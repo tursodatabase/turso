@@ -3447,12 +3447,14 @@ mod tests {
     fn empty_resolver<'a>(
         schema: &'a Schema,
         database_schemas: &'a RwLock<HashMap<usize, crate::sync::Arc<Schema>>>,
+        temp_database: &'a RwLock<Option<crate::connection::TempDatabase>>,
         attached_databases: &'a RwLock<DatabaseCatalog>,
         syms: &'a SymbolTable,
     ) -> Resolver<'a> {
         Resolver::new(
             schema,
             database_schemas,
+            temp_database,
             attached_databases,
             syms,
             true,
@@ -3483,7 +3485,14 @@ mod tests {
         let syms = SymbolTable::new();
         let database_schemas = RwLock::new(HashMap::default());
         let attached_databases = RwLock::new(DatabaseCatalog::new());
-        let resolver = empty_resolver(&schema, &database_schemas, &attached_databases, &syms);
+        let temp_database = RwLock::new(None);
+        let resolver = empty_resolver(
+            &schema,
+            &database_schemas,
+            &temp_database,
+            &attached_databases,
+            &syms,
+        );
 
         let expr = fn_call(
             "coalesce",
@@ -3512,7 +3521,14 @@ mod tests {
         let syms = SymbolTable::new();
         let database_schemas = RwLock::new(HashMap::default());
         let attached_databases = RwLock::new(DatabaseCatalog::new());
-        let resolver = empty_resolver(&schema, &database_schemas, &attached_databases, &syms);
+        let temp_database = RwLock::new(None);
+        let resolver = empty_resolver(
+            &schema,
+            &database_schemas,
+            &temp_database,
+            &attached_databases,
+            &syms,
+        );
 
         let expr = fn_call(
             "quote",

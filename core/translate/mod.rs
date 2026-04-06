@@ -101,6 +101,7 @@ pub fn translate(
     let mut resolver = Resolver::new(
         schema,
         connection.database_schemas(),
+        &connection.temp_database,
         connection.attached_databases(),
         syms,
         connection.experimental_custom_types_enabled(),

@@ -32,7 +32,7 @@ pub fn translate_delete(
     program: &mut ProgramBuilder,
     connection: &Arc<crate::Connection>,
 ) -> Result<()> {
-    let database_id = resolver.resolve_database_id(tbl_name)?;
+    let database_id = resolver.resolve_existing_table_database_id(tbl_name)?;
     let normalized_table_name = normalize_ident(tbl_name.name.as_str());
 
     // Check if this is a system table that should be protected from direct writes
@@ -43,7 +43,7 @@ pub fn translate_delete(
         crate::bail_parse_error!("table {} may not be modified", normalized_table_name);
     }
 
-    if crate::is_attached_db(database_id) {
+    if database_id != crate::MAIN_DB_ID {
         let schema_cookie = resolver.with_schema(database_id, |s| s.schema_version);
         program.begin_write_on_database(database_id, schema_cookie);
     }

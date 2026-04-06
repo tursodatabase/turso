@@ -860,15 +860,16 @@ pub fn translate_create_table(
     program: &mut ProgramBuilder,
     connection: &Connection,
 ) -> Result<()> {
-    let database_id = resolver.resolve_database_id(&tbl_name)?;
-    if crate::is_attached_db(database_id) {
+    let database_id = if temporary {
+        crate::TEMP_DB_ID
+    } else {
+        resolver.resolve_database_id(&tbl_name)?
+    };
+    if database_id != crate::MAIN_DB_ID {
         let schema_cookie = resolver.with_schema(database_id, |s| s.schema_version);
         program.begin_write_on_database(database_id, schema_cookie);
     }
     let normalized_tbl_name = normalize_ident(tbl_name.name.as_str());
-    if temporary {
-        bail_parse_error!("TEMPORARY table not supported yet");
-    }
     validate(&body, &normalized_tbl_name, resolver, connection)?;
 
     // Gate array column types behind the experimental custom types flag.
@@ -1443,6 +1444,7 @@ pub fn translate_create_virtual_table(
 /// Validates whether a DROP TABLE operation is allowed on the given table name.
 fn validate_drop_table(
     resolver: &Resolver,
+    database_id: usize,
     tbl_name: &str,
     connection: &Arc<Connection>,
 ) -> Result<()> {
@@ -1454,7 +1456,7 @@ fn validate_drop_table(
         bail_parse_error!("Cannot drop system table {}", tbl_name);
     }
     // Check if this is a materialized view - if so, refuse to drop it with DROP TABLE
-    if resolver.schema().is_materialized_view(tbl_name) {
+    if resolver.with_schema(database_id, |schema| schema.is_materialized_view(tbl_name)) {
         bail_parse_error!(
             "Cannot DROP TABLE on materialized view {tbl_name}. Use DROP VIEW instead.",
         );
@@ -1469,7 +1471,7 @@ pub fn translate_drop_table(
     program: &mut ProgramBuilder,
     connection: &Arc<Connection>,
 ) -> Result<()> {
-    let database_id = resolver.resolve_database_id(&tbl_name)?;
+    let database_id = resolver.resolve_existing_table_database_id(&tbl_name)?;
     let name = tbl_name.name.as_str();
     let opts = ProgramBuilderOpts {
         num_cursors: 4,
@@ -1478,7 +1480,7 @@ pub fn translate_drop_table(
     };
     program.extend(&opts);
 
-    if crate::is_attached_db(database_id) {
+    if database_id != crate::MAIN_DB_ID {
         let schema_cookie = resolver.with_schema(database_id, |s| s.schema_version);
         program.begin_write_on_database(database_id, schema_cookie);
     }
@@ -1489,7 +1491,7 @@ pub fn translate_drop_table(
         }
         bail_parse_error!("No such table: {name}");
     };
-    validate_drop_table(resolver, name, connection)?;
+    validate_drop_table(resolver, database_id, name, connection)?;
     // Check if foreign keys are enabled and if this table is referenced by foreign keys
     // Fire FK actions (CASCADE, SET NULL, SET DEFAULT) or check for violations (RESTRICT, NO ACTION)
     if connection.foreign_keys_enabled()

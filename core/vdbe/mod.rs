@@ -1785,7 +1785,7 @@ impl Program {
             match step_result {
                 IOResult::Done(_) => {
                     let attached_pager = conn.get_pager_from_database_index(&db_id);
-                    conn.publish_attached_schema(db_id);
+                    conn.publish_database_schema(db_id);
                     conn.set_mv_tx_for_db(db_id, None);
                     attached_pager.end_read_tx();
                     // Fall through to look for more
@@ -1820,7 +1820,7 @@ impl Program {
             match state_machine.step(&attached_mv_store)? {
                 IOResult::Done(_) => {
                     let attached_pager = conn.get_pager_from_database_index(&db_id);
-                    conn.publish_attached_schema(db_id);
+                    conn.publish_database_schema(db_id);
                     conn.set_mv_tx_for_db(db_id, None);
                     attached_pager.end_read_tx();
                     continue;
@@ -1955,7 +1955,7 @@ impl Program {
                 }
                 // WAL commit succeeded — publish the connection-local schema
                 // changes to the shared Database so other connections can see them.
-                connection.publish_attached_schema(db_id);
+                connection.publish_database_schema(db_id);
                 attached_pager.end_write_tx();
                 attached_pager.end_read_tx();
                 attached_pager.commit_dirty_pages_end();

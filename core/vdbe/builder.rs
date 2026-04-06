@@ -1510,7 +1510,7 @@ impl ProgramBuilder {
     /// so that a WAL read lock is acquired.
     pub fn begin_read_on_database(&mut self, database_id: usize, schema_cookie: u32) {
         self.begin_read_operation();
-        if crate::is_attached_db(database_id) {
+        if database_id != crate::MAIN_DB_ID {
             self.read_databases.insert(database_id);
             self.read_database_cookies
                 .insert(database_id, schema_cookie);
@@ -1557,9 +1557,9 @@ impl ProgramBuilder {
                     tx_mode: self.txn_mode,
                     schema_cookie: schema.schema_version,
                 });
-                // Emit Transaction for each attached database that needs a write
+                // Emit Transaction for each non-main database that needs a write
                 for &db_id in &self.write_databases.clone() {
-                    if crate::is_attached_db(db_id) {
+                    if db_id != crate::MAIN_DB_ID {
                         let cookie = self
                             .write_database_cookies
                             .get(&db_id)
@@ -1572,10 +1572,10 @@ impl ProgramBuilder {
                         });
                     }
                 }
-                // Emit Transaction for each attached database that only needs a read
+                // Emit Transaction for each non-main database that only needs a read
                 // (skip databases already covered by write_databases)
                 for &db_id in &self.read_databases.clone() {
-                    if !self.write_databases.contains(&db_id) {
+                    if db_id != crate::MAIN_DB_ID && !self.write_databases.contains(&db_id) {
                         let cookie = self.read_database_cookies.get(&db_id).copied().unwrap_or(0);
                         self.emit_insn(Insn::Transaction {
                             db: db_id,

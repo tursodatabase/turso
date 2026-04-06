@@ -126,6 +126,7 @@ impl From<bool> for DoubleQuotedDml {
 pub struct Resolver<'a> {
     schema: &'a Schema,
     database_schemas: &'a RwLock<HashMap<usize, Arc<Schema>>>,
+    temp_database: &'a RwLock<Option<crate::connection::TempDatabase>>,
     attached_databases: &'a RwLock<DatabaseCatalog>,
     pub symbol_table: &'a SymbolTable,
     pub expr_to_reg_cache_enabled: bool,
@@ -166,6 +167,7 @@ impl<'a> Resolver<'a> {
     pub(crate) fn new(
         schema: &'a Schema,
         database_schemas: &'a RwLock<HashMap<usize, Arc<Schema>>>,
+        temp_database: &'a RwLock<Option<crate::connection::TempDatabase>>,
         attached_databases: &'a RwLock<DatabaseCatalog>,
         symbol_table: &'a SymbolTable,
         enable_custom_types: bool,
@@ -174,6 +176,7 @@ impl<'a> Resolver<'a> {
         Self {
             schema,
             database_schemas,
+            temp_database,
             attached_databases,
             symbol_table,
             expr_to_reg_cache_enabled: false,
@@ -193,6 +196,7 @@ impl<'a> Resolver<'a> {
         Resolver {
             schema: self.schema,
             database_schemas: self.database_schemas,
+            temp_database: self.temp_database,
             attached_databases: self.attached_databases,
             symbol_table: self.symbol_table,
             expr_to_reg_cache_enabled: false,
@@ -208,6 +212,7 @@ impl<'a> Resolver<'a> {
         Resolver {
             schema: self.schema,
             database_schemas: self.database_schemas,
+            temp_database: self.temp_database,
             attached_databases: self.attached_databases,
             symbol_table: self.symbol_table,
             expr_to_reg_cache_enabled: self.expr_to_reg_cache_enabled,
@@ -300,26 +305,90 @@ impl<'a> Resolver<'a> {
 
     /// Access schema for a database using a closure pattern to avoid cloning
     pub(crate) fn with_schema<T>(&self, database_id: usize, f: impl FnOnce(&Schema) -> T) -> T {
-        if database_id == crate::MAIN_DB_ID || database_id == crate::TEMP_DB_ID {
-            f(self.schema)
-        } else {
-            // Attached database: prefer the connection-local copy (which may contain
-            // uncommitted schema changes from this connection's transaction), falling
-            // back to the shared Database schema (last committed state).
-            let schemas = self.database_schemas.read();
-            if let Some(local_schema) = schemas.get(&database_id) {
-                return f(local_schema);
+        match database_id {
+            crate::MAIN_DB_ID => f(self.schema),
+            crate::TEMP_DB_ID => {
+                let schemas = self.database_schemas.read();
+                if let Some(local_schema) = schemas.get(&database_id) {
+                    return f(local_schema);
+                }
+                drop(schemas);
+
+                if let Some(temp_db) = self.temp_database.read().as_ref() {
+                    let schema = temp_db.db.schema.lock().clone();
+                    f(&schema)
+                } else {
+                    let schema = Arc::new(Schema::with_options(self.enable_custom_types));
+                    f(&schema)
+                }
             }
-            drop(schemas);
+            _ => {
+                let schemas = self.database_schemas.read();
+                if let Some(local_schema) = schemas.get(&database_id) {
+                    return f(local_schema);
+                }
+                drop(schemas);
 
-            let attached_dbs = self.attached_databases.read();
-            let (db, _pager) = attached_dbs
-                .index_to_data
-                .get(&database_id)
-                .expect("Database ID should be valid after resolve_database_id");
+                let attached_dbs = self.attached_databases.read();
+                let (db, _pager) = attached_dbs
+                    .index_to_data
+                    .get(&database_id)
+                    .expect("Database ID should be valid after resolve_database_id");
 
-            let schema = db.schema.lock().clone();
-            f(&schema)
+                let schema = db.schema.lock().clone();
+                f(&schema)
+            }
+        }
+    }
+
+    pub(crate) fn resolve_existing_table_database_id(
+        &self,
+        qualified_name: &ast::QualifiedName,
+    ) -> Result<usize> {
+        if qualified_name.db_name.is_some() {
+            return self.resolve_database_id(qualified_name);
+        }
+
+        if let Some(ref ctx) = self.trigger_context {
+            return Ok(ctx.database_id);
+        }
+
+        let table_name = qualified_name.name.as_str();
+        if table_name.eq_ignore_ascii_case(crate::schema::SCHEMA_TABLE_NAME)
+            || table_name.eq_ignore_ascii_case("sqlite_master")
+        {
+            return Ok(crate::MAIN_DB_ID);
+        }
+        if self.with_schema(crate::TEMP_DB_ID, |schema| {
+            schema.get_table(table_name).is_some()
+                || schema.get_view(table_name).is_some()
+                || schema.get_materialized_view(table_name).is_some()
+        }) {
+            Ok(crate::TEMP_DB_ID)
+        } else {
+            Ok(crate::MAIN_DB_ID)
+        }
+    }
+
+    pub(crate) fn resolve_existing_index_database_id(
+        &self,
+        qualified_name: &ast::QualifiedName,
+    ) -> Result<usize> {
+        if qualified_name.db_name.is_some() {
+            return self.resolve_database_id(qualified_name);
+        }
+
+        let index_name = normalize_ident(qualified_name.name.as_str());
+        if self.with_schema(crate::TEMP_DB_ID, |schema| {
+            schema
+                .indexes
+                .values()
+                .flat_map(|indexes| indexes.iter())
+                .any(|index| index.name.eq_ignore_ascii_case(&index_name))
+        }) {
+            Ok(crate::TEMP_DB_ID)
+        } else {
+            Ok(crate::MAIN_DB_ID)
         }
     }
 
