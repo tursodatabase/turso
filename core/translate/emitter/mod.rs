@@ -148,8 +148,9 @@ pub struct Resolver<'a> {
     /// literals (SQLite's DQS misfeature) in DML statements.
     pub dqs_dml: DoubleQuotedDml,
     /// When set, we are compiling a trigger subprogram for this database.
-    /// All table references must resolve to this same database; cross-database
-    /// references are forbidden (matching SQLite's behavior).
+    /// Ordinary triggers are restricted to their own database, but temp-backed
+    /// triggers follow SQLite's looser resolution rules and may access objects
+    /// across schemas.
     pub(crate) trigger_context: Option<TriggerDatabaseContext>,
 }
 
@@ -160,6 +161,12 @@ pub(crate) struct TriggerDatabaseContext {
     database_id: usize,
     /// The trigger name (for error messages).
     trigger_name: String,
+}
+
+impl TriggerDatabaseContext {
+    fn restricts_db_references(&self) -> bool {
+        self.database_id != crate::TEMP_DB_ID
+    }
 }
 
 impl<'a> Resolver<'a> {
@@ -352,6 +359,19 @@ impl<'a> Resolver<'a> {
         }
 
         if let Some(ref ctx) = self.trigger_context {
+            if !ctx.restricts_db_references() {
+                return if self.with_schema(crate::TEMP_DB_ID, |schema| {
+                    schema.get_table(qualified_name.name.as_str()).is_some()
+                        || schema.get_view(qualified_name.name.as_str()).is_some()
+                        || schema
+                            .get_materialized_view(qualified_name.name.as_str())
+                            .is_some()
+                }) {
+                    Ok(crate::TEMP_DB_ID)
+                } else {
+                    Ok(crate::MAIN_DB_ID)
+                };
+            }
             return Ok(ctx.database_id);
         }
 
@@ -423,7 +443,11 @@ impl<'a> Resolver<'a> {
             // resolve to the trigger's database (matching SQLite behavior).
             // Otherwise default to main.
             if let Some(ref ctx) = self.trigger_context {
-                Ok(ctx.database_id)
+                if ctx.restricts_db_references() {
+                    Ok(ctx.database_id)
+                } else {
+                    Ok(crate::MAIN_DB_ID)
+                }
             } else {
                 Ok(0)
             }
@@ -433,6 +457,9 @@ impl<'a> Resolver<'a> {
         // This only fires for explicitly qualified names (e.g. "aux.table")
         // since unqualified names already resolve to the trigger's database above.
         if let Some(ref ctx) = self.trigger_context {
+            if !ctx.restricts_db_references() {
+                return Ok(resolved_id);
+            }
             if resolved_id != ctx.database_id {
                 let db_name = qualified_name
                     .db_name
