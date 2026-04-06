@@ -2,7 +2,7 @@
  * turso_tcl.c — Native Tcl extension for Turso/Limbo database.
  *
  * Provides the `sqlite3` Tcl command that creates in-process database
- * connections, replacing the subprocess-based shim in testing/sqlite3/tester.tcl.
+ * connections, replacing the subprocess-based shim in testing/conformance/sqlite3/tester.tcl.
  *
  * Supported db sub-commands:
  *   eval SQL ?array? ?script?   — execute SQL, return results as list
