@@ -223,7 +223,7 @@ mod tests {
             // Should not generate a table named "users" or "posts"
             prop_assert!(stmt.table_name != "users");
             prop_assert!(stmt.table_name != "posts");
-            prop_assert!(stmt.to_string().starts_with("CREATE TABLE"));
+            prop_assert!(stmt.to_string().starts_with("CREATE "));
         }
 
         #[test]

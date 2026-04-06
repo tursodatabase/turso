@@ -95,3 +95,17 @@ test pragma-index-list-function-syntax {
 expect {
     0|idx1|0|c|0
 }
+
+@skip-if mvcc "attach is not supported for mvcc"
+@cross-check-integrity
+test pragma-index-list-attached-database {
+    ATTACH ':memory:' AS aux;
+    CREATE TABLE aux.t1(a, b, c);
+    CREATE INDEX aux.idx1 ON t1(a);
+    PRAGMA aux.index_list('t1');
+    PRAGMA aux.index_info('idx1');
+}
+expect {
+    0|idx1|0|c|0
+    0|0|a
+}

@@ -71,3 +71,14 @@ test pragma-table-list-function-syntax {
 expect {
     main|t1|table|3|0|0
 }
+
+@skip-if mvcc "attach is not supported for mvcc"
+@cross-check-integrity
+test pragma-table-list-attached-database {
+    ATTACH ':memory:' AS aux;
+    CREATE TABLE aux.t1(a, b, c);
+    PRAGMA aux.table_list('t1');
+}
+expect {
+    aux|t1|table|3|0|0
+}

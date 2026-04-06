@@ -3,7 +3,7 @@
 use proptest::prelude::*;
 use std::fmt;
 
-use crate::create_table::identifier_excluding;
+use crate::create_table::{TemporaryKeyword, identifier_excluding};
 use crate::profile::StatementProfile;
 use crate::schema::{Schema, TableRef};
 use crate::select::OrderDirection;
@@ -58,11 +58,15 @@ pub struct CreateIndexStatement {
     pub columns: Vec<IndexColumn>,
     pub unique: bool,
     pub if_not_exists: bool,
+    pub temporary: Option<TemporaryKeyword>,
 }
 
 impl fmt::Display for CreateIndexStatement {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "CREATE ")?;
+        if let Some(keyword) = self.temporary {
+            write!(f, "{keyword} ")?;
+        }
 
         if self.unique {
             write!(f, "UNIQUE ")?;
@@ -99,20 +103,31 @@ pub fn create_index_for_table(
     schema: &Schema,
     profile: &StatementProfile,
 ) -> BoxedStrategy<CreateIndexStatement> {
-    let table_name = table.name.clone();
+    let index_database = table.database.clone();
+    let table_name = table.unqualified_name().to_string();
     let col_names: Vec<String> = table.columns.iter().map(|c| c.name.clone()).collect();
-    let existing_indexes = schema.index_names();
+    let existing_indexes = schema.index_names_in_database(index_database.as_deref());
 
     // Extract profile values from the CreateIndexProfile
     let max_columns = profile.create_index_profile().max_columns;
 
     if col_names.is_empty() {
+        let temporary = match index_database.as_deref() {
+            Some("temp") => Some(TemporaryKeyword::Temp),
+            _ => None,
+        };
+        let index_name = match index_database.as_deref() {
+            Some("temp") => "idx_empty".to_string(),
+            Some(db) => format!("{db}.idx_empty"),
+            None => "idx_empty".to_string(),
+        };
         return Just(CreateIndexStatement {
-            index_name: "idx_empty".to_string(),
+            index_name,
             table_name,
             columns: vec![],
             unique: false,
             if_not_exists: true,
+            temporary,
         })
         .boxed();
     }
@@ -125,6 +140,7 @@ pub fn create_index_for_table(
     )
         .prop_flat_map(
             move |(index_suffix, unique, if_not_exists, selected_cols)| {
+                let index_database = index_database.clone();
                 let table_name = table_name.clone();
 
                 let col_strategies: Vec<_> = selected_cols
@@ -132,12 +148,30 @@ pub fn create_index_for_table(
                     .map(|name| index_column(name).boxed())
                     .collect();
 
-                col_strategies.prop_map(move |columns| CreateIndexStatement {
-                    index_name: format!("idx_{table_name}_{index_suffix}"),
-                    table_name: table_name.clone(),
-                    columns,
-                    unique,
-                    if_not_exists,
+                col_strategies.prop_map(move |columns| {
+                    let index_name = format!("idx_{table_name}_{index_suffix}");
+                    let temporary = match index_database.as_deref() {
+                        Some("temp") => Some(if if_not_exists {
+                            TemporaryKeyword::Temporary
+                        } else {
+                            TemporaryKeyword::Temp
+                        }),
+                        _ => None,
+                    };
+                    let qualified_index_name = match index_database.as_deref() {
+                        Some("temp") => index_name.clone(),
+                        Some(db) => format!("{db}.{index_name}"),
+                        None => index_name,
+                    };
+
+                    CreateIndexStatement {
+                        index_name: qualified_index_name,
+                        table_name: table_name.clone(),
+                        columns,
+                        unique,
+                        if_not_exists,
+                        temporary,
+                    }
                 })
             },
         )
@@ -157,22 +191,44 @@ pub fn create_index(
     // Extract profile values from the CreateIndexProfile
     let max_columns = profile.create_index_profile().max_columns;
 
-    let existing_indexes = schema.index_names();
+    let existing_indexes_by_database: Vec<(Option<String>, std::collections::HashSet<String>)> =
+        std::iter::once(None)
+            .chain(schema.attached_databases.iter().cloned().map(Some))
+            .map(|db| {
+                let existing = schema.index_names_in_database(db.as_deref());
+                (db, existing)
+            })
+            .collect();
     let tables = (*schema.tables).clone();
 
     proptest::sample::select(tables)
         .prop_flat_map(move |table| {
-            let table_name = table.name.clone();
+            let index_database = table.database.clone();
+            let table_name = table.unqualified_name().to_string();
             let col_names: Vec<String> = table.columns.iter().map(|c| c.name.clone()).collect();
-            let existing = existing_indexes.clone();
+            let existing = existing_indexes_by_database
+                .iter()
+                .find(|(db, _)| *db == index_database)
+                .map(|(_, names)| names.clone())
+                .unwrap_or_default();
 
             if col_names.is_empty() {
+                let temporary = match index_database.as_deref() {
+                    Some("temp") => Some(TemporaryKeyword::Temp),
+                    _ => None,
+                };
+                let index_name = match index_database.as_deref() {
+                    Some("temp") => "idx_empty".to_string(),
+                    Some(db) => format!("{db}.idx_empty"),
+                    None => "idx_empty".to_string(),
+                };
                 return Just(CreateIndexStatement {
-                    index_name: "idx_empty".to_string(),
+                    index_name,
                     table_name,
                     columns: vec![],
                     unique: false,
                     if_not_exists: true,
+                    temporary,
                 })
                 .boxed();
             }
@@ -188,6 +244,7 @@ pub fn create_index(
             )
                 .prop_flat_map(
                     move |(index_suffix, unique, if_not_exists, selected_cols)| {
+                        let index_database = index_database.clone();
                         let table_name = table_name.clone();
 
                         let col_strategies: Vec<_> = selected_cols
@@ -195,12 +252,30 @@ pub fn create_index(
                             .map(|name| index_column(name).boxed())
                             .collect();
 
-                        col_strategies.prop_map(move |columns| CreateIndexStatement {
-                            index_name: format!("idx_{table_name}_{index_suffix}"),
-                            table_name: table_name.clone(),
-                            columns,
-                            unique,
-                            if_not_exists,
+                        col_strategies.prop_map(move |columns| {
+                            let index_name = format!("idx_{table_name}_{index_suffix}");
+                            let temporary = match index_database.as_deref() {
+                                Some("temp") => Some(if if_not_exists {
+                                    TemporaryKeyword::Temporary
+                                } else {
+                                    TemporaryKeyword::Temp
+                                }),
+                                _ => None,
+                            };
+                            let qualified_index_name = match index_database.as_deref() {
+                                Some("temp") => index_name.clone(),
+                                Some(db) => format!("{db}.{index_name}"),
+                                None => index_name,
+                            };
+
+                            CreateIndexStatement {
+                                index_name: qualified_index_name,
+                                table_name: table_name.clone(),
+                                columns,
+                                unique,
+                                if_not_exists,
+                                temporary,
+                            }
                         })
                     },
                 )
@@ -224,6 +299,7 @@ mod tests {
             }],
             unique: true,
             if_not_exists: false,
+            temporary: None,
         };
 
         assert_eq!(
@@ -249,11 +325,52 @@ mod tests {
             ],
             unique: false,
             if_not_exists: true,
+            temporary: None,
         };
 
         assert_eq!(
             stmt.to_string(),
             "CREATE INDEX IF NOT EXISTS idx_composite ON orders (user_id, created_at DESC)"
+        );
+    }
+
+    #[test]
+    fn test_create_index_with_temp_schema_name() {
+        let stmt = CreateIndexStatement {
+            index_name: "temp.idx_temp_users_email".to_string(),
+            table_name: "users".to_string(),
+            columns: vec![IndexColumn {
+                name: "email".to_string(),
+                direction: None,
+            }],
+            unique: false,
+            if_not_exists: false,
+            temporary: None,
+        };
+
+        assert_eq!(
+            stmt.to_string(),
+            "CREATE INDEX temp.idx_temp_users_email ON users (email)"
+        );
+    }
+
+    #[test]
+    fn test_create_temp_index_display() {
+        let stmt = CreateIndexStatement {
+            index_name: "idx_temp_users_email".to_string(),
+            table_name: "users".to_string(),
+            columns: vec![IndexColumn {
+                name: "email".to_string(),
+                direction: None,
+            }],
+            unique: false,
+            if_not_exists: false,
+            temporary: Some(TemporaryKeyword::Temp),
+        };
+
+        assert_eq!(
+            stmt.to_string(),
+            "CREATE TEMP INDEX idx_temp_users_email ON users (email)"
         );
     }
 }

@@ -1054,11 +1054,16 @@ pub struct CreateTableStmt {
     pub columns: Vec<ColumnDefStmt>,
     pub if_not_exists: bool,
     pub strict: bool,
+    pub temporary: Option<TemporaryKeyword>,
 }
 
 impl fmt::Display for CreateTableStmt {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "CREATE TABLE ")?;
+        write!(f, "CREATE ")?;
+        if let Some(keyword) = self.temporary {
+            write!(f, "{keyword} ")?;
+        }
+        write!(f, "TABLE ")?;
         if self.if_not_exists {
             write!(f, "IF NOT EXISTS ")?;
         }
@@ -1078,6 +1083,21 @@ impl fmt::Display for CreateTableStmt {
         }
 
         Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TemporaryKeyword {
+    Temp,
+    Temporary,
+}
+
+impl fmt::Display for TemporaryKeyword {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            TemporaryKeyword::Temp => write!(f, "TEMP"),
+            TemporaryKeyword::Temporary => write!(f, "TEMPORARY"),
+        }
     }
 }
 
@@ -1187,11 +1207,15 @@ pub struct CreateIndexStmt {
     pub columns: Vec<String>,
     pub unique: bool,
     pub if_not_exists: bool,
+    pub temporary: Option<TemporaryKeyword>,
 }
 
 impl fmt::Display for CreateIndexStmt {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "CREATE ")?;
+        if let Some(keyword) = self.temporary {
+            write!(f, "{keyword} ")?;
+        }
         if self.unique {
             write!(f, "UNIQUE ")?;
         }
@@ -2617,6 +2641,47 @@ mod tests {
         };
 
         assert_eq!(select.non_unique_order_by_reason(&schema), None);
+    }
+
+    #[test]
+    fn test_create_temp_table_display() {
+        let stmt = CreateTableStmt {
+            table: "t".to_string(),
+            columns: vec![ColumnDefStmt {
+                name: "id".to_string(),
+                data_type: DataType::Integer,
+                primary_key: true,
+                not_null: true,
+                unique: false,
+                default: None,
+                check: None,
+            }],
+            if_not_exists: false,
+            strict: false,
+            temporary: Some(TemporaryKeyword::Temp),
+        };
+
+        assert_eq!(
+            stmt.to_string(),
+            "CREATE TEMP TABLE t (id INTEGER PRIMARY KEY)"
+        );
+    }
+
+    #[test]
+    fn test_create_temporary_index_display() {
+        let stmt = CreateIndexStmt {
+            name: "idx_t_id".to_string(),
+            table: "t".to_string(),
+            columns: vec!["id".to_string()],
+            unique: false,
+            if_not_exists: false,
+            temporary: Some(TemporaryKeyword::Temporary),
+        };
+
+        assert_eq!(
+            stmt.to_string(),
+            "CREATE TEMPORARY INDEX idx_t_id ON t (id)"
+        );
     }
 
     #[test]
