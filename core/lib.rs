@@ -1406,6 +1406,7 @@ impl Database {
             attached_databases: RwLock::new(DatabaseCatalog::new()),
             query_only: AtomicBool::new(false),
             dml_require_where: AtomicBool::new(false),
+            dqs_dml: AtomicBool::new(true),
             mv_tx: RwLock::new(None),
             attached_mv_txs: RwLock::new(HashMap::default()),
             #[cfg(any(test, injected_yields))]

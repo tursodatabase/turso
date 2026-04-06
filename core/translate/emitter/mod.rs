@@ -116,6 +116,9 @@ pub struct Resolver<'a> {
     /// than redirecting column reads at codegen time.
     pub register_affinities: HashMap<usize, Affinity>,
     pub enable_custom_types: bool,
+    /// Whether DQS (double-quoted strings) fallback is enabled for DML.
+    /// When true, unresolved double-quoted identifiers fall back to string literals.
+    pub dqs_dml: bool,
     /// When set, we are compiling a trigger subprogram for this database.
     /// All table references must resolve to this same database; cross-database
     /// references are forbidden (matching SQLite's behavior).
@@ -141,6 +144,7 @@ impl<'a> Resolver<'a> {
         attached_databases: &'a RwLock<DatabaseCatalog>,
         symbol_table: &'a SymbolTable,
         enable_custom_types: bool,
+        dqs_dml: bool,
     ) -> Self {
         Self {
             schema,
@@ -151,6 +155,7 @@ impl<'a> Resolver<'a> {
             expr_to_reg_cache: Vec::new(),
             register_affinities: HashMap::default(),
             enable_custom_types,
+            dqs_dml,
             trigger_context: None,
         }
     }
@@ -169,6 +174,7 @@ impl<'a> Resolver<'a> {
             expr_to_reg_cache: Vec::new(),
             register_affinities: HashMap::default(),
             enable_custom_types: self.enable_custom_types,
+            dqs_dml: self.dqs_dml,
             trigger_context: self.trigger_context.clone(),
         }
     }
@@ -183,6 +189,7 @@ impl<'a> Resolver<'a> {
             expr_to_reg_cache: self.expr_to_reg_cache.clone(),
             register_affinities: self.register_affinities.clone(),
             enable_custom_types: self.enable_custom_types,
+            dqs_dml: self.dqs_dml,
             trigger_context: self.trigger_context.clone(),
         }
     }

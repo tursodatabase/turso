@@ -328,7 +328,14 @@ impl CompiledExpression {
         // Create a resolver for translate_expr
         let database_schemas = RwLock::new(HashMap::default());
         let attached_databases = RwLock::new(DatabaseCatalog::new());
-        let resolver = Resolver::new(schema, &database_schemas, &attached_databases, syms, true);
+        let resolver = Resolver::new(
+            schema,
+            &database_schemas,
+            &attached_databases,
+            syms,
+            true,
+            true,
+        );
 
         // Translate the transformed expression to bytecode
         translate_expr(
