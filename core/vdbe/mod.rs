@@ -770,6 +770,25 @@ impl ProgramState {
         }
     }
 
+    pub(crate) fn reset_stmt_status(&mut self, counter: crate::statement::StatementStatusCounter) {
+        match counter {
+            crate::statement::StatementStatusCounter::FullscanStep => {
+                self.metrics.fullscan_steps = 0
+            }
+            crate::statement::StatementStatusCounter::Sort => self.metrics.sort_operations = 0,
+            crate::statement::StatementStatusCounter::VmStep => self.metrics.insn_executed = 0,
+            crate::statement::StatementStatusCounter::Reprepare => self.metrics.reprepares = 0,
+            crate::statement::StatementStatusCounter::RowsRead => self.metrics.rows_read = 0,
+            crate::statement::StatementStatusCounter::RowsWritten => self.metrics.rows_written = 0,
+        }
+        if let OpProgramState::Step { statement, .. } = &mut self.op_program_state {
+            statement.reset_stmt_status(counter);
+        }
+        for statement in self.subprogram_stmt_cache.values_mut() {
+            statement.reset_stmt_status(counter);
+        }
+    }
+
     pub fn get_cursor(&mut self, cursor_id: CursorID) -> &mut Cursor {
         self.cursors
             .get_mut(cursor_id)

@@ -120,7 +120,7 @@ pub use io::{
     SyscallIO, WriteCompletion, IO,
 };
 pub use numeric::{nonnan::NonNan, Numeric};
-pub use statement::Statement;
+pub use statement::{Statement, StatementStatusCounter};
 pub use storage::{
     buffer_pool::BufferPool,
     database::{DatabaseStorage, IOContext},

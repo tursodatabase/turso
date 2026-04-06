@@ -57,6 +57,16 @@ pub(crate) enum StatementOrigin {
     Subprogram,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StatementStatusCounter {
+    FullscanStep,
+    Sort,
+    VmStep,
+    Reprepare,
+    RowsRead,
+    RowsWritten,
+}
+
 impl StatementOrigin {
     pub(crate) const fn needs_nested_guard(self) -> bool {
         matches!(self, Self::InternalHelper)
@@ -205,6 +215,22 @@ impl Statement {
 
     pub fn reset_metrics(&mut self) {
         self.state.reset_metrics();
+    }
+
+    pub fn stmt_status(&self, counter: StatementStatusCounter) -> u64 {
+        let metrics = self.metrics();
+        match counter {
+            StatementStatusCounter::FullscanStep => metrics.fullscan_steps,
+            StatementStatusCounter::Sort => metrics.sort_operations,
+            StatementStatusCounter::VmStep => metrics.insn_executed,
+            StatementStatusCounter::Reprepare => metrics.reprepares,
+            StatementStatusCounter::RowsRead => metrics.rows_read,
+            StatementStatusCounter::RowsWritten => metrics.rows_written,
+        }
+    }
+
+    pub fn reset_stmt_status(&mut self, counter: StatementStatusCounter) {
+        self.state.reset_stmt_status(counter);
     }
 
     pub fn mv_store(&self) -> impl Deref<Target = Option<Arc<MvStore>>> {
@@ -538,6 +564,7 @@ impl Statement {
             Some(cursor_count),
             self.counted_as_active_root,
         )?;
+        self.state.metrics.reprepares = self.state.metrics.reprepares.saturating_add(1);
         // Load the parameters back into the state
         self.state.parameters = parameters;
         Ok(())
