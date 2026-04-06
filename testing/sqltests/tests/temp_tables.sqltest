@@ -1,0 +1,231 @@
+@database :memory:
+
+test create-temp-table-behaves-like-temp-schema {
+    CREATE TEMP TABLE t(x INTEGER);
+    INSERT INTO t VALUES (7);
+    SELECT x FROM temp.t;
+    SELECT name FROM temp.sqlite_schema WHERE type = 'table' AND name = 't';
+}
+expect {
+    7
+    t
+}
+
+test create-temp-table-if-not-exists {
+    CREATE TEMP TABLE IF NOT EXISTS t_ifne(x INTEGER);
+    CREATE TEMP TABLE IF NOT EXISTS t_ifne(x INTEGER);
+    INSERT INTO t_ifne VALUES (1);
+    SELECT x FROM temp.t_ifne;
+}
+expect {
+    1
+}
+
+test create-temp-table-qualified-main-is-rejected {
+    CREATE TEMP TABLE main.bad(x INTEGER);
+}
+expect error {
+}
+
+test create-table-explicit-temp-schema {
+    CREATE TABLE temp.u(y INTEGER);
+    INSERT INTO u VALUES (9);
+    SELECT y FROM u;
+    SELECT y FROM temp.u;
+}
+expect {
+    9
+    9
+}
+
+test temp-and-main-can-share-table-name-both-directions {
+    CREATE TEMP TABLE same_name(x INTEGER);
+    INSERT INTO temp.same_name VALUES (5);
+    CREATE TABLE same_name(x INTEGER);
+    INSERT INTO main.same_name VALUES (6);
+    SELECT x FROM same_name;
+    SELECT x FROM main.same_name;
+    SELECT x FROM temp.same_name;
+}
+expect {
+    5
+    6
+    5
+}
+
+test temp-table-shadows-main-for-unqualified-lookups {
+    CREATE TABLE t(x INTEGER);
+    INSERT INTO main.t VALUES (1);
+    CREATE TEMP TABLE t(x INTEGER);
+    INSERT INTO temp.t VALUES (2);
+    SELECT x FROM t;
+    SELECT x FROM main.t;
+    SELECT x FROM temp.t;
+}
+expect {
+    2
+    1
+    2
+}
+
+test temp-table-shadowing-applies-to-update-and-delete {
+    CREATE TABLE t_shadow(x INTEGER);
+    INSERT INTO main.t_shadow VALUES (1), (2);
+    CREATE TEMP TABLE t_shadow(x INTEGER);
+    INSERT INTO temp.t_shadow VALUES (10), (20);
+    UPDATE t_shadow SET x = x + 1;
+    DELETE FROM t_shadow WHERE x = 11;
+    SELECT x FROM temp.t_shadow ORDER BY x;
+    SELECT x FROM main.t_shadow ORDER BY x;
+}
+expect {
+    21
+    1
+    2
+}
+
+test insert-into-temp-select-from-temp-self {
+    CREATE TEMP TABLE self_copy(x INTEGER);
+    INSERT INTO self_copy VALUES (1);
+    INSERT INTO self_copy SELECT x + 1 FROM self_copy;
+    SELECT x FROM self_copy ORDER BY x;
+}
+expect {
+    1
+    2
+}
+
+test create-temp-table-as-select-not-yet-supported {
+    CREATE TABLE src(x INTEGER);
+    INSERT INTO src VALUES (3), (4);
+    CREATE TEMP TABLE t_as AS SELECT x * 2 AS y FROM src ORDER BY x;
+}
+expect error {
+}
+
+test temp-schema-visible-only-via-temp-sqlite-schema {
+    CREATE TABLE schema_split(x INTEGER);
+    CREATE TEMP TABLE schema_split(x INTEGER);
+    SELECT count(*) FROM sqlite_schema WHERE type = 'table' AND name = 'schema_split';
+    SELECT count(*) FROM temp.sqlite_schema WHERE type = 'table' AND name = 'schema_split';
+}
+expect {
+    1
+    1
+}
+
+test sqlite-master-remains-main-schema-with-temp-present {
+    CREATE TABLE main_only(x INTEGER);
+    CREATE TEMP TABLE temp_only(x INTEGER);
+    SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = 'main_only';
+    SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = 'temp_only';
+    SELECT count(*) FROM temp.sqlite_master WHERE type = 'table' AND name = 'temp_only';
+}
+expect {
+    1
+    0
+    1
+}
+
+test create-index-on-temp-table-uses-temp-schema {
+    CREATE TEMP TABLE idx_t(x INTEGER, y INTEGER);
+    CREATE INDEX idx_temp_only ON idx_t(x);
+    INSERT INTO idx_t VALUES (1, 11), (2, 22);
+    SELECT name, type, tbl_name FROM temp.sqlite_schema WHERE name = 'idx_temp_only';
+    SELECT x FROM idx_t WHERE x = 2;
+}
+expect {
+    idx_temp_only|index|idx_t
+    2
+}
+
+test temp-and-main-can-share-index-name {
+    CREATE TABLE main_t(x INTEGER);
+    CREATE INDEX dup_idx ON main_t(x);
+    CREATE TEMP TABLE temp_t(x INTEGER);
+    CREATE INDEX dup_idx ON temp_t(x);
+    SELECT count(*) FROM sqlite_schema WHERE type = 'index' AND name = 'dup_idx';
+    SELECT count(*) FROM temp.sqlite_schema WHERE type = 'index' AND name = 'dup_idx';
+}
+expect {
+    1
+    1
+}
+
+test drop-index-prefers-temp-schema {
+    CREATE TABLE main_t2(x INTEGER);
+    CREATE INDEX dup_idx2 ON main_t2(x);
+    CREATE TEMP TABLE temp_t2(x INTEGER);
+    CREATE INDEX dup_idx2 ON temp_t2(x);
+    DROP INDEX dup_idx2;
+    SELECT count(*) FROM sqlite_schema WHERE type = 'index' AND name = 'dup_idx2';
+    SELECT count(*) FROM temp.sqlite_schema WHERE type = 'index' AND name = 'dup_idx2';
+}
+expect {
+    1
+    0
+}
+
+test drop-table-prefers-temp-schema {
+    CREATE TABLE t(x INTEGER);
+    INSERT INTO main.t VALUES (3);
+    CREATE TEMP TABLE t(x INTEGER);
+    DROP TABLE t;
+    SELECT x FROM main.t;
+    SELECT name FROM temp.sqlite_schema WHERE type = 'table' AND name = 't';
+}
+expect {
+    3
+}
+
+test drop-table-explicit-temp-schema {
+    CREATE TEMP TABLE drop_me(x INTEGER);
+    DROP TABLE temp.drop_me;
+    SELECT count(*) FROM temp.sqlite_schema WHERE type = 'table' AND name = 'drop_me';
+}
+expect {
+    0
+}
+
+test alter-temp-table-add-column {
+    CREATE TEMP TABLE alter_me(a INTEGER);
+    ALTER TABLE alter_me ADD COLUMN b TEXT;
+    INSERT INTO alter_me(a, b) VALUES (1, 'x');
+    SELECT sql FROM temp.sqlite_schema WHERE type = 'table' AND name = 'alter_me';
+    SELECT a, b FROM alter_me;
+}
+expect {
+    CREATE TABLE alter_me (a INTEGER, b TEXT)
+    1|x
+}
+
+test temp-table-join-can-distinguish-main-and-temp {
+    CREATE TABLE join_t(x INTEGER);
+    INSERT INTO main.join_t VALUES (1);
+    CREATE TEMP TABLE join_t(x INTEGER);
+    INSERT INTO temp.join_t VALUES (2);
+    SELECT m.x, t.x FROM main.join_t AS m, temp.join_t AS t;
+}
+expect {
+    1|2
+}
+
+test temp-store-memory-still-supports-temp-tables {
+    PRAGMA temp_store = MEMORY;
+    CREATE TEMP TABLE mem_only(v INTEGER);
+    INSERT INTO mem_only VALUES (11);
+    SELECT v FROM mem_only;
+}
+expect {
+    11
+}
+
+test temp-store-file-still-supports-temp-tables {
+    PRAGMA temp_store = FILE;
+    CREATE TEMP TABLE file_backed(v INTEGER);
+    INSERT INTO file_backed VALUES (12);
+    SELECT v FROM file_backed;
+}
+expect {
+    12
+}
