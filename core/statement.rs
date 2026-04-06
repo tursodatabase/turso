@@ -197,9 +197,14 @@ impl Statement {
         self.state.execution_state
     }
 
-    /// Current statement-level metrics (rows read, VM steps, etc.).
-    pub fn metrics(&self) -> &vdbe::metrics::StatementMetrics {
-        &self.state.metrics
+    /// Statement metrics accumulated across executions of this prepared
+    /// statement. Includes subprogram work.
+    pub fn metrics(&self) -> vdbe::metrics::StatementMetrics {
+        self.state.metrics()
+    }
+
+    pub fn reset_metrics(&mut self) {
+        self.state.reset_metrics();
     }
 
     pub fn mv_store(&self) -> impl Deref<Target = Option<Arc<MvStore>>> {
@@ -313,7 +318,7 @@ impl Statement {
                 .connection
                 .metrics
                 .write()
-                .record_statement(&self.state.metrics);
+                .record_statement(&self.metrics());
             self.busy = false;
             self.busy_handler_state = None; // Reset busy state on completion
             self.state.query_deadline = None;
@@ -965,5 +970,63 @@ impl Drop for Statement {
             self.program.connection.end_nested();
             self.nested_guard_active = false;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{Database, DatabaseOpts, MemoryIO, OpenFlags, IO};
+
+    fn open_test_connection() -> crate::Result<Arc<crate::Connection>> {
+        let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+        let db = Database::open_file_with_flags(
+            io,
+            ":memory:",
+            OpenFlags::Create,
+            DatabaseOpts::new(),
+            None,
+        )?;
+        db.connect()
+    }
+
+    #[test]
+    fn test_metrics_persist_across_reset() {
+        let conn = open_test_connection().unwrap();
+        conn.execute("CREATE TABLE t(x)").unwrap();
+        conn.metrics.write().reset();
+
+        let mut stmt = conn.prepare("INSERT INTO t VALUES (1)").unwrap();
+        stmt.run_ignore_rows().unwrap();
+        assert_eq!(stmt.metrics().rows_written, 1);
+
+        stmt.reset().unwrap();
+        assert_eq!(stmt.metrics().rows_written, 1);
+
+        stmt.run_ignore_rows().unwrap();
+        assert_eq!(stmt.metrics().rows_written, 2);
+
+        stmt.reset_metrics();
+        assert_eq!(stmt.metrics().rows_written, 0);
+    }
+
+    #[test]
+    fn test_metrics_include_subprogram_writes() {
+        let conn = open_test_connection().unwrap();
+        conn.execute("CREATE TABLE src(x)").unwrap();
+        conn.execute("CREATE TABLE log(x)").unwrap();
+        conn.execute(
+            "CREATE TRIGGER src_log AFTER INSERT ON src BEGIN INSERT INTO log VALUES (new.x); END",
+        )
+        .unwrap();
+
+        let mut stmt = conn.prepare("INSERT INTO src VALUES (1), (2)").unwrap();
+        stmt.run_ignore_rows().unwrap();
+
+        assert_eq!(
+            stmt.metrics().rows_written,
+            6,
+            "cumulative metrics should include root and trigger writes"
+        );
     }
 }

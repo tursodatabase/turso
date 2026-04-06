@@ -1299,7 +1299,7 @@ pub fn op_vfilter(
         state.pc = pc_if_empty.as_offset_int();
     } else {
         // VFilter positions to the first row if any exist, which counts as a read
-        state.metrics.rows_read = state.metrics.rows_read.saturating_add(1);
+        state.record_rows_read(1);
         state.pc += 1;
     }
     Ok(InsnFunctionStepResult::Step)
@@ -1400,6 +1400,7 @@ pub fn op_vupdate(
     };
     match result {
         Ok(Some(new_rowid)) => {
+            state.record_rows_written(1);
             if *conflict_action == 5 {
                 // ResolveType::Replace
                 program.connection.update_last_rowid(new_rowid);
@@ -1408,6 +1409,7 @@ pub fn op_vupdate(
         }
         Ok(None) => {
             // no-op or successful update without rowid return
+            state.record_rows_written(1);
             state.pc += 1;
         }
         Err(e) => {
@@ -1441,7 +1443,7 @@ pub fn op_vnext(
     };
     if has_more {
         // Increment metrics for row read from virtual table (including materialized views)
-        state.metrics.rows_read = state.metrics.rows_read.saturating_add(1);
+        state.record_rows_read(1);
         state.pc = pc_if_next.as_offset_int();
     } else {
         state.pc += 1;
@@ -1590,7 +1592,7 @@ pub fn op_rewind(
         state.pc = pc_if_empty.as_offset_int();
     } else {
         // Rewind positions to the first row, which is effectively a read
-        state.metrics.rows_read = state.metrics.rows_read.saturating_add(1);
+        state.record_rows_read(1);
         state.pc += 1;
     }
     Ok(InsnFunctionStepResult::Step)
@@ -1620,7 +1622,7 @@ pub fn op_last(
         state.pc = pc_if_empty.as_offset_int();
     } else {
         // Last positions to the last row, which is effectively a read
-        state.metrics.rows_read = state.metrics.rows_read.saturating_add(1);
+        state.record_rows_read(1);
         state.pc += 1;
     }
     Ok(InsnFunctionStepResult::Step)
@@ -2534,7 +2536,7 @@ pub fn op_next(
     };
     if !is_empty {
         // Increment metrics for row read
-        state.metrics.rows_read = state.metrics.rows_read.saturating_add(1);
+        state.record_rows_read(1);
         state.metrics.btree_next = state.metrics.btree_next.saturating_add(1);
         // Track if this is a full table scan or index scan
         if let Some((_, cursor_type)) = program.cursor_ref.get(*cursor_id) {
@@ -2581,7 +2583,7 @@ pub fn op_prev(
     };
     if !is_empty {
         // Increment metrics for row read
-        state.metrics.rows_read = state.metrics.rows_read.saturating_add(1);
+        state.record_rows_read(1);
         state.metrics.btree_prev = state.metrics.btree_prev.saturating_add(1);
         // Track if this is a full table scan or index scan
         if let Some((_, cursor_type)) = program.cursor_ref.get(*cursor_id) {
@@ -8575,7 +8577,7 @@ pub fn op_insert(
                     let cursor = get_cursor!(state, *cursor_id);
                     let cursor = cursor.as_btree_mut();
                     return_if_io!(cursor.insert(&BTreeKey::new_table_rowid(key, Some(&record))));
-                    state.metrics.rows_written = state.metrics.rows_written.saturating_add(1);
+                    state.record_rows_written(1);
                 }
                 // Only update last_insert_rowid for regular table inserts, not schema modifications
                 let root_page = {
@@ -8785,7 +8787,7 @@ pub fn op_delete(
                     return_if_io!(cursor.delete());
                 }
                 // Increment metrics for row write (DELETE is a write operation)
-                state.metrics.rows_written = state.metrics.rows_written.saturating_add(1);
+                state.record_rows_written(1);
                 let schema = program.connection.schema.read();
                 let dependent_views = schema.get_dependent_materialized_views(table_name);
                 if dependent_views.is_empty() {
@@ -8849,6 +8851,7 @@ pub fn op_idx_delete(
 
     if let Some(Cursor::IndexMethod(cursor)) = &mut state.cursors[*cursor_id] {
         return_if_io!(cursor.delete(&state.registers[*start_reg..*start_reg + *num_regs]));
+        state.record_rows_written(1);
         state.pc += 1;
         return Ok(InsnFunctionStepResult::Step);
     }
@@ -8924,7 +8927,7 @@ pub fn op_idx_delete(
                     return_if_io!(cursor.delete());
                 }
                 // Increment metrics for index write (delete is a write operation)
-                state.metrics.rows_written = state.metrics.rows_written.saturating_add(1);
+                state.record_rows_written(1);
                 state.pc += 1;
                 state.op_idx_delete_state = None;
                 return Ok(InsnFunctionStepResult::Step);
@@ -8976,6 +8979,7 @@ pub fn op_idx_insert(
             ));
         };
         return_if_io!(cursor.insert(&state.registers[start..start + count as usize]));
+        state.record_rows_written(1);
         state.pc += 1;
         return Ok(InsnFunctionStepResult::Step);
     }
@@ -9087,9 +9091,8 @@ pub fn op_idx_insert(
                 let cursor = cursor.as_btree_mut();
                 return_if_io!(cursor.insert(&BTreeKey::new_index_key(record_to_insert)));
             }
-            // Increment metrics for index write
             if flags.has(IdxInsertFlags::NCHANGE) {
-                state.metrics.rows_written = state.metrics.rows_written.saturating_add(1);
+                state.record_rows_written(1);
             }
             state.op_idx_insert_state = OpIdxInsertState::MaybeSeek;
             state.pc += 1;
@@ -11395,7 +11398,7 @@ pub fn op_count(
     // For optimized COUNT(*) queries, the count represents rows that would be read
     // SQLite tracks this differently (as pages read), but for consistency we track as rows
     if *exact {
-        state.metrics.rows_read = state.metrics.rows_read.saturating_add(count as u64);
+        state.record_rows_read(count as u64);
     }
 
     state.pc += 1;
@@ -12499,7 +12502,7 @@ pub fn op_hash_build(
     }
 
     state.op_hash_build_state = None;
-    state.metrics.rows_read = state.metrics.rows_read.saturating_add(1);
+    state.record_rows_read(1);
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
 }
