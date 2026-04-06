@@ -318,19 +318,19 @@ jobs:
 
   concurrent-simulator:
     runs-on: blacksmith-4vcpu-ubuntu-2404
-    timeout-minutes: 30
+    timeout-minutes: 40
     strategy:
       matrix:
         profile:
           - name: in-process
             iterations: 100
-            args: "--reopen-probability 0.001"
+            args: "--mode fast --reopen-probability 0.001"
           - name: multiprocess
             iterations: 20
-            args: "--multiprocess --max-connections 4"
+            args: "--mode fast --multiprocess --connections-per-process 4 --processes 4"
           - name: multiprocess-kill
             iterations: 10
-            args: "--multiprocess --max-connections 4 --kill-probability 0.01"
+            args: "--mode fast --multiprocess --connections-per-process 4 --processes 4 --kill-probability 0.01"
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable

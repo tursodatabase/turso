@@ -36,6 +36,12 @@ struct Args {
     /// Max connections
     #[arg(long, default_value_t = 4)]
     max_connections: usize,
+    /// Number of worker processes in multiprocess mode. Defaults to `max_connections`.
+    #[arg(long)]
+    processes: Option<usize>,
+    /// Number of connections opened inside each worker process in multiprocess mode.
+    #[arg(long, default_value_t = 1)]
+    connections_per_process: usize,
     #[arg(long, default_value_t = 0.0)]
     reopen_probability: f64,
     /// Max steps
@@ -83,6 +89,9 @@ enum SubCmd {
         /// Enable MVCC mode
         #[arg(long)]
         enable_mvcc: bool,
+        /// Number of connections to open inside this worker process
+        #[arg(long, default_value_t = 1)]
+        connections_per_process: usize,
     },
 }
 
@@ -94,10 +103,11 @@ fn main() -> anyhow::Result<()> {
     if let Some(SubCmd::Worker {
         db_path,
         enable_mvcc,
+        connections_per_process,
     }) = &args.subcommand
     {
         #[cfg(all(unix, target_pointer_width = "64"))]
-        return turso_whopper::worker::run_worker(db_path, *enable_mvcc);
+        return turso_whopper::worker::run_worker(db_path, *enable_mvcc, *connections_per_process);
     }
 
     init_logger();
@@ -138,10 +148,12 @@ fn run_multiprocess(args: &Args, seed: u64) -> anyhow::Result<()> {
 
     let (workloads, properties, elle_tables, chaotic_profiles) =
         build_workloads_and_properties(args);
+    let process_count = args.processes.unwrap_or(args.max_connections);
 
     let opts = MultiprocessOpts {
         seed: Some(seed),
-        max_connections: args.max_connections,
+        process_count,
+        connections_per_process: args.connections_per_process,
         max_steps,
         enable_mvcc: args.enable_mvcc,
         elle_tables,
@@ -154,7 +166,12 @@ fn run_multiprocess(args: &Args, seed: u64) -> anyhow::Result<()> {
         keep_files: args.keep,
     };
 
-    println!("multiprocess = true ({} workers)", args.max_connections);
+    println!(
+        "multiprocess = true ({} processes, {} connections/process, {} total connections)",
+        process_count,
+        args.connections_per_process,
+        process_count.saturating_mul(args.connections_per_process)
+    );
     if args.kill_probability > 0.0 {
         println!("kill_probability = {}", args.kill_probability);
     }

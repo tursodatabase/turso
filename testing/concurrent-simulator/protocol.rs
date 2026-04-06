@@ -31,15 +31,21 @@ pub struct WorkerSharedWalSnapshot {
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub enum WorkerCommand {
     /// Execute a SQL statement and return the result.
-    Execute { sql: String },
+    Execute { connection_idx: usize, sql: String },
     /// Disable connection-level automatic checkpointing.
-    DisableAutoCheckpoint,
+    DisableAutoCheckpoint { connection_idx: usize },
     /// Run a bounded passive checkpoint directly through the pager.
-    PassiveCheckpoint { upper_bound_inclusive: Option<u64> },
+    PassiveCheckpoint {
+        connection_idx: usize,
+        upper_bound_inclusive: Option<u64>,
+    },
     /// Clear the durable backfill proof without disturbing the authority snapshot.
     ClearBackfillProof,
     /// Install a valid durable proof while keeping published nbackfills at zero.
-    InstallUnpublishedBackfillProof { upper_bound_inclusive: u64 },
+    InstallUnpublishedBackfillProof {
+        connection_idx: usize,
+        upper_bound_inclusive: u64,
+    },
     /// Read the authoritative shared WAL snapshot for deterministic assertions.
     ReadSharedWalSnapshot,
     /// Read the authoritative shared wal-index mapping for one page.
