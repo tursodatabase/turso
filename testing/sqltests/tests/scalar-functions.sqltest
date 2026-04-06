@@ -537,6 +537,27 @@ test unhex-x-y-character-outside-set {
 expect {
 }
 
+test unhex-dash-separated {
+    SELECT quote(unhex('aa--bb', '-'));
+}
+expect {
+    X'AABB'
+}
+
+test unhex-multi-dash-separated {
+    SELECT quote(unhex('aa-bb-cc', '-'));
+}
+expect {
+    X'AABBCC'
+}
+
+test unhex-space-separated {
+    SELECT quote(unhex('aa bb', ' '));
+}
+expect {
+    X'AABB'
+}
+
 test trim {
     SELECT trim('   Limbo    ');
 }
