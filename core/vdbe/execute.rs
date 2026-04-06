@@ -4331,8 +4331,10 @@ pub fn op_seek(
     };
 
     if is_eq_only {
+        // We only care about Unpacked record sources for this short-circuit
         if let RecordSource::Unpacked { start_reg, .. } = record_source {
-            if state.registers[start_reg as usize].is_null() {
+            // Check only the primary register (no need for a loop 'i' here)
+            if state.registers[start_reg].is_null() {
                 let offset = match target_pc {
                     crate::vdbe::BranchOffset::Offset(o) => *o,
                     _ => unreachable!("Seek target must be an offset"),
