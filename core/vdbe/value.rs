@@ -790,11 +790,38 @@ impl Value {
             return Value::from_f64(((f + if f < 0.0 { -0.5 } else { 0.5 }) as i64) as f64);
         }
 
-        let f: f64 = crate::numeric::str_to_f64(format!("{f:.precision$}"))
-            .expect("formatted float should always parse successfully")
-            .into();
+        // SQLite rounds midpoint values (.5) away from zero, while Rust's
+        // format!("{:.N}") uses IEEE 754 banker's rounding (roundTiesToEven).
+        // We detect exact midpoints via extra-precision formatting (not float
+        // arithmetic, which can create false midpoints through rounding —
+        // e.g. 2.55 * 10 == 25.5 in IEEE 754 even though 2.55 != exact 2.55).
+        let extra_prec = precision + 15;
+        let full = format!("{f:.extra_prec$}");
+        let dot_pos = full.find('.').unwrap_or(full.len());
+        let decimals = &full.as_bytes()[dot_pos + 1..];
 
-        Value::from_f64(f)
+        let is_exact_midpoint = precision < decimals.len()
+            && decimals[precision] == b'5'
+            && decimals[precision + 1..].iter().all(|&b| b == b'0');
+
+        if is_exact_midpoint {
+            // Exact midpoint: round away from zero (SQLite semantics)
+            let scale = 10f64.powi(precision as i32);
+            let scaled = f * scale;
+            let rounded = if f < 0.0 {
+                (scaled - 0.5).ceil()
+            } else {
+                (scaled + 0.5).floor()
+            };
+            Value::from_f64(rounded / scale)
+        } else {
+            // Not a midpoint: standard formatting produces correct results
+            let f: f64 = crate::numeric::str_to_f64(format!("{f:.precision$}"))
+                .expect("formatted float should always parse successfully")
+                .into();
+
+            Value::from_f64(f)
+        }
     }
 
     fn _exec_trim(&self, pattern: Option<&Value>, trim_type: TrimType) -> Value {
