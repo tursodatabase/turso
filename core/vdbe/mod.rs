@@ -450,7 +450,7 @@ pub struct ProgramState {
     op_destroy_state: OpDestroyState,
     op_idx_delete_state: Option<OpIdxDeleteState>,
     op_integrity_check_state: OpIntegrityCheckState,
-    /// Metrics collected during statement execution
+    /// Metrics collected for the lifetime of this prepared statement.
     pub metrics: StatementMetrics,
     op_open_ephemeral_state: OpOpenEphemeralState,
     op_program_state: OpProgramState,
@@ -700,7 +700,6 @@ impl ProgramState {
         };
         self.op_idx_delete_state = None;
         self.op_integrity_check_state = OpIntegrityCheckState::Start;
-        self.metrics = StatementMetrics::new();
         self.op_open_ephemeral_state = OpOpenEphemeralState::Start;
         self.op_new_rowid_state = OpNewRowidState::Start;
         self.op_idx_insert_state = OpIdxInsertState::MaybeSeek;
@@ -742,6 +741,56 @@ impl ProgramState {
         self.pending_fail_error = None;
         self.pending_cdc_info = None;
         self.subprogram_stmt_cache.clear();
+    }
+
+    #[inline]
+    pub fn record_rows_read(&mut self, count: u64) {
+        self.metrics.rows_read = self.metrics.rows_read.saturating_add(count);
+    }
+
+    #[inline]
+    pub fn record_rows_written(&mut self, count: u64) {
+        self.metrics.rows_written = self.metrics.rows_written.saturating_add(count);
+    }
+
+    pub(crate) fn metrics(&self) -> StatementMetrics {
+        let mut metrics = self.metrics.clone();
+        if let OpProgramState::Step { statement, .. } = &self.op_program_state {
+            metrics.merge(&statement.metrics());
+        }
+        for statement in self.subprogram_stmt_cache.values() {
+            metrics.merge(&statement.metrics());
+        }
+        metrics
+    }
+
+    pub(crate) fn reset_metrics(&mut self) {
+        self.metrics.reset();
+        if let OpProgramState::Step { statement, .. } = &mut self.op_program_state {
+            statement.reset_metrics();
+        }
+        for statement in self.subprogram_stmt_cache.values_mut() {
+            statement.reset_metrics();
+        }
+    }
+
+    pub(crate) fn reset_stmt_status(&mut self, counter: crate::statement::StatementStatusCounter) {
+        match counter {
+            crate::statement::StatementStatusCounter::FullscanStep => {
+                self.metrics.fullscan_steps = 0
+            }
+            crate::statement::StatementStatusCounter::Sort => self.metrics.sort_operations = 0,
+            crate::statement::StatementStatusCounter::VmStep => self.metrics.insn_executed = 0,
+            crate::statement::StatementStatusCounter::Reprepare => self.metrics.reprepares = 0,
+            crate::statement::StatementStatusCounter::RowsRead => self.metrics.rows_read = 0,
+            crate::statement::StatementStatusCounter::RowsWritten => self.metrics.rows_written = 0,
+        }
+        if let OpProgramState::Step { statement, .. } = &mut self.op_program_state {
+            statement.reset_stmt_status(counter);
+        }
+        for statement in self.subprogram_stmt_cache.values_mut() {
+            statement.reset_stmt_status(counter);
+        }
     }
 
     pub fn get_cursor(&mut self, cursor_id: CursorID) -> &mut Cursor {

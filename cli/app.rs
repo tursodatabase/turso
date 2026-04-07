@@ -564,7 +564,7 @@ impl Limbo {
             // Capture metrics after stepping, before the Statement is dropped
             if capture_stats {
                 if let Ok(Some(ref stmt)) = output {
-                    last_stmt_metrics = Some(stmt.metrics().clone());
+                    last_stmt_metrics = Some(stmt.metrics());
                 }
             }
         }

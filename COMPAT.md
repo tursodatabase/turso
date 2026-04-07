@@ -486,7 +486,7 @@ Modifiers:
 | sqlite3_exec                | ✅ Yes     |         |
 | sqlite3_stmt_readonly       | ✅ Yes     |         |
 | sqlite3_stmt_busy           | ❌ No      | Stub    |
-| sqlite3_stmt_status         | ❌ No      |         |
+| sqlite3_stmt_status         | 🚧 Partial | Supports `FULLSCAN_STEP`, `SORT`, `VM_STEP`, `REPREPARE`, `LIBSQL_STMTSTATUS_ROWS_READ`, and `LIBSQL_STMTSTATUS_ROWS_WRITTEN`. Returns `0` for `AUTOINDEX`, `RUN`, `FILTER_MISS`, `FILTER_HIT`, and `MEMUSED`. |
 | sqlite3_sql                 | ❌ No      |         |
 | sqlite3_expanded_sql        | ❌ No      | Stub    |
 | sqlite3_normalized_sql      | ❌ No      |         |

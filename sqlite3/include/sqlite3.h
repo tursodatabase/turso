@@ -115,6 +115,22 @@ int sqlite3_stmt_readonly(sqlite3_stmt *_stmt);
 
 int sqlite3_stmt_busy(sqlite3_stmt *_stmt);
 
+int sqlite3_stmt_status(sqlite3_stmt *stmt, int op, int resetFlg);
+
+#define SQLITE_STMTSTATUS_FULLSCAN_STEP 1
+#define SQLITE_STMTSTATUS_SORT 2
+#define SQLITE_STMTSTATUS_AUTOINDEX 3
+#define SQLITE_STMTSTATUS_VM_STEP 4
+#define SQLITE_STMTSTATUS_REPREPARE 5
+#define SQLITE_STMTSTATUS_RUN 6
+#define SQLITE_STMTSTATUS_FILTER_MISS 7
+#define SQLITE_STMTSTATUS_FILTER_HIT 8
+#define SQLITE_STMTSTATUS_MEMUSED 99
+
+#define LIBSQL_STMTSTATUS_BASE 1024
+#define LIBSQL_STMTSTATUS_ROWS_READ (LIBSQL_STMTSTATUS_BASE + 1)
+#define LIBSQL_STMTSTATUS_ROWS_WRITTEN (LIBSQL_STMTSTATUS_BASE + 2)
+
 sqlite3_stmt *sqlite3_next_stmt(sqlite3 *db, sqlite3_stmt *stmt);
 
 int sqlite3_serialize(sqlite3 *_db, const char *_schema, void **_out, int *_out_bytes, unsigned int _flags);
