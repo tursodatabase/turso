@@ -7917,12 +7917,14 @@ pub fn op_function(
 
                                 if normalized_tbl_name == table {
                                     // This is the table being altered - update its column
-                                    let column = columns
-                                        .iter_mut()
-                                        .find(|column| {
-                                            normalize_ident(column.col_name.as_str()) == rename_from
-                                        })
-                                        .expect("column being renamed should be present");
+                                    let Some(column) = columns.iter_mut().find(|column| {
+                                        normalize_ident(column.col_name.as_str()) == rename_from
+                                    }) else {
+                                        // MVCC/temp-schema rewrite can reach an already-updated
+                                        // CREATE TABLE SQL image for the target table. Treat that
+                                        // as idempotent and keep the existing SQL text.
+                                        break 'sql None;
+                                    };
 
                                     match alter_func {
                                         AlterTableFunc::AlterColumn => *column = column_def.clone(),
