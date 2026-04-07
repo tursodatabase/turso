@@ -2144,7 +2144,8 @@ fn emit_update_insns<'a>(
             // Insert instruction to update the cell. We need to first delete the current cell
             // and later insert the updated record.
             // In MVCC mode, we also need DELETE+INSERT to properly version the row (Hekaton model).
-            let needs_delete = not_exists_check_required || connection.mvcc_enabled();
+            let needs_delete = not_exists_check_required
+                || connection.mv_store_for_db(update_database_id).is_some();
             if needs_delete {
                 program.emit_insn(Insn::Delete {
                     cursor_id: target_table_cursor_id,

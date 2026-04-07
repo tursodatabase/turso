@@ -71,6 +71,10 @@ fn schema_table_name_for_db(resolver: &Resolver, database_id: usize) -> String {
     }
 }
 
+fn database_uses_mvcc(connection: &Arc<crate::Connection>, database_id: usize) -> bool {
+    connection.mv_store_for_db(database_id).is_some()
+}
+
 fn collect_triggers_for_alter_target(
     resolver: &Resolver,
     target_database_id: usize,
@@ -219,7 +223,7 @@ fn emit_rename_sqlite_sequence_entry(
 
         // In MVCC mode, we need to delete before insert to properly
         // end the old version (Hekaton-style UPDATE = DELETE + INSERT)
-        if connection.mvcc_enabled() {
+        if database_uses_mvcc(connection, database_id) {
             program.emit_insn(Insn::Delete {
                 cursor_id: seq_cursor_id,
                 table_name: crate::schema::SQLITE_SEQUENCE_TABLE_NAME.to_string(),
@@ -1419,7 +1423,7 @@ pub fn translate_alter_table(
 
                 // In MVCC mode, we need to delete before insert to properly
                 // end the old version (Hekaton-style UPDATE = DELETE + INSERT)
-                if connection.mvcc_enabled() {
+                if database_uses_mvcc(connection, database_id) {
                     program.emit_insn(Insn::Delete {
                         cursor_id,
                         table_name: SQLITE_TABLEID.to_string(),
@@ -1789,7 +1793,7 @@ pub fn translate_alter_table(
 
                 // In MVCC mode, we need to delete before insert to properly
                 // end the old version (Hekaton-style UPDATE = DELETE + INSERT)
-                if connection.mvcc_enabled() {
+                if database_uses_mvcc(connection, database_id) {
                     program.emit_insn(Insn::Delete {
                         cursor_id,
                         table_name: SQLITE_TABLEID.to_string(),
@@ -1990,7 +1994,7 @@ fn emit_rewrite_table_rows(
             affinity_str: Some(affinity_str.clone()),
         });
 
-        if connection.mvcc_enabled() {
+        if database_uses_mvcc(connection, database_id) {
             program.emit_insn(Insn::Delete {
                 cursor_id,
                 table_name: table_name.clone(),
@@ -2091,7 +2095,7 @@ fn translate_rename_virtual_table(
 
         // In MVCC mode, we need to delete before insert to properly
         // end the old version (Hekaton-style UPDATE = DELETE + INSERT)
-        if connection.mvcc_enabled() {
+        if database_uses_mvcc(connection, database_id) {
             program.emit_insn(Insn::Delete {
                 cursor_id: schema_cur,
                 table_name: SQLITE_TABLEID.to_string(),
