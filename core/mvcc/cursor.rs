@@ -1399,14 +1399,23 @@ impl<Clock: LogicalClock + 'static> CursorTrait for MvccLazyCursor<Clock> {
     }
 
     fn delete(&mut self) -> Result<IOResult<()>> {
-        let rowid = match self.get_current_pos() {
-            CursorPosition::Loaded { row_id, .. } => row_id,
+        let (rowid, in_btree) = match self.get_current_pos() {
+            CursorPosition::Loaded { row_id, in_btree } => (row_id, in_btree),
             _ => panic!("Cannot delete: no current row"),
         };
         let maybe_index_id = match &self.mv_cursor_type {
             MvccCursorType::Index(_) => Some(self.table_id),
             MvccCursorType::Table => None,
         };
+        // If the cursor is positioned at a btree-resident row, the VDBE may never
+        // have materialized the row's record (e.g. UPDATE through a DeferredSeek
+        // never calls Column on the table cursor). Pre-fetch it here so the
+        // later synchronous fetch used to build a tombstone doesn't have to
+        // yield IO from inside this function, which is not IO-reentrant w.r.t.
+        // `delete_from_table_or_index`'s side effects.
+        if in_btree {
+            return_if_io!(self.record());
+        }
         let was_deleted =
             self.db
                 .delete_from_table_or_index(self.tx_id, rowid.clone(), maybe_index_id)?;
@@ -1415,7 +1424,7 @@ impl<Clock: LogicalClock + 'static> CursorTrait for MvccLazyCursor<Clock> {
         // based on the btree row.
         if !was_deleted {
             // The btree cursor must be correctly positioned and cannot cause IO to happen
-            // because in order to get here, we must have read it already in the VDBE.
+            // because we pre-fetched the record above when `in_btree` was true.
             let IOResult::Done(Some(record)) = self.record()? else {
                 crate::bail_corrupt_error!(
                     "Btree cursor should have a record when deleting a row that only exists in the btree"
