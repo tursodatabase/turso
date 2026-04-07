@@ -1,0 +1,57 @@
+@database :memory:
+
+test log10-1000-integer-cast {
+    SELECT CAST(log10(1000) AS INTEGER)
+}
+expect {
+    3
+}
+
+test log10-1000-float {
+    SELECT log10(1000.0)
+}
+expect {
+    3.0
+}
+
+test log10-100 {
+    SELECT log10(100.0)
+}
+expect {
+    2.0
+}
+
+test log10-10 {
+    SELECT log10(10.0)
+}
+expect {
+    1.0
+}
+
+test log10-1000000-integer-cast {
+    SELECT CAST(log10(1000000) AS INTEGER)
+}
+expect {
+    6
+}
+
+test log2-1024-integer-cast {
+    SELECT CAST(log2(1024) AS INTEGER)
+}
+expect {
+    10
+}
+
+test log2-8 {
+    SELECT log2(8.0)
+}
+expect {
+    3.0
+}
+
+test log2-256-integer-cast {
+    SELECT CAST(log2(256) AS INTEGER)
+}
+expect {
+    8
+}

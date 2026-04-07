@@ -18,10 +18,10 @@ mod cmath {
         x.ln()
     }
     pub fn log10(x: f64) -> f64 {
-        x.log(10.)
+        x.log10()
     }
     pub fn log2(x: f64) -> f64 {
-        x.log(2.)
+        x.log2()
     }
     pub fn pow(x: f64, y: f64) -> f64 {
         x.powf(y)
