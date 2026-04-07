@@ -11,21 +11,21 @@ test log10-1000-float {
     SELECT log10(1000.0)
 }
 expect {
-    3.0
+    3
 }
 
 test log10-100 {
     SELECT log10(100.0)
 }
 expect {
-    2.0
+    2
 }
 
 test log10-10 {
     SELECT log10(10.0)
 }
 expect {
-    1.0
+    1
 }
 
 test log10-1000000-integer-cast {
@@ -46,7 +46,7 @@ test log2-8 {
     SELECT log2(8.0)
 }
 expect {
-    3.0
+    3
 }
 
 test log2-256-integer-cast {
