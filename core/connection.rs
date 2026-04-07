@@ -2243,6 +2243,13 @@ impl Connection {
         let main_path = Self::get_canonical_path_for_database(&self.db);
         databases.push((MAIN_DB_ID, "main".to_string(), main_path));
 
+        // SQLite only exposes the temp schema in database_list after it has
+        // been initialized, and reports an empty path rather than the backing
+        // temp filename.
+        if self.temp_database.read().is_some() {
+            databases.push((crate::TEMP_DB_ID, "temp".to_string(), String::new()));
+        }
+
         // Add attached databases
         let attached_dbs = self.attached_databases.read();
         for (alias, &seq_number) in attached_dbs.name_to_index.iter() {
@@ -2900,6 +2907,24 @@ mod tests {
         assert!(
             err.contains("no such table"),
             "expected no such table error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_reprepare_after_temp_store_reset_does_not_panic() {
+        let temp_dir = TempDir::new().unwrap();
+        let db_path = temp_dir.path().join("main.db");
+        let conn = open_connection(&db_path);
+
+        conn.execute("CREATE TEMP TABLE t(x INTEGER)").unwrap();
+        let mut stmt = conn.prepare("SELECT x FROM t").unwrap();
+
+        conn.execute("PRAGMA temp_store = MEMORY").unwrap();
+
+        let err = stmt.step().unwrap_err().to_string();
+        assert!(
+            err.contains("no such table"),
+            "expected no such table after temp reset, got: {err}"
         );
     }
 }

@@ -506,10 +506,13 @@ impl Statement {
             .copied()
             .collect();
         for db_id in attached_db_ids {
-            let pager = conn.get_pager_from_database_index(&db_id);
             // Discard any connection-local schema changes for this attached DB
             // so the re-translate reads the committed schema.
             conn.database_schemas().write().remove(&db_id);
+            if db_id == crate::TEMP_DB_ID && conn.temp_database.read().is_none() {
+                continue;
+            }
+            let pager = conn.get_pager_from_database_index(&db_id);
             if pager.holds_read_lock() {
                 pager.rollback_attached();
             }
