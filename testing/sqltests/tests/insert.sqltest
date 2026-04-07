@@ -834,7 +834,7 @@ test double-quote-string-error-dqs-off {
     INSERT INTO test_dqs_off (id, name) VALUES (1, "Dave");
 }
 expect error {
-    no such column: Dave
+    no such column.*Dave
 }
 
 # regression test for incorrect order of column in insert

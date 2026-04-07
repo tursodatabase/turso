@@ -104,7 +104,7 @@ pub fn translate(
         connection.attached_databases(),
         syms,
         connection.experimental_custom_types_enabled(),
-        connection.get_dqs_dml(),
+        connection.get_dqs_dml().into(),
     );
 
     match stmt {

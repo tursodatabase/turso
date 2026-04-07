@@ -6,7 +6,7 @@ use crate::numeric::Numeric;
 use crate::schema::Schema;
 use crate::storage::pager::Pager;
 use crate::sync::Arc;
-use crate::translate::emitter::Resolver;
+use crate::translate::emitter::{DoubleQuotedDml, Resolver};
 use crate::translate::expr::translate_expr;
 use crate::types::Text;
 use crate::vdbe::builder::{ProgramBuilder, ProgramBuilderOpts};
@@ -334,7 +334,7 @@ impl CompiledExpression {
             &attached_databases,
             syms,
             true,
-            true,
+            DoubleQuotedDml::Enabled,
         );
 
         // Translate the transformed expression to bytecode

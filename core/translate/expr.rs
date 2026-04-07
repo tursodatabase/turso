@@ -2954,7 +2954,7 @@ pub fn translate_expr(
                 });
                 return Ok(target_register);
             }
-            if !resolver.dqs_dml {
+            if !resolver.dqs_dml.is_enabled() {
                 crate::bail_parse_error!("no such column: {}", id.as_str());
             }
             // DQS enabled: treat double-quoted identifiers as string literals (SQLite compatibility)
@@ -5719,7 +5719,7 @@ pub fn bind_and_rewrite_expr<'a>(
 
                     // SQLite DQS misfeature: double-quoted identifiers fall back to string literals
                     // only when DQS is enabled for DML statements
-                    if id.quoted_with('"') && resolver.dqs_dml {
+                    if id.quoted_with('"') && resolver.dqs_dml.is_enabled() {
                         *expr = Expr::Literal(ast::Literal::String(id.as_literal()));
                         return Ok(WalkControl::Continue);
                     } else {

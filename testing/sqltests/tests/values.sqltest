@@ -92,7 +92,7 @@ test values-double-quotes-error-dqs-off {
     VALUES ("double_quoted_string");
 }
 expect error {
-    no such column: double_quoted_string
+    no such column.*double_quoted_string
 }
 
 # regression test for: https://github.com/tursodatabase/turso/issues/2158

@@ -887,14 +887,14 @@ impl Limbo {
                     }
                     (Some("dqs_dml"), None) => {
                         let val = if self.conn.get_dqs_dml() { "on" } else { "off" };
-                        let _ = self.writeln(&format!("dqs_dml {}", val));
+                        let _ = self.writeln(format!("dqs_dml {val}"));
                     }
                     (Some(name), _) => {
-                        let _ = self.writeln(&format!("unknown dbconfig: {}", name));
+                        let _ = self.writeln(format!("unknown dbconfig: {name}"));
                     }
                     (None, _) => {
                         let dqs = if self.conn.get_dqs_dml() { "on" } else { "off" };
-                        let _ = self.writeln(&format!("dqs_dml {}", dqs));
+                        let _ = self.writeln(format!("dqs_dml {dqs}"));
                     }
                 },
                 Command::ListVfs => {

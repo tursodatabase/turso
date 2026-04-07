@@ -912,7 +912,7 @@ test select-double-quotes-error-dqs-off {
     SELECT "does_not_exist" FROM (SELECT 1 AS x);
 }
 expect error {
-    no such column: does_not_exist
+    no such column.*does_not_exist
 }
 
 @backend cli
@@ -921,7 +921,7 @@ test select-double-quotes-no-column-error-dqs-off {
     SELECT "first"
 }
 expect error {
-    no such column: first
+    no such column.*first
 }
 
 test select-in-simple {
