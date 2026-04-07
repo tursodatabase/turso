@@ -2513,19 +2513,11 @@ impl<'a> ValueIteratorExt for crate::types::ValueIterator<'a> {
                 }
                 self.set_data_section(&data[content_size..]);
                 let text_data = &data[..content_size];
-                // SAFETY: TEXT serial type contains valid UTF-8
-                let text_str = if cfg!(debug_assertions) {
-                    match std::str::from_utf8(text_data) {
+                let text_str =
+                    match crate::storage::sqlite3_ondisk::decode_text_serial_type(text_data) {
                         Ok(s) => s,
-                        Err(e) => {
-                            return Some(Err(LimboError::InternalError(format!(
-                                "Invalid UTF-8 in TEXT serial type: {e}"
-                            ))));
-                        }
-                    }
-                } else {
-                    unsafe { std::str::from_utf8_unchecked(text_data) }
-                };
+                        Err(e) => return Some(Err(e)),
+                    };
                 match dest {
                     Register::Value(Value::Text(existing_text)) => {
                         existing_text.do_extend(&text_str);
@@ -2544,6 +2536,29 @@ impl<'a> ValueIteratorExt for crate::types::ValueIterator<'a> {
         }
 
         Some(Ok(()))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Register, ValueIteratorExt};
+    use crate::{
+        error::LimboError,
+        types::{Value, ValueIterator},
+    };
+
+    #[test]
+    fn test_nth_into_register_rejects_invalid_utf8_text() {
+        let payload = [2, 15, 0xFF];
+        let mut iter = ValueIterator::new(&payload).unwrap();
+        let mut dest = Register::Value(Value::Null);
+
+        let result = iter.nth_into_register(0, &mut dest);
+
+        assert!(
+            matches!(result, Some(Err(LimboError::Corrupt(ref msg))) if msg.contains("Invalid UTF-8 in TEXT serial type")),
+            "expected invalid UTF-8 TEXT error, got {result:?}"
+        );
     }
 }
 

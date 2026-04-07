@@ -957,6 +957,12 @@ pub fn validate_serial_type(value: u64) -> Result<()> {
     Ok(())
 }
 
+#[inline(always)]
+pub(crate) fn decode_text_serial_type(data: &[u8]) -> Result<&str> {
+    std::str::from_utf8(data)
+        .map_err(|e| LimboError::Corrupt(format!("Invalid UTF-8 in TEXT serial type: {e}")))
+}
+
 /// Reads a value that might reference the buffer it is reading from. Be sure to store RefValue with the buffer
 /// always.
 #[inline(always)]
@@ -1078,8 +1084,7 @@ pub fn read_value<'a>(buf: &'a [u8], serial_type: SerialType) -> Result<(ValueRe
                     content_size
                 ))
             })?;
-            // SAFETY: SerialTypeKind is Text so this buffer is a valid string
-            let val = unsafe { std::str::from_utf8_unchecked(data) };
+            let val = decode_text_serial_type(data)?;
             Ok((
                 ValueRef::Text(TextRef::new(val, TextSubtype::Text)),
                 content_size,
@@ -1206,8 +1211,7 @@ pub fn read_value_serial_type<'a>(
                         content_size
                     ))
                 })?;
-                // SAFETY: SerialTypeKind is Text so this buffer is a valid string
-                let val = unsafe { std::str::from_utf8_unchecked(data) };
+                let val = decode_text_serial_type(data)?;
                 Ok((
                     ValueRef::Text(TextRef::new(val, TextSubtype::Text)),
                     content_size,
@@ -2077,6 +2081,24 @@ mod tests {
     ) {
         let result = read_value(buf, serial_type).unwrap();
         assert_eq!(result.0.to_owned(), expected);
+    }
+
+    #[test]
+    fn test_read_value_rejects_invalid_utf8_text() {
+        let result = read_value(&[0xFF], SerialType::text(1));
+        assert!(
+            matches!(result, Err(LimboError::Corrupt(ref msg)) if msg.contains("Invalid UTF-8 in TEXT serial type")),
+            "expected invalid UTF-8 TEXT error, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_read_value_serial_type_rejects_invalid_utf8_text() {
+        let result = read_value_serial_type(&[0xFF], 15);
+        assert!(
+            matches!(result, Err(LimboError::Corrupt(ref msg)) if msg.contains("Invalid UTF-8 in TEXT serial type")),
+            "expected invalid UTF-8 TEXT error, got {result:?}"
+        );
     }
 
     #[test]
