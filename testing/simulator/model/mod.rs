@@ -610,6 +610,7 @@ impl Shadow for Insert {
                 table,
                 values,
                 on_conflict,
+                conflict_clause: _, // Conflict clause handled by DB engine — shadow uses on_conflict only
             } => {
                 let table_name = table.clone();
 

@@ -6,6 +6,28 @@ use crate::model::table::SimValue;
 
 use super::select::Select;
 
+/// SQL conflict resolution clause: INSERT OR {REPLACE|IGNORE|FAIL|ABORT|ROLLBACK}
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub enum ConflictClause {
+    Replace,
+    Ignore,
+    Fail,
+    Abort,
+    Rollback,
+}
+
+impl Display for ConflictClause {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ConflictClause::Replace => write!(f, "OR REPLACE"),
+            ConflictClause::Ignore => write!(f, "OR IGNORE"),
+            ConflictClause::Fail => write!(f, "OR FAIL"),
+            ConflictClause::Abort => write!(f, "OR ABORT"),
+            ConflictClause::Rollback => write!(f, "OR ROLLBACK"),
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct OnConflict {
     pub target_column: String,
@@ -25,6 +47,8 @@ pub enum Insert {
         values: Vec<Vec<SimValue>>,
         #[serde(default)]
         on_conflict: Option<OnConflict>,
+        #[serde(default)]
+        conflict_clause: Option<ConflictClause>,
     },
     Select {
         table: String,
@@ -54,8 +78,13 @@ impl Display for Insert {
                 table,
                 values,
                 on_conflict,
+                conflict_clause,
             } => {
-                write!(f, "INSERT INTO {table} VALUES ")?;
+                write!(f, "INSERT ")?;
+                if let Some(clause) = conflict_clause {
+                    write!(f, "{clause} ")?;
+                }
+                write!(f, "INTO {table} VALUES ")?;
                 for (i, row) in values.iter().enumerate() {
                     if i != 0 {
                         write!(f, ", ")?;

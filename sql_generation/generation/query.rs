@@ -12,6 +12,7 @@ use crate::model::query::update::{SetValue, Update};
 use crate::model::query::{
     Create, CreateIndex, Delete, Drop, DropIndex, Insert, OnConflict, Select, UpdateSetItem,
 };
+use crate::model::query::insert::ConflictClause;
 use crate::model::table::{
     Column, ColumnType, Index, JoinType, JoinedTable, Name, SimValue, Table, TableContext,
 };
@@ -311,6 +312,8 @@ impl Arbitrary for Insert {
             })
         };
 
+        let gen_conflict_clause = |rng: &mut R| gen_insert_with_conflict_clause(rng, env, insert_opts);
+
         let mut choices = vec![
             (
                 1,
@@ -323,6 +326,10 @@ impl Arbitrary for Insert {
             (
                 1,
                 Box::new(gen_nested_self_insert) as Box<dyn Fn(&mut R) -> Option<Insert>>,
+            ),
+            (
+                2,
+                Box::new(gen_conflict_clause) as Box<dyn Fn(&mut R) -> Option<Insert>>,
             ),
         ];
 
@@ -379,6 +386,7 @@ fn gen_insert_values<R: Rng + ?Sized, C: GenerationContext>(
         table: table.name.clone(),
         values,
         on_conflict: None,
+        conflict_clause: None,
     })
 }
 
@@ -550,6 +558,121 @@ fn gen_insert_upsert_values<R: Rng + ?Sized, C: GenerationContext>(
             target_column: target_col.name.clone(),
             assignments,
         }),
+        conflict_clause: None,
+    })
+}
+
+/// Generate an INSERT with a conflict clause (OR REPLACE|IGNORE|FAIL|ABORT|ROLLBACK).
+///
+/// Picks a table that has at least one unique/PK column and existing rows,
+/// then generates 1-3 rows where the second row deliberately conflicts with
+/// an existing row on the chosen unique column.  This maximises the chance of
+/// exercising the conflict-resolution path under differential testing.
+fn gen_insert_with_conflict_clause<R: Rng + ?Sized, C: GenerationContext>(
+    rng: &mut R,
+    env: &C,
+    _insert_opts: &InsertOpts,
+) -> Option<Insert> {
+    const UNIQUE_BASE_OFFSET_RANGE: std::ops::Range<i64> = 3_000_000_000..4_000_000_000;
+    const UNIQUE_COL_STRIDE: i64 = 10_000_000;
+
+    // Need a table with unique/PK columns and at least one existing row to
+    // create a deliberate conflict.
+    let candidates: Vec<_> = env
+        .tables()
+        .iter()
+        .filter(|t| !t.rows.is_empty() && t.has_any_unique_column())
+        .collect();
+    let table = *candidates.choose(rng)?;
+
+    // Pick the conflict clause.
+    // NOTE: Replace temporarily excluded — crashes on attached DBs (#6269).
+    // NOTE: Rollback temporarily excluded — auto-rollback breaks the simulator's
+    //       property tests that wrap inserts in BEGIN/COMMIT.
+    let clause = match rng.random_range(0u8..3) {
+        0 => ConflictClause::Ignore,
+        1 => ConflictClause::Fail,
+        _ => ConflictClause::Abort,
+    };
+
+    // Find unique/PK column indices to force conflicts on.
+    let unique_col_indices: Vec<usize> = table
+        .columns
+        .iter()
+        .enumerate()
+        .filter(|(_, c)| c.has_unique_or_pk())
+        .map(|(i, _)| i)
+        .collect();
+
+    // Pick one unique column to be the conflict target.
+    let &conflict_col_idx = unique_col_indices.choose(rng)?;
+
+    // Pick an existing row whose conflict-column value is non-null.
+    let existing_rows: Vec<_> = table
+        .rows
+        .iter()
+        .filter(|r| {
+            r.get(conflict_col_idx)
+                .is_some_and(|v| v.0 != turso_core::Value::Null)
+        })
+        .collect();
+    let conflict_row = *existing_rows.choose(rng)?;
+
+    let integer_pk_idx = table
+        .columns
+        .iter()
+        .position(|c| matches!(c.column_type, ColumnType::Integer) && c.is_primary_key());
+
+    let base_offset: i64 = rng.random_range(UNIQUE_BASE_OFFSET_RANGE);
+
+    // Generate 1-3 rows.  Row 0 is clean; subsequent rows may conflict.
+    let num_rows = rng.random_range(1..=3usize);
+    let values: Vec<Vec<SimValue>> = (0..num_rows)
+        .map(|row_idx| {
+            let mut row: Vec<SimValue> = table
+                .columns
+                .iter()
+                .enumerate()
+                .map(|(col_idx, c)| {
+                    if c.has_unique_or_pk() {
+                        // Fresh unique value per row.
+                        let offset = base_offset
+                            + (col_idx as i64 * UNIQUE_COL_STRIDE)
+                            + row_idx as i64;
+                        SimValue::unique_for_type(&c.column_type, offset)
+                    } else {
+                        SimValue::arbitrary_from(rng, env, &c.column_type)
+                    }
+                })
+                .collect();
+
+            // Force the second row (index 1) to conflict on the chosen column
+            // by copying the value from an existing row.
+            if row_idx == 1 {
+                row[conflict_col_idx] = conflict_row[conflict_col_idx].clone();
+
+                // If the conflict column is NOT the INTEGER PK, make sure the
+                // PK is fresh so the only conflict is on the unique column.
+                if let Some(pk_idx) = integer_pk_idx {
+                    if pk_idx != conflict_col_idx {
+                        let pk_offset = base_offset + (pk_idx as i64 * UNIQUE_COL_STRIDE) + 9999;
+                        row[pk_idx] = SimValue::unique_for_type(
+                            &table.columns[pk_idx].column_type,
+                            pk_offset,
+                        );
+                    }
+                }
+            }
+
+            row
+        })
+        .collect();
+
+    Some(Insert::Values {
+        table: table.name.clone(),
+        values,
+        on_conflict: None,
+        conflict_clause: Some(clause),
     })
 }
 

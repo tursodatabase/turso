@@ -468,6 +468,7 @@ impl Property {
                     table,
                     values,
                     on_conflict: None,
+                    conflict_clause: None,
                 } = insert
                 {
                     (table, values)
@@ -1308,6 +1309,7 @@ fn property_insert_values_select<R: rand::Rng + ?Sized>(
         table: table.name.clone(),
         values: rows,
         on_conflict: None,
+        conflict_clause: None,
     });
 
     // Choose if we want queries to be executed in an interactive transaction
