@@ -617,7 +617,6 @@ fn push_warning_comments(executed_sql: &mut Vec<String>, stmt_idx: usize, reason
 #[cfg(test)]
 mod tests {
     use super::*;
-
     #[test]
     fn test_sim_config_default() {
         let config = SimConfig::default();

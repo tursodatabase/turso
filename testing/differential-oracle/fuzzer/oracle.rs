@@ -7,6 +7,7 @@
 use std::sync::Arc;
 use std::{
     collections::hash_map::DefaultHasher,
+    env,
     hash::{Hash, Hasher},
 };
 
@@ -309,8 +310,53 @@ pub fn check_differential(
     let turso_result = DifferentialOracle::execute_turso(turso_conn, &stmt.sql);
     let sqlite_result = DifferentialOracle::execute_sqlite(sqlite_conn, &stmt.sql);
 
+    maybe_log_schema_debug(turso_conn, sqlite_conn, stmt, &turso_result, &sqlite_result);
+
     let oracle = DifferentialOracle;
     oracle.check(stmt, &turso_result, &sqlite_result)
+}
+
+fn maybe_log_schema_debug(
+    turso_conn: &Arc<turso_core::Connection>,
+    sqlite_conn: &rusqlite::Connection,
+    stmt: &GeneratedStatement,
+    turso_result: &QueryResult,
+    sqlite_result: &QueryResult,
+) {
+    if env::var_os("DIFF_FUZZER_DEBUG_TEMP_SCHEMA").is_none() {
+        return;
+    }
+
+    if !matches!(sqlite_result, QueryResult::Error(_))
+        || matches!(turso_result, QueryResult::Error(_))
+    {
+        return;
+    }
+
+    if !stmt.sql.contains("tbl_helpful_glaremin") {
+        return;
+    }
+
+    let debug_sql = "SELECT type, name, tbl_name, sql FROM temp.sqlite_schema WHERE sql LIKE '%tbl_outstanding_davidneel%' OR tbl_name = 'tbl_helpful_glaremin' ORDER BY type, name";
+    let main_debug_sql = "SELECT type, name, tbl_name, sql FROM main.sqlite_schema WHERE name = 'tbl_outstanding_davidneel'";
+
+    tracing::error!("Debug schema dump triggered for SQL: {}", stmt.sql);
+    tracing::error!(
+        "SQLite temp schema snapshot: {:?}",
+        DifferentialOracle::execute_sqlite(sqlite_conn, debug_sql)
+    );
+    tracing::error!(
+        "Turso temp schema snapshot: {:?}",
+        DifferentialOracle::execute_turso(turso_conn, debug_sql)
+    );
+    tracing::error!(
+        "SQLite main schema snapshot: {:?}",
+        DifferentialOracle::execute_sqlite(sqlite_conn, main_debug_sql)
+    );
+    tracing::error!(
+        "Turso main schema snapshot: {:?}",
+        DifferentialOracle::execute_turso(turso_conn, main_debug_sql)
+    );
 }
 
 #[cfg(test)]
