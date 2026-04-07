@@ -1,3 +1,4 @@
+use crate::function::AggFunc;
 use crate::translate::plan::SimpleAggregate;
 use crate::translate::{
     aggregation::emit_collseq_if_needed,
@@ -263,6 +264,7 @@ fn emit_loop_source<'a>(
                     delimiter: 0,
                     func: min_max.func.clone(),
                     comparator,
+                    flag_reg: None,
                 });
                 program.emit_insn(Insn::Goto {
                     target_pc: loop_end,
@@ -278,14 +280,45 @@ fn emit_loop_source<'a>(
             // a more complex expression. Some examples: length(sum(x)), sum(x) + avg(y), sum(x) + 1, etc.
             // The result of those more complex expressions depends on the final result of the aggregate, so we don't translate the complete expressions here.
             // Instead, we accumulate the intermediate results of all aggreagates, and evaluate any expressions that do not contain aggregates.
+            // Determine if exactly one MIN/MAX aggregate is present alongside
+            // bare (non-aggregate) columns.  When true the once-flag register is
+            // passed to AggStep so the VDBE resets it whenever the extremum is
+            // updated, causing bare columns to be re-read from the winning row
+            // instead of being frozen to the first row scanned.
+            let sole_minmax_index: Option<usize> =
+                if t_ctx.reg_nonagg_emit_once_flag.is_some() {
+                    let minmax_positions: Vec<usize> = plan
+                        .aggregates
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, a)| {
+                            matches!(a.func, AggFunc::Min | AggFunc::Max)
+                        })
+                        .map(|(i, _)| i)
+                        .collect();
+                    if minmax_positions.len() == 1 {
+                        Some(minmax_positions[0])
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
+
             for (i, agg) in plan.aggregates.iter().enumerate() {
                 let reg = start_reg + i;
+                let agg_flag = if sole_minmax_index == Some(i) {
+                    t_ctx.reg_nonagg_emit_once_flag
+                } else {
+                    None
+                };
                 translate_aggregation_step(
                     program,
                     &plan.table_references,
                     AggArgumentSource::new_from_expression(&agg.func, &agg.args, &agg.distinctness),
                     reg,
                     &t_ctx.resolver,
+                    agg_flag,
                 )?;
                 if let Distinctness::Distinct { ctx } = &agg.distinctness {
                     let ctx = ctx

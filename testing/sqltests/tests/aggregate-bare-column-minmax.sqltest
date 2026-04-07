@@ -1,0 +1,168 @@
+@database :memory:
+
+# Regression tests: bare columns in ungrouped MIN/MAX aggregate queries must
+# return values from the row that produced the extremum, not from the first row
+# scanned.
+#
+# SQLite semantics: when a query contains MIN() or MAX() alongside bare
+# (non-aggregate) columns, those bare columns come from the row where the
+# min/max value was found. Previously Limbo read bare columns once on the first
+# row and never re-read them when MIN/MAX was updated.
+
+setup basic {
+    CREATE TABLE t1(a INTEGER, b TEXT);
+    INSERT INTO t1 VALUES(1, 'first');
+    INSERT INTO t1 VALUES(3, 'third');
+    INSERT INTO t1 VALUES(2, 'second');
+}
+
+@setup basic
+test max-bare-col-returns-max-row {
+    SELECT MAX(a), b FROM t1;
+}
+expect {
+    3|third
+}
+
+@setup basic
+test min-bare-col-returns-min-row {
+    SELECT MIN(a), b FROM t1;
+}
+expect {
+    1|first
+}
+
+# Max value is in the last inserted row
+setup reverse-order {
+    CREATE TABLE t2(x REAL, y TEXT, z INTEGER);
+    INSERT INTO t2 VALUES(5.0, 'five', 50);
+    INSERT INTO t2 VALUES(1.0, 'one', 10);
+    INSERT INTO t2 VALUES(9.0, 'nine', 90);
+    INSERT INTO t2 VALUES(3.0, 'three', 30);
+}
+
+@setup reverse-order
+test max-multiple-bare-cols {
+    SELECT MAX(x), y, z FROM t2;
+}
+expect {
+    9.0|nine|90
+}
+
+@setup reverse-order
+test min-multiple-bare-cols {
+    SELECT MIN(x), y, z FROM t2;
+}
+expect {
+    1.0|one|10
+}
+
+# Bare columns with text comparison
+setup text-minmax {
+    CREATE TABLE t3(name TEXT, score INTEGER);
+    INSERT INTO t3 VALUES('alice', 80);
+    INSERT INTO t3 VALUES('bob', 95);
+    INSERT INTO t3 VALUES('carol', 70);
+    INSERT INTO t3 VALUES('dave', 95);
+}
+
+@setup text-minmax
+test max-score-bare-name {
+    SELECT MAX(score), name FROM t3;
+}
+expect {
+    95|bob
+}
+
+@setup text-minmax
+test min-score-bare-name {
+    SELECT MIN(score), name FROM t3;
+}
+expect {
+    70|carol
+}
+
+# Min on text column, bare integer column
+@setup text-minmax
+test min-name-bare-score {
+    SELECT MIN(name), score FROM t3;
+}
+expect {
+    alice|80
+}
+
+@setup text-minmax
+test max-name-bare-score {
+    SELECT MAX(name), score FROM t3;
+}
+expect {
+    dave|95
+}
+
+# Single row table — bare column must still work
+setup single {
+    CREATE TABLE t4(a INTEGER, b TEXT);
+    INSERT INTO t4 VALUES(42, 'only');
+}
+
+@setup single
+test max-single-row {
+    SELECT MAX(a), b FROM t4;
+}
+expect {
+    42|only
+}
+
+@setup single
+test min-single-row {
+    SELECT MIN(a), b FROM t4;
+}
+expect {
+    42|only
+}
+
+# Empty table — bare column returns NULL (existing behavior, regression guard)
+setup empty {
+    CREATE TABLE t5(a INTEGER, b TEXT);
+}
+
+@setup empty
+test max-empty-table {
+    SELECT MAX(a), b FROM t5;
+}
+expect {
+    |
+}
+
+@setup empty
+test min-empty-table {
+    SELECT MIN(a), b FROM t5;
+}
+expect {
+    |
+}
+
+# NULL handling: NULLs should be skipped by MIN/MAX
+setup with-nulls {
+    CREATE TABLE t6(a INTEGER, b TEXT);
+    INSERT INTO t6 VALUES(NULL, 'null-row');
+    INSERT INTO t6 VALUES(5, 'five');
+    INSERT INTO t6 VALUES(NULL, 'another-null');
+    INSERT INTO t6 VALUES(2, 'two');
+}
+
+@setup with-nulls
+test max-skips-nulls-bare-col {
+    SELECT MAX(a), b FROM t6;
+}
+expect {
+    5|five
+}
+
+@setup with-nulls
+test min-skips-nulls-bare-col {
+    SELECT MIN(a), b FROM t6;
+}
+expect {
+    2|two
+}

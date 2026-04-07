@@ -5080,6 +5080,10 @@ fn init_agg_payload(func: &AggFunc, payload: &mut Vec<Value>) -> Result<()> {
 /// - **Min/Max**: `[current_extreme: Value]` - tracks min/max seen so far
 /// - **GroupConcat/StringAgg**: `[accumulated: Null|Text]` - Null until first value, then Text
 /// - **JsonGroup***: `[raw_jsonb: Blob]` - accumulated raw JSONB bytes
+///
+/// Returns `Ok(true)` when a MIN/MAX aggregate's accumulator was actually
+/// updated (including first-value initialization). All other aggregate
+/// types unconditionally return `Ok(false)`.
 fn update_agg_payload(
     func: &AggFunc,
     arg: Value,                // most agg functions take one argument
@@ -5087,7 +5091,7 @@ fn update_agg_payload(
     payload: &mut [Value],
     collation: CollationSeq,
     comparator: &Option<crate::vdbe::sorter::SortComparator>,
-) -> Result<()> {
+) -> Result<bool> {
     match func {
         AggFunc::Count => {
             // COUNT(column) increments only when arg is not NULL. Empty args treated as non-NULL
@@ -5115,7 +5119,7 @@ fn update_agg_payload(
         }
         AggFunc::Avg => {
             if matches!(arg, Value::Null) {
-                return Ok(());
+                return Ok(false);
             }
             // invariant as per init_agg_payload: payload[0] is Float (sum), payload[1] is Float (r_err), payload[2] is Integer (count)
             let [sum_val, r_err_val, count_val, ..] = payload else {
@@ -5125,7 +5129,7 @@ fn update_agg_payload(
                 ));
             };
             if matches!(*sum_val, Value::Null) {
-                return Ok(());
+                return Ok(false);
             }
             let r_err = r_err_val.to_float_or_zero();
             let Value::Numeric(Numeric::Integer(count)) = count_val else {
@@ -5192,7 +5196,7 @@ fn update_agg_payload(
                 ovrfl: *ovrfl_i != 0,
             };
             if matches!(*acc, Value::Null) && sum_state.approx {
-                return Ok(());
+                return Ok(false);
             }
             match arg {
                 Value::Null => {}
@@ -5251,11 +5255,11 @@ fn update_agg_payload(
         }
         AggFunc::Min | AggFunc::Max => {
             if matches!(arg, Value::Null) {
-                return Ok(());
+                return Ok(false);
             }
             if matches!(payload[0], Value::Null) {
                 payload[0] = arg;
-                return Ok(());
+                return Ok(true);
             }
             use std::cmp::Ordering;
             // Use custom type comparator if available, otherwise fall back to collation
@@ -5274,10 +5278,11 @@ fn update_agg_payload(
             if should_update {
                 payload[0] = arg;
             }
+            return Ok(should_update);
         }
         AggFunc::GroupConcat | AggFunc::StringAgg => {
             if matches!(arg, Value::Null) {
-                return Ok(());
+                return Ok(false);
             }
             let delimiter = maybe_arg2.unwrap_or_else(|| Value::build_text(","));
             let acc = &mut payload[0];
@@ -5342,7 +5347,7 @@ fn update_agg_payload(
             vec.append(&mut data);
         }
     }
-    Ok(())
+    Ok(false)
 }
 
 /// Convert the intermediate aggregate state in `payload` into the final result value.
@@ -5466,6 +5471,7 @@ pub fn op_agg_step(
             delimiter,
             func,
             comparator,
+            flag_reg,
         },
         insn
     );
@@ -5559,15 +5565,28 @@ pub fn op_agg_step(
                 };
                 let collation = state.current_collation.unwrap_or(CollationSeq::Binary);
 
-                // Now get mutable borrow on payload
-                let Register::Aggregate(agg) = &mut state.registers[*acc_reg] else {
-                    panic!(
-                        "Unexpected value {:?} in AggStep at register {}",
-                        state.registers[*acc_reg], *acc_reg
-                    );
+                // Scope the mutable borrow on the accumulator register so we
+                // can later write to a different register (flag_reg).
+                let updated = {
+                    let Register::Aggregate(agg) = &mut state.registers[*acc_reg] else {
+                        panic!(
+                            "Unexpected value {:?} in AggStep at register {}",
+                            state.registers[*acc_reg], *acc_reg
+                        );
+                    };
+                    let payload = agg.payload_mut();
+                    update_agg_payload(func, arg, maybe_arg2, payload, collation, &comparator)?
                 };
-                let payload = agg.payload_mut();
-                update_agg_payload(func, arg, maybe_arg2, payload, collation, &comparator)?;
+
+                // For MIN/MAX with bare columns: reset the flag register to 0
+                // whenever the aggregate value is updated (including first
+                // initialization), so the loop body re-reads non-aggregate
+                // columns from the current (winning) row.
+                if let Some(flag) = flag_reg {
+                    if updated {
+                        state.registers[*flag] = Register::Value(Value::from_i64(0));
+                    }
+                }
             }
         }
     };

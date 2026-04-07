@@ -1133,6 +1133,7 @@ pub fn insn_to_row(
                 delimiter: _,
                 col,
                 comparator: _,
+                flag_reg: _,
             } => (
                 "AggStep",
                 0,
