@@ -143,6 +143,72 @@
 //! WAL-last is intentional: if crash happens mid-checkpoint, WAL remains a safety net until
 //! logical-log cleanup is complete.
 //!
+//! ### Frame Layout: Unencrypted vs Encrypted
+//!
+//! ```text
+//! Unencrypted:
+//! ┌──────────────┬──────────────────────────────┬───────────┐
+//! │ TX Header    │ Payload                      │ Trailer   │
+//! │ (24B plain)  │ Op₀ | Op₁ | Op₂ | ...        │ CRC + End │
+//! └──────────────┴──────────────────────────────┴───────────┘
+//!
+//! Encrypted (chunked):
+//! ┌──────────────┬──────────┬──────────┬──────────┬───────────┐
+//! │ TX Header    │ Chunk 0  │ Chunk 1  │ Chunk N  │ Trailer   │
+//! │ (24B plain)  │ ct|n     │ ct|n     │ ct|n     │ CRC + End │
+//! └──────────────┴──────────┴──────────┴──────────┴───────────┘
+//!                     │
+//!                     ▼
+//!               ┌───────────────────────────┬───────┐
+//!               │ ciphertext (plain + tag)  │ nonce │
+//!               └───────────────────────────┴───────┘
+//! ```
+//!
+//! Each chunk encrypted with AAD (32B):
+//! ```text
+//! ┌────────┬────────────────────┬──────────┬────────────┬─────────────┐
+//! │salt (8)│payload_size_or_0(8)│op_cnt (4)│commit_ts(8)│chunk_idx (4)│
+//! └────────┴────────────────────┴──────────┴────────────┴─────────────┘
+//!           ↑
+//!           └── payload_size only in final chunk; zero for all others
+//! ```
+//!
+//! ### How Plaintext Payload Is Split Into Chunks
+//!
+//! ```text
+//! Plaintext payload (serialized ops, payload_size bytes):
+//!
+//! ┌──────┬──────┬────────────┬──────────┬──────┬────────────┬──────┬──────┬──────┬───────┐
+//! │ Op₀  │ Op₁  │    Op₂     │   Op₃    │ Op₄  │    Op₅     │ Op₆  │ Op₇  │ Op₈  │ Op₉   │
+//! └──────┴──────┴─────┼──────┴──────────┴──────┴──────┼─────┴──────┴──────┴──────┴───────┘
+//!                     │                               │
+//!               32 KB boundary                   64 KB boundary
+//!
+//! Chunking splits at fixed 32 KB boundaries — ops may straddle them:
+//!
+//!   Chunk 0 (32 KB)              Chunk 1 (32 KB)              Chunk 2 (remainder)
+//! ┌──────┬──────┬──────┐     ┌──────┬──────┬──────┬──────┐   ┌──────┬──────┬──────┬──────┐
+//! │ Op₀  │ Op₁  │ Op₂▌ │     │▐Op₂  │ Op₃  │ Op₄  │ Op₅▌ │   │▐Op₅  │ Op₆  │ Op₇  │ ...  │
+//! └──────┴──────┴──────┘     └──────┴──────┴──────┴──────┘   └──────┴──────┴──────┴──────┘
+//!                ├─── Op₂ split across chunks 0 & 1 ───┤              │
+//!                                          ├── Op₅ split across chunks 1 & 2 ──┤
+//!
+//!   Op₂ starts in chunk 0, ends in chunk 1.  The reader uses a "carry buffer"
+//!   to accumulate the partial op across chunk boundaries before parsing.
+//!
+//!             │                          │                       │
+//!             ▼                          ▼                       ▼
+//!       ┌───────────┬────┐         ┌───────────┬────┐     ┌───────────┬────┐
+//!       │ciphertext₀│ N₀ │         │ciphertext₁│ N₁ │     │ciphertext₂│ N₂ │
+//!       │(32KB+tag) │    │         │(32KB+tag) │    │     │(rem+tag)  │    │
+//!       └───────────┴────┘         └───────────┴────┘     └───────────┴────┘
+//!        on-disk chunk blob         on-disk chunk blob     on-disk chunk blob
+//!
+//! Each chunk is encrypted independently with AEAD. The reader decrypts one chunk
+//! at a time. If an op is incomplete at the end of a chunk, the leftover bytes go
+//! into a carry buffer and are joined with bytes from the next decrypted chunk.
+//! ```
+//!
 //! ## Non-goal
 //!
 //! Frame-level atomicity only: torn tails are discarded; partially written frames are not salvaged.
@@ -615,6 +681,7 @@ impl LogicalLog {
                 enc_ctx.tag_size(),
                 enc_ctx.nonce_size(),
             )?;
+            let write_buf_start = self.write_buf.len();
             self.write_buf.reserve(total_on_disk_size);
             let chunk_count =
                 encrypted_payload_chunk_count(payload_size, self.encrypted_payload_chunk_size);
@@ -653,6 +720,10 @@ impl LogicalLog {
                 self.write_buf.extend_from_slice(&ciphertext);
                 self.write_buf.extend_from_slice(&nonce);
             }
+            turso_assert!(
+                self.write_buf.len() - write_buf_start == total_on_disk_size,
+                "encrypted write_buf size mismatch"
+            );
             Ok(payload_size)
         } else {
             let payload_start = self.write_buf.len();
@@ -1339,23 +1410,21 @@ impl StreamingLogicalLogReader {
             let next_crc = crc32c::crc32c_append(running_crc, blob);
             let ciphertext = &blob[..plaintext_len + payload_ctx.tag_size];
             let nonce = &blob[plaintext_len + payload_ctx.tag_size..];
-            match encryption_ctx.decrypt_chunk_into(ciphertext, nonce, &aad, decrypt_scratch) {
-                Ok(()) => {}
-                Err(e) => {
-                    tracing::warn!("decrypt_chunk failed for chunk {chunk_index}: {e}");
-                    return Ok(EncryptedChunkReadResult::InvalidFrame);
-                }
-            }
+            encryption_ctx
+                .decrypt_chunk_into(ciphertext, nonce, &aad, decrypt_scratch)
+                .map_err(|e| {
+                    LimboError::Corrupt(format!(
+                        "decrypt_chunk failed for chunk {chunk_index}: {e}"
+                    ))
+                })?;
             (next_crc, decrypt_scratch.len())
         };
 
         self.buffer_offset = end;
         if decrypted_plaintext_len != plaintext_len {
-            tracing::warn!(
-                "decrypted chunk length mismatch: expected {plaintext_len}, got {}",
-                decrypted_plaintext_len
-            );
-            return Ok(EncryptedChunkReadResult::InvalidFrame);
+            return Err(LimboError::Corrupt(format!(
+                "decrypted chunk length mismatch: expected {plaintext_len}, got {decrypted_plaintext_len}"
+            )));
         }
 
         Ok(EncryptedChunkReadResult::Ok {
@@ -1512,9 +1581,6 @@ impl StreamingLogicalLogReader {
             )? {
                 EncryptedChunkReadResult::Ok { running_crc } => running_crc,
                 EncryptedChunkReadResult::Eof => return Ok(PayloadParseResult::Eof),
-                EncryptedChunkReadResult::InvalidFrame => {
-                    return Ok(PayloadParseResult::InvalidFrame);
-                }
             };
 
             let mut plaintext_start = 0usize;
@@ -1526,10 +1592,9 @@ impl StreamingLogicalLogReader {
             );
             if !carry.is_empty() {
                 if parsed_ops.len() == op_count as usize {
-                    tracing::warn!(
+                    return Err(LimboError::Corrupt(format!(
                         "encrypted payload has trailing carried bytes after parsing all {op_count} ops"
-                    );
-                    return Ok(PayloadParseResult::InvalidFrame);
+                    )));
                 }
                 // carry holds the prefix of an op that was split by the previous chunk boundary.
                 // Try to finish that carried op using bytes from the current decrypted chunk.
@@ -1546,8 +1611,9 @@ impl StreamingLogicalLogReader {
                     Ok(true) => {}
                     Ok(false) => continue,
                     Err(e) => {
-                        tracing::warn!("encrypted carried-op parse error: {e}");
-                        return Ok(PayloadParseResult::InvalidFrame);
+                        return Err(LimboError::Corrupt(format!(
+                            "encrypted carried-op parse error: {e}"
+                        )));
                     }
                 }
             }
@@ -1558,19 +1624,13 @@ impl StreamingLogicalLogReader {
             );
 
             // we don't have any carry bytes, so lets just parse the plaintext
-            let consumed = match Self::parse_decrypted_chunk_ops(
+            let consumed = Self::parse_decrypted_chunk_ops(
                 plaintext,
                 plaintext_start,
                 &mut parsed_ops,
                 op_count,
                 commit_ts,
-            ) {
-                Ok(consumed) => consumed,
-                Err(e) => {
-                    tracing::warn!("encrypted chunk parse error: {e}");
-                    return Ok(PayloadParseResult::InvalidFrame);
-                }
-            };
+            )?;
             plaintext_start += consumed;
             if plaintext_start < plaintext.len() {
                 // IOW we still have some bytes left over, so lets add that to carry so that
@@ -1583,20 +1643,18 @@ impl StreamingLogicalLogReader {
 
         // at this point, we must have parsed the full payload
         if parsed_ops.len() != op_count as usize {
-            tracing::warn!(
+            return Err(LimboError::Corrupt(format!(
                 "encrypted payload ended after {} parsed ops, expected {op_count}",
                 parsed_ops.len()
-            );
-            return Ok(PayloadParseResult::InvalidFrame);
+            )));
         }
 
         // once we have parsed the full payload, carry must be empty
         if !carry.is_empty() {
-            tracing::warn!(
+            return Err(LimboError::Corrupt(format!(
                 "encrypted payload has {} trailing plaintext bytes after parsing all ops",
                 carry.len()
-            );
-            return Ok(PayloadParseResult::InvalidFrame);
+            )));
         }
 
         Ok(PayloadParseResult::Ok(parsed_ops, running_crc))
@@ -1628,17 +1686,23 @@ impl StreamingLogicalLogReader {
             let table_id = match tag {
                 OP_UPSERT_TABLE | OP_DELETE_TABLE | OP_UPSERT_INDEX | OP_DELETE_INDEX => {
                     if flags & !OP_FLAG_BTREE_RESIDENT != 0 || table_id_i32 >= 0 {
-                        return Ok(PayloadParseResult::InvalidFrame);
+                        return Err(LimboError::Corrupt(format!(
+                            "invalid op flags={flags:#x} or table_id={table_id_i32} for tag={tag}"
+                        )));
                     }
                     Some(MVTableId::from(table_id_i32 as i64))
                 }
                 OP_UPDATE_HEADER => {
                     if flags != 0 || table_id_i32 != 0 {
-                        return Ok(PayloadParseResult::InvalidFrame);
+                        return Err(LimboError::Corrupt(format!(
+                            "OP_UPDATE_HEADER has non-zero flags={flags:#x} or table_id={table_id_i32}"
+                        )));
                     }
                     None
                 }
-                _ => return Ok(PayloadParseResult::InvalidFrame),
+                _ => {
+                    return Err(LimboError::Corrupt(format!("unknown op tag {tag}")));
+                }
             };
             let btree_resident = (flags & OP_FLAG_BTREE_RESIDENT) != 0;
 
@@ -1646,18 +1710,12 @@ impl StreamingLogicalLogReader {
                 match self.consume_varint_bytes(io) {
                     Ok(Some((value, bytes, len))) => (value, bytes, len),
                     Ok(None) => return Ok(PayloadParseResult::Eof),
-                    Err(LimboError::Corrupt(_)) => return Ok(PayloadParseResult::InvalidFrame),
                     Err(err) => return Err(err),
                 };
             running_crc =
                 crc32c::crc32c_append(running_crc, &payload_len_bytes[..payload_len_bytes_len]);
-            let payload_len = match usize::try_from(payload_len) {
-                Ok(v) => v,
-                Err(e) => {
-                    tracing::warn!("payload_len overflows usize: {e}");
-                    return Ok(PayloadParseResult::InvalidFrame);
-                }
-            };
+            let payload_len = usize::try_from(payload_len)
+                .map_err(|e| LimboError::Corrupt(format!("payload_len overflows usize: {e}")))?;
 
             let payload = match self.try_consume_bytes(io, payload_len)? {
                 Some(bytes) => bytes,
@@ -1666,27 +1724,24 @@ impl StreamingLogicalLogReader {
             running_crc = crc32c::crc32c_append(running_crc, &payload);
 
             let op_total_bytes = 6 + payload_len_bytes_len + payload_len;
-            payload_bytes_read = match u64::try_from(op_total_bytes)
+            payload_bytes_read = u64::try_from(op_total_bytes)
                 .ok()
                 .and_then(|op_size| payload_bytes_read.checked_add(op_size))
-            {
-                Some(v) => v,
-                None => return Ok(PayloadParseResult::InvalidFrame),
-            };
+                .ok_or_else(|| LimboError::Corrupt("payload_bytes_read overflow".to_string()))?;
 
             let parsed_op = match tag {
                 OP_UPSERT_TABLE => {
                     let table_id = table_id.expect("table op must carry table id");
-                    let (rowid_u64, rowid_len) = match read_varint(&payload) {
-                        Ok(v) => v,
-                        Err(e) => {
-                            tracing::warn!("failed to read rowid varint in upsert op: {e}");
-                            return Ok(PayloadParseResult::InvalidFrame);
-                        }
-                    };
+                    let (rowid_u64, rowid_len) = read_varint(&payload).map_err(|e| {
+                        LimboError::Corrupt(format!(
+                            "failed to read rowid varint in upsert op: {e}"
+                        ))
+                    })?;
                     let rowid_i64 = rowid_u64 as i64;
                     if rowid_len > payload.len() {
-                        return Ok(PayloadParseResult::InvalidFrame);
+                        return Err(LimboError::Corrupt(
+                            "upsert op rowid varint extends beyond payload".to_string(),
+                        ));
                     }
                     let mut payload = payload;
                     let record_bytes = payload.split_off(rowid_len);
@@ -1701,15 +1756,16 @@ impl StreamingLogicalLogReader {
                 }
                 OP_DELETE_TABLE => {
                     let table_id = table_id.expect("table op must carry table id");
-                    let (rowid_u64, rowid_len) = match read_varint(&payload) {
-                        Ok(v) => v,
-                        Err(e) => {
-                            tracing::warn!("failed to read rowid varint in delete op: {e}");
-                            return Ok(PayloadParseResult::InvalidFrame);
-                        }
-                    };
+                    let (rowid_u64, rowid_len) = read_varint(&payload).map_err(|e| {
+                        LimboError::Corrupt(format!(
+                            "failed to read rowid varint in delete op: {e}"
+                        ))
+                    })?;
                     if rowid_len != payload.len() {
-                        return Ok(PayloadParseResult::InvalidFrame);
+                        return Err(LimboError::Corrupt(format!(
+                            "delete op rowid varint len {rowid_len} != payload len {}",
+                            payload.len()
+                        )));
                     }
                     let rowid_i64 = rowid_u64 as i64;
                     let rowid = RowID::new(table_id, RowKey::Int(rowid_i64));
@@ -1739,24 +1795,36 @@ impl StreamingLogicalLogReader {
                 }
                 OP_UPDATE_HEADER => {
                     if payload.len() != DatabaseHeader::SIZE {
-                        return Ok(PayloadParseResult::InvalidFrame);
+                        return Err(LimboError::Corrupt(format!(
+                            "OP_UPDATE_HEADER payload len {} != DatabaseHeader::SIZE {}",
+                            payload.len(),
+                            DatabaseHeader::SIZE
+                        )));
                     }
                     let mut bytes = [0u8; DatabaseHeader::SIZE];
                     bytes.copy_from_slice(&payload);
                     let header = *bytemuck::from_bytes::<DatabaseHeader>(&bytes);
                     if header.magic != *b"SQLite format 3\0" {
-                        return Ok(PayloadParseResult::InvalidFrame);
+                        return Err(LimboError::Corrupt(
+                            "OP_UPDATE_HEADER has invalid SQLite magic".to_string(),
+                        ));
                     }
                     ParsedOp::UpdateHeader { header, commit_ts }
                 }
-                _ => return Ok(PayloadParseResult::InvalidFrame),
+                _ => {
+                    return Err(LimboError::Corrupt(format!(
+                        "unknown op tag {tag} in payload"
+                    )));
+                }
             };
 
             parsed_ops.push(parsed_op);
         }
 
         if payload_size as u64 != payload_bytes_read {
-            return Ok(PayloadParseResult::InvalidFrame);
+            return Err(LimboError::Corrupt(format!(
+                "payload_size ({payload_size}) != payload_bytes_read ({payload_bytes_read})"
+            )));
         }
 
         Ok(PayloadParseResult::Ok(parsed_ops, running_crc))
@@ -1824,18 +1892,21 @@ impl StreamingLogicalLogReader {
         let running_crc = crc32c::crc32c_append(self.running_crc, &header_bytes);
 
         // 2. Parse payload — branches for encrypted vs unencrypted.
-        let payload_result = if self.encryption_ctx.is_some() {
-            self.parse_encrypted_payload(io, op_count, payload_size, commit_ts, running_crc)?
+        //    Corrupt errors from payload parsing are treated as an invalid frame
+        //    (stop scanning, keep previously validated frames).
+        let (parsed_ops, running_crc) = match if self.encryption_ctx.is_some() {
+            self.parse_encrypted_payload(io, op_count, payload_size, commit_ts, running_crc)
         } else {
-            self.parse_streaming_payload(io, op_count, payload_size, commit_ts, running_crc)?
-        };
-        let (parsed_ops, running_crc) = match payload_result {
-            PayloadParseResult::Ok(ops, crc) => (ops, crc),
-            PayloadParseResult::Eof => return Ok(ParseResult::Eof),
-            PayloadParseResult::InvalidFrame => {
+            self.parse_streaming_payload(io, op_count, payload_size, commit_ts, running_crc)
+        } {
+            Ok(PayloadParseResult::Ok(ops, crc)) => (ops, crc),
+            Ok(PayloadParseResult::Eof) => return Ok(ParseResult::Eof),
+            Err(LimboError::Corrupt(msg)) => {
+                tracing::warn!("corrupt payload: {msg}");
                 self.last_valid_offset = frame_start;
                 return Ok(ParseResult::InvalidFrame);
             }
+            Err(e) => return Err(e),
         };
 
         // 3. TX TRAILER layout (8 bytes): crc32c(4, le u32) | END_MAGIC(4)
@@ -2172,20 +2243,23 @@ struct EncryptedPayloadReadContext {
 /// Result of parsing just the payload portion of a transaction frame.
 /// Used by `parse_encrypted_payload` and `parse_streaming_payload` to communicate
 /// back to `parse_next_transaction` without duplicating control flow.
+///
+/// Corruption is signalled via `Err(LimboError::Corrupt(...))`, not a variant here.
+/// The caller (`parse_next_transaction`) catches those errors and converts them to
+/// `ParseResult::InvalidFrame` to preserve the WAL-prefix "stop scanning" semantics.
 enum PayloadParseResult {
     /// Successfully parsed ops and updated running CRC.
     Ok(Vec<ParsedOp>, u32),
     /// Not enough bytes to complete the payload.
     Eof,
-    /// Payload data is structurally invalid.
-    InvalidFrame,
 }
 
 /// Result of reading and decrypting one encrypted chunk into `decrypt_scratch`.
+/// Corruption (decryption failure, length mismatch) is returned as
+/// `Err(LimboError::Corrupt(...))`.
 enum EncryptedChunkReadResult {
     Ok { running_crc: u32 },
     Eof,
-    InvalidFrame,
 }
 
 #[cfg_attr(test, derive(Debug))]
