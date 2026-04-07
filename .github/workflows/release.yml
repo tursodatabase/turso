@@ -60,7 +60,14 @@ jobs:
         with:
           persist-credentials: false
           submodules: recursive
+      - name: Cache cargo-dist
+        id: cache-dist
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/bin/dist
+          key: cargo-dist-v0.31.0-${{ runner.os }}
       - name: Install dist
+        if: steps.cache-dist.outputs.cache-hit != 'true'
         # we specify bash to get pipefail; it guards against the `curl` command
         # failing. otherwise `sh` won't catch that `curl` returned non-0
         shell: bash
