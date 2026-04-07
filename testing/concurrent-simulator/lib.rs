@@ -32,7 +32,7 @@ use crate::{
     properties::Property,
     workloads::{Workload, WorkloadContext},
 };
-pub use io::{IOFaultConfig, SimulatorIO};
+pub use io::{CosmicRayTarget, IOFaultConfig, SimulatorIO};
 pub use operations::{FiberState, OpContext, OpResult, Operation, TxMode};
 use yield_injection::{SimulatorYieldInjector, fiber_yield_seed};
 
@@ -478,6 +478,7 @@ impl Whopper {
 
         let fault_config = IOFaultConfig {
             cosmic_ray_probability: opts.cosmic_ray_probability,
+            ..IOFaultConfig::default()
         };
 
         let io = Arc::new(SimulatorIO::new(opts.keep_files, io_rng, fault_config));

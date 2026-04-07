@@ -3,6 +3,7 @@ use rand::{Rng, RngCore};
 use rand_chacha::ChaCha8Rng;
 use std::collections::{HashMap, HashSet};
 use std::fs::{File as StdFile, OpenOptions};
+use std::ops::Range;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use tracing::debug;
@@ -10,18 +11,34 @@ use turso_core::{
     Clock, Completion, File, IO, MonotonicInstant, OpenFlags, Result, WallClockInstant,
 };
 
+/// Restricts cosmic ray bit flips to a specific byte range in a specific file.
+///
+/// Used to focus the existing fault model on specific subsystems (e.g., a
+/// particular B-tree page or freelist trunk page) without changing the
+/// underlying fault class. The same random bit-flip mechanism still applies;
+/// only the universe of target bytes is narrowed.
+///
+/// This is useful when a fault class is reachable in principle but
+/// astronomically rare with whole-file random injection — focusing the scope
+/// makes discovery deterministic on a tractable seed budget while preserving
+/// the legitimacy of the fault model.
 #[derive(Debug, Clone)]
+pub struct CosmicRayTarget {
+    /// File path suffix to match (e.g. ".db" for the main database file).
+    pub file_suffix: String,
+    /// Byte range within the file where cosmic rays are allowed to fire.
+    pub byte_range: Range<usize>,
+}
+
+#[derive(Debug, Clone, Default)]
 pub struct IOFaultConfig {
     /// Probability of a cosmic ray bit flip on write (0.0-1.0)
     pub cosmic_ray_probability: f64,
-}
-
-impl Default for IOFaultConfig {
-    fn default() -> Self {
-        Self {
-            cosmic_ray_probability: 0.0,
-        }
-    }
+    /// When non-empty, cosmic ray bit flips are restricted to these target
+    /// ranges. The `cosmic_ray_probability` still gates whether a flip fires;
+    /// the targets only constrain *where* it can fire. When empty, cosmic rays
+    /// fire uniformly across the whole file (default behavior).
+    pub cosmic_ray_targets: Vec<CosmicRayTarget>,
 }
 
 pub struct SimulatorIO {
@@ -29,7 +46,7 @@ pub struct SimulatorIO {
     file_sizes: Arc<Mutex<HashMap<String, u64>>>,
     keep_files: bool,
     rng: Mutex<ChaCha8Rng>,
-    fault_config: IOFaultConfig,
+    fault_config: Mutex<IOFaultConfig>,
     /// Simulated time in microseconds, incremented on each step
     time: AtomicU64,
     pending: PendingQueue,
@@ -43,10 +60,19 @@ impl SimulatorIO {
             file_sizes: Arc::new(Mutex::new(HashMap::new())),
             keep_files,
             rng: Mutex::new(rng),
-            fault_config,
+            fault_config: Mutex::new(fault_config),
             time: AtomicU64::new(0),
             pending: Arc::new(Mutex::new(Vec::new())),
         }
+    }
+
+    /// Replace the active fault injection configuration. Used by tests that
+    /// need to build a clean database first and then enable focused fault
+    /// injection for a specific operation (e.g. populate a freelist, then
+    /// turn on cosmic rays focused on the freelist trunk page).
+    pub fn set_fault_config(&self, fault_config: IOFaultConfig) {
+        debug!("SimulatorIO fault config updated: {:?}", fault_config);
+        *self.fault_config.lock().unwrap() = fault_config;
     }
 
     pub fn file_sizes(&self) -> Arc<Mutex<HashMap<String, u64>>> {
@@ -84,17 +110,18 @@ impl SimulatorIO {
         Ok(())
     }
 
-    /// Inject raw bytes into a file's memory at a specific offset.
-    /// Used for targeted structural corruption injection in regression tests
-    /// (e.g., corrupting freelist metadata to test allocate_page robustness).
-    pub fn inject_bytes(&self, path: &str, offset: usize, bytes: &[u8]) {
+    /// Read a contiguous slice of a file's current contents.
+    /// Used by tests to inspect database structure (e.g. read the freelist
+    /// trunk pointer from the header) so they can compute byte ranges to
+    /// pass to `cosmic_ray_targets`.
+    pub fn read_file_bytes(&self, path: &str, range: Range<usize>) -> Vec<u8> {
         let files = self.files.lock().unwrap();
         let (_, file) = files
             .iter()
             .find(|(p, _)| p == path)
-            .unwrap_or_else(|| panic!("inject_bytes: file '{}' not found", path));
-        let mut mmap = file.mmap.lock().unwrap();
-        mmap[offset..offset + bytes.len()].copy_from_slice(bytes);
+            .unwrap_or_else(|| panic!("read_file_bytes: file '{path}' not found"));
+        let mmap = file.mmap.lock().unwrap();
+        mmap[range].to_vec()
     }
 }
 
@@ -183,9 +210,10 @@ impl IO for SimulatorIO {
         self.time.fetch_add(1000, Ordering::Relaxed);
 
         // Inject cosmic ray faults with configured probability
-        if self.fault_config.cosmic_ray_probability > 0.0 {
+        let fault_config = self.fault_config.lock().unwrap().clone();
+        if fault_config.cosmic_ray_probability > 0.0 {
             let mut rng = self.rng.lock().unwrap();
-            if rng.random::<f64>() < self.fault_config.cosmic_ray_probability {
+            if rng.random::<f64>() < fault_config.cosmic_ray_probability {
                 // Collect files that are still alive
                 let open_files: Vec<_> = {
                     let files = self.files.lock().unwrap();
@@ -196,22 +224,56 @@ impl IO for SimulatorIO {
                 };
 
                 if !open_files.is_empty() {
-                    let file_idx = rng.random_range(0..open_files.len());
-                    let (path, file) = &open_files[file_idx];
+                    // Build the candidate set: either restricted to configured
+                    // targets, or unrestricted (whole file) when no targets set.
+                    let targets = &fault_config.cosmic_ray_targets;
+                    let candidates: Vec<(String, Arc<SimulatorFile>, usize)> = if targets.is_empty()
+                    {
+                        open_files
+                            .into_iter()
+                            .filter_map(|(path, file)| {
+                                let size = *file.size.lock().unwrap();
+                                if size > 0 {
+                                    let byte_offset = rng.random_range(0..size);
+                                    Some((path, file, byte_offset))
+                                } else {
+                                    None
+                                }
+                            })
+                            .collect()
+                    } else {
+                        open_files
+                            .into_iter()
+                            .flat_map(|(path, file)| {
+                                let size = *file.size.lock().unwrap();
+                                let matching_ranges: Vec<Range<usize>> = targets
+                                    .iter()
+                                    .filter(|t| path.ends_with(&t.file_suffix))
+                                    .map(|t| t.byte_range.clone())
+                                    .filter(|r| r.start < size && r.start < r.end)
+                                    .map(|r| r.start..r.end.min(size))
+                                    .collect();
+                                matching_ranges
+                                    .into_iter()
+                                    .map(|range| {
+                                        let byte_offset = rng.random_range(range);
+                                        (path.clone(), file.clone(), byte_offset)
+                                    })
+                                    .collect::<Vec<_>>()
+                            })
+                            .collect()
+                    };
 
-                    // Get the actual file size (not the mmap size)
-                    let file_size = *file.size.lock().unwrap();
-                    if file_size > 0 {
-                        // Pick a random offset within the actual file size
-                        let byte_offset = rng.random_range(0..file_size);
+                    if !candidates.is_empty() {
+                        let pick = rng.random_range(0..candidates.len());
+                        let (path, file, byte_offset) = &candidates[pick];
                         let bit_idx = rng.random_range(0..8);
-
                         let mut mmap = file.mmap.lock().unwrap();
-                        let old_byte = mmap[byte_offset];
-                        mmap[byte_offset] ^= 1 << bit_idx;
+                        let old_byte = mmap[*byte_offset];
+                        mmap[*byte_offset] ^= 1 << bit_idx;
                         println!(
                             "Cosmic ray! File: {} - Flipped bit {} at offset {} (0x{:02x} -> 0x{:02x})",
-                            path, bit_idx, byte_offset, old_byte, mmap[byte_offset]
+                            path, bit_idx, byte_offset, old_byte, mmap[*byte_offset]
                         );
                     }
                 }
