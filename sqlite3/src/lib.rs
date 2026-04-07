@@ -631,12 +631,34 @@ pub unsafe extern "C" fn sqlite3_trace_v2(
 
 #[no_mangle]
 pub unsafe extern "C" fn sqlite3_progress_handler(
-    _db: *mut sqlite3,
-    _n: ffi::c_int,
-    _callback: Option<unsafe extern "C" fn() -> ffi::c_int>,
-    _context: *mut ffi::c_void,
-) -> ffi::c_int {
-    stub!();
+    db: *mut sqlite3,
+    n: ffi::c_int,
+    callback: Option<unsafe extern "C" fn(*mut ffi::c_void) -> ffi::c_int>,
+    context: *mut ffi::c_void,
+) {
+    if db.is_null() {
+        return;
+    }
+
+    let db_ref = &*db;
+    let inner = match db_ref.inner.lock() {
+        Ok(guard) => guard,
+        Err(_) => return,
+    };
+
+    match callback {
+        Some(c_callback) if n > 0 => {
+            let ctx = context as usize;
+            let cb = c_callback;
+            inner.conn.set_progress_handler(
+                n as u64,
+                Some(Box::new(move || unsafe {
+                    cb(ctx as *mut ffi::c_void) != 0
+                })),
+            );
+        }
+        _ => inner.conn.set_progress_handler(0, None),
+    }
 }
 
 /// Type for C busy handler callback function.
@@ -1272,8 +1294,16 @@ pub unsafe extern "C" fn sqlite3_last_insert_rowid(db: *mut sqlite3) -> ffi::c_i
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn sqlite3_interrupt(_db: *mut sqlite3) {
-    stub!();
+pub unsafe extern "C" fn sqlite3_interrupt(db: *mut sqlite3) {
+    if db.is_null() {
+        return;
+    }
+    let db_ref = &*db;
+    let inner = match db_ref.inner.lock() {
+        Ok(guard) => guard,
+        Err(_) => return,
+    };
+    inner.conn.interrupt();
 }
 
 #[no_mangle]

@@ -39,6 +39,7 @@ mod json;
 mod numeric;
 mod parameters;
 mod pragma;
+mod progress;
 mod pseudo;
 mod regexp;
 #[cfg(feature = "series")]
@@ -63,6 +64,7 @@ use crate::{
     busy::{BusyHandler, BusyHandlerCallback},
     incremental::view::AllViewsTxState,
     index_method::IndexMethod,
+    progress::ProgressHandler,
     schema::Trigger,
     stats::refresh_analyze_stats,
     storage::{
@@ -1423,7 +1425,9 @@ impl Database {
             temp_store: AtomicTempStore::new(TempStore::Default),
             data_sync_retry: AtomicBool::new(false),
             busy_handler: RwLock::new(BusyHandler::None),
+            progress_handler: ProgressHandler::new(),
             query_timeout_ms: AtomicU64::new(0),
+            interrupt_requested: AtomicBool::new(false),
             is_mvcc_bootstrap_connection: AtomicBool::new(is_mvcc_bootstrap_connection),
             full_column_names: AtomicBool::new(false),
             short_column_names: AtomicBool::new(true),

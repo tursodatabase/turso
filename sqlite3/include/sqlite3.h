@@ -83,7 +83,7 @@ int sqlite3_trace_v2(sqlite3 *_db,
                      void (*_callback)(unsigned int, void*, void*, void*),
                      void *_context);
 
-int sqlite3_progress_handler(sqlite3 *_db, int _n, int (*_callback)(void), void *_context);
+void sqlite3_progress_handler(sqlite3 *_db, int _n, int (*_callback)(void *), void *_context);
 
 int sqlite3_busy_timeout(sqlite3 *_db, int _ms);
 
