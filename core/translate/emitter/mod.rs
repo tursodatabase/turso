@@ -301,7 +301,9 @@ impl<'a> Resolver<'a> {
             let name_bytes = db_name_normalized.as_bytes();
             match_ignore_ascii_case!(match name_bytes {
                 b"main" => Ok(0),
-                b"temp" => Ok(1),
+                b"temp" => Err(LimboError::ParseError(
+                    "TEMPORARY database not supported yet".to_string(),
+                )),
                 _ => {
                     // Look up attached database
                     if let Some((idx, _attached_db)) =
