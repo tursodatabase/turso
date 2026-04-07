@@ -1863,13 +1863,12 @@ fn bind_insert(
                             for expr in values_expr.iter_mut().flat_map(|v| v.iter_mut()) {
                                 match expr.as_mut() {
                                     Expr::Id(name) => {
-                                        if name.quoted_with('"') {
+                                        if name.quoted_with('"') && resolver.dqs_dml.is_enabled() {
                                             *expr = Expr::Literal(ast::Literal::String(
                                                 name.as_literal(),
                                             ))
                                             .into();
                                         } else {
-                                            // an INSERT INTO ... VALUES (...) cannot reference columns
                                             crate::bail_parse_error!("no such column: {name}");
                                         }
                                     }

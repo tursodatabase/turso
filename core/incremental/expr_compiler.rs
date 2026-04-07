@@ -6,7 +6,7 @@ use crate::numeric::Numeric;
 use crate::schema::Schema;
 use crate::storage::pager::Pager;
 use crate::sync::Arc;
-use crate::translate::emitter::Resolver;
+use crate::translate::emitter::{DoubleQuotedDml, Resolver};
 use crate::translate::expr::translate_expr;
 use crate::types::Text;
 use crate::vdbe::builder::{ProgramBuilder, ProgramBuilderOpts};
@@ -328,7 +328,14 @@ impl CompiledExpression {
         // Create a resolver for translate_expr
         let database_schemas = RwLock::new(HashMap::default());
         let attached_databases = RwLock::new(DatabaseCatalog::new());
-        let resolver = Resolver::new(schema, &database_schemas, &attached_databases, syms, true);
+        let resolver = Resolver::new(
+            schema,
+            &database_schemas,
+            &attached_databases,
+            syms,
+            true,
+            DoubleQuotedDml::Enabled,
+        );
 
         // Translate the transformed expression to bytecode
         translate_expr(

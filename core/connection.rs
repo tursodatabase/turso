@@ -89,6 +89,9 @@ pub struct Connection {
     pub(super) query_only: AtomicBool,
     /// If enabled, the UPDATE/DELETE statements must have a WHERE clause
     pub(super) dml_require_where: AtomicBool,
+    /// SQLite DQS misfeature: when ON (default), unresolved double-quoted identifiers
+    /// in DML statements fall back to string literals instead of raising an error.
+    pub(super) dqs_dml: AtomicBool,
     /// Deprecated pragma: when ON, column names include table prefix (TABLE.COLUMN)
     pub(super) full_column_names: AtomicBool,
     /// Deprecated pragma: when ON (default), column refs use just the column name
@@ -2088,6 +2091,15 @@ impl Connection {
 
     pub fn set_dml_require_where(&self, value: bool) {
         self.dml_require_where.store(value, Ordering::SeqCst);
+    }
+
+    pub fn get_dqs_dml(&self) -> bool {
+        self.dqs_dml.load(Ordering::SeqCst)
+    }
+
+    pub fn set_dqs_dml(&self, value: bool) {
+        self.dqs_dml.store(value, Ordering::SeqCst);
+        self.bump_prepare_context_generation();
     }
 
     pub fn get_full_column_names(&self) -> bool {

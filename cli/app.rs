@@ -1,6 +1,6 @@
 use crate::{
     commands::{
-        args::{EchoMode, HeadersMode, ParameterArgs, ParameterCommand, TimerMode},
+        args::{DbConfigMode, EchoMode, HeadersMode, ParameterArgs, ParameterCommand, TimerMode},
         import::ImportFile,
         Command, CommandParser,
     },
@@ -878,9 +878,25 @@ impl Limbo {
                         let _ = self.writeln_fmt(format_args!("/****** ERROR: {e} ******/"));
                     }
                 }
-                Command::DbConfig(_args) => {
-                    let _ = self.writeln("dbconfig currently ignored");
-                }
+                Command::DbConfig(args) => match (args.config.as_deref(), args.mode) {
+                    (Some("dqs_dml"), Some(DbConfigMode::On)) => {
+                        self.conn.set_dqs_dml(true);
+                    }
+                    (Some("dqs_dml"), Some(DbConfigMode::Off)) => {
+                        self.conn.set_dqs_dml(false);
+                    }
+                    (Some("dqs_dml"), None) => {
+                        let val = if self.conn.get_dqs_dml() { "on" } else { "off" };
+                        let _ = self.writeln(format!("dqs_dml {val}"));
+                    }
+                    (Some(name), _) => {
+                        let _ = self.writeln(format!("unknown dbconfig: {name}"));
+                    }
+                    (None, _) => {
+                        let dqs = if self.conn.get_dqs_dml() { "on" } else { "off" };
+                        let _ = self.writeln(format!("dqs_dml {dqs}"));
+                    }
+                },
                 Command::ListVfs => {
                     let _ = self.writeln("Available VFS modules:");
                     self.conn.list_vfs().iter().for_each(|v| {

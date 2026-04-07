@@ -3431,7 +3431,7 @@ fn build_seek_def(
 #[cfg(test)]
 mod tests {
     use super::{where_term_is_null_rejecting_for_table, Optimizable};
-    use crate::translate::emitter::Resolver;
+    use crate::translate::emitter::{DoubleQuotedDml, Resolver};
     use crate::{schema::Schema, DatabaseCatalog, RwLock, SymbolTable};
     use rustc_hash::FxHashMap as HashMap;
     use turso_parser::ast::{self, Expr, FunctionTail, Name, TableInternalId};
@@ -3442,7 +3442,14 @@ mod tests {
         attached_databases: &'a RwLock<DatabaseCatalog>,
         syms: &'a SymbolTable,
     ) -> Resolver<'a> {
-        Resolver::new(schema, database_schemas, attached_databases, syms, true)
+        Resolver::new(
+            schema,
+            database_schemas,
+            attached_databases,
+            syms,
+            true,
+            DoubleQuotedDml::Enabled,
+        )
     }
 
     fn no_tail() -> FunctionTail {

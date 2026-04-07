@@ -81,6 +81,20 @@ expect {
     subquery_string
 }
 
+# Tests verifying error when DQS is disabled
+setup dqs_dml_off {
+    .dbconfig dqs_dml off
+}
+
+@backend cli
+@setup dqs_dml_off
+test values-double-quotes-error-dqs-off {
+    VALUES ("double_quoted_string");
+}
+expect error {
+    no such column.*double_quoted_string
+}
+
 # regression test for: https://github.com/tursodatabase/turso/issues/2158
 @cross-check-integrity
 test values-between {
