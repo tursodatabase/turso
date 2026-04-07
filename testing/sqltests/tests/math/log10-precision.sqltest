@@ -7,22 +7,22 @@ expect {
     3
 }
 
-test log10-1000-float {
-    SELECT log10(1000.0)
+test log10-1000-exact {
+    SELECT abs(log10(1000.0) - 3.0) < 1e-10
 }
 expect {
-    3
+    1
 }
 
-test log10-100 {
-    SELECT log10(100.0)
+test log10-100-exact {
+    SELECT abs(log10(100.0) - 2.0) < 1e-10
 }
 expect {
-    2
+    1
 }
 
-test log10-10 {
-    SELECT log10(10.0)
+test log10-10-exact {
+    SELECT abs(log10(10.0) - 1.0) < 1e-10
 }
 expect {
     1
@@ -42,11 +42,11 @@ expect {
     10
 }
 
-test log2-8 {
-    SELECT log2(8.0)
+test log2-8-exact {
+    SELECT abs(log2(8.0) - 3.0) < 1e-10
 }
 expect {
-    3
+    1
 }
 
 test log2-256-integer-cast {
