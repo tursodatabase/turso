@@ -2594,6 +2594,31 @@ impl Jsonb {
                                 bail_parse_error!("Element with negative index not found")
                             }
                         }
+                        None => {
+                            // $[#] — append to end of array
+                            let mut arr_pos = pos + root_header_size;
+                            while arr_pos < end_pos {
+                                arr_pos = self.skip_element(arr_pos)?;
+                            }
+
+                            if mode.allows_insert() {
+                                let placeholder =
+                                    JsonbHeader::new(ElementType::OBJECT, 0).into_bytes();
+                                let placeholder_bytes = placeholder.as_bytes();
+
+                                self.data
+                                    .splice(arr_pos..arr_pos, placeholder_bytes.iter().copied());
+
+                                return Ok(JsonTraversalResult::with_array_index(
+                                    pos,
+                                    JsonLocationKind::ArrayEntry,
+                                    placeholder_bytes.len() as isize,
+                                    arr_pos,
+                                ));
+                            }
+
+                            bail_parse_error!("Not found!");
+                        }
                         _ => unreachable!(),
                     }
                 } else {
@@ -2772,6 +2797,31 @@ impl Jsonb {
                             } else {
                                 bail_parse_error!("Element with negative index not found")
                             }
+                        }
+                        None => {
+                            // $[#] — append to end of array
+                            let mut arr_pos = pos + root_header_size;
+                            while arr_pos < end_pos {
+                                arr_pos = self.skip_element(arr_pos)?;
+                            }
+
+                            if mode.allows_insert() {
+                                let placeholder =
+                                    JsonbHeader::new(ElementType::OBJECT, 0).into_bytes();
+                                let placeholder_bytes = placeholder.as_bytes();
+
+                                self.data
+                                    .splice(arr_pos..arr_pos, placeholder_bytes.iter().copied());
+
+                                return Ok(JsonTraversalResult::with_array_index(
+                                    pos,
+                                    JsonLocationKind::DocumentRoot,
+                                    placeholder_bytes.len() as isize,
+                                    arr_pos,
+                                ));
+                            }
+
+                            bail_parse_error!("Not found!");
                         }
                         _ => unreachable!(),
                     }

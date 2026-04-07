@@ -1,0 +1,43 @@
+@database :memory:
+
+test json-set-append-empty-array {
+    SELECT json_set('[]', '$[#]', 1)
+}
+expect {
+    [1]
+}
+
+test json-set-append-existing-array {
+    SELECT json_set('[1,2,3]', '$[#]', 4)
+}
+expect {
+    [1,2,3,4]
+}
+
+test json-set-append-string {
+    SELECT json_set('[]', '$[#]', 'hello')
+}
+expect {
+    ["hello"]
+}
+
+test json-insert-append {
+    SELECT json_insert('[10,20]', '$[#]', 30)
+}
+expect {
+    [10,20,30]
+}
+
+test json-set-append-nested-object {
+    SELECT json_set('[1]', '$[#]', json('{"a":2}'))
+}
+expect {
+    [1,{"a":2}]
+}
+
+test json-set-append-nested-array {
+    SELECT json_set('["a"]', '$[#]', json('[1,2]'))
+}
+expect {
+    ["a",[1,2]]
+}
