@@ -1797,12 +1797,7 @@ impl Jsonb {
         }
     }
 
-    fn deserialize_string(
-        &mut self,
-        input: &[u8],
-        mut pos: usize,
-        strict: bool,
-    ) -> PResult<usize> {
+    fn deserialize_string(&mut self, input: &[u8], mut pos: usize, strict: bool) -> PResult<usize> {
         if pos >= input.len() {
             return Err(PError::Message {
                 msg: "Unexpected end of input".to_string(),
@@ -2062,12 +2057,7 @@ impl Jsonb {
         Ok(pos)
     }
 
-    fn deserialize_number(
-        &mut self,
-        input: &[u8],
-        mut pos: usize,
-        strict: bool,
-    ) -> PResult<usize> {
+    fn deserialize_number(&mut self, input: &[u8], mut pos: usize, strict: bool) -> PResult<usize> {
         let num_start = self.len();
         let mut len = 0;
         let mut is_float = false;
