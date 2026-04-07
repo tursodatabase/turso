@@ -61,41 +61,40 @@ unset data
 # without.  Compare the performance to make sure things go faster with the
 # cache turned on.
 #
-# TODO: This takes forever to run!
-#ifcapable tclvar {
-#  do_test select2-2.0.1 {
-#    set t1 [time {
-#      execsql {CREATE TABLE tbl2 (f1 int, f2 int, f3 int); BEGIN;}
-#      for {set i 1} {$i<=30000} {incr i} {
-#        set i2 [expr {$i*2}]
-#        set i3 [expr {$i*3}]
-#        db eval {INSERT INTO tbl2 VALUES($i,$i2,$i3)}
-#      }
-#      execsql {COMMIT}
-#    }]
-#    list
-#  } {}
-#  puts "time with cache: $::t1"
-#}
-#catch {execsql {DROP TABLE tbl2}}
-#do_test select2-2.0.2 {
-#  set t2 [time {
-#    execsql {CREATE TABLE tbl2 (f1 int, f2 int, f3 int); BEGIN;}
-#    for {set i 1} {$i<=30000} {incr i} {
-#      set i2 [expr {$i*2}]
-#      set i3 [expr {$i*3}]
-#      execsql "INSERT INTO tbl2 VALUES($i,$i2,$i3)"
-#    }
-#    execsql {COMMIT}
-#  }]
-#  list
-#} {}
-#puts "time without cache: $t2"
-#ifcapable tclvar {
-#  do_test select2-2.0.3 {
-#    expr {[lindex $t1 0]<[lindex $t2 0]}
-#  } 1
-#}
+ifcapable tclvar {
+  do_test select2-2.0.1 {
+    set t1 [time {
+      execsql {CREATE TABLE tbl2 (f1 int, f2 int, f3 int); BEGIN;}
+      for {set i 1} {$i<=30000} {incr i} {
+        set i2 [expr {$i*2}]
+        set i3 [expr {$i*3}]
+        db eval {INSERT INTO tbl2 VALUES($i,$i2,$i3)}
+      }
+      execsql {COMMIT}
+    }]
+    list
+  } {}
+  puts "time with cache: $::t1"
+}
+catch {execsql {DROP TABLE tbl2}}
+do_test select2-2.0.2 {
+  set t2 [time {
+    execsql {CREATE TABLE tbl2 (f1 int, f2 int, f3 int); BEGIN;}
+    for {set i 1} {$i<=30000} {incr i} {
+      set i2 [expr {$i*2}]
+      set i3 [expr {$i*3}]
+      execsql "INSERT INTO tbl2 VALUES($i,$i2,$i3)"
+    }
+    execsql {COMMIT}
+  }]
+  list
+} {}
+puts "time without cache: $t2"
+ifcapable tclvar {
+  do_test select2-2.0.3 {
+    expr {[lindex $t1 0]<[lindex $t2 0]}
+  } 1
+}
 
 do_test select2-2.1 {
   execsql {SELECT count(*) FROM tbl2}
