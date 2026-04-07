@@ -57,22 +57,31 @@ expect {
 }
 
 test round-midpoint-precision-0-positive {
-    SELECT CAST(round(0.5, 0) AS INTEGER)
+    SELECT round(0.5, 0)
 }
 expect {
+    1.0
+}
+expect @js {
     1
 }
 
 test round-midpoint-precision-0-negative {
-    SELECT CAST(round(-0.5, 0) AS INTEGER)
+    SELECT round(-0.5, 0)
 }
 expect {
+    -1.0
+}
+expect @js {
     -1
 }
 
 test round-midpoint-precision-0-25 {
-    SELECT CAST(round(2.5, 0) AS INTEGER)
+    SELECT round(2.5, 0)
 }
 expect {
+    3.0
+}
+expect @js {
     3
 }
