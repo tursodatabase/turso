@@ -46,6 +46,162 @@ fn parse_max_errors_from_value(value: &Option<Expr>) -> usize {
     }
 }
 
+fn visible_database_ids_for_table_list(connection: &crate::Connection) -> Vec<usize> {
+    let mut ids = vec![crate::MAIN_DB_ID, crate::TEMP_DB_ID];
+    let mut attached_ids: Vec<_> = connection
+        .attached_databases()
+        .read()
+        .index_to_data
+        .keys()
+        .copied()
+        .collect();
+    attached_ids.sort_unstable();
+    ids.extend(attached_ids);
+    ids
+}
+
+fn display_table_list_name(database_id: usize, name: &str) -> String {
+    if database_id == crate::TEMP_DB_ID
+        && name.eq_ignore_ascii_case(crate::schema::SCHEMA_TABLE_NAME)
+    {
+        "sqlite_temp_schema".to_string()
+    } else {
+        name.to_string()
+    }
+}
+
+fn normalize_table_pragma_lookup_name(database_id: usize, name: &str) -> String {
+    let normalized = normalize_ident(name);
+    if database_id == crate::TEMP_DB_ID
+        && (normalized.eq_ignore_ascii_case("sqlite_temp_schema")
+            || normalized.eq_ignore_ascii_case("sqlite_temp_master"))
+    {
+        crate::schema::SCHEMA_TABLE_NAME.to_string()
+    } else if normalized.eq_ignore_ascii_case("sqlite_master") {
+        crate::schema::SCHEMA_TABLE_NAME.to_string()
+    } else {
+        normalized
+    }
+}
+
+fn resolve_table_pragma_database_id(
+    resolver: &Resolver,
+    default_database_id: usize,
+    schema_was_explicit: bool,
+    table_name: &str,
+) -> crate::Result<usize> {
+    if schema_was_explicit {
+        return Ok(default_database_id);
+    }
+
+    if table_name.eq_ignore_ascii_case("sqlite_temp_schema")
+        || table_name.eq_ignore_ascii_case("sqlite_temp_master")
+    {
+        return Ok(crate::TEMP_DB_ID);
+    }
+
+    let qualified_name = ast::QualifiedName {
+        db_name: None,
+        name: ast::Name::exact(table_name.to_string()),
+        alias: None,
+    };
+    resolver.resolve_existing_table_database_id(&qualified_name)
+}
+
+fn resolve_index_pragma_database_id(
+    resolver: &Resolver,
+    default_database_id: usize,
+    schema_was_explicit: bool,
+    index_name: &str,
+) -> crate::Result<usize> {
+    if schema_was_explicit {
+        return Ok(default_database_id);
+    }
+
+    let qualified_name = ast::QualifiedName {
+        db_name: None,
+        name: ast::Name::exact(index_name.to_string()),
+        alias: None,
+    };
+    resolver.resolve_existing_index_database_id(&qualified_name)
+}
+
+fn emit_table_list_rows_for_schema(
+    program: &mut ProgramBuilder,
+    schema: &Schema,
+    database_id: usize,
+    database_name: &str,
+    base_reg: usize,
+    filter_name: Option<&str>,
+) {
+    let emit_table_row = |program: &mut ProgramBuilder,
+                          name: &str,
+                          obj_type: &str,
+                          ncol: usize,
+                          wr: bool,
+                          strict: bool| {
+        program.emit_string8(database_name.to_string(), base_reg);
+        program.emit_string8(display_table_list_name(database_id, name), base_reg + 1);
+        program.emit_string8(obj_type.to_string(), base_reg + 2);
+        program.emit_int(ncol as i64, base_reg + 3);
+        program.emit_int(wr as i64, base_reg + 4);
+        program.emit_int(strict as i64, base_reg + 5);
+        program.emit_result_row(base_reg, 6);
+    };
+
+    if let Some(filter_name) = filter_name {
+        let lookup_name = normalize_table_pragma_lookup_name(database_id, filter_name);
+        if let Some(table) = schema.get_table(&lookup_name) {
+            let (wr, strict) = match table.btree() {
+                Some(bt) => (!bt.has_rowid, bt.is_strict),
+                None => (false, false),
+            };
+            emit_table_row(
+                program,
+                table.get_name(),
+                "table",
+                table.columns().len(),
+                wr,
+                strict,
+            );
+        } else if let Some(view) = schema.get_view(&lookup_name) {
+            emit_table_row(
+                program,
+                &view.name,
+                "view",
+                view.columns.len(),
+                false,
+                false,
+            );
+        }
+        return;
+    }
+
+    for table in schema.tables.values() {
+        let Some(bt) = table.btree() else {
+            continue;
+        };
+        emit_table_row(
+            program,
+            &bt.name,
+            "table",
+            bt.columns.len(),
+            !bt.has_rowid,
+            bt.is_strict,
+        );
+    }
+    for view in schema.views.values() {
+        emit_table_row(
+            program,
+            &view.name,
+            "view",
+            view.columns.len(),
+            false,
+            false,
+        );
+    }
+}
+
 pub fn translate_pragma(
     resolver: &Resolver,
     name: &ast::QualifiedName,
@@ -72,6 +228,7 @@ pub fn translate_pragma(
     };
 
     let database_id = resolver.resolve_database_id(name)?;
+    let schema_was_explicit = name.db_name.is_some();
 
     let mode = match body {
         None => query_pragma(
@@ -81,6 +238,7 @@ pub fn translate_pragma(
             pager,
             connection,
             database_id,
+            schema_was_explicit,
             program,
         )?,
         Some(ast::PragmaBody::Equals(value) | ast::PragmaBody::Call(value)) => match pragma {
@@ -100,6 +258,7 @@ pub fn translate_pragma(
                 pager,
                 connection,
                 database_id,
+                schema_was_explicit,
                 program,
             )?,
             _ => update_pragma(
@@ -109,6 +268,7 @@ pub fn translate_pragma(
                 pager,
                 connection,
                 database_id,
+                schema_was_explicit,
                 program,
             )?,
         },
@@ -144,6 +304,7 @@ fn update_pragma(
     pager: Arc<Pager>,
     connection: Arc<crate::Connection>,
     database_id: usize,
+    schema_was_explicit: bool,
     program: &mut ProgramBuilder,
 ) -> crate::Result<TransactionMode> {
     let parse_pragma_enabled = |expr: &ast::Expr| -> bool {
@@ -245,6 +406,7 @@ fn update_pragma(
                 pager,
                 connection,
                 database_id,
+                schema_was_explicit,
                 program,
             )
         }
@@ -268,6 +430,7 @@ fn update_pragma(
             pager,
             connection,
             database_id,
+            schema_was_explicit,
             program,
         ),
         PragmaName::ModuleList => Ok(TransactionMode::None),
@@ -278,6 +441,7 @@ fn update_pragma(
             pager,
             connection,
             database_id,
+            schema_was_explicit,
             program,
         ),
         PragmaName::MaxPageCount => {
@@ -456,6 +620,7 @@ fn update_pragma(
             pager,
             connection,
             database_id,
+            schema_was_explicit,
             program,
         ),
         PragmaName::FreelistCount => query_pragma(
@@ -465,6 +630,7 @@ fn update_pragma(
             pager,
             connection,
             database_id,
+            schema_was_explicit,
             program,
         ),
         PragmaName::EncryptionKey => {
@@ -571,6 +737,9 @@ fn update_pragma(
                     _ => bail_parse_error!("temp_store must be 0, 1, 2, DEFAULT, FILE, or MEMORY"),
                 })
             };
+            if !connection.get_auto_commit() && connection.temp_database.read().is_some() {
+                bail_parse_error!("temporary storage cannot be changed from within a transaction");
+            }
             connection.set_temp_store(temp_store);
             Ok(TransactionMode::None)
         }
@@ -581,6 +750,7 @@ fn update_pragma(
             pager,
             connection,
             database_id,
+            schema_was_explicit,
             program,
         ),
     }
@@ -593,6 +763,7 @@ fn query_pragma(
     pager: Arc<Pager>,
     connection: Arc<crate::Connection>,
     database_id: usize,
+    schema_was_explicit: bool,
     program: &mut ProgramBuilder,
 ) -> crate::Result<TransactionMode> {
     let schema = resolver.schema();
@@ -809,7 +980,13 @@ fn query_pragma(
             program.alloc_registers(2);
 
             if let Some(index_name) = index_name {
-                resolver.with_schema(database_id, |schema| {
+                let index_database_id = resolve_index_pragma_database_id(
+                    resolver,
+                    database_id,
+                    schema_was_explicit,
+                    &index_name,
+                )?;
+                resolver.with_schema(index_database_id, |schema| {
                     let index = schema
                         .indexes
                         .values()
@@ -844,7 +1021,13 @@ fn query_pragma(
             program.alloc_registers(5);
 
             if let Some(index_name) = index_name {
-                resolver.with_schema(database_id, |schema| {
+                let index_database_id = resolve_index_pragma_database_id(
+                    resolver,
+                    database_id,
+                    schema_was_explicit,
+                    &index_name,
+                )?;
+                resolver.with_schema(index_database_id, |schema| {
                     let index = schema
                         .indexes
                         .values()
@@ -900,7 +1083,13 @@ fn query_pragma(
             program.alloc_registers(4);
 
             if let Some(table_name) = table_name {
-                resolver.with_schema(database_id, |schema| {
+                let table_database_id = resolve_table_pragma_database_id(
+                    resolver,
+                    database_id,
+                    schema_was_explicit,
+                    &table_name,
+                )?;
+                resolver.with_schema(table_database_id, |schema| {
                     if let Some(table) = schema.get_table(&table_name) {
                         let pk_cols: Vec<String> = table
                             .btree()
@@ -952,82 +1141,31 @@ fn query_pragma(
                 Some(ast::Expr::Name(name)) => Some(normalize_ident(name.as_str())),
                 _ => None,
             };
-            let database_name = connection
-                .get_database_name_by_index(database_id)
-                .unwrap_or_else(|| "main".to_string());
 
             let base_reg = register;
             // 6 columns: schema, name, type, ncol, wr, strict
             program.alloc_registers(5);
 
-            let emit_table_row = |program: &mut ProgramBuilder,
-                                  name: &str,
-                                  obj_type: &str,
-                                  ncol: usize,
-                                  wr: bool,
-                                  strict: bool| {
-                program.emit_string8(database_name.clone(), base_reg);
-                program.emit_string8(name.to_string(), base_reg + 1);
-                program.emit_string8(obj_type.to_string(), base_reg + 2);
-                program.emit_int(ncol as i64, base_reg + 3);
-                program.emit_int(wr as i64, base_reg + 4);
-                program.emit_int(strict as i64, base_reg + 5);
-                program.emit_result_row(base_reg, 6);
+            let database_ids = if schema_was_explicit {
+                vec![database_id]
+            } else {
+                visible_database_ids_for_table_list(connection.as_ref())
             };
-
-            resolver.with_schema(database_id, |schema| {
-                if let Some(name) = name {
-                    // Specific table/view lookup
-                    if let Some(table) = schema.get_table(&name) {
-                        let (wr, strict) = match table.btree() {
-                            Some(bt) => (!bt.has_rowid, bt.is_strict),
-                            None => (false, false),
-                        };
-                        emit_table_row(
-                            program,
-                            table.get_name(),
-                            "table",
-                            table.columns().len(),
-                            wr,
-                            strict,
-                        );
-                    } else if let Some(view) = schema.get_view(&name) {
-                        emit_table_row(
-                            program,
-                            &view.name,
-                            "view",
-                            view.columns.len(),
-                            false,
-                            false,
-                        );
-                    }
-                } else {
-                    // List all tables and views (only BTree tables, not built-in virtual tables)
-                    for table in schema.tables.values() {
-                        let Some(bt) = table.btree() else {
-                            continue;
-                        };
-                        emit_table_row(
-                            program,
-                            &bt.name,
-                            "table",
-                            bt.columns.len(),
-                            !bt.has_rowid,
-                            bt.is_strict,
-                        );
-                    }
-                    for view in schema.views.values() {
-                        emit_table_row(
-                            program,
-                            &view.name,
-                            "view",
-                            view.columns.len(),
-                            false,
-                            false,
-                        );
-                    }
-                }
-            });
+            for current_database_id in database_ids {
+                let database_name = connection
+                    .get_database_name_by_index(current_database_id)
+                    .unwrap_or_else(|| "main".to_string());
+                resolver.with_schema(current_database_id, |schema| {
+                    emit_table_list_rows_for_schema(
+                        program,
+                        schema,
+                        current_database_id,
+                        &database_name,
+                        base_reg,
+                        name.as_deref(),
+                    )
+                });
+            }
 
             let pragma_meta = pragma_for(&pragma);
             for col_name in pragma_meta.columns.iter() {
@@ -1045,14 +1183,21 @@ fn query_pragma(
             // we need 6 registers, but first register was allocated at the beginning  of the "query_pragma" function
             program.alloc_registers(5);
             if let Some(name) = name {
-                resolver.with_schema(database_id, |db_schema| {
-                    if let Some(table) = db_schema.get_table(&name) {
+                let table_database_id = resolve_table_pragma_database_id(
+                    resolver,
+                    database_id,
+                    schema_was_explicit,
+                    &name,
+                )?;
+                let lookup_name = normalize_table_pragma_lookup_name(table_database_id, &name);
+                resolver.with_schema(table_database_id, |db_schema| {
+                    if let Some(table) = db_schema.get_table(&lookup_name) {
                         emit_columns_for_table_info(program, table.columns(), base_reg, false);
-                    } else if let Some(view_mutex) = db_schema.get_materialized_view(&name) {
+                    } else if let Some(view_mutex) = db_schema.get_materialized_view(&lookup_name) {
                         let view = view_mutex.lock();
                         let flat_columns = view.column_schema.flat_columns();
                         emit_columns_for_table_info(program, &flat_columns, base_reg, false);
-                    } else if let Some(view) = db_schema.get_view(&name) {
+                    } else if let Some(view) = db_schema.get_view(&lookup_name) {
                         emit_columns_for_table_info(program, &view.columns, base_reg, false);
                     }
                 });
@@ -1073,14 +1218,21 @@ fn query_pragma(
             // we need 7 registers, but first register was allocated at the beginning  of the "query_pragma" function
             program.alloc_registers(6);
             if let Some(name) = name {
-                resolver.with_schema(database_id, |db_schema| {
-                    if let Some(table) = db_schema.get_table(&name) {
+                let table_database_id = resolve_table_pragma_database_id(
+                    resolver,
+                    database_id,
+                    schema_was_explicit,
+                    &name,
+                )?;
+                let lookup_name = normalize_table_pragma_lookup_name(table_database_id, &name);
+                resolver.with_schema(table_database_id, |db_schema| {
+                    if let Some(table) = db_schema.get_table(&lookup_name) {
                         emit_columns_for_table_info(program, table.columns(), base_reg, true);
-                    } else if let Some(view_mutex) = db_schema.get_materialized_view(&name) {
+                    } else if let Some(view_mutex) = db_schema.get_materialized_view(&lookup_name) {
                         let view = view_mutex.lock();
                         let flat_columns = view.column_schema.flat_columns();
                         emit_columns_for_table_info(program, &flat_columns, base_reg, true);
-                    } else if let Some(view) = db_schema.get_view(&name) {
+                    } else if let Some(view) = db_schema.get_view(&lookup_name) {
                         emit_columns_for_table_info(program, &view.columns, base_reg, true);
                     }
                 });
