@@ -178,8 +178,6 @@ impl JsonCacheCell {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::str::FromStr;
-
     // Helper function to create test Value and Jsonb from JSON string
     fn create_test_pair(json_str: &str) -> (Value, Jsonb) {
         // Create Value as text representation of JSON

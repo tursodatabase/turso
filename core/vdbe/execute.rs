@@ -6785,7 +6785,6 @@ pub fn op_function(
                 #[cfg(feature = "json")]
                 'outer: {
                     use crate::types::ValueIterator;
-                    use std::str::FromStr;
 
                     let columns_str = state.registers[*start_reg].get_value();
                     let bin_record = state.registers[*start_reg + 1].get_value();

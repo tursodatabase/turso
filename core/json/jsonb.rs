@@ -1536,7 +1536,13 @@ impl Jsonb {
         cursor
     }
 
-    fn deserialize_value(&mut self, input: &[u8], mut pos: usize, depth: usize) -> PResult<usize> {
+    fn deserialize_value(
+        &mut self,
+        input: &[u8],
+        mut pos: usize,
+        depth: usize,
+        strict: bool,
+    ) -> PResult<usize> {
         if depth > MAX_JSON_DEPTH {
             return Err(PError::Message {
                 msg: "Too deep".to_string(),
@@ -1555,11 +1561,11 @@ impl Jsonb {
         match input[pos] {
             b'{' => {
                 pos += 1; // consume '{'
-                pos = self.deserialize_obj(input, pos, depth + 1)?;
+                pos = self.deserialize_obj(input, pos, depth + 1, strict)?;
             }
             b'[' => {
                 pos += 1; // consume '['
-                pos = self.deserialize_array(input, pos, depth + 1)?;
+                pos = self.deserialize_array(input, pos, depth + 1, strict)?;
             }
             b't' => {
                 pos = self.deserialize_true(input, pos)?;
@@ -1568,10 +1574,18 @@ impl Jsonb {
                 pos = self.deserialize_false(input, pos)?;
             }
             b'n' | b'N' => {
-                pos = self.deserialize_null_or_nan(input, pos)?;
+                // In strict RFC 8259 mode, only lowercase 'n' is valid (for "null").
+                // Uppercase 'N' starts NaN which is JSON5-only.
+                if strict && input[pos] == b'N' {
+                    return Err(PError::Message {
+                        msg: "Unexpected character".to_string(),
+                        location: Some(pos),
+                    });
+                }
+                pos = self.deserialize_null_or_nan(input, pos, strict)?;
             }
             b'"' | b'\'' => {
-                pos = self.deserialize_string(input, pos)?;
+                pos = self.deserialize_string(input, pos, strict)?;
             }
             c if c.is_ascii_digit()
                 || c == b'-'
@@ -1579,7 +1593,7 @@ impl Jsonb {
                 || c == b'.'
                 || c.eq_ignore_ascii_case(&b'i') =>
             {
-                pos = self.deserialize_number(input, pos)?;
+                pos = self.deserialize_number(input, pos, strict)?;
             }
             _ => {
                 return Err(PError::Message {
@@ -1592,7 +1606,13 @@ impl Jsonb {
         Ok(pos)
     }
 
-    fn deserialize_obj(&mut self, input: &[u8], mut pos: usize, depth: usize) -> PResult<usize> {
+    fn deserialize_obj(
+        &mut self,
+        input: &[u8],
+        mut pos: usize,
+        depth: usize,
+        strict: bool,
+    ) -> PResult<usize> {
         if depth > MAX_JSON_DEPTH {
             return Err(PError::Message {
                 msg: "Too deep".to_string(),
@@ -1657,10 +1677,17 @@ impl Jsonb {
                             location: Some(pos),
                         });
                     }
+                    // Strict RFC 8259: trailing comma before '}' is not allowed
+                    if strict && input[pos] == b'}' {
+                        return Err(PError::Message {
+                            msg: "Trailing comma in object".to_string(),
+                            location: Some(pos),
+                        });
+                    }
                 }
                 _ => {
                     // Parse key (must be string)
-                    pos = self.deserialize_string(input, pos)?;
+                    pos = self.deserialize_string(input, pos, strict)?;
 
                     pos = skip_whitespace(input, pos);
                     if pos >= input.len() || input[pos] != b':' {
@@ -1674,7 +1701,7 @@ impl Jsonb {
                     pos = skip_whitespace(input, pos);
 
                     // Parse value - can be any JSON value including another object
-                    pos = self.deserialize_value(input, pos, depth + 1)?;
+                    pos = self.deserialize_value(input, pos, depth + 1, strict)?;
                     pos = skip_whitespace(input, pos);
                     if pos < input.len() && !matches!(input[pos], b',' | b'}') {
                         return Err(PError::Message {
@@ -1688,7 +1715,13 @@ impl Jsonb {
         }
     }
 
-    fn deserialize_array(&mut self, input: &[u8], mut pos: usize, depth: usize) -> PResult<usize> {
+    fn deserialize_array(
+        &mut self,
+        input: &[u8],
+        mut pos: usize,
+        depth: usize,
+        strict: bool,
+    ) -> PResult<usize> {
         if depth > MAX_JSON_DEPTH {
             return Err(PError::Message {
                 msg: "Too deep".to_string(),
@@ -1744,12 +1777,19 @@ impl Jsonb {
                             location: Some(pos),
                         });
                     }
+                    // Strict RFC 8259: trailing comma before ']' is not allowed
+                    if strict && input[pos] == b']' {
+                        return Err(PError::Message {
+                            msg: "Trailing comma in array".to_string(),
+                            location: Some(pos),
+                        });
+                    }
                 }
                 _ => {
                     pos = skip_whitespace(input, pos);
 
                     // Parse array element
-                    pos = self.deserialize_value(input, pos, depth + 1)?;
+                    pos = self.deserialize_value(input, pos, depth + 1, strict)?;
 
                     first = false;
                 }
@@ -1757,7 +1797,12 @@ impl Jsonb {
         }
     }
 
-    fn deserialize_string(&mut self, input: &[u8], mut pos: usize) -> PResult<usize> {
+    fn deserialize_string(
+        &mut self,
+        input: &[u8],
+        mut pos: usize,
+        strict: bool,
+    ) -> PResult<usize> {
         if pos >= input.len() {
             return Err(PError::Message {
                 msg: "Unexpected end of input".to_string(),
@@ -1767,6 +1812,15 @@ impl Jsonb {
 
         let string_start = self.len();
         let quote = input[pos];
+
+        // Strict RFC 8259: only double-quoted strings allowed
+        if strict && quote != b'"' {
+            return Err(PError::Message {
+                msg: "Expected double-quoted string".to_string(),
+                location: Some(pos),
+            });
+        }
+
         pos += 1; // consume quote
 
         let quoted = quote == b'"' || quote == b'\'';
@@ -2008,7 +2062,12 @@ impl Jsonb {
         Ok(pos)
     }
 
-    fn deserialize_number(&mut self, input: &[u8], mut pos: usize) -> PResult<usize> {
+    fn deserialize_number(
+        &mut self,
+        input: &[u8],
+        mut pos: usize,
+        strict: bool,
+    ) -> PResult<usize> {
         let num_start = self.len();
         let mut len = 0;
         let mut is_float = false;
@@ -2025,6 +2084,13 @@ impl Jsonb {
         // Handle sign
         if pos < input.len() && (input[pos] == b'-' || input[pos] == b'+') {
             if input[pos] == b'+' {
+                // Strict RFC 8259: + sign prefix not allowed
+                if strict {
+                    return Err(PError::Message {
+                        msg: "Unexpected character".to_string(),
+                        location: Some(pos),
+                    });
+                }
                 is_json5 = true;
                 pos += 1;
             } else {
@@ -2036,6 +2102,13 @@ impl Jsonb {
 
         // Handle JSON5 float starting with dot
         if pos < input.len() && input[pos] == b'.' {
+            // Strict RFC 8259: leading dot (.5) not allowed
+            if strict {
+                return Err(PError::Message {
+                    msg: "Unexpected character".to_string(),
+                    location: Some(pos),
+                });
+            }
             is_json5 = true;
             is_float = true;
         }
@@ -2048,6 +2121,13 @@ impl Jsonb {
             has_digit = true;
 
             if pos < input.len() && (input[pos] == b'x' || input[pos] == b'X') {
+                // Strict RFC 8259: hex numbers not allowed
+                if strict {
+                    return Err(PError::Message {
+                        msg: "Unexpected character".to_string(),
+                        location: Some(pos),
+                    });
+                }
                 // Hexadecimal number
                 self.data.push(input[pos]);
                 pos += 1;
@@ -2083,8 +2163,14 @@ impl Jsonb {
             }
         }
 
-        // Check for Infinity
+        // Check for Infinity (JSON5 only)
         if pos < input.len() && (input[pos] == b'I' || input[pos] == b'i') {
+            if strict {
+                return Err(PError::Message {
+                    msg: "Unexpected character".to_string(),
+                    location: Some(pos),
+                });
+            }
             // Try to match "Infinity"
             let infinity = b"infinity";
             let mut i = 0;
@@ -2139,8 +2225,14 @@ impl Jsonb {
                     pos += 1;
                     len += 1;
 
-                    // Check for trailing dot
+                    // Check for trailing dot (e.g. "1." — JSON5 only)
                     if pos >= input.len() || !input[pos].is_ascii_digit() {
+                        if strict {
+                            return Err(PError::Message {
+                                msg: "Trailing dot in number".to_string(),
+                                location: Some(pos),
+                            });
+                        }
                         is_json5 = true;
                     }
                 }
@@ -2233,7 +2325,12 @@ impl Jsonb {
         Ok(pos)
     }
 
-    pub fn deserialize_null_or_nan(&mut self, input: &[u8], mut pos: usize) -> PResult<usize> {
+    pub fn deserialize_null_or_nan(
+        &mut self,
+        input: &[u8],
+        mut pos: usize,
+        strict: bool,
+    ) -> PResult<usize> {
         // First check if we have enough bytes remaining for "nan" (minimum 3 bytes)
         if pos + 3 > input.len() {
             return Err(PError::Message {
@@ -2254,8 +2351,9 @@ impl Jsonb {
             return Ok(pos);
         }
 
-        // Fast path for "nan"
-        if pos + 3 <= input.len()
+        // Fast path for "nan" (JSON5 only — reject in strict mode)
+        if !strict
+            && pos + 3 <= input.len()
             && (input[pos] == b'n' || input[pos] == b'N')
             && (input[pos + 1] == b'a' || input[pos + 1] == b'A')
             && (input[pos + 2] == b'n' || input[pos + 2] == b'N')
@@ -2326,7 +2424,12 @@ impl Jsonb {
         Ok(new_len)
     }
 
-    fn from_str(input: &str) -> PResult<Self> {
+    /// Parse a JSON string (lenient, accepts JSON5 extensions like sqlite3's json()).
+    pub fn from_str(input: &str) -> PResult<Self> {
+        Self::parse_json(input, false)
+    }
+
+    fn parse_json(input: &str, strict: bool) -> PResult<Self> {
         let mut result = Self::new(input.len(), None);
         let input = input.as_bytes();
 
@@ -2339,7 +2442,7 @@ impl Jsonb {
 
         // Parse the first complete JSON value
         let mut pos = 0;
-        pos = result.deserialize_value(input, pos, 0)?;
+        pos = result.deserialize_value(input, pos, 0, strict)?;
 
         // Skip any trailing whitespace
         pos = skip_whitespace(input, pos);
@@ -2362,10 +2465,18 @@ impl Jsonb {
             let mut str = input.replace('\\', "\\\\").replace('"', "\\\"");
             str.insert(0, '"');
             str.push('"');
-            Jsonb::from_str(&str)
+            Self::parse_json(&str, false)
         } else {
-            Jsonb::from_str(input)
+            Self::parse_json(input, false)
         }
+    }
+
+    /// Parse JSON with strict RFC 8259 validation.
+    /// Rejects JSON5 extensions: trailing commas, single-quoted strings,
+    /// unquoted keys, hex numbers, +sign prefix, NaN, Infinity, leading/trailing dots.
+    /// Used by json_valid() which must reject non-standard JSON.
+    pub fn from_str_rfc8259(input: &str) -> PResult<Self> {
+        Self::parse_json(input, true)
     }
 
     pub fn from_raw_data(data: &[u8]) -> Self {
@@ -3276,7 +3387,7 @@ impl std::str::FromStr for Jsonb {
     type Err = PError;
 
     fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
-        Self::from_str(s)
+        Self::parse_json(s, false)
     }
 }
 

@@ -1,0 +1,190 @@
+@database :memory:
+
+test json-valid-trailing-comma-object {
+    SELECT json_valid('{"a":1,}')
+}
+expect {
+    0
+}
+
+test json-valid-trailing-comma-array {
+    SELECT json_valid('[1,]')
+}
+expect {
+    0
+}
+
+test json-valid-unquoted-key {
+    SELECT json_valid('{a:1}')
+}
+expect {
+    0
+}
+
+test json-valid-single-quoted-string {
+    SELECT json_valid('''hello''')
+}
+expect {
+    0
+}
+
+test json-valid-plus-sign {
+    SELECT json_valid('+1')
+}
+expect {
+    0
+}
+
+test json-valid-leading-dot {
+    SELECT json_valid('.5')
+}
+expect {
+    0
+}
+
+test json-valid-trailing-dot {
+    SELECT json_valid('1.')
+}
+expect {
+    0
+}
+
+test json-valid-hex-number {
+    SELECT json_valid('0xFF')
+}
+expect {
+    0
+}
+
+test json-valid-nan {
+    SELECT json_valid('NaN')
+}
+expect {
+    0
+}
+
+test json-valid-infinity {
+    SELECT json_valid('Infinity')
+}
+expect {
+    0
+}
+
+test json-valid-standard-object {
+    SELECT json_valid('{"a":1}')
+}
+expect {
+    1
+}
+
+test json-valid-standard-array {
+    SELECT json_valid('[1,2,3]')
+}
+expect {
+    1
+}
+
+test json-valid-standard-string {
+    SELECT json_valid('"hello"')
+}
+expect {
+    1
+}
+
+test json-valid-standard-number {
+    SELECT json_valid('42')
+}
+expect {
+    1
+}
+
+test json-valid-standard-float {
+    SELECT json_valid('3.14')
+}
+expect {
+    1
+}
+
+test json-valid-standard-true {
+    SELECT json_valid('true')
+}
+expect {
+    1
+}
+
+test json-valid-standard-false {
+    SELECT json_valid('false')
+}
+expect {
+    1
+}
+
+test json-valid-standard-null {
+    SELECT json_valid('null')
+}
+expect {
+    1
+}
+
+test json-valid-nested {
+    SELECT json_valid('{"nested":{"a":[1,2]}}')
+}
+expect {
+    1
+}
+
+test json-valid-negative-number {
+    SELECT json_valid('-42')
+}
+expect {
+    1
+}
+
+test json-valid-exponent {
+    SELECT json_valid('1.5e10')
+}
+expect {
+    1
+}
+
+test json-valid-integer-type {
+    SELECT json_valid(123)
+}
+expect {
+    1
+}
+
+test json-valid-float-type {
+    SELECT json_valid(12.5)
+}
+expect {
+    1
+}
+
+test json-accepts-trailing-comma-object {
+    SELECT json('{"a":1,}')
+}
+expect {
+    {"a":1}
+}
+
+test json-accepts-trailing-comma-array {
+    SELECT json('[1,]')
+}
+expect {
+    [1]
+}
+
+test json-accepts-unquoted-key {
+    SELECT json('{a:1}')
+}
+expect {
+    {"a":1}
+}
+
+test json-accepts-plus-sign {
+    SELECT json('+1')
+}
+expect {
+    1
+}

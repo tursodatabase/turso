@@ -107,6 +107,15 @@ fn parse_as_json_text(slice: &[u8], mode: Conv) -> crate::Result<Jsonb> {
     Jsonb::from_str_with_mode(str, mode).map_err(Into::into)
 }
 
+/// Parse as strict RFC 8259 JSON text, rejecting JSON5 extensions.
+fn parse_as_json_text_rfc8259(slice: &[u8]) -> crate::Result<Jsonb> {
+    let zero_pos = slice.iter().position(|&b| b == 0).unwrap_or(slice.len());
+    let truncated = &slice[..zero_pos];
+    let str = std::str::from_utf8(truncated)
+        .map_err(|_| LimboError::ParseError("malformed JSON".to_string()))?;
+    Jsonb::from_str_rfc8259(str).map_err(Into::into)
+}
+
 fn is_jsonb_blob(slice: &[u8]) -> bool {
     let Ok((header, header_offset)) = JsonbHeader::from_slice(0, slice) else {
         return false;
@@ -833,6 +842,9 @@ where
 
 /// Tries to convert the value to jsonb. Returns Value::from_i64(1) if the conversion
 /// succeeded, and Value::from_i64(0) if it didn't.
+/// Validates JSON per RFC 8259 (strict). Rejects JSON5 extensions that
+/// json()/json_extract() accept: trailing commas, single-quoted strings,
+/// unquoted keys, hex numbers, +prefix, NaN, Infinity, leading/trailing dots.
 pub fn is_json_valid(json_value: impl AsValueRef) -> Value {
     let json_value = json_value.as_value_ref();
     match json_value {
@@ -846,11 +858,15 @@ pub fn is_json_valid(json_value: impl AsValueRef) -> Value {
             if is_jsonb_blob(slice) {
                 Value::from_i64(0)
             } else {
-                parse_as_json_text(slice, Conv::Strict)
+                parse_as_json_text_rfc8259(slice)
                     .map(|_| Value::from_i64(1))
                     .unwrap_or_else(|_| Value::from_i64(0))
             }
         }
+        ValueRef::Text(text) => Jsonb::from_str_rfc8259(text.as_str())
+            .map(|_| Value::from_i64(1))
+            .unwrap_or_else(|_| Value::from_i64(0)),
+        // Numeric values (integers, floats) are valid JSON
         _ => convert_dbtype_to_jsonb(json_value, Conv::Strict)
             .map(|_| Value::from_i64(1))
             .unwrap_or_else(|_| Value::from_i64(0)),
