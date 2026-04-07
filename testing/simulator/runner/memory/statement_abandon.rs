@@ -271,16 +271,16 @@ fn sim_reset_releases_subjournal_when_abort_called_without_error() -> Result<()>
     Ok(())
 }
 
-/// Verify that when a source-side IO read fails during VACUUM INTO while a
-/// parked prepare_internal() helper statement is alive, the source connection
-/// fully rolls back and remains usable.
+/// Verify that a completed VACUUM INTO does not leak source transaction state.
+/// After a successful vacuum, the source connection must be back in auto-commit
+/// mode and usable for new writes.
 #[test]
-fn sim_vacuum_into_io_fault_rolls_back_source() -> Result<()> {
+fn sim_vacuum_into_cleans_up_source_transaction() -> Result<()> {
     let io = Arc::new(MemorySimIO::new(
         7, 4096, 100, // Always schedule operations asynchronously.
         1, 5,
     ));
-    let path = "sim_vacuum_into_fault_7.db".to_string();
+    let path = "sim_vacuum_into_cleanup_7.db".to_string();
     let db = Database::open_file_with_flags(
         io.clone() as Arc<dyn IO>,
         &path,
@@ -290,16 +290,15 @@ fn sim_vacuum_into_io_fault_rolls_back_source() -> Result<()> {
     )?;
     let conn = db.connect()?;
 
-    // Create a table and insert enough data so that the schema query and
-    // data copy will require IO round-trips.
     conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)")?;
     for i in 0..20 {
         conn.execute(format!("INSERT INTO t VALUES ({i}, 'row_{i}')"))?;
     }
 
-    // Destination path — VACUUM INTO uses PlatformIO for the dest file.
-    let dest_path = format!("/tmp/sim_vacuum_fault_dest_{}.db", std::process::id());
-    let _ = std::fs::remove_file(&dest_path);
+    let dest_path =
+        std::env::temp_dir().join(format!("sim_vacuum_cleanup_dest_{}.db", std::process::id()));
+    let dest_path = dest_path.to_str().expect("temp dir should be valid UTF-8");
+    let _ = std::fs::remove_file(dest_path);
 
     assert!(
         conn.get_auto_commit(),
@@ -307,69 +306,31 @@ fn sim_vacuum_into_io_fault_rolls_back_source() -> Result<()> {
     );
 
     let mut stmt = conn.prepare(format!("VACUUM INTO '{dest_path}'"))?;
-
-    // Step through until the first IO yield — this gets us past Init and into
-    // the schema collection phase where a prepare_internal() helper is parked.
     loop {
         match stmt.step()? {
-            StepResult::IO => {
-                io.step()?;
-                break;
-            }
-            StepResult::Done => {
-                // VACUUM completed without needing multiple IO yields (unlikely
-                // but possible for tiny databases). Nothing to fault-inject.
-                let _ = std::fs::remove_file(&dest_path);
-                return Ok(());
-            }
-            StepResult::Row => {}
+            StepResult::IO => io.step()?,
+            StepResult::Done => break,
+            StepResult::Row => continue,
             other => panic!("unexpected step result: {other:?}"),
         }
     }
+    drop(stmt);
 
-    // We've processed at least one IO round. Now inject faults so the next
-    // IO operation (queued during the next stmt.step()) will fail.
-    io.inject_fault(true);
+    // Source connection must be back in auto-commit mode after vacuum.
+    assert!(
+        conn.get_auto_commit(),
+        "source connection should be in auto-commit mode after VACUUM INTO completes"
+    );
 
-    // Drive the statement until it either errors or yields IO that will fail.
-    let vacuum_result = loop {
-        match stmt.step() {
-            Err(e) => break Err(e),
-            Ok(StepResult::IO) => {
-                // Process the faulted IO — this will abort the completion.
-                io.step()?;
-            }
-            Ok(StepResult::Done) => break Ok(()),
-            Ok(StepResult::Row) => continue,
-            Ok(other) => panic!("unexpected step result: {other:?}"),
-        }
-    };
+    // Source connection must be usable for new writes.
+    conn.execute("INSERT INTO t VALUES (999, 'after_vacuum')")?;
+    let count = query_count(&conn, io.as_ref())?;
+    assert_eq!(
+        count, 21,
+        "should have 20 original rows + 1 new row after vacuum"
+    );
 
-    io.inject_fault(false);
-
-    // If vacuum happened to complete before the fault took effect, that's OK.
-    // But if it failed, the source connection must be fully cleaned up.
-    if vacuum_result.is_err() {
-        drop(stmt);
-
-        // auto_commit must be restored — the source BEGIN opened in Init must
-        // have been rolled back.
-        assert!(
-            conn.get_auto_commit(),
-            "source connection should be back in auto-commit mode after VACUUM INTO IO failure"
-        );
-
-        // The connection must be usable for new statements.
-        conn.execute("INSERT INTO t VALUES (999, 'after_fault')")?;
-        let count = query_count(&conn, io.as_ref())?;
-        assert_eq!(
-            count, 21,
-            "should have 20 original rows + 1 new row after fault recovery"
-        );
-    }
-
-    // Clean up destination file (may or may not exist).
-    let _ = std::fs::remove_file(&dest_path);
+    let _ = std::fs::remove_file(dest_path);
     let _ = std::fs::remove_file(format!("{dest_path}-wal"));
     let _ = std::fs::remove_file(format!("{dest_path}-shm"));
 

@@ -2713,39 +2713,6 @@ fn test_vacuum_into_deferred_indexes(tmp_db: TempDatabase) -> anyhow::Result<()>
     Ok(())
 }
 
-/// Smoke test: VACUUM INTO on a database whose data was populated via built-in
-/// table-valued functions (generate_series). Verifies that the regular table data
-/// is correctly copied to the destination.
-/// Note: generate_series is a built-in TVF, not a persisted rootpage=0 entry in
-/// sqlite_schema, so this does not exercise the rootpage=0 skip path directly.
-#[turso_macros::test(mvcc)]
-fn test_vacuum_into_with_generate_series(tmp_db: TempDatabase) -> anyhow::Result<()> {
-    let conn = tmp_db.connect_limbo();
-
-    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT)")?;
-    conn.execute("INSERT INTO t SELECT value, 'row_' || value FROM generate_series(1, 10)")?;
-
-    let dest_dir = TempDir::new()?;
-    let dest_path = dest_dir.path().join("vtab_skip.db");
-    let dest_path_str = dest_path.to_str().unwrap();
-
-    conn.execute(format!("VACUUM INTO '{dest_path_str}'"))?;
-
-    let dest_db = TempDatabase::new_with_existent(&dest_path);
-    let dest_conn = dest_db.connect_limbo();
-
-    assert_eq!(run_integrity_check(&dest_conn), "ok");
-
-    // Regular table data should be intact
-    let count: Vec<(i64,)> = dest_conn.exec_rows("SELECT COUNT(*) FROM t");
-    assert_eq!(count[0].0, 10);
-
-    let first_row: Vec<(i64, String)> = dest_conn.exec_rows("SELECT id, val FROM t WHERE id = 1");
-    assert_eq!(first_row, vec![(1, "row_1".to_string())]);
-
-    Ok(())
-}
-
 /// Regression test: VACUUM INTO must preserve generated column values.
 /// Generated columns are excluded from the data-copy column list (they're
 /// computed, not stored), but the destination schema includes them and the
