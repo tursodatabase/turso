@@ -6270,6 +6270,18 @@ pub(crate) fn get_expr_affinity_info(
             }
             ExprAffinityInfo::no_affinity()
         }
+        ast::Expr::SubqueryResult {
+            subquery_id,
+            query_type: ast::SubqueryType::RowValue { num_regs, .. },
+            ..
+        } if *num_regs == 1 => {
+            if let Some(resolver) = resolver {
+                if let Some(aff) = resolver.subquery_affinities.borrow().get(subquery_id) {
+                    return *aff;
+                }
+            }
+            ExprAffinityInfo::no_affinity()
+        }
         _ => ExprAffinityInfo::no_affinity(),
     }
 }

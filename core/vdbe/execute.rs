@@ -27,8 +27,8 @@ use crate::util::{
     rewrite_column_level_fk_parent_columns_if_needed, rewrite_column_references_if_needed,
     rewrite_fk_parent_cols_if_self_ref, rewrite_fk_parent_table_if_needed,
     rewrite_inline_col_fk_target_if_needed, rewrite_trigger_cmd_column_refs,
-    rewrite_trigger_cmd_table_refs, rewrite_view_sql_for_column_rename, trim_ascii_whitespace,
-    RewrittenView,
+    rewrite_trigger_cmd_table_refs, rewrite_view_sql_for_column_rename,
+    trigger_still_references_renamed_column, trim_ascii_whitespace, RewrittenView,
 };
 use crate::vdbe::affinity::{
     apply_numeric_affinity, try_for_float, Affinity, NumericParseResult, ParsedNumber,
@@ -10639,6 +10639,15 @@ pub fn op_read_cookie(
             *db,
             |header| match cookie {
                 Cookie::ApplicationId => header.application_id.get().into(),
+                Cookie::DatabaseFormat => header.schema_format.get().into(),
+                Cookie::DatabaseTextEncoding => match header.text_encoding {
+                    crate::storage::sqlite3_ondisk::TextEncoding::Unset
+                    | crate::storage::sqlite3_ondisk::TextEncoding::Utf8 => 1,
+                    crate::storage::sqlite3_ondisk::TextEncoding::Utf16Le => 2,
+                    crate::storage::sqlite3_ondisk::TextEncoding::Utf16Be => 3,
+                    _ => 0,
+                },
+                Cookie::DefaultPageCacheSize => header.default_page_cache_size.get() as i64,
                 Cookie::UserVersion => header.user_version.get().into(),
                 Cookie::SchemaVersion => header.schema_cookie.get().into(),
                 Cookie::LargestRootPageNumber => header.vacuum_mode_largest_root_page.get().into(),
@@ -10695,6 +10704,19 @@ pub fn op_set_cookie(
         |header| {
             match cookie {
                 Cookie::ApplicationId => header.application_id = (*value).into(),
+                Cookie::DatabaseFormat => header.schema_format = (*value as u32).into(),
+                Cookie::DatabaseTextEncoding => {
+                    header.text_encoding = match *value {
+                        1 => crate::storage::sqlite3_ondisk::TextEncoding::Utf8,
+                        2 => crate::storage::sqlite3_ondisk::TextEncoding::Utf16Le,
+                        3 => crate::storage::sqlite3_ondisk::TextEncoding::Utf16Be,
+                        _ => unreachable!("unsupported text encoding cookie value: {}", *value),
+                    };
+                }
+                Cookie::DefaultPageCacheSize => {
+                    header.default_page_cache_size =
+                        crate::storage::sqlite3_ondisk::CacheSize::new(*value as i32);
+                }
                 Cookie::UserVersion => header.user_version = (*value).into(),
                 Cookie::LargestRootPageNumber => {
                     header.vacuum_mode_largest_root_page = (*value as u32).into();
@@ -10720,7 +10742,6 @@ pub fn op_set_cookie(
                     });
                     header.schema_cookie = (*value as u32).into();
                 }
-                cookie => todo!("{cookie:?} is not yet implement for SetCookie"),
             };
         }
     ));
@@ -11746,6 +11767,28 @@ pub fn op_rename_table(
         Ok(())
     })?;
 
+    if *db != crate::TEMP_DB_ID {
+        conn.with_database_schema_mut(crate::TEMP_DB_ID, |schema| -> crate::Result<()> {
+            for (_, triggers) in schema.triggers.iter_mut() {
+                for trigger_arc in triggers.iter_mut() {
+                    let trigger = Arc::make_mut(trigger_arc);
+                    let old_sql = trigger.sql.clone();
+                    for cmd in &mut trigger.commands {
+                        rewrite_trigger_cmd_table_refs(cmd, &normalized_from, &normalized_to);
+                    }
+                    if let Some(ref mut when) = trigger.when_clause {
+                        rewrite_check_expr_table_refs(when, &normalized_from, &normalized_to);
+                    }
+                    let new_sql = regenerate_trigger_sql(trigger);
+                    if new_sql != old_sql {
+                        trigger.sql = new_sql;
+                    }
+                }
+            }
+            Ok(())
+        })?;
+    }
+
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
 }
@@ -12096,50 +12139,66 @@ pub fn op_alter_column(
     })?;
 
     if *rename {
-        let old_col = old_column_name.clone();
-        let new_col = new_name;
         let tbl_name = normalized_table_name.clone();
-        // Update in-memory trigger objects for the renamed column
-        conn.with_database_schema_mut(*db, move |schema| {
-            for (_, triggers) in schema.triggers.iter_mut() {
-                for trigger_arc in triggers.iter_mut() {
-                    let trigger_tbl = normalize_ident(&trigger_arc.table_name);
-                    let trigger = Arc::make_mut(trigger_arc);
-                    // Rewrite WHEN clause: only rename NEW.col / OLD.col qualified refs.
-                    // Bare column names in WHEN clauses are invalid per SQLite semantics,
-                    // so we must not rename them (SQLite would error on such triggers).
-                    if let Some(ref mut when) = trigger.when_clause {
-                        rename_identifiers_scoped_when_clause(
-                            when,
-                            &tbl_name,
-                            &trigger_tbl,
-                            &old_col,
-                            &new_col,
-                        );
-                    }
-                    // Rewrite UPDATE OF columns if trigger is on the renamed table
-                    if trigger_tbl == tbl_name {
-                        if let ast::TriggerEvent::UpdateOf(ref mut cols) = trigger.event {
-                            for col in cols {
-                                if normalize_ident(col.as_str()) == normalize_ident(&old_col) {
-                                    *col = ast::Name::exact(new_col.clone());
+        let trigger_schema_ids = if *db == crate::TEMP_DB_ID {
+            vec![crate::TEMP_DB_ID]
+        } else {
+            vec![*db, crate::TEMP_DB_ID]
+        };
+        // Update in-memory trigger objects for the renamed column in both the
+        // altered schema and temp, since temp triggers may reference main/attached tables.
+        for trigger_db_id in trigger_schema_ids {
+            let old_col = old_column_name.clone();
+            let new_col = new_name.clone();
+            let tbl_name = tbl_name.clone();
+            conn.with_database_schema_mut(trigger_db_id, move |schema| {
+                for (_, triggers) in schema.triggers.iter_mut() {
+                    for trigger_arc in triggers.iter_mut() {
+                        let trigger_tbl = normalize_ident(&trigger_arc.table_name);
+                        let trigger = Arc::make_mut(trigger_arc);
+                        // Rewrite WHEN clause: only rename NEW.col / OLD.col qualified refs.
+                        // Bare column names in WHEN clauses are invalid per SQLite semantics,
+                        // so we must not rename them (SQLite would error on such triggers).
+                        if let Some(ref mut when) = trigger.when_clause {
+                            rename_identifiers_scoped_when_clause(
+                                when,
+                                &tbl_name,
+                                &trigger_tbl,
+                                &old_col,
+                                &new_col,
+                            );
+                        }
+                        // Rewrite UPDATE OF columns if trigger is on the renamed table
+                        if trigger_tbl == tbl_name {
+                            if let ast::TriggerEvent::UpdateOf(ref mut cols) = trigger.event {
+                                for col in cols {
+                                    if normalize_ident(col.as_str()) == normalize_ident(&old_col) {
+                                        *col = ast::Name::exact(new_col.clone());
+                                    }
                                 }
                             }
                         }
-                    }
-                    // Rewrite trigger body commands
-                    for cmd in &mut trigger.commands {
-                        rewrite_trigger_cmd_column_refs(
-                            cmd,
-                            &tbl_name,
-                            &trigger_tbl,
-                            &old_col,
-                            &new_col,
-                        );
+                        // Rewrite trigger body commands
+                        for cmd in &mut trigger.commands {
+                            rewrite_trigger_cmd_column_refs(
+                                cmd,
+                                &tbl_name,
+                                &trigger_tbl,
+                                &old_col,
+                                &new_col,
+                            );
+                        }
+                        if trigger_still_references_renamed_column(trigger, &tbl_name, &old_col) {
+                            return Err(LimboError::ParseError(format!(
+                                "error in trigger {} after rename: no such column: {}",
+                                trigger.name, old_col
+                            )));
+                        }
                     }
                 }
-            }
-        });
+                Ok(())
+            })?;
+        }
 
         let rewrites = view_rewrites;
         conn.with_database_schema_mut(*db, move |schema| -> crate::Result<()> {
