@@ -804,10 +804,15 @@ mod tests {
                 let port: u16 = rand::rng().random_range(10_000..=65_535);
                 let server_bin = env::var("LOCAL_SYNC_SERVER").unwrap();
 
+                // IMPORTANT: do not use Stdio::piped() here. Nothing reads from
+                // those pipes, so once the kernel pipe buffer (~64 KiB on Linux)
+                // fills, the child blocks forever inside write() and stops
+                // servicing HTTP requests, deadlocking sync operations in
+                // long-running tests like test_sync_parallel_writes_with_sync_ops.
                 let child = Command::new(server_bin)
                     .args(["--sync-server", &format!("0.0.0.0:{port}")])
-                    .stdout(Stdio::piped())
-                    .stderr(Stdio::piped())
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
                     .spawn()
                     .context("failed to spawn local sync server")?;
 
