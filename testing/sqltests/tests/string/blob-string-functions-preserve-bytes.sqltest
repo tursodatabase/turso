@@ -1,0 +1,43 @@
+@database :memory:
+
+test replace-blob-preserves-non-utf8-bytes {
+    SELECT hex(replace(X'010201', X'02', X'FF'))
+}
+expect {
+    01FF01
+}
+
+test replace-blob-no-match-preserves-bytes {
+    SELECT hex(replace(X'01FF03', X'AA', X'BB'))
+}
+expect {
+    01FF03
+}
+
+test upper-blob-preserves-non-utf8-bytes {
+    SELECT hex(upper(X'61FF62'))
+}
+expect {
+    41FF42
+}
+
+test lower-blob-preserves-non-utf8-bytes {
+    SELECT hex(lower(X'41FF42'))
+}
+expect {
+    61FF62
+}
+
+test replace-blob-ascii-pattern {
+    SELECT hex(replace(X'616263', X'62', X'FF'))
+}
+expect {
+    61FF63
+}
+
+test upper-blob-mixed-ascii {
+    SELECT hex(upper(X'6162006364'))
+}
+expect {
+    4142004344
+}

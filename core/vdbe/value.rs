@@ -182,7 +182,23 @@ enum TrimType {
 }
 
 impl Value {
+    /// Convert raw bytes to Text if valid UTF-8, otherwise to Blob.
+    /// This preserves data integrity for non-UTF-8 blob content that
+    /// passes through string functions (SQLite text can hold arbitrary
+    /// bytes; Rust String cannot).
+    fn bytes_to_text_or_blob(bytes: Vec<u8>) -> Value {
+        match String::from_utf8(bytes) {
+            Ok(s) => Value::build_text(s),
+            Err(e) => Value::Blob(e.into_bytes()),
+        }
+    }
+
     pub fn exec_lower(&self) -> Option<Self> {
+        if let Value::Blob(b) = self {
+            // Preserve raw bytes — only convert ASCII characters
+            let result: Vec<u8> = b.iter().map(|&byte| byte.to_ascii_lowercase()).collect();
+            return Some(Value::bytes_to_text_or_blob(result));
+        }
         self.cast_text()
             .map(|s| Value::build_text(s.to_ascii_lowercase()))
     }
@@ -216,6 +232,11 @@ impl Value {
     }
 
     pub fn exec_upper(&self) -> Option<Self> {
+        if let Value::Blob(b) = self {
+            // Preserve raw bytes — only convert ASCII characters
+            let result: Vec<u8> = b.iter().map(|&byte| byte.to_ascii_uppercase()).collect();
+            return Some(Value::bytes_to_text_or_blob(result));
+        }
         self.cast_text()
             .map(|s| Value::build_text(s.to_ascii_uppercase()))
     }

@@ -1,0 +1,22 @@
+@database :memory:
+
+test blob-concat-type-is-text {
+    SELECT TYPEOF(X'41' || X'42')
+}
+expect {
+    text
+}
+
+test blob-concat-preserves-content {
+    SELECT hex(X'DEAD' || X'BEEF')
+}
+expect {
+    DEADBEEF
+}
+
+test blob-concat-ascii-value {
+    SELECT X'41' || X'42'
+}
+expect {
+    AB
+}
