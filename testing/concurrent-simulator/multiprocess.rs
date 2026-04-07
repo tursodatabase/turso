@@ -11,6 +11,7 @@ use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -238,16 +239,22 @@ impl MultiprocessWhopper {
         });
         let mut rng = ChaCha8Rng::seed_from_u64(seed);
 
-        // Create database file on disk
+        // Create database file on disk.
+        // Use an atomic counter alongside the timestamp to guarantee uniqueness
+        // even when parallel test threads call SystemTime::now() within the same
+        // clock tick.
+        static PATH_COUNTER: AtomicU64 = AtomicU64::new(0);
         let unique_suffix = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .expect("system clock is before UNIX_EPOCH")
             .as_nanos();
+        let counter = PATH_COUNTER.fetch_add(1, AtomicOrdering::Relaxed);
         let db_path = PathBuf::from(format!(
-            "/tmp/whopper-mp-{}-{}-{}.db",
+            "/tmp/whopper-mp-{}-{}-{}-{}.db",
             seed,
             std::process::id(),
-            unique_suffix
+            unique_suffix,
+            counter
         ));
         info!("multiprocess db: {}", db_path.display());
 

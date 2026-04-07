@@ -511,9 +511,9 @@ impl Statement {
         // otherwise the retried statement can stack a fresh snapshot on top of
         // leaked transaction state from the failed attempt.
         let attached_leaked = conn
-            .get_all_attached_pagers_with_index()
+            .get_all_attached_pagers()
             .into_iter()
-            .any(|(_, pager)| pager.holds_write_lock() || pager.holds_read_lock());
+            .any(|pager| pager.holds_write_lock() || pager.holds_read_lock());
         let has_implicit_txn_state = main_pager.holds_write_lock()
             || main_pager.holds_read_lock()
             || conn.get_tx_state() != TransactionState::None
