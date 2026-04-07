@@ -1728,6 +1728,14 @@ impl ProgramBuilder {
                     either::Either::Right(val) => val,
                 };
             }
+            // REAL column affinity: also convert integers to floats for storage.
+            // This is separate from the comparison affinity path (which must NOT
+            // do this conversion to preserve precision for sqlite_int_float_cmp).
+            if matches!(affinity, Affinity::Real) {
+                if let crate::Value::Numeric(crate::numeric::Numeric::Integer(i)) = &value {
+                    value = crate::Value::from_f64(*i as f64);
+                }
+            }
 
             Some(value)
         };

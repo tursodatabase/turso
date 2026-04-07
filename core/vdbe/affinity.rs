@@ -207,15 +207,16 @@ impl Affinity {
             }
 
             Affinity::Real => {
-                let mut left = is_text
+                // Convert text to numeric (like Numeric affinity).
+                // Do NOT convert integers to floats here — the comparison
+                // handler's Numeric::cmp uses sqlite_int_float_cmp for
+                // precise mixed-type comparison without precision loss.
+                // (Integer→float for column storage is handled separately
+                // in builder.rs and the Cast instruction.)
+                is_text
                     .then(|| apply_numeric_affinity(val, false))
-                    .flatten();
-
-                if let ValueRef::Numeric(Numeric::Integer(i)) = left.unwrap_or(val) {
-                    left = Some(ValueRef::from_f64(i as f64));
-                }
-
-                left.map(Either::Left)
+                    .flatten()
+                    .map(Either::Left)
             }
 
             Affinity::Blob => None, // Do nothing for blob affinity.

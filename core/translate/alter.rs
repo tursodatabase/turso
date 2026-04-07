@@ -253,6 +253,14 @@ fn apply_affinity_to_value(value: &mut Value, affinity: Affinity) {
             Either::Right(val) => val,
         };
     }
+    // REAL affinity for storage: also convert integers to floats.
+    // (Affinity::Real::convert no longer does this, to preserve precision
+    // in comparison instructions where sqlite_int_float_cmp is used.)
+    if matches!(affinity, Affinity::Real) {
+        if let Value::Numeric(Numeric::Integer(i)) = value {
+            *value = Value::from_f64(*i as f64);
+        }
+    }
 }
 
 fn strict_default_type_mismatch(column: &Column) -> Result<bool> {

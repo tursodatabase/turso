@@ -1,0 +1,57 @@
+@database :memory:
+
+test cast-real-large-int-not-equal {
+    SELECT CAST(9007199254740993 AS REAL) = 9007199254740993
+}
+expect {
+    0
+}
+
+test cast-real-large-int-equal-to-truncated {
+    SELECT CAST(9007199254740993 AS REAL) = 9007199254740992
+}
+expect {
+    1
+}
+
+test cast-real-both-sides-equal {
+    SELECT CAST(9007199254740993 AS REAL) = CAST(9007199254740993 AS REAL)
+}
+expect {
+    1
+}
+
+test cast-real-negative-large-int-not-equal {
+    SELECT CAST(-9007199254740993 AS REAL) = -9007199254740993
+}
+expect {
+    0
+}
+
+test cast-real-larger-beyond-2pow54 {
+    SELECT CAST(18014398509481985 AS REAL) = 18014398509481985
+}
+expect {
+    0
+}
+
+test cast-real-exact-2pow54 {
+    SELECT CAST(18014398509481984 AS REAL) = 18014398509481984
+}
+expect {
+    1
+}
+
+test cast-real-small-int-equal {
+    SELECT CAST(1 AS REAL) = 1
+}
+expect {
+    1
+}
+
+test cast-real-zero-equal {
+    SELECT CAST(0 AS REAL) = 0
+}
+expect {
+    1
+}
