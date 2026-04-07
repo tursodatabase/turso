@@ -514,11 +514,24 @@ fn execute_trigger_commands(
     database_id: usize,
     ignore_jump_target: BranchOffset,
 ) -> Result<bool> {
+    struct TriggerCompilationGuard {
+        connection: Arc<crate::Connection>,
+    }
+
+    impl Drop for TriggerCompilationGuard {
+        fn drop(&mut self) {
+            self.connection.end_trigger_compilation();
+        }
+    }
+
     if connection.trigger_is_compiling(trigger) {
         // Do not recursively compile the same trigger
         return Ok(false);
     }
     connection.start_trigger_compilation(trigger.clone());
+    let _trigger_compilation_guard = TriggerCompilationGuard {
+        connection: connection.clone(),
+    };
 
     let has_new = ctx.new_registers.is_some();
     let has_old = ctx.old_registers.is_some();
@@ -617,7 +630,6 @@ fn execute_trigger_commands(
         program: built_subprogram.prepared().clone(),
         ignore_jump_target,
     });
-    connection.end_trigger_compilation();
 
     Ok(true)
 }

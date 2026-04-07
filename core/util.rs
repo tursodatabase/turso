@@ -2044,7 +2044,7 @@ pub fn rename_identifiers_scoped(
     from: &str,
     to: &str,
 ) {
-    rename_identifiers_scoped_inner(expr, target_table, trigger_table, from, to, true);
+    rename_identifiers_scoped_inner(expr, target_table, trigger_table, from, to, true, None);
 }
 
 /// Rename column references in a trigger WHEN clause.
@@ -2057,7 +2057,7 @@ pub fn rename_identifiers_scoped_when_clause(
     from: &str,
     to: &str,
 ) {
-    rename_identifiers_scoped_inner(expr, target_table, trigger_table, from, to, false);
+    rename_identifiers_scoped_inner(expr, target_table, trigger_table, from, to, false, None);
 }
 
 /// Inner implementation with `rename_unqualified` flag controlling whether bare `Expr::Id`
@@ -2070,6 +2070,7 @@ fn rename_identifiers_scoped_inner(
     from: &str,
     to: &str,
     rename_unqualified: bool,
+    target_qualifiers: Option<&[String]>,
 ) {
     let from_normalized = normalize_ident(from);
     let target_normalized = normalize_ident(target_table);
@@ -2087,10 +2088,18 @@ fn rename_identifiers_scoped_inner(
                         trigger_table,
                         from,
                         to,
+                        target_qualifiers.unwrap_or(&[]),
                     );
                 }
                 ast::Expr::InSelect { rhs, .. } => {
-                    rewrite_select_column_refs_scoped(rhs, target_table, trigger_table, from, to);
+                    rewrite_select_column_refs_scoped(
+                        rhs,
+                        target_table,
+                        trigger_table,
+                        from,
+                        to,
+                        target_qualifiers.unwrap_or(&[]),
+                    );
                     // lhs will be walked by walk_expr_mut
                 }
                 ast::Expr::Id(ref name) | ast::Expr::Name(ref name)
@@ -2105,7 +2114,9 @@ fn rename_identifiers_scoped_inner(
                     let should_rename = if tbl_norm == "new" || tbl_norm == "old" {
                         is_renaming_trigger_table
                     } else {
-                        tbl_norm == target_normalized
+                        target_qualifiers
+                            .is_some_and(|qualifiers| qualifiers.iter().any(|q| *q == tbl_norm))
+                            || tbl_norm == target_normalized
                     };
                     if should_rename {
                         let tbl = tbl.clone();
@@ -3172,11 +3183,25 @@ pub fn rewrite_check_expr_table_refs(expr: &mut ast::Expr, from: &str, to: &str)
     let _ = walk_expr_mut(
         expr,
         &mut |e: &mut ast::Expr| -> crate::Result<WalkControl> {
-            if let ast::Expr::Qualified(ref tbl, ref col) = *e {
-                if normalize_ident(tbl.as_str()) == from_normalized {
-                    let col = col.clone();
-                    *e = ast::Expr::Qualified(ast::Name::exact(to.to_owned()), col);
+            match e {
+                ast::Expr::Qualified(tbl, col) => {
+                    if normalize_ident(tbl.as_str()) == from_normalized {
+                        let col = col.clone();
+                        *e = ast::Expr::Qualified(ast::Name::exact(to.to_owned()), col);
+                    }
                 }
+                ast::Expr::Exists(select) | ast::Expr::Subquery(select) => {
+                    rewrite_select_table_refs(select, from, to);
+                }
+                ast::Expr::InSelect { rhs, .. } => {
+                    rewrite_select_table_refs(rhs, from, to);
+                }
+                ast::Expr::InTable { rhs, .. } => {
+                    if normalize_ident(rhs.name.as_str()) == from_normalized {
+                        rhs.name = ast::Name::exact(to.to_owned());
+                    }
+                }
+                _ => {}
             }
             Ok(WalkControl::Continue)
         },
@@ -3319,13 +3344,28 @@ fn rewrite_select_column_refs_scoped(
     trigger_table: &str,
     old_col: &str,
     new_col: &str,
+    outer_target_qualifiers: &[String],
 ) {
+    if let Some(with_clause) = &mut select.with {
+        for cte in &mut with_clause.ctes {
+            rewrite_select_column_refs_scoped(
+                &mut cte.select,
+                target_table,
+                trigger_table,
+                old_col,
+                new_col,
+                outer_target_qualifiers,
+            );
+        }
+    }
+
     rewrite_one_select_column_refs_scoped(
         &mut select.body.select,
         target_table,
         trigger_table,
         old_col,
         new_col,
+        outer_target_qualifiers,
     );
     for compound in &mut select.body.compounds {
         rewrite_one_select_column_refs_scoped(
@@ -3334,16 +3374,21 @@ fn rewrite_select_column_refs_scoped(
             trigger_table,
             old_col,
             new_col,
+            outer_target_qualifiers,
         );
     }
     // ORDER BY is in the same scope as the body's FROM
-    let body_from_has_target = match &select.body.select {
-        ast::OneSelect::Select { from, .. } => from_clause_has_target(from, target_table),
-        _ => false,
+    let body_target_qualifiers = match &select.body.select {
+        ast::OneSelect::Select { from, .. } => merge_target_qualifiers_scoped(
+            outer_target_qualifiers,
+            &from_clause_target_qualifiers(from, target_table),
+        ),
+        _ => outer_target_qualifiers.to_vec(),
     };
     let target_normalized = normalize_ident(target_table);
     let trigger_normalized = normalize_ident(trigger_table);
-    let rename_unqualified = body_from_has_target || target_normalized == trigger_normalized;
+    let rename_unqualified =
+        !body_target_qualifiers.is_empty() || target_normalized == trigger_normalized;
     for col in &mut select.order_by {
         rename_identifiers_scoped_inner(
             &mut col.expr,
@@ -3352,27 +3397,71 @@ fn rewrite_select_column_refs_scoped(
             old_col,
             new_col,
             rename_unqualified,
+            Some(&body_target_qualifiers),
         );
+    }
+    if let Some(limit) = &mut select.limit {
+        rename_identifiers_scoped_inner(
+            &mut limit.expr,
+            target_table,
+            trigger_table,
+            old_col,
+            new_col,
+            rename_unqualified,
+            Some(&body_target_qualifiers),
+        );
+        if let Some(offset) = &mut limit.offset {
+            rename_identifiers_scoped_inner(
+                offset,
+                target_table,
+                trigger_table,
+                old_col,
+                new_col,
+                rename_unqualified,
+                Some(&body_target_qualifiers),
+            );
+        }
     }
 }
 
-/// Check if a FROM clause contains a reference to the given table name.
-fn from_clause_has_target(from: &Option<ast::FromClause>, target_table: &str) -> bool {
+fn from_clause_target_qualifiers(
+    from: &Option<ast::FromClause>,
+    target_table: &str,
+) -> Vec<String> {
     let Some(from_clause) = from else {
-        return false;
+        return Vec::new();
     };
-    let target_normalized = normalize_ident(target_table);
-    let check_table = |st: &ast::SelectTable| -> bool {
-        matches!(
-            st,
-            ast::SelectTable::Table(name, _, _)
-                if normalize_ident(name.name.as_str()) == target_normalized
-        )
-    };
-    if check_table(&from_clause.select) {
-        return true;
+
+    let mut qualifiers = Vec::new();
+    collect_target_qualifiers(&from_clause.select, target_table, &mut qualifiers);
+    for join in &from_clause.joins {
+        collect_target_qualifiers(&join.table, target_table, &mut qualifiers);
     }
-    from_clause.joins.iter().any(|j| check_table(&j.table))
+    qualifiers
+}
+
+fn collect_target_qualifiers(
+    st: &ast::SelectTable,
+    target_table: &str,
+    qualifiers: &mut Vec<String>,
+) {
+    let ast::SelectTable::Table(name, alias, _) = st else {
+        return;
+    };
+    if normalize_ident(name.name.as_str()) != normalize_ident(target_table) {
+        return;
+    }
+
+    let target_table = normalize_ident(target_table);
+    if !qualifiers.contains(&target_table) {
+        qualifiers.push(target_table);
+    }
+    if let Some(alias) = alias {
+        let alias_norm = normalize_ident(alias.name().as_str());
+        if !qualifiers.contains(&alias_norm) {
+            qualifiers.push(alias_norm);
+        }
+    }
 }
 
 fn rewrite_one_select_column_refs_scoped(
@@ -3381,6 +3470,7 @@ fn rewrite_one_select_column_refs_scoped(
     trigger_table: &str,
     old_col: &str,
     new_col: &str,
+    outer_target_qualifiers: &[String],
 ) {
     match one {
         ast::OneSelect::Select {
@@ -3388,14 +3478,19 @@ fn rewrite_one_select_column_refs_scoped(
             where_clause,
             columns,
             group_by,
+            window_clause,
             ..
         } => {
             // Check if FROM clause references the target table to determine
             // whether unqualified Expr::Id should be renamed in this scope
-            let from_has_target = from_clause_has_target(from, target_table);
+            let visible_target_qualifiers = merge_target_qualifiers_scoped(
+                outer_target_qualifiers,
+                &from_clause_target_qualifiers(from, target_table),
+            );
             let target_normalized = normalize_ident(target_table);
             let trigger_normalized = normalize_ident(trigger_table);
-            let rename_unqualified = from_has_target || target_normalized == trigger_normalized;
+            let rename_unqualified =
+                !visible_target_qualifiers.is_empty() || target_normalized == trigger_normalized;
 
             if let Some(ref mut from) = from {
                 rewrite_from_clause_column_refs_scoped(
@@ -3404,6 +3499,7 @@ fn rewrite_one_select_column_refs_scoped(
                     trigger_table,
                     old_col,
                     new_col,
+                    outer_target_qualifiers,
                 );
             }
             if let Some(ref mut wc) = where_clause {
@@ -3414,17 +3510,19 @@ fn rewrite_one_select_column_refs_scoped(
                     old_col,
                     new_col,
                     rename_unqualified,
+                    Some(&visible_target_qualifiers),
                 );
             }
             for col in columns {
                 if let ast::ResultColumn::Expr(ref mut expr, _) = col {
-                    rename_identifiers_scoped_inner(
+                    rename_result_identifiers_scoped(
                         expr,
                         target_table,
                         trigger_table,
                         old_col,
                         new_col,
                         rename_unqualified,
+                        Some(&visible_target_qualifiers),
                     );
                 }
             }
@@ -3437,6 +3535,7 @@ fn rewrite_one_select_column_refs_scoped(
                         old_col,
                         new_col,
                         rename_unqualified,
+                        Some(&visible_target_qualifiers),
                     );
                 }
                 if let Some(ref mut having) = gb.having {
@@ -3447,8 +3546,19 @@ fn rewrite_one_select_column_refs_scoped(
                         old_col,
                         new_col,
                         rename_unqualified,
+                        Some(&visible_target_qualifiers),
                     );
                 }
+            }
+            for window_def in window_clause {
+                rewrite_window_column_refs_scoped(
+                    &mut window_def.window,
+                    target_table,
+                    trigger_table,
+                    old_col,
+                    new_col,
+                    &visible_target_qualifiers,
+                );
             }
         }
         ast::OneSelect::Values(rows) => {
@@ -3461,28 +3571,127 @@ fn rewrite_one_select_column_refs_scoped(
     }
 }
 
+fn rename_result_identifiers_scoped(
+    expr: &mut ast::Expr,
+    target_table: &str,
+    trigger_table: &str,
+    from: &str,
+    to: &str,
+    rename_unqualified: bool,
+    target_qualifiers: Option<&[String]>,
+) {
+    let from_normalized = normalize_ident(from);
+    let target_normalized = normalize_ident(target_table);
+    let trigger_normalized = normalize_ident(trigger_table);
+    let is_renaming_trigger_table = target_normalized == trigger_normalized;
+
+    let _ = walk_expr_mut(
+        expr,
+        &mut |e: &mut ast::Expr| -> crate::Result<WalkControl> {
+            match e {
+                ast::Expr::Exists(_) => return Ok(WalkControl::SkipChildren),
+                ast::Expr::Subquery(select) => {
+                    rewrite_select_column_refs_scoped(
+                        select,
+                        target_table,
+                        trigger_table,
+                        from,
+                        to,
+                        target_qualifiers.unwrap_or(&[]),
+                    );
+                }
+                ast::Expr::InSelect { rhs, .. } => {
+                    rewrite_select_column_refs_scoped(
+                        rhs,
+                        target_table,
+                        trigger_table,
+                        from,
+                        to,
+                        target_qualifiers.unwrap_or(&[]),
+                    );
+                }
+                ast::Expr::Id(ref name) | ast::Expr::Name(ref name)
+                    if rename_unqualified && normalize_ident(name.as_str()) == from_normalized =>
+                {
+                    *e = ast::Expr::Id(ast::Name::exact(to.to_owned()));
+                }
+                ast::Expr::Qualified(ref tbl, ref col_name)
+                    if normalize_ident(col_name.as_str()) == from_normalized =>
+                {
+                    let tbl_norm = normalize_ident(tbl.as_str());
+                    let should_rename = if tbl_norm == "new" || tbl_norm == "old" {
+                        is_renaming_trigger_table
+                    } else {
+                        target_qualifiers
+                            .is_some_and(|qualifiers| qualifiers.iter().any(|q| *q == tbl_norm))
+                            || tbl_norm == target_normalized
+                    };
+                    if should_rename {
+                        let tbl = tbl.clone();
+                        *e = ast::Expr::Qualified(tbl, ast::Name::exact(to.to_owned()));
+                    }
+                }
+                _ => {}
+            }
+            Ok(WalkControl::Continue)
+        },
+    );
+}
+
+fn rewrite_window_column_refs_scoped(
+    window: &mut ast::Window,
+    target_table: &str,
+    trigger_table: &str,
+    old_col: &str,
+    new_col: &str,
+    visible_target_qualifiers: &[String],
+) {
+    let target_normalized = normalize_ident(target_table);
+    let trigger_normalized = normalize_ident(trigger_table);
+    let rename_unqualified =
+        !visible_target_qualifiers.is_empty() || target_normalized == trigger_normalized;
+
+    for expr in &mut window.partition_by {
+        rename_identifiers_scoped_inner(
+            expr,
+            target_table,
+            trigger_table,
+            old_col,
+            new_col,
+            rename_unqualified,
+            Some(visible_target_qualifiers),
+        );
+    }
+    for sorted_col in &mut window.order_by {
+        rename_identifiers_scoped_inner(
+            &mut sorted_col.expr,
+            target_table,
+            trigger_table,
+            old_col,
+            new_col,
+            rename_unqualified,
+            Some(visible_target_qualifiers),
+        );
+    }
+}
+
 fn rewrite_from_clause_column_refs_scoped(
     from: &mut ast::FromClause,
     target_table: &str,
     trigger_table: &str,
     old_col: &str,
     new_col: &str,
+    outer_target_qualifiers: &[String],
 ) {
     // Check if this FROM clause references the target table for JOIN ON expressions
-    let from_has_target = {
-        let target_normalized = normalize_ident(target_table);
-        let check_table = |st: &ast::SelectTable| -> bool {
-            matches!(
-                st,
-                ast::SelectTable::Table(name, _, _)
-                    if normalize_ident(name.name.as_str()) == target_normalized
-            )
-        };
-        check_table(&from.select) || from.joins.iter().any(|j| check_table(&j.table))
-    };
+    let visible_target_qualifiers = merge_target_qualifiers_scoped(
+        outer_target_qualifiers,
+        &from_clause_target_qualifiers(&Some(from.clone()), target_table),
+    );
     let target_normalized = normalize_ident(target_table);
     let trigger_normalized = normalize_ident(trigger_table);
-    let rename_unqualified = from_has_target || target_normalized == trigger_normalized;
+    let rename_unqualified =
+        !visible_target_qualifiers.is_empty() || target_normalized == trigger_normalized;
 
     rewrite_select_table_entry_column_refs_scoped(
         &mut from.select,
@@ -3490,6 +3699,7 @@ fn rewrite_from_clause_column_refs_scoped(
         trigger_table,
         old_col,
         new_col,
+        outer_target_qualifiers,
     );
     for join in &mut from.joins {
         rewrite_select_table_entry_column_refs_scoped(
@@ -3498,6 +3708,7 @@ fn rewrite_from_clause_column_refs_scoped(
             trigger_table,
             old_col,
             new_col,
+            outer_target_qualifiers,
         );
         if let Some(ast::JoinConstraint::On(ref mut expr)) = join.constraint {
             rename_identifiers_scoped_inner(
@@ -3507,6 +3718,7 @@ fn rewrite_from_clause_column_refs_scoped(
                 old_col,
                 new_col,
                 rename_unqualified,
+                Some(&visible_target_qualifiers),
             );
         }
     }
@@ -3518,11 +3730,20 @@ fn rewrite_select_table_entry_column_refs_scoped(
     trigger_table: &str,
     old_col: &str,
     new_col: &str,
+    outer_target_qualifiers: &[String],
 ) {
     match st {
         ast::SelectTable::TableCall(_, ref mut args, _) => {
             for arg in args {
-                rename_identifiers_scoped(arg, target_table, trigger_table, old_col, new_col);
+                rename_identifiers_scoped_inner(
+                    arg,
+                    target_table,
+                    trigger_table,
+                    old_col,
+                    new_col,
+                    true,
+                    Some(outer_target_qualifiers),
+                );
             }
         }
         ast::SelectTable::Select(ref mut select, _) => {
@@ -3532,6 +3753,7 @@ fn rewrite_select_table_entry_column_refs_scoped(
                 trigger_table,
                 old_col,
                 new_col,
+                outer_target_qualifiers,
             );
         }
         ast::SelectTable::Sub(ref mut from, _) => {
@@ -3541,10 +3763,563 @@ fn rewrite_select_table_entry_column_refs_scoped(
                 trigger_table,
                 old_col,
                 new_col,
+                outer_target_qualifiers,
             );
         }
         ast::SelectTable::Table(..) => {}
     }
+}
+
+fn merge_target_qualifiers_scoped(outer: &[String], local: &[String]) -> Vec<String> {
+    let mut merged = outer.to_vec();
+    for qualifier in local {
+        if !merged.contains(qualifier) {
+            merged.push(qualifier.clone());
+        }
+    }
+    merged
+}
+
+fn expr_still_references_renamed_column(
+    expr: &ast::Expr,
+    target_table: &str,
+    trigger_table: &str,
+    old_col: &str,
+    rename_unqualified: bool,
+    visible_target_qualifiers: &[String],
+) -> bool {
+    let target_normalized = normalize_ident(target_table);
+    let trigger_normalized = normalize_ident(trigger_table);
+    let old_col_normalized = normalize_ident(old_col);
+    let mut expr = expr.clone();
+    let mut found = false;
+
+    let _ = walk_expr_mut(
+        &mut expr,
+        &mut |e: &mut ast::Expr| -> crate::Result<WalkControl> {
+            if found {
+                return Ok(WalkControl::Continue);
+            }
+
+            match e {
+                ast::Expr::Subquery(select) | ast::Expr::Exists(select) => {
+                    found = select_still_references_renamed_column(
+                        select,
+                        target_table,
+                        trigger_table,
+                        old_col,
+                        visible_target_qualifiers,
+                    );
+                }
+                ast::Expr::InSelect { rhs, .. } => {
+                    found = select_still_references_renamed_column(
+                        rhs,
+                        target_table,
+                        trigger_table,
+                        old_col,
+                        visible_target_qualifiers,
+                    );
+                }
+                ast::Expr::Qualified(ns, col) | ast::Expr::DoublyQualified(_, ns, col) => {
+                    if normalize_ident(col.as_str()) == old_col_normalized {
+                        let ns_norm = normalize_ident(ns.as_str());
+                        if (ns_norm == "new" || ns_norm == "old")
+                            && target_normalized == trigger_normalized
+                        {
+                            found = true;
+                        } else if visible_target_qualifiers
+                            .iter()
+                            .any(|qualifier| *qualifier == ns_norm)
+                        {
+                            found = true;
+                        } else if target_normalized == trigger_normalized
+                            && ns_norm == trigger_normalized
+                        {
+                            found = true;
+                        }
+                    }
+                }
+                ast::Expr::Id(name) | ast::Expr::Name(name) => {
+                    if rename_unqualified && normalize_ident(name.as_str()) == old_col_normalized {
+                        found = true;
+                    }
+                }
+                _ => {}
+            }
+            Ok(WalkControl::Continue)
+        },
+    );
+
+    found
+}
+
+fn one_select_still_references_renamed_column(
+    one: &ast::OneSelect,
+    target_table: &str,
+    trigger_table: &str,
+    old_col: &str,
+    outer_target_qualifiers: &[String],
+) -> bool {
+    match one {
+        ast::OneSelect::Select {
+            from,
+            where_clause,
+            columns,
+            group_by,
+            ..
+        } => {
+            let visible_target_qualifiers = merge_target_qualifiers_scoped(
+                outer_target_qualifiers,
+                &from_clause_target_qualifiers(from, target_table),
+            );
+            let rename_unqualified = !visible_target_qualifiers.is_empty()
+                || normalize_ident(target_table) == normalize_ident(trigger_table);
+
+            if let Some(from_clause) = from {
+                if from_clause_still_references_renamed_column(
+                    from_clause,
+                    target_table,
+                    trigger_table,
+                    old_col,
+                    outer_target_qualifiers,
+                ) {
+                    return true;
+                }
+            }
+
+            if let Some(where_expr) = where_clause {
+                if expr_still_references_renamed_column(
+                    where_expr,
+                    target_table,
+                    trigger_table,
+                    old_col,
+                    rename_unqualified,
+                    &visible_target_qualifiers,
+                ) {
+                    return true;
+                }
+            }
+
+            for col in columns {
+                if let ast::ResultColumn::Expr(expr, _) = col {
+                    if expr_still_references_renamed_column(
+                        expr,
+                        target_table,
+                        trigger_table,
+                        old_col,
+                        rename_unqualified,
+                        &visible_target_qualifiers,
+                    ) {
+                        return true;
+                    }
+                }
+            }
+
+            if let Some(group_by) = group_by {
+                for expr in &group_by.exprs {
+                    if expr_still_references_renamed_column(
+                        expr,
+                        target_table,
+                        trigger_table,
+                        old_col,
+                        rename_unqualified,
+                        &visible_target_qualifiers,
+                    ) {
+                        return true;
+                    }
+                }
+                if let Some(having) = &group_by.having {
+                    if expr_still_references_renamed_column(
+                        having,
+                        target_table,
+                        trigger_table,
+                        old_col,
+                        rename_unqualified,
+                        &visible_target_qualifiers,
+                    ) {
+                        return true;
+                    }
+                }
+            }
+        }
+        ast::OneSelect::Values(rows) => {
+            for row in rows {
+                for expr in row {
+                    if expr_still_references_renamed_column(
+                        expr,
+                        target_table,
+                        trigger_table,
+                        old_col,
+                        true,
+                        outer_target_qualifiers,
+                    ) {
+                        return true;
+                    }
+                }
+            }
+        }
+    }
+
+    false
+}
+
+fn select_still_references_renamed_column(
+    select: &ast::Select,
+    target_table: &str,
+    trigger_table: &str,
+    old_col: &str,
+    outer_target_qualifiers: &[String],
+) -> bool {
+    if let Some(with_clause) = &select.with {
+        for cte in &with_clause.ctes {
+            if select_still_references_renamed_column(
+                &cte.select,
+                target_table,
+                trigger_table,
+                old_col,
+                outer_target_qualifiers,
+            ) {
+                return true;
+            }
+        }
+    }
+
+    if one_select_still_references_renamed_column(
+        &select.body.select,
+        target_table,
+        trigger_table,
+        old_col,
+        outer_target_qualifiers,
+    ) {
+        return true;
+    }
+
+    for compound in &select.body.compounds {
+        if one_select_still_references_renamed_column(
+            &compound.select,
+            target_table,
+            trigger_table,
+            old_col,
+            outer_target_qualifiers,
+        ) {
+            return true;
+        }
+    }
+
+    let body_target_qualifiers = match &select.body.select {
+        ast::OneSelect::Select { from, .. } => merge_target_qualifiers_scoped(
+            outer_target_qualifiers,
+            &from_clause_target_qualifiers(from, target_table),
+        ),
+        _ => outer_target_qualifiers.to_vec(),
+    };
+    let rename_unqualified = !body_target_qualifiers.is_empty()
+        || normalize_ident(target_table) == normalize_ident(trigger_table);
+
+    for sorted_col in &select.order_by {
+        if expr_still_references_renamed_column(
+            &sorted_col.expr,
+            target_table,
+            trigger_table,
+            old_col,
+            rename_unqualified,
+            &body_target_qualifiers,
+        ) {
+            return true;
+        }
+    }
+
+    if let Some(limit) = &select.limit {
+        if expr_still_references_renamed_column(
+            &limit.expr,
+            target_table,
+            trigger_table,
+            old_col,
+            rename_unqualified,
+            &body_target_qualifiers,
+        ) {
+            return true;
+        }
+        if let Some(offset) = &limit.offset {
+            if expr_still_references_renamed_column(
+                offset,
+                target_table,
+                trigger_table,
+                old_col,
+                rename_unqualified,
+                &body_target_qualifiers,
+            ) {
+                return true;
+            }
+        }
+    }
+
+    false
+}
+
+fn select_table_still_references_renamed_column(
+    st: &ast::SelectTable,
+    target_table: &str,
+    trigger_table: &str,
+    old_col: &str,
+    outer_target_qualifiers: &[String],
+) -> bool {
+    match st {
+        ast::SelectTable::TableCall(_, args, _) => args.iter().any(|arg| {
+            expr_still_references_renamed_column(
+                arg,
+                target_table,
+                trigger_table,
+                old_col,
+                true,
+                outer_target_qualifiers,
+            )
+        }),
+        ast::SelectTable::Select(select, _) => select_still_references_renamed_column(
+            select,
+            target_table,
+            trigger_table,
+            old_col,
+            outer_target_qualifiers,
+        ),
+        ast::SelectTable::Sub(from, _) => from_clause_still_references_renamed_column(
+            from,
+            target_table,
+            trigger_table,
+            old_col,
+            outer_target_qualifiers,
+        ),
+        ast::SelectTable::Table(..) => false,
+    }
+}
+
+fn from_clause_still_references_renamed_column(
+    from: &ast::FromClause,
+    target_table: &str,
+    trigger_table: &str,
+    old_col: &str,
+    outer_target_qualifiers: &[String],
+) -> bool {
+    let visible_target_qualifiers = merge_target_qualifiers_scoped(
+        outer_target_qualifiers,
+        &from_clause_target_qualifiers(&Some(from.clone()), target_table),
+    );
+    let rename_unqualified = !visible_target_qualifiers.is_empty()
+        || normalize_ident(target_table) == normalize_ident(trigger_table);
+
+    if select_table_still_references_renamed_column(
+        &from.select,
+        target_table,
+        trigger_table,
+        old_col,
+        outer_target_qualifiers,
+    ) {
+        return true;
+    }
+
+    for join in &from.joins {
+        if select_table_still_references_renamed_column(
+            &join.table,
+            target_table,
+            trigger_table,
+            old_col,
+            outer_target_qualifiers,
+        ) {
+            return true;
+        }
+        if let Some(ast::JoinConstraint::On(expr)) = &join.constraint {
+            if expr_still_references_renamed_column(
+                expr,
+                target_table,
+                trigger_table,
+                old_col,
+                rename_unqualified,
+                &visible_target_qualifiers,
+            ) {
+                return true;
+            }
+        }
+    }
+
+    false
+}
+
+pub fn trigger_still_references_renamed_column(
+    trigger: &crate::schema::Trigger,
+    target_table: &str,
+    old_col: &str,
+) -> bool {
+    if normalize_ident(&trigger.table_name) == normalize_ident(target_table) {
+        if let ast::TriggerEvent::UpdateOf(cols) = &trigger.event {
+            if cols
+                .iter()
+                .any(|col| normalize_ident(col.as_str()) == normalize_ident(old_col))
+            {
+                return true;
+            }
+        }
+    }
+
+    if let Some(when_clause) = &trigger.when_clause {
+        if expr_still_references_renamed_column(
+            when_clause,
+            target_table,
+            &trigger.table_name,
+            old_col,
+            false,
+            &[],
+        ) {
+            return true;
+        }
+    }
+
+    for cmd in &trigger.commands {
+        match cmd {
+            ast::TriggerCmd::Update {
+                tbl_name,
+                sets,
+                from,
+                where_clause,
+                ..
+            } => {
+                let targets_renamed_table =
+                    normalize_ident(tbl_name.as_str()) == normalize_ident(target_table);
+                let visible_target_qualifiers = from_clause_target_qualifiers(from, target_table);
+
+                if targets_renamed_table
+                    && sets.iter().any(|set| {
+                        set.col_names.iter().any(|col_name| {
+                            normalize_ident(col_name.as_str()) == normalize_ident(old_col)
+                        })
+                    })
+                {
+                    return true;
+                }
+
+                for set in sets {
+                    if expr_still_references_renamed_column(
+                        &set.expr,
+                        target_table,
+                        &trigger.table_name,
+                        old_col,
+                        targets_renamed_table,
+                        &visible_target_qualifiers,
+                    ) {
+                        return true;
+                    }
+                }
+
+                if let Some(where_clause) = where_clause {
+                    if expr_still_references_renamed_column(
+                        where_clause,
+                        target_table,
+                        &trigger.table_name,
+                        old_col,
+                        targets_renamed_table,
+                        &visible_target_qualifiers,
+                    ) {
+                        return true;
+                    }
+                }
+
+                if let Some(from_clause) = from {
+                    if from_clause_still_references_renamed_column(
+                        from_clause,
+                        target_table,
+                        &trigger.table_name,
+                        old_col,
+                        &[],
+                    ) {
+                        return true;
+                    }
+                }
+            }
+            ast::TriggerCmd::Insert {
+                tbl_name,
+                col_names,
+                select,
+                upsert,
+                ..
+            } => {
+                if normalize_ident(tbl_name.as_str()) == normalize_ident(target_table)
+                    && col_names.iter().any(|col_name| {
+                        normalize_ident(col_name.as_str()) == normalize_ident(old_col)
+                    })
+                {
+                    return true;
+                }
+
+                if select_still_references_renamed_column(
+                    select,
+                    target_table,
+                    &trigger.table_name,
+                    old_col,
+                    &[],
+                ) {
+                    return true;
+                }
+
+                if let Some(upsert) = upsert {
+                    if let Some(index) = &upsert.index {
+                        for target in &index.targets {
+                            if expr_still_references_renamed_column(
+                                &target.expr,
+                                target_table,
+                                &trigger.table_name,
+                                old_col,
+                                normalize_ident(tbl_name.as_str()) == normalize_ident(target_table),
+                                &[],
+                            ) {
+                                return true;
+                            }
+                        }
+                        if let Some(where_clause) = &index.where_clause {
+                            if expr_still_references_renamed_column(
+                                where_clause,
+                                target_table,
+                                &trigger.table_name,
+                                old_col,
+                                normalize_ident(tbl_name.as_str()) == normalize_ident(target_table),
+                                &[],
+                            ) {
+                                return true;
+                            }
+                        }
+                    }
+                }
+            }
+            ast::TriggerCmd::Delete {
+                tbl_name,
+                where_clause,
+            } => {
+                if let Some(where_clause) = where_clause {
+                    if expr_still_references_renamed_column(
+                        where_clause,
+                        target_table,
+                        &trigger.table_name,
+                        old_col,
+                        normalize_ident(tbl_name.as_str()) == normalize_ident(target_table),
+                        &[],
+                    ) {
+                        return true;
+                    }
+                }
+            }
+            ast::TriggerCmd::Select(select) => {
+                if select_still_references_renamed_column(
+                    select,
+                    target_table,
+                    &trigger.table_name,
+                    old_col,
+                    &[],
+                ) {
+                    return true;
+                }
+            }
+        }
+    }
+
+    false
 }
 
 fn rename_excluded_column_refs(expr: &mut ast::Expr, old_col: &str, new_col: &str) {
@@ -3687,6 +4462,7 @@ pub fn rewrite_trigger_cmd_column_refs(
                     trigger_table,
                     old_col,
                     new_col,
+                    &[],
                 );
             }
         }
@@ -3706,7 +4482,7 @@ pub fn rewrite_trigger_cmd_column_refs(
                     }
                 }
             }
-            rewrite_select_column_refs_scoped(select, table, trigger_table, old_col, new_col);
+            rewrite_select_column_refs_scoped(select, table, trigger_table, old_col, new_col, &[]);
             if let Some(ref mut upsert) = upsert {
                 rewrite_upsert_column_refs_scoped(
                     upsert,
@@ -3733,12 +4509,17 @@ pub fn rewrite_trigger_cmd_column_refs(
             }
         }
         ast::TriggerCmd::Select(select) => {
-            rewrite_select_column_refs_scoped(select, table, trigger_table, old_col, new_col);
+            rewrite_select_column_refs_scoped(select, table, trigger_table, old_col, new_col, &[]);
         }
     }
 }
 
 fn rewrite_select_table_refs(select: &mut ast::Select, old_tbl: &str, new_tbl: &str) {
+    if let Some(with_clause) = &mut select.with {
+        for cte in &mut with_clause.ctes {
+            rewrite_select_table_refs(&mut cte.select, old_tbl, new_tbl);
+        }
+    }
     rewrite_one_select_table_refs(&mut select.body.select, old_tbl, new_tbl);
     for compound in &mut select.body.compounds {
         rewrite_one_select_table_refs(&mut compound.select, old_tbl, new_tbl);
@@ -3986,6 +4767,89 @@ pub mod tests {
             "{}",
             rewritten.sql
         );
+    }
+
+    #[test]
+    fn test_rewrite_trigger_cmd_table_refs_cte_branch() {
+        let sql = "CREATE TEMP TRIGGER trg AFTER INSERT ON temp.old BEGIN WITH cte AS (SELECT * FROM temp.old) SELECT * FROM cte; END";
+        let mut parser = Parser::new(sql.as_bytes());
+        let cmd = parser
+            .next_cmd()
+            .expect("trigger SQL should parse")
+            .expect("trigger SQL should produce a statement");
+        let ast::Cmd::Stmt(ast::Stmt::CreateTrigger { commands, .. }) = cmd else {
+            panic!("expected CREATE TRIGGER statement");
+        };
+        let mut commands = commands;
+        let ast::TriggerCmd::Select(select) = &mut commands[0] else {
+            panic!("expected SELECT trigger command");
+        };
+
+        rewrite_select_table_refs(select, "old", "new");
+
+        let Some(with_clause) = &select.with else {
+            panic!("expected WITH clause");
+        };
+        let ast::OneSelect::Select {
+            from: Some(from), ..
+        } = &with_clause.ctes[0].select.body.select
+        else {
+            panic!("expected CTE SELECT core");
+        };
+        let ast::SelectTable::Table(tbl_name, _, _) = from.select.as_ref() else {
+            panic!("expected CTE SELECT FROM table");
+        };
+
+        assert_eq!(
+            tbl_name.db_name.as_ref().map(ast::Name::as_str),
+            Some("temp")
+        );
+        assert_eq!(tbl_name.name.as_str(), "new");
+    }
+
+    #[test]
+    fn test_rewrite_trigger_cmd_table_refs_expr_subquery_branch() {
+        let sql =
+            "CREATE TEMP TRIGGER trg AFTER INSERT ON temp.old BEGIN SELECT EXISTS(SELECT 1 FROM temp.old); END";
+        let mut parser = Parser::new(sql.as_bytes());
+        let cmd = parser
+            .next_cmd()
+            .expect("trigger SQL should parse")
+            .expect("trigger SQL should produce a statement");
+        let ast::Cmd::Stmt(ast::Stmt::CreateTrigger { commands, .. }) = cmd else {
+            panic!("expected CREATE TRIGGER statement");
+        };
+        let mut commands = commands;
+        let ast::TriggerCmd::Select(select) = &mut commands[0] else {
+            panic!("expected SELECT trigger command");
+        };
+
+        rewrite_select_table_refs(select, "old", "new");
+
+        let ast::OneSelect::Select { columns, .. } = &select.body.select else {
+            panic!("expected SELECT core");
+        };
+        let ast::ResultColumn::Expr(expr, _) = &columns[0] else {
+            panic!("expected expression result column");
+        };
+        let ast::Expr::Exists(subquery) = expr.as_ref() else {
+            panic!("expected EXISTS expression");
+        };
+        let ast::OneSelect::Select {
+            from: Some(from), ..
+        } = &subquery.body.select
+        else {
+            panic!("expected EXISTS subquery FROM clause");
+        };
+        let ast::SelectTable::Table(tbl_name, _, _) = from.select.as_ref() else {
+            panic!("expected EXISTS subquery FROM table");
+        };
+
+        assert_eq!(
+            tbl_name.db_name.as_ref().map(ast::Name::as_str),
+            Some("temp")
+        );
+        assert_eq!(tbl_name.name.as_str(), "new");
     }
 
     #[test]

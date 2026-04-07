@@ -9,9 +9,10 @@ use crate::translate::main_loop::SemiAntiJoinMetadata;
 use crate::sync::Arc;
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use std::borrow::Cow;
+use std::cell::RefCell;
 use turso_macros::match_ignore_ascii_case;
 
-use super::expr::{emit_table_column, translate_expr};
+use super::expr::{emit_table_column, translate_expr, ExprAffinityInfo};
 use super::group_by::GroupByMetadata;
 use super::main_loop::{LeftJoinMetadata, LoopLabels};
 use super::order_by::SortMetadata;
@@ -143,6 +144,10 @@ pub struct Resolver<'a> {
     /// mechanism, but operates as a side-channel since limbo rewrites the AST rather
     /// than redirecting column reads at codegen time.
     pub register_affinities: HashMap<usize, Affinity>,
+    /// Affinity metadata for planned scalar subqueries keyed by their internal ID.
+    /// This lets comparison affinity follow SQLite rules for expressions like
+    /// `(SELECT text_col FROM ...) > some_numeric_expr`.
+    pub(crate) subquery_affinities: RefCell<HashMap<TableInternalId, ExprAffinityInfo>>,
     pub enable_custom_types: bool,
     /// Controls whether unresolved double-quoted identifiers fall back to string
     /// literals (SQLite's DQS misfeature) in DML statements.
@@ -191,6 +196,7 @@ impl<'a> Resolver<'a> {
             expr_to_reg_cache_enabled: false,
             expr_to_reg_cache: Vec::new(),
             register_affinities: HashMap::default(),
+            subquery_affinities: RefCell::new(HashMap::default()),
             enable_custom_types,
             dqs_dml,
             trigger_context: None,
@@ -211,6 +217,7 @@ impl<'a> Resolver<'a> {
             expr_to_reg_cache_enabled: false,
             expr_to_reg_cache: Vec::new(),
             register_affinities: HashMap::default(),
+            subquery_affinities: RefCell::new(self.subquery_affinities.borrow().clone()),
             enable_custom_types: self.enable_custom_types,
             dqs_dml: self.dqs_dml,
             trigger_context: self.trigger_context.clone(),
@@ -227,6 +234,7 @@ impl<'a> Resolver<'a> {
             expr_to_reg_cache_enabled: self.expr_to_reg_cache_enabled,
             expr_to_reg_cache: self.expr_to_reg_cache.clone(),
             register_affinities: self.register_affinities.clone(),
+            subquery_affinities: RefCell::new(self.subquery_affinities.borrow().clone()),
             enable_custom_types: self.enable_custom_types,
             dqs_dml: self.dqs_dml,
             trigger_context: self.trigger_context.clone(),

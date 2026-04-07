@@ -115,7 +115,7 @@ pub fn translate_create_trigger(
         );
     }
 
-    if crate::is_attached_db(database_id) {
+    if database_id != crate::MAIN_DB_ID {
         let schema_cookie = resolver.with_schema(database_id, |s| s.schema_version);
         program.begin_write_on_database(database_id, schema_cookie);
     }
@@ -466,7 +466,7 @@ pub fn translate_drop_trigger(
     program: &mut ProgramBuilder,
 ) -> Result<()> {
     let database_id = resolver.resolve_database_id(trigger_name)?;
-    if crate::is_attached_db(database_id) {
+    if database_id != crate::MAIN_DB_ID {
         let schema_cookie = resolver.with_schema(database_id, |s| s.schema_version);
         program.begin_write_on_database(database_id, schema_cookie);
     }

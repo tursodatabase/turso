@@ -966,20 +966,46 @@ pub fn translate_create_table(
         );
     }
 
-    let schema_master_table = resolver.schema().get_btree_table(SQLITE_TABLEID).unwrap();
-    let sqlite_schema_cursor_id =
-        program.alloc_cursor_id(CursorType::BTreeTable(schema_master_table));
-    program.emit_insn(Insn::OpenWrite {
-        cursor_id: sqlite_schema_cursor_id,
-        root_page: 1i64.into(),
-        db: database_id,
-    });
     let cdc_table = prepare_cdc_if_necessary(program, resolver.schema(), SQLITE_TABLEID)?;
+
+    let create_btree_label = program.allocate_label();
+    let database_format_reg = program.alloc_register();
+    program.emit_insn(Insn::ReadCookie {
+        db: database_id,
+        dest: database_format_reg,
+        cookie: Cookie::DatabaseFormat,
+    });
+    program.emit_insn(Insn::If {
+        reg: database_format_reg,
+        target_pc: create_btree_label,
+        jump_if_null: false,
+    });
+    program.emit_insn(Insn::SetCookie {
+        db: database_id,
+        cookie: Cookie::DatabaseFormat,
+        value: 4,
+        p5: 0,
+    });
+    program.emit_insn(Insn::SetCookie {
+        db: database_id,
+        cookie: Cookie::DatabaseTextEncoding,
+        value: 1,
+        p5: 0,
+    });
+    program.resolve_label(create_btree_label, program.offset());
 
     let created_sequence_table = if has_autoincrement
         && resolver.with_schema(database_id, |s| {
             s.get_table(SQLITE_SEQUENCE_TABLE_NAME).is_none()
         }) {
+        let schema_master_table = resolver.schema().get_btree_table(SQLITE_TABLEID).unwrap();
+        let sqlite_schema_cursor_id =
+            program.alloc_cursor_id(CursorType::BTreeTable(schema_master_table));
+        program.emit_insn(Insn::OpenWrite {
+            cursor_id: sqlite_schema_cursor_id,
+            root_page: 1i64.into(),
+            db: database_id,
+        });
         let seq_table_root_reg = program.alloc_register();
         program.emit_insn(Insn::CreateBtree {
             db: database_id,
@@ -1007,10 +1033,6 @@ pub fn translate_create_table(
     let sql = create_table_body_to_str(&tbl_name, &body)?;
 
     let parse_schema_label = program.allocate_label();
-    // TODO: ReadCookie
-    // TODO: If
-    // TODO: SetCookie
-    // TODO: SetCookie
 
     let table_root_reg = program.alloc_register();
     program.emit_insn(Insn::CreateBtree {
