@@ -236,20 +236,16 @@ impl Statement {
         self.state.query_deadline = Some(self.pager.io.current_time_monotonic() + timeout);
     }
 
-    fn maybe_interrupt_for_query_timeout(&mut self) {
-        if let Some(deadline) = self.state.query_deadline {
-            if self.pager.io.current_time_monotonic() >= deadline {
-                self.state.interrupt();
-            }
-        }
-    }
-
     fn release_active_root_if_counted(&mut self) {
         if self.counted_as_active_root {
-            self.program
+            let previous = self
+                .program
                 .connection
                 .n_active_root_statements
                 .fetch_sub(1, Ordering::SeqCst);
+            if previous == 1 {
+                self.program.connection.clear_interrupt_if_idle();
+            }
             self.counted_as_active_root = false;
         }
     }
@@ -275,7 +271,6 @@ impl Statement {
         }
 
         self.arm_query_timeout_if_needed();
-        self.maybe_interrupt_for_query_timeout();
 
         // If we're waiting for a busy handler timeout, check if we can proceed
         if let Some(busy_state) = self.busy_handler_state.as_ref() {

@@ -18,7 +18,9 @@ use crate::MAIN_DB_ID;
 use crate::{
     ast, function,
     io::{MemoryIO, IO},
-    parse_schema_rows, refresh_analyze_stats, translate,
+    parse_schema_rows,
+    progress::{ProgressHandler, ProgressHandlerCallback},
+    refresh_analyze_stats, translate,
     util::IOExt,
     vdbe, AllViewsTxState, AtomicCipherMode, AtomicSyncMode, AtomicTempStore, BusyHandler,
     BusyHandlerCallback, CaptureDataChangesInfo, CheckpointMode, CheckpointResult, CipherMode, Cmd,
@@ -126,9 +128,13 @@ pub struct Connection {
     /// Busy handler for lock contention
     /// Default is BusyHandler::None (return SQLITE_BUSY immediately)
     pub(super) busy_handler: RwLock<BusyHandler>,
+    /// Step-based progress callback for SQLite-compatible cancellation hooks.
+    pub(super) progress_handler: ProgressHandler,
     /// Maximum execution time for a single statement on this connection.
     /// `Duration::ZERO` means disabled.
     pub(super) query_timeout_ms: AtomicU64,
+    /// True when sqlite3_interrupt()-style cancellation is pending for active root statements.
+    pub(super) interrupt_requested: AtomicBool,
     /// Whether this is an internal connection used for MVCC bootstrap
     pub(super) is_mvcc_bootstrap_connection: AtomicBool,
     /// Whether pragma foreign_keys=ON for this connection
@@ -2275,6 +2281,37 @@ impl Connection {
     /// Get a reference to the busy handler.
     pub fn get_busy_handler(&self) -> crate::sync::RwLockReadGuard<'_, BusyHandler> {
         self.busy_handler.read()
+    }
+
+    /// Sets a progress handler invoked approximately every `ops` VM steps.
+    /// Passing `ops == 0` or `None` disables the progress handler.
+    pub fn set_progress_handler(&self, ops: u64, handler: Option<ProgressHandlerCallback>) {
+        self.progress_handler.set(ops, handler);
+    }
+
+    /// Returns true when the step-based progress handler requests interruption.
+    pub fn should_interrupt_for_progress(&self, vm_steps: u64) -> bool {
+        self.progress_handler.should_interrupt(vm_steps)
+    }
+
+    /// Request interruption of currently running root statements on this connection.
+    /// If no root statement is active, the request is ignored to match SQLite semantics.
+    pub fn interrupt(&self) {
+        if self.n_active_root_statements.load(Ordering::SeqCst) > 0 {
+            self.interrupt_requested.store(true, Ordering::SeqCst);
+        }
+    }
+
+    /// Returns true if an interrupt is currently pending for this connection.
+    pub fn is_interrupted(&self) -> bool {
+        self.interrupt_requested.load(Ordering::SeqCst)
+    }
+
+    /// Clear the connection interrupt once no root statements remain active.
+    pub(crate) fn clear_interrupt_if_idle(&self) {
+        if self.n_active_root_statements.load(Ordering::SeqCst) == 0 {
+            self.interrupt_requested.store(false, Ordering::SeqCst);
+        }
     }
 
     pub(crate) fn set_tx_state(&self, state: TransactionState) {

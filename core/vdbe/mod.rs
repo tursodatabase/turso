@@ -623,6 +623,10 @@ impl ProgramState {
         self.execution_state = ProgramExecutionState::Interrupting;
     }
 
+    pub fn is_interrupted(&self) -> bool {
+        matches!(self.execution_state, ProgramExecutionState::Interrupting)
+    }
+
     pub fn bind_at(&mut self, index: NonZero<usize>, value: Value) {
         let i = index.get() - 1;
         if i >= self.parameters.len() {
@@ -1125,6 +1129,24 @@ impl Program {
         self.connection.get_pager_from_database_index(idx)
     }
 
+    #[inline]
+    fn maybe_request_interrupt<I>(&self, state: &mut ProgramState, io: &I) -> bool
+    where
+        I: crate::IO + ?Sized,
+    {
+        let connection_interrupt = self.connection.is_interrupted();
+        let hit_query_deadline = state
+            .query_deadline
+            .is_some_and(|deadline| io.current_time_monotonic() >= deadline);
+        let progress_interrupt = self
+            .connection
+            .should_interrupt_for_progress(state.metrics.vm_steps);
+        if connection_interrupt || hit_query_deadline || progress_interrupt {
+            state.interrupt();
+        }
+        state.is_interrupted()
+    }
+
     pub fn step(
         &self,
         state: &mut ProgramState,
@@ -1163,13 +1185,7 @@ impl Program {
             return Err(LimboError::InternalError("Connection closed".to_string()));
         }
 
-        if let Some(deadline) = state.query_deadline {
-            if pager.io.current_time_monotonic() >= deadline {
-                state.execution_state = ProgramExecutionState::Interrupting;
-            }
-        }
-
-        if matches!(state.execution_state, ProgramExecutionState::Interrupting) {
+        if self.maybe_request_interrupt(state, pager.io.as_ref()) {
             return Ok(StepResult::Interrupt);
         }
 
@@ -1270,13 +1286,7 @@ impl Program {
                 return Err(LimboError::InternalError("Connection closed".to_string()));
             }
 
-            if let Some(deadline) = state.query_deadline {
-                if pager.io.current_time_monotonic() >= deadline {
-                    state.execution_state = ProgramExecutionState::Interrupting;
-                }
-            }
-
-            if matches!(state.execution_state, ProgramExecutionState::Interrupting) {
+            if self.maybe_request_interrupt(state, pager.io.as_ref()) {
                 return Ok(StepResult::Interrupt);
             }
 
@@ -1323,12 +1333,7 @@ impl Program {
                 }
                 return Err(LimboError::InternalError("Connection closed".to_string()));
             }
-            if let Some(deadline) = state.query_deadline {
-                if pager.io.current_time_monotonic() >= deadline {
-                    state.execution_state = ProgramExecutionState::Interrupting;
-                }
-            }
-            if matches!(state.execution_state, ProgramExecutionState::Interrupting) {
+            if self.maybe_request_interrupt(state, pager.io.as_ref()) {
                 self.abort(pager, None, state)?;
                 return Ok(StepResult::Interrupt);
             }
