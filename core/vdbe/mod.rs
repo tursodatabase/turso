@@ -1033,6 +1033,9 @@ pub struct PreparedProgram {
     pub comments: Vec<(InsnReference, &'static str)>,
     pub parameters: crate::parameters::Parameters,
     pub change_cnt_on: bool,
+    /// Flag that detect if the sqlite statement will directly manipulate the database file.\
+    /// mirrors: https://sqlite.org/c3ref/stmt_readonly.html.
+    pub readonly: bool,
     pub result_columns: Vec<ResultSetColumn>,
     pub table_references: TableReferences,
     pub sql: String,
@@ -1109,9 +1112,15 @@ impl PreparedProgram {
     pub fn is_compatible_with(&self, connection: &Connection) -> bool {
         self.prepare_context.matches_connection(connection)
     }
+
+    #[inline]
+    pub fn is_readonly(&self) -> bool {
+        self.readonly
+    }
 }
 
 impl Program {
+    #[inline]
     pub fn prepared(&self) -> &Arc<PreparedProgram> {
         &self.prepared
     }
@@ -1121,6 +1130,11 @@ impl Program {
             prepared,
             connection,
         }
+    }
+
+    #[inline]
+    pub fn is_readonly(&self) -> bool {
+        self.prepared().is_readonly()
     }
 }
 

@@ -1215,8 +1215,15 @@ pub unsafe extern "C" fn sqlite3_changes(db: *mut sqlite3) -> ffi::c_int {
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn sqlite3_stmt_readonly(_stmt: *mut sqlite3_stmt) -> ffi::c_int {
-    stub!();
+pub unsafe extern "C" fn sqlite3_stmt_readonly(stmt: *mut sqlite3_stmt) -> ffi::c_int {
+    if stmt.is_null() {
+        return 1;
+    }
+    if (*stmt).stmt.get_program().is_readonly() {
+        1
+    } else {
+        0
+    }
 }
 
 #[no_mangle]

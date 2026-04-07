@@ -484,7 +484,7 @@ Modifiers:
 | sqlite3_step                | ✅ Yes     |         |
 | sqlite3_reset               | ✅ Yes     |         |
 | sqlite3_exec                | ✅ Yes     |         |
-| sqlite3_stmt_readonly       | ❌ No      | Stub    |
+| sqlite3_stmt_readonly       | ✅ Yes     |         |
 | sqlite3_stmt_busy           | ❌ No      | Stub    |
 | sqlite3_stmt_status         | ❌ No      |         |
 | sqlite3_sql                 | ❌ No      |         |

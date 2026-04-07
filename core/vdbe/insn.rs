@@ -1922,6 +1922,49 @@ impl Insn {
         // InsnVariants::from(self).to_function_fast()
         INSN_VTABLE[self.discriminant() as usize]
     }
+
+    /// Returns true if this opcode cannot directly modify persistent database
+    /// contents. This is used to compute PreparedProgram::readonly, mirroring
+    /// SQLite's sqlite3_stmt_readonly() classification over compiled bytecode.
+    pub fn is_readonly(&self) -> bool {
+        match self {
+            Self::Checkpoint { .. }
+            | Self::VCreate { .. }
+            | Self::VUpdate { .. }
+            | Self::VDestroy { .. }
+            | Self::VRename { .. }
+            | Self::Transaction {
+                tx_mode: TransactionMode::Write | TransactionMode::Concurrent,
+                ..
+            }
+            | Self::Insert { .. }
+            | Self::Delete { .. }
+            | Self::IdxDelete { .. }
+            | Self::OpenWrite { .. }
+            | Self::CreateBtree { .. }
+            | Self::IndexMethodCreate { .. }
+            | Self::IndexMethodDestroy { .. }
+            | Self::IndexMethodOptimize { .. }
+            | Self::Destroy { .. }
+            | Self::DropTable { .. }
+            | Self::DropView { .. }
+            | Self::DropIndex { .. }
+            | Self::DropTrigger { .. }
+            | Self::DropType { .. }
+            | Self::AddType { .. }
+            | Self::ParseSchema { .. }
+            | Self::PopulateMaterializedViews { .. }
+            | Self::SetCookie { .. }
+            | Self::RenameTable { .. }
+            | Self::DropColumn { .. }
+            | Self::AddColumn { .. }
+            | Self::AlterColumn { .. }
+            | Self::JournalMode { .. } => false,
+            Self::MaxPgcnt { new_max, .. } => *new_max == 0,
+            Self::Program { program, .. } => program.is_readonly(),
+            _ => true,
+        }
+    }
 }
 
 // TODO: Add remaining cookies.
