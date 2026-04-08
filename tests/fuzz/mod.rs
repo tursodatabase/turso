@@ -9,6 +9,7 @@ pub mod orderby_collation;
 pub mod raise;
 pub mod rowid_alias;
 pub mod savepoint;
+pub mod savepoint_repro;
 pub mod subjournal;
 pub mod subquery;
 pub mod test_join_optimizer;
