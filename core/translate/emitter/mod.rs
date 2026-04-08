@@ -129,6 +129,7 @@ pub struct Resolver<'a> {
     database_schemas: &'a RwLock<HashMap<usize, Arc<Schema>>>,
     temp_database: &'a RwLock<Option<crate::connection::TempDatabase>>,
     attached_databases: &'a RwLock<DatabaseCatalog>,
+    non_main_schema_cache: RefCell<HashMap<usize, Arc<Schema>>>,
     pub symbol_table: &'a SymbolTable,
     pub expr_to_reg_cache_enabled: bool,
     /// Cache entries for previously translated expressions.
@@ -190,6 +191,7 @@ impl<'a> Resolver<'a> {
             database_schemas,
             temp_database,
             attached_databases,
+            non_main_schema_cache: RefCell::new(HashMap::default()),
             symbol_table,
             expr_to_reg_cache_enabled: false,
             expr_to_reg_cache: Vec::new(),
@@ -211,6 +213,7 @@ impl<'a> Resolver<'a> {
             database_schemas: self.database_schemas,
             temp_database: self.temp_database,
             attached_databases: self.attached_databases,
+            non_main_schema_cache: RefCell::new(self.non_main_schema_cache.borrow().clone()),
             symbol_table: self.symbol_table,
             expr_to_reg_cache_enabled: false,
             expr_to_reg_cache: Vec::new(),
@@ -228,6 +231,7 @@ impl<'a> Resolver<'a> {
             database_schemas: self.database_schemas,
             temp_database: self.temp_database,
             attached_databases: self.attached_databases,
+            non_main_schema_cache: RefCell::new(self.non_main_schema_cache.borrow().clone()),
             symbol_table: self.symbol_table,
             expr_to_reg_cache_enabled: self.expr_to_reg_cache_enabled,
             expr_to_reg_cache: self.expr_to_reg_cache.clone(),
@@ -244,6 +248,56 @@ impl<'a> Resolver<'a> {
             crate::bail_parse_error!("{} require --experimental-custom-types flag", feature);
         }
         Ok(())
+    }
+
+    fn cached_non_main_schema(&self, database_id: usize) -> Arc<Schema> {
+        debug_assert_ne!(database_id, crate::MAIN_DB_ID);
+
+        if let Some(schema) = self
+            .non_main_schema_cache
+            .borrow()
+            .get(&database_id)
+            .cloned()
+        {
+            return schema;
+        }
+
+        if let Some(schema) = self.database_schemas.read().get(&database_id).cloned() {
+            self.non_main_schema_cache
+                .borrow_mut()
+                .insert(database_id, schema.clone());
+            return schema;
+        }
+
+        let loaded_schema = match database_id {
+            crate::TEMP_DB_ID => self
+                .temp_database
+                .read()
+                .as_ref()
+                .map(|temp_db| temp_db.db.schema.lock().clone())
+                .unwrap_or_else(|| Arc::new(Schema::with_options(self.enable_custom_types))),
+            _ => {
+                let attached_dbs = self.attached_databases.read();
+                let (db, _pager) = attached_dbs
+                    .index_to_data
+                    .get(&database_id)
+                    .expect("Database ID should be valid after resolve_database_id");
+                let schema = db.schema.lock().clone();
+                schema
+            }
+        };
+
+        let schema = {
+            let mut schemas = self.database_schemas.write();
+            schemas
+                .entry(database_id)
+                .or_insert_with(|| loaded_schema)
+                .clone()
+        };
+        self.non_main_schema_cache
+            .borrow_mut()
+            .insert(database_id, schema.clone());
+        schema
     }
 
     /// Set trigger database context to restrict table resolution to the trigger's database.
@@ -322,35 +376,8 @@ impl<'a> Resolver<'a> {
     pub(crate) fn with_schema<T>(&self, database_id: usize, f: impl FnOnce(&Schema) -> T) -> T {
         match database_id {
             crate::MAIN_DB_ID => f(self.schema),
-            crate::TEMP_DB_ID => {
-                let schemas = self.database_schemas.read();
-                if let Some(local_schema) = schemas.get(&database_id) {
-                    return f(local_schema);
-                }
-                drop(schemas);
-
-                if let Some(temp_db) = self.temp_database.read().as_ref() {
-                    let schema = temp_db.db.schema.lock().clone();
-                    f(&schema)
-                } else {
-                    let schema = Arc::new(Schema::with_options(self.enable_custom_types));
-                    f(&schema)
-                }
-            }
             _ => {
-                let schemas = self.database_schemas.read();
-                if let Some(local_schema) = schemas.get(&database_id) {
-                    return f(local_schema);
-                }
-                drop(schemas);
-
-                let attached_dbs = self.attached_databases.read();
-                let (db, _pager) = attached_dbs
-                    .index_to_data
-                    .get(&database_id)
-                    .expect("Database ID should be valid after resolve_database_id");
-
-                let schema = db.schema.lock().clone();
+                let schema = self.cached_non_main_schema(database_id);
                 f(&schema)
             }
         }
@@ -495,6 +522,38 @@ impl<'a> Resolver<'a> {
             crate::TEMP_DB_ID => Some(Self::TEMP_DB.to_string()),
             _ => self.attached_databases.read().get_name_by_index(index),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{DoubleQuotedDml, Resolver};
+    use crate::{schema::Schema, DatabaseCatalog, RwLock, SymbolTable};
+    use rustc_hash::FxHashMap as HashMap;
+
+    #[test]
+    fn with_schema_caches_empty_temp_schema_on_first_lookup() {
+        let schema = Schema::new();
+        let syms = SymbolTable::new();
+        let database_schemas = RwLock::new(HashMap::default());
+        let attached_databases = RwLock::new(DatabaseCatalog::new());
+        let temp_database = RwLock::new(None);
+        let resolver = Resolver::new(
+            &schema,
+            &database_schemas,
+            &temp_database,
+            &attached_databases,
+            &syms,
+            true,
+            DoubleQuotedDml::Enabled,
+        );
+
+        resolver.with_schema(crate::TEMP_DB_ID, |temp_schema| {
+            assert!(temp_schema.get_table("temp_test_table").is_none());
+        });
+
+        let cached = database_schemas.read();
+        assert!(cached.contains_key(&crate::TEMP_DB_ID));
     }
 }
 

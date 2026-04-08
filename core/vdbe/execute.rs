@@ -496,6 +496,13 @@ pub fn op_checkpoint(
     insn: &Insn,
     _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
+    fn set_not_in_wal_result(state: &mut ProgramState, dest: usize) {
+        // Match SQLite for databases that are not in WAL mode.
+        state.registers[dest].set_int(0);
+        state.registers[dest + 1].set_int(-1);
+        state.registers[dest + 2].set_int(-1);
+    }
+
     load_insn!(
         Checkpoint {
             database,
@@ -511,7 +518,19 @@ pub fn op_checkpoint(
         // however.
         return Err(LimboError::TableLocked);
     }
+    if *database == crate::TEMP_DB_ID && program.connection.temp_database.read().is_none() {
+        set_not_in_wal_result(state, *dest);
+        state.pc += 1;
+        return Ok(InsnFunctionStepResult::Step);
+    }
+
     let pager = program.get_pager_from_database_index(database);
+    if !pager.has_wal() {
+        set_not_in_wal_result(state, *dest);
+        state.pc += 1;
+        return Ok(InsnFunctionStepResult::Step);
+    }
+
     // In autocommit mode, this statement can still hold an implicit read tx.
     // RESTART/TRUNCATE checkpoint needs to restart WAL and may fail with Busy
     // if we keep our own statement read slot while checkpointing.

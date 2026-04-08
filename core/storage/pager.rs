@@ -2503,7 +2503,6 @@ impl Pager {
         PageSize::new(value).expect("invalid page size stored")
     }
 
-    #[cfg(test)]
     pub(crate) fn has_wal(&self) -> bool {
         self.wal.is_some()
     }
