@@ -1,4 +1,4 @@
-use crate::common::{limbo_exec_rows, TempDatabase};
+use crate::common::{limbo_exec_rows, ExecRows, TempDatabase};
 use rusqlite::types::Value as RValue;
 #[cfg(not(target_vendor = "apple"))]
 use turso_core::LimboError;
@@ -449,4 +449,25 @@ fn test_pragma_temp_wal_checkpoint_without_temp_db_matches_sqlite(_db: TempDatab
         rows[0],
         vec![RValue::Integer(0), RValue::Integer(-1), RValue::Integer(-1)]
     );
+}
+
+#[turso_macros::test]
+fn test_pragma_temp_journal_mode_mvcc_is_ignored_without_corrupting_main(db: TempDatabase) {
+    let conn = db.connect_limbo();
+
+    conn.execute("CREATE TABLE m(x)").unwrap();
+    conn.execute("CREATE TEMP TABLE t(x)").unwrap();
+
+    let rows = limbo_exec_rows(&conn, "PRAGMA temp.journal_mode='mvcc'");
+    assert_eq!(rows, vec![vec![RValue::Text("wal".into())]]);
+
+    let err = conn.execute("BEGIN CONCURRENT").unwrap_err().to_string();
+    assert!(
+        err.contains("Concurrent transaction mode is only supported when MVCC is enabled"),
+        "unexpected error: {err}"
+    );
+
+    conn.execute("INSERT INTO m VALUES(1)").unwrap();
+    let rows: Vec<(i64,)> = conn.exec_rows("SELECT x FROM m");
+    assert_eq!(rows, vec![(1,)]);
 }

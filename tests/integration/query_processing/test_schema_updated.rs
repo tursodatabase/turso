@@ -72,6 +72,33 @@ fn test_schema_update_reprepares_statement(tmp_db: TempDatabase) -> Result<()> {
     Ok(())
 }
 
+#[turso_macros::test]
+fn test_temp_shadowing_reprepares_prepared_statement(tmp_db: TempDatabase) -> Result<()> {
+    let conn = tmp_db.connect_limbo();
+
+    conn.execute("CREATE TABLE t (x INTEGER)")?;
+    conn.execute("INSERT INTO main.t VALUES (1)")?;
+
+    let mut stmt = conn.prepare("SELECT x FROM t")?;
+
+    conn.execute("CREATE TEMP TABLE t (x INTEGER)")?;
+    conn.execute("INSERT INTO temp.t VALUES (2)")?;
+
+    let mut rows = Vec::new();
+    stmt.run_with_row_callback(|row| {
+        rows.push(row.get::<i64>(0)?);
+        Ok(())
+    })?;
+
+    assert_eq!(
+        rows,
+        vec![2],
+        "prepared statement should observe temp-table shadowing after reprepare"
+    );
+
+    Ok(())
+}
+
 /// Test that deferred_seeks vector is properly resized when a statement is reprepared
 /// with a larger cursor count due to schema changes (e.g., new index creation).
 ///
