@@ -64,7 +64,7 @@ fn display_table_list_name(database_id: usize, name: &str) -> String {
     if database_id == crate::TEMP_DB_ID
         && name.eq_ignore_ascii_case(crate::schema::SCHEMA_TABLE_NAME)
     {
-        "sqlite_temp_schema".to_string()
+        crate::schema::TEMP_SCHEMA_TABLE_NAME.to_string()
     } else {
         name.to_string()
     }
@@ -73,8 +73,8 @@ fn display_table_list_name(database_id: usize, name: &str) -> String {
 fn normalize_table_pragma_lookup_name(database_id: usize, name: &str) -> String {
     let normalized = normalize_ident(name);
     if (database_id == crate::TEMP_DB_ID
-        && (normalized.eq_ignore_ascii_case("sqlite_temp_schema")
-            || normalized.eq_ignore_ascii_case("sqlite_temp_master")))
+        && (normalized.eq_ignore_ascii_case(crate::schema::TEMP_SCHEMA_TABLE_NAME)
+            || normalized.eq_ignore_ascii_case(crate::schema::TEMP_SCHEMA_TABLE_NAME_ALT)))
         || normalized.eq_ignore_ascii_case(crate::schema::SCHEMA_TABLE_NAME_ALT)
     {
         crate::schema::SCHEMA_TABLE_NAME.to_string()
@@ -93,8 +93,8 @@ fn resolve_table_pragma_database_id(
         return Ok(default_database_id);
     }
 
-    if table_name.eq_ignore_ascii_case("sqlite_temp_schema")
-        || table_name.eq_ignore_ascii_case("sqlite_temp_master")
+    if table_name.eq_ignore_ascii_case(crate::schema::TEMP_SCHEMA_TABLE_NAME)
+        || table_name.eq_ignore_ascii_case(crate::schema::TEMP_SCHEMA_TABLE_NAME_ALT)
     {
         return Ok(crate::TEMP_DB_ID);
     }

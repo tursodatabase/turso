@@ -11848,6 +11848,17 @@ fn regenerate_trigger_sql(trigger: &crate::schema::Trigger) -> String {
     )
 }
 
+fn sql_might_reference_identifier(sql: &str, ident: &str) -> bool {
+    if ident.is_empty() {
+        return true;
+    }
+
+    let ident = ident.as_bytes();
+    sql.as_bytes()
+        .windows(ident.len())
+        .any(|window| window.eq_ignore_ascii_case(ident))
+}
+
 pub fn op_rename_table(
     program: &Program,
     state: &mut ProgramState,
@@ -11950,6 +11961,9 @@ pub fn op_rename_table(
         // in their body commands (e.g., INSERT INTO old_name in a trigger on another table)
         for (_, triggers) in schema.triggers.iter_mut() {
             for trigger_arc in triggers.iter_mut() {
+                if !sql_might_reference_identifier(&trigger_arc.sql, &normalized_from) {
+                    continue;
+                }
                 let trigger = Arc::make_mut(trigger_arc);
                 let old_sql = trigger.sql.clone();
                 for cmd in &mut trigger.commands {
@@ -11972,6 +11986,9 @@ pub fn op_rename_table(
         conn.with_database_schema_mut(crate::TEMP_DB_ID, |schema| -> crate::Result<()> {
             for (_, triggers) in schema.triggers.iter_mut() {
                 for trigger_arc in triggers.iter_mut() {
+                    if !sql_might_reference_identifier(&trigger_arc.sql, &normalized_from) {
+                        continue;
+                    }
                     let trigger = Arc::make_mut(trigger_arc);
                     let old_sql = trigger.sql.clone();
                     for cmd in &mut trigger.commands {

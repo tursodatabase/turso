@@ -2699,12 +2699,9 @@ impl Connection {
 
     pub(crate) fn rollback_named_savepoint_frame(&self, name: &str) -> Option<isize> {
         let mut savepoints = self.named_savepoints.write();
-        let Some(target_idx) = savepoints
+        let target_idx = savepoints
             .iter()
-            .rposition(|savepoint| savepoint.name == name)
-        else {
-            return None;
-        };
+            .rposition(|savepoint| savepoint.name == name)?;
         let deferred_fk_violations = savepoints[target_idx].deferred_fk_violations;
         savepoints.truncate(target_idx + 1);
         Some(deferred_fk_violations)
