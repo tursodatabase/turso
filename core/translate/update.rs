@@ -17,10 +17,11 @@ use crate::{
 use turso_parser::ast::{self, Expr};
 
 use super::emitter::emit_program;
-use super::expr::process_returning_clause;
+use super::expr::{process_returning_clause, walk_expr, WalkControl};
 use super::optimizer::optimize_plan;
 use super::plan::{
-    ColumnUsedMask, DmlSafety, JoinedTable, Plan, TableReferences, UpdatePlan, UpdateSetClause,
+    ColumnUsedMask, DmlSafety, DmlSafetyReason, JoinedTable, Plan, TableReferences, UpdatePlan,
+    UpdateSetClause, WhereTerm,
 };
 use super::planner::{append_vtab_predicates_to_where_clause, parse_from, parse_where};
 use super::subquery::{
@@ -421,6 +422,11 @@ fn prepare_update_plan(
         resolver,
     )?;
 
+    let mut safety = DmlSafety::default();
+    if where_clause_has_subquery(&where_clause) {
+        safety.require(DmlSafetyReason::SubqueryInWhere);
+    }
+
     let (limit, offset) = body
         .limit
         .map_or(Ok((None, None)), |l| parse_limit(l, resolver))?;
@@ -454,8 +460,32 @@ fn prepare_update_plan(
         write_set_plan: None,
         cdc_update_alter_statement: None,
         non_from_clause_subqueries,
-        safety: DmlSafety::default(),
+        safety,
     })
+}
+
+/// Check if any WHERE predicate contains a subquery (Subquery, InSelect, or Exists).
+fn where_clause_has_subquery(predicates: &[WhereTerm]) -> bool {
+    for pred in predicates {
+        let mut found = false;
+        let _ = walk_expr(&pred.expr, &mut |e| {
+            if matches!(
+                e,
+                Expr::Subquery(_) | Expr::InSelect { .. } | Expr::Exists(_)
+            ) {
+                found = true;
+            }
+            Ok(if found {
+                WalkControl::SkipChildren
+            } else {
+                WalkControl::Continue
+            })
+        });
+        if found {
+            return true;
+        }
+    }
+    false
 }
 
 fn collect_update_set_clauses(
