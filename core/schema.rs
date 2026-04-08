@@ -153,6 +153,8 @@ use turso_parser::{
 
 pub const SCHEMA_TABLE_NAME: &str = "sqlite_schema";
 pub const SCHEMA_TABLE_NAME_ALT: &str = "sqlite_master";
+pub const TEMP_SCHEMA_TABLE_NAME: &str = "sqlite_temp_schema";
+pub const TEMP_SCHEMA_TABLE_NAME_ALT: &str = "sqlite_temp_master";
 pub const SQLITE_SEQUENCE_TABLE_NAME: &str = "sqlite_sequence";
 pub const TURSO_TYPES_TABLE_NAME: &str = "__turso_internal_types";
 pub const DBSP_TABLE_PREFIX: &str = "__turso_internal_dbsp_state_v";
@@ -459,6 +461,18 @@ fn bootstrap_builtin_types(registry: &mut HashMap<String, Arc<TypeDef>>) {
 }
 
 impl Schema {
+    fn normalize_table_lookup_name<'a>(&self, name: &'a str) -> String {
+        let name = normalize_ident(name);
+        if name.eq_ignore_ascii_case(SCHEMA_TABLE_NAME_ALT)
+            || name.eq_ignore_ascii_case(TEMP_SCHEMA_TABLE_NAME)
+            || name.eq_ignore_ascii_case(TEMP_SCHEMA_TABLE_NAME_ALT)
+        {
+            SCHEMA_TABLE_NAME.to_string()
+        } else {
+            name
+        }
+    }
+
     pub fn new() -> Self {
         Self::with_options(true)
     }
@@ -813,13 +827,8 @@ impl Schema {
     }
 
     pub fn get_table(&self, name: &str) -> Option<Arc<Table>> {
-        let name = normalize_ident(name);
-        let name = if name.eq_ignore_ascii_case(SCHEMA_TABLE_NAME_ALT) {
-            SCHEMA_TABLE_NAME
-        } else {
-            &name
-        };
-        self.tables.get(name).cloned()
+        let name = self.normalize_table_lookup_name(name);
+        self.tables.get(&name).cloned()
     }
 
     pub fn remove_table(&mut self, table_name: &str) {
@@ -835,7 +844,7 @@ impl Schema {
     }
 
     pub fn get_btree_table(&self, name: &str) -> Option<Arc<BTreeTable>> {
-        let name = normalize_ident(name);
+        let name = self.normalize_table_lookup_name(name);
         if let Some(table) = self.tables.get(&name) {
             table.btree()
         } else {
@@ -1795,7 +1804,7 @@ impl Schema {
     /// Returns the type of schema object with the given name, if one exists.
     /// Checks tables, views, and indexes.
     pub fn get_object_type(&self, name: &str) -> Option<SchemaObjectType> {
-        let normalized_name = normalize_ident(name);
+        let normalized_name = self.normalize_table_lookup_name(name);
 
         if self.tables.contains_key(&normalized_name) {
             return Some(SchemaObjectType::Table);

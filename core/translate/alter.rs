@@ -2375,6 +2375,34 @@ fn rewrite_trigger_sql_for_column_rename(
         &new_commands,
     );
 
+    if trigger_database_id == crate::TEMP_DB_ID && target_database_id == crate::TEMP_DB_ID {
+        let rewritten_trigger = crate::schema::Trigger::new(
+            trigger_name.name.as_str().to_string(),
+            new_sql.clone(),
+            tbl_name.name.as_str().to_string(),
+            time,
+            new_event.clone(),
+            for_each_row,
+            new_when_clause.as_deref().cloned(),
+            new_commands.clone(),
+            temporary,
+        );
+        if let Some(bad_column) = validate_trigger_columns_after_drop(
+            &rewritten_trigger,
+            &target_table_name,
+            trigger_table.as_ref(),
+            resolver,
+            trigger_database_id,
+            target_database_id,
+        )? {
+            return Err(LimboError::ParseError(format!(
+                "error in trigger {}: no such column: {}",
+                trigger_name.name.as_str(),
+                bad_column
+            )));
+        }
+    }
+
     Ok(new_sql)
 }
 
