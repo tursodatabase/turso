@@ -1621,10 +1621,10 @@ impl Limbo {
             let prefix = (name != "main").then_some(&name);
             let sql = match pattern {
                 Some(pattern) => format!(
-                    "SELECT name FROM {name}.sqlite_schema WHERE type='table' AND name NOT LIKE 'sqlite_%' AND name LIKE '{pattern}' ORDER BY 1"
+                    "SELECT name FROM {name}.sqlite_schema WHERE type in ('table', 'view') AND name NOT LIKE 'sqlite_%' AND name LIKE '{pattern}' ORDER BY 1"
                 ),
                 None => format!(
-                    "SELECT name FROM {name}.sqlite_schema WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY 1"
+                    "SELECT name FROM {name}.sqlite_schema WHERE type in ('table', 'view') AND name NOT LIKE 'sqlite_%' ORDER BY 1"
                 ),
             };
             let handler = |row: &turso_core::Row| {
