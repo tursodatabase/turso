@@ -13,6 +13,7 @@ use crate::{
         emitter::{emit_check_constraints, gencol::compute_virtual_columns, Resolver},
         expr::{translate_expr, walk_expr, walk_expr_mut, WalkControl},
         plan::{ColumnUsedMask, OuterQueryReference, TableReferences},
+        trigger::create_trigger_to_sql,
     },
     util::{
         check_expr_references_column, escape_sql_string_literal, normalize_ident,
@@ -2164,8 +2165,7 @@ fn rewrite_trigger_sql_for_table_rename(
         )));
     };
 
-    let old_table_name_norm = normalize_ident(old_table_name);
-    let new_tbl_name = if normalize_ident(tbl_name.name.as_str()) == old_table_name_norm {
+    let new_tbl_name = if tbl_name.name.as_str().eq_ignore_ascii_case(old_table_name) {
         ast::QualifiedName {
             db_name: tbl_name.db_name,
             name: ast::Name::exact(new_table_name.to_string()),
@@ -2209,8 +2209,6 @@ fn rewrite_trigger_sql_for_column_rename(
     target_database_id: usize,
     resolver: &Resolver,
 ) -> Result<String> {
-    use turso_parser::parser::Parser;
-
     // Parse the trigger SQL
     let mut parser = Parser::new(trigger_sql.as_bytes());
     let cmd = parser
@@ -2250,7 +2248,7 @@ fn rewrite_trigger_sql_for_column_rename(
     // Check if this trigger references the column being renamed
     // We need to check if the column exists in the table being renamed
     let target_table_name = normalize_ident(table_name);
-    let target_table = resolver
+    let _target_table = resolver
         .with_schema(target_database_id, |schema| {
             schema.get_btree_table(&target_table_name)
         })
@@ -2338,7 +2336,6 @@ fn rewrite_trigger_sql_for_column_rename(
         let new_cmd = rewrite_trigger_cmd_for_column_rename(
             cmd,
             &trigger_table,
-            &target_table,
             trigger_table_name_raw,
             &target_table_name,
             &old_col_norm,
@@ -2362,7 +2359,6 @@ fn rewrite_trigger_sql_for_column_rename(
     )?;
 
     // Reconstruct the SQL
-    use crate::translate::trigger::create_trigger_to_sql;
     let new_sql = create_trigger_to_sql(
         temporary,
         if_not_exists,
@@ -2418,8 +2414,7 @@ fn validate_trigger_after_column_rename(
     database_id: usize,
     resolver: &Resolver,
 ) -> Result<()> {
-    let is_renaming_trigger_table =
-        normalize_ident(trigger_table_name) == normalize_ident(target_table_name);
+    let is_renaming_trigger_table = trigger_table_name.eq_ignore_ascii_case(target_table_name);
 
     if is_renaming_trigger_table {
         if let ast::TriggerEvent::UpdateOf(cols) = event {
@@ -2480,14 +2475,14 @@ fn validate_trigger_cmd_after_column_rename(
             where_clause,
             ..
         } => {
-            let update_table_name_norm = normalize_ident(tbl_name.as_str());
-            let is_renaming_update_table = update_table_name_norm == *target_table_name;
+            let is_renaming_update_table =
+                tbl_name.as_str().eq_ignore_ascii_case(target_table_name);
             let from_target_qualifiers = from_clause_target_qualifiers(from, target_table_name);
 
             if is_renaming_update_table {
                 for set in sets {
                     for col_name in &set.col_names {
-                        if normalize_ident(col_name.as_str()) == *old_col_norm {
+                        if col_name.as_str().eq_ignore_ascii_case(old_col_norm) {
                             return Err(LimboError::ParseError(format!(
                                 "no such column: {old_col_norm}"
                             )));
@@ -2503,7 +2498,7 @@ fn validate_trigger_cmd_after_column_rename(
                     trigger_table_name,
                     target_table_name,
                     old_col_norm,
-                    Some(&update_table_name_norm),
+                    Some(&tbl_name.as_str()),
                     &from_target_qualifiers,
                     database_id,
                     resolver,
@@ -2517,7 +2512,7 @@ fn validate_trigger_cmd_after_column_rename(
                     trigger_table_name,
                     target_table_name,
                     old_col_norm,
-                    Some(&update_table_name_norm),
+                    Some(&tbl_name.as_str()),
                     &from_target_qualifiers,
                     database_id,
                     resolver,
@@ -2544,9 +2539,9 @@ fn validate_trigger_cmd_after_column_rename(
             upsert,
             ..
         } => {
-            if normalize_ident(tbl_name.as_str()) == *target_table_name {
+            if tbl_name.as_str().eq_ignore_ascii_case(target_table_name) {
                 for col_name in col_names {
-                    if normalize_ident(col_name.as_str()) == *old_col_norm {
+                    if col_name.as_str().eq_ignore_ascii_case(old_col_norm) {
                         return Err(LimboError::ParseError(format!(
                             "no such column: {old_col_norm}"
                         )));
@@ -2660,7 +2655,7 @@ fn validate_upsert_for_column_rename(
         if insert_table_name_norm == *target_table_name {
             for set in sets {
                 for col_name in &set.col_names {
-                    if normalize_ident(col_name.as_str()) == *old_col_norm {
+                    if col_name.as_str().eq_ignore_ascii_case(old_col_norm) {
                         return Err(LimboError::ParseError(format!(
                             "no such column: {old_col_norm}"
                         )));
@@ -2734,7 +2729,7 @@ fn validate_expr_for_column_rename(
         context_table_name
     {
         let ctx_name_norm = normalize_ident(ctx_name);
-        let is_renaming = ctx_name_norm == target_table_name_norm;
+        let is_renaming = ctx_name_norm == *target_table_name_norm;
         let table = resolve_trigger_command_table_for_alter(resolver, database_id, &ctx_name_norm)
             .ok_or_else(|| {
                 LimboError::ParseError(format!("context table not found: {ctx_name_norm}"))
@@ -3212,8 +3207,7 @@ fn validate_expr_column_ref_with_context(
             }
 
             if is_renaming_trigger_table {
-                let trigger_table_name_norm = normalize_ident(trigger_table_name);
-                if ns_norm == trigger_table_name_norm
+                if ns_norm.eq_ignore_ascii_case(trigger_table_name)
                     && trigger_table.get_column(&col_norm).is_some()
                 {
                     return Err(LimboError::ParseError(format!(
@@ -3277,16 +3271,14 @@ fn rewrite_expr_for_column_rename(
     database_id: usize,
     resolver: &Resolver,
 ) -> Result<ast::Expr> {
-    let trigger_table_name_norm = normalize_ident(trigger_table_name);
-    let target_table_name_norm = normalize_ident(target_table_name);
-    let is_renaming_trigger_table = trigger_table_name_norm == target_table_name_norm;
+    let is_renaming_trigger_table = trigger_table_name.eq_ignore_ascii_case(target_table_name);
 
     // Get context table if provided (for UPDATE/DELETE WHERE clauses)
     let context_table_info: Option<(Arc<BTreeTable>, String, bool)> = if let Some(ctx_name) =
         context_table_name
     {
         let ctx_name_norm = normalize_ident(ctx_name);
-        let is_renaming = ctx_name_norm == target_table_name_norm;
+        let is_renaming = ctx_name_norm == target_table_name;
         let table = resolve_trigger_command_table_for_alter(resolver, database_id, &ctx_name_norm)
             .ok_or_else(|| {
                 LimboError::ParseError(format!("context table not found: {ctx_name_norm}"))
@@ -3349,7 +3341,6 @@ fn rewrite_expr_for_column_rename(
 fn rewrite_trigger_cmd_for_column_rename(
     cmd: ast::TriggerCmd,
     trigger_table: &BTreeTable,
-    _target_table: &BTreeTable,
     trigger_table_name: &str,
     target_table_name: &str,
     old_col_norm: &str,
@@ -3447,12 +3438,10 @@ fn rewrite_trigger_cmd_for_column_rename(
         } => {
             // Rewrite column names in INSERT column list
             // Check if the INSERT is targeting the table being renamed
-            let insert_table_name_norm = normalize_ident(tbl_name.as_str());
-            if insert_table_name_norm == *target_table_name {
+            if tbl_name.as_str().eq_ignore_ascii_case(target_table_name) {
                 // This INSERT targets the table being renamed, so rewrite column names
                 for col_name in &mut col_names {
-                    let col_norm = normalize_ident(col_name.as_str());
-                    if col_norm == *old_col_norm {
+                    if col_name.as_str().eq_ignore_ascii_case(old_col_norm) {
                         *col_name = ast::Name::from_string(new_col_norm);
                     }
                 }
@@ -3545,8 +3534,8 @@ fn rename_excluded_column_refs(
 ) -> Result<()> {
     walk_expr_mut(expr, &mut |e: &mut ast::Expr| -> Result<WalkControl> {
         if let ast::Expr::Qualified(ns, col) | ast::Expr::DoublyQualified(_, ns, col) = e {
-            if normalize_ident(ns.as_str()) == "excluded"
-                && normalize_ident(col.as_str()) == *old_col_norm
+            if ns.as_str().eq_ignore_ascii_case("excluded")
+                && col.as_str().eq_ignore_ascii_case(old_col_norm)
             {
                 *col = ast::Name::from_string(new_col_norm);
             }
@@ -3612,7 +3601,7 @@ fn rewrite_upsert_for_column_rename(
         for set in sets {
             if insert_targets_renamed_table {
                 for col_name in &mut set.col_names {
-                    if normalize_ident(col_name.as_str()) == *old_col_norm {
+                    if col_name.as_str().eq_ignore_ascii_case(old_col_norm) {
                         *col_name = ast::Name::from_string(new_col_norm);
                     }
                 }
@@ -4182,7 +4171,7 @@ fn collect_select_table_target_qualifiers(
     let ast::SelectTable::Table(name, alias, _) = select_table else {
         return;
     };
-    if normalize_ident(name.name.as_str()) != *target_table_name {
+    if !name.name.as_str().eq_ignore_ascii_case(target_table_name) {
         return;
     }
 
@@ -4244,9 +4233,7 @@ fn rewrite_expr_column_ref_with_context(
             let col_norm = normalize_ident(col.as_str());
 
             // Check if this is NEW.column or OLD.column
-            if (ns_norm.eq_ignore_ascii_case("new") || ns_norm.eq_ignore_ascii_case("old"))
-                && col_norm == *old_col_norm
-            {
+            if (ns_norm.eq("new") || ns_norm.eq("old")) && col_norm == *old_col_norm {
                 // NEW.x and OLD.x always refer to the trigger's owning table
                 if is_renaming_trigger_table && trigger_table.get_column(&col_norm).is_some() {
                     *col = ast::Name::from_string(new_col_norm);
