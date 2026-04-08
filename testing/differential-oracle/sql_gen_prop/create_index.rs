@@ -159,7 +159,7 @@ pub fn create_index_for_table(
                         _ => None,
                     };
                     let qualified_index_name = match index_database.as_deref() {
-                        Some("temp") => index_name.clone(),
+                        Some("temp") => index_name,
                         Some(db) => format!("{db}.{index_name}"),
                         None => index_name,
                     };
@@ -263,7 +263,7 @@ pub fn create_index(
                                 _ => None,
                             };
                             let qualified_index_name = match index_database.as_deref() {
-                                Some("temp") => index_name.clone(),
+                                Some("temp") => index_name,
                                 Some(db) => format!("{db}.{index_name}"),
                                 None => index_name,
                             };
