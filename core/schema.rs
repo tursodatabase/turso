@@ -461,7 +461,7 @@ fn bootstrap_builtin_types(registry: &mut HashMap<String, Arc<TypeDef>>) {
 }
 
 impl Schema {
-    fn normalize_table_lookup_name<'a>(&self, name: &'a str) -> String {
+    fn normalize_table_lookup_name(&self, name: &str) -> String {
         let name = normalize_ident(name);
         if name.eq_ignore_ascii_case(SCHEMA_TABLE_NAME_ALT)
             || name.eq_ignore_ascii_case(TEMP_SCHEMA_TABLE_NAME)

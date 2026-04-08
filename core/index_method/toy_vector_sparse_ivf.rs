@@ -412,17 +412,15 @@ impl IndexMethodCursor for VectorSparseInvertedIndexMethodCursor {
             .map(|name| format!("{name}."))
             .unwrap_or_default();
         let inverted_index_create = format!(
-            "CREATE INDEX {} ON {} USING {} ({})",
-            format!("{db_prefix}{}", self.inverted_index_btree),
+            "CREATE INDEX {db_prefix}{} ON {} USING {BACKING_BTREE_INDEX_METHOD_NAME} ({})",
+            self.inverted_index_btree,
             self.configuration.table_name,
-            BACKING_BTREE_INDEX_METHOD_NAME,
             columns.join(", ")
         );
         let stats_index_create = format!(
-            "CREATE INDEX {} ON {} USING {} ({})",
-            format!("{db_prefix}{}", self.stats_btree),
+            "CREATE INDEX {db_prefix}{} ON {} USING {BACKING_BTREE_INDEX_METHOD_NAME} ({})",
+            self.stats_btree,
             self.configuration.table_name,
-            BACKING_BTREE_INDEX_METHOD_NAME,
             columns.join(", ")
         );
         for sql in [inverted_index_create, stats_index_create] {

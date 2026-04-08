@@ -2377,7 +2377,7 @@ fn rewrite_trigger_sql_for_column_rename(
             new_sql.clone(),
             tbl_name.name.as_str().to_string(),
             time,
-            new_event.clone(),
+            new_event,
             for_each_row,
             new_when_clause.as_deref().cloned(),
             new_commands.clone(),
@@ -2498,7 +2498,7 @@ fn validate_trigger_cmd_after_column_rename(
                     trigger_table_name,
                     target_table_name,
                     old_col_norm,
-                    Some(&tbl_name.as_str()),
+                    Some(tbl_name.as_str()),
                     &from_target_qualifiers,
                     database_id,
                     resolver,
@@ -2512,7 +2512,7 @@ fn validate_trigger_cmd_after_column_rename(
                     trigger_table_name,
                     target_table_name,
                     old_col_norm,
-                    Some(&tbl_name.as_str()),
+                    Some(tbl_name.as_str()),
                     &from_target_qualifiers,
                     database_id,
                     resolver,
@@ -3206,15 +3206,14 @@ fn validate_expr_column_ref_with_context(
                 }
             }
 
-            if is_renaming_trigger_table {
-                if ns_norm.eq_ignore_ascii_case(trigger_table_name)
+            if is_renaming_trigger_table
+                && ns_norm.eq_ignore_ascii_case(trigger_table_name)
                     && trigger_table.get_column(&col_norm).is_some()
                 {
                     return Err(LimboError::ParseError(format!(
                         "no such column: {old_col_norm}"
                     )));
                 }
-            }
 
             if from_target_qualifiers.contains(&ns_norm) {
                 return Err(LimboError::ParseError(format!(
