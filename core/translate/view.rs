@@ -241,7 +241,9 @@ pub fn translate_create_materialized_view(
     program.emit_insn(Insn::ParseSchema {
         db: database_id,
         where_clause: Some(format!(
-            "name = '{escaped_view_name}' OR name = '{escaped_dbsp_table_name}' OR name = '{escaped_dbsp_index_name}'"
+            "(name = '{escaped_view_name}' AND type = 'view') OR \
+             (name = '{escaped_dbsp_table_name}' AND type = 'table') OR \
+             (name = '{escaped_dbsp_index_name}' AND type = 'index')"
         )),
     });
 
@@ -348,7 +350,7 @@ pub fn translate_create_view(
     let escaped_view_name = escape_sql_string_literal(&normalized_view_name);
     program.emit_insn(Insn::ParseSchema {
         db: database_id,
-        where_clause: Some(format!("name = '{escaped_view_name}'")),
+        where_clause: Some(format!("name = '{escaped_view_name}' AND type = 'view'")),
     });
 
     let schema_version = resolver.with_schema(database_id, |s| s.schema_version);
