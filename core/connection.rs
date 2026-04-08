@@ -37,7 +37,7 @@ use std::ops::Deref;
 #[cfg(not(target_family = "wasm"))]
 use tempfile::TempDir;
 use tracing::{instrument, Level};
-use turso_macros::AtomicEnum;
+use turso_macros::{turso_assert_ne, AtomicEnum};
 
 #[derive(Clone, AtomicEnum, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum TransactionState {
@@ -2158,6 +2158,37 @@ impl Connection {
         &self.database_schemas
     }
 
+    fn cached_non_main_schema(&self, database_id: usize) -> Arc<Schema> {
+        turso_assert_ne!(database_id, crate::MAIN_DB_ID);
+        if let Some(schema) = self.database_schemas.read().get(&database_id).cloned() {
+            return schema;
+        }
+
+        let loaded_schema = match database_id {
+            crate::TEMP_DB_ID => self
+                .temp_database
+                .read()
+                .as_ref()
+                .map(|temp_db| temp_db.db.schema.lock().clone())
+                .unwrap_or_else(|| self.empty_temp_schema()),
+            _ => {
+                let attached_dbs = self.attached_databases.read();
+                let (db, _pager) = attached_dbs
+                    .index_to_data
+                    .get(&database_id)
+                    .expect("Database ID should be valid after resolve_database_id");
+                let schema = db.schema.lock().clone();
+                schema
+            }
+        };
+
+        let mut schemas = self.database_schemas.write();
+        schemas
+            .entry(database_id)
+            .or_insert_with(|| loaded_schema)
+            .clone()
+    }
+
     /// Publish a connection-local non-main schema after commit.
     pub(crate) fn publish_database_schema(&self, database_id: usize) {
         let mut schemas = self.database_schemas.write();
@@ -2186,35 +2217,8 @@ impl Connection {
                 let schema = self.schema.read();
                 f(&schema)
             }
-            crate::TEMP_DB_ID => {
-                let schemas = self.database_schemas.read();
-                if let Some(local_schema) = schemas.get(&database_id) {
-                    return f(local_schema);
-                }
-                drop(schemas);
-
-                if let Some(temp_db) = self.temp_database.read().as_ref() {
-                    let schema = temp_db.db.schema.lock().clone();
-                    f(&schema)
-                } else {
-                    let empty_schema = self.empty_temp_schema();
-                    f(&empty_schema)
-                }
-            }
             _ => {
-                let schemas = self.database_schemas.read();
-                if let Some(local_schema) = schemas.get(&database_id) {
-                    return f(local_schema);
-                }
-                drop(schemas);
-
-                let attached_dbs = self.attached_databases.read();
-                let (db, _pager) = attached_dbs
-                    .index_to_data
-                    .get(&database_id)
-                    .expect("Database ID should be valid after resolve_database_id");
-
-                let schema = db.schema.lock().clone();
+                let schema = self.cached_non_main_schema(database_id);
                 f(&schema)
             }
         }

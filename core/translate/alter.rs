@@ -28,6 +28,7 @@ use crate::{
     LimboError, Numeric, Result, Value,
 };
 use either::Either;
+use rustc_hash::FxHashSet as HashSet;
 
 use super::{
     schema::{validate_check_expr, SQLITE_TABLEID},
@@ -4128,9 +4129,20 @@ fn from_clause_target_qualifiers(
     };
 
     let mut qualifiers = Vec::new();
-    collect_select_table_target_qualifiers(&from_clause.select, target_table_name, &mut qualifiers);
+    let mut seen = HashSet::default();
+    collect_select_table_target_qualifiers(
+        &from_clause.select,
+        target_table_name,
+        &mut qualifiers,
+        &mut seen,
+    );
     for join in &from_clause.joins {
-        collect_select_table_target_qualifiers(&join.table, target_table_name, &mut qualifiers);
+        collect_select_table_target_qualifiers(
+            &join.table,
+            target_table_name,
+            &mut qualifiers,
+            &mut seen,
+        );
     }
     qualifiers
 }
@@ -4139,6 +4151,7 @@ fn collect_select_table_target_qualifiers(
     select_table: &ast::SelectTable,
     target_table_name: &str,
     qualifiers: &mut Vec<String>,
+    seen: &mut HashSet<String>,
 ) {
     let ast::SelectTable::Table(name, alias, _) = select_table else {
         return;
@@ -4147,22 +4160,27 @@ fn collect_select_table_target_qualifiers(
         return;
     }
 
-    let target_table_name = target_table_name.to_string();
-    if !qualifiers.contains(&target_table_name) {
-        qualifiers.push(target_table_name);
+    if seen.insert(target_table_name.to_string()) {
+        qualifiers.push(target_table_name.to_string());
     }
     if let Some(alias) = alias {
         let alias_norm = normalize_ident(alias.name().as_str());
-        if !qualifiers.contains(&alias_norm) {
+        if seen.insert(alias_norm.clone()) {
             qualifiers.push(alias_norm);
         }
     }
 }
 
 fn merge_target_qualifiers(outer: &[String], local: &[String]) -> Vec<String> {
-    let mut merged = outer.to_vec();
+    let mut seen = HashSet::default();
+    let mut merged = Vec::with_capacity(outer.len() + local.len());
+    for qualifier in outer {
+        if seen.insert(qualifier.as_str()) {
+            merged.push(qualifier.clone());
+        }
+    }
     for qualifier in local {
-        if !merged.contains(qualifier) {
+        if seen.insert(qualifier.as_str()) {
             merged.push(qualifier.clone());
         }
     }

@@ -3431,10 +3431,17 @@ fn from_clause_target_qualifiers(
         return Vec::new();
     };
 
+    let target_table = normalize_ident(target_table);
     let mut qualifiers = Vec::new();
-    collect_target_qualifiers(&from_clause.select, target_table, &mut qualifiers);
+    let mut seen = HashSet::default();
+    collect_target_qualifiers(
+        &from_clause.select,
+        &target_table,
+        &mut qualifiers,
+        &mut seen,
+    );
     for join in &from_clause.joins {
-        collect_target_qualifiers(&join.table, target_table, &mut qualifiers);
+        collect_target_qualifiers(&join.table, &target_table, &mut qualifiers, &mut seen);
     }
     qualifiers
 }
@@ -3443,21 +3450,21 @@ fn collect_target_qualifiers(
     st: &ast::SelectTable,
     target_table: &str,
     qualifiers: &mut Vec<String>,
+    seen: &mut HashSet<String>,
 ) {
     let ast::SelectTable::Table(name, alias, _) = st else {
         return;
     };
-    if normalize_ident(name.name.as_str()) != normalize_ident(target_table) {
+    if normalize_ident(name.name.as_str()) != target_table {
         return;
     }
 
-    let target_table = normalize_ident(target_table);
-    if !qualifiers.contains(&target_table) {
-        qualifiers.push(target_table);
+    if seen.insert(target_table.to_string()) {
+        qualifiers.push(target_table.to_string());
     }
     if let Some(alias) = alias {
         let alias_norm = normalize_ident(alias.name().as_str());
-        if !qualifiers.contains(&alias_norm) {
+        if seen.insert(alias_norm.clone()) {
             qualifiers.push(alias_norm);
         }
     }
@@ -3769,9 +3776,15 @@ fn rewrite_select_table_entry_column_refs_scoped(
 }
 
 fn merge_target_qualifiers_scoped(outer: &[String], local: &[String]) -> Vec<String> {
-    let mut merged = outer.to_vec();
+    let mut seen = HashSet::default();
+    let mut merged = Vec::with_capacity(outer.len() + local.len());
+    for qualifier in outer {
+        if seen.insert(qualifier.as_str()) {
+            merged.push(qualifier.clone());
+        }
+    }
     for qualifier in local {
-        if !merged.contains(qualifier) {
+        if seen.insert(qualifier.as_str()) {
             merged.push(qualifier.clone());
         }
     }
@@ -4631,6 +4644,7 @@ pub mod tests {
     use super::*;
     use crate::schema::{BTreeTable, Type as SchemaValueType};
     use turso_parser::ast::{self, Expr, FunctionTail, Literal, Name, Operator::*, Type, Variable};
+    use turso_parser::parser::Parser;
 
     #[test]
     fn test_normalize_ident() {
@@ -4655,6 +4669,21 @@ pub mod tests {
 
     fn schema_with_table(create_table_sql: &str) -> Schema {
         schema_with_tables(&[create_table_sql])
+    }
+
+    fn parse_select_from(sql: &str) -> Option<ast::FromClause> {
+        let mut parser = Parser::new(sql.as_bytes());
+        let cmd = parser
+            .next_cmd()
+            .expect("test SQL should parse")
+            .expect("test SQL should contain a statement");
+        let ast::Cmd::Stmt(ast::Stmt::Select(select)) = cmd else {
+            panic!("expected SELECT statement");
+        };
+        match select.body.select {
+            ast::OneSelect::Select { from, .. } => from,
+            _ => panic!("expected simple SELECT"),
+        }
     }
 
     #[test]
@@ -4797,6 +4826,34 @@ pub mod tests {
             Some("temp")
         );
         assert_eq!(tbl_name.name.as_str(), "new");
+    }
+
+    #[test]
+    fn test_from_clause_target_qualifiers_dedups_case_insensitively() {
+        let from = parse_select_from("SELECT 1 FROM Target AS tgt, target AS TARGET");
+        assert_eq!(
+            from_clause_target_qualifiers(&from, "target"),
+            vec!["target".to_string(), "tgt".to_string()]
+        );
+    }
+
+    #[test]
+    fn test_merge_target_qualifiers_scoped_preserves_first_seen_order() {
+        let outer = vec!["target".to_string(), "outer_alias".to_string()];
+        let local = vec![
+            "outer_alias".to_string(),
+            "local_alias".to_string(),
+            "target".to_string(),
+        ];
+
+        assert_eq!(
+            merge_target_qualifiers_scoped(&outer, &local),
+            vec![
+                "target".to_string(),
+                "outer_alias".to_string(),
+                "local_alias".to_string(),
+            ]
+        );
     }
 
     #[test]
