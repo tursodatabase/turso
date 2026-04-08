@@ -341,7 +341,7 @@ impl DatabaseWalSession {
     ) -> Result<usize> {
         let conn = self.wal_session.conn();
         let pages = conn.wal_changed_pages_after(frame_watermark)?;
-        tracing::info!("rolling back {} pages", pages.len());
+        tracing::debug!("rolling back {} pages", pages.len());
         let pages_cnt = pages.len();
         for page_no in pages {
             self.rollback_page(coro, page_no, frame_watermark).await?;
@@ -586,7 +586,13 @@ impl DatabaseReplaySession {
 
                 if table == SQLITE_SCHEMA_TABLE {
                     let replay_info = self.generator.replay_info(coro, &change).await?;
-                    self.conn.execute(replay_info.query.as_str())?;
+                    if replay_info.change_type == DatabaseChangeType::Update {
+                        self.generator
+                            .execute_ddl_idempotent(coro, &replay_info.query)
+                            .await?;
+                    } else {
+                        self.conn.execute(replay_info.query.as_str())?;
+                    }
                 } else {
                     match change.change {
                         DatabaseTapeRowChangeType::Delete { before } => {
@@ -2125,6 +2131,210 @@ mod tests {
                             turso_core::Value::Text(turso_core::types::Text::new("p")),
                             turso_core::Value::Text(turso_core::types::Text::new("q")),
                             turso_core::Value::Null,
+                        ],
+                    ]
+                );
+                crate::Result::Ok(())
+            }
+        });
+        loop {
+            match gen.resume_with(Ok(())) {
+                genawaiter::GeneratorState::Yielded(..) => io.step().unwrap(),
+                genawaiter::GeneratorState::Complete(result) => {
+                    result.unwrap();
+                    break;
+                }
+            }
+        }
+    }
+
+    /// ALTER TABLE ADD COLUMN replayed into a target that already has the column.
+    /// This simulates the case where both local and remote independently added
+    /// the same column, and the pull replay must be idempotent.
+    #[test]
+    pub fn test_database_tape_replay_alter_table_add_column_idempotent() {
+        let temp_file1 = NamedTempFile::new().unwrap();
+        let db_path1 = temp_file1.path().to_str().unwrap();
+        let temp_file2 = NamedTempFile::new().unwrap();
+        let db_path2 = temp_file2.path().to_str().unwrap();
+
+        let io: Arc<dyn turso_core::IO> = Arc::new(turso_core::PlatformIO::new().unwrap());
+
+        let db1 = turso_core::Database::open_file(io.clone(), db_path1).unwrap();
+        let db1 = Arc::new(DatabaseTape::new(db1));
+
+        let db2 = turso_core::Database::open_file(io.clone(), db_path2).unwrap();
+        let db2 = Arc::new(DatabaseTape::new(db2));
+
+        let mut gen = genawaiter::sync::Gen::new({
+            |coro| async move {
+                let coro: Coro<()> = coro.into();
+
+                // db1: CREATE TABLE then ADD COLUMN z (captured by CDC)
+                let conn1 = db1.connect(&coro).await.unwrap();
+                conn1
+                    .execute("CREATE TABLE t(x TEXT PRIMARY KEY, y TEXT)")
+                    .unwrap();
+                conn1
+                    .execute("ALTER TABLE t ADD COLUMN z TEXT DEFAULT NULL")
+                    .unwrap();
+                conn1
+                    .execute("INSERT INTO t VALUES ('a', 'alpha', 'extra')")
+                    .unwrap();
+
+                // db2: already has the column z (simulating independent ADD COLUMN)
+                let conn2_setup = db2.connect_untracked().unwrap();
+                conn2_setup
+                    .execute("CREATE TABLE t(x TEXT PRIMARY KEY, y TEXT, z TEXT DEFAULT NULL)")
+                    .unwrap();
+
+                let conn2 = db2.connect(&coro).await.unwrap();
+                {
+                    let opts = DatabaseReplaySessionOpts {
+                        use_implicit_rowid: false,
+                    };
+                    let mut session = db2.start_replay_session(&coro, opts).await.unwrap();
+
+                    let opts = DatabaseChangesIteratorOpts {
+                        ignore_schema_changes: false,
+                        ..Default::default()
+                    };
+                    let mut iterator = db1.iterate_changes(opts).unwrap();
+                    while let Some(operation) = iterator.next(&coro).await.unwrap() {
+                        session.replay(&coro, operation).await.unwrap();
+                    }
+                }
+
+                // Verify schema is correct
+                let mut stmt = conn2
+                    .prepare("SELECT sql FROM sqlite_schema WHERE name = 't'")
+                    .unwrap();
+                let row = run_stmt_once(&coro, &mut stmt).await.unwrap().unwrap();
+                let sql = row.get_value(0).to_text().unwrap().to_string();
+                assert!(
+                    sql.contains("z"),
+                    "schema should still contain z column: {sql}"
+                );
+
+                // Verify data was replayed
+                let mut stmt = conn2.prepare("SELECT x, y, z FROM t").unwrap();
+                let mut rows = Vec::new();
+                while let Some(row) = run_stmt_once(&coro, &mut stmt).await.unwrap() {
+                    rows.push(row.get_values().cloned().collect::<Vec<_>>());
+                }
+                assert_eq!(
+                    rows,
+                    vec![vec![
+                        turso_core::Value::Text(turso_core::types::Text::new("a")),
+                        turso_core::Value::Text(turso_core::types::Text::new("alpha")),
+                        turso_core::Value::Text(turso_core::types::Text::new("extra")),
+                    ]]
+                );
+                crate::Result::Ok(())
+            }
+        });
+        loop {
+            match gen.resume_with(Ok(())) {
+                genawaiter::GeneratorState::Yielded(..) => io.step().unwrap(),
+                genawaiter::GeneratorState::Complete(result) => {
+                    result.unwrap();
+                    break;
+                }
+            }
+        }
+    }
+
+    /// Both databases independently add the same column, then replay each other's
+    /// changes. This tests bidirectional idempotency of ALTER TABLE ADD COLUMN.
+    #[test]
+    pub fn test_database_tape_replay_alter_table_add_column_both_sides() {
+        let temp_file1 = NamedTempFile::new().unwrap();
+        let db_path1 = temp_file1.path().to_str().unwrap();
+        let temp_file2 = NamedTempFile::new().unwrap();
+        let db_path2 = temp_file2.path().to_str().unwrap();
+        let temp_file3 = NamedTempFile::new().unwrap();
+        let db_path3 = temp_file3.path().to_str().unwrap();
+
+        let io: Arc<dyn turso_core::IO> = Arc::new(turso_core::PlatformIO::new().unwrap());
+
+        let db1 = turso_core::Database::open_file(io.clone(), db_path1).unwrap();
+        let db1 = Arc::new(DatabaseTape::new(db1));
+
+        let db2 = turso_core::Database::open_file(io.clone(), db_path2).unwrap();
+        let db2 = Arc::new(DatabaseTape::new(db2));
+
+        let db3 = turso_core::Database::open_file(io.clone(), db_path3).unwrap();
+        let db3 = Arc::new(DatabaseTape::new(db3));
+
+        let mut gen = genawaiter::sync::Gen::new({
+            |coro| async move {
+                let coro: Coro<()> = coro.into();
+
+                // db1: CREATE TABLE then ADD COLUMN z
+                let conn1 = db1.connect(&coro).await.unwrap();
+                conn1
+                    .execute("CREATE TABLE t(x TEXT PRIMARY KEY, y TEXT)")
+                    .unwrap();
+                conn1
+                    .execute("ALTER TABLE t ADD COLUMN z TEXT DEFAULT NULL")
+                    .unwrap();
+                conn1
+                    .execute("INSERT INTO t VALUES ('a', 'alpha', 'one')")
+                    .unwrap();
+
+                // db2: same base table, independently adds the same column z
+                let conn2 = db2.connect(&coro).await.unwrap();
+                conn2
+                    .execute("CREATE TABLE t(x TEXT PRIMARY KEY, y TEXT)")
+                    .unwrap();
+                conn2
+                    .execute("ALTER TABLE t ADD COLUMN z TEXT DEFAULT NULL")
+                    .unwrap();
+                conn2
+                    .execute("INSERT INTO t VALUES ('b', 'beta', 'two')")
+                    .unwrap();
+
+                // db3: merge both — replay db1 then db2 changes
+                let conn3 = db3.connect(&coro).await.unwrap();
+                {
+                    let opts = DatabaseReplaySessionOpts {
+                        use_implicit_rowid: false,
+                    };
+                    let mut session = db3.start_replay_session(&coro, opts).await.unwrap();
+
+                    let iter_opts = DatabaseChangesIteratorOpts {
+                        ignore_schema_changes: false,
+                        ..Default::default()
+                    };
+                    let mut it1 = db1.iterate_changes(iter_opts.clone()).unwrap();
+                    while let Some(op) = it1.next(&coro).await.unwrap() {
+                        session.replay(&coro, op).await.unwrap();
+                    }
+
+                    let mut it2 = db2.iterate_changes(iter_opts).unwrap();
+                    while let Some(op) = it2.next(&coro).await.unwrap() {
+                        session.replay(&coro, op).await.unwrap();
+                    }
+                }
+
+                // Verify merged data
+                let mut stmt = conn3.prepare("SELECT x, y, z FROM t ORDER BY x").unwrap();
+                let mut rows = Vec::new();
+                while let Some(row) = run_stmt_once(&coro, &mut stmt).await.unwrap() {
+                    rows.push(row.get_values().cloned().collect::<Vec<_>>());
+                }
+                assert_eq!(
+                    rows,
+                    vec![
+                        vec![
+                            turso_core::Value::Text(turso_core::types::Text::new("a")),
+                            turso_core::Value::Text(turso_core::types::Text::new("alpha")),
+                            turso_core::Value::Text(turso_core::types::Text::new("one")),
+                        ],
+                        vec![
+                            turso_core::Value::Text(turso_core::types::Text::new("b")),
+                            turso_core::Value::Text(turso_core::types::Text::new("beta")),
+                            turso_core::Value::Text(turso_core::types::Text::new("two")),
                         ],
                     ]
                 );

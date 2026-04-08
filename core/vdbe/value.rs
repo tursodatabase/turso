@@ -383,6 +383,65 @@ impl Value {
         }
     }
 
+    pub fn exec_unistr_quote(&self) -> Self {
+        const HEX: &[u8; 16] = b"0123456789abcdef";
+
+        match self {
+            Value::Text(s) => {
+                let s = s.as_str();
+                let mut end = s.len();
+                let mut has_ctrl = false;
+
+                for (i, &b) in s.as_bytes().iter().enumerate() {
+                    match b {
+                        0 => {
+                            end = i;
+                            break;
+                        }
+                        1..=0x1f => has_ctrl = true,
+                        _ => {}
+                    }
+                }
+
+                if !has_ctrl {
+                    return self.exec_quote();
+                }
+
+                let prefix = &s[..end];
+                let mut extra = 0;
+                for &b in prefix.as_bytes() {
+                    extra += match b {
+                        1..=0x1f => 5, // \u00xx is 6 output bytes, replacing 1 input byte.
+                        b'\\' | b'\'' => 1,
+                        _ => 0,
+                    };
+                }
+
+                let mut out = String::with_capacity(prefix.len() + extra + "unistr('')".len());
+                out.push_str("unistr('");
+                for c in prefix.chars() {
+                    match c {
+                        '\x01'..='\x1f' => {
+                            let b = c as u8;
+                            out.push('\\');
+                            out.push('u');
+                            out.push('0');
+                            out.push('0');
+                            out.push(HEX[(b >> 4) as usize] as char);
+                            out.push(HEX[(b & 0x0f) as usize] as char);
+                        }
+                        '\\' => out.push_str("\\\\"),
+                        '\'' => out.push_str("''"),
+                        _ => out.push(c),
+                    }
+                }
+                out.push_str("')");
+                Value::build_text(out)
+            }
+            _ => self.exec_quote(),
+        }
+    }
+
     pub fn exec_nullif(&self, second_value: &Self) -> Self {
         if self != second_value {
             self.clone()
@@ -593,15 +652,37 @@ impl Value {
                 },
                 Some(ignore) => match ignore {
                     Value::Text(_) => {
-                        let pat = ignore.to_string();
-                        let trimmed = self
-                            .to_string()
-                            .trim_start_matches(|x| pat.contains(x))
-                            .trim_end_matches(|x| pat.contains(x))
-                            .to_string();
-                        match hex::decode(trimmed) {
-                            Ok(bytes) => Value::Blob(bytes),
-                            _ => Value::Null,
+                        let input = self.to_string();
+                        let ignore = ignore.to_string();
+                        let mut chars = input.chars().peekable();
+                        let mut out = Vec::with_capacity(input.len() / 2);
+
+                        let is_sep = |c: char| ignore.contains(c) && !c.is_ascii_hexdigit();
+
+                        loop {
+                            while let Some(&c) = chars.peek() {
+                                if is_sep(c) {
+                                    chars.next();
+                                } else {
+                                    break;
+                                }
+                            }
+
+                            let Some(c1) = chars.next() else {
+                                return Value::Blob(out);
+                            };
+                            let Some(hi) = c1.to_digit(16) else {
+                                return Value::Null;
+                            };
+
+                            let Some(c2) = chars.next() else {
+                                return Value::Null;
+                            };
+                            let Some(lo) = c2.to_digit(16) else {
+                                return Value::Null;
+                            };
+
+                            out.push(((hi << 4) | lo) as u8);
                         }
                     }
                     _ => Value::Null,
@@ -2055,6 +2136,97 @@ mod tests {
     }
 
     #[test]
+    fn test_unistr_quote() {
+        assert_eq!(Value::Null.exec_unistr_quote(), Value::build_text("NULL"));
+        assert_eq!(
+            Value::from_i64(42).exec_unistr_quote(),
+            Value::build_text("42")
+        );
+        assert_eq!(
+            Value::from_f64(1.5).exec_unistr_quote(),
+            Value::build_text("1.5")
+        );
+        assert_eq!(
+            Value::Blob(vec![0xDE, 0xAD]).exec_unistr_quote(),
+            Value::build_text("X'DEAD'")
+        );
+        assert_eq!(
+            Value::build_text("hello").exec_unistr_quote(),
+            Value::build_text("'hello'")
+        );
+        // Backslash is NOT doubled when no control chars are present
+        assert_eq!(
+            Value::build_text("a\\b").exec_unistr_quote(),
+            Value::build_text("'a\\b'")
+        );
+        assert_eq!(
+            Value::build_text("it's").exec_unistr_quote(),
+            Value::build_text("'it''s'")
+        );
+        assert_eq!(
+            Value::build_text("a\tb").exec_unistr_quote(),
+            Value::build_text("unistr('a\\u0009b')")
+        );
+        assert_eq!(
+            Value::build_text("a\t\\b").exec_unistr_quote(),
+            Value::build_text("unistr('a\\u0009\\\\b')")
+        );
+        assert_eq!(
+            Value::build_text("a\tb'c").exec_unistr_quote(),
+            Value::build_text("unistr('a\\u0009b''c')")
+        );
+        assert_eq!(
+            Value::build_text("\x01abc'\\\t\n\r\x1fXYZ\0\x01tail").exec_unistr_quote(),
+            Value::build_text(r"unistr('\u0001abc''\\\u0009\u000a\u000d\u001fXYZ')")
+        );
+        assert_eq!(
+            Value::build_text("a\x01b\0c").exec_unistr_quote(),
+            Value::build_text("unistr('a\\u0001b')")
+        );
+        assert_eq!(
+            Value::build_text("\x01").exec_unistr_quote(),
+            Value::build_text("unistr('\\u0001')")
+        );
+        assert_eq!(
+            Value::build_text("\x01\x1f").exec_unistr_quote(),
+            Value::build_text("unistr('\\u0001\\u001f')")
+        );
+        assert_eq!(
+            Value::build_text("\x10").exec_unistr_quote(),
+            Value::build_text("unistr('\\u0010')")
+        );
+        assert_eq!(
+            Value::build_text("\x1f").exec_unistr_quote(),
+            Value::build_text("unistr('\\u001f')")
+        );
+        // 0x20 is the first char outside the control range
+        assert_eq!(
+            Value::build_text(" ").exec_unistr_quote(),
+            Value::build_text("' '")
+        );
+        assert_eq!(
+            Value::build_text("\0abc").exec_unistr_quote(),
+            Value::build_text("''")
+        );
+        assert_eq!(
+            Value::build_text("").exec_unistr_quote(),
+            Value::build_text("''")
+        );
+        assert_eq!(
+            Value::build_text("a\nb").exec_unistr_quote(),
+            Value::build_text("unistr('a\\u000ab')")
+        );
+        assert_eq!(
+            Value::build_text("a\rb").exec_unistr_quote(),
+            Value::build_text("unistr('a\\u000db')")
+        );
+        assert_eq!(
+            Value::build_text("a\0\t").exec_unistr_quote(),
+            Value::build_text("'a'")
+        );
+    }
+
+    #[test]
     fn test_min_max() {
         let input_int_vec = [
             Register::Value(Value::from_i64(-1)),
@@ -2288,6 +2460,38 @@ mod tests {
         let input = Value::Null;
         let expected = Value::Null;
         assert_eq!(input.exec_unhex(None), expected);
+
+        let input = Value::build_text("aa-bb");
+        let expected = Value::Blob(vec![0xaa, 0xbb]);
+        assert_eq!(input.exec_unhex(Some(&Value::build_text("-"))), expected);
+
+        let input = Value::build_text("aa--bb");
+        let expected = Value::Blob(vec![0xaa, 0xbb]);
+        assert_eq!(input.exec_unhex(Some(&Value::build_text("-"))), expected);
+
+        let input = Value::build_text("aa-bb-cc");
+        let expected = Value::Blob(vec![0xaa, 0xbb, 0xcc]);
+        assert_eq!(input.exec_unhex(Some(&Value::build_text("-"))), expected);
+
+        let input = Value::build_text("aa bb");
+        let expected = Value::Blob(vec![0xaa, 0xbb]);
+        assert_eq!(input.exec_unhex(Some(&Value::build_text(" "))), expected);
+
+        let input = Value::build_text("A BCD");
+        let expected = Value::Null;
+        assert_eq!(input.exec_unhex(Some(&Value::build_text(" "))), expected);
+
+        let input = Value::build_text("yx2xEzyx");
+        let expected = Value::Null;
+        assert_eq!(input.exec_unhex(Some(&Value::build_text("xyz"))), expected);
+
+        let input = Value::build_text("aa?bb");
+        let expected = Value::Null;
+        assert_eq!(input.exec_unhex(Some(&Value::build_text("-"))), expected);
+
+        let input = Value::build_text("aabb");
+        let expected = Value::Null;
+        assert_eq!(input.exec_unhex(Some(&Value::Null)), expected);
     }
 
     #[test]

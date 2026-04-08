@@ -1,0 +1,17 @@
+@database database/integrity_gencol_not_null_violation.db readonly
+
+@skip-file-if mvcc "not supported in MVCC mode"
+
+test integrity-check-gencol-not-null-violation {
+    PRAGMA integrity_check;
+}
+expect {
+    NULL value in t.b
+}
+
+test quick-check-gencol-not-null-violation {
+    PRAGMA quick_check;
+}
+expect {
+    NULL value in t.b
+}

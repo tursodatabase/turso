@@ -730,7 +730,10 @@ pub enum Insn {
     /// subprogram, so subprograms can be reentrant and recursive. The Param opcode
     /// is used by subprograms to access content in registers of the calling bytecode program."
     Program {
-        params: Vec<Value>,
+        /// Parent register indices for each parameter the subprogram reads.
+        /// At runtime, values are copied from these parent registers into
+        /// the child statement's parameters via bind_at.
+        param_registers: Vec<usize>,
         program: Arc<PreparedProgram>,
         /// Jump target when RAISE(IGNORE) fires in the subprogram.
         /// Points to the "skip this row" address in the parent program.
@@ -1918,6 +1921,49 @@ impl Insn {
         // dont use this because its still using match
         // InsnVariants::from(self).to_function_fast()
         INSN_VTABLE[self.discriminant() as usize]
+    }
+
+    /// Returns true if this opcode cannot directly modify persistent database
+    /// contents. This is used to compute PreparedProgram::readonly, mirroring
+    /// SQLite's sqlite3_stmt_readonly() classification over compiled bytecode.
+    pub fn is_readonly(&self) -> bool {
+        match self {
+            Self::Checkpoint { .. }
+            | Self::VCreate { .. }
+            | Self::VUpdate { .. }
+            | Self::VDestroy { .. }
+            | Self::VRename { .. }
+            | Self::Transaction {
+                tx_mode: TransactionMode::Write | TransactionMode::Concurrent,
+                ..
+            }
+            | Self::Insert { .. }
+            | Self::Delete { .. }
+            | Self::IdxDelete { .. }
+            | Self::OpenWrite { .. }
+            | Self::CreateBtree { .. }
+            | Self::IndexMethodCreate { .. }
+            | Self::IndexMethodDestroy { .. }
+            | Self::IndexMethodOptimize { .. }
+            | Self::Destroy { .. }
+            | Self::DropTable { .. }
+            | Self::DropView { .. }
+            | Self::DropIndex { .. }
+            | Self::DropTrigger { .. }
+            | Self::DropType { .. }
+            | Self::AddType { .. }
+            | Self::ParseSchema { .. }
+            | Self::PopulateMaterializedViews { .. }
+            | Self::SetCookie { .. }
+            | Self::RenameTable { .. }
+            | Self::DropColumn { .. }
+            | Self::AddColumn { .. }
+            | Self::AlterColumn { .. }
+            | Self::JournalMode { .. } => false,
+            Self::MaxPgcnt { new_max, .. } => *new_max == 0,
+            Self::Program { program, .. } => program.is_readonly(),
+            _ => true,
+        }
     }
 }
 

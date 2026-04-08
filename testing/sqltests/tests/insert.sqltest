@@ -822,6 +822,21 @@ expect {
     2|'bar'
 }
 
+# Tests verifying error when DQS is disabled
+setup dqs_dml_off {
+    .dbconfig dqs_dml off
+}
+
+@backend cli
+@setup dqs_dml_off
+test double-quote-string-error-dqs-off {
+    CREATE TABLE test_dqs_off (id INTEGER, name TEXT);
+    INSERT INTO test_dqs_off (id, name) VALUES (1, "Dave");
+}
+expect error {
+    no such column.*Dave
+}
+
 # regression test for incorrect order of column in insert
 @cross-check-integrity
 test insert-tricky-column-order-values {
@@ -2150,4 +2165,22 @@ test integer-pk-omit-column {
 }
 expect {
     integer|1|alice
+}
+
+@cross-check-integrity
+test insert-column-count-mismatch-values {
+    CREATE TABLE t1 (x);
+    INSERT INTO t1 VALUES (1, 2, 3);
+}
+expect error {
+    table t1 has 1 columns but 3 values were supplied
+}
+
+@cross-check-integrity
+test insert-column-count-mismatch-select {
+    CREATE TABLE t1 (x);
+    INSERT INTO t1 SELECT 1,2,3,4,5,6,7 UNION ALL SELECT 1,2,3,4,5,6,7 ORDER BY 1;
+}
+expect error {
+    table t1 has 1 columns but 7 values were supplied
 }

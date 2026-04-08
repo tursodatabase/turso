@@ -71,7 +71,7 @@ info:
   database: ':memory:'
 ---
 QUERY PLAN
-|--SCAN subquery_0
+|--SCAN (subquery-0)
 |  `--COMPOUND QUERY
 |     |--LEFT-MOST SUBQUERY
 |     |  `--SCAN user_messages

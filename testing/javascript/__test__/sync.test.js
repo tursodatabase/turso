@@ -345,6 +345,18 @@ test.serial("Statement.get() values", async (t) => {
   t.deepEqual(stmt.get(9007199254740991n), [9007199254740991]);
 });
 
+
+test.serial("Statement.get() datetime('now')", async (t) => {
+  const db = t.context.db;
+
+  const stmt = db.prepare("SELECT datetime('now') AS now");
+  const row = stmt.get();
+  t.truthy(row.now, "datetime('now') should return a value");
+  // Verify the result matches the expected ISO 8601 datetime format: YYYY-MM-DD HH:MM:SS
+  t.regex(row.now, /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$/, "datetime('now') should return a valid datetime string");
+});
+
+
 test.serial("Statement.get() [blob]", (t) => {
   const db = t.context.db;
 

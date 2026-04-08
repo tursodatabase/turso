@@ -1,4 +1,5 @@
 mod assert_details;
+mod attach;
 mod common;
 mod conflict_resolution;
 mod custom_types;
@@ -13,6 +14,7 @@ mod query_processing;
 mod query_timeout;
 mod statement_reset;
 mod stmt_journal;
+mod stmt_readonly;
 mod storage;
 mod trigger;
 mod wal;

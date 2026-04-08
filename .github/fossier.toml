@@ -1,0 +1,30 @@
+[repo]
+owner = "tursodatabase"
+name = "turso"
+
+[thresholds]
+allow_score = 70.0
+deny_score = 50.0
+min_confidence = 0.5
+
+[actions.deny]
+close_pr = true
+comment = true
+label = "fossier:spam-likely"
+
+[actions.review]
+comment = true
+label = "fossier:needs-review"
+
+[weights]
+prior_interaction = 0.3
+
+[registry]
+url = "https://registry.fossier.io"
+report_denials = true
+check_before_scoring = true
+block_threshold = 3
+
+[trust]
+flood_threshold = 4
+flood_window_hours = 1

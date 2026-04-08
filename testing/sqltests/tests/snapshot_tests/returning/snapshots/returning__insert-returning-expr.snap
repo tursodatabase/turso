@@ -22,12 +22,12 @@ addr  opcode           p1  p2  p3  p4     p5  comment
    5  String8           0   4   0  alice   0  r[4]='alice'
    6  Real              0   5   0  10.0    0  r[5]=10
    7  OpenWrite         0   3   0          0  root=3; iDb=0
-   8  NotNull           2  10   0          0  r[2]!=NULL -> goto 10
-   9  Goto              0  12   0          0
-  10  MustBeInt         2   0   0          0
-  11  Goto              0  13   0          0
-  12  NewRowid          2   2   0          0  r[2]=rowid
-  13  Affinity          3   3   0          0  r[3..6] = D, B, E
+   8  Affinity          3   3   0          0  r[3..6] = D, B, E
+   9  NotNull           2  11   0          0  r[2]!=NULL -> goto 11
+  10  Goto              0  13   0          0
+  11  MustBeInt         2   0   0          0
+  12  Goto              0  14   0          0
+  13  NewRowid          2   2   0          0  r[2]=rowid
   14  NotExists         2  16   2          0
   15  Halt           1555   0   0  t1.id   0
   16  Copy              4   7   0          0  r[7]=r[4]

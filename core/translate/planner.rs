@@ -520,6 +520,7 @@ fn plan_cte(
             cte_id: Some(cte_definitions[ref_idx].cte_id),
             cte_definition_only: false,
             rowid_referenced: false,
+            scope_depth: 0,
         });
     }
 
@@ -682,6 +683,7 @@ pub fn plan_ctes_as_outer_refs(
             cte_id: None, // DML CTEs don't track CTE sharing (TODO: implement if needed)
             cte_definition_only: true,
             rowid_referenced: false,
+            scope_depth: 0,
         });
     }
 
@@ -751,6 +753,7 @@ fn parse_from_clause_table(
                     cte_id: Some(cte_def.cte_id),
                     cte_definition_only: false,
                     rowid_referenced: false,
+                    scope_depth: 0,
                 });
             }
 
@@ -773,7 +776,7 @@ fn parse_from_clause_table(
             let cur_table_index = table_references.joined_tables().len();
             let identifier = maybe_alias
                 .map(|a| normalize_ident(a.name().as_str()))
-                .unwrap_or_else(|| format!("subquery_{cur_table_index}"));
+                .unwrap_or_else(|| format!("(subquery-{cur_table_index})"));
             table_references.add_joined_table(JoinedTable::new_subquery_from_plan(
                 identifier,
                 subplan,
@@ -1299,6 +1302,7 @@ pub fn parse_from(
                     // this scope's FROM/JOIN clause.
                     cte_definition_only: true,
                     rowid_referenced: false,
+                    scope_depth: 0,
                 });
             }
         }

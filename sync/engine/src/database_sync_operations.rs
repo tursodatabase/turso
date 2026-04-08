@@ -240,7 +240,7 @@ pub async fn wal_apply_from_file<Ctx>(
             coro.yield_(SyncEngineIoResult::IO).await?;
         }
         let info = WalFrameInfo::from_frame_header(buffer.as_slice());
-        tracing::info!("got frame: {:?}", info);
+        tracing::debug!("got frame: {:?}", info);
         db_size = info.db_size;
         session.append_page(info.page_no, &buffer.as_slice()[WAL_FRAME_HEADER..])?;
     }
@@ -345,7 +345,7 @@ pub async fn wal_pull_to_file_v1<IO: SyncEngineIo, Ctx>(
     .await?;
     while let Some(page_data) = page_data_opt.take() {
         let page_id = page_data.page_id;
-        tracing::info!("received page {}", page_id);
+        tracing::debug!("received page {}", page_id);
         let page = decode_page(&header, page_data)?;
         if page.len() != PAGE_SIZE {
             return Err(Error::DatabaseSyncEngineError(format!(
@@ -364,7 +364,7 @@ pub async fn wal_pull_to_file_v1<IO: SyncEngineIo, Ctx>(
         if page_data_opt.is_none() {
             frame_info.db_size = header.db_size as u32;
         }
-        tracing::info!("page_data_opt: {}", page_data_opt.is_some());
+        tracing::debug!("page_data_opt: {}", page_data_opt.is_some());
         frame_info.put_to_frame_header(buffer.as_mut_slice());
 
         let c = Completion::new_write(move |result| {
@@ -472,7 +472,7 @@ pub async fn pull_pages_v1<IO: SyncEngineIo, Ctx>(
     .await?;
     while let Some(page_data) = page_data_opt.take() {
         let page_id = page_data.page_id;
-        tracing::info!("received page {}", page_id);
+        tracing::debug!("received page {}", page_id);
         let page = decode_page(&header, page_data)?;
         if page.len() != PAGE_SIZE {
             return Err(Error::DatabaseSyncEngineError(format!(
@@ -484,7 +484,7 @@ pub async fn pull_pages_v1<IO: SyncEngineIo, Ctx>(
         pages.push(PulledPage { page_id, page });
         page_data_opt =
             wait_proto_message(ctx.coro, &completion, &ctx.io.network_stats, &mut bytes).await?;
-        tracing::info!("page_data_opt: {}", page_data_opt.is_some());
+        tracing::debug!("page_data_opt: {}", page_data_opt.is_some());
     }
 
     Ok(PulledPages {
@@ -865,7 +865,8 @@ pub async fn fetch_last_change_id<IO: SyncEngineIo, Ctx>(
         .into(),
     };
 
-    let response = match sql_execute_http(ctx, init_hrana_request).await {
+    let no_ignored_steps = std::collections::HashSet::new();
+    let response = match sql_execute_http(ctx, init_hrana_request, &no_ignored_steps).await {
         Ok(response) => response,
         Err(Error::DatabaseSyncEngineError(err)) if err.contains("no such table") => {
             return Ok((source_pull_gen, None));
@@ -948,6 +949,7 @@ pub async fn push_logical_changes<IO: SyncEngineIo, Ctx>(
             cond: Box::new(BatchCond::IsAutocommit {}),
         }),
     };
+    let mut add_column_step_indices = std::collections::HashSet::new();
     let mut sql_over_http_requests = vec![
         BatchStep {
             stmt: Stmt {
@@ -990,7 +992,7 @@ pub async fn push_logical_changes<IO: SyncEngineIo, Ctx>(
         None
     };
 
-    tracing::info!("local_changes: {:?}", local_changes);
+    tracing::debug!("local_changes: {:?}", local_changes);
 
     for (i, change) in local_changes.into_iter().enumerate() {
         let change_id = change.change_id;
@@ -1005,7 +1007,7 @@ pub async fn push_logical_changes<IO: SyncEngineIo, Ctx>(
         } else {
             DatabaseTapeOperation::RowChange(change)
         };
-        tracing::info!(
+        tracing::debug!(
             "change_id: {}, last_change_id: {:?}",
             change_id,
             last_change_id
@@ -1017,7 +1019,7 @@ pub async fn push_logical_changes<IO: SyncEngineIo, Ctx>(
         rows_changed += 1;
         // we give user full control over CDC table - so let's not emit assert here for now
         if last_change_id.is_some() && last_change_id.unwrap() + 1 != change_id {
-            tracing::warn!(
+            tracing::debug!(
                 "out of order change sequence: {} -> {}",
                 last_change_id.unwrap(),
                 change_id
@@ -1033,6 +1035,10 @@ pub async fn push_logical_changes<IO: SyncEngineIo, Ctx>(
             }
             DatabaseTapeOperation::RowChange(change) => {
                 let replay_info = generator.replay_info(ctx.coro, &change).await?;
+                // for now we try to support DDL statements which "extends" the schema (CREATE INDEX, CREATE TABLE, ALTER TABLE ADD COLUMN) and they have `IF NOT EXISTS` semantic
+                // as ALTER TABLE has no such syntax - we ignore error for such statements from remote for now
+                let is_alter_add_column =
+                    replay_info.is_ddl_replay && is_alter_table_add_column(&replay_info.query);
                 match change.change {
                     DatabaseTapeRowChangeType::Delete { before } => {
                         let values = generator.replay_values(
@@ -1087,6 +1093,9 @@ pub async fn push_logical_changes<IO: SyncEngineIo, Ctx>(
                             .push(step(replay_info.query.clone(), convert_to_args(values)));
                     }
                 }
+                if is_alter_add_column {
+                    add_column_step_indices.insert(sql_over_http_requests.len() - 1);
+                }
             }
         }
     }
@@ -1125,7 +1134,7 @@ pub async fn push_logical_changes<IO: SyncEngineIo, Ctx>(
         .into(),
     };
 
-    let _ = sql_execute_http(ctx, replay_hrana_request).await?;
+    let _ = sql_execute_http(ctx, replay_hrana_request, &add_column_step_indices).await?;
     tracing::info!("push_logical_changes: rows_changed={:?}", rows_changed);
     Ok((source_pull_gen, last_change_id.unwrap_or(0)))
 }
@@ -1322,7 +1331,7 @@ pub async fn bootstrap_db_file_v1<IO: SyncEngineIo, Ctx>(
     )
     .await?
     {
-        tracing::info!(
+        tracing::debug!(
             "bootstrap_db_file: received page page_id={}",
             page_data.page_id
         );
@@ -1434,6 +1443,7 @@ pub async fn reset_wal_file<Ctx>(
 async fn sql_execute_http<IO: SyncEngineIo, Ctx>(
     ctx: &SyncOperationCtx<'_, IO, Ctx>,
     request: server_proto::PipelineReqBody,
+    ignored_step_indices: &std::collections::HashSet<usize>,
 ) -> Result<Vec<StmtResult>> {
     let body = serde_json::to_vec(&request)?;
 
@@ -1468,10 +1478,16 @@ async fn sql_execute_http<IO: SyncEngineIo, Ctx>(
                     results.push(execute.result);
                 }
                 server_proto::StreamResponse::Batch(batch) => {
-                    if let Some(error) = batch.result.step_errors.into_iter().flatten().next() {
-                        return Err(Error::DatabaseSyncEngineError(format!(
-                            "failed to execute sql: {error:?}"
-                        )));
+                    for (i, error) in batch.result.step_errors.iter().enumerate() {
+                        if let Some(error) = error {
+                            if ignored_step_indices.contains(&i) {
+                                tracing::info!("ignoring step error at index {i}: {error:?}");
+                            } else {
+                                return Err(Error::DatabaseSyncEngineError(format!(
+                                    "failed to execute sql: {error:?}"
+                                )));
+                            }
+                        }
                     }
                     for result in batch.result.step_results.into_iter().flatten() {
                         results.push(result);
@@ -1481,6 +1497,22 @@ async fn sql_execute_http<IO: SyncEngineIo, Ctx>(
         }
     }
     Ok(results)
+}
+
+fn is_alter_table_add_column(sql: &str) -> bool {
+    let mut parser = turso_parser::parser::Parser::new(sql.as_bytes());
+    let Some(Ok(ast)) = parser.next() else {
+        return false;
+    };
+    matches!(
+        ast,
+        turso_parser::ast::Cmd::Stmt(turso_parser::ast::Stmt::AlterTable(
+            turso_parser::ast::AlterTable {
+                body: turso_parser::ast::AlterTableBody::AddColumn(_),
+                ..
+            }
+        ))
+    )
 }
 
 async fn wal_pull_http<IO: SyncEngineIo, Ctx>(

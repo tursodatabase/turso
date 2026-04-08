@@ -1674,6 +1674,8 @@ pub enum PragmaName {
     FreelistCount,
     /// Enable or disable foreign key constraint enforcement
     ForeignKeys,
+    /// Deprecated: control whether column names include table name prefix
+    FullColumnNames,
     /// List all SQL functions known to the database connection
     FunctionList,
     /// Use F_FULLFSYNC instead of fsync on macOS (only supported on macOS)
@@ -1685,6 +1687,8 @@ pub enum PragmaName {
     IntegrityCheck,
     /// `journal_mode` pragma
     JournalMode,
+    /// `locking_mode` pragma
+    LockingMode,
     /// Run a quick integrity check (skips expensive index consistency validation)
     QuickCheck,
     /// encryption key for encrypted databases, specified as hexadecimal string.
@@ -1706,6 +1710,8 @@ pub enum PragmaName {
     QueryOnly,
     /// Returns schema version of the database file.
     SchemaVersion,
+    /// Deprecated: control whether unaliased column names omit the table name prefix
+    ShortColumnNames,
     /// Alias for `require_where` pragma, as an homage to MySQL (https://dev.mysql.com/doc/refman/9.6/en/mysql-tips.html#safe-updates)
     IAmADummy,
     /// Reject DELETE/UPDATE without WHERE clause
@@ -1743,6 +1749,8 @@ pub enum PragmaName {
     MvccCheckpointThreshold,
     /// List all available types (built-in and custom)
     ListTypes,
+    /// Deprecated no-op: control whether callback is invoked for empty result sets
+    EmptyResultCallbacks,
 }
 
 /// `CREATE TRIGGER` time

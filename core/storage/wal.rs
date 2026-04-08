@@ -504,7 +504,7 @@ pub trait Wal: Debug + Send + Sync {
         sync_type: FileSyncType,
     ) -> Result<IOResult<()>>;
 
-    #[cfg(debug_assertions)]
+    #[cfg(any(test, debug_assertions))]
     fn as_any(&self) -> &dyn std::any::Any;
 }
 
@@ -1321,7 +1321,7 @@ impl Wal for WalFile {
                 // Return BusySnapshot instead of Busy so the caller knows it must
                 // restart the read transaction to get a fresh snapshot.
                 // Retrying with busy_timeout will NEVER HELP.
-                tracing::debug!("unable to upgrade transaction from read to write: snapshot is stale, give up and let caller retry from scratch, self.max_frame={}, shared_max={}", self.max_frame.load(Ordering::Acquire), shared.max_frame.load(Ordering::Acquire));
+                tracing::info!("unable to upgrade transaction from read to write: snapshot is stale, give up and let caller retry from scratch, self.max_frame={}, shared_max={}", self.max_frame.load(Ordering::Acquire), shared.max_frame.load(Ordering::Acquire));
                 shared.write_lock.unlock();
                 return Err(LimboError::BusySnapshot);
             }
@@ -1734,7 +1734,7 @@ impl Wal for WalFile {
         mode: CheckpointMode,
     ) -> Result<IOResult<CheckpointResult>> {
         self.checkpoint_inner(pager, mode).inspect_err(|e| {
-            tracing::debug!("Wal Checkpoint failed: {e}");
+            tracing::info!("Wal Checkpoint failed: {e}");
             let _ = self.checkpoint_guard.write().take();
             self.ongoing_checkpoint.write().state = CheckpointState::Start;
         })
@@ -2191,7 +2191,7 @@ impl Wal for WalFile {
         Ok(c)
     }
 
-    #[cfg(debug_assertions)]
+    #[cfg(any(test, debug_assertions))]
     fn as_any(&self) -> &dyn std::any::Any {
         self
     }
@@ -2252,6 +2252,11 @@ impl WalFile {
             checkpoint_guard: RwLock::new(None),
             io_ctx: RwLock::new(IOContext::default()),
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn shared_ptr(&self) -> usize {
+        Arc::as_ptr(&self.shared) as usize
     }
 
     fn page_size(&self) -> u32 {
@@ -2327,7 +2332,7 @@ impl WalFile {
     fn increment_checkpoint_epoch(&self) {
         self.with_shared(|shared| {
             let prev = shared.epoch.fetch_add(1, Ordering::Release);
-            tracing::debug!("increment checkpoint epoch: prev={}", prev);
+            tracing::info!("increment checkpoint epoch: prev={}", prev);
         });
     }
 
@@ -2383,7 +2388,7 @@ impl WalFile {
                         let n_backfills = shared.nbackfills.load(Ordering::Acquire);
                         (max_frame, n_backfills)
                     });
-                    tracing::debug!("shared_wal: max_frame={max_frame}, nbackfills={nbackfills}");
+                    tracing::info!("shared_wal: max_frame={max_frame}, nbackfills={nbackfills}");
                     let needs_backfill = max_frame > nbackfills;
                     if !needs_backfill && !mode.should_restart_log() {
                         // there are no frames to copy over and we don't need to reset
@@ -2421,7 +2426,7 @@ impl WalFile {
                         let oc = self.ongoing_checkpoint.read();
                         (oc.min_frame, oc.max_frame)
                     };
-                    tracing::debug!("checkpoint_inner::Start: min_frame={oc_min_frame}, max_frame={oc_max_frame}");
+                    tracing::info!("checkpoint_inner::Start: min_frame={oc_min_frame}, max_frame={oc_max_frame}");
                     let to_checkpoint = self.with_shared(|shared| {
                         let frame_cache = shared.frame_cache.lock();
                         let mut list = Vec::with_capacity(
@@ -2587,11 +2592,11 @@ impl WalFile {
                         let wal_checkpoint_backfilled =
                             wal_total_backfilled.saturating_sub(ongoing_chkpt.min_frame - 1);
 
-                        tracing::debug!("checkpoint: wal_max_frame={wal_max_frame}, wal_total_backfilled={wal_total_backfilled}, wal_checkpoint_backfilled={wal_checkpoint_backfilled}");
+                        tracing::info!("checkpoint: wal_max_frame={wal_max_frame}, wal_total_backfilled={wal_total_backfilled}, wal_checkpoint_backfilled={wal_checkpoint_backfilled}");
 
                         CheckpointResult::new(wal_max_frame, wal_total_backfilled, wal_checkpoint_backfilled)
                     });
-                    tracing::debug!("checkpoint_result={:?}, mode={:?}", checkpoint_result, mode);
+                    tracing::info!("checkpoint_result={:?}, mode={:?}", checkpoint_result, mode);
 
                     // store the max frame we were able to successfully checkpoint.
                     // NOTE: we don't have a .shm file yet, so it's safe to update nbackfills here
@@ -2642,7 +2647,7 @@ impl WalFile {
                     // increment wal epoch to ensure no stale pages are used for backfilling
                     self.increment_checkpoint_epoch();
 
-                    tracing::debug!("checkpoint_result={:?}", checkpoint_result);
+                    tracing::info!("checkpoint_result={:?}", checkpoint_result);
                     // we cannot truncate the db file here because we are currently inside a
                     // mut borrow of pager.wal, and accessing the header will attempt a borrow
                     // during 'read_page', so the caller will use the result to determine if:
@@ -2779,7 +2784,7 @@ impl WalFile {
     }
 
     fn restart_log(&self) -> Result<()> {
-        tracing::debug!("restart_log");
+        tracing::info!("restart_log");
         self.with_shared(|shared| {
             // Block all readers
             for idx in 1..shared.read_locks.len() {
@@ -2976,6 +2981,7 @@ impl WalFileShared {
     pub fn last_checksum_and_max_frame(&self) -> ((u32, u32), u64) {
         (self.last_checksum, self.max_frame.load(Ordering::Acquire))
     }
+
     pub fn open_shared_if_exists(
         io: &Arc<dyn IO>,
         path: &str,

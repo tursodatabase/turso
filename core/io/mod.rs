@@ -50,6 +50,63 @@ mod completions;
 pub use clock::Clock;
 pub use completions::*;
 
+/// Platform-independent file identity, analogous to SQLite's `struct unixFileId`.
+/// On Unix: (st_dev, st_ino). On Windows: (dwVolumeSerialNumber, nFileIndex).
+/// On non-filesystem backends: synthetic hash-based identity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct FileId {
+    pub dev: u64,
+    pub ino: u64,
+}
+
+impl FileId {
+    /// Synthetic identity from a path hash, for backends without real inodes
+    /// (MemoryIO, OPFS, simulators).
+    pub fn from_path_hash(path: &str) -> Self {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        path.hash(&mut hasher);
+        FileId {
+            dev: 0,
+            ino: hasher.finish(),
+        }
+    }
+}
+
+/// Return the OS-level file identity for a path.
+#[cfg(unix)]
+pub fn get_file_id(path: &str) -> Result<FileId, std::io::Error> {
+    use std::os::unix::fs::MetadataExt;
+    let m = std::fs::metadata(path)?;
+    Ok(FileId {
+        dev: m.dev(),
+        ino: m.ino(),
+    })
+}
+
+#[cfg(windows)]
+pub fn get_file_id(path: &str) -> Result<FileId, std::io::Error> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::{
+        GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION,
+    };
+    let file = std::fs::File::open(path)?;
+    let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+    let ret = unsafe { GetFileInformationByHandle(file.as_raw_handle() as _, &mut info) };
+    if ret == 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(FileId {
+        dev: info.dwVolumeSerialNumber as u64,
+        ino: (info.nFileIndexHigh as u64) << 32 | info.nFileIndexLow as u64,
+    })
+}
+
+#[cfg(not(any(unix, windows)))]
+pub fn get_file_id(path: &str) -> Result<FileId, std::io::Error> {
+    Ok(FileId::from_path_hash(path))
+}
+
 /// Controls which sync mechanism to use for durability.
 /// `FullFsync` only has effect on Apple platforms (uses F_FULLFSYNC fcntl).
 /// On other platforms, both variants behave the same (regular fsync).
@@ -281,6 +338,17 @@ pub trait IO: Clock + Send + Sync {
     /// Used for progressive backoff in contended lock acquisition.
     fn sleep(&self, duration: std::time::Duration) {
         crate::thread::sleep(duration);
+    }
+
+    /// Return the file identity for the given path.
+    /// Default uses OS-level metadata; non-filesystem backends override
+    /// with synthetic hash-based identity.
+    fn file_id(&self, path: &str) -> Result<FileId> {
+        get_file_id(path).map_err(|e| {
+            crate::LimboError::InternalError(format!(
+                "failed to get file identity for '{path}': {e}"
+            ))
+        })
     }
 }
 

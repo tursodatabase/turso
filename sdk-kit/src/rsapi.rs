@@ -1873,6 +1873,88 @@ mod tests {
         }
     }
 
+    /// Reproducer: stale DATABASE_MANAGER entry when old TursoDatabase/TursoConnection
+    /// haven't been GC'd (dropped) before reopening at the same path.
+    ///
+    /// Steps (mirrors the React Native bug report):
+    ///   1. Open database A via SDK, create table "cache", close connection
+    ///   2. Copy A.db → B.db, delete A.db
+    ///   3. Open a *new* database at path A.db — while old db_a/conn_a still alive
+    ///   4. CREATE TABLE cache should succeed (A.db is fresh) but fails with
+    ///      "table cache already exists" because the registry returned the stale Database
+    #[test]
+    pub fn test_stale_registry_with_live_sdk_handles() {
+        let tmp_dir = tempfile::TempDir::new().unwrap();
+        let path_a = tmp_dir.path().join("A.db");
+        let path_b = tmp_dir.path().join("B.db");
+
+        // 1. Open database A via SDK and create a table.
+        let db_a = TursoDatabase::new(TursoDatabaseConfig {
+            path: path_a.to_str().unwrap().to_string(),
+            experimental_features: None,
+            async_io: false,
+            encryption: None,
+            vfs: None,
+            io: None,
+            db_file: None,
+        });
+        let _ = db_a.open().unwrap();
+        let conn_a = db_a.connect().unwrap();
+
+        let mut stmt = conn_a
+            .prepare_single("CREATE TABLE cache(x INTEGER)")
+            .unwrap();
+        assert_eq!(stmt.execute(None).unwrap().status, TursoStatusCode::Done);
+        drop(stmt);
+
+        // Close the connection but do NOT drop conn_a or db_a — simulates
+        // the JS GC not having collected them yet.
+        conn_a.close().unwrap();
+
+        // 2. Copy A.db → B.db, then delete A.db (and WAL/SHM files).
+        std::fs::copy(&path_a, &path_b).unwrap();
+        std::fs::remove_file(&path_a).unwrap();
+        for ext in &["-wal", "-shm"] {
+            let src = tmp_dir.path().join(format!("A.db{ext}"));
+            let dst = tmp_dir.path().join(format!("B.db{ext}"));
+            if src.exists() {
+                std::fs::copy(&src, &dst).unwrap();
+                std::fs::remove_file(&src).unwrap();
+            }
+        }
+
+        // 3. Open a new database at the same path A.db.
+        //    The old db_a and conn_a are still alive — this is the key difference
+        //    from test_sdk_close_finalizes_leaked_statements which drops everything.
+        let db_a2 = TursoDatabase::new(TursoDatabaseConfig {
+            path: path_a.to_str().unwrap().to_string(),
+            experimental_features: None,
+            async_io: false,
+            encryption: None,
+            vfs: None,
+            io: None,
+            db_file: None,
+        });
+        let _ = db_a2.open().unwrap();
+        let conn_a2 = db_a2.connect().unwrap();
+
+        // 4. A.db should be a fresh empty database — CREATE TABLE cache must succeed.
+        let mut stmt2 = conn_a2
+            .prepare_single("CREATE TABLE cache(x INTEGER)")
+            .expect("prepare should succeed on fresh database");
+        let result = stmt2.execute(None);
+        assert_eq!(
+            result.unwrap().status,
+            TursoStatusCode::Done,
+            "CREATE TABLE cache on a fresh A.db should succeed — \
+             stale DATABASE_MANAGER entry returned the old Database"
+        );
+
+        // Cleanup: drop old handles (simulates eventual GC).
+        drop(conn_a);
+        drop(db_a);
+    }
+
     /// Regression test: connection.close() must finalize all outstanding statements
     /// to break the Statement → Arc<Connection> → Arc<Database> chain that keeps the
     /// database alive in DATABASE_MANAGER after a file rename.

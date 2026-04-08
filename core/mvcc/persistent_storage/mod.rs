@@ -65,6 +65,10 @@ pub trait DurableStorage: Send + Sync + Debug {
     ) -> Result<()> {
         Ok(())
     }
+
+    fn encryption_ctx(&self) -> Option<EncryptionContext> {
+        None
+    }
 }
 
 pub struct Storage {
@@ -127,6 +131,10 @@ impl DurableStorage for Storage {
 
     fn get_logical_log_file(&self) -> Arc<dyn File> {
         self.logical_log.write().file.clone()
+    }
+
+    fn encryption_ctx(&self) -> Option<EncryptionContext> {
+        self.logical_log.read().encryption_ctx().cloned()
     }
 
     /// Lock-free: reads shadowed atomics only.

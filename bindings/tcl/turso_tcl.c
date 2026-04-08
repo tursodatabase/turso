@@ -26,14 +26,22 @@
 
 #define TURSO_TCL_VERSION "1.0"
 #define MAX_FUNC_ARGS 64
+#define STMT_CACHE_SIZE 32
 
 /* ------------------------------------------------------------------ */
 /* TursoDb — state for a single open database connection               */
 /* ------------------------------------------------------------------ */
+typedef struct CachedStmt {
+    char         *sql;     /* SQL text (cache key) */
+    sqlite3_stmt *stmt;    /* prepared statement */
+} CachedStmt;
+
 typedef struct TursoDb {
     sqlite3    *db;
     Tcl_Interp *interp;
     Tcl_Obj    *null_obj;   /* replacement string for NULL values */
+    CachedStmt  stmt_cache[STMT_CACHE_SIZE];
+    int         cache_count;
 } TursoDb;
 
 /* ------------------------------------------------------------------ */
@@ -93,6 +101,79 @@ static Tcl_Obj *value_to_obj(void *argv_i)
     }
     default: /* NULL */
         return Tcl_NewStringObj("", 0);
+    }
+}
+
+/* ------------------------------------------------------------------ */
+/* Prepared statement cache                                            */
+/* ------------------------------------------------------------------ */
+
+static sqlite3_stmt *cache_find(TursoDb *tdb, const char *sql)
+{
+    int i;
+    for (i = 0; i < tdb->cache_count; i++) {
+        if (strcmp(tdb->stmt_cache[i].sql, sql) == 0) {
+            sqlite3_stmt *stmt = tdb->stmt_cache[i].stmt;
+            sqlite3_reset(stmt);
+            return stmt;
+        }
+    }
+    return NULL;
+}
+
+static void cache_store(TursoDb *tdb, const char *sql, sqlite3_stmt *stmt)
+{
+    if (tdb->cache_count >= STMT_CACHE_SIZE) return;
+    CachedStmt *cs = &tdb->stmt_cache[tdb->cache_count++];
+    cs->sql = strdup(sql);
+    cs->stmt = stmt;
+}
+
+static void cache_free(TursoDb *tdb)
+{
+    int i;
+    for (i = 0; i < tdb->cache_count; i++) {
+        sqlite3_finalize(tdb->stmt_cache[i].stmt);
+        free(tdb->stmt_cache[i].sql);
+    }
+    tdb->cache_count = 0;
+}
+
+/* ------------------------------------------------------------------ */
+/* TCL variable binding                                                */
+/* ------------------------------------------------------------------ */
+
+static void bind_tcl_variables(Tcl_Interp *interp, sqlite3_stmt *stmt)
+{
+    int nparams = sqlite3_bind_parameter_count(stmt);
+    int i;
+    for (i = 1; i <= nparams; i++) {
+        const char *name = sqlite3_bind_parameter_name(stmt, i);
+        if (!name) continue;
+
+        /* Skip the leading $ : or @ */
+        const char *varname = name;
+        if (varname[0] == '$' || varname[0] == ':' || varname[0] == '@') {
+            varname++;
+        }
+
+        Tcl_Obj *val = Tcl_GetVar2Ex(interp, varname, NULL, 0);
+        if (!val) {
+            sqlite3_bind_null(stmt, i);
+            continue;
+        }
+
+        Tcl_WideInt ival;
+        double dval;
+        if (Tcl_GetWideIntFromObj(NULL, val, &ival) == TCL_OK) {
+            sqlite3_bind_int64(stmt, i, (sqlite3_int64)ival);
+        } else if (Tcl_GetDoubleFromObj(NULL, val, &dval) == TCL_OK) {
+            sqlite3_bind_double(stmt, i, dval);
+        } else {
+            Tcl_Size len;
+            const char *str = Tcl_GetStringFromObj(val, &len);
+            sqlite3_bind_text(stmt, i, str, (int)len, SQLITE_TRANSIENT);
+        }
     }
 }
 
@@ -161,11 +242,47 @@ static void tcl_func_destroy(void *pApp)
  * Execute all statements in `sql`, collecting result rows from the last
  * statement that returns rows into `result_list`.
  * Returns TCL_OK or TCL_ERROR; sets the interpreter result on error.
+ *
+ * Uses prepared statement caching: single-statement SQL with bind parameters
+ * (e.g. $varname) is cached and reused on subsequent calls.  TCL variables
+ * referenced by parameter names are automatically bound.
  */
-static int exec_sql_collect(Tcl_Interp *interp, sqlite3 *db,
+static int exec_sql_collect(TursoDb *tdb,
                              const char *sql, const char *null_str,
                              Tcl_Obj **result_list_out)
 {
+    Tcl_Interp *interp = tdb->interp;
+    sqlite3    *db     = tdb->db;
+
+    /* Fast path: check if this exact SQL string has a cached statement */
+    sqlite3_stmt *cached_stmt = cache_find(tdb, sql);
+    if (cached_stmt) {
+        bind_tcl_variables(interp, cached_stmt);
+
+        Tcl_Obj *result_list = Tcl_NewListObj(0, NULL);
+        Tcl_IncrRefCount(result_list);
+        int ncols = sqlite3_column_count(cached_stmt);
+        int rc;
+
+        while ((rc = sqlite3_step(cached_stmt)) == SQLITE_ROW) {
+            int i;
+            for (i = 0; i < ncols; i++) {
+                Tcl_Obj *val = column_to_obj(cached_stmt, i, null_str);
+                Tcl_ListObjAppendElement(interp, result_list, val);
+            }
+        }
+
+        if (rc != SQLITE_DONE) {
+            Tcl_DecrRefCount(result_list);
+            Tcl_SetResult(interp, (char *)sqlite3_errmsg(db), TCL_VOLATILE);
+            return TCL_ERROR;
+        }
+
+        *result_list_out = result_list;
+        return TCL_OK;
+    }
+
+    /* Regular multi-statement path */
     Tcl_Obj    *result_list = Tcl_NewListObj(0, NULL);
     Tcl_IncrRefCount(result_list);
     const char *remaining   = sql;
@@ -195,6 +312,9 @@ static int exec_sql_collect(Tcl_Interp *interp, sqlite3 *db,
             continue;
         }
 
+        /* Bind TCL variables to any parameters */
+        bind_tcl_variables(interp, stmt);
+
         /* reset the list for each non-empty statement so the caller
            sees the results of the final one (matches SQLite tclsqlite behaviour) */
         Tcl_DecrRefCount(result_list);
@@ -211,12 +331,30 @@ static int exec_sql_collect(Tcl_Interp *interp, sqlite3 *db,
             }
         }
 
-        sqlite3_finalize(stmt);
-
         if (rc != SQLITE_DONE) {
+            sqlite3_finalize(stmt);
             Tcl_DecrRefCount(result_list);
             Tcl_SetResult(interp, (char *)sqlite3_errmsg(db), TCL_VOLATILE);
             return TCL_ERROR;
+        }
+
+        /* Cache single-statement SQL with bind parameters */
+        if (sqlite3_bind_parameter_count(stmt) > 0) {
+            /* Check if tail is empty (single statement) */
+            const char *p = tail;
+            if (p) {
+                while (*p == ' ' || *p == '\n' || *p == '\t' ||
+                       *p == '\r' || *p == ';') {
+                    p++;
+                }
+            }
+            if (!p || !*p) {
+                cache_store(tdb, sql, stmt);
+            } else {
+                sqlite3_finalize(stmt);
+            }
+        } else {
+            sqlite3_finalize(stmt);
         }
 
         remaining = tail;
@@ -234,6 +372,7 @@ static void TursoDbFree(ClientData cd)
 {
     TursoDb *tdb = (TursoDb *)cd;
     if (!tdb) return;
+    cache_free(tdb);
     if (tdb->db)       sqlite3_close(tdb->db);
     if (tdb->null_obj) Tcl_DecrRefCount(tdb->null_obj);
     Tcl_Free((char *)tdb);
@@ -330,7 +469,7 @@ static int TursoDbCmd(ClientData cd, Tcl_Interp *interp,
         /* db eval sql — collect all result values into a flat list */
         if (objc == 3) {
             Tcl_Obj *result_list = NULL;
-            int rc = exec_sql_collect(interp, tdb->db, sql, null_str,
+            int rc = exec_sql_collect(tdb, sql, null_str,
                                       &result_list);
             if (rc != TCL_OK) return rc;
             Tcl_SetObjResult(interp, result_list);
@@ -364,6 +503,9 @@ static int TursoDbCmd(ClientData cd, Tcl_Interp *interp,
                     return TCL_ERROR;
                 }
                 if (!stmt) { remaining = tail; continue; }
+
+                /* Bind TCL variables to any parameters */
+                bind_tcl_variables(interp, stmt);
 
                 int ncols = sqlite3_column_count(stmt);
 
@@ -582,9 +724,10 @@ static int TursoOpenCmd(ClientData cd, Tcl_Interp *interp,
     }
 
     TursoDb *tdb = (TursoDb *)Tcl_Alloc(sizeof(TursoDb));
-    tdb->db       = db;
-    tdb->interp   = interp;
-    tdb->null_obj = NULL;
+    tdb->db          = db;
+    tdb->interp      = interp;
+    tdb->null_obj    = NULL;
+    tdb->cache_count = 0;
 
     Tcl_CreateObjCommand(interp, handle_name, TursoDbCmd,
                          (ClientData)tdb, TursoDbFree);
@@ -601,6 +744,8 @@ int Tursotcl_Init(Tcl_Interp *interp)
     if (Tcl_InitStubs(interp, TCL_VERSION, 0) == NULL) {
         return TCL_ERROR;
     }
+
+    turso_enable_experimental();
 
     Tcl_CreateObjCommand(interp, "sqlite3", TursoOpenCmd, NULL, NULL);
 

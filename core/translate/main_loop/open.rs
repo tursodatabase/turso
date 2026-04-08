@@ -307,6 +307,11 @@ impl OpenLoop {
                                         matches!(&table.table, Table::FromClauseSubquery(_))
                                     };
                                     let num_seek_keys = seek_def.size(&seek_def.start);
+                                    let table_columns = if let Table::BTree(btree) = &table.table {
+                                        Some(btree.columns.as_slice())
+                                    } else {
+                                        None
+                                    };
                                     let AutoIndexResult {
                                         use_bloom_filter, ..
                                     } = emit_autoindex(
@@ -326,6 +331,10 @@ impl OpenLoop {
                                                 index, seek_def,
                                             )
                                             .as_ref(),
+                                            table_columns,
+                                            table_ref_id: table.internal_id,
+                                            table_references,
+                                            resolver: &t_ctx.resolver,
                                         },
                                     )?;
                                     bloom_filter = use_bloom_filter;

@@ -3,11 +3,30 @@
 
 use std::ffi::{self, CStr, CString};
 use std::num::NonZeroUsize;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use tracing::trace;
-use turso_core::{CheckpointMode, LimboError, Value};
+use turso_core::{CheckpointMode, DatabaseOpts, LimboError, Value};
 use turso_ext::ScalarFunction;
 use turso_ext::Value as ExtValue;
+
+/// Global flag: when set, all subsequently opened databases enable experimental features.
+static EXPERIMENTAL_ENABLED: AtomicBool = AtomicBool::new(false);
+
+/// Enable all experimental features for databases opened after this call.
+#[no_mangle]
+pub extern "C" fn turso_enable_experimental() {
+    EXPERIMENTAL_ENABLED.store(true, Ordering::Release);
+}
+
+/// Build `DatabaseOpts` respecting the global experimental flag.
+fn default_db_opts() -> DatabaseOpts {
+    let mut opts = DatabaseOpts::new();
+    if EXPERIMENTAL_ENABLED.load(Ordering::Acquire) {
+        opts = opts.with_generated_columns(true);
+    }
+    opts
+}
 
 macro_rules! stub {
     () => {
@@ -65,6 +84,18 @@ pub const SQLITE_FLOAT: ffi::c_int = 2;
 pub const SQLITE_TEXT: ffi::c_int = 3;
 pub const SQLITE_BLOB: ffi::c_int = 4;
 pub const SQLITE_NULL: ffi::c_int = 5;
+pub const SQLITE_STMTSTATUS_FULLSCAN_STEP: ffi::c_int = 1;
+pub const SQLITE_STMTSTATUS_SORT: ffi::c_int = 2;
+pub const SQLITE_STMTSTATUS_AUTOINDEX: ffi::c_int = 3;
+pub const SQLITE_STMTSTATUS_VM_STEP: ffi::c_int = 4;
+pub const SQLITE_STMTSTATUS_REPREPARE: ffi::c_int = 5;
+pub const SQLITE_STMTSTATUS_RUN: ffi::c_int = 6;
+pub const SQLITE_STMTSTATUS_FILTER_MISS: ffi::c_int = 7;
+pub const SQLITE_STMTSTATUS_FILTER_HIT: ffi::c_int = 8;
+pub const SQLITE_STMTSTATUS_MEMUSED: ffi::c_int = 99;
+pub const LIBSQL_STMTSTATUS_BASE: ffi::c_int = 1024;
+pub const LIBSQL_STMTSTATUS_ROWS_READ: ffi::c_int = LIBSQL_STMTSTATUS_BASE + 1;
+pub const LIBSQL_STMTSTATUS_ROWS_WRITTEN: ffi::c_int = LIBSQL_STMTSTATUS_BASE + 2;
 
 pub struct sqlite3 {
     pub(crate) inner: Arc<Mutex<sqlite3Inner>>,
@@ -338,7 +369,13 @@ pub unsafe extern "C" fn sqlite3_open(
             Err(_) => return SQLITE_CANTOPEN,
         },
     };
-    match turso_core::Database::open_file(io.clone(), filename_str) {
+    match turso_core::Database::open_file_with_flags(
+        io.clone(),
+        filename_str,
+        turso_core::OpenFlags::default(),
+        default_db_opts(),
+        None,
+    ) {
         Ok(db) => {
             let conn = db.connect().unwrap();
             let filename = match filename_str {
@@ -507,7 +544,13 @@ pub unsafe extern "C" fn sqlite3_open_v2(
         }
     } else if use_memory {
         let io: Arc<dyn turso_core::IO> = Arc::new(turso_core::MemoryIO::new());
-        match turso_core::Database::open_file(io.clone(), ":memory:") {
+        match turso_core::Database::open_file_with_flags(
+            io.clone(),
+            ":memory:",
+            turso_core::OpenFlags::default(),
+            default_db_opts(),
+            None,
+        ) {
             Ok(db) => (io, db),
             Err(e) => {
                 trace!("error opening memory database: {e:?}");
@@ -519,7 +562,13 @@ pub unsafe extern "C" fn sqlite3_open_v2(
             Ok(io) => Arc::new(io),
             Err(_) => return SQLITE_CANTOPEN,
         };
-        match turso_core::Database::open_file(io.clone(), &effective_filename) {
+        match turso_core::Database::open_file_with_flags(
+            io.clone(),
+            &effective_filename,
+            turso_core::OpenFlags::default(),
+            default_db_opts(),
+            None,
+        ) {
             Ok(db) => (io, db),
             Err(e) => {
                 trace!("error opening database {effective_filename}: {e:?}");
@@ -594,12 +643,34 @@ pub unsafe extern "C" fn sqlite3_trace_v2(
 
 #[no_mangle]
 pub unsafe extern "C" fn sqlite3_progress_handler(
-    _db: *mut sqlite3,
-    _n: ffi::c_int,
-    _callback: Option<unsafe extern "C" fn() -> ffi::c_int>,
-    _context: *mut ffi::c_void,
-) -> ffi::c_int {
-    stub!();
+    db: *mut sqlite3,
+    n: ffi::c_int,
+    callback: Option<unsafe extern "C" fn(*mut ffi::c_void) -> ffi::c_int>,
+    context: *mut ffi::c_void,
+) {
+    if db.is_null() {
+        return;
+    }
+
+    let db_ref = &*db;
+    let inner = match db_ref.inner.lock() {
+        Ok(guard) => guard,
+        Err(_) => return,
+    };
+
+    match callback {
+        Some(c_callback) if n > 0 => {
+            let ctx = context as usize;
+            let cb = c_callback;
+            inner.conn.set_progress_handler(
+                n as u64,
+                Some(Box::new(move || unsafe {
+                    cb(ctx as *mut ffi::c_void) != 0
+                })),
+            );
+        }
+        _ => inner.conn.set_progress_handler(0, None),
+    }
 }
 
 /// Type for C busy handler callback function.
@@ -1156,13 +1227,54 @@ pub unsafe extern "C" fn sqlite3_changes(db: *mut sqlite3) -> ffi::c_int {
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn sqlite3_stmt_readonly(_stmt: *mut sqlite3_stmt) -> ffi::c_int {
-    stub!();
+pub unsafe extern "C" fn sqlite3_stmt_readonly(stmt: *mut sqlite3_stmt) -> ffi::c_int {
+    if stmt.is_null() {
+        return 1;
+    }
+    if (*stmt).stmt.get_program().is_readonly() {
+        1
+    } else {
+        0
+    }
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn sqlite3_stmt_busy(_stmt: *mut sqlite3_stmt) -> ffi::c_int {
     stub!();
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn sqlite3_stmt_status(
+    stmt: *mut sqlite3_stmt,
+    op: ffi::c_int,
+    reset_flg: ffi::c_int,
+) -> ffi::c_int {
+    if stmt.is_null() {
+        return 0;
+    }
+
+    let stmt = &mut *stmt;
+    let counter = match op {
+        SQLITE_STMTSTATUS_FULLSCAN_STEP => turso_core::StatementStatusCounter::FullscanStep,
+        SQLITE_STMTSTATUS_SORT => turso_core::StatementStatusCounter::Sort,
+        SQLITE_STMTSTATUS_VM_STEP => turso_core::StatementStatusCounter::VmStep,
+        SQLITE_STMTSTATUS_REPREPARE => turso_core::StatementStatusCounter::Reprepare,
+        LIBSQL_STMTSTATUS_ROWS_READ => turso_core::StatementStatusCounter::RowsRead,
+        LIBSQL_STMTSTATUS_ROWS_WRITTEN => turso_core::StatementStatusCounter::RowsWritten,
+        SQLITE_STMTSTATUS_AUTOINDEX
+        | SQLITE_STMTSTATUS_RUN
+        | SQLITE_STMTSTATUS_FILTER_MISS
+        | SQLITE_STMTSTATUS_FILTER_HIT
+        | SQLITE_STMTSTATUS_MEMUSED => return 0,
+        _ => return 0,
+    };
+
+    let value = stmt.stmt.stmt_status(counter);
+    if reset_flg != 0 {
+        stmt.stmt.reset_stmt_status(counter);
+    }
+
+    value.min(ffi::c_int::MAX as u64) as ffi::c_int
 }
 
 /// Iterate over all prepared statements in the database.
@@ -1235,8 +1347,16 @@ pub unsafe extern "C" fn sqlite3_last_insert_rowid(db: *mut sqlite3) -> ffi::c_i
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn sqlite3_interrupt(_db: *mut sqlite3) {
-    stub!();
+pub unsafe extern "C" fn sqlite3_interrupt(db: *mut sqlite3) {
+    if db.is_null() {
+        return;
+    }
+    let db_ref = &*db;
+    let inner = match db_ref.inner.lock() {
+        Ok(guard) => guard,
+        Err(_) => return,
+    };
+    inner.conn.interrupt();
 }
 
 #[no_mangle]
@@ -2868,4 +2988,112 @@ unsafe fn set_db_err(db: &mut sqlite3Inner, err: LimboError) -> i32 {
     db.p_err = CString::new(err_msg).unwrap().into_raw() as *mut ffi::c_void;
     db.err_code = code;
     code
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::ptr;
+
+    #[test]
+    fn test_sqlite3_stmt_status_rows_read_written() {
+        unsafe {
+            let mut db = ptr::null_mut();
+            assert_eq!(sqlite3_open(c":memory:".as_ptr(), &mut db), SQLITE_OK);
+
+            assert_eq!(
+                sqlite3_exec(
+                    db,
+                    c"CREATE TABLE t(x); INSERT INTO t VALUES (1), (2);".as_ptr(),
+                    None,
+                    ptr::null_mut(),
+                    ptr::null_mut(),
+                ),
+                SQLITE_OK
+            );
+
+            let mut insert_stmt = ptr::null_mut();
+            assert_eq!(
+                sqlite3_prepare_v2(
+                    db,
+                    c"INSERT INTO t VALUES (3)".as_ptr(),
+                    -1,
+                    &mut insert_stmt,
+                    ptr::null_mut(),
+                ),
+                SQLITE_OK
+            );
+            assert_eq!(sqlite3_step(insert_stmt), SQLITE_DONE);
+            assert_eq!(
+                sqlite3_stmt_status(insert_stmt, LIBSQL_STMTSTATUS_ROWS_WRITTEN, 0),
+                1
+            );
+            assert_eq!(
+                sqlite3_stmt_status(insert_stmt, LIBSQL_STMTSTATUS_ROWS_WRITTEN, 1),
+                1
+            );
+            assert_eq!(
+                sqlite3_stmt_status(insert_stmt, LIBSQL_STMTSTATUS_ROWS_WRITTEN, 0),
+                0
+            );
+            assert_eq!(sqlite3_finalize(insert_stmt), SQLITE_OK);
+
+            let mut select_stmt = ptr::null_mut();
+            assert_eq!(
+                sqlite3_prepare_v2(
+                    db,
+                    c"SELECT x FROM t ORDER BY x".as_ptr(),
+                    -1,
+                    &mut select_stmt,
+                    ptr::null_mut(),
+                ),
+                SQLITE_OK
+            );
+            while sqlite3_step(select_stmt) == SQLITE_ROW {}
+
+            let rows_read = sqlite3_stmt_status(select_stmt, LIBSQL_STMTSTATUS_ROWS_READ, 0);
+            assert!(
+                rows_read >= 3,
+                "expected at least 3 rows read, got {rows_read}"
+            );
+            let fullscan_steps =
+                sqlite3_stmt_status(select_stmt, SQLITE_STMTSTATUS_FULLSCAN_STEP, 0);
+            assert!(
+                fullscan_steps >= 2,
+                "expected fullscan steps for table iteration, got {fullscan_steps}"
+            );
+            assert_eq!(
+                sqlite3_stmt_status(select_stmt, LIBSQL_STMTSTATUS_ROWS_READ, 1),
+                rows_read
+            );
+            assert_eq!(
+                sqlite3_stmt_status(select_stmt, LIBSQL_STMTSTATUS_ROWS_READ, 0),
+                0
+            );
+            assert_eq!(
+                sqlite3_stmt_status(select_stmt, SQLITE_STMTSTATUS_AUTOINDEX, 0),
+                0
+            );
+            assert_eq!(
+                sqlite3_stmt_status(select_stmt, SQLITE_STMTSTATUS_RUN, 0),
+                0
+            );
+            assert_eq!(
+                sqlite3_stmt_status(select_stmt, SQLITE_STMTSTATUS_FILTER_HIT, 0),
+                0
+            );
+            assert_eq!(
+                sqlite3_stmt_status(select_stmt, SQLITE_STMTSTATUS_FILTER_MISS, 0),
+                0
+            );
+            assert_eq!(
+                sqlite3_stmt_status(select_stmt, SQLITE_STMTSTATUS_MEMUSED, 0),
+                0
+            );
+            assert_eq!(sqlite3_stmt_status(select_stmt, 9999, 0), 0);
+            assert_eq!(sqlite3_finalize(select_stmt), SQLITE_OK);
+
+            assert_eq!(sqlite3_close(db), SQLITE_OK);
+        }
+    }
 }

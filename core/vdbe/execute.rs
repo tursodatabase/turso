@@ -1,5 +1,6 @@
 use crate::error::SQLITE_CONSTRAINT_UNIQUE;
 use crate::function::AlterTableFunc;
+use crate::io::TempFile;
 use crate::mvcc::cursor::{MvccCursorType, NextRowidResult};
 use crate::mvcc::database::CheckpointStateMachine;
 use crate::mvcc::MvccClock;
@@ -72,7 +73,6 @@ use branches::{mark_unlikely, unlikely};
 use either::Either;
 use smallvec::SmallVec;
 use std::any::Any;
-use std::env::temp_dir;
 use std::str::FromStr;
 use std::{
     borrow::BorrowMut,
@@ -1299,7 +1299,7 @@ pub fn op_vfilter(
         state.pc = pc_if_empty.as_offset_int();
     } else {
         // VFilter positions to the first row if any exist, which counts as a read
-        state.metrics.rows_read = state.metrics.rows_read.saturating_add(1);
+        state.record_rows_read(1);
         state.pc += 1;
     }
     Ok(InsnFunctionStepResult::Step)
@@ -1400,6 +1400,7 @@ pub fn op_vupdate(
     };
     match result {
         Ok(Some(new_rowid)) => {
+            state.record_rows_written(1);
             if *conflict_action == 5 {
                 // ResolveType::Replace
                 program.connection.update_last_rowid(new_rowid);
@@ -1408,6 +1409,7 @@ pub fn op_vupdate(
         }
         Ok(None) => {
             // no-op or successful update without rowid return
+            state.record_rows_written(1);
             state.pc += 1;
         }
         Err(e) => {
@@ -1441,7 +1443,7 @@ pub fn op_vnext(
     };
     if has_more {
         // Increment metrics for row read from virtual table (including materialized views)
-        state.metrics.rows_read = state.metrics.rows_read.saturating_add(1);
+        state.record_rows_read(1);
         state.pc = pc_if_next.as_offset_int();
     } else {
         state.pc += 1;
@@ -1590,7 +1592,7 @@ pub fn op_rewind(
         state.pc = pc_if_empty.as_offset_int();
     } else {
         // Rewind positions to the first row, which is effectively a read
-        state.metrics.rows_read = state.metrics.rows_read.saturating_add(1);
+        state.record_rows_read(1);
         state.pc += 1;
     }
     Ok(InsnFunctionStepResult::Step)
@@ -1620,7 +1622,7 @@ pub fn op_last(
         state.pc = pc_if_empty.as_offset_int();
     } else {
         // Last positions to the last row, which is effectively a read
-        state.metrics.rows_read = state.metrics.rows_read.saturating_add(1);
+        state.record_rows_read(1);
         state.pc += 1;
     }
     Ok(InsnFunctionStepResult::Step)
@@ -2534,7 +2536,7 @@ pub fn op_next(
     };
     if !is_empty {
         // Increment metrics for row read
-        state.metrics.rows_read = state.metrics.rows_read.saturating_add(1);
+        state.record_rows_read(1);
         state.metrics.btree_next = state.metrics.btree_next.saturating_add(1);
         // Track if this is a full table scan or index scan
         if let Some((_, cursor_type)) = program.cursor_ref.get(*cursor_id) {
@@ -2581,7 +2583,7 @@ pub fn op_prev(
     };
     if !is_empty {
         // Increment metrics for row read
-        state.metrics.rows_read = state.metrics.rows_read.saturating_add(1);
+        state.record_rows_read(1);
         state.metrics.btree_prev = state.metrics.btree_prev.saturating_add(1);
         // Track if this is a full table scan or index scan
         if let Some((_, cursor_type)) = program.cursor_ref.get(*cursor_id) {
@@ -3759,7 +3761,7 @@ pub fn op_program(
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(
         Program {
-            params,
+            param_registers,
             program: subprogram,
             ignore_jump_target,
         },
@@ -3768,13 +3770,24 @@ pub fn op_program(
     loop {
         match &mut state.op_program_state {
             OpProgramState::Start => {
-                let mut statement = Statement::new(
-                    Program::from_prepared(subprogram.clone(), program.connection.clone()),
-                    pager.clone(),
-                    QueryMode::Normal,
-                    0,
-                );
-                statement.reset()?;
+                // Try to reuse a cached statement for this PC, otherwise create a new one.
+                // When we have triggers or fk-actions with multi-row inserts, we can re-use
+                // cached statements by storing them key'd by the state.pc if we are in a loop
+                let pc_key = state.pc as usize;
+                let mut statement =
+                    if let Some(mut cached) = state.subprogram_stmt_cache.remove(&pc_key) {
+                        cached.reset_for_subprogram_reuse();
+                        cached
+                    } else {
+                        Box::new(Statement::new_with_origin(
+                            Program::from_prepared(subprogram.clone(), program.connection.clone()),
+                            pager.clone(),
+                            QueryMode::Normal,
+                            0,
+                            crate::statement::StatementOrigin::Subprogram,
+                            false,
+                        ))
+                    };
 
                 // Check if this is a trigger subprogram - if so, track execution
                 // and save last_insert_rowid so it can be restored after the trigger finishes.
@@ -3786,34 +3799,17 @@ pub fn op_program(
                         (false, None)
                     };
 
-                // Extract register values from params (which contain register indices encoded as negative integers)
-                // and bind them to the subprogram's parameters
-                for (param_idx, param_value) in params.iter().enumerate() {
-                    if let Value::Numeric(Numeric::Integer(reg_idx)) = param_value {
-                        let reg_idx = *reg_idx as usize;
-                        if reg_idx < state.registers.len() {
-                            let value = state.registers[reg_idx].get_value().clone();
-                            let param_index = NonZero::<usize>::new(param_idx + 1)
-                                .expect("param_idx + 1 should be non-zero");
-                            statement.bind_at(param_index, value);
-                        } else {
-                            crate::bail_corrupt_error!(
-                                "Register index {} out of bounds (len={})",
-                                reg_idx,
-                                state.registers.len()
-                            );
-                        }
-                    } else {
-                        crate::bail_parse_error!(
-                            "Subprogram parameters should be integers, got {:?}",
-                            param_value
-                        );
-                    }
+                // Copy parameter values from parent registers into the subprogram's parameters.
+                for (param_idx, &parent_reg) in param_registers.iter().enumerate() {
+                    let value = state.registers[parent_reg].get_value().clone();
+                    let param_index = NonZero::<usize>::new(param_idx + 1)
+                        .expect("param_idx + 1 should be non-zero");
+                    statement.bind_at(param_index, value);
                 }
 
                 state.op_program_state = OpProgramState::Step {
                     is_trigger,
-                    statement: Box::new(statement),
+                    statement,
                     saved_last_insert_rowid,
                 };
             }
@@ -3830,7 +3826,7 @@ pub fn op_program(
                 // so we must not call it again after the loop.
                 let mut subprogram_aborted = false;
                 loop {
-                    let res = statement.step();
+                    let res = statement.step_subprogram();
                     match res {
                         Ok(step_result) => match step_result {
                             StepResult::Done => break,
@@ -3862,7 +3858,6 @@ pub fn op_program(
                         }
                     }
                 }
-
                 // Only end trigger execution for normal completion. Error paths
                 // already called end_trigger_execution() via abort() in the subprogram.
                 if is_trigger && !subprogram_aborted {
@@ -3875,7 +3870,17 @@ pub fn op_program(
                     program.connection.update_last_rowid(rowid);
                 }
 
-                state.op_program_state = OpProgramState::Start;
+                // Cache the statement for reuse on subsequent fires of this
+                // same Program instruction (e.g. next row in an INSERT loop).
+                // Only cache on clean completion - aborted statements have dirty
+                // internal state and cannot be safely reused.
+                let pc_key = state.pc as usize;
+                let prev = std::mem::replace(&mut state.op_program_state, OpProgramState::Start);
+                if !subprogram_aborted {
+                    if let OpProgramState::Step { statement, .. } = prev {
+                        state.subprogram_stmt_cache.insert(pc_key, statement);
+                    }
+                }
                 if raise_ignore {
                     // RAISE(IGNORE) — skip the current row by jumping to ignore_jump_target
                     state.pc = ignore_jump_target.as_offset_int();
@@ -6486,6 +6491,7 @@ pub fn op_function(
             | ScalarFunc::Typeof
             | ScalarFunc::Unicode
             | ScalarFunc::Unistr
+            | ScalarFunc::UnistrQuote
             | ScalarFunc::Quote
             | ScalarFunc::RandomBlob
             | ScalarFunc::Sign
@@ -6503,6 +6509,7 @@ pub fn op_function(
                     ScalarFunc::Unicode => Some(reg_value.exec_unicode()),
                     ScalarFunc::Unistr => Some(reg_value.exec_unistr()?),
                     ScalarFunc::Quote => Some(reg_value.exec_quote()),
+                    ScalarFunc::UnistrQuote => Some(reg_value.exec_unistr_quote()),
                     ScalarFunc::RandomBlob => {
                         Some(reg_value.exec_randomblob(|dest| pager.io.fill_bytes(dest))?)
                     }
@@ -8570,7 +8577,7 @@ pub fn op_insert(
                     let cursor = get_cursor!(state, *cursor_id);
                     let cursor = cursor.as_btree_mut();
                     return_if_io!(cursor.insert(&BTreeKey::new_table_rowid(key, Some(&record))));
-                    state.metrics.rows_written = state.metrics.rows_written.saturating_add(1);
+                    state.record_rows_written(1);
                 }
                 // Only update last_insert_rowid for regular table inserts, not schema modifications
                 let root_page = {
@@ -8780,7 +8787,7 @@ pub fn op_delete(
                     return_if_io!(cursor.delete());
                 }
                 // Increment metrics for row write (DELETE is a write operation)
-                state.metrics.rows_written = state.metrics.rows_written.saturating_add(1);
+                state.record_rows_written(1);
                 let schema = program.connection.schema.read();
                 let dependent_views = schema.get_dependent_materialized_views(table_name);
                 if dependent_views.is_empty() {
@@ -8844,6 +8851,7 @@ pub fn op_idx_delete(
 
     if let Some(Cursor::IndexMethod(cursor)) = &mut state.cursors[*cursor_id] {
         return_if_io!(cursor.delete(&state.registers[*start_reg..*start_reg + *num_regs]));
+        state.record_rows_written(1);
         state.pc += 1;
         return Ok(InsnFunctionStepResult::Step);
     }
@@ -8919,7 +8927,7 @@ pub fn op_idx_delete(
                     return_if_io!(cursor.delete());
                 }
                 // Increment metrics for index write (delete is a write operation)
-                state.metrics.rows_written = state.metrics.rows_written.saturating_add(1);
+                state.record_rows_written(1);
                 state.pc += 1;
                 state.op_idx_delete_state = None;
                 return Ok(InsnFunctionStepResult::Step);
@@ -8971,6 +8979,7 @@ pub fn op_idx_insert(
             ));
         };
         return_if_io!(cursor.insert(&state.registers[start..start + count as usize]));
+        state.record_rows_written(1);
         state.pc += 1;
         return Ok(InsnFunctionStepResult::Step);
     }
@@ -9082,9 +9091,8 @@ pub fn op_idx_insert(
                 let cursor = cursor.as_btree_mut();
                 return_if_io!(cursor.insert(&BTreeKey::new_index_key(record_to_insert)));
             }
-            // Increment metrics for index write
             if flags.has(IdxInsertFlags::NCHANGE) {
-                state.metrics.rows_written = state.metrics.rows_written.saturating_add(1);
+                state.record_rows_written(1);
             }
             state.op_idx_insert_state = OpIdxInsertState::MaybeSeek;
             state.pc += 1;
@@ -10129,6 +10137,7 @@ pub fn op_close(
     if let Some(deferred_seek) = state.deferred_seeks.get_mut(*cursor_id) {
         deferred_seek.take();
     }
+    state.ephemeral_temp_files.remove(cursor_id);
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
 }
@@ -10243,7 +10252,7 @@ pub fn op_parse_schema(
     } else {
         format!("SELECT * FROM {schema_table}")
     };
-    let mut stmt = conn.prepare(sql)?;
+    let mut stmt = conn.prepare_internal(sql)?;
 
     // Get a mutable schema clone *without* holding the schema lock during
     // nested statement execution.  The nested Statement may call reprepare()
@@ -10280,8 +10289,6 @@ pub fn op_parse_schema(
     // Set up MVCC transaction for the nested statement
     let mv_tx = program.connection.get_mv_tx();
     stmt.set_mv_tx(mv_tx);
-
-    conn.start_nested();
 
     // Store state for resumption across IO boundaries
     state.op_parse_schema_state = Some(Box::new(OpParseSchemaInner {
@@ -10347,59 +10354,76 @@ fn op_parse_schema_step(
             }
             StepResult::Done => {
                 // Take the state to finalize
-                let inner = state
+                let OpParseSchemaInner {
+                    stmt,
+                    mut schema_arc,
+                    from_sql_indexes,
+                    automatic_indices,
+                    dbsp_state_roots,
+                    dbsp_state_index_roots,
+                    materialized_view_info,
+                    db,
+                    previous_auto_commit,
+                } = *state
                     .op_parse_schema_state
                     .take()
                     .expect("parse schema state should exist");
-                let mut schema_arc = inner.schema_arc;
                 let schema = Arc::make_mut(&mut schema_arc);
-                let mv_store = inner.stmt.mv_store();
+                let mv_store = stmt.mv_store();
                 let syms = conn.syms.read();
 
                 let res1 = schema.populate_indices(
                     &syms,
-                    inner.from_sql_indexes,
-                    inner.automatic_indices,
+                    from_sql_indexes,
+                    automatic_indices,
                     mv_store.is_some(),
                 );
                 let res2 = schema.populate_materialized_views(
-                    inner.materialized_view_info,
-                    inner.dbsp_state_roots,
-                    inner.dbsp_state_index_roots,
+                    materialized_view_info,
+                    dbsp_state_roots,
+                    dbsp_state_index_roots,
                 );
 
                 // Store the modified schema back
-                if crate::is_attached_db(inner.db) {
-                    conn.database_schemas().write().insert(inner.db, schema_arc);
+                if crate::is_attached_db(db) {
+                    conn.database_schemas().write().insert(db, schema_arc);
                 } else {
                     *conn.schema.write() = schema_arc;
                 }
-                conn.end_nested();
+                drop(stmt);
                 conn.auto_commit
-                    .store(inner.previous_auto_commit, Ordering::SeqCst);
+                    .store(previous_auto_commit, Ordering::SeqCst);
                 let _ = (res1?, res2?);
 
                 state.pc += 1;
                 return Ok(InsnFunctionStepResult::Step);
             }
             StepResult::Interrupt => {
-                let inner = state
+                let OpParseSchemaInner {
+                    stmt,
+                    previous_auto_commit,
+                    ..
+                } = *state
                     .op_parse_schema_state
                     .take()
                     .expect("parse schema state should exist");
-                conn.end_nested();
+                drop(stmt);
                 conn.auto_commit
-                    .store(inner.previous_auto_commit, Ordering::SeqCst);
+                    .store(previous_auto_commit, Ordering::SeqCst);
                 return Err(LimboError::Interrupt);
             }
             StepResult::Busy => {
-                let inner = state
+                let OpParseSchemaInner {
+                    stmt,
+                    previous_auto_commit,
+                    ..
+                } = *state
                     .op_parse_schema_state
                     .take()
                     .expect("parse schema state should exist");
-                conn.end_nested();
+                drop(stmt);
                 conn.auto_commit
-                    .store(inner.previous_auto_commit, Ordering::SeqCst);
+                    .store(previous_auto_commit, Ordering::SeqCst);
                 return Err(LimboError::Busy);
             }
         }
@@ -10447,8 +10471,7 @@ pub fn op_init_cdc_version(
     // Step 0: Check if the CDC table already exists but has no version row.
     // If so, it's a legacy v1 table that pre-dates version tracking.
     let cdc_table_exists = {
-        conn.start_nested();
-        let mut stmt = conn.prepare(format!(
+        let mut stmt = conn.prepare_internal(format!(
             "SELECT 1 FROM sqlite_schema WHERE type='table' AND name='{escaped_cdc_table_name}'",
         ))?;
         stmt.program
@@ -10456,13 +10479,11 @@ pub fn op_init_cdc_version(
             .needs_stmt_subtransactions
             .store(false, Ordering::Relaxed);
         let rows = stmt.run_collect_rows();
-        conn.end_nested();
         !rows?.is_empty()
     };
 
     // Step 1: Create CDC table if needed
     {
-        conn.start_nested();
         let create_sql = match version {
             CdcVersion::V1 => format!(
                 "CREATE TABLE IF NOT EXISTS {cdc_table_name} (change_id INTEGER PRIMARY KEY AUTOINCREMENT, change_time INTEGER, change_type INTEGER, table_name TEXT, id, before BLOB, after BLOB, updates BLOB)",
@@ -10471,29 +10492,24 @@ pub fn op_init_cdc_version(
                 "CREATE TABLE IF NOT EXISTS {cdc_table_name} (change_id INTEGER PRIMARY KEY AUTOINCREMENT, change_time INTEGER, change_txn_id INTEGER, change_type INTEGER, table_name TEXT, id, before BLOB, after BLOB, updates BLOB)",
             ),
         };
-        let mut stmt = conn.prepare(create_sql)?;
+        let mut stmt = conn.prepare_internal(create_sql)?;
         stmt.program
             .prepared
             .needs_stmt_subtransactions
             .store(false, Ordering::Relaxed);
-        let res = stmt.run_ignore_rows();
-        conn.end_nested();
-        res?;
+        stmt.run_ignore_rows()?;
     }
 
     // Step 2: Create version table if needed
     {
-        conn.start_nested();
-        let mut stmt = conn.prepare(format!(
+        let mut stmt = conn.prepare_internal(format!(
             "CREATE TABLE IF NOT EXISTS {TURSO_CDC_VERSION_TABLE_NAME} (table_name TEXT PRIMARY KEY, version TEXT NOT NULL)",
         ))?;
         stmt.program
             .prepared
             .needs_stmt_subtransactions
             .store(false, Ordering::Relaxed);
-        let res = stmt.run_ignore_rows();
-        conn.end_nested();
-        res?;
+        stmt.run_ignore_rows()?;
     }
 
     // Step 3: Insert version row only if one doesn't already exist.
@@ -10504,24 +10520,20 @@ pub fn op_init_cdc_version(
         *version
     };
     {
-        conn.start_nested();
-        let mut stmt = conn.prepare(format!(
+        let mut stmt = conn.prepare_internal(format!(
             "INSERT OR IGNORE INTO {TURSO_CDC_VERSION_TABLE_NAME} (table_name, version) VALUES ('{escaped_cdc_table_name}', '{version_to_insert}')",
         ))?;
         stmt.program
             .prepared
             .needs_stmt_subtransactions
             .store(false, Ordering::Relaxed);
-        let res = stmt.run_ignore_rows();
-        conn.end_nested();
-        res?;
+        stmt.run_ignore_rows()?;
     }
 
     // Step 4: Read back the actual version from the table (may differ from
     // `version` if the row already existed with an older version).
     let actual_version = {
-        conn.start_nested();
-        let mut stmt = conn.prepare(format!(
+        let mut stmt = conn.prepare_internal(format!(
             "SELECT version FROM {TURSO_CDC_VERSION_TABLE_NAME} WHERE table_name = '{escaped_cdc_table_name}'",
         ))?;
         stmt.program
@@ -10529,7 +10541,6 @@ pub fn op_init_cdc_version(
             .needs_stmt_subtransactions
             .store(false, Ordering::Relaxed);
         let rows = stmt.run_collect_rows();
-        conn.end_nested();
         let rows = rows?;
         match rows.first().and_then(|r| r.first()) {
             Some(crate::Value::Text(text)) => text.to_string().parse::<CdcVersion>()?,
@@ -10949,14 +10960,17 @@ pub enum OpOpenEphemeralState {
     // Slow path states for creating new ephemeral cursor
     StartingTxn {
         pager: Arc<Pager>,
+        temp_file: Option<TempFile>,
     },
     CreateBtree {
         pager: Arc<Pager>,
+        temp_file: Option<TempFile>,
     },
     // clippy complains this variant is too big when compared to the rest of the variants
     // so it says we need to box it here
     Rewind {
         cursor: Box<dyn CursorTrait>,
+        temp_file: Option<TempFile>,
     },
 }
 pub fn op_open_ephemeral(
@@ -10995,44 +11009,11 @@ pub fn op_open_ephemeral(
             ));
             let conn = program.connection.clone();
             let io = conn.pager.load().io.clone();
-            let rand_num = io.generate_random_number();
-            let db_file: Arc<dyn DatabaseStorage>;
-            let db_file_io: Arc<dyn crate::IO>;
-
-            // we support OPFS in WASM - but it require files to be pre-opened in the browser before use
-            // we can fix this if we will make open_file interface async
-            // but for now for simplicity we use MemoryIO for all intermediate calculations
-            #[cfg(target_family = "wasm")]
-            {
-                use crate::MemoryIO;
-
-                db_file_io = Arc::new(MemoryIO::new());
-                let file = db_file_io.open_file("temp-file", OpenFlags::Create, false)?;
-                db_file = Arc::new(DatabaseFile::new(file));
-            }
-            #[cfg(not(target_family = "wasm"))]
-            {
-                let temp_store = conn.get_temp_store();
-                if matches!(temp_store, crate::TempStore::Memory) {
-                    // When temp_store=memory, use in-memory storage for ephemeral tables
-                    use crate::MemoryIO;
-                    db_file_io = Arc::new(MemoryIO::new());
-                    let file = db_file_io.open_file("temp-file", OpenFlags::Create, false)?;
-                    db_file = Arc::new(DatabaseFile::new(file));
-                } else {
-                    let temp_dir = temp_dir();
-                    let rand_path = std::path::Path::new(&temp_dir)
-                        .join(format!("tursodb-ephemeral-{rand_num}"));
-                    let Some(rand_path_str) = rand_path.to_str() else {
-                        return Err(LimboError::InternalError(
-                            "Failed to convert path to string".to_string(),
-                        ));
-                    };
-                    let file = io.open_file(rand_path_str, OpenFlags::Create, false)?;
-                    db_file = Arc::new(DatabaseFile::new(file));
-                    db_file_io = io;
-                }
-            }
+            let temp_store = conn.get_temp_store();
+            let temp_file = TempFile::with_temp_store(&io, temp_store)?;
+            let db_file: Arc<dyn DatabaseStorage> =
+                Arc::new(DatabaseFile::new(temp_file.file.clone()));
+            let db_file_io: Arc<dyn crate::IO> = io;
 
             let buffer_pool = program.connection.db.buffer_pool.clone();
 
@@ -11052,7 +11033,10 @@ pub fn op_open_ephemeral(
 
             pager.set_page_size(page_size);
 
-            state.op_open_ephemeral_state = OpOpenEphemeralState::StartingTxn { pager };
+            state.op_open_ephemeral_state = OpOpenEphemeralState::StartingTxn {
+                pager,
+                temp_file: Some(temp_file),
+            };
         }
         OpOpenEphemeralState::ClearExisting => {
             tracing::trace!("ClearExisting");
@@ -11083,7 +11067,7 @@ pub fn op_open_ephemeral(
             state.pc += 1;
             state.op_open_ephemeral_state = OpOpenEphemeralState::Start;
         }
-        OpOpenEphemeralState::StartingTxn { pager } => {
+        OpOpenEphemeralState::StartingTxn { pager, temp_file } => {
             tracing::trace!("StartingTxn");
             pager
                 .begin_read_tx() // we have to begin a read tx before beginning a write
@@ -11091,9 +11075,10 @@ pub fn op_open_ephemeral(
             return_if_io!(pager.begin_write_tx());
             state.op_open_ephemeral_state = OpOpenEphemeralState::CreateBtree {
                 pager: pager.clone(),
+                temp_file: temp_file.take(),
             };
         }
-        OpOpenEphemeralState::CreateBtree { pager } => {
+        OpOpenEphemeralState::CreateBtree { pager, temp_file } => {
             tracing::trace!("CreateBtree");
             // FIXME: handle page cache is full
             let flag = if is_table {
@@ -11121,9 +11106,13 @@ pub fn op_open_ephemeral(
             };
             state.op_open_ephemeral_state = OpOpenEphemeralState::Rewind {
                 cursor: Box::new(cursor),
+                temp_file: temp_file.take(),
             };
         }
-        OpOpenEphemeralState::Rewind { cursor } => {
+        OpOpenEphemeralState::Rewind {
+            cursor,
+            temp_file: _,
+        } => {
             return_if_io!(cursor.rewind());
 
             let cursors = &mut state.cursors;
@@ -11133,11 +11122,14 @@ pub fn op_open_ephemeral(
                 .get(cursor_id)
                 .expect("cursor_id should exist in cursor_ref");
 
-            let OpOpenEphemeralState::Rewind { cursor } =
+            let OpOpenEphemeralState::Rewind { cursor, temp_file } =
                 std::mem::take(&mut state.op_open_ephemeral_state)
             else {
                 unreachable!()
             };
+
+            let tf = temp_file.expect("temp_file must be present in Rewind state");
+            state.ephemeral_temp_files.insert(cursor_id, tf);
 
             // Table content is erased if the cursor already exists
             match cursor_type {
@@ -11406,7 +11398,7 @@ pub fn op_count(
     // For optimized COUNT(*) queries, the count represents rows that would be read
     // SQLite tracks this differently (as pages read), but for consistency we track as rows
     if *exact {
-        state.metrics.rows_read = state.metrics.rows_read.saturating_add(count as u64);
+        state.record_rows_read(count as u64);
     }
 
     state.pc += 1;
@@ -12510,7 +12502,7 @@ pub fn op_hash_build(
     }
 
     state.op_hash_build_state = None;
-    state.metrics.rows_read = state.metrics.rows_read.saturating_add(1);
+    state.record_rows_read(1);
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
 }
@@ -13560,13 +13552,13 @@ fn op_journal_mode_inner(
                         ));
                     }
                     let db_path = program.connection.get_database_canonical_path();
-                    // todo(v): pass required encryption ctx to enable encryption with mvcc
+                    let enc_ctx = pager.io_ctx.read().encryption_context().cloned();
                     let mv_store = journal_mode::open_mv_store(
                         pager.io.clone(),
                         &db_path,
                         program.connection.db.open_flags,
                         program.connection.db.durable_storage.clone(),
-                        None,
+                        enc_ctx,
                     )?;
                     program.connection.db.mv_store.store(Some(mv_store.clone()));
                     program.connection.demote_to_mvcc_connection();
@@ -13827,6 +13819,19 @@ fn op_vacuum_into_inner(
                 if !program.connection.auto_commit.load(Ordering::SeqCst) {
                     return Err(LimboError::TxError(
                         "cannot VACUUM INTO from within a transaction".to_string(),
+                    ));
+                }
+                if program
+                    .connection
+                    .n_active_root_statements
+                    .load(Ordering::SeqCst)
+                    != 1
+                {
+                    // This VACUUM INTO statement itself is the one active root
+                    // statement. Any count other than 1 means some other
+                    // top-level statement on the same connection is still active.
+                    return Err(LimboError::TxError(
+                        "cannot VACUUM - SQL statements in progress".to_string(),
                     ));
                 }
 

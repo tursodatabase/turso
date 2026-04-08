@@ -1,4 +1,5 @@
 use crate::schema::{ColumnLayout, GeneratedType};
+use crate::translate::optimizer::Optimizable;
 use crate::turso_debug_assert;
 use crate::{
     error::{SQLITE_CONSTRAINT_NOTNULL, SQLITE_CONSTRAINT_PRIMARYKEY, SQLITE_CONSTRAINT_UNIQUE},
@@ -458,6 +459,30 @@ pub fn translate_insert(
         init_autoincrement(program, &mut ctx, resolver)?;
     }
 
+    // For non-STRICT tables, apply column affinity to the values early.
+    // This must happen before BEFORE triggers (matching SQLite's order) so that
+    // trigger bodies see affinity-applied values. Affinity is idempotent, so
+    // applying it here means we can skip the per-trigger Copy+Affinity in fire_trigger.
+    if !ctx.table.is_strict {
+        let affinity = insertion
+            .col_mappings
+            .iter()
+            .filter(|cm| !cm.column.is_virtual_generated())
+            .map(|col_mapping| col_mapping.column.affinity());
+
+        // Only emit Affinity if there's meaningful affinity to apply
+        // (i.e., not all BLOB/NONE affinity)
+        if affinity.clone().any(|a| a != Affinity::Blob) {
+            if let Ok(count) = NonZeroUsize::try_from(insertion.num_non_virtual_cols) {
+                program.emit_insn(Insn::Affinity {
+                    start_reg: insertion.first_col_register(),
+                    count,
+                    affinities: affinity.map(|a| a.aff_mask()).collect(),
+                });
+            }
+        }
+    }
+
     // Fire BEFORE INSERT triggers
 
     let relevant_before_triggers: Vec<_> = resolver.with_schema(database_id, |s| {
@@ -627,29 +652,8 @@ pub fn translate_insert(
             check_generated: true,
             table_reference: BTreeTable::type_check_table_ref(ctx.table, resolver.schema()),
         });
-    } else {
-        // For non-STRICT tables, apply column affinity to the values.
-        // This must happen early so that both index records and the table record
-        // use the converted values. SQLite does this with OP_Affinity before
-        // any index or constraint checks.
-        let affinity = insertion
-            .col_mappings
-            .iter()
-            .filter(|cm| !cm.column.is_virtual_generated())
-            .map(|col_mapping| col_mapping.column.affinity());
-
-        // Only emit Affinity if there's meaningful affinity to apply
-        // (i.e., not all BLOB/NONE affinity)
-        if affinity.clone().any(|a| a != Affinity::Blob) {
-            if let Ok(count) = NonZeroUsize::try_from(insertion.num_non_virtual_cols) {
-                program.emit_insn(Insn::Affinity {
-                    start_reg: insertion.first_col_register(),
-                    count,
-                    affinities: affinity.map(|a| a.aff_mask()).collect(),
-                });
-            }
-        }
     }
+    // Non-STRICT tables: Affinity was already emitted earlier (before BEFORE triggers).
 
     // For AUTOINCREMENT tables with an explicit rowid, update sqlite_sequence
     // before CHECK constraints. SQLite updates sqlite_sequence even when
@@ -1859,13 +1863,12 @@ fn bind_insert(
                             for expr in values_expr.iter_mut().flat_map(|v| v.iter_mut()) {
                                 match expr.as_mut() {
                                     Expr::Id(name) => {
-                                        if name.quoted_with('"') {
+                                        if name.quoted_with('"') && resolver.dqs_dml.is_enabled() {
                                             *expr = Expr::Literal(ast::Literal::String(
                                                 name.as_literal(),
                                             ))
                                             .into();
                                         } else {
-                                            // an INSERT INTO ... VALUES (...) cannot reference columns
                                             crate::bail_parse_error!("no such column: {name}");
                                         }
                                     }
@@ -1985,7 +1988,8 @@ fn init_source_emission<'a>(
         // If we had a single tuple in VALUES, it was inserted into the values vector parameter.
         if values.len() != required_column_count {
             crate::bail_parse_error!(
-                "{} values for {required_column_count} columns",
+                "table {} has {required_column_count} columns but {} values were supplied",
+                table.get_name(),
                 values.len()
             );
         }
@@ -2032,7 +2036,8 @@ fn init_source_emission<'a>(
                 })?;
                 if num_result_cols != required_column_count {
                     crate::bail_parse_error!(
-                        "{} values for {required_column_count} columns",
+                        "table {} has {required_column_count} columns but {} values were supplied",
+                        table.get_name(),
                         num_result_cols,
                     );
                 }
@@ -2620,6 +2625,14 @@ fn translate_column(
         program.emit_insn(Insn::SoftNull {
             reg: column_register,
         });
+    } else if matches!(
+        column.generated_type(),
+        GeneratedType::Virtual { resolved, .. } if resolved.is_constant(resolver)
+    ) {
+        // Constant virtual generated columns are hoisted to the program init
+        // section by translate_expr in compute_virtual_columns. Emitting NULL
+        // here would clobber the hoisted value before constraint checks
+        // (e.g. NOT NULL) and triggers read it.
     } else if column.hidden() || column.is_virtual_generated() {
         // Emit NULL for not-explicitly-mentioned hidden or virtual columns, even ignoring DEFAULT.
         program.emit_insn(Insn::Null {

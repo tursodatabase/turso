@@ -28,7 +28,7 @@ info:
 ---
 QUERY PLAN
 `--SCAN window_subquery_0
-   |--SCAN subquery_0
+   |--SCAN (subquery-0)
    |  `--SCAN window_subquery_0
    |     `--SCAN employees USING INDEX idx_employees_department
    `--USE SORTER FOR ORDER BY

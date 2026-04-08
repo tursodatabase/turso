@@ -39,6 +39,7 @@ mod json;
 mod numeric;
 mod parameters;
 mod pragma;
+mod progress;
 mod pseudo;
 mod regexp;
 #[cfg(feature = "series")]
@@ -63,6 +64,7 @@ use crate::{
     busy::{BusyHandler, BusyHandlerCallback},
     incremental::view::AllViewsTxState,
     index_method::IndexMethod,
+    progress::ProgressHandler,
     schema::Trigger,
     stats::refresh_analyze_stats,
     storage::{
@@ -120,7 +122,7 @@ pub use io::{
     SyscallIO, WriteCompletion, IO,
 };
 pub use numeric::{nonnan::NonNan, Numeric};
-pub use statement::Statement;
+pub use statement::{Statement, StatementStatusCounter};
 pub use storage::{
     buffer_pool::BufferPool,
     database::{DatabaseStorage, IOContext},
@@ -310,11 +312,8 @@ pub struct OpenDbAsyncState {
     make_from_btree_state: schema::MakeFromBtreeState,
     /// Schema lock held during LoadingSchema phase to ensure atomicity across IO yields
     schema_guard: Option<sync::ArcMutexGuard<Arc<Schema>>>,
-    /// Registry lock held during open_with_flags_async to prevent concurrent opens
-    registry_guard:
-        Option<parking_lot::ArcMutexGuard<parking_lot::RawMutex, HashMap<String, Weak<Database>>>>,
-    /// Canonical path for registry insertion (computed once at start)
-    canonical_path: Option<String>,
+    /// Registry key for insertion (computed once at start)
+    registry_key: Option<DatabaseKey>,
 }
 
 impl Default for OpenDbAsyncState {
@@ -333,10 +332,18 @@ impl OpenDbAsyncState {
             encryption_key: None,
             make_from_btree_state: schema::MakeFromBtreeState::new(),
             schema_guard: None,
-            registry_guard: None,
-            canonical_path: None,
+            registry_key: None,
         }
     }
+}
+
+/// Per-path entry in the database registry.
+enum RegistryEntry {
+    /// Another caller is currently opening this database. Callers that see
+    /// this should yield and retry later.
+    Opening,
+    /// The database has been opened and is (or was) live.
+    Ready(Weak<Database>),
 }
 
 /// The database manager ensures that there is a single, shared
@@ -349,8 +356,23 @@ impl OpenDbAsyncState {
 /// state between iterations, but static variables persist - using shuttle's
 /// Mutex here would cause panics when the second iteration tries to lock a
 /// mutex that belongs to a stale execution context.
+/// Registry key for the process-wide database manager.
+/// File-backed databases are keyed by their OS-level identity (dev, ino),
+/// matching SQLite's inodeList approach. Shared in-memory databases use
+/// their name as the key.
+///
+/// IMPORTANT: The mutex must only be held for brief HashMap operations, never
+/// across I/O yields. Holding it across yields deadlocks single-threaded
+/// event loops because the blocked thread
+/// can never resume the coroutine that owns the lock.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum DatabaseKey {
+    File(io::FileId),
+    SharedMemory(String),
+}
+
 #[allow(clippy::type_complexity)]
-static DATABASE_MANAGER: LazyLock<Arc<parking_lot::Mutex<HashMap<String, Weak<Database>>>>> =
+static DATABASE_MANAGER: LazyLock<Arc<parking_lot::Mutex<HashMap<DatabaseKey, RegistryEntry>>>> =
     LazyLock::new(|| Arc::new(parking_lot::Mutex::new(HashMap::default())));
 
 /// The `Database` object contains per database file state that is shared
@@ -458,6 +480,8 @@ impl Database {
         db_file: Arc<dyn DatabaseStorage>,
         encryption_opts: Option<EncryptionOpts>,
     ) -> Result<Self> {
+        let path = path.into();
+        let wal_path = wal_path.into();
         let shared_wal = WalFileShared::new_noop();
         let mv_store = ArcSwapOption::empty();
 
@@ -485,11 +509,10 @@ impl Database {
             None
         };
 
-        // opts is now passed as parameter
         let db = Database {
             mv_store,
-            path: path.into(),
-            wal_path: wal_path.into(),
+            path,
+            wal_path,
             schema: Arc::new(Mutex::new(Arc::new({
                 let mut s = Schema::with_options(opts.enable_custom_types);
                 s.generated_columns_enabled = opts.enable_generated_columns;
@@ -530,27 +553,31 @@ impl Database {
     /// matching SQLite's `file:name?mode=memory&cache=shared` semantics.
     #[cfg(feature = "fs")]
     pub fn open_shared_memory(name: &str) -> Result<Arc<Database>> {
-        let registry_key = format!(":memory:shared:{name}");
+        let key = DatabaseKey::SharedMemory(name.to_string());
 
         {
-            let registry = DATABASE_MANAGER.lock_arc();
-            if let Some(db) = registry.get(&registry_key).and_then(Weak::upgrade) {
-                return Ok(db);
+            let registry = DATABASE_MANAGER.lock();
+            if let Some(RegistryEntry::Ready(weak)) = registry.get(&key) {
+                if let Some(db) = weak.upgrade() {
+                    return Ok(db);
+                }
             }
         }
         // `:memory:` paths bypass DATABASE_MANAGER internally, so no deadlock.
         let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
         let db = Self::open_file(io, ":memory:")?;
 
-        let mut registry = DATABASE_MANAGER.lock_arc();
-        if let Some(existing) = registry.get(&registry_key).and_then(Weak::upgrade) {
-            return Ok(existing);
+        let mut registry = DATABASE_MANAGER.lock();
+        if let Some(RegistryEntry::Ready(weak)) = registry.get(&key) {
+            if let Some(existing) = weak.upgrade() {
+                return Ok(existing);
+            }
         }
-        registry.insert(registry_key, Arc::downgrade(&db));
+        registry.insert(key, RegistryEntry::Ready(Arc::downgrade(&db)));
         Ok(db)
     }
 
-    /// Look up a database in the process-wide registry by path.
+    /// Look up a database in the process-wide registry by file identity.
     /// Returns the cached Database if found, with encryption validation.
     /// This avoids opening a file (and acquiring a file lock) when the
     /// database is already open in this process.
@@ -561,17 +588,18 @@ impl Database {
         if path.starts_with(":memory:") {
             return Ok(None);
         }
-        let canonical = match std::fs::canonicalize(path)
-            .ok()
-            .and_then(|p| p.to_str().map(|s| s.to_string()))
-        {
-            Some(c) => c,
-            None => return Ok(None),
+        let file_id = match io::get_file_id(path) {
+            Ok(id) => id,
+            Err(_) => return Ok(None), // file doesn't exist yet
         };
-        let registry = DATABASE_MANAGER.lock_arc();
-        let db = match registry.get(&canonical).and_then(Weak::upgrade) {
-            Some(db) => db,
-            None => return Ok(None),
+        let key = DatabaseKey::File(file_id);
+        let registry = DATABASE_MANAGER.lock();
+        let db = match registry.get(&key) {
+            Some(RegistryEntry::Ready(weak)) => match weak.upgrade() {
+                Some(db) => db,
+                None => return Ok(None),
+            },
+            _ => return Ok(None),
         };
 
         // Validate encryption compatibility (key is not stored for security,
@@ -683,7 +711,8 @@ impl Database {
     ///
     /// Uses the database registry to ensure single Database instance per file within a process.
     /// Caller must drive the IO loop and pass state between calls.
-    /// The registry lock is held for the entire duration to prevent concurrent opens.
+    /// An `Opening` sentinel in the registry prevents concurrent opens of the same path
+    /// without holding the mutex across I/O yields.
     #[allow(clippy::too_many_arguments)]
     pub fn open_with_flags_async(
         state: &mut OpenDbAsyncState,
@@ -706,8 +735,11 @@ impl Database {
             durable_storage,
         );
         if result.is_err() {
-            // registry_guard is set by the open_with_flags_async_internal - so we release it in case of error
-            let _ = state.registry_guard.take();
+            // On error, remove the Opening sentinel so other callers can proceed.
+            if let Some(registry_key) = state.registry_key.take() {
+                let mut registry = DATABASE_MANAGER.lock();
+                registry.remove(&registry_key);
+            }
         }
         result
     }
@@ -728,40 +760,53 @@ impl Database {
         // so, we bypass registry for all db paths which starts with ":memory:"
 
         if matches!(state.phase, OpenDbAsyncPhase::Init) && !path.starts_with(":memory:") {
-            // lock the database manager for the whole duration of open_with_flags_async method
-            let registry = DATABASE_MANAGER.lock_arc();
+            // Briefly lock the registry to check/reserve — never hold across I/O yields.
+            let mut registry = DATABASE_MANAGER.lock();
 
-            let canonical_path = std::fs::canonicalize(path)
-                .ok()
-                .and_then(|p| p.to_str().map(|s| s.to_string()))
-                .unwrap_or_else(|| path.to_string());
+            // Look up by file identity (dev, ino). If file doesn't exist
+            // yet (CREATE mode), skip lookup — no cached entry is possible.
+            if let Ok(file_id) = io.file_id(path) {
+                let key = DatabaseKey::File(file_id);
+                match registry.get(&key) {
+                    Some(RegistryEntry::Ready(weak)) => {
+                        if let Some(db) = weak.upgrade() {
+                            tracing::debug!("took database {path:?} from the registry");
 
-            // Check if already in registry
-            if let Some(db) = registry.get(&canonical_path).and_then(Weak::upgrade) {
-                tracing::debug!("took database {canonical_path:?} from the registry");
-
-                // Check encryption compatibility using cipher mode (key is not stored in Database for security)
-                let db_is_encrypted = !matches!(db.encryption_cipher_mode.get(), CipherMode::None);
-
-                if db_is_encrypted && encryption_opts.is_none() {
-                    return Err(LimboError::InvalidArgument(
-                        "Database is encrypted but no encryption options provided".to_string(),
-                    ));
+                            let db_is_encrypted =
+                                !matches!(db.encryption_cipher_mode.get(), CipherMode::None);
+                            if db_is_encrypted && encryption_opts.is_none() {
+                                return Err(LimboError::InvalidArgument(
+                                    "Database is encrypted but no encryption options provided"
+                                        .to_string(),
+                                ));
+                            }
+                            return Ok(IOResult::Done(db));
+                        }
+                        // Weak ref expired — treat as absent, fall through to insert Opening.
+                        registry.insert(key.clone(), RegistryEntry::Opening);
+                    }
+                    Some(RegistryEntry::Opening) => {
+                        // Another caller is already opening this path. Yield so the
+                        // event loop can make progress and we retry later.
+                        return Ok(IOResult::IO(types::IOCompletions::Single(
+                            io::Completion::new_yield(),
+                        )));
+                    }
+                    None => {
+                        // Not in registry — mark as Opening and proceed.
+                        registry.insert(key.clone(), RegistryEntry::Opening);
+                    }
                 }
-
-                // Found in registry, no need to hold lock
-                return Ok(IOResult::Done(db));
+                state.registry_key = Some(key);
             }
-
-            // Not in registry, hold the lock and store canonical path for later insertion
-            state.registry_guard = Some(registry);
-            state.canonical_path = Some(canonical_path);
+            // Lock is dropped here — the Opening sentinel prevents concurrent opens
+            // of the same path without holding the mutex across yields.
         }
 
-        // Open the database asynchronously (registry lock is held in state for not `:memory:.*` pathes)
+        // Open the database asynchronously (no registry lock held).
         let result = Self::open_with_flags_bypass_registry_async(
             state,
-            io,
+            io.clone(),
             path,
             None,
             db_file,
@@ -772,11 +817,10 @@ impl Database {
         )?;
 
         if let IOResult::Done(ref db) = result {
-            // will be unset in case of `:memory:.*` path
-            if let (Some(mut registry), Some(canonical_path)) =
-                (state.registry_guard.take(), state.canonical_path.take())
-            {
-                registry.insert(canonical_path, Arc::downgrade(db));
+            // Register the opened database and remove the Opening sentinel.
+            if let Some(registry_key) = state.registry_key.take() {
+                let mut registry = DATABASE_MANAGER.lock();
+                registry.insert(registry_key, RegistryEntry::Ready(Arc::downgrade(db)));
             }
         }
 
@@ -933,9 +977,10 @@ impl Database {
                         .schema_guard
                         .as_mut()
                         .expect("schema_guard must be acquired in Init phase");
-                    // while we logically exclusively own schema as we hold DATABASE_MANAGER lock in the top level `open_with_flags_async_internal` function
-                    // at the moment we already created connection which cloned the schema internally
-                    // so, we can't use get_mut here for now
+                    // We logically exclusively own schema via the Opening sentinel in the
+                    // registry which prevents concurrent opens of the same path.
+                    // At this point we already created a connection which cloned the schema
+                    // internally, so we can't use get_mut here.
                     //
                     // it's not ideal but correctness is OK - before prepare connection call maybe_update_schema and in case of divergence update schema ref from the db + we always check connection cookie in the VDBE program itself
                     let schema = Arc::make_mut(&mut **guard);
@@ -1289,13 +1334,13 @@ impl Database {
         pager.set_schema_cookie(None);
 
         if open_mv_store {
-            // todo(v): pass required encryption ctx to enable encryption with mvcc
+            let enc_ctx = pager.io_ctx.read().encryption_context().cloned();
             let mv_store = journal_mode::open_mv_store(
                 self.io.clone(),
                 &self.path,
                 self.open_flags,
                 self.durable_storage.clone(),
-                None,
+                enc_ctx,
             )?;
             self.mv_store.store(Some(mv_store));
         }
@@ -1363,6 +1408,7 @@ impl Database {
             attached_databases: RwLock::new(DatabaseCatalog::new()),
             query_only: AtomicBool::new(false),
             dml_require_where: AtomicBool::new(false),
+            dqs_dml: AtomicBool::new(true),
             mv_tx: RwLock::new(None),
             attached_mv_txs: RwLock::new(HashMap::default()),
             #[cfg(any(test, injected_yields))]
@@ -1380,11 +1426,16 @@ impl Database {
             temp_store: AtomicTempStore::new(TempStore::Default),
             data_sync_retry: AtomicBool::new(false),
             busy_handler: RwLock::new(BusyHandler::None),
+            progress_handler: ProgressHandler::new(),
             query_timeout_ms: AtomicU64::new(0),
+            interrupt_requested: AtomicBool::new(false),
             is_mvcc_bootstrap_connection: AtomicBool::new(is_mvcc_bootstrap_connection),
+            full_column_names: AtomicBool::new(false),
+            short_column_names: AtomicBool::new(true),
             fk_pragma: AtomicBool::new(false),
             fk_deferred_violations: AtomicIsize::new(0),
             n_active_writes: AtomicI32::new(0),
+            n_active_root_statements: AtomicI32::new(0),
             check_constraints_pragma: AtomicBool::new(false),
             vtab_txn_states: RwLock::new(HashSet::default()),
             prepare_context_generation: AtomicU64::new(0),

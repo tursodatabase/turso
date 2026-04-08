@@ -118,7 +118,14 @@ extern "C" {
         callback: Option<unsafe extern "C" fn(*mut libc::c_void, i32) -> i32>,
         arg: *mut libc::c_void,
     ) -> i32;
+    fn sqlite3_progress_handler(
+        db: *mut sqlite3,
+        n: i32,
+        callback: Option<unsafe extern "C" fn(*mut libc::c_void) -> i32>,
+        arg: *mut libc::c_void,
+    );
     fn sqlite3_busy_timeout(db: *mut sqlite3, ms: i32) -> i32;
+    fn sqlite3_interrupt(db: *mut sqlite3);
     fn sqlite3_get_table(
         db: *mut sqlite3,
         sql: *const libc::c_char,
@@ -176,6 +183,7 @@ const SQLITE_ERROR: i32 = 1;
 const SQLITE_MISUSE: i32 = 21;
 const SQLITE_RANGE: i32 = 25;
 const SQLITE_CANTOPEN: i32 = 14;
+const SQLITE_INTERRUPT: i32 = 9;
 const SQLITE_ROW: i32 = 100;
 const SQLITE_DONE: i32 = 101;
 const SQLITE_PREPARE_PERSISTENT: u32 = 0x01;
@@ -2585,6 +2593,148 @@ mod tests {
                 SQLITE_OK
             );
 
+            assert_eq!(sqlite3_close(db), SQLITE_OK);
+        }
+    }
+
+    struct ProgressContext {
+        calls: std::sync::atomic::AtomicI32,
+        interrupt_after: i32,
+    }
+
+    unsafe extern "C" fn progress_handler_interrupt_after(data: *mut libc::c_void) -> i32 {
+        let ctx = &*(data as *const ProgressContext);
+        let current = ctx.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+        if current >= ctx.interrupt_after {
+            1
+        } else {
+            0
+        }
+    }
+
+    #[test]
+    fn test_sqlite3_progress_handler_interrupts_statement() {
+        unsafe {
+            let mut db: *mut sqlite3 = ptr::null_mut();
+            assert_eq!(sqlite3_open(c":memory:".as_ptr(), &mut db), SQLITE_OK);
+            assert_eq!(
+                sqlite3_exec(
+                    db,
+                    c"CREATE TABLE numbers(v INTEGER); INSERT INTO numbers(v) VALUES (0),(1),(2),(3),(4),(5),(6),(7),(8),(9);".as_ptr(),
+                    None,
+                    ptr::null_mut(),
+                    ptr::null_mut(),
+                ),
+                SQLITE_OK
+            );
+
+            let ctx = ProgressContext {
+                calls: std::sync::atomic::AtomicI32::new(0),
+                interrupt_after: 8,
+            };
+            sqlite3_progress_handler(
+                db,
+                1,
+                Some(progress_handler_interrupt_after),
+                &ctx as *const ProgressContext as *mut libc::c_void,
+            );
+
+            let mut stmt: *mut sqlite3_stmt = ptr::null_mut();
+            assert_eq!(
+                sqlite3_prepare_v2(
+                    db,
+                    c"SELECT count(*) FROM numbers AS a, numbers AS b, numbers AS c, numbers AS d, numbers AS e, numbers AS f, numbers AS g".as_ptr(),
+                    -1,
+                    &mut stmt,
+                    ptr::null_mut(),
+                ),
+                SQLITE_OK
+            );
+
+            assert_eq!(sqlite3_step(stmt), SQLITE_INTERRUPT);
+            assert!(
+                ctx.calls.load(std::sync::atomic::Ordering::SeqCst) >= ctx.interrupt_after,
+                "progress handler did not fire enough times"
+            );
+
+            sqlite3_progress_handler(db, 0, None, ptr::null_mut());
+            let finalize_rc = sqlite3_finalize(stmt);
+            assert!(
+                matches!(finalize_rc, SQLITE_OK | SQLITE_INTERRUPT),
+                "unexpected finalize rc: {finalize_rc}"
+            );
+            assert_eq!(sqlite3_close(db), SQLITE_OK);
+        }
+    }
+
+    #[test]
+    fn test_sqlite3_interrupt_without_active_statement_is_ignored() {
+        unsafe {
+            let mut db: *mut sqlite3 = ptr::null_mut();
+            assert_eq!(sqlite3_open(c":memory:".as_ptr(), &mut db), SQLITE_OK);
+
+            let mut stmt: *mut sqlite3_stmt = ptr::null_mut();
+            assert_eq!(
+                sqlite3_prepare_v2(db, c"SELECT 1".as_ptr(), -1, &mut stmt, ptr::null_mut()),
+                SQLITE_OK
+            );
+
+            sqlite3_interrupt(db);
+            assert_eq!(sqlite3_step(stmt), SQLITE_ROW);
+
+            assert_eq!(sqlite3_finalize(stmt), SQLITE_OK);
+            assert_eq!(sqlite3_close(db), SQLITE_OK);
+        }
+    }
+
+    #[test]
+    fn test_sqlite3_interrupt_active_statement() {
+        unsafe {
+            let mut db: *mut sqlite3 = ptr::null_mut();
+            assert_eq!(sqlite3_open(c":memory:".as_ptr(), &mut db), SQLITE_OK);
+            assert_eq!(
+                sqlite3_exec(
+                    db,
+                    c"CREATE TABLE numbers(v INTEGER); INSERT INTO numbers(v) VALUES (0),(1),(2),(3),(4),(5),(6),(7),(8),(9);".as_ptr(),
+                    None,
+                    ptr::null_mut(),
+                    ptr::null_mut(),
+                ),
+                SQLITE_OK
+            );
+
+            let mut stmt: *mut sqlite3_stmt = ptr::null_mut();
+            assert_eq!(
+                sqlite3_prepare_v2(
+                    db,
+                    c"SELECT a.v FROM numbers AS a, numbers AS b, numbers AS c, numbers AS d, numbers AS e, numbers AS f, numbers AS g, numbers AS h".as_ptr(),
+                    -1,
+                    &mut stmt,
+                    ptr::null_mut(),
+                ),
+                SQLITE_OK
+            );
+
+            let db_addr = db as usize;
+            let interrupter = std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+                sqlite3_interrupt(db_addr as *mut sqlite3);
+            });
+
+            let rc = loop {
+                let rc = sqlite3_step(stmt);
+                if rc != SQLITE_ROW {
+                    break rc;
+                }
+            };
+            interrupter.join().unwrap();
+            assert_eq!(rc, SQLITE_INTERRUPT, "expected SQLITE_INTERRUPT, got {rc}");
+
+            let finalize_rc = sqlite3_finalize(stmt);
+            assert!(
+                matches!(finalize_rc, SQLITE_OK | SQLITE_INTERRUPT),
+                "unexpected finalize rc: {finalize_rc}"
+            );
             assert_eq!(sqlite3_close(db), SQLITE_OK);
         }
     }

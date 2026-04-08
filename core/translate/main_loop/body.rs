@@ -385,11 +385,13 @@ fn emit_loop_source<'a>(
                 plan.aggregates.is_empty(),
                 "QueryResult target should not have aggregates"
             );
-            let offset_jump_to = t_ctx
-                .labels_main_loop
+            let offset_jump_to = plan
+                .join_order
                 .first()
+                .and_then(|j| t_ctx.labels_main_loop.get(j.original_idx))
                 .map(|l| l.next)
                 .or(t_ctx.label_main_loop_end);
+
             emit_select_result(
                 program,
                 &t_ctx.resolver,

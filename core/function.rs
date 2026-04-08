@@ -471,6 +471,7 @@ pub enum ScalarFunc {
     Typeof,
     Unicode,
     Unistr,
+    UnistrQuote,
     Quote,
     SqliteVersion,
     TursoVersion,
@@ -581,6 +582,7 @@ impl Deterministic for ScalarFunc {
             ScalarFunc::Typeof => true,
             ScalarFunc::Unicode => true,
             ScalarFunc::Unistr => true,
+            ScalarFunc::UnistrQuote => true,
             ScalarFunc::Quote => true,
             ScalarFunc::SqliteVersion => false,
             ScalarFunc::TursoVersion => false,
@@ -710,6 +712,7 @@ impl Display for ScalarFunc {
             Self::Typeof => "typeof",
             Self::Unicode => "unicode",
             Self::Unistr => "unistr",
+            Self::UnistrQuote => "unistr_quote",
             Self::Quote => "quote",
             Self::SqliteVersion => "sqlite_version",
             Self::TursoVersion => "turso_version",
@@ -821,6 +824,7 @@ impl ScalarFunc {
             | Self::Lower
             | Self::OctetLength
             | Self::Quote
+            | Self::UnistrQuote
             | Self::RandomBlob
             | Self::Sign
             | Self::Soundex
@@ -1289,6 +1293,7 @@ impl Func {
             "last_insert_rowid" => Ok(Some(Self::Scalar(ScalarFunc::LastInsertRowid))),
             "unicode" => Ok(Some(Self::Scalar(ScalarFunc::Unicode))),
             "unistr" => Ok(Some(Self::Scalar(ScalarFunc::Unistr))),
+            "unistr_quote" => Ok(Some(Self::Scalar(ScalarFunc::UnistrQuote))),
             "quote" => Ok(Some(Self::Scalar(ScalarFunc::Quote))),
             "sqlite_version" => Ok(Some(Self::Scalar(ScalarFunc::SqliteVersion))),
             "turso_version" => Ok(Some(Self::Scalar(ScalarFunc::TursoVersion))),

@@ -13,7 +13,7 @@
   "license": "ISC",
   "description": "",
   "devDependencies": {
-    "vite": "^7.1.9"
+    "vite": "^7.3.2"
   },
   "dependencies": {
     "@tursodatabase/sync-wasm": "../../../bindings/javascript/sync/packages/wasm"

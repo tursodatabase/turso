@@ -1,0 +1,21 @@
+[package]
+name = "memory-benchmark"
+version = "0.1.0"
+edition = "2024"
+license.workspace = true
+
+[[bin]]
+name = "memory-benchmark"
+path = "src/main.rs"
+
+[dependencies]
+turso = { path = "../../bindings/rust", default-features = false }
+clap = { workspace = true, features = ["derive"] }
+tokio = { workspace = true, default-features = true, features = ["full"] }
+tracing-subscriber = { workspace = true }
+memory-stats = "1.2.0"
+dhat = "0.3"
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+rand = { workspace = true }
