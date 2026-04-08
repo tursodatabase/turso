@@ -883,6 +883,20 @@ test round-half-away-from-zero-255 {
     SELECT round(2.55, 1);
 }
 expect {
+    2.5
+}
+
+test round-half-away-from-zero-245 {
+    SELECT round(2.45, 1);
+}
+expect {
+    2.5
+}
+
+test round-half-away-from-zero-265 {
+    SELECT round(2.65, 1);
+}
+expect {
     2.6
 }
 
