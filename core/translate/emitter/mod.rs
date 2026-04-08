@@ -385,6 +385,18 @@ impl<'a> Resolver<'a> {
         }
     }
 
+    fn attached_database_ids_in_search_order(&self) -> Vec<usize> {
+        let mut database_ids: Vec<_> = self
+            .attached_databases
+            .read()
+            .index_to_data
+            .keys()
+            .copied()
+            .collect();
+        database_ids.sort_unstable();
+        database_ids
+    }
+
     pub(crate) fn resolve_existing_table_database_id(
         &self,
         qualified_name: &ast::QualifiedName,
@@ -394,25 +406,45 @@ impl<'a> Resolver<'a> {
         }
 
         if let Some(ref ctx) = self.trigger_context {
-            if !ctx.restricts_db_references() {
-                return if self.with_schema(crate::TEMP_DB_ID, |schema| {
-                    schema.get_table(qualified_name.name.as_str()).is_some()
-                        || schema.get_view(qualified_name.name.as_str()).is_some()
-                        || schema
-                            .get_materialized_view(qualified_name.name.as_str())
-                            .is_some()
-                }) {
-                    Ok(crate::TEMP_DB_ID)
-                } else {
-                    Ok(crate::MAIN_DB_ID)
-                };
+            if ctx.restricts_db_references() {
+                return Ok(ctx.database_id);
             }
-            return Ok(ctx.database_id);
+
+            return if self.with_schema(crate::TEMP_DB_ID, |schema| {
+                schema.get_table(qualified_name.name.as_str()).is_some()
+                    || schema.get_view(qualified_name.name.as_str()).is_some()
+                    || schema
+                        .get_materialized_view(qualified_name.name.as_str())
+                        .is_some()
+            }) {
+                Ok(crate::TEMP_DB_ID)
+            } else if self.with_schema(crate::MAIN_DB_ID, |schema| {
+                schema.get_table(qualified_name.name.as_str()).is_some()
+                    || schema.get_view(qualified_name.name.as_str()).is_some()
+                    || schema
+                        .get_materialized_view(qualified_name.name.as_str())
+                        .is_some()
+            }) {
+                Ok(crate::MAIN_DB_ID)
+            } else {
+                for database_id in self.attached_database_ids_in_search_order() {
+                    if self.with_schema(database_id, |schema| {
+                        schema.get_table(qualified_name.name.as_str()).is_some()
+                            || schema.get_view(qualified_name.name.as_str()).is_some()
+                            || schema
+                                .get_materialized_view(qualified_name.name.as_str())
+                                .is_some()
+                    }) {
+                        return Ok(database_id);
+                    }
+                }
+                Ok(crate::MAIN_DB_ID)
+            };
         }
 
         let table_name = qualified_name.name.as_str();
         if table_name.eq_ignore_ascii_case(crate::schema::SCHEMA_TABLE_NAME)
-            || table_name.eq_ignore_ascii_case("sqlite_master")
+            || table_name.eq_ignore_ascii_case(crate::schema::SCHEMA_TABLE_NAME_ALT)
         {
             return Ok(crate::MAIN_DB_ID);
         }
@@ -421,10 +453,28 @@ impl<'a> Resolver<'a> {
                 || schema.get_view(table_name).is_some()
                 || schema.get_materialized_view(table_name).is_some()
         }) {
-            Ok(crate::TEMP_DB_ID)
-        } else {
-            Ok(crate::MAIN_DB_ID)
+            return Ok(crate::TEMP_DB_ID);
         }
+
+        if self.with_schema(crate::MAIN_DB_ID, |schema| {
+            schema.get_table(table_name).is_some()
+                || schema.get_view(table_name).is_some()
+                || schema.get_materialized_view(table_name).is_some()
+        }) {
+            return Ok(crate::MAIN_DB_ID);
+        }
+
+        for database_id in self.attached_database_ids_in_search_order() {
+            if self.with_schema(database_id, |schema| {
+                schema.get_table(table_name).is_some()
+                    || schema.get_view(table_name).is_some()
+                    || schema.get_materialized_view(table_name).is_some()
+            }) {
+                return Ok(database_id);
+            }
+        }
+
+        Ok(crate::MAIN_DB_ID)
     }
 
     pub(crate) fn resolve_existing_index_database_id(
@@ -444,9 +494,57 @@ impl<'a> Resolver<'a> {
                 .any(|index| index.name.eq_ignore_ascii_case(&index_name))
         }) {
             Ok(crate::TEMP_DB_ID)
+        } else if self.with_schema(crate::MAIN_DB_ID, |schema| {
+            schema
+                .indexes
+                .values()
+                .flat_map(|indexes| indexes.iter())
+                .any(|index| index.name.eq_ignore_ascii_case(&index_name))
+        }) {
+            Ok(crate::MAIN_DB_ID)
         } else {
+            for database_id in self.attached_database_ids_in_search_order() {
+                if self.with_schema(database_id, |schema| {
+                    schema
+                        .indexes
+                        .values()
+                        .flat_map(|indexes| indexes.iter())
+                        .any(|index| index.name.eq_ignore_ascii_case(&index_name))
+                }) {
+                    return Ok(database_id);
+                }
+            }
             Ok(crate::MAIN_DB_ID)
         }
+    }
+
+    pub(crate) fn resolve_existing_trigger_database_id(
+        &self,
+        qualified_name: &ast::QualifiedName,
+    ) -> Result<usize> {
+        if qualified_name.db_name.is_some() {
+            return self.resolve_database_id(qualified_name);
+        }
+
+        let trigger_name = qualified_name.name.as_str();
+        if self.with_schema(crate::TEMP_DB_ID, |schema| {
+            schema.get_trigger(trigger_name).is_some()
+        }) {
+            return Ok(crate::TEMP_DB_ID);
+        }
+        if self.with_schema(crate::MAIN_DB_ID, |schema| {
+            schema.get_trigger(trigger_name).is_some()
+        }) {
+            return Ok(crate::MAIN_DB_ID);
+        }
+        for database_id in self.attached_database_ids_in_search_order() {
+            if self.with_schema(database_id, |schema| {
+                schema.get_trigger(trigger_name).is_some()
+            }) {
+                return Ok(database_id);
+            }
+        }
+        Ok(crate::MAIN_DB_ID)
     }
 
     /// Resolve database ID from a qualified name

@@ -2916,6 +2916,7 @@ pub fn op_halt_if_null(
 pub enum OpTransactionState {
     Start,
     AttachedBeginWriteTx,
+    BeginNamedSavepoints,
     CheckSchemaCookie,
     BeginStatement,
 }
@@ -2957,6 +2958,133 @@ fn begin_mvcc_tx(
     }
 }
 
+fn pager_db_size_for_named_savepoint(pager: &Arc<Pager>) -> Result<IOResult<u32>> {
+    match pager.with_header(|header| header.database_size.get()) {
+        Ok(result) => Ok(result),
+        Err(LimboError::Page1NotAlloc) => Ok(IOResult::Done(0)),
+        Err(err) => Err(err),
+    }
+}
+
+fn open_named_savepoint_frames_on_wal_pager(
+    pager: &Arc<Pager>,
+    frames: &[crate::connection::NamedSavepointFrame],
+) -> Result<IOResult<()>> {
+    if frames.is_empty() {
+        return Ok(IOResult::Done(()));
+    }
+    pager.open_subjournal()?;
+    let db_size = match pager_db_size_for_named_savepoint(pager)? {
+        IOResult::Done(db_size) => db_size,
+        IOResult::IO(io) => return Ok(IOResult::IO(io)),
+    };
+    for frame in frames {
+        pager.open_named_savepoint(
+            frame.name.clone(),
+            db_size,
+            frame.starts_transaction,
+            frame.deferred_fk_violations,
+        )?;
+    }
+    Ok(IOResult::Done(()))
+}
+
+fn open_connection_named_savepoints_for_db(
+    conn: &Connection,
+    db: usize,
+    pager: &Arc<Pager>,
+) -> Result<IOResult<()>> {
+    let frames = conn.named_savepoints();
+    if frames.is_empty() {
+        return Ok(IOResult::Done(()));
+    }
+
+    if let Some(mv_store) = conn.mv_store_for_db(db) {
+        let Some(tx_id) = conn.get_mv_tx_id_for_db(db) else {
+            return Ok(IOResult::Done(()));
+        };
+        for frame in frames {
+            mv_store.begin_named_savepoint(
+                tx_id,
+                frame.name,
+                frame.starts_transaction,
+                frame.deferred_fk_violations,
+            );
+        }
+        Ok(IOResult::Done(()))
+    } else {
+        open_named_savepoint_frames_on_wal_pager(pager, &frames)
+    }
+}
+
+fn mirror_named_savepoint_begin_to_active_non_main_databases(
+    conn: &Connection,
+    frame: &crate::connection::NamedSavepointFrame,
+) -> Result<()> {
+    for (db_id, pager) in conn.get_all_attached_pagers_with_index() {
+        if let Some(mv_store) = conn.mv_store_for_db(db_id) {
+            let Some(tx_id) = conn.get_mv_tx_id_for_db(db_id) else {
+                continue;
+            };
+            mv_store.begin_named_savepoint(
+                tx_id,
+                frame.name.clone(),
+                frame.starts_transaction,
+                frame.deferred_fk_violations,
+            );
+            continue;
+        }
+        if !pager.holds_read_lock() {
+            continue;
+        }
+        match open_named_savepoint_frames_on_wal_pager(&pager, std::slice::from_ref(frame))? {
+            IOResult::Done(()) => {}
+            IOResult::IO(_) => {
+                unreachable!("active pager header should be resident before SAVEPOINT")
+            }
+        }
+    }
+    Ok(())
+}
+
+fn mirror_named_savepoint_release_to_active_non_main_databases(
+    conn: &Connection,
+    name: &str,
+) -> Result<()> {
+    for (db_id, pager) in conn.get_all_attached_pagers_with_index() {
+        if let Some(mv_store) = conn.mv_store_for_db(db_id) {
+            let Some(tx_id) = conn.get_mv_tx_id_for_db(db_id) else {
+                continue;
+            };
+            let _ = mv_store.release_named_savepoint(tx_id, name);
+            continue;
+        }
+        if pager.holds_read_lock() {
+            let _ = pager.release_named_savepoint(name)?;
+        }
+    }
+    Ok(())
+}
+
+fn mirror_named_savepoint_rollback_to_active_non_main_databases(
+    conn: &Connection,
+    name: &str,
+) -> Result<()> {
+    for (db_id, pager) in conn.get_all_attached_pagers_with_index() {
+        if let Some(mv_store) = conn.mv_store_for_db(db_id) {
+            let Some(tx_id) = conn.get_mv_tx_id_for_db(db_id) else {
+                continue;
+            };
+            let _ = mv_store.rollback_to_named_savepoint(tx_id, name);
+            continue;
+        }
+        if pager.holds_read_lock() {
+            let _ = pager.rollback_to_named_savepoint(name)?;
+        }
+    }
+    Ok(())
+}
+
 pub fn op_transaction_inner(
     program: &Program,
     state: &mut ProgramState,
@@ -2987,6 +3115,7 @@ pub fn op_transaction_inner(
             OpTransactionState::Start => {
                 let conn = program.connection.clone();
                 let write = matches!(tx_mode, TransactionMode::Write);
+                let mut started_secondary_tx = false;
                 if write && conn.is_readonly(*db) {
                     return Err(LimboError::ReadOnly);
                 }
@@ -3077,6 +3206,7 @@ pub fn op_transaction_inner(
                             match begin_mvcc_tx(mv_store, &pager, &effective_mode, None) {
                                 Ok(tx_id) => {
                                     conn.set_mv_tx_for_db(*db, Some((tx_id, effective_mode)));
+                                    started_secondary_tx = true;
                                 }
                                 Err(err) => {
                                     pager.end_read_tx();
@@ -3138,6 +3268,9 @@ pub fn op_transaction_inner(
                                     program
                                         .connection
                                         .set_mv_tx_for_db(*db, Some((tx_id, *tx_mode)));
+                                    if is_secondary_db {
+                                        started_secondary_tx = true;
+                                    }
                                 }
                                 Err(err) => {
                                     if started_read_tx {
@@ -3200,11 +3333,18 @@ pub fn op_transaction_inner(
                             continue;
                         }
                         pager.begin_read_tx()?;
+                        started_secondary_tx = true;
                         if matches!(tx_mode, TransactionMode::Write) {
                             // Transition to AttachedBeginWriteTx to handle begin_write_tx
                             // separately, so if it returns IO we don't re-call begin_read_tx
                             // on re-entry.
-                            state.op_transaction_state = OpTransactionState::AttachedBeginWriteTx;
+                            if conn.named_savepoints().is_empty() {
+                                state.op_transaction_state =
+                                    OpTransactionState::AttachedBeginWriteTx;
+                            } else {
+                                state.op_transaction_state =
+                                    OpTransactionState::BeginNamedSavepoints;
+                            }
                             continue;
                         }
                     } else if updated && matches!(current_state, TransactionState::None) {
@@ -3266,6 +3406,10 @@ pub fn op_transaction_inner(
                 if updated {
                     conn.set_tx_state(new_transaction_state);
                 }
+                if is_secondary_db && started_secondary_tx && !conn.named_savepoints().is_empty() {
+                    state.op_transaction_state = OpTransactionState::BeginNamedSavepoints;
+                    continue;
+                }
                 state.op_transaction_state = OpTransactionState::CheckSchemaCookie;
                 continue;
             }
@@ -3278,6 +3422,23 @@ pub fn op_transaction_inner(
                 }
                 state.op_transaction_state = OpTransactionState::CheckSchemaCookie;
                 continue;
+            }
+            OpTransactionState::BeginNamedSavepoints => {
+                match open_connection_named_savepoints_for_db(&program.connection, *db, &pager)? {
+                    IOResult::Done(()) => {
+                        if *db != crate::MAIN_DB_ID
+                            && mv_store.is_none()
+                            && matches!(tx_mode, TransactionMode::Write)
+                            && !pager.holds_write_lock()
+                        {
+                            state.op_transaction_state = OpTransactionState::AttachedBeginWriteTx;
+                        } else {
+                            state.op_transaction_state = OpTransactionState::CheckSchemaCookie;
+                        }
+                        continue;
+                    }
+                    IOResult::IO(io) => return Ok(InsnFunctionStepResult::IO(io)),
+                }
             }
             // 4. Check whether schema has changed if we are actually going to access the database.
             // Can only read header if page 1 has been allocated already
@@ -3395,6 +3556,12 @@ pub fn op_auto_commit(
         {
             conn.clear_deferred_foreign_key_violations();
         }
+        if matches!(
+            res,
+            Ok(InsnFunctionStepResult::Step | InsnFunctionStepResult::Done)
+        ) {
+            conn.clear_named_savepoints();
+        }
         return res;
     }
 
@@ -3505,6 +3672,7 @@ pub fn op_auto_commit(
     ) && (is_rollback_req || is_commit_req)
     {
         conn.set_cdc_transaction_id(-1);
+        conn.clear_named_savepoints();
     }
 
     res
@@ -3524,6 +3692,11 @@ pub fn op_savepoint(
         SavepointOp::Begin => {
             let starts_transaction = conn.auto_commit.load(Ordering::SeqCst);
             let deferred_fk_violations = conn.get_deferred_foreign_key_violations();
+            let frame = crate::connection::NamedSavepointFrame {
+                name: name.clone(),
+                starts_transaction,
+                deferred_fk_violations,
+            };
 
             if let Some(mv_store) = mv_store.as_ref() {
                 let tx_id = if let Some(tx_id) = conn.get_mv_tx_id() {
@@ -3542,17 +3715,6 @@ pub fn op_savepoint(
                     starts_transaction,
                     deferred_fk_violations,
                 );
-                // Open matching named savepoints on attached MVCC databases.
-                conn.for_each_attached_mv_tx(|db_id, att_tx_id| {
-                    if let Some(att_mv) = conn.mv_store_for_db(db_id) {
-                        att_mv.begin_named_savepoint(
-                            att_tx_id,
-                            name.clone(),
-                            false,
-                            deferred_fk_violations,
-                        );
-                    }
-                });
             } else {
                 pager.open_subjournal()?;
                 let db_size = return_if_io!(pager.with_header(|header| header.database_size.get()));
@@ -3563,6 +3725,8 @@ pub fn op_savepoint(
                     deferred_fk_violations,
                 )?;
             }
+            mirror_named_savepoint_begin_to_active_non_main_databases(&conn, &frame)?;
+            conn.push_named_savepoint(name.clone(), starts_transaction, deferred_fk_violations);
 
             if starts_transaction {
                 conn.auto_commit.store(false, Ordering::SeqCst);
@@ -3580,23 +3744,18 @@ pub fn op_savepoint(
             } else {
                 pager.release_named_savepoint(name)?
             };
-            // Release matching named savepoints on attached MVCC databases.
-            if mv_store.is_some() {
-                conn.for_each_attached_mv_tx(|db_id, att_tx_id| {
-                    if let Some(att_mv) = conn.mv_store_for_db(db_id) {
-                        let _ = att_mv.release_named_savepoint(att_tx_id, name);
-                    }
-                });
-            }
             match release_result {
                 SavepointResult::NotFound => {
                     mark_unlikely();
                     return Err(LimboError::TxError(format!("no such savepoint: {name}")));
                 }
                 SavepointResult::Release => {
-                    // Savepoint released successfully, just continue
+                    let _ = conn.release_named_savepoint_frame(name);
+                    mirror_named_savepoint_release_to_active_non_main_databases(&conn, name)?;
                 }
                 SavepointResult::Commit => {
+                    let _ = conn.release_named_savepoint_frame(name);
+                    mirror_named_savepoint_release_to_active_non_main_databases(&conn, name)?;
                     // This means that releasing the savepoint caused the transaction to commit, so we need to auto-commit here.
                     let auto_commit = Insn::AutoCommit {
                         auto_commit: true,
@@ -3611,12 +3770,6 @@ pub fn op_savepoint(
         }
         SavepointOp::RollbackTo => {
             let deferred_fk_snapshot = if let Some(mv_store) = mv_store.as_ref() {
-                // Rollback named savepoints on attached MVCC databases.
-                conn.for_each_attached_mv_tx(|db_id, att_tx_id| {
-                    if let Some(att_mv) = conn.mv_store_for_db(db_id) {
-                        let _ = att_mv.rollback_to_named_savepoint(att_tx_id, name);
-                    }
-                });
                 match conn.get_mv_tx_id() {
                     Some(tx_id) => mv_store.rollback_to_named_savepoint(tx_id, name)?,
                     None => None,
@@ -3629,6 +3782,8 @@ pub fn op_savepoint(
                 mark_unlikely();
                 return Err(LimboError::TxError(format!("no such savepoint: {name}")));
             };
+            let _ = conn.rollback_named_savepoint_frame(name);
+            mirror_named_savepoint_rollback_to_active_non_main_databases(&conn, name)?;
             conn.fk_deferred_violations
                 .store(deferred_fk_snapshot, Ordering::SeqCst);
 
@@ -13515,6 +13670,13 @@ fn op_journal_mode_inner(
                 // If same mode, just return
                 if prev_mode == new_mode {
                     let ret: &'static str = new_mode.into();
+                    state.registers[*dest].set_text(Text::new(ret));
+                    state.pc += 1;
+                    return Ok(InsnFunctionStepResult::Step);
+                }
+
+                if *db != crate::MAIN_DB_ID {
+                    let ret: &'static str = prev_mode.into();
                     state.registers[*dest].set_text(Text::new(ret));
                     state.pc += 1;
                     return Ok(InsnFunctionStepResult::Step);

@@ -102,12 +102,10 @@ impl InitLoop {
                 continue;
             }
             // Ensure non-main databases have a Transaction instruction for read access.
-            if table.database_id != crate::MAIN_DB_ID {
-                let schema_cookie = t_ctx
-                    .resolver
-                    .with_schema(table.database_id, |s| s.schema_version);
-                program.begin_read_on_database(table.database_id, schema_cookie);
-            }
+            let schema_cookie = t_ctx
+                .resolver
+                .with_schema(table.database_id, |s| s.schema_version);
+            program.begin_read_on_database(table.database_id, schema_cookie);
             // Initialize bookkeeping for OUTER JOIN
             if let Some(join_info) = table.join_info.as_ref() {
                 if join_info.is_outer() {
