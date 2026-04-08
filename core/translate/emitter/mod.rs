@@ -443,6 +443,11 @@ impl<'a> Resolver<'a> {
         }
 
         let table_name = qualified_name.name.as_str();
+        if table_name.eq_ignore_ascii_case(crate::schema::TEMP_SCHEMA_TABLE_NAME)
+            || table_name.eq_ignore_ascii_case(crate::schema::TEMP_SCHEMA_TABLE_NAME_ALT)
+        {
+            return Ok(crate::TEMP_DB_ID);
+        }
         if table_name.eq_ignore_ascii_case(crate::schema::SCHEMA_TABLE_NAME)
             || table_name.eq_ignore_ascii_case(crate::schema::SCHEMA_TABLE_NAME_ALT)
         {

@@ -3468,7 +3468,8 @@ pub fn op_transaction_inner(
             }
             OpTransactionState::BeginStatement => {
                 let needs_stmt_journal = program.needs_stmt_subtransactions.load(Ordering::Relaxed);
-                if *db == MAIN_DB_ID && needs_stmt_journal {
+                let in_explicit_txn = !program.connection.auto_commit.load(Ordering::SeqCst);
+                if *db == crate::MAIN_DB_ID && needs_stmt_journal {
                     let write = matches!(tx_mode, TransactionMode::Write);
                     let res = state.begin_statement(&program.connection, &pager, write)?;
                     if let IOResult::IO(io) = res {
@@ -3478,7 +3479,23 @@ pub fn op_transaction_inner(
                     && matches!(tx_mode, TransactionMode::Write)
                     && needs_stmt_journal
                 {
-                    if let Some(mv_store) = program.connection.mv_store_for_db(*db) {
+                    if in_explicit_txn && !state.has_stmt_transaction {
+                        state.has_stmt_transaction = true;
+                        state.fk_deferred_violations_when_stmt_started.store(
+                            program
+                                .connection
+                                .fk_deferred_violations
+                                .load(Ordering::Acquire),
+                            Ordering::SeqCst,
+                        );
+                        state
+                            .fk_immediate_violations_during_stmt
+                            .store(0, Ordering::Release);
+                    }
+                    if !in_explicit_txn {
+                        // Autocommit statements rollback the whole transaction on error, so
+                        // non-main pagers do not need statement savepoints here.
+                    } else if let Some(mv_store) = program.connection.mv_store_for_db(*db) {
                         // Attached MVCC DB: open an MvStore savepoint.
                         if let Some(tx_id) = program.connection.get_mv_tx_id_for_db(*db) {
                             mv_store.begin_savepoint(tx_id);
@@ -10418,6 +10435,14 @@ pub fn op_parse_schema(
         format!("SELECT * FROM {schema_table}")
     };
     let mut stmt = conn.prepare_internal(sql)?;
+    // ParseSchema runs as a nested helper statement inside the parent schema
+    // mutation. It only reads sqlite_schema, so a statement subtransaction is
+    // unnecessary and can contend with the parent's subjournal on temp/attached
+    // pagers, surfacing as SQLITE_BUSY during temp DDL.
+    stmt.program
+        .prepared
+        .needs_stmt_subtransactions
+        .store(false, Ordering::Relaxed);
 
     // Get a mutable schema clone *without* holding the schema lock during
     // nested statement execution.  The nested Statement may call reprepare()

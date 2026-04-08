@@ -889,8 +889,10 @@ impl ProgramState {
                         }
                     });
                     Ok(())
-                } else if self.uses_subjournal {
-                    pager.release_savepoint()?;
+                } else if self.uses_subjournal || !attached_pagers.is_empty() {
+                    if self.uses_subjournal {
+                        pager.release_savepoint()?;
+                    }
                     for p in &attached_pagers {
                         p.release_savepoint()?;
                     }
@@ -932,6 +934,15 @@ impl ProgramState {
                         }
                         Err(e) => Some(e),
                     }
+                } else if !attached_pagers.is_empty() {
+                    let mut err = None;
+                    for p in &attached_pagers {
+                        if let Err(e) = p.rollback_to_newest_savepoint() {
+                            err = Some(e);
+                            break;
+                        }
+                    }
+                    err
                 } else {
                     None
                 };
