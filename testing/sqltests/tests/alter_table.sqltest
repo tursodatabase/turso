@@ -186,7 +186,6 @@ test alter-table-rename-column-view-mutual-cycle {
 expect error {
 }
 
-@skip-if mvcc "ATTACH is not supported in MVCC mode"
 test alter-table-rename-column-view-attached-db-qualified {
     ATTACH ':memory:' AS aux;
     CREATE TABLE t (a, b);
@@ -197,7 +196,6 @@ expect error {
     cannot reference
 }
 
-@skip-if mvcc "ATTACH is not supported in MVCC mode"
 test alter-table-rename-column-trigger-attached-db-same-db {
     ATTACH ':memory:' AS aux;
     CREATE TABLE aux.t (a, b);
@@ -213,7 +211,6 @@ expect {
     7
 }
 
-@skip-if mvcc "ATTACH is not supported in MVCC mode"
 test alter-table-rename-column-view-attached-db-same-db {
     ATTACH ':memory:' AS aux;
     CREATE TABLE aux.t (a, b);
