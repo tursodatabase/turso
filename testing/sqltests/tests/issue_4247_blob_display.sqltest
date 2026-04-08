@@ -1,0 +1,35 @@
+-- Issue #4247: Blob display differs between turso and sqlite in list mode
+--
+-- Root cause: core/types.rs uses String::from_utf8_lossy() for Blob Display,
+-- which replaces invalid UTF-8 bytes with U+FFFD replacement character.
+-- SQLite outputs raw bytes directly.
+--
+-- This test verifies blob storage is correct (hex round-trip).
+-- The actual display difference is in the CLI output formatting.
+
+# minimal reproducer - 0xA0 is invalid UTF-8 start byte
+statement ok
+CREATE TABLE blob_test(b BLOB)
+
+statement ok
+INSERT INTO blob_test VALUES(X'434CA024')
+
+# The hex 434CA024 decodes to: 'C' (43), 'L' (4C), non-ascii (A0), '$' (24)
+# Verify blob is stored correctly via hex round-trip
+query T nosort
+SELECT hex(b) FROM blob_test
+----
+434CA024
+
+# Another test with more invalid UTF-8 bytes
+statement ok
+INSERT INTO blob_test VALUES(X'64157E9A')
+
+query T nosort
+SELECT hex(b) FROM blob_test ORDER BY b
+----
+434CA024
+64157E9A
+
+statement ok
+DROP TABLE blob_test
