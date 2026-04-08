@@ -124,6 +124,22 @@ fn test_mvcc_create_table_on_attached_db(tmp_db: TempDatabase) -> anyhow::Result
     Ok(())
 }
 
+#[turso_macros::test]
+fn test_temp_autoincrement_allowed_when_main_db_is_mvcc(
+    tmp_db: TempDatabase,
+) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+    conn.pragma_update("journal_mode", "'mvcc'")?;
+
+    conn.execute("CREATE TEMP TABLE t(id INTEGER PRIMARY KEY AUTOINCREMENT, v TEXT)")?;
+    conn.execute("INSERT INTO temp.t(v) VALUES ('a'), ('b')")?;
+
+    let rows: Vec<(i64, String)> = conn.exec_rows("SELECT id, v FROM temp.t ORDER BY id");
+    assert_eq!(rows, vec![(1, "a".to_string()), (2, "b".to_string())]);
+
+    Ok(())
+}
+
 /// Injecting a custom MVCC durable storage implementation via
 /// `Database::open_file_with_flags_and_durable_storage` should work.
 /// We validate that MVCC commits route through the injected storage by recording `log_tx` calls.
