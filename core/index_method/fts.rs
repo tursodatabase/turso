@@ -1515,10 +1515,27 @@ const NOTNULL_CONSTRAINT: ast::NamedColumnConstraint = ast::NamedColumnConstrain
     },
 };
 
-fn initialize_btree_storage_table(conn: &Arc<Connection>, table_name: &str) -> Result<()> {
+fn initialize_btree_storage_table(
+    conn: &Arc<Connection>,
+    database_id: usize,
+    table_name: &str,
+) -> Result<()> {
     const PATH_COLUMN: &str = "path";
     const CHUNK_NO_COLUMN: &str = "chunk_no";
     const BYTES_COLUMN: &str = "bytes";
+    let db_name = conn
+        .get_database_name_by_index(database_id)
+        .filter(|name| name != "main");
+    let qualified_name = ast::QualifiedName {
+        db_name: db_name.clone().map(ast::Name::from_string),
+        name: name(table_name),
+        alias: None,
+    };
+    let qualified_index_name = ast::QualifiedName {
+        db_name: db_name.map(ast::Name::from_string),
+        name: name(format!("{table_name}_key")),
+        alias: None,
+    };
     // inline ast to reduce parsing overhead
     // CREATE TABLE table_name (path TEXT NOT NULL, chunk_no INTEGER NOT NULL, bytes BLOB NOT NULL);
     let create_table_stmt = ast::Stmt::CreateTable {
@@ -1557,7 +1574,7 @@ fn initialize_btree_storage_table(conn: &Arc<Connection>, table_name: &str) -> R
         },
         temporary: false,
         if_not_exists: true,
-        tbl_name: ast::QualifiedName::single(name(table_name)),
+        tbl_name: qualified_name,
     };
     // "CREATE INDEX IF NOT EXISTS idx_name ON table_name USING backing_btree (path, chunk_no, bytes);"
     // Use backing_btree to create a BTree that stores all columns without rowid indirection
@@ -1565,7 +1582,7 @@ fn initialize_btree_storage_table(conn: &Arc<Connection>, table_name: &str) -> R
     let create_index_stmt = ast::Stmt::CreateIndex {
         unique: false, // backing_btree doesn't use unique constraint
         if_not_exists: true,
-        idx_name: ast::QualifiedName::single(name(format!("{table_name}_key"))),
+        idx_name: qualified_index_name,
         tbl_name: name(table_name),
         using: Some(name(super::BACKING_BTREE_INDEX_METHOD_NAME)),
         columns: vec![
@@ -1757,6 +1774,7 @@ pub struct FtsCursor {
     cached_parser: Option<tantivy::query::QueryParser>,
     shared_directory_cache: Arc<RwLock<Option<CachedFtsDirectory>>>,
     connection: Option<Arc<Connection>>,
+    database_id: Option<usize>,
     fts_dir_cursor: Option<BTreeCursor>,
     btree_root_page: Option<i64>,
     hybrid_directory: Option<HybridBTreeDirectory>,
@@ -1805,6 +1823,7 @@ impl FtsCursor {
             cached_parser: None,
             shared_directory_cache,
             connection: None,
+            database_id: None,
             fts_dir_cursor: None,
             btree_root_page: None,
             hybrid_directory: None,
@@ -1821,7 +1840,7 @@ impl FtsCursor {
     }
 
     /// Open the BTree cursor for FTS directory storage
-    fn open_cursor(&mut self, conn: &Arc<Connection>) -> Result<()> {
+    fn open_cursor(&mut self, conn: &Arc<Connection>, database_id: usize) -> Result<()> {
         if self.fts_dir_cursor.is_some() {
             return Ok(());
         }
@@ -1831,10 +1850,11 @@ impl FtsCursor {
         let index_name = format!("{}_key", self.dir_table_name);
 
         // Get root page for HybridBTreeDirectory
-        let pager = conn.pager.load().clone();
-        let schema = conn.schema.read();
-        let scratch = schema
-            .get_index(&self.dir_table_name, &index_name)
+        let pager = conn.get_pager_from_database_index(&database_id);
+        let scratch = conn
+            .with_schema(database_id, |schema| {
+                schema.get_index(&self.dir_table_name, &index_name).cloned()
+            })
             .ok_or_else(|| {
                 LimboError::InternalError(format!(
                     "index {} for table {} not found",
@@ -1842,7 +1862,6 @@ impl FtsCursor {
                 ))
             })?;
         let root_page = scratch.root_page;
-        drop(schema);
 
         self.btree_root_page = Some(root_page);
 
@@ -2537,13 +2556,15 @@ impl Drop for FtsCursor {
 
 impl IndexMethodCursor for FtsCursor {
     /// Creates the FTS index storage (internal BTree table for Tantivy files).
-    fn create(&mut self, conn: &Arc<Connection>) -> Result<IOResult<()>> {
-        initialize_btree_storage_table(conn, &self.dir_table_name)?;
+    fn create(&mut self, conn: &Arc<Connection>, database_id: usize) -> Result<IOResult<()>> {
+        self.database_id = Some(database_id);
+        initialize_btree_storage_table(conn, database_id, &self.dir_table_name)?;
         Ok(IOResult::Done(()))
     }
 
     /// Destroys the FTS index, dropping all storage and clearing caches.
-    fn destroy(&mut self, conn: &Arc<Connection>) -> Result<IOResult<()>> {
+    fn destroy(&mut self, conn: &Arc<Connection>, database_id: usize) -> Result<IOResult<()>> {
+        self.database_id = Some(database_id);
         tracing::debug!(
             "FTS destroy: dropping internal storage {}",
             self.dir_table_name
@@ -2569,7 +2590,14 @@ impl IndexMethodCursor for FtsCursor {
         // then use prepare/run_ignore_rows pattern and disable subtransactions to avoid Busy error
         let drop_table_ast = ast::Stmt::DropTable {
             if_exists: true,
-            tbl_name: ast::QualifiedName::single(ast::Name::exact(self.dir_table_name.clone())),
+            tbl_name: ast::QualifiedName {
+                db_name: conn
+                    .get_database_name_by_index(database_id)
+                    .filter(|name| name != "main")
+                    .map(ast::Name::from_string),
+                name: ast::Name::exact(self.dir_table_name.clone()),
+                alias: None,
+            },
         };
         conn.start_nested();
         let mut stmt = conn.prepare_stmt(drop_table_ast)?;
@@ -2588,15 +2616,16 @@ impl IndexMethodCursor for FtsCursor {
 
     /// Opens the index for reading, loading the catalog and creating a searcher.
     /// Uses async state machine for non-blocking IO during catalog/file loading.
-    fn open_read(&mut self, conn: &Arc<Connection>) -> Result<IOResult<()>> {
+    fn open_read(&mut self, conn: &Arc<Connection>, database_id: usize) -> Result<IOResult<()>> {
+        self.database_id = Some(database_id);
         loop {
             match &mut self.state {
                 FtsState::Init => {
                     self.connection = Some(conn.clone());
                     // Ensure storage table exists
-                    initialize_btree_storage_table(conn, &self.dir_table_name)?;
+                    initialize_btree_storage_table(conn, database_id, &self.dir_table_name)?;
                     // Open BTree cursor (needed for btree_root_page)
-                    self.open_cursor(conn)?;
+                    self.open_cursor(conn, database_id)?;
 
                     // Check for cached directory, avoid expensive catalog reload
                     {
@@ -2893,7 +2922,8 @@ impl IndexMethodCursor for FtsCursor {
 
     /// Opens the index for writing, creating the IndexWriter.
     /// Calls `open_read` first if not already initialized.
-    fn open_write(&mut self, conn: &Arc<Connection>) -> Result<IOResult<()>> {
+    fn open_write(&mut self, conn: &Arc<Connection>, database_id: usize) -> Result<IOResult<()>> {
+        self.database_id = Some(database_id);
         if self.connection.is_none() {
             self.connection = Some(conn.clone());
         }
@@ -2902,7 +2932,7 @@ impl IndexMethodCursor for FtsCursor {
         match &self.state {
             FtsState::Ready => {}
             _ => {
-                let result = self.open_read(conn)?;
+                let result = self.open_read(conn, database_id)?;
                 if let IOResult::IO(io) = result {
                     return Ok(IOResult::IO(io));
                 }
@@ -3277,7 +3307,10 @@ impl IndexMethodCursor for FtsCursor {
 
         // If we're not open for writing, open it
         if self.writer.is_none() {
-            return_if_io!(self.open_write(connection));
+            let database_id = self.database_id.ok_or_else(|| {
+                LimboError::InternalError("FTS cursor database_id is not initialized".to_string())
+            })?;
+            return_if_io!(self.open_write(connection, database_id));
         }
 
         let index = self

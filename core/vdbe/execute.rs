@@ -1097,7 +1097,7 @@ pub fn op_open_read(
             .as_mut()
             .expect("cursor should exist after initialization");
         let cursor = cursor.as_index_method_mut();
-        return_if_io!(cursor.open_read(&program.connection));
+        return_if_io!(cursor.open_read(&program.connection, *db));
         state.pc += 1;
         return Ok(InsnFunctionStepResult::Step);
     }
@@ -9802,7 +9802,7 @@ pub fn op_open_write(
             .as_mut()
             .expect("cursor should exist");
         let cursor = cursor.as_index_method_mut();
-        return_if_io!(cursor.open_write(&program.connection));
+        return_if_io!(cursor.open_write(&program.connection, *db));
         state.pc += 1;
         return Ok(InsnFunctionStepResult::Step);
     }
@@ -9989,7 +9989,7 @@ pub fn op_index_method_create(
         .as_mut()
         .expect("cursor should exist");
     let cursor = cursor.as_index_method_mut();
-    return_if_io!(cursor.create(&program.connection));
+    return_if_io!(cursor.create(&program.connection, *db));
 
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
@@ -10020,7 +10020,7 @@ pub fn op_index_method_destroy(
         .as_mut()
         .expect("cursor should exist");
     let cursor = cursor.as_index_method_mut();
-    return_if_io!(cursor.destroy(&program.connection));
+    return_if_io!(cursor.destroy(&program.connection, *db));
 
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
