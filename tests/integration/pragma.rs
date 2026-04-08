@@ -433,3 +433,20 @@ fn test_pragma_wal_checkpoint_targets_attached_database(db: TempDatabase) {
         "aux pager should have checkpointed frames (got {checkpointed})"
     );
 }
+
+#[turso_macros::test]
+fn test_pragma_temp_wal_checkpoint_without_temp_db_matches_sqlite(_db: TempDatabase) {
+    let db = TempDatabase::new_empty();
+    let conn = db.connect_limbo();
+
+    let rows = limbo_exec_rows(&conn, "PRAGMA temp.wal_checkpoint");
+    assert_eq!(
+        rows.len(),
+        1,
+        "wal_checkpoint should return exactly one row"
+    );
+    assert_eq!(
+        rows[0],
+        vec![RValue::Integer(0), RValue::Integer(-1), RValue::Integer(-1)]
+    );
+}
