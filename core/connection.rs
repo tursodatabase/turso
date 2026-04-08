@@ -293,11 +293,11 @@ impl Connection {
             )?;
             let pager = Arc::new(db._init(None)?);
             pager.set_initial_page_size(page_size)?;
-            return Ok(TempDatabase {
+            Ok(TempDatabase {
                 db,
                 pager,
                 _temp_dir: Some(temp_dir),
-            });
+            })
         }
 
         #[cfg(target_family = "wasm")]

@@ -10717,7 +10717,7 @@ pub fn op_set_cookie(
                 }
                 Cookie::DefaultPageCacheSize => {
                     header.default_page_cache_size =
-                        crate::storage::sqlite3_ondisk::CacheSize::new(*value as i32);
+                        crate::storage::sqlite3_ondisk::CacheSize::new(*value);
                 }
                 Cookie::UserVersion => header.user_version = (*value).into(),
                 Cookie::LargestRootPageNumber => {
