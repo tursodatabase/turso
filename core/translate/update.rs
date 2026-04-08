@@ -1,26 +1,26 @@
 use crate::sync::Arc;
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 
-use crate::schema::{columns_affected_by_update, ROWID_SENTINEL};
+use crate::schema::{ROWID_SENTINEL, columns_affected_by_update};
 use crate::translate::emitter::Resolver;
-use crate::translate::expr::{bind_and_rewrite_expr, BindingBehavior};
+use crate::translate::expr::{BindingBehavior, bind_and_rewrite_expr};
 use crate::translate::expression_index::expression_index_column_usage;
 use crate::translate::plan::{Operation, Scan};
-use crate::translate::planner::{parse_limit, ROWID_STRS};
+use crate::translate::planner::{ROWID_STRS, parse_limit};
 use crate::{
-    bail_parse_error,
+    CaptureDataChangesExt, Connection, bail_parse_error,
     schema::{Schema, Table},
     util::normalize_ident,
     vdbe::builder::{ProgramBuilder, ProgramBuilderOpts},
-    CaptureDataChangesExt, Connection,
 };
 use turso_parser::ast::{self, Expr, SortOrder};
 
 use super::emitter::emit_program;
-use super::expr::process_returning_clause;
+use super::expr::{WalkControl, process_returning_clause, walk_expr};
 use super::optimizer::optimize_plan;
 use super::plan::{
-    ColumnUsedMask, DmlSafety, IterationDirection, JoinedTable, Plan, TableReferences, UpdatePlan,
+    ColumnUsedMask, DmlSafety, DmlSafetyReason, IterationDirection, JoinedTable, Plan,
+    TableReferences, UpdatePlan, WhereTerm,
 };
 use super::planner::{parse_where, plan_ctes_as_outer_refs};
 use super::subquery::{
@@ -433,6 +433,11 @@ pub fn prepare_update_plan(
         resolver,
     )?;
 
+    let mut safety = DmlSafety::default();
+    if where_clause_has_subquery(&where_clause) {
+        safety.require(DmlSafetyReason::SubqueryInWhere);
+    }
+
     // Parse the LIMIT/OFFSET clause
     let (limit, offset) = body
         .limit
@@ -527,8 +532,32 @@ pub fn prepare_update_plan(
         ephemeral_plan: None,
         cdc_update_alter_statement: None,
         non_from_clause_subqueries,
-        safety: DmlSafety::default(),
+        safety,
     }))
+}
+
+/// Check if any WHERE predicate contains a subquery (Subquery, InSelect, or Exists).
+fn where_clause_has_subquery(predicates: &[WhereTerm]) -> bool {
+    for pred in predicates {
+        let mut found = false;
+        let _ = walk_expr(&pred.expr, &mut |e| {
+            if matches!(
+                e,
+                Expr::Subquery(_) | Expr::InSelect { .. } | Expr::Exists(_)
+            ) {
+                found = true;
+            }
+            Ok(if found {
+                WalkControl::SkipChildren
+            } else {
+                WalkControl::Continue
+            })
+        });
+        if found {
+            return true;
+        }
+    }
+    false
 }
 
 fn build_scan_op(table: &Table, iter_dir: IterationDirection) -> Operation {

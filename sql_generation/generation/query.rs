@@ -1,6 +1,6 @@
 use crate::generation::{
-    gen_random_text, pick_index, pick_n_unique, pick_unique, Arbitrary, ArbitraryFrom,
-    ArbitrarySized, GenerationContext, InsertOpts,
+    Arbitrary, ArbitraryFrom, ArbitrarySized, GenerationContext, InsertOpts, gen_random_text,
+    pick_index, pick_n_unique, pick_unique,
 };
 use crate::model::query::alter_table::{AlterTable, AlterTableType, AlterTableTypeDiscriminants};
 use crate::model::query::predicate::Predicate;
@@ -16,11 +16,91 @@ use crate::model::table::{
     Column, ColumnType, Index, JoinType, JoinedTable, Name, SimValue, Table, TableContext,
 };
 use indexmap::IndexSet;
-use rand::seq::IndexedRandom;
 use rand::Rng;
-use turso_parser::ast::{ColumnConstraint, Expr, SortOrder};
+use rand::seq::IndexedRandom;
+use turso_parser::ast::{
+    As, ColumnConstraint, Expr, Literal, OneSelect, Operator, QualifiedName,
+    ResultColumn as AstResultColumn, Select as AstSelect, SelectBody as AstSelectBody,
+    SelectTable as AstSelectTable, SortOrder,
+};
 
 use super::{backtrack, pick};
+
+const CORRELATED_EXISTS_PREDICATE_PROB: f64 = 0.15;
+
+fn random_exists_predicate<R: Rng + ?Sized>(rng: &mut R, table: &Table) -> Option<Predicate> {
+    // Keep generation conservative: this pattern relies on table-qualified outer references.
+    if table.name.contains('.') {
+        return None;
+    }
+
+    let pk_col = table.columns.iter().find(|c| c.is_primary_key())?;
+    let numeric_cols: Vec<&Column> = table
+        .columns
+        .iter()
+        .filter(|c| matches!(c.column_type, ColumnType::Integer | ColumnType::Float))
+        .collect();
+    let probe_col = *pick(&numeric_cols, rng);
+
+    let alias = "t2".to_string();
+    let zero = Expr::Literal(Literal::Numeric("0".to_string()));
+
+    let inner_probe = Expr::Qualified(
+        turso_parser::ast::Name::exact(alias.clone()),
+        turso_parser::ast::Name::exact(probe_col.name.clone()),
+    );
+    let inner_pk = Expr::Qualified(
+        turso_parser::ast::Name::exact(alias.clone()),
+        turso_parser::ast::Name::exact(pk_col.name.clone()),
+    );
+    let outer_pk = Expr::Qualified(
+        turso_parser::ast::Name::exact(table.name.clone()),
+        turso_parser::ast::Name::exact(pk_col.name.clone()),
+    );
+
+    let where_expr = Expr::Binary(
+        Box::new(Expr::Binary(
+            Box::new(inner_probe),
+            Operator::Greater,
+            Box::new(zero),
+        )),
+        Operator::And,
+        Box::new(Expr::Binary(
+            Box::new(inner_pk),
+            Operator::NotEquals,
+            Box::new(outer_pk),
+        )),
+    );
+
+    let subquery = AstSelect {
+        with: None,
+        body: AstSelectBody {
+            select: OneSelect::Select {
+                distinctness: None,
+                columns: vec![AstResultColumn::Expr(
+                    Box::new(Expr::Literal(Literal::Numeric("1".to_string()))),
+                    None,
+                )],
+                from: Some(turso_parser::ast::FromClause {
+                    select: Box::new(AstSelectTable::Table(
+                        QualifiedName::single(turso_parser::ast::Name::exact(table.name.clone())),
+                        Some(As::As(turso_parser::ast::Name::exact(alias))),
+                        None,
+                    )),
+                    joins: vec![],
+                }),
+                where_clause: Some(Box::new(where_expr)),
+                group_by: None,
+                window_clause: vec![],
+            },
+            compounds: vec![],
+        },
+        order_by: vec![],
+        limit: None,
+    };
+
+    Some(Predicate(Expr::Exists(subquery)).parens())
+}
 
 impl Arbitrary for Create {
     fn arbitrary<R: Rng + ?Sized, C: GenerationContext>(rng: &mut R, context: &C) -> Self {
@@ -556,9 +636,15 @@ fn gen_insert_upsert_values<R: Rng + ?Sized, C: GenerationContext>(
 impl Arbitrary for Delete {
     fn arbitrary<R: Rng + ?Sized, C: GenerationContext>(rng: &mut R, env: &C) -> Self {
         let table = pick(env.tables(), rng);
+        let predicate = if rng.random_bool(CORRELATED_EXISTS_PREDICATE_PROB) {
+            random_exists_predicate(rng, table)
+                .unwrap_or_else(|| Predicate::arbitrary_from(rng, env, table))
+        } else {
+            Predicate::arbitrary_from(rng, env, table)
+        };
         Self {
             table: table.name.clone(),
-            predicate: Predicate::arbitrary_from(rng, env, table),
+            predicate,
         }
     }
 }
@@ -709,7 +795,16 @@ impl Arbitrary for Update {
             let unique_value = SimValue::unique_for_type(&column.column_type, base_offset);
             let set_values = vec![(column.name.clone(), SetValue::Simple(unique_value))];
 
-            let predicate = if !table.rows.is_empty() {
+            let predicate = if rng.random_bool(CORRELATED_EXISTS_PREDICATE_PROB) {
+                random_exists_predicate(rng, table).unwrap_or_else(|| {
+                    if !table.rows.is_empty() {
+                        let row = pick(&table.rows, rng);
+                        Predicate::arbitrary_from(rng, env, (table, row))
+                    } else {
+                        Predicate::arbitrary_from(rng, env, table)
+                    }
+                })
+            } else if !table.rows.is_empty() {
                 let row = pick(&table.rows, rng);
                 Predicate::arbitrary_from(rng, env, (table, row))
             } else {
@@ -734,7 +829,12 @@ impl Arbitrary for Update {
                     })
                     .collect();
 
-            let predicate = Predicate::arbitrary_from(rng, env, table);
+            let predicate = if rng.random_bool(CORRELATED_EXISTS_PREDICATE_PROB) {
+                random_exists_predicate(rng, table)
+                    .unwrap_or_else(|| Predicate::arbitrary_from(rng, env, table))
+            } else {
+                Predicate::arbitrary_from(rng, env, table)
+            };
             (set_values, predicate)
         };
 
