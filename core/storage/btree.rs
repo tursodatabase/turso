@@ -8285,9 +8285,7 @@ mod tests {
         io::{Buffer, MemoryIO, OpenFlags, IO},
         schema::IndexColumn,
         storage::{
-            database::DatabaseFile,
-            page_cache::PageCache,
-            pager::{default_page1, CreateBTreeFlags},
+            database::DatabaseFile, page_cache::PageCache, pager::default_page1,
             sqlite3_ondisk::PageSize,
         },
         types::Text,
