@@ -486,3 +486,32 @@ fn test_sqlite_temp_schema_aliases_are_supported(db: TempDatabase) {
         conn.exec_rows("SELECT name FROM sqlite_temp_schema WHERE type='table' AND name='t'");
     assert_eq!(schema_rows, vec![("t".to_string(),)]);
 }
+
+#[turso_macros::test]
+fn test_pragma_temp_store_change_survives_rollback_before_temp_db_exists(db: TempDatabase) {
+    let conn = db.connect_limbo();
+
+    conn.execute("BEGIN").unwrap();
+    conn.execute("PRAGMA temp_store = 2").unwrap();
+    conn.execute("ROLLBACK").unwrap();
+
+    let rows = limbo_exec_rows(&conn, "PRAGMA temp_store");
+    assert_eq!(rows, vec![vec![RValue::Integer(2)]]);
+}
+
+#[turso_macros::test]
+fn test_pragma_temp_store_change_fails_in_transaction_after_temp_db_exists(db: TempDatabase) {
+    let conn = db.connect_limbo();
+
+    conn.execute("BEGIN").unwrap();
+    conn.execute("CREATE TEMP TABLE t(x)").unwrap();
+
+    let err = conn
+        .execute("PRAGMA temp_store = 2")
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.contains("temporary storage cannot be changed from within a transaction"),
+        "unexpected error: {err}",
+    );
+}
