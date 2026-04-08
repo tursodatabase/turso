@@ -471,3 +471,18 @@ fn test_pragma_temp_journal_mode_mvcc_is_ignored_without_corrupting_main(db: Tem
     let rows: Vec<(i64,)> = conn.exec_rows("SELECT x FROM m");
     assert_eq!(rows, vec![(1,)]);
 }
+
+#[turso_macros::test]
+fn test_sqlite_temp_schema_aliases_are_supported(db: TempDatabase) {
+    let conn = db.connect_limbo();
+
+    conn.execute("CREATE TEMP TABLE t(x)").unwrap();
+
+    let master_rows: Vec<(String,)> =
+        conn.exec_rows("SELECT name FROM sqlite_temp_master WHERE type='table' AND name='t'");
+    assert_eq!(master_rows, vec![("t".to_string(),)]);
+
+    let schema_rows: Vec<(String,)> =
+        conn.exec_rows("SELECT name FROM sqlite_temp_schema WHERE type='table' AND name='t'");
+    assert_eq!(schema_rows, vec![("t".to_string(),)]);
+}

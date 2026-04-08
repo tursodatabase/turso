@@ -939,6 +939,31 @@ fn test_alter_table_rename_column_fails_when_trigger_when_clause_references_colu
     );
 }
 
+#[turso_macros::test]
+fn test_alter_temp_table_rename_column_rejects_invalid_trigger_rewrite(db: TempDatabase) {
+    let conn = db.connect_limbo();
+
+    conn.execute("CREATE TEMP TABLE t(a,b)").unwrap();
+    conn.execute(
+        "CREATE TRIGGER tr AFTER INSERT ON temp.t BEGIN
+         INSERT INTO t VALUES(new.a,new.b);
+        END",
+    )
+    .unwrap();
+
+    let result = conn.execute("ALTER TABLE t RENAME COLUMN b TO c");
+    assert!(
+        result.is_err(),
+        "RENAME COLUMN should fail when SQLite would reject the temp trigger rewrite"
+    );
+
+    let error_msg = result.unwrap_err().to_string();
+    assert!(
+        error_msg.contains("error in trigger tr") && error_msg.contains("no such column: new.c"),
+        "unexpected error: {error_msg}",
+    );
+}
+
 #[turso_macros::test(mvcc)]
 fn test_alter_table_rename_column_propagates_to_multiple_triggers(db: TempDatabase) {
     let conn = db.connect_limbo();
