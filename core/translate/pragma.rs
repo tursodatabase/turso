@@ -72,12 +72,11 @@ fn display_table_list_name(database_id: usize, name: &str) -> String {
 
 fn normalize_table_pragma_lookup_name(database_id: usize, name: &str) -> String {
     let normalized = normalize_ident(name);
-    if database_id == crate::TEMP_DB_ID
+    if (database_id == crate::TEMP_DB_ID
         && (normalized.eq_ignore_ascii_case("sqlite_temp_schema")
-            || normalized.eq_ignore_ascii_case("sqlite_temp_master"))
+            || normalized.eq_ignore_ascii_case("sqlite_temp_master")))
+        || normalized.eq_ignore_ascii_case("sqlite_master")
     {
-        crate::schema::SCHEMA_TABLE_NAME.to_string()
-    } else if normalized.eq_ignore_ascii_case("sqlite_master") {
         crate::schema::SCHEMA_TABLE_NAME.to_string()
     } else {
         normalized
@@ -297,6 +296,7 @@ pub fn translate_pragma(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn update_pragma(
     pragma: PragmaName,
     resolver: &Resolver,
@@ -756,6 +756,7 @@ fn update_pragma(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn query_pragma(
     pragma: PragmaName,
     resolver: &Resolver,

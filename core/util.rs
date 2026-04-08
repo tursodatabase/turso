@@ -2114,8 +2114,7 @@ fn rename_identifiers_scoped_inner(
                     let should_rename = if tbl_norm == "new" || tbl_norm == "old" {
                         is_renaming_trigger_table
                     } else {
-                        target_qualifiers
-                            .is_some_and(|qualifiers| qualifiers.iter().any(|q| *q == tbl_norm))
+                        target_qualifiers.is_some_and(|qualifiers| qualifiers.contains(&tbl_norm))
                             || tbl_norm == target_normalized
                     };
                     if should_rename {
@@ -3622,8 +3621,7 @@ fn rename_result_identifiers_scoped(
                     let should_rename = if tbl_norm == "new" || tbl_norm == "old" {
                         is_renaming_trigger_table
                     } else {
-                        target_qualifiers
-                            .is_some_and(|qualifiers| qualifiers.iter().any(|q| *q == tbl_norm))
+                        target_qualifiers.is_some_and(|qualifiers| qualifiers.contains(&tbl_norm))
                             || tbl_norm == target_normalized
                     };
                     if should_rename {
@@ -3823,17 +3821,11 @@ fn expr_still_references_renamed_column(
                 ast::Expr::Qualified(ns, col) | ast::Expr::DoublyQualified(_, ns, col) => {
                     if normalize_ident(col.as_str()) == old_col_normalized {
                         let ns_norm = normalize_ident(ns.as_str());
-                        if (ns_norm == "new" || ns_norm == "old")
-                            && target_normalized == trigger_normalized
-                        {
-                            found = true;
-                        } else if visible_target_qualifiers
-                            .iter()
-                            .any(|qualifier| *qualifier == ns_norm)
-                        {
-                            found = true;
-                        } else if target_normalized == trigger_normalized
-                            && ns_norm == trigger_normalized
+                        if ((ns_norm == "new" || ns_norm == "old")
+                            && target_normalized == trigger_normalized)
+                            || visible_target_qualifiers.contains(&ns_norm)
+                            || (target_normalized == trigger_normalized
+                                && ns_norm == trigger_normalized)
                         {
                             found = true;
                         }

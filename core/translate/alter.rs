@@ -3195,10 +3195,7 @@ fn validate_expr_column_ref_with_context(
                 }
             }
 
-            if from_target_qualifiers
-                .iter()
-                .any(|target_name| ns_norm == *target_name)
-            {
+            if from_target_qualifiers.contains(&ns_norm) {
                 return Err(LimboError::ParseError(format!(
                     "no such column: {old_col_norm}"
                 )));
@@ -4245,10 +4242,7 @@ fn rewrite_expr_column_ref_with_context(
                 }
                 // Check if it's a qualified reference to a FROM clause table that is the
                 // rename target (e.g., src.b in SELECT src.b FROM src)
-                if from_target_qualifiers
-                    .iter()
-                    .any(|target_name| ns_norm == *target_name)
-                {
+                if from_target_qualifiers.contains(&ns_norm) {
                     *col = ast::Name::from_string(new_col_norm);
                 }
             }
@@ -4320,6 +4314,8 @@ fn validate_trigger_columns_after_drop(
     altered_database_id: usize,
 ) -> Result<Option<String>> {
     let trigger_table_norm = normalize_ident(&trigger.table_name);
+    let allow_bare_owning_columns =
+        trigger_database_id == altered_database_id && trigger_table_norm == *altered_table_norm;
 
     // Determine the trigger's owning table columns (post-drop if it's the altered table)
     let owning_table_columns: Option<Vec<String>> = if trigger_database_id == altered_database_id
@@ -4352,6 +4348,7 @@ fn validate_trigger_columns_after_drop(
                 when_expr,
                 &[],
                 &owning_table_columns,
+                allow_bare_owning_columns,
                 altered_table_norm,
                 post_drop_table,
                 resolver,
@@ -4391,6 +4388,7 @@ fn validate_trigger_columns_after_drop(
                         &set.expr,
                         cmd_table_cols.as_deref().unwrap_or(&[]),
                         &owning_table_columns,
+                        allow_bare_owning_columns,
                         altered_table_norm,
                         post_drop_table,
                         resolver,
@@ -4405,6 +4403,7 @@ fn validate_trigger_columns_after_drop(
                         where_expr,
                         cmd_table_cols.as_deref().unwrap_or(&[]),
                         &owning_table_columns,
+                        allow_bare_owning_columns,
                         altered_table_norm,
                         post_drop_table,
                         resolver,
@@ -4423,6 +4422,7 @@ fn validate_trigger_columns_after_drop(
                     select,
                     &[],
                     &owning_table_columns,
+                    allow_bare_owning_columns,
                     altered_table_norm,
                     post_drop_table,
                     resolver,
@@ -4452,6 +4452,7 @@ fn validate_trigger_columns_after_drop(
                         where_expr,
                         cmd_table_cols.as_deref().unwrap_or(&[]),
                         &owning_table_columns,
+                        allow_bare_owning_columns,
                         altered_table_norm,
                         post_drop_table,
                         resolver,
@@ -4467,6 +4468,7 @@ fn validate_trigger_columns_after_drop(
                     select,
                     &[],
                     &owning_table_columns,
+                    allow_bare_owning_columns,
                     altered_table_norm,
                     post_drop_table,
                     resolver,
@@ -5168,10 +5170,12 @@ fn table_reference_exists_after_rename(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn validate_expr_column_refs_after_drop(
     expr: &ast::Expr,
     visible_columns: &[String],
     owning_table_columns: &Option<Vec<String>>,
+    allow_bare_owning_columns: bool,
     altered_table_norm: &str,
     post_drop_table: &BTreeTable,
     resolver: &Resolver,
@@ -5184,6 +5188,7 @@ fn validate_expr_column_refs_after_drop(
                 select,
                 visible_columns,
                 owning_table_columns,
+                allow_bare_owning_columns,
                 altered_table_norm,
                 post_drop_table,
                 resolver,
@@ -5196,6 +5201,7 @@ fn validate_expr_column_refs_after_drop(
                 lhs,
                 visible_columns,
                 owning_table_columns,
+                allow_bare_owning_columns,
                 altered_table_norm,
                 post_drop_table,
                 resolver,
@@ -5209,6 +5215,7 @@ fn validate_expr_column_refs_after_drop(
                 rhs,
                 visible_columns,
                 owning_table_columns,
+                allow_bare_owning_columns,
                 altered_table_norm,
                 post_drop_table,
                 resolver,
@@ -5221,6 +5228,7 @@ fn validate_expr_column_refs_after_drop(
                 expr,
                 visible_columns,
                 owning_table_columns,
+                allow_bare_owning_columns,
                 altered_table_norm,
                 post_drop_table,
                 resolver,
@@ -5243,6 +5251,7 @@ fn validate_expr_column_refs_after_drop(
                     select,
                     visible_columns,
                     owning_table_columns,
+                    allow_bare_owning_columns,
                     altered_table_norm,
                     post_drop_table,
                     resolver,
@@ -5256,6 +5265,7 @@ fn validate_expr_column_refs_after_drop(
                     lhs,
                     visible_columns,
                     owning_table_columns,
+                    allow_bare_owning_columns,
                     altered_table_norm,
                     post_drop_table,
                     resolver,
@@ -5267,6 +5277,7 @@ fn validate_expr_column_refs_after_drop(
                         rhs,
                         visible_columns,
                         owning_table_columns,
+                        allow_bare_owning_columns,
                         altered_table_norm,
                         post_drop_table,
                         resolver,
@@ -5281,6 +5292,7 @@ fn validate_expr_column_refs_after_drop(
                     e,
                     visible_columns,
                     owning_table_columns,
+                    allow_bare_owning_columns,
                     altered_table_norm,
                     post_drop_table,
                     resolver,
@@ -5298,10 +5310,12 @@ fn validate_expr_column_refs_after_drop(
     Ok(bad)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn validate_select_column_refs_after_drop(
     select: &ast::Select,
     outer_visible_columns: &[String],
     owning_table_columns: &Option<Vec<String>>,
+    allow_bare_owning_columns: bool,
     altered_table_norm: &str,
     post_drop_table: &BTreeTable,
     resolver: &Resolver,
@@ -5314,6 +5328,7 @@ fn validate_select_column_refs_after_drop(
                 &cte.select,
                 &[],
                 owning_table_columns,
+                allow_bare_owning_columns,
                 altered_table_norm,
                 post_drop_table,
                 resolver,
@@ -5329,6 +5344,7 @@ fn validate_select_column_refs_after_drop(
         &select.body.select,
         outer_visible_columns,
         owning_table_columns,
+        allow_bare_owning_columns,
         altered_table_norm,
         post_drop_table,
         resolver,
@@ -5343,6 +5359,7 @@ fn validate_select_column_refs_after_drop(
             &compound.select,
             outer_visible_columns,
             owning_table_columns,
+            allow_bare_owning_columns,
             altered_table_norm,
             post_drop_table,
             resolver,
@@ -5378,6 +5395,7 @@ fn validate_select_column_refs_after_drop(
             &sorted_col.expr,
             &body_visible_columns,
             owning_table_columns,
+            allow_bare_owning_columns,
             altered_table_norm,
             post_drop_table,
             resolver,
@@ -5393,6 +5411,7 @@ fn validate_select_column_refs_after_drop(
             &limit.expr,
             &body_visible_columns,
             owning_table_columns,
+            allow_bare_owning_columns,
             altered_table_norm,
             post_drop_table,
             resolver,
@@ -5406,6 +5425,7 @@ fn validate_select_column_refs_after_drop(
                 offset,
                 &body_visible_columns,
                 owning_table_columns,
+                allow_bare_owning_columns,
                 altered_table_norm,
                 post_drop_table,
                 resolver,
@@ -5420,10 +5440,12 @@ fn validate_select_column_refs_after_drop(
     Ok(None)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn validate_one_select_column_refs_after_drop(
     one_select: &ast::OneSelect,
     outer_visible_columns: &[String],
     owning_table_columns: &Option<Vec<String>>,
+    allow_bare_owning_columns: bool,
     altered_table_norm: &str,
     post_drop_table: &BTreeTable,
     resolver: &Resolver,
@@ -5461,6 +5483,7 @@ fn validate_one_select_column_refs_after_drop(
                     from_clause,
                     outer_visible_columns,
                     owning_table_columns,
+                    allow_bare_owning_columns,
                     altered_table_norm,
                     post_drop_table,
                     resolver,
@@ -5477,6 +5500,7 @@ fn validate_one_select_column_refs_after_drop(
                         expr,
                         &local_visible_columns,
                         owning_table_columns,
+                        allow_bare_owning_columns,
                         altered_table_norm,
                         post_drop_table,
                         resolver,
@@ -5493,6 +5517,7 @@ fn validate_one_select_column_refs_after_drop(
                     where_clause,
                     &local_visible_columns,
                     owning_table_columns,
+                    allow_bare_owning_columns,
                     altered_table_norm,
                     post_drop_table,
                     resolver,
@@ -5509,6 +5534,7 @@ fn validate_one_select_column_refs_after_drop(
                         expr,
                         &local_visible_columns,
                         owning_table_columns,
+                        allow_bare_owning_columns,
                         altered_table_norm,
                         post_drop_table,
                         resolver,
@@ -5523,6 +5549,7 @@ fn validate_one_select_column_refs_after_drop(
                         having,
                         &local_visible_columns,
                         owning_table_columns,
+                        allow_bare_owning_columns,
                         altered_table_norm,
                         post_drop_table,
                         resolver,
@@ -5540,6 +5567,7 @@ fn validate_one_select_column_refs_after_drop(
                         partition,
                         &local_visible_columns,
                         owning_table_columns,
+                        allow_bare_owning_columns,
                         altered_table_norm,
                         post_drop_table,
                         resolver,
@@ -5554,6 +5582,7 @@ fn validate_one_select_column_refs_after_drop(
                         &order.expr,
                         &local_visible_columns,
                         owning_table_columns,
+                        allow_bare_owning_columns,
                         altered_table_norm,
                         post_drop_table,
                         resolver,
@@ -5572,6 +5601,7 @@ fn validate_one_select_column_refs_after_drop(
                         expr,
                         outer_visible_columns,
                         owning_table_columns,
+                        allow_bare_owning_columns,
                         altered_table_norm,
                         post_drop_table,
                         resolver,
@@ -5588,10 +5618,12 @@ fn validate_one_select_column_refs_after_drop(
     Ok(None)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn validate_from_clause_column_refs_after_drop(
     from_clause: &ast::FromClause,
     outer_visible_columns: &[String],
     owning_table_columns: &Option<Vec<String>>,
+    allow_bare_owning_columns: bool,
     altered_table_norm: &str,
     post_drop_table: &BTreeTable,
     resolver: &Resolver,
@@ -5603,6 +5635,7 @@ fn validate_from_clause_column_refs_after_drop(
     if let Some(bad) = validate_select_table_column_refs_after_drop(
         &from_clause.select,
         owning_table_columns,
+        allow_bare_owning_columns,
         altered_table_norm,
         post_drop_table,
         resolver,
@@ -5627,6 +5660,7 @@ fn validate_from_clause_column_refs_after_drop(
         if let Some(bad) = validate_select_table_column_refs_after_drop(
             &join.table,
             owning_table_columns,
+            allow_bare_owning_columns,
             altered_table_norm,
             post_drop_table,
             resolver,
@@ -5649,6 +5683,7 @@ fn validate_from_clause_column_refs_after_drop(
                 expr,
                 &on_visible_columns,
                 owning_table_columns,
+                allow_bare_owning_columns,
                 altered_table_norm,
                 post_drop_table,
                 resolver,
@@ -5664,9 +5699,11 @@ fn validate_from_clause_column_refs_after_drop(
     Ok(None)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn validate_select_table_column_refs_after_drop(
     select_table: &ast::SelectTable,
     owning_table_columns: &Option<Vec<String>>,
+    allow_bare_owning_columns: bool,
     altered_table_norm: &str,
     post_drop_table: &BTreeTable,
     resolver: &Resolver,
@@ -5678,6 +5715,7 @@ fn validate_select_table_column_refs_after_drop(
             select,
             &[],
             owning_table_columns,
+            allow_bare_owning_columns,
             altered_table_norm,
             post_drop_table,
             resolver,
@@ -5688,6 +5726,7 @@ fn validate_select_table_column_refs_after_drop(
             from_clause,
             &[],
             owning_table_columns,
+            allow_bare_owning_columns,
             altered_table_norm,
             post_drop_table,
             resolver,
@@ -5700,6 +5739,7 @@ fn validate_select_table_column_refs_after_drop(
                     arg,
                     &[],
                     owning_table_columns,
+                    allow_bare_owning_columns,
                     altered_table_norm,
                     post_drop_table,
                     resolver,
@@ -5815,10 +5855,12 @@ fn result_column_name(column: &ast::ResultColumn) -> Option<String> {
 
 /// Check a single expression node for invalid column references after a DROP COLUMN.
 /// Returns `Some(bad_column_description)` if invalid, `None` if OK.
+#[allow(clippy::too_many_arguments)]
 fn check_column_ref_valid(
     e: &ast::Expr,
     valid_columns: &[String],
     owning_table_columns: &Option<Vec<String>>,
+    allow_bare_owning_columns: bool,
     altered_table_norm: &str,
     post_drop_table: &BTreeTable,
     resolver: &Resolver,
@@ -5828,7 +5870,12 @@ fn check_column_ref_valid(
     match e {
         ast::Expr::Id(col) | ast::Expr::Name(col) => {
             let col_norm = normalize_ident(col.as_str());
-            if !valid_columns.contains(&col_norm) {
+            let is_visible = valid_columns.contains(&col_norm)
+                || (allow_bare_owning_columns
+                    && owning_table_columns
+                        .as_ref()
+                        .is_some_and(|cols| cols.contains(&col_norm)));
+            if !is_visible {
                 return Some(col.to_string());
             }
         }
