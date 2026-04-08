@@ -393,14 +393,26 @@ impl<'a> Resolver<'a> {
             return self.resolve_database_id(qualified_name);
         }
 
-            if ctx.restricts_db_references() {
-                return Ok(ctx.database_id);
+        if let Some(ref ctx) = self.trigger_context {
+            if !ctx.restricts_db_references() {
+                return if self.with_schema(crate::TEMP_DB_ID, |schema| {
+                    schema.get_table(qualified_name.name.as_str()).is_some()
+                        || schema.get_view(qualified_name.name.as_str()).is_some()
+                        || schema
+                            .get_materialized_view(qualified_name.name.as_str())
+                            .is_some()
+                }) {
+                    Ok(crate::TEMP_DB_ID)
+                } else {
+                    Ok(crate::MAIN_DB_ID)
+                };
             }
+            return Ok(ctx.database_id);
         }
 
         let table_name = qualified_name.name.as_str();
         if table_name.eq_ignore_ascii_case(crate::schema::SCHEMA_TABLE_NAME)
-            || table_name.eq_ignore_ascii_case(crate::schema::SCHEMA_TABLE_NAME_ALT)
+            || table_name.eq_ignore_ascii_case("sqlite_master")
         {
             return Ok(crate::MAIN_DB_ID);
         }
