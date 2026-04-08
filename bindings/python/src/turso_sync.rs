@@ -157,6 +157,7 @@ pub fn py_turso_sync_new(
         vfs: None,
         io: None,
         db_file: None,
+        flags: None,
     };
     // calculate and set reserved_bytes from cipher if necessary
     let reserved_bytes = sync_config
