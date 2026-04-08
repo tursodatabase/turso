@@ -69,6 +69,7 @@ fn validate(
     table_name: &str,
     resolver: &Resolver,
     table: &Table,
+    database_id: usize,
     conn: &Arc<Connection>,
 ) -> Result<()> {
     // Check if this is a system table that should be protected from direct writes
@@ -101,7 +102,9 @@ fn validate(
     if table.btree().is_some_and(|t| !t.has_rowid) {
         crate::bail_parse_error!("INSERT into WITHOUT ROWID table is not supported");
     }
-    if table.btree().is_some_and(|t| t.has_autoincrement) && conn.mvcc_enabled() {
+    if table.btree().is_some_and(|t| t.has_autoincrement)
+        && conn.mv_store_for_db(database_id).is_some()
+    {
         crate::bail_parse_error!(
             "AUTOINCREMENT is not supported in MVCC mode (journal_mode=experimental_mvcc)"
         );
@@ -291,7 +294,13 @@ pub fn translate_insert(
     if program.trigger.is_some() && table.virtual_table().is_some() {
         crate::bail_parse_error!("unsafe use of virtual table \"{}\"", tbl_name.name.as_str());
     }
-    validate(table_name.as_str(), resolver, &table, connection)?;
+    validate(
+        table_name.as_str(),
+        resolver,
+        &table,
+        database_id,
+        connection,
+    )?;
 
     let fk_enabled = connection.foreign_keys_enabled();
     if let Some(virtual_table) = &table.virtual_table() {
@@ -331,10 +340,8 @@ pub fn translate_insert(
 
     let cdc_table = prepare_cdc_if_necessary(program, resolver.schema(), table.get_name())?;
 
-    if database_id != crate::MAIN_DB_ID {
-        let schema_cookie = resolver.with_schema(database_id, |s| s.schema_version);
-        program.begin_write_on_database(database_id, schema_cookie);
-    }
+    let schema_cookie = resolver.with_schema(database_id, |s| s.schema_version);
+    program.begin_write_on_database(database_id, schema_cookie);
 
     let mut table_references = TableReferences::new(
         vec![JoinedTable {

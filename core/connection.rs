@@ -2,7 +2,7 @@ use crate::error::io_error;
 #[cfg(any(test, injected_yields))]
 use crate::mvcc::yield_points::YieldInjector;
 use crate::statement::StatementOrigin;
-use crate::storage::journal_mode;
+use crate::storage::{journal_mode, pager::SavepointResult};
 use crate::sync::{
     atomic::{AtomicBool, AtomicI32, AtomicI64, AtomicIsize, AtomicU16, AtomicU64, Ordering},
     Arc, RwLock,
@@ -59,6 +59,13 @@ pub(crate) struct TempDatabase {
     pub(crate) pager: Arc<Pager>,
     #[cfg(not(target_family = "wasm"))]
     _temp_dir: Option<TempDir>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct NamedSavepointFrame {
+    pub(crate) name: String,
+    pub(crate) starts_transaction: bool,
+    pub(crate) deferred_fk_violations: isize,
 }
 
 /// Database connection handle.
@@ -165,6 +172,9 @@ pub struct Connection {
     pub(super) check_constraints_pragma: AtomicBool,
     /// Track when each virtual table instance is currently in transaction.
     pub(crate) vtab_txn_states: RwLock<HashSet<u64>>,
+    /// Connection-level named savepoint stack used to mirror savepoint state
+    /// onto temp/attached databases that start participating after SAVEPOINT.
+    pub(crate) named_savepoints: RwLock<Vec<NamedSavepointFrame>>,
     /// Generation counter bumped whenever any setting that affects PrepareContext
     /// changes. Allows prepared statements to cheaply detect when they need to be
     /// reprepared (single u64 comparison instead of rebuilding the full context).
@@ -1714,7 +1724,9 @@ impl Connection {
                 }
             });
             let schema = Arc::make_mut(schema_arc);
-            f(schema)
+            let result = f(schema);
+            self.bump_prepare_context_generation();
+            result
         }
     }
 
@@ -2203,6 +2215,7 @@ impl Connection {
                     *db.schema.lock() = local_schema;
                 }
             }
+            self.bump_prepare_context_generation();
         }
     }
 
@@ -2607,6 +2620,7 @@ impl Connection {
     /// should all delegate here.
     pub(crate) fn rollback_attached_mvcc_txs(&self, clear_schemas: bool) {
         let txs: HashMap<usize, _> = self.attached_mv_txs.read().clone();
+        let mut cleared_any_schema = false;
         for (&db_id, &(tx_id, _mode)) in &txs {
             if let Some(attached_mv_store) = self.mv_store_for_db(db_id) {
                 let attached_pager = self.get_pager_from_database_index(&db_id);
@@ -2617,11 +2631,15 @@ impl Connection {
                 }
                 if clear_schemas {
                     self.database_schemas().write().remove(&db_id);
+                    cleared_any_schema = true;
                 }
                 attached_pager.end_read_tx();
             }
         }
         self.attached_mv_txs.write().clear();
+        if cleared_any_schema {
+            self.bump_prepare_context_generation();
+        }
     }
 
     /// Rollback WAL-mode transactions on all attached databases and discard
@@ -2640,10 +2658,60 @@ impl Connection {
             for (db_id, _) in &wal_pagers {
                 schemas.remove(db_id);
             }
+            self.bump_prepare_context_generation();
         }
         for (_, attached_pager) in &wal_pagers {
             attached_pager.rollback_attached();
         }
+    }
+
+    pub(crate) fn named_savepoints(&self) -> Vec<NamedSavepointFrame> {
+        self.named_savepoints.read().clone()
+    }
+
+    pub(crate) fn push_named_savepoint(
+        &self,
+        name: String,
+        starts_transaction: bool,
+        deferred_fk_violations: isize,
+    ) {
+        self.named_savepoints.write().push(NamedSavepointFrame {
+            name,
+            starts_transaction,
+            deferred_fk_violations,
+        });
+    }
+
+    pub(crate) fn release_named_savepoint_frame(&self, name: &str) -> SavepointResult {
+        let mut savepoints = self.named_savepoints.write();
+        let Some(target_idx) = savepoints
+            .iter()
+            .rposition(|savepoint| savepoint.name == name)
+        else {
+            return SavepointResult::NotFound;
+        };
+        if savepoints[target_idx].starts_transaction && target_idx == 0 {
+            return SavepointResult::Commit;
+        }
+        savepoints.truncate(target_idx);
+        SavepointResult::Release
+    }
+
+    pub(crate) fn rollback_named_savepoint_frame(&self, name: &str) -> Option<isize> {
+        let mut savepoints = self.named_savepoints.write();
+        let Some(target_idx) = savepoints
+            .iter()
+            .rposition(|savepoint| savepoint.name == name)
+        else {
+            return None;
+        };
+        let deferred_fk_violations = savepoints[target_idx].deferred_fk_violations;
+        savepoints.truncate(target_idx + 1);
+        Some(deferred_fk_violations)
+    }
+
+    pub(crate) fn clear_named_savepoints(&self) {
+        self.named_savepoints.write().clear();
     }
 
     /// Iterate over all attached MVCC transactions, calling `f(db_id, tx_id)` for each.

@@ -865,10 +865,8 @@ pub fn translate_create_table(
     } else {
         resolver.resolve_database_id(&tbl_name)?
     };
-    if database_id != crate::MAIN_DB_ID {
-        let schema_cookie = resolver.with_schema(database_id, |s| s.schema_version);
-        program.begin_write_on_database(database_id, schema_cookie);
-    }
+    let schema_cookie = resolver.with_schema(database_id, |s| s.schema_version);
+    program.begin_write_on_database(database_id, schema_cookie);
     let normalized_tbl_name = normalize_ident(tbl_name.name.as_str());
     validate(&body, &normalized_tbl_name, resolver, connection)?;
 
@@ -960,7 +958,7 @@ pub fn translate_create_table(
         }
     }
 
-    if has_autoincrement && connection.mvcc_enabled() {
+    if has_autoincrement && connection.mv_store_for_db(database_id).is_some() {
         bail_parse_error!(
             "AUTOINCREMENT is not supported in MVCC mode (journal_mode=experimental_mvcc)"
         );
@@ -1502,10 +1500,8 @@ pub fn translate_drop_table(
     };
     program.extend(&opts);
 
-    if database_id != crate::MAIN_DB_ID {
-        let schema_cookie = resolver.with_schema(database_id, |s| s.schema_version);
-        program.begin_write_on_database(database_id, schema_cookie);
-    }
+    let schema_cookie = resolver.with_schema(database_id, |s| s.schema_version);
+    program.begin_write_on_database(database_id, schema_cookie);
 
     let Some(table) = resolver.with_schema(database_id, |s| s.get_table(name)) else {
         if if_exists {

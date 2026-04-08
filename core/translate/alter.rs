@@ -651,10 +651,8 @@ pub fn translate_alter_table(
         body: alter_table,
     } = alter;
     let database_id = resolver.resolve_existing_table_database_id(&qualified_name)?;
-    if database_id != crate::MAIN_DB_ID {
-        let schema_cookie = resolver.with_schema(database_id, |s| s.schema_version);
-        program.begin_write_on_database(database_id, schema_cookie);
-    }
+    let schema_cookie = resolver.with_schema(database_id, |s| s.schema_version);
+    program.begin_write_on_database(database_id, schema_cookie);
     program.begin_write_operation();
     let table_name = qualified_name.name.as_str();
     // For attached databases, qualify sqlite_schema with the database name
