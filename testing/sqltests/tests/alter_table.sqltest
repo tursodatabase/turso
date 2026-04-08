@@ -1610,6 +1610,23 @@ expect {
     900
 }
 
+test temp-trigger-attached-read-cross-table {
+    ATTACH ':memory:' AS aux;
+    CREATE TABLE aux.src_temp_aux_read (a INTEGER PRIMARY KEY, b);
+    CREATE TABLE log_temp_aux_read (v);
+    CREATE TEMP TABLE temp_driver_aux_read (x);
+    INSERT INTO aux.src_temp_aux_read VALUES (1, 901);
+    CREATE TRIGGER trig_temp_aux_read AFTER INSERT ON temp.temp_driver_aux_read BEGIN
+        INSERT INTO log_temp_aux_read
+        SELECT b FROM aux.src_temp_aux_read WHERE a = new.x;
+    END;
+    INSERT INTO temp.temp_driver_aux_read VALUES (1);
+    SELECT * FROM log_temp_aux_read;
+}
+expect {
+    901
+}
+
 test alter-rename-col-cross-table-aggregate {
     DROP TABLE IF EXISTS src;
     DROP TABLE IF EXISTS dst;
