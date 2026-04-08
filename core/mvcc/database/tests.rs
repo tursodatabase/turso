@@ -4312,7 +4312,6 @@ fn get_rows(conn: &Arc<Connection>, query: &str) -> Vec<Vec<Value>> {
 /// What this test checks: MVCC transaction visibility and conflict handling follow the intended isolation behavior.
 /// Why this matters: Concurrency bugs are correctness bugs: they create anomalies users can observe as wrong query results.
 #[test]
-#[ignore]
 fn test_concurrent_writes() {
     struct ConnectionState {
         conn: Arc<Connection>,
