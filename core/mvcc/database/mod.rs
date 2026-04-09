@@ -1283,9 +1283,49 @@ impl<Clock: LogicalClock> CommitStateMachine<Clock> {
         // reference it. The SkipSet iteration order sorts by table_id (most negative
         // first), which would otherwise place data table rows (e.g. table_id=-3)
         // before schema rows (table_id=-1).
-        let collect_versions =
-            |id: &RowID, log_record: &mut LogRecord, did_commit_schema: &mut bool| {
-                if let Some(row_versions) = mvcc_store.rows.get(id) {
+        let collect_versions = |id: &RowID,
+                                log_record: &mut LogRecord,
+                                did_commit_schema: &mut bool| {
+            if let Some(row_versions) = mvcc_store.rows.get(id) {
+                let row_versions = row_versions.value().read();
+                for row_version in row_versions.iter() {
+                    let mut committed_version = row_version.clone();
+                    let mut changed = false;
+                    if let Some(TxTimestampOrID::TxID(vid)) = committed_version.begin {
+                        if vid == self.tx_id {
+                            // New version is valid STARTING FROM the committing
+                            // transaction's end timestamp. See Hekaton page 299.
+                            committed_version.begin = Some(TxTimestampOrID::Timestamp(end_ts));
+                            changed = true;
+                            if committed_version.row.id.table_id == SQLITE_SCHEMA_MVCC_TABLE_ID {
+                                *did_commit_schema = true;
+                            }
+                        }
+                    }
+                    if let Some(TxTimestampOrID::TxID(vid)) = committed_version.end {
+                        if vid == self.tx_id {
+                            // Old version is valid UNTIL the committing
+                            // transaction's end timestamp. See Hekaton page 299.
+                            committed_version.end = Some(TxTimestampOrID::Timestamp(end_ts));
+                            changed = true;
+                            if committed_version.row.id.table_id == SQLITE_SCHEMA_MVCC_TABLE_ID {
+                                *did_commit_schema = true;
+                            }
+                        }
+                    }
+                    if changed {
+                        mvcc_store
+                            .insert_version_raw(&mut log_record.row_versions, committed_version);
+                    }
+                }
+            }
+
+            if let Some(index) = mvcc_store.index_rows.get(&id.table_id) {
+                let index = index.value();
+                let RowKey::Record(ref index_key) = id.row_id else {
+                    panic!("Index writes must have a record key");
+                };
+                if let Some(row_versions) = index.get(index_key) {
                     let row_versions = row_versions.value().read();
                     for row_version in row_versions.iter() {
                         let mut committed_version = row_version.clone();
@@ -1294,14 +1334,8 @@ impl<Clock: LogicalClock> CommitStateMachine<Clock> {
                             if vid == self.tx_id {
                                 // New version is valid STARTING FROM the committing
                                 // transaction's end timestamp. See Hekaton page 299.
-                                committed_version.begin =
-                                    Some(TxTimestampOrID::Timestamp(end_ts));
+                                committed_version.begin = Some(TxTimestampOrID::Timestamp(end_ts));
                                 changed = true;
-                                if committed_version.row.id.table_id
-                                    == SQLITE_SCHEMA_MVCC_TABLE_ID
-                                {
-                                    *did_commit_schema = true;
-                                }
                             }
                         }
                         if let Some(TxTimestampOrID::TxID(vid)) = committed_version.end {
@@ -1310,11 +1344,6 @@ impl<Clock: LogicalClock> CommitStateMachine<Clock> {
                                 // transaction's end timestamp. See Hekaton page 299.
                                 committed_version.end = Some(TxTimestampOrID::Timestamp(end_ts));
                                 changed = true;
-                                if committed_version.row.id.table_id
-                                    == SQLITE_SCHEMA_MVCC_TABLE_ID
-                                {
-                                    *did_commit_schema = true;
-                                }
                             }
                         }
                         if changed {
@@ -1325,45 +1354,8 @@ impl<Clock: LogicalClock> CommitStateMachine<Clock> {
                         }
                     }
                 }
-
-                if let Some(index) = mvcc_store.index_rows.get(&id.table_id) {
-                    let index = index.value();
-                    let RowKey::Record(ref index_key) = id.row_id else {
-                        panic!("Index writes must have a record key");
-                    };
-                    if let Some(row_versions) = index.get(index_key) {
-                        let row_versions = row_versions.value().read();
-                        for row_version in row_versions.iter() {
-                            let mut committed_version = row_version.clone();
-                            let mut changed = false;
-                            if let Some(TxTimestampOrID::TxID(vid)) = committed_version.begin {
-                                if vid == self.tx_id {
-                                    // New version is valid STARTING FROM the committing
-                                    // transaction's end timestamp. See Hekaton page 299.
-                                    committed_version.begin =
-                                        Some(TxTimestampOrID::Timestamp(end_ts));
-                                    changed = true;
-                                }
-                            }
-                            if let Some(TxTimestampOrID::TxID(vid)) = committed_version.end {
-                                if vid == self.tx_id {
-                                    // Old version is valid UNTIL the committing
-                                    // transaction's end timestamp. See Hekaton page 299.
-                                    committed_version.end =
-                                        Some(TxTimestampOrID::Timestamp(end_ts));
-                                    changed = true;
-                                }
-                            }
-                            if changed {
-                                mvcc_store.insert_version_raw(
-                                    &mut log_record.row_versions,
-                                    committed_version,
-                                );
-                            }
-                        }
-                    }
-                }
-            };
+            }
+        };
 
         // First pass: schema rows only
         for id in &self.write_set {
