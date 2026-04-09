@@ -2699,8 +2699,12 @@ impl Connection {
         }
     }
 
-    pub(crate) fn named_savepoints(&self) -> Vec<NamedSavepointFrame> {
-        self.named_savepoints.read().clone()
+    pub(crate) fn with_named_savepoints<F, T>(&self, f: F) -> T
+    where
+        F: FnOnce(&Vec<NamedSavepointFrame>) -> T,
+    {
+        let savepoints = self.named_savepoints.read();
+        f(&savepoints)
     }
 
     pub(crate) fn push_named_savepoint(
