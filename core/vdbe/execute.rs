@@ -10897,55 +10897,63 @@ pub fn op_set_cookie(
         }
     }
 
-    return_if_io!(with_header_mut(
-        &pager,
-        mv_store.as_ref(),
-        program,
-        *db,
-        |header| {
-            match cookie {
-                Cookie::ApplicationId => header.application_id = (*value).into(),
-                Cookie::DatabaseFormat => header.schema_format = (*value as u32).into(),
-                Cookie::DatabaseTextEncoding => {
-                    header.text_encoding = match *value {
-                        1 => crate::storage::sqlite3_ondisk::TextEncoding::Utf8,
-                        2 => crate::storage::sqlite3_ondisk::TextEncoding::Utf16Le,
-                        3 => crate::storage::sqlite3_ondisk::TextEncoding::Utf16Be,
-                        _ => unreachable!("unsupported text encoding cookie value: {}", *value),
-                    };
-                }
-                Cookie::DefaultPageCacheSize => {
-                    header.default_page_cache_size =
-                        crate::storage::sqlite3_ondisk::CacheSize::new(*value);
-                }
-                Cookie::UserVersion => header.user_version = (*value).into(),
-                Cookie::LargestRootPageNumber => {
-                    header.vacuum_mode_largest_root_page = (*value as u32).into();
-                }
-                Cookie::IncrementalVacuum => {
-                    header.incremental_vacuum_enabled = (*value as u32).into()
-                }
-                Cookie::SchemaVersion => {
-                    // Only mark schema_did_change on connection for main database (db 0).
-                    // Attached databases track their schema independently.
-                    if *db == MAIN_DB_ID {
-                        match program.connection.get_tx_state() {
-                            TransactionState::Write { .. } => {
-                                program.connection.set_tx_state(TransactionState::Write { schema_did_change: true });
-                            },
-                            TransactionState::Read => unreachable!("invalid transaction state for SetCookie: TransactionState::Read, should be write"),
-                            TransactionState::None => unreachable!("invalid transaction state for SetCookie: TransactionState::None, should be write"),
-                            TransactionState::PendingUpgrade { .. } => unreachable!("invalid transaction state for SetCookie: TransactionState::PendingUpgrade, should be write"),
-                        }
+    match with_header_mut(&pager, mv_store.as_ref(), program, *db, |header| {
+        match cookie {
+            Cookie::ApplicationId => header.application_id = (*value).into(),
+            Cookie::DatabaseFormat => header.schema_format = (*value as u32).into(),
+            Cookie::DatabaseTextEncoding => {
+                header.text_encoding = match *value {
+                    1 => crate::storage::sqlite3_ondisk::TextEncoding::Utf8,
+                    2 => crate::storage::sqlite3_ondisk::TextEncoding::Utf16Le,
+                    3 => crate::storage::sqlite3_ondisk::TextEncoding::Utf16Be,
+                    _ => {
+                        return Err(LimboError::InternalError(format!(
+                            "unsupported text encoding cookie value: {value}",
+                        )));
                     }
-                    program.connection.with_database_schema_mut(*db, |schema| {
-                        schema.schema_version = *value as u32
-                    });
-                    header.schema_cookie = (*value as u32).into();
+                };
+            }
+            Cookie::DefaultPageCacheSize => {
+                header.default_page_cache_size =
+                    crate::storage::sqlite3_ondisk::CacheSize::new(*value);
+            }
+            Cookie::UserVersion => header.user_version = (*value).into(),
+            Cookie::LargestRootPageNumber => {
+                header.vacuum_mode_largest_root_page = (*value as u32).into();
+            }
+            Cookie::IncrementalVacuum => header.incremental_vacuum_enabled = (*value as u32).into(),
+            Cookie::SchemaVersion => {
+                // Only mark schema_did_change on connection for main database (db 0).
+                // Attached databases track their schema independently.
+                if *db == crate::MAIN_DB_ID {
+                    match program.connection.get_tx_state() {
+                        TransactionState::Write { .. } => {
+                            program.connection.set_tx_state(TransactionState::Write {
+                                schema_did_change: true,
+                            });
+                        }
+                        TransactionState::Read => unreachable!(
+                            "invalid transaction state for SetCookie: TransactionState::Read, should be write"
+                        ),
+                        TransactionState::None => unreachable!(
+                            "invalid transaction state for SetCookie: TransactionState::None, should be write"
+                        ),
+                        TransactionState::PendingUpgrade { .. } => unreachable!(
+                            "invalid transaction state for SetCookie: TransactionState::PendingUpgrade, should be write"
+                        ),
+                    }
                 }
-            };
-        }
-    ));
+                program
+                    .connection
+                    .with_database_schema_mut(*db, |schema| schema.schema_version = *value as u32);
+                header.schema_cookie = (*value as u32).into();
+            }
+        };
+        Ok(())
+    })? {
+        IOResult::Done(result) => result?,
+        IOResult::IO(io) => return Ok(InsnFunctionStepResult::IO(io)),
+    }
 
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
@@ -11859,6 +11867,67 @@ fn sql_might_reference_identifier(sql: &str, ident: &str) -> bool {
         .any(|window| window.eq_ignore_ascii_case(ident))
 }
 
+fn with_relevant_trigger_schemas_mut(
+    conn: &Connection,
+    table_db_id: usize,
+    mut f: impl FnMut(&mut Schema) -> crate::Result<()>,
+) -> crate::Result<()> {
+    conn.with_database_schema_mut(table_db_id, |schema| f(schema))?;
+    if table_db_id != crate::TEMP_DB_ID {
+        conn.with_database_schema_mut(crate::TEMP_DB_ID, |schema| f(schema))?;
+    }
+    Ok(())
+}
+
+fn rewrite_trigger_for_table_rename(
+    trigger: &mut crate::schema::Trigger,
+    normalized_from: &str,
+    normalized_to: &str,
+) {
+    let old_sql = trigger.sql.clone();
+    for cmd in &mut trigger.commands {
+        rewrite_trigger_cmd_table_refs(cmd, normalized_from, normalized_to);
+    }
+    if let Some(ref mut when) = trigger.when_clause {
+        rewrite_check_expr_table_refs(when, normalized_from, normalized_to);
+    }
+    let new_sql = regenerate_trigger_sql(trigger);
+    if new_sql != old_sql {
+        trigger.sql = new_sql;
+    }
+}
+
+fn rewrite_trigger_for_column_rename(
+    trigger: &mut crate::schema::Trigger,
+    table_name: &str,
+    old_col: &str,
+    new_col: &str,
+) -> crate::Result<()> {
+    let trigger_tbl = normalize_ident(&trigger.table_name);
+    if let Some(ref mut when) = trigger.when_clause {
+        rename_identifiers_scoped_when_clause(when, table_name, &trigger_tbl, old_col, new_col);
+    }
+    if trigger_tbl == table_name {
+        if let ast::TriggerEvent::UpdateOf(ref mut cols) = trigger.event {
+            for col in cols {
+                if normalize_ident(col.as_str()) == normalize_ident(old_col) {
+                    *col = ast::Name::exact(new_col.to_owned());
+                }
+            }
+        }
+    }
+    for cmd in &mut trigger.commands {
+        rewrite_trigger_cmd_column_refs(cmd, table_name, &trigger_tbl, old_col, new_col);
+    }
+    if trigger_still_references_renamed_column(trigger, table_name, old_col) {
+        return Err(LimboError::ParseError(format!(
+            "error in trigger {} after rename: no such column: {}",
+            trigger.name, old_col
+        )));
+    }
+    Ok(())
+}
+
 pub fn op_rename_table(
     program: &Program,
     state: &mut ProgramState,
@@ -11943,16 +12012,7 @@ pub fn op_rename_table(
             for trigger_arc in &mut triggers {
                 let trigger = Arc::make_mut(trigger_arc);
                 normalized_to.clone_into(&mut trigger.table_name);
-                // Rewrite table references in trigger body commands
-                for cmd in &mut trigger.commands {
-                    rewrite_trigger_cmd_table_refs(cmd, &normalized_from, &normalized_to);
-                }
-                // Rewrite WHEN clause qualified refs
-                if let Some(ref mut when) = trigger.when_clause {
-                    rewrite_check_expr_table_refs(when, &normalized_from, &normalized_to);
-                }
-                // Regenerate trigger.sql to reflect the updated table name and body
-                trigger.sql = regenerate_trigger_sql(trigger);
+                rewrite_trigger_for_table_rename(trigger, &normalized_from, &normalized_to);
             }
             schema.triggers.insert(normalized_to.to_owned(), triggers);
         }
@@ -11965,17 +12025,7 @@ pub fn op_rename_table(
                     continue;
                 }
                 let trigger = Arc::make_mut(trigger_arc);
-                let old_sql = trigger.sql.clone();
-                for cmd in &mut trigger.commands {
-                    rewrite_trigger_cmd_table_refs(cmd, &normalized_from, &normalized_to);
-                }
-                if let Some(ref mut when) = trigger.when_clause {
-                    rewrite_check_expr_table_refs(when, &normalized_from, &normalized_to);
-                }
-                let new_sql = regenerate_trigger_sql(trigger);
-                if new_sql != old_sql {
-                    trigger.sql = new_sql;
-                }
+                rewrite_trigger_for_table_rename(trigger, &normalized_from, &normalized_to);
             }
         }
 
@@ -11984,23 +12034,13 @@ pub fn op_rename_table(
 
     if *db != crate::TEMP_DB_ID {
         conn.with_database_schema_mut(crate::TEMP_DB_ID, |schema| -> crate::Result<()> {
-            for (_, triggers) in schema.triggers.iter_mut() {
+            for triggers in schema.triggers.values_mut() {
                 for trigger_arc in triggers.iter_mut() {
                     if !sql_might_reference_identifier(&trigger_arc.sql, &normalized_from) {
                         continue;
                     }
                     let trigger = Arc::make_mut(trigger_arc);
-                    let old_sql = trigger.sql.clone();
-                    for cmd in &mut trigger.commands {
-                        rewrite_trigger_cmd_table_refs(cmd, &normalized_from, &normalized_to);
-                    }
-                    if let Some(ref mut when) = trigger.when_clause {
-                        rewrite_check_expr_table_refs(when, &normalized_from, &normalized_to);
-                    }
-                    let new_sql = regenerate_trigger_sql(trigger);
-                    if new_sql != old_sql {
-                        trigger.sql = new_sql;
-                    }
+                    rewrite_trigger_for_table_rename(trigger, &normalized_from, &normalized_to);
                 }
             }
             Ok(())
@@ -12357,66 +12397,22 @@ pub fn op_alter_column(
     })?;
 
     if *rename {
-        let tbl_name = normalized_table_name.clone();
-        let trigger_schema_ids = if *db == crate::TEMP_DB_ID {
-            vec![crate::TEMP_DB_ID]
-        } else {
-            vec![*db, crate::TEMP_DB_ID]
-        };
         // Update in-memory trigger objects for the renamed column in both the
         // altered schema and temp, since temp triggers may reference main/attached tables.
-        for trigger_db_id in trigger_schema_ids {
-            let old_col = old_column_name.clone();
-            let new_col = new_name.clone();
-            let tbl_name = tbl_name.clone();
-            conn.with_database_schema_mut(trigger_db_id, move |schema| {
-                for (_, triggers) in schema.triggers.iter_mut() {
-                    for trigger_arc in triggers.iter_mut() {
-                        let trigger_tbl = normalize_ident(&trigger_arc.table_name);
-                        let trigger = Arc::make_mut(trigger_arc);
-                        // Rewrite WHEN clause: only rename NEW.col / OLD.col qualified refs.
-                        // Bare column names in WHEN clauses are invalid per SQLite semantics,
-                        // so we must not rename them (SQLite would error on such triggers).
-                        if let Some(ref mut when) = trigger.when_clause {
-                            rename_identifiers_scoped_when_clause(
-                                when,
-                                &tbl_name,
-                                &trigger_tbl,
-                                &old_col,
-                                &new_col,
-                            );
-                        }
-                        // Rewrite UPDATE OF columns if trigger is on the renamed table
-                        if trigger_tbl == tbl_name {
-                            if let ast::TriggerEvent::UpdateOf(ref mut cols) = trigger.event {
-                                for col in cols {
-                                    if normalize_ident(col.as_str()) == normalize_ident(&old_col) {
-                                        *col = ast::Name::exact(new_col.clone());
-                                    }
-                                }
-                            }
-                        }
-                        // Rewrite trigger body commands
-                        for cmd in &mut trigger.commands {
-                            rewrite_trigger_cmd_column_refs(
-                                cmd,
-                                &tbl_name,
-                                &trigger_tbl,
-                                &old_col,
-                                &new_col,
-                            );
-                        }
-                        if trigger_still_references_renamed_column(trigger, &tbl_name, &old_col) {
-                            return Err(LimboError::ParseError(format!(
-                                "error in trigger {} after rename: no such column: {}",
-                                trigger.name, old_col
-                            )));
-                        }
-                    }
+        with_relevant_trigger_schemas_mut(&conn, *db, |schema| {
+            for triggers in schema.triggers.values_mut() {
+                for trigger_arc in triggers.iter_mut() {
+                    let trigger = Arc::make_mut(trigger_arc);
+                    rewrite_trigger_for_column_rename(
+                        trigger,
+                        &normalized_table_name,
+                        &old_column_name,
+                        &new_name,
+                    )?;
                 }
-                Ok(())
-            })?;
-        }
+            }
+            Ok(())
+        })?;
 
         let rewrites = view_rewrites;
         conn.with_database_schema_mut(*db, move |schema| -> crate::Result<()> {
