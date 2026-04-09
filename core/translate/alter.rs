@@ -3208,12 +3208,12 @@ fn validate_expr_column_ref_with_context(
 
             if is_renaming_trigger_table
                 && ns_norm.eq_ignore_ascii_case(trigger_table_name)
-                    && trigger_table.get_column(&col_norm).is_some()
-                {
-                    return Err(LimboError::ParseError(format!(
-                        "no such column: {old_col_norm}"
-                    )));
-                }
+                && trigger_table.get_column(&col_norm).is_some()
+            {
+                return Err(LimboError::ParseError(format!(
+                    "no such column: {old_col_norm}"
+                )));
+            }
 
             if from_target_qualifiers.contains(&ns_norm) {
                 return Err(LimboError::ParseError(format!(
