@@ -42,8 +42,7 @@ fn assert_ptrmap_ok_via_rusqlite(db_path: &std::path::Path) {
 
     assert_eq!(
         result, "ok",
-        "ptrmap corrupt (rusqlite integrity_check failed): {}",
-        result
+        "ptrmap corrupt (rusqlite integrity_check failed): {result}"
     );
 }
 
@@ -144,7 +143,7 @@ fn test_ptrmap_updated_after_balance_root() {
         let conn = db.connect().unwrap();
         // Root splits at row ~13; 50 rows ensures balance_root fires.
         for i in 0..50i64 {
-            conn.execute(&format!("INSERT INTO t VALUES ({i}, 'payload_{i:0>32}');"))
+            conn.execute(format!("INSERT INTO t VALUES ({i}, 'payload_{i:0>32}');"))
                 .unwrap();
         }
     }
@@ -172,7 +171,7 @@ fn test_ptrmap_updated_after_balance_quick() {
         let conn = db.connect().unwrap();
         // 200 sequential rows: balance_quick fires ~14 times.
         for i in 0..200i64 {
-            conn.execute(&format!(
+            conn.execute(format!(
                 "INSERT INTO t VALUES ({i}, 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa');"
             ))
             .unwrap();
@@ -203,7 +202,7 @@ fn test_ptrmap_updated_after_balance_non_root() {
         let db = open_autovacuum_db(&path);
         let conn = db.connect().unwrap();
         for i in (0..200i64).rev() {
-            conn.execute(&format!(
+            conn.execute(format!(
                 "INSERT INTO t VALUES ({i}, 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb');"
             ))
             .unwrap();
@@ -238,7 +237,7 @@ fn test_ptrmap_updated_after_interior_page_rebalance() {
         let conn = db.connect().unwrap();
         for i in (0..300i64).rev() {
             let val = format!("key_{i:0>40}_{}", "x".repeat(20));
-            conn.execute(&format!("INSERT INTO t VALUES ({i}, '{val}');"))
+            conn.execute(format!("INSERT INTO t VALUES ({i}, '{val}');"))
                 .unwrap();
         }
     }
@@ -258,13 +257,13 @@ fn test_ptrmap_updated_after_mixed_inserts() {
         let db = open_autovacuum_db(&path);
         let conn = db.connect().unwrap();
         for i in 0..100i64 {
-            conn.execute(&format!(
+            conn.execute(format!(
                 "INSERT INTO t VALUES ({i}, 'cccccccccccccccccccccccccccccccccccc');"
             ))
             .unwrap();
         }
         for i in (100..200i64).rev() {
-            conn.execute(&format!(
+            conn.execute(format!(
                 "INSERT INTO t VALUES ({i}, 'dddddddddddddddddddddddddddddddddddd');"
             ))
             .unwrap();
@@ -287,16 +286,15 @@ fn test_ptrmap_correct_after_delete_and_rebalance() {
         let db = open_autovacuum_db(&path);
         let conn = db.connect().unwrap();
         for i in 0..200i64 {
-            conn.execute(&format!(
+            conn.execute(format!(
                 "INSERT INTO t VALUES ({i}, 'eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee');"
             ))
             .unwrap();
         }
         for i in (0..200i64).step_by(2) {
-            conn.execute(&format!("DELETE FROM t WHERE id = {i};"))
+            conn.execute(format!("DELETE FROM t WHERE id = {i};"))
                 .unwrap();
         }
     }
     assert_ptrmap_ok_via_rusqlite(&path);
 }
-
