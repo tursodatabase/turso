@@ -1,6 +1,5 @@
 @database :memory:
 
-#!/usr/bin/env tclsh
 test basic-tx-1 {
     BEGIN IMMEDIATE; END
 }
@@ -17,5 +16,81 @@ test basic-tx-3 {
     BEGIN DEFERRED; END
 }
 expect {
+}
+
+test temp-table-in-immediate-tx {
+    BEGIN IMMEDIATE;
+    CREATE TEMP TABLE t1(x);
+    INSERT INTO t1 VALUES(1),(2),(3);
+    SELECT * FROM t1;
+    COMMIT;
+}
+expect {
+    1
+    2
+    3
+}
+
+test temp-table-persists-after-immediate-tx {
+    BEGIN IMMEDIATE;
+    CREATE TEMP TABLE t2(a, b);
+    INSERT INTO t2 VALUES('hello', 'world');
+    COMMIT;
+    SELECT * FROM t2;
+}
+expect {
+    hello|world
+}
+
+test temp-table-in-exclusive-tx {
+    BEGIN EXCLUSIVE;
+    CREATE TEMP TABLE t3(v TEXT);
+    INSERT INTO t3 VALUES('a'),('b'),('c');
+    SELECT * FROM t3;
+    COMMIT;
+}
+expect {
+    a
+    b
+    c
+}
+
+test temp-table-in-deferred-tx {
+    BEGIN DEFERRED;
+    CREATE TEMP TABLE t4(n INTEGER);
+    INSERT INTO t4 VALUES(10),(20),(30);
+    SELECT SUM(n) FROM t4;
+    COMMIT;
+}
+expect {
+    60
+}
+
+test temp-and-main-table-in-immediate-tx {
+    CREATE TABLE main_t(id INTEGER PRIMARY KEY);
+    BEGIN IMMEDIATE;
+    INSERT INTO main_t VALUES(1),(2);
+    CREATE TEMP TABLE temp_t(id INTEGER PRIMARY KEY);
+    INSERT INTO temp_t VALUES(10),(20);
+    SELECT m.id, t.id FROM main_t m, temp_t t ORDER BY m.id, t.id;
+    COMMIT;
+}
+expect {
+    1|10
+    1|20
+    2|10
+    2|20
+}
+
+test temp-table-insert-rollback {
+    CREATE TEMP TABLE t_rb(x);
+    INSERT INTO t_rb VALUES(1);
+    BEGIN IMMEDIATE;
+    INSERT INTO t_rb VALUES(2),(3);
+    ROLLBACK;
+    SELECT * FROM t_rb;
+}
+expect {
+    1
 }
 
