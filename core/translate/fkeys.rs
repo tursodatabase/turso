@@ -2,12 +2,12 @@ use rustc_hash::FxHashSet as HashSet;
 use turso_parser::ast::{self, Expr, Literal, Name, QualifiedName, RefAct};
 
 use super::{translate_inner, ProgramBuilder, ProgramBuilderOpts};
+use crate::translate::emitter::cursor_to_registers;
 use crate::translate::expr::emit_table_column_for_dml;
 use crate::{
     error::SQLITE_CONSTRAINT_FOREIGNKEY,
     schema::{
-        stored_deps_of_virtual, BTreeTable, ColumnLayout, ForeignKey, Index, ResolvedFkRef,
-        ROWID_SENTINEL,
+        BTreeTable, ColumnLayout, ForeignKey, Index, ResolvedFkRef, ROWID_SENTINEL,
     },
     translate::{collate::CollationSeq, emitter::Resolver, planner::ROWID_STRS},
     vdbe::{
@@ -738,36 +738,6 @@ fn emit_fk_parent_key_probe(
     }
 
     Ok(())
-}
-
-/// Reads the stored columns needed by `target_columns` into compact registers.
-///
-/// Only the stored columns that are transitively referenced by virtual columns among
-/// `target_columns` are read from the cursor.
-pub fn cursor_to_registers(
-    program: &mut ProgramBuilder,
-    table: &BTreeTable,
-    cursor_id: usize,
-    rowid_reg: usize,
-    target_columns: &[usize],
-) -> DmlColumnContext {
-    let dependencies = stored_deps_of_virtual(&table.columns, target_columns);
-    let base = program.alloc_registers(dependencies.count());
-    let mut next_reg = base;
-    let pairs = table.columns.iter().enumerate().map(|(idx, col)| {
-        let reg = if col.is_rowid_alias() {
-            rowid_reg
-        } else if dependencies.get(idx) {
-            let reg = next_reg;
-            program.emit_column_or_rowid(cursor_id, idx, reg);
-            next_reg += 1;
-            reg
-        } else {
-            0
-        };
-        (col, reg)
-    });
-    DmlColumnContext::from_column_reg_mapping(pairs)
 }
 
 /// Build a parent key vector (in FK parent-column order) into `dest_start`.

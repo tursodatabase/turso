@@ -26,7 +26,6 @@ use crate::translate::expr::{
     bind_and_rewrite_expr, translate_expr_no_constant_opt, walk_expr, walk_expr_mut,
     BindingBehavior, NoConstantOptReason, WalkControl,
 };
-use crate::translate::fkeys::cursor_to_registers;
 use crate::translate::plan::{JoinedTable, NonFromClauseSubquery, Plan, ResultSetColumn};
 use crate::translate::planner::TableMask;
 use crate::translate::planner::ROWID_STRS;
@@ -1411,6 +1410,34 @@ fn rewrite_where_for_update_registers(
         }
         Ok(WalkControl::Continue)
     })
+}
+
+/// Reads the stored columns needed by `target_columns` into compact registers. This takes into
+/// account stored columns, and any stored columns required by virtual columns in `target_columns`.
+pub(crate) fn cursor_to_registers(
+    program: &mut ProgramBuilder,
+    table: &BTreeTable,
+    cursor_id: usize,
+    rowid_reg: usize,
+    target_columns: &[usize],
+) -> DmlColumnContext {
+    let dependencies = stored_deps_of_virtual(&table.columns, target_columns);
+    let base = program.alloc_registers(dependencies.count());
+    let mut next_reg = base;
+    let pairs = table.columns.iter().enumerate().map(|(idx, col)| {
+        let reg = if col.is_rowid_alias() {
+            rowid_reg
+        } else if dependencies.get(idx) {
+            let reg = next_reg;
+            program.emit_column_or_rowid(cursor_id, idx, reg);
+            next_reg += 1;
+            reg
+        } else {
+            0
+        };
+        (col, reg)
+    });
+    DmlColumnContext::from_column_reg_mapping(pairs)
 }
 
 /// Emit code to load the value of an IndexColumn from the OLD image of the row being updated.
