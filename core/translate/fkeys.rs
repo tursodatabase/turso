@@ -6,12 +6,10 @@ use crate::translate::emitter::cursor_to_registers;
 use crate::translate::expr::emit_table_column_for_dml;
 use crate::{
     error::SQLITE_CONSTRAINT_FOREIGNKEY,
-    schema::{
-        BTreeTable, ColumnLayout, ForeignKey, Index, ResolvedFkRef, ROWID_SENTINEL,
-    },
+    schema::{BTreeTable, ColumnLayout, ForeignKey, Index, ResolvedFkRef, ROWID_SENTINEL},
     translate::{collate::CollationSeq, emitter::Resolver, planner::ROWID_STRS},
     vdbe::{
-        builder::{CursorType, DmlColumnContext, QueryMode},
+        builder::{CursorType, QueryMode},
         insn::{CmpInsFlags, Insn},
         BranchOffset,
     },
@@ -444,14 +442,14 @@ pub fn emit_parent_index_key_change_checks(
         .any(|col| table_btree.columns[col.pos_in_table].is_virtual_generated());
 
     let old_key = program.alloc_registers(idx_len);
-    let idx_target_cols: Vec<usize> = index.columns.iter().map(|c| c.pos_in_table).collect();
+    let idx_target_cols = index.columns.iter().map(|c| c.pos_in_table);
     let dml_ctx = some_idx_columns_are_virtual.then(|| {
         cursor_to_registers(
             program,
             table_btree,
             cursor_id,
             old_rowid_reg,
-            &idx_target_cols,
+            idx_target_cols,
         )
     });
     for (i, index_col) in index.columns.iter().enumerate() {
@@ -757,17 +755,16 @@ fn build_parent_key(
             .is_some_and(|(_, c)| c.is_virtual_generated())
     });
 
-    let fk_target_cols: Vec<usize> = parent_cols
+    let fk_target_cols = parent_cols
         .iter()
-        .filter_map(|pcol| parent_bt.get_column(pcol).map(|(pos, _)| pos))
-        .collect();
+        .filter_map(|pcol| parent_bt.get_column(pcol).map(|(pos, _)| pos));
     let ctx = some_fk_cols_are_virtual.then(|| {
         cursor_to_registers(
             program,
             parent_bt,
             parent_cursor_id,
             parent_rowid_reg,
-            &fk_target_cols,
+            fk_target_cols,
         )
     });
 
