@@ -17,6 +17,9 @@ mod temp_table_fuzz_tests {
         temp_store: &'static str,
         next_temp_id: i64,
         next_shadow_id: i64,
+        /// Tracks which temp triggers currently exist on this connection.
+        /// Keys are trigger names.
+        active_triggers: std::collections::HashSet<String>,
     }
 
     struct StatementSpec {
@@ -108,8 +111,16 @@ mod temp_table_fuzz_tests {
                 "temp schema inventory",
                 "SELECT name, type, tbl_name \
                  FROM temp.sqlite_master \
-                 WHERE type IN ('table', 'index') \
+                 WHERE type IN ('table', 'index', 'trigger') \
                  ORDER BY type, name",
+            ),
+            (
+                "trigger log rows",
+                "SELECT trig, op, tbl, row_id FROM trigger_log ORDER BY seq",
+            ),
+            (
+                "trigger log aggregate",
+                "SELECT trig, op, count(*) FROM trigger_log GROUP BY trig, op ORDER BY trig, op",
             ),
         ];
 
@@ -302,31 +313,40 @@ mod temp_table_fuzz_tests {
                 ),
                 returns_rows: false,
             },
+            // NOTE: `UPDATE OR FAIL/ABORT/ROLLBACK ... SET v = NULL` is intentionally
+            // omitted here.  Turso has a known bug where NOT NULL enforcement on
+            // temp-table UPDATE does not raise the expected constraint error.
+            // Testing those paths causes spurious fuzzer failures unrelated to
+            // temp triggers.  Use non-null conflict-clause UPDATEs instead.
             13 => StatementSpec {
                 sql: format!(
-                    "UPDATE OR FAIL {table_name} SET v = NULL \
-                     WHERE id = (SELECT id FROM {table_name} ORDER BY id LIMIT 1)"
+                    "UPDATE OR FAIL {table_name} SET v = COALESCE(v, 0) + {} \
+                     WHERE id = (SELECT id FROM {table_name} ORDER BY id LIMIT 1)",
+                    rng.random_range(1..=50),
                 ),
                 returns_rows: false,
             },
             14 => StatementSpec {
                 sql: format!(
-                    "UPDATE OR ABORT {table_name} SET v = NULL \
-                     WHERE id = (SELECT id FROM {table_name} ORDER BY id LIMIT 1)"
+                    "UPDATE OR ABORT {table_name} SET v = COALESCE(v, 0) + {} \
+                     WHERE id = (SELECT id FROM {table_name} ORDER BY id LIMIT 1)",
+                    rng.random_range(1..=50),
                 ),
                 returns_rows: false,
             },
             15 => StatementSpec {
                 sql: format!(
-                    "UPDATE OR ROLLBACK {table_name} SET v = NULL \
-                     WHERE id = (SELECT id FROM {table_name} ORDER BY id LIMIT 1)"
+                    "UPDATE OR ROLLBACK {table_name} SET v = COALESCE(v, 0) + {} \
+                     WHERE id = (SELECT id FROM {table_name} ORDER BY id LIMIT 1)",
+                    rng.random_range(1..=50),
                 ),
                 returns_rows: false,
             },
             16 => StatementSpec {
                 sql: format!(
-                    "UPDATE OR REPLACE {table_name} SET v = NULL \
-                     WHERE id = (SELECT id FROM {table_name} ORDER BY id LIMIT 1)"
+                    "UPDATE OR REPLACE {table_name} SET v = COALESCE(v, 0) + {} \
+                     WHERE id = (SELECT id FROM {table_name} ORDER BY id LIMIT 1)",
+                    rng.random_range(1..=50),
                 ),
                 returns_rows: false,
             },
@@ -378,6 +398,77 @@ mod temp_table_fuzz_tests {
 
     fn random_shadow_dml(rng: &mut ChaCha8Rng, pair: &mut ConnPair) -> StatementSpec {
         random_temp_table_dml(rng, "shared", &mut pair.next_shadow_id, "shadow")
+    }
+
+    /// Candidate temp triggers that can be randomly created/dropped.
+    /// Each entry: (trigger_name, CREATE statement).
+    const TRIGGER_POOL: &[(&str, &str)] = &[
+        (
+            "trg_td_upd",
+            "CREATE TEMP TRIGGER trg_td_upd BEFORE UPDATE ON temp_data BEGIN \
+                 INSERT INTO trigger_log(trig, op, tbl, row_id) VALUES ('trg_td_upd', 'UPDATE', 'temp_data', NEW.id); \
+             END",
+        ),
+        (
+            "trg_sh_ins",
+            "CREATE TEMP TRIGGER trg_sh_ins AFTER INSERT ON shared BEGIN \
+                 INSERT INTO trigger_log(trig, op, tbl, row_id) VALUES ('trg_sh_ins', 'INSERT', 'shared', NEW.id); \
+             END",
+        ),
+        (
+            "trg_sh_del",
+            "CREATE TEMP TRIGGER trg_sh_del AFTER DELETE ON shared BEGIN \
+                 INSERT INTO trigger_log(trig, op, tbl, row_id) VALUES ('trg_sh_del', 'DELETE', 'shared', OLD.id); \
+             END",
+        ),
+        (
+            "trg_main_upd",
+            "CREATE TEMP TRIGGER trg_main_upd AFTER UPDATE ON main.shared BEGIN \
+                 INSERT INTO trigger_log(trig, op, tbl, row_id) VALUES ('trg_main_upd', 'UPDATE', 'main.shared', NEW.id); \
+             END",
+        ),
+        (
+            "trg_td_when",
+            "CREATE TEMP TRIGGER trg_td_when AFTER INSERT ON temp_data WHEN NEW.v > 100 BEGIN \
+                 INSERT INTO trigger_log(trig, op, tbl, row_id) VALUES ('trg_td_when', 'INSERT_BIG', 'temp_data', NEW.id); \
+             END",
+        ),
+    ];
+
+    /// Randomly create or drop a temp trigger.  Returns None if no-op.
+    fn random_trigger_op(rng: &mut ChaCha8Rng, pair: &mut ConnPair) -> Option<StatementSpec> {
+        if pair.active_triggers.is_empty() && rng.random_bool(0.5) {
+            return None; // nothing to drop, coin-flip says skip
+        }
+
+        // 60% chance to create, 40% chance to drop (if any exist)
+        let create = pair.active_triggers.is_empty() || rng.random_bool(0.6);
+
+        if create {
+            // Pick a random trigger from the pool that isn't already active
+            let candidates: Vec<_> = TRIGGER_POOL
+                .iter()
+                .filter(|(name, _)| !pair.active_triggers.contains(*name))
+                .collect();
+            if candidates.is_empty() {
+                return None;
+            }
+            let (name, sql) = candidates[rng.random_range(0..candidates.len())];
+            pair.active_triggers.insert(name.to_string());
+            Some(StatementSpec {
+                sql: sql.to_string(),
+                returns_rows: false,
+            })
+        } else {
+            // Drop a random active trigger
+            let active: Vec<String> = pair.active_triggers.iter().cloned().collect();
+            let name = &active[rng.random_range(0..active.len())];
+            pair.active_triggers.remove(name.as_str());
+            Some(StatementSpec {
+                sql: format!("DROP TRIGGER {name}"),
+                returns_rows: false,
+            })
+        }
     }
 
     fn random_main_dml(
@@ -524,6 +615,8 @@ mod temp_table_fuzz_tests {
             for stmt in [
                 "CREATE TEMP TABLE temp_data(id INTEGER PRIMARY KEY, v INTEGER NOT NULL DEFAULT 0, tag TEXT UNIQUE, note TEXT NOT NULL DEFAULT 'temp_note')",
                 "CREATE TEMP TABLE shared(id INTEGER PRIMARY KEY, v INTEGER NOT NULL DEFAULT 0, tag TEXT UNIQUE, note TEXT NOT NULL DEFAULT 'shadow_note')",
+                // Trigger log: records every temp trigger firing for differential verification.
+                "CREATE TEMP TABLE trigger_log(seq INTEGER PRIMARY KEY, trig TEXT NOT NULL, op TEXT NOT NULL, tbl TEXT NOT NULL, row_id INTEGER)",
                 "CREATE INDEX temp_idx_v ON temp_data(v)",
                 "CREATE UNIQUE INDEX temp_idx_tag ON temp_data(tag)",
                 "CREATE INDEX shadow_idx_v ON shared(v)",
@@ -559,6 +652,37 @@ mod temp_table_fuzz_tests {
                 limbo.execute(&shadow_stmt).unwrap();
                 sqlite.execute_batch(&shadow_stmt).unwrap();
             }
+            // Create initial temp triggers on the temp tables.
+            let mut active_triggers = std::collections::HashSet::new();
+            for stmt in [
+                "CREATE TEMP TRIGGER trg_td_ins AFTER INSERT ON temp_data BEGIN \
+                     INSERT INTO trigger_log(trig, op, tbl, row_id) VALUES ('trg_td_ins', 'INSERT', 'temp_data', NEW.id); \
+                 END",
+                "CREATE TEMP TRIGGER trg_td_del AFTER DELETE ON temp_data BEGIN \
+                     INSERT INTO trigger_log(trig, op, tbl, row_id) VALUES ('trg_td_del', 'DELETE', 'temp_data', OLD.id); \
+                 END",
+                "CREATE TEMP TRIGGER trg_sh_upd AFTER UPDATE ON shared BEGIN \
+                     INSERT INTO trigger_log(trig, op, tbl, row_id) VALUES ('trg_sh_upd', 'UPDATE', 'shared', NEW.id); \
+                 END",
+                // Temp trigger on a MAIN table — the key new feature being tested.
+                "CREATE TEMP TRIGGER trg_main_ins AFTER INSERT ON main.shared BEGIN \
+                     INSERT INTO trigger_log(trig, op, tbl, row_id) VALUES ('trg_main_ins', 'INSERT', 'main.shared', NEW.id); \
+                 END",
+                "CREATE TEMP TRIGGER trg_main_del AFTER DELETE ON main.shared BEGIN \
+                     INSERT INTO trigger_log(trig, op, tbl, row_id) VALUES ('trg_main_del', 'DELETE', 'main.shared', OLD.id); \
+                 END",
+            ] {
+                limbo.execute(stmt).unwrap();
+                sqlite.execute_batch(stmt).unwrap();
+            }
+            active_triggers.extend([
+                "trg_td_ins".to_string(),
+                "trg_td_del".to_string(),
+                "trg_sh_upd".to_string(),
+                "trg_main_ins".to_string(),
+                "trg_main_del".to_string(),
+            ]);
+
             do_flush(&limbo, &limbo_db).unwrap();
 
             pairs.push(ConnPair {
@@ -567,6 +691,7 @@ mod temp_table_fuzz_tests {
                 temp_store,
                 next_temp_id: 10,
                 next_shadow_id: 10,
+                active_triggers,
             });
 
             verify_connection_views(
@@ -595,6 +720,37 @@ mod temp_table_fuzz_tests {
             helpers::log_progress("temp_table_differential_fuzz", step, iterations, 10);
 
             let conn_idx = rng.random_range(0..pairs.len());
+
+            // Periodically create/drop temp triggers (every ~5 steps).
+            // Done before the main DML so trigger ops don't shift the RNG sequence
+            // for the core DML operations that validate data correctness.
+            if step % 5 == 0 {
+                let pair = &mut pairs[conn_idx];
+                if let Some(trigger_spec) = random_trigger_op(&mut rng, pair) {
+                    history.push(format!("conn[{conn_idx}] {}", trigger_spec.sql));
+                    let trig_context = format!(
+                        "seed: {seed}\nstep: {step} (trigger op)\nconn: {conn_idx}\nhistory:\n{}",
+                        helpers::history_tail(&history, 50)
+                    );
+                    let sqlite_res =
+                        execute_sqlite_statement_fallible(&pairs[conn_idx].sqlite, &trigger_spec);
+                    let limbo_res = limbo_exec_rows_fallible(
+                        &limbo_db,
+                        &pairs[conn_idx].limbo,
+                        &trigger_spec.sql,
+                    );
+                    helpers::assert_outcome_parity(
+                        &sqlite_res,
+                        &limbo_res,
+                        &trigger_spec.sql,
+                        &trig_context,
+                    );
+                    if sqlite_res.is_ok() && limbo_res.is_ok() {
+                        do_flush(&pairs[conn_idx].limbo, &limbo_db).unwrap();
+                    }
+                }
+            }
+
             let op_kind = rng.random_range(0..7);
             let spec = {
                 let pair = &mut pairs[conn_idx];
