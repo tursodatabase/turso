@@ -45,6 +45,43 @@ fn checkpoint_attached_database(
 }
 
 #[turso_macros::test]
+fn test_attached_schema_refreshes_after_other_connection_create(
+    tmp_db: TempDatabase,
+) -> anyhow::Result<()> {
+    let aux_path = tmp_db
+        .path
+        .parent()
+        .unwrap()
+        .join("attach_schema_refresh.db")
+        .to_string_lossy()
+        .to_string();
+
+    let conn1 = tmp_db.connect_limbo();
+    let conn2 = tmp_db.connect_limbo();
+
+    conn1.execute(format!("ATTACH '{aux_path}' AS aux"))?;
+    conn2.execute(format!("ATTACH '{aux_path}' AS aux"))?;
+
+    conn1.execute("CREATE TABLE aux.bootstrap (x INTEGER)")?;
+
+    // Populate conn2's attached-schema cache before conn1 adds another table.
+    let _ = limbo_exec_rows(&conn2, "SELECT * FROM aux.bootstrap");
+
+    conn1.execute("CREATE TABLE aux.created_later (y INTEGER)")?;
+    conn1.execute("INSERT INTO aux.created_later VALUES (1)")?;
+
+    let rows = limbo_exec_rows(&conn2, "SELECT y FROM aux.created_later");
+    assert_eq!(
+        rows.len(),
+        1,
+        "conn2 should see the newly created attached table"
+    );
+    assert_eq!(rows[0], vec![rusqlite::types::Value::Integer(1)]);
+
+    Ok(())
+}
+
+#[turso_macros::test]
 fn test_fresh_attach_inherits_main_page_size(_tmp_db: TempDatabase) -> anyhow::Result<()> {
     let db = attach_enabled_db(DatabaseOpts::new());
     let conn = db.connect_limbo();
