@@ -11877,7 +11877,7 @@ fn with_relevant_trigger_schemas_mut(
     mut f: impl FnMut(&mut Schema) -> crate::Result<()>,
 ) -> crate::Result<()> {
     conn.with_database_schema_mut(table_db_id, |schema| f(schema))?;
-    if table_db_id != crate::TEMP_DB_ID {
+    if table_db_id != crate::TEMP_DB_ID && conn.temp_database.read().is_some() {
         conn.with_database_schema_mut(crate::TEMP_DB_ID, |schema| f(schema))?;
     }
     Ok(())
@@ -12036,7 +12036,7 @@ pub fn op_rename_table(
         Ok(())
     })?;
 
-    if *db != crate::TEMP_DB_ID {
+    if *db != crate::TEMP_DB_ID && conn.temp_database.read().is_some() {
         conn.with_database_schema_mut(crate::TEMP_DB_ID, |schema| -> crate::Result<()> {
             for triggers in schema.triggers.values_mut() {
                 for trigger_arc in triggers.iter_mut() {
