@@ -1387,8 +1387,12 @@ enum AllocatePage1State {
 #[derive(Debug, Clone)]
 enum FreePageState {
     Start,
-    AddToTrunk { page: Arc<Page> },
-    NewTrunk { page: Arc<Page> },
+    AddToTrunk {
+        page: Arc<Page>,
+    },
+    NewTrunk {
+        page: Arc<Page>,
+    },
     /// After the page is added to the freelist, update its ptrmap entry to
     /// FreePage so that autovacuum knows the page is no longer in use.
     /// SQLite equivalent: ptrmapPut(pBt, iPage, PTRMAP_FREEPAGE, 0) in freePage2().
