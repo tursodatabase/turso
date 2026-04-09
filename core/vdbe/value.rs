@@ -191,25 +191,44 @@ fn coerce_to_text_bytes(value: &Value) -> Option<Cow<'_, [u8]>> {
     }
 }
 
-fn count_text_units(bytes: &[u8], stop_at_nul: bool) -> usize {
-    let mut count = 0;
+fn text_units(bytes: &[u8], stop_at_nul: bool) -> impl Iterator<Item = (usize, usize)> + '_ {
+    let mut chunks = bytes.utf8_chunks();
+    let mut chunk_offset = 0;
+    let mut valid_chars: Option<std::str::CharIndices<'_>> = None;
+    let mut valid_len = 0;
+    let mut invalid_len = 0;
 
-    for chunk in bytes.utf8_chunks() {
-        let valid = chunk.valid();
-        if stop_at_nul {
-            if let Some(pos) = valid.as_bytes().iter().position(|&b| b == 0) {
-                count += valid[..pos].chars().count();
-                return count;
+    std::iter::from_fn(move || loop {
+        if let Some(chars) = valid_chars.as_mut() {
+            if let Some((idx, ch)) = chars.next() {
+                let start = chunk_offset + idx;
+                if stop_at_nul && bytes[start] == 0 {
+                    return None;
+                }
+                return Some((start, start + ch.len_utf8()));
+            }
+
+            valid_chars = None;
+            chunk_offset += valid_len;
+            valid_len = 0;
+
+            if invalid_len != 0 {
+                let start = chunk_offset;
+                chunk_offset += invalid_len;
+                invalid_len = 0;
+                return Some((start, chunk_offset));
             }
         }
 
-        count += valid.chars().count();
-        if !chunk.invalid().is_empty() {
-            count += 1;
-        }
-    }
+        let chunk = chunks.next()?;
+        valid_len = chunk.valid().len();
+        valid_chars = Some(chunk.valid().char_indices());
+        invalid_len = chunk.invalid().len();
+    })
+}
 
-    count
+fn count_text_units(bytes: &[u8], stop_at_nul: bool) -> usize {
+    text_units(bytes, stop_at_nul).count()
 }
 
 fn boundary_after_text_units(bytes: &[u8], target: usize) -> usize {
@@ -217,68 +236,22 @@ fn boundary_after_text_units(bytes: &[u8], target: usize) -> usize {
         return 0;
     }
 
-    let mut count = 0;
-    let mut offset = 0;
-
-    for chunk in bytes.utf8_chunks() {
-        let valid = chunk.valid();
-        for (_, ch) in valid.char_indices() {
-            count += 1;
-            offset += ch.len_utf8();
-            if count == target {
-                return offset;
-            }
-        }
-
-        if !chunk.invalid().is_empty() {
-            count += 1;
-            offset += chunk.invalid().len();
-            if count == target {
-                return offset;
-            }
-        }
-    }
-
-    bytes.len()
-}
-
-fn collect_text_units(bytes: &[u8], stop_at_nul: bool) -> Vec<(usize, usize)> {
-    let mut units = Vec::new();
-    let mut offset = 0;
-
-    for chunk in bytes.utf8_chunks() {
-        let valid = chunk.valid();
-        for (idx, ch) in valid.char_indices() {
-            let start = offset + idx;
-            let end = start + ch.len_utf8();
-            if stop_at_nul && bytes[start] == 0 {
-                return units;
-            }
-            units.push((start, end));
-        }
-        offset += valid.len();
-
-        if !chunk.invalid().is_empty() {
-            let invalid_len = chunk.invalid().len();
-            units.push((offset, offset + invalid_len));
-            offset += invalid_len;
-        }
-    }
-
-    units
+    text_units(bytes, false)
+        .nth(target - 1)
+        .map_or(bytes.len(), |(_, end)| end)
 }
 
 fn trim_text_bytes(bytes: &[u8], pattern: Option<&[u8]>, trim_type: TrimType) -> Vec<u8> {
-    let units = collect_text_units(bytes, false);
+    let units: Vec<_> = text_units(bytes, false).collect();
     if units.is_empty() {
         return bytes.to_vec();
     }
 
-    let pattern_storage;
+    let pattern_storage: Vec<(usize, usize)>;
     let pattern_units: Vec<&[u8]> = match pattern {
         None => vec![b" "],
         Some(pattern) => {
-            pattern_storage = collect_text_units(pattern, false);
+            pattern_storage = text_units(pattern, false).collect();
             if pattern_storage.is_empty() {
                 return bytes.to_vec();
             }
@@ -336,17 +309,7 @@ impl Value {
 
     pub fn exec_length(&self) -> Self {
         match self {
-            Value::Text(t) => {
-                if let Ok(s) = t.try_as_str() {
-                    let len_before_null = s.find('\0').map_or_else(
-                        || s.chars().count(),
-                        |null_pos| s[..null_pos].chars().count(),
-                    );
-                    Value::from_i64(len_before_null as i64)
-                } else {
-                    Value::from_i64(count_text_units(t.as_bytes(), true) as i64)
-                }
-            }
+            Value::Text(t) => Value::from_i64(count_text_units(t.as_bytes(), true) as i64),
             Value::Numeric(_) => {
                 // For numbers, SQLite returns the length of the string representation
                 Value::from_i64(self.to_string().chars().count() as i64)
@@ -677,47 +640,6 @@ impl Value {
                     return Value::Null;
                 };
                 let bytes = text.as_ref();
-                if let Ok(s) = std::str::from_utf8(bytes) {
-                    /// Function is stabilized but not released for version 1.88 \
-                    /// https://doc.rust-lang.org/src/core/str/mod.rs.html#453
-                    const fn ceil_char_boundary(s: &str, index: usize) -> usize {
-                        const fn is_utf8_char_boundary(c: u8) -> bool {
-                            (c as i8) >= -0x40
-                        }
-
-                        if index >= s.len() {
-                            s.len()
-                        } else {
-                            let mut i = index;
-                            while i < s.len() {
-                                if is_utf8_char_boundary(s.as_bytes()[i]) {
-                                    break;
-                                }
-                                i += 1;
-                            }
-                            debug_assert!(i <= index + 3);
-                            i
-                        }
-                    }
-
-                    let char_count = s.chars().count();
-                    let (mut start, mut end) =
-                        calculate_postions(start, char_count, length_value.as_ref());
-
-                    let mut start_byte_idx = 0;
-                    end -= start;
-                    while start > 0 {
-                        start_byte_idx = ceil_char_boundary(s, start_byte_idx + 1);
-                        start -= 1;
-                    }
-                    let mut end_byte_idx = start_byte_idx;
-                    while end > 0 {
-                        end_byte_idx = ceil_char_boundary(s, end_byte_idx + 1);
-                        end -= 1;
-                    }
-                    return Value::build_text(s[start_byte_idx..end_byte_idx].to_string());
-                }
-
                 let char_count = count_text_units(bytes, false);
                 let (start, end) = calculate_postions(start, char_count, length_value.as_ref());
 
@@ -956,40 +878,6 @@ impl Value {
         let Some(text) = coerce_to_text_bytes(self) else {
             return Value::Null;
         };
-        if let Ok(text_str) = std::str::from_utf8(text.as_ref()) {
-            let trimmed = match pattern {
-                Some(p) => {
-                    if matches!(p, Value::Null) {
-                        return Value::Null;
-                    }
-                    let Some(pattern) = coerce_to_text_bytes(p) else {
-                        return Value::Null;
-                    };
-                    let Ok(pattern_str) = std::str::from_utf8(pattern.as_ref()) else {
-                        return Value::build_text(trim_text_bytes(
-                            text.as_ref(),
-                            Some(pattern.as_ref()),
-                            trim_type,
-                        ));
-                    };
-                    match trim_type {
-                        TrimType::All => text_str.trim_matches(|c| pattern_str.contains(c)),
-                        TrimType::Left => text_str.trim_start_matches(|c| pattern_str.contains(c)),
-                        TrimType::Right => text_str.trim_end_matches(|c| pattern_str.contains(c)),
-                    }
-                    .as_bytes()
-                    .to_vec()
-                }
-                None => match trim_type {
-                    TrimType::All => text_str.trim_matches(' '),
-                    TrimType::Left => text_str.trim_start_matches(' '),
-                    TrimType::Right => text_str.trim_end_matches(' '),
-                }
-                .as_bytes()
-                .to_vec(),
-            };
-            return Value::build_text(trimmed);
-        }
         let trimmed = match pattern {
             Some(p) => {
                 if matches!(p, Value::Null) {
