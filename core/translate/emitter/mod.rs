@@ -31,7 +31,7 @@ use crate::translate::expr::{
 use crate::translate::plan::{JoinedTable, NonFromClauseSubquery, Plan, ResultSetColumn};
 use crate::translate::planner::TableMask;
 use crate::translate::planner::ROWID_STRS;
-use crate::translate::trigger_exec::get_relevant_triggers_type_and_time;
+use crate::translate::trigger_exec::{get_triggers_with_temp, has_triggers_with_temp};
 use crate::translate::window::WindowMetadata;
 use crate::util::{
     check_expr_references_column, exprs_are_equivalent, normalize_ident, parse_numeric_literal,

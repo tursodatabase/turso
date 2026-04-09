@@ -34,7 +34,7 @@ use crate::{
             NonFromClauseSubquery, OuterQueryReference, QueryDestination, ResultSetColumn, Scan,
             SeekKeyComponent, SubqueryState,
         },
-        trigger_exec::has_relevant_triggers_type_only,
+        trigger_exec::has_triggers_with_temp,
     },
     types::SeekOp,
     util::{
@@ -838,14 +838,13 @@ fn first_update_safety_reason(
         // Check if there are UPDATE triggers
         let updated_cols: HashSet<usize> = plan.set_clauses.iter().map(|(i, _)| *i).collect();
         let database_id = table_ref.database_id;
-        if resolver.with_schema(database_id, |s| {
-            has_relevant_triggers_type_only(
-                s,
-                TriggerEvent::Update,
-                Some(&updated_cols),
-                btree_table,
-            )
-        }) {
+        if has_triggers_with_temp(
+            resolver,
+            database_id,
+            TriggerEvent::Update,
+            Some(&updated_cols),
+            btree_table,
+        ) {
             break 'requires Some(DmlSafetyReason::Trigger);
         }
 

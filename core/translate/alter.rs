@@ -355,12 +355,13 @@ fn strict_default_type_mismatch(column: &Column) -> Result<bool> {
 fn emit_add_column_default_type_validation(
     program: &mut ProgramBuilder,
     original_btree: &Arc<BTreeTable>,
+    database_id: usize,
 ) -> Result<()> {
     let check_cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(original_btree.clone()));
     program.emit_insn(Insn::OpenRead {
         cursor_id: check_cursor_id,
         root_page: original_btree.root_page,
-        db: crate::MAIN_DB_ID,
+        db: database_id,
     });
 
     let skip_check_label = program.allocate_label();
@@ -1189,16 +1190,7 @@ pub fn translate_alter_table(
                 }
             }
 
-            let sql = btree.to_sql();
-            let mut escaped = String::with_capacity(sql.len());
-
-            for ch in sql.chars() {
-                match ch {
-                    '\'' => escaped.push_str("''"),
-                    ch => escaped.push(ch),
-                }
-            }
-
+            let escaped = escape_sql_string_literal(&btree.to_sql());
             let escaped_table_name = escape_sql_string_literal(table_name);
             let stmt = format!(
                 r#"
@@ -1279,7 +1271,7 @@ pub fn translate_alter_table(
                 }
 
                 if default_type_mismatch {
-                    emit_add_column_default_type_validation(program, &original_btree)?;
+                    emit_add_column_default_type_validation(program, &original_btree, database_id)?;
                 }
 
                 emit_add_column_check_validation(
@@ -1633,7 +1625,7 @@ pub fn translate_alter_table(
             // If renaming, rewrite trigger SQL for all triggers that reference this column
             // We'll collect the triggers to rewrite and update them in sqlite_schema
             let mut triggers_to_rewrite: Vec<(usize, String, String)> = Vec::new();
-            let mut views_to_rewrite: Vec<(String, String)> = Vec::new();
+            let mut views_to_rewrite: Vec<(usize, String, String)> = Vec::new();
             if rename {
                 // Try to rewrite every trigger's SQL for the column rename.
                 // If the rewritten SQL differs from the original, include it
@@ -1715,16 +1707,45 @@ pub fn translate_alter_table(
                             from,
                             col_name,
                         )? {
-                            rewrites.push((view_name.clone(), rewritten.sql));
+                            rewrites.push((database_id, view_name.clone(), rewritten.sql));
                         }
                     }
                     Ok(rewrites)
                 })?;
+                // Also search temp schema for views referencing the renamed column
+                // (temp views can reference main/attached tables).
+                if database_id != crate::TEMP_DB_ID {
+                    let temp_rewrites =
+                        resolver.with_schema(crate::TEMP_DB_ID, |s| -> Result<_> {
+                            let mut rewrites = Vec::new();
+                            for (view_name, view) in s.views.iter() {
+                                if let Some(rewritten) = rewrite_view_sql_for_column_rename(
+                                    &view.sql,
+                                    s,
+                                    table_name,
+                                    &target_db_name,
+                                    from,
+                                    col_name,
+                                )? {
+                                    rewrites.push((
+                                        crate::TEMP_DB_ID,
+                                        view_name.clone(),
+                                        rewritten.sql,
+                                    ));
+                                }
+                            }
+                            Ok(rewrites)
+                        })?;
+                    views_to_rewrite.extend(temp_rewrites);
+                }
             }
-            let temp_schema_version = if triggers_to_rewrite
+            let has_temp_rewrites = triggers_to_rewrite
                 .iter()
                 .any(|(db, _, _)| *db == crate::TEMP_DB_ID)
-            {
+                || views_to_rewrite
+                    .iter()
+                    .any(|(db, _, _)| *db == crate::TEMP_DB_ID);
+            let temp_schema_version = if has_temp_rewrites {
                 let schema_cookie = resolver.with_schema(crate::TEMP_DB_ID, |s| s.schema_version);
                 program.begin_write_on_database(crate::TEMP_DB_ID, schema_cookie);
                 Some(schema_cookie)
@@ -1847,11 +1868,12 @@ pub fn translate_alter_table(
             }
 
             // Update view SQL for renamed columns
-            for (view_name, new_sql) in views_to_rewrite {
+            for (view_database_id, view_name, new_sql) in views_to_rewrite {
                 let escaped_sql = escape_sql_string_literal(&new_sql);
+                let view_schema_table = schema_table_name_for_db(resolver, view_database_id);
                 let update_stmt = format!(
                     r#"
-                        UPDATE {qualified_schema_table}
+                        UPDATE {view_schema_table}
                         SET sql = '{escaped_sql}'
                         WHERE name = '{view_name}' COLLATE NOCASE AND type = 'view'
                     "#,
@@ -2385,6 +2407,7 @@ fn rewrite_trigger_sql_for_column_rename(
             new_when_clause.as_deref().cloned(),
             new_commands.clone(),
             temporary,
+            Some(target_database_id),
         );
         if let Some(bad_column) = validate_trigger_columns_after_drop(
             &rewritten_trigger,
