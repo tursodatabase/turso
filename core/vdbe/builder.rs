@@ -45,7 +45,7 @@ use super::{
     affinity::Affinity, BranchOffset, CursorID, Insn, InsnReference, JumpTarget, PrepareContext,
     PreparedProgram, Program,
 };
-use crate::translate::plan::ColumnUsedMask;
+use crate::translate::plan::{BitSet, ColumnUsedMask};
 use std::num::NonZeroUsize;
 
 /// A key that uniquely identifies a cursor.
@@ -136,7 +136,7 @@ pub struct DmlColumnContext {
     registers: DmlColumnRegisters,
     rowid_alias_col: Option<usize>,
     /// Bitset marking which columns are virtual generated.
-    virtual_mask: ColumnUsedMask,
+    virtual_mask: BitSet,
     /// rank-indexed by `virtual_mask`.
     virtual_data: Vec<(Box<Expr>, Affinity)>,
 }
@@ -176,7 +176,7 @@ impl DmlColumnContext {
 
     pub fn from_column_reg_mapping<'a>(pairs: impl Iterator<Item = (&'a Column, usize)>) -> Self {
         let mut rowid_alias_col = None;
-        let mut virtual_mask = ColumnUsedMask::default();
+        let mut virtual_mask = BitSet::default();
         let mut virtual_data = Vec::new();
         let mut column_regs = Vec::new();
         for (idx, (col, reg)) in pairs.enumerate() {
@@ -223,24 +223,6 @@ impl DmlColumnContext {
             }
             DmlColumnRegisters::Indexed { column_regs } => column_regs[col_idx],
         }
-    }
-
-    fn extract_column_info(
-        columns: &[Column],
-    ) -> (Option<usize>, ColumnUsedMask, Vec<(Box<Expr>, Affinity)>) {
-        let mut rowid_alias_col = None;
-        let mut virtual_mask = ColumnUsedMask::default();
-        let mut virtual_data = Vec::new();
-        for (idx, col) in columns.iter().enumerate() {
-            if col.is_rowid_alias() {
-                rowid_alias_col = Some(idx);
-            }
-            if let GeneratedType::Virtual { resolved, .. } = col.generated_type() {
-                virtual_mask.set(idx);
-                virtual_data.push((resolved.clone(), col.affinity()));
-            }
-        }
-        (rowid_alias_col, virtual_mask, virtual_data)
     }
 }
 
