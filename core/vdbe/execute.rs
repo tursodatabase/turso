@@ -15168,8 +15168,9 @@ mod tests {
     #[test]
     fn test_negate_blob_subscript_invalid_utf8_no_panic() {
         // Negating a blob subscript that extracts a "text" value containing
-        // invalid UTF-8 bytes must not panic. The record decoder uses
-        // from_utf8_unchecked, so ArrayElement must validate extracted text.
+        // invalid UTF-8 bytes must not panic. Record decode preserves the raw
+        // TEXT bytes, so ArrayElement must not assume extracted text is valid
+        // UTF-8.
         //
         // Reproduces fuzzer bug at seed 27035.
         let io: Arc<dyn IO> = Arc::new(MemoryIO::new());

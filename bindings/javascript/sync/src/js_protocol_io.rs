@@ -229,23 +229,26 @@ impl SyncEngineIo for JsProtocolIo {
         &self,
         mutations: Vec<turso_sync_engine::types::DatabaseRowMutation>,
     ) -> turso_sync_engine::Result<Self::DataCompletionTransform> {
-        Ok(self.add_request(JsProtocolRequest::Transform {
-            mutations: mutations
-                .into_iter()
-                .filter_map(|mutation| {
-                    let change_type = core_change_type_to_js(mutation.change_type)?;
-                    Some(DatabaseRowMutationJs {
-                        change_time: mutation.change_time as i64,
-                        table_name: mutation.table_name,
-                        id: mutation.id,
-                        change_type,
-                        before: mutation.before.map(core_values_map_to_js),
-                        after: mutation.after.map(core_values_map_to_js),
-                        updates: mutation.updates.map(core_values_map_to_js),
-                    })
+        let mutations = mutations
+            .into_iter()
+            .filter_map(|mutation| {
+                core_change_type_to_js(mutation.change_type)
+                    .map(|change_type| (mutation, change_type))
+            })
+            .map(|(mutation, change_type)| {
+                Ok(DatabaseRowMutationJs {
+                    change_time: mutation.change_time as i64,
+                    table_name: mutation.table_name,
+                    id: mutation.id,
+                    change_type,
+                    before: mutation.before.map(core_values_map_to_js).transpose()?,
+                    after: mutation.after.map(core_values_map_to_js).transpose()?,
+                    updates: mutation.updates.map(core_values_map_to_js).transpose()?,
                 })
-                .collect(),
-        }))
+            })
+            .collect::<turso_sync_engine::Result<Vec<_>>>()?;
+
+        Ok(self.add_request(JsProtocolRequest::Transform { mutations }))
     }
 
     fn add_io_callback(&self, callback: Box<dyn FnMut() -> bool + Send>) {

@@ -60,7 +60,7 @@ impl Hash128 {
                 }
                 Value::Text(t) => {
                     s.push_str("T:");
-                    s.push_str(&t.as_str_lossy());
+                    s.push_str(&hex::encode(t.as_bytes()));
                 }
                 Value::Blob(b) => {
                     s.push_str("B:");
@@ -544,5 +544,16 @@ mod tests {
         let final_row = &delta.changes[0];
         assert_eq!(final_row.0.rowid, 2);
         assert_eq!(final_row.1, 2);
+    }
+
+    #[test]
+    fn test_hash_values_distinguishes_invalid_text_bytes() {
+        let ff = Value::Text(crate::types::Text::new(vec![0xFF]));
+        let fe = Value::Text(crate::types::Text::new(vec![0xFE]));
+
+        let ff_hash = Hash128::hash_values(&[ff]);
+        let fe_hash = Hash128::hash_values(&[fe]);
+
+        assert_ne!(ff_hash, fe_hash);
     }
 }
