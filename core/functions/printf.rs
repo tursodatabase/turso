@@ -164,7 +164,7 @@ fn coerce_to_i64(value: &Value) -> i64 {
     match value {
         Value::Numeric(Numeric::Integer(i)) => *i,
         Value::Numeric(Numeric::Float(f)) => f64::from(*f) as i64,
-        Value::Text(t) => str_to_i64(t.as_str()).unwrap_or(0),
+        Value::Text(t) => str_to_i64(t.as_str_lossy()).unwrap_or(0),
         Value::Blob(b) => {
             let s = String::from_utf8_lossy(b);
             str_to_i64(s.as_ref()).unwrap_or(0)
@@ -191,7 +191,7 @@ fn coerce_to_string(value: &Value) -> String {
         Value::Null => String::new(),
         Value::Numeric(Numeric::Integer(i)) => i.to_string(),
         Value::Numeric(Numeric::Float(f)) => format_float(f64::from(*f)),
-        Value::Text(t) => t.as_str().to_string(),
+        Value::Text(t) => t.as_str_lossy().into_owned(),
         Value::Blob(b) => String::from_utf8_lossy(b).to_string(),
     }
 }
@@ -1073,7 +1073,7 @@ fn format_string(output: &mut String, value: &Value, spec: &FormatSpec) {
 fn format_char(output: &mut String, value: &Value, spec: &FormatSpec) {
     // In SQLite SQL context, %c takes the first character of the string representation
     let c = match value {
-        Value::Text(t) => t.value.chars().next().unwrap_or('\0'),
+        Value::Text(t) => t.as_str_lossy().chars().next().unwrap_or('\0'),
         _ => {
             let s = coerce_to_string(value);
             s.chars().next().unwrap_or('\0')
@@ -1255,19 +1255,19 @@ pub fn exec_printf(values: &[Register]) -> crate::Result<Value> {
     let format_value = values[0].get_value();
     let fmt_owned: String;
     let format_str = match &format_value {
-        Value::Text(t) => t.as_str(),
+        Value::Text(t) => t.as_str_lossy(),
         Value::Null => return Ok(Value::Null),
         Value::Numeric(Numeric::Integer(i)) => {
             fmt_owned = i.to_string();
-            fmt_owned.as_str()
+            std::borrow::Cow::Borrowed(fmt_owned.as_str())
         }
         Value::Numeric(Numeric::Float(f)) => {
             fmt_owned = format_float(f64::from(*f));
-            fmt_owned.as_str()
+            std::borrow::Cow::Borrowed(fmt_owned.as_str())
         }
         Value::Blob(b) => {
             fmt_owned = String::from_utf8_lossy(b).to_string();
-            fmt_owned.as_str()
+            std::borrow::Cow::Borrowed(fmt_owned.as_str())
         }
     };
 
@@ -1471,7 +1471,7 @@ mod tests {
         // Huge finite float must not overflow rounding to produce "inf"
         let huge = exec_printf(&[text("%f"), float(1e308)]).unwrap();
         let huge_str = match &huge {
-            Value::Text(t) => t.as_str().to_string(),
+            Value::Text(t) => t.try_as_str().unwrap().to_string(),
             _ => panic!("expected text"),
         };
         assert!(huge_str.starts_with("9999999999999999"));
@@ -1778,7 +1778,7 @@ mod tests {
         // infinity without flag_zeropad → "Inf"
         let inf_f = exec_printf(&[text("%020f"), float(f64::INFINITY)]).unwrap();
         let inf_str = match &inf_f {
-            Value::Text(t) => t.as_str().to_string(),
+            Value::Text(t) => t.try_as_str().unwrap().to_string(),
             _ => panic!("expected text"),
         };
         assert!(inf_str.starts_with("9000"));
@@ -1836,7 +1836,7 @@ mod tests {
         // ! flag with %f infinity: strips trailing fractional zeros
         let inf_bang_f = exec_printf(&[text("%!0f"), float(f64::INFINITY)]).unwrap();
         let inf_bang_str = match &inf_bang_f {
-            Value::Text(t) => t.as_str().to_string(),
+            Value::Text(t) => t.try_as_str().unwrap().to_string(),
             _ => panic!("expected text"),
         };
         assert!(

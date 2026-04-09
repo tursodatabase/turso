@@ -1050,16 +1050,31 @@ impl Schema {
                         ValueRef::Text(sql) => Some(sql),
                         _ => None,
                     };
-                    let sql = sql_textref.map(|s| s.as_str());
+                    let ty = ty.try_as_str().map_err(|_| {
+                        LimboError::Corrupt("sqlite_schema type must be valid UTF-8".into())
+                    })?;
+                    let name = name.try_as_str().map_err(|_| {
+                        LimboError::Corrupt("sqlite_schema name must be valid UTF-8".into())
+                    })?;
+                    let table_name = table_name.try_as_str().map_err(|_| {
+                        LimboError::Corrupt("sqlite_schema tbl_name must be valid UTF-8".into())
+                    })?;
+                    let sql = sql_textref
+                        .map(|s| {
+                            s.try_as_str().map_err(|_| {
+                                LimboError::Corrupt("sqlite_schema sql must be valid UTF-8".into())
+                            })
+                        })
+                        .transpose()?;
 
                     let acc = state
                         .accumulators
                         .as_mut()
                         .expect("accumulators must be initialized in Init phase");
                     self.handle_schema_row(
-                        &ty,
-                        &name,
-                        &table_name,
+                        ty,
+                        name,
+                        table_name,
                         root_page,
                         sql,
                         syms,

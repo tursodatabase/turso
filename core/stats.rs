@@ -137,11 +137,11 @@ fn load_sqlite_stat1_from_stmt(
 
         let idx_name = match idx_value {
             Value::Null => None,
-            Value::Text(s) => Some(s.as_str()),
+            Value::Text(s) => Some(s.as_str_lossy()),
             _ => None,
         };
         let stat = match stat_value {
-            Value::Text(s) => s.as_str(),
+            Value::Text(s) => s.as_str_lossy(),
             _ => return Ok(()),
         };
 
@@ -149,7 +149,7 @@ fn load_sqlite_stat1_from_stmt(
         if schema.get_btree_table(table_name).is_none() {
             return Ok(());
         }
-        let Some(numbers) = parse_stat_numbers(stat) else {
+        let Some(numbers) = parse_stat_numbers(&stat) else {
             return Ok(());
         };
         if numbers.is_empty() {
@@ -163,7 +163,7 @@ fn load_sqlite_stat1_from_stmt(
         }
 
         // Index-level entry: only keep if the index exists on this table.
-        let idx_name = normalize_ident(idx_name.unwrap());
+        let idx_name = normalize_ident(idx_name.as_deref().unwrap());
         if schema.get_index(table_name, &idx_name).is_none() {
             return Ok(());
         }

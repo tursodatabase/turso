@@ -356,7 +356,7 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
     ///    * The row is not a delete (we inserted or changed an existing row), OR
     ///    * The row is a delete AND it exists in the database file already.
     ///      If the row didn't exist in the database file and was deleted, we can simply not write it.
-    fn collect_committed_table_row_versions(&mut self) {
+    fn collect_committed_table_row_versions(&mut self) -> Result<()> {
         // Invariant: RowID ordering is (table_id, row_id) with table_id ascending.
         // Since MV table IDs are negative and sqlite_schema is table_id=-1, iterating
         // in reverse visits sqlite_schema first so CREATE/DROP metadata is applied
@@ -395,9 +395,12 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                     let ValueRef::Text(type_str) = col0 else {
                         panic!("sqlite_schema.type column must be TEXT, got {col0:?}");
                     };
+                    let type_str = type_str.try_as_str().map_err(|_| {
+                        LimboError::Corrupt("sqlite_schema.type must be valid UTF-8".into())
+                    })?;
 
                     if let ValueRef::Numeric(Numeric::Integer(root_page)) = col3 {
-                        if type_str.as_str() == "index" {
+                        if type_str == "index" {
                             // This is an index schema change
                             if is_delete {
                                 // DROP INDEX
@@ -452,7 +455,7 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                                 // to index SQL). No B-tree creation needed; the row itself is written
                                 // to sqlite_schema below. See: test_checkpoint_allows_index_schema_update_after_rename_column.
                             }
-                        } else if type_str.as_str() == "table" {
+                        } else if type_str == "table" {
                             // This is a table schema change (existing logic)
                             tracing::trace!("table schema change with root page {root_page}, is_delete={is_delete}");
                             if is_delete {
@@ -512,6 +515,7 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                 version.0.row.id.row_id.clone(),
             )
         });
+        Ok(())
     }
 
     /// Collect all committed index row versions that need to be written to the B-tree.
@@ -713,7 +717,7 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                 }
                 self.lock_states.blocking_checkpoint_lock_held = true;
 
-                self.collect_committed_table_row_versions();
+                self.collect_committed_table_row_versions()?;
                 tracing::info!("Collected {} committed versions", self.write_set.len());
 
                 self.collect_committed_index_row_versions();

@@ -4,7 +4,7 @@
 //! - '0' = NULL (no data)
 //! - '1' + 8 bytes big-endian = INTEGER
 //! - '2' + 8 bytes big-endian IEEE 754 bits = FLOAT
-//! - '3' + raw UTF-8 bytes = TEXT
+//! - '3' + raw bytes = TEXT
 //! - '4' + raw bytes = BLOB
 
 use turso_core::{Numeric, Value};
@@ -29,7 +29,7 @@ pub fn encode_value(value: &Value, output: &mut Vec<u8>) {
         }
         Value::Text(text) => {
             output.push(b'3');
-            output.extend_from_slice(text.as_str().as_bytes());
+            output.extend_from_slice(text.as_bytes());
         }
         Value::Blob(b) => {
             output.push(b'4');

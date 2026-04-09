@@ -241,12 +241,28 @@ impl TursoSyncServer {
                         })
                         .collect();
 
-                    let result_rows: Vec<Row> = rows
+                    let result_rows = match rows
                         .into_iter()
-                        .map(|row| Row {
-                            values: row.into_iter().map(convert_core_to_value).collect(),
+                        .map(|row| {
+                            let values = row
+                                .into_iter()
+                                .map(convert_core_to_value)
+                                .collect::<Result<Vec<_>>>()?;
+                            Ok(Row { values })
                         })
-                        .collect();
+                        .collect::<Result<Vec<_>>>()
+                    {
+                        Ok(rows) => rows,
+                        Err(e) => {
+                            error!("Failed to encode result rows: {}", e);
+                            return StreamResult::Error {
+                                error: Error {
+                                    message: e.to_string(),
+                                    code: "ROW_ENCODING_ERROR".to_string(),
+                                },
+                            };
+                        }
+                    };
 
                     StreamResult::Ok {
                         response: StreamResponse::Execute(ExecuteStreamResp {
@@ -407,10 +423,14 @@ impl TursoSyncServer {
 
             let result_rows: Vec<Row> = rows
                 .into_iter()
-                .map(|row| Row {
-                    values: row.into_iter().map(convert_core_to_value).collect(),
+                .map(|row| {
+                    let values = row
+                        .into_iter()
+                        .map(convert_core_to_value)
+                        .collect::<Result<Vec<_>>>()?;
+                    Ok(Row { values })
                 })
-                .collect();
+                .collect::<Result<Vec<_>>>()?;
 
             Ok(StmtResult {
                 cols,
@@ -657,25 +677,46 @@ fn convert_value_to_core(value: &Value) -> CoreValue {
         Value::Integer { value } => CoreValue::from_i64(*value),
         Value::Float { value } => CoreValue::from_f64(*value),
         Value::Text { value } => CoreValue::Text(turso_core::types::Text {
-            value: std::borrow::Cow::Owned(value.clone()),
+            value: std::borrow::Cow::Owned(value.clone().into_bytes()),
             subtype: turso_core::types::TextSubtype::Text,
         }),
         Value::Blob { value } => CoreValue::Blob(value.to_vec()),
     }
 }
 
-fn convert_core_to_value(value: CoreValue) -> Value {
+fn convert_core_to_value(value: CoreValue) -> Result<Value> {
     match value {
-        CoreValue::Null => Value::Null,
-        CoreValue::Numeric(turso_core::Numeric::Integer(v)) => Value::Integer { value: v },
-        CoreValue::Numeric(turso_core::Numeric::Float(v)) => Value::Float {
+        CoreValue::Null => Ok(Value::Null),
+        CoreValue::Numeric(turso_core::Numeric::Integer(v)) => Ok(Value::Integer { value: v }),
+        CoreValue::Numeric(turso_core::Numeric::Float(v)) => Ok(Value::Float {
             value: f64::from(v),
-        },
-        CoreValue::Text(t) => Value::Text {
-            value: t.value.to_string(),
-        },
-        CoreValue::Blob(b) => Value::Blob {
+        }),
+        CoreValue::Text(t) => Ok(Value::Text {
+            value: t
+                .try_as_str()
+                .map(str::to_owned)
+                .map_err(|err| anyhow!("invalid UTF-8 in TEXT value: {err}"))?,
+        }),
+        CoreValue::Blob(b) => Ok(Value::Blob {
             value: Bytes::from(b),
-        },
+        }),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::convert_core_to_value;
+    use turso_core::Value as CoreValue;
+
+    #[test]
+    fn convert_core_to_value_rejects_invalid_text() {
+        let err = convert_core_to_value(CoreValue::from_text(vec![0xFF])).unwrap_err();
+        assert!(err.to_string().contains("invalid UTF-8 in TEXT value"));
+    }
+
+    #[test]
+    fn convert_core_to_value_keeps_valid_text() {
+        let value = convert_core_to_value(CoreValue::from_text("hello")).unwrap();
+        assert!(matches!(value, super::Value::Text { value } if value == "hello"));
     }
 }

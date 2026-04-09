@@ -378,6 +378,22 @@ impl<'a> From<&'a Value> for ValueRef<'a> {
     }
 }
 
+impl<'a> From<&'a turso_sdk_kit::rsapi::Value> for ValueRef<'a> {
+    fn from(v: &'a turso_sdk_kit::rsapi::Value) -> ValueRef<'a> {
+        match v {
+            turso_sdk_kit::rsapi::Value::Null => ValueRef::Null,
+            turso_sdk_kit::rsapi::Value::Numeric(turso_sdk_kit::rsapi::Numeric::Integer(i)) => {
+                ValueRef::Integer(*i)
+            }
+            turso_sdk_kit::rsapi::Value::Numeric(turso_sdk_kit::rsapi::Numeric::Float(r)) => {
+                ValueRef::Real(f64::from(*r))
+            }
+            turso_sdk_kit::rsapi::Value::Text(text) => ValueRef::Text(text.as_bytes()),
+            turso_sdk_kit::rsapi::Value::Blob(blob) => ValueRef::Blob(blob),
+        }
+    }
+}
+
 impl<'a, T> From<Option<T>> for ValueRef<'a>
 where
     T: Into<ValueRef<'a>>,

@@ -281,7 +281,7 @@ impl DifferentialOracle {
             Value::Null => SqlValue::Null,
             Value::Numeric(Numeric::Integer(i)) => SqlValue::Integer(i),
             Value::Numeric(Numeric::Float(f)) => SqlValue::Real(f64::from(f)),
-            Value::Text(s) => SqlValue::Text(s.as_str().to_string()),
+            Value::Text(s) => SqlValue::Text(s.as_str_lossy().into_owned()),
             Value::Blob(b) => SqlValue::Blob(b),
         }
     }

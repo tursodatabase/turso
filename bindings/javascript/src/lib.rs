@@ -955,7 +955,11 @@ fn to_js_value<'a>(
         turso_core::Value::Numeric(turso_core::Numeric::Float(f)) => {
             ToNapiValue::into_unknown(f64::from(*f), env)
         }
-        turso_core::Value::Text(s) => ToNapiValue::into_unknown(s.as_str(), env),
+        turso_core::Value::Text(s) => ToNapiValue::into_unknown(
+            s.try_as_str()
+                .map_err(|e| to_generic_error("invalid UTF-8 in TEXT value", e))?,
+            env,
+        ),
         turso_core::Value::Blob(b) => {
             #[cfg(not(feature = "browser"))]
             {

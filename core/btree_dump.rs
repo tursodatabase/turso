@@ -157,11 +157,11 @@ impl InternalVirtualTableCursor for BtreeDumpCursor {
         }
 
         let name = match args.first() {
-            Some(Value::Text(s)) => s.as_str(),
+            Some(Value::Text(s)) => s.as_str_lossy(),
             _ => return Ok(false),
         };
 
-        let root_page = match self.find_root_page(name) {
+        let root_page = match self.find_root_page(name.as_ref()) {
             Some(rp) if rp > 0 => rp,
             Some(_) => {
                 return Err(crate::LimboError::InternalError(format!(

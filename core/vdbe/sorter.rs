@@ -833,9 +833,9 @@ impl Ord for ArenaSortableRecord {
                 comparator(&self_val, &other_val)
             } else {
                 match (self_val, other_val) {
-                    (ValueRef::Text(left), ValueRef::Text(right)) => {
-                        key_info.collation.compare_strings(&left, &right)
-                    }
+                    (ValueRef::Text(left), ValueRef::Text(right)) => key_info
+                        .collation
+                        .compare_texts(left.as_bytes(), right.as_bytes()),
                     _ => self_val.partial_cmp(&other_val).unwrap_or(Ordering::Equal),
                 }
             };
@@ -948,9 +948,9 @@ impl Ord for BoxedSortableRecord {
                 comparator(&self_val, &other_val)
             } else {
                 match (self_val, other_val) {
-                    (ValueRef::Text(left), ValueRef::Text(right)) => {
-                        key_info.collation.compare_strings(&left, &right)
-                    }
+                    (ValueRef::Text(left), ValueRef::Text(right)) => key_info
+                        .collation
+                        .compare_texts(left.as_bytes(), right.as_bytes()),
                     _ => self_val.partial_cmp(&other_val).unwrap_or(Ordering::Equal),
                 }
             };

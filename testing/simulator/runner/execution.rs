@@ -329,7 +329,7 @@ fn limbo_integrity_check(conn: &Arc<Connection>) -> Result<()> {
 
     rows.run_with_row_callback(|row| {
         let val = match row.get_value(0) {
-            turso_core::Value::Text(text) => text.as_str().to_string(),
+            turso_core::Value::Text(text) => text.as_str_lossy().into_owned(),
             _ => unreachable!(),
         };
         result.push(val);

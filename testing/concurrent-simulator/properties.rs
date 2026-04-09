@@ -212,7 +212,7 @@ impl Property for IntegrityCheckProperty {
                     );
                 }
                 match &row[0] {
-                    Value::Text(text) if text.as_str() == "ok" => Ok(()),
+                    Value::Text(text) if text.try_as_str() == Ok("ok") => Ok(()),
                     other => {
                         bail!(
                             "step {step}, fiber {fiber_id}: integrity_check returned {:?}, expected \"ok\"",
@@ -714,7 +714,10 @@ fn parse_read_result(result: &OpResult) -> Option<Vec<i64>> {
         } else if let Some(row) = rows.first() {
             if let Some(value) = row.first() {
                 match value {
-                    Value::Text(csv_str) => parse_comma_separated_ints(csv_str.as_str()),
+                    Value::Text(csv_str) => csv_str
+                        .try_as_str()
+                        .ok()
+                        .and_then(parse_comma_separated_ints),
                     Value::Null => Some(vec![]),
                     _ => Some(vec![]),
                 }

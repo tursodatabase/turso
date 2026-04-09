@@ -47,7 +47,7 @@ pub mod sync;
 
 pub use connection::Connection;
 use turso_sdk_kit::rsapi::TursoError;
-pub use value::Value;
+pub use value::{Value, ValueRef};
 
 pub use params::params_from_iter;
 pub use params::IntoParams;

@@ -676,23 +676,25 @@ pub const TURSO_SYNC_UPDATE_LAST_CHANGE_ID: &str =
 const TURSO_SYNC_SELECT_LAST_CHANGE_ID: &str =
     "SELECT pull_gen, change_id FROM turso_sync_last_change_id WHERE client_id = ?";
 
-fn convert_to_args(values: Vec<turso_core::Value>) -> Vec<server_proto::Value> {
+fn convert_to_args(values: Vec<turso_core::Value>) -> Result<Vec<server_proto::Value>> {
     values
         .into_iter()
         .map(|value| match value {
-            Value::Null => server_proto::Value::Null,
+            Value::Null => Ok(server_proto::Value::Null),
             Value::Numeric(turso_core::Numeric::Integer(value)) => {
-                server_proto::Value::Integer { value }
+                Ok(server_proto::Value::Integer { value })
             }
-            Value::Numeric(turso_core::Numeric::Float(value)) => server_proto::Value::Float {
+            Value::Numeric(turso_core::Numeric::Float(value)) => Ok(server_proto::Value::Float {
                 value: f64::from(value),
-            },
-            Value::Text(value) => server_proto::Value::Text {
-                value: value.as_str().to_string(),
-            },
-            Value::Blob(value) => server_proto::Value::Blob {
+            }),
+            Value::Text(value) => Ok(server_proto::Value::Text {
+                value: value.try_as_str().map(str::to_owned).map_err(|err| {
+                    Error::DatabaseSyncEngineError(format!("invalid UTF-8 in TEXT value: {err}"))
+                })?,
+            }),
+            Value::Blob(value) => Ok(server_proto::Value::Blob {
                 value: value.into(),
-            },
+            }),
         })
         .collect()
 }
@@ -1031,7 +1033,7 @@ pub async fn push_logical_changes<IO: SyncEngineIo, Ctx>(
                 panic!("Commit operation must not be emited at this stage")
             }
             DatabaseTapeOperation::StmtReplay(replay) => {
-                sql_over_http_requests.push(step(replay.sql, convert_to_args(replay.values)))
+                sql_over_http_requests.push(step(replay.sql, convert_to_args(replay.values)?))
             }
             DatabaseTapeOperation::RowChange(change) => {
                 let replay_info = generator.replay_info(ctx.coro, &change).await?;
@@ -1049,7 +1051,7 @@ pub async fn push_logical_changes<IO: SyncEngineIo, Ctx>(
                             None,
                         );
                         sql_over_http_requests
-                            .push(step(replay_info.query.clone(), convert_to_args(values)))
+                            .push(step(replay_info.query.clone(), convert_to_args(values)?))
                     }
                     DatabaseTapeRowChangeType::Insert { after } => {
                         let values = generator.replay_values(
@@ -1060,7 +1062,7 @@ pub async fn push_logical_changes<IO: SyncEngineIo, Ctx>(
                             None,
                         );
                         sql_over_http_requests
-                            .push(step(replay_info.query.clone(), convert_to_args(values)));
+                            .push(step(replay_info.query.clone(), convert_to_args(values)?));
                     }
                     DatabaseTapeRowChangeType::Update {
                         after,
@@ -1075,7 +1077,7 @@ pub async fn push_logical_changes<IO: SyncEngineIo, Ctx>(
                             Some(updates),
                         );
                         sql_over_http_requests
-                            .push(step(replay_info.query.clone(), convert_to_args(values)));
+                            .push(step(replay_info.query.clone(), convert_to_args(values)?));
                     }
                     DatabaseTapeRowChangeType::Update {
                         after,
@@ -1090,7 +1092,7 @@ pub async fn push_logical_changes<IO: SyncEngineIo, Ctx>(
                             None,
                         );
                         sql_over_http_requests
-                            .push(step(replay_info.query.clone(), convert_to_args(values)));
+                            .push(step(replay_info.query.clone(), convert_to_args(values)?));
                     }
                 }
                 if is_alter_add_column {
@@ -1719,11 +1721,12 @@ mod tests {
 
     use bytes::{Bytes, BytesMut};
     use prost::Message;
+    use turso_core::Value;
 
     use crate::{
         database_sync_engine::DataStats,
         database_sync_engine_io::{DataCompletion, DataPollResult},
-        database_sync_operations::wait_proto_message,
+        database_sync_operations::{convert_to_args, wait_proto_message},
         server_proto::PageData,
         types::Coro,
         Result,
@@ -1814,5 +1817,11 @@ mod tests {
     fn test_remote_encryption_key_header_constant() {
         use super::ENCRYPTION_KEY_HEADER;
         assert_eq!(ENCRYPTION_KEY_HEADER, "x-turso-encryption-key");
+    }
+
+    #[test]
+    fn convert_to_args_rejects_invalid_text() {
+        let err = convert_to_args(vec![Value::from_text(vec![0xFF])]).unwrap_err();
+        assert!(err.to_string().contains("invalid UTF-8 in TEXT value"));
     }
 }

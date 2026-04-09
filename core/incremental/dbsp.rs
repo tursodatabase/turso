@@ -60,7 +60,7 @@ impl Hash128 {
                 }
                 Value::Text(t) => {
                     s.push_str("T:");
-                    s.push_str(t.as_str());
+                    s.push_str(&t.as_str_lossy());
                 }
                 Value::Blob(b) => {
                     s.push_str("B:");

@@ -366,10 +366,10 @@ impl VectorSparseInvertedIndexMethodCursor {
             _ => 1.0,
         };
         let scan_order = match configuration.parameters.get("scan_order") {
-            Some(Value::Text(scan_order)) if scan_order.as_str() == "dataset_frequency_asc" => {
+            Some(Value::Text(scan_order)) if scan_order.as_bytes() == b"dataset_frequency_asc" => {
                 ScanOrder::DatasetFrequencyAsc
             }
-            Some(Value::Text(scan_order)) if scan_order.as_str() == "query_weight_desc" => {
+            Some(Value::Text(scan_order)) if scan_order.as_bytes() == b"query_weight_desc" => {
                 ScanOrder::QueryWeightDesc
             }
             _ => ScanOrder::QueryWeightDesc,

@@ -155,7 +155,12 @@ impl InternalVirtualTableCursor for DbPageCursor {
 
         if (idx_num & 2) != 0 {
             if let Some(Value::Text(schema)) = args.get(arg_idx) {
-                if schema.as_str() != "main" {
+                let schema = schema.try_as_str().map_err(|_| {
+                    LimboError::InvalidArgument(
+                        "sqlite_dbpage schema must be valid UTF-8".to_string(),
+                    )
+                })?;
+                if schema != "main" {
                     self.schema_mismatch = true;
                     return Ok(false);
                 }
@@ -218,11 +223,18 @@ fn parse_rowid(value: &Value) -> Result<Option<i64>> {
 fn ensure_main_schema(value: &Value) -> Result<()> {
     match value {
         Value::Null => Ok(()),
-        Value::Text(schema) if schema.as_str() == "main" => Ok(()),
-        Value::Text(schema) => Err(LimboError::InvalidArgument(format!(
-            "sqlite_dbpage only supports main schema (got {})",
-            schema.as_str()
-        ))),
+        Value::Text(schema) => {
+            let schema = schema.try_as_str().map_err(|_| {
+                LimboError::InvalidArgument("sqlite_dbpage schema must be valid UTF-8".to_string())
+            })?;
+            if schema == "main" {
+                Ok(())
+            } else {
+                Err(LimboError::InvalidArgument(format!(
+                    "sqlite_dbpage only supports main schema (got {schema})"
+                )))
+            }
+        }
         _ => Err(LimboError::InvalidArgument(
             "sqlite_dbpage schema must be text or null".to_string(),
         )),

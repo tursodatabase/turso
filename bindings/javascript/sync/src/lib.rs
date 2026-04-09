@@ -76,7 +76,7 @@ fn core_value_to_js(value: turso_core::Value) -> Either5<Null, i64, f64, String,
             Either5::<Null, i64, f64, String, Vec<u8>>::C(f64::from(value))
         }
         turso_core::Value::Text(value) => {
-            Either5::<Null, i64, f64, String, Vec<u8>>::D(value.as_str().to_string())
+            Either5::<Null, i64, f64, String, Vec<u8>>::D(value.as_str_lossy().into_owned())
         }
         turso_core::Value::Blob(value) => Either5::<Null, i64, f64, String, Vec<u8>>::E(value),
     }

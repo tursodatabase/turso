@@ -1371,12 +1371,12 @@ impl Limbo {
             row.get::<&Value>(2),
         ) {
             let modified_schema = if db_display_name == "main" {
-                schema.as_str().to_string()
+                schema.as_str_lossy().into_owned()
             } else {
                 // We need to modify the SQL to include the database prefix in table names
                 // This is a simple approach - for CREATE TABLE statements, insert db name after "TABLE "
                 // For CREATE INDEX statements, insert db name after "ON "
-                let schema_str = schema.as_str();
+                let schema_str = schema.as_str_lossy();
                 if schema_str.to_uppercase().contains("CREATE TABLE ") {
                     // Find "CREATE TABLE " and insert database name after it
                     if let Some(pos) = schema_str.to_uppercase().find("CREATE TABLE ") {
@@ -1401,11 +1401,15 @@ impl Limbo {
             };
             let _ = self.writeln_fmt(format_args!("{modified_schema};"));
             // For views, add the column comment like SQLite does
-            if obj_type.as_str() == "view" {
+            if obj_type.as_bytes() == b"view" {
                 let columns = self
-                    .get_view_columns(obj_name.as_str())
+                    .get_view_columns(&obj_name.as_str_lossy())
                     .unwrap_or_else(|_| "x".to_string());
-                let _ = self.writeln_fmt(format_args!("/* {}({}) */", obj_name.as_str(), columns));
+                let _ = self.writeln_fmt(format_args!(
+                    "/* {}({}) */",
+                    obj_name.as_str_lossy(),
+                    columns
+                ));
             }
             true
         } else {
@@ -1422,7 +1426,7 @@ impl Limbo {
         let handler = |row: &turso_core::Row| {
             // Column name is in the second column (index 1) of PRAGMA table_info
             if let Ok(Value::Text(col_name)) = row.get::<&Value>(1) {
-                columns.push(col_name.as_str().to_string());
+                columns.push(col_name.as_str_lossy().into_owned());
             }
             Ok(())
         };
@@ -1579,7 +1583,7 @@ impl Limbo {
                         indexes.push_str(prefix);
                         indexes.push('.');
                     }
-                    indexes.push_str(idx.as_str());
+                    indexes.push_str(&idx.as_str_lossy());
                     indexes.push(' ');
                 }
                 Ok(())
@@ -1617,7 +1621,7 @@ impl Limbo {
                         tables.push_str(prefix);
                         tables.push('.');
                     }
-                    tables.push_str(table.as_str());
+                    tables.push_str(&table.as_str_lossy());
                     tables.push(' ');
                 }
                 Ok(())
@@ -1700,9 +1704,9 @@ impl Limbo {
                 row.get::<&Value>(2),
             ) {
                 let file = match file_value {
-                    Value::Text(path) => path.as_str(),
-                    Value::Null => "",
-                    _ => "",
+                    Value::Text(path) => path.as_str_lossy(),
+                    Value::Null => std::borrow::Cow::Borrowed(""),
+                    _ => std::borrow::Cow::Borrowed(""),
                 };
 
                 // Format like SQLite: "main: /path/to/file r/w"
@@ -1719,7 +1723,12 @@ impl Limbo {
                     "r/w"
                 };
 
-                databases.push(format!("{}: {} {}", name.as_str(), file_display, mode));
+                databases.push(format!(
+                    "{}: {} {}",
+                    name.as_str_lossy(),
+                    file_display,
+                    mode
+                ));
             }
             Ok(())
         })?;
@@ -1953,7 +1962,7 @@ impl Limbo {
             Value::Numeric(Numeric::Float(f)) => write!(out, "{}", f64::from(*f)).map(|_| ()),
             Value::Text(s) => {
                 out.write_all(b"'")?;
-                let bytes = s.value.as_bytes();
+                let bytes = s.as_bytes();
                 let mut i = 0;
                 while i < bytes.len() {
                     let b = bytes[i];

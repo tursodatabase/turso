@@ -28,7 +28,7 @@ pub fn json_patch(
         // Explicit handling for the case json_path('{}', 'null') case. If the patch value is
         // the text null, the result will also be the text null. No extra parsing required.
         (_, ValueRef::Text(t)) => {
-            if t.value == "null" {
+            if t.as_bytes() == b"null" {
                 return Ok(Value::Text(Text::new("null")));
             }
         }
@@ -103,7 +103,7 @@ where
     let mut json = json_cache.get_or_insert_with(first_arg, make_jsonb_fn)?;
     for arg in args {
         if let ValueRef::Text(s) = arg.as_value_ref() {
-            if s.as_str() == "$" {
+            if s.as_str_lossy() == "$" {
                 return Ok(Value::Null);
             }
         }
@@ -136,7 +136,7 @@ where
     let mut json = json_cache.get_or_insert_with(first_arg, make_jsonb_fn)?;
     for arg in args {
         if let ValueRef::Text(s) = arg.as_value_ref() {
-            if s.as_str() == "$" {
+            if s.as_str_lossy() == "$" {
                 return Ok(Value::Null);
             }
         }
@@ -432,7 +432,7 @@ mod tests {
         let json_cache = JsonCacheCell::new();
         let result = json_remove(&args, &json_cache).unwrap();
         match result {
-            Value::Text(t) => assert_eq!(t.as_str(), "[1,2,4,5]"),
+            Value::Text(t) => assert_eq!(t.try_as_str().unwrap(), "[1,2,4,5]"),
             _ => panic!("Expected Text value"),
         }
     }
@@ -448,7 +448,7 @@ mod tests {
         let json_cache = JsonCacheCell::new();
         let result = json_remove(&args, &json_cache).unwrap();
         match result {
-            Value::Text(t) => assert_eq!(t.as_str(), r#"{"b":2}"#),
+            Value::Text(t) => assert_eq!(t.try_as_str().unwrap(), r#"{"b":2}"#),
             _ => panic!("Expected Text value"),
         }
     }
@@ -463,7 +463,7 @@ mod tests {
         let json_cache = JsonCacheCell::new();
         let result = json_remove(&args, &json_cache).unwrap();
         match result {
-            Value::Text(t) => assert_eq!(t.as_str(), r#"{"a":{"b":{"d":2}}}"#),
+            Value::Text(t) => assert_eq!(t.try_as_str().unwrap(), r#"{"a":{"b":{"d":2}}}"#),
             _ => panic!("Expected Text value"),
         }
     }
@@ -478,7 +478,7 @@ mod tests {
         let json_cache = JsonCacheCell::new();
         let result = json_remove(&args, &json_cache).unwrap();
         match result {
-            Value::Text(t) => assert_eq!(t.as_str(), r#"{"a":2,"a":3}"#),
+            Value::Text(t) => assert_eq!(t.try_as_str().unwrap(), r#"{"a":2,"a":3}"#),
             _ => panic!("Expected Text value"),
         }
     }
@@ -507,7 +507,7 @@ mod tests {
         let result = json_remove(&args, &json_cache).unwrap();
         match result {
             Value::Text(t) => {
-                let value = t.as_str();
+                let value = t.try_as_str().unwrap();
                 assert!(value.contains(r#"[1,3]"#));
                 assert!(value.contains(r#"{"x":2}"#));
             }

@@ -1,12 +1,13 @@
 use crate::turso_assert;
 use crate::{
     function::MathFunc,
-    numeric::{format_float, format_float_for_quote, NullableInteger, Numeric},
+    numeric::{format_float_for_quote, NullableInteger, Numeric},
     translate::collate::CollationSeq,
     types::{compare_immutable_single, AsValueRef, SeekOp},
     vdbe::affinity::{real_to_i64, Affinity},
     LimboError, Result, Value, ValueRef,
 };
+use std::borrow::Cow;
 
 // we use math functions from Rust stdlib in order to be as portable as possible for the production version of the tursodb
 #[cfg(not(test))]
@@ -181,6 +182,152 @@ enum TrimType {
     Right,
 }
 
+fn coerce_to_text_bytes(value: &Value) -> Option<Cow<'_, [u8]>> {
+    match value {
+        Value::Null => None,
+        Value::Text(text) => Some(Cow::Borrowed(text.as_bytes())),
+        Value::Blob(blob) => Some(Cow::Borrowed(blob.as_slice())),
+        Value::Numeric(_) => Some(Cow::Owned(value.to_string().into_bytes())),
+    }
+}
+
+fn count_text_units(bytes: &[u8], stop_at_nul: bool) -> usize {
+    let mut count = 0;
+
+    for chunk in bytes.utf8_chunks() {
+        let valid = chunk.valid();
+        if stop_at_nul {
+            if let Some(pos) = valid.as_bytes().iter().position(|&b| b == 0) {
+                count += valid[..pos].chars().count();
+                return count;
+            }
+        }
+
+        count += valid.chars().count();
+        if !chunk.invalid().is_empty() {
+            count += 1;
+        }
+    }
+
+    count
+}
+
+fn boundary_after_text_units(bytes: &[u8], target: usize) -> usize {
+    if target == 0 {
+        return 0;
+    }
+
+    let mut count = 0;
+    let mut offset = 0;
+
+    for chunk in bytes.utf8_chunks() {
+        let valid = chunk.valid();
+        for (_, ch) in valid.char_indices() {
+            count += 1;
+            offset += ch.len_utf8();
+            if count == target {
+                return offset;
+            }
+        }
+
+        if !chunk.invalid().is_empty() {
+            count += 1;
+            offset += chunk.invalid().len();
+            if count == target {
+                return offset;
+            }
+        }
+    }
+
+    bytes.len()
+}
+
+fn collect_text_units(bytes: &[u8], stop_at_nul: bool) -> Vec<(usize, usize)> {
+    let mut units = Vec::new();
+    let mut offset = 0;
+
+    for chunk in bytes.utf8_chunks() {
+        let valid = chunk.valid();
+        for (idx, ch) in valid.char_indices() {
+            let start = offset + idx;
+            let end = start + ch.len_utf8();
+            if stop_at_nul && bytes[start] == 0 {
+                return units;
+            }
+            units.push((start, end));
+        }
+        offset += valid.len();
+
+        if !chunk.invalid().is_empty() {
+            let invalid_len = chunk.invalid().len();
+            units.push((offset, offset + invalid_len));
+            offset += invalid_len;
+        }
+    }
+
+    units
+}
+
+fn trim_text_bytes(bytes: &[u8], pattern: Option<&[u8]>, trim_type: TrimType) -> Vec<u8> {
+    let units = collect_text_units(bytes, false);
+    if units.is_empty() {
+        return bytes.to_vec();
+    }
+
+    let pattern_storage;
+    let pattern_units: Vec<&[u8]> = match pattern {
+        None => vec![b" "],
+        Some(pattern) => {
+            pattern_storage = collect_text_units(pattern, false);
+            if pattern_storage.is_empty() {
+                return bytes.to_vec();
+            }
+            pattern_storage
+                .iter()
+                .map(|(start, end)| &pattern[*start..*end])
+                .collect()
+        }
+    };
+
+    let mut start_idx = 0;
+    let mut end_idx = units.len();
+
+    if matches!(trim_type, TrimType::All | TrimType::Left) {
+        while start_idx < end_idx {
+            let unit = &bytes[units[start_idx].0..units[start_idx].1];
+            if pattern_units.contains(&unit) {
+                start_idx += 1;
+            } else {
+                break;
+            }
+        }
+    }
+
+    if matches!(trim_type, TrimType::All | TrimType::Right) {
+        while end_idx > start_idx {
+            let unit = &bytes[units[end_idx - 1].0..units[end_idx - 1].1];
+            if pattern_units.contains(&unit) {
+                end_idx -= 1;
+            } else {
+                break;
+            }
+        }
+    }
+
+    let start_byte = units
+        .get(start_idx)
+        .map_or(bytes.len(), |(start, _)| *start);
+    let end_byte = if end_idx == 0 {
+        0
+    } else if end_idx == units.len() {
+        bytes.len()
+    } else {
+        units[end_idx - 1].1
+    };
+
+    bytes[start_byte..end_byte].to_vec()
+}
+
 impl Value {
     pub fn exec_lower(&self) -> Option<Self> {
         self.cast_text()
@@ -190,12 +337,15 @@ impl Value {
     pub fn exec_length(&self) -> Self {
         match self {
             Value::Text(t) => {
-                let s = t.as_str();
-                let len_before_null = s.find('\0').map_or_else(
-                    || s.chars().count(),
-                    |null_pos| s[..null_pos].chars().count(),
-                );
-                Value::from_i64(len_before_null as i64)
+                if let Ok(s) = t.try_as_str() {
+                    let len_before_null = s.find('\0').map_or_else(
+                        || s.chars().count(),
+                        |null_pos| s[..null_pos].chars().count(),
+                    );
+                    Value::from_i64(len_before_null as i64)
+                } else {
+                    Value::from_i64(count_text_units(t.as_bytes(), true) as i64)
+                }
             }
             Value::Numeric(_) => {
                 // For numbers, SQLite returns the length of the string representation
@@ -208,7 +358,7 @@ impl Value {
 
     pub fn exec_octet_length(&self) -> Self {
         match self {
-            Value::Text(s) => Value::from_i64(s.as_str().len() as i64),
+            Value::Text(s) => Value::from_i64(s.as_bytes().len() as i64),
             Value::Blob(blob) => Value::from_i64(blob.len() as i64),
             Value::Numeric(_) => Value::from_i64(self.to_string().len() as i64),
             _ => self.to_owned(),
@@ -235,7 +385,10 @@ impl Value {
     /// Generates the Soundex code for a given word
     pub fn exec_soundex(&self) -> Value {
         let s = match self {
-            Value::Text(s) => s.as_str(),
+            Value::Text(s) => match s.try_as_str() {
+                Ok(s) => s,
+                Err(_) => return Value::build_text("?000"),
+            },
             Value::Null => return Value::build_text("?000"),
             _ => return Value::build_text("?000"),
         };
@@ -303,7 +456,7 @@ impl Value {
             Value::Numeric(Numeric::Float(non_nan)) => Value::from_f64(f64::from(*non_nan).abs()),
             _ => {
                 let s = match self {
-                    Value::Text(text) => std::borrow::Cow::Borrowed(text.as_str()),
+                    Value::Text(text) => text.as_str_lossy(),
                     Value::Blob(blob) => String::from_utf8_lossy(blob),
                     _ => unreachable!(),
                 };
@@ -332,7 +485,7 @@ impl Value {
         let length = match self {
             Value::Numeric(Numeric::Integer(i)) => *i,
             Value::Numeric(Numeric::Float(f)) => f64::from(*f) as i64,
-            Value::Text(t) => t.as_str().parse().unwrap_or(1),
+            Value::Text(t) => t.as_str_lossy().parse().unwrap_or(1),
             _ => 1,
         }
         .max(1);
@@ -365,9 +518,10 @@ impl Value {
                 Value::build_text(quoted)
             }
             Value::Text(s) => {
-                let mut quoted = String::with_capacity(s.as_str().len() + 2);
+                let s = s.as_str_lossy();
+                let mut quoted = String::with_capacity(s.len() + 2);
                 quoted.push('\'');
-                for c in s.as_str().chars() {
+                for c in s.chars() {
                     if c == '\0' {
                         break;
                     } else if c == '\'' {
@@ -388,7 +542,7 @@ impl Value {
 
         match self {
             Value::Text(s) => {
-                let s = s.as_str();
+                let s = s.as_str_lossy();
                 let mut end = s.len();
                 let mut has_ctrl = false;
 
@@ -455,32 +609,6 @@ impl Value {
         start_value: &Value,
         length_value: Option<&Value>,
     ) -> Value {
-        /// Function is stabilized but not released for version 1.88 \
-        /// https://doc.rust-lang.org/src/core/str/mod.rs.html#453
-        const fn ceil_char_boundary(s: &str, index: usize) -> usize {
-            const fn is_utf8_char_boundary(c: u8) -> bool {
-                // This is bit magic equivalent to: b < 128 || b >= 192
-                (c as i8) >= -0x40
-            }
-
-            if index >= s.len() {
-                s.len()
-            } else {
-                let mut i = index;
-                while i < s.len() {
-                    if is_utf8_char_boundary(s.as_bytes()[i]) {
-                        break;
-                    }
-                    i += 1;
-                }
-
-                //  The character boundary will be within four bytes of the index
-                debug_assert!(i <= index + 3);
-
-                i
-            }
-        }
-
         // Match SQLite's substr algorithm exactly (func.c substrFunc)
         // Uses wrapping arithmetic to match C overflow behavior
         fn calculate_postions(
@@ -545,14 +673,37 @@ impl Value {
                 Value::from_blob(b[start..end].to_vec())
             }
             (value, Value::Numeric(Numeric::Integer(start))) => {
-                if let Some(text) = value.cast_text() {
-                    // Use character count to accurately resolve negative offsets in UTF-8 strings
-                    let char_count = text.chars().count();
+                let Some(text) = coerce_to_text_bytes(value) else {
+                    return Value::Null;
+                };
+                let bytes = text.as_ref();
+                if let Ok(s) = std::str::from_utf8(bytes) {
+                    /// Function is stabilized but not released for version 1.88 \
+                    /// https://doc.rust-lang.org/src/core/str/mod.rs.html#453
+                    const fn ceil_char_boundary(s: &str, index: usize) -> usize {
+                        const fn is_utf8_char_boundary(c: u8) -> bool {
+                            (c as i8) >= -0x40
+                        }
+
+                        if index >= s.len() {
+                            s.len()
+                        } else {
+                            let mut i = index;
+                            while i < s.len() {
+                                if is_utf8_char_boundary(s.as_bytes()[i]) {
+                                    break;
+                                }
+                                i += 1;
+                            }
+                            debug_assert!(i <= index + 3);
+                            i
+                        }
+                    }
+
+                    let char_count = s.chars().count();
                     let (mut start, mut end) =
                         calculate_postions(start, char_count, length_value.as_ref());
 
-                    // https://github.com/sqlite/sqlite/blob/a248d84f/src/func.c#L417
-                    let s = text.as_str();
                     let mut start_byte_idx = 0;
                     end -= start;
                     while start > 0 {
@@ -564,10 +715,19 @@ impl Value {
                         end_byte_idx = ceil_char_boundary(s, end_byte_idx + 1);
                         end -= 1;
                     }
-                    Value::build_text(s[start_byte_idx..end_byte_idx].to_string())
-                } else {
-                    Value::Null
+                    return Value::build_text(s[start_byte_idx..end_byte_idx].to_string());
                 }
+
+                let char_count = count_text_units(bytes, false);
+                let (start, end) = calculate_postions(start, char_count, length_value.as_ref());
+
+                if start >= end || start >= char_count {
+                    return Value::build_text(Vec::new());
+                }
+
+                let start_byte = boundary_after_text_units(bytes, start);
+                let end_byte = boundary_after_text_units(bytes, end);
+                Value::build_text(bytes[start_byte..end_byte].to_vec())
             }
             _ => Value::Null,
         }
@@ -590,28 +750,25 @@ impl Value {
             return Value::from_i64(result as i64);
         }
 
-        let reg_str;
-        let reg = match self {
-            Value::Text(s) => s.as_str(),
-            _ => {
-                reg_str = self.to_string();
-                reg_str.as_str()
-            }
+        let Some(reg) = coerce_to_text_bytes(self) else {
+            return Value::Null;
         };
-
-        let pattern_str;
-        let pattern = match pattern {
-            Value::Text(s) => s.as_str(),
-            _ => {
-                pattern_str = pattern.to_string();
-                pattern_str.as_str()
-            }
+        let Some(pattern) = coerce_to_text_bytes(pattern) else {
+            return Value::Null;
         };
+        let reg = reg.as_ref();
+        let pattern = pattern.as_ref();
 
-        match reg.find(pattern) {
+        if pattern.is_empty() {
+            return Value::from_i64(1);
+        }
+
+        match reg
+            .windows(pattern.len())
+            .position(|window| window == pattern)
+        {
             Some(byte_pos) => {
-                // Convert byte position to character position (1-indexed)
-                let char_pos = reg[..byte_pos].chars().count() + 1;
+                let char_pos = count_text_units(&reg[..byte_pos], false) + 1;
                 Value::from_i64(char_pos as i64)
             }
             None => Value::from_i64(0),
@@ -630,10 +787,8 @@ impl Value {
 
     pub fn exec_hex(&self) -> Value {
         match self {
-            Value::Text(_) | Value::Numeric(_) => {
-                let text = self.to_string();
-                Value::build_text(hex::encode_upper(text))
-            }
+            Value::Text(text) => Value::build_text(hex::encode_upper(text.as_bytes())),
+            Value::Numeric(_) => Value::build_text(hex::encode_upper(self.to_string())),
             Value::Blob(blob_bytes) => Value::build_text(hex::encode_upper(blob_bytes)),
             Value::Null => Value::build_text(""),
         }
@@ -710,7 +865,7 @@ impl Value {
 
     pub fn exec_unistr(&self) -> Result<Value> {
         let text = match self {
-            Value::Text(t) => std::borrow::Cow::Borrowed(t.as_str()),
+            Value::Text(t) => t.as_str_lossy(),
             Value::Numeric(_) | Value::Blob(_) => std::borrow::Cow::Owned(self.to_string()),
             _ => return Ok(Value::Null),
         };
@@ -798,34 +953,56 @@ impl Value {
     }
 
     fn _exec_trim(&self, pattern: Option<&Value>, trim_type: TrimType) -> Value {
-        let text_cow = match self {
-            Value::Text(s) => std::borrow::Cow::Borrowed(s.as_str()),
-            Value::Null => return Value::Null,
-            _ => std::borrow::Cow::Owned(self.to_string()),
+        let Some(text) = coerce_to_text_bytes(self) else {
+            return Value::Null;
         };
+        if let Ok(text_str) = std::str::from_utf8(text.as_ref()) {
+            let trimmed = match pattern {
+                Some(p) => {
+                    if matches!(p, Value::Null) {
+                        return Value::Null;
+                    }
+                    let Some(pattern) = coerce_to_text_bytes(p) else {
+                        return Value::Null;
+                    };
+                    let Ok(pattern_str) = std::str::from_utf8(pattern.as_ref()) else {
+                        return Value::build_text(trim_text_bytes(
+                            text.as_ref(),
+                            Some(pattern.as_ref()),
+                            trim_type,
+                        ));
+                    };
+                    match trim_type {
+                        TrimType::All => text_str.trim_matches(|c| pattern_str.contains(c)),
+                        TrimType::Left => text_str.trim_start_matches(|c| pattern_str.contains(c)),
+                        TrimType::Right => text_str.trim_end_matches(|c| pattern_str.contains(c)),
+                    }
+                    .as_bytes()
+                    .to_vec()
+                }
+                None => match trim_type {
+                    TrimType::All => text_str.trim_matches(' '),
+                    TrimType::Left => text_str.trim_start_matches(' '),
+                    TrimType::Right => text_str.trim_end_matches(' '),
+                }
+                .as_bytes()
+                .to_vec(),
+            };
+            return Value::build_text(trimmed);
+        }
         let trimmed = match pattern {
             Some(p) => {
                 if matches!(p, Value::Null) {
                     return Value::Null;
                 }
-                let pat_cow = match p {
-                    Value::Text(s) => std::borrow::Cow::Borrowed(s.as_str()),
-                    _ => std::borrow::Cow::Owned(p.to_string()),
+                let Some(pattern) = coerce_to_text_bytes(p) else {
+                    return Value::Null;
                 };
-                let p_str = pat_cow.as_ref();
-                match trim_type {
-                    TrimType::All => text_cow.trim_matches(|c| p_str.contains(c)),
-                    TrimType::Left => text_cow.trim_start_matches(|c| p_str.contains(c)),
-                    TrimType::Right => text_cow.trim_end_matches(|c| p_str.contains(c)),
-                }
+                trim_text_bytes(text.as_ref(), Some(pattern.as_ref()), trim_type)
             }
-            None => match trim_type {
-                TrimType::All => text_cow.trim_matches(' '),
-                TrimType::Left => text_cow.trim_start_matches(' '),
-                TrimType::Right => text_cow.trim_end_matches(' '),
-            },
+            None => trim_text_bytes(text.as_ref(), None, trim_type),
         };
-        Value::build_text(trimmed.to_string())
+        Value::build_text(trimmed)
     }
 
     // Implements TRIM pattern matching.
@@ -846,7 +1023,7 @@ impl Value {
         let length: i64 = match self {
             Value::Numeric(Numeric::Integer(i)) => *i,
             Value::Numeric(Numeric::Float(f)) => f64::from(*f) as i64,
-            Value::Text(s) => s.as_str().parse().unwrap_or(0),
+            Value::Text(s) => s.as_str_lossy().parse().unwrap_or(0),
             _ => 0,
         }
         .max(0);
@@ -873,19 +1050,18 @@ impl Value {
         match Affinity::affinity(datatype) {
             // NONE	Casting a value to a type-name with no affinity causes the value to be converted into a BLOB. Casting to a BLOB consists of first casting the value to TEXT in the encoding of the database connection, then interpreting the resulting byte sequence as a BLOB instead of as TEXT.
             // Historically called NONE, but it's the same as BLOB
-            Affinity::Blob => {
-                // Convert to TEXT first, then interpret as BLOB
-                // TODO: handle encoding
-                let text = self.to_string();
-                Value::Blob(text.into_bytes())
-            }
+            Affinity::Blob => match self {
+                Value::Text(text) => Value::Blob(text.as_bytes().to_vec()),
+                Value::Blob(blob) => Value::Blob(blob.clone()),
+                _ => Value::Blob(self.to_string().into_bytes()),
+            },
             // TEXT To cast a BLOB value to TEXT, the sequence of bytes that make up the BLOB is interpreted as text encoded using the database encoding.
             // Casting an INTEGER or REAL value into TEXT renders the value as if via sqlite3_snprintf() except that the resulting TEXT uses the encoding of the database connection.
-            Affinity::Text => {
-                // Convert everything to text representation
-                // TODO: handle encoding and whatever sqlite3_snprintf does
-                Value::build_text(self.to_string())
-            }
+            Affinity::Text => match self {
+                Value::Text(text) => Value::Text(text.clone()),
+                Value::Blob(blob) => Value::build_text(blob.clone()),
+                _ => Value::build_text(self.to_string()),
+            },
             Affinity::Real => match self {
                 Value::Blob(b) => {
                     let text = String::from_utf8_lossy(b);
@@ -895,9 +1071,11 @@ impl Value {
                             .unwrap_or(0.0),
                     )
                 }
-                Value::Text(t) => {
-                    Value::from_f64(crate::numeric::str_to_f64(t).map(f64::from).unwrap_or(0.0))
-                }
+                Value::Text(t) => Value::from_f64(
+                    crate::numeric::str_to_f64(t.as_str_lossy())
+                        .map(f64::from)
+                        .unwrap_or(0.0),
+                ),
                 Value::Numeric(Numeric::Integer(i)) => Value::from_f64(*i as f64),
                 Value::Numeric(Numeric::Float(f)) => Value::Numeric(Numeric::Float(*f)),
                 _ => Value::from_f64(0.0),
@@ -908,7 +1086,9 @@ impl Value {
                     let text = String::from_utf8_lossy(b);
                     Value::from_i64(crate::numeric::str_to_i64(&text).unwrap_or(0))
                 }
-                Value::Text(t) => Value::from_i64(crate::numeric::str_to_i64(t).unwrap_or(0)),
+                Value::Text(t) => {
+                    Value::from_i64(crate::numeric::str_to_i64(t.as_str_lossy()).unwrap_or(0))
+                }
                 Value::Numeric(Numeric::Integer(i)) => Value::from_i64(*i),
                 // A cast of a REAL value into an INTEGER follows SQLite's sqlite3RealToI64:
                 // truncate toward zero and clamp to i64::MIN/MAX if outside the safe range.
@@ -921,7 +1101,7 @@ impl Value {
                 Value::Numeric(Numeric::Float(v)) => Value::Numeric(Numeric::Float(*v)),
                 _ => {
                     let s = match self {
-                        Value::Text(text) => text.as_str().into(),
+                        Value::Text(text) => text.as_str_lossy(),
                         Value::Blob(blob) => String::from_utf8_lossy(blob.as_slice()),
                         _ => unreachable!(),
                     };
@@ -953,13 +1133,25 @@ impl Value {
         // If any of the casts failed, panic as text casting is not expected to fail.
         match (&source, &pattern, &replacement) {
             (Value::Text(source), Value::Text(pattern), Value::Text(replacement)) => {
-                if pattern.as_str().is_empty() || pattern.as_str().starts_with('\0') {
+                let source_bytes = source.as_bytes();
+                let pattern_bytes = pattern.as_bytes();
+                let replacement_bytes = replacement.as_bytes();
+
+                if pattern_bytes.is_empty() || pattern_bytes[0] == 0 {
                     return Value::Text(source.clone());
                 }
 
-                let result = source
-                    .as_str()
-                    .replace(pattern.as_str(), replacement.as_str());
+                let mut result = Vec::with_capacity(source_bytes.len());
+                let mut offset = 0;
+                while offset < source_bytes.len() {
+                    if source_bytes[offset..].starts_with(pattern_bytes) {
+                        result.extend_from_slice(replacement_bytes);
+                        offset += pattern_bytes.len();
+                    } else {
+                        result.push(source_bytes[offset]);
+                        offset += 1;
+                    }
+                }
                 Value::build_text(result)
             }
             _ => unreachable!("text cast should never fail"),
@@ -1139,15 +1331,18 @@ impl Value {
             return Value::Blob([lhs.as_slice(), rhs.as_slice()].concat().to_vec());
         }
 
-        let Some(lhs) = self.cast_text() else {
+        let Some(lhs) = coerce_to_text_bytes(self) else {
             return Value::Null;
         };
 
-        let Some(rhs) = rhs.cast_text() else {
+        let Some(rhs) = coerce_to_text_bytes(rhs) else {
             return Value::Null;
         };
 
-        Value::build_text(lhs + &rhs)
+        let mut result = Vec::with_capacity(lhs.len() + rhs.len());
+        result.extend_from_slice(lhs.as_ref());
+        result.extend_from_slice(rhs.as_ref());
+        Value::build_text(result)
     }
 
     pub fn exec_and(&self, rhs: &Value) -> Value {
@@ -1288,18 +1483,16 @@ impl Value {
         let Value::Text(text) = self else {
             panic!("concat_to_text must be called only on Value::Text");
         };
-        text.value.to_mut().push_str(&other.to_string());
+        if let Some(other) = coerce_to_text_bytes(other) {
+            text.value.to_mut().extend_from_slice(other.as_ref());
+        }
     }
 
     pub fn exec_concat_strings<'a, T: Iterator<Item = &'a Self>>(registers: T) -> Self {
-        let mut result = String::new();
+        let mut result = Vec::new();
         for val in registers {
-            match val {
-                Value::Null => continue,
-                Value::Text(s) => result.push_str(s.as_str()),
-                Value::Blob(b) => result.push_str(&String::from_utf8_lossy(b)),
-                Value::Numeric(Numeric::Integer(i)) => result.push_str(&i.to_string()),
-                Value::Numeric(Numeric::Float(f)) => result.push_str(&format_float(f64::from(*f))),
+            if let Some(bytes) = coerce_to_text_bytes(val) {
+                result.extend_from_slice(bytes.as_ref());
             }
         }
         Value::build_text(result)
@@ -1315,15 +1508,27 @@ impl Value {
             .expect("registers should have at least one element after length check")
         {
             Value::Null | Value::Blob(_) => return Value::Null,
-            v => format!("{v}"),
+            Value::Text(text) => Cow::Borrowed(text.as_bytes()),
+            v => Cow::Owned(v.to_string().into_bytes()),
         };
 
-        let parts = registers.filter_map(|val| match val {
-            Value::Text(_) | Value::Numeric(_) => Some(format!("{val}")),
-            _ => None,
-        });
+        let mut result = Vec::new();
+        let mut first = true;
+        for val in registers {
+            let Some(bytes) = (match val {
+                Value::Text(text) => Some(Cow::Borrowed(text.as_bytes())),
+                Value::Numeric(_) => Some(Cow::Owned(val.to_string().into_bytes())),
+                _ => None,
+            }) else {
+                continue;
+            };
 
-        let result = parts.collect::<Vec<_>>().join(&separator);
+            if !first {
+                result.extend_from_slice(separator.as_ref());
+            }
+            result.extend_from_slice(bytes.as_ref());
+            first = false;
+        }
         Value::build_text(result)
     }
 
