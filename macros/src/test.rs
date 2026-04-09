@@ -37,6 +37,7 @@ struct Args {
     path: Option<SpannedType<String>>,
     mvcc: Option<SpannedType<()>>,
     views: Option<SpannedType<()>>,
+    encryption: Option<SpannedType<()>>,
     init_sql: Option<Expr>,
 }
 
@@ -109,6 +110,7 @@ impl Parse for Args {
         let mut path = None;
         let mut mvcc = None;
         let mut views = None;
+        let mut encryption = None;
         let mut init_sql = None;
 
         let errors = args
@@ -157,6 +159,9 @@ impl Parse for Args {
                         } else if p.is_ident("views") {
                             views = Some(SpannedType((), p.span()));
                             seen_args.insert(ident.unwrap().clone());
+                        } else if p.is_ident("encryption") {
+                            encryption = Some(SpannedType((), p.span()));
+                            seen_args.insert(ident.unwrap().clone());
                         } else {
                             return Some(syn::Error::new_spanned(p, "unexpected flag"));
                         }
@@ -180,6 +185,7 @@ impl Parse for Args {
             path,
             mvcc,
             views,
+            encryption,
             init_sql,
         })
     }
@@ -258,6 +264,13 @@ pub fn test_macro_attribute(args: TokenStream, input: TokenStream) -> TokenStrea
 
     let args = parse_macro_input!(args as Args);
 
+    // When `encryption` flag is set and the function has no parameters,
+    // generate a plain variant (with `let encrypted = false`) and an
+    // `_encrypted` variant (with `let encrypted = true`).
+    if args.encryption.is_some() && input.sig.inputs.is_empty() {
+        return encryption_tests(&input).into();
+    }
+
     let tmp_db_arg = match check_fn_inputs(&input) {
         Ok(fn_arg) => fn_arg,
         Err(err) => return err.into_compile_error().into(),
@@ -266,6 +279,39 @@ pub fn test_macro_attribute(args: TokenStream, input: TokenStream) -> TokenStrea
     let db_function = DatabaseFunction::new(input, tmp_db_arg, args);
 
     db_function.to_token_stream().into()
+}
+
+/// Generates test variants for the `encryption` flag: emits the original test
+/// as-is (with `let encrypted = false`) and an `_encrypted` variant (with
+/// `let encrypted = true`). The function must take no parameters; it reads
+/// the `encrypted` local binding from its body.
+fn encryption_tests(input: &ItemFn) -> proc_macro2::TokenStream {
+    let ItemFn {
+        attrs,
+        vis,
+        sig,
+        block,
+    } = input;
+
+    let base_name = &sig.ident;
+    let encrypted_name = Ident::new(&format!("{base_name}_encrypted"), base_name.span());
+    let fn_generics = &sig.generics;
+
+    quote! {
+        #[test]
+        #(#attrs)*
+        #vis fn #base_name #fn_generics() {
+            let encrypted = false;
+            #block
+        }
+
+        #[test]
+        #(#attrs)*
+        #vis fn #encrypted_name #fn_generics() {
+            let encrypted = true;
+            #block
+        }
+    }
 }
 
 fn check_fn_inputs(input: &ItemFn) -> syn::Result<(Pat, syn::Type)> {
