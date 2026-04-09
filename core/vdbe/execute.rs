@@ -11885,7 +11885,8 @@ pub fn op_add_column(
             db,
             table,
             column,
-            check_constraints
+            check_constraints,
+            foreign_keys
         },
         insn
     );
@@ -11911,6 +11912,8 @@ pub fn op_add_column(
             crate::schema::BTreeTable::build_logical_to_physical_map(&btree.columns);
         // Update CHECK constraints to include any constraints from the new column
         btree.check_constraints.clone_from(check_constraints);
+        // Update foreign keys to include any FK constraints from the new column
+        btree.foreign_keys.clone_from(foreign_keys);
 
         // Resolve generated column expressions and update virtual column metadata
         btree.prepare_generated_columns()?;

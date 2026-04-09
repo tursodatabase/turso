@@ -1237,6 +1237,7 @@ pub fn translate_alter_table(
                         table: table_name.to_owned(),
                         column: Box::new(column),
                         check_constraints: btree.check_constraints.clone(),
+                        foreign_keys: btree.foreign_keys.clone(),
                     });
                 },
             )?
