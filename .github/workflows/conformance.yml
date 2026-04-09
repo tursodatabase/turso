@@ -54,3 +54,30 @@ jobs:
       - name: Run conformance tests
         working-directory: testing/javascript
         run: npm run test:turso
+
+  sqlite-tcl:
+    name: SQLite TCL conformance tests
+    timeout-minutes: 30
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: conformance-sqlite-tcl-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            conformance-sqlite-tcl-cargo-
+          save-always: true
+      - name: Install TCL dev headers
+        run: sudo apt-get update && sudo apt-get install -y tcl-dev tcl
+      - name: Build libturso_tcl
+        run: make -C bindings/tcl build
+      - name: Run SQLite TCL conformance tests
+        run: tclsh testing/conformance/sqlite3/all.test
