@@ -346,6 +346,8 @@ mod tests {
     #[cfg(feature = "checksum")]
     #[test]
     fn checksum_read_wrapper_propagates_callback_errors() {
+        use crate::{MemoryIO, IO};
+
         let db_file = DatabaseFile {
             file: Arc::new(MockFile { read_result: Ok(0) }),
         };
@@ -386,6 +388,8 @@ mod tests {
     #[cfg(feature = "checksum")]
     #[test]
     fn checksum_read_wrapper_propagates_transport_errors_to_original_completion() {
+        use crate::{MemoryIO, IO};
+
         let db_file = DatabaseFile {
             file: Arc::new(MockFile {
                 read_result: Err(CompletionError::Aborted),

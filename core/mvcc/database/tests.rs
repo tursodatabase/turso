@@ -8499,3 +8499,189 @@ fn test_encrypted_recovery_corrupted_ciphertext() {
     assert_eq!(rows[0][0].as_int().unwrap(), 1);
     assert_eq!(rows[0][1].to_string(), "survives");
 }
+
+/// Reproducer for a bug where log replay after checkpoint-restart-checkpoint-restart
+/// panics with "table id that does not exist in the table_id_to_rootpage map".
+///
+/// The scenario from the simulator:
+/// 1. Create many tables, insert data, checkpoint (tables get positive root pages)
+/// 2. Restart (recovery rebuilds table_id_to_rootpage from btree schema)
+/// 3. Create more tables + insert into old and new tables
+/// 4. Checkpoint (all tables now have positive root pages, log is truncated)
+/// 5. Insert more data into all tables (un-checkpointed, written to log with
+///    table IDs assigned in this server incarnation)
+/// 6. Restart → bootstrap rebuilds map from btree root pages, then log replay
+///    sees row inserts for table IDs that may not match the bootstrap mapping
+#[test]
+fn test_recovery_many_tables_checkpoint_restart_checkpoint_restart() {
+    let mut db = MvccTestDbNoConn::new_with_random_db();
+    let num_initial_tables = 50;
+    let num_extra_tables = 30;
+
+    // Step 1: Create many tables, insert data, checkpoint
+    {
+        let conn = db.connect();
+        for i in 0..num_initial_tables {
+            conn.execute(format!("CREATE TABLE t{i}(id INTEGER PRIMARY KEY, v TEXT)"))
+                .unwrap();
+            conn.execute(format!("INSERT INTO t{i} VALUES (1, 'init')"))
+                .unwrap();
+        }
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+        conn.close().unwrap();
+    }
+
+    // Step 2: Restart (simulates server redeploy)
+    db.restart();
+
+    // Step 3: Create more tables + insert into old tables, then checkpoint
+    {
+        let conn = db.connect();
+        // Create new tables (these get new negative table IDs)
+        for i in 0..num_extra_tables {
+            conn.execute(format!(
+                "CREATE TABLE extra{i}(id INTEGER PRIMARY KEY, v TEXT)"
+            ))
+            .unwrap();
+            conn.execute(format!("INSERT INTO extra{i} VALUES (1, 'extra')"))
+                .unwrap();
+        }
+        // Insert into the original tables
+        for i in 0..num_initial_tables {
+            conn.execute(format!("INSERT INTO t{i} VALUES (2, 'after_restart')"))
+                .unwrap();
+        }
+        // Step 4: Checkpoint - all tables get positive root pages, log truncated
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+
+        // Step 5: More writes after checkpoint (un-checkpointed, in the log)
+        for i in 0..num_initial_tables {
+            conn.execute(format!("INSERT INTO t{i} VALUES (3, 'post_ckpt2')"))
+                .unwrap();
+        }
+        for i in 0..num_extra_tables {
+            conn.execute(format!(
+                "INSERT INTO extra{i} VALUES (2, 'extra_post_ckpt')"
+            ))
+            .unwrap();
+        }
+        conn.close().unwrap();
+    }
+
+    // Step 6: Restart again - log replay should not panic
+    db.restart();
+
+    // Verify data integrity
+    {
+        let conn = db.connect();
+        for i in 0..num_initial_tables {
+            let rows = get_rows(&conn, &format!("SELECT id, v FROM t{i} ORDER BY id"));
+            assert_eq!(
+                rows.len(),
+                3,
+                "table t{i} should have 3 rows, got {}",
+                rows.len()
+            );
+        }
+        for i in 0..num_extra_tables {
+            let rows = get_rows(&conn, &format!("SELECT id, v FROM extra{i} ORDER BY id"));
+            assert_eq!(
+                rows.len(),
+                2,
+                "table extra{i} should have 2 rows, got {}",
+                rows.len()
+            );
+        }
+    }
+}
+
+/// Variant that does 3 restart cycles with tables created across each incarnation.
+/// This stresses the table_id_to_rootpage mapping more aggressively.
+#[test]
+fn test_recovery_three_restarts_with_table_creation() {
+    let mut db = MvccTestDbNoConn::new_with_random_db();
+
+    // Incarnation 1: create tables, checkpoint
+    {
+        let conn = db.connect();
+        for i in 0..20 {
+            conn.execute(format!("CREATE TABLE a{i}(id INTEGER PRIMARY KEY, v TEXT)"))
+                .unwrap();
+            conn.execute(format!("INSERT INTO a{i} VALUES (1, 'a')"))
+                .unwrap();
+        }
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+        conn.close().unwrap();
+    }
+
+    db.restart();
+
+    // Incarnation 2: create more tables, insert into old, checkpoint, then more writes
+    {
+        let conn = db.connect();
+        for i in 0..20 {
+            conn.execute(format!("CREATE TABLE b{i}(id INTEGER PRIMARY KEY, v TEXT)"))
+                .unwrap();
+            conn.execute(format!("INSERT INTO b{i} VALUES (1, 'b')"))
+                .unwrap();
+        }
+        for i in 0..20 {
+            conn.execute(format!("INSERT INTO a{i} VALUES (2, 'a2')"))
+                .unwrap();
+        }
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+        // Un-checkpointed writes
+        for i in 0..20 {
+            conn.execute(format!("INSERT INTO a{i} VALUES (3, 'a3')"))
+                .unwrap();
+            conn.execute(format!("INSERT INTO b{i} VALUES (2, 'b2')"))
+                .unwrap();
+        }
+        conn.close().unwrap();
+    }
+
+    db.restart();
+
+    // Incarnation 3: create even more tables, insert everywhere, checkpoint, more writes
+    {
+        let conn = db.connect();
+        for i in 0..20 {
+            conn.execute(format!("CREATE TABLE c{i}(id INTEGER PRIMARY KEY, v TEXT)"))
+                .unwrap();
+            conn.execute(format!("INSERT INTO c{i} VALUES (1, 'c')"))
+                .unwrap();
+        }
+        for i in 0..20 {
+            conn.execute(format!("INSERT INTO a{i} VALUES (4, 'a4')"))
+                .unwrap();
+            conn.execute(format!("INSERT INTO b{i} VALUES (3, 'b3')"))
+                .unwrap();
+        }
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+        // Un-checkpointed writes to all tables
+        for i in 0..20 {
+            conn.execute(format!("INSERT INTO a{i} VALUES (5, 'a5')"))
+                .unwrap();
+            conn.execute(format!("INSERT INTO b{i} VALUES (4, 'b4')"))
+                .unwrap();
+            conn.execute(format!("INSERT INTO c{i} VALUES (2, 'c2')"))
+                .unwrap();
+        }
+        conn.close().unwrap();
+    }
+
+    // Final restart - should not panic during log replay
+    db.restart();
+
+    {
+        let conn = db.connect();
+        for i in 0..20 {
+            let rows = get_rows(&conn, &format!("SELECT id FROM a{i} ORDER BY id"));
+            assert_eq!(rows.len(), 5, "table a{i} should have 5 rows");
+            let rows = get_rows(&conn, &format!("SELECT id FROM b{i} ORDER BY id"));
+            assert_eq!(rows.len(), 4, "table b{i} should have 4 rows");
+            let rows = get_rows(&conn, &format!("SELECT id FROM c{i} ORDER BY id"));
+            assert_eq!(rows.len(), 2, "table c{i} should have 2 rows");
+        }
+    }
+}
