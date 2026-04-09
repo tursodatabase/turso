@@ -151,6 +151,14 @@ jobs:
           name: ios-libs
           path: bindings/react-native/libs/ios/
 
+      - name: Fix xcframework after artifact download
+        run: |
+          find bindings/react-native/libs/ios/turso-sync-sdk-kit.xcframework \
+            -name "turso-sync-sdk-kit" -type f | while read f; do
+            chmod +x "$f"
+            codesign -f -s - "$f"
+          done
+
       - name: Download TypeScript build
         uses: actions/download-artifact@v4
         with:
