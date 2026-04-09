@@ -7,7 +7,9 @@ use async_trait::async_trait;
 use std::collections::HashSet;
 use std::sync::Arc;
 use tempfile::NamedTempFile;
-use turso::{Builder, Connection, Database, Value};
+#[cfg(test)]
+use turso::Value;
+use turso::{Builder, Connection, Database, ValueRef};
 
 /// Native Rust backend using Turso bindings directly
 pub struct RustBackend {
@@ -170,8 +172,8 @@ impl RustDatabaseInstance {
                             let mut row_values = Vec::new();
                             let col_count = row.column_count();
                             for i in 0..col_count {
-                                let value = row.get_value(i)?;
-                                row_values.push(value_to_string(&value));
+                                let value = row.get_value_ref(i)?;
+                                row_values.push(value_ref_to_string(value));
                             }
                             all_rows.push(row_values);
                         }
@@ -233,6 +235,7 @@ impl DatabaseInstance for RustDatabaseInstance {
 /// - Integer and Real use standard formatting
 /// - Text is used as-is
 /// - Blob is converted to UTF-8 string (matching CLI list mode behavior)
+#[cfg(test)]
 fn value_to_string(value: &Value) -> String {
     match value {
         Value::Null => String::new(),
@@ -240,6 +243,15 @@ fn value_to_string(value: &Value) -> String {
         Value::Real(f) => format_real(*f),
         Value::Text(s) => s.clone(),
         Value::Blob(bytes) => String::from_utf8_lossy(bytes).to_string(),
+    }
+}
+
+fn value_ref_to_string(value: ValueRef<'_>) -> String {
+    match value {
+        ValueRef::Null => String::new(),
+        ValueRef::Integer(i) => i.to_string(),
+        ValueRef::Real(f) => format_real(f),
+        ValueRef::Text(bytes) | ValueRef::Blob(bytes) => String::from_utf8_lossy(bytes).to_string(),
     }
 }
 
