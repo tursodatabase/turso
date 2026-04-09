@@ -54,14 +54,14 @@ source $testdir/selectF.test
 # FIXME: source $testdir/alter4.test
 
 # FIXME: source $testdir/func.test
-# FIXME: source $testdir/func2.test
+source $testdir/func2.test
 # FIXME: source $testdir/func3.test
 # FIXME: source $testdir/func4.test
 # FIXME: source $testdir/func5.test
 # FIXME: source $testdir/func6.test
 # FIXME: source $testdir/func7.test
 # FIXME: source $testdir/func8.test
-# FIXME: source $testdir/func9.test
+source $testdir/func9.test
 
 # Print aggregate summary and exit non-zero if any test failed.
 puts ""
