@@ -5,7 +5,10 @@ use super::{translate_inner, ProgramBuilder, ProgramBuilderOpts};
 use crate::translate::expr::emit_table_column_for_dml;
 use crate::{
     error::SQLITE_CONSTRAINT_FOREIGNKEY,
-    schema::{BTreeTable, ColumnLayout, ForeignKey, Index, ResolvedFkRef, ROWID_SENTINEL},
+    schema::{
+        stored_deps_of_virtual, BTreeTable, ColumnLayout, ForeignKey, Index, ResolvedFkRef,
+        ROWID_SENTINEL,
+    },
     translate::{collate::CollationSeq, emitter::Resolver, planner::ROWID_STRS},
     vdbe::{
         builder::{CursorType, DmlColumnContext, QueryMode},
@@ -441,13 +444,14 @@ pub fn emit_parent_index_key_change_checks(
         .any(|col| table_btree.columns[col.pos_in_table].is_virtual_generated());
 
     let old_key = program.alloc_registers(idx_len);
+    let idx_target_cols: Vec<usize> = index.columns.iter().map(|c| c.pos_in_table).collect();
     let dml_ctx = some_idx_columns_are_virtual.then(|| {
         cursor_to_registers(
             program,
             table_btree,
-            layout.clone(),
             cursor_id,
             old_rowid_reg,
+            &idx_target_cols,
         )
     });
     for (i, index_col) in index.columns.iter().enumerate() {
@@ -736,26 +740,31 @@ fn emit_fk_parent_key_probe(
     Ok(())
 }
 
-/// `layout` has to be the [ColumnLayout] from `table.column_layout()`. It's passed this way
-/// because cloning it is cheaper than recreating it.
+/// Reads the stored columns needed by `target_columns` into compact registers.
+///
+/// Only the stored columns that are transitively referenced by virtual columns among
+/// `target_columns` are read from the cursor.
 pub fn cursor_to_registers(
     program: &mut ProgramBuilder,
     table: &BTreeTable,
-    layout: ColumnLayout,
     cursor_id: usize,
     rowid_reg: usize,
+    target_columns: &[usize],
 ) -> DmlColumnContext {
-    let ncols = table.columns.len();
-    let base = program.alloc_registers(ncols);
-    for (idx, col) in table.columns.iter().enumerate() {
-        let reg = layout.to_register(base, idx);
-        if col.is_virtual_generated() {
-            continue;
-        } else {
-            program.emit_column_or_rowid(cursor_id, idx, reg);
+    let dependencies = stored_deps_of_virtual(&table.columns, target_columns);
+    let base = program.alloc_registers(dependencies.count());
+    let mut column_regs = vec![0usize; table.columns.len()];
+    let mut next_reg = base;
+    for idx in 0..table.columns.len() {
+        if table.columns[idx].is_rowid_alias() {
+            column_regs[idx] = rowid_reg;
+        } else if dependencies.get(idx) {
+            column_regs[idx] = next_reg;
+            program.emit_column_or_rowid(cursor_id, idx, next_reg);
+            next_reg += 1;
         }
     }
-    DmlColumnContext::layout(&table.columns, base, rowid_reg, layout)
+    DmlColumnContext::indexed(table.columns.clone(), column_regs)
 }
 
 /// Build a parent key vector (in FK parent-column order) into `dest_start`.
@@ -775,13 +784,17 @@ fn build_parent_key(
             .is_some_and(|(_, c)| c.is_virtual_generated())
     });
 
+    let fk_target_cols: Vec<usize> = parent_cols
+        .iter()
+        .filter_map(|pcol| parent_bt.get_column(pcol).map(|(pos, _)| pos))
+        .collect();
     let ctx = some_fk_cols_are_virtual.then(|| {
         cursor_to_registers(
             program,
             parent_bt,
-            parent_bt.column_layout(),
             parent_cursor_id,
             parent_rowid_reg,
+            &fk_target_cols,
         )
     });
 
