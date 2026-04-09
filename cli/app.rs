@@ -1961,19 +1961,24 @@ impl Limbo {
             Value::Numeric(Numeric::Integer(i)) => out.write_all(format!("{i}").as_bytes()),
             Value::Numeric(Numeric::Float(f)) => write!(out, "{}", f64::from(*f)).map(|_| ()),
             Value::Text(s) => {
-                out.write_all(b"'")?;
-                let bytes = s.as_bytes();
-                let mut i = 0;
-                while i < bytes.len() {
-                    let b = bytes[i];
-                    if b == b'\'' {
-                        out.write_all(b"''")?;
-                    } else {
-                        out.write_all(&[b])?;
+                if let Ok(text) = s.try_as_str() {
+                    out.write_all(b"'")?;
+                    for ch in text.bytes() {
+                        if ch == b'\'' {
+                            out.write_all(b"''")?;
+                        } else {
+                            out.write_all(&[ch])?;
+                        }
                     }
-                    i += 1;
+                    out.write_all(b"'")
+                } else {
+                    out.write_all(b"CAST(X'")?;
+                    const HEX: &[u8; 16] = b"0123456789abcdef";
+                    for &byte in s.as_bytes() {
+                        out.write_all(&[HEX[(byte >> 4) as usize], HEX[(byte & 0x0F) as usize]])?;
+                    }
+                    out.write_all(b"' AS TEXT)")
                 }
-                out.write_all(b"'")
             }
             Value::Blob(b) => {
                 out.write_all(b"X'")?;
@@ -2352,6 +2357,8 @@ fn normalize_db_path(db_file: String) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
+    use turso_core::{DatabaseOpts, MemoryIO, IO};
 
     #[test]
     fn test_normalize_db_path_adds_file_prefix_for_query_params() {
@@ -2418,5 +2425,52 @@ mod tests {
             normalize_db_path("foo.bar?mode=ro?mode=ro".into()),
             "file:foo.bar%3Fmode=ro?mode=ro"
         );
+    }
+
+    #[test]
+    fn test_dump_round_trips_invalid_text_bytes() {
+        let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+        let db = Database::open_file_with_flags(
+            io.clone(),
+            ":memory:",
+            OpenFlags::Create,
+            DatabaseOpts::new(),
+            None,
+        )
+        .unwrap();
+        let conn = db.connect().unwrap();
+        Limbo::exec_all_conn(&conn, "CREATE TABLE t(val TEXT);").unwrap();
+        Limbo::exec_all_conn(&conn, "INSERT INTO t VALUES(CAST(X'FF' AS TEXT));").unwrap();
+
+        let mut dump = Vec::new();
+        Limbo::dump_database_from_conn(false, conn.clone(), &mut dump, NoopProgress).unwrap();
+        let dump_sql = std::str::from_utf8(&dump).unwrap();
+        assert!(dump_sql.contains("INSERT INTO \"t\" VALUES(CAST(X'ff' AS TEXT));"));
+
+        let restored_io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+        let restored = Database::open_file_with_flags(
+            restored_io,
+            ":memory:",
+            OpenFlags::Create,
+            DatabaseOpts::new(),
+            None,
+        )
+        .unwrap();
+        let restored_conn = restored.connect().unwrap();
+        let mut applier = ApplyWriter::new(&restored_conn);
+        applier.write_all(&dump).unwrap();
+        applier.finish().unwrap();
+
+        let mut rows = restored_conn
+            .query("SELECT hex(val) FROM t")
+            .unwrap()
+            .unwrap();
+        let mut result = None;
+        rows.run_with_row_callback(|row| {
+            result = Some(row.get::<&str>(0)?.to_string());
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(result.as_deref(), Some("FF"));
     }
 }
