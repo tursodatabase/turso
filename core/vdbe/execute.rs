@@ -2994,27 +2994,28 @@ fn open_connection_named_savepoints_for_db(
     db: usize,
     pager: &Arc<Pager>,
 ) -> Result<IOResult<()>> {
-    let frames = conn.named_savepoints();
-    if frames.is_empty() {
-        return Ok(IOResult::Done(()));
-    }
-
-    if let Some(mv_store) = conn.mv_store_for_db(db) {
-        let Some(tx_id) = conn.get_mv_tx_id_for_db(db) else {
+    conn.with_named_savepoints(|frames| {
+        if frames.is_empty() {
             return Ok(IOResult::Done(()));
-        };
-        for frame in frames {
-            mv_store.begin_named_savepoint(
-                tx_id,
-                frame.name,
-                frame.starts_transaction,
-                frame.deferred_fk_violations,
-            );
         }
-        Ok(IOResult::Done(()))
-    } else {
-        open_named_savepoint_frames_on_wal_pager(pager, &frames)
-    }
+
+        if let Some(mv_store) = conn.mv_store_for_db(db) {
+            let Some(tx_id) = conn.get_mv_tx_id_for_db(db) else {
+                return Ok(IOResult::Done(()));
+            };
+            for frame in frames {
+                mv_store.begin_named_savepoint(
+                    tx_id,
+                    frame.name.clone(),
+                    frame.starts_transaction,
+                    frame.deferred_fk_violations,
+                );
+            }
+            Ok(IOResult::Done(()))
+        } else {
+            open_named_savepoint_frames_on_wal_pager(pager, frames)
+        }
+    })
 }
 
 fn mirror_named_savepoint_begin_to_active_non_main_databases(
@@ -3338,7 +3339,7 @@ pub fn op_transaction_inner(
                             // Transition to AttachedBeginWriteTx to handle begin_write_tx
                             // separately, so if it returns IO we don't re-call begin_read_tx
                             // on re-entry.
-                            if conn.named_savepoints().is_empty() {
+                            if conn.with_named_savepoints(|savepoints| savepoints.is_empty()) {
                                 state.op_transaction_state =
                                     OpTransactionState::AttachedBeginWriteTx;
                             } else {
@@ -3406,7 +3407,10 @@ pub fn op_transaction_inner(
                 if updated {
                     conn.set_tx_state(new_transaction_state);
                 }
-                if is_secondary_db && started_secondary_tx && !conn.named_savepoints().is_empty() {
+                if is_secondary_db
+                    && started_secondary_tx
+                    && !conn.with_named_savepoints(|s| s.is_empty())
+                {
                     state.op_transaction_state = OpTransactionState::BeginNamedSavepoints;
                     continue;
                 }

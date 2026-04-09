@@ -1728,35 +1728,40 @@ impl Connection {
         f: impl FnOnce(&mut Schema) -> T,
     ) -> T {
         if database_id == crate::MAIN_DB_ID {
-            self.with_schema_mut(f)
-        } else {
-            // For attached databases, update a connection-local copy of the schema.
-            // We don't update the shared db.schema until after the WAL commit, so
-            // other connections won't see uncommitted schema changes (which would
-            // cause SchemaUpdated mismatches).
-            let mut schemas = self.database_schemas.write();
-            let schema_arc = schemas.entry(database_id).or_insert_with(|| {
-                if database_id == crate::TEMP_DB_ID {
-                    self.temp_database
-                        .read()
-                        .as_ref()
-                        .map(|temp_db| temp_db.db.schema.lock().clone())
-                        .unwrap_or_else(|| self.empty_temp_schema())
-                } else {
-                    let attached_dbs = self.attached_databases.read();
-                    let (db, _pager) = attached_dbs
-                        .index_to_data
-                        .get(&database_id)
-                        .expect("Database ID should be valid");
-                    let schema = db.schema.lock().clone();
-                    schema
-                }
-            });
-            let schema = Arc::make_mut(schema_arc);
+            return self.with_schema_mut(f);
+        }
+        if database_id == crate::TEMP_DB_ID {
+            // The temp database is connection-local, no other connection can
+            // reference its schema, so we can mutate it directly without cloning
+            // into `database_schemas`.
+            let temp_db_guard = self.temp_database.read();
+            let temp_db = temp_db_guard
+                .as_ref()
+                .expect("temp database should be initialized before schema mutation");
+            let mut schema_guard = temp_db.db.schema.lock();
+            let schema = Arc::make_mut(&mut schema_guard);
             let result = f(schema);
             self.bump_prepare_context_generation();
-            result
+            return result;
         }
+        // For attached databases, update a connection-local copy of the schema.
+        // We don't update the shared db.schema until after the WAL commit, so
+        // other connections won't see uncommitted schema changes (which would
+        // cause SchemaUpdated mismatches).
+        let mut schemas = self.database_schemas.write();
+        let schema_arc = schemas.entry(database_id).or_insert_with(|| {
+            let attached_dbs = self.attached_databases.read();
+            let (db, _pager) = attached_dbs
+                .index_to_data
+                .get(&database_id)
+                .expect("Database ID should be valid");
+            let schema = db.schema.lock().clone();
+            schema
+        });
+        let schema = Arc::make_mut(schema_arc);
+        let result = f(schema);
+        self.bump_prepare_context_generation();
+        result
     }
 
     pub fn is_db_initialized(&self) -> bool {
@@ -2694,8 +2699,12 @@ impl Connection {
         }
     }
 
-    pub(crate) fn named_savepoints(&self) -> Vec<NamedSavepointFrame> {
-        self.named_savepoints.read().clone()
+    pub(crate) fn with_named_savepoints<F, T>(&self, f: F) -> T
+    where
+        F: FnOnce(&Vec<NamedSavepointFrame>) -> T,
+    {
+        let savepoints = self.named_savepoints.read();
+        f(&savepoints)
     }
 
     pub(crate) fn push_named_savepoint(
