@@ -94,3 +94,64 @@ test truncated-invalid-text-units {
 expect {
     E282|1|2|E282|1|
 }
+
+setup invalid-text-comparison-rows {
+    CREATE TABLE t(val TEXT);
+    INSERT INTO t VALUES
+        (CAST(X'FF' AS TEXT)),
+        (CAST(X'FE' AS TEXT)),
+        (CAST(X'FF' AS TEXT));
+}
+
+@setup invalid-text-comparison-rows
+test invalid-text-set-ops-and-grouping {
+    SELECT
+        (SELECT group_concat(hex(val), ',') FROM (SELECT DISTINCT val FROM t ORDER BY val)),
+        (SELECT group_concat(hex(val), ',') FROM (SELECT val FROM t UNION SELECT val FROM t ORDER BY val)),
+        (SELECT group_concat(hex(val) || ':' || cnt, ',') FROM (SELECT val, count(*) AS cnt FROM t GROUP BY val ORDER BY val));
+}
+expect {
+    FE,FF|FE,FF|FE:1,FF:2
+}
+
+@setup invalid-text-comparison-rows
+test invalid-text-comparisons-and-collations {
+    SELECT
+        CAST(X'FF' AS TEXT) = CAST(X'FF' AS TEXT),
+        CAST(X'FF' AS TEXT) = CAST(X'FE' AS TEXT),
+        (SELECT group_concat(hex(val), ',') FROM (SELECT val FROM t ORDER BY val COLLATE BINARY, rowid)),
+        (SELECT group_concat(hex(val), ',') FROM (SELECT val FROM t ORDER BY val COLLATE NOCASE, rowid)),
+        (SELECT group_concat(hex(val), ',') FROM (SELECT val FROM t ORDER BY val COLLATE RTRIM, rowid));
+}
+expect {
+    1|0|FE,FF,FF|FE,FF,FF|FE,FF,FF
+}
+
+setup mixed-case-invalid-text-row {
+    CREATE TABLE t(val TEXT);
+    INSERT INTO t VALUES(CAST(X'41FF42' AS TEXT));
+}
+
+@setup mixed-case-invalid-text-row
+test mixed-invalid-text-case-folding {
+    SELECT
+        hex(lower(val)),
+        hex(upper(val))
+    FROM t;
+}
+expect {
+    61EFBFBD62|41EFBFBD42
+}
+
+@backend cli
+@setup invalid-text-row
+test invalid-text-dump-emits-replayable-sql {
+    .dump
+}
+expect raw {
+PRAGMA foreign_keys=OFF;
+BEGIN TRANSACTION;
+CREATE TABLE t (val TEXT);
+INSERT INTO "t" VALUES(CAST(X'ff' AS TEXT));
+COMMIT;
+}
