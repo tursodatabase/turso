@@ -20,7 +20,7 @@ test invalid-text-lossy-text-functions {
     FROM t;
 }
 expect {
-    FF|1|1|'�'|65533|EFBFBD|EFBFBD|0|0
+    FF|1|1|'�'|65533|FF|FF|0|0
 }
 
 @setup invalid-text-row
@@ -140,9 +140,10 @@ test mixed-invalid-text-case-folding {
     FROM t;
 }
 expect {
-    61EFBFBD62|41EFBFBD42
+    61FF62|41FF42
 }
 
+@skip-if sqlite "sqlite shell .dump output is lossy for invalid TEXT and differs in formatting"
 @backend cli
 @setup invalid-text-row
 test invalid-text-dump-emits-replayable-sql {

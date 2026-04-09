@@ -303,8 +303,16 @@ fn trim_text_bytes(bytes: &[u8], pattern: Option<&[u8]>, trim_type: TrimType) ->
 
 impl Value {
     pub fn exec_lower(&self) -> Option<Self> {
-        self.cast_text()
-            .map(|s| Value::build_text(s.to_ascii_lowercase()))
+        match self.exec_cast("TEXT") {
+            Value::Text(text) => Some(Value::build_text(
+                text.as_bytes()
+                    .iter()
+                    .map(|byte| byte.to_ascii_lowercase())
+                    .collect::<Vec<_>>(),
+            )),
+            Value::Null => None,
+            _ => unreachable!("TEXT cast should always return TEXT or NULL"),
+        }
     }
 
     pub fn exec_length(&self) -> Self {
@@ -329,8 +337,16 @@ impl Value {
     }
 
     pub fn exec_upper(&self) -> Option<Self> {
-        self.cast_text()
-            .map(|s| Value::build_text(s.to_ascii_uppercase()))
+        match self.exec_cast("TEXT") {
+            Value::Text(text) => Some(Value::build_text(
+                text.as_bytes()
+                    .iter()
+                    .map(|byte| byte.to_ascii_uppercase())
+                    .collect::<Vec<_>>(),
+            )),
+            Value::Null => None,
+            _ => unreachable!("TEXT cast should always return TEXT or NULL"),
+        }
     }
 
     pub fn exec_sign(&self) -> Option<Value> {
