@@ -1456,13 +1456,13 @@ pub(crate) fn emit_index_column_value_old_image(
     } else if let Some((table, generated_column)) =
         generated_column(&program, table_cursor_id, idx_col)
     {
-        cursor_to_registers(program, &table, table.column_layout(), table_cursor_id, 0);
+        cursor_to_registers(program, &table, table_cursor_id, 0, &[idx_col.pos_in_table]);
 
         emit_table_column(
             program,
             table_cursor_id,
             table_internal_id,
-            &table_references,
+            table_references,
             &generated_column,
             idx_col.pos_in_table,
             dest_reg,

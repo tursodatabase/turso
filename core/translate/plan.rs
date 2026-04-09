@@ -1488,6 +1488,17 @@ impl ColumnUsedMask {
             });
         inline_iter.chain(overflow_iter)
     }
+
+    /// returns the number of set bits
+    pub fn count(&self) -> usize {
+        let mut count = self.inline.count_ones() as usize;
+        if let Some(ref ov) = self.overflow {
+            for &word in ov {
+                count += word.count_ones() as usize;
+            }
+        }
+        count
+    }
 }
 
 impl std::ops::BitOrAssign<&Self> for ColumnUsedMask {

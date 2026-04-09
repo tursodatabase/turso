@@ -128,7 +128,7 @@ use crate::storage::btree::{BTreeCursor, CursorTrait};
 use crate::sync::Arc;
 use crate::sync::Mutex;
 use crate::translate::collate::CollationSeq;
-use crate::translate::plan::{Plan, TableReferences};
+use crate::translate::plan::{ColumnUsedMask, Plan, TableReferences};
 use crate::util::{
     module_args_from_sql, module_name_from_sql, type_from_name, UnparsedFromSqlIndex,
 };
@@ -2711,6 +2711,66 @@ pub(crate) fn columns_affected_by_update(
         }
     }
     affected
+}
+
+/// returns a bitset containing the indexes of the stored columns that the virtual columns in
+/// `targets` depends on.
+pub(crate) fn stored_deps_of_virtual(columns: &[Column], targets: &[usize]) -> ColumnUsedMask {
+    type Bitset = ColumnUsedMask;
+
+    fn collect_column_dependencies_of_gencol(expr: &Expr, columns: &[Column], out: &mut Bitset) {
+        let _ = walk_expr(expr, &mut |e| {
+            match e {
+                Expr::Column { table, column, .. } if table.is_self_table() => {
+                    out.set(*column);
+                }
+                Expr::Id(name) | Expr::Name(name) => {
+                    if let Some(idx) = find_column_index_by_name(columns, name.as_str()) {
+                        out.set(idx);
+                    }
+                }
+                Expr::Qualified(_, col) | Expr::DoublyQualified(_, _, col) => {
+                    if let Some(idx) = find_column_index_by_name(columns, col.as_str()) {
+                        out.set(idx);
+                    }
+                }
+                Expr::Subquery(_)
+                | Expr::Exists(_)
+                | Expr::InTable { .. }
+                | Expr::SubqueryResult { .. } => {
+                    unreachable!("generated columns cannot contain subqueries")
+                }
+                _ => {}
+            }
+            Ok(WalkControl::Continue)
+        });
+    }
+
+    let mut dependencies = Bitset::default();
+    let mut visited = Bitset::default();
+    let mut pending = Bitset::default();
+    for &idx in targets {
+        pending.set(idx);
+    }
+    loop {
+        let mut next = Bitset::default();
+        for idx in pending.iter() {
+            if visited.get(idx) {
+                continue;
+            }
+            visited.set(idx);
+            if let GeneratedType::Virtual { ref resolved, .. } = columns[idx].generated_type() {
+                collect_column_dependencies_of_gencol(resolved, columns, &mut next);
+            } else {
+                dependencies.set(idx);
+            }
+        }
+        if next.is_empty() {
+            break;
+        }
+        pending = next;
+    }
+    dependencies
 }
 
 /// Returns true if `expr` references any column in `target_set`.
