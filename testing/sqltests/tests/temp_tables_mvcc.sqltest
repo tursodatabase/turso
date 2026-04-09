@@ -13,6 +13,7 @@ expect {
     1
 }
 
+@skip-if mvcc "with --mvcc the main db already has MVCC, so BEGIN CONCURRENT succeeds"
 test begin-concurrent-still-fails-after-temp-journal-mode-mvcc {
     CREATE TABLE m(x INTEGER);
     CREATE TEMP TABLE t(x INTEGER);
