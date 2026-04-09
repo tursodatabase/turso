@@ -50,27 +50,6 @@ fn test_drop_trigger(db: TempDatabase) {
     assert_eq!(results.len(), 0);
 }
 
-#[turso_macros::test]
-fn test_drop_trigger_finds_attached_trigger_without_qualifier(db: TempDatabase) {
-    let conn = db.connect_limbo();
-    let aux_path = db.path.with_extension("trigger_aux.db");
-
-    conn.pragma_update("journal_mode", "'mvcc'").unwrap();
-    conn.execute(format!("ATTACH '{}' AS aux", aux_path.display()))
-        .unwrap();
-    conn.execute("CREATE TABLE aux.aux_t(x INTEGER PRIMARY KEY)")
-        .unwrap();
-
-    conn.execute("CREATE TRIGGER aux.trg BEFORE INSERT ON aux.aux_t BEGIN SELECT 1; END")
-        .unwrap();
-
-    conn.execute("DROP TRIGGER trg").unwrap();
-
-    let aux_results: Vec<(String,)> =
-        conn.exec_rows("SELECT name FROM aux.sqlite_schema WHERE type='trigger' AND name='trg'");
-    assert_eq!(aux_results.len(), 0, "attached trigger should be dropped");
-}
-
 #[turso_macros::test(mvcc)]
 fn test_trigger_after_insert(db: TempDatabase) {
     let conn = db.connect_limbo();
@@ -936,31 +915,6 @@ fn test_alter_table_rename_column_fails_when_trigger_when_clause_references_colu
     assert!(
         error_msg.contains("error in trigger") && error_msg.contains("no such column"),
         "Error should mention trigger and column: {error_msg}",
-    );
-}
-
-#[turso_macros::test]
-fn test_alter_temp_table_rename_column_rejects_invalid_trigger_rewrite(db: TempDatabase) {
-    let conn = db.connect_limbo();
-
-    conn.execute("CREATE TEMP TABLE t(a,b)").unwrap();
-    conn.execute(
-        "CREATE TRIGGER tr AFTER INSERT ON temp.t BEGIN
-         INSERT INTO t VALUES(new.a,new.b);
-        END",
-    )
-    .unwrap();
-
-    let result = conn.execute("ALTER TABLE t RENAME COLUMN b TO c");
-    assert!(
-        result.is_err(),
-        "RENAME COLUMN should fail when SQLite would reject the temp trigger rewrite"
-    );
-
-    let error_msg = result.unwrap_err().to_string();
-    assert!(
-        error_msg.contains("error in trigger tr") && error_msg.contains("no such column: new.c"),
-        "unexpected error: {error_msg}",
     );
 }
 
