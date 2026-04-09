@@ -336,7 +336,7 @@ mod temp_table_fuzz_tests {
             },
             15 => StatementSpec {
                 sql: format!(
-                    "UPDATE OR ROLLBACK {table_name} SET v = COALESCE(v, 0) + {} \
+                    "UPDATE {table_name} SET v = COALESCE(v, 0) + {} \
                      WHERE id = (SELECT id FROM {table_name} ORDER BY id LIMIT 1)",
                     rng.random_range(1..=50),
                 ),
