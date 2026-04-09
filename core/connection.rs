@@ -1766,12 +1766,18 @@ impl Connection {
     pub(crate) fn get_pager_from_database_index(&self, index: &usize) -> Arc<Pager> {
         match *index {
             crate::MAIN_DB_ID => self.pager.load().clone(),
-            crate::TEMP_DB_ID => self
-                .temp_database
-                .read()
-                .as_ref()
-                .map(|temp_db| temp_db.pager.clone())
-                .expect("temp database pager requested before initialization"),
+            crate::TEMP_DB_ID => {
+                // Lazily initialize the temp database if it hasn't been created yet.
+                if self.temp_database.read().is_none() {
+                    self.ensure_temp_database()
+                        .expect("failed to initialize temp database");
+                }
+                self.temp_database
+                    .read()
+                    .as_ref()
+                    .map(|temp_db| temp_db.pager.clone())
+                    .expect("temp database should be initialized")
+            }
             _ => self.attached_databases.read().get_pager_by_index(index),
         }
     }

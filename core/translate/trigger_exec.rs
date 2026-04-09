@@ -574,8 +574,14 @@ fn execute_trigger_commands(
         subprogram_builder.set_trigger_conflict_override(override_conflict);
     }
     // Restrict table resolution to the trigger's database during subprogram compilation.
+    // Temp triggers live in TEMP_DB_ID, regardless of which database the target table is in.
+    let trigger_database_id = if trigger.temporary {
+        crate::TEMP_DB_ID
+    } else {
+        database_id
+    };
     let prev_trigger_context = resolver.trigger_context.clone();
-    resolver.set_trigger_context(database_id, trigger.name.clone());
+    resolver.set_trigger_context(trigger_database_id, trigger.name.clone());
     let compile_result = (|| -> Result<()> {
         for command in trigger.commands.iter() {
             let stmt = trigger_cmd_to_stmt_for_subprogram(command, &subprogram_ctx)?;
@@ -747,6 +753,84 @@ pub fn get_relevant_triggers_type_and_time<'a>(
             trigger.time == time
         })
         .cloned()
+}
+
+/// Like [`get_relevant_triggers_type_and_time`], but also searches the temp
+/// schema when `database_id != TEMP_DB_ID`.  Temp triggers on a non-temp
+/// table are stored in the temp schema, so both schemas must be consulted
+/// for DML on any table.  Returns a combined, de-duplicated list.
+pub fn get_triggers_with_temp(
+    resolver: &Resolver,
+    database_id: usize,
+    event: TriggerEvent,
+    time: TriggerTime,
+    updated_column_indices: Option<HashSet<usize>>,
+    table: &BTreeTable,
+) -> Vec<Arc<Trigger>> {
+    let mut triggers: Vec<Arc<Trigger>> = resolver.with_schema(database_id, |s| {
+        get_relevant_triggers_type_and_time(
+            s,
+            event.clone(),
+            time,
+            updated_column_indices.clone(),
+            table,
+        )
+        .filter(|trigger| {
+            // In the temp schema, triggers may target a different database.
+            // Only include triggers whose target matches this database.
+            match trigger.target_database_id {
+                Some(target_db) => target_db == database_id,
+                None => true, // unqualified → targets this schema's own table
+            }
+        })
+        .collect()
+    });
+    if database_id != crate::TEMP_DB_ID {
+        let temp_triggers: Vec<Arc<Trigger>> = resolver.with_schema(crate::TEMP_DB_ID, |s| {
+            get_relevant_triggers_type_and_time(s, event, time, updated_column_indices, table)
+                .filter(|trigger| match trigger.target_database_id {
+                    // Explicit qualifier: include if it matches this database.
+                    Some(target_db) => target_db == database_id,
+                    // Unqualified: the trigger targets the temp schema's table if one
+                    // exists, otherwise it targets main/attached. Include it only when
+                    // no temp table with that name shadows it.
+                    None => s.get_table(&trigger.table_name).is_none(),
+                })
+                .collect()
+        });
+        triggers.extend(temp_triggers);
+    }
+    triggers
+}
+
+/// Like [`has_relevant_triggers_type_only`], but also checks the temp schema.
+pub fn has_triggers_with_temp(
+    resolver: &Resolver,
+    database_id: usize,
+    event: TriggerEvent,
+    updated_column_indices: Option<&HashSet<usize>>,
+    table: &BTreeTable,
+) -> bool {
+    let found = resolver.with_schema(database_id, |s| {
+        has_relevant_triggers_type_only(s, event.clone(), updated_column_indices, table)
+    });
+    if found {
+        return true;
+    }
+    if database_id != crate::TEMP_DB_ID {
+        // Check temp schema for triggers that target this database.
+        let has_temp = resolver.with_schema(crate::TEMP_DB_ID, |s| {
+            s.get_triggers_for_table(table.name.as_str())
+                .any(|trigger| match trigger.target_database_id {
+                    Some(target_db) => target_db == database_id,
+                    None => s.get_table(&trigger.table_name).is_none(),
+                })
+        });
+        if has_temp {
+            return true;
+        }
+    }
+    false
 }
 
 pub fn fire_trigger(

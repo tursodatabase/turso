@@ -37,8 +37,7 @@ use crate::{
             plan_subqueries_from_returning,
         },
         trigger_exec::{
-            fire_trigger, get_relevant_triggers_type_and_time, has_relevant_triggers_type_only,
-            TriggerContext,
+            fire_trigger, get_triggers_with_temp, has_triggers_with_temp, TriggerContext,
         },
         upsert::{
             collect_set_clauses_for_upsert, emit_upsert, resolve_upsert_target,
@@ -492,16 +491,14 @@ pub fn translate_insert(
 
     // Fire BEFORE INSERT triggers
 
-    let relevant_before_triggers: Vec<_> = resolver.with_schema(database_id, |s| {
-        get_relevant_triggers_type_and_time(
-            s,
-            TriggerEvent::Insert,
-            TriggerTime::Before,
-            None,
-            &btree_table,
-        )
-        .collect()
-    });
+    let relevant_before_triggers = get_triggers_with_temp(
+        resolver,
+        database_id,
+        TriggerEvent::Insert,
+        TriggerTime::Before,
+        None,
+        &btree_table,
+    );
 
     let has_before_triggers = !relevant_before_triggers.is_empty();
     if has_before_triggers {
@@ -894,16 +891,14 @@ pub fn translate_insert(
     });
 
     // Fire AFTER INSERT triggers
-    let relevant_after_triggers: Vec<_> = resolver.with_schema(database_id, |s| {
-        get_relevant_triggers_type_and_time(
-            s,
-            TriggerEvent::Insert,
-            TriggerTime::After,
-            None,
-            &btree_table,
-        )
-        .collect()
-    });
+    let relevant_after_triggers = get_triggers_with_temp(
+        resolver,
+        database_id,
+        TriggerEvent::Insert,
+        TriggerTime::After,
+        None,
+        &btree_table,
+    );
     let has_after_triggers = !relevant_after_triggers.is_empty();
     if has_after_triggers {
         compute_virtual_columns(
@@ -2002,9 +1997,13 @@ fn init_source_emission<'a>(
         }
     }
     // Check if INSERT triggers exist - if so, we need to use ephemeral table for VALUES with more than one row
-    let has_insert_triggers = resolver.with_schema(database_id, |s| {
-        has_relevant_triggers_type_only(s, TriggerEvent::Insert, None, ctx.table.as_ref())
-    });
+    let has_insert_triggers = has_triggers_with_temp(
+        resolver,
+        database_id,
+        TriggerEvent::Insert,
+        None,
+        ctx.table.as_ref(),
+    );
 
     let (num_values, cursor_id) = match body {
         InsertBody::Select(select, _) => {

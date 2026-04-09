@@ -95,6 +95,11 @@ pub struct Trigger {
     pub when_clause: Option<turso_parser::ast::Expr>,
     pub commands: Vec<turso_parser::ast::TriggerCmd>,
     pub temporary: bool,
+    /// For temp triggers that target a table in a specific database.
+    /// `None` means the trigger targets a table in its own schema.
+    /// `Some(db_id)` means it explicitly targets another database
+    /// (e.g. `CREATE TEMP TRIGGER ... ON main.table`).
+    pub target_database_id: Option<usize>,
 }
 
 impl Trigger {
@@ -109,6 +114,7 @@ impl Trigger {
         when_clause: Option<turso_parser::ast::Expr>,
         commands: Vec<turso_parser::ast::TriggerCmd>,
         temporary: bool,
+        target_database_id: Option<usize>,
     ) -> Self {
         Self {
             name,
@@ -120,6 +126,7 @@ impl Trigger {
             when_clause,
             commands,
             temporary,
+            target_database_id,
         }
     }
 }
@@ -1511,6 +1518,21 @@ impl Schema {
                         "invalid trigger sql: {sql}"
                     )));
                 };
+                // Resolve the target database from the SQL qualifier:
+                // CREATE TEMP TRIGGER ... ON main.tbl → target is MAIN_DB_ID
+                // CREATE TEMP TRIGGER ... ON tbl     → target is same as this schema
+                let target_database_id = tbl_name.db_name.as_ref().and_then(|db_name| {
+                    let db = db_name.as_str();
+                    if db.eq_ignore_ascii_case("main") {
+                        Some(crate::MAIN_DB_ID)
+                    } else if db.eq_ignore_ascii_case("temp") {
+                        Some(crate::TEMP_DB_ID)
+                    } else {
+                        // Attached database — can't resolve by name here,
+                        // but temp triggers on attached tables are rare.
+                        None
+                    }
+                });
                 self.add_trigger(
                     Trigger::new(
                         trigger_name,
@@ -1522,6 +1544,7 @@ impl Schema {
                         when_clause.map(|e| *e),
                         commands,
                         temporary,
+                        target_database_id,
                     ),
                     tbl_name.name.as_str(),
                 )?;

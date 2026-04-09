@@ -37,7 +37,9 @@ use crate::{
         },
         planner::ROWID_STRS,
         subquery::{emit_non_from_clause_subqueries_for_eval_at, emit_non_from_clause_subquery},
-        trigger_exec::{fire_trigger, get_relevant_triggers_type_and_time, TriggerContext},
+        trigger_exec::{
+            fire_trigger, get_triggers_with_temp, has_triggers_with_temp, TriggerContext,
+        },
         ProgramBuilder,
     },
     util::normalize_ident,
@@ -906,17 +908,13 @@ fn emit_update_insns<'a>(
     let has_before_triggers_early = if let Some(btree_table) = target_table.table.btree() {
         let updated_column_indices: HashSet<usize> =
             set_clauses.iter().map(|(col_idx, _)| *col_idx).collect();
-        t_ctx.resolver.with_schema(update_database_id, |s| {
-            get_relevant_triggers_type_and_time(
-                s,
-                TriggerEvent::Update,
-                TriggerTime::Before,
-                Some(updated_column_indices),
-                &btree_table,
-            )
-            .next()
-            .is_some()
-        })
+        has_triggers_with_temp(
+            &t_ctx.resolver,
+            update_database_id,
+            TriggerEvent::Update,
+            Some(&updated_column_indices),
+            &btree_table,
+        )
     } else {
         false
     };
@@ -1052,28 +1050,21 @@ fn emit_update_insns<'a>(
     {
         let updated_column_indices: HashSet<usize> =
             set_clauses.iter().map(|(col_idx, _)| *col_idx).collect();
-        let relevant_before_update_triggers: Vec<_> =
-            t_ctx.resolver.with_schema(update_database_id, |s| {
-                get_relevant_triggers_type_and_time(
-                    s,
-                    TriggerEvent::Update,
-                    TriggerTime::Before,
-                    Some(updated_column_indices.clone()),
-                    &btree_table,
-                )
-                .collect()
-            });
-        has_after_triggers = t_ctx.resolver.with_schema(update_database_id, |s| {
-            get_relevant_triggers_type_and_time(
-                s,
-                TriggerEvent::Update,
-                TriggerTime::After,
-                Some(updated_column_indices.clone()),
-                &btree_table,
-            )
-            .count()
-                > 0
-        });
+        let relevant_before_update_triggers = get_triggers_with_temp(
+            &t_ctx.resolver,
+            update_database_id,
+            TriggerEvent::Update,
+            TriggerTime::Before,
+            Some(updated_column_indices.clone()),
+            &btree_table,
+        );
+        has_after_triggers = has_triggers_with_temp(
+            &t_ctx.resolver,
+            update_database_id,
+            TriggerEvent::Update,
+            Some(&updated_column_indices),
+            &btree_table,
+        );
 
         let has_fk_cascade = connection.foreign_keys_enabled()
             && t_ctx.resolver.with_schema(update_database_id, |s| {
@@ -2255,17 +2246,14 @@ fn emit_update_insns<'a>(
             if let Some(btree_table) = target_table.table.btree() {
                 let updated_column_indices: HashSet<usize> =
                     set_clauses.iter().map(|(col_idx, _)| *col_idx).collect();
-                let relevant_triggers: Vec<_> =
-                    t_ctx.resolver.with_schema(update_database_id, |s| {
-                        get_relevant_triggers_type_and_time(
-                            s,
-                            TriggerEvent::Update,
-                            TriggerTime::After,
-                            Some(updated_column_indices),
-                            &btree_table,
-                        )
-                        .collect()
-                    });
+                let relevant_triggers = get_triggers_with_temp(
+                    &t_ctx.resolver,
+                    update_database_id,
+                    TriggerEvent::Update,
+                    TriggerTime::After,
+                    Some(updated_column_indices),
+                    &btree_table,
+                );
                 if !relevant_triggers.is_empty() {
                     let columns = target_table.table.columns();
 
