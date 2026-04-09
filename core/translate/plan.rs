@@ -1310,8 +1310,10 @@ impl TableReferences {
 
 /// Tracks which columns are used in a query. Optimized for the common case
 /// of ≤64 columns (single u64), with heap-allocated overflow
+pub type ColumnUsedMask = BitSet;
+
 #[derive(Clone, Debug, Default, PartialEq)]
-pub struct ColumnUsedMask {
+pub struct BitSet {
     inline: u64,
     overflow: Option<Vec<u64>>,
 }
