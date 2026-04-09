@@ -10,7 +10,7 @@ use turso_parser::ast::{Name, TransactionType};
 pub fn translate_tx_begin(
     tx_type: Option<TransactionType>,
     _tx_name: Option<Name>,
-    schema: &Schema,
+    resolver: &Resolver,
     program: &mut ProgramBuilder,
 ) -> Result<()> {
     program.extend(&ProgramBuilderOpts {
@@ -18,6 +18,8 @@ pub fn translate_tx_begin(
         approx_num_insns: 0,
         approx_num_labels: 0,
     });
+    let schema = resolver.schema();
+    let temp_schema_cookie = resolver.with_schema(crate::TEMP_DB_ID, |s| s.schema_version);
     let tx_type = tx_type.unwrap_or(TransactionType::Deferred);
     match tx_type {
         TransactionType::Deferred => {
@@ -32,7 +34,11 @@ pub fn translate_tx_begin(
                 tx_mode: TransactionMode::Write,
                 schema_cookie: schema.schema_version,
             });
-            // TODO: Emit transaction instruction on temporary tables when we support them.
+            program.emit_insn(Insn::Transaction {
+                db: crate::TEMP_DB_ID,
+                tx_mode: TransactionMode::Write,
+                schema_cookie: temp_schema_cookie,
+            });
             program.emit_insn(Insn::AutoCommit {
                 auto_commit: false,
                 rollback: false,
@@ -44,7 +50,11 @@ pub fn translate_tx_begin(
                 tx_mode: TransactionMode::Concurrent,
                 schema_cookie: schema.schema_version,
             });
-            // TODO: Emit transaction instruction on temporary tables when we support them.
+            program.emit_insn(Insn::Transaction {
+                db: crate::TEMP_DB_ID,
+                tx_mode: TransactionMode::Write,
+                schema_cookie: temp_schema_cookie,
+            });
             program.emit_insn(Insn::AutoCommit {
                 auto_commit: false,
                 rollback: false,
