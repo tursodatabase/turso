@@ -24,6 +24,11 @@
 #include <string.h>
 #include <stdlib.h>
 
+/* Tcl_Size was introduced in Tcl 9.0; fall back to int for 8.x */
+#ifndef TCL_SIZE_MAX
+typedef int Tcl_Size;
+#endif
+
 #define TURSO_TCL_VERSION "1.0"
 #define MAX_FUNC_ARGS 64
 #define STMT_CACHE_SIZE 32
