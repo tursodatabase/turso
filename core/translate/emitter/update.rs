@@ -2282,7 +2282,8 @@ fn emit_update_insns<'a>(
 
                     // Compute VIRTUAL columns for OLD values if we have preserved OLD registers
                     if let Some(ref old_regs) = preserved_old_registers {
-                        let old_ctx = DmlColumnContext::indexed(&columns, old_regs.clone());
+                        let pairs = columns.iter().zip(old_regs.iter().copied());
+                        let old_ctx = DmlColumnContext::from_column_reg_mapping(pairs);
                         compute_virtual_columns(program, columns, &old_ctx, &t_ctx.resolver)?;
                     }
 

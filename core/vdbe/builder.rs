@@ -161,16 +161,6 @@ impl DmlColumnContext {
         }
     }
 
-    pub fn indexed(columns: &[Column], column_regs: Vec<usize>) -> Self {
-        let (row_id_alias_columns, virtual_mask, virtual_data) = Self::extract_column_info(columns);
-        Self {
-            registers: DmlColumnRegisters::Indexed { column_regs },
-            row_id_alias_columns,
-            virtual_mask,
-            virtual_data,
-        }
-    }
-
     pub fn from_column_reg_mapping<'a>(pairs: impl Iterator<Item = (&'a Column, usize)>) -> Self {
         let mut row_id_alias_columns = ColumnUsedMask::default();
         let mut virtual_mask = ColumnUsedMask::default();

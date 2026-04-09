@@ -753,18 +753,21 @@ pub fn cursor_to_registers(
 ) -> DmlColumnContext {
     let dependencies = stored_deps_of_virtual(&table.columns, target_columns);
     let base = program.alloc_registers(dependencies.count());
-    let mut column_regs = vec![0usize; table.columns.len()];
     let mut next_reg = base;
-    for idx in 0..table.columns.len() {
-        if table.columns[idx].is_rowid_alias() {
-            column_regs[idx] = rowid_reg;
+    let pairs = table.columns.iter().enumerate().map(|(idx, col)| {
+        let reg = if col.is_rowid_alias() {
+            rowid_reg
         } else if dependencies.get(idx) {
-            column_regs[idx] = next_reg;
-            program.emit_column_or_rowid(cursor_id, idx, next_reg);
+            let reg = next_reg;
+            program.emit_column_or_rowid(cursor_id, idx, reg);
             next_reg += 1;
-        }
-    }
-    DmlColumnContext::indexed(&table.columns, column_regs)
+            reg
+        } else {
+            0
+        };
+        (col, reg)
+    });
+    DmlColumnContext::from_column_reg_mapping(pairs)
 }
 
 /// Build a parent key vector (in FK parent-column order) into `dest_start`.

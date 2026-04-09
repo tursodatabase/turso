@@ -3428,7 +3428,8 @@ fn emit_index_column_value_for_insert(
                 }
             }
         }
-        let ctx = SelfTableContext::ForDML(DmlColumnContext::indexed(&columns, column_regs));
+        let pairs = columns.iter().zip(column_regs.iter().copied());
+        let ctx = SelfTableContext::ForDML(DmlColumnContext::from_column_reg_mapping(pairs));
 
         program.with_self_table_context(Some(&ctx), |program, _| {
             translate_expr(program, None, &expr, dest_reg, resolver)?;
