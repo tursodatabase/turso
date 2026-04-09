@@ -424,6 +424,16 @@ pub enum TemporaryKeyword {
     Temporary,
 }
 
+impl TemporaryKeyword {
+    pub fn random() -> Self {
+        if std::time::UNIX_EPOCH.elapsed().unwrap().as_nanos() % 2 == 0 {
+            TemporaryKeyword::Temp
+        } else {
+            TemporaryKeyword::Temporary
+        }
+    }
+}
+
 impl fmt::Display for TemporaryKeyword {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -729,11 +739,7 @@ pub fn create_table(
             move |(target_db, table_name, if_not_exists, strict_roll, pk_col, other_cols)| {
                 let strict = strict_roll < strict_prob;
                 let temporary = match target_db.as_deref() {
-                    Some("temp") => Some(if strict_roll % 2 == 0 {
-                        TemporaryKeyword::Temp
-                    } else {
-                        TemporaryKeyword::Temporary
-                    }),
+                    Some("temp") => Some(TemporaryKeyword::random()),
                     _ => None,
                 };
 
