@@ -2990,26 +2990,20 @@ pub fn translate_expr(
                         )
                     }
                     Some(SelfTableContext::ForDML(dml_ctx)) => {
-                        let col = &dml_ctx.columns[*column];
-                        match col.generated_type() {
-                            GeneratedType::Virtual {
-                                resolved: gen_expr, ..
-                            } => {
-                                translate_expr(program, None, gen_expr, target_register, resolver)?;
-                                if col.affinity() != Affinity::Blob {
-                                    program.emit_column_affinity(target_register, col.affinity());
-                                }
-                                Ok(target_register)
+                        if let Some((resolved, affinity)) = dml_ctx.get_virtual_column(*column) {
+                            translate_expr(program, None, resolved, target_register, resolver)?;
+                            if affinity != Affinity::Blob {
+                                program.emit_column_affinity(target_register, affinity);
                             }
-                            GeneratedType::NotGenerated => {
-                                let src_reg = dml_ctx.to_column_reg(*column);
-                                program.emit_insn(Insn::Copy {
-                                    src_reg,
-                                    dst_reg: target_register,
-                                    extra_amount: 0,
-                                });
-                                Ok(target_register)
-                            }
+                            Ok(target_register)
+                        } else {
+                            let src_reg = dml_ctx.to_column_reg(*column);
+                            program.emit_insn(Insn::Copy {
+                                src_reg,
+                                dst_reg: target_register,
+                                extra_amount: 0,
+                            });
+                            Ok(target_register)
                         }
                     }
                     None => {

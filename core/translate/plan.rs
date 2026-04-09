@@ -1452,6 +1452,37 @@ impl ColumnUsedMask {
         }
         count
     }
+
+    /// Returns the number of set bits strictly below `index`.
+    pub fn rank(&self, index: usize) -> usize {
+        if index == 0 {
+            return 0;
+        }
+        if index <= Self::INLINE_BITS {
+            let mask = if index < 64 {
+                (1u64 << index) - 1
+            } else {
+                u64::MAX
+            };
+            return (self.inline & mask).count_ones() as usize;
+        }
+        let mut count = self.inline.count_ones() as usize;
+        let Some(ref ov) = self.overflow else {
+            return count;
+        };
+        let remaining = index - Self::INLINE_BITS;
+        let full_words = remaining / 64;
+        let extra_bits = remaining % 64;
+        for &word in ov.iter().take(full_words) {
+            count += word.count_ones() as usize;
+        }
+        if extra_bits > 0 {
+            if let Some(&word) = ov.get(full_words) {
+                count += (word & ((1u64 << extra_bits) - 1)).count_ones() as usize;
+            }
+        }
+        count
+    }
 }
 
 impl std::ops::BitOrAssign<&Self> for ColumnUsedMask {

@@ -764,7 +764,7 @@ pub fn cursor_to_registers(
             next_reg += 1;
         }
     }
-    DmlColumnContext::indexed(table.columns.clone(), column_regs)
+    DmlColumnContext::indexed(&table.columns, column_regs)
 }
 
 /// Build a parent key vector (in FK parent-column order) into `dest_start`.

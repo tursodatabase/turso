@@ -2664,20 +2664,15 @@ fn self_table_ctx_from_col_mappings<'a>(
     col_mappings: &[ColMapping<'a>],
     rowid_alias: Option<&ColMapping<'a>>,
 ) -> SelfTableContext {
-    let columns: Vec<_> = col_mappings.iter().map(|cm| cm.column.clone()).collect();
-    let column_regs = col_mappings
-        .iter()
-        .map(|cm| {
-            if cm.column.is_rowid_alias() {
-                if let Some(ra) = rowid_alias {
-                    return ra.register;
-                }
-            }
+    let col_reg_mapping = col_mappings.iter().map(|cm| {
+        let reg = if cm.column.is_rowid_alias() {
+            rowid_alias.map_or(cm.register, |ra| ra.register)
+        } else {
             cm.register
-        })
-        .collect();
-
-    SelfTableContext::ForDML(DmlColumnContext::indexed(columns, column_regs))
+        };
+        (cm.column, reg)
+    });
+    SelfTableContext::ForDML(DmlColumnContext::from_column_reg_mapping(col_reg_mapping))
 }
 
 pub fn compute_virtual_columns<'a>(
@@ -3423,7 +3418,7 @@ fn emit_index_column_value_for_insert(
                 }
             }
         }
-        let ctx = SelfTableContext::ForDML(DmlColumnContext::indexed(columns, column_regs));
+        let ctx = SelfTableContext::ForDML(DmlColumnContext::indexed(&columns, column_regs));
 
         program.with_self_table_context(Some(&ctx), |program, _| {
             translate_expr(program, None, &expr, dest_reg, resolver)?;
