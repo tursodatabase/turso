@@ -3295,7 +3295,12 @@ impl IndexMethodCursor for FtsCursor {
 
     /// Optimizes the FTS index by merging all segments into one.
     /// Call via `OPTIMIZE INDEX idx_name` SQL command.
-    fn optimize(&mut self, connection: &Arc<Connection>) -> Result<IOResult<()>> {
+    fn optimize(
+        &mut self,
+        connection: &Arc<Connection>,
+        database_id: usize,
+    ) -> Result<IOResult<()>> {
+        self.database_id = Some(database_id);
         // First ensure any pending documents are flushed
         if self.pending_docs_count > 0 {
             tracing::info!(
@@ -3307,9 +3312,6 @@ impl IndexMethodCursor for FtsCursor {
 
         // If we're not open for writing, open it
         if self.writer.is_none() {
-            let database_id = self.database_id.ok_or_else(|| {
-                LimboError::InternalError("FTS cursor database_id is not initialized".to_string())
-            })?;
             return_if_io!(self.open_write(connection, database_id));
         }
 

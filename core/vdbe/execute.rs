@@ -10051,7 +10051,7 @@ pub fn op_index_method_optimize(
         .as_mut()
         .expect("cursor should exist");
     let cursor = cursor.as_index_method_mut();
-    return_if_io!(cursor.optimize(&program.connection));
+    return_if_io!(cursor.optimize(&program.connection, *db));
 
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
