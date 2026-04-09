@@ -2248,13 +2248,16 @@ fn rewrite_trigger_sql_for_column_rename(
     // Check if this trigger references the column being renamed
     // We need to check if the column exists in the table being renamed
     let target_table_name = normalize_ident(table_name);
-    let _target_table = resolver
+    if resolver
         .with_schema(target_database_id, |schema| {
             schema.get_btree_table(&target_table_name)
         })
-        .ok_or_else(|| {
-            LimboError::ParseError(format!("target table not found: {target_table_name}"))
-        })?;
+        .is_none()
+    {
+        return Err(LimboError::ParseError(format!(
+            "target table not found: {target_table_name}"
+        )));
+    }
 
     // Rewrite UPDATE OF column list if renaming a column in the trigger's owning table
     let is_renaming_trigger_table = trigger_table_name == target_table_name;
@@ -2402,52 +2405,383 @@ fn rewrite_trigger_sql_for_column_rename(
     Ok(new_sql)
 }
 
+#[derive(Clone, Copy)]
+enum ColumnRenameMode<'a> {
+    Validate,
+    Rewrite { new_col_norm: &'a str },
+}
+
+impl<'a> ColumnRenameMode<'a> {
+    fn rewritten_name(self) -> Option<&'a str> {
+        match self {
+            Self::Validate => None,
+            Self::Rewrite { new_col_norm } => Some(new_col_norm),
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum ColumnRenameExprTraversal {
+    Normal,
+    RewriteResultExpr,
+}
+
+fn no_such_column_error(old_col_norm: &str) -> LimboError {
+    LimboError::ParseError(format!("no such column: {old_col_norm}"))
+}
+
 #[allow(clippy::too_many_arguments)]
-fn validate_trigger_after_column_rename(
-    event: &ast::TriggerEvent,
-    when_clause: Option<&ast::Expr>,
-    commands: &[ast::TriggerCmd],
+fn apply_expr_column_ref_with_context(
+    mode: ColumnRenameMode<'_>,
+    e: &mut ast::Expr,
+    trigger_table: &BTreeTable,
+    trigger_table_name: &str,
+    old_col_norm: &str,
+    is_renaming_trigger_table: bool,
+    context_table: Option<(&BTreeTable, &str, bool)>,
+    from_target_qualifiers: &[String],
+) -> Result<()> {
+    match e {
+        ast::Expr::Qualified(ns, col) | ast::Expr::DoublyQualified(_, ns, col) => {
+            let ns_norm = normalize_ident(ns.as_str());
+            let col_norm = normalize_ident(col.as_str());
+
+            if col_norm != *old_col_norm {
+                return Ok(());
+            }
+
+            if ns_norm.eq_ignore_ascii_case("new") || ns_norm.eq_ignore_ascii_case("old") {
+                if is_renaming_trigger_table && trigger_table.get_column(&col_norm).is_some() {
+                    if let Some(new_col_norm) = mode.rewritten_name() {
+                        *col = ast::Name::from_string(new_col_norm);
+                    } else {
+                        return Err(no_such_column_error(old_col_norm));
+                    }
+                }
+                return Ok(());
+            }
+
+            if let Some((_, ctx_name_norm, is_renaming_ctx)) = context_table {
+                if ns_norm == ctx_name_norm && is_renaming_ctx {
+                    if let Some(new_col_norm) = mode.rewritten_name() {
+                        *col = ast::Name::from_string(new_col_norm);
+                    } else {
+                        return Err(no_such_column_error(old_col_norm));
+                    }
+                }
+            }
+
+            if is_renaming_trigger_table
+                && ns_norm.eq_ignore_ascii_case(trigger_table_name)
+                && trigger_table.get_column(&col_norm).is_some()
+            {
+                if let Some(new_col_norm) = mode.rewritten_name() {
+                    let trigger_table_name_norm = normalize_ident(trigger_table_name);
+                    let ctx_is_different_table = context_table
+                        .as_ref()
+                        .is_some_and(|(_, ctx_name, _)| *ctx_name != trigger_table_name_norm);
+                    if ctx_is_different_table {
+                        return Err(LimboError::ParseError(format!(
+                            "no such column: {trigger_table_name}.{col_norm}"
+                        )));
+                    }
+                    *col = ast::Name::from_string(new_col_norm);
+                } else {
+                    return Err(no_such_column_error(old_col_norm));
+                }
+            }
+
+            if from_target_qualifiers.contains(&ns_norm) {
+                if let Some(new_col_norm) = mode.rewritten_name() {
+                    *col = ast::Name::from_string(new_col_norm);
+                } else {
+                    return Err(no_such_column_error(old_col_norm));
+                }
+            }
+        }
+        ast::Expr::Id(col) => {
+            let col_norm = normalize_ident(col.as_str());
+            if col_norm != *old_col_norm {
+                return Ok(());
+            }
+
+            if let Some((ctx_table, _, is_renaming_ctx)) = context_table {
+                if ctx_table.get_column(&col_norm).is_some() {
+                    if is_renaming_ctx {
+                        if let Some(new_col_norm) = mode.rewritten_name() {
+                            *e = ast::Expr::Id(ast::Name::from_string(new_col_norm));
+                        } else {
+                            return Err(no_such_column_error(old_col_norm));
+                        }
+                    }
+                    return Ok(());
+                }
+            }
+
+            if (is_renaming_trigger_table && trigger_table.get_column(&col_norm).is_some())
+                || !from_target_qualifiers.is_empty()
+            {
+                if let Some(new_col_norm) = mode.rewritten_name() {
+                    *e = ast::Expr::Id(ast::Name::from_string(new_col_norm));
+                } else {
+                    return Err(no_such_column_error(old_col_norm));
+                }
+            }
+        }
+        _ => {}
+    }
+
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn apply_expr_for_column_rename(
+    mode: ColumnRenameMode<'_>,
+    expr: &mut ast::Expr,
+    traversal: ColumnRenameExprTraversal,
     trigger_table: &BTreeTable,
     trigger_table_name: &str,
     target_table_name: &str,
     old_col_norm: &str,
+    context_table_name: Option<&str>,
+    from_target_qualifiers: &[String],
     database_id: usize,
     resolver: &Resolver,
 ) -> Result<()> {
     let is_renaming_trigger_table = trigger_table_name.eq_ignore_ascii_case(target_table_name);
 
-    if is_renaming_trigger_table {
-        if let ast::TriggerEvent::UpdateOf(cols) = event {
-            for col in cols {
-                if normalize_ident(col.as_str()) == *old_col_norm {
-                    return Err(LimboError::ParseError(format!(
-                        "no such column: {old_col_norm}"
-                    )));
+    let context_table_info: Option<(Arc<BTreeTable>, String, bool)> = if let Some(ctx_name) =
+        context_table_name
+    {
+        let ctx_name_norm = normalize_ident(ctx_name);
+        let is_renaming = ctx_name_norm == *target_table_name;
+        let table = resolve_trigger_command_table_for_alter(resolver, database_id, &ctx_name_norm)
+            .ok_or_else(|| {
+                LimboError::ParseError(format!("context table not found: {ctx_name_norm}"))
+            })?;
+        Some((table, ctx_name_norm, is_renaming))
+    } else {
+        None
+    };
+
+    walk_expr_mut(expr, &mut |e: &mut ast::Expr| -> Result<WalkControl> {
+        match e {
+            ast::Expr::Exists(select) => {
+                if matches!(traversal, ColumnRenameExprTraversal::RewriteResultExpr) {
+                    return Ok(WalkControl::SkipChildren);
+                }
+                apply_select_for_column_rename(
+                    mode,
+                    select,
+                    trigger_table,
+                    trigger_table_name,
+                    target_table_name,
+                    old_col_norm,
+                    from_target_qualifiers,
+                    database_id,
+                    resolver,
+                )?;
+            }
+            ast::Expr::Subquery(select) => {
+                apply_select_for_column_rename(
+                    mode,
+                    select,
+                    trigger_table,
+                    trigger_table_name,
+                    target_table_name,
+                    old_col_norm,
+                    from_target_qualifiers,
+                    database_id,
+                    resolver,
+                )?;
+            }
+            ast::Expr::InSelect { rhs, .. } => {
+                apply_select_for_column_rename(
+                    mode,
+                    rhs,
+                    trigger_table,
+                    trigger_table_name,
+                    target_table_name,
+                    old_col_norm,
+                    from_target_qualifiers,
+                    database_id,
+                    resolver,
+                )?;
+            }
+            _ => {
+                apply_expr_column_ref_with_context(
+                    mode,
+                    e,
+                    trigger_table,
+                    trigger_table_name,
+                    old_col_norm,
+                    is_renaming_trigger_table,
+                    context_table_info
+                        .as_ref()
+                        .map(|(table, name, is_renaming)| {
+                            (table.as_ref(), name.as_str(), *is_renaming)
+                        }),
+                    from_target_qualifiers,
+                )?;
+            }
+        }
+        Ok(WalkControl::Continue)
+    })?;
+
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn apply_result_expr_for_column_rename(
+    mode: ColumnRenameMode<'_>,
+    expr: &mut ast::Expr,
+    trigger_table: &BTreeTable,
+    trigger_table_name: &str,
+    target_table_name: &str,
+    old_col_norm: &str,
+    visible_target_qualifiers: &[String],
+    database_id: usize,
+    resolver: &Resolver,
+) -> Result<()> {
+    let traversal = match mode {
+        ColumnRenameMode::Validate => ColumnRenameExprTraversal::Normal,
+        ColumnRenameMode::Rewrite { .. } => ColumnRenameExprTraversal::RewriteResultExpr,
+    };
+    apply_expr_for_column_rename(
+        mode,
+        expr,
+        traversal,
+        trigger_table,
+        trigger_table_name,
+        target_table_name,
+        old_col_norm,
+        None,
+        visible_target_qualifiers,
+        database_id,
+        resolver,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn apply_upsert_for_column_rename(
+    mode: ColumnRenameMode<'_>,
+    upsert: &mut ast::Upsert,
+    trigger_table: &BTreeTable,
+    trigger_table_name: &str,
+    target_table_name: &str,
+    insert_table_name: &str,
+    old_col_norm: &str,
+    database_id: usize,
+    resolver: &Resolver,
+) -> Result<()> {
+    let insert_table_name_norm = normalize_ident(insert_table_name);
+    let insert_targets_renamed_table = insert_table_name_norm == *target_table_name;
+
+    if let Some(index) = &mut upsert.index {
+        for target in &mut index.targets {
+            apply_expr_for_column_rename(
+                mode,
+                &mut target.expr,
+                ColumnRenameExprTraversal::Normal,
+                trigger_table,
+                trigger_table_name,
+                target_table_name,
+                old_col_norm,
+                Some(&insert_table_name_norm),
+                &[],
+                database_id,
+                resolver,
+            )?;
+            if insert_targets_renamed_table {
+                if let Some(new_col_norm) = mode.rewritten_name() {
+                    rename_excluded_column_refs(&mut target.expr, old_col_norm, new_col_norm)?;
+                }
+            }
+        }
+        if let Some(where_clause) = &mut index.where_clause {
+            apply_expr_for_column_rename(
+                mode,
+                where_clause,
+                ColumnRenameExprTraversal::Normal,
+                trigger_table,
+                trigger_table_name,
+                target_table_name,
+                old_col_norm,
+                Some(&insert_table_name_norm),
+                &[],
+                database_id,
+                resolver,
+            )?;
+            if insert_targets_renamed_table {
+                if let Some(new_col_norm) = mode.rewritten_name() {
+                    rename_excluded_column_refs(where_clause, old_col_norm, new_col_norm)?;
                 }
             }
         }
     }
 
-    if let Some(when_expr) = when_clause {
-        validate_expr_for_column_rename(
-            when_expr,
-            trigger_table,
-            trigger_table_name,
-            target_table_name,
-            old_col_norm,
-            None,
-            &[],
-            database_id,
-            resolver,
-        )?;
+    if let ast::UpsertDo::Set { sets, where_clause } = &mut upsert.do_clause {
+        for set in sets {
+            if insert_targets_renamed_table {
+                for col_name in &mut set.col_names {
+                    if col_name.as_str().eq_ignore_ascii_case(old_col_norm) {
+                        if let Some(new_col_norm) = mode.rewritten_name() {
+                            *col_name = ast::Name::from_string(new_col_norm);
+                        } else {
+                            return Err(no_such_column_error(old_col_norm));
+                        }
+                    }
+                }
+            }
+            apply_expr_for_column_rename(
+                mode,
+                &mut set.expr,
+                ColumnRenameExprTraversal::Normal,
+                trigger_table,
+                trigger_table_name,
+                target_table_name,
+                old_col_norm,
+                Some(&insert_table_name_norm),
+                &[],
+                database_id,
+                resolver,
+            )?;
+            if insert_targets_renamed_table {
+                if let Some(new_col_norm) = mode.rewritten_name() {
+                    rename_excluded_column_refs(&mut set.expr, old_col_norm, new_col_norm)?;
+                }
+            }
+        }
+        if let Some(expr) = where_clause {
+            apply_expr_for_column_rename(
+                mode,
+                expr,
+                ColumnRenameExprTraversal::Normal,
+                trigger_table,
+                trigger_table_name,
+                target_table_name,
+                old_col_norm,
+                Some(&insert_table_name_norm),
+                &[],
+                database_id,
+                resolver,
+            )?;
+            if insert_targets_renamed_table {
+                if let Some(new_col_norm) = mode.rewritten_name() {
+                    rename_excluded_column_refs(expr, old_col_norm, new_col_norm)?;
+                }
+            }
+        }
     }
 
-    for cmd in commands {
-        validate_trigger_cmd_after_column_rename(
-            cmd,
+    if let Some(next) = &mut upsert.next {
+        apply_upsert_for_column_rename(
+            mode,
+            next,
             trigger_table,
             trigger_table_name,
             target_table_name,
+            insert_table_name,
             old_col_norm,
             database_id,
             resolver,
@@ -2458,8 +2792,427 @@ fn validate_trigger_after_column_rename(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn validate_trigger_cmd_after_column_rename(
-    cmd: &ast::TriggerCmd,
+fn apply_select_for_column_rename(
+    mode: ColumnRenameMode<'_>,
+    select: &mut ast::Select,
+    trigger_table: &BTreeTable,
+    trigger_table_name: &str,
+    target_table_name: &str,
+    old_col_norm: &str,
+    outer_target_qualifiers: &[String],
+    database_id: usize,
+    resolver: &Resolver,
+) -> Result<()> {
+    if let Some(ref mut with_clause) = select.with {
+        for cte in &mut with_clause.ctes {
+            apply_select_for_column_rename(
+                mode,
+                &mut cte.select,
+                trigger_table,
+                trigger_table_name,
+                target_table_name,
+                old_col_norm,
+                outer_target_qualifiers,
+                database_id,
+                resolver,
+            )?;
+        }
+    }
+
+    apply_one_select_for_column_rename(
+        mode,
+        &mut select.body.select,
+        trigger_table,
+        trigger_table_name,
+        target_table_name,
+        old_col_norm,
+        outer_target_qualifiers,
+        database_id,
+        resolver,
+    )?;
+
+    for compound in &mut select.body.compounds {
+        apply_one_select_for_column_rename(
+            mode,
+            &mut compound.select,
+            trigger_table,
+            trigger_table_name,
+            target_table_name,
+            old_col_norm,
+            outer_target_qualifiers,
+            database_id,
+            resolver,
+        )?;
+    }
+
+    let body_target_qualifiers = match &select.body.select {
+        ast::OneSelect::Select { from, .. } => merge_target_qualifiers(
+            outer_target_qualifiers,
+            &from_clause_target_qualifiers(from, target_table_name),
+        ),
+        _ => outer_target_qualifiers.to_vec(),
+    };
+
+    for sorted_col in &mut select.order_by {
+        apply_expr_for_column_rename(
+            mode,
+            &mut sorted_col.expr,
+            ColumnRenameExprTraversal::Normal,
+            trigger_table,
+            trigger_table_name,
+            target_table_name,
+            old_col_norm,
+            None,
+            &body_target_qualifiers,
+            database_id,
+            resolver,
+        )?;
+    }
+
+    if let Some(ref mut limit) = select.limit {
+        apply_expr_for_column_rename(
+            mode,
+            &mut limit.expr,
+            ColumnRenameExprTraversal::Normal,
+            trigger_table,
+            trigger_table_name,
+            target_table_name,
+            old_col_norm,
+            None,
+            &body_target_qualifiers,
+            database_id,
+            resolver,
+        )?;
+        if let Some(ref mut offset) = limit.offset {
+            apply_expr_for_column_rename(
+                mode,
+                offset,
+                ColumnRenameExprTraversal::Normal,
+                trigger_table,
+                trigger_table_name,
+                target_table_name,
+                old_col_norm,
+                None,
+                &body_target_qualifiers,
+                database_id,
+                resolver,
+            )?;
+        }
+    }
+
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn apply_one_select_for_column_rename(
+    mode: ColumnRenameMode<'_>,
+    one_select: &mut ast::OneSelect,
+    trigger_table: &BTreeTable,
+    trigger_table_name: &str,
+    target_table_name: &str,
+    old_col_norm: &str,
+    outer_target_qualifiers: &[String],
+    database_id: usize,
+    resolver: &Resolver,
+) -> Result<()> {
+    match one_select {
+        ast::OneSelect::Select {
+            columns,
+            from,
+            where_clause,
+            group_by,
+            window_clause,
+            ..
+        } => {
+            let visible_target_qualifiers = merge_target_qualifiers(
+                outer_target_qualifiers,
+                &from_clause_target_qualifiers(from, target_table_name),
+            );
+
+            for col in columns {
+                if let ast::ResultColumn::Expr(expr, _) = col {
+                    apply_result_expr_for_column_rename(
+                        mode,
+                        expr,
+                        trigger_table,
+                        trigger_table_name,
+                        target_table_name,
+                        old_col_norm,
+                        &visible_target_qualifiers,
+                        database_id,
+                        resolver,
+                    )?;
+                }
+            }
+
+            if let Some(ref mut from_clause) = from {
+                apply_from_clause_for_column_rename(
+                    mode,
+                    from_clause,
+                    trigger_table,
+                    trigger_table_name,
+                    target_table_name,
+                    old_col_norm,
+                    outer_target_qualifiers,
+                    database_id,
+                    resolver,
+                )?;
+            }
+
+            if let Some(ref mut where_expr) = where_clause {
+                apply_expr_for_column_rename(
+                    mode,
+                    where_expr,
+                    ColumnRenameExprTraversal::Normal,
+                    trigger_table,
+                    trigger_table_name,
+                    target_table_name,
+                    old_col_norm,
+                    None,
+                    &visible_target_qualifiers,
+                    database_id,
+                    resolver,
+                )?;
+            }
+
+            if let Some(ref mut group_by) = group_by {
+                for expr in &mut group_by.exprs {
+                    apply_expr_for_column_rename(
+                        mode,
+                        expr,
+                        ColumnRenameExprTraversal::Normal,
+                        trigger_table,
+                        trigger_table_name,
+                        target_table_name,
+                        old_col_norm,
+                        None,
+                        &visible_target_qualifiers,
+                        database_id,
+                        resolver,
+                    )?;
+                }
+                if let Some(ref mut having_expr) = group_by.having {
+                    apply_expr_for_column_rename(
+                        mode,
+                        having_expr,
+                        ColumnRenameExprTraversal::Normal,
+                        trigger_table,
+                        trigger_table_name,
+                        target_table_name,
+                        old_col_norm,
+                        None,
+                        &visible_target_qualifiers,
+                        database_id,
+                        resolver,
+                    )?;
+                }
+            }
+
+            for window_def in window_clause {
+                apply_window_for_column_rename(
+                    mode,
+                    &mut window_def.window,
+                    trigger_table,
+                    trigger_table_name,
+                    target_table_name,
+                    old_col_norm,
+                    &visible_target_qualifiers,
+                    database_id,
+                    resolver,
+                )?;
+            }
+        }
+        ast::OneSelect::Values(values) => {
+            for row in values {
+                for expr in row {
+                    apply_expr_for_column_rename(
+                        mode,
+                        expr,
+                        ColumnRenameExprTraversal::Normal,
+                        trigger_table,
+                        trigger_table_name,
+                        target_table_name,
+                        old_col_norm,
+                        None,
+                        outer_target_qualifiers,
+                        database_id,
+                        resolver,
+                    )?;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn apply_from_clause_for_column_rename(
+    mode: ColumnRenameMode<'_>,
+    from_clause: &mut ast::FromClause,
+    trigger_table: &BTreeTable,
+    trigger_table_name: &str,
+    target_table_name: &str,
+    old_col_norm: &str,
+    visible_target_qualifiers: &[String],
+    database_id: usize,
+    resolver: &Resolver,
+) -> Result<()> {
+    apply_select_table_for_column_rename(
+        mode,
+        &mut from_clause.select,
+        trigger_table,
+        trigger_table_name,
+        target_table_name,
+        old_col_norm,
+        visible_target_qualifiers,
+        database_id,
+        resolver,
+    )?;
+
+    for join in &mut from_clause.joins {
+        apply_select_table_for_column_rename(
+            mode,
+            &mut join.table,
+            trigger_table,
+            trigger_table_name,
+            target_table_name,
+            old_col_norm,
+            visible_target_qualifiers,
+            database_id,
+            resolver,
+        )?;
+        if let Some(ast::JoinConstraint::On(expr)) = &mut join.constraint {
+            apply_expr_for_column_rename(
+                mode,
+                expr,
+                ColumnRenameExprTraversal::Normal,
+                trigger_table,
+                trigger_table_name,
+                target_table_name,
+                old_col_norm,
+                None,
+                visible_target_qualifiers,
+                database_id,
+                resolver,
+            )?;
+        }
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn apply_select_table_for_column_rename(
+    mode: ColumnRenameMode<'_>,
+    select_table: &mut ast::SelectTable,
+    trigger_table: &BTreeTable,
+    trigger_table_name: &str,
+    target_table_name: &str,
+    old_col_norm: &str,
+    outer_target_qualifiers: &[String],
+    database_id: usize,
+    resolver: &Resolver,
+) -> Result<()> {
+    match select_table {
+        ast::SelectTable::Select(select, _) => {
+            apply_select_for_column_rename(
+                mode,
+                select,
+                trigger_table,
+                trigger_table_name,
+                target_table_name,
+                old_col_norm,
+                outer_target_qualifiers,
+                database_id,
+                resolver,
+            )?;
+        }
+        ast::SelectTable::Sub(from_clause, _) => {
+            apply_from_clause_for_column_rename(
+                mode,
+                from_clause,
+                trigger_table,
+                trigger_table_name,
+                target_table_name,
+                old_col_norm,
+                outer_target_qualifiers,
+                database_id,
+                resolver,
+            )?;
+        }
+        ast::SelectTable::TableCall(_, args, _) => {
+            for arg in args {
+                apply_expr_for_column_rename(
+                    mode,
+                    arg,
+                    ColumnRenameExprTraversal::Normal,
+                    trigger_table,
+                    trigger_table_name,
+                    target_table_name,
+                    old_col_norm,
+                    None,
+                    outer_target_qualifiers,
+                    database_id,
+                    resolver,
+                )?;
+            }
+        }
+        ast::SelectTable::Table(_, _, _) => {}
+    }
+
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn apply_window_for_column_rename(
+    mode: ColumnRenameMode<'_>,
+    window: &mut ast::Window,
+    trigger_table: &BTreeTable,
+    trigger_table_name: &str,
+    target_table_name: &str,
+    old_col_norm: &str,
+    visible_target_qualifiers: &[String],
+    database_id: usize,
+    resolver: &Resolver,
+) -> Result<()> {
+    for expr in &mut window.partition_by {
+        apply_expr_for_column_rename(
+            mode,
+            expr,
+            ColumnRenameExprTraversal::Normal,
+            trigger_table,
+            trigger_table_name,
+            target_table_name,
+            old_col_norm,
+            None,
+            visible_target_qualifiers,
+            database_id,
+            resolver,
+        )?;
+    }
+
+    for sorted_col in &mut window.order_by {
+        apply_expr_for_column_rename(
+            mode,
+            &mut sorted_col.expr,
+            ColumnRenameExprTraversal::Normal,
+            trigger_table,
+            trigger_table_name,
+            target_table_name,
+            old_col_norm,
+            None,
+            visible_target_qualifiers,
+            database_id,
+            resolver,
+        )?;
+    }
+
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn apply_trigger_cmd_for_column_rename(
+    mode: ColumnRenameMode<'_>,
+    cmd: &mut ast::TriggerCmd,
     trigger_table: &BTreeTable,
     trigger_table_name: &str,
     target_table_name: &str,
@@ -2475,30 +3228,34 @@ fn validate_trigger_cmd_after_column_rename(
             where_clause,
             ..
         } => {
-            let is_renaming_update_table =
-                tbl_name.as_str().eq_ignore_ascii_case(target_table_name);
+            let update_table_name_norm = normalize_ident(tbl_name.as_str());
+            let is_renaming_update_table = update_table_name_norm == *target_table_name;
             let from_target_qualifiers = from_clause_target_qualifiers(from, target_table_name);
 
             if is_renaming_update_table {
-                for set in sets {
-                    for col_name in &set.col_names {
+                for set in sets.iter_mut() {
+                    for col_name in &mut set.col_names {
                         if col_name.as_str().eq_ignore_ascii_case(old_col_norm) {
-                            return Err(LimboError::ParseError(format!(
-                                "no such column: {old_col_norm}"
-                            )));
+                            if let Some(new_col_norm) = mode.rewritten_name() {
+                                *col_name = ast::Name::from_string(new_col_norm);
+                            } else {
+                                return Err(no_such_column_error(old_col_norm));
+                            }
                         }
                     }
                 }
             }
 
-            for set in sets {
-                validate_expr_for_column_rename(
-                    &set.expr,
+            for set in sets.iter_mut() {
+                apply_expr_for_column_rename(
+                    mode,
+                    &mut set.expr,
+                    ColumnRenameExprTraversal::Normal,
                     trigger_table,
                     trigger_table_name,
                     target_table_name,
                     old_col_norm,
-                    Some(tbl_name.as_str()),
+                    Some(&update_table_name_norm),
                     &from_target_qualifiers,
                     database_id,
                     resolver,
@@ -2506,13 +3263,15 @@ fn validate_trigger_cmd_after_column_rename(
             }
 
             if let Some(where_expr) = where_clause {
-                validate_expr_for_column_rename(
+                apply_expr_for_column_rename(
+                    mode,
                     where_expr,
+                    ColumnRenameExprTraversal::Normal,
                     trigger_table,
                     trigger_table_name,
                     target_table_name,
                     old_col_norm,
-                    Some(tbl_name.as_str()),
+                    Some(&update_table_name_norm),
                     &from_target_qualifiers,
                     database_id,
                     resolver,
@@ -2520,7 +3279,8 @@ fn validate_trigger_cmd_after_column_rename(
             }
 
             if let Some(from_clause) = from {
-                validate_from_clause_for_column_rename(
+                apply_from_clause_for_column_rename(
+                    mode,
                     from_clause,
                     trigger_table,
                     trigger_table_name,
@@ -2540,16 +3300,19 @@ fn validate_trigger_cmd_after_column_rename(
             ..
         } => {
             if tbl_name.as_str().eq_ignore_ascii_case(target_table_name) {
-                for col_name in col_names {
+                for col_name in col_names.iter_mut() {
                     if col_name.as_str().eq_ignore_ascii_case(old_col_norm) {
-                        return Err(LimboError::ParseError(format!(
-                            "no such column: {old_col_norm}"
-                        )));
+                        if let Some(new_col_norm) = mode.rewritten_name() {
+                            *col_name = ast::Name::from_string(new_col_norm);
+                        } else {
+                            return Err(no_such_column_error(old_col_norm));
+                        }
                     }
                 }
             }
 
-            validate_select_for_column_rename(
+            apply_select_for_column_rename(
+                mode,
                 select,
                 trigger_table,
                 trigger_table_name,
@@ -2561,7 +3324,8 @@ fn validate_trigger_cmd_after_column_rename(
             )?;
 
             if let Some(upsert) = upsert {
-                validate_upsert_for_column_rename(
+                apply_upsert_for_column_rename(
+                    mode,
                     upsert,
                     trigger_table,
                     trigger_table_name,
@@ -2579,8 +3343,10 @@ fn validate_trigger_cmd_after_column_rename(
         } => {
             let delete_table_name_norm = normalize_ident(tbl_name.as_str());
             if let Some(where_expr) = where_clause {
-                validate_expr_for_column_rename(
+                apply_expr_for_column_rename(
+                    mode,
                     where_expr,
+                    ColumnRenameExprTraversal::Normal,
                     trigger_table,
                     trigger_table_name,
                     target_table_name,
@@ -2593,7 +3359,8 @@ fn validate_trigger_cmd_after_column_rename(
             }
         }
         ast::TriggerCmd::Select(select) => {
-            validate_select_for_column_rename(
+            apply_select_for_column_rename(
+                mode,
                 select,
                 trigger_table,
                 trigger_table_name,
@@ -2610,920 +3377,59 @@ fn validate_trigger_cmd_after_column_rename(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn validate_upsert_for_column_rename(
-    upsert: &ast::Upsert,
+fn validate_trigger_after_column_rename(
+    event: &ast::TriggerEvent,
+    when_clause: Option<&ast::Expr>,
+    commands: &[ast::TriggerCmd],
     trigger_table: &BTreeTable,
     trigger_table_name: &str,
     target_table_name: &str,
-    insert_table_name: &str,
     old_col_norm: &str,
     database_id: usize,
     resolver: &Resolver,
 ) -> Result<()> {
-    let insert_table_name_norm = normalize_ident(insert_table_name);
-
-    if let Some(index) = &upsert.index {
-        for target in &index.targets {
-            validate_expr_for_column_rename(
-                &target.expr,
-                trigger_table,
-                trigger_table_name,
-                target_table_name,
-                old_col_norm,
-                Some(&insert_table_name_norm),
-                &[],
-                database_id,
-                resolver,
-            )?;
-        }
-        if let Some(where_clause) = &index.where_clause {
-            validate_expr_for_column_rename(
-                where_clause,
-                trigger_table,
-                trigger_table_name,
-                target_table_name,
-                old_col_norm,
-                Some(&insert_table_name_norm),
-                &[],
-                database_id,
-                resolver,
-            )?;
-        }
-    }
-
-    if let ast::UpsertDo::Set { sets, where_clause } = &upsert.do_clause {
-        if insert_table_name_norm == *target_table_name {
-            for set in sets {
-                for col_name in &set.col_names {
-                    if col_name.as_str().eq_ignore_ascii_case(old_col_norm) {
-                        return Err(LimboError::ParseError(format!(
-                            "no such column: {old_col_norm}"
-                        )));
-                    }
+    let mut event = event.clone();
+    if trigger_table_name.eq_ignore_ascii_case(target_table_name) {
+        if let ast::TriggerEvent::UpdateOf(cols) = &mut event {
+            for col in cols {
+                if normalize_ident(col.as_str()) == *old_col_norm {
+                    return Err(no_such_column_error(old_col_norm));
                 }
             }
         }
-
-        for set in sets {
-            validate_expr_for_column_rename(
-                &set.expr,
-                trigger_table,
-                trigger_table_name,
-                target_table_name,
-                old_col_norm,
-                Some(&insert_table_name_norm),
-                &[],
-                database_id,
-                resolver,
-            )?;
-        }
-
-        if let Some(where_clause) = where_clause {
-            validate_expr_for_column_rename(
-                where_clause,
-                trigger_table,
-                trigger_table_name,
-                target_table_name,
-                old_col_norm,
-                Some(&insert_table_name_norm),
-                &[],
-                database_id,
-                resolver,
-            )?;
-        }
     }
 
-    if let Some(next) = &upsert.next {
-        validate_upsert_for_column_rename(
-            next,
-            trigger_table,
-            trigger_table_name,
-            target_table_name,
-            insert_table_name,
-            old_col_norm,
-            database_id,
-            resolver,
-        )?;
-    }
-
-    Ok(())
-}
-
-#[allow(clippy::too_many_arguments)]
-fn validate_expr_for_column_rename(
-    expr: &ast::Expr,
-    trigger_table: &BTreeTable,
-    trigger_table_name: &str,
-    target_table_name: &str,
-    old_col_norm: &str,
-    context_table_name: Option<&str>,
-    from_target_qualifiers: &[String],
-    database_id: usize,
-    resolver: &Resolver,
-) -> Result<()> {
-    let trigger_table_name_norm = normalize_ident(trigger_table_name);
-    let target_table_name_norm = normalize_ident(target_table_name);
-    let is_renaming_trigger_table = trigger_table_name_norm == target_table_name_norm;
-
-    let context_table_info: Option<(Arc<BTreeTable>, String, bool)> = if let Some(ctx_name) =
-        context_table_name
-    {
-        let ctx_name_norm = normalize_ident(ctx_name);
-        let is_renaming = ctx_name_norm == *target_table_name_norm;
-        let table = resolve_trigger_command_table_for_alter(resolver, database_id, &ctx_name_norm)
-            .ok_or_else(|| {
-                LimboError::ParseError(format!("context table not found: {ctx_name_norm}"))
-            })?;
-        Some((table, ctx_name_norm, is_renaming))
-    } else {
-        None
-    };
-
-    let mut expr = expr.clone();
-    walk_expr_mut(&mut expr, &mut |e: &mut ast::Expr| -> Result<WalkControl> {
-        match e {
-            ast::Expr::Subquery(select) | ast::Expr::Exists(select) => {
-                validate_select_for_column_rename(
-                    select,
-                    trigger_table,
-                    trigger_table_name,
-                    target_table_name,
-                    old_col_norm,
-                    from_target_qualifiers,
-                    database_id,
-                    resolver,
-                )?;
-            }
-            ast::Expr::InSelect { rhs, .. } => {
-                validate_select_for_column_rename(
-                    rhs,
-                    trigger_table,
-                    trigger_table_name,
-                    target_table_name,
-                    old_col_norm,
-                    from_target_qualifiers,
-                    database_id,
-                    resolver,
-                )?;
-            }
-            _ => {
-                validate_expr_column_ref_with_context(
-                    e,
-                    trigger_table,
-                    trigger_table_name,
-                    old_col_norm,
-                    is_renaming_trigger_table,
-                    context_table_info
-                        .as_ref()
-                        .map(|(table, name, is_renaming)| (table.as_ref(), name, *is_renaming)),
-                    from_target_qualifiers,
-                )?;
-            }
-        }
-        Ok(WalkControl::Continue)
-    })?;
-
-    Ok(())
-}
-
-#[allow(clippy::too_many_arguments)]
-fn validate_select_for_column_rename(
-    select: &ast::Select,
-    trigger_table: &BTreeTable,
-    trigger_table_name: &str,
-    target_table_name: &str,
-    old_col_norm: &str,
-    outer_target_qualifiers: &[String],
-    database_id: usize,
-    resolver: &Resolver,
-) -> Result<()> {
-    if let Some(with_clause) = &select.with {
-        for cte in &with_clause.ctes {
-            validate_select_for_column_rename(
-                &cte.select,
-                trigger_table,
-                trigger_table_name,
-                target_table_name,
-                old_col_norm,
-                outer_target_qualifiers,
-                database_id,
-                resolver,
-            )?;
-        }
-    }
-
-    validate_one_select_for_column_rename(
-        &select.body.select,
-        trigger_table,
-        trigger_table_name,
-        target_table_name,
-        old_col_norm,
-        outer_target_qualifiers,
-        database_id,
-        resolver,
-    )?;
-
-    for compound in &select.body.compounds {
-        validate_one_select_for_column_rename(
-            &compound.select,
-            trigger_table,
-            trigger_table_name,
-            target_table_name,
-            old_col_norm,
-            outer_target_qualifiers,
-            database_id,
-            resolver,
-        )?;
-    }
-
-    let body_target_qualifiers = match &select.body.select {
-        ast::OneSelect::Select { from, .. } => merge_target_qualifiers(
-            outer_target_qualifiers,
-            &from_clause_target_qualifiers(from, target_table_name),
-        ),
-        _ => outer_target_qualifiers.to_vec(),
-    };
-
-    for sorted_col in &select.order_by {
-        validate_expr_for_column_rename(
-            &sorted_col.expr,
+    if let Some(when_expr) = when_clause {
+        let mut when_expr = when_expr.clone();
+        apply_expr_for_column_rename(
+            ColumnRenameMode::Validate,
+            &mut when_expr,
+            ColumnRenameExprTraversal::Normal,
             trigger_table,
             trigger_table_name,
             target_table_name,
             old_col_norm,
             None,
-            &body_target_qualifiers,
+            &[],
             database_id,
             resolver,
         )?;
     }
 
-    if let Some(limit) = &select.limit {
-        validate_expr_for_column_rename(
-            &limit.expr,
+    for cmd in commands {
+        let mut cmd = cmd.clone();
+        apply_trigger_cmd_for_column_rename(
+            ColumnRenameMode::Validate,
+            &mut cmd,
             trigger_table,
             trigger_table_name,
             target_table_name,
             old_col_norm,
-            None,
-            &body_target_qualifiers,
-            database_id,
-            resolver,
-        )?;
-        if let Some(offset) = &limit.offset {
-            validate_expr_for_column_rename(
-                offset,
-                trigger_table,
-                trigger_table_name,
-                target_table_name,
-                old_col_norm,
-                None,
-                &body_target_qualifiers,
-                database_id,
-                resolver,
-            )?;
-        }
-    }
-
-    Ok(())
-}
-
-#[allow(clippy::too_many_arguments)]
-fn validate_one_select_for_column_rename(
-    one_select: &ast::OneSelect,
-    trigger_table: &BTreeTable,
-    trigger_table_name: &str,
-    target_table_name: &str,
-    old_col_norm: &str,
-    outer_target_qualifiers: &[String],
-    database_id: usize,
-    resolver: &Resolver,
-) -> Result<()> {
-    match one_select {
-        ast::OneSelect::Select {
-            columns,
-            from,
-            where_clause,
-            group_by,
-            window_clause,
-            ..
-        } => {
-            let visible_target_qualifiers = merge_target_qualifiers(
-                outer_target_qualifiers,
-                &from_clause_target_qualifiers(from, target_table_name),
-            );
-
-            for col in columns {
-                if let ast::ResultColumn::Expr(expr, _) = col {
-                    validate_expr_for_column_rename(
-                        expr,
-                        trigger_table,
-                        trigger_table_name,
-                        target_table_name,
-                        old_col_norm,
-                        None,
-                        &visible_target_qualifiers,
-                        database_id,
-                        resolver,
-                    )?;
-                }
-            }
-
-            if let Some(from_clause) = from {
-                validate_from_clause_for_column_rename(
-                    from_clause,
-                    trigger_table,
-                    trigger_table_name,
-                    target_table_name,
-                    old_col_norm,
-                    outer_target_qualifiers,
-                    database_id,
-                    resolver,
-                )?;
-            }
-
-            if let Some(where_expr) = where_clause {
-                validate_expr_for_column_rename(
-                    where_expr,
-                    trigger_table,
-                    trigger_table_name,
-                    target_table_name,
-                    old_col_norm,
-                    None,
-                    &visible_target_qualifiers,
-                    database_id,
-                    resolver,
-                )?;
-            }
-
-            if let Some(group_by) = group_by {
-                for expr in &group_by.exprs {
-                    validate_expr_for_column_rename(
-                        expr,
-                        trigger_table,
-                        trigger_table_name,
-                        target_table_name,
-                        old_col_norm,
-                        None,
-                        &visible_target_qualifiers,
-                        database_id,
-                        resolver,
-                    )?;
-                }
-                if let Some(having_expr) = &group_by.having {
-                    validate_expr_for_column_rename(
-                        having_expr,
-                        trigger_table,
-                        trigger_table_name,
-                        target_table_name,
-                        old_col_norm,
-                        None,
-                        &visible_target_qualifiers,
-                        database_id,
-                        resolver,
-                    )?;
-                }
-            }
-
-            for window_def in window_clause {
-                validate_window_for_column_rename(
-                    &window_def.window,
-                    trigger_table,
-                    trigger_table_name,
-                    target_table_name,
-                    old_col_norm,
-                    &visible_target_qualifiers,
-                    database_id,
-                    resolver,
-                )?;
-            }
-        }
-        ast::OneSelect::Values(values) => {
-            for row in values {
-                for expr in row {
-                    validate_expr_for_column_rename(
-                        expr,
-                        trigger_table,
-                        trigger_table_name,
-                        target_table_name,
-                        old_col_norm,
-                        None,
-                        outer_target_qualifiers,
-                        database_id,
-                        resolver,
-                    )?;
-                }
-            }
-        }
-    }
-
-    Ok(())
-}
-
-#[allow(clippy::too_many_arguments)]
-fn validate_from_clause_for_column_rename(
-    from_clause: &ast::FromClause,
-    trigger_table: &BTreeTable,
-    trigger_table_name: &str,
-    target_table_name: &str,
-    old_col_norm: &str,
-    visible_target_qualifiers: &[String],
-    database_id: usize,
-    resolver: &Resolver,
-) -> Result<()> {
-    validate_select_table_for_column_rename(
-        &from_clause.select,
-        trigger_table,
-        trigger_table_name,
-        target_table_name,
-        old_col_norm,
-        visible_target_qualifiers,
-        database_id,
-        resolver,
-    )?;
-
-    for join in &from_clause.joins {
-        validate_select_table_for_column_rename(
-            &join.table,
-            trigger_table,
-            trigger_table_name,
-            target_table_name,
-            old_col_norm,
-            visible_target_qualifiers,
-            database_id,
-            resolver,
-        )?;
-        if let Some(ast::JoinConstraint::On(expr)) = &join.constraint {
-            validate_expr_for_column_rename(
-                expr,
-                trigger_table,
-                trigger_table_name,
-                target_table_name,
-                old_col_norm,
-                None,
-                visible_target_qualifiers,
-                database_id,
-                resolver,
-            )?;
-        }
-    }
-
-    Ok(())
-}
-
-#[allow(clippy::too_many_arguments)]
-fn validate_select_table_for_column_rename(
-    select_table: &ast::SelectTable,
-    trigger_table: &BTreeTable,
-    trigger_table_name: &str,
-    target_table_name: &str,
-    old_col_norm: &str,
-    outer_target_qualifiers: &[String],
-    database_id: usize,
-    resolver: &Resolver,
-) -> Result<()> {
-    match select_table {
-        ast::SelectTable::Select(select, _) => {
-            validate_select_for_column_rename(
-                select,
-                trigger_table,
-                trigger_table_name,
-                target_table_name,
-                old_col_norm,
-                outer_target_qualifiers,
-                database_id,
-                resolver,
-            )?;
-        }
-        ast::SelectTable::Sub(from_clause, _) => {
-            validate_from_clause_for_column_rename(
-                from_clause,
-                trigger_table,
-                trigger_table_name,
-                target_table_name,
-                old_col_norm,
-                outer_target_qualifiers,
-                database_id,
-                resolver,
-            )?;
-        }
-        ast::SelectTable::TableCall(_, args, _) => {
-            for arg in args {
-                validate_expr_for_column_rename(
-                    arg,
-                    trigger_table,
-                    trigger_table_name,
-                    target_table_name,
-                    old_col_norm,
-                    None,
-                    outer_target_qualifiers,
-                    database_id,
-                    resolver,
-                )?;
-            }
-        }
-        ast::SelectTable::Table(_, _, _) => {}
-    }
-
-    Ok(())
-}
-
-#[allow(clippy::too_many_arguments)]
-fn validate_window_for_column_rename(
-    window: &ast::Window,
-    trigger_table: &BTreeTable,
-    trigger_table_name: &str,
-    target_table_name: &str,
-    old_col_norm: &str,
-    visible_target_qualifiers: &[String],
-    database_id: usize,
-    resolver: &Resolver,
-) -> Result<()> {
-    for expr in &window.partition_by {
-        validate_expr_for_column_rename(
-            expr,
-            trigger_table,
-            trigger_table_name,
-            target_table_name,
-            old_col_norm,
-            None,
-            visible_target_qualifiers,
             database_id,
             resolver,
         )?;
     }
-
-    for sorted_col in &window.order_by {
-        validate_expr_for_column_rename(
-            &sorted_col.expr,
-            trigger_table,
-            trigger_table_name,
-            target_table_name,
-            old_col_norm,
-            None,
-            visible_target_qualifiers,
-            database_id,
-            resolver,
-        )?;
-    }
-
     Ok(())
-}
-
-#[allow(clippy::too_many_arguments)]
-fn validate_expr_column_ref_with_context(
-    e: &mut ast::Expr,
-    trigger_table: &BTreeTable,
-    trigger_table_name: &str,
-    old_col_norm: &str,
-    is_renaming_trigger_table: bool,
-    context_table: Option<(&BTreeTable, &String, bool)>,
-    from_target_qualifiers: &[String],
-) -> Result<()> {
-    match e {
-        ast::Expr::Qualified(ns, col) | ast::Expr::DoublyQualified(_, ns, col) => {
-            let ns_norm = normalize_ident(ns.as_str());
-            let col_norm = normalize_ident(col.as_str());
-
-            if col_norm != *old_col_norm {
-                return Ok(());
-            }
-
-            if ns_norm.eq_ignore_ascii_case("new") || ns_norm.eq_ignore_ascii_case("old") {
-                if is_renaming_trigger_table && trigger_table.get_column(&col_norm).is_some() {
-                    return Err(LimboError::ParseError(format!(
-                        "no such column: {old_col_norm}"
-                    )));
-                }
-                return Ok(());
-            }
-
-            if let Some((_, ctx_name_norm, is_renaming_ctx)) = context_table {
-                if ns_norm == *ctx_name_norm && is_renaming_ctx {
-                    return Err(LimboError::ParseError(format!(
-                        "no such column: {old_col_norm}"
-                    )));
-                }
-            }
-
-            if is_renaming_trigger_table
-                && ns_norm.eq_ignore_ascii_case(trigger_table_name)
-                && trigger_table.get_column(&col_norm).is_some()
-            {
-                return Err(LimboError::ParseError(format!(
-                    "no such column: {old_col_norm}"
-                )));
-            }
-
-            if from_target_qualifiers.contains(&ns_norm) {
-                return Err(LimboError::ParseError(format!(
-                    "no such column: {old_col_norm}"
-                )));
-            }
-        }
-        ast::Expr::Id(col) => {
-            let col_norm = normalize_ident(col.as_str());
-            if col_norm != *old_col_norm {
-                return Ok(());
-            }
-
-            if let Some((ctx_table, _, is_renaming_ctx)) = context_table {
-                if ctx_table.get_column(&col_norm).is_some() {
-                    if is_renaming_ctx {
-                        return Err(LimboError::ParseError(format!(
-                            "no such column: {old_col_norm}"
-                        )));
-                    }
-                    return Ok(());
-                }
-            }
-
-            if (is_renaming_trigger_table && trigger_table.get_column(&col_norm).is_some())
-                || !from_target_qualifiers.is_empty()
-            {
-                return Err(LimboError::ParseError(format!(
-                    "no such column: {old_col_norm}"
-                )));
-            }
-        }
-        _ => {}
-    }
-
-    Ok(())
-}
-
-/// Rewrite an expression to replace column references
-///
-/// `context_table_name` is used for UPDATE/DELETE WHERE clauses where unqualified column
-/// references refer to the UPDATE/DELETE target table, not the trigger's owning table.
-/// If `None`, unqualified references refer to the trigger's owning table.
-#[allow(clippy::too_many_arguments)]
-fn rewrite_expr_for_column_rename(
-    expr: &ast::Expr,
-    trigger_table: &BTreeTable,
-    trigger_table_name: &str,
-    target_table_name: &str,
-    old_col_norm: &str,
-    new_col_norm: &str,
-    context_table_name: Option<&str>,
-    from_target_qualifiers: &[String],
-    database_id: usize,
-    resolver: &Resolver,
-) -> Result<ast::Expr> {
-    let is_renaming_trigger_table = trigger_table_name.eq_ignore_ascii_case(target_table_name);
-
-    // Get context table if provided (for UPDATE/DELETE WHERE clauses)
-    let context_table_info: Option<(Arc<BTreeTable>, String, bool)> = if let Some(ctx_name) =
-        context_table_name
-    {
-        let ctx_name_norm = normalize_ident(ctx_name);
-        let is_renaming = ctx_name_norm == target_table_name;
-        let table = resolve_trigger_command_table_for_alter(resolver, database_id, &ctx_name_norm)
-            .ok_or_else(|| {
-                LimboError::ParseError(format!("context table not found: {ctx_name_norm}"))
-            })?;
-        Some((table, ctx_name_norm, is_renaming))
-    } else {
-        None
-    };
-
-    let mut expr = expr.clone();
-    walk_expr_mut(&mut expr, &mut |e: &mut ast::Expr| -> Result<WalkControl> {
-        match e {
-            ast::Expr::Subquery(select) | ast::Expr::Exists(select) => {
-                // Subqueries don't inherit the context table scope
-                rewrite_select_for_column_rename(
-                    select,
-                    trigger_table,
-                    trigger_table_name,
-                    target_table_name,
-                    old_col_norm,
-                    new_col_norm,
-                    from_target_qualifiers,
-                )?;
-            }
-            ast::Expr::InSelect { rhs, .. } => {
-                rewrite_select_for_column_rename(
-                    rhs,
-                    trigger_table,
-                    trigger_table_name,
-                    target_table_name,
-                    old_col_norm,
-                    new_col_norm,
-                    from_target_qualifiers,
-                )?;
-                // lhs will be walked by walk_expr_mut
-            }
-            _ => {
-                rewrite_expr_column_ref_with_context(
-                    e,
-                    trigger_table,
-                    trigger_table_name,
-                    old_col_norm,
-                    new_col_norm,
-                    is_renaming_trigger_table,
-                    context_table_info
-                        .as_ref()
-                        .map(|(t, n, r)| (t.as_ref(), n, *r)),
-                    from_target_qualifiers,
-                )?;
-            }
-        }
-        Ok(WalkControl::Continue)
-    })?;
-
-    Ok(expr)
-}
-
-/// Rewrite a trigger command to replace column references
-#[allow(clippy::too_many_arguments)]
-fn rewrite_trigger_cmd_for_column_rename(
-    cmd: ast::TriggerCmd,
-    trigger_table: &BTreeTable,
-    trigger_table_name: &str,
-    target_table_name: &str,
-    old_col_norm: &str,
-    new_col_norm: &str,
-    database_id: usize,
-    resolver: &Resolver,
-) -> Result<ast::TriggerCmd> {
-    match cmd {
-        ast::TriggerCmd::Update {
-            or_conflict,
-            tbl_name,
-            mut sets,
-            from,
-            where_clause,
-        } => {
-            // Get the UPDATE target table to check if we're renaming a column in it
-            let update_table_name_norm = normalize_ident(tbl_name.as_str());
-            let is_renaming_update_table = update_table_name_norm == *target_table_name;
-            let from_target_qualifiers = from_clause_target_qualifiers(&from, target_table_name);
-
-            // Rewrite SET column names if renaming a column in the UPDATE target table
-            if is_renaming_update_table {
-                for set in &mut sets {
-                    for col_name in &mut set.col_names {
-                        let col_norm = normalize_ident(col_name.as_str());
-                        if col_norm == *old_col_norm {
-                            *col_name = ast::Name::from_string(new_col_norm);
-                        }
-                    }
-                }
-            }
-
-            // Rewrite SET expressions — unqualified refs in SET refer to the UPDATE target.
-            // Pass context_table so invalid qualified refs to trigger table are caught.
-            for set in &mut sets {
-                set.expr = Box::new(rewrite_expr_for_column_rename(
-                    &set.expr,
-                    trigger_table,
-                    trigger_table_name,
-                    target_table_name,
-                    old_col_norm,
-                    new_col_norm,
-                    Some(&update_table_name_norm),
-                    &from_target_qualifiers,
-                    database_id,
-                    resolver,
-                )?);
-            }
-
-            // Rewrite WHERE clause - unqualified column references refer to UPDATE target table
-            let new_where = where_clause
-                .map(|e| {
-                    rewrite_expr_for_column_rename(
-                        &e,
-                        trigger_table,
-                        trigger_table_name,
-                        target_table_name,
-                        old_col_norm,
-                        new_col_norm,
-                        Some(&update_table_name_norm), // UPDATE WHERE: unqualified refs refer to UPDATE target
-                        &from_target_qualifiers,
-                        database_id,
-                        resolver,
-                    )
-                    .map(Box::new)
-                })
-                .transpose()?;
-            let mut from = from;
-            if let Some(ref mut from_clause) = from {
-                rewrite_from_clause_for_column_rename(
-                    from_clause,
-                    trigger_table,
-                    trigger_table_name,
-                    target_table_name,
-                    old_col_norm,
-                    new_col_norm,
-                    &[],
-                )?;
-            }
-            Ok(ast::TriggerCmd::Update {
-                or_conflict,
-                tbl_name,
-                sets,
-                from,
-                where_clause: new_where,
-            })
-        }
-        ast::TriggerCmd::Insert {
-            or_conflict,
-            tbl_name,
-            mut col_names,
-            select,
-            upsert,
-            returning,
-        } => {
-            // Rewrite column names in INSERT column list
-            // Check if the INSERT is targeting the table being renamed
-            if tbl_name.as_str().eq_ignore_ascii_case(target_table_name) {
-                // This INSERT targets the table being renamed, so rewrite column names
-                for col_name in &mut col_names {
-                    if col_name.as_str().eq_ignore_ascii_case(old_col_norm) {
-                        *col_name = ast::Name::from_string(new_col_norm);
-                    }
-                }
-            }
-            // Rewrite SELECT expressions
-            let mut select = select;
-            rewrite_select_for_column_rename(
-                &mut select,
-                trigger_table,
-                trigger_table_name,
-                target_table_name,
-                old_col_norm,
-                new_col_norm,
-                &[],
-            )?;
-            let upsert = upsert
-                .map(|upsert| {
-                    rewrite_upsert_for_column_rename(
-                        *upsert,
-                        trigger_table,
-                        trigger_table_name,
-                        target_table_name,
-                        tbl_name.as_str(),
-                        old_col_norm,
-                        new_col_norm,
-                        database_id,
-                        resolver,
-                    )
-                    .map(Box::new)
-                })
-                .transpose()?;
-            Ok(ast::TriggerCmd::Insert {
-                or_conflict,
-                tbl_name,
-                col_names,
-                select,
-                upsert,
-                returning,
-            })
-        }
-        ast::TriggerCmd::Delete {
-            tbl_name,
-            where_clause,
-        } => {
-            // Get the DELETE target table to check if we're renaming a column in it
-            let delete_table_name_norm = normalize_ident(tbl_name.as_str());
-
-            // Rewrite WHERE clause - unqualified column references refer to DELETE target table
-            let new_where = where_clause
-                .map(|e| {
-                    rewrite_expr_for_column_rename(
-                        &e,
-                        trigger_table,
-                        trigger_table_name,
-                        target_table_name,
-                        old_col_norm,
-                        new_col_norm,
-                        Some(&delete_table_name_norm), // DELETE WHERE: unqualified refs refer to DELETE target
-                        &[],
-                        database_id,
-                        resolver,
-                    )
-                    .map(Box::new)
-                })
-                .transpose()?;
-            Ok(ast::TriggerCmd::Delete {
-                tbl_name,
-                where_clause: new_where,
-            })
-        }
-        ast::TriggerCmd::Select(mut select) => {
-            rewrite_select_for_column_rename(
-                &mut select,
-                trigger_table,
-                trigger_table_name,
-                target_table_name,
-                old_col_norm,
-                new_col_norm,
-                &[],
-            )?;
-            Ok(ast::TriggerCmd::Select(select))
-        }
-    }
 }
 
 fn rename_excluded_column_refs(
@@ -3541,596 +3447,6 @@ fn rename_excluded_column_refs(
         }
         Ok(WalkControl::Continue)
     })?;
-    Ok(())
-}
-
-#[allow(clippy::too_many_arguments)]
-fn rewrite_upsert_for_column_rename(
-    mut upsert: ast::Upsert,
-    trigger_table: &BTreeTable,
-    trigger_table_name: &str,
-    target_table_name: &str,
-    insert_table_name: &str,
-    old_col_norm: &str,
-    new_col_norm: &str,
-    database_id: usize,
-    resolver: &Resolver,
-) -> Result<ast::Upsert> {
-    let insert_table_name_norm = normalize_ident(insert_table_name);
-    let insert_targets_renamed_table = insert_table_name_norm == *target_table_name;
-
-    if let Some(index) = &mut upsert.index {
-        for target in &mut index.targets {
-            target.expr = Box::new(rewrite_expr_for_column_rename(
-                &target.expr,
-                trigger_table,
-                trigger_table_name,
-                target_table_name,
-                old_col_norm,
-                new_col_norm,
-                Some(&insert_table_name_norm),
-                &[],
-                database_id,
-                resolver,
-            )?);
-            if insert_targets_renamed_table {
-                rename_excluded_column_refs(&mut target.expr, old_col_norm, new_col_norm)?;
-            }
-        }
-        if let Some(where_clause) = &mut index.where_clause {
-            **where_clause = rewrite_expr_for_column_rename(
-                where_clause,
-                trigger_table,
-                trigger_table_name,
-                target_table_name,
-                old_col_norm,
-                new_col_norm,
-                Some(&insert_table_name_norm),
-                &[],
-                database_id,
-                resolver,
-            )?;
-            if insert_targets_renamed_table {
-                rename_excluded_column_refs(where_clause, old_col_norm, new_col_norm)?;
-            }
-        }
-    }
-
-    if let ast::UpsertDo::Set { sets, where_clause } = &mut upsert.do_clause {
-        for set in sets {
-            if insert_targets_renamed_table {
-                for col_name in &mut set.col_names {
-                    if col_name.as_str().eq_ignore_ascii_case(old_col_norm) {
-                        *col_name = ast::Name::from_string(new_col_norm);
-                    }
-                }
-            }
-            set.expr = Box::new(rewrite_expr_for_column_rename(
-                &set.expr,
-                trigger_table,
-                trigger_table_name,
-                target_table_name,
-                old_col_norm,
-                new_col_norm,
-                Some(&insert_table_name_norm),
-                &[],
-                database_id,
-                resolver,
-            )?);
-            if insert_targets_renamed_table {
-                rename_excluded_column_refs(&mut set.expr, old_col_norm, new_col_norm)?;
-            }
-        }
-        if let Some(expr) = where_clause {
-            **expr = rewrite_expr_for_column_rename(
-                expr,
-                trigger_table,
-                trigger_table_name,
-                target_table_name,
-                old_col_norm,
-                new_col_norm,
-                Some(&insert_table_name_norm),
-                &[],
-                database_id,
-                resolver,
-            )?;
-            if insert_targets_renamed_table {
-                rename_excluded_column_refs(expr, old_col_norm, new_col_norm)?;
-            }
-        }
-    }
-
-    if let Some(next) = upsert.next.take() {
-        upsert.next = Some(Box::new(rewrite_upsert_for_column_rename(
-            *next,
-            trigger_table,
-            trigger_table_name,
-            target_table_name,
-            insert_table_name,
-            old_col_norm,
-            new_col_norm,
-            database_id,
-            resolver,
-        )?));
-    }
-
-    Ok(upsert)
-}
-
-/// Walk an expression tree for column renaming, handling subqueries that walk_expr_mut skips.
-/// This is the central expression walker for trigger column rename rewrites.
-fn walk_expr_for_column_rename(
-    expr: &mut ast::Expr,
-    trigger_table: &BTreeTable,
-    trigger_table_name: &str,
-    target_table_name: &str,
-    old_col_norm: &str,
-    new_col_norm: &str,
-    visible_target_qualifiers: &[String],
-) -> Result<()> {
-    use crate::translate::expr::walk_expr_mut;
-
-    walk_expr_mut(expr, &mut |e: &mut ast::Expr| -> Result<WalkControl> {
-        match e {
-            ast::Expr::Subquery(select) | ast::Expr::Exists(select) => {
-                rewrite_select_for_column_rename(
-                    select,
-                    trigger_table,
-                    trigger_table_name,
-                    target_table_name,
-                    old_col_norm,
-                    new_col_norm,
-                    visible_target_qualifiers,
-                )?;
-            }
-            ast::Expr::InSelect { rhs, .. } => {
-                rewrite_select_for_column_rename(
-                    rhs,
-                    trigger_table,
-                    trigger_table_name,
-                    target_table_name,
-                    old_col_norm,
-                    new_col_norm,
-                    visible_target_qualifiers,
-                )?;
-                // lhs will be walked by walk_expr_mut
-            }
-            _ => {
-                rewrite_expr_column_ref(
-                    e,
-                    trigger_table,
-                    trigger_table_name,
-                    target_table_name,
-                    old_col_norm,
-                    new_col_norm,
-                    visible_target_qualifiers,
-                )?;
-            }
-        }
-        Ok(WalkControl::Continue)
-    })?;
-    Ok(())
-}
-
-#[allow(clippy::too_many_arguments)]
-fn walk_result_expr_for_column_rename(
-    expr: &mut ast::Expr,
-    trigger_table: &BTreeTable,
-    trigger_table_name: &str,
-    target_table_name: &str,
-    old_col_norm: &str,
-    new_col_norm: &str,
-    visible_target_qualifiers: &[String],
-) -> Result<()> {
-    use crate::translate::expr::walk_expr_mut;
-
-    walk_expr_mut(expr, &mut |e: &mut ast::Expr| -> Result<WalkControl> {
-        match e {
-            ast::Expr::Exists(_) => return Ok(WalkControl::SkipChildren),
-            ast::Expr::Subquery(select) => {
-                rewrite_select_for_column_rename(
-                    select,
-                    trigger_table,
-                    trigger_table_name,
-                    target_table_name,
-                    old_col_norm,
-                    new_col_norm,
-                    visible_target_qualifiers,
-                )?;
-            }
-            ast::Expr::InSelect { rhs, .. } => {
-                rewrite_select_for_column_rename(
-                    rhs,
-                    trigger_table,
-                    trigger_table_name,
-                    target_table_name,
-                    old_col_norm,
-                    new_col_norm,
-                    visible_target_qualifiers,
-                )?;
-            }
-            _ => {
-                rewrite_expr_column_ref(
-                    e,
-                    trigger_table,
-                    trigger_table_name,
-                    target_table_name,
-                    old_col_norm,
-                    new_col_norm,
-                    visible_target_qualifiers,
-                )?;
-            }
-        }
-        Ok(WalkControl::Continue)
-    })?;
-    Ok(())
-}
-
-/// Rewrite a SELECT statement in-place to replace column references.
-fn rewrite_select_for_column_rename(
-    select: &mut ast::Select,
-    trigger_table: &BTreeTable,
-    trigger_table_name: &str,
-    target_table_name: &str,
-    old_col_norm: &str,
-    new_col_norm: &str,
-    outer_target_qualifiers: &[String],
-) -> Result<()> {
-    // Rewrite WITH clause (CTEs)
-    if let Some(ref mut with_clause) = select.with {
-        for cte in &mut with_clause.ctes {
-            rewrite_select_for_column_rename(
-                &mut cte.select,
-                trigger_table,
-                trigger_table_name,
-                target_table_name,
-                old_col_norm,
-                new_col_norm,
-                outer_target_qualifiers,
-            )?;
-        }
-    }
-
-    // Rewrite main SELECT body
-    rewrite_one_select_for_column_rename(
-        &mut select.body.select,
-        trigger_table,
-        trigger_table_name,
-        target_table_name,
-        old_col_norm,
-        new_col_norm,
-        outer_target_qualifiers,
-    )?;
-
-    // Rewrite compound SELECTs (UNION, EXCEPT, INTERSECT)
-    for compound in &mut select.body.compounds {
-        rewrite_one_select_for_column_rename(
-            &mut compound.select,
-            trigger_table,
-            trigger_table_name,
-            target_table_name,
-            old_col_norm,
-            new_col_norm,
-            outer_target_qualifiers,
-        )?;
-    }
-
-    // Compute from_target for ORDER BY / LIMIT (same scope as body's FROM)
-    let body_target_qualifiers = match &select.body.select {
-        ast::OneSelect::Select { from, .. } => merge_target_qualifiers(
-            outer_target_qualifiers,
-            &from_clause_target_qualifiers(from, target_table_name),
-        ),
-        _ => outer_target_qualifiers.to_vec(),
-    };
-
-    // Rewrite ORDER BY
-    for sorted_col in &mut select.order_by {
-        walk_expr_for_column_rename(
-            &mut sorted_col.expr,
-            trigger_table,
-            trigger_table_name,
-            target_table_name,
-            old_col_norm,
-            new_col_norm,
-            &body_target_qualifiers,
-        )?;
-    }
-
-    // Rewrite LIMIT
-    if let Some(ref mut limit) = select.limit {
-        walk_expr_for_column_rename(
-            &mut limit.expr,
-            trigger_table,
-            trigger_table_name,
-            target_table_name,
-            old_col_norm,
-            new_col_norm,
-            &body_target_qualifiers,
-        )?;
-        if let Some(ref mut offset) = limit.offset {
-            walk_expr_for_column_rename(
-                offset,
-                trigger_table,
-                trigger_table_name,
-                target_table_name,
-                old_col_norm,
-                new_col_norm,
-                &body_target_qualifiers,
-            )?;
-        }
-    }
-
-    Ok(())
-}
-
-/// Rewrite a OneSelect to replace column references
-fn rewrite_one_select_for_column_rename(
-    one_select: &mut ast::OneSelect,
-    trigger_table: &BTreeTable,
-    trigger_table_name: &str,
-    target_table_name: &str,
-    old_col_norm: &str,
-    new_col_norm: &str,
-    outer_target_qualifiers: &[String],
-) -> Result<()> {
-    match one_select {
-        ast::OneSelect::Select {
-            columns,
-            from,
-            where_clause,
-            group_by,
-            window_clause,
-            ..
-        } => {
-            // Check if FROM references the target table (for cross-table column rename)
-            let visible_target_qualifiers = merge_target_qualifiers(
-                outer_target_qualifiers,
-                &from_clause_target_qualifiers(from, target_table_name),
-            );
-
-            // Rewrite columns
-            for col in columns {
-                if let ast::ResultColumn::Expr(expr, _) = col {
-                    walk_result_expr_for_column_rename(
-                        expr,
-                        trigger_table,
-                        trigger_table_name,
-                        target_table_name,
-                        old_col_norm,
-                        new_col_norm,
-                        &visible_target_qualifiers,
-                    )?;
-                }
-            }
-
-            // Rewrite FROM clause and JOIN conditions
-            if let Some(ref mut from_clause) = from {
-                rewrite_from_clause_for_column_rename(
-                    from_clause,
-                    trigger_table,
-                    trigger_table_name,
-                    target_table_name,
-                    old_col_norm,
-                    new_col_norm,
-                    outer_target_qualifiers,
-                )?;
-            }
-
-            // Rewrite WHERE clause
-            if let Some(ref mut where_expr) = where_clause {
-                walk_expr_for_column_rename(
-                    where_expr,
-                    trigger_table,
-                    trigger_table_name,
-                    target_table_name,
-                    old_col_norm,
-                    new_col_norm,
-                    &visible_target_qualifiers,
-                )?;
-            }
-
-            // Rewrite GROUP BY and HAVING
-            if let Some(ref mut group_by) = group_by {
-                for expr in &mut group_by.exprs {
-                    walk_expr_for_column_rename(
-                        expr,
-                        trigger_table,
-                        trigger_table_name,
-                        target_table_name,
-                        old_col_norm,
-                        new_col_norm,
-                        &visible_target_qualifiers,
-                    )?;
-                }
-                if let Some(ref mut having_expr) = group_by.having {
-                    walk_expr_for_column_rename(
-                        having_expr,
-                        trigger_table,
-                        trigger_table_name,
-                        target_table_name,
-                        old_col_norm,
-                        new_col_norm,
-                        &visible_target_qualifiers,
-                    )?;
-                }
-            }
-
-            // Rewrite WINDOW clause
-            for window_def in window_clause {
-                rewrite_window_for_column_rename(
-                    &mut window_def.window,
-                    trigger_table,
-                    trigger_table_name,
-                    target_table_name,
-                    old_col_norm,
-                    new_col_norm,
-                    &visible_target_qualifiers,
-                )?;
-            }
-        }
-        ast::OneSelect::Values(values) => {
-            for row in values {
-                for expr in row {
-                    walk_expr_for_column_rename(
-                        expr,
-                        trigger_table,
-                        trigger_table_name,
-                        target_table_name,
-                        old_col_norm,
-                        new_col_norm,
-                        outer_target_qualifiers,
-                    )?;
-                }
-            }
-        }
-    }
-    Ok(())
-}
-
-/// Rewrite expressions in a FROM clause (including JOIN conditions)
-fn rewrite_from_clause_for_column_rename(
-    from_clause: &mut ast::FromClause,
-    trigger_table: &BTreeTable,
-    trigger_table_name: &str,
-    target_table_name: &str,
-    old_col_norm: &str,
-    new_col_norm: &str,
-    visible_target_qualifiers: &[String],
-) -> Result<()> {
-    // Rewrite main table (could be a subquery)
-    rewrite_select_table_for_column_rename(
-        &mut from_clause.select,
-        trigger_table,
-        trigger_table_name,
-        target_table_name,
-        old_col_norm,
-        new_col_norm,
-        visible_target_qualifiers,
-    )?;
-
-    // Rewrite JOIN conditions
-    for join in &mut from_clause.joins {
-        rewrite_select_table_for_column_rename(
-            &mut join.table,
-            trigger_table,
-            trigger_table_name,
-            target_table_name,
-            old_col_norm,
-            new_col_norm,
-            visible_target_qualifiers,
-        )?;
-        if let Some(ref mut constraint) = join.constraint {
-            match constraint {
-                ast::JoinConstraint::On(expr) => {
-                    walk_expr_for_column_rename(
-                        expr,
-                        trigger_table,
-                        trigger_table_name,
-                        target_table_name,
-                        old_col_norm,
-                        new_col_norm,
-                        visible_target_qualifiers,
-                    )?;
-                }
-                ast::JoinConstraint::Using(_) => {
-                    // USING clause contains column names, not expressions
-                }
-            }
-        }
-    }
-    Ok(())
-}
-
-/// Rewrite expressions in a SelectTable (table, subquery, or table function)
-fn rewrite_select_table_for_column_rename(
-    select_table: &mut ast::SelectTable,
-    trigger_table: &BTreeTable,
-    trigger_table_name: &str,
-    target_table_name: &str,
-    old_col_norm: &str,
-    new_col_norm: &str,
-    outer_target_qualifiers: &[String],
-) -> Result<()> {
-    match select_table {
-        ast::SelectTable::Select(select, _) => {
-            rewrite_select_for_column_rename(
-                select,
-                trigger_table,
-                trigger_table_name,
-                target_table_name,
-                old_col_norm,
-                new_col_norm,
-                outer_target_qualifiers,
-            )?;
-        }
-        ast::SelectTable::Sub(from_clause, _) => {
-            rewrite_from_clause_for_column_rename(
-                from_clause,
-                trigger_table,
-                trigger_table_name,
-                target_table_name,
-                old_col_norm,
-                new_col_norm,
-                outer_target_qualifiers,
-            )?;
-        }
-        ast::SelectTable::TableCall(_, args, _) => {
-            for arg in args {
-                walk_expr_for_column_rename(
-                    arg,
-                    trigger_table,
-                    trigger_table_name,
-                    target_table_name,
-                    old_col_norm,
-                    new_col_norm,
-                    outer_target_qualifiers,
-                )?;
-            }
-        }
-        ast::SelectTable::Table(_, _, _) => {
-            // Table reference, no expressions
-        }
-    }
-    Ok(())
-}
-
-/// Rewrite expressions in a Window definition
-fn rewrite_window_for_column_rename(
-    window: &mut ast::Window,
-    trigger_table: &BTreeTable,
-    trigger_table_name: &str,
-    target_table_name: &str,
-    old_col_norm: &str,
-    new_col_norm: &str,
-    visible_target_qualifiers: &[String],
-) -> Result<()> {
-    // Rewrite PARTITION BY expressions
-    for expr in &mut window.partition_by {
-        walk_expr_for_column_rename(
-            expr,
-            trigger_table,
-            trigger_table_name,
-            target_table_name,
-            old_col_norm,
-            new_col_norm,
-            visible_target_qualifiers,
-        )?;
-    }
-
-    // Rewrite ORDER BY expressions
-    for sorted_col in &mut window.order_by {
-        walk_expr_for_column_rename(
-            &mut sorted_col.expr,
-            trigger_table,
-            trigger_table_name,
-            target_table_name,
-            old_col_norm,
-            new_col_norm,
-            visible_target_qualifiers,
-        )?;
-    }
-
     Ok(())
 }
 
@@ -4201,133 +3517,30 @@ fn merge_target_qualifiers(outer: &[String], local: &[String]) -> Vec<String> {
     merged
 }
 
-/// Rewrite a single expression's column reference
-///
-/// Handles column references in trigger expressions:
-/// - NEW.column and OLD.column: Always refer to the trigger's owning table
-/// - Qualified references (e.g., u.x): Refer to the specified table
-/// - Unqualified references (e.g., x): Resolution order:
-///   1. If `context_table` is provided (UPDATE/DELETE WHERE clauses), check the context table first
-///   2. Otherwise, check the trigger's owning table
-///   3. If `from_target` is provided (FROM clause has target table), rename the column
-///
-/// `context_table`: Optional tuple of (table, normalized_name, is_renaming) for UPDATE/DELETE
-///                  target tables.
-/// `from_target`: Normalized target table name when the enclosing SELECT's FROM clause
-///                references the table being renamed.
+/// Rewrite a trigger command to replace column references.
 #[allow(clippy::too_many_arguments)]
-fn rewrite_expr_column_ref_with_context(
-    e: &mut ast::Expr,
-    trigger_table: &BTreeTable,
-    trigger_table_name: &str,
-    old_col_norm: &str,
-    new_col_norm: &str,
-    is_renaming_trigger_table: bool,
-    context_table: Option<(&BTreeTable, &String, bool)>,
-    from_target_qualifiers: &[String],
-) -> Result<()> {
-    match e {
-        ast::Expr::Qualified(ns, col) | ast::Expr::DoublyQualified(_, ns, col) => {
-            let ns_norm = normalize_ident(ns.as_str());
-            let col_norm = normalize_ident(col.as_str());
-
-            // Check if this is NEW.column or OLD.column
-            if (ns_norm.eq("new") || ns_norm.eq("old")) && col_norm == *old_col_norm {
-                // NEW.x and OLD.x always refer to the trigger's owning table
-                if is_renaming_trigger_table && trigger_table.get_column(&col_norm).is_some() {
-                    *col = ast::Name::from_string(new_col_norm);
-                }
-            } else if col_norm == *old_col_norm {
-                // This is a qualified column reference like u.x or t.x
-                // Check if it refers to the context table (UPDATE/DELETE target) or trigger table
-                if let Some((_, ctx_name_norm, is_renaming_ctx)) = context_table {
-                    if ns_norm == *ctx_name_norm && is_renaming_ctx {
-                        // Qualified reference to context table (e.g., u.x where u is UPDATE target)
-                        *col = ast::Name::from_string(new_col_norm);
-                    }
-                }
-                // Also check if it's a qualified reference to the trigger's owning table
-                // (e.g., t.x in a trigger on table t).
-                // Only do this when there's no context table (i.e., in a SELECT), or when
-                // the trigger table IS the context table. In UPDATE/DELETE on a different
-                // table, qualified refs to the trigger table (t.x) are invalid in SQLite
-                // — only NEW.x/OLD.x are allowed — so we must not rename them.
-                if is_renaming_trigger_table {
-                    let trigger_table_name_norm = normalize_ident(trigger_table_name);
-                    if ns_norm == trigger_table_name_norm
-                        && trigger_table.get_column(&col_norm).is_some()
-                    {
-                        // If we're inside an UPDATE/DELETE targeting a different table,
-                        // a qualified ref to the trigger table (t.x) is invalid in SQLite.
-                        let ctx_is_different_table = context_table
-                            .as_ref()
-                            .is_some_and(|(_, ctx_name, _)| **ctx_name != trigger_table_name_norm);
-                        if ctx_is_different_table {
-                            return Err(LimboError::ParseError(format!(
-                                "no such column: {trigger_table_name}.{col_norm}"
-                            )));
-                        }
-                        *col = ast::Name::from_string(new_col_norm);
-                    }
-                }
-                // Check if it's a qualified reference to a FROM clause table that is the
-                // rename target (e.g., src.b in SELECT src.b FROM src)
-                if from_target_qualifiers.contains(&ns_norm) {
-                    *col = ast::Name::from_string(new_col_norm);
-                }
-            }
-        }
-        ast::Expr::Id(col) => {
-            // Unqualified column reference
-            let col_norm = normalize_ident(col.as_str());
-            if col_norm == *old_col_norm {
-                // Check context table first (for UPDATE/DELETE WHERE clauses)
-                if let Some((ctx_table, _, is_renaming_ctx)) = context_table {
-                    if ctx_table.get_column(&col_norm).is_some() {
-                        // This refers to the context table (UPDATE/DELETE target)
-                        if is_renaming_ctx {
-                            *e = ast::Expr::Id(ast::Name::from_string(new_col_norm));
-                        }
-                        return Ok(());
-                    }
-                }
-                // Check trigger's owning table or FROM clause target table
-                if (is_renaming_trigger_table && trigger_table.get_column(&col_norm).is_some())
-                    || !from_target_qualifiers.is_empty()
-                {
-                    *e = ast::Expr::Id(ast::Name::from_string(new_col_norm));
-                }
-            }
-        }
-        _ => {}
-    }
-    Ok(())
-}
-
-/// Rewrite a single expression's column reference (convenience wrapper for non-context cases)
-fn rewrite_expr_column_ref(
-    e: &mut ast::Expr,
+fn rewrite_trigger_cmd_for_column_rename(
+    cmd: ast::TriggerCmd,
     trigger_table: &BTreeTable,
     trigger_table_name: &str,
     target_table_name: &str,
     old_col_norm: &str,
     new_col_norm: &str,
-    from_target_qualifiers: &[String],
-) -> Result<()> {
-    let trigger_table_name_norm = normalize_ident(trigger_table_name);
-    let target_table_name_norm = normalize_ident(target_table_name);
-    let is_renaming_trigger_table = trigger_table_name_norm == target_table_name_norm;
-
-    rewrite_expr_column_ref_with_context(
-        e,
+    database_id: usize,
+    resolver: &Resolver,
+) -> Result<ast::TriggerCmd> {
+    let mut cmd = cmd;
+    apply_trigger_cmd_for_column_rename(
+        ColumnRenameMode::Rewrite { new_col_norm },
+        &mut cmd,
         trigger_table,
         trigger_table_name,
+        target_table_name,
         old_col_norm,
-        new_col_norm,
-        is_renaming_trigger_table,
-        None,
-        from_target_qualifiers,
-    )
+        database_id,
+        resolver,
+    )?;
+    Ok(cmd)
 }
 
 /// Validate all column references in a trigger after a DROP COLUMN operation.
