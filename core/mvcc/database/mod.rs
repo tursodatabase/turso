@@ -1283,6 +1283,26 @@ impl<Clock: LogicalClock> CommitStateMachine<Clock> {
         // reference it. The SkipSet iteration order sorts by table_id (most negative
         // first), which would otherwise place data table rows (e.g. table_id=-3)
         // before schema rows (table_id=-1).
+
+        // Remap a table_id to its canonical form for the log. After checkpoint,
+        // a table's in-memory table_id (e.g. -53) may differ from -(root_page)
+        // (e.g. -58). On recovery, bootstrap reconstructs the map using
+        // -(root_page), so log records must use that canonical form to be found.
+        let canonicalize_table_id = |version: &mut RowVersion| {
+            let table_id = version.row.id.table_id;
+            if table_id == SQLITE_SCHEMA_MVCC_TABLE_ID {
+                return;
+            }
+            if let Some(entry) = mvcc_store.table_id_to_rootpage.get(&table_id) {
+                if let Some(root_page) = *entry.value() {
+                    let canonical = MVTableId::from(-(root_page as i64));
+                    if canonical != table_id {
+                        version.row.id.table_id = canonical;
+                    }
+                }
+            }
+        };
+
         let collect_versions = |id: &RowID,
                                 log_record: &mut LogRecord,
                                 did_commit_schema: &mut bool| {
@@ -1314,6 +1334,7 @@ impl<Clock: LogicalClock> CommitStateMachine<Clock> {
                         }
                     }
                     if changed {
+                        canonicalize_table_id(&mut committed_version);
                         mvcc_store
                             .insert_version_raw(&mut log_record.row_versions, committed_version);
                     }
@@ -1347,6 +1368,7 @@ impl<Clock: LogicalClock> CommitStateMachine<Clock> {
                             }
                         }
                         if changed {
+                            canonicalize_table_id(&mut committed_version);
                             mvcc_store.insert_version_raw(
                                 &mut log_record.row_versions,
                                 committed_version,
