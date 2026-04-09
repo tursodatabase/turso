@@ -134,7 +134,7 @@ enum DmlColumnRegisters {
 #[derive(Clone)]
 pub struct DmlColumnContext {
     registers: DmlColumnRegisters,
-    row_id_alias_columns: ColumnUsedMask,
+    rowid_alias_col: Option<usize>,
     /// Bitset marking which columns are virtual generated.
     virtual_mask: ColumnUsedMask,
     /// rank-indexed by `virtual_mask`.
@@ -148,28 +148,41 @@ impl DmlColumnContext {
         rowid_reg: usize,
         layout: ColumnLayout,
     ) -> Self {
-        let (row_id_alias_columns, virtual_mask, virtual_data) = Self::extract_column_info(columns);
+        let mut rowid_alias_col = None;
+        let mut virtual_mask = BitSet::default();
+        let mut virtual_data = Vec::new();
+
+        for (idx, col) in columns.iter().enumerate() {
+            if col.is_rowid_alias() {
+                rowid_alias_col = Some(idx);
+            }
+            if let GeneratedType::Virtual { resolved, .. } = col.generated_type() {
+                virtual_mask.set(idx);
+                virtual_data.push((resolved.clone(), col.affinity()));
+            }
+        }
+
         Self {
             registers: DmlColumnRegisters::Layout {
                 base_reg,
                 rowid_reg,
                 layout,
             },
-            row_id_alias_columns,
+            rowid_alias_col,
             virtual_mask,
             virtual_data,
         }
     }
 
     pub fn from_column_reg_mapping<'a>(pairs: impl Iterator<Item = (&'a Column, usize)>) -> Self {
-        let mut row_id_alias_columns = ColumnUsedMask::default();
+        let mut rowid_alias_col = None;
         let mut virtual_mask = ColumnUsedMask::default();
         let mut virtual_data = Vec::new();
         let mut column_regs = Vec::new();
         for (idx, (col, reg)) in pairs.enumerate() {
             column_regs.push(reg);
             if col.is_rowid_alias() {
-                row_id_alias_columns.set(idx);
+                rowid_alias_col = Some(idx);
             }
             if let GeneratedType::Virtual { resolved, .. } = col.generated_type() {
                 virtual_mask.set(idx);
@@ -178,7 +191,7 @@ impl DmlColumnContext {
         }
         Self {
             registers: DmlColumnRegisters::Indexed { column_regs },
-            row_id_alias_columns,
+            rowid_alias_col,
             virtual_mask,
             virtual_data,
         }
@@ -202,7 +215,7 @@ impl DmlColumnContext {
                 rowid_reg,
                 layout,
             } => {
-                if self.row_id_alias_columns.get(col_idx) {
+                if self.rowid_alias_col == Some(col_idx) {
                     *rowid_reg
                 } else {
                     layout.to_register(*base_reg, col_idx)
@@ -214,20 +227,20 @@ impl DmlColumnContext {
 
     fn extract_column_info(
         columns: &[Column],
-    ) -> (ColumnUsedMask, ColumnUsedMask, Vec<(Box<Expr>, Affinity)>) {
-        let mut row_id_aliases = ColumnUsedMask::default();
+    ) -> (Option<usize>, ColumnUsedMask, Vec<(Box<Expr>, Affinity)>) {
+        let mut rowid_alias_col = None;
         let mut virtual_mask = ColumnUsedMask::default();
         let mut virtual_data = Vec::new();
         for (idx, col) in columns.iter().enumerate() {
             if col.is_rowid_alias() {
-                row_id_aliases.set(idx);
+                rowid_alias_col = Some(idx);
             }
             if let GeneratedType::Virtual { resolved, .. } = col.generated_type() {
                 virtual_mask.set(idx);
                 virtual_data.push((resolved.clone(), col.affinity()));
             }
         }
-        (row_id_aliases, virtual_mask, virtual_data)
+        (rowid_alias_col, virtual_mask, virtual_data)
     }
 }
 
