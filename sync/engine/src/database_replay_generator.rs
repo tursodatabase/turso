@@ -238,15 +238,14 @@ impl DatabaseReplayGenerator {
                     let mut ast = parser
                         .next()
                         .ok_or_else(|| {
-                            Error::DatabaseTapeError(format!("unexpected DDL query: {}", sql))
+                            Error::DatabaseTapeError(format!("unexpected DDL query: {sql}"))
                         })?
                         .map_err(|e| {
-                            Error::DatabaseTapeError(format!("unexpected DDL query {}: {}", e, sql))
+                            Error::DatabaseTapeError(format!("unexpected DDL query {e}: {sql}"))
                         })?;
                     let turso_parser::ast::Cmd::Stmt(stmt) = &mut ast else {
                         return Err(Error::DatabaseTapeError(format!(
-                            "unexpected DDL query: {}",
-                            sql
+                            "unexpected DDL query: {sql}"
                         )));
                     };
                     match stmt {

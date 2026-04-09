@@ -13,6 +13,9 @@ use turso::params::Params;
 
 use crate::measure::{MemoryReport, MemorySnapshot, file_size, take_snapshot};
 
+// Workspace clippy enables `turso`'s `mimalloc` feature, so avoid registering
+// a second allocator during lint-only builds.
+#[cfg(not(clippy))]
 #[global_allocator]
 static ALLOC: dhat::Alloc = dhat::Alloc;
 

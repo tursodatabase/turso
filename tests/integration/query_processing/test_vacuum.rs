@@ -14,7 +14,11 @@ fn run_integrity_check(conn: &Arc<Connection>) -> String {
         .filter_map(|row| {
             row.into_iter().next().and_then(|v| {
                 if let Value::Text(text) = v {
-                    Some(text.as_str().to_string())
+                    Some(
+                        text.try_as_str()
+                            .expect("integrity_check output must be valid UTF-8")
+                            .to_string(),
+                    )
                 } else {
                     None
                 }

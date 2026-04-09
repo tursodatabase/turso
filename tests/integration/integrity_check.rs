@@ -28,7 +28,11 @@ fn run_integrity_check(conn: &Arc<turso_core::Connection>) -> String {
         .filter_map(|row| {
             row.into_iter().next().and_then(|v| {
                 if let Value::Text(text) = v {
-                    Some(text.as_str().to_string())
+                    Some(
+                        text.try_as_str()
+                            .expect("integrity_check output must be valid UTF-8")
+                            .to_string(),
+                    )
                 } else {
                     None
                 }
@@ -48,7 +52,11 @@ fn run_quick_check(conn: &Arc<turso_core::Connection>) -> String {
         .filter_map(|row| {
             row.into_iter().next().and_then(|v| {
                 if let Value::Text(text) = v {
-                    Some(text.as_str().to_string())
+                    Some(
+                        text.try_as_str()
+                            .expect("quick_check output must be valid UTF-8")
+                            .to_string(),
+                    )
                 } else {
                     None
                 }
@@ -97,7 +105,11 @@ fn run_integrity_check_or_error(conn: &Arc<turso_core::Connection>) -> Result<St
                 .filter_map(|row| {
                     row.into_iter().next().and_then(|v| {
                         if let Value::Text(text) = v {
-                            Some(text.as_str().to_string())
+                            Some(
+                                text.try_as_str()
+                                    .expect("integrity_check output must be valid UTF-8")
+                                    .to_string(),
+                            )
                         } else {
                             None
                         }
@@ -213,7 +225,11 @@ fn test_integrity_check_max_errors(db: TempDatabase) {
         .filter_map(|row| {
             row.into_iter().next().and_then(|v| {
                 if let Value::Text(text) = v {
-                    Some(text.as_str().to_string())
+                    Some(
+                        text.try_as_str()
+                            .expect("integrity_check output must be valid UTF-8")
+                            .to_string(),
+                    )
                 } else {
                     None
                 }
