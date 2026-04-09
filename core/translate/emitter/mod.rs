@@ -289,17 +289,10 @@ impl<'a> Resolver<'a> {
             }
         };
 
-        let schema = {
-            let mut schemas = self.database_schemas.write();
-            schemas
-                .entry(database_id)
-                .or_insert_with(|| loaded_schema)
-                .clone()
-        };
         self.non_main_schema_cache
             .borrow_mut()
-            .insert(database_id, schema.clone());
-        schema
+            .insert(database_id, loaded_schema.clone());
+        loaded_schema
     }
 
     /// Set trigger database context to restrict table resolution to the trigger's database.

@@ -248,7 +248,6 @@ impl Connection {
         Arc::new(schema)
     }
 
-    #[cfg(feature = "fs")]
     fn make_temp_database_opts(&self) -> DatabaseOpts {
         DatabaseOpts::new()
             .with_views(self.db.experimental_views_enabled())
@@ -257,9 +256,22 @@ impl Connection {
             .with_generated_columns(self.db.experimental_generated_columns_enabled())
     }
 
+    fn effective_temp_store(&self) -> crate::TempStore {
+        let temp_store = self.get_temp_store();
+        #[cfg(feature = "fs")]
+        {
+            temp_store
+        }
+        #[cfg(not(feature = "fs"))]
+        {
+            let _ = temp_store;
+            crate::TempStore::Memory
+        }
+    }
+
     #[cfg(feature = "fs")]
     fn create_temp_database(&self) -> Result<TempDatabase> {
-        let temp_store = self.get_temp_store();
+        let temp_store = self.effective_temp_store();
         let db_opts = self.make_temp_database_opts();
         let page_size = self.get_page_size();
 
@@ -328,9 +340,22 @@ impl Connection {
 
     #[cfg(not(feature = "fs"))]
     fn create_temp_database(&self) -> Result<TempDatabase> {
-        Err(LimboError::InvalidArgument(
-            "temp tables are not available in this build (no-fs)".to_string(),
-        ))
+        let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+        let db = Database::open_file_with_flags(
+            io,
+            crate::util::MEMORY_PATH,
+            OpenFlags::Create,
+            self.make_temp_database_opts(),
+            None,
+        )?;
+        let pager = Arc::new(db._init(None)?);
+        pager.set_initial_page_size(self.get_page_size())?;
+        Ok(TempDatabase {
+            db,
+            pager,
+            #[cfg(not(target_family = "wasm"))]
+            _temp_dir: None,
+        })
     }
 
     pub(crate) fn ensure_temp_database(&self) -> Result<()> {
@@ -1705,6 +1730,10 @@ impl Connection {
         if database_id == crate::MAIN_DB_ID {
             self.with_schema_mut(f)
         } else {
+            // For attached databases, update a connection-local copy of the schema.
+            // We don't update the shared db.schema until after the WAL commit, so
+            // other connections won't see uncommitted schema changes (which would
+            // cause SchemaUpdated mismatches).
             let mut schemas = self.database_schemas.write();
             let schema_arc = schemas.entry(database_id).or_insert_with(|| {
                 if database_id == crate::TEMP_DB_ID {
@@ -2176,7 +2205,7 @@ impl Connection {
             return schema;
         }
 
-        let loaded_schema = match database_id {
+        match database_id {
             crate::TEMP_DB_ID => self
                 .temp_database
                 .read()
@@ -2192,13 +2221,7 @@ impl Connection {
                 let schema = db.schema.lock().clone();
                 schema
             }
-        };
-
-        let mut schemas = self.database_schemas.write();
-        schemas
-            .entry(database_id)
-            .or_insert_with(|| loaded_schema)
-            .clone()
+        }
     }
 
     /// Publish a connection-local non-main schema after commit.
