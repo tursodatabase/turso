@@ -1419,7 +1419,7 @@ pub(crate) fn cursor_to_registers(
     table: &BTreeTable,
     cursor_id: usize,
     rowid_reg: usize,
-    target_columns: &[usize],
+    target_columns: impl IntoIterator<Item = usize>,
 ) -> DmlColumnContext {
     let dependencies = stored_deps_of_virtual(&table.columns, target_columns);
     let base = program.alloc_registers(dependencies.count());
@@ -1483,7 +1483,7 @@ pub(crate) fn emit_index_column_value_old_image(
     } else if let Some((table, generated_column)) =
         generated_column(&program, table_cursor_id, idx_col)
     {
-        cursor_to_registers(program, &table, table_cursor_id, 0, &[idx_col.pos_in_table]);
+        cursor_to_registers(program, &table, table_cursor_id, 0, [idx_col.pos_in_table]);
 
         emit_table_column(
             program,

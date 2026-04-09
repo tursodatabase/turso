@@ -2715,7 +2715,7 @@ pub(crate) fn columns_affected_by_update(
 
 /// returns a bitset containing the indexes of the stored columns that the virtual columns in
 /// `targets` depends on.
-pub(crate) fn stored_deps_of_virtual(columns: &[Column], targets: &[usize]) -> ColumnUsedMask {
+pub(crate) fn stored_deps_of_virtual(columns: &[Column], targets: impl IntoIterator<Item = usize>) -> ColumnUsedMask {
     type Bitset = ColumnUsedMask;
 
     fn collect_column_dependencies_of_gencol(expr: &Expr, columns: &[Column], out: &mut Bitset) {
@@ -2749,7 +2749,7 @@ pub(crate) fn stored_deps_of_virtual(columns: &[Column], targets: &[usize]) -> C
     let mut dependencies = Bitset::default();
     let mut visited = Bitset::default();
     let mut pending = Bitset::default();
-    for &idx in targets {
+    for idx in targets {
         pending.set(idx);
     }
     loop {
