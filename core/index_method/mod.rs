@@ -149,7 +149,11 @@ pub trait IndexMethodCursor {
     }
 
     /// Optimize the index by merging segments or performing other maintenance.
-    fn optimize(&mut self, _connection: &Arc<Connection>) -> Result<IOResult<()>> {
+    fn optimize(
+        &mut self,
+        _connection: &Arc<Connection>,
+        _database_id: usize,
+    ) -> Result<IOResult<()>> {
         Ok(IOResult::Done(()))
     }
 

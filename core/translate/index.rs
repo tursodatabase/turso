@@ -1130,28 +1130,31 @@ pub fn translate_optimize(
     if let Some(name) = idx_name {
         // Optimize a specific index
         let idx_name = normalize_ident(name.name.as_str());
+        let database_id = resolver.resolve_existing_index_database_id(&name)?;
         let mut found = false;
 
-        for val in resolver.schema().indexes.values() {
-            for idx in val {
-                if idx.name == idx_name {
-                    if idx.index_method.is_some() && !idx.is_backing_btree_index() {
-                        indexes_to_optimize.push(idx.clone());
-                    } else {
-                        // Not an index method index - nothing to optimize
-                        tracing::debug!(
-                            "OPTIMIZE INDEX: {} is not an index method index, nothing to optimize",
-                            idx_name
-                        );
+        resolver.with_schema(database_id, |schema| {
+            for val in schema.indexes.values() {
+                for idx in val {
+                    if idx.name == idx_name {
+                        if idx.index_method.is_some() && !idx.is_backing_btree_index() {
+                            indexes_to_optimize.push((database_id, idx.clone()));
+                        } else {
+                            // Not an index method index - nothing to optimize
+                            tracing::debug!(
+                                "OPTIMIZE INDEX: {} is not an index method index, nothing to optimize",
+                                idx_name
+                            );
+                        }
+                        found = true;
+                        break;
                     }
-                    found = true;
+                }
+                if found {
                     break;
                 }
             }
-            if found {
-                break;
-            }
-        }
+        });
 
         if !found {
             return Err(LimboError::InvalidArgument(format!(
@@ -1159,13 +1162,17 @@ pub fn translate_optimize(
             )));
         }
     } else {
-        // Optimize all index method indexes
-        for val in resolver.schema().indexes.values() {
-            for idx in val {
-                if idx.index_method.is_some() && !idx.is_backing_btree_index() {
-                    indexes_to_optimize.push(idx.clone());
+        // Optimize all index method indexes across all visible databases.
+        for (database_id, _, _) in connection.list_all_databases() {
+            resolver.with_schema(database_id, |schema| {
+                for val in schema.indexes.values() {
+                    for idx in val {
+                        if idx.index_method.is_some() && !idx.is_backing_btree_index() {
+                            indexes_to_optimize.push((database_id, idx.clone()));
+                        }
+                    }
                 }
-            }
+            });
         }
 
         if indexes_to_optimize.is_empty() {
@@ -1175,10 +1182,10 @@ pub fn translate_optimize(
     }
 
     // Emit optimize instructions for each index method index
-    for idx in &indexes_to_optimize {
+    for (database_id, idx) in &indexes_to_optimize {
         let cursor_id = program.alloc_cursor_index(None, idx)?;
         program.emit_insn(Insn::IndexMethodOptimize {
-            db: crate::MAIN_DB_ID,
+            db: *database_id,
             cursor_id,
         });
     }
