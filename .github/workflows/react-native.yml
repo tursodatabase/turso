@@ -177,6 +177,11 @@ jobs:
         run: bundle exec pod install
         working-directory: examples/react-native/ios
 
+      - name: Verify xcframework
+        run: |
+          ls -la bindings/react-native/libs/ios/turso-sync-sdk-kit.xcframework/ios-arm64-simulator/turso-sync-sdk-kit.framework/
+          file bindings/react-native/libs/ios/turso-sync-sdk-kit.xcframework/ios-arm64-simulator/turso-sync-sdk-kit.framework/turso-sync-sdk-kit
+
       - name: Build iOS example app
         run: |
           xcodebuild build \
