@@ -111,6 +111,18 @@ test('blobs', () => {
     expect(rows).toEqual([{ x: Buffer.from([16, 32]) }])
 })
 
+test('raw invalid text is returned as bytes', () => {
+    const db = new Database(":memory:");
+    db.exec("CREATE TABLE t(val TEXT)");
+    db.exec("INSERT INTO t VALUES(CAST(X'FF' AS TEXT))");
+
+    const stmt = db.prepare("SELECT val FROM t");
+    stmt.raw(true);
+
+    const rows = stmt.all();
+    expect(rows).toEqual([[Buffer.from([0xFF])]])
+})
+
 test('encryption', () => {
     const path = `test-encryption-${(Math.random() * 10000) | 0}.db`;
     const hexkey = 'b1bbfda4f589dc9daaf004fe21111e00dc00c98237102f5c7002a5669fc76327';

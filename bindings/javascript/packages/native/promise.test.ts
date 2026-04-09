@@ -270,6 +270,18 @@ test('blobs', async () => {
     expect(rows).toEqual([{ x: Buffer.from([16, 32]) }])
 })
 
+test('raw invalid text is returned as bytes', async () => {
+    const db = await connect(":memory:");
+    await db.exec("CREATE TABLE t(val TEXT)");
+    await db.exec("INSERT INTO t VALUES(CAST(X'FF' AS TEXT))");
+
+    const stmt = db.prepare("SELECT val FROM t");
+    stmt.raw(true);
+
+    const rows = await stmt.all();
+    expect(rows).toEqual([[Buffer.from([0xFF])]])
+})
+
 
 test('example-1', async () => {
     const db = await connect(':memory:');
