@@ -113,7 +113,7 @@ pub fn create_index_for_table(
 
     if col_names.is_empty() {
         let temporary = match index_database.as_deref() {
-            Some("temp") => Some(TemporaryKeyword::Temp),
+            Some("temp") => Some(TemporaryKeyword::random()),
             _ => None,
         };
         let index_name = match index_database.as_deref() {
@@ -151,11 +151,7 @@ pub fn create_index_for_table(
                 col_strategies.prop_map(move |columns| {
                     let index_name = format!("idx_{table_name}_{index_suffix}");
                     let temporary = match index_database.as_deref() {
-                        Some("temp") => Some(if if_not_exists {
-                            TemporaryKeyword::Temporary
-                        } else {
-                            TemporaryKeyword::Temp
-                        }),
+                        Some("temp") => Some(TemporaryKeyword::random()),
                         _ => None,
                     };
                     let qualified_index_name = match index_database.as_deref() {
@@ -214,7 +210,7 @@ pub fn create_index(
 
             if col_names.is_empty() {
                 let temporary = match index_database.as_deref() {
-                    Some("temp") => Some(TemporaryKeyword::Temp),
+                    Some("temp") => Some(TemporaryKeyword::random()),
                     _ => None,
                 };
                 let index_name = match index_database.as_deref() {
@@ -255,11 +251,7 @@ pub fn create_index(
                         col_strategies.prop_map(move |columns| {
                             let index_name = format!("idx_{table_name}_{index_suffix}");
                             let temporary = match index_database.as_deref() {
-                                Some("temp") => Some(if if_not_exists {
-                                    TemporaryKeyword::Temporary
-                                } else {
-                                    TemporaryKeyword::Temp
-                                }),
+                                Some("temp") => Some(TemporaryKeyword::random()),
                                 _ => None,
                             };
                             let qualified_index_name = match index_database.as_deref() {
