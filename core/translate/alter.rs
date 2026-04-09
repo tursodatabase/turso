@@ -944,7 +944,7 @@ pub fn translate_alter_table(
 
             btree.columns.remove(dropped_index);
 
-            let sql = btree.to_sql().replace('\'', "''");
+            let sql = escape_sql_string_literal(&btree.to_sql());
 
             let escaped_table_name = escape_sql_string_literal(table_name);
             let stmt = format!(
@@ -1450,7 +1450,7 @@ pub fn translate_alter_table(
             );
 
             for (trigger_name, new_sql) in temp_triggers_to_rewrite {
-                let escaped_sql = new_sql.replace('\'', "''");
+                let escaped_sql = escape_sql_string_literal(&new_sql);
                 let escaped_trigger_name = escape_sql_string_literal(&trigger_name);
                 let qualified_schema_table = schema_table_name_for_db(resolver, crate::TEMP_DB_ID);
                 let update_stmt = format!(
@@ -1812,7 +1812,7 @@ pub fn translate_alter_table(
 
             // Update trigger SQL for renamed columns
             for (trigger_database_id, trigger_name, new_sql) in triggers_to_rewrite {
-                let escaped_sql = new_sql.replace('\'', "''");
+                let escaped_sql = escape_sql_string_literal(&new_sql);
                 let escaped_trigger_name = escape_sql_string_literal(&trigger_name);
                 let qualified_schema_table =
                     schema_table_name_for_db(resolver, trigger_database_id);
@@ -1848,7 +1848,7 @@ pub fn translate_alter_table(
 
             // Update view SQL for renamed columns
             for (view_name, new_sql) in views_to_rewrite {
-                let escaped_sql = new_sql.replace('\'', "''");
+                let escaped_sql = escape_sql_string_literal(&new_sql);
                 let update_stmt = format!(
                     r#"
                         UPDATE {qualified_schema_table}
