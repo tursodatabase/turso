@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use turso_core::{Connection, LimboError, Result, Statement, StepResult, Value};
 
-use crate::common::{assert_checkpoint_preserves_content, ExecRows, TempDatabase};
+use crate::common::{assert_checkpoint_preserves_content, TempDatabase};
 
 // Test a scenario where there are two concurrent deferred transactions:
 //
@@ -1604,30 +1604,6 @@ fn test_wal_savepoint_rollback_on_constraint_violation() {
     let stmt = conn.query("SELECT COUNT(*) FROM t").unwrap().unwrap();
     let row = helper_read_single_row(stmt);
     assert_eq!(row[0], Value::from_i64(1001));
-}
-
-#[turso_macros::test]
-fn test_named_savepoint_rollback_reverts_temp_table_changes(tmp_db: TempDatabase) -> Result<()> {
-    let conn = tmp_db.connect_limbo();
-
-    conn.execute("CREATE TABLE main_t(x INTEGER)")?;
-    conn.execute("CREATE TEMP TABLE temp_t(x INTEGER)")?;
-
-    conn.execute("BEGIN")?;
-    conn.execute("INSERT INTO main_t VALUES (1)")?;
-    conn.execute("SAVEPOINT sp1")?;
-    conn.execute("INSERT INTO temp.temp_t VALUES (2)")?;
-    conn.execute("ROLLBACK TO sp1")?;
-    conn.execute("RELEASE sp1")?;
-    conn.execute("COMMIT")?;
-
-    let main_rows: Vec<(i64,)> = conn.exec_rows("SELECT x FROM main_t ORDER BY x");
-    assert_eq!(main_rows, vec![(1,)]);
-
-    let temp_rows: Vec<(i64,)> = conn.exec_rows("SELECT x FROM temp.temp_t ORDER BY x");
-    assert!(temp_rows.is_empty(), "temp rows should be rolled back");
-
-    Ok(())
 }
 
 #[turso_macros::test]

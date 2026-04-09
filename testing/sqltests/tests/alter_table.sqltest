@@ -1593,6 +1593,17 @@ expect {
     10
 }
 
+test alter-table-rename-column-temp-table-rejects-invalid-trigger-rewrite {
+    CREATE TEMP TABLE t(a,b);
+    CREATE TRIGGER tr AFTER INSERT ON temp.t BEGIN
+        INSERT INTO t VALUES(new.a,new.b);
+    END;
+    ALTER TABLE t RENAME COLUMN b TO c;
+}
+expect error {
+    error in trigger tr.*no such column: new.c
+}
+
 test alter-table-rename-column-temp-trigger-attached-cross-table {
     ATTACH ':memory:' AS aux;
     CREATE TABLE aux.src_temp_aux (a INTEGER PRIMARY KEY, b);

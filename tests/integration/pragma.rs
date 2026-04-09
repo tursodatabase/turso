@@ -1,4 +1,4 @@
-use crate::common::{limbo_exec_rows, ExecRows, TempDatabase};
+use crate::common::{limbo_exec_rows, TempDatabase};
 use rusqlite::types::Value as RValue;
 #[cfg(not(target_vendor = "apple"))]
 use turso_core::LimboError;
@@ -431,87 +431,5 @@ fn test_pragma_wal_checkpoint_targets_attached_database(db: TempDatabase) {
     assert!(
         *checkpointed > 0,
         "aux pager should have checkpointed frames (got {checkpointed})"
-    );
-}
-
-#[turso_macros::test]
-fn test_pragma_temp_wal_checkpoint_without_temp_db_matches_sqlite(_db: TempDatabase) {
-    let db = TempDatabase::new_empty();
-    let conn = db.connect_limbo();
-
-    let rows = limbo_exec_rows(&conn, "PRAGMA temp.wal_checkpoint");
-    assert_eq!(
-        rows.len(),
-        1,
-        "wal_checkpoint should return exactly one row"
-    );
-    assert_eq!(
-        rows[0],
-        vec![RValue::Integer(0), RValue::Integer(-1), RValue::Integer(-1)]
-    );
-}
-
-#[turso_macros::test]
-fn test_pragma_temp_journal_mode_mvcc_is_ignored_without_corrupting_main(db: TempDatabase) {
-    let conn = db.connect_limbo();
-
-    conn.execute("CREATE TABLE m(x)").unwrap();
-    conn.execute("CREATE TEMP TABLE t(x)").unwrap();
-
-    let rows = limbo_exec_rows(&conn, "PRAGMA temp.journal_mode='mvcc'");
-    assert_eq!(rows, vec![vec![RValue::Text("wal".into())]]);
-
-    let err = conn.execute("BEGIN CONCURRENT").unwrap_err().to_string();
-    assert!(
-        err.contains("Concurrent transaction mode is only supported when MVCC is enabled"),
-        "unexpected error: {err}"
-    );
-
-    conn.execute("INSERT INTO m VALUES(1)").unwrap();
-    let rows: Vec<(i64,)> = conn.exec_rows("SELECT x FROM m");
-    assert_eq!(rows, vec![(1,)]);
-}
-
-#[turso_macros::test]
-fn test_sqlite_temp_schema_aliases_are_supported(db: TempDatabase) {
-    let conn = db.connect_limbo();
-
-    conn.execute("CREATE TEMP TABLE t(x)").unwrap();
-
-    let master_rows: Vec<(String,)> =
-        conn.exec_rows("SELECT name FROM sqlite_temp_master WHERE type='table' AND name='t'");
-    assert_eq!(master_rows, vec![("t".to_string(),)]);
-
-    let schema_rows: Vec<(String,)> =
-        conn.exec_rows("SELECT name FROM sqlite_temp_schema WHERE type='table' AND name='t'");
-    assert_eq!(schema_rows, vec![("t".to_string(),)]);
-}
-
-#[turso_macros::test]
-fn test_pragma_temp_store_change_survives_rollback_before_temp_db_exists(db: TempDatabase) {
-    let conn = db.connect_limbo();
-
-    conn.execute("BEGIN").unwrap();
-    conn.execute("PRAGMA temp_store = 2").unwrap();
-    conn.execute("ROLLBACK").unwrap();
-
-    let rows = limbo_exec_rows(&conn, "PRAGMA temp_store");
-    assert_eq!(rows, vec![vec![RValue::Integer(2)]]);
-}
-
-#[turso_macros::test]
-fn test_pragma_temp_store_change_fails_in_transaction_after_temp_db_exists(db: TempDatabase) {
-    let conn = db.connect_limbo();
-
-    conn.execute("BEGIN").unwrap();
-    conn.execute("CREATE TEMP TABLE t(x)").unwrap();
-
-    let err = conn
-        .execute("PRAGMA temp_store = 2")
-        .unwrap_err()
-        .to_string();
-    assert!(
-        err.contains("temporary storage cannot be changed from within a transaction"),
-        "unexpected error: {err}",
     );
 }

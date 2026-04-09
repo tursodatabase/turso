@@ -115,6 +115,16 @@ expect {
     1
 }
 
+test sqlite-temp-schema-aliases-are-supported {
+    CREATE TEMP TABLE t_alias(x INTEGER);
+    SELECT name FROM sqlite_temp_master WHERE type = 'table' AND name = 't_alias';
+    SELECT name FROM sqlite_temp_schema WHERE type = 'table' AND name = 't_alias';
+}
+expect {
+    t_alias
+    t_alias
+}
+
 test sqlite-master-remains-main-schema-with-temp-present {
     CREATE TABLE main_only(x INTEGER);
     CREATE TEMP TABLE temp_only(x INTEGER);
@@ -240,6 +250,13 @@ expect {
     1|temp|
 }
 
+test pragma-temp-wal-checkpoint-without-temp-db-matches-sqlite {
+    PRAGMA temp.wal_checkpoint;
+}
+expect {
+    0|-1|-1
+}
+
 test temp-store-change-outside-transaction-resets-temp-schema {
     CREATE TEMP TABLE reset_me(v INTEGER);
     PRAGMA temp_store = MEMORY;
@@ -247,6 +264,16 @@ test temp-store-change-outside-transaction-resets-temp-schema {
 }
 expect {
     0
+}
+
+test temp-store-change-survives-rollback-before-temp-db-exists {
+    BEGIN;
+    PRAGMA temp_store = MEMORY;
+    ROLLBACK;
+    PRAGMA temp_store;
+}
+expect {
+    2
 }
 
 test temp-store-change-inside-active-temp-transaction-errors {

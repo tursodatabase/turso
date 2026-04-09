@@ -26,6 +26,24 @@ expect {
 }
 
 @cross-check-integrity
+test savepoint-rollback-reverts-temp-table-changes {
+    CREATE TABLE main_t(x INTEGER);
+    CREATE TEMP TABLE temp_t(x INTEGER);
+    BEGIN;
+    INSERT INTO main_t VALUES (1);
+    SAVEPOINT sp1;
+    INSERT INTO temp.temp_t VALUES (2);
+    ROLLBACK TO sp1;
+    RELEASE sp1;
+    COMMIT;
+    SELECT x FROM main_t ORDER BY x;
+    SELECT x FROM temp.temp_t ORDER BY x;
+}
+expect {
+    1
+}
+
+@cross-check-integrity
 test savepoint-nested-release-outer {
     CREATE TABLE t(x);
     SAVEPOINT outer_sp;
