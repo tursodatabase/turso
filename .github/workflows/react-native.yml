@@ -175,7 +175,7 @@ jobs:
             -workspace TursoExample.xcworkspace \
             -scheme TursoExample \
             -sdk iphonesimulator \
-            -destination 'platform=iOS Simulator,name=iPhone 16' \
+            -destination 'generic/platform=iOS Simulator' \
             -configuration Debug \
             CODE_SIGNING_ALLOWED=NO \
             | tail -50
