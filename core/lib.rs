@@ -1391,16 +1391,11 @@ impl Database {
             .get();
 
         let encryption_cipher = self.encryption_cipher_mode.get();
-        let mut database_schemas = HashMap::default();
-        let mut temp_schema = Schema::with_options(self.experimental_custom_types_enabled());
-        temp_schema.generated_columns_enabled = self.experimental_generated_columns_enabled();
-        database_schemas.insert(crate::TEMP_DB_ID, Arc::new(temp_schema));
-
         let conn = Arc::new(Connection {
             db: self.clone(),
             pager: ArcSwap::new(pager),
             schema: RwLock::new(self.schema.lock().clone()),
-            database_schemas: RwLock::new(database_schemas),
+            database_schemas: RwLock::new(HashMap::default()),
             auto_commit: AtomicBool::new(true),
             transaction_state: AtomicTransactionState::new(TransactionState::None),
             last_insert_rowid: AtomicI64::new(0),

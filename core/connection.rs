@@ -406,9 +406,9 @@ impl Connection {
     }
 
     /// Check if a specific trigger is currently compiling (for recursive trigger prevention)
-    pub fn trigger_is_compiling(&self, trigger: impl AsRef<Trigger>) -> bool {
+    pub fn trigger_is_compiling(&self, trigger: &Arc<Trigger>) -> bool {
         let compiling = self.compiling_triggers.read();
-        if let Some(trigger) = compiling.iter().find(|t| t.name == trigger.as_ref().name) {
+        if let Some(trigger) = compiling.iter().find(|t| Arc::ptr_eq(t, trigger)) {
             tracing::debug!("Trigger is already compiling: {}", trigger.name);
             return true;
         }
@@ -429,9 +429,9 @@ impl Connection {
     }
 
     /// Check if a specific trigger is currently executing (for recursive trigger prevention)
-    pub fn is_trigger_executing(&self, trigger: impl AsRef<Trigger>) -> bool {
+    pub fn is_trigger_executing(&self, trigger: &Arc<Trigger>) -> bool {
         let executing = self.executing_triggers.read();
-        if let Some(trigger) = executing.iter().find(|t| t.name == trigger.as_ref().name) {
+        if let Some(trigger) = executing.iter().find(|t| Arc::ptr_eq(t, trigger)) {
             tracing::debug!("Trigger is already executing: {}", trigger.name);
             return true;
         }
@@ -3018,5 +3018,58 @@ mod tests {
             err.contains("no such table"),
             "expected no such table after temp reset, got: {err}"
         );
+    }
+
+    #[test]
+    fn test_temp_trigger_abort_rolls_back_temp_writes_without_panicking() {
+        let temp_dir = TempDir::new().unwrap();
+        let db_path = temp_dir.path().join("main.db");
+        let conn = open_connection(&db_path);
+
+        conn.execute("CREATE TEMP TABLE t(x INTEGER)").unwrap();
+        conn.execute("CREATE TEMP TABLE u(y INTEGER)").unwrap();
+        conn.execute(
+            "CREATE TRIGGER tr BEFORE INSERT ON temp.t BEGIN \
+             INSERT INTO u VALUES (NEW.x); \
+             SELECT RAISE(ABORT, 'boom'); \
+             END;",
+        )
+        .unwrap();
+
+        let err = conn.execute("INSERT INTO temp.t VALUES(1)").unwrap_err();
+        assert!(
+            err.to_string().contains("boom"),
+            "expected trigger abort error, got: {err}"
+        );
+        assert_eq!(query_single_i64(&conn, "SELECT COUNT(*) FROM temp.u"), 0);
+        assert_eq!(query_single_i64(&conn, "SELECT COUNT(*) FROM temp.t"), 0);
+    }
+
+    #[test]
+    fn test_temp_trigger_abort_rolls_back_main_and_temp_writes() {
+        let temp_dir = TempDir::new().unwrap();
+        let db_path = temp_dir.path().join("main.db");
+        let conn = open_connection(&db_path);
+
+        conn.execute("CREATE TABLE m(x INTEGER)").unwrap();
+        conn.execute("CREATE TEMP TABLE t(x INTEGER)").unwrap();
+        conn.execute("CREATE TEMP TABLE u(y INTEGER)").unwrap();
+        conn.execute(
+            "CREATE TRIGGER tr BEFORE INSERT ON temp.t BEGIN \
+             INSERT INTO m VALUES (NEW.x); \
+             INSERT INTO u VALUES (NEW.x); \
+             SELECT RAISE(ABORT, 'boom'); \
+             END;",
+        )
+        .unwrap();
+
+        let err = conn.execute("INSERT INTO temp.t VALUES(1)").unwrap_err();
+        assert!(
+            err.to_string().contains("boom"),
+            "expected trigger abort error, got: {err}"
+        );
+        assert_eq!(query_single_i64(&conn, "SELECT COUNT(*) FROM main.m"), 0);
+        assert_eq!(query_single_i64(&conn, "SELECT COUNT(*) FROM temp.u"), 0);
+        assert_eq!(query_single_i64(&conn, "SELECT COUNT(*) FROM temp.t"), 0);
     }
 }

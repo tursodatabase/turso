@@ -939,7 +939,6 @@ impl ProgramState {
                     for p in &attached_pagers {
                         if let Err(e) = p.rollback_to_newest_savepoint() {
                             err = Some(e);
-                            break;
                         }
                     }
                     err
@@ -2209,7 +2208,18 @@ impl Program {
             pager.end_read_tx();
             self.connection.rollback_attached_mvcc_txs(true);
         } else {
-            pager.rollback_tx(&self.connection);
+            let tx_state = self.connection.get_tx_state();
+            let has_attached_write = self
+                .connection
+                .get_all_attached_pagers()
+                .iter()
+                .any(|attached_pager| attached_pager.holds_write_lock());
+            match tx_state {
+                TransactionState::Write { .. } => pager.rollback_tx(&self.connection),
+                _ if pager.holds_write_lock() => pager.rollback_attached(),
+                _ if has_attached_write => pager.cleanup_read_tx(),
+                _ => pager.rollback_tx(&self.connection),
+            }
             self.connection.auto_commit.store(true, Ordering::SeqCst);
         }
         self.connection.rollback_attached_wal_txns();

@@ -1487,7 +1487,7 @@ impl ProgramBuilder {
     /// Tries to mirror: https://github.com/sqlite/sqlite/blob/e77e589a35862f6ac9c4141cfd1beb2844b84c61/src/build.c#L5379
     pub fn begin_write_operation(&mut self) {
         self.txn_mode = TransactionMode::Write;
-        self.write_databases.insert(MAIN_DB_ID);
+        self.write_databases.insert(crate::MAIN_DB_ID);
     }
 
     /// Begin a write operation on a specific database (for attached databases).
