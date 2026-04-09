@@ -922,7 +922,10 @@ mod tests {
         let input = Value::build_text("{ key: 'value' }");
         let result = get_json(&input, None).unwrap();
         if let Value::Text(result_str) = result {
-            assert!(result_str.try_as_str().unwrap().contains("\"key\":\"value\""));
+            assert!(result_str
+                .try_as_str()
+                .unwrap()
+                .contains("\"key\":\"value\""));
             assert_eq!(result_str.subtype, TextSubtype::Json);
         } else {
             panic!("Expected Value::Text");
@@ -946,7 +949,10 @@ mod tests {
         let input = Value::build_text("{ \"key\": -Infinity }");
         let result = get_json(&input, None).unwrap();
         if let Value::Text(result_str) = result {
-            assert!(result_str.try_as_str().unwrap().contains("{\"key\":-9e999}"));
+            assert!(result_str
+                .try_as_str()
+                .unwrap()
+                .contains("{\"key\":-9e999}"));
             assert_eq!(result_str.subtype, TextSubtype::Json);
         } else {
             panic!("Expected Value::Text");
@@ -980,7 +986,10 @@ mod tests {
         let input = Value::build_text("{\"key\":\"value\"}");
         let result = get_json(&input, None).unwrap();
         if let Value::Text(result_str) = result {
-            assert!(result_str.try_as_str().unwrap().contains("\"key\":\"value\""));
+            assert!(result_str
+                .try_as_str()
+                .unwrap()
+                .contains("\"key\":\"value\""));
             assert_eq!(result_str.subtype, TextSubtype::Json);
         } else {
             panic!("Expected Value::Text");
@@ -1410,7 +1419,10 @@ mod tests {
         let Value::Text(json_text) = result else {
             panic!("Expected Value::Text");
         };
-        assert_eq!(json_text.try_as_str().unwrap(), r#"{"key":{"json":"value"}}"#);
+        assert_eq!(
+            json_text.try_as_str().unwrap(),
+            r#"{"key":{"json":"value"}}"#
+        );
     }
 
     #[test]

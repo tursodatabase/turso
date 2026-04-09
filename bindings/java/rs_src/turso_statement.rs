@@ -111,10 +111,9 @@ fn row_to_obj_array<'local>(
                 env.new_object("java/lang/Double", "(D)V", &[JValue::Double(f64::from(*f))])?
             }
             turso_core::Value::Text(s) => env
-                .new_string(
-                    s.try_as_str()
-                        .map_err(|e| TursoError::CustomError(format!("invalid UTF-8 in TEXT value: {e}")))?,
-                )?
+                .new_string(s.try_as_str().map_err(|e| {
+                    TursoError::CustomError(format!("invalid UTF-8 in TEXT value: {e}"))
+                })?)?
                 .into(),
             turso_core::Value::Blob(b) => env.byte_array_from_slice(b.as_slice())?.into(),
         };

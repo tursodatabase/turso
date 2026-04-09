@@ -74,13 +74,13 @@ impl SchemaIntrospector {
         rows.run_with_row_callback(|row| {
             if let turso_core::Value::Text(name) = row.get_value(0) {
                 let strict = match row.get_value(1) {
-                    turso_core::Value::Text(sql) => Self::sql_is_strict(sql.try_as_str().map_err(
-                        |_| {
+                    turso_core::Value::Text(sql) => {
+                        Self::sql_is_strict(sql.try_as_str().map_err(|_| {
                             turso_core::LimboError::ConversionError(
                                 "sqlite_master.sql must be valid UTF-8".into(),
                             )
-                        },
-                    )?),
+                        })?)
+                    }
                     _ => false,
                 };
                 tables.push((
@@ -365,13 +365,11 @@ impl SchemaIntrospector {
 
         rows.run_with_row_callback(|row| {
             if let turso_core::Value::Text(name) = row.get_value(1) {
-                let name = name
-                    .try_as_str()
-                    .map_err(|_| {
-                        turso_core::LimboError::ConversionError(
-                            "PRAGMA database_list name must be valid UTF-8".into(),
-                        )
-                    })?;
+                let name = name.try_as_str().map_err(|_| {
+                    turso_core::LimboError::ConversionError(
+                        "PRAGMA database_list name must be valid UTF-8".into(),
+                    )
+                })?;
                 if name != "main" && name != "temp" {
                     databases.push(name.to_string());
                 }
