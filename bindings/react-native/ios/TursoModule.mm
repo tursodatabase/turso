@@ -88,7 +88,6 @@ RCT_EXPORT_MODULE()
 
 - (void)invalidate {
     turso::invalidate();
-    [super invalidate];
 }
 
 // Synchronous method to check if the module is installed
