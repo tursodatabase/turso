@@ -432,7 +432,10 @@ mod tests {
     #[test]
     fn normalize_sqlite_tables_output_preserves_single_spaces() {
         assert_eq!(
-            CliDatabaseInstance::normalize_sqlite_dot_command_output(".tables", "t1  v1\nuser logs"),
+            CliDatabaseInstance::normalize_sqlite_dot_command_output(
+                ".tables",
+                "t1  v1\nuser logs"
+            ),
             vec![vec!["t1 v1".to_string()], vec!["user logs".to_string()]]
         );
     }
