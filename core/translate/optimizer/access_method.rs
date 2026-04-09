@@ -1088,10 +1088,10 @@ pub fn try_hash_join_access_method(
         // Check if the subquery references the build or probe table
         if let SubqueryState::Unevaluated { plan } = &subquery.state {
             if let Some(plan) = plan.as_ref() {
-                let outer_refs = plan.table_references.outer_query_refs();
-                for outer_ref in outer_refs {
-                    if outer_ref.internal_id == build_table.internal_id
-                        || outer_ref.internal_id == probe_table.internal_id
+                let outer_ref_ids = plan.used_outer_query_ref_ids();
+                for outer_ref_id in &outer_ref_ids {
+                    if *outer_ref_id == build_table.internal_id
+                        || *outer_ref_id == probe_table.internal_id
                     {
                         return None;
                     }

@@ -123,8 +123,10 @@ fn select_plan_first_virtual_table_name(select_plan: &SelectPlan) -> Option<Stri
     }
     for subquery in &select_plan.non_from_clause_subqueries {
         if let SubqueryState::Unevaluated { plan: Some(plan) } = &subquery.state {
-            if let Some(name) = select_plan_first_virtual_table_name(plan) {
-                return Some(name);
+            if let Plan::Select(plan) = plan.as_ref() {
+                if let Some(name) = select_plan_first_virtual_table_name(plan) {
+                    return Some(name);
+                }
             }
         }
     }
@@ -927,7 +929,7 @@ fn reject_outer_query_refs_in_group_by_expr(
                 else {
                     unreachable!("GROUP BY subquery must be in unevaluated state during planning");
                 };
-                reject_outer_scope_refs_inside_select_plan(subquery_plan, table_references)?;
+                reject_outer_scope_refs_inside_plan_tree(subquery_plan, table_references)?;
             }
             _ => {}
         }
@@ -993,7 +995,7 @@ fn reject_outer_scope_refs_inside_select_plan(
         else {
             continue;
         };
-        reject_outer_scope_refs_inside_select_plan(subquery_plan, current_scope_table_refs)?;
+        reject_outer_scope_refs_inside_plan_tree(subquery_plan, current_scope_table_refs)?;
     }
 
     for joined_table in plan.table_references.joined_tables().iter() {

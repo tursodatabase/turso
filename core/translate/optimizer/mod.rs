@@ -646,11 +646,16 @@ pub fn optimize_select_plan(plan: &mut SelectPlan, schema: &Schema) -> Result<()
     // unnesting sees the plan without an artificial LIMIT.
     for sub in &mut plan.non_from_clause_subqueries {
         if matches!(sub.query_type, ast::SubqueryType::Exists { .. }) {
-            if let SubqueryState::Unevaluated { plan: Some(inner) } = &mut sub.state {
-                if inner.limit.is_none() {
-                    inner.limit = Some(Box::new(Expr::Literal(ast::Literal::Numeric(
-                        "1".to_string(),
-                    ))));
+            if let SubqueryState::Unevaluated {
+                plan: Some(inner), ..
+            } = &mut sub.state
+            {
+                if let Plan::Select(ref mut inner) = inner.as_mut() {
+                    if inner.limit.is_none() {
+                        inner.limit = Some(Box::new(Expr::Literal(ast::Literal::Numeric(
+                            "1".to_string(),
+                        ))));
+                    }
                 }
             }
         }
@@ -1144,6 +1149,9 @@ fn reoptimize_correlated_subqueries(plan: &mut SelectPlan, schema: &Schema) -> R
             plan: Some(inner_plan),
         } = &mut subquery.state
         else {
+            continue;
+        };
+        let Plan::Select(ref mut inner_plan) = inner_plan.as_mut() else {
             continue;
         };
         if !select_plan_contains_cte_from_clause_subquery(inner_plan) {
