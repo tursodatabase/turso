@@ -284,6 +284,8 @@ struct MakeFromBtreeAccumulators {
     dbsp_state_index_roots: HashMap<String, i64>,
     /// Store materialized view info (SQL and root page) for later creation
     materialized_view_info: HashMap<String, (String, i64)>,
+    /// Foreign tables deferred until servers are loaded
+    deferred_foreign_tables: Vec<(String, String)>,
 }
 
 /// Phase tracking for async schema loading
@@ -401,6 +403,11 @@ pub struct Schema {
     pub type_registry: HashMap<String, Arc<TypeDef>>,
 
     pub generated_columns_enabled: bool,
+
+    /// Foreign servers (SQL/MED), loaded from sqlite_schema type='server'
+    pub foreign_servers: HashMap<String, Arc<crate::foreign::ForeignServer>>,
+    /// Tracks which server each foreign table belongs to: table_name → server_name
+    pub foreign_table_servers: HashMap<String, String>,
 }
 
 impl Default for Schema {
@@ -507,6 +514,8 @@ impl Schema {
                 registry
             },
             generated_columns_enabled: false,
+            foreign_servers: HashMap::default(),
+            foreign_table_servers: HashMap::default(),
         }
     }
 
@@ -812,6 +821,95 @@ impl Schema {
         Ok(())
     }
 
+    pub fn add_foreign_server(&mut self, server: crate::foreign::ForeignServer) -> Result<()> {
+        let name = normalize_ident(&server.name);
+        if self.foreign_servers.contains_key(&name) {
+            bail_parse_error!("server {} already exists", server.name);
+        }
+        self.foreign_servers.insert(name, Arc::new(server));
+        Ok(())
+    }
+
+    pub fn get_foreign_server(&self, name: &str) -> Option<Arc<crate::foreign::ForeignServer>> {
+        self.foreign_servers.get(&normalize_ident(name)).cloned()
+    }
+
+    pub fn remove_foreign_server(&mut self, name: &str) {
+        self.foreign_servers.remove(&normalize_ident(name));
+    }
+
+    pub fn foreign_tables_using_server(&self, server_name: &str) -> Vec<String> {
+        let normalized = normalize_ident(server_name);
+        self.foreign_table_servers
+            .iter()
+            .filter(|(_, srv)| **srv == normalized)
+            .map(|(tbl, _)| tbl.clone())
+            .collect()
+    }
+
+    /// Reconstruct a foreign table from its CREATE FOREIGN TABLE SQL on schema reload.
+    pub fn populate_foreign_table(
+        &mut self,
+        name: &str,
+        sql: &str,
+        syms: &SymbolTable,
+    ) -> Result<()> {
+        // If already loaded (e.g. from syms.vtabs during initial CREATE), skip
+        if syms.vtabs.contains_key(name) {
+            let vtab = syms.vtabs.get(name).unwrap().clone();
+            self.add_virtual_table(vtab)?;
+            return Ok(());
+        }
+
+        use turso_parser::ast::{Cmd, Stmt};
+        use turso_parser::parser::Parser;
+        let mut parser = Parser::new(sql.as_bytes());
+        let cmd = parser.next_cmd().map_err(|e| {
+            crate::LimboError::InternalError(format!("Failed to parse foreign table SQL: {e}"))
+        })?;
+        let Some(Cmd::Stmt(Stmt::CreateForeignTable(ft))) = cmd else {
+            return Err(crate::LimboError::InternalError(format!(
+                "Invalid foreign table SQL: {sql}"
+            )));
+        };
+
+        let server_name = ft.server_name.as_str();
+        let server = self.get_foreign_server(server_name).ok_or_else(|| {
+            crate::LimboError::ParseError(format!("no such server: {server_name}"))
+        })?;
+
+        let factory = syms.foreign_drivers.get(&server.driver).ok_or_else(|| {
+            crate::LimboError::ParseError(format!("no such foreign driver: {}", server.driver))
+        })?;
+
+        let columns: Vec<crate::foreign::ForeignColumnDef> = ft
+            .columns
+            .iter()
+            .map(|cd| crate::foreign::ForeignColumnDef {
+                name: cd.col_name.as_str().to_string(),
+                type_name: cd
+                    .col_type
+                    .as_ref()
+                    .map(|t| t.name.clone())
+                    .unwrap_or_else(|| "TEXT".to_string()),
+            })
+            .collect();
+
+        let table_options: std::collections::HashMap<String, String> = ft
+            .options
+            .iter()
+            .map(|o| (o.key.as_str().to_string(), o.value.clone()))
+            .collect();
+
+        let fdw = factory.create_fdw(&server.options, &table_options, &columns)?;
+        let vtab = crate::VirtualTable::new_foreign(name, fdw)?;
+        let server_name_owned = server_name.to_string();
+        self.add_virtual_table(vtab)?;
+        self.foreign_table_servers
+            .insert(normalize_ident(name), normalize_ident(&server_name_owned));
+        Ok(())
+    }
+
     pub fn get_table(&self, name: &str) -> Option<Arc<Table>> {
         let name = normalize_ident(name);
         let name = if name.eq_ignore_ascii_case(SCHEMA_TABLE_NAME_ALT) {
@@ -979,6 +1077,7 @@ impl Schema {
                         dbsp_state_roots: HashMap::default(),
                         dbsp_state_index_roots: HashMap::default(),
                         materialized_view_info: HashMap::default(),
+                        deferred_foreign_tables: Vec::new(),
                     });
 
                     state.phase = MakeFromBtreePhase::Rewinding;
@@ -1015,6 +1114,11 @@ impl Schema {
                             acc.automatic_indices,
                             mv_cursor.is_some(),
                         )?;
+                        // Foreign tables before matviews — matviews may reference foreign tables
+                        for (name, sql) in acc.deferred_foreign_tables {
+                            self.populate_foreign_table(&name, &sql, syms)?;
+                        }
+
                         self.populate_materialized_views(
                             acc.materialized_view_info,
                             acc.dbsp_state_roots,
@@ -1068,6 +1172,7 @@ impl Schema {
                         &mut acc.dbsp_state_roots,
                         &mut acc.dbsp_state_index_roots,
                         &mut acc.materialized_view_info,
+                        &mut acc.deferred_foreign_tables,
                     )?;
 
                     state.phase = MakeFromBtreePhase::Advancing;
@@ -1310,12 +1415,42 @@ impl Schema {
         dbsp_state_roots: &mut HashMap<String, i64>,
         dbsp_state_index_roots: &mut HashMap<String, i64>,
         materialized_view_info: &mut HashMap<String, (String, i64)>,
+        deferred_foreign_tables: &mut Vec<(String, String)>,
     ) -> Result<()> {
         match ty {
+            "server" => {
+                let sql = maybe_sql.expect("sql should be present for server");
+                use turso_parser::ast::{Cmd, Stmt};
+                use turso_parser::parser::Parser;
+                let mut parser = Parser::new(sql.as_bytes());
+                if let Ok(Some(Cmd::Stmt(Stmt::CreateServer(cs)))) = parser.next_cmd() {
+                    let driver = cs
+                        .options
+                        .iter()
+                        .find(|o| o.key.as_str().eq_ignore_ascii_case("driver"))
+                        .map(|o| o.value.clone())
+                        .unwrap_or_default();
+                    let options = cs
+                        .options
+                        .iter()
+                        .map(|o| (o.key.as_str().to_string(), o.value.clone()))
+                        .collect();
+                    let server = crate::foreign::ForeignServer {
+                        name: cs.server_name.as_str().to_string(),
+                        driver,
+                        options,
+                    };
+                    self.add_foreign_server(server)?;
+                }
+            }
             "table" => {
                 let sql = maybe_sql.expect("sql should be present for table");
                 let sql_bytes = sql.as_bytes();
-                if root_page == 0 && contains_ignore_ascii_case!(sql_bytes, b"create virtual") {
+                if root_page == 0 && contains_ignore_ascii_case!(sql_bytes, b"create foreign") {
+                    deferred_foreign_tables.push((name.to_string(), sql.to_string()));
+                } else if root_page == 0
+                    && contains_ignore_ascii_case!(sql_bytes, b"create virtual")
+                {
                     // a virtual table is found in the sqlite_schema, but it's no
                     // longer in the in-memory schema. We need to recreate it if
                     // the module is loaded in the symbol table.
@@ -1897,6 +2032,8 @@ impl Clone for Schema {
             dropped_root_pages: self.dropped_root_pages.clone(),
             type_registry: self.type_registry.clone(),
             generated_columns_enabled: self.generated_columns_enabled,
+            foreign_servers: self.foreign_servers.clone(),
+            foreign_table_servers: self.foreign_table_servers.clone(),
         }
     }
 }
@@ -5174,6 +5311,7 @@ mod tests {
             &mut HashMap::default(),
             &mut HashMap::default(),
             &mut HashMap::default(),
+            &mut Vec::new(),
         );
         assert!(result
             .unwrap_err()
