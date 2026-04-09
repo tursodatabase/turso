@@ -1736,3 +1736,70 @@ func TestParallelSelectColumnsConcurrency(t *testing.T) {
 		require.NoError(t, runErr)
 	}
 }
+
+func TestFTS(t *testing.T) {
+	tmp := t.TempDir()
+	dbPath := path.Join(tmp, "fts.db")
+	dsn := fmt.Sprintf("%v?experimental=index_method", dbPath)
+	db, err := sql.Open("turso", dsn)
+	require.Nil(t, err)
+	t.Cleanup(func() { _ = db.Close() })
+	require.Nil(t, db.Ping())
+
+	// Create table and FTS index
+	_, err = db.Exec("CREATE TABLE docs (id INTEGER PRIMARY KEY, title TEXT, body TEXT)")
+	require.Nil(t, err)
+	_, err = db.Exec("CREATE INDEX docs_fts ON docs USING fts (title, body)")
+	require.Nil(t, err)
+
+	// Insert test data
+	_, err = db.Exec(`INSERT INTO docs (id, title, body) VALUES
+		(1, 'database systems', 'An introduction to database systems and architecture'),
+		(2, 'performance tuning', 'How to optimize database performance'),
+		(3, 'cooking recipes', 'A collection of recipes for healthy meals'),
+		(4, 'database indexing', 'Full-text search indexing techniques for databases'),
+		(5, 'travel guide', 'Exploring the mountains and rivers of Europe')`)
+	require.Nil(t, err)
+
+	t.Run("basic_match", func(t *testing.T) {
+		rows, err := db.Query("SELECT id, title FROM docs WHERE (title, body) MATCH 'database' ORDER BY id")
+		require.Nil(t, err)
+		defer rows.Close()
+
+		var ids []int
+		for rows.Next() {
+			var id int
+			var title string
+			require.Nil(t, rows.Scan(&id, &title))
+			ids = append(ids, id)
+		}
+		require.Nil(t, rows.Err())
+		require.Equal(t, []int{1, 2, 4}, ids)
+	})
+
+	t.Run("no_results", func(t *testing.T) {
+		rows, err := db.Query("SELECT id FROM docs WHERE (title, body) MATCH 'quantum'")
+		require.Nil(t, err)
+		defer rows.Close()
+
+		require.False(t, rows.Next())
+		require.Nil(t, rows.Err())
+	})
+
+	t.Run("insert_then_query", func(t *testing.T) {
+		_, err := db.Exec("INSERT INTO docs (id, title, body) VALUES (6, 'quantum computing', 'Introduction to quantum algorithms and systems')")
+		require.Nil(t, err)
+
+		var count int
+		err = db.QueryRow("SELECT count(*) FROM docs WHERE (title, body) MATCH 'quantum'").Scan(&count)
+		require.Nil(t, err)
+		require.Equal(t, 1, count)
+	})
+
+	t.Run("phrase_query", func(t *testing.T) {
+		var count int
+		err := db.QueryRow(`SELECT count(*) FROM docs WHERE (title, body) MATCH '"database systems"'`).Scan(&count)
+		require.Nil(t, err)
+		require.Greater(t, count, 0)
+	})
+}

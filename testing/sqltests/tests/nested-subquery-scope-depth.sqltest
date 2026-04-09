@@ -1,0 +1,70 @@
+@database :memory:
+
+# Regression test: nested correlated subqueries with the same column name
+# at different scope depths should not produce false "ambiguous column" errors.
+# The column resolver must match the nearest (shallowest) outer scope and not
+# consider deeper scopes, which would otherwise trigger ambiguity.
+
+setup schema {
+    CREATE TABLE t1(x INTEGER, y INTEGER);
+    INSERT INTO t1 VALUES(1, 10);
+    INSERT INTO t1 VALUES(2, 20);
+    INSERT INTO t1 VALUES(3, 30);
+
+    CREATE TABLE t2(x INTEGER, z INTEGER);
+    INSERT INTO t2 VALUES(1, 100);
+    INSERT INTO t2 VALUES(2, 200);
+    INSERT INTO t2 VALUES(4, 400);
+}
+
+# Two-level nesting: innermost subquery references 'x' which exists in both
+# the immediate outer scope (t2) and the grandparent scope (t1). The resolver
+# should bind to the nearest scope (t2.x) without an ambiguity error.
+@setup schema
+test nested-correlated-same-column-name {
+    SELECT * FROM t1
+    WHERE x IN (
+        SELECT t2.x FROM t2
+        WHERE EXISTS (
+            SELECT 1 FROM t1 AS t3 WHERE t3.x = x
+        )
+    );
+}
+expect {
+    1|10
+    2|20
+}
+
+# Explicit outer reference via alias in deeply nested subquery should resolve
+# to the correct scope level.
+@setup schema
+test nested-explicit-outer-ref {
+    SELECT * FROM t1 AS a
+    WHERE EXISTS (
+        SELECT 1 FROM t2 AS b
+        WHERE b.x = a.x
+        AND EXISTS (
+            SELECT 1 FROM t1 AS c WHERE c.x = b.x
+        )
+    );
+}
+expect {
+    1|10
+    2|20
+}
+
+# Three-level nesting where innermost references a column from the outermost scope.
+@setup schema
+test three-level-outer-ref {
+    SELECT y FROM t1 AS a
+    WHERE EXISTS (
+        SELECT 1 FROM t2 AS b
+        WHERE EXISTS (
+            SELECT 1 FROM t2 AS c WHERE c.x = a.x
+        )
+    );
+}
+expect {
+    10
+    20
+}

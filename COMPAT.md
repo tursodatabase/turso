@@ -484,9 +484,9 @@ Modifiers:
 | sqlite3_step                | ✅ Yes     |         |
 | sqlite3_reset               | ✅ Yes     |         |
 | sqlite3_exec                | ✅ Yes     |         |
-| sqlite3_stmt_readonly       | ❌ No      | Stub    |
+| sqlite3_stmt_readonly       | ✅ Yes     |         |
 | sqlite3_stmt_busy           | ❌ No      | Stub    |
-| sqlite3_stmt_status         | ❌ No      |         |
+| sqlite3_stmt_status         | 🚧 Partial | Supports `FULLSCAN_STEP`, `SORT`, `VM_STEP`, `REPREPARE`, `LIBSQL_STMTSTATUS_ROWS_READ`, and `LIBSQL_STMTSTATUS_ROWS_WRITTEN`. Returns `0` for `AUTOINDEX`, `RUN`, `FILTER_MISS`, `FILTER_HIT`, and `MEMUSED`. |
 | sqlite3_sql                 | ❌ No      |         |
 | sqlite3_expanded_sql        | ❌ No      | Stub    |
 | sqlite3_normalized_sql      | ❌ No      |         |
@@ -607,7 +607,7 @@ Modifiers:
 | sqlite3_busy_handler     | ✅ Yes     |         |
 | sqlite3_busy_timeout     | ✅ Yes     |         |
 | sqlite3_trace_v2         | ❌ No      | Stub    |
-| sqlite3_progress_handler | ❌ No      | Stub    |
+| sqlite3_progress_handler | ✅ Yes     | Step-time callbacks only |
 | sqlite3_set_authorizer   | ❌ No      | Stub    |
 | sqlite3_commit_hook      | ❌ No      |         |
 | sqlite3_rollback_hook    | ❌ No      |         |
@@ -700,7 +700,7 @@ Modifiers:
 | sqlite3_sourceid       | ❌ No      |         |
 | sqlite3_threadsafe     | ✅ Yes     | Returns 1 |
 | sqlite3_complete       | ❌ No      | Stub    |
-| sqlite3_interrupt      | ❌ No      | Stub    |
+| sqlite3_interrupt      | ✅ Yes     |         |
 | sqlite3_sleep          | ❌ No      | Stub    |
 | sqlite3_randomness     | ❌ No      |         |
 | sqlite3_get_table      | ✅ Yes     |         |

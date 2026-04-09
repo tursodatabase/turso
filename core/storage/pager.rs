@@ -4790,7 +4790,7 @@ impl Pager {
     }
 
     pub fn is_encryption_ctx_set(&self) -> bool {
-        self.io_ctx.write().encryption_context().is_some()
+        self.io_ctx.read().encryption_context().is_some()
     }
 
     pub fn is_encryption_enabled(&self) -> bool {

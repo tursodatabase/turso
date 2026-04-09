@@ -450,7 +450,7 @@ pub struct ProgramState {
     op_destroy_state: OpDestroyState,
     op_idx_delete_state: Option<OpIdxDeleteState>,
     op_integrity_check_state: OpIntegrityCheckState,
-    /// Metrics collected during statement execution
+    /// Metrics collected for the lifetime of this prepared statement.
     pub metrics: StatementMetrics,
     op_open_ephemeral_state: OpOpenEphemeralState,
     op_program_state: OpProgramState,
@@ -623,6 +623,10 @@ impl ProgramState {
         self.execution_state = ProgramExecutionState::Interrupting;
     }
 
+    pub fn is_interrupted(&self) -> bool {
+        matches!(self.execution_state, ProgramExecutionState::Interrupting)
+    }
+
     pub fn bind_at(&mut self, index: NonZero<usize>, value: Value) {
         let i = index.get() - 1;
         if i >= self.parameters.len() {
@@ -696,7 +700,6 @@ impl ProgramState {
         };
         self.op_idx_delete_state = None;
         self.op_integrity_check_state = OpIntegrityCheckState::Start;
-        self.metrics = StatementMetrics::new();
         self.op_open_ephemeral_state = OpOpenEphemeralState::Start;
         self.op_new_rowid_state = OpNewRowidState::Start;
         self.op_idx_insert_state = OpIdxInsertState::MaybeSeek;
@@ -738,6 +741,56 @@ impl ProgramState {
         self.pending_fail_error = None;
         self.pending_cdc_info = None;
         self.subprogram_stmt_cache.clear();
+    }
+
+    #[inline]
+    pub fn record_rows_read(&mut self, count: u64) {
+        self.metrics.rows_read = self.metrics.rows_read.saturating_add(count);
+    }
+
+    #[inline]
+    pub fn record_rows_written(&mut self, count: u64) {
+        self.metrics.rows_written = self.metrics.rows_written.saturating_add(count);
+    }
+
+    pub(crate) fn metrics(&self) -> StatementMetrics {
+        let mut metrics = self.metrics.clone();
+        if let OpProgramState::Step { statement, .. } = &self.op_program_state {
+            metrics.merge(&statement.metrics());
+        }
+        for statement in self.subprogram_stmt_cache.values() {
+            metrics.merge(&statement.metrics());
+        }
+        metrics
+    }
+
+    pub(crate) fn reset_metrics(&mut self) {
+        self.metrics.reset();
+        if let OpProgramState::Step { statement, .. } = &mut self.op_program_state {
+            statement.reset_metrics();
+        }
+        for statement in self.subprogram_stmt_cache.values_mut() {
+            statement.reset_metrics();
+        }
+    }
+
+    pub(crate) fn reset_stmt_status(&mut self, counter: crate::statement::StatementStatusCounter) {
+        match counter {
+            crate::statement::StatementStatusCounter::FullscanStep => {
+                self.metrics.fullscan_steps = 0
+            }
+            crate::statement::StatementStatusCounter::Sort => self.metrics.sort_operations = 0,
+            crate::statement::StatementStatusCounter::VmStep => self.metrics.insn_executed = 0,
+            crate::statement::StatementStatusCounter::Reprepare => self.metrics.reprepares = 0,
+            crate::statement::StatementStatusCounter::RowsRead => self.metrics.rows_read = 0,
+            crate::statement::StatementStatusCounter::RowsWritten => self.metrics.rows_written = 0,
+        }
+        if let OpProgramState::Step { statement, .. } = &mut self.op_program_state {
+            statement.reset_stmt_status(counter);
+        }
+        for statement in self.subprogram_stmt_cache.values_mut() {
+            statement.reset_stmt_status(counter);
+        }
     }
 
     pub fn get_cursor(&mut self, cursor_id: CursorID) -> &mut Cursor {
@@ -1029,6 +1082,9 @@ pub struct PreparedProgram {
     pub comments: Vec<(InsnReference, &'static str)>,
     pub parameters: crate::parameters::Parameters,
     pub change_cnt_on: bool,
+    /// Flag that detect if the sqlite statement will directly manipulate the database file.\
+    /// mirrors: https://sqlite.org/c3ref/stmt_readonly.html.
+    pub readonly: bool,
     pub result_columns: Vec<ResultSetColumn>,
     pub table_references: TableReferences,
     pub sql: String,
@@ -1105,9 +1161,15 @@ impl PreparedProgram {
     pub fn is_compatible_with(&self, connection: &Connection) -> bool {
         self.prepare_context.matches_connection(connection)
     }
+
+    #[inline]
+    pub fn is_readonly(&self) -> bool {
+        self.readonly
+    }
 }
 
 impl Program {
+    #[inline]
     pub fn prepared(&self) -> &Arc<PreparedProgram> {
         &self.prepared
     }
@@ -1118,11 +1180,34 @@ impl Program {
             connection,
         }
     }
+
+    #[inline]
+    pub fn is_readonly(&self) -> bool {
+        self.prepared().is_readonly()
+    }
 }
 
 impl Program {
     fn get_pager_from_database_index(&self, idx: &usize) -> Arc<Pager> {
         self.connection.get_pager_from_database_index(idx)
+    }
+
+    #[inline]
+    fn maybe_request_interrupt<I>(&self, state: &mut ProgramState, io: &I) -> bool
+    where
+        I: crate::IO + ?Sized,
+    {
+        let connection_interrupt = self.connection.is_interrupted();
+        let hit_query_deadline = state
+            .query_deadline
+            .is_some_and(|deadline| io.current_time_monotonic() >= deadline);
+        let progress_interrupt = self
+            .connection
+            .should_interrupt_for_progress(state.metrics.vm_steps);
+        if connection_interrupt || hit_query_deadline || progress_interrupt {
+            state.interrupt();
+        }
+        state.is_interrupted()
     }
 
     pub fn step(
@@ -1163,13 +1248,7 @@ impl Program {
             return Err(LimboError::InternalError("Connection closed".to_string()));
         }
 
-        if let Some(deadline) = state.query_deadline {
-            if pager.io.current_time_monotonic() >= deadline {
-                state.execution_state = ProgramExecutionState::Interrupting;
-            }
-        }
-
-        if matches!(state.execution_state, ProgramExecutionState::Interrupting) {
+        if self.maybe_request_interrupt(state, pager.io.as_ref()) {
             return Ok(StepResult::Interrupt);
         }
 
@@ -1270,13 +1349,7 @@ impl Program {
                 return Err(LimboError::InternalError("Connection closed".to_string()));
             }
 
-            if let Some(deadline) = state.query_deadline {
-                if pager.io.current_time_monotonic() >= deadline {
-                    state.execution_state = ProgramExecutionState::Interrupting;
-                }
-            }
-
-            if matches!(state.execution_state, ProgramExecutionState::Interrupting) {
+            if self.maybe_request_interrupt(state, pager.io.as_ref()) {
                 return Ok(StepResult::Interrupt);
             }
 
@@ -1323,12 +1396,7 @@ impl Program {
                 }
                 return Err(LimboError::InternalError("Connection closed".to_string()));
             }
-            if let Some(deadline) = state.query_deadline {
-                if pager.io.current_time_monotonic() >= deadline {
-                    state.execution_state = ProgramExecutionState::Interrupting;
-                }
-            }
-            if matches!(state.execution_state, ProgramExecutionState::Interrupting) {
+            if self.maybe_request_interrupt(state, pager.io.as_ref()) {
                 self.abort(pager, None, state)?;
                 return Ok(StepResult::Interrupt);
             }

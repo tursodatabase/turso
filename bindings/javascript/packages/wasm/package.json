@@ -1,6 +1,6 @@
 {
   "name": "@tursodatabase/database-wasm",
-  "version": "0.6.0-pre.15",
+  "version": "0.6.0-pre.16",
   "repository": {
     "type": "git",
     "url": "https://github.com/tursodatabase/turso"
@@ -34,7 +34,7 @@
     "@vitest/browser": "^3.2.4",
     "playwright": "^1.55.0",
     "typescript": "^5.9.2",
-    "vite": "^7.1.5",
+    "vite": "^7.3.2",
     "vitest": "^3.2.4"
   },
   "scripts": {
@@ -51,7 +51,7 @@
     ]
   },
   "dependencies": {
-    "@tursodatabase/database-common": "^0.6.0-pre.15",
-    "@tursodatabase/database-wasm-common": "^0.6.0-pre.15"
+    "@tursodatabase/database-common": "^0.6.0-pre.16",
+    "@tursodatabase/database-wasm-common": "^0.6.0-pre.16"
   }
 }

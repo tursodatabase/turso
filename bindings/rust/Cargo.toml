@@ -26,6 +26,7 @@ sync = [
 ]
 
 [dependencies]
+turso_core = { workspace = true }
 turso_sdk_kit = { workspace = true }
 turso_sync_sdk_kit = { workspace = true }
 thiserror = { workspace = true }

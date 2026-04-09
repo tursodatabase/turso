@@ -23,7 +23,7 @@ use crate::translate::plan::{Operation, ResultSetColumn, Search};
 use crate::translate::planner::parse_row_id;
 use crate::util::{exprs_are_equivalent, normalize_ident, parse_numeric_literal};
 use crate::vdbe::affinity::Affinity;
-use crate::vdbe::builder::{CursorKey, SelfTableContext};
+use crate::vdbe::builder::{CursorKey, DmlColumnContext, SelfTableContext};
 use crate::vdbe::{
     builder::ProgramBuilder,
     insn::{CmpInsFlags, InsertFlags, Insn},
@@ -2954,7 +2954,10 @@ pub fn translate_expr(
                 });
                 return Ok(target_register);
             }
-            // Treat double-quoted identifiers as string literals (SQLite compatibility)
+            if !resolver.dqs_dml.is_enabled() {
+                crate::bail_parse_error!("no such column: {}", id.as_str());
+            }
+            // DQS enabled: treat double-quoted identifiers as string literals (SQLite compatibility)
             program.emit_insn(Insn::String8 {
                 value: id.as_str().to_string(),
                 dest: target_register,
@@ -5210,24 +5213,62 @@ pub fn emit_table_column(
     target_register: usize,
     resolver: &Resolver,
 ) -> Result<()> {
+    do_emit_table_column(
+        program,
+        cursor_id,
+        &SelfTableContext::ForSelect {
+            table_ref_id,
+            referenced_tables: referenced_tables.clone(),
+        },
+        Some(referenced_tables),
+        column,
+        column_index,
+        target_register,
+        resolver,
+    )
+}
+
+/// Equivalent of [emit_table_column] for when registers are laid out for DML.
+#[allow(clippy::too_many_arguments)]
+pub fn emit_table_column_for_dml(
+    program: &mut ProgramBuilder,
+    cursor_id: CursorID,
+    dml_column_context: DmlColumnContext,
+    column: &Column,
+    column_index: usize,
+    target_register: usize,
+    resolver: &Resolver,
+) -> Result<()> {
+    do_emit_table_column(
+        program,
+        cursor_id,
+        &SelfTableContext::ForDML(dml_column_context),
+        None,
+        column,
+        column_index,
+        target_register,
+        resolver,
+    )
+}
+
+#[inline(always)]
+#[allow(clippy::too_many_arguments)]
+fn do_emit_table_column(
+    program: &mut ProgramBuilder,
+    cursor_id: CursorID,
+    self_table_context: &SelfTableContext,
+    referenced_tables: Option<&TableReferences>,
+    column: &Column,
+    column_index: usize,
+    target_register: usize,
+    resolver: &Resolver,
+) -> Result<()> {
     match column.generated_type() {
         GeneratedType::Virtual { resolved: expr, .. } => {
-            program.with_self_table_context(
-                Some(&SelfTableContext::ForSelect {
-                    table_ref_id,
-                    referenced_tables: referenced_tables.clone(),
-                }),
-                |program, _| {
-                    translate_expr(
-                        program,
-                        Some(referenced_tables),
-                        expr,
-                        target_register,
-                        resolver,
-                    )?;
-                    Ok(())
-                },
-            )?;
+            program.with_self_table_context(Some(self_table_context), |program, _| {
+                translate_expr(program, referenced_tables, expr, target_register, resolver)?;
+                Ok(())
+            })?;
             program.emit_column_affinity(target_register, column.affinity());
         }
         _ => {
@@ -5659,7 +5700,11 @@ pub fn bind_and_rewrite_expr<'a>(
                     // In this case, there is no ambiguity:
                     // - x in the outer query refers to t.x,
                     // - x in the inner query refers to t2.x.
+                    //
+                    // Ambiguity is only checked within the same scope depth. Once a match
+                    // is found at depth N, deeper scopes (N+1, N+2, ...) are not checked.
                     if match_result.is_none() {
+                        let mut matched_scope_depth = None;
                         for outer_ref in referenced_tables.outer_query_refs().iter() {
                             // CTEs (FromClauseSubquery) in outer_query_refs are only for table
                             // lookup (e.g., FROM cte1), not for column resolution. Columns from
@@ -5667,6 +5712,12 @@ pub fn bind_and_rewrite_expr<'a>(
                             // FROM clause, not as implicit outer references.
                             if matches!(outer_ref.table, Table::FromClauseSubquery(_)) {
                                 continue;
+                            }
+                            // Skip refs from deeper scopes once we found a match
+                            if let Some(depth) = matched_scope_depth {
+                                if outer_ref.scope_depth > depth {
+                                    continue;
+                                }
                             }
                             let col_idx = outer_ref.table.columns().iter().position(|c| {
                                 c.name
@@ -5686,6 +5737,7 @@ pub fn bind_and_rewrite_expr<'a>(
                                     col_idx.unwrap(),
                                     col.is_rowid_alias(),
                                 ));
+                                matched_scope_depth = Some(outer_ref.scope_depth);
                             }
                         }
                     }
@@ -5714,14 +5766,12 @@ pub fn bind_and_rewrite_expr<'a>(
                         }
                     }
 
-                    // SQLite behavior: Only double-quoted identifiers get fallback to string literals
-                    // Single quotes are handled as literals earlier, unquoted identifiers must resolve to columns
-                    if id.quoted_with('"') {
-                        // Convert failed double-quoted identifier to string literal
+                    // SQLite DQS misfeature: double-quoted identifiers fall back to string literals
+                    // only when DQS is enabled for DML statements
+                    if id.quoted_with('"') && resolver.dqs_dml.is_enabled() {
                         *expr = Expr::Literal(ast::Literal::String(id.as_literal()));
                         return Ok(WalkControl::Continue);
                     } else {
-                        // Unquoted identifiers must resolve to columns - no fallback
                         crate::bail_parse_error!("no such column: {}", id.as_str())
                     }
                 }

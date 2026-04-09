@@ -129,10 +129,10 @@ shuttle = { workspace = true }
 # Use pure-rust for Android and MacOS to avoid C cross-compilation issues.
 # Other targets can opt in via the `pure-rust-crypto` feature.
 [target.'cfg(any(target_os = "android", target_os = "macos"))'.dependencies]
-aegis = { version = "0.9.5", features = ["pure-rust"] }
+aegis = { version = "0.9.8", features = ["pure-rust"] }
 
 [target.'cfg(not(any(target_os = "android", target_os = "macos")))'.dependencies]
-aegis = { version = "0.9.5" }
+aegis = { version = "0.9.8" }
 
 [build-dependencies]
 cfg_aliases = "0.2.1"

@@ -16,6 +16,9 @@ label = "fossier:spam-likely"
 comment = true
 label = "fossier:needs-review"
 
+[weights]
+prior_interaction = 0.3
+
 [registry]
 url = "https://registry.fossier.io"
 report_denials = true

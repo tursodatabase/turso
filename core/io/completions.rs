@@ -351,7 +351,9 @@ impl Completion {
     }
 
     pub fn wake(&self) {
-        self.get_inner().context.wake();
+        if let Some(inner) = &self.inner {
+            inner.context.wake();
+        }
     }
 
     pub fn set_waker(&self, waker: &Waker) {

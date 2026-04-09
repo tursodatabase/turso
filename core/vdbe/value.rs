@@ -652,15 +652,37 @@ impl Value {
                 },
                 Some(ignore) => match ignore {
                     Value::Text(_) => {
-                        let pat = ignore.to_string();
-                        let trimmed = self
-                            .to_string()
-                            .trim_start_matches(|x| pat.contains(x))
-                            .trim_end_matches(|x| pat.contains(x))
-                            .to_string();
-                        match hex::decode(trimmed) {
-                            Ok(bytes) => Value::Blob(bytes),
-                            _ => Value::Null,
+                        let input = self.to_string();
+                        let ignore = ignore.to_string();
+                        let mut chars = input.chars().peekable();
+                        let mut out = Vec::with_capacity(input.len() / 2);
+
+                        let is_sep = |c: char| ignore.contains(c) && !c.is_ascii_hexdigit();
+
+                        loop {
+                            while let Some(&c) = chars.peek() {
+                                if is_sep(c) {
+                                    chars.next();
+                                } else {
+                                    break;
+                                }
+                            }
+
+                            let Some(c1) = chars.next() else {
+                                return Value::Blob(out);
+                            };
+                            let Some(hi) = c1.to_digit(16) else {
+                                return Value::Null;
+                            };
+
+                            let Some(c2) = chars.next() else {
+                                return Value::Null;
+                            };
+                            let Some(lo) = c2.to_digit(16) else {
+                                return Value::Null;
+                            };
+
+                            out.push(((hi << 4) | lo) as u8);
                         }
                     }
                     _ => Value::Null,
@@ -2438,6 +2460,38 @@ mod tests {
         let input = Value::Null;
         let expected = Value::Null;
         assert_eq!(input.exec_unhex(None), expected);
+
+        let input = Value::build_text("aa-bb");
+        let expected = Value::Blob(vec![0xaa, 0xbb]);
+        assert_eq!(input.exec_unhex(Some(&Value::build_text("-"))), expected);
+
+        let input = Value::build_text("aa--bb");
+        let expected = Value::Blob(vec![0xaa, 0xbb]);
+        assert_eq!(input.exec_unhex(Some(&Value::build_text("-"))), expected);
+
+        let input = Value::build_text("aa-bb-cc");
+        let expected = Value::Blob(vec![0xaa, 0xbb, 0xcc]);
+        assert_eq!(input.exec_unhex(Some(&Value::build_text("-"))), expected);
+
+        let input = Value::build_text("aa bb");
+        let expected = Value::Blob(vec![0xaa, 0xbb]);
+        assert_eq!(input.exec_unhex(Some(&Value::build_text(" "))), expected);
+
+        let input = Value::build_text("A BCD");
+        let expected = Value::Null;
+        assert_eq!(input.exec_unhex(Some(&Value::build_text(" "))), expected);
+
+        let input = Value::build_text("yx2xEzyx");
+        let expected = Value::Null;
+        assert_eq!(input.exec_unhex(Some(&Value::build_text("xyz"))), expected);
+
+        let input = Value::build_text("aa?bb");
+        let expected = Value::Null;
+        assert_eq!(input.exec_unhex(Some(&Value::build_text("-"))), expected);
+
+        let input = Value::build_text("aabb");
+        let expected = Value::Null;
+        assert_eq!(input.exec_unhex(Some(&Value::Null)), expected);
     }
 
     #[test]

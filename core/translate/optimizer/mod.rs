@@ -646,11 +646,16 @@ pub fn optimize_select_plan(plan: &mut SelectPlan, schema: &Schema) -> Result<()
     // unnesting sees the plan without an artificial LIMIT.
     for sub in &mut plan.non_from_clause_subqueries {
         if matches!(sub.query_type, ast::SubqueryType::Exists { .. }) {
-            if let SubqueryState::Unevaluated { plan: Some(inner) } = &mut sub.state {
-                if inner.limit.is_none() {
-                    inner.limit = Some(Box::new(Expr::Literal(ast::Literal::Numeric(
-                        "1".to_string(),
-                    ))));
+            if let SubqueryState::Unevaluated {
+                plan: Some(inner), ..
+            } = &mut sub.state
+            {
+                if let Plan::Select(ref mut inner) = inner.as_mut() {
+                    if inner.limit.is_none() {
+                        inner.limit = Some(Box::new(Expr::Literal(ast::Literal::Numeric(
+                            "1".to_string(),
+                        ))));
+                    }
                 }
             }
         }
@@ -1002,6 +1007,7 @@ fn add_ephemeral_table_to_update_plan(
                 cte_id: None,
                 cte_definition_only: false,
                 rowid_referenced: false,
+                scope_depth: 0,
             });
     }
 
@@ -1143,6 +1149,9 @@ fn reoptimize_correlated_subqueries(plan: &mut SelectPlan, schema: &Schema) -> R
             plan: Some(inner_plan),
         } = &mut subquery.state
         else {
+            continue;
+        };
+        let Plan::Select(ref mut inner_plan) = inner_plan.as_mut() else {
             continue;
         };
         if !select_plan_contains_cte_from_clause_subquery(inner_plan) {
@@ -3430,7 +3439,7 @@ fn build_seek_def(
 #[cfg(test)]
 mod tests {
     use super::{where_term_is_null_rejecting_for_table, Optimizable};
-    use crate::translate::emitter::Resolver;
+    use crate::translate::emitter::{DoubleQuotedDml, Resolver};
     use crate::{schema::Schema, DatabaseCatalog, RwLock, SymbolTable};
     use rustc_hash::FxHashMap as HashMap;
     use turso_parser::ast::{self, Expr, FunctionTail, Name, TableInternalId};
@@ -3441,7 +3450,14 @@ mod tests {
         attached_databases: &'a RwLock<DatabaseCatalog>,
         syms: &'a SymbolTable,
     ) -> Resolver<'a> {
-        Resolver::new(schema, database_schemas, attached_databases, syms, true)
+        Resolver::new(
+            schema,
+            database_schemas,
+            attached_databases,
+            syms,
+            true,
+            DoubleQuotedDml::Enabled,
+        )
     }
 
     fn no_tail() -> FunctionTail {

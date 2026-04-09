@@ -123,8 +123,10 @@ fn select_plan_first_virtual_table_name(select_plan: &SelectPlan) -> Option<Stri
     }
     for subquery in &select_plan.non_from_clause_subqueries {
         if let SubqueryState::Unevaluated { plan: Some(plan) } = &subquery.state {
-            if let Some(name) = select_plan_first_virtual_table_name(plan) {
-                return Some(name);
+            if let Plan::Select(plan) = plan.as_ref() {
+                if let Some(name) = select_plan_first_virtual_table_name(plan) {
+                    return Some(name);
+                }
             }
         }
     }
@@ -532,7 +534,11 @@ fn prepare_one_select_plan(
                 if !group_by.exprs.is_empty() {
                     // Normal GROUP BY with expressions
                     for expr in group_by.exprs.iter_mut() {
-                        replace_column_number_with_copy_of_column_expr(expr, &plan.result_columns)?;
+                        replace_column_number_with_copy_of_column_expr(
+                            expr,
+                            &plan.result_columns,
+                            "GROUP BY",
+                        )?;
                         bind_and_rewrite_expr(
                             expr,
                             Some(&mut plan.table_references),
@@ -582,7 +588,11 @@ fn prepare_one_select_plan(
                 .is_some_and(|gb| !gb.exprs.is_empty());
 
             for mut o in order_by {
-                replace_column_number_with_copy_of_column_expr(&mut o.expr, &plan.result_columns)?;
+                replace_column_number_with_copy_of_column_expr(
+                    &mut o.expr,
+                    &plan.result_columns,
+                    "ORDER BY",
+                )?;
 
                 bind_and_rewrite_expr(
                     &mut o.expr,
@@ -919,7 +929,7 @@ fn reject_outer_query_refs_in_group_by_expr(
                 else {
                     unreachable!("GROUP BY subquery must be in unevaluated state during planning");
                 };
-                reject_outer_scope_refs_inside_select_plan(subquery_plan, table_references)?;
+                reject_outer_scope_refs_inside_plan_tree(subquery_plan, table_references)?;
             }
             _ => {}
         }
@@ -985,7 +995,7 @@ fn reject_outer_scope_refs_inside_select_plan(
         else {
             continue;
         };
-        reject_outer_scope_refs_inside_select_plan(subquery_plan, current_scope_table_refs)?;
+        reject_outer_scope_refs_inside_plan_tree(subquery_plan, current_scope_table_refs)?;
     }
 
     for joined_table in plan.table_references.joined_tables().iter() {
@@ -1058,6 +1068,7 @@ fn vtab_predicate_table_id(expr: &Expr) -> Option<ast::TableInternalId> {
 fn replace_column_number_with_copy_of_column_expr(
     order_by_or_group_by_expr: &mut ast::Expr,
     columns: &[ResultSetColumn],
+    clause_name: &str,
 ) -> Result<()> {
     // Extract the numeric literal string, handling both bare integers (e.g. `2`)
     // and unary-plus integers (e.g. `+2`). In SQLite, `ORDER BY +2` strips the
@@ -1075,7 +1086,8 @@ fn replace_column_number_with_copy_of_column_expr(
             if let ast::Expr::Literal(ast::Literal::Numeric(num)) = inner.as_ref() {
                 if num.parse::<usize>().is_ok() {
                     crate::bail_parse_error!(
-                        "1st ORDER BY term out of range - should be between 1 and {}",
+                        "1st {} term out of range - should be between 1 and {}",
+                        clause_name,
                         columns.len()
                     );
                 }
@@ -1090,7 +1102,8 @@ fn replace_column_number_with_copy_of_column_expr(
         if let Ok(column_number) = num.parse::<usize>() {
             if column_number == 0 || column_number > columns.len() {
                 crate::bail_parse_error!(
-                    "1st ORDER BY term out of range - should be between 1 and {}",
+                    "1st {} term out of range - should be between 1 and {}",
+                    clause_name,
                     columns.len()
                 );
             }

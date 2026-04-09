@@ -1,0 +1,12 @@
+@database :memory:
+
+@backend cli
+@skip-if sqlite "sqlite backend in sqltests does not support .tables dot command here"
+test tables-includes-views {
+    CREATE TABLE t1(a);
+    CREATE VIEW v1 AS SELECT a FROM t1;
+    .tables
+}
+expect raw {
+t1 v1
+}
