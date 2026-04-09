@@ -128,7 +128,7 @@ use crate::storage::btree::{BTreeCursor, CursorTrait};
 use crate::sync::Arc;
 use crate::sync::Mutex;
 use crate::translate::collate::CollationSeq;
-use crate::translate::plan::{ColumnUsedMask, Plan, TableReferences};
+use crate::translate::plan::{BitSet, ColumnUsedMask, Plan, TableReferences};
 use crate::util::{
     module_args_from_sql, module_name_from_sql, type_from_name, UnparsedFromSqlIndex,
 };
@@ -2715,10 +2715,11 @@ pub(crate) fn columns_affected_by_update(
 
 /// returns a bitset containing the indexes of the stored columns that the virtual columns in
 /// `targets` depends on.
-pub(crate) fn stored_deps_of_virtual(columns: &[Column], targets: impl IntoIterator<Item = usize>) -> ColumnUsedMask {
-    type Bitset = ColumnUsedMask;
-
-    fn collect_column_dependencies_of_gencol(expr: &Expr, columns: &[Column], out: &mut Bitset) {
+pub(crate) fn stored_deps_of_virtual(
+    columns: &[Column],
+    targets: impl IntoIterator<Item = usize>,
+) -> ColumnUsedMask {
+    fn collect_column_dependencies_of_gencol(expr: &Expr, columns: &[Column], out: &mut BitSet) {
         let _ = walk_expr(expr, &mut |e| {
             match e {
                 Expr::Column { table, column, .. } if table.is_self_table() => {
@@ -2746,14 +2747,14 @@ pub(crate) fn stored_deps_of_virtual(columns: &[Column], targets: impl IntoItera
         });
     }
 
-    let mut dependencies = Bitset::default();
-    let mut visited = Bitset::default();
-    let mut pending = Bitset::default();
+    let mut dependencies = BitSet::default();
+    let mut visited = BitSet::default();
+    let mut pending = BitSet::default();
     for idx in targets {
         pending.set(idx);
     }
     loop {
-        let mut next = Bitset::default();
+        let mut next = BitSet::default();
         for idx in pending.iter() {
             if visited.get(idx) {
                 continue;
