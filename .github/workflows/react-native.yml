@@ -177,8 +177,7 @@ jobs:
             -sdk iphonesimulator \
             -destination 'generic/platform=iOS Simulator' \
             -configuration Debug \
-            CODE_SIGNING_ALLOWED=NO \
-            | tail -50
+            CODE_SIGNING_ALLOWED=NO
         working-directory: examples/react-native/ios
 
   publish:
