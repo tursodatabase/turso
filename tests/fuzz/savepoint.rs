@@ -14,9 +14,36 @@ mod savepoint_tests {
 
     const SAVEPOINT_NAMES: [&str; 8] = ["sp0", "sp1", "outer", "inner", "alpha", "beta", "x", "y"];
     const TAG_POOL: [&str; 8] = ["a", "b", "c", "d", "e", "foo", "bar", "baz"];
+    const TEMP_TABLE_NAMES: [&str; 3] = ["ttmp_a", "ttmp_b", "ttmp_c"];
 
     fn random_savepoint_name(rng: &mut ChaCha8Rng) -> &'static str {
         SAVEPOINT_NAMES.choose(rng).unwrap()
+    }
+
+    /// DDL targeting the TEMP schema. Used by the savepoint fuzzer to
+    /// exercise the Phase 1.2 rollback-to-savepoint restore path for
+    /// the connection-local temp schema.
+    ///
+    /// Scope is intentionally limited to CREATE/DROP TABLE + INSERT.
+    /// CREATE INDEX / CREATE TRIGGER are deferred to Phase 1.4 which
+    /// fixes DROP TABLE's cascade to dependent temp objects.
+    fn random_temp_ddl_stmt(rng: &mut ChaCha8Rng) -> String {
+        match rng.random_range(0..3) {
+            0 => {
+                let name = TEMP_TABLE_NAMES.choose(rng).unwrap();
+                format!("CREATE TEMP TABLE IF NOT EXISTS {name}(x INT, y INT)")
+            }
+            1 => {
+                let name = TEMP_TABLE_NAMES.choose(rng).unwrap();
+                format!("DROP TABLE IF EXISTS temp.{name}")
+            }
+            2 => {
+                let name = TEMP_TABLE_NAMES.choose(rng).unwrap();
+                let v = rng.random_range(1..=30);
+                format!("INSERT INTO temp.{name}(x, y) VALUES ({v}, {v})")
+            }
+            _ => unreachable!(),
+        }
     }
 
     fn random_where_clause(rng: &mut ChaCha8Rng) -> String {
@@ -254,16 +281,22 @@ mod savepoint_tests {
             ),
             ("p", "SELECT id, grp, tag FROM p ORDER BY id, grp, tag"),
             ("c", "SELECT id, pid, note FROM c ORDER BY id, pid, note"),
+            (
+                "temp_schema",
+                "SELECT type, name, tbl_name FROM temp.sqlite_schema \
+                 WHERE name NOT LIKE 'sqlite_%' ORDER BY type, name",
+            ),
         ];
 
         for step in 0..STEPS {
             helpers::log_progress("named_savepoint_differential_fuzz", step, STEPS, 8);
 
             let stmt = match rng.random_range(0..100) {
-                0..=29 => random_dml_stmt(&mut rng),
-                30..=49 => random_fk_dml_stmt(&mut rng),
+                0..=24 => random_dml_stmt(&mut rng),
+                25..=39 => random_fk_dml_stmt(&mut rng),
+                40..=49 => random_temp_ddl_stmt(&mut rng),
                 50..=74 => format!("SAVEPOINT {}", random_savepoint_name(&mut rng)),
-                75..=87 => {
+                75..=86 => {
                     let name = random_savepoint_name(&mut rng);
                     if rng.random_bool(0.5) {
                         format!("RELEASE {name}")
@@ -271,7 +304,7 @@ mod savepoint_tests {
                         format!("RELEASE SAVEPOINT {name}")
                     }
                 }
-                88..=99 => {
+                87..=99 => {
                     let name = random_savepoint_name(&mut rng);
                     if rng.random_bool(0.5) {
                         format!("ROLLBACK TO {name}")
