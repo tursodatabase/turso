@@ -28,11 +28,15 @@ impl Hash128 {
 
     /// Get the low 64 bits as i64 (for when we need a rowid)
     pub fn as_i64(&self) -> i64 {
+        self.as_u64() as i64
+    }
+
+    /// Get the low 64 bits as u64 (for use as a hash key)
+    pub fn as_u64(&self) -> u64 {
         let bytes = self.uuid.as_bytes();
-        let low = u64::from_be_bytes([
+        u64::from_be_bytes([
             bytes[8], bytes[9], bytes[10], bytes[11], bytes[12], bytes[13], bytes[14], bytes[15],
-        ]);
-        low as i64
+        ])
     }
 
     /// Compute a 128-bit hash of the given values
