@@ -44,8 +44,8 @@ const BLOB_HASH: u8 = 4;
 #[inline]
 /// Hash text case-insensitively without allocation (ASCII-only for SQLite NOCASE).
 /// SQLite's NOCASE collation only considers ASCII case, so to_ascii_lowercase() is correct.
-fn hash_text_nocase(hasher: &mut impl Hasher, text: &str) {
-    for byte in text.bytes() {
+fn hash_text_nocase(hasher: &mut impl Hasher, text: &[u8]) {
+    for &byte in text {
         hasher.write_u8(byte.to_ascii_lowercase());
     }
 }
@@ -83,11 +83,16 @@ fn hash_join_key(key_values: &[ValueRef], collations: &[CollationSeq]) -> u64 {
                 hasher.write_u8(TEXT_HASH);
                 match collation {
                     CollationSeq::NoCase => {
-                        hash_text_nocase(&mut hasher, text.as_str());
+                        hash_text_nocase(&mut hasher, text.as_bytes());
                     }
                     CollationSeq::Rtrim => {
-                        let trimmed = text.as_str().trim_end();
-                        hasher.write(trimmed.as_bytes());
+                        let trimmed = text
+                            .as_bytes()
+                            .iter()
+                            .rposition(|&b| b != b' ')
+                            .map(|i| &text.as_bytes()[..=i])
+                            .unwrap_or(&[]);
+                        hasher.write(trimmed);
                     }
                     CollationSeq::Binary | CollationSeq::Unset => {
                         hasher.write(text.as_bytes());
@@ -150,7 +155,7 @@ fn values_equal(v1: ValueRef, v2: ValueRef, collation: CollationSeq) -> bool {
         (ValueRef::Blob(b1), ValueRef::Blob(b2)) => b1 == b2,
         (ValueRef::Text(t1), ValueRef::Text(t2)) => {
             // Use collation for text comparison
-            collation.compare_strings(t1.as_str(), t2.as_str()) == Ordering::Equal
+            collation.compare_texts(t1.as_bytes(), t2.as_bytes()) == Ordering::Equal
         }
         _ => false,
     }
@@ -269,7 +274,7 @@ impl HashEntry {
         let value_size = |v: &Value| match v {
             Value::Null => 1,
             Value::Numeric(_) => 8,
-            Value::Text(t) => t.as_str().len(),
+            Value::Text(t) => t.as_bytes().len(),
             Value::Blob(b) => b.len(),
         };
         let key_size: usize = key_values.iter().map(value_size).sum();
@@ -284,7 +289,7 @@ impl HashEntry {
             Value::Null => 0,
             Value::Numeric(_) => 8,
             Value::Text(t) => {
-                let len = t.as_str().len();
+                let len = t.as_bytes().len();
                 varint_len(len as u64) + len
             }
             Value::Blob(b) => varint_len(b.len() as u64) + b.len(),
@@ -350,7 +355,7 @@ impl HashEntry {
             Value::Text(t) => {
                 buf[offset] = TEXT_HASH;
                 offset += 1;
-                let bytes = t.as_str().as_bytes();
+                let bytes = t.as_bytes();
                 offset += write_varint(&mut buf[offset..], bytes.len() as u64);
                 buf[offset..offset + bytes.len()].copy_from_slice(bytes);
                 offset += bytes.len();
@@ -405,7 +410,7 @@ impl HashEntry {
             }
             Value::Text(t) => {
                 buf.push(TEXT_HASH);
-                let bytes = t.as_str().as_bytes();
+                let bytes = t.as_bytes();
                 let len = write_varint(varint_buf, bytes.len() as u64);
                 buf.extend_from_slice(&varint_buf[..len]);
                 buf.extend_from_slice(bytes);
@@ -508,14 +513,9 @@ impl HashEntry {
                         "HashEntry: buffer too small for text".to_string(),
                     ));
                 }
-                // SAFETY: We serialized this data ourselves, so it should be valid UTF-8.
-                // Skipping validation here for performance in the spill/reload path.
-                // Doing checked utf8 construction here is a massive performance hit.
-                let s = unsafe {
-                    String::from_utf8_unchecked(buf[offset..offset + str_len as usize].to_vec())
-                };
+                let s = buf[offset..offset + str_len as usize].to_vec();
                 offset += str_len as usize;
-                Value::Text(s.into())
+                Value::from_text(s)
             }
             BLOB_HASH => {
                 let (blob_len, varint_len) = read_varint(&buf[offset..])?;
@@ -3451,7 +3451,9 @@ mod hashtests {
                 (Value::Numeric(Numeric::Integer(i1)), Value::Numeric(Numeric::Integer(i2))) => {
                     assert_eq!(i1, i2)
                 }
-                (Value::Text(t1), Value::Text(t2)) => assert_eq!(t1.as_str(), t2.as_str()),
+                (Value::Text(t1), Value::Text(t2)) => {
+                    assert_eq!(t1.try_as_str().unwrap(), t2.try_as_str().unwrap())
+                }
                 (Value::Numeric(Numeric::Float(f1)), Value::Numeric(Numeric::Float(f2))) => {
                     assert!((f64::from(*f1) - f64::from(*f2)).abs() < 1e-10)
                 }
@@ -4617,7 +4619,9 @@ mod hashtests {
                     let expected_payload = format!("payload_{}", build_entry.rowid);
                     assert_eq!(build_entry.payload_values.len(), 1);
                     match &build_entry.payload_values[0] {
-                        Value::Text(t) => assert_eq!(t.as_str(), expected_payload.as_str()),
+                        Value::Text(t) => {
+                            assert_eq!(t.try_as_str().unwrap(), expected_payload.as_str())
+                        }
                         other => panic!("expected text payload, got {other:?}"),
                     }
                     match_count += 1;

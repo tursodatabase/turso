@@ -1855,7 +1855,7 @@ pub unsafe extern "C" fn sqlite3_column_bytes(
         None => return 0,
     };
     match row.get::<&Value>(idx as usize) {
-        Ok(turso_core::Value::Text(text)) => text.as_str().len() as ffi::c_int,
+        Ok(turso_core::Value::Text(text)) => text.as_bytes().len() as ffi::c_int,
         Ok(turso_core::Value::Blob(blob)) => blob.len() as ffi::c_int,
         _ => 0,
     }
@@ -1998,7 +1998,7 @@ pub unsafe extern "C" fn sqlite3_column_text(
     match row.get::<&Value>(i) {
         Ok(turso_core::Value::Text(text)) => {
             let buf = &mut stmt.text_cache[i];
-            buf.extend(text.as_str().as_bytes());
+            buf.extend(text.as_bytes());
             buf.push(0);
             buf.as_ptr() as *const ffi::c_uchar
         }
@@ -2039,7 +2039,11 @@ pub unsafe extern "C" fn sqlite3_column_value(
         Ok(turso_core::Value::Numeric(turso_core::Numeric::Float(f))) => {
             ExtValue::from_float(f64::from(*f))
         }
-        Ok(turso_core::Value::Text(t)) => ExtValue::from_text(t.value.to_string()),
+        Ok(turso_core::Value::Text(t)) => {
+            // The extension value API still models TEXT as String, so this bridge is lossy
+            // until raw-byte TEXT is supported there too.
+            ExtValue::from_text(t.as_str_lossy().into_owned())
+        }
         Ok(turso_core::Value::Blob(b)) => ExtValue::from_blob(b.clone()),
         _ => ExtValue::null(),
     };
@@ -2878,13 +2882,19 @@ pub unsafe extern "C" fn sqlite3_table_column_metadata(
                     let mut found_column = false;
                     for row in rows {
                         let col_name: &str = match &row[1] {
-                            turso_core::Value::Text(text) => text.as_str(),
+                            turso_core::Value::Text(text) => match text.try_as_str() {
+                                Ok(text) => text,
+                                Err(_) => return SQLITE_ERROR,
+                            },
                             _ => return SQLITE_ERROR,
                         }; // name column
                         if col_name == column_name {
                             // Found the column, extract metadata
                             let col_type: String = match &row[2] {
-                                turso_core::Value::Text(text) => text.as_str().to_string(),
+                                turso_core::Value::Text(text) => match text.try_as_str() {
+                                    Ok(text) => text.to_string(),
+                                    Err(_) => return SQLITE_ERROR,
+                                },
                                 _ => return SQLITE_ERROR,
                             }; // type column
                             let col_notnull: i64 = row[3].as_int().unwrap(); // notnull column

@@ -201,7 +201,17 @@ impl DatabaseReplayGenerator {
                             before.get(1)
                         );
                     };
-                    let query = format!("DROP {} {}", entity_type.as_str(), entity_name.as_str());
+                    let entity_type = entity_type.try_as_str().map_err(|_| {
+                        Error::DatabaseTapeError(
+                            "sqlite_schema.type must be valid UTF-8".to_string(),
+                        )
+                    })?;
+                    let entity_name = entity_name.try_as_str().map_err(|_| {
+                        Error::DatabaseTapeError(
+                            "sqlite_schema.name must be valid UTF-8".to_string(),
+                        )
+                    })?;
+                    let query = format!("DROP {entity_type} {entity_name}");
                     let delete = ReplayInfo {
                         change_type: DatabaseChangeType::Delete,
                         query,
@@ -219,26 +229,23 @@ impl DatabaseReplayGenerator {
                             after.last()
                         )));
                     };
-                    let mut parser = Parser::new(sql.as_str().as_bytes());
+                    let sql = sql.try_as_str().map_err(|_| {
+                        Error::DatabaseTapeError(
+                            "sqlite_schema.sql must be valid UTF-8".to_string(),
+                        )
+                    })?;
+                    let mut parser = Parser::new(sql.as_bytes());
                     let mut ast = parser
                         .next()
                         .ok_or_else(|| {
-                            Error::DatabaseTapeError(format!(
-                                "unexpected DDL query: {}",
-                                sql.as_str()
-                            ))
+                            Error::DatabaseTapeError(format!("unexpected DDL query: {sql}"))
                         })?
                         .map_err(|e| {
-                            Error::DatabaseTapeError(format!(
-                                "unexpected DDL query {}: {}",
-                                e,
-                                sql.as_str()
-                            ))
+                            Error::DatabaseTapeError(format!("unexpected DDL query {e}: {sql}"))
                         })?;
                     let turso_parser::ast::Cmd::Stmt(stmt) = &mut ast else {
                         return Err(Error::DatabaseTapeError(format!(
-                            "unexpected DDL query: {}",
-                            sql.as_str()
+                            "unexpected DDL query: {sql}"
                         )));
                     };
                     match stmt {
@@ -278,7 +285,11 @@ impl DatabaseReplayGenerator {
                     };
                     let update = ReplayInfo {
                         change_type: DatabaseChangeType::Update,
-                        query: ddl_stmt.as_str().to_string(),
+                        query: ddl_stmt.try_as_str().map(str::to_owned).map_err(|_| {
+                            Error::DatabaseTapeError(
+                                "sqlite_schema.sql must be valid UTF-8".to_string(),
+                            )
+                        })?,
                         pk_column_indices: None,
                         column_names: Vec::new(),
                         is_ddl_replay: true,
@@ -538,7 +549,9 @@ impl DatabaseReplayGenerator {
             if *pk == 1 {
                 pk_column_indices.push(*column_id as usize);
             }
-            column_names.push(name.as_str().to_string());
+            column_names.push(name.try_as_str().map(str::to_owned).map_err(|_| {
+                Error::DatabaseTapeError("PRAGMA table_info name must be valid UTF-8".to_string())
+            })?);
         }
         Ok((column_names, pk_column_indices))
     }

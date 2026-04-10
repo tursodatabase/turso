@@ -3145,9 +3145,9 @@ mod tests {
             if let (Value::Text(name), Value::Numeric(Numeric::Float(sum))) =
                 (&row.values[0], &row.values[1])
             {
-                if name.as_str() == "Alice" {
+                if name.try_as_str().unwrap() == "Alice" {
                     assert_eq!(*sum, 55.0, "Alice should have sum 55");
-                } else if name.as_str() == "Bob" {
+                } else if name.try_as_str().unwrap() == "Bob" {
                     assert_eq!(*sum, 20.0, "Bob should have sum 20");
                 }
             }
@@ -3815,7 +3815,7 @@ mod tests {
             .iter()
             .map(|(row, _)| {
                 if let Value::Text(name) = &row.values[1] {
-                    name.as_str().to_string()
+                    name.try_as_str().unwrap().to_string()
                 } else {
                     panic!("Expected text value");
                 }
@@ -5065,7 +5065,11 @@ mod tests {
                 Value::Numeric(Numeric::Float(total)),
             ) = (&row.values[0], &row.values[1], &row.values[2])
             {
-                let key = format!("{}-{}", name.as_ref(), product.as_ref());
+                let key = format!(
+                    "{}-{}",
+                    name.try_as_str().unwrap(),
+                    product.try_as_str().unwrap()
+                );
                 found_results.insert(key.clone());
 
                 match key.as_str() {
@@ -5663,10 +5667,10 @@ mod tests {
 
             // Check the aggregated values
             if let Value::Text(name) = &row.values[0] {
-                if name.as_ref() == "Alice" {
+                if name.try_as_str().unwrap() == "Alice" {
                     // Alice should have total quantity of 8 (5 + 3)
                     assert_eq!(row.values[1], Value::from_i64(8));
-                } else if name.as_ref() == "Bob" {
+                } else if name.try_as_str().unwrap() == "Bob" {
                     // Bob should have total quantity of 7
                     assert_eq!(row.values[1], Value::from_i64(7));
                 }

@@ -1,4 +1,4 @@
-use crate::{assert_send_sync, Column, Error, Result, Statement, Value};
+use crate::{assert_send_sync, Column, Error, Result, Statement, Value, ValueRef};
 use std::fmt::Debug;
 use std::future::Future;
 
@@ -73,6 +73,16 @@ pub struct Row {
 }
 
 impl Row {
+    pub fn get_value_ref(&self, idx: usize) -> Result<ValueRef<'_>> {
+        let val = self.values.get(idx).ok_or_else(|| {
+            Error::Misuse(format!(
+                "column index {idx} out of bounds (row has {} columns)",
+                self.values.len()
+            ))
+        })?;
+        Ok(val.into())
+    }
+
     pub fn get_value(&self, idx: usize) -> Result<Value> {
         let val = self.values.get(idx).ok_or_else(|| {
             Error::Misuse(format!(
@@ -88,9 +98,12 @@ impl Row {
                 Ok(Value::Real(f64::from(*f)))
             }
             turso_sdk_kit::rsapi::Value::Null => Ok(Value::Null),
-            turso_sdk_kit::rsapi::Value::Text(text) => {
-                Ok(Value::Text(text.value.clone().into_owned()))
-            }
+            turso_sdk_kit::rsapi::Value::Text(text) => text
+                .try_as_str()
+                .map(|text| Value::Text(text.to_owned()))
+                .map_err(|err| {
+                    Error::ConversionFailure(format!("invalid UTF-8 in TEXT value: {err}"))
+                }),
             turso_sdk_kit::rsapi::Value::Blob(items) => Ok(Value::Blob(items.to_vec())),
         }
     }

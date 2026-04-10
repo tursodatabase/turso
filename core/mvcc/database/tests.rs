@@ -514,7 +514,7 @@ fn tamper_db_metadata_row_value(db_path: &str, metadata_root_page: u32, new_valu
     };
     let new_record = ImmutableRecord::from_values(
         &[
-            Value::Text(Text::new(key.as_str().to_string())),
+            Value::Text(Text::new(key.try_as_str().unwrap().to_string())),
             Value::from_i64(new_value),
         ],
         2,
@@ -541,7 +541,7 @@ fn tamper_db_metadata_row_value_by_key(
         let ValueRef::Text(key) = key else {
             panic!("metadata key must be text");
         };
-        if key.as_str() != target_key {
+        if key.try_as_str().unwrap() != target_key {
             continue;
         }
         let new_record = ImmutableRecord::from_values(
@@ -4244,7 +4244,7 @@ fn test_restart() {
         let record = get_record_value(&row);
         match record.get_value(0).unwrap() {
             ValueRef::Text(text) => {
-                assert_eq!(text.as_str(), "bar");
+                assert_eq!(text.try_as_str().unwrap(), "bar");
             }
             _ => panic!("Expected Text value"),
         }
@@ -8108,7 +8108,7 @@ fn test_mvcc_encrypted_log_recovery_and_wrong_key() {
             .unwrap();
         let record = get_record_value(&row);
         match record.get_value(0).unwrap() {
-            ValueRef::Text(text) => assert_eq!(text.as_str(), "encrypted_value"),
+            ValueRef::Text(text) => assert_eq!(text.try_as_str().unwrap(), "encrypted_value"),
             other => panic!("Expected Text, got {other:?}"),
         }
         conn.close().unwrap();

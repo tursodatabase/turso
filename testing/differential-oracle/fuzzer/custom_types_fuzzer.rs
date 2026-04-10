@@ -482,7 +482,7 @@ fn execute_turso_rows(conn: &Arc<turso_core::Connection>, sql: &str) -> Result<V
                         values.push(f.to_string());
                     }
                     turso_core::Value::Text(s) => {
-                        values.push(s.as_str().to_string());
+                        values.push(s.as_str_lossy().into_owned());
                     }
                     turso_core::Value::Blob(b) => {
                         let hex: String = b.iter().map(|byte| format!("{byte:02x}")).collect();

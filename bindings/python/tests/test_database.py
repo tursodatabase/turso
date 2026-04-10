@@ -1012,6 +1012,20 @@ def test_blob_data(provider):
     conn.close()
 
 
+def test_invalid_utf8_text_returns_bytes_turso():
+    conn = turso.connect(":memory:")
+    cursor = conn.cursor()
+    cursor.execute("CREATE TABLE test (value TEXT)")
+    cursor.execute("INSERT INTO test VALUES (CAST(X'FF' AS TEXT))")
+
+    cursor.execute("SELECT value FROM test")
+    row = cursor.fetchone()
+
+    assert row == (b"\xFF",)
+
+    conn.close()
+
+
 @pytest.mark.parametrize("provider", ["sqlite3", "turso"])
 def test_limit_offset(provider):
     conn = connect(provider, ":memory:")

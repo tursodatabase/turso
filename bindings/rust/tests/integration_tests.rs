@@ -1,5 +1,5 @@
 use tokio::fs;
-use turso::{Builder, EncryptionOpts, Error, Value};
+use turso::{Builder, EncryptionOpts, Error, Value, ValueRef};
 
 #[tokio::test]
 async fn test_rows_next() {
@@ -300,6 +300,29 @@ async fn test_row_get_conversion_error() {
 
     // Attempt to convert TEXT into integer (should fail)
     let result: Result<u32, _> = row.get(0);
+    assert!(matches!(result, Err(Error::ConversionFailure(_))));
+}
+
+#[tokio::test]
+async fn test_invalid_text_bytes_require_raw_access() {
+    let db = Builder::new_local(":memory:").build().await.unwrap();
+    let conn = db.connect().unwrap();
+
+    conn.execute("CREATE TABLE t (x TEXT)", ()).await.unwrap();
+    conn.execute("INSERT INTO t VALUES (CAST(X'FF' AS TEXT))", ())
+        .await
+        .unwrap();
+
+    let mut rows = conn.query("SELECT x FROM t", ()).await.unwrap();
+    let row = rows.next().await.unwrap().unwrap();
+
+    assert!(matches!(
+        row.get_value_ref(0).unwrap(),
+        ValueRef::Text(b"\xFF")
+    ));
+    assert!(matches!(row.get_value(0), Err(Error::ConversionFailure(_))));
+
+    let result: Result<String, _> = row.get(0);
     assert!(matches!(result, Err(Error::ConversionFailure(_))));
 }
 

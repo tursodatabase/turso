@@ -259,11 +259,7 @@ impl InternalVirtualTableCursor for JsonEachCursor {
         if args.len() == 2 && matches!(self.traversal_mode, JsonTraversalMode::Tree) {
             if let Value::Text(ref text) = args[1] {
                 if !text.value.is_empty()
-                    && text
-                        .value
-                        .as_bytes()
-                        .windows(3)
-                        .any(|chars| chars == b"[#-")
+                    && text.value.as_ref().windows(3).any(|chars| chars == b"[#-")
                 {
                     return Err(LimboError::InvalidArgument(
                         "Json paths with negative indices in json_tree are not supported yet"
@@ -276,7 +272,7 @@ impl InternalVirtualTableCursor for JsonEachCursor {
         let mut jsonb = convert_dbtype_to_jsonb(&args[0], Conv::Strict)?;
 
         let (path, root_json) = if args.len() == 1 {
-            let path = "$";
+            let path = "$".to_string();
             (path, jsonb)
         } else {
             let Value::Text(path) = &args[1] else {
@@ -289,12 +285,12 @@ impl InternalVirtualTableCursor for JsonEachCursor {
             } else {
                 return Ok(false);
             };
-            (path.as_str(), root_json)
+            (path.as_str_lossy().into_owned(), root_json)
         };
 
         self.json = root_json;
         self.path_to_current_value =
-            InPlaceJsonPath::from_json_path(path.to_owned(), json_path(path)?);
+            InPlaceJsonPath::from_json_path(path.clone(), json_path(&path)?);
         let iterator_state = json_iterator_from(&self.json)?;
         let innermost_container_path = if matches!(self.traversal_mode, JsonTraversalMode::Tree)
             && matches!(iterator_state, IteratorState::Primitive(_))

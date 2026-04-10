@@ -1,0 +1,158 @@
+@database :memory:
+
+setup invalid-text-row {
+    CREATE TABLE t(val TEXT);
+    INSERT INTO t VALUES(CAST(X'FF' AS TEXT));
+}
+
+@setup invalid-text-row
+test invalid-text-lossy-text-functions {
+    SELECT
+        hex(val),
+        length(val),
+        octet_length(val),
+        quote(val),
+        unicode(val),
+        hex(lower(val)),
+        hex(upper(val)),
+        val LIKE '%a%',
+        instr(val, 'a')
+    FROM t;
+}
+expect {
+    FF|1|1|'�'|65533|FF|FF|0|0
+}
+
+@setup invalid-text-row
+test invalid-text-byte-preserving-functions {
+    SELECT
+        hex(val || 'x'),
+        hex(concat(val, 'x')),
+        hex(group_concat(val)),
+        hex(trim(val, ' ')),
+        hex(replace(val, 'a', 'x')),
+        hex(replace(val, CAST(X'FF' AS TEXT), 'x')),
+        hex(substr(val, 1, 1)),
+        hex(CAST(val AS TEXT)),
+        hex(CAST(val AS BLOB))
+    FROM t;
+}
+expect {
+    FF78|FF78|FF|FF|FF|78|FF|FF|FF
+}
+
+@setup invalid-text-row
+test invalid-text-trim-invalid-pattern {
+    SELECT
+        hex(trim(val, CAST(X'FF' AS TEXT))),
+        hex(ltrim(val, CAST(X'FF' AS TEXT))),
+        hex(rtrim(val, CAST(X'FF' AS TEXT)))
+    FROM t;
+}
+expect {
+        ||
+}
+
+setup mixed-invalid-text-row {
+    CREATE TABLE t(val TEXT);
+    INSERT INTO t VALUES(CAST(X'61FF62E282AC63C32864' AS TEXT));
+}
+
+@setup mixed-invalid-text-row
+test mixed-invalid-text-byte-walks {
+    SELECT
+        hex(val),
+        length(val),
+        octet_length(val),
+        hex(substr(val, 1, 6)),
+        instr(val, CAST(X'E282AC' AS TEXT)),
+        instr(val, CAST(X'C328' AS TEXT)),
+        hex(trim(val, CAST(X'61FF' AS TEXT))),
+        hex(trim(val, CAST(X'64' AS TEXT)))
+    FROM t;
+}
+expect {
+    61FF62E282AC63C32864|8|10|61FF62E282AC63C3|4|6|62E282AC63C32864|61FF62E282AC63C328
+}
+
+setup truncated-invalid-text-row {
+    CREATE TABLE t(val TEXT);
+    INSERT INTO t VALUES(CAST(X'E282' AS TEXT));
+}
+
+@setup truncated-invalid-text-row
+test truncated-invalid-text-units {
+    SELECT
+        hex(val),
+        length(val),
+        octet_length(val),
+        hex(substr(val, 1, 2)),
+        instr(val, CAST(X'E282' AS TEXT)),
+        hex(trim(val, CAST(X'E282' AS TEXT)))
+    FROM t;
+}
+expect {
+    E282|1|2|E282|1|
+}
+
+setup invalid-text-comparison-rows {
+    CREATE TABLE t(val TEXT);
+    INSERT INTO t VALUES
+        (CAST(X'FF' AS TEXT)),
+        (CAST(X'FE' AS TEXT)),
+        (CAST(X'FF' AS TEXT));
+}
+
+@setup invalid-text-comparison-rows
+test invalid-text-set-ops-and-grouping {
+    SELECT
+        (SELECT group_concat(hex(val), ',') FROM (SELECT DISTINCT val FROM t ORDER BY val)),
+        (SELECT group_concat(hex(val), ',') FROM (SELECT val FROM t UNION SELECT val FROM t ORDER BY val)),
+        (SELECT group_concat(hex(val) || ':' || cnt, ',') FROM (SELECT val, count(*) AS cnt FROM t GROUP BY val ORDER BY val));
+}
+expect {
+    FE,FF|FE,FF|FE:1,FF:2
+}
+
+@setup invalid-text-comparison-rows
+test invalid-text-comparisons-and-collations {
+    SELECT
+        CAST(X'FF' AS TEXT) = CAST(X'FF' AS TEXT),
+        CAST(X'FF' AS TEXT) = CAST(X'FE' AS TEXT),
+        (SELECT group_concat(hex(val), ',') FROM (SELECT val FROM t ORDER BY val COLLATE BINARY, rowid)),
+        (SELECT group_concat(hex(val), ',') FROM (SELECT val FROM t ORDER BY val COLLATE NOCASE, rowid)),
+        (SELECT group_concat(hex(val), ',') FROM (SELECT val FROM t ORDER BY val COLLATE RTRIM, rowid));
+}
+expect {
+    1|0|FE,FF,FF|FE,FF,FF|FE,FF,FF
+}
+
+setup mixed-case-invalid-text-row {
+    CREATE TABLE t(val TEXT);
+    INSERT INTO t VALUES(CAST(X'41FF42' AS TEXT));
+}
+
+@setup mixed-case-invalid-text-row
+test mixed-invalid-text-case-folding {
+    SELECT
+        hex(lower(val)),
+        hex(upper(val))
+    FROM t;
+}
+expect {
+    61FF62|41FF42
+}
+
+@skip-if sqlite "sqlite shell .dump output is lossy for invalid TEXT and differs in formatting"
+@backend cli
+@setup invalid-text-row
+test invalid-text-dump-emits-replayable-sql {
+    .dump
+}
+expect raw {
+PRAGMA foreign_keys=OFF;
+BEGIN TRANSACTION;
+CREATE TABLE t (val TEXT);
+INSERT INTO "t" VALUES(CAST(X'ff' AS TEXT));
+COMMIT;
+}

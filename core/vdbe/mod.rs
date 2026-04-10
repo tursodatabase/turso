@@ -187,6 +187,27 @@ impl BranchOffset {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::{Register, ValueIteratorExt};
+    use crate::types::{Value, ValueIterator};
+
+    #[test]
+    fn test_nth_into_register_preserves_invalid_text_bytes() {
+        let payload = [2, 15, 0xFF];
+        let mut iter = ValueIterator::new(&payload).unwrap();
+        let mut dest = Register::Value(Value::Null);
+
+        let result = iter.nth_into_register(0, &mut dest);
+
+        assert!(matches!(result, Some(Ok(()))));
+        match dest {
+            Register::Value(Value::Text(text)) => assert_eq!(text.as_bytes(), &[0xFF]),
+            other => panic!("expected text register, got {other:?}"),
+        }
+    }
+}
+
 pub type CursorID = usize;
 
 pub type PageIdx = i64;
@@ -2264,7 +2285,10 @@ impl<'a> FromValueRow<'a> for f64 {
 impl<'a> FromValueRow<'a> for String {
     fn from_value(value: &'a Value) -> Result<Self> {
         match value {
-            Value::Text(s) => Ok(s.as_str().to_string()),
+            Value::Text(s) => s
+                .try_as_str()
+                .map(str::to_owned)
+                .map_err(|_| LimboError::ConversionError("Expected valid UTF-8 text value".into())),
             _ => Err(LimboError::ConversionError("Expected text value".into())),
         }
     }
@@ -2273,7 +2297,9 @@ impl<'a> FromValueRow<'a> for String {
 impl<'a> FromValueRow<'a> for &'a str {
     fn from_value(value: &'a Value) -> Result<Self> {
         match value {
-            Value::Text(s) => Ok(s.as_str()),
+            Value::Text(s) => s
+                .try_as_str()
+                .map_err(|_| LimboError::ConversionError("Expected valid UTF-8 text value".into())),
             _ => Err(LimboError::ConversionError("Expected text value".into())),
         }
     }
@@ -2513,25 +2539,12 @@ impl<'a> ValueIteratorExt for crate::types::ValueIterator<'a> {
                 }
                 self.set_data_section(&data[content_size..]);
                 let text_data = &data[..content_size];
-                // SAFETY: TEXT serial type contains valid UTF-8
-                let text_str = if cfg!(debug_assertions) {
-                    match std::str::from_utf8(text_data) {
-                        Ok(s) => s,
-                        Err(e) => {
-                            return Some(Err(LimboError::InternalError(format!(
-                                "Invalid UTF-8 in TEXT serial type: {e}"
-                            ))));
-                        }
-                    }
-                } else {
-                    unsafe { std::str::from_utf8_unchecked(text_data) }
-                };
                 match dest {
                     Register::Value(Value::Text(existing_text)) => {
-                        existing_text.do_extend(&text_str);
+                        existing_text.do_extend(&text_data);
                     }
                     _ => {
-                        dest.set_text(Text::new(text_str.to_string()));
+                        dest.set_text(Text::from(text_data.to_vec()));
                     }
                 }
             }
@@ -2588,7 +2601,7 @@ mod shuttle_tests {
                         Register::Value(Value::Numeric(Numeric::Integer(42)))
                     ));
                     if let Register::Value(Value::Text(t)) = &state.registers[1] {
-                        assert_eq!(t.as_str(), "test");
+                        assert_eq!(t.try_as_str().unwrap(), "test");
                     } else {
                         panic!("Expected text value");
                     }

@@ -547,8 +547,7 @@ pub fn apply_numeric_affinity(val: ValueRef, try_for_int: bool) -> Option<ValueR
         return None; // Only apply to text values
     };
 
-    let text_str = text.as_str();
-    let (parse_result, parsed_value) = try_for_float(text_str.as_bytes());
+    let (parse_result, parsed_value) = try_for_float(text.as_bytes());
 
     // Only convert if we have a complete valid number (not just a prefix)
     match parse_result {

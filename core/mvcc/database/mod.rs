@@ -4477,7 +4477,9 @@ impl<Clock: LogicalClock> MvStore<Clock> {
 
                 for record in schema_rows.values() {
                     let ty = match record.get_value_opt(0) {
-                        Some(ValueRef::Text(v)) => v.as_str(),
+                        Some(ValueRef::Text(v)) => v.try_as_str().map_err(|_| {
+                            LimboError::Corrupt("sqlite_schema type must be valid UTF-8".into())
+                        })?,
                         _ => {
                             return Err(LimboError::Corrupt(
                                 "sqlite_schema type must be text".to_string(),
@@ -4485,7 +4487,9 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                         }
                     };
                     let name = match record.get_value_opt(1) {
-                        Some(ValueRef::Text(v)) => v.as_str(),
+                        Some(ValueRef::Text(v)) => v.try_as_str().map_err(|_| {
+                            LimboError::Corrupt("sqlite_schema name must be valid UTF-8".into())
+                        })?,
                         _ => {
                             return Err(LimboError::Corrupt(
                                 "sqlite_schema name must be text".to_string(),
@@ -4493,7 +4497,9 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                         }
                     };
                     let table_name = match record.get_value_opt(2) {
-                        Some(ValueRef::Text(v)) => v.as_str(),
+                        Some(ValueRef::Text(v)) => v.try_as_str().map_err(|_| {
+                            LimboError::Corrupt("sqlite_schema tbl_name must be valid UTF-8".into())
+                        })?,
                         _ => {
                             return Err(LimboError::Corrupt(
                                 "sqlite_schema tbl_name must be text".to_string(),
@@ -4509,7 +4515,9 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                         }
                     };
                     let sql = match record.get_value_opt(4) {
-                        Some(ValueRef::Text(v)) => Some(v.as_str()),
+                        Some(ValueRef::Text(v)) => Some(v.try_as_str().map_err(|_| {
+                            LimboError::Corrupt("sqlite_schema sql must be valid UTF-8".into())
+                        })?),
                         _ => None,
                     };
                     fresh.handle_schema_row(
@@ -4612,7 +4620,9 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                                 "sqlite_schema type must be text".to_string(),
                             ));
                         };
-                        let row_type = row_type.as_str();
+                        let row_type = row_type.try_as_str().map_err(|_| {
+                            LimboError::Corrupt("sqlite_schema type must be valid UTF-8".into())
+                        })?;
                         let val = match record.get_value_opt(3) {
                             Some(v) => v,
                             None => {
@@ -4626,7 +4636,9 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                             panic!("Expected integer value for root page, got {val:?}");
                         };
                         let sql = match record.get_value_opt(4) {
-                            Some(ValueRef::Text(v)) => Some(v.as_str()),
+                            Some(ValueRef::Text(v)) => Some(v.try_as_str().map_err(|_| {
+                                LimboError::Corrupt("sqlite_schema sql must be valid UTF-8".into())
+                            })?),
                             _ => None,
                         };
                         let is_virtual_table = row_type == "table"
@@ -4765,7 +4777,9 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                                 "sqlite_schema type must be text".to_string(),
                             ));
                         };
-                        let row_type = row_type.as_str();
+                        let row_type = row_type.try_as_str().map_err(|_| {
+                            LimboError::Corrupt("sqlite_schema type must be valid UTF-8".into())
+                        })?;
                         let Some(ValueRef::Numeric(Numeric::Integer(root_page))) =
                             record.get_value_opt(3)
                         else {

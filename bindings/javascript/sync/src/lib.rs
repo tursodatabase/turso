@@ -66,8 +66,10 @@ fn js_value_to_core(value: Either5<Null, i64, f64, String, Vec<u8>>) -> turso_co
         Either5::E(value) => turso_core::Value::Blob(value),
     }
 }
-fn core_value_to_js(value: turso_core::Value) -> Either5<Null, i64, f64, String, Vec<u8>> {
-    match value {
+fn core_value_to_js(
+    value: turso_core::Value,
+) -> turso_sync_engine::Result<Either5<Null, i64, f64, String, Vec<u8>>> {
+    Ok(match value {
         turso_core::Value::Null => Either5::<Null, i64, f64, String, Vec<u8>>::A(Null),
         turso_core::Value::Numeric(turso_core::Numeric::Integer(value)) => {
             Either5::<Null, i64, f64, String, Vec<u8>>::B(value)
@@ -75,20 +77,27 @@ fn core_value_to_js(value: turso_core::Value) -> Either5<Null, i64, f64, String,
         turso_core::Value::Numeric(turso_core::Numeric::Float(value)) => {
             Either5::<Null, i64, f64, String, Vec<u8>>::C(f64::from(value))
         }
-        turso_core::Value::Text(value) => {
-            Either5::<Null, i64, f64, String, Vec<u8>>::D(value.as_str().to_string())
-        }
+        turso_core::Value::Text(value) => Either5::<Null, i64, f64, String, Vec<u8>>::D(
+            value
+                .try_as_str()
+                .map_err(|err| {
+                    turso_sync_engine::errors::Error::DatabaseSyncEngineError(format!(
+                        "invalid UTF-8 in TEXT value: {err}"
+                    ))
+                })?
+                .to_owned(),
+        ),
         turso_core::Value::Blob(value) => Either5::<Null, i64, f64, String, Vec<u8>>::E(value),
-    }
+    })
 }
 fn core_values_map_to_js(
     value: HashMap<String, turso_core::Value>,
-) -> HashMap<String, Either5<Null, i64, f64, String, Vec<u8>>> {
-    let mut result = HashMap::new();
+) -> turso_sync_engine::Result<HashMap<String, Either5<Null, i64, f64, String, Vec<u8>>>> {
+    let mut result = HashMap::with_capacity(value.len());
     for (key, value) in value {
-        result.insert(key, core_value_to_js(value));
+        result.insert(key, core_value_to_js(value)?);
     }
-    result
+    Ok(result)
 }
 
 #[napi(object)]
@@ -540,4 +549,17 @@ fn try_unwrap<'a>(
         ));
     };
     Ok(sync_engine)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_core_value_to_js_rejects_invalid_utf8_text() {
+        let value = turso_core::Value::Text(turso_core::types::Text::new(vec![0xFF]));
+        let err = core_value_to_js(value).unwrap_err();
+
+        assert!(err.to_string().contains("invalid UTF-8 in TEXT value"));
+    }
 }

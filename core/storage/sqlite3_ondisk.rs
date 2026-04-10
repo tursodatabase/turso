@@ -1079,10 +1079,8 @@ pub fn read_value<'a>(buf: &'a [u8], serial_type: SerialType) -> Result<(ValueRe
                     content_size
                 ))
             })?;
-            // SAFETY: SerialTypeKind is Text so this buffer is a valid string
-            let val = unsafe { std::str::from_utf8_unchecked(data) };
             Ok((
-                ValueRef::Text(TextRef::new(val, TextSubtype::Text)),
+                ValueRef::Text(TextRef::new(data, TextSubtype::Text)),
                 content_size,
             ))
         }
@@ -1207,10 +1205,8 @@ pub fn read_value_serial_type<'a>(
                         content_size
                     ))
                 })?;
-                // SAFETY: SerialTypeKind is Text so this buffer is a valid string
-                let val = unsafe { std::str::from_utf8_unchecked(data) };
                 Ok((
-                    ValueRef::Text(TextRef::new(val, TextSubtype::Text)),
+                    ValueRef::Text(TextRef::new(data, TextSubtype::Text)),
                     content_size,
                 ))
             }
@@ -2078,6 +2074,26 @@ mod tests {
     ) {
         let result = read_value(buf, serial_type).unwrap();
         assert_eq!(result.0.to_owned(), expected);
+    }
+
+    #[test]
+    fn test_read_value_preserves_invalid_text_bytes() {
+        let (value, consumed) = read_value(&[0xFF], SerialType::text(1)).unwrap();
+        assert_eq!(consumed, 1);
+        match value {
+            ValueRef::Text(text) => assert_eq!(text.as_bytes(), &[0xFF]),
+            other => panic!("expected text value, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_read_value_serial_type_preserves_invalid_text_bytes() {
+        let (value, consumed) = read_value_serial_type(&[0xFF], 15).unwrap();
+        assert_eq!(consumed, 1);
+        match value {
+            ValueRef::Text(text) => assert_eq!(text.as_bytes(), &[0xFF]),
+            other => panic!("expected text value, got {other:?}"),
+        }
     }
 
     #[test]

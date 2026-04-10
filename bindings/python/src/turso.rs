@@ -362,7 +362,10 @@ fn db_value_to_py(py: Python, value: Value) -> PyResult<Py<PyAny>> {
         Value::Null => Ok(py.None()),
         Value::Numeric(Numeric::Integer(i)) => Ok(i.into_pyobject(py)?.into()),
         Value::Numeric(Numeric::Float(f)) => Ok(f64::from(f).into_pyobject(py)?.into()),
-        Value::Text(s) => Ok(s.value.as_ref().into_pyobject(py)?.into()),
+        Value::Text(s) => match s.try_as_str() {
+            Ok(text) => Ok(text.into_pyobject(py)?.into()),
+            Err(_) => Ok(PyBytes::new(py, s.as_bytes()).into()),
+        },
         Value::Blob(b) => Ok(PyBytes::new(py, &b).into()),
     }
 }

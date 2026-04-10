@@ -779,7 +779,7 @@ impl HybridBTreeDirectory {
 
             // Extract and validate
             let found_path = record.get_value_opt(0).and_then(|v| match v {
-                crate::types::ValueRef::Text(t) => Some(t.value.to_string()),
+                crate::types::ValueRef::Text(t) => Some(t.as_str_lossy().into_owned()),
                 _ => None,
             });
             let found_chunk = record.get_value_opt(1).and_then(|v| match v {
@@ -2058,7 +2058,7 @@ impl FtsCursor {
                     let record = return_if_io!(cursor.record());
                     let current_path = record.as_ref().and_then(|r| {
                         r.get_value_opt(0).and_then(|v| match v {
-                            crate::types::ValueRef::Text(t) => Some(t.value.to_string()),
+                            crate::types::ValueRef::Text(t) => Some(t.as_str_lossy().into_owned()),
                             _ => None,
                         })
                     });
@@ -2284,7 +2284,9 @@ impl FtsCursor {
                     let record = return_if_io!(cursor.record());
                     let matches = if let Some(record) = record {
                         match record.get_value_opt(0) {
-                            Some(crate::types::ValueRef::Text(t)) => t.value == path_str,
+                            Some(crate::types::ValueRef::Text(t)) => {
+                                t.as_bytes() == path_str.as_bytes()
+                            }
                             _ => false,
                         }
                     } else {
@@ -2714,7 +2716,7 @@ impl IndexMethodCursor for FtsCursor {
                     let record = return_if_io!(cursor.record());
                     if let Some(record) = record {
                         let path_str = record.get_value_opt(0).and_then(|v| match v {
-                            crate::types::ValueRef::Text(t) => Some(t.value.to_string()),
+                            crate::types::ValueRef::Text(t) => Some(t.as_str_lossy().into_owned()),
                             _ => None,
                         });
                         let chunk_no = record.get_value_opt(1).and_then(|v| match v {
@@ -2985,7 +2987,10 @@ impl IndexMethodCursor for FtsCursor {
         for ((_col, field), reg) in self.text_fields.iter().zip(&values[..values.len() - 1]) {
             match reg {
                 Register::Value(Value::Text(t)) => {
-                    doc.add_text(*field, t.as_str());
+                    let text = t.try_as_str().map_err(|_| {
+                        LimboError::ConversionError("FTS text values must be valid UTF-8".into())
+                    })?;
+                    doc.add_text(*field, text);
                 }
                 Register::Value(Value::Null) => continue,
                 _ => continue,
@@ -3063,7 +3068,10 @@ impl IndexMethodCursor for FtsCursor {
 
         // values[1] = query string
         let query_str = match &values[1] {
-            Register::Value(Value::Text(t)) => t.as_str().to_string(),
+            Register::Value(Value::Text(t)) => t
+                .try_as_str()
+                .map(str::to_owned)
+                .map_err(|_| LimboError::ConversionError("FTS query must be valid UTF-8".into()))?,
             _ => return Err(LimboError::InternalError("FTS query must be text".into())),
         };
 

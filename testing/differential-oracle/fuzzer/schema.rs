@@ -74,10 +74,25 @@ impl SchemaIntrospector {
         rows.run_with_row_callback(|row| {
             if let turso_core::Value::Text(name) = row.get_value(0) {
                 let strict = match row.get_value(1) {
-                    turso_core::Value::Text(sql) => Self::sql_is_strict(sql.as_str()),
+                    turso_core::Value::Text(sql) => {
+                        Self::sql_is_strict(sql.try_as_str().map_err(|_| {
+                            turso_core::LimboError::ConversionError(
+                                "sqlite_master.sql must be valid UTF-8".into(),
+                            )
+                        })?)
+                    }
                     _ => false,
                 };
-                tables.push((name.as_str().to_string(), strict));
+                tables.push((
+                    name.try_as_str()
+                        .map_err(|_| {
+                            turso_core::LimboError::ConversionError(
+                                "sqlite_master.name must be valid UTF-8".into(),
+                            )
+                        })?
+                        .to_string(),
+                    strict,
+                ));
             }
             Ok(())
         })
@@ -143,12 +158,26 @@ impl SchemaIntrospector {
         rows.run_with_row_callback(|row| {
             // PRAGMA table_info returns: cid, name, type, notnull, dflt_value, pk
             let name = match row.get_value(1) {
-                turso_core::Value::Text(s) => s.as_str().to_string(),
+                turso_core::Value::Text(s) => s
+                    .try_as_str()
+                    .map_err(|_| {
+                        turso_core::LimboError::ConversionError(
+                            "PRAGMA table_info name must be valid UTF-8".into(),
+                        )
+                    })?
+                    .to_string(),
                 _ => return Ok(()),
             };
 
             let type_str = match row.get_value(2) {
-                turso_core::Value::Text(s) => s.as_str().to_uppercase(),
+                turso_core::Value::Text(s) => s
+                    .try_as_str()
+                    .map_err(|_| {
+                        turso_core::LimboError::ConversionError(
+                            "PRAGMA table_info type must be valid UTF-8".into(),
+                        )
+                    })?
+                    .to_uppercase(),
                 _ => "TEXT".to_string(),
             };
 
@@ -336,7 +365,11 @@ impl SchemaIntrospector {
 
         rows.run_with_row_callback(|row| {
             if let turso_core::Value::Text(name) = row.get_value(1) {
-                let name = name.as_str();
+                let name = name.try_as_str().map_err(|_| {
+                    turso_core::LimboError::ConversionError(
+                        "PRAGMA database_list name must be valid UTF-8".into(),
+                    )
+                })?;
                 if name != "main" && name != "temp" {
                     databases.push(name.to_string());
                 }
@@ -377,12 +410,26 @@ impl SchemaIntrospector {
 
         rows.run_with_row_callback(|row| {
             let name = match row.get_value(1) {
-                turso_core::Value::Text(s) => s.as_str().to_string(),
+                turso_core::Value::Text(s) => s
+                    .try_as_str()
+                    .map_err(|_| {
+                        turso_core::LimboError::ConversionError(
+                            "PRAGMA table_info name must be valid UTF-8".into(),
+                        )
+                    })?
+                    .to_string(),
                 _ => return Ok(()),
             };
 
             let type_str = match row.get_value(2) {
-                turso_core::Value::Text(s) => s.as_str().to_uppercase(),
+                turso_core::Value::Text(s) => s
+                    .try_as_str()
+                    .map_err(|_| {
+                        turso_core::LimboError::ConversionError(
+                            "PRAGMA table_info type must be valid UTF-8".into(),
+                        )
+                    })?
+                    .to_uppercase(),
                 _ => "TEXT".to_string(),
             };
 

@@ -48,7 +48,11 @@ fn test_pragma_module_list_generate_series(db: TempDatabase) {
         while let StepResult::Row = rows.step().unwrap() {
             let row = rows.row().unwrap();
             if let Value::Text(name) = row.get_value(0) {
-                if name.as_str() == "generate_series" {
+                if name
+                    .try_as_str()
+                    .expect("module_list entries must be valid UTF-8")
+                    == "generate_series"
+                {
                     found = true;
                     break;
                 }
@@ -152,7 +156,12 @@ fn test_pragma_page_sizes_with_writes_persists(db: TempDatabase) {
                 let Value::Text(value) = row.get_value(0) else {
                     panic!("expected text value");
                 };
-                assert_eq!(value.as_str(), "test data");
+                assert_eq!(
+                    value
+                        .try_as_str()
+                        .expect("stored test data must be valid UTF-8"),
+                    "test data"
+                );
                 Ok(())
             })
             .unwrap();

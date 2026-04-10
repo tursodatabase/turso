@@ -52,11 +52,17 @@ fn test_statement_bind(tmp_db: TempDatabase) -> anyhow::Result<()> {
 
     stmt.run_with_row_callback(|row| {
         if let turso_core::Value::Text(s) = row.get::<&Value>(0).unwrap() {
-            assert_eq!(s.as_str(), "hello")
+            assert_eq!(
+                s.try_as_str().expect("bound text must be valid UTF-8"),
+                "hello"
+            )
         }
 
         if let turso_core::Value::Text(s) = row.get::<&Value>(1).unwrap() {
-            assert_eq!(s.as_str(), "hello")
+            assert_eq!(
+                s.try_as_str().expect("bound text must be valid UTF-8"),
+                "hello"
+            )
         }
 
         if let turso_core::Value::Numeric(Numeric::Integer(i)) = row.get::<&Value>(2).unwrap() {

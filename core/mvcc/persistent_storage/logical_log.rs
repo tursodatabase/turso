@@ -2546,7 +2546,7 @@ mod tests {
         let ValueRef::Text(foo) = foo else {
             unreachable!()
         };
-        assert_eq!(foo.as_str(), "foo");
+        assert_eq!(foo.try_as_str().unwrap(), "foo");
     }
 
     /// What this test checks: A long sequence of committed frames is replayed in order without dropping or reordering transactions.
@@ -2624,7 +2624,7 @@ mod tests {
             let ValueRef::Text(foo) = foo else {
                 unreachable!()
             };
-            assert_eq!(foo.as_str(), value.as_str());
+            assert_eq!(foo.try_as_str().unwrap(), value.as_str());
         }
     }
 
@@ -2745,7 +2745,7 @@ mod tests {
             };
 
             assert_eq!(
-                foo.as_str(),
+                foo.try_as_str().unwrap(),
                 format!("row_{}", present_rowid.row_id.to_int_or_panic())
             );
         }
@@ -2824,7 +2824,7 @@ mod tests {
             let ValueRef::Text(data_text) = data_value else {
                 panic!("Data column should be text");
             };
-            assert_eq!(data_text.as_str(), expected_data);
+            assert_eq!(data_text.try_as_str().unwrap(), expected_data);
         }
 
         // Verify index rows can be read
@@ -2869,7 +2869,11 @@ mod tests {
             let ValueRef::Text(index_data) = values[0] else {
                 panic!("First index column should be text");
             };
-            assert_eq!(index_data.as_str(), data_value, "Index data should match");
+            assert_eq!(
+                index_data.try_as_str().unwrap(),
+                data_value,
+                "Index data should match"
+            );
             let ValueRef::Numeric(crate::numeric::Numeric::Integer(index_rowid_val)) = values[1]
             else {
                 panic!("Second index column should be integer (rowid)");

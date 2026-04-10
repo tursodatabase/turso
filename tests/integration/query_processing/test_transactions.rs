@@ -398,7 +398,12 @@ fn test_mvcc_update_same_row_twice(tmp_db: TempDatabase) {
     let Value::Text(value) = &row[0] else {
         panic!("expected text value");
     };
-    assert_eq!(value.as_str(), "second");
+    assert_eq!(
+        value
+            .try_as_str()
+            .expect("updated text must be valid UTF-8"),
+        "second"
+    );
 
     conn1
         .execute("UPDATE test SET value = 'third' WHERE id = 1")
@@ -412,7 +417,12 @@ fn test_mvcc_update_same_row_twice(tmp_db: TempDatabase) {
     let Value::Text(value) = &row[0] else {
         panic!("expected text value");
     };
-    assert_eq!(value.as_str(), "third");
+    assert_eq!(
+        value
+            .try_as_str()
+            .expect("updated text must be valid UTF-8"),
+        "third"
+    );
 }
 
 #[test]
@@ -1583,7 +1593,8 @@ fn test_wal_savepoint_rollback_on_constraint_violation() {
         panic!("Expected text value");
     };
     assert_eq!(
-        val.as_str(),
+        val.try_as_str()
+            .expect("rolled back text value must be valid UTF-8"),
         &padding,
         "Row should have original value after failed UPDATE rollback"
     );

@@ -23,7 +23,7 @@ pub(crate) fn array_values_from_blob(blob: &[u8]) -> Result<Vec<Value>> {
 pub(crate) fn array_values_from_any(arr: &Value) -> Option<Vec<Value>> {
     match arr {
         Value::Blob(blob) => array_values_from_blob(blob).ok(),
-        Value::Text(text) => parse_text_array(text.as_str()),
+        Value::Text(text) => parse_text_array(&text.as_str_lossy()),
         Value::Null => Some(Vec::new()),
         _ => None,
     }
@@ -186,7 +186,7 @@ fn write_value_ref_pg(result: &mut String, val: &crate::ValueRef<'_>) {
             }
         }
         crate::ValueRef::Text(t) => {
-            write_pg_text_element(result, t.as_str());
+            write_pg_text_element(result, &t.as_str_lossy());
         }
         crate::ValueRef::Blob(b) => {
             result.push_str("\"X'");
@@ -243,7 +243,7 @@ pub(crate) fn compute_array_length(val: &Value) -> Option<i64> {
             Ok(iter) => Some(iter.count() as i64),
             Err(_) => None,
         },
-        Value::Text(t) => parse_text_array(t.as_str()).map(|v| v.len() as i64),
+        Value::Text(t) => parse_text_array(&t.as_str_lossy()).map(|v| v.len() as i64),
         _ => None,
     }
 }
@@ -377,13 +377,13 @@ pub(crate) fn exec_string_to_array(
     null_str: Option<&Value>,
 ) -> Value {
     let text_str = match text {
-        Value::Text(t) => t.as_str().to_string(),
+        Value::Text(t) => t.as_str_lossy().into_owned(),
         Value::Null => return Value::Null,
         other => other.to_string(),
     };
 
     let null_match: Option<String> = match null_str {
-        Some(Value::Text(t)) => Some(t.as_str().to_string()),
+        Some(Value::Text(t)) => Some(t.as_str_lossy().into_owned()),
         Some(Value::Null) | None => None,
         Some(other) => Some(other.to_string()),
     };
@@ -406,7 +406,7 @@ pub(crate) fn exec_string_to_array(
     }
 
     let delim_str = match delimiter {
-        Value::Text(d) => d.as_str().to_string(),
+        Value::Text(d) => d.as_str_lossy().into_owned(),
         other => other.to_string(),
     };
 
@@ -445,13 +445,13 @@ pub(crate) fn exec_array_to_string(
     }
 
     let delim = match delimiter {
-        Value::Text(t) => t.as_str().to_string(),
+        Value::Text(t) => t.as_str_lossy().into_owned(),
         Value::Null => return Value::Null,
         other => other.to_string(),
     };
 
     let null_replacement: Option<String> = match null_str {
-        Some(Value::Text(t)) => Some(t.as_str().to_string()),
+        Some(Value::Text(t)) => Some(t.as_str_lossy().into_owned()),
         Some(Value::Null) | None => None,
         Some(other) => Some(other.to_string()),
     };
@@ -473,7 +473,7 @@ pub(crate) fn exec_array_to_string(
                             continue;
                         }
                     }
-                    crate::ValueRef::Text(t) => t.as_str().to_string(),
+                    crate::ValueRef::Text(t) => t.as_str_lossy().into_owned(),
                     other => format!("{other}"),
                 };
                 if !first {
@@ -501,7 +501,7 @@ pub(crate) fn exec_array_to_string(
                     continue;
                 }
             }
-            Value::Text(t) => t.as_str().to_string(),
+            Value::Text(t) => t.as_str_lossy().into_owned(),
             other => other.to_string(),
         };
         if !first {

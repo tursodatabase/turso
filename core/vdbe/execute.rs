@@ -182,8 +182,11 @@ fn value_to_bigdecimal(val: &Value) -> Result<bigdecimal::BigDecimal> {
         Value::Numeric(Numeric::Integer(i)) => Ok(BigDecimal::from(*i)),
         Value::Numeric(Numeric::Float(f)) => BigDecimal::from_str(&f.to_string())
             .map_err(|_| LimboError::Constraint(format!("invalid numeric value: {f}"))),
-        Value::Text(t) => BigDecimal::from_str(&t.value)
-            .map_err(|_| LimboError::Constraint(format!("invalid numeric value: \"{}\"", t.value))),
+        Value::Text(t) => {
+            let text = t.as_str_lossy();
+            BigDecimal::from_str(&text)
+                .map_err(|_| LimboError::Constraint(format!("invalid numeric value: \"{text}\"")))
+        }
         Value::Blob(b) => crate::numeric::decimal::blob_to_bigdecimal(b),
         _ => Err(LimboError::Constraint(format!(
             "cannot convert to numeric: \"{val}\""
@@ -221,7 +224,7 @@ fn make_sort_comparator(
             std::sync::Arc::new(|a: &ValueRef, b: &ValueRef| -> Ordering {
                 fn reverse_str(v: &ValueRef) -> String {
                     match v {
-                        ValueRef::Text(t) => t.to_string().chars().rev().collect(),
+                        ValueRef::Text(t) => t.as_str_lossy().chars().rev().collect(),
                         _ => String::new(),
                     }
                 }
@@ -245,7 +248,7 @@ fn make_sort_comparator(
                                 None
                             }
                         }
-                        ValueRef::Text(t) => t.to_string().parse::<u64>().ok(),
+                        ValueRef::Text(t) => t.as_str_lossy().parse::<u64>().ok(),
                         _ => None,
                     }
                 }
@@ -271,8 +274,10 @@ fn make_sort_comparator(
                             .unwrap_or(Ordering::Equal)
                     }
                     (ValueRef::Text(a_text), ValueRef::Text(b_text)) => {
-                        let a_vals = crate::vdbe::array::parse_text_array(a_text);
-                        let b_vals = crate::vdbe::array::parse_text_array(b_text);
+                        let a_text = a_text.as_str_lossy();
+                        let b_text = b_text.as_str_lossy();
+                        let a_vals = crate::vdbe::array::parse_text_array(&a_text);
+                        let b_vals = crate::vdbe::array::parse_text_array(&b_text);
                         match (a_vals, b_vals) {
                             (Some(av), Some(bv)) => {
                                 let a_blob = crate::vdbe::array::values_to_record_blob(&av);
@@ -304,7 +309,7 @@ fn compare_with_collation(
     match (lhs, rhs) {
         (Value::Text(lhs_text), Value::Text(rhs_text)) => {
             if let Some(coll) = collation {
-                coll.compare_strings(lhs_text.as_str(), rhs_text.as_str())
+                coll.compare_texts(lhs_text.as_bytes(), rhs_text.as_bytes())
             } else {
                 lhs.cmp(rhs)
             }
@@ -1981,7 +1986,7 @@ pub fn op_array_encode(
     // Extract elements from either blob (MakeArray) or text (JSON literal)
     let raw_elements = match val {
         Value::Blob(b) => array_values_from_blob(b).ok(),
-        Value::Text(text) => parse_text_array(text.as_str()),
+        Value::Text(text) => parse_text_array(&text.as_str_lossy()),
         _ => None,
     };
     let Some(raw_elements) = raw_elements else {
@@ -2114,19 +2119,7 @@ pub fn op_array_element(
             Ok(mut iter) => iter
                 .nth(idx)
                 .and_then(|r| r.ok())
-                .map(|vref| {
-                    // The blob may not be a real record — text fields could
-                    // contain invalid UTF-8 (from_utf8_unchecked in the
-                    // record decoder). Validate and demote to blob if needed.
-                    if let ValueRef::Text(t) = &vref {
-                        if t.value.as_bytes().iter().any(|&b| b > 0x7F)
-                            && std::str::from_utf8(t.value.as_bytes()).is_err()
-                        {
-                            return Value::Blob(t.value.as_bytes().to_vec());
-                        }
-                    }
-                    vref.to_owned()
-                })
+                .map(|vref| vref.to_owned())
                 .unwrap_or(Value::Null),
             Err(_) => Value::Null,
         },
@@ -5137,7 +5130,7 @@ fn update_agg_payload(
             let val = match arg {
                 Value::Numeric(Numeric::Integer(i)) => i as f64,
                 Value::Numeric(Numeric::Float(f)) => f64::from(f),
-                Value::Text(t) => match try_for_float(t.as_str().as_bytes()).1 {
+                Value::Text(t) => match try_for_float(t.as_bytes()).1 {
                     ParsedNumber::Integer(i) => i as f64,
                     ParsedNumber::Float(f) => f,
                     ParsedNumber::None => 0.0,
@@ -5237,7 +5230,7 @@ fn update_agg_payload(
                     _ => unreachable!("Sum/Total accumulator initialized to Null/Integer/Float"),
                 },
                 Value::Text(t) => {
-                    let (parse_result, parsed_number) = try_for_float(t.as_str().as_bytes());
+                    let (parse_result, parsed_number) = try_for_float(t.as_bytes());
                     handle_text_sum(acc, &mut sum_state, parsed_number, parse_result, false);
                 }
                 Value::Blob(b) => {
@@ -5283,7 +5276,7 @@ fn update_agg_payload(
             let acc = &mut payload[0];
             if matches!(acc, Value::Null) {
                 // First non-null value: convert to Text
-                *acc = Value::build_text(arg.to_string());
+                *acc = arg.exec_cast("TEXT");
             } else {
                 acc.exec_group_concat(&delimiter);
                 acc.exec_group_concat(&arg);
@@ -6273,19 +6266,26 @@ pub fn op_function(
                 // However, Rust strings uses utf-8
                 // so the behavior at the moment is slightly different
                 // To the way blobs are parsed here in SQLite.
+                let indent_buf;
                 let indent = match indent {
                     Some(value) => match value.get_value() {
-                        Value::Text(text) => text.as_str(),
-                        Value::Numeric(Numeric::Integer(val)) => &val.to_string(),
-                        Value::Numeric(Numeric::Float(val)) => &f64::from(*val).to_string(),
-                        Value::Blob(val) => &String::from_utf8_lossy(val),
-                        _ => "    ",
+                        Value::Text(text) => text.as_str_lossy(),
+                        Value::Numeric(Numeric::Integer(val)) => {
+                            indent_buf = val.to_string();
+                            std::borrow::Cow::Borrowed(indent_buf.as_str())
+                        }
+                        Value::Numeric(Numeric::Float(val)) => {
+                            indent_buf = f64::from(*val).to_string();
+                            std::borrow::Cow::Borrowed(indent_buf.as_str())
+                        }
+                        Value::Blob(val) => String::from_utf8_lossy(val),
+                        _ => std::borrow::Cow::Borrowed("    "),
                     },
                     // If the second argument is omitted or is NULL, then indentation is four spaces per level
-                    None => "    ",
+                    None => std::borrow::Cow::Borrowed("    "),
                 };
 
-                let json_str = get_json(json_value.get_value(), Some(indent))?;
+                let json_str = get_json(json_value.get_value(), Some(indent.as_ref()))?;
                 state.registers[*dest].set_value(json_str);
             }
             JsonFunc::JsonSet => {
@@ -6340,7 +6340,7 @@ pub fn op_function(
                 };
                 let result = reg_value_argument
                     .get_value()
-                    .exec_cast(reg_value_type.as_str());
+                    .exec_cast(&reg_value_type.as_str_lossy());
                 state.registers[*dest].set_value(result);
             }
             ScalarFunc::Changes => {
@@ -6383,7 +6383,7 @@ pub fn op_function(
                     state.registers[*dest].set_null();
                 } else {
                     let pattern_cow = match pattern_value {
-                        Value::Text(s) => std::borrow::Cow::Borrowed(s.as_str()),
+                        Value::Text(s) => s.as_str_lossy(),
                         v => match v.exec_cast("TEXT") {
                             Value::Text(s) => std::borrow::Cow::Owned(s.to_string()),
                             _ => unreachable!("Cast to TEXT should yield Text"),
@@ -6391,7 +6391,7 @@ pub fn op_function(
                     };
 
                     let match_cow = match match_value {
-                        Value::Text(s) => std::borrow::Cow::Borrowed(s.as_str()),
+                        Value::Text(s) => s.as_str_lossy(),
                         v => match v.exec_cast("TEXT") {
                             Value::Text(s) => std::borrow::Cow::Owned(s.to_string()),
                             _ => unreachable!("Cast to TEXT should yield Text"),
@@ -6438,7 +6438,7 @@ pub fn op_function(
                             }
                             _ => {
                                 let escape_cow = match escape_value {
-                                    Value::Text(s) => std::borrow::Cow::Borrowed(s.as_str()),
+                                    Value::Text(s) => s.as_str_lossy(),
                                     v => match v.exec_cast("TEXT") {
                                         Value::Text(s) => std::borrow::Cow::Owned(s.to_string()),
                                         _ => unreachable!("Cast to TEXT should yield Text"),
@@ -6462,7 +6462,7 @@ pub fn op_function(
                     } else {
                         // 3. Prepare Pattern and Text
                         let pattern_cow = match pattern_value {
-                            Value::Text(s) => std::borrow::Cow::Borrowed(s.as_str()),
+                            Value::Text(s) => s.as_str_lossy(),
                             v => match v.exec_cast("TEXT") {
                                 Value::Text(s) => std::borrow::Cow::Owned(s.to_string()),
                                 _ => unreachable!("Cast to TEXT should yield Text"),
@@ -6470,7 +6470,7 @@ pub fn op_function(
                         };
 
                         let match_cow = match match_value {
-                            Value::Text(s) => std::borrow::Cow::Borrowed(s.as_str()),
+                            Value::Text(s) => s.as_str_lossy(),
                             v => match v.exec_cast("TEXT") {
                                 Value::Text(s) => std::borrow::Cow::Owned(s.to_string()),
                                 _ => unreachable!("Cast to TEXT should yield Text"),
@@ -6744,7 +6744,7 @@ pub fn op_function(
                     };
                     let table = {
                         let schema = program.connection.schema.read();
-                        match schema.get_table(table.as_str()) {
+                        match schema.get_table(&table.as_str_lossy()) {
                             Some(table) => table,
                             None => {
                                 return Err(LimboError::InvalidArgument(format!(
@@ -6806,7 +6806,7 @@ pub fn op_function(
                         ));
                     };
                     let mut columns_json_array =
-                        json::jsonb::Jsonb::from_str(columns_str.as_str())?;
+                        json::jsonb::Jsonb::from_str(&columns_str.as_str_lossy())?;
                     let columns_len = columns_json_array.array_len()?;
 
                     let mut payload_iterator = ValueIterator::new(bin_record.as_slice())?;
@@ -6873,7 +6873,7 @@ pub fn op_function(
 
                 program
                     .connection
-                    .attach_database(filename_str.as_str(), dbname_str.as_str())?;
+                    .attach_database(&filename_str.as_str_lossy(), &dbname_str.as_str_lossy())?;
 
                 state.registers[*dest].set_null();
             }
@@ -6888,7 +6888,9 @@ pub fn op_function(
                 };
 
                 // Call the detach_database method on the connection
-                program.connection.detach_database(dbname_str.as_str())?;
+                program
+                    .connection
+                    .detach_database(&dbname_str.as_str_lossy())?;
 
                 // Set result to NULL (detach doesn't return a value)
                 state.registers[*dest].set_null();
@@ -7107,7 +7109,7 @@ pub fn op_function(
                         }
                     },
                     Value::Text(t) => {
-                        let v = &t.value;
+                        let v = t.as_str_lossy();
                         match v.to_ascii_lowercase().as_str() {
                             "true" | "t" | "yes" | "on" | "1" => Value::from_i64(1),
                             "false" | "f" | "no" | "off" | "0" => Value::from_i64(0),
@@ -7142,7 +7144,7 @@ pub fn op_function(
                 let result = match val.get_value() {
                     Value::Null => Value::Null,
                     Value::Text(t) => {
-                        let v = &t.value;
+                        let v = t.as_str_lossy();
                         v.parse::<std::net::IpAddr>().map_err(|_| {
                             LimboError::Constraint(format!("invalid input for type inet: \"{v}\""))
                         })?;
@@ -7189,7 +7191,7 @@ pub fn op_function(
                         let text = match other {
                             Value::Numeric(Numeric::Integer(i)) => i.to_string(),
                             Value::Numeric(Numeric::Float(f)) => f.to_string(),
-                            Value::Text(t) => t.value.to_string(),
+                            Value::Text(t) => t.as_str_lossy().into_owned(),
                             _ => {
                                 return Err(LimboError::Constraint(format!(
                                     "invalid input for type numeric: \"{other}\""
@@ -7532,7 +7534,9 @@ pub fn op_function(
                 AlterTableFunc::RenameTable => {
                     let rename_from = {
                         match &state.registers[*start_reg + 5].get_value() {
-                            Value::Text(rename_from) => normalize_ident(rename_from.as_str()),
+                            Value::Text(rename_from) => {
+                                normalize_ident(&rename_from.as_str_lossy())
+                            }
                             _ => panic!("rename_from parameter should be TEXT"),
                         }
                     };
@@ -7543,7 +7547,7 @@ pub fn op_function(
                             _ => panic!("rename_to parameter should be TEXT"),
                         }
                     };
-                    let rename_to = normalize_ident(original_rename_to.as_str());
+                    let rename_to = normalize_ident(&original_rename_to.as_str_lossy());
 
                     let new_name = if let Some(column) =
                         &name.strip_prefix(&format!("sqlite_autoindex_{rename_from}_"))
@@ -7566,7 +7570,8 @@ pub fn op_function(
                             break 'sql None;
                         };
 
-                        let mut parser = Parser::new(sql.as_str().as_bytes());
+                        let sql = sql.as_str_lossy();
+                        let mut parser = Parser::new(sql.as_bytes());
                         let ast::Cmd::Stmt(stmt) =
                             parser.next().expect("parser should have next item")?
                         else {
@@ -7637,7 +7642,7 @@ pub fn op_function(
                                         any_change |= rewrite_fk_parent_table_if_needed(
                                             clause,
                                             &rename_from,
-                                            original_rename_to.as_str(),
+                                            &original_rename_to.as_str_lossy(),
                                         );
                                     }
                                 }
@@ -7645,7 +7650,7 @@ pub fn op_function(
                                     any_change |= rewrite_inline_col_fk_target_if_needed(
                                         col,
                                         &rename_from,
-                                        original_rename_to.as_str(),
+                                        &original_rename_to.as_str_lossy(),
                                     );
                                 }
 
@@ -7770,7 +7775,7 @@ pub fn op_function(
                                     rewrite_check_expr_table_refs(
                                         when,
                                         &rename_from,
-                                        original_rename_to.as_str(),
+                                        &original_rename_to.as_str_lossy(),
                                     );
                                 }
 
@@ -7779,7 +7784,7 @@ pub fn op_function(
                                     rewrite_trigger_cmd_table_refs(
                                         cmd,
                                         &rename_from,
-                                        original_rename_to.as_str(),
+                                        &original_rename_to.as_str_lossy(),
                                     );
                                 }
 
@@ -7807,7 +7812,7 @@ pub fn op_function(
                 AlterTableFunc::AlterColumn | AlterTableFunc::RenameColumn => {
                     let table = {
                         match &state.registers[*start_reg + 5].get_value() {
-                            Value::Text(rename_to) => normalize_ident(rename_to.as_str()),
+                            Value::Text(rename_to) => normalize_ident(&rename_to.as_str_lossy()),
                             _ => panic!("table parameter should be TEXT"),
                         }
                     };
@@ -7818,11 +7823,11 @@ pub fn op_function(
                             _ => panic!("rename_from parameter should be TEXT"),
                         }
                     };
-                    let rename_from = normalize_ident(original_rename_from.as_str());
+                    let rename_from = normalize_ident(&original_rename_from.as_str_lossy());
 
                     let column_def = {
                         match &state.registers[*start_reg + 7].get_value() {
-                            Value::Text(column_def) => column_def.as_str(),
+                            Value::Text(column_def) => column_def.as_str_lossy(),
                             _ => panic!("rename_to parameter should be TEXT"),
                         }
                     };
@@ -7837,7 +7842,8 @@ pub fn op_function(
                             break 'sql None;
                         };
 
-                        let mut parser = Parser::new(sql.as_str().as_bytes());
+                        let sql = sql.as_str_lossy();
+                        let mut parser = Parser::new(sql.as_bytes());
                         let ast::Cmd::Stmt(stmt) =
                             parser.next().expect("parser should have next item")?
                         else {
@@ -9388,7 +9394,7 @@ pub fn op_must_be_int(
             Ok(i) => state.registers[*reg].set_int(i),
             Err(_) => bail_constraint_error!("datatype mismatch"),
         },
-        Value::Text(text) => match checked_cast_text_to_numeric(text.as_str(), true) {
+        Value::Text(text) => match checked_cast_text_to_numeric(&text.as_str_lossy(), true) {
             Ok(Value::Numeric(Numeric::Integer(i))) => state.registers[*reg].set_int(i),
             Ok(Value::Numeric(Numeric::Float(f))) => match cast_real_to_integer(f64::from(f)) {
                 Ok(i) => state.registers[*reg].set_int(i),
@@ -10792,7 +10798,7 @@ pub fn op_add_imm(
     let int_val = match current_value {
         Value::Numeric(Numeric::Integer(i)) => i + value,
         Value::Numeric(Numeric::Float(f)) => (f64::from(*f) as i64) + value,
-        Value::Text(s) => s.as_str().parse::<i64>().unwrap_or(0) + value,
+        Value::Text(s) => parse_sqlite_int_from_bytes(s.as_bytes()) + value,
         Value::Blob(_) => *value, // BLOB becomes the added value
         Value::Null => *value,    // NULL becomes the added value
     };
@@ -13153,7 +13159,8 @@ fn apply_affinity_char(target: &mut Register, affinity: Affinity) -> bool {
                 }
 
                 if let Value::Text(t) = value {
-                    let text = trim_ascii_whitespace(t.as_str());
+                    let text = t.as_str_lossy();
+                    let text = trim_ascii_whitespace(&text);
 
                     // Handle hex numbers - they shouldn't be converted
                     if text.starts_with("0x") {
@@ -13205,7 +13212,8 @@ fn apply_affinity_char(target: &mut Register, affinity: Affinity) -> bool {
                     return true;
                 }
                 Value::Text(t) => {
-                    let text = trim_ascii_whitespace(t.as_str());
+                    let text = t.as_str_lossy();
+                    let text = trim_ascii_whitespace(&text);
                     if text.starts_with("0x") {
                         return false;
                     }
@@ -13290,6 +13298,26 @@ fn execute_turso_version(version_integer: i64) -> String {
     format!("{major}.{minor}.{release}")
 }
 
+fn parsed_number_to_i64(parsed: ParsedNumber) -> i64 {
+    match parsed {
+        ParsedNumber::Integer(i) => i,
+        ParsedNumber::Float(f) => {
+            if f < -9223372036854774784.0 {
+                i64::MIN
+            } else if f > 9223372036854774784.0 {
+                i64::MAX
+            } else {
+                f as i64
+            }
+        }
+        ParsedNumber::None => 0,
+    }
+}
+
+fn parse_sqlite_int_from_bytes(bytes: &[u8]) -> i64 {
+    parsed_number_to_i64(try_for_float(bytes).1)
+}
+
 pub fn extract_int_value<V: AsValueRef>(value: V) -> i64 {
     let value = value.as_value_ref();
     match value {
@@ -13307,15 +13335,11 @@ pub fn extract_int_value<V: AsValueRef>(value: V) -> i64 {
         }
         ValueRef::Text(t) => {
             // Try to parse as integer, return 0 if failed
-            t.as_str().parse::<i64>().unwrap_or(0)
+            parse_sqlite_int_from_bytes(t.as_bytes())
         }
         ValueRef::Blob(b) => {
             // Try to parse blob as string then as integer
-            if let Ok(s) = std::str::from_utf8(b) {
-                s.parse::<i64>().unwrap_or(0)
-            } else {
-                0
-            }
+            parse_sqlite_int_from_bytes(b)
         }
         ValueRef::Null => 0,
     }
@@ -13951,27 +13975,33 @@ fn op_vacuum_into_inner(
                     crate::StepResult::Done => {
                         // Extract table names for data copy phase
                         // Include sqlite_sequence for AUTOINCREMENT counters, but not other sqlite_ tables
-                        vacuum_state.table_names = vacuum_state
-                            .schema_rows
-                            .iter()
-                            .filter_map(|row| {
-                                if row.len() >= 2 {
-                                    if let (Value::Text(type_val), Value::Text(name_val)) =
-                                        (&row[0], &row[1])
-                                    {
-                                        let name = name_val.as_str();
-                                        if type_val.as_str() == "table"
-                                            && (!name.starts_with("sqlite_")
-                                                || name == "sqlite_sequence")
-                                            && name != crate::mvcc::database::MVCC_META_TABLE_NAME
-                                        {
-                                            return Some(name.to_string());
-                                        }
-                                    }
-                                }
-                                None
-                            })
-                            .collect();
+                        let mut table_names = Vec::new();
+                        for row in &vacuum_state.schema_rows {
+                            if row.len() < 2 {
+                                continue;
+                            }
+                            let (Value::Text(type_val), Value::Text(name_val)) = (&row[0], &row[1])
+                            else {
+                                continue;
+                            };
+                            let type_str = type_val.try_as_str().map_err(|_| {
+                                LimboError::Corrupt(
+                                    "sqlite_schema.type must be valid UTF-8".to_string(),
+                                )
+                            })?;
+                            let name = name_val.try_as_str().map_err(|_| {
+                                LimboError::Corrupt(
+                                    "sqlite_schema.name must be valid UTF-8".to_string(),
+                                )
+                            })?;
+                            if type_str == "table"
+                                && (!name.starts_with("sqlite_") || name == "sqlite_sequence")
+                                && name != crate::mvcc::database::MVCC_META_TABLE_NAME
+                            {
+                                table_names.push(name.to_string());
+                            }
+                        }
+                        vacuum_state.table_names = table_names;
 
                         vacuum_state.sub_state =
                             OpVacuumIntoSubState::PrepareDestSchema { dest_conn, idx: 0 };
@@ -14019,7 +14049,9 @@ fn op_vacuum_into_inner(
                 // Skip triggers and views - they'll be created after data copy
                 // to avoid triggers firing during data copy
                 if let Value::Text(type_val) = &row[0] {
-                    let type_str = type_val.as_str();
+                    let type_str = type_val.try_as_str().map_err(|_| {
+                        LimboError::Corrupt("sqlite_schema.type must be valid UTF-8".to_string())
+                    })?;
                     if type_str == "trigger" || type_str == "view" {
                         vacuum_state.sub_state = OpVacuumIntoSubState::PrepareDestSchema {
                             dest_conn,
@@ -14037,7 +14069,10 @@ fn op_vacuum_into_inner(
                 // "CREATE TABLE sqlite_sequence(name,seq)", it fails with "table already exists".
                 // We still copy sqlite_sequence data in StartCopyTable to preserve counters.
                 if let Value::Text(name_val) = &row[1] {
-                    if name_val.as_str() == "sqlite_sequence" {
+                    if name_val.try_as_str().map_err(|_| {
+                        LimboError::Corrupt("sqlite_schema.name must be valid UTF-8".to_string())
+                    })? == "sqlite_sequence"
+                    {
                         vacuum_state.sub_state = OpVacuumIntoSubState::PrepareDestSchema {
                             dest_conn,
                             idx: idx + 1,
@@ -14050,7 +14085,9 @@ fn op_vacuum_into_inner(
                 let Value::Text(sql) = &row[3] else {
                     unreachable!("sql column should be text (query has WHERE sql IS NOT NULL)");
                 };
-                let sql_str = sql.as_str();
+                let sql_str = sql.try_as_str().map_err(|_| {
+                    LimboError::Corrupt("sqlite_schema.sql must be valid UTF-8".to_string())
+                })?;
 
                 // Internal tables (e.g. __turso_internal_types) have a reserved
                 // name prefix that translate_create_table rejects for user SQL.
@@ -14058,7 +14095,17 @@ fn op_vacuum_into_inner(
                 // so the reserved-name check is bypassed at compile time. We must
                 // NOT keep it nested during step() because that would prevent
                 // sub-statements from upgrading to write transactions.
-                let is_internal = matches!(&row[1], Value::Text(n) if n.as_str().starts_with(crate::schema::TURSO_INTERNAL_PREFIX));
+                let is_internal = match &row[1] {
+                    Value::Text(name) => name
+                        .try_as_str()
+                        .map_err(|_| {
+                            LimboError::Corrupt(
+                                "sqlite_schema.name must be valid UTF-8".to_string(),
+                            )
+                        })?
+                        .starts_with(crate::schema::TURSO_INTERNAL_PREFIX),
+                    _ => false,
+                };
                 if is_internal {
                     dest_conn.start_nested();
                 }
@@ -14089,8 +14136,17 @@ fn op_vacuum_into_inner(
                     // CREATE TABLE statements for STRICT tables with custom type
                     // columns can resolve those types.
                     let row = &vacuum_state.schema_rows[idx];
-                    if matches!(&row[1], Value::Text(n) if n.as_str() == crate::schema::TURSO_TYPES_TABLE_NAME)
-                    {
+                    let is_types_table = match &row[1] {
+                        Value::Text(name) => {
+                            name.try_as_str().map_err(|_| {
+                                LimboError::Corrupt(
+                                    "sqlite_schema.name must be valid UTF-8".to_string(),
+                                )
+                            })? == crate::schema::TURSO_TYPES_TABLE_NAME
+                        }
+                        _ => false,
+                    };
+                    if is_types_table {
                         let source_types: Vec<(String, std::sync::Arc<crate::schema::TypeDef>)> = {
                             let source_schema = program.connection.schema.read();
                             source_schema
@@ -14172,7 +14228,14 @@ fn op_vacuum_into_inner(
                         // Column name is at index 1
                         if let Value::Text(name) = row.get_value(1) {
                             // Escape double quotes in column name for safe SQL
-                            let escaped_name = name.as_str().replace('"', "\"\"");
+                            let escaped_name = name
+                                .try_as_str()
+                                .map_err(|_| {
+                                    LimboError::Corrupt(
+                                        "PRAGMA table_info name must be valid UTF-8".to_string(),
+                                    )
+                                })?
+                                .replace('"', "\"\"");
                             let col_name = format!("\"{escaped_name}\"");
                             vacuum_state.current_table_columns.push(col_name);
                         }
@@ -14432,10 +14495,16 @@ fn op_vacuum_into_inner(
 
                 // Only process triggers and views in this phase
                 if let Value::Text(type_val) = &row[0] {
-                    let type_str = type_val.as_str();
+                    let type_str = type_val.try_as_str().map_err(|_| {
+                        LimboError::Corrupt("sqlite_schema.type must be valid UTF-8".to_string())
+                    })?;
                     if type_str == "trigger" || type_str == "view" {
                         if let Value::Text(sql) = &row[3] {
-                            let sql_str = sql.as_str();
+                            let sql_str = sql.try_as_str().map_err(|_| {
+                                LimboError::Corrupt(
+                                    "sqlite_schema.sql must be valid UTF-8".to_string(),
+                                )
+                            })?;
                             let dest_stmt = dest_conn.prepare(sql_str)?;
                             vacuum_state.sub_state = OpVacuumIntoSubState::StepTriggersViews {
                                 dest_conn,
@@ -14786,7 +14855,7 @@ mod tests {
             match register {
                 Register::Value(Value::Text(t)) => {
                     assert_eq!(
-                        t.as_str().chars().count(),
+                        t.try_as_str().unwrap().chars().count(),
                         expected_len,
                         "String '{input}' should have {expected_len} characters",
                     );
@@ -14808,7 +14877,11 @@ mod tests {
             apply_affinity_char(&mut register, Affinity::Integer);
             match register {
                 Register::Value(Value::Text(t)) => {
-                    assert_eq!(t.as_str(), input, "Unexpected conversion for '{input}'");
+                    assert_eq!(
+                        t.try_as_str().unwrap(),
+                        input,
+                        "Unexpected conversion for '{input}'"
+                    );
                 }
                 other => {
                     panic!("'{input}' should remain text, got {other:?}");
@@ -14819,7 +14892,11 @@ mod tests {
             apply_affinity_char(&mut register, Affinity::Numeric);
             match register {
                 Register::Value(Value::Text(t)) => {
-                    assert_eq!(t.as_str(), input, "Unexpected conversion for '{input}'");
+                    assert_eq!(
+                        t.try_as_str().unwrap(),
+                        input,
+                        "Unexpected conversion for '{input}'"
+                    );
                 }
                 other => {
                     panic!("'{input}' should remain text, got {other:?}");
@@ -15094,8 +15171,9 @@ mod tests {
     #[test]
     fn test_negate_blob_subscript_invalid_utf8_no_panic() {
         // Negating a blob subscript that extracts a "text" value containing
-        // invalid UTF-8 bytes must not panic. The record decoder uses
-        // from_utf8_unchecked, so ArrayElement must validate extracted text.
+        // invalid UTF-8 bytes must not panic. Record decode preserves the raw
+        // TEXT bytes, so ArrayElement must not assume extracted text is valid
+        // UTF-8.
         //
         // Reproduces fuzzer bug at seed 27035.
         let io: Arc<dyn IO> = Arc::new(MemoryIO::new());

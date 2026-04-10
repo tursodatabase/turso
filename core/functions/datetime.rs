@@ -871,7 +871,8 @@ where
         let first = values.next().unwrap();
         match first.as_value_ref() {
             ValueRef::Text(s) => {
-                if parse_date_or_time(s.as_str(), &mut p).is_err() {
+                let s = s.as_str_lossy();
+                if parse_date_or_time(&s, &mut p).is_err() {
                     return Value::Null;
                 }
             }
@@ -898,7 +899,8 @@ where
     for (i, val) in values.enumerate() {
         has_modifier = true;
         if let ValueRef::Text(s) = val.as_value_ref() {
-            if parse_modifier(&mut p, s.as_str(), i).is_err() {
+            let s = s.as_str_lossy();
+            if parse_modifier(&mut p, &s, i).is_err() {
                 return Value::Null;
             }
         } else {
@@ -1041,7 +1043,8 @@ where
     let val1 = values.next().unwrap();
     match val1.as_value_ref() {
         ValueRef::Text(s) => {
-            if parse_date_or_time(s.as_str(), &mut d1).is_err() {
+            let s = s.as_str_lossy();
+            if parse_date_or_time(&s, &mut d1).is_err() {
                 return Value::Null;
             }
         }
@@ -1068,7 +1071,8 @@ where
     let val2 = values.next().unwrap();
     match val2.as_value_ref() {
         ValueRef::Text(s) => {
-            if parse_date_or_time(s.as_str(), &mut d2).is_err() {
+            let s = s.as_str_lossy();
+            if parse_date_or_time(&s, &mut d2).is_err() {
                 return Value::Null;
             }
         }
@@ -1189,7 +1193,7 @@ where
 
     let fmt_val = values.next().unwrap();
     let fmt_str = match fmt_val.as_value_ref() {
-        ValueRef::Text(s) => Cow::Borrowed(s.as_str()),
+        ValueRef::Text(s) => s.as_str_lossy(),
         ValueRef::Null => return Value::Null,
         val => Cow::Owned(val.to_string()),
     };
@@ -1201,7 +1205,7 @@ where
         let init_val = values.next().unwrap();
         match init_val.as_value_ref() {
             ValueRef::Text(s) => {
-                let s_str = s.as_str();
+                let s_str = s.as_str_lossy();
                 if s_str.eq_ignore_ascii_case("now") {
                     set_to_current(&mut p);
                 } else if let Ok(val) = s_str.parse::<f64>() {
@@ -1213,7 +1217,7 @@ where
                     }
                 } else {
                     let mut temp_p = DateTime::default();
-                    if parse_date_or_time(s_str, &mut temp_p).is_ok() {
+                    if parse_date_or_time(&s_str, &mut temp_p).is_ok() {
                         p = temp_p;
                     } else {
                         return Value::Null;
@@ -1241,7 +1245,8 @@ where
 
         for (i, val) in values.enumerate() {
             if let ValueRef::Text(s) = val.as_value_ref() {
-                if parse_modifier(&mut p, s.as_str(), i).is_err() {
+                let s = s.as_str_lossy();
+                if parse_modifier(&mut p, &s, i).is_err() {
                     return Value::Null;
                 }
             } else {
@@ -1632,7 +1637,7 @@ mod tests {
         for (input, expected) in test_cases {
             let result = exec_time(&[input]);
             if let Value::Text(result_str) = result {
-                assert_eq!(result_str.as_str(), expected);
+                assert_eq!(result_str.try_as_str().unwrap(), expected);
             } else {
                 panic!("Expected Value::Text, but got: {result:?}");
             }

@@ -46,6 +46,11 @@ impl CollationSeq {
 
     #[inline(always)]
     pub fn compare_strings(&self, lhs: &str, rhs: &str) -> Ordering {
+        self.compare_texts(lhs.as_bytes(), rhs.as_bytes())
+    }
+
+    #[inline(always)]
+    pub fn compare_texts(&self, lhs: &[u8], rhs: &[u8]) -> Ordering {
         match self {
             CollationSeq::Unset | CollationSeq::Binary => Self::binary_cmp(lhs, rhs),
             CollationSeq::NoCase => Self::nocase_cmp(lhs, rhs),
@@ -54,20 +59,37 @@ impl CollationSeq {
     }
 
     #[inline(always)]
-    fn binary_cmp(lhs: &str, rhs: &str) -> Ordering {
+    fn binary_cmp(lhs: &[u8], rhs: &[u8]) -> Ordering {
         lhs.cmp(rhs)
     }
 
     #[inline(always)]
-    fn nocase_cmp(lhs: &str, rhs: &str) -> Ordering {
-        let nocase_lhs = uncased::UncasedStr::new(lhs);
-        let nocase_rhs = uncased::UncasedStr::new(rhs);
-        nocase_lhs.cmp(nocase_rhs)
+    fn nocase_cmp(lhs: &[u8], rhs: &[u8]) -> Ordering {
+        let common_len = lhs.len().min(rhs.len());
+        for i in 0..common_len {
+            let l = lhs[i].to_ascii_lowercase();
+            let r = rhs[i].to_ascii_lowercase();
+            match l.cmp(&r) {
+                Ordering::Equal => continue,
+                non_eq => return non_eq,
+            }
+        }
+        lhs.len().cmp(&rhs.len())
     }
 
     #[inline(always)]
-    fn rtrim_cmp(lhs: &str, rhs: &str) -> Ordering {
-        lhs.trim_end_matches(' ').cmp(rhs.trim_end_matches(' '))
+    fn rtrim_cmp(lhs: &[u8], rhs: &[u8]) -> Ordering {
+        let lhs = lhs
+            .iter()
+            .rposition(|&b| b != b' ')
+            .map(|i| &lhs[..=i])
+            .unwrap_or(&[]);
+        let rhs = rhs
+            .iter()
+            .rposition(|&b| b != b' ')
+            .map(|i| &rhs[..=i])
+            .unwrap_or(&[]);
+        lhs.cmp(rhs)
     }
 }
 

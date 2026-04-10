@@ -808,7 +808,7 @@ impl Statement {
             PresentationMode::Raw => {
                 let mut raw_array = env.create_array(row_data.len() as u32)?;
                 for (idx, value) in row_data.get_values().enumerate() {
-                    let js_value = to_js_value(env, value, safe_integers)?;
+                    let js_value = to_js_raw_value(env, value, safe_integers)?;
                     raw_array.set(idx as u32, js_value)?;
                 }
                 raw_array.coerce_to_object()?.to_unknown()
@@ -955,7 +955,11 @@ fn to_js_value<'a>(
         turso_core::Value::Numeric(turso_core::Numeric::Float(f)) => {
             ToNapiValue::into_unknown(f64::from(*f), env)
         }
-        turso_core::Value::Text(s) => ToNapiValue::into_unknown(s.as_str(), env),
+        turso_core::Value::Text(s) => ToNapiValue::into_unknown(
+            s.try_as_str()
+                .map_err(|e| to_generic_error("invalid UTF-8 in TEXT value", e))?,
+            env,
+        ),
         turso_core::Value::Blob(b) => {
             #[cfg(not(feature = "browser"))]
             {
@@ -969,5 +973,34 @@ fn to_js_value<'a>(
                 ToNapiValue::into_unknown(buffer, env)
             }
         }
+    }
+}
+
+/// Convert a Turso value to a JavaScript value for raw row mode.
+///
+/// Raw mode keeps strict string semantics for valid TEXT, but preserves invalid
+/// TEXT bytes as byte arrays so callers can decide how to render them.
+fn to_js_raw_value<'a>(
+    env: &'a napi::Env,
+    value: &turso_core::Value,
+    safe_integers: bool,
+) -> napi::Result<Unknown<'a>> {
+    match value {
+        turso_core::Value::Text(s) => match s.try_as_str() {
+            Ok(text) => ToNapiValue::into_unknown(text, env),
+            Err(_) => {
+                #[cfg(not(feature = "browser"))]
+                {
+                    let buffer = Buffer::from(s.as_bytes());
+                    ToNapiValue::into_unknown(buffer, env)
+                }
+                #[cfg(feature = "browser")]
+                {
+                    let buffer = Uint8Array::from(s.as_bytes());
+                    ToNapiValue::into_unknown(buffer, env)
+                }
+            }
+        },
+        _ => to_js_value(env, value, safe_integers),
     }
 }
