@@ -868,20 +868,20 @@ fn emit_update_insns<'a>(
 
     let has_direct_rowid_update = set_clauses.iter().any(|(idx, _)| *idx == ROWID_SENTINEL);
 
-    let has_user_provided_rowid = if let Some(index) = rowid_alias_index {
+    let updates_rowid = if let Some(index) = rowid_alias_index {
         set_clauses.iter().any(|(idx, _)| *idx == index)
     } else {
         has_direct_rowid_update
     };
 
-    let rowid_set_clause_reg = if has_user_provided_rowid {
+    let rowid_set_clause_reg = if updates_rowid {
         Some(program.alloc_register())
     } else {
         None
     };
 
     turso_assert!(
-        !has_user_provided_rowid || rowid_set_clause_reg.is_some(),
+        !updates_rowid || rowid_set_clause_reg.is_some(),
         "has_user_provided_rowid requires rowid_set_clause_reg"
     );
 
@@ -898,7 +898,7 @@ fn emit_update_insns<'a>(
     };
 
     let not_exists_check_required =
-        has_user_provided_rowid || iteration_cursor_id != target_table_cursor_id;
+        updates_rowid || iteration_cursor_id != target_table_cursor_id;
 
     // Check early whether BEFORE UPDATE triggers exist, so we can defer NOT NULL
     // constraint checks until after the triggers fire (matching SQLite behavior).
@@ -1008,7 +1008,7 @@ fn emit_update_insns<'a>(
         col_len,
         table_name,
         has_direct_rowid_update,
-        has_user_provided_rowid,
+        updates_rowid,
         rowid_set_clause_reg,
         is_virtual_table,
         &index,
@@ -1225,7 +1225,7 @@ fn emit_update_insns<'a>(
             col_len,
             table_name,
             has_direct_rowid_update,
-            has_user_provided_rowid,
+            updates_rowid,
             rowid_set_clause_reg,
             is_virtual_table,
             &index,
@@ -1309,25 +1309,29 @@ fn emit_update_insns<'a>(
             .insert(rowid_reg, Affinity::Integer);
     }
 
-    let has_virtual_columns = target_table
-        .table
-        .btree()
-        .is_some_and(|bt| bt.has_virtual_columns());
+    let affected_columns = columns_affected_by_update(
+        target_table.table.columns(),
+        &HashSet::from_iter(set_clauses.iter().map(|(idx, _)| idx).cloned()),
+    );
+    let update_affects_virtual_columns = set_clauses
+        .iter()
+        .map(|(idx, _)| idx)
+        .any(|idx| affected_columns.contains(idx));
     let has_returning = returning.as_ref().is_some_and(|r| !r.is_empty());
     let has_check_constraints = target_table
         .table
         .btree()
         .is_some_and(|bt| !bt.check_constraints.is_empty());
-    if has_virtual_columns
-        && (!indexes_to_update.is_empty()
-            || has_before_triggers
-            || has_after_triggers
-            || has_returning
-            || has_check_constraints)
+    if update_affects_virtual_columns
+        || has_before_triggers
+        || has_after_triggers
+        || has_returning
+        || has_check_constraints
     {
         let columns = target_table.table.columns();
         let rowid_reg = rowid_set_clause_reg.unwrap_or(beg);
 
+        //TODO don't emit all virtual columns
         let dml_ctx = DmlColumnContext::layout(columns, start, rowid_reg, layout.clone());
         compute_virtual_columns(program, columns, &dml_ctx, &t_ctx.resolver)?;
     }
@@ -1341,7 +1345,7 @@ fn emit_update_insns<'a>(
     // PK ABORT/FAIL/ROLLBACK fires before an index IGNORE can silently skip the row.
     // SQLite checks PK constraints before index constraints in the UPDATE path.
     if target_table.table.btree().is_some()
-        && has_user_provided_rowid
+        && updates_rowid
         && !matches!(effective_rowid_alias_conflict, ResolveType::Replace)
     {
         let record_label = program.allocate_label();
@@ -1407,7 +1411,7 @@ fn emit_update_insns<'a>(
 
     // After the PK check above, NotExists may have repositioned the cursor.
     // Re-seek to the row under update so old-image reads in Phase 2 are correct.
-    if has_user_provided_rowid && !matches!(effective_rowid_alias_conflict, ResolveType::Replace) {
+    if updates_rowid && !matches!(effective_rowid_alias_conflict, ResolveType::Replace) {
         if let Some(label) = check_rowid_not_exists_label {
             program.emit_insn(Insn::NotExists {
                 cursor: target_table_cursor_id,
@@ -1907,7 +1911,7 @@ fn emit_update_insns<'a>(
     // Runs AFTER Phase 1 (all index constraint checks) so that non-REPLACE index
     // constraints fire before this deletion, matching SQLite's ordering.
     if target_table.table.btree().is_some()
-        && has_user_provided_rowid
+        && updates_rowid
         && matches!(effective_rowid_alias_conflict, ResolveType::Replace)
     {
         let target_reg = rowid_set_clause_reg.expect("rowid_set_clause_reg must be set");
@@ -2114,7 +2118,7 @@ fn emit_update_insns<'a>(
             // create separate register with rowid before UPDATE for CDC
             let cdc_rowid_before_reg = if t_ctx.cdc_cursor_id.is_some() {
                 let cdc_rowid_before_reg = program.alloc_register();
-                if has_user_provided_rowid {
+                if updates_rowid {
                     program.emit_insn(Insn::RowId {
                         cursor_id: target_table_cursor_id,
                         dest: cdc_rowid_before_reg,
@@ -2377,7 +2381,7 @@ fn emit_update_insns<'a>(
             if let Some(cdc_cursor_id) = t_ctx.cdc_cursor_id {
                 let cdc_rowid_before_reg =
                     cdc_rowid_before_reg.expect("cdc_rowid_before_reg must be set");
-                if has_user_provided_rowid {
+                if updates_rowid {
                     emit_cdc_insns(
                         program,
                         &t_ctx.resolver,
