@@ -800,8 +800,23 @@ impl Connection {
         } else {
             self.get_mv_tx()
         };
+        // Resolver so attached-db qualifiers in temp triggers can be
+        // mapped to their actual index on this connection (Phase 1.4c).
+        let attached_resolver = |name: &str| -> Option<usize> {
+            self.attached_databases
+                .read()
+                .get_database_by_name(&crate::util::normalize_ident(name))
+                .map(|(idx, _)| idx)
+        };
         // TODO: This function below is synchronous, make it async
-        parse_schema_rows(stmt, &mut fresh, &self.syms.read(), mv_tx, existing_views)?;
+        parse_schema_rows(
+            stmt,
+            &mut fresh,
+            &self.syms.read(),
+            mv_tx,
+            existing_views,
+            &attached_resolver,
+        )?;
 
         // Load custom types from __turso_internal_types if the table exists
         // and custom types are enabled. Type loading errors are non-fatal: we log
@@ -1631,6 +1646,12 @@ impl Connection {
             let mut dbsp_state_index_roots = HashMap::default();
             let mut materialized_view_info = HashMap::default();
 
+            let attached_resolver = |name: &str| -> Option<usize> {
+                self.attached_databases
+                    .read()
+                    .get_database_by_name(&crate::util::normalize_ident(name))
+                    .map(|(idx, _)| idx)
+            };
             for (ty, name, table_name, root_page, sql) in &rows_data {
                 match schema.handle_schema_row(
                     ty,
@@ -1644,6 +1665,7 @@ impl Connection {
                     &mut dbsp_state_roots,
                     &mut dbsp_state_index_roots,
                     &mut materialized_view_info,
+                    &attached_resolver,
                 ) {
                     Ok(()) => {}
                     Err(LimboError::ParseError(msg)) if msg.contains("already exists") => {}

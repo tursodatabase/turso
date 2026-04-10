@@ -155,3 +155,39 @@ test temp-trigger-when-clause {
 expect {
     big value: 15
 }
+
+#  regression: DROP TABLE main.t must not wipe temp triggers
+# that target temp.t. `remove_triggers_for_table` used to key only on
+# the table name, so a temp trigger trying to follow `temp.t` was
+# removed along with the main.t drop.
+test drop-table-main-preserves-temp-trigger-on-temp-shadow {
+    CREATE TABLE drop_t1 (x INTEGER);
+    CREATE TEMP TABLE drop_t1 (y INTEGER);
+    CREATE TEMP TRIGGER drop_tr_main AFTER INSERT ON main.drop_t1 BEGIN SELECT 1; END;
+    CREATE TEMP TRIGGER drop_tr_temp AFTER INSERT ON temp.drop_t1 BEGIN SELECT 2; END;
+    DROP TABLE main.drop_t1;
+    SELECT name FROM temp.sqlite_schema
+        WHERE type='trigger' AND name LIKE 'drop_tr_%' ORDER BY name;
+}
+expect {
+    drop_tr_temp
+}
+
+# regression: the temp.sqlite_schema cleanup loop emitted for
+# `DROP TABLE main.t` must filter by `type='trigger'`. Without the filter
+# it deletes any row whose `tbl_name` matches — including the shadow
+# temp table, its sqlite_autoindex rows, and user temp indexes — leaving
+# on-disk temp.sqlite_schema out of sync with the in-memory temp schema.
+test drop-table-main-preserves-temp-shadow-table-and-indexes {
+    CREATE TABLE drop_b (x INTEGER);
+    CREATE TEMP TABLE drop_b (y INTEGER);
+    CREATE INDEX temp.drop_b_idx ON drop_b (y);
+    DROP TABLE main.drop_b;
+    SELECT type, name FROM temp.sqlite_schema
+        WHERE tbl_name = 'drop_b' ORDER BY type, name;
+    SELECT y FROM temp.drop_b;
+}
+expect {
+    index|drop_b_idx
+    table|drop_b
+}
