@@ -518,7 +518,7 @@ pub fn op_checkpoint(
         // however.
         return Err(LimboError::TableLocked);
     }
-    if *database == crate::TEMP_DB_ID && program.connection.temp_database.read().is_none() {
+    if *database == crate::TEMP_DB_ID && program.connection.temp.database.read().is_none() {
         set_not_in_wal_result(state, *dest);
         state.pc += 1;
         return Ok(InsnFunctionStepResult::Step);
@@ -3835,7 +3835,7 @@ pub fn op_savepoint(
             // attached pagers; without this restore, the in-memory schemas
             // would keep DDL that the disk-level rollback just undid.
             if let Some(info) = frame_info {
-                if let Some(temp_db) = conn.temp_database.read().as_ref() {
+                if let Some(temp_db) = conn.temp.database.read().as_ref() {
                     match info.temp_schema_snapshot {
                         Some(snap) => *temp_db.db.schema.lock() = snap,
                         None => *temp_db.db.schema.lock() = conn.empty_temp_schema(),
@@ -10291,7 +10291,7 @@ pub fn op_drop_table(
         });
         // SQLite also removes temp triggers that target the dropped table.
         // Only needed when dropping from a non-temp database.
-        if *db != crate::TEMP_DB_ID && conn.temp_database.read().is_some() {
+        if *db != crate::TEMP_DB_ID && conn.temp.database.read().is_some() {
             conn.with_database_schema_mut(crate::TEMP_DB_ID, |temp_schema| {
                 temp_schema.remove_triggers_for_table(table_name);
             });
@@ -10509,7 +10509,8 @@ pub fn op_parse_schema(
     let schema_arc = if *db == crate::TEMP_DB_ID {
         // TEMP: single source of truth is `temp_db.db.schema`. Skip
         // `database_schemas` staging entirely — it would only go stale.
-        conn.temp_database
+        conn.temp
+            .database
             .read()
             .as_ref()
             .map(|temp_db| temp_db.db.schema.lock().clone())
@@ -10643,7 +10644,7 @@ fn op_parse_schema_step(
                     // the same transaction and trigger a spurious
                     // SchemaUpdated -> reprepare -> rollback_attached() loop
                     // that wipes in-flight dirty pages.
-                    if let Some(temp_db) = conn.temp_database.read().as_ref() {
+                    if let Some(temp_db) = conn.temp.database.read().as_ref() {
                         if let Some(cookie) = temp_db.pager.get_schema_cookie_cached() {
                             schema.schema_version = cookie;
                         }
@@ -11018,6 +11019,11 @@ pub fn op_set_cookie(
                             "invalid transaction state for SetCookie: TransactionState::PendingUpgrade, should be write"
                         ),
                     }
+                } else if *db == crate::TEMP_DB_ID {
+                    // TEMP has no shared `Database::schema` to publish to, so
+                    // commit/rollback consult a separate `committed_temp_schema`
+                    // snapshot on the connection. Flag that it needs updating.
+                    program.connection.mark_temp_schema_did_change();
                 }
                 program
                     .connection
@@ -11949,7 +11955,7 @@ fn with_relevant_trigger_schemas_mut(
     mut f: impl FnMut(&mut Schema) -> crate::Result<()>,
 ) -> crate::Result<()> {
     conn.with_database_schema_mut(table_db_id, |schema| f(schema))?;
-    if table_db_id != crate::TEMP_DB_ID && conn.temp_database.read().is_some() {
+    if table_db_id != crate::TEMP_DB_ID && conn.temp.database.read().is_some() {
         conn.with_database_schema_mut(crate::TEMP_DB_ID, |schema| f(schema))?;
     }
     Ok(())
@@ -12108,7 +12114,7 @@ pub fn op_rename_table(
         Ok(())
     })?;
 
-    if *db != crate::TEMP_DB_ID && conn.temp_database.read().is_some() {
+    if *db != crate::TEMP_DB_ID && conn.temp.database.read().is_some() {
         conn.with_database_schema_mut(crate::TEMP_DB_ID, |schema| -> crate::Result<()> {
             for triggers in schema.triggers.values_mut() {
                 for trigger_arc in triggers.iter_mut() {

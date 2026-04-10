@@ -1651,9 +1651,22 @@ impl Program {
         } else {
             self.commit_txn_wal(pager, program_state, rollback)
         }?;
-        if !res.is_io() && self.change_cnt_on {
-            self.connection
-                .set_changes(program_state.n_change.load(Ordering::SeqCst));
+        if !res.is_io() {
+            if self.change_cnt_on {
+                self.connection
+                    .set_changes(program_state.n_change.load(Ordering::SeqCst));
+            }
+            // finalize the in-memory TEMP schema. The pager's own
+            // rollback() only reinstates main's `connection.schema` from the
+            // shared `Database::schema`; TEMP has no shared Database so the
+            // connection keeps its own `committed_temp_schema` snapshot that
+            // we update here. Both methods are gated on `temp_schema_did_change`
+            // so they are cheap no-ops outside of temp DDL.
+            if rollback {
+                self.connection.rollback_temp_schema();
+            } else {
+                self.connection.commit_temp_schema();
+            }
         }
         Ok(res)
     }

@@ -307,3 +307,26 @@ expect {
     1
     2
 }
+
+# regression: full-txn ROLLBACK must restore the in-memory TEMP
+# schema from a committed snapshot. Previously the main pager's rollback()
+# only reinstated `connection.schema` (main) from the shared Database;
+# temp had no snapshot anywhere, so the in-memory temp schema kept DDL
+# that the disk-level rollback had undone. The sentinel created before
+# BEGIN must survive; the table created inside the rolled-back txn must
+# be gone.
+test full-txn-rollback-restores-temp-schema {
+    CREATE TEMP TABLE ft_sentinel(x INTEGER);
+    INSERT INTO temp.ft_sentinel VALUES(99);
+    BEGIN;
+    CREATE TEMP TABLE ft_rolled_back(y INTEGER);
+    INSERT INTO ft_rolled_back VALUES(1);
+    ROLLBACK;
+    SELECT name FROM temp.sqlite_schema
+        WHERE type='table' AND name LIKE 'ft_%' ORDER BY name;
+    SELECT x FROM temp.ft_sentinel;
+}
+expect {
+    ft_sentinel
+    99
+}
