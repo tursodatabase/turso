@@ -4512,6 +4512,13 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                         Some(ValueRef::Text(v)) => Some(v.as_str()),
                         _ => None,
                     };
+                    let attached_resolver = |alias: &str| -> Option<usize> {
+                        connection
+                            .attached_databases()
+                            .read()
+                            .get_database_by_name(&crate::util::normalize_ident(alias))
+                            .map(|(idx, _)| idx)
+                    };
                     fresh.handle_schema_row(
                         ty,
                         name,
@@ -4524,6 +4531,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                         &mut dbsp_state_roots,
                         &mut dbsp_state_index_roots,
                         &mut materialized_view_info,
+                        &attached_resolver,
                     )?;
                 }
                 fresh.populate_indices(

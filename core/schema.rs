@@ -96,9 +96,16 @@ pub struct Trigger {
     pub commands: Vec<turso_parser::ast::TriggerCmd>,
     pub temporary: bool,
     /// For temp triggers that target a table in a specific database.
-    /// `None` means the trigger targets a table in its own schema.
-    /// `Some(db_id)` means it explicitly targets another database
-    /// (e.g. `CREATE TEMP TRIGGER ... ON main.table`).
+    /// - `None` — the trigger was created without a db qualifier and
+    ///   targets a table in its own schema (or, if it's a temp trigger
+    ///   and no temp shadow exists, the parent schema's table).
+    /// - `Some(MAIN_DB_ID | TEMP_DB_ID | <attached_id>)` — resolved
+    ///   qualifier.
+    /// - `Some(crate::INVALID_DB_ID)` — the qualifier referenced an
+    ///   attached db name that could not be resolved at parse time
+    ///   (e.g. reloading `CREATE TEMP TRIGGER ... ON aux.x` when
+    ///   `aux` is not attached). The trigger never fires against a
+    ///   real db, which is the correct fail-safe behaviour.
     pub target_database_id: Option<usize>,
 }
 
@@ -791,6 +798,35 @@ impl Schema {
         self.triggers.remove(&table_name);
     }
 
+    /// Like [`remove_triggers_for_table`] but only removes triggers whose
+    /// `target_database_id` matches `target_db` (or is `None`, meaning
+    /// "targets the parent schema's table of this name", which also
+    /// applies). Used from `DROP TABLE main.t` to clean up temp triggers
+    /// without accidentally removing ones that target `temp.t` or
+    /// `aux.t` (the plain `remove_triggers_for_table` keys only on
+    /// table name).
+    pub fn remove_triggers_for_table_with_db(&mut self, table_name: &str, target_db: usize) {
+        let table_name = normalize_ident(table_name);
+        let Some(bucket) = self.triggers.get_mut(&table_name) else {
+            return;
+        };
+        bucket.retain(|trigger| {
+            // Keep triggers that explicitly target a *different* database.
+            // `None` means unqualified, which resolves to the parent schema's
+            // table of this name — so from the perspective of a DROP in
+            // `target_db`, an unqualified temp-schema trigger with the same
+            // table name is NOT meant for us unless the temp schema has no
+            // shadowing table. Conservatively, only drop when the ids match.
+            match trigger.target_database_id {
+                Some(db) => db != target_db,
+                None => false, // unqualified → assume it targets us
+            }
+        });
+        if bucket.is_empty() {
+            self.triggers.remove(&table_name);
+        }
+    }
+
     pub fn get_trigger_for_table(&self, table_name: &str, name: &str) -> Option<Arc<Trigger>> {
         let table_name = normalize_ident(table_name);
         let name = normalize_ident(name);
@@ -1072,6 +1108,11 @@ impl Schema {
                         .accumulators
                         .as_mut()
                         .expect("accumulators must be initialized in Init phase");
+                    // `make_from_btree` is called during database open before
+                    // any connection exists, so there is no attached catalog
+                    // to consult. Any `CREATE TEMP TRIGGER ... ON aux.x` row
+                    // maps to `Some(INVALID_DB_ID)` until a connection-scoped
+                    // reparse runs with a real resolver.
                     self.handle_schema_row(
                         &ty,
                         &name,
@@ -1084,6 +1125,7 @@ impl Schema {
                         &mut acc.dbsp_state_roots,
                         &mut acc.dbsp_state_index_roots,
                         &mut acc.materialized_view_info,
+                        &|_| None,
                     )?;
 
                     state.phase = MakeFromBtreePhase::Advancing;
@@ -1326,6 +1368,14 @@ impl Schema {
         dbsp_state_roots: &mut HashMap<String, i64>,
         dbsp_state_index_roots: &mut HashMap<String, i64>,
         materialized_view_info: &mut HashMap<String, (String, i64)>,
+        // Resolves an attached database name (case-insensitive) to its
+        // connection-local database id. Used when reparsing temp trigger
+        // SQL that qualifies its target with an attached db name like
+        // `CREATE TEMP TRIGGER tr ON aux.x ...`. Callers without a
+        // connection (tests, offline schema loading) can pass
+        // `&|_| None`; unresolvable names become `Some(INVALID_DB_ID)`
+        // so the trigger never fires against a real db.
+        resolve_attached_db: &dyn Fn(&str) -> Option<usize>,
     ) -> Result<()> {
         match ty {
             "table" => {
@@ -1520,17 +1570,22 @@ impl Schema {
                 };
                 // Resolve the target database from the SQL qualifier:
                 // CREATE TEMP TRIGGER ... ON main.tbl → target is MAIN_DB_ID
-                // CREATE TEMP TRIGGER ... ON tbl     → target is same as this schema
-                let target_database_id = tbl_name.db_name.as_ref().and_then(|db_name| {
+                // CREATE TEMP TRIGGER ... ON tbl     → target is None (unqualified)
+                // CREATE TEMP TRIGGER ... ON aux.tbl → resolve `aux` via the
+                //     attached catalog; if the name is unknown to this
+                //     connection use `INVALID_DB_ID` so the trigger never
+                //     fires on a mismatched db. Using `None` (the old
+                //     behaviour) would treat an unresolved attached name
+                //     the same as an unqualified reference, causing the
+                //     trigger to fire on every table with a matching name.
+                let target_database_id = tbl_name.db_name.as_ref().map(|db_name| {
                     let db = db_name.as_str();
                     if db.eq_ignore_ascii_case("main") {
-                        Some(crate::MAIN_DB_ID)
+                        crate::MAIN_DB_ID
                     } else if db.eq_ignore_ascii_case("temp") {
-                        Some(crate::TEMP_DB_ID)
+                        crate::TEMP_DB_ID
                     } else {
-                        // Attached database — can't resolve by name here,
-                        // but temp triggers on attached tables are rare.
-                        None
+                        resolve_attached_db(db).unwrap_or(crate::INVALID_DB_ID)
                     }
                 });
                 self.add_trigger(
@@ -5205,6 +5260,7 @@ mod tests {
             &mut HashMap::default(),
             &mut HashMap::default(),
             &mut HashMap::default(),
+            &|_| None,
         );
         assert!(result
             .unwrap_err()

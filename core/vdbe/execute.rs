@@ -10290,10 +10290,14 @@ pub fn op_drop_table(
             schema.remove_table(table_name);
         });
         // SQLite also removes temp triggers that target the dropped table.
-        // Only needed when dropping from a non-temp database.
+        // Only needed when dropping from a non-temp database. We must
+        // scope the removal to triggers whose `target_database_id`
+        // matches the dropped db — otherwise `DROP TABLE main.t` would
+        // also nuke temp triggers that target `temp.t` or `aux.t`.
         if *db != crate::TEMP_DB_ID && conn.temp.database.read().is_some() {
+            let dropped_db = *db;
             conn.with_database_schema_mut(crate::TEMP_DB_ID, |temp_schema| {
-                temp_schema.remove_triggers_for_table(table_name);
+                temp_schema.remove_triggers_for_table_with_db(table_name, dropped_db);
             });
         }
     }
@@ -10585,6 +10589,12 @@ fn op_parse_schema_step(
                 let sql = row.get::<&str>(4).ok();
                 let schema = Arc::make_mut(&mut inner.schema_arc);
                 let syms = conn.syms.read();
+                let attached_resolver = |alias: &str| -> Option<usize> {
+                    conn.attached_databases()
+                        .read()
+                        .get_database_by_name(&crate::util::normalize_ident(alias))
+                        .map(|(idx, _)| idx)
+                };
                 schema.handle_schema_row(
                     ty,
                     name,
@@ -10597,6 +10607,7 @@ fn op_parse_schema_step(
                     &mut inner.dbsp_state_roots,
                     &mut inner.dbsp_state_index_roots,
                     &mut inner.materialized_view_info,
+                    &attached_resolver,
                 )?;
                 continue;
             }

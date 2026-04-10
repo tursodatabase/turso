@@ -159,6 +159,16 @@ pub const TEMP_DB_ID: usize = 1;
 /// start at index 2.
 pub const FIRST_ATTACHED_DB_ID: usize = 2;
 
+/// Sentinel used when a SQL schema qualifier references an attached
+/// database name that cannot be resolved against the current
+/// connection's attached catalog (e.g. after reloading a
+/// `CREATE TEMP TRIGGER tr ON aux.x ...` row from `temp.sqlite_schema`
+/// without `aux` being attached). Stored in
+/// `Trigger::target_database_id` so filters never accidentally match a
+/// real database. Never equal to any real db id — guaranteed by
+/// `usize::MAX`.
+pub const INVALID_DB_ID: usize = usize::MAX;
+
 /// Returns true if the database index refers to "main" or "temp"
 pub const fn is_main_or_temp_db(database_id: usize) -> bool {
     database_id == MAIN_DB_ID || database_id == TEMP_DB_ID
