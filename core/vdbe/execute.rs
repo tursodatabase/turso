@@ -14232,11 +14232,14 @@ fn op_vacuum_into_inner(
                     ));
                 }
 
-                // we always vacuum into a new file, so check if it exists
-                if std::path::Path::new(dest_path).exists() {
-                    return Err(LimboError::ParseError(format!(
-                        "output file already exists: {dest_path}"
-                    )));
+                // We allows vaccum into new file or a empty file, so check if it exits and, if it does, ensure it is empty.
+                match std::fs::metadata(dest_path) {
+                    Ok(meta) if meta.len() > 0 => {
+                        return Err(LimboError::ParseError(format!(
+                            "output file already exists: {dest_path}"
+                        )));
+                    }
+                    _ => {}
                 }
 
                 // Pin source metadata before building the destination. The
