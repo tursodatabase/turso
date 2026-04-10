@@ -256,7 +256,7 @@ impl Fuzzer {
     }
 
     /// Introspect and return the current schema from the Turso database.
-    pub fn get_schema(&self) -> Result<sql_gen::Schema> {
+    pub fn get_schema(&self) -> Result<sql_gen_prop::Schema> {
         SchemaIntrospector::from_turso(&self.turso_conn)
             .context("Failed to introspect Turso schema")
     }
@@ -490,7 +490,7 @@ impl Fuzzer {
     }
 
     /// Introspect schemas from both databases and verify they match.
-    fn introspect_and_verify_schemas(&self) -> Result<sql_gen::Schema> {
+    fn introspect_and_verify_schemas(&self) -> Result<sql_gen_prop::Schema> {
         let (turso_schema, sqlite_schema) = (
             SchemaIntrospector::from_turso_with_attached(&self.turso_conn)
                 .context("Failed to introspect Turso schema (with attached)")?,
