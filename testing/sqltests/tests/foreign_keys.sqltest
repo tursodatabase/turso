@@ -2878,3 +2878,32 @@ test fk-update-or-replace-no-action-blocks {
 }
 expect error {
 }
+
+# FK added via ALTER TABLE ADD COLUMN should be enforced on INSERT
+@cross-check-integrity
+test fk-alter-table-add-column-enforced {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE parent(p TEXT UNIQUE);
+    CREATE TABLE child(a INTEGER);
+    ALTER TABLE child ADD COLUMN p TEXT REFERENCES parent(p) ON DELETE RESTRICT ON UPDATE RESTRICT;
+    INSERT INTO parent VALUES ('ok');
+    INSERT INTO child(a,p) VALUES (1,'ok');
+    INSERT INTO child(a,p) VALUES (2,NULL);
+    SELECT * FROM child ORDER BY a;
+}
+expect {
+    1|ok
+    2|
+}
+
+# FK added via ALTER TABLE ADD COLUMN should reject missing parent
+@cross-check-integrity
+test fk-alter-table-add-column-rejects-missing {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE parent(p TEXT UNIQUE);
+    CREATE TABLE child(a INTEGER);
+    ALTER TABLE child ADD COLUMN p TEXT REFERENCES parent(p) ON DELETE RESTRICT ON UPDATE RESTRICT;
+    INSERT INTO child(a,p) VALUES (1,'missing');
+}
+expect error {
+}
