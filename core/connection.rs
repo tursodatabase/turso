@@ -372,7 +372,8 @@ impl Connection {
     }
 
     fn reset_temp_database(&self) {
-        self.database_schemas.write().remove(&crate::TEMP_DB_ID);
+        // TEMP is never staged in `database_schemas` — writes go directly to
+        // `temp_db.db.schema`. Drop the handle and the schema goes with it.
         if let Some(temp_db) = self.temp_database.write().take() {
             temp_db.pager.rollback_attached();
         }
@@ -2219,42 +2220,46 @@ impl Connection {
 
     fn cached_non_main_schema(&self, database_id: usize) -> Arc<Schema> {
         turso_assert_ne!(database_id, crate::MAIN_DB_ID);
-        if let Some(schema) = self.database_schemas.read().get(&database_id).cloned() {
-            return schema;
-        }
-
-        match database_id {
-            crate::TEMP_DB_ID => self
+        // TEMP is the sole source-of-truth path: writes go directly to
+        // `temp_db.db.schema` (see `with_database_schema_mut`), so skip
+        // `database_schemas` entirely to avoid stale reads.
+        if database_id == crate::TEMP_DB_ID {
+            return self
                 .temp_database
                 .read()
                 .as_ref()
                 .map(|temp_db| temp_db.db.schema.lock().clone())
-                .unwrap_or_else(|| self.empty_temp_schema()),
-            _ => {
-                let attached_dbs = self.attached_databases.read();
-                let (db, _pager) = attached_dbs
-                    .index_to_data
-                    .get(&database_id)
-                    .expect("Database ID should be valid after resolve_database_id");
-                let schema = db.schema.lock().clone();
-                schema
-            }
+                .unwrap_or_else(|| self.empty_temp_schema());
         }
+        if let Some(schema) = self.database_schemas.read().get(&database_id).cloned() {
+            return schema;
+        }
+
+        let attached_dbs = self.attached_databases.read();
+        let (db, _pager) = attached_dbs
+            .index_to_data
+            .get(&database_id)
+            .expect("Database ID should be valid after resolve_database_id");
+        let schema = db.schema.lock().clone();
+        schema
     }
 
     /// Publish a connection-local non-main schema after commit.
+    ///
+    /// TEMP is not staged in `database_schemas` — writes go directly to
+    /// `temp_db.db.schema` via `with_database_schema_mut`, so there is
+    /// nothing to publish here. Attached databases still stage mutations
+    /// in `database_schemas` so other connections don't see uncommitted
+    /// DDL; those get published to the shared `db.schema` on commit.
     pub(crate) fn publish_database_schema(&self, database_id: usize) {
+        if database_id == crate::TEMP_DB_ID {
+            return;
+        }
         let mut schemas = self.database_schemas.write();
         if let Some(local_schema) = schemas.remove(&database_id) {
-            if database_id == crate::TEMP_DB_ID {
-                if let Some(temp_db) = self.temp_database.read().as_ref() {
-                    *temp_db.db.schema.lock() = local_schema;
-                }
-            } else {
-                let attached_dbs = self.attached_databases.read();
-                if let Some((db, _pager)) = attached_dbs.index_to_data.get(&database_id) {
-                    *db.schema.lock() = local_schema;
-                }
+            let attached_dbs = self.attached_databases.read();
+            if let Some((db, _pager)) = attached_dbs.index_to_data.get(&database_id) {
+                *db.schema.lock() = local_schema;
             }
             self.bump_prepare_context_generation();
         }
