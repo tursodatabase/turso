@@ -385,12 +385,10 @@ pub fn simple_bind_expr(
         #[allow(clippy::single_match)]
         match expr {
             Expr::Id(id) => {
-                let normalized_id = normalize_ident(id.as_str());
-
                 for result_column in result_columns.iter() {
                     if let ast::ResultColumn::Expr(result, Some(ast::As::As(alias))) = result_column
                     {
-                        if alias.as_str().eq_ignore_ascii_case(&normalized_id) {
+                        if alias.as_str().eq_ignore_ascii_case(id.as_str()) {
                             *expr = *result.clone();
                             return Ok(WalkControl::Continue);
                         }
@@ -399,7 +397,7 @@ pub fn simple_bind_expr(
                 let col_idx = joined_table.columns().iter().position(|c| {
                     c.name
                         .as_ref()
-                        .is_some_and(|name| name.eq_ignore_ascii_case(&normalized_id))
+                        .is_some_and(|name| name.eq_ignore_ascii_case(id.as_str()))
                 });
                 if let Some(col_idx) = col_idx {
                     let col = joined_table.table.columns().get(col_idx).unwrap();
@@ -413,7 +411,9 @@ pub fn simple_bind_expr(
                     // only if we haven't found a match, check for explicit rowid reference
                     let is_btree_table = matches!(joined_table.table, Table::BTree(_));
                     if is_btree_table {
-                        if let Some(rowid) = parse_row_id(&normalized_id, internal_id, || false)? {
+                        if let Some(rowid) =
+                            parse_row_id(&normalize_ident(id.as_str()), internal_id, || false)?
+                        {
                             *expr = rowid;
                         }
                     }
@@ -1678,9 +1678,9 @@ fn reject_cross_db_qualified_name(
 ) -> Result<()> {
     if let Some(table_db_name) = &qualified_name.db_name {
         let is_cross_db = match view_db_name {
-            Some(view_db) => {
-                normalize_ident(view_db.as_str()) != normalize_ident(table_db_name.as_str())
-            }
+            Some(view_db) => !view_db
+                .as_str()
+                .eq_ignore_ascii_case(table_db_name.as_str()),
             None => !table_db_name.as_str().eq_ignore_ascii_case("main"),
         };
         if is_cross_db {
@@ -1816,9 +1816,11 @@ pub fn extract_view_columns(
 
         // Helper function to find table index by name or alias
         let find_table_index = |name: &str| -> Option<usize> {
-            let name_norm = normalize_ident(name);
             tables.iter().position(|t| {
-                t.name == name_norm || t.alias.as_ref().is_some_and(|a| a == &name_norm)
+                t.name.eq_ignore_ascii_case(name)
+                    || t.alias
+                        .as_ref()
+                        .is_some_and(|a| a.eq_ignore_ascii_case(name))
             })
         };
 
@@ -1965,9 +1967,9 @@ pub fn rewrite_fk_parent_cols_if_self_ref(
     from: &str,
     to: &str,
 ) {
-    if normalize_ident(clause.tbl_name.as_str()) == normalize_ident(table) {
+    if clause.tbl_name.as_str().eq_ignore_ascii_case(table) {
         for c in &mut clause.columns {
-            if normalize_ident(c.col_name.as_str()) == normalize_ident(from) {
+            if c.col_name.as_str().eq_ignore_ascii_case(from) {
                 c.col_name = ast::Name::exact(to.to_owned());
             }
         }
@@ -1985,13 +1987,13 @@ pub fn check_expr_references_column(expr: &ast::Expr, col_name_normalized: &str)
         }
         match e {
             ast::Expr::Id(name) | ast::Expr::Name(name) => {
-                if normalize_ident(name.as_str()) == col_name_normalized {
+                if name.as_str().eq_ignore_ascii_case(col_name_normalized) {
                     found = true;
                     return Ok(WalkControl::SkipChildren);
                 }
             }
             ast::Expr::Qualified(_, col) | ast::Expr::DoublyQualified(_, _, col) => {
-                if normalize_ident(col.as_str()) == col_name_normalized {
+                if col.as_str().eq_ignore_ascii_case(col_name_normalized) {
                     found = true;
                     return Ok(WalkControl::SkipChildren);
                 }
@@ -2008,19 +2010,18 @@ pub fn check_expr_references_column(expr: &ast::Expr, col_name_normalized: &str)
 /// Replaces `Id(old)` and `Name(old)` with `Id(new)`, and updates the
 /// column name in `Qualified(tbl, old)` references.
 pub fn rename_identifiers(expr: &mut ast::Expr, from: &str, to: &str) {
-    let from_normalized = normalize_ident(from);
     // The closure is infallible, so walk_expr_mut cannot fail.
     let _ = walk_expr_mut(
         expr,
         &mut |e: &mut ast::Expr| -> crate::Result<WalkControl> {
             match e {
                 ast::Expr::Id(ref name) | ast::Expr::Name(ref name)
-                    if normalize_ident(name.as_str()) == from_normalized =>
+                    if name.as_str().eq_ignore_ascii_case(from) =>
                 {
                     *e = ast::Expr::Id(ast::Name::exact(to.to_owned()));
                 }
                 ast::Expr::Qualified(ref tbl, ref col_name)
-                    if normalize_ident(col_name.as_str()) == from_normalized =>
+                    if col_name.as_str().eq_ignore_ascii_case(from) =>
                 {
                     let tbl = tbl.clone();
                     *e = ast::Expr::Qualified(tbl, ast::Name::exact(to.to_owned()));
@@ -2072,11 +2073,7 @@ fn rename_identifiers_scoped_inner(
     rename_unqualified: bool,
     target_qualifiers: Option<&[String]>,
 ) {
-    let from_normalized = normalize_ident(from);
-    let target_normalized = normalize_ident(target_table);
-    let trigger_normalized = normalize_ident(trigger_table);
-    let is_renaming_trigger_table = target_normalized == trigger_normalized;
-
+    let is_renaming_trigger_table = target_table.eq_ignore_ascii_case(trigger_table);
     let _ = walk_expr_mut(
         expr,
         &mut |e: &mut ast::Expr| -> crate::Result<WalkControl> {
@@ -2105,19 +2102,19 @@ fn rename_identifiers_scoped_inner(
                     // lhs will be walked by walk_expr_mut
                 }
                 ast::Expr::Id(ref name) | ast::Expr::Name(ref name)
-                    if rename_unqualified && normalize_ident(name.as_str()) == from_normalized =>
+                    if rename_unqualified && name.as_str().eq_ignore_ascii_case(from) =>
                 {
                     *e = ast::Expr::Id(ast::Name::exact(to.to_owned()));
                 }
                 ast::Expr::Qualified(ref tbl, ref col_name)
-                    if normalize_ident(col_name.as_str()) == from_normalized =>
+                    if col_name.as_str().eq_ignore_ascii_case(from) =>
                 {
                     let tbl_norm = normalize_ident(tbl.as_str());
                     let should_rename = if tbl_norm == "new" || tbl_norm == "old" {
                         is_renaming_trigger_table
                     } else {
                         target_qualifiers.is_some_and(|qualifiers| qualifiers.contains(&tbl_norm))
-                            || tbl_norm == target_normalized
+                            || tbl_norm.eq_ignore_ascii_case(target_table)
                     };
                     if should_rename {
                         let tbl = tbl.clone();
@@ -3180,13 +3177,12 @@ pub use rename_column_view::{rewrite_view_sql_for_column_rename, RewrittenView};
 /// `t2.a > 0` when renaming t1 to t2. This matches SQLite 3.49.1+ behavior which
 /// rewrites qualified refs during ALTER TABLE RENAME instead of rejecting them.
 pub fn rewrite_check_expr_table_refs(expr: &mut ast::Expr, from: &str, to: &str) {
-    let from_normalized = normalize_ident(from);
     let _ = walk_expr_mut(
         expr,
         &mut |e: &mut ast::Expr| -> crate::Result<WalkControl> {
             match e {
                 ast::Expr::Qualified(tbl, col) => {
-                    if normalize_ident(tbl.as_str()) == from_normalized {
+                    if tbl.as_str().eq_ignore_ascii_case(from) {
                         let col = col.clone();
                         *e = ast::Expr::Qualified(ast::Name::exact(to.to_owned()), col);
                     }
@@ -3198,7 +3194,7 @@ pub fn rewrite_check_expr_table_refs(expr: &mut ast::Expr, from: &str, to: &str)
                     rewrite_select_table_refs(rhs, from, to);
                 }
                 ast::Expr::InTable { rhs, .. } => {
-                    if normalize_ident(rhs.name.as_str()) == from_normalized {
+                    if rhs.name.as_str().eq_ignore_ascii_case(from) {
                         rhs.name = ast::Name::exact(to.to_owned());
                     }
                 }
@@ -3255,7 +3251,7 @@ pub fn rewrite_fk_parent_table_if_needed(
     old_tbl: &str,
     new_tbl: &str,
 ) -> bool {
-    if normalize_ident(clause.tbl_name.as_str()) == normalize_ident(old_tbl) {
+    if clause.tbl_name.as_str().eq_ignore_ascii_case(old_tbl) {
         clause.tbl_name = ast::Name::exact(new_tbl.to_owned());
         return true;
     }
@@ -3285,7 +3281,6 @@ pub fn rewrite_inline_col_fk_target_if_needed(
 /// Updates tbl_name fields in INSERT/UPDATE/DELETE commands and table references
 /// in FROM clauses and qualified expressions throughout the trigger body.
 pub fn rewrite_trigger_cmd_table_refs(cmd: &mut ast::TriggerCmd, old_tbl: &str, new_tbl: &str) {
-    let old_normalized = normalize_ident(old_tbl);
     match cmd {
         ast::TriggerCmd::Update {
             tbl_name,
@@ -3294,7 +3289,7 @@ pub fn rewrite_trigger_cmd_table_refs(cmd: &mut ast::TriggerCmd, old_tbl: &str, 
             where_clause,
             ..
         } => {
-            if normalize_ident(tbl_name.as_str()) == old_normalized {
+            if tbl_name.as_str().eq_ignore_ascii_case(old_tbl) {
                 *tbl_name = ast::Name::exact(new_tbl.to_owned());
             }
             for set in sets {
@@ -3313,7 +3308,7 @@ pub fn rewrite_trigger_cmd_table_refs(cmd: &mut ast::TriggerCmd, old_tbl: &str, 
             upsert,
             ..
         } => {
-            if normalize_ident(tbl_name.as_str()) == old_normalized {
+            if tbl_name.as_str().eq_ignore_ascii_case(old_tbl) {
                 *tbl_name = ast::Name::exact(new_tbl.to_owned());
             }
             rewrite_select_table_refs(select, old_tbl, new_tbl);
@@ -3325,7 +3320,7 @@ pub fn rewrite_trigger_cmd_table_refs(cmd: &mut ast::TriggerCmd, old_tbl: &str, 
             tbl_name,
             where_clause,
         } => {
-            if normalize_ident(tbl_name.as_str()) == old_normalized {
+            if tbl_name.as_str().eq_ignore_ascii_case(old_tbl) {
                 *tbl_name = ast::Name::exact(new_tbl.to_owned());
             }
             if let Some(ref mut wc) = where_clause {
@@ -3386,10 +3381,8 @@ fn rewrite_select_column_refs_scoped(
         }
         _ => 0,
     };
-    let target_normalized = normalize_ident(target_table);
-    let trigger_normalized = normalize_ident(trigger_table);
     let rename_unqualified =
-        !target_qualifiers.is_empty() || target_normalized == trigger_normalized;
+        !target_qualifiers.is_empty() || target_table.eq_ignore_ascii_case(trigger_table);
     for col in &mut select.order_by {
         rename_identifiers_scoped_inner(
             &mut col.expr,
@@ -3458,7 +3451,7 @@ fn collect_target_qualifiers(
     let ast::SelectTable::Table(name, alias, _) = st else {
         return;
     };
-    if normalize_ident(name.name.as_str()) != target_table {
+    if !name.name.as_str().eq_ignore_ascii_case(target_table) {
         return;
     }
 
@@ -3495,10 +3488,8 @@ fn rewrite_one_select_column_refs_scoped(
             let local = from_clause_target_qualifiers(from, target_table);
             let added = extend_qualifiers_scoped(target_qualifiers, &local);
 
-            let target_normalized = normalize_ident(target_table);
-            let trigger_normalized = normalize_ident(trigger_table);
             let rename_unqualified =
-                !target_qualifiers.is_empty() || target_normalized == trigger_normalized;
+                !target_qualifiers.is_empty() || target_table.eq_ignore_ascii_case(trigger_table);
 
             if let Some(ref mut from) = from {
                 rewrite_from_clause_column_refs_scoped(
@@ -3589,10 +3580,7 @@ fn rename_result_identifiers_scoped(
     rename_unqualified: bool,
     target_qualifiers: Option<&[String]>,
 ) {
-    let from_normalized = normalize_ident(from);
-    let target_normalized = normalize_ident(target_table);
-    let trigger_normalized = normalize_ident(trigger_table);
-    let is_renaming_trigger_table = target_normalized == trigger_normalized;
+    let is_renaming_trigger_table = target_table.eq_ignore_ascii_case(trigger_table);
 
     let _ = walk_expr_mut(
         expr,
@@ -3622,19 +3610,19 @@ fn rename_result_identifiers_scoped(
                     );
                 }
                 ast::Expr::Id(ref name) | ast::Expr::Name(ref name)
-                    if rename_unqualified && normalize_ident(name.as_str()) == from_normalized =>
+                    if rename_unqualified && name.as_str().eq_ignore_ascii_case(from) =>
                 {
                     *e = ast::Expr::Id(ast::Name::exact(to.to_owned()));
                 }
                 ast::Expr::Qualified(ref tbl, ref col_name)
-                    if normalize_ident(col_name.as_str()) == from_normalized =>
+                    if col_name.as_str().eq_ignore_ascii_case(from) =>
                 {
                     let tbl_norm = normalize_ident(tbl.as_str());
                     let should_rename = if tbl_norm == "new" || tbl_norm == "old" {
                         is_renaming_trigger_table
                     } else {
                         target_qualifiers.is_some_and(|qualifiers| qualifiers.contains(&tbl_norm))
-                            || tbl_norm == target_normalized
+                            || tbl_norm.eq_ignore_ascii_case(target_table)
                     };
                     if should_rename {
                         let tbl = tbl.clone();
@@ -3656,10 +3644,8 @@ fn rewrite_window_column_refs_scoped(
     new_col: &str,
     visible_target_qualifiers: &[String],
 ) {
-    let target_normalized = normalize_ident(target_table);
-    let trigger_normalized = normalize_ident(trigger_table);
     let rename_unqualified =
-        !visible_target_qualifiers.is_empty() || target_normalized == trigger_normalized;
+        !visible_target_qualifiers.is_empty() || target_table.eq_ignore_ascii_case(trigger_table);
 
     for expr in &mut window.partition_by {
         rename_identifiers_scoped_inner(
@@ -3696,10 +3682,8 @@ fn rewrite_from_clause_column_refs_scoped(
     let local = from_clause_target_qualifiers(&Some(from.clone()), target_table);
     let added = extend_qualifiers_scoped(target_qualifiers, &local);
 
-    let target_normalized = normalize_ident(target_table);
-    let trigger_normalized = normalize_ident(trigger_table);
     let rename_unqualified =
-        !target_qualifiers.is_empty() || target_normalized == trigger_normalized;
+        !target_qualifiers.is_empty() || target_table.eq_ignore_ascii_case(trigger_table);
 
     rewrite_select_table_entry_column_refs_scoped(
         &mut from.select,
@@ -3799,9 +3783,6 @@ fn expr_still_references_renamed_column(
     rename_unqualified: bool,
     visible_target_qualifiers: &[String],
 ) -> bool {
-    let target_normalized = normalize_ident(target_table);
-    let trigger_normalized = normalize_ident(trigger_table);
-    let old_col_normalized = normalize_ident(old_col);
     let mut expr = expr.clone();
     let mut found = false;
 
@@ -3834,20 +3815,20 @@ fn expr_still_references_renamed_column(
                     );
                 }
                 ast::Expr::Qualified(ns, col) | ast::Expr::DoublyQualified(_, ns, col) => {
-                    if normalize_ident(col.as_str()) == old_col_normalized {
+                    if col.as_str().eq_ignore_ascii_case(old_col) {
                         let ns_norm = normalize_ident(ns.as_str());
                         if ((ns_norm == "new" || ns_norm == "old")
-                            && target_normalized == trigger_normalized)
+                            && target_table.eq_ignore_ascii_case(trigger_table))
                             || visible_target_qualifiers.contains(&ns_norm)
-                            || (target_normalized == trigger_normalized
-                                && ns_norm == trigger_normalized)
+                            || (target_table.eq_ignore_ascii_case(trigger_table)
+                                && ns_norm.eq_ignore_ascii_case(trigger_table))
                         {
                             found = true;
                         }
                     }
                 }
                 ast::Expr::Id(name) | ast::Expr::Name(name) => {
-                    if rename_unqualified && normalize_ident(name.as_str()) == old_col_normalized {
+                    if rename_unqualified && name.as_str().eq_ignore_ascii_case(old_col) {
                         found = true;
                     }
                 }
@@ -3878,8 +3859,8 @@ fn one_select_still_references_renamed_column(
             let local = from_clause_target_qualifiers(from, target_table);
             let added = extend_qualifiers_scoped(target_qualifiers, &local);
 
-            let rename_unqualified = !target_qualifiers.is_empty()
-                || normalize_ident(target_table) == normalize_ident(trigger_table);
+            let rename_unqualified =
+                !target_qualifiers.is_empty() || target_table.eq_ignore_ascii_case(trigger_table);
 
             let mut found = false;
             if let Some(from_clause) = from {
@@ -4033,8 +4014,8 @@ fn select_still_references_renamed_column(
         }
         _ => 0,
     };
-    let rename_unqualified = !target_qualifiers.is_empty()
-        || normalize_ident(target_table) == normalize_ident(trigger_table);
+    let rename_unqualified =
+        !target_qualifiers.is_empty() || target_table.eq_ignore_ascii_case(trigger_table);
 
     let mut found = false;
     for sorted_col in &select.order_by {
@@ -4130,8 +4111,8 @@ fn from_clause_still_references_renamed_column(
     let local = from_clause_target_qualifiers(&Some(from.clone()), target_table);
     let added = extend_qualifiers_scoped(target_qualifiers, &local);
 
-    let rename_unqualified = !target_qualifiers.is_empty()
-        || normalize_ident(target_table) == normalize_ident(trigger_table);
+    let rename_unqualified =
+        !target_qualifiers.is_empty() || target_table.eq_ignore_ascii_case(trigger_table);
 
     let mut found = false;
     if select_table_still_references_renamed_column(
@@ -4181,11 +4162,11 @@ pub fn trigger_still_references_renamed_column(
     target_table: &str,
     old_col: &str,
 ) -> bool {
-    if normalize_ident(&trigger.table_name) == normalize_ident(target_table) {
+    if trigger.table_name.eq_ignore_ascii_case(target_table) {
         if let ast::TriggerEvent::UpdateOf(cols) = &trigger.event {
             if cols
                 .iter()
-                .any(|col| normalize_ident(col.as_str()) == normalize_ident(old_col))
+                .any(|col| col.as_str().eq_ignore_ascii_case(old_col))
             {
                 return true;
             }
@@ -4214,15 +4195,14 @@ pub fn trigger_still_references_renamed_column(
                 where_clause,
                 ..
             } => {
-                let targets_renamed_table =
-                    normalize_ident(tbl_name.as_str()) == normalize_ident(target_table);
+                let targets_renamed_table = tbl_name.as_str().eq_ignore_ascii_case(target_table);
                 let visible_target_qualifiers = from_clause_target_qualifiers(from, target_table);
 
                 if targets_renamed_table
                     && sets.iter().any(|set| {
-                        set.col_names.iter().any(|col_name| {
-                            normalize_ident(col_name.as_str()) == normalize_ident(old_col)
-                        })
+                        set.col_names
+                            .iter()
+                            .any(|col_name| col_name.as_str().eq_ignore_ascii_case(old_col))
                     })
                 {
                     return true;
@@ -4273,10 +4253,10 @@ pub fn trigger_still_references_renamed_column(
                 upsert,
                 ..
             } => {
-                if normalize_ident(tbl_name.as_str()) == normalize_ident(target_table)
-                    && col_names.iter().any(|col_name| {
-                        normalize_ident(col_name.as_str()) == normalize_ident(old_col)
-                    })
+                if tbl_name.as_str().eq_ignore_ascii_case(target_table)
+                    && col_names
+                        .iter()
+                        .any(|col_name| col_name.as_str().eq_ignore_ascii_case(old_col))
                 {
                     return true;
                 }
@@ -4299,7 +4279,7 @@ pub fn trigger_still_references_renamed_column(
                                 target_table,
                                 &trigger.table_name,
                                 old_col,
-                                normalize_ident(tbl_name.as_str()) == normalize_ident(target_table),
+                                tbl_name.as_str().eq_ignore_ascii_case(target_table),
                                 &[],
                             ) {
                                 return true;
@@ -4311,7 +4291,7 @@ pub fn trigger_still_references_renamed_column(
                                 target_table,
                                 &trigger.table_name,
                                 old_col,
-                                normalize_ident(tbl_name.as_str()) == normalize_ident(target_table),
+                                tbl_name.as_str().eq_ignore_ascii_case(target_table),
                                 &[],
                             ) {
                                 return true;
@@ -4330,7 +4310,7 @@ pub fn trigger_still_references_renamed_column(
                         target_table,
                         &trigger.table_name,
                         old_col,
-                        normalize_ident(tbl_name.as_str()) == normalize_ident(target_table),
+                        tbl_name.as_str().eq_ignore_ascii_case(target_table),
                         &[],
                     ) {
                         return true;
@@ -4355,13 +4335,12 @@ pub fn trigger_still_references_renamed_column(
 }
 
 fn rename_excluded_column_refs(expr: &mut ast::Expr, old_col: &str, new_col: &str) {
-    let old_col_normalized = normalize_ident(old_col);
     let _ = walk_expr_mut(
         expr,
         &mut |e: &mut ast::Expr| -> crate::Result<WalkControl> {
             if let ast::Expr::Qualified(ns, col) | ast::Expr::DoublyQualified(_, ns, col) = e {
-                if normalize_ident(ns.as_str()) == "excluded"
-                    && normalize_ident(col.as_str()) == old_col_normalized
+                if ns.as_str().eq_ignore_ascii_case("excluded")
+                    && col.as_str().eq_ignore_ascii_case(&old_col)
                 {
                     *col = ast::Name::exact(new_col.to_owned());
                 }
@@ -4379,7 +4358,7 @@ fn rewrite_upsert_column_refs_scoped(
     old_col: &str,
     new_col: &str,
 ) {
-    let insert_targets_renamed_table = normalize_ident(insert_table) == normalize_ident(table);
+    let insert_targets_renamed_table = insert_table.eq_ignore_ascii_case(table);
     let rewrite_expr = |expr: &mut ast::Expr| {
         if insert_targets_renamed_table {
             rename_identifiers_scoped(expr, table, trigger_table, old_col, new_col);
@@ -4405,7 +4384,7 @@ fn rewrite_upsert_column_refs_scoped(
         for set in sets {
             if insert_targets_renamed_table {
                 for col_name in &mut set.col_names {
-                    if normalize_ident(col_name.as_str()) == normalize_ident(old_col) {
+                    if col_name.as_str().eq_ignore_ascii_case(old_col) {
                         *col_name = ast::Name::exact(new_col.to_owned());
                     }
                 }
@@ -4438,7 +4417,6 @@ pub fn rewrite_trigger_cmd_column_refs(
     old_col: &str,
     new_col: &str,
 ) {
-    let table_normalized = normalize_ident(table);
     match cmd {
         ast::TriggerCmd::Update {
             tbl_name,
@@ -4447,12 +4425,11 @@ pub fn rewrite_trigger_cmd_column_refs(
             where_clause,
             ..
         } => {
-            let cmd_tbl_norm = normalize_ident(tbl_name.as_str());
-            let targets_renamed_table = cmd_tbl_norm == table_normalized;
+            let targets_renamed_table = tbl_name.as_str().eq_ignore_ascii_case(table);
             if targets_renamed_table {
                 for set in sets {
                     for col_name in &mut set.col_names {
-                        if normalize_ident(col_name.as_str()) == normalize_ident(old_col) {
+                        if col_name.as_str().eq_ignore_ascii_case(old_col) {
                             *col_name = ast::Name::exact(new_col.to_owned());
                         }
                     }
@@ -4505,11 +4482,10 @@ pub fn rewrite_trigger_cmd_column_refs(
             upsert,
             ..
         } => {
-            let cmd_tbl_norm = normalize_ident(tbl_name.as_str());
-            let targets_renamed_table = cmd_tbl_norm == table_normalized;
+            let targets_renamed_table = tbl_name.as_str().eq_ignore_ascii_case(table);
             if targets_renamed_table {
                 for col_name in col_names {
-                    if normalize_ident(col_name.as_str()) == normalize_ident(old_col) {
+                    if col_name.as_str().eq_ignore_ascii_case(old_col) {
                         *col_name = ast::Name::exact(new_col.to_owned());
                     }
                 }
@@ -4537,8 +4513,7 @@ pub fn rewrite_trigger_cmd_column_refs(
             tbl_name,
             where_clause,
         } => {
-            let cmd_tbl_norm = normalize_ident(tbl_name.as_str());
-            let targets_renamed_table = cmd_tbl_norm == table_normalized;
+            let targets_renamed_table = tbl_name.as_str().eq_ignore_ascii_case(table);
             if targets_renamed_table {
                 if let Some(ref mut wc) = where_clause {
                     rename_identifiers_scoped(wc, table, trigger_table, old_col, new_col);
@@ -4596,7 +4571,7 @@ fn rewrite_one_select_table_refs(one: &mut ast::OneSelect, old_tbl: &str, new_tb
                         rewrite_check_expr_table_refs(expr, old_tbl, new_tbl);
                     }
                     ast::ResultColumn::TableStar(ref mut name) => {
-                        if normalize_ident(name.as_str()) == normalize_ident(old_tbl) {
+                        if name.as_str().eq_ignore_ascii_case(old_tbl) {
                             *name = ast::Name::exact(new_tbl.to_owned());
                         }
                     }
@@ -4633,15 +4608,14 @@ fn rewrite_from_clause_table_refs(from: &mut ast::FromClause, old_tbl: &str, new
 }
 
 fn rewrite_select_table_entry_table_refs(st: &mut ast::SelectTable, old_tbl: &str, new_tbl: &str) {
-    let old_normalized = normalize_ident(old_tbl);
     match st {
         ast::SelectTable::Table(ref mut name, _, _) => {
-            if normalize_ident(name.name.as_str()) == old_normalized {
+            if name.name.as_str().eq_ignore_ascii_case(old_tbl) {
                 name.name = ast::Name::exact(new_tbl.to_owned());
             }
         }
         ast::SelectTable::TableCall(ref mut name, ref mut args, _) => {
-            if normalize_ident(name.name.as_str()) == old_normalized {
+            if name.name.as_str().eq_ignore_ascii_case(old_tbl) {
                 name.name = ast::Name::exact(new_tbl.to_owned());
             }
             for arg in args {
