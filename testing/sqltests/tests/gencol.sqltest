@@ -4209,3 +4209,39 @@ test fk-child-references-parent-virtual-col-using-rowid-missing {
 }
 expect error {
 }
+@cross-check-integrity
+test delete_with_unique_gencol {
+    create table t(a, b as (a + 1) unique);
+    delete from t;
+}
+expect {
+}
+
+# DELETE with transitive virtual column dependency (c depends on b which depends on a)
+@cross-check-integrity
+test delete-transitive-virtual-dep {
+    CREATE TABLE t(a INTEGER, b AS (a * 2) VIRTUAL, c AS (b + 1) VIRTUAL);
+    CREATE UNIQUE INDEX idx_c ON t(c);
+    INSERT INTO t(a) VALUES(10);
+    DELETE FROM t WHERE a = 10;
+    SELECT count(*) FROM t;
+}
+expect {
+    0
+}
+
+# FK CASCADE through transitive virtual columns
+@cross-check-integrity
+test fk-transitive-virtual-cascade {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE p(a INTEGER, b AS (a * 2) VIRTUAL, c AS (b + 10) VIRTUAL);
+    CREATE UNIQUE INDEX idx_p_c ON p(c);
+    CREATE TABLE child(x INTEGER REFERENCES p(c) ON DELETE CASCADE);
+    INSERT INTO p(a) VALUES(5);
+    INSERT INTO child(x) VALUES(20);
+    DELETE FROM p WHERE a = 5;
+    SELECT count(*) FROM child;
+}
+expect {
+    0
+}

@@ -11,13 +11,14 @@ use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use std::borrow::Cow;
 use turso_macros::match_ignore_ascii_case;
 
-use super::expr::translate_expr;
+use super::expr::{emit_table_column, translate_expr};
 use super::group_by::GroupByMetadata;
 use super::main_loop::{LeftJoinMetadata, LoopLabels};
 use super::order_by::SortMetadata;
 use super::plan::{HashJoinType, TableReferences};
 use crate::error::SQLITE_CONSTRAINT_CHECK;
 use crate::function::Func;
+use crate::schema::stored_deps_of_virtual;
 use crate::schema::{
     BTreeTable, CheckConstraint, Column, ColumnLayout, GeneratedType, IndexColumn, Schema, Table,
 };
@@ -44,6 +45,7 @@ use tracing::instrument;
 use turso_parser::ast::{
     self, Expr, Literal, ResolveType, SubqueryType, TableInternalId, TriggerTime,
 };
+
 pub(crate) mod delete;
 pub(crate) mod gencol;
 pub(crate) mod select;
@@ -1411,6 +1413,34 @@ fn rewrite_where_for_update_registers(
     })
 }
 
+/// Reads the stored columns needed by `target_columns` into compact registers. This takes into
+/// account stored columns, and any stored columns required by virtual columns in `target_columns`.
+pub(crate) fn cursor_to_registers(
+    program: &mut ProgramBuilder,
+    table: &BTreeTable,
+    cursor_id: usize,
+    rowid_reg: usize,
+    target_columns: impl IntoIterator<Item = usize>,
+) -> DmlColumnContext {
+    let dependencies = stored_deps_of_virtual(&table.columns, target_columns);
+    let base = program.alloc_registers(dependencies.count());
+    let mut next_reg = base;
+    let pairs = table.columns.iter().enumerate().map(|(idx, col)| {
+        let reg = if col.is_rowid_alias() {
+            rowid_reg
+        } else if dependencies.get(idx) {
+            let reg = next_reg;
+            program.emit_column_or_rowid(cursor_id, idx, reg);
+            next_reg += 1;
+            reg
+        } else {
+            0
+        };
+        (col, reg)
+    });
+    DmlColumnContext::from_column_reg_mapping(pairs)
+}
+
 /// Emit code to load the value of an IndexColumn from the OLD image of the row being updated.
 /// Handling expression indexes and regular columns
 pub(crate) fn emit_index_column_value_old_image(
@@ -1418,6 +1448,7 @@ pub(crate) fn emit_index_column_value_old_image(
     resolver: &Resolver,
     table_references: &mut TableReferences,
     table_cursor_id: usize,
+    table_internal_id: TableInternalId,
     idx_col: &IndexColumn,
     dest_reg: usize,
 ) -> Result<()> {
@@ -1450,10 +1481,44 @@ pub(crate) fn emit_index_column_value_old_image(
             )?;
             Ok(())
         })?;
+    } else if let Some((table, generated_column)) =
+        generated_column(&program, table_cursor_id, idx_col)
+    {
+        cursor_to_registers(program, &table, table_cursor_id, 0, [idx_col.pos_in_table]);
+
+        emit_table_column(
+            program,
+            table_cursor_id,
+            table_internal_id,
+            table_references,
+            &generated_column,
+            idx_col.pos_in_table,
+            dest_reg,
+            resolver,
+        )?;
     } else {
         program.emit_column_or_rowid(table_cursor_id, idx_col.pos_in_table, dest_reg);
     }
     Ok(())
+}
+
+fn generated_column(
+    program: &&mut ProgramBuilder,
+    table_cursor_id: usize,
+    idx_col: &IndexColumn,
+) -> Option<(Arc<BTreeTable>, Column)> {
+    program
+        .btree_table_from_cursor(table_cursor_id)
+        .iter()
+        .cloned()
+        .flat_map(|table| {
+            table
+                .columns
+                .get(idx_col.pos_in_table)
+                .filter(|col| col.is_virtual_generated())
+                .map(|col| (table.clone(), col.clone()))
+        })
+        .next()
 }
 
 /// Emit code to load the value of an IndexColumn from the NEW image of the row being updated.
