@@ -1127,10 +1127,14 @@ impl SimulatorEnv {
                 self.connections[connection_index] = SimConnection::LimboConnection(conn);
             }
             SimulationType::Differential => {
-                self.connections[connection_index] = SimConnection::SQLiteConnection(
-                    rusqlite::Connection::open(self.get_db_path())
-                        .expect("Failed to open SQLite connection"),
-                );
+                let conn = rusqlite::Connection::open(self.get_db_path())
+                    .expect("Failed to open SQLite connection");
+                conn.pragma_update(None, "journal_mode", "WAL")
+                    .expect("Failed to set WAL mode on SQLite");
+                conn.pragma_update(None, "busy_timeout", 30000)
+                    .expect("Failed to set busy_timeout on SQLite");
+                self.connections[connection_index] =
+                    SimConnection::SQLiteConnection(conn);
             }
         };
 

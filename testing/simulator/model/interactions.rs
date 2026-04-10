@@ -887,6 +887,10 @@ fn reopen_database(env: &mut SimulatorEnv) {
             for i in 0..num_conns {
                 let conn = rusqlite::Connection::open(env.get_db_path())
                     .expect("Failed to open SQLite connection");
+                conn.pragma_update(None, "journal_mode", "WAL")
+                    .expect("Failed to set WAL mode on SQLite reopen");
+                conn.pragma_update(None, "busy_timeout", 30000)
+                    .expect("Failed to set busy_timeout on SQLite reopen");
                 for name in &env.attached_dbs {
                     let aux_path = env.get_aux_db_path(name);
                     conn.execute(&format!("ATTACH '{}' AS {name}", aux_path.display()), [])
