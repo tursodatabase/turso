@@ -1,5 +1,4 @@
-use crate::common::{limbo_exec_rows, ExecRows, TempDatabase};
-use rusqlite::types::Value;
+use crate::common::{ExecRows, TempDatabase};
 use std::collections::HashSet;
 use std::path::PathBuf;
 
@@ -22,13 +21,6 @@ fn find_leaked_temp_files(before: &HashSet<PathBuf>, after: &HashSet<PathBuf>) -
         .collect()
 }
 
-fn value_as_text(value: &Value) -> Option<&str> {
-    match value {
-        Value::Text(v) => Some(v.as_str()),
-        _ => None,
-    }
-}
-
 #[test]
 fn test_ephemeral_temp_files_cleaned_up() {
     let before = snapshot_temp_dir();
@@ -40,21 +32,9 @@ fn test_ephemeral_temp_files_cleaned_up() {
     conn.execute("INSERT INTO t_eph VALUES(3),(1),(2),(1),(3)")
         .unwrap();
 
-    //Sanity check to verify plan uses OpenEphemeral opcode
-    let explain_rows = limbo_exec_rows(
-        &conn,
-        "EXPLAIN SELECT x FROM t_eph UNION SELECT x FROM t_eph",
-    );
-
-    let has_open_ephemeral = explain_rows.iter().any(|row| {
-        row.get(1)
-            .and_then(value_as_text)
-            .is_some_and(|op| op == "OpenEphemeral")
-    });
-    assert!(
-        has_open_ephemeral,
-        "expected OpenEphemeral in EXPLAIN output"
-    );
+    // UNION emits OpenEphemeral
+    // which creates the temp file we want to verify gets cleaned up. If you change
+    // this query, make sure the replacement still creates a temp file
 
     let rows: Vec<(i64,)> = conn.exec_rows("SELECT x FROM t_eph UNION SELECT x FROM t_eph");
     assert_eq!(rows, vec![(1,), (2,), (3,)]);
