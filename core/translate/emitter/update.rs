@@ -436,7 +436,7 @@ fn emit_update_column_values<'a>(
     has_direct_rowid_update: bool,
     has_user_provided_rowid: bool,
     rowid_set_clause_reg: Option<usize>,
-    is_virtual: bool,
+    is_virtual_table: bool,
     index: &Option<(Arc<Index>, usize)>,
     cdc_updates_register: Option<usize>,
     t_ctx: &mut TranslateCtx<'a>,
@@ -473,7 +473,7 @@ fn emit_update_column_values<'a>(
                 }
                 if has_user_provided_rowid
                     && (table_column.primary_key() || table_column.is_rowid_alias())
-                    && !is_virtual
+                    && !is_virtual_table
                 {
                     let rowid_set_clause_reg = rowid_set_clause_reg.unwrap();
                     translate_expr(
@@ -631,9 +631,9 @@ fn emit_update_column_values<'a>(
 
                     // don't emit null for pkey of virtual tables. they require first two args
                     // before the 'record' to be explicitly non-null
-                    if table_column.is_rowid_alias() && !is_virtual {
+                    if table_column.is_rowid_alias() && !is_virtual_table {
                         program.emit_null(target_reg, None);
-                    } else if is_virtual {
+                    } else if is_virtual_table {
                         program.emit_insn(Insn::VColumn {
                             cursor_id: target_table_cursor_id,
                             column: idx,
@@ -805,7 +805,7 @@ fn emit_update_insns<'a>(
         .joined_tables()
         .first()
         .expect("UPDATE must have a source table");
-    let (index, is_virtual) = match &source_table.op {
+    let (index, is_virtual_table) = match &source_table.op {
         Operation::Scan(Scan::BTreeTable { index, .. }) => (
             index.as_ref().map(|index| {
                 (
@@ -848,7 +848,7 @@ fn emit_update_insns<'a>(
 
     let beg = program.alloc_registers(
         target_table.table.columns().len()
-            + if is_virtual {
+            + if is_virtual_table {
                 2 // two args before the relevant columns for VUpdate
             } else {
                 1 // rowid reg
@@ -965,7 +965,7 @@ fn emit_update_insns<'a>(
         )?;
     }
 
-    if is_virtual {
+    if is_virtual_table {
         program.emit_insn(Insn::Copy {
             src_reg: beg,
             dst_reg: beg + 1,
@@ -993,7 +993,7 @@ fn emit_update_insns<'a>(
         None
     };
     let table_name = target_table.table.get_name();
-    let start = if is_virtual { beg + 2 } else { beg + 1 };
+    let start = if is_virtual_table { beg + 2 } else { beg + 1 };
     let layout = ColumnLayout::from_table(&target_table.as_ref().table);
     let skip_set_clauses = false;
 
@@ -1010,7 +1010,7 @@ fn emit_update_insns<'a>(
         has_direct_rowid_update,
         has_user_provided_rowid,
         rowid_set_clause_reg,
-        is_virtual,
+        is_virtual_table,
         &index,
         cdc_updates_register,
         t_ctx,
@@ -1227,7 +1227,7 @@ fn emit_update_insns<'a>(
             has_direct_rowid_update,
             has_user_provided_rowid,
             rowid_set_clause_reg,
-            is_virtual,
+            is_virtual_table,
             &index,
             cdc_updates_register,
             t_ctx,
@@ -2440,8 +2440,6 @@ fn emit_update_insns<'a>(
             target_pc: t_ctx.label_main_loop_end.unwrap(),
         })
     }
-    // TODO(pthorpe): handle RETURNING clause
-
     if let Some(label) = check_rowid_not_exists_label {
         program.preassign_label_to_next_insn(label);
     }
