@@ -47,6 +47,7 @@ pub use memory::MemoryIO;
 pub mod clock;
 mod common;
 mod completions;
+pub(crate) mod file_lock;
 pub use clock::Clock;
 pub use completions::*;
 
