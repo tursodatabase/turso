@@ -10,7 +10,7 @@ use crate::sync::Arc;
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use std::borrow::Cow;
 use std::cell::RefCell;
-use turso_macros::match_ignore_ascii_case;
+use turso_macros::turso_assert_ne;
 
 use super::expr::{translate_expr, ExprAffinityInfo};
 use super::group_by::GroupByMetadata;
@@ -223,7 +223,7 @@ impl<'a> Resolver<'a> {
             database_schemas: self.database_schemas,
             temp_database: self.temp_database,
             attached_databases: self.attached_databases,
-            non_main_schema_cache: RefCell::new(self.non_main_schema_cache.borrow().clone()),
+            non_main_schema_cache: RefCell::new(HashMap::default()),
             symbol_table: self.symbol_table,
             expr_to_reg_cache_enabled: false,
             expr_to_reg_cache: Vec::new(),
@@ -242,7 +242,7 @@ impl<'a> Resolver<'a> {
             database_schemas: self.database_schemas,
             temp_database: self.temp_database,
             attached_databases: self.attached_databases,
-            non_main_schema_cache: RefCell::new(self.non_main_schema_cache.borrow().clone()),
+            non_main_schema_cache: RefCell::new(HashMap::default()),
             symbol_table: self.symbol_table,
             expr_to_reg_cache_enabled: self.expr_to_reg_cache_enabled,
             expr_to_reg_cache: self.expr_to_reg_cache.clone(),
@@ -263,7 +263,7 @@ impl<'a> Resolver<'a> {
     }
 
     fn cached_non_main_schema(&self, database_id: usize) -> Arc<Schema> {
-        debug_assert_ne!(database_id, crate::MAIN_DB_ID);
+        turso_assert_ne!(database_id, crate::MAIN_DB_ID);
 
         if let Some(schema) = self
             .non_main_schema_cache
@@ -526,15 +526,12 @@ impl<'a> Resolver<'a> {
 
     /// Resolve database ID from a qualified name
     pub(crate) fn resolve_database_id(&self, qualified_name: &ast::QualifiedName) -> Result<usize> {
-        use crate::util::normalize_ident;
-
         // Check if this is a qualified name (database.table) or unqualified
         let resolved_id = if let Some(db_name) = &qualified_name.db_name {
             let db_name_normalized = normalize_ident(db_name.as_str());
-            let name_bytes = db_name_normalized.as_bytes();
-            match_ignore_ascii_case!(match name_bytes {
-                b"main" => Ok(0),
-                b"temp" => Ok(1),
+            match db_name_normalized.as_str() {
+                "main" => Ok(0),
+                "temp" => Ok(1),
                 _ => {
                     // Look up attached database
                     if let Some((idx, _attached_db)) =
@@ -547,7 +544,7 @@ impl<'a> Resolver<'a> {
                         )))
                     }
                 }
-            })
+            }
         } else {
             // Unqualified table name — when compiling a trigger subprogram,
             // resolve to the trigger's database (matching SQLite behavior).
