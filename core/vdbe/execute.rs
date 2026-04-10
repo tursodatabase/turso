@@ -10466,14 +10466,16 @@ pub fn op_parse_schema(
     // which also acquires the schema / database_schemas write lock, so holding
     // it here would deadlock on the same thread (parking_lot RwLock is not
     // re-entrant).
-    let schema_arc = if *db != crate::MAIN_DB_ID {
-        let fallback_schema = if *db == crate::TEMP_DB_ID {
-            conn.temp_database
-                .read()
-                .as_ref()
-                .map(|temp_db| temp_db.db.schema.lock().clone())
-                .unwrap_or_else(|| conn.empty_temp_schema())
-        } else {
+    let schema_arc = if *db == crate::TEMP_DB_ID {
+        // TEMP: single source of truth is `temp_db.db.schema`. Skip
+        // `database_schemas` staging entirely — it would only go stale.
+        conn.temp_database
+            .read()
+            .as_ref()
+            .map(|temp_db| temp_db.db.schema.lock().clone())
+            .unwrap_or_else(|| conn.empty_temp_schema())
+    } else if *db != crate::MAIN_DB_ID {
+        let fallback_schema = {
             let attached_dbs = conn.attached_databases.read();
             let Some((db_inst, _pager)) = attached_dbs.index_to_data.get(db) else {
                 conn.auto_commit
@@ -10590,7 +10592,24 @@ fn op_parse_schema_step(
                 );
 
                 // Store the modified schema back
-                if db != crate::MAIN_DB_ID {
+                if db == crate::TEMP_DB_ID {
+                    // TEMP: write directly to `temp_db.db.schema` — the single
+                    // source of truth; never stage in `database_schemas`.
+                    //
+                    // Refresh schema_version from the pager header first. At
+                    // this point SetCookie has already run for the current
+                    // DDL, so the header cookie is authoritative; without this
+                    // the cached version can drift on subsequent temp DDLs in
+                    // the same transaction and trigger a spurious
+                    // SchemaUpdated -> reprepare -> rollback_attached() loop
+                    // that wipes in-flight dirty pages.
+                    if let Some(temp_db) = conn.temp_database.read().as_ref() {
+                        if let Some(cookie) = temp_db.pager.get_schema_cookie_cached() {
+                            schema.schema_version = cookie;
+                        }
+                        *temp_db.db.schema.lock() = schema_arc;
+                    }
+                } else if db != crate::MAIN_DB_ID {
                     conn.database_schemas().write().insert(db, schema_arc);
                 } else {
                     *conn.schema.write() = schema_arc;

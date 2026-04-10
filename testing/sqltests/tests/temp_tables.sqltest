@@ -283,3 +283,27 @@ test temp-store-change-inside-active-temp-transaction-errors {
 }
 expect error {
 }
+
+# Regression: two CREATE TEMP TABLE inside the same explicit transaction used
+# to leave database_schemas[TEMP] frozen at the first DDL's schema_version
+# while temp_db.db.schema advanced, triggering a spurious SchemaUpdated ->
+# reprepare -> rollback_attached() loop that wiped the in-flight dirty pages.
+# Both tables must survive and both INSERTs must be visible on COMMIT.
+test multi-ddl-in-temp-transaction-preserves-data {
+    BEGIN;
+    CREATE TEMP TABLE multi_ddl_t(x INTEGER);
+    CREATE TEMP TABLE multi_ddl_u(y INTEGER);
+    INSERT INTO multi_ddl_t VALUES (1);
+    INSERT INTO multi_ddl_u VALUES (2);
+    SELECT x FROM multi_ddl_t;
+    SELECT y FROM multi_ddl_u;
+    COMMIT;
+    SELECT x FROM multi_ddl_t;
+    SELECT y FROM multi_ddl_u;
+}
+expect {
+    1
+    2
+    1
+    2
+}

@@ -276,11 +276,15 @@ impl<'a> Resolver<'a> {
             return schema;
         }
 
-        if let Some(schema) = self.database_schemas.read().get(&database_id).cloned() {
-            self.non_main_schema_cache
-                .borrow_mut()
-                .insert(database_id, schema.clone());
-            return schema;
+        // TEMP uses `temp_db.db.schema` as its single source of truth; skip
+        // `database_schemas` which is never populated for TEMP.
+        if database_id != crate::TEMP_DB_ID {
+            if let Some(schema) = self.database_schemas.read().get(&database_id).cloned() {
+                self.non_main_schema_cache
+                    .borrow_mut()
+                    .insert(database_id, schema.clone());
+                return schema;
+            }
         }
 
         let loaded_schema = match database_id {
