@@ -1409,7 +1409,7 @@ impl Database {
             capture_data_changes: RwLock::new(None),
             cdc_transaction_id: AtomicI64::new(-1),
             closed: AtomicBool::new(false),
-            temp_database: RwLock::new(None),
+            temp: crate::connection::TempDbContext::new(),
             attached_databases: RwLock::new(DatabaseCatalog::new()),
             query_only: AtomicBool::new(false),
             dml_require_where: AtomicBool::new(false),

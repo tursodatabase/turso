@@ -733,7 +733,7 @@ fn update_pragma(
                     _ => bail_parse_error!("temp_store must be 0, 1, 2, DEFAULT, FILE, or MEMORY"),
                 })
             };
-            if !connection.get_auto_commit() && connection.temp_database.read().is_some() {
+            if !connection.get_auto_commit() && connection.temp.database.read().is_some() {
                 bail_parse_error!("temporary storage cannot be changed from within a transaction");
             }
             connection.set_temp_store(temp_store);

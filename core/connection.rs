@@ -61,6 +61,42 @@ pub(crate) struct TempDatabase {
     _temp_dir: Option<TempDir>,
 }
 
+/// All of the connection-local state needed to manage the `TEMP` schema.
+///
+/// Grouped so that anything that touches the temp database (the pager,
+/// the last committed schema snapshot, the dirty-schema flag) lives in
+/// one place. The individual fields keep their own locks because their
+/// access patterns differ: `database` is read on every temp-qualified
+/// lookup while `committed_schema` is only touched at commit/rollback
+/// boundaries, and `schema_did_change` is flipped from inside `SetCookie`.
+pub(crate) struct TempDbContext {
+    /// Per-connection temp database (`TEMP_DB_ID`/schema `temp`).
+    /// Lazily initialized on first temp DDL.
+    pub(crate) database: RwLock<Option<TempDatabase>>,
+    /// Last committed snapshot of `database.lock().as_ref().unwrap().db.schema`.
+    /// Updated on successful commit and consulted on full-txn rollback
+    /// to restore the in-memory temp schema (there is no shared
+    /// `Database::schema` for temp the way main has). `None` until the
+    /// first temp DDL is committed; a rollback with `None` resets the
+    /// temp schema to empty.
+    pub(crate) committed_schema: RwLock<Option<Arc<Schema>>>,
+    /// Set by `SetCookie` when a temp DDL runs; read by commit/rollback
+    /// to decide whether to snapshot/restore. Cleared on transaction
+    /// end. Mirrors the `schema_did_change` field inside
+    /// `TransactionState::Write` for the main DB.
+    pub(crate) schema_did_change: AtomicBool,
+}
+
+impl TempDbContext {
+    pub(crate) fn new() -> Self {
+        Self {
+            database: RwLock::new(None),
+            committed_schema: RwLock::new(None),
+            schema_did_change: AtomicBool::new(false),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct NamedSavepointFrame {
     pub(crate) name: String,
@@ -116,8 +152,9 @@ pub struct Connection {
     /// -1 means unset (will be assigned on first CDC write in the transaction).
     pub(crate) cdc_transaction_id: AtomicI64,
     pub(super) closed: AtomicBool,
-    /// Per-connection temp database (`TEMP_DB_ID` / schema `temp`).
-    pub(crate) temp_database: RwLock<Option<TempDatabase>>,
+    /// Per-connection state for the `TEMP` schema (pager, last-committed
+    /// snapshot, dirty-schema flag). See `TempDbContext`.
+    pub(crate) temp: TempDbContext,
     /// Attached databases
     pub(super) attached_databases: RwLock<DatabaseCatalog>,
     pub(super) query_only: AtomicBool,
@@ -375,12 +412,12 @@ impl Connection {
     }
 
     pub(crate) fn ensure_temp_database(&self) -> Result<()> {
-        if self.temp_database.read().is_some() {
+        if self.temp.database.read().is_some() {
             return Ok(());
         }
 
         let temp_db = self.create_temp_database()?;
-        let mut guard = self.temp_database.write();
+        let mut guard = self.temp.database.write();
         if guard.is_none() {
             *guard = Some(temp_db);
         }
@@ -390,9 +427,50 @@ impl Connection {
     fn reset_temp_database(&self) {
         // TEMP is never staged in `database_schemas` — writes go directly to
         // `temp_db.db.schema`. Drop the handle and the schema goes with it.
-        if let Some(temp_db) = self.temp_database.write().take() {
+        if let Some(temp_db) = self.temp.database.write().take() {
             temp_db.pager.rollback_attached();
         }
+        *self.temp.committed_schema.write() = None;
+        self.temp.schema_did_change.store(false, Ordering::Release);
+    }
+
+    /// Flag a temp-schema mutation within the current transaction so the
+    /// commit/rollback path knows to snapshot or restore the in-memory
+    /// temp schema. Called from `SetCookie` for `TEMP_DB_ID`.
+    pub(crate) fn mark_temp_schema_did_change(&self) {
+        self.temp.schema_did_change.store(true, Ordering::Release);
+    }
+
+    /// On successful commit, snapshot the current `temp_db.db.schema`
+    /// into `committed_temp_schema` so a future full-txn rollback can
+    /// restore it. No-op if no temp DDL ran in this transaction.
+    pub(crate) fn commit_temp_schema(&self) {
+        if !self.temp.schema_did_change.load(Ordering::Acquire) {
+            return;
+        }
+        if let Some(temp_db) = self.temp.database.read().as_ref() {
+            let snap = temp_db.db.schema.lock().clone();
+            *self.temp.committed_schema.write() = Some(snap);
+        }
+        self.temp.schema_did_change.store(false, Ordering::Release);
+    }
+
+    /// On full-txn rollback, restore `temp_db.db.schema` from the last
+    /// committed snapshot. If nothing was ever committed, reset to an
+    /// empty schema (matches the disk state the pager rolled back to).
+    pub(crate) fn rollback_temp_schema(&self) {
+        if !self.temp.schema_did_change.load(Ordering::Acquire) {
+            return;
+        }
+        if let Some(temp_db) = self.temp.database.read().as_ref() {
+            let committed = self.temp.committed_schema.read().clone();
+            match committed {
+                Some(snap) => *temp_db.db.schema.lock() = snap,
+                None => *temp_db.db.schema.lock() = self.empty_temp_schema(),
+            }
+        }
+        self.temp.schema_did_change.store(false, Ordering::Release);
+        self.bump_prepare_context_generation();
     }
 
     /// Bump the prepare context generation counter. Must be called whenever any
@@ -1452,7 +1530,8 @@ impl Connection {
         match index {
             crate::MAIN_DB_ID => self.db.is_readonly(),
             crate::TEMP_DB_ID => self
-                .temp_database
+                .temp
+                .database
                 .read()
                 .as_ref()
                 .is_some_and(|temp_db| temp_db.db.is_readonly()),
@@ -1750,7 +1829,7 @@ impl Connection {
                 // The temp database is connection-local, no other connection can
                 // reference its schema, so we can mutate it directly without cloning
                 // into `database_schemas`.
-                let temp_db_guard = self.temp_database.read();
+                let temp_db_guard = self.temp.database.read();
                 let temp_db = temp_db_guard
                     .as_ref()
                     .expect("temp database should be initialized before schema mutation");
@@ -1792,11 +1871,12 @@ impl Connection {
             crate::MAIN_DB_ID => self.pager.load().clone(),
             crate::TEMP_DB_ID => {
                 // Lazily initialize the temp database if it hasn't been created yet.
-                if self.temp_database.read().is_none() {
+                if self.temp.database.read().is_none() {
                     self.ensure_temp_database()
                         .expect("failed to initialize temp database");
                 }
-                self.temp_database
+                self.temp
+                    .database
                     .read()
                     .as_ref()
                     .map(|temp_db| temp_db.pager.clone())
@@ -2196,7 +2276,7 @@ impl Connection {
     /// Get all non-main database pagers (temp + attached).
     pub fn get_all_attached_pagers(&self) -> Vec<Arc<Pager>> {
         let mut pagers = Vec::new();
-        if let Some(temp_db) = self.temp_database.read().as_ref() {
+        if let Some(temp_db) = self.temp.database.read().as_ref() {
             pagers.push(temp_db.pager.clone());
         }
         let catalog = self.attached_databases.read();
@@ -2218,7 +2298,7 @@ impl Connection {
         F: FnOnce(&[(usize, Arc<Pager>)]) -> R,
     {
         let mut pagers: SmallVec<[(usize, Arc<Pager>); 8]> = SmallVec::new();
-        if let Some(temp_db) = self.temp_database.read().as_ref() {
+        if let Some(temp_db) = self.temp.database.read().as_ref() {
             pagers.push((crate::TEMP_DB_ID, temp_db.pager.clone()));
         }
         {
@@ -2241,7 +2321,8 @@ impl Connection {
         // `database_schemas` entirely to avoid stale reads.
         if database_id == crate::TEMP_DB_ID {
             return self
-                .temp_database
+                .temp
+                .database
                 .read()
                 .as_ref()
                 .map(|temp_db| temp_db.db.schema.lock().clone())
@@ -2325,7 +2406,7 @@ impl Connection {
         // SQLite only exposes the temp schema in database_list after it has
         // been initialized, and reports an empty path rather than the backing
         // temp filename.
-        if self.temp_database.read().is_some() {
+        if self.temp.database.read().is_some() {
             databases.push((crate::TEMP_DB_ID, "temp".to_string(), String::new()));
         }
 
@@ -2754,7 +2835,8 @@ impl Connection {
         F: FnOnce(Option<Arc<Schema>>, HashMap<usize, Arc<Schema>>) -> T,
     {
         let temp_schema_snapshot = self
-            .temp_database
+            .temp
+            .database
             .read()
             .as_ref()
             .map(|temp_db| temp_db.db.schema.lock().clone());
