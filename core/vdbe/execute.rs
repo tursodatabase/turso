@@ -10243,6 +10243,13 @@ pub fn op_drop_table(
             schema.remove_triggers_for_table(table_name);
             schema.remove_table(table_name);
         });
+        // SQLite also removes temp triggers that target the dropped table.
+        // Only needed when dropping from a non-temp database.
+        if *db != crate::TEMP_DB_ID && conn.temp_database.read().is_some() {
+            conn.with_database_schema_mut(crate::TEMP_DB_ID, |temp_schema| {
+                temp_schema.remove_triggers_for_table(table_name);
+            });
+        }
     }
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
