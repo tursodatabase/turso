@@ -1,11 +1,12 @@
 use clap::Parser;
+use crossterm::style::Color as CrosstermColor;
 use nu_ansi_term::{Color, Style};
-use rustyline::completion::{extract_word, Completer, Pair};
-use rustyline::highlight::Highlighter;
-use rustyline::hint::HistoryHinter;
-use rustyline::{Completer, Helper, Hinter, Validator};
+use reedline::{
+    Completer, Highlighter, Prompt, PromptEditMode, PromptHistorySearch, PromptHistorySearchStatus,
+    Span, StyledText, Suggestion, ValidationResult, Validator,
+};
 use shlex::Shlex;
-use std::cell::RefCell;
+use std::borrow::Cow;
 use std::marker::PhantomData;
 use std::sync::Arc;
 use std::{ffi::OsString, path::PathBuf, str::FromStr as _};
@@ -13,35 +14,161 @@ use syntect::dumps::from_uncompressed_data;
 use syntect::easy::HighlightLines;
 use syntect::highlighting::ThemeSet;
 use syntect::parsing::{Scope, SyntaxSet};
-use syntect::util::{as_24_bit_terminal_escaped, LinesWithEndings};
+use syntect::util::LinesWithEndings;
 use turso_core::Connection;
 
-use crate::commands::CommandParser;
 use crate::config::{HighlightConfig, CONFIG_DIR};
 
 macro_rules! try_result {
     ($expr:expr, $err:expr) => {
         match $expr {
             Ok(val) => val,
-            Err(_) => return Ok($err),
+            Err(_) => return $err,
         }
     };
 }
 
-#[derive(Helper, Completer, Hinter, Validator)]
-pub struct LimboHelper {
-    #[rustyline(Completer)]
-    completer: SqlCompleter<CommandParser>,
+// --- Completer ---
+
+pub struct TursoCompleter<C: Parser + Send + Sync + 'static> {
+    conn: Arc<Connection>,
+    cmd: clap::Command,
+    _cmd_phantom: PhantomData<C>,
+}
+
+impl<C: Parser + Send + Sync + 'static> TursoCompleter<C> {
+    pub fn new(conn: Arc<Connection>) -> Self {
+        Self {
+            conn,
+            cmd: C::command(),
+            _cmd_phantom: PhantomData,
+        }
+    }
+
+    fn dot_completion(&mut self, line: &str, pos: usize) -> Vec<Suggestion> {
+        let inner_line = &line[1..];
+        let inner_pos = pos.saturating_sub(1);
+
+        let args = Shlex::new(inner_line);
+        let mut args = std::iter::once("".to_owned())
+            .chain(args)
+            .map(OsString::from)
+            .collect::<Vec<_>>();
+        if inner_line.ends_with(' ') {
+            args.push(OsString::new());
+        }
+        let arg_index = args.len() - 1;
+
+        let prefix_pos = find_word_start(inner_line, inner_pos);
+
+        match clap_complete::engine::complete(
+            &mut self.cmd,
+            args,
+            arg_index,
+            PathBuf::from_str(".").ok().as_deref(),
+        ) {
+            Ok(candidates) => candidates
+                .iter()
+                .map(|candidate| {
+                    let value = candidate.get_value().to_string_lossy().into_owned();
+                    Suggestion {
+                        value,
+                        description: None,
+                        style: None,
+                        extra: None,
+                        span: Span::new(prefix_pos + 1, pos),
+                        append_whitespace: false,
+                        display_override: None,
+                        match_indices: None,
+                    }
+                })
+                .collect(),
+            Err(_) => Vec::new(),
+        }
+    }
+
+    fn sql_completion(&self, line: &str, pos: usize) -> Vec<Suggestion> {
+        let prefix_pos = find_word_start(line, pos);
+        let prefix = &line[prefix_pos..pos];
+
+        let query = try_result!(
+            self.conn.query(format!(
+                "SELECT candidate FROM completion('{prefix}', '{line}') ORDER BY 1;"
+            )),
+            Vec::new()
+        );
+
+        let mut candidates = Vec::new();
+        if let Some(mut rows) = query {
+            let _ = rows.run_with_row_callback(|row| {
+                let completion: &str = row.get::<&str>(0)?;
+                candidates.push(Suggestion {
+                    value: completion.to_string(),
+                    description: None,
+                    style: None,
+                    extra: None,
+                    span: Span::new(prefix_pos, pos),
+                    append_whitespace: false,
+                    display_override: None,
+                    match_indices: None,
+                });
+                Ok(())
+            });
+        }
+
+        candidates
+    }
+}
+
+fn find_word_start(line: &str, pos: usize) -> usize {
+    let bytes = line.as_bytes();
+    let mut i = pos;
+    while i > 0 {
+        let c = bytes[i - 1] as char;
+        if is_break_char(c) {
+            break;
+        }
+        i -= 1;
+    }
+    i
+}
+
+cfg_if::cfg_if! {
+    if #[cfg(unix)] {
+        fn is_break_char(c: char) -> bool {
+            matches!(c, ' ' | '\t' | '\n' | '"' | '\\' | '\'' | '`' | '@' | '$' | '>' | '<' | '=' | ';' | '|' | '&' |
+            '{' | '(' | '\0')
+        }
+    } else if #[cfg(windows)] {
+        fn is_break_char(c: char) -> bool {
+            matches!(c, ' ' | '\t' | '\n' | '"' | '\'' | '`' | '@' | '$' | '>' | '<' | '=' | ';' | '|' | '&' | '{' |
+            '(' | '\0')
+        }
+    } else if #[cfg(target_arch = "wasm32")] {
+        fn is_break_char(_c: char) -> bool { false }
+    }
+}
+
+impl<C: Parser + Send + Sync + 'static> Completer for TursoCompleter<C> {
+    fn complete(&mut self, line: &str, pos: usize) -> Vec<Suggestion> {
+        if line.starts_with('.') {
+            self.dot_completion(line, pos)
+        } else {
+            self.sql_completion(line, pos)
+        }
+    }
+}
+
+// --- Highlighter ---
+
+pub struct TursoHighlighter {
     syntax_set: SyntaxSet,
     theme_set: ThemeSet,
     syntax_config: HighlightConfig,
-    #[rustyline(Hinter)]
-    hinter: HistoryHinter,
 }
 
-impl LimboHelper {
-    pub fn new(conn: Arc<Connection>, syntax_config: Option<HighlightConfig>) -> Self {
-        // Load only predefined syntax
+impl TursoHighlighter {
+    pub fn new(syntax_config: Option<HighlightConfig>) -> Self {
         let ps = from_uncompressed_data(include_bytes!(concat!(
             env!("OUT_DIR"),
             "/SQL_syntax_set_dump.packdump"
@@ -54,21 +181,19 @@ impl LimboHelper {
                 tracing::error!("{err}");
             }
         }
-        LimboHelper {
-            completer: SqlCompleter::new(conn),
+        TursoHighlighter {
             syntax_set: ps,
             theme_set: ts,
             syntax_config: syntax_config.unwrap_or_default(),
-            hinter: HistoryHinter::new(),
         }
     }
 }
 
-impl Highlighter for LimboHelper {
-    fn highlight<'l>(&self, line: &'l str, pos: usize) -> std::borrow::Cow<'l, str> {
-        let _ = pos;
+impl Highlighter for TursoHighlighter {
+    fn highlight(&self, line: &str, _cursor: usize) -> StyledText {
+        let mut styled = StyledText::new();
+
         if self.syntax_config.enable {
-            // TODO use lifetimes to store highlight lines
             let syntax = self
                 .syntax_set
                 .find_syntax_by_scope(Scope::new("source.sql").unwrap())
@@ -79,198 +204,122 @@ impl Highlighter for LimboHelper {
                 .get(&self.syntax_config.theme)
                 .unwrap_or(&self.theme_set.themes["base16-ocean.dark"]);
             let mut h = HighlightLines::new(syntax, theme);
-            let ranges = {
-                let mut ret_ranges = Vec::new();
-                for new_line in LinesWithEndings::from(line) {
-                    let ranges: Vec<(syntect::highlighting::Style, &str)> =
-                        h.highlight_line(new_line, &self.syntax_set).unwrap();
-                    ret_ranges.extend(ranges);
+
+            for new_line in LinesWithEndings::from(line) {
+                let ranges = h.highlight_line(new_line, &self.syntax_set).unwrap();
+                for (style, text) in ranges {
+                    let fg = style.foreground;
+                    let nu_style = Style::new().fg(Color::Rgb(fg.r, fg.g, fg.b));
+                    styled.push((nu_style, text.to_string()));
                 }
-                ret_ranges
-            };
-            let mut ret_line = as_24_bit_terminal_escaped(&ranges[..], false);
-            // Push this escape sequence to reset terminal color modes at the end of the string
-            ret_line.push_str("\x1b[0m");
-            std::borrow::Cow::Owned(ret_line)
-        } else {
-            // Appease Pekka in syntax highlighting
-            let style = Style::new().fg(Color::White); // Standard shell text color
-            let styled_str = style.paint(line);
-            std::borrow::Cow::Owned(styled_str.to_string())
-        }
-    }
-
-    fn highlight_prompt<'b, 's: 'b, 'p: 'b>(
-        &'s self,
-        prompt: &'p str,
-        default: bool,
-    ) -> std::borrow::Cow<'b, str> {
-        let _ = default;
-        // Dark emerald green for prompt
-        let style = Style::new().bold().fg(self.syntax_config.prompt.0);
-        let styled_str = style.paint(prompt);
-        std::borrow::Cow::Owned(styled_str.to_string())
-    }
-
-    fn highlight_hint<'h>(&self, hint: &'h str) -> std::borrow::Cow<'h, str> {
-        let style = Style::new().bold().fg(self.syntax_config.hint.0); // Brighter dark grey for hints
-        let styled_str = style.paint(hint);
-        std::borrow::Cow::Owned(styled_str.to_string())
-    }
-
-    fn highlight_candidate<'c>(
-        &self,
-        candidate: &'c str,
-        completion: rustyline::CompletionType,
-    ) -> std::borrow::Cow<'c, str> {
-        let _ = completion;
-        let style = Style::new().fg(self.syntax_config.candidate.0);
-        let styled_str = style.paint(candidate);
-        std::borrow::Cow::Owned(styled_str.to_string())
-    }
-
-    fn highlight_char(&self, line: &str, pos: usize, kind: rustyline::highlight::CmdKind) -> bool {
-        let _ = (line, pos);
-        !matches!(kind, rustyline::highlight::CmdKind::MoveCursor)
-    }
-}
-
-pub struct SqlCompleter<C: Parser + Send + Sync + 'static> {
-    conn: Arc<Connection>,
-    // Has to be a ref cell as Rustyline takes immutable reference to self
-    // This problem would be solved with Reedline as it uses &mut self for completions
-    cmd: RefCell<clap::Command>,
-    _cmd_phantom: PhantomData<C>,
-}
-
-impl<C: Parser + Send + Sync + 'static> SqlCompleter<C> {
-    pub fn new(conn: Arc<Connection>) -> Self {
-        Self {
-            conn,
-            cmd: C::command().into(),
-            _cmd_phantom: PhantomData,
-        }
-    }
-
-    fn dot_completion(
-        &self,
-        mut line: &str,
-        mut pos: usize,
-    ) -> rustyline::Result<(usize, Vec<Pair>)> {
-        // TODO maybe check to see if the line is empty and then just output the command names
-        line = &line[1..];
-        pos -= 1;
-
-        let (prefix_pos, _) = extract_word(line, pos, ESCAPE_CHAR, default_break_chars);
-
-        let args = Shlex::new(line);
-        let mut args = std::iter::once("".to_owned())
-            .chain(args)
-            .map(OsString::from)
-            .collect::<Vec<_>>();
-        if line.ends_with(' ') {
-            args.push(OsString::new());
-        }
-        let arg_index = args.len() - 1;
-        // dbg!(&pos, line, &args, arg_index);
-
-        let mut cmd = self.cmd.borrow_mut();
-        match clap_complete::engine::complete(
-            &mut cmd,
-            args,
-            arg_index,
-            PathBuf::from_str(".").ok().as_deref(),
-        ) {
-            Ok(candidates) => {
-                let candidates = candidates
-                    .iter()
-                    .map(|candidate| Pair {
-                        display: candidate.get_value().to_string_lossy().into_owned(),
-                        replacement: candidate.get_value().to_string_lossy().into_owned(),
-                    })
-                    .collect::<Vec<Pair>>();
-
-                Ok((prefix_pos + 1, candidates))
             }
-            Err(_) => Ok((prefix_pos + 1, Vec::new())),
-        }
-    }
-
-    fn sql_completion(&self, line: &str, pos: usize) -> rustyline::Result<(usize, Vec<Pair>)> {
-        // TODO: have to differentiate words if they are enclosed in single of double quotes
-        let (prefix_pos, prefix) = extract_word(line, pos, ESCAPE_CHAR, default_break_chars);
-        let mut candidates = Vec::new();
-
-        let query = try_result!(
-            self.conn.query(format!(
-                "SELECT candidate FROM completion('{prefix}', '{line}') ORDER BY 1;"
-            )),
-            (prefix_pos, candidates)
-        );
-
-        if let Some(mut rows) = query {
-            try_result!(
-                rows.run_with_row_callback(|row| {
-                    let completion: &str = row.get::<&str>(0)?;
-                    let pair = Pair {
-                        display: completion.to_string(),
-                        replacement: completion.to_string(),
-                    };
-                    candidates.push(pair);
-                    Ok(())
-                }),
-                (prefix_pos, candidates)
-            );
-        }
-
-        Ok((prefix_pos, candidates))
-    }
-}
-
-// Got this from the FilenameCompleter.
-// TODO have to see what chars break words in Sqlite
-cfg_if::cfg_if! {
-    if #[cfg(unix)] {
-        // rl_basic_word_break_characters, rl_completer_word_break_characters
-        const fn default_break_chars(c : char) -> bool {
-            matches!(c, ' ' | '\t' | '\n' | '"' | '\\' | '\'' | '`' | '@' | '$' | '>' | '<' | '=' | ';' | '|' | '&' |
-            '{' | '(' | '\0')
-        }
-        const ESCAPE_CHAR: Option<char> = Some('\\');
-        // In double quotes, not all break_chars need to be escaped
-        // https://www.gnu.org/software/bash/manual/html_node/Double-Quotes.html
-        #[allow(dead_code)]
-        const fn double_quotes_special_chars(c: char) -> bool { matches!(c, '"' | '$' | '\\' | '`') }
-    } else if #[cfg(windows)] {
-        // Remove \ to make file completion works on windows
-        const fn default_break_chars(c: char) -> bool {
-            matches!(c, ' ' | '\t' | '\n' | '"' | '\'' | '`' | '@' | '$' | '>' | '<' | '=' | ';' | '|' | '&' | '{' |
-            '(' | '\0')
-        }
-        const ESCAPE_CHAR: Option<char> = None;
-        #[allow(dead_code)]
-        const fn double_quotes_special_chars(c: char) -> bool { c == '"' } // TODO Validate: only '"' ?
-    } else if #[cfg(target_arch = "wasm32")] {
-        const fn default_break_chars(c: char) -> bool { false }
-        const ESCAPE_CHAR: Option<char> = None;
-        #[allow(dead_code)]
-        const fn double_quotes_special_chars(c: char) -> bool { false }
-    }
-}
-
-impl<C: Parser + Send + Sync + 'static> Completer for SqlCompleter<C> {
-    type Candidate = Pair;
-
-    fn complete(
-        &self,
-        line: &str,
-        pos: usize,
-        _ctx: &rustyline::Context<'_>,
-    ) -> rustyline::Result<(usize, Vec<Self::Candidate>)> {
-        if line.starts_with(".") {
-            self.dot_completion(line, pos)
         } else {
-            self.sql_completion(line, pos)
+            let style = Style::new().fg(Color::White);
+            styled.push((style, line.to_string()));
         }
+
+        styled
+    }
+}
+
+// --- Validator ---
+
+pub struct TursoValidator;
+
+impl Validator for TursoValidator {
+    fn validate(&self, _line: &str) -> ValidationResult {
+        ValidationResult::Complete
+    }
+}
+
+// --- Prompt ---
+
+pub struct TursoPrompt {
+    prompt: String,
+    prompt_color: nu_ansi_term::Color,
+}
+
+impl TursoPrompt {
+    pub fn new(prompt: String, prompt_color: nu_ansi_term::Color) -> Self {
+        Self {
+            prompt,
+            prompt_color,
+        }
+    }
+
+    pub fn set_prompt(&mut self, prompt: String) {
+        self.prompt = prompt;
+    }
+
+    fn nu_color_to_crossterm(c: nu_ansi_term::Color) -> CrosstermColor {
+        match c {
+            nu_ansi_term::Color::Rgb(r, g, b) => CrosstermColor::Rgb { r, g, b },
+            nu_ansi_term::Color::Black => CrosstermColor::Black,
+            nu_ansi_term::Color::Red => CrosstermColor::DarkRed,
+            nu_ansi_term::Color::Green => CrosstermColor::DarkGreen,
+            nu_ansi_term::Color::Yellow => CrosstermColor::DarkYellow,
+            nu_ansi_term::Color::Blue => CrosstermColor::DarkBlue,
+            nu_ansi_term::Color::Purple => CrosstermColor::DarkMagenta,
+            nu_ansi_term::Color::Cyan => CrosstermColor::DarkCyan,
+            nu_ansi_term::Color::White => CrosstermColor::White,
+            nu_ansi_term::Color::DarkGray => CrosstermColor::DarkGrey,
+            nu_ansi_term::Color::LightRed => CrosstermColor::Red,
+            nu_ansi_term::Color::LightGreen => CrosstermColor::Green,
+            nu_ansi_term::Color::LightYellow => CrosstermColor::Yellow,
+            nu_ansi_term::Color::LightBlue => CrosstermColor::Blue,
+            nu_ansi_term::Color::LightPurple => CrosstermColor::Magenta,
+            nu_ansi_term::Color::LightCyan => CrosstermColor::Cyan,
+            nu_ansi_term::Color::LightGray => CrosstermColor::Grey,
+            nu_ansi_term::Color::Fixed(n) => CrosstermColor::AnsiValue(n),
+            _ => CrosstermColor::Reset,
+        }
+    }
+}
+
+impl Prompt for TursoPrompt {
+    fn render_prompt_left(&self) -> Cow<'_, str> {
+        Cow::Borrowed(&self.prompt)
+    }
+
+    fn render_prompt_right(&self) -> Cow<'_, str> {
+        Cow::Borrowed("")
+    }
+
+    fn render_prompt_indicator(&self, _edit_mode: PromptEditMode) -> Cow<'_, str> {
+        Cow::Borrowed("")
+    }
+
+    fn render_prompt_multiline_indicator(&self) -> Cow<'_, str> {
+        Cow::Borrowed("   ...> ")
+    }
+
+    fn render_prompt_history_search_indicator(
+        &self,
+        history_search: PromptHistorySearch,
+    ) -> Cow<'_, str> {
+        let prefix = match history_search.status {
+            PromptHistorySearchStatus::Passing => "",
+            PromptHistorySearchStatus::Failing => "failing ",
+        };
+        Cow::Owned(format!(
+            "({}reverse-i-search)`{}': ",
+            prefix, history_search.term
+        ))
+    }
+
+    fn get_prompt_color(&self) -> CrosstermColor {
+        Self::nu_color_to_crossterm(self.prompt_color)
+    }
+
+    fn get_prompt_multiline_color(&self) -> nu_ansi_term::Color {
+        self.prompt_color
+    }
+
+    fn get_indicator_color(&self) -> CrosstermColor {
+        CrosstermColor::Reset
+    }
+
+    fn get_prompt_right_color(&self) -> CrosstermColor {
+        CrosstermColor::Reset
     }
 }

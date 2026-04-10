@@ -5,7 +5,7 @@ use crate::{
         Command, CommandParser,
     },
     config::Config,
-    helper::LimboHelper,
+    helper::{TursoCompleter, TursoHighlighter, TursoPrompt, TursoValidator},
     input::{
         get_io, get_writer, ApplyWriter, DbLocation, NoopProgress, OutputMode, ProgressSink,
         Settings, StderrProgress,
@@ -13,12 +13,14 @@ use crate::{
     manual,
     opcodes_dictionary::OPCODE_DESCRIPTIONS,
     read_state_machine::ReadState,
-    HISTORY_FILE,
 };
 use anyhow::{anyhow, Context};
 use clap::Parser;
 use comfy_table::{Attribute, Cell, CellAlignment, ContentArrangement, Row, Table};
-use rustyline::{error::ReadlineError, history::DefaultHistory, Editor};
+use reedline::{
+    default_emacs_keybindings, ColumnarMenu, DescriptionMode, Emacs, IdeMenu, KeyCode,
+    KeyModifiers, MenuBuilder, Reedline, ReedlineEvent, ReedlineMenu, Signal,
+};
 use std::num::NonZeroUsize;
 use std::{
     fs::File,
@@ -37,6 +39,25 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilte
 use turso_core::{
     io_error, Connection, Database, LimboError, Numeric, OpenFlags, QueryMode, Statement, Value,
 };
+
+#[derive(Debug)]
+pub enum ReadlineEvent {
+    Interrupted,
+    Eof,
+    Error(std::io::Error),
+}
+
+impl std::fmt::Display for ReadlineEvent {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ReadlineEvent::Interrupted => write!(f, "interrupted"),
+            ReadlineEvent::Eof => write!(f, "eof"),
+            ReadlineEvent::Error(e) => write!(f, "{e}"),
+        }
+    }
+}
+
+impl std::error::Error for ReadlineEvent {}
 
 #[derive(Parser, Debug)]
 #[command(name = "Turso")]
@@ -106,7 +127,7 @@ pub struct Opts {
 const PROMPT: &str = "turso> ";
 
 pub struct Limbo {
-    pub prompt: String,
+    pub prompt: TursoPrompt,
     io: Arc<dyn turso_core::IO>,
     writer: Option<Box<dyn Write>>,
     conn: Arc<turso_core::Connection>,
@@ -115,7 +136,7 @@ pub struct Limbo {
     pub(crate) opts: Settings,
     db_opts: turso_core::DatabaseOpts,
     read_state: ReadState,
-    pub rl: Option<Editor<LimboHelper, DefaultHistory>>,
+    pub rl: Option<Reedline>,
     config: Option<Config>,
     had_query_error: bool,
     parameter_bindings: Vec<ParameterBinding>,
@@ -278,7 +299,7 @@ impl Limbo {
         let quiet = opts.quiet || !IsTerminal::is_terminal(&std::io::stdin());
         let config = Config::for_output_mode(opts.output_mode);
         let mut app = Self {
-            prompt: PROMPT.to_string(),
+            prompt: TursoPrompt::new(PROMPT.to_string(), nu_ansi_term::Color::Rgb(34, 197, 94)),
             io,
             writer: Some(get_writer(&opts.output)),
             conn,
@@ -301,12 +322,88 @@ impl Limbo {
         self
     }
 
-    pub fn with_readline(mut self, mut rl: Editor<LimboHelper, DefaultHistory>) -> Self {
-        let h = LimboHelper::new(
-            self.conn.clone(),
-            self.config.as_ref().map(|c| c.highlight.clone()),
+    pub fn with_readline(mut self, rl: Reedline) -> Self {
+        let highlight_config = self.config.as_ref().map(|c| c.highlight.clone());
+        // Update prompt color from config
+        if let Some(ref hc) = highlight_config {
+            self.prompt = TursoPrompt::new(PROMPT.to_string(), hc.prompt.0);
+        }
+
+        let completer = Box::new(TursoCompleter::<CommandParser>::new(self.conn.clone()));
+        let highlighter = Box::new(TursoHighlighter::new(highlight_config));
+        let validator = Box::new(TursoValidator);
+        let hinter = Box::new(
+            reedline::DefaultHinter::default().with_style(
+                nu_ansi_term::Style::new().fg(self
+                    .config
+                    .as_ref()
+                    .map(|c| c.highlight.hint.0)
+                    .unwrap_or(nu_ansi_term::Color::DarkGray)),
+            ),
         );
-        rl.set_helper(Some(h));
+
+        // Set up completion menus
+        let completion_menu = Box::new(
+            ColumnarMenu::default()
+                .with_name("completion_menu")
+                .with_text_style(nu_ansi_term::Color::Green.normal())
+                .with_selected_text_style(nu_ansi_term::Style::new().reverse())
+                .with_description_text_style(nu_ansi_term::Color::Yellow.normal())
+                .with_match_text_style(nu_ansi_term::Style::new().underline())
+                .with_selected_match_text_style(nu_ansi_term::Style::new().underline().reverse()),
+        );
+        let ide_menu = Box::new(
+            IdeMenu::default()
+                .with_name("ide_completion_menu")
+                .with_min_completion_width(0)
+                .with_max_completion_width(50)
+                .with_max_completion_height(10)
+                .with_padding(0)
+                .with_default_border()
+                .with_cursor_offset(0)
+                .with_description_mode(DescriptionMode::PreferRight)
+                .with_min_description_width(15)
+                .with_max_description_width(50)
+                .with_max_description_height(10)
+                .with_description_offset(1)
+                .with_correct_cursor_pos(false)
+                .with_marker("| ")
+                .with_only_buffer_difference(false)
+                .with_text_style(nu_ansi_term::Color::Green.normal())
+                .with_selected_text_style(nu_ansi_term::Style::new().reverse())
+                .with_description_text_style(nu_ansi_term::Color::Yellow.normal())
+                .with_match_text_style(nu_ansi_term::Style::new().underline())
+                .with_selected_match_text_style(nu_ansi_term::Style::new().underline().reverse()),
+        );
+
+        // Set up keybindings
+        let mut keybindings = default_emacs_keybindings();
+        // Tab: inline completion
+        keybindings.add_binding(
+            KeyModifiers::NONE,
+            KeyCode::Tab,
+            ReedlineEvent::UntilFound(vec![
+                ReedlineEvent::Menu("completion_menu".to_string()),
+                ReedlineEvent::MenuNext,
+            ]),
+        );
+        // Ctrl+Space: IDE-style dropdown completion
+        keybindings.add_binding(
+            KeyModifiers::CONTROL,
+            KeyCode::Char(' '),
+            ReedlineEvent::Menu("ide_completion_menu".to_string()),
+        );
+        let edit_mode = Box::new(Emacs::new(keybindings));
+
+        let rl = rl
+            .with_completer(completer)
+            .with_highlighter(highlighter)
+            .with_validator(validator)
+            .with_hinter(hinter)
+            .with_menu(ReedlineMenu::EngineCompleter(completion_menu))
+            .with_menu(ReedlineMenu::EngineCompleter(ide_menu))
+            .with_edit_mode(edit_mode);
+
         self.rl = Some(rl);
         self
     }
@@ -346,7 +443,7 @@ impl Limbo {
     }
 
     fn set_multiline_prompt(&mut self) {
-        self.prompt = match self.input_buff.chars().fold(0, |acc, c| match c {
+        let new_prompt = match self.input_buff.chars().fold(0, |acc, c| match c {
             '(' => acc + 1,
             ')' => acc - 1,
             _ => acc,
@@ -356,6 +453,7 @@ impl Limbo {
             n if n < 10 => format!("(x{n}...> "),
             _ => String::from("(.....> "),
         };
+        self.prompt.set_prompt(new_prompt);
     }
 
     #[cfg(not(target_family = "wasm"))]
@@ -414,7 +512,7 @@ impl Limbo {
     }
 
     pub fn reset_input(&mut self) {
-        self.prompt = PROMPT.to_string();
+        self.prompt.set_prompt(PROMPT.to_string());
         self.input_buff.clear();
         self.read_state = ReadState::default();
     }
@@ -1363,7 +1461,7 @@ impl Limbo {
             .with_default_directive(tracing::level_filters::LevelFilter::WARN.into())
             .from_env_lossy();
 
-        // Disable rustyline traces
+        // Disable reedline traces
         if let Err(e) = tracing_subscriber::registry()
             .with(
                 tracing_subscriber::fmt::layer()
@@ -1372,7 +1470,7 @@ impl Limbo {
                     .with_thread_ids(true)
                     .with_ansi(should_emit_ansi),
             )
-            .with(default_env_filter.add_directive("rustyline=off".parse().unwrap()))
+            .with(default_env_filter.add_directive("reedline=off".parse().unwrap()))
             .try_init()
         {
             println!("Unable to setup tracing appender: {e:?}");
@@ -1747,20 +1845,30 @@ impl Limbo {
         Ok(())
     }
 
-    // readline will read inputs from rustyline or stdin
+    // readline will read inputs from reedline or stdin
     // and write it to input_buff.
-    pub fn readline(&mut self) -> Result<(), ReadlineError> {
+    pub fn readline(&mut self) -> Result<(), ReadlineEvent> {
         use std::fmt::Write;
 
         if let Some(rl) = &mut self.rl {
-            let result = rl.readline(&self.prompt)?;
-            self.read_state.process(&result);
-            let _ = self.input_buff.write_str(result.as_str());
+            match rl.read_line(&self.prompt) {
+                Ok(Signal::Success(result)) => {
+                    self.read_state.process(&result);
+                    let _ = self.input_buff.write_str(result.as_str());
+                }
+                Ok(Signal::CtrlC) => return Err(ReadlineEvent::Interrupted),
+                Ok(Signal::CtrlD) => return Err(ReadlineEvent::Eof),
+                Err(e) => return Err(ReadlineEvent::Error(e)),
+            }
         } else {
             let mut reader = std::io::stdin().lock();
             let prev_len = self.input_buff.len();
-            if reader.read_line(&mut self.input_buff)? == 0 {
-                return Err(ReadlineError::Eof);
+            if reader
+                .read_line(&mut self.input_buff)
+                .map_err(ReadlineEvent::Error)?
+                == 0
+            {
+                return Err(ReadlineEvent::Eof);
             }
             self.read_state.process(&self.input_buff[prev_len..]);
         }
@@ -2055,7 +2163,7 @@ impl Limbo {
 
     fn save_history(&mut self) {
         if let Some(rl) = &mut self.rl {
-            let _ = rl.save_history(HISTORY_FILE.as_path());
+            let _ = rl.sync_history();
         }
     }
 
