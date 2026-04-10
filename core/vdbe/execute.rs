@@ -3018,9 +3018,15 @@ fn open_connection_named_savepoints_for_db(
     })
 }
 
-fn mirror_named_savepoint_begin_to_active_non_main_databases(
+enum SavepointMirror<'a> {
+    Begin(&'a crate::connection::NamedSavepointFrame),
+    Release(&'a str),
+    Rollback(&'a str),
+}
+
+fn mirror_named_savepoint_to_active_non_main_databases(
     conn: &Connection,
-    frame: &crate::connection::NamedSavepointFrame,
+    op: SavepointMirror<'_>,
 ) -> Result<()> {
     conn.with_all_attached_pagers_with_index(|pagers| {
         for (db_id, pager) in pagers {
@@ -3029,66 +3035,45 @@ fn mirror_named_savepoint_begin_to_active_non_main_databases(
                 let Some(tx_id) = conn.get_mv_tx_id_for_db(db_id) else {
                     continue;
                 };
-                mv_store.begin_named_savepoint(
-                    tx_id,
-                    frame.name.clone(),
-                    frame.starts_transaction,
-                    frame.deferred_fk_violations,
-                );
+                match op {
+                    SavepointMirror::Begin(frame) => {
+                        mv_store.begin_named_savepoint(
+                            tx_id,
+                            frame.name.clone(),
+                            frame.starts_transaction,
+                            frame.deferred_fk_violations,
+                        );
+                    }
+                    SavepointMirror::Release(name) => {
+                        let _ = mv_store.release_named_savepoint(tx_id, name);
+                    }
+                    SavepointMirror::Rollback(name) => {
+                        let _ = mv_store.rollback_to_named_savepoint(tx_id, name);
+                    }
+                }
                 continue;
             }
             if !pager.holds_read_lock() {
                 continue;
             }
-            match open_named_savepoint_frames_on_wal_pager(pager, std::slice::from_ref(frame))? {
-                IOResult::Done(()) => {}
-                IOResult::IO(_) => {
-                    unreachable!("active pager header should be resident before SAVEPOINT")
+            match op {
+                SavepointMirror::Begin(frame) => {
+                    match open_named_savepoint_frames_on_wal_pager(
+                        pager,
+                        std::slice::from_ref(frame),
+                    )? {
+                        IOResult::Done(()) => {}
+                        IOResult::IO(_) => {
+                            unreachable!("active pager header should be resident before SAVEPOINT")
+                        }
+                    }
                 }
-            }
-        }
-        Ok(())
-    })
-}
-
-fn mirror_named_savepoint_release_to_active_non_main_databases(
-    conn: &Connection,
-    name: &str,
-) -> Result<()> {
-    conn.with_all_attached_pagers_with_index(|pagers| {
-        for (db_id, pager) in pagers {
-            let db_id = *db_id;
-            if let Some(mv_store) = conn.mv_store_for_db(db_id) {
-                let Some(tx_id) = conn.get_mv_tx_id_for_db(db_id) else {
-                    continue;
-                };
-                let _ = mv_store.release_named_savepoint(tx_id, name);
-                continue;
-            }
-            if pager.holds_read_lock() {
-                let _ = pager.release_named_savepoint(name)?;
-            }
-        }
-        Ok(())
-    })
-}
-
-fn mirror_named_savepoint_rollback_to_active_non_main_databases(
-    conn: &Connection,
-    name: &str,
-) -> Result<()> {
-    conn.with_all_attached_pagers_with_index(|pagers| {
-        for (db_id, pager) in pagers {
-            let db_id = *db_id;
-            if let Some(mv_store) = conn.mv_store_for_db(db_id) {
-                let Some(tx_id) = conn.get_mv_tx_id_for_db(db_id) else {
-                    continue;
-                };
-                let _ = mv_store.rollback_to_named_savepoint(tx_id, name);
-                continue;
-            }
-            if pager.holds_read_lock() {
-                let _ = pager.rollback_to_named_savepoint(name)?;
+                SavepointMirror::Release(name) => {
+                    let _ = pager.release_named_savepoint(name)?;
+                }
+                SavepointMirror::Rollback(name) => {
+                    let _ = pager.rollback_to_named_savepoint(name)?;
+                }
             }
         }
         Ok(())
@@ -3755,7 +3740,10 @@ pub fn op_savepoint(
                     deferred_fk_violations,
                 )?;
             }
-            mirror_named_savepoint_begin_to_active_non_main_databases(&conn, &frame)?;
+            mirror_named_savepoint_to_active_non_main_databases(
+                &conn,
+                SavepointMirror::Begin(&frame),
+            )?;
             conn.push_named_savepoint(name.clone(), starts_transaction, deferred_fk_violations);
 
             if starts_transaction {
@@ -3781,11 +3769,17 @@ pub fn op_savepoint(
                 }
                 SavepointResult::Release => {
                     let _ = conn.release_named_savepoint_frame(name);
-                    mirror_named_savepoint_release_to_active_non_main_databases(&conn, name)?;
+                    mirror_named_savepoint_to_active_non_main_databases(
+                        &conn,
+                        SavepointMirror::Release(name),
+                    )?;
                 }
                 SavepointResult::Commit => {
                     let _ = conn.release_named_savepoint_frame(name);
-                    mirror_named_savepoint_release_to_active_non_main_databases(&conn, name)?;
+                    mirror_named_savepoint_to_active_non_main_databases(
+                        &conn,
+                        SavepointMirror::Release(name),
+                    )?;
                     // This means that releasing the savepoint caused the transaction to commit, so we need to auto-commit here.
                     let auto_commit = Insn::AutoCommit {
                         auto_commit: true,
@@ -3813,7 +3807,10 @@ pub fn op_savepoint(
                 return Err(LimboError::TxError(format!("no such savepoint: {name}")));
             };
             let _ = conn.rollback_named_savepoint_frame(name);
-            mirror_named_savepoint_rollback_to_active_non_main_databases(&conn, name)?;
+            mirror_named_savepoint_to_active_non_main_databases(
+                &conn,
+                SavepointMirror::Rollback(name),
+            )?;
             conn.fk_deferred_violations
                 .store(deferred_fk_snapshot, Ordering::SeqCst);
 
