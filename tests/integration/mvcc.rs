@@ -932,3 +932,125 @@ fn test_add_then_drop_table_in_same_tx_then_recover(db: TempDatabase) -> anyhow:
 
     Ok(())
 }
+
+/// Reproducer for #6207-like panic: create table, insert data, drop table across
+/// transactions, checkpoint, then recover. The logical log may contain data row
+/// inserts for a table whose schema entry was checkpointed and then dropped,
+/// leaving the table_id absent from table_id_to_rootpage on recovery.
+#[turso_macros::test]
+fn test_create_insert_drop_checkpoint_recover(db: TempDatabase) -> anyhow::Result<()> {
+    let path = db.path.clone();
+    let io = db.io.clone();
+
+    {
+        let conn = db.connect_limbo();
+        conn.execute("pragma journal_mode = 'mvcc'")?;
+
+        // Tx1: create table and insert rows
+        conn.execute("begin")?;
+        conn.execute("create table t(a integer, b text)")?;
+        for i in 0..100 {
+            conn.execute(format!("insert into t values({i}, 'row_{i}')"))?;
+        }
+        conn.execute("commit")?;
+
+        // Tx2: drop the table
+        conn.execute("begin")?;
+        conn.execute("drop table t")?;
+        conn.execute("commit")?;
+
+        // Checkpoint to flush to btree and advance persistent_tx_ts_max
+        let conn2 = db.connect_limbo();
+        conn2.execute("PRAGMA wal_checkpoint(TRUNCATE)")?;
+
+        // Tx3: create another table and insert (this will be above cutoff if
+        // the pod is killed before next checkpoint)
+        conn.execute("begin")?;
+        conn.execute("create table t2(x integer)")?;
+        for i in 0..50 {
+            conn.execute(format!("insert into t2 values({i})"))?;
+        }
+        conn.execute("commit")?;
+    }
+    drop(db);
+
+    // Reopen — triggers bootstrap / log replay
+    Database::open_file(io.clone(), path.to_str().unwrap())?;
+
+    Ok(())
+}
+
+/// Same-tx create + insert + drop: data rows reference a table_id whose schema
+/// entry is created and destroyed in the same transaction.
+#[turso_macros::test]
+fn test_create_insert_drop_same_tx_recover(db: TempDatabase) -> anyhow::Result<()> {
+    let path = db.path.clone();
+    let io = db.io.clone();
+
+    {
+        let conn = db.connect_limbo();
+        conn.execute("pragma journal_mode = 'mvcc'")?;
+
+        conn.execute("begin")?;
+        conn.execute("create table t(a integer)")?;
+        for i in 0..100 {
+            conn.execute(format!("insert into t values({i})"))?;
+        }
+        conn.execute("drop table t")?;
+        conn.execute("commit")?;
+    }
+    drop(db);
+
+    Database::open_file(io, path.to_str().unwrap())?;
+
+    Ok(())
+}
+
+/// Multiple create/drop cycles then recover: exercises the log replay path
+/// with multiple table_ids that may or may not be in table_id_to_rootpage.
+#[turso_macros::test]
+fn test_multiple_create_drop_cycles_recover(db: TempDatabase) -> anyhow::Result<()> {
+    let path = db.path.clone();
+    let io = db.io.clone();
+
+    {
+        let conn = db.connect_limbo();
+        conn.execute("pragma journal_mode = 'mvcc'")?;
+
+        for cycle in 0..5 {
+            conn.execute("begin")?;
+            conn.execute("create table t(a integer, b text)")?;
+            for i in 0..50 {
+                conn.execute(format!(
+                    "insert into t values({i}, 'cycle_{cycle}_row_{i}')"
+                ))?;
+            }
+            conn.execute("commit")?;
+
+            conn.execute("begin")?;
+            conn.execute("drop table t")?;
+            conn.execute("commit")?;
+        }
+
+        // Checkpoint midway
+        let conn2 = db.connect_limbo();
+        conn2.execute("PRAGMA wal_checkpoint(TRUNCATE)")?;
+
+        // One more cycle after checkpoint
+        conn.execute("begin")?;
+        conn.execute("create table t(a integer, b text)")?;
+        for i in 0..50 {
+            conn.execute(format!("insert into t values({i}, 'final_row_{i}')"))?;
+        }
+        conn.execute("commit")?;
+
+        conn.execute("begin")?;
+        conn.execute("drop table t")?;
+        conn.execute("commit")?;
+    }
+    drop(db);
+
+    Database::open_file(io, path.to_str().unwrap())?;
+
+    Ok(())
+}
