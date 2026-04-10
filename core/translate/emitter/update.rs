@@ -880,11 +880,6 @@ fn emit_update_insns<'a>(
         None
     };
 
-    turso_assert!(
-        !updates_rowid || rowid_set_clause_reg.is_some(),
-        "has_user_provided_rowid requires rowid_set_clause_reg"
-    );
-
     // Effective INTEGER PK conflict resolution: statement-level OR clause takes precedence;
     // otherwise use the constraint-level rowid_alias_conflict_clause from the table DDL.
     let constraint_rowid_alias_conflict = target_table
