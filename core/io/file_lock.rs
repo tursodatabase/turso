@@ -40,7 +40,7 @@ mod imp {
     use windows_sys::Win32::System::IO::OVERLAPPED;
 
     pub fn try_lock(file: &std::fs::File, exclusive: bool) -> std::io::Result<()> {
-        let handle = file.as_raw_handle() as isize;
+        let handle = file.as_raw_handle();
         let flags = LOCKFILE_FAIL_IMMEDIATELY
             | if exclusive {
                 LOCKFILE_EXCLUSIVE_LOCK
@@ -57,7 +57,7 @@ mod imp {
     }
 
     pub fn unlock(file: &std::fs::File) -> std::io::Result<()> {
-        let handle = file.as_raw_handle() as isize;
+        let handle = file.as_raw_handle();
         let mut overlapped: OVERLAPPED = unsafe { std::mem::zeroed() };
         let result = unsafe { UnlockFileEx(handle, 0, u32::MAX, u32::MAX, &mut overlapped) };
         if result == 0 {
