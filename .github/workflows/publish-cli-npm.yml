@@ -1,0 +1,92 @@
+name: Publish Turso CLI to npm
+
+on:
+  release:
+    types: [published]
+
+jobs:
+  publish:
+    name: Publish CLI npm packages
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          registry-url: https://registry.npmjs.org
+
+      - name: Update npm
+        run: npm install -g npm@11
+
+      - name: Download and extract release binaries
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="${{ github.event.release.tag_name }}"
+          TMPDIR=$(mktemp -d)
+
+          # Download all platform archives
+          gh release download "$TAG" \
+            --pattern "tursodb-aarch64-apple-darwin.tar.xz" \
+            --pattern "tursodb-x86_64-apple-darwin.tar.xz" \
+            --pattern "tursodb-aarch64-unknown-linux-gnu.tar.xz" \
+            --pattern "tursodb-x86_64-unknown-linux-gnu.tar.xz" \
+            --pattern "tursodb-x86_64-pc-windows-msvc.zip" \
+            --dir "$TMPDIR"
+
+          # Extract each binary into the corresponding npm package directory
+          tar -xf "$TMPDIR/tursodb-aarch64-apple-darwin.tar.xz" -C "$TMPDIR"
+          cp "$TMPDIR/tursodb-aarch64-apple-darwin/tursodb" packages/turso-cli/npm/darwin-arm64/tursodb
+
+          tar -xf "$TMPDIR/tursodb-x86_64-apple-darwin.tar.xz" -C "$TMPDIR"
+          cp "$TMPDIR/tursodb-x86_64-apple-darwin/tursodb" packages/turso-cli/npm/darwin-x64/tursodb
+
+          tar -xf "$TMPDIR/tursodb-aarch64-unknown-linux-gnu.tar.xz" -C "$TMPDIR"
+          cp "$TMPDIR/tursodb-aarch64-unknown-linux-gnu/tursodb" packages/turso-cli/npm/linux-arm64-gnu/tursodb
+
+          tar -xf "$TMPDIR/tursodb-x86_64-unknown-linux-gnu.tar.xz" -C "$TMPDIR"
+          cp "$TMPDIR/tursodb-x86_64-unknown-linux-gnu/tursodb" packages/turso-cli/npm/linux-x64-gnu/tursodb
+
+          unzip -o "$TMPDIR/tursodb-x86_64-pc-windows-msvc.zip" -d "$TMPDIR/tursodb-x86_64-pc-windows-msvc"
+          cp "$TMPDIR/tursodb-x86_64-pc-windows-msvc/tursodb.exe" packages/turso-cli/npm/win32-x64-msvc/tursodb.exe
+
+          # Set executable permissions
+          chmod +x packages/turso-cli/npm/darwin-arm64/tursodb
+          chmod +x packages/turso-cli/npm/darwin-x64/tursodb
+          chmod +x packages/turso-cli/npm/linux-arm64-gnu/tursodb
+          chmod +x packages/turso-cli/npm/linux-x64-gnu/tursodb
+
+      - name: Determine npm tag
+        id: npm-tag
+        run: |
+          TAG="${{ github.event.release.tag_name }}"
+          if echo "$TAG" | grep -qE '^v[0-9]+\.[0-9]+\.[0-9]+$'; then
+            echo "tag=latest" >> "$GITHUB_OUTPUT"
+          else
+            echo "tag=next" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Publish platform packages
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          for dir in \
+            packages/turso-cli/npm/darwin-arm64 \
+            packages/turso-cli/npm/darwin-x64 \
+            packages/turso-cli/npm/linux-arm64-gnu \
+            packages/turso-cli/npm/linux-x64-gnu \
+            packages/turso-cli/npm/win32-x64-msvc; do
+            npm publish "$dir" --access public --provenance --tag ${{ steps.npm-tag.outputs.tag }}
+          done
+
+      - name: Publish main turso package
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          npm publish packages/turso-cli --access public --provenance --tag ${{ steps.npm-tag.outputs.tag }}
