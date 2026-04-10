@@ -160,9 +160,80 @@ pub struct CliDatabaseInstance {
 }
 
 impl CliDatabaseInstance {
+    const DOT_COMMANDS: &[&str] = &[".schema", ".tables"];
+
+    fn final_supported_sqlite_dot_command(sql: &str) -> Option<&str> {
+        sql.lines().rev().map(str::trim).find(|line| {
+            !line.is_empty()
+                && Self::DOT_COMMANDS.iter().any(|cmd| {
+                    *line == *cmd
+                        || line
+                            .strip_prefix(cmd)
+                            .is_some_and(|rest| rest.is_empty() || rest.starts_with(' '))
+                })
+        })
+    }
+
+    fn normalize_sqlite_dot_command_script(sql: &str) -> String {
+        let final_dot_command = Self::final_supported_sqlite_dot_command(sql);
+
+        sql.lines()
+            .map(|line| {
+                if let Some(dot_command) = final_dot_command.filter(|cmd| line.trim() == *cmd) {
+                    dot_command.to_string()
+                } else {
+                    line.to_string()
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    fn collapse_repeated_spaces(input: &str) -> String {
+        let mut normalized = input.to_string();
+        while normalized.contains("  ") {
+            normalized = normalized.replace("  ", " ");
+        }
+        normalized
+    }
+
+    fn normalize_sqlite_schema_line(line: &str) -> String {
+        const PREFIXES: &[&str] = &["CREATE TABLE ", "CREATE TABLE IF NOT EXISTS "];
+
+        for prefix in PREFIXES {
+            if let Some(rest) = line.strip_prefix(prefix) {
+                if let Some(paren_idx) = rest.find('(') {
+                    let name_part = &rest[..paren_idx];
+                    if !name_part.ends_with(' ') {
+                        return format!("{prefix}{name_part} {}", &rest[paren_idx..]);
+                    }
+                }
+            }
+        }
+
+        line.to_string()
+    }
+
+    fn normalize_sqlite_dot_command_output(dot_command: &str, stdout: &str) -> Vec<Vec<String>> {
+        stdout
+            .lines()
+            .filter(|line| !line.is_empty())
+            .map(|line| match dot_command {
+                ".tables" => vec![Self::collapse_repeated_spaces(line)],
+                ".schema" => vec![Self::normalize_sqlite_schema_line(line)],
+                _ => vec![line.to_string()],
+            })
+            .collect()
+    }
+
     /// Execute SQL by spawning a CLI process
     async fn run_sql(&self, sql: &str) -> Result<QueryResult, BackendError> {
         let mut cmd = Command::new(&self.binary_path);
+        let sqlite_dot_command = self
+            .is_sqlite
+            .then(|| Self::final_supported_sqlite_dot_command(sql))
+            .flatten();
+        let is_sqlite_dot_command = sqlite_dot_command.is_some();
 
         let file_name = self
             .binary_path
@@ -218,6 +289,11 @@ impl CliDatabaseInstance {
         } else {
             sql.to_string()
         };
+        let sql_to_execute = if is_sqlite_dot_command {
+            Self::normalize_sqlite_dot_command_script(&sql_to_execute)
+        } else {
+            sql_to_execute
+        };
 
         // Write SQL to stdin
         if let Some(stdin) = child.stdin.as_mut() {
@@ -261,18 +337,27 @@ impl CliDatabaseInstance {
             return Ok(QueryResult::error(error_msg));
         }
 
-        let mut rows = parse_list_output(&stdout);
+        if is_sqlite_dot_command {
+            let rows = Self::normalize_sqlite_dot_command_output(
+                sqlite_dot_command.expect("checked above"),
+                &stdout,
+            );
 
-        // Filter out MVCC pragma output if present
-        if self.mvcc && !rows.is_empty() {
-            if let Some(first_row) = rows.first() {
-                if first_row.len() == 1 && first_row[0] == "mvcc" {
-                    rows.remove(0);
+            Ok(QueryResult::success(rows))
+        } else {
+            let mut rows = parse_list_output(&stdout);
+
+            // Filter out MVCC pragma output if present
+            if self.mvcc && !rows.is_empty() {
+                if let Some(first_row) = rows.first() {
+                    if first_row.len() == 1 && first_row[0] == "mvcc" {
+                        rows.remove(0);
+                    }
                 }
             }
-        }
 
-        Ok(QueryResult::success(rows))
+            Ok(QueryResult::success(rows))
+        }
     }
 }
 
@@ -319,5 +404,53 @@ impl DatabaseInstance for CliDatabaseInstance {
             Some(tf) => Ok(DatabaseFileHandle::temp(tf)),
             None => Ok(DatabaseFileHandle::none()),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::CliDatabaseInstance;
+
+    #[test]
+    fn final_supported_sqlite_dot_command_detects_last_line() {
+        let sql = "CREATE TABLE t1(a);\nSELECT '__SETUP_END_MARKER_7f3a9b2c__';\n    .schema";
+        assert_eq!(
+            CliDatabaseInstance::final_supported_sqlite_dot_command(sql),
+            Some(".schema")
+        );
+    }
+
+    #[test]
+    fn normalize_sqlite_dot_command_script_left_aligns_final_command_only() {
+        let sql = "CREATE TABLE t1(a);\n    .schema";
+        assert_eq!(
+            CliDatabaseInstance::normalize_sqlite_dot_command_script(sql),
+            "CREATE TABLE t1(a);\n.schema"
+        );
+    }
+
+    #[test]
+    fn normalize_sqlite_tables_output_preserves_single_spaces() {
+        assert_eq!(
+            CliDatabaseInstance::normalize_sqlite_dot_command_output(
+                ".tables",
+                "t1  v1\nuser logs"
+            ),
+            vec![vec!["t1 v1".to_string()], vec!["user logs".to_string()]]
+        );
+    }
+
+    #[test]
+    fn normalize_sqlite_schema_output_only_adjusts_create_table_prefix() {
+        assert_eq!(
+            CliDatabaseInstance::normalize_sqlite_dot_command_output(
+                ".schema",
+                "CREATE TABLE t1(a CHECK(abs(a) > 0));\nCREATE TRIGGER trg AFTER INSERT ON t1 BEGIN SELECT 1; END;"
+            ),
+            vec![
+                vec!["CREATE TABLE t1 (a CHECK(abs(a) > 0));".to_string()],
+                vec!["CREATE TRIGGER trg AFTER INSERT ON t1 BEGIN SELECT 1; END;".to_string()]
+            ]
+        );
     }
 }
