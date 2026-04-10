@@ -453,7 +453,7 @@ async fn read_page<Ctx, IO: SyncEngineIo>(
 
     tracing::debug!("read_page(page={page}): page loaded");
     read_buf.copy_from_slice(&buffer.as_slice()[0..read_buf_len]);
-    c.complete(read_buf_len as i32);
+    c.complete(read_buf_len as i64);
     Ok(())
 }
 

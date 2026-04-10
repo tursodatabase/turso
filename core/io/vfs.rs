@@ -88,7 +88,7 @@ unsafe extern "C" fn callback_fn(result: i32, ctx: SendPtr) {
     let completion = Completion {
         inner: (Some(Arc::from_raw(ctx.inner().as_ptr() as *mut CompletionInner))),
     };
-    completion.complete(result);
+    completion.complete(result as i64);
 }
 
 fn to_callback(c: Completion) -> IOCallback {

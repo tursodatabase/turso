@@ -82,7 +82,7 @@ impl File for SparseLinuxFile {
             let buf = buf.as_mut_slice();
             file.read_exact_at(buf, pos)
                 .map_err(|e| io_error(e, "pread"))?;
-            buf.len() as i32
+            buf.len() as i64
         };
         c.complete(nr);
         Ok(c)
@@ -94,7 +94,7 @@ impl File for SparseLinuxFile {
         let buf = buffer.as_slice();
         file.write_all_at(buf, pos)
             .map_err(|e| io_error(e, "pwrite"))?;
-        c.complete(buffer.len() as i32);
+        c.complete(buffer.len() as i64);
         Ok(c)
     }
 

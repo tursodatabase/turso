@@ -16,10 +16,10 @@ use crate::{Buffer, CompletionError};
 /// Callback for read completions. Returns `Some(error)` if the callback detects an error
 /// (e.g., short read), which will be stored in the completion and propagated to VDBE.
 pub type ReadComplete =
-    dyn Fn(Result<(Arc<Buffer>, i32), CompletionError>) -> Option<CompletionError> + Send + Sync;
-pub type WriteComplete = dyn Fn(Result<i32, CompletionError>) + Send + Sync;
-pub type SyncComplete = dyn Fn(Result<i32, CompletionError>) + Send + Sync;
-pub type TruncateComplete = dyn Fn(Result<i32, CompletionError>) + Send + Sync;
+    dyn Fn(Result<(Arc<Buffer>, i64), CompletionError>) -> Option<CompletionError> + Send + Sync;
+pub type WriteComplete = dyn Fn(Result<i64, CompletionError>) + Send + Sync;
+pub type SyncComplete = dyn Fn(Result<i64, CompletionError>) + Send + Sync;
+pub type TruncateComplete = dyn Fn(Result<i64, CompletionError>) + Send + Sync;
 
 #[must_use]
 #[derive(Debug, Clone)]
@@ -125,13 +125,13 @@ impl fmt::Debug for CompletionInner {
 
 pub struct CompletionGroup {
     completions: Vec<Completion>,
-    callback: Box<dyn Fn(Result<i32, CompletionError>) + Send + Sync>,
+    callback: Box<dyn Fn(Result<i64, CompletionError>) + Send + Sync>,
 }
 
 impl CompletionGroup {
     pub fn new<F>(callback: F) -> Self
     where
-        F: Fn(Result<i32, CompletionError>) + Send + Sync + 'static,
+        F: Fn(Result<i64, CompletionError>) + Send + Sync + 'static,
     {
         Self {
             completions: Vec::new(),
@@ -216,7 +216,7 @@ struct GroupCompletionInner {
     /// Number of completions that need to finish
     outstanding: AtomicUsize,
     /// Callback to invoke when all completions finish
-    complete: Box<dyn Fn(Result<i32, CompletionError>) + Send + Sync>,
+    complete: Box<dyn Fn(Result<i64, CompletionError>) + Send + Sync>,
     /// Cached result after all completions finish
     result: OnceLock<Option<CompletionError>>,
     /// Reference to the group's own Completion for notifying parents
@@ -226,7 +226,7 @@ struct GroupCompletionInner {
 impl GroupCompletion {
     pub fn new<F>(complete: F, outstanding: usize) -> Self
     where
-        F: Fn(Result<i32, CompletionError>) + Send + Sync + 'static,
+        F: Fn(Result<i64, CompletionError>) + Send + Sync + 'static,
     {
         Self {
             inner: Arc::new(GroupCompletionInner {
@@ -238,7 +238,7 @@ impl GroupCompletion {
         }
     }
 
-    pub fn callback(&self, result: Result<i32, CompletionError>) {
+    pub fn callback(&self, result: Result<i64, CompletionError>) {
         turso_assert_eq!(
             self.inner.outstanding.load(Ordering::SeqCst),
             0,
@@ -307,7 +307,7 @@ impl Completion {
 
     pub fn new_write<F>(complete: F) -> Self
     where
-        F: Fn(Result<i32, CompletionError>) + Send + Sync + 'static,
+        F: Fn(Result<i64, CompletionError>) + Send + Sync + 'static,
     {
         Self::new(CompletionType::Write(WriteCompletion::new(Box::new(
             complete,
@@ -316,7 +316,7 @@ impl Completion {
 
     pub fn new_read<F>(buf: Arc<Buffer>, complete: F) -> Self
     where
-        F: Fn(Result<(Arc<Buffer>, i32), CompletionError>) -> Option<CompletionError>
+        F: Fn(Result<(Arc<Buffer>, i64), CompletionError>) -> Option<CompletionError>
             + Send
             + Sync
             + 'static,
@@ -328,7 +328,7 @@ impl Completion {
     }
     pub fn new_sync<F>(complete: F) -> Self
     where
-        F: Fn(Result<i32, CompletionError>) + Send + Sync + 'static,
+        F: Fn(Result<i64, CompletionError>) + Send + Sync + 'static,
     {
         Self::new(CompletionType::Sync(SyncCompletion::new(Box::new(
             complete,
@@ -337,7 +337,7 @@ impl Completion {
 
     pub fn new_trunc<F>(complete: F) -> Self
     where
-        F: Fn(Result<i32, CompletionError>) + Send + Sync + 'static,
+        F: Fn(Result<i64, CompletionError>) + Send + Sync + 'static,
     {
         Self::new(CompletionType::Truncate(TruncateCompletion::new(Box::new(
             complete,
@@ -421,7 +421,7 @@ impl Completion {
         self.inner.is_none()
     }
 
-    pub fn complete(&self, result: i32) {
+    pub fn complete(&self, result: i64) {
         let result = Ok(result);
         self.callback(result);
     }
@@ -435,7 +435,7 @@ impl Completion {
         self.error(CompletionError::Aborted);
     }
 
-    fn callback(&self, result: Result<i32, CompletionError>) {
+    fn callback(&self, result: Result<i64, CompletionError>) {
         let inner = self.get_inner();
         inner.result.get_or_init(|| {
             // Run the type-specific callback. For ReadCompletion, this returns
@@ -533,7 +533,7 @@ impl ReadCompletion {
         &self.buf
     }
 
-    pub fn callback(&self, bytes_read: Result<i32, CompletionError>) -> Option<CompletionError> {
+    pub fn callback(&self, bytes_read: Result<i64, CompletionError>) -> Option<CompletionError> {
         (self.complete)(bytes_read.map(|b| (self.buf.clone(), b)))
     }
 
@@ -551,7 +551,7 @@ impl WriteCompletion {
         Self { complete }
     }
 
-    pub fn callback(&self, bytes_written: Result<i32, CompletionError>) {
+    pub fn callback(&self, bytes_written: Result<i64, CompletionError>) {
         (self.complete)(bytes_written);
     }
 }
@@ -565,7 +565,7 @@ impl SyncCompletion {
         Self { complete }
     }
 
-    pub fn callback(&self, res: Result<i32, CompletionError>) {
+    pub fn callback(&self, res: Result<i64, CompletionError>) {
         (self.complete)(res);
     }
 }
@@ -579,7 +579,7 @@ impl TruncateCompletion {
         Self { complete }
     }
 
-    pub fn callback(&self, res: Result<i32, CompletionError>) {
+    pub fn callback(&self, res: Result<i64, CompletionError>) {
         (self.complete)(res);
     }
 }
@@ -1212,9 +1212,9 @@ mod tests {
 
     #[test]
     fn test_completion_callback_receives_success_result() {
-        use crate::sync::atomic::{AtomicI32, Ordering};
+        use crate::sync::atomic::{AtomicI64, Ordering};
 
-        let result_value = Arc::new(AtomicI32::new(-1));
+        let result_value = Arc::new(AtomicI64::new(-1));
         let result_value_clone = result_value.clone();
 
         let c = Completion::new_write(move |res| {
