@@ -41,10 +41,14 @@ mod imp {
 
     pub fn try_lock(file: &std::fs::File, exclusive: bool) -> std::io::Result<()> {
         let handle = file.as_raw_handle() as isize;
-        let flags = LOCKFILE_FAIL_IMMEDIATELY | if exclusive { LOCKFILE_EXCLUSIVE_LOCK } else { 0 };
+        let flags = LOCKFILE_FAIL_IMMEDIATELY
+            | if exclusive {
+                LOCKFILE_EXCLUSIVE_LOCK
+            } else {
+                0
+            };
         let mut overlapped: OVERLAPPED = unsafe { std::mem::zeroed() };
-        let result =
-            unsafe { LockFileEx(handle, flags, 0, u32::MAX, u32::MAX, &mut overlapped) };
+        let result = unsafe { LockFileEx(handle, flags, 0, u32::MAX, u32::MAX, &mut overlapped) };
         if result == 0 {
             Err(std::io::Error::last_os_error())
         } else {
