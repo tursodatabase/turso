@@ -1284,6 +1284,7 @@ fn emit_update_insns<'a>(
                     rowid_new_reg,
                     rowid_set_clause_reg,
                     set_clauses,
+                    false,
                     update_database_id,
                     &t_ctx.resolver,
                 )?;

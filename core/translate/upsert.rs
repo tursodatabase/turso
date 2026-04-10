@@ -831,6 +831,7 @@ pub fn emit_upsert(
                 new_rowid_reg.unwrap_or(ctx.conflict_rowid_reg),
                 rowid_set_clause_reg,
                 set_pairs,
+                true,
                 upsert_database_id,
                 resolver,
             )?;

@@ -1725,16 +1725,19 @@ impl Pager {
     /// Release i.e. commit the current savepoint. This basically just means removing it.
     pub fn release_savepoint(&self) -> Result<()> {
         let mut savepoints = self.savepoints.write();
-        if !matches!(
-            savepoints.last().map(|savepoint| &savepoint.kind),
-            Some(SavepointKind::Statement)
-        ) {
+        let Some(statement_idx) = savepoints
+            .iter()
+            .rposition(|savepoint| matches!(savepoint.kind, SavepointKind::Statement))
+        else {
             return Ok(());
         };
-        let savepoint = savepoints.pop().expect("savepoint must exist");
-        if let Some(parent) = savepoints.last() {
+        let savepoint = savepoints.remove(statement_idx);
+        if let Some(parent) = statement_idx
+            .checked_sub(1)
+            .and_then(|idx| savepoints.get(idx))
+        {
             parent.set_write_offset(savepoint.write_offset());
-        } else {
+        } else if savepoints.is_empty() {
             let subjournal = self.subjournal.read();
             let Some(subjournal) = subjournal.as_ref() else {
                 return Ok(());
@@ -1834,19 +1837,22 @@ impl Pager {
     /// of the savepoint to the end of the subjournal and restoring the page images to the page cache.
     pub fn rollback_to_newest_savepoint(&self) -> Result<bool> {
         let mut savepoints = self.savepoints.write();
-        if !matches!(
-            savepoints.last().map(|savepoint| &savepoint.kind),
-            Some(SavepointKind::Statement)
-        ) {
+        let Some(statement_idx) = savepoints
+            .iter()
+            .rposition(|savepoint| matches!(savepoint.kind, SavepointKind::Statement))
+        else {
             return Ok(false);
-        }
-        let savepoint = savepoints.pop().expect("savepoint must exist");
+        };
+        let savepoint = savepoints.remove(statement_idx);
         let journal_end_offset = savepoint.write_offset();
         let savepoint = savepoint.snapshot();
 
         self.rollback_to_snapshot(&savepoint, journal_end_offset)?;
 
-        if let Some(parent) = savepoints.last() {
+        if let Some(parent) = statement_idx
+            .checked_sub(1)
+            .and_then(|idx| savepoints.get(idx))
+        {
             parent.set_write_offset(savepoint.start_offset);
         }
 
