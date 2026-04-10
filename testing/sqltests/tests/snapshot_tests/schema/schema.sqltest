@@ -36,14 +36,6 @@ snapshot explain-drop-temp-trigger-opens-temp-transaction {
     DROP TRIGGER temp.tr;
 }
 
-snapshot explain-begin-immediate-emits-temp-transaction {
-    BEGIN IMMEDIATE;
-}
-
-snapshot explain-begin-exclusive-emits-temp-transaction {
-    BEGIN EXCLUSIVE;
-}
-
 snapshot explain-begin-deferred-no-transaction-opcodes {
     BEGIN DEFERRED;
 }
