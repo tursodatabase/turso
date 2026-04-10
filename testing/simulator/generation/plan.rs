@@ -8,6 +8,8 @@ use sql_generation::{
     },
 };
 
+use crate::model::{Savepoint, ReleaseSavepoint, RollbackToSavepoint};
+
 use crate::{
     SimulatorEnv,
     generation::{
@@ -107,6 +109,49 @@ impl InteractionPlan {
                 && rng.random_bool(0.4)
             {
                 let query = Query::Commit(Commit);
+                Interactions::new(conn_index, InteractionsType::Query(query))
+            } else if !env.conn_in_transaction(conn_index)
+                && rng.random_bool(0.1)
+            {
+                // Start a transaction in non-mvcc mode too — needed for savepoint testing
+                let query = Query::Begin(Begin::Deferred);
+                Interactions::new(conn_index, InteractionsType::Query(query))
+            } else if env.conn_in_transaction(conn_index)
+                && !self.mvcc
+                && env.has_conn_executed_query_after_transaction(conn_index)
+                && rng.random_bool(0.15)
+            {
+                // Commit in non-mvcc mode
+                let query = Query::Commit(Commit);
+                Interactions::new(conn_index, InteractionsType::Query(query))
+            } else if env.conn_in_transaction(conn_index)
+                && env.has_conn_executed_query_after_transaction(conn_index)
+                && rng.random_bool(0.15)
+            {
+                // Generate SAVEPOINT operations inside transactions
+                // This tests that savepoints work correctly, especially on attached databases
+                let name = format!("sp{}", rng.random_range(0..5));
+                let query = Query::Savepoint(Savepoint { name: name.clone() });
+                env.connection_savepoints[conn_index].push(name);
+                Interactions::new(conn_index, InteractionsType::Query(query))
+            } else if env.conn_in_transaction(conn_index)
+                && !env.connection_savepoints[conn_index].is_empty()
+                && rng.random_bool(0.2)
+            {
+                // Generate ROLLBACK TO SAVEPOINT — only if a savepoint exists
+                let sp_idx = rng.random_range(0..env.connection_savepoints[conn_index].len());
+                let name = env.connection_savepoints[conn_index][sp_idx].clone();
+                let query = Query::RollbackToSavepoint(RollbackToSavepoint { name });
+                Interactions::new(conn_index, InteractionsType::Query(query))
+            } else if env.conn_in_transaction(conn_index)
+                && !env.connection_savepoints[conn_index].is_empty()
+                && rng.random_bool(0.15)
+            {
+                // Generate RELEASE SAVEPOINT — only if a savepoint exists
+                let sp_idx = rng.random_range(0..env.connection_savepoints[conn_index].len());
+                let name = env.connection_savepoints[conn_index][sp_idx].clone();
+                env.connection_savepoints[conn_index].remove(sp_idx);
+                let query = Query::ReleaseSavepoint(ReleaseSavepoint { name });
                 Interactions::new(conn_index, InteractionsType::Query(query))
             } else {
                 let conn_ctx = &env.connection_context(conn_index);

@@ -755,6 +755,8 @@ pub(crate) struct SimulatorEnv {
     /// and not Begin, Commit, Rollback \
     /// Has max size of 64 to accomodate 64 connections
     connection_last_query: Bitmap<64>,
+    /// Track active savepoints per connection (stack of savepoint names)
+    pub connection_savepoints: Vec<Vec<String>>,
     // Table data that is committed into the database or wal
     pub committed_tables: Vec<Table>,
     /// Names of attached databases (e.g. ["aux0", "aux1", "aux2"])
@@ -782,6 +784,7 @@ impl SimulatorEnv {
             // TODO: not sure if connection_tables should be recreated instead
             connection_tables: self.connection_tables.clone(),
             connection_last_query: self.connection_last_query,
+            connection_savepoints: self.connection_savepoints.clone(),
             committed_tables: self.committed_tables.clone(),
             attached_dbs: self.attached_dbs.clone(),
         }
@@ -1094,6 +1097,7 @@ impl SimulatorEnv {
             committed_tables: Vec::new(),
             connection_tables: vec![None; profile.max_connections],
             connection_last_query: Bitmap::new(),
+            connection_savepoints: vec![Vec::new(); profile.max_connections],
             attached_dbs,
         }
     }
@@ -1155,6 +1159,9 @@ impl SimulatorEnv {
         self.committed_tables.clear();
         self.connection_tables.iter_mut().for_each(|t| *t = None);
         self.connection_last_query = Bitmap::new();
+        for sp in &mut self.connection_savepoints {
+            sp.clear();
+        }
     }
 
     // TODO: does not yet create the appropriate context to avoid WriteWriteConflitcs
@@ -1198,7 +1205,12 @@ impl SimulatorEnv {
         let value = query.is_some_and(|query| {
             matches!(
                 query,
-                Query::Begin(..) | Query::Commit(..) | Query::Rollback(..)
+                Query::Begin(..)
+                    | Query::Commit(..)
+                    | Query::Rollback(..)
+                    | Query::Savepoint(..)
+                    | Query::ReleaseSavepoint(..)
+                    | Query::RollbackToSavepoint(..)
             )
         });
         self.connection_last_query.set(conn_index, value);
@@ -1207,6 +1219,7 @@ impl SimulatorEnv {
     pub fn rollback_conn(&mut self, conn_index: usize) {
         Rollback.shadow(&mut self.get_conn_tables_mut(conn_index));
         self.update_conn_last_interaction(conn_index, Some(&Query::Rollback(Rollback)));
+        self.connection_savepoints[conn_index].clear();
     }
 
     pub fn get_conn_tables(&self, conn_index: usize) -> ShadowTables<'_> {

@@ -147,7 +147,10 @@ impl QueryDiscriminants {
             QueryDiscriminants::DropIndex => random_drop_index,
             QueryDiscriminants::Begin
             | QueryDiscriminants::Commit
-            | QueryDiscriminants::Rollback => {
+            | QueryDiscriminants::Rollback
+            | QueryDiscriminants::Savepoint
+            | QueryDiscriminants::ReleaseSavepoint
+            | QueryDiscriminants::RollbackToSavepoint => {
                 unreachable!("transactional queries should not be generated")
             }
             QueryDiscriminants::Placeholder => {
@@ -172,7 +175,10 @@ impl QueryDiscriminants {
             QueryDiscriminants::DropIndex => remaining.drop_index,
             QueryDiscriminants::Begin
             | QueryDiscriminants::Commit
-            | QueryDiscriminants::Rollback => {
+            | QueryDiscriminants::Rollback
+            | QueryDiscriminants::Savepoint
+            | QueryDiscriminants::ReleaseSavepoint
+            | QueryDiscriminants::RollbackToSavepoint => {
                 unreachable!("transactional queries should not be generated")
             }
             QueryDiscriminants::Placeholder => {
