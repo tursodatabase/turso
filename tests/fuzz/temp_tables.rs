@@ -803,4 +803,82 @@ mod temp_table_fuzz_tests {
             );
         }
     }
+
+    /// Two connections to the same database each create a temp table with the
+    /// same name and schema. Data written through one connection must never be
+    /// visible through the other.
+    #[turso_macros::test]
+    fn temp_tables_are_connection_isolated(db: TempDatabase) {
+        let conn_a = db.connect_limbo();
+        let conn_b = db.connect_limbo();
+
+        let schema = "CREATE TEMP TABLE t(id INTEGER PRIMARY KEY, v TEXT)";
+        conn_a.execute(schema).unwrap();
+        conn_b.execute(schema).unwrap();
+
+        // Insert different data into each connection's temp table.
+        conn_a
+            .execute("INSERT INTO t VALUES (1, 'from_a')")
+            .unwrap();
+        conn_b
+            .execute("INSERT INTO t VALUES (1, 'from_b')")
+            .unwrap();
+        conn_b
+            .execute("INSERT INTO t VALUES (2, 'only_b')")
+            .unwrap();
+
+        do_flush(&conn_a, &db).unwrap();
+        do_flush(&conn_b, &db).unwrap();
+
+        // Each connection should only see its own rows.
+        let rows_a = limbo_exec_rows(&conn_a, "SELECT id, v FROM t ORDER BY id");
+        let rows_b = limbo_exec_rows(&conn_b, "SELECT id, v FROM t ORDER BY id");
+
+        assert_eq!(rows_a.len(), 1, "conn_a should see exactly 1 row");
+        assert_eq!(
+            rows_a[0][1],
+            Value::Text("from_a".into()),
+            "conn_a should see its own data"
+        );
+
+        assert_eq!(rows_b.len(), 2, "conn_b should see exactly 2 rows");
+        assert_eq!(
+            rows_b[0][1],
+            Value::Text("from_b".into()),
+            "conn_b row 1 should be its own data"
+        );
+        assert_eq!(
+            rows_b[1][1],
+            Value::Text("only_b".into()),
+            "conn_b row 2 should be its own data"
+        );
+
+        // Mutating one connection's temp table should not affect the other.
+        conn_a.execute("DELETE FROM t").unwrap();
+        do_flush(&conn_a, &db).unwrap();
+
+        let rows_a_after = limbo_exec_rows(&conn_a, "SELECT count(*) FROM t");
+        let rows_b_after = limbo_exec_rows(&conn_b, "SELECT count(*) FROM t");
+        assert_eq!(
+            rows_a_after[0][0],
+            Value::Integer(0),
+            "conn_a should be empty after DELETE"
+        );
+        assert_eq!(
+            rows_b_after[0][0],
+            Value::Integer(2),
+            "conn_b should be unaffected by conn_a's DELETE"
+        );
+
+        // Dropping the temp table on one connection must not affect the other.
+        conn_a.execute("DROP TABLE t").unwrap();
+        do_flush(&conn_a, &db).unwrap();
+
+        let rows_b_still = limbo_exec_rows(&conn_b, "SELECT id, v FROM t ORDER BY id");
+        assert_eq!(
+            rows_b_still.len(),
+            2,
+            "conn_b temp table should survive conn_a's DROP"
+        );
+    }
 }
