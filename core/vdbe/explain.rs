@@ -2348,14 +2348,14 @@ pub fn insn_to_row(
                 format!("hash_table_id={hash_table_id}"),
             )
         },
-        Insn::VacuumInto { dest_path } => (
+        Insn::VacuumInto { schema_name, dest_path } => (
             "VacuumInto",
             0,
             0,
             0,
             Value::build_text(dest_path.to_string()),
             0,
-            format!("dest={dest_path}"),
+            format!("schema={schema_name}, dest={dest_path}"),
         ),
         Insn::InitCdcVersion { cdc_table_name, version, cdc_mode } => (
             "InitCdcVersion",

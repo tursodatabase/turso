@@ -228,7 +228,7 @@ fn get_collseq_parts_from_expr(
 
 #[cfg(test)]
 mod tests {
-    use crate::sync::Arc;
+    use crate::{sync::Arc, MAIN_DB_ID};
 
     use turso_parser::ast::{Literal, Name, Operator, TableInternalId, UnaryOperator};
 
@@ -545,7 +545,7 @@ mod tests {
             col_used_mask: ColumnUsedMask::default(),
             column_use_counts: Vec::new(),
             expression_index_usages: Vec::new(),
-            database_id: 0,
+            database_id: MAIN_DB_ID,
             identifier: "foo".to_string(),
             internal_id: TableInternalId::from(1),
             join_info: None,
@@ -580,7 +580,7 @@ mod tests {
             col_used_mask: ColumnUsedMask::default(),
             column_use_counts: Vec::new(),
             expression_index_usages: Vec::new(),
-            database_id: 0,
+            database_id: MAIN_DB_ID,
             identifier: "t1".to_string(),
             internal_id: TableInternalId::from(1),
             join_info: None,
@@ -620,7 +620,7 @@ mod tests {
             col_used_mask: ColumnUsedMask::default(),
             column_use_counts: Vec::new(),
             expression_index_usages: Vec::new(),
-            database_id: 0,
+            database_id: MAIN_DB_ID,
             identifier: "t2".to_string(),
             internal_id: TableInternalId::from(2),
             join_info: None,
@@ -674,7 +674,7 @@ mod tests {
             col_used_mask: ColumnUsedMask::default(),
             column_use_counts: Vec::new(),
             expression_index_usages: Vec::new(),
-            database_id: 0,
+            database_id: MAIN_DB_ID,
             identifier: "bar".to_string(),
             internal_id: TableInternalId::from(1),
             join_info: None,

@@ -1,4 +1,4 @@
-use crate::common::{compute_dbhash, ExecRows, TempDatabase};
+use crate::common::{compute_dbhash, compute_dbhash_with_options, ExecRows, TempDatabase};
 use rusqlite::Connection as SqliteConnection;
 use std::sync::Arc;
 use tempfile::TempDir;
@@ -2487,6 +2487,154 @@ fn test_vacuum_into_compacts_fragmented_database(tmp_db: TempDatabase) -> anyhow
     assert!(
         dest_size < source_size,
         "VACUUM INTO should reduce file size. Source: {source_size} bytes, Destination: {dest_size} bytes"
+    );
+
+    Ok(())
+}
+
+// checksum feature changes reserved_space which breaks VACUUM INTO hash comparison
+#[cfg_attr(feature = "checksum", ignore)]
+#[turso_macros::test(init_sql = "CREATE TABLE main_t(x INTEGER);")]
+fn test_vacuum_into_attached_database(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+    conn.execute("INSERT INTO main_t VALUES (1), (2), (3)")?;
+
+    let attached_path = tmp_db.path.with_file_name("attached.db");
+    conn.execute(format!(
+        "ATTACH DATABASE '{}' AS att",
+        attached_path.display()
+    ))?;
+    conn.execute("CREATE TABLE att.att_t(y TEXT)")?;
+    conn.execute("INSERT INTO att.att_t VALUES ('a'), ('b'), ('c')")?;
+
+    let dest_dir = TempDir::new()?;
+    let dest_path = dest_dir.path().join("att_vacuumed.db");
+    let dest_path_str = dest_path.to_str().unwrap();
+
+    conn.execute(format!("VACUUM att INTO '{dest_path_str}'"))?;
+    assert!(dest_path.exists(), "Destination file should exist");
+
+    let dest_db = TempDatabase::new_with_existent(&dest_path);
+    let dest_conn = dest_db.connect_limbo();
+
+    let integrity = run_integrity_check(&dest_conn);
+    assert_eq!(
+        integrity, "ok",
+        "Vacuumed attached database should pass integrity check"
+    );
+
+    let attached_db = TempDatabase::new_with_existent(&attached_path);
+    let source_hash = compute_dbhash(&attached_db);
+    let dest_hash = compute_dbhash(&dest_db);
+    assert_eq!(
+        source_hash.hash, dest_hash.hash,
+        "Vacuumed database should have the same content hash as the attached source"
+    );
+
+    let rows: Vec<(String,)> = dest_conn.exec_rows("SELECT y FROM att_t ORDER BY y");
+    assert_eq!(rows.len(), 3);
+    assert_eq!(rows[0].0, "a");
+    assert_eq!(rows[1].0, "b");
+    assert_eq!(rows[2].0, "c");
+
+    let result = dest_conn.execute("SELECT * FROM main_t");
+    assert!(
+        result.is_err(),
+        "main_t should not exist in vacuumed attached database"
+    );
+
+    Ok(())
+}
+
+// checksum feature changes reserved_space which breaks VACUUM INTO hash comparison
+#[cfg_attr(feature = "checksum", ignore)]
+#[turso_macros::test(init_sql = "CREATE TABLE main_t(x INTEGER);")]
+fn test_vacuum_main_into(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+    conn.execute("INSERT INTO main_t VALUES (10), (20), (30)")?;
+
+    let attached_path = tmp_db.path.with_file_name("attached.db");
+    conn.execute(format!(
+        "ATTACH DATABASE '{}' AS att",
+        attached_path.display()
+    ))?;
+    conn.execute("CREATE TABLE att.att_t(z INTEGER)")?;
+    conn.execute("INSERT INTO att.att_t VALUES (100)")?;
+
+    // Hash content only (without_schema) because
+    // vacuumed target (main) is created by init_sql
+    // which is executed by rusqlite and produces different
+    // schema than turso's VACUUM INTO
+    let hash_opts = turso_dbhash::DbHashOptions {
+        without_schema: true,
+        ..Default::default()
+    };
+    let source_hash = compute_dbhash_with_options(&tmp_db, &hash_opts);
+
+    let dest_dir = TempDir::new()?;
+    let dest_path = dest_dir.path().join("main_vacuumed.db");
+    let dest_path_str = dest_path.to_str().unwrap();
+
+    conn.execute(format!("VACUUM main INTO '{dest_path_str}'"))?;
+    assert!(dest_path.exists(), "Destination file should exist");
+
+    let dest_db = TempDatabase::new_with_existent(&dest_path);
+    let dest_conn = dest_db.connect_limbo();
+
+    let integrity = run_integrity_check(&dest_conn);
+    assert_eq!(
+        integrity, "ok",
+        "Vacuumed main database should pass integrity check"
+    );
+
+    let dest_hash = compute_dbhash_with_options(&dest_db, &hash_opts);
+    assert_eq!(
+        source_hash.hash, dest_hash.hash,
+        "Vacuumed database should have the same content hash as main"
+    );
+
+    let rows: Vec<(i64,)> = dest_conn.exec_rows("SELECT x FROM main_t ORDER BY x");
+    assert_eq!(rows.len(), 3);
+    assert_eq!(rows[0].0, 10);
+    assert_eq!(rows[1].0, 20);
+    assert_eq!(rows[2].0, 30);
+
+    let result = dest_conn.execute("SELECT * FROM att_t");
+    assert!(
+        result.is_err(),
+        "att_t should not exist in vacuumed main database"
+    );
+
+    Ok(())
+}
+
+#[turso_macros::test(mvcc)]
+fn test_vacuum_into_nonexistent_schema(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+    let result = conn.execute("VACUUM nonexistent INTO 'out.db'");
+
+    assert!(result.is_err(), "Should error on non-existent database");
+    let err_msg = format!("{}", result.unwrap_err());
+    assert!(
+        err_msg.contains("no such database: nonexistent"),
+        "Error should indicate database not found: {err_msg}"
+    );
+
+    Ok(())
+}
+
+#[turso_macros::test(mvcc)]
+fn test_vacuum_into_temp_is_noop(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+
+    let dest_dir = TempDir::new()?;
+    let dest_path = dest_dir.path().join("temp_vacuum.db");
+    let dest_path_str = dest_path.to_str().unwrap();
+
+    conn.execute(format!("VACUUM temp INTO '{dest_path_str}'"))?;
+    assert!(
+        !dest_path.exists(),
+        "VACUUM temp INTO should not create a file"
     );
 
     Ok(())

@@ -1123,6 +1123,7 @@ mod tests {
             planner::TableMask,
         },
         vdbe::builder::TableRefIdCounter,
+        MAIN_DB_ID,
     };
     use rustc_hash::FxHashMap as HashMap;
     use std::{collections::VecDeque, sync::Arc};
@@ -1197,7 +1198,7 @@ mod tests {
             col_used_mask: ColumnUsedMask::default(),
             column_use_counts: Vec::new(),
             expression_index_usages: Vec::new(),
-            database_id: 0,
+            database_id: MAIN_DB_ID,
             indexed: None,
         }
     }

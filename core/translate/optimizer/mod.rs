@@ -9,7 +9,6 @@ use super::{
     },
     planner::TableMask,
 };
-use crate::schema::GeneratedType;
 use crate::translate::expression_index::expression_index_column_usage;
 use crate::translate::plan::MultiIndexBranchAccess;
 use crate::{
@@ -48,6 +47,7 @@ use crate::{
     },
     LimboError, Result,
 };
+use crate::{schema::GeneratedType, MAIN_DB_ID};
 use crate::{turso_assert, turso_assert_eq, turso_debug_assert, turso_soft_unreachable};
 use constraints::{
     constraints_from_where_clause, usable_constraints_for_join_order, Constraint,
@@ -983,7 +983,7 @@ fn add_ephemeral_table_to_update_plan(
             col_used_mask: ColumnUsedMask::default(),
             column_use_counts: Vec::new(),
             expression_index_usages: Vec::new(),
-            database_id: 0,
+            database_id: MAIN_DB_ID,
             indexed: None,
         }],
         vec![],

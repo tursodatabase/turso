@@ -1670,6 +1670,8 @@ pub enum Insn {
     /// VACUUM INTO - create a compacted copy of the database at the specified path.
     /// This copies all schema and data from the current database to a new file.
     VacuumInto {
+        /// Database name to vacuum
+        schema_name: String,
         /// Destination file path for the vacuumed database
         dest_path: String,
     },

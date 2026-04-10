@@ -96,6 +96,7 @@ use crate::{
 };
 
 use crate::{connection::Row, info, turso_assert, OpenFlags, TransactionState, ValueRef};
+use crate::{is_attached_db, MAIN_DB_ID, TEMP_DB_ID};
 
 use super::{
     array::{
@@ -2744,12 +2745,7 @@ pub fn halt(
                 vtab_rollback_all(&program.connection)?;
                 if let Some(mv_store) = mv_store.as_ref() {
                     if let Some(tx_id) = program.connection.get_mv_tx_id() {
-                        mv_store.rollback_tx(
-                            tx_id,
-                            pager.clone(),
-                            &program.connection,
-                            crate::MAIN_DB_ID,
-                        );
+                        mv_store.rollback_tx(tx_id, pager.clone(), &program.connection, MAIN_DB_ID);
                     }
                     pager.end_read_tx();
                 } else {
@@ -2975,7 +2971,7 @@ pub fn op_transaction_inner(
 
                 // 1. We try to upgrade current version
                 let current_state = conn.get_tx_state();
-                let is_attached = crate::is_attached_db(*db);
+                let is_attached = is_attached_db(*db);
                 let (new_transaction_state, updated) = if conn.is_nested_stmt() {
                     (current_state, false)
                 } else if is_attached {
@@ -3166,7 +3162,7 @@ pub fn op_transaction_inner(
                     // For attached databases without MVCC, always start read/write
                     // transactions on the attached pager, since the connection-level
                     // transaction state may already be Read/Write from the main database.
-                    let is_attached = crate::is_attached_db(*db);
+                    let is_attached = is_attached_db(*db);
                     if is_attached {
                         // If the pager already holds a read lock (e.g., after
                         // SchemaUpdated reprepare or prior write tx), skip
@@ -3290,13 +3286,13 @@ pub fn op_transaction_inner(
             }
             OpTransactionState::BeginStatement => {
                 let needs_stmt_journal = program.needs_stmt_subtransactions.load(Ordering::Relaxed);
-                if *db == crate::MAIN_DB_ID && needs_stmt_journal {
+                if *db == MAIN_DB_ID && needs_stmt_journal {
                     let write = matches!(tx_mode, TransactionMode::Write);
                     let res = state.begin_statement(&program.connection, &pager, write)?;
                     if let IOResult::IO(io) = res {
                         return Ok(InsnFunctionStepResult::IO(io));
                     }
-                } else if crate::is_attached_db(*db)
+                } else if is_attached_db(*db)
                     && matches!(tx_mode, TransactionMode::Write)
                     && needs_stmt_journal
                 {
@@ -3320,7 +3316,7 @@ pub fn op_transaction_inner(
                     }
                 }
 
-                if *db == crate::MAIN_DB_ID
+                if *db == MAIN_DB_ID
                     && matches!(tx_mode, TransactionMode::Write)
                     && !program.connection.auto_commit.load(Ordering::SeqCst)
                 {
@@ -3407,7 +3403,7 @@ pub fn op_auto_commit(
             // ROLLBACK transition
             if let Some(mv_store) = mv_store.as_ref() {
                 if let Some(tx_id) = conn.get_mv_tx_id() {
-                    mv_store.rollback_tx(tx_id, pager.clone(), &conn, crate::MAIN_DB_ID);
+                    mv_store.rollback_tx(tx_id, pager.clone(), &conn, MAIN_DB_ID);
                 }
                 pager.end_read_tx();
                 conn.rollback_attached_mvcc_txs(true);
@@ -9930,7 +9926,7 @@ pub fn op_destroy(
         return Ok(InsnFunctionStepResult::Step);
     }
 
-    let destroy_pager = if *db != crate::MAIN_DB_ID {
+    let destroy_pager = if *db != MAIN_DB_ID {
         program.get_pager_from_database_index(db)
     } else {
         pager.clone()
@@ -10239,7 +10235,7 @@ pub fn op_parse_schema(
     conn.auto_commit.store(false, Ordering::SeqCst);
 
     // For attached databases, qualify the sqlite_schema table with the database name
-    let schema_table = if crate::is_attached_db(*db) {
+    let schema_table = if is_attached_db(*db) {
         let db_name = conn
             .get_database_name_by_index(*db)
             .unwrap_or_else(|| "main".to_string());
@@ -10259,7 +10255,7 @@ pub fn op_parse_schema(
     // which also acquires the schema / database_schemas write lock, so holding
     // it here would deadlock on the same thread (parking_lot RwLock is not
     // re-entrant).
-    let schema_arc = if crate::is_attached_db(*db) {
+    let schema_arc = if is_attached_db(*db) {
         // Fetch the fallback schema from attached_databases BEFORE acquiring
         // database_schemas.write() to avoid a nested lock ordering dependency
         // (database_schemas.write -> attached_databases.read).
@@ -10385,7 +10381,7 @@ fn op_parse_schema_step(
                 );
 
                 // Store the modified schema back
-                if crate::is_attached_db(db) {
+                if is_attached_db(db) {
                     conn.database_schemas().write().insert(db, schema_arc);
                 } else {
                     *conn.schema.write() = schema_arc;
@@ -10718,7 +10714,7 @@ pub fn op_set_cookie(
                 Cookie::SchemaVersion => {
                     // Only mark schema_did_change on connection for main database (db 0).
                     // Attached databases track their schema independently.
-                    if *db == crate::MAIN_DB_ID {
+                    if *db == MAIN_DB_ID {
                         match program.connection.get_tx_state() {
                             TransactionState::Write { .. } => {
                                 program.connection.set_tx_state(TransactionState::Write { schema_did_change: true });
@@ -11462,7 +11458,7 @@ pub fn op_integrity_check(
 
     let mv_store = program.connection.mv_store_for_db(*db);
     // Use the correct pager for the target database (main or attached)
-    let target_pager = if *db == crate::MAIN_DB_ID {
+    let target_pager = if *db == MAIN_DB_ID {
         pager.clone()
     } else {
         program.get_pager_from_database_index(db)
@@ -12167,7 +12163,7 @@ pub fn op_alter_column(
             Ok(())
         })?;
 
-        if !crate::is_attached_db(*db) {
+        if !is_attached_db(*db) {
             conn.with_schema(*db, |schema| -> crate::Result<()> {
                 let table = schema
                     .tables
@@ -13749,6 +13745,10 @@ pub(crate) enum OpVacuumIntoSubState {
 #[derive(Default)]
 pub(crate) struct OpVacuumIntoState {
     sub_state: OpVacuumIntoSubState,
+    /// Escaped schema name for safe SQL interpolation
+    escaped_schema_name: String,
+    /// Database index for the target schema
+    database_id: usize,
     /// Keep dest_db alive while vacuum is in progress.
     #[allow(dead_code)]
     dest_db: Option<Arc<crate::Database>>,
@@ -13806,11 +13806,33 @@ fn op_vacuum_into_inner(
     state: &mut ProgramState,
     insn: &Insn,
 ) -> Result<InsnFunctionStepResult> {
-    load_insn!(VacuumInto { dest_path }, insn);
+    load_insn!(
+        VacuumInto {
+            schema_name,
+            dest_path
+        },
+        insn
+    );
 
-    let vacuum_state = state
-        .op_vacuum_into_state
-        .get_or_insert_with(OpVacuumIntoState::default);
+    if state.op_vacuum_into_state.is_none() {
+        let database_id = program.connection.get_database_id_by_name(schema_name)?;
+
+        // Matches sqlite that treats VACUUM temp INTO as a no-op (no file created)
+        if database_id == TEMP_DB_ID {
+            state.pc += 1;
+            return Ok(InsnFunctionStepResult::Step);
+        }
+
+        state.op_vacuum_into_state = Some(OpVacuumIntoState {
+            escaped_schema_name: schema_name.replace('"', "\"\""),
+            database_id,
+            ..Default::default()
+        });
+    }
+
+    let vacuum_state = state.op_vacuum_into_state.as_mut().unwrap();
+    let escaped_schema_name = &vacuum_state.escaped_schema_name;
+    let database_id = vacuum_state.database_id;
 
     loop {
         let current_sub_state = std::mem::take(&mut vacuum_state.sub_state);
@@ -13849,33 +13871,47 @@ fn op_vacuum_into_inner(
                 // Always use PlatformIO for the destination file, even if source is in-memory.
                 // This ensures VACUUM INTO actually writes to disk.
                 let io: Arc<dyn crate::IO> = Arc::new(crate::io::PlatformIO::new()?);
-                let source_db = &program.connection.db;
+                let source_db = program.connection.get_source_database(database_id);
                 let dest_opts = crate::DatabaseOpts::new()
                     .with_views(source_db.experimental_views_enabled())
                     .with_index_method(source_db.experimental_index_method_enabled());
 
                 program.connection.execute("BEGIN")?;
-                // lets set the same meta values as source db
+                // Set the same meta values from the source db (schema)
                 let user_version: i32 = extract_pragma_int(
-                    &program.connection.pragma_query("user_version")?,
+                    &program
+                        .connection
+                        .pragma_query(&format!("\"{escaped_schema_name}\".user_version"))?,
                     "user_version",
                 )?;
                 let application_id: i32 = extract_pragma_int(
-                    &program.connection.pragma_query("application_id")?,
+                    &program
+                        .connection
+                        .pragma_query(&format!("\"{escaped_schema_name}\".application_id"))?,
                     "application_id",
                 )?;
                 let page_size: u32 = extract_pragma_int(
-                    &program.connection.pragma_query("page_size")?,
+                    &program
+                        .connection
+                        .pragma_query(&format!("\"{escaped_schema_name}\".page_size"))?,
                     "page_size",
                 )?;
 
-                let reserved_space = {
-                    let pager = program.connection.pager.load();
-                    let reserved_space: u8 = match program.connection.get_reserved_bytes() {
+                let reserved_space: u8 = if !is_attached_db(database_id) {
+                    // For main or temp db prefer cached value to avoid blocking I/O
+                    match program.connection.get_reserved_bytes() {
                         Some(val) => val,
-                        None => io.block(|| pager.with_header(|header| header.reserved_space))?,
-                    };
-                    reserved_space
+                        None => {
+                            let pager = program.connection.pager.load();
+                            io.block(|| pager.with_header(|header| header.reserved_space))?
+                        }
+                    }
+                } else {
+                    // For attached db read from its own pager
+                    let pager = program
+                        .connection
+                        .get_pager_from_database_index(&database_id);
+                    io.block(|| pager.with_header(|header| header.reserved_space))?
                 };
 
                 let dest_db = crate::Database::open_file_with_flags(
@@ -13894,7 +13930,7 @@ fn op_vacuum_into_inner(
 
                 // Enable MVCC on destination if source has it enabled
                 // Must be done before any schema operations to ensure the log file is created
-                if program.connection.db.mvcc_enabled() {
+                if source_db.mvcc_enabled() {
                     dest_conn.execute("PRAGMA journal_mode = 'mvcc'")?;
                 }
 
@@ -13913,7 +13949,7 @@ fn op_vacuum_into_inner(
                 // internal artifact of mvcc mode and must not appear in a
                 // standalone SQLite file produced by VACUUM INTO.
                 let schema_sql = format!(
-                    "SELECT type, name, tbl_name, sql FROM sqlite_schema WHERE sql IS NOT NULL AND name <> '{}' ORDER BY CASE type WHEN 'table' THEN 1 WHEN 'index' THEN 2 WHEN 'trigger' THEN 3 WHEN 'view' THEN 4 ELSE 5 END",
+                    "SELECT type, name, tbl_name, sql FROM \"{escaped_schema_name}\".sqlite_schema WHERE sql IS NOT NULL AND name <> '{}' ORDER BY CASE type WHEN 'table' THEN 1 WHEN 'index' THEN 2 WHEN 'trigger' THEN 3 WHEN 'view' THEN 4 ELSE 5 END",
                     crate::mvcc::database::MVCC_META_TABLE_NAME
                 );
                 let schema_stmt = program.connection.prepare(schema_sql.as_str())?;
@@ -14091,15 +14127,17 @@ fn op_vacuum_into_inner(
                     let row = &vacuum_state.schema_rows[idx];
                     if matches!(&row[1], Value::Text(n) if n.as_str() == crate::schema::TURSO_TYPES_TABLE_NAME)
                     {
-                        let source_types: Vec<(String, std::sync::Arc<crate::schema::TypeDef>)> = {
-                            let source_schema = program.connection.schema.read();
-                            source_schema
-                                .type_registry
-                                .iter()
-                                .filter(|(_, td)| !td.is_builtin)
-                                .map(|(name, td)| (name.clone(), td.clone()))
-                                .collect()
-                        };
+                        let source_types: Vec<(String, std::sync::Arc<crate::schema::TypeDef>)> =
+                            program
+                                .connection
+                                .with_schema(database_id, |source_schema| {
+                                    source_schema
+                                        .type_registry
+                                        .iter()
+                                        .filter(|(_, td)| !td.is_builtin)
+                                        .map(|(name, td)| (name.clone(), td.clone()))
+                                        .collect()
+                                });
                         dest_conn.with_schema_mut(|dest_schema| {
                             for (name, td) in source_types {
                                 dest_schema.type_registry.insert(name, td);
@@ -14148,7 +14186,9 @@ fn op_vacuum_into_inner(
                 let table_name = &vacuum_state.table_names[table_idx];
                 // Escape double quotes in table name for safe SQL
                 let escaped_table_name = table_name.replace('"', "\"\"");
-                let pragma_sql = format!("PRAGMA table_info(\"{escaped_table_name}\")");
+                let pragma_sql = format!(
+                    "PRAGMA \"{escaped_schema_name}\".table_info(\"{escaped_table_name}\")"
+                );
                 let column_stmt = program.connection.prepare(&pragma_sql)?;
                 vacuum_state.current_table_columns.clear();
                 vacuum_state.sub_state = OpVacuumIntoSubState::CollectColumnInfo {
@@ -14194,8 +14234,9 @@ fn op_vacuum_into_inner(
                         // Prepare SELECT and INSERT statements for this table
                         let table_name = &vacuum_state.table_names[table_idx];
                         let escaped_table_name = table_name.replace('"', "\"\"");
-                        let source_btree_table =
-                            program.connection.schema.read().get_btree_table(table_name);
+                        let source_btree_table = program
+                            .connection
+                            .with_schema(database_id, |s| s.get_btree_table(table_name));
                         let rowid_alias = source_btree_table
                             .as_ref()
                             .filter(|table| table.has_rowid)
@@ -14228,21 +14269,21 @@ fn op_vacuum_into_inner(
                         }
                         let column_names = data_columns.join(", ");
 
+                        let qualified_table =
+                            format!("\"{escaped_schema_name}\".\"{escaped_table_name}\"");
                         let select_sql = match rowid_alias {
                             Some(alias)
                                 if excluded_rowid_alias_column && column_names.is_empty() =>
                             {
-                                format!("SELECT {alias} FROM \"{escaped_table_name}\"")
+                                format!("SELECT {alias} FROM {qualified_table}")
                             }
                             Some(alias) if excluded_rowid_alias_column => {
-                                format!(
-                                    "SELECT {alias}, {column_names} FROM \"{escaped_table_name}\""
-                                )
+                                format!("SELECT {alias}, {column_names} FROM {qualified_table}")
                             }
                             Some(alias) => {
-                                format!("SELECT {alias}, * FROM \"{escaped_table_name}\"")
+                                format!("SELECT {alias}, * FROM {qualified_table}")
                             }
-                            None => format!("SELECT * FROM \"{escaped_table_name}\""),
+                            None => format!("SELECT * FROM {qualified_table}"),
                         };
                         let select_stmt = program.connection.prepare(&select_sql)?;
 
