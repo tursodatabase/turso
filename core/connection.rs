@@ -66,6 +66,22 @@ pub(crate) struct NamedSavepointFrame {
     pub(crate) name: String,
     pub(crate) starts_transaction: bool,
     pub(crate) deferred_fk_violations: isize,
+    /// Snapshot of `temp_db.db.schema` taken at SAVEPOINT begin. `None`
+    /// when the temp database had not been initialized yet. Used by
+    /// ROLLBACK TO to restore the in-memory temp schema after the
+    /// on-disk pages have been rolled back via the mirror call.
+    pub(crate) temp_schema_snapshot: Option<Arc<Schema>>,
+    /// Snapshot of the connection-local `database_schemas` map at
+    /// SAVEPOINT begin. Cheap — values are `Arc`. Used by ROLLBACK TO
+    /// to restore staged DDL on attached databases.
+    pub(crate) staged_schema_snapshot: HashMap<usize, Arc<Schema>>,
+}
+
+/// Info returned by `rollback_named_savepoint_frame` so callers can
+/// restore in-memory schema state after the pager has rolled back.
+pub(crate) struct RollbackFrameInfo {
+    pub(crate) temp_schema_snapshot: Option<Arc<Schema>>,
+    pub(crate) staged_schema_snapshot: HashMap<usize, Arc<Schema>>,
 }
 
 /// Database connection handle.
@@ -2726,17 +2742,24 @@ impl Connection {
         f(&savepoints)
     }
 
-    pub(crate) fn push_named_savepoint(
-        &self,
-        name: String,
-        starts_transaction: bool,
-        deferred_fk_violations: isize,
-    ) {
-        self.named_savepoints.write().push(NamedSavepointFrame {
-            name,
-            starts_transaction,
-            deferred_fk_violations,
-        });
+    pub(crate) fn push_named_savepoint(&self, frame: NamedSavepointFrame) {
+        self.named_savepoints.write().push(frame);
+    }
+
+    /// Snapshot the in-memory non-main schemas for a savepoint frame so
+    /// ROLLBACK TO can restore them after the pager rolls back the
+    /// underlying pages.
+    pub(crate) fn with_snapshot_non_main_schemas<F, T>(&self, f: F) -> T
+    where
+        F: FnOnce(Option<Arc<Schema>>, HashMap<usize, Arc<Schema>>) -> T,
+    {
+        let temp_schema_snapshot = self
+            .temp_database
+            .read()
+            .as_ref()
+            .map(|temp_db| temp_db.db.schema.lock().clone());
+        let staged_schema_snapshot = self.database_schemas.read().clone();
+        f(temp_schema_snapshot, staged_schema_snapshot)
     }
 
     pub(crate) fn release_named_savepoint_frame(&self, name: &str) -> SavepointResult {
@@ -2754,14 +2777,20 @@ impl Connection {
         SavepointResult::Release
     }
 
-    pub(crate) fn rollback_named_savepoint_frame(&self, name: &str) -> Option<isize> {
+    pub(crate) fn rollback_named_savepoint_frame(&self, name: &str) -> Option<RollbackFrameInfo> {
         let mut savepoints = self.named_savepoints.write();
         let target_idx = savepoints
             .iter()
             .rposition(|savepoint| savepoint.name == name)?;
-        let deferred_fk_violations = savepoints[target_idx].deferred_fk_violations;
+        let frame = &savepoints[target_idx];
+        let info = RollbackFrameInfo {
+            temp_schema_snapshot: frame.temp_schema_snapshot.clone(),
+            staged_schema_snapshot: frame.staged_schema_snapshot.clone(),
+        };
+        // ROLLBACK TO keeps the target savepoint itself on the stack;
+        // only nested savepoints above it are discarded.
         savepoints.truncate(target_idx + 1);
-        Some(deferred_fk_violations)
+        Some(info)
     }
 
     pub(crate) fn clear_named_savepoints(&self) {

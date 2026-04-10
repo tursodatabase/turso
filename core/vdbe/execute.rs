@@ -3667,6 +3667,18 @@ pub fn op_auto_commit(
         && (is_rollback_req || is_commit_req)
     {
         pager.clear_savepoints()?;
+        // Non-main pagers (temp + attached) accumulate savepoints from the
+        // mirror path; they're not cleared by the main pager's commit/
+        // rollback. Without this, a stale savepoint with the same name from
+        // a previous transaction can be matched by a future ROLLBACK TO and
+        // undo unrelated pages. See fuzz regression in
+        // `named_savepoint_differential_fuzz`.
+        conn.with_all_attached_pagers_with_index(|pagers| -> Result<()> {
+            for (_, attached_pager) in pagers {
+                attached_pager.clear_savepoints()?;
+            }
+            Ok(())
+        })?;
     }
 
     // Clear deferred FK counters only after FINAL success of COMMIT/ROLLBACK.
@@ -3705,53 +3717,57 @@ pub fn op_savepoint(
 
     match *op {
         SavepointOp::Begin => {
-            let starts_transaction = conn.auto_commit.load(Ordering::SeqCst);
-            let deferred_fk_violations = conn.get_deferred_foreign_key_violations();
-            let frame = crate::connection::NamedSavepointFrame {
-                name: name.clone(),
-                starts_transaction,
-                deferred_fk_violations,
-            };
+            conn.with_snapshot_non_main_schemas(|temp_schema_snapshot, staged_schema_snapshot| {
+                let starts_transaction = conn.auto_commit.load(Ordering::SeqCst);
+                let deferred_fk_violations = conn.get_deferred_foreign_key_violations();
 
-            if let Some(mv_store) = mv_store.as_ref() {
-                let tx_id = if let Some(tx_id) = conn.get_mv_tx_id() {
-                    tx_id
+                if let Some(mv_store) = mv_store.as_ref() {
+                    let tx_id = if let Some(tx_id) = conn.get_mv_tx_id() {
+                        tx_id
+                    } else {
+                        let tx_id = mv_store.begin_tx(pager.clone())?;
+                        conn.set_mv_tx(Some((tx_id, TransactionMode::Read)));
+                        if matches!(conn.get_tx_state(), TransactionState::None) {
+                            conn.set_tx_state(TransactionState::Read);
+                        }
+                        tx_id
+                    };
+                    mv_store.begin_named_savepoint(
+                        tx_id,
+                        name.clone(),
+                        starts_transaction,
+                        deferred_fk_violations,
+                    );
                 } else {
-                    let tx_id = mv_store.begin_tx(pager.clone())?;
-                    conn.set_mv_tx(Some((tx_id, TransactionMode::Read)));
-                    if matches!(conn.get_tx_state(), TransactionState::None) {
-                        conn.set_tx_state(TransactionState::Read);
-                    }
-                    tx_id
+                    pager.open_subjournal()?;
+                    let db_size =
+                        return_if_io!(pager.with_header(|header| header.database_size.get()));
+                    pager.open_named_savepoint(
+                        name.clone(),
+                        db_size,
+                        starts_transaction,
+                        deferred_fk_violations,
+                    )?;
+                }
+                let frame = crate::connection::NamedSavepointFrame {
+                    name: name.clone(),
+                    starts_transaction,
+                    deferred_fk_violations,
+                    temp_schema_snapshot,
+                    staged_schema_snapshot,
                 };
-                mv_store.begin_named_savepoint(
-                    tx_id,
-                    name.clone(),
-                    starts_transaction,
-                    deferred_fk_violations,
-                );
-            } else {
-                pager.open_subjournal()?;
-                let db_size = return_if_io!(pager.with_header(|header| header.database_size.get()));
-                pager.open_named_savepoint(
-                    name.clone(),
-                    db_size,
-                    starts_transaction,
-                    deferred_fk_violations,
+                mirror_named_savepoint_to_active_non_main_databases(
+                    &conn,
+                    SavepointMirror::Begin(&frame),
                 )?;
-            }
-            mirror_named_savepoint_to_active_non_main_databases(
-                &conn,
-                SavepointMirror::Begin(&frame),
-            )?;
-            conn.push_named_savepoint(name.clone(), starts_transaction, deferred_fk_violations);
+                conn.push_named_savepoint(frame);
+                if starts_transaction {
+                    conn.auto_commit.store(false, Ordering::SeqCst);
+                }
 
-            if starts_transaction {
-                conn.auto_commit.store(false, Ordering::SeqCst);
-            }
-
-            state.pc += 1;
-            Ok(InsnFunctionStepResult::Step)
+                state.pc += 1;
+                Ok(InsnFunctionStepResult::Step)
+            })
         }
         SavepointOp::Release => {
             let release_result = if let Some(mv_store) = mv_store.as_ref() {
@@ -3806,13 +3822,37 @@ pub fn op_savepoint(
                 mark_unlikely();
                 return Err(LimboError::TxError(format!("no such savepoint: {name}")));
             };
-            let _ = conn.rollback_named_savepoint_frame(name);
+            let frame_info = conn.rollback_named_savepoint_frame(name);
             mirror_named_savepoint_to_active_non_main_databases(
                 &conn,
                 SavepointMirror::Rollback(name),
             )?;
             conn.fk_deferred_violations
-                .store(deferred_fk_snapshot, Ordering::SeqCst);
+                .store(deferred_fk_snapshot, Ordering::Release);
+
+            // Restore non-main in-memory schemas from the frame's snapshot.
+            // The mirror call above rolled back on-disk pages for temp and
+            // attached pagers; without this restore, the in-memory schemas
+            // would keep DDL that the disk-level rollback just undid.
+            if let Some(info) = frame_info {
+                if let Some(temp_db) = conn.temp_database.read().as_ref() {
+                    match info.temp_schema_snapshot {
+                        Some(snap) => *temp_db.db.schema.lock() = snap,
+                        None => *temp_db.db.schema.lock() = conn.empty_temp_schema(),
+                    }
+                }
+                *conn.database_schemas().write() = info.staged_schema_snapshot;
+                conn.bump_prepare_context_generation();
+            }
+
+            // Invalidate cached schema cookies on ALL non-main pagers whose
+            // pages may have been rolled back. The main pager is handled
+            // below. Next header read will re-populate the cached cookie.
+            conn.with_all_attached_pagers_with_index(|pagers| {
+                for (_db_id, attached_pager) in pagers {
+                    attached_pager.set_schema_cookie(None);
+                }
+            });
 
             // After rolling back pages, the in-memory schema cache may be stale
             // if DDL was executed within the savepoint. Invalidate the pager's
