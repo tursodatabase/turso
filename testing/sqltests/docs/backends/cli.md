@@ -101,7 +101,7 @@ echo "SELECT 1, 'hello';" | tursodb :memory: -m list
 
 ## Limitations
 
-1. **Interactive commands**: sqlite-backed CLI tests support `.tables` and `.schema`, but broader shell-command coverage is still limited
+1. **Interactive commands**: sqlite-backed CLI tests support a single `.tables` or `.schema` (must be the last output-producing statement in the test). Broader shell-command coverage is still limited
 2. **Multi-statement**: Each `execute()` call is a separate CLI invocation
 3. **Transactions**: Not persisted across `execute()` calls for `:memory:` databases
 
