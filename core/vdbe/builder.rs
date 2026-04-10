@@ -1,4 +1,4 @@
-use crate::{turso_assert, turso_assert_eq, turso_debug_assert, MAIN_DB_ID};
+use crate::{turso_assert, turso_assert_eq, turso_debug_assert};
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use tracing::{instrument, Level};
 use turso_parser::ast::{self, ResolveType, SortOrder, TableInternalId};

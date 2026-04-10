@@ -1627,14 +1627,10 @@ pub fn translate_drop_table(
     // Emit a second deletion loop over temp.sqlite_schema when the dropped
     // table belongs to a non-temp database and a temp database exists.
     if database_id != crate::TEMP_DB_ID && resolver.has_temp_database() {
-        let temp_schema_table = resolver
-            .with_schema(crate::TEMP_DB_ID, |s| {
-                s.get_btree_table(SQLITE_TABLEID)
-            });
+        let temp_schema_table =
+            resolver.with_schema(crate::TEMP_DB_ID, |s| s.get_btree_table(SQLITE_TABLEID));
         if let Some(temp_schema_table) = temp_schema_table {
-            let temp_cursor = program.alloc_cursor_id(
-                CursorType::BTreeTable(temp_schema_table),
-            );
+            let temp_cursor = program.alloc_cursor_id(CursorType::BTreeTable(temp_schema_table));
             program.emit_insn(Insn::OpenWrite {
                 cursor_id: temp_cursor,
                 root_page: 1i64.into(),
