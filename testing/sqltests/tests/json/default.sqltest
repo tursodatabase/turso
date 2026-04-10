@@ -953,27 +953,25 @@ expect {
     2
 }
 
-# Issue #6099: bracket-notation with quoted key — both forms should work like
-# the dot-quoted form $."key with spaces" already does.
+# Issue #6099: bracket-notation with quoted key — parsed without error but
+# always returns NULL (matches SQLite behavior: bracket notation on non-array
+# nodes produces NOTFOUND, not a parse error).
 test json_extract_bracket_quoted_key_double_quote {
     SELECT json_extract('{"key with spaces":1}', '$["key with spaces"]')
 }
 expect {
-    1
 }
 
 test json_extract_bracket_quoted_key_single_quote {
     SELECT json_extract('{"key":42}', '$[''key'']')
 }
 expect {
-    42
 }
 
 test json_extract_bracket_quoted_key_with_dots {
     SELECT json_extract('{"a.b.c":"hello"}', '$["a.b.c"]')
 }
 expect {
-    hello
 }
 
 test json_extract_bracket_quoted_key_missing {
@@ -986,14 +984,12 @@ test json_extract_bracket_quoted_key_nested {
     SELECT json_extract('{"outer":{"inner key":99}}', '$.outer["inner key"]')
 }
 expect {
-    99
 }
 
 test json_extract_bracket_quoted_key_with_array_index {
     SELECT json_extract('{"items":[{"k":1},{"k":2},{"k":3}]}', '$["items"][1].k')
 }
 expect {
-    2
 }
 
 test json_array_length {

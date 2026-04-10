@@ -35,6 +35,10 @@ pub enum PathElement<'a> {
     Key(Cow<'a, str>, RawString),
     /// Array locator, eg. [2], [#-5]
     ArrayLocator(Option<i32>),
+    /// Bracket-quoted key (e.g. `$["key"]`). Parsed without error for SQLite
+    /// compatibility but never matches during extraction — SQLite returns NULL
+    /// for bracket-notation on non-array nodes.
+    BracketQuotedKey(Cow<'a, str>),
 }
 
 type IsMaxNumber = bool;
@@ -331,7 +335,7 @@ fn handle_bracket_quoted_key<'a>(
     match path_iter.next() {
         Some((_, ']')) => {
             let key = &path[key_content_start..key_end];
-            path_components.push(PathElement::Key(Cow::Borrowed(key), true));
+            path_components.push(PathElement::BracketQuotedKey(Cow::Borrowed(key)));
             *parser_state = PPState::ExpectDotOrBracket;
             Ok(())
         }
@@ -588,45 +592,50 @@ mod tests {
     #[test]
     fn test_bracket_quoted_key() {
         // Issue #6099: bracket notation with double-quoted key.
+        // Parsed successfully but produces BracketQuotedKey (never matches
+        // during extraction — SQLite compat, always returns NULL).
         let path = json_path(r#"$["key"]"#).unwrap();
         assert_eq!(path.elements.len(), 2);
         assert_eq!(path.elements[0], PathElement::Root());
         assert_eq!(
             path.elements[1],
-            PathElement::Key(Cow::Borrowed("key"), true)
+            PathElement::BracketQuotedKey(Cow::Borrowed("key"))
         );
 
         // Key containing spaces (the original issue example).
         let path = json_path(r#"$["key with spaces"]"#).unwrap();
         assert_eq!(
             path.elements[1],
-            PathElement::Key(Cow::Borrowed("key with spaces"), true)
+            PathElement::BracketQuotedKey(Cow::Borrowed("key with spaces"))
         );
 
-        // Key containing dots — must be quoted to be parseable.
+        // Key containing dots.
         let path = json_path(r#"$["key.with.dots"]"#).unwrap();
         assert_eq!(
             path.elements[1],
-            PathElement::Key(Cow::Borrowed("key.with.dots"), true)
+            PathElement::BracketQuotedKey(Cow::Borrowed("key.with.dots"))
         );
 
         // Key containing brackets.
         let path = json_path(r#"$["key[0]"]"#).unwrap();
         assert_eq!(
             path.elements[1],
-            PathElement::Key(Cow::Borrowed("key[0]"), true)
+            PathElement::BracketQuotedKey(Cow::Borrowed("key[0]"))
         );
 
         // Single-quoted variant.
         let path = json_path(r#"$['key']"#).unwrap();
         assert_eq!(
             path.elements[1],
-            PathElement::Key(Cow::Borrowed("key"), true)
+            PathElement::BracketQuotedKey(Cow::Borrowed("key"))
         );
 
         // Empty quoted key.
         let path = json_path(r#"$[""]"#).unwrap();
-        assert_eq!(path.elements[1], PathElement::Key(Cow::Borrowed(""), true));
+        assert_eq!(
+            path.elements[1],
+            PathElement::BracketQuotedKey(Cow::Borrowed(""))
+        );
 
         // Mixed with dot notation and array indices.
         let path = json_path(r#"$.outer["inner key"][2]"#).unwrap();
@@ -637,7 +646,7 @@ mod tests {
         );
         assert_eq!(
             path.elements[2],
-            PathElement::Key(Cow::Borrowed("inner key"), true)
+            PathElement::BracketQuotedKey(Cow::Borrowed("inner key"))
         );
         assert_eq!(path.elements[3], PathElement::ArrayLocator(Some(2)));
     }
