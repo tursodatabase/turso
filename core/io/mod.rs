@@ -46,6 +46,7 @@ mod vfs;
 pub use memory::MemoryIO;
 pub mod clock;
 mod common;
+pub(crate) mod file_lock;
 mod completions;
 pub use clock::Clock;
 pub use completions::*;
