@@ -980,6 +980,32 @@ fn test_create_insert_drop_checkpoint_recover(db: TempDatabase) -> anyhow::Resul
     Ok(())
 }
 
+/// Same-tx CREATE INDEX + DROP INDEX: the index schema row is inserted and
+/// deleted in the same transaction, producing an insert-delete cycle in
+/// sqlite_schema that must not panic during log replay.
+#[turso_macros::test]
+fn test_create_drop_index_same_tx_recover(db: TempDatabase) -> anyhow::Result<()> {
+    let path = db.path.clone();
+    let io = db.io.clone();
+
+    {
+        let conn = db.connect_limbo();
+        conn.execute("pragma journal_mode = 'mvcc'")?;
+        conn.execute("create table t(id integer primary key, v text)")?;
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")?;
+
+        conn.execute("begin")?;
+        conn.execute("create index idx_t_v on t(v)")?;
+        conn.execute("drop index idx_t_v")?;
+        conn.execute("commit")?;
+    }
+    drop(db);
+
+    Database::open_file(io, path.to_str().unwrap())?;
+
+    Ok(())
+}
+
 /// Same-tx create + insert + drop: data rows reference a table_id whose schema
 /// entry is created and destroyed in the same transaction.
 #[turso_macros::test]
