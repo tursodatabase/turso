@@ -1623,6 +1623,51 @@ pub fn translate_drop_table(
         emit_cdc_autocommit_commit(program, resolver, cdc_cursor_id)?;
     }
 
+    // SQLite removes temp triggers targeting the dropped table.
+    // Emit a second deletion loop over temp.sqlite_schema when the dropped
+    // table belongs to a non-temp database and a temp database exists.
+    if database_id != crate::TEMP_DB_ID && resolver.has_temp_database() {
+        let temp_schema_table =
+            resolver.with_schema(crate::TEMP_DB_ID, |s| s.get_btree_table(SQLITE_TABLEID));
+        if let Some(temp_schema_table) = temp_schema_table {
+            let temp_cursor = program.alloc_cursor_id(CursorType::BTreeTable(temp_schema_table));
+            program.emit_insn(Insn::OpenWrite {
+                cursor_id: temp_cursor,
+                root_page: 1i64.into(),
+                db: crate::TEMP_DB_ID,
+            });
+            let temp_end_label = program.allocate_label();
+            let temp_loop_label = program.allocate_label();
+            program.emit_insn(Insn::Rewind {
+                cursor_id: temp_cursor,
+                pc_if_empty: temp_end_label,
+            });
+            program.preassign_label_to_next_insn(temp_loop_label);
+            let temp_tbl_name_reg = program.alloc_register();
+            // Column 2 of sqlite_schema is tbl_name
+            program.emit_column_or_rowid(temp_cursor, 2, temp_tbl_name_reg);
+            let temp_next_label = program.allocate_label();
+            program.emit_insn(Insn::Ne {
+                lhs: temp_tbl_name_reg,
+                rhs: table_reg,
+                target_pc: temp_next_label,
+                flags: CmpInsFlags::default(),
+                collation: program.curr_collation(),
+            });
+            program.emit_insn(Insn::Delete {
+                cursor_id: temp_cursor,
+                table_name: SQLITE_TABLEID.to_string(),
+                is_part_of_update: false,
+            });
+            program.resolve_label(temp_next_label, program.offset());
+            program.emit_insn(Insn::Next {
+                cursor_id: temp_cursor,
+                pc_if_next: temp_loop_label,
+            });
+            program.preassign_label_to_next_insn(temp_end_label);
+        }
+    }
+
     //  2. Destroy the indices within a loop
     let indices = resolver.schema().get_indices(tbl_name.name.as_str());
     for index in indices {

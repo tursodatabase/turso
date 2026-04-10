@@ -4340,7 +4340,7 @@ fn rename_excluded_column_refs(expr: &mut ast::Expr, old_col: &str, new_col: &st
         &mut |e: &mut ast::Expr| -> crate::Result<WalkControl> {
             if let ast::Expr::Qualified(ns, col) | ast::Expr::DoublyQualified(_, ns, col) = e {
                 if ns.as_str().eq_ignore_ascii_case("excluded")
-                    && col.as_str().eq_ignore_ascii_case(&old_col)
+                    && col.as_str().eq_ignore_ascii_case(old_col)
                 {
                     *col = ast::Name::exact(new_col.to_owned());
                 }

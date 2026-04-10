@@ -101,8 +101,7 @@ expect {
     fired
 }
 
-# DROP TABLE does not error even when temp trigger references it
-# (SQLite leaves orphaned temp triggers)
+# DROP TABLE also removes temp triggers that target the dropped table (matching SQLite)
 test temp-trigger-orphan-on-drop-table {
     CREATE TABLE t7 (id INTEGER PRIMARY KEY);
     CREATE TEMP TRIGGER tr_t7 BEFORE INSERT ON t7 BEGIN SELECT 1; END;
@@ -110,7 +109,7 @@ test temp-trigger-orphan-on-drop-table {
     SELECT count(*) FROM temp.sqlite_schema WHERE type='trigger' AND name='tr_t7';
 }
 expect {
-    1
+    0
 }
 
 # CREATE TEMP TRIGGER IF NOT EXISTS

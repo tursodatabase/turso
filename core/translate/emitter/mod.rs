@@ -158,6 +158,10 @@ pub struct Resolver<'a> {
     /// triggers follow SQLite's looser resolution rules and may access objects
     /// across schemas.
     pub(crate) trigger_context: Option<TriggerDatabaseContext>,
+    /// Cached flag: true when this connection has an active temp database.
+    /// Computed once at Resolver construction to avoid repeated RwLock reads
+    /// on every table name resolution.
+    has_temp_schema: bool,
 }
 
 /// Context for restricting table resolution during trigger subprogram compilation.
@@ -188,6 +192,7 @@ impl<'a> Resolver<'a> {
         enable_custom_types: bool,
         dqs_dml: DoubleQuotedDml,
     ) -> Self {
+        let has_temp_schema = temp_database.read().is_some();
         Self {
             schema,
             database_schemas,
@@ -202,6 +207,7 @@ impl<'a> Resolver<'a> {
             enable_custom_types,
             dqs_dml,
             trigger_context: None,
+            has_temp_schema,
         }
     }
 
@@ -210,7 +216,7 @@ impl<'a> Resolver<'a> {
     }
 
     pub fn has_temp_database(&self) -> bool {
-        self.temp_database.read().is_some()
+        self.has_temp_schema
     }
 
     pub fn fork(&self) -> Resolver<'a> {
@@ -228,6 +234,7 @@ impl<'a> Resolver<'a> {
             enable_custom_types: self.enable_custom_types,
             dqs_dml: self.dqs_dml,
             trigger_context: self.trigger_context.clone(),
+            has_temp_schema: self.has_temp_schema,
         }
     }
 
@@ -246,6 +253,7 @@ impl<'a> Resolver<'a> {
             enable_custom_types: self.enable_custom_types,
             dqs_dml: self.dqs_dml,
             trigger_context: self.trigger_context.clone(),
+            has_temp_schema: self.has_temp_schema,
         }
     }
 
@@ -402,9 +410,14 @@ impl<'a> Resolver<'a> {
     where
         F: Fn(&Schema, &str) -> bool,
     {
-        if self.with_schema(crate::TEMP_DB_ID, |schema| {
-            schema_contains_object(schema, object_name)
-        }) {
+        // Only check the temp schema when a temp database actually exists.
+        // This avoids expensive schema construction/lookup on every table
+        // resolution when no temp objects have been created.
+        if self.has_temp_schema
+            && self.with_schema(crate::TEMP_DB_ID, |schema| {
+                schema_contains_object(schema, object_name)
+            })
+        {
             return crate::TEMP_DB_ID;
         }
 
