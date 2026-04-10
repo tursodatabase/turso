@@ -434,7 +434,7 @@ fn emit_update_column_values<'a>(
     col_len: usize,
     table_name: &str,
     has_direct_rowid_update: bool,
-    has_user_provided_rowid: bool,
+    updates_rowid: bool,
     rowid_set_clause_reg: Option<usize>,
     is_virtual_table: bool,
     index: &Option<(Arc<Index>, usize)>,
@@ -471,7 +471,7 @@ fn emit_update_column_values<'a>(
                 if *col_idx == ROWID_SENTINEL {
                     continue;
                 }
-                if has_user_provided_rowid
+                if updates_rowid
                     && (table_column.primary_key() || table_column.is_rowid_alias())
                     && !is_virtual_table
                 {
