@@ -1955,42 +1955,44 @@ impl Program {
         connection: &Connection,
         rollback: bool,
     ) -> Result<IOResult<()>> {
-        let pagers = connection.get_all_attached_pagers_with_index();
-        for (db_id, attached_pager) in pagers {
-            // MVCC-enabled attached DBs are committed in commit_txn_mvcc phase 2
-            if connection.mv_store_for_db(db_id).is_some() {
-                continue;
-            }
-            if !attached_pager.holds_write_lock() {
-                continue;
-            }
-            if !rollback {
-                // Commit dirty pages to WAL, then end write+read transactions.
-                // We disable auto-checkpoint and avoid pager.commit_tx() since
-                // the checkpoint logic can leave read locks held.
-                match attached_pager.commit_dirty_pages(true, SyncMode::Normal, false) {
-                    Ok(IOResult::Done(_)) => {}
-                    Ok(IOResult::IO(io)) => {
-                        // IO pending — return so the caller can yield and re-enter.
-                        // commit_dirty_pages tracks its own internal state, so calling
-                        // it again on re-entry will resume correctly.
-                        return Ok(IOResult::IO(io));
-                    }
-                    Err(e) => return Err(e),
+        connection.with_all_attached_pagers_with_index(|pagers| {
+            for (db_id, attached_pager) in pagers {
+                let db_id = *db_id;
+                // MVCC-enabled attached DBs are committed in commit_txn_mvcc phase 2
+                if connection.mv_store_for_db(db_id).is_some() {
+                    continue;
                 }
-                // WAL commit succeeded — publish the connection-local schema
-                // changes to the shared Database so other connections can see them.
-                connection.publish_database_schema(db_id);
-                attached_pager.end_write_tx();
-                attached_pager.end_read_tx();
-                attached_pager.commit_dirty_pages_end();
-            } else {
-                // Discard any local schema changes on rollback
-                connection.database_schemas().write().remove(&db_id);
-                attached_pager.rollback_attached();
+                if !attached_pager.holds_write_lock() {
+                    continue;
+                }
+                if !rollback {
+                    // Commit dirty pages to WAL, then end write+read transactions.
+                    // We disable auto-checkpoint and avoid pager.commit_tx() since
+                    // the checkpoint logic can leave read locks held.
+                    match attached_pager.commit_dirty_pages(true, SyncMode::Normal, false) {
+                        Ok(IOResult::Done(_)) => {}
+                        Ok(IOResult::IO(io)) => {
+                            // IO pending — return so the caller can yield and re-enter.
+                            // commit_dirty_pages tracks its own internal state, so calling
+                            // it again on re-entry will resume correctly.
+                            return Ok(IOResult::IO(io));
+                        }
+                        Err(e) => return Err(e),
+                    }
+                    // WAL commit succeeded — publish the connection-local schema
+                    // changes to the shared Database so other connections can see them.
+                    connection.publish_database_schema(db_id);
+                    attached_pager.end_write_tx();
+                    attached_pager.end_read_tx();
+                    attached_pager.commit_dirty_pages_end();
+                } else {
+                    // Discard any local schema changes on rollback
+                    connection.database_schemas().write().remove(&db_id);
+                    attached_pager.rollback_attached();
+                }
             }
-        }
-        Ok(IOResult::Done(()))
+            Ok(IOResult::Done(()))
+        })
     }
 
     /// End read transactions on all attached databases that had transactions started.
