@@ -1,17 +1,23 @@
 pub use create::Create;
 pub use create_index::CreateIndex;
+pub use create_materialized_view::CreateMaterializedView;
+pub use create_view::CreateView;
 pub use delete::Delete;
 pub use drop::Drop;
 pub use drop_index::DropIndex;
-pub use insert::{Insert, OnConflict, UpdateSetItem};
-pub use select::Select;
+pub use drop_view::{DropMaterializedView, DropView};
+pub use insert::{ConflictAction, Insert, OnConflict, UpdateSetItem};
+pub use select::{Cte, Select, WithClause};
 
 pub mod alter_table;
 pub mod create;
 pub mod create_index;
+pub mod create_materialized_view;
+pub mod create_view;
 pub mod delete;
 pub mod drop;
 pub mod drop_index;
+pub mod drop_view;
 pub mod insert;
 pub mod pragma;
 pub mod predicate;
