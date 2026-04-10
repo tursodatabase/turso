@@ -464,9 +464,18 @@ impl Shadow for Query {
             Query::Begin(begin) => Ok(begin.shadow(env)),
             Query::Commit(commit) => Ok(commit.shadow(env)),
             Query::Rollback(rollback) => Ok(rollback.shadow(env)),
-            Query::Savepoint(_) => Ok(vec![]),
-            Query::ReleaseSavepoint(_) => Ok(vec![]),
-            Query::RollbackToSavepoint(_) => Ok(vec![]),
+            Query::Savepoint(_) => {
+                env.push_savepoint();
+                Ok(vec![])
+            }
+            Query::ReleaseSavepoint(_) => {
+                env.release_savepoint();
+                Ok(vec![])
+            }
+            Query::RollbackToSavepoint(_) => {
+                env.rollback_to_savepoint();
+                Ok(vec![])
+            },
             Query::Placeholder => Ok(vec![]),
             Query::Pragma(Pragma::AutoVacuumMode(_)) => Ok(vec![]),
         }

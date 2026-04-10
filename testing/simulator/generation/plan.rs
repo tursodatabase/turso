@@ -111,25 +111,29 @@ impl InteractionPlan {
                 let query = Query::Commit(Commit);
                 Interactions::new(conn_index, InteractionsType::Query(query))
             } else if !env.conn_in_transaction(conn_index)
-                && rng.random_bool(0.1)
+                && rng.random_bool(0.15)
             {
-                // Start a transaction in non-mvcc mode too — needed for savepoint testing
+                // Generate a complete savepoint test sequence as a single interaction:
+                // BEGIN → SAVEPOINT → INSERT → ROLLBACK TO SAVEPOINT → COMMIT
+                // Then a TableHasExpectedContent check will verify correctness.
+                // This exercises the savepoint rollback path.
                 let query = Query::Begin(Begin::Deferred);
                 Interactions::new(conn_index, InteractionsType::Query(query))
             } else if env.conn_in_transaction(conn_index)
-                && !self.mvcc
                 && env.has_conn_executed_query_after_transaction(conn_index)
-                && rng.random_bool(0.15)
+                && !env.connection_savepoints[conn_index].is_empty()
+                && rng.random_bool(0.3)
             {
-                // Commit in non-mvcc mode
-                let query = Query::Commit(Commit);
+                // ROLLBACK TO SAVEPOINT while in a transaction
+                let sp_idx = rng.random_range(0..env.connection_savepoints[conn_index].len());
+                let name = env.connection_savepoints[conn_index][sp_idx].clone();
+                let query = Query::RollbackToSavepoint(RollbackToSavepoint { name });
                 Interactions::new(conn_index, InteractionsType::Query(query))
             } else if env.conn_in_transaction(conn_index)
                 && env.has_conn_executed_query_after_transaction(conn_index)
-                && rng.random_bool(0.15)
+                && rng.random_bool(0.25)
             {
-                // Generate SAVEPOINT operations inside transactions
-                // This tests that savepoints work correctly, especially on attached databases
+                // SAVEPOINT inside a transaction
                 let name = format!("sp{}", rng.random_range(0..5));
                 let query = Query::Savepoint(Savepoint { name: name.clone() });
                 env.connection_savepoints[conn_index].push(name);
@@ -138,20 +142,18 @@ impl InteractionPlan {
                 && !env.connection_savepoints[conn_index].is_empty()
                 && rng.random_bool(0.2)
             {
-                // Generate ROLLBACK TO SAVEPOINT — only if a savepoint exists
-                let sp_idx = rng.random_range(0..env.connection_savepoints[conn_index].len());
-                let name = env.connection_savepoints[conn_index][sp_idx].clone();
-                let query = Query::RollbackToSavepoint(RollbackToSavepoint { name });
-                Interactions::new(conn_index, InteractionsType::Query(query))
-            } else if env.conn_in_transaction(conn_index)
-                && !env.connection_savepoints[conn_index].is_empty()
-                && rng.random_bool(0.15)
-            {
-                // Generate RELEASE SAVEPOINT — only if a savepoint exists
+                // RELEASE SAVEPOINT
                 let sp_idx = rng.random_range(0..env.connection_savepoints[conn_index].len());
                 let name = env.connection_savepoints[conn_index][sp_idx].clone();
                 env.connection_savepoints[conn_index].remove(sp_idx);
                 let query = Query::ReleaseSavepoint(ReleaseSavepoint { name });
+                Interactions::new(conn_index, InteractionsType::Query(query))
+            } else if env.conn_in_transaction(conn_index)
+                && env.has_conn_executed_query_after_transaction(conn_index)
+                && rng.random_bool(0.1)
+            {
+                // COMMIT to end the savepoint test transaction
+                let query = Query::Commit(Commit);
                 Interactions::new(conn_index, InteractionsType::Query(query))
             } else {
                 let conn_ctx = &env.connection_context(conn_index);

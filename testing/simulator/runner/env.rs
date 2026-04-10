@@ -131,6 +131,9 @@ pub struct Snapshot {
     operations: Vec<TxOperation>,
 
     transaction_mode: TransactionMode,
+    /// Stack of savepoint snapshots: each entry is (current_tables_clone, operations_length)
+    /// On ROLLBACK TO SAVEPOINT, we restore current_tables and truncate operations to the saved length.
+    savepoints: Vec<(Vec<Table>, usize)>,
 }
 
 impl Snapshot {
@@ -490,6 +493,7 @@ where
             current_tables: self.commited_tables.clone(),
             operations: Vec::new(),
             transaction_mode,
+            savepoints: Vec::new(),
         }));
     }
 
@@ -716,6 +720,33 @@ where
 
     pub fn delete_snapshot(&mut self) {
         *self.transaction_tables = None;
+    }
+
+    /// SAVEPOINT: push current state onto savepoint stack
+    pub fn push_savepoint(&mut self) {
+        if let Some(TransactionTables::Snapshot(snapshot)) = self.transaction_tables {
+            snapshot.savepoints.push((
+                snapshot.current_tables.clone(),
+                snapshot.operations.len(),
+            ));
+        }
+    }
+
+    /// RELEASE SAVEPOINT: pop the savepoint stack (merge changes into parent)
+    pub fn release_savepoint(&mut self) {
+        if let Some(TransactionTables::Snapshot(snapshot)) = self.transaction_tables {
+            snapshot.savepoints.pop();
+        }
+    }
+
+    /// ROLLBACK TO SAVEPOINT: restore tables and truncate operations to the savepoint
+    pub fn rollback_to_savepoint(&mut self) {
+        if let Some(TransactionTables::Snapshot(snapshot)) = self.transaction_tables {
+            if let Some((tables, ops_len)) = snapshot.savepoints.pop() {
+                snapshot.current_tables = tables;
+                snapshot.operations.truncate(ops_len);
+            }
+        }
     }
 }
 
