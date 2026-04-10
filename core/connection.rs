@@ -2190,20 +2190,25 @@ impl Connection {
         pagers
     }
 
-    /// Get all non-main database (index, pager) pairs (temp + attached).
-    pub(crate) fn get_all_attached_pagers_with_index(&self) -> Vec<(usize, Arc<Pager>)> {
-        let mut pagers = Vec::new();
+    /// Invoke `f` with a slice of all non-main database (index, pager) pairs
+    /// (temp + attached).The internal locks are released before `f` runs, which also
+    /// makes it safe for `f` to call back into the connection (e.g. `mv_store_for_db`,
+    /// which re-reads the attached-database catalog).
+    pub(crate) fn with_all_attached_pagers_with_index<F, R>(&self, f: F) -> R
+    where
+        F: FnOnce(&[(usize, Arc<Pager>)]) -> R,
+    {
+        let mut pagers: SmallVec<[(usize, Arc<Pager>); 8]> = SmallVec::new();
         if let Some(temp_db) = self.temp_database.read().as_ref() {
             pagers.push((crate::TEMP_DB_ID, temp_db.pager.clone()));
         }
-        let catalog = self.attached_databases.read();
-        pagers.extend(
-            catalog
-                .index_to_data
-                .iter()
-                .map(|(&idx, (_db, pager))| (idx, pager.clone())),
-        );
-        pagers
+        {
+            let catalog = self.attached_databases.read();
+            for (&idx, (_db, pager)) in catalog.index_to_data.iter() {
+                pagers.push((idx, pager.clone()));
+            }
+        }
+        f(&pagers)
     }
 
     pub(crate) fn database_schemas(&self) -> &RwLock<HashMap<usize, Arc<Schema>>> {
@@ -2680,23 +2685,30 @@ impl Connection {
     /// their connection-local schema caches.  MVCC-enabled attached databases
     /// are skipped — those are handled by `rollback_attached_mvcc_txs`.
     pub(crate) fn rollback_attached_wal_txns(&self) {
-        let attached_pagers = self.get_all_attached_pagers_with_index();
-        // Collect WAL-mode db_ids first, then batch the schema removal under
-        // a single write lock to avoid per-iteration lock contention.
-        let wal_pagers: SmallVec<[(usize, Arc<Pager>); 4]> = attached_pagers
-            .into_iter()
-            .filter(|(db_id, _)| self.mv_store_for_db(*db_id).is_none())
-            .collect();
-        if !wal_pagers.is_empty() {
-            let mut schemas = self.database_schemas().write();
-            for (db_id, _) in &wal_pagers {
-                schemas.remove(db_id);
+        self.with_all_attached_pagers_with_index(|pagers| {
+            // Record indices of WAL-mode entries so we can batch the schema
+            // removal under a single write lock and avoid calling
+            // `mv_store_for_db` more than once per entry.
+            let mut wal_indices: SmallVec<[usize; 4]> = SmallVec::new();
+            for (i, (db_id, _)) in pagers.iter().enumerate() {
+                if self.mv_store_for_db(*db_id).is_none() {
+                    wal_indices.push(i);
+                }
+            }
+            if wal_indices.is_empty() {
+                return;
+            }
+            {
+                let mut schemas = self.database_schemas().write();
+                for &i in &wal_indices {
+                    schemas.remove(&pagers[i].0);
+                }
             }
             self.bump_prepare_context_generation();
-        }
-        for (_, attached_pager) in &wal_pagers {
-            attached_pager.rollback_attached();
-        }
+            for &i in &wal_indices {
+                pagers[i].1.rollback_attached();
+            }
+        });
     }
 
     pub(crate) fn with_named_savepoints<F, T>(&self, f: F) -> T
