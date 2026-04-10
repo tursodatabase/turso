@@ -2573,22 +2573,22 @@ pub fn translate_expr(
                                 if let Ok(probability) = value.parse::<f64>() {
                                     if !(0.0..=1.0).contains(&probability) {
                                         crate::bail_parse_error!(
-                                            "second argument of likelihood() must be between 0.0 and 1.0",
+                                            "second argument to likelihood() must be a constant between 0.0 and 1.0",
                                         );
                                     }
                                     if !value.contains('.') {
                                         crate::bail_parse_error!(
-                                            "second argument of likelihood() must be a floating point number with decimal point",
+                                            "second argument to likelihood() must be a floating point number with decimal point",
                                         );
                                     }
                                 } else {
                                     crate::bail_parse_error!(
-                                        "second argument of likelihood() must be a floating point constant",
+                                        "second argument to likelihood() must be a floating point constant",
                                     );
                                 }
                             } else {
                                 crate::bail_parse_error!(
-                                    "second argument of likelihood() must be a numeric literal",
+                                    "second argument to likelihood() must be a constant between 0.0 and 1.0",
                                 );
                             }
                             translate_expr(
