@@ -209,6 +209,10 @@ impl<'a> Resolver<'a> {
         self.schema
     }
 
+    pub fn has_temp_database(&self) -> bool {
+        self.temp_database.read().is_some()
+    }
+
     pub fn fork(&self) -> Resolver<'a> {
         Resolver {
             schema: self.schema,
