@@ -892,29 +892,29 @@ fn emit_update_insns<'a>(
         constraint_rowid_alias_conflict.unwrap_or(ResolveType::Abort)
     };
 
-    let not_exists_check_required =
-        updates_rowid || iteration_cursor_id != target_table_cursor_id;
-
-    // Check early whether BEFORE UPDATE triggers exist, so we can defer NOT NULL
-    // constraint checks until after the triggers fire (matching SQLite behavior).
+    let not_exists_check_required = updates_rowid || iteration_cursor_id != target_table_cursor_id;
     let update_database_id = target_table.database_id;
-    let has_before_update_triggers = if let Some(btree_table) = target_table.table.btree() {
-        let updated_column_indices: HashSet<usize> =
-            set_clauses.iter().map(|(col_idx, _)| *col_idx).collect();
-        t_ctx.resolver.with_schema(update_database_id, |s| {
-            get_relevant_triggers_type_and_time(
-                s,
-                TriggerEvent::Update,
-                TriggerTime::Before,
-                Some(updated_column_indices),
-                &btree_table,
-            )
-            .next()
-            .is_some()
+
+    // If BEFORE UPDATE triggers exist, we need to defer NOT NULL constraint checks until after the
+    // triggers fire (matching SQLite behavior).
+    let has_before_update_triggers = target_table
+        .table
+        .btree()
+        .and_then(|btree_table| {
+            let updated_column_indices: HashSet<usize> =
+                set_clauses.iter().map(|(col_idx, _)| *col_idx).collect();
+            t_ctx.resolver.with_schema(update_database_id, |s| {
+                get_relevant_triggers_type_and_time(
+                    s,
+                    TriggerEvent::Update,
+                    TriggerTime::Before,
+                    Some(updated_column_indices),
+                    &btree_table,
+                )
+                .next()
+            })
         })
-    } else {
-        false
-    };
+        .is_some();
 
     let check_rowid_not_exists_label = if not_exists_check_required || has_before_update_triggers {
         Some(program.allocate_label())
