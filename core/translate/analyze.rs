@@ -372,7 +372,6 @@ pub fn translate_analyze(
         let emit_table_stat =
             !is_specific_index_target && !indexes.iter().any(|index| index.where_clause.is_none());
         if emit_table_stat {
-            let rowid_reg = program.alloc_register();
             let indexname_reg = program.alloc_register();
             let stat_text_reg = program.alloc_register();
             let record_reg = program.alloc_register();
@@ -409,6 +408,7 @@ pub fn translate_analyze(
                 index_name: None,
                 affinity_str: None,
             });
+            let rowid_reg = program.alloc_register();
             program.emit_insn(Insn::NewRowid {
                 cursor: stat_cursor,
                 rowid_reg,
