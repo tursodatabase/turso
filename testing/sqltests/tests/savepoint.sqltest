@@ -270,3 +270,41 @@ test savepoint-not-reusable-after-transaction-boundary {
 expect error {
     no such savepoint
 }
+
+@cross-check-integrity
+test deferred-fk-update-parent-pk-in-savepoint-rejects-commit {
+    PRAGMA foreign_keys = ON;
+    CREATE TABLE p (id INTEGER PRIMARY KEY, tag TEXT);
+    CREATE TABLE c (id INTEGER PRIMARY KEY, pid INT, note TEXT, FOREIGN KEY(pid) REFERENCES p(id) DEFERRABLE INITIALLY DEFERRED);
+    INSERT INTO p VALUES (24, 'tag24');
+    INSERT INTO c VALUES (1, 24, 'c1');
+    INSERT INTO c VALUES (2, 24, 'c2');
+    BEGIN;
+    SAVEPOINT sp0;
+    UPDATE p SET id = 4 WHERE id = 24;
+    RELEASE sp0;
+    COMMIT;
+}
+expect error {
+    deferred foreign key constraint failed
+}
+
+@cross-check-integrity
+test deferred-fk-update-parent-pk-rollback-restores-state {
+    PRAGMA foreign_keys = ON;
+    CREATE TABLE p (id INTEGER PRIMARY KEY, tag TEXT);
+    CREATE TABLE c (id INTEGER PRIMARY KEY, pid INT, note TEXT, FOREIGN KEY(pid) REFERENCES p(id) DEFERRABLE INITIALLY DEFERRED);
+    INSERT INTO p VALUES (1, 'a');
+    INSERT INTO c VALUES (10, 1, 'child');
+    BEGIN;
+    SAVEPOINT sp0;
+    UPDATE p SET id = 99 WHERE id = 1;
+    ROLLBACK TO sp0;
+    SELECT * FROM p;
+    SELECT * FROM c;
+    COMMIT;
+}
+expect {
+    1|a
+    10|1|child
+}
