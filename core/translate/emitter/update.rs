@@ -898,7 +898,7 @@ fn emit_update_insns<'a>(
     // Check early whether BEFORE UPDATE triggers exist, so we can defer NOT NULL
     // constraint checks until after the triggers fire (matching SQLite behavior).
     let update_database_id = target_table.database_id;
-    let has_before_triggers_early = if let Some(btree_table) = target_table.table.btree() {
+    let has_before_update_triggers = if let Some(btree_table) = target_table.table.btree() {
         let updated_column_indices: HashSet<usize> =
             set_clauses.iter().map(|(col_idx, _)| *col_idx).collect();
         t_ctx.resolver.with_schema(update_database_id, |s| {
@@ -916,7 +916,7 @@ fn emit_update_insns<'a>(
         false
     };
 
-    let check_rowid_not_exists_label = if not_exists_check_required || has_before_triggers_early {
+    let check_rowid_not_exists_label = if not_exists_check_required || has_before_update_triggers {
         Some(program.allocate_label())
     } else {
         None
@@ -1011,7 +1011,7 @@ fn emit_update_insns<'a>(
         t_ctx,
         skip_set_clauses,
         skip_row_label,
-        has_before_triggers_early,
+        has_before_update_triggers,
         &layout,
     )?;
 
