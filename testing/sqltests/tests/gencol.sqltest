@@ -1246,6 +1246,15 @@ expect {
     1|9|90
 }
 
+test gencol_insert_or_replace_not_null_no_default {
+    CREATE TABLE t(a, b AS (a) NOT NULL);
+    INSERT INTO t VALUES (1);
+    UPDATE OR REPLACE t SET a = null;
+}
+expect error {
+    NOT NULL constraint failed: t.b
+}
+
 test gencol_insert_or_ignore {
     CREATE TABLE t1(a INTEGER PRIMARY KEY, b INTEGER, c AS (b + 100));
     INSERT INTO t1(a, b) VALUES(1, 5);
@@ -4208,4 +4217,85 @@ test fk-child-references-parent-virtual-col-using-rowid-missing {
     INSERT INTO child VALUES(1, 99);
 }
 expect error {
+}
+
+test update-virtual-not-null {
+    CREATE TABLE t(a, b AS (a) NOT NULL);
+    INSERT INTO t VALUES (1);
+    UPDATE t SET a = null;
+}
+expect error {
+    NOT NULL constraint failed: t.b
+}
+
+test update-virtual-not-null-transitive {
+    CREATE TABLE t(a, b AS (a), c as (b) NOT NULL);
+    INSERT INTO t VALUES (1);
+    UPDATE t SET a = null;
+}
+expect error {
+    NOT NULL constraint failed: t.c
+}
+
+# Deferred NOT NULL: BEFORE UPDATE trigger fires before the NOT NULL check on
+# a virtual column, so RAISE(IGNORE) silently skips the update and the row is
+# left intact. If the NOT NULL check ran first, this would error out with
+# "NOT NULL constraint failed: t.b".
+@requires trigger "needs triggers"
+test update-virtual-not-null-deferred-trigger-ignore {
+    CREATE TABLE t(a, b AS (a) NOT NULL);
+    INSERT INTO t VALUES (1);
+    CREATE TRIGGER trg BEFORE UPDATE ON t WHEN NEW.a IS NULL BEGIN
+        SELECT RAISE(IGNORE);
+    END;
+    UPDATE t SET a = null;
+    SELECT a, b FROM t;
+}
+expect {
+    1|1
+}
+
+# Same deferred-ordering check for a transitively-computed virtual column.
+@requires trigger "needs triggers"
+test update-virtual-not-null-transitive-deferred-trigger-ignore {
+    CREATE TABLE t(a, b AS (a), c AS (b) NOT NULL);
+    INSERT INTO t VALUES (1);
+    CREATE TRIGGER trg BEFORE UPDATE ON t WHEN NEW.a IS NULL BEGIN
+        SELECT RAISE(IGNORE);
+    END;
+    UPDATE t SET a = null;
+    SELECT a, b, c FROM t;
+}
+expect {
+    1|1|1
+}
+
+# Deferred NOT NULL: BEFORE UPDATE trigger raises a custom abort error, which
+# must surface instead of the NOT NULL constraint error — proving the trigger
+# ran before the deferred check.
+@requires trigger "needs triggers"
+test update-virtual-not-null-deferred-trigger-abort {
+    CREATE TABLE t(a, b AS (a) NOT NULL);
+    INSERT INTO t VALUES (1);
+    CREATE TRIGGER trg BEFORE UPDATE ON t WHEN NEW.a IS NULL BEGIN
+        SELECT RAISE(ABORT, 'trigger rejects null');
+    END;
+    UPDATE t SET a = null;
+}
+expect error {
+    trigger rejects null
+}
+
+# Same deferred-ordering check for a transitively-computed virtual column.
+@requires trigger "needs triggers"
+test update-virtual-not-null-transitive-deferred-trigger-abort {
+    CREATE TABLE t(a, b AS (a), c AS (b) NOT NULL);
+    INSERT INTO t VALUES (1);
+    CREATE TRIGGER trg BEFORE UPDATE ON t WHEN NEW.a IS NULL BEGIN
+        SELECT RAISE(ABORT, 'trigger rejects null');
+    END;
+    UPDATE t SET a = null;
+}
+expect error {
+    trigger rejects null
 }

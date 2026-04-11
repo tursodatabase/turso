@@ -3016,6 +3016,8 @@ pub fn translate_expr(
                         }
                     }
                     None => {
+                        // This error means that a program.with_self_table_context() was missing
+                        // somewhere in the call stack.
                         crate::bail_parse_error!(
                             "SELF_TABLE column reference outside of generated column context"
                         );

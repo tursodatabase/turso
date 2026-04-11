@@ -2687,6 +2687,8 @@ pub fn collect_column_dependencies_of_expr(expr: &Expr, columns: &[Column]) -> H
     refs
 }
 
+//TODO this computation be replaced with a table-level cache of column->dependencies, and then
+// columns_affected_by_update could just do a union of the dependencies of all columns.
 pub(crate) fn columns_affected_by_update(
     columns: &[Column],
     updated_cols: &HashSet<usize>,
