@@ -785,6 +785,7 @@ impl InPlaceJsonPath {
 
                 digit_count + bracket_count
             }
+            PathElement::BracketQuotedKey(key) => key.len() + 4, // ["..."]
         }
     }
 
