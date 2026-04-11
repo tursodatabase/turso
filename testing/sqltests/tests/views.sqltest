@@ -1,5 +1,22 @@
 @database :memory:
 
+@requires trigger "uses triggers"
+@skip-if mvcc "views not supported in MVCC mode"
+@cross-check-integrity
+test view-create-does-not-duplicate-same-named-trigger {
+    CREATE TABLE t(x INTEGER);
+    CREATE TABLE log(v INTEGER);
+    CREATE TRIGGER dup AFTER INSERT ON t BEGIN
+        INSERT INTO log VALUES (NEW.x);
+    END;
+    CREATE VIEW dup AS SELECT x FROM t;
+    INSERT INTO t VALUES (1);
+    SELECT count(*), group_concat(v, ',') FROM log;
+}
+expect {
+    1|1
+}
+
 @cross-check-integrity
 test view-basic-filtering {
     CREATE TABLE products(id INTEGER, name TEXT, price INTEGER, category TEXT);

@@ -1,4 +1,5 @@
 use crate::common::{do_flush, ExecRows, TempDatabase};
+use rusqlite::Connection as SqliteConnection;
 
 #[turso_macros::test(mvcc)]
 fn test_create_trigger(db: TempDatabase) {
@@ -119,6 +120,46 @@ fn test_trigger_drop_table_drops_triggers(db: TempDatabase) {
     let results: Vec<(String,)> =
         conn.exec_rows("SELECT name FROM sqlite_schema WHERE type='trigger' AND name='t1'");
     assert_eq!(results.len(), 0);
+}
+
+#[turso_macros::test]
+fn test_create_view_does_not_duplicate_same_named_trigger(
+    tmp_db: TempDatabase,
+) -> anyhow::Result<()> {
+    drop(tmp_db);
+    let limbo_db = TempDatabase::builder()
+        .with_db_name("view_trigger_same_name.db")
+        .build();
+    let limbo_conn = limbo_db.connect_limbo();
+    let sqlite_conn = SqliteConnection::open_in_memory()?;
+
+    for stmt in [
+        "CREATE TABLE t(x INTEGER)",
+        "CREATE TABLE log(v INTEGER)",
+        "CREATE TRIGGER dup AFTER INSERT ON t BEGIN INSERT INTO log VALUES (NEW.x); END",
+        "CREATE VIEW dup AS SELECT x FROM t",
+    ] {
+        limbo_conn.execute(stmt)?;
+        sqlite_conn.execute_batch(stmt)?;
+    }
+
+    limbo_conn.execute("INSERT INTO t VALUES (1)")?;
+    sqlite_conn.execute_batch("INSERT INTO t VALUES (1)")?;
+
+    let limbo_rows: Vec<(i64, String)> =
+        limbo_conn.exec_rows("SELECT count(*), group_concat(v, ',') FROM log");
+    let sqlite_rows: Vec<(i64, String)> = sqlite_conn
+        .prepare("SELECT count(*), group_concat(v, ',') FROM log")?
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    assert_eq!(limbo_rows, sqlite_rows);
+
+    drop(limbo_conn);
+    let reopened = limbo_db.connect_limbo();
+    let reopened_rows: Vec<(i64, String)> =
+        reopened.exec_rows("SELECT count(*), group_concat(v, ',') FROM log");
+    assert_eq!(reopened_rows, vec![(1, "1".to_string())]);
+    Ok(())
 }
 
 #[turso_macros::test(mvcc)]
