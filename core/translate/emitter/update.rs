@@ -2174,11 +2174,11 @@ fn emit_update_insns<'a>(
             // If Phase 1 REPLACE deleted a parent row referenced by deferred FK children,
             // the counter was incremented. Now that the new row is inserted with the
             // (potentially same) parent key, scan children and decrement.
-            // Only needed for REPLACE conflict resolution — emit_fk_update_parent_actions
-            // already handles the increment/decrement for normal UPDATE.
-            if connection.foreign_keys_enabled()
-                && matches!(effective_rowid_alias_conflict, ResolveType::Replace)
-            {
+            // Only needed when REPLACE conflict resolution fired — either via
+            // rowid alias (PRIMARY KEY) or a UNIQUE index with ON CONFLICT REPLACE.
+            let has_replace_conflict = matches!(effective_rowid_alias_conflict, ResolveType::Replace)
+                || indexes_to_update.iter().any(|idx| idx.on_conflict == Some(ResolveType::Replace));
+            if connection.foreign_keys_enabled() && has_replace_conflict {
                 emit_fk_parent_new_key_reconcile(
                     program,
                     table,
