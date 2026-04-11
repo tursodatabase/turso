@@ -112,7 +112,7 @@ fn test_vacuum_into_error_cases(tmp_db: TempDatabase) -> anyhow::Result<()> {
     let result = conn.execute("VACUUM");
     assert!(result.is_err(), "Plain VACUUM should fail");
 
-    // 2. VACUUM INTO existing file should fail
+    // 2. VACUUM INTO existing non-empty file should fail
     let existing_path = dest_dir.path().join("existing.db");
     std::fs::write(&existing_path, b"existing content")?;
     let result = conn.execute(format!("VACUUM INTO '{}'", existing_path.to_str().unwrap()));
@@ -121,6 +121,16 @@ fn test_vacuum_into_error_cases(tmp_db: TempDatabase) -> anyhow::Result<()> {
     assert!(
         err_msg.contains("already exists") || err_msg.contains("output file"),
         "Error should mention file exists, got: {err_msg}"
+    );
+
+    // 2b. VACUUM INTO an existing but empty file should succeed
+    let empty_path = dest_dir.path().join("empty.db");
+    std::fs::write(&empty_path, b"")?;
+    assert!(empty_path.exists() && std::fs::metadata(&empty_path)?.len() == 0);
+    conn.execute(format!("VACUUM INTO '{}'", empty_path.to_str().unwrap()))?;
+    assert!(
+        std::fs::metadata(&empty_path)?.len() > 0,
+        "Destination should be populated after VACUUM INTO"
     );
 
     // 3. VACUUM INTO within transaction should fail
