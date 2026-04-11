@@ -1,0 +1,23 @@
+@database :memory:
+
+test left-join-null-index-bug {
+    CREATE TABLE a(id INTEGER PRIMARY KEY);
+    CREATE TABLE b(id INTEGER PRIMARY KEY, a_id INTEGER);
+    CREATE TABLE c(id INTEGER PRIMARY KEY, b_id INTEGER);
+
+    INSERT INTO a VALUES (1),(2);
+    INSERT INTO b VALUES (1,1);
+    INSERT INTO c VALUES (1,NULL);
+
+    CREATE INDEX idx_c_bid ON c(b_id);
+
+    SELECT a.id, b.id AS bid, c.id AS cid 
+    FROM a 
+    LEFT JOIN b ON a.id = b.a_id 
+    LEFT JOIN c ON b.id = c.b_id 
+    ORDER BY a.id;
+}
+expect {
+1|1|
+2||
+}

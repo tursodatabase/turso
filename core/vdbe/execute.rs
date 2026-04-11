@@ -4322,6 +4322,27 @@ pub fn op_seek(
         target_pc.is_offset(),
         "op_seek: target_pc should be an offset, is: {target_pc:?}"
     );
+    let is_eq_only = match insn {
+        Insn::SeekGE { eq_only, .. } => *eq_only,
+        Insn::SeekLE { eq_only, .. } => *eq_only,
+        _ => false,
+    };
+
+    if is_eq_only {
+        // We only care about Unpacked record sources for this short-circuit
+        if let RecordSource::Unpacked { start_reg, .. } = record_source {
+            // Check only the primary register (no need for a loop 'i' here)
+            if state.registers[start_reg].is_null() {
+                let offset = match target_pc {
+                    crate::vdbe::BranchOffset::Offset(o) => *o,
+                    _ => unreachable!("Seek target must be an offset"),
+                };
+                state.pc = offset;
+                return Ok(InsnFunctionStepResult::Step);
+            }
+        }
+    }
+
     let op = match insn {
         Insn::SeekGE { eq_only, .. } => SeekOp::GE { eq_only: *eq_only },
         Insn::SeekGT { .. } => SeekOp::GT,
