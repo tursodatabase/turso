@@ -939,9 +939,10 @@ pub fn translate_drop_index(
             )));
         }
     }
-    // Return an error if the index is associated with a unique or primary key constraint.
+    // Return an error if the index is an auto-generated constraint-backing index.
+    // User-created UNIQUE indexes (via CREATE UNIQUE INDEX) are allowed to be dropped.
     if let Some(ref idx) = maybe_index {
-        if idx.unique {
+        if idx.name.starts_with("sqlite_autoindex_") {
             return Err(crate::error::LimboError::InvalidArgument(
                 "index associated with UNIQUE or PRIMARY KEY constraint cannot be dropped"
                     .to_string(),
