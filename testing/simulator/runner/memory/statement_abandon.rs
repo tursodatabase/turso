@@ -276,41 +276,27 @@ fn sim_reset_releases_subjournal_when_abort_called_without_error() -> Result<()>
 /// mode and usable for new writes.
 #[test]
 fn sim_vacuum_into_cleans_up_source_transaction() -> Result<()> {
-    let io = Arc::new(MemorySimIO::new(
-        7, 4096, 100, // Always schedule operations asynchronously.
-        1, 5,
-    ));
-    let path = "sim_vacuum_into_cleanup_7.db".to_string();
-    let db = Database::open_file_with_flags(
-        io.clone() as Arc<dyn IO>,
-        &path,
-        OpenFlags::default(),
-        DatabaseOpts::new(),
-        None,
-    )?;
-    let conn = db.connect()?;
+    let (conn, io) = make_conn(7)?;
 
     conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)")?;
     for i in 0..20 {
         conn.execute(format!("INSERT INTO t VALUES ({i}, 'row_{i}')"))?;
     }
 
-    let dest_path =
-        std::env::temp_dir().join(format!("sim_vacuum_cleanup_dest_{}.db", std::process::id()));
-    let dest_path = dest_path.to_str().expect("temp dir should be valid UTF-8");
-    let _ = std::fs::remove_file(dest_path);
+    let dest_dir = tempfile::TempDir::new()?;
+    let dest_path = dest_dir.path().join("vacuumed.db");
+    let dest_path_str = dest_path.to_str().expect("temp dir should be valid UTF-8");
 
     assert!(
         conn.get_auto_commit(),
         "should be in auto-commit before VACUUM INTO"
     );
 
-    let mut stmt = conn.prepare(format!("VACUUM INTO '{dest_path}'"))?;
+    let mut stmt = conn.prepare(format!("VACUUM INTO '{dest_path_str}'"))?;
     loop {
         match stmt.step()? {
             StepResult::IO => io.step()?,
             StepResult::Done => break,
-            StepResult::Row => continue,
             other => panic!("unexpected step result: {other:?}"),
         }
     }
@@ -329,10 +315,5 @@ fn sim_vacuum_into_cleans_up_source_transaction() -> Result<()> {
         count, 21,
         "should have 20 original rows + 1 new row after vacuum"
     );
-
-    let _ = std::fs::remove_file(dest_path);
-    let _ = std::fs::remove_file(format!("{dest_path}-wal"));
-    let _ = std::fs::remove_file(format!("{dest_path}-shm"));
-
     Ok(())
 }

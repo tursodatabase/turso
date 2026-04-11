@@ -13931,9 +13931,7 @@ fn op_vacuum_into_inner(
                     .with_views(source_db.experimental_views_enabled())
                     .with_index_method(source_db.experimental_index_method_enabled())
                     .with_custom_types(source_db.experimental_custom_types_enabled())
-                    .with_generated_columns(source_db.experimental_generated_columns_enabled())
-                    .with_autovacuum(source_db.autovacuum_enabled())
-                    .with_attach(source_db.experimental_attach_enabled());
+                    .with_generated_columns(source_db.experimental_generated_columns_enabled());
 
                 // Always use PlatformIO for the destination file, even if source
                 // is in-memory. This ensures VACUUM INTO writes to disk.
@@ -14181,21 +14179,25 @@ fn op_vacuum_into_inner(
                 let entry = &vacuum_state.schema_entries[entry_ordinal];
                 let table_name = &entry.name;
 
-                // sqlite_sequence: only copy data if destination materialized it
-                // (i.e., an AUTOINCREMENT table was created that triggered its creation).
+                // sqlite_sequence: skip data copy — inserting rows with explicit
+                // rowids into AUTOINCREMENT tables already updates sqlite_sequence
+                // on the destination as a side effect. Just verify the destination
+                // has the table (it should, since the AUTOINCREMENT table CREATE
+                // auto-creates it).
                 if entry.is_sqlite_sequence() {
-                    let dest_has_sequence = dest_conn
-                        .schema
-                        .read()
-                        .get_btree_table("sqlite_sequence")
-                        .is_some();
-                    if !dest_has_sequence {
-                        vacuum_state.sub_state = OpVacuumIntoSubState::StartCopyTable {
-                            dest_conn,
-                            table_idx: table_idx + 1,
-                        };
-                        continue;
-                    }
+                    turso_assert!(
+                        dest_conn
+                            .schema
+                            .read()
+                            .get_btree_table(crate::schema::SQLITE_SEQUENCE_TABLE_NAME)
+                            .is_some(),
+                        "destination should have sqlite_sequence after creating AUTOINCREMENT tables"
+                    );
+                    vacuum_state.sub_state = OpVacuumIntoSubState::StartCopyTable {
+                        dest_conn,
+                        table_idx: table_idx + 1,
+                    };
+                    continue;
                 }
 
                 let escaped_table_name = table_name.replace('"', "\"\"");

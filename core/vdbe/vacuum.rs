@@ -1,15 +1,9 @@
-//! Shared vacuum temp-build types and helpers.
-//!
-//! This module contains the reusable types for the vacuum temp-build pipeline
-//! shared between `VACUUM INTO` and plain `VACUUM`. The actual opcode
-//! implementations live in `execute.rs` and delegate to these types for
-//! schema classification and phase ordering.
+use turso_macros::turso_assert;
 
 /// A typed representation of a row from `sqlite_schema`.
 ///
 /// Carries `rootpage` so we can distinguish storage-backed tables/indexes
 /// (rootpage != 0) from virtual tables, views, and triggers (rootpage = 0)
-/// without relying on name-prefix heuristics.
 #[derive(Debug, Clone)]
 pub(crate) struct SchemaEntry {
     pub entry_type: SchemaEntryType,
@@ -64,27 +58,14 @@ impl SchemaEntry {
         self.rootpage != 0
     }
 
-    /// Whether this is `sqlite_sequence` (needs special ordering care).
     pub fn is_sqlite_sequence(&self) -> bool {
         self.name == "sqlite_sequence"
     }
 }
 
-/// Classify schema entries into ordered replay phases for the temp-build
-/// pipeline. Returns `(tables_to_create, tables_to_copy, indexes_to_create,
+/// Classify schema entries, in a specific order required, for vacuum op.
+/// Returns `(tables_to_create, tables_to_copy, indexes_to_create,
 /// post_data_entries)`.
-///
-/// Phase ordering:
-/// 1. Create storage-backed tables (rootpage != 0, type=table), excluding
-///    `sqlite_sequence` (auto-created by AUTOINCREMENT table creation)
-/// 2. Copy table data for all storage-backed tables (including sqlite_sequence
-///    if destination materialized it, and including sqlite_stat1 etc.)
-/// 3. Create user-defined secondary indexes (type=index, rootpage != 0,
-///    sql IS NOT NULL — autoindexes are created implicitly by CREATE TABLE)
-/// 4. Replay views, triggers, and rootpage=0 schema objects
-///
-/// Within each phase, entries preserve their original `sqlite_schema` rowid
-/// order.
 pub(crate) fn classify_schema_entries(
     entries: &[SchemaEntry],
 ) -> (
@@ -110,13 +91,11 @@ pub(crate) fn classify_schema_entries(
                 // (which auto-creates sqlite_sequence), then later try to run
                 // "CREATE TABLE sqlite_sequence(name,seq)", it fails with
                 // "table already exists".
-                // We still copy sqlite_sequence data in the copy phase to
-                // preserve AUTOINCREMENT counters.
                 if !entry.is_sqlite_sequence() {
                     tables_to_create.push(entry);
                 }
-                // All storage-backed tables get their data copied in phase 2,
-                // including sqlite_stat1 and other internal storage-backed tables.
+                // All storage-backed tables get their data copied including sqlite_stat1 and
+                // other internal storage-backed tables.
                 // sqlite_sequence data copy is handled specially by the caller
                 // (only if destination materialized it).
                 tables_to_copy.push(entry);
@@ -132,11 +111,19 @@ pub(crate) fn classify_schema_entries(
                 // triggers firing during the copy phase.
                 post_data_entries.push(entry);
             }
-            _ => {
-                // rootpage=0 tables (virtual tables) and rootpage=0 indexes
-                // (autoindexes — but these have sql=NULL and are already
-                // filtered out by the schema query). Treat remaining
-                // rootpage=0 entries as post-data.
+            SchemaEntryType::Table => {
+                // Virtual tables (rootpage=0, type=table) land here.
+                // Replayed after data copy alongside triggers and views.
+                turso_assert!(
+                    !entry.is_storage_backed(),
+                    "unexpected storage-backed table with rootpage=0: {entry.name}"
+                );
+                post_data_entries.push(entry);
+            }
+            SchemaEntryType::Index => {
+                // Custom index-method indexes (FTS, vector, etc.) have rootpage=0
+                // because their storage is managed by the index method, not a
+                // B-tree. Replayed after data copy.
                 post_data_entries.push(entry);
             }
         }
