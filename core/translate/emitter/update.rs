@@ -3,6 +3,7 @@ use super::TranslateCtx;
 use crate::schema::{columns_affected_by_update, ColumnLayout, GeneratedType, Table};
 use crate::translate::insert::halt_desc_and_on_error;
 use crate::translate::stmt_journal::any_effective_replace;
+use crate::vdbe::builder::SelfTableContext;
 use crate::{
     ast, emit_explain,
     error::{SQLITE_CONSTRAINT_PRIMARYKEY, SQLITE_CONSTRAINT_UNIQUE},
@@ -431,6 +432,7 @@ fn emit_update_column_values<'a>(
     target_table: &Arc<JoinedTable>,
     target_table_cursor_id: usize,
     start: usize,
+    rowid_reg: usize,
     col_len: usize,
     table_name: &str,
     has_direct_rowid_update: bool,
@@ -463,12 +465,35 @@ fn emit_update_column_values<'a>(
             }
         }
     }
-    for (idx, table_column) in target_table.table.columns().iter().enumerate() {
+    let target_table_columns = target_table.table.columns();
+    let affected_columns = columns_affected_by_update(
+        target_table_columns,
+        &set_clauses.iter().map(|(idx, _)| *idx).collect(),
+    );
+
+    for (idx, table_column) in target_table_columns.iter().enumerate() {
         let target_reg = layout.to_register(start, idx);
-        if let Some((col_idx, expr)) = set_clauses.iter().find(|(i, _)| *i == idx) {
+
+        // If the column needs to be updated, retrieve its column index, or its expression.
+        // Such a column can be directly updated, in which case `expr` is the right-side of the SET
+        // clause, or it can be an indirectly updated generated columns, in which case `expr` is the
+        // column's expression.
+        let update_expr = set_clauses
+            .iter()
+            .find(|(i, _)| *i == idx)
+            .map(|(_, expr)| expr.as_ref())
+            .or_else(|| {
+                affected_columns
+                    .get(&idx)
+                    .into_iter()
+                    .flat_map(|_| table_column.generated_expr())
+                    .next()
+            });
+
+        if let Some(expr) = update_expr {
             if !skip_set_clauses {
                 // Skip if this is the sentinel value
-                if *col_idx == ROWID_SENTINEL {
+                if idx == ROWID_SENTINEL {
                     continue;
                 }
                 if updates_rowid
@@ -490,109 +515,127 @@ fn emit_update_column_values<'a>(
 
                     program.emit_null(target_reg, None);
                 } else {
-                    // Columns with custom type encode must not have their
-                    // SET expressions hoisted as constants. See the doc
-                    // comment on NoConstantOptReason::CustomTypeEncode.
-                    let has_custom_encode = {
-                        let ty = &table_column.ty_str;
-                        !ty.is_empty()
-                            && t_ctx
-                                .resolver
-                                .schema
-                                .get_type_def_unchecked(ty)
-                                .is_some_and(|td| td.encode.is_some())
+                    let self_table_context = match table_column.generated_type() {
+                        GeneratedType::Virtual { .. } => {
+                            Some(SelfTableContext::ForDML(DmlColumnContext::layout(
+                                target_table.table.columns(),
+                                start,
+                                rowid_reg,
+                                layout.clone(),
+                            )))
+                        }
+                        GeneratedType::NotGenerated => None,
                     };
-                    if has_custom_encode {
-                        translate_expr_no_constant_opt(
-                            program,
-                            Some(table_references),
-                            expr,
-                            target_reg,
-                            &t_ctx.resolver,
-                            NoConstantOptReason::CustomTypeEncode,
-                        )?;
-                    } else {
-                        translate_expr(
-                            program,
-                            Some(table_references),
-                            expr,
-                            target_reg,
-                            &t_ctx.resolver,
-                        )?;
-                    }
-                    if table_column.notnull() && !skip_notnull_checks {
-                        let notnull_conflict = if program.has_statement_conflict {
-                            or_conflict
-                        } else {
-                            table_column
-                                .notnull_conflict_clause
-                                .unwrap_or(ResolveType::Abort)
-                        };
-                        match notnull_conflict {
-                            ResolveType::Ignore => {
-                                // For IGNORE, skip this row on NOT NULL violation
-                                program.emit_insn(Insn::IsNull {
-                                    reg: target_reg,
-                                    target_pc: skip_row_label,
-                                });
+
+                    program.with_self_table_context(
+                        self_table_context.as_ref(),
+                        |program, _| {
+                            // Columns with custom type encode must not have their
+                            // SET expressions hoisted as constants. See the doc
+                            // comment on NoConstantOptReason::CustomTypeEncode.
+                            let has_custom_encode = {
+                                let ty = &table_column.ty_str;
+                                !ty.is_empty()
+                                    && t_ctx
+                                        .resolver
+                                        .schema
+                                        .get_type_def_unchecked(ty)
+                                        .is_some_and(|td| td.encode.is_some())
+                            };
+                            if has_custom_encode {
+                                translate_expr_no_constant_opt(
+                                    program,
+                                    Some(table_references),
+                                    expr,
+                                    target_reg,
+                                    &t_ctx.resolver,
+                                    NoConstantOptReason::CustomTypeEncode,
+                                )?;
+                            } else {
+                                translate_expr(
+                                    program,
+                                    Some(table_references),
+                                    expr,
+                                    target_reg,
+                                    &t_ctx.resolver,
+                                )?;
                             }
-                            ResolveType::Replace => {
-                                // For REPLACE with NOT NULL, use default value if available
-                                if let Some(default_expr) = table_column.default.as_ref() {
-                                    let continue_label = program.allocate_label();
-
-                                    // If not null, skip to continue
-                                    program.emit_insn(Insn::NotNull {
-                                        reg: target_reg,
-                                        target_pc: continue_label,
-                                    });
-
-                                    // Value is null, use default.
-                                    translate_expr_no_constant_opt(
-                                        program,
-                                        Some(table_references),
-                                        default_expr,
-                                        target_reg,
-                                        &t_ctx.resolver,
-                                        NoConstantOptReason::RegisterReuse,
-                                    )?;
-
-                                    program.preassign_label_to_next_insn(continue_label);
+                            if table_column.notnull() && !skip_notnull_checks {
+                                let notnull_conflict = if program.has_statement_conflict {
+                                    or_conflict
                                 } else {
-                                    // No default value, fall through to ABORT behavior
-                                    use crate::error::SQLITE_CONSTRAINT_NOTNULL;
-                                    program.emit_insn(Insn::HaltIfNull {
-                                        target_reg,
-                                        err_code: SQLITE_CONSTRAINT_NOTNULL,
-                                        description: format!(
-                                            "{}.{}",
-                                            table_name,
-                                            table_column
-                                                .name
-                                                .as_ref()
-                                                .expect("Column name must be present")
-                                        ),
-                                    });
+                                    table_column
+                                        .notnull_conflict_clause
+                                        .unwrap_or(ResolveType::Abort)
+                                };
+                                match notnull_conflict {
+                                    ResolveType::Ignore => {
+                                        // For IGNORE, skip this row on NOT NULL violation
+                                        program.emit_insn(Insn::IsNull {
+                                            reg: target_reg,
+                                            target_pc: skip_row_label,
+                                        });
+                                    }
+                                    ResolveType::Replace => {
+                                        // For REPLACE with NOT NULL, use default value if available
+                                        if let Some(default_expr) = table_column.default.as_ref() {
+                                            let continue_label = program.allocate_label();
+
+                                            // If not null, skip to continue
+                                            program.emit_insn(Insn::NotNull {
+                                                reg: target_reg,
+                                                target_pc: continue_label,
+                                            });
+
+                                            // Value is null, use default.
+                                            translate_expr_no_constant_opt(
+                                                program,
+                                                Some(table_references),
+                                                default_expr,
+                                                target_reg,
+                                                &t_ctx.resolver,
+                                                NoConstantOptReason::RegisterReuse,
+                                            )?;
+
+                                            program.preassign_label_to_next_insn(continue_label);
+                                        } else {
+                                            // No default value, fall through to ABORT behavior
+                                            use crate::error::SQLITE_CONSTRAINT_NOTNULL;
+                                            program.emit_insn(Insn::HaltIfNull {
+                                                target_reg,
+                                                err_code: SQLITE_CONSTRAINT_NOTNULL,
+                                                description: format!(
+                                                    "{}.{}",
+                                                    table_name,
+                                                    table_column
+                                                        .name
+                                                        .as_ref()
+                                                        .expect("Column name must be present")
+                                                ),
+                                            });
+                                        }
+                                    }
+                                    _ => {
+                                        // Default ABORT behavior
+                                        use crate::error::SQLITE_CONSTRAINT_NOTNULL;
+                                        program.emit_insn(Insn::HaltIfNull {
+                                            target_reg,
+                                            err_code: SQLITE_CONSTRAINT_NOTNULL,
+                                            description: format!(
+                                                "{}.{}",
+                                                table_name,
+                                                table_column
+                                                    .name
+                                                    .as_ref()
+                                                    .expect("Column name must be present")
+                                            ),
+                                        });
+                                    }
                                 }
                             }
-                            _ => {
-                                // Default ABORT behavior
-                                use crate::error::SQLITE_CONSTRAINT_NOTNULL;
-                                program.emit_insn(Insn::HaltIfNull {
-                                    target_reg,
-                                    err_code: SQLITE_CONSTRAINT_NOTNULL,
-                                    description: format!(
-                                        "{}.{}",
-                                        table_name,
-                                        table_column
-                                            .name
-                                            .as_ref()
-                                            .expect("Column name must be present")
-                                    ),
-                                });
-                            }
-                        }
-                    }
+                            Ok(())
+                        },
+                    )?;
                 }
 
                 if let Some(cdc_updates_register) = cdc_updates_register {
@@ -1000,6 +1043,7 @@ fn emit_update_insns<'a>(
         &target_table,
         target_table_cursor_id,
         start,
+        beg,
         col_len,
         table_name,
         has_direct_rowid_update,
@@ -1217,6 +1261,7 @@ fn emit_update_insns<'a>(
             &target_table,
             target_table_cursor_id,
             start,
+            beg,
             col_len,
             table_name,
             has_direct_rowid_update,
