@@ -25,7 +25,7 @@ use crate::{bail_parse_error, CaptureDataChangesExt, LimboError, MAIN_DB_ID};
 use crate::{
     schema::{BTreeTable, Index, IndexColumn, PseudoCursorType},
     storage::pager::CreateBTreeFlags,
-    util::{escape_sql_string_literal, normalize_ident},
+    util::{escape_sql_string_literal, normalize_ident, PRIMARY_KEY_AUTOMATIC_INDEX_NAME_PREFIX},
     vdbe::{
         builder::{CursorType, ProgramBuilder},
         insn::{IdxInsertFlags, Insn, RegisterOrLiteral},
@@ -939,9 +939,13 @@ pub fn translate_drop_index(
             )));
         }
     }
-    // Return an error if the index is associated with a unique or primary key constraint.
+    // Return an error if the index is an auto-generated constraint-backing index.
+    // User-created UNIQUE indexes (via CREATE UNIQUE INDEX) are allowed to be dropped.
     if let Some(ref idx) = maybe_index {
-        if idx.name.starts_with("sqlite_autoindex_") {
+        if idx
+            .name
+            .starts_with(PRIMARY_KEY_AUTOMATIC_INDEX_NAME_PREFIX)
+        {
             return Err(crate::error::LimboError::InvalidArgument(
                 "index associated with UNIQUE or PRIMARY KEY constraint cannot be dropped"
                     .to_string(),
