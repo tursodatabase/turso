@@ -257,6 +257,7 @@ expect {
     0|-1|-1
 }
 
+@cross-check-integrity
 test temp-store-change-outside-transaction-resets-temp-schema {
     CREATE TEMP TABLE reset_me(v INTEGER);
     PRAGMA temp_store = MEMORY;

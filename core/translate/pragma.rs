@@ -733,6 +733,15 @@ fn update_pragma(
                     _ => bail_parse_error!("temp_store must be 0, 1, 2, DEFAULT, FILE, or MEMORY"),
                 })
             };
+            // SQLite allows changing temp_store even after temp objects
+            // exist: it closes the temp btree and drops everything
+            // (`sqlite3BtreeClose` + `sqlite3ResetAllSchemasOfConnection`
+            // in `pragma.c`). We mirror that: `set_temp_store` tears
+            // down and re-initializes the temp pager.
+            //
+            // Changing inside an explicit transaction (BEGIN … COMMIT)
+            // with active temp state is blocked because savepoint /
+            // rollback bookkeeping would be inconsistent.
             if !connection.get_auto_commit() && connection.temp.database.read().is_some() {
                 bail_parse_error!("temporary storage cannot be changed from within a transaction");
             }

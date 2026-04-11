@@ -255,10 +255,17 @@ impl Fuzzer {
         Ok(())
     }
 
-    /// Introspect and return the current schema from the Turso database.
+    /// Introspect and return the current schema from the Turso
+    /// database, including attached databases.
+    ///
+    /// Uses `from_turso_with_attached` so callers see the same view
+    /// the internal schema verification path (`introspect_and_verify_schemas`)
+    /// uses; otherwise the diff fuzzer's "my view of the schema" and
+    /// "the schema I run integrity checks against" could silently
+    /// diverge when attached databases are present.
     pub fn get_schema(&self) -> Result<sql_gen::Schema> {
-        SchemaIntrospector::from_turso(&self.turso_conn)
-            .context("Failed to introspect Turso schema")
+        SchemaIntrospector::from_turso_with_attached(&self.turso_conn)
+            .context("Failed to introspect Turso schema (with attached)")
     }
 
     /// Run the simulation.

@@ -1341,10 +1341,20 @@ pub fn translate_alter_table(
                     )));
                 }
                 if trigger_entry.database_id == crate::TEMP_DB_ID {
+                    // Pass the renamed database's NAME so the rewrite
+                    // only touches triggers whose `tbl_name.db_name`
+                    // actually points at the db we are renaming in
+                    // (or is unqualified). Otherwise a temp trigger
+                    // referencing `aux.t` would be wrongly rewritten
+                    // during `ALTER TABLE main.t RENAME TO ...`.
+                    let renamed_db_name = resolver
+                        .get_database_name_by_index(database_id)
+                        .unwrap_or_else(|| "main".to_string());
                     let new_sql = rewrite_trigger_sql_for_table_rename(
                         &trigger_entry.trigger.sql,
                         table_name,
                         new_name,
+                        &renamed_db_name,
                     )?;
                     if new_sql != trigger_entry.trigger.sql {
                         temp_triggers_to_rewrite
@@ -2161,10 +2171,21 @@ fn translate_rename_virtual_table(
 /* Triggers must be rewritten when a column is renamed, and DROP COLUMN on table T must be forbidden if any trigger on T references the column.
 Here are some helpers related to that: */
 
+/// Rewrite a trigger's SQL after the table it targets has been
+/// renamed.
+///
+/// `renamed_db_name` is the name of the database whose table is being
+/// renamed (e.g. `"main"` or an attached alias). It's used to make
+/// sure we only rewrite triggers that actually target *this*
+/// database's version of the table — previously we keyed only on the
+/// unqualified table name, which incorrectly rewrote e.g.
+/// `CREATE TEMP TRIGGER ... ON aux.t` during
+/// `ALTER TABLE main.t RENAME TO ...`.
 fn rewrite_trigger_sql_for_table_rename(
     trigger_sql: &str,
     old_table_name: &str,
     new_table_name: &str,
+    renamed_db_name: &str,
 ) -> Result<String> {
     let mut parser = Parser::new(trigger_sql.as_bytes());
     let cmd = parser
@@ -2187,15 +2208,29 @@ fn rewrite_trigger_sql_for_table_rename(
         )));
     };
 
-    let new_tbl_name = if tbl_name.name.as_str().eq_ignore_ascii_case(old_table_name) {
-        ast::QualifiedName {
-            db_name: tbl_name.db_name,
-            name: ast::Name::exact(new_table_name.to_string()),
-            alias: None,
-        }
-    } else {
-        tbl_name
+    // Only rewrite when this trigger's `tbl_name` actually targets the
+    // renamed database. An explicit qualifier that points elsewhere
+    // (e.g. `ON aux.t`) must be left alone. An absent qualifier is
+    // ambiguous — it may resolve to temp (if a shadow exists) or to
+    // the parent schema — but treating "no qualifier + name match" as
+    // targeting the renamed db matches what the previous
+    // implementation did, and the caller already narrowed the
+    // candidate set by iterating temp schema triggers for renames in
+    // main only.
+    let qualifier_matches = match tbl_name.db_name.as_ref() {
+        Some(db) => db.as_str().eq_ignore_ascii_case(renamed_db_name),
+        None => true,
     };
+    let new_tbl_name =
+        if qualifier_matches && tbl_name.name.as_str().eq_ignore_ascii_case(old_table_name) {
+            ast::QualifiedName {
+                db_name: tbl_name.db_name,
+                name: ast::Name::exact(new_table_name.to_string()),
+                alias: None,
+            }
+        } else {
+            tbl_name
+        };
 
     if let Some(ref mut when) = when_clause {
         rewrite_check_expr_table_refs(when, old_table_name, new_table_name);
@@ -2396,7 +2431,26 @@ fn rewrite_trigger_sql_for_column_rename(
         &new_commands,
     );
 
-    if trigger_database_id == crate::TEMP_DB_ID && target_database_id == crate::TEMP_DB_ID {
+    // Validate the rewritten trigger against the dropped column.
+    //
+    // For temp-schema triggers the `UPDATE sqlite_schema` recompile
+    // backstop never runs (temp rows are rewritten in-place), so we
+    // need an explicit validation pass here. We only run it when the
+    // trigger's owning table IS the altered table — i.e. when the
+    // rename actually changes columns the trigger's NEW/OLD refs
+    // bind against. Cross-table references inside the trigger body
+    // (e.g. `SELECT other_col FROM other_table` where the rename is
+    // on `other_table`) are already handled by the per-expression
+    // rewrite above and don't need the extra pass; `validate_trigger_
+    // columns_after_drop` only resolves against the trigger's owning
+    // table and would false-positive on such cross-table refs.
+    //
+    // The old guard was `trigger_db == TEMP && target_db == TEMP`
+    // which silently skipped TEMP-trigger-on-MAIN (case C:
+    // `CREATE TEMP TRIGGER tr ON main.t`); adding
+    // `is_renaming_trigger_table` restores that coverage without
+    // breaking cross-table body refs.
+    if trigger_database_id == crate::TEMP_DB_ID && is_renaming_trigger_table {
         let rewritten_trigger = crate::schema::Trigger::new(
             trigger_name.name.as_str().to_string(),
             new_sql.clone(),
@@ -2473,6 +2527,15 @@ fn apply_expr_column_ref_with_context(
                 return Ok(());
             }
 
+            // These branches are mutually exclusive — a qualifier can
+            // match at most one of: NEW/OLD (the trigger table), the
+            // rewrite context table, the bare trigger table name, or
+            // a target qualifier from the FROM clause. Using an
+            // `else if` chain makes the mutual exclusion explicit;
+            // the previous sequence of independent `if`s could
+            // double-rewrite if the context table and the trigger
+            // table shared a name, because two branches both issued
+            // a rewrite on the same `col` node.
             if ns_norm.eq_ignore_ascii_case("new") || ns_norm.eq_ignore_ascii_case("old") {
                 if is_renaming_trigger_table && trigger_table.get_column(&col_norm).is_some() {
                     if let Some(new_col_norm) = mode.rewritten_name() {
@@ -2482,19 +2545,20 @@ fn apply_expr_column_ref_with_context(
                     }
                 }
                 return Ok(());
-            }
-
-            if let Some((_, ctx_name_norm, is_renaming_ctx)) = context_table {
-                if ns_norm == ctx_name_norm && is_renaming_ctx {
-                    if let Some(new_col_norm) = mode.rewritten_name() {
-                        *col = ast::Name::from_string(new_col_norm);
-                    } else {
-                        return Err(no_such_column_error(old_col_norm));
-                    }
+            } else if let Some((_, ctx_name_norm, is_renaming_ctx)) =
+                context_table
+                    .as_ref()
+                    .filter(|(_, ctx_name_norm, is_renaming_ctx)| {
+                        *is_renaming_ctx && ns_norm == **ctx_name_norm
+                    })
+            {
+                let _ = (ctx_name_norm, is_renaming_ctx);
+                if let Some(new_col_norm) = mode.rewritten_name() {
+                    *col = ast::Name::from_string(new_col_norm);
+                } else {
+                    return Err(no_such_column_error(old_col_norm));
                 }
-            }
-
-            if is_renaming_trigger_table
+            } else if is_renaming_trigger_table
                 && ns_norm.eq_ignore_ascii_case(trigger_table_name)
                 && trigger_table.get_column(&col_norm).is_some()
             {
@@ -2512,9 +2576,7 @@ fn apply_expr_column_ref_with_context(
                 } else {
                     return Err(no_such_column_error(old_col_norm));
                 }
-            }
-
-            if from_target_qualifiers.contains(&ns_norm) {
+            } else if from_target_qualifiers.contains(&ns_norm) {
                 if let Some(new_col_norm) = mode.rewritten_name() {
                     *col = ast::Name::from_string(new_col_norm);
                 } else {
@@ -2541,6 +2603,16 @@ fn apply_expr_column_ref_with_context(
                 }
             }
 
+            // TODO: ambiguous-join correctness. A bare `old_col`
+            // reference inside a trigger body that contains e.g.
+            // `JOIN other USING (old_col)` can legitimately bind
+            // to `other.old_col` rather than the trigger table's
+            // column. SQLite rewrites the post-resolution bound AST,
+            // so it never has to guess. We walk the unresolved AST,
+            // so "in a FROM that mentions a rename target" is the
+            // best proxy we have — which mis-rewrites a USING-joined
+            // reference when both sides happen to use the same
+            // pre-rename column name.
             if (is_renaming_trigger_table && trigger_table.get_column(&col_norm).is_some())
                 || !from_target_qualifiers.is_empty()
             {
