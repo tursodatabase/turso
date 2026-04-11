@@ -1246,6 +1246,15 @@ expect {
     1|9|90
 }
 
+test gencol_insert_or_replace_not_null_no_default {
+    CREATE TABLE t(a, b AS (a) NOT NULL);
+    INSERT INTO t VALUES (1);
+    UPDATE OR REPLACE t SET a = null;
+}
+expect error {
+    NOT NULL constraint failed: t.b
+}
+
 test gencol_insert_or_ignore {
     CREATE TABLE t1(a INTEGER PRIMARY KEY, b INTEGER, c AS (b + 100));
     INSERT INTO t1(a, b) VALUES(1, 5);
