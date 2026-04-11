@@ -887,22 +887,18 @@ pub fn generate_create_index<C: Capabilities>(
         .ok_or_else(|| GenError::schema_empty("tables"))?
         .clone();
 
-    // Generate unique index name
+    // Generate unique index name.
+    //
+    // Note: SQLite's grammar does NOT accept TEMP/TEMPORARY on
+    // CREATE INDEX. Indexes on temp tables are created via either
+    // `CREATE INDEX temp.<name>` or by indexing an unqualified temp
+    // table; the index implicitly lives in the temp schema.
     let existing_names = generator
         .schema()
         .index_names_in_database(table.database.as_deref());
     let prefix = format!("idx_{}", table.name);
     let index_name = ctx.gen_unique_name(&prefix, &existing_names);
-    let temporary = match table.database.as_deref() {
-        Some("temp") => Some(if ctx.gen_bool() {
-            TemporaryKeyword::Temp
-        } else {
-            TemporaryKeyword::Temporary
-        }),
-        _ => None,
-    };
     let qualified_index_name = match table.database.as_deref() {
-        Some("temp") => index_name,
         Some(db) => format!("{db}.{index_name}"),
         None => index_name,
     };
@@ -934,7 +930,6 @@ pub fn generate_create_index<C: Capabilities>(
         columns,
         unique: ctx.gen_bool_with_prob(create_index_config.unique_probability),
         if_not_exists: ctx.gen_bool_with_prob(create_index_config.if_not_exists_probability),
-        temporary,
     }))
 }
 
@@ -1004,15 +999,28 @@ pub fn generate_create_trigger<C: Capabilities>(
     // IF NOT EXISTS
     let if_not_exists = ctx.gen_bool_with_prob(trigger_config.if_not_exists_probability);
 
+    // TEMP triggers can target tables in any database; non-temp
+    // triggers must target tables in their own schema. Emit
+    // `CREATE TEMP TRIGGER` whenever the target lives in the temp
+    // schema (required) OR randomly for main-schema tables (so the
+    // fuzzer exercises temp-trigger-on-main paths).
+    let target_is_temp = matches!(table.database.as_deref(), Some("temp"));
+    let temporary = target_is_temp || ctx.gen_bool_with_prob(0.2);
+
     Ok(Stmt::CreateTrigger(CreateTriggerStmt {
         name: trigger_name,
-        table: table.qualified_name(),
+        // SQLite's grammar does not accept a schema qualifier on the
+        // target of CREATE TRIGGER (`ON temp.t` is a parse error).
+        // The trigger's schema is determined by the `TEMP` keyword and
+        // by any qualifier on the trigger NAME, not the target.
+        table: table.unqualified_name().to_string(),
         timing,
         event,
         for_each_row,
         when_clause,
         body,
         if_not_exists,
+        temporary,
     }))
 }
 

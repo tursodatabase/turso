@@ -425,12 +425,30 @@ pub enum TemporaryKeyword {
 }
 
 impl TemporaryKeyword {
-    pub fn random() -> Self {
-        if std::time::UNIX_EPOCH.elapsed().unwrap().as_nanos() % 2 == 0 {
-            TemporaryKeyword::Temp
-        } else {
+    /// Pick a keyword from a proptest-driven boolean. Callers should
+    /// thread an `any::<bool>()` through their `prop_flat_map` /
+    /// `prop_map` tuples so the proptest RNG (and therefore replay
+    /// and shrinking) drives the choice. An earlier version of this
+    /// function read the wall clock, which broke determinism.
+    pub fn from_bool(use_long: bool) -> Self {
+        if use_long {
             TemporaryKeyword::Temporary
+        } else {
+            TemporaryKeyword::Temp
         }
+    }
+}
+
+impl proptest::arbitrary::Arbitrary for TemporaryKeyword {
+    type Parameters = ();
+    type Strategy = proptest::strategy::BoxedStrategy<Self>;
+
+    fn arbitrary_with(_: Self::Parameters) -> Self::Strategy {
+        proptest::prop_oneof![
+            proptest::strategy::Just(TemporaryKeyword::Temp),
+            proptest::strategy::Just(TemporaryKeyword::Temporary),
+        ]
+        .boxed()
     }
 }
 
@@ -728,6 +746,9 @@ pub fn create_table(
                 identifier_excluding(existing_names),
                 if_not_exists_with_probability(if_not_exists_prob),
                 (0u8..100),
+                // Proptest-driven keyword choice (TEMP vs TEMPORARY)
+                // so replay and shrinking are deterministic.
+                any::<bool>(),
                 optional_primary_key(&pk_profile),
                 proptest::collection::vec(
                     column_def_with_profile(&column_profile),
@@ -736,10 +757,18 @@ pub fn create_table(
             )
         })
         .prop_map(
-            move |(target_db, table_name, if_not_exists, strict_roll, pk_col, other_cols)| {
+            move |(
+                target_db,
+                table_name,
+                if_not_exists,
+                strict_roll,
+                temp_keyword_long,
+                pk_col,
+                other_cols,
+            )| {
                 let strict = strict_roll < strict_prob;
                 let temporary = match target_db.as_deref() {
-                    Some("temp") => Some(TemporaryKeyword::random()),
+                    Some("temp") => Some(TemporaryKeyword::from_bool(temp_keyword_long)),
                     _ => None,
                 };
 

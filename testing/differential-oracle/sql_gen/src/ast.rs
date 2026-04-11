@@ -1200,6 +1200,12 @@ impl fmt::Display for AlterTableAction {
 }
 
 /// A CREATE INDEX statement.
+//
+// NOTE: SQLite's grammar does NOT accept TEMP / TEMPORARY on CREATE
+// INDEX. Temp indexes come from either the `temp.` name qualifier or
+// from indexing a temp table. Do not add a `temporary` field here —
+// the oracle would score "both errored" as a pass and the fuzzer
+// would silently burn its statement budget.
 #[derive(Debug, Clone)]
 pub struct CreateIndexStmt {
     pub name: String,
@@ -1207,15 +1213,11 @@ pub struct CreateIndexStmt {
     pub columns: Vec<String>,
     pub unique: bool,
     pub if_not_exists: bool,
-    pub temporary: Option<TemporaryKeyword>,
 }
 
 impl fmt::Display for CreateIndexStmt {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "CREATE ")?;
-        if let Some(keyword) = self.temporary {
-            write!(f, "{keyword} ")?;
-        }
         if self.unique {
             write!(f, "UNIQUE ")?;
         }
@@ -1257,6 +1259,11 @@ impl fmt::Display for DropIndexStmt {
 #[derive(Debug, Clone)]
 pub struct CreateTriggerStmt {
     pub name: String,
+    /// **Must** be unqualified. The schema on which the trigger fires
+    /// is determined by `temporary` (TEMP triggers can target tables in
+    /// any schema) or by the schema of the non-temp trigger itself.
+    /// SQLite's grammar does NOT accept `CREATE TRIGGER ... ON temp.t`
+    /// — the qualifier belongs on the trigger NAME.
     pub table: String,
     pub timing: TriggerTiming,
     pub event: TriggerEvent,
@@ -1264,11 +1271,19 @@ pub struct CreateTriggerStmt {
     pub when_clause: Option<Expr>,
     pub body: Vec<TriggerStmt>,
     pub if_not_exists: bool,
+    /// When true, emit `CREATE TEMP TRIGGER`. TEMP triggers live in
+    /// the temp schema regardless of their name's qualifier and can
+    /// target tables in any attached database.
+    pub temporary: bool,
 }
 
 impl fmt::Display for CreateTriggerStmt {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "CREATE TRIGGER ")?;
+        if self.temporary {
+            write!(f, "CREATE TEMP TRIGGER ")?;
+        } else {
+            write!(f, "CREATE TRIGGER ")?;
+        }
         if self.if_not_exists {
             write!(f, "IF NOT EXISTS ")?;
         }
@@ -2664,23 +2679,6 @@ mod tests {
         assert_eq!(
             stmt.to_string(),
             "CREATE TEMP TABLE t (id INTEGER PRIMARY KEY)"
-        );
-    }
-
-    #[test]
-    fn test_create_temporary_index_display() {
-        let stmt = CreateIndexStmt {
-            name: "idx_t_id".to_string(),
-            table: "t".to_string(),
-            columns: vec!["id".to_string()],
-            unique: false,
-            if_not_exists: false,
-            temporary: Some(TemporaryKeyword::Temporary),
-        };
-
-        assert_eq!(
-            stmt.to_string(),
-            "CREATE TEMPORARY INDEX idx_t_id ON t (id)"
         );
     }
 

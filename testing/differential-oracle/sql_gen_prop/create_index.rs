@@ -3,7 +3,7 @@
 use proptest::prelude::*;
 use std::fmt;
 
-use crate::create_table::{TemporaryKeyword, identifier_excluding};
+use crate::create_table::identifier_excluding;
 use crate::profile::StatementProfile;
 use crate::schema::{Schema, TableRef};
 use crate::select::OrderDirection;
@@ -52,22 +52,23 @@ impl fmt::Display for IndexColumn {
 
 /// A CREATE INDEX statement.
 #[derive(Debug, Clone)]
+// NOTE: SQLite's grammar does NOT accept TEMP / TEMPORARY on
+// CREATE INDEX. Temp indexes come from either the `temp.` name
+// qualifier or from indexing a temp table — there is no
+// `temporary` field here. The oracle would otherwise score
+// "both errored" as a pass and the fuzzer would silently burn
+// its statement budget.
 pub struct CreateIndexStatement {
     pub index_name: String,
     pub table_name: String,
     pub columns: Vec<IndexColumn>,
     pub unique: bool,
     pub if_not_exists: bool,
-    pub temporary: Option<TemporaryKeyword>,
 }
 
 impl fmt::Display for CreateIndexStatement {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "CREATE ")?;
-        if let Some(keyword) = self.temporary {
-            write!(f, "{keyword} ")?;
-        }
-
         if self.unique {
             write!(f, "UNIQUE ")?;
         }
@@ -112,12 +113,7 @@ pub fn create_index_for_table(
     let max_columns = profile.create_index_profile().max_columns;
 
     if col_names.is_empty() {
-        let temporary = match index_database.as_deref() {
-            Some("temp") => Some(TemporaryKeyword::random()),
-            _ => None,
-        };
         let index_name = match index_database.as_deref() {
-            Some("temp") => "idx_empty".to_string(),
             Some(db) => format!("{db}.idx_empty"),
             None => "idx_empty".to_string(),
         };
@@ -127,7 +123,6 @@ pub fn create_index_for_table(
             columns: vec![],
             unique: false,
             if_not_exists: true,
-            temporary,
         })
         .boxed();
     }
@@ -150,12 +145,7 @@ pub fn create_index_for_table(
 
                 col_strategies.prop_map(move |columns| {
                     let index_name = format!("idx_{table_name}_{index_suffix}");
-                    let temporary = match index_database.as_deref() {
-                        Some("temp") => Some(TemporaryKeyword::random()),
-                        _ => None,
-                    };
                     let qualified_index_name = match index_database.as_deref() {
-                        Some("temp") => index_name,
                         Some(db) => format!("{db}.{index_name}"),
                         None => index_name,
                     };
@@ -166,7 +156,6 @@ pub fn create_index_for_table(
                         columns,
                         unique,
                         if_not_exists,
-                        temporary,
                     }
                 })
             },
@@ -209,12 +198,7 @@ pub fn create_index(
                 .unwrap_or_default();
 
             if col_names.is_empty() {
-                let temporary = match index_database.as_deref() {
-                    Some("temp") => Some(TemporaryKeyword::random()),
-                    _ => None,
-                };
                 let index_name = match index_database.as_deref() {
-                    Some("temp") => "idx_empty".to_string(),
                     Some(db) => format!("{db}.idx_empty"),
                     None => "idx_empty".to_string(),
                 };
@@ -224,7 +208,6 @@ pub fn create_index(
                     columns: vec![],
                     unique: false,
                     if_not_exists: true,
-                    temporary,
                 })
                 .boxed();
             }
@@ -250,12 +233,7 @@ pub fn create_index(
 
                         col_strategies.prop_map(move |columns| {
                             let index_name = format!("idx_{table_name}_{index_suffix}");
-                            let temporary = match index_database.as_deref() {
-                                Some("temp") => Some(TemporaryKeyword::random()),
-                                _ => None,
-                            };
                             let qualified_index_name = match index_database.as_deref() {
-                                Some("temp") => index_name,
                                 Some(db) => format!("{db}.{index_name}"),
                                 None => index_name,
                             };
@@ -266,7 +244,6 @@ pub fn create_index(
                                 columns,
                                 unique,
                                 if_not_exists,
-                                temporary,
                             }
                         })
                     },
@@ -291,7 +268,6 @@ mod tests {
             }],
             unique: true,
             if_not_exists: false,
-            temporary: None,
         };
 
         assert_eq!(
@@ -317,7 +293,6 @@ mod tests {
             ],
             unique: false,
             if_not_exists: true,
-            temporary: None,
         };
 
         assert_eq!(
@@ -337,32 +312,11 @@ mod tests {
             }],
             unique: false,
             if_not_exists: false,
-            temporary: None,
         };
 
         assert_eq!(
             stmt.to_string(),
             "CREATE INDEX temp.idx_temp_users_email ON users (email)"
-        );
-    }
-
-    #[test]
-    fn test_create_temp_index_display() {
-        let stmt = CreateIndexStatement {
-            index_name: "idx_temp_users_email".to_string(),
-            table_name: "users".to_string(),
-            columns: vec![IndexColumn {
-                name: "email".to_string(),
-                direction: None,
-            }],
-            unique: false,
-            if_not_exists: false,
-            temporary: Some(TemporaryKeyword::Temp),
-        };
-
-        assert_eq!(
-            stmt.to_string(),
-            "CREATE TEMP INDEX idx_temp_users_email ON users (email)"
         );
     }
 }
