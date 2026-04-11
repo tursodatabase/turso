@@ -514,19 +514,33 @@ fn execute_trigger_commands(
     database_id: usize,
     ignore_jump_target: BranchOffset,
 ) -> Result<bool> {
+    struct TriggerCompilationGuard {
+        connection: Arc<crate::Connection>,
+    }
+
+    impl Drop for TriggerCompilationGuard {
+        fn drop(&mut self) {
+            self.connection.end_trigger_compilation();
+        }
+    }
+
     if connection.trigger_is_compiling(trigger) {
         // Do not recursively compile the same trigger
         return Ok(false);
     }
     connection.start_trigger_compilation(trigger.clone());
+    let _trigger_compilation_guard = TriggerCompilationGuard {
+        connection: connection.clone(),
+    };
 
     let has_new = ctx.new_registers.is_some();
     let has_old = ctx.old_registers.is_some();
     let num_cols = ctx.table.columns.len();
 
-    // For triggers on attached databases, resolve the database name so unqualified
-    // table references in the trigger body are correctly qualified to the trigger's database.
-    let db_name = if database_id == crate::MAIN_DB_ID {
+    // Ordinary non-main triggers need unqualified DML targets rewritten into the
+    // trigger's schema. Temp-backed triggers intentionally keep unqualified names
+    // unresolved so they can follow SQLite's normal temp/main lookup rules.
+    let db_name = if database_id == crate::MAIN_DB_ID || database_id == crate::TEMP_DB_ID {
         None
     } else {
         resolver
@@ -560,8 +574,14 @@ fn execute_trigger_commands(
         subprogram_builder.set_trigger_conflict_override(override_conflict);
     }
     // Restrict table resolution to the trigger's database during subprogram compilation.
+    // Temp triggers live in TEMP_DB_ID, regardless of which database the target table is in.
+    let trigger_database_id = if trigger.temporary {
+        crate::TEMP_DB_ID
+    } else {
+        database_id
+    };
     let prev_trigger_context = resolver.trigger_context.clone();
-    resolver.set_trigger_context(database_id, trigger.name.clone());
+    resolver.set_trigger_context(trigger_database_id, trigger.name.clone());
     let compile_result = (|| -> Result<()> {
         for command in trigger.commands.iter() {
             let stmt = trigger_cmd_to_stmt_for_subprogram(command, &subprogram_ctx)?;
@@ -582,6 +602,30 @@ fn execute_trigger_commands(
     subprogram_builder.epilogue(resolver.schema());
     let built_subprogram =
         subprogram_builder.build(connection.clone(), true, "trigger subprogram")?;
+    let subprogram_prepared = built_subprogram.prepared();
+
+    // Trigger subprograms do not emit Transaction opcodes, so the parent statement
+    // must acquire any attached/temp database transactions the trigger body needs
+    // before OP_Program enters the subprogram.
+    for &db_id in &subprogram_prepared.write_databases {
+        if db_id == crate::MAIN_DB_ID {
+            program.begin_write_operation();
+        } else {
+            let schema_cookie = resolver.with_schema(db_id, |s| s.schema_version);
+            program.begin_write_on_database(db_id, schema_cookie);
+        }
+    }
+    for &db_id in &subprogram_prepared.read_databases {
+        if subprogram_prepared.write_databases.contains(&db_id) {
+            continue;
+        }
+        if db_id == crate::MAIN_DB_ID {
+            program.begin_read_operation();
+        } else {
+            let schema_cookie = resolver.with_schema(db_id, |s| s.schema_version);
+            program.begin_read_on_database(db_id, schema_cookie);
+        }
+    }
 
     // Build the param_registers Vec from the sparse allocator: maps each parameter
     // index to the parent register that holds the value.
@@ -616,7 +660,6 @@ fn execute_trigger_commands(
         program: built_subprogram.prepared().clone(),
         ignore_jump_target,
     });
-    connection.end_trigger_compilation();
 
     Ok(true)
 }
@@ -710,6 +753,84 @@ pub fn get_relevant_triggers_type_and_time<'a>(
             trigger.time == time
         })
         .cloned()
+}
+
+/// Like [`get_relevant_triggers_type_and_time`], but also searches the temp
+/// schema when `database_id != TEMP_DB_ID`.  Temp triggers on a non-temp
+/// table are stored in the temp schema, so both schemas must be consulted
+/// for DML on any table.  Returns a combined, de-duplicated list.
+pub fn get_triggers_with_temp(
+    resolver: &Resolver,
+    database_id: usize,
+    event: TriggerEvent,
+    time: TriggerTime,
+    updated_column_indices: Option<HashSet<usize>>,
+    table: &BTreeTable,
+) -> Vec<Arc<Trigger>> {
+    let mut triggers: Vec<Arc<Trigger>> = resolver.with_schema(database_id, |s| {
+        get_relevant_triggers_type_and_time(
+            s,
+            event.clone(),
+            time,
+            updated_column_indices.clone(),
+            table,
+        )
+        .filter(|trigger| {
+            // In the temp schema, triggers may target a different database.
+            // Only include triggers whose target matches this database.
+            match trigger.target_database_id {
+                Some(target_db) => target_db == database_id,
+                None => true, // unqualified → targets this schema's own table
+            }
+        })
+        .collect()
+    });
+    if database_id != crate::TEMP_DB_ID {
+        let temp_triggers: Vec<Arc<Trigger>> = resolver.with_schema(crate::TEMP_DB_ID, |s| {
+            get_relevant_triggers_type_and_time(s, event, time, updated_column_indices, table)
+                .filter(|trigger| match trigger.target_database_id {
+                    // Explicit qualifier: include if it matches this database.
+                    Some(target_db) => target_db == database_id,
+                    // Unqualified: the trigger targets the temp schema's table if one
+                    // exists, otherwise it targets main/attached. Include it only when
+                    // no temp table with that name shadows it.
+                    None => s.get_table(&trigger.table_name).is_none(),
+                })
+                .collect()
+        });
+        triggers.extend(temp_triggers);
+    }
+    triggers
+}
+
+/// Like [`has_relevant_triggers_type_only`], but also checks the temp schema.
+pub fn has_triggers_with_temp(
+    resolver: &Resolver,
+    database_id: usize,
+    event: TriggerEvent,
+    updated_column_indices: Option<&HashSet<usize>>,
+    table: &BTreeTable,
+) -> bool {
+    let found = resolver.with_schema(database_id, |s| {
+        has_relevant_triggers_type_only(s, event.clone(), updated_column_indices, table)
+    });
+    if found {
+        return true;
+    }
+    if database_id != crate::TEMP_DB_ID {
+        // Check temp schema for triggers that target this database.
+        let has_temp = resolver.with_schema(crate::TEMP_DB_ID, |s| {
+            s.get_triggers_for_table(table.name.as_str())
+                .any(|trigger| match trigger.target_database_id {
+                    Some(target_db) => target_db == database_id,
+                    None => s.get_table(&trigger.table_name).is_none(),
+                })
+        });
+        if has_temp {
+            return true;
+        }
+    }
+    false
 }
 
 pub fn fire_trigger(

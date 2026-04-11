@@ -12,7 +12,7 @@ use crate::translate::subquery::{
     plan_subqueries_from_returning, plan_subqueries_from_select_plan,
     plan_subqueries_from_where_clause,
 };
-use crate::translate::trigger_exec::has_relevant_triggers_type_only;
+use crate::translate::trigger_exec::has_triggers_with_temp;
 use crate::util::normalize_ident;
 use crate::vdbe::builder::{ProgramBuilder, ProgramBuilderOpts};
 use crate::Result;
@@ -32,7 +32,7 @@ pub fn translate_delete(
     program: &mut ProgramBuilder,
     connection: &Arc<crate::Connection>,
 ) -> Result<()> {
-    let database_id = resolver.resolve_database_id(tbl_name)?;
+    let database_id = resolver.resolve_existing_table_database_id(tbl_name)?;
     let normalized_table_name = normalize_ident(tbl_name.name.as_str());
 
     // Check if this is a system table that should be protected from direct writes
@@ -43,10 +43,8 @@ pub fn translate_delete(
         crate::bail_parse_error!("table {} may not be modified", normalized_table_name);
     }
 
-    if crate::is_attached_db(database_id) {
-        let schema_cookie = resolver.with_schema(database_id, |s| s.schema_version);
-        program.begin_write_on_database(database_id, schema_cookie);
-    }
+    let schema_cookie = resolver.with_schema(database_id, |s| s.schema_version);
+    program.begin_write_on_database(database_id, schema_cookie);
 
     let mut delete_plan = prepare_delete_plan(
         program,
@@ -240,11 +238,7 @@ pub fn prepare_delete_plan(
     // to skip the rowset materialization.
     let has_delete_triggers = btree_table_for_triggers
         .as_ref()
-        .map(|bt| {
-            resolver.with_schema(database_id, |s| {
-                has_relevant_triggers_type_only(s, TriggerEvent::Delete, None, bt)
-            })
-        })
+        .map(|bt| has_triggers_with_temp(resolver, database_id, TriggerEvent::Delete, None, bt))
         .unwrap_or(false);
 
     let mut safety = DmlSafety::default();

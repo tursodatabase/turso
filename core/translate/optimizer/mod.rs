@@ -34,7 +34,7 @@ use crate::{
             NonFromClauseSubquery, OuterQueryReference, QueryDestination, ResultSetColumn, Scan,
             SeekKeyComponent, SubqueryState,
         },
-        trigger_exec::has_relevant_triggers_type_only,
+        trigger_exec::has_triggers_with_temp,
     },
     types::SeekOp,
     util::{
@@ -838,14 +838,13 @@ fn first_update_safety_reason(
         // Check if there are UPDATE triggers
         let updated_cols: HashSet<usize> = plan.set_clauses.iter().map(|(i, _)| *i).collect();
         let database_id = table_ref.database_id;
-        if resolver.with_schema(database_id, |s| {
-            has_relevant_triggers_type_only(
-                s,
-                TriggerEvent::Update,
-                Some(&updated_cols),
-                btree_table,
-            )
-        }) {
+        if has_triggers_with_temp(
+            resolver,
+            database_id,
+            TriggerEvent::Update,
+            Some(&updated_cols),
+            btree_table,
+        ) {
             break 'requires Some(DmlSafetyReason::Trigger);
         }
 
@@ -3447,12 +3446,14 @@ mod tests {
     fn empty_resolver<'a>(
         schema: &'a Schema,
         database_schemas: &'a RwLock<HashMap<usize, crate::sync::Arc<Schema>>>,
+        temp_database: &'a RwLock<Option<crate::connection::TempDatabase>>,
         attached_databases: &'a RwLock<DatabaseCatalog>,
         syms: &'a SymbolTable,
     ) -> Resolver<'a> {
         Resolver::new(
             schema,
             database_schemas,
+            temp_database,
             attached_databases,
             syms,
             true,
@@ -3483,7 +3484,14 @@ mod tests {
         let syms = SymbolTable::new();
         let database_schemas = RwLock::new(HashMap::default());
         let attached_databases = RwLock::new(DatabaseCatalog::new());
-        let resolver = empty_resolver(&schema, &database_schemas, &attached_databases, &syms);
+        let temp_database = RwLock::new(None);
+        let resolver = empty_resolver(
+            &schema,
+            &database_schemas,
+            &temp_database,
+            &attached_databases,
+            &syms,
+        );
 
         let expr = fn_call(
             "coalesce",
@@ -3512,7 +3520,14 @@ mod tests {
         let syms = SymbolTable::new();
         let database_schemas = RwLock::new(HashMap::default());
         let attached_databases = RwLock::new(DatabaseCatalog::new());
-        let resolver = empty_resolver(&schema, &database_schemas, &attached_databases, &syms);
+        let temp_database = RwLock::new(None);
+        let resolver = empty_resolver(
+            &schema,
+            &database_schemas,
+            &temp_database,
+            &attached_databases,
+            &syms,
+        );
 
         let expr = fn_call(
             "quote",

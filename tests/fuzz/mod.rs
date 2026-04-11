@@ -11,6 +11,7 @@ pub mod rowid_alias;
 pub mod savepoint;
 pub mod subjournal;
 pub mod subquery;
+pub mod temp_tables;
 pub mod test_join_optimizer;
 
 #[cfg(test)]

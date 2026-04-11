@@ -580,6 +580,20 @@ fn get_subquery_parser<'a>(
                 let reg_count = plan.result_columns.len();
                 let reg_start = program.alloc_registers(reg_count);
 
+                if reg_count == 1 {
+                    if let Some(result_col) = plan.result_columns.first() {
+                        let affinity = get_expr_affinity_info(
+                            &result_col.expr,
+                            Some(&plan.table_references),
+                            None,
+                        );
+                        resolver
+                            .subquery_affinities
+                            .borrow_mut()
+                            .insert(subquery_id, affinity);
+                    }
+                }
+
                 plan.query_destination = QueryDestination::RowValueSubqueryResult {
                     result_reg_start: reg_start,
                     num_regs: reg_count,

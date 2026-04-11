@@ -10,7 +10,7 @@ use turso_parser::ast::{Name, TransactionType};
 pub fn translate_tx_begin(
     tx_type: Option<TransactionType>,
     _tx_name: Option<Name>,
-    schema: &Schema,
+    resolver: &Resolver,
     program: &mut ProgramBuilder,
 ) -> Result<()> {
     program.extend(&ProgramBuilderOpts {
@@ -18,7 +18,18 @@ pub fn translate_tx_begin(
         approx_num_insns: 0,
         approx_num_labels: 0,
     });
+    let schema = resolver.schema();
     let tx_type = tx_type.unwrap_or(TransactionType::Deferred);
+    // For temp we never eagerly open a transaction here: temp is a
+    // per-connection database with no inter-connection locking, so
+    // there is nothing to "claim" up front. The builder path
+    // (`begin_read_on_database` / `begin_write_on_database`) emits
+    // `Insn::Transaction` for `TEMP_DB_ID` lazily when an individual
+    // statement inside the explicit transaction actually touches a
+    // temp object. Eagerly emitting it here would hard-code
+    // `TransactionMode::Write` regardless of the outer mode (which was
+    // wrong for `BEGIN CONCURRENT`) and force a write on temp even
+    // when the transaction only reads it.
     match tx_type {
         TransactionType::Deferred => {
             program.emit_insn(Insn::AutoCommit {
@@ -32,7 +43,6 @@ pub fn translate_tx_begin(
                 tx_mode: TransactionMode::Write,
                 schema_cookie: schema.schema_version,
             });
-            // TODO: Emit transaction instruction on temporary tables when we support them.
             program.emit_insn(Insn::AutoCommit {
                 auto_commit: false,
                 rollback: false,
@@ -44,7 +54,6 @@ pub fn translate_tx_begin(
                 tx_mode: TransactionMode::Concurrent,
                 schema_cookie: schema.schema_version,
             });
-            // TODO: Emit transaction instruction on temporary tables when we support them.
             program.emit_insn(Insn::AutoCommit {
                 auto_commit: false,
                 rollback: false,

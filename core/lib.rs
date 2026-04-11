@@ -159,6 +159,16 @@ pub const TEMP_DB_ID: usize = 1;
 /// start at index 2.
 pub const FIRST_ATTACHED_DB_ID: usize = 2;
 
+/// Sentinel used when a SQL schema qualifier references an attached
+/// database name that cannot be resolved against the current
+/// connection's attached catalog (e.g. after reloading a
+/// `CREATE TEMP TRIGGER tr ON aux.x ...` row from `temp.sqlite_schema`
+/// without `aux` being attached). Stored in
+/// `Trigger::target_database_id` so filters never accidentally match a
+/// real database. Never equal to any real db id — guaranteed by
+/// `usize::MAX`.
+pub const INVALID_DB_ID: usize = usize::MAX;
+
 /// Returns true if the database index refers to "main" or "temp"
 pub const fn is_main_or_temp_db(database_id: usize) -> bool {
     database_id == MAIN_DB_ID || database_id == TEMP_DB_ID
@@ -1391,7 +1401,6 @@ impl Database {
             .get();
 
         let encryption_cipher = self.encryption_cipher_mode.get();
-
         let conn = Arc::new(Connection {
             db: self.clone(),
             pager: ArcSwap::new(pager),
@@ -1410,6 +1419,7 @@ impl Database {
             capture_data_changes: RwLock::new(None),
             cdc_transaction_id: AtomicI64::new(-1),
             closed: AtomicBool::new(false),
+            temp: crate::connection::TempDbContext::new(),
             attached_databases: RwLock::new(DatabaseCatalog::new()),
             query_only: AtomicBool::new(false),
             dml_require_where: AtomicBool::new(false),
@@ -1443,6 +1453,7 @@ impl Database {
             n_active_root_statements: AtomicI32::new(0),
             check_constraints_pragma: AtomicBool::new(false),
             vtab_txn_states: RwLock::new(HashSet::default()),
+            named_savepoints: RwLock::new(Vec::new()),
             prepare_context_generation: AtomicU64::new(0),
         });
         self.n_connections

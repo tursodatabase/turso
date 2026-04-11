@@ -37,7 +37,9 @@ use crate::{
         },
         planner::ROWID_STRS,
         subquery::{emit_non_from_clause_subqueries_for_eval_at, emit_non_from_clause_subquery},
-        trigger_exec::{fire_trigger, get_relevant_triggers_type_and_time, TriggerContext},
+        trigger_exec::{
+            fire_trigger, get_triggers_with_temp, has_triggers_with_temp, TriggerContext,
+        },
         ProgramBuilder,
     },
     util::normalize_ident,
@@ -906,17 +908,13 @@ fn emit_update_insns<'a>(
     let has_before_triggers_early = if let Some(btree_table) = target_table.table.btree() {
         let updated_column_indices: HashSet<usize> =
             set_clauses.iter().map(|(col_idx, _)| *col_idx).collect();
-        t_ctx.resolver.with_schema(update_database_id, |s| {
-            get_relevant_triggers_type_and_time(
-                s,
-                TriggerEvent::Update,
-                TriggerTime::Before,
-                Some(updated_column_indices),
-                &btree_table,
-            )
-            .next()
-            .is_some()
-        })
+        has_triggers_with_temp(
+            &t_ctx.resolver,
+            update_database_id,
+            TriggerEvent::Update,
+            Some(&updated_column_indices),
+            &btree_table,
+        )
     } else {
         false
     };
@@ -1052,28 +1050,21 @@ fn emit_update_insns<'a>(
     {
         let updated_column_indices: HashSet<usize> =
             set_clauses.iter().map(|(col_idx, _)| *col_idx).collect();
-        let relevant_before_update_triggers: Vec<_> =
-            t_ctx.resolver.with_schema(update_database_id, |s| {
-                get_relevant_triggers_type_and_time(
-                    s,
-                    TriggerEvent::Update,
-                    TriggerTime::Before,
-                    Some(updated_column_indices.clone()),
-                    &btree_table,
-                )
-                .collect()
-            });
-        has_after_triggers = t_ctx.resolver.with_schema(update_database_id, |s| {
-            get_relevant_triggers_type_and_time(
-                s,
-                TriggerEvent::Update,
-                TriggerTime::After,
-                Some(updated_column_indices.clone()),
-                &btree_table,
-            )
-            .count()
-                > 0
-        });
+        let relevant_before_update_triggers = get_triggers_with_temp(
+            &t_ctx.resolver,
+            update_database_id,
+            TriggerEvent::Update,
+            TriggerTime::Before,
+            Some(updated_column_indices.clone()),
+            &btree_table,
+        );
+        has_after_triggers = has_triggers_with_temp(
+            &t_ctx.resolver,
+            update_database_id,
+            TriggerEvent::Update,
+            Some(&updated_column_indices),
+            &btree_table,
+        );
 
         let has_fk_cascade = connection.foreign_keys_enabled()
             && t_ctx.resolver.with_schema(update_database_id, |s| {
@@ -1290,6 +1281,24 @@ fn emit_update_insns<'a>(
             }
         }
     }
+
+    // Parent-key reconciliation after the new row is inserted is only valid if this row
+    // actually deleted a conflicting parent row via REPLACE. Otherwise it double-decrements
+    // deferred FK counters for ordinary parent-key updates.
+    let parent_replace_reconcile_reg = if connection.foreign_keys_enabled()
+        && target_table.table.btree().is_some()
+        && t_ctx.resolver.with_schema(update_database_id, |s| {
+            s.any_resolved_fks_referencing(table_name)
+        }) {
+        let reg = program.alloc_register();
+        program.emit_insn(Insn::Integer {
+            value: 0,
+            dest: reg,
+        });
+        Some(reg)
+    } else {
+        None
+    };
 
     // Populate register-to-affinity map for expression index evaluation.
     // When column references are rewritten to Expr::Register during UPDATE, comparison
@@ -1739,6 +1748,12 @@ fn emit_update_insns<'a>(
                     });
                 }
                 ResolveType::Replace => {
+                    if let Some(parent_replace_reconcile_reg) = parent_replace_reconcile_reg {
+                        program.emit_insn(Insn::Integer {
+                            value: 1,
+                            dest: parent_replace_reconcile_reg,
+                        });
+                    }
                     // For REPLACE with unique constraint, delete the conflicting row
                     // Save original rowid before seeking to conflicting row
                     let original_rowid_reg = program.alloc_register();
@@ -1910,6 +1925,12 @@ fn emit_update_insns<'a>(
         && has_user_provided_rowid
         && matches!(effective_rowid_alias_conflict, ResolveType::Replace)
     {
+        if let Some(parent_replace_reconcile_reg) = parent_replace_reconcile_reg {
+            program.emit_insn(Insn::Integer {
+                value: 1,
+                dest: parent_replace_reconcile_reg,
+            });
+        }
         let target_reg = rowid_set_clause_reg.expect("rowid_set_clause_reg must be set");
         let no_rowid_conflict_label = program.allocate_label();
         let row_not_found_label = check_rowid_not_exists_label
@@ -2144,7 +2165,8 @@ fn emit_update_insns<'a>(
             // Insert instruction to update the cell. We need to first delete the current cell
             // and later insert the updated record.
             // In MVCC mode, we also need DELETE+INSERT to properly version the row (Hekaton model).
-            let needs_delete = not_exists_check_required || connection.mvcc_enabled();
+            let needs_delete = not_exists_check_required
+                || connection.mv_store_for_db(update_database_id).is_some();
             if needs_delete {
                 program.emit_insn(Insn::Delete {
                     cursor_id: target_table_cursor_id,
@@ -2175,15 +2197,24 @@ fn emit_update_insns<'a>(
             // the counter was incremented. Now that the new row is inserted with the
             // (potentially same) parent key, scan children and decrement.
             if connection.foreign_keys_enabled() {
-                emit_fk_parent_new_key_reconcile(
-                    program,
-                    table,
-                    start,
-                    rowid_set_clause_reg.unwrap_or(beg),
-                    set_clauses,
-                    update_database_id,
-                    &t_ctx.resolver,
-                )?;
+                if let Some(parent_replace_reconcile_reg) = parent_replace_reconcile_reg {
+                    let skip_fk_parent_reconcile = program.allocate_label();
+                    program.emit_insn(Insn::IfNot {
+                        reg: parent_replace_reconcile_reg,
+                        target_pc: skip_fk_parent_reconcile,
+                        jump_if_null: true,
+                    });
+                    emit_fk_parent_new_key_reconcile(
+                        program,
+                        table,
+                        start,
+                        rowid_set_clause_reg.unwrap_or(beg),
+                        set_clauses,
+                        update_database_id,
+                        &t_ctx.resolver,
+                    )?;
+                    program.preassign_label_to_next_insn(skip_fk_parent_reconcile);
+                }
             }
 
             // Fire FK CASCADE/SET NULL actions AFTER the parent row is updated
@@ -2215,17 +2246,14 @@ fn emit_update_insns<'a>(
             if let Some(btree_table) = target_table.table.btree() {
                 let updated_column_indices: HashSet<usize> =
                     set_clauses.iter().map(|(col_idx, _)| *col_idx).collect();
-                let relevant_triggers: Vec<_> =
-                    t_ctx.resolver.with_schema(update_database_id, |s| {
-                        get_relevant_triggers_type_and_time(
-                            s,
-                            TriggerEvent::Update,
-                            TriggerTime::After,
-                            Some(updated_column_indices),
-                            &btree_table,
-                        )
-                        .collect()
-                    });
+                let relevant_triggers = get_triggers_with_temp(
+                    &t_ctx.resolver,
+                    update_database_id,
+                    TriggerEvent::Update,
+                    TriggerTime::After,
+                    Some(updated_column_indices),
+                    &btree_table,
+                );
                 if !relevant_triggers.is_empty() {
                     let columns = target_table.table.columns();
 
