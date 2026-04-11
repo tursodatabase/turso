@@ -306,3 +306,58 @@ fn test_attach_inherits_index_method_flag_on_reattach(_tmp_db: TempDatabase) -> 
 
     Ok(())
 }
+
+#[test]
+fn test_attach_create_stores_canonical_schema_sql() -> anyhow::Result<()> {
+    let aux_db = TempDatabase::builder().build();
+    let aux_conn = aux_db.connect_limbo();
+    aux_conn.execute("CREATE TABLE t(name TEXT)")?;
+    do_flush(&aux_conn, &aux_db)?;
+
+    let db = attach_enabled_db(DatabaseOpts::new());
+    let conn = db.connect_limbo();
+
+    conn.execute(format!("ATTACH '{}' AS aux", aux_db.path.display()))?;
+    conn.execute("CREATE TABLE aux.t2(col TEXT)")?;
+    conn.execute("CREATE INDEX aux.idx_t_name ON t(name)")?;
+
+    let rows: Vec<(String,)> =
+        conn.exec_rows("SELECT sql FROM aux.sqlite_schema WHERE type = 'table' AND name = 't2'");
+    assert_eq!(rows, vec![("CREATE TABLE t2 (col TEXT)".to_string(),)]);
+
+    let rows: Vec<(String,)> = conn.exec_rows(
+        "SELECT sql FROM aux.sqlite_schema WHERE type = 'index' AND name = 'idx_t_name'",
+    );
+    assert_eq!(
+        rows,
+        vec![("CREATE INDEX idx_t_name ON t (name)".to_string(),)]
+    );
+
+    Ok(())
+}
+
+/// this test is very much same like `test_attach_create_stores_canonical_schema_sql` except
+/// we don't attach any db, rather access the main db as if it was attached
+#[test]
+fn test_attach_create_stores_canonical_schema_sql_on_main() -> anyhow::Result<()> {
+    let db = TempDatabase::builder().build();
+    let conn = db.connect_limbo();
+    conn.execute("CREATE TABLE t(name TEXT)")?;
+    do_flush(&conn, &db)?;
+
+    conn.execute("CREATE TABLE main.t2(col TEXT)")?;
+    conn.execute("CREATE INDEX main.idx_t_name ON t(name)")?;
+
+    let rows: Vec<(String,)> =
+        conn.exec_rows("SELECT sql FROM sqlite_schema WHERE type = 'table' AND name = 't2'");
+    assert_eq!(rows, vec![("CREATE TABLE t2 (col TEXT)".to_string(),)]);
+
+    let rows: Vec<(String,)> = conn
+        .exec_rows("SELECT sql FROM sqlite_schema WHERE type = 'index' AND name = 'idx_t_name'");
+    assert_eq!(
+        rows,
+        vec![("CREATE INDEX idx_t_name ON t (name)".to_string(),)]
+    );
+
+    Ok(())
+}
