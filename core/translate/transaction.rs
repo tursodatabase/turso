@@ -19,8 +19,17 @@ pub fn translate_tx_begin(
         approx_num_labels: 0,
     });
     let schema = resolver.schema();
-    let has_temp_db = resolver.has_temp_database();
     let tx_type = tx_type.unwrap_or(TransactionType::Deferred);
+    // For temp we never eagerly open a transaction here: temp is a
+    // per-connection database with no inter-connection locking, so
+    // there is nothing to "claim" up front. The builder path
+    // (`begin_read_on_database` / `begin_write_on_database`) emits
+    // `Insn::Transaction` for `TEMP_DB_ID` lazily when an individual
+    // statement inside the explicit transaction actually touches a
+    // temp object. Eagerly emitting it here would hard-code
+    // `TransactionMode::Write` regardless of the outer mode (which was
+    // wrong for `BEGIN CONCURRENT`) and force a write on temp even
+    // when the transaction only reads it.
     match tx_type {
         TransactionType::Deferred => {
             program.emit_insn(Insn::AutoCommit {
@@ -34,19 +43,6 @@ pub fn translate_tx_begin(
                 tx_mode: TransactionMode::Write,
                 schema_cookie: schema.schema_version,
             });
-            // Only emit Transaction for the temp database when it has been
-            // initialized (i.e. temp objects exist). The builder path handles
-            // emitting Transaction for TEMP_DB_ID when individual statements
-            // within the transaction actually touch temp tables.
-            if has_temp_db {
-                let temp_schema_cookie =
-                    resolver.with_schema(crate::TEMP_DB_ID, |s| s.schema_version);
-                program.emit_insn(Insn::Transaction {
-                    db: crate::TEMP_DB_ID,
-                    tx_mode: TransactionMode::Write,
-                    schema_cookie: temp_schema_cookie,
-                });
-            }
             program.emit_insn(Insn::AutoCommit {
                 auto_commit: false,
                 rollback: false,
@@ -58,15 +54,6 @@ pub fn translate_tx_begin(
                 tx_mode: TransactionMode::Concurrent,
                 schema_cookie: schema.schema_version,
             });
-            if has_temp_db {
-                let temp_schema_cookie =
-                    resolver.with_schema(crate::TEMP_DB_ID, |s| s.schema_version);
-                program.emit_insn(Insn::Transaction {
-                    db: crate::TEMP_DB_ID,
-                    tx_mode: TransactionMode::Write,
-                    schema_cookie: temp_schema_cookie,
-                });
-            }
             program.emit_insn(Insn::AutoCommit {
                 auto_commit: false,
                 rollback: false,

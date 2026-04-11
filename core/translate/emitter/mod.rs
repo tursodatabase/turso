@@ -157,8 +157,16 @@ pub struct Resolver<'a> {
     /// across schemas.
     pub(crate) trigger_context: Option<TriggerDatabaseContext>,
     /// Cached flag: true when this connection has an active temp database.
-    /// Computed once at Resolver construction to avoid repeated RwLock reads
-    /// on every table name resolution.
+    ///
+    /// Computed once at Resolver construction to avoid repeated
+    /// `RwLock` reads on every table-name resolution. Safe because a
+    /// `Resolver` is short-lived (single translate pass) and a
+    /// connection is single-threaded at the VDBE layer: the temp
+    /// database can only be initialized / torn down *between*
+    /// Resolvers on the same connection, not during. If you add a
+    /// path that can initialize the temp database *inside* translate
+    /// (e.g. via a nested sub-program), update this field on that
+    /// path or switch to a live read.
     has_temp_schema: bool,
 }
 

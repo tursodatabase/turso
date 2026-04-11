@@ -3058,13 +3058,28 @@ fn mirror_named_savepoint_to_active_non_main_databases(
             }
             match op {
                 SavepointMirror::Begin(frame) => {
+                    // A pager holding a read lock does not pin page 1
+                    // in the cache, so the header read inside
+                    // `open_named_savepoint_frames_on_wal_pager` can
+                    // yield IO (e.g. after cache eviction). We can't
+                    // propagate IO out of this closure, so surface it
+                    // as a loud `InternalError` rather than panicking.
+                    // In practice page 1 is almost always resident at
+                    // this point and this branch is never taken, but
+                    // converting panic → error makes the fallback
+                    // observable.
                     match open_named_savepoint_frames_on_wal_pager(
                         pager,
                         std::slice::from_ref(frame),
                     )? {
                         IOResult::Done(()) => {}
                         IOResult::IO(_) => {
-                            unreachable!("active pager header should be resident before SAVEPOINT")
+                            return Err(LimboError::InternalError(
+                                "open_named_savepoint on non-main pager returned IO \
+                                 (page 1 not cached) — this path is not yet \
+                                 IO-reentrant"
+                                    .to_string(),
+                            ));
                         }
                     }
                 }
@@ -3756,10 +3771,36 @@ pub fn op_savepoint(
                     temp_schema_snapshot,
                     staged_schema_snapshot,
                 };
-                mirror_named_savepoint_to_active_non_main_databases(
+                // Mirror onto attached/temp pagers. If any pager fails
+                // mid-flight, earlier ones already opened a savepoint
+                // with this name — and main's savepoint is already
+                // open too. Undo the partial state atomically so the
+                // connection's and pagers' savepoint stacks stay in
+                // sync. `release_named_savepoint` is idempotent on a
+                // missing name, so we can blind-release on all non-
+                // main pagers.
+                if let Err(mirror_err) = mirror_named_savepoint_to_active_non_main_databases(
                     &conn,
                     SavepointMirror::Begin(&frame),
-                )?;
+                ) {
+                    // Release the partially-opened mirror savepoints.
+                    let _ = mirror_named_savepoint_to_active_non_main_databases(
+                        &conn,
+                        SavepointMirror::Release(name),
+                    );
+                    // Release the main savepoint we just opened so it
+                    // does not linger without a connection-level frame
+                    // recording it (which would leak past commit /
+                    // rollback).
+                    if let Some(mv_store) = mv_store.as_ref() {
+                        if let Some(tx_id) = conn.get_mv_tx_id() {
+                            let _ = mv_store.release_named_savepoint(tx_id, name);
+                        }
+                    } else {
+                        let _ = pager.release_named_savepoint(name);
+                    }
+                    return Err(mirror_err);
+                }
                 conn.push_named_savepoint(frame);
                 if starts_transaction {
                     conn.auto_commit.store(false, Ordering::SeqCst);

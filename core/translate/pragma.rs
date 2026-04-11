@@ -733,8 +733,13 @@ fn update_pragma(
                     _ => bail_parse_error!("temp_store must be 0, 1, 2, DEFAULT, FILE, or MEMORY"),
                 })
             };
-            if !connection.get_auto_commit() && connection.temp.database.read().is_some() {
-                bail_parse_error!("temporary storage cannot be changed from within a transaction");
+            // SQLite: "It is not possible to change the temp_store setting after
+            // a temporary table or temporary index has been created."
+            if connection.temp.database.read().is_some() {
+                bail_parse_error!(
+                    "temporary storage cannot be changed while temporary tables, \
+                     indexes, or triggers exist"
+                );
             }
             connection.set_temp_store(temp_store);
             Ok(TransactionMode::None)

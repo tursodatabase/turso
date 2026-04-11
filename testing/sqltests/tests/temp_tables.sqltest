@@ -257,13 +257,17 @@ expect {
     0|-1|-1
 }
 
-test temp-store-change-outside-transaction-resets-temp-schema {
+# Matches SQLite: PRAGMA temp_store cannot be changed once any
+# temporary object exists. The previous behaviour silently dropped the
+# temp pager, which corrupted any cursor still iterating over a temp
+# table on the same connection. The pragma handler now refuses the
+# change unconditionally if the temp database is initialized.
+test temp-store-change-with-temp-objects-errors {
     CREATE TEMP TABLE reset_me(v INTEGER);
     PRAGMA temp_store = MEMORY;
-    SELECT count(*) FROM temp.sqlite_schema WHERE type = 'table' AND name = 'reset_me';
 }
-expect {
-    0
+expect error {
+    temporary storage cannot be changed while temporary tables, indexes, or triggers exist
 }
 
 test temp-store-change-survives-rollback-before-temp-db-exists {

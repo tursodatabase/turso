@@ -424,20 +424,17 @@ impl Connection {
         Ok(())
     }
 
-    fn reset_temp_database(&self) {
-        // TEMP is never staged in `database_schemas` — writes go directly to
-        // `temp_db.db.schema`. Drop the handle and the schema goes with it.
-        if let Some(temp_db) = self.temp.database.write().take() {
-            temp_db.pager.rollback_attached();
-        }
-        *self.temp.committed_schema.write() = None;
-        self.temp.schema_did_change.store(false, Ordering::Release);
-    }
-
     /// Flag a temp-schema mutation within the current transaction so the
     /// commit/rollback path knows to snapshot or restore the in-memory
     /// temp schema. Called from `SetCookie` for `TEMP_DB_ID`.
     pub(crate) fn mark_temp_schema_did_change(&self) {
+        // If we're marking the temp schema dirty, temp DDL must have
+        // just run against the temp pager — which means the temp
+        // database was initialized. The opposite state is unreachable.
+        turso_assert!(
+            self.temp.database.read().is_some(),
+            "mark_temp_schema_did_change called without an initialized temp database"
+        );
         self.temp.schema_did_change.store(true, Ordering::Release);
     }
 
@@ -448,10 +445,25 @@ impl Connection {
         if !self.temp.schema_did_change.load(Ordering::Acquire) {
             return;
         }
-        if let Some(temp_db) = self.temp.database.read().as_ref() {
-            let snap = temp_db.db.schema.lock().clone();
-            *self.temp.committed_schema.write() = Some(snap);
-        }
+        // `schema_did_change` is only ever set by
+        // `mark_temp_schema_did_change`, which asserts temp is
+        // initialized. If it's somehow clear here we have a logic
+        // bug — no safe recovery, so fail loud.
+        let guard = self.temp.database.read();
+        turso_assert!(
+            guard.is_some(),
+            "commit_temp_schema: schema_did_change set but temp is uninitialized"
+        );
+        let snap = guard
+            .as_ref()
+            .expect("asserted above")
+            .db
+            .schema
+            .lock()
+            .clone();
+        drop(guard);
+        // save snapshot for potential future rollback.
+        *self.temp.committed_schema.write() = Some(snap);
         self.temp.schema_did_change.store(false, Ordering::Release);
     }
 
@@ -462,8 +474,16 @@ impl Connection {
         if !self.temp.schema_did_change.load(Ordering::Acquire) {
             return;
         }
-        if let Some(temp_db) = self.temp.database.read().as_ref() {
-            let committed = self.temp.committed_schema.read().clone();
+        // Same invariant as `commit_temp_schema` — the flag can only
+        // be set while temp is initialized.
+        let committed = self.temp.committed_schema.read().clone();
+        {
+            let guard = self.temp.database.read();
+            turso_assert!(
+                guard.is_some(),
+                "rollback_temp_schema: schema_did_change set but temp is uninitialized"
+            );
+            let temp_db = guard.as_ref().expect("asserted above");
             match committed {
                 Some(snap) => *temp_db.db.schema.lock() = snap,
                 None => *temp_db.db.schema.lock() = self.empty_temp_schema(),
@@ -2514,7 +2534,18 @@ impl Connection {
         if self.temp_store.get() == value {
             return;
         }
-        self.reset_temp_database();
+        // Caller must guarantee the temp database has not been
+        // initialized — see the `temp_store` branch in
+        // `core/translate/pragma.rs`, which refuses the change if
+        // any temp object exists. Tearing down a live temp pager
+        // here would corrupt any cursor still iterating it (the
+        // page cache and dirty pages get wiped), so we instead
+        // refuse the change earlier and assert here as a backstop.
+        turso_assert!(
+            self.temp.database.read().is_none(),
+            "set_temp_store called while temp database is initialized; \
+             pragma handler must reject the change first"
+        );
         self.temp_store.set(value);
         self.bump_prepare_context_generation();
     }
