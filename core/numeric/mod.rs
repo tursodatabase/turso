@@ -717,155 +717,99 @@ pub fn str_to_f64(input: impl AsRef<str>) -> Option<StrToF64> {
     })
 }
 
-enum FloatParts {
-    Special(String),
-    Normal {
-        negative: bool,
-        digits: Vec<u8>,
-        exp: i32,
-    },
+
+
+/// Format a float in scientific notation using Rust's standard library
+/// formatting with the specified number of significant digits.
+///
+/// Uses Rust's built-in Grisu3/Dragon4 algorithms for digit extraction,
+/// which match the behavior of C's printf and SQLite's sqlite3FpDecode.
+fn format_float_scientific(v: f64, precision: usize) -> String {
+    if v.is_nan() {
+        return "".to_string();
+    }
+    if v.is_infinite() {
+        return if v.is_sign_negative() { "-Inf" } else { "Inf" }.to_string();
+    }
+    if v == 0.0 {
+        return "0.0".to_string();
+    }
+
+    // {:.Pe} gives P+1 significant digits (1 integer + P fractional)
+    let frac_digits = precision.saturating_sub(1);
+    let sci = format!("{v:.frac_digits$e}");
+    let (mantissa_str, exp_str) = sci.split_once('e').unwrap();
+    let exp: i32 = exp_str.parse().unwrap();
+
+    // Strip trailing zeros from mantissa (like %g behavior)
+    let mantissa_trimmed = mantissa_str.trim_end_matches('0');
+    let mantissa_trimmed = if mantissa_trimmed.ends_with('.') {
+        // Keep at least one digit after decimal point
+        format!("{mantissa_trimmed}0")
+    } else {
+        mantissa_trimmed.to_string()
+    };
+
+    let exp_width = if exp.abs() > 99 { 3 } else { 2 };
+    format!(
+        "{}e{}{:0width$}",
+        mantissa_trimmed,
+        if exp >= 0 { "+" } else { "-" },
+        exp.abs(),
+        width = exp_width
+    )
 }
 
-fn decompose_float(v: f64, precision: usize) -> FloatParts {
+/// Format a float value matching SQLite's `printf("%.15g")` behavior.
+///
+/// This function uses Rust's standard library formatting for digit extraction
+/// instead of the custom `decompose_float` algorithm. Rust's formatter uses
+/// Grisu3/Dragon4, which are industry-standard IEEE 754 algorithms that match
+/// the behavior of modern C printf implementations and SQLite's sqlite3FpDecode.
+///
+/// The key difference from the previous implementation: `decompose_float` used
+/// DoubleDouble arithmetic for digit extraction which could produce different
+/// last-digit rounding than standard algorithms, leading to data corruption
+/// when formatted floats were re-parsed (e.g., during text affinity conversion).
+pub fn format_float(v: f64) -> String {
     if v.is_nan() {
-        return FloatParts::Special("".to_string());
+        return "".to_string();
     }
-
     if v.is_infinite() {
-        return FloatParts::Special(if v.is_sign_negative() { "-Inf" } else { "Inf" }.to_string());
+        return if v.is_sign_negative() { "-Inf" } else { "Inf" }.to_string();
     }
-
     if v == 0.0 {
-        return FloatParts::Special("0.0".to_string());
+        return "0.0".to_string();
     }
 
-    let negative = v < 0.0;
-    let mut d = DoubleDouble(v.abs(), 0.0);
-    let mut exp = 0;
+    // Use {:.14e} to get 15 significant digits in scientific notation
+    // (1 integer digit + 14 fractional digits = 15 significant digits)
+    let sci = format!("{v:.14e}");
+    let (_mantissa_str, exp_str) = sci.split_once('e').unwrap();
+    let exp: i32 = exp_str.parse().unwrap();
 
-    if d.0 > 9.223_372_036_854_775e18 {
-        while d.0 > 9.223_372_036_854_774e118 {
-            exp += 100;
-            d *= DoubleDouble::NEG_E100;
-        }
-        while d.0 > 9.223_372_036_854_774e28 {
-            exp += 10;
-            d *= DoubleDouble::NEG_E10;
-        }
-        while d.0 > 9.223_372_036_854_775e18 {
-            exp += 1;
-            d *= DoubleDouble::NEG_E1;
+    // SQLite's %.15g uses fixed notation when exponent is in [-4, precision-1]
+    // For precision=15: [-4, 14]
+    if (-4..=14).contains(&exp) {
+        // Use fixed notation with enough decimal places to show 15 sig digits
+        // Number of decimal places = max(0, 14 - exp) for 15 sig digits
+        let decimal_places = (14 - exp).max(0) as usize;
+        let fixed = format!("{v:.decimal_places$}");
+
+        // Strip trailing zeros but keep at least one digit after '.'
+        if !fixed.contains('.') {
+            // No decimal point at all (e.g., format!("{:.0}", 123456789012345.0))
+            format!("{fixed}.0")
+        } else {
+            let trimmed = fixed.trim_end_matches('0');
+            if trimmed.ends_with('.') {
+                format!("{trimmed}0")
+            } else {
+                trimmed.to_string()
+            }
         }
     } else {
-        while d.0 < 9.223_372_036_854_775e-83 {
-            exp -= 100;
-            d *= DoubleDouble::E100;
-        }
-        while d.0 < 9.223_372_036_854_775e7 {
-            exp -= 10;
-            d *= DoubleDouble::E10;
-        }
-        while d.0 < 9.223_372_036_854_775e17 {
-            exp -= 1;
-            d *= DoubleDouble::E1;
-        }
-    }
-
-    let mut digits = u64::from(d).to_string().into_bytes();
-    let mut decimal_pos = digits.len() as i32 + exp;
-
-    'out: {
-        if digits.len() > precision {
-            let round_up = digits[precision] >= b'5';
-            digits.truncate(precision);
-
-            if round_up {
-                for i in (0..precision).rev() {
-                    if digits[i] < b'9' {
-                        digits[i] += 1;
-                        break 'out;
-                    }
-                    digits[i] = b'0';
-                }
-
-                digits.insert(0, b'1');
-                decimal_pos += 1;
-            }
-        }
-    }
-
-    while digits.len() > 1 && digits[digits.len() - 1] == b'0' {
-        digits.pop();
-    }
-
-    FloatParts::Normal {
-        negative,
-        digits,
-        exp: decimal_pos - 1,
-    }
-}
-
-fn format_float_scientific(v: f64, precision: usize) -> String {
-    match decompose_float(v, precision) {
-        FloatParts::Special(s) => s,
-        FloatParts::Normal {
-            negative,
-            digits,
-            exp,
-        } => {
-            let first = digits.first().cloned().unwrap_or(b'0') as char;
-            let rest = digits
-                .get(1..)
-                .filter(|v| !v.is_empty())
-                .map(|v| unsafe { str::from_utf8_unchecked(v) })
-                .unwrap_or("0");
-            format!(
-                "{}{}.{}e{}{:0width$}",
-                if negative { "-" } else { "" },
-                first,
-                rest,
-                if exp.is_positive() { "+" } else { "-" },
-                exp.abs(),
-                width = if exp.abs() > 99 { 3 } else { 2 }
-            )
-        }
-    }
-}
-
-pub fn format_float(v: f64) -> String {
-    match decompose_float(v, 15) {
-        FloatParts::Special(s) => s,
-        FloatParts::Normal {
-            negative,
-            digits,
-            exp,
-        } => {
-            let decimal_pos = exp + 1;
-            if (-4..=14).contains(&exp) {
-                format!(
-                    "{}{}.{}{}",
-                    if negative { "-" } else { Default::default() },
-                    if decimal_pos > 0 {
-                        let zeroes = (decimal_pos - digits.len() as i32).max(0) as usize;
-                        let digits = digits
-                            .get(0..(decimal_pos.min(digits.len() as i32) as usize))
-                            .unwrap();
-                        (unsafe { str::from_utf8_unchecked(digits) }).to_owned()
-                            + &"0".repeat(zeroes)
-                    } else {
-                        "0".to_string()
-                    },
-                    "0".repeat(decimal_pos.min(0).unsigned_abs() as usize),
-                    digits
-                        .get((decimal_pos.max(0) as usize)..)
-                        .filter(|v| !v.is_empty())
-                        .map(|v| unsafe { str::from_utf8_unchecked(v) })
-                        .unwrap_or("0")
-                )
-            } else {
-                format_float_scientific(v, 15)
-            }
-        }
+        format_float_scientific(v, 15)
     }
 }
 
@@ -879,11 +823,33 @@ pub fn format_float_for_quote(v: f64) -> String {
 
 #[test]
 fn test_decode_float() {
-    assert_eq!(format_float(9.93e-322), "9.93071948140905e-322");
+    // These expected values match SQLite's printf("%.15g") output
+    assert_eq!(format_float(9.93e-322), "9.93071948140906e-322");
     assert_eq!(format_float(9.93), "9.93");
     assert_eq!(format_float(0.093), "0.093");
     assert_eq!(format_float(-0.093), "-0.093");
     assert_eq!(format_float(0.0), "0.0");
     assert_eq!(format_float(4.94e-322), "4.94065645841247e-322");
     assert_eq!(format_float(-20228007.0), "-20228007.0");
+}
+
+#[test]
+fn test_format_float_matches_sqlite() {
+    // Values that previously failed due to decompose_float rounding differences
+    assert_eq!(format_float(-8487739174.3030205), "-8487739174.30302");
+    assert_eq!(format_float(std::f64::consts::PI), "3.14159265358979");
+    assert_eq!(format_float(std::f64::consts::E), "2.71828182845905");
+    assert_eq!(format_float(-3549238712.7522917), "-3549238712.75229");
+    assert_eq!(format_float(220236260.57372093), "220236260.573721");
+}
+
+#[test]
+fn test_format_float_edge_cases() {
+    assert_eq!(format_float(f64::NAN), "");
+    assert_eq!(format_float(f64::INFINITY), "Inf");
+    assert_eq!(format_float(f64::NEG_INFINITY), "-Inf");
+    assert_eq!(format_float(1.0), "1.0");
+    assert_eq!(format_float(-1.0), "-1.0");
+    assert_eq!(format_float(0.1 + 0.2), "0.3");
+    assert_eq!(format_float(123456789012345.0), "123456789012345.0");
 }
