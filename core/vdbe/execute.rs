@@ -13931,6 +13931,12 @@ fn op_vacuum_into_inner(
                 // must be set before page 1 is allocated (before any schema operations)
                 dest_conn.set_reserved_bytes(reserved_space)?;
 
+                // The source database doesn't use checksums, so we must disable them
+                // in the destination to prevent them from overwriting our data.
+                if reserved_space != crate::storage::checksum::CHECKSUM_REQUIRED_RESERVED_BYTES {
+                    dest_conn.pager.load().reset_checksum_context();
+                }
+
                 // Enable MVCC on destination if source has it enabled
                 // Must be done before any schema operations to ensure the log file is created
                 if source_db.mvcc_enabled() {
