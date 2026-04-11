@@ -5,9 +5,6 @@
 //! implementations live in `execute.rs` and delegate to these types for
 //! schema classification and phase ordering.
 
-use crate::numeric::Numeric;
-use crate::types::Value;
-
 /// A typed representation of a row from `sqlite_schema`.
 ///
 /// Carries `rootpage` so we can distinguish storage-backed tables/indexes
@@ -33,46 +30,29 @@ pub(crate) enum SchemaEntryType {
 }
 
 impl SchemaEntryType {
-    pub fn from_str(s: &str) -> Option<Self> {
+    pub fn from_str(s: &str) -> crate::Result<Self> {
         match s {
-            "table" => Some(Self::Table),
-            "index" => Some(Self::Index),
-            "trigger" => Some(Self::Trigger),
-            "view" => Some(Self::View),
-            _ => None,
+            "table" => Ok(Self::Table),
+            "index" => Ok(Self::Index),
+            "trigger" => Ok(Self::Trigger),
+            "view" => Ok(Self::View),
+            other => Err(crate::error::LimboError::Corrupt(format!(
+                "unexpected sqlite_schema type: {other}"
+            ))),
         }
     }
 }
 
 impl SchemaEntry {
-    /// Parse a schema entry from a row of values in the order:
-    /// `(type, name, tbl_name, rootpage, sql)`.
-    pub fn from_row(values: &[Value], ordinal: usize) -> Option<Self> {
-        if values.len() < 5 {
-            return None;
-        }
-        let entry_type = match &values[0] {
-            Value::Text(t) => SchemaEntryType::from_str(t.as_str())?,
-            _ => return None,
-        };
-        let name = match &values[1] {
-            Value::Text(t) => t.as_str().to_string(),
-            _ => return None,
-        };
-        // values[2] is tbl_name — skip, not needed for current phases.
-        let rootpage = match &values[3] {
-            Value::Numeric(Numeric::Integer(n)) => *n,
-            _ => return None,
-        };
-        let sql = match &values[4] {
-            Value::Text(t) => t.as_str().to_string(),
-            _ => return None,
-        };
-        Some(Self {
+    /// Parse from a sqlite_schema row: (type, name, tbl_name, rootpage, sql)
+    pub fn from_row(row: &crate::vdbe::Row, ordinal: usize) -> crate::Result<Self> {
+        let entry_type = SchemaEntryType::from_str(row.get::<&str>(0)?)?;
+        Ok(Self {
             entry_type,
-            name,
-            rootpage,
-            sql,
+            name: row.get::<&str>(1)?.to_string(),
+            // row index 2 is tbl_name — not needed
+            rootpage: row.get::<i64>(3)?,
+            sql: row.get::<&str>(4)?.to_string(),
             ordinal,
         })
     }

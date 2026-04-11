@@ -14033,14 +14033,10 @@ fn op_vacuum_into_inner(
                         let row = schema_stmt
                             .row()
                             .expect("StepResult::Row but row() returned None");
-                        let values: Vec<Value> = row.get_values().cloned().collect();
                         let ordinal = vacuum_state.schema_entries.len();
-                        let entry = SchemaEntry::from_row(&values, ordinal).ok_or_else(|| {
-                            LimboError::Corrupt(format!(
-                                "malformed sqlite_schema row at ordinal {ordinal}"
-                            ))
-                        })?;
-                        vacuum_state.schema_entries.push(entry);
+                        vacuum_state
+                            .schema_entries
+                            .push(SchemaEntry::from_row(row, ordinal)?);
                         vacuum_state.sub_state = OpVacuumIntoSubState::CollectSchemaRows {
                             dest_conn,
                             schema_stmt,
