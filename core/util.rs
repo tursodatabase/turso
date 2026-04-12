@@ -4386,6 +4386,7 @@ pub mod tests {
                 name: "INTEGER".to_string(),
                 size: None,
                 array_dimensions: 0,
+                parameterized: None,
             }),
         };
 
@@ -4395,6 +4396,7 @@ pub mod tests {
                 name: "integer".to_string(),
                 size: None,
                 array_dimensions: 0,
+                parameterized: None,
             }),
         };
         assert!(exprs_are_equivalent(&cast1, &cast2));

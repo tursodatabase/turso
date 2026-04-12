@@ -790,6 +790,15 @@ fn validate(
                     );
                 }
 
+                // Inline STRUCT/UNION column types are not supported.
+                // Use CREATE TYPE to define a named type, then reference it by name.
+                if col_type.parameterized.is_some() {
+                    bail_parse_error!(
+                        "inline STRUCT/UNION column types are not supported; \
+                         use CREATE TYPE to define a named type first, then use the type name in the column definition"
+                    );
+                }
+
                 if !is_builtin && is_strict {
                     // On non-STRICT tables any type name is allowed and is
                     // treated as a plain affinity hint (no encode/decode).
@@ -2041,16 +2050,23 @@ pub fn translate_create_type(
         bail_parse_error!("type {normalized_name} already exists");
     }
 
-    // Validate encode/decode expressions for safety
-    if let Some(ref encode) = body.encode {
-        validate_type_expr(encode, "ENCODE", resolver)?;
-    }
-    if let Some(ref decode) = body.decode {
-        validate_type_expr(decode, "DECODE", resolver)?;
+    // Validate encode/decode expressions for safety (only for custom types)
+    if let ast::CreateTypeBody::CustomType {
+        ref encode,
+        ref decode,
+        ..
+    } = body
+    {
+        if let Some(ref encode) = encode {
+            validate_type_expr(encode, "ENCODE", resolver)?;
+        }
+        if let Some(ref decode) = decode {
+            validate_type_expr(decode, "DECODE", resolver)?;
+        }
     }
 
     // Reconstruct the SQL string (without IF NOT EXISTS) using TypeDef::to_sql()
-    let type_def = crate::schema::TypeDef::from_create_type(&normalized_name, body, false);
+    let type_def = crate::schema::TypeDef::from_create_type(&normalized_name, body, false)?;
     let sql = type_def.to_sql();
 
     // Ensure sqlite_turso_types table exists (lazy creation)

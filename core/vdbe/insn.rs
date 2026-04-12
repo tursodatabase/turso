@@ -601,6 +601,48 @@ pub enum Insn {
         dest: usize,
     },
 
+    /// Pack N contiguous registers into a struct blob (record-format).
+    /// Reads `count` values from start_reg..start_reg+count,
+    /// serializes via ImmutableRecord, stores Value::Blob in dest.
+    StructPack {
+        start_reg: usize,
+        count: usize,
+        dest: usize,
+    },
+
+    /// Extract a field from a struct blob by field index.
+    /// If src_reg is NULL, dest = NULL.
+    StructField {
+        src_reg: usize,
+        field_index: usize,
+        dest: usize,
+    },
+
+    /// Pack a tag index and a value into a union blob.
+    /// Format: [tag_index: 1 byte][record-format value].
+    UnionPack {
+        tag_index: u8,
+        value_reg: usize,
+        dest: usize,
+    },
+
+    /// Extract the tag name from a union blob as text.
+    /// Reads the tag index byte, looks up the name via tag_names.
+    /// If src_reg is NULL, dest = NULL. Otherwise dest = tag name as Text.
+    UnionTag {
+        src_reg: usize,
+        dest: usize,
+        tag_names: Arc<Vec<String>>,
+    },
+
+    /// Extract the value from a union blob if the tag index matches.
+    /// If tag matches, dest = extracted value. If mismatch or NULL, dest = NULL.
+    UnionExtract {
+        src_reg: usize,
+        expected_tag: u8,
+        dest: usize,
+    },
+
     /// Copy a register value to a dynamically-computed destination.
     /// dest = registers[base + registers[offset_reg]]
     /// registers[base + registers[offset_reg]] = registers[src]
@@ -1819,6 +1861,11 @@ impl InsnVariants {
             InsnVariants::ArrayLength => execute::op_array_length,
             InsnVariants::MakeArray => execute::op_make_array,
             InsnVariants::MakeArrayDynamic => execute::op_make_array_dynamic,
+            InsnVariants::StructPack => execute::op_struct_pack,
+            InsnVariants::StructField => execute::op_struct_field,
+            InsnVariants::UnionPack => execute::op_union_pack,
+            InsnVariants::UnionTag => execute::op_union_tag,
+            InsnVariants::UnionExtract => execute::op_union_extract,
             InsnVariants::RegCopyOffset => execute::op_reg_copy_offset,
             InsnVariants::ArrayConcat => execute::op_array_concat,
             InsnVariants::ArraySetElement => execute::op_array_set_element,

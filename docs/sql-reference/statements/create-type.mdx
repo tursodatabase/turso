@@ -279,11 +279,162 @@ Turso provides the following built-in custom types in STRICT tables:
 The `uuid`, `json`, and `jsonb` types require their respective extensions to be compiled in. They are available by default in standard Turso builds.
 </Info>
 
+## Composite Types: STRUCT and UNION
+
+In addition to encode/decode custom types, CREATE TYPE supports two composite type forms: **STRUCT** (named product type) and **UNION** (discriminated union / tagged variant). Both store data as blobs on disk and require STRICT tables.
+
+### STRUCT
+
+A STRUCT groups multiple named fields into a single column. Fields are accessed with dot notation.
+
+```sql
+CREATE TYPE point AS STRUCT(x INT, y INT);
+
+CREATE TABLE locations (
+    id INTEGER PRIMARY KEY,
+    pos point
+) STRICT;
+
+INSERT INTO locations VALUES (1, struct_pack(10, 20));
+INSERT INTO locations VALUES (2, struct_pack(30, 40));
+
+SELECT pos.x, pos.y FROM locations WHERE id = 1;
+-- 10|20
+
+SELECT id, pos.x FROM locations WHERE pos.y > 25;
+-- 2|30
+```
+
+#### struct_pack()
+
+Creates a struct value. Arguments are positional, matching the field order in the type definition.
+
+```sql
+CREATE TYPE address AS STRUCT(street TEXT, city TEXT, zip TEXT);
+CREATE TABLE people(name TEXT, home address) STRICT;
+
+INSERT INTO people VALUES ('Alice', struct_pack('123 Main St', 'Springfield', '62704'));
+
+SELECT name, home.city, home.zip FROM people;
+-- Alice|Springfield|62704
+```
+
+### UNION
+
+A UNION is a discriminated union (tagged variant). Each value carries exactly one of the declared variants. The active variant is identified by a tag.
+
+```sql
+CREATE TYPE platform_id AS UNION(telegram INT, slack TEXT, signal TEXT);
+
+CREATE TABLE contacts (
+    id INTEGER PRIMARY KEY,
+    platform platform_id
+) STRICT;
+
+INSERT INTO contacts VALUES (1, union_value('telegram', 12345));
+INSERT INTO contacts VALUES (2, union_value('slack', 'U0ABC'));
+INSERT INTO contacts VALUES (3, union_value('signal', '+1555'));
+```
+
+#### union_value()
+
+Creates a union value. The first argument is the variant tag (a string literal), the second is the value.
+
+```sql
+INSERT INTO contacts VALUES (1, union_value('telegram', 12345));
+```
+
+#### union_tag()
+
+Returns the tag name of the active variant as text.
+
+```sql
+SELECT id, union_tag(platform) FROM contacts ORDER BY id;
+-- 1|telegram
+-- 2|slack
+-- 3|signal
+```
+
+#### Dot notation (field extraction)
+
+Access a variant's value with dot notation. Returns NULL if the active variant doesn't match.
+
+```sql
+SELECT id, platform.telegram FROM contacts ORDER BY id;
+-- 1|12345
+-- 2|
+-- 3|
+
+SELECT id, platform.slack FROM contacts WHERE union_tag(platform) = 'slack';
+-- 2|U0ABC
+```
+
+#### union_extract()
+
+Explicit function form of dot-notation extraction. The second argument is the variant tag (a string literal).
+
+```sql
+SELECT union_extract(platform, 'telegram') FROM contacts WHERE id = 1;
+-- 12345
+```
+
+### NULL handling
+
+NULL values propagate through all struct and union operations:
+
+```sql
+CREATE TYPE number AS UNION(i INT, f REAL);
+CREATE TABLE values_t(id INT, val number) STRICT;
+
+INSERT INTO values_t VALUES (1, union_value('i', 42));
+INSERT INTO values_t VALUES (2, union_value('f', 3.14));
+INSERT INTO values_t VALUES (3, NULL);
+
+SELECT id, val.i, val.f FROM values_t ORDER BY id;
+-- 1|42|
+-- 2||3.14
+-- 3||
+```
+
+### Dot notation precedence
+
+When a dot expression `a.b` is ambiguous (e.g., `a` could be a table name or a column name), table references always take priority over struct field access. This follows DuckDB's resolution rules.
+
+```sql
+CREATE TYPE point AS STRUCT(x INT, y INT);
+CREATE TABLE t(x INT, t point) STRICT;
+INSERT INTO t VALUES (99, struct_pack(10, 20));
+
+-- t.x resolves as table.column (99), not column.field (10)
+SELECT t.x FROM t;
+-- 99
+
+-- Use an alias to reach the struct field
+SELECT s.t.x FROM t AS s;
+-- 10
+```
+
+For `a.b.c`, the resolution order is: database.table.column, then table.column.field.
+
+### Inline types not supported
+
+Inline STRUCT/UNION declarations in column definitions are not supported. Always use CREATE TYPE first:
+
+```sql
+-- This will error:
+CREATE TABLE t(data STRUCT(x INT, y INT)) STRICT;
+
+-- Do this instead:
+CREATE TYPE point AS STRUCT(x INT, y INT);
+CREATE TABLE t(data point) STRICT;
+```
+
 ## Restrictions
 
 - **STRICT tables only**: Custom type names are ignored in non-STRICT tables. The column uses standard type affinity rules instead.
 - **Cannot drop while in use**: A type cannot be dropped with DROP TYPE while any table has a column of that type.
 - **No subqueries in expressions**: The ENCODE, DECODE, and DEFAULT expressions cannot contain subqueries, aggregate functions, or window functions.
+- **No indexes on STRUCT/UNION columns**: CREATE INDEX on a STRUCT or UNION column is not supported.
 
 ## Examples
 

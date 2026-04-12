@@ -550,6 +550,11 @@ pub enum ScalarFunc {
     ArrayToString,
     ArrayOverlap,
     ArrayContainsAll,
+    // Struct/Union construction and access
+    StructPack,
+    UnionValueFunc,
+    UnionTagFunc,
+    UnionExtractFunc,
 }
 
 impl Deterministic for ScalarFunc {
@@ -656,6 +661,10 @@ impl Deterministic for ScalarFunc {
             | ScalarFunc::ArrayToString
             | ScalarFunc::ArrayOverlap
             | ScalarFunc::ArrayContainsAll => true,
+            ScalarFunc::StructPack
+            | ScalarFunc::UnionValueFunc
+            | ScalarFunc::UnionTagFunc
+            | ScalarFunc::UnionExtractFunc => true,
         }
     }
 }
@@ -787,6 +796,10 @@ impl Display for ScalarFunc {
             Self::ArrayToString => "array_to_string",
             Self::ArrayOverlap => "array_overlap",
             Self::ArrayContainsAll => "array_contains_all",
+            Self::StructPack => "struct_pack",
+            Self::UnionValueFunc => "union_value",
+            Self::UnionTagFunc => "union_tag",
+            Self::UnionExtractFunc => "union_extract",
         };
         write!(f, "{str}")
     }
@@ -922,6 +935,11 @@ impl ScalarFunc {
             Self::ArraySlice => &[3],
             Self::StringToArray => &[2, 3],
             Self::ArrayToString => &[2, 3],
+            // Struct/Union functions
+            Self::StructPack => &[-1], // variable arity (matches struct field count)
+            Self::UnionValueFunc => &[2], // union_value('tag', value)
+            Self::UnionTagFunc => &[1], // union_tag(col)
+            Self::UnionExtractFunc => &[2], // union_extract(col, 'tag')
         }
     }
 
@@ -1460,6 +1478,11 @@ impl Func {
             "array_to_string" => Ok(Some(Self::Scalar(ScalarFunc::ArrayToString))),
             "array_overlap" | "array_overlaps" => Ok(Some(Self::Scalar(ScalarFunc::ArrayOverlap))),
             "array_contains_all" => Ok(Some(Self::Scalar(ScalarFunc::ArrayContainsAll))),
+            // Struct/Union functions
+            "struct_pack" => Ok(Some(Self::Scalar(ScalarFunc::StructPack))),
+            "union_value" => Ok(Some(Self::Scalar(ScalarFunc::UnionValueFunc))),
+            "union_tag" => Ok(Some(Self::Scalar(ScalarFunc::UnionTagFunc))),
+            "union_extract" => Ok(Some(Self::Scalar(ScalarFunc::UnionExtractFunc))),
             _ => Ok(None),
         }
     }

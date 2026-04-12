@@ -181,6 +181,35 @@ fn quote_string_literal(s: &str) -> String {
     s.replace('\'', "''")
 }
 
+/// Field definition within a StructDef.
+#[derive(Debug, Clone)]
+pub struct StructFieldDef {
+    pub name: String,
+    pub field_index: usize,
+    pub base_affinity: Affinity,
+    pub type_name: String,
+}
+
+/// Definition for a STRUCT composite type.
+#[derive(Debug, Clone)]
+pub struct StructDef {
+    pub fields: Vec<StructFieldDef>,
+}
+
+/// Variant definition within a UnionDef.
+#[derive(Debug, Clone)]
+pub struct UnionVariantDef {
+    pub tag_name: String,
+    pub base_affinity: Affinity,
+    pub type_name: String,
+}
+
+/// Definition for a UNION discriminated union type.
+#[derive(Debug, Clone)]
+pub struct UnionDef {
+    pub variants: Vec<UnionVariantDef>,
+}
+
 /// Custom type definition, loaded from sqlite_turso_types
 #[derive(Debug, Clone)]
 pub struct TypeDef {
@@ -192,21 +221,121 @@ pub struct TypeDef {
     pub operators: Vec<TypeOperator>,
     pub default: Option<Box<ast::Expr>>,
     pub is_builtin: bool,
+    pub struct_def: Option<StructDef>,
+    pub union_def: Option<UnionDef>,
 }
 
 impl TypeDef {
+    /// Returns true if this is a STRUCT type.
+    pub fn is_struct(&self) -> bool {
+        self.struct_def.is_some()
+    }
+
+    /// Returns true if this is a UNION type.
+    pub fn is_union(&self) -> bool {
+        self.union_def.is_some()
+    }
+
+    /// Find a struct field by name. Returns (field_index, &StructFieldDef).
+    pub fn find_struct_field(&self, name: &str) -> Option<(usize, &StructFieldDef)> {
+        self.struct_def.as_ref().and_then(|sd| {
+            sd.fields
+                .iter()
+                .enumerate()
+                .find(|(_, f)| f.name.eq_ignore_ascii_case(name))
+        })
+    }
+
+    /// Find a union variant by name.
+    pub fn find_union_variant(&self, name: &str) -> Option<&UnionVariantDef> {
+        self.union_def.as_ref().and_then(|ud| {
+            ud.variants
+                .iter()
+                .find(|v| v.tag_name.eq_ignore_ascii_case(name))
+        })
+    }
+
     /// Construct a TypeDef from a parsed CREATE TYPE statement.
-    pub fn from_create_type(type_name: &str, body: &ast::CreateTypeBody, is_builtin: bool) -> Self {
-        Self {
-            name: type_name.to_string(),
-            params: body.params.clone(),
-            base: body.base.clone(),
-            encode: body.encode.clone(),
-            decode: body.decode.clone(),
-            operators: body.operators.clone(),
-            default: body.default.clone(),
-            is_builtin,
-        }
+    pub fn from_create_type(
+        type_name: &str,
+        body: &ast::CreateTypeBody,
+        is_builtin: bool,
+    ) -> crate::Result<Self> {
+        Ok(match body {
+            ast::CreateTypeBody::CustomType {
+                params,
+                base,
+                encode,
+                decode,
+                operators,
+                default,
+            } => Self {
+                name: type_name.to_string(),
+                params: params.clone(),
+                base: base.clone(),
+                encode: encode.clone(),
+                decode: decode.clone(),
+                operators: operators.clone(),
+                default: default.clone(),
+                is_builtin,
+                struct_def: None,
+                union_def: None,
+            },
+            ast::CreateTypeBody::Struct(fields) => {
+                let struct_fields: Vec<StructFieldDef> = fields
+                    .iter()
+                    .enumerate()
+                    .map(|(i, f)| StructFieldDef {
+                        name: f.name.to_string(),
+                        field_index: i,
+                        base_affinity: Affinity::affinity(&f.field_type.name),
+                        type_name: f.field_type.name.clone(),
+                    })
+                    .collect();
+                Self {
+                    name: type_name.to_string(),
+                    params: Vec::new(),
+                    base: "blob".to_string(),
+                    encode: None,
+                    decode: None,
+                    operators: Vec::new(),
+                    default: None,
+                    is_builtin,
+                    struct_def: Some(StructDef {
+                        fields: struct_fields,
+                    }),
+                    union_def: None,
+                }
+            }
+            ast::CreateTypeBody::Union(fields) => {
+                if fields.len() > 256 {
+                    return Err(crate::LimboError::ParseError(format!(
+                        "UNION type cannot have more than 256 variants (got {})",
+                        fields.len()
+                    )));
+                }
+                let variants: Vec<UnionVariantDef> = fields
+                    .iter()
+                    .map(|f| UnionVariantDef {
+                        tag_name: f.name.to_string(),
+                        base_affinity: Affinity::affinity(&f.field_type.name),
+                        type_name: f.field_type.name.clone(),
+                    })
+                    .collect();
+                Self {
+                    name: type_name.to_string(),
+                    params: Vec::new(),
+                    base: "blob".to_string(),
+                    encode: None,
+                    decode: None,
+                    operators: Vec::new(),
+                    default: None,
+                    is_builtin,
+                    struct_def: None,
+                    union_def: Some(UnionDef { variants }),
+                }
+            }
+        })
     }
 
     /// The expected input type for `value` in this custom type.
@@ -230,6 +359,32 @@ impl TypeDef {
 
     /// Reconstruct the CREATE TYPE SQL string from this definition.
     pub fn to_sql(&self) -> String {
+        // Struct and Union types use AS STRUCT(...) / AS UNION(...) syntax
+        if let Some(ref sd) = self.struct_def {
+            let fields: Vec<String> = sd
+                .fields
+                .iter()
+                .map(|f| format!("{} {}", quote_ident(&f.name), f.type_name))
+                .collect();
+            return format!(
+                "CREATE TYPE {} AS STRUCT({})",
+                quote_ident(&self.name),
+                fields.join(", ")
+            );
+        }
+        if let Some(ref ud) = self.union_def {
+            let variants: Vec<String> = ud
+                .variants
+                .iter()
+                .map(|v| format!("{} {}", quote_ident(&v.tag_name), v.type_name))
+                .collect();
+            return format!(
+                "CREATE TYPE {} AS UNION({})",
+                quote_ident(&self.name),
+                variants.join(", ")
+            );
+        }
+
         let mut sql = if self.params.is_empty() {
             format!(
                 "CREATE TYPE {} BASE {}",
@@ -470,7 +625,8 @@ fn bootstrap_builtin_types(registry: &mut HashMap<String, Arc<TypeDef>>) {
             panic!("Failed to parse built-in type SQL: {sql}");
         };
 
-        let type_def = TypeDef::from_create_type(&type_name, &body, true);
+        let type_def = TypeDef::from_create_type(&type_name, &body, true)
+            .unwrap_or_else(|e| panic!("Failed to create built-in type '{type_name}': {e}"));
         registry.insert(type_name.to_lowercase(), Arc::new(type_def));
     }
 
@@ -558,6 +714,30 @@ impl Schema {
         self.type_registry.get(&type_name.to_lowercase())
     }
 
+    /// Search all registered union types for a variant with the given name.
+    /// Returns the tag index if exactly one union type contains the variant.
+    /// Used by union_value() where the target type is not known from context.
+    pub fn find_union_tag_index(&self, variant_name: &str) -> Option<u8> {
+        let mut result = None;
+        for td in self.type_registry.values() {
+            if let Some(ud) = &td.union_def {
+                if let Some(idx) = ud
+                    .variants
+                    .iter()
+                    .position(|v| v.tag_name.eq_ignore_ascii_case(variant_name))
+                {
+                    if result.is_some() {
+                        // Ambiguous: multiple union types have this variant name.
+                        // Caller should error.
+                        return None;
+                    }
+                    result = Some(idx as u8);
+                }
+            }
+        }
+        result
+    }
+
     pub fn remove_type(&mut self, type_name: &str) {
         self.type_registry.remove(&type_name.to_lowercase());
     }
@@ -577,7 +757,7 @@ impl Schema {
             )));
         };
 
-        let type_def = TypeDef::from_create_type(&type_name, &body, false);
+        let type_def = TypeDef::from_create_type(&type_name, &body, false)?;
         self.type_registry
             .insert(type_name.to_lowercase(), Arc::new(type_def));
         Ok(())

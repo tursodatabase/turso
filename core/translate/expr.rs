@@ -231,6 +231,47 @@ macro_rules! expect_arguments_max {
     }};
 }
 
+/// Translate a function that is desugared into a dedicated variadic-argument instruction.
+/// Evaluates all args into consecutive registers, then emits the instruction.
+/// The instruction must have fields `start_reg`, `count`, and `dest`.
+///
+/// Used by: Array (MakeArray), StructPack.
+macro_rules! translate_variadic_insn {
+    ($program:expr, $referenced_tables:expr, $resolver:expr, $args:expr, $dest:expr,
+     $Insn:ident) => {{
+        let start_reg = $program.alloc_registers($args.len());
+        for (i, arg) in $args.iter().enumerate() {
+            translate_expr($program, $referenced_tables, arg, start_reg + i, $resolver)?;
+        }
+        $program.emit_insn(Insn::$Insn {
+            start_reg,
+            count: $args.len(),
+            dest: $dest,
+        });
+        Ok($dest)
+    }};
+}
+
+/// Translate a function that is desugared into a dedicated fixed-argument instruction.
+/// Evaluates each arg into its own register, then emits the instruction using a
+/// caller-provided expression that can reference the allocated registers by index.
+///
+/// `$reg_names` is a comma-separated list of identifiers bound to allocated
+/// registers for the corresponding arg indices.
+///
+/// Used by: ArrayElement, ArraySetElement, UnionTag, UnionExtract, UnionValue.
+macro_rules! translate_fixed_insn {
+    ($program:expr, $referenced_tables:expr, $resolver:expr, $args:expr, $dest:expr,
+     [$($reg_name:ident <- $idx:expr),+], $insn_expr:expr) => {{
+        $(
+            let $reg_name = $program.alloc_register();
+            translate_expr($program, $referenced_tables, &$args[$idx], $reg_name, $resolver)?;
+        )+
+        $program.emit_insn($insn_expr);
+        Ok($dest)
+    }};
+}
+
 #[inline]
 /// For expression indexes, try to emit code that directly reads the value from the index
 /// under the following conditions:
@@ -565,7 +606,12 @@ pub fn translate_condition_expr(
         }
         ast::Expr::DoublyQualified(_, _, _) | ast::Expr::Id(_) | ast::Expr::Qualified(_, _) => {
             crate::bail_parse_error!(
-                "DoublyQualified/Id/Qualified should have been rewritten in optimizer"
+                "DoublyQualified/Id/Qualified should have been rewritten to Column during binding"
+            );
+        }
+        ast::Expr::FieldAccess { .. } => {
+            crate::bail_parse_error!(
+                "struct/union field access cannot be used as a bare boolean condition in WHERE"
             );
         }
         ast::Expr::Exists(_) => {
@@ -1819,85 +1865,27 @@ pub fn translate_expr(
                         ScalarFunc::Cast => {
                             unreachable!("this is always ast::Expr::Cast")
                         }
+                        // Arity and custom-types checks are done at bind time
+                        // in validate_custom_type_function_call.
                         ScalarFunc::Array => {
-                            resolver.require_custom_types("Array features")?;
-                            let start_reg = program.alloc_registers(args.len());
-                            for (i, arg) in args.iter().enumerate() {
-                                translate_expr(
-                                    program,
-                                    referenced_tables,
-                                    arg,
-                                    start_reg + i,
-                                    resolver,
-                                )?;
-                            }
-                            program.emit_insn(Insn::MakeArray {
-                                start_reg,
-                                count: args.len(),
-                                dest: target_register,
-                            });
-                            Ok(target_register)
+                            translate_variadic_insn!(
+                                program,
+                                referenced_tables,
+                                resolver,
+                                args,
+                                target_register,
+                                MakeArray
+                            )
                         }
                         ScalarFunc::ArrayElement => {
-                            resolver.require_custom_types("Array features")?;
-                            let args = expect_arguments_exact!(args, 2, srf);
-                            let base_reg = program.alloc_register();
-                            translate_expr(
-                                program,
-                                referenced_tables,
-                                &args[0],
-                                base_reg,
-                                resolver,
-                            )?;
-                            let index_reg = program.alloc_register();
-                            translate_expr(
-                                program,
-                                referenced_tables,
-                                &args[1],
-                                index_reg,
-                                resolver,
-                            )?;
-                            program.emit_insn(Insn::ArrayElement {
-                                array_reg: base_reg,
-                                index_reg,
-                                dest: target_register,
-                            });
-                            Ok(target_register)
+                            translate_fixed_insn!(program, referenced_tables, resolver, args, target_register,
+                                [array_reg <- 0, index_reg <- 1],
+                                Insn::ArrayElement { array_reg, index_reg, dest: target_register })
                         }
                         ScalarFunc::ArraySetElement => {
-                            resolver.require_custom_types("Array features")?;
-                            let args = expect_arguments_exact!(args, 3, srf);
-                            let array_reg = program.alloc_register();
-                            translate_expr(
-                                program,
-                                referenced_tables,
-                                &args[0],
-                                array_reg,
-                                resolver,
-                            )?;
-                            let index_reg = program.alloc_register();
-                            translate_expr(
-                                program,
-                                referenced_tables,
-                                &args[1],
-                                index_reg,
-                                resolver,
-                            )?;
-                            let value_reg = program.alloc_register();
-                            translate_expr(
-                                program,
-                                referenced_tables,
-                                &args[2],
-                                value_reg,
-                                resolver,
-                            )?;
-                            program.emit_insn(Insn::ArraySetElement {
-                                array_reg,
-                                index_reg,
-                                value_reg,
-                                dest: target_register,
-                            });
-                            Ok(target_register)
+                            translate_fixed_insn!(program, referenced_tables, resolver, args, target_register,
+                                [array_reg <- 0, index_reg <- 1, value_reg <- 2],
+                                Insn::ArraySetElement { array_reg, index_reg, value_reg, dest: target_register })
                         }
                         ScalarFunc::Changes => {
                             if !args.is_empty() {
@@ -2750,16 +2738,67 @@ pub fn translate_expr(
                         | ScalarFunc::StringToArray
                         | ScalarFunc::ArrayToString
                         | ScalarFunc::ArrayOverlap
-                        | ScalarFunc::ArrayContainsAll => {
-                            resolver.require_custom_types("Array features")?;
-                            translate_function(
+                        | ScalarFunc::ArrayContainsAll => translate_function(
+                            program,
+                            args,
+                            referenced_tables,
+                            resolver,
+                            target_register,
+                            func_ctx,
+                        ),
+                        ScalarFunc::StructPack => {
+                            translate_variadic_insn!(
                                 program,
-                                args,
                                 referenced_tables,
                                 resolver,
+                                args,
                                 target_register,
-                                func_ctx,
+                                StructPack
                             )
+                        }
+                        ScalarFunc::UnionValueFunc => {
+                            let tag_name = extract_string_literal(&args[0]);
+                            // union_value('tag', val): resolve tag name → index.
+                            // The second arg is the value, not a column, so we search
+                            // the schema for a union type containing this variant.
+                            let tag_index = resolver.schema().find_union_tag_index(&tag_name)
+                                .ok_or_else(|| crate::LimboError::ParseError(format!(
+                                    "unknown union variant '{tag_name}'; no registered union type contains this variant"
+                                )))?;
+                            translate_fixed_insn!(program, referenced_tables, resolver, args, target_register,
+                                [value_reg <- 1],
+                                Insn::UnionPack { tag_index, value_reg, dest: target_register })
+                        }
+                        ScalarFunc::UnionTagFunc => {
+                            // union_tag(col): resolve col's union type for index→name lookup.
+                            let td =
+                                resolve_union_from_column(&args[0], referenced_tables, resolver);
+                            let tag_names = td
+                                .as_ref()
+                                .and_then(|td| td.union_def.as_ref())
+                                .map(union_tag_names)
+                                .unwrap_or_else(|| Arc::new(Vec::new()));
+                            translate_fixed_insn!(program, referenced_tables, resolver, args, target_register,
+                                [src_reg <- 0],
+                                Insn::UnionTag { src_reg, dest: target_register, tag_names })
+                        }
+                        ScalarFunc::UnionExtractFunc => {
+                            let tag_name = extract_string_literal(&args[1]);
+                            // union_extract(col, 'tag'): resolve col's union type for name→index.
+                            let td =
+                                resolve_union_from_column(&args[0], referenced_tables, resolver);
+                            let tag_index = td
+                                .as_ref()
+                                .and_then(|td| td.union_def.as_ref())
+                                .and_then(|ud| resolve_union_tag_index(ud, &tag_name))
+                                .ok_or_else(|| {
+                                    crate::LimboError::ParseError(format!(
+                                        "cannot resolve union variant '{tag_name}' for union_extract"
+                                    ))
+                                })?;
+                            translate_fixed_insn!(program, referenced_tables, resolver, args, target_register,
+                                [src_reg <- 0],
+                                Insn::UnionExtract { src_reg, expected_tag: tag_index, dest: target_register })
                         }
                     }
                 }
@@ -3638,6 +3677,75 @@ pub fn translate_expr(
         }
         ast::Expr::Qualified(_, _) => {
             unreachable!("Qualified should be resolved to a Column before translation")
+        }
+        ast::Expr::FieldAccess { base, field } => {
+            let base_reg = program.alloc_register();
+            translate_expr(program, referenced_tables, base, base_reg, resolver)?;
+            let field_name = normalize_ident(field.as_str());
+
+            // FieldAccess is produced by bind_and_rewrite_expr with base = Expr::Column.
+            // Guard against unexpected AST shapes (e.g. nested FieldAccess from future work).
+            let ast::Expr::Column { table, column, .. } = base.as_ref() else {
+                crate::bail_parse_error!(
+                    "cannot resolve field '{}': nested struct/union field access is not yet supported",
+                    field_name
+                );
+            };
+            let Some(referenced_tables) = referenced_tables else {
+                crate::bail_parse_error!("cannot resolve field '{}': no table context", field_name);
+            };
+            let Some((_is_outer, tbl)) = referenced_tables.find_table_by_internal_id(*table) else {
+                crate::bail_parse_error!("cannot resolve field '{}': table not found", field_name);
+            };
+
+            let col = &tbl.columns()[*column];
+            // Inline STRUCT/UNION column types are rejected at CREATE TABLE time,
+            // so ty_str here is always a named type (never bare "struct"/"union").
+            let Some(td) = resolver.schema().get_type_def_unchecked(&col.ty_str) else {
+                crate::bail_parse_error!(
+                    "column '{}' has type '{}' which is not a known struct or union type",
+                    col.name.as_deref().unwrap_or("?"),
+                    col.ty_str
+                );
+            };
+
+            if td.is_struct() {
+                let Some((idx, _)) = td.find_struct_field(&field_name) else {
+                    crate::bail_parse_error!(
+                        "no such field '{}' in struct type '{}'",
+                        field_name,
+                        col.ty_str
+                    );
+                };
+                program.emit_insn(Insn::StructField {
+                    src_reg: base_reg,
+                    field_index: idx,
+                    dest: target_register,
+                });
+                return Ok(target_register);
+            }
+            if td.is_union() {
+                let ud = td.union_def.as_ref().unwrap();
+                let tag_index = resolve_union_tag_index(ud, &field_name);
+                let Some(tag_index) = tag_index else {
+                    crate::bail_parse_error!(
+                        "no such variant '{}' in union type '{}'",
+                        field_name,
+                        col.ty_str
+                    );
+                };
+                program.emit_insn(Insn::UnionExtract {
+                    src_reg: base_reg,
+                    expected_tag: tag_index,
+                    dest: target_register,
+                });
+                return Ok(target_register);
+            }
+            crate::bail_parse_error!(
+                "column '{}' has type '{}' which is not a struct or union type",
+                col.name.as_deref().unwrap_or("?"),
+                col.ty_str
+            );
         }
         ast::Expr::Raise(resolve_type, msg_expr) => {
             let in_trigger = program.trigger.is_some();
@@ -5519,6 +5627,9 @@ where
                 | ast::Expr::Default => {
                     // No nested expressions
                 }
+                ast::Expr::FieldAccess { base, .. } => {
+                    walk_expr(base, func)?;
+                }
             }
         }
         WalkControl::SkipChildren => return Ok(WalkControl::Continue),
@@ -5798,6 +5909,66 @@ pub fn bind_and_rewrite_expr<'a>(
                                 id.as_str()
                             );
                         }
+                        // Dot-notation fallback for struct/union field access (DuckDB-style precedence).
+                        //
+                        // For `a.b`, resolution order is:
+                        //   1. a=table, b=column       (handled above — if we're here, this failed)
+                        //   2. a=column, b=struct field (handled below)
+                        //
+                        // This means table references always win over struct field access.
+                        // If a table `t` has a struct column also named `t` with field `x`,
+                        // `t.x` resolves as table.column, not column.field. The user can
+                        // disambiguate with an alias: `SELECT s.t.x FROM t AS s`.
+                        //
+                        // We do NOT reject ambiguous schemas at CREATE TABLE time because
+                        // the combinatorial explosion (CREATE TYPE, CREATE TABLE, ALTER TABLE)
+                        // makes that impractical. Deterministic precedence is sufficient.
+                        let field_name = normalize_ident(id.as_str());
+                        let mut match_count = 0usize;
+                        let mut matched_table_id = turso_parser::ast::TableInternalId::default();
+                        let mut matched_col_idx = 0;
+                        let mut matched_is_rowid_alias = false;
+                        for joined_table in referenced_tables.joined_tables().iter() {
+                            let cols = joined_table.table.columns();
+                            if let Some(col_idx) = cols.iter().position(|c| {
+                                c.name
+                                    .as_ref()
+                                    .is_some_and(|n| n.eq_ignore_ascii_case(&normalized_table_name))
+                            }) {
+                                let col = &cols[col_idx];
+                                // Check if the column type is a struct or union
+                                let type_def =
+                                    resolver.schema().get_type_def_unchecked(&col.ty_str);
+                                let is_struct_or_union = type_def
+                                    .map(|td| td.is_struct() || td.is_union())
+                                    .unwrap_or(false);
+                                if is_struct_or_union {
+                                    match_count += 1;
+                                    matched_table_id = joined_table.internal_id;
+                                    matched_col_idx = col_idx;
+                                    matched_is_rowid_alias = col.is_rowid_alias();
+                                }
+                            }
+                        }
+                        if match_count > 1 {
+                            crate::bail_parse_error!(
+                                "ambiguous column reference: '{}' — multiple tables have a struct/union column with this name",
+                                normalized_table_name
+                            );
+                        }
+                        if match_count == 1 {
+                            *expr = Expr::FieldAccess {
+                                base: Box::new(Expr::Column {
+                                    database: None,
+                                    table: matched_table_id,
+                                    column: matched_col_idx,
+                                    is_rowid_alias: matched_is_rowid_alias,
+                                }),
+                                field: ast::Name::from_bytes(field_name.as_bytes()),
+                            };
+                            referenced_tables.mark_column_used(matched_table_id, matched_col_idx);
+                            return Ok(WalkControl::Continue);
+                        }
                         crate::bail_parse_error!("no such table: {}", normalized_table_name);
                     }
                     let (tbl_id, tbl) = matching_tbl.unwrap();
@@ -5842,80 +6013,124 @@ pub fn bind_and_rewrite_expr<'a>(
                     return Ok(WalkControl::Continue);
                 }
                 Expr::DoublyQualified(db_name, tbl_name, col_name) => {
+                    // Clone the names upfront so we can reassign *expr later
+                    // without lifetime conflicts.
+                    let db_name_str = db_name.as_str().to_string();
+                    let tbl_name_str = tbl_name.as_str().to_string();
+                    let col_name_str = col_name.as_str().to_string();
+                    let tbl_name_clone = tbl_name.clone();
+                    let db_name_clone = db_name.clone();
+
                     let Some(referenced_tables) = &mut referenced_tables else {
                         if binding_behavior == BindingBehavior::AllowUnboundIdentifiers {
                             return Ok(WalkControl::Continue);
                         }
                         crate::bail_parse_error!(
                             "no such column: {}.{}.{}",
-                            db_name.as_str(),
-                            tbl_name.as_str(),
-                            col_name.as_str()
+                            db_name_str,
+                            tbl_name_str,
+                            col_name_str
                         );
                     };
-                    let normalized_col_name = normalize_ident(col_name.as_str());
+                    let normalized_col_name = normalize_ident(&col_name_str);
 
-                    // Create a QualifiedName and use existing resolve_database_id method
+                    // DoublyQualified: `a.b.c` — DuckDB-style precedence:
+                    //   1. a=database, b=table, c=column     (tried first)
+                    //   2. a=table,    b=column, c=struct field  (fallback)
+                    //
+                    // Same principle as Qualified: schema-level references always win.
                     let qualified_name = ast::QualifiedName {
-                        db_name: Some(db_name.clone()),
-                        name: tbl_name.clone(),
+                        db_name: Some(db_name_clone),
+                        name: tbl_name_clone,
                         alias: None,
                     };
-                    let database_id = resolver.resolve_database_id(&qualified_name)?;
+                    let db_resolution = resolver.resolve_database_id(&qualified_name);
 
-                    // Get the table from the specified database
-                    let table = resolver
-                        .with_schema(database_id, |schema| schema.get_table(tbl_name.as_str()))
-                        .ok_or_else(|| {
-                            LimboError::ParseError(format!(
-                                "no such table: {}.{}",
-                                db_name.as_str(),
-                                tbl_name.as_str()
-                            ))
-                        })?;
+                    // Try db.table.column interpretation first. If database resolves AND
+                    // the table+column exist, use that. Otherwise fall through to
+                    // table.column.field for struct/union field access.
+                    let mut resolved_as_db_table_col = false;
+                    if let Ok(database_id) = db_resolution {
+                        let table = resolver
+                            .with_schema(database_id, |schema| schema.get_table(&tbl_name_str));
 
-                    // Find the column in the table
-                    let col_idx = table
-                        .columns()
-                        .iter()
-                        .position(|c| {
-                            c.name
-                                .as_ref()
-                                .is_some_and(|name| name.eq_ignore_ascii_case(&normalized_col_name))
-                        })
-                        .ok_or_else(|| {
-                            LimboError::ParseError(format!(
-                                "Column: {}.{}.{} not found",
-                                db_name.as_str(),
-                                tbl_name.as_str(),
-                                col_name.as_str()
-                            ))
-                        })?;
+                        if let Some(table) = table {
+                            let col_idx = table.columns().iter().position(|c| {
+                                c.name.as_ref().is_some_and(|name| {
+                                    name.eq_ignore_ascii_case(&normalized_col_name)
+                                })
+                            });
 
-                    let col = table.columns().get(col_idx).unwrap();
+                            if let Some(col_idx) = col_idx {
+                                let col = table.columns().get(col_idx).unwrap();
+                                let is_rowid_alias = col.is_rowid_alias();
+                                let normalized_tbl_name = normalize_ident(&tbl_name_str);
+                                let matching_tbl = referenced_tables
+                                    .find_table_and_internal_id_by_identifier(&normalized_tbl_name);
 
-                    // Check if this is a rowid alias
-                    let is_rowid_alias = col.is_rowid_alias();
-
-                    // Convert to Column expression - since this is a cross-database reference,
-                    // we need to create a synthetic table reference for it
-                    // For now, we'll error if the table isn't already in the referenced tables
-                    let normalized_tbl_name = normalize_ident(tbl_name.as_str());
-                    let matching_tbl = referenced_tables
-                        .find_table_and_internal_id_by_identifier(&normalized_tbl_name);
-
-                    if let Some((tbl_id, _)) = matching_tbl {
-                        // Table is already in referenced tables, use existing internal ID
-                        *expr = Expr::Column {
-                            database: Some(database_id),
-                            table: tbl_id,
-                            column: col_idx,
-                            is_rowid_alias,
-                        };
-                        referenced_tables.mark_column_used(tbl_id, col_idx);
-                    } else {
+                                if let Some((tbl_id, _)) = matching_tbl {
+                                    *expr = Expr::Column {
+                                        database: Some(database_id),
+                                        table: tbl_id,
+                                        column: col_idx,
+                                        is_rowid_alias,
+                                    };
+                                    referenced_tables.mark_column_used(tbl_id, col_idx);
+                                    resolved_as_db_table_col = true;
+                                } else {
+                                    // Table exists in database but not in FROM clause
+                                    return Err(LimboError::ParseError(format!(
+                                        "table {normalized_tbl_name} is not in FROM clause — \
+                                         cross-database column references require the table to be explicitly joined"
+                                    )));
+                                }
+                            }
+                        }
+                    }
+                    if !resolved_as_db_table_col {
+                        // db.table.column failed — try table.column.field for struct/union
+                        let normalized_tbl_name = normalize_ident(&db_name_str);
+                        let normalized_col = normalize_ident(&tbl_name_str);
+                        let field_name = normalize_ident(&col_name_str);
+                        let matching_tbl = referenced_tables
+                            .find_table_and_internal_id_by_identifier(&normalized_tbl_name);
+                        if let Some((tbl_id, tbl)) = matching_tbl {
+                            let col_idx = tbl.columns().iter().position(|c| {
+                                c.name
+                                    .as_ref()
+                                    .is_some_and(|n| n.eq_ignore_ascii_case(&normalized_col))
+                            });
+                            if let Some(col_idx) = col_idx {
+                                let col = &tbl.columns()[col_idx];
+                                let type_def =
+                                    resolver.schema().get_type_def_unchecked(&col.ty_str);
+                                let is_struct_or_union = type_def
+                                    .map(|td| td.is_struct() || td.is_union())
+                                    .unwrap_or(false);
+                                if is_struct_or_union {
+                                    *expr = Expr::FieldAccess {
+                                        base: Box::new(Expr::Column {
+                                            database: None,
+                                            table: tbl_id,
+                                            column: col_idx,
+                                            is_rowid_alias: col.is_rowid_alias(),
+                                        }),
+                                        field: ast::Name::from_bytes(field_name.as_bytes()),
+                                    };
+                                    referenced_tables.mark_column_used(tbl_id, col_idx);
+                                    return Ok(WalkControl::Continue);
+                                } else {
+                                    // Column exists but is not a struct/union type
+                                    return Err(LimboError::ParseError(format!(
+                                        "column '{normalized_col}' is not a STRUCT or UNION type; \
+                                         cannot access field '{field_name}'"
+                                    )));
+                                }
+                            }
+                        }
+                        // Neither db.table.column nor table.column.field matched
                         return Err(LimboError::ParseError(format!(
-                            "table {normalized_tbl_name} is not in FROM clause - cross-database column references require the table to be explicitly joined"
+                            "no such column or database: {db_name_str}.{tbl_name_str}.{col_name_str}"
                         )));
                     }
                 }
@@ -5979,11 +6194,129 @@ pub fn bind_and_rewrite_expr<'a>(
                         }
                     }
                 }
+                // Validate struct/union function calls at bind time.
+                // Principle: compile-time checks belong in the earliest phase that
+                // has enough context. Binding has the resolver (for custom-types
+                // gate) and the raw AST args (for arity and literal checks).
+                // Catching errors here avoids wasting optimizer and translation
+                // cycles on invalid queries, and keeps the translate_expr match
+                // arms focused on code generation.
+                Expr::FunctionCall { name, args, .. } => {
+                    validate_custom_type_function_call(name.as_str(), args, resolver)?;
+                }
                 _ => {}
             }
             Ok(WalkControl::Continue)
         },
     )?;
+    Ok(())
+}
+
+/// Extract a string literal value from an expression that has already been
+/// validated as `Expr::Literal(Literal::String(_))` during bind-time checks.
+fn extract_string_literal(expr: &ast::Expr) -> String {
+    match expr {
+        ast::Expr::Literal(ast::Literal::String(s)) => s.trim_matches('\'').to_string(),
+        _ => unreachable!("bind phase guarantees this is a string literal"),
+    }
+}
+
+/// Resolve the UnionDef for a column expression. Returns the variant names list
+/// and optionally resolves a tag name to its numeric index.
+/// Used by union_value, union_tag, union_extract function translation.
+fn resolve_union_from_column(
+    expr: &ast::Expr,
+    referenced_tables: Option<&TableReferences>,
+    resolver: &Resolver,
+) -> Option<Arc<TypeDef>> {
+    let ast::Expr::Column { table, column, .. } = expr else {
+        return None;
+    };
+    let referenced_tables = referenced_tables?;
+    let (_, tbl) = referenced_tables.find_table_by_internal_id(*table)?;
+    let col = tbl.columns().get(*column)?;
+    let td = resolver.schema().get_type_def_unchecked(&col.ty_str)?;
+    if td.is_union() {
+        Some(Arc::clone(td))
+    } else {
+        None
+    }
+}
+
+/// Build the tag_names list from a UnionDef for use in UnionTag instructions.
+fn union_tag_names(union_def: &crate::schema::UnionDef) -> Arc<Vec<String>> {
+    Arc::new(
+        union_def
+            .variants
+            .iter()
+            .map(|v| v.tag_name.clone())
+            .collect(),
+    )
+}
+
+/// Resolve a tag name to its numeric index within a union type definition.
+fn resolve_union_tag_index(union_def: &crate::schema::UnionDef, tag_name: &str) -> Option<u8> {
+    union_def
+        .variants
+        .iter()
+        .position(|v| v.tag_name.eq_ignore_ascii_case(tag_name))
+        .map(|i| i as u8)
+}
+
+/// Validates custom-type function calls (arrays, structs, unions) at bind time.
+///
+/// Compile-time checks belong in the earliest phase that has enough context.
+/// Binding has the resolver (for the custom-types gate) and the raw AST args
+/// (for arity and literal checks). Catching errors here avoids wasting
+/// optimizer and translation cycles on invalid queries, and keeps the
+/// translate_expr match arms focused purely on register allocation and codegen.
+fn validate_custom_type_function_call(
+    name: &str,
+    args: &[Box<ast::Expr>],
+    resolver: &Resolver<'_>,
+) -> Result<()> {
+    let normalized = crate::util::normalize_ident(name);
+    match normalized.as_str() {
+        // Arrays
+        "array" | "array_element" | "array_set_element" | "array_length" | "array_append"
+        | "array_prepend" | "array_cat" | "array_remove" | "array_contains" | "array_position"
+        | "array_slice" | "string_to_array" | "array_to_string" | "array_overlap"
+        | "array_contains_all" => {
+            resolver.require_custom_types("Array features")?;
+        }
+        // Structs
+        "struct_pack" => {
+            resolver.require_custom_types("Struct features")?;
+        }
+        // Unions
+        "union_value" => {
+            resolver.require_custom_types("Union features")?;
+            if args.len() != 2 {
+                crate::bail_parse_error!("union_value() requires exactly 2 arguments");
+            }
+            if !matches!(&*args[0], ast::Expr::Literal(ast::Literal::String(_))) {
+                crate::bail_parse_error!("union_value() first argument must be a string literal");
+            }
+        }
+        "union_tag" => {
+            resolver.require_custom_types("Union features")?;
+            if args.len() != 1 {
+                crate::bail_parse_error!("union_tag() requires exactly 1 argument");
+            }
+        }
+        "union_extract" => {
+            resolver.require_custom_types("Union features")?;
+            if args.len() != 2 {
+                crate::bail_parse_error!("union_extract() requires exactly 2 arguments");
+            }
+            if !matches!(&*args[1], ast::Expr::Literal(ast::Literal::String(_))) {
+                crate::bail_parse_error!(
+                    "union_extract() second argument must be a string literal"
+                );
+            }
+        }
+        _ => {}
+    }
     Ok(())
 }
 
@@ -6152,6 +6485,9 @@ where
                 | ast::Expr::Register(_)
                 | ast::Expr::Default => {
                     // No nested expressions
+                }
+                ast::Expr::FieldAccess { base, .. } => {
+                    walk_expr_mut(base, func)?;
                 }
             }
         }
@@ -6871,6 +7207,7 @@ pub fn expr_vector_size(expr: &Expr) -> Result<usize> {
         }
         Expr::Parenthesized(exprs) => exprs.len(),
         Expr::Qualified(..) => 1,
+        Expr::FieldAccess { .. } => 1,
         Expr::Raise(..) => 1,
         Expr::Subquery(_) => {
             crate::bail_parse_error!("Scalar subquery is not supported in this context")

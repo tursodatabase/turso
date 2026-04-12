@@ -250,6 +250,12 @@ impl From<Text> for String {
     }
 }
 
+// Note: Struct and union values are serialized directly in VDBE instructions
+// (op_struct_pack, op_union_pack) using the SQLite record format for structs
+// and [tag_name_len: 1 byte][tag_name: N bytes][record] for unions.
+// No intermediate StructValue/UnionValue types are needed — blobs are
+// constructed from registers and extracted directly into registers.
+
 #[derive(Debug, Clone)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum Value {
@@ -886,6 +892,17 @@ impl std::ops::Div<Value> for Value {
 impl std::ops::DivAssign<Value> for Value {
     fn div_assign(&mut self, rhs: Value) {
         *self = self.clone() / rhs;
+    }
+}
+
+impl From<ValueRef<'_>> for Value {
+    fn from(value: ValueRef<'_>) -> Self {
+        match value {
+            ValueRef::Null => Value::Null,
+            ValueRef::Numeric(n) => Value::Numeric(n),
+            ValueRef::Text(t) => Value::Text(Text::new(t.value.to_string())),
+            ValueRef::Blob(b) => Value::Blob(b.to_vec()),
+        }
     }
 }
 

@@ -447,6 +447,13 @@ pub enum Expr {
     DoublyQualified(Name, Name, Name),
     /// `EXISTS` subquery
     Exists(Select),
+    /// Struct/union field access (produced by translator, not parser directly)
+    FieldAccess {
+        /// base expression (e.g., column reference)
+        base: Box<Expr>,
+        /// field or variant name
+        field: Name,
+    },
     /// call to a built-in function
     FunctionCall {
         /// function name
@@ -1307,19 +1314,26 @@ pub struct TypeParam {
 /// Body of a `CREATE TYPE` statement
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
-pub struct CreateTypeBody {
-    /// type parameters, e.g. `(value text, maxlen integer)` for varchar
-    pub params: Vec<TypeParam>,
-    /// base storage type: "text", "integer", "real", "blob"
-    pub base: String,
-    /// encode expression (called on write), uses `value` placeholder for input
-    pub encode: Option<Box<Expr>>,
-    /// decode expression (called on read), uses `value` placeholder for input
-    pub decode: Option<Box<Expr>>,
-    /// operator-to-function mappings
-    pub operators: Vec<TypeOperator>,
-    /// default expression for columns of this type
-    pub default: Option<Box<Expr>>,
+pub enum CreateTypeBody {
+    /// Custom type with encode/decode (e.g., varchar, email)
+    CustomType {
+        /// type parameters, e.g. `(value text, maxlen integer)` for varchar
+        params: Vec<TypeParam>,
+        /// base storage type: "text", "integer", "real", "blob"
+        base: String,
+        /// encode expression (called on write), uses `value` placeholder for input
+        encode: Option<Box<Expr>>,
+        /// decode expression (called on read), uses `value` placeholder for input
+        decode: Option<Box<Expr>>,
+        /// operator-to-function mappings
+        operators: Vec<TypeOperator>,
+        /// default expression for columns of this type
+        default: Option<Box<Expr>>,
+    },
+    /// `CREATE TYPE name AS STRUCT(field1 type1, field2 type2, ...)`
+    Struct(Vec<TypeField>),
+    /// `CREATE TYPE name AS UNION(variant1 type1, variant2 type2, ...)`
+    Union(Vec<TypeField>),
 }
 
 /// `CREATE TABLE` body
@@ -1934,6 +1948,26 @@ pub struct CommonTableExpr {
     pub select: Select,
 }
 
+/// A field in a STRUCT or UNION type declaration, e.g. `x INT` in `STRUCT(x INT, y TEXT)`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct TypeField {
+    /// field/variant name
+    pub name: Name,
+    /// field/variant type (recursive — allows nested STRUCT/UNION)
+    pub field_type: Type,
+}
+
+/// Parameterized composite type.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub enum ParameterizedType {
+    /// `STRUCT(x INT, y TEXT, ...)`
+    Struct(Vec<TypeField>),
+    /// `UNION(i INT, t TEXT, ...)`
+    Union(Vec<TypeField>),
+}
+
 /// Column type
 // https://sqlite.org/syntax/type-name.html
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1945,6 +1979,8 @@ pub struct Type {
     pub size: Option<TypeSize>,
     /// Number of array dimensions: 0 = scalar, 1 = `type[]`, 2 = `type[][]`, etc.
     pub array_dimensions: u32,
+    /// Parameterized type for inline STRUCT/UNION declarations
+    pub parameterized: Option<ParameterizedType>,
 }
 
 impl Type {

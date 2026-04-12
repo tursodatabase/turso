@@ -5,11 +5,12 @@ use crate::ast::{
     FrameClause, FrameExclude, FrameMode, FromClause, FunctionTail, GeneratedColumnType, GroupBy,
     Indexed, IndexedColumn, InitDeferredPred, InsertBody, JoinConstraint, JoinOperator, JoinType,
     JoinedSelectTable, LikeOperator, Limit, Literal, Materialized, Name, NamedColumnConstraint,
-    NamedTableConstraint, NullsOrder, OneSelect, Operator, Over, PragmaBody, PragmaValue,
-    QualifiedName, RefAct, RefArg, ResolveType, ResultColumn, Select, SelectBody, SelectTable, Set,
-    SortOrder, SortedColumn, Stmt, TableConstraint, TableOptions, TransactionType, TriggerCmd,
-    TriggerEvent, TriggerTime, Type, TypeOperator, TypeParam, TypeSize, UnaryOperator, Update,
-    Upsert, UpsertDo, UpsertIndex, Variable, Window, WindowDef, With,
+    NamedTableConstraint, NullsOrder, OneSelect, Operator, Over, ParameterizedType, PragmaBody,
+    PragmaValue, QualifiedName, RefAct, RefArg, ResolveType, ResultColumn, Select, SelectBody,
+    SelectTable, Set, SortOrder, SortedColumn, Stmt, TableConstraint, TableOptions,
+    TransactionType, TriggerCmd, TriggerEvent, TriggerTime, Type, TypeField, TypeOperator,
+    TypeParam, TypeSize, UnaryOperator, Update, Upsert, UpsertDo, UpsertIndex, Variable, Window,
+    WindowDef, With,
 };
 use crate::error::Error;
 use crate::lexer::{Lexer, Token};
@@ -153,6 +154,8 @@ pub struct Parser<'a> {
     /// Parser tracks that in order to properly auto-assign variable ids in correct order for anonymous parameters '?'
     last_variable_id: u32,
     named_variables: HashMap<&'a [u8], NonZeroU32>,
+    /// Tracks STRUCT/UNION nesting depth to prevent stack overflow from deeply nested types
+    type_nesting_depth: u32,
 }
 
 impl<'a> Iterator for Parser<'a> {
@@ -177,6 +180,7 @@ impl<'a> Parser<'a> {
             current_token: Token::new(&input[..0], TokenType::TK_NONE),
             last_variable_id: 0,
             named_variables: HashMap::new(),
+            type_nesting_depth: 0,
         }
     }
 
@@ -1085,6 +1089,31 @@ impl<'a> Parser<'a> {
             return Ok(None);
         };
 
+        // If type name is STRUCT or UNION and followed by '(', parse field list
+        let is_struct = type_name.eq_ignore_ascii_case("STRUCT");
+        let is_union = type_name.eq_ignore_ascii_case("UNION");
+        if (is_struct || is_union) && self.peek()?.is_some_and(|t| t.token_type == TK_LP) {
+            let fields = self.parse_type_field_list()?;
+            let parameterized = if is_struct {
+                ParameterizedType::Struct(fields)
+            } else {
+                ParameterizedType::Union(fields)
+            };
+            // Check for array suffix(es) after STRUCT/UNION declaration
+            let mut array_dimensions = 0u32;
+            while self.peek()?.is_some_and(|t| t.token_type == TK_LBRACKET) {
+                eat_assert!(self, TK_LBRACKET);
+                eat_expect!(self, TK_RBRACKET);
+                array_dimensions += 1;
+            }
+            return Ok(Some(Type {
+                name: type_name,
+                size: None,
+                array_dimensions,
+                parameterized: Some(parameterized),
+            }));
+        }
+
         while let Some(tok) = self.peek()? {
             match tok.token_type.fallback_id_if_ok() {
                 TK_ID | TK_STRING => {
@@ -1129,7 +1158,39 @@ impl<'a> Parser<'a> {
             name: type_name,
             size,
             array_dimensions,
+            parameterized: None,
         }))
+    }
+
+    /// Parse a parenthesized list of `name Type` pairs for STRUCT/UNION type declarations.
+    /// Expects the opening `(` to be the next token.
+    fn parse_type_field_list(&mut self) -> Result<Vec<TypeField>> {
+        self.type_nesting_depth += 1;
+        if self.type_nesting_depth > 32 {
+            return Err(Error::ParseError(
+                "STRUCT/UNION nesting depth exceeds maximum (32)".to_owned(),
+            ));
+        }
+        eat_expect!(self, TK_LP);
+        let mut fields = Vec::new();
+        loop {
+            // Parse field name (use parse_nm to handle keywords-as-identifiers)
+            let name = self.parse_nm()?;
+            // Parse field type (recursive — allows nested STRUCT/UNION)
+            let field_type = self.parse_type()?.ok_or_else(|| {
+                Error::ParseError("expected type after field name in STRUCT/UNION".to_owned())
+            })?;
+            fields.push(TypeField { name, field_type });
+            match self.peek()? {
+                Some(tok) if tok.token_type == TK_COMMA => {
+                    eat_assert!(self, TK_COMMA);
+                }
+                _ => break,
+            }
+        }
+        eat_expect!(self, TK_RP);
+        self.type_nesting_depth -= 1;
+        Ok(fields)
     }
 
     /// SQLite understands these operators, listed in precedence1 order
@@ -4298,11 +4359,8 @@ impl<'a> Parser<'a> {
         }
     }
 
-    /// Parse `CREATE TYPE [IF NOT EXISTS] name[(param, ...)] BASE base_type
-    ///     [ENCODE expr]
-    ///     [DECODE expr]
-    ///     [DEFAULT expr]
-    ///     [OPERATOR 'op' func_name]*`
+    /// Parse `CREATE TYPE [IF NOT EXISTS] name AS STRUCT(...) | UNION(...)`
+    /// or `CREATE TYPE [IF NOT EXISTS] name[(param, ...)] BASE base_type ...`
     fn parse_create_type(&mut self) -> Result<Stmt> {
         eat_assert!(self, TK_TYPE);
         let if_not_exists = self.parse_if_not_exists()?;
@@ -4313,6 +4371,45 @@ impl<'a> Parser<'a> {
             Some(tok) if tok.token_type == TK_ID => from_bytes(tok.as_bytes()),
             _ => return Err(Error::ParseError("expected type name".to_owned())),
         };
+
+        // Check for AS STRUCT/UNION syntax
+        if let Some(tok) = self.peek()? {
+            if tok.token_type == TK_AS {
+                eat_assert!(self, TK_AS);
+                let next = self.peek()?;
+                match next {
+                    Some(t) if t.token_type.fallback_id_if_ok() == TK_ID => {
+                        let kw = from_bytes_as_str(t.as_bytes());
+                        if kw.eq_ignore_ascii_case("STRUCT") {
+                            eat_assert!(self, TK_ID);
+                            let fields = self.parse_type_field_list()?;
+                            return Ok(Stmt::CreateType {
+                                if_not_exists,
+                                type_name,
+                                body: CreateTypeBody::Struct(fields),
+                            });
+                        } else if kw.eq_ignore_ascii_case("UNION") {
+                            eat_assert!(self, TK_ID);
+                            let fields = self.parse_type_field_list()?;
+                            return Ok(Stmt::CreateType {
+                                if_not_exists,
+                                type_name,
+                                body: CreateTypeBody::Union(fields),
+                            });
+                        } else {
+                            return Err(Error::ParseError(format!(
+                                "expected STRUCT or UNION after AS, got {kw}"
+                            )));
+                        }
+                    }
+                    _ => {
+                        return Err(Error::ParseError(
+                            "expected STRUCT or UNION after AS".to_owned(),
+                        ))
+                    }
+                }
+            }
+        }
 
         // Parse optional parameter list: (name [type], name [type], ...)
         let mut params = Vec::new();
@@ -4476,7 +4573,7 @@ impl<'a> Parser<'a> {
         Ok(Stmt::CreateType {
             if_not_exists,
             type_name,
-            body: CreateTypeBody {
+            body: CreateTypeBody::CustomType {
                 params,
                 base,
                 encode,
@@ -5301,6 +5398,7 @@ mod tests {
                                         name: "INTEGER".to_owned(),
                                         size: None,
                                         array_dimensions: 0,
+                                        parameterized: None,
                                     }),
                                 }),
                                 None,
@@ -5332,6 +5430,7 @@ mod tests {
                                             Literal::Numeric("255".to_owned()),
                                         )))),
                                         array_dimensions: 0,
+                                        parameterized: None,
                                     }),
                                 }),
                                 None,
@@ -5368,6 +5467,7 @@ mod tests {
                                             ))),
                                         )),
                                         array_dimensions: 0,
+                                        parameterized: None,
                                     }),
                                 }),
                                 None,
@@ -10060,6 +10160,7 @@ mod tests {
                             name: "INTEGER".to_owned(),
                             size: None,
                             array_dimensions: 0,
+                            parameterized: None,
                         }),
                         constraints: vec![],
                     }),
@@ -10075,6 +10176,7 @@ mod tests {
                             name: "INTEGER".to_owned(),
                             size: None,
                             array_dimensions: 0,
+                            parameterized: None,
                         }),
                         constraints: vec![
                             NamedColumnConstraint {
@@ -10097,6 +10199,7 @@ mod tests {
                             name: "INTEGER".to_owned(),
                             size: None,
                             array_dimensions: 0,
+                            parameterized: None,
                         }),
                         constraints: vec![
                             NamedColumnConstraint {
@@ -10121,6 +10224,7 @@ mod tests {
                             name: "INTEGER".to_owned(),
                             size: None,
                             array_dimensions: 0,
+                            parameterized: None,
                         }),
                         constraints: vec![
                             NamedColumnConstraint {
@@ -10146,6 +10250,7 @@ mod tests {
                             name: "INTEGER".to_owned(),
                             size: None,
                             array_dimensions: 0,
+                            parameterized: None,
                         }),
                         constraints: vec![
                             NamedColumnConstraint {
@@ -10171,6 +10276,7 @@ mod tests {
                             name: "INTEGER".to_owned(),
                             size: None,
                             array_dimensions: 0,
+                            parameterized: None,
                         }),
                         constraints: vec![
                             NamedColumnConstraint {
@@ -10193,6 +10299,7 @@ mod tests {
                             name: "INTEGER".to_owned(),
                             size: None,
                             array_dimensions: 0,
+                            parameterized: None,
                         }),
                         constraints: vec![
                             NamedColumnConstraint {
@@ -10216,6 +10323,7 @@ mod tests {
                             name: "INTEGER".to_owned(),
                             size: None,
                             array_dimensions: 0,
+                            parameterized: None,
                         }),
                         constraints: vec![
                             NamedColumnConstraint {
@@ -10239,6 +10347,7 @@ mod tests {
                             name: "INTEGER".to_owned(),
                             size: None,
                             array_dimensions: 0,
+                            parameterized: None,
                         }),
                         constraints: vec![
                             NamedColumnConstraint {
@@ -10262,6 +10371,7 @@ mod tests {
                             name: "INTEGER".to_owned(),
                             size: None,
                             array_dimensions: 0,
+                            parameterized: None,
                         }),
                         constraints: vec![
                             NamedColumnConstraint {
@@ -10285,6 +10395,7 @@ mod tests {
                             name: "INTEGER".to_owned(),
                             size: None,
                             array_dimensions: 0,
+                            parameterized: None,
                         }),
                         constraints: vec![
                             NamedColumnConstraint {
@@ -10308,6 +10419,7 @@ mod tests {
                             name: "INTEGER".to_owned(),
                             size: None,
                             array_dimensions: 0,
+                            parameterized: None,
                         }),
                         constraints: vec![
                             NamedColumnConstraint {
@@ -10330,6 +10442,7 @@ mod tests {
                             name: "INTEGER".to_owned(),
                             size: None,
                             array_dimensions: 0,
+                            parameterized: None,
                         }),
                         constraints: vec![
                             NamedColumnConstraint {
@@ -10352,6 +10465,7 @@ mod tests {
                             name: "INTEGER".to_owned(),
                             size: None,
                             array_dimensions: 0,
+                            parameterized: None,
                         }),
                         constraints: vec![
                             NamedColumnConstraint {
@@ -10379,6 +10493,7 @@ mod tests {
                             name: "INTEGER".to_owned(),
                             size: None,
                             array_dimensions: 0,
+                            parameterized: None,
                         }),
                         constraints: vec![
                             NamedColumnConstraint {
@@ -10420,6 +10535,7 @@ mod tests {
                             name: "INTEGER".to_owned(),
                             size: None,
                             array_dimensions: 0,
+                            parameterized: None,
                         }),
                         constraints: vec![
                             NamedColumnConstraint {
@@ -10461,6 +10577,7 @@ mod tests {
                             name: "INTEGER".to_owned(),
                             size: None,
                             array_dimensions: 0,
+                            parameterized: None,
                         }),
                         constraints: vec![
                             NamedColumnConstraint {
@@ -10502,6 +10619,7 @@ mod tests {
                             name: "INTEGER".to_owned(),
                             size: None,
                             array_dimensions: 0,
+                            parameterized: None,
                         }),
                         constraints: vec![
                             NamedColumnConstraint {
@@ -10543,6 +10661,7 @@ mod tests {
                             name: "INTEGER".to_owned(),
                             size: None,
                             array_dimensions: 0,
+                            parameterized: None,
                         }),
                         constraints: vec![
                             NamedColumnConstraint {
@@ -10584,6 +10703,7 @@ mod tests {
                             name: "INTEGER".to_owned(),
                             size: None,
                             array_dimensions: 0,
+                            parameterized: None,
                         }),
                         constraints: vec![
                             NamedColumnConstraint {
@@ -10625,6 +10745,7 @@ mod tests {
                             name: "INTEGER".to_owned(),
                             size: None,
                             array_dimensions: 0,
+                            parameterized: None,
                         }),
                         constraints: vec![
                             NamedColumnConstraint {
@@ -10666,6 +10787,7 @@ mod tests {
                             name: "INTEGER".to_owned(),
                             size: None,
                             array_dimensions: 0,
+                            parameterized: None,
                         }),
                         constraints: vec![
                             NamedColumnConstraint {
@@ -10696,6 +10818,7 @@ mod tests {
                             name: "INTEGER".to_owned(),
                             size: None,
                             array_dimensions: 0,
+                            parameterized: None,
                         }),
                         constraints: vec![
                             NamedColumnConstraint {
@@ -10726,6 +10849,7 @@ mod tests {
                             name: "INTEGER".to_owned(),
                             size: None,
                             array_dimensions: 0,
+                            parameterized: None,
                         }),
                         constraints: vec![
                             NamedColumnConstraint {
@@ -10756,6 +10880,7 @@ mod tests {
                             name: "INTEGER".to_owned(),
                             size: None,
                             array_dimensions: 0,
+                            parameterized: None,
                         }),
                         constraints: vec![
                             NamedColumnConstraint {
@@ -10786,6 +10911,7 @@ mod tests {
                             name: "INTEGER".to_owned(),
                             size: None,
                             array_dimensions: 0,
+                            parameterized: None,
                         }),
                         constraints: vec![
                             NamedColumnConstraint {
@@ -10808,6 +10934,7 @@ mod tests {
                             name: "INTEGER".to_owned(),
                             size: None,
                             array_dimensions: 0,
+                            parameterized: None,
                         }),
                         constraints: vec![
                             NamedColumnConstraint {
@@ -10831,6 +10958,7 @@ mod tests {
                             name: "INTEGER".to_owned(),
                             size: None,
                             array_dimensions: 0,
+                            parameterized: None,
                         }),
                         constraints: vec![
                             NamedColumnConstraint {
@@ -10854,6 +10982,7 @@ mod tests {
                             name: "INTEGER".to_owned(),
                             size: None,
                             array_dimensions: 0,
+                            parameterized: None,
                         }),
                         constraints: vec![
                             NamedColumnConstraint {
@@ -10879,6 +11008,7 @@ mod tests {
                                 name: "INTEGER".to_owned(),
                                 size: None,
                                 array_dimensions: 0,
+                                parameterized: None,
                             }),
                             constraints: vec![],
                         },
@@ -11045,6 +11175,7 @@ mod tests {
                                     name: "INTEGER".to_owned(),
                                     size: None,
                                     array_dimensions: 0,
+                                    parameterized: None,
                                 }),
                                 constraints: vec![],
                             },
@@ -11087,6 +11218,7 @@ mod tests {
                                     name: "INTEGER".to_owned(),
                                     size: None,
                                     array_dimensions: 0,
+                                    parameterized: None,
                                 }),
                                 constraints: vec![
                                     NamedColumnConstraint {
@@ -11105,6 +11237,7 @@ mod tests {
                                     name: "INTEGER".to_owned(),
                                     size: None,
                                     array_dimensions: 0,
+                                    parameterized: None,
                                 }),
                                 constraints: vec![],
                             },
@@ -11151,6 +11284,7 @@ mod tests {
                                     name: "INTEGER".to_owned(),
                                     size: None,
                                     array_dimensions: 0,
+                                    parameterized: None,
                                 }),
                                 constraints: vec![],
                             },
@@ -11190,6 +11324,7 @@ mod tests {
                                     name: "INTEGER".to_owned(),
                                     size: None,
                                     array_dimensions: 0,
+                                    parameterized: None,
                                 }),
                                 constraints: vec![],
                             },
@@ -12311,6 +12446,7 @@ mod tests {
                                     name: "INTEGER".to_owned(),
                                     size: None,
                                     array_dimensions: 0,
+                                    parameterized: None,
                                 }),
                                 constraints: vec![
                                     NamedColumnConstraint {
@@ -12380,6 +12516,251 @@ mod tests {
                 let result_str = result.to_string();
                 assert_eq!(result_str, expected_str[i], "Input: {rstring:?}");
             }
+        }
+    }
+
+    #[test]
+    fn test_struct_type_declaration() {
+        let sql = b"CREATE TABLE t(s STRUCT(x INT, y TEXT)) STRICT";
+        let cmd = Parser::new(sql).next().unwrap().unwrap();
+        if let Cmd::Stmt(Stmt::CreateTable { body, .. }) = cmd {
+            if let CreateTableBody::ColumnsAndConstraints { columns, .. } = body {
+                let col = &columns[0];
+                let ty = col.col_type.as_ref().unwrap();
+                assert!(ty.name.eq_ignore_ascii_case("STRUCT"));
+                match ty.parameterized.as_ref().unwrap() {
+                    ParameterizedType::Struct(fields) => {
+                        assert_eq!(fields.len(), 2);
+                        assert_eq!(fields[0].name.to_string(), "x");
+                        assert!(fields[0].field_type.name.eq_ignore_ascii_case("INT"));
+                        assert_eq!(fields[1].name.to_string(), "y");
+                        assert!(fields[1].field_type.name.eq_ignore_ascii_case("TEXT"));
+                    }
+                    _ => panic!("expected Struct"),
+                }
+            } else {
+                panic!("expected ColumnsAndConstraints");
+            }
+        } else {
+            panic!("expected CreateTable");
+        }
+    }
+
+    #[test]
+    fn test_union_type_declaration() {
+        let sql = b"CREATE TABLE t(u UNION(i INT, t TEXT)) STRICT";
+        let cmd = Parser::new(sql).next().unwrap().unwrap();
+        if let Cmd::Stmt(Stmt::CreateTable { body, .. }) = cmd {
+            if let CreateTableBody::ColumnsAndConstraints { columns, .. } = body {
+                let ty = columns[0].col_type.as_ref().unwrap();
+                assert!(ty.name.eq_ignore_ascii_case("UNION"));
+                match ty.parameterized.as_ref().unwrap() {
+                    ParameterizedType::Union(fields) => {
+                        assert_eq!(fields.len(), 2);
+                        assert_eq!(fields[0].name.to_string(), "i");
+                        assert_eq!(fields[1].name.to_string(), "t");
+                    }
+                    _ => panic!("expected Union"),
+                }
+            } else {
+                panic!("expected ColumnsAndConstraints");
+            }
+        } else {
+            panic!("expected CreateTable");
+        }
+    }
+
+    #[test]
+    fn test_nested_struct_type() {
+        let sql = b"CREATE TABLE t(s STRUCT(inner STRUCT(a INT, b INT), c TEXT)) STRICT";
+        let cmd = Parser::new(sql).next().unwrap().unwrap();
+        if let Cmd::Stmt(Stmt::CreateTable { body, .. }) = cmd {
+            if let CreateTableBody::ColumnsAndConstraints { columns, .. } = body {
+                let ty = columns[0].col_type.as_ref().unwrap();
+                match ty.parameterized.as_ref().unwrap() {
+                    ParameterizedType::Struct(fields) => {
+                        assert_eq!(fields.len(), 2);
+                        // First field is itself a struct
+                        assert!(fields[0].field_type.name.eq_ignore_ascii_case("STRUCT"));
+                        match fields[0].field_type.parameterized.as_ref().unwrap() {
+                            ParameterizedType::Struct(inner) => {
+                                assert_eq!(inner.len(), 2);
+                                assert_eq!(inner[0].name.to_string(), "a");
+                                assert_eq!(inner[1].name.to_string(), "b");
+                            }
+                            _ => panic!("expected inner Struct"),
+                        }
+                        // Second field is TEXT
+                        assert_eq!(fields[1].name.to_string(), "c");
+                        assert!(fields[1].field_type.name.eq_ignore_ascii_case("TEXT"));
+                    }
+                    _ => panic!("expected Struct"),
+                }
+            } else {
+                panic!("expected ColumnsAndConstraints");
+            }
+        } else {
+            panic!("expected CreateTable");
+        }
+    }
+
+    #[test]
+    fn test_struct_array_type() {
+        let sql = b"CREATE TABLE t(arr STRUCT(x INT, y INT)[]) STRICT";
+        let cmd = Parser::new(sql).next().unwrap().unwrap();
+        if let Cmd::Stmt(Stmt::CreateTable { body, .. }) = cmd {
+            if let CreateTableBody::ColumnsAndConstraints { columns, .. } = body {
+                let ty = columns[0].col_type.as_ref().unwrap();
+                assert_eq!(ty.array_dimensions, 1);
+                assert!(ty.parameterized.is_some());
+                match ty.parameterized.as_ref().unwrap() {
+                    ParameterizedType::Struct(fields) => assert_eq!(fields.len(), 2),
+                    _ => panic!("expected Struct"),
+                }
+            } else {
+                panic!("expected ColumnsAndConstraints");
+            }
+        } else {
+            panic!("expected CreateTable");
+        }
+    }
+
+    #[test]
+    fn test_union_with_struct_variant() {
+        let sql = b"CREATE TABLE t(u UNION(a STRUCT(x INT, y INT), b TEXT)) STRICT";
+        let cmd = Parser::new(sql).next().unwrap().unwrap();
+        if let Cmd::Stmt(Stmt::CreateTable { body, .. }) = cmd {
+            if let CreateTableBody::ColumnsAndConstraints { columns, .. } = body {
+                let ty = columns[0].col_type.as_ref().unwrap();
+                match ty.parameterized.as_ref().unwrap() {
+                    ParameterizedType::Union(fields) => {
+                        assert_eq!(fields.len(), 2);
+                        // First variant is a struct
+                        assert!(fields[0].field_type.parameterized.is_some());
+                        // Second variant is TEXT
+                        assert!(fields[1].field_type.name.eq_ignore_ascii_case("TEXT"));
+                    }
+                    _ => panic!("expected Union"),
+                }
+            } else {
+                panic!("expected ColumnsAndConstraints");
+            }
+        } else {
+            panic!("expected CreateTable");
+        }
+    }
+
+    #[test]
+    fn test_create_type_as_struct() {
+        let sql = b"CREATE TYPE point AS STRUCT(x INT, y INT)";
+        let cmd = Parser::new(sql).next().unwrap().unwrap();
+        if let Cmd::Stmt(Stmt::CreateType {
+            type_name, body, ..
+        }) = cmd
+        {
+            assert_eq!(type_name, "point");
+            match body {
+                CreateTypeBody::Struct(fields) => {
+                    assert_eq!(fields.len(), 2);
+                    assert_eq!(fields[0].name.to_string(), "x");
+                    assert_eq!(fields[1].name.to_string(), "y");
+                }
+                _ => panic!("expected Struct body"),
+            }
+        } else {
+            panic!("expected CreateType");
+        }
+    }
+
+    #[test]
+    fn test_create_type_as_union() {
+        let sql = b"CREATE TYPE platform AS UNION(telegram INT, slack TEXT)";
+        let cmd = Parser::new(sql).next().unwrap().unwrap();
+        if let Cmd::Stmt(Stmt::CreateType {
+            type_name, body, ..
+        }) = cmd
+        {
+            assert_eq!(type_name, "platform");
+            match body {
+                CreateTypeBody::Union(fields) => {
+                    assert_eq!(fields.len(), 2);
+                    assert_eq!(fields[0].name.to_string(), "telegram");
+                    assert_eq!(fields[1].name.to_string(), "slack");
+                }
+                _ => panic!("expected Union body"),
+            }
+        } else {
+            panic!("expected CreateType");
+        }
+    }
+
+    #[test]
+    fn test_dot_notation_still_produces_qualified() {
+        let sql = b"SELECT col.field FROM t";
+        let cmd = Parser::new(sql).next().unwrap().unwrap();
+        if let Cmd::Stmt(Stmt::Select(sel)) = cmd {
+            if let OneSelect::Select { columns, .. } = &sel.body.select {
+                if let ResultColumn::Expr(expr, _) = &columns[0] {
+                    assert!(
+                        matches!(expr.as_ref(), Expr::Qualified(_, _)),
+                        "expected Qualified, got: {expr:?}",
+                    );
+                } else {
+                    panic!("expected Expr");
+                }
+            } else {
+                panic!("expected Select");
+            }
+        } else {
+            panic!("expected Select");
+        }
+    }
+
+    #[test]
+    fn test_struct_pack_positional() {
+        let sql = b"SELECT struct_pack(1, 'hello')";
+        let cmd = Parser::new(sql).next().unwrap().unwrap();
+        if let Cmd::Stmt(Stmt::Select(sel)) = cmd {
+            if let OneSelect::Select { columns, .. } = &sel.body.select {
+                if let ResultColumn::Expr(expr, _) = &columns[0] {
+                    if let Expr::FunctionCall { name, args, .. } = expr.as_ref() {
+                        assert_eq!(name.to_string(), "struct_pack");
+                        assert_eq!(args.len(), 2);
+                    } else {
+                        panic!("expected FunctionCall");
+                    }
+                } else {
+                    panic!("expected Expr");
+                }
+            } else {
+                panic!("expected Select");
+            }
+        } else {
+            panic!("expected Select");
+        }
+    }
+
+    #[test]
+    fn test_union_value_string_tag() {
+        let sql = b"SELECT union_value('i', 42)";
+        let cmd = Parser::new(sql).next().unwrap().unwrap();
+        if let Cmd::Stmt(Stmt::Select(sel)) = cmd {
+            if let OneSelect::Select { columns, .. } = &sel.body.select {
+                if let ResultColumn::Expr(expr, _) = &columns[0] {
+                    if let Expr::FunctionCall { name, args, .. } = expr.as_ref() {
+                        assert_eq!(name.to_string(), "union_value");
+                        assert_eq!(args.len(), 2);
+                    } else {
+                        panic!("expected FunctionCall");
+                    }
+                } else {
+                    panic!("expected Expr");
+                }
+            } else {
+                panic!("expected Select");
+            }
+        } else {
+            panic!("expected Select");
         }
     }
 }

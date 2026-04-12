@@ -214,3 +214,11 @@ harness = false
 name = "wasm_udf_benchmark"
 harness = false
 required-features = ["wasm-udf"]
+
+[[bench]]
+name = "struct_union_benchmark"
+harness = false
+
+[[bench]]
+name = "struct_union_profile"
+harness = false
