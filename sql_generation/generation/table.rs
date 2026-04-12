@@ -50,6 +50,7 @@ impl Table {
             name,
             columns: Vec::from_iter(column_set),
             indexes: vec![],
+            without_rowid: false,
         }
     }
 }
@@ -57,8 +58,10 @@ impl Table {
 impl Arbitrary for Table {
     fn arbitrary<R: Rng + ?Sized, C: GenerationContext>(rng: &mut R, context: &C) -> Self {
         let name = Name::arbitrary(rng, context).0;
+        let without_rowid_prob = context.opts().table.without_rowid_prob;
+        let without_rowid = without_rowid_prob > 0.0 && rng.random_bool(without_rowid_prob);
 
-        let rowid_alias = rng.random_bool(context.opts().table.rowid_alias_prob);
+        let rowid_alias = !without_rowid && rng.random_bool(context.opts().table.rowid_alias_prob);
         if rowid_alias {
             let pk_name = Name::arbitrary(rng, context).0;
             let payload_name = Name::arbitrary(rng, context).0;
@@ -95,9 +98,12 @@ impl Arbitrary for Table {
                 name,
                 columns,
                 indexes: vec![],
+                without_rowid,
             }
         } else {
-            Table::arbitrary_with_columns(rng, context, name, vec![])
+            let mut table = Table::arbitrary_with_columns(rng, context, name, vec![]);
+            table.without_rowid = without_rowid;
+            table
         }
     }
 }

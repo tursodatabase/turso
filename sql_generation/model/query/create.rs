@@ -21,6 +21,12 @@ impl Display for Create {
             .map(|column| column.to_string())
             .join(", ");
 
-        write!(f, "{cols})")
+        write!(f, "{cols})")?;
+
+        if self.table.without_rowid {
+            write!(f, " WITHOUT ROWID")?;
+        }
+
+        Ok(())
     }
 }

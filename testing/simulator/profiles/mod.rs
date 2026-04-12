@@ -169,6 +169,40 @@ impl Profile {
         profile
     }
 
+    /// Profile for testing WITHOUT ROWID table corruption paths.
+    /// Generates tables with without_rowid_prob and exercises
+    /// ALTER TABLE ADD COLUMN, DELETE, and UPDATE operations
+    /// that are known to corrupt WITHOUT ROWID tables.
+    pub fn without_rowid_stress() -> Self {
+        let profile = Profile {
+            cache_size_pages: Some(2000),
+            query: QueryProfile {
+                gen_opts: Opts {
+                    table: TableOpts {
+                        without_rowid_prob: 0.3,
+                        ..Default::default()
+                    },
+                    query: QueryOpts {
+                        alter_table: AlterTableOpts { alter_column: true },
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+                create_table_weight: 15,
+                insert_weight: 25,
+                delete_weight: 20,
+                update_weight: 20,
+                select_weight: 15,
+                create_index_weight: 5,
+                alter_table_weight: 5,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        profile.validate().unwrap();
+        profile
+    }
+
     pub fn parse_from_type(profile_type: ProfileType) -> anyhow::Result<Self> {
         let profile = match profile_type {
             ProfileType::Default => Self::default(),
@@ -177,6 +211,7 @@ impl Profile {
             ProfileType::Faultless => Self::faultless(),
             ProfileType::SimpleMvcc => Self::simple_mvcc(),
             ProfileType::WriteStress => Self::write_stress(),
+            ProfileType::WithoutRowidStress => Self::without_rowid_stress(),
             ProfileType::Custom(path) => {
                 Self::parse(path).with_context(|| "failed to parse JSON profile")?
             }
@@ -218,6 +253,7 @@ pub enum ProfileType {
     Faultless,
     SimpleMvcc,
     WriteStress,
+    WithoutRowidStress,
     #[strum(disabled)]
     Custom(PathBuf),
 }

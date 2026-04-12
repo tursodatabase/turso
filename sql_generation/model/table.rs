@@ -47,6 +47,7 @@ pub struct Table {
     pub columns: Vec<Column>,
     pub rows: Vec<Vec<SimValue>>,
     pub indexes: Vec<Index>,
+    pub without_rowid: bool,
 }
 
 impl Table {
@@ -56,6 +57,7 @@ impl Table {
             name: "".to_string(),
             columns: vec![],
             indexes: vec![],
+            without_rowid: false,
         }
     }
 
