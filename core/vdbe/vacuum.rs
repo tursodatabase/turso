@@ -121,8 +121,9 @@ pub(crate) fn classify_schema_entries(
             }
             SchemaEntryType::Index => {
                 // Custom index-method indexes (FTS, vector, etc.) have rootpage=0
-                // because their storage is managed by the index method, not a
-                // B-tree. Replayed after data copy.
+                // in sqlite_schema because their storage is managed by the index
+                // method, not a B-tree (see translate/index.rs:253).
+                // Replayed after data copy.
                 post_data_entries.push(entry);
             }
         }

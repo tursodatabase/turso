@@ -2888,3 +2888,73 @@ fn test_vacuum_into_preserves_autoincrement_counter(tmp_db: TempDatabase) -> any
 
     Ok(())
 }
+
+/// VACUUM INTO is not yet supported for databases with custom index-method
+/// indexes (FTS, vector). The index method's create() doesn't rebuild backing
+/// indexes from existing data, so the destination would have empty indexes.
+#[turso_macros::test]
+fn test_vacuum_into_rejects_custom_index_method(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+
+    conn.execute("CREATE TABLE vectors (id INTEGER PRIMARY KEY, label TEXT, embedding BLOB)")?;
+    conn.execute("CREATE INDEX vec_idx ON vectors USING toy_vector_sparse_ivf (embedding)")?;
+    conn.execute("INSERT INTO vectors VALUES (1, 'cat', vector32_sparse('[1, 0, 0, 0]'))")?;
+
+    let dest_dir = TempDir::new()?;
+    let dest_path = dest_dir.path().join("vectors.db");
+    let dest_path_str = dest_path.to_str().unwrap();
+
+    let result = conn.execute(format!("VACUUM INTO '{dest_path_str}'"));
+    assert!(
+        result.is_err(),
+        "VACUUM INTO should reject custom index methods"
+    );
+
+    Ok(())
+}
+
+/// Test VACUUM INTO preserves vector data stored as blobs (without a vector index).
+/// Verifies that vector32() encoded blobs survive the vacuum round-trip
+/// and produce the same distance calculations on the destination.
+#[turso_macros::test]
+fn test_vacuum_into_preserves_vector_blobs(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+
+    conn.execute("CREATE TABLE vectors (id INTEGER PRIMARY KEY, label TEXT, embedding BLOB)")?;
+    conn.execute("INSERT INTO vectors VALUES (1, 'cat', vector32('[1.0, 0.0, 0.0, 0.0]'))")?;
+    conn.execute("INSERT INTO vectors VALUES (2, 'dog', vector32('[0.0, 1.0, 0.0, 0.0]'))")?;
+    conn.execute("INSERT INTO vectors VALUES (3, 'fish', vector32('[0.0, 0.0, 1.0, 0.0]'))")?;
+
+    // Compute a distance on the source for comparison
+    let source_dist: Vec<(f64,)> = conn.exec_rows(
+        "SELECT vector_distance_cos(
+            (SELECT embedding FROM vectors WHERE id = 1),
+            (SELECT embedding FROM vectors WHERE id = 2)
+        )",
+    );
+
+    let dest_dir = TempDir::new()?;
+    let dest_path = dest_dir.path().join("vectors.db");
+    let dest_path_str = dest_path.to_str().unwrap();
+
+    conn.execute(format!("VACUUM INTO '{dest_path_str}'"))?;
+
+    let dest_db = TempDatabase::new_with_existent(&dest_path);
+    let dest_conn = dest_db.connect_limbo();
+
+    assert_eq!(run_integrity_check(&dest_conn), "ok");
+
+    let count: Vec<(i64,)> = dest_conn.exec_rows("SELECT COUNT(*) FROM vectors");
+    assert_eq!(count[0].0, 3);
+
+    // Verify vector distance matches source — confirms blobs survived intact
+    let dest_dist: Vec<(f64,)> = dest_conn.exec_rows(
+        "SELECT vector_distance_cos(
+            (SELECT embedding FROM vectors WHERE id = 1),
+            (SELECT embedding FROM vectors WHERE id = 2)
+        )",
+    );
+    assert_eq!(source_dist, dest_dist);
+
+    Ok(())
+}

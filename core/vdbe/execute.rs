@@ -14074,17 +14074,18 @@ fn op_vacuum_into_inner(
                         vacuum_state.post_data_entries =
                             post_data.iter().map(|e| e.ordinal).collect();
 
-                        // Reject databases with FTS or other custom index-method
-                        // backing indexes. These create internal-prefixed schema
-                        // objects that VACUUM INTO cannot safely replay yet.
+                        // Reject databases with custom index-method indexes (FTS,
+                        // vector, etc.). Their backing_btree indexes can't be
+                        // populated correctly during VACUUM INTO because the index
+                        // method's create() doesn't rebuild from existing data.
                         for entry in &vacuum_state.schema_entries {
-                            if entry.name.starts_with(crate::schema::TURSO_INTERNAL_PREFIX)
-                                && entry.entry_type == crate::vdbe::vacuum::SchemaEntryType::Index
+                            if entry.entry_type == crate::vdbe::vacuum::SchemaEntryType::Index
+                                && !entry.is_storage_backed()
                             {
-                                return Err(LimboError::InternalError(
-                                    "VACUUM INTO is not supported for databases with FTS indexes"
-                                        .to_string(),
-                                ));
+                                return Err(LimboError::InternalError(format!(
+                                    "VACUUM INTO is not supported for databases with custom index-method indexes (found '{}')",
+                                    entry.name
+                                )));
                             }
                         }
 
