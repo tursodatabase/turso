@@ -179,7 +179,7 @@ impl Profile {
             query: QueryProfile {
                 gen_opts: Opts {
                     table: TableOpts {
-                        without_rowid_prob: 0.3,
+                        without_rowid_prob: 0.5,
                         ..Default::default()
                     },
                     query: QueryOpts {

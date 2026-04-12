@@ -726,9 +726,6 @@ fn validate(
         constraints,
     } = &body
     {
-        if options.contains_without_rowid() {
-            bail_parse_error!("WITHOUT ROWID tables are not supported");
-        }
         let column_names: Vec<&str> = columns.iter().map(|c| c.col_name.as_str()).collect();
         for i in 0..columns.len() {
             let col_i = &columns[i];
