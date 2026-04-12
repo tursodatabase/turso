@@ -13965,11 +13965,30 @@ fn op_vacuum_into_inner(
                 // at the end, so mid-build checkpointing is pointless extra IO.
                 dest_conn.wal_auto_checkpoint_disable();
 
-                // Mirror source symbol table (functions, vtab modules, index methods)
-                // so schema replay can resolve references to non-builtin symbols.
+                // Mirror source symbols needed for schema replay (functions, vtab
+                // modules, index methods). We skip vtabs — those are live instances
+                // tied to the source connection and not needed for compiling schema SQL.
                 {
-                    let source_syms: crate::SymbolTable = (*program.connection.syms.read()).clone();
-                    *dest_conn.syms.write() = source_syms;
+                    let source_syms = program.connection.syms.read();
+                    let mut dest_syms = dest_conn.syms.write();
+                    dest_syms.functions.extend(
+                        source_syms
+                            .functions
+                            .iter()
+                            .map(|(k, v)| (k.clone(), v.clone())),
+                    );
+                    dest_syms.vtab_modules.extend(
+                        source_syms
+                            .vtab_modules
+                            .iter()
+                            .map(|(k, v)| (k.clone(), v.clone())),
+                    );
+                    dest_syms.index_methods.extend(
+                        source_syms
+                            .index_methods
+                            .iter()
+                            .map(|(k, v)| (k.clone(), v.clone())),
+                    );
                 }
 
                 // Mirror source custom type definitions into destination schema
@@ -14179,25 +14198,24 @@ fn op_vacuum_into_inner(
                 let entry = &vacuum_state.schema_entries[entry_ordinal];
                 let table_name = &entry.name;
 
-                // sqlite_sequence: skip data copy — inserting rows with explicit
-                // rowids into AUTOINCREMENT tables already updates sqlite_sequence
-                // on the destination as a side effect. Just verify the destination
-                // has the table (it should, since the AUTOINCREMENT table CREATE
-                // auto-creates it).
+                // sqlite_sequence: only copy data if destination materialized it
+                // (i.e., an AUTOINCREMENT table was created that triggered its
+                // creation). The data copy is needed because inserting rows with
+                // explicit rowids via the `rowid` pseudo-column does not update
+                // sqlite_sequence counters on the destination.
                 if entry.is_sqlite_sequence() {
-                    turso_assert!(
-                        dest_conn
-                            .schema
-                            .read()
-                            .get_btree_table(crate::schema::SQLITE_SEQUENCE_TABLE_NAME)
-                            .is_some(),
-                        "destination should have sqlite_sequence after creating AUTOINCREMENT tables"
-                    );
-                    vacuum_state.sub_state = OpVacuumIntoSubState::StartCopyTable {
-                        dest_conn,
-                        table_idx: table_idx + 1,
-                    };
-                    continue;
+                    let dest_has_sequence = dest_conn
+                        .schema
+                        .read()
+                        .get_btree_table(crate::schema::SQLITE_SEQUENCE_TABLE_NAME)
+                        .is_some();
+                    if !dest_has_sequence {
+                        vacuum_state.sub_state = OpVacuumIntoSubState::StartCopyTable {
+                            dest_conn,
+                            table_idx: table_idx + 1,
+                        };
+                        continue;
+                    }
                 }
 
                 let escaped_table_name = table_name.replace('"', "\"\"");

@@ -2813,3 +2813,78 @@ fn test_vacuum_into_generated_column_with_rowid_and_deletes() -> anyhow::Result<
 
     Ok(())
 }
+
+/// Regression test: VACUUM INTO must preserve custom type definitions so that
+/// STRICT tables with custom type columns are correctly created on the destination
+/// and encode/decode values properly.
+#[test]
+fn test_vacuum_into_preserves_custom_types() -> anyhow::Result<()> {
+    let _ = env_logger::try_init();
+    let opts = turso_core::DatabaseOpts::new().with_custom_types(true);
+    let tmp_db = TempDatabase::builder().with_opts(opts).build();
+    let conn = tmp_db.connect_limbo();
+
+    // Create a custom type with encode/decode transforms
+    conn.execute("CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100")?;
+    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, amount cents) STRICT")?;
+    conn.execute("INSERT INTO t VALUES (1, 42)")?;
+    conn.execute("INSERT INTO t VALUES (2, 100)")?;
+
+    // Verify decoded values on source
+    let source_rows: Vec<(i64, i64)> = conn.exec_rows("SELECT id, amount FROM t ORDER BY id");
+    assert_eq!(source_rows, vec![(1, 42), (2, 100)]);
+
+    let dest_dir = TempDir::new()?;
+    let dest_path = dest_dir.path().join("custom_types.db");
+    let dest_path_str = dest_path.to_str().unwrap();
+
+    conn.execute(format!("VACUUM INTO '{dest_path_str}'"))?;
+
+    let dest_db = TempDatabase::new_with_existent_with_opts(&dest_path, opts);
+    let dest_conn = dest_db.connect_limbo();
+
+    assert_eq!(run_integrity_check(&dest_conn), "ok");
+
+    // Destination must decode values correctly (42, 100 — not raw 4200, 10000)
+    let dest_rows: Vec<(i64, i64)> = dest_conn.exec_rows("SELECT id, amount FROM t ORDER BY id");
+    assert_eq!(dest_rows, source_rows);
+
+    Ok(())
+}
+
+/// Regression test: VACUUM INTO must preserve AUTOINCREMENT counters so that
+/// new inserts on both source and destination get the same next rowid.
+#[turso_macros::test]
+fn test_vacuum_into_preserves_autoincrement_counter(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+
+    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY AUTOINCREMENT, val TEXT)")?;
+    conn.execute("INSERT INTO t (val) VALUES ('a')")?;
+    conn.execute("INSERT INTO t (val) VALUES ('b')")?;
+    conn.execute("INSERT INTO t (val) VALUES ('c')")?;
+    // Delete some rows to create a gap — AUTOINCREMENT should never reuse rowids
+    conn.execute("DELETE FROM t WHERE id = 2")?;
+
+    let dest_dir = TempDir::new()?;
+    let dest_path = dest_dir.path().join("autoincr.db");
+    let dest_path_str = dest_path.to_str().unwrap();
+
+    conn.execute(format!("VACUUM INTO '{dest_path_str}'"))?;
+
+    // Insert a new row on the source — should get id=4 (not 2, because AUTOINCREMENT)
+    conn.execute("INSERT INTO t (val) VALUES ('d')")?;
+    let source_new: Vec<(i64, String)> = conn.exec_rows("SELECT id, val FROM t WHERE val = 'd'");
+    assert_eq!(source_new, vec![(4, "d".to_string())]);
+
+    // Insert a new row on the destination — should also get id=4
+    let dest_db = TempDatabase::new_with_existent(&dest_path);
+    let dest_conn = dest_db.connect_limbo();
+    dest_conn.execute("INSERT INTO t (val) VALUES ('d')")?;
+    let dest_new: Vec<(i64, String)> = dest_conn.exec_rows("SELECT id, val FROM t WHERE val = 'd'");
+    assert_eq!(
+        dest_new, source_new,
+        "AUTOINCREMENT counter should produce the same next rowid on both databases"
+    );
+
+    Ok(())
+}
