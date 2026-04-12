@@ -8,6 +8,9 @@ use turso_macros::turso_assert;
 pub(crate) struct SchemaEntry {
     pub entry_type: SchemaEntryType,
     pub name: String,
+    /// `sqlite_schema.tbl_name`: for indexes and triggers, this is the table
+    /// the object belongs to; for tables and views it usually matches `name`.
+    pub tbl_name: String,
     pub rootpage: i64,
     pub sql: String,
     /// Original rowid-order position from `sqlite_schema`, used to preserve
@@ -44,6 +47,7 @@ impl SchemaEntry {
         Ok(Self {
             entry_type,
             name: row.get::<&str>(1)?.to_string(),
+            tbl_name: row.get::<&str>(2)?.to_string(),
             rootpage: row.get::<i64>(3)?,
             sql: row.get::<&str>(4)?.to_string(),
             ordinal,

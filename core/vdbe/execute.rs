@@ -14069,25 +14069,22 @@ fn op_vacuum_into_inner(
                             tables_create.iter().map(|e| e.ordinal).collect();
                         vacuum_state.tables_to_copy =
                             tables_copy.iter().map(|e| e.ordinal).collect();
-                        vacuum_state.indexes_to_create =
-                            indexes_create.iter().map(|e| e.ordinal).collect();
+                        // Backing-btree indexes are implementation details of custom index
+                        // methods. The user-visible custom-index CREATE in post_data_entries
+                        // recreates and backfills those backing indexes from the copied rows.
+                        vacuum_state.indexes_to_create = indexes_create
+                            .iter()
+                            .filter(|entry| {
+                                !program.connection.with_schema(database_id, |schema| {
+                                    schema
+                                        .get_index(&entry.tbl_name, &entry.name)
+                                        .is_some_and(|idx| idx.is_backing_btree_index())
+                                })
+                            })
+                            .map(|e| e.ordinal)
+                            .collect();
                         vacuum_state.post_data_entries =
                             post_data.iter().map(|e| e.ordinal).collect();
-
-                        // Reject databases with custom index-method indexes (FTS,
-                        // vector, etc.). Their backing_btree indexes can't be
-                        // populated correctly during VACUUM INTO because the index
-                        // method's create() doesn't rebuild from existing data.
-                        for entry in &vacuum_state.schema_entries {
-                            if entry.entry_type == crate::vdbe::vacuum::SchemaEntryType::Index
-                                && !entry.is_storage_backed()
-                            {
-                                return Err(LimboError::InternalError(format!(
-                                    "VACUUM INTO is not supported for databases with custom index-method indexes (found '{}')",
-                                    entry.name
-                                )));
-                            }
-                        }
 
                         vacuum_state.sub_state =
                             OpVacuumIntoSubState::PrepareCreateTable { dest_conn, idx: 0 };

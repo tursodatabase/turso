@@ -2889,26 +2889,59 @@ fn test_vacuum_into_preserves_autoincrement_counter(tmp_db: TempDatabase) -> any
     Ok(())
 }
 
-/// VACUUM INTO is not yet supported for databases with custom index-method
-/// indexes (FTS, vector). The index method's create() doesn't rebuild backing
-/// indexes from existing data, so the destination would have empty indexes.
+/// VACUUM INTO preserves custom index-method indexes by replaying the
+/// user-visible custom index after copying table data. The index method then
+/// recreates and backfills its backing storage from destination rows.
 #[turso_macros::test]
-fn test_vacuum_into_rejects_custom_index_method(tmp_db: TempDatabase) -> anyhow::Result<()> {
+fn test_vacuum_into_preserves_custom_index_method(tmp_db: TempDatabase) -> anyhow::Result<()> {
     let conn = tmp_db.connect_limbo();
 
     conn.execute("CREATE TABLE vectors (id INTEGER PRIMARY KEY, label TEXT, embedding BLOB)")?;
     conn.execute("CREATE INDEX vec_idx ON vectors USING toy_vector_sparse_ivf (embedding)")?;
     conn.execute("INSERT INTO vectors VALUES (1, 'cat', vector32_sparse('[1, 0, 0, 0]'))")?;
+    conn.execute("INSERT INTO vectors VALUES (2, 'dog', vector32_sparse('[0, 1, 0, 0]'))")?;
+    conn.execute("INSERT INTO vectors VALUES (3, 'fish', vector32_sparse('[0, 0, 1, 0]'))")?;
 
     let dest_dir = TempDir::new()?;
     let dest_path = dest_dir.path().join("vectors.db");
     let dest_path_str = dest_path.to_str().unwrap();
 
-    let result = conn.execute(format!("VACUUM INTO '{dest_path_str}'"));
-    assert!(
-        result.is_err(),
-        "VACUUM INTO should reject custom index methods"
+    conn.execute(format!("VACUUM INTO '{dest_path_str}'"))?;
+
+    let dest_db = TempDatabase::new_with_existent_with_opts(&dest_path, tmp_db.db_opts);
+    let dest_conn = dest_db.connect_limbo();
+
+    let indexes: Vec<(String,)> = dest_conn.exec_rows(
+        "SELECT name FROM sqlite_schema WHERE type = 'index' AND tbl_name = 'vectors' ORDER BY name",
     );
+    assert_eq!(
+        indexes,
+        vec![
+            ("vec_idx".to_string(),),
+            ("vec_idx_inverted_index".to_string(),),
+            ("vec_idx_stats".to_string(),),
+        ],
+    );
+
+    let eqp: Vec<(i64, i64, i64, String)> = dest_conn.exec_rows(
+        "EXPLAIN QUERY PLAN \
+         SELECT id, label, vector_distance_jaccard(embedding, vector32_sparse('[1, 0, 0, 0]')) AS distance \
+         FROM vectors ORDER BY distance LIMIT 1",
+    );
+    assert!(
+        eqp.iter()
+            .any(|(_, _, _, detail)| detail.contains("INDEX METHOD")),
+        "nearest-neighbor query should use custom index method, got plan: {eqp:?}",
+    );
+
+    let nearest: Vec<(i64, String, f64)> = dest_conn.exec_rows(
+        "SELECT id, label, vector_distance_jaccard(embedding, vector32_sparse('[1, 0, 0, 0]')) AS distance \
+         FROM vectors ORDER BY distance LIMIT 1",
+    );
+    assert_eq!(nearest.len(), 1);
+    assert_eq!(nearest[0].0, 1);
+    assert_eq!(nearest[0].1, "cat");
+    assert!(nearest[0].2.abs() < 1e-9);
 
     Ok(())
 }
