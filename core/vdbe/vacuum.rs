@@ -1,6 +1,6 @@
 use turso_macros::turso_assert;
 
-/// A typed representation of a row from `sqlite_schema`.
+/// A representation of a row from `sqlite_schema`.
 ///
 /// Carries `rootpage` so we can distinguish storage-backed tables/indexes
 /// (rootpage != 0) from virtual tables, views, and triggers (rootpage = 0)
@@ -11,7 +11,7 @@ pub(crate) struct SchemaEntry {
     pub rootpage: i64,
     pub sql: String,
     /// Original rowid-order position from `sqlite_schema`, used to preserve
-    /// creation order within each replay phase.
+    /// creation order within each VACUUM replay phase.
     pub ordinal: usize,
 }
 
@@ -44,7 +44,6 @@ impl SchemaEntry {
         Ok(Self {
             entry_type,
             name: row.get::<&str>(1)?.to_string(),
-            // row index 2 is tbl_name — not needed
             rootpage: row.get::<i64>(3)?,
             sql: row.get::<&str>(4)?.to_string(),
             ordinal,
@@ -101,8 +100,8 @@ pub(crate) fn classify_schema_entries(
                 tables_to_copy.push(entry);
             }
             SchemaEntryType::Index if entry.is_storage_backed() => {
-                // User-defined secondary index — defer creation until after
-                // data copy for performance (avoids maintaining indexes during
+                // User-defined secondary index: we do it after we copy data
+                // for performance (avoids maintaining indexes during
                 // bulk insert).
                 indexes_to_create.push(entry);
             }

@@ -31,7 +31,7 @@ pub mod insn;
 pub mod metrics;
 pub mod rowset;
 pub mod sorter;
-pub(crate) mod vacuum;
+pub mod vacuum;
 pub mod value;
 // for benchmarks
 pub use crate::translate::collate::CollationSeq;
@@ -2009,10 +2009,9 @@ impl Program {
 
         let mut abort_error: Option<LimboError> = None;
 
-        // Drop vacuum state before the nested-statement check below.
-        // Vacuum opcode state can hold parked prepare_internal() helpers whose
-        // nested guards would otherwise make is_nested_stmt() return true,
-        // preventing top-level rollback/finalization of the source transaction.
+        // Vacuum machinery might have nested statements in itself. So on abort we want to
+        // end them first gracefully, then we can go with the following checks that if the
+        // connection has any nested statements
         state.op_vacuum_into_state = None;
 
         // Only end trigger execution if the subprogram was actually running.

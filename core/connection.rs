@@ -2527,7 +2527,7 @@ pub type Row = vdbe::Row;
 
 pub type StepResult = vdbe::StepResult;
 
-#[derive(Default, Clone)]
+#[derive(Default)]
 pub struct SymbolTable {
     pub functions: HashMap<String, Arc<function::ExternalFunc>>,
     pub vtabs: HashMap<String, Arc<VirtualTable>>,
