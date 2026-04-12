@@ -37,7 +37,7 @@ use crate::{
             plan_subqueries_from_returning,
         },
         trigger_exec::{
-            fire_trigger, get_triggers_with_temp, has_triggers_with_temp, TriggerContext,
+            fire_trigger, get_triggers_including_temp, has_triggers_including_temp, TriggerContext,
         },
         upsert::{
             collect_set_clauses_for_upsert, emit_upsert, resolve_upsert_target,
@@ -284,7 +284,7 @@ pub fn translate_insert(
         // for RETURNING clause subqueries - handled below via with_for_returning.
     }
 
-    let database_id = resolver.resolve_existing_table_database_id(&tbl_name)?;
+    let database_id = resolver.resolve_existing_table_database_id_qualified(&tbl_name)?;
     let table_name = &tbl_name.name;
     let table = match resolver.with_schema(database_id, |s| s.get_table(table_name.as_str())) {
         Some(table) => table,
@@ -491,7 +491,7 @@ pub fn translate_insert(
 
     // Fire BEFORE INSERT triggers
 
-    let relevant_before_triggers = get_triggers_with_temp(
+    let relevant_before_triggers = get_triggers_including_temp(
         resolver,
         database_id,
         TriggerEvent::Insert,
@@ -891,7 +891,7 @@ pub fn translate_insert(
     });
 
     // Fire AFTER INSERT triggers
-    let relevant_after_triggers = get_triggers_with_temp(
+    let relevant_after_triggers = get_triggers_including_temp(
         resolver,
         database_id,
         TriggerEvent::Insert,
@@ -1997,7 +1997,7 @@ fn init_source_emission<'a>(
         }
     }
     // Check if INSERT triggers exist - if so, we need to use ephemeral table for VALUES with more than one row
-    let has_insert_triggers = has_triggers_with_temp(
+    let has_insert_triggers = has_triggers_including_temp(
         resolver,
         database_id,
         TriggerEvent::Insert,

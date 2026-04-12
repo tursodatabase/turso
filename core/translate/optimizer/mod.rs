@@ -34,7 +34,7 @@ use crate::{
             NonFromClauseSubquery, OuterQueryReference, QueryDestination, ResultSetColumn, Scan,
             SeekKeyComponent, SubqueryState,
         },
-        trigger_exec::has_triggers_with_temp,
+        trigger_exec::has_triggers_including_temp,
     },
     types::SeekOp,
     util::{
@@ -838,7 +838,7 @@ fn first_update_safety_reason(
         // Check if there are UPDATE triggers
         let updated_cols: HashSet<usize> = plan.set_clauses.iter().map(|(i, _)| *i).collect();
         let database_id = table_ref.database_id;
-        if has_triggers_with_temp(
+        if has_triggers_including_temp(
             resolver,
             database_id,
             TriggerEvent::Update,

@@ -1628,19 +1628,22 @@ impl Program {
         // Reset state for next use
         program_state.view_delta_state = ViewDeltaCommitState::NotStarted;
         let tx_state = self.connection.get_tx_state();
-        let has_attached_mv_tx = self.connection.next_attached_mv_tx().is_some();
-        let has_attached_wal_tx = self
-            .connection
-            .get_all_attached_pagers()
-            .iter()
-            .any(|pager| pager.holds_read_lock());
         if tx_state == TransactionState::None
             && matches!(program_state.commit_state, CommitState::Ready)
-            && !has_attached_mv_tx
-            && !has_attached_wal_tx
         {
-            // No active transaction and no in-progress commit — nothing to do.
-            return Ok(IOResult::Done(()));
+            // No main transaction and no in-progress commit — check whether
+            // any attached/temp database still has an active transaction before
+            // bailing out. Defer these checks to here so the common case
+            // (active main transaction) doesn't pay for the lock reads.
+            let has_attached_mv_tx = self.connection.next_attached_mv_tx().is_some();
+            let has_attached_wal_tx = self
+                .connection
+                .get_all_attached_pagers()
+                .iter()
+                .any(|pager| pager.holds_read_lock());
+            if !has_attached_mv_tx && !has_attached_wal_tx {
+                return Ok(IOResult::Done(()));
+            }
         }
         if self.connection.is_nested_stmt() {
             // We don't want to commit on nested statements. Let parent handle it.
@@ -2238,6 +2241,7 @@ impl Program {
             self.connection.auto_commit.store(true, Ordering::SeqCst);
         }
         self.connection.rollback_attached_wal_txns();
+        self.connection.rollback_temp_schema();
         self.connection.set_tx_state(TransactionState::None);
     }
 

@@ -7,8 +7,9 @@ use crate::{
         display::format_eqp_detail,
         emitter::{
             emit_cdc_autocommit_commit, emit_cdc_full_record, emit_cdc_insns,
-            emit_index_column_value_old_image, emit_program_for_select, get_triggers_with_temp,
-            has_triggers_with_temp, init_limit, OperationMode, TriggerTime,
+            emit_index_column_value_old_image, emit_program_for_select,
+            get_triggers_including_temp, has_triggers_including_temp, init_limit, OperationMode,
+            TriggerTime,
         },
         expr::{
             emit_returning_results, emit_returning_scan_back, emit_table_column,
@@ -467,7 +468,7 @@ fn emit_delete_insns<'a>(
     let main_table_cursor_id = program.resolve_cursor_id(&CursorKey::table(internal_id));
     let has_returning = !result_columns.is_empty();
     let has_delete_triggers = if let Some(btree_table) = btree_table {
-        has_triggers_with_temp(
+        has_triggers_including_temp(
             &t_ctx.resolver,
             database_id,
             TriggerEvent::Delete,
@@ -892,7 +893,7 @@ fn emit_delete_insns_when_triggers_present(
     let database_id = unsafe { (*table_reference).database_id };
     let has_returning = !result_columns.is_empty();
     let has_delete_triggers = if let Some(btree_table) = btree_table {
-        has_triggers_with_temp(
+        has_triggers_including_temp(
             &t_ctx.resolver,
             database_id,
             TriggerEvent::Delete,
@@ -928,7 +929,7 @@ fn emit_delete_insns_when_triggers_present(
 
     // Fire BEFORE DELETE triggers
     if let Some(btree_table) = unsafe { &*table_reference }.btree() {
-        let relevant_triggers = get_triggers_with_temp(
+        let relevant_triggers = get_triggers_including_temp(
             &t_ctx.resolver,
             database_id,
             TriggerEvent::Delete,
@@ -999,7 +1000,7 @@ fn emit_delete_insns_when_triggers_present(
 
     // Fire AFTER DELETE triggers
     if let Some(btree_table) = unsafe { &*table_reference }.btree() {
-        let relevant_triggers = get_triggers_with_temp(
+        let relevant_triggers = get_triggers_including_temp(
             &t_ctx.resolver,
             database_id,
             TriggerEvent::Delete,

@@ -1491,7 +1491,7 @@ pub fn translate_drop_table(
     program: &mut ProgramBuilder,
     connection: &Arc<Connection>,
 ) -> Result<()> {
-    let database_id = resolver.resolve_existing_table_database_id(&tbl_name)?;
+    let database_id = resolver.resolve_existing_table_database_id_qualified(&tbl_name)?;
     let name = tbl_name.name.as_str();
     let opts = ProgramBuilderOpts {
         num_cursors: 4,
@@ -1652,6 +1652,8 @@ pub fn translate_drop_table(
         });
 
         if !trigger_names_to_drop.is_empty() {
+            let temp_schema_cookie = resolver.with_schema(crate::TEMP_DB_ID, |s| s.schema_version);
+            program.begin_write_on_database(crate::TEMP_DB_ID, temp_schema_cookie);
             let temp_schema_table =
                 resolver.with_schema(crate::TEMP_DB_ID, |s| s.get_btree_table(SQLITE_TABLEID));
             if let Some(temp_schema_table) = temp_schema_table {

@@ -103,7 +103,7 @@ pub fn translate_create_trigger(
         resolve_create_trigger_database_id(resolver, &trigger_name, &tbl_name, temporary)?;
     let target_table_database_id = if temporary {
         // A temp trigger's target table can be in any schema.
-        resolver.resolve_existing_table_database_id(&tbl_name)?
+        resolver.resolve_existing_table_database_id_qualified(&tbl_name)?
     } else if tbl_name.db_name.is_some() {
         resolver.resolve_database_id(&tbl_name)?
     } else {
@@ -240,7 +240,7 @@ fn resolve_create_trigger_database_id(
 
     // Unqualified trigger names default to main, except when the trigger is
     // attached to a temp object. SQLite stores those triggers in temp.
-    match resolver.resolve_existing_table_database_id(tbl_name)? {
+    match resolver.resolve_existing_table_database_id_qualified(tbl_name)? {
         crate::TEMP_DB_ID => Ok(crate::TEMP_DB_ID),
         _ => Ok(crate::MAIN_DB_ID),
     }

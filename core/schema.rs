@@ -174,21 +174,7 @@ pub const TURSO_TYPES_TABLE_NAME: &str = "__turso_internal_types";
 pub const DBSP_TABLE_PREFIX: &str = "__turso_internal_dbsp_state_v";
 pub const TURSO_INTERNAL_PREFIX: &str = "__turso_internal_";
 
-/// Quote a SQL identifier with double quotes if it needs quoting.
-/// Quotes when the name contains non-alphanumeric characters (except underscore),
-/// starts with a digit, or is empty. Simple names like "test_uint" are left unquoted.
-fn quote_ident(name: &str) -> String {
-    let needs_quoting = name.is_empty()
-        || name.as_bytes()[0].is_ascii_digit()
-        || !name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
-        || turso_parser::lexer::is_quotable_keyword(name.as_bytes());
-    if needs_quoting {
-        let escaped = name.replace('"', "\"\"");
-        format!("\"{escaped}\"")
-    } else {
-        name.to_string()
-    }
-}
+use crate::util::quote_identifier as quote_ident;
 
 /// Escape a string literal for SQL single-quote context.
 /// The value goes inside the surrounding quotes already present in the format string.
@@ -810,16 +796,16 @@ impl Schema {
         let Some(bucket) = self.triggers.get_mut(&table_name) else {
             return;
         };
+        // Check once whether this schema has a table with the same name.
+        // If it does, unqualified triggers resolve to that local table,
+        // not to the one being dropped in `target_db`.
+        let has_shadow_table = self.tables.contains_key(&table_name);
         bucket.retain(|trigger| {
-            // Keep triggers that explicitly target a *different* database.
-            // `None` means unqualified, which resolves to the parent schema's
-            // table of this name — so from the perspective of a DROP in
-            // `target_db`, an unqualified temp-schema trigger with the same
-            // table name is NOT meant for us unless the temp schema has no
-            // shadowing table. Conservatively, only drop when the ids match.
             match trigger.target_database_id {
                 Some(db) => db != target_db,
-                None => false, // unqualified → assume it targets us
+                // Unqualified triggers resolve to the local schema's table
+                // first. Only remove when no local table shadows the name.
+                None => has_shadow_table,
             }
         });
         if bucket.is_empty() {

@@ -39,7 +39,7 @@ use crate::{
         planner::ROWID_STRS,
         subquery::{emit_non_from_clause_subqueries_for_eval_at, emit_non_from_clause_subquery},
         trigger_exec::{
-            fire_trigger, get_triggers_with_temp, has_triggers_with_temp, TriggerContext,
+            fire_trigger, get_triggers_including_temp, has_triggers_including_temp, TriggerContext,
         },
         ProgramBuilder,
     },
@@ -939,10 +939,10 @@ fn emit_update_insns<'a>(
 
     let not_exists_check_required = updates_rowid || iteration_cursor_id != target_table_cursor_id;
     let update_database_id = target_table.database_id;
-    let has_before_triggers_early = if let Some(btree_table) = target_table.table.btree() {
+    let has_before_update_triggers = if let Some(btree_table) = target_table.table.btree() {
         let updated_column_indices: HashSet<usize> =
             set_clauses.iter().map(|(col_idx, _)| *col_idx).collect();
-        has_triggers_with_temp(
+        has_triggers_including_temp(
             &t_ctx.resolver,
             update_database_id,
             TriggerEvent::Update,
@@ -952,27 +952,6 @@ fn emit_update_insns<'a>(
     } else {
         false
     };
-
-    // If BEFORE UPDATE triggers exist, we need to defer NOT NULL constraint checks until after the
-    // triggers fire (matching SQLite behavior).
-    let has_before_update_triggers = target_table
-        .table
-        .btree()
-        .and_then(|btree_table| {
-            let updated_column_indices: HashSet<usize> =
-                set_clauses.iter().map(|(col_idx, _)| *col_idx).collect();
-            t_ctx.resolver.with_schema(update_database_id, |s| {
-                get_relevant_triggers_type_and_time(
-                    s,
-                    TriggerEvent::Update,
-                    TriggerTime::Before,
-                    Some(updated_column_indices),
-                    &btree_table,
-                )
-                .next()
-            })
-        })
-        .is_some();
 
     let check_rowid_not_exists_label = if not_exists_check_required || has_before_update_triggers {
         Some(program.allocate_label())
@@ -1106,7 +1085,7 @@ fn emit_update_insns<'a>(
     {
         let updated_column_indices: HashSet<usize> =
             set_clauses.iter().map(|(col_idx, _)| *col_idx).collect();
-        let relevant_before_update_triggers = get_triggers_with_temp(
+        let relevant_before_update_triggers = get_triggers_including_temp(
             &t_ctx.resolver,
             update_database_id,
             TriggerEvent::Update,
@@ -1114,7 +1093,7 @@ fn emit_update_insns<'a>(
             Some(updated_column_indices.clone()),
             &btree_table,
         );
-        has_after_triggers = has_triggers_with_temp(
+        has_after_triggers = has_triggers_including_temp(
             &t_ctx.resolver,
             update_database_id,
             TriggerEvent::Update,
@@ -2310,7 +2289,7 @@ fn emit_update_insns<'a>(
             if let Some(btree_table) = target_table.table.btree() {
                 let updated_column_indices: HashSet<usize> =
                     set_clauses.iter().map(|(col_idx, _)| *col_idx).collect();
-                let relevant_triggers = get_triggers_with_temp(
+                let relevant_triggers = get_triggers_including_temp(
                     &t_ctx.resolver,
                     update_database_id,
                     TriggerEvent::Update,

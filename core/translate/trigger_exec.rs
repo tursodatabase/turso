@@ -759,7 +759,7 @@ pub fn get_relevant_triggers_type_and_time<'a>(
 /// schema when `database_id != TEMP_DB_ID`.  Temp triggers on a non-temp
 /// table are stored in the temp schema, so both schemas must be consulted
 /// for DML on any table.  Returns a combined, de-duplicated list.
-pub fn get_triggers_with_temp(
+pub fn get_triggers_including_temp(
     resolver: &Resolver,
     database_id: usize,
     event: TriggerEvent,
@@ -785,7 +785,7 @@ pub fn get_triggers_with_temp(
         })
         .collect()
     });
-    if database_id != crate::TEMP_DB_ID {
+    if database_id != crate::TEMP_DB_ID && resolver.has_temp_database() {
         let temp_triggers: Vec<Arc<Trigger>> = resolver.with_schema(crate::TEMP_DB_ID, |s| {
             get_relevant_triggers_type_and_time(s, event, time, updated_column_indices, table)
                 .filter(|trigger| match trigger.target_database_id {
@@ -804,7 +804,7 @@ pub fn get_triggers_with_temp(
 }
 
 /// Like [`has_relevant_triggers_type_only`], but also checks the temp schema.
-pub fn has_triggers_with_temp(
+pub fn has_triggers_including_temp(
     resolver: &Resolver,
     database_id: usize,
     event: TriggerEvent,
@@ -817,7 +817,7 @@ pub fn has_triggers_with_temp(
     if found {
         return true;
     }
-    if database_id != crate::TEMP_DB_ID {
+    if database_id != crate::TEMP_DB_ID && resolver.has_temp_database() {
         // Check temp schema for triggers that target this database.
         let has_temp = resolver.with_schema(crate::TEMP_DB_ID, |s| {
             s.get_triggers_for_table(table.name.as_str())

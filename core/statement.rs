@@ -506,8 +506,8 @@ impl Statement {
             .copied()
             .collect();
         for db_id in attached_db_ids {
-            // Discard any connection-local schema changes for this attached DB
-            // so the re-translate reads the committed schema.
+            // Discard any connection-local schema changes for this non-main DB
+            // (temp or attached) so the re-translate reads the committed schema.
             conn.database_schemas().write().remove(&db_id);
             if db_id == crate::TEMP_DB_ID && conn.temp.database.read().is_none() {
                 continue;

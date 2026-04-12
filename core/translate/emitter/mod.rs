@@ -31,7 +31,9 @@ use crate::translate::expr::{
 use crate::translate::plan::{JoinedTable, NonFromClauseSubquery, Plan, ResultSetColumn};
 use crate::translate::planner::TableMask;
 use crate::translate::planner::ROWID_STRS;
-use crate::translate::trigger_exec::{get_triggers_with_temp, has_triggers_with_temp};
+pub use crate::translate::trigger_exec::{
+    get_triggers_including_temp, has_triggers_including_temp,
+};
 use crate::translate::window::WindowMetadata;
 use crate::util::{
     check_expr_references_column, exprs_are_equivalent, normalize_ident, parse_numeric_literal,
@@ -484,26 +486,28 @@ impl<'a> Resolver<'a> {
         None
     }
 
-    pub(crate) fn resolve_existing_table_database_id(
+    pub(crate) fn resolve_existing_table_database_id_qualified(
         &self,
         qualified_name: &ast::QualifiedName,
     ) -> Result<usize> {
         if qualified_name.db_name.is_some() {
             return self.resolve_database_id(qualified_name);
         }
+        self.resolve_existing_table_database_id(qualified_name.name.as_str())
+    }
 
+    pub(crate) fn resolve_existing_table_database_id(&self, table_name: &str) -> Result<usize> {
         if let Some(ref ctx) = self.trigger_context {
             if ctx.restricts_db_references() {
                 return Ok(ctx.database_id);
             }
 
             return Ok(self.resolve_unqualified_existing_database_id(
-                qualified_name.name.as_str(),
+                table_name,
                 Self::schema_has_table_like_object,
             ));
         }
 
-        let table_name = qualified_name.name.as_str();
         if let Some(database_id) = Self::resolve_schema_table_database_id(table_name) {
             return Ok(database_id);
         }

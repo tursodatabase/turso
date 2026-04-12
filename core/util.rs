@@ -132,6 +132,21 @@ pub fn escape_sql_string_literal(literal: &str) -> String {
     literal.replace('\'', "''")
 }
 
+/// Quote a SQL identifier with double quotes when necessary.
+/// Always safe to call — returns the bare name when no quoting is needed.
+pub fn quote_identifier(name: &str) -> String {
+    let needs_quoting = name.is_empty()
+        || name.as_bytes()[0].is_ascii_digit()
+        || !name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
+        || turso_parser::lexer::is_quotable_keyword(name.as_bytes());
+    if needs_quoting {
+        let escaped = name.replace('"', "\"\"");
+        format!("\"{escaped}\"")
+    } else {
+        name.to_string()
+    }
+}
+
 pub const PRIMARY_KEY_AUTOMATIC_INDEX_NAME_PREFIX: &str = "sqlite_autoindex_";
 
 /// Unparsed index that comes from a sql query, i.e not an automatic index
@@ -3425,10 +3440,16 @@ fn from_clause_target_qualifiers(
     from: &Option<ast::FromClause>,
     target_table: &str,
 ) -> Vec<String> {
-    let Some(from_clause) = from else {
-        return Vec::new();
-    };
+    match from {
+        Some(from_clause) => from_clause_target_qualifiers_inner(from_clause, target_table),
+        None => Vec::new(),
+    }
+}
 
+fn from_clause_target_qualifiers_inner(
+    from_clause: &ast::FromClause,
+    target_table: &str,
+) -> Vec<String> {
     let target_table = normalize_ident(target_table);
     let mut qualifiers = Vec::new();
     let mut seen = HashSet::default();
@@ -3681,7 +3702,7 @@ fn rewrite_from_clause_column_refs_scoped(
     new_col: &str,
     target_qualifiers: &mut Vec<String>,
 ) {
-    let local = from_clause_target_qualifiers(&Some(from.clone()), target_table);
+    let local = from_clause_target_qualifiers_inner(from, target_table);
     let added = extend_qualifiers_scoped(target_qualifiers, &local);
 
     let rename_unqualified =
@@ -3785,60 +3806,56 @@ fn expr_still_references_renamed_column(
     rename_unqualified: bool,
     visible_target_qualifiers: &[String],
 ) -> bool {
-    let mut expr = expr.clone();
     let mut found = false;
 
-    let _ = walk_expr_mut(
-        &mut expr,
-        &mut |e: &mut ast::Expr| -> crate::Result<WalkControl> {
-            if found {
-                return Ok(WalkControl::Continue);
-            }
+    let _ = walk_expr(expr, &mut |e: &ast::Expr| -> crate::Result<WalkControl> {
+        if found {
+            return Ok(WalkControl::Continue);
+        }
 
-            match e {
-                ast::Expr::Subquery(select) | ast::Expr::Exists(select) => {
-                    let mut quals = visible_target_qualifiers.to_vec();
-                    found = select_still_references_renamed_column(
-                        select,
-                        target_table,
-                        trigger_table,
-                        old_col,
-                        &mut quals,
-                    );
-                }
-                ast::Expr::InSelect { rhs, .. } => {
-                    let mut quals = visible_target_qualifiers.to_vec();
-                    found = select_still_references_renamed_column(
-                        rhs,
-                        target_table,
-                        trigger_table,
-                        old_col,
-                        &mut quals,
-                    );
-                }
-                ast::Expr::Qualified(ns, col) | ast::Expr::DoublyQualified(_, ns, col) => {
-                    if col.as_str().eq_ignore_ascii_case(old_col) {
-                        let ns_norm = normalize_ident(ns.as_str());
-                        if ((ns_norm == "new" || ns_norm == "old")
-                            && target_table.eq_ignore_ascii_case(trigger_table))
-                            || visible_target_qualifiers.contains(&ns_norm)
-                            || (target_table.eq_ignore_ascii_case(trigger_table)
-                                && ns_norm.eq_ignore_ascii_case(trigger_table))
-                        {
-                            found = true;
-                        }
-                    }
-                }
-                ast::Expr::Id(name) | ast::Expr::Name(name) => {
-                    if rename_unqualified && name.as_str().eq_ignore_ascii_case(old_col) {
+        match e {
+            ast::Expr::Subquery(select) | ast::Expr::Exists(select) => {
+                let mut quals = visible_target_qualifiers.to_vec();
+                found = select_still_references_renamed_column(
+                    select,
+                    target_table,
+                    trigger_table,
+                    old_col,
+                    &mut quals,
+                );
+            }
+            ast::Expr::InSelect { rhs, .. } => {
+                let mut quals = visible_target_qualifiers.to_vec();
+                found = select_still_references_renamed_column(
+                    rhs,
+                    target_table,
+                    trigger_table,
+                    old_col,
+                    &mut quals,
+                );
+            }
+            ast::Expr::Qualified(ns, col) | ast::Expr::DoublyQualified(_, ns, col) => {
+                if col.as_str().eq_ignore_ascii_case(old_col) {
+                    let ns_norm = normalize_ident(ns.as_str());
+                    if ((ns_norm == "new" || ns_norm == "old")
+                        && target_table.eq_ignore_ascii_case(trigger_table))
+                        || visible_target_qualifiers.contains(&ns_norm)
+                        || (target_table.eq_ignore_ascii_case(trigger_table)
+                            && ns_norm.eq_ignore_ascii_case(trigger_table))
+                    {
                         found = true;
                     }
                 }
-                _ => {}
             }
-            Ok(WalkControl::Continue)
-        },
-    );
+            ast::Expr::Id(name) | ast::Expr::Name(name) => {
+                if rename_unqualified && name.as_str().eq_ignore_ascii_case(old_col) {
+                    found = true;
+                }
+            }
+            _ => {}
+        }
+        Ok(WalkControl::Continue)
+    });
 
     found
 }
@@ -4110,7 +4127,7 @@ fn from_clause_still_references_renamed_column(
     old_col: &str,
     target_qualifiers: &mut Vec<String>,
 ) -> bool {
-    let local = from_clause_target_qualifiers(&Some(from.clone()), target_table);
+    let local = from_clause_target_qualifiers_inner(from, target_table);
     let added = extend_qualifiers_scoped(target_qualifiers, &local);
 
     let rename_unqualified =

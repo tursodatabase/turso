@@ -82,15 +82,10 @@ pub fn translate_create_index(
     }
 
     let original_idx_name = idx_name;
-    let table_qname = QualifiedName {
-        db_name: None,
-        name: tbl_name.clone(),
-        alias: None,
-    };
     let database_id = if original_idx_name.db_name.is_some() {
         resolver.resolve_database_id(&original_idx_name)?
     } else {
-        resolver.resolve_existing_table_database_id(&table_qname)?
+        resolver.resolve_existing_table_database_id(tbl_name.as_str())?
     };
     let idx_name = normalize_ident(original_idx_name.name.as_str());
     let tbl_name = normalize_ident(tbl_name.as_str());

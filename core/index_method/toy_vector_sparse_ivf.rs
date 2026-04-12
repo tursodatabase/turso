@@ -6,6 +6,7 @@ use std::{
 use turso_parser::ast::{self, SortOrder};
 
 use crate::numeric::Numeric;
+use crate::util::quote_identifier;
 use crate::{
     index_method::{
         open_index_cursor, open_table_cursor, parse_patterns, IndexMethod, IndexMethodAttachment,
@@ -409,19 +410,21 @@ impl IndexMethodCursor for VectorSparseInvertedIndexMethodCursor {
         let db_prefix = connection
             .get_database_name_by_index(database_id)
             .filter(|name| name != "main")
-            .map(|name| format!("{name}."))
+            .map(|name| format!("{}.", quote_identifier(&name)))
             .unwrap_or_default();
+        let quoted_table = quote_identifier(&self.configuration.table_name);
+        let quoted_cols = columns
+            .iter()
+            .map(|c| quote_identifier(c))
+            .collect::<Vec<_>>()
+            .join(", ");
         let inverted_index_create = format!(
-            "CREATE INDEX {db_prefix}{} ON {} USING {BACKING_BTREE_INDEX_METHOD_NAME} ({})",
-            self.inverted_index_btree,
-            self.configuration.table_name,
-            columns.join(", ")
+            "CREATE INDEX {db_prefix}{} ON {quoted_table} USING {BACKING_BTREE_INDEX_METHOD_NAME} ({quoted_cols})",
+            quote_identifier(&self.inverted_index_btree),
         );
         let stats_index_create = format!(
-            "CREATE INDEX {db_prefix}{} ON {} USING {BACKING_BTREE_INDEX_METHOD_NAME} ({})",
-            self.stats_btree,
-            self.configuration.table_name,
-            columns.join(", ")
+            "CREATE INDEX {db_prefix}{} ON {quoted_table} USING {BACKING_BTREE_INDEX_METHOD_NAME} ({quoted_cols})",
+            quote_identifier(&self.stats_btree),
         );
         for sql in [inverted_index_create, stats_index_create] {
             let mut stmt = connection.prepare(&sql)?;
@@ -451,10 +454,16 @@ impl IndexMethodCursor for VectorSparseInvertedIndexMethodCursor {
         let db_prefix = connection
             .get_database_name_by_index(database_id)
             .filter(|name| name != "main")
-            .map(|name| format!("{name}."))
+            .map(|name| format!("{}.", quote_identifier(&name)))
             .unwrap_or_default();
-        let inverted_index_drop = format!("DROP INDEX {}{}", db_prefix, self.inverted_index_btree);
-        let stats_index_drop = format!("DROP INDEX {}{}", db_prefix, self.stats_btree);
+        let inverted_index_drop = format!(
+            "DROP INDEX {db_prefix}{}",
+            quote_identifier(&self.inverted_index_btree)
+        );
+        let stats_index_drop = format!(
+            "DROP INDEX {db_prefix}{}",
+            quote_identifier(&self.stats_btree)
+        );
         for sql in [inverted_index_drop, stats_index_drop] {
             let mut stmt = connection.prepare(&sql)?;
             connection.start_nested();

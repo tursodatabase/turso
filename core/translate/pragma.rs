@@ -98,13 +98,7 @@ fn resolve_table_pragma_database_id(
     {
         return Ok(crate::TEMP_DB_ID);
     }
-
-    let qualified_name = ast::QualifiedName {
-        db_name: None,
-        name: ast::Name::exact(table_name.to_string()),
-        alias: None,
-    };
-    resolver.resolve_existing_table_database_id(&qualified_name)
+    resolver.resolve_existing_table_database_id(table_name)
 }
 
 fn resolve_index_pragma_database_id(

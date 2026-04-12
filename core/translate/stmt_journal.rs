@@ -23,7 +23,7 @@
 
 use crate::translate::emitter::Resolver;
 use crate::translate::plan::{DeletePlan, DmlSafetyReason, UpdatePlan};
-use crate::translate::trigger_exec::has_triggers_with_temp;
+use crate::translate::trigger_exec::has_triggers_including_temp;
 use crate::vdbe::builder::ProgramBuilder;
 use crate::{sync::Arc, Connection, HashSet, Result};
 use turso_parser::ast::{ResolveType, TriggerEvent};
@@ -196,7 +196,7 @@ pub(crate) fn set_update_stmt_journal_flags(
     let database_id = target_table.database_id;
 
     let updated_cols: HashSet<usize> = plan.set_clauses.iter().map(|(i, _)| *i).collect();
-    let has_triggers = has_triggers_with_temp(
+    let has_triggers = has_triggers_including_temp(
         resolver,
         database_id,
         TriggerEvent::Update,

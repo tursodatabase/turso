@@ -17,7 +17,7 @@ use crate::Page;
 use crate::{
     ast, function,
     io::{MemoryIO, IO},
-    is_attached_db, parse_schema_rows,
+    parse_schema_rows,
     progress::{ProgressHandler, ProgressHandlerCallback},
     refresh_analyze_stats, translate,
     util::IOExt,
@@ -73,7 +73,7 @@ pub(crate) struct TempDbContext {
     /// Per-connection temp database (`TEMP_DB_ID`/schema `temp`).
     /// Lazily initialized on first temp DDL.
     pub(crate) database: RwLock<Option<TempDatabase>>,
-    /// Last committed snapshot of `database.lock().as_ref().unwrap().db.schema`.
+    /// Last committed snapshot of `database.read().as_ref().unwrap().db.schema`.
     /// Updated on successful commit and consulted on full-txn rollback
     /// to restore the in-memory temp schema (there is no shared
     /// `Database::schema` for temp the way main has). `None` until the
@@ -354,11 +354,12 @@ impl Connection {
             let temp_path_str = temp_path.to_str().ok_or_else(|| {
                 LimboError::InternalError("temp db path is not valid UTF-8".into())
             })?;
-            let io = if self.db.path.starts_with(crate::util::MEMORY_PATH) {
-                Database::io_for_path(temp_path_str)?
-            } else {
-                self.db.io.clone()
-            };
+            // Always create a fresh IO for the temp file. Cloning the
+            // main db's IO is wrong when the main db uses a mock /
+            // simulated backend (e.g. the deterministic simulator
+            // with `--io-backend=memory`) that can't access real
+            // filesystem paths produced by `tempfile::tempdir()`.
+            let io = Database::io_for_path(temp_path_str)?;
             let db = Database::open_file_with_flags(
                 io,
                 temp_path_str,
@@ -1968,13 +1969,20 @@ impl Connection {
 
     /// Get the Database object for a given database id.
     pub(crate) fn get_source_database(&self, database_id: usize) -> Arc<Database> {
-        if !is_attached_db(database_id) {
-            self.db.clone()
-        } else {
-            self.attached_databases
+        match database_id {
+            MAIN_DB_ID => self.db.clone(),
+            TEMP_DB_ID => self
+                .temp
+                .database
+                .read()
+                .as_ref()
+                .map(|temp_db| temp_db.db.clone())
+                .unwrap_or_else(|| self.db.clone()),
+            _ => self
+                .attached_databases
                 .read()
                 .get_database_by_index(database_id)
-                .expect("database index should be valid")
+                .expect("database index should be valid"),
         }
     }
 
@@ -2872,7 +2880,7 @@ impl Connection {
 
     pub(crate) fn with_named_savepoints<F, T>(&self, f: F) -> T
     where
-        F: FnOnce(&Vec<NamedSavepointFrame>) -> T,
+        F: FnOnce(&[NamedSavepointFrame]) -> T,
     {
         let savepoints = self.named_savepoints.read();
         f(&savepoints)
