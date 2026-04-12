@@ -263,6 +263,7 @@ fn emit_loop_source<'a>(
                     delimiter: 0,
                     func: min_max.func.clone(),
                     comparator,
+                    flag_reg: None,
                 });
                 program.emit_insn(Insn::Goto {
                     target_pc: loop_end,
@@ -286,6 +287,7 @@ fn emit_loop_source<'a>(
                     AggArgumentSource::new_from_expression(&agg.func, &agg.args, &agg.distinctness),
                     reg,
                     &t_ctx.resolver,
+                    None,
                 )?;
                 if let Distinctness::Distinct { ctx } = &agg.distinctness {
                     let ctx = ctx

@@ -1133,9 +1133,14 @@ pub fn insn_to_row(
                 delimiter: _,
                 col,
                 comparator: _,
+                flag_reg,
             } => (
                 "AggStep",
-                0,
+                if let Some(fr) = flag_reg {
+                    *fr as i64
+                } else {
+                    0
+                },
                 *col as i64,
                 *acc_reg as i64,
                 Value::build_text(func.as_str()),

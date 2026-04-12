@@ -19,6 +19,7 @@ use crate::translate::{
 };
 use crate::{
     emit_explain,
+    function::AggFunc,
     schema::PseudoCursorType,
     translate::collate::{get_collseq_from_expr, CollationSeq},
     util::exprs_are_equivalent,
@@ -552,7 +553,7 @@ pub fn emit_group_by_sort_loop_end(
 /// "SELECT indexed_col, count(1) FROM t GROUP BY indexed_col"
 /// the rows are processed directly in the order they arrive from
 /// the main query loop.
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 pub enum GroupByRowSource {
     Sorter {
         /// Cursor opened for the pseudo table that GROUP BY reads rows from.
@@ -581,11 +582,11 @@ pub enum GroupByRowSource {
 }
 
 /// Emits bytecode for processing a single GROUP BY group.
-pub fn group_by_process_single_group(
+pub fn group_by_process_single_group<'a>(
     program: &mut ProgramBuilder,
     group_by: &GroupBy,
-    plan: &SelectPlan,
-    t_ctx: &mut TranslateCtx,
+    plan: &'a SelectPlan,
+    t_ctx: &mut TranslateCtx<'a>,
 ) -> Result<()> {
     let GroupByMetadata {
         registers,
@@ -596,6 +597,7 @@ pub fn group_by_process_single_group(
         .meta_group_by
         .as_ref()
         .expect("group by metadata not found");
+    let row_source = *row_source;
     program.preassign_label_to_next_insn(labels.label_sort_loop_start);
     let groups_start_reg = match &row_source {
         GroupByRowSource::Sorter {
@@ -691,6 +693,21 @@ pub fn group_by_process_single_group(
         return_reg: registers.reg_subrtn_acc_clear_return_offset,
     });
 
+    // Determine if there is exactly one min/max aggregate (per SQLite spec,
+    // bare columns come from the row containing the min/max only when there
+    // is a single min() or max() in the query).
+    let min_max_count = plan
+        .aggregates
+        .iter()
+        .filter(|a| matches!(a.func, AggFunc::Min | AggFunc::Max))
+        .count();
+    let has_single_min_max = min_max_count == 1 && !plan.aggregates.is_empty();
+    let reg_min_max_flag = if has_single_min_max {
+        Some(program.alloc_register())
+    } else {
+        None
+    };
+
     // Process each aggregate function for the current row
     program.preassign_label_to_next_insn(labels.label_grouping_agg_step);
 
@@ -723,12 +740,19 @@ pub fn group_by_process_single_group(
                 let agg_result_reg = agg_start_reg + i;
                 let agg_arg_source =
                     AggArgumentSource::new_from_expression(&agg.func, &agg.args, &agg.distinctness);
+                let flag = if has_single_min_max && matches!(agg.func, AggFunc::Min | AggFunc::Max)
+                {
+                    reg_min_max_flag
+                } else {
+                    None
+                };
                 translate_aggregation_step(
                     program,
                     &plan.table_references,
                     agg_arg_source,
                     agg_result_reg,
                     &t_ctx.resolver,
+                    flag,
                 )?;
                 if let Distinctness::Distinct { ctx } = &agg.distinctness {
                     let ctx = ctx
@@ -751,12 +775,19 @@ pub fn group_by_process_single_group(
                 let start_reg_aggs = start_reg_src + t_ctx.non_aggregate_expressions.len();
                 let agg_arg_source =
                     AggArgumentSource::new_from_registers(start_reg_aggs + offset, agg);
+                let flag = if has_single_min_max && matches!(agg.func, AggFunc::Min | AggFunc::Max)
+                {
+                    reg_min_max_flag
+                } else {
+                    None
+                };
                 translate_aggregation_step(
                     program,
                     &plan.table_references,
                     agg_arg_source,
                     agg_result_reg,
                     &t_ctx.resolver,
+                    flag,
                 )?;
                 if let Distinctness::Distinct { ctx } = &agg.distinctness {
                     let ctx = ctx
@@ -769,19 +800,82 @@ pub fn group_by_process_single_group(
         }
     }
 
-    // We only need to store non-aggregate columns once per group
-    // Skip if we've already stored them for this group
-    program.add_comment(
-        program.offset(),
-        "don't emit group columns if continuing existing group",
-    );
-    program.emit_insn(Insn::If {
-        target_pc: labels.label_acc_indicator_set_flag_true,
-        reg: registers.reg_data_in_acc_flag,
-        jump_if_null: false,
+    // Copy out values needed after the mutable borrow of t_ctx, to avoid
+    // borrow-checker conflicts (registers/labels are borrowed from t_ctx).
+    let reg_data_in_acc_flag = registers.reg_data_in_acc_flag;
+    let label_acc_indicator_set_flag_true = labels.label_acc_indicator_set_flag_true;
+
+    // Bare column copy logic:
+    // - If there is a single min/max aggregate, bare columns must be updated
+    //   whenever the min/max value changes (not just on the first row).
+    // - Otherwise, bare columns are only stored once per group (first row).
+    if let Some(flag_reg) = reg_min_max_flag {
+        // With min/max tracking: skip bare column copy only if this is NOT the
+        // first row AND the min/max did not change.
+        // flag_reg == 1 means "aggregate did NOT update" (set by AggStep).
+        // reg_data_in_acc_flag == 0 means "first row of group".
+        //
+        // Logic: if first row (reg_data_in_acc_flag == 0), always copy.
+        //        if not first row and flag_reg != 0, skip copy.
+        let label_skip_bare_cols = program.allocate_label();
+        // If this is the first row, we must copy bare columns regardless.
+        program.add_comment(
+            program.offset(),
+            "if first row of group, always copy bare columns",
+        );
+        let label_do_copy = program.allocate_label();
+        program.emit_insn(Insn::IfNot {
+            reg: reg_data_in_acc_flag,
+            target_pc: label_do_copy,
+            jump_if_null: true,
+        });
+        // Not the first row: skip if min/max did not change.
+        program.add_comment(
+            program.offset(),
+            "skip bare columns if min/max did not change",
+        );
+        program.emit_insn(Insn::If {
+            reg: flag_reg,
+            target_pc: label_skip_bare_cols,
+            jump_if_null: false,
+        });
+        program.resolve_label(label_do_copy, program.offset());
+        // Copy bare columns
+        emit_bare_column_copy(program, t_ctx, plan, &row_source)?;
+        program.resolve_label(label_skip_bare_cols, program.offset());
+    } else {
+        // No min/max tracking: only store bare columns on first row of group.
+        program.add_comment(
+            program.offset(),
+            "don't emit group columns if continuing existing group",
+        );
+        program.emit_insn(Insn::If {
+            target_pc: label_acc_indicator_set_flag_true,
+            reg: reg_data_in_acc_flag,
+            jump_if_null: false,
+        });
+        emit_bare_column_copy(program, t_ctx, plan, &row_source)?;
+    }
+
+    // Mark that we've stored data for this group
+    program.resolve_label(label_acc_indicator_set_flag_true, program.offset());
+    program.add_comment(program.offset(), "indicate data in accumulator");
+    program.emit_insn(Insn::Integer {
+        value: 1,
+        dest: reg_data_in_acc_flag,
     });
 
-    // Read non-aggregate columns from the current row
+    Ok(())
+}
+
+/// Emits bytecode to copy non-aggregate (bare) column values from the current
+/// row into their accumulator registers.
+fn emit_bare_column_copy<'a>(
+    program: &mut ProgramBuilder,
+    t_ctx: &mut TranslateCtx<'a>,
+    plan: &'a SelectPlan,
+    row_source: &GroupByRowSource,
+) -> Result<()> {
     match row_source {
         GroupByRowSource::Sorter {
             pseudo_cursor,
@@ -789,7 +883,6 @@ pub fn group_by_process_single_group(
             ..
         } => {
             let mut next_reg = *start_reg_dest;
-
             for (sorter_column_index, (expr, expr_appears_in_result_columns)) in
                 t_ctx.non_aggregate_expressions.iter().enumerate()
             {
@@ -806,9 +899,6 @@ pub fn group_by_process_single_group(
             }
         }
         GroupByRowSource::MainLoop { start_reg_dest, .. } => {
-            // Re-translate all the non-aggregate expressions into destination registers. We cannot use the same registers as emitted
-            // in the earlier part of the main loop, because they would be overwritten by the next group before the group results
-            // are processed.
             for (i, expr) in t_ctx
                 .non_aggregate_expressions
                 .iter()
@@ -832,15 +922,6 @@ pub fn group_by_process_single_group(
             }
         }
     }
-
-    // Mark that we've stored data for this group
-    program.resolve_label(labels.label_acc_indicator_set_flag_true, program.offset());
-    program.add_comment(program.offset(), "indicate data in accumulator");
-    program.emit_insn(Insn::Integer {
-        value: 1,
-        dest: registers.reg_data_in_acc_flag,
-    });
-
     Ok(())
 }
 
@@ -850,10 +931,10 @@ pub fn group_by_process_single_group(
 ///    and we now have data in the GROUP BY sorter.
 /// 2. the rows are already sorted in the order that the GROUP BY keys are defined,
 ///    and we can start aggregating inside the main loop.
-pub fn group_by_agg_phase(
+pub fn group_by_agg_phase<'a>(
     program: &mut ProgramBuilder,
-    t_ctx: &mut TranslateCtx,
-    plan: &SelectPlan,
+    t_ctx: &mut TranslateCtx<'a>,
+    plan: &'a SelectPlan,
 ) -> Result<()> {
     let GroupByMetadata {
         labels, row_source, ..

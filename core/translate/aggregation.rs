@@ -345,6 +345,7 @@ pub fn translate_aggregation_step(
     agg_arg_source: AggArgumentSource,
     target_register: usize,
     resolver: &Resolver,
+    flag_reg: Option<usize>,
 ) -> Result<usize> {
     let num_args = agg_arg_source.num_args();
     let func = agg_arg_source.agg_func();
@@ -361,6 +362,7 @@ pub fn translate_aggregation_step(
                 delimiter: 0,
                 func: AggFunc::Avg,
                 comparator: None,
+                flag_reg: None,
             });
             target_register
         }
@@ -374,6 +376,7 @@ pub fn translate_aggregation_step(
                 delimiter: 0,
                 func: AggFunc::Count0,
                 comparator: None,
+                flag_reg: None,
             });
             target_register
         }
@@ -389,6 +392,7 @@ pub fn translate_aggregation_step(
                 delimiter: 0,
                 func: AggFunc::Count,
                 comparator: None,
+                flag_reg: None,
             });
             target_register
         }
@@ -414,6 +418,7 @@ pub fn translate_aggregation_step(
                 delimiter: delimiter_reg,
                 func: AggFunc::GroupConcat,
                 comparator: None,
+                flag_reg: None,
             });
 
             target_register
@@ -434,6 +439,7 @@ pub fn translate_aggregation_step(
                 delimiter: 0,
                 func: AggFunc::Max,
                 comparator,
+                flag_reg,
             });
             target_register
         }
@@ -453,6 +459,7 @@ pub fn translate_aggregation_step(
                 delimiter: 0,
                 func: AggFunc::Min,
                 comparator,
+                flag_reg,
             });
             target_register
         }
@@ -471,6 +478,7 @@ pub fn translate_aggregation_step(
                 delimiter: value_reg,
                 func: AggFunc::JsonGroupObject,
                 comparator: None,
+                flag_reg: None,
             });
             target_register
         }
@@ -487,6 +495,7 @@ pub fn translate_aggregation_step(
                 delimiter: 0,
                 func: AggFunc::JsonGroupArray,
                 comparator: None,
+                flag_reg: None,
             });
             target_register
         }
@@ -505,6 +514,7 @@ pub fn translate_aggregation_step(
                 delimiter: delimiter_reg,
                 func: AggFunc::StringAgg,
                 comparator: None,
+                flag_reg: None,
             });
 
             target_register
@@ -521,6 +531,7 @@ pub fn translate_aggregation_step(
                 delimiter: 0,
                 func: AggFunc::Sum,
                 comparator: None,
+                flag_reg: None,
             });
             target_register
         }
@@ -536,6 +547,7 @@ pub fn translate_aggregation_step(
                 delimiter: 0,
                 func: AggFunc::Total,
                 comparator: None,
+                flag_reg: None,
             });
             target_register
         }
@@ -552,6 +564,7 @@ pub fn translate_aggregation_step(
                 delimiter: 0,
                 func: AggFunc::ArrayAgg,
                 comparator: None,
+                flag_reg: None,
             });
             target_register
         }
@@ -582,6 +595,7 @@ pub fn translate_aggregation_step(
                 delimiter: 0,
                 func: AggFunc::External(func.clone()),
                 comparator: None,
+                flag_reg: None,
             });
             target_register
         }

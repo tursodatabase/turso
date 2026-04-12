@@ -912,6 +912,11 @@ pub enum Insn {
         func: AggFunc,
         /// Optional custom type comparator for MIN/MAX aggregates.
         comparator: Option<SortComparatorType>,
+        /// Optional flag register for MIN/MAX bare-column tracking.
+        /// When present, set to 1 if the aggregate value did NOT change
+        /// (i.e. the new value was not a new min/max), so the caller can
+        /// skip updating bare columns.
+        flag_reg: Option<usize>,
     },
 
     AggFinal {
