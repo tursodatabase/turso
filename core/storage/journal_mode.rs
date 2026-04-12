@@ -93,7 +93,5 @@ pub fn open_mv_store(
             ))
         };
 
-    let mv_store = MvStore::new(mvcc::MvccClock::new(), storage);
-    let mv_store = Arc::new(mv_store);
-    Ok(mv_store)
+    Ok(Arc::new(MvStore::new(mvcc::MvccClock::new(), storage)))
 }

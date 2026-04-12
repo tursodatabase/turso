@@ -81,6 +81,10 @@ impl IO for MemoryIO {
     fn file_id(&self, path: &str) -> Result<super::FileId> {
         Ok(super::FileId::from_path_hash(path))
     }
+
+    fn supports_shared_wal_coordination(&self) -> bool {
+        false
+    }
 }
 
 pub struct MemoryFile {

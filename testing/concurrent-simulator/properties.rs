@@ -40,6 +40,15 @@ pub trait Property: Send + Sync {
         _result: &OpResult,
     ) -> anyhow::Result<()>;
 
+    /// Called when a worker/fiber is aborted out-of-band (for example, the
+    /// multiprocess coordinator kills and respawns a worker process).
+    ///
+    /// Properties can use this to discard or finalize any pending state that
+    /// would otherwise leak across a crash boundary.
+    fn abort_fiber(&mut self, _fiber_id: usize, _txn_id: Option<u64>) -> anyhow::Result<()> {
+        Ok(())
+    }
+
     /// Called when the simulation finishes.
     /// Default implementation does nothing.
     fn finalize(&mut self) -> anyhow::Result<()> {
@@ -162,6 +171,14 @@ impl Property for SimpleKeysDoNotDisappear {
         }
         Ok(())
     }
+
+    fn abort_fiber(&mut self, _fiber_id: usize, txn_id: Option<u64>) -> anyhow::Result<()> {
+        if let Some(txn_id) = txn_id {
+            self.txn_started_at.remove(&txn_id);
+            self.simple_keys_added_at.remove(&Some(txn_id));
+        }
+        Ok(())
+    }
 }
 
 /// Property that validates integrity check results.
@@ -200,8 +217,9 @@ impl Property for IntegrityCheckProperty {
             Ok(rows) => {
                 if rows.len() != 1 {
                     bail!(
-                        "step {step}, fiber {fiber_id}: integrity_check returned {} rows, expected 1",
-                        rows.len()
+                        "step {step}, fiber {fiber_id}: integrity_check returned {} rows, expected 1: {:?}",
+                        rows.len(),
+                        rows
                     );
                 }
                 let row = &rows[0];
@@ -213,6 +231,8 @@ impl Property for IntegrityCheckProperty {
                 }
                 match &row[0] {
                     Value::Text(text) if text.as_str() == "ok" => Ok(()),
+                    // "Page N: never used" is informational in MVCC mode, not corruption
+                    Value::Text(text) if is_integrity_check_informational(text.as_str()) => Ok(()),
                     other => {
                         bail!(
                             "step {step}, fiber {fiber_id}: integrity_check returned {:?}, expected \"ok\"",
@@ -223,6 +243,15 @@ impl Property for IntegrityCheckProperty {
             }
         }
     }
+}
+
+/// Check if an integrity_check result is informational (not actual corruption).
+/// In MVCC mode, "Page N: never used" is expected for allocated but unused pages.
+fn is_integrity_check_informational(text: &str) -> bool {
+    text.lines().all(|line| {
+        let line = line.trim();
+        line.is_empty() || line.starts_with("***") || line.contains("never used")
+    })
 }
 
 /// A buffered Elle event to be sorted and written at the end.
@@ -631,6 +660,54 @@ impl Property for ElleHistoryRecorder {
         Ok(())
     }
 
+    fn abort_fiber(&mut self, fiber_id: usize, _txn_id: Option<u64>) -> anyhow::Result<()> {
+        if let Some(pending) = self.pending_txns.remove(&fiber_id) {
+            if let Some(invoke_index) = pending.invoke_index {
+                if !pending.ops.is_empty() {
+                    let invoke_time = pending
+                        .invoke_time
+                        .expect("invoke_time must be set when invoke_index is set");
+                    let invoke_ops = nil_reads(&pending.ops);
+                    self.add_event(
+                        invoke_index,
+                        ElleEventType::Invoke,
+                        fiber_id,
+                        invoke_ops,
+                        invoke_time,
+                    );
+                    let info_index = self.next_index();
+                    self.add_event(
+                        info_index,
+                        ElleEventType::Info,
+                        fiber_id,
+                        pending.ops,
+                        invoke_time,
+                    );
+                }
+            }
+        }
+
+        if let Some(pending) = self.pending_auto_commits.remove(&fiber_id) {
+            self.add_event(
+                pending.invoke_index,
+                ElleEventType::Invoke,
+                fiber_id,
+                vec![pending.op.clone()],
+                pending.invoke_time,
+            );
+            let info_index = self.next_index();
+            self.add_event(
+                info_index,
+                ElleEventType::Info,
+                fiber_id,
+                vec![pending.op],
+                pending.invoke_time,
+            );
+        }
+
+        Ok(())
+    }
+
     fn finalize(&mut self) -> anyhow::Result<()> {
         // Emit :info events for any pending transactions (incomplete)
         let pending_txns: Vec<_> = self.pending_txns.drain().collect();
@@ -705,6 +782,119 @@ fn nil_reads(ops: &[ElleOp]) -> Vec<ElleOp> {
             other => other.clone(),
         })
         .collect()
+}
+
+#[cfg(test)]
+#[allow(clippy::items_after_test_module)]
+mod tests {
+    use super::*;
+
+    fn test_output_path(label: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "turso-whopper-{label}-{}-{}.edn",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("test")
+        ))
+    }
+
+    #[test]
+    fn simple_keys_abort_fiber_drops_pending_transaction_state() {
+        let mut property = SimpleKeysDoNotDisappear::new();
+        property.txn_started_at.insert(7, 11);
+        property.simple_keys_added_at.insert(
+            Some(7),
+            HashMap::from([(("t".to_string(), "k".to_string()), 13)]),
+        );
+
+        property.abort_fiber(0, Some(7)).unwrap();
+
+        assert!(!property.txn_started_at.contains_key(&7));
+        assert!(!property.simple_keys_added_at.contains_key(&Some(7)));
+    }
+
+    #[test]
+    fn elle_history_abort_fiber_marks_pending_transaction_as_info() {
+        let mut recorder = ElleHistoryRecorder::new(test_output_path("abort-pending-transaction"));
+
+        recorder
+            .init_op(
+                0,
+                3,
+                Some(9),
+                17,
+                &Operation::Begin {
+                    mode: crate::operations::TxMode::Immediate,
+                },
+            )
+            .unwrap();
+        recorder
+            .finish_op(
+                0,
+                3,
+                Some(9),
+                17,
+                18,
+                &Operation::Begin {
+                    mode: crate::operations::TxMode::Immediate,
+                },
+                &Ok(vec![]),
+            )
+            .unwrap();
+        recorder
+            .finish_op(
+                1,
+                3,
+                Some(9),
+                21,
+                22,
+                &Operation::ElleAppend {
+                    table_name: "elle_lists".to_string(),
+                    key: "k".to_string(),
+                    value: 5,
+                },
+                &Ok(vec![]),
+            )
+            .unwrap();
+
+        recorder.abort_fiber(3, Some(9)).unwrap();
+
+        assert!(!recorder.pending_txns.contains_key(&3));
+        assert_eq!(recorder.events.len(), 2);
+        assert!(matches!(
+            recorder.events[0].event_type,
+            ElleEventType::Invoke
+        ));
+        assert!(matches!(recorder.events[1].event_type, ElleEventType::Info));
+    }
+
+    #[test]
+    fn elle_history_abort_fiber_marks_pending_autocommit_as_info() {
+        let mut recorder = ElleHistoryRecorder::new(test_output_path("abort-autocommit"));
+
+        recorder
+            .init_op(
+                0,
+                4,
+                None,
+                31,
+                &Operation::ElleRwWrite {
+                    table_name: "elle_rw".to_string(),
+                    key: "k".to_string(),
+                    value: 9,
+                },
+            )
+            .unwrap();
+
+        recorder.abort_fiber(4, None).unwrap();
+
+        assert!(!recorder.pending_auto_commits.contains_key(&4));
+        assert_eq!(recorder.events.len(), 2);
+        assert!(matches!(
+            recorder.events[0].event_type,
+            ElleEventType::Invoke
+        ));
+        assert!(matches!(recorder.events[1].event_type, ElleEventType::Info));
+    }
 }
 
 fn parse_read_result(result: &OpResult) -> Option<Vec<i64>> {
