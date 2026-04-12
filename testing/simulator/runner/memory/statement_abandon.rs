@@ -270,3 +270,50 @@ fn sim_reset_releases_subjournal_when_abort_called_without_error() -> Result<()>
     );
     Ok(())
 }
+
+/// Verify that a completed VACUUM INTO does not leak source transaction state.
+/// After a successful vacuum, the source connection must be back in auto-commit
+/// mode and usable for new writes.
+#[test]
+fn sim_vacuum_into_cleans_up_source_transaction() -> Result<()> {
+    let (conn, io) = make_conn(7)?;
+
+    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)")?;
+    for i in 0..20 {
+        conn.execute(format!("INSERT INTO t VALUES ({i}, 'row_{i}')"))?;
+    }
+
+    let dest_dir = tempfile::TempDir::new()?;
+    let dest_path = dest_dir.path().join("vacuumed.db");
+    let dest_path_str = dest_path.to_str().expect("temp dir should be valid UTF-8");
+
+    assert!(
+        conn.get_auto_commit(),
+        "should be in auto-commit before VACUUM INTO"
+    );
+
+    let mut stmt = conn.prepare(format!("VACUUM INTO '{dest_path_str}'"))?;
+    loop {
+        match stmt.step()? {
+            StepResult::IO => io.step()?,
+            StepResult::Done => break,
+            other => panic!("unexpected step result: {other:?}"),
+        }
+    }
+    drop(stmt);
+
+    // Source connection must be back in auto-commit mode after vacuum.
+    assert!(
+        conn.get_auto_commit(),
+        "source connection should be in auto-commit mode after VACUUM INTO completes"
+    );
+
+    // Source connection must be usable for new writes.
+    conn.execute("INSERT INTO t VALUES (999, 'after_vacuum')")?;
+    let count = query_count(&conn, io.as_ref())?;
+    assert_eq!(
+        count, 21,
+        "should have 20 original rows + 1 new row after vacuum"
+    );
+    Ok(())
+}
