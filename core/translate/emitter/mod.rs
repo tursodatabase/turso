@@ -1482,7 +1482,7 @@ pub(crate) fn emit_index_column_value_old_image(
             Ok(())
         })?;
     } else if let Some((table, generated_column)) =
-        generated_column(&program, table_cursor_id, idx_col)
+        generated_column(program, table_cursor_id, idx_col)
     {
         cursor_to_registers(program, &table, table_cursor_id, 0, [idx_col.pos_in_table]);
 
@@ -1503,7 +1503,7 @@ pub(crate) fn emit_index_column_value_old_image(
 }
 
 fn generated_column(
-    program: &&mut ProgramBuilder,
+    program: &mut ProgramBuilder,
     table_cursor_id: usize,
     idx_col: &IndexColumn,
 ) -> Option<(Arc<BTreeTable>, Column)> {

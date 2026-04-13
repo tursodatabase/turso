@@ -45,7 +45,7 @@ use super::{
     affinity::Affinity, BranchOffset, CursorID, Insn, InsnReference, JumpTarget, PrepareContext,
     PreparedProgram, Program,
 };
-use crate::translate::plan::{BitSet, ColumnUsedMask};
+use crate::translate::plan::BitSet;
 use std::num::NonZeroUsize;
 
 /// A key that uniquely identifies a cursor.
