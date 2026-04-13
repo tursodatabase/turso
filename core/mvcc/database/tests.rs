@@ -8685,3 +8685,174 @@ fn test_recovery_three_restarts_with_table_creation() {
         }
     }
 }
+
+fn create_wide_table_like_schema(conn: &Arc<Connection>) {
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS core(
+            id INTEGER PRIMARY KEY,
+            row_number INTEGER NOT NULL,
+            sheet_id INTEGER NOT NULL,
+            created_by TEXT,
+            updated_by TEXT,
+            created_at TEXT DEFAULT (datetime('now')),
+            updated_at TEXT DEFAULT (datetime('now')),
+            col_1 TEXT,
+            col_2 TEXT,
+            col_3 TEXT,
+            col_4 TEXT,
+            col_5 TEXT,
+            col_6 TEXT,
+            col_7 TEXT,
+            col_8 TEXT
+        )",
+    )
+    .unwrap();
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_core_sheet_row ON core(sheet_id, row_number)")
+        .unwrap();
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_core_created ON core(created_at)")
+        .unwrap();
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_core_updated ON core(updated_at, sheet_id)")
+        .unwrap();
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_core_created_by ON core(created_by, sheet_id)")
+        .unwrap();
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS metadata(
+            sheet_id INTEGER PRIMARY KEY,
+            next_row_number INTEGER NOT NULL DEFAULT 1,
+            row_count INTEGER NOT NULL DEFAULT 0,
+            updated_at TEXT DEFAULT (datetime('now'))
+        )",
+    )
+    .unwrap();
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS audit_log(
+            id INTEGER PRIMARY KEY,
+            sheet_id INTEGER NOT NULL,
+            action TEXT NOT NULL,
+            row_id INTEGER,
+            row_number INTEGER,
+            created_at TEXT DEFAULT (datetime('now')),
+            details TEXT
+        )",
+    )
+    .unwrap();
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS trigger_gate(
+            id INTEGER PRIMARY KEY,
+            sheet_id INTEGER NOT NULL,
+            trigger_type TEXT NOT NULL,
+            payload TEXT,
+            created_at TEXT DEFAULT (datetime('now'))
+        )",
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT OR IGNORE INTO metadata(sheet_id, next_row_number, row_count, updated_at)
+         VALUES (1, 1, 0, datetime('now'))",
+    )
+    .unwrap();
+}
+
+fn drop_wide_table_like_schema(conn: &Arc<Connection>) {
+    conn.execute("DROP TABLE IF EXISTS trigger_gate").unwrap();
+    conn.execute("DROP TABLE IF EXISTS audit_log").unwrap();
+    conn.execute("DROP TABLE IF EXISTS metadata").unwrap();
+    conn.execute("DROP INDEX IF EXISTS idx_core_sheet_row")
+        .unwrap();
+    conn.execute("DROP INDEX IF EXISTS idx_core_created")
+        .unwrap();
+    conn.execute("DROP INDEX IF EXISTS idx_core_updated")
+        .unwrap();
+    conn.execute("DROP INDEX IF EXISTS idx_core_created_by")
+        .unwrap();
+    conn.execute("DROP TABLE IF EXISTS core").unwrap();
+}
+
+fn insert_wide_table_like_batch(conn: &Arc<Connection>, start_row_number: i64, rows: usize) {
+    conn.execute("BEGIN").unwrap();
+
+    for offset in 0..rows {
+        let row_number = start_row_number + offset as i64;
+        conn.execute(format!(
+            "INSERT INTO core(
+                row_number, sheet_id, created_by, updated_by,
+                created_at, updated_at,
+                col_1, col_2, col_3, col_4, col_5, col_6, col_7, col_8
+             ) VALUES (
+                {row_number}, 1, 'seed', 'seed',
+                datetime('now'), datetime('now'),
+                hex(randomblob(8)), hex(randomblob(8)), hex(randomblob(8)), hex(randomblob(8)),
+                hex(randomblob(8)), hex(randomblob(8)), hex(randomblob(8)), hex(randomblob(8))
+             )",
+        ))
+        .unwrap();
+
+        conn.execute(format!(
+            "INSERT INTO audit_log(sheet_id, action, row_number, details, created_at)
+             VALUES (1, 'INSERT', {row_number}, 'wide table repro', datetime('now'))",
+        ))
+        .unwrap();
+    }
+
+    conn.execute(format!(
+        "UPDATE metadata
+         SET next_row_number = next_row_number + {rows},
+             row_count = row_count + {rows},
+             updated_at = datetime('now')
+         WHERE sheet_id = 1",
+    ))
+    .unwrap();
+    conn.execute(
+        "INSERT INTO trigger_gate(sheet_id, trigger_type, payload, created_at)
+         VALUES (1, 'ROW_INSERT', '{\"count\": 1}', datetime('now'))",
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO trigger_gate(sheet_id, trigger_type, payload, created_at)
+         VALUES (1, 'RECALC', '{\"sheet_id\": 1}', datetime('now'))",
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO trigger_gate(sheet_id, trigger_type, payload, created_at)
+         VALUES (1, 'WEBHOOK', '{\"event\": \"rows_added\"}', datetime('now'))",
+    )
+    .unwrap();
+
+    conn.execute("COMMIT").unwrap();
+}
+
+/// Reproducer for an MVCC crash-restart bug in checkpointing.
+///
+/// Sequence:
+/// 1. Create a wide-table style schema and write one row.
+/// 2. Simulate an abrupt process death (no clean connection close).
+/// 3. Restart, drop the old schema, recreate it, write one new row.
+/// 4. Checkpoint.
+///
+/// Current behavior: checkpoint panics because stale pre-crash table rows remain
+/// in MVCC state even though the old table-id to root-page mapping has been removed.
+#[test]
+#[ignore = "reproducer for crash-restart checkpoint panic"]
+#[should_panic(expected = "Table ID does not have a root page")]
+fn repro_crash_restart_drop_recreate_then_checkpoint_panics() {
+    let mut db = MvccTestDbNoConn::new_with_random_db();
+
+    {
+        let conn = db.connect();
+        conn.execute("PRAGMA mvcc_checkpoint_threshold = 1000000")
+            .unwrap();
+        create_wide_table_like_schema(&conn);
+        insert_wide_table_like_batch(&conn, 1, 1);
+    }
+
+    force_close_for_artifact_tamper(&mut db);
+    db.restart();
+
+    let conn = db.connect();
+    conn.execute("PRAGMA mvcc_checkpoint_threshold = 1000000")
+        .unwrap();
+    drop_wide_table_like_schema(&conn);
+    create_wide_table_like_schema(&conn);
+    insert_wide_table_like_batch(&conn, 1, 1);
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+}
