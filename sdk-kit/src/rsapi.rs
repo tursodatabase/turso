@@ -828,10 +828,14 @@ impl TursoConnection {
         }
     }
     pub fn get_auto_commit(&self) -> bool {
-        self.connection().map(|c| c.get_auto_commit()).unwrap_or(true)
+        self.connection()
+            .map(|c| c.get_auto_commit())
+            .unwrap_or(true)
     }
     pub fn last_insert_rowid(&self) -> i64 {
-        self.connection().map(|c| c.last_insert_rowid()).unwrap_or(0)
+        self.connection()
+            .map(|c| c.last_insert_rowid())
+            .unwrap_or(0)
     }
 
     /// prepares single SQL statement
@@ -856,10 +860,8 @@ impl TursoConnection {
         // Check if we have a cached version
         if let Some(cached) = self.cached_statements.lock().unwrap().get(sql_str) {
             if cached.program.is_compatible_with(&connection) {
-                let program = turso_core::Program::from_prepared(
-                    cached.program.clone(),
-                    connection.clone(),
-                );
+                let program =
+                    turso_core::Program::from_prepared(cached.program.clone(), connection.clone());
                 let statement =
                     Statement::new(program, connection.get_pager(), cached.query_mode, 0);
                 let handle: StatementHandle = Arc::new(Mutex::new(Some(statement)));
