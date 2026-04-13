@@ -31,6 +31,7 @@ pub mod insn;
 pub mod metrics;
 pub mod rowset;
 pub mod sorter;
+pub mod vacuum;
 pub mod value;
 // for benchmarks
 pub use crate::translate::collate::CollationSeq;
