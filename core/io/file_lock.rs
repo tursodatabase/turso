@@ -1,8 +1,8 @@
-/// Cross-platform file locking.
-///
-/// - Unix: fcntl(F_SETLK) via rustix
-/// - Windows: LockFileEx / UnlockFileEx via windows-sys
-/// - Other (WASM, miri): no-op with warning
+//! Cross-platform file locking.
+//!
+//! - Unix: fcntl(F_SETLK) via rustix
+//! - Windows: LockFileEx / UnlockFileEx via windows-sys
+//! - Other (WASM, miri): no-op with warning
 
 #[cfg(target_family = "unix")]
 mod imp {
@@ -43,8 +43,13 @@ mod imp {
     /// sqlite3 reports "database is locked" rather than "disk I/O error",
     /// because Windows byte-range locks are mandatory and a whole-file lock
     /// would block sqlite3 from reading data bytes.
+    ///
+    /// See SQLite definitions in `src/os.h`:
+    /// <https://github.com/sqlite/sqlite/blob/20079bb358d8c79077106af3f03f4961a3117ab8/src/os.h#L159-L166>
+    /// and the Windows lock implementation `winLock` in `src/os_win.c`:
+    /// <https://github.com/sqlite/sqlite/blob/20079bb358d8c79077106af3f03f4961a3117ab8/src/os_win.c#L3321-L3473>
     const PENDING_BYTE: u32 = 0x40000000;
-    /// Size of the SQLite lock page (PENDING + RESERVED + SHARED_SIZE).
+    /// Size of the SQLite lock page: PENDING_BYTE (1) + RESERVED_BYTE (1) + SHARED_SIZE (510) = 512.
     const LOCK_PAGE_SIZE: u32 = 512;
 
     fn lock_page_overlapped() -> OVERLAPPED {
@@ -68,8 +73,7 @@ mod imp {
                 0
             };
         let mut overlapped = lock_page_overlapped();
-        let result =
-            unsafe { LockFileEx(handle, flags, 0, LOCK_PAGE_SIZE, 0, &mut overlapped) };
+        let result = unsafe { LockFileEx(handle, flags, 0, LOCK_PAGE_SIZE, 0, &mut overlapped) };
         if result == 0 {
             Err(std::io::Error::last_os_error())
         } else {
@@ -80,8 +84,7 @@ mod imp {
     pub fn unlock(file: &std::fs::File) -> std::io::Result<()> {
         let handle = file.as_raw_handle();
         let mut overlapped = lock_page_overlapped();
-        let result =
-            unsafe { UnlockFileEx(handle, 0, LOCK_PAGE_SIZE, 0, &mut overlapped) };
+        let result = unsafe { UnlockFileEx(handle, 0, LOCK_PAGE_SIZE, 0, &mut overlapped) };
         if result == 0 {
             Err(std::io::Error::last_os_error())
         } else {
