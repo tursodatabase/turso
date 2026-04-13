@@ -1278,31 +1278,38 @@ impl<Clock: LogicalClock> CommitStateMachine<Clock> {
             log_record.header = Some(*tx.header.read());
         }
 
-        for id in &self.write_set {
+        // Process schema rows (sqlite_schema) before data rows so that during log
+        // replay the table_id_to_rootpage map is populated before data row inserts
+        // reference it. The SkipSet iteration order sorts by table_id (most negative
+        // first), which would otherwise place data table rows (e.g. table_id=-3)
+        // before schema rows (table_id=-1).
+        let collect_versions = |id: &RowID,
+                                log_record: &mut LogRecord,
+                                did_commit_schema: &mut bool| {
             if let Some(row_versions) = mvcc_store.rows.get(id) {
                 let row_versions = row_versions.value().read();
                 for row_version in row_versions.iter() {
                     let mut committed_version = row_version.clone();
                     let mut changed = false;
-                    if let Some(TxTimestampOrID::TxID(id)) = committed_version.begin {
-                        if id == self.tx_id {
+                    if let Some(TxTimestampOrID::TxID(vid)) = committed_version.begin {
+                        if vid == self.tx_id {
                             // New version is valid STARTING FROM the committing
                             // transaction's end timestamp. See Hekaton page 299.
                             committed_version.begin = Some(TxTimestampOrID::Timestamp(end_ts));
                             changed = true;
                             if committed_version.row.id.table_id == SQLITE_SCHEMA_MVCC_TABLE_ID {
-                                self.did_commit_schema_change = true;
+                                *did_commit_schema = true;
                             }
                         }
                     }
-                    if let Some(TxTimestampOrID::TxID(id)) = committed_version.end {
-                        if id == self.tx_id {
+                    if let Some(TxTimestampOrID::TxID(vid)) = committed_version.end {
+                        if vid == self.tx_id {
                             // Old version is valid UNTIL the committing
                             // transaction's end timestamp. See Hekaton page 299.
                             committed_version.end = Some(TxTimestampOrID::Timestamp(end_ts));
                             changed = true;
                             if committed_version.row.id.table_id == SQLITE_SCHEMA_MVCC_TABLE_ID {
-                                self.did_commit_schema_change = true;
+                                *did_commit_schema = true;
                             }
                         }
                     }
@@ -1323,16 +1330,16 @@ impl<Clock: LogicalClock> CommitStateMachine<Clock> {
                     for row_version in row_versions.iter() {
                         let mut committed_version = row_version.clone();
                         let mut changed = false;
-                        if let Some(TxTimestampOrID::TxID(id)) = committed_version.begin {
-                            if id == self.tx_id {
+                        if let Some(TxTimestampOrID::TxID(vid)) = committed_version.begin {
+                            if vid == self.tx_id {
                                 // New version is valid STARTING FROM the committing
                                 // transaction's end timestamp. See Hekaton page 299.
                                 committed_version.begin = Some(TxTimestampOrID::Timestamp(end_ts));
                                 changed = true;
                             }
                         }
-                        if let Some(TxTimestampOrID::TxID(id)) = committed_version.end {
-                            if id == self.tx_id {
+                        if let Some(TxTimestampOrID::TxID(vid)) = committed_version.end {
+                            if vid == self.tx_id {
                                 // Old version is valid UNTIL the committing
                                 // transaction's end timestamp. See Hekaton page 299.
                                 committed_version.end = Some(TxTimestampOrID::Timestamp(end_ts));
@@ -1347,6 +1354,19 @@ impl<Clock: LogicalClock> CommitStateMachine<Clock> {
                         }
                     }
                 }
+            }
+        };
+
+        // First pass: schema rows only
+        for id in &self.write_set {
+            if id.table_id == SQLITE_SCHEMA_MVCC_TABLE_ID {
+                collect_versions(id, &mut log_record, &mut self.did_commit_schema_change);
+            }
+        }
+        // Second pass: all non-schema rows
+        for id in &self.write_set {
+            if id.table_id != SQLITE_SCHEMA_MVCC_TABLE_ID {
+                collect_versions(id, &mut log_record, &mut self.did_commit_schema_change);
             }
         }
 
@@ -4670,12 +4690,14 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                         let rowid_int = rowid.row_id.to_int_or_panic();
                         schema_rows.insert(rowid_int, record);
                         needs_schema_rebuild.set(true);
-                    } else {
-                        turso_assert!(self.table_id_to_rootpage.get(&rowid.table_id).is_some(),
-                        "Logical log contains a row version insert with a table id that does not exist in the table_id_to_rootpage map",
-                        {"table_id": rowid.table_id,
-                            "table_id_to_rootpage_map": format!("{:?}", self.table_id_to_rootpage.iter().collect::<Vec<_>>())
-                        });
+                    } else if self.table_id_to_rootpage.get(&rowid.table_id).is_none() {
+                        // Data row references a table_id not yet in the map. This can happen
+                        // with logs written before the schema-first serialization fix: in a
+                        // same-transaction CREATE TABLE + INSERT + DROP TABLE, data rows were
+                        // serialized before the schema INSERT that registers the table_id.
+                        // The schema INSERT (or DELETE) for this table will follow later in
+                        // this transaction frame, so we register the table_id now.
+                        self.insert_table_id_to_rootpage(rowid.table_id, None);
                     }
 
                     let version_id = self.get_version_id();
@@ -4705,9 +4727,11 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                     if commit_ts <= replay_cutoff_ts {
                         continue;
                     }
-                    turso_assert!(self.table_id_to_rootpage.get(&rowid.table_id).is_some(),
-                        "Logical log contains a row version delete with a table id that does not exist in the table_id_to_rootpage map",
-                        {"rootpage_map": rowid.table_id});
+                    if self.table_id_to_rootpage.get(&rowid.table_id).is_none() {
+                        // See comment in UpsertTableRow: old logs may have data rows
+                        // serialized before the schema INSERT that registers the table_id.
+                        self.insert_table_id_to_rootpage(rowid.table_id, None);
+                    }
                     if let Some(versions) = self.rows.get(&rowid) {
                         // Row exists in memory — try to find the current (non-ended) version
                         // that was committed before this delete, and mark it as ended. If no
