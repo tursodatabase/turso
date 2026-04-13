@@ -1821,12 +1821,12 @@ mod tests {
     #[test]
     fn test_generate_bitmasks() {
         let bitmasks = generate_join_bitmasks(4, 2).collect::<Vec<_>>();
-        assert!(bitmasks.contains(&0b110.into())); // {0,1} -- first bit is always set to 0 so that a Mask with value 0 means "no tables are referenced".
-        assert!(bitmasks.contains(&0b1010.into())); // {0,2}
-        assert!(bitmasks.contains(&0b1100.into())); // {1,2}
-        assert!(bitmasks.contains(&0b10010.into())); // {0,3}
-        assert!(bitmasks.contains(&0b10100.into())); // {1,3}
-        assert!(bitmasks.contains(&0b11000.into())); // {2,3}
+        assert!(bitmasks.contains(&0b0011.into())); // {0,1}
+        assert!(bitmasks.contains(&0b0101.into())); // {0,2}
+        assert!(bitmasks.contains(&0b0110.into())); // {1,2}
+        assert!(bitmasks.contains(&0b1001.into())); // {0,3}
+        assert!(bitmasks.contains(&0b1010.into())); // {1,3}
+        assert!(bitmasks.contains(&0b1100.into())); // {2,3}
     }
 
     #[test]
