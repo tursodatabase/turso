@@ -199,7 +199,7 @@ impl DmlColumnContext {
 
     /// returns the expression and affinity of a virtual column, if the column index points to a
     /// virtual column
-    pub(crate) fn get_virtual_column(&self, col_idx: usize) -> Option<(&Expr, Affinity)> {
+    pub(crate) fn virtual_column_info(&self, col_idx: usize) -> Option<(&Expr, Affinity)> {
         if !self.virtual_mask.get(col_idx) {
             return None;
         }

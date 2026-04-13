@@ -2993,7 +2993,7 @@ pub fn translate_expr(
                         )
                     }
                     Some(SelfTableContext::ForDML(dml_ctx)) => {
-                        if let Some((resolved, affinity)) = dml_ctx.get_virtual_column(*column) {
+                        if let Some((resolved, affinity)) = dml_ctx.virtual_column_info(*column) {
                             translate_expr(program, None, resolved, target_register, resolver)?;
                             if affinity != Affinity::Blob {
                                 program.emit_column_affinity(target_register, affinity);
