@@ -1376,12 +1376,13 @@ fn query_pragma(
             Ok(TransactionMode::None)
         }
         PragmaName::FreelistCount => {
-            let value = pager.freepage_list();
-            let register = program.alloc_register();
-            program.emit_int(value as i64, register);
+            program.emit_insn(Insn::FreelistCount {
+                db: database_id,
+                dest: register,
+            });
             program.emit_result_row(register, 1);
             program.add_pragma_result_column(pragma.to_string());
-            Ok(TransactionMode::None)
+            Ok(TransactionMode::Read)
         }
         PragmaName::EncryptionKey => {
             let msg = {

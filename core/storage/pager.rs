@@ -4488,13 +4488,6 @@ impl Pager {
     ) -> Result<CheckpointResult> {
         self.io.block(|| self.checkpoint(mode, sync_mode, true))
     }
-
-    pub fn freepage_list(&self) -> u32 {
-        self.io
-            .block(|| HeaderRef::from_pager(self))
-            .map(|header_ref| header_ref.borrow().freelist_pages.get())
-            .unwrap_or(0)
-    }
     // Providing a page is optional, if provided it will be used to avoid reading the page from disk.
     // This is implemented in accordance with sqlite freepage2() function.
     #[instrument(skip_all, level = Level::DEBUG)]

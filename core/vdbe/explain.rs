@@ -1812,6 +1812,15 @@ pub fn insn_to_row(
                 0,
                 "".to_string(),
             ),
+            Insn::FreelistCount { db, dest } => (
+                "FreelistCount",
+                *db as i64,
+                *dest as i64,
+                0,
+                Value::build_text(""),
+                0,
+                "".to_string(),
+            ),
             Insn::ReadCookie { db, dest, cookie } => (
                 "ReadCookie",
                 *db as i64,

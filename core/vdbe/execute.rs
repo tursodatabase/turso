@@ -93,8 +93,6 @@ use turso_macros::match_ignore_ascii_case;
 
 use crate::pseudo::PseudoCursor;
 
-use crate::storage::btree::{BTreeCursor, BTreeKey};
-
 use super::{
     array::{
         array_values_from_blob, compare_arrays, compute_array_length, exec_array_append,
@@ -106,6 +104,7 @@ use super::{
     insn::{Cookie, RegisterOrLiteral, SortComparatorType},
     CommitState,
 };
+use crate::storage::btree::{BTreeCursor, BTreeKey};
 use crate::sync::{Mutex, RwLock};
 use turso_parser::ast::{self, ForeignKeyClause, Name, QualifiedName, ResolveType};
 use turso_parser::parser::Parser;
@@ -10607,6 +10606,42 @@ pub fn op_page_count(
     Ok(InsnFunctionStepResult::Step)
 }
 
+// use an opcode for getting freelist count so we can do it in a non-blocking manner.
+pub fn op_freelist_count(
+    program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+    _pager: &Arc<Pager>,
+) -> Result<InsnFunctionStepResult> {
+    load_insn!(FreelistCount { db, dest }, insn);
+    let pager = program.get_pager_from_database_index(db);
+    let mv_store = program.connection.mv_store_for_db(*db);
+    let count = if mv_store.is_none() {
+        if let Some(cached) = pager.get_freelist_pages_cached() {
+            cached.into()
+        } else {
+            match with_header(&pager, None, program, *db, |header| {
+                header.freelist_pages.get()
+            }) {
+                Err(_) => 0.into(),
+                Ok(IOResult::Done(v)) => v.into(),
+                Ok(IOResult::IO(io)) => return Ok(InsnFunctionStepResult::IO(io)),
+            }
+        }
+    } else {
+        match with_header(&pager, mv_store.as_ref(), program, *db, |header| {
+            header.freelist_pages.get()
+        }) {
+            Err(_) => 0.into(),
+            Ok(IOResult::Done(v)) => v.into(),
+            Ok(IOResult::IO(io)) => return Ok(InsnFunctionStepResult::IO(io)),
+        }
+    };
+    state.registers[*dest].set_int(count);
+    state.pc += 1;
+    Ok(InsnFunctionStepResult::Step)
+}
+
 /// State for the async ParseSchema instruction state machine.
 /// Stored in `ProgramState::op_parse_schema_state` so that when the inner
 /// schema query yields IO, we can return control to the outer caller and
@@ -14542,6 +14577,10 @@ mod tests {
     use crate::{Database, DatabaseOpts, MemoryIO, IO};
 
     fn prepare_test_statement() -> Statement {
+        prepare_test_statement_sql("SELECT 1;")
+    }
+
+    fn prepare_test_statement_sql(sql: &str) -> Statement {
         let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
         let db = Database::open_file_with_flags(
             io,
@@ -14552,7 +14591,7 @@ mod tests {
         )
         .unwrap();
         let conn = db.connect().unwrap();
-        conn.prepare("SELECT 1;").unwrap()
+        conn.prepare(sql).unwrap()
     }
 
     fn make_spilled_hash_table() -> (HashTable, Vec<Value>, usize) {
@@ -14631,6 +14670,19 @@ mod tests {
         assert!(
             state.op_hash_probe_state.is_none(),
             "HashProbe should not stash resumable state for the removed fallback path"
+        );
+    }
+
+    #[test]
+    fn test_pragma_freelist_count_compiles_to_runtime_opcode() {
+        let stmt = prepare_test_statement_sql("PRAGMA freelist_count;");
+        assert!(
+            stmt.get_program()
+                .prepared
+                .insns
+                .iter()
+                .any(|(insn, _)| matches!(insn, Insn::FreelistCount { .. })),
+            "PRAGMA freelist_count should compile to a resumable runtime opcode"
         );
     }
 

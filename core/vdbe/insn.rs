@@ -1363,6 +1363,11 @@ pub enum Insn {
         db: usize,
         dest: usize,
     },
+    /// Write the current freelist page count in database P1 to memory cell P2.
+    FreelistCount {
+        db: usize,
+        dest: usize,
+    },
     /// Read cookie number P3 from database P1 and write it into register P2
     ReadCookie {
         db: usize,
@@ -1868,6 +1873,7 @@ impl InsnVariants {
             InsnVariants::Or => execute::op_or,
             InsnVariants::Noop => execute::op_noop,
             InsnVariants::PageCount => execute::op_page_count,
+            InsnVariants::FreelistCount => execute::op_freelist_count,
             InsnVariants::ReadCookie => execute::op_read_cookie,
             InsnVariants::SetCookie => execute::op_set_cookie,
             InsnVariants::OpenEphemeral | InsnVariants::OpenAutoindex => execute::op_open_ephemeral,
