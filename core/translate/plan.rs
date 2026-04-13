@@ -1362,6 +1362,7 @@ pub type ColumnUsedMask = BitSet;
 #[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
 pub struct BitSet {
     inline: u64,
+    /// invariant: `overflow` is `None` iff no bits ≥ 64 are set.
     overflow: Option<Vec<u64>>,
 }
 
@@ -1406,6 +1407,7 @@ impl BitSet {
             if let Some(word) = overflow.get_mut(overflow_idx) {
                 *word &= !(1 << bit);
             }
+            self.trim_overflow();
         }
     }
 
@@ -1414,22 +1416,22 @@ impl BitSet {
             return false;
         }
         match (&self.overflow, &other.overflow) {
-            (None, None) => true,
-            (None, Some(other_ov)) => other_ov.iter().all(|&w| w == 0),
-            (Some(_), None) => true,
-            (Some(self_ov), Some(other_ov)) => other_ov.iter().enumerate().all(|(i, &other_w)| {
-                let self_w = self_ov.get(i).copied().unwrap_or(0);
-                (self_w & other_w) == other_w
-            }),
+            (_, None) => true,
+            (None, Some(_)) => false,
+            (Some(self_ov), Some(other_ov)) => {
+                if other_ov.len() > self_ov.len() {
+                    return false;
+                }
+                self_ov
+                    .iter()
+                    .zip(other_ov.iter())
+                    .all(|(&s, &o)| (s & o) == o)
+            }
         }
     }
 
     pub fn is_empty(&self) -> bool {
-        self.inline == 0
-            && self
-                .overflow
-                .as_ref()
-                .is_none_or(|ov| ov.iter().all(|&w| w == 0))
+        self.inline == 0 && self.overflow.is_none()
     }
 
     pub fn is_only(&self, index: usize) -> bool {
@@ -1465,27 +1467,38 @@ impl BitSet {
     pub fn subtract(&mut self, other: &Self) {
         self.inline &= !other.inline;
         if let (Some(self_ov), Some(other_ov)) = (&mut self.overflow, &other.overflow) {
-            for (i, other_w) in other_ov.iter().enumerate() {
-                if let Some(self_w) = self_ov.get_mut(i) {
-                    *self_w &= !other_w;
-                }
+            for (s, &o) in self_ov.iter_mut().zip(other_ov.iter()) {
+                *s &= !o;
             }
+            self.trim_overflow();
         }
     }
 
     pub fn iter(&self) -> impl Iterator<Item = usize> + '_ {
-        let inline_iter = (0..Self::INLINE_BITS).filter(|&i| (self.inline >> i) & 1 != 0);
+        // this iterator, derived from Kernighan's bitcount algorithm, is O(num_words + popcount)
+        let mut inline = self.inline;
+        let inline_iter = std::iter::from_fn(move || {
+            if inline == 0 {
+                return None;
+            }
+            let bit = inline.trailing_zeros() as usize;
+            inline &= inline - 1; // clear lowest set bit
+            Some(bit)
+        });
         let overflow_iter = self
             .overflow
             .iter()
             .flat_map(|ov| ov.iter().enumerate())
             .flat_map(|(word_idx, &word)| {
-                (0..64).filter_map(move |bit| {
-                    if (word >> bit) & 1 != 0 {
-                        Some(Self::INLINE_BITS + word_idx * 64 + bit)
-                    } else {
-                        None
+                let mut w = word;
+                let base = Self::INLINE_BITS + word_idx * 64;
+                std::iter::from_fn(move || {
+                    if w == 0 {
+                        return None;
                     }
+                    let bit = w.trailing_zeros() as usize;
+                    w &= w - 1; // clear lowest set bit
+                    Some(base + bit)
                 })
             });
         inline_iter.chain(overflow_iter)
@@ -1545,6 +1558,17 @@ impl BitSet {
             _ => false,
         }
     }
+
+    fn trim_overflow(&mut self) {
+        if let Some(overflow) = &mut self.overflow {
+            while overflow.last() == Some(&0) {
+                overflow.pop();
+            }
+            if overflow.is_empty() {
+                self.overflow = None;
+            }
+        }
+    }
 }
 
 impl std::ops::BitOrAssign<&Self> for ColumnUsedMask {
@@ -1555,8 +1579,8 @@ impl std::ops::BitOrAssign<&Self> for ColumnUsedMask {
             if self_ov.len() < rhs_ov.len() {
                 self_ov.resize(rhs_ov.len(), 0);
             }
-            for (i, &rhs_w) in rhs_ov.iter().enumerate() {
-                self_ov[i] |= rhs_w;
+            for (s, &r) in self_ov.iter_mut().zip(rhs_ov.iter()) {
+                *s |= r;
             }
         }
     }
