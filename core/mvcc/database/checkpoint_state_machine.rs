@@ -160,6 +160,84 @@ pub enum SpecialWrite {
     },
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SqliteSchemaBtreeKind {
+    Table,
+    Index,
+}
+
+impl SqliteSchemaBtreeKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Table => "table",
+            Self::Index => "index",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SqliteSchemaBtreeIdentity {
+    kind: SqliteSchemaBtreeKind,
+    root_page: i64,
+}
+
+/// Identity of a sqlite_schema row version that refers to a B-tree-backed object.
+/// Schema rewrites that preserve this identity are metadata-only and should not be
+/// treated as create/drop lifecycle changes.
+fn sqlite_schema_btree_identity(version: &RowVersion) -> Option<SqliteSchemaBtreeIdentity> {
+    if version.row.id.table_id != SQLITE_SCHEMA_MVCC_TABLE_ID {
+        return None;
+    }
+
+    let row_data = ImmutableRecord::from_bin_record(version.row.payload().to_vec());
+    let (col0, col3) = row_data
+        .get_two_values(0, 3)
+        .expect("failed to get columns 0 and 3 (type, rootpage) from sqlite_schema");
+
+    let kind = match col0 {
+        ValueRef::Text(type_str) => match type_str.as_str() {
+            "table" => SqliteSchemaBtreeKind::Table,
+            "index" => SqliteSchemaBtreeKind::Index,
+            _ => return None,
+        },
+        _ => panic!("sqlite_schema.type column must be TEXT, got {col0:?}"),
+    };
+
+    let ValueRef::Numeric(Numeric::Integer(root_page)) = col3 else {
+        panic!("sqlite_schema.rootpage column must be INTEGER, got {col3:?}");
+    };
+
+    if root_page == 0 {
+        return None;
+    }
+
+    Some(SqliteSchemaBtreeIdentity { kind, root_page })
+}
+
+fn sqlite_schema_versions_refer_to_same_object(lhs: &RowVersion, rhs: &RowVersion) -> bool {
+    sqlite_schema_btree_identity(lhs)
+        .zip(sqlite_schema_btree_identity(rhs))
+        .is_some_and(|(lhs_id, rhs_id)| lhs_id == rhs_id)
+}
+
+fn sqlite_schema_transition_crosses_object_boundary(
+    current: &RowVersion,
+    next: Option<&RowVersion>,
+) -> bool {
+    if current.end.is_none() {
+        return false;
+    }
+
+    let Some(_current_identity) = sqlite_schema_btree_identity(current) else {
+        return false;
+    };
+
+    match next {
+        Some(next) => !sqlite_schema_versions_refer_to_same_object(current, next),
+        None => true,
+    }
+}
+
 impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
     pub fn new(
         pager: Arc<Pager>,
@@ -388,19 +466,10 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                 // These don't need to be written to the B-tree, we just need to track them.
                 let mut skip_write = false;
 
-                if version.row.id.table_id == SQLITE_SCHEMA_MVCC_TABLE_ID {
-                    let row_data = ImmutableRecord::from_bin_record(version.row.payload().to_vec());
-
-                    let (col0, col3) = row_data.get_two_values(0, 3).expect(
-                        "failed to get columns 0 and 3 (type, rootpage) from sqlite_schema",
-                    );
-
-                    let ValueRef::Text(type_str) = col0 else {
-                        panic!("sqlite_schema.type column must be TEXT, got {col0:?}");
-                    };
-
-                    if let ValueRef::Numeric(Numeric::Integer(root_page)) = col3 {
-                        if type_str.as_str() == "index" {
+                if let Some(schema_identity) = sqlite_schema_btree_identity(&version) {
+                    let root_page = schema_identity.root_page;
+                    match schema_identity.kind {
+                        SqliteSchemaBtreeKind::Index => {
                             // This is an index schema change
                             if is_delete {
                                 // DROP INDEX
@@ -455,7 +524,8 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                                 // to index SQL). No B-tree creation needed; the row itself is written
                                 // to sqlite_schema below. See: test_checkpoint_allows_index_schema_update_after_rename_column.
                             }
-                        } else if type_str.as_str() == "table" {
+                        }
+                        SqliteSchemaBtreeKind::Table => {
                             // This is a table schema change (existing logic)
                             tracing::trace!("table schema change with root page {root_page}, is_delete={is_delete}");
                             if is_delete {
@@ -1543,5 +1613,113 @@ impl<Clock: LogicalClock> StateTransition for CheckpointStateMachine<Clock> {
 
     fn is_finalized(&self) -> bool {
         matches!(self.state, CheckpointState::Finalize)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sqlite_schema_row_version(
+        rowid: i64,
+        entry_type: &'static str,
+        name: &'static str,
+        table_name: &'static str,
+        root_page: i64,
+        begin: Option<u64>,
+        end: Option<u64>,
+    ) -> RowVersion {
+        let record = ImmutableRecord::from_values(
+            &[
+                Value::build_text(entry_type),
+                Value::build_text(name),
+                Value::build_text(table_name),
+                Value::from_i64(root_page),
+                Value::build_text(format!("sql:{entry_type}:{name}:{root_page}")),
+            ],
+            5,
+        );
+        RowVersion {
+            id: 1,
+            begin: begin.map(TxTimestampOrID::Timestamp),
+            end: end.map(TxTimestampOrID::Timestamp),
+            row: Row::new_table_row(
+                RowID::new(SQLITE_SCHEMA_MVCC_TABLE_ID, RowKey::Int(rowid)),
+                record.as_blob().to_vec(),
+                5,
+            ),
+            btree_resident: false,
+        }
+    }
+
+    #[test]
+    fn sqlite_schema_identity_treats_index_sql_rewrite_as_same_object() {
+        let old = sqlite_schema_row_version(3, "index", "idx_t_a", "t", 7, Some(1), Some(2));
+        let new = sqlite_schema_row_version(3, "index", "idx_t_a", "t", 7, Some(2), None);
+
+        assert_eq!(
+            sqlite_schema_btree_identity(&old),
+            Some(SqliteSchemaBtreeIdentity {
+                kind: SqliteSchemaBtreeKind::Index,
+                root_page: 7,
+            })
+        );
+        assert!(sqlite_schema_versions_refer_to_same_object(&old, &new));
+        assert!(!sqlite_schema_transition_crosses_object_boundary(
+            &old,
+            Some(&new)
+        ));
+    }
+
+    #[test]
+    fn sqlite_schema_identity_treats_table_sql_rewrite_as_same_object() {
+        let old = sqlite_schema_row_version(2, "table", "t", "t", 5, Some(1), Some(2));
+        let new = sqlite_schema_row_version(2, "table", "t", "t", 5, Some(2), None);
+
+        assert!(sqlite_schema_versions_refer_to_same_object(&old, &new));
+        assert!(!sqlite_schema_transition_crosses_object_boundary(
+            &old,
+            Some(&new)
+        ));
+    }
+
+    #[test]
+    fn sqlite_schema_identity_detects_drop_recreate_as_different_objects() {
+        let dropped = sqlite_schema_row_version(3, "index", "idx_t_v", "t", -4, Some(1), Some(2));
+        let recreated = sqlite_schema_row_version(3, "index", "idx_t_v", "t", -5, Some(2), None);
+
+        assert!(!sqlite_schema_versions_refer_to_same_object(
+            &dropped, &recreated
+        ));
+        assert!(sqlite_schema_transition_crosses_object_boundary(
+            &dropped,
+            Some(&recreated)
+        ));
+    }
+
+    #[test]
+    fn sqlite_schema_identity_detects_drop_without_successor() {
+        let dropped = sqlite_schema_row_version(3, "index", "idx_t_v", "t", 11, Some(1), Some(2));
+
+        assert!(sqlite_schema_transition_crosses_object_boundary(
+            &dropped, None
+        ));
+    }
+
+    #[test]
+    fn sqlite_schema_identity_ignores_non_btree_schema_entries() {
+        let trigger = sqlite_schema_row_version(9, "trigger", "trg_t", "t", 0, Some(1), Some(2));
+        let rewritten_trigger =
+            sqlite_schema_row_version(9, "trigger", "trg_t", "t", 0, Some(2), None);
+
+        assert_eq!(sqlite_schema_btree_identity(&trigger), None);
+        assert!(!sqlite_schema_versions_refer_to_same_object(
+            &trigger,
+            &rewritten_trigger
+        ));
+        assert!(!sqlite_schema_transition_crosses_object_boundary(
+            &trigger,
+            Some(&rewritten_trigger)
+        ));
     }
 }
