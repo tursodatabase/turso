@@ -28,6 +28,7 @@ tracing = { workspace = true }
 tracing-appender = { workspace = true }
 tracing-subscriber = { workspace = true, features = ["env-filter"] }
 parking_lot = { workspace = true, features = ["send_guard"] } # otherwise, TursoDatabase is not Send with an error: `*mut ()` cannot be sent between threads safely
+arc-swap = "1.7"
 
 [dev-dependencies]
 tempfile = { workspace = true }

@@ -10,6 +10,7 @@ use std::{
     time::Duration,
 };
 
+use arc_swap::ArcSwapOption;
 use tracing::level_filters::LevelFilter;
 use tracing_subscriber::{
     fmt::{self, format::Writer},
@@ -789,7 +790,10 @@ struct CachedStatement {
 pub struct TursoConnection {
     async_io: bool,
     concurrent_guard: Arc<ConcurrentGuard>,
-    connection: Arc<Connection>,
+    /// Wrapped in `ArcSwapOption` so that `close()` can drop the underlying
+    /// `Arc<Connection>` (and transitively `Arc<Database>` and the file lock)
+    /// without waiting for every `Arc<TursoConnection>` clone to be dropped.
+    connection: Arc<ArcSwapOption<Connection>>,
     cached_statements: Arc<Mutex<HashMap<String, Arc<CachedStatement>>>>,
     /// Weak refs to every statement handle created by this connection, keyed
     /// by a monotonic ID. Statements remove themselves on drop, so this map
@@ -803,27 +807,36 @@ impl TursoConnection {
     pub fn new(config: &TursoDatabaseConfig, connection: Arc<Connection>) -> Arc<Self> {
         Arc::new(Self {
             async_io: config.async_io,
-            connection,
+            connection: Arc::new(ArcSwapOption::from(Some(connection))),
             concurrent_guard: Arc::new(ConcurrentGuard::new()),
             cached_statements: Arc::new(Mutex::new(HashMap::new())),
             stmts: Arc::new(Mutex::new(HashMap::new())),
             next_stmt_id: Arc::new(AtomicUsize::new(0)),
         })
     }
+
+    /// Returns the underlying connection, or an error if `close()` was already called.
+    fn connection(&self) -> Result<Arc<Connection>, TursoError> {
+        self.connection
+            .load_full()
+            .ok_or_else(|| TursoError::Misuse("connection is closed".to_string()))
+    }
     /// Set busy timeout for the connection
     pub fn set_busy_timeout(&self, duration: Duration) {
-        self.connection.set_busy_timeout(duration);
+        if let Ok(conn) = self.connection() {
+            conn.set_busy_timeout(duration);
+        }
     }
     pub fn get_auto_commit(&self) -> bool {
-        self.connection.get_auto_commit()
+        self.connection().map(|c| c.get_auto_commit()).unwrap_or(true)
     }
     pub fn last_insert_rowid(&self) -> i64 {
-        self.connection.last_insert_rowid()
+        self.connection().map(|c| c.last_insert_rowid()).unwrap_or(0)
     }
 
     /// prepares single SQL statement
     pub fn prepare_single(&self, sql: impl AsRef<str>) -> Result<Box<TursoStatement>, TursoError> {
-        let statement = self.connection.prepare(sql)?;
+        let statement = self.connection()?.prepare(sql)?;
         let handle: StatementHandle = Arc::new(Mutex::new(Some(statement)));
         let stmt_id = self.track_stmt(&handle);
         Ok(Box::new(TursoStatement {
@@ -838,16 +851,17 @@ impl TursoConnection {
     /// Prepare a statement from the provided SQL string and cache it for future use.
     pub fn prepare_cached(&self, sql: impl AsRef<str>) -> Result<Box<TursoStatement>, TursoError> {
         let sql_str = sql.as_ref();
+        let connection = self.connection()?;
 
         // Check if we have a cached version
         if let Some(cached) = self.cached_statements.lock().unwrap().get(sql_str) {
-            if cached.program.is_compatible_with(&self.connection) {
+            if cached.program.is_compatible_with(&connection) {
                 let program = turso_core::Program::from_prepared(
                     cached.program.clone(),
-                    self.connection.clone(),
+                    connection.clone(),
                 );
                 let statement =
-                    Statement::new(program, self.connection.get_pager(), cached.query_mode, 0);
+                    Statement::new(program, connection.get_pager(), cached.query_mode, 0);
                 let handle: StatementHandle = Arc::new(Mutex::new(Some(statement)));
                 let stmt_id = self.track_stmt(&handle);
                 return Ok(Box::new(TursoStatement {
@@ -861,7 +875,7 @@ impl TursoConnection {
         }
 
         // Not cached, prepare it fresh
-        let statement = self.connection.prepare(sql_str)?;
+        let statement = connection.prepare(sql_str)?;
 
         // Cache it for future use
         let cached = Arc::new(CachedStatement {
@@ -890,7 +904,7 @@ impl TursoConnection {
         &self,
         sql: impl AsRef<str>,
     ) -> Result<Option<(Box<TursoStatement>, usize)>, TursoError> {
-        match self.connection.consume_stmt(sql)? {
+        match self.connection()?.consume_stmt(sql)? {
             Some((statement, position)) => {
                 let handle: StatementHandle = Arc::new(Mutex::new(Some(statement)));
                 let stmt_id = self.track_stmt(&handle);
@@ -912,6 +926,9 @@ impl TursoConnection {
     /// close the connection preventing any further operations executed over it
     /// SAFETY: caller must guarantee that no ongoing operations are running over connection before calling close(...) method
     pub fn close(&self) -> Result<(), TursoError> {
+        let Some(connection) = self.connection.load_full() else {
+            return Ok(());
+        };
         // Finalize all outstanding statements to release their Arc chain:
         // Statement → Program → Arc<Connection> → Arc<Database>.
         // Without this, un-finalized statements keep the Database alive in
@@ -924,14 +941,22 @@ impl TursoConnection {
                 *handle.lock().unwrap() = None;
             }
         }
-        self.connection.close()?;
+        // Drop cached programs — they hold Arc<PreparedProgram> which can
+        // transitively pin schema/connection state.
+        self.cached_statements.lock().unwrap().clear();
+        connection.close()?;
+        // Drop the underlying Arc<Connection> so the Database (and its file
+        // lock) is released as soon as no other references exist, instead of
+        // waiting for every Arc<TursoConnection> clone to be dropped.
+        self.connection.store(None);
         Ok(())
     }
 
     /// low-level method used only by the Rust SDK
     pub fn cacheflush(&self) -> Result<(), TursoError> {
-        let completions = self.connection.cacheflush()?;
-        let pager = self.connection.get_pager();
+        let connection = self.connection()?;
+        let completions = connection.cacheflush()?;
+        let pager = connection.get_pager();
         for c in completions {
             pager.io.wait_for_completion(c)?;
         }

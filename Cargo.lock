@@ -6472,6 +6472,7 @@ dependencies = [
 name = "turso_sdk_kit"
 version = "0.6.0-pre.16"
 dependencies = [
+ "arc-swap",
  "bindgen",
  "env_logger",
  "parking_lot",
