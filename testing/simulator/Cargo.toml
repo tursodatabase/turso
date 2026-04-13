@@ -44,6 +44,7 @@ chrono = { workspace = true, default-features = true, features = ["serde"] }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true, features = ["env-filter"] }
 anyhow.workspace = true
+tempfile.workspace = true
 hex = { workspace = true }
 itertools = { workspace = true }
 sql_generation = { workspace = true }

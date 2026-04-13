@@ -3123,6 +3123,7 @@ dependencies = [
  "similar-asserts",
  "sql_generation",
  "strum",
+ "tempfile",
  "tracing",
  "tracing-subscriber",
  "turso_core",
