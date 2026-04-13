@@ -186,10 +186,7 @@ impl InternalVirtualTableCursor for DbPageCursor {
                     }
                 }
 
-                let (page_ref, completion) = self.pager.read_page(self.pgno)?;
-                if let Some(c) = completion {
-                    self.pager.io.wait_for_completion(c)?;
-                }
+                let page_ref = self.pager.io.block(|| self.pager.read_page(self.pgno))?;
 
                 let page_contents = page_ref.get_contents();
                 let data_slice = page_contents.as_ptr();
@@ -319,10 +316,7 @@ pub(crate) fn update_dbpage(pager: &Arc<Pager>, args: &[Value]) -> Result<Option
         )));
     }
 
-    let (page_ref, completion) = pager.read_page(target_pgno)?;
-    if let Some(c) = completion {
-        pager.io.wait_for_completion(c)?;
-    }
+    let page_ref = pager.io.block(|| pager.read_page(target_pgno))?;
 
     pager.add_dirty(&page_ref)?;
     let contents = page_ref.get_contents();
