@@ -1,0 +1,61 @@
+@database :memory:
+
+setup schema {
+    CREATE TABLE t(x INTEGER);
+    INSERT INTO t VALUES (1),(2),(3),(4),(5);
+}
+
+# Regression test for #6344: UNION + LIMIT inside WHERE IN subquery
+# was ignoring the LIMIT clause because the ephemeral index used for
+# IN deduplication was reused as the UNION dedup index, skipping the
+# read-back loop that enforces LIMIT.
+
+@setup schema
+test union-limit-in-subquery {
+    SELECT * FROM t WHERE x IN (SELECT 1 UNION SELECT 2 UNION SELECT 3 LIMIT 2);
+}
+expect {
+    1
+    2
+}
+
+# UNION ALL + LIMIT in subquery (was already correct, verify no regression)
+@setup schema
+test union-all-limit-in-subquery {
+    SELECT * FROM t WHERE x IN (SELECT 1 UNION ALL SELECT 2 UNION ALL SELECT 3 LIMIT 2);
+}
+expect {
+    1
+    2
+}
+
+# UNION + ORDER BY + LIMIT in subquery (was already correct, verify no regression)
+@setup schema
+test union-order-by-limit-in-subquery {
+    SELECT * FROM t WHERE x IN (SELECT 1 UNION SELECT 2 UNION SELECT 3 ORDER BY 1 DESC LIMIT 2);
+}
+expect {
+    2
+    3
+}
+
+# UNION without LIMIT in subquery (verify no regression)
+@setup schema
+test union-no-limit-in-subquery {
+    SELECT * FROM t WHERE x IN (SELECT 1 UNION SELECT 2 UNION SELECT 3);
+}
+expect {
+    1
+    2
+    3
+}
+
+# UNION + LIMIT + OFFSET in subquery
+@setup schema
+test union-limit-offset-in-subquery {
+    SELECT * FROM t WHERE x IN (SELECT 1 UNION SELECT 2 UNION SELECT 3 LIMIT 2 OFFSET 1);
+}
+expect {
+    2
+    3
+}

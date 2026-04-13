@@ -311,10 +311,17 @@ fn emit_compound_select(
             }
             CompoundOperator::Union => {
                 let mut new_dedupe_index = false;
+                let has_limit = limit_ctx.is_some();
                 let dedupe_index = match &right_most.query_destination {
+                    // When the destination is already an ephemeral index (e.g. IN
+                    // subquery), we can reuse it for deduplication — but only when
+                    // there is no LIMIT.  With a LIMIT we must collect into a
+                    // separate dedupe index first so that
+                    // `read_deduplicated_union_or_except_rows` can enforce the
+                    // LIMIT while copying rows to the final destination.
                     QueryDestination::EphemeralIndex {
                         cursor_id, index, ..
-                    } if !index.has_rowid => (*cursor_id, index.clone()),
+                    } if !index.has_rowid && !has_limit => (*cursor_id, index.clone()),
                     _ => {
                         new_dedupe_index = true;
                         create_dedupe_index(program, &plan, &right_most)?
