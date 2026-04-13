@@ -1820,6 +1820,10 @@ impl ProgramBuilder {
         ctx: Option<&SelfTableContext>,
         f: impl FnOnce(&mut ProgramBuilder, Option<&SelfTableContext>) -> crate::Result<T>,
     ) -> crate::Result<T> {
+        if ctx.is_none() {
+            return f(self, ctx);
+        }
+
         let prev = self.self_table_context.take();
         self.self_table_context = ctx.cloned();
         let result = f(self, ctx);
