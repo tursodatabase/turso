@@ -13889,7 +13889,7 @@ fn op_vacuum_into_inner(
                 let io: Arc<dyn crate::IO> = Arc::new(crate::io::PlatformIO::new()?);
                 let source_db = program.connection.get_source_database(database_id);
                 program.connection.execute("BEGIN")?;
-                // Set the same meta values from the source db (schema)
+                state.auto_txn_cleanup = TxnCleanup::RollbackTxn;
                 let user_version: i32 = extract_pragma_int(
                     &program
                         .connection
@@ -14467,9 +14467,10 @@ fn op_vacuum_into_inner(
             },
 
             OpVacuumIntoSubState::Done { dest_conn } => {
-                // Commit the transaction that was started in Init state
+                // Commit the transactions started in Init state.
                 dest_conn.execute("COMMIT")?;
                 program.connection.execute("COMMIT")?;
+                state.auto_txn_cleanup = TxnCleanup::None;
 
                 state.pc += 1;
                 return Ok(InsnFunctionStepResult::Step);

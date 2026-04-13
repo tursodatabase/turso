@@ -2009,6 +2009,11 @@ impl Program {
 
         let mut abort_error: Option<LimboError> = None;
 
+        // VACUUM INTO state can own internal helper statements whose drop path
+        // releases nested guards. Drop them before checking whether this program
+        // is itself nested; otherwise abort could skip top-level cleanup.
+        state.op_vacuum_into_state = None;
+
         // Only end trigger execution if the subprogram was actually running.
         // Cached (pooled) statements may be dropped after their trigger execution
         // was already ended by op_program; calling end again would pop the wrong
