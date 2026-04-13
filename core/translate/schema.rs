@@ -860,15 +860,14 @@ pub fn translate_create_table(
     program: &mut ProgramBuilder,
     connection: &Connection,
 ) -> Result<()> {
-    let database_id = resolver.resolve_database_id(&tbl_name)?;
-    if crate::is_attached_db(database_id) {
-        let schema_cookie = resolver.with_schema(database_id, |s| s.schema_version);
-        program.begin_write_on_database(database_id, schema_cookie);
-    }
+    let database_id = if temporary {
+        crate::TEMP_DB_ID
+    } else {
+        resolver.resolve_database_id(&tbl_name)?
+    };
+    let schema_cookie = resolver.with_schema(database_id, |s| s.schema_version);
+    program.begin_write_on_database(database_id, schema_cookie);
     let normalized_tbl_name = normalize_ident(tbl_name.name.as_str());
-    if temporary {
-        bail_parse_error!("TEMPORARY table not supported yet");
-    }
     validate(&body, &normalized_tbl_name, resolver, connection)?;
 
     // Gate array column types behind the experimental custom types flag.
@@ -959,26 +958,52 @@ pub fn translate_create_table(
         }
     }
 
-    if has_autoincrement && connection.mvcc_enabled() {
+    if has_autoincrement && connection.mv_store_for_db(database_id).is_some() {
         bail_parse_error!(
             "AUTOINCREMENT is not supported in MVCC mode (journal_mode=experimental_mvcc)"
         );
     }
 
-    let schema_master_table = resolver.schema().get_btree_table(SQLITE_TABLEID).unwrap();
-    let sqlite_schema_cursor_id =
-        program.alloc_cursor_id(CursorType::BTreeTable(schema_master_table));
-    program.emit_insn(Insn::OpenWrite {
-        cursor_id: sqlite_schema_cursor_id,
-        root_page: 1i64.into(),
-        db: database_id,
-    });
     let cdc_table = prepare_cdc_if_necessary(program, resolver.schema(), SQLITE_TABLEID)?;
+
+    let create_btree_label = program.allocate_label();
+    let database_format_reg = program.alloc_register();
+    program.emit_insn(Insn::ReadCookie {
+        db: database_id,
+        dest: database_format_reg,
+        cookie: Cookie::DatabaseFormat,
+    });
+    program.emit_insn(Insn::If {
+        reg: database_format_reg,
+        target_pc: create_btree_label,
+        jump_if_null: false,
+    });
+    program.emit_insn(Insn::SetCookie {
+        db: database_id,
+        cookie: Cookie::DatabaseFormat,
+        value: 4,
+        p5: 0,
+    });
+    program.emit_insn(Insn::SetCookie {
+        db: database_id,
+        cookie: Cookie::DatabaseTextEncoding,
+        value: 1,
+        p5: 0,
+    });
+    program.resolve_label(create_btree_label, program.offset());
 
     let created_sequence_table = if has_autoincrement
         && resolver.with_schema(database_id, |s| {
             s.get_table(SQLITE_SEQUENCE_TABLE_NAME).is_none()
         }) {
+        let schema_master_table = resolver.schema().get_btree_table(SQLITE_TABLEID).unwrap();
+        let sqlite_schema_cursor_id =
+            program.alloc_cursor_id(CursorType::BTreeTable(schema_master_table));
+        program.emit_insn(Insn::OpenWrite {
+            cursor_id: sqlite_schema_cursor_id,
+            root_page: 1i64.into(),
+            db: database_id,
+        });
         let seq_table_root_reg = program.alloc_register();
         program.emit_insn(Insn::CreateBtree {
             db: database_id,
@@ -1006,10 +1031,6 @@ pub fn translate_create_table(
     let sql = create_table_body_to_str(&tbl_name, &body)?;
 
     let parse_schema_label = program.allocate_label();
-    // TODO: ReadCookie
-    // TODO: If
-    // TODO: SetCookie
-    // TODO: SetCookie
 
     let table_root_reg = program.alloc_register();
     program.emit_insn(Insn::CreateBtree {
@@ -1443,6 +1464,7 @@ pub fn translate_create_virtual_table(
 /// Validates whether a DROP TABLE operation is allowed on the given table name.
 fn validate_drop_table(
     resolver: &Resolver,
+    database_id: usize,
     tbl_name: &str,
     connection: &Arc<Connection>,
 ) -> Result<()> {
@@ -1454,7 +1476,7 @@ fn validate_drop_table(
         bail_parse_error!("Cannot drop system table {}", tbl_name);
     }
     // Check if this is a materialized view - if so, refuse to drop it with DROP TABLE
-    if resolver.schema().is_materialized_view(tbl_name) {
+    if resolver.with_schema(database_id, |schema| schema.is_materialized_view(tbl_name)) {
         bail_parse_error!(
             "Cannot DROP TABLE on materialized view {tbl_name}. Use DROP VIEW instead.",
         );
@@ -1469,7 +1491,7 @@ pub fn translate_drop_table(
     program: &mut ProgramBuilder,
     connection: &Arc<Connection>,
 ) -> Result<()> {
-    let database_id = resolver.resolve_database_id(&tbl_name)?;
+    let database_id = resolver.resolve_existing_table_database_id_qualified(&tbl_name)?;
     let name = tbl_name.name.as_str();
     let opts = ProgramBuilderOpts {
         num_cursors: 4,
@@ -1478,10 +1500,8 @@ pub fn translate_drop_table(
     };
     program.extend(&opts);
 
-    if crate::is_attached_db(database_id) {
-        let schema_cookie = resolver.with_schema(database_id, |s| s.schema_version);
-        program.begin_write_on_database(database_id, schema_cookie);
-    }
+    let schema_cookie = resolver.with_schema(database_id, |s| s.schema_version);
+    program.begin_write_on_database(database_id, schema_cookie);
 
     let Some(table) = resolver.with_schema(database_id, |s| s.get_table(name)) else {
         if if_exists {
@@ -1489,7 +1509,7 @@ pub fn translate_drop_table(
         }
         bail_parse_error!("No such table: {name}");
     };
-    validate_drop_table(resolver, name, connection)?;
+    validate_drop_table(resolver, database_id, name, connection)?;
     // Check if foreign keys are enabled and if this table is referenced by foreign keys
     // Fire FK actions (CASCADE, SET NULL, SET DEFAULT) or check for violations (RESTRICT, NO ACTION)
     if connection.foreign_keys_enabled()
@@ -1601,6 +1621,114 @@ pub fn translate_drop_table(
     // end of loop on schema table
     if let Some((cdc_cursor_id, _)) = cdc_table {
         emit_cdc_autocommit_commit(program, resolver, cdc_cursor_id)?;
+    }
+
+    // SQLite removes temp triggers targeting the dropped table.
+    // Enumerate the temp schema triggers at translate time (which is
+    // safe because a concurrent DDL would bump the schema cookie and
+    // force a reprepare) and emit per-trigger bytecode to delete only
+    // the rows that should be removed. Filtering in the bytecode by
+    // `tbl_name` alone is not enough: two triggers with the same
+    // unqualified table name can live in the temp schema but point to
+    // different databases (e.g. one on `main.t`, one on `temp.t` when a
+    // shadow table exists). We must key on trigger name.
+    if database_id != crate::TEMP_DB_ID && resolver.has_temp_database() {
+        // A temp schema trigger targets the dropped db iff:
+        //   - it explicitly qualifies with the dropped db, or
+        //   - it is unqualified AND dropping from main AND temp has no
+        //     shadow table of the same name (in which case the
+        //     unqualified reference resolves to main).
+        let temp_has_shadow = resolver.with_schema(crate::TEMP_DB_ID, |s| {
+            s.get_table(tbl_name.name.as_str()).is_some()
+        });
+        let trigger_names_to_drop: Vec<String> = resolver.with_schema(crate::TEMP_DB_ID, |s| {
+            s.get_triggers_for_table(tbl_name.name.as_str())
+                .filter(|trigger| match trigger.target_database_id {
+                    Some(db_id) => db_id == database_id,
+                    None => !temp_has_shadow && database_id == crate::MAIN_DB_ID,
+                })
+                .map(|trigger| trigger.name.clone())
+                .collect()
+        });
+
+        if !trigger_names_to_drop.is_empty() {
+            let temp_schema_cookie = resolver.with_schema(crate::TEMP_DB_ID, |s| s.schema_version);
+            program.begin_write_on_database(crate::TEMP_DB_ID, temp_schema_cookie);
+            let temp_schema_table =
+                resolver.with_schema(crate::TEMP_DB_ID, |s| s.get_btree_table(SQLITE_TABLEID));
+            if let Some(temp_schema_table) = temp_schema_table {
+                let temp_cursor =
+                    program.alloc_cursor_id(CursorType::BTreeTable(temp_schema_table));
+                program.emit_insn(Insn::OpenWrite {
+                    cursor_id: temp_cursor,
+                    root_page: 1i64.into(),
+                    db: crate::TEMP_DB_ID,
+                });
+                // Hoist the literal trigger names + `"trigger"` type
+                // string into constant registers before the loop.
+                let trigger_type_reg = program.emit_string8_new_reg("trigger".to_string());
+                program.mark_last_insn_constant();
+                let name_regs: Vec<usize> = trigger_names_to_drop
+                    .iter()
+                    .map(|name| {
+                        let reg = program.emit_string8_new_reg(name.clone());
+                        program.mark_last_insn_constant();
+                        reg
+                    })
+                    .collect();
+
+                let temp_end_label = program.allocate_label();
+                let temp_loop_label = program.allocate_label();
+                program.emit_insn(Insn::Rewind {
+                    cursor_id: temp_cursor,
+                    pc_if_empty: temp_end_label,
+                });
+                program.preassign_label_to_next_insn(temp_loop_label);
+                let temp_next_label = program.allocate_label();
+                let temp_delete_label = program.allocate_label();
+
+                // Skip non-trigger rows (column 0 = type).
+                let temp_type_reg = program.alloc_register();
+                program.emit_column_or_rowid(temp_cursor, 0, temp_type_reg);
+                program.emit_insn(Insn::Ne {
+                    lhs: temp_type_reg,
+                    rhs: trigger_type_reg,
+                    target_pc: temp_next_label,
+                    flags: CmpInsFlags::default(),
+                    collation: None,
+                });
+
+                // Cascade-check name (column 1) against each trigger we
+                // want to drop. First match jumps to the delete label.
+                let temp_name_reg = program.alloc_register();
+                program.emit_column_or_rowid(temp_cursor, 1, temp_name_reg);
+                for name_reg in &name_regs {
+                    program.emit_insn(Insn::Eq {
+                        lhs: temp_name_reg,
+                        rhs: *name_reg,
+                        target_pc: temp_delete_label,
+                        flags: CmpInsFlags::default(),
+                        collation: None,
+                    });
+                }
+                // No name matched — skip the delete.
+                program.emit_insn(Insn::Goto {
+                    target_pc: temp_next_label,
+                });
+                program.resolve_label(temp_delete_label, program.offset());
+                program.emit_insn(Insn::Delete {
+                    cursor_id: temp_cursor,
+                    table_name: SQLITE_TABLEID.to_string(),
+                    is_part_of_update: false,
+                });
+                program.resolve_label(temp_next_label, program.offset());
+                program.emit_insn(Insn::Next {
+                    cursor_id: temp_cursor,
+                    pc_if_next: temp_loop_label,
+                });
+                program.preassign_label_to_next_insn(temp_end_label);
+            }
+        }
     }
 
     //  2. Destroy the indices within a loop

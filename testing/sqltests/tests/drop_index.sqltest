@@ -80,3 +80,13 @@ expect error {
     index associated with UNIQUE or PRIMARY KEY constraint cannot be dropped
 }
 
+@cross-check-integrity
+test drop-explicit-unique-index {
+    CREATE TABLE t16 (id INT);
+    CREATE UNIQUE INDEX t16_unique_idx ON t16(id);
+    DROP INDEX t16_unique_idx;
+    SELECT count(*) FROM sqlite_schema WHERE type='index' AND name='t16_unique_idx';
+}
+expect {
+    0
+}

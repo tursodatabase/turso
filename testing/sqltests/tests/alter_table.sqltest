@@ -186,7 +186,6 @@ test alter-table-rename-column-view-mutual-cycle {
 expect error {
 }
 
-@skip-if mvcc "ATTACH is not supported in MVCC mode"
 test alter-table-rename-column-view-attached-db-qualified {
     ATTACH ':memory:' AS aux;
     CREATE TABLE t (a, b);
@@ -197,7 +196,6 @@ expect error {
     cannot reference
 }
 
-@skip-if mvcc "ATTACH is not supported in MVCC mode"
 test alter-table-rename-column-trigger-attached-db-same-db {
     ATTACH ':memory:' AS aux;
     CREATE TABLE aux.t (a, b);
@@ -213,7 +211,6 @@ expect {
     7
 }
 
-@skip-if mvcc "ATTACH is not supported in MVCC mode"
 test alter-table-rename-column-view-attached-db-same-db {
     ATTACH ':memory:' AS aux;
     CREATE TABLE aux.t (a, b);
@@ -1471,6 +1468,176 @@ expect {
     500
 }
 
+test alter-table-rename-column-temp-trigger-main-cross-table {
+    CREATE TABLE src_temp_main (a INTEGER PRIMARY KEY, b);
+    CREATE TABLE log_temp_main (v);
+    CREATE TEMP TABLE temp_driver_main (x);
+    INSERT INTO src_temp_main VALUES (1, 500);
+    CREATE TRIGGER trig_temp_main AFTER INSERT ON temp.temp_driver_main BEGIN
+        INSERT INTO log_temp_main SELECT b FROM src_temp_main WHERE a = new.x;
+    END;
+    ALTER TABLE src_temp_main RENAME COLUMN b TO c;
+    INSERT INTO temp.temp_driver_main VALUES (1);
+    SELECT * FROM log_temp_main;
+}
+expect {
+    500
+}
+
+test alter-table-rename-column-temp-table-trigger-main-delete-target {
+    CREATE TABLE main_delete_log (x);
+    INSERT INTO main_delete_log VALUES (1), (2);
+    CREATE TEMP TABLE temp_src_delete (a, b);
+    INSERT INTO temp.temp_src_delete VALUES (1, 10);
+    CREATE TRIGGER trig_temp_delete BEFORE DELETE ON temp.temp_src_delete BEGIN
+        DELETE FROM main_delete_log WHERE x = old.a;
+    END;
+    ALTER TABLE temp.temp_src_delete RENAME COLUMN b TO c;
+    DELETE FROM temp.temp_src_delete WHERE a = 1;
+    SELECT * FROM main_delete_log ORDER BY x;
+}
+expect {
+    2
+}
+
+test alter-table-rename-column-temp-trigger-main-alias-cross-table {
+    CREATE TABLE src_temp_main_alias (a INTEGER PRIMARY KEY, b);
+    CREATE TABLE log_temp_main_alias (v);
+    CREATE TEMP TABLE temp_driver_main_alias (x);
+    INSERT INTO src_temp_main_alias VALUES (1, 700);
+    CREATE TRIGGER trig_temp_main_alias AFTER INSERT ON temp.temp_driver_main_alias BEGIN
+        INSERT INTO log_temp_main_alias
+        SELECT t.b
+        FROM src_temp_main_alias AS t
+        WHERE EXISTS (
+            SELECT 1
+            FROM src_temp_main_alias AS u
+            WHERE u.a = new.x AND u.b = t.b
+        );
+    END;
+    ALTER TABLE src_temp_main_alias RENAME COLUMN b TO c;
+    INSERT INTO temp.temp_driver_main_alias VALUES (1);
+    SELECT * FROM log_temp_main_alias;
+}
+expect {
+    700
+}
+
+test alter-table-rename-temp-table-invalid-temp-trigger-missing-main-table {
+    CREATE TABLE missing_main_tbl (x);
+    CREATE TEMP TABLE temp_rename_src (a);
+    CREATE TEMP TABLE temp_trigger_driver (b);
+    CREATE TRIGGER trig_invalid_temp_rename AFTER UPDATE ON temp.temp_trigger_driver BEGIN
+        SELECT * FROM missing_main_tbl;
+    END;
+    DROP TABLE missing_main_tbl;
+    ALTER TABLE temp.temp_rename_src RENAME TO temp_rename_dst;
+}
+expect error {
+    error in trigger trig_invalid_temp_rename: no such table: missing_main_tbl
+}
+
+test alter-table-rename-table-rewrites-temp-trigger-on-temp-table {
+    CREATE TABLE rename_src_main (x);
+    INSERT INTO rename_src_main VALUES (1);
+    CREATE TEMP TABLE temp_rename_driver (y);
+    INSERT INTO temp.temp_rename_driver VALUES (10);
+    CREATE TRIGGER trig_temp_table_rename AFTER UPDATE ON temp.temp_rename_driver BEGIN
+        DELETE FROM rename_src_main WHERE x;
+    END;
+    ALTER TABLE rename_src_main RENAME TO rename_dst_main;
+    SELECT instr(sql, 'rename_dst_main') > 0 FROM temp.sqlite_schema WHERE name = 'trig_temp_table_rename';
+    SELECT instr(sql, 'rename_src_main') = 0 FROM temp.sqlite_schema WHERE name = 'trig_temp_table_rename';
+    UPDATE temp.temp_rename_driver SET y = 11;
+    SELECT count(*) FROM rename_dst_main;
+}
+expect {
+    1
+    1
+    0
+}
+
+test alter-table-rename-column-temp-trigger-exists-result-expr-error {
+    CREATE TEMP TABLE temp_exists_driver (n);
+    CREATE TABLE src_temp_exists (c1, c2, b);
+    CREATE TRIGGER trig_temp_exists AFTER INSERT ON temp.temp_exists_driver BEGIN
+        SELECT 1 NOT IN (
+            NOT EXISTS (
+                SELECT *
+                FROM src_temp_exists
+                WHERE c1
+                ORDER BY b ASC, CASE WHEN b THEN 'x' WHEN b THEN 1 END
+            )
+        );
+    END;
+    ALTER TABLE src_temp_exists RENAME COLUMN b TO bb;
+}
+expect error {
+    error in trigger trig_temp_exists after rename: no such column: b
+}
+
+test alter-table-rename-column-temp-trigger-result-scalar-subquery {
+    CREATE TEMP TABLE temp_scalar_driver (n);
+    CREATE TABLE src_temp_scalar (c1, c2, b);
+    CREATE TABLE log_temp_scalar (v);
+    INSERT INTO src_temp_scalar VALUES (10, 20, 30);
+    CREATE TRIGGER trig_temp_scalar AFTER INSERT ON temp.temp_scalar_driver BEGIN
+        INSERT INTO log_temp_scalar
+        SELECT (SELECT c1 FROM src_temp_scalar ORDER BY b ASC, CASE WHEN b THEN 'x' WHEN b THEN 1 END);
+    END;
+    ALTER TABLE src_temp_scalar RENAME COLUMN b TO bb;
+    INSERT INTO temp.temp_scalar_driver VALUES (1);
+    SELECT * FROM log_temp_scalar;
+}
+expect {
+    10
+}
+
+test alter-table-rename-column-temp-table-rejects-invalid-trigger-rewrite {
+    CREATE TEMP TABLE t(a,b);
+    CREATE TRIGGER tr AFTER INSERT ON temp.t BEGIN
+        INSERT INTO t VALUES(new.a,new.b);
+    END;
+    ALTER TABLE t RENAME COLUMN b TO c;
+}
+expect error {
+    error in trigger tr.*no such column: new.c
+}
+
+test alter-table-rename-column-temp-trigger-attached-cross-table {
+    ATTACH ':memory:' AS aux;
+    CREATE TABLE aux.src_temp_aux (a INTEGER PRIMARY KEY, b);
+    CREATE TABLE log_temp_aux (v);
+    CREATE TEMP TABLE temp_driver_aux (x);
+    INSERT INTO aux.src_temp_aux VALUES (1, 900);
+    CREATE TRIGGER trig_temp_aux AFTER INSERT ON temp.temp_driver_aux BEGIN
+        INSERT INTO log_temp_aux SELECT b FROM aux.src_temp_aux WHERE a = new.x;
+    END;
+    ALTER TABLE aux.src_temp_aux RENAME COLUMN b TO c;
+    INSERT INTO temp.temp_driver_aux VALUES (1);
+    SELECT * FROM log_temp_aux;
+}
+expect {
+    900
+}
+
+test temp-trigger-attached-read-cross-table {
+    ATTACH ':memory:' AS aux;
+    CREATE TABLE aux.src_temp_aux_read (a INTEGER PRIMARY KEY, b);
+    CREATE TABLE log_temp_aux_read (v);
+    CREATE TEMP TABLE temp_driver_aux_read (x);
+    INSERT INTO aux.src_temp_aux_read VALUES (1, 901);
+    CREATE TRIGGER trig_temp_aux_read AFTER INSERT ON temp.temp_driver_aux_read BEGIN
+        INSERT INTO log_temp_aux_read
+        SELECT b FROM aux.src_temp_aux_read WHERE a = new.x;
+    END;
+    INSERT INTO temp.temp_driver_aux_read VALUES (1);
+    SELECT * FROM log_temp_aux_read;
+}
+expect {
+    901
+}
+
 test alter-rename-col-cross-table-aggregate {
     DROP TABLE IF EXISTS src;
     DROP TABLE IF EXISTS dst;
@@ -1489,6 +1656,91 @@ test alter-rename-col-cross-table-aggregate {
 }
 expect {
     30
+}
+
+test alter-table-drop-column-temp-trigger-invalid {
+    CREATE TABLE src_drop_temp (a, b);
+    CREATE TEMP TABLE temp_drop_driver (x);
+    CREATE TRIGGER trig_temp_drop AFTER INSERT ON temp.temp_drop_driver BEGIN
+        SELECT b FROM src_drop_temp;
+    END;
+    ALTER TABLE src_drop_temp DROP COLUMN b;
+}
+expect error {
+    error in trigger trig_temp_drop after drop column: no such column: b
+}
+
+test alter-table-drop-column-invalid-temp-trigger-missing-main-table {
+    CREATE TABLE missing_main_tbl_drop (x);
+    CREATE TABLE main_drop_src (a, b);
+    CREATE TEMP TABLE temp_drop_driver_missing (x);
+    CREATE TRIGGER trig_invalid_temp_drop AFTER UPDATE ON temp.temp_drop_driver_missing BEGIN
+        SELECT * FROM missing_main_tbl_drop;
+    END;
+    DROP TABLE missing_main_tbl_drop;
+    ALTER TABLE main_drop_src DROP COLUMN a;
+}
+expect error {
+    error in trigger trig_invalid_temp_drop: no such table: missing_main_tbl_drop
+}
+
+test alter-table-drop-column-trigger-bare-owning-column-in-when-invalid {
+    CREATE TABLE trigger_when_src (x, y);
+    CREATE TABLE trigger_when_alter (a, b);
+    CREATE TRIGGER trig_when_invalid AFTER INSERT ON trigger_when_src
+    WHEN y
+    BEGIN
+        SELECT 1;
+    END;
+    ALTER TABLE trigger_when_alter DROP COLUMN a;
+}
+expect error {
+    error in trigger trig_when_invalid: no such column: y
+}
+
+test alter-table-drop-column-trigger-bare-owning-column-in-update-invalid {
+    CREATE TABLE trigger_update_src (x, y);
+    CREATE TABLE trigger_update_dst (u);
+    CREATE TABLE trigger_update_alter (a, b);
+    CREATE TRIGGER trig_update_invalid AFTER INSERT ON trigger_update_src BEGIN
+        UPDATE trigger_update_dst SET u = y;
+    END;
+    ALTER TABLE trigger_update_alter DROP COLUMN a;
+}
+expect error {
+    error in trigger trig_update_invalid: no such column: y
+}
+
+test alter-table-drop-column-cross-table-trigger-select-surviving-column {
+    CREATE TABLE src_drop_select (a, b);
+    INSERT INTO src_drop_select VALUES (1, 2);
+    CREATE TABLE drop_select_driver (x);
+    CREATE TABLE drop_select_log (v);
+    CREATE TRIGGER trig_drop_select AFTER INSERT ON drop_select_driver BEGIN
+        INSERT INTO drop_select_log SELECT b FROM src_drop_select;
+    END;
+    ALTER TABLE src_drop_select DROP COLUMN a;
+    INSERT INTO drop_select_driver VALUES (1);
+    SELECT * FROM drop_select_log;
+}
+expect {
+    2
+}
+
+test alter-table-drop-column-temp-trigger-select-surviving-column {
+    CREATE TEMP TABLE temp_src_drop_select (a, b);
+    INSERT INTO temp.temp_src_drop_select VALUES (1, 2);
+    CREATE TEMP TABLE temp_drop_select_driver (x);
+    CREATE TEMP TABLE temp_drop_select_log (v);
+    CREATE TRIGGER trig_temp_drop_select AFTER INSERT ON temp.temp_drop_select_driver BEGIN
+        INSERT INTO temp_drop_select_log SELECT b FROM temp_src_drop_select;
+    END;
+    ALTER TABLE temp.temp_src_drop_select DROP COLUMN a;
+    INSERT INTO temp.temp_drop_select_driver VALUES (1);
+    SELECT * FROM temp.temp_drop_select_log;
+}
+expect {
+    2
 }
 
 test alter-rename-col-cross-table-qualified-ref {

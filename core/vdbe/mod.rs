@@ -889,8 +889,10 @@ impl ProgramState {
                         }
                     });
                     Ok(())
-                } else if self.uses_subjournal {
-                    pager.release_savepoint()?;
+                } else if self.uses_subjournal || !attached_pagers.is_empty() {
+                    if self.uses_subjournal {
+                        pager.release_savepoint()?;
+                    }
                     for p in &attached_pagers {
                         p.release_savepoint()?;
                     }
@@ -932,6 +934,14 @@ impl ProgramState {
                         }
                         Err(e) => Some(e),
                     }
+                } else if !attached_pagers.is_empty() {
+                    let mut err = None;
+                    for p in &attached_pagers {
+                        if let Err(e) = p.rollback_to_newest_savepoint() {
+                            err = Some(e);
+                        }
+                    }
+                    err
                 } else {
                     None
                 };
@@ -1621,11 +1631,19 @@ impl Program {
         if tx_state == TransactionState::None
             && matches!(program_state.commit_state, CommitState::Ready)
         {
-            // No active transaction and no in-progress commit — nothing to do.
-            // Attached MVCC transactions are only started after the main DB's
-            // Transaction opcode runs, so tx_state==None implies no attached
-            // MVCC txs either.
-            return Ok(IOResult::Done(()));
+            // No main transaction and no in-progress commit — check whether
+            // any attached/temp database still has an active transaction before
+            // bailing out. Defer these checks to here so the common case
+            // (active main transaction) doesn't pay for the lock reads.
+            let has_attached_mv_tx = self.connection.next_attached_mv_tx().is_some();
+            let has_attached_wal_tx = self
+                .connection
+                .get_all_attached_pagers()
+                .iter()
+                .any(|pager| pager.holds_read_lock());
+            if !has_attached_mv_tx && !has_attached_wal_tx {
+                return Ok(IOResult::Done(()));
+            }
         }
         if self.connection.is_nested_stmt() {
             // We don't want to commit on nested statements. Let parent handle it.
@@ -1636,9 +1654,22 @@ impl Program {
         } else {
             self.commit_txn_wal(pager, program_state, rollback)
         }?;
-        if !res.is_io() && self.change_cnt_on {
-            self.connection
-                .set_changes(program_state.n_change.load(Ordering::SeqCst));
+        if !res.is_io() {
+            if self.change_cnt_on {
+                self.connection
+                    .set_changes(program_state.n_change.load(Ordering::SeqCst));
+            }
+            // finalize the in-memory TEMP schema. The pager's own
+            // rollback() only reinstates main's `connection.schema` from the
+            // shared `Database::schema`; TEMP has no shared Database so the
+            // connection keeps its own `committed_temp_schema` snapshot that
+            // we update here. Both methods are gated on `temp_schema_did_change`
+            // so they are cheap no-ops outside of temp DDL.
+            if rollback {
+                self.connection.rollback_temp_schema();
+            } else {
+                self.connection.commit_temp_schema();
+            }
         }
         Ok(res)
     }
@@ -1698,7 +1729,17 @@ impl Program {
                     self.end_attached_read_txns(&connection);
                     Ok(IOResult::Done(()))
                 }
-                TransactionState::None => Ok(IOResult::Done(())),
+                TransactionState::None => {
+                    match self.end_attached_write_txns(&connection, rollback)? {
+                        IOResult::Done(_) => {}
+                        IOResult::IO(io) => {
+                            program_state.commit_state = CommitState::CommittingAttached;
+                            return Ok(IOResult::IO(io));
+                        }
+                    }
+                    self.end_attached_read_txns(&connection);
+                    Ok(IOResult::Done(()))
+                }
                 TransactionState::PendingUpgrade { .. } => {
                     panic!("Unexpected transaction state: {tx_state:?} during auto-commit",)
                 }
@@ -1785,7 +1826,7 @@ impl Program {
             match step_result {
                 IOResult::Done(_) => {
                     let attached_pager = conn.get_pager_from_database_index(&db_id);
-                    conn.publish_attached_schema(db_id);
+                    conn.publish_database_schema(db_id);
                     conn.set_mv_tx_for_db(db_id, None);
                     attached_pager.end_read_tx();
                     // Fall through to look for more
@@ -1820,7 +1861,7 @@ impl Program {
             match state_machine.step(&attached_mv_store)? {
                 IOResult::Done(_) => {
                     let attached_pager = conn.get_pager_from_database_index(&db_id);
-                    conn.publish_attached_schema(db_id);
+                    conn.publish_database_schema(db_id);
                     conn.set_mv_tx_for_db(db_id, None);
                     attached_pager.end_read_tx();
                     continue;
@@ -1930,42 +1971,44 @@ impl Program {
         connection: &Connection,
         rollback: bool,
     ) -> Result<IOResult<()>> {
-        let pagers = connection.get_all_attached_pagers_with_index();
-        for (db_id, attached_pager) in pagers {
-            // MVCC-enabled attached DBs are committed in commit_txn_mvcc phase 2
-            if connection.mv_store_for_db(db_id).is_some() {
-                continue;
-            }
-            if !attached_pager.holds_write_lock() {
-                continue;
-            }
-            if !rollback {
-                // Commit dirty pages to WAL, then end write+read transactions.
-                // We disable auto-checkpoint and avoid pager.commit_tx() since
-                // the checkpoint logic can leave read locks held.
-                match attached_pager.commit_dirty_pages(true, SyncMode::Normal, false) {
-                    Ok(IOResult::Done(_)) => {}
-                    Ok(IOResult::IO(io)) => {
-                        // IO pending — return so the caller can yield and re-enter.
-                        // commit_dirty_pages tracks its own internal state, so calling
-                        // it again on re-entry will resume correctly.
-                        return Ok(IOResult::IO(io));
-                    }
-                    Err(e) => return Err(e),
+        connection.with_all_attached_pagers_with_index(|pagers| {
+            for (db_id, attached_pager) in pagers {
+                let db_id = *db_id;
+                // MVCC-enabled attached DBs are committed in commit_txn_mvcc phase 2
+                if connection.mv_store_for_db(db_id).is_some() {
+                    continue;
                 }
-                // WAL commit succeeded — publish the connection-local schema
-                // changes to the shared Database so other connections can see them.
-                connection.publish_attached_schema(db_id);
-                attached_pager.end_write_tx();
-                attached_pager.end_read_tx();
-                attached_pager.commit_dirty_pages_end();
-            } else {
-                // Discard any local schema changes on rollback
-                connection.database_schemas().write().remove(&db_id);
-                attached_pager.rollback_attached();
+                if !attached_pager.holds_write_lock() {
+                    continue;
+                }
+                if !rollback {
+                    // Commit dirty pages to WAL, then end write+read transactions.
+                    // We disable auto-checkpoint and avoid pager.commit_tx() since
+                    // the checkpoint logic can leave read locks held.
+                    match attached_pager.commit_dirty_pages(true, SyncMode::Normal, false) {
+                        Ok(IOResult::Done(_)) => {}
+                        Ok(IOResult::IO(io)) => {
+                            // IO pending — return so the caller can yield and re-enter.
+                            // commit_dirty_pages tracks its own internal state, so calling
+                            // it again on re-entry will resume correctly.
+                            return Ok(IOResult::IO(io));
+                        }
+                        Err(e) => return Err(e),
+                    }
+                    // WAL commit succeeded — publish the connection-local schema
+                    // changes to the shared Database so other connections can see them.
+                    connection.publish_database_schema(db_id);
+                    attached_pager.end_write_tx();
+                    attached_pager.end_read_tx();
+                    attached_pager.commit_dirty_pages_end();
+                } else {
+                    // Discard any local schema changes on rollback
+                    connection.database_schemas().write().remove(&db_id);
+                    attached_pager.rollback_attached();
+                }
             }
-        }
-        Ok(IOResult::Done(()))
+            Ok(IOResult::Done(()))
+        })
     }
 
     /// End read transactions on all attached databases that had transactions started.
@@ -2183,10 +2226,22 @@ impl Program {
             pager.end_read_tx();
             self.connection.rollback_attached_mvcc_txs(true);
         } else {
-            pager.rollback_tx(&self.connection);
+            let tx_state = self.connection.get_tx_state();
+            let has_attached_write = self
+                .connection
+                .get_all_attached_pagers()
+                .iter()
+                .any(|attached_pager| attached_pager.holds_write_lock());
+            match tx_state {
+                TransactionState::Write { .. } => pager.rollback_tx(&self.connection),
+                _ if pager.holds_write_lock() => pager.rollback_attached(),
+                _ if has_attached_write => pager.cleanup_read_tx(),
+                _ => pager.rollback_tx(&self.connection),
+            }
             self.connection.auto_commit.store(true, Ordering::SeqCst);
         }
         self.connection.rollback_attached_wal_txns();
+        self.connection.rollback_temp_schema();
         self.connection.set_tx_state(TransactionState::None);
     }
 

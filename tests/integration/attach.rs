@@ -1,4 +1,5 @@
-use crate::common::{do_flush, limbo_exec_rows, ExecRows, TempDatabase};
+use crate::common::{do_flush, limbo_exec_rows, sqlite_exec_rows, ExecRows, TempDatabase};
+use rusqlite::params;
 use rusqlite::Connection as RusqliteConnection;
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
@@ -41,6 +42,43 @@ fn checkpoint_attached_database(
     let pragma = format!("PRAGMA {alias}.wal_checkpoint(TRUNCATE)");
     let _ = limbo_exec_rows(conn, &pragma);
     do_flush(conn, db)?;
+    Ok(())
+}
+
+#[turso_macros::test]
+fn test_attached_schema_refreshes_after_other_connection_create(
+    tmp_db: TempDatabase,
+) -> anyhow::Result<()> {
+    let aux_path = tmp_db
+        .path
+        .parent()
+        .unwrap()
+        .join("attach_schema_refresh.db")
+        .to_string_lossy()
+        .to_string();
+
+    let conn1 = tmp_db.connect_limbo();
+    let conn2 = tmp_db.connect_limbo();
+
+    conn1.execute(format!("ATTACH '{aux_path}' AS aux"))?;
+    conn2.execute(format!("ATTACH '{aux_path}' AS aux"))?;
+
+    conn1.execute("CREATE TABLE aux.bootstrap (x INTEGER)")?;
+
+    // Populate conn2's attached-schema cache before conn1 adds another table.
+    let _ = limbo_exec_rows(&conn2, "SELECT * FROM aux.bootstrap");
+
+    conn1.execute("CREATE TABLE aux.created_later (y INTEGER)")?;
+    conn1.execute("INSERT INTO aux.created_later VALUES (1)")?;
+
+    let rows = limbo_exec_rows(&conn2, "SELECT y FROM aux.created_later");
+    assert_eq!(
+        rows.len(),
+        1,
+        "conn2 should see the newly created attached table"
+    );
+    assert_eq!(rows[0], vec![rusqlite::types::Value::Integer(1)]);
+
     Ok(())
 }
 
@@ -358,6 +396,175 @@ fn test_attach_create_stores_canonical_schema_sql_on_main() -> anyhow::Result<()
         rows,
         vec![("CREATE INDEX idx_t_name ON t (name)".to_string(),)]
     );
+    Ok(())
+}
 
+// ---------------------------------------------------------------------------
+// Transaction-opcode emission tests
+//
+// SQLite emits `Transaction` for every open database (main, temp, each
+// attached) on `BEGIN IMMEDIATE` and `BEGIN EXCLUSIVE`. Verify that turso
+// emits the same number, covering the db-id set we expect.
+// ---------------------------------------------------------------------------
+
+/// Extract the set of `p1` (db index) values from `Transaction` opcodes
+/// in an EXPLAIN result set. Column 1 = opcode name, column 2 = p1.
+fn transaction_db_ids_from_explain(rows: &[Vec<rusqlite::types::Value>]) -> Vec<i64> {
+    rows.iter()
+        .filter_map(|row| {
+            let opcode = match &row[1] {
+                rusqlite::types::Value::Text(s) => s.as_str(),
+                _ => return None,
+            };
+            if opcode != "Transaction" {
+                return None;
+            }
+            match &row[2] {
+                rusqlite::types::Value::Integer(db_id) => Some(*db_id),
+                _ => None,
+            }
+        })
+        .collect()
+}
+
+#[turso_macros::test]
+fn test_begin_immediate_transaction_count_no_attached(_tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let db = attach_enabled_db(DatabaseOpts::new());
+    let turso = db.connect_limbo();
+    let sqlite = RusqliteConnection::open_in_memory()?;
+
+    let turso_ids =
+        transaction_db_ids_from_explain(&limbo_exec_rows(&turso, "EXPLAIN BEGIN IMMEDIATE"));
+    let sqlite_ids =
+        transaction_db_ids_from_explain(&sqlite_exec_rows(&sqlite, "EXPLAIN BEGIN IMMEDIATE"));
+
+    assert_eq!(
+        turso_ids.len(),
+        sqlite_ids.len(),
+        "Transaction opcode count mismatch (no attached)\nturso db_ids: {turso_ids:?}\nsqlite db_ids: {sqlite_ids:?}"
+    );
+    assert!(
+        turso_ids.contains(&0),
+        "turso must emit Transaction for main (db=0)"
+    );
+    Ok(())
+}
+
+#[turso_macros::test]
+fn test_begin_immediate_transaction_count_one_attached(
+    _tmp_db: TempDatabase,
+) -> anyhow::Result<()> {
+    let db = attach_enabled_db(DatabaseOpts::new());
+    let turso = db.connect_limbo();
+    let sqlite = RusqliteConnection::open_in_memory()?;
+
+    turso.execute("ATTACH ':memory:' AS aux")?;
+    sqlite.execute("ATTACH ':memory:' AS aux", params![])?;
+
+    turso.execute("CREATE TABLE aux.t(x INTEGER)")?;
+    sqlite.execute("CREATE TABLE aux.t(x INTEGER)", params![])?;
+
+    let turso_ids =
+        transaction_db_ids_from_explain(&limbo_exec_rows(&turso, "EXPLAIN BEGIN IMMEDIATE"));
+    let sqlite_ids =
+        transaction_db_ids_from_explain(&sqlite_exec_rows(&sqlite, "EXPLAIN BEGIN IMMEDIATE"));
+
+    assert_eq!(
+        turso_ids.len(),
+        sqlite_ids.len(),
+        "Transaction opcode count mismatch (one attached)\nturso db_ids: {turso_ids:?}\nsqlite db_ids: {sqlite_ids:?}"
+    );
+    assert!(turso_ids.contains(&0), "must emit Transaction for main");
+    // Attached db gets index 2 (slot 1 is always temp).
+    assert!(
+        turso_ids.iter().any(|&id| id >= 2),
+        "must emit Transaction for attached db"
+    );
+    Ok(())
+}
+
+#[turso_macros::test]
+fn test_begin_immediate_transaction_count_two_attached(
+    _tmp_db: TempDatabase,
+) -> anyhow::Result<()> {
+    let db = attach_enabled_db(DatabaseOpts::new());
+    let turso = db.connect_limbo();
+    let sqlite = RusqliteConnection::open_in_memory()?;
+
+    for alias in ["aux1", "aux2"] {
+        turso.execute(format!("ATTACH ':memory:' AS {alias}"))?;
+        sqlite.execute(&format!("ATTACH ':memory:' AS {alias}"), params![])?;
+        turso.execute(format!("CREATE TABLE {alias}.t(x INTEGER)"))?;
+        sqlite.execute(&format!("CREATE TABLE {alias}.t(x INTEGER)"), params![])?;
+    }
+
+    let turso_ids =
+        transaction_db_ids_from_explain(&limbo_exec_rows(&turso, "EXPLAIN BEGIN IMMEDIATE"));
+    let sqlite_ids =
+        transaction_db_ids_from_explain(&sqlite_exec_rows(&sqlite, "EXPLAIN BEGIN IMMEDIATE"));
+
+    assert_eq!(
+        turso_ids.len(),
+        sqlite_ids.len(),
+        "Transaction opcode count mismatch (two attached)\nturso db_ids: {turso_ids:?}\nsqlite db_ids: {sqlite_ids:?}"
+    );
+    assert!(turso_ids.contains(&0), "must emit Transaction for main");
+    let attached_count = turso_ids.iter().filter(|&&id| id >= 2).count();
+    assert_eq!(
+        attached_count, 2,
+        "must emit Transaction for both attached dbs"
+    );
+    Ok(())
+}
+
+#[turso_macros::test]
+fn test_begin_immediate_transaction_count_with_temp(_tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let db = attach_enabled_db(DatabaseOpts::new());
+    let turso = db.connect_limbo();
+    let sqlite = RusqliteConnection::open_in_memory()?;
+
+    turso.execute("CREATE TEMP TABLE tt(v INTEGER)")?;
+    sqlite.execute("CREATE TEMP TABLE tt(v INTEGER)", params![])?;
+
+    let turso_ids =
+        transaction_db_ids_from_explain(&limbo_exec_rows(&turso, "EXPLAIN BEGIN IMMEDIATE"));
+    let sqlite_ids =
+        transaction_db_ids_from_explain(&sqlite_exec_rows(&sqlite, "EXPLAIN BEGIN IMMEDIATE"));
+
+    assert_eq!(
+        turso_ids.len(),
+        sqlite_ids.len(),
+        "Transaction opcode count mismatch (with temp)\nturso db_ids: {turso_ids:?}\nsqlite db_ids: {sqlite_ids:?}"
+    );
+    assert!(turso_ids.contains(&0), "must emit Transaction for main");
+    assert!(
+        turso_ids.contains(&1),
+        "must emit Transaction for temp (db=1)"
+    );
+    Ok(())
+}
+
+#[turso_macros::test]
+fn test_begin_deferred_emits_no_transaction_opcodes(_tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let db = attach_enabled_db(DatabaseOpts::new());
+    let turso = db.connect_limbo();
+    let sqlite = RusqliteConnection::open_in_memory()?;
+
+    turso.execute("ATTACH ':memory:' AS aux")?;
+    sqlite.execute("ATTACH ':memory:' AS aux", params![])?;
+    turso.execute("CREATE TABLE aux.t(x INTEGER)")?;
+    sqlite.execute("CREATE TABLE aux.t(x INTEGER)", params![])?;
+
+    let turso_ids = transaction_db_ids_from_explain(&limbo_exec_rows(&turso, "EXPLAIN BEGIN"));
+    let sqlite_ids = transaction_db_ids_from_explain(&sqlite_exec_rows(&sqlite, "EXPLAIN BEGIN"));
+
+    assert!(
+        turso_ids.is_empty(),
+        "BEGIN (deferred) should emit no Transaction opcodes, got: {turso_ids:?}"
+    );
+    assert!(
+        sqlite_ids.is_empty(),
+        "SQLite BEGIN (deferred) should emit no Transaction opcodes, got: {sqlite_ids:?}"
+    );
     Ok(())
 }

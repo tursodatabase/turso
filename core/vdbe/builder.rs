@@ -1,4 +1,4 @@
-use crate::{turso_assert, turso_assert_eq, turso_debug_assert, MAIN_DB_ID};
+use crate::{turso_assert, turso_assert_eq, turso_debug_assert};
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use tracing::{instrument, Level};
 use turso_parser::ast::{self, Expr, ResolveType, SortOrder, TableInternalId};
@@ -1537,7 +1537,7 @@ impl ProgramBuilder {
     /// Tries to mirror: https://github.com/sqlite/sqlite/blob/e77e589a35862f6ac9c4141cfd1beb2844b84c61/src/build.c#L5379
     pub fn begin_write_operation(&mut self) {
         self.txn_mode = TransactionMode::Write;
-        self.write_databases.insert(MAIN_DB_ID);
+        self.write_databases.insert(crate::MAIN_DB_ID);
     }
 
     /// Begin a write operation on a specific database (for attached databases).
@@ -1553,18 +1553,19 @@ impl ProgramBuilder {
         if matches!(self.txn_mode, TransactionMode::None) {
             self.txn_mode = TransactionMode::Read;
         }
+        self.read_databases.insert(crate::MAIN_DB_ID);
     }
 
     /// Begin a read operation on a specific attached database.
     /// This ensures a Transaction instruction is emitted for the attached pager
     /// so that a WAL read lock is acquired.
     pub fn begin_read_on_database(&mut self, database_id: usize, schema_cookie: u32) {
-        self.begin_read_operation();
-        if crate::is_attached_db(database_id) {
-            self.read_databases.insert(database_id);
-            self.read_database_cookies
-                .insert(database_id, schema_cookie);
+        if matches!(self.txn_mode, TransactionMode::None) {
+            self.txn_mode = TransactionMode::Read;
         }
+        self.read_databases.insert(database_id);
+        self.read_database_cookies
+            .insert(database_id, schema_cookie);
     }
 
     pub fn begin_concurrent_operation(&mut self) {
@@ -1601,36 +1602,38 @@ impl ProgramBuilder {
             self.preassign_label_to_next_insn(self.init_label);
 
             if !matches!(self.txn_mode, TransactionMode::None) {
-                // Emit Transaction for main database always
-                self.emit_insn(Insn::Transaction {
-                    db: crate::MAIN_DB_ID,
-                    tx_mode: self.txn_mode,
-                    schema_cookie: schema.schema_version,
-                });
-                // Emit Transaction for each attached database that needs a write
-                for &db_id in &self.write_databases.clone() {
-                    if crate::is_attached_db(db_id) {
-                        let cookie = self
-                            .write_database_cookies
+                let mut write_db_ids: Vec<_> = self.write_databases.iter().copied().collect();
+                write_db_ids.sort_unstable();
+                for db_id in write_db_ids {
+                    let schema_cookie = if db_id == crate::MAIN_DB_ID {
+                        schema.schema_version
+                    } else {
+                        self.write_database_cookies
                             .get(&db_id)
                             .copied()
-                            .unwrap_or(0);
-                        self.emit_insn(Insn::Transaction {
-                            db: db_id,
-                            tx_mode: self.txn_mode,
-                            schema_cookie: cookie,
-                        });
-                    }
+                            .unwrap_or(0)
+                    };
+                    self.emit_insn(Insn::Transaction {
+                        db: db_id,
+                        tx_mode: self.txn_mode,
+                        schema_cookie,
+                    });
                 }
-                // Emit Transaction for each attached database that only needs a read
+                // Emit Transaction for each non-main database that only needs a read
                 // (skip databases already covered by write_databases)
-                for &db_id in &self.read_databases.clone() {
+                let mut read_db_ids: Vec<_> = self.read_databases.iter().copied().collect();
+                read_db_ids.sort_unstable();
+                for db_id in read_db_ids {
                     if !self.write_databases.contains(&db_id) {
-                        let cookie = self.read_database_cookies.get(&db_id).copied().unwrap_or(0);
+                        let schema_cookie = if db_id == crate::MAIN_DB_ID {
+                            schema.schema_version
+                        } else {
+                            self.read_database_cookies.get(&db_id).copied().unwrap_or(0)
+                        };
                         self.emit_insn(Insn::Transaction {
                             db: db_id,
                             tx_mode: TransactionMode::Read,
-                            schema_cookie: cookie,
+                            schema_cookie,
                         });
                     }
                 }

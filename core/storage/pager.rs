@@ -2503,7 +2503,6 @@ impl Pager {
         PageSize::new(value).expect("invalid page size stored")
     }
 
-    #[cfg(test)]
     pub(crate) fn has_wal(&self) -> bool {
         self.wal.is_some()
     }
@@ -2732,6 +2731,16 @@ impl Pager {
         wal.end_read_tx();
     }
 
+    pub(crate) fn cleanup_read_tx(&self) {
+        let Some(wal) = self.wal.as_ref() else {
+            return;
+        };
+        self.reset_internal_states();
+        if wal.holds_read_lock() {
+            wal.end_read_tx();
+        }
+    }
+
     #[instrument(skip_all, level = Level::DEBUG)]
     pub fn end_read_tx(&self) {
         let Some(wal) = self.wal.as_ref() else {
@@ -2781,13 +2790,7 @@ impl Pager {
             wal.rollback(None);
             wal.end_write_tx();
         } else {
-            // For read-only transactions, pager state machines (e.g. header_ref_state)
-            // can be left in intermediate states if an IO completion was aborted.
-            // Reset them so the next query on this attached DB starts clean.
-            self.reset_internal_states();
-        }
-        if wal.holds_read_lock() {
-            wal.end_read_tx();
+            self.cleanup_read_tx();
         }
     }
 

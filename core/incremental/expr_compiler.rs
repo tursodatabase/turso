@@ -327,10 +327,12 @@ impl CompiledExpression {
 
         // Create a resolver for translate_expr
         let database_schemas = RwLock::new(HashMap::default());
+        let temp_database = RwLock::new(None);
         let attached_databases = RwLock::new(DatabaseCatalog::new());
         let resolver = Resolver::new(
             schema,
             &database_schemas,
+            &temp_database,
             &attached_databases,
             syms,
             true,

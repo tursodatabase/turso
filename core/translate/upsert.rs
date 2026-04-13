@@ -17,7 +17,7 @@ use crate::translate::fkeys::{
 use crate::translate::insert::{format_unique_violation_desc, InsertEmitCtx};
 use crate::translate::planner::ROWID_STRS;
 use crate::translate::trigger_exec::{
-    fire_trigger, get_relevant_triggers_type_and_time, TriggerContext,
+    fire_trigger, get_triggers_including_temp, has_triggers_including_temp, TriggerContext,
 };
 use crate::vdbe::insn::{to_u16, CmpInsFlags};
 use crate::{
@@ -676,17 +676,14 @@ pub fn emit_upsert(
     let preserved_old_registers: Option<Vec<usize>> = if let Some(btree_table) = table.btree() {
         let updated_column_indices: HashSet<usize> =
             set_pairs.iter().map(|(col_idx, _)| *col_idx).collect();
-        let relevant_before_update_triggers: Vec<_> =
-            resolver.with_schema(upsert_database_id, |s| {
-                get_relevant_triggers_type_and_time(
-                    s,
-                    TriggerEvent::Update,
-                    TriggerTime::Before,
-                    Some(updated_column_indices.clone()),
-                    &btree_table,
-                )
-                .collect()
-            });
+        let relevant_before_update_triggers = get_triggers_including_temp(
+            resolver,
+            upsert_database_id,
+            TriggerEvent::Update,
+            TriggerTime::Before,
+            Some(updated_column_indices.clone()),
+            &btree_table,
+        );
         // OLD row values are in current_start registers
         let old_registers: Vec<usize> = (0..num_cols)
             .map(|i| layout.to_register(current_start, i))
@@ -731,17 +728,13 @@ pub fn emit_upsert(
                 target_pc: ctx.loop_labels.row_done,
             });
 
-            let has_relevant_after_triggers = resolver.with_schema(upsert_database_id, |s| {
-                get_relevant_triggers_type_and_time(
-                    s,
-                    TriggerEvent::Update,
-                    TriggerTime::After,
-                    Some(updated_column_indices),
-                    &btree_table,
-                )
-                .count()
-                    > 0
-            });
+            let has_relevant_after_triggers = has_triggers_including_temp(
+                resolver,
+                upsert_database_id,
+                TriggerEvent::Update,
+                Some(&updated_column_indices),
+                &btree_table,
+            );
             if has_relevant_after_triggers {
                 // Preserve OLD registers for AFTER triggers
                 let preserved: Vec<usize> = old_registers
@@ -762,17 +755,13 @@ pub fn emit_upsert(
             }
         } else {
             // Check if we need to preserve for AFTER triggers
-            let has_relevant_after_triggers = resolver.with_schema(upsert_database_id, |s| {
-                get_relevant_triggers_type_and_time(
-                    s,
-                    TriggerEvent::Update,
-                    TriggerTime::After,
-                    Some(updated_column_indices),
-                    &btree_table,
-                )
-                .count()
-                    > 0
-            });
+            let has_relevant_after_triggers = has_triggers_including_temp(
+                resolver,
+                upsert_database_id,
+                TriggerEvent::Update,
+                Some(&updated_column_indices),
+                &btree_table,
+            );
             if has_relevant_after_triggers {
                 Some(old_registers)
             } else {
@@ -1244,16 +1233,14 @@ pub fn emit_upsert(
     if let (Some(btree_table), Some(old_regs)) = (table.btree(), preserved_old_registers) {
         let updated_column_indices: HashSet<usize> =
             set_pairs.iter().map(|(col_idx, _)| *col_idx).collect();
-        let relevant_triggers: Vec<_> = resolver.with_schema(upsert_database_id, |s| {
-            get_relevant_triggers_type_and_time(
-                s,
-                TriggerEvent::Update,
-                TriggerTime::After,
-                Some(updated_column_indices),
-                &btree_table,
-            )
-            .collect()
-        });
+        let relevant_triggers = get_triggers_including_temp(
+            resolver,
+            upsert_database_id,
+            TriggerEvent::Update,
+            TriggerTime::After,
+            Some(updated_column_indices),
+            &btree_table,
+        );
         if !relevant_triggers.is_empty() {
             let new_rowid_for_trigger = new_rowid_reg.unwrap_or(ctx.conflict_rowid_reg);
             let new_registers_after: Vec<usize> = (0..num_cols)

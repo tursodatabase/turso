@@ -82,7 +82,11 @@ pub fn translate_create_index(
     }
 
     let original_idx_name = idx_name;
-    let database_id = resolver.resolve_database_id(&original_idx_name)?;
+    let database_id = if original_idx_name.db_name.is_some() {
+        resolver.resolve_database_id(&original_idx_name)?
+    } else {
+        resolver.resolve_existing_table_database_id(tbl_name.as_str())?
+    };
     let idx_name = normalize_ident(original_idx_name.name.as_str());
     let tbl_name = normalize_ident(tbl_name.as_str());
 
@@ -106,10 +110,8 @@ pub fn translate_create_index(
     };
     program.extend(&opts);
 
-    if crate::is_attached_db(database_id) {
-        let schema_cookie = resolver.with_schema(database_id, |s| s.schema_version);
-        program.begin_write_on_database(database_id, schema_cookie);
-    }
+    let schema_cookie = resolver.with_schema(database_id, |s| s.schema_version);
+    program.begin_write_on_database(database_id, schema_cookie);
 
     // Check if the index is being created on a valid btree table and
     // the name is globally unique in the schema.
@@ -899,7 +901,7 @@ pub fn translate_drop_index(
     if_exists: bool,
     program: &mut ProgramBuilder,
 ) -> crate::Result<()> {
-    let database_id = resolver.resolve_database_id(qualified_name)?;
+    let database_id = resolver.resolve_existing_index_database_id(qualified_name)?;
     let idx_name = normalize_ident(qualified_name.name.as_str());
     let opts = ProgramBuilderOpts {
         num_cursors: 5,
@@ -908,10 +910,8 @@ pub fn translate_drop_index(
     };
     program.extend(&opts);
 
-    if crate::is_attached_db(database_id) {
-        let schema_cookie = resolver.with_schema(database_id, |s| s.schema_version);
-        program.begin_write_on_database(database_id, schema_cookie);
-    }
+    let schema_cookie = resolver.with_schema(database_id, |s| s.schema_version);
+    program.begin_write_on_database(database_id, schema_cookie);
 
     // Find the index in Schema
     let mut maybe_index = None;
@@ -941,7 +941,7 @@ pub fn translate_drop_index(
     }
     // Return an error if the index is associated with a unique or primary key constraint.
     if let Some(ref idx) = maybe_index {
-        if idx.unique {
+        if idx.name.starts_with("sqlite_autoindex_") {
             return Err(crate::error::LimboError::InvalidArgument(
                 "index associated with UNIQUE or PRIMARY KEY constraint cannot be dropped"
                     .to_string(),
@@ -1125,28 +1125,31 @@ pub fn translate_optimize(
     if let Some(name) = idx_name {
         // Optimize a specific index
         let idx_name = normalize_ident(name.name.as_str());
+        let database_id = resolver.resolve_existing_index_database_id(&name)?;
         let mut found = false;
 
-        for val in resolver.schema().indexes.values() {
-            for idx in val {
-                if idx.name == idx_name {
-                    if idx.index_method.is_some() && !idx.is_backing_btree_index() {
-                        indexes_to_optimize.push(idx.clone());
-                    } else {
-                        // Not an index method index - nothing to optimize
-                        tracing::debug!(
-                            "OPTIMIZE INDEX: {} is not an index method index, nothing to optimize",
-                            idx_name
-                        );
+        resolver.with_schema(database_id, |schema| {
+            for val in schema.indexes.values() {
+                for idx in val {
+                    if idx.name == idx_name {
+                        if idx.index_method.is_some() && !idx.is_backing_btree_index() {
+                            indexes_to_optimize.push((database_id, idx.clone()));
+                        } else {
+                            // Not an index method index - nothing to optimize
+                            tracing::debug!(
+                                "OPTIMIZE INDEX: {} is not an index method index, nothing to optimize",
+                                idx_name
+                            );
+                        }
+                        found = true;
+                        break;
                     }
-                    found = true;
+                }
+                if found {
                     break;
                 }
             }
-            if found {
-                break;
-            }
-        }
+        });
 
         if !found {
             return Err(LimboError::InvalidArgument(format!(
@@ -1154,13 +1157,17 @@ pub fn translate_optimize(
             )));
         }
     } else {
-        // Optimize all index method indexes
-        for val in resolver.schema().indexes.values() {
-            for idx in val {
-                if idx.index_method.is_some() && !idx.is_backing_btree_index() {
-                    indexes_to_optimize.push(idx.clone());
+        // Optimize all index method indexes across all visible databases.
+        for (database_id, _, _) in connection.list_all_databases() {
+            resolver.with_schema(database_id, |schema| {
+                for val in schema.indexes.values() {
+                    for idx in val {
+                        if idx.index_method.is_some() && !idx.is_backing_btree_index() {
+                            indexes_to_optimize.push((database_id, idx.clone()));
+                        }
+                    }
                 }
-            }
+            });
         }
 
         if indexes_to_optimize.is_empty() {
@@ -1170,10 +1177,10 @@ pub fn translate_optimize(
     }
 
     // Emit optimize instructions for each index method index
-    for idx in &indexes_to_optimize {
+    for (database_id, idx) in &indexes_to_optimize {
         let cursor_id = program.alloc_cursor_index(None, idx)?;
         program.emit_insn(Insn::IndexMethodOptimize {
-            db: crate::MAIN_DB_ID,
+            db: *database_id,
             cursor_id,
         });
     }

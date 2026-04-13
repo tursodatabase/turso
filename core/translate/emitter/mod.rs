@@ -9,9 +9,10 @@ use crate::translate::main_loop::SemiAntiJoinMetadata;
 use crate::sync::Arc;
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use std::borrow::Cow;
-use turso_macros::match_ignore_ascii_case;
+use std::cell::RefCell;
+use turso_macros::turso_assert_ne;
 
-use super::expr::{emit_table_column, translate_expr};
+use super::expr::{emit_table_column, translate_expr, ExprAffinityInfo};
 use super::group_by::GroupByMetadata;
 use super::main_loop::{LeftJoinMetadata, LoopLabels};
 use super::order_by::SortMetadata;
@@ -30,7 +31,9 @@ use crate::translate::expr::{
 use crate::translate::plan::{JoinedTable, NonFromClauseSubquery, Plan, ResultSetColumn};
 use crate::translate::planner::TableMask;
 use crate::translate::planner::ROWID_STRS;
-use crate::translate::trigger_exec::get_relevant_triggers_type_and_time;
+pub use crate::translate::trigger_exec::{
+    get_triggers_including_temp, has_triggers_including_temp,
+};
 use crate::translate::window::WindowMetadata;
 use crate::util::{
     check_expr_references_column, exprs_are_equivalent, normalize_ident, parse_numeric_literal,
@@ -128,7 +131,9 @@ impl From<bool> for DoubleQuotedDml {
 pub struct Resolver<'a> {
     schema: &'a Schema,
     database_schemas: &'a RwLock<HashMap<usize, Arc<Schema>>>,
+    temp_database: &'a RwLock<Option<crate::connection::TempDatabase>>,
     attached_databases: &'a RwLock<DatabaseCatalog>,
+    non_main_schema_cache: RefCell<HashMap<usize, Arc<Schema>>>,
     pub symbol_table: &'a SymbolTable,
     pub expr_to_reg_cache_enabled: bool,
     /// Cache entries for previously translated expressions.
@@ -142,14 +147,31 @@ pub struct Resolver<'a> {
     /// mechanism, but operates as a side-channel since limbo rewrites the AST rather
     /// than redirecting column reads at codegen time.
     pub register_affinities: HashMap<usize, Affinity>,
+    /// Affinity metadata for planned scalar subqueries keyed by their internal ID.
+    /// This lets comparison affinity follow SQLite rules for expressions like
+    /// `(SELECT text_col FROM ...) > some_numeric_expr`.
+    pub(crate) subquery_affinities: RefCell<HashMap<TableInternalId, ExprAffinityInfo>>,
     pub enable_custom_types: bool,
     /// Controls whether unresolved double-quoted identifiers fall back to string
     /// literals (SQLite's DQS misfeature) in DML statements.
     pub dqs_dml: DoubleQuotedDml,
     /// When set, we are compiling a trigger subprogram for this database.
-    /// All table references must resolve to this same database; cross-database
-    /// references are forbidden (matching SQLite's behavior).
+    /// Ordinary triggers are restricted to their own database, but temp-backed
+    /// triggers follow SQLite's looser resolution rules and may access objects
+    /// across schemas.
     pub(crate) trigger_context: Option<TriggerDatabaseContext>,
+    /// Cached flag: true when this connection has an active temp database.
+    ///
+    /// Computed once at Resolver construction to avoid repeated
+    /// `RwLock` reads on every table-name resolution. Safe because a
+    /// `Resolver` is short-lived (single translate pass) and a
+    /// connection is single-threaded at the VDBE layer: the temp
+    /// database can only be initialized / torn down *between*
+    /// Resolvers on the same connection, not during. If you add a
+    /// path that can initialize the temp database *inside* translate
+    /// (e.g. via a nested sub-program), update this field on that
+    /// path or switch to a live read.
+    has_temp_schema: bool,
 }
 
 /// Context for restricting table resolution during trigger subprogram compilation.
@@ -161,6 +183,12 @@ pub(crate) struct TriggerDatabaseContext {
     trigger_name: String,
 }
 
+impl TriggerDatabaseContext {
+    fn restricts_db_references(&self) -> bool {
+        self.database_id != crate::TEMP_DB_ID
+    }
+}
+
 impl<'a> Resolver<'a> {
     const MAIN_DB: &'static str = "main";
     const TEMP_DB: &'static str = "temp";
@@ -168,22 +196,28 @@ impl<'a> Resolver<'a> {
     pub(crate) fn new(
         schema: &'a Schema,
         database_schemas: &'a RwLock<HashMap<usize, Arc<Schema>>>,
+        temp_database: &'a RwLock<Option<crate::connection::TempDatabase>>,
         attached_databases: &'a RwLock<DatabaseCatalog>,
         symbol_table: &'a SymbolTable,
         enable_custom_types: bool,
         dqs_dml: DoubleQuotedDml,
     ) -> Self {
+        let has_temp_schema = temp_database.read().is_some();
         Self {
             schema,
             database_schemas,
+            temp_database,
             attached_databases,
+            non_main_schema_cache: RefCell::new(HashMap::default()),
             symbol_table,
             expr_to_reg_cache_enabled: false,
             expr_to_reg_cache: Vec::new(),
             register_affinities: HashMap::default(),
+            subquery_affinities: RefCell::new(HashMap::default()),
             enable_custom_types,
             dqs_dml,
             trigger_context: None,
+            has_temp_schema,
         }
     }
 
@@ -191,18 +225,26 @@ impl<'a> Resolver<'a> {
         self.schema
     }
 
+    pub fn has_temp_database(&self) -> bool {
+        self.has_temp_schema
+    }
+
     pub fn fork(&self) -> Resolver<'a> {
         Resolver {
             schema: self.schema,
             database_schemas: self.database_schemas,
+            temp_database: self.temp_database,
             attached_databases: self.attached_databases,
+            non_main_schema_cache: RefCell::new(HashMap::default()),
             symbol_table: self.symbol_table,
             expr_to_reg_cache_enabled: false,
             expr_to_reg_cache: Vec::new(),
             register_affinities: HashMap::default(),
+            subquery_affinities: RefCell::new(self.subquery_affinities.borrow().clone()),
             enable_custom_types: self.enable_custom_types,
             dqs_dml: self.dqs_dml,
             trigger_context: self.trigger_context.clone(),
+            has_temp_schema: self.has_temp_schema,
         }
     }
 
@@ -210,14 +252,18 @@ impl<'a> Resolver<'a> {
         Resolver {
             schema: self.schema,
             database_schemas: self.database_schemas,
+            temp_database: self.temp_database,
             attached_databases: self.attached_databases,
+            non_main_schema_cache: RefCell::new(HashMap::default()),
             symbol_table: self.symbol_table,
             expr_to_reg_cache_enabled: self.expr_to_reg_cache_enabled,
             expr_to_reg_cache: self.expr_to_reg_cache.clone(),
             register_affinities: self.register_affinities.clone(),
+            subquery_affinities: RefCell::new(self.subquery_affinities.borrow().clone()),
             enable_custom_types: self.enable_custom_types,
             dqs_dml: self.dqs_dml,
             trigger_context: self.trigger_context.clone(),
+            has_temp_schema: self.has_temp_schema,
         }
     }
 
@@ -226,6 +272,53 @@ impl<'a> Resolver<'a> {
             crate::bail_parse_error!("{} require --experimental-custom-types flag", feature);
         }
         Ok(())
+    }
+
+    fn cached_non_main_schema(&self, database_id: usize) -> Arc<Schema> {
+        turso_assert_ne!(database_id, crate::MAIN_DB_ID);
+
+        if let Some(schema) = self
+            .non_main_schema_cache
+            .borrow()
+            .get(&database_id)
+            .cloned()
+        {
+            return schema;
+        }
+
+        // TEMP uses `temp_db.db.schema` as its single source of truth; skip
+        // `database_schemas` which is never populated for TEMP.
+        if database_id != crate::TEMP_DB_ID {
+            if let Some(schema) = self.database_schemas.read().get(&database_id).cloned() {
+                self.non_main_schema_cache
+                    .borrow_mut()
+                    .insert(database_id, schema.clone());
+                return schema;
+            }
+        }
+
+        let loaded_schema = match database_id {
+            crate::TEMP_DB_ID => self
+                .temp_database
+                .read()
+                .as_ref()
+                .map(|temp_db| temp_db.db.schema.lock().clone())
+                .unwrap_or_else(|| Arc::new(Schema::with_options(self.enable_custom_types))),
+            _ => {
+                let attached_dbs = self.attached_databases.read();
+                let (db, _pager) = attached_dbs
+                    .index_to_data
+                    .get(&database_id)
+                    .expect("Database ID should be valid after resolve_database_id");
+                let schema = db.schema.lock().clone();
+                schema
+            }
+        };
+
+        self.non_main_schema_cache
+            .borrow_mut()
+            .insert(database_id, loaded_schema.clone());
+        loaded_schema
     }
 
     /// Set trigger database context to restrict table resolution to the trigger's database.
@@ -302,40 +395,161 @@ impl<'a> Resolver<'a> {
 
     /// Access schema for a database using a closure pattern to avoid cloning
     pub(crate) fn with_schema<T>(&self, database_id: usize, f: impl FnOnce(&Schema) -> T) -> T {
-        if database_id == crate::MAIN_DB_ID || database_id == crate::TEMP_DB_ID {
-            f(self.schema)
-        } else {
-            // Attached database: prefer the connection-local copy (which may contain
-            // uncommitted schema changes from this connection's transaction), falling
-            // back to the shared Database schema (last committed state).
-            let schemas = self.database_schemas.read();
-            if let Some(local_schema) = schemas.get(&database_id) {
-                return f(local_schema);
+        match database_id {
+            crate::MAIN_DB_ID => f(self.schema),
+            _ => {
+                let schema = self.cached_non_main_schema(database_id);
+                f(&schema)
             }
-            drop(schemas);
-
-            let attached_dbs = self.attached_databases.read();
-            let (db, _pager) = attached_dbs
-                .index_to_data
-                .get(&database_id)
-                .expect("Database ID should be valid after resolve_database_id");
-
-            let schema = db.schema.lock().clone();
-            f(&schema)
         }
+    }
+
+    pub(crate) fn attached_database_ids_in_search_order(&self) -> Vec<usize> {
+        let mut database_ids: Vec<_> = self
+            .attached_databases
+            .read()
+            .index_to_data
+            .keys()
+            .copied()
+            .collect();
+        database_ids.sort_unstable();
+        database_ids
+    }
+
+    fn resolve_unqualified_existing_database_id<F>(
+        &self,
+        object_name: &str,
+        schema_contains_object: F,
+    ) -> usize
+    where
+        F: Fn(&Schema, &str) -> bool,
+    {
+        // Only check the temp schema when a temp database actually exists.
+        // This avoids expensive schema construction/lookup on every table
+        // resolution when no temp objects have been created.
+        if self.has_temp_schema
+            && self.with_schema(crate::TEMP_DB_ID, |schema| {
+                schema_contains_object(schema, object_name)
+            })
+        {
+            return crate::TEMP_DB_ID;
+        }
+
+        if self.with_schema(crate::MAIN_DB_ID, |schema| {
+            schema_contains_object(schema, object_name)
+        }) {
+            return crate::MAIN_DB_ID;
+        }
+
+        for database_id in self.attached_database_ids_in_search_order() {
+            if self.with_schema(database_id, |schema| {
+                schema_contains_object(schema, object_name)
+            }) {
+                return database_id;
+            }
+        }
+
+        crate::MAIN_DB_ID
+    }
+
+    fn schema_has_table_like_object(schema: &Schema, table_name: &str) -> bool {
+        schema.get_table(table_name).is_some()
+            || schema.get_view(table_name).is_some()
+            || schema.get_materialized_view(table_name).is_some()
+    }
+
+    fn schema_has_index(schema: &Schema, index_name: &str) -> bool {
+        schema
+            .indexes
+            .values()
+            .flat_map(|indexes| indexes.iter())
+            .any(|index| index.name.eq_ignore_ascii_case(index_name))
+    }
+
+    fn schema_has_trigger(schema: &Schema, trigger_name: &str) -> bool {
+        schema.get_trigger(trigger_name).is_some()
+    }
+
+    fn resolve_schema_table_database_id(table_name: &str) -> Option<usize> {
+        if table_name.eq_ignore_ascii_case(crate::schema::TEMP_SCHEMA_TABLE_NAME)
+            || table_name.eq_ignore_ascii_case(crate::schema::TEMP_SCHEMA_TABLE_NAME_ALT)
+        {
+            return Some(crate::TEMP_DB_ID);
+        }
+
+        if table_name.eq_ignore_ascii_case(crate::schema::SCHEMA_TABLE_NAME)
+            || table_name.eq_ignore_ascii_case(crate::schema::SCHEMA_TABLE_NAME_ALT)
+        {
+            return Some(crate::MAIN_DB_ID);
+        }
+
+        None
+    }
+
+    pub(crate) fn resolve_existing_table_database_id_qualified(
+        &self,
+        qualified_name: &ast::QualifiedName,
+    ) -> Result<usize> {
+        if qualified_name.db_name.is_some() {
+            return self.resolve_database_id(qualified_name);
+        }
+        self.resolve_existing_table_database_id(qualified_name.name.as_str())
+    }
+
+    pub(crate) fn resolve_existing_table_database_id(&self, table_name: &str) -> Result<usize> {
+        if let Some(ref ctx) = self.trigger_context {
+            if ctx.restricts_db_references() {
+                return Ok(ctx.database_id);
+            }
+
+            return Ok(self.resolve_unqualified_existing_database_id(
+                table_name,
+                Self::schema_has_table_like_object,
+            ));
+        }
+
+        if let Some(database_id) = Self::resolve_schema_table_database_id(table_name) {
+            return Ok(database_id);
+        }
+
+        Ok(self.resolve_unqualified_existing_database_id(
+            table_name,
+            Self::schema_has_table_like_object,
+        ))
+    }
+
+    pub(crate) fn resolve_existing_index_database_id(
+        &self,
+        qualified_name: &ast::QualifiedName,
+    ) -> Result<usize> {
+        if qualified_name.db_name.is_some() {
+            return self.resolve_database_id(qualified_name);
+        }
+
+        let index_name = normalize_ident(qualified_name.name.as_str());
+        Ok(self.resolve_unqualified_existing_database_id(&index_name, Self::schema_has_index))
+    }
+
+    pub(crate) fn resolve_existing_trigger_database_id(
+        &self,
+        qualified_name: &ast::QualifiedName,
+    ) -> Result<usize> {
+        if qualified_name.db_name.is_some() {
+            return self.resolve_database_id(qualified_name);
+        }
+
+        let trigger_name = qualified_name.name.as_str();
+        Ok(self.resolve_unqualified_existing_database_id(trigger_name, Self::schema_has_trigger))
     }
 
     /// Resolve database ID from a qualified name
     pub(crate) fn resolve_database_id(&self, qualified_name: &ast::QualifiedName) -> Result<usize> {
-        use crate::util::normalize_ident;
-
         // Check if this is a qualified name (database.table) or unqualified
         let resolved_id = if let Some(db_name) = &qualified_name.db_name {
             let db_name_normalized = normalize_ident(db_name.as_str());
-            let name_bytes = db_name_normalized.as_bytes();
-            match_ignore_ascii_case!(match name_bytes {
-                b"main" => Ok(0),
-                b"temp" => Ok(1),
+            match db_name_normalized.as_str() {
+                "main" => Ok(0),
+                "temp" => Ok(1),
                 _ => {
                     // Look up attached database
                     if let Some((idx, _attached_db)) =
@@ -348,13 +562,17 @@ impl<'a> Resolver<'a> {
                         )))
                     }
                 }
-            })
+            }
         } else {
             // Unqualified table name — when compiling a trigger subprogram,
             // resolve to the trigger's database (matching SQLite behavior).
             // Otherwise default to main.
             if let Some(ref ctx) = self.trigger_context {
-                Ok(ctx.database_id)
+                if ctx.restricts_db_references() {
+                    Ok(ctx.database_id)
+                } else {
+                    Ok(crate::MAIN_DB_ID)
+                }
             } else {
                 Ok(0)
             }
@@ -364,6 +582,9 @@ impl<'a> Resolver<'a> {
         // This only fires for explicitly qualified names (e.g. "aux.table")
         // since unqualified names already resolve to the trigger's database above.
         if let Some(ref ctx) = self.trigger_context {
+            if !ctx.restricts_db_references() {
+                return Ok(resolved_id);
+            }
             if resolved_id != ctx.database_id {
                 let db_name = qualified_name
                     .db_name

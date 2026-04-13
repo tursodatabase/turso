@@ -962,14 +962,14 @@ impl Limbo {
                 let output_mode = self.opts.output_mode;
 
                 match (output_mode, query_mode) {
+                    (OutputMode::List, _) => {
+                        self.print_list_mode(rows, statistics)?;
+                    }
                     (_, QueryMode::ExplainQueryPlan) => {
                         self.print_explain_query_plan(rows, statistics)?;
                     }
                     (_, QueryMode::Explain) => {
                         self.print_explain(rows, statistics)?;
-                    }
-                    (OutputMode::List, _) => {
-                        self.print_list_mode(rows, statistics)?;
                     }
                     (OutputMode::Pretty, _) => {
                         self.print_pretty_mode(rows, statistics)?;

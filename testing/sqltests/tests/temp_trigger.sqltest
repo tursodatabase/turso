@@ -1,0 +1,193 @@
+@database :memory:
+@requires-file trigger "temp trigger tests require trigger support"
+
+# CREATE TEMP TRIGGER on a main table (INSERT)
+test temp-trigger-insert-on-main-table {
+    CREATE TABLE t1 (id INTEGER PRIMARY KEY, val TEXT);
+    CREATE TABLE t1_log (msg TEXT);
+    CREATE TEMP TRIGGER tr_t1_insert BEFORE INSERT ON t1 BEGIN
+        INSERT INTO t1_log VALUES ('inserting ' || NEW.val);
+    END;
+    INSERT INTO t1 VALUES (1, 'hello');
+    SELECT * FROM t1_log;
+}
+expect {
+    inserting hello
+}
+
+# Temp trigger lives in temp schema, not main
+test temp-trigger-in-temp-schema {
+    CREATE TABLE t2 (x INTEGER);
+    CREATE TEMP TRIGGER tr_t2 BEFORE INSERT ON t2 BEGIN SELECT 1; END;
+    SELECT count(*) FROM sqlite_schema WHERE type='trigger' AND name='tr_t2';
+    SELECT count(*) FROM temp.sqlite_schema WHERE type='trigger' AND name='tr_t2';
+}
+expect {
+    0
+    1
+}
+
+# TEMP TRIGGER on a temp table (INSERT)
+test temp-trigger-on-temp-table {
+    CREATE TEMP TABLE tt1 (id INTEGER PRIMARY KEY, val TEXT);
+    CREATE TEMP TABLE tt1_log (msg TEXT);
+    CREATE TEMP TRIGGER tr_tt1_insert BEFORE INSERT ON tt1 BEGIN
+        INSERT INTO tt1_log VALUES ('temp: ' || NEW.val);
+    END;
+    INSERT INTO tt1 VALUES (1, 'world');
+    SELECT * FROM tt1_log;
+}
+expect {
+    temp: world
+}
+
+# TEMP TRIGGER fires on UPDATE
+test temp-trigger-update-on-main-table {
+    CREATE TABLE t3 (id INTEGER PRIMARY KEY, val TEXT);
+    CREATE TABLE t3_log (msg TEXT);
+    CREATE TEMP TRIGGER tr_t3_update AFTER UPDATE ON t3 BEGIN
+        INSERT INTO t3_log VALUES ('updated ' || OLD.val || ' -> ' || NEW.val);
+    END;
+    INSERT INTO t3 VALUES (1, 'old');
+    UPDATE t3 SET val = 'new' WHERE id = 1;
+    SELECT * FROM t3_log;
+}
+expect {
+    updated old -> new
+}
+
+# TEMP TRIGGER fires on DELETE
+test temp-trigger-delete-on-main-table {
+    CREATE TABLE t4 (id INTEGER PRIMARY KEY, val TEXT);
+    CREATE TABLE t4_log (msg TEXT);
+    CREATE TEMP TRIGGER tr_t4_delete BEFORE DELETE ON t4 BEGIN
+        INSERT INTO t4_log VALUES ('deleting ' || OLD.val);
+    END;
+    INSERT INTO t4 VALUES (1, 'bye');
+    DELETE FROM t4 WHERE id = 1;
+    SELECT * FROM t4_log;
+}
+expect {
+    deleting bye
+}
+
+# TEMP TRIGGER referencing both temp and main tables in body
+test temp-trigger-cross-db-body {
+    CREATE TABLE t5 (id INTEGER PRIMARY KEY, val TEXT);
+    CREATE TEMP TABLE temp_audit (msg TEXT);
+    CREATE TEMP TRIGGER tr_t5_audit AFTER INSERT ON t5 BEGIN
+        INSERT INTO temp_audit VALUES ('main insert: ' || NEW.val);
+    END;
+    INSERT INTO t5 VALUES (1, 'cross');
+    SELECT * FROM temp_audit;
+}
+expect {
+    main insert: cross
+}
+
+# DROP TEMP TRIGGER
+test temp-trigger-drop {
+    CREATE TABLE t6 (id INTEGER PRIMARY KEY, val TEXT);
+    CREATE TABLE t6_log (msg TEXT);
+    CREATE TEMP TRIGGER tr_t6 BEFORE INSERT ON t6 BEGIN
+        INSERT INTO t6_log VALUES ('fired');
+    END;
+    INSERT INTO t6 VALUES (1, 'a');
+    DROP TRIGGER tr_t6;
+    INSERT INTO t6 VALUES (2, 'b');
+    SELECT * FROM t6_log;
+}
+expect {
+    fired
+}
+
+# DROP TABLE also removes temp triggers that target the dropped table (matching SQLite)
+test temp-trigger-orphan-on-drop-table {
+    CREATE TABLE t7 (id INTEGER PRIMARY KEY);
+    CREATE TEMP TRIGGER tr_t7 BEFORE INSERT ON t7 BEGIN SELECT 1; END;
+    DROP TABLE t7;
+    SELECT count(*) FROM temp.sqlite_schema WHERE type='trigger' AND name='tr_t7';
+}
+expect {
+    0
+}
+
+# CREATE TEMP TRIGGER IF NOT EXISTS
+test temp-trigger-if-not-exists {
+    CREATE TABLE t8 (x INTEGER);
+    CREATE TEMP TRIGGER IF NOT EXISTS tr_t8 BEFORE INSERT ON t8 BEGIN SELECT 1; END;
+    CREATE TEMP TRIGGER IF NOT EXISTS tr_t8 BEFORE INSERT ON t8 BEGIN SELECT 1; END;
+    SELECT count(*) FROM temp.sqlite_schema WHERE type='trigger' AND name='tr_t8';
+}
+expect {
+    1
+}
+
+# Multiple temp triggers on same table
+test temp-trigger-multiple-on-same-table {
+    CREATE TABLE t9 (id INTEGER PRIMARY KEY, val TEXT);
+    CREATE TABLE t9_log (msg TEXT);
+    CREATE TEMP TRIGGER tr_t9a BEFORE INSERT ON t9 BEGIN
+        INSERT INTO t9_log VALUES ('before');
+    END;
+    CREATE TEMP TRIGGER tr_t9b AFTER INSERT ON t9 BEGIN
+        INSERT INTO t9_log VALUES ('after');
+    END;
+    INSERT INTO t9 VALUES (1, 'test');
+    SELECT * FROM t9_log ORDER BY rowid;
+}
+expect {
+    before
+    after
+}
+
+# Temp trigger with WHEN clause
+test temp-trigger-when-clause {
+    CREATE TABLE t10 (id INTEGER PRIMARY KEY, val INTEGER);
+    CREATE TABLE t10_log (msg TEXT);
+    CREATE TEMP TRIGGER tr_t10 BEFORE INSERT ON t10 WHEN NEW.val > 10 BEGIN
+        INSERT INTO t10_log VALUES ('big value: ' || NEW.val);
+    END;
+    INSERT INTO t10 VALUES (1, 5);
+    INSERT INTO t10 VALUES (2, 15);
+    SELECT * FROM t10_log;
+}
+expect {
+    big value: 15
+}
+
+#  regression: DROP TABLE main.t must not wipe temp triggers
+# that target temp.t. `remove_triggers_for_table` used to key only on
+# the table name, so a temp trigger trying to follow `temp.t` was
+# removed along with the main.t drop.
+test drop-table-main-preserves-temp-trigger-on-temp-shadow {
+    CREATE TABLE drop_t1 (x INTEGER);
+    CREATE TEMP TABLE drop_t1 (y INTEGER);
+    CREATE TEMP TRIGGER drop_tr_main AFTER INSERT ON main.drop_t1 BEGIN SELECT 1; END;
+    CREATE TEMP TRIGGER drop_tr_temp AFTER INSERT ON temp.drop_t1 BEGIN SELECT 2; END;
+    DROP TABLE main.drop_t1;
+    SELECT name FROM temp.sqlite_schema
+        WHERE type='trigger' AND name LIKE 'drop_tr_%' ORDER BY name;
+}
+expect {
+    drop_tr_temp
+}
+
+# regression: the temp.sqlite_schema cleanup loop emitted for
+# `DROP TABLE main.t` must filter by `type='trigger'`. Without the filter
+# it deletes any row whose `tbl_name` matches — including the shadow
+# temp table, its sqlite_autoindex rows, and user temp indexes — leaving
+# on-disk temp.sqlite_schema out of sync with the in-memory temp schema.
+test drop-table-main-preserves-temp-shadow-table-and-indexes {
+    CREATE TABLE drop_b (x INTEGER);
+    CREATE TEMP TABLE drop_b (y INTEGER);
+    CREATE INDEX temp.drop_b_idx ON drop_b (y);
+    DROP TABLE main.drop_b;
+    SELECT type, name FROM temp.sqlite_schema
+        WHERE tbl_name = 'drop_b' ORDER BY type, name;
+    SELECT y FROM temp.drop_b;
+}
+expect {
+    index|drop_b_idx
+    table|drop_b
+}

@@ -390,11 +390,16 @@ pub struct CreateTableStatement {
     pub columns: Vec<ColumnDef>,
     pub if_not_exists: bool,
     pub strict: bool,
+    pub temporary: Option<TemporaryKeyword>,
 }
 
 impl fmt::Display for CreateTableStatement {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "CREATE TABLE ")?;
+        write!(f, "CREATE ")?;
+        if let Some(keyword) = self.temporary {
+            write!(f, "{keyword} ")?;
+        }
+        write!(f, "TABLE ")?;
 
         if self.if_not_exists {
             write!(f, "IF NOT EXISTS ")?;
@@ -410,6 +415,49 @@ impl fmt::Display for CreateTableStatement {
         }
 
         Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TemporaryKeyword {
+    Temp,
+    Temporary,
+}
+
+impl TemporaryKeyword {
+    /// Pick a keyword from a proptest-driven boolean. Callers should
+    /// thread an `any::<bool>()` through their `prop_flat_map` /
+    /// `prop_map` tuples so the proptest RNG (and therefore replay
+    /// and shrinking) drives the choice. An earlier version of this
+    /// function read the wall clock, which broke determinism.
+    pub fn from_bool(use_long: bool) -> Self {
+        if use_long {
+            TemporaryKeyword::Temporary
+        } else {
+            TemporaryKeyword::Temp
+        }
+    }
+}
+
+impl proptest::arbitrary::Arbitrary for TemporaryKeyword {
+    type Parameters = ();
+    type Strategy = proptest::strategy::BoxedStrategy<Self>;
+
+    fn arbitrary_with(_: Self::Parameters) -> Self::Strategy {
+        proptest::prop_oneof![
+            proptest::strategy::Just(TemporaryKeyword::Temp),
+            proptest::strategy::Just(TemporaryKeyword::Temporary),
+        ]
+        .boxed()
+    }
+}
+
+impl fmt::Display for TemporaryKeyword {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            TemporaryKeyword::Temp => write!(f, "TEMP"),
+            TemporaryKeyword::Temporary => write!(f, "TEMPORARY"),
+        }
     }
 }
 
@@ -663,8 +711,22 @@ pub fn create_table(
     schema: &Schema,
     profile: &StatementProfile,
 ) -> BoxedStrategy<CreateTableStatement> {
-    let existing_names = schema.table_names();
     let attached_databases = schema.attached_databases.clone();
+    let mut database_choices = vec![None, Some("temp".to_string())];
+    for db in attached_databases {
+        if db == "temp" {
+            continue;
+        }
+        database_choices.push(Some(db));
+    }
+    let target_databases: Vec<(Option<String>, std::collections::HashSet<String>)> =
+        database_choices
+            .into_iter()
+            .map(|db| {
+                let existing_names = schema.table_names_in_database(db.as_deref());
+                (db, existing_names)
+            })
+            .collect();
 
     // Extract profile values from the CreateTableProfile
     let create_table_profile = profile.create_table_profile();
@@ -674,18 +736,41 @@ pub fn create_table(
     let if_not_exists_prob = create_table_profile.if_not_exists_probability;
     let strict_prob = create_table_profile.strict_probability;
 
-    (
-        identifier_excluding(existing_names),
-        if_not_exists_with_probability(if_not_exists_prob),
-        (0u8..100),
-        optional_primary_key(&pk_profile),
-        proptest::collection::vec(column_def_with_profile(&column_profile), column_count_range),
-        // 50% chance of targeting an attached database when available
-        any::<proptest::sample::Index>(),
-    )
+    any::<proptest::sample::Index>()
+        .prop_flat_map(move |db_idx| {
+            let (target_db, existing_names) =
+                target_databases[db_idx.index(target_databases.len())].clone();
+
+            (
+                Just(target_db),
+                identifier_excluding(existing_names),
+                if_not_exists_with_probability(if_not_exists_prob),
+                (0u8..100),
+                // Proptest-driven keyword choice (TEMP vs TEMPORARY)
+                // so replay and shrinking are deterministic.
+                any::<bool>(),
+                optional_primary_key(&pk_profile),
+                proptest::collection::vec(
+                    column_def_with_profile(&column_profile),
+                    column_count_range.clone(),
+                ),
+            )
+        })
         .prop_map(
-            move |(table_name, if_not_exists, strict_roll, pk_col, other_cols, db_idx)| {
+            move |(
+                target_db,
+                table_name,
+                if_not_exists,
+                strict_roll,
+                temp_keyword_long,
+                pk_col,
+                other_cols,
+            )| {
                 let strict = strict_roll < strict_prob;
+                let temporary = match target_db.as_deref() {
+                    Some("temp") => Some(TemporaryKeyword::from_bool(temp_keyword_long)),
+                    _ => None,
+                };
 
                 let mut columns = Vec::with_capacity(other_cols.len() + 1);
                 if let Some(pk) = pk_col {
@@ -716,20 +801,10 @@ pub fn create_table(
                     }
                 }
 
-                // Optionally qualify the table name with an attached database.
-                // We use a list of [None, Some("aux"), ...] to give ~50% chance to main.
-                let qualified_name = if attached_databases.is_empty() {
-                    table_name
-                } else {
-                    let mut choices: Vec<Option<&str>> = vec![None];
-                    for db in &attached_databases {
-                        choices.push(Some(db.as_str()));
-                    }
-                    let choice = db_idx.index(choices.len());
-                    match choices[choice] {
-                        Some(db) => format!("{db}.{table_name}"),
-                        None => table_name,
-                    }
+                let qualified_name = match target_db.as_deref() {
+                    Some("temp") => table_name,
+                    Some(db) => format!("{db}.{table_name}"),
+                    None => table_name,
                 };
 
                 CreateTableStatement {
@@ -737,6 +812,7 @@ pub fn create_table(
                     columns,
                     if_not_exists,
                     strict,
+                    temporary,
                 }
             },
         )
@@ -789,6 +865,7 @@ mod tests {
             ],
             if_not_exists: false,
             strict: false,
+            temporary: None,
         };
 
         assert_eq!(
@@ -812,11 +889,36 @@ mod tests {
             }],
             if_not_exists: true,
             strict: false,
+            temporary: None,
         };
 
         assert_eq!(
             stmt.to_string(),
             "CREATE TABLE IF NOT EXISTS test (id INTEGER PRIMARY KEY)"
+        );
+    }
+
+    #[test]
+    fn test_create_temp_table_display() {
+        let stmt = CreateTableStatement {
+            table_name: "tmp_users".to_string(),
+            columns: vec![ColumnDef {
+                name: "id".to_string(),
+                data_type: DataType::Integer,
+                nullable: false,
+                primary_key: true,
+                unique: false,
+                default: None,
+                check_constraint: None,
+            }],
+            if_not_exists: false,
+            strict: false,
+            temporary: Some(TemporaryKeyword::Temporary),
+        };
+
+        assert_eq!(
+            stmt.to_string(),
+            "CREATE TEMPORARY TABLE tmp_users (id INTEGER PRIMARY KEY)"
         );
     }
 
@@ -930,7 +1032,7 @@ mod tests {
             )
         ) {
             let sql = stmt.to_string();
-            prop_assert!(sql.starts_with("CREATE TABLE"));
+            prop_assert!(sql.starts_with("CREATE "));
             // Strict profile should have primary key
             prop_assert!(stmt.columns.iter().any(|c| c.primary_key));
         }

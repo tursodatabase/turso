@@ -210,7 +210,7 @@ impl fmt::Display for AlterTableStatement {
 /// Generate an ALTER TABLE RENAME TO statement.
 pub fn alter_table_rename_to(table: &Table, schema: &Schema) -> BoxedStrategy<AlterTableStatement> {
     let table_name = table.qualified_name();
-    let existing_names = schema.table_names();
+    let existing_names = schema.table_names_in_database(table.database.as_deref());
     identifier_excluding(existing_names)
         .prop_map(move |new_name| AlterTableStatement {
             table_name: table_name.clone(),

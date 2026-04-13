@@ -101,13 +101,11 @@ impl InitLoop {
             if !required_tables.contains(&table_index) {
                 continue;
             }
-            // Ensure attached databases have a Transaction instruction for read access
-            if crate::is_attached_db(table.database_id) {
-                let schema_cookie = t_ctx
-                    .resolver
-                    .with_schema(table.database_id, |s| s.schema_version);
-                program.begin_read_on_database(table.database_id, schema_cookie);
-            }
+            // Ensure non-main databases have a Transaction instruction for read access.
+            let schema_cookie = t_ctx
+                .resolver
+                .with_schema(table.database_id, |s| s.schema_version);
+            program.begin_read_on_database(table.database_id, schema_cookie);
             // Initialize bookkeeping for OUTER JOIN
             if let Some(join_info) = table.join_info.as_ref() {
                 if join_info.is_outer() {

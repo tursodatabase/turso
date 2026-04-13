@@ -37,8 +37,7 @@ use crate::{
             plan_subqueries_from_returning,
         },
         trigger_exec::{
-            fire_trigger, get_relevant_triggers_type_and_time, has_relevant_triggers_type_only,
-            TriggerContext,
+            fire_trigger, get_triggers_including_temp, has_triggers_including_temp, TriggerContext,
         },
         upsert::{
             collect_set_clauses_for_upsert, emit_upsert, resolve_upsert_target,
@@ -69,6 +68,7 @@ fn validate(
     table_name: &str,
     resolver: &Resolver,
     table: &Table,
+    database_id: usize,
     conn: &Arc<Connection>,
 ) -> Result<()> {
     // Check if this is a system table that should be protected from direct writes
@@ -101,7 +101,9 @@ fn validate(
     if table.btree().is_some_and(|t| !t.has_rowid) {
         crate::bail_parse_error!("INSERT into WITHOUT ROWID table is not supported");
     }
-    if table.btree().is_some_and(|t| t.has_autoincrement) && conn.mvcc_enabled() {
+    if table.btree().is_some_and(|t| t.has_autoincrement)
+        && conn.mv_store_for_db(database_id).is_some()
+    {
         crate::bail_parse_error!(
             "AUTOINCREMENT is not supported in MVCC mode (journal_mode=experimental_mvcc)"
         );
@@ -282,7 +284,7 @@ pub fn translate_insert(
         // for RETURNING clause subqueries - handled below via with_for_returning.
     }
 
-    let database_id = resolver.resolve_database_id(&tbl_name)?;
+    let database_id = resolver.resolve_existing_table_database_id_qualified(&tbl_name)?;
     let table_name = &tbl_name.name;
     let table = match resolver.with_schema(database_id, |s| s.get_table(table_name.as_str())) {
         Some(table) => table,
@@ -291,7 +293,13 @@ pub fn translate_insert(
     if program.trigger.is_some() && table.virtual_table().is_some() {
         crate::bail_parse_error!("unsafe use of virtual table \"{}\"", tbl_name.name.as_str());
     }
-    validate(table_name.as_str(), resolver, &table, connection)?;
+    validate(
+        table_name.as_str(),
+        resolver,
+        &table,
+        database_id,
+        connection,
+    )?;
 
     let fk_enabled = connection.foreign_keys_enabled();
     if let Some(virtual_table) = &table.virtual_table() {
@@ -331,10 +339,8 @@ pub fn translate_insert(
 
     let cdc_table = prepare_cdc_if_necessary(program, resolver.schema(), table.get_name())?;
 
-    if crate::is_attached_db(database_id) {
-        let schema_cookie = resolver.with_schema(database_id, |s| s.schema_version);
-        program.begin_write_on_database(database_id, schema_cookie);
-    }
+    let schema_cookie = resolver.with_schema(database_id, |s| s.schema_version);
+    program.begin_write_on_database(database_id, schema_cookie);
 
     let mut table_references = TableReferences::new(
         vec![JoinedTable {
@@ -485,16 +491,14 @@ pub fn translate_insert(
 
     // Fire BEFORE INSERT triggers
 
-    let relevant_before_triggers: Vec<_> = resolver.with_schema(database_id, |s| {
-        get_relevant_triggers_type_and_time(
-            s,
-            TriggerEvent::Insert,
-            TriggerTime::Before,
-            None,
-            &btree_table,
-        )
-        .collect()
-    });
+    let relevant_before_triggers = get_triggers_including_temp(
+        resolver,
+        database_id,
+        TriggerEvent::Insert,
+        TriggerTime::Before,
+        None,
+        &btree_table,
+    );
 
     let has_before_triggers = !relevant_before_triggers.is_empty();
     if has_before_triggers {
@@ -887,16 +891,14 @@ pub fn translate_insert(
     });
 
     // Fire AFTER INSERT triggers
-    let relevant_after_triggers: Vec<_> = resolver.with_schema(database_id, |s| {
-        get_relevant_triggers_type_and_time(
-            s,
-            TriggerEvent::Insert,
-            TriggerTime::After,
-            None,
-            &btree_table,
-        )
-        .collect()
-    });
+    let relevant_after_triggers = get_triggers_including_temp(
+        resolver,
+        database_id,
+        TriggerEvent::Insert,
+        TriggerTime::After,
+        None,
+        &btree_table,
+    );
     let has_after_triggers = !relevant_after_triggers.is_empty();
     if has_after_triggers {
         compute_virtual_columns(
@@ -1995,9 +1997,13 @@ fn init_source_emission<'a>(
         }
     }
     // Check if INSERT triggers exist - if so, we need to use ephemeral table for VALUES with more than one row
-    let has_insert_triggers = resolver.with_schema(database_id, |s| {
-        has_relevant_triggers_type_only(s, TriggerEvent::Insert, None, ctx.table.as_ref())
-    });
+    let has_insert_triggers = has_triggers_including_temp(
+        resolver,
+        database_id,
+        TriggerEvent::Insert,
+        None,
+        ctx.table.as_ref(),
+    );
 
     let (num_values, cursor_id) = match body {
         InsertBody::Select(select, _) => {
@@ -3695,8 +3701,7 @@ fn emit_replace_delete_conflicting_row(
 
     for (name, _, index_cursor_id) in ctx.idx_cursors.iter() {
         let index = resolver
-            .schema()
-            .get_index(table_name, name)
+            .with_schema(ctx.database_id, |s| s.get_index(table_name, name).cloned())
             .expect("index to exist");
         let skip_delete_label = if index.where_clause.is_some() {
             let where_copy = index

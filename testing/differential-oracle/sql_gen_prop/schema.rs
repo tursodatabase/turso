@@ -118,7 +118,7 @@ impl fmt::Display for ColumnDef {
 pub struct Table {
     pub name: String,
     pub columns: Vec<ColumnDef>,
-    /// The database this table belongs to (e.g. "aux" for attached databases).
+    /// The database this table belongs to (e.g. "temp" or "aux").
     /// `None` means the main database.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub database: Option<String>,
@@ -152,6 +152,10 @@ impl Table {
         }
     }
 
+    pub fn unqualified_name(&self) -> &str {
+        &self.name
+    }
+
     /// Set the database this table belongs to.
     pub fn in_database(mut self, db: impl Into<String>) -> Self {
         self.database = Some(db.into());
@@ -178,6 +182,8 @@ pub struct Index {
     pub table_name: String,
     pub columns: Vec<String>,
     pub unique: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub database: Option<String>,
 }
 
 impl Index {
@@ -191,12 +197,25 @@ impl Index {
             table_name: table_name.into(),
             columns,
             unique: false,
+            database: None,
         }
     }
 
     pub fn unique(mut self) -> Self {
         self.unique = true;
         self
+    }
+
+    pub fn in_database(mut self, db: impl Into<String>) -> Self {
+        self.database = Some(db.into());
+        self
+    }
+
+    pub fn qualified_name(&self) -> String {
+        match &self.database {
+            Some(db) => format!("{}.{}", db, self.name),
+            None => self.name.clone(),
+        }
     }
 }
 
@@ -269,7 +288,9 @@ impl SchemaBuilder {
     }
 
     pub fn add_database(mut self, name: String) -> Self {
-        self.attached_databases.push(name);
+        if !self.attached_databases.contains(&name) {
+            self.attached_databases.push(name);
+        }
         self
     }
 
@@ -312,9 +333,25 @@ impl Schema {
         self.tables.iter().map(|t| t.name.clone()).collect()
     }
 
+    pub fn table_names_in_database(&self, database: Option<&str>) -> HashSet<String> {
+        self.tables
+            .iter()
+            .filter(|t| t.database.as_deref() == database)
+            .map(|t| t.name.clone())
+            .collect()
+    }
+
     /// Returns all index names in the schema.
     pub fn index_names(&self) -> HashSet<String> {
         self.indexes.iter().map(|i| i.name.clone()).collect()
+    }
+
+    pub fn index_names_in_database(&self, database: Option<&str>) -> HashSet<String> {
+        self.indexes
+            .iter()
+            .filter(|i| i.database.as_deref() == database)
+            .map(|i| i.name.clone())
+            .collect()
     }
 
     /// Returns all view names in the schema.
@@ -355,3 +392,48 @@ impl Schema {
 }
 
 // GENERATION
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn scoped_name_sets_keep_main_and_temp_separate() {
+        let schema = SchemaBuilder::new()
+            .add_database("temp".to_string())
+            .add_table(Table::new(
+                "shadowed",
+                vec![ColumnDef::new("id", DataType::Integer)],
+            ))
+            .add_table(
+                Table::new("shadowed", vec![ColumnDef::new("id", DataType::Integer)])
+                    .in_database("temp"),
+            )
+            .add_index(Index::new(
+                "shadowed_idx",
+                "shadowed",
+                vec!["id".to_string()],
+            ))
+            .add_index(
+                Index::new("shadowed_idx", "shadowed", vec!["id".to_string()]).in_database("temp"),
+            )
+            .build();
+
+        assert_eq!(
+            schema.table_names_in_database(None),
+            HashSet::from([String::from("shadowed")])
+        );
+        assert_eq!(
+            schema.table_names_in_database(Some("temp")),
+            HashSet::from([String::from("shadowed")])
+        );
+        assert_eq!(
+            schema.index_names_in_database(None),
+            HashSet::from([String::from("shadowed_idx")])
+        );
+        assert_eq!(
+            schema.index_names_in_database(Some("temp")),
+            HashSet::from([String::from("shadowed_idx")])
+        );
+    }
+}

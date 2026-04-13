@@ -1,0 +1,35 @@
+---
+source: schema.sqltest
+expression: |-
+  CREATE TRIGGER tr AFTER DELETE ON temp.t BEGIN
+          SELECT 1;
+      END;
+info:
+  statement_type: CREATE
+  tables:
+  - temp.t
+  setup_blocks:
+  - temp_trigger_table
+  database: ':memory:'
+---
+QUERY PLAN
+
+
+BYTECODE
+addr  opcode       p1  p2  p3  p4                                                              p5  comment
+   0  Init          0  13   0                                                                   0  Start at 13
+   1  OpenWrite     0   1   1                                                                   0  root=1; iDb=1
+   2  NewRowid      0   1   0                                                                   0  r[1]=rowid
+   3  String8       0   2   0  trigger                                                          0  r[2]='trigger'
+   4  String8       0   3   0  tr                                                               0  r[3]='tr'
+   5  String8       0   4   0  t                                                                0  r[4]='t'
+   6  Integer       0   5   0                                                                   0  r[5]=0
+   7  String8       0   6   0  CREATE TRIGGER tr AFTER DELETE ON "temp".t BEGIN SELECT 1; END   0  r[6]='CREATE TRIGGER tr AFTER DELETE ON "temp".t BEGIN SELECT 1; END'
+   8  MakeRecord    2   5   7                                                                   0  r[7]=mkrec(r[2..6])
+   9  Insert        0   7   1  t                                                                0  intkey=r[1] data=r[7]
+  10  SetCookie     1   1   2                                                                   0
+  11  ParseSchema   1   0   0  name = 'tr' AND type = 'trigger'                                 0  name = 'tr' AND type = 'trigger'
+  12  Halt          0   0   0                                                                   0
+  13  Transaction   0   2   0                                                                   0  iDb=0 tx_mode=Write
+  14  Transaction   1   2   1                                                                   0  iDb=1 tx_mode=Write
+  15  Goto          0   1   0                                                                   0
