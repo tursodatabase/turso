@@ -13888,10 +13888,6 @@ fn op_vacuum_into_inner(
                 // async work starts with the schema scan below.
                 let io: Arc<dyn crate::IO> = Arc::new(crate::io::PlatformIO::new()?);
                 let source_db = program.connection.get_source_database(database_id);
-                let dest_opts = crate::DatabaseOpts::new()
-                    .with_views(source_db.experimental_views_enabled())
-                    .with_index_method(source_db.experimental_index_method_enabled());
-
                 program.connection.execute("BEGIN")?;
                 // Set the same meta values from the source db (schema)
                 let user_version: i32 = extract_pragma_int(
@@ -13930,6 +13926,17 @@ fn op_vacuum_into_inner(
                     io.block(|| pager.with_header(|header| header.reserved_space))?
                 };
 
+                // Mirror source feature flags to the destination so schema replay
+                // can resolve custom types, generated columns, vtab modules, etc.
+                let dest_opts = crate::DatabaseOpts::new()
+                    .with_views(source_db.experimental_views_enabled())
+                    .with_index_method(source_db.experimental_index_method_enabled())
+                    .with_custom_types(source_db.experimental_custom_types_enabled())
+                    .with_generated_columns(source_db.experimental_generated_columns_enabled());
+
+                // Always use PlatformIO for the destination file, even if source
+                // is in-memory. This ensures VACUUM INTO writes to disk.
+                let io: Arc<dyn crate::IO> = Arc::new(crate::io::PlatformIO::new()?);
                 let dest_db = crate::Database::open_file_with_flags(
                     io,
                     dest_path,
@@ -13950,15 +13957,65 @@ fn op_vacuum_into_inner(
                     dest_conn.execute("PRAGMA journal_mode = 'mvcc'")?;
                 }
 
-                // Performance optimizations for destination database:
+                // Performance optimizations for destination database (matches SQLite vacuum.c):
                 // 1. Disable fsync - destination is a new file, if crash occurs we just delete it
                 // 2. Disable foreign key checks - source data is already consistent
                 // These match SQLite's vacuum.c optimizations (PAGER_SYNCHRONOUS_OFF, ~SQLITE_ForeignKeys)
-                dest_conn.execute("PRAGMA synchronous = OFF")?;
-                dest_conn.execute("PRAGMA foreign_keys = OFF")?;
+                dest_conn.set_sync_mode(crate::SyncMode::Off);
+                dest_conn.set_foreign_keys_enabled(false);
 
-                // Wrap all operations in a single transaction for atomicity and performance.
-                // This batches all writes and ensures destination is either empty or complete.
+                // Mirror source symbols needed for schema replay (functions, vtab
+                // modules, index methods). We skip vtabs - those are live instances
+                // tied to the source connection and not needed for compiling schema SQL.
+                {
+                    let source_syms = program.connection.syms.read();
+                    let mut dest_syms = dest_conn.syms.write();
+                    dest_syms.functions.extend(
+                        source_syms
+                            .functions
+                            .iter()
+                            .map(|(k, v)| (k.clone(), v.clone())),
+                    );
+                    dest_syms.vtab_modules.extend(
+                        source_syms
+                            .vtab_modules
+                            .iter()
+                            .map(|(k, v)| (k.clone(), v.clone())),
+                    );
+                    dest_syms.index_methods.extend(
+                        source_syms
+                            .index_methods
+                            .iter()
+                            .map(|(k, v)| (k.clone(), v.clone())),
+                    );
+                }
+
+                // Mirror source custom type definitions into destination schema
+                // so that STRICT tables with custom type columns can resolve
+                // those types during CREATE TABLE replay.
+                {
+                    let source_types: Vec<(String, std::sync::Arc<crate::schema::TypeDef>)> = {
+                        program
+                            .connection
+                            .with_schema(database_id, |source_schema| {
+                                source_schema
+                                    .type_registry
+                                    .iter()
+                                    .filter(|(_, td)| !td.is_builtin)
+                                    .map(|(name, td)| (name.clone(), td.clone()))
+                                    .collect()
+                            })
+                    };
+                    if !source_types.is_empty() {
+                        dest_conn.with_schema_mut(|dest_schema| {
+                            for (name, td) in source_types {
+                                dest_schema.type_registry.insert(name, td);
+                            }
+                        });
+                    }
+                }
+
+                // Wrap all operations in a single transaction for atomicity.
                 dest_conn.execute("BEGIN")?;
 
                 // Query sqlite_schema with rootpage, ordered by rowid.
