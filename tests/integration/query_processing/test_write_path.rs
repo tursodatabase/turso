@@ -1,5 +1,6 @@
 use crate::common::{
-    self, compute_dbhash, limbo_exec_rows, maybe_setup_tracing, rusqlite_integrity_check, ExecRows,
+    self, compute_dbhash, drop_and_sqlite_integrity_check, limbo_exec_rows, maybe_setup_tracing,
+    ExecRows,
 };
 use crate::common::{compare_string, do_flush, TempDatabase};
 use log::debug;
@@ -479,11 +480,12 @@ fn test_rollback_on_unique_constraint_violation(tmp_db: TempDatabase) -> anyhow:
     // Checkpoint the WAL
     conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")?;
 
-    // Integrity check with rusqlite
-    rusqlite_integrity_check(tmp_db.path.as_path())?;
+    // Drop limbo handles (releases the file lock) and run integrity check.
+    let db_path = tmp_db.path.clone();
+    drop_and_sqlite_integrity_check(tmp_db, [conn])?;
 
     // Size on disk should be 3 * 4096
-    let db_size = std::fs::metadata(&tmp_db.path).unwrap().len();
+    let db_size = std::fs::metadata(&db_path).unwrap().len();
     assert_eq!(db_size, 3 * 4096);
 
     Ok(())
@@ -550,11 +552,12 @@ fn test_rollback_on_foreign_key_constraint_violation(tmp_db: TempDatabase) -> an
     // Checkpoint the WAL
     conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")?;
 
-    // Integrity check with rusqlite
-    rusqlite_integrity_check(tmp_db.path.as_path())?;
+    // Drop limbo handles (releases the file lock) and run integrity check.
+    let db_path = tmp_db.path.clone();
+    drop_and_sqlite_integrity_check(tmp_db, [conn])?;
 
     // Size on disk should be 21 * 4096
-    let db_size = std::fs::metadata(&tmp_db.path).unwrap().len();
+    let db_size = std::fs::metadata(&db_path).unwrap().len();
     assert_eq!(db_size, 21 * 4096);
 
     Ok(())

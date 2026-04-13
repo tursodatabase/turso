@@ -576,6 +576,25 @@ pub fn rusqlite_integrity_check(db_path: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Drop the given `TempDatabase` and connections, then run
+/// [`rusqlite_integrity_check`] against the database file.
+///
+/// Turso holds an exclusive file lock while the database is open, so rusqlite
+/// would fail to even open the file if any turso handle were still alive.
+/// Taking ownership of `db` and `connections` here makes the drop ordering
+/// explicit and impossible to forget at the call site.
+pub fn drop_and_sqlite_integrity_check(
+    db: TempDatabase,
+    connections: impl IntoIterator<Item = Arc<Connection>>,
+) -> anyhow::Result<()> {
+    let path = db.path.clone();
+    for conn in connections {
+        drop(conn);
+    }
+    drop(db);
+    rusqlite_integrity_check(&path)
+}
+
 /// Compute dbhash of the test database.
 pub fn compute_dbhash(tmp_db: &TempDatabase) -> turso_dbhash::DbHashResult {
     let path = tmp_db.path.to_str().unwrap();
