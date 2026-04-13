@@ -13700,15 +13700,9 @@ pub(crate) enum OpVacuumIntoSubState {
         dest_schema_stmt: Box<crate::Statement>,
         idx: usize,
     },
-    /// Start copying a table - prepare column info query
+    /// Start copying a table's data
     StartCopyTable {
         dest_conn: Arc<Connection>,
-        table_idx: usize,
-    },
-    /// Collect column info for current table
-    CollectColumnInfo {
-        dest_conn: Arc<Connection>,
-        column_stmt: Box<crate::Statement>,
         table_idx: usize,
     },
     /// Select rows from source table and insert into destination
@@ -14112,185 +14106,85 @@ fn op_vacuum_into_inner(
                 }
             },
 
+            // Phase 2: Copy data for all storage-backed tables.
+            // Column lists are derived from BTreeTable.columns in the schema,
+            // not PRAGMA table_info, because table_info omits generated columns
+            // while SELECT * includes them - causing a column count mismatch.
             OpVacuumIntoSubState::StartCopyTable {
                 dest_conn,
                 table_idx,
             } => {
-                let table_names_len = vacuum_state.table_names.len();
-                turso_assert!(
-                    table_idx <= table_names_len,
-                    "table_idx incremented past end of table_names",
-                    { "table_idx": table_idx, "table_names_len": table_names_len }
-                );
-                if table_idx == table_names_len {
-                    // Done copying all tables, now copy meta values
+                let tables_len = vacuum_state.tables_to_copy.len();
+                if table_idx >= tables_len {
+                    // Done copying all tables, proceed to meta values
                     vacuum_state.sub_state = OpVacuumIntoSubState::CopyMetaValues { dest_conn };
                     continue;
                 }
 
-                let table_name = &vacuum_state.table_names[table_idx];
-                // Escape double quotes in table name for safe SQL
+                let entry_ordinal = vacuum_state.tables_to_copy[table_idx];
+                let entry = &vacuum_state.schema_entries[entry_ordinal];
+                let table_name = &entry.name;
+
+                // sqlite_sequence: only copy data if the destination has it
+                // (auto-created when an AUTOINCREMENT table was created in
+                // phase 1). If not present, skip — no AUTOINCREMENT tables
+                // means no counters to preserve. The explicit copy is needed
+                // because inserting rows with the `rowid` pseudo-column does
+                // not update sqlite_sequence counters automatically.
+                if entry.is_sqlite_sequence() {
+                    let dest_has_sequence = dest_conn
+                        .schema
+                        .read()
+                        .get_btree_table(crate::schema::SQLITE_SEQUENCE_TABLE_NAME)
+                        .is_some();
+                    if !dest_has_sequence {
+                        vacuum_state.sub_state = OpVacuumIntoSubState::StartCopyTable {
+                            dest_conn,
+                            table_idx: table_idx + 1,
+                        };
+                        continue;
+                    }
+                }
+
                 let escaped_table_name = table_name.replace('"', "\"\"");
-                let pragma_sql = format!(
-                    "PRAGMA \"{escaped_schema_name}\".table_info(\"{escaped_table_name}\")"
-                );
-                let column_stmt = program.connection.prepare(&pragma_sql)?;
-                vacuum_state.current_table_columns.clear();
-                vacuum_state.sub_state = OpVacuumIntoSubState::CollectColumnInfo {
+                // Derive copy-column list from BTreeTable.columns in schema,
+                // filtering out virtual generated columns so the SELECT and
+                // INSERT arities stay aligned.
+                let source_btree_table = program
+                    .connection
+                    .with_schema(database_id, |schema| schema.get_btree_table(table_name));
+
+                let (select_sql, insert_sql) = build_copy_sql(
+                    escaped_schema_name,
+                    &escaped_table_name,
+                    source_btree_table.as_deref(),
+                )?;
+
+                // SELECT from source, INSERT into destination.
+                let select_stmt = program.connection.prepare_internal(&select_sql)?;
+
+                // System tables need nested mode during prepare() to bypass
+                // "may not be modified" checks. Can't use prepare_internal()
+                // because the nested guard must not persist into step() - the
+                // Transaction opcode needs to run for page-level write setup.
+                let is_system = crate::schema::is_system_table(table_name);
+                if is_system {
+                    dest_conn.start_nested();
+                }
+                let dest_insert_stmt = dest_conn.prepare(&insert_sql);
+                if is_system {
+                    dest_conn.end_nested();
+                }
+                let dest_insert_stmt = dest_insert_stmt?;
+
+                vacuum_state.sub_state = OpVacuumIntoSubState::CopyRows {
                     dest_conn,
-                    column_stmt: Box::new(column_stmt),
+                    select_stmt: Box::new(select_stmt),
+                    dest_insert_stmt: Box::new(dest_insert_stmt),
                     table_idx,
                 };
                 continue;
             }
-
-            OpVacuumIntoSubState::CollectColumnInfo {
-                dest_conn,
-                mut column_stmt,
-                table_idx,
-            } => {
-                match column_stmt.step()? {
-                    crate::StepResult::Row => {
-                        let row = column_stmt
-                            .row()
-                            .expect("StepResult::Row but row() returned None");
-                        // Column name is at index 1
-                        if let Value::Text(name) = row.get_value(1) {
-                            // Escape double quotes in column name for safe SQL
-                            let escaped_name = name.as_str().replace('"', "\"\"");
-                            let col_name = format!("\"{escaped_name}\"");
-                            vacuum_state.current_table_columns.push(col_name);
-                        }
-                        vacuum_state.sub_state = OpVacuumIntoSubState::CollectColumnInfo {
-                            dest_conn,
-                            column_stmt,
-                            table_idx,
-                        };
-                        continue;
-                    }
-                    crate::StepResult::Done => {
-                        if vacuum_state.current_table_columns.is_empty() {
-                            // if no columns, then db is corrupt
-                            return Err(LimboError::Corrupt(
-                                "found a table without any columns".to_string(),
-                            ));
-                        }
-
-                        // Prepare SELECT and INSERT statements for this table
-                        let table_name = &vacuum_state.table_names[table_idx];
-                        let escaped_table_name = table_name.replace('"', "\"\"");
-                        let source_btree_table = program
-                            .connection
-                            .with_schema(database_id, |s| s.get_btree_table(table_name));
-                        let rowid_alias = source_btree_table
-                            .as_ref()
-                            .filter(|table| table.has_rowid)
-                            .and_then(|table| {
-                                ["rowid", "_rowid_", "oid"]
-                                    .iter()
-                                    .copied()
-                                    .find(|alias| table.get_column(alias).is_none())
-                            });
-                        let rowid_alias_column_index = source_btree_table
-                            .as_ref()
-                            .and_then(|table| table.get_rowid_alias_column().map(|(idx, _)| idx));
-
-                        let mut data_columns: Vec<&str> = vacuum_state
-                            .current_table_columns
-                            .iter()
-                            .map(String::as_str)
-                            .collect();
-                        let mut excluded_rowid_alias_column = false;
-                        if rowid_alias.is_some() {
-                            if let Some(idx) = rowid_alias_column_index {
-                                turso_assert!(
-                                    idx < data_columns.len(),
-                                    "rowid alias column index out of bounds for table columns",
-                                    { "idx": idx, "columns_len": data_columns.len() }
-                                );
-                                data_columns.remove(idx);
-                                excluded_rowid_alias_column = true;
-                            }
-                        }
-                        let column_names = data_columns.join(", ");
-
-                        let qualified_table =
-                            format!("\"{escaped_schema_name}\".\"{escaped_table_name}\"");
-                        let select_sql = match rowid_alias {
-                            Some(alias)
-                                if excluded_rowid_alias_column && column_names.is_empty() =>
-                            {
-                                format!("SELECT {alias} FROM {qualified_table}")
-                            }
-                            Some(alias) if excluded_rowid_alias_column => {
-                                format!("SELECT {alias}, {column_names} FROM {qualified_table}")
-                            }
-                            Some(alias) => {
-                                format!("SELECT {alias}, * FROM {qualified_table}")
-                            }
-                            None => format!("SELECT * FROM {qualified_table}"),
-                        };
-                        let select_stmt = program.connection.prepare(&select_sql)?;
-
-                        // Prepare INSERT statement once per table (reused for all rows)
-                        let bind_count = if rowid_alias.is_some() {
-                            data_columns.len() + 1
-                        } else {
-                            data_columns.len()
-                        };
-                        let placeholders: String =
-                            (0..bind_count).map(|_| "?").collect::<Vec<_>>().join(", ");
-                        let insert_columns = if let Some(alias) = rowid_alias {
-                            if column_names.is_empty() {
-                                alias.to_string()
-                            } else {
-                                format!("{alias}, {column_names}")
-                            }
-                        } else {
-                            column_names
-                        };
-                        let insert_sql = format!(
-                            "INSERT INTO \"{escaped_table_name}\" ({insert_columns}) VALUES ({placeholders})"
-                        );
-
-                        // Internal tables need nested mode to bypass "may not
-                        // be modified" checks during prepare (compile time).
-                        let is_internal =
-                            table_name.starts_with(crate::schema::TURSO_INTERNAL_PREFIX);
-                        if is_internal {
-                            dest_conn.start_nested();
-                        }
-                        let dest_insert_stmt = dest_conn.prepare(&insert_sql);
-                        if is_internal {
-                            dest_conn.end_nested();
-                        }
-                        let dest_insert_stmt = dest_insert_stmt?;
-
-                        vacuum_state.sub_state = OpVacuumIntoSubState::CopyRows {
-                            dest_conn,
-                            select_stmt: Box::new(select_stmt),
-                            dest_insert_stmt: Box::new(dest_insert_stmt),
-                            table_idx,
-                        };
-                        continue;
-                    }
-                    crate::StepResult::IO => {
-                        let io = column_stmt
-                            .take_io_completions()
-                            .expect("StepResult::IO returned but no completions available");
-                        vacuum_state.sub_state = OpVacuumIntoSubState::CollectColumnInfo {
-                            dest_conn,
-                            column_stmt,
-                            table_idx,
-                        };
-                        return Ok(InsnFunctionStepResult::IO(io));
-                    }
-                    crate::StepResult::Busy | crate::StepResult::Interrupt => {
-                        return Err(LimboError::Busy);
-                    }
-                }
-            }
-
             OpVacuumIntoSubState::CopyRows {
                 dest_conn,
                 mut select_stmt,
@@ -14302,14 +14196,12 @@ fn op_vacuum_into_inner(
                         .row()
                         .expect("StepResult::Row but row() returned None");
 
-                    let values: Vec<Value> = row.get_values().cloned().collect();
-
                     dest_insert_stmt.reset()?;
                     dest_insert_stmt.clear_bindings();
-                    for (i, value) in values.iter().enumerate() {
+                    for (i, value) in row.get_values().cloned().enumerate() {
                         let index =
                             std::num::NonZero::new(i + 1).expect("i + 1 is always non-zero");
-                        dest_insert_stmt.bind_at(index, value.clone());
+                        dest_insert_stmt.bind_at(index, value);
                     }
 
                     vacuum_state.sub_state = OpVacuumIntoSubState::StepDestInsert {
@@ -14481,6 +14373,146 @@ fn op_vacuum_into_inner(
             }
         }
     }
+}
+
+// Build the SELECT and INSERT SQL strings for copying a table's data.
+//
+// Uses the in-memory `BTreeTable` column metadata from the schema to derive
+// the copy-column list. Virtual generated columns are excluded from both
+// SELECT and INSERT since they are computed, not stored. This keeps both
+// lists tied to the same stored-column model.
+//
+// For e.g. given a schema:
+// CREATE TABLE employees (
+//       id INTEGER PRIMARY KEY,
+//       name TEXT,
+//       salary INTEGER,
+//       bonus INTEGER GENERATED ALWAYS AS (salary * 0.1) VIRTUAL
+//   )
+//
+//   Output:
+//   - select_sql: SELECT rowid, "name", "salary" FROM "main"."employees"
+//   - insert_sql: INSERT INTO "main"."employees" (rowid, "name", "salary") VALUES (?, ?, ?)
+fn build_copy_sql(
+    escaped_schema_name: &str,
+    escaped_table_name: &str,
+    source_btree_table: Option<&crate::schema::BTreeTable>,
+) -> Result<(String, String)> {
+    let Some(btree) = source_btree_table else {
+        // Storage-backed tables must have schema metadata. If we get here,
+        // the schema is inconsistent - somewhere it has gone terribly wrong
+        return Err(LimboError::Corrupt(format!(
+            "no schema metadata for storage-backed table \"{escaped_table_name}\""
+        )));
+    };
+
+    // Collect non-virtual-generated columns with their quoted names.
+    let mut data_columns: Vec<String> = Vec::new();
+    let mut rowid_alias_col_idx: Option<usize> = None;
+    for (i, col) in btree.columns.iter().enumerate() {
+        if col.is_virtual_generated() {
+            continue;
+        }
+        if col.is_rowid_alias() {
+            rowid_alias_col_idx = Some(i);
+        }
+        let Some(name) = col.name.as_deref() else {
+            return Err(LimboError::Corrupt(format!(
+                "missing column name for table \"{escaped_table_name}\""
+            )));
+        };
+        let escaped = name.replace('"', "\"\"");
+        data_columns.push(format!("\"{escaped}\""));
+    }
+
+    if data_columns.is_empty() {
+        return Err(LimboError::Corrupt(
+            "found a table without any columns".to_string(),
+        ));
+    }
+
+    // Determine rowid handling: for has_rowid tables, we need to preserve the
+    // rowid. Find an alias name (rowid, _rowid_, or oid) that doesn't conflict
+    // with an actual column name.
+    let rowid_alias = if btree.has_rowid {
+        ["rowid", "_rowid_", "oid"]
+            .iter()
+            .copied()
+            .find(|alias| btree.get_column(alias).is_none())
+    } else {
+        None
+    };
+
+    // Build the column lists. If there's a rowid alias column (INTEGER PRIMARY KEY),
+    // we exclude it from the data columns and use the rowid alias instead, since
+    // the rowid alias column IS the rowid.
+    //
+    // Track bind_count explicitly instead of parsing the joined string - column
+    // names can contain commas inside quotes which would miscount.
+    let (select_cols, insert_cols, bind_count) = if let Some(alias) = rowid_alias {
+        if let Some(alias_idx) = rowid_alias_col_idx {
+            // Remove the rowid alias column from data_columns (it IS the rowid)
+            let mut filtered: Vec<&str> = Vec::new();
+            let mut col_physical_idx = 0;
+            for (i, col) in btree.columns.iter().enumerate() {
+                if col.is_virtual_generated() {
+                    continue;
+                }
+                if i != alias_idx {
+                    filtered.push(&data_columns[col_physical_idx]);
+                }
+                col_physical_idx += 1;
+            }
+            if filtered.is_empty() {
+                // Table only has the rowid alias column
+                (alias.to_string(), alias.to_string(), 1)
+            } else {
+                let count = filtered.len() + 1; // +1 for rowid alias
+                let cols = filtered.join(", ");
+                (
+                    format!("{alias}, {cols}"),
+                    format!("{alias}, {cols}"),
+                    count,
+                )
+            }
+        } else {
+            // has_rowid but no explicit alias column - prepend the chosen rowid
+            // pseudo-column to the stored column list.
+            let count = data_columns.len() + 1; // +1 for rowid alias
+            let cols = data_columns.join(", ");
+            (
+                format!("{alias}, {cols}"),
+                format!("{alias}, {cols}"),
+                count,
+            )
+        }
+    } else {
+        // Either WITHOUT ROWID, or a rowid table where all three pseudo-names
+        // are shadowed by real columns. In the shadowed case SQL cannot name
+        // the hidden rowid, and SQLite does not require rowid stability for
+        // tables without an INTEGER PRIMARY KEY during VACUUM.
+        let count = data_columns.len();
+        let cols = data_columns.join(", ");
+        (cols.clone(), cols, count)
+    };
+
+    // The first placeholder is just "?"; each later placeholder adds ", ?".
+    // Reserve 3 bytes per placeholder, then subtract the 2-byte separator that
+    // the first placeholder does not need.
+    let mut placeholders = String::with_capacity(bind_count.saturating_mul(3).saturating_sub(2));
+    for i in 0..bind_count {
+        if i > 0 {
+            placeholders.push_str(", ");
+        }
+        placeholders.push('?');
+    }
+
+    let select_sql =
+        format!("SELECT {select_cols} FROM \"{escaped_schema_name}\".\"{escaped_table_name}\"");
+    let insert_sql =
+        format!("INSERT INTO \"{escaped_table_name}\" ({insert_cols}) VALUES ({placeholders})");
+
+    Ok((select_sql, insert_sql))
 }
 
 fn with_header<T, F>(
