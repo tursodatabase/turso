@@ -377,7 +377,7 @@ pub(crate) fn expr_tables_subset_of(
                     .iter()
                     .position(|t| t.internal_id == *table)
                 {
-                    if !allowed.contains_table(idx) {
+                    if !allowed.get(idx) {
                         ok = false;
                         return Ok(WalkControl::SkipChildren);
                     }

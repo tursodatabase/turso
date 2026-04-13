@@ -1359,13 +1359,13 @@ impl TableReferences {
 /// of ≤64 columns (single u64), with heap-allocated overflow
 pub type ColumnUsedMask = BitSet;
 
-#[derive(Clone, Debug, Default, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
 pub struct BitSet {
     inline: u64,
     overflow: Option<Vec<u64>>,
 }
 
-impl ColumnUsedMask {
+impl BitSet {
     const INLINE_BITS: usize = 64;
 
     pub fn set(&mut self, index: usize) {
@@ -1532,6 +1532,19 @@ impl ColumnUsedMask {
         }
         count
     }
+
+    pub(crate) fn intersects(&self, other: &Self) -> bool {
+        if (self.inline & other.inline) != 0 {
+            return true;
+        }
+        match (&self.overflow, &other.overflow) {
+            (Some(self_ov), Some(other_ov)) => self_ov
+                .iter()
+                .zip(other_ov.iter())
+                .any(|(&a, &b)| (a & b) != 0),
+            _ => false,
+        }
+    }
 }
 
 impl std::ops::BitOrAssign<&Self> for ColumnUsedMask {
@@ -1545,6 +1558,26 @@ impl std::ops::BitOrAssign<&Self> for ColumnUsedMask {
             for (i, &rhs_w) in rhs_ov.iter().enumerate() {
                 self_ov[i] |= rhs_w;
             }
+        }
+    }
+}
+
+impl FromIterator<usize> for BitSet {
+    fn from_iter<I: IntoIterator<Item = usize>>(iter: I) -> Self {
+        let mut set = Self::default();
+        for index in iter {
+            set.set(index);
+        }
+        set
+    }
+}
+
+impl From<u128> for BitSet {
+    fn from(from: u128) -> Self {
+        let high = (from >> 64) as u64;
+        Self {
+            inline: from as u64,
+            overflow: (high != 0).then(|| vec![high]),
         }
     }
 }

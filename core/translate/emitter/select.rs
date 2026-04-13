@@ -588,7 +588,7 @@ fn prune_join_order_for_materialized_inputs(
         return Ok(());
     }
 
-    let prefix_mask = TableMask::from_table_number_iter(tables_to_remove.iter().copied());
+    let prefix_mask: TableMask = tables_to_remove.iter().cloned().collect();
     for term in plan.where_clause.iter_mut() {
         if term.consumed {
             continue;
@@ -606,7 +606,7 @@ fn prune_join_order_for_materialized_inputs(
             &plan.table_references,
             &plan.non_from_clause_subqueries,
         )?;
-        if prefix_mask.contains_all(&mask) {
+        if prefix_mask.contains_all_set_bits_of(&mask) {
             term.consumed = true;
         }
     }
@@ -776,12 +776,11 @@ fn build_materialized_build_input_plan(
     // Bitmask of tables that are actually in the prefix join order for
     // this materialization subplan. Anything that depends on other tables
     // cannot be evaluated during those table scans.
-    let join_prefix_mask =
-        TableMask::from_table_number_iter(join_order.iter().map(|m| m.original_idx));
+    let join_prefix_mask: TableMask = join_order.iter().map(|m| m.original_idx).collect();
     // Expressions can also reference build tables of earlier hash joins in this subplan,
     // because those tables are available during probe loops. Use the broader "included"
     // set when deciding which WHERE terms can be evaluated inside the materialization.
-    let eval_prefix_mask = TableMask::from_table_number_iter(included_tables.iter().copied());
+    let eval_prefix_mask: TableMask = included_tables.into_iter().collect();
 
     // Clone WHERE terms for the materialization subplan. We cannot reuse the
     // parent plan's consumed flags because the optimizer may have consumed
@@ -795,7 +794,7 @@ fn build_materialized_build_input_plan(
             &plan.table_references,
             &plan.non_from_clause_subqueries,
         )?;
-        term.consumed = !eval_prefix_mask.contains_all(&mask);
+        term.consumed = !eval_prefix_mask.contains_all_set_bits_of(&mask);
     }
 
     // Clone table references and then "sanitize" each access method so that
@@ -826,14 +825,14 @@ fn build_materialized_build_input_plan(
             &plan.table_references,
             &plan.non_from_clause_subqueries,
         )?;
-        Ok(!join_prefix_mask.contains_all(&mask))
+        Ok(!join_prefix_mask.contains_all_set_bits_of(&mask))
     };
 
     // Walk each table in the cloned plan and ensure its access method is
     // valid within the prefix. If the access method depends on tables
     // outside the prefix, downgrade to a plain scan.
     for (table_idx, joined_table) in table_references.joined_tables_mut().iter_mut().enumerate() {
-        if !join_prefix_mask.contains_table(table_idx) {
+        if !join_prefix_mask.get(table_idx) {
             continue;
         }
 
@@ -891,7 +890,7 @@ fn build_materialized_build_input_plan(
                 // must be in the prefix; otherwise the hash join cannot be evaluated
                 // inside this subplan. The build table may live outside the prefix
                 // because the hash build phase scans it independently.
-                if !join_prefix_mask.contains_table(hash_join_op.probe_table_idx) {
+                if !join_prefix_mask.get(hash_join_op.probe_table_idx) {
                     reset_op = true;
                 }
             }

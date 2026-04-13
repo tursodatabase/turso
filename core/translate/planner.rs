@@ -1,6 +1,5 @@
 use crate::sync::Arc;
-use crate::{turso_assert, turso_assert_greater_than_or_equal, turso_assert_less_than};
-use std::cmp::PartialEq;
+use crate::{turso_assert, turso_assert_greater_than_or_equal};
 
 use super::{
     expr::{walk_expr, walk_expr_mut},
@@ -11,6 +10,7 @@ use super::{
     },
     select::prepare_select_plan,
 };
+use crate::translate::plan::BitSet;
 use crate::translate::{
     emitter::Resolver,
     expr::{expr_vector_size, unwrap_parens, BindingBehavior, WalkControl},
@@ -1477,82 +1477,7 @@ pub fn determine_where_to_eval_term(
 /// the [TableMask] refers to the index of the table in the original join order, not the internal ID.
 /// This is simply because we want to represent the tables as a contiguous set of bits, and the internal ID
 /// might not be contiguous after e.g. subquery unnesting or other transformations.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct TableMask(pub u128);
-
-impl std::ops::BitOrAssign for TableMask {
-    fn bitor_assign(&mut self, rhs: Self) {
-        self.0 |= rhs.0;
-    }
-}
-
-impl TableMask {
-    /// Creates a new empty table mask.
-    ///
-    /// The initial mask represents an empty set of tables.
-    pub fn new() -> Self {
-        Self(0)
-    }
-
-    /// Returns true if the mask represents an empty set of tables.
-    pub fn is_empty(&self) -> bool {
-        self.0 == 0
-    }
-
-    /// Creates a new mask that is the same as this one but without the specified table.
-    pub fn without_table(&self, table_no: usize) -> Self {
-        turso_assert_less_than!(table_no, 127, "table_no must be less than 127");
-        Self(self.0 ^ (1 << (table_no + 1)))
-    }
-
-    /// Creates a table mask from raw bits.
-    ///
-    /// The bits are shifted left by 1 to maintain the convention that table 0 is at bit 1.
-    pub fn from_bits(bits: u128) -> Self {
-        Self(bits << 1)
-    }
-
-    /// Creates a table mask from an iterator of table numbers.
-    pub fn from_table_number_iter(iter: impl Iterator<Item = usize>) -> Self {
-        iter.fold(Self::new(), |mut mask, table_no| {
-            turso_assert_less_than!(table_no, 127, "table_no must be less than 127");
-            mask.add_table(table_no);
-            mask
-        })
-    }
-
-    /// Adds a table to the mask.
-    pub fn add_table(&mut self, table_no: usize) {
-        turso_assert_less_than!(table_no, 127, "table_no must be less than 127");
-        self.0 |= 1 << (table_no + 1);
-    }
-
-    /// Returns true if the mask contains the specified table.
-    pub fn contains_table(&self, table_no: usize) -> bool {
-        turso_assert_less_than!(table_no, 127, "table_no must be less than 127");
-        self.0 & (1 << (table_no + 1)) != 0
-    }
-
-    /// Returns true if this mask contains all tables in the other mask.
-    pub fn contains_all(&self, other: &TableMask) -> bool {
-        self.0 & other.0 == other.0
-    }
-
-    /// Returns the number of tables in the mask.
-    pub fn table_count(&self) -> usize {
-        self.0.count_ones() as usize
-    }
-
-    /// Returns true if this mask shares any tables with the other mask.
-    pub fn intersects(&self, other: &TableMask) -> bool {
-        self.0 & other.0 != 0
-    }
-
-    /// Iterate the table indices present in this mask.
-    pub fn tables_iter(&self) -> impl Iterator<Item = usize> + '_ {
-        (0..127).filter(move |table_no| self.contains_table(*table_no))
-    }
-}
+pub type TableMask = BitSet;
 
 /// Returns a [TableMask] representing the tables referenced in the given expression.
 ///
@@ -1564,7 +1489,7 @@ pub fn table_mask_from_expr(
     table_references: &TableReferences,
     subqueries: &[NonFromClauseSubquery],
 ) -> Result<TableMask> {
-    let mut mask = TableMask::new();
+    let mut mask = TableMask::default();
     walk_expr(top_level_expr, &mut |expr: &Expr| -> Result<WalkControl> {
         match expr {
             Expr::Column { table, .. } | Expr::RowId { table, .. } => {
@@ -1573,7 +1498,7 @@ pub fn table_mask_from_expr(
                     .iter()
                     .position(|t| t.internal_id == *table)
                 {
-                    mask.add_table(table_idx);
+                    mask.set(table_idx);
                 } else if table_references
                     .find_outer_query_ref_by_internal_id(*table)
                     .is_none()
@@ -1601,7 +1526,7 @@ pub fn table_mask_from_expr(
                                 .iter()
                                 .position(|t| t.internal_id == *outer_ref_id)
                             {
-                                mask.add_table(table_idx);
+                                mask.set(table_idx);
                             }
                         }
                     }
@@ -1619,7 +1544,7 @@ pub fn table_mask_from_expr(
                                 .iter()
                                 .position(|t| t.internal_id == *outer_ref_id)
                             {
-                                mask.add_table(table_idx);
+                                mask.set(table_idx);
                             }
                         }
                     }
