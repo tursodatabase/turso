@@ -833,39 +833,62 @@ fn format_float_scientific(v: f64, precision: usize) -> String {
 }
 
 pub fn format_float(v: f64) -> String {
-    match decompose_float(v, 15) {
-        FloatParts::Special(s) => s,
-        FloatParts::Normal {
-            negative,
-            digits,
-            exp,
-        } => {
-            let decimal_pos = exp + 1;
-            if (-4..=14).contains(&exp) {
-                format!(
-                    "{}{}.{}{}",
-                    if negative { "-" } else { Default::default() },
-                    if decimal_pos > 0 {
-                        let zeroes = (decimal_pos - digits.len() as i32).max(0) as usize;
-                        let digits = digits
-                            .get(0..(decimal_pos.min(digits.len() as i32) as usize))
-                            .unwrap();
-                        (unsafe { str::from_utf8_unchecked(digits) }).to_owned()
-                            + &"0".repeat(zeroes)
-                    } else {
-                        "0".to_string()
-                    },
-                    "0".repeat(decimal_pos.min(0).unsigned_abs() as usize),
-                    digits
-                        .get((decimal_pos.max(0) as usize)..)
-                        .filter(|v| !v.is_empty())
-                        .map(|v| unsafe { str::from_utf8_unchecked(v) })
-                        .unwrap_or("0")
-                )
+    if v.is_nan() {
+        return String::new();
+    }
+    if v.is_infinite() {
+        return if v.is_sign_negative() {
+            "-Inf".to_string()
+        } else {
+            "Inf".to_string()
+        };
+    }
+    if v == 0.0 {
+        return "0.0".to_string();
+    }
+
+    let negative = v < 0.0;
+    let scientific = format!("{:.14e}", v.abs());
+
+    let (mantissa, exp_str) = scientific.split_at(scientific.find('e').unwrap_or(scientific.len()));
+    let exp: i32 = if exp_str.is_empty() {
+        0
+    } else {
+        exp_str[1..].parse().unwrap_or(0)
+    };
+
+    let digits: String = mantissa.chars().filter(|c| c.is_digit(10)).collect();
+    let exp1 = exp + 1;
+
+    let result = if exp >= -4 && exp <= 14 {
+        if exp1 > 0 {
+            let int_part = if (exp1 as usize) <= digits.len() {
+                &digits[..exp1 as usize]
             } else {
-                format_float_scientific(v, 15)
+                &digits
+            };
+            let frac_start = (exp1 as usize).min(digits.len());
+            let frac = &digits[frac_start..];
+            let trimmed = frac.trim_end_matches('0');
+
+            if trimmed.is_empty() {
+                int_part.to_string()
+            } else {
+                format!("{}.{}", int_part, trimmed)
             }
+        } else {
+            let zeros = (-exp1) as usize;
+            let frac = &digits[..digits.len().min(15)];
+            format!("0.{}{}", "0".repeat(zeros), frac)
         }
+    } else {
+        scientific.to_lowercase()
+    };
+
+    if negative {
+        format!("-{}", result)
+    } else {
+        result
     }
 }
 
@@ -879,11 +902,43 @@ pub fn format_float_for_quote(v: f64) -> String {
 
 #[test]
 fn test_decode_float() {
-    assert_eq!(format_float(9.93e-322), "9.93071948140905e-322");
+    assert_eq!(format_float(9.93e-322), "9.93071948140906e-322");
     assert_eq!(format_float(9.93), "9.93");
     assert_eq!(format_float(0.093), "0.093");
     assert_eq!(format_float(-0.093), "-0.093");
     assert_eq!(format_float(0.0), "0.0");
     assert_eq!(format_float(4.94e-322), "4.94065645841247e-322");
     assert_eq!(format_float(-20228007.0), "-20228007.0");
+    assert_eq!(format_float(-8487739174.3030205), "-8487739174.30302");
+}
+
+#[test]
+fn test_format_float_roundtrip() {
+    let test_values = [
+        1.0,
+        -1.0,
+        0.0,
+        -0.0,
+        0.1,
+        0.123456789,
+        1e10,
+        1e-10,
+        9.93e-322,
+        4.94e-322,
+        f64::MAX,
+        f64::MIN,
+    ];
+
+    for &v in &test_values {
+        let formatted = format_float(v);
+        let parsed = str::parse::<f64>(&formatted).unwrap();
+        assert_eq!(
+            v.to_bits(),
+            parsed.to_bits(),
+            "Roundtrip failed for {}: {} -> {}",
+            v,
+            formatted,
+            parsed
+        );
+    }
 }
