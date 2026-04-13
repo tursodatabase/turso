@@ -34,6 +34,7 @@ pub enum AdvanceState {
 pub enum CountState {
     Start,
     Loop,
+    RestoreRoot,
     Finish,
 }
 
