@@ -13721,13 +13721,24 @@ pub(crate) enum OpVacuumIntoSubState {
     },
     /// Copy meta values (user_version, application_id) from source to destination
     CopyMetaValues { dest_conn: Arc<Connection> },
-    /// Create triggers and views after data copy (to avoid triggers firing during copy)
-    PrepareTriggersViews {
+    /// Prepare CREATE INDEX statement on destination (idx into indexes_to_create)
+    PrepareCreateIndex {
         dest_conn: Arc<Connection>,
         idx: usize,
     },
-    /// Step through CREATE TRIGGER/VIEW statement on destination
-    StepTriggersViews {
+    /// Step through CREATE INDEX statement on destination (async)
+    StepCreateIndex {
+        dest_conn: Arc<Connection>,
+        dest_schema_stmt: Box<crate::Statement>,
+        idx: usize,
+    },
+    /// Prepare post-data schema objects (triggers, views, rootpage = 0 entries)
+    PreparePostData {
+        dest_conn: Arc<Connection>,
+        idx: usize,
+    },
+    /// Step through post-data CREATE statement on destination
+    StepPostData {
         dest_conn: Arc<Connection>,
         dest_schema_stmt: Box<crate::Statement>,
         idx: usize,
@@ -14286,62 +14297,47 @@ fn op_vacuum_into_inner(
                     vacuum_state.source_application_id.to_string(),
                 )?;
 
-                // Now create triggers and views (after data copy to avoid triggers firing)
+                // Phase 3: Create user-defined secondary indexes after data copy
+                // for performance (avoids maintaining indexes during bulk insert).
                 vacuum_state.sub_state =
-                    OpVacuumIntoSubState::PrepareTriggersViews { dest_conn, idx: 0 };
+                    OpVacuumIntoSubState::PrepareCreateIndex { dest_conn, idx: 0 };
                 continue;
             }
 
-            OpVacuumIntoSubState::PrepareTriggersViews { dest_conn, idx } => {
-                let schema_rows_len = vacuum_state.schema_rows.len();
-                turso_assert!(
-                    idx <= schema_rows_len,
-                    "idx incremented past end of schema_rows",
-                    { "idx": idx, "schema_rows_len": schema_rows_len }
-                );
-                if idx == schema_rows_len {
-                    // Done creating triggers and views
-                    vacuum_state.sub_state = OpVacuumIntoSubState::Done { dest_conn };
+            // Phase 3: Create user-defined secondary indexes.
+            OpVacuumIntoSubState::PrepareCreateIndex { dest_conn, idx } => {
+                let entries_len = vacuum_state.indexes_to_create.len();
+                if idx >= entries_len {
+                    // Done creating indexes, move to post-data objects
+                    vacuum_state.sub_state =
+                        OpVacuumIntoSubState::PreparePostData { dest_conn, idx: 0 };
                     continue;
                 }
 
-                // We validated row.len() == 4 in PrepareDestSchema
-                let row = &vacuum_state.schema_rows[idx];
-
-                // Only process triggers and views in this phase
-                if let Value::Text(type_val) = &row[0] {
-                    let type_str = type_val.as_str();
-                    if type_str == "trigger" || type_str == "view" {
-                        if let Value::Text(sql) = &row[3] {
-                            let sql_str = sql.as_str();
-                            let dest_stmt = dest_conn.prepare(sql_str)?;
-                            vacuum_state.sub_state = OpVacuumIntoSubState::StepTriggersViews {
-                                dest_conn,
-                                dest_schema_stmt: Box::new(dest_stmt),
-                                idx,
-                            };
-                            continue;
-                        }
-                    }
-                }
-
-                // Skip non-trigger/view entries
-                vacuum_state.sub_state = OpVacuumIntoSubState::PrepareTriggersViews {
+                let entry_ordinal = vacuum_state.indexes_to_create[idx];
+                let entry = &vacuum_state.schema_entries[entry_ordinal];
+                // Backing-btree indexes for custom index methods were filtered
+                // out when indexes_to_create was built. The remaining CREATE
+                // INDEX statements are user-visible and can use ordinary prepare.
+                let dest_stmt = dest_conn.prepare(&entry.sql)?;
+                vacuum_state.sub_state = OpVacuumIntoSubState::StepCreateIndex {
                     dest_conn,
-                    idx: idx + 1,
+                    dest_schema_stmt: Box::new(dest_stmt),
+                    idx,
                 };
+                continue;
             }
 
-            OpVacuumIntoSubState::StepTriggersViews {
+            OpVacuumIntoSubState::StepCreateIndex {
                 dest_conn,
                 mut dest_schema_stmt,
                 idx,
             } => match dest_schema_stmt.step()? {
                 crate::StepResult::Row => {
-                    unreachable!("CREATE TRIGGER/VIEW statement unexpectedly returned a row");
+                    unreachable!("CREATE INDEX statement unexpectedly returned a row");
                 }
                 crate::StepResult::Done => {
-                    vacuum_state.sub_state = OpVacuumIntoSubState::PrepareTriggersViews {
+                    vacuum_state.sub_state = OpVacuumIntoSubState::PrepareCreateIndex {
                         dest_conn,
                         idx: idx + 1,
                     };
@@ -14351,7 +14347,57 @@ fn op_vacuum_into_inner(
                     let io = dest_schema_stmt
                         .take_io_completions()
                         .expect("StepResult::IO returned but no completions available");
-                    vacuum_state.sub_state = OpVacuumIntoSubState::StepTriggersViews {
+                    vacuum_state.sub_state = OpVacuumIntoSubState::StepCreateIndex {
+                        dest_conn,
+                        dest_schema_stmt,
+                        idx,
+                    };
+                    return Ok(InsnFunctionStepResult::IO(io));
+                }
+                crate::StepResult::Busy | crate::StepResult::Interrupt => {
+                    return Err(LimboError::Busy);
+                }
+            },
+
+            // Phase 4: Create triggers, views, and rootpage=0 schema objects.
+            OpVacuumIntoSubState::PreparePostData { dest_conn, idx } => {
+                let entries_len = vacuum_state.post_data_entries.len();
+                if idx >= entries_len {
+                    vacuum_state.sub_state = OpVacuumIntoSubState::Done { dest_conn };
+                    continue;
+                }
+
+                let entry_ordinal = vacuum_state.post_data_entries[idx];
+                let entry = &vacuum_state.schema_entries[entry_ordinal];
+                let dest_stmt = dest_conn.prepare(&entry.sql)?;
+                vacuum_state.sub_state = OpVacuumIntoSubState::StepPostData {
+                    dest_conn,
+                    dest_schema_stmt: Box::new(dest_stmt),
+                    idx,
+                };
+                continue;
+            }
+
+            OpVacuumIntoSubState::StepPostData {
+                dest_conn,
+                mut dest_schema_stmt,
+                idx,
+            } => match dest_schema_stmt.step()? {
+                crate::StepResult::Row => {
+                    unreachable!("CREATE statement unexpectedly returned a row");
+                }
+                crate::StepResult::Done => {
+                    vacuum_state.sub_state = OpVacuumIntoSubState::PreparePostData {
+                        dest_conn,
+                        idx: idx + 1,
+                    };
+                    continue;
+                }
+                crate::StepResult::IO => {
+                    let io = dest_schema_stmt
+                        .take_io_completions()
+                        .expect("StepResult::IO returned but no completions available");
+                    vacuum_state.sub_state = OpVacuumIntoSubState::StepPostData {
                         dest_conn,
                         dest_schema_stmt,
                         idx,
