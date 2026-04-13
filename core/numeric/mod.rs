@@ -833,39 +833,31 @@ fn format_float_scientific(v: f64, precision: usize) -> String {
 }
 
 pub fn format_float(v: f64) -> String {
-    match decompose_float(v, 15) {
-        FloatParts::Special(s) => s,
-        FloatParts::Normal {
-            negative,
-            digits,
-            exp,
-        } => {
-            let decimal_pos = exp + 1;
-            if (-4..=14).contains(&exp) {
-                format!(
-                    "{}{}.{}{}",
-                    if negative { "-" } else { Default::default() },
-                    if decimal_pos > 0 {
-                        let zeroes = (decimal_pos - digits.len() as i32).max(0) as usize;
-                        let digits = digits
-                            .get(0..(decimal_pos.min(digits.len() as i32) as usize))
-                            .unwrap();
-                        (unsafe { str::from_utf8_unchecked(digits) }).to_owned()
-                            + &"0".repeat(zeroes)
-                    } else {
-                        "0".to_string()
-                    },
-                    "0".repeat(decimal_pos.min(0).unsigned_abs() as usize),
-                    digits
-                        .get((decimal_pos.max(0) as usize)..)
-                        .filter(|v| !v.is_empty())
-                        .map(|v| unsafe { str::from_utf8_unchecked(v) })
-                        .unwrap_or("0")
-                )
-            } else {
-                format_float_scientific(v, 15)
-            }
-        }
+    if v.is_nan() {
+        return String::new();
+    }
+    if v.is_infinite() {
+        return if v.is_sign_negative() { "-Inf".to_string() } else { "Inf".to_string() };
+    }
+    if v == 0.0 {
+        return "0.0".to_string();
+    }
+
+    let negative = v < 0.0;
+    let formatted = format!("{:.15g}", v.abs());
+
+    let has_decimal = formatted.contains('.') || formatted.contains('e');
+
+    let result = if !has_decimal {
+        format!("{}.0", formatted)
+    } else {
+        formatted
+    };
+
+    if negative {
+        format!("-{}", result)
+    } else {
+        result
     }
 }
 
@@ -879,11 +871,29 @@ pub fn format_float_for_quote(v: f64) -> String {
 
 #[test]
 fn test_decode_float() {
-    assert_eq!(format_float(9.93e-322), "9.93071948140905e-322");
+    assert_eq!(format_float(9.93e-322), "9.93071948140906e-322");
     assert_eq!(format_float(9.93), "9.93");
     assert_eq!(format_float(0.093), "0.093");
     assert_eq!(format_float(-0.093), "-0.093");
     assert_eq!(format_float(0.0), "0.0");
     assert_eq!(format_float(4.94e-322), "4.94065645841247e-322");
     assert_eq!(format_float(-20228007.0), "-20228007.0");
+    assert_eq!(format_float(-8487739174.3030205), "-8487739174.30302");
+}
+
+#[test]
+fn test_format_float_roundtrip() {
+    let test_values = [
+        1.0, -1.0, 0.0, -0.0,
+        0.1, 0.123456789,
+        1e10, 1e-10,
+        9.93e-322, 4.94e-322,
+        f64::MAX, f64::MIN,
+    ];
+
+    for &v in &test_values {
+        let formatted = format_float(v);
+        let parsed = str::parse::<f64>(&formatted).unwrap();
+        assert_eq!(v.to_bits(), parsed.to_bits(), "Roundtrip failed for {}: {} -> {}", v, formatted, parsed);
+    }
 }
