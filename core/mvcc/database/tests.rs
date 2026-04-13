@@ -8829,12 +8829,10 @@ fn insert_wide_table_like_batch(conn: &Arc<Connection>, start_row_number: i64, r
 /// 3. Restart, drop the old schema, recreate it, write one new row.
 /// 4. Checkpoint.
 ///
-/// Current behavior: checkpoint panics because stale pre-crash table rows remain
-/// in MVCC state even though the old table-id to root-page mapping has been removed.
+/// Checkpoint should retire the dropped table before creating the replacement table,
+/// even when sqlite_schema rowids are reused across a crash + restart cycle.
 #[test]
-#[ignore = "reproducer for crash-restart checkpoint panic"]
-#[should_panic(expected = "Table ID does not have a root page")]
-fn repro_crash_restart_drop_recreate_then_checkpoint_panics() {
+fn test_checkpoint_recovers_after_crash_restart_drop_recreate_table() {
     let mut db = MvccTestDbNoConn::new_with_random_db();
 
     {
@@ -8855,4 +8853,94 @@ fn repro_crash_restart_drop_recreate_then_checkpoint_panics() {
     create_wide_table_like_schema(&conn);
     insert_wide_table_like_batch(&conn, 1, 1);
     conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+
+    let rows = get_rows(
+        &conn,
+        "SELECT row_number, sheet_id, created_by FROM core ORDER BY id",
+    );
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0][0].as_int().unwrap(), 1);
+    assert_eq!(rows[0][1].as_int().unwrap(), 1);
+    assert_eq!(rows[0][2].to_string(), "seed");
+
+    let rows = get_rows(&conn, "PRAGMA integrity_check");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(&rows[0][0].to_string(), "ok");
+
+    conn.close().unwrap();
+    db.restart();
+
+    let conn = db.connect();
+    let rows = get_rows(
+        &conn,
+        "SELECT row_number, sheet_id, created_by FROM core ORDER BY id",
+    );
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0][0].as_int().unwrap(), 1);
+    assert_eq!(rows[0][1].as_int().unwrap(), 1);
+    assert_eq!(rows[0][2].to_string(), "seed");
+}
+
+/// Reproducer for the original index-side panic:
+/// "Index struct for index_id ... must exist when checkpointing index rows".
+///
+/// Sequence:
+/// 1. Create and checkpoint a table with one row.
+/// 2. Create an index on that existing table.
+/// 3. Simulate an abrupt process death before the index is checkpointed.
+/// 4. Restart, drop and recreate the index, insert one more row.
+/// 5. Checkpoint.
+///
+/// Checkpoint should retire the dropped index before processing recovered index rows,
+/// even when sqlite_schema reuses the same rowid for the recreated index.
+#[test]
+fn test_checkpoint_recovers_after_crash_restart_drop_recreate_index() {
+    let mut db = MvccTestDbNoConn::new_with_random_db();
+
+    {
+        let conn = db.connect();
+        conn.execute("PRAGMA mvcc_checkpoint_threshold = 1000000")
+            .unwrap();
+        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT, payload TEXT)")
+            .unwrap();
+        conn.execute("INSERT INTO t VALUES (1, 'seed_1', hex(randomblob(16)))")
+            .unwrap();
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+        conn.execute("CREATE INDEX idx_t_v ON t(v)").unwrap();
+    }
+
+    force_close_for_artifact_tamper(&mut db);
+    db.restart();
+
+    let conn = db.connect();
+    conn.execute("PRAGMA mvcc_checkpoint_threshold = 1000000")
+        .unwrap();
+    conn.execute("DROP INDEX IF EXISTS idx_t_v").unwrap();
+    conn.execute("CREATE INDEX idx_t_v ON t(v)").unwrap();
+    conn.execute("INSERT INTO t VALUES (2, 'post_2', hex(randomblob(16)))")
+        .unwrap();
+    dbg!("herere");
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+
+    let rows = get_rows(&conn, "SELECT id, v FROM t ORDER BY id");
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0][0].as_int().unwrap(), 1);
+    assert_eq!(rows[0][1].to_string(), "seed_1");
+    assert_eq!(rows[1][0].as_int().unwrap(), 2);
+    assert_eq!(rows[1][1].to_string(), "post_2");
+
+    let rows = get_rows(&conn, "PRAGMA integrity_check");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(&rows[0][0].to_string(), "ok");
+
+    conn.close().unwrap();
+    db.restart();
+
+    let conn = db.connect();
+    let rows = get_rows(&conn, "SELECT id, v FROM t ORDER BY id");
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0][0].as_int().unwrap(), 1);
+    assert_eq!(rows[0][1].to_string(), "seed_1");
+    assert_eq!(rows[1][0].as_int().unwrap(), 2);
+    assert_eq!(rows[1][1].to_string(), "post_2");
 }
