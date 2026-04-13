@@ -7,6 +7,57 @@ use std::rc::Rc;
 use serde::Serialize;
 
 pub type TableRef = Rc<Table>;
+
+// =============================================================================
+// GENERATED COLUMN TYPES
+// =============================================================================
+
+/// Storage mode for generated columns.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub enum GeneratedStorage {
+    /// Computed on read, not stored on disk.
+    Virtual,
+}
+
+impl fmt::Display for GeneratedStorage {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            GeneratedStorage::Virtual => write!(f, "VIRTUAL"),
+        }
+    }
+}
+
+/// Collation for text columns.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub enum Collation {
+    /// Binary comparison (default).
+    Binary,
+    /// Case-insensitive comparison.
+    NoCase,
+    /// Trailing spaces are ignored.
+    RTrim,
+}
+
+impl fmt::Display for Collation {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Collation::Binary => write!(f, "BINARY"),
+            Collation::NoCase => write!(f, "NOCASE"),
+            Collation::RTrim => write!(f, "RTRIM"),
+        }
+    }
+}
+
+/// A generated (computed) column definition.
+#[derive(Debug, Clone, Serialize)]
+pub struct GeneratedColumn {
+    /// The SQL expression that computes this column's value.
+    pub expr: String,
+    /// Storage mode (currently only VIRTUAL is supported).
+    pub storage: GeneratedStorage,
+    /// Optional collation for text columns.
+    pub collation: Option<Collation>,
+}
 pub type IndexRef = Rc<Index>;
 pub type ViewRef = Rc<View>;
 pub type TriggerRef = Rc<Trigger>;
@@ -43,6 +94,8 @@ pub struct ColumnDef {
     pub unique: bool,
     pub default: Option<String>,
     pub check_constraint: Option<String>,
+    /// If set, this is a generated (computed) column.
+    pub generated: Option<GeneratedColumn>,
 }
 
 impl ColumnDef {
@@ -56,6 +109,7 @@ impl ColumnDef {
             unique: false,
             default: None,
             check_constraint: None,
+            generated: None,
         }
     }
 
@@ -83,11 +137,56 @@ impl ColumnDef {
         self.default = Some(value.into());
         self
     }
+
+    /// Make this a virtual generated (computed) column.
+    pub fn generated(mut self, expr: impl Into<String>) -> Self {
+        self.generated = Some(GeneratedColumn {
+            expr: expr.into(),
+            storage: GeneratedStorage::Virtual,
+            collation: None,
+        });
+        // Generated columns cannot have DEFAULT
+        self.default = None;
+        self
+    }
+
+    /// Make this a virtual generated column with collation.
+    pub fn generated_with_collation(
+        mut self,
+        expr: impl Into<String>,
+        collation: Collation,
+    ) -> Self {
+        self.generated = Some(GeneratedColumn {
+            expr: expr.into(),
+            storage: GeneratedStorage::Virtual,
+            collation: Some(collation),
+        });
+        // Generated columns cannot have DEFAULT
+        self.default = None;
+        self
+    }
+
+    /// Returns true if this is a generated column.
+    pub fn is_generated(&self) -> bool {
+        self.generated.is_some()
+    }
 }
 
 impl fmt::Display for ColumnDef {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{} {}", self.name, self.data_type)?;
+
+        // Generated column syntax: AS (expr) VIRTUAL
+        if let Some(generated) = &self.generated {
+            write!(f, " AS ({})", generated.expr)?;
+            // Note: VIRTUAL is the default in SQLite, but we always write it explicitly
+            // for clarity and to ensure both DBs interpret it the same way
+            write!(f, " {}", generated.storage)?;
+
+            if let Some(collation) = &generated.collation {
+                write!(f, " COLLATE {collation}")?;
+            }
+        }
 
         if self.primary_key {
             write!(f, " PRIMARY KEY")?;
@@ -101,8 +200,11 @@ impl fmt::Display for ColumnDef {
             write!(f, " UNIQUE")?;
         }
 
+        // DEFAULT is mutually exclusive with GENERATED, so only show if not generated
         if let Some(default) = &self.default {
-            write!(f, " DEFAULT {default}")?;
+            if self.generated.is_none() {
+                write!(f, " DEFAULT {default}")?;
+            }
         }
 
         if let Some(check) = &self.check_constraint {
@@ -165,9 +267,27 @@ impl Table {
             .filter(|c| c.data_type != DataType::Blob)
     }
 
-    /// Returns columns that can be updated (non-primary key).
+    /// Returns columns that can be updated (non-primary key, non-generated).
     pub fn updatable_columns(&self) -> impl Iterator<Item = &ColumnDef> {
-        self.columns.iter().filter(|c| !c.primary_key)
+        self.columns
+            .iter()
+            .filter(|c| !c.primary_key && !c.is_generated())
+    }
+
+    /// Returns columns that can be inserted (non-generated).
+    /// Generated columns cannot be included in INSERT column lists.
+    pub fn insertable_columns(&self) -> impl Iterator<Item = &ColumnDef> {
+        self.columns.iter().filter(|c| !c.is_generated())
+    }
+
+    /// Returns only generated columns.
+    pub fn generated_columns(&self) -> impl Iterator<Item = &ColumnDef> {
+        self.columns.iter().filter(|c| c.is_generated())
+    }
+
+    /// Returns non-generated columns.
+    pub fn non_generated_columns(&self) -> impl Iterator<Item = &ColumnDef> {
+        self.columns.iter().filter(|c| !c.is_generated())
     }
 }
 
