@@ -1533,7 +1533,7 @@ pub enum RecordCompare {
 impl RecordCompare {
     pub fn compare<V, E, I>(
         &self,
-        serialized: &ImmutableRecord,
+        serialized: &ImmutableRecordRef,
         unpacked: I,
         index_info: &IndexInfo,
         skip: usize,
@@ -1635,7 +1635,7 @@ pub fn get_tie_breaker_from_seek_op(seek_op: SeekOp) -> std::cmp::Ordering {
 /// 5. **Remaining fields**: If first field is equal and more fields exist,
 ///    delegates to `compare_records_generic()` with `skip=1`
 fn compare_records_int<V, I>(
-    serialized: &ImmutableRecord,
+    serialized: &ImmutableRecordRef,
     unpacked: I,
     index_info: &IndexInfo,
     tie_breaker: std::cmp::Ordering,
@@ -1731,7 +1731,7 @@ where
 /// 5. **Remaining fields**: If first field is equal and more fields exist,
 ///    delegates to `compare_records_generic()` with `skip=1`
 fn compare_records_string<V, I>(
-    serialized: &ImmutableRecord,
+    serialized: &ImmutableRecordRef,
     unpacked: I,
     index_info: &IndexInfo,
     tie_breaker: std::cmp::Ordering,
@@ -1842,7 +1842,7 @@ where
 /// of fields. If all fields that appear in both records are equal, then
 /// `tie_breaker` is returned.
 pub fn compare_records_generic<V, I>(
-    serialized: &ImmutableRecord,
+    serialized: &ImmutableRecordRef,
     unpacked: I,
     index_info: &IndexInfo,
     skip: usize,
@@ -2738,6 +2738,10 @@ mod tests {
         ImmutableRecord::from_registers(&registers, registers.len())
     }
 
+    fn create_record_ref(record: &ImmutableRecord) -> &ImmutableRecordRef {
+        ImmutableRecordRef::from_value_ref(ValueRef::Blob(record.get_payload()))
+    }
+
     fn create_index_info(
         num_cols: usize,
         sort_orders: Vec<SortOrder>,
@@ -3590,5 +3594,55 @@ mod tests {
                 "column_count should be {num_values}, not {cnt}"
             );
         }
+    }
+
+    #[test]
+    fn test_immutable_record_ref_uses_shared_accessors() {
+        let values = vec![
+            Value::from_i64(7),
+            Value::Text(Text::new("hello")),
+            Value::Blob(vec![1, 2, 3]),
+        ];
+        let record = create_record(values.clone());
+        let record_ref = create_record_ref(&record);
+
+        assert_eq!(record_ref.get_payload(), record.get_payload());
+        assert_eq!(record_ref.first_value().unwrap(), ValueRef::from_i64(7));
+        assert_eq!(
+            record_ref.get_value(1).unwrap(),
+            ValueRef::Text(TextRef::new("hello", TextSubtype::Text))
+        );
+        assert_eq!(
+            record_ref.get_value_opt(2),
+            Some(ValueRef::Blob(&[1, 2, 3]))
+        );
+        assert_eq!(record_ref.get_values_owned().unwrap(), values);
+        assert_eq!(record_ref.column_count(), 3);
+    }
+
+    #[test]
+    fn test_compare_records_accepts_immutable_record_ref() {
+        let index_info = create_index_info(
+            2,
+            vec![SortOrder::Asc, SortOrder::Asc],
+            vec![CollationSeq::Binary; 2],
+        );
+        let record = create_record(vec![Value::from_i64(42), Value::Text(Text::new("abc"))]);
+        let record_ref = create_record_ref(&record);
+        let unpacked = [
+            ValueRef::from_i64(42),
+            ValueRef::Text(TextRef::new("abd", TextSubtype::Text)),
+        ];
+        let tie_breaker = std::cmp::Ordering::Equal;
+
+        let generic =
+            compare_records_generic(record_ref, unpacked.iter(), &index_info, 0, tie_breaker)
+                .unwrap();
+        let optimized = find_compare(unpacked.iter().peekable(), &index_info)
+            .compare(record_ref, unpacked, &index_info, 0, tie_breaker)
+            .unwrap();
+
+        assert_eq!(generic, std::cmp::Ordering::Less);
+        assert_eq!(optimized, generic);
     }
 }

@@ -1,4 +1,5 @@
 use branches::{mark_unlikely, unlikely};
+use std::ops::Deref;
 
 use crate::storage::sqlite3_ondisk::{read_varint, write_varint};
 use crate::vdbe::Register;
@@ -9,88 +10,42 @@ use super::{
     ValueRef,
 };
 
-/// This struct serves the purpose of not allocating multiple vectors of bytes if not needed.
-/// A value in a record that has already been serialized can stay serialized and what this struct offsers
-/// is easy acces to each value which point to the payload.
-/// The name might be contradictory as it is immutable in the sense that you cannot modify the values without modifying the payload.
-pub struct ImmutableRecord {
-    // We have to be super careful with this buffer since we make values point to the payload we need to take care reallocations
-    // happen in a controlled manner. If we realocate with values that should be correct, they will now point to undefined data.
-    // We don't use pin here because it would make it imposible to reuse the buffer if we need to push a new record in the same struct.
-    //
-    // payload is the Vec<u8> but in order to use Register which holds ImmutableRecord as a Value - we store Vec<u8> as Value::Blob
-    payload: Value,
-}
+#[repr(transparent)]
+pub struct ImmutableRecordRef([u8]);
 
-// SAFETY: all ImmutableRecord instances are intended to be used in a single thread
-// by a single connection.
-unsafe impl Send for ImmutableRecord {}
-unsafe impl Sync for ImmutableRecord {}
-
-impl Clone for ImmutableRecord {
-    fn clone(&self) -> Self {
-        Self {
-            payload: self.payload.clone(),
-        }
+impl ImmutableRecordRef {
+    #[inline]
+    pub fn new(payload: &[u8]) -> &Self {
+        // SAFETY: ImmutableRecordRef is repr(transparent) over [u8].
+        unsafe { &*(payload as *const [u8] as *const Self) }
     }
-}
 
-impl PartialEq for ImmutableRecord {
-    fn eq(&self, other: &Self) -> bool {
-        self.payload == other.payload // Only compare payload, ignore cursor state
-    }
-}
-
-impl Eq for ImmutableRecord {}
-
-impl PartialOrd for ImmutableRecord {
-    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        Some(self.cmp(other))
-    }
-}
-
-impl Ord for ImmutableRecord {
-    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        self.payload.cmp(&other.payload) // Only compare payload, ignore cursor state
-    }
-}
-
-impl std::fmt::Debug for ImmutableRecord {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match &self.payload {
-            Value::Blob(bytes) => {
-                let preview = if bytes.len() > 20 {
-                    format!("{:?} ... ({} bytes total)", &bytes[..20], bytes.len())
-                } else {
-                    format!("{bytes:?}")
-                };
-                write!(f, "ImmutableRecord {{ payload: {preview} }}")
-            }
-            Value::Text(s) => {
-                let string = s.as_str();
-                let preview = if string.len() > 20 {
-                    format!("{:?} ... ({} chars total)", &string[..20], string.len())
-                } else {
-                    format!("{string:?}")
-                };
-                write!(f, "ImmutableRecord {{ payload: {preview} }}")
-            }
-            other => write!(f, "ImmutableRecord {{ payload: {other:?} }}"),
-        }
-    }
-}
-
-impl ImmutableRecord {
-    pub fn new(payload_capacity: usize) -> Self {
-        Self {
-            payload: Value::Blob(Vec::with_capacity(payload_capacity)),
+    #[inline]
+    pub fn from_value_ref(payload: ValueRef<'_>) -> &Self {
+        match payload {
+            ValueRef::Blob(blob) => Self::new(blob),
+            _ => panic!("ImmutableRecordRef payload must be a blob"),
         }
     }
 
-    pub fn from_bin_record(payload: Vec<u8>) -> Self {
-        Self {
-            payload: Value::Blob(payload),
-        }
+    #[inline]
+    pub fn as_blob(&self) -> &[u8] {
+        &self.0
+    }
+
+    #[inline]
+    pub fn as_blob_value(&self) -> ValueRef<'_> {
+        ValueRef::Blob(self.as_blob())
+    }
+
+    #[inline]
+    pub fn get_payload(&self) -> &[u8] {
+        self.as_blob()
+    }
+
+    #[inline]
+    pub fn is_invalidated(&self) -> bool {
+        self.as_blob().is_empty()
     }
 
     // Don't use this in performance critical paths, prefer using `iter()` instead
@@ -200,6 +155,222 @@ impl ImmutableRecord {
             }
         }
         Ok(values)
+    }
+
+    #[inline(always)]
+    pub fn iter(&self) -> Result<ValueIterator<'_>, LimboError> {
+        ValueIterator::new(self.get_payload())
+    }
+
+    #[inline]
+    /// Returns true if the record contains any NULL values.
+    /// This is an optimization that only examines the header (serial types)
+    /// without deserializing the data section.
+    pub fn contains_null(&self) -> Result<bool> {
+        let payload = self.get_payload();
+        let (header_size, header_varint_len) = read_varint(payload)?;
+        let header_size = header_size as usize;
+
+        if header_size > payload.len() || header_varint_len > payload.len() {
+            return Err(LimboError::Corrupt(
+                "Payload too small for indicated header size".into(),
+            ));
+        }
+
+        let mut header = &payload[header_varint_len..header_size];
+
+        while !header.is_empty() {
+            let (serial_type, bytes_read) = read_varint(header)?;
+            if serial_type == 0 {
+                return Ok(true);
+            }
+            header = &header[bytes_read..];
+        }
+
+        Ok(false)
+    }
+
+    #[inline]
+    pub fn last_value(&self) -> Option<Result<ValueRef<'_>>> {
+        if unlikely(self.is_invalidated()) {
+            return Some(Err(LimboError::InternalError(
+                "Record is invalidated".into(),
+            )));
+        }
+        let iter = match self.iter() {
+            Ok(it) => it,
+            Err(e) => return Some(Err(e)),
+        };
+        iter.last()
+    }
+
+    #[inline]
+    pub fn first_value(&self) -> Result<ValueRef<'_>> {
+        if unlikely(self.is_invalidated()) {
+            return Err(LimboError::InternalError("Record is invalidated".into()));
+        }
+        match self.iter()?.next() {
+            Some(v) => v,
+            None => Err(LimboError::InternalError("Record has no columns".into())),
+        }
+    }
+
+    #[inline]
+    pub fn get_value(&self, idx: usize) -> Result<ValueRef<'_>> {
+        if unlikely(self.is_invalidated()) {
+            return Err(LimboError::InternalError("Record is invalidated".into()));
+        }
+        let mut iter = self.iter()?;
+        iter.nth(idx)
+            .transpose()?
+            .ok_or_else(|| LimboError::InternalError("Index out of bounds".into()))
+    }
+
+    #[inline]
+    pub fn get_value_opt(&self, idx: usize) -> Option<ValueRef<'_>> {
+        let mut iter = match self.iter() {
+            Ok(it) => it,
+            Err(_) => {
+                mark_unlikely();
+                return None;
+            }
+        };
+        match iter.nth(idx) {
+            Some(Ok(v)) => Some(v),
+            _ => {
+                mark_unlikely();
+                None
+            }
+        }
+    }
+
+    pub fn column_count(&self) -> usize {
+        self.iter().map(|it| it.count()).unwrap_or_default()
+    }
+}
+
+impl std::fmt::Debug for ImmutableRecordRef {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let bytes = self.as_blob();
+        let preview = if bytes.len() > 20 {
+            format!("{:?} ... ({} bytes total)", &bytes[..20], bytes.len())
+        } else {
+            format!("{bytes:?}")
+        };
+        write!(f, "ImmutableRecordRef {{ payload: {preview} }}")
+    }
+}
+
+impl PartialEq for ImmutableRecordRef {
+    fn eq(&self, other: &Self) -> bool {
+        self.as_blob() == other.as_blob()
+    }
+}
+
+impl Eq for ImmutableRecordRef {}
+
+impl PartialOrd for ImmutableRecordRef {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for ImmutableRecordRef {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.as_blob().cmp(other.as_blob())
+    }
+}
+
+/// This struct serves the purpose of not allocating multiple vectors of bytes if not needed.
+/// A value in a record that has already been serialized can stay serialized and what this struct offsers
+/// is easy acces to each value which point to the payload.
+/// The name might be contradictory as it is immutable in the sense that you cannot modify the values without modifying the payload.
+pub struct ImmutableRecord {
+    // We have to be super careful with this buffer since we make values point to the payload we need to take care reallocations
+    // happen in a controlled manner. If we realocate with values that should be correct, they will now point to undefined data.
+    // We don't use pin here because it would make it imposible to reuse the buffer if we need to push a new record in the same struct.
+    //
+    // payload is the Vec<u8> but in order to use Register which holds ImmutableRecord as a Value - we store Vec<u8> as Value::Blob
+    payload: Value,
+}
+
+// SAFETY: all ImmutableRecord instances are intended to be used in a single thread
+// by a single connection.
+unsafe impl Send for ImmutableRecord {}
+unsafe impl Sync for ImmutableRecord {}
+
+impl Clone for ImmutableRecord {
+    fn clone(&self) -> Self {
+        Self {
+            payload: self.payload.clone(),
+        }
+    }
+}
+
+impl PartialEq for ImmutableRecord {
+    fn eq(&self, other: &Self) -> bool {
+        self.payload == other.payload // Only compare payload, ignore cursor state
+    }
+}
+
+impl Eq for ImmutableRecord {}
+
+impl PartialOrd for ImmutableRecord {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for ImmutableRecord {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.payload.cmp(&other.payload) // Only compare payload, ignore cursor state
+    }
+}
+
+impl std::fmt::Debug for ImmutableRecord {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match &self.payload {
+            Value::Blob(bytes) => {
+                let preview = if bytes.len() > 20 {
+                    format!("{:?} ... ({} bytes total)", &bytes[..20], bytes.len())
+                } else {
+                    format!("{bytes:?}")
+                };
+                write!(f, "ImmutableRecord {{ payload: {preview} }}")
+            }
+            Value::Text(s) => {
+                let string = s.as_str();
+                let preview = if string.len() > 20 {
+                    format!("{:?} ... ({} chars total)", &string[..20], string.len())
+                } else {
+                    format!("{string:?}")
+                };
+                write!(f, "ImmutableRecord {{ payload: {preview} }}")
+            }
+            other => write!(f, "ImmutableRecord {{ payload: {other:?} }}"),
+        }
+    }
+}
+
+impl Deref for ImmutableRecord {
+    type Target = ImmutableRecordRef;
+
+    fn deref(&self) -> &Self::Target {
+        ImmutableRecordRef::new(self.as_blob())
+    }
+}
+
+impl ImmutableRecord {
+    pub fn new(payload_capacity: usize) -> Self {
+        Self {
+            payload: Value::Blob(Vec::with_capacity(payload_capacity)),
+        }
+    }
+
+    pub fn from_bin_record(payload: Vec<u8>) -> Self {
+        Self {
+            payload: Value::Blob(payload),
+        }
     }
 
     pub fn from_registers<'a, I: Iterator<Item = &'a Register> + Clone>(
@@ -327,106 +498,5 @@ impl ImmutableRecord {
     #[inline]
     pub fn invalidate(&mut self) {
         self.as_blob_mut().clear();
-    }
-
-    #[inline]
-    pub fn is_invalidated(&self) -> bool {
-        self.as_blob().is_empty()
-    }
-
-    #[inline]
-    pub fn get_payload(&self) -> &[u8] {
-        self.as_blob()
-    }
-
-    #[inline(always)]
-    pub fn iter(&self) -> Result<ValueIterator<'_>, LimboError> {
-        ValueIterator::new(self.get_payload())
-    }
-
-    #[inline]
-    /// Returns true if the record contains any NULL values.
-    /// This is an optimization that only examines the header (serial types)
-    /// without deserializing the data section.
-    pub fn contains_null(&self) -> Result<bool> {
-        let payload = self.get_payload();
-        let (header_size, header_varint_len) = read_varint(payload)?;
-        let header_size = header_size as usize;
-
-        if header_size > payload.len() || header_varint_len > payload.len() {
-            return Err(LimboError::Corrupt(
-                "Payload too small for indicated header size".into(),
-            ));
-        }
-
-        let mut header = &payload[header_varint_len..header_size];
-
-        while !header.is_empty() {
-            let (serial_type, bytes_read) = read_varint(header)?;
-            if serial_type == 0 {
-                return Ok(true);
-            }
-            header = &header[bytes_read..];
-        }
-
-        Ok(false)
-    }
-
-    #[inline]
-    pub fn last_value(&self) -> Option<Result<ValueRef<'_>>> {
-        if unlikely(self.is_invalidated()) {
-            return Some(Err(LimboError::InternalError(
-                "Record is invalidated".into(),
-            )));
-        }
-        let iter = match self.iter() {
-            Ok(it) => it,
-            Err(e) => return Some(Err(e)),
-        };
-        iter.last()
-    }
-
-    #[inline]
-    pub fn first_value(&self) -> Result<ValueRef<'_>> {
-        if unlikely(self.is_invalidated()) {
-            return Err(LimboError::InternalError("Record is invalidated".into()));
-        }
-        match self.iter()?.next() {
-            Some(v) => v,
-            None => Err(LimboError::InternalError("Record has no columns".into())),
-        }
-    }
-
-    #[inline]
-    pub fn get_value(&self, idx: usize) -> Result<ValueRef<'_>> {
-        if unlikely(self.is_invalidated()) {
-            return Err(LimboError::InternalError("Record is invalidated".into()));
-        }
-        let mut iter = self.iter()?;
-        iter.nth(idx)
-            .transpose()?
-            .ok_or_else(|| LimboError::InternalError("Index out of bounds".into()))
-    }
-
-    #[inline]
-    pub fn get_value_opt(&self, idx: usize) -> Option<ValueRef<'_>> {
-        let mut iter = match self.iter() {
-            Ok(it) => it,
-            Err(_) => {
-                mark_unlikely();
-                return None;
-            }
-        };
-        match iter.nth(idx) {
-            Some(Ok(v)) => Some(v),
-            _ => {
-                mark_unlikely();
-                None
-            }
-        }
-    }
-
-    pub fn column_count(&self) -> usize {
-        self.iter().map(|it| it.count()).unwrap_or_default()
     }
 }
