@@ -121,6 +121,10 @@ pub(crate) struct NamedSavepointFrame {
     pub(crate) name: String,
     pub(crate) starts_transaction: bool,
     pub(crate) deferred_fk_violations: isize,
+    /// Snapshot of the connection-local main schema taken at SAVEPOINT begin.
+    /// Used by ROLLBACK TO to restore in-memory main-schema state after the
+    /// pager rolls back on-disk pages.
+    pub(crate) main_schema_snapshot: Arc<Schema>,
     /// Snapshot of `temp_db.db.schema` taken at SAVEPOINT begin. `None`
     /// when the temp database had not been initialized yet. Used by
     /// ROLLBACK TO to restore the in-memory temp schema after the
@@ -135,6 +139,7 @@ pub(crate) struct NamedSavepointFrame {
 /// Info returned by `rollback_named_savepoint_frame` so callers can
 /// restore in-memory schema state after the pager has rolled back.
 pub(crate) struct RollbackFrameInfo {
+    pub(crate) main_schema_snapshot: Arc<Schema>,
     pub(crate) temp_schema_snapshot: Option<Arc<Schema>>,
     pub(crate) staged_schema_snapshot: HashMap<usize, Arc<Schema>>,
 }
@@ -3050,6 +3055,7 @@ impl Connection {
             .rposition(|savepoint| savepoint.name == name)?;
         let frame = &savepoints[target_idx];
         let info = RollbackFrameInfo {
+            main_schema_snapshot: frame.main_schema_snapshot.clone(),
             temp_schema_snapshot: frame.temp_schema_snapshot.clone(),
             staged_schema_snapshot: frame.staged_schema_snapshot.clone(),
         };

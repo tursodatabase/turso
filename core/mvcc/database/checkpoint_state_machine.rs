@@ -16,7 +16,7 @@ use crate::sync::RwLock;
 use crate::types::{IOCompletions, IOResult, ImmutableRecord};
 use crate::{turso_assert, turso_assert_eq};
 use crate::{
-    CheckpointResult, Completion, Connection, IOExt, LimboError, Numeric, Pager, Result, SyncMode,
+    CheckpointResult, Completion, Connection, LimboError, Numeric, Pager, Result, SyncMode,
     TransactionState, Value, ValueRef,
 };
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
@@ -29,6 +29,18 @@ pub enum CheckpointState {
     WriteRow {
         write_set_index: usize,
         requires_seek: bool,
+    },
+    DestroyTableBTree {
+        write_set_index: usize,
+        table_id: MVTableId,
+        root_page: u64,
+        num_columns: usize,
+    },
+    DestroyIndexBTree {
+        write_set_index: usize,
+        index_id: MVTableId,
+        root_page: u64,
+        num_columns: usize,
     },
     WriteRowStateMachine {
         write_set_index: usize,
@@ -57,6 +69,9 @@ pub enum CheckpointState {
     /// Truncate the WAL file after DB file and logical-log cleanup are safely durable.
     TruncateWal,
     Finalize,
+    FinalizePersistHeader {
+        new_schema_version: u32,
+    },
 }
 
 /// The states of the locks held by the state machine - these are tracked for error handling so that they are
@@ -670,15 +685,12 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
         let Some(wal) = &self.pager.wal else {
             panic!("No WAL to checkpoint");
         };
-        match wal.checkpoint(
+        wal.checkpoint(
             &self.pager,
             CheckpointMode::Truncate {
                 upper_bound_inclusive: None,
             },
-        )? {
-            IOResult::Done(result) => Ok(IOResult::Done(result)),
-            IOResult::IO(io) => Ok(IOResult::IO(io)),
-        }
+        )
     }
 
     /// Garbage-collect row versions for rows that were just checkpointed.
@@ -856,7 +868,10 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                     self.lock_states.pager_read_tx = true;
                 }
 
-                self.pager.io.block(|| self.pager.begin_write_tx())?;
+                match self.pager.begin_write_tx()? {
+                    IOResult::IO(io) => return Ok(TransitionResult::Io(io)),
+                    IOResult::Done(()) => {}
+                }
                 if self.update_transaction_state {
                     self.connection.set_tx_state(TransactionState::Write {
                         schema_did_change: false,
@@ -912,9 +927,11 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                 if let Some(special_write) = special_write {
                     match special_write {
                         SpecialWrite::BTreeCreate { table_id, .. } => {
-                            let created_root_page: u32 = self.pager.io.block(|| {
-                                self.pager.btree_create(&CreateBTreeFlags::new_table())
-                            })?;
+                            let created_root_page =
+                                match self.pager.btree_create(&CreateBTreeFlags::new_table())? {
+                                    IOResult::IO(io) => return Ok(TransitionResult::Io(io)),
+                                    IOResult::Done(root_page) => root_page,
+                                };
                             self.mvstore.insert_table_id_to_rootpage(
                                 table_id,
                                 Some(created_root_page as u64),
@@ -939,27 +956,20 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                                 "checkpoint root page mismatch for BTreeDestroy",
                                 { "known_root_page": known_root_page, "schema_root_page": root_page }
                             );
-                            let cursor = if let Some(cursor) = self.cursors.get(&known_root_page) {
-                                cursor.clone()
-                            } else {
-                                let cursor = BTreeCursor::new_table(
-                                    self.pager.clone(),
-                                    known_root_page as i64,
-                                    num_columns,
-                                );
-                                let cursor = Arc::new(RwLock::new(cursor));
-                                self.cursors.insert(root_page, cursor.clone());
-                                cursor
+                            self.state = CheckpointState::DestroyTableBTree {
+                                write_set_index,
+                                table_id,
+                                root_page: known_root_page,
+                                num_columns,
                             };
-                            self.pager.io.block(|| cursor.write().btree_destroy())?;
-                            // Evict stale cursor.
-                            self.cursors.remove(&root_page);
-                            self.destroyed_tables.insert(table_id);
+                            return Ok(TransitionResult::Continue);
                         }
                         SpecialWrite::BTreeCreateIndex { index_id, .. } => {
-                            let created_root_page: u32 = self.pager.io.block(|| {
-                                self.pager.btree_create(&CreateBTreeFlags::new_index())
-                            })?;
+                            let created_root_page =
+                                match self.pager.btree_create(&CreateBTreeFlags::new_index())? {
+                                    IOResult::IO(io) => return Ok(TransitionResult::Io(io)),
+                                    IOResult::Done(root_page) => root_page,
+                                };
                             self.mvstore.insert_table_id_to_rootpage(
                                 index_id,
                                 Some(created_root_page as u64),
@@ -990,32 +1000,13 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                                 "checkpoint root page mismatch for BTreeDestroyIndex",
                                 { "known_root_page": known_root_page, "schema_root_page": root_page }
                             );
-
-                            let cursor = if let Some(cursor) = self.cursors.get(&known_root_page) {
-                                cursor.clone()
-                            } else if let Some(index) = self.index_id_to_index.get(&index_id) {
-                                let cursor = BTreeCursor::new_index(
-                                    self.pager.clone(),
-                                    known_root_page as i64,
-                                    index.as_ref(),
-                                    num_columns,
-                                );
-                                let cursor = Arc::new(RwLock::new(cursor));
-                                self.cursors.insert(root_page, cursor.clone());
-                                cursor
-                            } else {
-                                // DROP INDEX destroy path: schema may no longer contain the index definition.
-                                // We only need a cursor to destroy pages so num_columns is not important.
-                                Arc::new(RwLock::new(BTreeCursor::new_table(
-                                    self.pager.clone(),
-                                    known_root_page as i64,
-                                    num_columns,
-                                )))
+                            self.state = CheckpointState::DestroyIndexBTree {
+                                write_set_index,
+                                index_id,
+                                root_page: known_root_page,
+                                num_columns,
                             };
-                            self.pager.io.block(|| cursor.write().btree_destroy())?;
-                            // Evict stale cursor.
-                            self.cursors.remove(&root_page);
-                            self.destroyed_indexes.insert(index_id);
+                            return Ok(TransitionResult::Continue);
                         }
                     }
                 }
@@ -1196,6 +1187,82 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                 }
             }
 
+            CheckpointState::DestroyTableBTree {
+                write_set_index,
+                table_id,
+                root_page,
+                num_columns,
+            } => {
+                let cursor = if let Some(cursor) = self.cursors.get(root_page) {
+                    cursor.clone()
+                } else {
+                    let cursor =
+                        BTreeCursor::new_table(self.pager.clone(), *root_page as i64, *num_columns);
+                    let cursor = Arc::new(RwLock::new(cursor));
+                    self.cursors.insert(*root_page, cursor.clone());
+                    cursor
+                };
+                let destroy_result = {
+                    let mut cursor = cursor.write();
+                    cursor.btree_destroy()?
+                };
+                match destroy_result {
+                    IOResult::IO(io) => Ok(TransitionResult::Io(io)),
+                    IOResult::Done(_) => {
+                        self.destroyed_tables.insert(*table_id);
+                        self.state = CheckpointState::WriteRow {
+                            write_set_index: *write_set_index + 1,
+                            requires_seek: true,
+                        };
+                        Ok(TransitionResult::Continue)
+                    }
+                }
+            }
+
+            CheckpointState::DestroyIndexBTree {
+                write_set_index,
+                index_id,
+                root_page,
+                num_columns,
+            } => {
+                let cursor = if let Some(cursor) = self.cursors.get(root_page) {
+                    cursor.clone()
+                } else if let Some(index) = self.index_id_to_index.get(index_id) {
+                    let cursor = BTreeCursor::new_index(
+                        self.pager.clone(),
+                        *root_page as i64,
+                        index.as_ref(),
+                        *num_columns,
+                    );
+                    let cursor = Arc::new(RwLock::new(cursor));
+                    self.cursors.insert(*root_page, cursor.clone());
+                    cursor
+                } else {
+                    // DROP INDEX destroy path: schema may no longer contain the index definition.
+                    // We only need a cursor to destroy pages so num_columns is not important.
+                    Arc::new(RwLock::new(BTreeCursor::new_table(
+                        self.pager.clone(),
+                        *root_page as i64,
+                        *num_columns,
+                    )))
+                };
+                let destroy_result = {
+                    let mut cursor = cursor.write();
+                    cursor.btree_destroy()?
+                };
+                match destroy_result {
+                    IOResult::IO(io) => Ok(TransitionResult::Io(io)),
+                    IOResult::Done(_) => {
+                        self.destroyed_indexes.insert(*index_id);
+                        self.state = CheckpointState::WriteRow {
+                            write_set_index: *write_set_index + 1,
+                            requires_seek: true,
+                        };
+                        Ok(TransitionResult::Continue)
+                    }
+                }
+            }
+
             CheckpointState::DeleteRowStateMachine { write_set_index } => {
                 let write_set_index = *write_set_index;
                 let delete_row_state_machine =
@@ -1366,21 +1433,22 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                         })?;
                     checkpoint_header.schema_cookie =
                         self.connection.db.schema.lock().schema_version.into();
-                    let staged_header = self.pager.io.block(|| {
-                        self.pager.with_header_mut(|header| {
-                            // Keep pager-maintained fields (for example database_size/change_counter)
-                            // intact, and apply only MVCC header mutations that are authored via
-                            // SetCookie/PRAGMA paths.
-                            header.schema_cookie = checkpoint_header.schema_cookie;
-                            header.user_version = checkpoint_header.user_version;
-                            header.application_id = checkpoint_header.application_id;
-                            header.vacuum_mode_largest_root_page =
-                                checkpoint_header.vacuum_mode_largest_root_page;
-                            header.incremental_vacuum_enabled =
-                                checkpoint_header.incremental_vacuum_enabled;
-                            *header
-                        })
-                    })?;
+                    let staged_header = match self.pager.with_header_mut(|header| {
+                        // Keep pager-maintained fields (for example database_size/change_counter)
+                        // intact, and apply only MVCC header mutations that are authored via
+                        // SetCookie/PRAGMA paths.
+                        header.schema_cookie = checkpoint_header.schema_cookie;
+                        header.user_version = checkpoint_header.user_version;
+                        header.application_id = checkpoint_header.application_id;
+                        header.vacuum_mode_largest_root_page =
+                            checkpoint_header.vacuum_mode_largest_root_page;
+                        header.incremental_vacuum_enabled =
+                            checkpoint_header.incremental_vacuum_enabled;
+                        *header
+                    })? {
+                        IOResult::IO(io) => return Ok(TransitionResult::Io(io)),
+                        IOResult::Done(header) => header,
+                    };
                     self.staged_checkpoint_header = Some(staged_header);
                     self.header_staged_for_commit = true;
                 }
@@ -1548,7 +1616,7 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                 }
 
                 // Patch in-memory schema to do the same
-                self.connection.db.with_schema_mut(|schema| {
+                let new_schema_version = self.connection.db.with_schema_mut(|schema| {
                     for table in schema.tables.values_mut() {
                         let table = Arc::get_mut(table).expect("this should be the only reference");
                         let Some(btree_table) = table.btree_mut() else {
@@ -1591,15 +1659,20 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                     // The btree pages for dropped tables have been freed, so integrity_check
                     // no longer needs to track them.
                     schema.dropped_root_pages.clear();
-                    let _ = self.pager.io.block(|| {
-                        self.pager.with_header_mut(|header| {
-                            header.schema_cookie = schema.schema_version.into();
-                            self.mvstore.global_header.write().replace(*header);
-                            IOResult::Done(())
-                        })
-                    })?;
-                    Ok(())
+                    Ok(schema.schema_version)
                 })?;
+                self.state = CheckpointState::FinalizePersistHeader { new_schema_version };
+                Ok(TransitionResult::Continue)
+            }
+
+            CheckpointState::FinalizePersistHeader { new_schema_version } => {
+                match self.pager.with_header_mut(|header| {
+                    header.schema_cookie = (*new_schema_version).into();
+                    self.mvstore.global_header.write().replace(*header);
+                })? {
+                    IOResult::IO(io) => return Ok(TransitionResult::Io(io)),
+                    IOResult::Done(()) => {}
+                }
 
                 self.mvstore
                     .durable_txid_max
@@ -1648,7 +1721,7 @@ impl<Clock: LogicalClock> StateTransition for CheckpointStateMachine<Clock> {
     }
 
     fn is_finalized(&self) -> bool {
-        matches!(self.state, CheckpointState::Finalize)
+        matches!(self.state, CheckpointState::FinalizePersistHeader { .. })
     }
 }
 

@@ -36,7 +36,6 @@ use crate::{
         find_compare, get_tie_breaker_from_seek_op, IOCompletions, IndexInfo, RecordCompare,
         SeekResult,
     },
-    util::IOExt,
     vdbe::Register,
     Completion, MvStore,
 };
@@ -3659,11 +3658,10 @@ impl BTreeCursor {
                             "left pointer is not the same as page id"
                         );
                         // FIXME: remove this lock
-                        let database_size = self
-                            .pager
-                            .io
-                            .block(|| self.pager.with_header(|header| header.database_size))?
-                            .get();
+                        let database_size =
+                            self.pager.get_database_size_cached().ok_or_else(|| {
+                                LimboError::InternalError("database size cache missing".to_string())
+                            })?;
                         turso_assert!(
                             left_pointer <= database_size,
                             "invalid page number divider left pointer exceeds database number of pages",
@@ -4492,13 +4490,11 @@ impl BTreeCursor {
                         if unlikely(
                             next_page < 2
                                 || next_page
-                                    > self
-                                        .pager
-                                        .io
-                                        .block(|| {
-                                            self.pager.with_header(|header| header.database_size)
-                                        })?
-                                        .get(),
+                                    > self.pager.get_database_size_cached().ok_or_else(|| {
+                                        LimboError::InternalError(
+                                            "database size cache missing".to_string(),
+                                        )
+                                    })?,
                         ) {
                             self.overflow_state = OverflowState::Start;
                             return Err(LimboError::Corrupt("Invalid overflow page number".into()));
@@ -4525,13 +4521,11 @@ impl BTreeCursor {
                         if unlikely(
                             next < 2
                                 || next
-                                    > self
-                                        .pager
-                                        .io
-                                        .block(|| {
-                                            self.pager.with_header(|header| header.database_size)
-                                        })?
-                                        .get(),
+                                    > self.pager.get_database_size_cached().ok_or_else(|| {
+                                        LimboError::InternalError(
+                                            "database size cache missing".to_string(),
+                                        )
+                                    })?,
                         ) {
                             self.overflow_state = OverflowState::Start;
                             return Err(LimboError::Corrupt("Invalid overflow page number".into()));

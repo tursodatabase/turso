@@ -48,8 +48,8 @@ use crate::{
     types::{IOCompletions, IOResult},
     vdbe::{
         execute::{
-            OpColumnState, OpDeleteState, OpDeleteSubState, OpDestroyState, OpIdxInsertState,
-            OpInsertState, OpInsertSubState, OpJournalModeState, OpNewRowidState,
+            OpCheckpointState, OpColumnState, OpDeleteState, OpDeleteSubState, OpDestroyState,
+            OpIdxInsertState, OpInsertState, OpInsertSubState, OpJournalModeState, OpNewRowidState,
             OpNoConflictState, OpProgramState, OpRowIdState, OpSeekState, OpTransactionState,
             OpVacuumIntoState,
         },
@@ -466,6 +466,7 @@ pub struct ProgramState {
     op_column_state: OpColumnState,
     op_row_id_state: OpRowIdState,
     op_transaction_state: OpTransactionState,
+    op_checkpoint_state: OpCheckpointState,
     op_journal_mode_state: OpJournalModeState,
     op_vacuum_into_state: Option<OpVacuumIntoState>,
     /// State machine for committing view deltas with I/O handling
@@ -582,6 +583,7 @@ impl ProgramState {
             op_column_state: OpColumnState::Start,
             op_row_id_state: OpRowIdState::Start,
             op_transaction_state: OpTransactionState::Start,
+            op_checkpoint_state: OpCheckpointState::default(),
             op_journal_mode_state: OpJournalModeState::default(),
             op_vacuum_into_state: None,
             view_delta_state: ViewDeltaCommitState::NotStarted,
@@ -719,6 +721,7 @@ impl ProgramState {
         self.op_destroy_state = OpDestroyState::CreateCursor;
         self.op_program_state = OpProgramState::Start;
         self.op_transaction_state = OpTransactionState::Start;
+        self.op_checkpoint_state = OpCheckpointState::default();
         self.op_journal_mode_state = OpJournalModeState::default();
         self.op_vacuum_into_state = None;
         self.view_delta_state = ViewDeltaCommitState::NotStarted;

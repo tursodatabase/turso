@@ -126,8 +126,8 @@ impl InternalVirtualTableCursor for DbPageCursor {
 
         let db_size = self
             .pager
-            .io
-            .block(|| self.pager.with_header(|header| header.database_size.get()))?;
+            .get_database_size_cached()
+            .ok_or_else(|| LimboError::InternalError("database size cache missing".to_string()))?;
 
         self.mx_pgno = db_size as i64;
 
@@ -296,8 +296,8 @@ pub(crate) fn update_dbpage(pager: &Arc<Pager>, args: &[Value]) -> Result<Option
     };
 
     let db_size = pager
-        .io
-        .block(|| pager.with_header(|header| header.database_size.get()))?;
+        .get_database_size_cached()
+        .ok_or_else(|| LimboError::InternalError("database size cache missing".to_string()))?;
     if target_pgno as u64 > db_size as u64 {
         return Err(LimboError::InvalidArgument(format!(
             "sqlite_dbpage pgno {target_pgno} is out of range"

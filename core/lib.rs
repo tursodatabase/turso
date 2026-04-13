@@ -1637,10 +1637,8 @@ impl Database {
         let page_size = pager.get_page_size_unchecked();
 
         let default_cache_size = pager
-            .io
-            .block(|| pager.with_header(|header| header.default_page_cache_size))
-            .unwrap_or_default()
-            .get();
+            .get_default_page_cache_size_cached()
+            .unwrap_or_default();
 
         let encryption_cipher = self.encryption_cipher_mode.get();
         let conn = Arc::new(Connection {

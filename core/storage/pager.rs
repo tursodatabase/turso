@@ -17,7 +17,8 @@ use crate::storage::{
     wal::{CheckpointResult, RollbackTo, Wal, IOV_MAX},
 };
 use crate::sync::atomic::{
-    AtomicBool, AtomicIsize, AtomicU16, AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering,
+    AtomicBool, AtomicI32, AtomicIsize, AtomicU16, AtomicU32, AtomicU64, AtomicU8, AtomicUsize,
+    Ordering,
 };
 use crate::sync::Arc;
 use crate::sync::{Mutex, RwLock};
@@ -58,6 +59,8 @@ use crate::storage::encryption::{CipherMode, EncryptionContext, EncryptionKey};
 /// SQLite's default maximum page count
 const DEFAULT_MAX_PAGE_COUNT: u32 = 0xfffffffe;
 const RESERVED_SPACE_NOT_SET: u16 = u16::MAX;
+const HEADER_U32_CACHE_NOT_SET: u32 = u32::MAX;
+const DEFAULT_PAGE_CACHE_SIZE_NOT_SET: i32 = i32::MIN;
 
 #[cfg(feature = "test_helper")]
 /// Used for testing purposes to change the position of the PENDING BYTE
@@ -76,6 +79,10 @@ pub struct HeaderRef(PageRef);
 impl HeaderRef {
     pub fn from_pager(pager: &Pager) -> Result<IOResult<Self>> {
         let page = return_if_io!(pager.read_header_page());
+        let content = page.get_contents();
+        let header =
+            bytemuck::from_bytes::<DatabaseHeader>(&content.as_ptr()[0..DatabaseHeader::SIZE]);
+        pager.cache_header_fields(header);
         Ok(IOResult::Done(Self(page)))
     }
 
@@ -92,6 +99,10 @@ pub struct HeaderRefMut(PageRef);
 impl HeaderRefMut {
     pub fn from_pager(pager: &Pager) -> Result<IOResult<Self>> {
         let page = return_if_io!(pager.read_header_page());
+        let content = page.get_contents();
+        let header =
+            bytemuck::from_bytes::<DatabaseHeader>(&content.as_ptr()[0..DatabaseHeader::SIZE]);
+        pager.cache_header_fields(header);
         pager.add_dirty(&page)?;
         Ok(IOResult::Done(Self(page)))
     }
@@ -1345,6 +1356,9 @@ pub struct Pager {
     /// Note that schema cookie is 32-bits, but we use 64-bit field so we can
     /// represent case where value is not set.
     schema_cookie: AtomicU64,
+    database_size_cache: AtomicU32,
+    freelist_pages_cache: AtomicU32,
+    default_page_cache_size_cache: AtomicI32,
     free_page_state: RwLock<FreePageState>,
     /// State machine for async cache spilling.
     spill_state: RwLock<SpillState>,
@@ -1421,6 +1435,18 @@ enum SpillState {
     #[default]
     /// No spill operation in progress
     Idle,
+    /// WAL spill waiting for the WAL header write to complete.
+    PrepareWal {
+        pages: Vec<PinGuard>,
+        page_sz: PageSize,
+        completion: Completion,
+    },
+    /// WAL spill waiting for the WAL header sync/finalize to complete.
+    PrepareWalSync {
+        pages: Vec<PinGuard>,
+        page_sz: PageSize,
+        completion: Completion,
+    },
     /// WAL spill in progress, waiting for write completions
     WritingToWal {
         /// Pinned pages being spilled
@@ -1515,6 +1541,9 @@ impl Pager {
             page_size: AtomicU32::new(0), // 0 means not set
             reserved_space: AtomicU16::new(RESERVED_SPACE_NOT_SET),
             schema_cookie: AtomicU64::new(Self::SCHEMA_COOKIE_NOT_SET),
+            database_size_cache: AtomicU32::new(HEADER_U32_CACHE_NOT_SET),
+            freelist_pages_cache: AtomicU32::new(HEADER_U32_CACHE_NOT_SET),
+            default_page_cache_size_cache: AtomicI32::new(DEFAULT_PAGE_CACHE_SIZE_NOT_SET),
             free_page_state: RwLock::new(FreePageState::Start),
             spill_state: RwLock::new(SpillState::Idle),
             cacheflush_state: RwLock::new(CacheFlushState::default()),
@@ -2428,28 +2457,12 @@ impl Pager {
     /// The usable size of a page might be an odd number. However, the usable size is not allowed to be less than 480.
     /// In other words, if the page size is 512, then the reserved space size cannot exceed 32.
     pub fn usable_space(&self) -> usize {
-        let page_size = self.get_page_size().unwrap_or_else(|| {
-            let size = self
-                .io
-                .block(|| self.with_header(|header| header.page_size))
-                .unwrap_or_default();
-            self.page_size.store(size.get(), Ordering::SeqCst);
-            size
-        });
-
+        let page_size = self.get_page_size_unchecked();
         let reserved_space = self.get_reserved_space().unwrap_or_else(|| {
-            let space = if self.db_initialized() {
-                self.io
-                    .block(|| self.with_header(|header| header.reserved_space))
-                    .unwrap_or_default()
-            } else {
-                // Before page 1 is allocated, the in-memory bootstrap header may still carry
-                // reserved_space=0. Use IOContext so checksum/encryption-required tail bytes are
-                // respected when computing usable space for first writes.
-                self.io_ctx.read().get_reserved_space_bytes()
-            };
-            self.set_reserved_space(space);
-            space
+            // Before page 1 is allocated, the in-memory bootstrap header may still carry
+            // reserved_space=0. Use IOContext so checksum/encryption-required tail bytes are
+            // respected when computing usable space for first writes.
+            self.io_ctx.read().get_reserved_space_bytes()
         });
 
         (page_size.get() as usize) - (reserved_space as usize)
@@ -2546,16 +2559,27 @@ impl Pager {
     /// Get the current reserved space. Returns None if not set yet.
     pub fn get_reserved_space(&self) -> Option<u8> {
         let value = self.reserved_space.load(Ordering::SeqCst);
-        if value == RESERVED_SPACE_NOT_SET {
-            None
-        } else {
-            Some(value as u8)
-        }
+        (value != RESERVED_SPACE_NOT_SET).then_some(value as u8)
     }
 
     /// Set the reserved space. Must fit in u8.
     pub fn set_reserved_space(&self, space: u8) {
         self.reserved_space.store(space as u16, Ordering::SeqCst);
+    }
+
+    pub fn get_database_size_cached(&self) -> Option<u32> {
+        let value = self.database_size_cache.load(Ordering::SeqCst);
+        (value != HEADER_U32_CACHE_NOT_SET).then_some(value)
+    }
+
+    pub fn get_freelist_pages_cached(&self) -> Option<u32> {
+        let value = self.freelist_pages_cache.load(Ordering::SeqCst);
+        (value != HEADER_U32_CACHE_NOT_SET).then_some(value)
+    }
+
+    pub fn get_default_page_cache_size_cached(&self) -> Option<i32> {
+        let value = self.default_page_cache_size_cache.load(Ordering::SeqCst);
+        (value != DEFAULT_PAGE_CACHE_SIZE_NOT_SET).then_some(value)
     }
 
     /// Schema cookie sentinel value that represents value not set.
@@ -3331,9 +3355,12 @@ impl Pager {
                             // Ensure WAL is initialized. Most of the time this is a no-op.
                             let prepare = wal.prepare_wal_start(page_sz)?;
                             if let Some(c) = prepare {
-                                self.io.wait_for_completion(c)?;
-                                let c = wal.prepare_wal_finish(self.get_sync_type())?;
-                                self.io.wait_for_completion(c)?;
+                                *self.spill_state.write() = SpillState::PrepareWal {
+                                    pages,
+                                    page_sz,
+                                    completion: c.clone(),
+                                };
+                                io_yield_one!(c);
                             }
 
                             let wal_pages: Vec<PageRef> = pages
@@ -3389,6 +3416,67 @@ impl Pager {
                         }
                     }
                 }
+            }
+            SpillState::PrepareWal {
+                pages,
+                page_sz,
+                completion,
+            } => {
+                if !completion.succeeded() {
+                    io_yield_one!(completion);
+                }
+                let wal = self
+                    .wal
+                    .as_ref()
+                    .expect("WAL spill should only exist when pager has a WAL");
+                let completion = wal.prepare_wal_finish(self.get_sync_type())?;
+                *self.spill_state.write() = SpillState::PrepareWalSync {
+                    pages,
+                    page_sz,
+                    completion: completion.clone(),
+                };
+                io_yield_one!(completion);
+            }
+            SpillState::PrepareWalSync {
+                pages,
+                page_sz,
+                completion,
+            } => {
+                if !completion.succeeded() {
+                    io_yield_one!(completion);
+                }
+                let wal = self
+                    .wal
+                    .as_ref()
+                    .expect("WAL spill should only exist when pager has a WAL");
+                let wal_pages: Vec<PageRef> = pages
+                    .iter()
+                    .map(|p| {
+                        p.set_write_pending();
+                        p.to_page()
+                    })
+                    .collect();
+                let c = wal.append_frames_vectored(wal_pages, page_sz)?;
+
+                if c.succeeded() {
+                    {
+                        let mut cache = self.page_cache.write();
+                        for page in &pages {
+                            if page.has_wal_tag() {
+                                let key = PageCacheKey::new(page.get().id);
+                                cache.notify_page_spilled(key);
+                                page.set_spilled();
+                            }
+                        }
+                    }
+                    *self.spill_state.write() = SpillState::Idle;
+                    return Ok(IOResult::Done(true));
+                }
+                *self.spill_state.write() = SpillState::WritingToWal {
+                    pages,
+                    completions: vec![c.clone()],
+                };
+                io_yield_one!(c);
             }
             SpillState::WritingToWal { pages, completions } => {
                 for c in &completions {
@@ -3899,9 +3987,10 @@ impl Pager {
             );
         }
         if header.page_number == 1 {
-            let db_size = self
-                .io
-                .block(|| self.with_header(|header| header.database_size))?;
+            let db_header =
+                bytemuck::from_bytes::<DatabaseHeader>(&raw_page[..DatabaseHeader::SIZE]);
+            self.cache_header_fields(db_header);
+            let db_size = db_header.database_size;
             tracing::debug!("truncate page_cache as first page was written: {}", db_size);
             let mut page_cache = self.page_cache.write();
             page_cache.truncate(db_size.get() as usize).map_err(|e| {
@@ -4414,7 +4503,7 @@ impl Pager {
         // Number of reserved slots in trunk header (next pointer + leaf count)
         const RESERVED_SLOTS: usize = 2;
 
-        let header_ref = self.io.block(|| HeaderRefMut::from_pager(self))?;
+        let header_ref = return_if_io!(HeaderRefMut::from_pager(self));
         let header = header_ref.borrow_mut();
 
         let mut state = self.free_page_state.write();
@@ -4445,6 +4534,7 @@ impl Pager {
                         None => self.read_page(page_id as i64)?,
                     };
                     header.freelist_pages = (header.freelist_pages.get() + 1).into();
+                    self.cache_header_fields(header);
 
                     let trunk_page_id = header.freelist_trunk_page.get();
 
@@ -4582,6 +4672,7 @@ impl Pager {
                     (default_header.page_size.get() - default_header.reserved_space as u32)
                         as usize,
                 );
+                self.cache_header_fields(&default_header);
                 let c = begin_write_btree_page(self, &page1)?;
 
                 // Pin page1 to prevent eviction while stored in state machine
@@ -4627,7 +4718,7 @@ impl Pager {
         // Ensure cache has room before allocating (we may spill dirty pages first)
         return_if_io!(self.ensure_cache_space());
 
-        let header_ref = self.io.block(|| HeaderRefMut::from_pager(self))?;
+        let header_ref = return_if_io!(HeaderRefMut::from_pager(self));
         let header = header_ref.borrow_mut();
 
         loop {
@@ -4723,6 +4814,7 @@ impl Pager {
                     // Update the database's first freelist trunk page to the next trunk page (may be 0 if there are no more trunk pages).
                     header.freelist_trunk_page = next_trunk_page_id.into();
                     header.freelist_pages = (header.freelist_pages.get() - 1).into();
+                    self.cache_header_fields(header);
                     self.add_dirty(trunk_page)?;
                     // zero out the page
                     turso_assert!(
@@ -4799,6 +4891,7 @@ impl Pager {
                     );
 
                     header.freelist_pages = (header.freelist_pages.get() - 1).into();
+                    self.cache_header_fields(header);
                     // Unpin both pages before returning - caller takes ownership of leaf_page
                     trunk_page.unpin();
                     leaf_page.unpin();
@@ -4844,6 +4937,7 @@ impl Pager {
                             cache.insert(page_key, page.clone())?;
                         }
                         header.database_size = new_db_size.into();
+                        self.cache_header_fields(header);
                         *state = AllocatePageState::Start;
                         return Ok(IOResult::Done(page));
                     }
@@ -4927,11 +5021,23 @@ impl Pager {
         *self.header_ref_state.write() = HeaderRefState::Start;
     }
 
+    fn cache_header_fields(&self, header: &DatabaseHeader) {
+        self.page_size
+            .store(header.page_size.get(), Ordering::SeqCst);
+        self.set_reserved_space(header.reserved_space);
+        self.set_schema_cookie(Some(header.schema_cookie.get()));
+        self.database_size_cache
+            .store(header.database_size.get(), Ordering::SeqCst);
+        self.freelist_pages_cache
+            .store(header.freelist_pages.get(), Ordering::SeqCst);
+        self.default_page_cache_size_cache
+            .store(header.default_page_cache_size.get(), Ordering::SeqCst);
+    }
+
     pub fn with_header<T>(&self, f: impl Fn(&DatabaseHeader) -> T) -> Result<IOResult<T>> {
         let header_ref = return_if_io!(HeaderRef::from_pager(self));
         let header = header_ref.borrow();
-        // Update cached schema cookie when reading header
-        self.set_schema_cookie(Some(header.schema_cookie.get()));
+        self.cache_header_fields(header);
         Ok(IOResult::Done(f(header)))
     }
 
@@ -4939,8 +5045,7 @@ impl Pager {
         let header_ref = return_if_io!(HeaderRefMut::from_pager(self));
         let header = header_ref.borrow_mut();
         let result = f(header);
-        // Update cached schema cookie after modification
-        self.set_schema_cookie(Some(header.schema_cookie.get()));
+        self.cache_header_fields(header);
         Ok(IOResult::Done(result))
     }
 
