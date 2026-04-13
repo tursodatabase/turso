@@ -2993,26 +2993,20 @@ pub fn translate_expr(
                         )
                     }
                     Some(SelfTableContext::ForDML(dml_ctx)) => {
-                        let col = &dml_ctx.columns[*column];
-                        match col.generated_type() {
-                            GeneratedType::Virtual {
-                                resolved: gen_expr, ..
-                            } => {
-                                translate_expr(program, None, gen_expr, target_register, resolver)?;
-                                if col.affinity() != Affinity::Blob {
-                                    program.emit_column_affinity(target_register, col.affinity());
-                                }
-                                Ok(target_register)
+                        if let Some((resolved, affinity)) = dml_ctx.virtual_column_info(*column) {
+                            translate_expr(program, None, resolved, target_register, resolver)?;
+                            if affinity != Affinity::Blob {
+                                program.emit_column_affinity(target_register, affinity);
                             }
-                            GeneratedType::NotGenerated => {
-                                let src_reg = dml_ctx.to_column_reg(*column);
-                                program.emit_insn(Insn::Copy {
-                                    src_reg,
-                                    dst_reg: target_register,
-                                    extra_amount: 0,
-                                });
-                                Ok(target_register)
-                            }
+                            Ok(target_register)
+                        } else {
+                            let src_reg = dml_ctx.to_column_reg(*column);
+                            program.emit_insn(Insn::Copy {
+                                src_reg,
+                                dst_reg: target_register,
+                                extra_amount: 0,
+                            });
+                            Ok(target_register)
                         }
                     }
                     None => {
@@ -5591,19 +5585,15 @@ where
 }
 
 /// The precedence of binding identifiers to columns.
-///
-/// TryResultColumnsFirst means that result columns (e.g. SELECT x AS y, ...) take precedence over canonical columns (e.g. SELECT x, y AS z, ...). This is the default behavior.
-///
-/// TryCanonicalColumnsFirst means that canonical columns take precedence over result columns. This is used for e.g. WHERE clauses.
-///
-/// ResultColumnsNotAllowed means that referring to result columns is not allowed. This is used e.g. for DML statements.
-///
-/// AllowUnboundIdentifiers means that unbound identifiers are allowed. This is used for INSERT ... ON CONFLICT DO UPDATE SET ... where binding is handled later than this phase.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BindingBehavior {
+    /// `TryResultColumnsFirst` means that result columns (e.g. SELECT x AS y, ...) take precedence over canonical columns (e.g. SELECT x, y AS z, ...). This is the default behavior.
     TryResultColumnsFirst,
+    /// `TryCanonicalColumnsFirst` means that canonical columns take precedence over result columns. This is used for e.g. WHERE clauses.
     TryCanonicalColumnsFirst,
+    /// `ResultColumnsNotAllowed` means that referring to result columns is not allowed. This is used e.g. for DML statements.
     ResultColumnsNotAllowed,
+    /// `AllowUnboundIdentifiers` means that unbound identifiers are allowed. This is used for INSERT ... ON CONFLICT DO UPDATE SET ... where binding is handled later than this phase.
     AllowUnboundIdentifiers,
 }
 
