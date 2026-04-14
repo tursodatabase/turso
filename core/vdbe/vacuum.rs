@@ -189,7 +189,6 @@ struct VacuumIntoState {
     /// Keep the destination database alive while VACUUM INTO is in progress.
     #[allow(dead_code)]
     dest_db: Arc<Database>,
-    /// Destination connection - lives here, not in each sub-state variant.
     dest_conn: Arc<Connection>,
     sub_state: VacuumIntoSubState,
     /// Typed schema entries collected from sqlite_schema, ordered by rowid.
@@ -198,9 +197,9 @@ struct VacuumIntoState {
     tables_to_create: Vec<usize>,
     /// Storage-backed tables whose data to copy.
     tables_to_copy: Vec<usize>,
-    /// User-defined secondary indexes to CREATE (deferred for performance).
+    /// User-defined secondary indexes to CREATE.
     indexes_to_create: Vec<usize>,
-    /// Triggers, views, and rootpage = 0 objects (deferred to avoid trigger firing).
+    /// Triggers, views, custom indexes, and rootpage = 0 objects.
     post_data_entries: Vec<usize>,
 }
 
@@ -242,7 +241,7 @@ enum VacuumIntoSubState {
         dest_insert_stmt: Box<crate::Statement>,
         table_idx: usize,
     },
-    /// Step through INSERT statement on destination (async)
+    /// Step through INSERT statement on destination
     StepDestInsert {
         select_stmt: Box<crate::Statement>,
         dest_insert_stmt: Box<crate::Statement>,
@@ -252,7 +251,7 @@ enum VacuumIntoSubState {
     CopyMetaValues,
     /// Prepare CREATE INDEX statement on destination (idx into indexes_to_create)
     PrepareCreateIndex { idx: usize },
-    /// Step through CREATE INDEX statement on destination (async)
+    /// Step through CREATE INDEX statement on destination
     StepCreateIndex {
         dest_schema_stmt: Box<crate::Statement>,
         idx: usize,
@@ -759,10 +758,6 @@ fn vacuum_into_step(
         }
     }
 }
-
-// ---------------------------------------------------------------------------
-// SQL generation for table data copy
-// ---------------------------------------------------------------------------
 
 // Build the SELECT and INSERT SQL strings for copying a table's data.
 //
