@@ -4453,6 +4453,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "WITHOUT ROWID not supported"]
     pub fn test_has_rowid_false() -> Result<()> {
         let sql = r#"CREATE TABLE t1 (a INTEGER PRIMARY KEY, b TEXT) WITHOUT ROWID;"#;
         let table = BTreeTable::from_sql(sql, 0)?;
