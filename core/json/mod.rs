@@ -1744,6 +1744,66 @@ mod tests {
         assert_eq!(result.unwrap().to_text().unwrap(), "[123,456]");
     }
 
+    // Regression tests for #3225: the `[#]` array locator (a path segment of
+    // `#` with no index) means "the slot just past the last element" per
+    // SQLite semantics. For insert-capable modes this is an append. Before
+    // the fix, navigate_path hit `unreachable!()` and panicked.
+    #[test]
+    fn test_json_set_root_hash_appends_to_array() {
+        let json_cache = JsonCacheCell::new();
+        let result = json_set(
+            &[
+                Value::build_text("[0,1,2]"),
+                Value::build_text("$[#]"),
+                Value::build_text("new"),
+            ],
+            &json_cache,
+        );
+        assert_eq!(result.unwrap().to_text().unwrap(), r#"[0,1,2,"new"]"#);
+    }
+
+    #[test]
+    fn test_json_set_root_hash_on_empty_array() {
+        let json_cache = JsonCacheCell::new();
+        let result = json_set(
+            &[
+                Value::build_text("[]"),
+                Value::build_text("$[#]"),
+                Value::build_text("first"),
+            ],
+            &json_cache,
+        );
+        assert_eq!(result.unwrap().to_text().unwrap(), r#"["first"]"#);
+    }
+
+    #[test]
+    fn test_json_set_keyed_hash_appends_to_nested_array() {
+        let json_cache = JsonCacheCell::new();
+        let result = json_set(
+            &[
+                Value::build_text(r#"{"a":[0,1]}"#),
+                Value::build_text("$.a[#]"),
+                Value::from_i64(42),
+            ],
+            &json_cache,
+        );
+        assert_eq!(result.unwrap().to_text().unwrap(), r#"{"a":[0,1,42]}"#);
+    }
+
+    #[test]
+    fn test_json_set_keyed_hash_on_empty_nested_array() {
+        let json_cache = JsonCacheCell::new();
+        let result = json_set(
+            &[
+                Value::build_text(r#"{"a":[]}"#),
+                Value::build_text("$.a[#]"),
+                Value::build_text("first"),
+            ],
+            &json_cache,
+        );
+        assert_eq!(result.unwrap().to_text().unwrap(), r#"{"a":["first"]}"#);
+    }
+
     #[test]
     fn test_json_set_add_value_to_array_out_of_bounds() {
         let json_cache = JsonCacheCell::new();

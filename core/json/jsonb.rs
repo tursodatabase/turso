@@ -2594,7 +2594,30 @@ impl Jsonb {
                                 bail_parse_error!("Element with negative index not found")
                             }
                         }
-                        _ => unreachable!(),
+                        // The `[#]` locator (no index) maps to "the slot just
+                        // past the last element" per SQLite semantics — an
+                        // append position for insert-capable modes like
+                        // json_set / json_insert (#3225). Pre-fix this hit
+                        // `unreachable!()` and panicked.
+                        None => {
+                            if mode.allows_insert() {
+                                let placeholder =
+                                    JsonbHeader::new(ElementType::OBJECT, 0).into_bytes();
+                                let placeholder_bytes = placeholder.as_bytes();
+
+                                self.data
+                                    .splice(end_pos..end_pos, placeholder_bytes.iter().copied());
+
+                                return Ok(JsonTraversalResult::with_array_index(
+                                    pos,
+                                    JsonLocationKind::ArrayEntry,
+                                    placeholder_bytes.len() as isize,
+                                    end_pos,
+                                ));
+                            }
+                            bail_parse_error!("Path [#] requires an insert-capable mode");
+                        }
+                        Some(_) => unreachable!(),
                     }
                 } else {
                     if root_type == ElementType::OBJECT
@@ -2773,7 +2796,27 @@ impl Jsonb {
                                 bail_parse_error!("Element with negative index not found")
                             }
                         }
-                        _ => unreachable!(),
+                        // `$[#]` at the document root: append slot for
+                        // insert-capable modes (#3225).
+                        None => {
+                            if mode.allows_insert() {
+                                let placeholder =
+                                    JsonbHeader::new(ElementType::OBJECT, 0).into_bytes();
+                                let placeholder_bytes = placeholder.as_bytes();
+
+                                self.data
+                                    .splice(end_pos..end_pos, placeholder_bytes.iter().copied());
+
+                                return Ok(JsonTraversalResult::with_array_index(
+                                    pos,
+                                    JsonLocationKind::DocumentRoot,
+                                    placeholder_bytes.len() as isize,
+                                    end_pos,
+                                ));
+                            }
+                            bail_parse_error!("Path [#] requires an insert-capable mode");
+                        }
+                        Some(_) => unreachable!(),
                     }
                 } else {
                     bail_parse_error!("Root is not an array");
@@ -2948,6 +2991,17 @@ impl Jsonb {
                             }
                         }
                         Some(_) => unreachable!(),
+                        // `$.key[#]`: append to the keyed array (#3225).
+                        // The pre-existing None branch here only `insert`-ed
+                        // a single placeholder byte, skipped updating the
+                        // containing array header, and fell through without
+                        // returning a `JsonTraversalResult` — so the slot was
+                        // silently dropped and the function reported
+                        // "Not found". Mirror the `Some(idx) if idx >= 0`
+                        // append path above so the placeholder is actually
+                        // spliced in, the array header is rewritten with the
+                        // new size, and the caller receives the insertion
+                        // location.
                         None => {
                             if mode.allows_insert() {
                                 let placeholder =
@@ -2955,10 +3009,24 @@ impl Jsonb {
                                 let placeholder_bytes = placeholder.as_bytes();
                                 let insertion_point = value_idx + value_size + value_header_size;
 
-                                self.data.insert(insertion_point, placeholder_bytes[0]);
-                            } else {
-                                bail_parse_error!("Cant insert")
+                                self.data.splice(
+                                    insertion_point..insertion_point,
+                                    placeholder_bytes.iter().copied(),
+                                );
+                                self.write_element_header(
+                                    value_idx,
+                                    ElementType::ARRAY,
+                                    value_size + placeholder_bytes.len(),
+                                    true,
+                                )?;
+                                return Ok(JsonTraversalResult::with_array_index(
+                                    value_idx,
+                                    JsonLocationKind::ObjectProperty(key_idx),
+                                    placeholder_bytes.len() as isize,
+                                    insertion_point,
+                                ));
                             }
+                            bail_parse_error!("Path [#] requires an insert-capable mode");
                         }
                     }
                 }
