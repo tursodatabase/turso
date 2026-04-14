@@ -1637,6 +1637,7 @@ fn rewrite_where_for_update_registers(
 /// Emits  `target_columns`, plus the stored columns needed by `target_columns`, into compact
 /// registers. This takes into account stored columns, and any stored columns required
 /// by virtual columns in `target_columns`.
+#[must_use]
 pub(crate) fn emit_columns_and_dependencies(
     program: &mut ProgramBuilder,
     table: &BTreeTable,
@@ -1703,11 +1704,7 @@ pub(crate) fn emit_index_column_value_old_image(
             )?;
             Ok(())
         })?;
-    } else if let Some((table, generated_column)) =
-        generated_column(program, table_cursor_id, idx_col)
-    {
-        emit_columns_and_dependencies(program, &table, table_cursor_id, 0, [idx_col.pos_in_table]);
-
+    } else if let Some(generated_column) = generated_column(program, table_cursor_id, idx_col) {
         emit_table_column(
             program,
             table_cursor_id,
@@ -1728,7 +1725,7 @@ fn generated_column(
     program: &mut ProgramBuilder,
     table_cursor_id: usize,
     idx_col: &IndexColumn,
-) -> Option<(Arc<BTreeTable>, Column)> {
+) -> Option<Column> {
     program
         .btree_table_from_cursor(table_cursor_id)
         .iter()
@@ -1738,7 +1735,7 @@ fn generated_column(
                 .columns
                 .get(idx_col.pos_in_table)
                 .filter(|col| col.is_virtual_generated())
-                .map(|col| (table.clone(), col.clone()))
+                .cloned()
         })
         .next()
 }
