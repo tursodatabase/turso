@@ -204,7 +204,7 @@ fn validate_update(
     Ok(())
 }
 
-pub fn prepare_update_plan(
+fn prepare_update_plan(
     program: &mut ProgramBuilder,
     resolver: &Resolver,
     mut body: ast::Update,
