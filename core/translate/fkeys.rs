@@ -2,7 +2,7 @@ use rustc_hash::FxHashSet as HashSet;
 use turso_parser::ast::{self, Expr, Literal, Name, QualifiedName, RefAct};
 
 use super::{translate_inner, ProgramBuilder, ProgramBuilderOpts};
-use crate::translate::emitter::cursor_to_registers;
+use crate::translate::emitter::emit_columns_and_dependencies;
 use crate::translate::expr::emit_table_column_for_dml;
 use crate::{
     error::SQLITE_CONSTRAINT_FOREIGNKEY,
@@ -444,7 +444,7 @@ pub fn emit_parent_index_key_change_checks(
     let old_key = program.alloc_registers(idx_len);
     let idx_target_cols = index.columns.iter().map(|c| c.pos_in_table);
     let dml_ctx = some_idx_columns_are_virtual.then(|| {
-        cursor_to_registers(
+        emit_columns_and_dependencies(
             program,
             table_btree,
             cursor_id,
@@ -759,7 +759,7 @@ fn build_parent_key(
         .iter()
         .filter_map(|pcol| parent_bt.get_column(pcol).map(|(pos, _)| pos));
     let ctx = some_fk_cols_are_virtual.then(|| {
-        cursor_to_registers(
+        emit_columns_and_dependencies(
             program,
             parent_bt,
             parent_cursor_id,

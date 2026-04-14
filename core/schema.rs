@@ -2786,9 +2786,9 @@ pub(crate) fn columns_affected_by_update(
     affected
 }
 
-/// returns a bitset containing the indexes of the stored columns that the virtual columns in
-/// `targets` depends on.
-pub(crate) fn stored_deps_of_virtual(
+/// returns a bitset containing the indexes of `targets` and of the stored columns that the
+/// virtual columns in `targets` depend on.
+pub(crate) fn dependencies_of_columns(
     columns: &[Column],
     targets: impl IntoIterator<Item = usize>,
 ) -> ColumnUsedMask {
