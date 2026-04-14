@@ -8,38 +8,49 @@ use crate::runner::SimIO;
 use crate::runner::memory::io::MemorySimIO;
 
 fn make_conn(seed: u64) -> Result<(Arc<Connection>, Arc<MemorySimIO>)> {
-    let io = Arc::new(MemorySimIO::new(
+    let io = make_io(seed);
+    let path = format!("sim_stmt_abandon_{seed}.db");
+    let conn = open_conn(io.clone(), &path)?;
+    Ok((conn, io))
+}
+
+fn make_two_conns(seed: u64) -> Result<(Arc<Connection>, Arc<Connection>, Arc<MemorySimIO>)> {
+    let io = make_io(seed);
+    let path = format!("sim_stmt_abandon_two_conns_{seed}.db");
+    let (conn1, conn2) = open_two_conns(io.clone(), &path)?;
+    Ok((conn1, conn2, io))
+}
+
+fn make_io(seed: u64) -> Arc<MemorySimIO> {
+    Arc::new(MemorySimIO::new(
         seed, 4096, 100, // Always schedule operations asynchronously.
         1, 5,
-    ));
-    let path = format!("sim_stmt_abandon_{seed}.db");
+    ))
+}
+
+fn open_conn(io: Arc<MemorySimIO>, path: &str) -> Result<Arc<Connection>> {
     let db = Database::open_file_with_flags(
-        io.clone() as Arc<dyn IO>,
-        &path,
+        io as Arc<dyn IO>,
+        path,
         OpenFlags::default(),
         DatabaseOpts::new(),
         None,
     )?;
     let conn = db.connect()?;
-    Ok((conn, io))
+    Ok(conn)
 }
 
-fn make_two_conns(seed: u64) -> Result<(Arc<Connection>, Arc<Connection>, Arc<MemorySimIO>)> {
-    let io = Arc::new(MemorySimIO::new(
-        seed, 4096, 100, // Always schedule operations asynchronously.
-        1, 5,
-    ));
-    let path = format!("sim_stmt_abandon_two_conns_{seed}.db");
+fn open_two_conns(io: Arc<MemorySimIO>, path: &str) -> Result<(Arc<Connection>, Arc<Connection>)> {
     let db = Database::open_file_with_flags(
-        io.clone() as Arc<dyn IO>,
-        &path,
+        io as Arc<dyn IO>,
+        path,
         OpenFlags::default(),
         DatabaseOpts::new(),
         None,
     )?;
     let conn1 = db.connect()?;
     let conn2 = db.connect()?;
-    Ok((conn1, conn2, io))
+    Ok((conn1, conn2))
 }
 
 fn query_count(conn: &Arc<Connection>, io: &MemorySimIO) -> Result<i64> {
@@ -267,6 +278,103 @@ fn sim_reset_releases_subjournal_when_abort_called_without_error() -> Result<()>
     assert_eq!(
         query_rows(&conn, io.as_ref())?,
         vec![(99, "ok".to_string())]
+    );
+    Ok(())
+}
+
+/// Verify that a completed VACUUM INTO does not leak source transaction state.
+/// After a successful vacuum, the source connection must be back in auto-commit
+/// mode and usable for new writes.
+#[test]
+fn sim_vacuum_into_cleans_up_source_transaction() -> Result<()> {
+    let (conn, io) = make_conn(7)?;
+
+    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)")?;
+    for i in 0..20 {
+        conn.execute(format!("INSERT INTO t VALUES ({i}, 'row_{i}')"))?;
+    }
+
+    let dest_dir = tempfile::TempDir::new()?;
+    let dest_path = dest_dir.path().join("vacuumed.db");
+    let dest_path_str = dest_path.to_str().expect("temp dir should be valid UTF-8");
+
+    assert!(
+        conn.get_auto_commit(),
+        "should be in auto-commit before VACUUM INTO"
+    );
+
+    let mut stmt = conn.prepare(format!("VACUUM INTO '{dest_path_str}'"))?;
+    loop {
+        match stmt.step()? {
+            StepResult::IO => io.step()?,
+            StepResult::Done => break,
+            other => panic!("unexpected step result: {other:?}"),
+        }
+    }
+    drop(stmt);
+
+    // Source connection must be back in auto-commit mode after vacuum.
+    assert!(
+        conn.get_auto_commit(),
+        "source connection should be in auto-commit mode after VACUUM INTO completes"
+    );
+
+    // Source connection must be usable for new writes.
+    conn.execute("INSERT INTO t VALUES (999, 'after_vacuum')")?;
+    let count = query_count(&conn, io.as_ref())?;
+    assert_eq!(
+        count, 21,
+        "should have 20 original rows + 1 new row after vacuum"
+    );
+    Ok(())
+}
+
+/// Abandoning VACUUM INTO while it is still running must roll back the manually
+/// owned source transaction.
+#[test]
+fn sim_abandon_vacuum_into_cleans_up_source_transaction() -> Result<()> {
+    let io = make_io(8);
+    let path = "sim_stmt_abandon_vacuum_reopen.db";
+    // Reopen so VACUUM reads source pages from simulated storage; with warm
+    // cache, this can complete synchronously and not exercise abandon cleanup.
+    {
+        let conn = open_conn(io.clone(), path)?;
+        conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)")?;
+        let payload = "x".repeat(256);
+        for i in 0..400 {
+            conn.execute(format!("INSERT INTO t VALUES ({i}, '{payload}')"))?;
+        }
+    }
+
+    let conn = open_conn(io.clone(), path)?;
+
+    let dest_dir = tempfile::TempDir::new()?;
+    let dest_path = dest_dir.path().join("abandoned_vacuum.db");
+    let dest_path_str = dest_path.to_str().expect("temp dir should be valid UTF-8");
+
+    let mut stmt = conn.prepare(format!("VACUUM INTO '{dest_path_str}'"))?;
+    let first = stmt.step()?;
+    assert!(
+        matches!(first, StepResult::IO),
+        "expected IO while VACUUM INTO is running, got {first:?}"
+    );
+    assert!(
+        !conn.get_auto_commit(),
+        "VACUUM INTO should own a source transaction while it is running"
+    );
+
+    drop(stmt);
+    io.step()?;
+
+    assert!(
+        conn.get_auto_commit(),
+        "source connection should return to auto-commit after abandoned VACUUM INTO"
+    );
+    conn.execute("INSERT INTO t VALUES (999, 'after_abandon')")?;
+    let count = query_count(&conn, io.as_ref())?;
+    assert_eq!(
+        count, 401,
+        "should have 400 original rows + 1 new row after abandoned vacuum"
     );
     Ok(())
 }

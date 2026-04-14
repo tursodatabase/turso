@@ -10,7 +10,9 @@ use std::sync::Arc;
 
 use sha1::{Digest, Sha1};
 use std::num::NonZero;
-use turso_core::{Database, LimboError, PlatformIO, StepResult, Value, IO};
+use turso_core::{
+    Database, DatabaseOpts, LimboError, OpenFlags, PlatformIO, StepResult, Value, IO,
+};
 
 pub use encoder::encode_value;
 
@@ -44,12 +46,27 @@ pub struct DbHashResult {
 ///
 /// System tables (sqlite_%), virtual tables, and statistics tables are excluded.
 pub fn hash_database(path: &str, options: &DbHashOptions) -> Result<DbHashResult, LimboError> {
+    hash_database_with_database_opts(path, options, DatabaseOpts::new())
+}
+
+/// Compute content hash of a database, opening it with explicit feature flags.
+pub fn hash_database_with_database_opts(
+    path: &str,
+    options: &DbHashOptions,
+    database_opts: DatabaseOpts,
+) -> Result<DbHashResult, LimboError> {
     assert!(
         !(options.schema_only && options.without_schema),
         "`schema_only` and `without_schema` cannot both be true"
     );
     let io: Arc<dyn IO> = Arc::new(PlatformIO::new()?);
-    let db = Database::open_file(io.clone(), path)?;
+    let db = Database::open_file_with_flags(
+        io.clone(),
+        path,
+        OpenFlags::default(),
+        database_opts,
+        None,
+    )?;
     let conn = db.connect()?;
 
     let mut hasher = Sha1::new();
