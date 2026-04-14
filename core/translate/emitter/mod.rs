@@ -1704,7 +1704,11 @@ pub(crate) fn emit_index_column_value_old_image(
             )?;
             Ok(())
         })?;
-    } else if let Some(generated_column) = generated_column(program, table_cursor_id, idx_col) {
+    } else if let Some((table, generated_column)) =
+        generated_column(program, table_cursor_id, idx_col)
+    {
+        emit_columns_and_dependencies(program, &table, table_cursor_id, 0, [idx_col.pos_in_table]);
+
         emit_table_column(
             program,
             table_cursor_id,
@@ -1725,7 +1729,7 @@ fn generated_column(
     program: &mut ProgramBuilder,
     table_cursor_id: usize,
     idx_col: &IndexColumn,
-) -> Option<Column> {
+) -> Option<(Arc<BTreeTable>, Column)> {
     program
         .btree_table_from_cursor(table_cursor_id)
         .iter()
@@ -1735,7 +1739,7 @@ fn generated_column(
                 .columns
                 .get(idx_col.pos_in_table)
                 .filter(|col| col.is_virtual_generated())
-                .cloned()
+                .map(|col| (table.clone(), col.clone()))
         })
         .next()
 }
