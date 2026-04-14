@@ -2012,3 +2012,54 @@ fn test_trigger_upsert_clause_persists_after_rename() -> anyhow::Result<()> {
 
     Ok(())
 }
+
+// Regression test for #6145: if trigger body compilation fails, the trigger
+// must not be left in the "compiling" state for subsequent statements, or
+// every later DML that would fire the trigger silently skips it.
+//
+// The scenario: `ALTER TABLE ... ADD COLUMN` changes the shape of `SELECT *`
+// inside the trigger body so the `UNION ALL` column counts no longer match.
+// The first offending INSERT correctly surfaces the parse error. The second
+// INSERT must surface the same error — before the fix in `execute_trigger_commands`
+// (RAII `TriggerCompilationGuard`), the second INSERT succeeded silently
+// because `trigger_is_compiling()` still returned true.
+#[turso_macros::test(mvcc)]
+fn test_trigger_compilation_error_does_not_disable_trigger(db: TempDatabase) {
+    let conn = db.connect_limbo();
+
+    conn.execute("CREATE TABLE t1 (a INTEGER PRIMARY KEY, b INTEGER, c REAL NOT NULL)")
+        .unwrap();
+
+    conn.execute(
+        "CREATE TRIGGER trg AFTER INSERT ON t1 FOR EACH ROW BEGIN
+           SELECT * FROM t1 WHERE 1 UNION ALL SELECT b, b, a FROM t1;
+         END",
+    )
+    .unwrap();
+
+    // ADD COLUMN changes `SELECT *` to 4 cols; the UNION ALL in the trigger
+    // body still emits 3 cols, so the next INSERT that fires the trigger
+    // must fail at compile time.
+    conn.execute("ALTER TABLE t1 ADD COLUMN d TEXT").unwrap();
+
+    // First INSERT: the error is expected. What matters for the regression is
+    // what happens on the SECOND INSERT.
+    let first = conn.execute("INSERT INTO t1 (a, b, c, d) VALUES (1, 2, 3.0, 'x')");
+    assert!(
+        first.is_err(),
+        "first INSERT should fail because the trigger body has a column-count mismatch, got: {first:?}"
+    );
+
+    // Second INSERT with the same trigger body: previously this succeeded
+    // silently (trigger skipped). The fix must re-compile the trigger fresh
+    // and surface the same error.
+    let second = conn.execute("INSERT INTO t1 (a, b, c, d) VALUES (10, 20, 30.0, 'y')");
+    assert!(
+        second.is_err(),
+        "second INSERT should also fail — the trigger must not be silently disabled (#6145), got: {second:?}"
+    );
+
+    // And since no INSERT should have succeeded, the table must still be empty.
+    let rows: Vec<(i64,)> = conn.exec_rows("SELECT COUNT(*) FROM t1");
+    assert_eq!(rows, vec![(0,)]);
+}
