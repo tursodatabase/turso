@@ -8685,3 +8685,354 @@ fn test_recovery_three_restarts_with_table_creation() {
         }
     }
 }
+
+fn create_wide_table_like_schema(conn: &Arc<Connection>) {
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS core(
+            id INTEGER PRIMARY KEY,
+            row_number INTEGER NOT NULL,
+            sheet_id INTEGER NOT NULL,
+            created_by TEXT,
+            updated_by TEXT,
+            created_at TEXT DEFAULT (datetime('now')),
+            updated_at TEXT DEFAULT (datetime('now')),
+            col_1 TEXT,
+            col_2 TEXT,
+            col_3 TEXT,
+            col_4 TEXT,
+            col_5 TEXT,
+            col_6 TEXT,
+            col_7 TEXT,
+            col_8 TEXT
+        )",
+    )
+    .unwrap();
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_core_sheet_row ON core(sheet_id, row_number)")
+        .unwrap();
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_core_created ON core(created_at)")
+        .unwrap();
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_core_updated ON core(updated_at, sheet_id)")
+        .unwrap();
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_core_created_by ON core(created_by, sheet_id)")
+        .unwrap();
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS metadata(
+            sheet_id INTEGER PRIMARY KEY,
+            next_row_number INTEGER NOT NULL DEFAULT 1,
+            row_count INTEGER NOT NULL DEFAULT 0,
+            updated_at TEXT DEFAULT (datetime('now'))
+        )",
+    )
+    .unwrap();
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS audit_log(
+            id INTEGER PRIMARY KEY,
+            sheet_id INTEGER NOT NULL,
+            action TEXT NOT NULL,
+            row_id INTEGER,
+            row_number INTEGER,
+            created_at TEXT DEFAULT (datetime('now')),
+            details TEXT
+        )",
+    )
+    .unwrap();
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS trigger_gate(
+            id INTEGER PRIMARY KEY,
+            sheet_id INTEGER NOT NULL,
+            trigger_type TEXT NOT NULL,
+            payload TEXT,
+            created_at TEXT DEFAULT (datetime('now'))
+        )",
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT OR IGNORE INTO metadata(sheet_id, next_row_number, row_count, updated_at)
+         VALUES (1, 1, 0, datetime('now'))",
+    )
+    .unwrap();
+}
+
+fn drop_wide_table_like_schema(conn: &Arc<Connection>) {
+    conn.execute("DROP TABLE IF EXISTS trigger_gate").unwrap();
+    conn.execute("DROP TABLE IF EXISTS audit_log").unwrap();
+    conn.execute("DROP TABLE IF EXISTS metadata").unwrap();
+    conn.execute("DROP INDEX IF EXISTS idx_core_sheet_row")
+        .unwrap();
+    conn.execute("DROP INDEX IF EXISTS idx_core_created")
+        .unwrap();
+    conn.execute("DROP INDEX IF EXISTS idx_core_updated")
+        .unwrap();
+    conn.execute("DROP INDEX IF EXISTS idx_core_created_by")
+        .unwrap();
+    conn.execute("DROP TABLE IF EXISTS core").unwrap();
+}
+
+fn insert_wide_table_like_batch(conn: &Arc<Connection>, start_row_number: i64, rows: usize) {
+    conn.execute("BEGIN").unwrap();
+
+    for offset in 0..rows {
+        let row_number = start_row_number + offset as i64;
+        conn.execute(format!(
+            "INSERT INTO core(
+                row_number, sheet_id, created_by, updated_by,
+                created_at, updated_at,
+                col_1, col_2, col_3, col_4, col_5, col_6, col_7, col_8
+             ) VALUES (
+                {row_number}, 1, 'seed', 'seed',
+                datetime('now'), datetime('now'),
+                hex(randomblob(8)), hex(randomblob(8)), hex(randomblob(8)), hex(randomblob(8)),
+                hex(randomblob(8)), hex(randomblob(8)), hex(randomblob(8)), hex(randomblob(8))
+             )",
+        ))
+        .unwrap();
+
+        conn.execute(format!(
+            "INSERT INTO audit_log(sheet_id, action, row_number, details, created_at)
+             VALUES (1, 'INSERT', {row_number}, 'wide table repro', datetime('now'))",
+        ))
+        .unwrap();
+    }
+
+    conn.execute(format!(
+        "UPDATE metadata
+         SET next_row_number = next_row_number + {rows},
+             row_count = row_count + {rows},
+             updated_at = datetime('now')
+         WHERE sheet_id = 1",
+    ))
+    .unwrap();
+    conn.execute(
+        "INSERT INTO trigger_gate(sheet_id, trigger_type, payload, created_at)
+         VALUES (1, 'ROW_INSERT', '{\"count\": 1}', datetime('now'))",
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO trigger_gate(sheet_id, trigger_type, payload, created_at)
+         VALUES (1, 'RECALC', '{\"sheet_id\": 1}', datetime('now'))",
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO trigger_gate(sheet_id, trigger_type, payload, created_at)
+         VALUES (1, 'WEBHOOK', '{\"event\": \"rows_added\"}', datetime('now'))",
+    )
+    .unwrap();
+
+    conn.execute("COMMIT").unwrap();
+}
+
+/// Reproducer for an MVCC crash-restart bug in checkpointing.
+///
+/// Sequence:
+/// 1. Create a wide-table style schema and write one row.
+/// 2. Simulate an abrupt process death (no clean connection close).
+/// 3. Restart, drop the old schema, recreate it, write one new row.
+/// 4. Checkpoint.
+///
+/// Checkpoint should retire the dropped table before creating the replacement table,
+/// even when sqlite_schema rowids are reused across a crash + restart cycle.
+#[test]
+fn test_checkpoint_recovers_after_crash_restart_drop_recreate_table() {
+    let mut db = MvccTestDbNoConn::new_with_random_db();
+
+    {
+        let conn = db.connect();
+        conn.execute("PRAGMA mvcc_checkpoint_threshold = 1000000")
+            .unwrap();
+        create_wide_table_like_schema(&conn);
+        insert_wide_table_like_batch(&conn, 1, 1);
+    }
+
+    force_close_for_artifact_tamper(&mut db);
+    db.restart();
+
+    let conn = db.connect();
+    conn.execute("PRAGMA mvcc_checkpoint_threshold = 1000000")
+        .unwrap();
+    drop_wide_table_like_schema(&conn);
+    create_wide_table_like_schema(&conn);
+    insert_wide_table_like_batch(&conn, 1, 1);
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+
+    let rows = get_rows(
+        &conn,
+        "SELECT row_number, sheet_id, created_by FROM core ORDER BY id",
+    );
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0][0].as_int().unwrap(), 1);
+    assert_eq!(rows[0][1].as_int().unwrap(), 1);
+    assert_eq!(rows[0][2].to_string(), "seed");
+
+    let rows = get_rows(&conn, "PRAGMA integrity_check");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(&rows[0][0].to_string(), "ok");
+
+    conn.close().unwrap();
+    db.restart();
+
+    let conn = db.connect();
+    let rows = get_rows(
+        &conn,
+        "SELECT row_number, sheet_id, created_by FROM core ORDER BY id",
+    );
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0][0].as_int().unwrap(), 1);
+    assert_eq!(rows[0][1].as_int().unwrap(), 1);
+    assert_eq!(rows[0][2].to_string(), "seed");
+}
+
+/// Reproducer for the original index-side panic:
+/// "Index struct for index_id ... must exist when checkpointing index rows".
+///
+/// Sequence:
+/// 1. Create and checkpoint a table with one row.
+/// 2. Create an index on that existing table.
+/// 3. Simulate an abrupt process death before the index is checkpointed.
+/// 4. Restart, drop and recreate the index, insert one more row.
+/// 5. Checkpoint.
+///
+/// Checkpoint should retire the dropped index before processing recovered index rows,
+/// even when sqlite_schema reuses the same rowid for the recreated index.
+#[test]
+fn test_checkpoint_recovers_after_crash_restart_drop_recreate_index() {
+    let mut db = MvccTestDbNoConn::new_with_random_db();
+
+    {
+        let conn = db.connect();
+        conn.execute("PRAGMA mvcc_checkpoint_threshold = 1000000")
+            .unwrap();
+        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT, payload TEXT)")
+            .unwrap();
+        conn.execute("INSERT INTO t VALUES (1, 'seed_1', hex(randomblob(16)))")
+            .unwrap();
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+        conn.execute("CREATE INDEX idx_t_v ON t(v)").unwrap();
+    }
+
+    force_close_for_artifact_tamper(&mut db);
+    db.restart();
+
+    let conn = db.connect();
+    conn.execute("PRAGMA mvcc_checkpoint_threshold = 1000000")
+        .unwrap();
+    conn.execute("DROP INDEX IF EXISTS idx_t_v").unwrap();
+    conn.execute("CREATE INDEX idx_t_v ON t(v)").unwrap();
+    conn.execute("INSERT INTO t VALUES (2, 'post_2', hex(randomblob(16)))")
+        .unwrap();
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+
+    let rows = get_rows(&conn, "SELECT id, v FROM t ORDER BY id");
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0][0].as_int().unwrap(), 1);
+    assert_eq!(rows[0][1].to_string(), "seed_1");
+    assert_eq!(rows[1][0].as_int().unwrap(), 2);
+    assert_eq!(rows[1][1].to_string(), "post_2");
+
+    let rows = get_rows(&conn, "PRAGMA integrity_check");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(&rows[0][0].to_string(), "ok");
+
+    conn.close().unwrap();
+    db.restart();
+
+    let conn = db.connect();
+    let rows = get_rows(&conn, "SELECT id, v FROM t ORDER BY id");
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0][0].as_int().unwrap(), 1);
+    assert_eq!(rows[0][1].to_string(), "seed_1");
+    assert_eq!(rows[1][0].as_int().unwrap(), 2);
+    assert_eq!(rows[1][1].to_string(), "post_2");
+}
+
+/// Reproducer for recovery of a dropped checkpointed index.
+///
+/// Sequence:
+/// 1. Create and checkpoint a table plus index.
+/// 2. Drop the checkpointed index.
+/// 3. Simulate an abrupt process death before checkpoint.
+/// 4. Restart and checkpoint.
+///
+/// Recovery must preserve the deleted sqlite_schema record so checkpoint can
+/// retire the dropped index without losing its object identity.
+#[test]
+fn test_checkpoint_recovers_after_restart_drop_checkpointed_index() {
+    let mut db = MvccTestDbNoConn::new_with_random_db();
+
+    {
+        let conn = db.connect();
+        conn.execute("PRAGMA mvcc_checkpoint_threshold = 1000000")
+            .unwrap();
+        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")
+            .unwrap();
+        conn.execute("CREATE INDEX idx_t_v ON t(v)").unwrap();
+        conn.execute("INSERT INTO t VALUES (1, 'seed_1')").unwrap();
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+        conn.execute("DROP INDEX idx_t_v").unwrap();
+    }
+
+    force_close_for_artifact_tamper(&mut db);
+    db.restart();
+
+    let conn = db.connect();
+    conn.execute("PRAGMA mvcc_checkpoint_threshold = 1000000")
+        .unwrap();
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+
+    let rows = get_rows(&conn, "SELECT id, v FROM t ORDER BY id");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0][0].as_int().unwrap(), 1);
+    assert_eq!(rows[0][1].to_string(), "seed_1");
+
+    let rows = get_rows(
+        &conn,
+        "SELECT name FROM sqlite_schema WHERE type = 'index' AND name = 'idx_t_v'",
+    );
+    assert_eq!(rows.len(), 0);
+
+    let rows = get_rows(&conn, "PRAGMA integrity_check");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(&rows[0][0].to_string(), "ok");
+}
+
+#[test]
+fn test_drop_recreate_indexed_table_many_inserts_restart() {
+    let mut db = MvccTestDbNoConn::new_with_random_db();
+
+    for round in 0..2 {
+        {
+            let conn = db.connect();
+            let mv_store = db.get_mvcc_store();
+            mv_store.set_checkpoint_threshold(4096);
+
+            if round > 0 {
+                conn.execute("DROP TABLE IF EXISTS t").unwrap();
+            }
+
+            conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, a TEXT, b TEXT, c INTEGER)")
+                .unwrap();
+            conn.execute("CREATE INDEX idx_a ON t(a)").unwrap();
+            conn.execute("CREATE INDEX idx_b ON t(b)").unwrap();
+            conn.execute("CREATE INDEX idx_c ON t(c)").unwrap();
+
+            for i in 0..1000 {
+                conn.execute(format!("INSERT INTO t VALUES({i}, 'a_{i}', 'b_{i}', {i})"))
+                    .unwrap();
+            }
+
+            conn.close().unwrap();
+        }
+
+        db.restart();
+
+        {
+            let conn = db.connect();
+            let rows = get_rows(&conn, "SELECT count(*) FROM t");
+            assert_eq!(
+                rows[0][0].as_int().unwrap(),
+                1000,
+                "round {round}: expected 1000 rows"
+            );
+            conn.close().unwrap();
+        }
+    }
+}
