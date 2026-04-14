@@ -2012,3 +2012,80 @@ fn test_trigger_upsert_clause_persists_after_rename() -> anyhow::Result<()> {
 
     Ok(())
 }
+
+// Regression for #6332: ALTER TABLE RENAME COLUMN must NOT rewrite an
+// ORDER BY identifier that binds to an output alias. SQLite's ORDER BY
+// resolution rule prefers the output alias over a same-named FROM column,
+// so renaming `src.b` to `src.c` must leave `ORDER BY b` alone when `b` is
+// an `AS` alias.
+//
+// Note: this asserts the *stored* trigger body only. The runtime trigger
+// execution path has a separate binding quirk that causes the ORDER BY to
+// still resolve against the FROM column rather than the alias — that is a
+// different bug surfaced by the same issue, not addressed in this PR.
+#[turso_macros::test(mvcc)]
+fn test_alter_table_rename_column_preserves_order_by_alias_in_trigger(db: TempDatabase) {
+    let conn = db.connect_limbo();
+
+    conn.execute("CREATE TABLE src(a, b)").unwrap();
+    conn.execute("CREATE TABLE dst(x)").unwrap();
+    conn.execute("CREATE TABLE log(v)").unwrap();
+
+    conn.execute(
+        "CREATE TRIGGER trig AFTER INSERT ON dst BEGIN
+           INSERT INTO log SELECT a AS b FROM src ORDER BY b;
+         END",
+    )
+    .unwrap();
+
+    conn.execute("ALTER TABLE src RENAME COLUMN b TO c")
+        .unwrap();
+
+    // The rewrite must leave the ORDER BY alias reference alone. Before the
+    // fix, it was rewritten to `ORDER BY c`, which is a plain lie about what
+    // the trigger body says and rules out ever getting the correct alias
+    // binding at execution time.
+    let trigger_sql: Vec<(String,)> =
+        conn.exec_rows("SELECT sql FROM sqlite_schema WHERE type='trigger' AND name='trig'");
+    assert_eq!(trigger_sql.len(), 1);
+    let body = &trigger_sql[0].0;
+    assert!(
+        body.contains("ORDER BY b"),
+        "ORDER BY must still reference the alias `b` after rename, got: {body}"
+    );
+    assert!(
+        !body.contains("ORDER BY c"),
+        "ORDER BY alias `b` must not have been rewritten to the renamed column `c`, got: {body}"
+    );
+}
+
+// Companion regression: also exercise an elided alias (`SELECT a b` without
+// the explicit `AS`). SQLite treats both forms as user-provided aliases for
+// ORDER BY resolution.
+#[turso_macros::test(mvcc)]
+fn test_alter_table_rename_column_preserves_order_by_elided_alias_in_trigger(db: TempDatabase) {
+    let conn = db.connect_limbo();
+
+    conn.execute("CREATE TABLE src(a, b)").unwrap();
+    conn.execute("CREATE TABLE dst(x)").unwrap();
+    conn.execute("CREATE TABLE log(v)").unwrap();
+
+    conn.execute(
+        "CREATE TRIGGER trig AFTER INSERT ON dst BEGIN
+           INSERT INTO log SELECT a b FROM src ORDER BY b;
+         END",
+    )
+    .unwrap();
+
+    conn.execute("ALTER TABLE src RENAME COLUMN b TO c")
+        .unwrap();
+
+    let trigger_sql: Vec<(String,)> =
+        conn.exec_rows("SELECT sql FROM sqlite_schema WHERE type='trigger' AND name='trig'");
+    assert_eq!(trigger_sql.len(), 1);
+    let body = &trigger_sql[0].0;
+    assert!(
+        body.contains("ORDER BY b"),
+        "ORDER BY must still reference the elided alias `b` after rename, got: {body}"
+    );
+}

@@ -2948,7 +2948,20 @@ fn apply_select_for_column_rename(
         _ => outer_target_qualifiers.to_vec(),
     };
 
+    // Per SQLite's ORDER BY resolution rules (https://sqlite.org/lang_select.html),
+    // an ORDER BY expression that is a bare identifier matching an *output column
+    // alias* binds to that alias, NOT to a same-named column in the FROM tables.
+    // For `SELECT a AS b FROM src ORDER BY b`, the `b` in ORDER BY refers to the
+    // alias for `a`, so renaming `src.b` to `src.c` must leave the ORDER BY alone
+    // (#6332). Without this guard, the rewriter blindly turned `ORDER BY b` into
+    // `ORDER BY c`, which then binds to the renamed column and produces wrong
+    // results when the trigger fires.
+    let output_aliases = select_output_aliases(&select.body.select);
+
     for sorted_col in &mut select.order_by {
+        if is_bare_id_matching_alias(&sorted_col.expr, &output_aliases) {
+            continue;
+        }
         apply_expr_for_column_rename(
             mode,
             &mut sorted_col.expr,
@@ -3610,6 +3623,41 @@ fn merge_target_qualifiers(outer: &[String], local: &[String]) -> Vec<String> {
         }
     }
     merged
+}
+
+/// Collect the set of user-provided output column aliases from a `SELECT`
+/// body (explicit `AS x` or elided `x`). Used by the ORDER BY rewriter to
+/// avoid mis-rewriting identifiers that bind to an alias rather than to a
+/// FROM-clause column (#6332).
+///
+/// Implicit column names (`As::ImplicitColumnName`) are intentionally
+/// *excluded*: those are synthetic names derived from the expression text
+/// for display purposes only, and unqualified ORDER BY references against
+/// them should still resolve against the FROM tables per SQLite semantics.
+fn select_output_aliases(body: &ast::OneSelect) -> Vec<String> {
+    let ast::OneSelect::Select { columns, .. } = body else {
+        return Vec::new();
+    };
+    columns
+        .iter()
+        .filter_map(|c| match c {
+            ast::ResultColumn::Expr(_, Some(ast::As::As(name)))
+            | ast::ResultColumn::Expr(_, Some(ast::As::Elided(name))) => {
+                Some(normalize_ident(name.as_str()))
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+/// Returns `true` when `expr` is a bare identifier whose normalized name
+/// matches one of the provided output aliases.
+fn is_bare_id_matching_alias(expr: &ast::Expr, aliases: &[String]) -> bool {
+    let ast::Expr::Id(name) = expr else {
+        return false;
+    };
+    let col_norm = normalize_ident(name.as_str());
+    aliases.iter().any(|alias| alias == &col_norm)
 }
 
 /// Rewrite a trigger command to replace column references.
