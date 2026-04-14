@@ -136,6 +136,7 @@ fn test_autovacuum_readonly_behavior() {
 /// update_ptrmap(child_id, root_id) in a separate resumable step so an IO
 /// yield cannot cause do_allocate_page to run a second time.
 #[test]
+#[cfg(not(feature = "omit_autovacuum"))]
 fn test_ptrmap_updated_after_balance_root() {
     let (_dir, path) = make_autovacuum_db(512, "");
     {
@@ -164,6 +165,7 @@ fn test_ptrmap_updated_after_balance_root() {
 /// Sequential ascending rowids always hit this path: the overflow cell is
 /// always the last cell, which is the only condition balance_quick checks.
 #[test]
+#[cfg(not(feature = "omit_autovacuum"))]
 fn test_ptrmap_updated_after_balance_quick() {
     let (_dir, path) = make_autovacuum_db(512, "");
     {
@@ -196,6 +198,7 @@ fn test_ptrmap_updated_after_balance_quick() {
 /// Descending rowids bypass balance_quick (overflow cell is never the last)
 /// and always take the balance_non_root path.
 #[test]
+#[cfg(not(feature = "omit_autovacuum"))]
 fn test_ptrmap_updated_after_balance_non_root() {
     let (_dir, path) = make_autovacuum_db(512, "");
     {
@@ -230,6 +233,7 @@ fn test_ptrmap_updated_after_balance_non_root() {
 /// pages fill quickly at page_size=512 and the interior level itself
 /// triggers balance_non_root, exercising sites 2 and 3.
 #[test]
+#[cfg(not(feature = "omit_autovacuum"))]
 fn test_ptrmap_updated_after_interior_page_rebalance() {
     let (_dir, path) = make_autovacuum_db(512, "CREATE INDEX t_val ON t(val);");
     {
@@ -251,6 +255,7 @@ fn test_ptrmap_updated_after_interior_page_rebalance() {
 /// triggering balance_non_root for middle-of-tree splits. All five ptrmap write
 /// sites are exercised in a single test.
 #[test]
+#[cfg(not(feature = "omit_autovacuum"))]
 fn test_ptrmap_updated_after_mixed_inserts() {
     let (_dir, path) = make_autovacuum_db(512, "");
     {
@@ -280,6 +285,7 @@ fn test_ptrmap_updated_after_mixed_inserts() {
 /// rusqlite's integrity_check catches any entry that was not updated after
 /// a merge reassigned a page to a different sibling.
 #[test]
+#[cfg(not(feature = "omit_autovacuum"))]
 fn test_ptrmap_correct_after_delete_and_rebalance() {
     let (_dir, path) = make_autovacuum_db(512, "");
     {
