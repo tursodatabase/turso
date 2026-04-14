@@ -3367,10 +3367,7 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
             }
 
             if options.contains_without_rowid() {
-                has_rowid = false;
-                return Err(crate::LimboError::ParseError(
-                    "WITHOUT ROWID tables are not supported".to_string(),
-                ));
+                crate::bail_parse_error!("WITHOUT ROWID tables are not supported");
             }
         }
         CreateTableBody::AsSelect(_) => {
@@ -4501,7 +4498,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "WITHOUT ROWID tables are now rejected early in create_table"]
+    #[ignore = "WITHOUT ROWID not supported"]
     pub fn test_column_is_rowid_alias_single_integer_separate_primary_key_definition_without_rowid(
     ) -> Result<()> {
         let sql = r#"CREATE TABLE t1 (a INTEGER, b TEXT, PRIMARY KEY(a)) WITHOUT ROWID;"#;
@@ -4515,7 +4512,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "WITHOUT ROWID tables are now rejected early in create_table"]
+    #[ignore = "WITHOUT ROWID not supported"]
     pub fn test_column_is_rowid_alias_single_integer_without_rowid() -> Result<()> {
         let sql = r#"CREATE TABLE t1 (a INTEGER PRIMARY KEY, b TEXT) WITHOUT ROWID;"#;
         let table = BTreeTable::from_sql(sql, 0)?;
@@ -5124,11 +5121,9 @@ mod tests {
     fn test_without_rowid_rejected() {
         let sql = r#"CREATE TABLE t(code TEXT PRIMARY KEY, val TEXT) WITHOUT ROWID"#;
         let result = BTreeTable::from_sql(sql, 0);
-        assert!(result.is_err());
-        let err_msg = format!("{:?}", result.unwrap_err());
-        assert!(
-            err_msg.contains("WITHOUT ROWID"),
-            "Error should mention WITHOUT ROWID: {err_msg}"
+        assert_eq!(
+            "Parse error: WITHOUT ROWID tables are not supported",
+            format!("{}", result.unwrap_err())
         );
     }
 
