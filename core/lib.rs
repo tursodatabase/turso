@@ -1768,14 +1768,20 @@ pub enum CdcVersion {
     V1 = 1,
     /// 9 columns (adds change_txn_id + COMMIT records with change_type=2)
     V2 = 2,
+    /// 10 columns (adds origin of the modification - user/trigger/fk action)
+    V3 = 3,
 }
 
-pub const CDC_VERSION_CURRENT: CdcVersion = CdcVersion::V2;
+pub const CDC_VERSION_CURRENT: CdcVersion = CdcVersion::V3;
 
 impl CdcVersion {
     /// Whether this version emits COMMIT records (change_type=2)
     pub fn has_commit_record(self) -> bool {
         self >= CdcVersion::V2
+    }
+    /// Whether this version emits change_origin column
+    pub fn has_change_origin(self) -> bool {
+        self >= CdcVersion::V3
     }
 }
 
@@ -1784,6 +1790,7 @@ impl std::fmt::Display for CdcVersion {
         match self {
             CdcVersion::V1 => write!(f, "v1"),
             CdcVersion::V2 => write!(f, "v2"),
+            CdcVersion::V3 => write!(f, "v3"),
         }
     }
 }
@@ -1794,6 +1801,7 @@ impl std::str::FromStr for CdcVersion {
         match s {
             "v1" => Ok(CdcVersion::V1),
             "v2" => Ok(CdcVersion::V2),
+            "v3" => Ok(CdcVersion::V3),
             _ => Err(LimboError::InternalError(format!(
                 "unexpected CDC version: {s}"
             ))),
