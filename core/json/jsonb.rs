@@ -784,13 +784,23 @@ impl JsonbHeader {
                 // Get the last 4 bits for header_size
                 let header_size = header_byte >> 4;
                 let offset: usize;
+                // Use checked arithmetic when advancing past the header byte.
+                // Fuzzer-crafted JSONB can drive `cursor` to near-`usize::MAX`
+                // values via deeply nested elements, and the unchecked
+                // `cursor + 1` below would then panic with
+                // "attempt to add with overflow" in debug builds (#5057).
+                let size_cursor = || {
+                    cursor
+                        .checked_add(1)
+                        .ok_or_else(|| LimboError::ParseError("malformed JSON".to_string()))
+                };
                 let total_size = match header_size {
                     size if size <= 11 => {
                         offset = 1;
                         size as usize
                     }
 
-                    12 => match slice.get(cursor + 1) {
+                    12 => match slice.get(size_cursor()?) {
                         Some(value) => {
                             offset = 2;
                             *value as usize
@@ -798,7 +808,7 @@ impl JsonbHeader {
                         None => bail_parse_error!("Failed to read 1-byte size"),
                     },
 
-                    13 => match Self::get_size_bytes(slice, cursor + 1, 2) {
+                    13 => match Self::get_size_bytes(slice, size_cursor()?, 2) {
                         Ok(bytes) => {
                             offset = 3;
                             u16::from_be_bytes([bytes[0], bytes[1]]) as usize
@@ -806,7 +816,7 @@ impl JsonbHeader {
                         Err(e) => return Err(e),
                     },
 
-                    14 => match Self::get_size_bytes(slice, cursor + 1, 4) {
+                    14 => match Self::get_size_bytes(slice, size_cursor()?, 4) {
                         Ok(bytes) => {
                             offset = 5;
                             u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) as usize
@@ -815,7 +825,7 @@ impl JsonbHeader {
                     },
 
                     // 15 = 8-byte payload size (for future expansion per SQLite spec)
-                    15 => match Self::get_size_bytes(slice, cursor + 1, 8) {
+                    15 => match Self::get_size_bytes(slice, size_cursor()?, 8) {
                         Ok(bytes) => {
                             offset = 9;
                             u64::from_be_bytes([
@@ -884,7 +894,13 @@ impl JsonbHeader {
     }
 
     fn get_size_bytes(slice: &[u8], start: usize, count: usize) -> Result<&[u8]> {
-        match slice.get(start..start + count) {
+        // `start + count` overflows in debug builds when fuzzer-crafted JSONB
+        // drives `start` (i.e. the header cursor) near `usize::MAX`. Reach for
+        // `checked_add` so we surface a parse error instead of panicking (#5057).
+        let end = start
+            .checked_add(count)
+            .ok_or_else(|| LimboError::ParseError("malformed JSON".to_string()))?;
+        match slice.get(start..end) {
             Some(bytes) => Ok(bytes),
             None => bail_parse_error!("Failed to read header size"),
         }
@@ -4542,5 +4558,33 @@ mod path_operations_tests {
         // Should return an error instead of panicking with overflow
         let result = jsonb.array_len();
         assert!(result.is_err());
+    }
+
+    // Regression coverage for #5057: the fuzzer drove `cursor` high enough
+    // that `cursor + 1` in `JsonbHeader::from_slice` and `start + count` in
+    // `get_size_bytes` overflowed `usize` in debug builds and panicked
+    // ("attempt to add with overflow"). These inputs exercise those two
+    // arithmetic sites directly via `element_type()`, which calls
+    // `read_header` → `from_slice`.
+    #[test]
+    fn test_from_slice_saturated_cursor_one_byte_size() {
+        // ARRAY (11) with 1-byte payload-size marker (12 << 4): needs to
+        // read cursor+1, so near-max cursor must not overflow.
+        let malformed: Vec<u8> = vec![0xCB]; // header present, but no size byte follows
+        let jsonb = Jsonb { data: malformed };
+        let result = jsonb.element_type();
+        assert!(result.is_err(), "expected parse error, got {result:?}");
+    }
+
+    #[test]
+    fn test_from_slice_saturated_cursor_multi_byte_size() {
+        // ARRAY (11) with 4-byte payload-size marker (14 << 4): needs to
+        // read cursor+1..cursor+5 via `get_size_bytes`. Only one byte
+        // follows, so both the `checked_add(count)` and the slice `get`
+        // should surface a parse error rather than panicking.
+        let malformed: Vec<u8> = vec![0xEB, 0x00];
+        let jsonb = Jsonb { data: malformed };
+        let result = jsonb.element_type();
+        assert!(result.is_err(), "expected parse error, got {result:?}");
     }
 }
