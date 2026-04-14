@@ -1,11 +1,14 @@
-use crate::translate::emitter::Resolver;
+use crate::translate::emitter::{
+    emit_cdc_autocommit_commit, emit_cdc_full_record, emit_cdc_insns, prepare_cdc_if_necessary,
+    OperationMode, Resolver,
+};
 use crate::translate::schema::{emit_schema_entry, SchemaEntryType, SQLITE_TABLEID};
 use crate::translate::ProgramBuilder;
 use crate::translate::ProgramBuilderOpts;
 use crate::util::{escape_sql_string_literal, normalize_ident};
 use crate::vdbe::builder::CursorType;
-use crate::vdbe::insn::{Cookie, Insn};
-use crate::{bail_parse_error, Result, MAIN_DB_ID};
+use crate::vdbe::insn::{CmpInsFlags, Cookie, Insn};
+use crate::{bail_parse_error, CaptureDataChangesExt, Result, MAIN_DB_ID};
 use turso_parser::ast::{self, QualifiedName};
 
 /// Reconstruct SQL string from CREATE TRIGGER AST
@@ -190,12 +193,14 @@ pub fn translate_create_trigger(
         db: database_id,
     });
 
+    let cdc_table = prepare_cdc_if_necessary(program, resolver.schema(), SQLITE_TABLEID)?;
+
     // Add the trigger entry to sqlite_schema
     emit_schema_entry(
         program,
         resolver,
         sqlite_schema_cursor_id,
-        None, // cdc_table_cursor_id, no cdc for triggers
+        cdc_table.as_ref().map(|x| x.0),
         SchemaEntryType::Trigger,
         &normalized_trigger_name,
         &normalized_table_name,
@@ -501,13 +506,17 @@ pub fn translate_drop_trigger(
     program.extend(&opts);
 
     // Open cursor to sqlite_schema table (structure is the same for all databases)
-    let table = resolver.with_schema(MAIN_DB_ID, |s| s.get_btree_table(SQLITE_TABLEID).unwrap());
-    let sqlite_schema_cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(table));
+    let sqlite_schema_table =
+        resolver.with_schema(MAIN_DB_ID, |s| s.get_btree_table(SQLITE_TABLEID).unwrap());
+    let sqlite_schema_cursor_id =
+        program.alloc_cursor_id(CursorType::BTreeTable(sqlite_schema_table.clone()));
     program.emit_insn(Insn::OpenWrite {
         cursor_id: sqlite_schema_cursor_id,
         root_page: 1i64.into(),
         db: database_id,
     });
+
+    let cdc_table = prepare_cdc_if_necessary(program, resolver.schema(), SQLITE_TABLEID)?;
 
     let search_loop_label = program.allocate_label();
     let skip_non_trigger_label = program.allocate_label();
@@ -547,7 +556,7 @@ pub fn translate_drop_trigger(
         lhs: type_reg,
         rhs: type_str_reg,
         target_pc: skip_non_trigger_label,
-        flags: crate::vdbe::insn::CmpInsFlags::default(),
+        flags: CmpInsFlags::default(),
         collation: program.curr_collation(),
     });
 
@@ -557,11 +566,42 @@ pub fn translate_drop_trigger(
         lhs: name_reg,
         rhs: trigger_name_str_reg,
         target_pc: skip_non_trigger_label,
-        flags: crate::vdbe::insn::CmpInsFlags::default(),
+        flags: CmpInsFlags::default(),
         collation: program.curr_collation(),
     });
 
-    // Found it! Delete the row
+    if let Some((cdc_cursor_id, _)) = cdc_table {
+        // Found it — emit CDC record and delete the row
+        let row_id_reg = program.alloc_register();
+        program.emit_insn(Insn::RowId {
+            cursor_id: sqlite_schema_cursor_id,
+            dest: row_id_reg,
+        });
+
+        let before_record_reg = if program.capture_data_changes_info().has_before() {
+            Some(emit_cdc_full_record(
+                program,
+                &sqlite_schema_table.columns,
+                sqlite_schema_cursor_id,
+                row_id_reg,
+                sqlite_schema_table.is_strict,
+            ))
+        } else {
+            None
+        };
+        emit_cdc_insns(
+            program,
+            resolver,
+            OperationMode::DELETE,
+            cdc_cursor_id,
+            row_id_reg,
+            before_record_reg,
+            None,
+            None,
+            SQLITE_TABLEID,
+        )?;
+    }
+
     program.emit_insn(Insn::Delete {
         cursor_id: sqlite_schema_cursor_id,
         table_name: SQLITE_TABLEID.to_string(),
@@ -581,6 +621,10 @@ pub fn translate_drop_trigger(
     program.preassign_label_to_next_insn(done_label);
 
     program.preassign_label_to_next_insn(rewind_done_label);
+
+    if let Some((cdc_cursor_id, _)) = cdc_table {
+        emit_cdc_autocommit_commit(program, resolver, cdc_cursor_id)?;
+    }
 
     // Update schema version
     let schema_version = resolver.with_schema(database_id, |s| s.schema_version);

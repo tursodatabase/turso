@@ -930,10 +930,10 @@ pub fn prepare_cdc_if_necessary(
     changed_table_name: &str,
 ) -> Result<Option<(usize, Arc<BTreeTable>)>> {
     let mode = program.capture_data_changes_info();
-    // replay of changes from triggers/fk actions is not safe in sync engine - so we ignore them in this version of CDC
     match program.program_origin() {
         ProgramOrigin::User => {}
         ProgramOrigin::Trigger | ProgramOrigin::ForeignKeyAction => {
+            // replay of changes from triggers/fk actions will lead to duplicates in the sync engine - so we ignore them in the version of CDC which has no information about change origin
             if mode.is_none() || !mode.as_ref().unwrap().cdc_version().has_change_origin() {
                 return Ok(None);
             }
