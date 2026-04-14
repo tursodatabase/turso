@@ -640,7 +640,122 @@ fn vacuum_into_step(
                 }
             },
 
-            _ => todo!("VACUUM INTO engine phase not moved yet"),
+            VacuumIntoSubState::CopyMetaValues => {
+                // Copy meta values to destination database
+                // Use pragma_update to set user_version and application_id
+                // Note: schema_version is not copied - VACUUM INTO creates a new file so
+                // there's no cache to invalidate. The destination will have its own
+                // schema_version based on the schema operations performed.
+                state
+                    .dest_conn
+                    .pragma_update("user_version", config.source_user_version.to_string())?;
+                state
+                    .dest_conn
+                    .pragma_update("application_id", config.source_application_id.to_string())?;
+
+                // Phase 3: Create user-defined secondary indexes after data copy
+                // for performance (avoids maintaining indexes during bulk insert).
+                state.sub_state = VacuumIntoSubState::PrepareCreateIndex { idx: 0 };
+                continue;
+            }
+
+            // Phase 3: Create user-defined secondary indexes.
+            VacuumIntoSubState::PrepareCreateIndex { idx } => {
+                let entries_len = state.indexes_to_create.len();
+                if idx >= entries_len {
+                    // Done creating indexes, move to post-data objects
+                    state.sub_state = VacuumIntoSubState::PreparePostData { idx: 0 };
+                    continue;
+                }
+
+                let entry_ordinal = state.indexes_to_create[idx];
+                let entry = &state.schema_entries[entry_ordinal];
+                // Backing-btree indexes for custom index methods were filtered
+                // out when indexes_to_create was built. The remaining CREATE
+                // INDEX statements are user-visible and can use ordinary prepare.
+                let dest_stmt = state.dest_conn.prepare(&entry.sql)?;
+                state.sub_state = VacuumIntoSubState::StepCreateIndex {
+                    dest_schema_stmt: Box::new(dest_stmt),
+                    idx,
+                };
+                continue;
+            }
+
+            VacuumIntoSubState::StepCreateIndex {
+                mut dest_schema_stmt,
+                idx,
+            } => match dest_schema_stmt.step()? {
+                crate::StepResult::Row => {
+                    unreachable!("CREATE INDEX statement unexpectedly returned a row");
+                }
+                crate::StepResult::Done => {
+                    state.sub_state = VacuumIntoSubState::PrepareCreateIndex { idx: idx + 1 };
+                    continue;
+                }
+                crate::StepResult::IO => {
+                    let io = dest_schema_stmt
+                        .take_io_completions()
+                        .expect("StepResult::IO returned but no completions available");
+                    state.sub_state = VacuumIntoSubState::StepCreateIndex {
+                        dest_schema_stmt,
+                        idx,
+                    };
+                    return Ok(IOResult::IO(io));
+                }
+                crate::StepResult::Busy | crate::StepResult::Interrupt => {
+                    return Err(LimboError::Busy);
+                }
+            },
+
+            // Phase 4: Create triggers, views, and rootpage=0 schema objects.
+            VacuumIntoSubState::PreparePostData { idx } => {
+                let entries_len = state.post_data_entries.len();
+                if idx >= entries_len {
+                    state.sub_state = VacuumIntoSubState::Done;
+                    continue;
+                }
+
+                let entry_ordinal = state.post_data_entries[idx];
+                let entry = &state.schema_entries[entry_ordinal];
+                let dest_stmt = state.dest_conn.prepare(&entry.sql)?;
+                state.sub_state = VacuumIntoSubState::StepPostData {
+                    dest_schema_stmt: Box::new(dest_stmt),
+                    idx,
+                };
+                continue;
+            }
+
+            VacuumIntoSubState::StepPostData {
+                mut dest_schema_stmt,
+                idx,
+            } => match dest_schema_stmt.step()? {
+                crate::StepResult::Row => {
+                    unreachable!("CREATE statement unexpectedly returned a row");
+                }
+                crate::StepResult::Done => {
+                    state.sub_state = VacuumIntoSubState::PreparePostData { idx: idx + 1 };
+                    continue;
+                }
+                crate::StepResult::IO => {
+                    let io = dest_schema_stmt
+                        .take_io_completions()
+                        .expect("StepResult::IO returned but no completions available");
+                    state.sub_state = VacuumIntoSubState::StepPostData {
+                        dest_schema_stmt,
+                        idx,
+                    };
+                    return Ok(IOResult::IO(io));
+                }
+                crate::StepResult::Busy | crate::StepResult::Interrupt => {
+                    return Err(LimboError::Busy);
+                }
+            },
+
+            VacuumIntoSubState::Done => {
+                // Commit the destination transaction started in Init state.
+                state.dest_conn.execute("COMMIT")?;
+                return Ok(IOResult::Done(()));
+            }
         }
     }
 }
