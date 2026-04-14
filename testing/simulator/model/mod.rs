@@ -12,7 +12,7 @@ use sql_generation::model::{
         pragma::Pragma,
         select::{CompoundOperator, FromClause, ResultColumn, SelectInner},
         transaction::{Begin, Commit, Rollback},
-        update::{SetValue, Update},
+        update::{SelfRefSubquery, SetValue, Update},
     },
     table::{Column, ColumnType, Index, JoinTable, JoinType, SimValue, Table, TableContext},
 };
@@ -587,7 +587,7 @@ impl Shadow for Insert {
     //FIXME this doesn't handle type affinity
     fn shadow(&self, tables: &mut ShadowTablesMut) -> Self::Result {
         match self {
-            Insert::Select { table, select } => {
+            Insert::Select { table, select, .. } => {
                 let table_name = table.clone();
                 let raw_rows = select.shadow(tables)?;
 
@@ -610,6 +610,7 @@ impl Shadow for Insert {
                 table,
                 values,
                 on_conflict,
+                ..
             } => {
                 let table_name = table.clone();
 
@@ -1040,6 +1041,65 @@ impl Shadow for Update {
                                         new_row[idx] = then_value.clone();
                                     }
                                 }
+                                SetValue::SelfRefSubquery(subquery) => match subquery {
+                                    SelfRefSubquery::MatchByColumn {
+                                        source_column,
+                                        key_column,
+                                    } => {
+                                        if let (Some(source_idx), Some(key_idx)) = (
+                                            columns.iter().position(|c| c.name == *source_column),
+                                            columns.iter().position(|c| c.name == *key_column),
+                                        ) {
+                                            let val = t2
+                                                .rows
+                                                .iter()
+                                                .find(|r| r[key_idx] == old_row[key_idx])
+                                                .map(|r| r[source_idx].clone())
+                                                .unwrap_or(SimValue::NULL);
+                                            new_row[idx] = val;
+                                        }
+                                    }
+                                    SelfRefSubquery::PreviousByOrder {
+                                        source_column,
+                                        order_column,
+                                    } => {
+                                        if let (Some(source_idx), Some(order_idx)) = (
+                                            columns.iter().position(|c| c.name == *source_column),
+                                            columns.iter().position(|c| c.name == *order_column),
+                                        ) {
+                                            let mut best_row: Option<&Vec<SimValue>> = None;
+                                            for candidate in &t2.rows {
+                                                let is_less_than_outer = candidate[order_idx]
+                                                    .binary_compare(
+                                                        &old_row[order_idx],
+                                                        turso_parser::ast::Operator::Less,
+                                                    )
+                                                    .as_bool();
+                                                if !is_less_than_outer {
+                                                    continue;
+                                                }
+
+                                                let is_better = match best_row {
+                                                    None => true,
+                                                    Some(best) => best[order_idx]
+                                                        .binary_compare(
+                                                            &candidate[order_idx],
+                                                            turso_parser::ast::Operator::Less,
+                                                        )
+                                                        .as_bool(),
+                                                };
+
+                                                if is_better {
+                                                    best_row = Some(candidate);
+                                                }
+                                            }
+
+                                            new_row[idx] = best_row
+                                                .map(|r| r[source_idx].clone())
+                                                .unwrap_or(SimValue::NULL);
+                                        }
+                                    }
+                                },
                             }
                         }
                     }

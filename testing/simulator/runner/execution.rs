@@ -459,44 +459,63 @@ fn execute_query_rusqlite(
         );
     }
     match query {
-        Query::Select(select) => {
-            let mut stmt = connection.prepare(select.to_string().as_str())?;
-            let rows = stmt.query_map([], |row| {
-                let mut values = vec![];
-                for i in 0.. {
-                    let value = match row.get(i) {
-                        Ok(value) => value,
-                        Err(err) => match err {
-                            rusqlite::Error::InvalidColumnIndex(_) => break,
-                            _ => {
-                                tracing::error!(?err);
-                                panic!("{err}")
-                            }
-                        },
-                    };
-                    let value = match value {
-                        rusqlite::types::Value::Null => Value::Null,
-                        rusqlite::types::Value::Integer(i) => Value::from_i64(i),
-                        rusqlite::types::Value::Real(f) => Value::from_f64(f),
-                        rusqlite::types::Value::Text(s) => Value::build_text(s),
-                        rusqlite::types::Value::Blob(b) => Value::Blob(b),
-                    };
-                    values.push(SimValue(value));
-                }
-                Ok(values)
-            })?;
-            let mut result = vec![];
-            for row in rows {
-                result.push(row?);
-            }
-            Ok(result)
-        }
         Query::Placeholder => {
             unreachable!("simulation cannot have a placeholder Query for execution")
         }
+        _ if query_returns_rows(query) => execute_query_rows_rusqlite(connection, query),
         _ => {
             connection.execute(query.to_string().as_str(), ())?;
             Ok(vec![])
         }
     }
+}
+
+fn query_returns_rows(query: &Query) -> bool {
+    match query {
+        Query::Select(_) => true,
+        Query::Insert(insert) => match insert {
+            sql_generation::model::query::Insert::Values { returning, .. }
+            | sql_generation::model::query::Insert::Select { returning, .. } => returning.is_some(),
+        },
+        Query::Update(update) => update.returning.is_some(),
+        Query::Delete(delete) => delete.returning.is_some(),
+        _ => false,
+    }
+}
+
+fn execute_query_rows_rusqlite(
+    connection: &rusqlite::Connection,
+    query: &Query,
+) -> rusqlite::Result<Vec<Vec<SimValue>>> {
+    let sql = query.to_string();
+    let mut stmt = connection.prepare(sql.as_str())?;
+    let rows = stmt.query_map([], |row| {
+        let mut values = vec![];
+        for i in 0.. {
+            let value = match row.get(i) {
+                Ok(value) => value,
+                Err(err) => match err {
+                    rusqlite::Error::InvalidColumnIndex(_) => break,
+                    _ => {
+                        tracing::error!(?err);
+                        panic!("{err}")
+                    }
+                },
+            };
+            let value = match value {
+                rusqlite::types::Value::Null => Value::Null,
+                rusqlite::types::Value::Integer(i) => Value::from_i64(i),
+                rusqlite::types::Value::Real(f) => Value::from_f64(f),
+                rusqlite::types::Value::Text(s) => Value::build_text(s),
+                rusqlite::types::Value::Blob(b) => Value::Blob(b),
+            };
+            values.push(SimValue(value));
+        }
+        Ok(values)
+    })?;
+    let mut result = vec![];
+    for row in rows {
+        result.push(row?);
+    }
+    Ok(result)
 }

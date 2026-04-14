@@ -107,11 +107,14 @@ impl Profile {
                         insert: InsertOpts {
                             min_rows: NonZeroU32::new(50).unwrap(),
                             max_rows: NonZeroU32::new(200).unwrap(),
+                            returning_prob: 0.25,
                             ..Default::default()
                         },
                         update: UpdateOpts {
                             padding_size: Some(20_000),
                             force_late_failure: true,
+                            self_ref_subquery_prob: 0.45,
+                            returning_prob: 0.35,
                         },
                         ..Default::default()
                     },

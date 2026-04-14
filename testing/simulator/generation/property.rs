@@ -76,6 +76,7 @@ impl Property {
                         Query::Delete(Delete {
                             table: t,
                             predicate,
+                            ..
                         }) if t == &table.name && predicate.test(row, table) => {
                             // The inserted row will not be deleted.
                             None
@@ -89,6 +90,7 @@ impl Property {
                             table: t,
                             set_values: _,
                             predicate,
+                            ..
                         }) if t == &table.name && predicate.test(row, table) => {
                             // The inserted row will not be updated.
                             None
@@ -174,6 +176,7 @@ impl Property {
                         Query::Insert(Insert::Select {
                             table: t,
                             select: _,
+                            ..
                         }) if t == &table.name => {
                             // A row that holds for the predicate will not be inserted.
                             None
@@ -407,6 +410,9 @@ impl Property {
                                                         )));
                                                     }
                                                 }
+                                                SetValue::SelfRefSubquery(_) => {
+                                                    // noop
+                                                }
                                             }
                                         }
                                     }
@@ -468,6 +474,7 @@ impl Property {
                     table,
                     values,
                     on_conflict: None,
+                    ..
                 } = insert
                 {
                     (table, values)
@@ -707,6 +714,7 @@ impl Property {
                 let delete = InteractionType::Query(Query::Delete(Delete {
                     table: table.clone(),
                     predicate: predicate.clone(),
+                    returning: None,
                 }));
 
                 let select = InteractionType::Query(Query::Select(Select::simple(
@@ -1308,6 +1316,7 @@ fn property_insert_values_select<R: rand::Rng + ?Sized>(
         table: table.name.clone(),
         values: rows,
         on_conflict: None,
+        returning: None,
     });
 
     // Choose if we want queries to be executed in an interactive transaction

@@ -188,6 +188,8 @@ pub struct InsertOpts {
     pub max_rows: NonZeroU32,
     #[garde(range(min = 0.0, max = 1.0))]
     pub upsert_prob: f64,
+    #[garde(range(min = 0.0, max = 1.0))]
+    pub returning_prob: f64,
 }
 
 impl Default for InsertOpts {
@@ -196,17 +198,33 @@ impl Default for InsertOpts {
             min_rows: NonZero::new(1).unwrap(),
             max_rows: NonZero::new(10).unwrap(),
             upsert_prob: 0.15,
+            returning_prob: 0.10,
         }
     }
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema, Validate)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, Validate)]
 #[serde(deny_unknown_fields, default)]
 pub struct UpdateOpts {
     #[garde(skip)]
     pub padding_size: Option<usize>,
     #[garde(skip)]
     pub force_late_failure: bool,
+    #[garde(range(min = 0.0, max = 1.0))]
+    pub self_ref_subquery_prob: f64,
+    #[garde(range(min = 0.0, max = 1.0))]
+    pub returning_prob: f64,
+}
+
+impl Default for UpdateOpts {
+    fn default() -> Self {
+        Self {
+            padding_size: None,
+            force_late_failure: false,
+            self_ref_subquery_prob: 0.20,
+            returning_prob: 0.15,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, Validate)]

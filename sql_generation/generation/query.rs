@@ -8,7 +8,7 @@ use crate::model::query::select::{
     CompoundOperator, CompoundSelect, Distinctness, FromClause, OrderBy, ResultColumn, SelectBody,
     SelectInner, SelectTable,
 };
-use crate::model::query::update::{SetValue, Update};
+use crate::model::query::update::{SelfRefSubquery, SetValue, Update};
 use crate::model::query::{
     Create, CreateIndex, Delete, Drop, DropIndex, Insert, OnConflict, Select, UpdateSetItem,
 };
@@ -291,6 +291,7 @@ impl Arbitrary for Insert {
             Some(Insert::Select {
                 table: table.name.clone(),
                 select: Box::new(select),
+                returning: None,
             })
         };
 
@@ -308,6 +309,7 @@ impl Arbitrary for Insert {
             Some(Insert::Select {
                 table: select_table.name.clone(),
                 select: Box::new(select),
+                returning: None,
             })
         };
 
@@ -330,8 +332,43 @@ impl Arbitrary for Insert {
             choices.push((1, Box::new(gen_select)));
         }
 
-        backtrack(choices, rng).expect("backtrack should with these arguments not return None")
+        let mut insert =
+            backtrack(choices, rng).expect("backtrack should with these arguments not return None");
+
+        if rng.random_bool(insert_opts.returning_prob) {
+            let table_name = insert.table().to_string();
+            let returning = env
+                .tables()
+                .iter()
+                .find(|t| t.name == table_name)
+                .and_then(|t| gen_returning_columns_for_table(rng, t));
+            match &mut insert {
+                Insert::Values { returning: r, .. } | Insert::Select { returning: r, .. } => {
+                    *r = returning
+                }
+            }
+        }
+
+        insert
     }
+}
+
+fn gen_returning_columns_for_table<R: Rng + ?Sized>(
+    rng: &mut R,
+    table: &Table,
+) -> Option<Vec<String>> {
+    if table.columns.is_empty() {
+        return Some(vec![]);
+    }
+    if rng.random_bool(0.5) {
+        return Some(vec![]);
+    }
+    let max_cols = table.columns.len().min(3);
+    let num_cols = rng.random_range(1..=max_cols);
+    let cols = pick_unique(&table.columns, num_cols, rng)
+        .map(|c| c.name.clone())
+        .collect();
+    Some(cols)
 }
 
 fn gen_insert_values<R: Rng + ?Sized, C: GenerationContext>(
@@ -379,6 +416,7 @@ fn gen_insert_values<R: Rng + ?Sized, C: GenerationContext>(
         table: table.name.clone(),
         values,
         on_conflict: None,
+        returning: None,
     })
 }
 
@@ -550,6 +588,7 @@ fn gen_insert_upsert_values<R: Rng + ?Sized, C: GenerationContext>(
             target_column: target_col.name.clone(),
             assignments,
         }),
+        returning: None,
     })
 }
 
@@ -559,6 +598,11 @@ impl Arbitrary for Delete {
         Self {
             table: table.name.clone(),
             predicate: Predicate::arbitrary_from(rng, env, table),
+            returning: if rng.random_bool(env.opts().query.update.returning_prob) {
+                gen_returning_columns_for_table(rng, table)
+            } else {
+                None
+            },
         }
     }
 }
@@ -633,6 +677,15 @@ impl Arbitrary for Update {
     fn arbitrary<R: Rng + ?Sized, C: GenerationContext>(rng: &mut R, env: &C) -> Self {
         let table = pick(env.tables(), rng);
         let update_opts = &env.opts().query.update;
+
+        if rng.random_bool(update_opts.self_ref_subquery_prob) {
+            if let Some(mut update) = gen_self_referential_update(rng, env, table) {
+                if rng.random_bool(update_opts.returning_prob) {
+                    update.returning = gen_returning_columns_for_table(rng, table);
+                }
+                return update;
+            }
+        }
 
         let unique_columns: Vec<(usize, &Column)> = table
             .columns
@@ -738,12 +791,85 @@ impl Arbitrary for Update {
             (set_values, predicate)
         };
 
-        Update {
+        let mut update = Update {
             table: table.name.clone(),
             set_values,
             predicate,
+            returning: None,
+        };
+
+        if rng.random_bool(update_opts.returning_prob) {
+            update.returning = gen_returning_columns_for_table(rng, table);
         }
+
+        update
     }
+}
+
+fn gen_self_referential_update<R: Rng + ?Sized, C: GenerationContext>(
+    rng: &mut R,
+    env: &C,
+    table: &Table,
+) -> Option<Update> {
+    if table.rows.len() < 2 {
+        return None;
+    }
+
+    let indexed_cols: IndexSet<&str> = table
+        .indexes
+        .iter()
+        .flat_map(|idx| idx.columns.iter().map(|(name, _)| name.as_str()))
+        .collect();
+
+    let key_candidates: Vec<&Column> = table
+        .columns
+        .iter()
+        .filter(|c| c.has_unique_or_pk() && !matches!(c.column_type, ColumnType::Blob))
+        .collect();
+    if key_candidates.is_empty() {
+        return None;
+    }
+
+    let target_candidates: Vec<&Column> = table
+        .columns
+        .iter()
+        .filter(|c| c.has_unique_or_pk() || indexed_cols.contains(c.name.as_str()))
+        .collect();
+    if target_candidates.is_empty() {
+        return None;
+    }
+
+    let target_col = *pick(&target_candidates, rng);
+    let key_col = *pick(&key_candidates, rng);
+
+    let order_candidates: Vec<&Column> = table
+        .columns
+        .iter()
+        .filter(|c| {
+            matches!(c.column_type, ColumnType::Integer | ColumnType::Float)
+                && (c.has_unique_or_pk() || indexed_cols.contains(c.name.as_str()))
+        })
+        .collect();
+
+    let subquery = if !order_candidates.is_empty() && rng.random_bool(0.5) {
+        let order_col = *pick(&order_candidates, rng);
+        SelfRefSubquery::PreviousByOrder {
+            source_column: target_col.name.clone(),
+            order_column: order_col.name.clone(),
+        }
+    } else {
+        SelfRefSubquery::MatchByColumn {
+            source_column: target_col.name.clone(),
+            key_column: key_col.name.clone(),
+        }
+    };
+
+    Some(Update {
+        table: table.name.clone(),
+        set_values: vec![(target_col.name.clone(), SetValue::SelfRefSubquery(subquery))],
+        predicate: Predicate::arbitrary_from(rng, env, table),
+        returning: None,
+    })
 }
 
 const ALTER_TABLE_ALL: &[AlterTableTypeDiscriminants] = &[
