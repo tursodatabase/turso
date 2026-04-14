@@ -2202,7 +2202,15 @@ impl Database {
             _ => {
                 #[cfg(all(target_os = "linux", feature = "io_uring", not(miri)))]
                 {
-                    Arc::new(UringIO::new()?)
+                    match UringIO::new() {
+                        Ok(io) => Arc::new(io),
+                        Err(e) => {
+                            tracing::error!(
+                                "Failed to initialize io_uring: {e}. Falling back to SyscallIO."
+                            );
+                            Arc::new(PlatformIO::new()?)
+                        }
+                    }
                 }
                 #[cfg(any(
                     not(target_os = "linux"),
