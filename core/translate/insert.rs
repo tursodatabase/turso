@@ -505,7 +505,7 @@ pub fn translate_insert(
         compute_virtual_columns(
             program,
             &insertion.col_mappings,
-            insertion.rowid_alias_mapping(),
+            insertion.key_register(),
             resolver,
         )?;
 
@@ -739,10 +739,11 @@ pub fn translate_insert(
 
     // Make computed virtual columns accessible to CHECK and NOT NULL constraint evaluation
     if insertion.has_virtual_columns() {
+        //TODO only compute the necessary virtual columns for CHECK and NOT NULL evaluation
         compute_virtual_columns(
             program,
             &insertion.col_mappings,
-            insertion.rowid_alias_mapping(),
+            insertion.key_register(),
             resolver,
         )?;
     }
@@ -904,7 +905,7 @@ pub fn translate_insert(
         compute_virtual_columns(
             program,
             &insertion.col_mappings,
-            insertion.rowid_alias_mapping(),
+            insertion.key_register(),
             resolver,
         )?;
 
@@ -2676,13 +2677,13 @@ fn translate_column(
     Ok(())
 }
 
-fn self_table_ctx_from_col_mappings<'a>(
-    col_mappings: &[ColMapping<'a>],
-    rowid_alias: Option<&ColMapping<'a>>,
+fn self_table_ctx_from_col_mappings(
+    col_mappings: &[ColMapping],
+    rowid_reg: usize,
 ) -> SelfTableContext {
     let col_reg_mapping = col_mappings.iter().map(|cm| {
         let reg = if cm.column.is_rowid_alias() {
-            rowid_alias.map_or(cm.register, |ra| ra.register)
+            rowid_reg
         } else {
             cm.register
         };
@@ -2694,7 +2695,7 @@ fn self_table_ctx_from_col_mappings<'a>(
 pub fn compute_virtual_columns<'a>(
     program: &mut ProgramBuilder,
     col_mappings: &[ColMapping<'a>],
-    rowid_alias: Option<&ColMapping<'a>>,
+    rowid_alias: usize,
     resolver: &Resolver,
 ) -> Result<()> {
     let ctx = self_table_ctx_from_col_mappings(col_mappings, rowid_alias);
