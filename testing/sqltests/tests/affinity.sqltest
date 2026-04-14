@@ -220,6 +220,32 @@ expect {
     1.0
 }
 
+@cross-check-integrity
+test affinity-scalar-subquery-text-comparison {
+    CREATE TABLE t_text (a TEXT);
+    CREATE TABLE t_real (b REAL);
+    INSERT INTO t_text VALUES ('0iqxVenNBUPjXarV');
+    INSERT INTO t_real VALUES (638769.7645092034);
+    SELECT (SELECT a FROM t_text ORDER BY a LIMIT 1) > MAX(b, -829063) FROM t_real;
+}
+expect {
+    0
+}
+
+@cross-check-integrity
+test affinity-scalar-subquery-text-delete-predicate {
+    CREATE TABLE t_text (a TEXT);
+    CREATE TABLE t_real (b REAL);
+    INSERT INTO t_text VALUES ('0iqxVenNBUPjXarV');
+    INSERT INTO t_real VALUES (638769.7645092034);
+    DELETE FROM t_real
+    WHERE (SELECT a FROM t_text ORDER BY a LIMIT 1) > MAX(b, -829063);
+    SELECT COUNT(*) FROM t_real;
+}
+expect {
+    1
+}
+
 # ============================================
 # Multiple columns with different affinities
 # ============================================

@@ -7,9 +7,7 @@ use super::{
         SeekDef, SeekKey, SelectPlan, SetOperation, SimpleAggregate, TableReferences, UpdatePlan,
         WhereTerm,
     },
-    planner::TableMask,
 };
-use crate::schema::GeneratedType;
 use crate::translate::expression_index::expression_index_column_usage;
 use crate::translate::plan::MultiIndexBranchAccess;
 use crate::{
@@ -35,7 +33,7 @@ use crate::{
             NonFromClauseSubquery, OuterQueryReference, QueryDestination, ResultSetColumn, Scan,
             SeekKeyComponent, SubqueryState,
         },
-        trigger_exec::has_relevant_triggers_type_only,
+        trigger_exec::has_triggers_including_temp,
     },
     types::SeekOp,
     util::{
@@ -48,6 +46,7 @@ use crate::{
     },
     LimboError, Result,
 };
+use crate::{schema::GeneratedType, MAIN_DB_ID};
 use crate::{turso_assert, turso_assert_eq, turso_debug_assert, turso_soft_unreachable};
 use constraints::{
     constraints_from_where_clause, usable_constraints_for_join_order, Constraint,
@@ -646,11 +645,16 @@ pub fn optimize_select_plan(plan: &mut SelectPlan, schema: &Schema) -> Result<()
     // unnesting sees the plan without an artificial LIMIT.
     for sub in &mut plan.non_from_clause_subqueries {
         if matches!(sub.query_type, ast::SubqueryType::Exists { .. }) {
-            if let SubqueryState::Unevaluated { plan: Some(inner) } = &mut sub.state {
-                if inner.limit.is_none() {
-                    inner.limit = Some(Box::new(Expr::Literal(ast::Literal::Numeric(
-                        "1".to_string(),
-                    ))));
+            if let SubqueryState::Unevaluated {
+                plan: Some(inner), ..
+            } = &mut sub.state
+            {
+                if let Plan::Select(ref mut inner) = inner.as_mut() {
+                    if inner.limit.is_none() {
+                        inner.limit = Some(Box::new(Expr::Literal(ast::Literal::Numeric(
+                            "1".to_string(),
+                        ))));
+                    }
                 }
             }
         }
@@ -833,14 +837,13 @@ fn first_update_safety_reason(
         // Check if there are UPDATE triggers
         let updated_cols: HashSet<usize> = plan.set_clauses.iter().map(|(i, _)| *i).collect();
         let database_id = table_ref.database_id;
-        if resolver.with_schema(database_id, |s| {
-            has_relevant_triggers_type_only(
-                s,
-                TriggerEvent::Update,
-                Some(&updated_cols),
-                btree_table,
-            )
-        }) {
+        if has_triggers_including_temp(
+            resolver,
+            database_id,
+            TriggerEvent::Update,
+            Some(&updated_cols),
+            btree_table,
+        ) {
             break 'requires Some(DmlSafetyReason::Trigger);
         }
 
@@ -978,7 +981,7 @@ fn add_ephemeral_table_to_update_plan(
             col_used_mask: ColumnUsedMask::default(),
             column_use_counts: Vec::new(),
             expression_index_usages: Vec::new(),
-            database_id: 0,
+            database_id: MAIN_DB_ID,
             indexed: None,
         }],
         vec![],
@@ -1144,6 +1147,9 @@ fn reoptimize_correlated_subqueries(plan: &mut SelectPlan, schema: &Schema) -> R
             plan: Some(inner_plan),
         } = &mut subquery.state
         else {
+            continue;
+        };
+        let Plan::Select(ref mut inner_plan) = inner_plan.as_mut() else {
             continue;
         };
         if !select_plan_contains_cte_from_clause_subquery(inner_plan) {
@@ -2382,11 +2388,10 @@ fn optimize_table_access(
         if build_table_was_prior_probe {
             continue;
         }
-        let prior_mask = TableMask::from_table_number_iter(
-            best_join_order[..probe_pos]
-                .iter()
-                .map(|member| member.original_idx),
-        );
+        let prior_mask = best_join_order[..probe_pos]
+            .iter()
+            .map(|member| member.original_idx)
+            .collect();
         let join_key_indices: HashSet<usize> = hash_join_op
             .join_keys
             .iter()
@@ -3439,12 +3444,14 @@ mod tests {
     fn empty_resolver<'a>(
         schema: &'a Schema,
         database_schemas: &'a RwLock<HashMap<usize, crate::sync::Arc<Schema>>>,
+        temp_database: &'a RwLock<Option<crate::connection::TempDatabase>>,
         attached_databases: &'a RwLock<DatabaseCatalog>,
         syms: &'a SymbolTable,
     ) -> Resolver<'a> {
         Resolver::new(
             schema,
             database_schemas,
+            temp_database,
             attached_databases,
             syms,
             true,
@@ -3475,7 +3482,14 @@ mod tests {
         let syms = SymbolTable::new();
         let database_schemas = RwLock::new(HashMap::default());
         let attached_databases = RwLock::new(DatabaseCatalog::new());
-        let resolver = empty_resolver(&schema, &database_schemas, &attached_databases, &syms);
+        let temp_database = RwLock::new(None);
+        let resolver = empty_resolver(
+            &schema,
+            &database_schemas,
+            &temp_database,
+            &attached_databases,
+            &syms,
+        );
 
         let expr = fn_call(
             "coalesce",
@@ -3504,7 +3518,14 @@ mod tests {
         let syms = SymbolTable::new();
         let database_schemas = RwLock::new(HashMap::default());
         let attached_databases = RwLock::new(DatabaseCatalog::new());
-        let resolver = empty_resolver(&schema, &database_schemas, &attached_databases, &syms);
+        let temp_database = RwLock::new(None);
+        let resolver = empty_resolver(
+            &schema,
+            &database_schemas,
+            &temp_database,
+            &attached_databases,
+            &syms,
+        );
 
         let expr = fn_call(
             "quote",

@@ -142,7 +142,7 @@ expect {
 
 # Unary-plus on integer literals should still resolve as column index
 # references, matching SQLite behavior.
-# Fixes select1-4.9.2 in testing/sqlite3/all.test.
+# Fixes select1-4.9.2 in testing/conformance/sqlite3/all.test.
 
 test order-by-plus-2 {
     CREATE TABLE t8(a, b);
@@ -189,7 +189,7 @@ expect {
 
 # Negative integer literals in ORDER BY should be rejected as invalid
 # column index references, matching SQLite behavior.
-# Fixes select1-4.10.2 in testing/sqlite3/all.test.
+# Fixes select1-4.10.2 in testing/conformance/sqlite3/all.test.
 
 test order-by-negative-1 {
     CREATE TABLE t12(a, b);
@@ -210,7 +210,7 @@ expect error {
 }
 
 # Positive out-of-range and zero column indices should use SQLite-compatible
-# error messages. Fixes select1-4.10.1 in testing/sqlite3/all.test.
+# error messages. Fixes select1-4.10.1 in testing/conformance/sqlite3/all.test.
 
 test order-by-out-of-range {
     CREATE TABLE t14(a, b);

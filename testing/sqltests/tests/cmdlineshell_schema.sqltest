@@ -1,7 +1,6 @@
 @database :memory:
 
 @backend cli
-@skip-if sqlite "sqlite backend in sqltests does not support .schema dot command here"
 test schema-includes-trigger {
     CREATE TABLE t1(a);
     CREATE TRIGGER trg AFTER INSERT ON t1 BEGIN SELECT 1; END;

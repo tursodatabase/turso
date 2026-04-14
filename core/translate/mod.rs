@@ -101,6 +101,7 @@ pub fn translate(
     let mut resolver = Resolver::new(
         schema,
         connection.database_schemas(),
+        &connection.temp.database,
         connection.attached_databases(),
         syms,
         connection.experimental_custom_types_enabled(),
@@ -178,9 +179,7 @@ pub fn translate_inner(
         ast::Stmt::Attach { expr, db_name, key } => {
             attach::translate_attach(&expr, resolver, &db_name, &key, program, connection.clone())?;
         }
-        ast::Stmt::Begin { typ, name } => {
-            translate_tx_begin(typ, name, resolver.schema(), program)?
-        }
+        ast::Stmt::Begin { typ, name } => translate_tx_begin(typ, name, resolver, program)?,
         ast::Stmt::Commit { name } => {
             translate_tx_commit(name, resolver.schema(), resolver, program)?
         }
@@ -505,5 +504,34 @@ mod tests {
             }
             other => panic!("expected LimboError::Corrupt, got: {other}"),
         }
+    }
+
+    #[test]
+    fn test_trigger_compile_error_does_not_poison_future_insert_compilation() {
+        let io = Arc::new(MemoryIO::new());
+        let db = Database::open_file(io, ":memory:").unwrap();
+        let conn = db.connect().unwrap();
+
+        conn.execute("CREATE TABLE ref(x);").unwrap();
+        conn.execute("CREATE TABLE t(a INTEGER);").unwrap();
+        conn.execute("CREATE TRIGGER tr AFTER INSERT ON t BEGIN SELECT * FROM ref; END;")
+            .unwrap();
+        conn.execute("DROP TABLE ref;").unwrap();
+
+        let err = conn
+            .execute("INSERT INTO t VALUES (1);")
+            .expect_err("single-row insert should fail while trigger references dropped table");
+        assert!(
+            err.to_string().contains("no such table: ref"),
+            "expected missing-table error, got: {err}"
+        );
+
+        let err = conn.execute("INSERT INTO t VALUES (2), (3);").expect_err(
+            "multi-row insert should still fail instead of skipping the poisoned trigger",
+        );
+        assert!(
+            err.to_string().contains("no such table: ref"),
+            "expected missing-table error, got: {err}"
+        );
     }
 }

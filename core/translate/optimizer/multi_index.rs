@@ -463,7 +463,7 @@ fn partition_residual_multi_or_exprs(
 
     let mut pre_filter_exprs = Vec::new();
     let mut post_filter_exprs = Vec::new();
-    let mut post_mask = TableMask::new();
+    let mut post_mask = TableMask::default();
 
     for (idx, term) in branch_terms.iter().enumerate() {
         if consumed[idx] {
@@ -474,10 +474,10 @@ fn partition_residual_multi_or_exprs(
             return None;
         }
         let mask = table_mask_from_expr(expr, table_references, subqueries).ok()?;
-        if lhs_mask.contains_all(&mask) {
+        if lhs_mask.contains_all_set_bits_of(&mask) {
             pre_filter_exprs.push(expr.clone());
         } else {
-            post_mask |= mask;
+            post_mask |= &mask;
             post_filter_exprs.push(expr.clone());
         }
     }
@@ -898,7 +898,7 @@ pub fn consider_multi_index_union(
             continue;
         }
 
-        let mut allowed_mask = *lhs_mask;
+        let mut allowed_mask = lhs_mask.clone();
         let Some(rhs_idx) = table_references
             .joined_tables()
             .iter()
@@ -906,7 +906,7 @@ pub fn consider_multi_index_union(
         else {
             continue;
         };
-        allowed_mask.add_table(rhs_idx);
+        allowed_mask.set(rhs_idx);
 
         // Each disjunct is replanned with branch-local `TableConstraints`, so
         // compound conjuncts can reuse the same compound-seek analysis as
@@ -956,11 +956,11 @@ pub fn consider_multi_index_union(
                     table_references,
                     subqueries,
                 )?;
-                if !allowed_mask.contains_all(&partitioned_pre_post.post_mask) {
+                if !allowed_mask.contains_all_set_bits_of(&partitioned_pre_post.post_mask) {
                     return None;
                 }
                 chosen.union_prepost_filters = Some(UnionBranchPrePostFilters {
-                    requires_table_cursor: partitioned_pre_post.post_mask.contains_table(rhs_idx),
+                    requires_table_cursor: partitioned_pre_post.post_mask.get(rhs_idx),
                     pre_filter_exprs: partitioned_pre_post.pre_filter_exprs,
                     post_filter_exprs: partitioned_pre_post.post_filter_exprs,
                 });
@@ -1030,7 +1030,7 @@ pub fn consider_multi_index_intersection(
     let all_usable = decomposition
         .branches
         .iter()
-        .all(|b| lhs_mask.contains_all(&b.constraint.lhs_mask));
+        .all(|b| lhs_mask.contains_all_set_bits_of(&b.constraint.lhs_mask));
     if !all_usable {
         return None;
     }
@@ -1123,6 +1123,7 @@ mod tests {
             planner::TableMask,
         },
         vdbe::builder::TableRefIdCounter,
+        MAIN_DB_ID,
     };
     use rustc_hash::FxHashMap as HashMap;
     use std::{collections::VecDeque, sync::Arc};
@@ -1197,7 +1198,7 @@ mod tests {
             col_used_mask: ColumnUsedMask::default(),
             column_use_counts: Vec::new(),
             expression_index_usages: Vec::new(),
-            database_id: 0,
+            database_id: MAIN_DB_ID,
             indexed: None,
         }
     }
@@ -1387,7 +1388,7 @@ mod tests {
 
         let table_references = TableReferences::new(joined_tables, vec![]);
         let base_row_count = RowCountEstimate::hardcoded_fallback(&DEFAULT_PARAMS);
-        let lhs_mask = TableMask::from_table_number_iter([LINK].into_iter());
+        let lhs_mask: TableMask = [LINK].into_iter().collect();
 
         let access_method = consider_multi_index_union(
             &table_references.joined_tables()[ITEM],
@@ -1487,7 +1488,7 @@ mod tests {
             base_row_count,
             &DEFAULT_PARAMS,
             Cost(f64::INFINITY),
-            &TableMask::new(),
+            &TableMask::default(),
             &AnalyzeStats::default(),
         )
         .expect("rowid and secondary-index terms should be eligible for intersection");
@@ -1661,7 +1662,7 @@ mod tests {
         }];
 
         let table_references = TableReferences::new(joined_tables, vec![]);
-        let lhs_mask = TableMask::from_table_number_iter([LINK].into_iter());
+        let lhs_mask = [LINK].into_iter().collect();
         let base_row_count = RowCountEstimate::hardcoded_fallback(&DEFAULT_PARAMS);
 
         let access_method = consider_multi_index_union(
@@ -1803,7 +1804,7 @@ mod tests {
         };
 
         let table_references = TableReferences::new(joined_tables, vec![]);
-        let lhs_mask = TableMask::from_table_number_iter([LINK].into_iter());
+        let lhs_mask = [LINK].into_iter().collect();
         let base_row_count = RowCountEstimate::hardcoded_fallback(&DEFAULT_PARAMS);
 
         let without_residual = consider_multi_index_union(

@@ -1,12 +1,15 @@
 use crate::{turso_assert, turso_assert_eq, turso_debug_assert};
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use tracing::{instrument, Level};
-use turso_parser::ast::{self, ResolveType, SortOrder, TableInternalId};
+use turso_parser::ast::{self, Expr, ResolveType, SortOrder, TableInternalId};
 
 use crate::{
     index_method::IndexMethodAttachment,
     parameters::Parameters,
-    schema::{BTreeTable, Column, ColumnLayout, Index, PseudoCursorType, Schema, Table, Trigger},
+    schema::{
+        BTreeTable, Column, ColumnLayout, GeneratedType, Index, PseudoCursorType, Schema, Table,
+        Trigger,
+    },
     translate::{
         collate::CollationSeq,
         emitter::{MaterializedColumnRef, TransactionMode},
@@ -38,12 +41,12 @@ impl TableRefIdCounter {
     }
 }
 
-use std::num::NonZeroUsize;
-
 use super::{
     affinity::Affinity, BranchOffset, CursorID, Insn, InsnReference, JumpTarget, PrepareContext,
     PreparedProgram, Program,
 };
+use crate::translate::plan::BitSet;
+use std::num::NonZeroUsize;
 
 /// A key that uniquely identifies a cursor.
 /// The key is a pair of table reference id and index.
@@ -116,7 +119,7 @@ pub enum SelfTableContext {
 }
 
 #[derive(Clone)]
-pub enum DmlColumnRegisters {
+enum DmlColumnRegisters {
     // Used to compute column registers lazily
     Layout {
         base_reg: usize,
@@ -130,8 +133,12 @@ pub enum DmlColumnRegisters {
 
 #[derive(Clone)]
 pub struct DmlColumnContext {
-    pub registers: DmlColumnRegisters,
-    pub columns: Arc<[Column]>,
+    registers: DmlColumnRegisters,
+    rowid_alias_col: Option<usize>,
+    /// Bitset marking which columns are virtual generated.
+    virtual_mask: BitSet,
+    /// rank-indexed by `virtual_mask`.
+    virtual_data: Vec<(Box<Expr>, Affinity)>,
 }
 
 impl DmlColumnContext {
@@ -141,21 +148,64 @@ impl DmlColumnContext {
         rowid_reg: usize,
         layout: ColumnLayout,
     ) -> Self {
+        let mut rowid_alias_col = None;
+        let mut virtual_mask = BitSet::default();
+        let mut virtual_data = Vec::new();
+
+        for (idx, col) in columns.iter().enumerate() {
+            if col.is_rowid_alias() {
+                rowid_alias_col = Some(idx);
+            }
+            if let GeneratedType::Virtual { resolved, .. } = col.generated_type() {
+                virtual_mask.set(idx);
+                virtual_data.push((resolved.clone(), col.affinity()));
+            }
+        }
+
         Self {
             registers: DmlColumnRegisters::Layout {
                 base_reg,
                 rowid_reg,
                 layout,
             },
-            columns: Arc::from(columns),
+            rowid_alias_col,
+            virtual_mask,
+            virtual_data,
         }
     }
 
-    pub fn indexed(columns: impl Into<Arc<[Column]>>, column_regs: Vec<usize>) -> Self {
+    pub fn from_column_reg_mapping<'a>(pairs: impl Iterator<Item = (&'a Column, usize)>) -> Self {
+        let mut rowid_alias_col = None;
+        let mut virtual_mask = BitSet::default();
+        let mut virtual_data = Vec::new();
+        let mut column_regs = Vec::new();
+        for (idx, (col, reg)) in pairs.enumerate() {
+            column_regs.push(reg);
+            if col.is_rowid_alias() {
+                rowid_alias_col = Some(idx);
+            }
+            if let GeneratedType::Virtual { resolved, .. } = col.generated_type() {
+                virtual_mask.set(idx);
+                virtual_data.push((resolved.clone(), col.affinity()));
+            }
+        }
         Self {
             registers: DmlColumnRegisters::Indexed { column_regs },
-            columns: columns.into(),
+            rowid_alias_col,
+            virtual_mask,
+            virtual_data,
         }
+    }
+
+    /// returns the expression and affinity of a virtual column, if the column index points to a
+    /// virtual column
+    pub(crate) fn virtual_column_info(&self, col_idx: usize) -> Option<(&Expr, Affinity)> {
+        if !self.virtual_mask.get(col_idx) {
+            return None;
+        }
+        let rank = self.virtual_mask.rank(col_idx);
+        let (ref expr, affinity) = self.virtual_data[rank];
+        Some((expr, affinity))
     }
 
     pub fn to_column_reg(&self, col_idx: usize) -> usize {
@@ -165,7 +215,7 @@ impl DmlColumnContext {
                 rowid_reg,
                 layout,
             } => {
-                if self.columns[col_idx].is_rowid_alias() {
+                if self.rowid_alias_col == Some(col_idx) {
                     *rowid_reg
                 } else {
                     layout.to_register(*base_reg, col_idx)
@@ -1487,7 +1537,7 @@ impl ProgramBuilder {
     /// Tries to mirror: https://github.com/sqlite/sqlite/blob/e77e589a35862f6ac9c4141cfd1beb2844b84c61/src/build.c#L5379
     pub fn begin_write_operation(&mut self) {
         self.txn_mode = TransactionMode::Write;
-        self.write_databases.insert(0);
+        self.write_databases.insert(crate::MAIN_DB_ID);
     }
 
     /// Begin a write operation on a specific database (for attached databases).
@@ -1503,18 +1553,19 @@ impl ProgramBuilder {
         if matches!(self.txn_mode, TransactionMode::None) {
             self.txn_mode = TransactionMode::Read;
         }
+        self.read_databases.insert(crate::MAIN_DB_ID);
     }
 
     /// Begin a read operation on a specific attached database.
     /// This ensures a Transaction instruction is emitted for the attached pager
     /// so that a WAL read lock is acquired.
     pub fn begin_read_on_database(&mut self, database_id: usize, schema_cookie: u32) {
-        self.begin_read_operation();
-        if crate::is_attached_db(database_id) {
-            self.read_databases.insert(database_id);
-            self.read_database_cookies
-                .insert(database_id, schema_cookie);
+        if matches!(self.txn_mode, TransactionMode::None) {
+            self.txn_mode = TransactionMode::Read;
         }
+        self.read_databases.insert(database_id);
+        self.read_database_cookies
+            .insert(database_id, schema_cookie);
     }
 
     pub fn begin_concurrent_operation(&mut self) {
@@ -1551,36 +1602,38 @@ impl ProgramBuilder {
             self.preassign_label_to_next_insn(self.init_label);
 
             if !matches!(self.txn_mode, TransactionMode::None) {
-                // Emit Transaction for main database always
-                self.emit_insn(Insn::Transaction {
-                    db: crate::MAIN_DB_ID,
-                    tx_mode: self.txn_mode,
-                    schema_cookie: schema.schema_version,
-                });
-                // Emit Transaction for each attached database that needs a write
-                for &db_id in &self.write_databases.clone() {
-                    if crate::is_attached_db(db_id) {
-                        let cookie = self
-                            .write_database_cookies
+                let mut write_db_ids: Vec<_> = self.write_databases.iter().copied().collect();
+                write_db_ids.sort_unstable();
+                for db_id in write_db_ids {
+                    let schema_cookie = if db_id == crate::MAIN_DB_ID {
+                        schema.schema_version
+                    } else {
+                        self.write_database_cookies
                             .get(&db_id)
                             .copied()
-                            .unwrap_or(0);
-                        self.emit_insn(Insn::Transaction {
-                            db: db_id,
-                            tx_mode: self.txn_mode,
-                            schema_cookie: cookie,
-                        });
-                    }
+                            .unwrap_or(0)
+                    };
+                    self.emit_insn(Insn::Transaction {
+                        db: db_id,
+                        tx_mode: self.txn_mode,
+                        schema_cookie,
+                    });
                 }
-                // Emit Transaction for each attached database that only needs a read
+                // Emit Transaction for each non-main database that only needs a read
                 // (skip databases already covered by write_databases)
-                for &db_id in &self.read_databases.clone() {
+                let mut read_db_ids: Vec<_> = self.read_databases.iter().copied().collect();
+                read_db_ids.sort_unstable();
+                for db_id in read_db_ids {
                     if !self.write_databases.contains(&db_id) {
-                        let cookie = self.read_database_cookies.get(&db_id).copied().unwrap_or(0);
+                        let schema_cookie = if db_id == crate::MAIN_DB_ID {
+                            schema.schema_version
+                        } else {
+                            self.read_database_cookies.get(&db_id).copied().unwrap_or(0)
+                        };
                         self.emit_insn(Insn::Transaction {
                             db: db_id,
                             tx_mode: TransactionMode::Read,
-                            schema_cookie: cookie,
+                            schema_cookie,
                         });
                     }
                 }
@@ -1603,6 +1656,14 @@ impl ProgramBuilder {
     /// Returns true if the cursor is a BTreeTable cursor.
     pub fn cursor_is_btree(&self, cursor_id: CursorID) -> bool {
         matches!(self.cursor_ref[cursor_id].1, CursorType::BTreeTable(_))
+    }
+
+    /// Returns the BTreeTable for the given cursor, if it is a BTreeTable cursor.
+    pub fn btree_table_from_cursor(&self, cursor_id: CursorID) -> Option<&Arc<BTreeTable>> {
+        match &self.cursor_ref[cursor_id].1 {
+            CursorType::BTreeTable(t) => Some(t),
+            _ => None,
+        }
     }
 
     #[inline]
@@ -1820,6 +1881,10 @@ impl ProgramBuilder {
         ctx: Option<&SelfTableContext>,
         f: impl FnOnce(&mut ProgramBuilder, Option<&SelfTableContext>) -> crate::Result<T>,
     ) -> crate::Result<T> {
+        if ctx.is_none() {
+            return f(self, ctx);
+        }
+
         let prev = self.self_table_context.take();
         self.self_table_context = ctx.cloned();
         let result = f(self, ctx);

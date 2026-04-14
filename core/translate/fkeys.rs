@@ -2,6 +2,8 @@ use rustc_hash::FxHashSet as HashSet;
 use turso_parser::ast::{self, Expr, Literal, Name, QualifiedName, RefAct};
 
 use super::{translate_inner, ProgramBuilder, ProgramBuilderOpts};
+use crate::translate::emitter::cursor_to_registers;
+use crate::translate::expr::emit_table_column_for_dml;
 use crate::{
     error::SQLITE_CONSTRAINT_FOREIGNKEY,
     schema::{BTreeTable, ColumnLayout, ForeignKey, Index, ResolvedFkRef, ROWID_SENTINEL},
@@ -433,24 +435,36 @@ pub fn emit_parent_index_key_change_checks(
     }
 
     let idx_len = index.columns.len();
+    let layout = table_btree.column_layout();
+    let some_idx_columns_are_virtual = index
+        .columns
+        .iter()
+        .any(|col| table_btree.columns[col.pos_in_table].is_virtual_generated());
 
     let old_key = program.alloc_registers(idx_len);
+    let idx_target_cols = index.columns.iter().map(|c| c.pos_in_table);
+    let dml_ctx = some_idx_columns_are_virtual.then(|| {
+        cursor_to_registers(
+            program,
+            table_btree,
+            cursor_id,
+            old_rowid_reg,
+            idx_target_cols,
+        )
+    });
     for (i, index_col) in index.columns.iter().enumerate() {
-        let pos_in_table = index_col.pos_in_table;
-        let column = &table_btree.columns[pos_in_table];
-        if column.is_rowid_alias() {
-            program.emit_insn(Insn::Copy {
-                src_reg: old_rowid_reg,
-                dst_reg: old_key + i,
-                extra_amount: 0,
-            });
-        } else {
-            program.emit_insn(Insn::Column {
+        if let Some(ref ctx) = dml_ctx {
+            emit_table_column_for_dml(
+                program,
                 cursor_id,
-                column: pos_in_table,
-                dest: old_key + i,
-                default: None,
-            });
+                ctx.clone(),
+                &table_btree.columns[index_col.pos_in_table],
+                index_col.pos_in_table,
+                old_key + i,
+                resolver,
+            )?;
+        } else {
+            program.emit_column_or_rowid(cursor_id, index_col.pos_in_table, old_key + i);
         }
     }
     let new_key = program.alloc_registers(idx_len);
@@ -460,7 +474,7 @@ pub fn emit_parent_index_key_change_checks(
         let src = if column.is_rowid_alias() {
             new_rowid_reg
         } else {
-            new_values_start + pos_in_table
+            layout.to_register(new_values_start, pos_in_table)
         };
         program.emit_insn(Insn::Copy {
             src_reg: src,
@@ -733,31 +747,56 @@ fn build_parent_key(
     parent_cursor_id: usize,
     parent_rowid_reg: usize,
     dest_start: usize,
+    resolver: &Resolver,
 ) -> Result<()> {
+    let some_fk_cols_are_virtual = parent_cols.iter().any(|pcol| {
+        parent_bt
+            .get_column(pcol)
+            .is_some_and(|(_, c)| c.is_virtual_generated())
+    });
+
+    let fk_target_cols = parent_cols
+        .iter()
+        .filter_map(|pcol| parent_bt.get_column(pcol).map(|(pos, _)| pos));
+    let ctx = some_fk_cols_are_virtual.then(|| {
+        cursor_to_registers(
+            program,
+            parent_bt,
+            parent_cursor_id,
+            parent_rowid_reg,
+            fk_target_cols,
+        )
+    });
+
     for (i, pcol) in parent_cols.iter().enumerate() {
-        let src = if ROWID_STRS.iter().any(|s| pcol.eq_ignore_ascii_case(s)) {
-            parent_rowid_reg
-        } else {
-            let (pos, col) = parent_bt
-                .get_column(pcol)
-                .ok_or_else(|| LimboError::InternalError(format!("col {pcol} missing")))?;
-            if col.is_rowid_alias() {
-                parent_rowid_reg
-            } else {
-                program.emit_insn(Insn::Column {
-                    cursor_id: parent_cursor_id,
-                    column: pos,
-                    dest: dest_start + i,
-                    default: None,
+        let Some((pos, col)) = parent_bt.get_column(pcol) else {
+            if ROWID_STRS.iter().any(|s| pcol.eq_ignore_ascii_case(s)) {
+                // child column references parent rowid
+                program.emit_insn(Insn::Copy {
+                    src_reg: parent_rowid_reg,
+                    dst_reg: dest_start + i,
+                    extra_amount: 0,
                 });
                 continue;
             }
+            return Err(LimboError::InternalError(format!("col {pcol} missing")));
         };
-        program.emit_insn(Insn::Copy {
-            src_reg: src,
-            dst_reg: dest_start + i,
-            extra_amount: 0,
-        });
+
+        if some_fk_cols_are_virtual {
+            // the virtual column will need the registers we previously copied
+            emit_table_column_for_dml(
+                program,
+                parent_cursor_id,
+                ctx.clone()
+                    .expect("ctx is always computed if some fk cols are virtual"),
+                col,
+                pos,
+                dest_start + i,
+                resolver,
+            )?;
+        } else {
+            program.emit_column_or_rowid(parent_cursor_id, pos, dest_start + i);
+        }
     }
     Ok(())
 }
@@ -1040,6 +1079,7 @@ fn emit_fk_delete_parent_existence_check_single(
         parent_cursor_id,
         parent_rowid_reg,
         parent_key_start,
+        resolver,
     )?;
 
     let child_cols = &fk_ref.fk.child_columns;
@@ -1767,6 +1807,7 @@ impl ForeignKeyActions<PreparedFkDeleteAction> {
                 parent_cursor_id,
                 parent_rowid_reg,
                 key_regs_start,
+                resolver,
             )?;
 
             match fk_ref.fk.on_delete {
@@ -2074,6 +2115,7 @@ pub fn emit_fk_drop_table_check(
             parent_write_cur,
             current_rowid_reg,
             key_regs_start,
+            resolver,
         )?;
 
         // Decode encoded values so they match the subprogram's decoded column reads
@@ -2116,6 +2158,7 @@ pub fn emit_fk_drop_table_check(
             parent_write_cur,
             current_rowid_reg,
             parent_key_start,
+            resolver,
         )?;
 
         // Scan child table for matching rows

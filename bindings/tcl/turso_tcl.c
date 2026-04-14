@@ -2,7 +2,7 @@
  * turso_tcl.c — Native Tcl extension for Turso/Limbo database.
  *
  * Provides the `sqlite3` Tcl command that creates in-process database
- * connections, replacing the subprocess-based shim in testing/sqlite3/tester.tcl.
+ * connections, replacing the subprocess-based shim in testing/conformance/sqlite3/tester.tcl.
  *
  * Supported db sub-commands:
  *   eval SQL ?array? ?script?   — execute SQL, return results as list
@@ -23,6 +23,11 @@
 #include <sqlite3.h>
 #include <string.h>
 #include <stdlib.h>
+
+/* Tcl_Size was introduced in Tcl 9.0; fall back to int for 8.x */
+#ifndef TCL_SIZE_MAX
+typedef int Tcl_Size;
+#endif
 
 #define TURSO_TCL_VERSION "1.0"
 #define MAX_FUNC_ARGS 64

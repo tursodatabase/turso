@@ -1,0 +1,78 @@
+#!/usr/bin/env tclsh
+
+set testdir [file dirname $argv0]
+
+# Signal to tester.tcl's finish_test that individual .test files are being
+# sourced as part of an aggregate run; they should not print their own
+# summaries or exit.
+set ALL_TESTS 1
+
+source $testdir/select1.test
+# FIXME: source $testdir/select2.test
+# FIXME: source $testdir/select3.test
+# FIXME: source $testdir/select4.test
+# FIXME: source $testdir/select5.test
+# FIXME: source $testdir/select6.test
+# FIXME: source $testdir/select7.test
+source $testdir/select8.test
+# FIXME: source $testdir/select9.test
+# FIXME: source $testdir/selectA.test
+# FIXME: source $testdir/selectB.test
+# FIXME: source $testdir/selectC.test
+# FIXME: source $testdir/selectD.test
+# FIXME: source $testdir/selectE.test
+source $testdir/selectF.test
+# FIXME: source $testdir/selectG.test
+# FIXME: source $testdir/selectH.test
+
+# FIXME: source $testdir/insert.test
+# FIXME: source $testdir/insert2.test
+# FIXME: source $testdir/insert3.test
+# FIXME: source $testdir/insert4.test
+# FIXME: source $testdir/insert5.test
+
+# FIXME: source $testdir/join.test
+# FIXME: source $testdir/join2.test
+# FIXME: source $testdir/join3.test
+# FIXME: source $testdir/join4.test
+# FIXME: source $testdir/join5.test
+# FIXME: source $testdir/join6.test
+# FIXME: source $testdir/join7.test
+# FIXME: source $testdir/join8.test
+# FIXME: source $testdir/join9.test
+# FIXME: source $testdir/joinA.test
+# FIXME: source $testdir/joinB.test
+# FIXME: source $testdir/joinC.test
+# FIXME: source $testdir/joinD.test
+# FIXME: source $testdir/joinE.test
+# FIXME: source $testdir/joinF.test
+# FIXME: source $testdir/joinH.test
+
+# FIXME: source $testdir/alter.test
+# FIXME: source $testdir/alter2.test
+# FIXME: source $testdir/alter3.test
+# FIXME: source $testdir/alter4.test
+
+# FIXME: source $testdir/func.test
+# FIXME: source $testdir/func2.test
+# FIXME: source $testdir/func3.test
+# FIXME: source $testdir/func4.test
+# FIXME: source $testdir/func5.test
+# FIXME: source $testdir/func6.test
+# FIXME: source $testdir/func7.test
+# FIXME: source $testdir/func8.test
+# FIXME: source $testdir/func9.test
+
+# Print aggregate summary and exit non-zero if any test failed.
+puts ""
+puts "=========================================="
+if {$TC(errors) == 0} {
+  puts "All $TC(count) tests passed!"
+  puts "=========================================="
+  exit 0
+} else {
+  puts "$TC(errors) errors out of $TC(count) tests"
+  puts "Failed tests: $TC(fail_list)"
+  puts "=========================================="
+  exit 1
+}

@@ -3,6 +3,7 @@ use super::TranslateCtx;
 use crate::schema::{columns_affected_by_update, ColumnLayout, GeneratedType, Table};
 use crate::translate::insert::halt_desc_and_on_error;
 use crate::translate::stmt_journal::any_effective_replace;
+use crate::vdbe::builder::SelfTableContext;
 use crate::{
     ast, emit_explain,
     error::{SQLITE_CONSTRAINT_PRIMARYKEY, SQLITE_CONSTRAINT_UNIQUE},
@@ -37,7 +38,9 @@ use crate::{
         },
         planner::ROWID_STRS,
         subquery::{emit_non_from_clause_subqueries_for_eval_at, emit_non_from_clause_subquery},
-        trigger_exec::{fire_trigger, get_relevant_triggers_type_and_time, TriggerContext},
+        trigger_exec::{
+            fire_trigger, get_triggers_including_temp, has_triggers_including_temp, TriggerContext,
+        },
         ProgramBuilder,
     },
     util::normalize_ident,
@@ -431,12 +434,13 @@ fn emit_update_column_values<'a>(
     target_table: &Arc<JoinedTable>,
     target_table_cursor_id: usize,
     start: usize,
+    rowid_reg: usize,
     col_len: usize,
     table_name: &str,
     has_direct_rowid_update: bool,
-    has_user_provided_rowid: bool,
+    updates_rowid: bool,
     rowid_set_clause_reg: Option<usize>,
-    is_virtual: bool,
+    is_virtual_table: bool,
     index: &Option<(Arc<Index>, usize)>,
     cdc_updates_register: Option<usize>,
     t_ctx: &mut TranslateCtx<'a>,
@@ -463,17 +467,40 @@ fn emit_update_column_values<'a>(
             }
         }
     }
-    for (idx, table_column) in target_table.table.columns().iter().enumerate() {
+    let target_table_columns = target_table.table.columns();
+    let affected_columns = columns_affected_by_update(
+        target_table_columns,
+        &set_clauses.iter().map(|(idx, _)| *idx).collect(),
+    );
+
+    for (idx, table_column) in target_table_columns.iter().enumerate() {
         let target_reg = layout.to_register(start, idx);
-        if let Some((col_idx, expr)) = set_clauses.iter().find(|(i, _)| *i == idx) {
+
+        // If the column needs to be updated, retrieve its column index, or its expression.
+        // Such a column can be directly updated, in which case `expr` is the right-side of the SET
+        // clause, or it can be an indirectly updated generated columns, in which case `expr` is the
+        // column's expression.
+        let update_expr = set_clauses
+            .iter()
+            .find(|(i, _)| *i == idx)
+            .map(|(_, expr)| expr.as_ref())
+            .or_else(|| {
+                affected_columns
+                    .get(&idx)
+                    .into_iter()
+                    .flat_map(|_| table_column.generated_expr())
+                    .next()
+            });
+
+        if let Some(expr) = update_expr {
             if !skip_set_clauses {
                 // Skip if this is the sentinel value
-                if *col_idx == ROWID_SENTINEL {
+                if idx == ROWID_SENTINEL {
                     continue;
                 }
-                if has_user_provided_rowid
+                if updates_rowid
                     && (table_column.primary_key() || table_column.is_rowid_alias())
-                    && !is_virtual
+                    && !is_virtual_table
                 {
                     let rowid_set_clause_reg = rowid_set_clause_reg.unwrap();
                     translate_expr(
@@ -490,109 +517,127 @@ fn emit_update_column_values<'a>(
 
                     program.emit_null(target_reg, None);
                 } else {
-                    // Columns with custom type encode must not have their
-                    // SET expressions hoisted as constants. See the doc
-                    // comment on NoConstantOptReason::CustomTypeEncode.
-                    let has_custom_encode = {
-                        let ty = &table_column.ty_str;
-                        !ty.is_empty()
-                            && t_ctx
-                                .resolver
-                                .schema
-                                .get_type_def_unchecked(ty)
-                                .is_some_and(|td| td.encode.is_some())
+                    let self_table_context = match table_column.generated_type() {
+                        GeneratedType::Virtual { .. } => {
+                            Some(SelfTableContext::ForDML(DmlColumnContext::layout(
+                                target_table.table.columns(),
+                                start,
+                                rowid_reg,
+                                layout.clone(),
+                            )))
+                        }
+                        GeneratedType::NotGenerated => None,
                     };
-                    if has_custom_encode {
-                        translate_expr_no_constant_opt(
-                            program,
-                            Some(table_references),
-                            expr,
-                            target_reg,
-                            &t_ctx.resolver,
-                            NoConstantOptReason::CustomTypeEncode,
-                        )?;
-                    } else {
-                        translate_expr(
-                            program,
-                            Some(table_references),
-                            expr,
-                            target_reg,
-                            &t_ctx.resolver,
-                        )?;
-                    }
-                    if table_column.notnull() && !skip_notnull_checks {
-                        let notnull_conflict = if program.has_statement_conflict {
-                            or_conflict
-                        } else {
-                            table_column
-                                .notnull_conflict_clause
-                                .unwrap_or(ResolveType::Abort)
-                        };
-                        match notnull_conflict {
-                            ResolveType::Ignore => {
-                                // For IGNORE, skip this row on NOT NULL violation
-                                program.emit_insn(Insn::IsNull {
-                                    reg: target_reg,
-                                    target_pc: skip_row_label,
-                                });
+
+                    program.with_self_table_context(
+                        self_table_context.as_ref(),
+                        |program, _| {
+                            // Columns with custom type encode must not have their
+                            // SET expressions hoisted as constants. See the doc
+                            // comment on NoConstantOptReason::CustomTypeEncode.
+                            let has_custom_encode = {
+                                let ty = &table_column.ty_str;
+                                !ty.is_empty()
+                                    && t_ctx
+                                        .resolver
+                                        .schema
+                                        .get_type_def_unchecked(ty)
+                                        .is_some_and(|td| td.encode.is_some())
+                            };
+                            if has_custom_encode {
+                                translate_expr_no_constant_opt(
+                                    program,
+                                    Some(table_references),
+                                    expr,
+                                    target_reg,
+                                    &t_ctx.resolver,
+                                    NoConstantOptReason::CustomTypeEncode,
+                                )?;
+                            } else {
+                                translate_expr(
+                                    program,
+                                    Some(table_references),
+                                    expr,
+                                    target_reg,
+                                    &t_ctx.resolver,
+                                )?;
                             }
-                            ResolveType::Replace => {
-                                // For REPLACE with NOT NULL, use default value if available
-                                if let Some(default_expr) = table_column.default.as_ref() {
-                                    let continue_label = program.allocate_label();
-
-                                    // If not null, skip to continue
-                                    program.emit_insn(Insn::NotNull {
-                                        reg: target_reg,
-                                        target_pc: continue_label,
-                                    });
-
-                                    // Value is null, use default.
-                                    translate_expr_no_constant_opt(
-                                        program,
-                                        Some(table_references),
-                                        default_expr,
-                                        target_reg,
-                                        &t_ctx.resolver,
-                                        NoConstantOptReason::RegisterReuse,
-                                    )?;
-
-                                    program.preassign_label_to_next_insn(continue_label);
+                            if table_column.notnull() && !skip_notnull_checks {
+                                let notnull_conflict = if program.has_statement_conflict {
+                                    or_conflict
                                 } else {
-                                    // No default value, fall through to ABORT behavior
-                                    use crate::error::SQLITE_CONSTRAINT_NOTNULL;
-                                    program.emit_insn(Insn::HaltIfNull {
-                                        target_reg,
-                                        err_code: SQLITE_CONSTRAINT_NOTNULL,
-                                        description: format!(
-                                            "{}.{}",
-                                            table_name,
-                                            table_column
-                                                .name
-                                                .as_ref()
-                                                .expect("Column name must be present")
-                                        ),
-                                    });
+                                    table_column
+                                        .notnull_conflict_clause
+                                        .unwrap_or(ResolveType::Abort)
+                                };
+                                match notnull_conflict {
+                                    ResolveType::Ignore => {
+                                        // For IGNORE, skip this row on NOT NULL violation
+                                        program.emit_insn(Insn::IsNull {
+                                            reg: target_reg,
+                                            target_pc: skip_row_label,
+                                        });
+                                    }
+                                    ResolveType::Replace => {
+                                        // For REPLACE with NOT NULL, use default value if available
+                                        if let Some(default_expr) = table_column.default.as_ref() {
+                                            let continue_label = program.allocate_label();
+
+                                            // If not null, skip to continue
+                                            program.emit_insn(Insn::NotNull {
+                                                reg: target_reg,
+                                                target_pc: continue_label,
+                                            });
+
+                                            // Value is null, use default.
+                                            translate_expr_no_constant_opt(
+                                                program,
+                                                Some(table_references),
+                                                default_expr,
+                                                target_reg,
+                                                &t_ctx.resolver,
+                                                NoConstantOptReason::RegisterReuse,
+                                            )?;
+
+                                            program.preassign_label_to_next_insn(continue_label);
+                                        } else {
+                                            // No default value, fall through to ABORT behavior
+                                            use crate::error::SQLITE_CONSTRAINT_NOTNULL;
+                                            program.emit_insn(Insn::HaltIfNull {
+                                                target_reg,
+                                                err_code: SQLITE_CONSTRAINT_NOTNULL,
+                                                description: format!(
+                                                    "{}.{}",
+                                                    table_name,
+                                                    table_column
+                                                        .name
+                                                        .as_ref()
+                                                        .expect("Column name must be present")
+                                                ),
+                                            });
+                                        }
+                                    }
+                                    _ => {
+                                        // Default ABORT behavior
+                                        use crate::error::SQLITE_CONSTRAINT_NOTNULL;
+                                        program.emit_insn(Insn::HaltIfNull {
+                                            target_reg,
+                                            err_code: SQLITE_CONSTRAINT_NOTNULL,
+                                            description: format!(
+                                                "{}.{}",
+                                                table_name,
+                                                table_column
+                                                    .name
+                                                    .as_ref()
+                                                    .expect("Column name must be present")
+                                            ),
+                                        });
+                                    }
                                 }
                             }
-                            _ => {
-                                // Default ABORT behavior
-                                use crate::error::SQLITE_CONSTRAINT_NOTNULL;
-                                program.emit_insn(Insn::HaltIfNull {
-                                    target_reg,
-                                    err_code: SQLITE_CONSTRAINT_NOTNULL,
-                                    description: format!(
-                                        "{}.{}",
-                                        table_name,
-                                        table_column
-                                            .name
-                                            .as_ref()
-                                            .expect("Column name must be present")
-                                    ),
-                                });
-                            }
-                        }
-                    }
+                            Ok(())
+                        },
+                    )?;
                 }
 
                 if let Some(cdc_updates_register) = cdc_updates_register {
@@ -631,9 +676,9 @@ fn emit_update_column_values<'a>(
 
                     // don't emit null for pkey of virtual tables. they require first two args
                     // before the 'record' to be explicitly non-null
-                    if table_column.is_rowid_alias() && !is_virtual {
+                    if table_column.is_rowid_alias() && !is_virtual_table {
                         program.emit_null(target_reg, None);
-                    } else if is_virtual {
+                    } else if is_virtual_table {
                         program.emit_insn(Insn::VColumn {
                             cursor_id: target_table_cursor_id,
                             column: idx,
@@ -805,7 +850,7 @@ fn emit_update_insns<'a>(
         .joined_tables()
         .first()
         .expect("UPDATE must have a source table");
-    let (index, is_virtual) = match &source_table.op {
+    let (index, is_virtual_table) = match &source_table.op {
         Operation::Scan(Scan::BTreeTable { index, .. }) => (
             index.as_ref().map(|index| {
                 (
@@ -848,7 +893,7 @@ fn emit_update_insns<'a>(
 
     let beg = program.alloc_registers(
         target_table.table.columns().len()
-            + if is_virtual {
+            + if is_virtual_table {
                 2 // two args before the relevant columns for VUpdate
             } else {
                 1 // rowid reg
@@ -868,22 +913,17 @@ fn emit_update_insns<'a>(
 
     let has_direct_rowid_update = set_clauses.iter().any(|(idx, _)| *idx == ROWID_SENTINEL);
 
-    let has_user_provided_rowid = if let Some(index) = rowid_alias_index {
+    let updates_rowid = if let Some(index) = rowid_alias_index {
         set_clauses.iter().any(|(idx, _)| *idx == index)
     } else {
         has_direct_rowid_update
     };
 
-    let rowid_set_clause_reg = if has_user_provided_rowid {
+    let rowid_set_clause_reg = if updates_rowid {
         Some(program.alloc_register())
     } else {
         None
     };
-
-    turso_assert!(
-        !has_user_provided_rowid || rowid_set_clause_reg.is_some(),
-        "has_user_provided_rowid requires rowid_set_clause_reg"
-    );
 
     // Effective INTEGER PK conflict resolution: statement-level OR clause takes precedence;
     // otherwise use the constraint-level rowid_alias_conflict_clause from the table DDL.
@@ -897,31 +937,23 @@ fn emit_update_insns<'a>(
         constraint_rowid_alias_conflict.unwrap_or(ResolveType::Abort)
     };
 
-    let not_exists_check_required =
-        has_user_provided_rowid || iteration_cursor_id != target_table_cursor_id;
-
-    // Check early whether BEFORE UPDATE triggers exist, so we can defer NOT NULL
-    // constraint checks until after the triggers fire (matching SQLite behavior).
+    let not_exists_check_required = updates_rowid || iteration_cursor_id != target_table_cursor_id;
     let update_database_id = target_table.database_id;
-    let has_before_triggers_early = if let Some(btree_table) = target_table.table.btree() {
+    let has_before_update_triggers = if let Some(btree_table) = target_table.table.btree() {
         let updated_column_indices: HashSet<usize> =
             set_clauses.iter().map(|(col_idx, _)| *col_idx).collect();
-        t_ctx.resolver.with_schema(update_database_id, |s| {
-            get_relevant_triggers_type_and_time(
-                s,
-                TriggerEvent::Update,
-                TriggerTime::Before,
-                Some(updated_column_indices),
-                &btree_table,
-            )
-            .next()
-            .is_some()
-        })
+        has_triggers_including_temp(
+            &t_ctx.resolver,
+            update_database_id,
+            TriggerEvent::Update,
+            Some(&updated_column_indices),
+            &btree_table,
+        )
     } else {
         false
     };
 
-    let check_rowid_not_exists_label = if not_exists_check_required || has_before_triggers_early {
+    let check_rowid_not_exists_label = if not_exists_check_required || has_before_update_triggers {
         Some(program.allocate_label())
     } else {
         None
@@ -965,7 +997,7 @@ fn emit_update_insns<'a>(
         )?;
     }
 
-    if is_virtual {
+    if is_virtual_table {
         program.emit_insn(Insn::Copy {
             src_reg: beg,
             dst_reg: beg + 1,
@@ -993,7 +1025,7 @@ fn emit_update_insns<'a>(
         None
     };
     let table_name = target_table.table.get_name();
-    let start = if is_virtual { beg + 2 } else { beg + 1 };
+    let start = if is_virtual_table { beg + 2 } else { beg + 1 };
     let layout = ColumnLayout::from_table(&target_table.as_ref().table);
     let skip_set_clauses = false;
 
@@ -1005,18 +1037,19 @@ fn emit_update_insns<'a>(
         &target_table,
         target_table_cursor_id,
         start,
+        beg,
         col_len,
         table_name,
         has_direct_rowid_update,
-        has_user_provided_rowid,
+        updates_rowid,
         rowid_set_clause_reg,
-        is_virtual,
+        is_virtual_table,
         &index,
         cdc_updates_register,
         t_ctx,
         skip_set_clauses,
         skip_row_label,
-        has_before_triggers_early,
+        has_before_update_triggers,
         &layout,
     )?;
 
@@ -1052,28 +1085,21 @@ fn emit_update_insns<'a>(
     {
         let updated_column_indices: HashSet<usize> =
             set_clauses.iter().map(|(col_idx, _)| *col_idx).collect();
-        let relevant_before_update_triggers: Vec<_> =
-            t_ctx.resolver.with_schema(update_database_id, |s| {
-                get_relevant_triggers_type_and_time(
-                    s,
-                    TriggerEvent::Update,
-                    TriggerTime::Before,
-                    Some(updated_column_indices.clone()),
-                    &btree_table,
-                )
-                .collect()
-            });
-        has_after_triggers = t_ctx.resolver.with_schema(update_database_id, |s| {
-            get_relevant_triggers_type_and_time(
-                s,
-                TriggerEvent::Update,
-                TriggerTime::After,
-                Some(updated_column_indices.clone()),
-                &btree_table,
-            )
-            .count()
-                > 0
-        });
+        let relevant_before_update_triggers = get_triggers_including_temp(
+            &t_ctx.resolver,
+            update_database_id,
+            TriggerEvent::Update,
+            TriggerTime::Before,
+            Some(updated_column_indices.clone()),
+            &btree_table,
+        );
+        has_after_triggers = has_triggers_including_temp(
+            &t_ctx.resolver,
+            update_database_id,
+            TriggerEvent::Update,
+            Some(&updated_column_indices),
+            &btree_table,
+        );
 
         let has_fk_cascade = connection.foreign_keys_enabled()
             && t_ctx.resolver.with_schema(update_database_id, |s| {
@@ -1222,12 +1248,13 @@ fn emit_update_insns<'a>(
             &target_table,
             target_table_cursor_id,
             start,
+            beg,
             col_len,
             table_name,
             has_direct_rowid_update,
-            has_user_provided_rowid,
+            updates_rowid,
             rowid_set_clause_reg,
-            is_virtual,
+            is_virtual_table,
             &index,
             cdc_updates_register,
             t_ctx,
@@ -1291,6 +1318,24 @@ fn emit_update_insns<'a>(
         }
     }
 
+    // Parent-key reconciliation after the new row is inserted is only valid if this row
+    // actually deleted a conflicting parent row via REPLACE. Otherwise it double-decrements
+    // deferred FK counters for ordinary parent-key updates.
+    let parent_replace_reconcile_reg = if connection.foreign_keys_enabled()
+        && target_table.table.btree().is_some()
+        && t_ctx.resolver.with_schema(update_database_id, |s| {
+            s.any_resolved_fks_referencing(table_name)
+        }) {
+        let reg = program.alloc_register();
+        program.emit_insn(Insn::Integer {
+            value: 0,
+            dest: reg,
+        });
+        Some(reg)
+    } else {
+        None
+    };
+
     // Populate register-to-affinity map for expression index evaluation.
     // When column references are rewritten to Expr::Register during UPDATE, comparison
     // operators need the original column affinity. This is set once here and cleared at
@@ -1309,25 +1354,29 @@ fn emit_update_insns<'a>(
             .insert(rowid_reg, Affinity::Integer);
     }
 
-    let has_virtual_columns = target_table
-        .table
-        .btree()
-        .is_some_and(|bt| bt.has_virtual_columns());
+    let affected_columns = columns_affected_by_update(
+        target_table.table.columns(),
+        &HashSet::from_iter(set_clauses.iter().map(|(idx, _)| idx).cloned()),
+    );
+    let update_affects_virtual_columns = set_clauses
+        .iter()
+        .map(|(idx, _)| idx)
+        .any(|idx| affected_columns.contains(idx));
     let has_returning = returning.as_ref().is_some_and(|r| !r.is_empty());
     let has_check_constraints = target_table
         .table
         .btree()
         .is_some_and(|bt| !bt.check_constraints.is_empty());
-    if has_virtual_columns
-        && (!indexes_to_update.is_empty()
-            || has_before_triggers
-            || has_after_triggers
-            || has_returning
-            || has_check_constraints)
+    if update_affects_virtual_columns
+        || has_before_triggers
+        || has_after_triggers
+        || has_returning
+        || has_check_constraints
     {
         let columns = target_table.table.columns();
         let rowid_reg = rowid_set_clause_reg.unwrap_or(beg);
 
+        //TODO don't emit all virtual columns
         let dml_ctx = DmlColumnContext::layout(columns, start, rowid_reg, layout.clone());
         compute_virtual_columns(program, columns, &dml_ctx, &t_ctx.resolver)?;
     }
@@ -1341,7 +1390,7 @@ fn emit_update_insns<'a>(
     // PK ABORT/FAIL/ROLLBACK fires before an index IGNORE can silently skip the row.
     // SQLite checks PK constraints before index constraints in the UPDATE path.
     if target_table.table.btree().is_some()
-        && has_user_provided_rowid
+        && updates_rowid
         && !matches!(effective_rowid_alias_conflict, ResolveType::Replace)
     {
         let record_label = program.allocate_label();
@@ -1407,7 +1456,7 @@ fn emit_update_insns<'a>(
 
     // After the PK check above, NotExists may have repositioned the cursor.
     // Re-seek to the row under update so old-image reads in Phase 2 are correct.
-    if has_user_provided_rowid && !matches!(effective_rowid_alias_conflict, ResolveType::Replace) {
+    if updates_rowid && !matches!(effective_rowid_alias_conflict, ResolveType::Replace) {
         if let Some(label) = check_rowid_not_exists_label {
             program.emit_insn(Insn::NotExists {
                 cursor: target_table_cursor_id,
@@ -1739,6 +1788,12 @@ fn emit_update_insns<'a>(
                     });
                 }
                 ResolveType::Replace => {
+                    if let Some(parent_replace_reconcile_reg) = parent_replace_reconcile_reg {
+                        program.emit_insn(Insn::Integer {
+                            value: 1,
+                            dest: parent_replace_reconcile_reg,
+                        });
+                    }
                     // For REPLACE with unique constraint, delete the conflicting row
                     // Save original rowid before seeking to conflicting row
                     let original_rowid_reg = program.alloc_register();
@@ -1810,6 +1865,7 @@ fn emit_update_insns<'a>(
                                 &t_ctx.resolver,
                                 table_references,
                                 target_table_cursor_id,
+                                internal_id,
                                 column_index,
                                 other_start_reg + reg_offset,
                             )?;
@@ -1907,9 +1963,15 @@ fn emit_update_insns<'a>(
     // Runs AFTER Phase 1 (all index constraint checks) so that non-REPLACE index
     // constraints fire before this deletion, matching SQLite's ordering.
     if target_table.table.btree().is_some()
-        && has_user_provided_rowid
+        && updates_rowid
         && matches!(effective_rowid_alias_conflict, ResolveType::Replace)
     {
+        if let Some(parent_replace_reconcile_reg) = parent_replace_reconcile_reg {
+            program.emit_insn(Insn::Integer {
+                value: 1,
+                dest: parent_replace_reconcile_reg,
+            });
+        }
         let target_reg = rowid_set_clause_reg.expect("rowid_set_clause_reg must be set");
         let no_rowid_conflict_label = program.allocate_label();
         let row_not_found_label = check_rowid_not_exists_label
@@ -1979,6 +2041,7 @@ fn emit_update_insns<'a>(
                     &t_ctx.resolver,
                     table_references,
                     target_table_cursor_id,
+                    internal_id,
                     column_index,
                     other_start_reg + reg_offset,
                 )?;
@@ -2043,6 +2106,7 @@ fn emit_update_insns<'a>(
                 &t_ctx.resolver,
                 table_references,
                 target_table_cursor_id,
+                internal_id,
                 column_index,
                 delete_start_reg + reg_offset,
             )?;
@@ -2114,7 +2178,7 @@ fn emit_update_insns<'a>(
             // create separate register with rowid before UPDATE for CDC
             let cdc_rowid_before_reg = if t_ctx.cdc_cursor_id.is_some() {
                 let cdc_rowid_before_reg = program.alloc_register();
-                if has_user_provided_rowid {
+                if updates_rowid {
                     program.emit_insn(Insn::RowId {
                         cursor_id: target_table_cursor_id,
                         dest: cdc_rowid_before_reg,
@@ -2144,7 +2208,8 @@ fn emit_update_insns<'a>(
             // Insert instruction to update the cell. We need to first delete the current cell
             // and later insert the updated record.
             // In MVCC mode, we also need DELETE+INSERT to properly version the row (Hekaton model).
-            let needs_delete = not_exists_check_required || connection.mvcc_enabled();
+            let needs_delete = not_exists_check_required
+                || connection.mv_store_for_db(update_database_id).is_some();
             if needs_delete {
                 program.emit_insn(Insn::Delete {
                     cursor_id: target_table_cursor_id,
@@ -2175,15 +2240,24 @@ fn emit_update_insns<'a>(
             // the counter was incremented. Now that the new row is inserted with the
             // (potentially same) parent key, scan children and decrement.
             if connection.foreign_keys_enabled() {
-                emit_fk_parent_new_key_reconcile(
-                    program,
-                    table,
-                    start,
-                    rowid_set_clause_reg.unwrap_or(beg),
-                    set_clauses,
-                    update_database_id,
-                    &t_ctx.resolver,
-                )?;
+                if let Some(parent_replace_reconcile_reg) = parent_replace_reconcile_reg {
+                    let skip_fk_parent_reconcile = program.allocate_label();
+                    program.emit_insn(Insn::IfNot {
+                        reg: parent_replace_reconcile_reg,
+                        target_pc: skip_fk_parent_reconcile,
+                        jump_if_null: true,
+                    });
+                    emit_fk_parent_new_key_reconcile(
+                        program,
+                        table,
+                        start,
+                        rowid_set_clause_reg.unwrap_or(beg),
+                        set_clauses,
+                        update_database_id,
+                        &t_ctx.resolver,
+                    )?;
+                    program.preassign_label_to_next_insn(skip_fk_parent_reconcile);
+                }
             }
 
             // Fire FK CASCADE/SET NULL actions AFTER the parent row is updated
@@ -2215,17 +2289,14 @@ fn emit_update_insns<'a>(
             if let Some(btree_table) = target_table.table.btree() {
                 let updated_column_indices: HashSet<usize> =
                     set_clauses.iter().map(|(col_idx, _)| *col_idx).collect();
-                let relevant_triggers: Vec<_> =
-                    t_ctx.resolver.with_schema(update_database_id, |s| {
-                        get_relevant_triggers_type_and_time(
-                            s,
-                            TriggerEvent::Update,
-                            TriggerTime::After,
-                            Some(updated_column_indices),
-                            &btree_table,
-                        )
-                        .collect()
-                    });
+                let relevant_triggers = get_triggers_including_temp(
+                    &t_ctx.resolver,
+                    update_database_id,
+                    TriggerEvent::Update,
+                    TriggerTime::After,
+                    Some(updated_column_indices),
+                    &btree_table,
+                );
                 if !relevant_triggers.is_empty() {
                     let columns = target_table.table.columns();
 
@@ -2235,7 +2306,8 @@ fn emit_update_insns<'a>(
 
                     // Compute VIRTUAL columns for OLD values if we have preserved OLD registers
                     if let Some(ref old_regs) = preserved_old_registers {
-                        let old_ctx = DmlColumnContext::indexed(columns.clone(), old_regs.clone());
+                        let pairs = columns.iter().zip(old_regs.iter().copied());
+                        let old_ctx = DmlColumnContext::from_column_reg_mapping(pairs);
                         compute_virtual_columns(program, columns, &old_ctx, &t_ctx.resolver)?;
                     }
 
@@ -2377,7 +2449,7 @@ fn emit_update_insns<'a>(
             if let Some(cdc_cursor_id) = t_ctx.cdc_cursor_id {
                 let cdc_rowid_before_reg =
                     cdc_rowid_before_reg.expect("cdc_rowid_before_reg must be set");
-                if has_user_provided_rowid {
+                if updates_rowid {
                     emit_cdc_insns(
                         program,
                         &t_ctx.resolver,
@@ -2440,8 +2512,6 @@ fn emit_update_insns<'a>(
             target_pc: t_ctx.label_main_loop_end.unwrap(),
         })
     }
-    // TODO(pthorpe): handle RETURNING clause
-
     if let Some(label) = check_rowid_not_exists_label {
         program.preassign_label_to_next_insn(label);
     }

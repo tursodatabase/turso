@@ -339,9 +339,8 @@ impl<'a, 'plan> PreparedHashBuild<'a, 'plan> {
         }
 
         if !config.use_materialized_keys {
-            let build_only_mask = TableMask::from_table_number_iter(
-                [planner.hash_join_op.build_table_idx].into_iter(),
-            );
+            let build_only_mask: TableMask =
+                [planner.hash_join_op.build_table_idx].into_iter().collect();
             for cond in planner.predicates.iter() {
                 if cond.from_outer_join.is_some() {
                     // OUTER JOIN predicates must stay on the right-table loop
@@ -355,8 +354,8 @@ impl<'a, 'plan> PreparedHashBuild<'a, 'plan> {
                     planner.table_references,
                     planner.non_from_clause_subqueries,
                 )?;
-                if !mask.contains_table(planner.hash_join_op.build_table_idx)
-                    || !build_only_mask.contains_all(&mask)
+                if !mask.get(planner.hash_join_op.build_table_idx)
+                    || !build_only_mask.contains_all_set_bits_of(&mask)
                 {
                     continue;
                 }

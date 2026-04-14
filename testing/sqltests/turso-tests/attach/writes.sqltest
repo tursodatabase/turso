@@ -1482,3 +1482,72 @@ expect {
     t1|1
     t1|0
 }
+
+# regression: `CREATE TEMP TRIGGER ... ON aux.x` must
+# target the attached db, not "unqualified" (= parent schema's table
+# of this name). Previously unknown qualifiers got mapped to `None`,
+# which the trigger-firing filter treats as "fire on any shadow of
+# this name" — causing the trigger to incorrectly fire on inserts into
+# `main.x`.
+# BEGIN IMMEDIATE must open a write transaction on attached databases
+# so that data written in the explicit transaction persists after COMMIT.
+# SQLite emits Transaction opcodes for every open database (main, temp,
+# each attached) on BEGIN IMMEDIATE / EXCLUSIVE.
+test attach-begin-immediate-locks-attached-db {
+    ATTACH ':memory:' AS aux;
+    CREATE TABLE aux.t(v INTEGER);
+    BEGIN IMMEDIATE;
+    INSERT INTO aux.t VALUES (1);
+    INSERT INTO aux.t VALUES (2);
+    COMMIT;
+    SELECT v FROM aux.t ORDER BY v;
+}
+expect {
+    1
+    2
+}
+
+test attach-begin-immediate-rollback-reverts-attached {
+    ATTACH ':memory:' AS aux;
+    CREATE TABLE aux.t(v INTEGER);
+    INSERT INTO aux.t VALUES (10);
+    BEGIN IMMEDIATE;
+    INSERT INTO aux.t VALUES (20);
+    ROLLBACK;
+    SELECT v FROM aux.t ORDER BY v;
+}
+expect {
+    10
+}
+
+test attach-begin-exclusive-multiple-attached {
+    ATTACH ':memory:' AS a;
+    ATTACH ':memory:' AS b;
+    CREATE TABLE a.t(x INTEGER);
+    CREATE TABLE b.t(y INTEGER);
+    BEGIN EXCLUSIVE;
+    INSERT INTO a.t VALUES (1);
+    INSERT INTO b.t VALUES (2);
+    COMMIT;
+    SELECT x FROM a.t;
+    SELECT y FROM b.t;
+}
+expect {
+    1
+    2
+}
+
+test attach-temp-trigger-attached-target-not-confused-with-main {
+    CREATE TABLE log_main(v INTEGER);
+    ATTACH ':memory:' AS aux;
+    CREATE TABLE aux.x(v INTEGER);
+    CREATE TABLE x(v INTEGER);
+    CREATE TEMP TRIGGER tr_aux AFTER INSERT ON aux.x BEGIN
+        INSERT INTO log_main VALUES (NEW.v);
+    END;
+    INSERT INTO main.x VALUES (100);
+    SELECT count(*) FROM log_main;
+}
+expect {
+    0
+}

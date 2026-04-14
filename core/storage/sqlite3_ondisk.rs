@@ -302,6 +302,7 @@ impl Default for TextEncoding {
 }
 
 #[derive(Pod, Zeroable, Clone, Copy, Debug)]
+#[cfg_attr(test, derive(PartialEq, Eq))]
 #[repr(C, packed)]
 /// Database Header Format
 pub struct DatabaseHeader {

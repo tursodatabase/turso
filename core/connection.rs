@@ -2,7 +2,7 @@ use crate::error::io_error;
 #[cfg(any(test, injected_yields))]
 use crate::mvcc::yield_points::YieldInjector;
 use crate::statement::StatementOrigin;
-use crate::storage::journal_mode;
+use crate::storage::{journal_mode, pager::SavepointResult};
 use crate::sync::{
     atomic::{AtomicBool, AtomicI32, AtomicI64, AtomicIsize, AtomicU16, AtomicU64, Ordering},
     Arc, RwLock,
@@ -14,7 +14,6 @@ use crate::types::{WalFrameInfo, WalState};
 use crate::util::{OpenMode, OpenOptions};
 #[cfg(all(feature = "fs", feature = "conn_raw_api"))]
 use crate::Page;
-use crate::MAIN_DB_ID;
 use crate::{
     ast, function,
     io::{MemoryIO, IO},
@@ -29,13 +28,16 @@ use crate::{
     Parser, QueryMode, QueryRunner, Result, Schema, Statement, SyncMode, TransactionMode, Trigger,
     Value, VirtualTable,
 };
+use crate::{MAIN_DB_ID, TEMP_DB_ID};
 use arc_swap::ArcSwap;
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use smallvec::SmallVec;
 use std::fmt::Display;
 use std::ops::Deref;
+#[cfg(not(target_family = "wasm"))]
+use tempfile::TempDir;
 use tracing::{instrument, Level};
-use turso_macros::AtomicEnum;
+use turso_macros::{turso_assert_ne, AtomicEnum};
 
 #[derive(Clone, AtomicEnum, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum TransactionState {
@@ -50,6 +52,72 @@ pub(crate) enum TransactionState {
         has_read_txn: bool,
     },
     None,
+}
+
+pub(crate) struct TempDatabase {
+    pub(crate) db: Arc<Database>,
+    pub(crate) pager: Arc<Pager>,
+    #[cfg(not(target_family = "wasm"))]
+    _temp_dir: Option<TempDir>,
+}
+
+/// All of the connection-local state needed to manage the `TEMP` schema.
+///
+/// Grouped so that anything that touches the temp database (the pager,
+/// the last committed schema snapshot, the dirty-schema flag) lives in
+/// one place. The individual fields keep their own locks because their
+/// access patterns differ: `database` is read on every temp-qualified
+/// lookup while `committed_schema` is only touched at commit/rollback
+/// boundaries, and `schema_did_change` is flipped from inside `SetCookie`.
+pub(crate) struct TempDbContext {
+    /// Per-connection temp database (`TEMP_DB_ID`/schema `temp`).
+    /// Lazily initialized on first temp DDL.
+    pub(crate) database: RwLock<Option<TempDatabase>>,
+    /// Last committed snapshot of `database.read().as_ref().unwrap().db.schema`.
+    /// Updated on successful commit and consulted on full-txn rollback
+    /// to restore the in-memory temp schema (there is no shared
+    /// `Database::schema` for temp the way main has). `None` until the
+    /// first temp DDL is committed; a rollback with `None` resets the
+    /// temp schema to empty.
+    pub(crate) committed_schema: RwLock<Option<Arc<Schema>>>,
+    /// Set by `SetCookie` when a temp DDL runs; read by commit/rollback
+    /// to decide whether to snapshot/restore. Cleared on transaction
+    /// end. Mirrors the `schema_did_change` field inside
+    /// `TransactionState::Write` for the main DB.
+    pub(crate) schema_did_change: AtomicBool,
+}
+
+impl TempDbContext {
+    pub(crate) fn new() -> Self {
+        Self {
+            database: RwLock::new(None),
+            committed_schema: RwLock::new(None),
+            schema_did_change: AtomicBool::new(false),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct NamedSavepointFrame {
+    pub(crate) name: String,
+    pub(crate) starts_transaction: bool,
+    pub(crate) deferred_fk_violations: isize,
+    /// Snapshot of `temp_db.db.schema` taken at SAVEPOINT begin. `None`
+    /// when the temp database had not been initialized yet. Used by
+    /// ROLLBACK TO to restore the in-memory temp schema after the
+    /// on-disk pages have been rolled back via the mirror call.
+    pub(crate) temp_schema_snapshot: Option<Arc<Schema>>,
+    /// Snapshot of the connection-local `database_schemas` map at
+    /// SAVEPOINT begin. Cheap — values are `Arc`. Used by ROLLBACK TO
+    /// to restore staged DDL on attached databases.
+    pub(crate) staged_schema_snapshot: HashMap<usize, Arc<Schema>>,
+}
+
+/// Info returned by `rollback_named_savepoint_frame` so callers can
+/// restore in-memory schema state after the pager has rolled back.
+pub(crate) struct RollbackFrameInfo {
+    pub(crate) temp_schema_snapshot: Option<Arc<Schema>>,
+    pub(crate) staged_schema_snapshot: HashMap<usize, Arc<Schema>>,
 }
 
 /// Database connection handle.
@@ -84,6 +152,9 @@ pub struct Connection {
     /// -1 means unset (will be assigned on first CDC write in the transaction).
     pub(crate) cdc_transaction_id: AtomicI64,
     pub(super) closed: AtomicBool,
+    /// Per-connection state for the `TEMP` schema (pager, last-committed
+    /// snapshot, dirty-schema flag). See `TempDbContext`.
+    pub(crate) temp: TempDbContext,
     /// Attached databases
     pub(super) attached_databases: RwLock<DatabaseCatalog>,
     pub(super) query_only: AtomicBool,
@@ -154,6 +225,9 @@ pub struct Connection {
     pub(super) check_constraints_pragma: AtomicBool,
     /// Track when each virtual table instance is currently in transaction.
     pub(crate) vtab_txn_states: RwLock<HashSet<u64>>,
+    /// Connection-level named savepoint stack used to mirror savepoint state
+    /// onto temp/attached databases that start participating after SAVEPOINT.
+    pub(crate) named_savepoints: RwLock<Vec<NamedSavepointFrame>>,
     /// Generation counter bumped whenever any setting that affects PrepareContext
     /// changes. Allows prepared statements to cheaply detect when they need to be
     /// reprepared (single u64 comparison instead of rebuilding the full context).
@@ -221,6 +295,218 @@ impl Drop for Connection {
 }
 
 impl Connection {
+    pub(crate) fn empty_temp_schema(&self) -> Arc<Schema> {
+        let mut schema = Schema::with_options(self.db.experimental_custom_types_enabled());
+        schema.generated_columns_enabled = self.db.experimental_generated_columns_enabled();
+        Arc::new(schema)
+    }
+
+    fn make_temp_database_opts(&self) -> DatabaseOpts {
+        DatabaseOpts::new()
+            .with_views(self.db.experimental_views_enabled())
+            .with_custom_types(self.db.experimental_custom_types_enabled())
+            .with_index_method(self.db.experimental_index_method_enabled())
+            .with_generated_columns(self.db.experimental_generated_columns_enabled())
+    }
+
+    fn effective_temp_store(&self) -> crate::TempStore {
+        let temp_store = self.get_temp_store();
+        #[cfg(feature = "fs")]
+        {
+            temp_store
+        }
+        #[cfg(not(feature = "fs"))]
+        {
+            let _ = temp_store;
+            crate::TempStore::Memory
+        }
+    }
+
+    #[cfg(feature = "fs")]
+    fn create_temp_database(&self) -> Result<TempDatabase> {
+        let temp_store = self.effective_temp_store();
+        let db_opts = self.make_temp_database_opts();
+        let page_size = self.get_page_size();
+
+        if matches!(temp_store, crate::TempStore::Memory) {
+            let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+            let db = Database::open_file_with_flags(
+                io,
+                crate::util::MEMORY_PATH,
+                OpenFlags::Create,
+                db_opts,
+                None,
+            )?;
+            let pager = Arc::new(db._init(None)?);
+            pager.set_initial_page_size(page_size)?;
+            return Ok(TempDatabase {
+                db,
+                pager,
+                #[cfg(not(target_family = "wasm"))]
+                _temp_dir: None,
+            });
+        }
+
+        #[cfg(not(target_family = "wasm"))]
+        {
+            let temp_dir = tempfile::tempdir().map_err(|e| io_error(e, "tempdir"))?;
+            let temp_path = temp_dir.path().join("tursodb-temp.db");
+            let temp_path_str = temp_path.to_str().ok_or_else(|| {
+                LimboError::InternalError("temp db path is not valid UTF-8".into())
+            })?;
+            // Always create a fresh IO for the temp file. Cloning the
+            // main db's IO is wrong when the main db uses a mock /
+            // simulated backend (e.g. the deterministic simulator
+            // with `--io-backend=memory`) that can't access real
+            // filesystem paths produced by `tempfile::tempdir()`.
+            let io = Database::io_for_path(temp_path_str)?;
+            let db = Database::open_file_with_flags(
+                io,
+                temp_path_str,
+                OpenFlags::Create,
+                db_opts,
+                None,
+            )?;
+            let pager = Arc::new(db._init(None)?);
+            pager.set_initial_page_size(page_size)?;
+            Ok(TempDatabase {
+                db,
+                pager,
+                _temp_dir: Some(temp_dir),
+            })
+        }
+
+        #[cfg(target_family = "wasm")]
+        {
+            let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+            let db = Database::open_file_with_flags(
+                io,
+                crate::util::MEMORY_PATH,
+                OpenFlags::Create,
+                db_opts,
+                None,
+            )?;
+            let pager = Arc::new(db._init(None)?);
+            pager.set_initial_page_size(page_size)?;
+            Ok(TempDatabase { db, pager })
+        }
+    }
+
+    #[cfg(not(feature = "fs"))]
+    fn create_temp_database(&self) -> Result<TempDatabase> {
+        let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+        let db = Database::open_file_with_flags(
+            io,
+            crate::util::MEMORY_PATH,
+            OpenFlags::Create,
+            self.make_temp_database_opts(),
+            None,
+        )?;
+        let pager = Arc::new(db._init(None)?);
+        pager.set_initial_page_size(self.get_page_size())?;
+        Ok(TempDatabase {
+            db,
+            pager,
+            #[cfg(not(target_family = "wasm"))]
+            _temp_dir: None,
+        })
+    }
+
+    pub(crate) fn ensure_temp_database(&self) -> Result<()> {
+        if self.temp.database.read().is_some() {
+            return Ok(());
+        }
+
+        let temp_db = self.create_temp_database()?;
+        let mut guard = self.temp.database.write();
+        if guard.is_none() {
+            *guard = Some(temp_db);
+        }
+        Ok(())
+    }
+
+    /// Tear down the per-connection temp database.
+    ///
+    /// Drops the temp pager, clears the committed schema snapshot and
+    /// the dirty-schema flag. Called by `set_temp_store` when the user
+    /// changes `PRAGMA temp_store` outside of an explicit transaction.
+    fn reset_temp_database(&self) {
+        if let Some(temp_db) = self.temp.database.write().take() {
+            temp_db.pager.rollback_attached();
+        }
+        *self.temp.committed_schema.write() = None;
+        self.temp.schema_did_change.store(false, Ordering::Release);
+    }
+
+    /// Flag a temp-schema mutation within the current transaction so the
+    /// commit/rollback path knows to snapshot or restore the in-memory
+    /// temp schema. Called from `SetCookie` for `TEMP_DB_ID`.
+    pub(crate) fn mark_temp_schema_did_change(&self) {
+        // If we're marking the temp schema dirty, temp DDL must have
+        // just run against the temp pager — which means the temp
+        // database was initialized. The opposite state is unreachable.
+        turso_assert!(
+            self.temp.database.read().is_some(),
+            "mark_temp_schema_did_change called without an initialized temp database"
+        );
+        self.temp.schema_did_change.store(true, Ordering::Release);
+    }
+
+    /// On successful commit, snapshot the current `temp_db.db.schema`
+    /// into `committed_temp_schema` so a future full-txn rollback can
+    /// restore it. No-op if no temp DDL ran in this transaction.
+    pub(crate) fn commit_temp_schema(&self) {
+        if !self.temp.schema_did_change.load(Ordering::Acquire) {
+            return;
+        }
+        // `schema_did_change` is only ever set by
+        // `mark_temp_schema_did_change`, which asserts temp is
+        // initialized. If it's somehow clear here we have a logic
+        // bug — no safe recovery, so fail loud.
+        let guard = self.temp.database.read();
+        turso_assert!(
+            guard.is_some(),
+            "commit_temp_schema: schema_did_change set but temp is uninitialized"
+        );
+        let snap = guard
+            .as_ref()
+            .expect("asserted above")
+            .db
+            .schema
+            .lock()
+            .clone();
+        drop(guard);
+        // save snapshot for potential future rollback.
+        *self.temp.committed_schema.write() = Some(snap);
+        self.temp.schema_did_change.store(false, Ordering::Release);
+    }
+
+    /// On full-txn rollback, restore `temp_db.db.schema` from the last
+    /// committed snapshot. If nothing was ever committed, reset to an
+    /// empty schema (matches the disk state the pager rolled back to).
+    pub(crate) fn rollback_temp_schema(&self) {
+        if !self.temp.schema_did_change.load(Ordering::Acquire) {
+            return;
+        }
+        // Same invariant as `commit_temp_schema` — the flag can only
+        // be set while temp is initialized.
+        let committed = self.temp.committed_schema.read().clone();
+        {
+            let guard = self.temp.database.read();
+            turso_assert!(
+                guard.is_some(),
+                "rollback_temp_schema: schema_did_change set but temp is uninitialized"
+            );
+            let temp_db = guard.as_ref().expect("asserted above");
+            match committed {
+                Some(snap) => *temp_db.db.schema.lock() = snap,
+                None => *temp_db.db.schema.lock() = self.empty_temp_schema(),
+            }
+        }
+        self.temp.schema_did_change.store(false, Ordering::Release);
+        self.bump_prepare_context_generation();
+    }
+
     /// Bump the prepare context generation counter. Must be called whenever any
     /// connection setting that is tracked in `PrepareContext` changes, so that
     /// prepared statements know they need to be reprepared.
@@ -249,9 +535,9 @@ impl Connection {
     }
 
     /// Check if a specific trigger is currently compiling (for recursive trigger prevention)
-    pub fn trigger_is_compiling(&self, trigger: impl AsRef<Trigger>) -> bool {
+    pub fn trigger_is_compiling(&self, trigger: &Arc<Trigger>) -> bool {
         let compiling = self.compiling_triggers.read();
-        if let Some(trigger) = compiling.iter().find(|t| t.name == trigger.as_ref().name) {
+        if let Some(trigger) = compiling.iter().find(|t| Arc::ptr_eq(t, trigger)) {
             tracing::debug!("Trigger is already compiling: {}", trigger.name);
             return true;
         }
@@ -272,9 +558,9 @@ impl Connection {
     }
 
     /// Check if a specific trigger is currently executing (for recursive trigger prevention)
-    pub fn is_trigger_executing(&self, trigger: impl AsRef<Trigger>) -> bool {
+    pub fn is_trigger_executing(&self, trigger: &Arc<Trigger>) -> bool {
         let executing = self.executing_triggers.read();
-        if let Some(trigger) = executing.iter().find(|t| t.name == trigger.as_ref().name) {
+        if let Some(trigger) = executing.iter().find(|t| Arc::ptr_eq(t, trigger)) {
             tracing::debug!("Trigger is already executing: {}", trigger.name);
             return true;
         }
@@ -548,8 +834,23 @@ impl Connection {
         } else {
             self.get_mv_tx()
         };
+        // Resolver so attached-db qualifiers in temp triggers can be
+        // mapped to their actual index on this connection (Phase 1.4c).
+        let attached_resolver = |name: &str| -> Option<usize> {
+            self.attached_databases
+                .read()
+                .get_database_by_name(&crate::util::normalize_ident(name))
+                .map(|(idx, _)| idx)
+        };
         // TODO: This function below is synchronous, make it async
-        parse_schema_rows(stmt, &mut fresh, &self.syms.read(), mv_tx, existing_views)?;
+        parse_schema_rows(
+            stmt,
+            &mut fresh,
+            &self.syms.read(),
+            mv_tx,
+            existing_views,
+            &attached_resolver,
+        )?;
 
         // Load custom types from __turso_internal_types if the table exists
         // and custom types are enabled. Type loading errors are non-fatal: we log
@@ -1275,12 +1576,19 @@ impl Connection {
 
     /// Check if a specific attached database is read only or not, by its index
     pub fn is_readonly(&self, index: usize) -> bool {
-        if index <= 1 {
-            self.db.is_readonly()
-        } else {
-            let db = self.attached_databases.read().get_database_by_index(index);
-            db.expect("Should never have called this without being sure the database exists")
-                .is_readonly()
+        match index {
+            crate::MAIN_DB_ID => self.db.is_readonly(),
+            crate::TEMP_DB_ID => self
+                .temp
+                .database
+                .read()
+                .as_ref()
+                .is_some_and(|temp_db| temp_db.db.is_readonly()),
+            _ => {
+                let db = self.attached_databases.read().get_database_by_index(index);
+                db.expect("Should never have called this without being sure the database exists")
+                    .is_readonly()
+            }
         }
     }
 
@@ -1372,6 +1680,12 @@ impl Connection {
             let mut dbsp_state_index_roots = HashMap::default();
             let mut materialized_view_info = HashMap::default();
 
+            let attached_resolver = |name: &str| -> Option<usize> {
+                self.attached_databases
+                    .read()
+                    .get_database_by_name(&crate::util::normalize_ident(name))
+                    .map(|(idx, _)| idx)
+            };
             for (ty, name, table_name, root_page, sql) in &rows_data {
                 match schema.handle_schema_row(
                     ty,
@@ -1385,6 +1699,7 @@ impl Connection {
                     &mut dbsp_state_roots,
                     &mut dbsp_state_index_roots,
                     &mut materialized_view_info,
+                    &attached_resolver,
                 ) {
                     Ok(()) => {}
                     Err(LimboError::ParseError(msg)) if msg.contains("already exists") => {}
@@ -1564,26 +1879,42 @@ impl Connection {
         database_id: usize,
         f: impl FnOnce(&mut Schema) -> T,
     ) -> T {
-        if !crate::is_attached_db(database_id) {
-            self.with_schema_mut(f)
-        } else {
-            // For attached databases, update a connection-local copy of the schema.
-            // We don't update the shared db.schema until after the WAL commit, so
-            // other connections won't see uncommitted schema changes (which would
-            // cause SchemaUpdated mismatches).
-            let mut schemas = self.database_schemas.write();
-            let schema_arc = schemas.entry(database_id).or_insert_with(|| {
-                // Lazily copy from the shared Database schema
-                let attached_dbs = self.attached_databases.read();
-                let (db, _pager) = attached_dbs
-                    .index_to_data
-                    .get(&database_id)
-                    .expect("Database ID should be valid");
-                let schema = db.schema.lock().clone();
-                schema
-            });
-            let schema = Arc::make_mut(schema_arc);
-            f(schema)
+        match database_id {
+            crate::MAIN_DB_ID => self.with_schema_mut(f),
+            crate::TEMP_DB_ID => {
+                // The temp database is connection-local, no other connection can
+                // reference its schema, so we can mutate it directly without cloning
+                // into `database_schemas`.
+                let temp_db_guard = self.temp.database.read();
+                let temp_db = temp_db_guard
+                    .as_ref()
+                    .expect("temp database should be initialized before schema mutation");
+                let mut schema_guard = temp_db.db.schema.lock();
+                let schema = Arc::make_mut(&mut schema_guard);
+                let result = f(schema);
+                self.bump_prepare_context_generation();
+                result
+            }
+            _ => {
+                // For attached databases, update a connection-local copy of the schema.
+                // We don't update the shared db.schema until after the WAL commit, so
+                // other connections won't see uncommitted schema changes (which would
+                // cause SchemaUpdated mismatches).
+                let mut schemas = self.database_schemas.write();
+                let schema_arc = schemas.entry(database_id).or_insert_with(|| {
+                    let attached_dbs = self.attached_databases.read();
+                    let (db, _pager) = attached_dbs
+                        .index_to_data
+                        .get(&database_id)
+                        .expect("Database ID should be valid");
+                    let schema = db.schema.lock().clone();
+                    schema
+                });
+                let schema = Arc::make_mut(schema_arc);
+                let result = f(schema);
+                self.bump_prepare_context_generation();
+                result
+            }
         }
     }
 
@@ -1592,10 +1923,22 @@ impl Connection {
     }
 
     pub(crate) fn get_pager_from_database_index(&self, index: &usize) -> Arc<Pager> {
-        if *index < 2 {
-            self.pager.load().clone()
-        } else {
-            self.attached_databases.read().get_pager_by_index(index)
+        match *index {
+            crate::MAIN_DB_ID => self.pager.load().clone(),
+            crate::TEMP_DB_ID => {
+                // Lazily initialize the temp database if it hasn't been created yet.
+                if self.temp.database.read().is_none() {
+                    self.ensure_temp_database()
+                        .expect("failed to initialize temp database");
+                }
+                self.temp
+                    .database
+                    .read()
+                    .as_ref()
+                    .map(|temp_db| temp_db.pager.clone())
+                    .expect("temp database should be initialized")
+            }
+            _ => self.attached_databases.read().get_pager_by_index(index),
         }
     }
 
@@ -1603,9 +1946,43 @@ impl Connection {
     /// Returns "main" for index 0, "temp" for index 1, and the alias for attached databases.
     pub(crate) fn get_database_name_by_index(&self, index: usize) -> Option<String> {
         match index {
-            0 => Some("main".to_string()),
-            1 => Some("temp".to_string()),
+            MAIN_DB_ID => Some("main".to_string()),
+            TEMP_DB_ID => Some("temp".to_string()),
             _ => self.attached_databases.read().get_name_by_index(index),
+        }
+    }
+
+    /// Get the database id for a schema name ("main", "temp", or an attached db alias).
+    pub(crate) fn get_database_id_by_name(&self, name: &str) -> Result<usize> {
+        let normalized: String = crate::util::normalize_ident(name);
+        match normalized.as_str() {
+            "main" => Ok(MAIN_DB_ID),
+            "temp" => Ok(TEMP_DB_ID),
+            _ => self
+                .attached_databases
+                .read()
+                .get_database_by_name(&normalized)
+                .map(|(idx, _)| idx)
+                .ok_or_else(|| LimboError::InvalidArgument(format!("no such database: {name}"))),
+        }
+    }
+
+    /// Get the Database object for a given database id.
+    pub(crate) fn get_source_database(&self, database_id: usize) -> Arc<Database> {
+        match database_id {
+            MAIN_DB_ID => self.db.clone(),
+            TEMP_DB_ID => self
+                .temp
+                .database
+                .read()
+                .as_ref()
+                .map(|temp_db| temp_db.db.clone())
+                .unwrap_or_else(|| self.db.clone()),
+            _ => self
+                .attached_databases
+                .read()
+                .get_database_by_index(database_id)
+                .expect("database index should be valid"),
         }
     }
 
@@ -1959,40 +2336,92 @@ impl Connection {
             .collect()
     }
 
-    /// Get all attached database pagers (excludes main/temp databases)
+    /// Get all non-main database pagers (temp + attached).
     pub fn get_all_attached_pagers(&self) -> Vec<Arc<Pager>> {
+        let mut pagers = Vec::new();
+        if let Some(temp_db) = self.temp.database.read().as_ref() {
+            pagers.push(temp_db.pager.clone());
+        }
         let catalog = self.attached_databases.read();
-        catalog
-            .index_to_data
-            .values()
-            .map(|(_db, pager)| pager.clone())
-            .collect()
+        pagers.extend(
+            catalog
+                .index_to_data
+                .values()
+                .map(|(_db, pager)| pager.clone()),
+        );
+        pagers
     }
 
-    /// Get all attached database (index, pager) pairs (excludes main/temp databases)
-    pub(crate) fn get_all_attached_pagers_with_index(&self) -> Vec<(usize, Arc<Pager>)> {
-        let catalog = self.attached_databases.read();
-        catalog
-            .index_to_data
-            .iter()
-            .map(|(&idx, (_db, pager))| (idx, pager.clone()))
-            .collect()
+    /// Invoke `f` with a slice of all non-main database (index, pager) pairs
+    /// (temp + attached).The internal locks are released before `f` runs, which also
+    /// makes it safe for `f` to call back into the connection (e.g. `mv_store_for_db`,
+    /// which re-reads the attached-database catalog).
+    pub(crate) fn with_all_attached_pagers_with_index<F, R>(&self, f: F) -> R
+    where
+        F: FnOnce(&[(usize, Arc<Pager>)]) -> R,
+    {
+        let mut pagers: SmallVec<[(usize, Arc<Pager>); 8]> = SmallVec::new();
+        if let Some(temp_db) = self.temp.database.read().as_ref() {
+            pagers.push((crate::TEMP_DB_ID, temp_db.pager.clone()));
+        }
+        {
+            let catalog = self.attached_databases.read();
+            for (&idx, (_db, pager)) in catalog.index_to_data.iter() {
+                pagers.push((idx, pager.clone()));
+            }
+        }
+        f(&pagers)
     }
 
     pub(crate) fn database_schemas(&self) -> &RwLock<HashMap<usize, Arc<Schema>>> {
         &self.database_schemas
     }
 
-    /// Publish a connection-local attached DB schema to the shared Database instance.
-    /// Called after the attached pager's WAL commit succeeds, so other connections
-    /// can now see the schema changes.
-    pub(crate) fn publish_attached_schema(&self, database_id: usize) {
+    fn cached_non_main_schema(&self, database_id: usize) -> Arc<Schema> {
+        turso_assert_ne!(database_id, crate::MAIN_DB_ID);
+        // TEMP is the sole source-of-truth path: writes go directly to
+        // `temp_db.db.schema` (see `with_database_schema_mut`), so skip
+        // `database_schemas` entirely to avoid stale reads.
+        if database_id == crate::TEMP_DB_ID {
+            return self
+                .temp
+                .database
+                .read()
+                .as_ref()
+                .map(|temp_db| temp_db.db.schema.lock().clone())
+                .unwrap_or_else(|| self.empty_temp_schema());
+        }
+        if let Some(schema) = self.database_schemas.read().get(&database_id).cloned() {
+            return schema;
+        }
+
+        let attached_dbs = self.attached_databases.read();
+        let (db, _pager) = attached_dbs
+            .index_to_data
+            .get(&database_id)
+            .expect("Database ID should be valid after resolve_database_id");
+        let schema = db.schema.lock().clone();
+        schema
+    }
+
+    /// Publish a connection-local non-main schema after commit.
+    ///
+    /// TEMP is not staged in `database_schemas` — writes go directly to
+    /// `temp_db.db.schema` via `with_database_schema_mut`, so there is
+    /// nothing to publish here. Attached databases still stage mutations
+    /// in `database_schemas` so other connections don't see uncommitted
+    /// DDL; those get published to the shared `db.schema` on commit.
+    pub(crate) fn publish_database_schema(&self, database_id: usize) {
+        if database_id == crate::TEMP_DB_ID {
+            return;
+        }
         let mut schemas = self.database_schemas.write();
         if let Some(local_schema) = schemas.remove(&database_id) {
             let attached_dbs = self.attached_databases.read();
             if let Some((db, _pager)) = attached_dbs.index_to_data.get(&database_id) {
                 *db.schema.lock() = local_schema;
             }
+            self.bump_prepare_context_generation();
         }
     }
 
@@ -2003,30 +2432,12 @@ impl Connection {
     /// Access schema for a database using a closure pattern to avoid cloning
     pub(crate) fn with_schema<T>(&self, database_id: usize, f: impl FnOnce(&Schema) -> T) -> T {
         match database_id {
-            crate::MAIN_DB_ID | crate::TEMP_DB_ID => {
-                // Main database - use connection's schema which should be kept in sync
-                // NOTE: for Temp databases, for now they can use the connection-local schema
-                // but this will change in the future
+            crate::MAIN_DB_ID => {
                 let schema = self.schema.read();
                 f(&schema)
             }
             _ => {
-                // Attached database: prefer the connection-local copy (which may contain
-                // uncommitted schema changes from this connection's transaction), falling
-                // back to the shared Database schema (last committed state).
-                let schemas = self.database_schemas.read();
-                if let Some(local_schema) = schemas.get(&database_id) {
-                    return f(local_schema);
-                }
-                drop(schemas);
-
-                let attached_dbs = self.attached_databases.read();
-                let (db, _pager) = attached_dbs
-                    .index_to_data
-                    .get(&database_id)
-                    .expect("Database ID should be valid after resolve_database_id");
-
-                let schema = db.schema.lock().clone();
+                let schema = self.cached_non_main_schema(database_id);
                 f(&schema)
             }
         }
@@ -2053,7 +2464,14 @@ impl Connection {
 
         // Add main database (always seq=0, name="main")
         let main_path = Self::get_canonical_path_for_database(&self.db);
-        databases.push((0, "main".to_string(), main_path));
+        databases.push((MAIN_DB_ID, "main".to_string(), main_path));
+
+        // SQLite only exposes the temp schema in database_list after it has
+        // been initialized, and reports an empty path rather than the backing
+        // temp filename.
+        if self.temp.database.read().is_some() {
+            databases.push((crate::TEMP_DB_ID, "temp".to_string(), String::new()));
+        }
 
         // Add attached databases
         let attached_dbs = self.attached_databases.read();
@@ -2134,7 +2552,12 @@ impl Connection {
     }
 
     pub fn set_temp_store(&self, value: crate::TempStore) {
+        if self.temp_store.get() == value {
+            return;
+        }
+        self.reset_temp_database();
         self.temp_store.set(value);
+        self.bump_prepare_context_generation();
     }
 
     pub fn get_data_sync_retry(&self) -> bool {
@@ -2357,7 +2780,7 @@ impl Connection {
     /// Get MVCC transaction ID for a specific database.
     /// Uses fast path for main DB, O(1) HashMap lookup for attached DBs.
     pub(crate) fn get_mv_tx_id_for_db(&self, db: usize) -> Option<u64> {
-        if !crate::is_attached_db(db) {
+        if db == crate::MAIN_DB_ID {
             self.get_mv_tx_id()
         } else {
             self.attached_mv_txs
@@ -2369,7 +2792,7 @@ impl Connection {
 
     /// Get MVCC transaction ID and mode for a specific database.
     pub(crate) fn get_mv_tx_for_db(&self, db: usize) -> Option<(u64, TransactionMode)> {
-        if !crate::is_attached_db(db) {
+        if db == crate::MAIN_DB_ID {
             self.get_mv_tx()
         } else {
             self.attached_mv_txs.read().get(&db).copied()
@@ -2378,7 +2801,7 @@ impl Connection {
 
     /// Set MVCC transaction for a specific database.
     pub(crate) fn set_mv_tx_for_db(&self, db: usize, val: Option<(u64, TransactionMode)>) {
-        if !crate::is_attached_db(db) {
+        if db == crate::MAIN_DB_ID {
             self.set_mv_tx(val);
         } else {
             let mut txs = self.attached_mv_txs.write();
@@ -2403,6 +2826,7 @@ impl Connection {
     /// should all delegate here.
     pub(crate) fn rollback_attached_mvcc_txs(&self, clear_schemas: bool) {
         let txs: HashMap<usize, _> = self.attached_mv_txs.read().clone();
+        let mut cleared_any_schema = false;
         for (&db_id, &(tx_id, _mode)) in &txs {
             if let Some(attached_mv_store) = self.mv_store_for_db(db_id) {
                 let attached_pager = self.get_pager_from_database_index(&db_id);
@@ -2413,33 +2837,109 @@ impl Connection {
                 }
                 if clear_schemas {
                     self.database_schemas().write().remove(&db_id);
+                    cleared_any_schema = true;
                 }
                 attached_pager.end_read_tx();
             }
         }
         self.attached_mv_txs.write().clear();
+        if cleared_any_schema {
+            self.bump_prepare_context_generation();
+        }
     }
 
     /// Rollback WAL-mode transactions on all attached databases and discard
     /// their connection-local schema caches.  MVCC-enabled attached databases
     /// are skipped — those are handled by `rollback_attached_mvcc_txs`.
     pub(crate) fn rollback_attached_wal_txns(&self) {
-        let attached_pagers = self.get_all_attached_pagers_with_index();
-        // Collect WAL-mode db_ids first, then batch the schema removal under
-        // a single write lock to avoid per-iteration lock contention.
-        let wal_pagers: SmallVec<[(usize, Arc<Pager>); 4]> = attached_pagers
-            .into_iter()
-            .filter(|(db_id, _)| self.mv_store_for_db(*db_id).is_none())
-            .collect();
-        if !wal_pagers.is_empty() {
-            let mut schemas = self.database_schemas().write();
-            for (db_id, _) in &wal_pagers {
-                schemas.remove(db_id);
+        self.with_all_attached_pagers_with_index(|pagers| {
+            // Record indices of WAL-mode entries so we can batch the schema
+            // removal under a single write lock and avoid calling
+            // `mv_store_for_db` more than once per entry.
+            let mut wal_indices: SmallVec<[usize; 4]> = SmallVec::new();
+            for (i, (db_id, _)) in pagers.iter().enumerate() {
+                if self.mv_store_for_db(*db_id).is_none() {
+                    wal_indices.push(i);
+                }
             }
+            if wal_indices.is_empty() {
+                return;
+            }
+            {
+                let mut schemas = self.database_schemas().write();
+                for &i in &wal_indices {
+                    schemas.remove(&pagers[i].0);
+                }
+            }
+            self.bump_prepare_context_generation();
+            for &i in &wal_indices {
+                pagers[i].1.rollback_attached();
+            }
+        });
+    }
+
+    pub(crate) fn with_named_savepoints<F, T>(&self, f: F) -> T
+    where
+        F: FnOnce(&[NamedSavepointFrame]) -> T,
+    {
+        let savepoints = self.named_savepoints.read();
+        f(&savepoints)
+    }
+
+    pub(crate) fn push_named_savepoint(&self, frame: NamedSavepointFrame) {
+        self.named_savepoints.write().push(frame);
+    }
+
+    /// Snapshot the in-memory non-main schemas for a savepoint frame so
+    /// ROLLBACK TO can restore them after the pager rolls back the
+    /// underlying pages.
+    pub(crate) fn with_snapshot_non_main_schemas<F, T>(&self, f: F) -> T
+    where
+        F: FnOnce(Option<Arc<Schema>>, HashMap<usize, Arc<Schema>>) -> T,
+    {
+        let temp_schema_snapshot = self
+            .temp
+            .database
+            .read()
+            .as_ref()
+            .map(|temp_db| temp_db.db.schema.lock().clone());
+        let staged_schema_snapshot = self.database_schemas.read().clone();
+        f(temp_schema_snapshot, staged_schema_snapshot)
+    }
+
+    pub(crate) fn release_named_savepoint_frame(&self, name: &str) -> SavepointResult {
+        let mut savepoints = self.named_savepoints.write();
+        let Some(target_idx) = savepoints
+            .iter()
+            .rposition(|savepoint| savepoint.name == name)
+        else {
+            return SavepointResult::NotFound;
+        };
+        if savepoints[target_idx].starts_transaction && target_idx == 0 {
+            return SavepointResult::Commit;
         }
-        for (_, attached_pager) in &wal_pagers {
-            attached_pager.rollback_attached();
-        }
+        savepoints.truncate(target_idx);
+        SavepointResult::Release
+    }
+
+    pub(crate) fn rollback_named_savepoint_frame(&self, name: &str) -> Option<RollbackFrameInfo> {
+        let mut savepoints = self.named_savepoints.write();
+        let target_idx = savepoints
+            .iter()
+            .rposition(|savepoint| savepoint.name == name)?;
+        let frame = &savepoints[target_idx];
+        let info = RollbackFrameInfo {
+            temp_schema_snapshot: frame.temp_schema_snapshot.clone(),
+            staged_schema_snapshot: frame.staged_schema_snapshot.clone(),
+        };
+        // ROLLBACK TO keeps the target savepoint itself on the stack;
+        // only nested savepoints above it are discarded.
+        savepoints.truncate(target_idx + 1);
+        Some(info)
+    }
+
+    pub(crate) fn clear_named_savepoints(&self) {
+        self.named_savepoints.write().clear();
     }
 
     /// Iterate over all attached MVCC transactions, calling `f(db_id, tx_id)` for each.
@@ -2466,14 +2966,16 @@ impl Connection {
         if self.is_mvcc_bootstrap_connection() {
             return None;
         }
-        if !crate::is_attached_db(db) {
-            self.db.get_mv_store().as_ref().cloned()
-        } else {
-            let catalog = self.attached_databases.read();
-            catalog
-                .index_to_data
-                .get(&db)
-                .and_then(|(db, _)| db.get_mv_store().as_ref().cloned())
+        match db {
+            crate::MAIN_DB_ID => self.db.get_mv_store().as_ref().cloned(),
+            crate::TEMP_DB_ID => None,
+            _ => {
+                let catalog = self.attached_databases.read();
+                catalog
+                    .index_to_data
+                    .get(&db)
+                    .and_then(|(db, _)| db.get_mv_store().as_ref().cloned())
+            }
         }
     }
 
@@ -2589,6 +3091,14 @@ mod tests {
         db.connect().unwrap()
     }
 
+    fn query_single_i64(conn: &Arc<Connection>, sql: &str) -> i64 {
+        let mut stmt = conn.prepare(sql).unwrap();
+        match stmt.step().unwrap() {
+            StepResult::Row => stmt.row().unwrap().get::<i64>(0).unwrap(),
+            other => panic!("expected a row, got {other:?}"),
+        }
+    }
+
     // given a attached 'alias', return the Database and Pager for that attached database
     fn attached_entry(conn: &Connection, alias: &str) -> (Arc<Database>, Arc<Pager>) {
         let catalog = conn.attached_databases.read();
@@ -2672,5 +3182,102 @@ mod tests {
         let db_shared_ptr = Arc::as_ptr(&attached_db.shared_wal) as usize;
 
         assert_eq!(pager_shared_ptr, db_shared_ptr);
+    }
+
+    #[test]
+    fn test_temp_tables_are_connection_local_and_shadow_main() {
+        let temp_dir = TempDir::new().unwrap();
+        let db_path = temp_dir.path().join("main.db");
+        let conn1 = open_connection(&db_path);
+
+        conn1.execute("CREATE TABLE t(x INTEGER)").unwrap();
+        conn1.execute("INSERT INTO main.t VALUES(1)").unwrap();
+        let conn2 = open_connection(&db_path);
+        conn1.execute("CREATE TEMP TABLE t(x INTEGER)").unwrap();
+        conn1.execute("INSERT INTO temp.t VALUES(2)").unwrap();
+
+        assert_eq!(query_single_i64(&conn1, "SELECT x FROM t"), 2);
+        assert_eq!(query_single_i64(&conn1, "SELECT x FROM main.t"), 1);
+        assert_eq!(query_single_i64(&conn2, "SELECT x FROM t"), 1);
+
+        let err = conn2
+            .prepare("SELECT x FROM temp.t")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("no such table"),
+            "expected no such table error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_reprepare_after_temp_store_reset_does_not_panic() {
+        let temp_dir = TempDir::new().unwrap();
+        let db_path = temp_dir.path().join("main.db");
+        let conn = open_connection(&db_path);
+
+        conn.execute("CREATE TEMP TABLE t(x INTEGER)").unwrap();
+        let mut stmt = conn.prepare("SELECT x FROM t").unwrap();
+
+        conn.execute("PRAGMA temp_store = MEMORY").unwrap();
+
+        let err = stmt.step().unwrap_err().to_string();
+        assert!(
+            err.contains("no such table"),
+            "expected no such table after temp reset, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_temp_trigger_abort_rolls_back_temp_writes_without_panicking() {
+        let temp_dir = TempDir::new().unwrap();
+        let db_path = temp_dir.path().join("main.db");
+        let conn = open_connection(&db_path);
+
+        conn.execute("CREATE TEMP TABLE t(x INTEGER)").unwrap();
+        conn.execute("CREATE TEMP TABLE u(y INTEGER)").unwrap();
+        conn.execute(
+            "CREATE TRIGGER tr BEFORE INSERT ON temp.t BEGIN \
+             INSERT INTO u VALUES (NEW.x); \
+             SELECT RAISE(ABORT, 'boom'); \
+             END;",
+        )
+        .unwrap();
+
+        let err = conn.execute("INSERT INTO temp.t VALUES(1)").unwrap_err();
+        assert!(
+            err.to_string().contains("boom"),
+            "expected trigger abort error, got: {err}"
+        );
+        assert_eq!(query_single_i64(&conn, "SELECT COUNT(*) FROM temp.u"), 0);
+        assert_eq!(query_single_i64(&conn, "SELECT COUNT(*) FROM temp.t"), 0);
+    }
+
+    #[test]
+    fn test_temp_trigger_abort_rolls_back_main_and_temp_writes() {
+        let temp_dir = TempDir::new().unwrap();
+        let db_path = temp_dir.path().join("main.db");
+        let conn = open_connection(&db_path);
+
+        conn.execute("CREATE TABLE m(x INTEGER)").unwrap();
+        conn.execute("CREATE TEMP TABLE t(x INTEGER)").unwrap();
+        conn.execute("CREATE TEMP TABLE u(y INTEGER)").unwrap();
+        conn.execute(
+            "CREATE TRIGGER tr BEFORE INSERT ON temp.t BEGIN \
+             INSERT INTO m VALUES (NEW.x); \
+             INSERT INTO u VALUES (NEW.x); \
+             SELECT RAISE(ABORT, 'boom'); \
+             END;",
+        )
+        .unwrap();
+
+        let err = conn.execute("INSERT INTO temp.t VALUES(1)").unwrap_err();
+        assert!(
+            err.to_string().contains("boom"),
+            "expected trigger abort error, got: {err}"
+        );
+        assert_eq!(query_single_i64(&conn, "SELECT COUNT(*) FROM main.m"), 0);
+        assert_eq!(query_single_i64(&conn, "SELECT COUNT(*) FROM temp.u"), 0);
+        assert_eq!(query_single_i64(&conn, "SELECT COUNT(*) FROM temp.t"), 0);
     }
 }

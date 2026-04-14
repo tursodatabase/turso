@@ -1,0 +1,22 @@
+{
+  "name": "@tursodatabase/cli-linux-x64-gnu",
+  "version": "0.6.0-pre.17",
+  "description": "Turso CLI binary for Linux x64 (glibc)",
+  "os": [
+    "linux"
+  ],
+  "cpu": [
+    "x64"
+  ],
+  "libc": [
+    "glibc"
+  ],
+  "files": [
+    "tursodb"
+  ],
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/tursodatabase/turso"
+  }
+}

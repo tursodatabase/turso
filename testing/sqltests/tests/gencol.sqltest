@@ -1246,6 +1246,15 @@ expect {
     1|9|90
 }
 
+test gencol_insert_or_replace_not_null_no_default {
+    CREATE TABLE t(a, b AS (a) NOT NULL);
+    INSERT INTO t VALUES (1);
+    UPDATE OR REPLACE t SET a = null;
+}
+expect error {
+    NOT NULL constraint failed: t.b
+}
+
 test gencol_insert_or_ignore {
     CREATE TABLE t1(a INTEGER PRIMARY KEY, b INTEGER, c AS (b + 100));
     INSERT INTO t1(a, b) VALUES(1, 5);
@@ -4043,3 +4052,286 @@ expect {
     1|y|1y
 }
 
+
+# Parent UPDATE with default NO ACTION should fail when gen-col FK changes
+@cross-check-integrity
+test fk-gencol-unique-idx-update-no-action {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE p(a INTEGER, b INTEGER GENERATED ALWAYS AS (a*2) VIRTUAL);
+    CREATE UNIQUE INDEX idx_p_b ON p(b);
+    CREATE TABLE c(x INTEGER REFERENCES p(b));
+    INSERT INTO p(a) VALUES(1);
+    INSERT INTO c(x) VALUES(2);
+    UPDATE p SET a=3 WHERE a=1;
+}
+expect error {
+}
+
+# ON DELETE CASCADE should remove child rows
+@cross-check-integrity
+test fk-gencol-unique-idx-delete-cascade {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE p(a INTEGER, b INTEGER GENERATED ALWAYS AS (a*2) VIRTUAL);
+    CREATE UNIQUE INDEX idx_p_b ON p(b);
+    CREATE TABLE c(x INTEGER REFERENCES p(b) ON DELETE CASCADE);
+    INSERT INTO p(a) VALUES(10);
+    INSERT INTO c(x) VALUES(20);
+    DELETE FROM p WHERE a=10;
+    SELECT count(*) FROM c;
+}
+expect {
+    0
+}
+
+# ON DELETE SET NULL should null-out child FK column
+@cross-check-integrity
+test fk-gencol-unique-idx-delete-set-null {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE p(a INTEGER, b INTEGER GENERATED ALWAYS AS (a*2) VIRTUAL);
+    CREATE UNIQUE INDEX idx_p_b ON p(b);
+    CREATE TABLE c(x INTEGER REFERENCES p(b) ON DELETE SET NULL);
+    INSERT INTO p(a) VALUES(100);
+    INSERT INTO c(x) VALUES(200);
+    DELETE FROM p WHERE a=100;
+    SELECT typeof(x), x FROM c;
+}
+expect {
+    null|
+}
+
+# ON UPDATE CASCADE should propagate new generated value
+@cross-check-integrity
+test fk-gencol-unique-idx-update-cascade {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE p(a INTEGER, b INTEGER GENERATED ALWAYS AS (a*2) VIRTUAL);
+    CREATE UNIQUE INDEX idx_p_b ON p(b);
+    CREATE TABLE c(x INTEGER REFERENCES p(b) ON UPDATE CASCADE);
+    INSERT INTO p(a) VALUES(1000);
+    INSERT INTO c(x) VALUES(2000);
+    UPDATE p SET a=1001 WHERE a=1000;
+    SELECT * FROM c;
+}
+expect {
+    2002
+}
+
+# DROP TABLE should fail with default NO ACTION when child rows exist
+@cross-check-integrity
+test fk-gencol-unique-idx-drop-table {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE p2(a INTEGER, b INTEGER GENERATED ALWAYS AS (a*2) VIRTUAL);
+    CREATE UNIQUE INDEX idx_p2_b ON p2(b);
+    CREATE TABLE c5(x INTEGER REFERENCES p2(b));
+    INSERT INTO p2(a) VALUES(1);
+    INSERT INTO c5(x) VALUES(2);
+    DROP TABLE p2;
+}
+expect error {
+}
+
+# Child insert validation should still work (sanity check)
+@cross-check-integrity
+test fk-gencol-unique-idx-child-insert-reject {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE p(a INTEGER, b INTEGER GENERATED ALWAYS AS (a*2) VIRTUAL);
+    CREATE UNIQUE INDEX idx_p_b ON p(b);
+    CREATE TABLE c(x INTEGER REFERENCES p(b));
+    INSERT INTO p(a) VALUES(1);
+    INSERT INTO c(x) VALUES(3);
+}
+expect error {
+}
+
+# Virtual column NOT at end of schema -- tests physical column index mapping
+@cross-check-integrity
+test fk-gencol-unique-idx-mid-schema-delete-cascade {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE p(a INTEGER, b INTEGER GENERATED ALWAYS AS (a*2) VIRTUAL, c TEXT);
+    CREATE UNIQUE INDEX idx_p_b ON p(b);
+    CREATE TABLE c(x INTEGER REFERENCES p(b) ON DELETE CASCADE);
+    INSERT INTO p(a, c) VALUES(10, 'hello');
+    INSERT INTO c(x) VALUES(20);
+    DELETE FROM p WHERE a=10;
+    SELECT count(*) FROM c;
+}
+expect {
+    0
+}
+
+@cross-check-integrity
+test fk-gencol-unique-idx-mid-schema-update-no-action {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE p(a INTEGER, b INTEGER GENERATED ALWAYS AS (a*2) VIRTUAL, c TEXT);
+    CREATE UNIQUE INDEX idx_p_b ON p(b);
+    CREATE TABLE c(x INTEGER REFERENCES p(b));
+    INSERT INTO p(a, c) VALUES(1, 'hi');
+    INSERT INTO c(x) VALUES(2);
+    UPDATE p SET a=3 WHERE a=1;
+}
+expect error {
+}
+
+@cross-check-integrity
+test fk-child-references-parent-virtual-col {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE parent(id INTEGER PRIMARY KEY, a INTEGER, v AS (a * 2) VIRTUAL UNIQUE);
+    CREATE TABLE child(id INTEGER PRIMARY KEY, pv INTEGER REFERENCES parent(v));
+    INSERT INTO parent(id, a) VALUES(1, 5);
+    INSERT INTO child VALUES(1, 10);
+    SELECT c.id, c.pv, p.a, p.v FROM child c JOIN parent p ON c.pv = p.v;
+}
+expect {
+    1|10|5|10
+}
+
+@cross-check-integrity
+test fk-child-references-parent-virtual-col-missing {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE parent(id INTEGER PRIMARY KEY, a INTEGER, v AS (a * 2) VIRTUAL UNIQUE);
+    CREATE TABLE child(id INTEGER PRIMARY KEY, pv INTEGER REFERENCES parent(v));
+    INSERT INTO parent(id, a) VALUES(1, 5);
+    INSERT INTO child VALUES(1, 99);
+}
+expect error {
+}
+
+@cross-check-integrity
+test fk-child-references-parent-virtual-col-using-rowid {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE parent(id INTEGER PRIMARY KEY, a INTEGER, v AS (id + a) VIRTUAL UNIQUE);
+    CREATE TABLE child(id INTEGER PRIMARY KEY, pv INTEGER REFERENCES parent(v));
+    INSERT INTO parent(id, a) VALUES(10, 5);
+    INSERT INTO child VALUES(1, 15);
+    SELECT c.id, c.pv, p.id, p.a, p.v FROM child c JOIN parent p ON c.pv = p.v;
+}
+expect {
+    1|15|10|5|15
+}
+
+@cross-check-integrity
+test fk-child-references-parent-virtual-col-using-rowid-missing {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE parent(id INTEGER PRIMARY KEY, a INTEGER, v AS (id + a) VIRTUAL UNIQUE);
+    CREATE TABLE child(id INTEGER PRIMARY KEY, pv INTEGER REFERENCES parent(v));
+    INSERT INTO parent(id, a) VALUES(10, 5);
+    INSERT INTO child VALUES(1, 99);
+}
+expect error {
+}
+@cross-check-integrity
+test delete_with_unique_gencol {
+    create table t(a, b as (a + 1) unique);
+    delete from t;
+}
+expect {
+}
+
+# DELETE with transitive virtual column dependency (c depends on b which depends on a)
+@cross-check-integrity
+test delete-transitive-virtual-dep {
+    CREATE TABLE t(a INTEGER, b AS (a * 2) VIRTUAL, c AS (b + 1) VIRTUAL);
+    CREATE UNIQUE INDEX idx_c ON t(c);
+    INSERT INTO t(a) VALUES(10);
+    DELETE FROM t WHERE a = 10;
+    SELECT count(*) FROM t;
+}
+expect {
+    0
+}
+
+# FK CASCADE through transitive virtual columns
+@cross-check-integrity
+test fk-transitive-virtual-cascade {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE p(a INTEGER, b AS (a * 2) VIRTUAL, c AS (b + 10) VIRTUAL);
+    CREATE UNIQUE INDEX idx_p_c ON p(c);
+    CREATE TABLE child(x INTEGER REFERENCES p(c) ON DELETE CASCADE);
+    INSERT INTO p(a) VALUES(5);
+    INSERT INTO child(x) VALUES(20);
+    DELETE FROM p WHERE a = 5;
+    SELECT count(*) FROM child;
+}
+expect {
+    0
+}
+
+test update-virtual-not-null {
+    CREATE TABLE t(a, b AS (a) NOT NULL);
+    INSERT INTO t VALUES (1);
+    UPDATE t SET a = null;
+}
+expect error {
+    NOT NULL constraint failed: t.b
+}
+
+test update-virtual-not-null-transitive {
+    CREATE TABLE t(a, b AS (a), c as (b) NOT NULL);
+    INSERT INTO t VALUES (1);
+    UPDATE t SET a = null;
+}
+expect error {
+    NOT NULL constraint failed: t.c
+}
+
+# Deferred NOT NULL: BEFORE UPDATE trigger fires before the NOT NULL check on
+# a virtual column, so RAISE(IGNORE) silently skips the update and the row is
+# left intact. If the NOT NULL check ran first, this would error out with
+# "NOT NULL constraint failed: t.b".
+@requires trigger "needs triggers"
+test update-virtual-not-null-deferred-trigger-ignore {
+    CREATE TABLE t(a, b AS (a) NOT NULL);
+    INSERT INTO t VALUES (1);
+    CREATE TRIGGER trg BEFORE UPDATE ON t WHEN NEW.a IS NULL BEGIN
+        SELECT RAISE(IGNORE);
+    END;
+    UPDATE t SET a = null;
+    SELECT a, b FROM t;
+}
+expect {
+    1|1
+}
+
+# Same deferred-ordering check for a transitively-computed virtual column.
+@requires trigger "needs triggers"
+test update-virtual-not-null-transitive-deferred-trigger-ignore {
+    CREATE TABLE t(a, b AS (a), c AS (b) NOT NULL);
+    INSERT INTO t VALUES (1);
+    CREATE TRIGGER trg BEFORE UPDATE ON t WHEN NEW.a IS NULL BEGIN
+        SELECT RAISE(IGNORE);
+    END;
+    UPDATE t SET a = null;
+    SELECT a, b, c FROM t;
+}
+expect {
+    1|1|1
+}
+
+# Deferred NOT NULL: BEFORE UPDATE trigger raises a custom abort error, which
+# must surface instead of the NOT NULL constraint error — proving the trigger
+# ran before the deferred check.
+@requires trigger "needs triggers"
+test update-virtual-not-null-deferred-trigger-abort {
+    CREATE TABLE t(a, b AS (a) NOT NULL);
+    INSERT INTO t VALUES (1);
+    CREATE TRIGGER trg BEFORE UPDATE ON t WHEN NEW.a IS NULL BEGIN
+        SELECT RAISE(ABORT, 'trigger rejects null');
+    END;
+    UPDATE t SET a = null;
+}
+expect error {
+    trigger rejects null
+}
+
+# Same deferred-ordering check for a transitively-computed virtual column.
+@requires trigger "needs triggers"
+test update-virtual-not-null-transitive-deferred-trigger-abort {
+    CREATE TABLE t(a, b AS (a), c AS (b) NOT NULL);
+    INSERT INTO t VALUES (1);
+    CREATE TRIGGER trg BEFORE UPDATE ON t WHEN NEW.a IS NULL BEGIN
+        SELECT RAISE(ABORT, 'trigger rejects null');
+    END;
+    UPDATE t SET a = null;
+}
+expect error {
+    trigger rejects null
+}

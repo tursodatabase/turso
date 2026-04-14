@@ -1,6 +1,7 @@
 use crate::sync::Arc;
 use crate::sync::RwLock;
 use crate::vtab::{InternalVirtualTable, InternalVirtualTableCursor};
+use crate::MAIN_DB_ID;
 use crate::{Connection, Result, Value};
 use turso_ext::{ConstraintInfo, ConstraintUsage, IndexInfo, OrderByInfo, ResultCode};
 
@@ -75,7 +76,7 @@ impl TursoTypesCursor {
 
     fn snapshot_types(&mut self) {
         self.entries.clear();
-        self.conn.with_schema(0, |schema| {
+        self.conn.with_schema(MAIN_DB_ID, |schema| {
             let mut names: Vec<_> = schema
                 .type_registry
                 .iter()

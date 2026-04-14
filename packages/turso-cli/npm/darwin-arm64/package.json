@@ -1,0 +1,19 @@
+{
+  "name": "@tursodatabase/cli-darwin-arm64",
+  "version": "0.6.0-pre.17",
+  "description": "Turso CLI binary for macOS ARM64",
+  "os": [
+    "darwin"
+  ],
+  "cpu": [
+    "arm64"
+  ],
+  "files": [
+    "tursodb"
+  ],
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/tursodatabase/turso"
+  }
+}

@@ -62,6 +62,47 @@ expect {
     1|from_aux
 }
 
+test drop-trigger-finds-attached-trigger-without-qualifier {
+    ATTACH ':memory:' AS aux;
+    CREATE TABLE aux.aux_t(x INTEGER PRIMARY KEY);
+    CREATE TRIGGER aux.trg BEFORE INSERT ON aux.aux_t BEGIN SELECT 1; END;
+    DROP TRIGGER trg;
+    SELECT name FROM aux.sqlite_schema WHERE type = 'trigger' AND name = 'trg';
+}
+expect {
+}
+
+test trigger-temp-db-same-db {
+    CREATE TEMP TABLE temp_src (id INTEGER PRIMARY KEY, val TEXT);
+    CREATE TEMP TABLE temp_dst (id INTEGER PRIMARY KEY, val TEXT);
+    CREATE TRIGGER trg_temp AFTER INSERT ON temp.temp_src
+    BEGIN
+        SELECT * FROM temp.temp_dst;
+        INSERT INTO temp_dst (id, val) VALUES (NEW.id, NEW.val);
+    END;
+    INSERT INTO temp.temp_src VALUES (1, 'from_temp');
+    SELECT * FROM temp.temp_dst;
+}
+expect {
+    1|from_temp
+}
+
+test trigger-temp-db-can-reference-main {
+    CREATE TABLE main_dst_explicit (id INTEGER PRIMARY KEY, val TEXT);
+    CREATE TABLE main_dst_unqualified (id INTEGER PRIMARY KEY, val TEXT);
+    CREATE TEMP TABLE temp_src_main (id INTEGER PRIMARY KEY, val TEXT);
+    CREATE TRIGGER trg_temp_main AFTER INSERT ON temp.temp_src_main
+    BEGIN
+        SELECT * FROM main.main_dst_explicit;
+        INSERT INTO main_dst_unqualified (id, val) VALUES (NEW.id, NEW.val);
+    END;
+    INSERT INTO temp.temp_src_main VALUES (1, 'from_temp_to_main');
+    SELECT * FROM main_dst_unqualified;
+}
+expect {
+    1|from_temp_to_main
+}
+
 # Trigger on attached db cannot reference main db tables
 test trigger-attached-db-cross-to-main-reject {
     ATTACH ':memory:' AS aux;

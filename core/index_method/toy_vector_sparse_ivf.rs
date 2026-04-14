@@ -6,6 +6,7 @@ use std::{
 use turso_parser::ast::{self, SortOrder};
 
 use crate::numeric::Numeric;
+use crate::util::quote_identifier;
 use crate::{
     index_method::{
         open_index_cursor, open_table_cursor, parse_patterns, IndexMethod, IndexMethodAttachment,
@@ -401,24 +402,29 @@ fn key_info() -> KeyInfo {
 }
 
 impl IndexMethodCursor for VectorSparseInvertedIndexMethodCursor {
-    fn create(&mut self, connection: &Arc<Connection>) -> Result<IOResult<()>> {
+    fn create(&mut self, connection: &Arc<Connection>, database_id: usize) -> Result<IOResult<()>> {
         // we need to properly track subprograms and propagate result to the root program to make this execution async
 
         let columns = &self.configuration.columns;
         let columns = columns.iter().map(|x| x.name.as_str()).collect::<Vec<_>>();
+        let db_prefix = connection
+            .get_database_name_by_index(database_id)
+            .filter(|name| name != "main")
+            .map(|name| format!("{}.", quote_identifier(&name)))
+            .unwrap_or_default();
+        let quoted_table = quote_identifier(&self.configuration.table_name);
+        let quoted_cols = columns
+            .iter()
+            .map(|c| quote_identifier(c))
+            .collect::<Vec<_>>()
+            .join(", ");
         let inverted_index_create = format!(
-            "CREATE INDEX {} ON {} USING {} ({})",
-            self.inverted_index_btree,
-            self.configuration.table_name,
-            BACKING_BTREE_INDEX_METHOD_NAME,
-            columns.join(", ")
+            "CREATE INDEX {db_prefix}{} ON {quoted_table} USING {BACKING_BTREE_INDEX_METHOD_NAME} ({quoted_cols})",
+            quote_identifier(&self.inverted_index_btree),
         );
         let stats_index_create = format!(
-            "CREATE INDEX {} ON {} USING {} ({})",
-            self.stats_btree,
-            self.configuration.table_name,
-            BACKING_BTREE_INDEX_METHOD_NAME,
-            columns.join(", ")
+            "CREATE INDEX {db_prefix}{} ON {quoted_table} USING {BACKING_BTREE_INDEX_METHOD_NAME} ({quoted_cols})",
+            quote_identifier(&self.stats_btree),
         );
         for sql in [inverted_index_create, stats_index_create] {
             let mut stmt = connection.prepare(&sql)?;
@@ -440,9 +446,24 @@ impl IndexMethodCursor for VectorSparseInvertedIndexMethodCursor {
         Ok(IOResult::Done(()))
     }
 
-    fn destroy(&mut self, connection: &Arc<Connection>) -> Result<IOResult<()>> {
-        let inverted_index_drop = format!("DROP INDEX {}", self.inverted_index_btree);
-        let stats_index_drop = format!("DROP INDEX {}", self.stats_btree);
+    fn destroy(
+        &mut self,
+        connection: &Arc<Connection>,
+        database_id: usize,
+    ) -> Result<IOResult<()>> {
+        let db_prefix = connection
+            .get_database_name_by_index(database_id)
+            .filter(|name| name != "main")
+            .map(|name| format!("{}.", quote_identifier(&name)))
+            .unwrap_or_default();
+        let inverted_index_drop = format!(
+            "DROP INDEX {db_prefix}{}",
+            quote_identifier(&self.inverted_index_btree)
+        );
+        let stats_index_drop = format!(
+            "DROP INDEX {db_prefix}{}",
+            quote_identifier(&self.stats_btree)
+        );
         for sql in [inverted_index_drop, stats_index_drop] {
             let mut stmt = connection.prepare(&sql)?;
             connection.start_nested();
@@ -454,9 +475,14 @@ impl IndexMethodCursor for VectorSparseInvertedIndexMethodCursor {
         Ok(IOResult::Done(()))
     }
 
-    fn open_read(&mut self, connection: &Arc<Connection>) -> Result<IOResult<()>> {
+    fn open_read(
+        &mut self,
+        connection: &Arc<Connection>,
+        database_id: usize,
+    ) -> Result<IOResult<()>> {
         self.inverted_index_cursor = Some(open_index_cursor(
             connection,
+            database_id,
             &self.configuration.table_name,
             &self.inverted_index_btree,
             // component, length, rowid
@@ -464,6 +490,7 @@ impl IndexMethodCursor for VectorSparseInvertedIndexMethodCursor {
         )?);
         self.stats_cursor = Some(open_index_cursor(
             connection,
+            database_id,
             &self.configuration.table_name,
             &self.stats_btree,
             // component
@@ -471,14 +498,20 @@ impl IndexMethodCursor for VectorSparseInvertedIndexMethodCursor {
         )?);
         self.main_btree = Some(open_table_cursor(
             connection,
+            database_id,
             &self.configuration.table_name,
         )?);
         Ok(IOResult::Done(()))
     }
 
-    fn open_write(&mut self, connection: &Arc<Connection>) -> Result<IOResult<()>> {
+    fn open_write(
+        &mut self,
+        connection: &Arc<Connection>,
+        database_id: usize,
+    ) -> Result<IOResult<()>> {
         self.inverted_index_cursor = Some(open_index_cursor(
             connection,
+            database_id,
             &self.configuration.table_name,
             &self.inverted_index_btree,
             // component, length, rowid
@@ -486,6 +519,7 @@ impl IndexMethodCursor for VectorSparseInvertedIndexMethodCursor {
         )?);
         self.stats_cursor = Some(open_index_cursor(
             connection,
+            database_id,
             &self.configuration.table_name,
             &self.stats_btree,
             // component

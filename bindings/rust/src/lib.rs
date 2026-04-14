@@ -61,6 +61,9 @@ use std::task::Poll;
 // Re-exports rows
 pub use crate::rows::{Row, Rows};
 
+// Re-export turso_core
+pub use turso_core as core;
+
 /// Assert that a type implements both Send and Sync at compile time.
 /// Usage: assert_send_sync!(MyType);
 /// Usage: assert_send_sync!(Type1, Type2, Type3);
@@ -144,6 +147,7 @@ pub struct Builder {
     enable_generated_columns: bool,
     vfs: Option<String>,
     encryption_opts: Option<turso_sdk_kit::rsapi::EncryptionOpts>,
+    io: Option<Arc<dyn turso_core::IO>>,
 }
 
 impl Builder {
@@ -159,6 +163,7 @@ impl Builder {
             enable_generated_columns: false,
             vfs: None,
             encryption_opts: None,
+            io: None,
         }
     }
 
@@ -211,6 +216,13 @@ impl Builder {
         self.vfs = Some(vfs);
         self
     }
+
+    /// Can pass custom IO implementation
+    pub fn with_io_impl(mut self, io: Arc<dyn turso_core::IO>) -> Self {
+        self.io = Some(io);
+        self
+    }
+
     fn build_features_string(&self) -> Option<String> {
         let mut features = Vec::new();
         if self.enable_encryption {
@@ -248,7 +260,7 @@ impl Builder {
                 async_io: true,
                 encryption: self.encryption_opts,
                 vfs: self.vfs,
-                io: None,
+                io: self.io,
                 db_file: None,
             });
         while let Some(io_c) = db.open()?.io() {

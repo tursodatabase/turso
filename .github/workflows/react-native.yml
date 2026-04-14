@@ -123,6 +123,78 @@ jobs:
             bindings/react-native/lib/
           if-no-files-found: error
 
+  build-example-ios:
+    name: Build example app (iOS)
+    runs-on: macos-latest
+    timeout-minutes: 45
+    needs:
+      - build-ios
+      - build-typescript
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Setup Ruby
+        uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: '3.2'
+          bundler-cache: true
+          working-directory: examples/react-native
+
+      - name: Download iOS artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: ios-libs
+          path: bindings/react-native/libs/ios/
+
+      - name: Fix xcframework after artifact download
+        run: |
+          find bindings/react-native/libs/ios/turso-sync-sdk-kit.xcframework \
+            -name "turso-sync-sdk-kit" -type f | while read f; do
+            chmod +x "$f"
+            codesign -f -s - "$f"
+          done
+
+      - name: Download TypeScript build
+        uses: actions/download-artifact@v4
+        with:
+          name: typescript-build
+          path: bindings/react-native/lib/
+
+      - name: Install binding dependencies
+        run: npm install
+        working-directory: ${{ env.working-directory }}
+
+      - name: Install example app dependencies
+        run: npm install
+        working-directory: examples/react-native
+
+      - name: Install CocoaPods dependencies
+        run: bundle exec pod install
+        working-directory: examples/react-native/ios
+
+      - name: Verify xcframework
+        run: |
+          ls -la bindings/react-native/libs/ios/turso-sync-sdk-kit.xcframework/ios-arm64-simulator/turso-sync-sdk-kit.framework/
+          file bindings/react-native/libs/ios/turso-sync-sdk-kit.xcframework/ios-arm64-simulator/turso-sync-sdk-kit.framework/turso-sync-sdk-kit
+
+      - name: Build iOS example app
+        run: |
+          xcodebuild build \
+            -workspace TursoExample.xcworkspace \
+            -scheme TursoExample \
+            -sdk iphonesimulator \
+            -destination 'generic/platform=iOS Simulator' \
+            -configuration Debug \
+            CODE_SIGNING_ALLOWED=NO \
+            ARCHS=arm64 \
+            ONLY_ACTIVE_ARCH=YES
+        working-directory: examples/react-native/ios
+
   publish:
     name: Publish to npm
     runs-on: ubuntu-latest
@@ -131,6 +203,7 @@ jobs:
       - build-ios
       - build-android
       - build-typescript
+      - build-example-ios
     permissions:
       contents: read
       id-token: write

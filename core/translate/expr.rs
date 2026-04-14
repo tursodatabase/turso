@@ -23,7 +23,7 @@ use crate::translate::plan::{Operation, ResultSetColumn, Search};
 use crate::translate::planner::parse_row_id;
 use crate::util::{exprs_are_equivalent, normalize_ident, parse_numeric_literal};
 use crate::vdbe::affinity::Affinity;
-use crate::vdbe::builder::{CursorKey, SelfTableContext};
+use crate::vdbe::builder::{CursorKey, DmlColumnContext, SelfTableContext};
 use crate::vdbe::{
     builder::ProgramBuilder,
     insn::{CmpInsFlags, InsertFlags, Insn},
@@ -2993,29 +2993,25 @@ pub fn translate_expr(
                         )
                     }
                     Some(SelfTableContext::ForDML(dml_ctx)) => {
-                        let col = &dml_ctx.columns[*column];
-                        match col.generated_type() {
-                            GeneratedType::Virtual {
-                                resolved: gen_expr, ..
-                            } => {
-                                translate_expr(program, None, gen_expr, target_register, resolver)?;
-                                if col.affinity() != Affinity::Blob {
-                                    program.emit_column_affinity(target_register, col.affinity());
-                                }
-                                Ok(target_register)
+                        if let Some((resolved, affinity)) = dml_ctx.virtual_column_info(*column) {
+                            translate_expr(program, None, resolved, target_register, resolver)?;
+                            if affinity != Affinity::Blob {
+                                program.emit_column_affinity(target_register, affinity);
                             }
-                            GeneratedType::NotGenerated => {
-                                let src_reg = dml_ctx.to_column_reg(*column);
-                                program.emit_insn(Insn::Copy {
-                                    src_reg,
-                                    dst_reg: target_register,
-                                    extra_amount: 0,
-                                });
-                                Ok(target_register)
-                            }
+                            Ok(target_register)
+                        } else {
+                            let src_reg = dml_ctx.to_column_reg(*column);
+                            program.emit_insn(Insn::Copy {
+                                src_reg,
+                                dst_reg: target_register,
+                                extra_amount: 0,
+                            });
+                            Ok(target_register)
                         }
                     }
                     None => {
+                        // This error means that a program.with_self_table_context() was missing
+                        // somewhere in the call stack.
                         crate::bail_parse_error!(
                             "SELF_TABLE column reference outside of generated column context"
                         );
@@ -5213,24 +5209,62 @@ pub fn emit_table_column(
     target_register: usize,
     resolver: &Resolver,
 ) -> Result<()> {
+    do_emit_table_column(
+        program,
+        cursor_id,
+        &SelfTableContext::ForSelect {
+            table_ref_id,
+            referenced_tables: referenced_tables.clone(),
+        },
+        Some(referenced_tables),
+        column,
+        column_index,
+        target_register,
+        resolver,
+    )
+}
+
+/// Equivalent of [emit_table_column] for when registers are laid out for DML.
+#[allow(clippy::too_many_arguments)]
+pub fn emit_table_column_for_dml(
+    program: &mut ProgramBuilder,
+    cursor_id: CursorID,
+    dml_column_context: DmlColumnContext,
+    column: &Column,
+    column_index: usize,
+    target_register: usize,
+    resolver: &Resolver,
+) -> Result<()> {
+    do_emit_table_column(
+        program,
+        cursor_id,
+        &SelfTableContext::ForDML(dml_column_context),
+        None,
+        column,
+        column_index,
+        target_register,
+        resolver,
+    )
+}
+
+#[inline(always)]
+#[allow(clippy::too_many_arguments)]
+fn do_emit_table_column(
+    program: &mut ProgramBuilder,
+    cursor_id: CursorID,
+    self_table_context: &SelfTableContext,
+    referenced_tables: Option<&TableReferences>,
+    column: &Column,
+    column_index: usize,
+    target_register: usize,
+    resolver: &Resolver,
+) -> Result<()> {
     match column.generated_type() {
         GeneratedType::Virtual { resolved: expr, .. } => {
-            program.with_self_table_context(
-                Some(&SelfTableContext::ForSelect {
-                    table_ref_id,
-                    referenced_tables: referenced_tables.clone(),
-                }),
-                |program, _| {
-                    translate_expr(
-                        program,
-                        Some(referenced_tables),
-                        expr,
-                        target_register,
-                        resolver,
-                    )?;
-                    Ok(())
-                },
-            )?;
+            program.with_self_table_context(Some(self_table_context), |program, _| {
+                translate_expr(program, referenced_tables, expr, target_register, resolver)?;
+                Ok(())
+            })?;
             program.emit_column_affinity(target_register, column.affinity());
         }
         _ => {
@@ -5551,19 +5585,15 @@ where
 }
 
 /// The precedence of binding identifiers to columns.
-///
-/// TryResultColumnsFirst means that result columns (e.g. SELECT x AS y, ...) take precedence over canonical columns (e.g. SELECT x, y AS z, ...). This is the default behavior.
-///
-/// TryCanonicalColumnsFirst means that canonical columns take precedence over result columns. This is used for e.g. WHERE clauses.
-///
-/// ResultColumnsNotAllowed means that referring to result columns is not allowed. This is used e.g. for DML statements.
-///
-/// AllowUnboundIdentifiers means that unbound identifiers are allowed. This is used for INSERT ... ON CONFLICT DO UPDATE SET ... where binding is handled later than this phase.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BindingBehavior {
+    /// `TryResultColumnsFirst` means that result columns (e.g. SELECT x AS y, ...) take precedence over canonical columns (e.g. SELECT x, y AS z, ...). This is the default behavior.
     TryResultColumnsFirst,
+    /// `TryCanonicalColumnsFirst` means that canonical columns take precedence over result columns. This is used for e.g. WHERE clauses.
     TryCanonicalColumnsFirst,
+    /// `ResultColumnsNotAllowed` means that referring to result columns is not allowed. This is used e.g. for DML statements.
     ResultColumnsNotAllowed,
+    /// `AllowUnboundIdentifiers` means that unbound identifiers are allowed. This is used for INSERT ... ON CONFLICT DO UPDATE SET ... where binding is handled later than this phase.
     AllowUnboundIdentifiers,
 }
 
@@ -6228,6 +6258,18 @@ pub(crate) fn get_expr_affinity_info(
             if let Some(resolver) = resolver {
                 if let Some(aff) = resolver.register_affinities.get(reg) {
                     return ExprAffinityInfo::with_affinity(*aff);
+                }
+            }
+            ExprAffinityInfo::no_affinity()
+        }
+        ast::Expr::SubqueryResult {
+            subquery_id,
+            query_type: ast::SubqueryType::RowValue { num_regs, .. },
+            ..
+        } if *num_regs == 1 => {
+            if let Some(resolver) = resolver {
+                if let Some(aff) = resolver.subquery_affinities.borrow().get(subquery_id) {
+                    return *aff;
                 }
             }
             ExprAffinityInfo::no_affinity()

@@ -18,7 +18,7 @@ if {![info exists testprefix]} {
   set testprefix ""
 }
 
-set script_dir [file dirname [file dirname [file dirname [file normalize [info script]]]]]
+set script_dir [file dirname [file dirname [file dirname [file dirname [file normalize [info script]]]]]]
 set test_db "test.db"
 
 # Load the native TCL extension (libturso_tcl).

@@ -237,8 +237,8 @@ pub(super) fn choose_best_btree_candidate(
     let mut best_is_ordered = false;
 
     // Build a mask for the rhs table itself.
-    let mut rhs_table_mask = TableMask::new();
-    rhs_table_mask.add_table(rhs_table_idx);
+    let mut rhs_table_mask = TableMask::default();
+    rhs_table_mask.set(rhs_table_idx);
 
     // Estimate cost for each candidate index (including the rowid index) and
     // keep the best candidate.
@@ -344,7 +344,7 @@ pub(super) fn choose_best_btree_candidate(
         // label='requires' (prereqs={}) cannot claim credit for the
         // join-dependent residual fromId=e1.toId.
         let loop_prereq_mask = {
-            let mut mask = TableMask::new();
+            let mut mask = TableMask::default();
             for ucref in usable_constraint_refs.iter() {
                 for idx in [
                     ucref.eq.as_ref().map(|e| e.constraint_pos),
@@ -355,20 +355,17 @@ pub(super) fn choose_best_btree_candidate(
                 .flatten()
                 {
                     let c = &rhs_constraints.constraints[idx];
-                    mask = TableMask::from_table_number_iter(
-                        mask.tables_iter().chain(c.lhs_mask.tables_iter()),
-                    );
+                    mask = mask.iter().chain(c.lhs_mask.iter()).collect();
                 }
             }
             mask
         };
         // Tables whose constraints this loop can account for: the loop's own
         // prerequisite tables plus the current table itself.
-        let allowed_mask = TableMask::from_table_number_iter(
-            loop_prereq_mask
-                .tables_iter()
-                .chain(rhs_table_mask.tables_iter()),
-        );
+        let allowed_mask: TableMask = loop_prereq_mask
+            .iter()
+            .chain(rhs_table_mask.iter())
+            .collect();
 
         // Collect which constraint positions are consumed by the index seek.
         let consumed: SmallVec<[usize; 8]> = usable_constraint_refs
@@ -393,7 +390,7 @@ pub(super) fn choose_best_btree_candidate(
             .filter(|(i, c)| {
                 !consumed.contains(i)
                     && c.usable
-                    && allowed_mask.contains_all(&c.lhs_mask)
+                    && allowed_mask.contains_all_set_bits_of(&c.lhs_mask)
                     && matches!(
                         c.operator,
                         ConstraintOperator::AstNativeOperator(ast::Operator::Equals)
@@ -530,7 +527,7 @@ pub(super) fn choose_best_in_seek_candidate(
             else {
                 continue;
             };
-            if not || !lhs_mask.contains_all(&constraint.lhs_mask) {
+            if not || !lhs_mask.contains_all_set_bits_of(&constraint.lhs_mask) {
                 continue;
             }
 
@@ -703,12 +700,11 @@ fn find_best_access_method_for_btree(
     params: &CostModelParams,
 ) -> Result<Option<AccessMethod>> {
     let rhs_table_idx = join_order.last().unwrap().original_idx;
-    let lhs_mask = TableMask::from_table_number_iter(
-        join_order
-            .iter()
-            .take(join_order.len() - 1)
-            .map(|member| member.original_idx),
-    );
+    let lhs_mask: TableMask = join_order
+        .iter()
+        .take(join_order.len() - 1)
+        .map(|member| member.original_idx)
+        .collect();
     let best = choose_best_btree_candidate(
         rhs_table,
         rhs_constraints,
@@ -1088,10 +1084,10 @@ pub fn try_hash_join_access_method(
         // Check if the subquery references the build or probe table
         if let SubqueryState::Unevaluated { plan } = &subquery.state {
             if let Some(plan) = plan.as_ref() {
-                let outer_refs = plan.table_references.outer_query_refs();
-                for outer_ref in outer_refs {
-                    if outer_ref.internal_id == build_table.internal_id
-                        || outer_ref.internal_id == probe_table.internal_id
+                let outer_ref_ids = plan.used_outer_query_ref_ids();
+                for outer_ref_id in &outer_ref_ids {
+                    if *outer_ref_id == build_table.internal_id
+                        || *outer_ref_id == probe_table.internal_id
                     {
                         return None;
                     }

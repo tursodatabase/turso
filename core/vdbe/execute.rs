@@ -27,8 +27,8 @@ use crate::util::{
     rewrite_column_level_fk_parent_columns_if_needed, rewrite_column_references_if_needed,
     rewrite_fk_parent_cols_if_self_ref, rewrite_fk_parent_table_if_needed,
     rewrite_inline_col_fk_target_if_needed, rewrite_trigger_cmd_column_refs,
-    rewrite_trigger_cmd_table_refs, rewrite_view_sql_for_column_rename, trim_ascii_whitespace,
-    RewrittenView,
+    rewrite_trigger_cmd_table_refs, rewrite_view_sql_for_column_rename,
+    trigger_still_references_renamed_column, trim_ascii_whitespace, RewrittenView,
 };
 use crate::vdbe::affinity::{
     apply_numeric_affinity, try_for_float, Affinity, NumericParseResult, ParsedNumber,
@@ -96,6 +96,7 @@ use crate::{
 };
 
 use crate::{connection::Row, info, turso_assert, OpenFlags, TransactionState, ValueRef};
+use crate::{is_attached_db, MAIN_DB_ID, TEMP_DB_ID};
 
 use super::{
     array::{
@@ -495,6 +496,13 @@ pub fn op_checkpoint(
     insn: &Insn,
     _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
+    fn set_not_in_wal_result(state: &mut ProgramState, dest: usize) {
+        // Match SQLite for databases that are not in WAL mode.
+        state.registers[dest].set_int(0);
+        state.registers[dest + 1].set_int(-1);
+        state.registers[dest + 2].set_int(-1);
+    }
+
     load_insn!(
         Checkpoint {
             database,
@@ -510,7 +518,19 @@ pub fn op_checkpoint(
         // however.
         return Err(LimboError::TableLocked);
     }
+    if *database == crate::TEMP_DB_ID && program.connection.temp.database.read().is_none() {
+        set_not_in_wal_result(state, *dest);
+        state.pc += 1;
+        return Ok(InsnFunctionStepResult::Step);
+    }
+
     let pager = program.get_pager_from_database_index(database);
+    if !pager.has_wal() {
+        set_not_in_wal_result(state, *dest);
+        state.pc += 1;
+        return Ok(InsnFunctionStepResult::Step);
+    }
+
     // In autocommit mode, this statement can still hold an implicit read tx.
     // RESTART/TRUNCATE checkpoint needs to restart WAL and may fail with Busy
     // if we keep our own statement read slot while checkpointing.
@@ -1077,7 +1097,7 @@ pub fn op_open_read(
             .as_mut()
             .expect("cursor should exist after initialization");
         let cursor = cursor.as_index_method_mut();
-        return_if_io!(cursor.open_read(&program.connection));
+        return_if_io!(cursor.open_read(&program.connection, *db));
         state.pc += 1;
         return Ok(InsnFunctionStepResult::Step);
     }
@@ -2744,12 +2764,7 @@ pub fn halt(
                 vtab_rollback_all(&program.connection)?;
                 if let Some(mv_store) = mv_store.as_ref() {
                     if let Some(tx_id) = program.connection.get_mv_tx_id() {
-                        mv_store.rollback_tx(
-                            tx_id,
-                            pager.clone(),
-                            &program.connection,
-                            crate::MAIN_DB_ID,
-                        );
+                        mv_store.rollback_tx(tx_id, pager.clone(), &program.connection, MAIN_DB_ID);
                     }
                     pager.end_read_tx();
                 } else {
@@ -2901,6 +2916,7 @@ pub fn op_halt_if_null(
 pub enum OpTransactionState {
     Start,
     AttachedBeginWriteTx,
+    BeginNamedSavepoints,
     CheckSchemaCookie,
     BeginStatement,
 }
@@ -2942,6 +2958,143 @@ fn begin_mvcc_tx(
     }
 }
 
+fn pager_db_size_for_named_savepoint(pager: &Arc<Pager>) -> Result<IOResult<u32>> {
+    match pager.with_header(|header| header.database_size.get()) {
+        Ok(result) => Ok(result),
+        Err(LimboError::Page1NotAlloc) => Ok(IOResult::Done(0)),
+        Err(err) => Err(err),
+    }
+}
+
+fn open_named_savepoint_frames_on_wal_pager(
+    pager: &Arc<Pager>,
+    frames: &[crate::connection::NamedSavepointFrame],
+) -> Result<IOResult<()>> {
+    if frames.is_empty() {
+        return Ok(IOResult::Done(()));
+    }
+    pager.open_subjournal()?;
+    let db_size = match pager_db_size_for_named_savepoint(pager)? {
+        IOResult::Done(db_size) => db_size,
+        IOResult::IO(io) => return Ok(IOResult::IO(io)),
+    };
+    for frame in frames {
+        pager.open_named_savepoint(
+            frame.name.clone(),
+            db_size,
+            frame.starts_transaction,
+            frame.deferred_fk_violations,
+        )?;
+    }
+    Ok(IOResult::Done(()))
+}
+
+fn open_connection_named_savepoints_for_db(
+    conn: &Connection,
+    db: usize,
+    pager: &Arc<Pager>,
+) -> Result<IOResult<()>> {
+    conn.with_named_savepoints(|frames| {
+        if frames.is_empty() {
+            return Ok(IOResult::Done(()));
+        }
+
+        if let Some(mv_store) = conn.mv_store_for_db(db) {
+            let Some(tx_id) = conn.get_mv_tx_id_for_db(db) else {
+                return Ok(IOResult::Done(()));
+            };
+            for frame in frames {
+                mv_store.begin_named_savepoint(
+                    tx_id,
+                    frame.name.clone(),
+                    frame.starts_transaction,
+                    frame.deferred_fk_violations,
+                );
+            }
+            Ok(IOResult::Done(()))
+        } else {
+            open_named_savepoint_frames_on_wal_pager(pager, frames)
+        }
+    })
+}
+
+enum SavepointMirror<'a> {
+    Begin(&'a crate::connection::NamedSavepointFrame),
+    Release(&'a str),
+    Rollback(&'a str),
+}
+
+fn mirror_named_savepoint_to_active_non_main_databases(
+    conn: &Connection,
+    op: SavepointMirror<'_>,
+) -> Result<()> {
+    conn.with_all_attached_pagers_with_index(|pagers| {
+        for (db_id, pager) in pagers {
+            let db_id = *db_id;
+            if let Some(mv_store) = conn.mv_store_for_db(db_id) {
+                let Some(tx_id) = conn.get_mv_tx_id_for_db(db_id) else {
+                    continue;
+                };
+                match op {
+                    SavepointMirror::Begin(frame) => {
+                        mv_store.begin_named_savepoint(
+                            tx_id,
+                            frame.name.clone(),
+                            frame.starts_transaction,
+                            frame.deferred_fk_violations,
+                        );
+                    }
+                    SavepointMirror::Release(name) => {
+                        let _ = mv_store.release_named_savepoint(tx_id, name);
+                    }
+                    SavepointMirror::Rollback(name) => {
+                        let _ = mv_store.rollback_to_named_savepoint(tx_id, name);
+                    }
+                }
+                continue;
+            }
+            if !pager.holds_read_lock() {
+                continue;
+            }
+            match op {
+                SavepointMirror::Begin(frame) => {
+                    // A pager holding a read lock does not pin page 1
+                    // in the cache, so the header read inside
+                    // `open_named_savepoint_frames_on_wal_pager` can
+                    // yield IO (e.g. after cache eviction). We can't
+                    // propagate IO out of this closure, so surface it
+                    // as a loud `InternalError` rather than panicking.
+                    // In practice page 1 is almost always resident at
+                    // this point and this branch is never taken, but
+                    // converting panic → error makes the fallback
+                    // observable.
+                    match open_named_savepoint_frames_on_wal_pager(
+                        pager,
+                        std::slice::from_ref(frame),
+                    )? {
+                        IOResult::Done(()) => {}
+                        IOResult::IO(_) => {
+                            return Err(LimboError::InternalError(
+                                "open_named_savepoint on non-main pager returned IO \
+                                 (page 1 not cached) — this path is not yet \
+                                 IO-reentrant"
+                                    .to_string(),
+                            ));
+                        }
+                    }
+                }
+                SavepointMirror::Release(name) => {
+                    let _ = pager.release_named_savepoint(name)?;
+                }
+                SavepointMirror::Rollback(name) => {
+                    let _ = pager.rollback_to_named_savepoint(name)?;
+                }
+            }
+        }
+        Ok(())
+    })
+}
+
 pub fn op_transaction_inner(
     program: &Program,
     state: &mut ProgramState,
@@ -2961,6 +3114,9 @@ pub fn op_transaction_inner(
             "Transaction instruction should not be used in trigger subprograms"
         );
     }
+    if *db == crate::TEMP_DB_ID {
+        program.connection.ensure_temp_database()?;
+    }
     let pager = program.get_pager_from_database_index(db);
     // Get the MvStore for the specific database (main or attached).
     let mv_store = program.connection.mv_store_for_db(*db);
@@ -2969,16 +3125,17 @@ pub fn op_transaction_inner(
             OpTransactionState::Start => {
                 let conn = program.connection.clone();
                 let write = matches!(tx_mode, TransactionMode::Write);
+                let mut started_secondary_tx = false;
                 if write && conn.is_readonly(*db) {
                     return Err(LimboError::ReadOnly);
                 }
 
                 // 1. We try to upgrade current version
                 let current_state = conn.get_tx_state();
-                let is_attached = crate::is_attached_db(*db);
+                let is_secondary_db = *db != crate::MAIN_DB_ID;
                 let (new_transaction_state, updated) = if conn.is_nested_stmt() {
                     (current_state, false)
-                } else if is_attached {
+                } else if is_secondary_db {
                     // For attached databases, don't modify the connection-level
                     // transaction state — it tracks the main database's state.
                     // Attached pager locks are managed independently below.
@@ -3024,7 +3181,7 @@ pub fn op_transaction_inner(
 
                 // 2. Start transaction if needed
                 if let Some(mv_store) = mv_store.as_ref() {
-                    if is_attached {
+                    if is_secondary_db {
                         // Attached databases don't participate in the connection-level
                         // transaction state machine above (phase 1), so the pager read
                         // tx that the main DB path starts on None→Read isn't triggered
@@ -3059,6 +3216,7 @@ pub fn op_transaction_inner(
                             match begin_mvcc_tx(mv_store, &pager, &effective_mode, None) {
                                 Ok(tx_id) => {
                                     conn.set_mv_tx_for_db(*db, Some((tx_id, effective_mode)));
+                                    started_secondary_tx = true;
                                 }
                                 Err(err) => {
                                     pager.end_read_tx();
@@ -3120,6 +3278,9 @@ pub fn op_transaction_inner(
                                     program
                                         .connection
                                         .set_mv_tx_for_db(*db, Some((tx_id, *tx_mode)));
+                                    if is_secondary_db {
+                                        started_secondary_tx = true;
+                                    }
                                 }
                                 Err(err) => {
                                     if started_read_tx {
@@ -3166,8 +3327,7 @@ pub fn op_transaction_inner(
                     // For attached databases without MVCC, always start read/write
                     // transactions on the attached pager, since the connection-level
                     // transaction state may already be Read/Write from the main database.
-                    let is_attached = crate::is_attached_db(*db);
-                    if is_attached {
+                    if is_secondary_db {
                         // If the pager already holds a read lock (e.g., after
                         // SchemaUpdated reprepare or prior write tx), skip
                         // locks that are already held.
@@ -3183,11 +3343,18 @@ pub fn op_transaction_inner(
                             continue;
                         }
                         pager.begin_read_tx()?;
+                        started_secondary_tx = true;
                         if matches!(tx_mode, TransactionMode::Write) {
                             // Transition to AttachedBeginWriteTx to handle begin_write_tx
                             // separately, so if it returns IO we don't re-call begin_read_tx
                             // on re-entry.
-                            state.op_transaction_state = OpTransactionState::AttachedBeginWriteTx;
+                            if conn.with_named_savepoints(|savepoints| savepoints.is_empty()) {
+                                state.op_transaction_state =
+                                    OpTransactionState::AttachedBeginWriteTx;
+                            } else {
+                                state.op_transaction_state =
+                                    OpTransactionState::BeginNamedSavepoints;
+                            }
                             continue;
                         }
                     } else if updated && matches!(current_state, TransactionState::None) {
@@ -3199,7 +3366,7 @@ pub fn op_transaction_inner(
                         state.auto_txn_cleanup = TxnCleanup::RollbackTxn;
                     }
 
-                    if !is_attached
+                    if !is_secondary_db
                         && updated
                         && matches!(new_transaction_state, TransactionState::Write { .. })
                     {
@@ -3249,6 +3416,13 @@ pub fn op_transaction_inner(
                 if updated {
                     conn.set_tx_state(new_transaction_state);
                 }
+                if is_secondary_db
+                    && started_secondary_tx
+                    && !conn.with_named_savepoints(|s| s.is_empty())
+                {
+                    state.op_transaction_state = OpTransactionState::BeginNamedSavepoints;
+                    continue;
+                }
                 state.op_transaction_state = OpTransactionState::CheckSchemaCookie;
                 continue;
             }
@@ -3261,6 +3435,23 @@ pub fn op_transaction_inner(
                 }
                 state.op_transaction_state = OpTransactionState::CheckSchemaCookie;
                 continue;
+            }
+            OpTransactionState::BeginNamedSavepoints => {
+                match open_connection_named_savepoints_for_db(&program.connection, *db, &pager)? {
+                    IOResult::Done(()) => {
+                        if *db != crate::MAIN_DB_ID
+                            && mv_store.is_none()
+                            && matches!(tx_mode, TransactionMode::Write)
+                            && !pager.holds_write_lock()
+                        {
+                            state.op_transaction_state = OpTransactionState::AttachedBeginWriteTx;
+                        } else {
+                            state.op_transaction_state = OpTransactionState::CheckSchemaCookie;
+                        }
+                        continue;
+                    }
+                    IOResult::IO(io) => return Ok(InsnFunctionStepResult::IO(io)),
+                }
             }
             // 4. Check whether schema has changed if we are actually going to access the database.
             // Can only read header if page 1 has been allocated already
@@ -3290,17 +3481,34 @@ pub fn op_transaction_inner(
             }
             OpTransactionState::BeginStatement => {
                 let needs_stmt_journal = program.needs_stmt_subtransactions.load(Ordering::Relaxed);
+                let in_explicit_txn = !program.connection.auto_commit.load(Ordering::SeqCst);
                 if *db == crate::MAIN_DB_ID && needs_stmt_journal {
                     let write = matches!(tx_mode, TransactionMode::Write);
                     let res = state.begin_statement(&program.connection, &pager, write)?;
                     if let IOResult::IO(io) = res {
                         return Ok(InsnFunctionStepResult::IO(io));
                     }
-                } else if crate::is_attached_db(*db)
+                } else if *db != crate::MAIN_DB_ID
                     && matches!(tx_mode, TransactionMode::Write)
                     && needs_stmt_journal
                 {
-                    if let Some(mv_store) = program.connection.mv_store_for_db(*db) {
+                    if in_explicit_txn && !state.has_stmt_transaction {
+                        state.has_stmt_transaction = true;
+                        state.fk_deferred_violations_when_stmt_started.store(
+                            program
+                                .connection
+                                .fk_deferred_violations
+                                .load(Ordering::Acquire),
+                            Ordering::SeqCst,
+                        );
+                        state
+                            .fk_immediate_violations_during_stmt
+                            .store(0, Ordering::Release);
+                    }
+                    if !in_explicit_txn {
+                        // Autocommit statements rollback the whole transaction on error, so
+                        // non-main pagers do not need statement savepoints here.
+                    } else if let Some(mv_store) = program.connection.mv_store_for_db(*db) {
                         // Attached MVCC DB: open an MvStore savepoint.
                         if let Some(tx_id) = program.connection.get_mv_tx_id_for_db(*db) {
                             mv_store.begin_savepoint(tx_id);
@@ -3320,7 +3528,7 @@ pub fn op_transaction_inner(
                     }
                 }
 
-                if *db == crate::MAIN_DB_ID
+                if *db == MAIN_DB_ID
                     && matches!(tx_mode, TransactionMode::Write)
                     && !program.connection.auto_commit.load(Ordering::SeqCst)
                 {
@@ -3378,6 +3586,12 @@ pub fn op_auto_commit(
         {
             conn.clear_deferred_foreign_key_violations();
         }
+        if matches!(
+            res,
+            Ok(InsnFunctionStepResult::Step | InsnFunctionStepResult::Done)
+        ) {
+            conn.clear_named_savepoints();
+        }
         return res;
     }
 
@@ -3407,7 +3621,7 @@ pub fn op_auto_commit(
             // ROLLBACK transition
             if let Some(mv_store) = mv_store.as_ref() {
                 if let Some(tx_id) = conn.get_mv_tx_id() {
-                    mv_store.rollback_tx(tx_id, pager.clone(), &conn, crate::MAIN_DB_ID);
+                    mv_store.rollback_tx(tx_id, pager.clone(), &conn, MAIN_DB_ID);
                 }
                 pager.end_read_tx();
                 conn.rollback_attached_mvcc_txs(true);
@@ -3468,6 +3682,18 @@ pub fn op_auto_commit(
         && (is_rollback_req || is_commit_req)
     {
         pager.clear_savepoints()?;
+        // Non-main pagers (temp + attached) accumulate savepoints from the
+        // mirror path; they're not cleared by the main pager's commit/
+        // rollback. Without this, a stale savepoint with the same name from
+        // a previous transaction can be matched by a future ROLLBACK TO and
+        // undo unrelated pages. See fuzz regression in
+        // `named_savepoint_differential_fuzz`.
+        conn.with_all_attached_pagers_with_index(|pagers| -> Result<()> {
+            for (_, attached_pager) in pagers {
+                attached_pager.clear_savepoints()?;
+            }
+            Ok(())
+        })?;
     }
 
     // Clear deferred FK counters only after FINAL success of COMMIT/ROLLBACK.
@@ -3488,6 +3714,7 @@ pub fn op_auto_commit(
     ) && (is_rollback_req || is_commit_req)
     {
         conn.set_cdc_transaction_id(-1);
+        conn.clear_named_savepoints();
     }
 
     res
@@ -3505,54 +3732,83 @@ pub fn op_savepoint(
 
     match *op {
         SavepointOp::Begin => {
-            let starts_transaction = conn.auto_commit.load(Ordering::SeqCst);
-            let deferred_fk_violations = conn.get_deferred_foreign_key_violations();
+            conn.with_snapshot_non_main_schemas(|temp_schema_snapshot, staged_schema_snapshot| {
+                let starts_transaction = conn.auto_commit.load(Ordering::SeqCst);
+                let deferred_fk_violations = conn.get_deferred_foreign_key_violations();
 
-            if let Some(mv_store) = mv_store.as_ref() {
-                let tx_id = if let Some(tx_id) = conn.get_mv_tx_id() {
-                    tx_id
+                if let Some(mv_store) = mv_store.as_ref() {
+                    let tx_id = if let Some(tx_id) = conn.get_mv_tx_id() {
+                        tx_id
+                    } else {
+                        let tx_id = mv_store.begin_tx(pager.clone())?;
+                        conn.set_mv_tx(Some((tx_id, TransactionMode::Read)));
+                        if matches!(conn.get_tx_state(), TransactionState::None) {
+                            conn.set_tx_state(TransactionState::Read);
+                        }
+                        tx_id
+                    };
+                    mv_store.begin_named_savepoint(
+                        tx_id,
+                        name.clone(),
+                        starts_transaction,
+                        deferred_fk_violations,
+                    );
                 } else {
-                    let tx_id = mv_store.begin_tx(pager.clone())?;
-                    conn.set_mv_tx(Some((tx_id, TransactionMode::Read)));
-                    if matches!(conn.get_tx_state(), TransactionState::None) {
-                        conn.set_tx_state(TransactionState::Read);
-                    }
-                    tx_id
+                    pager.open_subjournal()?;
+                    let db_size =
+                        return_if_io!(pager.with_header(|header| header.database_size.get()));
+                    pager.open_named_savepoint(
+                        name.clone(),
+                        db_size,
+                        starts_transaction,
+                        deferred_fk_violations,
+                    )?;
+                }
+                let frame = crate::connection::NamedSavepointFrame {
+                    name: name.clone(),
+                    starts_transaction,
+                    deferred_fk_violations,
+                    temp_schema_snapshot,
+                    staged_schema_snapshot,
                 };
-                mv_store.begin_named_savepoint(
-                    tx_id,
-                    name.clone(),
-                    starts_transaction,
-                    deferred_fk_violations,
-                );
-                // Open matching named savepoints on attached MVCC databases.
-                conn.for_each_attached_mv_tx(|db_id, att_tx_id| {
-                    if let Some(att_mv) = conn.mv_store_for_db(db_id) {
-                        att_mv.begin_named_savepoint(
-                            att_tx_id,
-                            name.clone(),
-                            false,
-                            deferred_fk_violations,
-                        );
+                // Mirror onto attached/temp pagers. If any pager fails
+                // mid-flight, earlier ones already opened a savepoint
+                // with this name — and main's savepoint is already
+                // open too. Undo the partial state atomically so the
+                // connection's and pagers' savepoint stacks stay in
+                // sync. `release_named_savepoint` is idempotent on a
+                // missing name, so we can blind-release on all non-
+                // main pagers.
+                if let Err(mirror_err) = mirror_named_savepoint_to_active_non_main_databases(
+                    &conn,
+                    SavepointMirror::Begin(&frame),
+                ) {
+                    // Release the partially-opened mirror savepoints.
+                    let _ = mirror_named_savepoint_to_active_non_main_databases(
+                        &conn,
+                        SavepointMirror::Release(name),
+                    );
+                    // Release the main savepoint we just opened so it
+                    // does not linger without a connection-level frame
+                    // recording it (which would leak past commit /
+                    // rollback).
+                    if let Some(mv_store) = mv_store.as_ref() {
+                        if let Some(tx_id) = conn.get_mv_tx_id() {
+                            let _ = mv_store.release_named_savepoint(tx_id, name);
+                        }
+                    } else {
+                        let _ = pager.release_named_savepoint(name);
                     }
-                });
-            } else {
-                pager.open_subjournal()?;
-                let db_size = return_if_io!(pager.with_header(|header| header.database_size.get()));
-                pager.open_named_savepoint(
-                    name.clone(),
-                    db_size,
-                    starts_transaction,
-                    deferred_fk_violations,
-                )?;
-            }
+                    return Err(mirror_err);
+                }
+                conn.push_named_savepoint(frame);
+                if starts_transaction {
+                    conn.auto_commit.store(false, Ordering::SeqCst);
+                }
 
-            if starts_transaction {
-                conn.auto_commit.store(false, Ordering::SeqCst);
-            }
-
-            state.pc += 1;
-            Ok(InsnFunctionStepResult::Step)
+                state.pc += 1;
+                Ok(InsnFunctionStepResult::Step)
+            })
         }
         SavepointOp::Release => {
             let release_result = if let Some(mv_store) = mv_store.as_ref() {
@@ -3563,23 +3819,24 @@ pub fn op_savepoint(
             } else {
                 pager.release_named_savepoint(name)?
             };
-            // Release matching named savepoints on attached MVCC databases.
-            if mv_store.is_some() {
-                conn.for_each_attached_mv_tx(|db_id, att_tx_id| {
-                    if let Some(att_mv) = conn.mv_store_for_db(db_id) {
-                        let _ = att_mv.release_named_savepoint(att_tx_id, name);
-                    }
-                });
-            }
             match release_result {
                 SavepointResult::NotFound => {
                     mark_unlikely();
                     return Err(LimboError::TxError(format!("no such savepoint: {name}")));
                 }
                 SavepointResult::Release => {
-                    // Savepoint released successfully, just continue
+                    let _ = conn.release_named_savepoint_frame(name);
+                    mirror_named_savepoint_to_active_non_main_databases(
+                        &conn,
+                        SavepointMirror::Release(name),
+                    )?;
                 }
                 SavepointResult::Commit => {
+                    let _ = conn.release_named_savepoint_frame(name);
+                    mirror_named_savepoint_to_active_non_main_databases(
+                        &conn,
+                        SavepointMirror::Release(name),
+                    )?;
                     // This means that releasing the savepoint caused the transaction to commit, so we need to auto-commit here.
                     let auto_commit = Insn::AutoCommit {
                         auto_commit: true,
@@ -3594,12 +3851,6 @@ pub fn op_savepoint(
         }
         SavepointOp::RollbackTo => {
             let deferred_fk_snapshot = if let Some(mv_store) = mv_store.as_ref() {
-                // Rollback named savepoints on attached MVCC databases.
-                conn.for_each_attached_mv_tx(|db_id, att_tx_id| {
-                    if let Some(att_mv) = conn.mv_store_for_db(db_id) {
-                        let _ = att_mv.rollback_to_named_savepoint(att_tx_id, name);
-                    }
-                });
                 match conn.get_mv_tx_id() {
                     Some(tx_id) => mv_store.rollback_to_named_savepoint(tx_id, name)?,
                     None => None,
@@ -3612,8 +3863,37 @@ pub fn op_savepoint(
                 mark_unlikely();
                 return Err(LimboError::TxError(format!("no such savepoint: {name}")));
             };
+            let frame_info = conn.rollback_named_savepoint_frame(name);
+            mirror_named_savepoint_to_active_non_main_databases(
+                &conn,
+                SavepointMirror::Rollback(name),
+            )?;
             conn.fk_deferred_violations
-                .store(deferred_fk_snapshot, Ordering::SeqCst);
+                .store(deferred_fk_snapshot, Ordering::Release);
+
+            // Restore non-main in-memory schemas from the frame's snapshot.
+            // The mirror call above rolled back on-disk pages for temp and
+            // attached pagers; without this restore, the in-memory schemas
+            // would keep DDL that the disk-level rollback just undid.
+            if let Some(info) = frame_info {
+                if let Some(temp_db) = conn.temp.database.read().as_ref() {
+                    match info.temp_schema_snapshot {
+                        Some(snap) => *temp_db.db.schema.lock() = snap,
+                        None => *temp_db.db.schema.lock() = conn.empty_temp_schema(),
+                    }
+                }
+                *conn.database_schemas().write() = info.staged_schema_snapshot;
+                conn.bump_prepare_context_generation();
+            }
+
+            // Invalidate cached schema cookies on ALL non-main pagers whose
+            // pages may have been rolled back. The main pager is handled
+            // below. Next header read will re-populate the cached cookie.
+            conn.with_all_attached_pagers_with_index(|pagers| {
+                for (_db_id, attached_pager) in pagers {
+                    attached_pager.set_schema_cookie(None);
+                }
+            });
 
             // After rolling back pages, the in-memory schema cache may be stale
             // if DDL was executed within the savepoint. Invalidate the pager's
@@ -7919,12 +8199,14 @@ pub fn op_function(
 
                                 if normalized_tbl_name == table {
                                     // This is the table being altered - update its column
-                                    let column = columns
-                                        .iter_mut()
-                                        .find(|column| {
-                                            normalize_ident(column.col_name.as_str()) == rename_from
-                                        })
-                                        .expect("column being renamed should be present");
+                                    let Some(column) = columns.iter_mut().find(|column| {
+                                        normalize_ident(column.col_name.as_str()) == rename_from
+                                    }) else {
+                                        // MVCC/temp-schema rewrite can reach an already-updated
+                                        // CREATE TABLE SQL image for the target table. Treat that
+                                        // as idempotent and keep the existing SQL text.
+                                        break 'sql None;
+                                    };
 
                                     match alter_func {
                                         AlterTableFunc::AlterColumn => *column = column_def.clone(),
@@ -9611,7 +9893,7 @@ pub fn op_open_write(
             .as_mut()
             .expect("cursor should exist");
         let cursor = cursor.as_index_method_mut();
-        return_if_io!(cursor.open_write(&program.connection));
+        return_if_io!(cursor.open_write(&program.connection, *db));
         state.pc += 1;
         return Ok(InsnFunctionStepResult::Step);
     }
@@ -9798,7 +10080,7 @@ pub fn op_index_method_create(
         .as_mut()
         .expect("cursor should exist");
     let cursor = cursor.as_index_method_mut();
-    return_if_io!(cursor.create(&program.connection));
+    return_if_io!(cursor.create(&program.connection, *db));
 
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
@@ -9829,7 +10111,7 @@ pub fn op_index_method_destroy(
         .as_mut()
         .expect("cursor should exist");
     let cursor = cursor.as_index_method_mut();
-    return_if_io!(cursor.destroy(&program.connection));
+    return_if_io!(cursor.destroy(&program.connection, *db));
 
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
@@ -9860,7 +10142,7 @@ pub fn op_index_method_optimize(
         .as_mut()
         .expect("cursor should exist");
     let cursor = cursor.as_index_method_mut();
-    return_if_io!(cursor.optimize(&program.connection));
+    return_if_io!(cursor.optimize(&program.connection, *db));
 
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
@@ -9916,13 +10198,10 @@ pub fn op_destroy(
             db,
             root,
             former_root_reg,
-            is_temp,
+            is_temp: _,
         },
         insn
     );
-    if *is_temp == 1 {
-        todo!("temp databases not implemented yet.");
-    }
     let mv_store = program.connection.mv_store_for_db(*db);
     if mv_store.is_some() {
         // MVCC only does pager operations in checkpoint
@@ -9930,7 +10209,7 @@ pub fn op_destroy(
         return Ok(InsnFunctionStepResult::Step);
     }
 
-    let destroy_pager = if *db != crate::MAIN_DB_ID {
+    let destroy_pager = if *db != MAIN_DB_ID {
         program.get_pager_from_database_index(db)
     } else {
         pager.clone()
@@ -10051,6 +10330,17 @@ pub fn op_drop_table(
             schema.remove_triggers_for_table(table_name);
             schema.remove_table(table_name);
         });
+        // SQLite also removes temp triggers that target the dropped table.
+        // Only needed when dropping from a non-temp database. We must
+        // scope the removal to triggers whose `target_database_id`
+        // matches the dropped db — otherwise `DROP TABLE main.t` would
+        // also nuke temp triggers that target `temp.t` or `aux.t`.
+        if *db != crate::TEMP_DB_ID && conn.temp.database.read().is_some() {
+            let dropped_db = *db;
+            conn.with_database_schema_mut(crate::TEMP_DB_ID, |temp_schema| {
+                temp_schema.remove_triggers_for_table_with_db(table_name, dropped_db);
+            });
+        }
     }
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
@@ -10078,11 +10368,8 @@ pub fn op_drop_type(
     _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(DropType { db, type_name }, insn);
-    if *db > 0 {
-        todo!("temp databases not implemented yet");
-    }
     let conn = program.connection.clone();
-    conn.with_schema_mut(|schema| {
+    conn.with_database_schema_mut(*db, |schema| {
         schema.remove_type(type_name);
         Ok::<(), crate::LimboError>(())
     })?;
@@ -10097,11 +10384,8 @@ pub fn op_add_type(
     _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(AddType { db, sql }, insn);
-    if *db > 0 {
-        todo!("temp databases not implemented yet");
-    }
     let conn = program.connection.clone();
-    conn.with_schema_mut(|schema| schema.add_type_from_sql(sql))?;
+    conn.with_database_schema_mut(*db, |schema| schema.add_type_from_sql(sql))?;
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
 }
@@ -10239,7 +10523,7 @@ pub fn op_parse_schema(
     conn.auto_commit.store(false, Ordering::SeqCst);
 
     // For attached databases, qualify the sqlite_schema table with the database name
-    let schema_table = if crate::is_attached_db(*db) {
+    let schema_table = if *db != crate::MAIN_DB_ID {
         let db_name = conn
             .get_database_name_by_index(*db)
             .unwrap_or_else(|| "main".to_string());
@@ -10253,35 +10537,44 @@ pub fn op_parse_schema(
         format!("SELECT * FROM {schema_table}")
     };
     let mut stmt = conn.prepare_internal(sql)?;
+    // ParseSchema runs as a nested helper statement inside the parent schema
+    // mutation. It only reads sqlite_schema, so a statement subtransaction is
+    // unnecessary and can contend with the parent's subjournal on temp/attached
+    // pagers, surfacing as SQLITE_BUSY during temp DDL.
+    stmt.program
+        .prepared
+        .needs_stmt_subtransactions
+        .store(false, Ordering::Relaxed);
 
     // Get a mutable schema clone *without* holding the schema lock during
     // nested statement execution.  The nested Statement may call reprepare()
     // which also acquires the schema / database_schemas write lock, so holding
     // it here would deadlock on the same thread (parking_lot RwLock is not
     // re-entrant).
-    let schema_arc = if crate::is_attached_db(*db) {
-        // Fetch the fallback schema from attached_databases BEFORE acquiring
-        // database_schemas.write() to avoid a nested lock ordering dependency
-        // (database_schemas.write -> attached_databases.read).
+    let schema_arc = if *db == crate::TEMP_DB_ID {
+        // TEMP: single source of truth is `temp_db.db.schema`. Skip
+        // `database_schemas` staging entirely — it would only go stale.
+        conn.temp
+            .database
+            .read()
+            .as_ref()
+            .map(|temp_db| temp_db.db.schema.lock().clone())
+            .unwrap_or_else(|| conn.empty_temp_schema())
+    } else if *db != crate::MAIN_DB_ID {
         let fallback_schema = {
             let attached_dbs = conn.attached_databases.read();
-            attached_dbs
-                .index_to_data
-                .get(db)
-                .map(|(db_inst, _pager)| db_inst.schema.lock().clone())
-        };
-        let Some(fallback_schema) = fallback_schema else {
-            conn.auto_commit
-                .store(previous_auto_commit, Ordering::SeqCst);
-            return Err(LimboError::InternalError(format!(
-                "stale reference to detached database (index {db})"
-            )));
+            let Some((db_inst, _pager)) = attached_dbs.index_to_data.get(db) else {
+                conn.auto_commit
+                    .store(previous_auto_commit, Ordering::SeqCst);
+                return Err(LimboError::InternalError(format!(
+                    "stale reference to detached database (index {db})"
+                )));
+            };
+            let schema = db_inst.schema.lock().clone();
+            schema
         };
         let mut schemas = conn.database_schemas().write();
-        schemas
-            .entry(*db)
-            .or_insert_with(|| fallback_schema)
-            .clone() // cheap Arc clone; write lock released at end of block
+        schemas.entry(*db).or_insert(fallback_schema).clone() // cheap Arc clone; write lock released at end of block
     } else {
         conn.schema.read().clone()
     };
@@ -10337,6 +10630,12 @@ fn op_parse_schema_step(
                 let sql = row.get::<&str>(4).ok();
                 let schema = Arc::make_mut(&mut inner.schema_arc);
                 let syms = conn.syms.read();
+                let attached_resolver = |alias: &str| -> Option<usize> {
+                    conn.attached_databases()
+                        .read()
+                        .get_database_by_name(&crate::util::normalize_ident(alias))
+                        .map(|(idx, _)| idx)
+                };
                 schema.handle_schema_row(
                     ty,
                     name,
@@ -10349,6 +10648,7 @@ fn op_parse_schema_step(
                     &mut inner.dbsp_state_roots,
                     &mut inner.dbsp_state_index_roots,
                     &mut inner.materialized_view_info,
+                    &attached_resolver,
                 )?;
                 continue;
             }
@@ -10385,7 +10685,24 @@ fn op_parse_schema_step(
                 );
 
                 // Store the modified schema back
-                if crate::is_attached_db(db) {
+                if db == crate::TEMP_DB_ID {
+                    // TEMP: write directly to `temp_db.db.schema` — the single
+                    // source of truth; never stage in `database_schemas`.
+                    //
+                    // Refresh schema_version from the pager header first. At
+                    // this point SetCookie has already run for the current
+                    // DDL, so the header cookie is authoritative; without this
+                    // the cached version can drift on subsequent temp DDLs in
+                    // the same transaction and trigger a spurious
+                    // SchemaUpdated -> reprepare -> rollback_attached() loop
+                    // that wipes in-flight dirty pages.
+                    if let Some(temp_db) = conn.temp.database.read().as_ref() {
+                        if let Some(cookie) = temp_db.pager.get_schema_cookie_cached() {
+                            schema.schema_version = cookie;
+                        }
+                        *temp_db.db.schema.lock() = schema_arc;
+                    }
+                } else if db != crate::MAIN_DB_ID {
                     conn.database_schemas().write().insert(db, schema_arc);
                 } else {
                     *conn.schema.write() = schema_arc;
@@ -10652,6 +10969,15 @@ pub fn op_read_cookie(
             *db,
             |header| match cookie {
                 Cookie::ApplicationId => header.application_id.get().into(),
+                Cookie::DatabaseFormat => header.schema_format.get().into(),
+                Cookie::DatabaseTextEncoding => match header.text_encoding {
+                    crate::storage::sqlite3_ondisk::TextEncoding::Unset
+                    | crate::storage::sqlite3_ondisk::TextEncoding::Utf8 => 1,
+                    crate::storage::sqlite3_ondisk::TextEncoding::Utf16Le => 2,
+                    crate::storage::sqlite3_ondisk::TextEncoding::Utf16Be => 3,
+                    _ => 0,
+                },
+                Cookie::DefaultPageCacheSize => header.default_page_cache_size.get() as i64,
                 Cookie::UserVersion => header.user_version.get().into(),
                 Cookie::SchemaVersion => header.schema_cookie.get().into(),
                 Cookie::LargestRootPageNumber => header.vacuum_mode_largest_root_page.get().into(),
@@ -10700,43 +11026,68 @@ pub fn op_set_cookie(
         }
     }
 
-    return_if_io!(with_header_mut(
-        &pager,
-        mv_store.as_ref(),
-        program,
-        *db,
-        |header| {
-            match cookie {
-                Cookie::ApplicationId => header.application_id = (*value).into(),
-                Cookie::UserVersion => header.user_version = (*value).into(),
-                Cookie::LargestRootPageNumber => {
-                    header.vacuum_mode_largest_root_page = (*value as u32).into();
-                }
-                Cookie::IncrementalVacuum => {
-                    header.incremental_vacuum_enabled = (*value as u32).into()
-                }
-                Cookie::SchemaVersion => {
-                    // Only mark schema_did_change on connection for main database (db 0).
-                    // Attached databases track their schema independently.
-                    if *db == crate::MAIN_DB_ID {
-                        match program.connection.get_tx_state() {
-                            TransactionState::Write { .. } => {
-                                program.connection.set_tx_state(TransactionState::Write { schema_did_change: true });
-                            },
-                            TransactionState::Read => unreachable!("invalid transaction state for SetCookie: TransactionState::Read, should be write"),
-                            TransactionState::None => unreachable!("invalid transaction state for SetCookie: TransactionState::None, should be write"),
-                            TransactionState::PendingUpgrade { .. } => unreachable!("invalid transaction state for SetCookie: TransactionState::PendingUpgrade, should be write"),
-                        }
+    match with_header_mut(&pager, mv_store.as_ref(), program, *db, |header| {
+        match cookie {
+            Cookie::ApplicationId => header.application_id = (*value).into(),
+            Cookie::DatabaseFormat => header.schema_format = (*value as u32).into(),
+            Cookie::DatabaseTextEncoding => {
+                header.text_encoding = match *value {
+                    1 => crate::storage::sqlite3_ondisk::TextEncoding::Utf8,
+                    2 => crate::storage::sqlite3_ondisk::TextEncoding::Utf16Le,
+                    3 => crate::storage::sqlite3_ondisk::TextEncoding::Utf16Be,
+                    _ => {
+                        return Err(LimboError::InternalError(format!(
+                            "unsupported text encoding cookie value: {value}",
+                        )));
                     }
-                    program.connection.with_database_schema_mut(*db, |schema| {
-                        schema.schema_version = *value as u32
-                    });
-                    header.schema_cookie = (*value as u32).into();
+                };
+            }
+            Cookie::DefaultPageCacheSize => {
+                header.default_page_cache_size =
+                    crate::storage::sqlite3_ondisk::CacheSize::new(*value);
+            }
+            Cookie::UserVersion => header.user_version = (*value).into(),
+            Cookie::LargestRootPageNumber => {
+                header.vacuum_mode_largest_root_page = (*value as u32).into();
+            }
+            Cookie::IncrementalVacuum => header.incremental_vacuum_enabled = (*value as u32).into(),
+            Cookie::SchemaVersion => {
+                // Only mark schema_did_change on connection for main database (db 0).
+                // Attached databases track their schema independently.
+                if *db == crate::MAIN_DB_ID {
+                    match program.connection.get_tx_state() {
+                        TransactionState::Write { .. } => {
+                            program.connection.set_tx_state(TransactionState::Write {
+                                schema_did_change: true,
+                            });
+                        }
+                        TransactionState::Read => unreachable!(
+                            "invalid transaction state for SetCookie: TransactionState::Read, should be write"
+                        ),
+                        TransactionState::None => unreachable!(
+                            "invalid transaction state for SetCookie: TransactionState::None, should be write"
+                        ),
+                        TransactionState::PendingUpgrade { .. } => unreachable!(
+                            "invalid transaction state for SetCookie: TransactionState::PendingUpgrade, should be write"
+                        ),
+                    }
+                } else if *db == crate::TEMP_DB_ID {
+                    // TEMP has no shared `Database::schema` to publish to, so
+                    // commit/rollback consult a separate `committed_temp_schema`
+                    // snapshot on the connection. Flag that it needs updating.
+                    program.connection.mark_temp_schema_did_change();
                 }
-                cookie => todo!("{cookie:?} is not yet implement for SetCookie"),
-            };
-        }
-    ));
+                program
+                    .connection
+                    .with_database_schema_mut(*db, |schema| schema.schema_version = *value as u32);
+                header.schema_cookie = (*value as u32).into();
+            }
+        };
+        Ok(())
+    })? {
+        IOResult::Done(result) => result?,
+        IOResult::IO(io) => return Ok(InsnFunctionStepResult::IO(io)),
+    }
 
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
@@ -11462,7 +11813,7 @@ pub fn op_integrity_check(
 
     let mv_store = program.connection.mv_store_for_db(*db);
     // Use the correct pager for the target database (main or attached)
-    let target_pager = if *db == crate::MAIN_DB_ID {
+    let target_pager = if *db == MAIN_DB_ID {
         pager.clone()
     } else {
         program.get_pager_from_database_index(db)
@@ -11639,6 +11990,78 @@ fn regenerate_trigger_sql(trigger: &crate::schema::Trigger) -> String {
     )
 }
 
+fn sql_might_reference_identifier(sql: &str, ident: &str) -> bool {
+    if ident.is_empty() {
+        return true;
+    }
+
+    let ident = ident.as_bytes();
+    sql.as_bytes()
+        .windows(ident.len())
+        .any(|window| window.eq_ignore_ascii_case(ident))
+}
+
+fn with_relevant_trigger_schemas_mut(
+    conn: &Connection,
+    table_db_id: usize,
+    mut f: impl FnMut(&mut Schema) -> crate::Result<()>,
+) -> crate::Result<()> {
+    conn.with_database_schema_mut(table_db_id, |schema| f(schema))?;
+    if table_db_id != crate::TEMP_DB_ID && conn.temp.database.read().is_some() {
+        conn.with_database_schema_mut(crate::TEMP_DB_ID, |schema| f(schema))?;
+    }
+    Ok(())
+}
+
+fn rewrite_trigger_for_table_rename(
+    trigger: &mut crate::schema::Trigger,
+    normalized_from: &str,
+    normalized_to: &str,
+) {
+    let old_sql = trigger.sql.clone();
+    for cmd in &mut trigger.commands {
+        rewrite_trigger_cmd_table_refs(cmd, normalized_from, normalized_to);
+    }
+    if let Some(ref mut when) = trigger.when_clause {
+        rewrite_check_expr_table_refs(when, normalized_from, normalized_to);
+    }
+    let new_sql = regenerate_trigger_sql(trigger);
+    if new_sql != old_sql {
+        trigger.sql = new_sql;
+    }
+}
+
+fn rewrite_trigger_for_column_rename(
+    trigger: &mut crate::schema::Trigger,
+    table_name: &str,
+    old_col: &str,
+    new_col: &str,
+) -> crate::Result<()> {
+    let trigger_tbl = normalize_ident(&trigger.table_name);
+    if let Some(ref mut when) = trigger.when_clause {
+        rename_identifiers_scoped_when_clause(when, table_name, &trigger_tbl, old_col, new_col);
+    }
+    if trigger_tbl == table_name {
+        if let ast::TriggerEvent::UpdateOf(ref mut cols) = trigger.event {
+            for col in cols {
+                if normalize_ident(col.as_str()) == normalize_ident(old_col) {
+                    *col = ast::Name::exact(new_col.to_owned());
+                }
+            }
+        }
+    }
+    for cmd in &mut trigger.commands {
+        rewrite_trigger_cmd_column_refs(cmd, table_name, &trigger_tbl, old_col, new_col);
+    }
+    if trigger_still_references_renamed_column(trigger, table_name, old_col) {
+        return Err(LimboError::ParseError(format!(
+            "error in trigger {} after rename: no such column: {}",
+            trigger.name, old_col
+        )));
+    }
+    Ok(())
+}
+
 pub fn op_rename_table(
     program: &Program,
     state: &mut ProgramState,
@@ -11723,16 +12146,7 @@ pub fn op_rename_table(
             for trigger_arc in &mut triggers {
                 let trigger = Arc::make_mut(trigger_arc);
                 normalized_to.clone_into(&mut trigger.table_name);
-                // Rewrite table references in trigger body commands
-                for cmd in &mut trigger.commands {
-                    rewrite_trigger_cmd_table_refs(cmd, &normalized_from, &normalized_to);
-                }
-                // Rewrite WHEN clause qualified refs
-                if let Some(ref mut when) = trigger.when_clause {
-                    rewrite_check_expr_table_refs(when, &normalized_from, &normalized_to);
-                }
-                // Regenerate trigger.sql to reflect the updated table name and body
-                trigger.sql = regenerate_trigger_sql(trigger);
+                rewrite_trigger_for_table_rename(trigger, &normalized_from, &normalized_to);
             }
             schema.triggers.insert(normalized_to.to_owned(), triggers);
         }
@@ -11741,23 +12155,31 @@ pub fn op_rename_table(
         // in their body commands (e.g., INSERT INTO old_name in a trigger on another table)
         for (_, triggers) in schema.triggers.iter_mut() {
             for trigger_arc in triggers.iter_mut() {
+                if !sql_might_reference_identifier(&trigger_arc.sql, &normalized_from) {
+                    continue;
+                }
                 let trigger = Arc::make_mut(trigger_arc);
-                let old_sql = trigger.sql.clone();
-                for cmd in &mut trigger.commands {
-                    rewrite_trigger_cmd_table_refs(cmd, &normalized_from, &normalized_to);
-                }
-                if let Some(ref mut when) = trigger.when_clause {
-                    rewrite_check_expr_table_refs(when, &normalized_from, &normalized_to);
-                }
-                let new_sql = regenerate_trigger_sql(trigger);
-                if new_sql != old_sql {
-                    trigger.sql = new_sql;
-                }
+                rewrite_trigger_for_table_rename(trigger, &normalized_from, &normalized_to);
             }
         }
 
         Ok(())
     })?;
+
+    if *db != crate::TEMP_DB_ID && conn.temp.database.read().is_some() {
+        conn.with_database_schema_mut(crate::TEMP_DB_ID, |schema| -> crate::Result<()> {
+            for triggers in schema.triggers.values_mut() {
+                for trigger_arc in triggers.iter_mut() {
+                    if !sql_might_reference_identifier(&trigger_arc.sql, &normalized_from) {
+                        continue;
+                    }
+                    let trigger = Arc::make_mut(trigger_arc);
+                    rewrite_trigger_for_table_rename(trigger, &normalized_from, &normalized_to);
+                }
+            }
+            Ok(())
+        })?;
+    }
 
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
@@ -11885,7 +12307,8 @@ pub fn op_add_column(
             db,
             table,
             column,
-            check_constraints
+            check_constraints,
+            foreign_keys
         },
         insn
     );
@@ -11911,6 +12334,8 @@ pub fn op_add_column(
             crate::schema::BTreeTable::build_logical_to_physical_map(&btree.columns);
         // Update CHECK constraints to include any constraints from the new column
         btree.check_constraints.clone_from(check_constraints);
+        // Update foreign keys to include any FK constraints from the new column
+        btree.foreign_keys.clone_from(foreign_keys);
 
         // Resolve generated column expressions and update virtual column metadata
         btree.prepare_generated_columns()?;
@@ -11957,13 +12382,13 @@ pub fn op_alter_column(
     let new_column = crate::schema::Column::try_from(definition.as_ref())?;
     let new_name = definition.col_name.as_str().to_owned();
 
-    let view_rewrites = if *rename {
+    let view_rewrites: Vec<(usize, String, RewrittenView)> = if *rename {
         let target_db_name = conn.get_database_name_by_index(*db).ok_or_else(|| {
             LimboError::InternalError(format!("unknown database id {} during ALTER TABLE", *db))
         })?;
-        conn.with_schema(
+        let mut all_rewrites = conn.with_schema(
             *db,
-            |schema| -> crate::Result<Vec<(String, RewrittenView)>> {
+            |schema| -> crate::Result<Vec<(usize, String, RewrittenView)>> {
                 let mut rewrites = Vec::new();
                 for (view_name, view) in schema.views.iter() {
                     if let Some(rewritten) = rewrite_view_sql_for_column_rename(
@@ -11974,12 +12399,36 @@ pub fn op_alter_column(
                         &old_column_name,
                         &new_name,
                     )? {
-                        rewrites.push((view_name.clone(), rewritten));
+                        rewrites.push((*db, view_name.clone(), rewritten));
                     }
                 }
                 Ok(rewrites)
             },
-        )?
+        )?;
+        // Also search temp schema for views referencing the renamed column.
+        if *db != crate::TEMP_DB_ID {
+            let temp_rewrites = conn.with_schema(
+                crate::TEMP_DB_ID,
+                |schema| -> crate::Result<Vec<(usize, String, RewrittenView)>> {
+                    let mut rewrites = Vec::new();
+                    for (view_name, view) in schema.views.iter() {
+                        if let Some(rewritten) = rewrite_view_sql_for_column_rename(
+                            &view.sql,
+                            schema,
+                            table_name.as_str(),
+                            &target_db_name,
+                            &old_column_name,
+                            &new_name,
+                        )? {
+                            rewrites.push((crate::TEMP_DB_ID, view_name.clone(), rewritten));
+                        }
+                    }
+                    Ok(rewrites)
+                },
+            )?;
+            all_rewrites.extend(temp_rewrites);
+        }
+        all_rewrites
     } else {
         Vec::new()
     };
@@ -12106,65 +12555,36 @@ pub fn op_alter_column(
     })?;
 
     if *rename {
-        let old_col = old_column_name.clone();
-        let new_col = new_name;
-        let tbl_name = normalized_table_name.clone();
-        // Update in-memory trigger objects for the renamed column
-        conn.with_database_schema_mut(*db, move |schema| {
-            for (_, triggers) in schema.triggers.iter_mut() {
+        // Update in-memory trigger objects for the renamed column in both the
+        // altered schema and temp, since temp triggers may reference main/attached tables.
+        with_relevant_trigger_schemas_mut(&conn, *db, |schema| {
+            for triggers in schema.triggers.values_mut() {
                 for trigger_arc in triggers.iter_mut() {
-                    let trigger_tbl = normalize_ident(&trigger_arc.table_name);
                     let trigger = Arc::make_mut(trigger_arc);
-                    // Rewrite WHEN clause: only rename NEW.col / OLD.col qualified refs.
-                    // Bare column names in WHEN clauses are invalid per SQLite semantics,
-                    // so we must not rename them (SQLite would error on such triggers).
-                    if let Some(ref mut when) = trigger.when_clause {
-                        rename_identifiers_scoped_when_clause(
-                            when,
-                            &tbl_name,
-                            &trigger_tbl,
-                            &old_col,
-                            &new_col,
-                        );
-                    }
-                    // Rewrite UPDATE OF columns if trigger is on the renamed table
-                    if trigger_tbl == tbl_name {
-                        if let ast::TriggerEvent::UpdateOf(ref mut cols) = trigger.event {
-                            for col in cols {
-                                if normalize_ident(col.as_str()) == normalize_ident(&old_col) {
-                                    *col = ast::Name::exact(new_col.clone());
-                                }
-                            }
-                        }
-                    }
-                    // Rewrite trigger body commands
-                    for cmd in &mut trigger.commands {
-                        rewrite_trigger_cmd_column_refs(
-                            cmd,
-                            &tbl_name,
-                            &trigger_tbl,
-                            &old_col,
-                            &new_col,
-                        );
-                    }
+                    rewrite_trigger_for_column_rename(
+                        trigger,
+                        &normalized_table_name,
+                        &old_column_name,
+                        &new_name,
+                    )?;
                 }
             }
-        });
+            Ok(())
+        })?;
 
-        let rewrites = view_rewrites;
-        conn.with_database_schema_mut(*db, move |schema| -> crate::Result<()> {
-            for (view_name, rewritten) in rewrites {
+        for (view_db, view_name, rewritten) in view_rewrites {
+            conn.with_database_schema_mut(view_db, move |schema| -> crate::Result<()> {
                 if let Some(view_arc) = schema.views.get_mut(&view_name) {
                     let view = Arc::make_mut(view_arc);
                     view.sql = rewritten.sql;
                     view.select_stmt = rewritten.select_stmt;
                     view.columns = rewritten.columns;
                 }
-            }
-            Ok(())
-        })?;
+                Ok(())
+            })?;
+        }
 
-        if !crate::is_attached_db(*db) {
+        if *db != crate::MAIN_DB_ID {
             conn.with_schema(*db, |schema| -> crate::Result<()> {
                 let table = schema
                     .tables
@@ -13450,6 +13870,13 @@ fn op_journal_mode_inner(
                     return Ok(InsnFunctionStepResult::Step);
                 }
 
+                if *db != crate::MAIN_DB_ID {
+                    let ret: &'static str = prev_mode.into();
+                    state.registers[*dest].set_text(Text::new(ret));
+                    state.pc += 1;
+                    return Ok(InsnFunctionStepResult::Step);
+                }
+
                 // Check if database is readonly - cannot change journal mode on readonly databases
                 if program.connection.is_readonly(*db) {
                     return Err(LimboError::ReadOnly);
@@ -13746,6 +14173,10 @@ pub(crate) enum OpVacuumIntoSubState {
 #[derive(Default)]
 pub(crate) struct OpVacuumIntoState {
     sub_state: OpVacuumIntoSubState,
+    /// Escaped schema name for safe SQL interpolation
+    escaped_schema_name: String,
+    /// Database index for the target schema
+    database_id: usize,
     /// Keep dest_db alive while vacuum is in progress.
     #[allow(dead_code)]
     dest_db: Option<Arc<crate::Database>>,
@@ -13803,11 +14234,33 @@ fn op_vacuum_into_inner(
     state: &mut ProgramState,
     insn: &Insn,
 ) -> Result<InsnFunctionStepResult> {
-    load_insn!(VacuumInto { dest_path }, insn);
+    load_insn!(
+        VacuumInto {
+            schema_name,
+            dest_path
+        },
+        insn
+    );
 
-    let vacuum_state = state
-        .op_vacuum_into_state
-        .get_or_insert_with(OpVacuumIntoState::default);
+    if state.op_vacuum_into_state.is_none() {
+        let database_id = program.connection.get_database_id_by_name(schema_name)?;
+
+        // Matches sqlite that treats VACUUM temp INTO as a no-op (no file created)
+        if database_id == TEMP_DB_ID {
+            state.pc += 1;
+            return Ok(InsnFunctionStepResult::Step);
+        }
+
+        state.op_vacuum_into_state = Some(OpVacuumIntoState {
+            escaped_schema_name: schema_name.replace('"', "\"\""),
+            database_id,
+            ..Default::default()
+        });
+    }
+
+    let vacuum_state = state.op_vacuum_into_state.as_mut().unwrap();
+    let escaped_schema_name = &vacuum_state.escaped_schema_name;
+    let database_id = vacuum_state.database_id;
 
     loop {
         let current_sub_state = std::mem::take(&mut vacuum_state.sub_state);
@@ -13846,33 +14299,47 @@ fn op_vacuum_into_inner(
                 // Always use PlatformIO for the destination file, even if source is in-memory.
                 // This ensures VACUUM INTO actually writes to disk.
                 let io: Arc<dyn crate::IO> = Arc::new(crate::io::PlatformIO::new()?);
-                let source_db = &program.connection.db;
+                let source_db = program.connection.get_source_database(database_id);
                 let dest_opts = crate::DatabaseOpts::new()
                     .with_views(source_db.experimental_views_enabled())
                     .with_index_method(source_db.experimental_index_method_enabled());
 
                 program.connection.execute("BEGIN")?;
-                // lets set the same meta values as source db
+                // Set the same meta values from the source db (schema)
                 let user_version: i32 = extract_pragma_int(
-                    &program.connection.pragma_query("user_version")?,
+                    &program
+                        .connection
+                        .pragma_query(&format!("\"{escaped_schema_name}\".user_version"))?,
                     "user_version",
                 )?;
                 let application_id: i32 = extract_pragma_int(
-                    &program.connection.pragma_query("application_id")?,
+                    &program
+                        .connection
+                        .pragma_query(&format!("\"{escaped_schema_name}\".application_id"))?,
                     "application_id",
                 )?;
                 let page_size: u32 = extract_pragma_int(
-                    &program.connection.pragma_query("page_size")?,
+                    &program
+                        .connection
+                        .pragma_query(&format!("\"{escaped_schema_name}\".page_size"))?,
                     "page_size",
                 )?;
 
-                let reserved_space = {
-                    let pager = program.connection.pager.load();
-                    let reserved_space: u8 = match program.connection.get_reserved_bytes() {
+                let reserved_space: u8 = if !is_attached_db(database_id) {
+                    // For main or temp db prefer cached value to avoid blocking I/O
+                    match program.connection.get_reserved_bytes() {
                         Some(val) => val,
-                        None => io.block(|| pager.with_header(|header| header.reserved_space))?,
-                    };
-                    reserved_space
+                        None => {
+                            let pager = program.connection.pager.load();
+                            io.block(|| pager.with_header(|header| header.reserved_space))?
+                        }
+                    }
+                } else {
+                    // For attached db read from its own pager
+                    let pager = program
+                        .connection
+                        .get_pager_from_database_index(&database_id);
+                    io.block(|| pager.with_header(|header| header.reserved_space))?
                 };
 
                 let dest_db = crate::Database::open_file_with_flags(
@@ -13891,7 +14358,7 @@ fn op_vacuum_into_inner(
 
                 // Enable MVCC on destination if source has it enabled
                 // Must be done before any schema operations to ensure the log file is created
-                if program.connection.db.mvcc_enabled() {
+                if source_db.mvcc_enabled() {
                     dest_conn.execute("PRAGMA journal_mode = 'mvcc'")?;
                 }
 
@@ -13910,7 +14377,7 @@ fn op_vacuum_into_inner(
                 // internal artifact of mvcc mode and must not appear in a
                 // standalone SQLite file produced by VACUUM INTO.
                 let schema_sql = format!(
-                    "SELECT type, name, tbl_name, sql FROM sqlite_schema WHERE sql IS NOT NULL AND name <> '{}' ORDER BY CASE type WHEN 'table' THEN 1 WHEN 'index' THEN 2 WHEN 'trigger' THEN 3 WHEN 'view' THEN 4 ELSE 5 END",
+                    "SELECT type, name, tbl_name, sql FROM \"{escaped_schema_name}\".sqlite_schema WHERE sql IS NOT NULL AND name <> '{}' ORDER BY CASE type WHEN 'table' THEN 1 WHEN 'index' THEN 2 WHEN 'trigger' THEN 3 WHEN 'view' THEN 4 ELSE 5 END",
                     crate::mvcc::database::MVCC_META_TABLE_NAME
                 );
                 let schema_stmt = program.connection.prepare(schema_sql.as_str())?;
@@ -14088,15 +14555,17 @@ fn op_vacuum_into_inner(
                     let row = &vacuum_state.schema_rows[idx];
                     if matches!(&row[1], Value::Text(n) if n.as_str() == crate::schema::TURSO_TYPES_TABLE_NAME)
                     {
-                        let source_types: Vec<(String, std::sync::Arc<crate::schema::TypeDef>)> = {
-                            let source_schema = program.connection.schema.read();
-                            source_schema
-                                .type_registry
-                                .iter()
-                                .filter(|(_, td)| !td.is_builtin)
-                                .map(|(name, td)| (name.clone(), td.clone()))
-                                .collect()
-                        };
+                        let source_types: Vec<(String, std::sync::Arc<crate::schema::TypeDef>)> =
+                            program
+                                .connection
+                                .with_schema(database_id, |source_schema| {
+                                    source_schema
+                                        .type_registry
+                                        .iter()
+                                        .filter(|(_, td)| !td.is_builtin)
+                                        .map(|(name, td)| (name.clone(), td.clone()))
+                                        .collect()
+                                });
                         dest_conn.with_schema_mut(|dest_schema| {
                             for (name, td) in source_types {
                                 dest_schema.type_registry.insert(name, td);
@@ -14145,7 +14614,9 @@ fn op_vacuum_into_inner(
                 let table_name = &vacuum_state.table_names[table_idx];
                 // Escape double quotes in table name for safe SQL
                 let escaped_table_name = table_name.replace('"', "\"\"");
-                let pragma_sql = format!("PRAGMA table_info(\"{escaped_table_name}\")");
+                let pragma_sql = format!(
+                    "PRAGMA \"{escaped_schema_name}\".table_info(\"{escaped_table_name}\")"
+                );
                 let column_stmt = program.connection.prepare(&pragma_sql)?;
                 vacuum_state.current_table_columns.clear();
                 vacuum_state.sub_state = OpVacuumIntoSubState::CollectColumnInfo {
@@ -14191,8 +14662,9 @@ fn op_vacuum_into_inner(
                         // Prepare SELECT and INSERT statements for this table
                         let table_name = &vacuum_state.table_names[table_idx];
                         let escaped_table_name = table_name.replace('"', "\"\"");
-                        let source_btree_table =
-                            program.connection.schema.read().get_btree_table(table_name);
+                        let source_btree_table = program
+                            .connection
+                            .with_schema(database_id, |s| s.get_btree_table(table_name));
                         let rowid_alias = source_btree_table
                             .as_ref()
                             .filter(|table| table.has_rowid)
@@ -14225,21 +14697,21 @@ fn op_vacuum_into_inner(
                         }
                         let column_names = data_columns.join(", ");
 
+                        let qualified_table =
+                            format!("\"{escaped_schema_name}\".\"{escaped_table_name}\"");
                         let select_sql = match rowid_alias {
                             Some(alias)
                                 if excluded_rowid_alias_column && column_names.is_empty() =>
                             {
-                                format!("SELECT {alias} FROM \"{escaped_table_name}\"")
+                                format!("SELECT {alias} FROM {qualified_table}")
                             }
                             Some(alias) if excluded_rowid_alias_column => {
-                                format!(
-                                    "SELECT {alias}, {column_names} FROM \"{escaped_table_name}\""
-                                )
+                                format!("SELECT {alias}, {column_names} FROM {qualified_table}")
                             }
                             Some(alias) => {
-                                format!("SELECT {alias}, * FROM \"{escaped_table_name}\"")
+                                format!("SELECT {alias}, * FROM {qualified_table}")
                             }
-                            None => format!("SELECT * FROM \"{escaped_table_name}\""),
+                            None => format!("SELECT * FROM {qualified_table}"),
                         };
                         let select_stmt = program.connection.prepare(&select_sql)?;
 

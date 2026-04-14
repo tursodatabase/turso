@@ -12,7 +12,7 @@ pub fn to_u16(v: usize) -> u16 {
 
 use super::{execute, AggFunc, BranchOffset, CursorID, FuncCtx, InsnFunction, PageIdx};
 use crate::{
-    schema::{BTreeTable, CheckConstraint, Column, Index},
+    schema::{BTreeTable, CheckConstraint, Column, ForeignKey, Index},
     storage::{pager::CreateBTreeFlags, wal::CheckpointMode},
     translate::{collate::CollationSeq, emitter::TransactionMode},
     types::KeyInfo,
@@ -1461,6 +1461,7 @@ pub enum Insn {
         table: String,
         column: Box<Column>,
         check_constraints: Vec<CheckConstraint>,
+        foreign_keys: Vec<Arc<ForeignKey>>,
     },
     AlterColumn {
         db: usize,
@@ -1669,6 +1670,8 @@ pub enum Insn {
     /// VACUUM INTO - create a compacted copy of the database at the specified path.
     /// This copies all schema and data from the current database to a new file.
     VacuumInto {
+        /// Database name to vacuum
+        schema_name: String,
         /// Destination file path for the vacuumed database
         dest_path: String,
     },
