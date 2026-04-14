@@ -5,6 +5,7 @@ use crate::translate::insert::halt_desc_and_on_error;
 use crate::translate::plan::ColumnMask;
 use crate::translate::stmt_journal::any_effective_replace;
 use crate::vdbe::builder::SelfTableContext;
+use crate::Level;
 use crate::{
     ast, emit_explain,
     error::{SQLITE_CONSTRAINT_PRIMARYKEY, SQLITE_CONSTRAINT_UNIQUE},
@@ -54,7 +55,7 @@ use crate::{
     CaptureDataChangesExt, Connection, HashSet, Result,
 };
 use std::num::NonZeroUsize;
-use tracing::{instrument, Level};
+use tracing::instrument;
 use turso_macros::{turso_assert, turso_assert_eq};
 use turso_parser::ast::{ResolveType, TriggerEvent, TriggerTime};
 
@@ -1579,14 +1580,6 @@ fn emit_update_insns<'a>(
         if let Some(table_btree) = target_table.table.btree() {
             if t_ctx.resolver.schema().has_child_fks(table_name) {
                 let rowid_new_reg = rowid_set_clause_reg.unwrap_or(beg);
-                let directly_and_indirectly_updated_columns: ColumnMask = set_clauses
-                    .iter()
-                    .map(|(i, _)| *i)
-                    .flat_map(|col| {
-                        columns_affected_by_update(&table_btree.columns, [col].iter().cloned())
-                    })
-                    .collect();
-
                 let directly_and_indirectly_updated_columns: ColumnMask = set_clauses
                     .iter()
                     .map(|(i, _)| *i)
