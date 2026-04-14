@@ -8993,3 +8993,46 @@ fn test_checkpoint_recovers_after_restart_drop_checkpointed_index() {
     assert_eq!(rows.len(), 1);
     assert_eq!(&rows[0][0].to_string(), "ok");
 }
+
+#[test]
+fn test_drop_recreate_indexed_table_many_inserts_restart() {
+    let mut db = MvccTestDbNoConn::new_with_random_db();
+
+    for round in 0..2 {
+        {
+            let conn = db.connect();
+            let mv_store = db.get_mvcc_store();
+            mv_store.set_checkpoint_threshold(4096);
+
+            if round > 0 {
+                conn.execute("DROP TABLE IF EXISTS t").unwrap();
+            }
+
+            conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, a TEXT, b TEXT, c INTEGER)")
+                .unwrap();
+            conn.execute("CREATE INDEX idx_a ON t(a)").unwrap();
+            conn.execute("CREATE INDEX idx_b ON t(b)").unwrap();
+            conn.execute("CREATE INDEX idx_c ON t(c)").unwrap();
+
+            for i in 0..1000 {
+                conn.execute(format!("INSERT INTO t VALUES({i}, 'a_{i}', 'b_{i}', {i})"))
+                    .unwrap();
+            }
+
+            conn.close().unwrap();
+        }
+
+        db.restart();
+
+        {
+            let conn = db.connect();
+            let rows = get_rows(&conn, "SELECT count(*) FROM t");
+            assert_eq!(
+                rows[0][0].as_int().unwrap(),
+                1000,
+                "round {round}: expected 1000 rows"
+            );
+            conn.close().unwrap();
+        }
+    }
+}

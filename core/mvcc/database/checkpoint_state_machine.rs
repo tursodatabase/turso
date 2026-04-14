@@ -702,10 +702,19 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
         );
         let lwm = self.mvstore.compute_lwm();
         let ckpt_max = self.durable_txid_max_new;
+        let mut table_rows_to_gc = std::collections::BTreeSet::new();
+        let mut index_rows_to_gc = std::collections::BTreeSet::new();
 
         for (row_version, _special_write) in &self.write_set {
-            let row_id = &row_version.row.id;
-            let Some(entry) = self.mvstore.rows.get(row_id) else {
+            table_rows_to_gc.insert((
+                row_version.row.id.table_id,
+                row_version.row.id.row_id.clone(),
+            ));
+        }
+
+        for (table_id, row_key) in table_rows_to_gc {
+            let row_id = RowID::new(table_id, row_key);
+            let Some(entry) = self.mvstore.rows.get(&row_id) else {
                 // The MVCC metadata table row (persistent_tx_ts_max) is staged
                 // directly into the write set by maybe_stage_mvcc_metadata_write() and do not
                 // have a backing in-memory MVCC version chain. Skip GC for these.
@@ -722,7 +731,7 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                 versions.is_empty()
             };
             if is_now_empty {
-                self.mvstore.rows.remove(row_id);
+                self.mvstore.rows.remove(&row_id);
             }
         }
 
@@ -730,22 +739,29 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
             let RowKey::Record(sortable_key) = &row_version.row.id.row_id else {
                 unreachable!("index row versions always have Record keys");
             };
+            index_rows_to_gc.insert((*index_id, RowKey::Record(sortable_key.clone())));
+        }
+
+        for (index_id, row_key) in index_rows_to_gc {
+            let RowKey::Record(sortable_key) = row_key else {
+                unreachable!("index row versions always have Record keys");
+            };
             let outer_entry = self
                 .mvstore
                 .index_rows
-                .get(index_id)
+                .get(&index_id)
                 .expect("index_id from write set must exist in index_rows");
             let inner_map = outer_entry.value();
             let is_now_empty = {
                 let inner_entry = inner_map
-                    .get(sortable_key)
+                    .get(&sortable_key)
                     .expect("index row from write set must exist in inner map");
                 let mut versions = inner_entry.value().write();
                 MvStore::<Clock>::gc_version_chain(&mut versions, lwm, ckpt_max);
                 versions.is_empty()
             };
             if is_now_empty {
-                inner_map.remove(sortable_key);
+                inner_map.remove(&sortable_key);
             }
         }
     }
