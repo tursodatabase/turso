@@ -1,4 +1,5 @@
 use crate::schema::{ColumnLayout, GeneratedType};
+use crate::translate::emitter::gencol;
 use crate::translate::optimizer::Optimizable;
 use crate::turso_debug_assert;
 use crate::{
@@ -56,6 +57,7 @@ use crate::{
     },
     CaptureDataChangesExt, Connection, LimboError, Result, VirtualTable,
 };
+use gencol::compute_virtual_columns;
 use std::num::NonZeroUsize;
 use turso_macros::turso_assert;
 use turso_parser::ast::{
@@ -500,12 +502,24 @@ pub fn translate_insert(
         &btree_table,
     );
 
+    let dml_ctx =
+        DmlColumnContext::from_column_reg_mapping(insertion.col_mappings.iter().map(|cm| {
+            (
+                cm.column,
+                if cm.column.is_rowid_alias() {
+                    insertion.key_register()
+                } else {
+                    cm.register
+                },
+            )
+        }));
+
     let has_before_triggers = !relevant_before_triggers.is_empty();
     if has_before_triggers {
         compute_virtual_columns(
             program,
-            &insertion.col_mappings,
-            insertion.key_register(),
+            insertion.col_mappings.iter().map(|cm| cm.column),
+            &dml_ctx,
             resolver,
         )?;
 
@@ -742,8 +756,8 @@ pub fn translate_insert(
         //TODO only compute the necessary virtual columns for CHECK and NOT NULL evaluation
         compute_virtual_columns(
             program,
-            &insertion.col_mappings,
-            insertion.key_register(),
+            insertion.col_mappings.iter().map(|cm| cm.column),
+            &dml_ctx,
             resolver,
         )?;
     }
@@ -904,8 +918,8 @@ pub fn translate_insert(
     if has_after_triggers {
         compute_virtual_columns(
             program,
-            &insertion.col_mappings,
-            insertion.key_register(),
+            insertion.col_mappings.iter().map(|cm| cm.column),
+            &dml_ctx,
             resolver,
         )?;
 
@@ -2674,43 +2688,6 @@ fn translate_column(
             dest_end: None,
         });
     }
-    Ok(())
-}
-
-fn self_table_ctx_from_col_mappings(
-    col_mappings: &[ColMapping],
-    rowid_reg: usize,
-) -> SelfTableContext {
-    let col_reg_mapping = col_mappings.iter().map(|cm| {
-        let reg = if cm.column.is_rowid_alias() {
-            rowid_reg
-        } else {
-            cm.register
-        };
-        (cm.column, reg)
-    });
-    SelfTableContext::ForDML(DmlColumnContext::from_column_reg_mapping(col_reg_mapping))
-}
-
-pub fn compute_virtual_columns<'a>(
-    program: &mut ProgramBuilder,
-    col_mappings: &[ColMapping<'a>],
-    rowid_alias: usize,
-    resolver: &Resolver,
-) -> Result<()> {
-    let ctx = self_table_ctx_from_col_mappings(col_mappings, rowid_alias);
-    for col_mapping in col_mappings {
-        if let GeneratedType::Virtual { resolved: expr, .. } = col_mapping.column.generated_type() {
-            program.with_self_table_context(Some(&ctx), |program, _| {
-                translate_expr(program, None, expr, col_mapping.register, resolver)?;
-                Ok(())
-            })?;
-            if col_mapping.column.affinity() != Affinity::Blob {
-                program.emit_column_affinity(col_mapping.register, col_mapping.column.affinity());
-            }
-        }
-    }
-
     Ok(())
 }
 

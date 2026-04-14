@@ -1,4 +1,4 @@
-use crate::schema::{ColumnLayout, GeneratedType};
+use crate::schema::{Column, ColumnLayout, GeneratedType};
 use crate::translate::expr::translate_expr;
 use crate::vdbe::affinity::Affinity;
 use crate::vdbe::builder::{DmlColumnContext, SelfTableContext};
@@ -8,14 +8,14 @@ use turso_parser::ast;
 use super::{ProgramBuilder, Resolver};
 
 /// Emit bytecode to compute all virtual generated columns for a row.
-pub fn compute_virtual_columns(
+pub fn compute_virtual_columns<'a>(
     program: &mut ProgramBuilder,
-    columns: &[crate::schema::Column],
+    columns: impl Iterator<Item = &'a Column>,
     dml_ctx: &DmlColumnContext,
     resolver: &Resolver,
 ) -> Result<()> {
     let ctx = SelfTableContext::ForDML(dml_ctx.clone());
-    for (idx, column) in columns.iter().enumerate() {
+    for (idx, column) in columns.enumerate() {
         let GeneratedType::Virtual { resolved: expr, .. } = column.generated_type() else {
             continue;
         };
