@@ -1,3 +1,10 @@
+use std::sync::Arc;
+
+use crate::error::LimboError;
+use crate::schema::TypeDef;
+use crate::types::IOResult;
+use crate::Result;
+use crate::{Connection, Database};
 use turso_macros::turso_assert;
 
 /// A representation of a row from `sqlite_schema`.
@@ -132,4 +139,275 @@ pub(crate) fn classify_schema_entries(
         indexes_to_create,
         post_data_entries,
     )
+}
+
+/// Configuration for the VACUUM INTO engine. Provided by the caller (opcode
+/// handler) after reading source metadata and setting up the destination DB.
+pub(crate) struct VacuumIntoConfig {
+    /// Source connection - used for `prepare_internal` and `with_schema` during
+    /// schema collection and data copy.
+    pub source_conn: Arc<Connection>,
+    /// Escaped schema name for safe SQL interpolation (e.g. `"main"`).
+    pub escaped_schema_name: String,
+    /// Database index for schema lookups on the source connection.
+    pub database_id: usize,
+    /// Source `user_version` pragma value to copy to destination.
+    pub source_user_version: i32,
+    /// Source `application_id` pragma value to copy to destination.
+    pub source_application_id: i32,
+    /// Pre-captured source custom type definitions for STRICT table replay.
+    pub source_custom_types: Vec<(String, Arc<TypeDef>)>,
+    /// Whether the source database has MVCC enabled.
+    pub source_mvcc_enabled: bool,
+}
+
+pub(crate) struct VacuumInto {
+    config: VacuumIntoConfig,
+    state: VacuumIntoState,
+}
+
+impl VacuumInto {
+    pub fn new(
+        config: VacuumIntoConfig,
+        dest_db: Arc<Database>,
+        dest_conn: Arc<Connection>,
+    ) -> Self {
+        Self {
+            config,
+            state: VacuumIntoState::new(dest_db, dest_conn),
+        }
+    }
+
+    pub fn step(&mut self) -> Result<IOResult<()>> {
+        vacuum_into_step(&self.config, &mut self.state)
+    }
+}
+
+/// State for the VACUUM INTO engine. Holds the destination connection and all
+/// intermediate state needed across async yields.
+struct VacuumIntoState {
+    /// Keep the destination database alive while VACUUM INTO is in progress.
+    #[allow(dead_code)]
+    dest_db: Arc<Database>,
+    /// Destination connection - lives here, not in each sub-state variant.
+    dest_conn: Arc<Connection>,
+    sub_state: VacuumIntoSubState,
+    /// Typed schema entries collected from sqlite_schema, ordered by rowid.
+    schema_entries: Vec<SchemaEntry>,
+    /// Storage-backed tables to CREATE (excludes sqlite_sequence).
+    tables_to_create: Vec<usize>,
+    /// Storage-backed tables whose data to copy.
+    tables_to_copy: Vec<usize>,
+    /// User-defined secondary indexes to CREATE (deferred for performance).
+    indexes_to_create: Vec<usize>,
+    /// Triggers, views, and rootpage = 0 objects (deferred to avoid trigger firing).
+    post_data_entries: Vec<usize>,
+}
+
+impl VacuumIntoState {
+    fn new(dest_db: Arc<Database>, dest_conn: Arc<Connection>) -> Self {
+        Self {
+            dest_db,
+            dest_conn,
+            sub_state: VacuumIntoSubState::Init,
+            schema_entries: Vec::new(),
+            tables_to_create: Vec::new(),
+            tables_to_copy: Vec::new(),
+            indexes_to_create: Vec::new(),
+            post_data_entries: Vec::new(),
+        }
+    }
+}
+
+/// Sub-states for the VACUUM INTO engine state machine.
+#[derive(Default)]
+enum VacuumIntoSubState {
+    /// Mirror symbols/types, set perf flags, begin dest tx, prepare schema query.
+    #[default]
+    Init,
+    /// Step through schema query to collect rows
+    CollectSchemaRows { schema_stmt: Box<crate::Statement> },
+    /// Prepare CREATE TABLE statement on destination (idx into tables_to_create)
+    PrepareCreateTable { idx: usize },
+    /// Step through CREATE TABLE statement on destination (async)
+    StepCreateTable {
+        dest_schema_stmt: Box<crate::Statement>,
+        idx: usize,
+    },
+    /// Start copying a table's data
+    StartCopyTable { table_idx: usize },
+    /// Select rows from source table and insert into destination
+    CopyRows {
+        select_stmt: Box<crate::Statement>,
+        dest_insert_stmt: Box<crate::Statement>,
+        table_idx: usize,
+    },
+    /// Step through INSERT statement on destination (async)
+    StepDestInsert {
+        select_stmt: Box<crate::Statement>,
+        dest_insert_stmt: Box<crate::Statement>,
+        table_idx: usize,
+    },
+    /// Copy meta values (user_version, application_id) from source to destination
+    CopyMetaValues,
+    /// Prepare CREATE INDEX statement on destination (idx into indexes_to_create)
+    PrepareCreateIndex { idx: usize },
+    /// Step through CREATE INDEX statement on destination (async)
+    StepCreateIndex {
+        dest_schema_stmt: Box<crate::Statement>,
+        idx: usize,
+    },
+    /// Prepare post-data schema objects (triggers, views, rootpage = 0 entries)
+    PreparePostData { idx: usize },
+    /// Step through post-data CREATE statement on destination
+    StepPostData {
+        dest_schema_stmt: Box<crate::Statement>,
+        idx: usize,
+    },
+    /// Operation complete
+    Done,
+}
+
+// ---------------------------------------------------------------------------
+// SQL generation for table data copy
+// ---------------------------------------------------------------------------
+
+// Build the SELECT and INSERT SQL strings for copying a table's data.
+//
+// Uses the in-memory `BTreeTable` column metadata from the schema to derive
+// the copy-column list. Virtual generated columns are excluded from both
+// SELECT and INSERT since they are computed, not stored. This keeps both
+// lists tied to the same stored-column model.
+//
+// For e.g. given a schema:
+// CREATE TABLE employees (
+//       id INTEGER PRIMARY KEY,
+//       name TEXT,
+//       salary INTEGER,
+//       bonus INTEGER GENERATED ALWAYS AS (salary * 0.1) VIRTUAL
+//   )
+//
+//   Output:
+//   - select_sql: SELECT rowid, "name", "salary" FROM "main"."employees"
+//   - insert_sql: INSERT INTO "main"."employees" (rowid, "name", "salary") VALUES (?, ?, ?)
+pub(crate) fn build_copy_sql(
+    escaped_schema_name: &str,
+    escaped_table_name: &str,
+    source_btree_table: Option<&crate::schema::BTreeTable>,
+) -> Result<(String, String)> {
+    let Some(btree) = source_btree_table else {
+        // Storage-backed tables must have schema metadata. If we get here,
+        // the schema is inconsistent - somewhere it has gone terribly wrong
+        return Err(LimboError::Corrupt(format!(
+            "no schema metadata for storage-backed table \"{escaped_table_name}\""
+        )));
+    };
+
+    // Collect non-virtual-generated columns with their quoted names.
+    let mut data_columns: Vec<String> = Vec::new();
+    let mut rowid_alias_col_idx: Option<usize> = None;
+    for (i, col) in btree.columns.iter().enumerate() {
+        if col.is_virtual_generated() {
+            continue;
+        }
+        if col.is_rowid_alias() {
+            rowid_alias_col_idx = Some(i);
+        }
+        let Some(name) = col.name.as_deref() else {
+            return Err(LimboError::Corrupt(format!(
+                "missing column name for table \"{escaped_table_name}\""
+            )));
+        };
+        let escaped = name.replace('"', "\"\"");
+        data_columns.push(format!("\"{escaped}\""));
+    }
+
+    if data_columns.is_empty() {
+        return Err(LimboError::Corrupt(
+            "found a table without any columns".to_string(),
+        ));
+    }
+
+    // Determine rowid handling: for has_rowid tables, we need to preserve the
+    // rowid. Find an alias name (rowid, _rowid_, or oid) that doesn't conflict
+    // with an actual column name.
+    let rowid_alias = if btree.has_rowid {
+        ["rowid", "_rowid_", "oid"]
+            .iter()
+            .copied()
+            .find(|alias| btree.get_column(alias).is_none())
+    } else {
+        None
+    };
+
+    // Build the column lists. If there's a rowid alias column (INTEGER PRIMARY KEY),
+    // we exclude it from the data columns and use the rowid alias instead, since
+    // the rowid alias column IS the rowid.
+    //
+    // Track bind_count explicitly instead of parsing the joined string - column
+    // names can contain commas inside quotes which would miscount.
+    let (select_cols, insert_cols, bind_count) = if let Some(alias) = rowid_alias {
+        if let Some(alias_idx) = rowid_alias_col_idx {
+            // Remove the rowid alias column from data_columns (it IS the rowid)
+            let mut filtered: Vec<&str> = Vec::new();
+            let mut col_physical_idx = 0;
+            for (i, col) in btree.columns.iter().enumerate() {
+                if col.is_virtual_generated() {
+                    continue;
+                }
+                if i != alias_idx {
+                    filtered.push(&data_columns[col_physical_idx]);
+                }
+                col_physical_idx += 1;
+            }
+            if filtered.is_empty() {
+                // Table only has the rowid alias column
+                (alias.to_string(), alias.to_string(), 1)
+            } else {
+                let count = filtered.len() + 1; // +1 for rowid alias
+                let cols = filtered.join(", ");
+                (
+                    format!("{alias}, {cols}"),
+                    format!("{alias}, {cols}"),
+                    count,
+                )
+            }
+        } else {
+            // has_rowid but no explicit alias column - prepend the chosen rowid
+            // pseudo-column to the stored column list.
+            let count = data_columns.len() + 1; // +1 for rowid alias
+            let cols = data_columns.join(", ");
+            (
+                format!("{alias}, {cols}"),
+                format!("{alias}, {cols}"),
+                count,
+            )
+        }
+    } else {
+        // Either WITHOUT ROWID, or a rowid table where all three pseudo-names
+        // are shadowed by real columns. In the shadowed case SQL cannot name
+        // the hidden rowid, and SQLite does not require rowid stability for
+        // tables without an INTEGER PRIMARY KEY during VACUUM.
+        let count = data_columns.len();
+        let cols = data_columns.join(", ");
+        (cols.clone(), cols, count)
+    };
+
+    // The first placeholder is just "?"; each later placeholder adds ", ?".
+    // Reserve 3 bytes per placeholder, then subtract the 2-byte separator that
+    // the first placeholder does not need.
+    let mut placeholders = String::with_capacity(bind_count.saturating_mul(3).saturating_sub(2));
+    for i in 0..bind_count {
+        if i > 0 {
+            placeholders.push_str(", ");
+        }
+        placeholders.push('?');
+    }
+
+    let select_sql =
+        format!("SELECT {select_cols} FROM \"{escaped_schema_name}\".\"{escaped_table_name}\"");
+    let insert_sql =
+        format!("INSERT INTO \"{escaped_table_name}\" ({insert_cols}) VALUES ({placeholders})");
+
+    Ok((select_sql, insert_sql))
 }
