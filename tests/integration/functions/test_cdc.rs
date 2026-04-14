@@ -17,9 +17,9 @@ fn replace_column_with_null(rows: Vec<Vec<Value>>, column: usize) -> Vec<Vec<Val
         .collect()
 }
 
-/// Normalize v2 CDC rows by replacing change_id (0), change_time (1), and change_txn_id (2)
-/// with Null. This makes assertions work for both MVCC and non-MVCC modes.
-fn normalize_cdc_v2_rows(rows: Vec<Vec<Value>>) -> Vec<Vec<Value>> {
+/// Normalize CDC rows by replacing change_id (0), change_time (1), and change_txn_id (2)
+/// with Null. Works for both v2 (9 cols) and v3 (10 cols).
+fn normalize_cdc_rows(rows: Vec<Vec<Value>>) -> Vec<Vec<Value>> {
     rows.into_iter()
         .map(|row| {
             row.into_iter()
@@ -30,8 +30,8 @@ fn normalize_cdc_v2_rows(rows: Vec<Vec<Value>>) -> Vec<Vec<Value>> {
         .collect()
 }
 
-/// A normalized v2 COMMIT row: change_type=2, everything else Null.
-fn v2_commit() -> Vec<Value> {
+/// A normalized v3 COMMIT row (10 cols): change_type=2, everything else Null.
+fn cdc_commit() -> Vec<Value> {
     vec![
         Value::Null,
         Value::Null,
@@ -42,12 +42,15 @@ fn v2_commit() -> Vec<Value> {
         Value::Null,
         Value::Null,
         Value::Null,
+        Value::Null,
     ]
 }
 
-/// Build a normalized v2 data row (change_id/time/txn_id replaced with Null).
-fn v2_row(
+/// Build a normalized v3 data row (change_id/time/txn_id replaced with Null).
+/// change_origin: 0=user, 1=FK action, 2=trigger.
+fn cdc_row(
     change_type: i64,
+    change_origin: i64,
     table: &str,
     id: i64,
     before: Option<Vec<u8>>,
@@ -59,6 +62,7 @@ fn v2_row(
         Value::Null,
         Value::Null,
         Value::Integer(change_type),
+        Value::Integer(change_origin),
         Value::Text(table.to_string()),
         Value::Integer(id),
         before.map_or(Value::Null, Value::Blob),
@@ -84,13 +88,13 @@ fn test_cdc_simple_id(db: TempDatabase) {
             vec![Value::Integer(10), Value::Integer(10)],
         ]
     );
-    let rows = normalize_cdc_v2_rows(limbo_exec_rows(&conn, "SELECT * FROM turso_cdc"));
+    let rows = normalize_cdc_rows(limbo_exec_rows(&conn, "SELECT * FROM turso_cdc"));
     assert_eq!(
         rows,
         vec![
-            v2_row(1, "t", 10, None, None, None),
-            v2_row(1, "t", 5, None, None, None),
-            v2_commit(),
+            cdc_row(1, 0, "t", 10, None, None, None),
+            cdc_row(1, 0, "t", 5, None, None, None),
+            cdc_commit(),
         ]
     );
 }
@@ -122,15 +126,16 @@ fn test_cdc_simple_before(db: TempDatabase) {
     conn.execute("UPDATE t SET y = 3 WHERE x = 1").unwrap();
     conn.execute("DELETE FROM t WHERE x = 3").unwrap();
     conn.execute("DELETE FROM t WHERE x = 1").unwrap();
-    let rows = normalize_cdc_v2_rows(limbo_exec_rows(&conn, "SELECT * FROM turso_cdc"));
+    let rows = normalize_cdc_rows(limbo_exec_rows(&conn, "SELECT * FROM turso_cdc"));
 
     assert_eq!(
         rows,
         vec![
-            v2_row(1, "t", 1, None, None, None),
-            v2_row(1, "t", 3, None, None, None),
-            v2_commit(),
-            v2_row(
+            cdc_row(1, 0, "t", 1, None, None, None),
+            cdc_row(1, 0, "t", 3, None, None, None),
+            cdc_commit(),
+            cdc_row(
+                0,
                 0,
                 "t",
                 1,
@@ -138,25 +143,27 @@ fn test_cdc_simple_before(db: TempDatabase) {
                 None,
                 None,
             ),
-            v2_commit(),
-            v2_row(
+            cdc_commit(),
+            cdc_row(
                 -1,
+                0,
                 "t",
                 3,
                 Some(record([Value::Integer(3), Value::Integer(4)])),
                 None,
                 None,
             ),
-            v2_commit(),
-            v2_row(
+            cdc_commit(),
+            cdc_row(
                 -1,
+                0,
                 "t",
                 1,
                 Some(record([Value::Integer(1), Value::Integer(3)])),
                 None,
                 None,
             ),
-            v2_commit(),
+            cdc_commit(),
         ]
     );
 }
@@ -172,29 +179,32 @@ fn test_cdc_simple_after(db: TempDatabase) {
     conn.execute("UPDATE t SET y = 3 WHERE x = 1").unwrap();
     conn.execute("DELETE FROM t WHERE x = 3").unwrap();
     conn.execute("DELETE FROM t WHERE x = 1").unwrap();
-    let rows = normalize_cdc_v2_rows(limbo_exec_rows(&conn, "SELECT * FROM turso_cdc"));
+    let rows = normalize_cdc_rows(limbo_exec_rows(&conn, "SELECT * FROM turso_cdc"));
 
     assert_eq!(
         rows,
         vec![
-            v2_row(
+            cdc_row(
                 1,
+                0,
                 "t",
                 1,
                 None,
                 Some(record([Value::Integer(1), Value::Integer(2)])),
                 None,
             ),
-            v2_row(
+            cdc_row(
                 1,
+                0,
                 "t",
                 3,
                 None,
                 Some(record([Value::Integer(3), Value::Integer(4)])),
                 None,
             ),
-            v2_commit(),
-            v2_row(
+            cdc_commit(),
+            cdc_row(
+                0,
                 0,
                 "t",
                 1,
@@ -202,11 +212,11 @@ fn test_cdc_simple_after(db: TempDatabase) {
                 Some(record([Value::Integer(1), Value::Integer(3)])),
                 None,
             ),
-            v2_commit(),
-            v2_row(-1, "t", 3, None, None, None),
-            v2_commit(),
-            v2_row(-1, "t", 1, None, None, None),
-            v2_commit(),
+            cdc_commit(),
+            cdc_row(-1, 0, "t", 3, None, None, None),
+            cdc_commit(),
+            cdc_row(-1, 0, "t", 1, None, None, None),
+            cdc_commit(),
         ]
     );
 }
@@ -222,29 +232,32 @@ fn test_cdc_simple_full(db: TempDatabase) {
     conn.execute("UPDATE t SET y = 3 WHERE x = 1").unwrap();
     conn.execute("DELETE FROM t WHERE x = 3").unwrap();
     conn.execute("DELETE FROM t WHERE x = 1").unwrap();
-    let rows = normalize_cdc_v2_rows(limbo_exec_rows(&conn, "SELECT * FROM turso_cdc"));
+    let rows = normalize_cdc_rows(limbo_exec_rows(&conn, "SELECT * FROM turso_cdc"));
 
     assert_eq!(
         rows,
         vec![
-            v2_row(
+            cdc_row(
                 1,
+                0,
                 "t",
                 1,
                 None,
                 Some(record([Value::Integer(1), Value::Integer(2)])),
                 None,
             ),
-            v2_row(
+            cdc_row(
                 1,
+                0,
                 "t",
                 3,
                 None,
                 Some(record([Value::Integer(3), Value::Integer(4)])),
                 None,
             ),
-            v2_commit(),
-            v2_row(
+            cdc_commit(),
+            cdc_row(
+                0,
                 0,
                 "t",
                 1,
@@ -257,25 +270,27 @@ fn test_cdc_simple_full(db: TempDatabase) {
                     Value::Integer(3)
                 ])),
             ),
-            v2_commit(),
-            v2_row(
+            cdc_commit(),
+            cdc_row(
                 -1,
+                0,
                 "t",
                 3,
                 Some(record([Value::Integer(3), Value::Integer(4)])),
                 None,
                 None,
             ),
-            v2_commit(),
-            v2_row(
+            cdc_commit(),
+            cdc_row(
                 -1,
+                0,
                 "t",
                 1,
                 Some(record([Value::Integer(1), Value::Integer(3)])),
                 None,
                 None,
             ),
-            v2_commit(),
+            cdc_commit(),
         ]
     );
 }
@@ -302,29 +317,29 @@ fn test_cdc_crud(db: TempDatabase) {
             vec![Value::Integer(5), Value::Integer(100)],
         ]
     );
-    let rows = normalize_cdc_v2_rows(limbo_exec_rows(&conn, "SELECT * FROM turso_cdc"));
+    let rows = normalize_cdc_rows(limbo_exec_rows(&conn, "SELECT * FROM turso_cdc"));
     assert_eq!(
         rows,
         vec![
             // INSERT INTO t VALUES (20, 20), (10, 10), (5, 1)
-            v2_row(1, "t", 20, None, None, None),
-            v2_row(1, "t", 10, None, None, None),
-            v2_row(1, "t", 5, None, None, None),
-            v2_commit(),
+            cdc_row(1, 0, "t", 20, None, None, None),
+            cdc_row(1, 0, "t", 10, None, None, None),
+            cdc_row(1, 0, "t", 5, None, None, None),
+            cdc_commit(),
             // UPDATE t SET y = 100 WHERE x = 5
-            v2_row(0, "t", 5, None, None, None),
-            v2_commit(),
+            cdc_row(0, 0, "t", 5, None, None, None),
+            cdc_commit(),
             // DELETE FROM t WHERE x > 5
-            v2_row(-1, "t", 10, None, None, None),
-            v2_row(-1, "t", 20, None, None, None),
-            v2_commit(),
+            cdc_row(-1, 0, "t", 10, None, None, None),
+            cdc_row(-1, 0, "t", 20, None, None, None),
+            cdc_commit(),
             // INSERT INTO t VALUES (1, 1)
-            v2_row(1, "t", 1, None, None, None),
-            v2_commit(),
+            cdc_row(1, 0, "t", 1, None, None, None),
+            cdc_commit(),
             // UPDATE t SET x = 2 WHERE x = 1 (rowid change: DELETE + INSERT + COMMIT)
-            v2_row(-1, "t", 1, None, None, None),
-            v2_row(1, "t", 2, None, None, None),
-            v2_commit(),
+            cdc_row(-1, 0, "t", 1, None, None, None),
+            cdc_row(1, 0, "t", 2, None, None, None),
+            cdc_commit(),
         ]
     );
 }
@@ -355,19 +370,19 @@ fn test_cdc_failed_op(db: TempDatabase) {
             vec![Value::Integer(7), Value::Integer(70)],
         ]
     );
-    let rows = normalize_cdc_v2_rows(limbo_exec_rows(&conn, "SELECT * FROM turso_cdc"));
+    let rows = normalize_cdc_rows(limbo_exec_rows(&conn, "SELECT * FROM turso_cdc"));
     assert_eq!(
         rows,
         vec![
             // INSERT INTO t VALUES (1, 10), (2, 20) — succeeds
-            v2_row(1, "t", 1, None, None, None),
-            v2_row(1, "t", 2, None, None, None),
-            v2_commit(),
+            cdc_row(1, 0, "t", 1, None, None, None),
+            cdc_row(1, 0, "t", 2, None, None, None),
+            cdc_commit(),
             // INSERT INTO t VALUES (3, 30), (4, 40), (5, 10) — fails, no CDC
             // INSERT INTO t VALUES (6, 60), (7, 70) — succeeds
-            v2_row(1, "t", 6, None, None, None),
-            v2_row(1, "t", 7, None, None, None),
-            v2_commit(),
+            cdc_row(1, 0, "t", 6, None, None, None),
+            cdc_row(1, 0, "t", 7, None, None, None),
+            cdc_commit(),
         ]
     );
 }
@@ -414,16 +429,16 @@ fn test_cdc_uncaptured_connection(db: TempDatabase) {
             vec![Value::Integer(7), Value::Integer(70)],
         ]
     );
-    let rows = normalize_cdc_v2_rows(limbo_exec_rows(&conn1, "SELECT * FROM turso_cdc"));
+    let rows = normalize_cdc_rows(limbo_exec_rows(&conn1, "SELECT * FROM turso_cdc"));
     assert_eq!(
         rows,
         vec![
-            v2_row(1, "t", 2, None, None, None),
-            v2_commit(),
-            v2_row(1, "t", 4, None, None, None),
-            v2_commit(),
-            v2_row(1, "t", 6, None, None, None),
-            v2_commit(),
+            cdc_row(1, 0, "t", 2, None, None, None),
+            cdc_commit(),
+            cdc_row(1, 0, "t", 4, None, None, None),
+            cdc_commit(),
+            cdc_row(1, 0, "t", 6, None, None, None),
+            cdc_commit(),
         ]
     );
 }
@@ -448,14 +463,14 @@ fn test_cdc_custom_table(db: TempDatabase) {
             vec![Value::Integer(2), Value::Integer(20)],
         ]
     );
-    let rows = normalize_cdc_v2_rows(limbo_exec_rows(&conn1, "SELECT * FROM custom_cdc"));
+    let rows = normalize_cdc_rows(limbo_exec_rows(&conn1, "SELECT * FROM custom_cdc"));
     assert_eq!(
         rows,
         vec![
-            v2_row(1, "t", 1, None, None, None),
-            v2_commit(),
-            v2_row(1, "t", 2, None, None, None),
-            v2_commit(),
+            cdc_row(1, 0, "t", 1, None, None, None),
+            cdc_commit(),
+            cdc_row(1, 0, "t", 2, None, None, None),
+            cdc_commit(),
         ]
     );
 }
@@ -483,15 +498,15 @@ fn test_cdc_ignore_changes_in_cdc_table(db: TempDatabase) {
     conn1
         .execute("DELETE FROM custom_cdc WHERE change_id < 2")
         .unwrap();
-    let rows = normalize_cdc_v2_rows(limbo_exec_rows(&conn1, "SELECT * FROM custom_cdc"));
+    let rows = normalize_cdc_rows(limbo_exec_rows(&conn1, "SELECT * FROM custom_cdc"));
     assert_eq!(
         rows,
         vec![
             // COMMIT from first INSERT (change_id=2 survived the delete)
-            v2_commit(),
+            cdc_commit(),
             // INSERT (2, 20) + COMMIT
-            v2_row(1, "t", 2, None, None, None),
-            v2_commit(),
+            cdc_row(1, 0, "t", 2, None, None, None),
+            cdc_commit(),
         ]
     );
 }
@@ -520,17 +535,17 @@ fn test_cdc_transaction(db: TempDatabase) {
     assert_eq!(rows, vec![vec![Value::Integer(3), Value::Integer(30)],]);
     let rows = limbo_exec_rows(&conn1, "SELECT * FROM q");
     assert_eq!(rows, vec![vec![Value::Integer(2), Value::Integer(200)],]);
-    let rows = normalize_cdc_v2_rows(limbo_exec_rows(&conn1, "SELECT * FROM custom_cdc"));
+    let rows = normalize_cdc_rows(limbo_exec_rows(&conn1, "SELECT * FROM custom_cdc"));
     assert_eq!(
         rows,
         vec![
             // Explicit transaction: no per-row COMMITs, one COMMIT at end
-            v2_row(1, "t", 1, None, None, None),
-            v2_row(1, "q", 2, None, None, None),
-            v2_row(1, "t", 3, None, None, None),
-            v2_row(-1, "t", 1, None, None, None),
-            v2_row(0, "q", 2, None, None, None),
-            v2_commit(),
+            cdc_row(1, 0, "t", 1, None, None, None),
+            cdc_row(1, 0, "q", 2, None, None, None),
+            cdc_row(1, 0, "t", 3, None, None, None),
+            cdc_row(-1, 0, "t", 1, None, None, None),
+            cdc_row(0, 0, "q", 2, None, None, None),
+            cdc_commit(),
         ]
     );
 }
@@ -550,16 +565,16 @@ fn test_cdc_ddl_in_explicit_transaction(db: TempDatabase) {
         .unwrap();
     conn.execute("COMMIT").unwrap();
 
-    let rows = normalize_cdc_v2_rows(limbo_exec_rows(&conn, "SELECT * FROM turso_cdc"));
+    let rows = normalize_cdc_rows(limbo_exec_rows(&conn, "SELECT * FROM turso_cdc"));
     assert_eq!(
         rows,
         vec![
             // All DDL and DML in explicit transaction: no per-statement COMMITs
-            v2_row(1, "sqlite_schema", 5, None, None, None), // CREATE TABLE t
-            v2_row(1, "t", 1, None, None, None),             // INSERT (1, 10)
-            v2_row(1, "t", 2, None, None, None),             // INSERT (2, 20)
-            v2_row(1, "sqlite_schema", 6, None, None, None), // CREATE TABLE q
-            v2_commit(),                                     // single COMMIT at end
+            cdc_row(1, 0, "sqlite_schema", 5, None, None, None), // CREATE TABLE t
+            cdc_row(1, 0, "t", 1, None, None, None),             // INSERT (1, 10)
+            cdc_row(1, 0, "t", 2, None, None, None),             // INSERT (2, 20)
+            cdc_row(1, 0, "sqlite_schema", 6, None, None, None), // CREATE TABLE q
+            cdc_commit(),                                        // single COMMIT at end
         ]
     );
 }
@@ -588,15 +603,15 @@ fn test_cdc_independent_connections(db: TempDatabase) {
             vec![Value::Integer(2), Value::Integer(20)]
         ]
     );
-    let rows = normalize_cdc_v2_rows(limbo_exec_rows(&conn1, "SELECT * FROM custom_cdc1"));
+    let rows = normalize_cdc_rows(limbo_exec_rows(&conn1, "SELECT * FROM custom_cdc1"));
     assert_eq!(
         rows,
-        vec![v2_row(1, "t", 1, None, None, None), v2_commit(),]
+        vec![cdc_row(1, 0, "t", 1, None, None, None), cdc_commit(),]
     );
-    let rows = normalize_cdc_v2_rows(limbo_exec_rows(&conn1, "SELECT * FROM custom_cdc2"));
+    let rows = normalize_cdc_rows(limbo_exec_rows(&conn1, "SELECT * FROM custom_cdc2"));
     assert_eq!(
         rows,
-        vec![v2_row(1, "t", 2, None, None, None), v2_commit(),]
+        vec![cdc_row(1, 0, "t", 2, None, None, None), cdc_commit(),]
     );
 }
 
@@ -634,32 +649,32 @@ fn test_cdc_independent_connections_different_cdc_not_ignore(db: TempDatabase) {
             vec![Value::Integer(4), Value::Integer(40)],
         ]
     );
-    let rows = normalize_cdc_v2_rows(limbo_exec_rows(&conn1, "SELECT * FROM custom_cdc1"));
+    let rows = normalize_cdc_rows(limbo_exec_rows(&conn1, "SELECT * FROM custom_cdc1"));
     assert_eq!(
         rows,
         vec![
             // COMMIT from first INSERT (change_id=1 was deleted)
-            v2_commit(),
+            cdc_commit(),
             // INSERT (2, 20) + COMMIT
-            v2_row(1, "t", 2, None, None, None),
-            v2_commit(),
+            cdc_row(1, 0, "t", 2, None, None, None),
+            cdc_commit(),
             // DELETE from custom_cdc2 + COMMIT
-            v2_row(-1, "custom_cdc2", 1, None, None, None),
-            v2_commit(),
+            cdc_row(-1, 0, "custom_cdc2", 1, None, None, None),
+            cdc_commit(),
         ]
     );
-    let rows = normalize_cdc_v2_rows(limbo_exec_rows(&conn2, "SELECT * FROM custom_cdc2"));
+    let rows = normalize_cdc_rows(limbo_exec_rows(&conn2, "SELECT * FROM custom_cdc2"));
     assert_eq!(
         rows,
         vec![
             // COMMIT from first INSERT (change_id=1 was deleted)
-            v2_commit(),
+            cdc_commit(),
             // INSERT (4, 40) + COMMIT
-            v2_row(1, "t", 4, None, None, None),
-            v2_commit(),
+            cdc_row(1, 0, "t", 4, None, None, None),
+            cdc_commit(),
             // DELETE from custom_cdc1 + COMMIT
-            v2_row(-1, "custom_cdc1", 1, None, None, None),
-            v2_commit(),
+            cdc_row(-1, 0, "custom_cdc1", 1, None, None, None),
+            cdc_commit(),
         ]
     );
 }
@@ -720,7 +735,7 @@ fn test_cdc_schema_changes(db: TempDatabase) {
     conn.execute("CREATE INDEX q_abc ON q(a, b, c)").unwrap();
     conn.execute("DROP TABLE t").unwrap();
     conn.execute("DROP INDEX q_abc").unwrap();
-    let rows = normalize_cdc_v2_rows(limbo_exec_rows(&conn, "SELECT * FROM turso_cdc"));
+    let rows = normalize_cdc_rows(limbo_exec_rows(&conn, "SELECT * FROM turso_cdc"));
 
     // turso_cdc_version table + its auto-index add 2 entries to sqlite_schema,
     // shifting rowids and rootpages by +2 compared to before version tracking
@@ -728,8 +743,9 @@ fn test_cdc_schema_changes(db: TempDatabase) {
         rows,
         vec![
             // CREATE TABLE t
-            v2_row(
+            cdc_row(
                 1,
+                0,
                 "sqlite_schema",
                 5,
                 None,
@@ -744,10 +760,11 @@ fn test_cdc_schema_changes(db: TempDatabase) {
                 ])),
                 None,
             ),
-            v2_commit(),
+            cdc_commit(),
             // CREATE TABLE q
-            v2_row(
+            cdc_row(
                 1,
+                0,
                 "sqlite_schema",
                 8,
                 None,
@@ -760,10 +777,11 @@ fn test_cdc_schema_changes(db: TempDatabase) {
                 ])),
                 None,
             ),
-            v2_commit(),
+            cdc_commit(),
             // CREATE INDEX t_q
-            v2_row(
+            cdc_row(
                 1,
+                0,
                 "sqlite_schema",
                 9,
                 None,
@@ -776,10 +794,11 @@ fn test_cdc_schema_changes(db: TempDatabase) {
                 ])),
                 None,
             ),
-            v2_commit(),
+            cdc_commit(),
             // CREATE INDEX q_abc
-            v2_row(
+            cdc_row(
                 1,
+                0,
                 "sqlite_schema",
                 10,
                 None,
@@ -792,10 +811,11 @@ fn test_cdc_schema_changes(db: TempDatabase) {
                 ])),
                 None,
             ),
-            v2_commit(),
+            cdc_commit(),
             // DROP TABLE t
-            v2_row(
+            cdc_row(
                 -1,
+                0,
                 "sqlite_schema",
                 5,
                 Some(record([
@@ -810,10 +830,11 @@ fn test_cdc_schema_changes(db: TempDatabase) {
                 None,
                 None,
             ),
-            v2_commit(),
+            cdc_commit(),
             // DROP INDEX q_abc
-            v2_row(
+            cdc_row(
                 -1,
+                0,
                 "sqlite_schema",
                 10,
                 Some(record([
@@ -826,9 +847,127 @@ fn test_cdc_schema_changes(db: TempDatabase) {
                 None,
                 None,
             ),
-            v2_commit(),
+            cdc_commit(),
         ]
     );
+}
+
+// TODO: cannot use mvcc because of indexes
+#[turso_macros::test()]
+fn test_cdc_schema_changes_triggers(db: TempDatabase) {
+    let conn = db.connect_limbo();
+    conn.execute("PRAGMA capture_data_changes_conn('full')")
+        .unwrap();
+    conn.execute("CREATE TABLE t(x, y)").unwrap();
+    conn.execute("CREATE TRIGGER t_ins AFTER INSERT ON t BEGIN SELECT 1; END")
+        .unwrap();
+    conn.execute("DROP TRIGGER t_ins").unwrap();
+    let rows = normalize_cdc_rows(limbo_exec_rows(&conn, "SELECT * FROM turso_cdc"));
+
+    assert_eq!(
+        rows,
+        vec![
+            // CREATE TABLE t
+            cdc_row(
+                1,
+                0,
+                "sqlite_schema",
+                5,
+                None,
+                Some(record([
+                    Value::Text("table".to_string()),
+                    Value::Text("t".to_string()),
+                    Value::Text("t".to_string()),
+                    Value::Integer(6),
+                    Value::Text("CREATE TABLE t (x, y)".to_string())
+                ])),
+                None,
+            ),
+            cdc_commit(),
+            // CREATE TRIGGER t_ins
+            cdc_row(
+                1,
+                0,
+                "sqlite_schema",
+                6,
+                None,
+                Some(record([
+                    Value::Text("trigger".to_string()),
+                    Value::Text("t_ins".to_string()),
+                    Value::Text("t".to_string()),
+                    Value::Integer(0),
+                    Value::Text(
+                        "CREATE TRIGGER t_ins AFTER INSERT ON t BEGIN SELECT 1; END".to_string()
+                    )
+                ])),
+                None,
+            ),
+            cdc_commit(),
+            // DROP TRIGGER t_ins
+            cdc_row(
+                -1,
+                0,
+                "sqlite_schema",
+                6,
+                Some(record([
+                    Value::Text("trigger".to_string()),
+                    Value::Text("t_ins".to_string()),
+                    Value::Text("t".to_string()),
+                    Value::Integer(0),
+                    Value::Text(
+                        "CREATE TRIGGER t_ins AFTER INSERT ON t BEGIN SELECT 1; END".to_string()
+                    )
+                ])),
+                None,
+                None,
+            ),
+            cdc_commit(),
+        ]
+    );
+}
+
+// Trigger-originated DML is captured in v3 with change_origin=2 (trigger).
+#[turso_macros::test()]
+fn test_cdc_trigger_originated_dml_has_origin(db: TempDatabase) {
+    let conn = db.connect_limbo();
+    conn.execute("CREATE TABLE t(x INTEGER PRIMARY KEY, y TEXT)")
+        .unwrap();
+    conn.execute("CREATE TABLE audit(op TEXT, val INTEGER)")
+        .unwrap();
+    conn.execute(
+        "CREATE TRIGGER t_after_insert AFTER INSERT ON t \
+         BEGIN INSERT INTO audit VALUES ('insert', NEW.x); END",
+    )
+    .unwrap();
+    conn.execute("PRAGMA capture_data_changes_conn('id')")
+        .unwrap();
+
+    // INSERT into t fires the trigger, which inserts into audit
+    conn.execute("INSERT INTO t VALUES (1, 'hello')").unwrap();
+
+    // Verify the trigger actually fired
+    let audit_rows = limbo_exec_rows(&conn, "SELECT * FROM audit");
+    assert_eq!(
+        audit_rows,
+        vec![vec![Value::Text("insert".to_string()), Value::Integer(1)]]
+    );
+
+    // CDC contains both: trigger INSERT (origin=2) runs first, then user INSERT (origin=0)
+    let cdc_rows = normalize_cdc_rows(limbo_exec_rows(&conn, "SELECT * FROM turso_cdc"));
+    // Trigger subprogram emits its own CDC + COMMIT, then user INSERT + COMMIT
+    assert_eq!(cdc_rows.len(), 4);
+    // trigger INSERT into audit: change_type=1, change_origin=2
+    assert_eq!(cdc_rows[0][3], Value::Integer(1));
+    assert_eq!(cdc_rows[0][4], Value::Integer(2));
+    assert_eq!(cdc_rows[0][5], Value::Text("audit".to_string()));
+    // COMMIT from trigger subprogram
+    assert_eq!(cdc_rows[1][3], Value::Integer(2));
+    // user INSERT into t: change_type=1, change_origin=0
+    assert_eq!(cdc_rows[2][3], Value::Integer(1));
+    assert_eq!(cdc_rows[2][4], Value::Integer(0));
+    assert_eq!(cdc_rows[2][5], Value::Text("t".to_string()));
+    // COMMIT from user statement
+    assert_eq!(cdc_rows[3][3], Value::Integer(2));
 }
 
 // TODO: cannot use mvcc because of indexes
@@ -841,7 +980,7 @@ fn test_cdc_schema_changes_alter_table(db: TempDatabase) {
         .unwrap();
     conn.execute("ALTER TABLE t DROP COLUMN q").unwrap();
     conn.execute("ALTER TABLE t ADD COLUMN t").unwrap();
-    let rows = normalize_cdc_v2_rows(limbo_exec_rows(&conn, "SELECT * FROM turso_cdc"));
+    let rows = normalize_cdc_rows(limbo_exec_rows(&conn, "SELECT * FROM turso_cdc"));
 
     // turso_cdc_version table + its auto-index add 2 entries to sqlite_schema,
     // shifting rowids and rootpages by +2 compared to before version tracking
@@ -849,8 +988,9 @@ fn test_cdc_schema_changes_alter_table(db: TempDatabase) {
         rows,
         vec![
             // CREATE TABLE t
-            v2_row(
+            cdc_row(
                 1,
+                0,
                 "sqlite_schema",
                 5,
                 None,
@@ -865,9 +1005,10 @@ fn test_cdc_schema_changes_alter_table(db: TempDatabase) {
                 ])),
                 None,
             ),
-            v2_commit(),
+            cdc_commit(),
             // ALTER TABLE t DROP COLUMN q
-            v2_row(
+            cdc_row(
+                0,
                 0,
                 "sqlite_schema",
                 5,
@@ -900,9 +1041,10 @@ fn test_cdc_schema_changes_alter_table(db: TempDatabase) {
                     Value::Text("ALTER TABLE t DROP COLUMN q".to_string())
                 ])),
             ),
-            v2_commit(),
+            cdc_commit(),
             // ALTER TABLE t ADD COLUMN t
-            v2_row(
+            cdc_row(
+                0,
                 0,
                 "sqlite_schema",
                 5,
@@ -935,7 +1077,7 @@ fn test_cdc_schema_changes_alter_table(db: TempDatabase) {
                     Value::Text("ALTER TABLE t ADD COLUMN t".to_string())
                 ])),
             ),
-            v2_commit(),
+            cdc_commit(),
         ]
     );
 }
@@ -1496,6 +1638,105 @@ fn test_cdc_preexisting_v1_table_writes_v1_format(db: TempDatabase) {
 }
 
 #[turso_macros::test]
+fn test_cdc_preexisting_v2_table_writes_v2_format(db: TempDatabase) {
+    let conn = db.connect_limbo();
+    conn.execute("CREATE TABLE t (x INTEGER PRIMARY KEY, y)")
+        .unwrap();
+
+    // Simulate a pre-existing v2 CDC table (9 columns) with version table
+    conn.execute(
+        "CREATE TABLE turso_cdc (change_id INTEGER PRIMARY KEY AUTOINCREMENT, change_time INTEGER, change_txn_id INTEGER, change_type INTEGER, table_name TEXT, id, before BLOB, after BLOB, updates BLOB)",
+    ).unwrap();
+    conn.execute(
+        "CREATE TABLE turso_cdc_version (table_name TEXT PRIMARY KEY, version TEXT NOT NULL)",
+    )
+    .unwrap();
+    conn.execute("INSERT INTO turso_cdc_version (table_name, version) VALUES ('turso_cdc', 'v2')")
+        .unwrap();
+
+    // Enable CDC — table already exists, InitCdcVersion reads version from table
+    conn.execute("PRAGMA capture_data_changes_conn('id')")
+        .unwrap();
+
+    // Verify version is v2
+    let rows = limbo_exec_rows(
+        &conn,
+        "SELECT version FROM turso_cdc_version WHERE table_name = 'turso_cdc'",
+    );
+    assert_eq!(rows, vec![vec![Value::Text("v2".to_string())]]);
+
+    // Insert — v2 format has 9 columns with change_txn_id and COMMIT records
+    conn.execute("INSERT INTO t VALUES (1, 10)").unwrap();
+
+    let rows = limbo_exec_rows(&conn, "SELECT * FROM turso_cdc");
+    // v2: 9 columns
+    assert_eq!(rows[0].len(), 9);
+    // Should have INSERT + COMMIT
+    assert_eq!(rows.len(), 2);
+    // change_type=1 (INSERT)
+    assert_eq!(rows[0][3], Value::Integer(1));
+    // change_type=2 (COMMIT)
+    assert_eq!(rows[1][3], Value::Integer(2));
+}
+
+#[turso_macros::test]
+fn test_cdc_preexisting_v3_table_writes_v3_format(db: TempDatabase) {
+    let conn = db.connect_limbo();
+    conn.execute("CREATE TABLE t (x INTEGER PRIMARY KEY, y)")
+        .unwrap();
+    conn.execute("CREATE TABLE audit(op TEXT, val INTEGER)")
+        .unwrap();
+    conn.execute(
+        "CREATE TRIGGER t_after_insert AFTER INSERT ON t \
+         BEGIN INSERT INTO audit VALUES ('insert', NEW.x); END",
+    )
+    .unwrap();
+
+    // Simulate a pre-existing v3 CDC table (10 columns) with version table
+    conn.execute(
+        "CREATE TABLE turso_cdc (change_id INTEGER PRIMARY KEY AUTOINCREMENT, change_time INTEGER, change_txn_id INTEGER, change_type INTEGER, change_origin INTEGER, table_name TEXT, id, before BLOB, after BLOB, updates BLOB)",
+    ).unwrap();
+    conn.execute(
+        "CREATE TABLE turso_cdc_version (table_name TEXT PRIMARY KEY, version TEXT NOT NULL)",
+    )
+    .unwrap();
+    conn.execute("INSERT INTO turso_cdc_version (table_name, version) VALUES ('turso_cdc', 'v3')")
+        .unwrap();
+
+    // Enable CDC
+    conn.execute("PRAGMA capture_data_changes_conn('id')")
+        .unwrap();
+
+    // Verify version is v3
+    let rows = limbo_exec_rows(
+        &conn,
+        "SELECT version FROM turso_cdc_version WHERE table_name = 'turso_cdc'",
+    );
+    assert_eq!(rows, vec![vec![Value::Text("v3".to_string())]]);
+
+    // Insert — trigger fires, both user and trigger DML should be captured
+    conn.execute("INSERT INTO t VALUES (1, 10)").unwrap();
+
+    let rows = limbo_exec_rows(&conn, "SELECT * FROM turso_cdc");
+    // v3: 10 columns
+    assert_eq!(rows[0].len(), 10);
+    // trigger INSERT + COMMIT, then user INSERT + COMMIT
+    assert_eq!(rows.len(), 4);
+    // Trigger INSERT: change_type=1, change_origin=2
+    assert_eq!(rows[0][3], Value::Integer(1));
+    assert_eq!(rows[0][4], Value::Integer(2));
+    assert_eq!(rows[0][5], Value::Text("audit".to_string()));
+    // Trigger COMMIT
+    assert_eq!(rows[1][3], Value::Integer(2));
+    // User INSERT: change_type=1, change_origin=0
+    assert_eq!(rows[2][3], Value::Integer(1));
+    assert_eq!(rows[2][4], Value::Integer(0));
+    assert_eq!(rows[2][5], Value::Text("t".to_string()));
+    // User COMMIT
+    assert_eq!(rows[3][3], Value::Integer(2));
+}
+
+#[turso_macros::test]
 fn test_cdc_drop_table_cleans_up_version(db: TempDatabase) {
     let conn = db.connect_limbo();
     conn.execute("CREATE TABLE t (x INTEGER PRIMARY KEY, y)")
@@ -1600,12 +1841,13 @@ fn test_cdc_v2_commit_record_fields(db: TempDatabase) {
     assert!(matches!(commit[2], Value::Integer(_)));
     // change_type = 2
     assert_eq!(commit[3], Value::Integer(2));
-    // table_name, id, before, after, updates are all NULL
+    // change_origin, table_name, id, before, after, updates are all NULL
     assert_eq!(commit[4], Value::Null);
     assert_eq!(commit[5], Value::Null);
     assert_eq!(commit[6], Value::Null);
     assert_eq!(commit[7], Value::Null);
     assert_eq!(commit[8], Value::Null);
+    assert_eq!(commit[9], Value::Null);
 }
 
 // Note: is_autocommit() and conn_txn_id() are internal functions and cannot be
@@ -1634,7 +1876,7 @@ fn test_cdc_v2_txn_id_reset_after_commit(db: TempDatabase) {
 }
 
 #[turso_macros::test]
-fn test_cdc_v2_schema_has_9_columns(db: TempDatabase) {
+fn test_cdc_v3_schema_has_10_columns(db: TempDatabase) {
     let conn = db.connect_limbo();
     conn.execute("CREATE TABLE t (x INTEGER PRIMARY KEY, y)")
         .unwrap();
@@ -1642,16 +1884,16 @@ fn test_cdc_v2_schema_has_9_columns(db: TempDatabase) {
         .unwrap();
     conn.execute("INSERT INTO t VALUES (1, 10)").unwrap();
 
-    // v2 CDC table should have 9 columns
+    // v3 CDC table should have 10 columns
     let rows = limbo_exec_rows(&conn, "SELECT * FROM turso_cdc LIMIT 1");
-    assert_eq!(rows[0].len(), 9);
+    assert_eq!(rows[0].len(), 10);
 
     // Verify column names via table_columns_json_array
     let rows = limbo_exec_rows(&conn, "SELECT table_columns_json_array('turso_cdc')");
     assert_eq!(
         rows,
         vec![vec![Value::Text(
-            r#"["change_id","change_time","change_txn_id","change_type","table_name","id","before","after","updates"]"#
+            r#"["change_id","change_time","change_txn_id","change_type","change_origin","table_name","id","before","after","updates"]"#
                 .to_string()
         )]]
     );
@@ -1666,15 +1908,16 @@ fn test_cdc_no_internal_table_changes(db: TempDatabase) {
     conn.execute("CREATE TABLE t(x)").unwrap();
     conn.execute("CREATE INDEX t_idx ON t(x)").unwrap();
 
-    let rows = normalize_cdc_v2_rows(limbo_exec_rows(&conn, "SELECT * FROM turso_cdc"));
+    let rows = normalize_cdc_rows(limbo_exec_rows(&conn, "SELECT * FROM turso_cdc"));
     // Only user DDL should appear — no records for turso_cdc, turso_cdc_version,
     // sqlite_sequence, or their auto-indexes. Those are created before CDC is active.
     assert_eq!(
         rows,
         vec![
             // CREATE TABLE t
-            v2_row(
+            cdc_row(
                 1,
+                0,
                 "sqlite_schema",
                 5,
                 None,
@@ -1687,10 +1930,11 @@ fn test_cdc_no_internal_table_changes(db: TempDatabase) {
                 ])),
                 None,
             ),
-            v2_commit(),
+            cdc_commit(),
             // CREATE INDEX t_idx ON t(x)
-            v2_row(
+            cdc_row(
                 1,
+                0,
                 "sqlite_schema",
                 6,
                 None,
@@ -1703,7 +1947,7 @@ fn test_cdc_no_internal_table_changes(db: TempDatabase) {
                 ])),
                 None,
             ),
-            v2_commit(),
+            cdc_commit(),
         ]
     );
 }
