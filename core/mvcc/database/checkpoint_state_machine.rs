@@ -212,7 +212,7 @@ fn sqlite_schema_btree_identity(version: &RowVersion) -> Option<SqliteSchemaBtre
     Some(SqliteSchemaBtreeIdentity { kind, root_page })
 }
 
-fn sqlite_schema_versions_refer_to_same_object(lhs: &RowVersion, rhs: &RowVersion) -> bool {
+fn sqlite_schema_versions_refer_to_btree(lhs: &RowVersion, rhs: &RowVersion) -> bool {
     sqlite_schema_btree_identity(lhs)
         .zip(sqlite_schema_btree_identity(rhs))
         .is_some_and(|(lhs_id, rhs_id)| lhs_id == rhs_id)
@@ -220,16 +220,13 @@ fn sqlite_schema_versions_refer_to_same_object(lhs: &RowVersion, rhs: &RowVersio
 
 /// A single `sqlite_schema` rowid can be reused across multiple row versions. Some of those
 /// transitions are metadata-only rewrites of the same B-tree object, while others represent a
-/// real object lifecycle boundary.
+/// real change that mutates the BTREE.
 ///
-/// Checkpoint needs to preserve ended schema versions only for lifecycle boundaries so it can
+/// Checkpoint needs to preserve ended schema versions only for the types of changes so it can
 /// register destroyed tables/indexes and skip stale recovered rows. Same-object rewrites, such as
 /// `ALTER TABLE ... RENAME COLUMN`, must collapse to the latest version; otherwise checkpoint
 /// treats one schema row chain as a DROP+CREATE pair and emits duplicate work for the same rowid.
-fn sqlite_schema_transition_crosses_object_boundary(
-    current: &RowVersion,
-    next: Option<&RowVersion>,
-) -> bool {
+fn is_schema_metadata_only_rewrite(current: &RowVersion, next: Option<&RowVersion>) -> bool {
     if current.end.is_none() {
         return false;
     }
@@ -239,7 +236,7 @@ fn sqlite_schema_transition_crosses_object_boundary(
     };
 
     match next {
-        Some(next) => !sqlite_schema_versions_refer_to_same_object(current, next),
+        Some(next) => !sqlite_schema_versions_refer_to_btree(current, next),
         None => true,
     }
 }
@@ -437,10 +434,7 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
 
                 if let Some(previous_version) = versions_to_checkpoint.last() {
                     let should_drop_previous = previous_version.end.is_some()
-                        && !sqlite_schema_transition_crosses_object_boundary(
-                            previous_version,
-                            Some(version),
-                        );
+                        && !is_schema_metadata_only_rewrite(previous_version, Some(version));
                     if should_drop_previous {
                         versions_to_checkpoint.pop();
                     }
@@ -1702,11 +1696,8 @@ mod tests {
                 root_page: 7,
             })
         );
-        assert!(sqlite_schema_versions_refer_to_same_object(&old, &new));
-        assert!(!sqlite_schema_transition_crosses_object_boundary(
-            &old,
-            Some(&new)
-        ));
+        assert!(sqlite_schema_versions_refer_to_btree(&old, &new));
+        assert!(!is_schema_metadata_only_rewrite(&old, Some(&new)));
     }
 
     #[test]
@@ -1714,11 +1705,8 @@ mod tests {
         let old = sqlite_schema_row_version(2, "table", "t", "t", 5, Some(1), Some(2));
         let new = sqlite_schema_row_version(2, "table", "t", "t", 5, Some(2), None);
 
-        assert!(sqlite_schema_versions_refer_to_same_object(&old, &new));
-        assert!(!sqlite_schema_transition_crosses_object_boundary(
-            &old,
-            Some(&new)
-        ));
+        assert!(sqlite_schema_versions_refer_to_btree(&old, &new));
+        assert!(!is_schema_metadata_only_rewrite(&old, Some(&new)));
     }
 
     #[test]
@@ -1726,22 +1714,15 @@ mod tests {
         let dropped = sqlite_schema_row_version(3, "index", "idx_t_v", "t", -4, Some(1), Some(2));
         let recreated = sqlite_schema_row_version(3, "index", "idx_t_v", "t", -5, Some(2), None);
 
-        assert!(!sqlite_schema_versions_refer_to_same_object(
-            &dropped, &recreated
-        ));
-        assert!(sqlite_schema_transition_crosses_object_boundary(
-            &dropped,
-            Some(&recreated)
-        ));
+        assert!(!sqlite_schema_versions_refer_to_btree(&dropped, &recreated));
+        assert!(is_schema_metadata_only_rewrite(&dropped, Some(&recreated)));
     }
 
     #[test]
     fn sqlite_schema_identity_detects_drop_without_successor() {
         let dropped = sqlite_schema_row_version(3, "index", "idx_t_v", "t", 11, Some(1), Some(2));
 
-        assert!(sqlite_schema_transition_crosses_object_boundary(
-            &dropped, None
-        ));
+        assert!(is_schema_metadata_only_rewrite(&dropped, None));
     }
 
     #[test]
@@ -1751,11 +1732,11 @@ mod tests {
             sqlite_schema_row_version(9, "trigger", "trg_t", "t", 0, Some(2), None);
 
         assert_eq!(sqlite_schema_btree_identity(&trigger), None);
-        assert!(!sqlite_schema_versions_refer_to_same_object(
+        assert!(!sqlite_schema_versions_refer_to_btree(
             &trigger,
             &rewritten_trigger
         ));
-        assert!(!sqlite_schema_transition_crosses_object_boundary(
+        assert!(!is_schema_metadata_only_rewrite(
             &trigger,
             Some(&rewritten_trigger)
         ));
@@ -1776,8 +1757,6 @@ mod tests {
         };
 
         assert_eq!(sqlite_schema_btree_identity(&tombstone), None);
-        assert!(!sqlite_schema_transition_crosses_object_boundary(
-            &tombstone, None
-        ));
+        assert!(!is_schema_metadata_only_rewrite(&tombstone, None));
     }
 }
