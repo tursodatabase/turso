@@ -15,7 +15,7 @@ use crate::{
         emitter::{MaterializedColumnRef, TransactionMode},
         plan::{ResultSetColumn, TableReferences},
     },
-    Arc, CaptureDataChangesInfo, Connection, VirtualTable,
+    Arc, CaptureDataChangesInfo, Connection, ProgramOrigin, VirtualTable,
 };
 
 // Keep distinct hash-table ids far from table internal ids to avoid collisions.
@@ -259,6 +259,7 @@ pub struct ProgramBuilder {
     init_label: BranchOffset,
     start_offset: BranchOffset,
     capture_data_changes_info: Option<CaptureDataChangesInfo>,
+    program_origin: ProgramOrigin,
     // TODO: when we support multiple dbs, this should be a write mask to track which DBs need to be written
     txn_mode: TransactionMode,
     /// Set of database IDs that need write transactions (for attached databases).
@@ -506,7 +507,14 @@ impl ProgramBuilder {
         capture_data_changes_info: Option<CaptureDataChangesInfo>,
         opts: ProgramBuilderOpts,
     ) -> Self {
-        ProgramBuilder::_new(query_mode, capture_data_changes_info, opts, None, false)
+        ProgramBuilder::_new(
+            query_mode,
+            capture_data_changes_info,
+            opts,
+            None,
+            false,
+            ProgramOrigin::User,
+        )
     }
     pub fn new_for_trigger(
         query_mode: QueryMode,
@@ -520,16 +528,24 @@ impl ProgramBuilder {
             opts,
             Some(trigger),
             true,
+            ProgramOrigin::Trigger,
         )
     }
-    /// Create a ProgramBuilder for a subprogram (FK actions, etc.) that runs within
+    /// Create a ProgramBuilder for a FK actions subprogram that runs within
     /// an existing transaction and doesn't emit Transaction instructions.
-    pub fn new_for_subprogram(
+    pub fn new_for_fk_subprogram(
         query_mode: QueryMode,
         capture_data_changes_info: Option<CaptureDataChangesInfo>,
         opts: ProgramBuilderOpts,
     ) -> Self {
-        ProgramBuilder::_new(query_mode, capture_data_changes_info, opts, None, true)
+        ProgramBuilder::_new(
+            query_mode,
+            capture_data_changes_info,
+            opts,
+            None,
+            true,
+            ProgramOrigin::ForeignKeyAction,
+        )
     }
     fn _new(
         query_mode: QueryMode,
@@ -537,6 +553,7 @@ impl ProgramBuilder {
         opts: ProgramBuilderOpts,
         trigger: Option<Arc<Trigger>>,
         is_subprogram: bool,
+        program_origin: ProgramOrigin,
     ) -> Self {
         Self {
             table_reference_counter: TableRefIdCounter::new(),
@@ -558,6 +575,7 @@ impl ProgramBuilder {
             init_label: BranchOffset::Placeholder,
             start_offset: BranchOffset::Placeholder,
             capture_data_changes_info,
+            program_origin,
             txn_mode: TransactionMode::None,
             write_databases: HashSet::default(),
             read_databases: HashSet::default(),
@@ -741,6 +759,10 @@ impl ProgramBuilder {
     /// Mark that this statement may throw an ABORT exception (mirrors SQLite's sqlite3MayAbort).
     pub fn set_may_abort(&mut self, may_abort: bool) {
         self.may_abort = may_abort;
+    }
+
+    pub fn program_origin(&self) -> ProgramOrigin {
+        self.program_origin
     }
 
     pub fn capture_data_changes_info(&self) -> &Option<CaptureDataChangesInfo> {

@@ -42,7 +42,10 @@ use crate::vdbe::affinity::Affinity;
 use crate::vdbe::builder::{CursorType, DmlColumnContext, ProgramBuilder, SelfTableContext};
 use crate::vdbe::insn::{to_u16, InsertFlags};
 use crate::vdbe::{insn::Insn, BranchOffset, CursorID};
-use crate::{bail_parse_error, Database, DatabaseCatalog, LimboError, Result, RwLock, SymbolTable};
+use crate::{
+    bail_parse_error, Database, DatabaseCatalog, LimboError, ProgramOrigin, Result, RwLock,
+    SymbolTable,
+};
 use crate::{CaptureDataChangesExt, Connection};
 use tracing::instrument;
 use turso_parser::ast::{
@@ -926,6 +929,11 @@ pub fn prepare_cdc_if_necessary(
     schema: &Schema,
     changed_table_name: &str,
 ) -> Result<Option<(usize, Arc<BTreeTable>)>> {
+    // replay of changes from triggers/fk actions is not safe in sync engine - so we ignore them in this version of CDC
+    match program.program_origin() {
+        ProgramOrigin::User => {}
+        ProgramOrigin::Trigger | ProgramOrigin::ForeignKeyAction => return Ok(None),
+    }
     let mode = program.capture_data_changes_info();
     let cdc_table = mode.table();
     let Some(cdc_table) = cdc_table else {

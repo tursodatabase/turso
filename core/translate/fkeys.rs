@@ -1432,7 +1432,7 @@ fn emit_fk_action_subprogram(
     ctx: &FkActionContext,
     description: &'static str,
 ) -> Result<()> {
-    let mut subprogram_builder = ProgramBuilder::new_for_subprogram(
+    let mut subprogram_builder = ProgramBuilder::new_for_fk_subprogram(
         QueryMode::Normal,
         program.capture_data_changes_info().clone(),
         FK_SUBPROGRAM_OPTS,

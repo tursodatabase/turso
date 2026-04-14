@@ -1744,6 +1744,13 @@ impl Database {
     }
 }
 
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum ProgramOrigin {
+    User,
+    ForeignKeyAction,
+    Trigger,
+}
+
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub enum CaptureDataChangesMode {
     Id,
