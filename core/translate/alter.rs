@@ -5,6 +5,10 @@ use turso_parser::{
     parser::Parser,
 };
 
+use super::{
+    schema::{validate_check_expr, SQLITE_TABLEID},
+    update::translate_update_for_schema_change,
+};
 use crate::{
     error::SQLITE_CONSTRAINT_CHECK,
     function::{AlterTableFunc, Func},
@@ -30,11 +34,6 @@ use crate::{
 };
 use either::Either;
 use rustc_hash::FxHashSet as HashSet;
-
-use super::{
-    schema::{validate_check_expr, SQLITE_TABLEID},
-    update::translate_update_for_schema_change,
-};
 
 fn validate(alter_table: &ast::AlterTableBody, table_name: &str) -> Result<()> {
     // Check if someone is trying to ALTER a system table
@@ -876,12 +875,10 @@ pub fn translate_alter_table(
 
             // Check if any virtual column depends on the dropped column
             {
-                let mut dropped_set = rustc_hash::FxHashSet::default();
-                dropped_set.insert(dropped_index);
                 let affected =
-                    crate::schema::columns_affected_by_update(&btree.columns, &dropped_set);
+                    crate::schema::columns_affected_by_update(&btree.columns, [dropped_index]);
                 for idx in &affected {
-                    if *idx != dropped_index && btree.columns[*idx].is_virtual_generated() {
+                    if idx != dropped_index && btree.columns[idx].is_virtual_generated() {
                         return Err(LimboError::ParseError(format!(
                             "error in table {table_name} after drop column: no such column: {column_name}"
                         )));

@@ -1357,15 +1357,78 @@ impl TableReferences {
     }
 }
 
-/// Tracks which columns are used in a query. Optimized for the common case
-/// of ≤64 columns (single u64), with heap-allocated overflow
+/// Tracks which columns are used in a query.
 pub type ColumnUsedMask = BitSet;
 
+//TODO instead of using this alias, ideally we wouldn't carry naked usize's around, and we would
+// have `ColumnID`, `UsedColumnID`, `TableID`, etc. aliases, just like we have `CursorID`.
+// Then, we can have types like `BitSet<ColumnID>` and type-safe associated functions.
+pub type ColumnMask = BitSet;
+
+/// Bitset optimized for the common case where all elements ≤64, with heap-allocated overflow.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
 pub struct BitSet {
     inline: u64,
     /// invariant: `overflow` is `None` iff no bits ≥ 64 are set.
     overflow: Option<Vec<u64>>,
+}
+
+/// This iterator, inspired by Kernighan's bit-counting algorighm, is `O(num_words + popcount)`
+/// for the whole bitset.
+pub struct BitSetIter<B: std::borrow::Borrow<BitSet>> {
+    bitset: B,
+    /// Remaining bits to drain from the word currently pointed at by `word`.
+    current: u64,
+    /// `0` = inline word, `1..=overflow.len()` = `overflow[word - 1]`.
+    word: usize,
+}
+
+impl<B: std::borrow::Borrow<BitSet>> Iterator for BitSetIter<B> {
+    type Item = usize;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            if self.current != 0 {
+                let bit = self.current.trailing_zeros() as usize;
+                self.current &= self.current - 1;
+                let base = if self.word == 0 {
+                    0
+                } else {
+                    BitSet::INLINE_BITS + (self.word - 1) * 64
+                };
+                return Some(base + bit);
+            }
+            self.word += 1;
+            let overflow = self.bitset.borrow().overflow.as_ref()?;
+            self.current = *overflow.get(self.word - 1)?;
+        }
+    }
+}
+
+impl<'a> IntoIterator for &'a BitSet {
+    type Item = usize;
+    type IntoIter = BitSetIter<&'a BitSet>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        BitSetIter {
+            current: self.inline,
+            bitset: self,
+            word: 0,
+        }
+    }
+}
+
+impl IntoIterator for BitSet {
+    type Item = usize;
+    type IntoIter = BitSetIter<BitSet>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        BitSetIter {
+            current: self.inline,
+            bitset: self,
+            word: 0,
+        }
+    }
 }
 
 impl BitSet {
@@ -1477,33 +1540,11 @@ impl BitSet {
     }
 
     pub fn iter(&self) -> impl Iterator<Item = usize> + '_ {
-        // this iterator, derived from Kernighan's bitcount algorithm, is O(num_words + popcount)
-        let mut inline = self.inline;
-        let inline_iter = std::iter::from_fn(move || {
-            if inline == 0 {
-                return None;
-            }
-            let bit = inline.trailing_zeros() as usize;
-            inline &= inline - 1; // clear lowest set bit
-            Some(bit)
-        });
-        let overflow_iter = self
-            .overflow
-            .iter()
-            .flat_map(|ov| ov.iter().enumerate())
-            .flat_map(|(word_idx, &word)| {
-                let mut w = word;
-                let base = Self::INLINE_BITS + word_idx * 64;
-                std::iter::from_fn(move || {
-                    if w == 0 {
-                        return None;
-                    }
-                    let bit = w.trailing_zeros() as usize;
-                    w &= w - 1; // clear lowest set bit
-                    Some(base + bit)
-                })
-            });
-        inline_iter.chain(overflow_iter)
+        BitSetIter {
+            current: self.inline,
+            bitset: self,
+            word: 0,
+        }
     }
 
     /// returns the number of set bits

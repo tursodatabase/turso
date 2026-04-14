@@ -15,6 +15,7 @@ use crate::translate::fkeys::{
     emit_fk_child_update_counters, emit_parent_key_change_checks, fire_fk_update_actions,
 };
 use crate::translate::insert::{format_unique_violation_desc, InsertEmitCtx};
+use crate::translate::plan::ColumnMask;
 use crate::translate::planner::ROWID_STRS;
 use crate::translate::trigger_exec::{
     fire_trigger, get_triggers_including_temp, has_triggers_including_temp, TriggerContext,
@@ -165,16 +166,15 @@ pub fn upsert_matches_rowid_alias(upsert: &Upsert, table: &Table) -> bool {
 fn collect_changed_cols(
     table: &Table,
     set_pairs: &[(usize, Box<ast::Expr>)],
-) -> (HashSet<usize>, bool) {
-    let mut cols_changed =
-        HashSet::with_capacity_and_hasher(table.columns().len(), Default::default());
+) -> (ColumnMask, bool) {
+    let mut cols_changed = ColumnMask::default();
     let mut rowid_changed = false;
     for (col_idx, _) in set_pairs {
         if let Some(c) = table.columns().get(*col_idx) {
             if c.is_rowid_alias() {
                 rowid_changed = true;
             } else {
-                cols_changed.insert(*col_idx);
+                cols_changed.set(*col_idx);
             }
         }
     }
@@ -185,7 +185,7 @@ fn collect_changed_cols(
 fn upsert_index_is_affected(
     table: &Table,
     idx: &Index,
-    changed_cols: &HashSet<usize>,
+    changed_cols: &ColumnMask,
     rowid_changed: bool,
 ) -> bool {
     if rowid_changed {
@@ -198,7 +198,7 @@ fn upsert_index_is_affected(
         .collect();
     let pm = referenced_index_cols(idx, table);
     for c in km.iter().chain(pm.iter()) {
-        if changed_cols.contains(c) {
+        if changed_cols.get(*c) {
             return true;
         }
     }
@@ -674,7 +674,7 @@ pub fn emit_upsert(
     // Fire BEFORE UPDATE triggers
     let upsert_database_id = ctx.database_id;
     let preserved_old_registers: Option<Vec<usize>> = if let Some(btree_table) = table.btree() {
-        let updated_column_indices: HashSet<usize> =
+        let updated_column_indices: ColumnMask =
             set_pairs.iter().map(|(col_idx, _)| *col_idx).collect();
         let relevant_before_update_triggers = get_triggers_including_temp(
             resolver,
@@ -1232,7 +1232,7 @@ pub fn emit_upsert(
 
     // Fire AFTER UPDATE triggers
     if let (Some(btree_table), Some(old_regs)) = (table.btree(), preserved_old_registers) {
-        let updated_column_indices: HashSet<usize> =
+        let updated_column_indices: ColumnMask =
             set_pairs.iter().map(|(col_idx, _)| *col_idx).collect();
         let relevant_triggers = get_triggers_including_temp(
             resolver,

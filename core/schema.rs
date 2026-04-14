@@ -142,7 +142,7 @@ use crate::storage::btree::{BTreeCursor, CursorTrait};
 use crate::sync::Arc;
 use crate::sync::Mutex;
 use crate::translate::collate::CollationSeq;
-use crate::translate::plan::{BitSet, ColumnUsedMask, Plan, TableReferences};
+use crate::translate::plan::{BitSet, ColumnMask, ColumnUsedMask, Plan, TableReferences};
 use crate::util::{
     module_args_from_sql, module_name_from_sql, type_from_name, UnparsedFromSqlIndex,
 };
@@ -2764,21 +2764,30 @@ pub fn collect_column_dependencies_of_expr(expr: &Expr, columns: &[Column]) -> H
 // columns_affected_by_update could just do a union of the dependencies of all columns.
 pub(crate) fn columns_affected_by_update(
     columns: &[Column],
-    updated_cols: &HashSet<usize>,
-) -> HashSet<usize> {
-    let mut affected = updated_cols.clone();
+    updated_cols: impl IntoIterator<Item = usize>,
+) -> ColumnMask {
+    let mut affected = ColumnMask::default();
+    for idx in updated_cols {
+        // We remove ROWID_SENTINEL because it would blow up ColumnMask (a dense bitset).
+        // Luckily, since the rowid column cannot be referenced by generated columns, it's safe to
+        // omit in this particular case.
+        if idx == ROWID_SENTINEL {
+            continue;
+        }
+        affected.set(idx);
+    }
     let mut changed = true;
     while changed {
         changed = false;
         for (idx, col) in columns.iter().enumerate() {
-            if affected.contains(&idx) {
+            if affected.get(idx) {
                 continue;
             }
             let GeneratedType::Virtual { ref expr, .. } = col.generated_type() else {
                 continue;
             };
             if expr_refers_one_of(expr, columns, &affected) {
-                affected.insert(idx);
+                affected.set(idx);
                 changed = true;
             }
         }
@@ -2848,7 +2857,7 @@ pub(crate) fn dependencies_of_columns(
 }
 
 /// Returns true if `expr` references any column in `target_set`.
-fn expr_refers_one_of(expr: &Expr, columns: &[Column], target_set: &HashSet<usize>) -> bool {
+fn expr_refers_one_of(expr: &Expr, columns: &[Column], target_set: &ColumnUsedMask) -> bool {
     let mut found = false;
     let _ = walk_expr(expr, &mut |e| {
         if found {
@@ -2856,18 +2865,18 @@ fn expr_refers_one_of(expr: &Expr, columns: &[Column], target_set: &HashSet<usiz
         }
         match e {
             Expr::Column { table, column, .. } if table.is_self_table() => {
-                found = target_set.contains(column);
+                found = target_set.get(*column);
                 Ok(WalkControl::Continue)
             }
             Expr::Id(name) | Expr::Name(name) => {
                 if let Some(idx) = find_column_index_by_name(columns, name.as_str()) {
-                    found = target_set.contains(&idx);
+                    found = target_set.get(idx);
                 }
                 Ok(WalkControl::Continue)
             }
             Expr::Qualified(_, col) | Expr::DoublyQualified(_, _, col) => {
                 if let Some(idx) = find_column_index_by_name(columns, col.as_str()) {
-                    found = target_set.contains(&idx);
+                    found = target_set.get(idx);
                 }
                 Ok(WalkControl::Continue)
             }
@@ -3712,7 +3721,7 @@ impl ResolvedFkRef {
     /// Returns if any referenced parent column can change when these column positions are updated.
     pub fn parent_key_may_change(
         &self,
-        updated_parent_positions: &HashSet<usize>,
+        updated_parent_positions: &ColumnMask,
         parent_tbl: &BTreeTable,
     ) -> bool {
         if self.parent_uses_rowid {
@@ -3723,32 +3732,32 @@ impl ResolvedFkRef {
                 .enumerate()
                 .find(|(_, c)| c.is_rowid_alias())
             {
-                return updated_parent_positions.contains(&idx);
+                return updated_parent_positions.get(idx);
             }
             // Without a rowid alias, a direct rowid update is represented separately with ROWID_SENTINEL
             return true;
         }
         let affected = columns_affected_by_update(&parent_tbl.columns, updated_parent_positions);
-        self.parent_pos.iter().any(|p| affected.contains(p))
+        self.parent_pos.iter().any(|p| affected.get(*p))
     }
 
     /// Returns if any child column of this FK is in `updated_child_positions`
     pub fn child_key_changed(
         &self,
-        updated_child_positions: &HashSet<usize>,
+        updated_child_positions: &ColumnMask,
         child_tbl: &BTreeTable,
     ) -> bool {
         if self
             .child_pos
             .iter()
-            .any(|p| updated_child_positions.contains(p))
+            .any(|p| updated_child_positions.get(*p))
         {
             return true;
         }
         // special case: if FK uses a rowid alias on child, and rowid changed
         if self.child_cols.len() == 1 {
             let (i, col) = child_tbl.get_column(&self.child_cols[0]).unwrap();
-            if col.is_rowid_alias() && updated_child_positions.contains(&i) {
+            if col.is_rowid_alias() && updated_child_positions.get(i) {
                 return true;
             }
         }
