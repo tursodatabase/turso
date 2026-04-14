@@ -2952,7 +2952,7 @@ pub(crate) fn validate_generated_expr(expr: &Expr) -> Result<()> {
 pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> Result<BTreeTable> {
     let table_name = normalize_ident(tbl_name);
     trace!("Creating table {}", table_name);
-    let mut has_rowid = true;
+    let has_rowid = true;
     let mut has_autoincrement = false;
     let mut primary_key_columns = vec![];
     let mut foreign_keys = vec![];
