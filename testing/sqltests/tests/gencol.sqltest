@@ -4335,3 +4335,106 @@ test update-virtual-not-null-transitive-deferred-trigger-abort {
 expect error {
     trigger rejects null
 }
+
+test gencol-virtual-join-inner-inner {
+    CREATE TABLE t1(a, b AS (a*2));
+    CREATE TABLE t2(x);
+    CREATE TABLE t3(y);
+    INSERT INTO t1(a) VALUES(1),(2),(3);
+    INSERT INTO t2 VALUES(1),(2),(3);
+    INSERT INTO t3 VALUES(1),(2),(3);
+    SELECT t1.a FROM t1 JOIN t2 ON t1.a = t2.x JOIN t3 ON t1.a = t3.y;
+}
+expect {
+    1
+    2
+    3
+}
+
+test gencol-virtual-join-left-inner {
+    CREATE TABLE t1(a, b AS (a*2));
+    CREATE TABLE t2(x);
+    CREATE TABLE t3(y);
+    INSERT INTO t1(a) VALUES(1),(2),(3);
+    INSERT INTO t2 VALUES(1),(2),(3);
+    INSERT INTO t3 VALUES(1),(2),(3);
+    SELECT t1.a FROM t1 LEFT JOIN t2 ON t1.a = t2.x JOIN t3 ON t1.a = t3.y;
+}
+expect {
+    1
+    2
+    3
+}
+
+test gencol-virtual-join-t1-second {
+    CREATE TABLE t1(a, b AS (a*2));
+    CREATE TABLE t2(x);
+    CREATE TABLE t3(y);
+    INSERT INTO t1(a) VALUES(1),(2),(3);
+    INSERT INTO t2 VALUES(1),(2),(3);
+    INSERT INTO t3 VALUES(1),(2),(3);
+    SELECT t1.a FROM t2 JOIN t1 ON t2.x = t1.a JOIN t3 ON t1.a = t3.y;
+}
+expect {
+    1
+    2
+    3
+}
+
+test gencol-virtual-join-two-table {
+    CREATE TABLE t1(a, b AS (a*2));
+    CREATE TABLE t2(x);
+    INSERT INTO t1(a) VALUES(1),(2),(3);
+    INSERT INTO t2 VALUES(1),(2),(3);
+    SELECT t1.a FROM t1 JOIN t2 ON t1.a = t2.x;
+}
+expect {
+    1
+    2
+    3
+}
+
+test gencol-virtual-join-cross {
+    CREATE TABLE t1(a, b AS (a*2));
+    CREATE TABLE t2(x);
+    CREATE TABLE t3(y);
+    INSERT INTO t1(a) VALUES(1),(2),(3);
+    INSERT INTO t2 VALUES(1),(2),(3);
+    INSERT INTO t3 VALUES(1),(2),(3);
+    SELECT t1.a FROM t1 CROSS JOIN t2 CROSS JOIN t3 WHERE t1.a = t2.x AND t2.x = t3.y;
+}
+expect {
+    1
+    2
+    3
+}
+
+test gencol-virtual-join-comma {
+    CREATE TABLE t1(a, b AS (a*2));
+    CREATE TABLE t2(x);
+    CREATE TABLE t3(y);
+    INSERT INTO t1(a) VALUES(1),(2),(3);
+    INSERT INTO t2 VALUES(1),(2),(3);
+    INSERT INTO t3 VALUES(1),(2),(3);
+    SELECT t1.a FROM t1, t2, t3 WHERE t1.a = t2.x AND t2.x = t3.y;
+}
+expect {
+    1
+    2
+    3
+}
+
+test gencol-virtual-join-all-left {
+    CREATE TABLE t1(a, b AS (a*2));
+    CREATE TABLE t2(x);
+    CREATE TABLE t3(y);
+    INSERT INTO t1(a) VALUES(1),(2),(3);
+    INSERT INTO t2 VALUES(1),(2),(3);
+    INSERT INTO t3 VALUES(1),(2),(3);
+    SELECT t1.a FROM t1 LEFT JOIN t2 ON t1.a = t2.x LEFT JOIN t3 ON t1.a = t3.y;
+}
+expect {
+    1
+    2
+    3
+}
