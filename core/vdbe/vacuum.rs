@@ -268,6 +268,161 @@ enum VacuumIntoSubState {
     Done,
 }
 
+/// VACUUM INTO - create a compacted copy of the database at the specified path.
+///
+/// This is an async state machine implementation that yields on I/O operations.
+/// The caller creates a new database at the destination path with matching
+/// page_size, reserved bytes, source feature flags, and schema-replay symbols.
+///
+/// It:
+/// 1. Mirrors source symbols and custom types to destination
+/// 2. Queries sqlite_schema for all schema objects including rootpage, ordered by rowid
+/// 3. Creates storage-backed tables (rootpage != 0) in destination, excluding
+///    sqlite_sequence (auto-created when AUTOINCREMENT tables are created)
+/// 4. Copies data for all storage-backed tables, including sqlite_stat1 and other
+///    internal storage-backed tables
+/// 5. Creates user-defined secondary indexes after data copy for performance
+///    (backing-btree indexes for custom index methods are excluded here)
+/// 6. Copies meta values (user_version, application_id) from source to destination
+/// 7. Creates triggers, views, and rootpage = 0 objects last (after data copy).
+///    Custom index methods (FTS, vector) recreate and backfill their backing
+///    indexes from the copied table data in this phase.
+fn vacuum_into_step(
+    config: &VacuumIntoConfig,
+    state: &mut VacuumIntoState,
+) -> Result<IOResult<()>> {
+    loop {
+        let current_sub_state = std::mem::take(&mut state.sub_state);
+
+        match current_sub_state {
+            VacuumIntoSubState::Init => {
+                // Mirror source symbols needed for schema replay (functions, vtab
+                // modules, index methods). We skip vtabs - those are live instances
+                // tied to the source connection and not needed for compiling schema SQL.
+                {
+                    let source_syms = config.source_conn.syms.read();
+                    let mut dest_syms = state.dest_conn.syms.write();
+                    dest_syms.functions.extend(
+                        source_syms
+                            .functions
+                            .iter()
+                            .map(|(k, v)| (k.clone(), v.clone())),
+                    );
+                    dest_syms.vtab_modules.extend(
+                        source_syms
+                            .vtab_modules
+                            .iter()
+                            .map(|(k, v)| (k.clone(), v.clone())),
+                    );
+                    dest_syms.index_methods.extend(
+                        source_syms
+                            .index_methods
+                            .iter()
+                            .map(|(k, v)| (k.clone(), v.clone())),
+                    );
+                }
+
+                // Mirror source custom type definitions into destination schema
+                // so that STRICT tables with custom type columns can resolve
+                // those types during CREATE TABLE replay.
+                if !config.source_custom_types.is_empty() {
+                    state.dest_conn.with_schema_mut(|dest_schema| {
+                        for (name, td) in &config.source_custom_types {
+                            dest_schema.type_registry.insert(name.clone(), td.clone());
+                        }
+                    });
+                }
+
+                // Enable MVCC on destination if source has it enabled
+                // Must be done before any schema operations to ensure the log file is created
+                if config.source_mvcc_enabled {
+                    state.dest_conn.execute("PRAGMA journal_mode = 'mvcc'")?;
+                }
+
+                // Performance optimizations for destination database (matches SQLite vacuum.c):
+                // 1. Disable fsync - destination is a new file, if crash occurs we just delete it
+                // 2. Disable foreign key checks - source data is already consistent
+                // These match SQLite's vacuum.c optimizations (PAGER_SYNCHRONOUS_OFF, ~SQLITE_ForeignKeys)
+                state.dest_conn.set_sync_mode(crate::SyncMode::Off);
+                state.dest_conn.set_foreign_keys_enabled(false);
+
+                // Wrap all operations in a single transaction for atomicity.
+                state.dest_conn.execute("BEGIN")?;
+
+                // Query sqlite_schema with rootpage, ordered by rowid.
+                // Exclude the MVCC metadata table - it is an internal artifact.
+                let escaped_schema_name = &config.escaped_schema_name;
+                let schema_sql = format!(
+                    "SELECT type, name, tbl_name, rootpage, sql \
+                     FROM \"{escaped_schema_name}\".sqlite_schema \
+                     WHERE sql IS NOT NULL AND name <> '{}' ORDER BY rowid",
+                    crate::mvcc::database::MVCC_META_TABLE_NAME
+                );
+                let schema_stmt = config.source_conn.prepare_internal(schema_sql.as_str())?;
+
+                state.sub_state = VacuumIntoSubState::CollectSchemaRows {
+                    schema_stmt: Box::new(schema_stmt),
+                };
+                continue;
+            }
+
+            VacuumIntoSubState::CollectSchemaRows { mut schema_stmt } => {
+                match schema_stmt.step()? {
+                    crate::StepResult::Row => {
+                        let row = schema_stmt
+                            .row()
+                            .expect("StepResult::Row but row() returned None");
+                        state.schema_entries.push(SchemaEntry::from_row(row)?);
+                        state.sub_state = VacuumIntoSubState::CollectSchemaRows { schema_stmt };
+                        continue;
+                    }
+                    crate::StepResult::Done => {
+                        // Classify schema entries into replay phases using rootpage.
+                        let (tables_create, tables_copy, indexes_create, post_data) =
+                            classify_schema_entries(&state.schema_entries);
+                        state.tables_to_create = tables_create;
+                        state.tables_to_copy = tables_copy;
+                        // Backing-btree indexes are implementation details of custom index
+                        // methods. i.e. when custom indexes are created, they are created automatically
+                        // The user-visible custom-index CREATE in post_data_entries
+                        // recreates and backfills those backing indexes from the copied rows.
+                        // for now, we will skip them
+                        state.indexes_to_create = indexes_create
+                            .into_iter()
+                            .filter(|entry_ordinal| {
+                                let entry = &state.schema_entries[*entry_ordinal];
+                                !config
+                                    .source_conn
+                                    .with_schema(config.database_id, |schema| {
+                                        schema
+                                            .get_index(&entry.tbl_name, &entry.name)
+                                            .is_some_and(|idx| idx.is_backing_btree_index())
+                                    })
+                            })
+                            .collect();
+                        state.post_data_entries = post_data;
+
+                        state.sub_state = VacuumIntoSubState::PrepareCreateTable { idx: 0 };
+                        continue;
+                    }
+                    crate::StepResult::IO => {
+                        let io = schema_stmt
+                            .take_io_completions()
+                            .expect("StepResult::IO returned but no completions available");
+                        state.sub_state = VacuumIntoSubState::CollectSchemaRows { schema_stmt };
+                        return Ok(IOResult::IO(io));
+                    }
+                    crate::StepResult::Busy | crate::StepResult::Interrupt => {
+                        return Err(LimboError::Busy);
+                    }
+                }
+            }
+
+            _ => todo!("VACUUM INTO engine phase not moved yet"),
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // SQL generation for table data copy
 // ---------------------------------------------------------------------------
