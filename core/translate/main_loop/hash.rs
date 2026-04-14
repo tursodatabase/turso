@@ -421,7 +421,9 @@ impl<'a, 'plan> PreparedHashBuild<'a, 'plan> {
                     .get(col_idx)
                     .map(|c| c.generated_type())
                 {
-                    Some(GeneratedType::Virtual { resolved: expr, .. }) => {
+                    Some(GeneratedType::Virtual { resolved: expr, .. })
+                        if !config.use_materialized_keys =>
+                    {
                         planner.program.with_self_table_context(
                             Some(&SelfTableContext::ForSelect {
                                 table_ref_id: build_table.internal_id,
@@ -444,9 +446,11 @@ impl<'a, 'plan> PreparedHashBuild<'a, 'plan> {
                             build_table.columns()[col_idx].affinity(),
                         );
                     }
-                    Some(GeneratedType::NotGenerated) | None => planner
-                        .program
-                        .emit_column_or_rowid(payload_source_cursor_id, col_idx, payload_reg + i),
+                    _ => planner.program.emit_column_or_rowid(
+                        payload_source_cursor_id,
+                        col_idx,
+                        payload_reg + i,
+                    ),
                 };
             }
             (

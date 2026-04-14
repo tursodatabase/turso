@@ -55,7 +55,9 @@ fn infer_type_from_expr(
 
 #[derive(Debug, Clone)]
 pub struct ResultSetColumn {
+    /// `a + 1` in `SELECT a + 1 FROM t`
     pub expr: ast::Expr,
+    /// `col` in `SELECT a AS col FROM t`
     pub alias: Option<String>,
     /// Original SQL expression text for display as column name.
     /// Only used when there is no explicit alias and the expression is not
