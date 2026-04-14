@@ -676,7 +676,7 @@ pub struct MaterializedBuildInput {
     /// Encoding mode for the materialized rows.
     pub mode: MaterializedBuildInputMode,
     /// Join-prefix table indices folded into this materialization.
-    pub prefix_tables: Vec<usize>,
+    pub prefix_tables: TableMask,
 }
 
 impl LimitCtx {

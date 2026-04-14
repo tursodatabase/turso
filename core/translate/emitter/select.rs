@@ -292,7 +292,7 @@ struct MaterializationSpec {
     build_table_idx: usize,
     probe_table_idx: usize,
     mode: MaterializedBuildInputMode,
-    prefix_tables: Vec<usize>,
+    prefix_tables: TableMask,
     key_exprs: Vec<Expr>,
     payload_columns: Vec<MaterializedColumnRef>,
 }
@@ -389,7 +389,7 @@ fn emit_materialized_build_inputs(
                 materialization_prefix(plan, hash_join_op.build_table_idx, probe_table_idx)?;
             let prefix_has_other_tables = included_tables
                 .iter()
-                .any(|table_idx| *table_idx != hash_join_op.build_table_idx);
+                .any(|table_idx| table_idx != hash_join_op.build_table_idx);
 
             if build_table_was_prior_probe || prefix_has_other_tables {
                 // Prior probe -> build chaining OR any multi-table prefix requires keys+payload
@@ -419,7 +419,7 @@ fn emit_materialized_build_inputs(
                     build_table_idx: hash_join_op.build_table_idx,
                     probe_table_idx,
                     mode: MaterializedBuildInputMode::RowidOnly,
-                    prefix_tables: Vec::new(),
+                    prefix_tables: TableMask::default(),
                     key_exprs: Vec::new(),
                     payload_columns: Vec::new(),
                 });
@@ -545,7 +545,7 @@ fn emit_materialized_build_inputs(
                 input
                     .prefix_tables
                     .iter()
-                    .all(|table_idx| !join_order_tables.contains(table_idx))
+                    .all(|table_idx| !join_order_tables.contains(&table_idx))
             })
         },
         "materialized build input prefix table still present in join order"
@@ -580,7 +580,7 @@ fn prune_join_order_for_materialized_inputs(
             continue;
         }
         if matches!(input.mode, MaterializedBuildInputMode::KeyPayload { .. }) {
-            tables_to_remove.extend(input.prefix_tables.iter().copied());
+            tables_to_remove.extend(input.prefix_tables.iter());
         }
     }
 
@@ -625,7 +625,7 @@ fn materialization_prefix(
     plan: &SelectPlan,
     build_table_idx: usize,
     probe_table_idx: usize,
-) -> Result<(Vec<JoinOrderMember>, Vec<usize>)> {
+) -> Result<(Vec<JoinOrderMember>, TableMask)> {
     let mut join_order = plan.join_order.clone();
     if join_order
         .iter()
@@ -664,17 +664,13 @@ fn materialization_prefix(
         });
     }
 
-    let mut included_tables: Vec<usize> =
-        prefix_join_order.iter().map(|m| m.original_idx).collect();
+    let mut included_tables: TableMask = prefix_join_order.iter().map(|m| m.original_idx).collect();
     for member in prefix_join_order.iter() {
         let table_ref = &plan.table_references.joined_tables()[member.original_idx];
         if let Operation::HashJoin(hash_join_op) = &table_ref.op {
-            included_tables.push(hash_join_op.build_table_idx);
+            included_tables.set(hash_join_op.build_table_idx);
         }
     }
-    included_tables.sort_unstable();
-    included_tables.dedup();
-
     Ok((prefix_join_order, included_tables))
 }
 
@@ -685,11 +681,11 @@ fn materialization_prefix(
 /// without seeking back into base tables.
 fn collect_materialized_payload_columns(
     plan: &SelectPlan,
-    included_tables: &[usize],
+    included_tables: &TableMask,
 ) -> Result<Vec<MaterializedColumnRef>> {
     let mut payload_columns: Vec<MaterializedColumnRef> = Vec::new();
     let mut seen: HashSet<MaterializedColumnRef> = HashSet::default();
-    for table_idx in included_tables.iter().copied() {
+    for table_idx in included_tables.iter() {
         let table = &plan.table_references.joined_tables()[table_idx];
         for col_idx in table.col_used_mask.iter() {
             let is_rowid_alias = table
@@ -777,10 +773,6 @@ fn build_materialized_build_input_plan(
     // this materialization subplan. Anything that depends on other tables
     // cannot be evaluated during those table scans.
     let join_prefix_mask: TableMask = join_order.iter().map(|m| m.original_idx).collect();
-    // Expressions can also reference build tables of earlier hash joins in this subplan,
-    // because those tables are available during probe loops. Use the broader "included"
-    // set when deciding which WHERE terms can be evaluated inside the materialization.
-    let eval_prefix_mask: TableMask = included_tables.into_iter().collect();
 
     // Clone WHERE terms for the materialization subplan. We cannot reuse the
     // parent plan's consumed flags because the optimizer may have consumed
@@ -794,7 +786,10 @@ fn build_materialized_build_input_plan(
             &plan.table_references,
             &plan.non_from_clause_subqueries,
         )?;
-        term.consumed = !eval_prefix_mask.contains_all_set_bits_of(&mask);
+        // Expressions can also reference build tables of earlier hash joins in this subplan,
+        // because those tables are available during probe loops. Use the broader "included"
+        // set when deciding which WHERE terms can be evaluated inside the materialization.
+        term.consumed = !included_tables.contains_all_set_bits_of(&mask);
     }
 
     // Clone table references and then "sanitize" each access method so that
