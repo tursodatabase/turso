@@ -166,15 +166,6 @@ enum SqliteSchemaBtreeKind {
     Index,
 }
 
-impl SqliteSchemaBtreeKind {
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::Table => "table",
-            Self::Index => "index",
-        }
-    }
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct SqliteSchemaBtreeIdentity {
     kind: SqliteSchemaBtreeKind,
@@ -220,6 +211,14 @@ fn sqlite_schema_versions_refer_to_same_object(lhs: &RowVersion, rhs: &RowVersio
         .is_some_and(|(lhs_id, rhs_id)| lhs_id == rhs_id)
 }
 
+/// A single `sqlite_schema` rowid can be reused across multiple row versions. Some of those
+/// transitions are metadata-only rewrites of the same B-tree object, while others represent a
+/// real object lifecycle boundary.
+///
+/// Checkpoint needs to preserve ended schema versions only for lifecycle boundaries so it can
+/// register destroyed tables/indexes and skip stale recovered rows. Same-object rewrites, such as
+/// `ALTER TABLE ... RENAME COLUMN`, must collapse to the latest version; otherwise checkpoint
+/// treats one schema row chain as a DROP+CREATE pair and emits duplicate work for the same rowid.
 fn sqlite_schema_transition_crosses_object_boundary(
     current: &RowVersion,
     next: Option<&RowVersion>,
@@ -420,14 +419,30 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
             let should_checkpoint =
                 is_uncheckpointed_insert || is_delete_and_exists_in_db_file || is_schema_delete;
             if should_checkpoint {
-                if versions_to_checkpoint.is_empty() || table_id == SQLITE_SCHEMA_MVCC_TABLE_ID {
-                    versions_to_checkpoint.push(version.clone());
-                } else if table_id != SQLITE_SCHEMA_MVCC_TABLE_ID {
-                    // For non schema rows we only maintain the latest version
-                    versions_to_checkpoint[0] = version.clone();
+                if table_id != SQLITE_SCHEMA_MVCC_TABLE_ID {
+                    if versions_to_checkpoint.is_empty() {
+                        versions_to_checkpoint.push(version.clone())
+                    } else {
+                        versions_to_checkpoint[0] = version.clone()
+                    }
+                    continue;
                 }
+
+                if let Some(previous_version) = versions_to_checkpoint.last() {
+                    let should_drop_previous = previous_version.end.is_some()
+                        && !sqlite_schema_transition_crosses_object_boundary(
+                            previous_version,
+                            Some(version),
+                        );
+                    if should_drop_previous {
+                        versions_to_checkpoint.pop();
+                    }
+                }
+
+                versions_to_checkpoint.push(version.clone());
             }
         }
+
         versions_to_checkpoint
     }
 
