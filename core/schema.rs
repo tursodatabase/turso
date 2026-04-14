@@ -2774,10 +2774,10 @@ pub(crate) fn columns_affected_by_update(
             if affected.contains(&idx) {
                 continue;
             }
-            let GeneratedType::Virtual { ref resolved, .. } = col.generated_type() else {
+            let GeneratedType::Virtual { ref expr, .. } = col.generated_type() else {
                 continue;
             };
-            if expr_refers_one_of(resolved, columns, &affected) {
+            if expr_refers_one_of(expr, columns, &affected) {
                 affected.insert(idx);
                 changed = true;
             }
@@ -2833,8 +2833,8 @@ pub(crate) fn dependencies_of_columns(
                 continue;
             }
             visited.set(idx);
-            if let GeneratedType::Virtual { ref resolved, .. } = columns[idx].generated_type() {
-                collect_column_dependencies_of_gencol(resolved, columns, &mut next);
+            if let GeneratedType::Virtual { ref expr, .. } = columns[idx].generated_type() {
+                collect_column_dependencies_of_gencol(expr, columns, &mut next);
             } else {
                 dependencies.set(idx);
             }
@@ -2909,11 +2909,11 @@ fn has_transitive_dependency_inner(
         return false;
     };
 
-    let GeneratedType::Virtual { ref resolved, .. } = col.generated_type() else {
+    let GeneratedType::Virtual { ref expr, .. } = col.generated_type() else {
         return false;
     };
 
-    let deps = collect_column_refs(resolved);
+    let deps = collect_column_refs(expr);
 
     if deps.contains(target) {
         return true;
@@ -3784,7 +3784,7 @@ pub enum GeneratedType {
     /// `Expr::Column { table: SELF_TABLE }` for use at compile time.
     /// `original_sql` preserves the original SQL text for `to_sql()` round-tripping.
     Virtual {
-        resolved: Box<Expr>,
+        expr: Box<Expr>,
         original_sql: String,
     },
     // Stored { resolved: Box<Expr>, original_sql: String },
@@ -3893,10 +3893,7 @@ impl Column {
         let generated_type = match generated {
             Some(expr) => {
                 let original_sql = expr.to_string();
-                GeneratedType::Virtual {
-                    resolved: expr,
-                    original_sql,
-                }
+                GeneratedType::Virtual { expr, original_sql }
             }
             None => GeneratedType::NotGenerated,
         };
@@ -4017,7 +4014,7 @@ impl Column {
     #[inline]
     pub fn generated_expr(&self) -> Option<&Expr> {
         match &self.generated_type {
-            GeneratedType::Virtual { resolved, .. } => Some(resolved.as_ref()),
+            GeneratedType::Virtual { expr, .. } => Some(expr.as_ref()),
             GeneratedType::NotGenerated => None,
         }
     }
@@ -4025,7 +4022,7 @@ impl Column {
     #[inline]
     pub fn generated_expr_mut(&mut self) -> Option<&mut Expr> {
         match &mut self.generated_type {
-            GeneratedType::Virtual { resolved, .. } => Some(resolved.as_mut()),
+            GeneratedType::Virtual { expr, .. } => Some(expr.as_mut()),
             GeneratedType::NotGenerated => None,
         }
     }

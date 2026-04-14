@@ -156,7 +156,7 @@ impl DmlColumnContext {
             if col.is_rowid_alias() {
                 rowid_alias_col = Some(idx);
             }
-            if let GeneratedType::Virtual { resolved, .. } = col.generated_type() {
+            if let GeneratedType::Virtual { expr: resolved, .. } = col.generated_type() {
                 virtual_mask.set(idx);
                 virtual_data.push((resolved.clone(), col.affinity()));
             }
@@ -184,9 +184,9 @@ impl DmlColumnContext {
             if col.is_rowid_alias() {
                 rowid_alias_col = Some(idx);
             }
-            if let GeneratedType::Virtual { resolved, .. } = col.generated_type() {
+            if let GeneratedType::Virtual { expr, .. } = col.generated_type() {
                 virtual_mask.set(idx);
-                virtual_data.push((resolved.clone(), col.affinity()));
+                virtual_data.push((expr.clone(), col.affinity()));
             }
         }
         Self {
