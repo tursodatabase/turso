@@ -4762,6 +4762,22 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                         // serialized before the schema INSERT that registers the table_id.
                         self.insert_table_id_to_rootpage(rowid.table_id, None);
                     }
+                    let tombstone_row = if rowid.table_id == SQLITE_SCHEMA_MVCC_TABLE_ID {
+                        let rowid_int = rowid.row_id.to_int_or_panic();
+                        if let Some(record) = schema_rows.get(&rowid_int) {
+                            // Preserve the pre-delete sqlite_schema record in recovered
+                            // tombstones so checkpoint can still recover B-tree identity.
+                            Row::new_table_row(
+                                rowid.clone(),
+                                record.as_blob().clone(),
+                                record.column_count(),
+                            )
+                        } else {
+                            Row::new_table_row(rowid.clone(), Vec::new(), 0)
+                        }
+                    } else {
+                        Row::new_table_row(rowid.clone(), Vec::new(), 0)
+                    };
                     if let Some(versions) = self.rows.get(&rowid) {
                         // Row exists in memory — try to find the current (non-ended) version
                         // that was committed before this delete, and mark it as ended. If no
@@ -4775,24 +4791,22 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                             existing.end = Some(TxTimestampOrID::Timestamp(commit_ts));
                         } else {
                             let version_id = self.get_version_id();
-                            let row = Row::new_table_row(rowid.clone(), Vec::new(), 0);
                             let row_version = RowVersion {
                                 id: version_id,
                                 begin: None,
                                 end: Some(TxTimestampOrID::Timestamp(commit_ts)),
-                                row,
+                                row: tombstone_row.clone(),
                                 btree_resident,
                             };
                             self.insert_version_raw(&mut versions, row_version);
                         }
                     } else {
                         let version_id = self.get_version_id();
-                        let row = Row::new_table_row(rowid.clone(), Vec::new(), 0);
                         let row_version = RowVersion {
                             id: version_id,
                             begin: None,
                             end: Some(TxTimestampOrID::Timestamp(commit_ts)),
-                            row,
+                            row: tombstone_row,
                             btree_resident,
                         };
                         let versions = self

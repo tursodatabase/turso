@@ -8919,7 +8919,6 @@ fn test_checkpoint_recovers_after_crash_restart_drop_recreate_index() {
     conn.execute("CREATE INDEX idx_t_v ON t(v)").unwrap();
     conn.execute("INSERT INTO t VALUES (2, 'post_2', hex(randomblob(16)))")
         .unwrap();
-    dbg!("herere");
     conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
 
     let rows = get_rows(&conn, "SELECT id, v FROM t ORDER BY id");
@@ -8943,4 +8942,54 @@ fn test_checkpoint_recovers_after_crash_restart_drop_recreate_index() {
     assert_eq!(rows[0][1].to_string(), "seed_1");
     assert_eq!(rows[1][0].as_int().unwrap(), 2);
     assert_eq!(rows[1][1].to_string(), "post_2");
+}
+
+/// Reproducer for recovery of a dropped checkpointed index.
+///
+/// Sequence:
+/// 1. Create and checkpoint a table plus index.
+/// 2. Drop the checkpointed index.
+/// 3. Simulate an abrupt process death before checkpoint.
+/// 4. Restart and checkpoint.
+///
+/// Recovery must preserve the deleted sqlite_schema record so checkpoint can
+/// retire the dropped index without losing its object identity.
+#[test]
+fn test_checkpoint_recovers_after_restart_drop_checkpointed_index() {
+    let mut db = MvccTestDbNoConn::new_with_random_db();
+
+    {
+        let conn = db.connect();
+        conn.execute("PRAGMA mvcc_checkpoint_threshold = 1000000")
+            .unwrap();
+        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")
+            .unwrap();
+        conn.execute("CREATE INDEX idx_t_v ON t(v)").unwrap();
+        conn.execute("INSERT INTO t VALUES (1, 'seed_1')").unwrap();
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+        conn.execute("DROP INDEX idx_t_v").unwrap();
+    }
+
+    force_close_for_artifact_tamper(&mut db);
+    db.restart();
+
+    let conn = db.connect();
+    conn.execute("PRAGMA mvcc_checkpoint_threshold = 1000000")
+        .unwrap();
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+
+    let rows = get_rows(&conn, "SELECT id, v FROM t ORDER BY id");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0][0].as_int().unwrap(), 1);
+    assert_eq!(rows[0][1].to_string(), "seed_1");
+
+    let rows = get_rows(
+        &conn,
+        "SELECT name FROM sqlite_schema WHERE type = 'index' AND name = 'idx_t_v'",
+    );
+    assert_eq!(rows.len(), 0);
+
+    let rows = get_rows(&conn, "PRAGMA integrity_check");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(&rows[0][0].to_string(), "ok");
 }

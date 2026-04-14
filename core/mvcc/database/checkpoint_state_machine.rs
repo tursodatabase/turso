@@ -180,10 +180,17 @@ fn sqlite_schema_btree_identity(version: &RowVersion) -> Option<SqliteSchemaBtre
         return None;
     }
 
+    // Recovery can synthesize payload-less sqlite_schema tombstones when the
+    // pre-delete record is no longer available. Those versions do not carry
+    // enough information to recover B-tree identity.
+    if version.row.payload().is_empty() {
+        return None;
+    }
+
     let row_data = ImmutableRecord::from_bin_record(version.row.payload().to_vec());
-    let (col0, col3) = row_data
-        .get_two_values(0, 3)
-        .expect("failed to get columns 0 and 3 (type, rootpage) from sqlite_schema");
+    let Ok((col0, col3)) = row_data.get_two_values(0, 3) else {
+        return None;
+    };
 
     let kind = match col0 {
         ValueRef::Text(type_str) => match type_str.as_str() {
@@ -1735,6 +1742,26 @@ mod tests {
         assert!(!sqlite_schema_transition_crosses_object_boundary(
             &trigger,
             Some(&rewritten_trigger)
+        ));
+    }
+
+    #[test]
+    fn sqlite_schema_identity_ignores_payloadless_tombstones() {
+        let tombstone = RowVersion {
+            id: 1,
+            begin: None,
+            end: Some(TxTimestampOrID::Timestamp(2)),
+            row: Row::new_table_row(
+                RowID::new(SQLITE_SCHEMA_MVCC_TABLE_ID, RowKey::Int(9)),
+                Vec::new(),
+                0,
+            ),
+            btree_resident: false,
+        };
+
+        assert_eq!(sqlite_schema_btree_identity(&tombstone), None);
+        assert!(!sqlite_schema_transition_crosses_object_boundary(
+            &tombstone, None
         ));
     }
 }
