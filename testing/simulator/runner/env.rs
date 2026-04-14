@@ -1120,6 +1120,10 @@ impl SimulatorEnv {
                     conn.execute(format!("PRAGMA cache_size = {}", self.opts.cache_size))
                         .expect("set pragma cache_size");
                 }
+                if matches!(self.io_backend, IoBackend::Memory) {
+                    conn.execute("PRAGMA temp_store = MEMORY")
+                        .expect("set pragma temp_store");
+                }
                 self.connections[connection_index] = SimConnection::LimboConnection(conn);
             }
             SimulationType::Differential => {

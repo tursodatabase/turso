@@ -221,6 +221,12 @@ impl SimIO for MemorySimIO {
         for (file_path, file) in files.iter() {
             if file_path.ends_with(".db") || file_path.ends_with("wal") || file_path.ends_with("lg")
             {
+                let path = std::path::Path::new(file_path);
+                if path.parent().is_some_and(|p| !p.exists()) {
+                    // Skip files whose parent directory was cleaned up (e.g. temp
+                    // tables whose TempDir has been dropped).
+                    continue;
+                }
                 std::fs::write(file_path, &*file.buffer.borrow())?;
             }
         }

@@ -380,16 +380,8 @@ impl Connection {
             let temp_path_str = temp_path.to_str().ok_or_else(|| {
                 LimboError::InternalError("temp db path is not valid UTF-8".into())
             })?;
-            // TEMP uses a separate pager/database object, but statement
-            // execution only pumps the root statement pager's IO. A fresh
-            // async backend here (for example a second io_uring instance)
-            // can yield completions that nobody advances, hanging simple
-            // statements like `CREATE TEMP TABLE` on re-entry. Keep temp DBs
-            // on the synchronous filesystem backend until the runtime can
-            // drive multiple IO engines per statement.
-            let io: Arc<dyn IO> = Arc::new(crate::PlatformIO::new()?);
             let db = Database::open_file_with_flags(
-                io,
+                self.db.io.clone(),
                 temp_path_str,
                 OpenFlags::Create,
                 db_opts,

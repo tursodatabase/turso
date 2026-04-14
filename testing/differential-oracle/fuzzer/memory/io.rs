@@ -69,6 +69,11 @@ impl SimIO for MemorySimIO {
                 || file_path.ends_with("log")
             {
                 let path = std::path::Path::new(file_path);
+                if path.parent().is_some_and(|p| !p.exists()) {
+                    // Skip files whose parent directory was cleaned up (e.g. temp
+                    // tables whose TempDir has been dropped).
+                    continue;
+                }
                 if path.exists() {
                     std::fs::remove_file(path)?;
                 }
