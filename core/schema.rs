@@ -3088,7 +3088,7 @@ pub(crate) fn validate_generated_expr(expr: &Expr) -> Result<()> {
 pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> Result<BTreeTable> {
     let table_name = normalize_ident(tbl_name);
     trace!("Creating table {}", table_name);
-    let mut has_rowid = true;
+    let has_rowid = true;
     let mut has_autoincrement = false;
     let mut primary_key_columns = vec![];
     let mut foreign_keys = vec![];
@@ -3503,7 +3503,7 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
             }
 
             if options.contains_without_rowid() {
-                has_rowid = false;
+                crate::bail_parse_error!("WITHOUT ROWID tables are not supported");
             }
         }
         CreateTableBody::AsSelect(_) => {
@@ -4589,6 +4589,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "WITHOUT ROWID not supported"]
     pub fn test_has_rowid_false() -> Result<()> {
         let sql = r#"CREATE TABLE t1 (a INTEGER PRIMARY KEY, b TEXT) WITHOUT ROWID;"#;
         let table = BTreeTable::from_sql(sql, 0)?;
@@ -4634,6 +4635,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "WITHOUT ROWID not supported"]
     pub fn test_column_is_rowid_alias_single_integer_separate_primary_key_definition_without_rowid(
     ) -> Result<()> {
         let sql = r#"CREATE TABLE t1 (a INTEGER, b TEXT, PRIMARY KEY(a)) WITHOUT ROWID;"#;
@@ -4647,6 +4649,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "WITHOUT ROWID not supported"]
     pub fn test_column_is_rowid_alias_single_integer_without_rowid() -> Result<()> {
         let sql = r#"CREATE TABLE t1 (a INTEGER PRIMARY KEY, b TEXT) WITHOUT ROWID;"#;
         let table = BTreeTable::from_sql(sql, 0)?;
@@ -5249,6 +5252,16 @@ mod tests {
         );
 
         Ok(())
+    }
+
+    #[test]
+    fn test_without_rowid_rejected() {
+        let sql = r#"CREATE TABLE t(code TEXT PRIMARY KEY, val TEXT) WITHOUT ROWID"#;
+        let result = BTreeTable::from_sql(sql, 0);
+        assert_eq!(
+            "Parse error: WITHOUT ROWID tables are not supported",
+            format!("{}", result.unwrap_err())
+        );
     }
 
     #[test]
