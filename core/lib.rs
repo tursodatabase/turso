@@ -2199,7 +2199,20 @@ impl Database {
         use crate::util::MEMORY_PATH;
         let io: Arc<dyn IO> = match path.trim() {
             MEMORY_PATH => Arc::new(MemoryIO::new()),
-            _ => Arc::new(PlatformIO::new()?),
+            _ => {
+                #[cfg(all(target_os = "linux", feature = "io_uring", not(miri)))]
+                {
+                    Arc::new(UringIO::new()?)
+                }
+                #[cfg(any(
+                    not(target_os = "linux"),
+                    all(target_os = "linux", not(feature = "io_uring")),
+                    miri
+                ))]
+                {
+                    Arc::new(PlatformIO::new()?)
+                }
+            }
         };
         Ok(io)
     }

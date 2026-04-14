@@ -40,25 +40,18 @@ impl Display for Io {
 }
 
 impl Default for Io {
-    /// Custom Default impl with cfg! macro, to provide compile-time default to Clap based on platform
-    /// The cfg! could be elided, but Clippy complains
-    /// The default value can still be overridden with the Clap argument
+    /// Provide a compile-time default backend for Clap based on platform support.
     fn default() -> Self {
-        match cfg!(all(target_os = "linux", feature = "io_uring")) {
-            true => {
-                #[cfg(all(target_os = "linux", feature = "io_uring"))]
-                {
-                    Io::Syscall // FIXME: make io_uring faster so it can be the default
-                }
-                #[cfg(any(
-                    not(target_os = "linux"),
-                    all(target_os = "linux", not(feature = "io_uring"))
-                ))]
-                {
-                    Io::Syscall
-                }
-            }
-            false => Io::Syscall,
+        #[cfg(all(target_os = "linux", feature = "io_uring"))]
+        {
+            Io::IoUring
+        }
+        #[cfg(any(
+            not(target_os = "linux"),
+            all(target_os = "linux", not(feature = "io_uring"))
+        ))]
+        {
+            Io::Syscall
         }
     }
 }

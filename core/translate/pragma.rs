@@ -1272,9 +1272,9 @@ fn query_pragma(
         PragmaName::PageSize => {
             program.emit_int(
                 pager
-                    .io
-                    .block(|| pager.with_header(|header| header.page_size.get()))
-                    .unwrap_or_else(|_| connection.get_page_size().get()) as i64,
+                    .get_page_size()
+                    .unwrap_or_else(|| connection.get_page_size())
+                    .get() as i64,
                 register,
             );
             program.emit_result_row(register, 1);
@@ -1653,9 +1653,8 @@ fn update_cache_size(
             .unwrap_or(i64::MAX)
             .saturating_mul(1024);
         let page_size = pager
-            .io
-            .block(|| pager.with_header(|header| header.page_size))
-            .unwrap_or_default()
+            .get_page_size()
+            .unwrap_or_else(|| connection.get_page_size())
             .get() as i64;
         if page_size == 0 {
             turso_soft_unreachable!("Page size cannot be zero");

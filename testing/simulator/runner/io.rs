@@ -5,7 +5,9 @@ use std::{
 
 use rand::{Rng, RngCore, SeedableRng};
 use rand_chacha::ChaCha8Rng;
-use turso_core::{Clock, IO, MonotonicInstant, OpenFlags, PlatformIO, Result, WallClockInstant};
+#[cfg(not(target_os = "linux"))]
+use turso_core::PlatformIO;
+use turso_core::{Clock, IO, MonotonicInstant, OpenFlags, Result, WallClockInstant};
 
 use crate::runner::{SimIO, cli::IoBackend, clock::SimulatorClock, file::SimulatorFile};
 
@@ -33,7 +35,16 @@ impl SimulatorIO {
         io_backend: IoBackend,
     ) -> Result<Self> {
         let inner: Box<dyn turso_core::IO> = match io_backend {
-            IoBackend::Default => Box::new(PlatformIO::new()?),
+            IoBackend::Default => {
+                #[cfg(target_os = "linux")]
+                {
+                    Box::new(turso_core::UringIO::new()?)
+                }
+                #[cfg(not(target_os = "linux"))]
+                {
+                    Box::new(PlatformIO::new()?)
+                }
+            }
             #[cfg(target_os = "linux")]
             IoBackend::IoUring => Box::new(turso_core::UringIO::new()?),
             #[cfg(target_os = "windows")]

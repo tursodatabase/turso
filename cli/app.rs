@@ -1546,33 +1546,23 @@ impl Limbo {
                 // Parse table name to handle database prefixes (e.g., "db.table")
                 let clean_table_spec = table_spec.trim_end_matches(';');
 
-                let (target_db, table_name) =
-                    if let Some((db, tbl)) = clean_table_spec.split_once('.') {
-                        (db, tbl)
-                    } else {
-                        ("main", clean_table_spec)
-                    };
-
-                // Query only the specific table in the specific database
-                if target_db == "main" {
-                    self.query_one_table_schema("main", "main", table_name)?;
-                } else {
-                    // Check if the database is attached
-                    let attached_databases = self.conn.list_attached_databases();
-                    if attached_databases.contains(&target_db.to_string()) {
+                if let Some((target_db, table_name)) = clean_table_spec.split_once('.') {
+                    // Explicit db prefix: query only that database
+                    let db_names = self.database_names()?;
+                    if db_names.iter().any(|n| n == target_db) {
                         self.query_one_table_schema(target_db, target_db, table_name)?;
+                    }
+                } else {
+                    // No db prefix: search all databases for the table
+                    let table_name = clean_table_spec;
+                    for db_name in self.database_names()? {
+                        self.query_one_table_schema(&db_name, &db_name, table_name)?;
                     }
                 }
             }
             None => {
                 // Show schema for all tables in all databases
-                let attached_databases = self.conn.list_attached_databases();
-
-                // Query main database first
-                self.query_all_tables_schema("main", "main")?;
-
-                // Query all attached databases
-                for db_name in attached_databases {
+                for db_name in self.database_names()? {
                     self.query_all_tables_schema(&db_name, &db_name)?;
                 }
             }
@@ -2012,7 +2002,7 @@ impl Limbo {
         if Path::new(output_file).exists() {
             anyhow::bail!("Refusing to overwrite existing file: {output_file}");
         }
-        let io: Arc<dyn turso_core::IO> = Arc::new(turso_core::PlatformIO::new()?);
+        let io = turso_core::Database::io_for_path(output_file)?;
         let db = Database::open_file(io.clone(), output_file)?;
         let target = db.connect()?;
 
