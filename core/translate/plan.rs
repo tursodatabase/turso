@@ -1359,13 +1359,14 @@ impl TableReferences {
 /// of ≤64 columns (single u64), with heap-allocated overflow
 pub type ColumnUsedMask = BitSet;
 
-#[derive(Clone, Debug, Default, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
 pub struct BitSet {
     inline: u64,
+    /// invariant: `overflow` is `None` iff no bits ≥ 64 are set.
     overflow: Option<Vec<u64>>,
 }
 
-impl ColumnUsedMask {
+impl BitSet {
     const INLINE_BITS: usize = 64;
 
     pub fn set(&mut self, index: usize) {
@@ -1406,6 +1407,7 @@ impl ColumnUsedMask {
             if let Some(word) = overflow.get_mut(overflow_idx) {
                 *word &= !(1 << bit);
             }
+            self.trim_overflow();
         }
     }
 
@@ -1414,22 +1416,22 @@ impl ColumnUsedMask {
             return false;
         }
         match (&self.overflow, &other.overflow) {
-            (None, None) => true,
-            (None, Some(other_ov)) => other_ov.iter().all(|&w| w == 0),
-            (Some(_), None) => true,
-            (Some(self_ov), Some(other_ov)) => other_ov.iter().enumerate().all(|(i, &other_w)| {
-                let self_w = self_ov.get(i).copied().unwrap_or(0);
-                (self_w & other_w) == other_w
-            }),
+            (_, None) => true,
+            (None, Some(_)) => false,
+            (Some(self_ov), Some(other_ov)) => {
+                if other_ov.len() > self_ov.len() {
+                    return false;
+                }
+                self_ov
+                    .iter()
+                    .zip(other_ov.iter())
+                    .all(|(&s, &o)| (s & o) == o)
+            }
         }
     }
 
     pub fn is_empty(&self) -> bool {
-        self.inline == 0
-            && self
-                .overflow
-                .as_ref()
-                .is_none_or(|ov| ov.iter().all(|&w| w == 0))
+        self.inline == 0 && self.overflow.is_none()
     }
 
     pub fn is_only(&self, index: usize) -> bool {
@@ -1465,27 +1467,38 @@ impl ColumnUsedMask {
     pub fn subtract(&mut self, other: &Self) {
         self.inline &= !other.inline;
         if let (Some(self_ov), Some(other_ov)) = (&mut self.overflow, &other.overflow) {
-            for (i, other_w) in other_ov.iter().enumerate() {
-                if let Some(self_w) = self_ov.get_mut(i) {
-                    *self_w &= !other_w;
-                }
+            for (s, &o) in self_ov.iter_mut().zip(other_ov.iter()) {
+                *s &= !o;
             }
+            self.trim_overflow();
         }
     }
 
     pub fn iter(&self) -> impl Iterator<Item = usize> + '_ {
-        let inline_iter = (0..Self::INLINE_BITS).filter(|&i| (self.inline >> i) & 1 != 0);
+        // this iterator, derived from Kernighan's bitcount algorithm, is O(num_words + popcount)
+        let mut inline = self.inline;
+        let inline_iter = std::iter::from_fn(move || {
+            if inline == 0 {
+                return None;
+            }
+            let bit = inline.trailing_zeros() as usize;
+            inline &= inline - 1; // clear lowest set bit
+            Some(bit)
+        });
         let overflow_iter = self
             .overflow
             .iter()
             .flat_map(|ov| ov.iter().enumerate())
             .flat_map(|(word_idx, &word)| {
-                (0..64).filter_map(move |bit| {
-                    if (word >> bit) & 1 != 0 {
-                        Some(Self::INLINE_BITS + word_idx * 64 + bit)
-                    } else {
-                        None
+                let mut w = word;
+                let base = Self::INLINE_BITS + word_idx * 64;
+                std::iter::from_fn(move || {
+                    if w == 0 {
+                        return None;
                     }
+                    let bit = w.trailing_zeros() as usize;
+                    w &= w - 1; // clear lowest set bit
+                    Some(base + bit)
                 })
             });
         inline_iter.chain(overflow_iter)
@@ -1532,6 +1545,30 @@ impl ColumnUsedMask {
         }
         count
     }
+
+    pub(crate) fn intersects(&self, other: &Self) -> bool {
+        if (self.inline & other.inline) != 0 {
+            return true;
+        }
+        match (&self.overflow, &other.overflow) {
+            (Some(self_ov), Some(other_ov)) => self_ov
+                .iter()
+                .zip(other_ov.iter())
+                .any(|(&a, &b)| (a & b) != 0),
+            _ => false,
+        }
+    }
+
+    fn trim_overflow(&mut self) {
+        if let Some(overflow) = &mut self.overflow {
+            while overflow.last() == Some(&0) {
+                overflow.pop();
+            }
+            if overflow.is_empty() {
+                self.overflow = None;
+            }
+        }
+    }
 }
 
 impl std::ops::BitOrAssign<&Self> for ColumnUsedMask {
@@ -1542,9 +1579,29 @@ impl std::ops::BitOrAssign<&Self> for ColumnUsedMask {
             if self_ov.len() < rhs_ov.len() {
                 self_ov.resize(rhs_ov.len(), 0);
             }
-            for (i, &rhs_w) in rhs_ov.iter().enumerate() {
-                self_ov[i] |= rhs_w;
+            for (s, &r) in self_ov.iter_mut().zip(rhs_ov.iter()) {
+                *s |= r;
             }
+        }
+    }
+}
+
+impl FromIterator<usize> for BitSet {
+    fn from_iter<I: IntoIterator<Item = usize>>(iter: I) -> Self {
+        let mut set = Self::default();
+        for index in iter {
+            set.set(index);
+        }
+        set
+    }
+}
+
+impl From<u128> for BitSet {
+    fn from(from: u128) -> Self {
+        let high = (from >> 64) as u64;
+        Self {
+            inline: from as u64,
+            overflow: (high != 0).then(|| vec![high]),
         }
     }
 }
@@ -3351,5 +3408,207 @@ mod tests {
         // Final verification: iter should produce same results
         let mask_set: std::collections::BTreeSet<usize> = mask.iter().collect();
         assert_eq!(mask_set, reference.0, "final iter mismatch, seed={seed}");
+    }
+
+    #[test]
+    fn test_bitset_properties_fuzz() {
+        fn sample_other(
+            rng: &mut ChaCha8Rng,
+            max_index: usize,
+        ) -> (BitSet, std::collections::BTreeSet<usize>) {
+            let mut m = BitSet::default();
+            let mut r = std::collections::BTreeSet::new();
+            for _ in 0..(rng.next_u32() % 20) {
+                let i = (rng.next_u32() as usize) % max_index;
+                m.set(i);
+                r.insert(i);
+            }
+            (m, r)
+        }
+
+        let (mut rng, seed) = rng_from_env_or_time();
+        eprintln!("test_bitset_properties_fuzz seed: {seed}");
+
+        let mut mask = BitSet::default();
+        let mut reference = std::collections::BTreeSet::<usize>::new();
+        let max_index: usize = 2048;
+        let num_ops = 30_000;
+
+        for step in 0..num_ops {
+            let op = rng.next_u32() % 16;
+            let idx = (rng.next_u32() as usize) % max_index;
+
+            match op {
+                0..=3 => {
+                    // Set (weighted to grow the set)
+                    mask.set(idx);
+                    reference.insert(idx);
+                }
+                4 => {
+                    // Clear
+                    mask.clear(idx);
+                    reference.remove(&idx);
+                }
+                5 => {
+                    // count() agrees with reference size
+                    assert_eq!(
+                        mask.count(),
+                        reference.len(),
+                        "step={step} seed={seed} op=count"
+                    );
+                }
+                6 => {
+                    // rank(k) agrees with |{x in ref : x < k}|
+                    let expected = reference.range(..idx).count();
+                    assert_eq!(
+                        mask.rank(idx),
+                        expected,
+                        "step={step} seed={seed} op=rank({idx})"
+                    );
+                }
+                7 => {
+                    // intersects() agrees with BTreeSet intersection
+                    let (other_mask, other_ref) = sample_other(&mut rng, max_index);
+                    let expected = reference.intersection(&other_ref).next().is_some();
+                    assert_eq!(
+                        mask.intersects(&other_mask),
+                        expected,
+                        "step={step} seed={seed} op=intersects"
+                    );
+                    // Symmetry: intersects is commutative
+                    assert_eq!(
+                        other_mask.intersects(&mask),
+                        expected,
+                        "step={step} seed={seed} op=intersects-symmetric"
+                    );
+                }
+                8 => {
+                    // FromIterator: building a fresh BitSet from the reference
+                    // must compare equal to the mask.
+                    let built: BitSet = reference.iter().copied().collect();
+                    assert_eq!(built, mask, "step={step} seed={seed} op=FromIterator");
+                }
+                9 => {
+                    // iter() -> collect::<BitSet>() round trip is the identity
+                    let round: BitSet = mask.iter().collect();
+                    assert_eq!(round, mask, "step={step} seed={seed} op=iter-roundtrip");
+
+                    // iter() yields bits in strictly increasing order, matching the reference
+                    let collected: Vec<usize> = mask.iter().collect();
+                    for w in collected.windows(2) {
+                        assert!(
+                            w[0] < w[1],
+                            "step={step} seed={seed} iter not strictly increasing"
+                        );
+                    }
+                    let ref_vec: Vec<usize> = reference.iter().copied().collect();
+                    assert_eq!(
+                        collected, ref_vec,
+                        "step={step} seed={seed} iter contents vs ref"
+                    );
+                }
+                10 => {
+                    // From<u128>: sample a random u128, verify per-bit and count
+                    let val = ((rng.next_u32() as u128) << 96)
+                        | ((rng.next_u32() as u128) << 64)
+                        | ((rng.next_u32() as u128) << 32)
+                        | (rng.next_u32() as u128);
+                    let bs = BitSet::from(val);
+                    assert_eq!(
+                        bs.count(),
+                        val.count_ones() as usize,
+                        "step={step} seed={seed} From<u128>({val:#x}) count"
+                    );
+                    for i in 0..128 {
+                        let expected = (val >> i) & 1 != 0;
+                        assert_eq!(
+                            bs.get(i),
+                            expected,
+                            "step={step} seed={seed} From<u128>({val:#x}) get({i})"
+                        );
+                    }
+                    // Path equivalence: same bits via set() must compare equal
+                    let mut manual = BitSet::default();
+                    for i in 0..128 {
+                        if (val >> i) & 1 != 0 {
+                            manual.set(i);
+                        }
+                    }
+                    assert_eq!(
+                        bs, manual,
+                        "step={step} seed={seed} From<u128>({val:#x}) vs manual"
+                    );
+                    // From<u128>(0) must equal default (equality anchor)
+                    assert_eq!(
+                        BitSet::from(0u128),
+                        BitSet::default(),
+                        "step={step} seed={seed} From<u128>(0) != default"
+                    );
+                }
+                11 => {
+                    // Subtract
+                    let (other_mask, other_ref) = sample_other(&mut rng, max_index);
+                    mask.subtract(&other_mask);
+                    for i in &other_ref {
+                        reference.remove(i);
+                    }
+                }
+                12 => {
+                    // BitOrAssign
+                    let (other_mask, other_ref) = sample_other(&mut rng, max_index);
+                    mask |= &other_mask;
+                    for i in other_ref {
+                        reference.insert(i);
+                    }
+                }
+                13 => {
+                    // Cross-method: count() == iter().count() == rank(usize::MAX)
+                    let c = mask.count();
+                    assert_eq!(
+                        c,
+                        mask.iter().count(),
+                        "step={step} seed={seed} count vs iter().count()"
+                    );
+                    assert_eq!(
+                        c,
+                        mask.rank(usize::MAX),
+                        "step={step} seed={seed} count vs rank(MAX)"
+                    );
+                }
+                14 => {
+                    // Cross-method: contains_all(other) && !other.is_empty() => intersects(other)
+                    let (other_mask, other_ref) = sample_other(&mut rng, max_index);
+                    if mask.contains_all_set_bits_of(&other_mask) && !other_ref.is_empty() {
+                        assert!(
+                            mask.intersects(&other_mask),
+                            "step={step} seed={seed} contains_all should imply intersects"
+                        );
+                    }
+                }
+                15 => {
+                    // Cross-method: is_empty() iff count() == 0
+                    assert_eq!(
+                        mask.is_empty(),
+                        mask.count() == 0,
+                        "step={step} seed={seed} is_empty vs count==0"
+                    );
+                    assert_eq!(
+                        mask.is_empty(),
+                        reference.is_empty(),
+                        "step={step} seed={seed} is_empty vs ref"
+                    );
+                }
+                _ => unreachable!(),
+            }
+        }
+
+        // Final verification: complete iter vs reference, and count agreement
+        let collected: std::collections::BTreeSet<usize> = mask.iter().collect();
+        assert_eq!(collected, reference, "final iter mismatch, seed={seed}");
+        assert_eq!(
+            mask.count(),
+            reference.len(),
+            "final count mismatch, seed={seed}"
+        );
     }
 }

@@ -7,7 +7,6 @@ use super::{
         SeekDef, SeekKey, SelectPlan, SetOperation, SimpleAggregate, TableReferences, UpdatePlan,
         WhereTerm,
     },
-    planner::TableMask,
 };
 use crate::translate::expression_index::expression_index_column_usage;
 use crate::translate::plan::MultiIndexBranchAccess;
@@ -2389,11 +2388,10 @@ fn optimize_table_access(
         if build_table_was_prior_probe {
             continue;
         }
-        let prior_mask = TableMask::from_table_number_iter(
-            best_join_order[..probe_pos]
-                .iter()
-                .map(|member| member.original_idx),
-        );
+        let prior_mask = best_join_order[..probe_pos]
+            .iter()
+            .map(|member| member.original_idx)
+            .collect();
         let join_key_indices: HashSet<usize> = hash_join_op
             .join_keys
             .iter()

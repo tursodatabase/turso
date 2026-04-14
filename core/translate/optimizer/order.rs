@@ -726,7 +726,7 @@ fn expr_to_column_order(
         _ => {}
     }
     let mask = table_mask_from_expr(expr, tables, &[]).ok()?;
-    if mask.table_count() != 1 {
+    if mask.count() != 1 {
         return None;
     }
     let collation = get_collseq_from_expr(expr, tables)
@@ -736,7 +736,7 @@ fn expr_to_column_order(
         .joined_tables()
         .iter()
         .enumerate()
-        .find_map(|(i, _)| mask.contains_table(i).then_some(i))?;
+        .find_map(|(i, _)| mask.get(i).then_some(i))?;
     let table_id = tables.joined_tables()[table_no].internal_id;
     Some(ColumnOrder {
         table_id,
