@@ -418,6 +418,228 @@ fn vacuum_into_step(
                 }
             }
 
+            // Phase 1: Create storage-backed tables (rootpage != 0, type=table),
+            // excluding sqlite_sequence (auto-created by AUTOINCREMENT tables).
+            VacuumIntoSubState::PrepareCreateTable { idx } => {
+                let entries_len = state.tables_to_create.len();
+                if idx >= entries_len {
+                    // Done creating tables, start copying data
+                    state.sub_state = VacuumIntoSubState::StartCopyTable { table_idx: 0 };
+                    continue;
+                }
+
+                let entry_ordinal = state.tables_to_create[idx];
+                let entry = &state.schema_entries[entry_ordinal];
+                let sql_str = &entry.sql;
+
+                // System tables (sqlite_stat1, __turso_internal_types, etc.) have
+                // reserved name prefixes that translate_create_table rejects for
+                // user SQL. Temporarily mark the dest connection as nested during
+                // prepare() so the reserved-name check is bypassed at compile
+                // time. The guard is only for prepare: keeping it during step()
+                // would make this CREATE TABLE look nested, so its Transaction
+                // opcode would skip write setup.
+                let is_system = crate::schema::is_system_table(&entry.name);
+                if is_system {
+                    state.dest_conn.start_nested();
+                }
+                let dest_stmt = state.dest_conn.prepare(sql_str);
+                if is_system {
+                    state.dest_conn.end_nested();
+                }
+                let dest_stmt = dest_stmt?;
+                state.sub_state = VacuumIntoSubState::StepCreateTable {
+                    dest_schema_stmt: Box::new(dest_stmt),
+                    idx,
+                };
+                continue;
+            }
+
+            VacuumIntoSubState::StepCreateTable {
+                mut dest_schema_stmt,
+                idx,
+            } => match dest_schema_stmt.step()? {
+                crate::StepResult::Row => {
+                    unreachable!("CREATE TABLE statement unexpectedly returned a row");
+                }
+                crate::StepResult::Done => {
+                    state.sub_state = VacuumIntoSubState::PrepareCreateTable { idx: idx + 1 };
+                    continue;
+                }
+                crate::StepResult::IO => {
+                    let io = dest_schema_stmt
+                        .take_io_completions()
+                        .expect("StepResult::IO returned but no completions available");
+                    state.sub_state = VacuumIntoSubState::StepCreateTable {
+                        dest_schema_stmt,
+                        idx,
+                    };
+                    return Ok(IOResult::IO(io));
+                }
+                crate::StepResult::Busy | crate::StepResult::Interrupt => {
+                    return Err(LimboError::Busy);
+                }
+            },
+
+            // Phase 2: Copy data for all storage-backed tables.
+            // Column lists are derived from BTreeTable.columns in the schema,
+            // not PRAGMA table_info, because table_info omits generated columns
+            // while SELECT * includes them - causing a column count mismatch.
+            VacuumIntoSubState::StartCopyTable { table_idx } => {
+                let tables_len = state.tables_to_copy.len();
+                if table_idx >= tables_len {
+                    // Done copying all tables, proceed to meta values
+                    state.sub_state = VacuumIntoSubState::CopyMetaValues;
+                    continue;
+                }
+
+                let entry_ordinal = state.tables_to_copy[table_idx];
+                let entry = &state.schema_entries[entry_ordinal];
+                let table_name = &entry.name;
+
+                // sqlite_sequence: only copy data if the destination has it
+                // (auto-created when an AUTOINCREMENT table was created in
+                // phase 1). If not present, skip — no AUTOINCREMENT tables
+                // means no counters to preserve. The explicit copy is needed
+                // because inserting rows with the `rowid` pseudo-column does
+                // not update sqlite_sequence counters automatically.
+                if entry.is_sqlite_sequence() {
+                    let dest_has_sequence = state
+                        .dest_conn
+                        .schema
+                        .read()
+                        .get_btree_table(crate::schema::SQLITE_SEQUENCE_TABLE_NAME)
+                        .is_some();
+                    if !dest_has_sequence {
+                        state.sub_state = VacuumIntoSubState::StartCopyTable {
+                            table_idx: table_idx + 1,
+                        };
+                        continue;
+                    }
+                }
+
+                let escaped_table_name = table_name.replace('"', "\"\"");
+                // Derive copy-column list from BTreeTable.columns in schema,
+                // filtering out virtual generated columns so the SELECT and
+                // INSERT arities stay aligned.
+                let source_btree_table = config
+                    .source_conn
+                    .with_schema(config.database_id, |schema| {
+                        schema.get_btree_table(table_name)
+                    });
+
+                let (select_sql, insert_sql) = build_copy_sql(
+                    &config.escaped_schema_name,
+                    &escaped_table_name,
+                    source_btree_table.as_deref(),
+                )?;
+
+                // SELECT from source, INSERT into destination.
+                let select_stmt = config.source_conn.prepare_internal(&select_sql)?;
+
+                // System tables need nested mode during prepare() to bypass
+                // "may not be modified" checks. Can't use prepare_internal()
+                // because the nested guard must not persist into step() - the
+                // Transaction opcode needs to run for page-level write setup.
+                let is_system = crate::schema::is_system_table(table_name);
+                if is_system {
+                    state.dest_conn.start_nested();
+                }
+                let dest_insert_stmt = state.dest_conn.prepare(&insert_sql);
+                if is_system {
+                    state.dest_conn.end_nested();
+                }
+                let dest_insert_stmt = dest_insert_stmt?;
+
+                state.sub_state = VacuumIntoSubState::CopyRows {
+                    select_stmt: Box::new(select_stmt),
+                    dest_insert_stmt: Box::new(dest_insert_stmt),
+                    table_idx,
+                };
+                continue;
+            }
+
+            VacuumIntoSubState::CopyRows {
+                mut select_stmt,
+                mut dest_insert_stmt,
+                table_idx,
+            } => match select_stmt.step()? {
+                crate::StepResult::Row => {
+                    let row = select_stmt
+                        .row()
+                        .expect("StepResult::Row but row() returned None");
+
+                    dest_insert_stmt.reset()?;
+                    dest_insert_stmt.clear_bindings();
+                    for (i, value) in row.get_values().cloned().enumerate() {
+                        let index =
+                            std::num::NonZero::new(i + 1).expect("i + 1 is always non-zero");
+                        dest_insert_stmt.bind_at(index, value);
+                    }
+
+                    state.sub_state = VacuumIntoSubState::StepDestInsert {
+                        select_stmt,
+                        dest_insert_stmt,
+                        table_idx,
+                    };
+                    continue;
+                }
+                crate::StepResult::Done => {
+                    // Move to next table
+                    state.sub_state = VacuumIntoSubState::StartCopyTable {
+                        table_idx: table_idx + 1,
+                    };
+                    continue;
+                }
+                crate::StepResult::IO => {
+                    let io = select_stmt
+                        .take_io_completions()
+                        .expect("StepResult::IO returned but no completions available");
+                    state.sub_state = VacuumIntoSubState::CopyRows {
+                        select_stmt,
+                        dest_insert_stmt,
+                        table_idx,
+                    };
+                    return Ok(IOResult::IO(io));
+                }
+                crate::StepResult::Busy | crate::StepResult::Interrupt => {
+                    return Err(LimboError::Busy);
+                }
+            },
+
+            VacuumIntoSubState::StepDestInsert {
+                select_stmt,
+                mut dest_insert_stmt,
+                table_idx,
+            } => match dest_insert_stmt.step()? {
+                crate::StepResult::Row => {
+                    unreachable!("INSERT statement unexpectedly returned a row");
+                }
+                crate::StepResult::Done => {
+                    // Go back to get next row from source
+                    state.sub_state = VacuumIntoSubState::CopyRows {
+                        select_stmt,
+                        dest_insert_stmt,
+                        table_idx,
+                    };
+                    continue;
+                }
+                crate::StepResult::IO => {
+                    let io = dest_insert_stmt
+                        .take_io_completions()
+                        .expect("StepResult::IO returned but no completions available");
+                    state.sub_state = VacuumIntoSubState::StepDestInsert {
+                        select_stmt,
+                        dest_insert_stmt,
+                        table_idx,
+                    };
+                    return Ok(IOResult::IO(io));
+                }
+                crate::StepResult::Busy | crate::StepResult::Interrupt => {
+                    return Err(LimboError::Busy);
+                }
+            },
+
             _ => todo!("VACUUM INTO engine phase not moved yet"),
         }
     }
