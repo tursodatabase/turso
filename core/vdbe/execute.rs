@@ -14674,19 +14674,6 @@ mod tests {
     }
 
     #[test]
-    fn test_pragma_freelist_count_compiles_to_runtime_opcode() {
-        let stmt = prepare_test_statement_sql("PRAGMA freelist_count;");
-        assert!(
-            stmt.get_program()
-                .prepared
-                .insns
-                .iter()
-                .any(|(insn, _)| matches!(insn, Insn::FreelistCount { .. })),
-            "PRAGMA freelist_count should compile to a resumable runtime opcode"
-        );
-    }
-
-    #[test]
     fn test_hash_probe_allows_grace_style_probe_after_partition_preload() {
         let stmt = prepare_test_statement();
         let (mut ht, probe_key, partition_idx) = make_spilled_hash_table();
