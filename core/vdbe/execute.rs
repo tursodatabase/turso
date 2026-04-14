@@ -571,7 +571,7 @@ fn op_checkpoint_inner(
         if state.op_checkpoint_state.checkpoint_sm.is_none() {
             state.op_checkpoint_state.checkpoint_sm =
                 Some(StateMachine::new(CheckpointStateMachine::new(
-                    pager.clone(),
+                    pager,
                     mv_store.clone(),
                     program.connection.clone(),
                     true,
