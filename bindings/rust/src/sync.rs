@@ -1718,4 +1718,103 @@ mod tests {
         assert_eq!(remote_rows[1][1], Value::Text("beta".to_string()));
         assert_eq!(remote_rows[1][2], Value::Text("from-local".to_string()));
     }
+
+    /// Push test: local creates a trigger, pushes, and a second client pulls and sees the trigger.
+    #[tokio::test]
+    pub async fn test_sync_push_create_trigger() {
+        let _ = tracing_subscriber::fmt::try_init();
+        let server = TursoServer::new().await.unwrap();
+
+        // Remote: create table
+        server.db_sql("CREATE TABLE t(x, y)").await.unwrap();
+
+        // Client 1: bootstrap, create trigger, insert data, push
+        let db1 = crate::sync::Builder::new_remote(":memory:")
+            .with_remote_url(server.db_url())
+            .build()
+            .await
+            .unwrap();
+        let conn1 = db1.connect().await.unwrap();
+        conn1
+            .execute(
+                "CREATE TRIGGER t_ins AFTER INSERT ON t BEGIN \
+                 INSERT INTO t VALUES (NEW.x || '_copy', NEW.y); \
+                 END",
+                (),
+            )
+            .await
+            .unwrap();
+        // The trigger fires on this insert, adding a second row automatically
+        conn1
+            .execute("INSERT INTO t VALUES ('a', 'alpha')", ())
+            .await
+            .unwrap();
+        db1.push().await.unwrap();
+
+        // Client 2: bootstrap from remote, should see the trigger and both rows
+        let db2 = crate::sync::Builder::new_remote(":memory:")
+            .with_remote_url(server.db_url())
+            .build()
+            .await
+            .unwrap();
+        let conn2 = db2.connect().await.unwrap();
+
+        // Verify the trigger-generated rows are visible
+        let rows = all_rows(
+            conn2
+                .query("SELECT x, y FROM t ORDER BY x", ())
+                .await
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            rows,
+            vec![
+                vec![
+                    Value::Text("a".to_string()),
+                    Value::Text("alpha".to_string()),
+                ],
+                vec![
+                    Value::Text("a_copy".to_string()),
+                    Value::Text("alpha".to_string()),
+                ],
+            ]
+        );
+
+        // Verify the trigger itself was synced — a new insert should fire it
+        conn2
+            .execute("INSERT INTO t VALUES ('b', 'beta')", ())
+            .await
+            .unwrap();
+        let rows = all_rows(
+            conn2
+                .query("SELECT x, y FROM t ORDER BY x", ())
+                .await
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            rows,
+            vec![
+                vec![
+                    Value::Text("a".to_string()),
+                    Value::Text("alpha".to_string()),
+                ],
+                vec![
+                    Value::Text("a_copy".to_string()),
+                    Value::Text("alpha".to_string()),
+                ],
+                vec![
+                    Value::Text("b".to_string()),
+                    Value::Text("beta".to_string()),
+                ],
+                vec![
+                    Value::Text("b_copy".to_string()),
+                    Value::Text("beta".to_string()),
+                ],
+            ]
+        );
+    }
 }
