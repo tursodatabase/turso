@@ -1587,6 +1587,14 @@ fn emit_update_insns<'a>(
                     })
                     .collect();
 
+                let directly_and_indirectly_updated_columns: ColumnMask = set_clauses
+                    .iter()
+                    .map(|(i, _)| *i)
+                    .flat_map(|col| {
+                        columns_affected_by_update(&table_btree.columns, [col].iter().cloned())
+                    })
+                    .collect();
+
                 emit_fk_child_update_counters(
                     program,
                     &table_btree,
