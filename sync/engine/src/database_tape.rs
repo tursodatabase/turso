@@ -390,13 +390,23 @@ pub enum DatabaseChangesIteratorMode {
 }
 
 impl DatabaseChangesIteratorMode {
-    pub fn query(&self, table_name: &str, limit: usize) -> String {
+    pub fn query(
+        &self,
+        cdc_version: turso_core::CdcVersion,
+        cdc_table_name: &str,
+        limit: usize,
+    ) -> String {
         let (operation, order) = match self {
             DatabaseChangesIteratorMode::Apply => (">=", "ASC"),
             DatabaseChangesIteratorMode::Revert => ("<=", "DESC"),
         };
+        let change_origin_predicate = if cdc_version == turso_core::CdcVersion::V3 {
+            "change_origin = 0 AND "
+        } else {
+            ""
+        };
         format!(
-            "SELECT * FROM {table_name} WHERE change_id {operation} ? ORDER BY change_id {order} LIMIT {limit}",
+            "SELECT * FROM {cdc_table_name} WHERE {change_origin_predicate} change_id {operation} ? ORDER BY change_id {order} LIMIT {limit}",
         )
     }
     pub fn first_id(&self) -> i64 {
@@ -474,7 +484,9 @@ impl DatabaseChangesIterator {
     }
     async fn refill<Ctx>(&mut self, coro: &Coro<Ctx>) -> Result<()> {
         if self.query_stmt.is_none() {
-            let query = self.mode.query(&self.cdc_table, self.batch_size);
+            let query = self
+                .mode
+                .query(self.cdc_version, &self.cdc_table, self.batch_size);
             let stmt = match self.conn.prepare(&query) {
                 Ok(stmt) => stmt,
                 Err(LimboError::ParseError(err)) if err.contains("no such table") => return Ok(()),

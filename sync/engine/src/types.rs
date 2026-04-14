@@ -4,6 +4,7 @@ use std::{
 };
 
 use serde::{Deserialize, Serialize};
+use turso_core::ProgramOrigin;
 
 use crate::{database_sync_operations::MutexSlot, errors::Error, Result};
 
@@ -239,6 +240,8 @@ pub struct DatabaseChange {
     pub change_txn_id: Option<i64>,
     /// Type of the change
     pub change_type: DatabaseChangeType,
+    /// CDC v3: change origin. None for v1 and v2
+    pub change_origin: Option<ProgramOrigin>,
     /// Table of the change
     pub table_name: String,
     /// Rowid of changed row
@@ -291,6 +294,7 @@ impl DatabaseChange {
         Ok(DatabaseTapeRowChange {
             change_id: self.change_id,
             change_time: self.change_time,
+            change_origin: self.change_origin,
             change: tape_change,
             table_name: self.table_name,
             id: self.id,
@@ -334,6 +338,7 @@ impl DatabaseChange {
             change_id: self.change_id,
             change_time: self.change_time,
             change: tape_change,
+            change_origin: self.change_origin,
             table_name: self.table_name,
             id: self.id,
         })
@@ -376,6 +381,17 @@ fn parse_change_type(value: i64) -> Result<DatabaseChangeType> {
     }
 }
 
+fn parse_change_origin(value: i64) -> Result<ProgramOrigin> {
+    match value {
+        0 => Ok(ProgramOrigin::User),
+        1 => Ok(ProgramOrigin::Trigger),
+        2 => Ok(ProgramOrigin::ForeignKeyAction),
+        v => Err(Error::DatabaseTapeError(format!(
+            "unexpected change origin: expected 0|1|2, got '{v:?}'"
+        ))),
+    }
+}
+
 impl DatabaseChange {
     /// Parse a CDC row using v1 layout (8 columns, no change_txn_id).
     pub fn from_row_v1(row: &turso_core::Row) -> Result<Self> {
@@ -393,6 +409,7 @@ impl DatabaseChange {
             change_time,
             change_txn_id: None,
             change_type,
+            change_origin: None,
             table_name,
             id,
             before,
@@ -419,6 +436,36 @@ impl DatabaseChange {
             change_time,
             change_txn_id,
             change_type,
+            change_origin: None,
+            table_name,
+            id,
+            before,
+            after,
+            updates,
+        })
+    }
+
+    /// Parse a CDC row using v2 layout (10 columns, with change_origin).
+    pub fn from_row_v3(row: &turso_core::Row) -> Result<Self> {
+        let change_id = get_core_value_i64(row, 0)?;
+        let change_time = get_core_value_i64(row, 1)? as u64;
+        let change_txn_id = get_core_value_i64_or_null(row, 2)?;
+        let change_type = get_core_value_i64(row, 3)?;
+        let change_type = parse_change_type(change_type)?;
+        let change_origin = get_core_value_i64(row, 4)?;
+        let change_origin = Some(parse_change_origin(change_origin)?);
+        // COMMIT records have NULL for table_name and id
+        let table_name = get_core_value_text_or_null(row, 5)?.unwrap_or_default();
+        let id = get_core_value_i64_or_null(row, 6)?.unwrap_or(0);
+        let before = get_core_value_blob_or_null(row, 7)?;
+        let after = get_core_value_blob_or_null(row, 8)?;
+        let updates = get_core_value_blob_or_null(row, 9)?;
+        Ok(Self {
+            change_id,
+            change_time,
+            change_txn_id,
+            change_type,
+            change_origin,
             table_name,
             id,
             before,
@@ -429,6 +476,7 @@ impl DatabaseChange {
 
     pub fn from_row(row: &turso_core::Row, cdc_version: turso_core::CdcVersion) -> Result<Self> {
         match cdc_version {
+            turso_core::CdcVersion::V3 => Self::from_row_v3(row),
             turso_core::CdcVersion::V2 => Self::from_row_v2(row),
             turso_core::CdcVersion::V1 => Self::from_row_v1(row),
         }
@@ -499,6 +547,7 @@ pub enum DatabaseTapeOperation {
 pub struct DatabaseTapeRowChange {
     pub change_id: i64,
     pub change_time: u64,
+    pub change_origin: Option<ProgramOrigin>,
     pub change: DatabaseTapeRowChangeType,
     pub table_name: String,
     pub id: i64,
