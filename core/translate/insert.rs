@@ -1,5 +1,5 @@
 use crate::schema::{ColumnLayout, GeneratedType};
-use crate::translate::emitter::gencol;
+use crate::translate::emitter::{emit_index_column_value_old_image, gencol};
 use crate::translate::optimizer::Optimizable;
 use crate::turso_debug_assert;
 use crate::{
@@ -3708,31 +3708,17 @@ fn emit_replace_delete_conflicting_row(
         let num_regs = index.columns.len() + 1;
         let start_reg = program.alloc_registers(num_regs);
 
+        let table_internal_id = table_references.joined_tables()[0].internal_id;
         for (reg_offset, column_index) in index.columns.iter().enumerate() {
-            if let Some(expr) = &column_index.expr {
-                let mut expr = expr.as_ref().clone();
-                bind_and_rewrite_expr(
-                    &mut expr,
-                    Some(table_references),
-                    None,
-                    resolver,
-                    BindingBehavior::ResultColumnsNotAllowed,
-                )?;
-                translate_expr_no_constant_opt(
-                    program,
-                    Some(table_references),
-                    &expr,
-                    start_reg + reg_offset,
-                    resolver,
-                    NoConstantOptReason::RegisterReuse,
-                )?;
-            } else {
-                program.emit_column_or_rowid(
-                    main_cursor_id,
-                    column_index.pos_in_table,
-                    start_reg + reg_offset,
-                );
-            }
+            emit_index_column_value_old_image(
+                program,
+                resolver,
+                table_references,
+                main_cursor_id,
+                table_internal_id,
+                column_index,
+                start_reg + reg_offset,
+            )?;
         }
         program.emit_insn(Insn::Copy {
             src_reg: ctx.conflict_rowid_reg,
