@@ -2280,7 +2280,20 @@ impl JoinedTable {
                 // rowid is always implicitly covered by the index
                 continue;
             }
-            let covered_by_index = index.columns.iter().any(|c| c.pos_in_table == required_col);
+            let covered_by_index = index
+                .columns
+                .iter()
+                .filter(|c| c.pos_in_table == required_col)
+                .any(|c| {
+                    // SQLite doesn't consider fulfill covering indexes with virtual columns,
+                    // see `recomputeColumnsNotIndexed` in `build.c`. We might be able to improve this
+                    // in the future, but for now we do this to ensure correctness.
+                    !btree
+                        .columns
+                        .get(c.pos_in_table)
+                        .expect("column should be in table")
+                        .is_virtual_generated()
+                });
             if !covered_by_index {
                 return false;
             }
