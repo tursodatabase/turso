@@ -303,6 +303,7 @@ pub fn emit_parent_key_change_checks(
     rowid_new_reg: usize,
     rowid_set_clause_reg: Option<usize>,
     set_clauses: &[(usize, Box<Expr>)],
+    reconcile_new_key: bool,
     database_id: usize,
     resolver: &Resolver,
 ) -> Result<()> {
@@ -325,6 +326,7 @@ pub fn emit_parent_key_change_checks(
             &incoming,
             old_rowid_reg,
             rowid_set_clause_reg.unwrap_or(old_rowid_reg),
+            reconcile_new_key,
             database_id,
             resolver,
         )?;
@@ -340,6 +342,7 @@ pub fn emit_parent_key_change_checks(
             &incoming,
             table_btree,
             index.as_ref(),
+            reconcile_new_key,
             database_id,
             resolver,
         )?;
@@ -353,6 +356,7 @@ pub fn emit_rowid_pk_change_check(
     incoming: &[ResolvedFkRef],
     old_rowid_reg: usize,
     new_rowid_reg: usize,
+    reconcile_new_key: bool,
     database_id: usize,
     resolver: &Resolver,
 ) -> Result<()> {
@@ -378,7 +382,16 @@ pub fn emit_rowid_pk_change_check(
         extra_amount: 0,
     });
 
-    emit_fk_parent_pk_change_counters(program, incoming, old_pk, new_pk, 1, database_id, resolver)?;
+    emit_fk_parent_pk_change_counters(
+        program,
+        incoming,
+        old_pk,
+        new_pk,
+        1,
+        reconcile_new_key,
+        database_id,
+        resolver,
+    )?;
     program.preassign_label_to_next_insn(skip);
     Ok(())
 }
@@ -409,6 +422,7 @@ pub fn emit_parent_index_key_change_checks(
     incoming: &[ResolvedFkRef],
     table_btree: &BTreeTable,
     index: &Index,
+    reconcile_new_key: bool,
     database_id: usize,
     resolver: &Resolver,
 ) -> Result<()> {
@@ -511,6 +525,7 @@ pub fn emit_parent_index_key_change_checks(
         old_key,
         new_key,
         idx_len,
+        reconcile_new_key,
         database_id,
         resolver,
     )?;
@@ -518,9 +533,11 @@ pub fn emit_parent_index_key_change_checks(
     Ok(())
 }
 
-/// Two-pass parent-side maintenance for UPDATE of a parent key:
-/// 1. Probe child for OLD key, increment deferred counter if any references exist.
-/// 2. Probe child for NEW key, guarded decrement cancels exactly one increment if present
+/// Parent-side maintenance for UPDATE of a parent key:
+/// probe child for OLD key and increment deferred counter if references exist.
+///
+/// When statement conflict handling is active (e.g. UPSERT/REPLACE paths),
+/// also probe the NEW key to reconcile pre-existing deferred violations.
 #[allow(clippy::too_many_arguments)]
 pub fn emit_fk_parent_pk_change_counters(
     program: &mut ProgramBuilder,
@@ -528,6 +545,7 @@ pub fn emit_fk_parent_pk_change_counters(
     old_pk_start: usize,
     new_pk_start: usize,
     n_cols: usize,
+    reconcile_new_key: bool,
     database_id: usize,
     resolver: &Resolver,
 ) -> Result<()> {
@@ -541,15 +559,18 @@ pub fn emit_fk_parent_pk_change_counters(
             database_id,
             resolver,
         )?;
-        emit_fk_parent_key_probe(
-            program,
-            fk_ref,
-            new_pk_start,
-            n_cols,
-            ParentProbePass::New,
-            database_id,
-            resolver,
-        )?;
+
+        if reconcile_new_key {
+            emit_fk_parent_key_probe(
+                program,
+                fk_ref,
+                new_pk_start,
+                n_cols,
+                ParentProbePass::New,
+                database_id,
+                resolver,
+            )?;
+        }
     }
     Ok(())
 }
@@ -1156,6 +1177,7 @@ pub fn emit_fk_update_parent_actions(
     rowid_new_reg: usize,
     rowid_set_clause_reg: Option<usize>,
     set_clauses: &[(usize, Box<Expr>)],
+    reconcile_new_key: bool,
     database_id: usize,
     resolver: &Resolver,
 ) -> Result<()> {
@@ -1199,6 +1221,7 @@ pub fn emit_fk_update_parent_actions(
                             &[fk_ref.clone()],
                             old_rowid_reg,
                             rowid_set_clause_reg.unwrap_or(old_rowid_reg),
+                            reconcile_new_key,
                             database_id,
                             resolver,
                         )?;
@@ -1214,6 +1237,7 @@ pub fn emit_fk_update_parent_actions(
                             &[fk_ref.clone()],
                             table_btree,
                             index.as_ref(),
+                            reconcile_new_key,
                             database_id,
                             resolver,
                         )?;
@@ -1236,6 +1260,7 @@ pub fn emit_fk_update_parent_actions(
                 &incoming,
                 old_rowid_reg,
                 rowid_set_clause_reg.unwrap_or(old_rowid_reg),
+                reconcile_new_key,
                 database_id,
                 resolver,
             )?;
@@ -1251,6 +1276,7 @@ pub fn emit_fk_update_parent_actions(
                 &incoming,
                 table_btree,
                 index.as_ref(),
+                reconcile_new_key,
                 database_id,
                 resolver,
             )?;

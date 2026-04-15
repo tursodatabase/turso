@@ -1730,7 +1730,7 @@ impl Pager {
             Some(SavepointKind::Statement)
         ) {
             return Ok(());
-        };
+        }
         let savepoint = savepoints.pop().expect("savepoint must exist");
         if let Some(parent) = savepoints.last() {
             parent.set_write_offset(savepoint.write_offset());
