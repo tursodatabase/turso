@@ -4559,7 +4559,7 @@ pub fn op_seek(
     insn: &Insn,
     pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
-    let (cursor_id, is_index, record_source, target_pc) = match insn {
+    let (cursor_id, is_index, start_reg, num_regs, target_pc) = match insn {
         Insn::SeekGE {
             cursor_id,
             is_index,
@@ -4591,21 +4591,37 @@ pub fn op_seek(
             num_regs,
             target_pc,
             ..
-        } => (
-            cursor_id,
-            *is_index,
-            RecordSource::Unpacked {
-                start_reg: *start_reg,
-                num_regs: *num_regs,
-            },
-            target_pc,
-        ),
+        } => (cursor_id, *is_index, *start_reg, *num_regs, target_pc),
         _ => unreachable!("unexpected Insn {:?}", insn),
     };
     assert!(
         target_pc.is_offset(),
         "op_seek: target_pc should be an offset, is: {target_pc:?}"
     );
+    let is_eq_only = match insn {
+        Insn::SeekGE { eq_only, .. } => *eq_only,
+        Insn::SeekLE { eq_only, .. } => *eq_only,
+        _ => false,
+    };
+
+    if is_eq_only
+        && state.registers[start_reg..start_reg + num_regs]
+            .iter()
+            .any(|value| value.is_null())
+    {
+        // Exact-match seeks use "=" semantics across the full unpacked key.
+        // If any key column is NULL, the comparison is unknown, so no row can match.
+        // Translation often emits IsNull guards earlier, but outer joins can still
+        // null-extend these registers at runtime after non-null analysis has run.
+        state.pc = target_pc.as_offset_int();
+        return Ok(InsnFunctionStepResult::Step);
+    }
+
+    let record_source = RecordSource::Unpacked {
+        start_reg,
+        num_regs,
+    };
+
     let op = match insn {
         Insn::SeekGE { eq_only, .. } => SeekOp::GE { eq_only: *eq_only },
         Insn::SeekGT { .. } => SeekOp::GT,

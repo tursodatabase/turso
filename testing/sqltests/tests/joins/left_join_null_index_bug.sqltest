@@ -1,0 +1,51 @@
+@database :memory:
+
+setup left-join-null-index-bug-single-column-schema {
+    CREATE TABLE a(id INTEGER PRIMARY KEY);
+    CREATE TABLE b(id INTEGER PRIMARY KEY, a_id INTEGER);
+    CREATE TABLE c(id INTEGER PRIMARY KEY, b_id INTEGER);
+
+    INSERT INTO a VALUES (1),(2);
+    INSERT INTO b VALUES (1,1);
+    INSERT INTO c VALUES (1,NULL);
+
+    CREATE INDEX idx_c_bid ON c(b_id);
+}
+
+@setup left-join-null-index-bug-single-column-schema
+test left-join-null-index-bug {
+    SELECT a.id, b.id AS bid, c.id AS cid 
+    FROM a 
+    LEFT JOIN b ON a.id = b.a_id 
+    LEFT JOIN c ON b.id = c.b_id 
+    ORDER BY a.id;
+}
+expect {
+1|1|
+2||
+}
+
+setup left-join-null-index-bug-composite-index-schema {
+    CREATE TABLE a(id INTEGER PRIMARY KEY);
+    CREATE TABLE b(id INTEGER PRIMARY KEY, a_id INTEGER);
+    CREATE TABLE c(id INTEGER PRIMARY KEY, x INTEGER, y INTEGER);
+
+    INSERT INTO a VALUES (1),(2);
+    INSERT INTO b VALUES (1,1);
+    INSERT INTO c VALUES (1,7,NULL);
+
+    CREATE INDEX idx_c_x_y ON c(x, y);
+}
+
+@setup left-join-null-index-bug-composite-index-schema
+test left-join-null-index-bug-composite-key {
+    SELECT a.id, b.id AS bid, c.id AS cid
+    FROM a
+    LEFT JOIN b ON a.id = b.a_id
+    LEFT JOIN c ON c.x = 7 AND c.y = b.id
+    ORDER BY a.id;
+}
+expect {
+1|1|
+2||
+}
