@@ -881,6 +881,27 @@ expect {
     3|pending
 }
 
+# Regression: UPDATE with correlated EXISTS reading the same table must materialize
+# the write set before applying row updates.
+@cross-check-integrity
+test update-correlated-exists-same-table-materializes-write-set {
+    CREATE TABLE t_subq(id INTEGER PRIMARY KEY, val INTEGER);
+    INSERT INTO t_subq VALUES(1,1),(2,2),(3,3);
+    UPDATE t_subq SET val = 0
+    WHERE EXISTS (
+        SELECT 1
+        FROM t_subq AS t2
+        WHERE t2.val > 0
+          AND t2.id != t_subq.id
+    );
+    SELECT id, val FROM t_subq ORDER BY id;
+}
+expect {
+    1|0
+    2|0
+    3|0
+}
+
 # Test UPDATE with scalar comparison subquery (=)
 
 @cross-check-integrity
@@ -1018,4 +1039,3 @@ expect {
     1|2
     2|1
 }
-
