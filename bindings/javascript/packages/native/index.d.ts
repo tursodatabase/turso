@@ -5,10 +5,6 @@ export declare class BatchExecutor {
   reset(): void
 }
 
-export interface QueryOptions {
-  queryTimeout?: number
-}
-
 /** A database connection. */
 export declare class Database {
   /**
@@ -179,4 +175,8 @@ export interface EncryptionOpts {
   cipher: EncryptionCipher
   /** The hex-encoded encryption key */
   hexkey: string
+}
+
+export interface QueryOptions {
+  queryTimeout?: number
 }
