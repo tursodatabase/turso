@@ -1209,6 +1209,9 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                 match destroy_result {
                     IOResult::IO(io) => Ok(TransitionResult::Io(io)),
                     IOResult::Done(_) => {
+                        // Evict stale cursor (the btree is gone, and its root_page may be
+                        // reused by a subsequent create within this checkpoint).
+                        self.cursors.remove(root_page);
                         self.destroyed_tables.insert(*table_id);
                         self.state = CheckpointState::WriteRow {
                             write_set_index: *write_set_index + 1,
@@ -1240,11 +1243,13 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                 } else {
                     // DROP INDEX destroy path: schema may no longer contain the index definition.
                     // We only need a cursor to destroy pages so num_columns is not important.
-                    Arc::new(RwLock::new(BTreeCursor::new_table(
+                    let cursor = Arc::new(RwLock::new(BTreeCursor::new_table(
                         self.pager.clone(),
                         *root_page as i64,
                         *num_columns,
-                    )))
+                    )));
+                    self.cursors.insert(*root_page, cursor.clone());
+                    cursor
                 };
                 let destroy_result = {
                     let mut cursor = cursor.write();
@@ -1253,6 +1258,9 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                 match destroy_result {
                     IOResult::IO(io) => Ok(TransitionResult::Io(io)),
                     IOResult::Done(_) => {
+                        // Evict stale cursor (the btree is gone, and its root_page may be
+                        // reused by a subsequent create within this checkpoint).
+                        self.cursors.remove(root_page);
                         self.destroyed_indexes.insert(*index_id);
                         self.state = CheckpointState::WriteRow {
                             write_set_index: *write_set_index + 1,
