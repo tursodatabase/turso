@@ -952,6 +952,8 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                                 cursor
                             };
                             self.pager.io.block(|| cursor.write().btree_destroy())?;
+                            // Evict stale cursor.
+                            self.cursors.remove(&root_page);
                             self.destroyed_tables.insert(table_id);
                         }
                         SpecialWrite::BTreeCreateIndex { index_id, .. } => {
@@ -1011,6 +1013,8 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                                 )))
                             };
                             self.pager.io.block(|| cursor.write().btree_destroy())?;
+                            // Evict stale cursor.
+                            self.cursors.remove(&root_page);
                             self.destroyed_indexes.insert(index_id);
                         }
                     }
