@@ -16,6 +16,10 @@ label = "fossier:spam-likely"
 comment = true
 label = "fossier:needs-review"
 
+[actions.allow]
+comment = true
+label = "fossier:verified"
+
 [weights]
 prior_interaction = 0.3
 
