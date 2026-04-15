@@ -221,6 +221,7 @@ impl From<Expr> for WhereTerm {
 }
 
 use crate::ast::Expr;
+use crate::schema::ROWID_SENTINEL;
 use crate::util::exprs_are_equivalent;
 
 /// The loop index where to evaluate the condition.
@@ -1360,22 +1361,101 @@ impl TableReferences {
 /// Tracks which columns are used in a query.
 pub type ColumnUsedMask = BitSet;
 
-//TODO instead of using this alias, ideally we wouldn't carry naked usize's around, and we would
-// have `ColumnID`, `UsedColumnID`, `TableID`, etc. aliases, just like we have `CursorID`.
-// Then, we can have types like `BitSet<ColumnID>` and type-safe associated functions.
-pub type ColumnMask = BitSet;
+/// ColumnMask wraps [BitSet] and adds a special-case so that it can store [ROWID_SENTINEL]
+/// in `O(1)` space
+//TODO instead of carrying naked usize's around, we should ideally have a `ColumnID` type alias,
+// just like we have `CursorID`, so that we can make [ColumnMask] type-safe.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
+pub struct ColumnMask {
+    columns: BitSet,
+    has_rowid_update: bool,
+}
+
+impl ColumnMask {
+    pub fn set(&mut self, idx: usize) {
+        if idx == ROWID_SENTINEL {
+            self.has_rowid_update = true;
+        } else {
+            self.columns.set(idx);
+        }
+    }
+
+    pub fn get(&self, idx: usize) -> bool {
+        if idx == ROWID_SENTINEL {
+            self.has_rowid_update
+        } else {
+            self.columns.get(idx)
+        }
+    }
+
+    pub fn count(&self) -> usize {
+        self.columns.count() + self.has_rowid_update as usize
+    }
+}
+
+impl FromIterator<usize> for ColumnMask {
+    fn from_iter<I: IntoIterator<Item = usize>>(iter: I) -> Self {
+        let mut mask = ColumnMask::default();
+        for idx in iter {
+            mask.set(idx);
+        }
+        mask
+    }
+}
+
+pub struct ColumnMaskIter<B: std::borrow::Borrow<BitSet>> {
+    inner: BitSetIter<B>,
+    pending_rowid: bool,
+}
+
+impl<B: std::borrow::Borrow<BitSet>> Iterator for ColumnMaskIter<B> {
+    type Item = usize;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if let Some(v) = self.inner.next() {
+            return Some(v);
+        }
+        if self.pending_rowid {
+            self.pending_rowid = false;
+            return Some(ROWID_SENTINEL);
+        }
+        None
+    }
+}
+
+impl<'a> IntoIterator for &'a ColumnMask {
+    type Item = usize;
+    type IntoIter = ColumnMaskIter<&'a BitSet>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        ColumnMaskIter {
+            inner: (&self.columns).into_iter(),
+            pending_rowid: self.has_rowid_update,
+        }
+    }
+}
+
+impl IntoIterator for ColumnMask {
+    type Item = usize;
+    type IntoIter = ColumnMaskIter<BitSet>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        ColumnMaskIter {
+            inner: self.columns.into_iter(),
+            pending_rowid: self.has_rowid_update,
+        }
+    }
+}
 
 /// Dense bitset optimized for the common case where all elements ≤64, with heap-allocated overflow.
-/// As a special case, this bitset can accomodate `usize::MAX` with O(1) space.
 ///
 /// *WARNING*: This bitset occupies `O(max_num)` space when `max_num > 64`,
 /// so it is best used for smaller numbers.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
 pub struct BitSet {
     inline: u64,
-    /// invariant: `overflow` is `None` iff no bits ≥ 64 and < `usize::MAX` are set.
+    /// invariant: `overflow` is `None` iff no bits ≥ 64 are set.
     overflow: Option<Vec<u64>>,
-    has_usize_max: bool,
 }
 
 /// This iterator, inspired by Kernighan's bit-counting algorighm, is `O(num_words + popcount)`
@@ -1386,7 +1466,6 @@ pub struct BitSetIter<B: std::borrow::Borrow<BitSet>> {
     current: u64,
     /// `0` = inline word, `1..=overflow.len()` = `overflow[word - 1]`.
     word: usize,
-    pending_usize_max: bool,
 }
 
 impl<B: std::borrow::Borrow<BitSet>> Iterator for BitSetIter<B> {
@@ -1405,22 +1484,8 @@ impl<B: std::borrow::Borrow<BitSet>> Iterator for BitSetIter<B> {
                 return Some(base + bit);
             }
             self.word += 1;
-            let next_word = self
-                .bitset
-                .borrow()
-                .overflow
-                .as_ref()
-                .and_then(|ov| ov.get(self.word - 1).copied());
-            match next_word {
-                Some(w) => self.current = w,
-                None => {
-                    if self.pending_usize_max {
-                        self.pending_usize_max = false;
-                        return Some(usize::MAX);
-                    }
-                    return None;
-                }
-            }
+            let overflow = self.bitset.borrow().overflow.as_ref()?;
+            self.current = *overflow.get(self.word - 1)?;
         }
     }
 }
@@ -1432,7 +1497,6 @@ impl<'a> IntoIterator for &'a BitSet {
     fn into_iter(self) -> Self::IntoIter {
         BitSetIter {
             current: self.inline,
-            pending_usize_max: self.has_usize_max,
             bitset: self,
             word: 0,
         }
@@ -1446,7 +1510,6 @@ impl IntoIterator for BitSet {
     fn into_iter(self) -> Self::IntoIter {
         BitSetIter {
             current: self.inline,
-            pending_usize_max: self.has_usize_max,
             bitset: self,
             word: 0,
         }
@@ -1457,10 +1520,6 @@ impl BitSet {
     const INLINE_BITS: usize = 64;
 
     pub fn set(&mut self, index: usize) {
-        if index == usize::MAX {
-            self.has_usize_max = true;
-            return;
-        }
         if index < Self::INLINE_BITS {
             self.inline |= 1 << index;
         } else {
@@ -1475,9 +1534,6 @@ impl BitSet {
     }
 
     pub fn get(&self, index: usize) -> bool {
-        if index == usize::MAX {
-            return self.has_usize_max;
-        }
         if index < Self::INLINE_BITS {
             (self.inline >> index) & 1 != 0
         } else {
@@ -1493,10 +1549,6 @@ impl BitSet {
     }
 
     pub fn clear(&mut self, index: usize) {
-        if index == usize::MAX {
-            self.has_usize_max = false;
-            return;
-        }
         if index < Self::INLINE_BITS {
             self.inline &= !(1 << index);
         } else if let Some(overflow) = &mut self.overflow {
@@ -1510,9 +1562,6 @@ impl BitSet {
     }
 
     pub fn contains_all_set_bits_of(&self, other: &Self) -> bool {
-        if other.has_usize_max && !self.has_usize_max {
-            return false;
-        }
         if (self.inline & other.inline) != other.inline {
             return false;
         }
@@ -1532,21 +1581,10 @@ impl BitSet {
     }
 
     pub fn is_empty(&self) -> bool {
-        self.inline == 0 && self.overflow.is_none() && !self.has_usize_max
+        self.inline == 0 && self.overflow.is_none()
     }
 
     pub fn is_only(&self, index: usize) -> bool {
-        if index == usize::MAX {
-            return self.has_usize_max
-                && self.inline == 0
-                && self
-                    .overflow
-                    .as_ref()
-                    .is_none_or(|ov| ov.iter().all(|&w| w == 0));
-        }
-        if self.has_usize_max {
-            return false;
-        }
         if index < Self::INLINE_BITS {
             self.inline == (1 << index)
                 && self
@@ -1577,9 +1615,6 @@ impl BitSet {
     }
 
     pub fn subtract(&mut self, other: &Self) {
-        if other.has_usize_max {
-            self.has_usize_max = false;
-        }
         self.inline &= !other.inline;
         if let (Some(self_ov), Some(other_ov)) = (&mut self.overflow, &other.overflow) {
             for (s, &o) in self_ov.iter_mut().zip(other_ov.iter()) {
@@ -1592,7 +1627,6 @@ impl BitSet {
     pub fn iter(&self) -> impl Iterator<Item = usize> + '_ {
         BitSetIter {
             current: self.inline,
-            pending_usize_max: self.has_usize_max,
             bitset: self,
             word: 0,
         }
@@ -1606,7 +1640,7 @@ impl BitSet {
                 count += word.count_ones() as usize;
             }
         }
-        count + self.has_usize_max as usize
+        count
     }
 
     /// Returns the number of set bits strictly below `index`.
@@ -1641,9 +1675,6 @@ impl BitSet {
     }
 
     pub(crate) fn intersects(&self, other: &Self) -> bool {
-        if self.has_usize_max && other.has_usize_max {
-            return true;
-        }
         if (self.inline & other.inline) != 0 {
             return true;
         }
@@ -1671,7 +1702,6 @@ impl BitSet {
 impl std::ops::BitOrAssign<&Self> for ColumnUsedMask {
     fn bitor_assign(&mut self, rhs: &Self) {
         self.inline |= rhs.inline;
-        self.has_usize_max |= rhs.has_usize_max;
         if let Some(rhs_ov) = &rhs.overflow {
             let self_ov = self.overflow.get_or_insert_with(Vec::new);
             if self_ov.len() < rhs_ov.len() {
@@ -1700,7 +1730,6 @@ impl From<u128> for BitSet {
         Self {
             inline: from as u64,
             overflow: (high != 0).then(|| vec![high]),
-            has_usize_max: false,
         }
     }
 }
@@ -3362,32 +3391,20 @@ mod tests {
     }
 
     #[test]
-    fn test_column_used_mask_usize_max_sentinel() {
-        // `usize::MAX` is stored out-of-band (see `BitSet::has_usize_max`) because the
-        // dense overflow vec can't address it. Every method that touches positions must
-        // honor this; this test pins the behavior down method-by-method.
+    fn test_column_mask_rowid_sentinel() {
+        // ColumnMask stores `usize::MAX` (ROWID_SENTINEL) in an out-of-band bool
+        // so that the underlying dense BitSet never sees it. The small API surface
+        // that ColumnMask exposes must all honor the sentinel consistently.
 
-        // --- set / get / clear round-trip
-        let mut mask = ColumnUsedMask::default();
+        // set / get round-trip on the sentinel alone
+        let mut mask = ColumnMask::default();
         assert!(!mask.get(usize::MAX));
         mask.set(usize::MAX);
         assert!(mask.get(usize::MAX));
-        mask.clear(usize::MAX);
-        assert!(!mask.get(usize::MAX));
+        assert_eq!(mask.count(), 1);
 
-        // --- is_empty / count / is_only with only the sentinel
-        let mut only_max = ColumnUsedMask::default();
-        only_max.set(usize::MAX);
-        assert!(!only_max.is_empty());
-        assert_eq!(only_max.count(), 1);
-        assert!(only_max.is_only(usize::MAX));
-        assert!(!only_max.is_only(0));
-        assert!(!only_max.is_only(63));
-        assert!(!only_max.is_only(64));
-        assert!(!only_max.is_only(1000));
-
-        // --- sentinel coexists with dense bits
-        let mut mixed = ColumnUsedMask::default();
+        // sentinel coexists with dense bits
+        let mut mixed = ColumnMask::default();
         mixed.set(0);
         mixed.set(63);
         mixed.set(64); // crosses into overflow
@@ -3399,91 +3416,22 @@ mod tests {
         assert!(mixed.get(500));
         assert!(mixed.get(usize::MAX));
         assert_eq!(mixed.count(), 5);
-        assert!(!mixed.is_only(usize::MAX)); // not alone
-        assert!(!mixed.is_only(0));
 
-        // iter() yields dense positions in ascending order, then `usize::MAX` at the end.
-        let collected: Vec<usize> = mixed.iter().collect();
+        // iter yields dense positions in ascending order, then usize::MAX at the end
+        let collected: Vec<usize> = (&mixed).into_iter().collect();
         assert_eq!(collected, vec![0, 63, 64, 500, usize::MAX]);
-        // count() and iter().count() must agree.
-        assert_eq!(mixed.count(), mixed.iter().count());
+        // count() and iter().count() must agree
+        assert_eq!(mixed.count(), (&mixed).into_iter().count());
 
-        // --- FromIterator and iter->collect round-trips through the sentinel
-        let built: BitSet = [0usize, 63, 64, 500, usize::MAX].into_iter().collect();
+        // FromIterator round-trip through the sentinel
+        let built: ColumnMask = [0usize, 63, 64, 500, usize::MAX].into_iter().collect();
         assert_eq!(built, mixed);
-        let round: BitSet = mixed.iter().collect();
+        let round: ColumnMask = (&mixed).into_iter().collect();
         assert_eq!(round, mixed);
 
-        // --- contains_all_set_bits_of
-        let mut superset = ColumnUsedMask::default();
-        superset.set(0);
-        superset.set(usize::MAX);
-        let mut subset = ColumnUsedMask::default();
-        subset.set(usize::MAX);
-        assert!(superset.contains_all_set_bits_of(&subset));
-        assert!(!subset.contains_all_set_bits_of(&superset));
-        assert!(superset.contains_all_set_bits_of(&superset));
-        // A mask without the sentinel never contains a mask that has it
-        let mut dense_only = ColumnUsedMask::default();
-        dense_only.set(0);
-        dense_only.set(12345);
-        let mut with_sentinel = ColumnUsedMask::default();
-        with_sentinel.set(usize::MAX);
-        assert!(!dense_only.contains_all_set_bits_of(&with_sentinel));
-
-        // --- subtract clears the sentinel when present in `other`
-        let mut a = ColumnUsedMask::default();
-        a.set(5);
-        a.set(usize::MAX);
-        let mut b = ColumnUsedMask::default();
-        b.set(usize::MAX);
-        a.subtract(&b);
-        assert!(a.get(5));
-        assert!(!a.get(usize::MAX));
-        // Subtracting a mask without the sentinel must not touch self's sentinel
-        let mut c = ColumnUsedMask::default();
-        c.set(usize::MAX);
-        c.set(10);
-        let mut d = ColumnUsedMask::default();
-        d.set(10);
-        c.subtract(&d);
-        assert!(c.get(usize::MAX));
-        assert!(!c.get(10));
-
-        // --- BitOrAssign ORs the sentinels
-        let mut e = ColumnUsedMask::default();
-        e.set(1);
-        let mut f = ColumnUsedMask::default();
-        f.set(usize::MAX);
-        e |= &f;
-        assert!(e.get(1));
-        assert!(e.get(usize::MAX));
-
-        // --- intersects is true iff both have the sentinel (or overlap densely)
-        let mut g = ColumnUsedMask::default();
-        g.set(usize::MAX);
-        let mut h = ColumnUsedMask::default();
-        h.set(usize::MAX);
-        assert!(g.intersects(&h));
-        let mut i = ColumnUsedMask::default();
-        i.set(0);
-        // `g` has only the sentinel; `i` has only 0; they don't intersect.
-        assert!(!g.intersects(&i));
-        assert!(!i.intersects(&g));
-
-        // --- rank(usize::MAX) counts positions STRICTLY below usize::MAX — so it
-        // deliberately excludes the sentinel. `count() == rank(usize::MAX) + get(MAX)`.
-        assert_eq!(
-            mixed.count(),
-            mixed.rank(usize::MAX) + mixed.get(usize::MAX) as usize
-        );
-
-        // --- clearing the sentinel leaves `is_empty` true when nothing else is set
-        let mut k = ColumnUsedMask::default();
-        k.set(usize::MAX);
-        k.clear(usize::MAX);
-        assert!(k.is_empty());
-        assert_eq!(k.count(), 0);
+        // owned IntoIterator (used by flat_map in the UPDATE emitter)
+        let mixed_owned: Vec<usize> = mixed.clone().into_iter().collect();
+        assert_eq!(mixed_owned, vec![0, 63, 64, 500, usize::MAX]);
     }
 
     fn rng_from_env_or_time() -> (ChaCha8Rng, u64) {
@@ -3538,16 +3486,8 @@ mod tests {
 
     #[test]
     fn test_column_used_mask_fuzz() {
-        // Pick an index in `0..max_index`, but with ~5% probability return `usize::MAX`
-        // to exercise the out-of-band sentinel slot alongside dense-range positions.
-        // `ReferenceMask` wraps `BTreeSet<usize>` which handles `usize::MAX` trivially,
-        // so the existing oracle comparisons keep working.
         fn pick_index(rng: &mut ChaCha8Rng, max_index: u32) -> usize {
-            if rng.next_u32() % 20 == 0 {
-                usize::MAX
-            } else {
-                (rng.next_u32() % max_index) as usize
-            }
+            (rng.next_u32() % max_index) as usize
         }
 
         let (mut rng, seed) = rng_from_env_or_time();

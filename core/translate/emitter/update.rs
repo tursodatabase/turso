@@ -1518,7 +1518,7 @@ fn emit_update_insns<'a>(
                 &btree_table.columns,
                 set_clauses.iter().map(|(idx, _)| *idx),
             )
-            .iter()
+            .into_iter()
             .filter_map(|col_idx| btree_table.columns.get(col_idx))
             .filter_map(|col| col.name.as_deref())
             .map(normalize_ident)

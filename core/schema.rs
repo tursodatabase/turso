@@ -2768,12 +2768,6 @@ pub(crate) fn columns_affected_by_update(
 ) -> ColumnMask {
     let mut affected = ColumnMask::default();
     for idx in updated_cols {
-        // We remove ROWID_SENTINEL because it would blow up ColumnMask (a dense bitset).
-        // Luckily, since the rowid column cannot be referenced by generated columns, it's safe to
-        // omit in this particular case.
-        if idx == ROWID_SENTINEL {
-            continue;
-        }
         affected.set(idx);
     }
     let mut changed = true;
@@ -2857,7 +2851,7 @@ pub(crate) fn dependencies_of_columns(
 }
 
 /// Returns true if `expr` references any column in `target_set`.
-fn expr_refers_one_of(expr: &Expr, columns: &[Column], target_set: &ColumnUsedMask) -> bool {
+fn expr_refers_one_of(expr: &Expr, columns: &[Column], target_set: &ColumnMask) -> bool {
     let mut found = false;
     let _ = walk_expr(expr, &mut |e| {
         if found {
