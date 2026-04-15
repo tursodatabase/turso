@@ -87,15 +87,15 @@ pub struct ConflictTarget {
 
 // Extract `(column, optional_collate)` from an ON CONFLICT target Expr.
 // Accepts: Id, Qualified, DoublyQualified, Parenthesized, Collate
-fn extract_target_key(e: &ast::Expr) -> Option<ConflictTarget> {
+fn extract_conflict_target(e: &ast::Expr) -> Option<ConflictTarget> {
     match e {
-        ast::Expr::Collate(inner, c) => {
-            let mut tk = extract_target_key(inner.as_ref())?;
-            let cstr = c.as_str();
-            tk.collate = Some(cstr.to_ascii_lowercase());
-            Some(tk)
+        ast::Expr::Collate(inner, collation) => {
+            let mut conflict_target = extract_conflict_target(inner.as_ref())?;
+            let collation_str = collation.as_str();
+            conflict_target.collate = Some(collation_str.to_ascii_lowercase());
+            Some(conflict_target)
         }
-        ast::Expr::Parenthesized(v) if v.len() == 1 => extract_target_key(&v[0]),
+        ast::Expr::Parenthesized(v) if v.len() == 1 => extract_conflict_target(&v[0]),
 
         ast::Expr::Id(name) => Some(ConflictTarget {
             col_name: normalize_ident(name.as_str()),
@@ -152,7 +152,7 @@ pub fn upsert_matches_rowid_alias(upsert: &Upsert, table: &Table) -> bool {
     // Only treat as PK if the PK is the rowid alias (INTEGER PRIMARY KEY)
     let pk = table.columns().iter().find(|c| c.is_rowid_alias());
     if let Some(pkcol) = pk {
-        extract_target_key(&t.targets[0].expr).is_some_and(|tk| {
+        extract_conflict_target(&t.targets[0].expr).is_some_and(|tk| {
             tk.col_name
                 .eq_ignore_ascii_case(pkcol.name.as_ref().unwrap_or(&String::new()))
         })
@@ -275,9 +275,9 @@ pub fn upsert_matches_index(upsert: &Upsert, index: &Index, table: &Table) -> bo
     for te in &target.targets {
         let mut found = None;
 
-        if let Some(tk) = extract_target_key(&te.expr) {
+        if let Some(conflict_target) = extract_conflict_target(&te.expr) {
             // Simple column reference target: match by name and collation.
-            let tname = &tk.col_name;
+            let tname = &conflict_target.col_name;
             for (i, ic) in index.columns.iter().enumerate() {
                 if matched.get(i) || ic.expr.is_some() {
                     continue;
@@ -285,7 +285,7 @@ pub fn upsert_matches_index(upsert: &Upsert, index: &Index, table: &Table) -> bo
                 let iname = normalize_ident(&ic.name);
                 let icoll = effective_collation_for_index_col(ic, table);
                 if tname.eq_ignore_ascii_case(&iname)
-                    && match tk.collate.as_ref() {
+                    && match conflict_target.collate.as_ref() {
                         Some(c) => c.eq_ignore_ascii_case(&icoll),
                         None => true, // unspecified collation -> accept any
                     }
