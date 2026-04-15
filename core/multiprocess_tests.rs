@@ -115,6 +115,29 @@ fn open_multiprocess_db_with_flags(
     Database::open_file_with_flags(io, path, flags, multiprocess_wal_db_opts(), None)
 }
 
+#[test]
+fn open_db_async_state_drop_clears_opening_registry_entry() {
+    let key = DatabaseKey::SharedMemory(
+        "open-db-async-state-drop-clears-opening-registry-entry".to_string(),
+    );
+    {
+        let mut manager = DATABASE_MANAGER.lock();
+        manager.clear();
+        manager.insert(key.clone(), RegistryEntry::Opening);
+    }
+
+    let mut state = OpenDbAsyncState::new();
+    state.registry_key = Some(key.clone());
+    drop(state);
+
+    let mut manager = DATABASE_MANAGER.lock();
+    assert!(
+        !manager.contains_key(&key),
+        "dropping an incomplete async open must clear the Opening sentinel"
+    );
+    manager.clear();
+}
+
 fn flip_db_header_reserved_byte(path: &std::path::Path) {
     use std::io::{Read, Seek, SeekFrom, Write};
 

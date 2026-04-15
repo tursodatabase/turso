@@ -395,6 +395,15 @@ impl OpenDbAsyncState {
     }
 }
 
+impl Drop for OpenDbAsyncState {
+    fn drop(&mut self) {
+        if let Some(registry_key) = self.registry_key.take() {
+            let mut registry = DATABASE_MANAGER.lock();
+            registry.remove(&registry_key);
+        }
+    }
+}
+
 /// Per-path entry in the database registry.
 enum RegistryEntry {
     /// Another caller is currently opening this database. Callers that see

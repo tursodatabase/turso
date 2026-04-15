@@ -294,16 +294,18 @@ impl Drop for Connection {
             }
 
             // Also release WAL locks on all attached database pagers
-            for attached_pager in self.get_all_attached_pagers() {
-                if let Some(wal) = &attached_pager.wal {
-                    if wal.holds_write_lock() {
-                        wal.end_write_tx();
-                    }
-                    if wal.holds_read_lock() {
-                        wal.end_read_tx();
+            self.with_all_attached_pagers_with_index(|attached_pagers| {
+                for (_, attached_pager) in attached_pagers {
+                    if let Some(wal) = &attached_pager.wal {
+                        if wal.holds_write_lock() {
+                            wal.end_write_tx();
+                        }
+                        if wal.holds_read_lock() {
+                            wal.end_read_tx();
+                        }
                     }
                 }
-            }
+            });
 
             // if connection wasn't properly closed, decrement the connection counter
             self.db
@@ -556,7 +558,7 @@ impl Connection {
     /// Check if a specific trigger is currently compiling (for recursive trigger prevention)
     pub fn trigger_is_compiling(&self, trigger: &Arc<Trigger>) -> bool {
         let compiling = self.compiling_triggers.read();
-        if let Some(trigger) = compiling.iter().find(|t| Arc::ptr_eq(t, trigger)) {
+        if let Some(trigger) = compiling.iter().find(|t| t.name == trigger.name) {
             tracing::debug!("Trigger is already compiling: {}", trigger.name);
             return true;
         }
@@ -579,7 +581,7 @@ impl Connection {
     /// Check if a specific trigger is currently executing (for recursive trigger prevention)
     pub fn is_trigger_executing(&self, trigger: &Arc<Trigger>) -> bool {
         let executing = self.executing_triggers.read();
-        if let Some(trigger) = executing.iter().find(|t| Arc::ptr_eq(t, trigger)) {
+        if let Some(trigger) = executing.iter().find(|t| t.name == trigger.name) {
             tracing::debug!("Trigger is already executing: {}", trigger.name);
             return true;
         }
@@ -2054,23 +2056,23 @@ impl Connection {
         self.db.initialized()
     }
 
-    pub(crate) fn get_pager_from_database_index(&self, index: &usize) -> Arc<Pager> {
+    pub(crate) fn get_pager_from_database_index(&self, index: &usize) -> Result<Arc<Pager>> {
         match *index {
-            crate::MAIN_DB_ID => self.pager.load().clone(),
+            crate::MAIN_DB_ID => Ok(self.pager.load().clone()),
             crate::TEMP_DB_ID => {
                 // Lazily initialize the temp database if it hasn't been created yet.
                 if self.temp.database.read().is_none() {
-                    self.ensure_temp_database()
-                        .expect("failed to initialize temp database");
+                    self.ensure_temp_database()?;
                 }
-                self.temp
+                Ok(self
+                    .temp
                     .database
                     .read()
                     .as_ref()
                     .map(|temp_db| temp_db.pager.clone())
-                    .expect("temp database should be initialized")
+                    .expect("temp database should be initialized after ensure_temp_database"))
             }
-            _ => self.attached_databases.read().get_pager_by_index(index),
+            _ => Ok(self.attached_databases.read().get_pager_by_index(index)),
         }
     }
 
@@ -2430,7 +2432,9 @@ impl Connection {
         // Rollback any active transaction on this database before detaching.
         // After the Database is removed from the catalog, the MvStore / Pager
         // become unreachable and the transaction would leak forever.
-        let pager = self.get_pager_from_database_index(&database_id);
+        let pager = self
+            .get_pager_from_database_index(&database_id)
+            .expect("attached database should always have a pager");
         if let Some((tx_id, _mode)) = self.get_mv_tx_for_db(database_id) {
             if let Some(mv_store) = self.mv_store_for_db(database_id) {
                 mv_store.rollback_tx(tx_id, pager.clone(), self, database_id);
@@ -2466,22 +2470,6 @@ impl Connection {
             .keys()
             .cloned()
             .collect()
-    }
-
-    /// Get all non-main database pagers (temp + attached).
-    pub fn get_all_attached_pagers(&self) -> Vec<Arc<Pager>> {
-        let mut pagers = Vec::new();
-        if let Some(temp_db) = self.temp.database.read().as_ref() {
-            pagers.push(temp_db.pager.clone());
-        }
-        let catalog = self.attached_databases.read();
-        pagers.extend(
-            catalog
-                .index_to_data
-                .values()
-                .map(|(_db, pager)| pager.clone()),
-        );
-        pagers
     }
 
     /// Invoke `f` with a slice of all non-main database (index, pager) pairs
@@ -2961,7 +2949,9 @@ impl Connection {
         let mut cleared_any_schema = false;
         for (&db_id, &(tx_id, _mode)) in &txs {
             if let Some(attached_mv_store) = self.mv_store_for_db(db_id) {
-                let attached_pager = self.get_pager_from_database_index(&db_id);
+                let attached_pager = self
+                    .get_pager_from_database_index(&db_id)
+                    .expect("attached MVCC transaction should always have a pager");
                 if attached_mv_store.is_tx_rollbackable(tx_id) {
                     attached_mv_store.rollback_tx(tx_id, attached_pager.clone(), self, db_id);
                 } else {

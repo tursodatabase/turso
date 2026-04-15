@@ -356,13 +356,20 @@ impl TursoRwLock {
         turso_debug_assert!(Self::has_writer(cur));
         // Preserve value bits, replace writer with one reader
         let desired = (cur & Self::VALUE_MASK) | Self::READER_INC;
-        let prev = self
-            .0
-            .compare_exchange(cur, desired, Ordering::AcqRel, Ordering::Relaxed);
-        turso_debug_assert!(
-            prev.is_ok(),
-            "downgrade CAS failed — lock was mutated concurrently"
-        );
+        #[cfg(debug_assertions)]
+        {
+            let prev = self
+                .0
+                .compare_exchange(cur, desired, Ordering::AcqRel, Ordering::Relaxed);
+            turso_debug_assert!(
+                prev.is_ok(),
+                "downgrade CAS failed — lock was mutated concurrently"
+            );
+        }
+        #[cfg(not(debug_assertions))]
+        {
+            self.0.store(desired, Ordering::Release);
+        }
     }
 
     #[inline]

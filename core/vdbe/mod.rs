@@ -1200,7 +1200,7 @@ impl Program {
 }
 
 impl Program {
-    fn get_pager_from_database_index(&self, idx: &usize) -> Arc<Pager> {
+    fn get_pager_from_database_index(&self, idx: &usize) -> Result<Arc<Pager>> {
         self.connection.get_pager_from_database_index(idx)
     }
 
@@ -1638,11 +1638,11 @@ impl Program {
             // bailing out. Defer these checks to here so the common case
             // (active main transaction) doesn't pay for the lock reads.
             let has_attached_mv_tx = self.connection.next_attached_mv_tx().is_some();
-            let has_attached_wal_tx = self
-                .connection
-                .get_all_attached_pagers()
-                .iter()
-                .any(|pager| pager.holds_read_lock());
+            let has_attached_wal_tx =
+                self.connection
+                    .with_all_attached_pagers_with_index(|pagers| {
+                        pagers.iter().any(|(_, pager)| pager.holds_read_lock())
+                    });
             if !has_attached_mv_tx && !has_attached_wal_tx {
                 return Ok(IOResult::Done(()));
             }
@@ -1661,16 +1661,19 @@ impl Program {
                 self.connection
                     .set_changes(program_state.n_change.load(Ordering::SeqCst));
             }
-            // finalize the in-memory TEMP schema. The pager's own
-            // rollback() only reinstates main's `connection.schema` from the
-            // shared `Database::schema`; TEMP has no shared Database so the
-            // connection keeps its own `committed_temp_schema` snapshot that
-            // we update here. Both methods are gated on `temp_schema_did_change`
-            // so they are cheap no-ops outside of temp DDL.
-            if rollback {
-                self.connection.rollback_temp_schema();
-            } else {
-                self.connection.commit_temp_schema();
+            let transaction_finished = self.connection.auto_commit.load(Ordering::SeqCst)
+                && self.connection.get_tx_state() == TransactionState::None;
+            if transaction_finished {
+                // Finalize the in-memory TEMP schema only when the outer
+                // transaction actually finishes. Updating the committed temp
+                // snapshot after every statement inside an explicit
+                // transaction would make a later full ROLLBACK restore
+                // uncommitted temp DDL.
+                if rollback {
+                    self.connection.rollback_temp_schema();
+                } else {
+                    self.connection.commit_temp_schema();
+                }
             }
         }
         Ok(res)
@@ -1827,7 +1830,9 @@ impl Program {
             };
             match step_result {
                 IOResult::Done(_) => {
-                    let attached_pager = conn.get_pager_from_database_index(&db_id);
+                    let attached_pager = conn
+                        .get_pager_from_database_index(&db_id)
+                        .expect("attached MVCC transaction should always have a pager");
                     conn.publish_database_schema(db_id);
                     conn.set_mv_tx_for_db(db_id, None);
                     attached_pager.end_read_tx();
@@ -1862,7 +1867,9 @@ impl Program {
             };
             match state_machine.step(&attached_mv_store)? {
                 IOResult::Done(_) => {
-                    let attached_pager = conn.get_pager_from_database_index(&db_id);
+                    let attached_pager = conn
+                        .get_pager_from_database_index(&db_id)
+                        .expect("attached MVCC transaction should always have a pager");
                     conn.publish_database_schema(db_id);
                     conn.set_mv_tx_for_db(db_id, None);
                     attached_pager.end_read_tx();
@@ -2015,11 +2022,21 @@ impl Program {
 
     /// End read transactions on all attached databases that had transactions started.
     fn end_attached_read_txns(&self, connection: &Connection) {
-        for attached_pager in connection.get_all_attached_pagers() {
-            if attached_pager.holds_read_lock() {
-                attached_pager.end_read_tx();
-            }
-        }
+        connection.with_all_attached_pagers_with_index(|pagers| {
+            pagers.iter().for_each(|(db_id, attached_pager)| {
+                if connection.mv_store_for_db(*db_id).is_some() {
+                    // MVCC-enabled attached DBs don't use WAL read transactions, so skip.
+                    return;
+                }
+                if attached_pager.holds_write_lock() {
+                    // Attached pager has a write lock, so its read transaction was ended by end_attached_write_txns: skip.
+                    return;
+                }
+                if attached_pager.holds_read_lock() {
+                    attached_pager.end_read_tx();
+                }
+            });
+        })
     }
 
     #[instrument(skip(self, commit_state, mv_store), level = Level::DEBUG)]

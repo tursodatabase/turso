@@ -1850,7 +1850,7 @@ impl FtsCursor {
         let index_name = format!("{}_key", self.dir_table_name);
 
         // Get root page for HybridBTreeDirectory
-        let pager = conn.get_pager_from_database_index(&database_id);
+        let pager = conn.get_pager_from_database_index(&database_id)?;
         let scratch = conn
             .with_schema(database_id, |schema| {
                 schema.get_index(&self.dir_table_name, &index_name).cloned()

@@ -2792,6 +2792,9 @@ impl Pager {
         } else {
             self.cleanup_read_tx();
         }
+        if wal.holds_read_lock() {
+            wal.end_read_tx();
+        }
     }
 
     /// Reads a page from disk (either WAL or DB file) bypassing page-cache

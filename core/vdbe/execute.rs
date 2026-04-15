@@ -517,7 +517,7 @@ pub fn op_checkpoint(
         return Ok(InsnFunctionStepResult::Step);
     }
 
-    let pager = program.get_pager_from_database_index(database);
+    let pager = program.get_pager_from_database_index(database)?;
     if !pager.has_wal() {
         set_not_in_wal_result(state, *dest);
         state.pc += 1;
@@ -1076,7 +1076,7 @@ pub fn op_open_read(
         insn
     );
 
-    let pager = program.get_pager_from_database_index(db);
+    let pager = program.get_pager_from_database_index(db)?;
     let mv_store = program.connection.mv_store_for_db(*db);
 
     if let (_, CursorType::IndexMethod(module)) = &program.cursor_ref[*cursor_id] {
@@ -3110,7 +3110,7 @@ pub fn op_transaction_inner(
     if *db == crate::TEMP_DB_ID {
         program.connection.ensure_temp_database()?;
     }
-    let pager = program.get_pager_from_database_index(db);
+    let pager = program.get_pager_from_database_index(db)?;
     // Get the MvStore for the specific database (main or attached).
     let mv_store = program.connection.mv_store_for_db(*db);
     loop {
@@ -3622,6 +3622,7 @@ pub fn op_auto_commit(
                 pager.rollback_tx(&conn);
             }
             conn.rollback_attached_wal_txns();
+            conn.rollback_temp_schema();
             conn.set_tx_state(TransactionState::None);
             conn.auto_commit.store(true, Ordering::SeqCst);
             conn.set_cdc_transaction_id(-1);
@@ -9982,7 +9983,7 @@ pub fn op_open_write(
     if program.connection.is_readonly(*db) {
         return Err(LimboError::ReadOnly);
     }
-    let pager = program.get_pager_from_database_index(db);
+    let pager = program.get_pager_from_database_index(db)?;
     let mv_store = program.connection.mv_store_for_db(*db);
 
     if let (_, CursorType::IndexMethod(module)) = &program.cursor_ref[*cursor_id] {
@@ -10150,7 +10151,7 @@ pub fn op_create_btree(
         state.pc += 1;
         return Ok(InsnFunctionStepResult::Step);
     }
-    let pager = program.get_pager_from_database_index(db);
+    let pager = program.get_pager_from_database_index(db)?;
     // FIXME: handle page cache is full
     let root_page = return_if_io!(pager.btree_create(flags));
     state.registers[*root].set_int(root_page as i64);
@@ -10313,7 +10314,7 @@ pub fn op_destroy(
     }
 
     let destroy_pager = if *db != MAIN_DB_ID {
-        program.get_pager_from_database_index(db)
+        program.get_pager_from_database_index(db)?
     } else {
         pager.clone()
     };
@@ -10573,7 +10574,7 @@ pub fn op_page_count(
     _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(PageCount { db, dest }, insn);
-    let pager = program.get_pager_from_database_index(db);
+    let pager = program.get_pager_from_database_index(db)?;
     let mv_store = program.connection.mv_store_for_db(*db);
     let count = match with_header(&pager, mv_store.as_ref(), program, *db, |header| {
         header.database_size.get()
@@ -11061,7 +11062,7 @@ pub fn op_read_cookie(
     _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(ReadCookie { db, dest, cookie }, insn);
-    let pager = program.get_pager_from_database_index(db);
+    let pager = program.get_pager_from_database_index(db)?;
     let mv_store = program.connection.mv_store_for_db(*db);
 
     let cookie_value =
@@ -11112,7 +11113,7 @@ pub fn op_set_cookie(
         },
         insn
     );
-    let pager = program.get_pager_from_database_index(db);
+    let pager = program.get_pager_from_database_index(db)?;
     let mv_store = program.connection.mv_store_for_db(*db);
     if let Some(mv_store) = mv_store.as_ref() {
         let Some(tx_id) = program.connection.get_mv_tx_id_for_db(*db) else {
@@ -11919,7 +11920,7 @@ pub fn op_integrity_check(
     let target_pager = if *db == MAIN_DB_ID {
         pager.clone()
     } else {
-        program.get_pager_from_database_index(db)
+        program.get_pager_from_database_index(db)?
     };
     match &mut state.op_integrity_check_state {
         OpIntegrityCheckState::Start => {
@@ -13850,7 +13851,7 @@ pub fn op_max_pgcnt(
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(MaxPgcnt { db, dest, new_max }, insn);
 
-    let pager = program.get_pager_from_database_index(db);
+    let pager = program.get_pager_from_database_index(db)?;
     let result_value = if *new_max == 0 {
         // If new_max is 0, just return current maximum without changing it
         pager.get_max_page_count()
@@ -13925,7 +13926,7 @@ fn op_journal_mode_inner(
     use crate::storage::sqlite3_ondisk::begin_write_btree_page;
 
     load_insn!(JournalMode { db, dest, new_mode }, insn);
-    let pager = program.get_pager_from_database_index(db);
+    let pager = program.get_pager_from_database_index(db)?;
     let pager = &pager;
 
     loop {
@@ -14382,7 +14383,7 @@ fn op_vacuum_into_inner(
                     // For attached db read from its own pager
                     let pager = program
                         .connection
-                        .get_pager_from_database_index(&database_id);
+                        .get_pager_from_database_index(&database_id)?;
                     io.block(|| pager.with_header(|header| header.reserved_space))?
                 };
 
