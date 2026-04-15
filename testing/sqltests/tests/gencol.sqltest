@@ -4465,3 +4465,11 @@ test replace-conflict-on-virtual-column {
     2|4
     3|6
 }
+
+test delete-using-indexed-virtual-column {
+    CREATE TABLE t(a, b AS (a * 2));
+    CREATE INDEX idx ON t(b);
+    INSERT INTO t VALUES (1);
+    DELETE FROM t WHERE b = 2;
+} expect {
+}
