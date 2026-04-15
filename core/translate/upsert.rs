@@ -270,7 +270,7 @@ pub fn upsert_matches_index(upsert: &Upsert, index: &Index, table: &Table) -> bo
     }
 
     // Track which index columns have been matched (consumed).
-    let mut matched = vec![false; index.columns.len()];
+    let mut matched = ColumnMask::default();
 
     for te in &target.targets {
         let mut found = None;
@@ -279,7 +279,7 @@ pub fn upsert_matches_index(upsert: &Upsert, index: &Index, table: &Table) -> bo
             // Simple column reference target: match by name and collation.
             let tname = &tk.col_name;
             for (i, ic) in index.columns.iter().enumerate() {
-                if matched[i] || ic.expr.is_some() {
+                if matched.get(i) || ic.expr.is_some() {
                     continue;
                 }
                 let iname = normalize_ident(&ic.name);
@@ -299,7 +299,7 @@ pub fn upsert_matches_index(upsert: &Upsert, index: &Index, table: &Table) -> bo
             // columns using semantic equivalence.
             let (target_expr, target_collate) = extract_target_expr(&te.expr);
             for (i, ic) in index.columns.iter().enumerate() {
-                if matched[i] {
+                if matched.get(i) {
                     continue;
                 }
                 if let Some(idx_expr) = &ic.expr {
@@ -319,13 +319,13 @@ pub fn upsert_matches_index(upsert: &Upsert, index: &Index, table: &Table) -> bo
         }
 
         if let Some(i) = found {
-            matched[i] = true;
+            matched.set(i);
         } else {
             return false;
         }
     }
     // All target columns matched exactly once, and all index columns consumed
-    matched.iter().all(|&m| m)
+    matched.count() == index.columns.len()
 }
 
 #[derive(Clone, Debug)]
