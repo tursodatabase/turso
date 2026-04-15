@@ -1707,7 +1707,7 @@ fn parse_join(
     };
 
     if natural && constraint.is_some() {
-        crate::bail_parse_error!("NATURAL JOIN cannot be combined with ON or USING clause");
+        crate::bail_parse_error!("a NATURAL join may not have an ON or USING clause");
     }
 
     // SQLite allows duplicate table names/aliases in FROM clauses.
@@ -1798,7 +1798,7 @@ fn parse_join(
                     }
                     if left_col.is_none() {
                         crate::bail_parse_error!(
-                            "cannot join using column {} - column not present in all tables",
+                            "cannot join using column {} - column not present in both tables",
                             distinct_name.as_str()
                         );
                     }
@@ -1809,7 +1809,7 @@ fn parse_join(
                     });
                     if right_col.is_none() {
                         crate::bail_parse_error!(
-                            "cannot join using column {} - column not present in all tables",
+                            "cannot join using column {} - column not present in both tables",
                             distinct_name.as_str()
                         );
                     }
