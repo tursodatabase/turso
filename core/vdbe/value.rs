@@ -790,27 +790,45 @@ impl Value {
             return Value::from_f64(((f + if f < 0.0 { -0.5 } else { 0.5 }) as i64) as f64);
         }
 
-        // Rust's format! uses banker's rounding (round-half-to-even), which differs
-        // from SQLite's round-half-away-from-zero only at exact midpoint ties.
-        // Format with extra precision to detect ties, then handle them explicitly.
+        // Format once with extra fractional digits, then round that decimal
+        // buffer in place using SQLite's round-half-away-from-zero rule.
         let abs_f = f.abs();
         let extra_prec = precision + 20;
-        let extended = format!("{abs_f:.extra_prec$}");
-        let dot_pos = extended.find('.').unwrap();
-        let after_dot = &extended.as_bytes()[dot_pos + 1..];
+        let mut buf = format!("{abs_f:.extra_prec$}");
+        let dot_pos = buf
+            .find('.')
+            .expect("fixed-precision format should contain '.'");
+        let round_pos = dot_pos + 1 + precision;
+        let round_up = buf.as_bytes()[round_pos] >= b'5';
+        buf.truncate(round_pos);
 
-        let is_exact_tie =
-            after_dot[precision] == b'5' && after_dot[precision + 1..].iter().all(|&b| b == b'0');
+        if round_up {
+            // Safe: we only mutate ASCII digits and keep the existing '.' intact,
+            // so the string remains valid UTF-8.
+            let bytes = unsafe { buf.as_mut_vec() };
+            let mut i = bytes.len();
+            loop {
+                // Walk right-to-left over e.g. "12.349", turning trailing 9s into 0s
+                // until we can increment one kept digit, yielding "12.350".
 
-        let result = if is_exact_tie {
-            let truncated: f64 = extended[..dot_pos + 1 + precision].parse().unwrap();
-            let unit = 10f64.powi(-(precision as i32));
-            format!("{:.precision$}", truncated + unit)
-                .parse::<f64>()
-                .unwrap()
-        } else {
-            format!("{abs_f:.precision$}").parse::<f64>().unwrap()
-        };
+                // If we've reached the leftmost digit, we've seen only digit 9s so prepend a 1 to round up
+                if i == 0 {
+                    bytes.insert(0, b'1');
+                    break;
+                }
+                i -= 1;
+                if bytes[i] == b'.' {
+                    continue;
+                }
+                if bytes[i] < b'9' {
+                    bytes[i] += 1;
+                    break;
+                }
+                bytes[i] = b'0';
+            }
+        }
+
+        let result = buf.parse::<f64>().unwrap();
 
         Value::from_f64(if f < 0.0 { -result } else { result })
     }
@@ -2763,6 +2781,11 @@ mod tests {
         let input_val = Value::from_f64(2.5);
         let expected_val = Value::from_f64(3.0);
         assert_eq!(input_val.exec_round(None), expected_val);
+
+        let input_val = Value::from_f64(1.125);
+        let precision_val = Value::from_i64(2);
+        let expected_val = Value::from_f64(1.13);
+        assert_eq!(input_val.exec_round(Some(&precision_val)), expected_val);
     }
 
     #[test]
