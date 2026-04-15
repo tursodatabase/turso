@@ -19,7 +19,7 @@ use super::order_by::SortMetadata;
 use super::plan::{HashJoinType, TableReferences};
 use crate::error::SQLITE_CONSTRAINT_CHECK;
 use crate::function::Func;
-use crate::schema::stored_deps_of_virtual;
+use crate::schema::dependencies_of_columns;
 use crate::schema::{
     BTreeTable, CheckConstraint, Column, ColumnLayout, GeneratedType, IndexColumn, Schema, Table,
 };
@@ -1634,16 +1634,18 @@ fn rewrite_where_for_update_registers(
     })
 }
 
-/// Reads the stored columns needed by `target_columns` into compact registers. This takes into
-/// account stored columns, and any stored columns required by virtual columns in `target_columns`.
-pub(crate) fn cursor_to_registers(
+/// Emits  `target_columns`, plus the stored columns needed by `target_columns`, into compact
+/// registers. This takes into account stored columns, and any stored columns required
+/// by virtual columns in `target_columns`.
+#[must_use]
+pub(crate) fn emit_columns_and_dependencies(
     program: &mut ProgramBuilder,
     table: &BTreeTable,
     cursor_id: usize,
     rowid_reg: usize,
     target_columns: impl IntoIterator<Item = usize>,
 ) -> DmlColumnContext {
-    let dependencies = stored_deps_of_virtual(&table.columns, target_columns);
+    let dependencies = dependencies_of_columns(&table.columns, target_columns);
     let base = program.alloc_registers(dependencies.count());
     let mut next_reg = base;
     let pairs = table.columns.iter().enumerate().map(|(idx, col)| {
@@ -1702,11 +1704,7 @@ pub(crate) fn emit_index_column_value_old_image(
             )?;
             Ok(())
         })?;
-    } else if let Some((table, generated_column)) =
-        generated_column(program, table_cursor_id, idx_col)
-    {
-        cursor_to_registers(program, &table, table_cursor_id, 0, [idx_col.pos_in_table]);
-
+    } else if let Some(generated_column) = generated_column(program, table_cursor_id, idx_col) {
         emit_table_column(
             program,
             table_cursor_id,
@@ -1727,7 +1725,7 @@ fn generated_column(
     program: &mut ProgramBuilder,
     table_cursor_id: usize,
     idx_col: &IndexColumn,
-) -> Option<(Arc<BTreeTable>, Column)> {
+) -> Option<Column> {
     program
         .btree_table_from_cursor(table_cursor_id)
         .iter()
@@ -1737,7 +1735,7 @@ fn generated_column(
                 .columns
                 .get(idx_col.pos_in_table)
                 .filter(|col| col.is_virtual_generated())
-                .map(|col| (table.clone(), col.clone()))
+                .cloned()
         })
         .next()
 }
@@ -1805,10 +1803,10 @@ fn emit_index_column_value_new_image(
             .get(idx_col.pos_in_table)
             .expect("column index out of bounds");
         match col_in_table.generated_type() {
-            GeneratedType::Virtual { ref resolved, .. } => {
+            GeneratedType::Virtual { ref expr, .. } => {
                 gencol::emit_gencol_expr_from_registers(
                     program,
-                    resolved,
+                    expr,
                     dest_reg,
                     columns_start_reg,
                     columns,

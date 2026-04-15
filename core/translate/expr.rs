@@ -3184,7 +3184,7 @@ pub fn translate_expr(
                         match table_column.generated_type() {
                             // if we're reading from an index that contains this virtual column,
                             // the index already has the computed value, so read it from the index
-                            GeneratedType::Virtual { resolved: expr, .. } if !read_from_index => {
+                            GeneratedType::Virtual { expr, .. } if !read_from_index => {
                                 program.with_self_table_context(
                                     Some(&SelfTableContext::ForSelect {
                                         table_ref_id: *table_ref_id,
@@ -5260,7 +5260,7 @@ fn do_emit_table_column(
     resolver: &Resolver,
 ) -> Result<()> {
     match column.generated_type() {
-        GeneratedType::Virtual { resolved: expr, .. } => {
+        GeneratedType::Virtual { expr, .. } => {
             program.with_self_table_context(Some(self_table_context), |program, _| {
                 translate_expr(program, referenced_tables, expr, target_register, resolver)?;
                 Ok(())

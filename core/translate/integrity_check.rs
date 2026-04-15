@@ -300,9 +300,9 @@ fn translate_integrity_check_impl(
             .filter_map(|(idx, col)| {
                 let name = col.name.clone().unwrap_or_else(|| format!("column{idx}"));
                 match col.generated_type() {
-                    GeneratedType::Virtual { resolved, .. } => {
+                    GeneratedType::Virtual { expr, .. } => {
                         let bound =
-                            bind_expr_for_table(resolved, &mut table_references, resolver).ok()?;
+                            bind_expr_for_table(expr, &mut table_references, resolver).ok()?;
                         Some((BoundIndexColumn::Expr(Box::new(bound)), name))
                     }
                     GeneratedType::NotGenerated => Some((BoundIndexColumn::Column(idx), name)),

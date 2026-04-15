@@ -2648,7 +2648,7 @@ fn translate_column(
         });
     } else if matches!(
         column.generated_type(),
-        GeneratedType::Virtual { resolved, .. } if resolved.is_constant(resolver)
+        GeneratedType::Virtual { expr, .. } if expr.is_constant(resolver)
     ) {
         // Constant virtual generated columns are hoisted to the program init
         // section by translate_expr in compute_virtual_columns. Emitting NULL
