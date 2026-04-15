@@ -28,6 +28,7 @@ url = "https://registry.fossier.io"
 report_denials = true
 check_before_scoring = true
 block_threshold = 3
+report_score_denials = false
 
 [trust]
 flood_threshold = 4
