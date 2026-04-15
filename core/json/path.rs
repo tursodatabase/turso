@@ -35,6 +35,10 @@ pub enum PathElement<'a> {
     Key(Cow<'a, str>, RawString),
     /// Array locator, eg. [2], [#-5]
     ArrayLocator(Option<i32>),
+    /// Bracket-quoted key (e.g. `$["key"]`). Parsed without error for SQLite
+    /// compatibility but never matches during extraction — SQLite returns NULL
+    /// for bracket-notation on non-array nodes.
+    BracketQuotedKey(Cow<'a, str>),
 }
 
 type IsMaxNumber = bool;
@@ -233,14 +237,14 @@ fn handle_quoted_key<'a>(
     Ok(())
 }
 
-fn handle_array_index(
+fn handle_array_index<'a>(
     ch: (usize, char),
     parser_state: &mut PPState,
     index_state: &mut ArrayIndexState,
     index_buffer: &mut i128,
-    path_components: &mut Vec<PathElement<'_>>,
+    path_components: &mut Vec<PathElement<'a>>,
     path_iter: &mut std::str::CharIndices,
-    path: &str,
+    path: &'a str,
 ) -> crate::Result<()> {
     match (&index_state, ch.1) {
         (ArrayIndexState::Start, '#') => {
@@ -251,6 +255,13 @@ fn handle_array_index(
                 crate::LimboError::ParseError(format!("failed to parse digit: {ch}", ch = ch.1))
             })? as i128;
             *index_state = ArrayIndexState::CollectingNumbers;
+        }
+        // Bracket-notation quoted key, e.g. $["key with spaces"] or $['key'].
+        // Issue #6099: previously this fell through to the catch-all and produced
+        // a "Bad json path" parse error. Dispatch to a dedicated helper that
+        // consumes the quoted string and the closing `]`.
+        (ArrayIndexState::Start, q @ ('"' | '\'')) => {
+            handle_bracket_quoted_key(q, ch.0, parser_state, path_components, path_iter, path)?;
         }
         (ArrayIndexState::AfterHash, '-') => {
             handle_negative_index(index_state, index_buffer, path_iter, path)?;
@@ -280,6 +291,56 @@ fn handle_array_index(
         (_, _) => bail_parse_error!("Bad json path: {}", path),
     }
     Ok(())
+}
+
+/// Handle bracket-notation with a quoted key, e.g. `$["key with spaces"]` or `$['key']`.
+/// The opening bracket and the opening quote have already been consumed by
+/// `handle_array_index`; `quote_start` is the byte index of the opening quote.
+/// After the closing quote we require a `]`.
+///
+/// Escape handling mirrors `handle_quoted_key` (raw bytes preserved, no decoding)
+/// so the dot-quoted form `$."key"` and the bracket-quoted form behave the same.
+fn handle_bracket_quoted_key<'a>(
+    quote_char: char,
+    quote_start: usize,
+    parser_state: &mut PPState,
+    path_components: &mut Vec<PathElement<'a>>,
+    path_iter: &mut std::str::CharIndices,
+    path: &'a str,
+) -> crate::Result<()> {
+    // The quote character is always 1 byte (ASCII '"' or '\''), so the key
+    // content begins at quote_start + 1.
+    let key_content_start = quote_start + 1;
+    let mut key_end: Option<usize> = None;
+
+    while let Some((idx, ch)) = path_iter.next() {
+        match ch {
+            '\\' => {
+                // Skip the escaped character (matches handle_quoted_key's behavior).
+                path_iter.next();
+            }
+            c if c == quote_char => {
+                key_end = Some(idx);
+                break;
+            }
+            _ => {}
+        }
+    }
+
+    let Some(key_end) = key_end else {
+        bail_parse_error!("Bad json path: {}", path)
+    };
+
+    // Expect the closing bracket immediately after the closing quote.
+    match path_iter.next() {
+        Some((_, ']')) => {
+            let key = &path[key_content_start..key_end];
+            path_components.push(PathElement::BracketQuotedKey(Cow::Borrowed(key)));
+            *parser_state = PPState::ExpectDotOrBracket;
+            Ok(())
+        }
+        _ => bail_parse_error!("Bad json path: {}", path),
+    }
 }
 
 fn handle_negative_index(
@@ -526,5 +587,80 @@ mod tests {
             path.elements[1],
             PathElement::Key(Cow::Borrowed("世界"), true)
         );
+    }
+
+    #[test]
+    fn test_bracket_quoted_key() {
+        // Issue #6099: bracket notation with double-quoted key.
+        // Parsed successfully but produces BracketQuotedKey (never matches
+        // during extraction — SQLite compat, always returns NULL).
+        let path = json_path(r#"$["key"]"#).unwrap();
+        assert_eq!(path.elements.len(), 2);
+        assert_eq!(path.elements[0], PathElement::Root());
+        assert_eq!(
+            path.elements[1],
+            PathElement::BracketQuotedKey(Cow::Borrowed("key"))
+        );
+
+        // Key containing spaces (the original issue example).
+        let path = json_path(r#"$["key with spaces"]"#).unwrap();
+        assert_eq!(
+            path.elements[1],
+            PathElement::BracketQuotedKey(Cow::Borrowed("key with spaces"))
+        );
+
+        // Key containing dots.
+        let path = json_path(r#"$["key.with.dots"]"#).unwrap();
+        assert_eq!(
+            path.elements[1],
+            PathElement::BracketQuotedKey(Cow::Borrowed("key.with.dots"))
+        );
+
+        // Key containing brackets.
+        let path = json_path(r#"$["key[0]"]"#).unwrap();
+        assert_eq!(
+            path.elements[1],
+            PathElement::BracketQuotedKey(Cow::Borrowed("key[0]"))
+        );
+
+        // Single-quoted variant.
+        let path = json_path(r#"$['key']"#).unwrap();
+        assert_eq!(
+            path.elements[1],
+            PathElement::BracketQuotedKey(Cow::Borrowed("key"))
+        );
+
+        // Empty quoted key.
+        let path = json_path(r#"$[""]"#).unwrap();
+        assert_eq!(
+            path.elements[1],
+            PathElement::BracketQuotedKey(Cow::Borrowed(""))
+        );
+
+        // Mixed with dot notation and array indices.
+        let path = json_path(r#"$.outer["inner key"][2]"#).unwrap();
+        assert_eq!(path.elements.len(), 4);
+        assert_eq!(
+            path.elements[1],
+            PathElement::Key(Cow::Borrowed("outer"), false)
+        );
+        assert_eq!(
+            path.elements[2],
+            PathElement::BracketQuotedKey(Cow::Borrowed("inner key"))
+        );
+        assert_eq!(path.elements[3], PathElement::ArrayLocator(Some(2)));
+    }
+
+    #[test]
+    fn test_bracket_quoted_key_invalid() {
+        // Unclosed quote.
+        assert!(json_path(r#"$["key"#).is_err());
+        // Closing quote but no closing bracket.
+        assert!(json_path(r#"$["key""#).is_err());
+        // Mismatched quote characters (single quote inside double-quoted key
+        // is fine; this case has the wrong closing quote).
+        assert!(json_path(r#"$["key']"#).is_err());
+        // Trailing junk between closing quote and bracket.
+        assert!(json_path(r#"$["key"x]"#).is_err());
     }
 }
