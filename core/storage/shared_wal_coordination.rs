@@ -37,7 +37,7 @@ use std::ptr::NonNull;
 /// Durable file-format magic stored at the start of every `.tshm` mapping.
 const SHARED_WAL_COORDINATION_MAGIC: [u8; 8] = *b"TSHMWAL\0";
 /// Durable `.tshm` file-format version. Bump whenever persisted layout changes.
-const SHARED_WAL_COORDINATION_VERSION: u32 = 9;
+const SHARED_WAL_COORDINATION_VERSION: u32 = 10;
 /// Version for the optional persisted backfill-proof payload.
 const SHARED_WAL_BACKFILL_PROOF_VERSION: u32 = 1;
 /// Sentinel meaning a reader slot is not currently pinning any WAL frame.
@@ -523,6 +523,11 @@ struct SharedWalCoordinationMapHeader {
     /// only exists as a last-resort guard once we have consumed the full mapped
     /// region.
     frame_index_overflowed: AtomicU32,
+    /// Sequence lock protecting multi-field snapshot reads and writes.
+    ///
+    /// Even values mean stable. Odd values mean a writer is publishing a new
+    /// snapshot, so readers must retry.
+    snapshot_seq: AtomicU64,
     max_frame: AtomicU64,
     nbackfills: AtomicU64,
     transaction_count: AtomicU64,
@@ -852,18 +857,7 @@ impl MappedSharedWalCoordination {
             LimboError::InternalError("shared WAL coordination path is not valid UTF-8".into())
         })?)?;
         let lock_kind = Self::lock_kind_for_mode(ownership_mode);
-        let open_mode =
-            match file.shared_wal_try_lock_byte(PROCESS_LIFETIME_LOCK_OFFSET, true, lock_kind)? {
-                true => {
-                    file.shared_wal_unlock_byte(PROCESS_LIFETIME_LOCK_OFFSET, lock_kind)?;
-                    file.shared_wal_lock_byte(PROCESS_LIFETIME_LOCK_OFFSET, false, lock_kind)?;
-                    SharedWalCoordinationOpenMode::Exclusive
-                }
-                false => {
-                    file.shared_wal_lock_byte(PROCESS_LIFETIME_LOCK_OFFSET, false, lock_kind)?;
-                    SharedWalCoordinationOpenMode::MultiProcess
-                }
-            };
+        let open_mode = Self::detect_open_mode(&file, lock_kind, base_len)?;
         let metadata_len = file.size()? as usize;
         let initialize = metadata_len == 0
             || (open_mode == SharedWalCoordinationOpenMode::Exclusive && metadata_len < base_len);
@@ -957,18 +951,7 @@ impl MappedSharedWalCoordination {
             Err(err) => return Err(err),
         };
         let lock_kind = Self::lock_kind_for_mode(ownership_mode);
-        let open_mode =
-            match file.shared_wal_try_lock_byte(PROCESS_LIFETIME_LOCK_OFFSET, true, lock_kind)? {
-                true => {
-                    file.shared_wal_unlock_byte(PROCESS_LIFETIME_LOCK_OFFSET, lock_kind)?;
-                    file.shared_wal_lock_byte(PROCESS_LIFETIME_LOCK_OFFSET, false, lock_kind)?;
-                    SharedWalCoordinationOpenMode::Exclusive
-                }
-                false => {
-                    file.shared_wal_lock_byte(PROCESS_LIFETIME_LOCK_OFFSET, false, lock_kind)?;
-                    SharedWalCoordinationOpenMode::MultiProcess
-                }
-            };
+        let open_mode = Self::detect_open_mode(&file, lock_kind, base_len)?;
         let metadata_len = file.size()? as usize;
         if metadata_len < base_len {
             file.shared_wal_unlock_byte(PROCESS_LIFETIME_LOCK_OFFSET, lock_kind)?;
@@ -1025,6 +1008,30 @@ impl MappedSharedWalCoordination {
         READER_LOCK_START_OFFSET + slot_index as u64
     }
 
+    fn detect_open_mode(
+        file: &Arc<dyn File>,
+        lock_kind: SharedWalLockKind,
+        base_len: usize,
+    ) -> Result<SharedWalCoordinationOpenMode> {
+        let metadata_len_before_probe = file.size()? as usize;
+        match file.shared_wal_try_lock_byte(PROCESS_LIFETIME_LOCK_OFFSET, true, lock_kind)? {
+            true => {
+                file.shared_wal_unlock_byte(PROCESS_LIFETIME_LOCK_OFFSET, lock_kind)?;
+                file.shared_wal_lock_byte(PROCESS_LIFETIME_LOCK_OFFSET, false, lock_kind)?;
+                let metadata_len_after_probe = file.size()? as usize;
+                if metadata_len_before_probe < base_len && metadata_len_after_probe >= base_len {
+                    Ok(SharedWalCoordinationOpenMode::MultiProcess)
+                } else {
+                    Ok(SharedWalCoordinationOpenMode::Exclusive)
+                }
+            }
+            false => {
+                file.shared_wal_lock_byte(PROCESS_LIFETIME_LOCK_OFFSET, false, lock_kind)?;
+                Ok(SharedWalCoordinationOpenMode::MultiProcess)
+            }
+        }
+    }
+
     /// Return whether dropping this mapping would leave no other process with
     /// the lifetime byte lock held.
     ///
@@ -1044,6 +1051,9 @@ impl MappedSharedWalCoordination {
         let _ = self
             .file
             .shared_wal_unlock_byte(PROCESS_LIFETIME_LOCK_OFFSET, self.lock_kind());
+        let _ =
+            self.file
+                .shared_wal_lock_byte(PROCESS_LIFETIME_LOCK_OFFSET, false, self.lock_kind());
         true
     }
 
@@ -1147,26 +1157,33 @@ impl MappedSharedWalCoordination {
     }
 
     /// Read a consistent snapshot of the shared coordination header.
-    ///
-    /// # Safety invariant
-    /// Individual fields are read with atomic loads, but the multi-field read is
-    /// NOT an atomic snapshot. Consistency relies on the writer lock serializing
-    /// all modifications — any concurrent modifier MUST hold the writer lock.
     pub(crate) fn snapshot(&self) -> SharedWalCoordinationHeader {
         let header = self.header();
-        SharedWalCoordinationHeader {
-            max_frame: header.max_frame.load(Ordering::Acquire),
-            nbackfills: header.nbackfills.load(Ordering::Acquire),
-            transaction_count: header.transaction_count.load(Ordering::Acquire),
-            visibility_generation: header.visibility_generation.load(Ordering::Acquire),
-            checkpoint_seq: header.checkpoint_seq.load(Ordering::Acquire),
-            checkpoint_epoch: header.checkpoint_epoch.load(Ordering::Acquire),
-            page_size: header.page_size.load(Ordering::Acquire),
-            salt_1: header.salt_1.load(Ordering::Acquire),
-            salt_2: header.salt_2.load(Ordering::Acquire),
-            checksum_1: header.checksum_1.load(Ordering::Acquire),
-            checksum_2: header.checksum_2.load(Ordering::Acquire),
-            reader_slot_count: header.reader_slot_count,
+        loop {
+            let seq_before = header.snapshot_seq.load(Ordering::Acquire);
+            if seq_before & 1 != 0 {
+                std::hint::spin_loop();
+                continue;
+            }
+            let snapshot = SharedWalCoordinationHeader {
+                max_frame: header.max_frame.load(Ordering::Acquire),
+                nbackfills: header.nbackfills.load(Ordering::Acquire),
+                transaction_count: header.transaction_count.load(Ordering::Acquire),
+                visibility_generation: header.visibility_generation.load(Ordering::Acquire),
+                checkpoint_seq: header.checkpoint_seq.load(Ordering::Acquire),
+                checkpoint_epoch: header.checkpoint_epoch.load(Ordering::Acquire),
+                page_size: header.page_size.load(Ordering::Acquire),
+                salt_1: header.salt_1.load(Ordering::Acquire),
+                salt_2: header.salt_2.load(Ordering::Acquire),
+                checksum_1: header.checksum_1.load(Ordering::Acquire),
+                checksum_2: header.checksum_2.load(Ordering::Acquire),
+                reader_slot_count: header.reader_slot_count,
+            };
+            let seq_after = header.snapshot_seq.load(Ordering::Acquire);
+            if seq_before == seq_after {
+                return snapshot;
+            }
+            std::hint::spin_loop();
         }
     }
 
@@ -1195,37 +1212,37 @@ impl MappedSharedWalCoordination {
         // range, trim them before publishing the new header so later frame
         // appends cannot observe a stale tail.
         self.rollback_frames(snapshot.max_frame);
-
-        let header = self.header();
-        header
-            .max_frame
-            .store(snapshot.max_frame, Ordering::Release);
-        header
-            .nbackfills
-            .store(snapshot.nbackfills, Ordering::Release);
-        header
-            .transaction_count
-            .store(snapshot.transaction_count, Ordering::Release);
-        header
-            .visibility_generation
-            .store(snapshot.visibility_generation, Ordering::Release);
-        header
-            .checkpoint_seq
-            .store(snapshot.checkpoint_seq, Ordering::Release);
-        header
-            .checkpoint_epoch
-            .store(snapshot.checkpoint_epoch, Ordering::Release);
-        header
-            .page_size
-            .store(snapshot.page_size, Ordering::Release);
-        header.salt_1.store(snapshot.salt_1, Ordering::Release);
-        header.salt_2.store(snapshot.salt_2, Ordering::Release);
-        header
-            .checksum_1
-            .store(snapshot.checksum_1, Ordering::Release);
-        header
-            .checksum_2
-            .store(snapshot.checksum_2, Ordering::Release);
+        self.with_snapshot_write(|header| {
+            header
+                .max_frame
+                .store(snapshot.max_frame, Ordering::Release);
+            header
+                .nbackfills
+                .store(snapshot.nbackfills, Ordering::Release);
+            header
+                .transaction_count
+                .store(snapshot.transaction_count, Ordering::Release);
+            header
+                .visibility_generation
+                .store(snapshot.visibility_generation, Ordering::Release);
+            header
+                .checkpoint_seq
+                .store(snapshot.checkpoint_seq, Ordering::Release);
+            header
+                .checkpoint_epoch
+                .store(snapshot.checkpoint_epoch, Ordering::Release);
+            header
+                .page_size
+                .store(snapshot.page_size, Ordering::Release);
+            header.salt_1.store(snapshot.salt_1, Ordering::Release);
+            header.salt_2.store(snapshot.salt_2, Ordering::Release);
+            header
+                .checksum_1
+                .store(snapshot.checksum_1, Ordering::Release);
+            header
+                .checksum_2
+                .store(snapshot.checksum_2, Ordering::Release);
+        });
     }
 
     /// Repair transient runtime state when a process determines that it can
@@ -1302,9 +1319,7 @@ impl MappedSharedWalCoordination {
     /// Publish a committed transaction to the shared coordination header.
     ///
     /// # Precondition
-    /// The caller MUST hold the WAL writer lock. The multi-field update is not
-    /// atomic; the writer lock serializes all writers so readers see a consistent
-    /// state (the checksum TOCTOU below is safe only under this invariant).
+    /// The caller MUST hold the WAL writer lock.
     pub(crate) fn publish_commit(
         &self,
         max_frame: u64,
@@ -1313,22 +1328,23 @@ impl MappedSharedWalCoordination {
         transaction_count: u64,
     ) {
         self.clear_backfill_proof();
-        let header = self.header();
-        // Use fetch_max to ensure we never lower max_frame. In multi-process
-        // mode, another process may have committed frames after ours, advancing
-        // max_frame beyond our local value. Overwriting with a smaller value
-        // would make those later frames invisible to checkpoints, causing data loss.
-        header.max_frame.fetch_max(max_frame, Ordering::AcqRel);
-        // Only update checksums if we are the latest writer (our max_frame is the current max).
-        // Otherwise, a later writer's checksums are authoritative.
-        if header.max_frame.load(Ordering::Acquire) == max_frame {
-            header.checksum_1.store(checksum_1, Ordering::Release);
-            header.checksum_2.store(checksum_2, Ordering::Release);
-        }
-        header
-            .transaction_count
-            .fetch_max(transaction_count, Ordering::AcqRel);
-        header.visibility_generation.fetch_add(1, Ordering::AcqRel);
+        self.with_snapshot_write(|header| {
+            // Use fetch_max to ensure we never lower max_frame. In multi-process
+            // mode, another process may have committed frames after ours, advancing
+            // max_frame beyond our local value. Overwriting with a smaller value
+            // would make those later frames invisible to checkpoints, causing data loss.
+            header.max_frame.fetch_max(max_frame, Ordering::AcqRel);
+            // Only update checksums if we are the latest writer (our max_frame is the current max).
+            // Otherwise, a later writer's checksums are authoritative.
+            if header.max_frame.load(Ordering::Acquire) == max_frame {
+                header.checksum_1.store(checksum_1, Ordering::Release);
+                header.checksum_2.store(checksum_2, Ordering::Release);
+            }
+            header
+                .transaction_count
+                .fetch_max(transaction_count, Ordering::AcqRel);
+            header.visibility_generation.fetch_add(1, Ordering::AcqRel);
+        });
     }
 
     /// Publish durable checkpoint progress after a successful backfill step.
@@ -1339,9 +1355,9 @@ impl MappedSharedWalCoordination {
         if nbackfills == 0 {
             self.clear_backfill_proof();
         }
-        self.header()
-            .nbackfills
-            .store(nbackfills, Ordering::Release);
+        self.with_snapshot_write(|header| {
+            header.nbackfills.store(nbackfills, Ordering::Release);
+        });
     }
 
     /// Clear the persisted durable proof that positive checkpoint progress is safe to trust.
@@ -1503,15 +1519,23 @@ impl MappedSharedWalCoordination {
 
     /// Seed only the WAL header identity fields needed before the first commit is published.
     pub(crate) fn install_header_fields(&self, page_size: u32, salt_1: u32, salt_2: u32) {
-        let header = self.header();
-        header.page_size.store(page_size, Ordering::Release);
-        header.salt_1.store(salt_1, Ordering::Release);
-        header.salt_2.store(salt_2, Ordering::Release);
+        self.with_snapshot_write(|header| {
+            header.page_size.store(page_size, Ordering::Release);
+            header.salt_1.store(salt_1, Ordering::Release);
+            header.salt_2.store(salt_2, Ordering::Release);
+        });
     }
 
     /// Advance the durable WAL generation counter and return the new value.
     pub(crate) fn bump_checkpoint_seq(&self) -> u32 {
-        self.header().checkpoint_seq.fetch_add(1, Ordering::AcqRel) + 1
+        self.with_snapshot_write(|header| {
+            let next = header
+                .checkpoint_seq
+                .load(Ordering::Acquire)
+                .wrapping_add(1);
+            header.checkpoint_seq.store(next, Ordering::Release);
+            next
+        })
     }
 
     /// Read the checkpoint epoch used to detect same-generation visibility changes.
@@ -1521,9 +1545,13 @@ impl MappedSharedWalCoordination {
 
     /// Bump the checkpoint epoch after a visibility-affecting checkpoint step.
     pub(crate) fn bump_checkpoint_epoch(&self) -> u32 {
-        self.header()
-            .checkpoint_epoch
-            .fetch_add(1, Ordering::AcqRel)
+        self.with_snapshot_write(|header| {
+            let prev = header.checkpoint_epoch.load(Ordering::Acquire);
+            header
+                .checkpoint_epoch
+                .store(prev.wrapping_add(1), Ordering::Release);
+            prev
+        })
     }
 
     /// Borrow the per-process local lock counters under the mapping mutex.
@@ -1539,6 +1567,34 @@ impl MappedSharedWalCoordination {
     ) -> T {
         let mut entry = self.process_local_ownership.lock();
         f(&mut entry)
+    }
+
+    fn with_snapshot_write<T>(&self, f: impl FnOnce(&SharedWalCoordinationMapHeader) -> T) -> T {
+        let header = self.header();
+        loop {
+            let seq = header.snapshot_seq.load(Ordering::Acquire);
+            if seq & 1 != 0 {
+                std::hint::spin_loop();
+                continue;
+            }
+            if header
+                .snapshot_seq
+                .compare_exchange(
+                    seq,
+                    seq.wrapping_add(1),
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                )
+                .is_ok()
+            {
+                let result = f(header);
+                header
+                    .snapshot_seq
+                    .store(seq.wrapping_add(2), Ordering::Release);
+                return result;
+            }
+            std::hint::spin_loop();
+        }
     }
 
     /// Clear one shared owner slot, asserting it still records `owner`.
@@ -2717,6 +2773,7 @@ impl MappedSharedWalCoordination {
             std::ptr::addr_of_mut!((*header).frame_index_capacity).write(MAX_FRAME_INDEX_CAPACITY);
             std::ptr::addr_of_mut!((*header).frame_index_len).write(AtomicU32::new(0));
             std::ptr::addr_of_mut!((*header).frame_index_overflowed).write(AtomicU32::new(0));
+            std::ptr::addr_of_mut!((*header).snapshot_seq).write(AtomicU64::new(0));
             std::ptr::addr_of_mut!((*header).backfill_proof_version).write(AtomicU32::new(0));
             std::ptr::addr_of_mut!((*header).backfill_proof_nbackfills).write(AtomicU64::new(0));
             std::ptr::addr_of_mut!((*header).backfill_proof_max_frame).write(AtomicU64::new(0));
@@ -3222,6 +3279,102 @@ mod tests {
 
         assert_eq!(mapped_a.bump_checkpoint_epoch(), 0);
         assert_eq!(mapped_b.checkpoint_epoch(), 1);
+    }
+
+    #[test]
+    fn mapped_shared_wal_coordination_last_process_probe_reacquires_shared_lifetime_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("coordination.tshm");
+        let mapped_a = create_mapping(&path);
+
+        assert!(
+            mapped_a.is_last_process_mapping(),
+            "single mapping should identify itself as the last live process mapping"
+        );
+
+        let mapped_b = create_mapping(&path);
+        assert_eq!(
+            mapped_b.open_mode(),
+            SharedWalCoordinationOpenMode::MultiProcess,
+            "lifetime lock probe must leave the original mapping holding the shared lifetime lock"
+        );
+    }
+
+    #[test]
+    fn mapped_shared_wal_coordination_snapshot_waits_for_stable_sequence() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("coordination.tshm");
+        let mapped = Arc::new(create_mapping(&path));
+        let expected = SharedWalCoordinationHeader {
+            max_frame: 14,
+            nbackfills: 8,
+            transaction_count: 9,
+            visibility_generation: 10,
+            checkpoint_seq: 5,
+            checkpoint_epoch: 7,
+            page_size: 4096,
+            salt_1: 17,
+            salt_2: 23,
+            checksum_1: 31,
+            checksum_2: 37,
+            reader_slot_count: 64,
+        };
+
+        let header = mapped.header();
+        let seq = header.snapshot_seq.load(Ordering::Acquire);
+        assert_eq!(
+            seq & 1,
+            0,
+            "fresh mapping should start with a stable snapshot sequence"
+        );
+        assert!(
+            header
+                .snapshot_seq
+                .compare_exchange(seq, seq + 1, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok(),
+            "test must acquire the snapshot write sequence"
+        );
+
+        let reader = mapped.clone();
+        let handle = std::thread::spawn(move || reader.snapshot());
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        assert!(
+            !handle.is_finished(),
+            "snapshot readers must wait while a writer holds the sequence lock"
+        );
+
+        header
+            .max_frame
+            .store(expected.max_frame, Ordering::Release);
+        header
+            .nbackfills
+            .store(expected.nbackfills, Ordering::Release);
+        header
+            .transaction_count
+            .store(expected.transaction_count, Ordering::Release);
+        header
+            .visibility_generation
+            .store(expected.visibility_generation, Ordering::Release);
+        header
+            .checkpoint_seq
+            .store(expected.checkpoint_seq, Ordering::Release);
+        header
+            .checkpoint_epoch
+            .store(expected.checkpoint_epoch, Ordering::Release);
+        header
+            .page_size
+            .store(expected.page_size, Ordering::Release);
+        header.salt_1.store(expected.salt_1, Ordering::Release);
+        header.salt_2.store(expected.salt_2, Ordering::Release);
+        header
+            .checksum_1
+            .store(expected.checksum_1, Ordering::Release);
+        header
+            .checksum_2
+            .store(expected.checksum_2, Ordering::Release);
+        header.snapshot_seq.store(seq + 2, Ordering::Release);
+
+        assert_eq!(handle.join().unwrap(), expected);
     }
 
     #[test]

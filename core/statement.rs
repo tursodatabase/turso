@@ -510,13 +510,12 @@ impl Statement {
         // before reparsing. This must clear both pager locks and MVCC tx ids;
         // otherwise the retried statement can stack a fresh snapshot on top of
         // leaked transaction state from the failed attempt.
-        let attached_leaked = conn
-            .get_all_attached_pagers()
-            .into_iter()
-            .any(|pager| pager.holds_write_lock() || pager.holds_read_lock());
-        let has_implicit_txn_state = main_pager.holds_write_lock()
-            || main_pager.holds_read_lock()
-            || conn.get_tx_state() != TransactionState::None
+        let attached_leaked = conn.with_all_attached_pagers_with_index(|pagers| {
+            pagers
+                .iter()
+                .any(|(_, pager)| pager.holds_write_lock() || pager.holds_read_lock())
+        });
+        let has_implicit_txn_state = conn.get_tx_state() != TransactionState::None
             || conn.get_mv_tx().is_some()
             || conn.next_attached_mv_tx().is_some()
             || attached_leaked
@@ -549,7 +548,7 @@ impl Statement {
             if db_id == crate::TEMP_DB_ID && conn.temp.database.read().is_none() {
                 continue;
             }
-            let pager = conn.get_pager_from_database_index(&db_id);
+            let pager = conn.get_pager_from_database_index(&db_id)?;
             if pager.holds_read_lock() {
                 pager.rollback_attached();
             }
