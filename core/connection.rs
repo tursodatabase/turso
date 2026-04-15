@@ -136,7 +136,7 @@ pub struct Connection {
     pub(crate) auto_commit: AtomicBool,
     pub(super) transaction_state: AtomicTransactionState,
     pub(super) last_insert_rowid: AtomicI64,
-    pub(crate) last_change: AtomicI64,
+    pub(crate) changes: AtomicI64,
     pub(crate) total_changes: AtomicI64,
     pub(crate) syms: parking_lot::RwLock<SymbolTable>,
     pub(super) _shared_cache: bool,
@@ -1512,21 +1512,22 @@ impl Connection {
         self.last_insert_rowid.store(rowid, Ordering::SeqCst);
     }
 
-    pub(crate) fn set_last_change(&self, nchange: i64) {
-        self.last_change.store(nchange, Ordering::SeqCst);
+    /// Sets the value of `changes()`, but without altering `total_changes()`.
+    pub(crate) fn set_changes_without_total(&self, num_changes: i64) {
+        self.changes.store(num_changes, Ordering::SeqCst);
     }
 
-    pub(crate) fn add_total_changes(&self, nchange: i64) {
-        self.total_changes.fetch_add(nchange, Ordering::SeqCst);
+    pub(crate) fn add_total_changes(&self, num_changes: i64) {
+        self.total_changes.fetch_add(num_changes, Ordering::SeqCst);
     }
 
-    pub fn set_changes(&self, nchange: i64) {
-        self.set_last_change(nchange);
-        self.add_total_changes(nchange);
+    pub fn set_changes(&self, num_changes: i64) {
+        self.set_changes_without_total(num_changes);
+        self.add_total_changes(num_changes);
     }
 
     pub fn changes(&self) -> i64 {
-        self.last_change.load(Ordering::SeqCst)
+        self.changes.load(Ordering::SeqCst)
     }
 
     pub fn total_changes(&self) -> i64 {

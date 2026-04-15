@@ -2109,6 +2109,7 @@ impl Program {
                     if self.connection.get_auto_commit() {
                         self.rollback_current_txn(pager);
                     }
+                    self.connection.set_changes_without_total(0);
                 }
                 // Constraint and RAISE errors: behavior depends on the effective resolve type.
                 // For normal constraints, the resolve type comes from the statement (ON CONFLICT).
@@ -2195,6 +2196,11 @@ impl Program {
                             }
                         }
                     }
+                    let last_change = match effective_resolve {
+                        ResolveType::Fail => state.n_change.load(Ordering::SeqCst),
+                        _ => 0,
+                    };
+                    self.connection.set_changes_without_total(last_change);
                 }
                 Some(LimboError::RaiseIgnore) => {
                     tracing::error!(
@@ -2210,21 +2216,6 @@ impl Program {
                         self.rollback_current_txn(pager);
                     }
                 }
-            }
-
-            if let Some(last_change) = match err {
-                Some(LimboError::Constraint(_)) => Some(match self.resolve_type {
-                    ResolveType::Fail => state.n_change.load(Ordering::SeqCst),
-                    _ => 0,
-                }),
-                Some(LimboError::Raise(resolve_type, _)) => Some(match resolve_type {
-                    ResolveType::Fail => state.n_change.load(Ordering::SeqCst),
-                    _ => 0,
-                }),
-                Some(LimboError::ForeignKeyConstraint(_)) => Some(0),
-                _ => None,
-            } {
-                self.connection.set_last_change(last_change);
             }
         }
         if state.uses_subjournal {

@@ -4031,7 +4031,7 @@ pub enum OpProgramState {
         /// Saved connection-level `changes()` value to restore after a trigger subprogram.
         /// Trigger-body statements temporarily replace it via ResetCount, but the caller's
         /// value becomes visible again once the trigger returns.
-        saved_last_change: Option<i64>,
+        saved_changes_value: Option<i64>,
     },
 }
 
@@ -4041,23 +4041,28 @@ fn finish_subprogram(
     is_trigger: bool,
     subprogram_aborted: bool,
     saved_last_insert_rowid: Option<i64>,
-    saved_last_change: Option<i64>,
+    saved_changes_value: Option<i64>,
 ) {
     let pending_changes = statement.n_change();
     if pending_changes != 0 {
         program.connection.add_total_changes(pending_changes);
     }
 
+    // Only end trigger execution for normal completion. Error paths
+    // already called end_trigger_execution() via abort() in the subprogram.
     if is_trigger && !subprogram_aborted {
         program.connection.end_trigger_execution();
     }
 
+    // Restore last_insert_rowid after trigger execution, per SQLite semantics:
+    // trigger-body INSERTs must not overwrite the top-level rowid.
     if let Some(rowid) = saved_last_insert_rowid {
         program.connection.update_last_rowid(rowid);
     }
 
-    if let Some(last_change) = saved_last_change {
-        program.connection.set_last_change(last_change);
+    // Restore `changes()`, but not `total_changes()`
+    if let Some(changes) = saved_changes_value {
+        program.connection.set_changes_without_total(changes);
     }
 }
 
@@ -4117,7 +4122,7 @@ pub fn op_program(
 
                 // Check if this is a trigger subprogram - if so, track execution
                 // and save last_insert_rowid so it can be restored after the trigger finishes.
-                let (is_trigger, saved_last_insert_rowid, saved_last_change) =
+                let (is_trigger, saved_last_insert_rowid, saved_last_changes_value) =
                     if let Some(ref trigger) = statement.get_trigger() {
                         program.connection.start_trigger_execution(trigger.clone());
                         (
@@ -4141,14 +4146,14 @@ pub fn op_program(
                     is_trigger,
                     statement,
                     saved_last_insert_rowid,
-                    saved_last_change,
+                    saved_changes_value: saved_last_changes_value,
                 };
             }
             OpProgramState::Step {
                 is_trigger,
                 mut statement,
                 saved_last_insert_rowid,
-                saved_last_change,
+                saved_changes_value: saved_last_changes_value,
             } => {
                 let mut raise_ignore = false;
                 // Track whether the subprogram aborted with an error. When abort()
@@ -4168,7 +4173,7 @@ pub fn op_program(
                                     is_trigger,
                                     statement,
                                     saved_last_insert_rowid,
-                                    saved_last_change,
+                                    saved_changes_value: saved_last_changes_value,
                                 };
                                 return Ok(InsnFunctionStepResult::IO(io));
                             }
@@ -4178,7 +4183,7 @@ pub fn op_program(
                                     is_trigger,
                                     statement,
                                     saved_last_insert_rowid,
-                                    saved_last_change,
+                                    saved_changes_value: saved_last_changes_value,
                                 };
                                 return Err(LimboError::Busy);
                             }
@@ -4192,7 +4197,7 @@ pub fn op_program(
                                     is_trigger,
                                     subprogram_aborted,
                                     saved_last_insert_rowid,
-                                    saved_last_change,
+                                    saved_last_changes_value,
                                 );
                                 return Err(LimboError::Constraint(constraint_err));
                             }
@@ -4212,7 +4217,7 @@ pub fn op_program(
                                 is_trigger,
                                 subprogram_aborted,
                                 saved_last_insert_rowid,
-                                saved_last_change,
+                                saved_last_changes_value,
                             );
                             return Err(err);
                         }
@@ -4224,7 +4229,7 @@ pub fn op_program(
                     is_trigger,
                     subprogram_aborted,
                     saved_last_insert_rowid,
-                    saved_last_change,
+                    saved_last_changes_value,
                 );
 
                 // Cache the statement for reuse on subsequent fires of this
@@ -6698,7 +6703,7 @@ pub fn op_function(
                 state.registers[*dest].set_value(result);
             }
             ScalarFunc::Changes => {
-                let res = &program.connection.last_change;
+                let res = &program.connection.changes;
                 let changes = res.load(Ordering::SeqCst);
                 state.registers[*dest].set_int(changes);
             }
