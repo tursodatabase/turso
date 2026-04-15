@@ -1,6 +1,7 @@
 use crate::schema::{BTreeTable, Trigger};
 use crate::sync::Arc;
 use crate::translate::expr::WalkControl;
+use crate::translate::plan::ColumnMask;
 use crate::translate::subquery::{
     emit_non_from_clause_subquery, plan_subqueries_from_trigger_when_clause,
 };
@@ -14,7 +15,6 @@ use crate::util::normalize_ident;
 use crate::vdbe::affinity::Affinity;
 use crate::vdbe::insn::Insn;
 use crate::vdbe::BranchOffset;
-use crate::HashSet;
 use crate::{bail_parse_error, QueryMode, Result};
 use std::cell::RefCell;
 use std::num::NonZero;
@@ -677,7 +677,7 @@ fn execute_trigger_commands(
 pub fn has_relevant_triggers_type_only(
     schema: &crate::schema::Schema,
     event: TriggerEvent,
-    updated_column_indices: Option<&HashSet<usize>>,
+    updated_column_indices: Option<&ColumnMask>,
     table: &BTreeTable,
 ) -> bool {
     let mut triggers = schema.get_triggers_for_table(table.name.as_str());
@@ -698,7 +698,7 @@ pub fn has_relevant_triggers_type_only(
                 trigger_cols.iter().any(|col_name| {
                     let normalized_col = normalize_ident(col_name.as_str());
                     if let Some((col_idx, _)) = table.get_column(&normalized_col) {
-                        updated_cols.contains(&col_idx)
+                        updated_cols.get(col_idx)
                     } else {
                         // Column doesn't exist - according to SQLite docs, unrecognized
                         // column names in UPDATE OF are silently ignored
@@ -719,7 +719,7 @@ pub fn get_relevant_triggers_type_and_time<'a>(
     schema: &'a crate::schema::Schema,
     event: TriggerEvent,
     time: TriggerTime,
-    updated_column_indices: Option<HashSet<usize>>,
+    updated_column_indices: Option<ColumnMask>,
     table: &'a BTreeTable,
 ) -> impl Iterator<Item = Arc<Trigger>> + 'a + Clone {
     let triggers = schema.get_triggers_for_table(table.name.as_str());
@@ -740,7 +740,7 @@ pub fn get_relevant_triggers_type_and_time<'a>(
                         trigger_cols.iter().any(|col_name| {
                             let normalized_col = normalize_ident(col_name.as_str());
                             if let Some((col_idx, _)) = table.get_column(&normalized_col) {
-                                updated_cols.contains(&col_idx)
+                                updated_cols.get(col_idx)
                             } else {
                                 // Column doesn't exist - according to SQLite docs, unrecognized
                                 // column names in UPDATE OF are silently ignored
@@ -772,7 +772,7 @@ pub fn get_triggers_including_temp(
     database_id: usize,
     event: TriggerEvent,
     time: TriggerTime,
-    updated_column_indices: Option<HashSet<usize>>,
+    updated_column_indices: Option<ColumnMask>,
     table: &BTreeTable,
 ) -> Vec<Arc<Trigger>> {
     let mut triggers: Vec<Arc<Trigger>> = resolver.with_schema(database_id, |s| {
@@ -816,7 +816,7 @@ pub fn has_triggers_including_temp(
     resolver: &Resolver,
     database_id: usize,
     event: TriggerEvent,
-    updated_column_indices: Option<&HashSet<usize>>,
+    updated_column_indices: Option<&ColumnMask>,
     table: &BTreeTable,
 ) -> bool {
     let found = resolver.with_schema(database_id, |s| {

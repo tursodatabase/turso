@@ -1,11 +1,11 @@
 use crate::sync::Arc;
-use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
+use rustc_hash::FxHashMap as HashMap;
 
 use crate::schema::{columns_affected_by_update, ROWID_SENTINEL};
 use crate::translate::emitter::Resolver;
 use crate::translate::expr::{bind_and_rewrite_expr, BindingBehavior};
 use crate::translate::expression_index::expression_index_column_usage;
-use crate::translate::plan::{Operation, Scan};
+use crate::translate::plan::{ColumnMask, Operation, Scan};
 use crate::translate::planner::{parse_limit, ROWID_STRS};
 use crate::{
     bail_parse_error,
@@ -452,7 +452,7 @@ pub fn prepare_update_plan(
     let updated_cols = (!rowid_alias_used).then(|| set_clauses.iter().map(|(i, _)| *i).collect());
     let affected_cols = updated_cols
         .as_ref()
-        .map(|updated_cols: &HashSet<usize>| columns_affected_by_update(columns, updated_cols));
+        .map(|updated_cols: &ColumnMask| columns_affected_by_update(columns, updated_cols));
     let mut indexes_to_update = Vec::new();
 
     for idx in indexes {
@@ -469,7 +469,7 @@ pub fn prepare_update_plan(
 
                 if !must_update
                     && affected_cols.as_ref().is_some_and(|affected_cols| {
-                        cols_used.iter().any(|cidx| affected_cols.contains(&cidx))
+                        cols_used.iter().any(|cidx| affected_cols.get(cidx))
                     })
                 {
                     // an index must be updated if any of the affected columns is used in an indexed expression
@@ -478,7 +478,7 @@ pub fn prepare_update_plan(
             } else if !must_update
                 && affected_cols
                     .as_ref()
-                    .is_some_and(|affected_cols| affected_cols.contains(&col.pos_in_table))
+                    .is_some_and(|affected_cols| affected_cols.get(col.pos_in_table))
             {
                 // an index must be updated if any of its columns is affected by the update
                 must_update = true;
@@ -494,7 +494,7 @@ pub fn prepare_update_plan(
                 )?;
                 // a partial index must be updated if any column of its WHERE clause is affected
                 must_update = affected_cols.as_ref().is_some_and(|affected_cols| {
-                    cols_used.iter().any(|cidx| affected_cols.contains(&cidx))
+                    cols_used.iter().any(|cidx| affected_cols.get(cidx))
                 });
             }
         }

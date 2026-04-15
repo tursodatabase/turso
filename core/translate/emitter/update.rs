@@ -2,6 +2,7 @@ use super::gencol::compute_virtual_columns;
 use super::TranslateCtx;
 use crate::schema::{columns_affected_by_update, ColumnLayout, GeneratedType, Table};
 use crate::translate::insert::halt_desc_and_on_error;
+use crate::translate::plan::ColumnMask;
 use crate::translate::stmt_journal::any_effective_replace;
 use crate::vdbe::builder::SelfTableContext;
 use crate::{
@@ -470,7 +471,7 @@ fn emit_update_column_values<'a>(
     let target_table_columns = target_table.table.columns();
     let affected_columns = columns_affected_by_update(
         target_table_columns,
-        &set_clauses.iter().map(|(idx, _)| *idx).collect(),
+        set_clauses.iter().map(|(idx, _)| *idx),
     );
 
     for (idx, table_column) in target_table_columns.iter().enumerate() {
@@ -485,11 +486,11 @@ fn emit_update_column_values<'a>(
             .find(|(i, _)| *i == idx)
             .map(|(_, expr)| expr.as_ref())
             .or_else(|| {
-                affected_columns
-                    .get(&idx)
-                    .into_iter()
-                    .flat_map(|_| table_column.generated_expr())
-                    .next()
+                if affected_columns.get(idx) {
+                    table_column.generated_expr()
+                } else {
+                    None
+                }
             });
 
         if let Some(expr) = update_expr {
@@ -940,8 +941,7 @@ fn emit_update_insns<'a>(
     let not_exists_check_required = updates_rowid || iteration_cursor_id != target_table_cursor_id;
     let update_database_id = target_table.database_id;
     let has_before_update_triggers = if let Some(btree_table) = target_table.table.btree() {
-        let updated_column_indices: HashSet<usize> =
-            set_clauses.iter().map(|(col_idx, _)| *col_idx).collect();
+        let updated_column_indices = set_clauses.iter().map(|(col_idx, _)| *col_idx).collect();
         has_triggers_including_temp(
             &t_ctx.resolver,
             update_database_id,
@@ -1083,7 +1083,7 @@ fn emit_update_insns<'a>(
     let preserved_old_registers: Option<Vec<usize>> = if let Some(btree_table) =
         target_table.table.btree()
     {
-        let updated_column_indices: HashSet<usize> =
+        let updated_column_indices: ColumnMask =
             set_clauses.iter().map(|(col_idx, _)| *col_idx).collect();
         let relevant_before_update_triggers = get_triggers_including_temp(
             &t_ctx.resolver,
@@ -1356,14 +1356,13 @@ fn emit_update_insns<'a>(
             .insert(rowid_reg, Affinity::Integer);
     }
 
-    let affected_columns = columns_affected_by_update(
-        target_table.table.columns(),
-        &HashSet::from_iter(set_clauses.iter().map(|(idx, _)| idx).cloned()),
-    );
-    let update_affects_virtual_columns = set_clauses
-        .iter()
-        .map(|(idx, _)| idx)
-        .any(|idx| affected_columns.contains(idx));
+    let mut set_clause_cols = ColumnMask::default();
+    for (idx, _) in set_clauses {
+        set_clause_cols.set(*idx);
+    }
+    let affected_columns =
+        columns_affected_by_update(target_table.table.columns(), &set_clause_cols);
+    let update_affects_virtual_columns = affected_columns.count() > set_clause_cols.count();
     let has_returning = returning.as_ref().is_some_and(|r| !r.is_empty());
     let has_check_constraints = target_table
         .table
@@ -1517,10 +1516,10 @@ fn emit_update_insns<'a>(
             // column in the SET clause. Build a set of updated column names to filter.
             let mut updated_col_names: HashSet<String> = columns_affected_by_update(
                 &btree_table.columns,
-                &set_clauses.iter().map(|(idx, _)| *idx).collect(),
+                set_clauses.iter().map(|(idx, _)| *idx),
             )
-            .iter()
-            .filter_map(|col_idx| btree_table.columns.get(*col_idx))
+            .into_iter()
+            .filter_map(|col_idx| btree_table.columns.get(col_idx))
             .filter_map(|col| col.name.as_deref())
             .map(normalize_ident)
             .collect();
@@ -1580,6 +1579,14 @@ fn emit_update_insns<'a>(
         if let Some(table_btree) = target_table.table.btree() {
             if t_ctx.resolver.schema().has_child_fks(table_name) {
                 let rowid_new_reg = rowid_set_clause_reg.unwrap_or(beg);
+                let directly_and_indirectly_updated_columns: ColumnMask = set_clauses
+                    .iter()
+                    .map(|(i, _)| *i)
+                    .flat_map(|col| {
+                        columns_affected_by_update(&table_btree.columns, [col].iter().cloned())
+                    })
+                    .collect();
+
                 emit_fk_child_update_counters(
                     program,
                     &table_btree,
@@ -1587,7 +1594,7 @@ fn emit_update_insns<'a>(
                     target_table_cursor_id,
                     start,
                     rowid_new_reg,
-                    &set_clauses.iter().map(|(i, _)| *i).collect::<HashSet<_>>(),
+                    &directly_and_indirectly_updated_columns,
                     update_database_id,
                     &t_ctx.resolver,
                     &layout,
@@ -2289,7 +2296,7 @@ fn emit_update_insns<'a>(
 
             // Fire AFTER UPDATE triggers
             if let Some(btree_table) = target_table.table.btree() {
-                let updated_column_indices: HashSet<usize> =
+                let updated_column_indices: ColumnMask =
                     set_clauses.iter().map(|(col_idx, _)| *col_idx).collect();
                 let relevant_triggers = get_triggers_including_temp(
                     &t_ctx.resolver,

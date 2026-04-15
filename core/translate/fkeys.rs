@@ -4,6 +4,7 @@ use turso_parser::ast::{self, Expr, Literal, Name, QualifiedName, RefAct};
 use super::{translate_inner, ProgramBuilder, ProgramBuilderOpts};
 use crate::translate::emitter::emit_columns_and_dependencies;
 use crate::translate::expr::emit_table_column_for_dml;
+use crate::translate::plan::ColumnMask;
 use crate::{
     error::SQLITE_CONSTRAINT_FOREIGNKEY,
     schema::{BTreeTable, ColumnLayout, ForeignKey, Index, ResolvedFkRef, ROWID_SENTINEL},
@@ -307,7 +308,7 @@ pub fn emit_parent_key_change_checks(
     database_id: usize,
     resolver: &Resolver,
 ) -> Result<()> {
-    let updated_positions: HashSet<usize> = set_clauses.iter().map(|(i, _)| *i).collect();
+    let updated_positions: ColumnMask = set_clauses.iter().map(|(i, _)| *i).collect();
     let incoming = resolver.with_schema(database_id, |s| {
         s.resolved_fks_referencing(&table_btree.name)
     })?;
@@ -592,7 +593,7 @@ pub fn emit_fk_parent_new_key_reconcile(
     database_id: usize,
     resolver: &Resolver,
 ) -> Result<()> {
-    let updated_positions: HashSet<usize> = set_clauses.iter().map(|(i, _)| *i).collect();
+    let updated_positions: ColumnMask = set_clauses.iter().map(|(i, _)| *i).collect();
     let incoming = resolver.with_schema(database_id, |s| {
         s.resolved_fks_referencing(&table_btree.name)
     })?;
@@ -834,7 +835,7 @@ pub fn emit_fk_child_update_counters(
     child_cursor_id: usize,
     new_start_reg: usize,
     new_rowid_reg: usize,
-    updated_cols: &HashSet<usize>,
+    updated_cols: &ColumnMask,
     database_id: usize,
     resolver: &Resolver,
     layout: &ColumnLayout,
@@ -1181,7 +1182,7 @@ pub fn emit_fk_update_parent_actions(
     database_id: usize,
     resolver: &Resolver,
 ) -> Result<()> {
-    let updated_positions: HashSet<usize> = set_clauses.iter().map(|(i, _)| *i).collect();
+    let updated_positions: ColumnMask = set_clauses.iter().map(|(i, _)| *i).collect();
     let incoming = resolver.with_schema(database_id, |s| {
         s.resolved_fks_referencing(&table_btree.name)
     })?;

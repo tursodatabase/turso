@@ -25,7 +25,7 @@ use crate::translate::emitter::Resolver;
 use crate::translate::plan::{DeletePlan, DmlSafetyReason, UpdatePlan};
 use crate::translate::trigger_exec::has_triggers_including_temp;
 use crate::vdbe::builder::ProgramBuilder;
-use crate::{sync::Arc, Connection, HashSet, Result};
+use crate::{sync::Arc, Connection, Result};
 use turso_parser::ast::{ResolveType, TriggerEvent};
 
 /// Check whether any DDL-level constraint (IPK or index) uses REPLACE.
@@ -195,7 +195,7 @@ pub(crate) fn set_update_stmt_journal_flags(
     };
     let database_id = target_table.database_id;
 
-    let updated_cols: HashSet<usize> = plan.set_clauses.iter().map(|(i, _)| *i).collect();
+    let updated_cols = plan.set_clauses.iter().map(|(i, _)| *i).collect();
     let has_triggers = has_triggers_including_temp(
         resolver,
         database_id,

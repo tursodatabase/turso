@@ -9,7 +9,7 @@ use super::{
     },
 };
 use crate::translate::expression_index::expression_index_column_usage;
-use crate::translate::plan::MultiIndexBranchAccess;
+use crate::translate::plan::{ColumnMask, MultiIndexBranchAccess};
 use crate::{
     function::{AggFunc, Deterministic},
     index_method::IndexMethodCostEstimate,
@@ -835,7 +835,7 @@ fn first_update_safety_reason(
         }
 
         // Check if there are UPDATE triggers
-        let updated_cols: HashSet<usize> = plan.set_clauses.iter().map(|(i, _)| *i).collect();
+        let updated_cols: ColumnMask = plan.set_clauses.iter().map(|(i, _)| *i).collect();
         let database_id = table_ref.database_id;
         if has_triggers_including_temp(
             resolver,
@@ -889,7 +889,7 @@ fn first_update_safety_reason(
         if index
             .columns
             .iter()
-            .any(|c| affected_cols.contains(&c.pos_in_table))
+            .any(|c| affected_cols.get(c.pos_in_table))
         {
             break 'requires Some(DmlSafetyReason::KeyMutation);
         }

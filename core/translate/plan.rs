@@ -221,6 +221,7 @@ impl From<Expr> for WhereTerm {
 }
 
 use crate::ast::Expr;
+use crate::schema::ROWID_SENTINEL;
 use crate::util::exprs_are_equivalent;
 
 /// The loop index where to evaluate the condition.
@@ -1357,15 +1358,162 @@ impl TableReferences {
     }
 }
 
-/// Tracks which columns are used in a query. Optimized for the common case
-/// of ≤64 columns (single u64), with heap-allocated overflow
+/// Tracks which columns are used in a query.
 pub type ColumnUsedMask = BitSet;
 
+/// ColumnMask wraps [BitSet] and adds a special-case so that it can store [ROWID_SENTINEL]
+/// in `O(1)` space
+//TODO instead of carrying naked usize's around, we should ideally have a `ColumnID` type alias,
+// just like we have `CursorID`, so that we can make [ColumnMask] type-safe.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
+pub struct ColumnMask {
+    columns: BitSet,
+    has_rowid_update: bool,
+}
+
+impl ColumnMask {
+    pub fn set(&mut self, idx: usize) {
+        if idx == ROWID_SENTINEL {
+            self.has_rowid_update = true;
+        } else {
+            self.columns.set(idx);
+        }
+    }
+
+    pub fn get(&self, idx: usize) -> bool {
+        if idx == ROWID_SENTINEL {
+            self.has_rowid_update
+        } else {
+            self.columns.get(idx)
+        }
+    }
+
+    pub fn count(&self) -> usize {
+        self.columns.count() + self.has_rowid_update as usize
+    }
+}
+
+impl FromIterator<usize> for ColumnMask {
+    fn from_iter<I: IntoIterator<Item = usize>>(iter: I) -> Self {
+        let mut mask = ColumnMask::default();
+        for idx in iter {
+            mask.set(idx);
+        }
+        mask
+    }
+}
+
+pub struct ColumnMaskIter<B: std::borrow::Borrow<BitSet>> {
+    inner: BitSetIter<B>,
+    pending_rowid: bool,
+}
+
+impl<B: std::borrow::Borrow<BitSet>> Iterator for ColumnMaskIter<B> {
+    type Item = usize;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if let Some(v) = self.inner.next() {
+            return Some(v);
+        }
+        if self.pending_rowid {
+            self.pending_rowid = false;
+            return Some(ROWID_SENTINEL);
+        }
+        None
+    }
+}
+
+impl<'a> IntoIterator for &'a ColumnMask {
+    type Item = usize;
+    type IntoIter = ColumnMaskIter<&'a BitSet>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        ColumnMaskIter {
+            inner: (&self.columns).into_iter(),
+            pending_rowid: self.has_rowid_update,
+        }
+    }
+}
+
+impl IntoIterator for ColumnMask {
+    type Item = usize;
+    type IntoIter = ColumnMaskIter<BitSet>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        ColumnMaskIter {
+            inner: self.columns.into_iter(),
+            pending_rowid: self.has_rowid_update,
+        }
+    }
+}
+
+/// Dense bitset optimized for the common case where all elements ≤64, with heap-allocated overflow.
+///
+/// *WARNING*: This bitset occupies `O(max_num)` space when `max_num > 64`,
+/// so it is best used for smaller numbers.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
 pub struct BitSet {
     inline: u64,
     /// invariant: `overflow` is `None` iff no bits ≥ 64 are set.
     overflow: Option<Vec<u64>>,
+}
+
+/// This iterator, inspired by Kernighan's bit-counting algorighm, is `O(num_words + popcount)`
+/// for the whole bitset.
+pub struct BitSetIter<B: std::borrow::Borrow<BitSet>> {
+    bitset: B,
+    /// Remaining bits to drain from the word currently pointed at by `word`.
+    current: u64,
+    /// `0` = inline word, `1..=overflow.len()` = `overflow[word - 1]`.
+    word: usize,
+}
+
+impl<B: std::borrow::Borrow<BitSet>> Iterator for BitSetIter<B> {
+    type Item = usize;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            if self.current != 0 {
+                let bit = self.current.trailing_zeros() as usize;
+                self.current &= self.current - 1;
+                let base = if self.word == 0 {
+                    0
+                } else {
+                    BitSet::INLINE_BITS + (self.word - 1) * 64
+                };
+                return Some(base + bit);
+            }
+            self.word += 1;
+            let overflow = self.bitset.borrow().overflow.as_ref()?;
+            self.current = *overflow.get(self.word - 1)?;
+        }
+    }
+}
+
+impl<'a> IntoIterator for &'a BitSet {
+    type Item = usize;
+    type IntoIter = BitSetIter<&'a BitSet>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        BitSetIter {
+            current: self.inline,
+            bitset: self,
+            word: 0,
+        }
+    }
+}
+
+impl IntoIterator for BitSet {
+    type Item = usize;
+    type IntoIter = BitSetIter<BitSet>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        BitSetIter {
+            current: self.inline,
+            bitset: self,
+            word: 0,
+        }
+    }
 }
 
 impl BitSet {
@@ -1477,33 +1625,11 @@ impl BitSet {
     }
 
     pub fn iter(&self) -> impl Iterator<Item = usize> + '_ {
-        // this iterator, derived from Kernighan's bitcount algorithm, is O(num_words + popcount)
-        let mut inline = self.inline;
-        let inline_iter = std::iter::from_fn(move || {
-            if inline == 0 {
-                return None;
-            }
-            let bit = inline.trailing_zeros() as usize;
-            inline &= inline - 1; // clear lowest set bit
-            Some(bit)
-        });
-        let overflow_iter = self
-            .overflow
-            .iter()
-            .flat_map(|ov| ov.iter().enumerate())
-            .flat_map(|(word_idx, &word)| {
-                let mut w = word;
-                let base = Self::INLINE_BITS + word_idx * 64;
-                std::iter::from_fn(move || {
-                    if w == 0 {
-                        return None;
-                    }
-                    let bit = w.trailing_zeros() as usize;
-                    w &= w - 1; // clear lowest set bit
-                    Some(base + bit)
-                })
-            });
-        inline_iter.chain(overflow_iter)
+        BitSetIter {
+            current: self.inline,
+            bitset: self,
+            word: 0,
+        }
     }
 
     /// returns the number of set bits
@@ -3264,6 +3390,50 @@ mod tests {
         assert!(mask3.is_only(64));
     }
 
+    #[test]
+    fn test_column_mask_rowid_sentinel() {
+        // ColumnMask stores `usize::MAX` (ROWID_SENTINEL) in an out-of-band bool
+        // so that the underlying dense BitSet never sees it. The small API surface
+        // that ColumnMask exposes must all honor the sentinel consistently.
+
+        // set / get round-trip on the sentinel alone
+        let mut mask = ColumnMask::default();
+        assert!(!mask.get(usize::MAX));
+        mask.set(usize::MAX);
+        assert!(mask.get(usize::MAX));
+        assert_eq!(mask.count(), 1);
+
+        // sentinel coexists with dense bits
+        let mut mixed = ColumnMask::default();
+        mixed.set(0);
+        mixed.set(63);
+        mixed.set(64); // crosses into overflow
+        mixed.set(500);
+        mixed.set(usize::MAX);
+        assert!(mixed.get(0));
+        assert!(mixed.get(63));
+        assert!(mixed.get(64));
+        assert!(mixed.get(500));
+        assert!(mixed.get(usize::MAX));
+        assert_eq!(mixed.count(), 5);
+
+        // iter yields dense positions in ascending order, then usize::MAX at the end
+        let collected: Vec<usize> = (&mixed).into_iter().collect();
+        assert_eq!(collected, vec![0, 63, 64, 500, usize::MAX]);
+        // count() and iter().count() must agree
+        assert_eq!(mixed.count(), (&mixed).into_iter().count());
+
+        // FromIterator round-trip through the sentinel
+        let built: ColumnMask = [0usize, 63, 64, 500, usize::MAX].into_iter().collect();
+        assert_eq!(built, mixed);
+        let round: ColumnMask = (&mixed).into_iter().collect();
+        assert_eq!(round, mixed);
+
+        // owned IntoIterator (used by flat_map in the UPDATE emitter)
+        let mixed_owned: Vec<usize> = mixed.clone().into_iter().collect();
+        assert_eq!(mixed_owned, vec![0, 63, 64, 500, usize::MAX]);
+    }
+
     fn rng_from_env_or_time() -> (ChaCha8Rng, u64) {
         let seed = std::env::var("TEST_SEED")
             .ok()
@@ -3316,6 +3486,10 @@ mod tests {
 
     #[test]
     fn test_column_used_mask_fuzz() {
+        fn pick_index(rng: &mut ChaCha8Rng, max_index: u32) -> usize {
+            (rng.next_u32() % max_index) as usize
+        }
+
         let (mut rng, seed) = rng_from_env_or_time();
         eprintln!("test_column_used_mask_random_ops seed: {seed}");
 
@@ -3327,7 +3501,7 @@ mod tests {
 
         for _ in 0..num_ops {
             let op = rng.next_u32() % 10;
-            let idx = (rng.next_u32() % max_index) as usize;
+            let idx = pick_index(&mut rng, max_index);
 
             match op {
                 0..=2 => {
@@ -3369,7 +3543,7 @@ mod tests {
                     let mut other_mask = ColumnUsedMask::default();
                     let mut other_ref = ReferenceMask::new();
                     for _ in 0..(rng.next_u32() % 20) {
-                        let other_idx = (rng.next_u32() % max_index) as usize;
+                        let other_idx = pick_index(&mut rng, max_index);
                         other_mask.set(other_idx);
                         other_ref.set(other_idx);
                     }
@@ -3384,7 +3558,7 @@ mod tests {
                     let mut other_mask = ColumnUsedMask::default();
                     let mut other_ref = ReferenceMask::new();
                     for _ in 0..(rng.next_u32() % 20) {
-                        let other_idx = (rng.next_u32() % max_index) as usize;
+                        let other_idx = pick_index(&mut rng, max_index);
                         other_mask.set(other_idx);
                         other_ref.set(other_idx);
                     }
@@ -3396,7 +3570,7 @@ mod tests {
                     let mut other_mask = ColumnUsedMask::default();
                     let mut other_ref = ReferenceMask::new();
                     for _ in 0..(rng.next_u32() % 20) {
-                        let other_idx = (rng.next_u32() % max_index) as usize;
+                        let other_idx = pick_index(&mut rng, max_index);
                         other_mask.set(other_idx);
                         other_ref.set(other_idx);
                     }
