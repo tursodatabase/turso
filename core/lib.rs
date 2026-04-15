@@ -1409,7 +1409,7 @@ impl Database {
             auto_commit: AtomicBool::new(true),
             transaction_state: AtomicTransactionState::new(TransactionState::None),
             last_insert_rowid: AtomicI64::new(0),
-            last_change: AtomicI64::new(0),
+            changes: AtomicI64::new(0),
             total_changes: AtomicI64::new(0),
             syms: parking_lot::RwLock::new(SymbolTable::new()),
             _shared_cache: false,
