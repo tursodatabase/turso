@@ -1477,11 +1477,9 @@ impl MappedSharedWalCoordination {
             )
     }
 
-    /// fsync the `.tshm` coordination file when the caller needs durable publication.
-    pub(crate) fn sync(&self, io: &Arc<dyn IO>, sync_type: FileSyncType) -> Result<()> {
-        let c = self.file.sync(Completion::new_sync(|_| {}), sync_type)?;
-        io.wait_for_completion(c)?;
-        Ok(())
+    /// Begin syncing the `.tshm` coordination file when the caller needs durable publication.
+    pub(crate) fn begin_sync(&self, sync_type: FileSyncType) -> Result<Completion> {
+        self.file.sync(Completion::new_sync(|_| {}), sync_type)
     }
 
     /// On exclusive open, discard any persisted backfill proof that is malformed or stale.

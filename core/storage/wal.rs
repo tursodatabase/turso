@@ -65,7 +65,6 @@ pub struct CheckpointResult {
     maybe_guard: Option<CheckpointLocks>,
     pub db_truncate_sent: bool,
     pub db_sync_sent: bool,
-    pending_durable_backfill: Option<u64>,
     /// Whether WAL truncation I/O has been submitted (for TRUNCATE checkpoint mode)
     pub wal_truncate_sent: bool,
     /// Whether WAL sync I/O has been submitted after truncation
@@ -91,7 +90,6 @@ impl CheckpointResult {
             maybe_guard: None,
             db_sync_sent: false,
             db_truncate_sent: false,
-            pending_durable_backfill: None,
             wal_truncate_sent: false,
             wal_sync_sent: false,
         }
@@ -107,14 +105,6 @@ impl CheckpointResult {
     }
     pub fn release_guard(&mut self) {
         let _ = self.maybe_guard.take();
-    }
-
-    fn set_pending_durable_backfill(&mut self, max_frame: u64) {
-        self.pending_durable_backfill = Some(max_frame);
-    }
-
-    fn take_pending_durable_backfill(&mut self) -> Option<u64> {
-        self.pending_durable_backfill.take()
     }
 }
 
@@ -460,15 +450,15 @@ trait WalCoordination: Debug + Send + Sync {
     /// Publish the highest frame durably backfilled during checkpoint.
     fn publish_backfill(&self, max_frame: u64);
 
-    /// Publish backfill only after any backend-specific durable proof is installed.
-    fn publish_durable_backfill(
+    /// Install any backend-specific durable proof before publishing backfill.
+    /// Returns an optional completion that must finish before `publish_backfill`.
+    fn install_durable_backfill_proof(
         &self,
-        io: &Arc<dyn IO>,
         max_frame: u64,
         db_size_pages: u32,
         db_header_crc32c: u32,
         sync_type: FileSyncType,
-    ) -> Result<()>;
+    ) -> Result<Option<Completion>>;
 
     /// Find the newest frame for `page_id` within the caller's visible range.
     fn find_frame(
@@ -653,7 +643,14 @@ pub trait Wal: Debug + Send + Sync {
     fn should_checkpoint(&self) -> bool;
     fn checkpoint(&self, pager: &Pager, mode: CheckpointMode)
         -> Result<IOResult<CheckpointResult>>;
-    fn complete_checkpoint_sync(&self, pager: &Pager, result: &mut CheckpointResult) -> Result<()>;
+    fn install_durable_backfill_proof(
+        &self,
+        max_frame: u64,
+        db_size_pages: u32,
+        db_header_crc32c: u32,
+        sync_type: FileSyncType,
+    ) -> Result<Option<Completion>>;
+    fn publish_backfill(&self, max_frame: u64);
     fn sync(&self, sync_type: FileSyncType) -> Result<Completion>;
     fn is_syncing(&self) -> bool;
     fn get_max_frame_in_wal(&self) -> u64;
@@ -777,16 +774,14 @@ impl WalCoordination for InProcessWalCoordination {
             .store(max_frame, Ordering::Release);
     }
 
-    fn publish_durable_backfill(
+    fn install_durable_backfill_proof(
         &self,
-        _io: &Arc<dyn IO>,
-        max_frame: u64,
+        _max_frame: u64,
         _db_size_pages: u32,
         _db_header_crc32c: u32,
         _sync_type: FileSyncType,
-    ) -> Result<()> {
-        self.publish_backfill(max_frame);
-        Ok(())
+    ) -> Result<Option<Completion>> {
+        Ok(None)
     }
 
     fn find_frame(
@@ -1202,18 +1197,6 @@ impl ShmWalCoordination {
             .overflow_fallback_coverage
             .lock()
             .clear();
-    }
-
-    fn local_overflow_scan_covers_snapshot(
-        authority_snapshot: SharedWalCoordinationHeader,
-        required_snapshot: WalSnapshot,
-        scanned: SharedWalCoordinationHeader,
-    ) -> bool {
-        scanned.checkpoint_seq == required_snapshot.checkpoint_seq
-            && scanned.page_size == authority_snapshot.page_size
-            && scanned.salt_1 == authority_snapshot.salt_1
-            && scanned.salt_2 == authority_snapshot.salt_2
-            && scanned.max_frame >= required_snapshot.max_frame
     }
 
     fn local_authority_snapshot_from_shared(
@@ -1687,32 +1670,14 @@ impl ShmWalCoordination {
             return Ok(());
         }
 
-        let wal_file = self.fallback.wal_file()?;
-        let scanned = sqlite3_ondisk::build_shared_wal(&wal_file, io)?;
-        let (scanned_snapshot, scanned_frame_cache) = {
-            let scanned_guard = scanned.read();
-            let snapshot =
-                Self::local_authority_snapshot_from_shared(&scanned_guard, authority_snapshot);
-            let frame_cache = scanned_guard.runtime.frame_cache.lock().clone();
-            (snapshot, frame_cache)
-        };
-
-        if !Self::local_overflow_scan_covers_snapshot(
-            authority_snapshot,
-            required_snapshot,
-            scanned_snapshot,
-        ) {
-            return Err(LimboError::Busy);
-        }
-
-        let shared = self.shared.write();
-        *shared.runtime.frame_cache.lock() = scanned_frame_cache;
-        shared
-            .runtime
-            .overflow_fallback_coverage
-            .lock()
-            .record_snapshot(scanned_snapshot, scanned_snapshot.max_frame);
-        Ok(())
+        let _ = io;
+        tracing::debug!(
+            required_max_frame = required_snapshot.max_frame,
+            authority_max_frame = authority_snapshot.max_frame,
+            authority_checkpoint_seq = authority_snapshot.checkpoint_seq,
+            "refusing live overflow fallback refresh on a read path because it would require blocking WAL scan I/O"
+        );
+        Err(LimboError::Busy)
     }
 }
 
@@ -1778,14 +1743,13 @@ impl WalCoordination for ShmWalCoordination {
         self.authority.publish_backfill(max_frame);
     }
 
-    fn publish_durable_backfill(
+    fn install_durable_backfill_proof(
         &self,
-        io: &Arc<dyn IO>,
         nbackfills: u64,
         db_size_pages: u32,
         db_header_crc32c: u32,
         sync_type: FileSyncType,
-    ) -> Result<()> {
+    ) -> Result<Option<Completion>> {
         let snapshot = self.authority.snapshot();
         turso_assert!(
             (snapshot.nbackfills..=snapshot.max_frame).contains(&nbackfills),
@@ -1802,9 +1766,7 @@ impl WalCoordination for ShmWalCoordination {
         };
         self.authority
             .install_backfill_proof(proof_snapshot, db_size_pages, db_header_crc32c);
-        self.authority.sync(io, sync_type)?;
-        self.publish_backfill(nbackfills);
-        Ok(())
+        Ok(Some(self.authority.begin_sync(sync_type)?))
     }
 
     fn find_frame(
@@ -3311,24 +3273,23 @@ impl Wal for WalFile {
         })
     }
 
-    fn complete_checkpoint_sync(&self, pager: &Pager, result: &mut CheckpointResult) -> Result<()> {
-        let Some(max_frame) = result.take_pending_durable_backfill() else {
-            return Ok(());
-        };
-        let Some((db_size_pages, db_header_crc32c)) =
-            read_database_identity_from_storage(&self.io, &pager.db_file)?
-        else {
-            return Err(LimboError::Corrupt(
-                "database header unreadable after checkpoint sync".into(),
-            ));
-        };
-        self.coordination.publish_durable_backfill(
-            &self.io,
+    fn install_durable_backfill_proof(
+        &self,
+        max_frame: u64,
+        db_size_pages: u32,
+        db_header_crc32c: u32,
+        sync_type: FileSyncType,
+    ) -> Result<Option<Completion>> {
+        self.coordination.install_durable_backfill_proof(
             max_frame,
             db_size_pages,
             db_header_crc32c,
-            pager.get_sync_type(),
+            sync_type,
         )
+    }
+
+    fn publish_backfill(&self, max_frame: u64) {
+        self.coordination.publish_backfill(max_frame);
     }
 
     #[instrument(err, skip_all, level = Level::DEBUG)]
@@ -4140,15 +4101,12 @@ impl WalFile {
                     let wal_checkpoint_backfilled =
                         wal_total_backfilled.saturating_sub(ongoing_chkpt.min_frame - 1);
 
-                    let mut checkpoint_result = CheckpointResult::new(
+                    let checkpoint_result = CheckpointResult::new(
                         wal_max_frame,
                         wal_total_backfilled,
                         wal_checkpoint_backfilled,
                     );
                     tracing::info!("checkpoint_result={:?}, mode={:?}", checkpoint_result, mode);
-                    if wal_checkpoint_backfilled > 0 && !mode.should_restart_log() {
-                        checkpoint_result.set_pending_durable_backfill(ongoing_chkpt.max_frame);
-                    }
                     if mode.require_all_backfilled() && !checkpoint_result.everything_backfilled() {
                         return Err(LimboError::Busy);
                     }
@@ -4534,7 +4492,7 @@ fn wal_header_matches_authority_snapshot(
         && wal_header.salt_2 == snapshot.salt_2
 }
 
-fn database_identity_from_header_bytes(header_bytes: &[u8]) -> Result<(u32, u32)> {
+pub(crate) fn database_identity_from_header_bytes(header_bytes: &[u8]) -> Result<(u32, u32)> {
     if header_bytes.len() < DatabaseHeader::SIZE {
         return Err(LimboError::Corrupt(format!(
             "database header must be at least {} bytes, got {}",
@@ -6255,7 +6213,7 @@ pub mod test {
 
     #[cfg(all(unix, target_pointer_width = "64"))]
     #[test]
-    fn test_shm_coordination_live_overflow_refreshes_reused_fallback_for_active_reader() {
+    fn test_shm_coordination_live_overflow_returns_busy_without_runtime_disk_scan() {
         let dir = tempfile::tempdir().unwrap();
         let wal_path = dir.path().join("test-live-overflow.db-wal");
         let shm_path = dir.path().join("test-live-overflow.db-tshm");
@@ -6291,13 +6249,20 @@ pub mod test {
         wal.begin_read_tx().unwrap();
         reopened_authority.mark_frame_index_overflowed_for_tests();
 
-        assert_eq!(wal.find_frame(7, None).unwrap(), Some(1));
-        assert_eq!(
-            shared.read().runtime.frame_cache.lock().get(&7).cloned(),
-            Some(vec![1])
+        assert!(
+            matches!(wal.find_frame(7, None), Err(LimboError::Busy)),
+            "page lookup must refuse the overflowed path instead of rescanning the WAL synchronously"
+        );
+        assert!(
+            shared.read().runtime.frame_cache.lock().is_empty(),
+            "refusing the overflow refresh must leave the local fallback cache untouched"
         );
 
         wal.end_read_tx();
+        assert!(
+            matches!(wal.begin_read_tx(), Err(LimboError::Busy)),
+            "new readers must also refuse an uncovered overflowed frame index without blocking"
+        );
     }
 
     #[cfg(all(unix, target_pointer_width = "64"))]

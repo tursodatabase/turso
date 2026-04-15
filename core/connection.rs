@@ -558,8 +558,9 @@ impl Connection {
     /// Check if a specific trigger is currently compiling (for recursive trigger prevention)
     pub fn trigger_is_compiling(&self, trigger: &Arc<Trigger>) -> bool {
         let compiling = self.compiling_triggers.read();
-        if let Some(trigger) = compiling.iter().find(|t| t.name == trigger.name) {
+        if let Some(active_trigger) = compiling.iter().find(|t| Arc::ptr_eq(t, trigger)) {
             tracing::debug!("Trigger is already compiling: {}", trigger.name);
+            debug_assert!(Arc::ptr_eq(active_trigger, trigger));
             return true;
         }
         false
@@ -581,8 +582,9 @@ impl Connection {
     /// Check if a specific trigger is currently executing (for recursive trigger prevention)
     pub fn is_trigger_executing(&self, trigger: &Arc<Trigger>) -> bool {
         let executing = self.executing_triggers.read();
-        if let Some(trigger) = executing.iter().find(|t| t.name == trigger.name) {
+        if let Some(active_trigger) = executing.iter().find(|t| Arc::ptr_eq(t, trigger)) {
             tracing::debug!("Trigger is already executing: {}", trigger.name);
+            debug_assert!(Arc::ptr_eq(active_trigger, trigger));
             return true;
         }
         false
