@@ -14232,11 +14232,14 @@ fn op_vacuum_into_inner(
                     ));
                 }
 
-                // we always vacuum into a new file, so check if it exists
-                if std::path::Path::new(dest_path).exists() {
-                    return Err(LimboError::ParseError(format!(
-                        "output file already exists: {dest_path}"
-                    )));
+                // We allows vaccum into new file or a empty file, so check if it exits and, if it does, ensure it is empty.
+                match std::fs::metadata(dest_path) {
+                    Ok(meta) if meta.len() > 0 => {
+                        return Err(LimboError::ParseError(format!(
+                            "output file already exists: {dest_path}"
+                        )));
+                    }
+                    _ => {}
                 }
 
                 // Pin source metadata before building the destination. The
@@ -14306,6 +14309,12 @@ fn op_vacuum_into_inner(
                 // this is important for databases using encryption or checksums
                 // must be set before page 1 is allocated (before any schema operations)
                 dest_conn.set_reserved_bytes(reserved_space)?;
+
+                // The source database doesn't use checksums, so we must disable them
+                // in the destination to prevent them from overwriting our data.
+                if reserved_space != crate::storage::checksum::CHECKSUM_REQUIRED_RESERVED_BYTES {
+                    dest_conn.pager.load().reset_checksum_context();
+                }
 
                 // Capture source custom type definitions so that STRICT tables with
                 // custom type columns can resolve those types during CREATE TABLE
