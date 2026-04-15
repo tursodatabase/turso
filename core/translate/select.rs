@@ -551,8 +551,8 @@ fn prepare_one_select_plan(
                     plan.group_by = Some(GroupBy {
                         sort_order: Vec::new(),
                         nulls_order: Vec::new(),
+                        exprs: group_by.exprs.into_iter().map(|expr| *expr).collect(),
                         sort_elided: false,
-                        exprs: group_by.exprs.iter().map(|expr| *expr.clone()).collect(),
                         having: having_predicates,
                     });
                 } else {
@@ -770,8 +770,8 @@ fn prepare_one_select_plan(
                 query_destination,
                 distinctness: Distinctness::NonDistinct,
                 values: values
-                    .iter()
-                    .map(|values| values.iter().map(|value| *value.clone()).collect())
+                    .into_iter()
+                    .map(|values| values.into_iter().map(|value| *value).collect())
                     .collect(),
                 window: None,
                 non_from_clause_subqueries,
