@@ -5,9 +5,7 @@ use std::{
 
 use rand::{Rng, RngCore, SeedableRng};
 use rand_chacha::ChaCha8Rng;
-#[cfg(not(target_os = "linux"))]
-use turso_core::PlatformIO;
-use turso_core::{Clock, IO, MonotonicInstant, OpenFlags, Result, WallClockInstant};
+use turso_core::{Clock, IO, MonotonicInstant, OpenFlags, PlatformIO, Result, WallClockInstant};
 
 use crate::runner::{SimIO, cli::IoBackend, clock::SimulatorClock, file::SimulatorFile};
 
@@ -38,7 +36,16 @@ impl SimulatorIO {
             IoBackend::Default => {
                 #[cfg(target_os = "linux")]
                 {
-                    Box::new(turso_core::UringIO::new()?)
+                    let io: Box<dyn turso_core::IO> = match turso_core::UringIO::new() {
+                        Err(_) => {
+                            tracing::warn!(
+                                "io_uring initialization failed, falling back to PlatformIO"
+                            );
+                            Box::new(PlatformIO::new()?)
+                        }
+                        Ok(io) => Box::new(io),
+                    };
+                    io
                 }
                 #[cfg(not(target_os = "linux"))]
                 {
@@ -46,7 +53,18 @@ impl SimulatorIO {
                 }
             }
             #[cfg(target_os = "linux")]
-            IoBackend::IoUring => Box::new(turso_core::UringIO::new()?),
+            IoBackend::IoUring => {
+                let io: Box<dyn turso_core::IO> = match turso_core::UringIO::new() {
+                    Err(_) => {
+                        tracing::warn!(
+                            "io_uring initialization failed, falling back to PlatformIO"
+                        );
+                        Box::new(PlatformIO::new()?)
+                    }
+                    Ok(io) => Box::new(io),
+                };
+                io
+            }
             #[cfg(target_os = "windows")]
             IoBackend::WindowsIOCP => Box::new(turso_core::WindowsIOCP::new()?),
             IoBackend::Memory => {
