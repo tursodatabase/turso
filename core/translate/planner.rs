@@ -1335,7 +1335,7 @@ pub fn parse_from(
 }
 
 pub fn parse_where(
-    where_clause: Option<&Expr>,
+    where_clause: Option<Box<Expr>>,
     table_references: &mut TableReferences,
     result_columns: Option<&[ResultSetColumn]>,
     out_where_clause: &mut Vec<WhereTerm>,
@@ -1343,7 +1343,8 @@ pub fn parse_where(
 ) -> Result<()> {
     if let Some(where_expr) = where_clause {
         let start_idx = out_where_clause.len();
-        break_predicate_at_and_boundaries(where_expr, out_where_clause);
+        out_where_clause.reserve(count_and_predicate_terms(&where_expr));
+        break_predicate_at_and_boundaries(*where_expr, out_where_clause);
         for expr in out_where_clause[start_idx..].iter_mut() {
             bind_and_rewrite_expr(
                 &mut expr.expr,
@@ -1409,8 +1410,9 @@ pub fn parse_where(
                 Expr::Binary(_, ast::Operator::And, _)
             ) {
                 let term = out_where_clause.remove(i);
-                let mut new_terms: Vec<WhereTerm> = Vec::new();
-                break_predicate_at_and_boundaries(&term.expr, &mut new_terms);
+                let mut new_terms: Vec<WhereTerm> =
+                    Vec::with_capacity(count_and_predicate_terms(&term.expr));
+                break_predicate_at_and_boundaries(term.expr, &mut new_terms);
                 // Preserve from_outer_join from the original term
                 for new_term in new_terms.iter_mut() {
                     new_term.from_outer_join = term.from_outer_join;
@@ -1754,9 +1756,10 @@ fn parse_join(
 
     if let Some(constraint) = constraint {
         match constraint {
-            ast::JoinConstraint::On(ref expr) => {
+            ast::JoinConstraint::On(expr) => {
                 let start_idx = out_where_clause.len();
-                break_predicate_at_and_boundaries(expr, out_where_clause);
+                out_where_clause.reserve(count_and_predicate_terms(&expr));
+                break_predicate_at_and_boundaries(*expr, out_where_clause);
                 for predicate in out_where_clause[start_idx..].iter_mut() {
                     predicate.from_outer_join = if outer {
                         Some(table_references.joined_tables().last().unwrap().internal_id)
@@ -1879,23 +1882,37 @@ fn parse_join(
     Ok(())
 }
 
+pub(crate) fn count_and_predicate_terms(predicate: &Expr) -> usize {
+    let predicate = unwrap_parens(predicate).unwrap_or(predicate);
+    match predicate {
+        Expr::Binary(left, ast::Operator::And, right) => {
+            count_and_predicate_terms(left) + count_and_predicate_terms(right)
+        }
+        _ => 1,
+    }
+}
+
 pub fn break_predicate_at_and_boundaries<T: From<Expr>>(
-    predicate: &Expr,
+    predicate: Expr,
     out_predicates: &mut Vec<T>,
 ) {
     // Unwrap single-element parenthesized expressions recursively: ((expr)) -> expr.
     // This is semantically equivalent since single-element Parenthesized is purely
     // syntactic grouping. Multi-element Parenthesized (row values like (x, y)) are
     // left as-is by unwrap_parens.
-    let predicate = unwrap_parens(predicate).unwrap_or(predicate);
+    let predicate = match predicate {
+        Expr::Parenthesized(mut exprs) if exprs.len() == 1 => {
+            break_predicate_at_and_boundaries(*exprs.pop().unwrap(), out_predicates);
+            return;
+        }
+        predicate => predicate,
+    };
     match predicate {
         Expr::Binary(left, ast::Operator::And, right) => {
-            break_predicate_at_and_boundaries(left, out_predicates);
-            break_predicate_at_and_boundaries(right, out_predicates);
+            break_predicate_at_and_boundaries(*left, out_predicates);
+            break_predicate_at_and_boundaries(*right, out_predicates);
         }
-        _ => {
-            out_predicates.push(predicate.clone().into());
-        }
+        _ => out_predicates.push(predicate.into()),
     }
 }
 
@@ -1945,4 +1962,61 @@ pub fn parse_limit(
         )?;
     }
     Ok((Some(limit.expr), limit.offset))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{break_predicate_at_and_boundaries, count_and_predicate_terms};
+    use turso_parser::{ast, parser::Parser};
+
+    fn parse_expr(sql: &str) -> ast::Expr {
+        let mut parser = Parser::new(sql.as_bytes());
+        let cmd = parser
+            .next()
+            .expect("expected a statement")
+            .expect("expected valid SQL");
+        let ast::Cmd::Stmt(ast::Stmt::Select(select)) = cmd else {
+            panic!("expected SELECT statement");
+        };
+        let ast::OneSelect::Select {
+            where_clause: Some(where_clause),
+            ..
+        } = select.body.select
+        else {
+            panic!("expected WHERE clause");
+        };
+        *where_clause
+    }
+
+    #[test]
+    fn break_predicate_moves_and_terms_without_leaving_top_level_ands() {
+        let predicate = parse_expr("SELECT * FROM t WHERE ((a = 1 AND b = 2)) AND c = 3");
+        let count = count_and_predicate_terms(&predicate);
+        let mut terms = Vec::<ast::Expr>::with_capacity(count);
+        break_predicate_at_and_boundaries(predicate, &mut terms);
+
+        assert_eq!(count, 3);
+        assert_eq!(terms.len(), 3);
+        assert!(terms
+            .iter()
+            .all(|expr| !matches!(expr, ast::Expr::Binary(_, ast::Operator::And, _))));
+    }
+
+    #[test]
+    fn break_predicate_keeps_row_value_parentheses_intact() {
+        let predicate = parse_expr("SELECT * FROM t WHERE (a, b) = (1, 2) AND c = 3");
+        let count = count_and_predicate_terms(&predicate);
+        let mut terms = Vec::<ast::Expr>::with_capacity(count);
+        break_predicate_at_and_boundaries(predicate, &mut terms);
+
+        assert_eq!(terms.len(), 2);
+        assert!(matches!(
+            terms[0],
+            ast::Expr::Binary(_, ast::Operator::Equals, _)
+        ));
+        assert!(matches!(
+            terms[1],
+            ast::Expr::Binary(_, ast::Operator::Equals, _)
+        ));
+    }
 }

@@ -412,7 +412,7 @@ pub fn prepare_update_plan(
     let mut where_clause = vec![];
     // Parse the WHERE clause
     parse_where(
-        body.where_clause.as_deref(),
+        body.where_clause,
         &mut table_references,
         Some(&result_columns),
         &mut where_clause,
