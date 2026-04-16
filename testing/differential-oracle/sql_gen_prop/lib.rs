@@ -40,7 +40,7 @@ pub mod view;
 pub use alter_table::{
     AlterTableContext, AlterTableOp, AlterTableOpKind, AlterTableOpWeights, AlterTableStatement,
 };
-pub use create_index::{CreateIndexStatement, IndexColumn};
+pub use create_index::{CreateIndexStatement, IndexColumn, IndexColumnKind};
 pub use create_table::{ColumnProfile, CreateTableStatement, DataTypeWeights, PrimaryKeyProfile};
 pub use create_trigger::{
     CreateTriggerContext, CreateTriggerKind, CreateTriggerOpWeights, CreateTriggerStatement,
