@@ -194,6 +194,53 @@ fn rewrite_value_to_column(expr: &ast::Expr, col_name: &str) -> Box<ast::Expr> {
     Box::new(cloned)
 }
 
+/// Field definition within a StructDef.
+#[derive(Debug, Clone)]
+pub struct StructFieldDef {
+    pub name: String,
+    pub base_affinity: Affinity,
+    pub type_name: String,
+}
+
+/// Definition for a STRUCT composite type.
+#[derive(Debug, Clone)]
+pub struct StructDef {
+    pub fields: Vec<StructFieldDef>,
+}
+
+/// Variant definition within a UnionDef.
+#[derive(Debug, Clone)]
+pub struct UnionVariantDef {
+    pub tag_name: String,
+    pub tag_index: u8,
+    pub base_affinity: Affinity,
+    pub type_name: String,
+}
+
+/// Definition for a UNION discriminated union type.
+#[derive(Debug, Clone)]
+pub struct UnionDef {
+    pub variants: Vec<UnionVariantDef>,
+    /// Cached variant tag names for `UnionTag` instructions.
+    /// Built once at type registration time so we don't rebuild per-instruction.
+    pub tag_names: Arc<[String]>,
+}
+
+/// The kind-specific payload of a custom type.
+#[derive(Debug, Clone)]
+pub enum TypeDefKind {
+    Custom {
+        params: Vec<ast::TypeParam>,
+        base: String,
+        encode: Option<Box<ast::Expr>>,
+        decode: Option<Box<ast::Expr>>,
+        operators: Vec<TypeOperator>,
+        default: Option<Box<ast::Expr>>,
+    },
+    Struct(StructDef),
+    Union(UnionDef),
+}
+
 /// Custom type definition, loaded from sqlite_turso_types
 #[derive(Debug, Clone)]
 /// A fully-resolved custom type: the chain of TypeDefs from the named type
@@ -220,19 +267,13 @@ impl ResolvedType {
     /// Matches PostgreSQL: a child domain inherits the parent's DEFAULT when it
     /// doesn't declare its own.
     pub fn default_expr(&self) -> Option<&ast::Expr> {
-        self.chain.iter().find_map(|td| td.default.as_deref())
+        self.chain.iter().find_map(|td| td.default_expr())
     }
 }
 
 #[derive(Debug, Clone)]
 pub struct TypeDef {
     pub name: String,
-    pub params: Vec<ast::TypeParam>,
-    pub base: String,
-    pub encode: Option<Box<ast::Expr>>,
-    pub decode: Option<Box<ast::Expr>>,
-    pub operators: Vec<TypeOperator>,
-    pub default: Option<Box<ast::Expr>>,
     pub is_builtin: bool,
     pub not_null: bool,
     /// Whether this is a domain (CREATE DOMAIN) vs a custom type (CREATE TYPE).
@@ -242,30 +283,197 @@ pub struct TypeDef {
     /// CHECK constraints from CREATE DOMAIN, stored as first-class data.
     /// Empty for regular CREATE TYPE definitions.
     pub domain_checks: Vec<ast::DomainConstraint>,
+    pub kind: TypeDefKind,
 }
 
 impl TypeDef {
+    /// Returns true if this is a STRUCT type.
+    pub fn is_struct(&self) -> bool {
+        matches!(self.kind, TypeDefKind::Struct(_))
+    }
+
+    /// Returns true if this is a UNION type.
+    pub fn is_union(&self) -> bool {
+        matches!(self.kind, TypeDefKind::Union(_))
+    }
+
+    /// Returns the StructDef if this is a STRUCT type.
+    pub fn struct_def(&self) -> Option<&StructDef> {
+        match &self.kind {
+            TypeDefKind::Struct(sd) => Some(sd),
+            _ => None,
+        }
+    }
+
+    /// Returns the UnionDef if this is a UNION type.
+    pub fn union_def(&self) -> Option<&UnionDef> {
+        match &self.kind {
+            TypeDefKind::Union(ud) => Some(ud),
+            _ => None,
+        }
+    }
+
+    /// Returns the encode expression (Custom types only).
+    pub fn encode(&self) -> Option<&ast::Expr> {
+        match &self.kind {
+            TypeDefKind::Custom { encode, .. } => encode.as_deref(),
+            _ => None,
+        }
+    }
+
+    /// Returns the decode expression (Custom types only).
+    pub fn decode(&self) -> Option<&ast::Expr> {
+        match &self.kind {
+            TypeDefKind::Custom { decode, .. } => decode.as_deref(),
+            _ => None,
+        }
+    }
+
+    /// Returns the base type name.
+    pub fn base(&self) -> &str {
+        match &self.kind {
+            TypeDefKind::Custom { base, .. } => base,
+            TypeDefKind::Struct(_) | TypeDefKind::Union(_) => "blob",
+        }
+    }
+
+    /// Returns the params (Custom types only, empty for Struct/Union).
+    pub fn params(&self) -> &[ast::TypeParam] {
+        match &self.kind {
+            TypeDefKind::Custom { params, .. } => params,
+            _ => &[],
+        }
+    }
+
+    /// Returns the operators (Custom types only, empty for Struct/Union).
+    pub fn operators(&self) -> &[TypeOperator] {
+        match &self.kind {
+            TypeDefKind::Custom { operators, .. } => operators,
+            _ => &[],
+        }
+    }
+
+    /// Returns the default expression (Custom types only).
+    pub fn default_expr(&self) -> Option<&ast::Expr> {
+        match &self.kind {
+            TypeDefKind::Custom { default, .. } => default.as_deref(),
+            _ => None,
+        }
+    }
+
+    /// Find a struct field by name. Returns (field_index, &StructFieldDef).
+    pub fn find_struct_field(&self, name: &str) -> Option<(usize, &StructFieldDef)> {
+        self.struct_def().and_then(|sd| {
+            sd.fields
+                .iter()
+                .enumerate()
+                .find(|(_, f)| f.name.eq_ignore_ascii_case(name))
+        })
+    }
+
+    /// Resolve a tag name to its numeric index within this union type.
+    /// Returns None if this is not a union or the variant doesn't exist.
+    pub fn resolve_union_tag_index(&self, tag_name: &str) -> Option<u8> {
+        self.find_union_variant(tag_name).map(|(idx, _)| idx)
+    }
+
+    /// Find a union variant by tag name. Returns (tag_index, &UnionVariantDef).
+    pub fn find_union_variant(&self, name: &str) -> Option<(u8, &UnionVariantDef)> {
+        self.union_def().and_then(|ud| {
+            ud.variants
+                .iter()
+                .find(|v| v.tag_name.eq_ignore_ascii_case(name))
+                .map(|v| (v.tag_index, v))
+        })
+    }
+
     /// Construct a TypeDef from a parsed CREATE TYPE statement.
     pub fn from_create_type(
         type_name: &str,
         body: &ast::CreateTypeBody,
         is_builtin: bool,
         sql: String,
-    ) -> Self {
-        Self {
-            name: type_name.to_string(),
-            params: body.params.clone(),
-            base: body.base.clone(),
-            encode: body.encode.clone(),
-            decode: body.decode.clone(),
-            operators: body.operators.clone(),
-            default: body.default.clone(),
-            is_builtin,
-            not_null: false,
-            is_domain: false,
-            sql,
-            domain_checks: Vec::new(),
-        }
+    ) -> crate::Result<Self> {
+        Ok(match body {
+            ast::CreateTypeBody::CustomType {
+                params,
+                base,
+                encode,
+                decode,
+                operators,
+                default,
+            } => Self {
+                name: type_name.to_string(),
+                is_builtin,
+                not_null: false,
+                is_domain: false,
+                sql,
+                domain_checks: Vec::new(),
+                kind: TypeDefKind::Custom {
+                    params: params.clone(),
+                    base: base.clone(),
+                    encode: encode.clone(),
+                    decode: decode.clone(),
+                    operators: operators.clone(),
+                    default: default.clone(),
+                },
+            },
+            ast::CreateTypeBody::Struct(fields) => {
+                let struct_fields: Vec<StructFieldDef> = fields
+                    .iter()
+                    .map(|f| StructFieldDef {
+                        name: f.name.to_string(),
+                        base_affinity: Affinity::affinity(&f.field_type.name),
+                        type_name: f.field_type.name.clone(),
+                    })
+                    .collect();
+                Self {
+                    name: type_name.to_string(),
+                    is_builtin,
+                    not_null: false,
+                    is_domain: false,
+                    sql,
+                    domain_checks: Vec::new(),
+                    kind: TypeDefKind::Struct(StructDef {
+                        fields: struct_fields,
+                    }),
+                }
+            }
+            ast::CreateTypeBody::Union(fields) => {
+                if fields.len() > 256 {
+                    return Err(crate::LimboError::ParseError(format!(
+                        "UNION type cannot have more than 256 variants (got {})",
+                        fields.len()
+                    )));
+                }
+                let variants: Vec<UnionVariantDef> = fields
+                    .iter()
+                    .enumerate()
+                    .map(|(i, f)| UnionVariantDef {
+                        tag_name: f.name.to_string(),
+                        tag_index: i as u8,
+                        base_affinity: Affinity::affinity(&f.field_type.name),
+                        type_name: f.field_type.name.clone(),
+                    })
+                    .collect();
+                Self {
+                    name: type_name.to_string(),
+                    is_builtin,
+                    not_null: false,
+                    is_domain: false,
+                    sql,
+                    domain_checks: Vec::new(),
+                    kind: TypeDefKind::Union(UnionDef {
+                        tag_names: variants
+                            .iter()
+                            .map(|v| v.tag_name.clone())
+                            .collect::<Vec<_>>()
+                            .into(),
+                        variants,
+                    }),
+                }
+            }
+        })
     }
 
     /// Construct a TypeDef from a parsed CREATE DOMAIN statement.
@@ -280,35 +488,37 @@ impl TypeDef {
     ) -> Self {
         Self {
             name: domain_name.to_string(),
-            params: Vec::new(),
-            base: base_type.to_string(),
-            encode: None,
-            decode: None,
-            operators: Vec::new(),
-            default,
             is_builtin: false,
             not_null,
             is_domain: true,
             sql,
             domain_checks: constraints.to_vec(),
+            kind: TypeDefKind::Custom {
+                params: Vec::new(),
+                base: base_type.to_string(),
+                encode: None,
+                decode: None,
+                operators: Vec::new(),
+                default,
+            },
         }
     }
 
     /// The expected input type for `value` in this custom type.
     /// Looks for a `value` parameter with a type annotation.
-    /// Falls back to `self.base` if `value` is not declared.
+    /// Falls back to base type if `value` is not declared.
     pub fn value_input_type(&self) -> &str {
-        for p in &self.params {
+        for p in self.params() {
             if p.name.eq_ignore_ascii_case("value") {
-                return p.ty.as_deref().unwrap_or(&self.base);
+                return p.ty.as_deref().unwrap_or_else(|| self.base());
             }
         }
-        &self.base
+        self.base()
     }
 
     /// The non-value params (user-provided at column declaration time).
     pub fn user_params(&self) -> impl Iterator<Item = &turso_parser::ast::TypeParam> {
-        self.params
+        self.params()
             .iter()
             .filter(|p| !p.name.eq_ignore_ascii_case("value"))
     }
@@ -453,7 +663,9 @@ impl Default for Schema {
     }
 }
 
-fn bootstrap_builtin_types(registry: &mut HashMap<String, Arc<TypeDef>>) {
+fn bootstrap_builtin_types(
+    registry: &mut HashMap<String, Arc<TypeDef>>,
+) -> crate::Result<()> {
     use turso_parser::ast::{Cmd, Stmt};
     use turso_parser::parser::Parser;
 
@@ -482,10 +694,12 @@ fn bootstrap_builtin_types(registry: &mut HashMap<String, Arc<TypeDef>>) {
             type_name, body, ..
         }))) = parser.next_cmd()
         else {
-            panic!("Failed to parse built-in type SQL: {sql}");
+            return Err(crate::LimboError::InternalError(format!(
+                "failed to parse built-in type SQL: {sql}"
+            )));
         };
 
-        let type_def = TypeDef::from_create_type(&type_name, &body, true, sql.to_string());
+        let type_def = TypeDef::from_create_type(&type_name, &body, true, sql.to_string())?;
         registry.insert(type_name.to_lowercase(), Arc::new(type_def));
     }
 
@@ -500,6 +714,7 @@ fn bootstrap_builtin_types(registry: &mut HashMap<String, Arc<TypeDef>>) {
             registry.insert(alias.to_string(), type_def);
         }
     }
+    Ok(())
 }
 
 impl Schema {
@@ -515,11 +730,16 @@ impl Schema {
         }
     }
 
+    /// Create a schema with custom types enabled.
+    ///
+    /// Panics if a hardcoded built-in type definition is malformed (programmer
+    /// bug). Production code that opens user databases should prefer
+    /// [`Schema::with_options`] which returns `Result`.
     pub fn new() -> Self {
-        Self::with_options(true)
+        Self::with_options(true).expect("built-in type definitions are malformed")
     }
 
-    pub fn with_options(enable_custom_types: bool) -> Self {
+    pub fn with_options(enable_custom_types: bool) -> crate::Result<Self> {
         let mut tables: HashMap<String, Arc<Table>> = HashMap::default();
         let has_indexes = HashSet::default();
         let indexes: HashMap<String, VecDeque<Arc<Index>>> = HashMap::default();
@@ -541,7 +761,11 @@ impl Schema {
         let triggers = HashMap::default();
         let table_to_materialized_views: HashMap<String, Vec<String>> = HashMap::default();
         let incompatible_views = HashSet::default();
-        Self {
+        let mut type_registry = HashMap::default();
+        if enable_custom_types {
+            bootstrap_builtin_types(&mut type_registry)?;
+        }
+        Ok(Self {
             tables,
             materialized_view_names,
             materialized_view_sql,
@@ -555,15 +779,9 @@ impl Schema {
             table_to_materialized_views,
             incompatible_views,
             dropped_root_pages: HashSet::default(),
-            type_registry: {
-                let mut registry = HashMap::default();
-                if enable_custom_types {
-                    bootstrap_builtin_types(&mut registry);
-                }
-                registry
-            },
+            type_registry,
             generated_columns_enabled: false,
-        }
+        })
     }
 
     /// Look up a custom type definition by name.
@@ -633,7 +851,7 @@ impl Schema {
             match self.type_registry.get(&current) {
                 Some(td) => {
                     chain.push(Arc::clone(td));
-                    current = td.base.to_lowercase();
+                    current = td.base().to_lowercase();
                 }
                 None => {
                     // current is not in the registry — it's a primitive
@@ -654,7 +872,8 @@ impl Schema {
             Ok(Some(Cmd::Stmt(Stmt::CreateType {
                 type_name, body, ..
             }))) => {
-                let type_def = TypeDef::from_create_type(&type_name, &body, false, sql.to_string());
+                let type_def =
+                    TypeDef::from_create_type(&type_name, &body, false, sql.to_string())?;
                 self.type_registry
                     .insert(type_name.to_lowercase(), Arc::new(type_def));
             }
@@ -2190,6 +2409,15 @@ impl Table {
         }
     }
 
+    /// Like `btree()` but returns an error instead of None.
+    pub fn require_btree(&self) -> crate::Result<Arc<BTreeTable>> {
+        self.btree().ok_or_else(|| {
+            crate::LimboError::InternalError(
+                "operation requires a btree table, not a virtual table".into(),
+            )
+        })
+    }
+
     pub fn btree_mut(&mut self) -> Option<&mut Arc<BTreeTable>> {
         match self {
             Self::BTree(table) => Some(table),
@@ -3129,11 +3357,11 @@ fn find_column_index_by_name(columns: &[Column], col_name: &str) -> Option<usize
     })
 }
 
-/// Resolve [Expr::Id] / [Expr::Qualified] in a generated column expression to
-/// `Expr::Column { table: SELF_TABLE, column: idx }`.
+/// Resolve [Expr::Id] / [Expr::Qualified] / [Expr::DoublyQualified] in a generated column
+/// or partial-index expression to `Expr::Column { table: SELF_TABLE, column: idx }`.
 pub fn resolve_gencol_expr_columns(gencol_expr: &mut Expr, columns: &[Column]) -> Result<()> {
     walk_expr_mut(gencol_expr, &mut |e| match e {
-        Expr::Id(name) | Expr::Qualified(_, name) => {
+        Expr::Id(name) | Expr::Qualified(_, name) | Expr::DoublyQualified(_, _, name) => {
             let col_name = normalize_ident(name.as_str());
             let (idx, col) = columns
                 .iter()

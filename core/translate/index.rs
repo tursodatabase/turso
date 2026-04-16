@@ -144,7 +144,7 @@ pub fn translate_create_index(
     };
     let columns = resolve_sorted_columns(&tbl, &columns)?;
 
-    // Block CREATE INDEX on non-orderable custom type columns
+    // Block CREATE INDEX on non-orderable custom type columns and STRUCT/UNION columns
     for col in &columns {
         if col.expr.is_none() {
             // Simple column reference (not expression index)
@@ -153,8 +153,14 @@ pub fn translate_create_index(
                     .schema()
                     .get_type_def(&column.ty_str, tbl.is_strict)
                 {
-                    if type_def.decode.is_some()
-                        && !type_def.operators.iter().any(|op| op.op == "<")
+                    if type_def.is_struct() || type_def.is_union() {
+                        bail_parse_error!(
+                            "cannot create index on STRUCT/UNION column '{}'",
+                            col.name
+                        );
+                    }
+                    if type_def.decode().is_some()
+                        && !type_def.operators().iter().any(|op| op.op == "<")
                     {
                         bail_parse_error!(
                             "cannot create index on column '{}' of type '{}': type does not declare OPERATOR '<'",

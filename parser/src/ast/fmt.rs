@@ -717,44 +717,65 @@ impl ToTokens for Stmt {
                     s.append(TK_EXISTS, None)?;
                 }
                 s.append(TK_ID, Some(type_name))?;
-                // Parameters
-                if !body.params.is_empty() {
-                    s.append(TK_LP, None)?;
-                    for (i, param) in body.params.iter().enumerate() {
-                        if i > 0 {
-                            s.append(TK_COMMA, None)?;
-                        }
-                        s.append(TK_ID, Some(&param.name))?;
-                        if let Some(ref ty) = param.ty {
-                            s.append(TK_ID, Some(ty))?;
-                        }
+                match body {
+                    CreateTypeBody::Struct(fields) => {
+                        s.append(TK_AS, None)?;
+                        s.append(TK_ID, Some("STRUCT"))?;
+                        type_fields_to_tokens(fields, s, context)?;
                     }
-                    s.append(TK_RP, None)?;
-                }
-                // BASE
-                s.append(TK_ID, Some("BASE"))?;
-                s.append(TK_ID, Some(&body.base))?;
-                // ENCODE
-                if let Some(ref encode) = body.encode {
-                    s.append(TK_ID, Some("ENCODE"))?;
-                    encode.to_tokens(s, context)?;
-                }
-                // DECODE
-                if let Some(ref decode) = body.decode {
-                    s.append(TK_ID, Some("DECODE"))?;
-                    decode.to_tokens(s, context)?;
-                }
-                // DEFAULT
-                if let Some(ref default) = body.default {
-                    s.append(TK_ID, Some("DEFAULT"))?;
-                    default.to_tokens(s, context)?;
-                }
-                // OPERATOR clauses
-                for op in &body.operators {
-                    s.append(TK_ID, Some("OPERATOR"))?;
-                    s.append(TK_STRING, Some(&format!("'{}'", op.op)))?;
-                    if let Some(ref func_name) = op.func_name {
-                        s.append(TK_ID, Some(func_name))?;
+                    CreateTypeBody::Union(fields) => {
+                        s.append(TK_AS, None)?;
+                        s.append(TK_ID, Some("UNION"))?;
+                        type_fields_to_tokens(fields, s, context)?;
+                    }
+                    CreateTypeBody::CustomType {
+                        params,
+                        base,
+                        encode,
+                        decode,
+                        operators,
+                        default,
+                    } => {
+                        // Parameters
+                        if !params.is_empty() {
+                            s.append(TK_LP, None)?;
+                            for (i, param) in params.iter().enumerate() {
+                                if i > 0 {
+                                    s.append(TK_COMMA, None)?;
+                                }
+                                s.append(TK_ID, Some(&param.name))?;
+                                if let Some(ref ty) = param.ty {
+                                    s.append(TK_ID, Some(ty))?;
+                                }
+                            }
+                            s.append(TK_RP, None)?;
+                        }
+                        // BASE
+                        s.append(TK_ID, Some("BASE"))?;
+                        s.append(TK_ID, Some(base))?;
+                        // ENCODE
+                        if let Some(ref encode) = encode {
+                            s.append(TK_ID, Some("ENCODE"))?;
+                            encode.to_tokens(s, context)?;
+                        }
+                        // DECODE
+                        if let Some(ref decode) = decode {
+                            s.append(TK_ID, Some("DECODE"))?;
+                            decode.to_tokens(s, context)?;
+                        }
+                        // DEFAULT
+                        if let Some(ref default) = default {
+                            s.append(TK_ID, Some("DEFAULT"))?;
+                            default.to_tokens(s, context)?;
+                        }
+                        // OPERATOR clauses
+                        for op in operators {
+                            s.append(TK_ID, Some("OPERATOR"))?;
+                            s.append(TK_STRING, Some(&format!("'{}'", op.op)))?;
+                            if let Some(ref func_name) = op.func_name {
+                                s.append(TK_ID, Some(func_name))?;
+                            }
+                        }
                     }
                 }
                 Ok(())
@@ -1031,6 +1052,11 @@ impl ToTokens for Expr {
                 qualifier.to_tokens(s, context)?;
                 s.append(TK_DOT, None)?;
                 qualified.to_tokens(s, context)
+            }
+            Self::FieldAccess { base, field, .. } => {
+                base.to_tokens(s, context)?;
+                s.append(TK_DOT, None)?;
+                field.to_tokens(s, context)
             }
             Self::Raise(rt, err) => {
                 s.append(TK_RAISE, None)?;
@@ -2344,14 +2370,11 @@ impl ToTokens for Type {
         s: &mut S,
         context: &C,
     ) -> Result<(), S::Error> {
-        match self.size {
-            None => s.append(TK_ID, Some(&self.name))?,
-            Some(ref size) => {
-                s.append(TK_ID, Some(&self.name))?; // TODO check there is no forbidden chars
-                s.append(TK_LP, None)?;
-                size.to_tokens(s, context)?;
-                s.append(TK_RP, None)?;
-            }
+        s.append(TK_ID, Some(&self.name))?;
+        if let Some(ref size) = self.size {
+            s.append(TK_LP, None)?;
+            size.to_tokens(s, context)?;
+            s.append(TK_RP, None)?;
         }
         for _ in 0..self.array_dimensions {
             s.append(TK_LBRACKET, None)?;
@@ -2634,6 +2657,23 @@ impl ToTokens for FrameExclude {
             Self::Ties => s.append(TK_TIES, None),
         }
     }
+}
+
+/// Emit a parenthesized, comma-separated list of `name Type` pairs.
+fn type_fields_to_tokens<S: TokenStream + ?Sized, C: ToSqlContext>(
+    fields: &[TypeField],
+    s: &mut S,
+    context: &C,
+) -> Result<(), S::Error> {
+    s.append(TK_LP, None)?;
+    for (i, field) in fields.iter().enumerate() {
+        if i > 0 {
+            s.append(TK_COMMA, None)?;
+        }
+        field.name.to_tokens(s, context)?;
+        field.field_type.to_tokens(s, context)?;
+    }
+    s.append(TK_RP, None)
 }
 
 fn comma<I, S: TokenStream + ?Sized, C: ToSqlContext>(

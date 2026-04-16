@@ -18,8 +18,7 @@ use crate::{
             bind_and_rewrite_expr, emit_returning_results, emit_returning_scan_back,
             process_returning_clause, restore_returning_row_image_in_cache,
             seed_returning_row_image_in_cache, translate_expr, translate_expr_no_constant_opt,
-            walk_expr, walk_expr_mut, BindingBehavior, NoConstantOptReason, ReturningBufferCtx,
-            WalkControl,
+            walk_expr, BindingBehavior, NoConstantOptReason, ReturningBufferCtx, WalkControl,
         },
         fkeys::{
             build_index_affinity_string, emit_fk_restrict_halt, emit_fk_violation,
@@ -48,10 +47,7 @@ use crate::{
     util::normalize_ident,
     vdbe::{
         affinity::Affinity,
-        builder::{
-            CursorKey, CursorType, DmlColumnContext, ProgramBuilder, ProgramBuilderOpts,
-            SelfTableContext,
-        },
+        builder::{CursorKey, CursorType, DmlColumnContext, ProgramBuilder, ProgramBuilderOpts},
         insn::{to_u16, CmpInsFlags, IdxInsertFlags, InsertFlags, Insn, RegisterOrLiteral},
         BranchOffset,
     },
@@ -507,7 +503,13 @@ pub fn translate_insert(
 
     let has_before_triggers = !relevant_before_triggers.is_empty();
     if has_before_triggers {
-        compute_virtual_columns(program, &ctx.table.columns_topo_sort()?, &dml_ctx, resolver)?;
+        compute_virtual_columns(
+            program,
+            &ctx.table.columns_topo_sort()?,
+            &dml_ctx,
+            resolver,
+            &btree_table,
+        )?;
 
         // In SQLite, NEW.<rowid_alias> returns -1 in BEFORE INSERT triggers when the rowid
         // hasn't been assigned yet (i.e., it's NULL). We need to temporarily set the key
@@ -722,7 +724,13 @@ pub fn translate_insert(
     // Make computed virtual columns accessible to CHECK and NOT NULL constraint evaluation
     if insertion.has_virtual_columns() {
         //TODO only compute the necessary virtual columns for CHECK and NOT NULL evaluation
-        compute_virtual_columns(program, &ctx.table.columns_topo_sort()?, &dml_ctx, resolver)?;
+        compute_virtual_columns(
+            program,
+            &ctx.table.columns_topo_sort()?,
+            &dml_ctx,
+            resolver,
+            &btree_table,
+        )?;
     }
 
     // Evaluate CHECK constraints after type affinity/TypeCheck but before other constraints
@@ -904,7 +912,13 @@ pub fn translate_insert(
     );
     let has_after_triggers = !relevant_after_triggers.is_empty();
     if has_after_triggers {
-        compute_virtual_columns(program, &ctx.table.columns_topo_sort()?, &dml_ctx, resolver)?;
+        compute_virtual_columns(
+            program,
+            &ctx.table.columns_topo_sort()?,
+            &dml_ctx,
+            resolver,
+            &btree_table,
+        )?;
 
         // Build raw NEW registers for AFTER triggers. Values are encoded at this point;
         // fire_trigger will decode them via decode_trigger_registers.
@@ -1230,20 +1244,37 @@ fn emit_partial_index_check(
     resolver: &Resolver,
     index: &Index,
     insertion: &Insertion,
+    table: &Arc<BTreeTable>,
 ) -> Result<Option<BranchOffset>> {
     let Some(where_clause) = &index.where_clause else {
         return Ok(None);
     };
-    let mut where_for_eval = where_clause.as_ref().clone();
-    rewrite_partial_index_where(&mut where_for_eval, insertion)?;
+    let expr = where_clause.as_ref().clone();
+    let columns: Vec<Column> = insertion
+        .col_mappings
+        .iter()
+        .map(|cm| cm.column.clone())
+        .collect();
+    let mut column_regs: Vec<usize> = insertion
+        .col_mappings
+        .iter()
+        .map(|cm| {
+            if cm.column.is_rowid_alias() {
+                insertion.key_register()
+            } else {
+                cm.register
+            }
+        })
+        .collect();
     let reg = program.alloc_register();
-    translate_expr_no_constant_opt(
+    crate::translate::expr::emit_dml_expr_index_value(
         program,
-        Some(&TableReferences::new_empty()),
-        &where_for_eval,
-        reg,
         resolver,
-        NoConstantOptReason::RegisterReuse,
+        expr,
+        &columns,
+        &mut column_regs,
+        table,
+        reg,
     )?;
     let skip_label = program.allocate_label();
     program.emit_insn(Insn::IfNot {
@@ -1283,7 +1314,8 @@ fn emit_commit_phase(
             .expect("no cursor found for index");
 
         // Re-evaluate partial predicate on the would-be inserted image
-        let commit_skip_label = emit_partial_index_check(program, resolver, index, insertion)?;
+        let commit_skip_label =
+            emit_partial_index_check(program, resolver, index, insertion, ctx.table)?;
 
         let num_cols = index.columns.len();
         let idx_start_reg = program.alloc_registers(num_cols + 1);
@@ -1703,7 +1735,7 @@ fn emit_notnulls(
             .schema()
             .get_type_def(&column_mapping.column.ty_str, ctx.table.is_strict)
         {
-            if type_def.decode.is_some() {
+            if type_def.decode().is_some() {
                 let decoded_reg = program.alloc_register();
                 crate::translate::expr::emit_user_facing_column_value(
                     program,
@@ -2326,13 +2358,6 @@ impl<'a> Insertion<'a> {
                 .is_some_and(|n| n.eq_ignore_ascii_case(name))
         })
     }
-
-    fn rowid_alias_mapping(&self) -> Option<&ColMapping<'a>> {
-        match &self.key {
-            InsertionKey::RowidAlias(mapping) => Some(mapping),
-            _ => None,
-        }
-    }
 }
 
 #[derive(Debug)]
@@ -2651,7 +2676,18 @@ fn translate_column(
     is_strict: bool,
 ) -> Result<()> {
     if let Some(value_index) = value_index {
-        translate_value_fn(program, value_index, column_register)?;
+        // Save/restore target_union_type so union_value() resolves tags
+        // against this column's union type. See ProgramBuilder::target_union_type.
+        let union_td = resolver
+            .schema()
+            .get_type_def_unchecked(&column.ty_str)
+            .filter(|td| td.is_union())
+            .cloned();
+        let prev = program.target_union_type.take();
+        program.target_union_type = union_td;
+        let result = translate_value_fn(program, value_index, column_register);
+        program.target_union_type = prev;
+        result?;
     } else if column.is_rowid_alias() {
         // Although a non-NULL integer key is used for the insertion key,
         // the rowid alias column is emitted as NULL.
@@ -2785,7 +2821,8 @@ fn emit_index_uniqueness_check(
         .expect("no cursor found for index");
 
     // For partial indexes, evaluate the WHERE clause and skip if false
-    let maybe_skip_probe_label = emit_partial_index_check(program, resolver, index, insertion)?;
+    let maybe_skip_probe_label =
+        emit_partial_index_check(program, resolver, index, insertion, ctx.table)?;
 
     let num_cols = index.columns.len();
     // allocate scratch registers for the index columns plus rowid
@@ -3311,108 +3348,41 @@ pub fn format_unique_violation_desc(table_name: &str, index: &Index) -> String {
     }
 }
 
-/// Rewrite WHERE clause for partial index to reference insertion registers
-pub fn rewrite_partial_index_where(
-    expr: &mut ast::Expr,
-    insertion: &Insertion,
-) -> crate::Result<WalkControl> {
-    let col_reg = |name: &str| -> Option<usize> {
-        if ROWID_STRS.iter().any(|s| s.eq_ignore_ascii_case(name)) {
-            Some(insertion.key_register())
-        } else if let Some(c) = insertion.get_col_mapping_by_name(name) {
-            if c.column.is_rowid_alias() {
-                Some(insertion.key_register())
-            } else {
-                Some(c.register)
-            }
-        } else {
-            None
-        }
-    };
-    walk_expr_mut(
-        expr,
-        &mut |e: &mut ast::Expr| -> crate::Result<WalkControl> {
-            match e {
-                // NOTE: should not have ANY Expr::Columns bound to the expr
-                Expr::Id(name) => {
-                    let normalized = normalize_ident(name.as_str());
-                    if let Some(reg) = col_reg(&normalized) {
-                        *e = Expr::Register(reg);
-                    }
-                }
-                Expr::Qualified(_, col) | Expr::DoublyQualified(_, _, col) => {
-                    let normalized = normalize_ident(col.as_str());
-                    if let Some(reg) = col_reg(&normalized) {
-                        *e = Expr::Register(reg);
-                    }
-                }
-                _ => {}
-            }
-            Ok(WalkControl::Continue)
-        },
-    )
-}
-
 fn emit_index_column_value_for_insert(
     program: &mut ProgramBuilder,
     resolver: &Resolver,
     insertion: &Insertion,
-    table: &BTreeTable,
+    table: &Arc<BTreeTable>,
     idx_col: &IndexColumn,
     dest_reg: usize,
 ) -> Result<()> {
     if let Some(expr) = &idx_col.expr {
-        let mut expr = expr.as_ref().clone();
+        let expr = expr.as_ref().clone();
         let columns: Vec<Column> = insertion
             .col_mappings
             .iter()
             .map(|cm| cm.column.clone())
             .collect();
-        schema::resolve_gencol_expr_columns(&mut expr, &columns)?;
-
-        // After rewrite, column registers hold encoded custom-type values.
-        // Decode them into temp registers so the expression evaluates on
-        // user-facing values, matching what SELECT / CREATE INDEX see.
-        let rowid_alias = insertion.rowid_alias_mapping();
-        let is_strict = table.is_strict;
         let mut column_regs: Vec<usize> = insertion
             .col_mappings
             .iter()
             .map(|cm| {
                 if cm.column.is_rowid_alias() {
-                    if let Some(ra) = rowid_alias {
-                        return ra.register;
-                    }
+                    insertion.key_register()
+                } else {
+                    cm.register
                 }
-                cm.register
             })
             .collect();
-        for (i, cm) in insertion.col_mappings.iter().enumerate() {
-            if cm.column.is_rowid_alias() {
-                continue;
-            }
-            if let Some(type_def) = resolver.schema().get_type_def(&cm.column.ty_str, is_strict) {
-                if type_def.decode.is_some() {
-                    let tmp = program.alloc_register();
-                    crate::translate::expr::emit_user_facing_column_value(
-                        program,
-                        cm.register,
-                        tmp,
-                        cm.column,
-                        is_strict,
-                        resolver,
-                    )?;
-                    column_regs[i] = tmp;
-                }
-            }
-        }
-        let pairs = columns.iter().zip(column_regs.iter().copied());
-        let ctx = SelfTableContext::ForDML(DmlColumnContext::from_column_reg_mapping(pairs));
-
-        program.with_self_table_context(Some(&ctx), |program, _| {
-            translate_expr(program, None, &expr, dest_reg, resolver)?;
-            Ok(())
-        })?;
+        crate::translate::expr::emit_dml_expr_index_value(
+            program,
+            resolver,
+            expr,
+            &columns,
+            &mut column_regs,
+            table,
+            dest_reg,
+        )?;
     } else {
         let Some(cm) = insertion.get_col_mapping_by_name(&idx_col.name) else {
             return Err(LimboError::PlanningError(
