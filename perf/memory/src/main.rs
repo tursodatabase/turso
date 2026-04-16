@@ -7,6 +7,7 @@ use anyhow::Result;
 use clap::{Parser, ValueEnum};
 use profile::{
     Phase, Profile, WorkItem, insert::InsertHeavy, mixed::Mixed, read::ReadHeavy, scan::ScanHeavy,
+    series_blob::SeriesBlob,
 };
 use turso::Connection;
 use turso::params::Params;
@@ -37,6 +38,7 @@ enum WorkloadProfile {
     ReadHeavy,
     Mixed,
     ScanHeavy,
+    SeriesBlob,
 }
 
 impl std::fmt::Display for WorkloadProfile {
@@ -46,6 +48,7 @@ impl std::fmt::Display for WorkloadProfile {
             WorkloadProfile::ReadHeavy => write!(f, "read-heavy"),
             WorkloadProfile::Mixed => write!(f, "mixed"),
             WorkloadProfile::ScanHeavy => write!(f, "scan-heavy"),
+            WorkloadProfile::SeriesBlob => write!(f, "series-blob"),
         }
     }
 }
@@ -287,6 +290,7 @@ fn create_profile(
         WorkloadProfile::ReadHeavy => Box::new(ReadHeavy::new(iterations, batch_size)),
         WorkloadProfile::Mixed => Box::new(Mixed::new(iterations, batch_size)),
         WorkloadProfile::ScanHeavy => Box::new(ScanHeavy::new(iterations, batch_size)),
+        WorkloadProfile::SeriesBlob => Box::new(SeriesBlob::new(iterations, batch_size)),
     }
 }
 
