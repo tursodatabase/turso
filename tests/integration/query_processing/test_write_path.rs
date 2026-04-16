@@ -893,6 +893,28 @@ pub fn upsert_conflict(limbo: TempDatabase) {
 }
 
 #[turso_macros::test]
+pub fn insert_returning_qualified_quoted_table(limbo: TempDatabase) {
+    // Regression: qualified column refs in RETURNING (e.g. "users"."id")
+    // failed with `no such table: users` when the table was created with
+    // quoted identifiers, because INSERT stored the joined-table identifier
+    // via `Name::to_string` (which preserves quotes) instead of normalizing
+    // it like DELETE/UPDATE do.
+    let conn = limbo.db.connect().unwrap();
+    conn.execute(r#"CREATE TABLE "users" ("id" INTEGER PRIMARY KEY AUTOINCREMENT, "name" TEXT);"#)
+        .unwrap();
+    assert_eq!(
+        vec![vec![
+            rusqlite::types::Value::Integer(1),
+            rusqlite::types::Value::Text("ret".to_string()),
+        ]],
+        limbo_exec_rows(
+            &conn,
+            r#"INSERT INTO "users" ("name") VALUES ('ret') RETURNING "users"."id", "users"."name""#,
+        )
+    );
+}
+
+#[turso_macros::test]
 pub fn concurrent_writes_over_single_connection(limbo: TempDatabase) {
     const COUNT: usize = 16;
     let conn = limbo.db.connect().unwrap();
