@@ -2282,7 +2282,7 @@ impl BTreeTable {
     pub fn input_type_check_table_ref(
         table: &Arc<BTreeTable>,
         schema: &Schema,
-        only_columns: Option<&std::collections::HashSet<usize>>,
+        only_columns: Option<&ColumnMask>,
     ) -> Arc<BTreeTable> {
         let has_virtual = table.has_virtual_columns();
         let has_custom = table
@@ -2295,14 +2295,14 @@ impl BTreeTable {
         let mut modified = (**table).clone();
         let remapped_only_columns = if has_virtual {
             let remapped = only_columns.map(|only| {
-                let mut new_set = std::collections::HashSet::new();
+                let mut new_set = ColumnMask::default();
                 let mut physical = 0usize;
                 for (orig, col) in modified.columns.iter().enumerate() {
                     if col.is_virtual_generated() {
                         continue;
                     }
-                    if only.contains(&orig) {
-                        new_set.insert(physical);
+                    if only.get(orig) {
+                        new_set.set(physical);
                     }
                     physical += 1;
                 }
@@ -2317,7 +2317,7 @@ impl BTreeTable {
         let effective_only = remapped_only_columns.as_ref().or(only_columns);
         for (i, col) in modified.columns.iter_mut().enumerate() {
             if let Some(only) = effective_only {
-                if !only.contains(&i) {
+                if !only.get(i) {
                     col.ty_str = "ANY".to_string();
                     continue;
                 }

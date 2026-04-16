@@ -87,18 +87,18 @@ impl InitLoop {
             );
         }
         // Include hash-join build tables so their cursors are opened for hash build.
-        let mut required_tables: HashSet<usize> = join_order
+        let mut required_tables: TableMask = join_order
             .iter()
             .map(|member| member.original_idx)
             .collect();
         for table in tables.joined_tables().iter() {
             if let Operation::HashJoin(hash_join_op) = &table.op {
-                required_tables.insert(hash_join_op.build_table_idx);
+                required_tables.set(hash_join_op.build_table_idx);
             }
         }
 
         for (table_index, table) in tables.joined_tables().iter().enumerate() {
-            if !required_tables.contains(&table_index) {
+            if !required_tables.get(table_index) {
                 continue;
             }
             // Ensure non-main databases have a Transaction instruction for read access.

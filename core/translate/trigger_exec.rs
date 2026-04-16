@@ -615,7 +615,7 @@ fn execute_trigger_commands(
     // Trigger subprograms do not emit Transaction opcodes, so the parent statement
     // must acquire any attached/temp database transactions the trigger body needs
     // before OP_Program enters the subprogram.
-    for &db_id in &subprogram_prepared.write_databases {
+    for db_id in &subprogram_prepared.write_databases {
         if db_id == crate::MAIN_DB_ID {
             program.begin_write_operation();
         } else {
@@ -623,8 +623,8 @@ fn execute_trigger_commands(
             program.begin_write_on_database(db_id, schema_cookie);
         }
     }
-    for &db_id in &subprogram_prepared.read_databases {
-        if subprogram_prepared.write_databases.contains(&db_id) {
+    for db_id in &subprogram_prepared.read_databases {
+        if subprogram_prepared.write_databases.get(db_id) {
             continue;
         }
         if db_id == crate::MAIN_DB_ID {

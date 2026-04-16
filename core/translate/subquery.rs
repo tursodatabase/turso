@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
+use rustc_hash::FxHashMap as HashMap;
 use turso_parser::ast::{self, SortOrder, SubqueryType};
 
 use crate::{
@@ -38,7 +38,7 @@ use super::{
     emitter::{Resolver, TranslateCtx},
     main_loop::LoopLabels,
     plan::{Aggregate, Operation, QueryDestination, Scan, Search, SelectPlan},
-    planner::resolve_window_and_aggregate_functions,
+    planner::{resolve_window_and_aggregate_functions, TableMask},
 };
 
 struct DirectMaterializedSubquery {
@@ -1095,18 +1095,18 @@ pub fn emit_from_clause_subqueries(
         .iter()
         .map(|member| member.original_idx)
         .collect();
-    let visit_set: HashSet<usize> = visit_order.iter().copied().collect();
+    let visit_set: TableMask = visit_order.iter().copied().collect();
     for table in tables.joined_tables().iter() {
         if let Operation::HashJoin(hash_join_op) = &table.op {
             let build_idx = hash_join_op.build_table_idx;
-            if !visit_set.contains(&build_idx) {
+            if !visit_set.get(build_idx) {
                 visit_order.push(build_idx);
             }
         }
     }
 
     // Build lookup from table index to is_outer for LEFT-JOIN annotations
-    let outer_table_set: HashSet<usize> = join_order
+    let outer_table_set: TableMask = join_order
         .iter()
         .filter(|m| m.is_outer)
         .map(|m| m.original_idx)
@@ -1114,7 +1114,7 @@ pub fn emit_from_clause_subqueries(
 
     for table_index in visit_order {
         let table_reference = &mut tables.joined_tables_mut()[table_index];
-        let left_join_suffix = if outer_table_set.contains(&table_index) {
+        let left_join_suffix = if outer_table_set.get(table_index) {
             " LEFT-JOIN"
         } else {
             ""

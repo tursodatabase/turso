@@ -4,7 +4,7 @@ use crate::schema::ColDef;
 use crate::sync::Mutex;
 use crate::translate::emitter::TransactionMode;
 use crate::translate::expr::{walk_expr, walk_expr_mut, WalkControl};
-use crate::translate::plan::{JoinedTable, TableReferences};
+use crate::translate::plan::{BitSet, JoinedTable, TableReferences};
 use crate::translate::planner::{parse_row_id, TableMask};
 use crate::types::IOResult;
 use crate::IO;
@@ -642,16 +642,16 @@ pub fn try_capture_parameters_column_agnostic(
 
     // For column arguments: check that the same set of columns is used (order-independent)
     // We use a greedy matching approach: for each query column, find a matching pattern column
-    let mut matched_pattern_indices: HashSet<usize> = HashSet::default();
+    let mut matched_pattern_indices = BitSet::default();
 
     for query_col in query_col_args {
         let mut found_match = false;
         for (i, pattern_col) in pattern_col_args.iter().enumerate() {
-            if matched_pattern_indices.contains(&i) {
+            if matched_pattern_indices.get(i) {
                 continue;
             }
             if exprs_are_equivalent(pattern_col, query_col) {
-                matched_pattern_indices.insert(i);
+                matched_pattern_indices.set(i);
                 found_match = true;
                 break;
             }
@@ -661,7 +661,7 @@ pub fn try_capture_parameters_column_agnostic(
         }
     }
     // All pattern columns must be matched
-    if matched_pattern_indices.len() != pattern_col_args.len() {
+    if matched_pattern_indices.count() != pattern_col_args.len() {
         return None;
     }
     // Remaining args must match positionally (includes the query string parameter)

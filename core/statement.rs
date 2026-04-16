@@ -502,8 +502,7 @@ impl Statement {
             .write_databases
             .iter()
             .chain(self.program.prepared.read_databases.iter())
-            .filter(|&&id| id != crate::MAIN_DB_ID)
-            .copied()
+            .filter(|&id| id != crate::MAIN_DB_ID)
             .collect();
         for db_id in &attached_db_ids {
             // Discard any connection-local schema changes for this non-main DB

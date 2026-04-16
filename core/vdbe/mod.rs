@@ -17,8 +17,9 @@
 //!
 //! https://www.sqlite.org/opcode.html
 
+use crate::translate::plan::BitSet;
 use crate::types::{Extendable, Text};
-use crate::{turso_assert, turso_assert_ne, turso_debug_assert, HashSet, NonNan};
+use crate::{turso_assert, turso_assert_ne, turso_debug_assert, NonNan};
 pub mod affinity;
 pub mod array;
 pub mod bloom_filter;
@@ -1112,9 +1113,9 @@ pub struct PreparedProgram {
     pub resolve_type: ResolveType,
     pub prepare_context: PrepareContext,
     /// Set of attached database indices that need write transactions.
-    pub write_databases: HashSet<usize>,
+    pub write_databases: BitSet,
     /// Set of attached database indices that need read transactions.
-    pub read_databases: HashSet<usize>,
+    pub read_databases: BitSet,
 }
 
 #[derive(Clone)]

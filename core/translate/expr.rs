@@ -19,7 +19,7 @@ use crate::sync::Arc;
 use crate::translate::expression_index::{
     normalize_expr_for_index_matching, single_table_column_usage,
 };
-use crate::translate::plan::{Operation, ResultSetColumn, Search};
+use crate::translate::plan::{ColumnMask, Operation, ResultSetColumn, Search};
 use crate::translate::planner::parse_row_id;
 use crate::util::{exprs_are_equivalent, normalize_ident, parse_numeric_literal};
 use crate::vdbe::affinity::Affinity;
@@ -30,7 +30,6 @@ use crate::vdbe::{
     BranchOffset, CursorID,
 };
 use crate::{LimboError, Numeric, Result, Value};
-use std::collections::HashSet;
 
 #[derive(Debug, Clone, Copy)]
 pub struct ConditionMetadata {
@@ -7665,13 +7664,13 @@ pub(crate) fn emit_custom_type_encode_columns(
     resolver: &Resolver,
     columns: &[Column],
     start_reg: usize,
-    only_columns: Option<&HashSet<usize>>,
+    only_columns: Option<&ColumnMask>,
     table_name: &str,
     layout: &ColumnLayout,
 ) -> Result<()> {
     for (i, col) in columns.iter().enumerate() {
         if let Some(filter) = only_columns {
-            if !filter.contains(&i) {
+            if !filter.get(i) {
                 continue;
             }
         }
@@ -7725,12 +7724,12 @@ pub(crate) fn emit_custom_type_decode_columns(
     resolver: &Resolver,
     columns: &[Column],
     start_reg: usize,
-    only_columns: Option<&HashSet<usize>>,
+    only_columns: Option<&ColumnMask>,
     layout: &ColumnLayout,
 ) -> Result<()> {
     for (i, col) in columns.iter().enumerate() {
         if let Some(filter) = only_columns {
-            if !filter.contains(&i) {
+            if !filter.get(i) {
                 continue;
             }
         }

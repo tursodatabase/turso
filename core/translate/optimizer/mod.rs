@@ -1903,7 +1903,7 @@ fn optimize_table_access(
             .unzip();
     #[cfg(debug_assertions)]
     {
-        let mut probe_tables: HashSet<usize> = HashSet::default();
+        let mut probe_tables: TableMask = TableMask::default();
         let mut build_tables: HashMap<usize, bool> = HashMap::default();
         let mut pos_by_table: Vec<Option<usize>> =
             vec![None; table_references.joined_tables().len()];
@@ -1932,13 +1932,13 @@ fn optimize_table_access(
                         "hash join build/probe tables are not adjacent in join order"
                     );
                 }
-                probe_tables.insert(*probe_table_idx);
+                probe_tables.set(*probe_table_idx);
                 build_tables.insert(*build_table_idx, *materialize_build_input);
             }
         }
 
         for (build_table_idx, materialize_build_input) in build_tables {
-            if probe_tables.contains(&build_table_idx) {
+            if probe_tables.get(build_table_idx) {
                 turso_assert!(
                     materialize_build_input,
                     "probe->build chaining requires materialized build input"
@@ -2387,7 +2387,7 @@ fn optimize_table_access(
             .iter()
             .map(|member| member.original_idx)
             .collect();
-        let join_key_indices: HashSet<usize> = hash_join_op
+        let join_key_indices: BitSet = hash_join_op
             .join_keys
             .iter()
             .map(|key| key.where_clause_idx)
@@ -2398,7 +2398,7 @@ fn optimize_table_access(
             if !constraint.lhs_mask.intersects(&prior_mask) {
                 continue;
             }
-            if join_key_indices.contains(&constraint.where_clause_pos.0) {
+            if join_key_indices.get(constraint.where_clause_pos.0) {
                 continue;
             }
             has_prior_constraints = true;
