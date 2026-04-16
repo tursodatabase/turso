@@ -1819,6 +1819,7 @@ fn emit_update_insns<'a>(
                                 table_name,
                                 target_table_cursor_id,
                                 idx_rowid_reg,
+                                Some((start, rowid_set_clause_reg.unwrap_or(beg))),
                                 update_database_id,
                             )?
                         } else {
@@ -1994,6 +1995,7 @@ fn emit_update_insns<'a>(
                     table_name,
                     target_table_cursor_id,
                     target_reg,
+                    Some((start, rowid_set_clause_reg.unwrap_or(beg))),
                     update_database_id,
                 )?
             } else {

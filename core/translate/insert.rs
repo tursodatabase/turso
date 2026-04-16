@@ -3657,6 +3657,7 @@ fn emit_replace_delete_conflicting_row(
             ctx.table.name.as_str(),
             ctx.cursor_id,
             ctx.conflict_rowid_reg,
+            None,
             ctx.database_id,
         )?;
         if resolver.schema().has_child_fks(ctx.table.name.as_str()) {
