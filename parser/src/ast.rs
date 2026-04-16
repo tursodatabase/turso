@@ -3,6 +3,7 @@ pub mod fmt;
 
 use std::{num::NonZeroU32, sync::Arc};
 
+use crate::identifier::Identifier;
 use crate::lexer::is_quotable_keyword;
 use strum_macros::{EnumIter, EnumString};
 
@@ -1039,7 +1040,7 @@ pub struct GroupBy {
 #[derive(Clone, Debug, Eq)]
 pub struct Name {
     quote: Option<char>,
-    value: String,
+    value: Identifier,
 }
 
 impl PartialEq for Name {
@@ -1060,7 +1061,7 @@ impl serde::Serialize for Name {
     where
         S: serde::Serializer,
     {
-        serializer.serialize_str(&self.value)
+        serializer.serialize_str(self.value.as_str())
     }
 }
 
@@ -1089,12 +1090,18 @@ impl<'de> serde::Deserialize<'de> for Name {
     }
 }
 
+impl PartialEq<str> for Name {
+    fn eq(&self, other: &str) -> bool {
+        self.value == *other
+    }
+}
+
 impl Name {
     /// Create name which will have exactly the value of given string
     /// (e.g. if s = "\"str\"" - the name value will contain quotes and translation to SQL will give us """str""")
     pub fn exact(s: String) -> Self {
         Self {
-            value: s,
+            value: Identifier::new(s),
             quote: None,
         }
     }
@@ -1114,14 +1121,14 @@ impl Name {
         if matches!(bytes[0], b'"' | b'\'' | b'`') {
             assert!(s.len() >= 2);
             assert!(bytes[bytes.len() - 1] == bytes[0]);
-            let s = match bytes[0] {
+            let unquoted = match bytes[0] {
                 b'"' => s[1..s.len() - 1].replace("\"\"", "\""),
                 b'\'' => s[1..s.len() - 1].replace("''", "'"),
                 b'`' => s[1..s.len() - 1].replace("``", "`"),
                 _ => unreachable!(),
             };
             Name {
-                value: s,
+                value: Identifier::new(unquoted),
                 quote: Some(bytes[0] as char),
             }
         } else if bytes[0] == b'[' {
@@ -1135,29 +1142,38 @@ impl Name {
 
     /// Return string value of the name
     pub fn as_str(&self) -> &str {
+        self.value.as_str()
+    }
+
+    pub fn identifier(&self) -> &Identifier {
         &self.value
+    }
+
+    pub fn into_identifier(self) -> Identifier {
+        self.value
     }
 
     /// Convert value to the string literal (e.g. single-quoted string with escaped single quotes)
     pub fn as_literal(&self) -> String {
-        format!("'{}'", self.value.replace("'", "''"))
+        format!("'{}'", self.value.as_str().replace("'", "''"))
     }
 
     /// Convert value to the name string (e.g. double-quoted string with escaped double quotes)
     pub fn as_ident(&self) -> String {
+        let s = self.value.as_str();
         // let's keep original quotes if they were set
         // (parser.rs tests validates that behaviour)
         if let Some(quote) = self.quote {
             let single = quote.to_string();
             let double = single.clone() + &single;
-            return format!("{}{}{}", quote, self.value.replace(&single, &double), quote);
+            return format!("{}{}{}", quote, s.replace(&single, &double), quote);
         }
-        let value = self.value.as_bytes();
+        let value = s.as_bytes();
         let safe_char = |&c: &u8| c.is_ascii_alphanumeric() || c == b'_';
         if !value.is_empty() && value.iter().all(safe_char) && !is_quotable_keyword(value) {
-            self.value.clone()
+            s.to_owned()
         } else {
-            format!("\"{}\"", self.value.replace("\"", "\"\""))
+            format!("\"{}\"", s.replace("\"", "\"\""))
         }
     }
 

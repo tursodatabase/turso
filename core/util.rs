@@ -20,6 +20,7 @@ use std::sync::Arc;
 use tracing::{instrument, Level};
 use turso_macros::match_ignore_ascii_case;
 use turso_parser::ast::{self, CreateTableBody, Expr, Literal, UnaryOperator};
+use turso_parser::identifier::Identifier;
 use turso_parser::parser::Parser;
 
 #[macro_export]
@@ -164,7 +165,7 @@ pub fn parse_schema_rows(
     schema: &mut Schema,
     syms: &SymbolTable,
     mv_tx: Option<(u64, TransactionMode)>,
-    _existing_views: HashMap<String, Arc<Mutex<IncrementalView>>>,
+    _existing_views: HashMap<turso_parser::identifier::Identifier, Arc<Mutex<IncrementalView>>>,
     resolve_attached_db: &dyn Fn(&str) -> Option<usize>,
 ) -> Result<()> {
     rows.set_mv_tx(mv_tx);
@@ -175,11 +176,11 @@ pub fn parse_schema_rows(
     let mut automatic_indices = HashMap::with_capacity_and_hasher(10, Default::default());
 
     // Store DBSP state table root pages: view_name -> dbsp_state_root_page
-    let mut dbsp_state_roots: HashMap<String, i64> = HashMap::default();
+    let mut dbsp_state_roots: HashMap<Identifier, i64> = HashMap::default();
     // Store DBSP state table index root pages: view_name -> dbsp_state_index_root_page
-    let mut dbsp_state_index_roots: HashMap<String, i64> = HashMap::default();
+    let mut dbsp_state_index_roots: HashMap<Identifier, i64> = HashMap::default();
     // Store materialized view info (SQL and root page) for later creation
-    let mut materialized_view_info: HashMap<String, (String, i64)> = HashMap::default();
+    let mut materialized_view_info: HashMap<Identifier, (String, i64)> = HashMap::default();
 
     // TODO: How do we ensure that the I/O we submitted to
     // read the schema is actually complete?
@@ -2679,7 +2680,11 @@ mod rename_column_view {
                     .is_none_or(|db| db == ctx.target_db_norm);
 
                 if is_local {
-                    if let Some(view) = ctx.schema.views.get(&table_name_norm) {
+                    if let Some(view) = ctx
+                        .schema
+                        .views
+                        .get(&Identifier::from(table_name_norm.as_str()))
+                    {
                         let columns_before = view
                             .columns
                             .iter()
@@ -3175,7 +3180,7 @@ mod rename_column_view {
             );
         }
         let table_norm = normalize_ident(table_name);
-        if let Some(view) = schema.views.get(&table_norm) {
+        if let Some(view) = schema.views.get(&Identifier::from(table_norm.as_str())) {
             return Some(
                 view.columns
                     .iter()

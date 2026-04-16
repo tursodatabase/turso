@@ -79,7 +79,7 @@ pub(crate) unsafe extern "C" fn register_vtab_module(
                 let mutex = &*(ext_ctx.schema as *mut Mutex<Arc<Schema>>);
                 let mut guard = mutex.lock();
                 let schema = Arc::make_mut(&mut *guard);
-                schema.tables.insert(name_str, table);
+                schema.tables.insert(name_str.into(), table);
             } else {
                 return ResultCode::Error;
             }

@@ -1497,7 +1497,7 @@ fn query_pragma(
                 let mut type_names: Vec<_> = schema
                     .type_registry
                     .iter()
-                    .filter(|(key, td)| *key == &td.name.to_lowercase())
+                    .filter(|(key, td)| key.as_str() == td.name.to_lowercase())
                     .map(|(key, _)| key)
                     .collect();
                 type_names.sort();

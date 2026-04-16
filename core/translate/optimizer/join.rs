@@ -7,6 +7,7 @@ use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use smallvec::SmallVec;
 
 use turso_parser::ast::{Expr, Operator, TableInternalId};
+use turso_parser::identifier::Identifier;
 
 use super::{
     access_method::{find_best_access_method_for_join_order, AccessMethod},
@@ -164,7 +165,7 @@ pub fn join_lhs_and_rhs<'a>(
     index_method_candidates: &[IndexMethodCandidate],
     params: &CostModelParams,
     analyze_stats: &AnalyzeStats,
-    available_indexes: &HashMap<String, VecDeque<Arc<Index>>>,
+    available_indexes: &HashMap<Identifier, VecDeque<Arc<Index>>>,
     table_references: &TableReferences,
     schema: &Schema,
 ) -> Result<Option<JoinN>> {
@@ -892,7 +893,7 @@ pub fn compute_best_join_order<'a>(
     index_method_candidates: &[IndexMethodCandidate],
     params: &CostModelParams,
     analyze_stats: &AnalyzeStats,
-    available_indexes: &HashMap<String, VecDeque<Arc<Index>>>,
+    available_indexes: &HashMap<Identifier, VecDeque<Arc<Index>>>,
     table_references: &TableReferences,
     schema: &Schema,
 ) -> Result<Option<BestJoinOrderResult>> {
@@ -930,7 +931,7 @@ pub(crate) fn compute_best_join_order_with_context<'a>(
     index_method_candidates: &[IndexMethodCandidate],
     params: &CostModelParams,
     analyze_stats: &AnalyzeStats,
-    available_indexes: &HashMap<String, VecDeque<Arc<Index>>>,
+    available_indexes: &HashMap<Identifier, VecDeque<Arc<Index>>>,
     table_references: &TableReferences,
     schema: &Schema,
 ) -> Result<Option<BestJoinOrderResult>> {
@@ -1364,7 +1365,7 @@ pub fn compute_greedy_join_order<'a>(
     index_method_candidates: &[IndexMethodCandidate],
     params: &CostModelParams,
     analyze_stats: &AnalyzeStats,
-    available_indexes: &HashMap<String, VecDeque<Arc<Index>>>,
+    available_indexes: &HashMap<Identifier, VecDeque<Arc<Index>>>,
     table_references: &TableReferences,
     schema: &Schema,
 ) -> Result<Option<BestJoinOrderResult>> {
@@ -1624,7 +1625,7 @@ pub fn compute_naive_left_deep_plan<'a>(
     index_method_candidates: &[IndexMethodCandidate],
     params: &CostModelParams,
     analyze_stats: &AnalyzeStats,
-    available_indexes: &HashMap<String, VecDeque<Arc<Index>>>,
+    available_indexes: &HashMap<Identifier, VecDeque<Arc<Index>>>,
     table_references: &TableReferences,
     schema: &Schema,
 ) -> Result<Option<JoinN>> {
@@ -1785,6 +1786,7 @@ mod tests {
     use std::{collections::VecDeque, sync::Arc};
 
     use turso_parser::ast::{self, Expr, Operator, SortOrder, TableInternalId};
+    use turso_parser::identifier::Identifier;
 
     use super::*;
     use crate::{
@@ -2015,7 +2017,7 @@ mod tests {
             index_method: None,
             on_conflict: None,
         });
-        available_indexes.insert("test_table".to_string(), VecDeque::from([index]));
+        available_indexes.insert(Identifier::from("test_table"), VecDeque::from([index]));
 
         let table_constraints = constraints_from_where_clause(
             &where_clause,
@@ -2108,7 +2110,7 @@ mod tests {
             index_method: None,
             on_conflict: None,
         });
-        available_indexes.insert("table1".to_string(), VecDeque::from([index1]));
+        available_indexes.insert(Identifier::from("table1"), VecDeque::from([index1]));
 
         // SELECT * FROM table1 JOIN table2 WHERE table1.id = table2.id
         // expecting table2 to be chosen first due to the index on table1.id
@@ -2250,7 +2252,7 @@ mod tests {
                     index_method: None,
                     on_conflict: None,
                 });
-                available_indexes.insert(table_name.to_string(), VecDeque::from([index]));
+                available_indexes.insert(Identifier::from(*table_name), VecDeque::from([index]));
             });
         let customer_id_idx = Arc::new(Index {
             name: "orders_customer_id_idx".to_string(),
@@ -2292,10 +2294,10 @@ mod tests {
         });
 
         available_indexes
-            .entry("orders".to_string())
+            .entry(Identifier::from("orders"))
             .and_modify(|v| v.push_front(customer_id_idx));
         available_indexes
-            .entry("order_items".to_string())
+            .entry(Identifier::from("order_items"))
             .and_modify(|v| v.push_front(order_id_idx));
 
         // SELECT * FROM orders JOIN customers JOIN order_items
@@ -2796,7 +2798,7 @@ mod tests {
         });
 
         let mut available_indexes = HashMap::default();
-        available_indexes.insert("t1".to_string(), VecDeque::from([index]));
+        available_indexes.insert(Identifier::from("t1"), VecDeque::from([index]));
 
         let table = Table::BTree(table);
         joined_tables.push(JoinedTable {
@@ -2914,7 +2916,7 @@ mod tests {
             index_method: None,
             on_conflict: None,
         });
-        available_indexes.insert("t1".to_string(), VecDeque::from([index]));
+        available_indexes.insert(Identifier::from("t1"), VecDeque::from([index]));
 
         let table = Table::BTree(table);
         joined_tables.push(JoinedTable {
@@ -3053,7 +3055,7 @@ mod tests {
             index_method: None,
             on_conflict: None,
         });
-        available_indexes.insert("t1".to_string(), VecDeque::from([index]));
+        available_indexes.insert(Identifier::from("t1"), VecDeque::from([index]));
 
         let table = Table::BTree(table);
         joined_tables.push(JoinedTable {
@@ -3336,7 +3338,7 @@ mod tests {
             index_method: None,
             on_conflict: None,
         });
-        available_indexes.insert("t2".to_string(), VecDeque::from([index_t2_a]));
+        available_indexes.insert(Identifier::from("t2"), VecDeque::from([index_t2_a]));
 
         // WHERE t1.a = t2.a
         let mut where_clause = vec![_create_binary_expr(

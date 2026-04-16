@@ -88,7 +88,7 @@ fn collect_all_tables_in_db(database_id: usize, resolver: &Resolver) -> Vec<Anal
             .filter_map(|(name, table)| {
                 if RESERVED_TABLE_PREFIXES
                     .iter()
-                    .any(|prefix| name.starts_with(prefix))
+                    .any(|prefix| name.as_str().starts_with(prefix))
                 {
                     return None;
                 }
@@ -119,7 +119,7 @@ fn resolve_targets_in_db(
                     .iter()
                     .find(|idx| idx.name.eq_ignore_ascii_case(name))
                 {
-                    if let Some(table) = schema.get_btree_table(table_name) {
+                    if let Some(table) = schema.get_btree_table(table_name.as_str()) {
                         return Some((table, index.clone()));
                     }
                 }

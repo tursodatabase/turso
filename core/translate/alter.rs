@@ -696,7 +696,11 @@ pub fn translate_alter_table(
     if !dependent_views.is_empty() {
         return Err(LimboError::ParseError(format!(
             "cannot alter table \"{table_name}\": it has dependent materialized view(s): {}",
-            dependent_views.join(", ")
+            dependent_views
+                .iter()
+                .map(|v| v.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
         )));
     }
 
@@ -1714,7 +1718,11 @@ pub fn translate_alter_table(
                             from,
                             col_name,
                         )? {
-                            rewrites.push((database_id, view_name.clone(), rewritten.sql));
+                            rewrites.push((
+                                database_id,
+                                view_name.as_str().to_owned(),
+                                rewritten.sql,
+                            ));
                         }
                     }
                     Ok(rewrites)
@@ -1736,7 +1744,7 @@ pub fn translate_alter_table(
                                 )? {
                                     rewrites.push((
                                         crate::TEMP_DB_ID,
-                                        view_name.clone(),
+                                        view_name.as_str().to_owned(),
                                         rewritten.sql,
                                     ));
                                 }

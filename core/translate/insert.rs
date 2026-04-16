@@ -91,7 +91,7 @@ fn validate(
              These views were created with a different DBSP version than the current version ({}). \n\
              Please DROP and recreate the view(s) before modifying this table.",
             table_name,
-            incompatible_views.join(", "),
+            incompatible_views.iter().map(|v| v.as_str()).collect::<Vec<_>>().join(", "),
             DBSP_CIRCUIT_VERSION
         );
     }

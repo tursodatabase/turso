@@ -80,6 +80,7 @@ use std::{
     sync::{atomic::Ordering, Arc},
 };
 use turso_macros::match_ignore_ascii_case;
+use turso_parser::identifier::Identifier;
 
 use crate::pseudo::PseudoCursor;
 
@@ -9044,7 +9045,7 @@ pub fn op_insert(
                         let tx_state = program
                             .connection
                             .view_transaction_states
-                            .get_or_create(view_name);
+                            .get_or_create(view_name.as_str());
                         tx_state.delete(table_name, key, values.clone());
                     }
                 }
@@ -9052,7 +9053,7 @@ pub fn op_insert(
                     let tx_state = program
                         .connection
                         .view_transaction_states
-                        .get_or_create(view_name);
+                        .get_or_create(view_name.as_str());
 
                     tx_state.insert(table_name, key, values.clone());
                 }
@@ -9183,7 +9184,7 @@ pub fn op_delete(
                         let tx_state = program
                             .connection
                             .view_transaction_states
-                            .get_or_create(&view_name);
+                            .get_or_create(view_name.as_str());
                         tx_state.delete(table_name, key, values.clone());
                     }
                 }
@@ -10413,7 +10414,7 @@ pub fn op_drop_table(
                     }
                 }
                 // Capture index root pages (table may not have indexes)
-                if let Some(indexes) = schema.indexes.get(table_name) {
+                if let Some(indexes) = schema.indexes.get(&Identifier::from(table_name.as_str())) {
                     for index in indexes.iter() {
                         if index.root_page > 0 {
                             schema.dropped_root_pages.insert(index.root_page);
@@ -10587,10 +10588,10 @@ pub struct OpParseSchemaInner {
     stmt: crate::Statement,
     schema_arc: Arc<Schema>,
     from_sql_indexes: Vec<crate::util::UnparsedFromSqlIndex>,
-    automatic_indices: crate::HashMap<String, Vec<(String, i64)>>,
-    dbsp_state_roots: crate::HashMap<String, i64>,
-    dbsp_state_index_roots: crate::HashMap<String, i64>,
-    materialized_view_info: crate::HashMap<String, (String, i64)>,
+    automatic_indices: crate::HashMap<Identifier, Vec<(Identifier, i64)>>,
+    dbsp_state_roots: crate::HashMap<Identifier, i64>,
+    dbsp_state_index_roots: crate::HashMap<Identifier, i64>,
+    materialized_view_info: crate::HashMap<Identifier, (String, i64)>,
     db: usize,
     previous_auto_commit: bool,
 }
@@ -12171,7 +12172,10 @@ pub fn op_rename_table(
     let conn = program.connection.clone();
 
     conn.with_database_schema_mut(*db, |schema| -> crate::Result<()> {
-        if let Some(mut indexes) = schema.indexes.remove(&normalized_from) {
+        if let Some(mut indexes) = schema
+            .indexes
+            .remove(&Identifier::from(normalized_from.as_str()))
+        {
             let autoindex_prefix = format!("sqlite_autoindex_{normalized_from}_");
             indexes.iter_mut().for_each(|index| {
                 let index = Arc::make_mut(index);
@@ -12182,12 +12186,14 @@ pub fn op_rename_table(
                 }
             });
 
-            schema.indexes.insert(normalized_to.to_owned(), indexes);
+            schema
+                .indexes
+                .insert(Identifier::from(normalized_to.as_str()), indexes);
         };
 
         let mut table = schema
             .tables
-            .remove(&normalized_from)
+            .remove(&Identifier::from(normalized_from.as_str()))
             .expect("table being renamed should be in schema");
         match Arc::make_mut(&mut table) {
             Table::BTree(btree) => {
@@ -12217,11 +12223,13 @@ pub fn op_rename_table(
             _ => panic!("only btree and virtual tables can be renamed"),
         }
 
-        schema.tables.insert(normalized_to.to_owned(), table);
+        schema
+            .tables
+            .insert(Identifier::from(normalized_to.as_str()), table);
 
         for (tname, t_arc) in schema.tables.iter_mut() {
             // skip the table we just renamed
-            if normalize_ident(tname) == normalized_to {
+            if normalize_ident(tname.as_str()) == normalized_to {
                 continue;
             }
             if let Table::BTree(ref mut child_btree_arc) = Arc::make_mut(t_arc) {
@@ -12237,13 +12245,18 @@ pub fn op_rename_table(
 
         // Update triggers: move from old table name key to new, and update
         // each trigger's table_name field and body commands.
-        if let Some(mut triggers) = schema.triggers.remove(&normalized_from) {
+        if let Some(mut triggers) = schema
+            .triggers
+            .remove(&Identifier::from(normalized_from.as_str()))
+        {
             for trigger_arc in &mut triggers {
                 let trigger = Arc::make_mut(trigger_arc);
                 normalized_to.clone_into(&mut trigger.table_name);
                 rewrite_trigger_for_table_rename(trigger, &normalized_from, &normalized_to);
             }
-            schema.triggers.insert(normalized_to.to_owned(), triggers);
+            schema
+                .triggers
+                .insert(Identifier::from(normalized_to.as_str()), triggers);
         }
 
         // Also update triggers on OTHER tables that reference the renamed table
@@ -12299,10 +12312,11 @@ pub fn op_drop_column(
 
     let normalized_table_name = normalize_ident(table.as_str());
 
+    let normalized_table_ident = Identifier::from(normalized_table_name.as_str());
     let column_name = conn.with_schema(*db, |schema| {
         let table = schema
             .tables
-            .get(&normalized_table_name)
+            .get(&normalized_table_ident)
             .expect("table being ALTERed should be in schema");
         table
             .get_column_at(*column_index)
@@ -12316,7 +12330,7 @@ pub fn op_drop_column(
     conn.with_database_schema_mut(*db, |schema| -> Result<()> {
         let table = schema
             .tables
-            .get_mut(&normalized_table_name)
+            .get_mut(&normalized_table_ident)
             .expect("table being renamed should be in schema");
 
         let table = Arc::get_mut(table).expect("this should be the only strong reference");
@@ -12343,7 +12357,7 @@ pub fn op_drop_column(
     })?;
 
     conn.with_schema(*db, |schema| -> crate::Result<()> {
-        if let Some(indexes) = schema.indexes.get(&normalized_table_name) {
+        if let Some(indexes) = schema.indexes.get(&normalized_table_ident) {
             for index in indexes {
                 if index
                     .columns
@@ -12362,7 +12376,7 @@ pub fn op_drop_column(
     // Update index.pos_in_table for all indexes.
     // For example, if the dropped column had index 2, then anything that was indexed on column 3 or higher should be decremented by 1.
     conn.with_database_schema_mut(*db, |schema| {
-        if let Some(indexes) = schema.indexes.get_mut(&normalized_table_name) {
+        if let Some(indexes) = schema.indexes.get_mut(&normalized_table_ident) {
             for index in indexes {
                 let index = Arc::get_mut(index).expect("this should be the only strong reference");
                 for index_column in index.columns.iter_mut() {
@@ -12410,11 +12424,12 @@ pub fn op_add_column(
 
     let conn = program.connection.clone();
     let normalized_table_name = normalize_ident(table.as_str());
+    let normalized_table_ident = Identifier::from(normalized_table_name.as_str());
 
     conn.with_database_schema_mut(*db, |schema| -> Result<()> {
         let table_ref = schema
             .tables
-            .get_mut(&normalized_table_name)
+            .get_mut(&normalized_table_ident)
             .expect("table being altered should be in schema");
 
         let table_ref = Arc::make_mut(table_ref);
@@ -12461,10 +12476,11 @@ pub fn op_alter_column(
     let conn = program.connection.clone();
 
     let normalized_table_name = normalize_ident(table_name.as_str());
+    let normalized_table_ident = Identifier::from(normalized_table_name.as_str());
     let old_column_name = conn.with_schema(*db, |schema| {
         let table = schema
             .tables
-            .get(&normalized_table_name)
+            .get(&normalized_table_ident)
             .expect("table being ALTERed should be in schema");
         table
             .get_column_at(*column_index)
@@ -12494,7 +12510,7 @@ pub fn op_alter_column(
                         &old_column_name,
                         &new_name,
                     )? {
-                        rewrites.push((*db, view_name.clone(), rewritten));
+                        rewrites.push((*db, view_name.as_str().to_owned(), rewritten));
                     }
                 }
                 Ok(rewrites)
@@ -12515,7 +12531,11 @@ pub fn op_alter_column(
                             &old_column_name,
                             &new_name,
                         )? {
-                            rewrites.push((crate::TEMP_DB_ID, view_name.clone(), rewritten));
+                            rewrites.push((
+                                crate::TEMP_DB_ID,
+                                view_name.as_str().to_owned(),
+                                rewritten,
+                            ));
                         }
                     }
                     Ok(rewrites)
@@ -12531,7 +12551,7 @@ pub fn op_alter_column(
     conn.with_database_schema_mut(*db, |schema| -> Result<()> {
         let table_arc = schema
             .tables
-            .get_mut(&normalized_table_name)
+            .get_mut(&normalized_table_ident)
             .expect("table being ALTERed should be in schema");
         let table = Arc::make_mut(table_arc);
 
@@ -12550,7 +12570,7 @@ pub fn op_alter_column(
             .clone();
 
         // Update indexes on THIS table that name the old column (you already had this)
-        if let Some(idxs) = schema.indexes.get_mut(&normalized_table_name) {
+        if let Some(idxs) = schema.indexes.get_mut(&normalized_table_ident) {
             for idx in idxs {
                 let idx = Arc::make_mut(idx);
                 for ic in &mut idx.columns {
@@ -12628,7 +12648,7 @@ pub fn op_alter_column(
 
         // fix OTHER tables that reference this table as parent
         for (tname, t_arc) in schema.tables.iter_mut() {
-            if normalize_ident(tname) == normalized_table_name {
+            if normalize_ident(tname.as_str()) == normalized_table_name {
                 continue;
             }
             if let Table::BTree(ref mut child_btree_arc) = Arc::make_mut(t_arc) {
@@ -12669,7 +12689,8 @@ pub fn op_alter_column(
 
         for (view_db, view_name, rewritten) in view_rewrites {
             conn.with_database_schema_mut(view_db, move |schema| -> crate::Result<()> {
-                if let Some(view_arc) = schema.views.get_mut(&view_name) {
+                if let Some(view_arc) = schema.views.get_mut(&Identifier::from(view_name.as_str()))
+                {
                     let view = Arc::make_mut(view_arc);
                     view.sql = rewritten.sql;
                     view.select_stmt = rewritten.select_stmt;
@@ -12683,7 +12704,7 @@ pub fn op_alter_column(
             conn.with_schema(*db, |schema| -> crate::Result<()> {
                 let table = schema
                     .tables
-                    .get(&normalized_table_name)
+                    .get(&normalized_table_ident)
                     .expect("table being ALTERed should be in schema");
                 let _column = table
                     .get_column_at(*column_index)
@@ -14412,7 +14433,7 @@ fn op_vacuum_into_inner(
                             .type_registry
                             .iter()
                             .filter(|(_, td)| !td.is_builtin)
-                            .map(|(name, td)| (name.clone(), td.clone()))
+                            .map(|(name, td)| (name.as_str().to_owned(), td.clone()))
                             .collect()
                     });
 

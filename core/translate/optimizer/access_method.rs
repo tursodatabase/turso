@@ -5,6 +5,7 @@ use std::collections::VecDeque;
 
 use turso_ext::{ConstraintInfo, ConstraintUsage, ResultCode};
 use turso_parser::ast::{self, SortOrder, TableInternalId};
+use turso_parser::identifier::Identifier;
 
 use crate::schema::Schema;
 use crate::stats::AnalyzeStats;
@@ -636,7 +637,7 @@ pub fn find_best_access_method_for_join_order(
     join_order: &[JoinOrderMember],
     planning_context: JoinPlanningContext<'_>,
     where_clause: &[WhereTerm],
-    available_indexes: &HashMap<String, VecDeque<Arc<Index>>>,
+    available_indexes: &HashMap<Identifier, VecDeque<Arc<Index>>>,
     table_references: &TableReferences,
     subqueries: &[NonFromClauseSubquery],
     schema: &Schema,
@@ -690,7 +691,7 @@ fn find_best_access_method_for_btree(
     join_order: &[JoinOrderMember],
     maybe_order_target: Option<&OrderTarget>,
     where_clause: &[WhereTerm],
-    available_indexes: &HashMap<String, VecDeque<Arc<Index>>>,
+    available_indexes: &HashMap<Identifier, VecDeque<Arc<Index>>>,
     table_references: &TableReferences,
     subqueries: &[NonFromClauseSubquery],
     schema: &Schema,

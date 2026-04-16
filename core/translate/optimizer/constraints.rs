@@ -16,6 +16,7 @@ use rustc_hash::FxHashMap as HashMap;
 use std::{cmp::Ordering, collections::VecDeque, sync::Arc};
 use turso_ext::{ConstraintInfo, ConstraintOp};
 use turso_parser::ast::{self, SortOrder, TableInternalId};
+use turso_parser::identifier::Identifier;
 
 use super::cost_params::CostModelParams;
 
@@ -250,7 +251,7 @@ fn estimate_selectivity(
     table_name: &str,
     column: Option<&Column>,
     column_pos: Option<usize>,
-    available_indexes: &HashMap<String, VecDeque<Arc<Index>>>,
+    available_indexes: &HashMap<Identifier, VecDeque<Arc<Index>>>,
     op: ConstraintOperator,
     params: &CostModelParams,
     is_rowid: bool,
@@ -275,7 +276,7 @@ fn estimate_selectivity(
                 selectivity_when_unique
             } else if let Some(col_pos) = column_pos {
                 // For non-unique columns, find an index containing this column and use its stats
-                if let Some(indexes) = available_indexes.get(table_name) {
+                if let Some(indexes) = available_indexes.get(&Identifier::from(table_name)) {
                     for index in indexes {
                         // Check if this index has our column as its first column
                         // (selectivity is most accurate when column is leftmost in index)
@@ -290,7 +291,11 @@ fn estimate_selectivity(
                                     return selectivity_when_unique;
                                 }
                                 if let Some(stats) = table_stats {
-                                    if let Some(idx_stat) = stats.index_stats.get(&index.name) {
+                                    if let Some(idx_stat) = stats.index_stats.get(
+                                        &turso_parser::identifier::Identifier::from(
+                                            index.name.as_str(),
+                                        ),
+                                    ) {
                                         if let (Some(total), Some(&avg_rows)) = (
                                             idx_stat.total_rows,
                                             idx_stat.avg_rows_per_distinct_prefix.first(),
@@ -339,7 +344,7 @@ fn estimate_constraint_selectivity(
     column: Option<&Column>,
     column_pos: Option<usize>,
     operator: ConstraintOperator,
-    available_indexes: &HashMap<String, VecDeque<Arc<Index>>>,
+    available_indexes: &HashMap<Identifier, VecDeque<Arc<Index>>>,
     params: &CostModelParams,
     is_rowid: bool,
 ) -> f64 {
@@ -379,7 +384,7 @@ fn expression_matches_table(
 pub fn constraints_from_where_clause(
     where_clause: &[WhereTerm],
     table_references: &TableReferences,
-    available_indexes: &HashMap<String, VecDeque<Arc<Index>>>,
+    available_indexes: &HashMap<Identifier, VecDeque<Arc<Index>>>,
     subqueries: &[NonFromClauseSubquery],
     schema: &Schema,
     params: &CostModelParams,
@@ -397,7 +402,7 @@ pub fn constraints_from_where_clause(
             table_id: table_reference.internal_id,
             constraints: Vec::new(),
             candidates: available_indexes
-                .get(table_reference.table.get_name())
+                .get(&Identifier::from(table_reference.table.get_name()))
                 .map_or(Vec::new(), |indexes| {
                     indexes
                         .iter()
@@ -803,7 +808,7 @@ pub fn constraints_from_where_clause(
                 });
             }
             for index in available_indexes
-                .get(table_reference.table.get_name())
+                .get(&Identifier::from(table_reference.table.get_name()))
                 .unwrap_or(&VecDeque::new())
                 .iter()
                 .filter(|idx| idx.index_method.is_none())

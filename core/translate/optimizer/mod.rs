@@ -64,6 +64,7 @@ use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use std::{cmp::Ordering, collections::VecDeque, sync::Arc};
 use turso_ext::{ConstraintInfo, ConstraintUsage};
 use turso_parser::ast::{self, Expr, SortOrder, SubqueryType, TriggerEvent};
+use turso_parser::identifier::Identifier;
 
 pub(crate) mod access_method;
 pub(crate) mod constraints;
@@ -351,7 +352,7 @@ fn sorted_arguments_from_parameters(parameters: &HashMap<i32, ast::Expr>) -> Vec
 #[allow(clippy::too_many_arguments)]
 fn collect_index_method_candidates(
     table_references: &TableReferences,
-    available_indexes: &HashMap<String, VecDeque<Arc<Index>>>,
+    available_indexes: &HashMap<Identifier, VecDeque<Arc<Index>>>,
     where_clause: &[WhereTerm],
     order_by: &[(
         Box<ast::Expr>,
@@ -373,7 +374,7 @@ fn collect_index_method_candidates(
 
     let tables = table_references.joined_tables();
     for (table_idx, table) in tables.iter().enumerate() {
-        let Some(indexes) = available_indexes.get(table.table.get_name()) else {
+        let Some(indexes) = available_indexes.get(&Identifier::from(table.table.get_name())) else {
             continue;
         };
 
@@ -1202,7 +1203,7 @@ fn select_plan_contains_cte_from_clause_subquery(plan: &SelectPlan) -> bool {
 fn optimize_table_access_with_custom_modules(
     result_columns: &mut [ResultSetColumn],
     table_references: &mut TableReferences,
-    available_indexes: &HashMap<String, VecDeque<Arc<Index>>>,
+    available_indexes: &HashMap<Identifier, VecDeque<Arc<Index>>>,
     where_query: &mut [WhereTerm],
     order_by: &mut Vec<(
         Box<ast::Expr>,
@@ -1226,7 +1227,7 @@ fn optimize_table_access_with_custom_modules(
     // Only optimize the first table with custom index methods.
     // This allows FTS to be used as the driving table in joins.
     let table = &mut tables[0];
-    let Some(indexes) = available_indexes.get(table.table.get_name()) else {
+    let Some(indexes) = available_indexes.get(&Identifier::from(table.table.get_name())) else {
         return Ok(false);
     };
     for index in indexes {
@@ -1536,7 +1537,7 @@ fn expr_has_null_masking_for_table(expr: &ast::Expr, table_id: ast::TableInterna
 /// filtering constraint candidates accordingly.
 fn enforce_indexed_by_hints(
     table_references: &TableReferences,
-    available_indexes: &HashMap<String, VecDeque<Arc<Index>>>,
+    available_indexes: &HashMap<Identifier, VecDeque<Arc<Index>>>,
     constraints_per_table: &mut [TableConstraints],
 ) -> Result<()> {
     for (i, table_ref) in table_references.joined_tables().iter().enumerate() {
@@ -1553,11 +1554,13 @@ fn enforce_indexed_by_hints(
             ast::Indexed::IndexedBy(name) => {
                 let idx_name = name.as_str();
                 // Verify the index exists and belongs to this table.
-                let forced_index = available_indexes.get(&btree.name).and_then(|indexes| {
-                    indexes.iter().find(|idx| {
-                        idx.name.eq_ignore_ascii_case(idx_name) && idx.index_method.is_none()
-                    })
-                });
+                let forced_index = available_indexes
+                    .get(&Identifier::from(btree.name.as_str()))
+                    .and_then(|indexes| {
+                        indexes.iter().find(|idx| {
+                            idx.name.eq_ignore_ascii_case(idx_name) && idx.index_method.is_none()
+                        })
+                    });
                 let Some(forced_index) = forced_index else {
                     crate::bail_parse_error!("no such index: {}", idx_name);
                 };
@@ -1602,7 +1605,7 @@ fn optimize_table_access(
     schema: &Schema,
     result_columns: &mut [ResultSetColumn],
     table_references: &mut TableReferences,
-    available_indexes: &HashMap<String, VecDeque<Arc<Index>>>,
+    available_indexes: &HashMap<Identifier, VecDeque<Arc<Index>>>,
     where_clause: &mut [WhereTerm],
     order_by: &mut Vec<(
         Box<ast::Expr>,
@@ -1635,7 +1638,7 @@ fn optimize_table_access(
 
     let has_expression_index = table_references.joined_tables().iter().any(|t| {
         matches!(&t.table, Table::BTree(btree) if available_indexes
-            .get(&btree.name)
+            .get(&Identifier::from(btree.name.as_str()))
             .is_some_and(|indexes| indexes.iter().any(|index| index.is_expression_index())))
     });
 

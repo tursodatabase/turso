@@ -32,6 +32,7 @@ use smallvec::SmallVec;
 use std::{collections::VecDeque, sync::Arc};
 use turso_macros::turso_assert_eq;
 use turso_parser::ast::{self, TableInternalId};
+use turso_parser::identifier::Identifier;
 
 #[derive(Debug, Clone)]
 /// Parameters for a single branch of a multi-index scan.
@@ -147,7 +148,7 @@ fn get_table_local_constraints_for_branch(
     from_outer_join: Option<TableInternalId>,
     table_reference: &JoinedTable,
     table_references: &TableReferences,
-    available_indexes: &HashMap<String, VecDeque<Arc<Index>>>,
+    available_indexes: &HashMap<Identifier, VecDeque<Arc<Index>>>,
     subqueries: &[NonFromClauseSubquery],
     schema: &Schema,
     params: &CostModelParams,
@@ -507,7 +508,7 @@ fn estimate_residual_expr_selectivity(
     expr: &ast::Expr,
     rhs_table: &JoinedTable,
     table_references: &TableReferences,
-    available_indexes: &HashMap<String, VecDeque<Arc<Index>>>,
+    available_indexes: &HashMap<Identifier, VecDeque<Arc<Index>>>,
     subqueries: &[NonFromClauseSubquery],
     schema: &Schema,
     params: &CostModelParams,
@@ -602,7 +603,7 @@ fn estimate_multi_or_residual_selectivity(
     residual_exprs: &[ast::Expr],
     rhs_table: &JoinedTable,
     table_references: &TableReferences,
-    available_indexes: &HashMap<String, VecDeque<Arc<Index>>>,
+    available_indexes: &HashMap<Identifier, VecDeque<Arc<Index>>>,
     subqueries: &[NonFromClauseSubquery],
     schema: &Schema,
     params: &CostModelParams,
@@ -633,7 +634,7 @@ fn evaluate_multi_index_branches(
     where_term_idx: usize,
     rhs_table: &JoinedTable,
     table_references: &TableReferences,
-    available_indexes: &HashMap<String, VecDeque<Arc<Index>>>,
+    available_indexes: &HashMap<Identifier, VecDeque<Arc<Index>>>,
     subqueries: &[NonFromClauseSubquery],
     schema: &Schema,
     base_row_count: RowCountEstimate,
@@ -756,7 +757,7 @@ fn evaluate_multi_index_branches(
 fn analyze_and_terms_for_multi_index(
     table_reference: &JoinedTable,
     where_clause: &[WhereTerm],
-    available_indexes: &HashMap<String, VecDeque<Arc<Index>>>,
+    available_indexes: &HashMap<Identifier, VecDeque<Arc<Index>>>,
     table_references: &TableReferences,
     subqueries: &[NonFromClauseSubquery],
     schema: &Schema,
@@ -764,7 +765,7 @@ fn analyze_and_terms_for_multi_index(
 ) -> Option<AndClauseDecomposition> {
     let table_id = table_reference.internal_id;
     let table_name = table_reference.table.get_name();
-    let indexes = available_indexes.get(table_name);
+    let indexes = available_indexes.get(&Identifier::from(table_name));
     let rowid_alias_column = table_reference
         .columns()
         .iter()
@@ -903,7 +904,7 @@ fn analyze_and_terms_for_multi_index(
 pub fn consider_multi_index_union(
     rhs_table: &JoinedTable,
     where_clause: &[WhereTerm],
-    available_indexes: &HashMap<String, VecDeque<Arc<Index>>>,
+    available_indexes: &HashMap<Identifier, VecDeque<Arc<Index>>>,
     table_references: &TableReferences,
     subqueries: &[NonFromClauseSubquery],
     schema: &Schema,
@@ -1032,7 +1033,7 @@ pub fn consider_multi_index_union(
 pub fn consider_multi_index_intersection(
     rhs_table: &JoinedTable,
     where_clause: &[WhereTerm],
-    available_indexes: &HashMap<String, VecDeque<Arc<Index>>>,
+    available_indexes: &HashMap<Identifier, VecDeque<Arc<Index>>>,
     table_references: &TableReferences,
     subqueries: &[NonFromClauseSubquery],
     schema: &Schema,
@@ -1158,6 +1159,7 @@ mod tests {
     use rustc_hash::FxHashMap as HashMap;
     use std::{collections::VecDeque, sync::Arc};
     use turso_parser::ast::{self, Expr, Operator, SortOrder, TableInternalId};
+    use turso_parser::identifier::Identifier;
 
     struct TestColumn {
         name: String,
@@ -1312,7 +1314,7 @@ mod tests {
 
         let mut available_indexes = HashMap::default();
         available_indexes.insert(
-            "item".to_string(),
+            Identifier::from("item"),
             VecDeque::from([Arc::new(Index {
                 name: "idx_item_id".to_string(),
                 table_name: "item".to_string(),
@@ -1461,7 +1463,7 @@ mod tests {
 
         let mut available_indexes = HashMap::default();
         available_indexes.insert(
-            "item".to_string(),
+            Identifier::from("item"),
             VecDeque::from([Arc::new(Index {
                 name: "idx_item_a".to_string(),
                 table_name: "item".to_string(),
@@ -1574,7 +1576,7 @@ mod tests {
 
         let mut available_indexes = HashMap::default();
         available_indexes.insert(
-            "item".to_string(),
+            Identifier::from("item"),
             VecDeque::from([Arc::new(Index {
                 name: "idx_item_id_kind".to_string(),
                 table_name: "item".to_string(),
@@ -1770,7 +1772,7 @@ mod tests {
 
         let mut available_indexes = HashMap::default();
         available_indexes.insert(
-            "item".to_string(),
+            Identifier::from("item"),
             VecDeque::from([Arc::new(Index {
                 name: "idx_item_id".to_string(),
                 table_name: "item".to_string(),

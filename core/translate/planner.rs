@@ -37,6 +37,7 @@ use turso_parser::ast::{
     self, As, Expr, FromClause, JoinType, Materialized, Over, QualifiedName, Select,
     TableInternalId, With,
 };
+use turso_parser::identifier::Identifier;
 
 /// A CTE definition stored for deferred planning.
 /// Instead of planning CTEs once and cloning the result, we store the AST and
@@ -1126,7 +1127,7 @@ fn parse_table(
     let is_incompatible = resolver.with_schema(database_id, |schema| {
         schema
             .incompatible_views
-            .contains(&normalized_qualified_name)
+            .contains(&Identifier::from(normalized_qualified_name.as_str()))
     });
 
     if is_incompatible {

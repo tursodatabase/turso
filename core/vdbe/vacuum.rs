@@ -6,6 +6,7 @@ use crate::types::IOResult;
 use crate::Result;
 use crate::{Connection, Database};
 use turso_macros::turso_assert;
+use turso_parser::identifier::Identifier;
 
 /// A representation of a row from `sqlite_schema`.
 ///
@@ -327,7 +328,9 @@ fn vacuum_into_step(
                 if !config.source_custom_types.is_empty() {
                     state.dest_conn.with_schema_mut(|dest_schema| {
                         for (name, td) in &config.source_custom_types {
-                            dest_schema.type_registry.insert(name.clone(), td.clone());
+                            dest_schema
+                                .type_registry
+                                .insert(Identifier::from(name.as_str()), td.clone());
                         }
                     });
                 }
