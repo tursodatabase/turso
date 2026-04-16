@@ -372,20 +372,24 @@ fn translate_integrity_check_impl(
 
         for check_expr in &bound_checks {
             let check_ok = program.allocate_label();
-            let check_fail = program.allocate_label();
-            translate_condition_expr(
+            // Evaluate the CHECK expression into a register, then branch.
+            // A CHECK constraint passes when the result is TRUE *or* NULL
+            // (only explicit FALSE/0 is a violation), so we use
+            // jump_if_null: true to treat NULL as passing.
+            let check_reg = program.alloc_register();
+            translate_expr_no_constant_opt(
                 program,
-                &table_references,
+                Some(&table_references),
                 check_expr,
-                ConditionMetadata {
-                    jump_if_condition_is_true: true,
-                    jump_target_when_true: check_ok,
-                    jump_target_when_false: check_fail,
-                    jump_target_when_null: check_ok,
-                },
+                check_reg,
                 resolver,
+                NoConstantOptReason::RegisterReuse,
             )?;
-            program.preassign_label_to_next_insn(check_fail);
+            program.emit_insn(Insn::If {
+                reg: check_reg,
+                target_pc: check_ok,
+                jump_if_null: true,
+            });
             program.emit_string8(
                 format!("CHECK constraint failed in {}", btree_table.name),
                 message_reg,

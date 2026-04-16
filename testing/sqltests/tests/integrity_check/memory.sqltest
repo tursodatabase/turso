@@ -181,3 +181,36 @@ expect {
     ok
 }
 
+# Test integrity_check with CHECK constraint and NULL values.
+# A CHECK constraint passes when the expression evaluates to TRUE or NULL;
+# only an explicit FALSE (0) is a violation. NULL values in columns with
+# CHECK (col BETWEEN x AND y) must not be reported as failures.
+@cross-check-integrity
+test integrity-check-check-constraint-null-passes {
+    CREATE TABLE t9(a INTEGER CHECK (a BETWEEN 0 AND 1000));
+    INSERT INTO t9 VALUES (NULL);
+    INSERT INTO t9 VALUES (500);
+    PRAGMA integrity_check;
+}
+expect {
+    ok
+}
+
+# Same test with a table-level CHECK and multiple NULL columns
+@cross-check-integrity
+test integrity-check-table-check-constraint-null-passes {
+    CREATE TABLE t10(
+        x INTEGER,
+        y INTEGER,
+        CHECK (x + y > 0)
+    );
+    INSERT INTO t10 VALUES (NULL, NULL);
+    INSERT INTO t10 VALUES (1, NULL);
+    INSERT INTO t10 VALUES (NULL, 2);
+    INSERT INTO t10 VALUES (3, 4);
+    PRAGMA integrity_check;
+}
+expect {
+    ok
+}
+
