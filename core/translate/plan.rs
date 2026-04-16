@@ -1367,29 +1367,33 @@ pub type ColumnUsedMask = BitSet;
 // just like we have `CursorID`, so that we can make [ColumnMask] type-safe.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
 pub struct ColumnMask {
-    columns: BitSet,
-    has_rowid_update: bool,
+    bitset: BitSet,
+    has_rowid_sentinel: bool,
 }
 
 impl ColumnMask {
     pub fn set(&mut self, idx: usize) {
         if idx == ROWID_SENTINEL {
-            self.has_rowid_update = true;
+            self.has_rowid_sentinel = true;
         } else {
-            self.columns.set(idx);
+            self.bitset.set(idx);
         }
     }
 
     pub fn get(&self, idx: usize) -> bool {
         if idx == ROWID_SENTINEL {
-            self.has_rowid_update
+            self.has_rowid_sentinel
         } else {
-            self.columns.get(idx)
+            self.bitset.get(idx)
         }
     }
 
     pub fn count(&self) -> usize {
-        self.columns.count() + self.has_rowid_update as usize
+        self.bitset.count() + self.has_rowid_sentinel as usize
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.bitset.is_empty() && !self.has_rowid_sentinel
     }
 }
 
@@ -1400,6 +1404,14 @@ impl FromIterator<usize> for ColumnMask {
             mask.set(idx);
         }
         mask
+    }
+}
+
+impl Extend<usize> for ColumnMask {
+    fn extend<I: IntoIterator<Item = usize>>(&mut self, iter: I) {
+        for idx in iter {
+            self.set(idx);
+        }
     }
 }
 
@@ -1429,8 +1441,8 @@ impl<'a> IntoIterator for &'a ColumnMask {
 
     fn into_iter(self) -> Self::IntoIter {
         ColumnMaskIter {
-            inner: (&self.columns).into_iter(),
-            pending_rowid: self.has_rowid_update,
+            inner: (&self.bitset).into_iter(),
+            pending_rowid: self.has_rowid_sentinel,
         }
     }
 }
@@ -1441,8 +1453,8 @@ impl IntoIterator for ColumnMask {
 
     fn into_iter(self) -> Self::IntoIter {
         ColumnMaskIter {
-            inner: self.columns.into_iter(),
-            pending_rowid: self.has_rowid_update,
+            inner: self.bitset.into_iter(),
+            pending_rowid: self.has_rowid_sentinel,
         }
     }
 }
@@ -1724,6 +1736,14 @@ impl FromIterator<usize> for BitSet {
     }
 }
 
+impl Extend<usize> for BitSet {
+    fn extend<I: IntoIterator<Item = usize>>(&mut self, iter: I) {
+        for index in iter {
+            self.set(index);
+        }
+    }
+}
+
 impl From<u128> for BitSet {
     fn from(from: u128) -> Self {
         let high = (from >> 64) as u64;
@@ -1822,9 +1842,7 @@ pub enum SetOperation {
     Union,
     /// Intersection: rowid appears in result only if it's in ALL branches (AND).
     /// Carries the indices of additional WHERE terms consumed beyond the primary one.
-    Intersection {
-        additional_consumed_terms: Vec<usize>,
-    },
+    Intersection { additional_consumed_terms: BitSet },
 }
 
 /// Multi-index scan operation metadata for OR-by-union or AND-by-intersection optimization.

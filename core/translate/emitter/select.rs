@@ -13,8 +13,9 @@ use crate::{
         main_loop::{init_distinct, CloseLoop, InitLoop, LoopBodyEmitter, OpenLoop},
         order_by::EmitOrderBy,
         plan::{
-            Distinctness, EphemeralRowidMode, EvalAt, IndexMethodQuery, JoinOrderMember, Operation,
-            QueryDestination, Scan, Search, SeekKeyComponent, SelectPlan, SimpleAggregate,
+            BitSet, Distinctness, EphemeralRowidMode, EvalAt, IndexMethodQuery, JoinOrderMember,
+            Operation, QueryDestination, Scan, Search, SeekKeyComponent, SelectPlan,
+            SimpleAggregate,
         },
         planner::table_mask_from_expr,
         select::emit_simple_count,
@@ -317,7 +318,7 @@ fn emit_materialized_build_inputs(
 ) -> Result<HashMap<usize, MaterializedBuildInput>> {
     let mut build_inputs: HashMap<usize, MaterializedBuildInput> = HashMap::default();
     let mut materializations: Vec<MaterializationSpec> = Vec::new();
-    let mut hash_tables_to_keep_open: HashSet<usize> = HashSet::default();
+    let mut hash_tables_to_keep_open = BitSet::default();
 
     // Keep hash tables open while running materialization subplans so we can reuse them.
     // A build table may appear in multiple hash joins when chaining, so we do not
@@ -325,21 +326,22 @@ fn emit_materialized_build_inputs(
     for table in plan.table_references.joined_tables().iter() {
         if let Operation::HashJoin(hash_join_op) = &table.op {
             let build_table = &plan.table_references.joined_tables()[hash_join_op.build_table_idx];
-            hash_tables_to_keep_open.insert(build_table.internal_id.into());
+            hash_tables_to_keep_open.set(build_table.internal_id.into());
         }
     }
 
-    let mut seen_build_tables: HashSet<usize> = HashSet::default();
+    let mut seen_build_tables: TableMask = TableMask::default();
 
     // decide per-hash-join materialization mode (rowid-only vs key+payload).
     for member in plan.join_order.iter() {
         let table = &plan.table_references.joined_tables()[member.original_idx];
         if let Operation::HashJoin(hash_join_op) = &table.op {
             if !hash_join_op.materialize_build_input
-                || !seen_build_tables.insert(hash_join_op.build_table_idx)
+                || seen_build_tables.get(hash_join_op.build_table_idx)
             {
                 continue;
             }
+            seen_build_tables.set(hash_join_op.build_table_idx);
 
             let probe_table_idx = hash_join_op.probe_table_idx;
             let probe_pos = plan
@@ -566,17 +568,17 @@ fn prune_join_order_for_materialized_inputs(
         return Ok(());
     }
 
-    let mut build_tables_in_plan = HashSet::default();
+    let mut build_tables_in_plan = TableMask::default();
     for member in plan.join_order.iter() {
         let table = &plan.table_references.joined_tables()[member.original_idx];
         if let Operation::HashJoin(hash_join_op) = &table.op {
-            build_tables_in_plan.insert(hash_join_op.build_table_idx);
+            build_tables_in_plan.set(hash_join_op.build_table_idx);
         }
     }
 
-    let mut tables_to_remove: HashSet<usize> = HashSet::default();
+    let mut tables_to_remove: TableMask = TableMask::default();
     for (build_table_idx, input) in build_inputs.iter() {
-        if !build_tables_in_plan.contains(build_table_idx) {
+        if !build_tables_in_plan.get(*build_table_idx) {
             continue;
         }
         if matches!(input.mode, MaterializedBuildInputMode::KeyPayload { .. }) {
@@ -588,7 +590,6 @@ fn prune_join_order_for_materialized_inputs(
         return Ok(());
     }
 
-    let prefix_mask: TableMask = tables_to_remove.iter().cloned().collect();
     for term in plan.where_clause.iter_mut() {
         if term.consumed {
             continue;
@@ -606,12 +607,12 @@ fn prune_join_order_for_materialized_inputs(
             &plan.table_references,
             &plan.non_from_clause_subqueries,
         )?;
-        if prefix_mask.contains_all_set_bits_of(&mask) {
+        if tables_to_remove.contains_all_set_bits_of(&mask) {
             term.consumed = true;
         }
     }
     plan.join_order
-        .retain(|member| !tables_to_remove.contains(&member.original_idx));
+        .retain(|member| !tables_to_remove.get(member.original_idx));
     Ok(())
 }
 

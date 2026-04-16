@@ -18,7 +18,7 @@ use crate::{
     parameters,
     schema::Trigger,
     stats::refresh_analyze_stats,
-    translate::{self, display::PlanContext, emitter::TransactionMode},
+    translate::{self, display::PlanContext, emitter::TransactionMode, plan::BitSet},
     vdbe::{
         self,
         explain::{EXPLAIN_COLUMNS_TYPE, EXPLAIN_QUERY_PLAN_COLUMNS_TYPE},
@@ -496,16 +496,15 @@ impl Statement {
         // with the stale schema cookie, causing an infinite SchemaUpdated loop.
         // SchemaUpdated can occur at different points in the Transaction opcode,
         // so the attached pager may or may not hold locks at this point.
-        let attached_db_ids: Vec<usize> = self
+        let attached_db_ids: BitSet = self
             .program
             .prepared
             .write_databases
             .iter()
             .chain(self.program.prepared.read_databases.iter())
-            .filter(|&&id| id != crate::MAIN_DB_ID)
-            .copied()
+            .filter(|&id| id != crate::MAIN_DB_ID)
             .collect();
-        for db_id in attached_db_ids {
+        for db_id in &attached_db_ids {
             // Discard any connection-local schema changes for this non-main DB
             // (temp or attached) so the re-translate reads the committed schema.
             conn.database_schemas().write().remove(&db_id);

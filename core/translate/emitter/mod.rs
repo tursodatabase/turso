@@ -16,7 +16,7 @@ use super::expr::{emit_table_column, translate_expr, ExprAffinityInfo};
 use super::group_by::GroupByMetadata;
 use super::main_loop::{LeftJoinMetadata, LoopLabels};
 use super::order_by::SortMetadata;
-use super::plan::{HashJoinType, TableReferences};
+use super::plan::{BitSet, HashJoinType, TableReferences};
 use crate::error::SQLITE_CONSTRAINT_CHECK;
 use crate::function::Func;
 use crate::schema::dependencies_of_columns;
@@ -404,16 +404,13 @@ impl<'a> Resolver<'a> {
         }
     }
 
-    pub(crate) fn attached_database_ids_in_search_order(&self) -> Vec<usize> {
-        let mut database_ids: Vec<_> = self
-            .attached_databases
+    pub(crate) fn attached_database_ids_in_search_order(&self) -> BitSet {
+        self.attached_databases
             .read()
             .index_to_data
             .keys()
             .copied()
-            .collect();
-        database_ids.sort_unstable();
-        database_ids
+            .collect()
     }
 
     fn resolve_unqualified_existing_database_id<F>(

@@ -1464,8 +1464,7 @@ fn emit_update_insns<'a>(
     // This ensures that if a constraint fails, indexes remain consistent.
     if let Some(btree_table) = target_table.table.btree() {
         if btree_table.is_strict {
-            let set_col_indices: std::collections::HashSet<usize> =
-                set_clauses.iter().map(|(idx, _)| *idx).collect();
+            let set_col_indices: ColumnMask = set_clauses.iter().map(|(idx, _)| *idx).collect();
 
             // Pre-encode TypeCheck: validate SET column input types.
             // Non-SET columns hold encoded values from disk, so skip them (ANY).

@@ -1,6 +1,7 @@
 use super::*;
 use crate::schema::GeneratedType;
 use crate::translate::emitter::HashLabels;
+use crate::translate::plan::ColumnUsedMask;
 use crate::vdbe::builder::SelfTableContext;
 
 #[derive(Debug, Clone)]
@@ -35,7 +36,7 @@ fn expr_references_outer_query(expr: &Expr, table_references: &TableReferences) 
 /// Static configuration for a fresh hash-table build.
 struct HashBuildConfig {
     payload_columns: Vec<MaterializedColumnRef>,
-    payload_signature_columns: Vec<usize>,
+    payload_signature_columns: ColumnUsedMask,
     key_affinities: String,
     collations: Vec<CollationSeq>,
     use_bloom_filter: bool,
@@ -155,7 +156,7 @@ impl<'a, 'plan> HashBuildPlanner<'a, 'plan> {
                         *payload_num_keys == num_keys,
                         "materialized hash build input key count mismatch"
                     );
-                    let payload_signature_columns = (0..payload_columns.len())
+                    let payload_signature_columns: ColumnUsedMask = (0..payload_columns.len())
                         .map(|i| *payload_num_keys + i)
                         .collect();
                     (
@@ -166,18 +167,18 @@ impl<'a, 'plan> HashBuildPlanner<'a, 'plan> {
                     )
                 }
                 _ => {
-                    let payload_signature_columns: Vec<usize> =
-                        build_table.col_used_mask.iter().collect();
+                    let payload_signature_columns: ColumnUsedMask =
+                        build_table.col_used_mask.clone();
                     let payload_columns = payload_signature_columns
                         .iter()
                         .map(|col_idx| {
                             let column = build_table
                                 .columns()
-                                .get(*col_idx)
+                                .get(col_idx)
                                 .expect("build table column missing");
                             MaterializedColumnRef::Column {
                                 table_id: build_table.internal_id,
-                                column_idx: *col_idx,
+                                column_idx: col_idx,
                                 is_rowid_alias: column.is_rowid_alias(),
                             }
                         })
@@ -414,7 +415,7 @@ impl<'a, 'plan> PreparedHashBuild<'a, 'plan> {
         let num_payload = config.payload_columns.len();
         let (payload_start_reg, mut payload_info) = if num_payload > 0 {
             let payload_reg = planner.program.alloc_registers(num_payload);
-            for (i, &col_idx) in config.payload_signature_columns.iter().enumerate() {
+            for (i, col_idx) in config.payload_signature_columns.iter().enumerate() {
                 match build_table
                     .columns()
                     .get(col_idx)

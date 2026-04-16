@@ -1,4 +1,3 @@
-use rustc_hash::FxHashSet as HashSet;
 use turso_parser::ast::{self, Expr, Literal, Name, QualifiedName, RefAct};
 
 use super::{translate_inner, ProgramBuilder, ProgramBuilderOpts};
@@ -373,7 +372,7 @@ pub fn stabilize_new_row_for_fk(
     if table_btree.primary_key_columns.is_empty() {
         return Ok(());
     }
-    let set_cols: HashSet<usize> = set_clauses
+    let set_cols: ColumnMask = set_clauses
         .iter()
         .filter_map(|(i, _)| if *i == ROWID_SENTINEL { None } else { Some(*i) })
         .collect();
@@ -382,7 +381,7 @@ pub fn stabilize_new_row_for_fk(
         let (pos, col) = table_btree
             .get_column(pk_name)
             .ok_or_else(|| LimboError::InternalError(format!("pk col {pk_name} missing")))?;
-        if !set_cols.contains(&pos) {
+        if !set_cols.get(pos) {
             if col.is_rowid_alias() {
                 program.emit_insn(Insn::Copy {
                     src_reg: rowid_new_reg,

@@ -1,5 +1,5 @@
 use crate::{turso_assert, turso_assert_eq, turso_debug_assert};
-use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
+use rustc_hash::FxHashMap as HashMap;
 use tracing::{instrument, Level};
 use turso_parser::ast::{self, Expr, ResolveType, SortOrder, TableInternalId};
 
@@ -262,9 +262,9 @@ pub struct ProgramBuilder {
     // TODO: when we support multiple dbs, this should be a write mask to track which DBs need to be written
     txn_mode: TransactionMode,
     /// Set of database IDs that need write transactions (for attached databases).
-    write_databases: HashSet<usize>,
+    write_databases: BitSet,
     /// Set of attached database IDs that need read transactions.
-    read_databases: HashSet<usize>,
+    read_databases: BitSet,
     /// Schema cookies for attached databases at prepare time.
     write_database_cookies: HashMap<usize, u32>,
     /// Schema cookies for attached databases opened for reading.
@@ -319,7 +319,7 @@ pub struct ProgramBuilder {
     /// Hash join build signatures keyed by hash table id.
     hash_build_signatures: HashMap<usize, HashBuildSignature>,
     /// Hash tables to keep open across subplans (e.g. materialization).
-    hash_tables_to_keep_open: HashSet<usize>,
+    hash_tables_to_keep_open: BitSet,
     /// Maps table internal_id to result_columns_start_reg for FROM clause subqueries.
     /// Used when nested subqueries need to reference columns from outer query subqueries.
     subquery_result_regs: HashMap<TableInternalId, usize>,
@@ -559,8 +559,8 @@ impl ProgramBuilder {
             start_offset: BranchOffset::Placeholder,
             capture_data_changes_info,
             txn_mode: TransactionMode::None,
-            write_databases: HashSet::default(),
-            read_databases: HashSet::default(),
+            write_databases: BitSet::default(),
+            read_databases: BitSet::default(),
             write_database_cookies: HashMap::default(),
             read_database_cookies: HashMap::default(),
             rollback: false,
@@ -580,7 +580,7 @@ impl ProgramBuilder {
             suppress_custom_type_decode: false,
             suppress_column_default: false,
             hash_build_signatures: HashMap::default(),
-            hash_tables_to_keep_open: HashSet::default(),
+            hash_tables_to_keep_open: BitSet::default(),
             subquery_result_regs: HashMap::default(),
             self_table_context: None,
             next_cte_id: 0,
@@ -677,17 +677,17 @@ impl ProgramBuilder {
 
     /// Returns true if the given hash table id should be kept open across subplans.
     pub fn should_keep_hash_table_open(&self, hash_table_id: usize) -> bool {
-        self.hash_tables_to_keep_open.contains(&hash_table_id)
+        self.hash_tables_to_keep_open.get(hash_table_id)
     }
 
     /// Set the set of hash tables to keep open across subplans.
-    pub fn set_hash_tables_to_keep_open(&mut self, tables: &HashSet<usize>) {
+    pub fn set_hash_tables_to_keep_open(&mut self, tables: &BitSet) {
         self.hash_tables_to_keep_open.clone_from(tables);
     }
 
     /// Reset the set of hash tables to keep open.
     pub fn clear_hash_tables_to_keep_open(&mut self) {
-        self.hash_tables_to_keep_open.clear();
+        self.hash_tables_to_keep_open = BitSet::default();
     }
 
     /// Returns true if the given hash build signature matches the recorded one for the given hash table id.
@@ -1537,13 +1537,13 @@ impl ProgramBuilder {
     /// Tries to mirror: https://github.com/sqlite/sqlite/blob/e77e589a35862f6ac9c4141cfd1beb2844b84c61/src/build.c#L5379
     pub fn begin_write_operation(&mut self) {
         self.txn_mode = TransactionMode::Write;
-        self.write_databases.insert(crate::MAIN_DB_ID);
+        self.write_databases.set(crate::MAIN_DB_ID);
     }
 
     /// Begin a write operation on a specific database (for attached databases).
     pub fn begin_write_on_database(&mut self, database_id: usize, schema_cookie: u32) {
         self.txn_mode = TransactionMode::Write;
-        self.write_databases.insert(database_id);
+        self.write_databases.set(database_id);
         self.write_database_cookies
             .insert(database_id, schema_cookie);
     }
@@ -1553,7 +1553,7 @@ impl ProgramBuilder {
         if matches!(self.txn_mode, TransactionMode::None) {
             self.txn_mode = TransactionMode::Read;
         }
-        self.read_databases.insert(crate::MAIN_DB_ID);
+        self.read_databases.set(crate::MAIN_DB_ID);
     }
 
     /// Begin a read operation on a specific attached database.
@@ -1563,7 +1563,7 @@ impl ProgramBuilder {
         if matches!(self.txn_mode, TransactionMode::None) {
             self.txn_mode = TransactionMode::Read;
         }
-        self.read_databases.insert(database_id);
+        self.read_databases.set(database_id);
         self.read_database_cookies
             .insert(database_id, schema_cookie);
     }
@@ -1602,9 +1602,8 @@ impl ProgramBuilder {
             self.preassign_label_to_next_insn(self.init_label);
 
             if !matches!(self.txn_mode, TransactionMode::None) {
-                let mut write_db_ids: Vec<_> = self.write_databases.iter().copied().collect();
-                write_db_ids.sort_unstable();
-                for db_id in write_db_ids {
+                let write_dbs = self.write_databases.clone();
+                for db_id in &write_dbs {
                     let schema_cookie = if db_id == crate::MAIN_DB_ID {
                         schema.schema_version
                     } else {
@@ -1621,10 +1620,9 @@ impl ProgramBuilder {
                 }
                 // Emit Transaction for each non-main database that only needs a read
                 // (skip databases already covered by write_databases)
-                let mut read_db_ids: Vec<_> = self.read_databases.iter().copied().collect();
-                read_db_ids.sort_unstable();
-                for db_id in read_db_ids {
-                    if !self.write_databases.contains(&db_id) {
+                let read_dbs = self.read_databases.clone();
+                for db_id in &read_dbs {
+                    if !write_dbs.get(db_id) {
                         let schema_cookie = if db_id == crate::MAIN_DB_ID {
                             schema.schema_version
                         } else {

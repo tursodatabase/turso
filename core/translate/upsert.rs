@@ -1,4 +1,4 @@
-use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
+use rustc_hash::FxHashMap as HashMap;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
 
@@ -192,24 +192,24 @@ fn upsert_index_is_affected(
     if rowid_changed {
         return true;
     }
-    let km: HashSet<usize> = idx
+    let km: ColumnMask = idx
         .columns
         .iter()
         .filter_map(|ic| ic.expr.is_none().then_some(ic.pos_in_table))
         .collect();
     let pm = referenced_index_cols(idx, table);
-    for c in km.iter().chain(pm.iter()) {
-        if changed_cols.get(*c) {
+    for c in km.into_iter().chain(pm.into_iter()) {
+        if changed_cols.get(c) {
             return true;
         }
     }
     false
 }
 
-/// Collect HashSet of columns referenced by the partial WHERE (empty if none), or
+/// Collect the set of columns referenced by the partial WHERE (empty if none), or
 /// by the expression of any IndexColumn on the index.
-fn referenced_index_cols(idx: &Index, table: &Table) -> HashSet<usize> {
-    let mut out = HashSet::default();
+fn referenced_index_cols(idx: &Index, table: &Table) -> ColumnMask {
+    let mut out = ColumnMask::default();
     if let Some(expr) = &idx.where_clause {
         index_expression_cols(table, &mut out, expr);
     }
@@ -222,13 +222,13 @@ fn referenced_index_cols(idx: &Index, table: &Table) -> HashSet<usize> {
 }
 
 /// Columns referenced by any expression index columns on the index.
-fn index_expression_cols(table: &Table, out: &mut HashSet<usize>, expr: &ast::Expr) {
+fn index_expression_cols(table: &Table, out: &mut ColumnMask, expr: &ast::Expr) {
     use ast::Expr;
     let _ = walk_expr(expr, &mut |e: &ast::Expr| -> crate::Result<WalkControl> {
         match e {
             Expr::Id(n) => {
                 if let Some((i, _)) = table.get_column_by_name(&normalize_ident(n.as_str())) {
-                    out.insert(i);
+                    out.set(i);
                 } else if ROWID_STRS
                     .iter()
                     .any(|r| r.eq_ignore_ascii_case(n.as_str()))
@@ -237,7 +237,7 @@ fn index_expression_cols(table: &Table, out: &mut HashSet<usize>, expr: &ast::Ex
                         .btree()
                         .and_then(|t| t.get_rowid_alias_column().map(|(p, _)| p))
                     {
-                        out.insert(rowid_pos);
+                        out.set(rowid_pos);
                     }
                 }
             }
@@ -246,7 +246,7 @@ fn index_expression_cols(table: &Table, out: &mut HashSet<usize>, expr: &ast::Ex
                 let tname = normalize_ident(table.get_name());
                 if nsn.eq_ignore_ascii_case(&tname) {
                     if let Some((i, _)) = table.get_column_by_name(&normalize_ident(c.as_str())) {
-                        out.insert(i);
+                        out.set(i);
                     }
                 }
             }
