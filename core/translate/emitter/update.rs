@@ -27,9 +27,9 @@ use crate::{
             ReturningBufferCtx,
         },
         fkeys::{
-            emit_fk_child_update_counters, emit_fk_parent_new_key_reconcile,
+            emit_fk_child_update_counters, emit_fk_parent_deferred_new_key_probes,
             emit_fk_update_parent_actions, fire_fk_update_actions, stabilize_new_row_for_fk,
-            ForeignKeyActions,
+            ForeignKeyActions, ParentKeyNewProbeMode,
         },
         main_loop::{CloseLoop, InitLoop, OpenLoop},
         plan::{
@@ -1281,6 +1281,7 @@ fn emit_update_insns<'a>(
         )?;
     }
 
+    let mut deferred_new_key_plans = Vec::new();
     if connection.foreign_keys_enabled() {
         let rowid_new_reg = rowid_set_clause_reg.unwrap_or(beg);
         if let Some(table_btree) = target_table.table.btree() {
@@ -1302,7 +1303,17 @@ fn emit_update_insns<'a>(
             if t_ctx.resolver.with_schema(update_database_id, |s| {
                 s.any_resolved_fks_referencing(table_name)
             }) {
-                emit_fk_update_parent_actions(
+                let new_key_probe_mode = if any_effective_replace(
+                    program.has_statement_conflict,
+                    or_conflict,
+                    table_btree.rowid_alias_conflict_clause,
+                    indexes_to_update.iter().map(|idx| idx.on_conflict),
+                ) {
+                    ParentKeyNewProbeMode::AfterReplace
+                } else {
+                    ParentKeyNewProbeMode::BeforeWrite
+                };
+                deferred_new_key_plans = emit_fk_update_parent_actions(
                     program,
                     &table_btree,
                     indexes_to_update.iter(),
@@ -1312,31 +1323,13 @@ fn emit_update_insns<'a>(
                     rowid_new_reg,
                     rowid_set_clause_reg,
                     set_clauses,
-                    false,
+                    new_key_probe_mode,
                     update_database_id,
                     &t_ctx.resolver,
                 )?;
             }
         }
     }
-
-    // Parent-key reconciliation after the new row is inserted is only valid if this row
-    // actually deleted a conflicting parent row via REPLACE. Otherwise it double-decrements
-    // deferred FK counters for ordinary parent-key updates.
-    let parent_replace_reconcile_reg = if connection.foreign_keys_enabled()
-        && target_table.table.btree().is_some()
-        && t_ctx.resolver.with_schema(update_database_id, |s| {
-            s.any_resolved_fks_referencing(table_name)
-        }) {
-        let reg = program.alloc_register();
-        program.emit_insn(Insn::Integer {
-            value: 0,
-            dest: reg,
-        });
-        Some(reg)
-    } else {
-        None
-    };
 
     // Populate register-to-affinity map for expression index evaluation.
     // When column references are rewritten to Expr::Register during UPDATE, comparison
@@ -1797,12 +1790,6 @@ fn emit_update_insns<'a>(
                     });
                 }
                 ResolveType::Replace => {
-                    if let Some(parent_replace_reconcile_reg) = parent_replace_reconcile_reg {
-                        program.emit_insn(Insn::Integer {
-                            value: 1,
-                            dest: parent_replace_reconcile_reg,
-                        });
-                    }
                     // For REPLACE with unique constraint, delete the conflicting row
                     // Save original rowid before seeking to conflicting row
                     let original_rowid_reg = program.alloc_register();
@@ -1975,12 +1962,6 @@ fn emit_update_insns<'a>(
         && updates_rowid
         && matches!(effective_rowid_alias_conflict, ResolveType::Replace)
     {
-        if let Some(parent_replace_reconcile_reg) = parent_replace_reconcile_reg {
-            program.emit_insn(Insn::Integer {
-                value: 1,
-                dest: parent_replace_reconcile_reg,
-            });
-        }
         let target_reg = rowid_set_clause_reg.expect("rowid_set_clause_reg must be set");
         let no_rowid_conflict_label = program.allocate_label();
         let row_not_found_label = check_rowid_not_exists_label
@@ -2244,29 +2225,13 @@ fn emit_update_insns<'a>(
                 table_name: target_table.identifier.clone(),
             });
 
-            // Reconcile deferred FK violations after REPLACE.
-            // If Phase 1 REPLACE deleted a parent row referenced by deferred FK children,
-            // the counter was incremented. Now that the new row is inserted with the
-            // (potentially same) parent key, scan children and decrement.
             if connection.foreign_keys_enabled() {
-                if let Some(parent_replace_reconcile_reg) = parent_replace_reconcile_reg {
-                    let skip_fk_parent_reconcile = program.allocate_label();
-                    program.emit_insn(Insn::IfNot {
-                        reg: parent_replace_reconcile_reg,
-                        target_pc: skip_fk_parent_reconcile,
-                        jump_if_null: true,
-                    });
-                    emit_fk_parent_new_key_reconcile(
-                        program,
-                        table,
-                        start,
-                        rowid_set_clause_reg.unwrap_or(beg),
-                        set_clauses,
-                        update_database_id,
-                        &t_ctx.resolver,
-                    )?;
-                    program.preassign_label_to_next_insn(skip_fk_parent_reconcile);
-                }
+                emit_fk_parent_deferred_new_key_probes(
+                    program,
+                    &deferred_new_key_plans,
+                    update_database_id,
+                    &t_ctx.resolver,
+                )?;
             }
 
             // Fire FK CASCADE/SET NULL actions AFTER the parent row is updated

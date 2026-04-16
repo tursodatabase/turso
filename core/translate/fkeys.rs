@@ -34,6 +34,118 @@ pub fn emit_guarded_fk_decrement(
     });
 }
 
+/// Chooses when the parent-side NEW-key probe runs.
+///
+/// `BeforeWrite` is correct for plain `UPDATE` and `UPSERT .. DO UPDATE`:
+/// if a child row matches the NEW key, that child is genuinely missing its
+/// parent until this statement creates it.
+///
+/// `AfterReplace` is required for REPLACE-style updates: before the write, a
+/// child row may still be valid only because some other parent row still owns
+/// the NEW key. Counting that child too early can clear the wrong deferred FK
+/// violation.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum ParentKeyNewProbeMode {
+    BeforeWrite,
+    AfterReplace,
+}
+
+/// A NEW-key probe that must wait until after a REPLACE-style write.
+///
+/// The guard register is set only when OLD != NEW, so no-op statements like
+/// `UPDATE OR REPLACE p SET id = 10 WHERE id = 10` do not clear unrelated
+/// deferred violations. The register range points at the already-built NEW key
+/// so the post-write path does not need to rebuild it.
+pub struct DeferredNewKeyProbePlan {
+    guard_reg: usize,
+    incoming: Vec<ResolvedFkRef>,
+    new_key_start: usize,
+    new_key_len: usize,
+}
+
+/// Emit parent-side OLD/NEW key probes when a parent key actually changes.
+///
+/// In `AfterReplace` mode this returns the deferred NEW-key probe needed after
+/// the write. In `BeforeWrite` mode the NEW-key probe is emitted inline here.
+#[expect(clippy::too_many_arguments)]
+fn emit_parent_key_change_probes(
+    program: &mut ProgramBuilder,
+    incoming: &[ResolvedFkRef],
+    old_key_start: usize,
+    new_key_start: usize,
+    n_cols: usize,
+    new_key_probe_mode: ParentKeyNewProbeMode,
+    database_id: usize,
+    resolver: &Resolver,
+) -> Result<Option<DeferredNewKeyProbePlan>> {
+    let skip = program.allocate_label();
+    let changed = program.allocate_label();
+    let deferred_new_key_probe =
+        if matches!(new_key_probe_mode, ParentKeyNewProbeMode::AfterReplace) {
+            let deferred_fks: Vec<_> = incoming
+                .iter()
+                .filter(|fk_ref| fk_ref.fk.deferred)
+                .cloned()
+                .collect();
+            if deferred_fks.is_empty() {
+                None
+            } else {
+                let guard_reg = program.alloc_register();
+                program.emit_insn(Insn::Integer {
+                    value: 0,
+                    dest: guard_reg,
+                });
+                Some(DeferredNewKeyProbePlan {
+                    guard_reg,
+                    incoming: deferred_fks,
+                    new_key_start,
+                    new_key_len: n_cols,
+                })
+            }
+        } else {
+            None
+        };
+
+    for i in 0..n_cols {
+        let next = if i + 1 == n_cols {
+            skip
+        } else {
+            program.allocate_label()
+        };
+        program.emit_insn(Insn::Eq {
+            lhs: old_key_start + i,
+            rhs: new_key_start + i,
+            target_pc: next,
+            flags: CmpInsFlags::default(),
+            collation: None,
+        });
+        program.emit_insn(Insn::Goto { target_pc: changed });
+        if i + 1 != n_cols {
+            program.preassign_label_to_next_insn(next);
+        }
+    }
+
+    program.preassign_label_to_next_insn(changed);
+    if let Some(ref plan) = deferred_new_key_probe {
+        program.emit_insn(Insn::Integer {
+            value: 1,
+            dest: plan.guard_reg,
+        });
+    }
+    emit_fk_parent_pk_change_counters(
+        program,
+        incoming,
+        old_key_start,
+        new_key_start,
+        n_cols,
+        new_key_probe_mode,
+        database_id,
+        resolver,
+    )?;
+    program.preassign_label_to_next_insn(skip);
+    Ok(deferred_new_key_probe)
+}
+
 /// Open a read cursor on an index and return its cursor id.
 #[inline]
 pub fn open_read_index(program: &mut ProgramBuilder, idx: &Arc<Index>, db: usize) -> usize {
@@ -290,129 +402,29 @@ pub fn stabilize_new_row_for_fk(
     Ok(())
 }
 
-/// Parent-side checks when the parent key might change (UPDATE on parent):
-/// Detect if any child references the OLD key (potential violation), and if any references the NEW key
-/// (which cancels one potential violation). For composite keys this builds OLD/NEW vectors first.
-#[allow(clippy::too_many_arguments)]
-pub fn emit_parent_key_change_checks(
-    program: &mut ProgramBuilder,
-    table_btree: &BTreeTable,
-    indexes_to_update: impl Iterator<Item = impl AsRef<Index>>,
-    cursor_id: usize,
-    old_rowid_reg: usize,
-    start: usize,
-    rowid_new_reg: usize,
-    rowid_set_clause_reg: Option<usize>,
-    set_clauses: &[(usize, Box<Expr>)],
-    reconcile_new_key: bool,
-    database_id: usize,
-    resolver: &Resolver,
-) -> Result<()> {
-    let updated_positions: ColumnMask = set_clauses.iter().map(|(i, _)| *i).collect();
-    let incoming = resolver.with_schema(database_id, |s| {
-        s.resolved_fks_referencing(&table_btree.name)
-    })?;
-    let affects_pk = incoming
-        .iter()
-        .any(|r| r.parent_key_may_change(&updated_positions, table_btree));
-    if !affects_pk {
-        return Ok(());
-    }
-
-    let primary_key_is_rowid_alias = table_btree.get_rowid_alias_column().is_some();
-
-    if primary_key_is_rowid_alias || table_btree.primary_key_columns.is_empty() {
-        emit_rowid_pk_change_check(
-            program,
-            &incoming,
-            old_rowid_reg,
-            rowid_set_clause_reg.unwrap_or(old_rowid_reg),
-            reconcile_new_key,
-            database_id,
-            resolver,
-        )?;
-    }
-
-    for index in indexes_to_update {
-        emit_parent_index_key_change_checks(
-            program,
-            cursor_id,
-            start,
-            old_rowid_reg,
-            rowid_new_reg,
-            &incoming,
-            table_btree,
-            index.as_ref(),
-            reconcile_new_key,
-            database_id,
-            resolver,
-        )?;
-    }
-    Ok(())
-}
-
-/// Rowid-table parent PK change: compare rowid OLD vs NEW; if changed, run two-pass counters.
+/// Handles rowid and `INTEGER PRIMARY KEY` parent-key updates.
 pub fn emit_rowid_pk_change_check(
     program: &mut ProgramBuilder,
     incoming: &[ResolvedFkRef],
     old_rowid_reg: usize,
     new_rowid_reg: usize,
-    reconcile_new_key: bool,
+    new_key_probe_mode: ParentKeyNewProbeMode,
     database_id: usize,
     resolver: &Resolver,
-) -> Result<()> {
-    let skip = program.allocate_label();
-    program.emit_insn(Insn::Eq {
-        lhs: new_rowid_reg,
-        rhs: old_rowid_reg,
-        target_pc: skip,
-        flags: CmpInsFlags::default(),
-        collation: None,
-    });
-
-    let old_pk = program.alloc_register();
-    let new_pk = program.alloc_register();
-    program.emit_insn(Insn::Copy {
-        src_reg: old_rowid_reg,
-        dst_reg: old_pk,
-        extra_amount: 0,
-    });
-    program.emit_insn(Insn::Copy {
-        src_reg: new_rowid_reg,
-        dst_reg: new_pk,
-        extra_amount: 0,
-    });
-
-    emit_fk_parent_pk_change_counters(
+) -> Result<Option<DeferredNewKeyProbePlan>> {
+    emit_parent_key_change_probes(
         program,
         incoming,
-        old_pk,
-        new_pk,
+        old_rowid_reg,
+        new_rowid_reg,
         1,
-        reconcile_new_key,
+        new_key_probe_mode,
         database_id,
         resolver,
-    )?;
-    program.preassign_label_to_next_insn(skip);
-    Ok(())
+    )
 }
 
-/// Foreign keys are only legal if the referenced parent key is:
-/// 1. The rowid alias (no separate index)
-/// 2. Part of a primary key / unique index (there is no practical difference between the two)
-///
-/// If the foreign key references a composite key, all of the columns in the key must be referenced.
-/// E.g.
-/// CREATE TABLE parent (a, b, c, PRIMARY KEY (a, b, c));
-/// CREATE TABLE child (a, b, c, FOREIGN KEY (a, b, c) REFERENCES parent (a, b, c));
-///
-/// Whereas this is not allowed:
-/// CREATE TABLE parent (a, b, c, PRIMARY KEY (a, b, c));
-/// CREATE TABLE child (a, b, c, FOREIGN KEY (a, b) REFERENCES parent (a, b, c));
-///
-/// This function checks if the parent key has changed by comparing the OLD and NEW values.
-/// If the parent key has changed, it emits the counters for the foreign keys.
-/// If the parent key has not changed, it does nothing.
+/// Handles parent-key updates backed by a UNIQUE index.
 #[allow(clippy::too_many_arguments)]
 pub fn emit_parent_index_key_change_checks(
     program: &mut ProgramBuilder,
@@ -423,30 +435,24 @@ pub fn emit_parent_index_key_change_checks(
     incoming: &[ResolvedFkRef],
     table_btree: &BTreeTable,
     index: &Index,
-    reconcile_new_key: bool,
+    new_key_probe_mode: ParentKeyNewProbeMode,
     database_id: usize,
     resolver: &Resolver,
-) -> Result<()> {
-    // Only process FKs that:
-    // 1. Reference this specific index (OLD/NEW key vectors are built from this index's columns)
-    // 2. Have NO ACTION or RESTRICT on_update action (CASCADE/SET NULL/SET DEFAULT are handled
-    //    later by fire_fk_update_actions AFTER the update completes)
+) -> Result<Option<DeferredNewKeyProbePlan>> {
+    // Only process FKs that reference this specific index.
     let matching_fks: Vec<_> = incoming
         .iter()
         .filter(|fk_ref| {
-            let matches_index = fk_ref
+            fk_ref
                 .parent_unique_index
                 .as_ref()
-                .is_some_and(|idx| idx.name == index.name);
-            let is_noaction_or_restrict =
-                matches!(fk_ref.fk.on_update, RefAct::NoAction | RefAct::Restrict);
-            matches_index && is_noaction_or_restrict
+                .is_some_and(|idx| idx.name == index.name)
         })
         .cloned()
         .collect();
 
     if matching_fks.is_empty() {
-        return Ok(());
+        return Ok(None);
     }
 
     let idx_len = index.columns.len();
@@ -498,47 +504,22 @@ pub fn emit_parent_index_key_change_checks(
         });
     }
 
-    let skip = program.allocate_label();
-    let changed = program.allocate_label();
-    for i in 0..idx_len {
-        let next = if i + 1 == idx_len {
-            None
-        } else {
-            Some(program.allocate_label())
-        };
-        program.emit_insn(Insn::Eq {
-            lhs: old_key + i,
-            rhs: new_key + i,
-            target_pc: next.unwrap_or(skip),
-            flags: CmpInsFlags::default(),
-            collation: None,
-        });
-        program.emit_insn(Insn::Goto { target_pc: changed });
-        if let Some(n) = next {
-            program.preassign_label_to_next_insn(n);
-        }
-    }
-
-    program.preassign_label_to_next_insn(changed);
-    emit_fk_parent_pk_change_counters(
+    emit_parent_key_change_probes(
         program,
         &matching_fks,
         old_key,
         new_key,
         idx_len,
-        reconcile_new_key,
+        new_key_probe_mode,
         database_id,
         resolver,
-    )?;
-    program.preassign_label_to_next_insn(skip);
-    Ok(())
+    )
 }
 
-/// Parent-side maintenance for UPDATE of a parent key:
-/// probe child for OLD key and increment deferred counter if references exist.
+/// Emits OLD-key probe (always) and NEW-key probe (only in `BeforeWrite` mode).
 ///
-/// When statement conflict handling is active (e.g. UPSERT/REPLACE paths),
-/// also probe the NEW key to reconcile pre-existing deferred violations.
+/// In `AfterReplace` mode the NEW-key probe is handled later by
+/// `emit_fk_parent_deferred_new_key_probes` once the REPLACE write is done.
 #[allow(clippy::too_many_arguments)]
 pub fn emit_fk_parent_pk_change_counters(
     program: &mut ProgramBuilder,
@@ -546,7 +527,7 @@ pub fn emit_fk_parent_pk_change_counters(
     old_pk_start: usize,
     new_pk_start: usize,
     n_cols: usize,
-    reconcile_new_key: bool,
+    new_key_probe_mode: ParentKeyNewProbeMode,
     database_id: usize,
     resolver: &Resolver,
 ) -> Result<()> {
@@ -561,7 +542,7 @@ pub fn emit_fk_parent_pk_change_counters(
             resolver,
         )?;
 
-        if reconcile_new_key {
+        if matches!(new_key_probe_mode, ParentKeyNewProbeMode::BeforeWrite) {
             emit_fk_parent_key_probe(
                 program,
                 fk_ref,
@@ -576,97 +557,44 @@ pub fn emit_fk_parent_pk_change_counters(
     Ok(())
 }
 
-/// After INSERT in the UPDATE path, if REPLACE fired during Phase 1,
-/// children referencing the NEW parent key may resolve deferred FK violations
-/// that the REPLACE delete incremented. This emits a FkIfZero-guarded scan
-/// that decrements the counter for each matching child row.
+/// Run deferred NEW-key probes after the row write completes.
 ///
-/// Matches SQLite's post-delete / pre-insert FK reconciliation
-/// (sqlite3FkCheck → fkScanChildren with isIgnoreErr=1 path).
-#[allow(clippy::too_many_arguments)]
-pub fn emit_fk_parent_new_key_reconcile(
+/// Each plan carries the register range where the NEW key was built during
+/// the check phase, so no key reconstruction is needed here.
+pub fn emit_fk_parent_deferred_new_key_probes(
     program: &mut ProgramBuilder,
-    table_btree: &BTreeTable,
-    new_values_start: usize,
-    new_rowid_reg: usize,
-    set_clauses: &[(usize, Box<ast::Expr>)],
+    deferred_new_key_plans: &[DeferredNewKeyProbePlan],
     database_id: usize,
     resolver: &Resolver,
 ) -> Result<()> {
-    let updated_positions: ColumnMask = set_clauses.iter().map(|(i, _)| *i).collect();
-    let incoming = resolver.with_schema(database_id, |s| {
-        s.resolved_fks_referencing(&table_btree.name)
-    })?;
-
-    let is_relevant = |fk: &ResolvedFkRef| -> bool {
-        fk.fk.deferred && fk.parent_key_may_change(&updated_positions, table_btree)
-    };
-    if !incoming.iter().any(&is_relevant) {
+    if deferred_new_key_plans.is_empty() {
         return Ok(());
     }
-
-    // FkIfZero guard: skip entire section if counter is already zero.
     let skip_all = program.allocate_label();
     program.emit_insn(Insn::FkIfZero {
         deferred: true,
         target_pc: skip_all,
     });
 
-    for fk_ref in incoming.iter().filter(|fk| is_relevant(fk)) {
-        if fk_ref.parent_uses_rowid {
+    for plan in deferred_new_key_plans {
+        let skip_plan = program.allocate_label();
+        program.emit_insn(Insn::IfNot {
+            reg: plan.guard_reg,
+            target_pc: skip_plan,
+            jump_if_null: true,
+        });
+        for fk_ref in &plan.incoming {
             emit_fk_parent_key_probe(
                 program,
                 fk_ref,
-                new_rowid_reg,
-                1,
+                plan.new_key_start,
+                plan.new_key_len,
                 ParentProbePass::New,
                 database_id,
                 resolver,
             )?;
-            continue;
         }
-
-        // Build contiguous NEW key registers from the parent column positions.
-        // Parent columns come from explicit FK declaration, or implicitly from PK.
-        let explicit = &fk_ref.fk.parent_columns;
-        let pk = &table_btree.primary_key_columns;
-        let n_cols = if explicit.is_empty() {
-            pk.len()
-        } else {
-            explicit.len()
-        };
-        let new_key = program.alloc_registers(n_cols);
-
-        for i in 0..n_cols {
-            let col_name = if explicit.is_empty() {
-                pk[i].0.as_str()
-            } else {
-                explicit[i].as_str()
-            };
-            let (pos, col) = table_btree
-                .get_column(col_name)
-                .ok_or_else(|| LimboError::InternalError(format!("col {col_name} missing")))?;
-            let src = if col.is_rowid_alias() {
-                new_rowid_reg
-            } else {
-                new_values_start + pos
-            };
-            program.emit_insn(Insn::Copy {
-                src_reg: src,
-                dst_reg: new_key + i,
-                extra_amount: 0,
-            });
-        }
-
-        emit_fk_parent_key_probe(
-            program,
-            fk_ref,
-            new_key,
-            n_cols,
-            ParentProbePass::New,
-            database_id,
-            resolver,
-        )?;
+        program.preassign_label_to_next_insn(skip_plan);
     }
 
     program.preassign_label_to_next_insn(skip_all);
@@ -1166,7 +1094,15 @@ fn emit_fk_delete_parent_existence_check_single(
     Ok(())
 }
 
-/// Handle all parent-side FK actions on UPDATE based on ON UPDATE action type.
+/// Parent-side FK counter checks for UPDATE.
+///
+/// CASCADE/SET NULL/SET DEFAULT actions are handled later by
+/// `fire_fk_update_actions`; this function only emits counter-based checks
+/// for NO ACTION / RESTRICT foreign keys.
+///
+/// Returns deferred NEW-key probes when `new_key_probe_mode` is `AfterReplace`,
+/// so the caller can run them only after the REPLACE write has established the
+/// final parent row at the NEW key.
 #[allow(clippy::too_many_arguments)]
 pub fn emit_fk_update_parent_actions(
     program: &mut ProgramBuilder,
@@ -1178,113 +1114,65 @@ pub fn emit_fk_update_parent_actions(
     rowid_new_reg: usize,
     rowid_set_clause_reg: Option<usize>,
     set_clauses: &[(usize, Box<Expr>)],
-    reconcile_new_key: bool,
+    new_key_probe_mode: ParentKeyNewProbeMode,
     database_id: usize,
     resolver: &Resolver,
-) -> Result<()> {
+) -> Result<Vec<DeferredNewKeyProbePlan>> {
+    let mut deferred_new_key_plans = Vec::new();
     let updated_positions: ColumnMask = set_clauses.iter().map(|(i, _)| *i).collect();
-    let incoming = resolver.with_schema(database_id, |s| {
-        s.resolved_fks_referencing(&table_btree.name)
-    })?;
-    let affects_pk = incoming
-        .iter()
-        .any(|r| r.parent_key_may_change(&updated_positions, table_btree));
-    if !affects_pk {
-        return Ok(());
+    let check_fks: Vec<_> = resolver
+        .with_schema(database_id, |s| {
+            s.resolved_fks_referencing(&table_btree.name)
+        })?
+        .into_iter()
+        .filter(|fk| fk.parent_key_may_change(&updated_positions, table_btree))
+        .filter(|fk| matches!(fk.fk.on_update, RefAct::NoAction | RefAct::Restrict))
+        .collect();
+    if check_fks.is_empty() {
+        return Ok(deferred_new_key_plans);
     }
 
-    // Collect indexes to update into a Vec so we can iterate multiple times
-    let indexes: Vec<_> = indexes_to_update.collect();
-
-    // Check if any FK has CASCADE or SET NULL/SET DEFAULT action
-    let has_cascade_or_set = incoming
-        .iter()
-        .any(|fk_ref| !matches!(fk_ref.fk.on_update, RefAct::NoAction | RefAct::Restrict));
-
-    if has_cascade_or_set {
-        // We have CASCADE or SET NULL/DEFAULT - need to handle them
-        let primary_key_is_rowid_alias = table_btree.get_rowid_alias_column().is_some();
-
-        for fk_ref in &incoming {
-            if !fk_ref.parent_key_may_change(&updated_positions, table_btree) {
-                continue;
-            }
-
-            match fk_ref.fk.on_update {
-                RefAct::NoAction | RefAct::Restrict => {
-                    // Use existing counter-based logic for just this FK
-                    // We need to emit check for this specific FK
-                    if (primary_key_is_rowid_alias || table_btree.primary_key_columns.is_empty())
-                        && fk_ref.parent_uses_rowid
-                    {
-                        emit_rowid_pk_change_check(
-                            program,
-                            &[fk_ref.clone()],
-                            old_rowid_reg,
-                            rowid_set_clause_reg.unwrap_or(old_rowid_reg),
-                            reconcile_new_key,
-                            database_id,
-                            resolver,
-                        )?;
-                    }
-
-                    for index in &indexes {
-                        emit_parent_index_key_change_checks(
-                            program,
-                            cursor_id,
-                            start,
-                            old_rowid_reg,
-                            rowid_new_reg,
-                            &[fk_ref.clone()],
-                            table_btree,
-                            index.as_ref(),
-                            reconcile_new_key,
-                            database_id,
-                            resolver,
-                        )?;
-                    }
-                }
-                RefAct::Cascade | RefAct::SetNull | RefAct::SetDefault => {
-                    // CASCADE, SET NULL, and SET DEFAULT actions are handled by
-                    // fire_fk_update_actions AFTER the parent update (not here).
-                    // This function only handles NO ACTION/RESTRICT checks.
-                }
-            }
-        }
-    } else {
-        // All FKs use NoAction/Restrict - use original counter-based approach
-        let primary_key_is_rowid_alias = table_btree.get_rowid_alias_column().is_some();
-
-        if primary_key_is_rowid_alias || table_btree.primary_key_columns.is_empty() {
-            emit_rowid_pk_change_check(
+    let primary_key_is_rowid_alias = table_btree.get_rowid_alias_column().is_some();
+    if primary_key_is_rowid_alias || table_btree.primary_key_columns.is_empty() {
+        let rowid_fks: Vec<_> = check_fks
+            .iter()
+            .filter(|fk| fk.parent_uses_rowid)
+            .cloned()
+            .collect();
+        if !rowid_fks.is_empty() {
+            if let Some(plan) = emit_rowid_pk_change_check(
                 program,
-                &incoming,
+                &rowid_fks,
                 old_rowid_reg,
                 rowid_set_clause_reg.unwrap_or(old_rowid_reg),
-                reconcile_new_key,
+                new_key_probe_mode,
                 database_id,
                 resolver,
-            )?;
-        }
-
-        for index in indexes {
-            emit_parent_index_key_change_checks(
-                program,
-                cursor_id,
-                start,
-                old_rowid_reg,
-                rowid_new_reg,
-                &incoming,
-                table_btree,
-                index.as_ref(),
-                reconcile_new_key,
-                database_id,
-                resolver,
-            )?;
+            )? {
+                deferred_new_key_plans.push(plan);
+            }
         }
     }
 
-    Ok(())
+    for index in indexes_to_update {
+        if let Some(plan) = emit_parent_index_key_change_checks(
+            program,
+            cursor_id,
+            start,
+            old_rowid_reg,
+            rowid_new_reg,
+            &check_fks,
+            table_btree,
+            index.as_ref(),
+            new_key_probe_mode,
+            database_id,
+            resolver,
+        )? {
+            deferred_new_key_plans.push(plan);
+        }
+    }
+
+    Ok(deferred_new_key_plans)
 }
 
 /// Context for FK action execution: holds register info for OLD/NEW parent key values
