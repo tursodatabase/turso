@@ -12,7 +12,8 @@ use crate::schema::{
 use crate::translate::emitter::{emit_check_constraints, emit_make_record, UpdateRowSource};
 use crate::translate::expr::{walk_expr, WalkControl};
 use crate::translate::fkeys::{
-    emit_fk_child_update_counters, emit_parent_key_change_checks, fire_fk_update_actions,
+    emit_fk_child_update_counters, emit_fk_update_parent_actions, fire_fk_update_actions,
+    ParentKeyNewProbeMode,
 };
 use crate::translate::insert::{format_unique_violation_desc, InsertEmitCtx};
 use crate::translate::plan::ColumnMask;
@@ -808,7 +809,7 @@ pub fn emit_upsert(
             let upsert_indices: Vec<_> = resolver.with_schema(upsert_database_id, |s| {
                 s.get_indices(table.get_name()).cloned().collect()
             });
-            emit_parent_key_change_checks(
+            let _ = emit_fk_update_parent_actions(
                 program,
                 &bt,
                 upsert_indices.iter().filter(|idx| {
@@ -820,7 +821,7 @@ pub fn emit_upsert(
                 new_rowid_reg.unwrap_or(ctx.conflict_rowid_reg),
                 rowid_set_clause_reg,
                 set_pairs,
-                true,
+                ParentKeyNewProbeMode::BeforeWrite,
                 upsert_database_id,
                 resolver,
             )?;
