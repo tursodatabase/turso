@@ -23,7 +23,7 @@ use crate::translate::optimizer::cost::{
 };
 use crate::translate::optimizer::cost_params::CostModelParams;
 use crate::translate::plan::{
-    InSeekSource, JoinedTable, NonFromClauseSubquery, SetOperation, TableReferences,
+    BitSet, InSeekSource, JoinedTable, NonFromClauseSubquery, SetOperation, TableReferences,
     UnionBranchPrePostFilters, WhereTerm,
 };
 use crate::translate::planner::{table_mask_from_expr, TableMask};
@@ -705,7 +705,7 @@ fn evaluate_multi_index_branches(
             additional_consumed_terms,
         } = &set_op
         {
-            for term_idx in additional_consumed_terms.iter().copied() {
+            for term_idx in additional_consumed_terms.iter() {
                 if !consumed_where_terms.contains(&term_idx) {
                     consumed_where_terms.push(term_idx);
                 }
@@ -1081,7 +1081,7 @@ pub fn consider_multi_index_intersection(
         .collect();
 
     let where_term_idx = decomposition.term_indices[0];
-    let additional_consumed_terms: Vec<usize> =
+    let additional_consumed_terms: BitSet =
         decomposition.term_indices.iter().skip(1).copied().collect();
 
     evaluate_multi_index_branches(

@@ -9,7 +9,8 @@ use super::{
     },
 };
 use crate::translate::expression_index::expression_index_column_usage;
-use crate::translate::plan::{ColumnMask, MultiIndexBranchAccess};
+use crate::translate::plan::{BitSet, ColumnMask, MultiIndexBranchAccess};
+use crate::translate::planner::TableMask;
 use crate::{
     function::{AggFunc, Deterministic},
     index_method::IndexMethodCostEstimate,
@@ -1881,7 +1882,7 @@ fn optimize_table_access(
     // Collect hash join build/probe table indices. Build tables are excluded from the main
     // join order because they are consumed during hash build. A table may appear as both
     // probe and build (probe->build chaining) only when the build input is materialized.
-    let (hash_join_build_tables, hash_join_probe_tables): (Vec<usize>, Vec<usize>) =
+    let (hash_join_build_tables, hash_join_probe_tables): (TableMask, TableMask) =
         best_access_methods
             .iter()
             .filter_map(|&am_idx| {
@@ -1945,17 +1946,16 @@ fn optimize_table_access(
             }
         }
     }
-    let hash_join_build_only_tables: HashSet<usize> = hash_join_build_tables
+    let hash_join_build_only_tables: TableMask = hash_join_build_tables
         .iter()
-        .copied()
-        .filter(|table_idx| !hash_join_probe_tables.contains(table_idx))
+        .filter(|table_idx| !hash_join_probe_tables.get(*table_idx))
         .collect();
 
     let best_join_order: Vec<JoinOrderMember> = best_table_numbers
         .iter()
         .filter(|table_number| {
-            !hash_join_build_tables.contains(table_number)
-                || hash_join_probe_tables.contains(table_number)
+            !hash_join_build_tables.get(**table_number)
+                || hash_join_probe_tables.get(**table_number)
         })
         .map(|&table_number| JoinOrderMember {
             table_id: table_references.joined_tables_mut()[table_number].internal_id,
@@ -2051,12 +2051,10 @@ fn optimize_table_access(
                     // assigned sequential index positions (0, 1, 2), the seek key would include
                     // 3 components but the ephemeral index only has 2 key columns (t2.a, t2.c),
                     // causing the seek to compare against the wrong columns and return no results.
-                    let mut unique_col_positions: Vec<usize> = usable
+                    let unique_col_positions: BitSet = usable
                         .iter()
                         .map(|(_, c)| c.table_col_pos.expect("table_col_pos was Some above"))
                         .collect();
-                    unique_col_positions.sort_unstable();
-                    unique_col_positions.dedup();
                     // Map each usable constraint to a ConstraintRef.
                     // Multiple constraints with the same table_col_pos share the same index_col_pos.
                     let mut temp_constraint_refs: Vec<ConstraintRef> = usable
@@ -2064,9 +2062,7 @@ fn optimize_table_access(
                         .map(|(orig_idx, c)| {
                             let table_col_pos =
                                 c.table_col_pos.expect("table_col_pos was Some above");
-                            let index_col_pos = unique_col_positions
-                                .binary_search(&table_col_pos)
-                                .expect("table_col_pos must exist in unique_col_positions");
+                            let index_col_pos = unique_col_positions.rank(table_col_pos);
                             ConstraintRef {
                                 constraint_vec_pos: *orig_idx, // index in the original constraints vec
                                 index_col_pos,
@@ -2103,7 +2099,7 @@ fn optimize_table_access(
                             .join_info
                             .as_ref()
                             .is_some_and(|ji| ji.is_outer()),
-                        hash_join_build_only_tables.contains(&table_idx),
+                        hash_join_build_only_tables.get(table_idx),
                     );
 
                     let ephemeral_index = Arc::new(ephemeral_index);
@@ -2123,8 +2119,7 @@ fn optimize_table_access(
                         .join_info
                         .as_ref()
                         .is_some_and(|join_info| join_info.is_outer());
-                    let defer_cross_table_constraints =
-                        hash_join_build_only_tables.contains(&table_idx);
+                    let defer_cross_table_constraints = hash_join_build_only_tables.get(table_idx);
                     mark_seek_constraints_consumed(
                         &constraints_per_table[table_idx].constraints,
                         constraint_refs,
@@ -2279,7 +2274,7 @@ fn optimize_table_access(
                 } = set_op
                 {
                     for term_idx in additional_consumed_terms.iter() {
-                        where_clause[*term_idx].consumed = true;
+                        where_clause[term_idx].consumed = true;
                     }
                 }
 

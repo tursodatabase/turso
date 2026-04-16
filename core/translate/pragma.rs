@@ -20,6 +20,7 @@ use crate::storage::pager::Pager;
 use crate::storage::sqlite3_ondisk::CacheSize;
 use crate::storage::wal::CheckpointMode;
 use crate::translate::emitter::{Resolver, TransactionMode};
+use crate::translate::plan::BitSet;
 use crate::util::{normalize_ident, parse_signed_number, parse_string, IOExt as _};
 use crate::vdbe::builder::{ProgramBuilder, ProgramBuilderOpts};
 use crate::vdbe::insn::{Cookie, Insn};
@@ -46,17 +47,18 @@ fn parse_max_errors_from_value(value: &Option<Expr>) -> usize {
     }
 }
 
-fn visible_database_ids_for_table_list(connection: &crate::Connection) -> Vec<usize> {
-    let mut ids = vec![crate::MAIN_DB_ID, crate::TEMP_DB_ID];
-    let mut attached_ids: Vec<_> = connection
-        .attached_databases()
-        .read()
-        .index_to_data
-        .keys()
-        .copied()
-        .collect();
-    attached_ids.sort_unstable();
-    ids.extend(attached_ids);
+fn visible_database_ids_for_table_list(connection: &crate::Connection) -> BitSet {
+    let mut ids = BitSet::default();
+    ids.set(crate::MAIN_DB_ID);
+    ids.set(crate::TEMP_DB_ID);
+    ids.extend(
+        connection
+            .attached_databases()
+            .read()
+            .index_to_data
+            .keys()
+            .copied(),
+    );
     ids
 }
 
@@ -1147,11 +1149,11 @@ fn query_pragma(
             program.alloc_registers(5);
 
             let database_ids = if schema_was_explicit {
-                vec![database_id]
+                [database_id].into_iter().collect::<BitSet>()
             } else {
                 visible_database_ids_for_table_list(connection.as_ref())
             };
-            for current_database_id in database_ids {
+            for current_database_id in &database_ids {
                 let database_name = connection
                     .get_database_name_by_index(current_database_id)
                     .unwrap_or_else(|| "main".to_string());

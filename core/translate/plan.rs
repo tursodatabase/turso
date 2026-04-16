@@ -1403,6 +1403,14 @@ impl FromIterator<usize> for ColumnMask {
     }
 }
 
+impl Extend<usize> for ColumnMask {
+    fn extend<I: IntoIterator<Item = usize>>(&mut self, iter: I) {
+        for idx in iter {
+            self.set(idx);
+        }
+    }
+}
+
 pub struct ColumnMaskIter<B: std::borrow::Borrow<BitSet>> {
     inner: BitSetIter<B>,
     pending_rowid: bool,
@@ -1724,6 +1732,14 @@ impl FromIterator<usize> for BitSet {
     }
 }
 
+impl Extend<usize> for BitSet {
+    fn extend<I: IntoIterator<Item = usize>>(&mut self, iter: I) {
+        for index in iter {
+            self.set(index);
+        }
+    }
+}
+
 impl From<u128> for BitSet {
     fn from(from: u128) -> Self {
         let high = (from >> 64) as u64;
@@ -1822,9 +1838,7 @@ pub enum SetOperation {
     Union,
     /// Intersection: rowid appears in result only if it's in ALL branches (AND).
     /// Carries the indices of additional WHERE terms consumed beyond the primary one.
-    Intersection {
-        additional_consumed_terms: Vec<usize>,
-    },
+    Intersection { additional_consumed_terms: BitSet },
 }
 
 /// Multi-index scan operation metadata for OR-by-union or AND-by-intersection optimization.
