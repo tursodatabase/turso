@@ -1367,29 +1367,33 @@ pub type ColumnUsedMask = BitSet;
 // just like we have `CursorID`, so that we can make [ColumnMask] type-safe.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
 pub struct ColumnMask {
-    columns: BitSet,
-    has_rowid_update: bool,
+    bitset: BitSet,
+    has_rowid_sentinel: bool,
 }
 
 impl ColumnMask {
     pub fn set(&mut self, idx: usize) {
         if idx == ROWID_SENTINEL {
-            self.has_rowid_update = true;
+            self.has_rowid_sentinel = true;
         } else {
-            self.columns.set(idx);
+            self.bitset.set(idx);
         }
     }
 
     pub fn get(&self, idx: usize) -> bool {
         if idx == ROWID_SENTINEL {
-            self.has_rowid_update
+            self.has_rowid_sentinel
         } else {
-            self.columns.get(idx)
+            self.bitset.get(idx)
         }
     }
 
     pub fn count(&self) -> usize {
-        self.columns.count() + self.has_rowid_update as usize
+        self.bitset.count() + self.has_rowid_sentinel as usize
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.bitset.is_empty() && !self.has_rowid_sentinel
     }
 }
 
@@ -1437,8 +1441,8 @@ impl<'a> IntoIterator for &'a ColumnMask {
 
     fn into_iter(self) -> Self::IntoIter {
         ColumnMaskIter {
-            inner: (&self.columns).into_iter(),
-            pending_rowid: self.has_rowid_update,
+            inner: (&self.bitset).into_iter(),
+            pending_rowid: self.has_rowid_sentinel,
         }
     }
 }
@@ -1449,8 +1453,8 @@ impl IntoIterator for ColumnMask {
 
     fn into_iter(self) -> Self::IntoIter {
         ColumnMaskIter {
-            inner: self.columns.into_iter(),
-            pending_rowid: self.has_rowid_update,
+            inner: self.bitset.into_iter(),
+            pending_rowid: self.has_rowid_sentinel,
         }
     }
 }
