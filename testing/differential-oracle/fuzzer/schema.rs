@@ -444,6 +444,15 @@ impl SchemaIntrospector {
             .context("Expected rows from PRAGMA index_info")?;
 
         rows.run_with_row_callback(|row| {
+            // Expression index columns have cid < 0 (typically -2).
+            // Skip them since they don't map to a named column.
+            let cid = match row.get_value(1) {
+                turso_core::Value::Numeric(turso_core::Numeric::Integer(i)) => *i,
+                _ => return Ok(()),
+            };
+            if cid < 0 {
+                return Ok(());
+            }
             if let turso_core::Value::Text(name) = row.get_value(2) {
                 columns.push(name.as_str().to_string());
             }
@@ -467,10 +476,14 @@ impl SchemaIntrospector {
             .prepare(&query)
             .context("Failed to prepare PRAGMA index_info")?;
 
-        stmt.query_map([], |row| row.get::<_, String>(2))
+        // Expression index columns return NULL for the column name.
+        // We skip them since they don't map to a named column.
+        let columns = stmt
+            .query_map([], |row| row.get::<_, Option<String>>(2))
             .context("Failed to query index_info")?
-            .collect::<std::result::Result<Vec<_>, _>>()
-            .context("Failed to collect index columns")
+            .filter_map(|r| r.ok().flatten())
+            .collect();
+        Ok(columns)
     }
 
     fn parse_type(type_str: &str) -> DataType {
