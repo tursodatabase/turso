@@ -4483,3 +4483,11 @@ test update-with-virtual-column-before-pk {
 } expect {
     1|2|99
 }
+
+test update-ipk-with-indexed-virtual-col {
+    CREATE TABLE t(a INTEGER PRIMARY KEY, b, c AS (b * 2));
+    CREATE INDEX idx ON t(c);
+    INSERT INTO t(a, b) VALUES (1, 5);
+    UPDATE t SET a = 100 WHERE a = 1;
+} expect {
+}
