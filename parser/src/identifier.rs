@@ -27,10 +27,17 @@ impl Eq for Identifier {}
 
 impl std::hash::Hash for Identifier {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-        for byte in self.0.bytes() {
-            state.write_u8(byte.to_ascii_lowercase());
+        // Lowercase into a stack buffer and feed the hasher in blocks so it
+        // can process full words at a time and the inner loop can vectorize.
+        let bytes = self.0.as_bytes();
+        let mut buf = [0u8; 64];
+        for chunk in bytes.chunks(buf.len()) {
+            for (dst, &src) in buf.iter_mut().zip(chunk) {
+                *dst = src.to_ascii_lowercase();
+            }
+            state.write(&buf[..chunk.len()]);
         }
-        state.write_usize(self.0.len());
+        state.write_u8(0xff);
     }
 }
 
