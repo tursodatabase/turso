@@ -2,13 +2,11 @@ use super::{Completion, File, OpenFlags, IO};
 use crate::error::{io_error, CompletionError, LimboError};
 use crate::io::clock::{Clock, DefaultClock, MonotonicInstant, WallClockInstant};
 use crate::io::common;
+use crate::io::file_lock;
 use crate::io::FileSyncType;
 use crate::Result;
 use crate::sync::Mutex;
-use rustix::{
-    fd::{AsFd, AsRawFd},
-    fs::{self, FlockOperation},
-};
+use rustix::fd::AsRawFd;
 use std::os::fd::RawFd;
 
 use std::{io::ErrorKind, sync::Arc};
@@ -133,42 +131,22 @@ pub struct UnixFile {
 
 impl File for UnixFile {
     fn lock_file(&self, exclusive: bool) -> Result<()> {
-        let fd = self.file.lock();
-        let fd = fd.as_fd();
-        // F_SETLK is a non-blocking lock. The lock will be released when the file is closed
-        // or the process exits or after an explicit unlock.
-        fs::fcntl_lock(
-            fd,
-            if exclusive {
-                FlockOperation::NonBlockingLockExclusive
+        let file = self.file.lock();
+        file_lock::try_lock(&file, exclusive).map_err(|e| {
+            let message = if file_lock::is_contention_error(&e) {
+                "Failed locking file. File is locked by another process".to_string()
             } else {
-                FlockOperation::NonBlockingLockShared
-            },
-        )
-        .map_err(|e| {
-            let io_error = std::io::Error::from(e);
-            let message = match io_error.kind() {
-                ErrorKind::WouldBlock => {
-                    "Failed locking file. File is locked by another process".to_string()
-                }
-                _ => format!("Failed locking file, {io_error}"),
+                format!("Failed locking file, {e}")
             };
             LimboError::LockingError(message)
-        })?;
-
-        Ok(())
+        })
     }
 
     fn unlock_file(&self) -> Result<()> {
-        let fd = self.file.lock();
-        let fd = fd.as_fd();
-        fs::fcntl_lock(fd, FlockOperation::NonBlockingUnlock).map_err(|e| {
-            LimboError::LockingError(format!(
-                "Failed to release file lock: {}",
-                std::io::Error::from(e)
-            ))
-        })?;
-        Ok(())
+        let file = self.file.lock();
+        file_lock::unlock(&file).map_err(|e| {
+            LimboError::LockingError(format!("Failed to release file lock: {e}"))
+        })
     }
 
     #[instrument(err, skip_all, level = Level::TRACE)]

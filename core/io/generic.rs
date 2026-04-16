@@ -1,5 +1,7 @@
-use crate::error::io_error;
+use crate::error::{io_error, LimboError};
 use crate::io::clock::{DefaultClock, MonotonicInstant, WallClockInstant};
+use crate::io::common;
+use crate::io::file_lock;
 use crate::{Clock, Completion, File, OpenFlags, Result, IO};
 use crate::sync::RwLock;
 use std::io::{Read, Seek, Write};
@@ -27,9 +29,15 @@ impl IO for GenericIO {
         }
 
         let file = file.open(path).map_err(|e| io_error(e, "open"))?;
-        Ok(Arc::new(GenericFile {
+        let generic_file = Arc::new(GenericFile {
             file: RwLock::new(file),
-        }))
+        });
+        if std::env::var(common::ENV_DISABLE_FILE_LOCK).is_err()
+            && !flags.contains(OpenFlags::ReadOnly)
+        {
+            generic_file.lock_file(true)?;
+        }
+        Ok(generic_file)
     }
 
     #[instrument(err, skip_all, level = Level::TRACE)]
@@ -59,15 +67,30 @@ pub struct GenericFile {
     file: RwLock<std::fs::File>,
 }
 
+impl Drop for GenericFile {
+    fn drop(&mut self) {
+        let _ = self.unlock_file();
+    }
+}
+
 impl File for GenericFile {
     #[instrument(err, skip_all, level = Level::TRACE)]
     fn lock_file(&self, exclusive: bool) -> Result<()> {
-        Ok(())
+        file_lock::try_lock(&self.file.read(), exclusive).map_err(|e| {
+            let message = if file_lock::is_contention_error(&e) {
+                "Failed locking file. File is locked by another process".to_string()
+            } else {
+                format!("Failed locking file, {e}")
+            };
+            LimboError::LockingError(message)
+        })
     }
 
     #[instrument(err, skip_all, level = Level::TRACE)]
     fn unlock_file(&self) -> Result<()> {
-        Ok(())
+        file_lock::unlock(&self.file.read()).map_err(|e| {
+            LimboError::LockingError(format!("Failed to release file lock: {e}"))
+        })
     }
 
     #[instrument(skip(self, c), level = Level::TRACE)]

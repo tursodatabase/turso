@@ -225,6 +225,9 @@ impl MvccTestDbNoConn {
         {
             let mut manager = DATABASE_MANAGER.lock();
             manager.clear();
+
+            // also drop db immediately
+            let _ = self.db.take();
         }
         // Now open again.
         let io = Arc::new(PlatformIO::new().unwrap());

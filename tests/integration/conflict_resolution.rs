@@ -11,7 +11,9 @@
 
 use std::sync::Arc;
 
-use crate::common::{limbo_exec_rows, sqlite_exec_rows, TempDatabase};
+use crate::common::{
+    drop_and_sqlite_integrity_check, limbo_exec_rows, sqlite_exec_rows, TempDatabase,
+};
 use rusqlite::params;
 
 // ---------------------------------------------------------------------------
@@ -229,16 +231,6 @@ const ROW_COUNTS: &[u32] = &[10, 134, 500, 1000];
 // Helpers
 // ---------------------------------------------------------------------------
 
-/// Run SQLite's integrity_check on the database file.
-/// The Limbo connection + database must be dropped first so rusqlite can open the file
-/// and recover the WAL.
-fn sqlite_integrity_check(path: &std::path::Path) -> String {
-    match crate::common::rusqlite_integrity_check(path) {
-        Ok(()) => "ok".to_string(),
-        Err(e) => e.to_string(),
-    }
-}
-
 /// Execute a statement, returning Ok or Err (for statements that may fail due to constraint).
 fn sqlite_try_exec(conn: &rusqlite::Connection, sql: &str) -> Result<(), String> {
     conn.execute_batch(sql).map_err(|e| e.to_string())
@@ -397,12 +389,8 @@ fn test_conflict_resolution_matrix(tmp_db: TempDatabase) -> anyhow::Result<()> {
 
                 // --- Integrity check (SQLite canonical) ---
                 // Drop all Limbo handles so rusqlite can open the file and recover WAL.
-                let db_path = limbo_db.path.clone();
-                drop(limbo_conn);
-                drop(limbo_db);
-                let ic = sqlite_integrity_check(&db_path);
-                if ic != "ok" {
-                    failures.push(format!("[{label}] integrity_check: {ic}"));
+                if let Err(e) = drop_and_sqlite_integrity_check(limbo_db, [limbo_conn]) {
+                    failures.push(format!("[{label}] integrity_check: {e}"));
                 }
             }
         }
@@ -484,12 +472,8 @@ fn test_multi_row_partial_conflict(tmp_db: TempDatabase) -> anyhow::Result<()> {
                 failures.push(e);
             }
 
-            let db_path = limbo_db.path.clone();
-            drop(limbo_conn);
-            drop(limbo_db);
-            let ic = sqlite_integrity_check(&db_path);
-            if ic != "ok" {
-                failures.push(format!("[{label}] integrity_check: {ic}"));
+            if let Err(e) = drop_and_sqlite_integrity_check(limbo_db, [limbo_conn]) {
+                failures.push(format!("[{label}] integrity_check: {e}"));
             }
         }
     }
@@ -561,12 +545,8 @@ fn test_or_rollback_in_transaction(tmp_db: TempDatabase) -> anyhow::Result<()> {
             failures.push(e);
         }
 
-        let db_path = limbo_db.path.clone();
-        drop(limbo_conn);
-        drop(limbo_db);
-        let ic = sqlite_integrity_check(&db_path);
-        if ic != "ok" {
-            failures.push(format!("[{label}] integrity_check: {ic}"));
+        if let Err(e) = drop_and_sqlite_integrity_check(limbo_db, [limbo_conn]) {
+            failures.push(format!("[{label}] integrity_check: {e}"));
         }
     }
 
@@ -672,11 +652,9 @@ fn test_update_rowid_alias_pk_on_conflict_rollback(tmp_db: TempDatabase) -> anyh
     }
 
     // Integrity check.
-    let db_path = limbo_db.path.clone();
-    drop(limbo_conn);
-    drop(limbo_db);
-    let ic = sqlite_integrity_check(&db_path);
-    assert_eq!(ic, "ok", "[{label}] integrity_check: {ic}");
+    if let Err(e) = drop_and_sqlite_integrity_check(limbo_db, [limbo_conn]) {
+        panic!("[{label}] integrity_check: {e}");
+    }
 
     Ok(())
 }
@@ -747,12 +725,8 @@ fn test_update_rowid_alias_pk_all_conflict_modes(tmp_db: TempDatabase) -> anyhow
             failures.push(e);
         }
 
-        let db_path = limbo_db.path.clone();
-        drop(limbo_conn);
-        drop(limbo_db);
-        let ic = sqlite_integrity_check(&db_path);
-        if ic != "ok" {
-            failures.push(format!("[{label}] integrity_check: {ic}"));
+        if let Err(e) = drop_and_sqlite_integrity_check(limbo_db, [limbo_conn]) {
+            failures.push(format!("[{label}] integrity_check: {e}"));
         }
     }
 
@@ -827,11 +801,9 @@ fn test_ipk_replace_with_index_abort(tmp_db: TempDatabase) -> anyhow::Result<()>
         panic!("{e}");
     }
 
-    let db_path = limbo_db.path.clone();
-    drop(limbo_conn);
-    drop(limbo_db);
-    let ic = sqlite_integrity_check(&db_path);
-    assert_eq!(ic, "ok", "[{label}] integrity_check: {ic}");
+    if let Err(e) = drop_and_sqlite_integrity_check(limbo_db, [limbo_conn]) {
+        panic!("[{label}] integrity_check: {e}");
+    }
 
     Ok(())
 }
@@ -881,11 +853,9 @@ fn test_ipk_replace_with_index_fail(tmp_db: TempDatabase) -> anyhow::Result<()> 
         panic!("{e}");
     }
 
-    let db_path = limbo_db.path.clone();
-    drop(limbo_conn);
-    drop(limbo_db);
-    let ic = sqlite_integrity_check(&db_path);
-    assert_eq!(ic, "ok", "[{label}] integrity_check: {ic}");
+    if let Err(e) = drop_and_sqlite_integrity_check(limbo_db, [limbo_conn]) {
+        panic!("[{label}] integrity_check: {e}");
+    }
 
     Ok(())
 }
@@ -937,11 +907,9 @@ fn test_index_replace_with_index_abort(tmp_db: TempDatabase) -> anyhow::Result<(
         panic!("{e}");
     }
 
-    let db_path = limbo_db.path.clone();
-    drop(limbo_conn);
-    drop(limbo_db);
-    let ic = sqlite_integrity_check(&db_path);
-    assert_eq!(ic, "ok", "[{label}] integrity_check: {ic}");
+    if let Err(e) = drop_and_sqlite_integrity_check(limbo_db, [limbo_conn]) {
+        panic!("[{label}] integrity_check: {e}");
+    }
 
     Ok(())
 }
@@ -993,11 +961,9 @@ fn test_update_ipk_replace_deferred(tmp_db: TempDatabase) -> anyhow::Result<()> 
         panic!("{e}");
     }
 
-    let db_path = limbo_db.path.clone();
-    drop(limbo_conn);
-    drop(limbo_db);
-    let ic = sqlite_integrity_check(&db_path);
-    assert_eq!(ic, "ok", "[{label}] integrity_check: {ic}");
+    if let Err(e) = drop_and_sqlite_integrity_check(limbo_db, [limbo_conn]) {
+        panic!("[{label}] integrity_check: {e}");
+    }
 
     Ok(())
 }
@@ -1049,11 +1015,9 @@ fn test_update_index_replace_ordering(tmp_db: TempDatabase) -> anyhow::Result<()
         panic!("{e}");
     }
 
-    let db_path = limbo_db.path.clone();
-    drop(limbo_conn);
-    drop(limbo_db);
-    let ic = sqlite_integrity_check(&db_path);
-    assert_eq!(ic, "ok", "[{label}] integrity_check: {ic}");
+    if let Err(e) = drop_and_sqlite_integrity_check(limbo_db, [limbo_conn]) {
+        panic!("[{label}] integrity_check: {e}");
+    }
 
     Ok(())
 }
@@ -1106,11 +1070,9 @@ fn test_update_unique_index_on_conflict_replace_integrity(
     }
 
     // Integrity check: stale index entries must be cleaned up.
-    let db_path = limbo_db.path.clone();
-    drop(limbo_conn);
-    drop(limbo_db);
-    let ic = sqlite_integrity_check(&db_path);
-    assert_eq!(ic, "ok", "[{label}] integrity_check: {ic}");
+    if let Err(e) = drop_and_sqlite_integrity_check(limbo_db, [limbo_conn]) {
+        panic!("[{label}] integrity_check: {e}");
+    }
 
     Ok(())
 }
@@ -1164,11 +1126,9 @@ fn run_mixed_constraint_case(
         panic!("{e}");
     }
 
-    let db_path = limbo_db.path.clone();
-    drop(limbo_conn);
-    drop(limbo_db);
-    let ic = sqlite_integrity_check(&db_path);
-    assert_eq!(ic, "ok", "[{label}] integrity_check: {ic}");
+    if let Err(e) = drop_and_sqlite_integrity_check(limbo_db, [limbo_conn]) {
+        panic!("[{label}] integrity_check: {e}");
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1244,11 +1204,9 @@ fn test_ipk_replace_with_index_rollback(tmp_db: TempDatabase) -> anyhow::Result<
         panic!("{e}");
     }
 
-    let db_path = limbo_db.path.clone();
-    drop(limbo_conn);
-    drop(limbo_db);
-    let ic = sqlite_integrity_check(&db_path);
-    assert_eq!(ic, "ok", "[{label}] integrity_check: {ic}");
+    if let Err(e) = drop_and_sqlite_integrity_check(limbo_db, [limbo_conn]) {
+        panic!("[{label}] integrity_check: {e}");
+    }
 
     Ok(())
 }
@@ -1346,11 +1304,9 @@ fn test_index_replace_with_index_rollback(tmp_db: TempDatabase) -> anyhow::Resul
         panic!("{e}");
     }
 
-    let db_path = limbo_db.path.clone();
-    drop(limbo_conn);
-    drop(limbo_db);
-    let ic = sqlite_integrity_check(&db_path);
-    assert_eq!(ic, "ok", "[{label}] integrity_check: {ic}");
+    if let Err(e) = drop_and_sqlite_integrity_check(limbo_db, [limbo_conn]) {
+        panic!("[{label}] integrity_check: {e}");
+    }
 
     Ok(())
 }
@@ -1450,11 +1406,9 @@ fn test_update_ipk_replace_with_index_rollback(tmp_db: TempDatabase) -> anyhow::
         panic!("{e}");
     }
 
-    let db_path = limbo_db.path.clone();
-    drop(limbo_conn);
-    drop(limbo_db);
-    let ic = sqlite_integrity_check(&db_path);
-    assert_eq!(ic, "ok", "[{label}] integrity_check: {ic}");
+    if let Err(e) = drop_and_sqlite_integrity_check(limbo_db, [limbo_conn]) {
+        panic!("[{label}] integrity_check: {e}");
+    }
 
     Ok(())
 }
@@ -1555,11 +1509,9 @@ fn test_update_index_replace_with_rollback(tmp_db: TempDatabase) -> anyhow::Resu
         panic!("{e}");
     }
 
-    let db_path = limbo_db.path.clone();
-    drop(limbo_conn);
-    drop(limbo_db);
-    let ic = sqlite_integrity_check(&db_path);
-    assert_eq!(ic, "ok", "[{label}] integrity_check: {ic}");
+    if let Err(e) = drop_and_sqlite_integrity_check(limbo_db, [limbo_conn]) {
+        panic!("[{label}] integrity_check: {e}");
+    }
 
     Ok(())
 }
@@ -1676,11 +1628,9 @@ fn test_three_indexes_three_modes(tmp_db: TempDatabase) -> anyhow::Result<()> {
         panic!("{e}");
     }
 
-    let db_path = limbo_db.path.clone();
-    drop(limbo_conn);
-    drop(limbo_db);
-    let ic = sqlite_integrity_check(&db_path);
-    assert_eq!(ic, "ok", "[{label}] integrity_check: {ic}");
+    if let Err(e) = drop_and_sqlite_integrity_check(limbo_db, [limbo_conn]) {
+        panic!("[{label}] integrity_check: {e}");
+    }
 
     Ok(())
 }
@@ -1732,11 +1682,9 @@ fn test_multi_row_fail_with_mixed_constraints(tmp_db: TempDatabase) -> anyhow::R
         panic!("{e}");
     }
 
-    let db_path = limbo_db.path.clone();
-    drop(limbo_conn);
-    drop(limbo_db);
-    let ic = sqlite_integrity_check(&db_path);
-    assert_eq!(ic, "ok", "[{label}] integrity_check: {ic}");
+    if let Err(e) = drop_and_sqlite_integrity_check(limbo_db, [limbo_conn]) {
+        panic!("[{label}] integrity_check: {e}");
+    }
 
     Ok(())
 }
@@ -1781,11 +1729,9 @@ fn test_multi_row_ipk_replace_unique_fail(tmp_db: TempDatabase) -> anyhow::Resul
         panic!("{e}");
     }
 
-    let db_path = limbo_db.path.clone();
-    drop(limbo_conn);
-    drop(limbo_db);
-    let ic = sqlite_integrity_check(&db_path);
-    assert_eq!(ic, "ok", "[{label}] integrity_check: {ic}");
+    if let Err(e) = drop_and_sqlite_integrity_check(limbo_db, [limbo_conn]) {
+        panic!("[{label}] integrity_check: {e}");
+    }
 
     Ok(())
 }
@@ -1874,11 +1820,9 @@ fn test_commit_phase_non_replace_index_integrity(tmp_db: TempDatabase) -> anyhow
         "[{label}] Index query diverged: limbo={limbo_rows:?}, sqlite={sqlite_rows:?}"
     );
 
-    let db_path = limbo_db.path.clone();
-    drop(limbo_conn);
-    drop(limbo_db);
-    let ic = sqlite_integrity_check(&db_path);
-    assert_eq!(ic, "ok", "[{label}] integrity_check: {ic}");
+    if let Err(e) = drop_and_sqlite_integrity_check(limbo_db, [limbo_conn]) {
+        panic!("[{label}] integrity_check: {e}");
+    }
 
     Ok(())
 }
@@ -2346,11 +2290,9 @@ fn run_fk_constraint_case(
         panic!("{e}");
     }
 
-    let db_path = limbo_db.path.clone();
-    drop(limbo_conn);
-    drop(limbo_db);
-    let ic = sqlite_integrity_check(&db_path);
-    assert_eq!(ic, "ok", "[{label}] integrity_check: {ic}");
+    if let Err(e) = drop_and_sqlite_integrity_check(limbo_db, [limbo_conn]) {
+        panic!("[{label}] integrity_check: {e}");
+    }
 }
 
 /// Multi-row UPDATE that violates child-side FK: all rows must be rolled back.
@@ -2661,11 +2603,9 @@ fn test_notnull_replace_cascade_unique_abort_insert(tmp_db: TempDatabase) -> any
         panic!("{e}");
     }
 
-    let db_path = limbo_db.path.clone();
-    drop(limbo_conn);
-    drop(limbo_db);
-    let ic = sqlite_integrity_check(&db_path);
-    assert_eq!(ic, "ok", "[{label}] integrity_check: {ic}");
+    if let Err(e) = drop_and_sqlite_integrity_check(limbo_db, [limbo_conn]) {
+        panic!("[{label}] integrity_check: {e}");
+    }
 
     Ok(())
 }
@@ -2715,11 +2655,9 @@ fn test_notnull_replace_cascade_unique_fail_insert(tmp_db: TempDatabase) -> anyh
         panic!("{e}");
     }
 
-    let db_path = limbo_db.path.clone();
-    drop(limbo_conn);
-    drop(limbo_db);
-    let ic = sqlite_integrity_check(&db_path);
-    assert_eq!(ic, "ok", "[{label}] integrity_check: {ic}");
+    if let Err(e) = drop_and_sqlite_integrity_check(limbo_db, [limbo_conn]) {
+        panic!("[{label}] integrity_check: {e}");
+    }
 
     Ok(())
 }
@@ -2768,11 +2706,9 @@ fn test_notnull_replace_cascade_unique_ignore_insert(tmp_db: TempDatabase) -> an
         panic!("{e}");
     }
 
-    let db_path = limbo_db.path.clone();
-    drop(limbo_conn);
-    drop(limbo_db);
-    let ic = sqlite_integrity_check(&db_path);
-    assert_eq!(ic, "ok", "[{label}] integrity_check: {ic}");
+    if let Err(e) = drop_and_sqlite_integrity_check(limbo_db, [limbo_conn]) {
+        panic!("[{label}] integrity_check: {e}");
+    }
 
     Ok(())
 }
@@ -2826,11 +2762,9 @@ fn test_notnull_replace_cascade_unique_rollback_insert(tmp_db: TempDatabase) -> 
         panic!("{e}");
     }
 
-    let db_path = limbo_db.path.clone();
-    drop(limbo_conn);
-    drop(limbo_db);
-    let ic = sqlite_integrity_check(&db_path);
-    assert_eq!(ic, "ok", "[{label}] integrity_check: {ic}");
+    if let Err(e) = drop_and_sqlite_integrity_check(limbo_db, [limbo_conn]) {
+        panic!("[{label}] integrity_check: {e}");
+    }
 
     Ok(())
 }
@@ -2880,11 +2814,9 @@ fn test_notnull_replace_cascade_unique_replace_insert(tmp_db: TempDatabase) -> a
         panic!("{e}");
     }
 
-    let db_path = limbo_db.path.clone();
-    drop(limbo_conn);
-    drop(limbo_db);
-    let ic = sqlite_integrity_check(&db_path);
-    assert_eq!(ic, "ok", "[{label}] integrity_check: {ic}");
+    if let Err(e) = drop_and_sqlite_integrity_check(limbo_db, [limbo_conn]) {
+        panic!("[{label}] integrity_check: {e}");
+    }
 
     Ok(())
 }
@@ -2936,11 +2868,9 @@ fn test_notnull_replace_cascade_pk_abort_insert(tmp_db: TempDatabase) -> anyhow:
         panic!("{e}");
     }
 
-    let db_path = limbo_db.path.clone();
-    drop(limbo_conn);
-    drop(limbo_db);
-    let ic = sqlite_integrity_check(&db_path);
-    assert_eq!(ic, "ok", "[{label}] integrity_check: {ic}");
+    if let Err(e) = drop_and_sqlite_integrity_check(limbo_db, [limbo_conn]) {
+        panic!("[{label}] integrity_check: {e}");
+    }
 
     Ok(())
 }
@@ -2991,11 +2921,9 @@ fn test_notnull_replace_cascade_unique_abort_update(tmp_db: TempDatabase) -> any
         panic!("{e}");
     }
 
-    let db_path = limbo_db.path.clone();
-    drop(limbo_conn);
-    drop(limbo_db);
-    let ic = sqlite_integrity_check(&db_path);
-    assert_eq!(ic, "ok", "[{label}] integrity_check: {ic}");
+    if let Err(e) = drop_and_sqlite_integrity_check(limbo_db, [limbo_conn]) {
+        panic!("[{label}] integrity_check: {e}");
+    }
 
     Ok(())
 }
@@ -3046,11 +2974,9 @@ fn test_notnull_replace_cascade_unique_ignore_update(tmp_db: TempDatabase) -> an
         panic!("{e}");
     }
 
-    let db_path = limbo_db.path.clone();
-    drop(limbo_conn);
-    drop(limbo_db);
-    let ic = sqlite_integrity_check(&db_path);
-    assert_eq!(ic, "ok", "[{label}] integrity_check: {ic}");
+    if let Err(e) = drop_and_sqlite_integrity_check(limbo_db, [limbo_conn]) {
+        panic!("[{label}] integrity_check: {e}");
+    }
 
     Ok(())
 }
@@ -3137,11 +3063,9 @@ fn test_notnull_replace_cascade_multi_column(tmp_db: TempDatabase) -> anyhow::Re
         panic!("{e}");
     }
 
-    let db_path = limbo_db.path.clone();
-    drop(limbo_conn);
-    drop(limbo_db);
-    let ic = sqlite_integrity_check(&db_path);
-    assert_eq!(ic, "ok", "[{label}] integrity_check: {ic}");
+    if let Err(e) = drop_and_sqlite_integrity_check(limbo_db, [limbo_conn]) {
+        panic!("[{label}] integrity_check: {e}");
+    }
 
     Ok(())
 }
@@ -3215,11 +3139,9 @@ fn test_notnull_replace_cascade_in_txn_rollback(tmp_db: TempDatabase) -> anyhow:
     let _ = limbo_try_exec(&limbo_conn, "COMMIT");
     let _ = sqlite_try_exec(&sqlite_conn, "COMMIT");
 
-    let db_path = limbo_db.path.clone();
-    drop(limbo_conn);
-    drop(limbo_db);
-    let ic = sqlite_integrity_check(&db_path);
-    assert_eq!(ic, "ok", "[{label}] integrity_check: {ic}");
+    if let Err(e) = drop_and_sqlite_integrity_check(limbo_db, [limbo_conn]) {
+        panic!("[{label}] integrity_check: {e}");
+    }
 
     Ok(())
 }
@@ -3287,11 +3209,9 @@ fn run_fk_cascade_replace_case(
         }
     }
 
-    let db_path = limbo_db.path.clone();
-    drop(limbo_conn);
-    drop(limbo_db);
-    let ic = sqlite_integrity_check(&db_path);
-    assert_eq!(ic, "ok", "[{label}] integrity_check: {ic}");
+    if let Err(e) = drop_and_sqlite_integrity_check(limbo_db, [limbo_conn]) {
+        panic!("[{label}] integrity_check: {e}");
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -3769,11 +3689,9 @@ fn test_fk_cascade_replace_then_abort_stmt_rollback(tmp_db: TempDatabase) -> any
         }
     }
 
-    let db_path = limbo_db.path.clone();
-    drop(limbo_conn);
-    drop(limbo_db);
-    let ic = sqlite_integrity_check(&db_path);
-    assert_eq!(ic, "ok", "[{label}] integrity_check: {ic}");
+    if let Err(e) = drop_and_sqlite_integrity_check(limbo_db, [limbo_conn]) {
+        panic!("[{label}] integrity_check: {e}");
+    }
 
     Ok(())
 }
@@ -3975,8 +3893,7 @@ fn test_statement_or_overrides_ddl_multirow_insert_or_fail_uq_replace(tmp_db: Te
         "SELECT * FROM t ORDER BY a",
     );
     assert!(diff.is_none(), "{diff:?}");
-    let ic = sqlite_integrity_check(&limbo_db.path);
-    assert_eq!(ic, "ok");
+    drop_and_sqlite_integrity_check(limbo_db, [limbo_conn]).unwrap();
 }
 
 #[turso_macros::test]
@@ -4155,8 +4072,7 @@ fn test_trigger_before_insert_raise_fail_multirow(tmp_db: TempDatabase) {
         "SELECT * FROM t ORDER BY a",
     );
     assert!(diff.is_none(), "{diff:?}");
-    let ic = sqlite_integrity_check(&limbo_db.path);
-    assert_eq!(ic, "ok");
+    drop_and_sqlite_integrity_check(limbo_db, [limbo_conn]).unwrap();
 }
 
 /// BEFORE UPDATE trigger + UNIQUE ON CONFLICT REPLACE: trigger fires, then REPLACE
@@ -4249,8 +4165,7 @@ fn test_trigger_before_insert_raise_rollback_in_txn(tmp_db: TempDatabase) {
         "SELECT * FROM t ORDER BY a",
     );
     assert!(diff.is_none(), "{diff:?}");
-    let ic = sqlite_integrity_check(&limbo_db.path);
-    assert_eq!(ic, "ok");
+    drop_and_sqlite_integrity_check(limbo_db, [limbo_conn]).unwrap();
 }
 
 /// BEFORE UPDATE trigger on a table with mixed DDL modes (PK REPLACE + UQ ABORT).
@@ -4323,8 +4238,7 @@ fn test_trigger_before_update_changes_value_unique_conflict(tmp_db: TempDatabase
         "SELECT * FROM t ORDER BY a",
     );
     assert!(diff.is_none(), "{diff:?}");
-    let ic = sqlite_integrity_check(&limbo_db.path);
-    assert_eq!(ic, "ok");
+    drop_and_sqlite_integrity_check(limbo_db, [limbo_conn]).unwrap();
 }
 
 // ---------------------------------------------------------------------------
@@ -4358,8 +4272,7 @@ fn test_autocommit_fail_insert_partial_committed(tmp_db: TempDatabase) {
         "SELECT * FROM t ORDER BY a",
     );
     assert!(diff.is_none(), "{diff:?}");
-    let ic = sqlite_integrity_check(&limbo_db.path);
-    assert_eq!(ic, "ok");
+    drop_and_sqlite_integrity_check(limbo_db, [limbo_conn]).unwrap();
 }
 
 /// INSERT OR FAIL in explicit transaction: partial rows survive within the transaction.
@@ -4406,8 +4319,7 @@ fn test_explicit_txn_fail_insert_partial_in_txn(tmp_db: TempDatabase) {
         "SELECT * FROM t ORDER BY a",
     );
     assert!(diff.is_none(), "{diff:?}");
-    let ic = sqlite_integrity_check(&limbo_db.path);
-    assert_eq!(ic, "ok");
+    drop_and_sqlite_integrity_check(limbo_db, [limbo_conn]).unwrap();
 }
 
 /// UPDATE OR FAIL in autocommit mode: partial row updates are committed.
@@ -4439,8 +4351,7 @@ fn test_autocommit_fail_update_partial_committed(tmp_db: TempDatabase) {
         "SELECT * FROM t ORDER BY a",
     );
     assert!(diff.is_none(), "{diff:?}");
-    let ic = sqlite_integrity_check(&limbo_db.path);
-    assert_eq!(ic, "ok");
+    drop_and_sqlite_integrity_check(limbo_db, [limbo_conn]).unwrap();
 }
 
 /// UPDATE OR FAIL in explicit transaction: partial updates survive, transaction can commit.
@@ -4477,8 +4388,7 @@ fn test_explicit_txn_fail_update_partial_in_txn(tmp_db: TempDatabase) {
         "SELECT * FROM t ORDER BY a",
     );
     assert!(diff.is_none(), "{diff:?}");
-    let ic = sqlite_integrity_check(&limbo_db.path);
-    assert_eq!(ic, "ok");
+    drop_and_sqlite_integrity_check(limbo_db, [limbo_conn]).unwrap();
 }
 
 /// INSERT OR FAIL with PK conflict in autocommit: partial rows committed.
@@ -4507,8 +4417,7 @@ fn test_autocommit_fail_insert_pk_conflict(tmp_db: TempDatabase) {
         "SELECT * FROM t ORDER BY a",
     );
     assert!(diff.is_none(), "{diff:?}");
-    let ic = sqlite_integrity_check(&limbo_db.path);
-    assert_eq!(ic, "ok");
+    drop_and_sqlite_integrity_check(limbo_db, [limbo_conn]).unwrap();
 }
 
 /// UPDATE OR FAIL with NOT NULL violation in autocommit mode.
@@ -4540,8 +4449,7 @@ fn test_autocommit_fail_update_notnull(tmp_db: TempDatabase) {
         "SELECT * FROM t ORDER BY a",
     );
     assert!(diff.is_none(), "{diff:?}");
-    let ic = sqlite_integrity_check(&limbo_db.path);
-    assert_eq!(ic, "ok");
+    drop_and_sqlite_integrity_check(limbo_db, [limbo_conn]).unwrap();
 }
 
 /// INSERT OR FAIL with mixed PK and UNIQUE conflicts: first conflict stops execution.
@@ -4572,8 +4480,7 @@ fn test_autocommit_fail_insert_mixed_constraints(tmp_db: TempDatabase) {
         "SELECT * FROM t ORDER BY a",
     );
     assert!(diff.is_none(), "{diff:?}");
-    let ic = sqlite_integrity_check(&limbo_db.path);
-    assert_eq!(ic, "ok");
+    drop_and_sqlite_integrity_check(limbo_db, [limbo_conn]).unwrap();
 }
 
 /// UPDATE OR FAIL with CHECK constraint violation in autocommit mode.
@@ -4605,8 +4512,7 @@ fn test_autocommit_fail_update_check_constraint(tmp_db: TempDatabase) {
         "SELECT * FROM t ORDER BY a",
     );
     assert!(diff.is_none(), "{diff:?}");
-    let ic = sqlite_integrity_check(&limbo_db.path);
-    assert_eq!(ic, "ok");
+    drop_and_sqlite_integrity_check(limbo_db, [limbo_conn]).unwrap();
 }
 
 // ---------------------------------------------------------------------------
