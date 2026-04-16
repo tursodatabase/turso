@@ -10,7 +10,7 @@
     "test:better-sqlite3": "PROVIDER=better-sqlite3 ava __test__/sync.test.js"
   },
   "devDependencies": {
-    "ava": "^5.3.0"
+    "ava": "^6.4.1"
   },
   "dependencies": {
     "@tursodatabase/serverless": "../../serverless/javascript",
