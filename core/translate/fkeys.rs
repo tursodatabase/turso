@@ -377,24 +377,21 @@ pub fn stabilize_new_row_for_fk(
         .filter_map(|(i, _)| if *i == ROWID_SENTINEL { None } else { Some(*i) })
         .collect();
 
+    let layout = table_btree.column_layout();
     for (pk_name, _) in &table_btree.primary_key_columns {
         let (pos, col) = table_btree
             .get_column(pk_name)
             .ok_or_else(|| LimboError::InternalError(format!("pk col {pk_name} missing")))?;
         if !set_cols.get(pos) {
+            let dst_reg = layout.to_register(start, pos);
             if col.is_rowid_alias() {
                 program.emit_insn(Insn::Copy {
                     src_reg: rowid_new_reg,
-                    dst_reg: start + pos,
+                    dst_reg,
                     extra_amount: 0,
                 });
             } else {
-                program.emit_insn(Insn::Column {
-                    cursor_id,
-                    column: pos,
-                    dest: start + pos,
-                    default: None,
-                });
+                program.emit_column_or_rowid(cursor_id, pos, dst_reg);
             }
         }
     }
