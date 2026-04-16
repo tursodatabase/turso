@@ -4499,7 +4499,6 @@ impl Index {
             return true;
         };
 
-        let tbl_norm = self.table_name.as_str();
         let has_col = |name: &str| {
             table.columns().iter().any(|c| {
                 c.name
@@ -4507,7 +4506,7 @@ impl Index {
                     .is_some_and(|cn| cn.eq_ignore_ascii_case(name))
             })
         };
-        let is_tbl = |ns: &str| ns.eq_ignore_ascii_case(tbl_norm);
+        let is_tbl = |ns: &str| self.table_name == ns;
         let is_deterministic_fn = |name: &str, argc: usize| {
             let n = name.to_ascii_lowercase();
             Func::resolve_function(&n, argc).is_ok_and(|f| f.is_some_and(|f| f.is_deterministic()))
