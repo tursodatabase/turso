@@ -21,12 +21,13 @@ use crate::storage::sqlite3_ondisk::CacheSize;
 use crate::storage::wal::CheckpointMode;
 use crate::translate::emitter::{Resolver, TransactionMode};
 use crate::translate::plan::BitSet;
-use crate::util::{normalize_ident, parse_signed_number, parse_string, IOExt as _};
+use crate::util::{parse_signed_number, parse_string, IOExt as _};
 use crate::vdbe::builder::{ProgramBuilder, ProgramBuilderOpts};
 use crate::vdbe::insn::{Cookie, Insn};
 use crate::{bail_parse_error, CaptureDataChangesInfo, LimboError, Numeric, Value};
 use std::str::FromStr;
 use strum::IntoEnumIterator;
+use turso_parser::identifier::Identifier;
 
 fn list_pragmas(program: &mut ProgramBuilder) {
     for x in PragmaName::iter() {
@@ -73,15 +74,15 @@ fn display_table_list_name(database_id: usize, name: &str) -> String {
 }
 
 fn normalize_table_pragma_lookup_name(database_id: usize, name: &str) -> String {
-    let normalized = normalize_ident(name);
+    let id = Identifier::from(name);
     if (database_id == crate::TEMP_DB_ID
-        && (normalized.eq_ignore_ascii_case(crate::schema::TEMP_SCHEMA_TABLE_NAME)
-            || normalized.eq_ignore_ascii_case(crate::schema::TEMP_SCHEMA_TABLE_NAME_ALT)))
-        || normalized.eq_ignore_ascii_case(crate::schema::SCHEMA_TABLE_NAME_ALT)
+        && (id == crate::schema::TEMP_SCHEMA_TABLE_NAME
+            || id == crate::schema::TEMP_SCHEMA_TABLE_NAME_ALT))
+        || id == crate::schema::SCHEMA_TABLE_NAME_ALT
     {
         crate::schema::SCHEMA_TABLE_NAME.to_string()
     } else {
-        normalized
+        name.to_owned()
     }
 }
 
@@ -876,12 +877,8 @@ fn query_pragma(
             // Checkpoint uses 3 registers: P1, P2, P3. Ref Insn::Checkpoint for more info.
             // Allocate two more here as one was allocated at the top.
             let mode = match value {
-                Some(ast::Expr::Name(name)) => {
-                    let mode_name = normalize_ident(name.as_str());
-                    CheckpointMode::from_str(&mode_name).map_err(|e| {
-                        LimboError::ParseError(format!("Unknown Checkpoint Mode: {e}"))
-                    })?
-                }
+                Some(ast::Expr::Name(name)) => CheckpointMode::from_str(name.as_str())
+                    .map_err(|e| LimboError::ParseError(format!("Unknown Checkpoint Mode: {e}")))?,
                 _ => CheckpointMode::Passive {
                     upper_bound_inclusive: None,
                 },
@@ -973,7 +970,7 @@ fn query_pragma(
         }
         PragmaName::IndexInfo => {
             let index_name = match value {
-                Some(ast::Expr::Name(name)) => Some(normalize_ident(name.as_str())),
+                Some(ast::Expr::Name(name)) => Some(name.as_str().to_owned()),
                 _ => None,
             };
 
@@ -1014,7 +1011,7 @@ fn query_pragma(
         }
         PragmaName::IndexXinfo => {
             let index_name = match value {
-                Some(ast::Expr::Name(name)) => Some(normalize_ident(name.as_str())),
+                Some(ast::Expr::Name(name)) => Some(name.as_str().to_owned()),
                 _ => None,
             };
 
@@ -1076,7 +1073,7 @@ fn query_pragma(
         }
         PragmaName::IndexList => {
             let table_name = match value {
-                Some(ast::Expr::Name(name)) => Some(normalize_ident(name.as_str())),
+                Some(ast::Expr::Name(name)) => Some(name.as_str().to_owned()),
                 _ => None,
             };
 
@@ -1140,7 +1137,7 @@ fn query_pragma(
         }
         PragmaName::TableList => {
             let name = match value {
-                Some(ast::Expr::Name(name)) => Some(normalize_ident(name.as_str())),
+                Some(ast::Expr::Name(name)) => Some(name.as_str().to_owned()),
                 _ => None,
             };
 
@@ -1177,7 +1174,7 @@ fn query_pragma(
         }
         PragmaName::TableInfo => {
             let name = match value {
-                Some(ast::Expr::Name(name)) => Some(normalize_ident(name.as_str())),
+                Some(ast::Expr::Name(name)) => Some(name.as_str().to_owned()),
                 _ => None,
             };
 
@@ -1212,7 +1209,7 @@ fn query_pragma(
         }
         PragmaName::TableXinfo => {
             let name = match value {
-                Some(ast::Expr::Name(name)) => Some(normalize_ident(name.as_str())),
+                Some(ast::Expr::Name(name)) => Some(name.as_str().to_owned()),
                 _ => None,
             };
 

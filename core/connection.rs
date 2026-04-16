@@ -840,7 +840,7 @@ impl Connection {
         let attached_resolver = |name: &str| -> Option<usize> {
             self.attached_databases
                 .read()
-                .get_database_by_name(&crate::util::normalize_ident(name))
+                .get_database_by_name(&name.to_ascii_lowercase())
                 .map(|(idx, _)| idx)
         };
         // TODO: This function below is synchronous, make it async
@@ -1694,7 +1694,7 @@ impl Connection {
             let attached_resolver = |name: &str| -> Option<usize> {
                 self.attached_databases
                     .read()
-                    .get_database_by_name(&crate::util::normalize_ident(name))
+                    .get_database_by_name(&name.to_ascii_lowercase())
                     .map(|(idx, _)| idx)
             };
             for (ty, name, table_name, root_page, sql) in &rows_data {
@@ -1965,7 +1965,7 @@ impl Connection {
 
     /// Get the database id for a schema name ("main", "temp", or an attached db alias).
     pub(crate) fn get_database_id_by_name(&self, name: &str) -> Result<usize> {
-        let normalized: String = crate::util::normalize_ident(name);
+        let normalized: String = name.to_ascii_lowercase();
         match normalized.as_str() {
             "main" => Ok(MAIN_DB_ID),
             "temp" => Ok(TEMP_DB_ID),

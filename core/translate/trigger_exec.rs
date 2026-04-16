@@ -11,7 +11,6 @@ use crate::translate::{
     planner::ROWID_STRS,
     translate_inner, ProgramBuilder, ProgramBuilderOpts,
 };
-use crate::util::normalize_ident;
 use crate::vdbe::affinity::Affinity;
 use crate::vdbe::insn::Insn;
 use crate::vdbe::BranchOffset;
@@ -413,14 +412,11 @@ fn rewrite_trigger_expr_single_for_subprogram(
             return Ok(());
         }
         Expr::Qualified(ns, col) | Expr::DoublyQualified(_, ns, col) => {
-            let ns = normalize_ident(ns.as_str());
-            let col = normalize_ident(col.as_str());
-
             // Handle NEW.column references
-            if ns.eq_ignore_ascii_case("new") {
+            if *ns == "new" {
                 if ctx.has_new {
                     let num_cols = ctx.table.columns.len();
-                    if let Some((idx, col_def)) = ctx.table.get_column(&col) {
+                    if let Some((idx, col_def)) = ctx.table.get_column(col.as_str()) {
                         if col_def.is_rowid_alias() {
                             *e = variable_from_parameter_index(
                                 ctx.get_new_rowid_param()
@@ -439,7 +435,7 @@ fn rewrite_trigger_expr_single_for_subprogram(
                         }
                     }
                     // Handle NEW.rowid
-                    if ROWID_STRS.iter().any(|s| s.eq_ignore_ascii_case(&col)) {
+                    if ROWID_STRS.iter().any(|s| *col == **s) {
                         *e = variable_from_parameter_index(
                             ctx.get_new_rowid_param()
                                 .expect("NEW parameters must be provided"),
@@ -455,10 +451,10 @@ fn rewrite_trigger_expr_single_for_subprogram(
             }
 
             // Handle OLD.column references
-            if ns.eq_ignore_ascii_case("old") {
+            if *ns == "old" {
                 if ctx.has_old {
                     let num_cols = ctx.table.columns.len();
-                    if let Some((idx, col_def)) = ctx.table.get_column(&col) {
+                    if let Some((idx, col_def)) = ctx.table.get_column(col.as_str()) {
                         if col_def.is_rowid_alias() {
                             *e = variable_from_parameter_index(
                                 ctx.get_old_rowid_param()
@@ -477,7 +473,7 @@ fn rewrite_trigger_expr_single_for_subprogram(
                         }
                     }
                     // Handle OLD.rowid
-                    if ROWID_STRS.iter().any(|s| s.eq_ignore_ascii_case(&col)) {
+                    if ROWID_STRS.iter().any(|s| *col == **s) {
                         *e = variable_from_parameter_index(
                             ctx.get_old_rowid_param()
                                 .expect("OLD parameters must be provided"),
@@ -696,8 +692,7 @@ pub fn has_relevant_triggers_type_only(
                     updated_column_indices.expect("UPDATE should contain some updated columns");
                 // Check if any of the trigger's specified columns are being updated
                 trigger_cols.iter().any(|col_name| {
-                    let normalized_col = normalize_ident(col_name.as_str());
-                    if let Some((col_idx, _)) = table.get_column(&normalized_col) {
+                    if let Some((col_idx, _)) = table.get_column(col_name.as_str()) {
                         updated_cols.get(col_idx)
                     } else {
                         // Column doesn't exist - according to SQLite docs, unrecognized
@@ -738,8 +733,7 @@ pub fn get_relevant_triggers_type_and_time<'a>(
                     if let Some(ref updated_cols) = updated_column_indices {
                         // Check if any of the trigger's specified columns are being updated
                         trigger_cols.iter().any(|col_name| {
-                            let normalized_col = normalize_ident(col_name.as_str());
-                            if let Some((col_idx, _)) = table.get_column(&normalized_col) {
+                            if let Some((col_idx, _)) = table.get_column(col_name.as_str()) {
                                 updated_cols.get(col_idx)
                             } else {
                                 // Column doesn't exist - according to SQLite docs, unrecognized
@@ -1252,11 +1246,9 @@ fn rewrite_trigger_expr_single_for_when_clause(
         // Bare column references are not valid in trigger WHEN clauses.
         // Per SQLite docs, columns must be qualified with NEW or OLD.
         Expr::Id(name) if !allow_non_trigger_qualified => {
-            let ident = normalize_ident(name.as_str());
-            if table.get_column(&ident).is_some()
-                || ROWID_STRS.iter().any(|s| s.eq_ignore_ascii_case(&ident))
+            if table.get_column(name.as_str()).is_some() || ROWID_STRS.iter().any(|s| *name == **s)
             {
-                crate::bail_parse_error!("no such column: {}", ident);
+                crate::bail_parse_error!("no such column: {}", name.as_str());
             }
             return Ok(());
         }
@@ -1269,13 +1261,10 @@ fn rewrite_trigger_expr_single_for_when_clause(
             return Ok(());
         }
         Expr::Qualified(ns, col) | Expr::DoublyQualified(_, ns, col) => {
-            let ns = normalize_ident(ns.as_str());
-            let col = normalize_ident(col.as_str());
-
             // Handle NEW.column references
-            if ns.eq_ignore_ascii_case("new") {
+            if *ns == "new" {
                 if let Some(new_regs) = &ctx.new_registers {
-                    if let Some((idx, col_def)) = table.get_column(&col) {
+                    if let Some((idx, col_def)) = table.get_column(col.as_str()) {
                         if col_def.is_rowid_alias() {
                             // Rowid alias columns map to the rowid register (last element)
                             *expr = Expr::Register(
@@ -1289,7 +1278,7 @@ fn rewrite_trigger_expr_single_for_when_clause(
                         }
                     }
                     // Handle NEW.rowid
-                    if ROWID_STRS.iter().any(|s| s.eq_ignore_ascii_case(&col)) {
+                    if ROWID_STRS.iter().any(|s| *col == **s) {
                         *expr = Expr::Register(
                             *ctx.new_registers
                                 .as_ref()
@@ -1308,16 +1297,16 @@ fn rewrite_trigger_expr_single_for_when_clause(
             }
 
             // Handle OLD.column references
-            if ns.eq_ignore_ascii_case("old") {
+            if *ns == "old" {
                 if let Some(old_regs) = &ctx.old_registers {
-                    if let Some((idx, _)) = table.get_column(&col) {
+                    if let Some((idx, _)) = table.get_column(col.as_str()) {
                         if idx < old_regs.len() {
                             *expr = Expr::Register(old_regs[idx]);
                             return Ok(());
                         }
                     }
                     // Handle OLD.rowid
-                    if ROWID_STRS.iter().any(|s| s.eq_ignore_ascii_case(&col)) {
+                    if ROWID_STRS.iter().any(|s| *col == **s) {
                         *expr = Expr::Register(
                             *ctx.old_registers
                                 .as_ref()

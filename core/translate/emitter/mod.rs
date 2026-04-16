@@ -35,9 +35,7 @@ pub use crate::translate::trigger_exec::{
     get_triggers_including_temp, has_triggers_including_temp,
 };
 use crate::translate::window::WindowMetadata;
-use crate::util::{
-    check_expr_references_column, exprs_are_equivalent, normalize_ident, parse_numeric_literal,
-};
+use crate::util::{check_expr_references_column, exprs_are_equivalent, parse_numeric_literal};
 use crate::vdbe::affinity::Affinity;
 use crate::vdbe::builder::{CursorType, DmlColumnContext, ProgramBuilder, SelfTableContext};
 use crate::vdbe::insn::{to_u16, InsertFlags};
@@ -523,8 +521,10 @@ impl<'a> Resolver<'a> {
             return self.resolve_database_id(qualified_name);
         }
 
-        let index_name = normalize_ident(qualified_name.name.as_str());
-        Ok(self.resolve_unqualified_existing_database_id(&index_name, Self::schema_has_index))
+        Ok(self.resolve_unqualified_existing_database_id(
+            qualified_name.name.as_str(),
+            Self::schema_has_index,
+        ))
     }
 
     pub(crate) fn resolve_existing_trigger_database_id(
@@ -543,22 +543,17 @@ impl<'a> Resolver<'a> {
     pub(crate) fn resolve_database_id(&self, qualified_name: &ast::QualifiedName) -> Result<usize> {
         // Check if this is a qualified name (database.table) or unqualified
         let resolved_id = if let Some(db_name) = &qualified_name.db_name {
-            let db_name_normalized = normalize_ident(db_name.as_str());
-            match db_name_normalized.as_str() {
-                "main" => Ok(0),
-                "temp" => Ok(1),
-                _ => {
-                    // Look up attached database
-                    if let Some((idx, _attached_db)) =
-                        self.get_attached_database(&db_name_normalized)
-                    {
-                        Ok(idx)
-                    } else {
-                        Err(LimboError::InvalidArgument(format!(
-                            "no such database: {db_name_normalized}"
-                        )))
-                    }
-                }
+            if *db_name == "main" {
+                Ok(0)
+            } else if *db_name == "temp" {
+                Ok(1)
+            } else if let Some((idx, _attached_db)) = self.get_attached_database(db_name.as_str()) {
+                Ok(idx)
+            } else {
+                Err(LimboError::InvalidArgument(format!(
+                    "no such database: {}",
+                    db_name.as_str()
+                )))
             }
         } else {
             // Unqualified table name — when compiling a trigger subprogram,
@@ -1587,12 +1582,11 @@ fn rewrite_where_for_update_registers(
     walk_expr_mut(expr, &mut |e: &mut Expr| -> Result<WalkControl> {
         match e {
             Expr::Qualified(_, col) | Expr::DoublyQualified(_, _, col) => {
-                let normalized = normalize_ident(col.as_str());
-                if let Some((idx, c)) = columns.iter().enumerate().find(|(_, c)| {
-                    c.name
-                        .as_ref()
-                        .is_some_and(|n| n.eq_ignore_ascii_case(&normalized))
-                }) {
+                if let Some((idx, c)) = columns
+                    .iter()
+                    .enumerate()
+                    .find(|(_, c)| c.name.as_ref().is_some_and(|n| *col == **n))
+                {
                     if c.is_rowid_alias() {
                         *e = Expr::Register(rowid_reg);
                     } else {
@@ -1601,17 +1595,13 @@ fn rewrite_where_for_update_registers(
                 }
             }
             Expr::Id(name) => {
-                let normalized = normalize_ident(name.as_str());
-                if ROWID_STRS
-                    .iter()
-                    .any(|s| s.eq_ignore_ascii_case(&normalized))
-                {
+                if ROWID_STRS.iter().any(|s| *name == **s) {
                     *e = Expr::Register(rowid_reg);
-                } else if let Some((idx, c)) = columns.iter().enumerate().find(|(_, c)| {
-                    c.name
-                        .as_ref()
-                        .is_some_and(|n| n.eq_ignore_ascii_case(&normalized))
-                }) {
+                } else if let Some((idx, c)) = columns
+                    .iter()
+                    .enumerate()
+                    .find(|(_, c)| c.name.as_ref().is_some_and(|n| *name == **n))
+                {
                     if c.is_rowid_alias() {
                         *e = Expr::Register(rowid_reg);
                     } else {

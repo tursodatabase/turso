@@ -45,7 +45,6 @@ use crate::{
             ResolvedUpsertTarget,
         },
     },
-    util::normalize_ident,
     vdbe::{
         affinity::Affinity,
         builder::{
@@ -1794,10 +1793,9 @@ fn resolve_defaults_in_row(
             table.columns().iter().filter(|c| !c.hidden()).nth(i)
         } else {
             // Column list — map by name
-            columns.get(i).and_then(|name| {
-                let name = crate::util::normalize_ident(name.as_str());
-                table.get_column_by_name(&name).map(|(_, col)| col)
-            })
+            columns
+                .get(i)
+                .and_then(|name| table.get_column_by_name(name.as_str()).map(|(_, col)| col))
         };
         *expr = match col {
             Some(col) => col.default.clone().unwrap_or_else(|| {
@@ -2116,15 +2114,11 @@ fn init_source_emission<'a>(
                         columns
                             .iter()
                             .map(|col_name| {
-                                let column_name = normalize_ident(col_name.as_str());
-                                if ROWID_STRS
-                                    .iter()
-                                    .any(|s| s.eq_ignore_ascii_case(&column_name))
-                                {
+                                if ROWID_STRS.iter().any(|s| *col_name == **s) {
                                     return Ok(Affinity::Integer.aff_mask());
                                 }
                                 table
-                                    .get_column_by_name(&column_name)
+                                    .get_column_by_name(col_name.as_str())
                                     .map(|(_, col)| {
                                         col.affinity_with_strict(ctx.table.is_strict).aff_mask()
                                     })
@@ -2132,7 +2126,7 @@ fn init_source_emission<'a>(
                                         crate::error::LimboError::ParseError(format!(
                                             "table {} has no column named {}",
                                             table.get_name(),
-                                            column_name
+                                            col_name.as_str()
                                         ))
                                     })
                             })
@@ -2449,10 +2443,11 @@ fn build_insertion<'a>(
         // Case 2: Columns specified - map named columns to their values
         // Map each named column to its value index
         for (value_index, column_name) in columns.iter().enumerate() {
-            let column_name = normalize_ident(column_name.as_str());
-            if let Some((idx_in_table, col_in_table)) = table.get_column_by_name(&column_name) {
+            if let Some((idx_in_table, col_in_table)) =
+                table.get_column_by_name(column_name.as_str())
+            {
                 // Generated columns cannot be written to directly
-                col_in_table.ensure_not_generated("INSERT into", &column_name)?;
+                col_in_table.ensure_not_generated("INSERT into", column_name.as_str())?;
                 // Named column
                 if col_in_table.is_rowid_alias() {
                     insertion_key = InsertionKey::RowidAlias(ColMapping {
@@ -2463,10 +2458,7 @@ fn build_insertion<'a>(
                 } else if column_mappings[idx_in_table].value_index.is_none() {
                     column_mappings[idx_in_table].value_index = Some(value_index);
                 }
-            } else if ROWID_STRS
-                .iter()
-                .any(|s| s.eq_ignore_ascii_case(&column_name))
-            {
+            } else if ROWID_STRS.iter().any(|s| *column_name == **s) {
                 // Explicit use of the 'rowid' keyword
                 if let Some(col_in_table) = table.columns().iter().find(|c| c.is_rowid_alias()) {
                     insertion_key = InsertionKey::RowidAlias(ColMapping {
@@ -3343,14 +3335,12 @@ pub fn rewrite_partial_index_where(
             match e {
                 // NOTE: should not have ANY Expr::Columns bound to the expr
                 Expr::Id(name) => {
-                    let normalized = normalize_ident(name.as_str());
-                    if let Some(reg) = col_reg(&normalized) {
+                    if let Some(reg) = col_reg(name.as_str()) {
                         *e = Expr::Register(reg);
                     }
                 }
                 Expr::Qualified(_, col) | Expr::DoublyQualified(_, _, col) => {
-                    let normalized = normalize_ident(col.as_str());
-                    if let Some(reg) = col_reg(&normalized) {
+                    if let Some(reg) = col_reg(col.as_str()) {
                         *e = Expr::Register(reg);
                     }
                 }

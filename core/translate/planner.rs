@@ -20,7 +20,7 @@ use crate::{
     ast::Limit,
     function::Func,
     schema::Table,
-    util::{exprs_are_equivalent, normalize_ident, validate_aggregate_function_tail},
+    util::{exprs_are_equivalent, validate_aggregate_function_tail},
     Result,
 };
 use crate::{
@@ -93,7 +93,7 @@ fn collect_from_select_table(table: &ast::SelectTable, out: &mut Vec<String>) {
     match table {
         ast::SelectTable::Table(qualified_name, _, _)
         | ast::SelectTable::TableCall(qualified_name, _, _) => {
-            out.push(normalize_ident(qualified_name.name.as_str()));
+            out.push(qualified_name.name.as_str().to_owned());
         }
         ast::SelectTable::Select(subselect, _) => {
             collect_from_clause_table_refs(subselect, out);
@@ -419,15 +419,14 @@ fn resolve_window<'a>(windows: &'a mut Vec<Window>, over_clause: &Over) -> Resul
             Ok(windows.last_mut().expect("just pushed, so must exist"))
         }
         Over::Name(name) => {
-            let window_name = normalize_ident(name.as_str());
             // When multiple windows share the same name, SQLite uses the most recent
             // definition. Iterate in reverse so we find the last definition first.
             for window in windows.iter_mut().rev() {
-                if window.name.as_ref() == Some(&window_name) {
+                if window.name.as_ref().is_some_and(|n| *name == **n) {
                     return Ok(window);
                 }
             }
-            crate::bail_parse_error!("no such window: {}", window_name);
+            crate::bail_parse_error!("no such window: {}", name.as_str());
         }
     }
 }
@@ -606,20 +605,19 @@ pub fn plan_ctes_as_outer_refs(
     }
 
     for cte in with.ctes {
-        // Normalize explicit column names
         let explicit_columns: Vec<String> = cte
             .columns
             .iter()
-            .map(|c| normalize_ident(c.col_name.as_str()))
+            .map(|c| c.col_name.as_str().to_owned())
             .collect();
 
-        let cte_name = normalize_ident(cte.tbl_name.as_str());
+        let cte_name = cte.tbl_name.as_str().to_owned();
 
         // Check for duplicate CTE names
         if table_references
             .outer_query_refs()
             .iter()
-            .any(|r| r.identifier == cte_name)
+            .any(|r| cte.tbl_name == *r.identifier)
         {
             crate::bail_parse_error!("duplicate WITH table name: {}", cte.tbl_name.as_str());
         }
@@ -773,7 +771,7 @@ fn parse_from_clause_table(
             }
             let cur_table_index = table_references.joined_tables().len();
             let identifier = maybe_alias
-                .map(|a| normalize_ident(a.name().as_str()))
+                .map(|a| a.name().as_str().to_owned())
                 .unwrap_or_else(|| format!("(subquery-{cur_table_index})"));
             table_references.add_joined_table(JoinedTable::new_subquery_from_plan(
                 identifier,
@@ -817,15 +815,15 @@ fn parse_table(
     indexed: Option<ast::Indexed>,
     connection: &Arc<crate::Connection>,
 ) -> Result<()> {
-    let normalized_qualified_name = normalize_ident(qualified_name.name.as_str());
     let database_id = resolver.resolve_existing_table_database_id_qualified(qualified_name)?;
     let table_name = &qualified_name.name;
+    let qualified_name_str = table_name.as_str().to_owned();
 
     // Check if the FROM clause table is referring to a CTE in the current scope.
     // Each reference gets a freshly planned CTE to ensure unique internal_ids and cursor IDs.
     if let Some(cte_idx) = cte_definitions
         .iter()
-        .position(|cte| cte.name == normalized_qualified_name)
+        .position(|cte| *table_name == *cte.name)
     {
         let planning_outer_query_refs =
             base_outer_refs_for_cte_planning(table_references.outer_query_refs(), cte_definitions);
@@ -842,7 +840,7 @@ fn parse_table(
 
         // If there's an alias provided, update the identifier to use that alias
         if let Some(a) = maybe_alias {
-            cte_table.identifier = normalize_ident(a.name().as_str());
+            a.name().as_str().clone_into(&mut cte_table.identifier);
         }
 
         // Mark the pre-planned outer_query_ref as "CTE definition only" so it is
@@ -850,7 +848,7 @@ fn parse_table(
         // EXISTS (SELECT 1 FROM <cte_name> ...)), but no longer participates in
         // column resolution. Column resolution now goes through the joined_table
         // which has the alias (if any) or the original name.
-        table_references.mark_outer_query_ref_cte_definition_only(&normalized_qualified_name);
+        table_references.mark_outer_query_ref_cte_definition_only(table_name.as_str());
 
         table_references.add_joined_table(cte_table);
         return Ok(());
@@ -858,7 +856,7 @@ fn parse_table(
 
     // A non-recursive CTE's body cannot reference its own name. The CTE name
     // shadows any same-named schema object, but without RECURSIVE it's circular.
-    if program.is_cte_being_defined(&normalized_qualified_name) {
+    if program.is_cte_being_defined(table_name.as_str()) {
         crate::bail_parse_error!("circular reference: {}", table_name.as_str());
     }
 
@@ -866,14 +864,14 @@ fn parse_table(
     // This handles cases like: WITH a AS (...), b AS (SELECT ... FROM a) SELECT * FROM b;
     // When planning b's body, 'a' is in outer_query_refs.
     if let Some(outer_ref) =
-        table_references.find_outer_query_ref_by_identifier(&normalized_qualified_name)
+        table_references.find_outer_query_ref_by_identifier(table_name.as_str())
     {
         // If this is a CTE reference (via outer_query_refs), count it for materialization decisions.
         // This handles scalar subqueries that reference CTEs.
         if let Some(cte_id) = outer_ref.cte_id {
             program.increment_cte_reference(cte_id);
         }
-        let alias = maybe_alias.map(|a| normalize_ident(a.name().as_str()));
+        let alias = maybe_alias.map(|a| a.name().as_str().to_owned());
         // Clone fields we need before dropping the borrow on table_references.
         let cte_select = outer_ref.cte_select.clone();
         let cte_explicit_columns = outer_ref.cte_explicit_columns.clone();
@@ -908,7 +906,7 @@ fn parse_table(
                 if cols.len() != result_col_count {
                     crate::bail_parse_error!(
                         "table {} has {} columns but {} column names were provided",
-                        normalized_qualified_name,
+                        qualified_name_str,
                         result_col_count,
                         cols.len()
                     );
@@ -916,8 +914,9 @@ fn parse_table(
             }
             // Use the CTE name for the subquery name so query plans show
             // "SCAN cte_name AS alias" instead of just "SCAN alias".
+            #[allow(clippy::redundant_clone)]
             let mut jt = JoinedTable::new_subquery_from_plan(
-                normalized_qualified_name.clone(),
+                qualified_name_str.clone(),
                 cte_plan,
                 None,
                 program.table_reference_counter.next(),
@@ -935,7 +934,7 @@ fn parse_table(
             table_references.add_joined_table(JoinedTable {
                 op: Operation::default_scan_for(&outer_table),
                 table: outer_table,
-                identifier: alias.unwrap_or(normalized_qualified_name),
+                identifier: alias.unwrap_or(qualified_name_str),
                 internal_id,
                 join_info: None,
                 col_used_mask: ColumnUsedMask::default(),
@@ -952,7 +951,7 @@ fn parse_table(
     let table = resolver.with_schema(database_id, |schema| schema.get_table(table_name.as_str()));
 
     if let Some(table) = table {
-        let alias = maybe_alias.map(|a| normalize_ident(a.name().as_str()));
+        let alias = maybe_alias.map(|a| a.name().as_str().to_owned());
         let internal_id = program.table_reference_counter.next();
         let tbl_ref = if let Table::Virtual(tbl) = table.as_ref() {
             transform_args_into_where_terms(args, internal_id, vtab_predicates, table.as_ref())?;
@@ -967,7 +966,7 @@ fn parse_table(
         table_references.add_joined_table(JoinedTable {
             op: Operation::default_scan_for(&tbl_ref),
             table: tbl_ref,
-            identifier: alias.unwrap_or(normalized_qualified_name),
+            identifier: alias.unwrap_or(qualified_name_str),
             internal_id,
             join_info: None,
             col_used_mask: ColumnUsedMask::default(),
@@ -1076,7 +1075,7 @@ fn parse_table(
         });
         drop(view_guard);
 
-        let alias = maybe_alias.map(|a| normalize_ident(a.name().as_str()));
+        let alias = maybe_alias.map(|a| a.name().as_str().to_owned());
 
         table_references.add_joined_table(JoinedTable {
             op: Operation::Scan(Scan::BTreeTable {
@@ -1084,7 +1083,7 @@ fn parse_table(
                 index: None,
             }),
             table: Table::BTree(btree_table),
-            identifier: alias.unwrap_or(normalized_qualified_name),
+            identifier: alias.unwrap_or(qualified_name_str),
             internal_id: program.table_reference_counter.next(),
             join_info: None,
             col_used_mask: ColumnUsedMask::default(),
@@ -1104,7 +1103,7 @@ fn parse_table(
     // because the query can simply _reference_ them in e.g. the SELECT columns or the WHERE clause,
     // but it's not part of the join order.
     if let Some(outer_ref) =
-        table_references.find_outer_query_ref_by_identifier(&normalized_qualified_name)
+        table_references.find_outer_query_ref_by_identifier(&qualified_name_str)
     {
         if matches!(outer_ref.table, Table::FromClauseSubquery(_)) {
             table_references.add_joined_table(JoinedTable {
@@ -1127,7 +1126,7 @@ fn parse_table(
     let is_incompatible = resolver.with_schema(database_id, |schema| {
         schema
             .incompatible_views
-            .contains(&Identifier::from(normalized_qualified_name.as_str()))
+            .contains(&Identifier::from(qualified_name_str.as_str()))
     });
 
     if is_incompatible {
@@ -1136,12 +1135,12 @@ fn parse_table(
             "Materialized view '{}' has an incompatible version. \n\
              The view was created with a different DBSP version than the current version ({}). \n\
              Please DROP and recreate the view to use it.",
-            normalized_qualified_name,
+            qualified_name_str,
             DBSP_CIRCUIT_VERSION
         );
     }
 
-    crate::bail_parse_error!("no such table: {}", normalized_qualified_name);
+    crate::bail_parse_error!("no such table: {}", qualified_name_str);
 }
 
 fn transform_args_into_where_terms(
@@ -1233,14 +1232,11 @@ pub fn parse_from(
             let explicit_columns: Vec<String> = cte
                 .columns
                 .iter()
-                .map(|c| normalize_ident(c.col_name.as_str()))
+                .map(|c| c.col_name.as_str().to_owned())
                 .collect();
 
-            let cte_name_normalized = normalize_ident(cte.tbl_name.as_str());
-            if cte_definitions
-                .iter()
-                .any(|d| d.name == cte_name_normalized)
-            {
+            let cte_name = cte.tbl_name.as_str().to_owned();
+            if cte_definitions.iter().any(|d| cte.tbl_name == *d.name) {
                 crate::bail_parse_error!("duplicate WITH table name: {}", cte.tbl_name.as_str());
             }
             // Collect table names referenced in this CTE's FROM clause.
@@ -1250,7 +1246,10 @@ pub fn parse_from(
             // Find which preceding CTEs are directly referenced by this CTE.
             // This avoids exponential re-planning when CTEs have transitive dependencies.
             let referenced_cte_indices: SmallVec<[usize; 2]> = (0..idx)
-                .filter(|&i| referenced_tables.contains(&cte_definitions[i].name))
+                .filter(|&i| {
+                    let id = Identifier::from(cte_definitions[i].name.as_str());
+                    referenced_tables.iter().any(|r| id == **r)
+                })
                 .collect();
 
             // AS MATERIALIZED forces materialization; AS NOT MATERIALIZED prevents it
@@ -1258,7 +1257,7 @@ pub fn parse_from(
 
             cte_definitions.push(CteDefinition {
                 cte_id: program.alloc_cte_id(),
-                name: cte_name_normalized,
+                name: cte_name,
                 select: cte.select,
                 explicit_columns,
                 referenced_cte_indices,
@@ -1775,7 +1774,6 @@ fn parse_join(
             ast::JoinConstraint::Using(distinct_names) => {
                 // USING join is replaced with a list of equality predicates
                 for distinct_name in distinct_names.iter() {
-                    let name_normalized = normalize_ident(distinct_name.as_str());
                     let cur_table_idx = table_references.joined_tables().len() - 1;
                     let left_tables = &table_references.joined_tables()[..cur_table_idx];
                     turso_assert!(!left_tables.is_empty());
@@ -1790,7 +1788,7 @@ fn parse_join(
                             .find(|(_, col)| {
                                 col.name
                                     .as_ref()
-                                    .is_some_and(|name| *name == name_normalized)
+                                    .is_some_and(|name| *distinct_name == **name)
                             })
                             .map(|(idx, col)| (left_table_idx, left_table.internal_id, idx, col));
                         if left_col.is_some() {
@@ -1806,7 +1804,7 @@ fn parse_join(
                     let right_col = right_table.columns().iter().enumerate().find(|(_, col)| {
                         col.name
                             .as_ref()
-                            .is_some_and(|name| *name == name_normalized)
+                            .is_some_and(|name| *distinct_name == **name)
                     });
                     if right_col.is_none() {
                         crate::bail_parse_error!(

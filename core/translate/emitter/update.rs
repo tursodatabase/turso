@@ -44,7 +44,6 @@ use crate::{
         },
         ProgramBuilder,
     },
-    util::normalize_ident,
     vdbe::{
         affinity::Affinity,
         builder::{CursorKey, CursorType, DmlColumnContext},
@@ -1513,7 +1512,7 @@ fn emit_update_insns<'a>(
             .into_iter()
             .filter_map(|col_idx| btree_table.columns.get(col_idx))
             .filter_map(|col| col.name.as_deref())
-            .map(normalize_ident)
+            .map(str::to_owned)
             .collect();
 
             // If the rowid is being updated (either directly via ROWID_SENTINEL or

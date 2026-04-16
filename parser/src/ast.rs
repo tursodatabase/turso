@@ -1096,6 +1096,12 @@ impl PartialEq<str> for Name {
     }
 }
 
+impl PartialEq<&str> for Name {
+    fn eq(&self, other: &&str) -> bool {
+        self.value == **other
+    }
+}
+
 impl Name {
     /// Create name which will have exactly the value of given string
     /// (e.g. if s = "\"str\"" - the name value will contain quotes and translation to SQL will give us """str""")

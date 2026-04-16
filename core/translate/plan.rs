@@ -4,6 +4,7 @@ use std::{cmp::Ordering, marker::PhantomData, sync::Arc};
 use turso_parser::ast::{
     self, FrameBound, FrameClause, FrameExclude, FrameMode, ResolveType, SortOrder, SubqueryType,
 };
+use turso_parser::identifier::Identifier;
 
 use crate::{
     function::{AggFunc, WindowFunc},
@@ -821,17 +822,15 @@ pub fn select_star(
         // If this table's identifier appears more than once in the FROM clause,
         // expanding * would produce ambiguous column references (matches SQLite).
         // However, columns deduplicated by USING/NATURAL are not ambiguous.
-        let has_duplicate_identifier = tables
-            .iter()
-            .filter(|t| t.identifier == table.identifier)
-            .count()
-            > 1;
+        let table_id = Identifier::from(table.identifier.as_str());
+        let has_duplicate_identifier =
+            tables.iter().filter(|t| table_id == *t.identifier).count() > 1;
         if has_duplicate_identifier {
             // Collect all USING columns from duplicate tables (both this table's
             // own join_info and the join_info of other tables with the same identifier).
             let using_cols: Vec<&str> = tables
                 .iter()
-                .filter(|t| t.identifier == table.identifier)
+                .filter(|t| table_id == *t.identifier)
                 .filter_map(|t| t.join_info.as_ref())
                 .flat_map(|ji| ji.using.iter().map(|u| u.as_str()))
                 .collect();
@@ -1222,14 +1221,15 @@ impl TableReferences {
     /// Returns an immutable reference to the [Table] with the given identifier,
     /// where identifier is either the literal name of the table or an alias.
     pub fn find_table_by_identifier(&self, identifier: &str) -> Option<&Table> {
+        let id = Identifier::from(identifier);
         self.joined_tables
             .iter()
-            .find(|t| t.identifier == identifier)
+            .find(|t| id == *t.identifier)
             .map(|t| &t.table)
             .or_else(|| {
                 self.outer_query_refs
                     .iter()
-                    .find(|t| t.identifier == identifier)
+                    .find(|t| id == *t.identifier)
                     .map(|t| &t.table)
             })
     }
@@ -1259,9 +1259,8 @@ impl TableReferences {
         &self,
         identifier: &str,
     ) -> Option<&OuterQueryReference> {
-        self.outer_query_refs
-            .iter()
-            .find(|t| t.identifier == identifier)
+        let id = Identifier::from(identifier);
+        self.outer_query_refs.iter().find(|t| id == *t.identifier)
     }
 
     /// Marks the pre-planned [OuterQueryReference] with the given identifier as
@@ -1270,10 +1269,11 @@ impl TableReferences {
     /// clauses. Called when a CTE is consumed by a FROM clause, since column
     /// resolution is then handled by the joined_table entry instead.
     pub fn mark_outer_query_ref_cte_definition_only(&mut self, identifier: &str) {
+        let id = Identifier::from(identifier);
         if let Some(outer_ref) = self
             .outer_query_refs
             .iter_mut()
-            .find(|t| t.identifier == identifier)
+            .find(|t| id == *t.identifier)
         {
             outer_ref.cte_definition_only = true;
         }
@@ -1284,14 +1284,15 @@ impl TableReferences {
         &self,
         identifier: &str,
     ) -> Option<(TableInternalId, &Table)> {
+        let id = Identifier::from(identifier);
         self.joined_tables
             .iter()
-            .find(|t| t.identifier == identifier)
+            .find(|t| id == *t.identifier)
             .map(|t| (t.internal_id, &t.table))
             .or_else(|| {
                 self.outer_query_refs
                     .iter()
-                    .find(|t| t.identifier == identifier && !t.cte_definition_only)
+                    .find(|t| id == *t.identifier && !t.cte_definition_only)
                     .map(|t| (t.internal_id, &t.table))
             })
     }

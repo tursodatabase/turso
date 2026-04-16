@@ -114,20 +114,6 @@ impl<I: ?Sized + IO> IOExt for I {
     }
 }
 
-// https://sqlite.org/lang_keywords.html
-const QUOTE_PAIRS: &[(char, char)] = &[
-    ('"', '"'),
-    ('[', ']'),
-    ('`', '`'),
-    ('\'', '\''), // string sometimes used as identifier quoting
-];
-
-pub fn normalize_ident(identifier: &str) -> String {
-    // quotes normalization already happened in the parser layer (see Name ast node implementation)
-    // so, we only need to convert identifier string to lowercase
-    identifier.to_lowercase()
-}
-
 /// Escape a SQL string literal payload for safe interpolation inside single quotes.
 pub fn escape_sql_string_literal(literal: &str) -> String {
     literal.replace('\'', "''")
@@ -243,18 +229,6 @@ fn cmp_numeric_strings(num_str: &str, other: &str) -> bool {
     }
 }
 
-pub fn check_ident_equivalency(ident1: &str, ident2: &str) -> bool {
-    fn strip_quotes(identifier: &str) -> &str {
-        for &(start, end) in QUOTE_PAIRS {
-            if identifier.starts_with(start) && identifier.ends_with(end) {
-                return &identifier[1..identifier.len() - 1];
-            }
-        }
-        identifier
-    }
-    strip_quotes(ident1).eq_ignore_ascii_case(strip_quotes(ident2))
-}
-
 pub fn module_name_from_sql(sql: &str) -> Result<&str> {
     if let Some(start) = sql.find("USING") {
         let start = start + 6;
@@ -353,7 +327,7 @@ pub fn check_literal_equivalency(lhs: &Literal, rhs: &Literal) -> bool {
         (Literal::Numeric(n1), Literal::Numeric(n2)) => cmp_numeric_strings(n1, n2),
         (Literal::String(s1), Literal::String(s2)) => s1 == s2,
         (Literal::Blob(b1), Literal::Blob(b2)) => b1 == b2,
-        (Literal::Keyword(k1), Literal::Keyword(k2)) => check_ident_equivalency(k1, k2),
+        (Literal::Keyword(k1), Literal::Keyword(k2)) => k1.eq_ignore_ascii_case(k2),
         (Literal::Null, Literal::Null) => true,
         (Literal::CurrentDate, Literal::CurrentDate) => true,
         (Literal::CurrentTime, Literal::CurrentTime) => true,
@@ -429,9 +403,7 @@ pub fn simple_bind_expr(
                     // only if we haven't found a match, check for explicit rowid reference
                     let is_btree_table = matches!(joined_table.table, Table::BTree(_));
                     if is_btree_table {
-                        if let Some(rowid) =
-                            parse_row_id(&normalize_ident(id.as_str()), internal_id, || false)?
-                        {
+                        if let Some(rowid) = parse_row_id(id.as_str(), internal_id, || false)? {
                             *expr = rowid;
                         }
                     }
@@ -790,7 +762,7 @@ pub fn exprs_are_equivalent(expr1: &Expr, expr2: &Expr) -> bool {
         (Expr::NotNull(expr1), Expr::NotNull(expr2)) => exprs_are_equivalent(expr1, expr2),
         (Expr::IsNull(expr1), Expr::IsNull(expr2)) => exprs_are_equivalent(expr1, expr2),
         (Expr::Literal(lit1), Expr::Literal(lit2)) => check_literal_equivalency(lit1, lit2),
-        (Expr::Id(id1), Expr::Id(id2)) => check_ident_equivalency(id1.as_str(), id2.as_str()),
+        (Expr::Id(id1), Expr::Id(id2)) => id1 == id2,
         (Expr::Unary(op1, expr1), Expr::Unary(op2, expr2)) => {
             op1 == op2 && exprs_are_equivalent(expr1, expr2)
         }
@@ -805,14 +777,9 @@ pub fn exprs_are_equivalent(expr1: &Expr, expr2: &Expr) -> bool {
         (Expr::Parenthesized(exprs1), exprs2) | (exprs2, Expr::Parenthesized(exprs1)) => {
             exprs1.len() == 1 && exprs_are_equivalent(&exprs1[0], exprs2)
         }
-        (Expr::Qualified(tn1, cn1), Expr::Qualified(tn2, cn2)) => {
-            check_ident_equivalency(tn1.as_str(), tn2.as_str())
-                && check_ident_equivalency(cn1.as_str(), cn2.as_str())
-        }
+        (Expr::Qualified(tn1, cn1), Expr::Qualified(tn2, cn2)) => tn1 == tn2 && cn1 == cn2,
         (Expr::DoublyQualified(sn1, tn1, cn1), Expr::DoublyQualified(sn2, tn2, cn2)) => {
-            check_ident_equivalency(sn1.as_str(), sn2.as_str())
-                && check_ident_equivalency(tn1.as_str(), tn2.as_str())
-                && check_ident_equivalency(cn1.as_str(), cn2.as_str())
+            sn1 == sn2 && tn1 == tn2 && cn1 == cn2
         }
         (
             Expr::InList {
@@ -1378,11 +1345,10 @@ pub fn parse_pragma_bool(expr: &Expr) -> Result<bool> {
             return Ok(x != 0);
         }
     } else if let Expr::Name(name) = expr {
-        let ident = normalize_ident(name.as_str());
-        if TRUE_VALUES.contains(&ident.as_str()) {
+        if TRUE_VALUES.iter().any(|v| name == v) {
             return Ok(true);
         }
-        if FALSE_VALUES.contains(&ident.as_str()) {
+        if FALSE_VALUES.iter().any(|v| name == v) {
             return Ok(false);
         }
     }
@@ -1397,7 +1363,7 @@ pub fn extract_column_name_from_expr(expr: impl AsRef<ast::Expr>) -> Option<Stri
     match expr.as_ref() {
         ast::Expr::Id(name) => Some(name.as_str().to_string()),
         ast::Expr::DoublyQualified(_, _, name) | ast::Expr::Qualified(_, name) => {
-            Some(normalize_ident(name.as_str()))
+            Some(name.as_str().to_owned())
         }
         _ => None,
     }
@@ -1406,9 +1372,7 @@ pub fn extract_column_name_from_expr(expr: impl AsRef<ast::Expr>) -> Option<Stri
 /// Information about a table referenced in a view
 #[derive(Debug, Clone)]
 pub struct ViewTable {
-    /// Unqualified table name, normalized.
     pub name: String,
-    /// Database qualifier if present, normalized.
     pub db_name: Option<String>,
     /// Optional alias (e.g., "c" in "FROM customers c")
     pub alias: Option<String>,
@@ -1794,15 +1758,15 @@ pub fn extract_view_columns(
             // Add the main table from FROM clause
             match from.select.as_ref() {
                 ast::SelectTable::Table(qualified_name, alias, _) => {
-                    let table_name = normalize_ident(qualified_name.name.as_str());
+                    let table_name = qualified_name.name.as_str().to_owned();
                     let db_name = qualified_name
                         .db_name
                         .as_ref()
-                        .map(|db| normalize_ident(db.as_str()));
+                        .map(|db| db.as_str().to_owned());
                     tables.push(ViewTable {
                         name: table_name,
                         db_name,
-                        alias: alias.as_ref().map(|a| normalize_ident(a.name().as_str())),
+                        alias: alias.as_ref().map(|a| a.name().as_str().to_owned()),
                     });
                 }
                 _ => {
@@ -1814,15 +1778,15 @@ pub fn extract_view_columns(
             for join in &from.joins {
                 match join.table.as_ref() {
                     ast::SelectTable::Table(qualified_name, alias, _) => {
-                        let table_name = normalize_ident(qualified_name.name.as_str());
+                        let table_name = qualified_name.name.as_str().to_owned();
                         let db_name = qualified_name
                             .db_name
                             .as_ref()
-                            .map(|db| normalize_ident(db.as_str()));
+                            .map(|db| db.as_str().to_owned());
                         tables.push(ViewTable {
                             name: table_name,
                             db_name,
-                            alias: alias.as_ref().map(|a| normalize_ident(a.name().as_str())),
+                            alias: alias.as_ref().map(|a| a.name().as_str().to_owned()),
                         });
                     }
                     _ => {
@@ -1929,8 +1893,7 @@ pub fn extract_view_columns(
                 }
                 ast::ResultColumn::TableStar(table_ref) => {
                     // For table.*, expand to all columns from the specified table
-                    let table_name_str = normalize_ident(table_ref.as_str());
-                    if let Some(table_idx) = find_table_index(&table_name_str) {
+                    if let Some(table_idx) = find_table_index(table_ref.as_str()) {
                         if let Some(table) = schema.get_table(&tables[table_idx].name) {
                             for table_column in table.columns() {
                                 let col_name =
@@ -1964,7 +1927,7 @@ pub fn extract_view_columns(
                             columns.push(ViewColumn {
                                 table_index: usize::MAX,
                                 column: Column::new_default_text(
-                                    Some(format!("{table_name_str}.*")),
+                                    Some(format!("{table_ref}.*")),
                                     "TEXT".to_string(),
                                     None,
                                 ),
@@ -2127,12 +2090,14 @@ fn rename_identifiers_scoped_inner(
                 ast::Expr::Qualified(ref tbl, ref col_name)
                     if col_name.as_str().eq_ignore_ascii_case(from) =>
                 {
-                    let tbl_norm = normalize_ident(tbl.as_str());
-                    let should_rename = if tbl_norm == "new" || tbl_norm == "old" {
+                    let should_rename = if *tbl == "new" || *tbl == "old" {
                         is_renaming_trigger_table
                     } else {
-                        target_qualifiers.is_some_and(|qualifiers| qualifiers.contains(&tbl_norm))
-                            || tbl_norm.eq_ignore_ascii_case(target_table)
+                        target_qualifiers.is_some_and(|qualifiers| {
+                            qualifiers
+                                .iter()
+                                .any(|q| q.eq_ignore_ascii_case(tbl.as_str()))
+                        }) || tbl.as_str().eq_ignore_ascii_case(target_table)
                     };
                     if should_rename {
                         let tbl = tbl.clone();
@@ -2183,7 +2148,7 @@ mod rename_column_view {
         target_db_name: &str,
         old_column: &str,
         new_column: &str,
-        visiting_views: &mut HashSet<String>,
+        visiting_views: &mut HashSet<Identifier>,
     ) -> Result<Option<RewrittenView>> {
         let mut parser = Parser::new(view_sql.as_bytes());
         let cmd = parser
@@ -2200,10 +2165,11 @@ mod rename_column_view {
             return Ok(None);
         };
 
-        let current_view_name = normalize_ident(view_name.name.as_str());
-        if !visiting_views.insert(current_view_name.clone()) {
+        let current_view_ident = Identifier::from(view_name.name.as_str());
+        if !visiting_views.insert(current_view_ident.clone()) {
             return Err(LimboError::ParseError(format!(
-                "view {current_view_name} is circularly defined"
+                "view {} is circularly defined",
+                view_name.name
             )));
         }
 
@@ -2251,7 +2217,7 @@ mod rename_column_view {
                 columns: final_columns,
             }))
         })();
-        visiting_views.remove(&current_view_name);
+        visiting_views.remove(&current_view_ident);
         rewrite_result
     }
 
@@ -2259,7 +2225,6 @@ mod rename_column_view {
         view_columns: ViewColumnSchema,
         ctx: &ViewRewriteCtx,
     ) -> Vec<Column> {
-        let target_norm = ctx.target_table_norm.as_str();
         let mut columns = view_columns.columns;
 
         for view_column in &mut columns {
@@ -2270,8 +2235,8 @@ mod rename_column_view {
             if table_name_matches_target(
                 &table.name,
                 table.db_name.as_deref(),
-                target_norm,
-                &ctx.target_db_norm,
+                ctx.target_table,
+                ctx.target_db,
             ) {
                 if let Some(ref mut name) = view_column.column.name {
                     if name.as_str().eq_ignore_ascii_case(ctx.old_column) {
@@ -2312,16 +2277,16 @@ mod rename_column_view {
 
     #[derive(Clone)]
     struct ViewSourceInfo {
-        qualifiers: Vec<String>,
-        columns_before: HashSet<String>,
-        rename_map: HashMap<String, String>,
+        qualifiers: Vec<Identifier>,
+        columns_before: HashSet<Identifier>,
+        rename_map: HashMap<Identifier, String>,
         is_target_table: bool,
-        db_name: Option<String>,
+        db_name: Option<Identifier>,
     }
 
     impl ViewSourceInfo {
         fn matches_qualifier(&self, qualifier: &str) -> bool {
-            self.qualifiers.iter().any(|q| q == qualifier)
+            self.qualifiers.iter().any(|q| *q == qualifier)
         }
     }
 
@@ -2331,17 +2296,15 @@ mod rename_column_view {
 
     #[derive(Clone)]
     struct CteInfo {
-        columns_before: HashSet<String>,
-        rename_map: HashMap<String, String>,
+        columns_before: HashSet<Identifier>,
+        rename_map: HashMap<Identifier, String>,
     }
 
     struct ViewRewriteCtx<'a> {
         schema: &'a Schema,
         target_table: &'a str,
-        target_table_norm: String,
-        target_db_norm: String,
+        target_db: &'a str,
         old_column: &'a str,
-        old_column_norm: String,
         new_column: &'a str,
     }
 
@@ -2349,17 +2312,15 @@ mod rename_column_view {
         fn new(
             schema: &'a Schema,
             target_table: &'a str,
-            target_db_name: &'a str,
+            target_db: &'a str,
             old_column: &'a str,
             new_column: &'a str,
         ) -> Self {
             Self {
                 schema,
                 target_table,
-                target_table_norm: normalize_ident(target_table),
-                target_db_norm: normalize_ident(target_db_name),
+                target_db,
                 old_column,
-                old_column_norm: normalize_ident(old_column),
                 new_column,
             }
         }
@@ -2369,11 +2330,11 @@ mod rename_column_view {
         select: &mut ast::Select,
         ctx: &ViewRewriteCtx,
         outer_scopes: &[&[ViewSourceInfo]],
-        visiting_views: &mut HashSet<String>,
+        visiting_views: &mut HashSet<Identifier>,
     ) -> Result<bool> {
         let mut changed = false;
 
-        let mut ctes: HashMap<String, CteInfo> = HashMap::default();
+        let mut ctes: HashMap<Identifier, CteInfo> = HashMap::default();
         if let Some(ref mut with_clause) = select.with {
             for cte in &mut with_clause.ctes {
                 let mut before_cols = select_output_columns(&cte.select, ctx, false)?;
@@ -2387,14 +2348,11 @@ mod rename_column_view {
                 changed |= cte_changed;
                 let mut after_cols = select_output_columns(&cte.select, ctx, true)?;
                 apply_explicit_column_names(&mut after_cols, &cte.columns);
-                let rename_map = build_rename_map(&before_cols, &after_cols, &ctx.old_column_norm);
+                let rename_map = build_rename_map(&before_cols, &after_cols, ctx.old_column);
                 ctes.insert(
-                    normalize_ident(cte.tbl_name.as_str()),
+                    Identifier::from(cte.tbl_name.as_str()),
                     CteInfo {
-                        columns_before: before_cols
-                            .into_iter()
-                            .map(|c| normalize_ident(&c))
-                            .collect(),
+                        columns_before: before_cols.into_iter().map(Identifier::from).collect(),
                         rename_map,
                     },
                 );
@@ -2463,10 +2421,10 @@ mod rename_column_view {
     fn rewrite_one_select_for_column_rename(
         one_select: &mut ast::OneSelect,
         ctx: &ViewRewriteCtx,
-        ctes: &HashMap<String, CteInfo>,
+        ctes: &HashMap<Identifier, CteInfo>,
         outer_scopes: &[&[ViewSourceInfo]],
         changed: &mut bool,
-        visiting_views: &mut HashSet<String>,
+        visiting_views: &mut HashSet<Identifier>,
     ) -> Result<Option<Vec<ViewSourceInfo>>> {
         match one_select {
             ast::OneSelect::Select {
@@ -2583,10 +2541,10 @@ mod rename_column_view {
     fn rewrite_from_clause_for_column_rename(
         from_clause: &mut ast::FromClause,
         ctx: &ViewRewriteCtx,
-        ctes: &HashMap<String, CteInfo>,
+        ctes: &HashMap<Identifier, CteInfo>,
         outer_scopes: &[&[ViewSourceInfo]],
         changed: &mut bool,
-        visiting_views: &mut HashSet<String>,
+        visiting_views: &mut HashSet<Identifier>,
     ) -> Result<Vec<ViewSourceInfo>> {
         let mut sources = Vec::new();
         let first_source = rewrite_select_table_for_column_rename(
@@ -2631,7 +2589,7 @@ mod rename_column_view {
                             cols,
                             left_sources,
                             right_source,
-                            &ctx.old_column_norm,
+                            ctx.old_column,
                             ctx.new_column,
                         );
                     }
@@ -2646,25 +2604,25 @@ mod rename_column_view {
         select_table: &mut ast::SelectTable,
         visible_sources: &[ViewSourceInfo],
         ctx: &ViewRewriteCtx,
-        ctes: &HashMap<String, CteInfo>,
+        ctes: &HashMap<Identifier, CteInfo>,
         outer_scopes: &[&[ViewSourceInfo]],
         changed: &mut bool,
-        visiting_views: &mut HashSet<String>,
+        visiting_views: &mut HashSet<Identifier>,
     ) -> Result<ViewSourceInfo> {
         match select_table {
             ast::SelectTable::Table(tbl_name, alias, _) => {
-                let table_name_norm = normalize_ident(tbl_name.name.as_str());
-                let table_db_norm = tbl_name
+                let table_name_ident = Identifier::from(tbl_name.name.as_str());
+                let table_db_ident = tbl_name
                     .db_name
                     .as_ref()
-                    .map(|db| normalize_ident(db.as_str()));
+                    .map(|db| Identifier::from(db.as_str()));
                 let mut qualifiers = Vec::new();
-                qualifiers.push(table_name_norm.clone());
+                qualifiers.push(table_name_ident.clone());
                 if let Some(ref alias) = alias {
-                    qualifiers.push(normalize_ident(alias_name(alias)));
+                    qualifiers.push(Identifier::from(alias_name(alias)));
                 }
-                if table_db_norm.is_none() {
-                    if let Some(cte) = ctes.get(&table_name_norm) {
+                if table_db_ident.is_none() {
+                    if let Some(cte) = ctes.get(&table_name_ident) {
                         return Ok(ViewSourceInfo {
                             qualifiers,
                             columns_before: cte.columns_before.clone(),
@@ -2675,21 +2633,17 @@ mod rename_column_view {
                     }
                 }
 
-                let is_local = table_db_norm
-                    .as_deref()
-                    .is_none_or(|db| db == ctx.target_db_norm);
+                let is_local = table_db_ident
+                    .as_ref()
+                    .is_none_or(|db| *db == ctx.target_db);
 
                 if is_local {
-                    if let Some(view) = ctx
-                        .schema
-                        .views
-                        .get(&Identifier::from(table_name_norm.as_str()))
-                    {
+                    if let Some(view) = ctx.schema.views.get(&table_name_ident) {
                         let columns_before = view
                             .columns
                             .iter()
                             .filter_map(|col| col.name.clone())
-                            .map(|name| normalize_ident(&name))
+                            .map(Identifier::from)
                             .collect();
 
                         let mut rename_map = HashMap::default();
@@ -2697,7 +2651,7 @@ mod rename_column_view {
                             &view.sql,
                             ctx.schema,
                             ctx.target_table,
-                            &ctx.target_db_norm,
+                            ctx.target_db,
                             ctx.old_column,
                             ctx.new_column,
                             visiting_views,
@@ -2705,7 +2659,7 @@ mod rename_column_view {
                             rename_map = build_rename_map_from_columns(
                                 &view.columns,
                                 &rewritten.columns,
-                                &ctx.old_column_norm,
+                                ctx.old_column,
                             );
                         }
 
@@ -2714,21 +2668,21 @@ mod rename_column_view {
                             columns_before,
                             rename_map,
                             is_target_table: false,
-                            db_name: table_db_norm,
+                            db_name: table_db_ident,
                         });
                     }
                 }
                 let is_target = table_name_matches_target(
-                    &table_name_norm,
-                    table_db_norm.as_deref(),
-                    &ctx.target_table_norm,
-                    &ctx.target_db_norm,
+                    tbl_name.name.as_str(),
+                    table_db_ident.as_ref().map(|i| i.as_str()),
+                    ctx.target_table,
+                    ctx.target_db,
                 );
                 let columns_before = if is_local {
-                    table_source_columns(ctx.schema, &table_name_norm)
+                    table_source_columns(ctx.schema, tbl_name.name.as_str())
                         .unwrap_or_default()
                         .into_iter()
-                        .map(|c| normalize_ident(&c))
+                        .map(Identifier::from)
                         .collect()
                 } else {
                     HashSet::default()
@@ -2739,7 +2693,7 @@ mod rename_column_view {
                     columns_before,
                     rename_map: HashMap::default(),
                     is_target_table: is_target,
-                    db_name: table_db_norm,
+                    db_name: table_db_ident,
                 })
             }
             ast::SelectTable::Select(select, alias) => {
@@ -2747,17 +2701,14 @@ mod rename_column_view {
                 *changed |=
                     rewrite_view_select_for_column_rename(select, ctx, &[], visiting_views)?;
                 let after_cols = select_output_columns(select, ctx, true)?;
-                let rename_map = build_rename_map(&before_cols, &after_cols, &ctx.old_column_norm);
+                let rename_map = build_rename_map(&before_cols, &after_cols, ctx.old_column);
                 let qualifiers = alias
                     .as_ref()
-                    .map(|alias| vec![normalize_ident(alias_name(alias))])
+                    .map(|alias| vec![Identifier::from(alias_name(alias))])
                     .unwrap_or_default();
                 Ok(ViewSourceInfo {
                     qualifiers,
-                    columns_before: before_cols
-                        .into_iter()
-                        .map(|c| normalize_ident(&c))
-                        .collect(),
+                    columns_before: before_cols.into_iter().map(Identifier::from).collect(),
                     rename_map,
                     is_target_table: false,
                     db_name: None,
@@ -2774,17 +2725,14 @@ mod rename_column_view {
                     visiting_views,
                 )?;
                 let after_cols = from_clause_output_columns(from_clause, ctx, true)?;
-                let rename_map = build_rename_map(&before_cols, &after_cols, &ctx.old_column_norm);
+                let rename_map = build_rename_map(&before_cols, &after_cols, ctx.old_column);
                 let qualifiers = alias
                     .as_ref()
-                    .map(|alias| vec![normalize_ident(alias_name(alias))])
+                    .map(|alias| vec![Identifier::from(alias_name(alias))])
                     .unwrap_or_default();
                 Ok(ViewSourceInfo {
                     qualifiers,
-                    columns_before: before_cols
-                        .into_iter()
-                        .map(|c| normalize_ident(&c))
-                        .collect(),
+                    columns_before: before_cols.into_iter().map(Identifier::from).collect(),
                     rename_map,
                     is_target_table: false,
                     db_name: None,
@@ -2803,7 +2751,7 @@ mod rename_column_view {
                 }
                 let qualifiers = alias
                     .as_ref()
-                    .map(|alias| vec![normalize_ident(alias_name(alias))])
+                    .map(|alias| vec![Identifier::from(alias_name(alias))])
                     .unwrap_or_default();
                 Ok(ViewSourceInfo {
                     qualifiers,
@@ -2822,7 +2770,7 @@ mod rename_column_view {
         outer_scopes: &[&[ViewSourceInfo]],
         ctx: &ViewRewriteCtx,
         changed: &mut bool,
-        visiting_views: &mut HashSet<String>,
+        visiting_views: &mut HashSet<Identifier>,
     ) -> Result<()> {
         let mut outer_scopes_for_subqueries: Vec<&[ViewSourceInfo]> =
             Vec::with_capacity(outer_scopes.len() + 1);
@@ -2835,8 +2783,8 @@ mod rename_column_view {
                 e,
                 sources,
                 outer_scopes,
-                &ctx.target_db_norm,
-                &ctx.old_column_norm,
+                ctx.target_db,
+                ctx.old_column,
                 ctx.new_column,
             ) {
                 *changed = true;
@@ -2873,16 +2821,17 @@ mod rename_column_view {
         expr: &mut ast::Expr,
         sources: &[ViewSourceInfo],
         outer_scopes: &[&[ViewSourceInfo]],
-        target_db_norm: &str,
-        old_column_norm: &str,
+        target_db: &str,
+        old_column: &str,
         new_column: &str,
     ) -> bool {
+        let old_col_ident = Identifier::from(old_column);
         let apply_rename = |source: &ViewSourceInfo, set_name: &mut dyn FnMut(String)| {
             if source.is_target_table {
                 set_name(new_column.to_string());
                 return true;
             }
-            if let Some(mapped) = source.rename_map.get(old_column_norm) {
+            if let Some(mapped) = source.rename_map.get(&old_col_ident) {
                 set_name(mapped.to_string());
                 return true;
             }
@@ -2891,12 +2840,13 @@ mod rename_column_view {
 
         match expr {
             ast::Expr::Qualified(ns, col) => {
-                let ns_norm = normalize_ident(ns.as_str());
-                if !col.as_str().eq_ignore_ascii_case(old_column_norm) {
+                if *col != old_column {
                     return false;
                 }
+                let ns_ident = Identifier::from(ns.as_str());
+                let target_db_ident = Identifier::from(target_db);
                 let (source, local_ambiguous) =
-                    resolve_qualified(sources, &ns_norm, target_db_norm);
+                    resolve_qualified(sources, &ns_ident, &target_db_ident);
                 if let Some(source) = source {
                     return apply_rename(source, &mut |name| {
                         *col = ast::Name::exact(name);
@@ -2906,7 +2856,7 @@ mod rename_column_view {
                     return false;
                 }
                 for scope in outer_scopes {
-                    let (source, ambiguous) = resolve_qualified(scope, &ns_norm, target_db_norm);
+                    let (source, ambiguous) = resolve_qualified(scope, &ns_ident, &target_db_ident);
                     if let Some(source) = source {
                         return apply_rename(source, &mut |name| {
                             *col = ast::Name::exact(name);
@@ -2918,15 +2868,16 @@ mod rename_column_view {
                 }
             }
             ast::Expr::DoublyQualified(schema, ns, col) => {
-                let schema_norm = normalize_ident(schema.as_str());
-                if schema_norm != target_db_norm {
+                if *schema != target_db {
                     return false;
                 }
-                let ns_norm = normalize_ident(ns.as_str());
-                if !col.as_str().eq_ignore_ascii_case(old_column_norm) {
+                if *col != old_column {
                     return false;
                 }
-                let (source, local_ambiguous) = resolve_qualified(sources, &ns_norm, &schema_norm);
+                let ns_ident = Identifier::from(ns.as_str());
+                let schema_ident = Identifier::from(schema.as_str());
+                let (source, local_ambiguous) =
+                    resolve_qualified(sources, &ns_ident, &schema_ident);
                 if let Some(source) = source {
                     return apply_rename(source, &mut |name| {
                         *col = ast::Name::exact(name);
@@ -2936,7 +2887,7 @@ mod rename_column_view {
                     return false;
                 }
                 for scope in outer_scopes {
-                    let (source, ambiguous) = resolve_qualified(scope, &ns_norm, &schema_norm);
+                    let (source, ambiguous) = resolve_qualified(scope, &ns_ident, &schema_ident);
                     if let Some(source) = source {
                         return apply_rename(source, &mut |name| {
                             *col = ast::Name::exact(name);
@@ -2948,11 +2899,10 @@ mod rename_column_view {
                 }
             }
             ast::Expr::Id(col) | ast::Expr::Name(col) => {
-                if !col.as_str().eq_ignore_ascii_case(old_column_norm) {
+                if *col != old_column {
                     return false;
                 }
-                let col_norm = normalize_ident(col.as_str());
-                let (source, local_ambiguous) = resolve_unqualified(sources, &col_norm);
+                let (source, local_ambiguous) = resolve_unqualified(sources, &old_col_ident);
                 if let Some(source) = source {
                     return apply_rename(source, &mut |name| {
                         *expr = ast::Expr::Id(ast::Name::exact(name));
@@ -2962,7 +2912,7 @@ mod rename_column_view {
                     return false;
                 }
                 for scope in outer_scopes {
-                    let (source, ambiguous) = resolve_unqualified(scope, &col_norm);
+                    let (source, ambiguous) = resolve_unqualified(scope, &old_col_ident);
                     if let Some(source) = source {
                         return apply_rename(source, &mut |name| {
                             *expr = ast::Expr::Id(ast::Name::exact(name));
@@ -2980,11 +2930,11 @@ mod rename_column_view {
 
     fn resolve_unqualified<'a>(
         candidates: &'a [ViewSourceInfo],
-        old_column_norm: &str,
+        old_column: &Identifier,
     ) -> (Option<&'a ViewSourceInfo>, bool) {
         let mut matches = candidates
             .iter()
-            .filter(|s| s.columns_before.contains(old_column_norm));
+            .filter(|s| s.columns_before.contains(old_column));
         let Some(first) = matches.next() else {
             return (None, false);
         };
@@ -2996,12 +2946,12 @@ mod rename_column_view {
 
     fn resolve_qualified<'a>(
         candidates: &'a [ViewSourceInfo],
-        qualifier: &str,
-        target_db_norm: &str,
+        qualifier: &Identifier,
+        target_db: &Identifier,
     ) -> (Option<&'a ViewSourceInfo>, bool) {
         let mut matches = candidates.iter().filter(|s| {
-            s.matches_qualifier(qualifier)
-                && s.db_name.as_deref().is_none_or(|db| db == target_db_norm)
+            s.matches_qualifier(qualifier.as_str())
+                && s.db_name.as_ref().is_none_or(|db| db == target_db)
         });
         let Some(first) = matches.next() else {
             return (None, false);
@@ -3016,15 +2966,16 @@ mod rename_column_view {
         cols: &mut [ast::Name],
         left_sources: &[ViewSourceInfo],
         right: &ViewSourceInfo,
-        old_column_norm: &str,
+        old_column: &str,
         new_column: &str,
     ) -> bool {
         let mut changed = false;
+        let old_col_ident = Identifier::from(old_column);
         let left_map = left_sources
             .iter()
-            .find_map(|source| source.rename_map.get(old_column_norm));
+            .find_map(|source| source.rename_map.get(&old_col_ident));
         let left_has_target = left_sources.iter().any(|source| source.is_target_table);
-        let right_map = right.rename_map.get(old_column_norm);
+        let right_map = right.rename_map.get(&old_col_ident);
         let should_rename =
             left_has_target || right.is_target_table || left_map.is_some() || right_map.is_some();
         if !should_rename {
@@ -3036,7 +2987,7 @@ mod rename_column_view {
             .unwrap_or(new_column);
 
         for col in cols {
-            if col.as_str().eq_ignore_ascii_case(old_column_norm) {
+            if *col == old_column {
                 *col = ast::Name::exact(replacement.to_string());
                 changed = true;
             }
@@ -3052,7 +3003,6 @@ mod rename_column_view {
         let view_columns = extract_view_columns(select, ctx.schema)?;
         let mut columns = view_columns.columns;
         if apply_rename {
-            let target_norm = ctx.target_table_norm.as_str();
             for view_column in &mut columns {
                 if view_column.table_index == usize::MAX {
                     continue;
@@ -3061,8 +3011,8 @@ mod rename_column_view {
                 if table_name_matches_target(
                     &table.name,
                     table.db_name.as_deref(),
-                    target_norm,
-                    &ctx.target_db_norm,
+                    ctx.target_table,
+                    ctx.target_db,
                 ) {
                     if let Some(ref mut name) = view_column.column.name {
                         if name.as_str().eq_ignore_ascii_case(ctx.old_column) {
@@ -3114,14 +3064,14 @@ mod rename_column_view {
     fn build_rename_map(
         before_cols: &[String],
         after_cols: &[String],
-        old_column_norm: &str,
-    ) -> HashMap<String, String> {
+        old_column: &str,
+    ) -> HashMap<Identifier, String> {
         let mut map = HashMap::default();
         for (before, after) in before_cols.iter().zip(after_cols.iter()) {
-            if before.as_str().eq_ignore_ascii_case(old_column_norm)
-                && !after.as_str().eq_ignore_ascii_case(before.as_str())
+            if before.eq_ignore_ascii_case(old_column)
+                && !after.eq_ignore_ascii_case(before.as_str())
             {
-                map.insert(old_column_norm.to_string(), after.to_string());
+                map.insert(Identifier::from(old_column), after.to_string());
             }
         }
         map
@@ -3130,8 +3080,8 @@ mod rename_column_view {
     fn build_rename_map_from_columns(
         before_cols: &[Column],
         after_cols: &[Column],
-        old_column_norm: &str,
-    ) -> HashMap<String, String> {
+        old_column: &str,
+    ) -> HashMap<Identifier, String> {
         if before_cols.len() != after_cols.len() {
             return HashMap::default();
         }
@@ -3143,12 +3093,10 @@ mod rename_column_view {
             let Some(after_name) = after.name.as_ref() else {
                 continue;
             };
-            if before_name.as_str().eq_ignore_ascii_case(old_column_norm)
-                && !after_name
-                    .as_str()
-                    .eq_ignore_ascii_case(before_name.as_str())
+            if before_name.eq_ignore_ascii_case(old_column)
+                && !after_name.eq_ignore_ascii_case(before_name.as_str())
             {
-                map.insert(old_column_norm.to_string(), after_name.to_string());
+                map.insert(Identifier::from(old_column), after_name.to_string());
             }
         }
         map
@@ -3157,15 +3105,15 @@ mod rename_column_view {
     fn table_name_matches_target(
         table_name: &str,
         table_db: Option<&str>,
-        target_table_norm: &str,
-        target_db_norm: &str,
+        target_table: &str,
+        target_db: &str,
     ) -> bool {
-        if !table_name.eq_ignore_ascii_case(target_table_norm) {
+        if !table_name.eq_ignore_ascii_case(target_table) {
             return false;
         }
         match table_db {
             None => true,
-            Some(db) => db.eq_ignore_ascii_case(target_db_norm),
+            Some(db) => db.eq_ignore_ascii_case(target_db),
         }
     }
 
@@ -3179,8 +3127,7 @@ mod rename_column_view {
                     .collect(),
             );
         }
-        let table_norm = normalize_ident(table_name);
-        if let Some(view) = schema.views.get(&Identifier::from(table_norm.as_str())) {
+        if let Some(view) = schema.views.get(&Identifier::from(table_name)) {
             return Some(
                 view.columns
                     .iter()
@@ -3455,17 +3402,16 @@ fn from_clause_target_qualifiers_inner(
     from_clause: &ast::FromClause,
     target_table: &str,
 ) -> Vec<String> {
-    let target_table = normalize_ident(target_table);
     let mut qualifiers = Vec::new();
     let mut seen = HashSet::default();
     collect_target_qualifiers(
         &from_clause.select,
-        &target_table,
+        target_table,
         &mut qualifiers,
         &mut seen,
     );
     for join in &from_clause.joins {
-        collect_target_qualifiers(&join.table, &target_table, &mut qualifiers, &mut seen);
+        collect_target_qualifiers(&join.table, target_table, &mut qualifiers, &mut seen);
     }
     qualifiers
 }
@@ -3474,22 +3420,23 @@ fn collect_target_qualifiers(
     st: &ast::SelectTable,
     target_table: &str,
     qualifiers: &mut Vec<String>,
-    seen: &mut HashSet<String>,
+    seen: &mut HashSet<Identifier>,
 ) {
     let ast::SelectTable::Table(name, alias, _) = st else {
         return;
     };
-    if !name.name.as_str().eq_ignore_ascii_case(target_table) {
+    if name.name != target_table {
         return;
     }
 
-    if seen.insert(target_table.to_string()) {
+    let target_ident = Identifier::from(target_table);
+    if seen.insert(target_ident) {
         qualifiers.push(target_table.to_string());
     }
     if let Some(alias) = alias {
-        let alias_norm = normalize_ident(alias.name().as_str());
-        if seen.insert(alias_norm.clone()) {
-            qualifiers.push(alias_norm);
+        let alias_ident = Identifier::from(alias.name().as_str());
+        if seen.insert(alias_ident) {
+            qualifiers.push(alias.name().as_str().to_owned());
         }
     }
 }
@@ -3645,12 +3592,14 @@ fn rename_result_identifiers_scoped(
                 ast::Expr::Qualified(ref tbl, ref col_name)
                     if col_name.as_str().eq_ignore_ascii_case(from) =>
                 {
-                    let tbl_norm = normalize_ident(tbl.as_str());
-                    let should_rename = if tbl_norm == "new" || tbl_norm == "old" {
+                    let should_rename = if *tbl == "new" || *tbl == "old" {
                         is_renaming_trigger_table
                     } else {
-                        target_qualifiers.is_some_and(|qualifiers| qualifiers.contains(&tbl_norm))
-                            || tbl_norm.eq_ignore_ascii_case(target_table)
+                        target_qualifiers.is_some_and(|qualifiers| {
+                            qualifiers
+                                .iter()
+                                .any(|q| q.eq_ignore_ascii_case(tbl.as_str()))
+                        }) || tbl.as_str().eq_ignore_ascii_case(target_table)
                     };
                     if should_rename {
                         let tbl = tbl.clone();
@@ -3840,16 +3789,16 @@ fn expr_still_references_renamed_column(
                 );
             }
             ast::Expr::Qualified(ns, col) | ast::Expr::DoublyQualified(_, ns, col) => {
-                if col.as_str().eq_ignore_ascii_case(old_col) {
-                    let ns_norm = normalize_ident(ns.as_str());
-                    if ((ns_norm == "new" || ns_norm == "old")
+                if col.as_str().eq_ignore_ascii_case(old_col)
+                    && (((*ns == "new" || *ns == "old")
                         && target_table.eq_ignore_ascii_case(trigger_table))
-                        || visible_target_qualifiers.contains(&ns_norm)
+                        || visible_target_qualifiers
+                            .iter()
+                            .any(|q| q.eq_ignore_ascii_case(ns.as_str()))
                         || (target_table.eq_ignore_ascii_case(trigger_table)
-                            && ns_norm.eq_ignore_ascii_case(trigger_table))
-                    {
-                        found = true;
-                    }
+                            && ns.as_str().eq_ignore_ascii_case(trigger_table)))
+                {
+                    found = true;
                 }
             }
             ast::Expr::Id(name) | ast::Expr::Name(name) => {
@@ -4685,13 +4634,6 @@ pub mod tests {
     use turso_parser::ast::{self, Expr, FunctionTail, Literal, Name, Operator::*, Type, Variable};
     use turso_parser::parser::Parser;
 
-    #[test]
-    fn test_normalize_ident() {
-        assert_eq!(normalize_ident("foo"), "foo");
-        assert_eq!(normalize_ident("FOO"), "foo");
-        assert_eq!(normalize_ident("ὈΔΥΣΣΕΎΣ"), "ὀδυσσεύς");
-    }
-
     fn schema_with_tables(create_table_sqls: &[&str]) -> Schema {
         let mut schema = Schema::new();
         for (index, create_table_sql) in create_table_sqls.iter().enumerate() {
@@ -5357,16 +5299,6 @@ pub mod tests {
             }),
         };
         assert!(exprs_are_equivalent(&cast1, &cast2));
-    }
-
-    #[test]
-    fn test_ident_equivalency() {
-        assert!(check_ident_equivalency("\"foo\"", "foo"));
-        assert!(check_ident_equivalency("[foo]", "foo"));
-        assert!(check_ident_equivalency("`FOO`", "foo"));
-        assert!(check_ident_equivalency("\"foo\"", "`FOO`"));
-        assert!(!check_ident_equivalency("\"foo\"", "[bar]"));
-        assert!(!check_ident_equivalency("foo", "\"bar\""));
     }
 
     #[test]

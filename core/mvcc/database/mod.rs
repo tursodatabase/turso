@@ -2274,10 +2274,9 @@ impl<Clock: LogicalClock> MvStore<Clock> {
         table_valued_functions: &[Arc<crate::vtab::VirtualTable>],
     ) {
         for vtab in table_valued_functions {
-            let normalized_name = crate::util::normalize_ident(&vtab.name);
             schema
                 .tables
-                .entry(normalized_name.into())
+                .entry(Identifier::from(vtab.name.as_str()))
                 .or_insert_with(|| Arc::new(Table::Virtual(vtab.clone())));
         }
     }
@@ -4561,7 +4560,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                         connection
                             .attached_databases()
                             .read()
-                            .get_database_by_name(&crate::util::normalize_ident(alias))
+                            .get_database_by_name(&alias.to_ascii_lowercase())
                             .map(|(idx, _)| idx)
                     };
                     fresh.handle_schema_row(

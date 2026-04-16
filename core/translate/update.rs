@@ -10,11 +10,11 @@ use crate::translate::planner::{parse_limit, ROWID_STRS};
 use crate::{
     bail_parse_error,
     schema::{Schema, Table},
-    util::normalize_ident,
     vdbe::builder::{ProgramBuilder, ProgramBuilderOpts},
     CaptureDataChangesExt, Connection,
 };
 use turso_parser::ast::{self, Expr, SortOrder};
+use turso_parser::identifier::Identifier;
 
 use super::emitter::emit_program;
 use super::expr::process_returning_clause;
@@ -275,11 +275,15 @@ pub fn prepare_update_plan(
     // Plan CTEs and add them as outer query references for subquery resolution
     plan_ctes_as_outer_refs(with, resolver, program, &mut table_references, connection)?;
 
-    let column_lookup: HashMap<String, usize> = table
+    let column_lookup: HashMap<Identifier, usize> = table
         .columns()
         .iter()
         .enumerate()
-        .filter_map(|(i, col)| col.name.as_ref().map(|name| (name.to_lowercase(), i)))
+        .filter_map(|(i, col)| {
+            col.name
+                .as_ref()
+                .map(|name| (Identifier::from(name.as_str()), i))
+        })
         .collect();
 
     let mut set_clauses: Vec<(usize, Box<Expr>)> = Vec::with_capacity(body.sets.len());
@@ -309,9 +313,7 @@ pub fn prepare_update_plan(
         }
 
         for (col_name, expr) in set.col_names.iter().zip(values.iter()) {
-            let ident = normalize_ident(col_name.as_str());
-
-            let col_index = match column_lookup.get(&ident) {
+            let col_index = match column_lookup.get(col_name.identifier()) {
                 Some(idx) => {
                     // cannot update generated columns directly
                     table.columns()[*idx].ensure_not_generated("UPDATE", col_name.as_str())?;
@@ -319,7 +321,7 @@ pub fn prepare_update_plan(
                 }
                 None => {
                     // Check if this is the 'rowid' keyword
-                    if ROWID_STRS.iter().any(|s| s.eq_ignore_ascii_case(&ident)) {
+                    if ROWID_STRS.iter().any(|s| col_name == *s) {
                         // Find the rowid alias column if it exists
                         if let Some((idx, _col)) = table
                             .columns()
