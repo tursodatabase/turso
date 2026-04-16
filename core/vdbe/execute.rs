@@ -12464,13 +12464,13 @@ pub fn op_alter_column(
     let new_column = crate::schema::Column::try_from(definition.as_ref())?;
     let new_name = definition.col_name.as_str().to_owned();
 
-    let view_rewrites: Vec<(usize, String, RewrittenView)> = if *rename {
+    let view_rewrites: Vec<(usize, Identifier, RewrittenView)> = if *rename {
         let target_db_name = conn.get_database_name_by_index(*db).ok_or_else(|| {
             LimboError::InternalError(format!("unknown database id {} during ALTER TABLE", *db))
         })?;
         let mut all_rewrites = conn.with_schema(
             *db,
-            |schema| -> crate::Result<Vec<(usize, String, RewrittenView)>> {
+            |schema| -> crate::Result<Vec<(usize, Identifier, RewrittenView)>> {
                 let mut rewrites = Vec::new();
                 for (view_name, view) in schema.views.iter() {
                     if let Some(rewritten) = rewrite_view_sql_for_column_rename(
@@ -12481,7 +12481,7 @@ pub fn op_alter_column(
                         &old_column_name,
                         &new_name,
                     )? {
-                        rewrites.push((*db, view_name.as_str().to_owned(), rewritten));
+                        rewrites.push((*db, view_name.clone(), rewritten));
                     }
                 }
                 Ok(rewrites)
@@ -12491,7 +12491,7 @@ pub fn op_alter_column(
         if *db != crate::TEMP_DB_ID {
             let temp_rewrites = conn.with_schema(
                 crate::TEMP_DB_ID,
-                |schema| -> crate::Result<Vec<(usize, String, RewrittenView)>> {
+                |schema| -> crate::Result<Vec<(usize, Identifier, RewrittenView)>> {
                     let mut rewrites = Vec::new();
                     for (view_name, view) in schema.views.iter() {
                         if let Some(rewritten) = rewrite_view_sql_for_column_rename(
@@ -12502,11 +12502,7 @@ pub fn op_alter_column(
                             &old_column_name,
                             &new_name,
                         )? {
-                            rewrites.push((
-                                crate::TEMP_DB_ID,
-                                view_name.as_str().to_owned(),
-                                rewritten,
-                            ));
+                            rewrites.push((crate::TEMP_DB_ID, view_name.clone(), rewritten));
                         }
                     }
                     Ok(rewrites)
@@ -12659,8 +12655,7 @@ pub fn op_alter_column(
 
         for (view_db, view_name, rewritten) in view_rewrites {
             conn.with_database_schema_mut(view_db, move |schema| -> crate::Result<()> {
-                if let Some(view_arc) = schema.views.get_mut(&Identifier::from(view_name.as_str()))
-                {
+                if let Some(view_arc) = schema.views.get_mut(&view_name) {
                     let view = Arc::make_mut(view_arc);
                     view.sql = rewritten.sql;
                     view.select_stmt = rewritten.select_stmt;

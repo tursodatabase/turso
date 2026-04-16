@@ -2276,7 +2276,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
         for vtab in table_valued_functions {
             schema
                 .tables
-                .entry(Identifier::from(vtab.name.as_str()))
+                .entry(vtab.name.clone())
                 .or_insert_with(|| Arc::new(Table::Virtual(vtab.clone())));
         }
     }

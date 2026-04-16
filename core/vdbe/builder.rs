@@ -337,7 +337,7 @@ pub struct ProgramBuilder {
     /// Stack of CTE names currently being planned. Used to detect circular
     /// references in non-recursive CTEs and to prevent fallthrough to schema
     /// resolution for same-named tables/views.
-    ctes_being_defined: Vec<String>,
+    ctes_being_defined: Vec<String>, // TODO: Vec<Identifier>
     /// Counter for subquery numbering in EXPLAIN QUERY PLAN output.
     next_subquery_eqp_id: usize,
 }

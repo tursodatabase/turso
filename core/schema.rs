@@ -27,7 +27,7 @@ pub enum ViewState {
 /// Simple view structure for non-materialized views
 #[derive(Debug)]
 pub struct View {
-    pub name: String,
+    pub name: String, // TODO: Identifier
     pub sql: String,
     pub select_stmt: ast::Select,
     pub columns: Vec<Column>,
@@ -87,9 +87,9 @@ pub type ViewsMap = HashMap<Identifier, Arc<View>>;
 /// Trigger structure
 #[derive(Debug, Clone)]
 pub struct Trigger {
-    pub name: String,
+    pub name: String, // TODO: Identifier
     pub sql: String,
-    pub table_name: String,
+    pub table_name: String, // TODO: Identifier
     pub time: turso_parser::ast::TriggerTime,
     pub event: turso_parser::ast::TriggerEvent,
     pub for_each_row: bool,
@@ -462,6 +462,9 @@ fn bootstrap_builtin_types(registry: &mut HashMap<Identifier, Arc<TypeDef>>) {
     }
 }
 
+// TODO: Schema lookup methods (get_table, get_btree_table, get_view, get_trigger,
+// get_indices, etc.) still take &str and create Identifier internally. They should
+// take &Identifier to avoid allocation on every lookup call.
 impl Schema {
     fn normalize_table_lookup_name(&self, name: &str) -> Identifier {
         let id = Identifier::from(name);
@@ -3685,11 +3688,11 @@ pub fn _build_pseudo_table(columns: &[ResultColumn]) -> PseudoCursorType {
 #[derive(Debug, Clone)]
 pub struct ForeignKey {
     /// Columns in this table (child side)
-    pub child_columns: Vec<String>,
+    pub child_columns: Vec<String>, // TODO: Vec<Identifier>
     /// Referenced (parent) table
-    pub parent_table: String,
+    pub parent_table: String, // TODO: Identifier
     /// Parent-side referenced columns
-    pub parent_columns: Vec<String>,
+    pub parent_columns: Vec<String>, // TODO: Vec<Identifier>
     pub on_delete: RefAct,
     pub on_update: RefAct,
     /// DEFERRABLE INITIALLY DEFERRED
@@ -3782,7 +3785,7 @@ impl ResolvedFkRef {
 
 #[derive(Debug, Clone)]
 pub struct Column {
-    pub name: Option<String>,
+    pub name: Option<String>, // TODO: Option<Identifier>
 
     pub ty_str: String,
     pub ty_params: Vec<Box<Expr>>,
@@ -4281,7 +4284,7 @@ pub struct Index {
 #[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct IndexColumn {
-    pub name: String,
+    pub name: String, // TODO: Identifier
     pub order: SortOrder,
     /// the position of the column in the source table.
     /// for example:

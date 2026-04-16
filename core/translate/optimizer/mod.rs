@@ -1636,7 +1636,7 @@ fn optimize_table_access(
 
     let has_expression_index = table_references.joined_tables().iter().any(|t| {
         matches!(&t.table, Table::BTree(btree) if available_indexes
-            .get(&Identifier::from(btree.name.as_str()))
+            .get(&btree.name)
             .is_some_and(|indexes| indexes.iter().any(|index| index.is_expression_index())))
     });
 

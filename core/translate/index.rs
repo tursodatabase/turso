@@ -678,9 +678,8 @@ fn validate_index_expression(expr: &Expr, table: &BTreeTable) -> bool {
         return false;
     }
 
-    let tbl_id = Identifier::from(table.name.as_str());
     let has_col = |name: &str| table.get_column(name).is_some();
-    let is_tbl = |ns: &str| tbl_id == ns;
+    let is_tbl = |ns: &str| table.name == ns;
     let is_deterministic_fn = |name: &str, args: &[Box<Expr>]| {
         Func::resolve_function(name, args.len())
             .is_ok_and(|f| f.is_some_and(|f| is_valid_index_function_call(&f, args)))
