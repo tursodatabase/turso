@@ -642,6 +642,7 @@ fn emit_delete_row_common(
                     table_name,
                     main_table_cursor_id,
                     rowid_reg,
+                    None,
                     delete_db_id,
                 )?
             } else {

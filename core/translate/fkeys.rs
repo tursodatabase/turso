@@ -1693,12 +1693,18 @@ impl ForeignKeyActions<PreparedFkDeleteAction> {
     /// NoAction/Restrict checks. Returns prepared actions for CASCADE/SetNull/
     /// SetDefault that must be fired AFTER the parent row is deleted (step 4 per
     /// SQLite docs: delete parent row first, then perform FK cascade actions).
+    ///
+    /// `replace_new_parent_regs` is only needed for REPLACE-style updates.
+    /// When present, an immediate `ON DELETE NO ACTION` check is skipped if the
+    /// row being inserted right after the implicit delete restores the same
+    /// parent key, because that delete cannot leave any child orphaned.
     pub fn prepare_fk_delete_actions(
         program: &mut ProgramBuilder,
         resolver: &mut Resolver,
         parent_table_name: &str,
         parent_cursor_id: usize,
         parent_rowid_reg: usize,
+        replace_new_parent_regs: Option<(usize, usize)>,
         database_id: usize,
     ) -> Result<ForeignKeyActions<PreparedFkDeleteAction>> {
         let parent_bt = resolver
@@ -1725,7 +1731,60 @@ impl ForeignKeyActions<PreparedFkDeleteAction> {
             )?;
 
             match fk_ref.fk.on_delete {
-                RefAct::NoAction | RefAct::Restrict => {
+                RefAct::NoAction => {
+                    // For REPLACE-style updates with immediate NO ACTION: skip the
+                    // check when the replacement row restores the same parent key,
+                    // since the implicit delete cannot orphan any children.
+                    if !fk_ref.fk.deferred {
+                        if let Some((replace_values_start, replace_rowid_reg)) =
+                            replace_new_parent_regs
+                        {
+                            let skip = program.allocate_label();
+                            let changed = program.allocate_label();
+                            let new_key_start = program.alloc_registers(ncols);
+                            copy_key_from_values(
+                                program,
+                                &parent_bt,
+                                &parent_cols,
+                                replace_values_start,
+                                replace_rowid_reg,
+                                new_key_start,
+                            )?;
+                            emit_key_change_check(
+                                program,
+                                key_regs_start,
+                                new_key_start,
+                                ncols,
+                                skip,
+                                changed,
+                            );
+                            program.preassign_label_to_next_insn(changed);
+                            emit_fk_delete_parent_existence_check_single(
+                                program,
+                                &fk_ref,
+                                &parent_bt,
+                                parent_table_name,
+                                parent_cursor_id,
+                                parent_rowid_reg,
+                                database_id,
+                                resolver,
+                            )?;
+                            program.preassign_label_to_next_insn(skip);
+                            continue;
+                        }
+                    }
+                    emit_fk_delete_parent_existence_check_single(
+                        program,
+                        &fk_ref,
+                        &parent_bt,
+                        parent_table_name,
+                        parent_cursor_id,
+                        parent_rowid_reg,
+                        database_id,
+                        resolver,
+                    )?;
+                }
+                RefAct::Restrict => {
                     emit_fk_delete_parent_existence_check_single(
                         program,
                         &fk_ref,
