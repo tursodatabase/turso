@@ -185,7 +185,7 @@ fn collect_changed_cols(
 fn upsert_index_is_affected(
     table: &Table,
     idx: &Index,
-    changed_cols: &ColumnMask,
+    directly_changed_cols: &ColumnMask,
     rowid_changed: bool,
 ) -> crate::Result<bool> {
     if rowid_changed {
@@ -193,7 +193,7 @@ fn upsert_index_is_affected(
     }
 
     for c in referenced_index_cols(idx, table)? {
-        if changed_cols.get(c) {
+        if directly_changed_cols.get(c) {
             return Ok(true);
         }
     }
@@ -665,14 +665,7 @@ pub fn emit_upsert(
         )?;
     }
 
-    let (changed_cols, rowid_changed) = collect_changed_cols(table, set_pairs);
-    // Expand to include virtual columns that transitively depend on SET columns,
-    // so that indexes on virtual columns are correctly updated.
-    let changed_cols = if ctx.table.has_virtual_columns() {
-        ctx.table.columns_affected_by_update(&changed_cols)?
-    } else {
-        changed_cols
-    };
+    let (directly_changed_cols, rowid_changed) = collect_changed_cols(table, set_pairs);
 
     // Fire BEFORE UPDATE triggers
     let upsert_database_id = ctx.database_id;
@@ -802,7 +795,7 @@ pub fn emit_upsert(
                     ctx.cursor_id,
                     new_start,
                     rowid_new_reg,
-                    &changed_cols,
+                    &directly_changed_cols,
                     upsert_database_id,
                     resolver,
                     &layout,
@@ -814,7 +807,7 @@ pub fn emit_upsert(
             let affected_upsert_indices: Vec<_> = upsert_indices
                 .iter()
                 .filter_map(|idx| {
-                    upsert_index_is_affected(table, idx, &changed_cols, rowid_changed)
+                    upsert_index_is_affected(table, idx, &directly_changed_cols, rowid_changed)
                         .map(|affected| affected.then_some(idx))
                         .transpose()
                 })
@@ -863,7 +856,7 @@ pub fn emit_upsert(
                 })
                 .expect("index exists");
 
-            if !upsert_index_is_affected(table, &idx_meta, &changed_cols, rowid_changed)? {
+            if !upsert_index_is_affected(table, &idx_meta, &directly_changed_cols, rowid_changed)? {
                 continue; // skip untouched index completely
             }
             let k = idx_meta.columns.len();
