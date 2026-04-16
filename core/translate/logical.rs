@@ -2401,6 +2401,7 @@ impl<'a> LogicalPlanBuilder<'a> {
 mod tests {
     use super::*;
     use crate::schema::{BTreeTable, ColDef, Column as SchemaColumn, Schema, Type};
+    use turso_parser::identifier::Identifier;
     use turso_parser::parser::Parser;
 
     fn create_test_schema() -> Schema {
@@ -2428,7 +2429,7 @@ mod tests {
         ];
         let logical_to_physical_map = BTreeTable::build_logical_to_physical_map(&columns);
         let users_table = BTreeTable {
-            name: "users".to_string(),
+            name: Identifier::from("users"),
             root_page: 2,
             primary_key_columns: vec![("id".to_string(), turso_parser::ast::SortOrder::Asc)],
             foreign_keys: vec![],
@@ -2480,7 +2481,7 @@ mod tests {
         ];
         let logical_to_physical_map = BTreeTable::build_logical_to_physical_map(&columns);
         let orders_table = BTreeTable {
-            name: "orders".to_string(),
+            name: Identifier::from("orders"),
             root_page: 3,
             primary_key_columns: vec![("id".to_string(), turso_parser::ast::SortOrder::Asc)],
             columns,
@@ -2532,7 +2533,7 @@ mod tests {
         ];
         let logical_to_physical_map = BTreeTable::build_logical_to_physical_map(&columns);
         let products_table = BTreeTable {
-            name: "products".to_string(),
+            name: Identifier::from("products"),
             root_page: 4,
             primary_key_columns: vec![("id".to_string(), turso_parser::ast::SortOrder::Asc)],
             columns,

@@ -12167,10 +12167,10 @@ pub fn op_rename_table(
             let autoindex_prefix = format!("sqlite_autoindex_{from}_");
             indexes.iter_mut().for_each(|index| {
                 let index = Arc::make_mut(index);
-                to.clone_into(&mut index.table_name);
+                index.table_name = to_ident.clone();
                 // Rename autoindexes to match the new table name
-                if let Some(suffix) = index.name.strip_prefix(&autoindex_prefix) {
-                    index.name = format!("sqlite_autoindex_{to}_{suffix}");
+                if let Some(suffix) = index.name.as_str().strip_prefix(&autoindex_prefix) {
+                    index.name = format!("sqlite_autoindex_{to}_{suffix}").into();
                 }
             });
 
@@ -12197,10 +12197,10 @@ pub fn op_rename_table(
                     rewrite_check_expr_table_refs(&mut check.expr, from, to);
                 }
 
-                to.clone_into(&mut btree.name);
+                btree.name = Identifier::from(to.as_str());
             }
             Table::Virtual(vtab) => {
-                Arc::make_mut(vtab).name.clone_from(to);
+                Arc::make_mut(vtab).name = Identifier::from(to.as_str());
             }
             _ => panic!("only btree and virtual tables can be renamed"),
         }

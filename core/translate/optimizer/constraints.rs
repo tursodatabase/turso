@@ -291,11 +291,7 @@ fn estimate_selectivity(
                                     return selectivity_when_unique;
                                 }
                                 if let Some(stats) = table_stats {
-                                    if let Some(idx_stat) = stats.index_stats.get(
-                                        &turso_parser::identifier::Identifier::from(
-                                            index.name.as_str(),
-                                        ),
-                                    ) {
+                                    if let Some(idx_stat) = stats.index_stats.get(&index.name) {
                                         if let (Some(total), Some(&avg_rows)) = (
                                             idx_stat.total_rows,
                                             idx_stat.avg_rows_per_distinct_prefix.first(),
@@ -350,7 +346,7 @@ fn estimate_constraint_selectivity(
 ) -> f64 {
     estimate_selectivity(
         schema,
-        table_reference.table.get_name(),
+        table_reference.table.get_name().as_str(),
         column,
         column_pos,
         available_indexes,
@@ -402,7 +398,7 @@ pub fn constraints_from_where_clause(
             table_id: table_reference.internal_id,
             constraints: Vec::new(),
             candidates: available_indexes
-                .get(&Identifier::from(table_reference.table.get_name()))
+                .get(table_reference.table.get_name())
                 .map_or(Vec::new(), |indexes| {
                     indexes
                         .iter()
@@ -507,7 +503,7 @@ pub fn constraints_from_where_clause(
                             false,
                         );
                         tracing::debug!(
-                            table = table_reference.table.get_name(),
+                            table = table_reference.table.get_name().as_str(),
                             where_clause_pos = i,
                             operator = ?operator,
                             lhs_mask = ?table_mask_from_expr(rhs, table_references, subqueries)?,
@@ -601,7 +597,7 @@ pub fn constraints_from_where_clause(
                             false,
                         );
                         tracing::debug!(
-                            table = table_reference.table.get_name(),
+                            table = table_reference.table.get_name().as_str(),
                             where_clause_pos = i,
                             operator = ?operator,
                             lhs_mask = ?table_mask_from_expr(lhs, table_references, subqueries)?,
@@ -638,7 +634,7 @@ pub fn constraints_from_where_clause(
                 }
                 let table_stats = schema
                     .analyze_stats
-                    .table_stats(table_reference.table.get_name());
+                    .table_stats(table_reference.table.get_name().as_str());
                 let row_count = table_stats
                     .and_then(|s| s.row_count)
                     .unwrap_or(params.rows_per_table_fallback as u64)
@@ -703,7 +699,7 @@ pub fn constraints_from_where_clause(
                     let estimated_values = params.in_subquery_rows;
                     let table_stats = schema
                         .analyze_stats
-                        .table_stats(table_reference.table.get_name());
+                        .table_stats(table_reference.table.get_name().as_str());
                     let row_count = table_stats
                         .and_then(|s| s.row_count)
                         .unwrap_or(params.rows_per_table_fallback as u64)
@@ -808,7 +804,7 @@ pub fn constraints_from_where_clause(
                 });
             }
             for index in available_indexes
-                .get(&Identifier::from(table_reference.table.get_name()))
+                .get(table_reference.table.get_name())
                 .unwrap_or(&VecDeque::new())
                 .iter()
                 .filter(|idx| idx.index_method.is_none())

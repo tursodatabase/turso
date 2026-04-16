@@ -57,7 +57,7 @@ fn resolve_analyze_targets(
             }
 
             // Check if it's an attached database name
-            if let Some((db_id, _)) = resolver.get_attached_database(name.as_str()) {
+            if let Some((db_id, _)) = resolver.get_attached_database(name.identifier()) {
                 let targets = collect_all_tables_in_db(db_id, resolver);
                 return Ok((db_id, targets));
             }
@@ -113,10 +113,7 @@ fn resolve_targets_in_db(
     let found: Option<(Arc<BTreeTable>, Arc<Index>)> =
         resolver.with_schema(database_id, |schema| {
             for (table_name, indexes) in schema.indexes.iter() {
-                if let Some(index) = indexes
-                    .iter()
-                    .find(|idx| idx.name.eq_ignore_ascii_case(name))
-                {
+                if let Some(index) = indexes.iter().find(|idx| idx.name == name) {
                     if let Some(table) = schema.get_btree_table(table_name.as_str()) {
                         return Some((table, index.clone()));
                     }
@@ -408,7 +405,7 @@ pub fn translate_analyze(
         let indexes: Vec<Arc<Index>> = match target_index {
             Some(idx) => vec![idx],
             None => resolver.with_schema(database_id, |s| {
-                s.get_indices(&target_table.name)
+                s.get_indices(target_table.name.as_str())
                     .filter(|idx| idx.index_method.is_none()) // skip custom for now
                     .cloned()
                     .collect()

@@ -1771,7 +1771,7 @@ pub fn translate_drop_table(
                 )));
             }
             program.emit_insn(Insn::VDestroy {
-                table_name: vtab.name.clone(),
+                table_name: vtab.name.to_string(),
                 db: database_id,
             });
         }
@@ -1801,7 +1801,7 @@ pub fn translate_drop_table(
         let logical_to_physical_map = BTreeTable::build_logical_to_physical_map(&columns);
         let simple_table_rc = Arc::new(BTreeTable {
             root_page: 0, // Not relevant for ephemeral table definition
-            name: "ephemeral_scratch".to_string(),
+            name: Identifier::from("ephemeral_scratch"),
             has_rowid: true,
             has_autoincrement: false,
             primary_key_columns: vec![],

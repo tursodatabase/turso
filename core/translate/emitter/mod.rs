@@ -46,6 +46,7 @@ use tracing::instrument;
 use turso_parser::ast::{
     self, Expr, Literal, ResolveType, SubqueryType, TableInternalId, TriggerTime,
 };
+use turso_parser::identifier::Identifier;
 
 pub(crate) mod delete;
 pub(crate) mod gencol;
@@ -458,7 +459,7 @@ impl<'a> Resolver<'a> {
             .indexes
             .values()
             .flat_map(|indexes| indexes.iter())
-            .any(|index| index.name.eq_ignore_ascii_case(index_name))
+            .any(|index| index.name == index_name)
     }
 
     fn schema_has_trigger(schema: &Schema, trigger_name: &str) -> bool {
@@ -547,12 +548,13 @@ impl<'a> Resolver<'a> {
                 Ok(0)
             } else if *db_name == "temp" {
                 Ok(1)
-            } else if let Some((idx, _attached_db)) = self.get_attached_database(db_name.as_str()) {
+            } else if let Some((idx, _attached_db)) =
+                self.get_attached_database(db_name.identifier())
+            {
                 Ok(idx)
             } else {
                 Err(LimboError::InvalidArgument(format!(
-                    "no such database: {}",
-                    db_name.as_str()
+                    "no such database: {db_name}"
                 )))
             }
         } else {
@@ -593,9 +595,13 @@ impl<'a> Resolver<'a> {
         Ok(resolved_id)
     }
 
-    // Get an attached database by alias name
-    pub(crate) fn get_attached_database(&self, alias: &str) -> Option<(usize, Arc<Database>)> {
-        self.attached_databases.read().get_database_by_name(alias)
+    pub(crate) fn get_attached_database(
+        &self,
+        alias: &Identifier,
+    ) -> Option<(usize, Arc<Database>)> {
+        self.attached_databases
+            .read()
+            .get_database_by_name(alias.as_str())
     }
 
     /// Get the database name for a given database index.
@@ -1840,7 +1846,7 @@ fn emit_check_constraint_bytecode(
             if let Some(joined_table) = binding_tables.joined_tables_mut().first_mut() {
                 // CHECK expressions come from schema SQL and may use the base table name
                 // even when the query references the table through an alias.
-                joined_table.identifier = table_name.to_string();
+                joined_table.identifier = Identifier::from(table_name);
             }
             bind_and_rewrite_expr(
                 &mut rewritten_expr,
@@ -1910,10 +1916,10 @@ fn emit_check_constraint_bytecode(
 /// normalized name is in `column_names`. This is used during UPDATE to skip
 /// CHECK constraints that only reference columns not in the SET clause, matching
 /// SQLite's optimization behavior.
-fn check_expr_references_columns(expr: &ast::Expr, column_names: &HashSet<String>) -> bool {
+fn check_expr_references_columns(expr: &ast::Expr, column_names: &HashSet<Identifier>) -> bool {
     column_names
         .iter()
-        .any(|name| check_expr_references_column(expr, name))
+        .any(|name| check_expr_references_column(expr, name.as_str()))
 }
 
 /// Emit CHECK constraint evaluation with resolver cache setup and teardown.

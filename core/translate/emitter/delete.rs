@@ -158,7 +158,9 @@ pub fn emit_program_for_delete(
 
             // Open all indexes for writing (needed for DELETE)
             let write_indices: Vec<_> = resolver.with_schema(table_ref.database_id, |s| {
-                s.get_indices(table_ref.table.get_name()).cloned().collect()
+                s.get_indices(table_ref.table.get_name().as_str())
+                    .cloned()
+                    .collect()
             });
             for index in &write_indices {
                 let index_cursor_id = program.alloc_cursor_index(
@@ -625,7 +627,7 @@ fn emit_delete_row_common(
     returning_buffer: Option<&ReturningBufferCtx>,
 ) -> Result<()> {
     let internal_id = unsafe { (*table_reference).internal_id };
-    let table_name = unsafe { &*table_reference }.table.get_name();
+    let table_name = unsafe { &*table_reference }.table.get_name().as_str();
 
     // Phase 1: Before Delete - build parent key registers and handle NoAction/Restrict.
     // CASCADE/SetNull/SetDefault actions are prepared but deferred until after Delete.
@@ -814,8 +816,10 @@ fn emit_delete_row_common(
                 .iter_mut()
                 .filter(|s| !s.has_been_evaluated() && s.is_post_write_returning())
             {
-                let rerun_for_target_scan =
-                    subquery.reads_table(delete_table.database_id, delete_table.table.get_name());
+                let rerun_for_target_scan = subquery.reads_table(
+                    delete_table.database_id,
+                    delete_table.table.get_name().as_str(),
+                );
                 let subquery_plan = subquery.consume_plan(EvalAt::Loop(0));
                 emit_non_from_clause_subquery(
                     program,

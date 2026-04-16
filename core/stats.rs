@@ -75,11 +75,9 @@ impl AnalyzeStats {
     }
 
     /// Remove statistics for a specific index on a table.
-    pub fn remove_index(&mut self, table_name: &Identifier, index_name: &str) {
+    pub fn remove_index(&mut self, table_name: &Identifier, index_name: &Identifier) {
         if let Some(table_stats) = self.tables.get_mut(table_name) {
-            table_stats
-                .index_stats
-                .remove(&Identifier::from(index_name));
+            table_stats.index_stats.remove(index_name);
         }
     }
 }

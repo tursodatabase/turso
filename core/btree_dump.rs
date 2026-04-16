@@ -114,7 +114,7 @@ impl BtreeDumpCursor {
         // Search indexes first (indexes are stored by table name, so iterate all)
         for indexes in self.schema.indexes.values() {
             for index in indexes {
-                if index.name.eq_ignore_ascii_case(name) {
+                if index.name == name {
                     return Some(index.root_page);
                 }
             }

@@ -239,7 +239,7 @@ fn index_expression_cols(table: &Table, out: &mut ColumnMask, expr: &ast::Expr) 
                 }
             }
             Expr::Qualified(ns, c) | Expr::DoublyQualified(_, ns, c) => {
-                if *ns == *table.get_name() {
+                if ns.as_str() == table.get_name().as_str() {
                     if let Some((i, _)) = table.get_column_by_name(c.as_str()) {
                         out.set(i);
                     }
@@ -351,7 +351,7 @@ pub fn resolve_upsert_target(
     }
 
     // Otherwise match a UNIQUE index, also covering non-rowid PRIMARY KEYs
-    for idx in schema.get_indices(table.get_name()) {
+    for idx in schema.get_indices(table.get_name().as_str()) {
         if idx.unique && upsert_matches_index(upsert, idx, table) {
             return Ok(ResolvedUpsertTarget::Index(Arc::clone(idx)));
         }
@@ -517,7 +517,7 @@ pub fn emit_upsert(
             table,
             expr_current_start,
             ctx.conflict_rowid_reg,
-            Some(table.get_name()),
+            Some(table.get_name().as_str()),
             Some(insertion),
             true,
             excluded_decoded_start,
@@ -540,7 +540,7 @@ pub fn emit_upsert(
             table,
             expr_current_start,
             ctx.conflict_rowid_reg,
-            Some(table.get_name()),
+            Some(table.get_name().as_str()),
             Some(insertion),
             true,
             excluded_decoded_start,
@@ -559,7 +559,7 @@ pub fn emit_upsert(
             program.emit_insn(Insn::HaltIfNull {
                 target_reg: layout.to_register(new_start, *col_idx),
                 err_code: SQLITE_CONSTRAINT_NOTNULL,
-                description: String::from(table.get_name()) + "." + col.name.as_ref().unwrap(),
+                description: table.get_name().to_string() + "." + col.name.as_ref().unwrap(),
             });
         }
         if col.is_rowid_alias() {
@@ -607,7 +607,7 @@ pub fn emit_upsert(
                 &bt.columns,
                 new_start,
                 None,
-                &bt.name,
+                bt.name.as_str(),
                 &layout,
             )?;
 
@@ -644,7 +644,7 @@ pub fn emit_upsert(
             program,
             &bt.check_constraints,
             resolver,
-            &bt.name,
+            bt.name.as_str(),
             new_rowid_reg.unwrap_or(ctx.conflict_rowid_reg),
             bt.columns.iter().enumerate().filter_map(|(idx, col)| {
                 col.name
@@ -791,7 +791,7 @@ pub fn emit_upsert(
                 emit_fk_child_update_counters(
                     program,
                     &bt,
-                    table.get_name(),
+                    table.get_name().as_str(),
                     ctx.cursor_id,
                     new_start,
                     rowid_new_reg,
@@ -802,7 +802,7 @@ pub fn emit_upsert(
                 )?;
             }
             let upsert_indices: Vec<_> = resolver.with_schema(upsert_database_id, |s| {
-                s.get_indices(table.get_name()).cloned().collect()
+                s.get_indices(table.get_name().as_str()).cloned().collect()
             });
             let _ = emit_fk_update_parent_actions(
                 program,
@@ -828,7 +828,8 @@ pub fn emit_upsert(
         for (idx_name, _root, idx_cid) in &ctx.idx_cursors {
             let idx_meta = resolver
                 .with_schema(ctx.database_id, |s| {
-                    s.get_index(table.get_name(), idx_name).cloned()
+                    s.get_index(table.get_name().as_str(), idx_name.as_str())
+                        .cloned()
                 })
                 .expect("index exists");
 
@@ -872,7 +873,7 @@ pub fn emit_upsert(
                         table,
                         before,
                         ctx.conflict_rowid_reg,
-                        Some(table.get_name()),
+                        Some(table.get_name().as_str()),
                         None,
                         false,
                         None,
@@ -931,7 +932,7 @@ pub fn emit_upsert(
                         table,
                         new_start,
                         new_rowid,
-                        Some(table.get_name()),
+                        Some(table.get_name().as_str()),
                         None,
                         false,
                         None,
@@ -965,7 +966,7 @@ pub fn emit_upsert(
                 start_reg: to_u16(ins),
                 count: to_u16(k + 1),
                 dest_reg: to_u16(rec),
-                index_name: Some((*idx_name).clone()),
+                index_name: Some(idx_name.to_string()),
                 affinity_str: None,
             });
 
@@ -1015,7 +1016,8 @@ pub fn emit_upsert(
                     flags: CmpInsFlags::default(),
                     collation: program.curr_collation(),
                 });
-                let description = format_unique_violation_desc(table.get_name(), &idx_meta);
+                let description =
+                    format_unique_violation_desc(table.get_name().as_str(), &idx_meta);
                 program.emit_insn(Insn::Halt {
                     err_code: SQLITE_CONSTRAINT_PRIMARYKEY,
                     description,
@@ -1166,7 +1168,7 @@ pub fn emit_upsert(
                 before_rec,
                 None,
                 None,
-                table.get_name(),
+                table.get_name().as_str(),
             )?;
 
             // INSERT (after)
@@ -1186,7 +1188,7 @@ pub fn emit_upsert(
                 None,
                 after_rec,
                 None,
-                table.get_name(),
+                table.get_name().as_str(),
             )?;
         } else {
             let after_rec = if program.capture_data_changes_info().has_after() {
@@ -1221,7 +1223,7 @@ pub fn emit_upsert(
                 before_rec,
                 after_rec,
                 None,
-                table.get_name(),
+                table.get_name().as_str(),
             )?;
         }
     }

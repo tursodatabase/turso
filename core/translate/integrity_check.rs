@@ -145,12 +145,7 @@ fn translate_integrity_check_impl(
                 continue;
             }
             root_pages.push(btree_table.root_page);
-            if let Some(indexes) = schema
-                .indexes
-                .get(&turso_parser::identifier::Identifier::from(
-                    btree_table.name.as_str(),
-                ))
-            {
+            if let Some(indexes) = schema.indexes.get(&btree_table.name) {
                 for index in indexes {
                     if index.root_page > 0 {
                         root_pages.push(index.root_page);
@@ -240,12 +235,7 @@ fn translate_integrity_check_impl(
         );
 
         let mut bound_indexes = Vec::new();
-        if let Some(indexes) = schema
-            .indexes
-            .get(&turso_parser::identifier::Identifier::from(
-                btree_table.name.as_str(),
-            ))
-        {
+        if let Some(indexes) = schema.indexes.get(&btree_table.name) {
             for index in indexes {
                 if index.root_page <= 0 {
                     continue;
@@ -492,7 +482,7 @@ fn translate_integrity_check_impl(
                     row_number_reg,
                     scratch_reg,
                     message_reg,
-                    &bound_index.index.name,
+                    bound_index.index.name.as_str(),
                     remaining_errors_reg,
                     had_error_reg,
                 );

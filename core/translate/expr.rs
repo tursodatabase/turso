@@ -5782,7 +5782,7 @@ pub fn bind_and_rewrite_expr<'a>(
                     let duplicate_count = referenced_tables
                         .joined_tables()
                         .iter()
-                        .filter(|t| *tbl == *t.identifier)
+                        .filter(|t| *tbl.identifier() == t.identifier)
                         .count();
                     if duplicate_count > 1 {
                         crate::bail_parse_error!(
@@ -5791,8 +5791,8 @@ pub fn bind_and_rewrite_expr<'a>(
                             id.as_str()
                         );
                     }
-                    let matching_tbl =
-                        referenced_tables.find_table_and_internal_id_by_identifier(tbl.as_str());
+                    let matching_tbl = referenced_tables
+                        .find_table_and_internal_id_by_identifier(tbl.identifier());
                     if matching_tbl.is_none() {
                         // CTEs preplanned for subquery FROM visibility are kept as
                         // definition-only outer refs. They are not valid column sources
@@ -5800,7 +5800,7 @@ pub fn bind_and_rewrite_expr<'a>(
                         // Restrict this branch to actual CTE definition refs so other
                         // definition-only uses (if added later) still report "no such table".
                         if referenced_tables
-                            .find_outer_query_ref_by_identifier(tbl.as_str())
+                            .find_outer_query_ref_by_identifier(tbl.identifier())
                             .is_some_and(|outer_ref| {
                                 outer_ref.cte_definition_only
                                     && (outer_ref.cte_id.is_some()
@@ -5830,7 +5830,7 @@ pub fn bind_and_rewrite_expr<'a>(
                             if let Some(row_id_expr) = parse_row_id(id.as_str(), tbl_id, || false)?
                             {
                                 if !btree.has_rowid {
-                                    crate::bail_parse_error!("no such column: {}", id.as_str());
+                                    crate::bail_parse_error!("no such column: {id}");
                                 }
                                 *expr = row_id_expr;
                                 // Mark the table's rowid as referenced so correlated
@@ -5840,7 +5840,7 @@ pub fn bind_and_rewrite_expr<'a>(
                                 return Ok(WalkControl::Continue);
                             }
                         }
-                        crate::bail_parse_error!("no such column: {}", id.as_str());
+                        crate::bail_parse_error!("no such column: {id}");
                     };
                     let col = tbl.columns().get(col_idx).unwrap();
                     *expr = Expr::Column {
@@ -5907,7 +5907,7 @@ pub fn bind_and_rewrite_expr<'a>(
                     // we need to create a synthetic table reference for it
                     // For now, we'll error if the table isn't already in the referenced tables
                     let matching_tbl = referenced_tables
-                        .find_table_and_internal_id_by_identifier(tbl_name.as_str());
+                        .find_table_and_internal_id_by_identifier(tbl_name.identifier());
 
                     if let Some((tbl_id, _)) = matching_tbl {
                         // Table is already in referenced tables, use existing internal ID

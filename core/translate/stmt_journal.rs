@@ -137,7 +137,7 @@ pub(crate) fn set_insert_stmt_journal_flags(
     has_unique: bool,
 ) {
     let index_modes: Vec<(Option<ResolveType>, bool)> = resolver.with_schema(database_id, |s| {
-        s.get_indices(&table.name)
+        s.get_indices(table.name.as_str())
             .map(|idx| (idx.on_conflict, idx.unique))
             .collect()
     });

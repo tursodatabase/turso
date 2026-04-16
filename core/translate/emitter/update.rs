@@ -56,6 +56,7 @@ use std::num::NonZeroUsize;
 use tracing::{instrument, Level};
 use turso_macros::{turso_assert, turso_assert_eq};
 use turso_parser::ast::{ResolveType, TriggerEvent, TriggerTime};
+use turso_parser::identifier::Identifier;
 
 #[instrument(skip_all, level = Level::DEBUG)]
 pub fn emit_program_for_update(
@@ -314,7 +315,7 @@ pub fn emit_program_for_update(
         plan.indexes_to_update.iter().map(|idx| idx.on_conflict),
     );
     let all_index_cursors = if any_replace {
-        let table_name = target_table.table.get_name();
+        let table_name = target_table.table.get_name().as_str();
         let all_indexes: Vec<_> = resolver.with_schema(target_database_id, |s| {
             s.get_indices(table_name).cloned().collect()
         });
@@ -1023,7 +1024,7 @@ fn emit_update_insns<'a>(
     } else {
         None
     };
-    let table_name = target_table.table.get_name();
+    let table_name = target_table.table.get_name().as_str();
     let start = if is_virtual_table { beg + 2 } else { beg + 1 };
     let layout = ColumnLayout::from_table(&target_table.as_ref().table);
     let skip_set_clauses = false;
@@ -1505,14 +1506,14 @@ fn emit_update_insns<'a>(
         if !btree_table.check_constraints.is_empty() {
             // SQLite only evaluates CHECK constraints that reference at least one
             // column in the SET clause. Build a set of updated column names to filter.
-            let mut updated_col_names: HashSet<String> = columns_affected_by_update(
+            let mut updated_col_names: HashSet<Identifier> = columns_affected_by_update(
                 &btree_table.columns,
                 set_clauses.iter().map(|(idx, _)| *idx),
             )
             .into_iter()
             .filter_map(|col_idx| btree_table.columns.get(col_idx))
             .filter_map(|col| col.name.as_deref())
-            .map(str::to_owned)
+            .map(Identifier::from)
             .collect();
 
             // If the rowid is being updated (either directly via ROWID_SENTINEL or
@@ -1524,7 +1525,7 @@ fn emit_update_insns<'a>(
                 });
             if rowid_updated {
                 for name in ROWID_STRS {
-                    updated_col_names.insert(name.to_string());
+                    updated_col_names.insert(Identifier::from(name.to_string()));
                 }
             }
 
@@ -1541,7 +1542,7 @@ fn emit_update_insns<'a>(
                 program,
                 &relevant_checks,
                 &mut t_ctx.resolver,
-                &btree_table.name,
+                btree_table.name.as_str(),
                 rowid_set_clause_reg.unwrap_or(beg),
                 btree_table
                     .columns
@@ -1721,7 +1722,7 @@ fn emit_update_insns<'a>(
             start_reg: to_u16(idx_start_reg),
             count: to_u16(num_cols + 1),
             dest_reg: to_u16(*record_reg),
-            index_name: Some(index.name.clone()),
+            index_name: Some(index.name.to_string()),
             affinity_str: None,
         });
 
@@ -2222,7 +2223,7 @@ fn emit_update_insns<'a>(
                 } else {
                     InsertFlags::new().skip_last_rowid()
                 },
-                table_name: target_table.identifier.clone(),
+                table_name: target_table.identifier.to_string(),
             });
 
             if connection.foreign_keys_enabled() {
@@ -2364,8 +2365,10 @@ fn emit_update_insns<'a>(
                         .iter_mut()
                         .filter(|s| !s.has_been_evaluated() && s.is_post_write_returning())
                     {
-                        let rerun_for_target_scan = subquery
-                            .reads_table(target_table.database_id, target_table.table.get_name());
+                        let rerun_for_target_scan = subquery.reads_table(
+                            target_table.database_id,
+                            target_table.table.get_name().as_str(),
+                        );
                         let subquery_plan = subquery.consume_plan(EvalAt::Loop(0));
                         emit_non_from_clause_subquery(
                             program,

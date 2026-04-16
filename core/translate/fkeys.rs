@@ -651,7 +651,7 @@ fn emit_fk_parent_key_probe(
 
     // Prefer exact child index on (child_cols...)
     let indices: Vec<_> = resolver.with_schema(database_id, |s| {
-        s.get_indices(&child_tbl.name).cloned().collect()
+        s.get_indices(child_tbl.name.as_str()).cloned().collect()
     });
     let idx = indices.iter().find(|ix| {
         ix.columns.len() == child_cols.len()
@@ -998,10 +998,7 @@ fn emit_fk_delete_parent_existence_check_single(
     database_id: usize,
     resolver: &Resolver,
 ) -> Result<()> {
-    let is_self_ref = fk_ref
-        .child_table
-        .name
-        .eq_ignore_ascii_case(parent_table_name);
+    let is_self_ref = fk_ref.child_table.name == parent_table_name;
 
     let is_restrict = matches!(fk_ref.fk.on_delete, RefAct::Restrict);
 
@@ -1031,7 +1028,9 @@ fn emit_fk_delete_parent_existence_check_single(
     let child_cols = &fk_ref.fk.child_columns;
     let child_idx = if !is_self_ref {
         let indices: Vec<_> = resolver.with_schema(database_id, |s| {
-            s.get_indices(&fk_ref.child_table.name).cloned().collect()
+            s.get_indices(fk_ref.child_table.name.as_str())
+                .cloned()
+                .collect()
         });
         indices.into_iter().find(|idx| {
             idx.columns.len() == child_cols.len()
@@ -1118,7 +1117,7 @@ pub fn emit_fk_update_parent_actions(
     let updated_positions: ColumnMask = set_clauses.iter().map(|(i, _)| *i).collect();
     let check_fks: Vec<_> = resolver
         .with_schema(database_id, |s| {
-            s.resolved_fks_referencing(&table_btree.name)
+            s.resolved_fks_referencing(table_btree.name.as_str())
         })?
         .into_iter()
         .filter(|fk| fk.parent_key_may_change(&updated_positions, table_btree))
@@ -1464,7 +1463,7 @@ fn generate_set_default_stmt(
     ast::Stmt::Update(ast::Update {
         with: None,
         or_conflict: None,
-        tbl_name: qualified_table_name(&child_table.name, db_name),
+        tbl_name: qualified_table_name(child_table.name.as_str(), db_name),
         indexed: None,
         sets,
         from: None,
@@ -1567,7 +1566,7 @@ fn fire_fk_cascade_delete(
     let child_cols = &fk_ref.fk.child_columns;
     let subprog_ctx = FkSubprogramContext::new(child_cols.len(), false);
     let stmt = generate_cascade_delete_stmt(
-        &fk_ref.child_table.name,
+        fk_ref.child_table.name.as_str(),
         child_cols,
         &subprog_ctx,
         db_name.as_deref(),
@@ -1600,7 +1599,7 @@ fn fire_fk_set_null(
     let child_cols = &fk_ref.fk.child_columns;
     let subprog_ctx = FkSubprogramContext::new(child_cols.len(), false);
     let stmt = generate_set_null_stmt(
-        &fk_ref.child_table.name,
+        fk_ref.child_table.name.as_str(),
         child_cols,
         &subprog_ctx,
         db_name.as_deref(),
@@ -1653,7 +1652,7 @@ fn fire_fk_cascade_update(
     // CASCADE UPDATE needs new params for the SET clause
     let subprog_ctx = FkSubprogramContext::new(child_cols.len(), true);
     let stmt = generate_cascade_update_stmt(
-        &fk_ref.child_table.name,
+        fk_ref.child_table.name.as_str(),
         child_cols,
         &subprog_ctx,
         db_name.as_deref(),

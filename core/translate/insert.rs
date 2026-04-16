@@ -63,6 +63,7 @@ use turso_parser::ast::{
     self, Expr, InsertBody, OneSelect, QualifiedName, ResolveType, ResultColumn, TriggerEvent,
     TriggerTime, Upsert, UpsertDo, With,
 };
+use turso_parser::identifier::Identifier;
 
 /// Validate anything with this insert statement that should throw an early parse error
 fn validate(
@@ -146,7 +147,7 @@ pub struct InsertEmitCtx<'a> {
 
     /// Index cursors we need to populate for this table
     /// (idx name, root_page, idx cursor id)
-    pub idx_cursors: Vec<(String, i64, usize)>,
+    pub idx_cursors: Vec<(Identifier, i64, usize)>,
 
     /// Context for if the insert values are materialized first
     /// into a temporary table
@@ -338,7 +339,8 @@ pub fn translate_insert(
         ensure_sequence_initialized(program, resolver, &btree_table, database_id)?;
     }
 
-    let cdc_table = prepare_cdc_if_necessary(program, resolver.schema(), table.get_name())?;
+    let cdc_table =
+        prepare_cdc_if_necessary(program, resolver.schema(), table.get_name().as_str())?;
 
     let schema_cookie = resolver.with_schema(database_id, |s| s.schema_version);
     program.begin_write_on_database(database_id, schema_cookie);
@@ -350,7 +352,7 @@ pub fn translate_insert(
                     .btree()
                     .expect("we shouldn't have got here without a BTree table"),
             ),
-            identifier: table_name.to_string(),
+            identifier: table_name.identifier().clone(),
             internal_id: program.table_reference_counter.next(),
             op: Operation::default_scan_for(&table),
             join_info: None,
@@ -659,7 +661,7 @@ pub fn translate_insert(
         });
 
         // Encode values for columns with custom types.
-        emit_custom_type_encode(program, resolver, &insertion, &ctx.table.name)?;
+        emit_custom_type_encode(program, resolver, &insertion, ctx.table.name.as_str())?;
 
         // Post-encode TypeCheck: validate that encode produced the correct
         // storage type (BASE).
@@ -766,7 +768,7 @@ pub fn translate_insert(
         program,
         &ctx.table.check_constraints,
         resolver,
-        &ctx.table.name,
+        ctx.table.name.as_str(),
         insertion.key_register(),
         insertion.col_mappings.iter().filter_map(|m| {
             m.column.name.as_deref().map(|n| {
@@ -1074,8 +1076,10 @@ pub fn translate_insert(
                 .iter_mut()
                 .filter(|s| !s.has_been_evaluated())
             {
-                let rerun_for_target_scan =
-                    subquery.reads_table(target_table.database_id, target_table.table.get_name());
+                let rerun_for_target_scan = subquery.reads_table(
+                    target_table.database_id,
+                    target_table.table.get_name().as_str(),
+                );
                 let subquery_plan = subquery.consume_plan(EvalAt::Loop(0));
                 emit_non_from_clause_subquery(
                     program,
@@ -1300,7 +1304,7 @@ fn emit_commit_phase(
             start_reg: to_u16(idx_start_reg),
             count: to_u16(num_cols + 1),
             dest_reg: to_u16(record_reg),
-            index_name: Some(index.name.clone()),
+            index_name: Some(index.name.to_string()),
             affinity_str: None,
         });
         program.emit_insn(Insn::IdxInsert {
@@ -1554,7 +1558,7 @@ fn open_autoincrement_state(
         db: ctx.database_id,
     });
 
-    let table_name_reg = program.emit_string8_new_reg(ctx.table.name.clone());
+    let table_name_reg = program.emit_string8_new_reg(ctx.table.name.to_string());
     let r_seq = program.alloc_register();
     let r_seq_rowid = program.alloc_register();
 
@@ -2124,9 +2128,8 @@ fn init_source_emission<'a>(
                                     })
                                     .ok_or_else(|| {
                                         crate::error::LimboError::ParseError(format!(
-                                            "table {} has no column named {}",
-                                            table.get_name(),
-                                            col_name.as_str()
+                                            "table {} has no column named {col_name}",
+                                            table.get_name()
                                         ))
                                     })
                             })
@@ -2832,7 +2835,7 @@ fn emit_index_uniqueness_check(
                 start_reg: to_u16(idx_start_reg),
                 count: to_u16(num_cols + 1),
                 dest_reg: to_u16(record_reg),
-                index_name: Some(index.name.clone()),
+                index_name: Some(index.name.to_string()),
                 affinity_str: None,
             });
             program.emit_insn(Insn::IdxInsert {
@@ -2984,7 +2987,7 @@ fn emit_unique_index_check(
                 start_reg: to_u16(idx_start_reg),
                 count: to_u16(num_cols + 1),
                 dest_reg: to_u16(record_reg),
-                index_name: Some(index.name.clone()),
+                index_name: Some(index.name.to_string()),
                 affinity_str: None,
             });
             program.emit_insn(Insn::IdxInsert {
@@ -3174,7 +3177,7 @@ fn ensure_sequence_initialized(
         db: database_id,
     });
 
-    let table_name_reg = program.emit_string8_new_reg(table.name.clone());
+    let table_name_reg = program.emit_string8_new_reg(table.name.to_string());
 
     let loop_start_label = program.allocate_label();
     let entry_exists_label = program.allocate_label();
@@ -3672,7 +3675,9 @@ fn emit_replace_delete_conflicting_row(
 
     for (name, _, index_cursor_id) in ctx.idx_cursors.iter() {
         let index = resolver
-            .with_schema(ctx.database_id, |s| s.get_index(table_name, name).cloned())
+            .with_schema(ctx.database_id, |s| {
+                s.get_index(table_name, name.as_str()).cloned()
+            })
             .expect("index to exist");
         let skip_delete_label = if index.where_clause.is_some() {
             let where_copy = index
@@ -3785,10 +3790,13 @@ pub fn emit_fk_child_insert_checks(
     database_id: usize,
     layout: &ColumnLayout,
 ) -> crate::Result<()> {
-    for fk_ref in
-        resolver.with_schema(database_id, |s| s.resolved_fks_for_child(&child_tbl.name))?
-    {
-        let is_self_ref = fk_ref.fk.parent_table.eq_ignore_ascii_case(&child_tbl.name);
+    for fk_ref in resolver.with_schema(database_id, |s| {
+        s.resolved_fks_for_child(child_tbl.name.as_str())
+    })? {
+        let is_self_ref = fk_ref
+            .fk
+            .parent_table
+            .eq_ignore_ascii_case(child_tbl.name.as_str());
 
         // Short-circuit if any NEW component is NULL
         let fk_ok = program.allocate_label();
@@ -4052,12 +4060,9 @@ pub fn emit_parent_side_fk_decrement_on_insert(
     database_id: usize,
 ) -> crate::Result<()> {
     for pref in resolver.with_schema(database_id, |s| {
-        s.resolved_fks_referencing(&parent_table.name)
+        s.resolved_fks_referencing(parent_table.name.as_str())
     })? {
-        let is_self_ref = pref
-            .child_table
-            .name
-            .eq_ignore_ascii_case(&parent_table.name);
+        let is_self_ref = pref.child_table.name == parent_table.name;
         // Skip only when it cannot repair anything: non-deferred and not self-referencing
         if !force_immediate && !pref.fk.deferred && !is_self_ref {
             continue;
@@ -4068,7 +4073,7 @@ pub fn emit_parent_side_fk_decrement_on_insert(
         let child_tbl = &pref.child_table;
         let child_cols = &pref.fk.child_columns;
         let indices: Vec<_> = resolver.with_schema(database_id, |s| {
-            s.get_indices(&child_tbl.name).cloned().collect()
+            s.get_indices(child_tbl.name.as_str()).cloned().collect()
         });
         let idx = indices.iter().find(|ix| {
             ix.columns.len() == child_cols.len()

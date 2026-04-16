@@ -595,7 +595,7 @@ fn emit_add_column_check_validation(
                         Ok(WalkControl::SkipChildren)
                     }
                     ast::Expr::Qualified(tbl, col)
-                        if *tbl == **table_name && col_name_id == *col.as_str() =>
+                        if tbl.as_str() == table_name.as_str() && col_name_id == *col.as_str() =>
                     {
                         *e = default_expr.clone();
                         Ok(WalkControl::SkipChildren)
@@ -674,7 +674,7 @@ pub fn translate_alter_table(
     };
     if let Some(tbl) = table.virtual_table() {
         if let ast::AlterTableBody::RenameTo(new_name) = &alter_table {
-            let new_name_str = new_name.as_str().to_owned();
+            let new_name_str = new_name.identifier().clone();
             return translate_rename_virtual_table(
                 program,
                 tbl,
@@ -782,7 +782,7 @@ pub fn translate_alter_table(
                     let mut table_references = TableReferences::new(
                         vec![],
                         vec![OuterQueryReference {
-                            identifier: table_name.to_string(),
+                            identifier: Identifier::from(table_name),
                             internal_id: TableInternalId::from(0),
                             table: Table::BTree(Arc::new(btree.clone())),
                             col_used_mask: ColumnUsedMask::default(),
@@ -974,7 +974,7 @@ pub fn translate_alter_table(
                 connection,
                 input,
                 |program| {
-                    let table_name = btree.name.clone();
+                    let table_name = btree.name.to_string();
                     let source_column_by_schema_idx = btree
                         .columns
                         .iter()
@@ -1176,7 +1176,7 @@ pub fn translate_alter_table(
                             .iter()
                             .filter_map(|c| c.name.as_deref())
                             .collect();
-                        validate_check_expr(expr, &btree.name, &column_names, resolver)?;
+                        validate_check_expr(expr, btree.name.as_str(), &column_names, resolver)?;
                         btree.check_constraints.push(CheckConstraint::new(
                             constraint.name.as_ref(),
                             expr,
@@ -1319,7 +1319,7 @@ pub fn translate_alter_table(
                     || s.indexes
                         .values()
                         .flatten()
-                        .any(|index| new_name_id == *index.name)
+                        .any(|index| new_name_id == index.name)
             }) {
                 return Err(LimboError::ParseError(format!(
                     "there is already another table or index with this name: {new_name}"
@@ -1996,7 +1996,7 @@ fn emit_rewrite_table_rows(
     let layout = rewritten_table.column_layout();
     let non_virtual_column_count = layout.num_non_virtual_cols();
     let root_page = rewritten_table.root_page;
-    let table_name = rewritten_table.name.clone();
+    let table_name = rewritten_table.name.to_string();
     let affinity_str = non_virtual_affinity_str(rewritten_table);
     let cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(original_btree));
 
@@ -2060,7 +2060,7 @@ fn translate_rename_virtual_table(
     program: &mut ProgramBuilder,
     vtab: Arc<VirtualTable>,
     old_name: &str,
-    new_name_str: String,
+    new_name_str: Identifier,
     resolver: &Resolver,
     connection: &Arc<crate::Connection>,
     database_id: usize,
@@ -2072,7 +2072,7 @@ fn translate_rename_virtual_table(
         cursor_id: vtab_cur,
     });
 
-    let new_name_reg = program.emit_string8_new_reg(new_name_str.clone());
+    let new_name_reg = program.emit_string8_new_reg(new_name_str.to_string());
     program.emit_insn(Insn::VRename {
         cursor_id: vtab_cur,
         new_name_reg,
@@ -2104,7 +2104,7 @@ fn translate_rename_virtual_table(
         program.emit_string8_new_reg(old_name.to_string());
         program.mark_last_insn_constant();
 
-        program.emit_string8_new_reg(new_name_str.clone());
+        program.emit_string8_new_reg(new_name_str.to_string());
         program.mark_last_insn_constant();
 
         let out = program.alloc_registers(ncols);
@@ -2158,7 +2158,7 @@ fn translate_rename_virtual_table(
     program.emit_insn(Insn::RenameTable {
         db: database_id,
         from: old_name.to_owned(),
-        to: new_name_str,
+        to: new_name_str.to_string(),
     });
 
     program.emit_insn(Insn::Close {
@@ -2565,8 +2565,7 @@ fn apply_expr_column_ref_with_context(
                         });
                     if ctx_is_different_table {
                         return Err(LimboError::ParseError(format!(
-                            "no such column: {trigger_table_name}.{}",
-                            col.as_str()
+                            "no such column: {trigger_table_name}.{col}",
                         )));
                     }
                     *col = ast::Name::from_string(new_col_norm);

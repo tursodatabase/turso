@@ -48,7 +48,7 @@ struct CteDefinition {
     /// Multiple references to this CTE will use this ID to look up shared cursors.
     cte_id: usize,
     /// Normalized CTE name
-    name: String,
+    name: Identifier,
     /// The original AST SELECT statement (cloned for each reference)
     select: Select,
     /// Explicit column names from WITH t(a, b) AS (...) syntax
@@ -528,7 +528,7 @@ fn plan_cte(
     // planning of its body. Without this, a same-named view would be expanded
     // recursively (stack overflow) and a same-named table would give wrong
     // results. `parse_table` checks this and produces "circular reference".
-    program.push_cte_being_defined(cte_def.name.clone());
+    program.push_cte_being_defined(cte_def.name.to_string());
 
     // Plan this CTE with fresh IDs
     let cte_plan = prepare_select_plan(
@@ -611,13 +611,13 @@ pub fn plan_ctes_as_outer_refs(
             .map(|c| c.col_name.as_str().to_owned())
             .collect();
 
-        let cte_name = cte.tbl_name.as_str().to_owned();
+        let cte_name = cte.tbl_name.identifier().clone();
 
         // Check for duplicate CTE names
         if table_references
             .outer_query_refs()
             .iter()
-            .any(|r| cte.tbl_name == *r.identifier)
+            .any(|r| *cte.tbl_name.identifier() == r.identifier)
         {
             crate::bail_parse_error!("duplicate WITH table name: {}", cte.tbl_name.as_str());
         }
@@ -629,7 +629,7 @@ pub fn plan_ctes_as_outer_refs(
 
         // Block the CTE's own name from resolving to a schema object during
         // planning of its body (see push_cte_being_defined).
-        program.push_cte_being_defined(cte_name.clone());
+        program.push_cte_being_defined(cte_name.to_string());
 
         // Plan the CTE SELECT
         let cte_plan = prepare_select_plan(
@@ -771,8 +771,8 @@ fn parse_from_clause_table(
             }
             let cur_table_index = table_references.joined_tables().len();
             let identifier = maybe_alias
-                .map(|a| a.name().as_str().to_owned())
-                .unwrap_or_else(|| format!("(subquery-{cur_table_index})"));
+                .map(|a| Identifier::from(a.name().as_str()))
+                .unwrap_or_else(|| Identifier::from(format!("(subquery-{cur_table_index})")));
             table_references.add_joined_table(JoinedTable::new_subquery_from_plan(
                 identifier,
                 subplan,
@@ -817,13 +817,13 @@ fn parse_table(
 ) -> Result<()> {
     let database_id = resolver.resolve_existing_table_database_id_qualified(qualified_name)?;
     let table_name = &qualified_name.name;
-    let qualified_name_str = table_name.as_str().to_owned();
+    let qualified_name_str = table_name.identifier().clone();
 
     // Check if the FROM clause table is referring to a CTE in the current scope.
     // Each reference gets a freshly planned CTE to ensure unique internal_ids and cursor IDs.
     if let Some(cte_idx) = cte_definitions
         .iter()
-        .position(|cte| *table_name == *cte.name)
+        .position(|cte| *table_name.identifier() == cte.name)
     {
         let planning_outer_query_refs =
             base_outer_refs_for_cte_planning(table_references.outer_query_refs(), cte_definitions);
@@ -840,7 +840,7 @@ fn parse_table(
 
         // If there's an alias provided, update the identifier to use that alias
         if let Some(a) = maybe_alias {
-            a.name().as_str().clone_into(&mut cte_table.identifier);
+            cte_table.identifier = Identifier::from(a.name().as_str());
         }
 
         // Mark the pre-planned outer_query_ref as "CTE definition only" so it is
@@ -848,7 +848,7 @@ fn parse_table(
         // EXISTS (SELECT 1 FROM <cte_name> ...)), but no longer participates in
         // column resolution. Column resolution now goes through the joined_table
         // which has the alias (if any) or the original name.
-        table_references.mark_outer_query_ref_cte_definition_only(table_name.as_str());
+        table_references.mark_outer_query_ref_cte_definition_only(table_name.identifier());
 
         table_references.add_joined_table(cte_table);
         return Ok(());
@@ -864,14 +864,14 @@ fn parse_table(
     // This handles cases like: WITH a AS (...), b AS (SELECT ... FROM a) SELECT * FROM b;
     // When planning b's body, 'a' is in outer_query_refs.
     if let Some(outer_ref) =
-        table_references.find_outer_query_ref_by_identifier(table_name.as_str())
+        table_references.find_outer_query_ref_by_identifier(table_name.identifier())
     {
         // If this is a CTE reference (via outer_query_refs), count it for materialization decisions.
         // This handles scalar subqueries that reference CTEs.
         if let Some(cte_id) = outer_ref.cte_id {
             program.increment_cte_reference(cte_id);
         }
-        let alias = maybe_alias.map(|a| a.name().as_str().to_owned());
+        let alias = maybe_alias.map(|a| Identifier::from(a.name().as_str()));
         // Clone fields we need before dropping the borrow on table_references.
         let cte_select = outer_ref.cte_select.clone();
         let cte_explicit_columns = outer_ref.cte_explicit_columns.clone();
@@ -951,7 +951,7 @@ fn parse_table(
     let table = resolver.with_schema(database_id, |schema| schema.get_table(table_name.as_str()));
 
     if let Some(table) = table {
-        let alias = maybe_alias.map(|a| a.name().as_str().to_owned());
+        let alias = maybe_alias.map(|a| Identifier::from(a.name().as_str()));
         let internal_id = program.table_reference_counter.next();
         let tbl_ref = if let Table::Virtual(tbl) = table.as_ref() {
             transform_args_into_where_terms(args, internal_id, vtab_predicates, table.as_ref())?;
@@ -1058,7 +1058,7 @@ fn parse_table(
         let logical_to_physical_map =
             crate::schema::BTreeTable::build_logical_to_physical_map(&columns);
         let btree_table = Arc::new(crate::schema::BTreeTable {
-            name: view_guard.name().to_string(),
+            name: Identifier::from(view_guard.name()),
             root_page,
             columns,
             primary_key_columns: Vec::new(),
@@ -1075,7 +1075,7 @@ fn parse_table(
         });
         drop(view_guard);
 
-        let alias = maybe_alias.map(|a| a.name().as_str().to_owned());
+        let alias = maybe_alias.map(|a| Identifier::from(a.name().as_str()));
 
         table_references.add_joined_table(JoinedTable {
             op: Operation::Scan(Scan::BTreeTable {
@@ -1083,7 +1083,7 @@ fn parse_table(
                 index: None,
             }),
             table: Table::BTree(btree_table),
-            identifier: alias.unwrap_or(qualified_name_str),
+            identifier: alias.unwrap_or_else(|| qualified_name_str.clone()),
             internal_id: program.table_reference_counter.next(),
             join_info: None,
             col_used_mask: ColumnUsedMask::default(),
@@ -1124,9 +1124,7 @@ fn parse_table(
 
     // Check if this is an incompatible view
     let is_incompatible = resolver.with_schema(database_id, |schema| {
-        schema
-            .incompatible_views
-            .contains(&Identifier::from(qualified_name_str.as_str()))
+        schema.incompatible_views.contains(&qualified_name_str)
     });
 
     if is_incompatible {
@@ -1235,8 +1233,11 @@ pub fn parse_from(
                 .map(|c| c.col_name.as_str().to_owned())
                 .collect();
 
-            let cte_name = cte.tbl_name.as_str().to_owned();
-            if cte_definitions.iter().any(|d| cte.tbl_name == *d.name) {
+            let cte_name = cte.tbl_name.identifier().clone();
+            if cte_definitions
+                .iter()
+                .any(|d| *cte.tbl_name.identifier() == d.name)
+            {
                 crate::bail_parse_error!("duplicate WITH table name: {}", cte.tbl_name.as_str());
             }
             // Collect table names referenced in this CTE's FROM clause.
@@ -1247,8 +1248,9 @@ pub fn parse_from(
             // This avoids exponential re-planning when CTEs have transitive dependencies.
             let referenced_cte_indices: SmallVec<[usize; 2]> = (0..idx)
                 .filter(|&i| {
-                    let id = Identifier::from(cte_definitions[i].name.as_str());
-                    referenced_tables.iter().any(|r| id == **r)
+                    referenced_tables
+                        .iter()
+                        .any(|r| cte_definitions[i].name == **r)
                 })
                 .collect();
 

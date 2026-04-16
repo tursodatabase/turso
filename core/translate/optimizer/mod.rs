@@ -374,7 +374,7 @@ fn collect_index_method_candidates(
 
     let tables = table_references.joined_tables();
     for (table_idx, table) in tables.iter().enumerate() {
-        let Some(indexes) = available_indexes.get(&Identifier::from(table.table.get_name())) else {
+        let Some(indexes) = available_indexes.get(table.table.get_name()) else {
             continue;
         };
 
@@ -491,7 +491,7 @@ fn transform_match_to_fts_match(
             .find(|t| t.internal_id == table_id)
             .and_then(|t| {
                 if let Table::BTree(btree) = &t.table {
-                    Some(schema.has_fts_index(&btree.name))
+                    Some(schema.has_fts_index(btree.name.as_str()))
                 } else {
                     None
                 }
@@ -950,7 +950,7 @@ fn add_ephemeral_table_to_update_plan(
     let logical_to_physical_map = BTreeTable::build_logical_to_physical_map(&columns);
     let ephemeral_table = Arc::new(BTreeTable {
         root_page: 0, // Not relevant for ephemeral table definition
-        name: "ephemeral_scratch".to_string(),
+        name: Identifier::from("ephemeral_scratch"),
         has_rowid: true,
         has_autoincrement: false,
         primary_key_columns: vec![],
@@ -973,7 +973,7 @@ fn add_ephemeral_table_to_update_plan(
     let table_references_update = TableReferences::new(
         vec![JoinedTable {
             table: Table::BTree(ephemeral_table.clone()),
-            identifier: "ephemeral_scratch".to_string(),
+            identifier: Identifier::from("ephemeral_scratch"),
             internal_id,
             op: Operation::Scan(Scan::BTreeTable {
                 iter_dir: IterationDirection::Forwards,
@@ -1227,7 +1227,7 @@ fn optimize_table_access_with_custom_modules(
     // Only optimize the first table with custom index methods.
     // This allows FTS to be used as the driving table in joins.
     let table = &mut tables[0];
-    let Some(indexes) = available_indexes.get(&Identifier::from(table.table.get_name())) else {
+    let Some(indexes) = available_indexes.get(table.table.get_name()) else {
         return Ok(false);
     };
     for index in indexes {
@@ -1364,7 +1364,7 @@ fn base_row_estimate(
 ) -> RowCountEstimate {
     match &table.table {
         Table::BTree(btree) => {
-            if let Some(stats) = schema.analyze_stats.table_stats(&btree.name) {
+            if let Some(stats) = schema.analyze_stats.table_stats(btree.name.as_str()) {
                 if let Some(rows) = stats.row_count.or_else(|| {
                     stats
                         .index_stats
@@ -1554,13 +1554,11 @@ fn enforce_indexed_by_hints(
             ast::Indexed::IndexedBy(name) => {
                 let idx_name = name.as_str();
                 // Verify the index exists and belongs to this table.
-                let forced_index = available_indexes
-                    .get(&Identifier::from(btree.name.as_str()))
-                    .and_then(|indexes| {
-                        indexes.iter().find(|idx| {
-                            idx.name.eq_ignore_ascii_case(idx_name) && idx.index_method.is_none()
-                        })
-                    });
+                let forced_index = available_indexes.get(&btree.name).and_then(|indexes| {
+                    indexes
+                        .iter()
+                        .find(|idx| idx.name == idx_name && idx.index_method.is_none())
+                });
                 let Some(forced_index) = forced_index else {
                     crate::bail_parse_error!("no such index: {}", idx_name);
                 };
@@ -2972,11 +2970,12 @@ fn ephemeral_index_build(
             "ephemeral_{}_{}",
             table_reference.table.get_name(),
             table_reference.internal_id
-        ),
+        )
+        .into(),
         columns: ephemeral_columns,
         unique: false,
         ephemeral: true,
-        table_name: table_reference.table.get_name().to_string(),
+        table_name: table_reference.table.get_name().clone(),
         root_page: 0,
         where_clause: None,
         has_rowid: table_reference

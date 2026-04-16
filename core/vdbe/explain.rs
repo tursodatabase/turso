@@ -1646,7 +1646,7 @@ pub fn insn_to_row(
                 0,
                 0,
                 0,
-                Value::build_text(index.name.clone()),
+                Value::build_text(index.name.to_string()),
                 0,
                 format!("DROP INDEX {}", index.name),
             ),

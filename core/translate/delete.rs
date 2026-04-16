@@ -16,6 +16,7 @@ use crate::translate::trigger_exec::has_triggers_including_temp;
 use crate::vdbe::builder::{ProgramBuilder, ProgramBuilderOpts};
 use crate::Result;
 use turso_parser::ast::{Expr, Limit, QualifiedName, ResultColumn, TriggerEvent, With};
+use turso_parser::identifier::Identifier;
 
 use super::plan::{ColumnUsedMask, JoinedTable, TableReferences, WhereTerm};
 
@@ -179,14 +180,17 @@ pub fn prepare_delete_plan(
     } else {
         crate::bail_parse_error!("Table is neither a virtual table nor a btree table");
     };
-    let indexes = schema.get_indices(table.get_name()).cloned().collect();
+    let indexes = schema
+        .get_indices(table.get_name().as_str())
+        .cloned()
+        .collect();
     let joined_tables = vec![JoinedTable {
         op: Operation::default_scan_for(&table),
         table,
-        identifier: tbl_name
-            .alias
-            .as_ref()
-            .map_or_else(|| table_name.to_owned(), |alias| alias.as_str().to_owned()),
+        identifier: tbl_name.alias.as_ref().map_or_else(
+            || Identifier::from(table_name),
+            |alias| Identifier::from(alias.as_str()),
+        ),
         internal_id: program.table_reference_counter.next(),
         join_info: None,
         col_used_mask: ColumnUsedMask::default(),

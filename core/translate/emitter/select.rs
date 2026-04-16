@@ -1,3 +1,5 @@
+use turso_parser::identifier::Identifier;
+
 use crate::{
     emit_explain,
     schema::BTreeTable,
@@ -432,8 +434,8 @@ fn emit_materialized_build_inputs(
     // Now we emit each of the materialization subplans into an ephemeral table.
     for spec in materializations.iter() {
         let build_table = &plan.table_references.joined_tables()[spec.build_table_idx];
-        let build_table_name = if build_table.table.get_name() == build_table.identifier {
-            build_table.identifier.clone()
+        let build_table_name = if *build_table.table.get_name() == build_table.identifier {
+            build_table.identifier.to_string()
         } else {
             format!(
                 "{} AS {}",
@@ -452,7 +454,7 @@ fn emit_materialized_build_inputs(
         let logical_to_physical_map = BTreeTable::build_logical_to_physical_map(&columns);
         let ephemeral_table = Arc::new(BTreeTable {
             root_page: 0,
-            name: format!("hash_build_input_{internal_id}"),
+            name: Identifier::from(format!("hash_build_input_{internal_id}")),
             has_rowid: true,
             has_autoincrement: false,
             primary_key_columns: vec![],

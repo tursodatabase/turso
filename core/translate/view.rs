@@ -1,3 +1,5 @@
+use turso_parser::identifier::Identifier;
+
 use crate::schema::{SchemaObjectType, DBSP_TABLE_PREFIX, RESERVED_TABLE_PREFIXES};
 use crate::storage::pager::CreateBTreeFlags;
 use crate::sync::Arc;
@@ -91,7 +93,7 @@ pub fn translate_create_materialized_view(
     let logical_to_physical_map = BTreeTable::build_logical_to_physical_map(&view_columns);
     let view_table = Arc::new(BTreeTable {
         root_page: 0, // Will be set to actual root page after creation
-        name: view_name_str.to_owned(),
+        name: Identifier::from(view_name_str),
         columns: view_columns,
         primary_key_columns: vec![], // Materialized views use implicit rowid
         has_rowid: true,

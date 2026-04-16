@@ -154,7 +154,7 @@ fn emit_table_list_rows_for_schema(
             };
             emit_table_row(
                 program,
-                table.get_name(),
+                table.get_name().as_str(),
                 "table",
                 table.columns().len(),
                 wr,
@@ -179,7 +179,7 @@ fn emit_table_list_rows_for_schema(
         };
         emit_table_row(
             program,
-            &bt.name,
+            bt.name.as_str(),
             "table",
             bt.columns.len(),
             !bt.has_rowid,
@@ -990,7 +990,7 @@ fn query_pragma(
                         .indexes
                         .values()
                         .flatten()
-                        .find(|idx| idx.name.eq_ignore_ascii_case(&index_name));
+                        .find(|idx| idx.name == index_name.as_str());
 
                     if let Some(index) = index {
                         for (seqno, col) in index.columns.iter().enumerate() {
@@ -1031,7 +1031,7 @@ fn query_pragma(
                         .indexes
                         .values()
                         .flatten()
-                        .find(|idx| idx.name.eq_ignore_ascii_case(&index_name));
+                        .find(|idx| idx.name == index_name.as_str());
 
                     if let Some(index) = index {
                         for (seqno, col) in index.columns.iter().enumerate() {
@@ -1101,7 +1101,7 @@ fn query_pragma(
                             .unwrap_or_default();
 
                         for (seq, index) in schema.get_indices(&table_name).enumerate() {
-                            let origin = if index.name.starts_with("sqlite_autoindex_") {
+                            let origin = if index.name.as_str().starts_with("sqlite_autoindex_") {
                                 let idx_cols: Vec<&str> =
                                     index.columns.iter().map(|c| c.name.as_str()).collect();
                                 if idx_cols.len() == pk_cols.len()
@@ -1119,7 +1119,7 @@ fn query_pragma(
                             };
 
                             program.emit_int(seq as i64, base_reg);
-                            program.emit_string8(index.name.clone(), base_reg + 1);
+                            program.emit_string8(index.name.to_string(), base_reg + 1);
                             program.emit_int(index.unique as i64, base_reg + 2);
                             program.emit_string8(origin.to_string(), base_reg + 3);
                             program.emit_int(index.where_clause.is_some() as i64, base_reg + 4);

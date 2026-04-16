@@ -667,7 +667,7 @@ impl Statement {
                 .program
                 .table_references
                 .find_table_by_internal_id(*table)
-                .map(|(_, table_ref)| Cow::Borrowed(table_ref.get_name())),
+                .map(|(_, table_ref)| Cow::Borrowed(table_ref.get_name().as_str())),
             _ => None,
         }
     }

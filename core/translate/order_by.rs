@@ -1,6 +1,7 @@
 use crate::sync::Arc;
 
 use turso_parser::ast::{self, SortOrder};
+use turso_parser::identifier::Identifier;
 
 use crate::{
     emit_explain,
@@ -235,8 +236,8 @@ impl EmitOrderBy {
                 })
             }
             let index = Arc::new(Index {
-                name: index_name,
-                table_name: String::new(),
+                name: index_name.into(),
+                table_name: Identifier::from(""),
                 ephemeral: true,
                 root_page: 0,
                 columns: index_columns,

@@ -20,6 +20,7 @@ use crate::sync::Mutex;
 use crate::types::IOResult;
 use crate::Result;
 use std::fmt::Debug;
+use turso_parser::identifier::Identifier;
 
 /// Struct to hold both table and index cursors for DBSP state operations
 pub struct DbspStateCursors {
@@ -43,8 +44,8 @@ impl DbspStateCursors {
 /// This defines the primary key index on (operator_id, zset_id, element_id)
 pub fn create_dbsp_state_index(root_page: i64) -> Index {
     Index {
-        name: "dbsp_state_pk".to_string(),
-        table_name: "dbsp_state".to_string(),
+        name: Identifier::from("dbsp_state_pk"),
+        table_name: Identifier::from("dbsp_state"),
         root_page,
         columns: vec![
             IndexColumn {

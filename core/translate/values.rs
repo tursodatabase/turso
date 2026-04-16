@@ -318,7 +318,7 @@ fn emit_values_to_index(
             start_reg: to_u16(record_start),
             count: to_u16(record_count),
             dest_reg: to_u16(record_reg),
-            index_name: Some(index.name.clone()),
+            index_name: Some(index.name.to_string()),
             affinity_str: affinity_str.as_ref().map(|s| (**s).clone()),
         });
         program.emit_insn(Insn::IdxInsert {
@@ -350,7 +350,7 @@ fn emit_values_to_table(
         start_reg: to_u16(start_reg),
         count: to_u16(row_len),
         dest_reg: to_u16(record_reg),
-        index_name: Some(table.name.clone()),
+        index_name: Some(table.name.to_string()),
         affinity_str: None,
     });
     program.emit_insn(Insn::NewRowid {
@@ -363,6 +363,6 @@ fn emit_values_to_table(
         key_reg: rowid_reg,
         record_reg,
         flag: InsertFlags::new().is_ephemeral_table_insert(),
-        table_name: table.name.clone(),
+        table_name: table.name.to_string(),
     });
 }

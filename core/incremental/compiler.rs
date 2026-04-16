@@ -2275,6 +2275,7 @@ mod tests {
     use crate::{Database, MemoryIO, Pager, IO};
     use rustc_hash::FxHashSet as HashSet;
     use turso_parser::ast;
+    use turso_parser::identifier::Identifier;
     use turso_parser::parser::Parser;
 
     // Macro to create a test schema with a users table
@@ -2305,7 +2306,7 @@ mod tests {
             ];
             let logical_to_physical_map = BTreeTable::build_logical_to_physical_map(&columns);
             let users_table = BTreeTable {
-                name: "users".to_string(),
+                name: Identifier::from("users"),
                 root_page: 2,
                 primary_key_columns: vec![("id".to_string(), turso_parser::ast::SortOrder::Asc)],
                 columns,
@@ -2352,7 +2353,7 @@ mod tests {
             ];
             let logical_to_physical_map = BTreeTable::build_logical_to_physical_map(&columns);
             let products_table = BTreeTable {
-                name: "products".to_string(),
+                name: Identifier::from("products"),
                 root_page: 3,
                 primary_key_columns: vec![(
                     "product_id".to_string(),
@@ -2407,7 +2408,7 @@ mod tests {
             ];
             let logical_to_physical_map = BTreeTable::build_logical_to_physical_map(&columns);
             let orders_table = BTreeTable {
-                name: "orders".to_string(),
+                name: Identifier::from("orders"),
                 root_page: 4,
                 primary_key_columns: vec![(
                     "order_id".to_string(),
@@ -2448,7 +2449,7 @@ mod tests {
             ];
             let logical_to_physical_map = BTreeTable::build_logical_to_physical_map(&columns);
             let customers_table = BTreeTable {
-                name: "customers".to_string(),
+                name: Identifier::from("customers"),
                 root_page: 6,
                 primary_key_columns: vec![("id".to_string(), turso_parser::ast::SortOrder::Asc)],
                 columns,
@@ -2500,7 +2501,7 @@ mod tests {
             ];
             let logical_to_physical_map = BTreeTable::build_logical_to_physical_map(&columns);
             let purchases_table = BTreeTable {
-                name: "purchases".to_string(),
+                name: Identifier::from("purchases"),
                 root_page: 7,
                 primary_key_columns: vec![("id".to_string(), turso_parser::ast::SortOrder::Asc)],
                 columns,
@@ -2543,7 +2544,7 @@ mod tests {
             ];
             let logical_to_physical_map = BTreeTable::build_logical_to_physical_map(&columns);
             let vendors_table = BTreeTable {
-                name: "vendors".to_string(),
+                name: Identifier::from("vendors"),
                 root_page: 8,
                 primary_key_columns: vec![("id".to_string(), turso_parser::ast::SortOrder::Asc)],
                 columns,
@@ -2575,7 +2576,7 @@ mod tests {
             ];
             let logical_to_physical_map = BTreeTable::build_logical_to_physical_map(&columns);
             let sales_table = BTreeTable {
-                name: "sales".to_string(),
+                name: Identifier::from("sales"),
                 root_page: 2,
                 primary_key_columns: vec![],
                 columns,

@@ -231,6 +231,7 @@ mod tests {
     use crate::{sync::Arc, MAIN_DB_ID};
 
     use turso_parser::ast::{Literal, Name, Operator, TableInternalId, UnaryOperator};
+    use turso_parser::identifier::Identifier;
 
     use crate::{
         schema::{BTreeTable, ColDef, Column, Table, Type},
@@ -527,7 +528,7 @@ mod tests {
             has_autoincrement: false,
             has_rowid: false,
             is_strict: false,
-            name: "foo".to_string(),
+            name: Identifier::from("foo"),
             primary_key_columns: vec![],
             columns,
             unique_sets: vec![],
@@ -546,7 +547,7 @@ mod tests {
             column_use_counts: Vec::new(),
             expression_index_usages: Vec::new(),
             database_id: MAIN_DB_ID,
-            identifier: "foo".to_string(),
+            identifier: Identifier::from("foo"),
             internal_id: TableInternalId::from(1),
             join_info: None,
             table,
@@ -581,7 +582,7 @@ mod tests {
             column_use_counts: Vec::new(),
             expression_index_usages: Vec::new(),
             database_id: MAIN_DB_ID,
-            identifier: "t1".to_string(),
+            identifier: Identifier::from("t1"),
             internal_id: TableInternalId::from(1),
             join_info: None,
             table: Table::BTree(Arc::new(BTreeTable {
@@ -589,7 +590,7 @@ mod tests {
                 has_autoincrement: false,
                 has_rowid: true,
                 is_strict: false,
-                name: "t1".to_string(),
+                name: Identifier::from("t1"),
                 primary_key_columns: vec![],
                 columns,
                 unique_sets: vec![],
@@ -621,7 +622,7 @@ mod tests {
             column_use_counts: Vec::new(),
             expression_index_usages: Vec::new(),
             database_id: MAIN_DB_ID,
-            identifier: "t2".to_string(),
+            identifier: Identifier::from("t2"),
             internal_id: TableInternalId::from(2),
             join_info: None,
             table: Table::BTree(Arc::new(BTreeTable {
@@ -629,7 +630,7 @@ mod tests {
                 has_autoincrement: false,
                 has_rowid: true,
                 is_strict: false,
-                name: "t2".to_string(),
+                name: Identifier::from("t2"),
                 primary_key_columns: vec![],
                 columns,
                 unique_sets: vec![],
@@ -675,7 +676,7 @@ mod tests {
             column_use_counts: Vec::new(),
             expression_index_usages: Vec::new(),
             database_id: MAIN_DB_ID,
-            identifier: "bar".to_string(),
+            identifier: Identifier::from("bar"),
             internal_id: TableInternalId::from(1),
             join_info: None,
             indexed: None,
@@ -684,7 +685,7 @@ mod tests {
                 has_autoincrement: false,
                 has_rowid: true,
                 is_strict: false,
-                name: "bar".to_string(),
+                name: Identifier::from("bar"),
                 primary_key_columns: vec![("id".to_string(), SortOrder::Asc)],
                 columns,
                 unique_sets: vec![],

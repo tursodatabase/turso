@@ -88,16 +88,15 @@ pub fn translate_create_index(
     } else {
         resolver.resolve_existing_table_database_id(tbl_name.as_str())?
     };
-    let idx_name = original_idx_name.name.as_str().to_owned();
-    let tbl_name = tbl_name.as_str().to_owned();
+    let idx_name = original_idx_name.name.identifier().clone();
+    let tbl_name = Identifier::from(tbl_name.as_str());
 
-    let tbl_id = Identifier::from(tbl_name.as_str());
-    if tbl_id == "sqlite_sequence" {
+    if tbl_name == "sqlite_sequence" {
         crate::bail_parse_error!("table sqlite_sequence may not be indexed");
     }
     if RESERVED_TABLE_PREFIXES.iter().any(|prefix| {
-        idx_name.to_ascii_lowercase().starts_with(prefix)
-            || tbl_name.to_ascii_lowercase().starts_with(prefix)
+        idx_name.as_str().to_ascii_lowercase().starts_with(prefix)
+            || tbl_name.as_str().to_ascii_lowercase().starts_with(prefix)
     }) && !connection.is_nested_stmt()
     {
         bail_parse_error!(
@@ -117,7 +116,8 @@ pub fn translate_create_index(
 
     // Check if the index is being created on a valid btree table and
     // the name is globally unique in the schema.
-    let schema_unique = resolver.with_schema(database_id, |s| s.is_unique_idx_name(&idx_name));
+    let schema_unique =
+        resolver.with_schema(database_id, |s| s.is_unique_idx_name(idx_name.as_str()));
     if !schema_unique {
         // If IF NOT EXISTS is specified, silently return without error
         if if_not_exists {
@@ -125,7 +125,7 @@ pub fn translate_create_index(
         }
         crate::bail_parse_error!("Error: index with name '{idx_name}' already exists.");
     }
-    let table = resolver.with_schema(database_id, |s| s.get_table(&tbl_name));
+    let table = resolver.with_schema(database_id, |s| s.get_table(tbl_name.as_str()));
     let Some(table) = table else {
         crate::bail_parse_error!("Error: table '{tbl_name}' does not exist.");
     };
@@ -174,8 +174,8 @@ pub fn translate_create_index(
         if let Some(index_module) = index_module {
             let parameters = resolve_index_method_parameters(with_clause)?;
             index_method = Some(index_module.attach(&IndexMethodConfiguration {
-                table_name: tbl.name.clone(),
-                index_name: idx_name.clone(),
+                table_name: tbl.name.to_string(),
+                index_name: idx_name.to_string(),
                 columns: columns.clone(),
                 parameters,
             })?);
@@ -277,8 +277,8 @@ pub fn translate_create_index(
         sqlite_schema_cursor_id,
         cdc_table.map(|x| x.0),
         SchemaEntryType::Index,
-        &idx_name,
-        &tbl_name,
+        idx_name.as_str(),
+        tbl_name.as_str(),
         root_page_reg,
         Some(sql),
     )?;
@@ -356,7 +356,7 @@ pub fn translate_create_index(
             start_reg: to_u16(start_reg),
             count: to_u16(columns.len() + 1),
             dest_reg: to_u16(record_reg),
-            index_name: Some(idx_name.clone()),
+            index_name: Some(idx_name.to_string()),
             affinity_str: None,
         });
 
@@ -459,7 +459,7 @@ pub fn translate_create_index(
             start_reg: to_u16(start_reg),
             count: to_u16(columns.len() + 1),
             dest_reg: to_u16(record_reg),
-            index_name: Some(idx_name.clone()),
+            index_name: Some(idx_name.to_string()),
             affinity_str: None,
         });
         program.emit_insn(Insn::SorterInsert {
@@ -560,7 +560,7 @@ pub fn translate_create_index(
         p5: 0,
     });
     // Parse the schema table to get the index root page and add new index to Schema
-    let escaped_idx_name = escape_sql_string_literal(&idx_name);
+    let escaped_idx_name = escape_sql_string_literal(idx_name.as_str());
     let parse_schema_where_clause = format!("name = '{escaped_idx_name}' AND type = 'index'");
     program.emit_insn(Insn::ParseSchema {
         db: database_id,
@@ -915,7 +915,7 @@ pub fn translate_drop_index(
         s.indexes
             .values()
             .flat_map(|v| v.iter())
-            .filter(|idx| idx_id == *idx.name)
+            .filter(|idx| idx.name == idx_id)
             .cloned()
             .collect()
     });
@@ -940,6 +940,7 @@ pub fn translate_drop_index(
     if let Some(ref idx) = maybe_index {
         if idx
             .name
+            .as_str()
             .starts_with(PRIMARY_KEY_AUTOMATIC_INDEX_NAME_PREFIX)
         {
             return Err(crate::error::LimboError::InvalidArgument(
@@ -1132,7 +1133,7 @@ pub fn translate_optimize(
         resolver.with_schema(database_id, |schema| {
             for val in schema.indexes.values() {
                 for idx in val {
-                    if idx_id == *idx.name {
+                    if idx_id == idx.name {
                         if idx.index_method.is_some() && !idx.is_backing_btree_index() {
                             indexes_to_optimize.push((database_id, idx.clone()));
                         } else {

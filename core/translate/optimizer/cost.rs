@@ -307,14 +307,10 @@ fn estimate_rows_from_analyze_stats(
         return None;
     }
 
-    let table_name = ctx.rhs_table.table.get_name();
+    let table_name = ctx.rhs_table.table.get_name().as_str();
 
     let table_stats = ctx.stats.table_stats(table_name)?;
-    let idx_stats = table_stats
-        .index_stats
-        .get(&turso_parser::identifier::Identifier::from(
-            index.name.as_str(),
-        ))?;
+    let idx_stats = table_stats.index_stats.get(&index.name)?;
 
     if eq_prefix_len <= idx_stats.avg_rows_per_distinct_prefix.len() {
         Some(idx_stats.avg_rows_per_distinct_prefix[eq_prefix_len - 1] as f64)

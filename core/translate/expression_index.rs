@@ -97,7 +97,7 @@ pub fn expression_index_column_usage(
     let mut bound_expr = expr.clone();
     let mut binding_table = table_reference.clone();
     if let Some(btree_table) = binding_table.table.btree() {
-        binding_table.identifier.clone_from(&btree_table.name);
+        binding_table.identifier = btree_table.name.clone();
     }
     let mut binding_tables = TableReferences::new(vec![binding_table], vec![]);
     bind_and_rewrite_expr(

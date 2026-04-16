@@ -230,7 +230,7 @@ pub fn emit_columns_to_destination(
                     start_reg: to_u16(record_start),
                     count: to_u16(record_count),
                     dest_reg: to_u16(record_reg),
-                    index_name: Some(dedupe_index.name.clone()),
+                    index_name: Some(dedupe_index.name.to_string()),
                     affinity_str: affinity_str.as_ref().map(|s| (**s).clone()),
                 });
                 program.emit_insn(Insn::IdxInsert {
@@ -260,7 +260,7 @@ pub fn emit_columns_to_destination(
                             start_reg: to_u16(start_reg),
                             count: to_u16(1),
                             dest_reg: to_u16(record_reg),
-                            index_name: Some(table.name.clone()),
+                            index_name: Some(table.name.to_string()),
                             affinity_str: None,
                         });
                     } else if num_columns > 1 {
@@ -268,7 +268,7 @@ pub fn emit_columns_to_destination(
                             start_reg: to_u16(start_reg),
                             count: to_u16(num_columns - 1),
                             dest_reg: to_u16(record_reg),
-                            index_name: Some(table.name.clone()),
+                            index_name: Some(table.name.to_string()),
                             affinity_str: None,
                         });
                     }
@@ -279,7 +279,7 @@ pub fn emit_columns_to_destination(
                         flag: InsertFlags::new()
                             .require_seek()
                             .is_ephemeral_table_insert(),
-                        table_name: table.name.clone(),
+                        table_name: table.name.to_string(),
                     });
                 }
                 super::plan::EphemeralRowidMode::Auto => {
@@ -288,7 +288,7 @@ pub fn emit_columns_to_destination(
                             start_reg: to_u16(start_reg),
                             count: to_u16(num_columns),
                             dest_reg: to_u16(record_reg),
-                            index_name: Some(table.name.clone()),
+                            index_name: Some(table.name.to_string()),
                             affinity_str: None,
                         });
                     }
@@ -303,7 +303,7 @@ pub fn emit_columns_to_destination(
                         key_reg: rowid_reg,
                         record_reg,
                         flag: InsertFlags::new().is_ephemeral_table_insert(),
-                        table_name: table.name.clone(),
+                        table_name: table.name.to_string(),
                     });
                 }
             }

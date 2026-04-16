@@ -239,7 +239,7 @@ pub fn prepare_update_plan(
     let or_conflict = body.or_conflict.take();
     let indexed = body.indexed.take();
 
-    let table_name = table.get_name();
+    let table_name = table.get_name().as_str();
     let iter_dir = body
         .order_by
         .first()
@@ -258,8 +258,8 @@ pub fn prepare_update_plan(
             _ => unreachable!(),
         },
         identifier: body.tbl_name.alias.as_ref().map_or_else(
-            || table_name.to_string(),
-            |alias| alias.as_str().to_string(),
+            || Identifier::from(table_name),
+            |alias| Identifier::from(alias.as_str()),
         ),
         internal_id: program.table_reference_counter.next(),
         op: build_scan_op(&table, iter_dir),

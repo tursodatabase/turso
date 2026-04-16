@@ -822,15 +822,17 @@ pub fn select_star(
         // If this table's identifier appears more than once in the FROM clause,
         // expanding * would produce ambiguous column references (matches SQLite).
         // However, columns deduplicated by USING/NATURAL are not ambiguous.
-        let table_id = Identifier::from(table.identifier.as_str());
-        let has_duplicate_identifier =
-            tables.iter().filter(|t| table_id == *t.identifier).count() > 1;
+        let has_duplicate_identifier = tables
+            .iter()
+            .filter(|t| t.identifier == table.identifier)
+            .count()
+            > 1;
         if has_duplicate_identifier {
             // Collect all USING columns from duplicate tables (both this table's
             // own join_info and the join_info of other tables with the same identifier).
             let using_cols: Vec<&str> = tables
                 .iter()
-                .filter(|t| table_id == *t.identifier)
+                .filter(|t| t.identifier == table.identifier)
                 .filter_map(|t| t.join_info.as_ref())
                 .flat_map(|ji| ji.using.iter().map(|u| u.as_str()))
                 .collect();
@@ -968,7 +970,7 @@ pub struct JoinedTable {
     /// Table object, which contains metadata about the table, e.g. columns.
     pub table: Table,
     /// The name of the table as referred to in the query, either the literal name or an alias e.g. "users" or "u"
-    pub identifier: String,
+    pub identifier: Identifier,
     /// Internal ID of the table reference, used in e.g. [Expr::Column] to refer to this table.
     pub internal_id: TableInternalId,
     /// The join info for this table reference, if it is the right side of a join (which all except the first table reference have)
@@ -999,7 +1001,7 @@ pub struct JoinedTable {
 #[derive(Debug, Clone)]
 pub struct OuterQueryReference {
     /// The name of the table as referred to in the query, either the literal name or an alias e.g. "users" or "u"
-    pub identifier: String,
+    pub identifier: Identifier,
     /// Internal ID of the table reference, used in e.g. [Expr::Column] to refer to this table.
     pub internal_id: TableInternalId,
     /// Table object, which contains metadata about the table, e.g. columns.
@@ -1220,16 +1222,15 @@ impl TableReferences {
 
     /// Returns an immutable reference to the [Table] with the given identifier,
     /// where identifier is either the literal name of the table or an alias.
-    pub fn find_table_by_identifier(&self, identifier: &str) -> Option<&Table> {
-        let id = Identifier::from(identifier);
+    pub fn find_table_by_identifier(&self, identifier: &Identifier) -> Option<&Table> {
         self.joined_tables
             .iter()
-            .find(|t| id == *t.identifier)
+            .find(|t| t.identifier == *identifier)
             .map(|t| &t.table)
             .or_else(|| {
                 self.outer_query_refs
                     .iter()
-                    .find(|t| id == *t.identifier)
+                    .find(|t| t.identifier == *identifier)
                     .map(|t| &t.table)
             })
     }
@@ -1240,15 +1241,15 @@ impl TableReferences {
     /// (e.g. "a"). This is needed when looking up column metadata for
     /// ephemeral auto-indexes, whose `table_name` field stores the base name
     /// while the table reference may be aliased.
-    pub fn find_table_by_table_name(&self, name: &str) -> Option<&Table> {
+    pub fn find_table_by_table_name(&self, name: &Identifier) -> Option<&Table> {
         self.joined_tables
             .iter()
-            .find(|t| t.table.get_name() == name)
+            .find(|t| *t.table.get_name() == *name)
             .map(|t| &t.table)
             .or_else(|| {
                 self.outer_query_refs
                     .iter()
-                    .find(|t| t.table.get_name() == name)
+                    .find(|t| *t.table.get_name() == *name)
                     .map(|t| &t.table)
             })
     }
@@ -1257,10 +1258,11 @@ impl TableReferences {
     /// where identifier is either the literal name of the table or an alias.
     pub fn find_outer_query_ref_by_identifier(
         &self,
-        identifier: &str,
+        identifier: &Identifier,
     ) -> Option<&OuterQueryReference> {
-        let id = Identifier::from(identifier);
-        self.outer_query_refs.iter().find(|t| id == *t.identifier)
+        self.outer_query_refs
+            .iter()
+            .find(|t| t.identifier == *identifier)
     }
 
     /// Marks the pre-planned [OuterQueryReference] with the given identifier as
@@ -1268,12 +1270,11 @@ impl TableReferences {
     /// resolution while still allowing CTE definition lookup in subquery FROM
     /// clauses. Called when a CTE is consumed by a FROM clause, since column
     /// resolution is then handled by the joined_table entry instead.
-    pub fn mark_outer_query_ref_cte_definition_only(&mut self, identifier: &str) {
-        let id = Identifier::from(identifier);
+    pub fn mark_outer_query_ref_cte_definition_only(&mut self, identifier: &Identifier) {
         if let Some(outer_ref) = self
             .outer_query_refs
             .iter_mut()
-            .find(|t| id == *t.identifier)
+            .find(|t| t.identifier == *identifier)
         {
             outer_ref.cte_definition_only = true;
         }
@@ -1282,17 +1283,16 @@ impl TableReferences {
     /// Returns the internal ID and immutable reference to the [Table] with the given identifier,
     pub fn find_table_and_internal_id_by_identifier(
         &self,
-        identifier: &str,
+        identifier: &Identifier,
     ) -> Option<(TableInternalId, &Table)> {
-        let id = Identifier::from(identifier);
         self.joined_tables
             .iter()
-            .find(|t| id == *t.identifier)
+            .find(|t| t.identifier == *identifier)
             .map(|t| (t.internal_id, &t.table))
             .or_else(|| {
                 self.outer_query_refs
                     .iter()
-                    .find(|t| id == *t.identifier && !t.cte_definition_only)
+                    .find(|t| t.identifier == *identifier && !t.cte_definition_only)
                     .map(|t| (t.internal_id, &t.table))
             })
     }
@@ -2014,12 +2014,12 @@ impl JoinedTable {
     fn matches(&self, database_id: usize, table_name: &str) -> bool {
         self.database_id == database_id
             && matches!(self.table, Table::BTree(_) | Table::Virtual(_))
-            && self.table.get_name().eq_ignore_ascii_case(table_name)
+            && *self.table.get_name() == *table_name
     }
 
     /// Creates a new TableReference for a subquery from a SelectPlan.
     pub fn new_subquery(
-        identifier: String,
+        identifier: Identifier,
         plan: SelectPlan,
         join_info: Option<JoinInfo>,
         internal_id: TableInternalId,
@@ -2083,7 +2083,7 @@ impl JoinedTable {
     /// If `materialize_hint` is true, the CTE was declared with AS MATERIALIZED and should always
     /// be materialized regardless of reference count.
     pub fn new_subquery_from_plan(
-        identifier: String,
+        identifier: Identifier,
         plan: Plan,
         join_info: Option<JoinInfo>,
         internal_id: TableInternalId,
@@ -2307,12 +2307,13 @@ impl JoinedTable {
                     ))
                 } else {
                     // Check if this is a materialized view
-                    let cursor_type =
-                        if let Some(view_mutex) = schema.get_materialized_view(&btree.name) {
-                            CursorType::MaterializedView(btree.clone(), view_mutex)
-                        } else {
-                            CursorType::BTreeTable(btree.clone())
-                        };
+                    let cursor_type = if let Some(view_mutex) =
+                        schema.get_materialized_view(btree.name.as_str())
+                    {
+                        CursorType::MaterializedView(btree.clone(), view_mutex)
+                    } else {
+                        CursorType::BTreeTable(btree.clone())
+                    };
                     Some(program.alloc_cursor_id_keyed_if_not_exists(
                         CursorKey::table(self.internal_id),
                         cursor_type,

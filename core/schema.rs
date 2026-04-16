@@ -734,8 +734,8 @@ impl Schema {
 
     /// Add a regular (non-materialized) view
     pub fn add_view(&mut self, view: View) -> Result<()> {
-        self.check_object_name_conflict(&view.name)?;
         let name = Identifier::from(view.name.as_str());
+        self.check_object_name_conflict(&name)?;
         self.views.insert(name, Arc::new(view));
         Ok(())
     }
@@ -761,13 +761,11 @@ impl Schema {
     }
 
     pub fn remove_trigger(&mut self, name: &str) -> Result<()> {
-        let name = Identifier::from(name);
-
         let mut removed = false;
         for triggers_list in self.triggers.values_mut() {
             for i in 0..triggers_list.len() {
                 let trigger = &triggers_list[i];
-                if trigger.name.as_str() == name {
+                if trigger.name.as_str().eq_ignore_ascii_case(name) {
                     removed = true;
                     triggers_list.remove(i);
                     break;
@@ -820,10 +818,12 @@ impl Schema {
 
     pub fn get_trigger_for_table(&self, table_name: &str, name: &str) -> Option<Arc<Trigger>> {
         let table_name = Identifier::from(table_name);
-        let name = Identifier::from(name);
-        self.triggers
-            .get(&table_name)
-            .and_then(|triggers| triggers.iter().find(|t| t.name.as_str() == name).cloned())
+        self.triggers.get(&table_name).and_then(|triggers| {
+            triggers
+                .iter()
+                .find(|t| t.name.as_str().eq_ignore_ascii_case(name))
+                .cloned()
+        })
     }
 
     pub fn get_triggers_for_table(
@@ -838,24 +838,23 @@ impl Schema {
     }
 
     pub fn get_trigger(&self, name: &str) -> Option<Arc<Trigger>> {
-        let name = Identifier::from(name);
         self.triggers
             .values()
             .flatten()
-            .find(|t| t.name.as_str() == name)
+            .find(|t| t.name.as_str().eq_ignore_ascii_case(name))
             .cloned()
     }
 
     pub fn add_btree_table(&mut self, table: Arc<BTreeTable>) -> Result<()> {
         self.check_object_name_conflict(&table.name)?;
-        let name = Identifier::from(table.name.as_str());
+        let name = table.name.clone();
         self.tables.insert(name, Table::BTree(table).into());
         Ok(())
     }
 
     pub fn add_virtual_table(&mut self, table: Arc<VirtualTable>) -> Result<()> {
         self.check_object_name_conflict(&table.name)?;
-        let name = Identifier::from(table.name.as_str());
+        let name = table.name.clone();
         self.tables.insert(name, Table::Virtual(table).into());
         Ok(())
     }
@@ -870,7 +869,6 @@ impl Schema {
         self.tables.remove(&name);
         self.analyze_stats.remove_table(&name);
 
-        // If this was a materialized view, also clean up the metadata
         if self.materialized_view_names.remove(&name) {
             self.incremental_views.remove(&name);
             self.materialized_view_sql.remove(&name);
@@ -888,7 +886,7 @@ impl Schema {
 
     pub fn add_index(&mut self, index: Arc<Index>) -> Result<()> {
         self.check_object_name_conflict(&index.name)?;
-        let table_name = Identifier::from(index.table_name.as_str());
+        let table_name = index.table_name.clone();
         // We must add the new index to the front of the deque, because SQLite stores index definitions as a linked list
         // where the newest parsed index entry is at the head of list. If we would add it to the back of a regular Vec for example,
         // then we would evaluate ON CONFLICT DO UPDATE clauses in the wrong index iteration order and UPDATE the wrong row.
@@ -1203,7 +1201,7 @@ impl Schema {
                     if let Some((idx_name, root)) = automatic_indexes.pop() {
                         self.add_index(Arc::new(Index::automatic_from_primary_key(
                             table.as_ref(),
-                            (idx_name.into_inner(), root),
+                            (idx_name, root),
                             unique_set.columns.len(),
                             unique_set.conflict_clause,
                         )?))?;
@@ -1233,7 +1231,7 @@ impl Schema {
                     if let Some((idx_name, root)) = automatic_indexes.pop() {
                         self.add_index(Arc::new(Index::automatic_from_unique(
                             table.as_ref(),
-                            (idx_name.into_inner(), root),
+                            (idx_name, root),
                             column_indices_and_sort_orders,
                             unique_set.conflict_clause,
                         )?))?;
@@ -1294,8 +1292,8 @@ impl Schema {
                 let mut index = create_dbsp_state_index(dbsp_state_index_root);
                 let dbsp_table_name =
                     format!("{DBSP_TABLE_PREFIX}{DBSP_CIRCUIT_VERSION}_{view_name}");
-                index.name = format!("sqlite_autoindex_{dbsp_table_name}_1");
-                index.table_name = dbsp_table_name;
+                index.name = format!("sqlite_autoindex_{dbsp_table_name}_1").into();
+                index.table_name = dbsp_table_name.into();
                 if let Err(e) = self.add_index(std::sync::Arc::new(index)) {
                     if !e.to_string().contains("already exists") {
                         return Err(e);
@@ -1317,7 +1315,7 @@ impl Schema {
             let cols = incremental_view.column_schema.flat_columns();
             let logical_to_physical_map = BTreeTable::build_logical_to_physical_map(&cols);
             let table = Arc::new(Table::BTree(Arc::new(BTreeTable {
-                name: view_name.as_str().to_owned(),
+                name: view_name.clone(),
                 root_page: main_root,
                 columns: cols,
                 primary_key_columns: Vec::new(),
@@ -1399,9 +1397,9 @@ impl Schema {
                     }
 
                     // Check if this is a DBSP state table
-                    if table.name.starts_with(DBSP_TABLE_PREFIX) {
+                    if table.name.as_str().starts_with(DBSP_TABLE_PREFIX) {
                         // Extract version and view name from __turso_internal_dbsp_state_v<version>_<viewname>
-                        let suffix = table.name.strip_prefix(DBSP_TABLE_PREFIX).unwrap();
+                        let suffix = table.name.as_str().strip_prefix(DBSP_TABLE_PREFIX).unwrap();
 
                         // Parse version and view name (format: "<version>_<viewname>")
                         if let Some(underscore_pos) = suffix.find('_') {
@@ -1615,7 +1613,7 @@ impl Schema {
 
         // Precompute helper to find parent unique index, if it's not the rowid
         let find_parent_unique = |cols: &Vec<String>| -> Option<Arc<Index>> {
-            self.get_indices(&parent_tbl.name)
+            self.get_indices(parent_tbl.name.as_str())
                 .find(|idx| {
                     idx.unique
                         && idx.columns.len() == cols.len()
@@ -1638,15 +1636,18 @@ impl Schema {
                 }
                 if fk.child_columns.is_empty() {
                     // SQLite requires an explicit child column list unless the table has a single-column PK that
-                    return Err(fk_mismatch_err(&child.name, &parent_tbl.name));
+                    return Err(fk_mismatch_err(
+                        child.name.as_str(),
+                        parent_tbl.name.as_str(),
+                    ));
                 }
                 let child_cols: Vec<String> = fk.child_columns.clone();
                 let mut child_pos = Vec::with_capacity(child_cols.len());
 
                 for cname in &child_cols {
-                    let (i, _) = child
-                        .get_column(cname)
-                        .ok_or_else(|| fk_mismatch_err(&child.name, &parent_tbl.name))?;
+                    let (i, _) = child.get_column(cname).ok_or_else(|| {
+                        fk_mismatch_err(child.name.as_str(), parent_tbl.name.as_str())
+                    })?;
                     child_pos.push(i);
                 }
                 let parent_cols: Vec<String> = if fk.parent_columns.is_empty() {
@@ -1658,7 +1659,10 @@ impl Schema {
                             .cloned()
                             .collect()
                     } else {
-                        return Err(fk_mismatch_err(&child.name, &parent_tbl.name));
+                        return Err(fk_mismatch_err(
+                            child.name.as_str(),
+                            parent_tbl.name.as_str(),
+                        ));
                     }
                 } else {
                     fk.parent_columns.clone()
@@ -1666,7 +1670,10 @@ impl Schema {
 
                 // Same length required
                 if parent_cols.len() != child_cols.len() {
-                    return Err(fk_mismatch_err(&child.name, &parent_tbl.name));
+                    return Err(fk_mismatch_err(
+                        child.name.as_str(),
+                        parent_tbl.name.as_str(),
+                    ));
                 }
 
                 let mut parent_pos = Vec::with_capacity(parent_cols.len());
@@ -1678,7 +1685,10 @@ impl Schema {
                             .then_some(0)
                     });
                     let Some(p) = pos else {
-                        return Err(fk_mismatch_err(&child.name, &parent_tbl.name));
+                        return Err(fk_mismatch_err(
+                            child.name.as_str(),
+                            parent_tbl.name.as_str(),
+                        ));
                     };
                     parent_pos.push(p);
                 }
@@ -1736,19 +1746,22 @@ impl Schema {
             let parent_name = Identifier::from(fk.parent_table.as_str());
             let parent_tbl = self
                 .get_btree_table(parent_name.as_str())
-                .ok_or_else(|| fk_mismatch_err(&child.name, parent_name.as_str()))?;
+                .ok_or_else(|| fk_mismatch_err(child.name.as_str(), parent_name.as_str()))?;
 
             let child_cols: Vec<String> = fk.child_columns.clone();
             if child_cols.is_empty() {
-                return Err(fk_mismatch_err(&child.name, &parent_tbl.name));
+                return Err(fk_mismatch_err(
+                    child.name.as_str(),
+                    parent_tbl.name.as_str(),
+                ));
             }
 
             // Child positions exist
             let mut child_pos = Vec::with_capacity(child_cols.len());
             for cname in &child_cols {
-                let (i, _) = child
-                    .get_column(cname)
-                    .ok_or_else(|| fk_mismatch_err(&child.name, &parent_tbl.name))?;
+                let (i, _) = child.get_column(cname).ok_or_else(|| {
+                    fk_mismatch_err(child.name.as_str(), parent_tbl.name.as_str())
+                })?;
                 child_pos.push(i);
             }
 
@@ -1761,14 +1774,20 @@ impl Schema {
                         .cloned()
                         .collect()
                 } else {
-                    return Err(fk_mismatch_err(&child.name, &parent_tbl.name));
+                    return Err(fk_mismatch_err(
+                        child.name.as_str(),
+                        parent_tbl.name.as_str(),
+                    ));
                 }
             } else {
                 fk.parent_columns.clone()
             };
 
             if parent_cols.len() != child_cols.len() {
-                return Err(fk_mismatch_err(&child.name, &parent_tbl.name));
+                return Err(fk_mismatch_err(
+                    child.name.as_str(),
+                    parent_tbl.name.as_str(),
+                ));
             }
 
             // Parent positions exist, or rowid sentinel
@@ -1781,7 +1800,10 @@ impl Schema {
                         .then_some(0)
                 });
                 let Some(p) = pos else {
-                    return Err(fk_mismatch_err(&child.name, &parent_tbl.name));
+                    return Err(fk_mismatch_err(
+                        child.name.as_str(),
+                        parent_tbl.name.as_str(),
+                    ));
                 };
                 parent_pos.push(p);
             }
@@ -1802,7 +1824,7 @@ impl Schema {
             let parent_unique_index = if parent_uses_rowid {
                 None
             } else {
-                self.get_indices(&parent_tbl.name)
+                self.get_indices(parent_tbl.name.as_str())
                     .find(|idx| {
                         idx.unique
                             && idx.where_clause.is_none()
@@ -1814,7 +1836,7 @@ impl Schema {
                                 .all(|(ic, pc)| ic.name.eq_ignore_ascii_case(pc))
                     })
                     .cloned()
-                    .ok_or_else(|| fk_mismatch_err(&child.name, &parent_tbl.name))?
+                    .ok_or_else(|| fk_mismatch_err(child.name.as_str(), parent_tbl.name.as_str()))?
                     .into()
             };
 
@@ -1852,8 +1874,8 @@ impl Schema {
             .is_some_and(|t| !t.foreign_keys.is_empty())
     }
 
-    fn check_object_name_conflict(&self, name: &str) -> Result<()> {
-        if let Some(object_type) = self.get_object_type(name) {
+    fn check_object_name_conflict(&self, name: &Identifier) -> Result<()> {
+        if let Some(object_type) = self.get_object_type(name.as_str()) {
             let type_str = match object_type {
                 SchemaObjectType::Table => "table",
                 SchemaObjectType::View => "view",
@@ -1880,7 +1902,7 @@ impl Schema {
         }
 
         for index_list in self.indexes.values() {
-            if index_list.iter().any(|i| i.name.eq_ignore_ascii_case(name)) {
+            if index_list.iter().any(|i| i.name == name) {
                 return Some(SchemaObjectType::Index);
             }
         }
@@ -2105,7 +2127,7 @@ impl Table {
         }
     }
 
-    pub fn get_name(&self) -> &str {
+    pub fn get_name(&self) -> &Identifier {
         match self {
             Self::BTree(table) => &table.name,
             Self::Virtual(table) => &table.name,
@@ -2230,7 +2252,7 @@ impl CheckConstraint {
 #[derive(Clone, Debug)]
 pub struct BTreeTable {
     pub root_page: i64,
-    pub name: String,
+    pub name: Identifier,
     pub primary_key_columns: Vec<(String, SortOrder)>,
     pub columns: Vec<Column>,
     pub has_rowid: bool,
@@ -2403,7 +2425,7 @@ impl BTreeTable {
     /// For example, if a user creates a table like: `CREATE TABLE t              (x)`, we store it as
     /// `CREATE TABLE t (x)`, whereas sqlite stores it with the original extra whitespace.
     pub fn to_sql(&self) -> String {
-        let mut sql = format!("CREATE TABLE {} (", quote_ident(&self.name));
+        let mut sql = format!("CREATE TABLE {} (", quote_ident(self.name.as_str()));
         let needs_pk_inline = self.primary_key_columns.len() == 1;
         // Add columns
         for (i, column) in self.columns.iter().enumerate() {
@@ -2662,7 +2684,7 @@ impl PseudoCursorType {
 #[derive(Debug, Clone)]
 pub struct FromClauseSubquery {
     /// The name of the derived table; uses the alias if available.
-    pub name: String,
+    pub name: Identifier,
     /// The query plan for the derived table. Can be either a simple SelectPlan
     /// or a compound select (UNION/INTERSECT/EXCEPT).
     pub plan: Box<Plan>,
@@ -3573,7 +3595,7 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
 
     let mut table = BTreeTable {
         root_page,
-        name: table_name.into_inner(),
+        name: table_name,
         has_rowid,
         primary_key_columns,
         has_autoincrement,
@@ -3761,6 +3783,7 @@ impl ResolvedFkRef {
 #[derive(Debug, Clone)]
 pub struct Column {
     pub name: Option<String>,
+
     pub ty_str: String,
     pub ty_params: Vec<Box<Expr>>,
     pub default: Option<Box<Expr>>,
@@ -4219,7 +4242,7 @@ pub fn sqlite_schema_table() -> BTreeTable {
     let logical_to_physical_map = BTreeTable::build_logical_to_physical_map(&columns);
     BTreeTable {
         root_page: 1,
-        name: "sqlite_schema".to_string(),
+        name: Identifier::from("sqlite_schema"),
         has_rowid: true,
         is_strict: false,
         has_autoincrement: false,
@@ -4237,8 +4260,8 @@ pub fn sqlite_schema_table() -> BTreeTable {
 #[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct Index {
-    pub name: String,
-    pub table_name: String,
+    pub name: Identifier,
+    pub table_name: Identifier,
     pub root_page: i64,
     pub columns: Vec<IndexColumn>,
     pub unique: bool,
@@ -4292,7 +4315,7 @@ impl Index {
                 with_clause,
                 ..
             })) => {
-                let index_name = idx_name.name.as_str().to_owned();
+                let index_name = idx_name.name.identifier().clone();
                 let index_columns = resolve_sorted_columns(table, &columns)?;
                 if let Some(using) = using {
                     if where_clause.is_some() {
@@ -4306,15 +4329,15 @@ impl Index {
                         bail_parse_error!("unknown module name: '{}'", using);
                     };
                     let configuration = IndexMethodConfiguration {
-                        table_name: table.name.clone(),
-                        index_name: index_name.clone(),
+                        table_name: table.name.to_string(),
+                        index_name: index_name.to_string(),
                         columns: index_columns.clone(),
                         parameters,
                     };
                     let descriptor = module.attach(&configuration)?;
                     Ok(Index {
                         name: index_name,
-                        table_name: tbl_name.as_str().to_owned(),
+                        table_name: tbl_name.identifier().clone(),
                         root_page,
                         columns: index_columns,
                         unique: false,
@@ -4327,7 +4350,7 @@ impl Index {
                 } else {
                     Ok(Index {
                         name: index_name,
-                        table_name: tbl_name.as_str().to_owned(),
+                        table_name: tbl_name.identifier().clone(),
                         root_page,
                         columns: index_columns,
                         unique,
@@ -4357,7 +4380,7 @@ impl Index {
 
     pub fn automatic_from_primary_key(
         table: &BTreeTable,
-        auto_index: (String, i64), // name, root_page
+        auto_index: (Identifier, i64), // name, root_page
         column_count: usize,
         conflict_clause: Option<ResolveType>,
     ) -> Result<Index> {
@@ -4403,7 +4426,7 @@ impl Index {
 
     pub fn automatic_from_unique(
         table: &BTreeTable,
-        auto_index: (String, i64), // name, root_page
+        auto_index: (Identifier, i64), // name, root_page
         column_indices_and_sort_orders: Vec<(usize, SortOrder)>,
         conflict_clause: Option<ResolveType>,
     ) -> Result<Index> {
@@ -4946,7 +4969,7 @@ mod tests {
         let table = BTreeTable::from_sql(sql, 0).unwrap();
         let _index = Index::automatic_from_primary_key(
             &table,
-            ("sqlite_autoindex_t1_1".to_string(), 2),
+            (Identifier::from("sqlite_autoindex_t1_1"), 2),
             1,
             None,
         )
@@ -4959,7 +4982,7 @@ mod tests {
         let table = BTreeTable::from_sql(sql, 0)?;
         let index = Index::automatic_from_primary_key(
             &table,
-            ("sqlite_autoindex_t1_1".to_string(), 2),
+            (Identifier::from("sqlite_autoindex_t1_1"), 2),
             2,
             None,
         )?;
@@ -4983,7 +5006,7 @@ mod tests {
         let table = BTreeTable::from_sql(sql, 0).unwrap();
         Index::automatic_from_primary_key(
             &table,
-            ("sqlite_autoindex_t1_1".to_string(), 2),
+            (Identifier::from("sqlite_autoindex_t1_1"), 2),
             1,
             None,
         )
@@ -5001,7 +5024,7 @@ mod tests {
         let logical_to_physical_map = BTreeTable::build_logical_to_physical_map(&columns);
         let table = BTreeTable {
             root_page: 0,
-            name: "t1".to_string(),
+            name: Identifier::from("t1"),
             has_rowid: true,
             is_strict: false,
             has_autoincrement: false,
@@ -5017,7 +5040,7 @@ mod tests {
 
         let result = Index::automatic_from_primary_key(
             &table,
-            ("sqlite_autoindex_t1_1".to_string(), 2),
+            (Identifier::from("sqlite_autoindex_t1_1"), 2),
             1,
             None,
         );
@@ -5030,7 +5053,7 @@ mod tests {
         let table = BTreeTable::from_sql(sql, 0)?;
         let index = Index::automatic_from_unique(
             &table,
-            ("sqlite_autoindex_t1_1".to_string(), 2),
+            (Identifier::from("sqlite_autoindex_t1_1"), 2),
             vec![(1, SortOrder::Asc)],
             None,
         )?;
@@ -5052,13 +5075,13 @@ mod tests {
         let indices = [
             Index::automatic_from_primary_key(
                 &table,
-                ("sqlite_autoindex_t1_1".to_string(), 2),
+                (Identifier::from("sqlite_autoindex_t1_1"), 2),
                 1,
                 None,
             )?,
             Index::automatic_from_unique(
                 &table,
-                ("sqlite_autoindex_t1_2".to_string(), 3),
+                (Identifier::from("sqlite_autoindex_t1_2"), 3),
                 vec![(1, SortOrder::Asc)],
                 None,
             )?,
@@ -5088,26 +5111,26 @@ mod tests {
         let sql = r#"CREATE TABLE t1 (a PRIMARY KEY, b UNIQUE, c, d, UNIQUE(c, d));"#;
         let table = BTreeTable::from_sql(sql, 0)?;
         let auto_indices = [
-            ("sqlite_autoindex_t1_1".to_string(), 2),
-            ("sqlite_autoindex_t1_2".to_string(), 3),
-            ("sqlite_autoindex_t1_3".to_string(), 4),
+            (Identifier::from("sqlite_autoindex_t1_1"), 2),
+            (Identifier::from("sqlite_autoindex_t1_2"), 3),
+            (Identifier::from("sqlite_autoindex_t1_3"), 4),
         ];
         let indices = vec![
             Index::automatic_from_primary_key(
                 &table,
-                ("sqlite_autoindex_t1_1".to_string(), 2),
+                (Identifier::from("sqlite_autoindex_t1_1"), 2),
                 1,
                 None,
             )?,
             Index::automatic_from_unique(
                 &table,
-                ("sqlite_autoindex_t1_2".to_string(), 3),
+                (Identifier::from("sqlite_autoindex_t1_2"), 3),
                 vec![(1, SortOrder::Asc)],
                 None,
             )?,
             Index::automatic_from_unique(
                 &table,
-                ("sqlite_autoindex_t1_3".to_string(), 4),
+                (Identifier::from("sqlite_autoindex_t1_3"), 4),
                 vec![(2, SortOrder::Asc), (3, SortOrder::Asc)],
                 None,
             )?,
@@ -5146,7 +5169,7 @@ mod tests {
         let table = BTreeTable::from_sql(sql, 0)?;
         let index = Index::automatic_from_unique(
             &table,
-            ("sqlite_autoindex_t1_1".to_string(), 2),
+            (Identifier::from("sqlite_autoindex_t1_1"), 2),
             vec![(0, SortOrder::Asc), (1, SortOrder::Asc)],
             None,
         )?;
@@ -5170,7 +5193,7 @@ mod tests {
         let table = BTreeTable::from_sql(sql, 0)?;
         let index = Index::automatic_from_primary_key(
             &table,
-            ("sqlite_autoindex_t1_1".to_string(), 2),
+            (Identifier::from("sqlite_autoindex_t1_1"), 2),
             1,
             None,
         )?;
@@ -5192,7 +5215,7 @@ mod tests {
         let table = BTreeTable::from_sql(sql, 0)?;
         let index = Index::automatic_from_primary_key(
             &table,
-            ("sqlite_autoindex_t1_1".to_string(), 2),
+            (Identifier::from("sqlite_autoindex_t1_1"), 2),
             2,
             None,
         )?;
@@ -5270,13 +5293,13 @@ mod tests {
         let mut indexes = vec![
             Index::automatic_from_unique(
                 &table,
-                ("sqlite_autoindex_t1_1".to_string(), 2),
+                (Identifier::from("sqlite_autoindex_t1_1"), 2),
                 vec![(0, SortOrder::Asc)],
                 None,
             )?,
             Index::automatic_from_primary_key(
                 &table,
-                ("sqlite_autoindex_t1_2".to_string(), 3),
+                (Identifier::from("sqlite_autoindex_t1_2"), 3),
                 1,
                 None,
             )?,
