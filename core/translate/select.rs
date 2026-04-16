@@ -5,6 +5,7 @@ use super::plan::{
 };
 use crate::schema::Table;
 use crate::sync::Arc;
+use crate::translate::collate::CollationSeq;
 use crate::translate::emitter::{OperationMode, Resolver};
 use crate::translate::expr::{
     bind_and_rewrite_expr, expr_vector_size, walk_expr, BindingBehavior, WalkControl,
@@ -219,8 +220,14 @@ pub fn prepare_select_plan(
             } else {
                 let mut key = Vec::with_capacity(select.order_by.len());
                 for (i, o) in select.order_by.iter().enumerate() {
-                    let col_idx = resolve_compound_order_by_expr(&o.expr, &all_plans, i + 1)?;
-                    key.push((col_idx, o.order.unwrap_or(ast::SortOrder::Asc), o.nulls));
+                    let (col_idx, collation) =
+                        resolve_compound_order_by_expr(&o.expr, &all_plans, i + 1)?;
+                    key.push((
+                        col_idx,
+                        o.order.unwrap_or(ast::SortOrder::Asc),
+                        o.nulls,
+                        collation,
+                    ));
                 }
                 Some(key)
             };
@@ -1065,25 +1072,44 @@ fn vtab_predicate_table_id(expr: &Expr) -> Option<ast::TableInternalId> {
 ///
 /// Per SQLite documentation, only constant integers are treated as column references.
 /// Non-integer numeric literals (floats) are treated as constant expressions.
+/// Root COLLATE wrappers still apply after ordinal resolution.
+fn unwrap_order_or_group_by_alias_expr(mut expr: &ast::Expr) -> (&ast::Expr, Vec<ast::Name>) {
+    let mut collations = Vec::new();
+    loop {
+        match expr {
+            ast::Expr::Collate(inner, collation) => {
+                collations.push(collation.clone());
+                expr = inner.as_ref();
+            }
+            ast::Expr::Parenthesized(exprs) if exprs.len() == 1 => {
+                expr = exprs[0].as_ref();
+            }
+            ast::Expr::Unary(ast::UnaryOperator::Positive, inner) => {
+                expr = inner.as_ref();
+            }
+            _ => return (expr, collations),
+        }
+    }
+}
+
+fn wrap_expr_with_collations(mut expr: ast::Expr, collations: &[ast::Name]) -> ast::Expr {
+    for collation in collations.iter().rev() {
+        expr = ast::Expr::collate(expr, collation.clone());
+    }
+    expr
+}
+
 fn replace_column_number_with_copy_of_column_expr(
     order_by_or_group_by_expr: &mut ast::Expr,
     columns: &[ResultSetColumn],
     clause_name: &str,
 ) -> Result<()> {
-    // Extract the numeric literal string, handling both bare integers (e.g. `2`)
-    // and unary-plus integers (e.g. `+2`). In SQLite, `ORDER BY +2` strips the
-    // unary plus and still resolves `2` as a column index reference.
-    let num_str = match order_by_or_group_by_expr {
+    let (alias_expr, collations) = unwrap_order_or_group_by_alias_expr(order_by_or_group_by_expr);
+    let num_str = match alias_expr {
         ast::Expr::Literal(ast::Literal::Numeric(num)) => Some(num.clone()),
-        ast::Expr::Unary(ast::UnaryOperator::Positive, inner) => {
-            if let ast::Expr::Literal(ast::Literal::Numeric(num)) = inner.as_ref() {
-                Some(num.clone())
-            } else {
-                None
-            }
-        }
         ast::Expr::Unary(ast::UnaryOperator::Negative, inner) => {
-            if let ast::Expr::Literal(ast::Literal::Numeric(num)) = inner.as_ref() {
+            let (inner, _) = unwrap_order_or_group_by_alias_expr(inner.as_ref());
+            if let ast::Expr::Literal(ast::Literal::Numeric(num)) = inner {
                 if num.parse::<usize>().is_ok() {
                     crate::bail_parse_error!(
                         "1st {} term out of range - should be between 1 and {}",
@@ -1108,7 +1134,7 @@ fn replace_column_number_with_copy_of_column_expr(
                 );
             }
             let ResultSetColumn { expr, .. } = &columns[column_number - 1];
-            *order_by_or_group_by_expr = expr.clone();
+            *order_by_or_group_by_expr = wrap_expr_with_collations(expr.clone(), &collations);
         }
         // Otherwise, leave the expression as-is (constant expression, case 3 per SQLite docs)
     }
@@ -1123,9 +1149,16 @@ fn resolve_compound_order_by_expr(
     expr: &ast::Expr,
     all_plans: &[&SelectPlan],
     term_number: usize,
-) -> Result<usize> {
+) -> Result<(usize, Option<CollationSeq>)> {
     let num_result_columns = all_plans[0].result_columns.len();
-    match expr {
+    let (alias_expr, collations) = unwrap_order_or_group_by_alias_expr(expr);
+    // Compound ORDER BY only needs the effective explicit collation.
+    // For stacked postfix COLLATE operators, the outermost one is the active collation.
+    let collation = collations
+        .first()
+        .map(|name| CollationSeq::new(name.as_str()))
+        .transpose()?;
+    match alias_expr {
         // Case 1: Numeric column reference (e.g., ORDER BY 1)
         ast::Expr::Literal(ast::Literal::Numeric(num)) => {
             if let Ok(column_number) = num.parse::<usize>() {
@@ -1136,13 +1169,29 @@ fn resolve_compound_order_by_expr(
                         num_result_columns
                     );
                 }
-                Ok(column_number - 1)
+                Ok((column_number - 1, collation))
             } else {
                 crate::bail_parse_error!(
                     "{} ORDER BY term does not match any column in the result set",
                     ordinal(term_number)
                 );
             }
+        }
+        ast::Expr::Unary(ast::UnaryOperator::Negative, inner) => {
+            let (inner, _) = unwrap_order_or_group_by_alias_expr(inner.as_ref());
+            if let ast::Expr::Literal(ast::Literal::Numeric(num)) = inner {
+                if num.parse::<usize>().is_ok() {
+                    crate::bail_parse_error!(
+                        "{} ORDER BY term out of range - should be between 1 and {}",
+                        ordinal(term_number),
+                        num_result_columns
+                    );
+                }
+            }
+            crate::bail_parse_error!(
+                "{} ORDER BY term does not match any column in the result set",
+                ordinal(term_number)
+            );
         }
         // Case 2: Name reference (e.g., ORDER BY name or ORDER BY alias)
         ast::Expr::Id(name) => {
@@ -1155,7 +1204,7 @@ fn resolve_compound_order_by_expr(
                 for (i, rc) in result_columns.iter().enumerate() {
                     if let Some(alias) = &rc.alias {
                         if normalize_ident(alias) == name_normalized {
-                            return Ok(i);
+                            return Ok((i, collation));
                         }
                     }
                 }
@@ -1163,7 +1212,7 @@ fn resolve_compound_order_by_expr(
                 for (i, rc) in result_columns.iter().enumerate() {
                     if let Some(col_name) = rc.name(table_references) {
                         if normalize_ident(col_name) == name_normalized {
-                            return Ok(i);
+                            return Ok((i, collation));
                         }
                     }
                 }

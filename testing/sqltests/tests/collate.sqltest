@@ -64,6 +64,112 @@ expect {
     1
 }
 
+@cross-check-integrity
+test collate_order_by_ordinal_preserves_explicit_collation {
+    CREATE TABLE t(x TEXT, v INT);
+    INSERT INTO t VALUES('b', 2), ('A', 1), ('c', 3), ('a', 3);
+    SELECT x FROM t ORDER BY 1 COLLATE NOCASE;
+}
+expect {
+    A
+    a
+    b
+    c
+}
+
+@cross-check-integrity
+test collate_order_by_parenthesized_ordinal_preserves_explicit_collation {
+    CREATE TABLE t(x TEXT);
+    INSERT INTO t VALUES('b'), ('A'), ('c'), ('a');
+    SELECT x FROM t ORDER BY (1) COLLATE NOCASE;
+}
+expect {
+    A
+    a
+    b
+    c
+}
+
+@cross-check-integrity
+test collate_order_by_positive_ordinal_preserves_explicit_collation {
+    CREATE TABLE t(x TEXT);
+    INSERT INTO t VALUES('b'), ('A'), ('c'), ('a');
+    SELECT x FROM t ORDER BY +1 COLLATE NOCASE;
+}
+expect {
+    A
+    a
+    b
+    c
+}
+
+@cross-check-integrity
+test collate_group_by_ordinal_preserves_explicit_collation {
+    CREATE TABLE t(x TEXT, v INT);
+    INSERT INTO t VALUES('b', 2), ('A', 1), ('c', 3), ('a', 3);
+    SELECT x, sum(v) FROM t GROUP BY 1 COLLATE NOCASE ORDER BY 1 COLLATE NOCASE;
+}
+expect {
+    A|4
+    b|2
+    c|3
+}
+
+@cross-check-integrity
+test collate_order_by_stacked_collations_preserve_wrapper_order {
+    CREATE TABLE t(x TEXT);
+    INSERT INTO t VALUES('a'), ('B'), ('A');
+    SELECT x FROM t ORDER BY 1 COLLATE RTRIM COLLATE NOCASE;
+}
+expect {
+    a
+    A
+    B
+}
+
+test collate_order_by_negative_ordinal_with_collation_errors {
+    CREATE TABLE t(x TEXT);
+    INSERT INTO t VALUES('b'), ('A');
+    SELECT x FROM t ORDER BY -1 COLLATE NOCASE;
+}
+expect error {
+    1st ORDER BY term out of range - should be between 1 and 1
+}
+
+@cross-check-integrity
+test collate_compound_order_by_ordinal_preserves_explicit_collation {
+    SELECT 'a' AS x
+    UNION ALL
+    SELECT 'A'
+    ORDER BY 1 COLLATE NOCASE;
+}
+expect {
+    a
+    A
+}
+
+test collate_compound_order_by_negative_ordinal_with_collation_errors {
+    SELECT 'a' AS x
+    UNION ALL
+    SELECT 'A'
+    ORDER BY -1 COLLATE NOCASE;
+}
+expect error {
+    1st ORDER BY term out of range - should be between 1 and 1
+}
+
+@cross-check-integrity
+test collate_compound_order_by_alias_preserves_explicit_collation {
+    SELECT 'a' AS x
+    UNION ALL
+    SELECT 'A'
+    ORDER BY x COLLATE NOCASE;
+}
+expect {
+    a
+    A
+}
+
 
 
 @cross-check-integrity
