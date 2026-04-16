@@ -3,6 +3,7 @@ use super::plan::{
     select_star, Distinctness, InSeekSource, JoinOrderMember, Operation, OuterQueryReference,
     QueryDestination, Search, TableReferences, WhereTerm, Window,
 };
+use crate::function::{Func, ScalarFunc};
 use crate::schema::Table;
 use crate::sync::Arc;
 use crate::translate::collate::CollationSeq;
@@ -112,7 +113,7 @@ fn select_plan_first_virtual_table_name(select_plan: &SelectPlan) -> Option<Stri
     for joined_table in select_plan.joined_tables() {
         match &joined_table.table {
             Table::Virtual(virtual_table) if !virtual_table.innocuous => {
-                return Some(virtual_table.name.clone())
+                return Some(virtual_table.name.clone());
             }
             Table::FromClauseSubquery(from_clause_subquery) => {
                 if let Some(name) = plan_first_virtual_table_name(&from_clause_subquery.plan) {
@@ -553,6 +554,7 @@ fn prepare_one_select_plan(
                             resolver,
                             BindingBehavior::TryCanonicalColumnsFirst,
                         )?;
+                        strip_shadowed_inner_collations(expr, resolver)?;
                     }
 
                     plan.group_by = Some(GroupBy {
@@ -608,6 +610,7 @@ fn prepare_one_select_plan(
                     resolver,
                     BindingBehavior::TryResultColumnsFirst,
                 )?;
+                strip_shadowed_inner_collations(&mut o.expr, resolver)?;
                 let had_agg = resolve_window_and_aggregate_functions(
                     &o.expr,
                     resolver,
@@ -1070,33 +1073,339 @@ fn vtab_predicate_table_id(expr: &Expr) -> Option<ast::TableInternalId> {
 /// For example, in SELECT u.first_name, count(1) FROM users u GROUP BY 1 ORDER BY 2,
 /// the column number 1 is replaced with u.first_name and the column number 2 is replaced with count(1).
 ///
-/// Per SQLite documentation, only constant integers are treated as column references.
-/// Non-integer numeric literals (floats) are treated as constant expressions.
-/// Root COLLATE wrappers still apply after ordinal resolution.
-fn unwrap_order_or_group_by_alias_expr(mut expr: &ast::Expr) -> (&ast::Expr, Vec<ast::Name>) {
-    let mut collations = Vec::new();
+/// Mirrors SQLite's root-level sqlite3ExprSkipCollateAndLikely() for ORDER/GROUP BY
+/// ordinal detection. Our AST keeps single-item parentheses, so we skip those too.
+/// Only the outermost explicit COLLATE matters once an ordinal is replaced.
+fn unwrap_order_or_group_by_root_collation(
+    mut expr: &ast::Expr,
+) -> (&ast::Expr, Option<ast::Name>) {
+    let mut outermost_collation = None;
     loop {
         match expr {
+            ast::Expr::Parenthesized(exprs) if exprs.len() == 1 => {
+                expr = exprs[0].as_ref();
+            }
             ast::Expr::Collate(inner, collation) => {
-                collations.push(collation.clone());
+                if outermost_collation.is_none() {
+                    outermost_collation = Some(collation.clone());
+                }
                 expr = inner.as_ref();
             }
+            _ => return (expr, outermost_collation),
+        }
+    }
+}
+
+fn wrap_expr_with_collation(expr: ast::Expr, collation: Option<ast::Name>) -> ast::Expr {
+    match collation {
+        Some(collation) => ast::Expr::collate(expr, collation),
+        None => expr,
+    }
+}
+
+fn unwrap_single_parenthesized_expr(mut expr: &ast::Expr) -> &ast::Expr {
+    loop {
+        match expr {
+            ast::Expr::Parenthesized(exprs) if exprs.len() == 1 => {
+                expr = exprs[0].as_ref();
+            }
+            _ => return expr,
+        }
+    }
+}
+
+fn expr_is_null_or_boolean_literal(expr: &ast::Expr) -> bool {
+    let expr = unwrap_single_parenthesized_expr(expr);
+    matches!(
+        expr,
+        ast::Expr::Literal(ast::Literal::Null | ast::Literal::True | ast::Literal::False)
+    )
+}
+
+fn binary_expr_is_collation_transparent(op: ast::Operator, rhs: &ast::Expr) -> bool {
+    !op.is_comparison()
+        || matches!(op, ast::Operator::Is | ast::Operator::IsNot)
+            && expr_is_null_or_boolean_literal(rhs)
+}
+
+fn function_call_is_collation_transparent(
+    name: &ast::Name,
+    arg_count: usize,
+    resolver: &Resolver,
+) -> Result<bool> {
+    Ok(match resolver.resolve_function(name.as_str(), arg_count)? {
+        Some(Func::Scalar(scalar_func)) => !matches!(
+            scalar_func,
+            ScalarFunc::Min | ScalarFunc::Max | ScalarFunc::Nullif
+        ),
+        Some(Func::Math(_) | Func::Vector(_) | Func::AlterTable(_)) => true,
+        _ => false,
+    })
+}
+
+/// Scalar subqueries only contribute a single output expression to the outer
+/// ORDER/GROUP BY term. Leave wider result sets alone so normal column-count
+/// validation still reports those errors.
+fn rewrite_scalar_subquery_output_exprs(
+    select: &mut ast::Select,
+    resolver: &Resolver,
+    rewrite_expr: fn(&mut ast::Expr, &Resolver) -> Result<()>,
+) -> Result<()> {
+    rewrite_one_select_scalar_subquery_output_exprs(
+        &mut select.body.select,
+        resolver,
+        rewrite_expr,
+    )?;
+    for compound in select.body.compounds.iter_mut() {
+        rewrite_one_select_scalar_subquery_output_exprs(
+            &mut compound.select,
+            resolver,
+            rewrite_expr,
+        )?;
+    }
+    Ok(())
+}
+
+fn rewrite_one_select_scalar_subquery_output_exprs(
+    one_select: &mut ast::OneSelect,
+    resolver: &Resolver,
+    rewrite_expr: fn(&mut ast::Expr, &Resolver) -> Result<()>,
+) -> Result<()> {
+    match one_select {
+        ast::OneSelect::Select { columns, .. } => {
+            if let [ast::ResultColumn::Expr(expr, _)] = columns.as_mut_slice() {
+                rewrite_expr(expr.as_mut(), resolver)?;
+            }
+        }
+        ast::OneSelect::Values(rows) => {
+            for row in rows.iter_mut() {
+                if let [expr] = row.as_mut_slice() {
+                    rewrite_expr(expr.as_mut(), resolver)?;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// SQLite only validates the explicit COLLATE that actually controls an
+/// ORDER/GROUP BY subexpression. If a subtree already has `... COLLATE X`,
+/// then deeper `COLLATE Y` nodes reached only through collation-transparent
+/// operators are shadowed and must not raise `no such collation sequence`.
+fn strip_shadowed_collations_below_explicit_collation(
+    expr: &mut ast::Expr,
+    resolver: &Resolver,
+) -> Result<()> {
+    match expr {
+        ast::Expr::Collate(inner, _) => {
+            *expr = inner.as_ref().clone();
+            strip_shadowed_collations_below_explicit_collation(expr, resolver)
+        }
+        ast::Expr::Parenthesized(exprs) if exprs.len() == 1 => {
+            strip_shadowed_collations_below_explicit_collation(exprs[0].as_mut(), resolver)
+        }
+        ast::Expr::Cast { expr, .. }
+        | ast::Expr::IsNull(expr)
+        | ast::Expr::NotNull(expr)
+        | ast::Expr::Unary(_, expr) => {
+            strip_shadowed_collations_below_explicit_collation(expr.as_mut(), resolver)
+        }
+        ast::Expr::Binary(lhs, op, rhs) if binary_expr_is_collation_transparent(*op, rhs) => {
+            strip_shadowed_collations_below_explicit_collation(lhs.as_mut(), resolver)?;
+            strip_shadowed_collations_below_explicit_collation(rhs.as_mut(), resolver)
+        }
+        ast::Expr::Case {
+            base,
+            when_then_pairs,
+            else_expr,
+        } => {
+            if base.is_none() {
+                for (when_expr, then_expr) in when_then_pairs.iter_mut() {
+                    strip_shadowed_collations_below_explicit_collation(
+                        when_expr.as_mut(),
+                        resolver,
+                    )?;
+                    strip_shadowed_collations_below_explicit_collation(
+                        then_expr.as_mut(),
+                        resolver,
+                    )?;
+                }
+            } else {
+                for (_, then_expr) in when_then_pairs.iter_mut() {
+                    strip_shadowed_collations_below_explicit_collation(
+                        then_expr.as_mut(),
+                        resolver,
+                    )?;
+                }
+            }
+            if let Some(else_expr) = else_expr.as_mut() {
+                strip_shadowed_collations_below_explicit_collation(else_expr.as_mut(), resolver)?;
+            }
+            Ok(())
+        }
+        ast::Expr::FunctionCall {
+            name,
+            args,
+            filter_over,
+            ..
+        } if function_call_is_collation_transparent(name, args.len(), resolver)? => {
+            for arg in args.iter_mut() {
+                strip_shadowed_collations_below_explicit_collation(arg.as_mut(), resolver)?;
+            }
+            if let Some(filter_expr) = filter_over.filter_clause.as_mut() {
+                strip_shadowed_collations_below_explicit_collation(filter_expr.as_mut(), resolver)?;
+            }
+            Ok(())
+        }
+        ast::Expr::FunctionCallStar { filter_over, .. } => {
+            if let Some(filter_expr) = filter_over.filter_clause.as_mut() {
+                strip_shadowed_collations_below_explicit_collation(filter_expr.as_mut(), resolver)?;
+            }
+            Ok(())
+        }
+        ast::Expr::Like {
+            lhs, rhs, escape, ..
+        } => {
+            strip_shadowed_collations_below_explicit_collation(lhs.as_mut(), resolver)?;
+            strip_shadowed_collations_below_explicit_collation(rhs.as_mut(), resolver)?;
+            if let Some(escape) = escape.as_mut() {
+                strip_shadowed_collations_below_explicit_collation(escape.as_mut(), resolver)?;
+            }
+            Ok(())
+        }
+        ast::Expr::Subquery(select) => rewrite_scalar_subquery_output_exprs(
+            select,
+            resolver,
+            strip_shadowed_collations_below_explicit_collation,
+        ),
+        _ => Ok(()),
+    }
+}
+
+fn strip_shadowed_inner_collations(expr: &mut ast::Expr, resolver: &Resolver) -> Result<()> {
+    match expr {
+        ast::Expr::Between {
+            lhs, start, end, ..
+        } => {
+            strip_shadowed_inner_collations(lhs.as_mut(), resolver)?;
+            strip_shadowed_inner_collations(start.as_mut(), resolver)?;
+            strip_shadowed_inner_collations(end.as_mut(), resolver)
+        }
+        ast::Expr::Binary(lhs, _, rhs) => {
+            strip_shadowed_inner_collations(lhs.as_mut(), resolver)?;
+            strip_shadowed_inner_collations(rhs.as_mut(), resolver)
+        }
+        ast::Expr::Case {
+            base,
+            when_then_pairs,
+            else_expr,
+        } => {
+            if let Some(base) = base.as_mut() {
+                strip_shadowed_inner_collations(base.as_mut(), resolver)?;
+            }
+            for (when_expr, then_expr) in when_then_pairs.iter_mut() {
+                strip_shadowed_inner_collations(when_expr.as_mut(), resolver)?;
+                strip_shadowed_inner_collations(then_expr.as_mut(), resolver)?;
+            }
+            if let Some(else_expr) = else_expr.as_mut() {
+                strip_shadowed_inner_collations(else_expr.as_mut(), resolver)?;
+            }
+            Ok(())
+        }
+        ast::Expr::Collate(expr, _) => {
+            strip_shadowed_collations_below_explicit_collation(expr.as_mut(), resolver)?;
+            strip_shadowed_inner_collations(expr.as_mut(), resolver)
+        }
+        ast::Expr::Cast { expr, .. }
+        | ast::Expr::IsNull(expr)
+        | ast::Expr::NotNull(expr)
+        | ast::Expr::Unary(_, expr) => strip_shadowed_inner_collations(expr.as_mut(), resolver),
+        ast::Expr::FunctionCall {
+            args,
+            order_by,
+            filter_over,
+            ..
+        } => {
+            for arg in args.iter_mut() {
+                strip_shadowed_inner_collations(arg.as_mut(), resolver)?;
+            }
+            for sorted_expr in order_by.iter_mut() {
+                strip_shadowed_inner_collations(sorted_expr.expr.as_mut(), resolver)?;
+            }
+            if let Some(filter_expr) = filter_over.filter_clause.as_mut() {
+                strip_shadowed_inner_collations(filter_expr.as_mut(), resolver)?;
+            }
+            Ok(())
+        }
+        ast::Expr::FunctionCallStar { filter_over, .. } => {
+            if let Some(filter_expr) = filter_over.filter_clause.as_mut() {
+                strip_shadowed_inner_collations(filter_expr.as_mut(), resolver)?;
+            }
+            Ok(())
+        }
+        ast::Expr::InList { lhs, rhs, .. } => {
+            strip_shadowed_inner_collations(lhs.as_mut(), resolver)?;
+            for expr in rhs.iter_mut() {
+                strip_shadowed_inner_collations(expr.as_mut(), resolver)?;
+            }
+            Ok(())
+        }
+        ast::Expr::InSelect { lhs, .. } => strip_shadowed_inner_collations(lhs.as_mut(), resolver),
+        ast::Expr::InTable { lhs, args, .. } => {
+            strip_shadowed_inner_collations(lhs.as_mut(), resolver)?;
+            for expr in args.iter_mut() {
+                strip_shadowed_inner_collations(expr.as_mut(), resolver)?;
+            }
+            Ok(())
+        }
+        ast::Expr::Like {
+            lhs, rhs, escape, ..
+        } => {
+            strip_shadowed_inner_collations(lhs.as_mut(), resolver)?;
+            strip_shadowed_inner_collations(rhs.as_mut(), resolver)?;
+            if let Some(escape) = escape.as_mut() {
+                strip_shadowed_inner_collations(escape.as_mut(), resolver)?;
+            }
+            Ok(())
+        }
+        ast::Expr::Parenthesized(exprs) => {
+            for expr in exprs.iter_mut() {
+                strip_shadowed_inner_collations(expr.as_mut(), resolver)?;
+            }
+            Ok(())
+        }
+        ast::Expr::Subquery(select) => {
+            rewrite_scalar_subquery_output_exprs(select, resolver, strip_shadowed_inner_collations)
+        }
+        ast::Expr::Array { elements } => {
+            for expr in elements.iter_mut() {
+                strip_shadowed_inner_collations(expr.as_mut(), resolver)?;
+            }
+            Ok(())
+        }
+        ast::Expr::Subscript { base, index } => {
+            strip_shadowed_inner_collations(base.as_mut(), resolver)?;
+            strip_shadowed_inner_collations(index.as_mut(), resolver)
+        }
+        _ => Ok(()),
+    }
+}
+
+/// Mirrors sqlite3ExprIsInteger() for our AST. We peel unary + and single-item
+/// parentheses, but never cross a COLLATE node because +(1 COLLATE X) is not an
+/// ordinal alias in SQLite.
+fn unwrap_order_or_group_by_integer_expr(mut expr: &ast::Expr) -> &ast::Expr {
+    loop {
+        match expr {
             ast::Expr::Parenthesized(exprs) if exprs.len() == 1 => {
                 expr = exprs[0].as_ref();
             }
             ast::Expr::Unary(ast::UnaryOperator::Positive, inner) => {
                 expr = inner.as_ref();
             }
-            _ => return (expr, collations),
+            _ => return expr,
         }
     }
-}
-
-fn wrap_expr_with_collations(mut expr: ast::Expr, collations: &[ast::Name]) -> ast::Expr {
-    for collation in collations.iter().rev() {
-        expr = ast::Expr::collate(expr, collation.clone());
-    }
-    expr
 }
 
 fn replace_column_number_with_copy_of_column_expr(
@@ -1104,11 +1413,13 @@ fn replace_column_number_with_copy_of_column_expr(
     columns: &[ResultSetColumn],
     clause_name: &str,
 ) -> Result<()> {
-    let (alias_expr, collations) = unwrap_order_or_group_by_alias_expr(order_by_or_group_by_expr);
+    let (alias_expr, collation) =
+        unwrap_order_or_group_by_root_collation(order_by_or_group_by_expr);
+    let alias_expr = unwrap_order_or_group_by_integer_expr(alias_expr);
     let num_str = match alias_expr {
         ast::Expr::Literal(ast::Literal::Numeric(num)) => Some(num.clone()),
         ast::Expr::Unary(ast::UnaryOperator::Negative, inner) => {
-            let (inner, _) = unwrap_order_or_group_by_alias_expr(inner.as_ref());
+            let inner = unwrap_order_or_group_by_integer_expr(inner.as_ref());
             if let ast::Expr::Literal(ast::Literal::Numeric(num)) = inner {
                 if num.parse::<usize>().is_ok() {
                     crate::bail_parse_error!(
@@ -1134,7 +1445,7 @@ fn replace_column_number_with_copy_of_column_expr(
                 );
             }
             let ResultSetColumn { expr, .. } = &columns[column_number - 1];
-            *order_by_or_group_by_expr = wrap_expr_with_collations(expr.clone(), &collations);
+            *order_by_or_group_by_expr = wrap_expr_with_collation(expr.clone(), collation);
         }
         // Otherwise, leave the expression as-is (constant expression, case 3 per SQLite docs)
     }
@@ -1151,14 +1462,13 @@ fn resolve_compound_order_by_expr(
     term_number: usize,
 ) -> Result<(usize, Option<CollationSeq>)> {
     let num_result_columns = all_plans[0].result_columns.len();
-    let (alias_expr, collations) = unwrap_order_or_group_by_alias_expr(expr);
-    // Compound ORDER BY only needs the effective explicit collation.
-    // For stacked postfix COLLATE operators, the outermost one is the active collation.
-    let collation = collations
-        .first()
+    let (alias_expr, collation) = unwrap_order_or_group_by_root_collation(expr);
+    let integer_expr = unwrap_order_or_group_by_integer_expr(alias_expr);
+    let collation = collation
+        .as_ref()
         .map(|name| CollationSeq::new(name.as_str()))
         .transpose()?;
-    match alias_expr {
+    match integer_expr {
         // Case 1: Numeric column reference (e.g., ORDER BY 1)
         ast::Expr::Literal(ast::Literal::Numeric(num)) => {
             if let Ok(column_number) = num.parse::<usize>() {
@@ -1169,7 +1479,7 @@ fn resolve_compound_order_by_expr(
                         num_result_columns
                     );
                 }
-                Ok((column_number - 1, collation))
+                return Ok((column_number - 1, collation));
             } else {
                 crate::bail_parse_error!(
                     "{} ORDER BY term does not match any column in the result set",
@@ -1178,7 +1488,7 @@ fn resolve_compound_order_by_expr(
             }
         }
         ast::Expr::Unary(ast::UnaryOperator::Negative, inner) => {
-            let (inner, _) = unwrap_order_or_group_by_alias_expr(inner.as_ref());
+            let inner = unwrap_order_or_group_by_integer_expr(inner.as_ref());
             if let ast::Expr::Literal(ast::Literal::Numeric(num)) = inner {
                 if num.parse::<usize>().is_ok() {
                     crate::bail_parse_error!(
@@ -1193,42 +1503,37 @@ fn resolve_compound_order_by_expr(
                 ordinal(term_number)
             );
         }
+        _ => {}
+    }
+    if let ast::Expr::Id(name) = alias_expr {
         // Case 2: Name reference (e.g., ORDER BY name or ORDER BY alias)
-        ast::Expr::Id(name) => {
-            let name_normalized = normalize_ident(name.as_str());
-            // Check aliases and column names across all constituent SELECTs
-            for plan in all_plans {
-                let result_columns = &plan.result_columns;
-                let table_references = &plan.table_references;
-                // Try matching against aliases
-                for (i, rc) in result_columns.iter().enumerate() {
-                    if let Some(alias) = &rc.alias {
-                        if normalize_ident(alias) == name_normalized {
-                            return Ok((i, collation));
-                        }
-                    }
-                }
-                // Try matching against column names from the table references
-                for (i, rc) in result_columns.iter().enumerate() {
-                    if let Some(col_name) = rc.name(table_references) {
-                        if normalize_ident(col_name) == name_normalized {
-                            return Ok((i, collation));
-                        }
+        let name_normalized = normalize_ident(name.as_str());
+        // Check aliases and column names across all constituent SELECTs
+        for plan in all_plans {
+            let result_columns = &plan.result_columns;
+            let table_references = &plan.table_references;
+            // Try matching against aliases
+            for (i, rc) in result_columns.iter().enumerate() {
+                if let Some(alias) = &rc.alias {
+                    if normalize_ident(alias) == name_normalized {
+                        return Ok((i, collation));
                     }
                 }
             }
-            crate::bail_parse_error!(
-                "{} ORDER BY term does not match any column in the result set",
-                ordinal(term_number)
-            );
-        }
-        _ => {
-            crate::bail_parse_error!(
-                "{} ORDER BY term does not match any column in the result set",
-                ordinal(term_number)
-            );
+            // Try matching against column names from the table references
+            for (i, rc) in result_columns.iter().enumerate() {
+                if let Some(col_name) = rc.name(table_references) {
+                    if normalize_ident(col_name) == name_normalized {
+                        return Ok((i, collation));
+                    }
+                }
+            }
         }
     }
+    crate::bail_parse_error!(
+        "{} ORDER BY term does not match any column in the result set",
+        ordinal(term_number)
+    );
 }
 
 fn ordinal(n: usize) -> String {
