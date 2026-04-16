@@ -583,7 +583,7 @@ impl Database {
             path,
             wal_path,
             schema: Arc::new(Mutex::new(Arc::new({
-                let mut s = Schema::with_options(opts.enable_custom_types);
+                let mut s = Schema::with_options(opts.enable_custom_types)?;
                 s.generated_columns_enabled = opts.enable_generated_columns;
                 s
             }))),

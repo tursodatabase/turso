@@ -1499,11 +1499,11 @@ fn query_pragma(
                 type_names.sort();
                 for type_name in type_names {
                     let type_def = &schema.type_registry[type_name];
-                    let display_name = if type_def.params.is_empty() {
+                    let display_name = if type_def.params().is_empty() {
                         type_def.name.clone()
                     } else {
                         let params: Vec<String> = type_def
-                            .params
+                            .params()
                             .iter()
                             .map(|p| match &p.ty {
                                 Some(ty) => format!("{} {}", p.name, ty),
@@ -1513,27 +1513,27 @@ fn query_pragma(
                         format!("{}({})", type_def.name, params.join(", "))
                     };
                     program.emit_string8(display_name, base_reg);
-                    program.emit_string8(type_def.base.clone(), base_reg + 1);
-                    if let Some(ref expr) = type_def.encode {
+                    program.emit_string8(type_def.base().to_string(), base_reg + 1);
+                    if let Some(expr) = type_def.encode() {
                         program.emit_string8(expr.to_string(), base_reg + 2);
                     } else {
                         program.emit_null(base_reg + 2, None);
                     }
-                    if let Some(ref expr) = type_def.decode {
+                    if let Some(expr) = type_def.decode() {
                         program.emit_string8(expr.to_string(), base_reg + 3);
                     } else {
                         program.emit_null(base_reg + 3, None);
                     }
-                    if let Some(ref expr) = type_def.default {
+                    if let Some(expr) = type_def.default_expr() {
                         program.emit_string8(expr.to_string(), base_reg + 4);
                     } else {
                         program.emit_null(base_reg + 4, None);
                     }
-                    if type_def.operators.is_empty() {
+                    if type_def.operators().is_empty() {
                         program.emit_null(base_reg + 5, None);
                     } else {
                         let ops: Vec<String> = type_def
-                            .operators
+                            .operators()
                             .iter()
                             .map(|op| match &op.func_name {
                                 Some(f) => format!("'{}' {}", op.op, f),

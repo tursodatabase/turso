@@ -206,3 +206,11 @@ harness = false
 [[bench]]
 name = "triggers"
 harness = false
+
+[[bench]]
+name = "struct_union_benchmark"
+harness = false
+
+[[bench]]
+name = "struct_union_profile"
+harness = false

@@ -19,7 +19,6 @@ use crate::translate::planner::ROWID_STRS;
 use crate::translate::trigger_exec::{
     fire_trigger, get_triggers_including_temp, has_triggers_including_temp, TriggerContext,
 };
-use crate::vdbe::builder::SelfTableContext;
 use crate::vdbe::insn::{to_u16, CmpInsFlags};
 use crate::{
     bail_parse_error,
@@ -404,6 +403,10 @@ pub fn emit_upsert(
     connection: &Arc<Connection>,
     table_references: &mut TableReferences,
 ) -> crate::Result<()> {
+    // Populate SELF_TABLE column affinities so expression index evaluation
+    // can resolve affinity for column references (matches UPDATE path).
+    resolver.self_table_column_affinities = table.columns().iter().map(|c| c.affinity()).collect();
+
     // Seek & snapshot CURRENT
     program.emit_insn(Insn::SeekRowid {
         cursor_id: ctx.cursor_id,
@@ -553,15 +556,26 @@ pub fn emit_upsert(
             excluded_decoded_start,
             &layout,
         )?;
-        translate_expr_no_constant_opt(
+        // Save/restore target_union_type so union_value() resolves tags
+        // against this column's union type. See ProgramBuilder::target_union_type.
+        let col = &table.columns()[*col_idx];
+        let union_td = resolver
+            .schema()
+            .get_type_def_unchecked(&col.ty_str)
+            .filter(|td| td.is_union())
+            .cloned();
+        let prev_union = program.target_union_type.take();
+        program.target_union_type = union_td;
+        let translate_result = translate_expr_no_constant_opt(
             program,
             None,
             expr,
             layout.to_register(new_start, *col_idx),
             resolver,
             NoConstantOptReason::RegisterReuse,
-        )?;
-        let col = &table.columns()[*col_idx];
+        );
+        program.target_union_type = prev_union;
+        translate_result?;
         if col.notnull() && !col.is_rowid_alias() {
             program.emit_insn(Insn::HaltIfNull {
                 target_reg: layout.to_register(new_start, *col_idx),
@@ -588,7 +602,13 @@ pub fn emit_upsert(
         let rowid_reg = new_rowid_reg.unwrap_or(ctx.conflict_rowid_reg);
         let dml_ctx =
             DmlColumnContext::layout(ctx.table.columns(), new_start, rowid_reg, layout.clone());
-        compute_virtual_columns(program, ctx.table.columns().iter(), &dml_ctx, resolver)?;
+        compute_virtual_columns(
+            program,
+            ctx.table.columns().iter(),
+            &dml_ctx,
+            resolver,
+            ctx.table,
+        )?;
     }
 
     if let Some(bt) = table.btree() {
@@ -831,24 +851,6 @@ pub fn emit_upsert(
 
     // Index rebuild (DELETE old, INSERT new), honoring partial-index WHEREs
     if let Some(before) = before_start {
-        let has_virtual = table.btree().is_some_and(|btree| btree.has_virtual_columns);
-        let before_ctx = has_virtual.then(|| {
-            SelfTableContext::ForDML(DmlColumnContext::layout(
-                table.columns(),
-                before,
-                ctx.conflict_rowid_reg,
-                layout.clone(),
-            ))
-        });
-        let after_ctx = has_virtual.then(|| {
-            SelfTableContext::ForDML(DmlColumnContext::layout(
-                table.columns(),
-                new_start,
-                new_rowid_reg.unwrap_or(ctx.conflict_rowid_reg),
-                layout.clone(),
-            ))
-        });
-
         for (idx_name, _root, idx_cid) in &ctx.idx_cursors {
             let idx_meta = resolver
                 .with_schema(ctx.database_id, |s| {
@@ -889,29 +891,17 @@ pub fn emit_upsert(
             // DELETE old key
             let del = program.alloc_registers(k + 1);
             for (i, ic) in idx_meta.columns.iter().enumerate() {
-                if let Some(expr) = &ic.expr {
-                    let mut e = expr.as_ref().clone();
-                    rewrite_expr_to_registers(
-                        &mut e,
+                if ic.expr.is_some() {
+                    emit_upsert_expr_index_value(
+                        program,
+                        resolver,
                         table,
+                        ic,
                         before,
                         ctx.conflict_rowid_reg,
-                        Some(table.get_name()),
-                        None,
-                        false,
-                        None,
+                        del + i,
                         &layout,
                     )?;
-                    program.with_self_table_context(before_ctx.as_ref(), |program, _| {
-                        translate_expr_no_constant_opt(
-                            program,
-                            None,
-                            &e,
-                            del + i,
-                            resolver,
-                            NoConstantOptReason::RegisterReuse,
-                        )
-                    })?;
                 } else {
                     let (ci, _) = table.get_column_by_name(&ic.name).unwrap();
                     program.emit_insn(Insn::Copy {
@@ -950,29 +940,17 @@ pub fn emit_upsert(
             // INSERT new key (use NEW rowid if present)
             let ins = program.alloc_registers(k + 1);
             for (i, ic) in idx_meta.columns.iter().enumerate() {
-                if let Some(expr) = &ic.expr {
-                    let mut e = expr.as_ref().clone();
-                    rewrite_expr_to_registers(
-                        &mut e,
+                if ic.expr.is_some() {
+                    emit_upsert_expr_index_value(
+                        program,
+                        resolver,
                         table,
+                        ic,
                         new_start,
                         new_rowid,
-                        Some(table.get_name()),
-                        None,
-                        false,
-                        None,
+                        ins + i,
                         &layout,
                     )?;
-                    program.with_self_table_context(after_ctx.as_ref(), |program, _| {
-                        translate_expr_no_constant_opt(
-                            program,
-                            None,
-                            &e,
-                            ins + i,
-                            resolver,
-                            NoConstantOptReason::RegisterReuse,
-                        )
-                    })?;
                 } else {
                     let (ci, _) = table.get_column_by_name(&ic.name).unwrap();
                     program.emit_insn(Insn::Copy {
@@ -1306,7 +1284,13 @@ pub fn emit_upsert(
         let rowid_reg = new_rowid_reg.unwrap_or(ctx.conflict_rowid_reg);
         let dml_ctx =
             DmlColumnContext::layout(ctx.table.columns(), new_start, rowid_reg, layout.clone());
-        compute_virtual_columns(program, ctx.table.columns().iter(), &dml_ctx, resolver)?;
+        compute_virtual_columns(
+            program,
+            ctx.table.columns().iter(),
+            &dml_ctx,
+            resolver,
+            ctx.table,
+        )?;
     }
 
     // RETURNING from NEW image + final rowid
@@ -1387,40 +1371,75 @@ fn eval_partial_pred_for_row_image(
     let Some(where_expr) = &idx.where_clause else {
         return None;
     };
-    let mut e = where_expr.as_ref().clone();
-    rewrite_expr_to_registers(
-        &mut e, table, row_start, rowid_reg, None,  // table_name
-        None,  // insertion
-        false, // dont allow EXCLUDED
-        None,  // no decoded excluded
-        layout,
-    )
-    .ok()?;
+    let expr = where_expr.as_ref().clone();
+    let columns = table.columns();
+    let bt = table.require_btree().ok()?;
+
+    let mut column_regs: Vec<usize> = columns
+        .iter()
+        .enumerate()
+        .map(|(i, col)| {
+            if col.is_rowid_alias() {
+                rowid_reg
+            } else {
+                layout.to_register(row_start, i)
+            }
+        })
+        .collect();
+
     let r = prg.alloc_register();
-    translate_expr_no_constant_opt(
+    crate::translate::expr::emit_dml_expr_index_value(
         prg,
-        None,
-        &e,
-        r,
         resolver,
-        NoConstantOptReason::RegisterReuse,
+        expr,
+        columns,
+        &mut column_regs,
+        &bt,
+        r,
     )
     .ok()?;
     Some(r)
 }
 
-/// Generic rewriter that maps column references to registers for a given row image.
-///
-/// - Id/Qualified refs to the *target table* (when `table_name` is provided) resolve
-///   to the CURRENT/NEW row image starting at `base_start`, with `rowid` (or the
-///   rowid-alias) mapped to `rowid_reg`.
-/// - If `allow_excluded` and `insertion` are provided, `EXCLUDED.x` resolves to the
-///   insertion registers (and `EXCLUDED.rowid` resolves to `insertion.key_register()`).
-///   When `excluded_decoded_start` is provided, excluded column references resolve to
-///   decoded registers at `excluded_decoded_start + col_idx` instead of the raw
-///   (encoded) insertion registers. This prevents double-encoding in UPSERT.
-/// - If `table_name` is `None`, qualified refs never match
-/// - Leaves names from other tables/namespaces untouched.
+#[allow(clippy::too_many_arguments)]
+fn emit_upsert_expr_index_value(
+    program: &mut ProgramBuilder,
+    resolver: &Resolver,
+    table: &Table,
+    idx_col: &IndexColumn,
+    row_start: usize,
+    rowid_reg: usize,
+    dest_reg: usize,
+    layout: &ColumnLayout,
+) -> crate::Result<()> {
+    let expr = idx_col.expr.as_ref().expect("caller checked is_some");
+    let expr = expr.as_ref().clone();
+    let columns = table.columns();
+    let bt = table.require_btree()?;
+
+    let mut column_regs: Vec<usize> = columns
+        .iter()
+        .enumerate()
+        .map(|(i, col)| {
+            if col.is_rowid_alias() {
+                rowid_reg
+            } else {
+                layout.to_register(row_start, i)
+            }
+        })
+        .collect();
+    crate::translate::expr::emit_dml_expr_index_value(
+        program,
+        resolver,
+        expr,
+        columns,
+        &mut column_regs,
+        &bt,
+        dest_reg,
+    )?;
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 fn rewrite_expr_to_registers(
     e: &mut ast::Expr,

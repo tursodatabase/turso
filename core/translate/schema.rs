@@ -2514,12 +2514,19 @@ pub fn translate_create_type(
         bail_parse_error!("type {normalized_name} already exists");
     }
 
-    // Validate encode/decode expressions for safety
-    if let Some(ref encode) = body.encode {
-        validate_type_expr(encode, "ENCODE", resolver)?;
-    }
-    if let Some(ref decode) = body.decode {
-        validate_type_expr(decode, "DECODE", resolver)?;
+    // Validate encode/decode expressions for safety (only for custom types)
+    if let ast::CreateTypeBody::CustomType {
+        ref encode,
+        ref decode,
+        ..
+    } = body
+    {
+        if let Some(ref encode) = encode {
+            validate_type_expr(encode, "ENCODE", resolver)?;
+        }
+        if let Some(ref decode) = decode {
+            validate_type_expr(decode, "DECODE", resolver)?;
+        }
     }
 
     // Build canonical SQL (without IF NOT EXISTS) for persistence
@@ -2535,48 +2542,92 @@ fn build_create_type_sql(name: &str, body: &ast::CreateTypeBody) -> String {
         s.replace('\'', "''")
     }
 
-    let mut sql = if body.params.is_empty() {
-        format!(
-            "CREATE TYPE {} BASE {}",
-            quote_ident(name),
-            quote_ident(&body.base)
-        )
-    } else {
-        let params: Vec<String> = body
-            .params
-            .iter()
-            .map(|p| match &p.ty {
-                Some(ty) => format!("{} {}", quote_ident(&p.name), ty),
-                None => quote_ident(&p.name),
-            })
-            .collect();
-        format!(
-            "CREATE TYPE {}({}) BASE {}",
-            quote_ident(name),
-            params.join(", "),
-            quote_ident(&body.base)
-        )
-    };
-    if let Some(ref encode) = body.encode {
-        sql.push_str(&format!(" ENCODE {encode}"));
-    }
-    if let Some(ref decode) = body.decode {
-        sql.push_str(&format!(" DECODE {decode}"));
-    }
-    if let Some(ref default) = body.default {
-        sql.push_str(&format!(" DEFAULT {default}"));
-    }
-    for op in &body.operators {
-        match &op.func_name {
-            Some(func_name) => sql.push_str(&format!(
-                " OPERATOR '{}' {}",
-                quote_string_literal(&op.op),
-                quote_ident(func_name)
-            )),
-            None => sql.push_str(&format!(" OPERATOR '{}'", quote_string_literal(&op.op),)),
+    match body {
+        ast::CreateTypeBody::CustomType {
+            params,
+            base,
+            encode,
+            decode,
+            default,
+            operators,
+        } => {
+            let mut sql = if params.is_empty() {
+                format!(
+                    "CREATE TYPE {} BASE {}",
+                    quote_ident(name),
+                    quote_ident(base)
+                )
+            } else {
+                let param_strs: Vec<String> = params
+                    .iter()
+                    .map(|p| match &p.ty {
+                        Some(ty) => format!("{} {}", quote_ident(&p.name), ty),
+                        None => quote_ident(&p.name),
+                    })
+                    .collect();
+                format!(
+                    "CREATE TYPE {}({}) BASE {}",
+                    quote_ident(name),
+                    param_strs.join(", "),
+                    quote_ident(base)
+                )
+            };
+            if let Some(ref encode) = encode {
+                sql.push_str(&format!(" ENCODE {encode}"));
+            }
+            if let Some(ref decode) = decode {
+                sql.push_str(&format!(" DECODE {decode}"));
+            }
+            if let Some(ref default) = default {
+                sql.push_str(&format!(" DEFAULT {default}"));
+            }
+            for op in operators {
+                match &op.func_name {
+                    Some(func_name) => sql.push_str(&format!(
+                        " OPERATOR '{}' {}",
+                        quote_string_literal(&op.op),
+                        quote_ident(func_name)
+                    )),
+                    None => sql.push_str(&format!(" OPERATOR '{}'", quote_string_literal(&op.op))),
+                }
+            }
+            sql
+        }
+        ast::CreateTypeBody::Struct(fields) => {
+            let field_strs: Vec<String> = fields
+                .iter()
+                .map(|f| {
+                    format!(
+                        "{} {}",
+                        quote_ident(f.name.as_str()),
+                        quote_ident(&f.field_type.name)
+                    )
+                })
+                .collect();
+            format!(
+                "CREATE TYPE {} AS STRUCT({})",
+                quote_ident(name),
+                field_strs.join(", ")
+            )
+        }
+        ast::CreateTypeBody::Union(fields) => {
+            let variant_strs: Vec<String> = fields
+                .iter()
+                .map(|f| {
+                    format!(
+                        "{} {}",
+                        quote_ident(f.name.as_str()),
+                        quote_ident(&f.field_type.name)
+                    )
+                })
+                .collect();
+            format!(
+                "CREATE TYPE {} AS UNION({})",
+                quote_ident(name),
+                variant_strs.join(", ")
+            )
         }
     }
-    sql
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2714,7 +2765,7 @@ pub fn translate_drop_type(
 
     // Check if any other type/domain depends on this type
     for (name, td) in resolver.schema().type_registry.iter() {
-        if normalize_ident(&td.base) == normalized_name {
+        if normalize_ident(td.base()) == normalized_name {
             bail_parse_error!(
                 "cannot drop type {}: type {} depends on it",
                 normalized_name,

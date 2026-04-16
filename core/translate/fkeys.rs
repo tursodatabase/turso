@@ -481,6 +481,7 @@ pub fn emit_parent_index_key_change_checks(
                 index_col.pos_in_table,
                 old_key + i,
                 resolver,
+                &Arc::new(table_btree.clone()),
             )?;
         } else {
             program.emit_column_or_rowid(cursor_id, index_col.pos_in_table, old_key + i);
@@ -743,6 +744,7 @@ fn build_parent_key(
                 pos,
                 dest_start + i,
                 resolver,
+                &Arc::new(parent_bt.clone()),
             )?;
         } else {
             program.emit_column_or_rowid(parent_cursor_id, pos, dest_start + i);

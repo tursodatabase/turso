@@ -467,7 +467,14 @@ fn emit_add_virtual_column_validation(
 
     let dml_ctx =
         DmlColumnContext::layout(resolved_table.columns(), base_dest_reg, rowid_reg, layout);
-    compute_virtual_columns(program, resolved_table.columns().iter(), &dml_ctx, resolver)?;
+    let resolved_table_arc = Arc::new(resolved_table.clone());
+    compute_virtual_columns(
+        program,
+        resolved_table.columns().iter(),
+        &dml_ctx,
+        resolver,
+        &resolved_table_arc,
+    )?;
     let result_reg = dml_ctx.to_column_reg(new_column_idx);
 
     if !check_constraints.is_empty() {

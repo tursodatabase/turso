@@ -86,11 +86,11 @@ impl TursoTypesCursor {
             names.sort();
             for name in names {
                 let td = &schema.type_registry[&name];
-                let display_name = if td.params.is_empty() {
+                let display_name = if td.params().is_empty() {
                     td.name.clone()
                 } else {
                     let params: Vec<String> = td
-                        .params
+                        .params()
                         .iter()
                         .map(|p| match &p.ty {
                             Some(ty) => format!("{} {}", p.name, ty),
