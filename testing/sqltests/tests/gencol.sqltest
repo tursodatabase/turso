@@ -4491,3 +4491,28 @@ test update-ipk-with-indexed-virtual-col {
     UPDATE t SET a = 100 WHERE a = 1;
 } expect {
 }
+
+test upsert-unique-virtual-column {
+    create table t(a unique, b, c as (b) unique);
+    insert into t values (1, 1), (2, 2);
+    insert into t values (1, 2) on conflict(a) do update set b = excluded.b;
+} expect error {
+    UNIQUE constraint failed: t.c
+}
+
+test upsert-unique-virtual-column-ipk-autoindex {
+    create table t(a integer primary key, b, c as (b) unique);
+    insert into t values (1, 1), (2, 2);
+    insert into t values (1, 2) on conflict(a) do update set b = excluded.b;
+} expect error {
+    UNIQUE constraint failed: t.c
+}
+
+test upsert-unique-virtual-column-ipk {
+    create table t(a integer primary key, b, c as (b));
+    create unique index idx on t(c);
+    insert into t values (1, 1), (2, 2);
+    insert into t values (1, 2) on conflict(a) do update set b = excluded.b;
+} expect error {
+    UNIQUE constraint failed: t.c
+}
