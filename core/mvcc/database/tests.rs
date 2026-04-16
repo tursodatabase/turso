@@ -9073,3 +9073,31 @@ fn test_drop_recreate_indexed_table_many_inserts_restart() {
         }
     }
 }
+
+/// What this test checks: CREATE TYPE (which writes to __turso_internal_types,
+/// not sqlite_schema) is visible to a second connection under MVCC.
+/// Why this matters: The commit phase must detect schema changes even when no
+/// rows are written to sqlite_schema. Without the fix, did_commit_schema_change
+/// stayed false and the second connection never reloaded the schema.
+#[test]
+fn test_create_type_visible_to_second_connection_under_mvcc() {
+    let db =
+        MvccTestDbNoConn::new_with_random_db_with_opts(DatabaseOpts::new().with_custom_types(true));
+
+    // conn1: define a custom type
+    let conn1 = db.connect();
+    conn1
+        .execute("CREATE TYPE my_uint(value any) BASE text ENCODE my_uint_enc(value) DECODE my_uint_dec(value)")
+        .unwrap();
+    conn1.close().unwrap();
+
+    // conn2: the type should be visible without reopening the database
+    let conn2 = db.connect();
+    let rows = get_rows(
+        &conn2,
+        "SELECT name FROM sqlite_turso_types WHERE name LIKE 'my_uint%'",
+    );
+    assert_eq!(rows.len(), 1, "CREATE TYPE should be visible to conn2");
+    assert_eq!(rows[0][0].to_string(), "my_uint(value any)");
+    conn2.close().unwrap();
+}
