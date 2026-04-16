@@ -12,7 +12,9 @@ use crate::storage::btree::CursorTrait;
 use crate::sync::Arc;
 use crate::sync::Mutex;
 use crate::translate::plan::ColumnMask;
-use crate::types::{IOResult, ImmutableRecord, SeekKey, SeekOp, SeekResult, ValueRef};
+use crate::types::{
+    IOResult, ImmutableRecord, ImmutableRecordRef, SeekKey, SeekOp, SeekResult, ValueRef,
+};
 use crate::{return_and_restore_if_io, return_if_io, LimboError, Result, Value};
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use std::collections::BTreeMap;
@@ -1009,7 +1011,7 @@ impl AggregateState {
     }
 
     pub fn from_blob(blob: &[u8]) -> Result<(Self, Vec<Value>)> {
-        let record = ImmutableRecord::from_bin_record(blob.to_vec());
+        let record = ImmutableRecordRef::new(blob);
         let mut all_values: Vec<Value> = record.get_values_owned()?;
 
         if all_values.is_empty() {
