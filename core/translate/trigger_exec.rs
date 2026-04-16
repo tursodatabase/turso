@@ -196,13 +196,15 @@ struct TriggerSubprogramContext {
     db_name: Option<ast::Name>,
 }
 
-fn variable_from_parameter_index(index: NonZero<usize>) -> Expr {
-    Expr::Variable(ast::Variable::indexed(
-        u32::try_from(index.get())
-            .ok()
-            .and_then(std::num::NonZeroU32::new)
-            .expect("trigger parameter index must fit into NonZeroU32"),
-    ))
+fn variable_from_parameter_index(index: NonZero<usize>, col_type: Option<&str>) -> Expr {
+    let nz = u32::try_from(index.get())
+        .ok()
+        .and_then(std::num::NonZeroU32::new)
+        .expect("trigger parameter index must fit into NonZeroU32");
+    match col_type {
+        Some(ty) => Expr::Variable(ast::Variable::indexed_typed(nz, ty)),
+        None => Expr::Variable(ast::Variable::indexed(nz)),
+    }
 }
 
 impl TriggerSubprogramContext {
@@ -421,10 +423,12 @@ fn rewrite_trigger_expr_single_for_subprogram(
                 if ctx.has_new {
                     let num_cols = ctx.table.columns().len();
                     if let Some((idx, col_def)) = ctx.table.get_column(&col) {
+                        let ty = Some(col_def.ty_str.as_str());
                         if col_def.is_rowid_alias() {
                             *e = variable_from_parameter_index(
                                 ctx.get_new_rowid_param()
                                     .expect("NEW parameters must be provided"),
+                                ty,
                             );
                             return Ok(());
                         }
@@ -432,6 +436,7 @@ fn rewrite_trigger_expr_single_for_subprogram(
                             *e = variable_from_parameter_index(
                                 ctx.get_new_param(idx)
                                     .expect("NEW parameters must be provided"),
+                                ty,
                             );
                             return Ok(());
                         } else {
@@ -443,6 +448,7 @@ fn rewrite_trigger_expr_single_for_subprogram(
                         *e = variable_from_parameter_index(
                             ctx.get_new_rowid_param()
                                 .expect("NEW parameters must be provided"),
+                            None,
                         );
                         return Ok(());
                     }
@@ -459,10 +465,12 @@ fn rewrite_trigger_expr_single_for_subprogram(
                 if ctx.has_old {
                     let num_cols = ctx.table.columns().len();
                     if let Some((idx, col_def)) = ctx.table.get_column(&col) {
+                        let ty = Some(col_def.ty_str.as_str());
                         if col_def.is_rowid_alias() {
                             *e = variable_from_parameter_index(
                                 ctx.get_old_rowid_param()
                                     .expect("OLD parameters must be provided"),
+                                ty,
                             );
                             return Ok(());
                         }
@@ -470,6 +478,7 @@ fn rewrite_trigger_expr_single_for_subprogram(
                             *e = variable_from_parameter_index(
                                 ctx.get_old_param(idx)
                                     .expect("OLD parameters must be provided"),
+                                ty,
                             );
                             return Ok(());
                         } else {
@@ -481,6 +490,7 @@ fn rewrite_trigger_expr_single_for_subprogram(
                         *e = variable_from_parameter_index(
                             ctx.get_old_rowid_param()
                                 .expect("OLD parameters must be provided"),
+                            None,
                         );
                         return Ok(());
                     }

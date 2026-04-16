@@ -1434,6 +1434,7 @@ fn expr_contains_subquery(expr: &Expr) -> bool {
             | Expr::Literal(_)
             | Expr::Name(_)
             | Expr::Qualified(_, _)
+            | Expr::FieldAccess { .. }
             | Expr::Register(_)
             | Expr::RowId { .. }
             | Expr::Variable(_)

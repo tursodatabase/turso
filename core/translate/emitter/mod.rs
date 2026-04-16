@@ -9,8 +9,7 @@ use super::{
     },
     expr::{
         bind_and_rewrite_expr, emit_table_column, translate_expr, translate_expr_no_constant_opt,
-        walk_expr, walk_expr_mut, BindingBehavior, ExprAffinityInfo, NoConstantOptReason,
-        WalkControl,
+        walk_expr, BindingBehavior, ExprAffinityInfo, NoConstantOptReason, WalkControl,
     },
     group_by::GroupByMetadata,
     main_loop::{LeftJoinMetadata, LoopLabels, SemiAntiJoinMetadata},
@@ -315,7 +314,13 @@ impl<'a> Resolver<'a> {
                 .read()
                 .as_ref()
                 .map(|temp_db| temp_db.db.schema.lock().clone())
-                .unwrap_or_else(|| Arc::new(Schema::with_options(self.enable_custom_types))),
+                .unwrap_or_else(|| {
+                    // with_options only fails if built-in type SQL is malformed (programmer bug).
+                    Arc::new(
+                        Schema::with_options(self.enable_custom_types)
+                            .expect("built-in type definitions are malformed"),
+                    )
+                }),
             _ => {
                 let attached_dbs = self.attached_databases.read();
                 let (db, _pager) = attached_dbs
@@ -1585,64 +1590,6 @@ pub(crate) fn init_limit(
     Ok(())
 }
 
-/// We have `Expr`s which have *not* had column references bound to them,
-/// so they are in the state of Expr::Id/Expr::Qualified, etc, and instead of binding Expr::Column
-/// we need to bind Expr::Register, as we have already loaded the *new* column values from the
-/// UPDATE statement into registers starting at `columns_start_reg`, which we want to reference.
-fn rewrite_where_for_update_registers(
-    expr: &mut Expr,
-    columns: &[Column],
-    columns_start_reg: usize,
-    rowid_reg: usize,
-    layout: &ColumnLayout,
-) -> Result<WalkControl> {
-    walk_expr_mut(expr, &mut |e: &mut Expr| -> Result<WalkControl> {
-        match e {
-            Expr::Qualified(_, col) | Expr::DoublyQualified(_, _, col) => {
-                let normalized = normalize_ident(col.as_str());
-                if let Some((idx, c)) = columns.iter().enumerate().find(|(_, c)| {
-                    c.name
-                        .as_ref()
-                        .is_some_and(|n| n.eq_ignore_ascii_case(&normalized))
-                }) {
-                    if c.is_rowid_alias() {
-                        *e = Expr::Register(rowid_reg);
-                    } else {
-                        *e = Expr::Register(layout.to_register(columns_start_reg, idx));
-                    }
-                }
-            }
-            Expr::Id(name) => {
-                let normalized = normalize_ident(name.as_str());
-                if ROWID_STRS
-                    .iter()
-                    .any(|s| s.eq_ignore_ascii_case(&normalized))
-                {
-                    *e = Expr::Register(rowid_reg);
-                } else if let Some((idx, c)) = columns.iter().enumerate().find(|(_, c)| {
-                    c.name
-                        .as_ref()
-                        .is_some_and(|n| n.eq_ignore_ascii_case(&normalized))
-                }) {
-                    if c.is_rowid_alias() {
-                        *e = Expr::Register(rowid_reg);
-                    } else {
-                        *e = Expr::Register(layout.to_register(columns_start_reg, idx));
-                    }
-                }
-            }
-            Expr::RowId { .. } => {
-                *e = Expr::Register(rowid_reg);
-            }
-            Expr::Column { table, .. } if table.is_self_table() => {
-                return Ok(WalkControl::SkipChildren);
-            }
-            _ => {}
-        }
-        Ok(WalkControl::Continue)
-    })
-}
-
 /// Emits  `target_columns`, plus the stored columns needed by `target_columns`, into compact
 /// registers. This takes into account stored columns, and any stored columns required
 /// by virtual columns in `target_columns`.
@@ -1706,7 +1653,8 @@ pub(crate) fn emit_columns_and_dependencies(
         .windows(2)
         .all(|w| { dml_ctx.to_column_reg(w[1]) == dml_ctx.to_column_reg(w[0]) + 1 }));
 
-    gencol::compute_virtual_columns(program, &table.columns_topo_sort()?, &dml_ctx, resolver)?;
+    let table_arc = Arc::new(table.clone());
+    gencol::compute_virtual_columns(program, &table.columns_topo_sort()?, &dml_ctx, resolver, &table_arc)?;
 
     Ok(dml_ctx)
 }
@@ -1794,67 +1742,63 @@ fn emit_index_column_value_new_image(
     rowid_reg: usize,
     idx_col: &IndexColumn,
     dest_reg: usize,
-    is_strict: bool,
     layout: &ColumnLayout,
+    table: &Arc<BTreeTable>,
 ) -> Result<()> {
     if let Some(expr) = &idx_col.expr {
-        let mut expr = expr.as_ref().clone();
-        rewrite_where_for_update_registers(
-            &mut expr,
-            columns,
-            columns_start_reg,
-            rowid_reg,
-            layout,
-        )?;
-        // The caller must have populated resolver.register_affinities so that
-        // comparison instructions in the expression get the correct column
-        // affinity even though column references have been rewritten to
-        // Expr::Register.
-        // After rewrite, Expr::Register nodes reference encoded column registers.
-        // Decode custom type registers so the expression evaluates on user-facing
-        // values, matching what SELECT / CREATE INDEX see.
-        crate::translate::expr::decode_custom_type_registers_in_expr(
+        let expr = expr.as_ref().clone();
+        let mut column_regs: Vec<usize> = columns
+            .iter()
+            .enumerate()
+            .map(|(i, col)| {
+                if col.is_rowid_alias() {
+                    rowid_reg
+                } else {
+                    layout.to_register(columns_start_reg, i)
+                }
+            })
+            .collect();
+        crate::translate::expr::emit_dml_expr_index_value(
             program,
             resolver,
-            &mut expr,
+            expr,
             columns,
-            columns_start_reg,
-            Some(rowid_reg),
-            is_strict,
-            layout,
+            &mut column_regs,
+            table,
+            dest_reg,
         )?;
-
-        let ctx = SelfTableContext::ForDML(DmlColumnContext::layout(
-            columns,
-            columns_start_reg,
-            rowid_reg,
-            layout.clone(),
-        ));
-        program.with_self_table_context(Some(&ctx), |program, _| {
-            translate_expr_no_constant_opt(
-                program,
-                None,
-                &expr,
-                dest_reg,
-                resolver,
-                NoConstantOptReason::RegisterReuse,
-            )?;
-            Ok(())
-        })?;
     } else {
         let col_in_table = columns
             .get(idx_col.pos_in_table)
             .expect("column index out of bounds");
-        let src_reg = if col_in_table.is_rowid_alias() {
-            rowid_reg
-        } else {
-            layout.to_register(columns_start_reg, idx_col.pos_in_table)
-        };
-        program.emit_insn(Insn::Copy {
-            src_reg,
-            dst_reg: dest_reg,
-            extra_amount: 0,
-        });
+        match col_in_table.generated_type() {
+            GeneratedType::Virtual { ref expr, .. } => {
+                gencol::emit_gencol_expr_from_registers(
+                    program,
+                    expr,
+                    dest_reg,
+                    columns_start_reg,
+                    columns,
+                    resolver,
+                    rowid_reg,
+                    layout,
+                    table,
+                )?;
+                program.emit_column_affinity(dest_reg, col_in_table.affinity());
+            }
+            GeneratedType::NotGenerated => {
+                let src_reg = if col_in_table.is_rowid_alias() {
+                    rowid_reg
+                } else {
+                    layout.to_register(columns_start_reg, idx_col.pos_in_table)
+                };
+                program.emit_insn(Insn::Copy {
+                    src_reg,
+                    dst_reg: dest_reg,
+                    extra_amount: 0,
+                });
+            }
+        }
     }
     Ok(())
 }

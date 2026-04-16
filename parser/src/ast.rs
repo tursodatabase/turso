@@ -387,6 +387,15 @@ impl std::fmt::Display for TableInternalId {
 }
 
 /// SQL expression
+/// Pre-resolved field/variant index for FieldAccess expressions.
+/// Populated during binding so that translation can emit instructions directly.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub enum FieldAccessResolution {
+    StructField { field_index: usize },
+    UnionVariant { tag_index: u8 },
+}
+
 // https://sqlite.org/syntax/expr.html
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
@@ -429,6 +438,15 @@ pub enum Expr {
     DoublyQualified(Name, Name, Name),
     /// `EXISTS` subquery
     Exists(Select),
+    /// Struct/union field access (produced by translator, not parser directly)
+    FieldAccess {
+        /// base expression (e.g., column reference)
+        base: Box<Expr>,
+        /// field or variant name
+        field: Name,
+        /// pre-resolved field/variant index (populated during binding)
+        resolved: Option<FieldAccessResolution>,
+    },
     /// call to a built-in function
     FunctionCall {
         /// function name
@@ -576,17 +594,36 @@ impl Default for Expr {
 pub struct Variable {
     pub index: NonZeroU32,
     pub name: Option<Box<str>>,
+    /// Type of the source column, if known (e.g. from trigger NEW/OLD rewrite).
+    pub col_type: Option<Box<str>>,
 }
 
 impl Variable {
-    pub const fn indexed(index: NonZeroU32) -> Self {
-        Self { index, name: None }
+    pub fn indexed(index: NonZeroU32) -> Self {
+        Self {
+            index,
+            name: None,
+            col_type: None,
+        }
+    }
+
+    pub fn indexed_typed(index: NonZeroU32, col_type: &str) -> Self {
+        Self {
+            index,
+            name: None,
+            col_type: if col_type.is_empty() {
+                None
+            } else {
+                Some(col_type.into())
+            },
+        }
     }
 
     pub fn named(name: impl Into<Box<str>>, index: NonZeroU32) -> Self {
         Self {
             index,
             name: Some(name.into()),
+            col_type: None,
         }
     }
 }
@@ -1315,19 +1352,26 @@ pub struct DomainConstraint {
 /// Body of a `CREATE TYPE` statement
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
-pub struct CreateTypeBody {
-    /// type parameters, e.g. `(value text, maxlen integer)` for varchar
-    pub params: Vec<TypeParam>,
-    /// base storage type: "text", "integer", "real", "blob"
-    pub base: String,
-    /// encode expression (called on write), uses `value` placeholder for input
-    pub encode: Option<Box<Expr>>,
-    /// decode expression (called on read), uses `value` placeholder for input
-    pub decode: Option<Box<Expr>>,
-    /// operator-to-function mappings
-    pub operators: Vec<TypeOperator>,
-    /// default expression for columns of this type
-    pub default: Option<Box<Expr>>,
+pub enum CreateTypeBody {
+    /// Custom type with encode/decode (e.g., varchar, email)
+    CustomType {
+        /// type parameters, e.g. `(value text, maxlen integer)` for varchar
+        params: Vec<TypeParam>,
+        /// base storage type: "text", "integer", "real", "blob"
+        base: String,
+        /// encode expression (called on write), uses `value` placeholder for input
+        encode: Option<Box<Expr>>,
+        /// decode expression (called on read), uses `value` placeholder for input
+        decode: Option<Box<Expr>>,
+        /// operator-to-function mappings
+        operators: Vec<TypeOperator>,
+        /// default expression for columns of this type
+        default: Option<Box<Expr>>,
+    },
+    /// `CREATE TYPE name AS STRUCT(field1 type1, field2 type2, ...)`
+    Struct(Vec<TypeField>),
+    /// `CREATE TYPE name AS UNION(variant1 type1, variant2 type2, ...)`
+    Union(Vec<TypeField>),
 }
 
 /// `CREATE TABLE` body
@@ -1938,6 +1982,16 @@ pub struct CommonTableExpr {
     pub materialized: Materialized,
     /// query
     pub select: Select,
+}
+
+/// A field in a STRUCT or UNION type declaration, e.g. `x INT` in `STRUCT(x INT, y TEXT)`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct TypeField {
+    /// field/variant name
+    pub name: Name,
+    /// field/variant type (recursive — allows nested STRUCT/UNION)
+    pub field_type: Type,
 }
 
 /// Column type
