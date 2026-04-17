@@ -191,10 +191,10 @@ fn test_vector_sparse_ivf_update(tmp_db: TempDatabase) {
     let index = VectorSparseInvertedIndexMethod;
     let attached = index
         .attach(&IndexMethodConfiguration {
-            table_name: "t".to_string(),
-            index_name: "t_idx".to_string(),
+            table_name: "t".into(),
+            index_name: "t_idx".into(),
             columns: vec![IndexColumn {
-                name: "embedding".to_string(),
+                name: "embedding".into(),
                 order: SortOrder::Asc,
                 pos_in_table: 1,
                 collation: None,
@@ -409,11 +409,11 @@ fn test_fts_create_destroy(tmp_db: TempDatabase) {
     let index = FtsIndexMethod;
     let attached = index
         .attach(&IndexMethodConfiguration {
-            table_name: "docs".to_string(),
-            index_name: "fts_docs".to_string(),
+            table_name: "docs".into(),
+            index_name: "fts_docs".into(),
             columns: vec![
                 IndexColumn {
-                    name: "title".to_string(),
+                    name: "title".into(),
                     order: SortOrder::Asc,
                     pos_in_table: 1,
                     collation: None,
@@ -421,7 +421,7 @@ fn test_fts_create_destroy(tmp_db: TempDatabase) {
                     expr: None,
                 },
                 IndexColumn {
-                    name: "body".to_string(),
+                    name: "body".into(),
                     order: SortOrder::Asc,
                     pos_in_table: 2,
                     collation: None,
@@ -468,11 +468,11 @@ fn test_fts_insert_query(tmp_db: TempDatabase) {
     let index = FtsIndexMethod;
     let attached = index
         .attach(&IndexMethodConfiguration {
-            table_name: "docs".to_string(),
-            index_name: "fts_docs".to_string(),
+            table_name: "docs".into(),
+            index_name: "fts_docs".into(),
             columns: vec![
                 IndexColumn {
-                    name: "title".to_string(),
+                    name: "title".into(),
                     order: SortOrder::Asc,
                     pos_in_table: 1,
                     collation: None,
@@ -480,7 +480,7 @@ fn test_fts_insert_query(tmp_db: TempDatabase) {
                     expr: None,
                 },
                 IndexColumn {
-                    name: "body".to_string(),
+                    name: "body".into(),
                     order: SortOrder::Asc,
                     pos_in_table: 2,
                     collation: None,
