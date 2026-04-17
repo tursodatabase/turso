@@ -1220,6 +1220,14 @@ impl QualifiedName {
             alias: Some(alias),
         }
     }
+
+    /// Return the resolved identifier as a String
+    pub fn identifier(&self) -> String {
+        self.alias.as_ref().map_or_else(
+            || self.name.as_str().to_string(),
+            |alias| alias.as_str().to_string(),
+        )
+    }
 }
 
 /// `ALTER TABLE` body

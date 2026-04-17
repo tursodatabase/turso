@@ -173,7 +173,7 @@ fn validate_update(
     if !is_internal_schema_change
         && !conn.is_nested_stmt()
         && !conn.is_mvcc_bootstrap_connection()
-        && !crate::schema::can_write_to_table(table_name)
+        && !crate::schema::allow_user_dml(table_name)
     {
         crate::bail_parse_error!("table {} may not be modified", table_name);
     }
@@ -189,19 +189,18 @@ fn validate_update(
     }
 
     // Check if this table has any incompatible dependent views
-    let incompatible_views = schema.has_incompatible_dependent_views(table_name);
-    if !incompatible_views.is_empty() {
+    schema.with_incompatible_dependent_views(table_name, |views| {
+    if !views.is_empty() {
         use crate::incremental::compiler::DBSP_CIRCUIT_VERSION;
-        bail_parse_error!(
-            "Cannot UPDATE table '{}' because it has incompatible dependent materialized view(s): {}. \n\
-             These views were created with a different DBSP version than the current version ({}). \n\
+        crate::bail_parse_error!(
+            "Cannot DELETE from table '{table_name}' because it has incompatible dependent materialized view(s): {}. \n\
+             These views were created with a different DBSP version than the current version ({DBSP_CIRCUIT_VERSION}). \n\
              Please DROP and recreate the view(s) before modifying this table.",
-            table_name,
-            incompatible_views.join(", "),
-            DBSP_CIRCUIT_VERSION
+            views.iter().fold(String::new(), |_, s| s.to_string() + ", "),
         );
     }
     Ok(())
+    })
 }
 
 pub fn prepare_update_plan(
@@ -257,10 +256,7 @@ pub fn prepare_update_plan(
             Table::BTree(btree_table) => Table::BTree(btree_table.clone()),
             _ => unreachable!(),
         },
-        identifier: body.tbl_name.alias.as_ref().map_or_else(
-            || table_name.to_string(),
-            |alias| alias.as_str().to_string(),
-        ),
+        identifier: body.tbl_name.identifier(),
         internal_id: program.table_reference_counter.next(),
         op: build_scan_op(&table, iter_dir),
         join_info: None,

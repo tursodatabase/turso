@@ -19,7 +19,8 @@ use crate::{
             bind_and_rewrite_expr, emit_returning_results, emit_returning_scan_back,
             process_returning_clause, restore_returning_row_image_in_cache,
             seed_returning_row_image_in_cache, translate_expr, translate_expr_no_constant_opt,
-            walk_expr_mut, BindingBehavior, NoConstantOptReason, ReturningBufferCtx, WalkControl,
+            walk_expr, walk_expr_mut, BindingBehavior, NoConstantOptReason, ReturningBufferCtx,
+            WalkControl,
         },
         fkeys::{
             build_index_affinity_string, emit_fk_restrict_halt, emit_fk_violation,
@@ -76,26 +77,11 @@ fn validate(
     // Check if this is a system table that should be protected from direct writes
     if !conn.is_nested_stmt()
         && !conn.is_mvcc_bootstrap_connection()
-        && !crate::schema::can_write_to_table(table_name)
+        && !crate::schema::allow_user_dml(table_name)
     {
         crate::bail_parse_error!("table {} may not be modified", table_name);
     }
     // Check if this table has any incompatible dependent views
-    let incompatible_views = resolver
-        .schema()
-        .has_incompatible_dependent_views(table_name);
-    if !incompatible_views.is_empty() {
-        use crate::incremental::compiler::DBSP_CIRCUIT_VERSION;
-        crate::bail_parse_error!(
-            "Cannot INSERT into table '{}' because it has incompatible dependent materialized view(s): {}. \n\
-             These views were created with a different DBSP version than the current version ({}). \n\
-             Please DROP and recreate the view(s) before modifying this table.",
-            table_name,
-            incompatible_views.join(", "),
-            DBSP_CIRCUIT_VERSION
-        );
-    }
-
     // Check if this is a materialized view
     if resolver.schema().is_materialized_view(table_name) {
         crate::bail_parse_error!("cannot modify materialized view {}", table_name);
@@ -110,8 +96,18 @@ fn validate(
             "AUTOINCREMENT is not supported in MVCC mode (journal_mode=experimental_mvcc)"
         );
     }
-
+    resolver.schema().with_incompatible_dependent_views(table_name, |views| {
+    if !views.is_empty() {
+        use crate::incremental::compiler::DBSP_CIRCUIT_VERSION;
+        crate::bail_parse_error!(
+            "Cannot DELETE from table '{table_name}' because it has incompatible dependent materialized view(s): {}. \n\
+             These views were created with a different DBSP version than the current version ({DBSP_CIRCUIT_VERSION}). \n\
+             Please DROP and recreate the view(s) before modifying this table.",
+            views.iter().fold(String::new(), |_, s| s.to_string() + ", "),
+        );
+    }
     Ok(())
+    })
 }
 
 pub struct TempTableCtx {
@@ -195,7 +191,6 @@ impl<'a> InsertEmitCtx<'a> {
         num_values: usize,
         temp_table_ctx: Option<TempTableCtx>,
         database_id: usize,
-        _connection: &Arc<crate::Connection>,
     ) -> Result<Self> {
         // allocate cursor id's for each btree index cursor we'll need to populate the indexes
         let indices: Vec<_> = resolver.with_schema(database_id, |s| {
@@ -403,7 +398,6 @@ pub fn translate_insert(
         values.len(),
         None,
         database_id,
-        connection,
     )?;
     program.has_statement_conflict = on_conflict.is_some();
 
@@ -616,25 +610,7 @@ pub fn translate_insert(
     }
 
     if has_user_provided_rowid {
-        let must_be_int_label = program.allocate_label();
-
-        program.emit_insn(Insn::NotNull {
-            reg: insertion.key_register(),
-            target_pc: must_be_int_label,
-        });
-
-        program.emit_insn(Insn::Goto {
-            target_pc: ctx.key_labels.key_generation,
-        });
-
-        program.preassign_label_to_next_insn(must_be_int_label);
-        program.emit_insn(Insn::MustBeInt {
-            reg: insertion.key_register(),
-        });
-
-        program.emit_insn(Insn::Goto {
-            target_pc: ctx.key_labels.key_ready_for_check,
-        });
+        emit_check_for_user_provided_rowid(program, &insertion, &ctx);
     }
 
     program.preassign_label_to_next_insn(ctx.key_labels.key_generation);
@@ -794,7 +770,6 @@ pub fn translate_insert(
         &upsert_actions,
         has_user_provided_rowid,
         resolver,
-        connection,
         ctx.database_id,
         ctx.table.rowid_alias_conflict_clause,
         ctx.statement_on_conflict.is_some(),
@@ -1153,6 +1128,32 @@ pub fn translate_insert(
     program.result_columns = result_columns;
     program.table_references.extend(table_references);
     Ok(())
+}
+
+/// If the user provided an explicit rowid for this insert, we must validate that it is an Integer and non-null
+fn emit_check_for_user_provided_rowid(
+    program: &mut ProgramBuilder,
+    insertion: &Insertion,
+    ctx: &InsertEmitCtx,
+) {
+    let must_be_int_label = program.allocate_label();
+    program.emit_insn(Insn::NotNull {
+        reg: insertion.key_register(),
+        target_pc: must_be_int_label,
+    });
+
+    program.emit_insn(Insn::Goto {
+        target_pc: ctx.key_labels.key_generation,
+    });
+
+    program.preassign_label_to_next_insn(must_be_int_label);
+    program.emit_insn(Insn::MustBeInt {
+        reg: insertion.key_register(),
+    });
+
+    program.emit_insn(Insn::Goto {
+        target_pc: ctx.key_labels.key_ready_for_check,
+    });
 }
 
 fn emit_epilogue(
@@ -1761,7 +1762,6 @@ struct BoundInsertResult {
 /// This is used to detect when single-row VALUES should be routed through the
 /// multi-row path which has proper subquery handling.
 fn expr_contains_subquery(expr: &Expr) -> bool {
-    use crate::translate::expr::{walk_expr, WalkControl};
     let mut found_subquery = false;
     let _ = walk_expr(expr, &mut |e| {
         if matches!(
@@ -3465,13 +3465,11 @@ struct PreflightCtx<'a, 'b> {
     table_references: &'b mut TableReferences,
 }
 
-#[allow(clippy::too_many_arguments)]
 fn build_constraints_to_check(
     table_name: &str,
     upsert_actions: &[(ResolvedUpsertTarget, BranchOffset, Box<Upsert>)],
     has_user_provided_rowid: bool,
     resolver: &Resolver,
-    _connection: &Arc<crate::Connection>,
     database_id: usize,
     rowid_alias_conflict_clause: Option<ResolveType>,
     has_statement_conflict: bool,

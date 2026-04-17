@@ -1,49 +1,53 @@
-use crate::translate::collate::{get_expr_collation_ctx, CollationSeq};
-use crate::translate::emitter::delete::emit_program_for_delete;
-use crate::translate::emitter::select::emit_program_for_select;
-use crate::translate::emitter::update::emit_program_for_update;
-use crate::translate::main_loop::SemiAntiJoinMetadata;
 // This module contains code for emitting bytecode instructions for SQL query execution.
 // It handles translating high-level SQL operations into low-level bytecode that can be executed by the virtual machine.
-
-use crate::sync::Arc;
-use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
-use std::borrow::Cow;
-use std::cell::RefCell;
-use turso_macros::turso_assert_ne;
-
-use super::expr::{emit_table_column, translate_expr, ExprAffinityInfo};
-use super::group_by::GroupByMetadata;
-use super::main_loop::{LeftJoinMetadata, LoopLabels};
-use super::order_by::SortMetadata;
-use super::plan::{BitSet, HashJoinType, TableReferences};
-use crate::error::SQLITE_CONSTRAINT_CHECK;
-use crate::function::Func;
+use super::{
+    collate::{get_expr_collation_ctx, CollationSeq},
+    compound_select::emit_program_for_compound_select,
+    emitter::{
+        delete::emit_program_for_delete, select::emit_program_for_select,
+        update::emit_program_for_update,
+    },
+    expr::{
+        bind_and_rewrite_expr, emit_table_column, translate_expr, translate_expr_no_constant_opt,
+        walk_expr, walk_expr_mut, BindingBehavior, ExprAffinityInfo, NoConstantOptReason,
+        WalkControl,
+    },
+    group_by::GroupByMetadata,
+    main_loop::{LeftJoinMetadata, LoopLabels, SemiAntiJoinMetadata},
+    order_by::SortMetadata,
+    plan::{
+        BitSet, HashJoinType, JoinedTable, NonFromClauseSubquery, Plan, ResultSetColumn,
+        TableReferences,
+    },
+    planner::{TableMask, ROWID_STRS},
+    trigger_exec::{get_triggers_including_temp, has_triggers_including_temp},
+    window::WindowMetadata,
+};
+use crate::instrument;
 use crate::schema::{
     BTreeTable, CheckConstraint, Column, ColumnLayout, GeneratedType, IndexColumn, Schema, Table,
 };
-use crate::translate::compound_select::emit_program_for_compound_select;
-use crate::translate::expr::{
-    bind_and_rewrite_expr, translate_expr_no_constant_opt, walk_expr, walk_expr_mut,
-    BindingBehavior, NoConstantOptReason, WalkControl,
+use crate::vdbe::{
+    affinity::Affinity,
+    builder::{CursorType, DmlColumnContext, ProgramBuilder, SelfTableContext},
+    insn::{to_u16, InsertFlags, Insn},
+    BranchOffset, CursorID,
 };
-use crate::translate::plan::{JoinedTable, NonFromClauseSubquery, Plan, ResultSetColumn};
-use crate::translate::planner::TableMask;
-use crate::translate::planner::ROWID_STRS;
-pub use crate::translate::trigger_exec::{
-    get_triggers_including_temp, has_triggers_including_temp,
+use crate::{
+    bail_parse_error,
+    error::SQLITE_CONSTRAINT_CHECK,
+    function::Func,
+    sync::Arc,
+    turso_assert_ne,
+    util::{
+        check_expr_references_column, exprs_are_equivalent, normalize_ident, parse_numeric_literal,
+    },
+    CaptureDataChangesExt, Connection, Database, DatabaseCatalog, LimboError, Result, RwLock,
+    SymbolTable,
 };
-use crate::translate::window::WindowMetadata;
-use crate::util::{
-    check_expr_references_column, exprs_are_equivalent, normalize_ident, parse_numeric_literal,
-};
-use crate::vdbe::affinity::Affinity;
-use crate::vdbe::builder::{CursorType, DmlColumnContext, ProgramBuilder, SelfTableContext};
-use crate::vdbe::insn::{to_u16, InsertFlags};
-use crate::vdbe::{insn::Insn, BranchOffset, CursorID};
-use crate::{bail_parse_error, Database, DatabaseCatalog, LimboError, Result, RwLock, SymbolTable};
-use crate::{CaptureDataChangesExt, Connection};
-use tracing::instrument;
+use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
+use std::borrow::Cow;
+use std::cell::RefCell;
 use turso_parser::ast::{
     self, Expr, Literal, ResolveType, SubqueryType, TableInternalId, TriggerTime,
 };
@@ -544,8 +548,8 @@ impl<'a> Resolver<'a> {
         let resolved_id = if let Some(db_name) = &qualified_name.db_name {
             let db_name_normalized = normalize_ident(db_name.as_str());
             match db_name_normalized.as_str() {
-                "main" => Ok(0),
-                "temp" => Ok(1),
+                "main" => Ok(crate::MAIN_DB_ID),
+                "temp" => Ok(crate::TEMP_DB_ID),
                 _ => {
                     // Look up attached database
                     if let Some((idx, _attached_db)) =
