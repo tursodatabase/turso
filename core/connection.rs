@@ -2342,7 +2342,7 @@ impl Connection {
         //   file-based (important for simulator fault injection and WAL coordination)
         // - If the parent is :memory: (MemoryIO) but the attached DB is file-based,
         //   we need a file-capable IO layer since MemoryIO can't read real files
-        let is_memory_db = Database::is_memory_path(path);
+        let is_memory_db = is_memory_like(path);
         let io: Arc<dyn IO> = if is_memory_db {
             Arc::new(MemoryIO::new())
         } else if self.db.is_in_memory_db() {
