@@ -2331,12 +2331,6 @@ pub struct BTreeTable {
     pub root_page: i64,
     pub name: String,
     pub primary_key_columns: Vec<(String, SortOrder)>,
-    /// Prefer mutating through [`BTreeTable::columns_mut`], which invalidates
-    /// [`BTreeTable::cached_graph`]. `pub(crate)` so struct-literal callers
-    /// inside this crate can construct tables without a builder; external
-    /// crates (bindings, CLI) must go through the accessors. Internal
-    /// mutations must still route through `columns_mut()` to keep the cache
-    /// consistent.
     pub(crate) columns: Vec<Column>,
     pub has_rowid: bool,
     pub is_strict: bool,
@@ -2357,8 +2351,6 @@ impl BTreeTable {
         &self.columns
     }
 
-    /// Returns a mutable reference to the columns vector, invalidating the
-    /// cached dependency graph so it is rebuilt on the next query.
     pub fn columns_mut(&mut self) -> &mut Vec<Column> {
         self.column_dependencies.0 = OnceLock::new();
         &mut self.columns
@@ -2706,10 +2698,6 @@ impl BTreeTable {
     }
 
     pub fn prepare_generated_columns(&mut self) -> Result<()> {
-        // Any mutation of columns happened through `columns_mut()` upstream,
-        // which already reset the cache; rebuild here is lazy-on-next-access.
-        // Reset explicitly to cover callers that constructed this BTreeTable
-        // via struct literal and populated columns before calling us.
         self.column_dependencies.0 = OnceLock::new();
         self.has_virtual_columns = self.columns.iter().any(|c| c.is_virtual_generated());
         if !self.has_virtual_columns {
@@ -2722,7 +2710,6 @@ impl BTreeTable {
                 *self.columns[i].generated_expr_mut().unwrap() = expr;
             }
         }
-        // Force eager cache build so cycle errors surface at CREATE TABLE / ALTER time.
         self.column_graph()?;
         Ok(())
     }
@@ -3489,9 +3476,6 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
                     if referenced_cols.iter().any(|c| c == &current_col_name) {
                         bail_parse_error!("generated column \"{}\" cannot reference itself", name);
                     }
-                    // Transitive-cycle detection happens inside
-                    // `prepare_generated_columns()` via Kahn's algorithm when
-                    // `GeneratedColGraph::build` is forced.
                 }
 
                 if primary_key {
@@ -5366,8 +5350,6 @@ mod tests {
             .to_string()
             .contains("generated columns"));
     }
-
-    // --- generated-column dependency graph ---
 
     fn indices(mask: &ColumnMask) -> Vec<usize> {
         let mut v: Vec<usize> = mask.iter().collect();
