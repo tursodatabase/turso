@@ -1422,6 +1422,16 @@ impl Program {
                     return Ok(StepResult::IO);
                 }
                 if let Some(err) = io.get_error() {
+                    // When a checkpoint yields IO and that IO later errors, the
+                    // checkpoint state machine never re-runs through op_checkpoint
+                    // and therefore never gets to release its pager/WAL/blocking
+                    // checkpoint locks — leaving a subsequent checkpoint or even
+                    // writes on other connections to fail with Busy. Release those
+                    // locks here, before we return the error to the caller.
+                    if let Some(ckpt_sm) = state.op_checkpoint_state.checkpoint_sm.as_mut() {
+                        ckpt_sm.inner_state_mut().cleanup_after_external_io_error();
+                    }
+                    state.op_checkpoint_state = Default::default();
                     if pager.is_checkpointing() {
                         // Wrap IO errors that occurred during checkpointing in CheckpointFailed error,
                         // so that abort() knows not to try to rollback the transaction, because the transaction

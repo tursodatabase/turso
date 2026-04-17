@@ -29,6 +29,14 @@ pub enum CheckpointState {
     WriteRow {
         write_set_index: usize,
         requires_seek: bool,
+        /// When true, the `special_write` handling (CREATE/DESTROY btree) has
+        /// already run for this `write_set_index` — typically because we just
+        /// returned from `DestroyTableBTree`/`DestroyIndexBTree` and still need
+        /// to write the accompanying sqlite_schema DELETE to the sqlite_schema
+        /// btree. Skipping the match but keeping the same index preserves the
+        /// pre-IO-removal semantics where the destroy + row write happened in
+        /// one synchronous iteration.
+        skip_special_write: bool,
     },
     DestroyTableBTree {
         write_set_index: usize,
@@ -345,7 +353,17 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
     /// checkpoint bookkeeping.
     pub fn cleanup_after_external_io_error(&mut self) {
         if self.lock_states.pager_write_tx {
+            // pager.rollback_tx skips `wal.end_write_tx()` unless the connection's
+            // tx_state is `Write` — but auto-checkpoints run with
+            // `update_transaction_state=false` and never set that state, so routing
+            // through rollback_tx leaks the WAL write lock acquired by
+            // `pager.begin_write_tx`. Release it explicitly here.
             self.pager.rollback_tx(self.connection.as_ref());
+            if let Some(wal) = self.pager.wal.as_ref() {
+                if wal.holds_write_lock() {
+                    wal.end_write_tx();
+                }
+            }
             if self.update_transaction_state {
                 self.connection.set_tx_state(TransactionState::None);
             }
@@ -358,6 +376,11 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
             }
             self.lock_states.pager_read_tx = false;
         }
+
+        // Any cursors we registered while destroying btrees may be pointing at
+        // root pages that are partially destroyed or will be reused on a retry;
+        // drop them so the retry reconstructs fresh cursors.
+        self.cursors.clear();
 
         // MVCC checkpointing drives WAL checkpoint directly; on errors we must
         // explicitly reset both pager and WAL checkpoint states.
@@ -881,6 +904,7 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                 self.state = CheckpointState::WriteRow {
                     write_set_index: 0,
                     requires_seek: true,
+                    skip_special_write: false,
                 };
                 Ok(TransitionResult::Continue)
             }
@@ -888,9 +912,11 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
             CheckpointState::WriteRow {
                 write_set_index,
                 requires_seek,
+                skip_special_write,
             } => {
                 let write_set_index = *write_set_index;
                 let requires_seek = *requires_seek;
+                let skip_special_write = *skip_special_write;
 
                 if !self.has_more_rows(write_set_index) {
                     // Done writing all table rows, now process index rows
@@ -923,8 +949,12 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                     )
                 };
 
-                // Handle CREATE TABLE / DROP TABLE / CREATE INDEX / DROP INDEX ops
-                if let Some(special_write) = special_write {
+                // Handle CREATE TABLE / DROP TABLE / CREATE INDEX / DROP INDEX ops.
+                // When `skip_special_write` is set we have already handled this
+                // write_set entry's special-write portion (we just came back
+                // from Destroy{Table,Index}BTree completion) and only need to
+                // perform the row-level sqlite_schema write below.
+                if let (Some(special_write), false) = (special_write, skip_special_write) {
                     match special_write {
                         SpecialWrite::BTreeCreate { table_id, .. } => {
                             let created_root_page =
@@ -1016,6 +1046,7 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                     self.state = CheckpointState::WriteRow {
                         write_set_index: write_set_index + 1,
                         requires_seek: true,
+                        skip_special_write: false,
                     };
                     return Ok(TransitionResult::Continue);
                 }
@@ -1146,6 +1177,7 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                         self.state = CheckpointState::WriteRow {
                             write_set_index: write_set_index + 1,
                             requires_seek: true,
+                            skip_special_write: false,
                         };
                         return Ok(TransitionResult::Continue);
                     }
@@ -1181,6 +1213,7 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                         self.state = CheckpointState::WriteRow {
                             write_set_index: write_set_index + 1,
                             requires_seek: true,
+                            skip_special_write: false,
                         };
                         Ok(TransitionResult::Continue)
                     }
@@ -1213,9 +1246,16 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                         // reused by a subsequent create within this checkpoint).
                         self.cursors.remove(root_page);
                         self.destroyed_tables.insert(*table_id);
+                        // Re-enter WriteRow at the *same* write_set_index with
+                        // `skip_special_write: true` so the accompanying
+                        // sqlite_schema DELETE row gets written to the
+                        // sqlite_schema btree. Before this the destroy was
+                        // terminal and the DROP TABLE's schema row never left
+                        // the MVCC store on a restart-after-checkpoint flow.
                         self.state = CheckpointState::WriteRow {
-                            write_set_index: *write_set_index + 1,
+                            write_set_index: *write_set_index,
                             requires_seek: true,
+                            skip_special_write: true,
                         };
                         Ok(TransitionResult::Continue)
                     }
@@ -1262,9 +1302,14 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                         // reused by a subsequent create within this checkpoint).
                         self.cursors.remove(root_page);
                         self.destroyed_indexes.insert(*index_id);
+                        // See DestroyTableBTree: re-enter WriteRow at the same
+                        // index with skip_special_write=true so the DROP INDEX
+                        // sqlite_schema DELETE is still written to the
+                        // sqlite_schema btree after the index btree is gone.
                         self.state = CheckpointState::WriteRow {
-                            write_set_index: *write_set_index + 1,
+                            write_set_index: *write_set_index,
                             requires_seek: true,
+                            skip_special_write: true,
                         };
                         Ok(TransitionResult::Continue)
                     }
@@ -1286,6 +1331,7 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                         self.state = CheckpointState::WriteRow {
                             write_set_index: write_set_index + 1,
                             requires_seek: true,
+                            skip_special_write: false,
                         };
                         Ok(TransitionResult::Continue)
                     }
@@ -1474,6 +1520,8 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                         // Advance the in-memory durable boundary immediately so that if
                         // later checkpoint phases fail, a same-process retry starts from
                         // this durable prefix instead of re-staging older versions.
+                        // (This matches the behavior test_meta_checkpoint_case_11
+                        // expects: once commit_tx succeeds, the pager data is durable.)
                         self.mvstore
                             .durable_txid_max
                             .store(self.durable_txid_max_new, Ordering::SeqCst);
@@ -1497,12 +1545,16 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                 tracing::info!("Truncating logical log file");
                 let c = self.truncate_logical_log()?;
                 self.state = CheckpointState::FsyncLogicalLog;
-                // if Completion Completed without errors we can continue
-                if c.succeeded() {
-                    Ok(TransitionResult::Continue)
-                } else {
-                    Ok(TransitionResult::Io(IOCompletions::Single(c)))
+                // `succeeded()` returns false for both "not yet finished" AND
+                // "finished with error" — use `finished()` + explicit error check,
+                // otherwise an errored completion yields forever.
+                if !c.finished() {
+                    return Ok(TransitionResult::Io(IOCompletions::Single(c)));
                 }
+                if let Some(err) = c.get_error() {
+                    return Err(err.into());
+                }
+                Ok(TransitionResult::Continue)
             }
 
             CheckpointState::FsyncLogicalLog => {
@@ -1515,12 +1567,15 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                 tracing::debug!("Fsyncing logical log file");
                 let c = self.fsync_logical_log()?;
                 self.state = CheckpointState::TruncateWal;
-                // if Completion Completed without errors we can continue
-                if c.succeeded() {
-                    Ok(TransitionResult::Continue)
-                } else {
-                    Ok(TransitionResult::Io(IOCompletions::Single(c)))
+                // See TruncateLogicalLog: use finished() + get_error() so an
+                // errored completion propagates instead of looping forever.
+                if !c.finished() {
+                    return Ok(TransitionResult::Io(IOCompletions::Single(c)));
                 }
+                if let Some(err) = c.get_error() {
+                    return Err(err.into());
+                }
+                Ok(TransitionResult::Continue)
             }
 
             CheckpointState::CheckpointWal => {
@@ -1707,9 +1762,19 @@ impl<Clock: LogicalClock> StateTransition for CheckpointStateMachine<Clock> {
         let res = self.step_inner(&());
         match res {
             Err(ref err) => {
-                self.mvstore
+                // Do not propagate an error from `on_checkpoint_end` with `?` here:
+                // if we did, the cleanup below would be skipped and the WAL write
+                // lock / pager checkpoint state / blocking checkpoint lock would
+                // stay held, wedging every subsequent checkpoint with Busy.
+                if let Err(notify_err) = self
+                    .mvstore
                     .storage
-                    .on_checkpoint_end(self.durable_txid_max_new, Err(err.clone()))?;
+                    .on_checkpoint_end(self.durable_txid_max_new, Err(err.clone()))
+                {
+                    tracing::warn!(
+                        "on_checkpoint_end notify failed during error cleanup: {notify_err}"
+                    );
+                }
                 tracing::info!("Error in checkpoint state machine: {err}");
                 self.cleanup_after_external_io_error();
                 res

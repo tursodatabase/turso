@@ -75,4 +75,11 @@ impl<State: StateTransition> StateMachine<State> {
     pub fn is_finalized(&self) -> bool {
         self.is_finalized
     }
+
+    /// Mutable access to the inner state, used when a caller needs to invoke
+    /// state-specific cleanup methods (e.g. releasing locks) after an IO
+    /// completion errored outside of `step()`.
+    pub fn inner_state_mut(&mut self) -> &mut State {
+        &mut self.state
+    }
 }

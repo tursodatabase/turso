@@ -83,7 +83,15 @@ impl HeaderRef {
         let content = page.get_contents();
         let header =
             bytemuck::from_bytes::<DatabaseHeader>(&content.as_ptr()[0..DatabaseHeader::SIZE]);
-        pager.cache_header_fields(header);
+        // Only refresh cached header fields from a real on-disk page1.
+        // Before the DB is initialized, read_header_page returns the in-memory
+        // bootstrap `init_page_1` (with default reserved_space=0 / default page_size).
+        // Caching from that page would clobber values the caller just set via
+        // e.g. `set_reserved_space_bytes` / `set_initial_page_size` and cause
+        // the first on-disk page1 to be written with the wrong header fields.
+        if pager.db_initialized() {
+            pager.cache_header_fields(header);
+        }
         Ok(IOResult::Done(Self(page)))
     }
 
@@ -103,7 +111,12 @@ impl HeaderRefMut {
         let content = page.get_contents();
         let header =
             bytemuck::from_bytes::<DatabaseHeader>(&content.as_ptr()[0..DatabaseHeader::SIZE]);
-        pager.cache_header_fields(header);
+        // See HeaderRef::from_pager: skip caching bootstrap header fields so
+        // caller-provided reserved_space/page_size are preserved through the
+        // initial allocate_page1.
+        if pager.db_initialized() {
+            pager.cache_header_fields(header);
+        }
         pager.add_dirty(&page)?;
         Ok(IOResult::Done(Self(page)))
     }
@@ -2957,15 +2970,33 @@ impl Pager {
                 None => {
                     return_if_io!(self.ensure_cache_space());
                     tracing::debug!("read_page(page_idx = {page_idx}) = reading page from disk");
+                    // Register the inflight entry *before* issuing the kernel
+                    // read so another concurrent caller coalesces onto it
+                    // instead of submitting a duplicate read with a separate
+                    // Page/buffer. Double-check under the write lock that the
+                    // cache / inflight map didn't change while we were
+                    // yielded by ensure_cache_space.
+                    let mut inflight = self.inflight_page_reads.write();
+                    if inflight.contains_key(&page_idx) {
+                        continue;
+                    }
+                    {
+                        let mut page_cache = self.page_cache.write();
+                        let page_key = PageCacheKey::new(page_idx);
+                        if let Some(page) = page_cache.get(&page_key)? {
+                            return Ok(IOResult::Done(page));
+                        }
+                    }
                     let (page, completion) =
                         self.read_page_no_cache(page_idx as i64, None, false)?;
-                    self.inflight_page_reads.write().insert(
+                    inflight.insert(
                         page_idx,
                         InflightPageRead::Reading {
                             page,
                             completion: completion.clone(),
                         },
                     );
+                    drop(inflight);
                     if !completion.finished() {
                         return Ok(IOResult::IO(IOCompletions::Single(completion)));
                     }
@@ -3000,7 +3031,10 @@ impl Pager {
             match page_cache.insert(page_key, page.clone()) {
                 Ok(_) => return Ok(IOResult::Done(())),
                 Err(CacheError::KeyExists) => {
-                    unreachable!("Page should not exist in cache after get() miss");
+                    // Another reentrant caller won the race and inserted this
+                    // page. The cache already holds a valid entry for page_idx,
+                    // so treat this as success.
+                    return Ok(IOResult::Done(()));
                 }
                 Err(CacheError::Full) => {
                     // Fall through to spilling
@@ -3471,8 +3505,12 @@ impl Pager {
                 page_sz,
                 completion,
             } => {
-                if !completion.succeeded() {
+                if !completion.finished() {
                     io_yield_one!(completion);
+                }
+                if let Some(err) = completion.get_error() {
+                    *self.spill_state.write() = SpillState::Idle;
+                    return Err(err.into());
                 }
                 let wal = self
                     .wal
@@ -3491,8 +3529,12 @@ impl Pager {
                 page_sz,
                 completion,
             } => {
-                if !completion.succeeded() {
+                if !completion.finished() {
                     io_yield_one!(completion);
+                }
+                if let Some(err) = completion.get_error() {
+                    *self.spill_state.write() = SpillState::Idle;
+                    return Err(err.into());
                 }
                 let wal = self
                     .wal
@@ -3529,8 +3571,14 @@ impl Pager {
             }
             SpillState::WritingToWal { pages, completions } => {
                 for c in &completions {
-                    if !c.succeeded() {
+                    if !c.finished() {
                         io_yield_one!(c.clone());
+                    }
+                }
+                for c in &completions {
+                    if let Some(err) = c.get_error() {
+                        *self.spill_state.write() = SpillState::Idle;
+                        return Err(err.into());
                     }
                 }
                 // All I/O complete, pages are now in WAL.
@@ -3569,12 +3617,15 @@ impl Pager {
                 return Ok(IOResult::Done(true));
             }
             SpillState::WritingToDisk { pages, completions } => {
-                let all_done = completions.iter().all(|c| c.succeeded());
-                if !all_done {
-                    for c in &completions {
-                        if !c.succeeded() {
-                            io_yield_one!(c.clone());
-                        }
+                for c in &completions {
+                    if !c.finished() {
+                        io_yield_one!(c.clone());
+                    }
+                }
+                for c in &completions {
+                    if let Some(err) = c.get_error() {
+                        *self.spill_state.write() = SpillState::Idle;
+                        return Err(err.into());
                     }
                 }
                 // All I/O complete, finish ephemeral spill
@@ -4410,12 +4461,12 @@ impl Pager {
                     state.phase = CheckpointPhase::NotCheckpointing;
                     state.mode = None;
 
-                    // Clear page cache only if requested (explicit checkpoints do this, auto-checkpoint does not)
+                    // Clear page cache only if requested (explicit checkpoints do this, auto-checkpoint does not).
+                    // Use self.clear_page_cache so in-flight page reads are also aborted and removed;
+                    // otherwise a finished-but-not-yet-inserted InflightPageRead would be re-used after
+                    // the cache is cleared, re-populating it with a stale page buffer.
                     if clear_page_cache {
-                        self.page_cache.write().clear(false).map_err(|e| {
-                            res.release_guard();
-                            LimboError::InternalError(format!("Failed to clear page cache: {e:?}"))
-                        })?;
+                        self.clear_page_cache(false);
                     }
 
                     // Release checkpoint guard
@@ -5042,7 +5093,7 @@ impl Pager {
         self.commit_info.write().reset();
         *self.allocate_page_state.write() = AllocatePageState::Start;
         *self.free_page_state.write() = FreePageState::Start;
-        *self.spill_state.write() = SpillState::Idle;
+        self.abort_spill_state();
         #[cfg(not(feature = "omit_autovacuum"))]
         {
             let mut vacuum_state = self.vacuum_state.write();
@@ -5052,6 +5103,32 @@ impl Pager {
         }
 
         *self.header_ref_state.write() = HeaderRefState::Start;
+    }
+
+    /// Abort any outstanding spill completions and reset the spill state to Idle.
+    ///
+    /// Must be called before we transition the pager back to a "clean" state
+    /// (e.g. rollback, reset, or checkpoint finalize). Without this, a
+    /// completion that is still in flight when `spill_state` is replaced with
+    /// `Idle` will fire its callback later and mutate pages (`set_spilled`,
+    /// `wal_tag`) that the pager believes it has no outstanding writes for —
+    /// producing WAL/cache inconsistency and data corruption.
+    fn abort_spill_state(&self) {
+        let mut state = self.spill_state.write();
+        match &*state {
+            SpillState::Idle => {}
+            SpillState::PrepareWal { completion, .. }
+            | SpillState::PrepareWalSync { completion, .. } => {
+                completion.abort();
+            }
+            SpillState::WritingToWal { completions, .. }
+            | SpillState::WritingToDisk { completions, .. } => {
+                for c in completions {
+                    c.abort();
+                }
+            }
+        }
+        *state = SpillState::Idle;
     }
 
     fn clear_inflight_page_reads(&self) {
@@ -5081,7 +5158,14 @@ impl Pager {
     pub fn with_header<T>(&self, f: impl Fn(&DatabaseHeader) -> T) -> Result<IOResult<T>> {
         let header_ref = return_if_io!(HeaderRef::from_pager(self));
         let header = header_ref.borrow();
-        self.cache_header_fields(header);
+        // Only refresh cached header fields from a real on-disk page1.
+        // Before the DB is initialized, this reads the in-memory bootstrap header
+        // (reserved_space=0, default page_size), and caching that would clobber
+        // caller-provided values (e.g. set via set_reserved_space_bytes by the
+        // sync engine or encryption setup) on the very next allocate_page1.
+        if self.db_initialized() {
+            self.cache_header_fields(header);
+        }
         Ok(IOResult::Done(f(header)))
     }
 
@@ -5089,7 +5173,10 @@ impl Pager {
         let header_ref = return_if_io!(HeaderRefMut::from_pager(self));
         let header = header_ref.borrow_mut();
         let result = f(header);
-        self.cache_header_fields(header);
+        // See with_header: do not cache bootstrap header fields while uninitialized.
+        if self.db_initialized() {
+            self.cache_header_fields(header);
+        }
         Ok(IOResult::Done(result))
     }
 

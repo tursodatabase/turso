@@ -496,6 +496,16 @@ pub fn op_checkpoint(
             Ok(result)
         }
         Err(err) => {
+            // If the checkpoint state machine yielded IO and that IO later
+            // errored (so we're being called with an error result from the
+            // driver), the SM itself never got a chance to run its Err arm in
+            // step() and therefore never released its pager/WAL/checkpoint
+            // locks. Explicitly invoke the external-io-error cleanup before
+            // dropping the SM so the next checkpoint isn't blocked by a stale
+            // WAL write lock or checkpoint lock.
+            if let Some(ckpt_sm) = state.op_checkpoint_state.checkpoint_sm.as_mut() {
+                ckpt_sm.inner_state_mut().cleanup_after_external_io_error();
+            }
             state.op_checkpoint_state = Default::default();
             Err(err)
         }
