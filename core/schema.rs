@@ -155,6 +155,7 @@ use core::fmt;
 use rustc_hash::{FxBuildHasher, FxHashMap as HashMap, FxHashSet as HashSet};
 use std::collections::VecDeque;
 use std::ops::Deref;
+use std::sync::OnceLock;
 use tracing::trace;
 use turso_parser::ast::{
     self, ColumnDefinition, Expr, InitDeferredPred, Literal, Name, RefAct, ResolveType, SortOrder,
@@ -1325,6 +1326,7 @@ impl Schema {
                 unique_sets: vec![],
                 has_virtual_columns: false,
                 logical_to_physical_map,
+                column_dependencies: Default::default(),
             })));
 
             // Only add to schema if compatible
@@ -2226,12 +2228,118 @@ impl CheckConstraint {
     }
 }
 
+/// Wrapper whose `Clone` resets the inner value to its `Default`. Used to
+/// hang derived caches off structs that want `#[derive(Clone)]` without
+/// propagating stale cache state into the clone.
+#[derive(Debug, Default)]
+pub struct ResetOnClone<T: Default>(pub T);
+
+impl<T: Default> Clone for ResetOnClone<T> {
+    fn clone(&self) -> Self {
+        Self(T::default())
+    }
+}
+
+/// Transitive closure of the generated-column dependency DAG, computed
+/// lazily via [`OnceLock`]. Accessed through [`BTreeTable::columns_affected_by_update`]
+/// and [`BTreeTable::dependencies_of_columns`].
+#[derive(Debug)]
+pub(crate) struct GeneratedColGraph {
+    /// `dependencies[j]` = columns `j` transitively reads from (excludes `j`).
+    dependencies: Vec<ColumnMask>,
+    /// `dependents[i]` = columns that transitively read from `i` (excludes `i`).
+    dependents: Vec<ColumnMask>,
+}
+
+impl GeneratedColGraph {
+    fn build(columns: &[Column]) -> Result<Self> {
+        let n = columns.len();
+
+        // Step 1: walk each virtual column's expression once → direct edges.
+        let mut direct_deps = vec![ColumnMask::default(); n];
+        let mut direct_dependents = vec![ColumnMask::default(); n];
+        let mut in_degree: Vec<u32> = vec![0; n];
+        for (j, col) in columns.iter().enumerate() {
+            let GeneratedType::Virtual { ref expr, .. } = col.generated_type() else {
+                continue;
+            };
+            let mut direct = BitSet::default();
+            collect_column_dependencies_of_gencol(expr, columns, &mut direct);
+            for i in direct.iter() {
+                if i == j {
+                    bail_parse_error!(
+                        "generated column \"{}\" cannot reference itself",
+                        col.name.as_deref().unwrap_or("?")
+                    );
+                }
+                direct_deps[j].set(i);
+                direct_dependents[i].set(j);
+                in_degree[j] += 1;
+            }
+        }
+
+        // Step 2: Kahn's topological sort over direct_deps. Unordered nodes = cycle.
+        let mut topo: Vec<usize> = Vec::with_capacity(n);
+        let mut ready: Vec<usize> = (0..n).filter(|&i| in_degree[i] == 0).collect();
+        while let Some(i) = ready.pop() {
+            topo.push(i);
+            for j in direct_dependents[i].iter() {
+                in_degree[j] -= 1;
+                if in_degree[j] == 0 {
+                    ready.push(j);
+                }
+            }
+        }
+        if topo.len() != n {
+            let cycle_names: Vec<&str> = (0..n)
+                .filter(|i| in_degree[*i] > 0)
+                .filter_map(|i| columns[i].name.as_deref())
+                .collect();
+            bail_parse_error!(
+                "circular dependency in generated columns: {}",
+                cycle_names.join(", ")
+            );
+        }
+
+        // Step 3: forward DP in topo order → transitive dependencies.
+        let mut dependencies = vec![ColumnMask::default(); n];
+        for &j in &topo {
+            dependencies[j] = direct_deps[j].clone();
+            for i in direct_deps[j].iter() {
+                let snapshot = dependencies[i].clone();
+                dependencies[j].union_with(&snapshot);
+            }
+        }
+
+        // Step 4: reverse DP → transitive dependents.
+        let mut dependents = vec![ColumnMask::default(); n];
+        for &i in topo.iter().rev() {
+            dependents[i] = direct_dependents[i].clone();
+            for j in direct_dependents[i].iter() {
+                let snapshot = dependents[j].clone();
+                dependents[i].union_with(&snapshot);
+            }
+        }
+
+        Ok(Self {
+            dependencies,
+            dependents,
+        })
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct BTreeTable {
     pub root_page: i64,
     pub name: String,
     pub primary_key_columns: Vec<(String, SortOrder)>,
-    pub columns: Vec<Column>,
+    /// Prefer mutating through [`BTreeTable::columns_mut`], which invalidates
+    /// [`BTreeTable::cached_graph`]. `pub(crate)` so struct-literal callers
+    /// inside this crate can construct tables without a builder; external
+    /// crates (bindings, CLI) must go through the accessors. Internal
+    /// mutations must still route through `columns_mut()` to keep the cache
+    /// consistent.
+    pub(crate) columns: Vec<Column>,
     pub has_rowid: bool,
     pub is_strict: bool,
     pub has_autoincrement: bool,
@@ -2243,9 +2351,21 @@ pub struct BTreeTable {
     pub rowid_alias_conflict_clause: Option<ResolveType>,
     pub has_virtual_columns: bool,
     pub logical_to_physical_map: Vec<usize>,
+    pub(crate) column_dependencies: ResetOnClone<OnceLock<GeneratedColGraph>>,
 }
 
 impl BTreeTable {
+    pub fn columns(&self) -> &[Column] {
+        &self.columns
+    }
+
+    /// Returns a mutable reference to the columns vector, invalidating the
+    /// cached dependency graph so it is rebuilt on the next query.
+    pub fn columns_mut(&mut self) -> &mut Vec<Column> {
+        self.column_dependencies.0 = OnceLock::new();
+        &mut self.columns
+    }
+
     /// Create a table reference for TypeCheck where custom type columns have
     /// their `ty_str` replaced with the base type name, and where virtual columns
     /// are skipped. This ensures TypeCheck validates the encoded value against the
@@ -2588,6 +2708,11 @@ impl BTreeTable {
     }
 
     pub fn prepare_generated_columns(&mut self) -> Result<()> {
+        // Any mutation of columns happened through `columns_mut()` upstream,
+        // which already reset the cache; rebuild here is lazy-on-next-access.
+        // Reset explicitly to cover callers that constructed this BTreeTable
+        // via struct literal and populated columns before calling us.
+        self.column_dependencies.0 = OnceLock::new();
         self.has_virtual_columns = self.columns.iter().any(|c| c.is_virtual_generated());
         if !self.has_virtual_columns {
             return Ok(());
@@ -2599,6 +2724,8 @@ impl BTreeTable {
                 *self.columns[i].generated_expr_mut().unwrap() = expr;
             }
         }
+        // Force eager cache build so cycle errors surface at CREATE TABLE / ALTER time.
+        self.column_graph()?;
         Ok(())
     }
 
@@ -2637,6 +2764,61 @@ impl BTreeTable {
         }
 
         Ok(())
+    }
+
+    fn column_graph(&self) -> Result<&GeneratedColGraph> {
+        if let Some(graph) = self.column_dependencies.0.get() {
+            return Ok(graph);
+        }
+        let graph = GeneratedColGraph::build(&self.columns)?;
+        // If a concurrent reader already initialized the cache, our `set` is a
+        // no-op and we return the already-stored value below. Either version is
+        // correct because the cache is a pure function of `self.columns`.
+        let _ = self.column_dependencies.0.set(graph);
+        Ok(self
+            .column_dependencies
+            .0
+            .get()
+            .expect("cached_graph was just initialized"))
+    }
+
+    pub(crate) fn columns_affected_by_update(
+        &self,
+        updated_cols: impl IntoIterator<Item = usize>,
+    ) -> Result<ColumnMask> {
+        let graph = self.column_graph()?;
+        let mut affected = ColumnMask::default();
+        for i in updated_cols {
+            affected.set(i);
+            if i < graph.dependents.len() {
+                let snapshot = graph.dependents[i].clone();
+                affected.union_with(&snapshot);
+            }
+        }
+        Ok(affected)
+    }
+
+    /// Returns a bitset containing the indexes of `targets` that are stored
+    /// columns, plus the stored columns that virtual `targets` transitively
+    /// depend on.
+    pub(crate) fn dependencies_of_columns(
+        &self,
+        targets: impl IntoIterator<Item = usize>,
+    ) -> Result<ColumnUsedMask> {
+        let graph = self.column_graph()?;
+        let mut deps = BitSet::default();
+        for j in targets {
+            if !self.columns[j].is_virtual_generated() {
+                deps.set(j);
+                continue;
+            }
+            for i in graph.dependencies[j].iter() {
+                if !self.columns[i].is_virtual_generated() {
+                    deps.set(i);
+                }
+            }
+        }
+        Ok(deps)
     }
 }
 
@@ -2760,128 +2942,32 @@ pub fn collect_column_dependencies_of_expr(expr: &Expr, columns: &[Column]) -> H
     refs
 }
 
-//TODO this computation be replaced with a table-level cache of column->dependencies, and then
-// columns_affected_by_update could just do a union of the dependencies of all columns.
-pub(crate) fn columns_affected_by_update(
-    columns: &[Column],
-    updated_cols: impl IntoIterator<Item = usize>,
-) -> ColumnMask {
-    let mut affected = ColumnMask::default();
-    for idx in updated_cols {
-        affected.set(idx);
-    }
-    let mut changed = true;
-    while changed {
-        changed = false;
-        for (idx, col) in columns.iter().enumerate() {
-            if affected.get(idx) {
-                continue;
-            }
-            let GeneratedType::Virtual { ref expr, .. } = col.generated_type() else {
-                continue;
-            };
-            if expr_refers_one_of(expr, columns, &affected) {
-                affected.set(idx);
-                changed = true;
-            }
-        }
-    }
-    affected
-}
-
-/// returns a bitset containing the indexes of `targets` and of the stored columns that the
-/// virtual columns in `targets` depend on.
-pub(crate) fn dependencies_of_columns(
-    columns: &[Column],
-    targets: impl IntoIterator<Item = usize>,
-) -> ColumnUsedMask {
-    fn collect_column_dependencies_of_gencol(expr: &Expr, columns: &[Column], out: &mut BitSet) {
-        let _ = walk_expr(expr, &mut |e| {
-            match e {
-                Expr::Column { table, column, .. } if table.is_self_table() => {
-                    out.set(*column);
-                }
-                Expr::Id(name) | Expr::Name(name) => {
-                    if let Some(idx) = find_column_index_by_name(columns, name.as_str()) {
-                        out.set(idx);
-                    }
-                }
-                Expr::Qualified(_, col) | Expr::DoublyQualified(_, _, col) => {
-                    if let Some(idx) = find_column_index_by_name(columns, col.as_str()) {
-                        out.set(idx);
-                    }
-                }
-                Expr::Subquery(_)
-                | Expr::Exists(_)
-                | Expr::InTable { .. }
-                | Expr::SubqueryResult { .. } => {
-                    unreachable!("generated columns cannot contain subqueries")
-                }
-                _ => {}
-            }
-            Ok(WalkControl::Continue)
-        });
-    }
-
-    let mut dependencies = BitSet::default();
-    let mut visited = BitSet::default();
-    let mut pending = BitSet::default();
-    for idx in targets {
-        pending.set(idx);
-    }
-    loop {
-        let mut next = BitSet::default();
-        for idx in pending.iter() {
-            if visited.get(idx) {
-                continue;
-            }
-            visited.set(idx);
-            if let GeneratedType::Virtual { ref expr, .. } = columns[idx].generated_type() {
-                collect_column_dependencies_of_gencol(expr, columns, &mut next);
-            } else {
-                dependencies.set(idx);
-            }
-        }
-        if next.is_empty() {
-            break;
-        }
-        pending = next;
-    }
-    dependencies
-}
-
-/// Returns true if `expr` references any column in `target_set`.
-fn expr_refers_one_of(expr: &Expr, columns: &[Column], target_set: &ColumnMask) -> bool {
-    let mut found = false;
+fn collect_column_dependencies_of_gencol(expr: &Expr, columns: &[Column], out: &mut BitSet) {
     let _ = walk_expr(expr, &mut |e| {
-        if found {
-            return Ok(WalkControl::SkipChildren);
-        }
         match e {
             Expr::Column { table, column, .. } if table.is_self_table() => {
-                found = target_set.get(*column);
-                Ok(WalkControl::Continue)
+                out.set(*column);
             }
             Expr::Id(name) | Expr::Name(name) => {
                 if let Some(idx) = find_column_index_by_name(columns, name.as_str()) {
-                    found = target_set.get(idx);
+                    out.set(idx);
                 }
-                Ok(WalkControl::Continue)
             }
             Expr::Qualified(_, col) | Expr::DoublyQualified(_, _, col) => {
                 if let Some(idx) = find_column_index_by_name(columns, col.as_str()) {
-                    found = target_set.get(idx);
+                    out.set(idx);
                 }
-                Ok(WalkControl::Continue)
             }
             Expr::Subquery(_)
             | Expr::Exists(_)
             | Expr::InTable { .. }
-            | Expr::SubqueryResult { .. } => Ok(WalkControl::SkipChildren),
-            _ => Ok(WalkControl::Continue),
+            | Expr::SubqueryResult { .. } => {
+                unreachable!("generated columns cannot contain subqueries")
+            }
+            _ => {}
         }
+        Ok(WalkControl::Continue)
     });
-    found
 }
 
 fn find_column_index_by_name(columns: &[Column], col_name: &str) -> Option<usize> {
@@ -2891,44 +2977,6 @@ fn find_column_index_by_name(columns: &[Column], col_name: &str) -> Option<usize
             .filter(|name| name.eq_ignore_ascii_case(col_name))
             .map(|_| i)
     })
-}
-
-fn has_transitive_dependency(start: &str, target: &str, columns: &[Column]) -> bool {
-    let mut visited = std::collections::HashSet::new();
-    has_transitive_dependency_inner(start, target, columns, &mut visited)
-}
-
-fn has_transitive_dependency_inner(
-    start: &str,
-    target: &str,
-    columns: &[Column],
-    visited: &mut std::collections::HashSet<String>,
-) -> bool {
-    if !visited.insert(start.to_owned()) {
-        return false;
-    }
-
-    let Some(col) = columns.iter().find(|c| c.name.as_deref() == Some(start)) else {
-        return false;
-    };
-
-    let GeneratedType::Virtual { ref expr, .. } = col.generated_type() else {
-        return false;
-    };
-
-    let deps = collect_column_refs(expr);
-
-    if deps.contains(target) {
-        return true;
-    }
-
-    for dep in deps {
-        if has_transitive_dependency_inner(&dep, target, columns, visited) {
-            return true;
-        }
-    }
-
-    false
 }
 
 /// Resolve [Expr::Id] / [Expr::Qualified] in a generated column expression to
@@ -3448,16 +3496,9 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
                     if referenced_cols.iter().any(|c| c == &current_col_name) {
                         bail_parse_error!("generated column \"{}\" cannot reference itself", name);
                     }
-
-                    for ref_col in &referenced_cols {
-                        if has_transitive_dependency(ref_col, &current_col_name, &cols) {
-                            bail_parse_error!(
-                                "circular dependency in generated columns \"{}\" and \"{}\"",
-                                name,
-                                ref_col
-                            );
-                        }
-                    }
+                    // Transitive-cycle detection happens inside
+                    // `prepare_generated_columns()` via Kahn's algorithm when
+                    // `GeneratedColGraph::build` is forced.
                 }
 
                 if primary_key {
@@ -3626,6 +3667,7 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
         rowid_alias_conflict_clause,
         has_virtual_columns: false,
         logical_to_physical_map: Vec::new(),
+        column_dependencies: Default::default(),
     };
     table.prepare_generated_columns()?;
     table.logical_to_physical_map = BTreeTable::build_logical_to_physical_map(&table.columns);
@@ -3717,7 +3759,7 @@ impl ResolvedFkRef {
         &self,
         updated_parent_positions: &ColumnMask,
         parent_tbl: &BTreeTable,
-    ) -> bool {
+    ) -> Result<bool> {
         if self.parent_uses_rowid {
             // parent rowid changes if the parent's rowid or alias is updated
             if let Some((idx, _)) = parent_tbl
@@ -3726,13 +3768,13 @@ impl ResolvedFkRef {
                 .enumerate()
                 .find(|(_, c)| c.is_rowid_alias())
             {
-                return updated_parent_positions.get(idx);
+                return Ok(updated_parent_positions.get(idx));
             }
             // Without a rowid alias, a direct rowid update is represented separately with ROWID_SENTINEL
-            return true;
+            return Ok(true);
         }
-        let affected = columns_affected_by_update(&parent_tbl.columns, updated_parent_positions);
-        self.parent_pos.iter().any(|p| affected.get(*p))
+        let affected = parent_tbl.columns_affected_by_update(updated_parent_positions)?;
+        Ok(self.parent_pos.iter().any(|p| affected.get(*p)))
     }
 
     /// Returns if any child column of this FK is in `updated_child_positions`
@@ -4232,6 +4274,7 @@ pub fn sqlite_schema_table() -> BTreeTable {
         unique_sets: vec![],
         has_virtual_columns: false,
         logical_to_physical_map,
+        column_dependencies: Default::default(),
     }
 }
 
@@ -5014,6 +5057,7 @@ mod tests {
             rowid_alias_conflict_clause: None,
             has_virtual_columns: false,
             logical_to_physical_map,
+            column_dependencies: Default::default(),
         };
 
         let result = Index::automatic_from_primary_key(
@@ -5328,5 +5372,264 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("generated columns"));
+    }
+
+    // --- generated-column dependency graph ---
+
+    fn indices(mask: &ColumnMask) -> Vec<usize> {
+        let mut v: Vec<usize> = mask.iter().collect();
+        v.sort_unstable();
+        v
+    }
+
+    fn stored(bits: &BitSet) -> Vec<usize> {
+        let mut v: Vec<usize> = bits.iter().collect();
+        v.sort_unstable();
+        v
+    }
+
+    #[test]
+    fn gencol_graph_no_virtual_columns() -> Result<()> {
+        let t = BTreeTable::from_sql("CREATE TABLE t(a, b)", 0)?;
+        assert_eq!(indices(&t.columns_affected_by_update([0])?), vec![0]);
+        assert_eq!(indices(&t.columns_affected_by_update([0, 1])?), vec![0, 1]);
+        assert_eq!(stored(&t.dependencies_of_columns([0])?), vec![0]);
+        assert_eq!(stored(&t.dependencies_of_columns([])?), Vec::<usize>::new());
+        Ok(())
+    }
+
+    #[test]
+    fn gencol_graph_linear_chain() -> Result<()> {
+        let t = BTreeTable::from_sql("CREATE TABLE t(a, b AS (a) VIRTUAL, c AS (b) VIRTUAL)", 0)?;
+        // affected-by({a}) = {a, b, c}
+        assert_eq!(indices(&t.columns_affected_by_update([0])?), vec![0, 1, 2]);
+        // affected-by({b}) = {b, c} (b is virtual, but updating it still propagates through dependents)
+        assert_eq!(indices(&t.columns_affected_by_update([1])?), vec![1, 2]);
+        // deps-of({c}) = {a} (transitive stored deps of virtual c)
+        assert_eq!(stored(&t.dependencies_of_columns([2])?), vec![0]);
+        // deps-of({b}) = {a}
+        assert_eq!(stored(&t.dependencies_of_columns([1])?), vec![0]);
+        // deps-of({a}) = {a} (stored target included)
+        assert_eq!(stored(&t.dependencies_of_columns([0])?), vec![0]);
+        Ok(())
+    }
+
+    #[test]
+    fn gencol_graph_diamond() -> Result<()> {
+        let t = BTreeTable::from_sql(
+            "CREATE TABLE t(a, b AS (a) VIRTUAL, c AS (a) VIRTUAL, d AS (b + c) VIRTUAL)",
+            0,
+        )?;
+        assert_eq!(
+            indices(&t.columns_affected_by_update([0])?),
+            vec![0, 1, 2, 3]
+        );
+        assert_eq!(stored(&t.dependencies_of_columns([3])?), vec![0]);
+        assert_eq!(stored(&t.dependencies_of_columns([1])?), vec![0]);
+        Ok(())
+    }
+
+    #[test]
+    fn gencol_graph_multiple_stored_roots() -> Result<()> {
+        let t = BTreeTable::from_sql("CREATE TABLE t(a, b, c AS (a + b) VIRTUAL)", 0)?;
+        assert_eq!(indices(&t.columns_affected_by_update([0])?), vec![0, 2]);
+        assert_eq!(indices(&t.columns_affected_by_update([1])?), vec![1, 2]);
+        assert_eq!(
+            indices(&t.columns_affected_by_update([0, 1])?),
+            vec![0, 1, 2]
+        );
+        assert_eq!(stored(&t.dependencies_of_columns([2])?), vec![0, 1]);
+        Ok(())
+    }
+
+    #[test]
+    fn gencol_graph_empty_input() -> Result<()> {
+        let t = BTreeTable::from_sql("CREATE TABLE t(a, b AS (a) VIRTUAL)", 0)?;
+        assert!(t.columns_affected_by_update(std::iter::empty())?.is_empty());
+        assert!(t.dependencies_of_columns(std::iter::empty())?.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn gencol_graph_disjoint_components() -> Result<()> {
+        let t = BTreeTable::from_sql(
+            "CREATE TABLE t(a, b AS (a) VIRTUAL, c, d AS (c) VIRTUAL)",
+            0,
+        )?;
+        assert_eq!(indices(&t.columns_affected_by_update([0])?), vec![0, 1]);
+        assert_eq!(indices(&t.columns_affected_by_update([2])?), vec![2, 3]);
+        assert_eq!(stored(&t.dependencies_of_columns([1])?), vec![0]);
+        assert_eq!(stored(&t.dependencies_of_columns([3])?), vec![2]);
+        Ok(())
+    }
+
+    #[test]
+    fn gencol_graph_deep_chain() -> Result<()> {
+        // Build 50-long chain: c0 (stored), c1 := c0, c2 := c1, ... c49 := c48.
+        let mut sql = String::from("CREATE TABLE t(c0");
+        for i in 1..50 {
+            sql.push_str(&format!(", c{i} AS (c{prev}) VIRTUAL", prev = i - 1));
+        }
+        sql.push(')');
+        let t = BTreeTable::from_sql(&sql, 0)?;
+        // affected-by({c0}) = {c0..c49}
+        let affected = t.columns_affected_by_update([0])?;
+        assert_eq!(affected.count(), 50);
+        // deps-of({c49}) = {c0}
+        assert_eq!(stored(&t.dependencies_of_columns([49])?), vec![0]);
+        Ok(())
+    }
+
+    #[test]
+    fn gencol_graph_very_deep_chain_no_stack_overflow() -> Result<()> {
+        // Validates that the iterative Kahn's + DP don't blow the stack on
+        // realistic worst-case generated-column depth.
+        let mut sql = String::from("CREATE TABLE t(c0");
+        for i in 1..500 {
+            sql.push_str(&format!(", c{i} AS (c{prev}) VIRTUAL", prev = i - 1));
+        }
+        sql.push(')');
+        let t = BTreeTable::from_sql(&sql, 0)?;
+        assert_eq!(t.columns_affected_by_update([0])?.count(), 500);
+        assert_eq!(stored(&t.dependencies_of_columns([499])?), vec![0]);
+        Ok(())
+    }
+
+    #[test]
+    fn gencol_graph_rowid_sentinel_passthrough() -> Result<()> {
+        let t = BTreeTable::from_sql("CREATE TABLE t(a, b AS (a) VIRTUAL)", 0)?;
+        let affected = t.columns_affected_by_update([ROWID_SENTINEL])?;
+        // ROWID_SENTINEL is preserved in the mask flag but does not propagate through the graph
+        // (no generated column can depend on ROWID_SENTINEL directly).
+        assert!(affected.get(ROWID_SENTINEL));
+        assert_eq!(affected.count(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn gencol_graph_transpose_duality() -> Result<()> {
+        let t = BTreeTable::from_sql(
+            "CREATE TABLE t(a, b AS (a) VIRTUAL, c AS (b) VIRTUAL, d AS (a + c) VIRTUAL)",
+            0,
+        )?;
+        let graph = t.column_graph()?;
+        // j ∈ dependencies[i] iff i ∈ dependents[j]
+        for i in 0..graph.dependencies.len() {
+            for j in graph.dependencies[i].iter() {
+                assert!(
+                    graph.dependents[j].get(i),
+                    "transpose violated: {j} is in dependencies[{i}] but {i} is not in dependents[{j}]"
+                );
+            }
+            for j in graph.dependents[i].iter() {
+                assert!(
+                    graph.dependencies[j].get(i),
+                    "transpose violated: {j} is in dependents[{i}] but {i} is not in dependencies[{j}]"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn gencol_graph_idempotence() -> Result<()> {
+        // affected_by(affected_by(xs)) == affected_by(xs).
+        let t = BTreeTable::from_sql(
+            "CREATE TABLE t(a, b, c AS (a) VIRTUAL, d AS (b + c) VIRTUAL)",
+            0,
+        )?;
+        let once = t.columns_affected_by_update([0, 1])?;
+        let twice = t.columns_affected_by_update(once.iter())?;
+        assert_eq!(indices(&twice), indices(&once));
+        Ok(())
+    }
+
+    #[test]
+    fn gencol_graph_union_monotonicity() -> Result<()> {
+        // affected_by(A ∪ B) == affected_by(A) ∪ affected_by(B).
+        let t = BTreeTable::from_sql(
+            "CREATE TABLE t(a, b, c AS (a) VIRTUAL, d AS (b) VIRTUAL, e AS (c + d) VIRTUAL)",
+            0,
+        )?;
+        let mut expected = t.columns_affected_by_update([0])?;
+        let b_mask = t.columns_affected_by_update([1])?;
+        expected.union_with(&b_mask);
+        let union_mask = t.columns_affected_by_update([0, 1])?;
+        assert_eq!(indices(&union_mask), indices(&expected));
+        Ok(())
+    }
+
+    #[test]
+    fn gencol_graph_cycle_rejected() {
+        // Two-cycle: a := b, b := a. Must be rejected at CREATE TABLE time by Kahn's.
+        let err = BTreeTable::from_sql(
+            "CREATE TABLE t(stored, a AS (b) VIRTUAL, b AS (a) VIRTUAL)",
+            0,
+        )
+        .expect_err("cycle must be rejected");
+        assert!(
+            err.to_string().contains("circular dependency")
+                || err.to_string().contains("cannot reference itself"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn gencol_graph_three_cycle_rejected() {
+        // Three-cycle: a := b, b := c, c := a.
+        let err = BTreeTable::from_sql(
+            "CREATE TABLE t(stored, a AS (b) VIRTUAL, b AS (c) VIRTUAL, c AS (a) VIRTUAL)",
+            0,
+        )
+        .expect_err("cycle must be rejected");
+        assert!(err.to_string().contains("circular dependency"));
+    }
+
+    #[test]
+    fn gencol_graph_self_reference_rejected() {
+        let err = BTreeTable::from_sql("CREATE TABLE t(a, b AS (b) VIRTUAL)", 0)
+            .expect_err("self-reference must be rejected");
+        assert!(err.to_string().contains("cannot reference itself"));
+    }
+
+    #[test]
+    #[allow(clippy::redundant_clone)]
+    fn gencol_graph_clone_invalidates_cache() -> Result<()> {
+        // After cloning a BTreeTable, the cache is fresh. Mutating columns on
+        // the clone via `columns_mut()` keeps it fresh; `prepare_generated_columns`
+        // rebuilds correctly.
+        let original = BTreeTable::from_sql("CREATE TABLE t(a, b AS (a) VIRTUAL)", 0)?;
+        // Force the cache to be populated on the original.
+        let _ = original.columns_affected_by_update([0])?;
+        assert!(original.column_dependencies.0.get().is_some());
+
+        // Clone: ResetOnClone makes the cloned cache empty. We keep a real clone
+        // (not a move) because the point of the test is that Clone produces a
+        // fresh cache independently from the original.
+        let cloned = original.clone();
+        assert!(cloned.column_dependencies.0.get().is_none());
+        // Original's cache is still populated — clone didn't touch it.
+        assert!(original.column_dependencies.0.get().is_some());
+
+        // The clone still returns correct results — cache rebuilds lazily.
+        assert_eq!(
+            indices(&cloned.columns_affected_by_update([0])?),
+            vec![0, 1]
+        );
+        assert!(cloned.column_dependencies.0.get().is_some());
+        Ok(())
+    }
+
+    #[test]
+    fn gencol_graph_columns_mut_invalidates_cache() -> Result<()> {
+        let mut t = BTreeTable::from_sql("CREATE TABLE t(a, b AS (a) VIRTUAL)", 0)?;
+        // Force the cache to be populated.
+        let _ = t.columns_affected_by_update([0])?;
+        assert!(t.column_dependencies.0.get().is_some());
+
+        // Any access through columns_mut() wipes the cache, even if we don't mutate.
+        let _ = t.columns_mut();
+        assert!(t.column_dependencies.0.get().is_none());
+        Ok(())
     }
 }

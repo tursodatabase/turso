@@ -19,7 +19,6 @@ use super::order_by::SortMetadata;
 use super::plan::{BitSet, HashJoinType, TableReferences};
 use crate::error::SQLITE_CONSTRAINT_CHECK;
 use crate::function::Func;
-use crate::schema::dependencies_of_columns;
 use crate::schema::{
     BTreeTable, CheckConstraint, Column, ColumnLayout, GeneratedType, IndexColumn, Schema, Table,
 };
@@ -1634,18 +1633,17 @@ fn rewrite_where_for_update_registers(
 /// Emits  `target_columns`, plus the stored columns needed by `target_columns`, into compact
 /// registers. This takes into account stored columns, and any stored columns required
 /// by virtual columns in `target_columns`.
-#[must_use]
 pub(crate) fn emit_columns_and_dependencies(
     program: &mut ProgramBuilder,
     table: &BTreeTable,
     cursor_id: usize,
     rowid_reg: usize,
     target_columns: impl IntoIterator<Item = usize>,
-) -> DmlColumnContext {
-    let dependencies = dependencies_of_columns(&table.columns, target_columns);
+) -> Result<DmlColumnContext> {
+    let dependencies = table.dependencies_of_columns(target_columns)?;
     let base = program.alloc_registers(dependencies.count());
     let mut next_reg = base;
-    let pairs = table.columns.iter().enumerate().map(|(idx, col)| {
+    let pairs = table.columns().iter().enumerate().map(|(idx, col)| {
         let reg = if col.is_rowid_alias() {
             rowid_reg
         } else if dependencies.get(idx) {
@@ -1658,7 +1656,7 @@ pub(crate) fn emit_columns_and_dependencies(
         };
         (col, reg)
     });
-    DmlColumnContext::from_column_reg_mapping(pairs)
+    Ok(DmlColumnContext::from_column_reg_mapping(pairs))
 }
 
 /// Emit code to load the value of an IndexColumn from the OLD image of the row being updated.
@@ -1729,7 +1727,7 @@ fn generated_column(
         .cloned()
         .flat_map(|table| {
             table
-                .columns
+                .columns()
                 .get(idx_col.pos_in_table)
                 .filter(|col| col.is_virtual_generated())
                 .cloned()

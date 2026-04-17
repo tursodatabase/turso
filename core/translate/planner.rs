@@ -1072,6 +1072,7 @@ fn parse_table(
             rowid_alias_conflict_clause: None,
             has_virtual_columns: false,
             logical_to_physical_map,
+            column_dependencies: Default::default(),
         });
         drop(view_guard);
 

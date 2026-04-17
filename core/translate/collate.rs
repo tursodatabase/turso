@@ -536,6 +536,7 @@ mod tests {
             rowid_alias_conflict_clause: None,
             has_virtual_columns: false,
             logical_to_physical_map,
+            column_dependencies: Default::default(),
         }));
         table_references.add_joined_table(JoinedTable {
             op: Operation::Scan(Scan::BTreeTable {
@@ -598,6 +599,7 @@ mod tests {
                 rowid_alias_conflict_clause: None,
                 has_virtual_columns: false,
                 logical_to_physical_map,
+                column_dependencies: Default::default(),
             })),
             indexed: None,
         });
@@ -638,6 +640,7 @@ mod tests {
                 rowid_alias_conflict_clause: None,
                 has_virtual_columns: false,
                 logical_to_physical_map,
+                column_dependencies: Default::default(),
             })),
             indexed: None,
         });
@@ -693,6 +696,7 @@ mod tests {
                 rowid_alias_conflict_clause: None,
                 has_virtual_columns: false,
                 logical_to_physical_map,
+                column_dependencies: Default::default(),
             })),
         });
         table_references

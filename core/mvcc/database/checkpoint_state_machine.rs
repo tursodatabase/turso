@@ -273,7 +273,7 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
             );
             (
                 mvstore.get_table_id_from_root_page(table.root_page),
-                table.columns.len(),
+                table.columns().len(),
             )
         });
         let durable_mvcc_metadata =

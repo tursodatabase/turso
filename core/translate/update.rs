@@ -1,7 +1,7 @@
 use crate::sync::Arc;
 use rustc_hash::FxHashMap as HashMap;
 
-use crate::schema::{columns_affected_by_update, ROWID_SENTINEL};
+use crate::schema::ROWID_SENTINEL;
 use crate::translate::emitter::Resolver;
 use crate::translate::expr::{bind_and_rewrite_expr, BindingBehavior};
 use crate::translate::expression_index::expression_index_column_usage;
@@ -449,10 +449,13 @@ pub fn prepare_update_plan(
     let rowid_alias_used = set_clauses
         .iter()
         .any(|(idx, _)| *idx == ROWID_SENTINEL || columns[*idx].is_rowid_alias());
-    let updated_cols = (!rowid_alias_used).then(|| set_clauses.iter().map(|(i, _)| *i).collect());
-    let affected_cols = updated_cols
-        .as_ref()
-        .map(|updated_cols: &ColumnMask| columns_affected_by_update(columns, updated_cols));
+    let updated_cols: Option<ColumnMask> =
+        (!rowid_alias_used).then(|| set_clauses.iter().map(|(i, _)| *i).collect());
+    let affected_cols = match (table.btree(), updated_cols.as_ref()) {
+        (Some(bt), Some(updated)) => Some(bt.columns_affected_by_update(updated)?),
+        (None, Some(updated)) => Some(updated.clone()),
+        _ => None,
+    };
     let mut indexes_to_update = Vec::new();
 
     for idx in indexes {

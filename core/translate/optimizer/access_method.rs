@@ -575,7 +575,7 @@ pub(super) fn choose_best_in_seek_candidate(
 
             let affinity = if let Some(col_pos) = constraint.table_col_pos {
                 btree
-                    .columns
+                    .columns()
                     .get(col_pos)
                     .map(|col| col.affinity())
                     .unwrap_or(Affinity::Blob)

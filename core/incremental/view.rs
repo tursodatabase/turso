@@ -703,7 +703,7 @@ impl IncrementalView {
 
         for table in referenced_tables {
             // Check if the table has a rowid alias (INTEGER PRIMARY KEY column)
-            let has_rowid_alias = table.columns.iter().any(|col| col.is_rowid_alias());
+            let has_rowid_alias = table.columns().iter().any(|col| col.is_rowid_alias());
 
             // Select all columns. The circuit will handle filtering and projection
             // If there's a rowid alias, we don't need to select rowid separately
@@ -1098,7 +1098,7 @@ impl IncrementalView {
                     for table_name in all_tables {
                         if let Some(table) = schema.get_btree_table(table_name) {
                             if table
-                                .columns
+                                .columns()
                                 .iter()
                                 .any(|col| col.name.as_deref() == Some(column.as_str()))
                             {
@@ -1465,6 +1465,7 @@ mod tests {
             has_autoincrement: false,
             has_virtual_columns: false,
             logical_to_physical_map,
+            column_dependencies: Default::default(),
         };
 
         // Create orders table
@@ -1515,6 +1516,7 @@ mod tests {
             unique_sets: vec![],
             has_virtual_columns: false,
             logical_to_physical_map,
+            column_dependencies: Default::default(),
         };
 
         // Create products table
@@ -1561,6 +1563,7 @@ mod tests {
             unique_sets: vec![],
             has_virtual_columns: false,
             logical_to_physical_map,
+            column_dependencies: Default::default(),
         };
 
         // Create logs table - without a rowid alias (no INTEGER PRIMARY KEY)
@@ -1600,6 +1603,7 @@ mod tests {
             unique_sets: vec![],
             has_virtual_columns: false,
             logical_to_physical_map,
+            column_dependencies: Default::default(),
         };
 
         schema

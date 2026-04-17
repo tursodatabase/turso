@@ -1114,9 +1114,9 @@ pub fn op_open_read(
     }
     let cursors = &mut state.cursors;
     let num_columns = match cursor_type {
-        CursorType::BTreeTable(table_rc) => table_rc.columns.len(),
+        CursorType::BTreeTable(table_rc) => table_rc.columns().len(),
         CursorType::BTreeIndex(index_arc) => index_arc.columns.len(),
-        CursorType::MaterializedView(table_rc, _) => table_rc.columns.len(),
+        CursorType::MaterializedView(table_rc, _) => table_rc.columns().len(),
         _ => unreachable!("This should not have happened"),
     };
 
@@ -1889,7 +1889,7 @@ pub fn op_type_check(
     assert!(table_reference.is_strict);
     state.registers[*start_reg..*start_reg + *count]
         .iter_mut()
-        .zip(table_reference.columns.iter())
+        .zip(table_reference.columns().iter())
         .try_for_each(|(reg, col)| {
             // INT PRIMARY KEY is not row_id_alias so we throw error if this col is NULL
             if !col.is_rowid_alias() && col.primary_key() && matches!(reg.get_value(), Value::Null)
@@ -10079,8 +10079,8 @@ pub fn op_open_write(
                 .replace(Cursor::new_btree(cursor));
         } else {
             let num_columns = match cursor_type {
-                CursorType::BTreeTable(table_rc) => table_rc.columns.len(),
-                CursorType::MaterializedView(table_rc, _) => table_rc.columns.len(),
+                CursorType::BTreeTable(table_rc) => table_rc.columns().len(),
+                CursorType::MaterializedView(table_rc, _) => table_rc.columns().len(),
                 _ => unreachable!(
                     "Expected BTreeTable or MaterializedView. This should not have happened."
                 ),
@@ -11540,7 +11540,7 @@ pub fn op_open_ephemeral(
                 .expect("cursor_id should exist in cursor_ref");
 
             let num_columns = match cursor_type {
-                CursorType::BTreeTable(table_rc) => table_rc.columns.len(),
+                CursorType::BTreeTable(table_rc) => table_rc.columns().len(),
                 CursorType::BTreeIndex(index_arc) => index_arc.columns.len(),
                 _ => unreachable!("This should not have happened"),
             };
@@ -11654,7 +11654,7 @@ pub fn op_open_dup(
             let cursor = Box::new(BTreeCursor::new_table(
                 pager,
                 maybe_transform_root_page_to_positive(mv_store.as_ref(), root_page),
-                table.columns.len(),
+                table.columns().len(),
             ));
             let cursor: Box<dyn CursorTrait> = if !is_ephemeral {
                 if let Some(tx_id) = program.connection.get_mv_tx_id() {
@@ -12326,9 +12326,9 @@ pub fn op_drop_column(
         };
 
         let btree = Arc::make_mut(btree);
-        btree.columns.remove(*column_index);
+        btree.columns_mut().remove(*column_index);
         btree.logical_to_physical_map =
-            crate::schema::BTreeTable::build_logical_to_physical_map(&btree.columns);
+            crate::schema::BTreeTable::build_logical_to_physical_map(btree.columns());
         // Remove column-level CHECK constraints for the dropped column
         let col_name = column_name.clone();
         btree.check_constraints.retain(|c| {
@@ -12337,7 +12337,7 @@ pub fn op_drop_column(
                 .is_none_or(|col| normalize_ident(col) != normalize_ident(&col_name))
         });
 
-        btree.has_virtual_columns = btree.columns.iter().any(|c| c.is_virtual_generated());
+        btree.has_virtual_columns = btree.columns().iter().any(|c| c.is_virtual_generated());
         btree.shift_generated_column_indices_after_drop(*column_index)?;
         Ok(())
     })?;
@@ -12424,9 +12424,9 @@ pub fn op_add_column(
         };
 
         let btree = Arc::make_mut(btree);
-        btree.columns.push((**column).clone());
+        btree.columns_mut().push((**column).clone());
         btree.logical_to_physical_map =
-            crate::schema::BTreeTable::build_logical_to_physical_map(&btree.columns);
+            crate::schema::BTreeTable::build_logical_to_physical_map(btree.columns());
         // Update CHECK constraints to include any constraints from the new column
         btree.check_constraints.clone_from(check_constraints);
         // Update foreign keys to include any FK constraints from the new column
@@ -12540,7 +12540,7 @@ pub fn op_alter_column(
         };
         let btree = Arc::make_mut(btree_arc);
         let existing_column_name = btree
-            .columns
+            .columns()
             .get(*column_index)
             .expect("column being ALTERed should be in schema");
         let existing_column_name = existing_column_name
@@ -12565,14 +12565,14 @@ pub fn op_alter_column(
             }
         }
         if *rename {
-            btree.columns[*column_index].name = Some(new_name.clone());
+            btree.columns_mut()[*column_index].name = Some(new_name.clone());
         } else {
-            btree.columns[*column_index] = new_column.clone();
+            btree.columns_mut()[*column_index] = new_column.clone();
         }
 
         btree.prepare_generated_columns()?;
         btree.logical_to_physical_map =
-            crate::schema::BTreeTable::build_logical_to_physical_map(&btree.columns);
+            crate::schema::BTreeTable::build_logical_to_physical_map(btree.columns());
 
         // Keep primary_key_columns consistent (names may change on rename)
         for (pk_name, _ord) in &mut btree.primary_key_columns {
@@ -12604,7 +12604,7 @@ pub fn op_alter_column(
         // Maintain rowid-alias bit after change/rename (INTEGER PRIMARY KEY)
         if !*rename {
             // recompute alias from `new_column`
-            btree.columns[*column_index].set_rowid_alias(new_column.is_rowid_alias());
+            btree.columns_mut()[*column_index].set_rowid_alias(new_column.is_rowid_alias());
         }
 
         // Update this table's OWN foreign keys

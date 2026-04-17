@@ -228,7 +228,7 @@ pub(crate) fn set_update_stmt_journal_flags(
             return false;
         }
         btree_table
-            .columns
+            .columns()
             .get(*col_idx)
             .is_some_and(|c| c.notnull() && !c.is_rowid_alias())
     });

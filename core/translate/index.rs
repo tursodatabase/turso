@@ -136,7 +136,7 @@ pub fn translate_create_index(
     for col in &columns {
         if col.expr.is_none() {
             // Simple column reference (not expression index)
-            if let Some(column) = tbl.columns.get(col.pos_in_table) {
+            if let Some(column) = tbl.columns().get(col.pos_in_table) {
                 if let Some(type_def) = resolver
                     .schema()
                     .get_type_def(&column.ty_str, tbl.is_strict)
@@ -222,7 +222,7 @@ pub fn translate_create_index(
     );
     let sorter_cursor_id = program.alloc_cursor_id(CursorType::Sorter);
     let pseudo_cursor_id = program.alloc_cursor_id(CursorType::Pseudo(PseudoCursorType {
-        column_count: tbl.columns.len(),
+        column_count: tbl.columns().len(),
     }));
 
     let mut table_references = TableReferences::new(
@@ -680,7 +680,7 @@ fn validate_index_expression(expr: &Expr, table: &BTreeTable) -> bool {
     let has_col = |name: &str| {
         let n = normalize_ident(name);
         table
-            .columns
+            .columns()
             .iter()
             .any(|c| c.name.as_ref().is_some_and(|cn| normalize_ident(cn) == n))
     };
@@ -1030,7 +1030,7 @@ pub fn translate_drop_index(
         let before_record_reg = if program.capture_data_changes_info().has_before() {
             Some(emit_cdc_full_record(
                 program,
-                &sqlite_table.columns,
+                sqlite_table.columns(),
                 sqlite_schema_cursor_id,
                 row_id_reg,
                 sqlite_table.is_strict,

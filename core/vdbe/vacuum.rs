@@ -793,7 +793,7 @@ pub(crate) fn build_copy_sql(
     // Collect non-virtual-generated columns with their quoted names.
     let mut data_columns: Vec<String> = Vec::new();
     let mut rowid_alias_col_idx: Option<usize> = None;
-    for (i, col) in btree.columns.iter().enumerate() {
+    for (i, col) in btree.columns().iter().enumerate() {
         if col.is_virtual_generated() {
             continue;
         }
@@ -838,7 +838,7 @@ pub(crate) fn build_copy_sql(
             // Remove the rowid alias column from data_columns (it IS the rowid)
             let mut filtered: Vec<&str> = Vec::new();
             let mut col_physical_idx = 0;
-            for (i, col) in btree.columns.iter().enumerate() {
+            for (i, col) in btree.columns().iter().enumerate() {
                 if col.is_virtual_generated() {
                     continue;
                 }

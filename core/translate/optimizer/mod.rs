@@ -15,9 +15,7 @@ use crate::{
     function::{AggFunc, Deterministic},
     index_method::IndexMethodCostEstimate,
     numeric::Numeric,
-    schema::{
-        columns_affected_by_update, BTreeTable, Index, IndexColumn, Schema, Table, ROWID_SENTINEL,
-    },
+    schema::{BTreeTable, Index, IndexColumn, Schema, Table, ROWID_SENTINEL},
     translate::{
         insert::ROWID_COLUMN,
         optimizer::{
@@ -859,7 +857,7 @@ fn first_update_safety_reason(
 
         let Some(index) = table_ref.op.index() else {
             let rowid_alias_used = plan.set_clauses.iter().fold(false, |accum, (idx, _)| {
-                accum || (*idx != ROWID_SENTINEL && btree_table.columns[*idx].is_rowid_alias())
+                accum || (*idx != ROWID_SENTINEL && btree_table.columns()[*idx].is_rowid_alias())
             });
             if rowid_alias_used {
                 break 'requires Some(DmlSafetyReason::KeyMutation);
@@ -886,7 +884,7 @@ fn first_update_safety_reason(
             }
         }
 
-        let affected_cols = columns_affected_by_update(&btree_table.columns, &updated_cols);
+        let affected_cols = btree_table.columns_affected_by_update(&updated_cols)?;
         if index
             .columns
             .iter()
@@ -961,6 +959,7 @@ fn add_ephemeral_table_to_update_plan(
         rowid_alias_conflict_clause: None,
         has_virtual_columns: false,
         logical_to_physical_map,
+        column_dependencies: Default::default(),
     });
 
     let temp_cursor_id = program.alloc_cursor_id_keyed(

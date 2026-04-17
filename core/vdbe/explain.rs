@@ -580,7 +580,7 @@ pub fn insn_to_row(
                 let cursor_type = &program.cursor_ref[*cursor_id].1;
                 let column_name: Option<&String> = match cursor_type {
                     CursorType::BTreeTable(table) => {
-                        let name = table.columns.get(*column).and_then(|v| v.name.as_ref());
+                        let name = table.columns().get(*column).and_then(|v| v.name.as_ref());
                         name
                     }
                     CursorType::BTreeIndex(index) => {
@@ -588,7 +588,7 @@ pub fn insn_to_row(
                         Some(name)
                     }
                     CursorType::MaterializedView(table, _) => {
-                        let name = table.columns.get(*column).and_then(|v| v.name.as_ref());
+                        let name = table.columns().get(*column).and_then(|v| v.name.as_ref());
                         name
                     }
                     CursorType::Pseudo(_) => None,
