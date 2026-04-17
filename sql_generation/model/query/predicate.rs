@@ -34,33 +34,27 @@ impl Predicate {
     }
 
     pub fn and(predicates: Vec<Predicate>) -> Self {
-        if predicates.is_empty() {
-            Self::true_()
-        } else if predicates.len() == 1 {
-            predicates.into_iter().next().unwrap().parens()
-        } else {
-            let expr = ast::Expr::Binary(
-                Box::new(predicates[0].0.clone()),
-                ast::Operator::And,
-                Box::new(Self::and(predicates[1..].to_vec()).0),
-            );
+        let mut predicates = predicates.into_iter();
+        let Some(first) = predicates.next() else {
+            return Self::true_();
+        };
+
+        predicates.fold(first.parens(), |lhs, rhs| {
+            let expr = ast::Expr::Binary(Box::new(lhs.0), ast::Operator::And, Box::new(rhs.0));
             Self(expr).parens()
-        }
+        })
     }
 
     pub fn or(predicates: Vec<Predicate>) -> Self {
-        if predicates.is_empty() {
-            Self::false_()
-        } else if predicates.len() == 1 {
-            predicates.into_iter().next().unwrap().parens()
-        } else {
-            let expr = ast::Expr::Binary(
-                Box::new(predicates[0].0.clone()),
-                ast::Operator::Or,
-                Box::new(Self::or(predicates[1..].to_vec()).0),
-            );
+        let mut predicates = predicates.into_iter();
+        let Some(first) = predicates.next() else {
+            return Self::false_();
+        };
+
+        predicates.fold(first.parens(), |lhs, rhs| {
+            let expr = ast::Expr::Binary(Box::new(lhs.0), ast::Operator::Or, Box::new(rhs.0));
             Self(expr).parens()
-        }
+        })
     }
 
     pub fn eq(lhs: Predicate, rhs: Predicate) -> Self {
@@ -110,16 +104,14 @@ pub fn expr_to_value<T: TableContext>(
     match expr {
         ast::Expr::DoublyQualified(_, _, col_name)
         | ast::Expr::Qualified(_, col_name)
-        | ast::Expr::Id(col_name) => {
-            let columns = table.columns().collect::<Vec<_>>();
+        | ast::Expr::Id(col_name)
+        | ast::Expr::Name(col_name) => {
             let col_name = col_name.as_str();
-            assert_eq!(row.len(), columns.len());
-            columns
-                .iter()
-                .zip(row.iter())
-                .find(|(column, _)| column.column.name == col_name)
-                .map(|(_, value)| value)
-                .cloned()
+            assert_eq!(row.len(), table.columns().count());
+            table
+                .columns()
+                .position(|c| c.column.name.eq_ignore_ascii_case(col_name))
+                .map(|idx| row[idx].clone())
         }
         ast::Expr::Literal(literal) => Some(literal.into()),
         ast::Expr::Binary(lhs, op, rhs) => {
@@ -147,6 +139,36 @@ pub fn expr_to_value<T: TableContext>(
         ast::Expr::Parenthesized(exprs) => {
             assert_eq!(exprs.len(), 1);
             expr_to_value(&exprs[0], row, table)
+        }
+        ast::Expr::FunctionCall {
+            name,
+            distinctness: _,
+            args,
+            order_by: _,
+            filter_over: _,
+        } => {
+            let name = name.as_str();
+            if name.eq_ignore_ascii_case("abs") && args.len() == 1 {
+                let val = expr_to_value(args[0].as_ref(), row, table)?;
+                val.0.exec_abs().ok().map(SimValue)
+            } else if (name.eq_ignore_ascii_case("substr")
+                || name.eq_ignore_ascii_case("substring"))
+                && (args.len() == 2 || args.len() == 3)
+            {
+                let value = expr_to_value(args[0].as_ref(), row, table)?;
+                let start = expr_to_value(args[1].as_ref(), row, table)?;
+                let len = args
+                    .get(2)
+                    .and_then(|a| expr_to_value(a.as_ref(), row, table));
+                let out = turso_core::Value::exec_substring(
+                    &value.0,
+                    &start.0,
+                    len.as_ref().map(|v| &v.0),
+                );
+                Some(SimValue(out))
+            } else {
+                None
+            }
         }
         _ => unreachable!("{:?}", expr),
     }
