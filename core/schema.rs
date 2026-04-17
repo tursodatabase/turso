@@ -142,7 +142,7 @@ use crate::storage::btree::{BTreeCursor, CursorTrait};
 use crate::sync::Arc;
 use crate::sync::Mutex;
 use crate::translate::collate::CollationSeq;
-use crate::translate::plan::{BitSet, ColumnMask, ColumnUsedMask, Plan, TableReferences};
+use crate::translate::plan::{BitSet, ColumnMask, Plan, TableReferences};
 use crate::util::{
     module_args_from_sql, module_name_from_sql, type_from_name, UnparsedFromSqlIndex,
 };
@@ -2228,11 +2228,9 @@ impl CheckConstraint {
     }
 }
 
-/// Wrapper whose `Clone` resets the inner value to its `Default`. Used to
-/// hang derived caches off structs that want `#[derive(Clone)]` without
-/// propagating stale cache state into the clone.
+/// RAII wrapper that resets its inner value when cloned.
 #[derive(Debug, Default)]
-pub struct ResetOnClone<T: Default>(pub T);
+pub struct ResetOnClone<T: Default>(T);
 
 impl<T: Default> Clone for ResetOnClone<T> {
     fn clone(&self) -> Self {
@@ -2240,9 +2238,6 @@ impl<T: Default> Clone for ResetOnClone<T> {
     }
 }
 
-/// Transitive closure of the generated-column dependency DAG, computed
-/// lazily via [`OnceLock`]. Accessed through [`BTreeTable::columns_affected_by_update`]
-/// and [`BTreeTable::dependencies_of_columns`].
 #[derive(Debug)]
 pub(crate) struct GeneratedColGraph {
     /// `dependencies[j]` = columns `j` transitively reads from (excludes `j`).
@@ -2255,10 +2250,11 @@ impl GeneratedColGraph {
     fn build(columns: &[Column]) -> Result<Self> {
         let n = columns.len();
 
-        // Step 1: walk each virtual column's expression once → direct edges.
         let mut direct_deps = vec![ColumnMask::default(); n];
         let mut direct_dependents = vec![ColumnMask::default(); n];
         let mut in_degree: Vec<u32> = vec![0; n];
+
+        // walk each virtual column's expression once to extract edges
         for (j, col) in columns.iter().enumerate() {
             let GeneratedType::Virtual { ref expr, .. } = col.generated_type() else {
                 continue;
@@ -2278,7 +2274,7 @@ impl GeneratedColGraph {
             }
         }
 
-        // Step 2: Kahn's topological sort over direct_deps. Unordered nodes = cycle.
+        // Kahn's algorithm (topological sort) over direct_deps.
         let mut topo: Vec<usize> = Vec::with_capacity(n);
         let mut ready: Vec<usize> = (0..n).filter(|&i| in_degree[i] == 0).collect();
         while let Some(i) = ready.pop() {
@@ -2290,6 +2286,8 @@ impl GeneratedColGraph {
                 }
             }
         }
+
+        // see if there's cycles in the graph
         if topo.len() != n {
             let cycle_names: Vec<&str> = (0..n)
                 .filter(|i| in_degree[*i] > 0)
@@ -2301,7 +2299,7 @@ impl GeneratedColGraph {
             );
         }
 
-        // Step 3: forward DP in topo order → transitive dependencies.
+        // compute transitive closures.
         let mut dependencies = vec![ColumnMask::default(); n];
         for &j in &topo {
             dependencies[j] = direct_deps[j].clone();
@@ -2311,7 +2309,7 @@ impl GeneratedColGraph {
             }
         }
 
-        // Step 4: reverse DP → transitive dependents.
+        // compute transitive closures of the transpose graph (dependents)
         let mut dependents = vec![ColumnMask::default(); n];
         for &i in topo.iter().rev() {
             dependents[i] = direct_dependents[i].clone();
@@ -2771,9 +2769,7 @@ impl BTreeTable {
             return Ok(graph);
         }
         let graph = GeneratedColGraph::build(&self.columns)?;
-        // If a concurrent reader already initialized the cache, our `set` is a
-        // no-op and we return the already-stored value below. Either version is
-        // correct because the cache is a pure function of `self.columns`.
+        // we ignore a concurrent initialization, because OnceLock::get_or_try_init is still nightly-only
         let _ = self.column_dependencies.0.set(graph);
         Ok(self
             .column_dependencies
@@ -2798,15 +2794,12 @@ impl BTreeTable {
         Ok(affected)
     }
 
-    /// Returns a bitset containing the indexes of `targets` that are stored
-    /// columns, plus the stored columns that virtual `targets` transitively
-    /// depend on.
     pub(crate) fn dependencies_of_columns(
         &self,
         targets: impl IntoIterator<Item = usize>,
-    ) -> Result<ColumnUsedMask> {
+    ) -> Result<ColumnMask> {
         let graph = self.column_graph()?;
-        let mut deps = BitSet::default();
+        let mut deps = ColumnMask::default();
         for j in targets {
             if !self.columns[j].is_virtual_generated() {
                 deps.set(j);
@@ -5382,7 +5375,7 @@ mod tests {
         v
     }
 
-    fn stored(bits: &BitSet) -> Vec<usize> {
+    fn stored(bits: &ColumnMask) -> Vec<usize> {
         let mut v: Vec<usize> = bits.iter().collect();
         v.sort_unstable();
         v

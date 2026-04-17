@@ -1396,10 +1396,9 @@ impl ColumnMask {
         self.bitset.is_empty() && !self.has_rowid_sentinel
     }
 
-    /// Iterates over the real column indices in this mask. ROWID_SENTINEL,
-    /// if present, is not yielded.
     pub fn iter(&self) -> impl Iterator<Item = usize> + '_ {
-        self.bitset.iter()
+        let rowid_sentinel = self.has_rowid_sentinel.then_some(ROWID_SENTINEL);
+        self.bitset.iter().chain(rowid_sentinel)
     }
 
     pub fn union_with(&mut self, other: &ColumnMask) {

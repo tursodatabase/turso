@@ -1572,10 +1572,10 @@ fn emit_update_insns<'a>(
             if t_ctx.resolver.schema().has_child_fks(table_name) {
                 let rowid_new_reg = rowid_set_clause_reg.unwrap_or(beg);
                 let mut directly_and_indirectly_updated_columns = ColumnMask::default();
-                for (i, _) in set_clauses.iter() {
-                    directly_and_indirectly_updated_columns
-                        .union_with(&table_btree.columns_affected_by_update([*i])?);
-                }
+                directly_and_indirectly_updated_columns.union_with(
+                    &table_btree
+                        .columns_affected_by_update(set_clauses.iter().map(|(idx, _)| *idx))?,
+                );
 
                 emit_fk_child_update_counters(
                     program,
