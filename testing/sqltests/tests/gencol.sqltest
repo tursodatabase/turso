@@ -4473,3 +4473,13 @@ test delete-using-indexed-virtual-column {
     DELETE FROM t WHERE b = 2;
 } expect {
 }
+
+test update-with-virtual-column-before-pk {
+    PRAGMA foreign_keys = ON;
+    CREATE TABLE t(a AS (1), b, c, PRIMARY KEY (b));
+    INSERT INTO t(b, c) VALUES (2, 3);
+    UPDATE t SET c = 99;
+    SELECT * FROM t;
+} expect {
+    1|2|99
+}
