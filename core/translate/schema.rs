@@ -1515,6 +1515,9 @@ pub fn translate_drop_table(
         }
         bail_parse_error!("No such table: {name}");
     };
+    // Use the canonical name from the schema (not the user's casing) so that
+    // the VDBE Ne comparison against sqlite_schema matches correctly.
+    let canonical_name = table.get_name().to_string();
     validate_drop_table(resolver, database_id, name, connection)?;
     // Check if foreign keys are enabled and if this table is referenced by foreign keys
     // Fire FK actions (CASCADE, SET NULL, SET DEFAULT) or check for violations (RESTRICT, NO ACTION)
@@ -1528,7 +1531,7 @@ pub fn translate_drop_table(
     let null_reg = program.alloc_register(); //  r1
     program.emit_null(null_reg, None);
     let table_name_and_root_page_register = program.alloc_register(); //  r2, this register is special because it's first used to track table name and then moved root page
-    let table_reg = program.emit_string8_new_reg(tbl_name.name.as_str().to_owned()); //  r3
+    let table_reg = program.emit_string8_new_reg(canonical_name); //  r3
     program.mark_last_insn_constant();
     let _table_type = program.emit_string8_new_reg("trigger".to_string()); //  r4
     program.mark_last_insn_constant();
