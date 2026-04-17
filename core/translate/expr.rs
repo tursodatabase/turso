@@ -2886,8 +2886,8 @@ pub fn translate_expr(
                             // Note: ast::Literal::String values must be wrapped in single quotes
                             // because sanitize_string() strips the first and last character
                             let col_name = col
-                                .name
-                                .clone()
+                                .name_str()
+                                .map(str::to_owned)
                                 .unwrap_or_else(|| format!("column{}", col_idx + 1));
                             let quoted_col_name = format!("'{col_name}'");
                             args.push(Box::new(ast::Expr::Literal(ast::Literal::String(
@@ -5634,11 +5634,10 @@ pub fn bind_and_rewrite_expr<'a>(
 
                     // First check joined tables
                     for joined_table in referenced_tables.joined_tables().iter() {
-                        let col_idx = joined_table
-                            .table
-                            .columns()
-                            .iter()
-                            .position(|c| c.name.as_ref().is_some_and(|name| *id == **name));
+                        let col_idx =
+                            joined_table.table.columns().iter().position(|c| {
+                                c.name.as_ref().is_some_and(|name| name == id.as_str())
+                            });
                         if col_idx.is_some() {
                             if match_result.is_some() {
                                 let mut ok = false;
@@ -5711,10 +5710,9 @@ pub fn bind_and_rewrite_expr<'a>(
                                     continue;
                                 }
                             }
-                            let col_idx =
-                                outer_ref.table.columns().iter().position(|c| {
-                                    c.name.as_ref().is_some_and(|name| *id == **name)
-                                });
+                            let col_idx = outer_ref.table.columns().iter().position(|c| {
+                                c.name.as_ref().is_some_and(|name| name == id.as_str())
+                            });
                             if col_idx.is_some() {
                                 if match_result.is_some() {
                                     crate::bail_parse_error!(
@@ -5820,7 +5818,7 @@ pub fn bind_and_rewrite_expr<'a>(
                     let col_idx = tbl
                         .columns()
                         .iter()
-                        .position(|c| c.name.as_ref().is_some_and(|name| *id == **name));
+                        .position(|c| c.name.as_ref().is_some_and(|name| name == id.as_str()));
                     // User-defined columns take precedence over rowid aliases
                     // (oid, rowid, _rowid_). Only fall back to parse_row_id()
                     // when no matching user column exists.
@@ -5891,7 +5889,11 @@ pub fn bind_and_rewrite_expr<'a>(
                     let col_idx = table
                         .columns()
                         .iter()
-                        .position(|c| c.name.as_ref().is_some_and(|name| *col_name == **name))
+                        .position(|c| {
+                            c.name
+                                .as_ref()
+                                .is_some_and(|name| name == col_name.as_str())
+                        })
                         .ok_or_else(|| {
                             LimboError::ParseError(format!(
                                 "Column: {}.{}.{} not found",
@@ -5956,9 +5958,10 @@ pub fn bind_and_rewrite_expr<'a>(
                                             }
 
                                             // Add column name as a string literal
-                                            let col_name = col.name.clone().unwrap_or_else(|| {
-                                                format!("column{}", col_idx + 1)
-                                            });
+                                            let col_name =
+                                                col.name_str().map(str::to_owned).unwrap_or_else(
+                                                    || format!("column{}", col_idx + 1),
+                                                );
                                             let quoted_col_name = format!("'{col_name}'");
                                             args.push(Box::new(ast::Expr::Literal(
                                                 ast::Literal::String(quoted_col_name),
@@ -6505,7 +6508,7 @@ pub fn process_returning_clause(
 
                     result_columns.push(ResultSetColumn {
                         expr: column_expr,
-                        alias: column.name.clone(),
+                        alias: column.name_str().map(str::to_owned),
                         implicit_column_name: None,
                         contains_aggregates: false,
                     });
@@ -7589,7 +7592,7 @@ fn emit_array_encode(
                 element_affinity: Affinity::Blob,
                 element_type: "ANY".into(),
                 table_name: table_name.as_str().into(),
-                col_name: col.name.as_deref().unwrap_or("").into(),
+                col_name: col.name_str().unwrap_or("").into(),
             });
 
             emit_array_element_loop(program, reg, encode_expr, col, type_def, resolver)?;
@@ -7602,7 +7605,7 @@ fn emit_array_encode(
     // Only 1-dimensional arrays validate elements against the declared base type.
     let is_any = col.ty_str.eq_ignore_ascii_case("ANY");
     let is_multidim = col.array_dimensions() > 1;
-    let col_name = col.name.as_deref().unwrap_or("");
+    let col_name = col.name_str().unwrap_or("");
     let element_affinity = if is_any || is_multidim {
         Affinity::Blob
     } else {

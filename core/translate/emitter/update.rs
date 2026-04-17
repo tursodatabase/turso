@@ -649,7 +649,7 @@ fn emit_update_column_values<'a>(
                     program.mark_last_insn_constant();
                     let mut updated = false;
                     if let Some(ddl_query_for_cdc_update) = cdc_update_alter_statement {
-                        if table_column.name.as_deref() == Some("sql") {
+                        if table_column.name_str() == Some("sql") {
                             program.emit_string8(ddl_query_for_cdc_update.to_string(), value_reg);
                             updated = true;
                         }
@@ -1428,7 +1428,7 @@ fn emit_update_insns<'a>(
                             .unwrap()
                             .name
                             .as_ref()
-                            .map_or("", |v| v)
+                            .map_or("", |v| v.as_str())
                 } else {
                     table_name.to_string() + ".rowid"
                 };
@@ -1513,8 +1513,7 @@ fn emit_update_insns<'a>(
             )
             .into_iter()
             .filter_map(|col_idx| btree_table.columns.get(col_idx))
-            .filter_map(|col| col.name.as_deref())
-            .map(Identifier::from)
+            .filter_map(|col| col.name.clone())
             .collect();
 
             // If the rowid is being updated (either directly via ROWID_SENTINEL or
@@ -1550,7 +1549,7 @@ fn emit_update_insns<'a>(
                     .iter()
                     .enumerate()
                     .filter_map(|(idx, col)| {
-                        col.name.as_deref().map(|n| {
+                        col.name_str().map(|n| {
                             if col.is_rowid_alias() {
                                 (n, rowid_set_clause_reg.unwrap_or(beg))
                             } else {

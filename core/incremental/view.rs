@@ -269,8 +269,8 @@ impl IncrementalView {
             .enumerate()
             .map(|(i, vc)| {
                 vc.column
-                    .name
-                    .clone()
+                    .name_str()
+                    .map(str::to_owned)
                     .unwrap_or_else(|| format!("column{}", i + 1))
             })
     }
@@ -1103,7 +1103,7 @@ impl IncrementalView {
                             if table
                                 .columns
                                 .iter()
-                                .any(|col| col.name.as_deref() == Some(column.as_str()))
+                                .any(|col| col.name_str() == Some(column.as_str()))
                             {
                                 tables.push(table_name.clone());
                                 break; // Found the table, stop looking
@@ -1437,7 +1437,7 @@ mod tests {
         // Create customers table
         let columns = vec![
             SchemaColumn::new(
-                Some("id".to_string()),
+                Some("id".into()),
                 "INTEGER".to_string(),
                 None,
                 None,
@@ -1452,7 +1452,7 @@ mod tests {
                     notnull_conflict_clause: None,
                 },
             ),
-            SchemaColumn::new_default_text(Some("name".to_string()), "TEXT".to_string(), None),
+            SchemaColumn::new_default_text(Some("name".into()), "TEXT".to_string(), None),
         ];
         let logical_to_physical_map = BTreeTable::build_logical_to_physical_map(&columns);
         let customers_table = BTreeTable {
@@ -1474,7 +1474,7 @@ mod tests {
         // Create orders table
         let columns = vec![
             SchemaColumn::new(
-                Some("id".to_string()),
+                Some("id".into()),
                 "INTEGER".to_string(),
                 None,
                 None,
@@ -1490,7 +1490,7 @@ mod tests {
                 },
             ),
             SchemaColumn::new(
-                Some("customer_id".to_string()),
+                Some("customer_id".into()),
                 "INTEGER".to_string(),
                 None,
                 None,
@@ -1498,11 +1498,7 @@ mod tests {
                 None,
                 ColDef::default(),
             ),
-            SchemaColumn::new_default_integer(
-                Some("total".to_string()),
-                "INTEGER".to_string(),
-                None,
-            ),
+            SchemaColumn::new_default_integer(Some("total".into()), "INTEGER".to_string(), None),
         ];
         let logical_to_physical_map = BTreeTable::build_logical_to_physical_map(&columns);
         let orders_table = BTreeTable {
@@ -1524,7 +1520,7 @@ mod tests {
         // Create products table
         let columns = vec![
             SchemaColumn::new(
-                Some("id".to_string()),
+                Some("id".into()),
                 "INTEGER".to_string(),
                 None,
                 None,
@@ -1539,9 +1535,9 @@ mod tests {
                     notnull_conflict_clause: None,
                 },
             ),
-            SchemaColumn::new_default_text(Some("name".to_string()), "TEXT".to_string(), None),
+            SchemaColumn::new_default_text(Some("name".into()), "TEXT".to_string(), None),
             SchemaColumn::new(
-                Some("price".to_string()),
+                Some("price".into()),
                 "REAL".to_string(),
                 None,
                 None,
@@ -1570,7 +1566,7 @@ mod tests {
         // Create logs table - without a rowid alias (no INTEGER PRIMARY KEY)
         let columns = vec![
             SchemaColumn::new(
-                Some("message".to_string()),
+                Some("message".into()),
                 "TEXT".to_string(),
                 None,
                 None,
@@ -1578,13 +1574,9 @@ mod tests {
                 None,
                 ColDef::default(),
             ),
+            SchemaColumn::new_default_integer(Some("level".into()), "INTEGER".to_string(), None),
             SchemaColumn::new_default_integer(
-                Some("level".to_string()),
-                "INTEGER".to_string(),
-                None,
-            ),
-            SchemaColumn::new_default_integer(
-                Some("timestamp".to_string()),
+                Some("timestamp".into()),
                 "INTEGER".to_string(),
                 None,
             ),

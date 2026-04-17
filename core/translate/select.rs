@@ -451,7 +451,7 @@ fn prepare_one_select_plan(
                                 if long_names {
                                     format!("{}.{}", table.identifier, col_name)
                                 } else {
-                                    col_name.clone()
+                                    col_name.to_string()
                                 }
                             });
                             plan.result_columns.push(ResultSetColumn {
@@ -902,7 +902,7 @@ fn reject_outer_query_refs_in_group_by_expr(
                     let column_name = outer_ref
                         .columns()
                         .get(*column)
-                        .and_then(|col| col.name.as_deref())
+                        .and_then(|col| col.name_str())
                         .expect(
                             "bound outer-scope Expr::Column must point to a named column in schema",
                         );
@@ -980,7 +980,7 @@ fn reject_outer_scope_refs_inside_select_plan(
             let column_name = outer_ref
                 .columns()
                 .get(col_idx)
-                .and_then(|col| col.name.as_deref())
+                .and_then(|col| col.name_str())
                 .expect("bound outer-scope Expr::Column must point to a named column in schema");
             crate::bail_parse_error!("no such column: {}.{}", outer_ref.identifier, column_name);
         }

@@ -1811,7 +1811,7 @@ pub fn translate_drop_table(
         let sqlite_schema_cursor_id_1 =
             program.alloc_cursor_id(CursorType::BTreeTable(schema_table.clone()));
         let columns = vec![Column::new(
-            Some("rowid".to_string()),
+            Some("rowid".into()),
             "INTEGER".to_string(),
             None,
             None,
@@ -2319,7 +2319,7 @@ pub fn translate_drop_type(
             if type_id == *col.ty_str {
                 bail_parse_error!(
                     "cannot drop type {type_name}: used by column {} in table {}",
-                    col.name.as_deref().unwrap_or("?"),
+                    col.name_str().unwrap_or("?"),
                     table.get_name()
                 );
             }

@@ -3167,7 +3167,7 @@ mod tests {
 
     fn _create_column(c: &TestColumn) -> Column {
         Column::new(
-            Some(c.name.clone()),
+            Some(Identifier::from(c.name.as_str())),
             c.ty.to_string(),
             None,
             None,

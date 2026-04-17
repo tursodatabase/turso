@@ -86,12 +86,11 @@ impl ResultSetColumn {
                         .table
                         .get_column_at(*column)
                         .unwrap()
-                        .name
-                        .as_deref()
+                        .name_str()
                 } else {
                     // Column references an outer query table (correlated subquery).
                     let (_, table_ref) = tables.find_table_by_internal_id(*table)?;
-                    table_ref.get_column_at(*column)?.name.as_deref()
+                    table_ref.get_column_at(*column)?.name_str()
                 }
             }
             ast::Expr::RowId { table, .. } => {
@@ -100,7 +99,7 @@ impl ResultSetColumn {
                 if let Table::BTree(table) = &table_ref {
                     if let Some(rowid_alias_column) = table.get_rowid_alias_column() {
                         if let Some(name) = &rowid_alias_column.1.name {
-                            return Some(name);
+                            return Some(name.as_str());
                         }
                     }
                 }
@@ -838,7 +837,7 @@ pub fn select_star(
                 .collect();
             for col in table.columns().iter().filter(|c| !c.hidden()) {
                 if let Some(col_name) = &col.name {
-                    let in_using = using_cols.iter().any(|u| u.eq_ignore_ascii_case(col_name));
+                    let in_using = using_cols.iter().any(|u| col_name == *u);
                     if !in_using {
                         crate::bail_parse_error!(
                             "ambiguous column name: {}.{}",
@@ -862,7 +861,7 @@ pub fn select_star(
                         !join_info.using.iter().any(|using_col| {
                             col.name
                                 .as_ref()
-                                .is_some_and(|name| name.eq_ignore_ascii_case(using_col.as_str()))
+                                .is_some_and(|name| name == using_col.as_str())
                         })
                     } else {
                         true
@@ -877,7 +876,7 @@ pub fn select_star(
                         if long_names {
                             format!("{}.{}", table.identifier, col_name)
                         } else {
-                            col_name.clone()
+                            col_name.to_string()
                         }
                     });
                     ResultSetColumn {
@@ -2031,7 +2030,7 @@ impl JoinedTable {
                 let (col_type, type_name) =
                     infer_type_from_expr(&rc.expr, Some(&plan.table_references));
                 Column::new(
-                    rc.name(&plan.table_references).map(String::from),
+                    rc.name(&plan.table_references).map(Identifier::from),
                     type_name.to_string(),
                     None,
                     None,
@@ -2122,9 +2121,9 @@ impl JoinedTable {
             .enumerate()
             .map(|(i, rc)| {
                 // Use explicit column name if provided, otherwise derive from result column
-                let col_name = explicit_columns
-                    .and_then(|cols| cols.get(i).cloned())
-                    .or_else(|| rc.name(table_references).map(String::from));
+                let col_name: Option<Identifier> = explicit_columns
+                    .and_then(|cols| cols.get(i).map(|s| Identifier::from(s.as_str())))
+                    .or_else(|| rc.name(table_references).map(Identifier::from));
                 let (col_type, type_name) = infer_type_from_expr(&rc.expr, Some(table_references));
                 Column::new(
                     col_name,

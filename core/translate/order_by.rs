@@ -173,7 +173,7 @@ impl EmitOrderBy {
                 if let Some((col, type_def)) =
                     result_column_custom_type_info(expr, referenced_tables, t_ctx.resolver.schema())
                 {
-                    let col_name = col.name.as_deref().unwrap_or("?");
+                    let col_name = col.name_str().unwrap_or("?");
                     crate::bail_parse_error!(
                     "cannot ORDER BY column '{}' of type '{}': type does not declare OPERATOR '<'",
                     col_name,

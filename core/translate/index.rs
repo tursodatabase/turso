@@ -653,10 +653,9 @@ fn resolve_index_column<'a>(
         _ => return None,
     };
     let column_name = column
-        .name
-        .as_ref()
+        .name_str()
         .expect("column name must exist for indexed column")
-        .clone();
+        .to_owned();
     Some((pos, column_name, column))
 }
 

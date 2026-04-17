@@ -995,7 +995,7 @@ fn parse_table(
                 if let (Some(name_str), ast::ResultColumn::Expr(_, ref mut alias)) =
                     (&col.name, result_col)
                 {
-                    *alias = Some(ast::As::As(ast::Name::exact(name_str.clone())));
+                    *alias = Some(ast::As::As(ast::Name::exact(name_str.to_string())));
                 }
             }
         }
@@ -1733,7 +1733,7 @@ fn parse_join(
                 for left_col in left_table.columns().iter().filter(|col| !col.hidden()) {
                     if left_col.name == right_col.name {
                         distinct_names.push(ast::Name::exact(
-                            left_col.name.clone().expect("column name is None"),
+                            left_col.name_str().expect("column name is None").to_owned(),
                         ));
                         found_match = true;
                         break;
@@ -1792,7 +1792,7 @@ fn parse_join(
                             .find(|(_, col)| {
                                 col.name
                                     .as_ref()
-                                    .is_some_and(|name| *distinct_name == **name)
+                                    .is_some_and(|name| name == distinct_name.as_str())
                             })
                             .map(|(idx, col)| (left_table_idx, left_table.internal_id, idx, col));
                         if left_col.is_some() {
@@ -1808,7 +1808,7 @@ fn parse_join(
                     let right_col = right_table.columns().iter().enumerate().find(|(_, col)| {
                         col.name
                             .as_ref()
-                            .is_some_and(|name| *distinct_name == **name)
+                            .is_some_and(|name| name == distinct_name.as_str())
                     });
                     if right_col.is_none() {
                         crate::bail_parse_error!(

@@ -156,8 +156,10 @@ pub fn upsert_matches_rowid_alias(upsert: &Upsert, table: &Table) -> bool {
     let pk = table.columns().iter().find(|c| c.is_rowid_alias());
     if let Some(pkcol) = pk {
         extract_target_key(&t.targets[0].expr).is_some_and(|tk| {
-            tk.col_name
-                .eq_ignore_ascii_case(pkcol.name.as_ref().unwrap_or(&String::new()))
+            pkcol
+                .name
+                .as_ref()
+                .is_some_and(|n| n == tk.col_name.as_str())
         })
     } else {
         false
@@ -559,7 +561,7 @@ pub fn emit_upsert(
             program.emit_insn(Insn::HaltIfNull {
                 target_reg: layout.to_register(new_start, *col_idx),
                 err_code: SQLITE_CONSTRAINT_NOTNULL,
-                description: table.get_name().to_string() + "." + col.name.as_ref().unwrap(),
+                description: table.get_name().to_string() + "." + col.name_str().unwrap(),
             });
         }
         if col.is_rowid_alias() {
@@ -647,8 +649,7 @@ pub fn emit_upsert(
             bt.name.as_str(),
             new_rowid_reg.unwrap_or(ctx.conflict_rowid_reg),
             bt.columns.iter().enumerate().filter_map(|(idx, col)| {
-                col.name
-                    .as_deref()
+                col.name_str()
                     .map(|n| (n, layout.to_register(new_start, idx)))
             }),
             connection,
@@ -1078,7 +1079,7 @@ pub fn emit_upsert(
                     .columns()
                     .iter()
                     .find(|c| c.is_rowid_alias())
-                    .and_then(|c| c.name.as_deref())
+                    .and_then(|c| c.name_str())
                     .unwrap_or("rowid")
             ),
             on_error: None,
@@ -1315,7 +1316,7 @@ pub fn collect_set_clauses_for_upsert(
         .columns()
         .iter()
         .enumerate()
-        .filter_map(|(i, c)| c.name.as_deref().map(|n| (Identifier::from(n), i)))
+        .filter_map(|(i, c)| c.name.as_ref().map(|n| (n.clone(), i)))
         .collect();
 
     let mut out: Vec<(usize, Box<ast::Expr>)> = vec![];

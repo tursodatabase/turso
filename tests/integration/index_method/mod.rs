@@ -58,10 +58,10 @@ fn test_vector_sparse_ivf_create_destroy(tmp_db: TempDatabase) {
     let index = VectorSparseInvertedIndexMethod;
     let attached = index
         .attach(&IndexMethodConfiguration {
-            table_name: "t".to_string(),
-            index_name: "t_idx".to_string(),
+            table_name: "t".into(),
+            index_name: "t_idx".into(),
             columns: vec![IndexColumn {
-                name: "embedding".to_string(),
+                name: "embedding".into(),
                 order: SortOrder::Asc,
                 pos_in_table: 1,
                 collation: None,
@@ -101,10 +101,10 @@ fn test_vector_sparse_ivf_insert_query(tmp_db: TempDatabase) {
     let index = VectorSparseInvertedIndexMethod;
     let attached = index
         .attach(&IndexMethodConfiguration {
-            table_name: "t".to_string(),
-            index_name: "t_idx".to_string(),
+            table_name: "t".into(),
+            index_name: "t_idx".into(),
             columns: vec![IndexColumn {
-                name: "embedding".to_string(),
+                name: "embedding".into(),
                 order: SortOrder::Asc,
                 pos_in_table: 1,
                 collation: None,

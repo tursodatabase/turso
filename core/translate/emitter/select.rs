@@ -727,13 +727,13 @@ fn build_materialized_input_columns(
     let mut columns = Vec::with_capacity(num_keys + payload_columns.len());
     for i in 0..num_keys {
         columns.push(Column::new_default_text(
-            Some(format!("key_{i}")),
+            Some(format!("key_{i}").into()),
             "BLOB".to_string(),
             None,
         ));
     }
     for (i, payload) in payload_columns.iter().enumerate() {
-        let name = Some(format!("payload_{i}"));
+        let name = Some(Identifier::from(format!("payload_{i}")));
         let column = match payload {
             MaterializedColumnRef::RowId { .. } => {
                 Column::new_default_integer(name, "INTEGER".to_string(), None)

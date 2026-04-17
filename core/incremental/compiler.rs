@@ -2284,7 +2284,7 @@ mod tests {
             let mut schema = Schema::new();
             let columns = vec![
                 SchemaColumn::new(
-                    Some("id".to_string()),
+                    Some("id".into()),
                     "INTEGER".to_string(),
                     None,
                     None,
@@ -2297,12 +2297,8 @@ mod tests {
                         ..Default::default()
                     },
                 ),
-                SchemaColumn::new_default_text(Some("name".to_string()), "TEXT".to_string(), None),
-                SchemaColumn::new_default_integer(
-                    Some("age".to_string()),
-                    "INTEGER".to_string(),
-                    None,
-                ),
+                SchemaColumn::new_default_text(Some("name".into()), "TEXT".to_string(), None),
+                SchemaColumn::new_default_integer(Some("age".into()), "INTEGER".to_string(), None),
             ];
             let logical_to_physical_map = BTreeTable::build_logical_to_physical_map(&columns);
             let users_table = BTreeTable {
@@ -2327,7 +2323,7 @@ mod tests {
             // Add products table for join tests
             let columns = vec![
                 SchemaColumn::new(
-                    Some("product_id".to_string()),
+                    Some("product_id".into()),
                     "INTEGER".to_string(),
                     None,
                     None,
@@ -2341,12 +2337,12 @@ mod tests {
                     },
                 ),
                 SchemaColumn::new_default_text(
-                    Some("product_name".to_string()),
+                    Some("product_name".into()),
                     "TEXT".to_string(),
                     None,
                 ),
                 SchemaColumn::new_default_integer(
-                    Some("price".to_string()),
+                    Some("price".into()),
                     "INTEGER".to_string(),
                     None,
                 ),
@@ -2377,7 +2373,7 @@ mod tests {
             // Add orders table for join tests
             let columns = vec![
                 SchemaColumn::new(
-                    Some("order_id".to_string()),
+                    Some("order_id".into()),
                     "INTEGER".to_string(),
                     None,
                     None,
@@ -2391,17 +2387,17 @@ mod tests {
                     },
                 ),
                 SchemaColumn::new_default_integer(
-                    Some("user_id".to_string()),
+                    Some("user_id".into()),
                     "INTEGER".to_string(),
                     None,
                 ),
                 SchemaColumn::new_default_integer(
-                    Some("product_id".to_string()),
+                    Some("product_id".into()),
                     "INTEGER".to_string(),
                     None,
                 ),
                 SchemaColumn::new_default_integer(
-                    Some("quantity".to_string()),
+                    Some("quantity".into()),
                     "INTEGER".to_string(),
                     None,
                 ),
@@ -2432,7 +2428,7 @@ mod tests {
             // Add customers table with id and name for testing column ambiguity
             let columns = vec![
                 SchemaColumn::new(
-                    Some("id".to_string()),
+                    Some("id".into()),
                     "INTEGER".to_string(),
                     None,
                     None,
@@ -2445,7 +2441,7 @@ mod tests {
                         ..Default::default()
                     },
                 ),
-                SchemaColumn::new_default_text(Some("name".to_string()), "TEXT".to_string(), None),
+                SchemaColumn::new_default_text(Some("name".into()), "TEXT".to_string(), None),
             ];
             let logical_to_physical_map = BTreeTable::build_logical_to_physical_map(&columns);
             let customers_table = BTreeTable {
@@ -2470,7 +2466,7 @@ mod tests {
             // Add purchases table (junction table for three-way join)
             let columns = vec![
                 SchemaColumn::new(
-                    Some("id".to_string()),
+                    Some("id".into()),
                     "INTEGER".to_string(),
                     None,
                     None,
@@ -2484,17 +2480,17 @@ mod tests {
                     },
                 ),
                 SchemaColumn::new_default_integer(
-                    Some("customer_id".to_string()),
+                    Some("customer_id".into()),
                     "INTEGER".to_string(),
                     None,
                 ),
                 SchemaColumn::new_default_integer(
-                    Some("vendor_id".to_string()),
+                    Some("vendor_id".into()),
                     "INTEGER".to_string(),
                     None,
                 ),
                 SchemaColumn::new_default_integer(
-                    Some("quantity".to_string()),
+                    Some("quantity".into()),
                     "INTEGER".to_string(),
                     None,
                 ),
@@ -2522,7 +2518,7 @@ mod tests {
             // Add vendors table with id, name, and price (ambiguous columns with customers)
             let columns = vec![
                 SchemaColumn::new(
-                    Some("id".to_string()),
+                    Some("id".into()),
                     "INTEGER".to_string(),
                     None,
                     None,
@@ -2535,9 +2531,9 @@ mod tests {
                         ..Default::default()
                     },
                 ),
-                SchemaColumn::new_default_text(Some("name".to_string()), "TEXT".to_string(), None),
+                SchemaColumn::new_default_text(Some("name".into()), "TEXT".to_string(), None),
                 SchemaColumn::new_default_integer(
-                    Some("price".to_string()),
+                    Some("price".into()),
                     "INTEGER".to_string(),
                     None,
                 ),
@@ -2564,12 +2560,12 @@ mod tests {
 
             let columns = vec![
                 SchemaColumn::new_default_integer(
-                    Some("product_id".to_string()),
+                    Some("product_id".into()),
                     "INTEGER".to_string(),
                     None,
                 ),
                 SchemaColumn::new_default_integer(
-                    Some("amount".to_string()),
+                    Some("amount".into()),
                     "INTEGER".to_string(),
                     None,
                 ),

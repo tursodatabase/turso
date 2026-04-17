@@ -386,11 +386,10 @@ pub fn simple_bind_expr(
                         }
                     }
                 }
-                let col_idx = joined_table.columns().iter().position(|c| {
-                    c.name
-                        .as_ref()
-                        .is_some_and(|name| name.eq_ignore_ascii_case(id.as_str()))
-                });
+                let col_idx = joined_table
+                    .columns()
+                    .iter()
+                    .position(|c| c.name.as_ref().is_some_and(|name| name == id.as_str()));
                 if let Some(col_idx) = col_idx {
                     let col = joined_table.table.columns().get(col_idx).unwrap();
                     *expr = ast::Expr::Column {
@@ -1744,7 +1743,7 @@ pub fn extract_view_columns(
 ) -> Result<ViewColumnSchema> {
     let mut tables = Vec::new();
     let mut columns = Vec::new();
-    let mut column_name_counts: HashMap<String, usize> = HashMap::default();
+    let mut column_name_counts: HashMap<Identifier, usize> = HashMap::default();
 
     // Navigate to the first SELECT in the statement
     if let ast::OneSelect::Select {
@@ -1842,7 +1841,11 @@ pub fn extract_view_columns(
 
                     columns.push(ViewColumn {
                         table_index: table_index.unwrap_or(usize::MAX),
-                        column: Column::new_default_text(Some(col_name), "TEXT".to_string(), None),
+                        column: Column::new_default_text(
+                            Some(col_name.into()),
+                            "TEXT".to_string(),
+                            None,
+                        ),
                     });
                 }
                 ast::ResultColumn::Star => {
@@ -1853,13 +1856,13 @@ pub fn extract_view_columns(
                         {
                             for table_column in table_obj.columns() {
                                 let col_name =
-                                    table_column.name.clone().unwrap_or_else(|| "?".to_string());
+                                    table_column.name.clone().unwrap_or_else(|| "?".into());
 
                                 // Handle duplicate column names by adding suffix
                                 let final_name =
                                     if let Some(count) = column_name_counts.get_mut(&col_name) {
                                         *count += 1;
-                                        format!("{}:{}", col_name, *count - 1)
+                                        Identifier::from(format!("{}:{}", col_name, *count - 1))
                                     } else {
                                         column_name_counts.insert(col_name.clone(), 1);
                                         col_name.clone()
@@ -1886,7 +1889,7 @@ pub fn extract_view_columns(
                         columns.push(ViewColumn {
                             table_index: usize::MAX,
                             column: Column::new_default_text(
-                                Some("*".to_string()),
+                                Some("*".into()),
                                 "TEXT".to_string(),
                                 None,
                             ),
@@ -1901,13 +1904,13 @@ pub fn extract_view_columns(
                         {
                             for table_column in table.columns() {
                                 let col_name =
-                                    table_column.name.clone().unwrap_or_else(|| "?".to_string());
+                                    table_column.name.clone().unwrap_or_else(|| "?".into());
 
                                 // Handle duplicate column names by adding suffix
                                 let final_name =
                                     if let Some(count) = column_name_counts.get_mut(&col_name) {
                                         *count += 1;
-                                        format!("{}:{}", col_name, *count - 1)
+                                        Identifier::from(format!("{}:{}", col_name, *count - 1))
                                     } else {
                                         column_name_counts.insert(col_name.clone(), 1);
                                         col_name.clone()
@@ -1931,7 +1934,7 @@ pub fn extract_view_columns(
                             columns.push(ViewColumn {
                                 table_index: usize::MAX,
                                 column: Column::new_default_text(
-                                    Some(format!("{table_ref}.*")),
+                                    Some(format!("{table_ref}.*").into()),
                                     "TEXT".to_string(),
                                     None,
                                 ),
@@ -2188,7 +2191,7 @@ mod rename_column_view {
 
             for (i, indexed_col) in view_columns.iter().enumerate() {
                 if let Some(col) = final_columns.get_mut(i) {
-                    col.name = Some(indexed_col.col_name.to_string());
+                    col.name = Some(Identifier::from(indexed_col.col_name.as_str()));
                 }
             }
 
@@ -2240,7 +2243,7 @@ mod rename_column_view {
             ) {
                 if let Some(ref mut name) = view_column.column.name {
                     if *ctx.old_column == name.as_str() {
-                        *name = ctx.new_column.to_string();
+                        *name = ctx.new_column.clone();
                     }
                 }
             }
@@ -2258,7 +2261,7 @@ mod rename_column_view {
         let mut columns = view_column_schema.flat_columns();
         for (i, indexed_col) in explicit.iter().enumerate() {
             if let Some(col) = columns.get_mut(i) {
-                col.name = Some(indexed_col.col_name.to_string());
+                col.name = Some(Identifier::from(indexed_col.col_name.as_str()));
             }
         }
         Ok(columns)
@@ -2269,9 +2272,9 @@ mod rename_column_view {
             return false;
         }
         left.iter().zip(right.iter()).all(|(l, r)| {
-            let l_name = l.name.as_deref().unwrap_or("");
-            let r_name = r.name.as_deref().unwrap_or("");
-            l_name.eq_ignore_ascii_case(r_name)
+            let l_name = l.name.as_ref();
+            let r_name = r.name.as_ref();
+            l_name == r_name
         })
     }
 
@@ -2641,7 +2644,6 @@ mod rename_column_view {
                             .columns
                             .iter()
                             .filter_map(|col| col.name.clone())
-                            .map(Identifier::from)
                             .collect();
 
                         let mut rename_map = HashMap::default();
@@ -3009,7 +3011,7 @@ mod rename_column_view {
                 ) {
                     if let Some(ref mut name) = view_column.column.name {
                         if *ctx.old_column == name.as_str() {
-                            *name = ctx.new_column.to_string();
+                            *name = ctx.new_column.clone();
                         }
                     }
                 }
@@ -3018,7 +3020,7 @@ mod rename_column_view {
 
         Ok(columns
             .into_iter()
-            .map(|vc| vc.column.name.unwrap_or_else(|| "?".to_string()))
+            .map(|vc| vc.column.name.unwrap_or_else(|| "?".into()).to_string())
             .collect())
     }
 
@@ -3084,9 +3086,7 @@ mod rename_column_view {
             let Some(after_name) = after.name.as_ref() else {
                 continue;
             };
-            if *old_column == before_name.as_str()
-                && !after_name.eq_ignore_ascii_case(before_name.as_str())
-            {
+            if *old_column == before_name.as_str() && after_name != before_name {
                 map.insert(old_column.clone(), Identifier::from(after_name.as_str()));
             }
         }
@@ -3114,7 +3114,7 @@ mod rename_column_view {
                 table
                     .columns()
                     .iter()
-                    .filter_map(|col| col.name.clone())
+                    .filter_map(|col| col.name_str().map(str::to_owned))
                     .collect(),
             );
         }
@@ -3122,7 +3122,7 @@ mod rename_column_view {
             return Some(
                 view.columns
                     .iter()
-                    .filter_map(|col| col.name.clone())
+                    .filter_map(|col| col.name_str().map(str::to_owned))
                     .collect(),
             );
         }

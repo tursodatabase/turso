@@ -402,7 +402,7 @@ fn emit_add_virtual_column_validation(
                 Some(CheckConstraint::new(
                     c.name.as_ref(),
                     expr,
-                    column.name.as_deref(),
+                    column.name_str(),
                 ))
             } else {
                 None
@@ -417,8 +417,7 @@ fn emit_add_virtual_column_validation(
     let mut resolved_table = table.clone();
     resolved_table.prepare_generated_columns()?;
     let new_column_name = column
-        .name
-        .as_deref()
+        .name_str()
         .ok_or_else(|| LimboError::ParseError("generated column name is missing".to_string()))?;
     let (new_column_idx, _) = resolved_table.get_column(new_column_name).ok_or_else(|| {
         LimboError::ParseError(format!(
@@ -487,8 +486,7 @@ fn emit_add_virtual_column_validation(
                 .iter()
                 .enumerate()
                 .filter_map(|(idx, col)| {
-                    col.name
-                        .as_deref()
+                    col.name_str()
                         .map(|name| (name, dml_ctx.to_column_reg(idx)))
                 }),
             connection,
@@ -1061,9 +1059,9 @@ pub fn translate_alter_table(
                     "column name is missing in ALTER TABLE ADD COLUMN".to_string(),
                 )
             })?;
-            if btree.get_column(new_column_name).is_some() {
+            if btree.get_column(new_column_name.as_str()).is_some() {
                 return Err(LimboError::ParseError(
-                    "duplicate column name: ".to_string() + new_column_name,
+                    "duplicate column name: ".to_string() + new_column_name.as_str(),
                 ));
             }
 
@@ -1171,16 +1169,13 @@ pub fn translate_alter_table(
                         btree.foreign_keys.push(Arc::new(fk));
                     }
                     ast::ColumnConstraint::Check(expr) => {
-                        let column_names: Vec<&str> = btree
-                            .columns
-                            .iter()
-                            .filter_map(|c| c.name.as_deref())
-                            .collect();
+                        let column_names: Vec<&str> =
+                            btree.columns.iter().filter_map(|c| c.name_str()).collect();
                         validate_check_expr(expr, btree.name.as_str(), &column_names, resolver)?;
                         btree.check_constraints.push(CheckConstraint::new(
                             constraint.name.as_ref(),
                             expr,
-                            Some(new_column_name),
+                            Some(new_column_name.as_str()),
                         ));
                     }
                     _ => {
@@ -1277,7 +1272,7 @@ pub fn translate_alter_table(
                     program,
                     &btree,
                     &original_btree,
-                    new_column_name,
+                    new_column_name.as_str(),
                     &column,
                     &constraints,
                     resolver,
@@ -3662,7 +3657,7 @@ fn validate_trigger_columns_after_drop(
                 post_drop_table
                     .columns
                     .iter()
-                    .filter_map(|c| c.name.as_deref().map(|n| n.to_owned()))
+                    .filter_map(|c| c.name_str().map(|n| n.to_owned()))
                     .collect(),
             )
         } else {
@@ -3672,7 +3667,7 @@ fn validate_trigger_columns_after_drop(
                     t.btree().map(|bt| {
                         bt.columns
                             .iter()
-                            .filter_map(|c| c.name.as_deref().map(|n| n.to_owned()))
+                            .filter_map(|c| c.name_str().map(|n| n.to_owned()))
                             .collect()
                     })
                 })
@@ -5298,7 +5293,7 @@ fn get_table_columns(
             post_drop_table
                 .columns
                 .iter()
-                .filter_map(|c| c.name.as_deref().map(|n| n.to_owned()))
+                .filter_map(|c| c.name_str().map(|n| n.to_owned()))
                 .collect(),
         )
     } else {
@@ -5307,7 +5302,7 @@ fn get_table_columns(
                 t.btree().map(|bt| {
                     bt.columns
                         .iter()
-                        .filter_map(|c| c.name.as_deref().map(|n| n.to_owned()))
+                        .filter_map(|c| c.name_str().map(|n| n.to_owned()))
                         .collect()
                 })
             })

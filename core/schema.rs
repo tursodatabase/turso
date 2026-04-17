@@ -1507,7 +1507,8 @@ impl Schema {
                             let mut final_columns = view_column_schema.flat_columns();
                             for (i, indexed_col) in column_names.iter().enumerate() {
                                 if let Some(col) = final_columns.get_mut(i) {
-                                    col.name = Some(indexed_col.col_name.to_string());
+                                    col.name =
+                                        Some(Identifier::from(indexed_col.col_name.as_str()));
                                 }
                             }
 
@@ -1689,10 +1690,7 @@ impl Schema {
                     let pc = &parent_cols[0];
                     ROWID_STRS.iter().any(|&r| *pc == r)
                         || parent_tbl.columns.iter().any(|c| {
-                            c.is_rowid_alias()
-                                && c.name
-                                    .as_deref()
-                                    .is_some_and(|n| n.eq_ignore_ascii_case(pc.as_str()))
+                            c.is_rowid_alias() && c.name.as_ref().is_some_and(|n| n == pc.as_str())
                         })
                 } else {
                     false
@@ -1801,11 +1799,7 @@ impl Schema {
                 let c = parent_cols[0].as_str();
                 ROWID_STRS.iter().any(|&r| r.eq_ignore_ascii_case(c))
                     || parent_tbl.columns.iter().any(|col| {
-                        col.is_rowid_alias()
-                            && col
-                                .name
-                                .as_deref()
-                                .is_some_and(|n| n.eq_ignore_ascii_case(c))
+                        col.is_rowid_alias() && col.name.as_ref().is_some_and(|n| n == c)
                     })
             };
 
@@ -2138,20 +2132,16 @@ impl Table {
     pub fn get_column_by_name(&self, name: &str) -> Option<(usize, &Column)> {
         match self {
             Self::BTree(table) => table.get_column(name),
-            Self::Virtual(table) => table.columns.iter().enumerate().find(|(_, col)| {
-                col.name
-                    .as_ref()
-                    .is_some_and(|n| n.eq_ignore_ascii_case(name))
-            }),
+            Self::Virtual(table) => table
+                .columns
+                .iter()
+                .enumerate()
+                .find(|(_, col)| col.name.as_ref().is_some_and(|n| n == name)),
             Self::FromClauseSubquery(from_clause_subquery) => from_clause_subquery
                 .columns
                 .iter()
                 .enumerate()
-                .find(|(_, col)| {
-                    col.name
-                        .as_ref()
-                        .is_some_and(|n| n.eq_ignore_ascii_case(name))
-                }),
+                .find(|(_, col)| col.name.as_ref().is_some_and(|n| n == name)),
         }
     }
 
@@ -2395,12 +2385,10 @@ impl BTreeTable {
     /// E.g. if table is CREATE TABLE t (a, b, c)
     /// then get_column("b") returns (1, &Column { .. })
     pub fn get_column(&self, name: &str) -> Option<(usize, &Column)> {
-        self.columns.iter().enumerate().find(|(_, column)| {
-            column
-                .name
-                .as_ref()
-                .is_some_and(|n| n.eq_ignore_ascii_case(name))
-        })
+        self.columns
+            .iter()
+            .enumerate()
+            .find(|(_, column)| column.name.as_ref().is_some_and(|n| n == name))
     }
 
     pub fn from_sql(sql: &str, root_page: i64) -> Result<BTreeTable> {
@@ -2429,7 +2417,7 @@ impl BTreeTable {
             }
 
             let column_name = column.name.as_ref().expect("column name is None");
-            sql.push_str(&quote_ident(column_name));
+            sql.push_str(&quote_ident(column_name.as_str()));
 
             if !column.ty_str.is_empty() {
                 sql.push(' ');
@@ -2909,7 +2897,7 @@ fn find_column_index_by_name(columns: &[Column], col_name: &str) -> Option<usize
     columns.iter().enumerate().find_map(|(i, col)| {
         col.name
             .as_ref()
-            .filter(|name| name.eq_ignore_ascii_case(col_name))
+            .filter(|name| *name == col_name)
             .map(|_| i)
     })
 }
@@ -2931,7 +2919,7 @@ fn has_transitive_dependency_inner(
 
     let Some(col) = columns
         .iter()
-        .find(|c| c.name.as_deref().is_some_and(|n| *start == *n))
+        .find(|c| c.name.as_ref().is_some_and(|n| n == start))
     else {
         return false;
     };
@@ -3277,7 +3265,7 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
                 constraints,
             } in columns
             {
-                let name = col_name.as_str().to_string();
+                let name = Identifier::from(col_name.as_str());
                 // Regular sqlite tables have an integer rowid that uniquely identifies a row.
                 // Even if you create a table with a column e.g. 'id INT PRIMARY KEY', there will still
                 // be a separate hidden rowid, and the 'id' column will have a separate index built for it.
@@ -3328,7 +3316,7 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
                             check_constraints.push(CheckConstraint::new(
                                 c_def.name.as_ref(),
                                 expr,
-                                Some(&name),
+                                Some(name.as_str()),
                             ));
                         }
                         ast::ColumnConstraint::Generated { expr, typ } => {
@@ -3361,7 +3349,7 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
                                 order = *o;
                             }
                             unique_sets_columns.push(UniqueSet {
-                                columns: vec![(name.clone(), order)],
+                                columns: vec![(name.to_string(), order)],
                                 is_primary_key: true,
                                 conflict_clause: *conflict_clause,
                             });
@@ -3383,7 +3371,7 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
                         ast::ColumnConstraint::Unique(conflict) => {
                             unique = true;
                             unique_sets_columns.push(UniqueSet {
-                                columns: vec![(name.clone(), order)],
+                                columns: vec![(name.to_string(), order)],
                                 is_primary_key: false,
                                 conflict_clause: *conflict,
                             });
@@ -3463,7 +3451,7 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
                     }
 
                     let referenced_cols = collect_column_refs(gen_expr);
-                    let current_col_name = Identifier::from(name.as_str());
+                    let current_col_name = name.clone();
 
                     if referenced_cols.iter().any(|c| c == &current_col_name) {
                         bail_parse_error!("generated column \"{}\" cannot reference itself", name);
@@ -3481,13 +3469,13 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
                 }
 
                 if primary_key {
-                    primary_key_columns.push((name.clone(), order));
+                    primary_key_columns.push((name.to_string(), order));
                     if order == SortOrder::Desc {
                         primary_key_desc_columns_constraint = true;
                     }
                 } else if primary_key_columns
                     .iter()
-                    .any(|(col_name, _)| col_name.eq_ignore_ascii_case(&name))
+                    .any(|(col_name, _)| name == col_name.as_str())
                 {
                     if generated.is_some() {
                         crate::bail_parse_error!(
@@ -3549,11 +3537,9 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
         }
 
         let pk_col_name = &primary_key_columns[0].0;
-        let pk_col = cols.iter().find(|c| {
-            c.name
-                .as_deref()
-                .is_some_and(|n| n.eq_ignore_ascii_case(pk_col_name))
-        });
+        let pk_col = cols
+            .iter()
+            .find(|c| c.name.as_ref().is_some_and(|n| n == pk_col_name.as_str()));
 
         if let Some(col) = pk_col {
             if col.ty() != Type::Integer {
@@ -3584,7 +3570,7 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
                         .first()
                         .unwrap()
                         .0
-                        .eq_ignore_ascii_case(col.name.as_ref().unwrap())
+                        .eq_ignore_ascii_case(col.name.as_ref().unwrap().as_str())
             });
             if let Some(u) = unique_set_w_only_rowid_alias {
                 unique_sets.remove(u);
@@ -3781,7 +3767,7 @@ impl ResolvedFkRef {
 
 #[derive(Debug, Clone)]
 pub struct Column {
-    pub name: Option<String>, // TODO: Option<Identifier>
+    pub name: Option<Identifier>,
 
     pub ty_str: String,
     pub ty_params: Vec<Box<Expr>>,
@@ -3874,8 +3860,12 @@ impl Column {
             self.affinity()
         }
     }
+    pub fn name_str(&self) -> Option<&str> {
+        self.name.as_ref().map(Identifier::as_str)
+    }
+
     pub fn new_default_text(
-        name: Option<String>,
+        name: Option<Identifier>,
         ty_str: String,
         default: Option<Box<Expr>>,
     ) -> Self {
@@ -3890,7 +3880,7 @@ impl Column {
         )
     }
     pub fn new_default_integer(
-        name: Option<String>,
+        name: Option<Identifier>,
         ty_str: String,
         default: Option<Box<Expr>>,
     ) -> Self {
@@ -3906,7 +3896,7 @@ impl Column {
     }
     #[inline]
     pub fn new(
-        name: Option<String>,
+        name: Option<Identifier>,
         ty_str: String,
         default: Option<Box<Expr>>,
         generated: Option<Box<Expr>>,
@@ -4165,7 +4155,7 @@ impl TryFrom<&ColumnDefinition> for Column {
         let hidden = ty_str.contains("HIDDEN");
 
         let mut col = Column::new(
-            Some(name.to_string()),
+            Some(Identifier::from(name)),
             ty_str,
             default,
             generated,
@@ -4232,11 +4222,11 @@ impl fmt::Display for Type {
 
 pub fn sqlite_schema_table() -> BTreeTable {
     let columns = vec![
-        Column::new_default_text(Some("type".to_string()), "TEXT".to_string(), None),
-        Column::new_default_text(Some("name".to_string()), "TEXT".to_string(), None),
-        Column::new_default_text(Some("tbl_name".to_string()), "TEXT".to_string(), None),
-        Column::new_default_integer(Some("rootpage".to_string()), "INT".to_string(), None),
-        Column::new_default_text(Some("sql".to_string()), "TEXT".to_string(), None),
+        Column::new_default_text(Some(Identifier::from("type")), "TEXT".to_string(), None),
+        Column::new_default_text(Some(Identifier::from("name")), "TEXT".to_string(), None),
+        Column::new_default_text(Some(Identifier::from("tbl_name")), "TEXT".to_string(), None),
+        Column::new_default_integer(Some(Identifier::from("rootpage")), "INT".to_string(), None),
+        Column::new_default_text(Some(Identifier::from("sql")), "TEXT".to_string(), None),
     ];
     let logical_to_physical_map = BTreeTable::build_logical_to_physical_map(&columns);
     BTreeTable {
@@ -4445,7 +4435,7 @@ impl Index {
                 )));
             };
             unique_cols.push(IndexColumn {
-                name: Identifier::from(col.name.as_deref().unwrap()),
+                name: col.name.clone().unwrap(),
                 order: *sort_order,
                 pos_in_table,
                 collation: col.collation_opt(),
@@ -4499,11 +4489,10 @@ impl Index {
         };
 
         let has_col = |name: &str| {
-            table.columns().iter().any(|c| {
-                c.name
-                    .as_ref()
-                    .is_some_and(|cn| cn.eq_ignore_ascii_case(name))
-            })
+            table
+                .columns()
+                .iter()
+                .any(|c| c.name.as_ref().is_some_and(|cn| cn == name))
         };
         let is_tbl = |ns: &str| self.table_name == ns;
         let is_deterministic_fn = |name: &str, argc: usize| {
@@ -5015,7 +5004,7 @@ mod tests {
     fn test_automatic_index_nonexistent_column() {
         // Create a table with a primary key column that doesn't exist in the table
         let columns = vec![Column::new_default_integer(
-            Some("a".to_string()),
+            Some("a".into()),
             "INT".to_string(),
             None,
         )];

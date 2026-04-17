@@ -806,7 +806,7 @@ pub(crate) fn build_copy_sql(
         if col.is_rowid_alias() {
             rowid_alias_col_idx = Some(i);
         }
-        let Some(name) = col.name.as_deref() else {
+        let Some(name) = col.name_str() else {
             return Err(LimboError::Corrupt(format!(
                 "missing column name for table \"{escaped_table_name}\""
             )));

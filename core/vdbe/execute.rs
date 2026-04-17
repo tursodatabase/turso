@@ -1898,7 +1898,7 @@ pub fn op_type_check(
                 bail_constraint_error!(
                     "NOT NULL constraint failed: {}.{} ({})",
                     &table_reference.name,
-                    col.name.as_deref().unwrap_or(""),
+                    col.name_str().unwrap_or(""),
                     SQLITE_CONSTRAINT
                 )
             } else if col.is_rowid_alias() && matches!(reg.get_value(), Value::Null) {
@@ -1932,7 +1932,7 @@ pub fn op_type_check(
                                 value_type,
                                 ty_str,
                                 &table_reference.name,
-                                col.name.as_deref().unwrap_or(""),
+                                col.name_str().unwrap_or(""),
                                 SQLITE_CONSTRAINT
                             ),
                         });
@@ -7134,7 +7134,7 @@ pub fn op_function(
                     for column in table.columns() {
                         use crate::types::TextRef;
 
-                        let name = column.name.as_ref().expect("column should have a name");
+                        let name = column.name_str().expect("column should have a name");
                         let name_json = json::convert_ref_dbtype_to_jsonb(
                             ValueRef::Text(TextRef::new(name, TextSubtype::Text)),
                             json::Conv::ToString,
@@ -12551,12 +12551,12 @@ pub fn op_alter_column(
                 }
                 // Update partial index WHERE clause column references
                 if let Some(ref mut wc) = idx.where_clause {
-                    rename_identifiers(wc, &old_column_name, &new_name);
+                    rename_identifiers(wc, old_column_name.as_str(), &new_name);
                 }
             }
         }
         if *rename {
-            btree.columns[*column_index].name = Some(new_name.clone());
+            btree.columns[*column_index].name = Some(Identifier::from(new_name.as_str()));
         } else {
             btree.columns[*column_index] = new_column.clone();
         }
@@ -12567,7 +12567,7 @@ pub fn op_alter_column(
 
         // Keep primary_key_columns consistent (names may change on rename)
         for (pk_name, _ord) in &mut btree.primary_key_columns {
-            if pk_name.eq_ignore_ascii_case(&old_column_name) {
+            if pk_name.eq_ignore_ascii_case(old_column_name.as_str()) {
                 pk_name.clone_from(&new_name);
             }
         }
@@ -12575,7 +12575,7 @@ pub fn op_alter_column(
         // Update unique_sets to reflect the renamed column
         for unique_set in &mut btree.unique_sets {
             for (col_name, _) in &mut unique_set.columns {
-                if col_name.eq_ignore_ascii_case(&old_column_name) {
+                if col_name.eq_ignore_ascii_case(old_column_name.as_str()) {
                     col_name.clone_from(&new_name);
                 }
             }
@@ -12583,7 +12583,7 @@ pub fn op_alter_column(
 
         // Update CHECK constraint expressions to reference the new column name
         for check in &mut btree.check_constraints {
-            rename_identifiers(&mut check.expr, &old_column_name, &new_name);
+            rename_identifiers(&mut check.expr, old_column_name.as_str(), &new_name);
             if let Some(ref mut col) = check.column {
                 if *col == old_column_name.as_str() {
                     *col = Identifier::from(new_name.as_str());

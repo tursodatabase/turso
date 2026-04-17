@@ -1565,7 +1565,7 @@ fn materialized_subquery_ephemeral_index(
             continue;
         }
         index_columns.push(IndexColumn {
-            name: Identifier::from(column.name.as_deref().unwrap_or("")),
+            name: column.name.clone().unwrap_or_else(|| Identifier::from("")),
             order: SortOrder::Asc,
             pos_in_table: col_pos,
             collation: column.collation_opt(),
@@ -1579,7 +1579,7 @@ fn materialized_subquery_ephemeral_index(
             continue;
         }
         index_columns.push(IndexColumn {
-            name: Identifier::from(column.name.as_deref().unwrap_or("")),
+            name: column.name.clone().unwrap_or_else(|| Identifier::from("")),
             order: SortOrder::Asc,
             pos_in_table: col_pos,
             collation: column.collation_opt(),

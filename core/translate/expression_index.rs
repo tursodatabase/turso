@@ -33,8 +33,8 @@ pub fn normalize_expr_for_index_matching(
     let mut normalize = |e: &mut ast::Expr| -> Result<WalkControl> {
         match e {
             ast::Expr::Column { column, .. } => {
-                if let Some(name) = columns.get(*column).and_then(|c| c.name.as_ref()) {
-                    *e = ast::Expr::Id(ast::Name::exact(name.clone()));
+                if let Some(name) = columns.get(*column).and_then(|c| c.name_str()) {
+                    *e = ast::Expr::Id(ast::Name::exact(name.to_owned()));
                 }
             }
             ast::Expr::RowId { .. } => {

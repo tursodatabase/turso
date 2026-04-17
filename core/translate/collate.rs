@@ -514,7 +514,7 @@ mod tests {
     ) -> TableReferences {
         let mut table_references = TableReferences::new_empty();
         let columns = vec![Column::new(
-            Some("foo".to_string()),
+            Some("foo".into()),
             "text".to_string(),
             None,
             None,
@@ -564,7 +564,7 @@ mod tests {
         let mut table_references = TableReferences::new_empty();
         // Left table t1(id=1)
         let columns = vec![Column::new(
-            Some("a".to_string()),
+            Some("a".into()),
             "text".to_string(),
             None,
             None,
@@ -604,7 +604,7 @@ mod tests {
         });
         // Right table t2(id=2)
         let columns = vec![Column::new(
-            Some("b".to_string()),
+            Some("b".into()),
             "text".to_string(),
             None,
             None,
@@ -651,7 +651,7 @@ mod tests {
         use turso_parser::ast::SortOrder;
         let mut table_references = TableReferences::new_empty();
         let columns = vec![Column::new(
-            Some("id".to_string()),
+            Some("id".into()),
             "INTEGER".to_string(),
             None,
             None,

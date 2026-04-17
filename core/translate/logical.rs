@@ -2294,7 +2294,7 @@ impl<'a> LogicalPlanBuilder<'a> {
         for col in table.columns() {
             if let Some(ref name) = col.name {
                 columns.push(ColumnInfo {
-                    name: name.clone(),
+                    name: name.to_string(),
                     ty: col.ty(),
                     database: database.clone(),
                     table: Some(actual_table.clone()),
@@ -2411,7 +2411,7 @@ mod tests {
         // Create users table
         let columns = vec![
             SchemaColumn::new(
-                Some("id".to_string()),
+                Some("id".into()),
                 "INTEGER".to_string(),
                 None,
                 None,
@@ -2424,9 +2424,9 @@ mod tests {
                     ..Default::default()
                 },
             ),
-            SchemaColumn::new_default_text(Some("name".to_string()), "TEXT".to_string(), None),
-            SchemaColumn::new_default_integer(Some("age".to_string()), "INTEGER".to_string(), None),
-            SchemaColumn::new_default_text(Some("email".to_string()), "TEXT".to_string(), None),
+            SchemaColumn::new_default_text(Some("name".into()), "TEXT".to_string(), None),
+            SchemaColumn::new_default_integer(Some("age".into()), "INTEGER".to_string(), None),
+            SchemaColumn::new_default_text(Some("email".into()), "TEXT".to_string(), None),
         ];
         let logical_to_physical_map = BTreeTable::build_logical_to_physical_map(&columns);
         let users_table = BTreeTable {
@@ -2451,7 +2451,7 @@ mod tests {
         // Create orders table
         let columns = vec![
             SchemaColumn::new(
-                Some("id".to_string()),
+                Some("id".into()),
                 "INTEGER".to_string(),
                 None,
                 None,
@@ -2464,14 +2464,10 @@ mod tests {
                     ..Default::default()
                 },
             ),
-            SchemaColumn::new_default_integer(
-                Some("user_id".to_string()),
-                "INTEGER".to_string(),
-                None,
-            ),
-            SchemaColumn::new_default_text(Some("product".to_string()), "TEXT".to_string(), None),
+            SchemaColumn::new_default_integer(Some("user_id".into()), "INTEGER".to_string(), None),
+            SchemaColumn::new_default_text(Some("product".into()), "TEXT".to_string(), None),
             SchemaColumn::new(
-                Some("amount".to_string()),
+                Some("amount".into()),
                 "REAL".to_string(),
                 None,
                 None,
@@ -2503,7 +2499,7 @@ mod tests {
         // Create products table
         let columns = vec![
             SchemaColumn::new(
-                Some("id".to_string()),
+                Some("id".into()),
                 "INTEGER".to_string(),
                 None,
                 None,
@@ -2516,9 +2512,9 @@ mod tests {
                     ..Default::default()
                 },
             ),
-            SchemaColumn::new_default_text(Some("name".to_string()), "TEXT".to_string(), None),
+            SchemaColumn::new_default_text(Some("name".into()), "TEXT".to_string(), None),
             SchemaColumn::new(
-                Some("price".to_string()),
+                Some("price".into()),
                 "REAL".to_string(),
                 None,
                 None,
@@ -2527,7 +2523,7 @@ mod tests {
                 ColDef::default(),
             ),
             SchemaColumn::new_default_integer(
-                Some("product_id".to_string()),
+                Some("product_id".into()),
                 "INTEGER".to_string(),
                 None,
             ),

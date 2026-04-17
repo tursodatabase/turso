@@ -299,7 +299,10 @@ fn translate_integrity_check_impl(
             .enumerate()
             .filter(|(_, col)| col.notnull() && !col.is_rowid_alias())
             .filter_map(|(idx, col)| {
-                let name = col.name.clone().unwrap_or_else(|| format!("column{idx}"));
+                let name = col
+                    .name_str()
+                    .map(str::to_owned)
+                    .unwrap_or_else(|| format!("column{idx}"));
                 match col.generated_type() {
                     GeneratedType::Virtual { expr, .. } => {
                         let bound =

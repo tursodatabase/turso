@@ -919,7 +919,7 @@ pub fn emit_program(
 
 /// Returns the single-column schema used by rowid-only hash build inputs.
 fn build_rowid_column() -> Column {
-    Column::new_default_integer(Some("build_rowid".to_string()), "INTEGER".to_string(), None)
+    Column::new_default_integer(Some("build_rowid".into()), "INTEGER".to_string(), None)
 }
 
 pub fn prepare_cdc_if_necessary(
@@ -1594,7 +1594,7 @@ fn rewrite_where_for_update_registers(
                 if let Some((idx, c)) = columns
                     .iter()
                     .enumerate()
-                    .find(|(_, c)| c.name.as_ref().is_some_and(|n| *col == **n))
+                    .find(|(_, c)| c.name.as_ref().is_some_and(|n| n == col.as_str()))
                 {
                     if c.is_rowid_alias() {
                         *e = Expr::Register(rowid_reg);
@@ -1609,7 +1609,7 @@ fn rewrite_where_for_update_registers(
                 } else if let Some((idx, c)) = columns
                     .iter()
                     .enumerate()
-                    .find(|(_, c)| c.name.as_ref().is_some_and(|n| *name == **n))
+                    .find(|(_, c)| c.name.as_ref().is_some_and(|n| n == name.as_str()))
                 {
                     if c.is_rowid_alias() {
                         *e = Expr::Register(rowid_reg);
@@ -1965,11 +1965,10 @@ pub(crate) fn emit_check_constraints<'a>(
     for (col_name, register) in column_mappings.iter().copied() {
         let collation = joined_table
             .and_then(|table| {
-                table.columns().iter().find(|col| {
-                    col.name
-                        .as_ref()
-                        .is_some_and(|name| name.eq_ignore_ascii_case(col_name))
-                })
+                table
+                    .columns()
+                    .iter()
+                    .find(|col| col.name.as_ref().is_some_and(|name| name == col_name))
             })
             .map(|col| (col.collation(), false));
         let column_expr = ast::Expr::Id(ast::Name::exact(col_name.to_string()));
@@ -1993,11 +1992,12 @@ pub(crate) fn emit_check_constraints<'a>(
         );
 
         for (col_name, register) in column_mappings.iter().copied() {
-            if let Some((idx, col)) = joined_table.columns().iter().enumerate().find(|(_, c)| {
-                c.name
-                    .as_ref()
-                    .is_some_and(|n| n.eq_ignore_ascii_case(col_name))
-            }) {
+            if let Some((idx, col)) = joined_table
+                .columns()
+                .iter()
+                .enumerate()
+                .find(|(_, c)| c.name.as_ref().is_some_and(|n| n == col_name))
+            {
                 resolver.cache_expr_reg(
                     Cow::Owned(ast::Expr::Column {
                         database: None,

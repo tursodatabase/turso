@@ -772,7 +772,7 @@ pub fn translate_insert(
         ctx.table.name.as_str(),
         insertion.key_register(),
         insertion.col_mappings.iter().filter_map(|m| {
-            m.column.name.as_deref().map(|n| {
+            m.column.name_str().map(|n| {
                 // Rowid alias columns have NULL in their register (the real value
                 // lives in the key register), so point CHECK to the key register.
                 let reg = if m.column.is_rowid_alias() {
@@ -1519,10 +1519,10 @@ fn get_valid_sqlite_sequence_table(
         );
     }
 
-    let col0_name = seq_table.columns[0].name.as_deref();
-    let col1_name = seq_table.columns[1].name.as_deref();
-    if !matches!(col0_name, Some(name) if name.eq_ignore_ascii_case("name"))
-        || !matches!(col1_name, Some(name) if name.eq_ignore_ascii_case("seq"))
+    let col0_name = seq_table.columns[0].name.as_ref();
+    let col1_name = seq_table.columns[1].name.as_ref();
+    if !matches!(col0_name, Some(name) if name == "name")
+        || !matches!(col1_name, Some(name) if name == "seq")
     {
         crate::bail_corrupt_error!("malformed sqlite_sequence: expected columns (name, seq)");
     }
@@ -1725,25 +1725,15 @@ fn emit_notnulls(
                 target_reg: check_reg,
                 err_code: SQLITE_CONSTRAINT_NOTNULL,
                 description: {
-                    let mut description = String::with_capacity(
-                        ctx.table.name.as_str().len()
-                            + column_mapping
-                                .column
-                                .name
-                                .as_ref()
-                                .expect("Column name must be present")
-                                .len()
-                            + 2,
-                    );
+                    let col_name = column_mapping
+                        .column
+                        .name_str()
+                        .expect("Column name must be present");
+                    let mut description =
+                        String::with_capacity(ctx.table.name.as_str().len() + col_name.len() + 2);
                     description.push_str(ctx.table.name.as_str());
                     description.push('.');
-                    description.push_str(
-                        column_mapping
-                            .column
-                            .name
-                            .as_ref()
-                            .expect("Column name must be present"),
-                    );
+                    description.push_str(col_name);
                     description
                 },
             });
@@ -2296,21 +2286,13 @@ impl<'a> Insertion<'a> {
             // If the key is a rowid alias, a NULL is emitted as the column value,
             // so we need to return the key mapping instead so that the non-NULL rowid is used
             // for the index insert.
-            if mapping
-                .column
-                .name
-                .as_ref()
-                .is_some_and(|n| n.eq_ignore_ascii_case(name))
-            {
+            if mapping.column.name.as_ref().is_some_and(|n| n == name) {
                 return Some(mapping);
             }
         }
-        self.col_mappings.iter().find(|col| {
-            col.column
-                .name
-                .as_ref()
-                .is_some_and(|n| n.eq_ignore_ascii_case(name))
-        })
+        self.col_mappings
+            .iter()
+            .find(|col| col.column.name.as_ref().is_some_and(|n| n == name))
     }
 
     fn rowid_alias_mapping(&self) -> Option<&ColMapping<'a>> {
