@@ -558,7 +558,10 @@ test.serial("Statement.reader [DELETE RETURNING is true]", (t) => {
   t.is(stmt.reader, true);
 });
 
-test.serial("Query timeout option interrupts long-running query", async (t) => {
+const queryTimeoutInterruptsLongRunningQueryTest =
+  process.env.PROVIDER === "better-sqlite3" ? test.serial.skip : test.serial;
+
+queryTimeoutInterruptsLongRunningQueryTest("Query timeout option interrupts long-running query", async (t) => {
   const path = genDatabaseFilename();
   const [db] = await connect(path, { defaultQueryTimeout: 50 });
   const stmt = db.prepare("SELECT sum(value) FROM generate_series(1, 1000000000);");
