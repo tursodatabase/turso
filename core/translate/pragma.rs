@@ -7,6 +7,7 @@ use chrono::Datelike;
 use turso_macros::match_ignore_ascii_case;
 use turso_parser::ast::PragmaName;
 use turso_parser::ast::{self, Expr, Literal};
+use turso_parser::identifier::Identifier;
 
 use super::integrity_check::{
     translate_integrity_check, translate_quick_check, MAX_INTEGRITY_CHECK_ERRORS,
@@ -21,7 +22,7 @@ use crate::storage::sqlite3_ondisk::CacheSize;
 use crate::storage::wal::CheckpointMode;
 use crate::translate::emitter::{Resolver, TransactionMode};
 use crate::translate::plan::BitSet;
-use crate::util::{normalize_ident, parse_signed_number, parse_string, IOExt as _};
+use crate::util::{parse_signed_number, parse_string, IOExt as _};
 use crate::vdbe::builder::{ProgramBuilder, ProgramBuilderOpts};
 use crate::vdbe::insn::{Cookie, Insn};
 use crate::{bail_parse_error, CaptureDataChangesInfo, LimboError, Numeric, Value};
@@ -73,15 +74,15 @@ fn display_table_list_name(database_id: usize, name: &str) -> String {
 }
 
 fn normalize_table_pragma_lookup_name(database_id: usize, name: &str) -> String {
-    let normalized = normalize_ident(name);
+    let id = Identifier::from(name);
     if (database_id == crate::TEMP_DB_ID
-        && (normalized.eq_ignore_ascii_case(crate::schema::TEMP_SCHEMA_TABLE_NAME)
-            || normalized.eq_ignore_ascii_case(crate::schema::TEMP_SCHEMA_TABLE_NAME_ALT)))
-        || normalized.eq_ignore_ascii_case(crate::schema::SCHEMA_TABLE_NAME_ALT)
+        && (id == crate::schema::TEMP_SCHEMA_TABLE_NAME
+            || id == crate::schema::TEMP_SCHEMA_TABLE_NAME_ALT))
+        || id == crate::schema::SCHEMA_TABLE_NAME_ALT
     {
         crate::schema::SCHEMA_TABLE_NAME.to_string()
     } else {
-        normalized
+        name.to_owned()
     }
 }
 
@@ -107,7 +108,7 @@ fn resolve_index_pragma_database_id(
     resolver: &Resolver,
     default_database_id: usize,
     schema_was_explicit: bool,
-    index_name: &str,
+    index_name: &Identifier,
 ) -> crate::Result<usize> {
     if schema_was_explicit {
         return Ok(default_database_id);
@@ -145,7 +146,8 @@ fn emit_table_list_rows_for_schema(
     };
 
     if let Some(filter_name) = filter_name {
-        let lookup_name = normalize_table_pragma_lookup_name(database_id, filter_name);
+        let lookup_name =
+            Identifier::from(normalize_table_pragma_lookup_name(database_id, filter_name));
         if let Some(table) = schema.get_table(&lookup_name) {
             let (wr, strict) = match table.btree() {
                 Some(bt) => (!bt.has_rowid, bt.is_strict),
@@ -153,7 +155,7 @@ fn emit_table_list_rows_for_schema(
             };
             emit_table_row(
                 program,
-                table.get_name(),
+                table.get_name().as_str(),
                 "table",
                 table.columns().len(),
                 wr,
@@ -162,7 +164,7 @@ fn emit_table_list_rows_for_schema(
         } else if let Some(view) = schema.get_view(&lookup_name) {
             emit_table_row(
                 program,
-                &view.name,
+                view.name.as_str(),
                 "view",
                 view.columns.len(),
                 false,
@@ -178,7 +180,7 @@ fn emit_table_list_rows_for_schema(
         };
         emit_table_row(
             program,
-            &bt.name,
+            bt.name.as_str(),
             "table",
             bt.columns.len(),
             !bt.has_rowid,
@@ -188,7 +190,7 @@ fn emit_table_list_rows_for_schema(
     for view in schema.views.values() {
         emit_table_row(
             program,
-            &view.name,
+            view.name.as_str(),
             "view",
             view.columns.len(),
             false,
@@ -876,12 +878,8 @@ fn query_pragma(
             // Checkpoint uses 3 registers: P1, P2, P3. Ref Insn::Checkpoint for more info.
             // Allocate two more here as one was allocated at the top.
             let mode = match value {
-                Some(ast::Expr::Name(name)) => {
-                    let mode_name = normalize_ident(name.as_str());
-                    CheckpointMode::from_str(&mode_name).map_err(|e| {
-                        LimboError::ParseError(format!("Unknown Checkpoint Mode: {e}"))
-                    })?
-                }
+                Some(ast::Expr::Name(name)) => CheckpointMode::from_str(name.as_str())
+                    .map_err(|e| LimboError::ParseError(format!("Unknown Checkpoint Mode: {e}")))?,
                 _ => CheckpointMode::Passive {
                     upper_bound_inclusive: None,
                 },
@@ -973,7 +971,7 @@ fn query_pragma(
         }
         PragmaName::IndexInfo => {
             let index_name = match value {
-                Some(ast::Expr::Name(name)) => Some(normalize_ident(name.as_str())),
+                Some(ast::Expr::Name(name)) => Some(name.into_identifier()),
                 _ => None,
             };
 
@@ -993,13 +991,13 @@ fn query_pragma(
                         .indexes
                         .values()
                         .flatten()
-                        .find(|idx| idx.name.eq_ignore_ascii_case(&index_name));
+                        .find(|idx| idx.name == index_name);
 
                     if let Some(index) = index {
                         for (seqno, col) in index.columns.iter().enumerate() {
                             program.emit_int(seqno as i64, base_reg);
                             program.emit_int(col.pos_in_table as i64, base_reg + 1);
-                            program.emit_string8(col.name.clone(), base_reg + 2);
+                            program.emit_string8(col.name.to_string(), base_reg + 2);
                             program.emit_result_row(base_reg, 3);
                         }
                     }
@@ -1014,7 +1012,7 @@ fn query_pragma(
         }
         PragmaName::IndexXinfo => {
             let index_name = match value {
-                Some(ast::Expr::Name(name)) => Some(normalize_ident(name.as_str())),
+                Some(ast::Expr::Name(name)) => Some(name.into_identifier()),
                 _ => None,
             };
 
@@ -1034,7 +1032,7 @@ fn query_pragma(
                         .indexes
                         .values()
                         .flatten()
-                        .find(|idx| idx.name.eq_ignore_ascii_case(&index_name));
+                        .find(|idx| idx.name == index_name);
 
                     if let Some(index) = index {
                         for (seqno, col) in index.columns.iter().enumerate() {
@@ -1046,7 +1044,7 @@ fn query_pragma(
 
                             program.emit_int(seqno as i64, base_reg);
                             program.emit_int(col.pos_in_table as i64, base_reg + 1);
-                            program.emit_string8(col.name.clone(), base_reg + 2);
+                            program.emit_string8(col.name.to_string(), base_reg + 2);
                             program.emit_int(desc as i64, base_reg + 3);
                             program.emit_string8(coll, base_reg + 4);
                             program.emit_int(1, base_reg + 5); // key column
@@ -1076,7 +1074,7 @@ fn query_pragma(
         }
         PragmaName::IndexList => {
             let table_name = match value {
-                Some(ast::Expr::Name(name)) => Some(normalize_ident(name.as_str())),
+                Some(ast::Expr::Name(name)) => Some(name.as_str().to_owned()),
                 _ => None,
             };
 
@@ -1085,11 +1083,12 @@ fn query_pragma(
             program.alloc_registers(4);
 
             if let Some(table_name) = table_name {
+                let table_name = Identifier::from(table_name);
                 let table_database_id = resolve_table_pragma_database_id(
                     resolver,
                     database_id,
                     schema_was_explicit,
-                    &table_name,
+                    table_name.as_str(),
                 )?;
                 resolver.with_schema(table_database_id, |schema| {
                     if let Some(table) = schema.get_table(&table_name) {
@@ -1104,7 +1103,7 @@ fn query_pragma(
                             .unwrap_or_default();
 
                         for (seq, index) in schema.get_indices(&table_name).enumerate() {
-                            let origin = if index.name.starts_with("sqlite_autoindex_") {
+                            let origin = if index.name.as_str().starts_with("sqlite_autoindex_") {
                                 let idx_cols: Vec<&str> =
                                     index.columns.iter().map(|c| c.name.as_str()).collect();
                                 if idx_cols.len() == pk_cols.len()
@@ -1122,7 +1121,7 @@ fn query_pragma(
                             };
 
                             program.emit_int(seq as i64, base_reg);
-                            program.emit_string8(index.name.clone(), base_reg + 1);
+                            program.emit_string8(index.name.to_string(), base_reg + 1);
                             program.emit_int(index.unique as i64, base_reg + 2);
                             program.emit_string8(origin.to_string(), base_reg + 3);
                             program.emit_int(index.where_clause.is_some() as i64, base_reg + 4);
@@ -1140,7 +1139,7 @@ fn query_pragma(
         }
         PragmaName::TableList => {
             let name = match value {
-                Some(ast::Expr::Name(name)) => Some(normalize_ident(name.as_str())),
+                Some(ast::Expr::Name(name)) => Some(name.as_str().to_owned()),
                 _ => None,
             };
 
@@ -1177,7 +1176,7 @@ fn query_pragma(
         }
         PragmaName::TableInfo => {
             let name = match value {
-                Some(ast::Expr::Name(name)) => Some(normalize_ident(name.as_str())),
+                Some(ast::Expr::Name(name)) => Some(name.as_str().to_owned()),
                 _ => None,
             };
 
@@ -1191,7 +1190,8 @@ fn query_pragma(
                     schema_was_explicit,
                     &name,
                 )?;
-                let lookup_name = normalize_table_pragma_lookup_name(table_database_id, &name);
+                let lookup_name =
+                    Identifier::from(normalize_table_pragma_lookup_name(table_database_id, &name));
                 resolver.with_schema(table_database_id, |db_schema| {
                     if let Some(table) = db_schema.get_table(&lookup_name) {
                         emit_columns_for_table_info(program, table.columns(), base_reg, false);
@@ -1212,7 +1212,8 @@ fn query_pragma(
         }
         PragmaName::TableXinfo => {
             let name = match value {
-                Some(ast::Expr::Name(name)) => Some(normalize_ident(name.as_str())),
+                //TODO everywhere, the pattern .as_str().to_owned() can likely be simplified to .to_string()
+                Some(ast::Expr::Name(name)) => Some(name.as_str().to_owned()),
                 _ => None,
             };
 
@@ -1226,7 +1227,8 @@ fn query_pragma(
                     schema_was_explicit,
                     &name,
                 )?;
-                let lookup_name = normalize_table_pragma_lookup_name(table_database_id, &name);
+                let lookup_name =
+                    Identifier::from(normalize_table_pragma_lookup_name(table_database_id, &name));
                 resolver.with_schema(table_database_id, |db_schema| {
                     if let Some(table) = db_schema.get_table(&lookup_name) {
                         emit_columns_for_table_info(program, table.columns(), base_reg, true);
@@ -1497,14 +1499,14 @@ fn query_pragma(
                 let mut type_names: Vec<_> = schema
                     .type_registry
                     .iter()
-                    .filter(|(key, td)| *key == &td.name.to_lowercase())
+                    .filter(|(key, td)| *key == &td.name)
                     .map(|(key, _)| key)
                     .collect();
                 type_names.sort();
                 for type_name in type_names {
                     let type_def = &schema.type_registry[type_name];
                     let display_name = if type_def.params.is_empty() {
-                        type_def.name.clone()
+                        type_def.name.to_string()
                     } else {
                         let params: Vec<String> = type_def
                             .params
@@ -1517,7 +1519,7 @@ fn query_pragma(
                         format!("{}({})", type_def.name, params.join(", "))
                     };
                     program.emit_string8(display_name, base_reg);
-                    program.emit_string8(type_def.base.clone(), base_reg + 1);
+                    program.emit_string8(type_def.base.to_string(), base_reg + 1);
                     if let Some(ref expr) = type_def.encode {
                         program.emit_string8(expr.to_string(), base_reg + 2);
                     } else {
@@ -1600,7 +1602,7 @@ fn emit_columns_for_table_info(
         cid += 1;
 
         // name
-        program.emit_string8(column.name.clone().unwrap_or_default(), base_reg + 1);
+        program.emit_string8(column.name_str().unwrap_or("").to_owned(), base_reg + 1);
 
         // type
         program.emit_string8(column.ty_str.clone(), base_reg + 2);

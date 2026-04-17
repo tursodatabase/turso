@@ -33,8 +33,8 @@ pub fn normalize_expr_for_index_matching(
     let mut normalize = |e: &mut ast::Expr| -> Result<WalkControl> {
         match e {
             ast::Expr::Column { column, .. } => {
-                if let Some(name) = columns.get(*column).and_then(|c| c.name.as_ref()) {
-                    *e = ast::Expr::Id(ast::Name::exact(name.clone()));
+                if let Some(name) = columns.get(*column).and_then(|c| c.name_str()) {
+                    *e = ast::Expr::Id(ast::Name::exact(name.to_owned()));
                 }
             }
             ast::Expr::RowId { .. } => {
@@ -97,7 +97,7 @@ pub fn expression_index_column_usage(
     let mut bound_expr = expr.clone();
     let mut binding_table = table_reference.clone();
     if let Some(btree_table) = binding_table.table.btree() {
-        binding_table.identifier.clone_from(&btree_table.name);
+        binding_table.identifier = btree_table.name.clone();
     }
     let mut binding_tables = TableReferences::new(vec![binding_table], vec![]);
     bind_and_rewrite_expr(

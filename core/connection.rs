@@ -38,6 +38,7 @@ use std::ops::Deref;
 use tempfile::TempDir;
 use tracing::{instrument, Level};
 use turso_macros::{turso_assert_ne, AtomicEnum};
+use turso_parser::identifier::Identifier;
 
 #[derive(Clone, AtomicEnum, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum TransactionState {
@@ -839,7 +840,7 @@ impl Connection {
         let attached_resolver = |name: &str| -> Option<usize> {
             self.attached_databases
                 .read()
-                .get_database_by_name(&crate::util::normalize_ident(name))
+                .get_database_by_name(&name.to_ascii_lowercase())
                 .map(|(idx, _)| idx)
         };
         // TODO: This function below is synchronous, make it async
@@ -858,7 +859,7 @@ impl Connection {
         if self.experimental_custom_types_enabled()
             && fresh
                 .tables
-                .contains_key(crate::schema::TURSO_TYPES_TABLE_NAME)
+                .contains_key(&Identifier::from(crate::schema::TURSO_TYPES_TABLE_NAME))
         {
             // Temporarily install the schema so we can prepare a query against it
             self.with_schema_mut(|schema| {
@@ -1171,7 +1172,8 @@ impl Connection {
     pub(crate) fn query_stored_type_definitions(self: &Arc<Connection>) -> Result<Vec<String>> {
         let has_types_table = {
             let s = self.schema.read();
-            s.tables.contains_key(crate::schema::TURSO_TYPES_TABLE_NAME)
+            s.tables
+                .contains_key(&Identifier::from(crate::schema::TURSO_TYPES_TABLE_NAME))
         };
         if !has_types_table {
             return Ok(Vec::new());
@@ -1692,7 +1694,7 @@ impl Connection {
             let attached_resolver = |name: &str| -> Option<usize> {
                 self.attached_databases
                     .read()
-                    .get_database_by_name(&crate::util::normalize_ident(name))
+                    .get_database_by_name(&name.to_ascii_lowercase())
                     .map(|(idx, _)| idx)
             };
             for (ty, name, table_name, root_page, sql) in &rows_data {
@@ -1963,7 +1965,7 @@ impl Connection {
 
     /// Get the database id for a schema name ("main", "temp", or an attached db alias).
     pub(crate) fn get_database_id_by_name(&self, name: &str) -> Result<usize> {
-        let normalized: String = crate::util::normalize_ident(name);
+        let normalized: String = name.to_ascii_lowercase();
         match normalized.as_str() {
             "main" => Ok(MAIN_DB_ID),
             "temp" => Ok(TEMP_DB_ID),

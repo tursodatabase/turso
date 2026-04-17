@@ -10,11 +10,11 @@ use crate::translate::planner::{parse_limit, ROWID_STRS};
 use crate::{
     bail_parse_error,
     schema::{Schema, Table},
-    util::normalize_ident,
     vdbe::builder::{ProgramBuilder, ProgramBuilderOpts},
     CaptureDataChangesExt, Connection,
 };
 use turso_parser::ast::{self, Expr, SortOrder};
+use turso_parser::identifier::Identifier;
 
 use super::emitter::emit_program;
 use super::expr::process_returning_clause;
@@ -184,12 +184,13 @@ fn validate_update(
         bail_parse_error!("ORDER BY is not supported in UPDATE");
     }
     // Check if this is a materialized view
-    if schema.is_materialized_view(table_name) {
+    let table_name_id = Identifier::from(table_name);
+    if schema.is_materialized_view(&table_name_id) {
         bail_parse_error!("cannot modify materialized view {}", table_name);
     }
 
     // Check if this table has any incompatible dependent views
-    let incompatible_views = schema.has_incompatible_dependent_views(table_name);
+    let incompatible_views = schema.has_incompatible_dependent_views(&table_name_id);
     if !incompatible_views.is_empty() {
         use crate::incremental::compiler::DBSP_CIRCUIT_VERSION;
         bail_parse_error!(
@@ -197,7 +198,7 @@ fn validate_update(
              These views were created with a different DBSP version than the current version ({}). \n\
              Please DROP and recreate the view(s) before modifying this table.",
             table_name,
-            incompatible_views.join(", "),
+            incompatible_views.iter().map(|v| v.as_str()).collect::<Vec<_>>().join(", "),
             DBSP_CIRCUIT_VERSION
         );
     }
@@ -214,7 +215,7 @@ pub fn prepare_update_plan(
     let database_id = resolver.resolve_existing_table_database_id_qualified(&body.tbl_name)?;
     let schema = resolver.schema();
     let table_name = &body.tbl_name.name;
-    let table = match resolver.with_schema(database_id, |s| s.get_table(table_name.as_str())) {
+    let table = match resolver.with_schema(database_id, |s| s.get_table(table_name.identifier())) {
         Some(table) => table,
         None => bail_parse_error!("Parse error: no such table: {}", table_name),
     };
@@ -258,8 +259,8 @@ pub fn prepare_update_plan(
             _ => unreachable!(),
         },
         identifier: body.tbl_name.alias.as_ref().map_or_else(
-            || table_name.to_string(),
-            |alias| alias.as_str().to_string(),
+            || table_name.clone(),
+            |alias| Identifier::from(alias.as_str()),
         ),
         internal_id: program.table_reference_counter.next(),
         op: build_scan_op(&table, iter_dir),
@@ -275,11 +276,15 @@ pub fn prepare_update_plan(
     // Plan CTEs and add them as outer query references for subquery resolution
     plan_ctes_as_outer_refs(with, resolver, program, &mut table_references, connection)?;
 
-    let column_lookup: HashMap<String, usize> = table
+    let column_lookup: HashMap<Identifier, usize> = table
         .columns()
         .iter()
         .enumerate()
-        .filter_map(|(i, col)| col.name.as_ref().map(|name| (name.to_lowercase(), i)))
+        .filter_map(|(i, col)| {
+            col.name
+                .as_ref()
+                .map(|name| (Identifier::from(name.as_str()), i))
+        })
         .collect();
 
     let mut set_clauses: Vec<(usize, Box<Expr>)> = Vec::with_capacity(body.sets.len());
@@ -309,9 +314,7 @@ pub fn prepare_update_plan(
         }
 
         for (col_name, expr) in set.col_names.iter().zip(values.iter()) {
-            let ident = normalize_ident(col_name.as_str());
-
-            let col_index = match column_lookup.get(&ident) {
+            let col_index = match column_lookup.get(col_name.identifier()) {
                 Some(idx) => {
                     // cannot update generated columns directly
                     table.columns()[*idx].ensure_not_generated("UPDATE", col_name.as_str())?;
@@ -319,7 +322,7 @@ pub fn prepare_update_plan(
                 }
                 None => {
                     // Check if this is the 'rowid' keyword
-                    if ROWID_STRS.iter().any(|s| s.eq_ignore_ascii_case(&ident)) {
+                    if ROWID_STRS.iter().any(|s| col_name == *s) {
                         // Find the rowid alias column if it exists
                         if let Some((idx, _col)) = table
                             .columns()
@@ -438,7 +441,7 @@ pub fn prepare_update_plan(
 
     // Determine which indexes need updating
     let indexes: Vec<_> = resolver.with_schema(database_id, |s| {
-        s.get_indices(table_name).cloned().collect()
+        s.get_indices(table.get_name()).cloned().collect()
     });
     let target_table_ref = table_references
         .joined_tables()

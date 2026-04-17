@@ -1,4 +1,5 @@
 use turso_parser::ast::{Expr, SortOrder, TableInternalId};
+use turso_parser::identifier::Identifier;
 
 use super::{
     aggregation::{translate_aggregation_step, AggArgumentSource},

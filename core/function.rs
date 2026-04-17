@@ -1182,7 +1182,7 @@ impl Func {
         false
     }
     pub fn resolve_function(name: &str, arg_count: usize) -> Result<Option<Self>, LimboError> {
-        let normalized_name = crate::util::normalize_ident(name);
+        let normalized_name = name.to_ascii_lowercase();
         match normalized_name.as_str() {
             "avg" => {
                 if arg_count != 1 {

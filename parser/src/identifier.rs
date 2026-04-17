@@ -1,0 +1,215 @@
+use strumbra::SharedString;
+
+/// A SQL identifier with ASCII-only case-insensitive equality, ordering, and hashing.
+/// Stores the original-case string; comparisons fold only A-Z to a-z.
+///
+/// Backed by [`SharedString`] (Umbra-style string) for compact storage:
+/// 16 bytes vs String's 24, with inline storage for identifiers up to 12 bytes.
+/// Cloning is O(1) (refcount bump) for heap-allocated strings.
+#[derive(Clone, Debug)]
+pub struct Identifier(GermanString);
+
+pub type GermanString = SharedString;
+
+impl Identifier {
+    pub fn new(s: String) -> Self {
+        Self(GermanString::try_from(s).unwrap())
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    pub fn into_inner(self) -> String {
+        self.0.to_string()
+    }
+}
+
+impl PartialEq for Identifier {
+    fn eq(&self, other: &Self) -> bool {
+        self.as_str().eq_ignore_ascii_case(other.as_str())
+    }
+}
+
+impl Eq for Identifier {}
+
+impl std::hash::Hash for Identifier {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        let bytes = self.as_str().as_bytes();
+        let mut buf = [0u8; 64];
+        for chunk in bytes.chunks(buf.len()) {
+            for (dst, &src) in buf.iter_mut().zip(chunk) {
+                *dst = src.to_ascii_lowercase();
+            }
+            state.write(&buf[..chunk.len()]);
+        }
+        state.write_u8(0xff);
+    }
+}
+
+impl PartialOrd for Identifier {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for Identifier {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        let a = self.as_str().as_bytes();
+        let b = other.as_str().as_bytes();
+        for (x, y) in a.iter().zip(b.iter()) {
+            match x.to_ascii_lowercase().cmp(&y.to_ascii_lowercase()) {
+                std::cmp::Ordering::Equal => continue,
+                ord => return ord,
+            }
+        }
+        a.len().cmp(&b.len())
+    }
+}
+
+impl std::fmt::Display for Identifier {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl From<String> for Identifier {
+    fn from(s: String) -> Self {
+        Self(GermanString::try_from(s).unwrap())
+    }
+}
+
+impl From<&str> for Identifier {
+    fn from(s: &str) -> Self {
+        Self(GermanString::try_from(s).unwrap())
+    }
+}
+
+impl AsRef<str> for Identifier {
+    fn as_ref(&self) -> &str {
+        self.as_str()
+    }
+}
+
+impl PartialEq<str> for Identifier {
+    fn eq(&self, other: &str) -> bool {
+        self.as_str().eq_ignore_ascii_case(other)
+    }
+}
+
+impl PartialEq<Identifier> for str {
+    fn eq(&self, other: &Identifier) -> bool {
+        self.eq_ignore_ascii_case(other.as_str())
+    }
+}
+
+impl PartialEq<&str> for Identifier {
+    fn eq(&self, other: &&str) -> bool {
+        self.as_str().eq_ignore_ascii_case(other)
+    }
+}
+
+impl PartialEq<Identifier> for &str {
+    fn eq(&self, other: &Identifier) -> bool {
+        self.eq_ignore_ascii_case(other.as_str())
+    }
+}
+
+#[cfg(feature = "serde")]
+impl serde::Serialize for Identifier {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_str(self.as_str())
+    }
+}
+
+#[cfg(feature = "serde")]
+impl<'de> serde::Deserialize<'de> for Identifier {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        String::deserialize(deserializer).map(Identifier::from)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ascii_case_insensitive_eq() {
+        assert_eq!(Identifier::from("Foo"), Identifier::from("foo"));
+        assert_eq!(Identifier::from("FOO"), Identifier::from("foo"));
+        assert_ne!(Identifier::from("foo"), Identifier::from("bar"));
+    }
+
+    #[test]
+    fn non_ascii_case_sensitive() {
+        // SQLite only folds A-Z/a-z. Non-ASCII must be byte-exact.
+        assert_ne!(Identifier::from("straße"), Identifier::from("STRASSE"));
+        assert_eq!(Identifier::from("café"), Identifier::from("café"));
+        assert_ne!(Identifier::from("café"), Identifier::from("CAFÉ"));
+    }
+
+    #[test]
+    fn hash_consistent_with_eq() {
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+
+        let hash = |id: &Identifier| {
+            let mut h = DefaultHasher::new();
+            id.hash(&mut h);
+            h.finish()
+        };
+
+        let a = Identifier::from("MyTable");
+        let b = Identifier::from("mytable");
+        assert_eq!(a, b);
+        assert_eq!(hash(&a), hash(&b));
+    }
+
+    #[test]
+    fn ord_consistent_with_eq() {
+        use std::cmp::Ordering;
+        let a = Identifier::from("Abc");
+        let b = Identifier::from("abc");
+        assert_eq!(a.cmp(&b), Ordering::Equal);
+
+        let id_a = Identifier::from("a");
+        let id_a_upper = Identifier::from("A");
+        let id_b = Identifier::from("b");
+        assert!(id_a < id_b);
+        assert!(id_a_upper < id_b);
+    }
+
+    #[test]
+    fn partial_eq_str() {
+        let id = Identifier::from("MyTable");
+        assert!(id == "mytable");
+        assert!("MYTABLE" == id);
+    }
+
+    #[test]
+    fn display_preserves_original_case() {
+        let id = Identifier::from("MyTable");
+        assert_eq!(id.to_string(), "MyTable");
+    }
+
+    #[test]
+    fn compact_size() {
+        assert_eq!(std::mem::size_of::<Identifier>(), 16);
+    }
+
+    #[test]
+    fn short_identifiers_are_inline() {
+        // Identifiers ≤12 bytes should not heap-allocate (SSO).
+        // We can't directly test this, but we can verify they work correctly.
+        for name in &["id", "name", "rowid", "_rowid_", "oid", "created_at"] {
+            let id = Identifier::from(*name);
+            assert_eq!(id.as_str(), *name);
+        }
+    }
+}

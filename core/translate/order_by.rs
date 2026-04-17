@@ -1,6 +1,7 @@
 use crate::sync::Arc;
 
 use turso_parser::ast::{self, SortOrder};
+use turso_parser::identifier::Identifier;
 
 use crate::{
     emit_explain,
@@ -172,7 +173,7 @@ impl EmitOrderBy {
                 if let Some((col, type_def)) =
                     result_column_custom_type_info(expr, referenced_tables, t_ctx.resolver.schema())
                 {
-                    let col_name = col.name.as_deref().unwrap_or("?");
+                    let col_name = col.name_str().unwrap_or("?");
                     crate::bail_parse_error!(
                     "cannot ORDER BY column '{}' of type '{}': type does not declare OPERATOR '<'",
                     col_name,
@@ -205,7 +206,7 @@ impl EmitOrderBy {
                 let collation = get_collseq_from_expr(column, referenced_tables)?;
                 let pos_in_table = index_columns.len();
                 index_columns.push(IndexColumn {
-                    name: pos_in_table.to_string(),
+                    name: Identifier::from(pos_in_table.to_string()),
                     order: *order,
                     pos_in_table,
                     collation,
@@ -216,7 +217,7 @@ impl EmitOrderBy {
             let pos_in_table = index_columns.len();
             // add sequence number between ORDER BY columns and result column
             index_columns.push(IndexColumn {
-                name: pos_in_table.to_string(),
+                name: Identifier::from(pos_in_table.to_string()),
                 order: SortOrder::Asc,
                 pos_in_table,
                 collation: None,
@@ -226,7 +227,7 @@ impl EmitOrderBy {
             for _ in remappings.iter().filter(|r| !r.deduplicated) {
                 let pos_in_table = index_columns.len();
                 index_columns.push(IndexColumn {
-                    name: pos_in_table.to_string(),
+                    name: Identifier::from(pos_in_table.to_string()),
                     order: SortOrder::Asc,
                     pos_in_table,
                     collation: None,
@@ -235,8 +236,8 @@ impl EmitOrderBy {
                 })
             }
             let index = Arc::new(Index {
-                name: index_name,
-                table_name: String::new(),
+                name: index_name.into(),
+                table_name: Identifier::from(""),
                 ephemeral: true,
                 root_page: 0,
                 columns: index_columns,

@@ -44,8 +44,8 @@ fn fmt_order_by_item(
 pub(crate) fn format_eqp_detail(table: &JoinedTable) -> String {
     match &table.op {
         Operation::Scan(scan) => {
-            let table_name = if table.table.get_name() == table.identifier {
-                table.identifier.clone()
+            let table_name = if *table.table.get_name() == table.identifier {
+                table.identifier.to_string()
             } else {
                 format!("{} AS {}", table.table.get_name(), table.identifier)
             };
@@ -128,8 +128,8 @@ pub(crate) fn format_eqp_detail(table: &JoinedTable) -> String {
             )
         }
         Operation::HashJoin(_) => {
-            let table_name = if table.table.get_name() == table.identifier {
-                table.identifier.clone()
+            let table_name = if *table.table.get_name() == table.identifier {
+                table.identifier.to_string()
             } else {
                 format!("{} AS {}", table.table.get_name(), table.identifier)
             };
@@ -254,8 +254,8 @@ impl Display for SelectPlan {
 
             match &reference.op {
                 Operation::Scan(scan) => {
-                    let table_name = if reference.table.get_name() == reference.identifier {
-                        reference.identifier.clone()
+                    let table_name = if *reference.table.get_name() == reference.identifier {
+                        reference.identifier.to_string()
                     } else {
                         format!("{} AS {}", reference.table.get_name(), reference.identifier)
                     };
@@ -377,8 +377,8 @@ impl Display for DeletePlan {
 
             match &reference.op {
                 Operation::Scan(scan) => {
-                    let table_name = if reference.table.get_name() == reference.identifier {
-                        reference.identifier.clone()
+                    let table_name = if *reference.table.get_name() == reference.identifier {
+                        reference.identifier.to_string()
                     } else {
                         format!("{} AS {}", reference.table.get_name(), reference.identifier)
                     };
@@ -500,8 +500,8 @@ impl fmt::Display for UpdatePlan {
 
             match &reference.op {
                 Operation::Scan(scan) => {
-                    let table_name = if reference.table.get_name() == reference.identifier {
-                        reference.identifier.clone()
+                    let table_name = if *reference.table.get_name() == reference.identifier {
+                        reference.identifier.to_string()
                     } else {
                         format!("{} AS {}", reference.table.get_name(), reference.identifier)
                     };
@@ -629,9 +629,9 @@ impl ToSqlContext for PlanContext<'_> {
         let joined_table = table_ref.find_joined_table_by_internal_id(id);
         let outer_query = table_ref.find_outer_query_ref_by_internal_id(id);
         match (joined_table, outer_query) {
-            (Some(table), None) => Some(&table.identifier),
-            (None, Some(table)) => Some(&table.identifier),
-            (Some(table), Some(_)) => Some(&table.identifier),
+            (Some(table), None) => Some(table.identifier.as_str()),
+            (None, Some(table)) => Some(table.identifier.as_str()),
+            (Some(table), Some(_)) => Some(table.identifier.as_str()),
             (None, None) => unreachable!(),
         }
     }
@@ -719,10 +719,10 @@ impl ToTokens for JoinedTable {
         match &self.table {
             Table::BTree(..) | Table::Virtual(..) => {
                 let name = self.table.get_name();
-                s.append(TokenType::TK_ID, Some(name))?;
-                if self.identifier != name {
+                s.append(TokenType::TK_ID, Some(name.as_str()))?;
+                if self.identifier != *name {
                     s.append(TokenType::TK_AS, None)?;
-                    s.append(TokenType::TK_ID, Some(&self.identifier))?;
+                    s.append(TokenType::TK_ID, Some(self.identifier.as_str()))?;
                 }
             }
             Table::FromClauseSubquery(from_clause_subquery) => {
@@ -732,7 +732,7 @@ impl ToTokens for JoinedTable {
                 s.append(TokenType::TK_RP, None)?;
 
                 s.append(TokenType::TK_AS, None)?;
-                s.append(TokenType::TK_ID, Some(&self.identifier))?;
+                s.append(TokenType::TK_ID, Some(self.identifier.as_str()))?;
             }
         };
 
@@ -904,7 +904,7 @@ impl ToTokens for DeletePlan {
 
         s.append(TokenType::TK_DELETE, None)?;
         s.append(TokenType::TK_FROM, None)?;
-        s.append(TokenType::TK_ID, Some(table.table.get_name()))?;
+        s.append(TokenType::TK_ID, Some(table.table.get_name().as_str()))?;
 
         if !self.where_clause.is_empty() {
             s.append(TokenType::TK_WHERE, None)?;
@@ -967,7 +967,7 @@ impl ToTokens for UpdatePlan {
         let context = &PlanContext(&context);
 
         s.append(TokenType::TK_UPDATE, None)?;
-        s.append(TokenType::TK_ID, Some(table.table.get_name()))?;
+        s.append(TokenType::TK_ID, Some(table.table.get_name().as_str()))?;
         s.append(TokenType::TK_SET, None)?;
 
         s.comma(
@@ -982,7 +982,7 @@ impl ToTokens for UpdatePlan {
                     .unwrap();
 
                 ast::Set {
-                    col_names: vec![ast::Name::exact(col_name.clone())],
+                    col_names: vec![ast::Name::exact(col_name.to_string())],
                     expr: set_expr.clone(),
                 }
             }),

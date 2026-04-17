@@ -2275,6 +2275,7 @@ mod tests {
     use crate::{Database, MemoryIO, Pager, IO};
     use rustc_hash::FxHashSet as HashSet;
     use turso_parser::ast;
+    use turso_parser::identifier::Identifier;
     use turso_parser::parser::Parser;
 
     // Macro to create a test schema with a users table
@@ -2283,7 +2284,7 @@ mod tests {
             let mut schema = Schema::new();
             let columns = vec![
                 SchemaColumn::new(
-                    Some("id".to_string()),
+                    Some("id".into()),
                     "INTEGER".to_string(),
                     None,
                     None,
@@ -2296,16 +2297,12 @@ mod tests {
                         ..Default::default()
                     },
                 ),
-                SchemaColumn::new_default_text(Some("name".to_string()), "TEXT".to_string(), None),
-                SchemaColumn::new_default_integer(
-                    Some("age".to_string()),
-                    "INTEGER".to_string(),
-                    None,
-                ),
+                SchemaColumn::new_default_text(Some("name".into()), "TEXT".to_string(), None),
+                SchemaColumn::new_default_integer(Some("age".into()), "INTEGER".to_string(), None),
             ];
             let logical_to_physical_map = BTreeTable::build_logical_to_physical_map(&columns);
             let users_table = BTreeTable {
-                name: "users".to_string(),
+                name: Identifier::from("users"),
                 root_page: 2,
                 primary_key_columns: vec![("id".to_string(), turso_parser::ast::SortOrder::Asc)],
                 columns,
@@ -2326,7 +2323,7 @@ mod tests {
             // Add products table for join tests
             let columns = vec![
                 SchemaColumn::new(
-                    Some("product_id".to_string()),
+                    Some("product_id".into()),
                     "INTEGER".to_string(),
                     None,
                     None,
@@ -2340,19 +2337,19 @@ mod tests {
                     },
                 ),
                 SchemaColumn::new_default_text(
-                    Some("product_name".to_string()),
+                    Some("product_name".into()),
                     "TEXT".to_string(),
                     None,
                 ),
                 SchemaColumn::new_default_integer(
-                    Some("price".to_string()),
+                    Some("price".into()),
                     "INTEGER".to_string(),
                     None,
                 ),
             ];
             let logical_to_physical_map = BTreeTable::build_logical_to_physical_map(&columns);
             let products_table = BTreeTable {
-                name: "products".to_string(),
+                name: Identifier::from("products"),
                 root_page: 3,
                 primary_key_columns: vec![(
                     "product_id".to_string(),
@@ -2376,7 +2373,7 @@ mod tests {
             // Add orders table for join tests
             let columns = vec![
                 SchemaColumn::new(
-                    Some("order_id".to_string()),
+                    Some("order_id".into()),
                     "INTEGER".to_string(),
                     None,
                     None,
@@ -2390,24 +2387,24 @@ mod tests {
                     },
                 ),
                 SchemaColumn::new_default_integer(
-                    Some("user_id".to_string()),
+                    Some("user_id".into()),
                     "INTEGER".to_string(),
                     None,
                 ),
                 SchemaColumn::new_default_integer(
-                    Some("product_id".to_string()),
+                    Some("product_id".into()),
                     "INTEGER".to_string(),
                     None,
                 ),
                 SchemaColumn::new_default_integer(
-                    Some("quantity".to_string()),
+                    Some("quantity".into()),
                     "INTEGER".to_string(),
                     None,
                 ),
             ];
             let logical_to_physical_map = BTreeTable::build_logical_to_physical_map(&columns);
             let orders_table = BTreeTable {
-                name: "orders".to_string(),
+                name: Identifier::from("orders"),
                 root_page: 4,
                 primary_key_columns: vec![(
                     "order_id".to_string(),
@@ -2431,7 +2428,7 @@ mod tests {
             // Add customers table with id and name for testing column ambiguity
             let columns = vec![
                 SchemaColumn::new(
-                    Some("id".to_string()),
+                    Some("id".into()),
                     "INTEGER".to_string(),
                     None,
                     None,
@@ -2444,11 +2441,11 @@ mod tests {
                         ..Default::default()
                     },
                 ),
-                SchemaColumn::new_default_text(Some("name".to_string()), "TEXT".to_string(), None),
+                SchemaColumn::new_default_text(Some("name".into()), "TEXT".to_string(), None),
             ];
             let logical_to_physical_map = BTreeTable::build_logical_to_physical_map(&columns);
             let customers_table = BTreeTable {
-                name: "customers".to_string(),
+                name: Identifier::from("customers"),
                 root_page: 6,
                 primary_key_columns: vec![("id".to_string(), turso_parser::ast::SortOrder::Asc)],
                 columns,
@@ -2469,7 +2466,7 @@ mod tests {
             // Add purchases table (junction table for three-way join)
             let columns = vec![
                 SchemaColumn::new(
-                    Some("id".to_string()),
+                    Some("id".into()),
                     "INTEGER".to_string(),
                     None,
                     None,
@@ -2483,24 +2480,24 @@ mod tests {
                     },
                 ),
                 SchemaColumn::new_default_integer(
-                    Some("customer_id".to_string()),
+                    Some("customer_id".into()),
                     "INTEGER".to_string(),
                     None,
                 ),
                 SchemaColumn::new_default_integer(
-                    Some("vendor_id".to_string()),
+                    Some("vendor_id".into()),
                     "INTEGER".to_string(),
                     None,
                 ),
                 SchemaColumn::new_default_integer(
-                    Some("quantity".to_string()),
+                    Some("quantity".into()),
                     "INTEGER".to_string(),
                     None,
                 ),
             ];
             let logical_to_physical_map = BTreeTable::build_logical_to_physical_map(&columns);
             let purchases_table = BTreeTable {
-                name: "purchases".to_string(),
+                name: Identifier::from("purchases"),
                 root_page: 7,
                 primary_key_columns: vec![("id".to_string(), turso_parser::ast::SortOrder::Asc)],
                 columns,
@@ -2521,7 +2518,7 @@ mod tests {
             // Add vendors table with id, name, and price (ambiguous columns with customers)
             let columns = vec![
                 SchemaColumn::new(
-                    Some("id".to_string()),
+                    Some("id".into()),
                     "INTEGER".to_string(),
                     None,
                     None,
@@ -2534,16 +2531,16 @@ mod tests {
                         ..Default::default()
                     },
                 ),
-                SchemaColumn::new_default_text(Some("name".to_string()), "TEXT".to_string(), None),
+                SchemaColumn::new_default_text(Some("name".into()), "TEXT".to_string(), None),
                 SchemaColumn::new_default_integer(
-                    Some("price".to_string()),
+                    Some("price".into()),
                     "INTEGER".to_string(),
                     None,
                 ),
             ];
             let logical_to_physical_map = BTreeTable::build_logical_to_physical_map(&columns);
             let vendors_table = BTreeTable {
-                name: "vendors".to_string(),
+                name: Identifier::from("vendors"),
                 root_page: 8,
                 primary_key_columns: vec![("id".to_string(), turso_parser::ast::SortOrder::Asc)],
                 columns,
@@ -2563,19 +2560,19 @@ mod tests {
 
             let columns = vec![
                 SchemaColumn::new_default_integer(
-                    Some("product_id".to_string()),
+                    Some("product_id".into()),
                     "INTEGER".to_string(),
                     None,
                 ),
                 SchemaColumn::new_default_integer(
-                    Some("amount".to_string()),
+                    Some("amount".into()),
                     "INTEGER".to_string(),
                     None,
                 ),
             ];
             let logical_to_physical_map = BTreeTable::build_logical_to_physical_map(&columns);
             let sales_table = BTreeTable {
-                name: "sales".to_string(),
+                name: Identifier::from("sales"),
                 root_page: 2,
                 primary_key_columns: vec![],
                 columns,

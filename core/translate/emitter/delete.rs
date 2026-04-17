@@ -36,6 +36,7 @@ use crate::{
 };
 use tracing::{instrument, Level};
 use turso_parser::ast::TriggerEvent;
+use turso_parser::identifier::Identifier;
 
 #[instrument(skip_all, level = Level::DEBUG)]
 pub fn emit_program_for_delete(
@@ -288,16 +289,16 @@ pub fn emit_fk_child_decrement_on_delete(
     database_id: usize,
     resolver: &Resolver,
 ) -> crate::Result<()> {
-    for fk_ref in
-        resolver.with_schema(database_id, |s| s.resolved_fks_for_child(child_table_name))?
-    {
+    for fk_ref in resolver.with_schema(database_id, |s| {
+        s.resolved_fks_for_child(&Identifier::from(child_table_name))
+    })? {
         if !fk_ref.fk.deferred {
             continue;
         }
         // Fast path: if any FK column is NULL can't be a violation
         let null_skip = program.allocate_label();
         for cname in &fk_ref.child_cols {
-            let (pos, col) = child_tbl.get_column(cname).unwrap();
+            let (pos, col) = child_tbl.get_column(cname.as_str()).unwrap();
             let src = if col.is_rowid_alias() {
                 child_rowid_reg
             } else {
@@ -319,11 +320,13 @@ pub fn emit_fk_child_decrement_on_delete(
         if fk_ref.parent_uses_rowid {
             // Probe parent table by rowid
             let parent_tbl = resolver
-                .with_schema(database_id, |s| s.get_btree_table(&fk_ref.fk.parent_table))
+                .with_schema(database_id, |s| {
+                    s.get_btree_table(&Identifier::from(fk_ref.fk.parent_table.as_str()))
+                })
                 .expect("parent btree");
             let pcur = open_read_table(program, &parent_tbl, database_id);
 
-            let (pos, col) = child_tbl.get_column(&fk_ref.child_cols[0]).unwrap();
+            let (pos, col) = child_tbl.get_column(fk_ref.child_cols[0].as_str()).unwrap();
             let val = if col.is_rowid_alias() {
                 child_rowid_reg
             } else {
@@ -366,7 +369,9 @@ pub fn emit_fk_child_decrement_on_delete(
         } else {
             // Probe parent unique index
             let parent_tbl = resolver
-                .with_schema(database_id, |s| s.get_btree_table(&fk_ref.fk.parent_table))
+                .with_schema(database_id, |s| {
+                    s.get_btree_table(&Identifier::from(fk_ref.fk.parent_table.as_str()))
+                })
                 .expect("parent btree");
             let idx = fk_ref.parent_unique_index.as_ref().expect("unique index");
             let icur = open_read_index(program, idx, database_id);
@@ -375,7 +380,7 @@ pub fn emit_fk_child_decrement_on_delete(
             let n = fk_ref.child_cols.len();
             let probe = program.alloc_registers(n);
             for (i, cname) in fk_ref.child_cols.iter().enumerate() {
-                let (pos, col) = child_tbl.get_column(cname).unwrap();
+                let (pos, col) = child_tbl.get_column(cname.as_str()).unwrap();
                 let src = if col.is_rowid_alias() {
                     child_rowid_reg
                 } else {
@@ -639,7 +644,7 @@ fn emit_delete_row_common(
                 ForeignKeyActions::prepare_fk_delete_actions(
                     program,
                     &mut t_ctx.resolver,
-                    table_name,
+                    table_name.as_str(),
                     main_table_cursor_id,
                     rowid_reg,
                     None,
@@ -655,7 +660,7 @@ fn emit_delete_row_common(
                 emit_fk_child_decrement_on_delete(
                     program,
                     &table,
-                    table_name,
+                    table_name.as_str(),
                     main_table_cursor_id,
                     rowid_reg,
                     delete_db_id,

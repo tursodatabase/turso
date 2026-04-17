@@ -2333,6 +2333,7 @@ mod tests {
         types::{ImmutableRecord, IndexInfo, Text},
         Buffer, Completion, LimboError, Value, ValueRef,
     };
+    use turso_parser::identifier::Identifier;
 
     use super::{
         build_encrypted_chunk_aad, encrypted_chunk_blob_size, encrypted_chunk_plaintext_len,
@@ -2797,7 +2798,9 @@ mod tests {
         let pager = conn.pager.load().clone();
         let mvcc_store = db.get_mvcc_store();
         let schema = conn.schema.read();
-        let table = schema.get_table("test").expect("table test should exist");
+        let table = schema
+            .get_table(&Identifier::from("test"))
+            .expect("table test should exist");
         let Table::BTree(table) = table.as_ref() else {
             panic!("table test should be btree");
         };
@@ -2805,7 +2808,7 @@ mod tests {
 
         // Get the index from schema
         let index = schema
-            .get_index("test", "idx_data")
+            .get_index(&Identifier::from("test"), &Identifier::from("idx_data"))
             .expect("Index should exist");
         // Use get_table_id_from_root_page to get the correct index_id (handles both checkpointed and non-checkpointed)
         let index_id = mvcc_store.get_table_id_from_root_page(index.root_page);

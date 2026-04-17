@@ -24,11 +24,11 @@ pub(super) fn open_in_seek_source_cursor(
                 .and_then(|idx| idx.columns.first())
                 .and_then(|c| c.collation);
             let ephemeral_index = Arc::new(Index {
-                name: String::new(),
-                table_name: String::new(),
+                name: Identifier::from(""),
+                table_name: Identifier::from(""),
                 root_page: 0,
                 columns: vec![IndexColumn {
-                    name: String::new(),
+                    name: Identifier::from(""),
                     order: SortOrder::Asc,
                     pos_in_table: 0,
                     collation,

@@ -393,6 +393,7 @@ mod tests {
     use crate::io::MemoryIO;
     use crate::schema::{BTreeTable, Table, SQLITE_SEQUENCE_TABLE_NAME};
     use crate::Database;
+    use turso_parser::identifier::Identifier;
 
     /// Verify that REGEXP produces the correct error when no regexp function is registered.
     #[test]
@@ -438,14 +439,14 @@ mod tests {
 
         let mut schema = db.schema.lock().as_ref().clone();
         let seq_root_page = schema
-            .get_btree_table(SQLITE_SEQUENCE_TABLE_NAME)
+            .get_btree_table(&Identifier::from(SQLITE_SEQUENCE_TABLE_NAME))
             .expect("sqlite_sequence should exist after creating AUTOINCREMENT table")
             .root_page;
         let malformed_seq =
             BTreeTable::from_sql("CREATE TABLE sqlite_sequence(name)", seq_root_page)
                 .expect("malformed sqlite_sequence SQL should parse");
         schema.tables.insert(
-            SQLITE_SEQUENCE_TABLE_NAME.to_string(),
+            Identifier::from(SQLITE_SEQUENCE_TABLE_NAME),
             Arc::new(Table::BTree(Arc::new(malformed_seq))),
         );
 
@@ -481,7 +482,9 @@ mod tests {
             .unwrap();
 
         let mut schema = db.schema.lock().as_ref().clone();
-        schema.tables.remove(SQLITE_SEQUENCE_TABLE_NAME);
+        schema
+            .tables
+            .remove(&Identifier::from(SQLITE_SEQUENCE_TABLE_NAME));
 
         let pager = conn.pager.load().clone();
         let syms = SymbolTable::new();

@@ -2,6 +2,7 @@ use std::sync::Arc;
 
 use rustc_hash::FxHashMap as HashMap;
 use turso_parser::ast::{self, SortOrder, SubqueryType};
+use turso_parser::identifier::Identifier;
 
 use crate::{
     emit_explain,
@@ -737,7 +738,7 @@ fn get_subquery_parser<'a>(
                     .map(|(i, c)| {
                         let rhs_collation = get_collseq_from_expr(&c.expr, table_references)?;
                         Ok(IndexColumn {
-                            name: c.name(table_references).unwrap_or("").to_string(),
+                            name: Identifier::from(c.name(table_references).unwrap_or("")),
                             order: SortOrder::Asc,
                             pos_in_table: i,
                             collation: lhs_collations[i].or(rhs_collation),
@@ -749,8 +750,8 @@ fn get_subquery_parser<'a>(
 
                 let ephemeral_index = Arc::new(Index {
                     columns,
-                    name: format!("ephemeral_index_where_sub_{subquery_id}"),
-                    table_name: String::new(),
+                    name: format!("ephemeral_index_where_sub_{subquery_id}").into(),
+                    table_name: Identifier::from(""),
                     ephemeral: true,
                     has_rowid: false,
                     root_page: 0,
@@ -1125,8 +1126,8 @@ pub fn emit_from_clause_subqueries(
             match &table_reference.op {
                 Operation::Scan(scan) => {
                     let table_name =
-                        if table_reference.table.get_name() == table_reference.identifier {
-                            table_reference.identifier.clone()
+                        if *table_reference.table.get_name() == table_reference.identifier {
+                            table_reference.identifier.to_string()
                         } else {
                             format!(
                                 "{} AS {}",
@@ -1195,8 +1196,8 @@ pub fn emit_from_clause_subqueries(
                 }
                 Operation::HashJoin(_) => {
                     let table_name =
-                        if table_reference.table.get_name() == table_reference.identifier {
-                            table_reference.identifier.clone()
+                        if *table_reference.table.get_name() == table_reference.identifier {
+                            table_reference.identifier.to_string()
                         } else {
                             format!(
                                 "{} AS {}",
@@ -1531,7 +1532,7 @@ fn emit_materialized_subquery_table(
     let logical_to_physical_map = BTreeTable::build_logical_to_physical_map(columns);
     let ephemeral_table = Arc::new(BTreeTable {
         root_page: 0,
-        name: String::new(),
+        name: Identifier::from(""),
         columns: columns.to_vec(),
         primary_key_columns: vec![],
         has_rowid: true,

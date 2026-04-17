@@ -5,6 +5,7 @@ use std::collections::VecDeque;
 
 use turso_ext::{ConstraintInfo, ConstraintUsage, ResultCode};
 use turso_parser::ast::{self, SortOrder, TableInternalId};
+use turso_parser::identifier::Identifier;
 
 use crate::schema::Schema;
 use crate::stats::AnalyzeStats;
@@ -636,7 +637,7 @@ pub fn find_best_access_method_for_join_order(
     join_order: &[JoinOrderMember],
     planning_context: JoinPlanningContext<'_>,
     where_clause: &[WhereTerm],
-    available_indexes: &HashMap<String, VecDeque<Arc<Index>>>,
+    available_indexes: &HashMap<Identifier, VecDeque<Arc<Index>>>,
     table_references: &TableReferences,
     subqueries: &[NonFromClauseSubquery],
     schema: &Schema,
@@ -690,7 +691,7 @@ fn find_best_access_method_for_btree(
     join_order: &[JoinOrderMember],
     maybe_order_target: Option<&OrderTarget>,
     where_clause: &[WhereTerm],
-    available_indexes: &HashMap<String, VecDeque<Arc<Index>>>,
+    available_indexes: &HashMap<Identifier, VecDeque<Arc<Index>>>,
     table_references: &TableReferences,
     subqueries: &[NonFromClauseSubquery],
     schema: &Schema,
@@ -1111,8 +1112,8 @@ pub fn try_hash_join_access_method(
     })
     .collect::<Vec<_>>();
     tracing::debug!(
-        build_table = build_table.table.get_name(),
-        probe_table = probe_table.table.get_name(),
+        build_table = build_table.table.get_name().as_str(),
+        probe_table = probe_table.table.get_name().as_str(),
         join_key_count = join_keys.len(),
         "hash-join equi-join keys"
     );
@@ -1453,7 +1454,7 @@ fn find_best_access_method_for_subquery(
     let has_search_constraints = !usable_constraint_refs.is_empty();
     if !has_search_constraints {
         tracing::trace!(
-            table = rhs_table.table.get_name(),
+            table = rhs_table.table.get_name().as_str(),
             cost = ?scan_cost,
             "using coroutine subquery access because no usable seek constraints remain"
         );
@@ -1564,7 +1565,7 @@ fn materialized_subquery_ephemeral_index(
             continue;
         }
         index_columns.push(IndexColumn {
-            name: column.name.clone().unwrap_or_default(),
+            name: column.name.clone().unwrap_or_else(|| Identifier::from("")),
             order: SortOrder::Asc,
             pos_in_table: col_pos,
             collation: column.collation_opt(),
@@ -1578,7 +1579,7 @@ fn materialized_subquery_ephemeral_index(
             continue;
         }
         index_columns.push(IndexColumn {
-            name: column.name.clone().unwrap_or_default(),
+            name: column.name.clone().unwrap_or_else(|| Identifier::from("")),
             order: SortOrder::Asc,
             pos_in_table: col_pos,
             collation: column.collation_opt(),
@@ -1590,7 +1591,7 @@ fn materialized_subquery_ephemeral_index(
     Arc::new(Index {
         // Match the runtime autoindex naming so EQP and bytecode make it clear
         // that this is a synthetic probe/index-on-temp-table path.
-        name: format!("ephemeral_subquery_{}", rhs_table.internal_id),
+        name: format!("ephemeral_subquery_{}", rhs_table.internal_id).into(),
         columns: index_columns,
         unique: false,
         ephemeral: true,

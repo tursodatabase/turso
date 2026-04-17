@@ -9,7 +9,7 @@ fn index_seek_affinities(
     let table = tables
         .joined_tables()
         .iter()
-        .find(|jt| jt.table.get_name() == idx.table_name)
+        .find(|jt| jt.table.get_name() == &idx.table_name)
         .expect("index source table not found in table references");
 
     idx.columns
@@ -44,9 +44,10 @@ fn encode_seek_keys_for_custom_types(
     idx_col_offset: usize,
     resolver: &Resolver<'_>,
 ) -> crate::Result<()> {
+    let table_id = Identifier::from(seek_index.table_name.as_str());
     let table = tables
-        .find_table_by_identifier(&seek_index.table_name)
-        .or_else(|| tables.find_table_by_table_name(&seek_index.table_name));
+        .find_table_by_identifier(&table_id)
+        .or_else(|| tables.find_table_by_table_name(&table_id));
     let table = match table {
         Some(t) => t,
         None => return Ok(()),

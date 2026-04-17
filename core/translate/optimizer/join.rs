@@ -7,6 +7,7 @@ use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use smallvec::SmallVec;
 
 use turso_parser::ast::{Expr, Operator, TableInternalId};
+use turso_parser::identifier::Identifier;
 
 use super::{
     access_method::{find_best_access_method_for_join_order, AccessMethod},
@@ -164,7 +165,7 @@ pub fn join_lhs_and_rhs<'a>(
     index_method_candidates: &[IndexMethodCandidate],
     params: &CostModelParams,
     analyze_stats: &AnalyzeStats,
-    available_indexes: &HashMap<String, VecDeque<Arc<Index>>>,
+    available_indexes: &HashMap<Identifier, VecDeque<Arc<Index>>>,
     table_references: &TableReferences,
     schema: &Schema,
 ) -> Result<Option<JoinN>> {
@@ -482,8 +483,8 @@ pub fn join_lhs_and_rhs<'a>(
                 && !chaining_across_outer;
 
             tracing::debug!(
-                lhs_table = build_table.table.get_name(),
-                rhs_table = rhs_table_reference.table.get_name(),
+                lhs_table = build_table.table.get_name().as_str(),
+                rhs_table = rhs_table_reference.table.get_name().as_str(),
                 allow_hash_join,
                 rhs_has_selective_seek,
                 probe_table_is_prior_build,
@@ -633,8 +634,8 @@ pub fn join_lhs_and_rhs<'a>(
                                 *materialize_build_input = false;
                             }
                             tracing::debug!(
-                                lhs_table = build_table.table.get_name(),
-                                rhs_table = rhs_table_reference.table.get_name(),
+                                lhs_table = build_table.table.get_name().as_str(),
+                                rhs_table = rhs_table_reference.table.get_name().as_str(),
                                 materialize_build_input = *materialize_build_input,
                                 needs_materialization,
                                 estimated_filtered_rows,
@@ -892,7 +893,7 @@ pub fn compute_best_join_order<'a>(
     index_method_candidates: &[IndexMethodCandidate],
     params: &CostModelParams,
     analyze_stats: &AnalyzeStats,
-    available_indexes: &HashMap<String, VecDeque<Arc<Index>>>,
+    available_indexes: &HashMap<Identifier, VecDeque<Arc<Index>>>,
     table_references: &TableReferences,
     schema: &Schema,
 ) -> Result<Option<BestJoinOrderResult>> {
@@ -930,7 +931,7 @@ pub(crate) fn compute_best_join_order_with_context<'a>(
     index_method_candidates: &[IndexMethodCandidate],
     params: &CostModelParams,
     analyze_stats: &AnalyzeStats,
-    available_indexes: &HashMap<String, VecDeque<Arc<Index>>>,
+    available_indexes: &HashMap<Identifier, VecDeque<Arc<Index>>>,
     table_references: &TableReferences,
     schema: &Schema,
 ) -> Result<Option<BestJoinOrderResult>> {
@@ -1364,7 +1365,7 @@ pub fn compute_greedy_join_order<'a>(
     index_method_candidates: &[IndexMethodCandidate],
     params: &CostModelParams,
     analyze_stats: &AnalyzeStats,
-    available_indexes: &HashMap<String, VecDeque<Arc<Index>>>,
+    available_indexes: &HashMap<Identifier, VecDeque<Arc<Index>>>,
     table_references: &TableReferences,
     schema: &Schema,
 ) -> Result<Option<BestJoinOrderResult>> {
@@ -1624,7 +1625,7 @@ pub fn compute_naive_left_deep_plan<'a>(
     index_method_candidates: &[IndexMethodCandidate],
     params: &CostModelParams,
     analyze_stats: &AnalyzeStats,
-    available_indexes: &HashMap<String, VecDeque<Arc<Index>>>,
+    available_indexes: &HashMap<Identifier, VecDeque<Arc<Index>>>,
     table_references: &TableReferences,
     schema: &Schema,
 ) -> Result<Option<JoinN>> {
@@ -1785,6 +1786,7 @@ mod tests {
     use std::{collections::VecDeque, sync::Arc};
 
     use turso_parser::ast::{self, Expr, Operator, SortOrder, TableInternalId};
+    use turso_parser::identifier::Identifier;
 
     use super::*;
     use crate::{
@@ -1997,11 +1999,11 @@ mod tests {
         let mut access_methods_arena = Vec::new();
         let mut available_indexes = HashMap::default();
         let index = Arc::new(Index {
-            name: "sqlite_autoindex_test_table_1".to_string(),
-            table_name: "test_table".to_string(),
+            name: Identifier::from("sqlite_autoindex_test_table_1"),
+            table_name: Identifier::from("test_table"),
             where_clause: None,
             columns: vec![IndexColumn {
-                name: "id".to_string(),
+                name: Identifier::from("id"),
                 order: SortOrder::Asc,
                 pos_in_table: 0,
                 collation: None,
@@ -2015,7 +2017,7 @@ mod tests {
             index_method: None,
             on_conflict: None,
         });
-        available_indexes.insert("test_table".to_string(), VecDeque::from([index]));
+        available_indexes.insert(Identifier::from("test_table"), VecDeque::from([index]));
 
         let table_constraints = constraints_from_where_clause(
             &where_clause,
@@ -2090,11 +2092,11 @@ mod tests {
         let mut available_indexes = HashMap::default();
         // Index on the outer table (table1)
         let index1 = Arc::new(Index {
-            name: "index1".to_string(),
-            table_name: "table1".to_string(),
+            name: Identifier::from("index1"),
+            table_name: Identifier::from("table1"),
             where_clause: None,
             columns: vec![IndexColumn {
-                name: "id".to_string(),
+                name: Identifier::from("id"),
                 order: SortOrder::Asc,
                 pos_in_table: 0,
                 collation: None,
@@ -2108,7 +2110,7 @@ mod tests {
             index_method: None,
             on_conflict: None,
         });
-        available_indexes.insert("table1".to_string(), VecDeque::from([index1]));
+        available_indexes.insert(Identifier::from("table1"), VecDeque::from([index1]));
 
         // SELECT * FROM table1 JOIN table2 WHERE table1.id = table2.id
         // expecting table2 to be chosen first due to the index on table1.id
@@ -2232,11 +2234,11 @@ mod tests {
                 // add primary key index called sqlite_autoindex_<tablename>_1
                 let index_name = format!("sqlite_autoindex_{table_name}_1");
                 let index = Arc::new(Index {
-                    name: index_name,
+                    name: index_name.into(),
                     where_clause: None,
-                    table_name: table_name.to_string(),
+                    table_name: Identifier::from(*table_name),
                     columns: vec![IndexColumn {
-                        name: "id".to_string(),
+                        name: Identifier::from("id"),
                         order: SortOrder::Asc,
                         pos_in_table: 0,
                         collation: None,
@@ -2250,14 +2252,14 @@ mod tests {
                     index_method: None,
                     on_conflict: None,
                 });
-                available_indexes.insert(table_name.to_string(), VecDeque::from([index]));
+                available_indexes.insert(Identifier::from(*table_name), VecDeque::from([index]));
             });
         let customer_id_idx = Arc::new(Index {
-            name: "orders_customer_id_idx".to_string(),
-            table_name: "orders".to_string(),
+            name: Identifier::from("orders_customer_id_idx"),
+            table_name: Identifier::from("orders"),
             where_clause: None,
             columns: vec![IndexColumn {
-                name: "customer_id".to_string(),
+                name: Identifier::from("customer_id"),
                 order: SortOrder::Asc,
                 pos_in_table: 1,
                 collation: None,
@@ -2272,11 +2274,11 @@ mod tests {
             on_conflict: None,
         });
         let order_id_idx = Arc::new(Index {
-            name: "order_items_order_id_idx".to_string(),
-            table_name: "order_items".to_string(),
+            name: Identifier::from("order_items_order_id_idx"),
+            table_name: Identifier::from("order_items"),
             where_clause: None,
             columns: vec![IndexColumn {
-                name: "order_id".to_string(),
+                name: Identifier::from("order_id"),
                 order: SortOrder::Asc,
                 pos_in_table: 1,
                 collation: None,
@@ -2292,10 +2294,10 @@ mod tests {
         });
 
         available_indexes
-            .entry("orders".to_string())
+            .entry(Identifier::from("orders"))
             .and_modify(|v| v.push_front(customer_id_idx));
         available_indexes
-            .entry("order_items".to_string())
+            .entry(Identifier::from("order_items"))
             .and_modify(|v| v.push_front(order_id_idx));
 
         // SELECT * FROM orders JOIN customers JOIN order_items
@@ -2766,12 +2768,12 @@ mod tests {
 
         // Create a two-column index on (x,y)
         let index = Arc::new(Index {
-            name: "idx_xy".to_string(),
-            table_name: "t1".to_string(),
+            name: Identifier::from("idx_xy"),
+            table_name: Identifier::from("t1"),
             where_clause: None,
             columns: vec![
                 IndexColumn {
-                    name: "x".to_string(),
+                    name: Identifier::from("x"),
                     order: SortOrder::Asc,
                     pos_in_table: 0,
                     collation: None,
@@ -2779,7 +2781,7 @@ mod tests {
                     expr: None,
                 },
                 IndexColumn {
-                    name: "y".to_string(),
+                    name: Identifier::from("y"),
                     order: SortOrder::Asc,
                     pos_in_table: 1,
                     collation: None,
@@ -2796,14 +2798,14 @@ mod tests {
         });
 
         let mut available_indexes = HashMap::default();
-        available_indexes.insert("t1".to_string(), VecDeque::from([index]));
+        available_indexes.insert(Identifier::from("t1"), VecDeque::from([index]));
 
         let table = Table::BTree(table);
         joined_tables.push(JoinedTable {
             op: Operation::default_scan_for(&table),
             table,
             internal_id: table_id_counter.next(),
-            identifier: "t1".to_string(),
+            identifier: Identifier::from("t1"),
             join_info: None,
             col_used_mask: ColumnUsedMask::default(),
             column_use_counts: Vec::new(),
@@ -2878,12 +2880,12 @@ mod tests {
         let columns = _create_column_list(&["c1", "c2", "c3"], Type::Integer);
         let table = _create_btree_table("t1", columns);
         let index = Arc::new(Index {
-            name: "idx1".to_string(),
-            table_name: "t1".to_string(),
+            name: Identifier::from("idx1"),
+            table_name: Identifier::from("t1"),
             where_clause: None,
             columns: vec![
                 IndexColumn {
-                    name: "c1".to_string(),
+                    name: Identifier::from("c1"),
                     order: SortOrder::Asc,
                     pos_in_table: 0,
                     collation: None,
@@ -2891,7 +2893,7 @@ mod tests {
                     expr: None,
                 },
                 IndexColumn {
-                    name: "c2".to_string(),
+                    name: Identifier::from("c2"),
                     order: SortOrder::Asc,
                     pos_in_table: 1,
                     collation: None,
@@ -2899,7 +2901,7 @@ mod tests {
                     expr: None,
                 },
                 IndexColumn {
-                    name: "c3".to_string(),
+                    name: Identifier::from("c3"),
                     order: SortOrder::Asc,
                     pos_in_table: 2,
                     collation: None,
@@ -2914,14 +2916,14 @@ mod tests {
             index_method: None,
             on_conflict: None,
         });
-        available_indexes.insert("t1".to_string(), VecDeque::from([index]));
+        available_indexes.insert(Identifier::from("t1"), VecDeque::from([index]));
 
         let table = Table::BTree(table);
         joined_tables.push(JoinedTable {
             op: Operation::default_scan_for(&table),
             table,
             internal_id: table_id_counter.next(),
-            identifier: "t1".to_string(),
+            identifier: Identifier::from("t1"),
             join_info: None,
             col_used_mask: ColumnUsedMask::default(),
             column_use_counts: Vec::new(),
@@ -3017,12 +3019,12 @@ mod tests {
         let columns = _create_column_list(&["c1", "c2", "c3"], Type::Integer);
         let table = _create_btree_table("t1", columns);
         let index = Arc::new(Index {
-            name: "idx1".to_string(),
-            table_name: "t1".to_string(),
+            name: Identifier::from("idx1"),
+            table_name: Identifier::from("t1"),
             where_clause: None,
             columns: vec![
                 IndexColumn {
-                    name: "c1".to_string(),
+                    name: Identifier::from("c1"),
                     order: SortOrder::Asc,
                     pos_in_table: 0,
                     collation: None,
@@ -3030,7 +3032,7 @@ mod tests {
                     expr: None,
                 },
                 IndexColumn {
-                    name: "c2".to_string(),
+                    name: Identifier::from("c2"),
                     order: SortOrder::Asc,
                     pos_in_table: 1,
                     collation: None,
@@ -3038,7 +3040,7 @@ mod tests {
                     expr: None,
                 },
                 IndexColumn {
-                    name: "c3".to_string(),
+                    name: Identifier::from("c3"),
                     order: SortOrder::Asc,
                     pos_in_table: 2,
                     collation: None,
@@ -3053,14 +3055,14 @@ mod tests {
             index_method: None,
             on_conflict: None,
         });
-        available_indexes.insert("t1".to_string(), VecDeque::from([index]));
+        available_indexes.insert(Identifier::from("t1"), VecDeque::from([index]));
 
         let table = Table::BTree(table);
         joined_tables.push(JoinedTable {
             op: Operation::default_scan_for(&table),
             table,
             internal_id: table_id_counter.next(),
-            identifier: "t1".to_string(),
+            identifier: Identifier::from("t1"),
             join_info: None,
             col_used_mask: ColumnUsedMask::default(),
             column_use_counts: Vec::new(),
@@ -3165,7 +3167,7 @@ mod tests {
 
     fn _create_column(c: &TestColumn) -> Column {
         Column::new(
-            Some(c.name.clone()),
+            Some(Identifier::from(c.name.as_str())),
             c.ty.to_string(),
             None,
             None,
@@ -3206,7 +3208,7 @@ mod tests {
         let logical_to_physical_map = BTreeTable::build_logical_to_physical_map(&columns);
         Arc::new(BTreeTable {
             root_page: 1, // Page number doesn't matter for tests
-            name: name.to_string(),
+            name: Identifier::from(name),
             has_autoincrement: false,
             primary_key_columns: vec![],
             columns,
@@ -3318,11 +3320,11 @@ mod tests {
         // Index on t2.a
         let mut available_indexes = HashMap::default();
         let index_t2_a = Arc::new(Index {
-            name: "idx_t2_a".to_string(),
-            table_name: "t2".to_string(),
+            name: Identifier::from("idx_t2_a"),
+            table_name: Identifier::from("t2"),
             where_clause: None,
             columns: vec![IndexColumn {
-                name: "a".to_string(),
+                name: Identifier::from("a"),
                 order: SortOrder::Asc,
                 pos_in_table: 0,
                 collation: None,
@@ -3336,7 +3338,7 @@ mod tests {
             index_method: None,
             on_conflict: None,
         });
-        available_indexes.insert("t2".to_string(), VecDeque::from([index_t2_a]));
+        available_indexes.insert(Identifier::from("t2"), VecDeque::from([index_t2_a]));
 
         // WHERE t1.a = t2.a
         let mut where_clause = vec![_create_binary_expr(

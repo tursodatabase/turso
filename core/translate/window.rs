@@ -26,6 +26,7 @@ use crate::{turso_assert, turso_assert_eq};
 use std::mem;
 use turso_parser::ast::Name;
 use turso_parser::ast::{Expr, FunctionTail, Literal, Over, SortOrder, TableInternalId};
+use turso_parser::identifier::Identifier;
 
 const SUBQUERY_DATABASE_ID: usize = 0;
 
@@ -241,7 +242,7 @@ fn prepare_window_subquery(
     )?;
 
     let subquery = JoinedTable::new_subquery(
-        format!("window_subquery_{processed_window_count}"),
+        Identifier::from(format!("window_subquery_{processed_window_count}")),
         inner_plan,
         None,
         subquery_id,
@@ -454,7 +455,7 @@ pub struct WindowMetadata<'a> {
     /// Maps expressions in the current query that reference subquery columns
     /// to their corresponding column indexes in the subquery’s result.
     pub expressions_referencing_subquery: Vec<(&'a Expr, usize)>,
-    pub buffer_table_name: String,
+    pub buffer_table_name: Identifier,
 }
 
 #[derive(Debug)]
@@ -546,7 +547,7 @@ impl EmitWindow {
             //  attached database. Other ephemeral tables are created similarly, so it’s left
             //  as-is for now. Ideally, there should be a way to mark tables as ephemeral so
             //  they can be handled differently from regular tables.
-            name: format!("buffer_table_{window_name}"),
+            name: Identifier::from(format!("buffer_table_{window_name}")),
             has_rowid: true,
             primary_key_columns: vec![],
             columns: src_columns,
@@ -952,7 +953,7 @@ fn emit_insert_row_into_buffer(
     registers: &WindowRegisters,
     cursors: &WindowCursors,
     input_column_count: &usize,
-    table_name: &str,
+    table_name: &Identifier,
 ) {
     let reg_record = program.alloc_register();
 

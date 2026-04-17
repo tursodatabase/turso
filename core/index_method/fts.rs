@@ -37,6 +37,7 @@ use tantivy::{
     DocAddress, HasLen, Index, IndexReader, IndexSettings, IndexWriter, Searcher, TantivyDocument,
 };
 use turso_parser::ast::{self, Select, SortOrder};
+use turso_parser::identifier::Identifier;
 
 /// Name identifier for the FTS index method, used in `CREATE INDEX ... USING fts`.
 pub const FTS_INDEX_METHOD_NAME: &str = "fts";
@@ -1407,7 +1408,7 @@ impl FtsIndexAttachment {
                         ),
                 )
                 .set_stored();
-            let field = schema_builder.add_text_field(&col.name, opts);
+            let field = schema_builder.add_text_field(col.name.as_str(), opts);
             text_fields.push((col.clone(), field));
         }
 
@@ -1488,7 +1489,7 @@ impl IndexMethodAttachment for FtsIndexAttachment {
     fn definition<'a>(&'a self) -> IndexMethodDefinition<'a> {
         IndexMethodDefinition {
             method_name: FTS_INDEX_METHOD_NAME,
-            index_name: &self.cfg.index_name,
+            index_name: self.cfg.index_name.as_str(),
             patterns: &self.patterns,
             backing_btree: false,
             results_materialized: true,
@@ -1811,7 +1812,11 @@ impl FtsCursor {
         let default_fields: Vec<Field> = text_fields.iter().map(|(_, f)| *f).collect();
         let field_boosts: Vec<(Field, f32)> = text_fields
             .iter()
-            .filter_map(|(col, field)| field_weights.get(&col.name).map(|&boost| (*field, boost)))
+            .filter_map(|(col, field)| {
+                field_weights
+                    .get(col.name.as_str())
+                    .map(|&boost| (*field, boost))
+            })
             .collect();
         Self {
             schema,
@@ -1853,7 +1858,12 @@ impl FtsCursor {
         let pager = conn.get_pager_from_database_index(&database_id);
         let scratch = conn
             .with_schema(database_id, |schema| {
-                schema.get_index(&self.dir_table_name, &index_name).cloned()
+                schema
+                    .get_index(
+                        &Identifier::from(self.dir_table_name.as_str()),
+                        &Identifier::from(index_name.as_str()),
+                    )
+                    .cloned()
             })
             .ok_or_else(|| {
                 LimboError::InternalError(format!(

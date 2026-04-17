@@ -530,7 +530,7 @@ pub(super) fn emit_autoindex(
         start_reg: to_u16(ephemeral_cols_start_reg),
         count: to_u16(num_regs_to_reserve),
         dest_reg: to_u16(record_reg),
-        index_name: Some(index.name.clone()),
+        index_name: Some(index.name.to_string()),
         affinity_str: affinity_str.map(|s| (**s).clone()),
     });
     // Skip bloom filter for non-binary collations since it uses binary hashing.

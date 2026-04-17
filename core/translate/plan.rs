@@ -4,6 +4,7 @@ use std::{cmp::Ordering, marker::PhantomData, sync::Arc};
 use turso_parser::ast::{
     self, FrameBound, FrameClause, FrameExclude, FrameMode, ResolveType, SortOrder, SubqueryType,
 };
+use turso_parser::identifier::Identifier;
 
 use crate::{
     function::{AggFunc, WindowFunc},
@@ -85,12 +86,11 @@ impl ResultSetColumn {
                         .table
                         .get_column_at(*column)
                         .unwrap()
-                        .name
-                        .as_deref()
+                        .name_str()
                 } else {
                     // Column references an outer query table (correlated subquery).
                     let (_, table_ref) = tables.find_table_by_internal_id(*table)?;
-                    table_ref.get_column_at(*column)?.name.as_deref()
+                    table_ref.get_column_at(*column)?.name_str()
                 }
             }
             ast::Expr::RowId { table, .. } => {
@@ -99,7 +99,7 @@ impl ResultSetColumn {
                 if let Table::BTree(table) = &table_ref {
                     if let Some(rowid_alias_column) = table.get_rowid_alias_column() {
                         if let Some(name) = &rowid_alias_column.1.name {
-                            return Some(name);
+                            return Some(name.as_str());
                         }
                     }
                 }
@@ -423,7 +423,7 @@ impl Plan {
 
     /// Returns true if this plan or any of its subplans read from the given table.
     /// (Not for Delete/Update plans)
-    fn reads_table(&self, database_id: usize, table_name: &str) -> bool {
+    fn reads_table(&self, database_id: usize, table_name: &Identifier) -> bool {
         match self {
             Plan::Select(select_plan) => select_plan.reads_table(database_id, table_name),
             Plan::CompoundSelect {
@@ -679,7 +679,7 @@ impl SelectPlan {
                 })
     }
 
-    fn reads_table(&self, database_id: usize, table_name: &str) -> bool {
+    fn reads_table(&self, database_id: usize, table_name: &Identifier) -> bool {
         self.table_references.joined_tables().iter().any(|table| {
             table.matches(database_id, table_name)
                 || match &table.table {
@@ -837,7 +837,7 @@ pub fn select_star(
                 .collect();
             for col in table.columns().iter().filter(|c| !c.hidden()) {
                 if let Some(col_name) = &col.name {
-                    let in_using = using_cols.iter().any(|u| u.eq_ignore_ascii_case(col_name));
+                    let in_using = using_cols.iter().any(|u| col_name == *u);
                     if !in_using {
                         crate::bail_parse_error!(
                             "ambiguous column name: {}.{}",
@@ -861,7 +861,7 @@ pub fn select_star(
                         !join_info.using.iter().any(|using_col| {
                             col.name
                                 .as_ref()
-                                .is_some_and(|name| name.eq_ignore_ascii_case(using_col.as_str()))
+                                .is_some_and(|name| name == using_col.as_str())
                         })
                     } else {
                         true
@@ -876,7 +876,7 @@ pub fn select_star(
                         if long_names {
                             format!("{}.{}", table.identifier, col_name)
                         } else {
-                            col_name.clone()
+                            col_name.to_string()
                         }
                     });
                     ResultSetColumn {
@@ -969,7 +969,7 @@ pub struct JoinedTable {
     /// Table object, which contains metadata about the table, e.g. columns.
     pub table: Table,
     /// The name of the table as referred to in the query, either the literal name or an alias e.g. "users" or "u"
-    pub identifier: String,
+    pub identifier: Identifier,
     /// Internal ID of the table reference, used in e.g. [Expr::Column] to refer to this table.
     pub internal_id: TableInternalId,
     /// The join info for this table reference, if it is the right side of a join (which all except the first table reference have)
@@ -1000,7 +1000,7 @@ pub struct JoinedTable {
 #[derive(Debug, Clone)]
 pub struct OuterQueryReference {
     /// The name of the table as referred to in the query, either the literal name or an alias e.g. "users" or "u"
-    pub identifier: String,
+    pub identifier: Identifier,
     /// Internal ID of the table reference, used in e.g. [Expr::Column] to refer to this table.
     pub internal_id: TableInternalId,
     /// Table object, which contains metadata about the table, e.g. columns.
@@ -1221,15 +1221,15 @@ impl TableReferences {
 
     /// Returns an immutable reference to the [Table] with the given identifier,
     /// where identifier is either the literal name of the table or an alias.
-    pub fn find_table_by_identifier(&self, identifier: &str) -> Option<&Table> {
+    pub fn find_table_by_identifier(&self, identifier: &Identifier) -> Option<&Table> {
         self.joined_tables
             .iter()
-            .find(|t| t.identifier == identifier)
+            .find(|t| t.identifier == *identifier)
             .map(|t| &t.table)
             .or_else(|| {
                 self.outer_query_refs
                     .iter()
-                    .find(|t| t.identifier == identifier)
+                    .find(|t| t.identifier == *identifier)
                     .map(|t| &t.table)
             })
     }
@@ -1240,15 +1240,15 @@ impl TableReferences {
     /// (e.g. "a"). This is needed when looking up column metadata for
     /// ephemeral auto-indexes, whose `table_name` field stores the base name
     /// while the table reference may be aliased.
-    pub fn find_table_by_table_name(&self, name: &str) -> Option<&Table> {
+    pub fn find_table_by_table_name(&self, name: &Identifier) -> Option<&Table> {
         self.joined_tables
             .iter()
-            .find(|t| t.table.get_name() == name)
+            .find(|t| *t.table.get_name() == *name)
             .map(|t| &t.table)
             .or_else(|| {
                 self.outer_query_refs
                     .iter()
-                    .find(|t| t.table.get_name() == name)
+                    .find(|t| *t.table.get_name() == *name)
                     .map(|t| &t.table)
             })
     }
@@ -1257,11 +1257,11 @@ impl TableReferences {
     /// where identifier is either the literal name of the table or an alias.
     pub fn find_outer_query_ref_by_identifier(
         &self,
-        identifier: &str,
+        identifier: &Identifier,
     ) -> Option<&OuterQueryReference> {
         self.outer_query_refs
             .iter()
-            .find(|t| t.identifier == identifier)
+            .find(|t| t.identifier == *identifier)
     }
 
     /// Marks the pre-planned [OuterQueryReference] with the given identifier as
@@ -1269,11 +1269,11 @@ impl TableReferences {
     /// resolution while still allowing CTE definition lookup in subquery FROM
     /// clauses. Called when a CTE is consumed by a FROM clause, since column
     /// resolution is then handled by the joined_table entry instead.
-    pub fn mark_outer_query_ref_cte_definition_only(&mut self, identifier: &str) {
+    pub fn mark_outer_query_ref_cte_definition_only(&mut self, identifier: &Identifier) {
         if let Some(outer_ref) = self
             .outer_query_refs
             .iter_mut()
-            .find(|t| t.identifier == identifier)
+            .find(|t| t.identifier == *identifier)
         {
             outer_ref.cte_definition_only = true;
         }
@@ -1282,16 +1282,16 @@ impl TableReferences {
     /// Returns the internal ID and immutable reference to the [Table] with the given identifier,
     pub fn find_table_and_internal_id_by_identifier(
         &self,
-        identifier: &str,
+        identifier: &Identifier,
     ) -> Option<(TableInternalId, &Table)> {
         self.joined_tables
             .iter()
-            .find(|t| t.identifier == identifier)
+            .find(|t| t.identifier == *identifier)
             .map(|t| (t.internal_id, &t.table))
             .or_else(|| {
                 self.outer_query_refs
                     .iter()
-                    .find(|t| t.identifier == identifier && !t.cte_definition_only)
+                    .find(|t| t.identifier == *identifier && !t.cte_definition_only)
                     .map(|t| (t.internal_id, &t.table))
             })
     }
@@ -2010,15 +2010,15 @@ impl JoinedTable {
         }
     }
 
-    fn matches(&self, database_id: usize, table_name: &str) -> bool {
+    fn matches(&self, database_id: usize, table_name: &Identifier) -> bool {
         self.database_id == database_id
             && matches!(self.table, Table::BTree(_) | Table::Virtual(_))
-            && self.table.get_name().eq_ignore_ascii_case(table_name)
+            && *self.table.get_name() == *table_name
     }
 
     /// Creates a new TableReference for a subquery from a SelectPlan.
     pub fn new_subquery(
-        identifier: String,
+        identifier: Identifier,
         plan: SelectPlan,
         join_info: Option<JoinInfo>,
         internal_id: TableInternalId,
@@ -2030,7 +2030,7 @@ impl JoinedTable {
                 let (col_type, type_name) =
                     infer_type_from_expr(&rc.expr, Some(&plan.table_references));
                 Column::new(
-                    rc.name(&plan.table_references).map(String::from),
+                    rc.name(&plan.table_references).map(Identifier::from),
                     type_name.to_string(),
                     None,
                     None,
@@ -2082,7 +2082,7 @@ impl JoinedTable {
     /// If `materialize_hint` is true, the CTE was declared with AS MATERIALIZED and should always
     /// be materialized regardless of reference count.
     pub fn new_subquery_from_plan(
-        identifier: String,
+        identifier: Identifier,
         plan: Plan,
         join_info: Option<JoinInfo>,
         internal_id: TableInternalId,
@@ -2121,9 +2121,9 @@ impl JoinedTable {
             .enumerate()
             .map(|(i, rc)| {
                 // Use explicit column name if provided, otherwise derive from result column
-                let col_name = explicit_columns
-                    .and_then(|cols| cols.get(i).cloned())
-                    .or_else(|| rc.name(table_references).map(String::from));
+                let col_name: Option<Identifier> = explicit_columns
+                    .and_then(|cols| cols.get(i).map(|s| Identifier::from(s.as_str())))
+                    .or_else(|| rc.name(table_references).map(Identifier::from));
                 let (col_type, type_name) = infer_type_from_expr(&rc.expr, Some(table_references));
                 Column::new(
                     col_name,
@@ -2905,7 +2905,7 @@ impl NonFromClauseSubquery {
             && matches!(self.eval_phase, SubqueryEvalPhase::PostWriteReturning)
     }
 
-    pub fn reads_table(&self, database_id: usize, table_name: &str) -> bool {
+    pub fn reads_table(&self, database_id: usize, table_name: &Identifier) -> bool {
         match &self.state {
             SubqueryState::Unevaluated { plan: Some(plan) } => {
                 Plan::reads_table(plan, database_id, table_name)

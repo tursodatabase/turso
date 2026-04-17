@@ -35,9 +35,7 @@ pub use crate::translate::trigger_exec::{
     get_triggers_including_temp, has_triggers_including_temp,
 };
 use crate::translate::window::WindowMetadata;
-use crate::util::{
-    check_expr_references_column, exprs_are_equivalent, normalize_ident, parse_numeric_literal,
-};
+use crate::util::{check_expr_references_column, exprs_are_equivalent, parse_numeric_literal};
 use crate::vdbe::affinity::Affinity;
 use crate::vdbe::builder::{CursorType, DmlColumnContext, ProgramBuilder, SelfTableContext};
 use crate::vdbe::insn::{to_u16, InsertFlags};
@@ -48,6 +46,7 @@ use tracing::instrument;
 use turso_parser::ast::{
     self, Expr, Literal, ResolveType, SubqueryType, TableInternalId, TriggerTime,
 };
+use turso_parser::identifier::Identifier;
 
 pub(crate) mod delete;
 pub(crate) mod gencol;
@@ -450,9 +449,10 @@ impl<'a> Resolver<'a> {
     }
 
     fn schema_has_table_like_object(schema: &Schema, table_name: &str) -> bool {
-        schema.get_table(table_name).is_some()
-            || schema.get_view(table_name).is_some()
-            || schema.get_materialized_view(table_name).is_some()
+        let id = Identifier::from(table_name);
+        schema.get_table(&id).is_some()
+            || schema.get_view(&id).is_some()
+            || schema.get_materialized_view(&id).is_some()
     }
 
     fn schema_has_index(schema: &Schema, index_name: &str) -> bool {
@@ -460,11 +460,13 @@ impl<'a> Resolver<'a> {
             .indexes
             .values()
             .flat_map(|indexes| indexes.iter())
-            .any(|index| index.name.eq_ignore_ascii_case(index_name))
+            .any(|index| index.name == index_name)
     }
 
     fn schema_has_trigger(schema: &Schema, trigger_name: &str) -> bool {
-        schema.get_trigger(trigger_name).is_some()
+        schema
+            .get_trigger(&Identifier::from(trigger_name))
+            .is_some()
     }
 
     fn resolve_schema_table_database_id(table_name: &str) -> Option<usize> {
@@ -523,8 +525,10 @@ impl<'a> Resolver<'a> {
             return self.resolve_database_id(qualified_name);
         }
 
-        let index_name = normalize_ident(qualified_name.name.as_str());
-        Ok(self.resolve_unqualified_existing_database_id(&index_name, Self::schema_has_index))
+        Ok(self.resolve_unqualified_existing_database_id(
+            qualified_name.name.as_str(),
+            Self::schema_has_index,
+        ))
     }
 
     pub(crate) fn resolve_existing_trigger_database_id(
@@ -543,22 +547,18 @@ impl<'a> Resolver<'a> {
     pub(crate) fn resolve_database_id(&self, qualified_name: &ast::QualifiedName) -> Result<usize> {
         // Check if this is a qualified name (database.table) or unqualified
         let resolved_id = if let Some(db_name) = &qualified_name.db_name {
-            let db_name_normalized = normalize_ident(db_name.as_str());
-            match db_name_normalized.as_str() {
-                "main" => Ok(0),
-                "temp" => Ok(1),
-                _ => {
-                    // Look up attached database
-                    if let Some((idx, _attached_db)) =
-                        self.get_attached_database(&db_name_normalized)
-                    {
-                        Ok(idx)
-                    } else {
-                        Err(LimboError::InvalidArgument(format!(
-                            "no such database: {db_name_normalized}"
-                        )))
-                    }
-                }
+            if *db_name == "main" {
+                Ok(0)
+            } else if *db_name == "temp" {
+                Ok(1)
+            } else if let Some((idx, _attached_db)) =
+                self.get_attached_database(db_name.identifier())
+            {
+                Ok(idx)
+            } else {
+                Err(LimboError::InvalidArgument(format!(
+                    "no such database: {db_name}"
+                )))
             }
         } else {
             // Unqualified table name — when compiling a trigger subprogram,
@@ -598,9 +598,13 @@ impl<'a> Resolver<'a> {
         Ok(resolved_id)
     }
 
-    // Get an attached database by alias name
-    pub(crate) fn get_attached_database(&self, alias: &str) -> Option<(usize, Arc<Database>)> {
-        self.attached_databases.read().get_database_by_name(alias)
+    pub(crate) fn get_attached_database(
+        &self,
+        alias: &Identifier,
+    ) -> Option<(usize, Arc<Database>)> {
+        self.attached_databases
+            .read()
+            .get_database_by_name(alias.as_str())
     }
 
     /// Get the database name for a given database index.
@@ -915,7 +919,7 @@ pub fn emit_program(
 
 /// Returns the single-column schema used by rowid-only hash build inputs.
 fn build_rowid_column() -> Column {
-    Column::new_default_integer(Some("build_rowid".to_string()), "INTEGER".to_string(), None)
+    Column::new_default_integer(Some("build_rowid".into()), "INTEGER".to_string(), None)
 }
 
 pub fn prepare_cdc_if_necessary(
@@ -933,7 +937,7 @@ pub fn prepare_cdc_if_necessary(
     {
         return Ok(None);
     }
-    let Some(turso_cdc_table) = schema.get_table(cdc_table) else {
+    let Some(turso_cdc_table) = schema.get_table(&Identifier::from(cdc_table)) else {
         crate::bail_parse_error!("no such table: {}", cdc_table);
     };
     let Some(cdc_btree) = turso_cdc_table.btree() else {
@@ -1064,7 +1068,7 @@ pub fn emit_cdc_insns(
     before_record_reg: Option<usize>,
     after_record_reg: Option<usize>,
     updates_record_reg: Option<usize>,
-    table_name: &str,
+    table_name: &Identifier,
 ) -> Result<()> {
     let cdc_info = program.capture_data_changes_info().as_ref();
     match cdc_info.map(|info| info.cdc_version()) {
@@ -1077,7 +1081,7 @@ pub fn emit_cdc_insns(
             before_record_reg,
             after_record_reg,
             updates_record_reg,
-            table_name,
+            table_name.as_str(),
         ),
         Some(crate::CdcVersion::V1) => emit_cdc_insns_v1(
             program,
@@ -1088,7 +1092,7 @@ pub fn emit_cdc_insns(
             before_record_reg,
             after_record_reg,
             updates_record_reg,
-            table_name,
+            table_name.as_str(),
         ),
         None => Err(crate::LimboError::InternalError(
             "cdc info not set".to_string(),
@@ -1587,12 +1591,11 @@ fn rewrite_where_for_update_registers(
     walk_expr_mut(expr, &mut |e: &mut Expr| -> Result<WalkControl> {
         match e {
             Expr::Qualified(_, col) | Expr::DoublyQualified(_, _, col) => {
-                let normalized = normalize_ident(col.as_str());
-                if let Some((idx, c)) = columns.iter().enumerate().find(|(_, c)| {
-                    c.name
-                        .as_ref()
-                        .is_some_and(|n| n.eq_ignore_ascii_case(&normalized))
-                }) {
+                if let Some((idx, c)) = columns
+                    .iter()
+                    .enumerate()
+                    .find(|(_, c)| c.name.as_ref().is_some_and(|n| n == col.as_str()))
+                {
                     if c.is_rowid_alias() {
                         *e = Expr::Register(rowid_reg);
                     } else {
@@ -1601,17 +1604,13 @@ fn rewrite_where_for_update_registers(
                 }
             }
             Expr::Id(name) => {
-                let normalized = normalize_ident(name.as_str());
-                if ROWID_STRS
-                    .iter()
-                    .any(|s| s.eq_ignore_ascii_case(&normalized))
-                {
+                if ROWID_STRS.iter().any(|s| *name == **s) {
                     *e = Expr::Register(rowid_reg);
-                } else if let Some((idx, c)) = columns.iter().enumerate().find(|(_, c)| {
-                    c.name
-                        .as_ref()
-                        .is_some_and(|n| n.eq_ignore_ascii_case(&normalized))
-                }) {
+                } else if let Some((idx, c)) = columns
+                    .iter()
+                    .enumerate()
+                    .find(|(_, c)| c.name.as_ref().is_some_and(|n| n == name.as_str()))
+                {
                     if c.is_rowid_alias() {
                         *e = Expr::Register(rowid_reg);
                     } else {
@@ -1850,7 +1849,7 @@ fn emit_check_constraint_bytecode(
             if let Some(joined_table) = binding_tables.joined_tables_mut().first_mut() {
                 // CHECK expressions come from schema SQL and may use the base table name
                 // even when the query references the table through an alias.
-                joined_table.identifier = table_name.to_string();
+                joined_table.identifier = Identifier::from(table_name);
             }
             bind_and_rewrite_expr(
                 &mut rewritten_expr,
@@ -1886,7 +1885,7 @@ fn emit_check_constraint_bytecode(
         });
 
         let constraint_name = match &check_constraint.name {
-            Some(name) => name.clone(),
+            Some(name) => name.to_string(),
             None => format!("{}", check_constraint.expr),
         };
 
@@ -1920,10 +1919,10 @@ fn emit_check_constraint_bytecode(
 /// normalized name is in `column_names`. This is used during UPDATE to skip
 /// CHECK constraints that only reference columns not in the SET clause, matching
 /// SQLite's optimization behavior.
-fn check_expr_references_columns(expr: &ast::Expr, column_names: &HashSet<String>) -> bool {
+fn check_expr_references_columns(expr: &ast::Expr, column_names: &HashSet<Identifier>) -> bool {
     column_names
         .iter()
-        .any(|name| check_expr_references_column(expr, name))
+        .any(|name| check_expr_references_column(expr, name.as_str()))
 }
 
 /// Emit CHECK constraint evaluation with resolver cache setup and teardown.
@@ -1966,11 +1965,10 @@ pub(crate) fn emit_check_constraints<'a>(
     for (col_name, register) in column_mappings.iter().copied() {
         let collation = joined_table
             .and_then(|table| {
-                table.columns().iter().find(|col| {
-                    col.name
-                        .as_ref()
-                        .is_some_and(|name| name.eq_ignore_ascii_case(col_name))
-                })
+                table
+                    .columns()
+                    .iter()
+                    .find(|col| col.name.as_ref().is_some_and(|name| name == col_name))
             })
             .map(|col| (col.collation(), false));
         let column_expr = ast::Expr::Id(ast::Name::exact(col_name.to_string()));
@@ -1994,11 +1992,12 @@ pub(crate) fn emit_check_constraints<'a>(
         );
 
         for (col_name, register) in column_mappings.iter().copied() {
-            if let Some((idx, col)) = joined_table.columns().iter().enumerate().find(|(_, c)| {
-                c.name
-                    .as_ref()
-                    .is_some_and(|n| n.eq_ignore_ascii_case(col_name))
-            }) {
+            if let Some((idx, col)) = joined_table
+                .columns()
+                .iter()
+                .enumerate()
+                .find(|(_, c)| c.name.as_ref().is_some_and(|n| n == col_name))
+            {
                 resolver.cache_expr_reg(
                     Cow::Owned(ast::Expr::Column {
                         database: None,

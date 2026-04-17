@@ -9001,6 +9001,7 @@ mod tests {
 
     fn btree_index_insert_fuzz_run(attempts: usize, inserts: usize) {
         use crate::storage::pager::CreateBTreeFlags;
+        use turso_parser::identifier::Identifier;
 
         let (mut rng, seed) = if std::env::var("SEED").is_ok() {
             let seed = std::env::var("SEED").unwrap();
@@ -9019,11 +9020,11 @@ mod tests {
                 .block(|| pager.btree_create(&CreateBTreeFlags::new_index()))
                 .unwrap() as i64;
             let index_def = Index {
-                name: "testindex".to_string(),
+                name: Identifier::from("testindex"),
                 where_clause: None,
                 columns: (0..10)
                     .map(|i| IndexColumn {
-                        name: format!("test{i}"),
+                        name: Identifier::from(format!("test{i}")),
                         order: SortOrder::Asc,
                         collation: None,
                         pos_in_table: i,
@@ -9031,7 +9032,7 @@ mod tests {
                         expr: None,
                     })
                     .collect(),
-                table_name: "test".to_string(),
+                table_name: Identifier::from("test"),
                 root_page: index_root_page,
                 unique: false,
                 ephemeral: false,
@@ -9174,6 +9175,7 @@ mod tests {
         insert_chance: f64,
     ) {
         use crate::storage::pager::CreateBTreeFlags;
+        use turso_parser::identifier::Identifier;
 
         let (mut rng, seed) = if std::env::var("SEED").is_ok() {
             let seed = std::env::var("SEED").unwrap();
@@ -9193,17 +9195,17 @@ mod tests {
                 .block(|| pager.btree_create(&CreateBTreeFlags::new_index()))
                 .unwrap() as i64;
             let index_def = Index {
-                name: "testindex".to_string(),
+                name: Identifier::from("testindex"),
                 where_clause: None,
                 columns: vec![IndexColumn {
-                    name: "testcol".to_string(),
+                    name: Identifier::from("testcol"),
                     order: SortOrder::Asc,
                     collation: None,
                     pos_in_table: 0,
                     default: None,
                     expr: None,
                 }],
-                table_name: "test".to_string(),
+                table_name: Identifier::from("test"),
                 root_page: index_root_page,
                 unique: false,
                 ephemeral: false,

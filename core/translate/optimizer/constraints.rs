@@ -16,6 +16,7 @@ use rustc_hash::FxHashMap as HashMap;
 use std::{cmp::Ordering, collections::VecDeque, sync::Arc};
 use turso_ext::{ConstraintInfo, ConstraintOp};
 use turso_parser::ast::{self, SortOrder, TableInternalId};
+use turso_parser::identifier::Identifier;
 
 use super::cost_params::CostModelParams;
 
@@ -250,7 +251,7 @@ fn estimate_selectivity(
     table_name: &str,
     column: Option<&Column>,
     column_pos: Option<usize>,
-    available_indexes: &HashMap<String, VecDeque<Arc<Index>>>,
+    available_indexes: &HashMap<Identifier, VecDeque<Arc<Index>>>,
     op: ConstraintOperator,
     params: &CostModelParams,
     is_rowid: bool,
@@ -275,7 +276,7 @@ fn estimate_selectivity(
                 selectivity_when_unique
             } else if let Some(col_pos) = column_pos {
                 // For non-unique columns, find an index containing this column and use its stats
-                if let Some(indexes) = available_indexes.get(table_name) {
+                if let Some(indexes) = available_indexes.get(&Identifier::from(table_name)) {
                     for index in indexes {
                         // Check if this index has our column as its first column
                         // (selectivity is most accurate when column is leftmost in index)
@@ -339,13 +340,13 @@ fn estimate_constraint_selectivity(
     column: Option<&Column>,
     column_pos: Option<usize>,
     operator: ConstraintOperator,
-    available_indexes: &HashMap<String, VecDeque<Arc<Index>>>,
+    available_indexes: &HashMap<Identifier, VecDeque<Arc<Index>>>,
     params: &CostModelParams,
     is_rowid: bool,
 ) -> f64 {
     estimate_selectivity(
         schema,
-        table_reference.table.get_name(),
+        table_reference.table.get_name().as_str(),
         column,
         column_pos,
         available_indexes,
@@ -379,7 +380,7 @@ fn expression_matches_table(
 pub fn constraints_from_where_clause(
     where_clause: &[WhereTerm],
     table_references: &TableReferences,
-    available_indexes: &HashMap<String, VecDeque<Arc<Index>>>,
+    available_indexes: &HashMap<Identifier, VecDeque<Arc<Index>>>,
     subqueries: &[NonFromClauseSubquery],
     schema: &Schema,
     params: &CostModelParams,
@@ -502,7 +503,7 @@ pub fn constraints_from_where_clause(
                             false,
                         );
                         tracing::debug!(
-                            table = table_reference.table.get_name(),
+                            table = table_reference.table.get_name().as_str(),
                             where_clause_pos = i,
                             operator = ?operator,
                             lhs_mask = ?table_mask_from_expr(rhs, table_references, subqueries)?,
@@ -596,7 +597,7 @@ pub fn constraints_from_where_clause(
                             false,
                         );
                         tracing::debug!(
-                            table = table_reference.table.get_name(),
+                            table = table_reference.table.get_name().as_str(),
                             where_clause_pos = i,
                             operator = ?operator,
                             lhs_mask = ?table_mask_from_expr(lhs, table_references, subqueries)?,
@@ -633,7 +634,7 @@ pub fn constraints_from_where_clause(
                 }
                 let table_stats = schema
                     .analyze_stats
-                    .table_stats(table_reference.table.get_name());
+                    .table_stats(table_reference.table.get_name().as_str());
                 let row_count = table_stats
                     .and_then(|s| s.row_count)
                     .unwrap_or(params.rows_per_table_fallback as u64)
@@ -698,7 +699,7 @@ pub fn constraints_from_where_clause(
                     let estimated_values = params.in_subquery_rows;
                     let table_stats = schema
                         .analyze_stats
-                        .table_stats(table_reference.table.get_name());
+                        .table_stats(table_reference.table.get_name().as_str());
                     let row_count = table_stats
                         .and_then(|s| s.row_count)
                         .unwrap_or(params.rows_per_table_fallback as u64)
@@ -1393,7 +1394,7 @@ pub(crate) fn analyze_binary_term_for_index(
     table_reference: &JoinedTable,
     indexes: Option<&VecDeque<Arc<Index>>>,
     rowid_alias_column: Option<usize>,
-    available_indexes: &HashMap<String, VecDeque<Arc<Index>>>,
+    available_indexes: &HashMap<Identifier, VecDeque<Arc<Index>>>,
     table_references: &TableReferences,
     subqueries: &[NonFromClauseSubquery],
     schema: &Schema,

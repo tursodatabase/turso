@@ -64,6 +64,7 @@ use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use std::{cmp::Ordering, collections::VecDeque, sync::Arc};
 use turso_ext::{ConstraintInfo, ConstraintUsage};
 use turso_parser::ast::{self, Expr, SortOrder, SubqueryType, TriggerEvent};
+use turso_parser::identifier::Identifier;
 
 pub(crate) mod access_method;
 pub(crate) mod constraints;
@@ -351,7 +352,7 @@ fn sorted_arguments_from_parameters(parameters: &HashMap<i32, ast::Expr>) -> Vec
 #[allow(clippy::too_many_arguments)]
 fn collect_index_method_candidates(
     table_references: &TableReferences,
-    available_indexes: &HashMap<String, VecDeque<Arc<Index>>>,
+    available_indexes: &HashMap<Identifier, VecDeque<Arc<Index>>>,
     where_clause: &[WhereTerm],
     order_by: &[(
         Box<ast::Expr>,
@@ -949,7 +950,7 @@ fn add_ephemeral_table_to_update_plan(
     let logical_to_physical_map = BTreeTable::build_logical_to_physical_map(&columns);
     let ephemeral_table = Arc::new(BTreeTable {
         root_page: 0, // Not relevant for ephemeral table definition
-        name: "ephemeral_scratch".to_string(),
+        name: Identifier::from("ephemeral_scratch"),
         has_rowid: true,
         has_autoincrement: false,
         primary_key_columns: vec![],
@@ -972,7 +973,7 @@ fn add_ephemeral_table_to_update_plan(
     let table_references_update = TableReferences::new(
         vec![JoinedTable {
             table: Table::BTree(ephemeral_table.clone()),
-            identifier: "ephemeral_scratch".to_string(),
+            identifier: Identifier::from("ephemeral_scratch"),
             internal_id,
             op: Operation::Scan(Scan::BTreeTable {
                 iter_dir: IterationDirection::Forwards,
@@ -1202,7 +1203,7 @@ fn select_plan_contains_cte_from_clause_subquery(plan: &SelectPlan) -> bool {
 fn optimize_table_access_with_custom_modules(
     result_columns: &mut [ResultSetColumn],
     table_references: &mut TableReferences,
-    available_indexes: &HashMap<String, VecDeque<Arc<Index>>>,
+    available_indexes: &HashMap<Identifier, VecDeque<Arc<Index>>>,
     where_query: &mut [WhereTerm],
     order_by: &mut Vec<(
         Box<ast::Expr>,
@@ -1363,7 +1364,7 @@ fn base_row_estimate(
 ) -> RowCountEstimate {
     match &table.table {
         Table::BTree(btree) => {
-            if let Some(stats) = schema.analyze_stats.table_stats(&btree.name) {
+            if let Some(stats) = schema.analyze_stats.table_stats(btree.name.as_str()) {
                 if let Some(rows) = stats.row_count.or_else(|| {
                     stats
                         .index_stats
@@ -1536,7 +1537,7 @@ fn expr_has_null_masking_for_table(expr: &ast::Expr, table_id: ast::TableInterna
 /// filtering constraint candidates accordingly.
 fn enforce_indexed_by_hints(
     table_references: &TableReferences,
-    available_indexes: &HashMap<String, VecDeque<Arc<Index>>>,
+    available_indexes: &HashMap<Identifier, VecDeque<Arc<Index>>>,
     constraints_per_table: &mut [TableConstraints],
 ) -> Result<()> {
     for (i, table_ref) in table_references.joined_tables().iter().enumerate() {
@@ -1554,9 +1555,9 @@ fn enforce_indexed_by_hints(
                 let idx_name = name.as_str();
                 // Verify the index exists and belongs to this table.
                 let forced_index = available_indexes.get(&btree.name).and_then(|indexes| {
-                    indexes.iter().find(|idx| {
-                        idx.name.eq_ignore_ascii_case(idx_name) && idx.index_method.is_none()
-                    })
+                    indexes
+                        .iter()
+                        .find(|idx| idx.name == idx_name && idx.index_method.is_none())
                 });
                 let Some(forced_index) = forced_index else {
                     crate::bail_parse_error!("no such index: {}", idx_name);
@@ -1602,7 +1603,7 @@ fn optimize_table_access(
     schema: &Schema,
     result_columns: &mut [ResultSetColumn],
     table_references: &mut TableReferences,
-    available_indexes: &HashMap<String, VecDeque<Arc<Index>>>,
+    available_indexes: &HashMap<Identifier, VecDeque<Arc<Index>>>,
     where_clause: &mut [WhereTerm],
     order_by: &mut Vec<(
         Box<ast::Expr>,
@@ -2969,11 +2970,12 @@ fn ephemeral_index_build(
             "ephemeral_{}_{}",
             table_reference.table.get_name(),
             table_reference.internal_id
-        ),
+        )
+        .into(),
         columns: ephemeral_columns,
         unique: false,
         ephemeral: true,
-        table_name: table_reference.table.get_name().to_string(),
+        table_name: table_reference.table.get_name().clone(),
         root_page: 0,
         where_clause: None,
         has_rowid: table_reference

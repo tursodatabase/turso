@@ -4,6 +4,7 @@ use std::{
 };
 
 use turso_parser::ast::{self, SortOrder};
+use turso_parser::identifier::Identifier;
 
 use crate::numeric::Numeric;
 use crate::util::quote_identifier;
@@ -341,7 +342,7 @@ impl IndexMethodAttachment for VectorSparseInvertedIndexMethodAttachment {
     fn definition<'a>(&'a self) -> IndexMethodDefinition<'a> {
         IndexMethodDefinition {
             method_name: TOY_VECTOR_SPARSE_IVF_INDEX_METHOD_NAME,
-            index_name: &self.configuration.index_name,
+            index_name: self.configuration.index_name.as_str(),
             patterns: self.patterns.as_slice(),
             backing_btree: false,
             results_materialized: true,
@@ -412,7 +413,7 @@ impl IndexMethodCursor for VectorSparseInvertedIndexMethodCursor {
             .filter(|name| name != "main")
             .map(|name| format!("{}.", quote_identifier(&name)))
             .unwrap_or_default();
-        let quoted_table = quote_identifier(&self.configuration.table_name);
+        let quoted_table = quote_identifier(self.configuration.table_name.as_str());
         let quoted_cols = columns
             .iter()
             .map(|c| quote_identifier(c))
@@ -484,7 +485,7 @@ impl IndexMethodCursor for VectorSparseInvertedIndexMethodCursor {
             connection,
             database_id,
             &self.configuration.table_name,
-            &self.inverted_index_btree,
+            &Identifier::from(self.inverted_index_btree.as_str()),
             // component, length, rowid
             vec![key_info(), key_info(), key_info()],
         )?);
@@ -492,7 +493,7 @@ impl IndexMethodCursor for VectorSparseInvertedIndexMethodCursor {
             connection,
             database_id,
             &self.configuration.table_name,
-            &self.stats_btree,
+            &Identifier::from(self.stats_btree.as_str()),
             // component
             vec![key_info()],
         )?);
@@ -513,7 +514,7 @@ impl IndexMethodCursor for VectorSparseInvertedIndexMethodCursor {
             connection,
             database_id,
             &self.configuration.table_name,
-            &self.inverted_index_btree,
+            &Identifier::from(self.inverted_index_btree.as_str()),
             // component, length, rowid
             vec![key_info(), key_info(), key_info()],
         )?);
@@ -521,7 +522,7 @@ impl IndexMethodCursor for VectorSparseInvertedIndexMethodCursor {
             connection,
             database_id,
             &self.configuration.table_name,
-            &self.stats_btree,
+            &Identifier::from(self.stats_btree.as_str()),
             // component
             vec![key_info()],
         )?);

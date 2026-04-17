@@ -19,7 +19,7 @@ use crate::translate::planner::{
 use crate::translate::result_row::emit_select_result;
 use crate::translate::subquery::{plan_subqueries_from_select_plan, plan_subqueries_from_values};
 use crate::translate::window::plan_windows;
-use crate::util::{exprs_are_equivalent, normalize_ident};
+use crate::util::exprs_are_equivalent;
 use crate::vdbe::builder::ProgramBuilderOpts;
 use crate::vdbe::insn::Insn;
 use crate::{vdbe::builder::ProgramBuilder, Result};
@@ -111,7 +111,7 @@ fn select_plan_first_virtual_table_name(select_plan: &SelectPlan) -> Option<Stri
     for joined_table in select_plan.joined_tables() {
         match &joined_table.table {
             Table::Virtual(virtual_table) if !virtual_table.innocuous => {
-                return Some(virtual_table.name.clone())
+                return Some(virtual_table.name.to_string())
             }
             Table::FromClauseSubquery(from_clause_subquery) => {
                 if let Some(name) = plan_first_virtual_table_name(&from_clause_subquery.plan) {
@@ -352,8 +352,10 @@ fn prepare_one_select_plan(
 
             let mut windows = Vec::with_capacity(window_clause.len());
             for window_def in window_clause.iter() {
-                let name = normalize_ident(window_def.name.as_str());
-                let mut window = Window::new(Some(name), &window_def.window)?;
+                let mut window = Window::new(
+                    Some(window_def.name.as_str().to_owned()),
+                    &window_def.window,
+                )?;
 
                 for expr in window.partition_by.iter_mut() {
                     bind_and_rewrite_expr(
@@ -400,21 +402,21 @@ fn prepare_one_select_plan(
                         }
                     }
                     ResultColumn::TableStar(name) => {
-                        let name_normalized = normalize_ident(name.as_str());
                         // If this table identifier appears more than once in the FROM
                         // clause, `A.*` is ambiguous (matches SQLite behavior).
                         let dup_count = plan
                             .table_references
                             .joined_tables()
                             .iter()
-                            .filter(|t| t.identifier == name_normalized)
+                            //TODO as_str necessary for this and the following occurrences?
+                            .filter(|t| name == t.identifier.as_str())
                             .count();
                         if dup_count > 1 {
                             let first_tbl = plan
                                 .table_references
                                 .joined_tables()
                                 .iter()
-                                .find(|t| t.identifier == name_normalized)
+                                .find(|t| name == t.identifier.as_str())
                                 .unwrap(); // safe: dup_count > 1 guarantees a match
                             let col_name = first_tbl
                                 .columns()
@@ -433,7 +435,7 @@ fn prepare_one_select_plan(
                             .table_references
                             .joined_tables_mut()
                             .iter_mut()
-                            .find(|t| t.identifier == name_normalized);
+                            .find(|t| name == t.identifier.as_str());
 
                         if referenced_table.is_none() {
                             crate::bail_parse_error!("no such table: {}", name.as_str());
@@ -449,7 +451,7 @@ fn prepare_one_select_plan(
                                 if long_names {
                                     format!("{}.{}", table.identifier, col_name)
                                 } else {
-                                    col_name.clone()
+                                    col_name.to_string()
                                 }
                             });
                             plan.result_columns.push(ResultSetColumn {
@@ -900,7 +902,7 @@ fn reject_outer_query_refs_in_group_by_expr(
                     let column_name = outer_ref
                         .columns()
                         .get(*column)
-                        .and_then(|col| col.name.as_deref())
+                        .and_then(|col| col.name_str())
                         .expect(
                             "bound outer-scope Expr::Column must point to a named column in schema",
                         );
@@ -978,7 +980,7 @@ fn reject_outer_scope_refs_inside_select_plan(
             let column_name = outer_ref
                 .columns()
                 .get(col_idx)
-                .and_then(|col| col.name.as_deref())
+                .and_then(|col| col.name_str())
                 .expect("bound outer-scope Expr::Column must point to a named column in schema");
             crate::bail_parse_error!("no such column: {}.{}", outer_ref.identifier, column_name);
         }
@@ -1146,7 +1148,6 @@ fn resolve_compound_order_by_expr(
         }
         // Case 2: Name reference (e.g., ORDER BY name or ORDER BY alias)
         ast::Expr::Id(name) => {
-            let name_normalized = normalize_ident(name.as_str());
             // Check aliases and column names across all constituent SELECTs
             for plan in all_plans {
                 let result_columns = &plan.result_columns;
@@ -1154,7 +1155,7 @@ fn resolve_compound_order_by_expr(
                 // Try matching against aliases
                 for (i, rc) in result_columns.iter().enumerate() {
                     if let Some(alias) = &rc.alias {
-                        if normalize_ident(alias) == name_normalized {
+                        if *name == **alias {
                             return Ok(i);
                         }
                     }
@@ -1162,7 +1163,7 @@ fn resolve_compound_order_by_expr(
                 // Try matching against column names from the table references
                 for (i, rc) in result_columns.iter().enumerate() {
                     if let Some(col_name) = rc.name(table_references) {
-                        if normalize_ident(col_name) == name_normalized {
+                        if *name == *col_name {
                             return Ok(i);
                         }
                     }
@@ -1672,11 +1673,10 @@ fn find_aliased_aggregate_ref(expr: &ast::Expr, result_columns: &[ResultSetColum
 
     walk_expr(expr, &mut |e| {
         if let Expr::Id(id) = e {
-            let normalized = normalize_ident(id.as_str());
             for rc in result_columns.iter() {
                 if let Some(alias) = &rc.alias {
-                    if alias.eq_ignore_ascii_case(&normalized) && rc.contains_aggregates {
-                        crate::bail_parse_error!("misuse of aliased aggregate {}", normalized);
+                    if *id == **alias && rc.contains_aggregates {
+                        crate::bail_parse_error!("misuse of aliased aggregate {}", id);
                     }
                 }
             }

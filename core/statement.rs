@@ -615,7 +615,7 @@ impl Statement {
                             {
                                 let col_name = table_ref
                                     .get_column_at(*col_idx)
-                                    .and_then(|c| c.name.as_deref())
+                                    .and_then(|c| c.name_str())
                                     .unwrap_or("?");
                                 return Cow::Owned(format!(
                                     "{}.{}",
@@ -667,7 +667,7 @@ impl Statement {
                 .program
                 .table_references
                 .find_table_by_internal_id(*table)
-                .map(|(_, table_ref)| Cow::Borrowed(table_ref.get_name())),
+                .map(|(_, table_ref)| Cow::Borrowed(table_ref.get_name().as_str())),
             _ => None,
         }
     }

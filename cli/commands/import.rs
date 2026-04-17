@@ -85,11 +85,7 @@ impl<'a> ImportFile<'a> {
         // If table doesn't exist, use first row as header to create table
         if !table_exists {
             if let Some(Ok(header)) = records.next() {
-                let columns = header
-                    .iter()
-                    .map(normalize_ident)
-                    .collect::<Vec<_>>()
-                    .join(", ");
+                let columns = header.iter().collect::<Vec<_>>().join(", ");
                 let create_table = format!("CREATE TABLE {} ({});", args.table, columns);
 
                 let rows = match self.conn.query(create_table) {
@@ -258,20 +254,4 @@ impl<'a> ImportFile<'a> {
             );
         }
     }
-}
-
-// https://sqlite.org/lang_keywords.html
-const QUOTE_PAIRS: &[(char, char)] = &[('"', '"'), ('[', ']'), ('`', '`')];
-
-pub fn normalize_ident(identifier: &str) -> String {
-    let quote_pair = QUOTE_PAIRS
-        .iter()
-        .find(|&(start, end)| identifier.starts_with(*start) && identifier.ends_with(*end));
-
-    if let Some(&(_, _)) = quote_pair {
-        &identifier[1..identifier.len() - 1]
-    } else {
-        identifier
-    }
-    .to_lowercase()
 }

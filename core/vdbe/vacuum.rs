@@ -6,6 +6,7 @@ use crate::types::IOResult;
 use crate::Result;
 use crate::{Connection, Database};
 use turso_macros::turso_assert;
+use turso_parser::identifier::Identifier;
 
 /// A representation of a row from `sqlite_schema`.
 ///
@@ -156,7 +157,7 @@ pub(crate) struct VacuumIntoConfig {
     /// Source `application_id` pragma value to copy to destination.
     pub source_application_id: i32,
     /// Pre-captured source custom type definitions for STRICT table replay.
-    pub source_custom_types: Vec<(String, Arc<TypeDef>)>,
+    pub source_custom_types: Vec<(Identifier, Arc<TypeDef>)>,
     /// Whether the source database has MVCC enabled.
     pub source_mvcc_enabled: bool,
 }
@@ -394,7 +395,10 @@ fn vacuum_into_step(
                                     .source_conn
                                     .with_schema(config.database_id, |schema| {
                                         schema
-                                            .get_index(&entry.tbl_name, &entry.name)
+                                            .get_index(
+                                                &Identifier::from(entry.tbl_name.as_str()),
+                                                &Identifier::from(entry.name.as_str()),
+                                            )
                                             .is_some_and(|idx| idx.is_backing_btree_index())
                                     })
                             })
@@ -507,7 +511,9 @@ fn vacuum_into_step(
                         .dest_conn
                         .schema
                         .read()
-                        .get_btree_table(crate::schema::SQLITE_SEQUENCE_TABLE_NAME)
+                        .get_btree_table(&Identifier::from(
+                            crate::schema::SQLITE_SEQUENCE_TABLE_NAME,
+                        ))
                         .is_some();
                     if !dest_has_sequence {
                         state.sub_state = VacuumIntoSubState::StartCopyTable {
@@ -524,7 +530,7 @@ fn vacuum_into_step(
                 let source_btree_table = config
                     .source_conn
                     .with_schema(config.database_id, |schema| {
-                        schema.get_btree_table(table_name)
+                        schema.get_btree_table(&Identifier::from(table_name.as_str()))
                     });
 
                 let (select_sql, insert_sql) = build_copy_sql(
@@ -800,7 +806,7 @@ pub(crate) fn build_copy_sql(
         if col.is_rowid_alias() {
             rowid_alias_col_idx = Some(i);
         }
-        let Some(name) = col.name.as_deref() else {
+        let Some(name) = col.name_str() else {
             return Err(LimboError::Corrupt(format!(
                 "missing column name for table \"{escaped_table_name}\""
             )));

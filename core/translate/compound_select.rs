@@ -11,6 +11,7 @@ use crate::vdbe::insn::Insn;
 use crate::{emit_explain, LimboError};
 use tracing::instrument;
 use turso_parser::ast::{CompoundOperator, Expr, Literal, SortOrder};
+use turso_parser::identifier::Identifier;
 
 use tracing::Level;
 
@@ -506,10 +507,7 @@ fn create_dedupe_index(
         .iter()
         .enumerate()
         .map(|(i, c)| IndexColumn {
-            name: c
-                .name(&right_select.table_references)
-                .map(|n| n.to_string())
-                .unwrap_or_default(),
+            name: Identifier::from(c.name(&right_select.table_references).unwrap_or("")),
             order: SortOrder::Asc,
             pos_in_table: i,
             default: None,
@@ -537,10 +535,10 @@ fn create_dedupe_index(
 
     let dedupe_index = Arc::new(Index {
         columns: dedupe_columns,
-        name: "compound_dedupe".to_string(),
+        name: Identifier::from("compound_dedupe"),
         root_page: 0,
         ephemeral: true,
-        table_name: String::new(),
+        table_name: Identifier::from(""),
         unique: false,
         has_rowid: false,
         where_clause: None,
@@ -727,10 +725,7 @@ fn create_collection_index(
         .iter()
         .enumerate()
         .map(|(i, c)| IndexColumn {
-            name: c
-                .name(&right_select.table_references)
-                .map(|n| n.to_string())
-                .unwrap_or_default(),
+            name: Identifier::from(c.name(&right_select.table_references).unwrap_or("")),
             order: SortOrder::Asc,
             pos_in_table: i,
             default: None,
@@ -757,10 +752,10 @@ fn create_collection_index(
 
     let index = Arc::new(Index {
         columns,
-        name: "compound_collection".to_string(),
+        name: Identifier::from("compound_collection"),
         root_page: 0,
         ephemeral: true,
-        table_name: String::new(),
+        table_name: Identifier::from(""),
         unique: false,
         has_rowid: true, // Allow duplicates for UNION ALL
         where_clause: None,

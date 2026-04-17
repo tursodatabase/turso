@@ -20,6 +20,7 @@
 use crate::translate::plan::BitSet;
 use crate::types::{Extendable, Text};
 use crate::{turso_assert, turso_assert_ne, turso_debug_assert, NonNan};
+use turso_parser::identifier::Identifier;
 pub mod affinity;
 pub mod array;
 pub mod bloom_filter;
@@ -1538,7 +1539,9 @@ impl Program {
                     // Collect materialized views - they should all have storage
                     let mut views = Vec::new();
                     for view_name in self.connection.view_transaction_states.get_view_names() {
-                        if let Some(view_mutex) = schema.get_materialized_view(&view_name) {
+                        if let Some(view_mutex) =
+                            schema.get_materialized_view(&Identifier::from(view_name.as_str()))
+                        {
                             let view = view_mutex.lock();
                             let root_page = view.get_root_page();
 
@@ -1581,7 +1584,9 @@ impl Program {
                         .get_table_deltas();
 
                     let schema = self.connection.schema.read();
-                    if let Some(view_mutex) = schema.get_materialized_view(view_name) {
+                    if let Some(view_mutex) =
+                        schema.get_materialized_view(&Identifier::from(view_name.as_str()))
+                    {
                         let mut view = view_mutex.lock();
 
                         // Create a DeltaSet from the per-table deltas

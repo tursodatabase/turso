@@ -18,6 +18,7 @@ use rustc_hash::FxHashMap as HashMap;
 use std::fmt::{self, Display, Formatter};
 use turso_macros::match_ignore_ascii_case;
 use turso_parser::ast;
+use turso_parser::identifier::Identifier;
 
 /// Result type for preprocessing aggregate expressions
 type PreprocessAggregateResult = (
@@ -2278,7 +2279,7 @@ impl<'a> LogicalPlanBuilder<'a> {
         // Look up table in schema
         let table = self
             .schema
-            .get_table(table_name)
+            .get_table(&Identifier::from(table_name))
             .ok_or_else(|| LimboError::ParseError(format!("Table '{table_name}' not found")))?;
 
         // Parse table_name which might be "db.table" for attached databases
@@ -2293,7 +2294,7 @@ impl<'a> LogicalPlanBuilder<'a> {
         for col in table.columns() {
             if let Some(ref name) = col.name {
                 columns.push(ColumnInfo {
-                    name: name.clone(),
+                    name: name.to_string(),
                     ty: col.ty(),
                     database: database.clone(),
                     table: Some(actual_table.clone()),
@@ -2401,6 +2402,7 @@ impl<'a> LogicalPlanBuilder<'a> {
 mod tests {
     use super::*;
     use crate::schema::{BTreeTable, ColDef, Column as SchemaColumn, Schema, Type};
+    use turso_parser::identifier::Identifier;
     use turso_parser::parser::Parser;
 
     fn create_test_schema() -> Schema {
@@ -2409,7 +2411,7 @@ mod tests {
         // Create users table
         let columns = vec![
             SchemaColumn::new(
-                Some("id".to_string()),
+                Some("id".into()),
                 "INTEGER".to_string(),
                 None,
                 None,
@@ -2422,13 +2424,13 @@ mod tests {
                     ..Default::default()
                 },
             ),
-            SchemaColumn::new_default_text(Some("name".to_string()), "TEXT".to_string(), None),
-            SchemaColumn::new_default_integer(Some("age".to_string()), "INTEGER".to_string(), None),
-            SchemaColumn::new_default_text(Some("email".to_string()), "TEXT".to_string(), None),
+            SchemaColumn::new_default_text(Some("name".into()), "TEXT".to_string(), None),
+            SchemaColumn::new_default_integer(Some("age".into()), "INTEGER".to_string(), None),
+            SchemaColumn::new_default_text(Some("email".into()), "TEXT".to_string(), None),
         ];
         let logical_to_physical_map = BTreeTable::build_logical_to_physical_map(&columns);
         let users_table = BTreeTable {
-            name: "users".to_string(),
+            name: Identifier::from("users"),
             root_page: 2,
             primary_key_columns: vec![("id".to_string(), turso_parser::ast::SortOrder::Asc)],
             foreign_keys: vec![],
@@ -2449,7 +2451,7 @@ mod tests {
         // Create orders table
         let columns = vec![
             SchemaColumn::new(
-                Some("id".to_string()),
+                Some("id".into()),
                 "INTEGER".to_string(),
                 None,
                 None,
@@ -2462,14 +2464,10 @@ mod tests {
                     ..Default::default()
                 },
             ),
-            SchemaColumn::new_default_integer(
-                Some("user_id".to_string()),
-                "INTEGER".to_string(),
-                None,
-            ),
-            SchemaColumn::new_default_text(Some("product".to_string()), "TEXT".to_string(), None),
+            SchemaColumn::new_default_integer(Some("user_id".into()), "INTEGER".to_string(), None),
+            SchemaColumn::new_default_text(Some("product".into()), "TEXT".to_string(), None),
             SchemaColumn::new(
-                Some("amount".to_string()),
+                Some("amount".into()),
                 "REAL".to_string(),
                 None,
                 None,
@@ -2480,7 +2478,7 @@ mod tests {
         ];
         let logical_to_physical_map = BTreeTable::build_logical_to_physical_map(&columns);
         let orders_table = BTreeTable {
-            name: "orders".to_string(),
+            name: Identifier::from("orders"),
             root_page: 3,
             primary_key_columns: vec![("id".to_string(), turso_parser::ast::SortOrder::Asc)],
             columns,
@@ -2501,7 +2499,7 @@ mod tests {
         // Create products table
         let columns = vec![
             SchemaColumn::new(
-                Some("id".to_string()),
+                Some("id".into()),
                 "INTEGER".to_string(),
                 None,
                 None,
@@ -2514,9 +2512,9 @@ mod tests {
                     ..Default::default()
                 },
             ),
-            SchemaColumn::new_default_text(Some("name".to_string()), "TEXT".to_string(), None),
+            SchemaColumn::new_default_text(Some("name".into()), "TEXT".to_string(), None),
             SchemaColumn::new(
-                Some("price".to_string()),
+                Some("price".into()),
                 "REAL".to_string(),
                 None,
                 None,
@@ -2525,14 +2523,14 @@ mod tests {
                 ColDef::default(),
             ),
             SchemaColumn::new_default_integer(
-                Some("product_id".to_string()),
+                Some("product_id".into()),
                 "INTEGER".to_string(),
                 None,
             ),
         ];
         let logical_to_physical_map = BTreeTable::build_logical_to_physical_map(&columns);
         let products_table = BTreeTable {
-            name: "products".to_string(),
+            name: Identifier::from("products"),
             root_page: 4,
             primary_key_columns: vec![("id".to_string(), turso_parser::ast::SortOrder::Asc)],
             columns,

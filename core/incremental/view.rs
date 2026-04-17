@@ -15,6 +15,7 @@ use std::cell::RefCell;
 use std::fmt;
 use std::rc::Rc;
 use turso_parser::ast;
+use turso_parser::identifier::Identifier;
 use turso_parser::{
     ast::{Cmd, Stmt},
     parser::Parser,
@@ -268,8 +269,8 @@ impl IncrementalView {
             .enumerate()
             .map(|(i, vc)| {
                 vc.column
-                    .name
-                    .clone()
+                    .name_str()
+                    .map(str::to_owned)
                     .unwrap_or_else(|| format!("column{}", i + 1))
             })
     }
@@ -436,7 +437,7 @@ impl IncrementalView {
     pub fn get_referenced_table_names(&self) -> Vec<String> {
         self.referenced_tables
             .iter()
-            .map(|t| t.name.clone())
+            .map(|t| t.name.to_string())
             .collect()
     }
 
@@ -466,7 +467,7 @@ impl IncrementalView {
 
         // Skip CTEs - they're not real tables
         if !cte_names.contains(table_name) {
-            if let Some(table) = schema.get_btree_table(table_name) {
+            if let Some(table) = schema.get_btree_table(name.name.identifier()) {
                 table_map.insert(table_name.to_string(), table);
                 qualified_names.insert(table_name.to_string(), qualified_name);
 
@@ -714,12 +715,12 @@ impl IncrementalView {
             };
 
             // Get accumulated WHERE conditions for this table
-            let where_clause = if let Some(conditions) = table_conditions.get(&table.name) {
+            let where_clause = if let Some(conditions) = table_conditions.get(table.name.as_str()) {
                 // Combine multiple conditions with OR if there are multiple occurrences
                 Self::combine_conditions(
                     select_stmt,
                     conditions,
-                    &table.name,
+                    table.name.as_str(),
                     referenced_tables,
                     table_aliases,
                 )?
@@ -729,9 +730,9 @@ impl IncrementalView {
 
             // Use the qualified table name if available, otherwise just the table name
             let table_name = qualified_table_names
-                .get(&table.name)
+                .get(table.name.as_str())
                 .cloned()
-                .unwrap_or_else(|| table.name.clone());
+                .unwrap_or_else(|| table.name.to_string());
 
             // Construct the query for this table
             let query = if where_clause.is_empty() {
@@ -1096,11 +1097,13 @@ impl IncrementalView {
                 } else {
                     // Check which table has this column
                     for table_name in all_tables {
-                        if let Some(table) = schema.get_btree_table(table_name) {
+                        if let Some(table) =
+                            schema.get_btree_table(&Identifier::from(table_name.as_str()))
+                        {
                             if table
                                 .columns
                                 .iter()
-                                .any(|col| col.name.as_deref() == Some(column.as_str()))
+                                .any(|col| col.name_str() == Some(column.as_str()))
                             {
                                 tables.push(table_name.clone());
                                 break; // Found the table, stop looking
@@ -1365,7 +1368,7 @@ impl IncrementalView {
 
         // Create a DeltaSet with this delta for the current table
         let mut delta_set = DeltaSet::new();
-        let table_name = self.referenced_tables[table_idx].name.clone();
+        let table_name = self.referenced_tables[table_idx].name.to_string();
         delta_set.insert(table_name, single_row_delta);
 
         // Process through merge_delta
@@ -1424,6 +1427,7 @@ mod tests {
     use crate::schema::{BTreeTable, ColDef, Column as SchemaColumn, Schema, Type};
     use crate::sync::Arc;
     use turso_parser::ast;
+    use turso_parser::identifier::Identifier;
     use turso_parser::parser::Parser;
 
     // Helper function to create a test schema with multiple tables
@@ -1433,7 +1437,7 @@ mod tests {
         // Create customers table
         let columns = vec![
             SchemaColumn::new(
-                Some("id".to_string()),
+                Some("id".into()),
                 "INTEGER".to_string(),
                 None,
                 None,
@@ -1448,11 +1452,11 @@ mod tests {
                     notnull_conflict_clause: None,
                 },
             ),
-            SchemaColumn::new_default_text(Some("name".to_string()), "TEXT".to_string(), None),
+            SchemaColumn::new_default_text(Some("name".into()), "TEXT".to_string(), None),
         ];
         let logical_to_physical_map = BTreeTable::build_logical_to_physical_map(&columns);
         let customers_table = BTreeTable {
-            name: "customers".to_string(),
+            name: Identifier::from("customers"),
             root_page: 2,
             primary_key_columns: vec![("id".to_string(), ast::SortOrder::Asc)],
             columns,
@@ -1470,7 +1474,7 @@ mod tests {
         // Create orders table
         let columns = vec![
             SchemaColumn::new(
-                Some("id".to_string()),
+                Some("id".into()),
                 "INTEGER".to_string(),
                 None,
                 None,
@@ -1486,7 +1490,7 @@ mod tests {
                 },
             ),
             SchemaColumn::new(
-                Some("customer_id".to_string()),
+                Some("customer_id".into()),
                 "INTEGER".to_string(),
                 None,
                 None,
@@ -1494,15 +1498,11 @@ mod tests {
                 None,
                 ColDef::default(),
             ),
-            SchemaColumn::new_default_integer(
-                Some("total".to_string()),
-                "INTEGER".to_string(),
-                None,
-            ),
+            SchemaColumn::new_default_integer(Some("total".into()), "INTEGER".to_string(), None),
         ];
         let logical_to_physical_map = BTreeTable::build_logical_to_physical_map(&columns);
         let orders_table = BTreeTable {
-            name: "orders".to_string(),
+            name: Identifier::from("orders"),
             root_page: 3,
             primary_key_columns: vec![("id".to_string(), ast::SortOrder::Asc)],
             columns,
@@ -1520,7 +1520,7 @@ mod tests {
         // Create products table
         let columns = vec![
             SchemaColumn::new(
-                Some("id".to_string()),
+                Some("id".into()),
                 "INTEGER".to_string(),
                 None,
                 None,
@@ -1535,9 +1535,9 @@ mod tests {
                     notnull_conflict_clause: None,
                 },
             ),
-            SchemaColumn::new_default_text(Some("name".to_string()), "TEXT".to_string(), None),
+            SchemaColumn::new_default_text(Some("name".into()), "TEXT".to_string(), None),
             SchemaColumn::new(
-                Some("price".to_string()),
+                Some("price".into()),
                 "REAL".to_string(),
                 None,
                 None,
@@ -1548,7 +1548,7 @@ mod tests {
         ];
         let logical_to_physical_map = BTreeTable::build_logical_to_physical_map(&columns);
         let products_table = BTreeTable {
-            name: "products".to_string(),
+            name: Identifier::from("products"),
             root_page: 4,
             primary_key_columns: vec![("id".to_string(), ast::SortOrder::Asc)],
             columns,
@@ -1566,7 +1566,7 @@ mod tests {
         // Create logs table - without a rowid alias (no INTEGER PRIMARY KEY)
         let columns = vec![
             SchemaColumn::new(
-                Some("message".to_string()),
+                Some("message".into()),
                 "TEXT".to_string(),
                 None,
                 None,
@@ -1574,20 +1574,16 @@ mod tests {
                 None,
                 ColDef::default(),
             ),
+            SchemaColumn::new_default_integer(Some("level".into()), "INTEGER".to_string(), None),
             SchemaColumn::new_default_integer(
-                Some("level".to_string()),
-                "INTEGER".to_string(),
-                None,
-            ),
-            SchemaColumn::new_default_integer(
-                Some("timestamp".to_string()),
+                Some("timestamp".into()),
                 "INTEGER".to_string(),
                 None,
             ),
         ];
         let logical_to_physical_map = BTreeTable::build_logical_to_physical_map(&columns);
         let logs_table = BTreeTable {
-            name: "logs".to_string(),
+            name: Identifier::from("logs"),
             root_page: 5,
             primary_key_columns: vec![], // No primary key, so no rowid alias
             columns,
@@ -2567,7 +2563,7 @@ mod tests {
         let schema = create_test_schema();
 
         // Get the orders table twice (simulating what would happen with CTEs)
-        let orders_table = schema.get_btree_table("orders").unwrap();
+        let orders_table = schema.get_btree_table(&Identifier::from("orders")).unwrap();
 
         let referenced_tables = vec![orders_table.clone(), orders_table];
 

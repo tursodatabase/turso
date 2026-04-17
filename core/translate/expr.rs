@@ -3,6 +3,7 @@ use crate::translate::optimizer::constraints::ConstraintOperator;
 use crate::turso_assert;
 use tracing::{instrument, Level};
 use turso_parser::ast::{self, Expr, ResolveType, SubqueryType, TableInternalId, UnaryOperator};
+use turso_parser::identifier::Identifier;
 
 use super::collate::{get_collseq_from_expr, CollationSeq};
 use super::emitter::Resolver;
@@ -21,7 +22,7 @@ use crate::translate::expression_index::{
 };
 use crate::translate::plan::{ColumnMask, Operation, ResultSetColumn, Search};
 use crate::translate::planner::parse_row_id;
-use crate::util::{exprs_are_equivalent, normalize_ident, parse_numeric_literal};
+use crate::util::{exprs_are_equivalent, parse_numeric_literal};
 use crate::vdbe::affinity::Affinity;
 use crate::vdbe::builder::{CursorKey, DmlColumnContext, SelfTableContext};
 use crate::vdbe::{
@@ -2885,8 +2886,8 @@ pub fn translate_expr(
                             // Note: ast::Literal::String values must be wrapped in single quotes
                             // because sanitize_string() strips the first and last character
                             let col_name = col
-                                .name
-                                .clone()
+                                .name_str()
+                                .map(str::to_owned)
                                 .unwrap_or_else(|| format!("column{}", col_idx + 1));
                             let quoted_col_name = format!("'{col_name}'");
                             args.push(Box::new(ast::Expr::Literal(ast::Literal::String(
@@ -5617,13 +5618,11 @@ pub fn bind_and_rewrite_expr<'a>(
                         }
                         crate::bail_parse_error!("no such column: {}", id.as_str());
                     };
-                    let normalized_id = normalize_ident(id.as_str());
-
                     if binding_behavior == BindingBehavior::TryResultColumnsFirst {
                         if let Some(result_columns) = result_columns {
                             for result_column in result_columns.iter() {
                                 if let Some(alias) = &result_column.alias {
-                                    if alias.eq_ignore_ascii_case(&normalized_id) {
+                                    if *id == **alias {
                                         *expr = result_column.expr.clone();
                                         return Ok(WalkControl::Continue);
                                     }
@@ -5635,20 +5634,21 @@ pub fn bind_and_rewrite_expr<'a>(
 
                     // First check joined tables
                     for joined_table in referenced_tables.joined_tables().iter() {
-                        let col_idx = joined_table.table.columns().iter().position(|c| {
-                            c.name
-                                .as_ref()
-                                .is_some_and(|name| name.eq_ignore_ascii_case(&normalized_id))
-                        });
+                        let col_idx =
+                            joined_table.table.columns().iter().position(|c| {
+                                c.name.as_ref().is_some_and(|name| name == id.as_str())
+                            });
                         if col_idx.is_some() {
                             if match_result.is_some() {
                                 let mut ok = false;
                                 // Column name ambiguity is ok if it is in the USING clause because then it is deduplicated
                                 // and the left table is used.
                                 if let Some(join_info) = &joined_table.join_info {
-                                    if join_info.using.iter().any(|using_col| {
-                                        using_col.as_str().eq_ignore_ascii_case(&normalized_id)
-                                    }) {
+                                    if join_info
+                                        .using
+                                        .iter()
+                                        .any(|using_col| *id == *using_col.as_str())
+                                    {
                                         ok = true;
                                     }
                                 }
@@ -5670,7 +5670,7 @@ pub fn bind_and_rewrite_expr<'a>(
                         // only if we haven't found a match, check for explicit rowid reference
                         } else if let Table::BTree(btree) = &joined_table.table {
                             if let Some(row_id_expr) = parse_row_id(
-                                &normalized_id,
+                                id.as_str(),
                                 referenced_tables.joined_tables()[0].internal_id,
                                 || referenced_tables.joined_tables().len() != 1,
                             )? {
@@ -5711,9 +5711,7 @@ pub fn bind_and_rewrite_expr<'a>(
                                 }
                             }
                             let col_idx = outer_ref.table.columns().iter().position(|c| {
-                                c.name
-                                    .as_ref()
-                                    .is_some_and(|name| name.eq_ignore_ascii_case(&normalized_id))
+                                c.name.as_ref().is_some_and(|name| name == id.as_str())
                             });
                             if col_idx.is_some() {
                                 if match_result.is_some() {
@@ -5748,7 +5746,7 @@ pub fn bind_and_rewrite_expr<'a>(
                         if let Some(result_columns) = result_columns {
                             for result_column in result_columns.iter() {
                                 if let Some(alias) = &result_column.alias {
-                                    if alias.eq_ignore_ascii_case(&normalized_id) {
+                                    if *id == **alias {
                                         *expr = result_column.expr.clone();
                                         return Ok(WalkControl::Continue);
                                     }
@@ -5778,13 +5776,12 @@ pub fn bind_and_rewrite_expr<'a>(
                             id.as_str()
                         );
                     };
-                    let normalized_table_name = normalize_ident(tbl.as_str());
                     // Check for duplicate table aliases — if multiple joined tables
                     // share the same identifier, the qualified column ref is ambiguous.
                     let duplicate_count = referenced_tables
                         .joined_tables()
                         .iter()
-                        .filter(|t| t.identifier == normalized_table_name)
+                        .filter(|t| *tbl.identifier() == t.identifier)
                         .count();
                     if duplicate_count > 1 {
                         crate::bail_parse_error!(
@@ -5794,7 +5791,7 @@ pub fn bind_and_rewrite_expr<'a>(
                         );
                     }
                     let matching_tbl = referenced_tables
-                        .find_table_and_internal_id_by_identifier(&normalized_table_name);
+                        .find_table_and_internal_id_by_identifier(tbl.identifier());
                     if matching_tbl.is_none() {
                         // CTEs preplanned for subquery FROM visibility are kept as
                         // definition-only outer refs. They are not valid column sources
@@ -5802,7 +5799,7 @@ pub fn bind_and_rewrite_expr<'a>(
                         // Restrict this branch to actual CTE definition refs so other
                         // definition-only uses (if added later) still report "no such table".
                         if referenced_tables
-                            .find_outer_query_ref_by_identifier(&normalized_table_name)
+                            .find_outer_query_ref_by_identifier(tbl.identifier())
                             .is_some_and(|outer_ref| {
                                 outer_ref.cte_definition_only
                                     && (outer_ref.cte_id.is_some()
@@ -5815,15 +5812,13 @@ pub fn bind_and_rewrite_expr<'a>(
                                 id.as_str()
                             );
                         }
-                        crate::bail_parse_error!("no such table: {}", normalized_table_name);
+                        crate::bail_parse_error!("no such table: {}", tbl.as_str());
                     }
                     let (tbl_id, tbl) = matching_tbl.unwrap();
-                    let normalized_id = normalize_ident(id.as_str());
-                    let col_idx = tbl.columns().iter().position(|c| {
-                        c.name
-                            .as_ref()
-                            .is_some_and(|name| name.eq_ignore_ascii_case(&normalized_id))
-                    });
+                    let col_idx = tbl
+                        .columns()
+                        .iter()
+                        .position(|c| c.name.as_ref().is_some_and(|name| name == id.as_str()));
                     // User-defined columns take precedence over rowid aliases
                     // (oid, rowid, _rowid_). Only fall back to parse_row_id()
                     // when no matching user column exists.
@@ -5831,11 +5826,10 @@ pub fn bind_and_rewrite_expr<'a>(
                     // don't have a rowid.
                     let Some(col_idx) = col_idx else {
                         if let Table::BTree(btree) = tbl {
-                            if let Some(row_id_expr) =
-                                parse_row_id(&normalized_id, tbl_id, || false)?
+                            if let Some(row_id_expr) = parse_row_id(id.as_str(), tbl_id, || false)?
                             {
                                 if !btree.has_rowid {
-                                    crate::bail_parse_error!("no such column: {}", normalized_id);
+                                    crate::bail_parse_error!("no such column: {id}");
                                 }
                                 *expr = row_id_expr;
                                 // Mark the table's rowid as referenced so correlated
@@ -5845,7 +5839,7 @@ pub fn bind_and_rewrite_expr<'a>(
                                 return Ok(WalkControl::Continue);
                             }
                         }
-                        crate::bail_parse_error!("no such column: {}", normalized_id);
+                        crate::bail_parse_error!("no such column: {id}");
                     };
                     let col = tbl.columns().get(col_idx).unwrap();
                     *expr = Expr::Column {
@@ -5870,8 +5864,6 @@ pub fn bind_and_rewrite_expr<'a>(
                             col_name.as_str()
                         );
                     };
-                    let normalized_col_name = normalize_ident(col_name.as_str());
-
                     // Create a QualifiedName and use existing resolve_database_id method
                     let qualified_name = ast::QualifiedName {
                         db_name: Some(db_name.clone()),
@@ -5882,7 +5874,9 @@ pub fn bind_and_rewrite_expr<'a>(
 
                     // Get the table from the specified database
                     let table = resolver
-                        .with_schema(database_id, |schema| schema.get_table(tbl_name.as_str()))
+                        .with_schema(database_id, |schema| {
+                            schema.get_table(tbl_name.identifier())
+                        })
                         .ok_or_else(|| {
                             LimboError::ParseError(format!(
                                 "no such table: {}.{}",
@@ -5898,7 +5892,7 @@ pub fn bind_and_rewrite_expr<'a>(
                         .position(|c| {
                             c.name
                                 .as_ref()
-                                .is_some_and(|name| name.eq_ignore_ascii_case(&normalized_col_name))
+                                .is_some_and(|name| name == col_name.as_str())
                         })
                         .ok_or_else(|| {
                             LimboError::ParseError(format!(
@@ -5917,9 +5911,8 @@ pub fn bind_and_rewrite_expr<'a>(
                     // Convert to Column expression - since this is a cross-database reference,
                     // we need to create a synthetic table reference for it
                     // For now, we'll error if the table isn't already in the referenced tables
-                    let normalized_tbl_name = normalize_ident(tbl_name.as_str());
                     let matching_tbl = referenced_tables
-                        .find_table_and_internal_id_by_identifier(&normalized_tbl_name);
+                        .find_table_and_internal_id_by_identifier(tbl_name.identifier());
 
                     if let Some((tbl_id, _)) = matching_tbl {
                         // Table is already in referenced tables, use existing internal ID
@@ -5932,7 +5925,7 @@ pub fn bind_and_rewrite_expr<'a>(
                         referenced_tables.mark_column_used(tbl_id, col_idx);
                     } else {
                         return Err(LimboError::ParseError(format!(
-                            "table {normalized_tbl_name} is not in FROM clause - cross-database column references require the table to be explicitly joined"
+                            "table {} is not in FROM clause - cross-database column references require the table to be explicitly joined", tbl_name.as_str()
                         )));
                     }
                 }
@@ -5965,9 +5958,10 @@ pub fn bind_and_rewrite_expr<'a>(
                                             }
 
                                             // Add column name as a string literal
-                                            let col_name = col.name.clone().unwrap_or_else(|| {
-                                                format!("column{}", col_idx + 1)
-                                            });
+                                            let col_name =
+                                                col.name_str().map(str::to_owned).unwrap_or_else(
+                                                    || format!("column{}", col_idx + 1),
+                                                );
                                             let quoted_col_name = format!("'{col_name}'");
                                             args.push(Box::new(ast::Expr::Literal(
                                                 ast::Literal::String(quoted_col_name),
@@ -6514,7 +6508,7 @@ pub fn process_returning_clause(
 
                     result_columns.push(ResultSetColumn {
                         expr: column_expr,
-                        alias: column.name.clone(),
+                        alias: column.name_str().map(str::to_owned),
                         implicit_column_name: None,
                         contains_aggregates: false,
                     });
@@ -7588,7 +7582,7 @@ fn emit_array_encode(
     reg: usize,
     col: &Column,
     resolver: &Resolver,
-    table_name: &str,
+    table_name: &Identifier,
 ) -> Result<()> {
     if let Some(type_def) = resolver.schema().get_type_def_unchecked(&col.ty_str) {
         if let Some(encode_expr) = type_def.encode.as_ref() {
@@ -7597,8 +7591,8 @@ fn emit_array_encode(
                 reg,
                 element_affinity: Affinity::Blob,
                 element_type: "ANY".into(),
-                table_name: table_name.into(),
-                col_name: col.name.as_deref().unwrap_or("").into(),
+                table_name: table_name.as_str().into(),
+                col_name: col.name_str().unwrap_or("").into(),
             });
 
             emit_array_element_loop(program, reg, encode_expr, col, type_def, resolver)?;
@@ -7611,7 +7605,7 @@ fn emit_array_encode(
     // Only 1-dimensional arrays validate elements against the declared base type.
     let is_any = col.ty_str.eq_ignore_ascii_case("ANY");
     let is_multidim = col.array_dimensions() > 1;
-    let col_name = col.name.as_deref().unwrap_or("");
+    let col_name = col.name_str().unwrap_or("");
     let element_affinity = if is_any || is_multidim {
         Affinity::Blob
     } else {
@@ -7626,7 +7620,7 @@ fn emit_array_encode(
         reg,
         element_affinity,
         element_type,
-        table_name: table_name.into(),
+        table_name: table_name.as_str().into(),
         col_name: col_name.into(),
     });
     Ok(())
@@ -7665,7 +7659,7 @@ pub(crate) fn emit_custom_type_encode_columns(
     columns: &[Column],
     start_reg: usize,
     only_columns: Option<&ColumnMask>,
-    table_name: &str,
+    table_name: &Identifier,
     layout: &ColumnLayout,
 ) -> Result<()> {
     for (i, col) in columns.iter().enumerate() {

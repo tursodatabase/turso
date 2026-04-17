@@ -30,6 +30,7 @@ use turso_ext::{
     ExtensionApi, InitAggFunction, ResultCode, ScalarFunction, VTabKind, VTabModuleImpl,
 };
 pub use turso_ext::{FinalizeFunction, StepFunction, Value as ExtValue, ValueType as ExtValueType};
+use turso_parser::identifier::Identifier;
 pub use vtab_xconnect::{execute, prepare_stmt};
 
 /// The context passed to extensions to register with Core
@@ -55,7 +56,7 @@ pub(crate) unsafe extern "C" fn register_vtab_module(
 
     let c_str = unsafe { CString::from_raw(name as *mut c_char) };
     let name_str = match c_str.to_str() {
-        Ok(s) => s.to_string(),
+        Ok(s) => Identifier::from(s),
         Err(_) => return ResultCode::Error,
     };
 
@@ -68,13 +69,14 @@ pub(crate) unsafe extern "C" fn register_vtab_module(
 
     unsafe {
         let syms = &mut *ext_ctx.syms;
-        syms.vtab_modules.insert(name_str.clone(), vmodule.into());
+        syms.vtab_modules
+            .insert(name_str.to_string(), vmodule.into());
         if !ext_ctx.prepare_context_generation.is_null() {
             (*ext_ctx.prepare_context_generation).fetch_add(1, Ordering::Release);
         }
 
         if kind == VTabKind::TableValuedFunction {
-            if let Ok(vtab) = VirtualTable::function(&name_str, syms) {
+            if let Ok(vtab) = VirtualTable::function(name_str.as_str(), syms) {
                 let table = Arc::new(Table::Virtual(vtab));
                 let mutex = &*(ext_ctx.schema as *mut Mutex<Arc<Schema>>);
                 let mut guard = mutex.lock();

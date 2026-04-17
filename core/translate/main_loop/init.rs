@@ -51,7 +51,7 @@ impl InitLoop {
             let prepared = prepare_cdc_if_necessary(
                 program,
                 t_ctx.resolver.schema(),
-                changed_table.get_name(),
+                changed_table.get_name().as_str(),
             )?;
             if let Some((cdc_cursor_id, _)) = prepared {
                 t_ctx.cdc_cursor_id = Some(cdc_cursor_id);

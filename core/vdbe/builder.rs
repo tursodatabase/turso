@@ -2,6 +2,7 @@ use crate::{turso_assert, turso_assert_eq, turso_debug_assert};
 use rustc_hash::FxHashMap as HashMap;
 use tracing::{instrument, Level};
 use turso_parser::ast::{self, Expr, ResolveType, SortOrder, TableInternalId};
+use turso_parser::identifier::Identifier;
 
 use crate::{
     index_method::IndexMethodAttachment,
@@ -337,7 +338,7 @@ pub struct ProgramBuilder {
     /// Stack of CTE names currently being planned. Used to detect circular
     /// references in non-recursive CTEs and to prevent fallthrough to schema
     /// resolution for same-named tables/views.
-    ctes_being_defined: Vec<String>,
+    ctes_being_defined: Vec<Identifier>,
     /// Counter for subquery numbering in EXPLAIN QUERY PLAN output.
     next_subquery_eqp_id: usize,
 }
@@ -640,7 +641,7 @@ impl ProgramBuilder {
     /// Mark a CTE name as currently being planned. While on the stack,
     /// `parse_table` will reject references to this name with "circular
     /// reference" instead of falling through to schema resolution.
-    pub fn push_cte_being_defined(&mut self, name: String) {
+    pub fn push_cte_being_defined(&mut self, name: Identifier) {
         self.ctes_being_defined.push(name);
     }
 
@@ -656,12 +657,12 @@ impl ProgramBuilder {
 
     /// Temporarily take the CTE-being-defined stack (e.g. during view
     /// expansion, which should not see CTE context from the caller).
-    pub fn take_ctes_being_defined(&mut self) -> Vec<String> {
+    pub fn take_ctes_being_defined(&mut self) -> Vec<Identifier> {
         std::mem::take(&mut self.ctes_being_defined)
     }
 
     /// Restore the CTE-being-defined stack after a context-isolated expansion.
-    pub fn restore_ctes_being_defined(&mut self, saved: Vec<String>) {
+    pub fn restore_ctes_being_defined(&mut self, saved: Vec<Identifier>) {
         self.ctes_being_defined = saved;
     }
 

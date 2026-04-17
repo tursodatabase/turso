@@ -1,11 +1,11 @@
+use turso_parser::identifier::Identifier;
+
 use crate::schema::{SchemaObjectType, DBSP_TABLE_PREFIX, RESERVED_TABLE_PREFIXES};
 use crate::storage::pager::CreateBTreeFlags;
 use crate::sync::Arc;
 use crate::translate::emitter::Resolver;
 use crate::translate::schema::{emit_schema_entry, SchemaEntryType, SQLITE_TABLEID};
-use crate::util::{
-    escape_sql_string_literal, normalize_ident, PRIMARY_KEY_AUTOMATIC_INDEX_NAME_PREFIX,
-};
+use crate::util::{escape_sql_string_literal, PRIMARY_KEY_AUTOMATIC_INDEX_NAME_PREFIX};
 use crate::vdbe::builder::{CursorType, ProgramBuilder};
 use crate::vdbe::insn::{CmpInsFlags, Cookie, Insn, RegisterOrLiteral};
 use crate::{bail_parse_error, Connection, Result, MAIN_DB_ID};
@@ -35,23 +35,21 @@ pub fn translate_create_materialized_view(
     let schema_cookie = resolver.with_schema(database_id, |s| s.schema_version);
     program.begin_write_on_database(database_id, schema_cookie);
 
-    let normalized_view_name = normalize_ident(view_name.name.as_str());
+    let view_name_str = view_name.name.as_str();
     if RESERVED_TABLE_PREFIXES
         .iter()
-        .any(|prefix| normalized_view_name.starts_with(prefix))
+        .any(|prefix| view_name_str.starts_with(prefix))
     {
-        bail_parse_error!(
-            "Object name reserved for internal use: {}",
-            view_name.name.as_str()
-        );
+        bail_parse_error!("Object name reserved for internal use: {}", view_name_str);
     }
 
     // Check if view already exists
     if resolver.with_schema(database_id, |s| {
-        s.get_materialized_view(&normalized_view_name).is_some()
+        s.get_materialized_view(&Identifier::from(view_name_str))
+            .is_some()
     }) {
         return Err(crate::LimboError::ParseError(format!(
-            "View {normalized_view_name} already exists"
+            "View {view_name_str} already exists"
         )));
     }
 
@@ -96,7 +94,7 @@ pub fn translate_create_materialized_view(
     let logical_to_physical_map = BTreeTable::build_logical_to_physical_map(&view_columns);
     let view_table = Arc::new(BTreeTable {
         root_page: 0, // Will be set to actual root page after creation
-        name: normalized_view_name.clone(),
+        name: Identifier::from(view_name_str),
         columns: view_columns,
         primary_key_columns: vec![], // Materialized views use implicit rowid
         has_rowid: true,
@@ -139,7 +137,7 @@ pub fn translate_create_materialized_view(
     program.preassign_label_to_next_insn(clear_loop_label);
     program.emit_insn(Insn::Delete {
         cursor_id: view_cursor_id,
-        table_name: normalized_view_name.clone(),
+        table_name: view_name_str.to_owned(),
         is_part_of_update: false,
     });
     program.emit_insn(Insn::Next {
@@ -150,7 +148,10 @@ pub fn translate_create_materialized_view(
     program.preassign_label_to_next_insn(clear_done_label);
 
     // Open cursor to sqlite_schema table
-    let table = resolver.with_schema(database_id, |s| s.get_btree_table(SQLITE_TABLEID).unwrap());
+    let table = resolver.with_schema(database_id, |s| {
+        s.get_btree_table(&Identifier::from(SQLITE_TABLEID))
+            .unwrap()
+    });
     let sqlite_schema_cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(table));
     program.emit_insn(Insn::OpenWrite {
         cursor_id: sqlite_schema_cursor_id,
@@ -165,8 +166,8 @@ pub fn translate_create_materialized_view(
         sqlite_schema_cursor_id,
         None, // cdc_table_cursor_id, no cdc for views
         SchemaEntryType::View,
-        &normalized_view_name,
-        &normalized_view_name,
+        view_name_str,
+        view_name_str,
         view_root_reg, // btree root for materialized view data
         Some(sql),
     )?;
@@ -175,7 +176,7 @@ pub fn translate_create_materialized_view(
     // Include the version number in the table name
     use crate::incremental::compiler::DBSP_CIRCUIT_VERSION;
     let dbsp_table_name = ast::Name::exact(format!(
-        "{DBSP_TABLE_PREFIX}{DBSP_CIRCUIT_VERSION}_{normalized_view_name}"
+        "{DBSP_TABLE_PREFIX}{DBSP_CIRCUIT_VERSION}_{view_name_str}"
     ));
     let dbsp_table_ident = dbsp_table_name.as_ident();
     // The element_id column uses SQLite's dynamic typing system to store different value types:
@@ -233,7 +234,7 @@ pub fn translate_create_materialized_view(
     )?;
 
     // Parse schema to load the new view and DBSP state table
-    let escaped_view_name = escape_sql_string_literal(&normalized_view_name);
+    let escaped_view_name = escape_sql_string_literal(view_name_str);
     let escaped_dbsp_table_name = escape_sql_string_literal(dbsp_table_name.as_str());
     let escaped_dbsp_index_name = escape_sql_string_literal(&dbsp_index_name);
     program.emit_insn(Insn::ParseSchema {
@@ -252,7 +253,7 @@ pub fn translate_create_materialized_view(
     });
 
     // Populate the materialized view
-    let cursor_info = vec![(normalized_view_name.clone(), view_cursor_id)];
+    let cursor_info = vec![(view_name_str.to_owned(), view_cursor_id)];
     program.emit_insn(Insn::PopulateMaterializedViews {
         cursors: cursor_info,
     });
@@ -275,41 +276,38 @@ pub fn translate_create_view(
     let database_id = resolver.resolve_database_id(view_name)?;
     let schema_cookie = resolver.with_schema(database_id, |s| s.schema_version);
     program.begin_write_on_database(database_id, schema_cookie);
-    let normalized_view_name = normalize_ident(view_name.name.as_str());
+    let view_name_str = view_name.name.as_str();
 
     if RESERVED_TABLE_PREFIXES
         .iter()
-        .any(|prefix| normalized_view_name.starts_with(prefix))
+        .any(|prefix| view_name_str.starts_with(prefix))
     {
-        bail_parse_error!(
-            "Object name reserved for internal use: {}",
-            view_name.name.as_str()
-        );
+        bail_parse_error!("Object name reserved for internal use: {}", view_name_str);
     }
 
     // Check for name conflicts with existing schema objects
-    if let Some(object_type) =
-        resolver.with_schema(database_id, |s| s.get_object_type(&normalized_view_name))
-    {
+    if let Some(object_type) = resolver.with_schema(database_id, |s| {
+        s.get_object_type(&Identifier::from(view_name_str))
+    }) {
         let type_str = match object_type {
             SchemaObjectType::Table => "table",
             SchemaObjectType::View => "view",
             SchemaObjectType::Index => "index",
         };
         return Err(crate::LimboError::ParseError(format!(
-            "{type_str} {normalized_view_name} already exists"
+            "{type_str} {view_name_str} already exists"
         )));
     }
 
     // Also check materialized views (not in get_object_type since they're stored differently)
     if resolver
         .with_schema(database_id, |s| {
-            s.get_materialized_view(&normalized_view_name)
+            s.get_materialized_view(&Identifier::from(view_name_str))
         })
         .is_some()
     {
         return Err(crate::LimboError::ParseError(format!(
-            "view {normalized_view_name} already exists"
+            "view {view_name_str} already exists"
         )));
     }
 
@@ -319,7 +317,10 @@ pub fn translate_create_view(
     let sql = create_view_to_str(&view_name.name.as_ident(), columns, select_stmt);
 
     // Open cursor to sqlite_schema table
-    let table = resolver.schema().get_btree_table(SQLITE_TABLEID).unwrap();
+    let table = resolver
+        .schema()
+        .get_btree_table(&Identifier::from(SQLITE_TABLEID))
+        .unwrap();
     let sqlite_schema_cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(table));
     program.emit_insn(Insn::OpenWrite {
         cursor_id: sqlite_schema_cursor_id,
@@ -334,14 +335,14 @@ pub fn translate_create_view(
         sqlite_schema_cursor_id,
         None, // cdc_table_cursor_id, no cdc for views
         SchemaEntryType::View,
-        &normalized_view_name,
-        &normalized_view_name,
+        view_name_str,
+        view_name_str,
         0, // Regular views don't have a btree
         Some(sql),
     )?;
 
     // Parse schema to load the new view
-    let escaped_view_name = escape_sql_string_literal(&normalized_view_name);
+    let escaped_view_name = escape_sql_string_literal(view_name_str);
     program.emit_insn(Insn::ParseSchema {
         db: database_id,
         where_clause: Some(format!("name = '{escaped_view_name}'")),
@@ -383,20 +384,21 @@ pub fn translate_drop_view(
     let database_id = resolver.resolve_database_id(view_name)?;
     let schema_cookie = resolver.with_schema(database_id, |s| s.schema_version);
     program.begin_write_on_database(database_id, schema_cookie);
-    let normalized_view_name = normalize_ident(view_name.name.as_str());
+    let view_name_str = view_name.name.as_str();
 
     // Check if view exists (either regular or materialized)
+    let view_name_id = Identifier::from(view_name_str);
     let (is_regular_view, is_materialized_view) = resolver.with_schema(database_id, |s| {
         (
-            s.get_view(&normalized_view_name).is_some(),
-            s.is_materialized_view(&normalized_view_name),
+            s.get_view(&view_name_id).is_some(),
+            s.is_materialized_view(&view_name_id),
         )
     });
     let view_exists = is_regular_view || is_materialized_view;
 
     if !view_exists && !if_exists {
         return Err(crate::LimboError::ParseError(format!(
-            "no such view: {normalized_view_name}"
+            "no such view: {view_name_str}"
         )));
     }
 
@@ -408,9 +410,7 @@ pub fn translate_drop_view(
     // If this is a materialized view, we need to destroy its btree as well
     // and also clean up the associated DBSP state table and index
     let dbsp_table_name = if is_materialized_view {
-        if let Some(table) =
-            resolver.with_schema(database_id, |s| s.get_table(&normalized_view_name))
-        {
+        if let Some(table) = resolver.with_schema(database_id, |s| s.get_table(&view_name_id)) {
             if let Some(btree_table) = table.btree() {
                 // Destroy the btree for the materialized view
                 program.emit_insn(Insn::Destroy {
@@ -425,7 +425,7 @@ pub fn translate_drop_view(
         // Construct the DBSP state table name
         use crate::incremental::compiler::DBSP_CIRCUIT_VERSION;
         Some(format!(
-            "{DBSP_TABLE_PREFIX}{DBSP_CIRCUIT_VERSION}_{normalized_view_name}"
+            "{DBSP_TABLE_PREFIX}{DBSP_CIRCUIT_VERSION}_{view_name_str}"
         ))
     } else {
         None
@@ -433,9 +433,10 @@ pub fn translate_drop_view(
 
     // Destroy DBSP state table and index btrees if this is a materialized view
     if let Some(ref dbsp_table_name) = dbsp_table_name {
+        let dbsp_table_name_id = Identifier::from(dbsp_table_name.as_str());
         // Destroy DBSP indexes first
         let dbsp_indexes: Vec<_> = resolver.with_schema(database_id, |s| {
-            s.get_indices(dbsp_table_name).cloned().collect()
+            s.get_indices(&dbsp_table_name_id).cloned().collect()
         });
         for index in &dbsp_indexes {
             program.emit_insn(Insn::Destroy {
@@ -448,7 +449,7 @@ pub fn translate_drop_view(
 
         // Destroy DBSP state table btree
         if let Some(dbsp_table) =
-            resolver.with_schema(database_id, |s| s.get_table(dbsp_table_name))
+            resolver.with_schema(database_id, |s| s.get_table(&dbsp_table_name_id))
         {
             if let Some(dbsp_btree_table) = dbsp_table.btree() {
                 program.emit_insn(Insn::Destroy {
@@ -462,8 +463,10 @@ pub fn translate_drop_view(
     }
 
     // Open cursor to sqlite_schema table (structure is the same for all databases)
-    let schema_table =
-        resolver.with_schema(MAIN_DB_ID, |s| s.get_btree_table(SQLITE_TABLEID).unwrap());
+    let schema_table = resolver.with_schema(MAIN_DB_ID, |s| {
+        s.get_btree_table(&Identifier::from(SQLITE_TABLEID))
+            .unwrap()
+    });
     let sqlite_schema_cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(schema_table));
     program.emit_insn(Insn::OpenWrite {
         cursor_id: sqlite_schema_cursor_id,
@@ -479,7 +482,7 @@ pub fn translate_drop_view(
     // Set the view name and type we're looking for
     program.emit_insn(Insn::String8 {
         dest: view_name_reg,
-        value: normalized_view_name.clone(),
+        value: view_name_str.to_owned(),
     });
     program.emit_insn(Insn::String8 {
         dest: type_reg,
@@ -662,7 +665,7 @@ pub fn translate_drop_view(
     // Remove the view from the in-memory schema
     program.emit_insn(Insn::DropView {
         db: database_id,
-        view_name: normalized_view_name,
+        view_name: view_name_str.to_owned(),
     });
 
     // Update schema version (increment schema cookie)

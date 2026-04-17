@@ -44,7 +44,6 @@ use crate::{
         },
         ProgramBuilder,
     },
-    util::normalize_ident,
     vdbe::{
         affinity::Affinity,
         builder::{CursorKey, CursorType, DmlColumnContext},
@@ -57,6 +56,7 @@ use std::num::NonZeroUsize;
 use tracing::{instrument, Level};
 use turso_macros::{turso_assert, turso_assert_eq};
 use turso_parser::ast::{ResolveType, TriggerEvent, TriggerTime};
+use turso_parser::identifier::Identifier;
 
 #[instrument(skip_all, level = Level::DEBUG)]
 pub fn emit_program_for_update(
@@ -315,9 +315,10 @@ pub fn emit_program_for_update(
         plan.indexes_to_update.iter().map(|idx| idx.on_conflict),
     );
     let all_index_cursors = if any_replace {
-        let table_name = target_table.table.get_name();
         let all_indexes: Vec<_> = resolver.with_schema(target_database_id, |s| {
-            s.get_indices(table_name).cloned().collect()
+            s.get_indices(target_table.table.get_name())
+                .cloned()
+                .collect()
         });
         let source_table = plan
             .table_references
@@ -648,7 +649,7 @@ fn emit_update_column_values<'a>(
                     program.mark_last_insn_constant();
                     let mut updated = false;
                     if let Some(ddl_query_for_cdc_update) = cdc_update_alter_statement {
-                        if table_column.name.as_deref() == Some("sql") {
+                        if table_column.name_str() == Some("sql") {
                             program.emit_string8(ddl_query_for_cdc_update.to_string(), value_reg);
                             updated = true;
                         }
@@ -671,7 +672,7 @@ fn emit_update_column_values<'a>(
                             table_column
                                 .name
                                 .as_ref()
-                                .is_some_and(|tc_name| c.name.eq_ignore_ascii_case(tc_name))
+                                .is_some_and(|tc_name| c.name == tc_name.as_str())
                         })
                     });
 
@@ -1039,7 +1040,7 @@ fn emit_update_insns<'a>(
         start,
         beg,
         col_len,
-        table_name,
+        table_name.as_str(),
         has_direct_rowid_update,
         updates_rowid,
         rowid_set_clause_reg,
@@ -1251,7 +1252,7 @@ fn emit_update_insns<'a>(
             start,
             beg,
             col_len,
-            table_name,
+            table_name.as_str(),
             has_direct_rowid_update,
             updates_rowid,
             rowid_set_clause_reg,
@@ -1274,7 +1275,7 @@ fn emit_update_insns<'a>(
             &target_table,
             set_clauses,
             start,
-            table_name,
+            table_name.as_str(),
             skip_row_label,
             t_ctx,
             &layout,
@@ -1418,7 +1419,7 @@ fn emit_update_insns<'a>(
             _ => {
                 // ABORT/FAIL/ROLLBACK behavior
                 let raw_desc = if let Some(idx) = rowid_alias_index {
-                    String::from(table_name)
+                    table_name.to_string()
                         + "."
                         + target_table
                             .table
@@ -1427,9 +1428,9 @@ fn emit_update_insns<'a>(
                             .unwrap()
                             .name
                             .as_ref()
-                            .map_or("", |v| v)
+                            .map_or("", |v| v.as_str())
                 } else {
-                    String::from(table_name) + ".rowid"
+                    table_name.to_string() + ".rowid"
                 };
                 let (description, on_error) = halt_desc_and_on_error(
                     &raw_desc,
@@ -1506,14 +1507,13 @@ fn emit_update_insns<'a>(
         if !btree_table.check_constraints.is_empty() {
             // SQLite only evaluates CHECK constraints that reference at least one
             // column in the SET clause. Build a set of updated column names to filter.
-            let mut updated_col_names: HashSet<String> = columns_affected_by_update(
+            let mut updated_col_names: HashSet<Identifier> = columns_affected_by_update(
                 &btree_table.columns,
                 set_clauses.iter().map(|(idx, _)| *idx),
             )
             .into_iter()
             .filter_map(|col_idx| btree_table.columns.get(col_idx))
-            .filter_map(|col| col.name.as_deref())
-            .map(normalize_ident)
+            .filter_map(|col| col.name.clone())
             .collect();
 
             // If the rowid is being updated (either directly via ROWID_SENTINEL or
@@ -1525,7 +1525,7 @@ fn emit_update_insns<'a>(
                 });
             if rowid_updated {
                 for name in ROWID_STRS {
-                    updated_col_names.insert(name.to_string());
+                    updated_col_names.insert(Identifier::from(name.to_string()));
                 }
             }
 
@@ -1542,14 +1542,14 @@ fn emit_update_insns<'a>(
                 program,
                 &relevant_checks,
                 &mut t_ctx.resolver,
-                &btree_table.name,
+                btree_table.name.as_str(),
                 rowid_set_clause_reg.unwrap_or(beg),
                 btree_table
                     .columns
                     .iter()
                     .enumerate()
                     .filter_map(|(idx, col)| {
-                        col.name.as_deref().map(|n| {
+                        col.name_str().map(|n| {
                             if col.is_rowid_alias() {
                                 (n, rowid_set_clause_reg.unwrap_or(beg))
                             } else {
@@ -1582,7 +1582,7 @@ fn emit_update_insns<'a>(
                 emit_fk_child_update_counters(
                     program,
                     &table_btree,
-                    table_name,
+                    table_name.as_str(),
                     target_table_cursor_id,
                     start,
                     rowid_new_reg,
@@ -1722,7 +1722,7 @@ fn emit_update_insns<'a>(
             start_reg: to_u16(idx_start_reg),
             count: to_u16(num_cols + 1),
             dest_reg: to_u16(*record_reg),
-            index_name: Some(index.name.clone()),
+            index_name: Some(index.name.to_string()),
             affinity_str: None,
         });
 
@@ -1815,7 +1815,7 @@ fn emit_update_insns<'a>(
                             ForeignKeyActions::prepare_fk_delete_actions(
                                 program,
                                 &mut t_ctx.resolver,
-                                table_name,
+                                table_name.as_str(),
                                 target_table_cursor_id,
                                 idx_rowid_reg,
                                 Some((start, rowid_set_clause_reg.unwrap_or(beg))),
@@ -1834,7 +1834,7 @@ fn emit_update_insns<'a>(
                                     .table
                                     .btree()
                                     .expect("UPDATE target must be a BTree table"),
-                                table_name,
+                                table_name.as_str(),
                                 target_table_cursor_id,
                                 idx_rowid_reg,
                                 update_database_id,
@@ -1916,9 +1916,9 @@ fn emit_update_insns<'a>(
                             if idx > 0 {
                                 accum.push_str(", ");
                             }
-                            accum.push_str(table_name);
+                            accum.push_str(table_name.as_str());
                             accum.push('.');
-                            accum.push_str(&col.name);
+                            accum.push_str(col.name.as_str());
                             accum
                         },
                     );
@@ -1991,7 +1991,7 @@ fn emit_update_insns<'a>(
                 ForeignKeyActions::prepare_fk_delete_actions(
                     program,
                     &mut t_ctx.resolver,
-                    table_name,
+                    table_name.as_str(),
                     target_table_cursor_id,
                     target_reg,
                     Some((start, rowid_set_clause_reg.unwrap_or(beg))),
@@ -2010,7 +2010,7 @@ fn emit_update_insns<'a>(
                         .table
                         .btree()
                         .expect("UPDATE target must be a BTree table"),
-                    table_name,
+                    table_name.as_str(),
                     target_table_cursor_id,
                     target_reg,
                     update_database_id,
@@ -2223,7 +2223,7 @@ fn emit_update_insns<'a>(
                 } else {
                     InsertFlags::new().skip_last_rowid()
                 },
-                table_name: target_table.identifier.clone(),
+                table_name: target_table.identifier.to_string(),
             });
 
             if connection.foreign_keys_enabled() {
@@ -2250,7 +2250,7 @@ fn emit_update_insns<'a>(
                 fire_fk_update_actions(
                     program,
                     &mut t_ctx.resolver,
-                    table_name,
+                    table_name.as_str(),
                     beg, // old_rowid_reg
                     old_values_start,
                     start, // new_values_start

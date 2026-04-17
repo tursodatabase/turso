@@ -1,4 +1,5 @@
 use crate::sync::Arc;
+use turso_parser::identifier::Identifier;
 
 use crate::{
     bail_parse_error,
@@ -9,7 +10,6 @@ use crate::{
         emitter::Resolver,
         schema::{emit_schema_entry, SchemaEntryType, SQLITE_TABLEID},
     },
-    util::normalize_ident,
     vdbe::{
         affinity::Affinity,
         builder::{CursorType, ProgramBuilder},
@@ -36,38 +36,37 @@ fn resolve_analyze_targets(
 ) -> Result<(usize, Vec<AnalyzeTarget>)> {
     match target_opt {
         Some(target) => {
-            let normalized = normalize_ident(target.name.as_str());
+            let name = &target.name;
 
             // If db_name is specified, resolve to that database
             if let Some(db_name) = &target.db_name {
                 let database_id = resolver.resolve_database_id(target)?;
-                let db_normalized = normalize_ident(db_name.as_str());
 
                 // "ANALYZE db.table" — the name part is the table/index
                 // But first check if the name is actually a database name too (shouldn't be with db_name set)
-                let targets = resolve_targets_in_db(&normalized, database_id, resolver)?;
+                let targets = resolve_targets_in_db(name.as_str(), database_id, resolver)?;
                 if targets.is_empty() {
-                    bail_parse_error!("no such table or index: {}.{}", db_normalized, normalized);
+                    bail_parse_error!("no such table or index: {}.{}", db_name, name);
                 }
                 return Ok((database_id, targets));
             }
 
             // No db_name — check if the name is a database name first
-            if normalized.eq_ignore_ascii_case("main") {
+            if name == "main" {
                 let targets = collect_all_tables_in_db(0, resolver);
                 return Ok((0, targets));
             }
 
             // Check if it's an attached database name
-            if let Some((db_id, _)) = resolver.get_attached_database(&normalized) {
+            if let Some((db_id, _)) = resolver.get_attached_database(name.identifier()) {
                 let targets = collect_all_tables_in_db(db_id, resolver);
                 return Ok((db_id, targets));
             }
 
             // Not a database name — search main schema for table/index
-            let targets = resolve_targets_in_db(&normalized, 0, resolver)?;
+            let targets = resolve_targets_in_db(name.as_str(), 0, resolver)?;
             if targets.is_empty() {
-                bail_parse_error!("no such table or index: {}", target.name);
+                bail_parse_error!("no such table or index: {}", name);
             }
             Ok((0, targets))
         }
@@ -88,7 +87,7 @@ fn collect_all_tables_in_db(database_id: usize, resolver: &Resolver) -> Vec<Anal
             .filter_map(|(name, table)| {
                 if RESERVED_TABLE_PREFIXES
                     .iter()
-                    .any(|prefix| name.starts_with(prefix))
+                    .any(|prefix| name.as_str().starts_with(prefix))
                 {
                     return None;
                 }
@@ -105,8 +104,9 @@ fn resolve_targets_in_db(
     resolver: &Resolver,
 ) -> Result<Vec<AnalyzeTarget>> {
     // Try as a table first
+    let name_id = Identifier::from(name);
     let table_opt: Option<Arc<BTreeTable>> =
-        resolver.with_schema(database_id, |s| s.get_btree_table(name));
+        resolver.with_schema(database_id, |s| s.get_btree_table(&name_id));
     if let Some(table) = table_opt {
         return Ok(vec![(table, None)]);
     }
@@ -115,10 +115,7 @@ fn resolve_targets_in_db(
     let found: Option<(Arc<BTreeTable>, Arc<Index>)> =
         resolver.with_schema(database_id, |schema| {
             for (table_name, indexes) in schema.indexes.iter() {
-                if let Some(index) = indexes
-                    .iter()
-                    .find(|idx| idx.name.eq_ignore_ascii_case(name))
-                {
+                if let Some(index) = indexes.iter().find(|idx| idx.name == name) {
                     if let Some(table) = schema.get_btree_table(table_name) {
                         return Some((table, index.clone()));
                     }
@@ -165,8 +162,9 @@ pub fn translate_analyze(
     let sqlite_stat1_btreetable: Arc<BTreeTable>;
     let sqlite_stat1_source: RegisterOrLiteral<_>;
 
-    let stat1_table: Option<Arc<BTreeTable>> =
-        resolver.with_schema(database_id, |s| s.get_btree_table("sqlite_stat1"));
+    let stat1_table: Option<Arc<BTreeTable>> = resolver.with_schema(database_id, |s| {
+        s.get_btree_table(&Identifier::from("sqlite_stat1"))
+    });
     if let Some(sqlite_stat1) = stat1_table {
         sqlite_stat1_btreetable = sqlite_stat1.clone();
         sqlite_stat1_source = RegisterOrLiteral::Literal(sqlite_stat1.root_page);
@@ -198,7 +196,9 @@ pub fn translate_analyze(
         sqlite_stat1_source = RegisterOrLiteral::Register(table_root_reg);
 
         let table = resolver
-            .with_schema(database_id, |s| s.get_btree_table(SQLITE_TABLEID))
+            .with_schema(database_id, |s| {
+                s.get_btree_table(&Identifier::from(SQLITE_TABLEID))
+            })
             .unwrap();
         let sqlite_schema_cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(table));
         program.emit_insn(Insn::OpenWrite {

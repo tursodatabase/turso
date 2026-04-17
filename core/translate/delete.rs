@@ -13,10 +13,10 @@ use crate::translate::subquery::{
     plan_subqueries_from_where_clause,
 };
 use crate::translate::trigger_exec::has_triggers_including_temp;
-use crate::util::normalize_ident;
 use crate::vdbe::builder::{ProgramBuilder, ProgramBuilderOpts};
 use crate::Result;
 use turso_parser::ast::{Expr, Limit, QualifiedName, ResultColumn, TriggerEvent, With};
+use turso_parser::identifier::Identifier;
 
 use super::plan::{ColumnUsedMask, JoinedTable, TableReferences, WhereTerm};
 
@@ -33,14 +33,12 @@ pub fn translate_delete(
     connection: &Arc<crate::Connection>,
 ) -> Result<()> {
     let database_id = resolver.resolve_existing_table_database_id_qualified(tbl_name)?;
-    let normalized_table_name = normalize_ident(tbl_name.name.as_str());
-
     // Check if this is a system table that should be protected from direct writes
     if !connection.is_nested_stmt()
         && !connection.is_mvcc_bootstrap_connection()
-        && crate::schema::is_system_table(&normalized_table_name)
+        && crate::schema::is_system_table(tbl_name.name.as_str())
     {
-        crate::bail_parse_error!("table {} may not be modified", normalized_table_name);
+        crate::bail_parse_error!("table {} may not be modified", tbl_name.name.as_str());
     }
 
     let schema_cookie = resolver.with_schema(database_id, |s| s.schema_version);
@@ -144,9 +142,10 @@ pub fn prepare_delete_plan(
     connection: &Arc<crate::Connection>,
     database_id: usize,
 ) -> Result<Plan> {
-    let table_name = normalize_ident(tbl_name.name.as_str());
+    let table_name = tbl_name.name.as_str();
+    let table_name_id = tbl_name.name.identifier().clone();
     let schema = resolver.schema();
-    let table = match resolver.with_schema(database_id, |s| s.get_table(&table_name)) {
+    let table = match resolver.with_schema(database_id, |s| s.get_table(&table_name_id)) {
         Some(table) => table,
         None => crate::bail_parse_error!("no such table: {}", table_name),
     };
@@ -155,12 +154,12 @@ pub fn prepare_delete_plan(
     }
 
     // Check if this is a materialized view
-    if schema.is_materialized_view(&table_name) {
+    if schema.is_materialized_view(&table_name_id) {
         crate::bail_parse_error!("cannot modify materialized view {}", table_name);
     }
 
     // Check if this table has any incompatible dependent views
-    let incompatible_views = schema.has_incompatible_dependent_views(&table_name);
+    let incompatible_views = schema.has_incompatible_dependent_views(&table_name_id);
     if !incompatible_views.is_empty() {
         use crate::incremental::compiler::DBSP_CIRCUIT_VERSION;
         crate::bail_parse_error!(
@@ -168,7 +167,7 @@ pub fn prepare_delete_plan(
              These views were created with a different DBSP version than the current version ({}). \n\
              Please DROP and recreate the view(s) before modifying this table.",
             table_name,
-            incompatible_views.join(", "),
+            incompatible_views.iter().map(|v| v.as_str()).collect::<Vec<_>>().join(", "),
             DBSP_CIRCUIT_VERSION
         );
     }
@@ -186,10 +185,10 @@ pub fn prepare_delete_plan(
     let joined_tables = vec![JoinedTable {
         op: Operation::default_scan_for(&table),
         table,
-        identifier: tbl_name
-            .alias
-            .as_ref()
-            .map_or_else(|| table_name.clone(), |alias| alias.as_str().to_string()),
+        identifier: tbl_name.alias.as_ref().map_or_else(
+            || Identifier::from(table_name),
+            |alias| Identifier::from(alias.as_str()),
+        ),
         internal_id: program.table_reference_counter.next(),
         join_info: None,
         col_used_mask: ColumnUsedMask::default(),

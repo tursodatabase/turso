@@ -1,3 +1,5 @@
+use turso_parser::identifier::Identifier;
+
 use crate::mvcc::clock::LogicalClock;
 use crate::mvcc::database::{
     DeleteRowStateMachine, MVTableId, MvStore, Row, RowID, RowKey, RowVersion, TxTimestampOrID,
@@ -266,16 +268,18 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                 )
             })
             .collect();
-        let mvcc_meta_table = schema.get_btree_table(MVCC_META_TABLE_NAME).map(|table| {
-            turso_assert!(
-                table.root_page != 0,
-                "mvcc meta table root_page must be non-zero"
-            );
-            (
-                mvstore.get_table_id_from_root_page(table.root_page),
-                table.columns.len(),
-            )
-        });
+        let mvcc_meta_table = schema
+            .get_btree_table(&Identifier::from(MVCC_META_TABLE_NAME))
+            .map(|table| {
+                turso_assert!(
+                    table.root_page != 0,
+                    "mvcc meta table root_page must be non-zero"
+                );
+                (
+                    mvstore.get_table_id_from_root_page(table.root_page),
+                    table.columns.len(),
+                )
+            });
         let durable_mvcc_metadata =
             !connection.db.path.starts_with(":memory:") && mvcc_meta_table.is_some();
         let durable_tx_max = mvstore.durable_txid_max.load(Ordering::SeqCst);
