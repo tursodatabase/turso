@@ -1,11 +1,16 @@
+use strumbra::UniqueString;
+
 /// A SQL identifier with ASCII-only case-insensitive equality, ordering, and hashing.
 /// Stores the original-case string; comparisons fold only A-Z to a-z.
+///
+/// Backed by [`UniqueString`] (Umbra-style string) for compact storage:
+/// 16 bytes vs String's 24, with inline storage for identifiers up to 12 bytes.
 #[derive(Clone, Debug)]
-pub struct Identifier(String);
+pub struct Identifier(UniqueString);
 
 impl Identifier {
     pub fn new(s: String) -> Self {
-        Self(s)
+        Self(UniqueString::try_from(s).unwrap())
     }
 
     pub fn as_str(&self) -> &str {
@@ -13,13 +18,13 @@ impl Identifier {
     }
 
     pub fn into_inner(self) -> String {
-        self.0
+        self.0.to_string()
     }
 }
 
 impl PartialEq for Identifier {
     fn eq(&self, other: &Self) -> bool {
-        self.0.eq_ignore_ascii_case(&other.0)
+        self.as_str().eq_ignore_ascii_case(other.as_str())
     }
 }
 
@@ -27,9 +32,7 @@ impl Eq for Identifier {}
 
 impl std::hash::Hash for Identifier {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-        // Lowercase into a stack buffer and feed the hasher in blocks so it
-        // can process full words at a time and the inner loop can vectorize.
-        let bytes = self.0.as_bytes();
+        let bytes = self.as_str().as_bytes();
         let mut buf = [0u8; 64];
         for chunk in bytes.chunks(buf.len()) {
             for (dst, &src) in buf.iter_mut().zip(chunk) {
@@ -49,8 +52,8 @@ impl PartialOrd for Identifier {
 
 impl Ord for Identifier {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        let a = self.0.as_bytes();
-        let b = other.0.as_bytes();
+        let a = self.as_str().as_bytes();
+        let b = other.as_str().as_bytes();
         for (x, y) in a.iter().zip(b.iter()) {
             match x.to_ascii_lowercase().cmp(&y.to_ascii_lowercase()) {
                 std::cmp::Ordering::Equal => continue,
@@ -63,49 +66,49 @@ impl Ord for Identifier {
 
 impl std::fmt::Display for Identifier {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.0)
+        f.write_str(self.as_str())
     }
 }
 
 impl From<String> for Identifier {
     fn from(s: String) -> Self {
-        Self(s)
+        Self(UniqueString::try_from(s).unwrap())
     }
 }
 
 impl From<&str> for Identifier {
     fn from(s: &str) -> Self {
-        Self(s.to_owned())
+        Self(UniqueString::try_from(s).unwrap())
     }
 }
 
 impl AsRef<str> for Identifier {
     fn as_ref(&self) -> &str {
-        &self.0
+        self.as_str()
     }
 }
 
 impl PartialEq<str> for Identifier {
     fn eq(&self, other: &str) -> bool {
-        self.0.eq_ignore_ascii_case(other)
+        self.as_str().eq_ignore_ascii_case(other)
     }
 }
 
 impl PartialEq<Identifier> for str {
     fn eq(&self, other: &Identifier) -> bool {
-        self.eq_ignore_ascii_case(&other.0)
+        self.eq_ignore_ascii_case(other.as_str())
     }
 }
 
 impl PartialEq<&str> for Identifier {
     fn eq(&self, other: &&str) -> bool {
-        self.0.eq_ignore_ascii_case(other)
+        self.as_str().eq_ignore_ascii_case(other)
     }
 }
 
 impl PartialEq<Identifier> for &str {
     fn eq(&self, other: &Identifier) -> bool {
-        self.eq_ignore_ascii_case(&other.0)
+        self.eq_ignore_ascii_case(other.as_str())
     }
 }
 
@@ -115,7 +118,7 @@ impl serde::Serialize for Identifier {
     where
         S: serde::Serializer,
     {
-        serializer.serialize_str(&self.0)
+        serializer.serialize_str(self.as_str())
     }
 }
 
@@ -125,7 +128,7 @@ impl<'de> serde::Deserialize<'de> for Identifier {
     where
         D: serde::Deserializer<'de>,
     {
-        String::deserialize(deserializer).map(Identifier)
+        String::deserialize(deserializer).map(Identifier::from)
     }
 }
 
@@ -190,5 +193,20 @@ mod tests {
     fn display_preserves_original_case() {
         let id = Identifier::from("MyTable");
         assert_eq!(id.to_string(), "MyTable");
+    }
+
+    #[test]
+    fn compact_size() {
+        assert_eq!(std::mem::size_of::<Identifier>(), 16);
+    }
+
+    #[test]
+    fn short_identifiers_are_inline() {
+        // Identifiers ≤12 bytes should not heap-allocate (SSO).
+        // We can't directly test this, but we can verify they work correctly.
+        for name in &["id", "name", "rowid", "_rowid_", "oid", "created_at"] {
+            let id = Identifier::from(*name);
+            assert_eq!(id.as_str(), *name);
+        }
     }
 }

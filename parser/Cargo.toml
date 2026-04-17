@@ -25,6 +25,7 @@ serde = { workspace = true , optional = true, features = ["derive", "rc"] }
 thiserror = { workspace = true }
 turso_macros = { workspace = true }
 memchr = "2.7.6"
+strumbra = "0.6"
 
 [dev-dependencies]
 fallible-iterator = { workspace = true }
