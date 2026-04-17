@@ -2247,7 +2247,7 @@ pub struct MvStore<Clock: LogicalClock> {
 
 impl<Clock: LogicalClock> MvStore<Clock> {
     fn uses_durable_mvcc_metadata(&self, connection: &Arc<Connection>) -> bool {
-        !connection.db.path.starts_with(":memory:")
+        !connection.db.is_in_memory_db()
     }
 
     /// Captures table-valued functions (e.g. generate_series) from the schema before
