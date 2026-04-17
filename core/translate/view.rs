@@ -107,10 +107,10 @@ pub fn translate_create_materialized_view(
         vec![], // primary_key_columns — materialized views use implicit rowid
         view_columns,
         BTreeCharacteristics::HAS_ROWID,
-        vec![], // unique_sets
-        vec![], // foreign_keys
-        vec![], // check_constraints
-        None,   // rowid_alias_conflict_clause
+        vec![],
+        vec![],
+        vec![],
+        None,
     ));
 
     // Allocate a cursor for writing to the view's btree during population

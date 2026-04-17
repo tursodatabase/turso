@@ -2260,17 +2260,13 @@ impl<T: Default> Clone for ResetOnClone<T> {
 }
 
 bitflags! {
-    /// Set of boolean table-level properties passed to [`BTreeTable::new`].
-    /// These correspond to SQL CREATE TABLE clauses/flags and end up stored
-    /// as individual `bool` fields on [`BTreeTable`]; the bitflags form is
-    /// just an ergonomic way to pass several at once.
     #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
     pub struct BTreeCharacteristics: u8 {
         /// Table has a rowid column (i.e. not `WITHOUT ROWID`).
         const HAS_ROWID         = 0b0000_0001;
         /// Table is declared `STRICT`.
         const STRICT            = 0b0000_0010;
-        /// Table has an INTEGER PRIMARY KEY AUTOINCREMENT column.
+        /// Table has an `AUTOINCREMENT` column.
         const HAS_AUTOINCREMENT = 0b0000_0100;
     }
 }
@@ -2369,10 +2365,6 @@ pub struct BTreeTable {
     pub root_page: i64,
     pub name: String,
     pub primary_key_columns: Vec<(String, SortOrder)>,
-    /// Read via [`BTreeTable::columns`]; mutate via [`BTreeTable::columns_mut`],
-    /// which invalidates [`BTreeTable::column_dependencies`]. Construction goes
-    /// through [`BTreeTable::new`] so that `column_dependencies` is never
-    /// supplied by a caller — it is always initialized to empty.
     columns: Vec<Column>,
     pub has_rowid: bool,
     pub is_strict: bool,
@@ -2388,10 +2380,6 @@ pub struct BTreeTable {
     column_dependencies: ResetOnClone<OnceLock<GeneratedColGraph>>,
 }
 
-/// RAII guard returned by [`BTreeTable::columns_mut`]. Deref-accesses the
-/// inner `Vec<Column>`; on drop, refreshes derived state that must stay in
-/// lockstep with the columns (cached dependency graph, virtual-columns flag,
-/// logical-to-physical map).
 pub struct ColumnsMut<'a> {
     table: &'a mut BTreeTable,
 }
@@ -2913,10 +2901,6 @@ impl BTreeTable {
             .expect("column_dependencies was just initialized"))
     }
 
-    /// Test-only accessor that returns the cached dependency graph without
-    /// triggering a build. Useful for asserting cache-invalidation semantics
-    /// (Clone resets the cache, `columns_mut()` resets the cache, etc.) without
-    /// observing those assertions through a method that would repopulate it.
     #[cfg(test)]
     pub(crate) fn peek_column_dependencies(&self) -> Option<&GeneratedColGraph> {
         self.column_dependencies.0.get()

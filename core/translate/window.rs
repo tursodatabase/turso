@@ -539,12 +539,12 @@ impl EmitWindow {
         let window_function_count = window.functions.len();
 
         // An ephemeral table used to buffer rows for the current frame
-        // TODO: Generating the name this way may cause collisions with real tables in the
-        //  attached database. Other ephemeral tables are created similarly, so it's left
-        //  as-is for now. Ideally, there should be a way to mark tables as ephemeral so
-        //  they can be handled differently from regular tables.
         let buffer_table = Arc::new(BTreeTable::new(
             0,
+            // TODO: Generating the name this way may cause collisions with real tables in the
+            //  attached database. Other ephemeral tables are created similarly, so it's left
+            //  as-is for now. Ideally, there should be a way to mark tables as ephemeral so
+            //  they can be handled differently from regular tables.
             format!("buffer_table_{window_name}"),
             vec![],
             src_columns,
