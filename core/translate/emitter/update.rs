@@ -1,6 +1,6 @@
 use super::gencol::compute_virtual_columns;
 use super::TranslateCtx;
-use crate::schema::{columns_affected_by_update, ColumnLayout, GeneratedType, Table};
+use crate::schema::{ColumnLayout, GeneratedType, Table};
 use crate::translate::insert::halt_desc_and_on_error;
 use crate::translate::plan::ColumnMask;
 use crate::translate::stmt_journal::any_effective_replace;
@@ -469,10 +469,10 @@ fn emit_update_column_values<'a>(
         }
     }
     let target_table_columns = target_table.table.columns();
-    let affected_columns = columns_affected_by_update(
-        target_table_columns,
-        set_clauses.iter().map(|(idx, _)| *idx),
-    );
+    let affected_columns = match target_table.table.btree() {
+        Some(btree) => btree.columns_affected_by_update(set_clauses.iter().map(|(idx, _)| *idx))?,
+        None => set_clauses.iter().map(|(idx, _)| *idx).collect(),
+    };
 
     for (idx, table_column) in target_table_columns.iter().enumerate() {
         let target_reg = layout.to_register(start, idx);
@@ -1059,7 +1059,7 @@ fn emit_update_insns<'a>(
     if let Some(btree_table) = target_table.table.btree() {
         if !btree_table.is_strict {
             let affinity = btree_table
-                .columns
+                .columns()
                 .iter()
                 .filter(|c| !c.is_virtual_generated())
                 .map(|c| c.affinity());
@@ -1353,8 +1353,10 @@ fn emit_update_insns<'a>(
     for (idx, _) in set_clauses {
         set_clause_cols.set(*idx);
     }
-    let affected_columns =
-        columns_affected_by_update(target_table.table.columns(), &set_clause_cols);
+    let affected_columns = match target_table.table.btree() {
+        Some(btree) => btree.columns_affected_by_update(&set_clause_cols)?,
+        None => set_clause_cols.clone(),
+    };
     let update_affects_virtual_columns = affected_columns.count() > set_clause_cols.count();
     let has_returning = returning.as_ref().is_some_and(|r| !r.is_empty());
     let has_check_constraints = target_table
@@ -1484,7 +1486,7 @@ fn emit_update_insns<'a>(
             crate::translate::expr::emit_custom_type_encode_columns(
                 program,
                 &t_ctx.resolver,
-                &btree_table.columns,
+                btree_table.columns(),
                 start,
                 Some(&set_col_indices),
                 table_name,
@@ -1506,21 +1508,19 @@ fn emit_update_insns<'a>(
         if !btree_table.check_constraints.is_empty() {
             // SQLite only evaluates CHECK constraints that reference at least one
             // column in the SET clause. Build a set of updated column names to filter.
-            let mut updated_col_names: HashSet<String> = columns_affected_by_update(
-                &btree_table.columns,
-                set_clauses.iter().map(|(idx, _)| *idx),
-            )
-            .into_iter()
-            .filter_map(|col_idx| btree_table.columns.get(col_idx))
-            .filter_map(|col| col.name.as_deref())
-            .map(normalize_ident)
-            .collect();
+            let mut updated_col_names: HashSet<String> = btree_table
+                .columns_affected_by_update(set_clauses.iter().map(|(idx, _)| *idx))?
+                .into_iter()
+                .filter_map(|col_idx| btree_table.columns().get(col_idx))
+                .filter_map(|col| col.name.as_deref())
+                .map(normalize_ident)
+                .collect();
 
             // If the rowid is being updated (either directly via ROWID_SENTINEL or
             // through a rowid alias column), also include the rowid pseudo-column
             // names so that CHECK(rowid > 0) etc. are properly triggered.
             let rowid_updated = set_clauses.iter().any(|(idx, _)| *idx == ROWID_SENTINEL)
-                || btree_table.columns.iter().enumerate().any(|(i, c)| {
+                || btree_table.columns().iter().enumerate().any(|(i, c)| {
                     c.is_rowid_alias() && set_clauses.iter().any(|(idx, _)| *idx == i)
                 });
             if rowid_updated {
@@ -1545,7 +1545,7 @@ fn emit_update_insns<'a>(
                 &btree_table.name,
                 rowid_set_clause_reg.unwrap_or(beg),
                 btree_table
-                    .columns
+                    .columns()
                     .iter()
                     .enumerate()
                     .filter_map(|(idx, col)| {
@@ -1571,13 +1571,11 @@ fn emit_update_insns<'a>(
         if let Some(table_btree) = target_table.table.btree() {
             if t_ctx.resolver.schema().has_child_fks(table_name) {
                 let rowid_new_reg = rowid_set_clause_reg.unwrap_or(beg);
-                let directly_and_indirectly_updated_columns: ColumnMask = set_clauses
-                    .iter()
-                    .map(|(i, _)| *i)
-                    .flat_map(|col| {
-                        columns_affected_by_update(&table_btree.columns, [col].iter().cloned())
-                    })
-                    .collect();
+                let mut directly_and_indirectly_updated_columns = ColumnMask::default();
+                directly_and_indirectly_updated_columns.union_with(
+                    &table_btree
+                        .columns_affected_by_update(set_clauses.iter().map(|(idx, _)| *idx))?,
+                );
 
                 emit_fk_child_update_counters(
                     program,

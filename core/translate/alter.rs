@@ -176,7 +176,7 @@ fn emit_rename_sqlite_sequence_entry(
     program.mark_last_insn_constant();
 
     let affinity_str = sqlite_sequence
-        .columns
+        .columns()
         .iter()
         .map(|col| col.affinity().aff_mask())
         .collect::<String>();
@@ -426,10 +426,12 @@ fn emit_add_virtual_column_validation(
     })?;
 
     let mut original_table = table.clone();
-    original_table.columns.retain(|c| !c.is_virtual_generated());
+    original_table
+        .columns_mut()
+        .retain(|c| !c.is_virtual_generated());
     original_table.has_virtual_columns = false;
     original_table.logical_to_physical_map =
-        BTreeTable::build_logical_to_physical_map(&original_table.columns);
+        BTreeTable::build_logical_to_physical_map(original_table.columns());
     let original_table = Arc::new(original_table);
     let cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(original_table.clone()));
     program.emit_insn(Insn::OpenRead {
@@ -454,7 +456,7 @@ fn emit_add_virtual_column_validation(
 
     let layout = resolved_table.column_layout();
     let base_dest_reg = program.alloc_registers(layout.column_count());
-    for (idx, table_column) in resolved_table.columns.iter().enumerate() {
+    for (idx, table_column) in resolved_table.columns().iter().enumerate() {
         if table_column.is_virtual_generated() || table_column.is_rowid_alias() {
             continue;
         }
@@ -467,8 +469,8 @@ fn emit_add_virtual_column_validation(
     }
 
     let dml_ctx =
-        DmlColumnContext::layout(&resolved_table.columns, base_dest_reg, rowid_reg, layout);
-    compute_virtual_columns(program, resolved_table.columns.iter(), &dml_ctx, resolver)?;
+        DmlColumnContext::layout(resolved_table.columns(), base_dest_reg, rowid_reg, layout);
+    compute_virtual_columns(program, resolved_table.columns().iter(), &dml_ctx, resolver)?;
     let result_reg = dml_ctx.to_column_reg(new_column_idx);
 
     if !check_constraints.is_empty() {
@@ -481,7 +483,7 @@ fn emit_add_virtual_column_validation(
             resolved_table.name.as_str(),
             rowid_reg,
             resolved_table
-                .columns
+                .columns()
                 .iter()
                 .enumerate()
                 .filter_map(|(idx, col)| {
@@ -707,9 +709,9 @@ pub fn translate_alter_table(
             let column_name = column_name.as_str();
 
             // Tables always have at least one column.
-            turso_assert_ne!(btree.columns.len(), 0);
+            turso_assert_ne!(btree.columns().len(), 0);
 
-            if btree.columns.len() == 1 {
+            if btree.columns().len() == 1 {
                 return Err(LimboError::ParseError(format!(
                     "cannot drop column \"{column_name}\": no other columns exist"
                 )));
@@ -861,7 +863,7 @@ pub fn translate_alter_table(
             // Must have at least one non-generated column after the drop
             {
                 let remaining_non_generated = btree
-                    .columns
+                    .columns()
                     .iter()
                     .enumerate()
                     .filter(|(idx, col)| *idx != dropped_index && !col.is_generated())
@@ -875,10 +877,9 @@ pub fn translate_alter_table(
 
             // Check if any virtual column depends on the dropped column
             {
-                let affected =
-                    crate::schema::columns_affected_by_update(&btree.columns, [dropped_index]);
+                let affected = btree.columns_affected_by_update([dropped_index])?;
                 for idx in &affected {
-                    if idx != dropped_index && btree.columns[idx].is_virtual_generated() {
+                    if idx != dropped_index && btree.columns()[idx].is_virtual_generated() {
                         return Err(LimboError::ParseError(format!(
                             "error in table {table_name} after drop column: no such column: {column_name}"
                         )));
@@ -895,7 +896,7 @@ pub fn translate_alter_table(
             // trigger execution time.
             let post_drop_btree = {
                 let mut t = btree.clone();
-                t.columns.remove(dropped_index);
+                t.columns_mut().remove(dropped_index);
                 t
             };
             let table_name_norm = normalize_ident(table_name);
@@ -940,7 +941,7 @@ pub fn translate_alter_table(
                 }
             }
 
-            btree.columns.remove(dropped_index);
+            btree.columns_mut().remove(dropped_index);
 
             let sql = escape_sql_string_literal(&btree.to_sql());
 
@@ -972,7 +973,7 @@ pub fn translate_alter_table(
                 |program| {
                     let table_name = btree.name.clone();
                     let source_column_by_schema_idx = btree
-                        .columns
+                        .columns()
                         .iter()
                         .enumerate()
                         .map(|(new_idx, column)| {
@@ -1110,7 +1111,7 @@ pub fn translate_alter_table(
             }
 
             // TODO: All quoted ids will be quoted with `[]`, we should store some info from the parsed AST
-            btree.columns.push(column.clone());
+            btree.columns_mut().push(column.clone());
 
             // Add foreign key constraints and CHECK constraints to the btree table
             for constraint in &constraints {
@@ -1170,7 +1171,7 @@ pub fn translate_alter_table(
                     }
                     ast::ColumnConstraint::Check(expr) => {
                         let column_names: Vec<&str> = btree
-                            .columns
+                            .columns()
                             .iter()
                             .filter_map(|c| c.name.as_deref())
                             .collect();
@@ -1383,7 +1384,7 @@ pub fn translate_alter_table(
             });
 
             program.cursor_loop(cursor_id, |program, rowid| {
-                let sqlite_schema_column_len = sqlite_schema.columns.len();
+                let sqlite_schema_column_len = sqlite_schema.columns().len();
                 turso_assert_eq!(sqlite_schema_column_len, 5);
 
                 let first_column = program.alloc_registers(sqlite_schema_column_len);
@@ -1570,7 +1571,7 @@ pub fn translate_alter_table(
                 true => (false, None),
                 false => {
                     let replacement_column = Column::try_from(&definition)?;
-                    let rewrites_physical_layout = !btree.columns[column_index].is_generated()
+                    let rewrites_physical_layout = !btree.columns()[column_index].is_generated()
                         && replacement_column.is_generated();
                     (rewrites_physical_layout, Some(replacement_column))
                 }
@@ -1604,7 +1605,7 @@ pub fn translate_alter_table(
                 }
 
                 let non_generated_count = btree
-                    .columns
+                    .columns()
                     .iter()
                     .enumerate()
                     .filter(|(idx, col)| *idx != column_index && !col.is_generated())
@@ -1619,11 +1620,11 @@ pub fn translate_alter_table(
 
             let rewritten_table = if rewrites_physical_layout {
                 let mut table = btree.clone();
-                table.columns[column_index] =
+                table.columns_mut()[column_index] =
                     replacement_column.expect("replacement_column must exist for ALTER COLUMN");
                 table.prepare_generated_columns()?;
                 table.logical_to_physical_map =
-                    BTreeTable::build_logical_to_physical_map(&table.columns);
+                    BTreeTable::build_logical_to_physical_map(table.columns());
                 Some(table)
             } else {
                 None
@@ -1775,7 +1776,7 @@ pub fn translate_alter_table(
             });
 
             program.cursor_loop(cursor_id, |program, rowid| {
-                let sqlite_schema_column_len = sqlite_schema.columns.len();
+                let sqlite_schema_column_len = sqlite_schema.columns().len();
                 turso_assert_eq!(sqlite_schema_column_len, 5);
 
                 let first_column = program.alloc_registers(sqlite_schema_column_len);
@@ -1921,7 +1922,7 @@ pub fn translate_alter_table(
                 emit_add_virtual_column_validation(
                     program,
                     &rewritten_table,
-                    &rewritten_table.columns[column_index],
+                    &rewritten_table.columns()[column_index],
                     &definition.constraints,
                     resolver,
                     connection,
@@ -1929,7 +1930,7 @@ pub fn translate_alter_table(
                 )?;
 
                 let source_column_by_schema_idx = rewritten_table
-                    .columns
+                    .columns()
                     .iter()
                     .enumerate()
                     .map(|(idx, column)| {
@@ -1984,7 +1985,7 @@ fn emit_rewrite_table_rows(
 ) {
     turso_assert_eq!(
         source_column_by_schema_idx.len(),
-        rewritten_table.columns.len()
+        rewritten_table.columns().len()
     );
 
     let layout = rewritten_table.column_layout();
@@ -2043,7 +2044,7 @@ fn emit_rewrite_table_rows(
 
 fn non_virtual_affinity_str(table: &BTreeTable) -> String {
     table
-        .columns
+        .columns()
         .iter()
         .filter(|col| !col.is_virtual_generated())
         .map(|col| col.affinity_with_strict(table.is_strict).aff_mask())
@@ -2087,7 +2088,7 @@ fn translate_rename_virtual_table(
     });
 
     program.cursor_loop(schema_cur, |program, rowid| {
-        let ncols = sqlite_schema.columns.len();
+        let ncols = sqlite_schema.columns().len();
         turso_assert_eq!(ncols, 5);
 
         let first_col = program.alloc_registers(ncols);
@@ -3658,7 +3659,7 @@ fn validate_trigger_columns_after_drop(
     {
         Some(
             post_drop_table
-                .columns
+                .columns()
                 .iter()
                 .filter_map(|c| c.name.as_deref().map(normalize_ident))
                 .collect(),
@@ -3667,7 +3668,7 @@ fn validate_trigger_columns_after_drop(
         resolver.with_schema(trigger_database_id, |s| {
             s.get_table(&trigger_table_norm).and_then(|t| {
                 t.btree().map(|bt| {
-                    bt.columns
+                    bt.columns()
                         .iter()
                         .filter_map(|c| c.name.as_deref().map(normalize_ident))
                         .collect()
@@ -5296,7 +5297,7 @@ fn get_table_columns(
     if lookup_database_id == altered_database_id && table_name_norm == altered_table_norm {
         Some(
             post_drop_table
-                .columns
+                .columns()
                 .iter()
                 .filter_map(|c| c.name.as_deref().map(normalize_ident))
                 .collect(),
@@ -5305,7 +5306,7 @@ fn get_table_columns(
         resolver.with_schema(lookup_database_id, |s| {
             s.get_table(table_name_norm).and_then(|t| {
                 t.btree().map(|bt| {
-                    bt.columns
+                    bt.columns()
                         .iter()
                         .filter_map(|c| c.name.as_deref().map(normalize_ident))
                         .collect()

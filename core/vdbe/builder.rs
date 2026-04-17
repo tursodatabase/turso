@@ -399,14 +399,14 @@ impl CursorType {
     pub fn get_explain_description(&self) -> String {
         let out = match self {
             CursorType::BTreeTable(btree_table) => {
-                let mut col_count = btree_table.columns.len();
+                let mut col_count = btree_table.columns().len();
                 if btree_table.get_rowid_alias_column().is_none() {
                     col_count += 1;
                 }
                 Some((
                     col_count,
                     btree_table
-                        .columns
+                        .columns()
                         .iter()
                         .map(|col| {
                             if let Some(coll) = col.collation_opt() {
@@ -1700,7 +1700,7 @@ impl ProgramBuilder {
         let (_, cursor_type) = self.cursor_ref.get(cursor_id).expect("cursor_id is valid");
         if let CursorType::BTreeTable(btree) = cursor_type {
             let column_def = btree
-                .columns
+                .columns()
                 .get(column)
                 .expect("column index out of bounds");
             if column_def.is_rowid_alias() {
@@ -1733,7 +1733,7 @@ impl ProgramBuilder {
 
         if let CursorType::BTreeTable(btree) = cursor_type {
             let column_def = btree
-                .columns
+                .columns()
                 .get(column)
                 .expect("column index out of bounds");
             turso_assert!(
@@ -1750,9 +1750,9 @@ impl ProgramBuilder {
 
         let default = 'value: {
             let default = match cursor_type {
-                CursorType::BTreeTable(btree) => &btree.columns[column].default,
+                CursorType::BTreeTable(btree) => &btree.columns()[column].default,
                 CursorType::BTreeIndex(index) => &index.columns[column].default,
-                CursorType::MaterializedView(btree, _) => &btree.columns[column].default,
+                CursorType::MaterializedView(btree, _) => &btree.columns()[column].default,
                 _ => break 'value None,
             };
 
@@ -1777,8 +1777,8 @@ impl ProgramBuilder {
             // pCol->affinity. This ensures e.g. ALTER TABLE ADD COLUMN c TEXT
             // DEFAULT 0 returns text "0" rather than integer 0 for pre-existing rows.
             let affinity = match cursor_type {
-                CursorType::BTreeTable(btree) => btree.columns[column].affinity(),
-                CursorType::MaterializedView(btree, _) => btree.columns[column].affinity(),
+                CursorType::BTreeTable(btree) => btree.columns()[column].affinity(),
+                CursorType::MaterializedView(btree, _) => btree.columns()[column].affinity(),
                 _ => Affinity::Blob,
             };
             if let Some(converted) = affinity.convert(&value) {

@@ -6,9 +6,7 @@ use turso_parser::ast::{self, TriggerEvent, TriggerTime, Upsert};
 
 use super::emitter::gencol::compute_virtual_columns;
 use crate::error::SQLITE_CONSTRAINT_PRIMARYKEY;
-use crate::schema::{
-    columns_affected_by_update, BTreeTable, ColumnLayout, IndexColumn, ROWID_SENTINEL,
-};
+use crate::schema::{BTreeTable, ColumnLayout, IndexColumn, ROWID_SENTINEL};
 use crate::translate::emitter::{emit_check_constraints, emit_make_record, UpdateRowSource};
 use crate::translate::expr::{walk_expr, WalkControl};
 use crate::translate::fkeys::{
@@ -408,7 +406,7 @@ pub fn emit_upsert(
         src_reg: ctx.conflict_rowid_reg,
         target_pc: ctx.loop_labels.row_done,
     });
-    let num_cols = ctx.table.columns.len();
+    let num_cols = ctx.table.columns().len();
     let layout = ctx.table.column_layout();
 
     let table_ref_id = table_references
@@ -472,7 +470,7 @@ pub fn emit_upsert(
             crate::translate::expr::emit_custom_type_decode_columns(
                 program,
                 resolver,
-                &bt.columns,
+                bt.columns(),
                 decoded_current,
                 None,
                 &layout,
@@ -482,7 +480,7 @@ pub fn emit_upsert(
             crate::translate::expr::emit_custom_type_decode_columns(
                 program,
                 resolver,
-                &bt.columns,
+                bt.columns(),
                 new_start,
                 None,
                 &layout,
@@ -498,7 +496,7 @@ pub fn emit_upsert(
             crate::translate::expr::emit_custom_type_decode_columns(
                 program,
                 resolver,
-                &bt.columns,
+                bt.columns(),
                 decoded_excluded,
                 None,
                 &layout,
@@ -585,8 +583,8 @@ pub fn emit_upsert(
     if ctx.table.has_virtual_columns() {
         let rowid_reg = new_rowid_reg.unwrap_or(ctx.conflict_rowid_reg);
         let dml_ctx =
-            DmlColumnContext::layout(&ctx.table.columns, new_start, rowid_reg, layout.clone());
-        compute_virtual_columns(program, ctx.table.columns.iter(), &dml_ctx, resolver)?;
+            DmlColumnContext::layout(ctx.table.columns(), new_start, rowid_reg, layout.clone());
+        compute_virtual_columns(program, ctx.table.columns().iter(), &dml_ctx, resolver)?;
     }
 
     if let Some(bt) = table.btree() {
@@ -609,7 +607,7 @@ pub fn emit_upsert(
             crate::translate::expr::emit_custom_type_encode_columns(
                 program,
                 resolver,
-                &bt.columns,
+                bt.columns(),
                 new_start,
                 None,
                 &bt.name,
@@ -628,7 +626,7 @@ pub fn emit_upsert(
             // This must happen early so that both index records and the table record
             // use the converted values.
             let affinity = bt
-                .columns
+                .columns()
                 .iter()
                 .filter(|c| !c.is_virtual_generated())
                 .map(|c| c.affinity());
@@ -651,7 +649,7 @@ pub fn emit_upsert(
             resolver,
             &bt.name,
             new_rowid_reg.unwrap_or(ctx.conflict_rowid_reg),
-            bt.columns.iter().enumerate().filter_map(|(idx, col)| {
+            bt.columns().iter().enumerate().filter_map(|(idx, col)| {
                 col.name
                     .as_deref()
                     .map(|n| (n, layout.to_register(new_start, idx)))
@@ -667,7 +665,7 @@ pub fn emit_upsert(
     // Expand to include virtual columns that transitively depend on SET columns,
     // so that indexes on virtual columns are correctly updated.
     let changed_cols = if ctx.table.has_virtual_columns() {
-        columns_affected_by_update(table.columns(), &changed_cols)
+        ctx.table.columns_affected_by_update(&changed_cols)?
     } else {
         changed_cols
     };
@@ -1282,8 +1280,8 @@ pub fn emit_upsert(
     if !returning.is_empty() && ctx.table.has_virtual_columns() {
         let rowid_reg = new_rowid_reg.unwrap_or(ctx.conflict_rowid_reg);
         let dml_ctx =
-            DmlColumnContext::layout(&ctx.table.columns, new_start, rowid_reg, layout.clone());
-        compute_virtual_columns(program, ctx.table.columns.iter(), &dml_ctx, resolver)?;
+            DmlColumnContext::layout(ctx.table.columns(), new_start, rowid_reg, layout.clone());
+        compute_virtual_columns(program, ctx.table.columns().iter(), &dml_ctx, resolver)?;
     }
 
     // RETURNING from NEW image + final rowid

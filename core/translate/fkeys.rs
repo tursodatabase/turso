@@ -330,7 +330,7 @@ pub fn build_index_affinity_string(idx: &Index, table: &BTreeTable) -> String {
     idx.columns
         .iter()
         .map(|ic| {
-            table.columns[ic.pos_in_table]
+            table.columns()[ic.pos_in_table]
                 .affinity_with_strict(table.is_strict)
                 .aff_mask()
         })
@@ -456,26 +456,28 @@ pub fn emit_parent_index_key_change_checks(
     let some_idx_columns_are_virtual = index
         .columns
         .iter()
-        .any(|col| table_btree.columns[col.pos_in_table].is_virtual_generated());
+        .any(|col| table_btree.columns()[col.pos_in_table].is_virtual_generated());
 
     let old_key = program.alloc_registers(idx_len);
     let idx_target_cols = index.columns.iter().map(|c| c.pos_in_table);
-    let dml_ctx = some_idx_columns_are_virtual.then(|| {
-        emit_columns_and_dependencies(
-            program,
-            table_btree,
-            cursor_id,
-            old_rowid_reg,
-            idx_target_cols,
-        )
-    });
+    let dml_ctx = some_idx_columns_are_virtual
+        .then(|| {
+            emit_columns_and_dependencies(
+                program,
+                table_btree,
+                cursor_id,
+                old_rowid_reg,
+                idx_target_cols,
+            )
+        })
+        .transpose()?;
     for (i, index_col) in index.columns.iter().enumerate() {
         if let Some(ref ctx) = dml_ctx {
             emit_table_column_for_dml(
                 program,
                 cursor_id,
                 ctx.clone(),
-                &table_btree.columns[index_col.pos_in_table],
+                &table_btree.columns()[index_col.pos_in_table],
                 index_col.pos_in_table,
                 old_key + i,
                 resolver,
@@ -487,7 +489,7 @@ pub fn emit_parent_index_key_change_checks(
     let new_key = program.alloc_registers(idx_len);
     for (i, index_col) in index.columns.iter().enumerate() {
         let pos_in_table = index_col.pos_in_table;
-        let column = &table_btree.columns[pos_in_table];
+        let column = &table_btree.columns()[pos_in_table];
         let src = if column.is_rowid_alias() {
             new_rowid_reg
         } else {
@@ -704,15 +706,17 @@ fn build_parent_key(
     let fk_target_cols = parent_cols
         .iter()
         .filter_map(|pcol| parent_bt.get_column(pcol).map(|(pos, _)| pos));
-    let ctx = some_fk_cols_are_virtual.then(|| {
-        emit_columns_and_dependencies(
-            program,
-            parent_bt,
-            parent_cursor_id,
-            parent_rowid_reg,
-            fk_target_cols,
-        )
-    });
+    let ctx = some_fk_cols_are_virtual
+        .then(|| {
+            emit_columns_and_dependencies(
+                program,
+                parent_bt,
+                parent_cursor_id,
+                parent_rowid_reg,
+                fk_target_cols,
+            )
+        })
+        .transpose()?;
 
     for (i, pcol) in parent_cols.iter().enumerate() {
         let Some((pos, col)) = parent_bt.get_column(pcol) else {
@@ -1116,14 +1120,19 @@ pub fn emit_fk_update_parent_actions(
 ) -> Result<Vec<DeferredNewKeyProbePlan>> {
     let mut deferred_new_key_plans = Vec::new();
     let updated_positions: ColumnMask = set_clauses.iter().map(|(i, _)| *i).collect();
-    let check_fks: Vec<_> = resolver
-        .with_schema(database_id, |s| {
-            s.resolved_fks_referencing(&table_btree.name)
-        })?
-        .into_iter()
-        .filter(|fk| fk.parent_key_may_change(&updated_positions, table_btree))
-        .filter(|fk| matches!(fk.fk.on_update, RefAct::NoAction | RefAct::Restrict))
-        .collect();
+    let mut check_fks: Vec<_> = Vec::new();
+    let referencing = resolver.with_schema(database_id, |s| {
+        s.resolved_fks_referencing(&table_btree.name)
+    })?;
+    for fk in referencing {
+        if !fk.parent_key_may_change(&updated_positions, table_btree)? {
+            continue;
+        }
+        if !matches!(fk.fk.on_update, RefAct::NoAction | RefAct::Restrict) {
+            continue;
+        }
+        check_fks.push(fk);
+    }
     if check_fks.is_empty() {
         return Ok(deferred_new_key_plans);
     }

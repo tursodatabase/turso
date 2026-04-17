@@ -2441,6 +2441,7 @@ mod tests {
             unique_sets: vec![],
             has_virtual_columns: false,
             logical_to_physical_map,
+            column_dependencies: Default::default(),
         };
         schema
             .add_btree_table(Arc::new(users_table))
@@ -2493,6 +2494,7 @@ mod tests {
             rowid_alias_conflict_clause: None,
             has_virtual_columns: false,
             logical_to_physical_map,
+            column_dependencies: Default::default(),
         };
         schema
             .add_btree_table(Arc::new(orders_table))
@@ -2545,6 +2547,7 @@ mod tests {
             rowid_alias_conflict_clause: None,
             has_virtual_columns: false,
             logical_to_physical_map,
+            column_dependencies: Default::default(),
         };
         schema
             .add_btree_table(Arc::new(products_table))

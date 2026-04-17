@@ -1510,15 +1510,15 @@ fn get_valid_sqlite_sequence_table(
         crate::bail_corrupt_error!("malformed sqlite_sequence: table must have rowid");
     }
 
-    if seq_table.columns.len() != 2 {
+    if seq_table.columns().len() != 2 {
         crate::bail_corrupt_error!(
             "malformed sqlite_sequence: expected 2 columns, got {}",
-            seq_table.columns.len()
+            seq_table.columns().len()
         );
     }
 
-    let col0_name = seq_table.columns[0].name.as_deref();
-    let col1_name = seq_table.columns[1].name.as_deref();
+    let col0_name = seq_table.columns()[0].name.as_deref();
+    let col1_name = seq_table.columns()[1].name.as_deref();
     if !matches!(col0_name, Some(name) if name.eq_ignore_ascii_case("name"))
         || !matches!(col1_name, Some(name) if name.eq_ignore_ascii_case("seq"))
     {
@@ -2107,7 +2107,7 @@ fn init_source_emission<'a>(
                     let record_reg = program.alloc_register();
                     let affinity_str = if columns.is_empty() {
                         ctx.table
-                            .columns
+                            .columns()
                             .iter()
                             .filter(|col| !col.hidden() && !col.is_generated())
                             .map(|col| col.affinity_with_strict(ctx.table.is_strict).aff_mask())
@@ -2881,7 +2881,7 @@ fn emit_unique_index_check(
             if ic.expr.is_some() {
                 Affinity::Blob.aff_mask()
             } else {
-                ctx.table.columns[ic.pos_in_table]
+                ctx.table.columns()[ic.pos_in_table]
                     .affinity_with_strict(ctx.table.is_strict)
                     .aff_mask()
             }
@@ -3236,7 +3236,7 @@ fn ensure_sequence_initialized(
     });
 
     let affinity_str = seq_table
-        .columns
+        .columns()
         .iter()
         .map(|c| c.affinity().aff_mask())
         .collect();
@@ -3586,7 +3586,7 @@ fn emit_update_sqlite_sequence(
 
     let seq_table = get_valid_sqlite_sequence_table(resolver, database_id)?;
     let affinity_str = seq_table
-        .columns
+        .columns()
         .iter()
         .map(|col| col.affinity().aff_mask())
         .collect::<String>();
@@ -3746,7 +3746,7 @@ fn emit_replace_delete_conflicting_row(
         let before_record_reg = if cdc_has_before {
             Some(emit_cdc_full_record(
                 program,
-                &table.columns,
+                table.columns(),
                 main_cursor_id,
                 ctx.conflict_rowid_reg,
                 table.is_strict,

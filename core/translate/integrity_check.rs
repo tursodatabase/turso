@@ -268,7 +268,7 @@ fn translate_integrity_check_impl(
                         unique_nullable.push(true);
                     } else {
                         columns.push(BoundIndexColumn::Column(col.pos_in_table));
-                        unique_nullable.push(!btree_table.columns[col.pos_in_table].notnull());
+                        unique_nullable.push(!btree_table.columns()[col.pos_in_table].notnull());
                     }
                 }
 
@@ -293,7 +293,7 @@ fn translate_integrity_check_impl(
         }
 
         let not_null_columns: Vec<(BoundIndexColumn, String)> = btree_table
-            .columns
+            .columns()
             .iter()
             .enumerate()
             .filter(|(_, col)| col.notnull() && !col.is_rowid_alias())

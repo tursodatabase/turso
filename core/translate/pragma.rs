@@ -180,7 +180,7 @@ fn emit_table_list_rows_for_schema(
             program,
             &bt.name,
             "table",
-            bt.columns.len(),
+            bt.columns().len(),
             !bt.has_rowid,
             bt.is_strict,
         );

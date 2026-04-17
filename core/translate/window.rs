@@ -558,6 +558,7 @@ impl EmitWindow {
             rowid_alias_conflict_clause: None,
             has_virtual_columns: false,
             logical_to_physical_map,
+            column_dependencies: Default::default(),
         });
         let cursor_buffer_read =
             program.alloc_cursor_id(CursorType::BTreeTable(buffer_table.clone()));

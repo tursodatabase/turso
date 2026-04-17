@@ -1395,6 +1395,16 @@ impl ColumnMask {
     pub fn is_empty(&self) -> bool {
         self.bitset.is_empty() && !self.has_rowid_sentinel
     }
+
+    pub fn iter(&self) -> impl Iterator<Item = usize> + '_ {
+        let rowid_sentinel = self.has_rowid_sentinel.then_some(ROWID_SENTINEL);
+        self.bitset.iter().chain(rowid_sentinel)
+    }
+
+    pub fn union_with(&mut self, other: &ColumnMask) {
+        self.bitset.union_with(&other.bitset);
+        self.has_rowid_sentinel |= other.has_rowid_sentinel;
+    }
 }
 
 impl FromIterator<usize> for ColumnMask {
@@ -1633,6 +1643,19 @@ impl BitSet {
                 *s &= !o;
             }
             self.trim_overflow();
+        }
+    }
+
+    pub fn union_with(&mut self, other: &Self) {
+        self.inline |= other.inline;
+        if let Some(other_ov) = &other.overflow {
+            let self_ov = self.overflow.get_or_insert_with(Vec::new);
+            if self_ov.len() < other_ov.len() {
+                self_ov.resize(other_ov.len(), 0);
+            }
+            for (s, &o) in self_ov.iter_mut().zip(other_ov.iter()) {
+                *s |= o;
+            }
         }
     }
 
@@ -2433,7 +2456,7 @@ impl JoinedTable {
                     // see `recomputeColumnsNotIndexed` in `build.c`. We might be able to improve this
                     // in the future, but for now we do this to ensure correctness.
                     !btree
-                        .columns
+                        .columns()
                         .get(c.pos_in_table)
                         .expect("column should be in table")
                         .is_virtual_generated()

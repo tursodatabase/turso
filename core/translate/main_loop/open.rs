@@ -308,7 +308,7 @@ impl OpenLoop {
                                     };
                                     let num_seek_keys = seek_def.size(&seek_def.start);
                                     let table_columns = if let Table::BTree(btree) = &table.table {
-                                        Some(btree.columns.as_slice())
+                                        Some(btree.columns())
                                     } else {
                                         None
                                     };

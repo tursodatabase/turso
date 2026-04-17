@@ -419,7 +419,7 @@ fn rewrite_trigger_expr_single_for_subprogram(
             // Handle NEW.column references
             if ns.eq_ignore_ascii_case("new") {
                 if ctx.has_new {
-                    let num_cols = ctx.table.columns.len();
+                    let num_cols = ctx.table.columns().len();
                     if let Some((idx, col_def)) = ctx.table.get_column(&col) {
                         if col_def.is_rowid_alias() {
                             *e = variable_from_parameter_index(
@@ -457,7 +457,7 @@ fn rewrite_trigger_expr_single_for_subprogram(
             // Handle OLD.column references
             if ns.eq_ignore_ascii_case("old") {
                 if ctx.has_old {
-                    let num_cols = ctx.table.columns.len();
+                    let num_cols = ctx.table.columns().len();
                     if let Some((idx, col_def)) = ctx.table.get_column(&col) {
                         if col_def.is_rowid_alias() {
                             *e = variable_from_parameter_index(
@@ -535,7 +535,7 @@ fn execute_trigger_commands(
 
     let has_new = ctx.new_registers.is_some();
     let has_old = ctx.old_registers.is_some();
-    let num_cols = ctx.table.columns.len();
+    let num_cols = ctx.table.columns().len();
 
     // Ordinary non-main triggers need unqualified DML targets rewritten into the
     // trigger's schema. Temp-backed triggers intentionally keep unqualified names
@@ -954,7 +954,7 @@ fn decode_trigger_registers(
         });
     }
 
-    let columns = &ctx.table.columns;
+    let columns = ctx.table.columns();
 
     let decoded_new = if ctx.new_encoded {
         if let Some(new_regs) = &ctx.new_registers {
@@ -1011,7 +1011,7 @@ fn populate_trigger_row_register_affinities(
         return;
     };
 
-    for (idx, column) in table.columns.iter().enumerate() {
+    for (idx, column) in table.columns().iter().enumerate() {
         let affinity = if column.is_rowid_alias() {
             Affinity::Integer
         } else {

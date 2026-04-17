@@ -109,6 +109,7 @@ pub fn translate_create_materialized_view(
         rowid_alias_conflict_clause: None,
         has_virtual_columns: false,
         logical_to_physical_map,
+        column_dependencies: Default::default(),
     });
 
     // Allocate a cursor for writing to the view's btree during population

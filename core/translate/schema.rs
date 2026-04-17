@@ -1585,7 +1585,7 @@ pub fn translate_drop_table(
         let before_record_reg = if program.capture_data_changes_info().has_before() {
             Some(emit_cdc_full_record(
                 program,
-                &schema_table.columns,
+                schema_table.columns(),
                 sqlite_schema_cursor_id_0,
                 row_id_reg,
                 schema_table.is_strict,
@@ -1820,6 +1820,7 @@ pub fn translate_drop_table(
             rowid_alias_conflict_clause: None,
             has_virtual_columns: false,
             logical_to_physical_map,
+            column_dependencies: Default::default(),
         });
         // cursor id 2
         let ephemeral_cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(simple_table_rc));
