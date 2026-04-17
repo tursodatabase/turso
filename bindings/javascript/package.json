@@ -15,5 +15,12 @@
     "sync/packages/native",
     "sync/packages/wasm"
   ],
+  "resolutions": {
+    "emnapi": "1.4.5",
+    "@emnapi/core": "1.8.1",
+    "@emnapi/runtime": "1.8.1",
+    "@emnapi/wasi-threads": "1.1.0",
+    "@napi-rs/cli": "3.1.5"
+  },
   "version": "0.6.0-pre.21"
 }
