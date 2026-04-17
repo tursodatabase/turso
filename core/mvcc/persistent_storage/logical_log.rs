@@ -1959,8 +1959,7 @@ impl StreamingLogicalLogReader {
                 // Compute column_count from the serialized record so recovered rows keep
                 // the same shape metadata as non-recovered rows.
                 let column_count =
-                    crate::types::ImmutableRecord::from_bin_record(record_bytes.clone())
-                        .column_count();
+                    crate::types::ImmutableRecordRef::new(&record_bytes).column_count();
                 let row = Row::new_table_row(
                     RowID::new(table_id, rowid.row_id.clone()),
                     record_bytes,
