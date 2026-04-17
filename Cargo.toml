@@ -115,7 +115,7 @@ anyhow = "1.0.98"
 mimalloc = { version = "0.1.47", default-features = false }
 rusqlite = { version = "0.37.0", features = ["bundled"] }
 itertools = "0.14.0"
-rand = "0.9.4"
+rand = "0.9.2"
 rand_chacha = "0.9.0"
 tracing = "0.1.41"
 schemars = "1.0.4"

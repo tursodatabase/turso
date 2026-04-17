@@ -1,5 +1,5 @@
 use include_dir::{include_dir, Dir};
-use rand::seq::IndexedRandom;
+use rand::seq::SliceRandom;
 use std::io::{stdout, IsTerminal, Write};
 
 use termimad::{
@@ -36,7 +36,7 @@ pub fn get_random_feature_hint() -> Option<String> {
     }
 
     features
-        .choose(&mut rand::rng())
+        .choose(&mut rand::thread_rng())
         .map(|(feature, display_name)| {
             format!("Did you know that Turso supports {display_name}? Type .manual {feature} to learn more.")
         })
