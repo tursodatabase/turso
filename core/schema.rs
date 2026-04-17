@@ -2305,7 +2305,7 @@ impl GeneratedColGraph {
                 );
             }
             let direct_mask: ColumnMask = ColumnMask::from_iter(direct.iter());
-            direct_deps[j].set_all(&direct_mask);
+            direct_deps[j].union_with(&direct_mask);
             for i in direct.iter() {
                 direct_dependents[i].set(j);
                 in_degree[j] += 1;
@@ -2932,7 +2932,7 @@ impl BTreeTable {
             affected.set(i);
             if i < graph.dependents.len() {
                 let snapshot = graph.dependents[i].clone();
-                affected.set_all(&snapshot);
+                affected.union_with(&snapshot);
             }
         }
         Ok(affected)
@@ -5696,7 +5696,7 @@ mod tests {
         )?;
         let mut expected = t.columns_affected_by_update([0])?;
         let b_mask = t.columns_affected_by_update([1])?;
-        expected.set_all(&b_mask);
+        expected.union_with(&b_mask);
         let union_mask = t.columns_affected_by_update([0, 1])?;
         assert_eq!(indices(&union_mask), indices(&expected));
         Ok(())
