@@ -45,7 +45,8 @@ pub fn translate_create_materialized_view(
 
     // Check if view already exists
     if resolver.with_schema(database_id, |s| {
-        s.get_materialized_view(view_name_str).is_some()
+        s.get_materialized_view(&Identifier::from(view_name_str))
+            .is_some()
     }) {
         return Err(crate::LimboError::ParseError(format!(
             "View {view_name_str} already exists"
@@ -147,7 +148,10 @@ pub fn translate_create_materialized_view(
     program.preassign_label_to_next_insn(clear_done_label);
 
     // Open cursor to sqlite_schema table
-    let table = resolver.with_schema(database_id, |s| s.get_btree_table(SQLITE_TABLEID).unwrap());
+    let table = resolver.with_schema(database_id, |s| {
+        s.get_btree_table(&Identifier::from(SQLITE_TABLEID))
+            .unwrap()
+    });
     let sqlite_schema_cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(table));
     program.emit_insn(Insn::OpenWrite {
         cursor_id: sqlite_schema_cursor_id,
@@ -282,9 +286,9 @@ pub fn translate_create_view(
     }
 
     // Check for name conflicts with existing schema objects
-    if let Some(object_type) =
-        resolver.with_schema(database_id, |s| s.get_object_type(view_name_str))
-    {
+    if let Some(object_type) = resolver.with_schema(database_id, |s| {
+        s.get_object_type(&Identifier::from(view_name_str))
+    }) {
         let type_str = match object_type {
             SchemaObjectType::Table => "table",
             SchemaObjectType::View => "view",
@@ -297,7 +301,9 @@ pub fn translate_create_view(
 
     // Also check materialized views (not in get_object_type since they're stored differently)
     if resolver
-        .with_schema(database_id, |s| s.get_materialized_view(view_name_str))
+        .with_schema(database_id, |s| {
+            s.get_materialized_view(&Identifier::from(view_name_str))
+        })
         .is_some()
     {
         return Err(crate::LimboError::ParseError(format!(
@@ -311,7 +317,10 @@ pub fn translate_create_view(
     let sql = create_view_to_str(&view_name.name.as_ident(), columns, select_stmt);
 
     // Open cursor to sqlite_schema table
-    let table = resolver.schema().get_btree_table(SQLITE_TABLEID).unwrap();
+    let table = resolver
+        .schema()
+        .get_btree_table(&Identifier::from(SQLITE_TABLEID))
+        .unwrap();
     let sqlite_schema_cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(table));
     program.emit_insn(Insn::OpenWrite {
         cursor_id: sqlite_schema_cursor_id,
@@ -378,10 +387,11 @@ pub fn translate_drop_view(
     let view_name_str = view_name.name.as_str();
 
     // Check if view exists (either regular or materialized)
+    let view_name_id = Identifier::from(view_name_str);
     let (is_regular_view, is_materialized_view) = resolver.with_schema(database_id, |s| {
         (
-            s.get_view(view_name_str).is_some(),
-            s.is_materialized_view(view_name_str),
+            s.get_view(&view_name_id).is_some(),
+            s.is_materialized_view(&view_name_id),
         )
     });
     let view_exists = is_regular_view || is_materialized_view;
@@ -400,7 +410,7 @@ pub fn translate_drop_view(
     // If this is a materialized view, we need to destroy its btree as well
     // and also clean up the associated DBSP state table and index
     let dbsp_table_name = if is_materialized_view {
-        if let Some(table) = resolver.with_schema(database_id, |s| s.get_table(view_name_str)) {
+        if let Some(table) = resolver.with_schema(database_id, |s| s.get_table(&view_name_id)) {
             if let Some(btree_table) = table.btree() {
                 // Destroy the btree for the materialized view
                 program.emit_insn(Insn::Destroy {
@@ -423,9 +433,10 @@ pub fn translate_drop_view(
 
     // Destroy DBSP state table and index btrees if this is a materialized view
     if let Some(ref dbsp_table_name) = dbsp_table_name {
+        let dbsp_table_name_id = Identifier::from(dbsp_table_name.as_str());
         // Destroy DBSP indexes first
         let dbsp_indexes: Vec<_> = resolver.with_schema(database_id, |s| {
-            s.get_indices(dbsp_table_name).cloned().collect()
+            s.get_indices(&dbsp_table_name_id).cloned().collect()
         });
         for index in &dbsp_indexes {
             program.emit_insn(Insn::Destroy {
@@ -438,7 +449,7 @@ pub fn translate_drop_view(
 
         // Destroy DBSP state table btree
         if let Some(dbsp_table) =
-            resolver.with_schema(database_id, |s| s.get_table(dbsp_table_name))
+            resolver.with_schema(database_id, |s| s.get_table(&dbsp_table_name_id))
         {
             if let Some(dbsp_btree_table) = dbsp_table.btree() {
                 program.emit_insn(Insn::Destroy {
@@ -452,8 +463,10 @@ pub fn translate_drop_view(
     }
 
     // Open cursor to sqlite_schema table (structure is the same for all databases)
-    let schema_table =
-        resolver.with_schema(MAIN_DB_ID, |s| s.get_btree_table(SQLITE_TABLEID).unwrap());
+    let schema_table = resolver.with_schema(MAIN_DB_ID, |s| {
+        s.get_btree_table(&Identifier::from(SQLITE_TABLEID))
+            .unwrap()
+    });
     let sqlite_schema_cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(schema_table));
     program.emit_insn(Insn::OpenWrite {
         cursor_id: sqlite_schema_cursor_id,

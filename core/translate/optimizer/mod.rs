@@ -491,7 +491,7 @@ fn transform_match_to_fts_match(
             .find(|t| t.internal_id == table_id)
             .and_then(|t| {
                 if let Table::BTree(btree) = &t.table {
-                    Some(schema.has_fts_index(btree.name.as_str()))
+                    Some(schema.has_fts_index(&btree.name))
                 } else {
                     None
                 }

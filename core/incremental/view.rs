@@ -15,6 +15,7 @@ use std::cell::RefCell;
 use std::fmt;
 use std::rc::Rc;
 use turso_parser::ast;
+use turso_parser::identifier::Identifier;
 use turso_parser::{
     ast::{Cmd, Stmt},
     parser::Parser,
@@ -154,6 +155,7 @@ impl AllViewsTxState {
 
     /// Get or create a transaction state for a view
     #[allow(clippy::arc_with_non_send_sync)]
+    //TODO Identifier
     pub fn get_or_create(&self, view_name: &str) -> Arc<ViewTransactionState> {
         let mut states = self.states.borrow_mut();
         // ViewTransactionState uses RefCell (not Sync), but AllViewsTxState is
@@ -166,6 +168,7 @@ impl AllViewsTxState {
     }
 
     /// Get a transaction state for a view if it exists
+    //TODO Identifier
     pub fn get(&self, view_name: &str) -> Option<Arc<ViewTransactionState>> {
         self.states.borrow().get(view_name).cloned()
     }
@@ -466,7 +469,7 @@ impl IncrementalView {
 
         // Skip CTEs - they're not real tables
         if !cte_names.contains(table_name) {
-            if let Some(table) = schema.get_btree_table(table_name) {
+            if let Some(table) = schema.get_btree_table(name.name.identifier()) {
                 table_map.insert(table_name.to_string(), table);
                 qualified_names.insert(table_name.to_string(), qualified_name);
 
@@ -1096,7 +1099,9 @@ impl IncrementalView {
                 } else {
                     // Check which table has this column
                     for table_name in all_tables {
-                        if let Some(table) = schema.get_btree_table(table_name) {
+                        if let Some(table) =
+                            schema.get_btree_table(&Identifier::from(table_name.as_str()))
+                        {
                             if table
                                 .columns
                                 .iter()
@@ -2568,7 +2573,7 @@ mod tests {
         let schema = create_test_schema();
 
         // Get the orders table twice (simulating what would happen with CTEs)
-        let orders_table = schema.get_btree_table("orders").unwrap();
+        let orders_table = schema.get_btree_table(&Identifier::from("orders")).unwrap();
 
         let referenced_tables = vec![orders_table.clone(), orders_table];
 

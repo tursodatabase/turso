@@ -7,6 +7,7 @@ use crate::vdbe::builder::CursorType;
 use crate::vdbe::insn::{Cookie, Insn};
 use crate::{bail_parse_error, Result, MAIN_DB_ID};
 use turso_parser::ast::{self, QualifiedName};
+use turso_parser::identifier::Identifier;
 
 /// Reconstruct SQL string from CREATE TRIGGER AST
 #[allow(clippy::too_many_arguments)]
@@ -145,7 +146,9 @@ pub fn translate_create_trigger(
     }
 
     // Check if trigger already exists
-    if resolver.with_schema(database_id, |s| s.get_trigger(trigger_name_str).is_some()) {
+    let trigger_name_id = Identifier::from(trigger_name_str);
+    let table_name_id = Identifier::from(table_name_str);
+    if resolver.with_schema(database_id, |s| s.get_trigger(&trigger_name_id).is_some()) {
         if if_not_exists {
             return Ok(());
         }
@@ -153,7 +156,7 @@ pub fn translate_create_trigger(
     }
 
     // Verify the table exists (use the table's database, not the trigger's).
-    let table = resolver.with_schema(target_table_database_id, |s| s.get_table(table_name_str));
+    let table = resolver.with_schema(target_table_database_id, |s| s.get_table(&table_name_id));
     let Some(table) = table else {
         bail_parse_error!("no such table: {}", table_name_str);
     };
@@ -177,7 +180,9 @@ pub fn translate_create_trigger(
 
     // Open cursor to sqlite_schema table (in the trigger's database)
     let table = resolver
-        .with_schema(database_id, |s| s.get_btree_table(SQLITE_TABLEID))
+        .with_schema(database_id, |s| {
+            s.get_btree_table(&Identifier::from(SQLITE_TABLEID))
+        })
         .unwrap();
     let sqlite_schema_cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(table));
     program.emit_insn(Insn::OpenWrite {
@@ -480,7 +485,8 @@ pub fn translate_drop_trigger(
     let trigger_name_str = trigger_name.name.as_str();
 
     // Check if trigger exists
-    if resolver.with_schema(database_id, |s| s.get_trigger(trigger_name_str).is_none()) {
+    let trigger_name_id = Identifier::from(trigger_name_str);
+    if resolver.with_schema(database_id, |s| s.get_trigger(&trigger_name_id).is_none()) {
         if if_exists {
             return Ok(());
         }
@@ -495,7 +501,10 @@ pub fn translate_drop_trigger(
     program.extend(&opts);
 
     // Open cursor to sqlite_schema table (structure is the same for all databases)
-    let table = resolver.with_schema(MAIN_DB_ID, |s| s.get_btree_table(SQLITE_TABLEID).unwrap());
+    let table = resolver.with_schema(MAIN_DB_ID, |s| {
+        s.get_btree_table(&Identifier::from(SQLITE_TABLEID))
+            .unwrap()
+    });
     let sqlite_schema_cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(table));
     program.emit_insn(Insn::OpenWrite {
         cursor_id: sqlite_schema_cursor_id,

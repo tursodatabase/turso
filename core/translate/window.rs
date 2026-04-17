@@ -455,6 +455,7 @@ pub struct WindowMetadata<'a> {
     /// Maps expressions in the current query that reference subquery columns
     /// to their corresponding column indexes in the subquery’s result.
     pub expressions_referencing_subquery: Vec<(&'a Expr, usize)>,
+    //TODO Identifier (?)
     pub buffer_table_name: String,
 }
 

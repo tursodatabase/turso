@@ -18,6 +18,7 @@ use rustc_hash::FxHashMap as HashMap;
 use std::fmt::{self, Display, Formatter};
 use turso_macros::match_ignore_ascii_case;
 use turso_parser::ast;
+use turso_parser::identifier::Identifier;
 
 /// Result type for preprocessing aggregate expressions
 type PreprocessAggregateResult = (
@@ -2278,7 +2279,7 @@ impl<'a> LogicalPlanBuilder<'a> {
         // Look up table in schema
         let table = self
             .schema
-            .get_table(table_name)
+            .get_table(&Identifier::from(table_name))
             .ok_or_else(|| LimboError::ParseError(format!("Table '{table_name}' not found")))?;
 
         // Parse table_name which might be "db.table" for attached databases

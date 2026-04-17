@@ -408,6 +408,7 @@ fn prepare_one_select_plan(
                             .table_references
                             .joined_tables()
                             .iter()
+                            //TODO as_str necessary for this and the following occurrences?
                             .filter(|t| name == t.identifier.as_str())
                             .count();
                         if dup_count > 1 {
@@ -1675,7 +1676,7 @@ fn find_aliased_aggregate_ref(expr: &ast::Expr, result_columns: &[ResultSetColum
             for rc in result_columns.iter() {
                 if let Some(alias) = &rc.alias {
                     if *id == **alias && rc.contains_aggregates {
-                        crate::bail_parse_error!("misuse of aliased aggregate {}", id.as_str());
+                        crate::bail_parse_error!("misuse of aliased aggregate {}", id);
                     }
                 }
             }

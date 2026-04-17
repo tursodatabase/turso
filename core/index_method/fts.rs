@@ -37,6 +37,7 @@ use tantivy::{
     DocAddress, HasLen, Index, IndexReader, IndexSettings, IndexWriter, Searcher, TantivyDocument,
 };
 use turso_parser::ast::{self, Select, SortOrder};
+use turso_parser::identifier::Identifier;
 
 /// Name identifier for the FTS index method, used in `CREATE INDEX ... USING fts`.
 pub const FTS_INDEX_METHOD_NAME: &str = "fts";
@@ -1853,7 +1854,12 @@ impl FtsCursor {
         let pager = conn.get_pager_from_database_index(&database_id);
         let scratch = conn
             .with_schema(database_id, |schema| {
-                schema.get_index(&self.dir_table_name, &index_name).cloned()
+                schema
+                    .get_index(
+                        &Identifier::from(self.dir_table_name.as_str()),
+                        &Identifier::from(index_name.as_str()),
+                    )
+                    .cloned()
             })
             .ok_or_else(|| {
                 LimboError::InternalError(format!(

@@ -187,8 +187,10 @@ fn quote_string_literal(s: &str) -> String {
 /// Custom type definition, loaded from sqlite_turso_types
 #[derive(Debug, Clone)]
 pub struct TypeDef {
+    //TODO Identifier
     pub name: String,
     pub params: Vec<ast::TypeParam>,
+    //TODO Identifier
     pub base: String,
     pub encode: Option<Box<ast::Expr>>,
     pub decode: Option<Box<ast::Expr>>,
@@ -199,6 +201,7 @@ pub struct TypeDef {
 
 impl TypeDef {
     /// Construct a TypeDef from a parsed CREATE TYPE statement.
+    //TODO Identifier
     pub fn from_create_type(type_name: &str, body: &ast::CreateTypeBody, is_builtin: bool) -> Self {
         Self {
             name: type_name.to_string(),
@@ -462,19 +465,18 @@ fn bootstrap_builtin_types(registry: &mut HashMap<Identifier, Arc<TypeDef>>) {
     }
 }
 
-// TODO: Schema lookup methods (get_table, get_btree_table, get_view, get_trigger,
-// get_indices, etc.) still take &str and create Identifier internally. They should
-// take &Identifier to avoid allocation on every lookup call.
 impl Schema {
-    fn normalize_table_lookup_name(&self, name: &str) -> Identifier {
-        let id = Identifier::from(name);
-        if id == SCHEMA_TABLE_NAME_ALT
-            || id == TEMP_SCHEMA_TABLE_NAME
-            || id == TEMP_SCHEMA_TABLE_NAME_ALT
+    fn normalize_table_lookup_name<'a>(
+        &self,
+        name: &'a Identifier,
+    ) -> std::borrow::Cow<'a, Identifier> {
+        if *name == SCHEMA_TABLE_NAME_ALT
+            || *name == TEMP_SCHEMA_TABLE_NAME
+            || *name == TEMP_SCHEMA_TABLE_NAME_ALT
         {
-            Identifier::from(SCHEMA_TABLE_NAME)
+            std::borrow::Cow::Owned(Identifier::from(SCHEMA_TABLE_NAME))
         } else {
-            id
+            std::borrow::Cow::Borrowed(name)
         }
     }
 
@@ -604,7 +606,7 @@ impl Schema {
                     let needs_fixup = bt
                         .columns
                         .iter()
-                        .any(|c| self.get_type_def_unchecked(&c.ty_str).is_some());
+                        .any(|c| self.get_type_def_unchecked(c.ty_str.as_str()).is_some());
                     if needs_fixup {
                         let mut modified = (**bt).clone();
                         modified.resolve_custom_type_affinities(self);
@@ -616,11 +618,11 @@ impl Schema {
         }
     }
 
-    pub fn is_unique_idx_name(&self, name: &str) -> bool {
+    pub fn is_unique_idx_name(&self, name: &Identifier) -> bool {
         !self
             .indexes
             .iter()
-            .any(|idx| idx.1.iter().any(|i| i.name == name))
+            .any(|idx| idx.1.iter().any(|i| i.name == *name))
     }
     pub fn add_materialized_view(&mut self, view: IncrementalView, table: Arc<Table>, sql: String) {
         let name = Identifier::from(view.name());
@@ -637,15 +639,13 @@ impl Schema {
             .insert(name, Arc::new(Mutex::new(view)));
     }
 
-    pub fn get_materialized_view(&self, name: &str) -> Option<Arc<Mutex<IncrementalView>>> {
-        let name = Identifier::from(name);
-        self.incremental_views.get(&name).cloned()
+    pub fn get_materialized_view(&self, name: &Identifier) -> Option<Arc<Mutex<IncrementalView>>> {
+        self.incremental_views.get(name).cloned()
     }
 
     /// Check if DBSP state table exists with the current version
-    pub fn has_compatible_dbsp_state_table(&self, view_name: &str) -> bool {
+    pub fn has_compatible_dbsp_state_table(&self, view_name: &Identifier) -> bool {
         use crate::incremental::compiler::DBSP_CIRCUIT_VERSION;
-        let view_name = Identifier::from(view_name);
         let expected_table_name = Identifier::from(format!(
             "{DBSP_TABLE_PREFIX}{DBSP_CIRCUIT_VERSION}_{view_name}"
         ));
@@ -654,19 +654,16 @@ impl Schema {
         self.tables.contains_key(&expected_table_name)
     }
 
-    pub fn is_materialized_view(&self, name: &str) -> bool {
-        let name = Identifier::from(name);
-        self.materialized_view_names.contains(&name)
+    pub fn is_materialized_view(&self, name: &Identifier) -> bool {
+        self.materialized_view_names.contains(name)
     }
 
     /// Check if a table has any incompatible dependent materialized views
-    pub fn has_incompatible_dependent_views(&self, table_name: &str) -> Vec<Identifier> {
-        let table_name = Identifier::from(table_name);
-
+    pub fn has_incompatible_dependent_views(&self, table_name: &Identifier) -> Vec<Identifier> {
         // Get all materialized views that depend on this table
         let dependent_views = self
             .table_to_materialized_views
-            .get(&table_name)
+            .get(table_name)
             .cloned()
             .unwrap_or_default();
 
@@ -677,31 +674,29 @@ impl Schema {
             .collect()
     }
 
-    pub fn remove_view(&mut self, name: &str) -> Result<()> {
-        let name = Identifier::from(name);
-
-        if self.views.contains_key(&name) {
-            self.views.remove(&name);
+    pub fn remove_view(&mut self, name: &Identifier) -> Result<()> {
+        if self.views.contains_key(name) {
+            self.views.remove(name);
             Ok(())
-        } else if self.materialized_view_names.contains(&name) {
+        } else if self.materialized_view_names.contains(name) {
             // Remove from tables
-            self.tables.remove(&name);
+            self.tables.remove(name);
 
             // Remove DBSP state table and its indexes from in-memory schema
             use crate::incremental::compiler::DBSP_CIRCUIT_VERSION;
             let dbsp_table_name =
                 Identifier::from(format!("{DBSP_TABLE_PREFIX}{DBSP_CIRCUIT_VERSION}_{name}"));
             self.tables.remove(&dbsp_table_name);
-            self.remove_indices_for_table(dbsp_table_name.as_str());
+            self.remove_indices_for_table(&dbsp_table_name);
 
             // Remove from materialized view tracking
-            self.materialized_view_names.remove(&name);
-            self.materialized_view_sql.remove(&name);
-            self.incremental_views.remove(&name);
+            self.materialized_view_names.remove(name);
+            self.materialized_view_sql.remove(name);
+            self.incremental_views.remove(name);
 
             // Remove from table_to_materialized_views dependencies
             for views in self.table_to_materialized_views.values_mut() {
-                views.retain(|v| v != &name);
+                views.retain(|v| v != name);
             }
 
             Ok(())
@@ -713,24 +708,24 @@ impl Schema {
     }
 
     /// Register that a materialized view depends on a table
-    pub fn add_materialized_view_dependency(&mut self, table_name: &str, view_name: &str) {
-        let table_name = Identifier::from(table_name);
-        let view_name = Identifier::from(view_name);
-
+    pub fn add_materialized_view_dependency(
+        &mut self,
+        table_name: &Identifier,
+        view_name: &Identifier,
+    ) {
         self.table_to_materialized_views
-            .entry(table_name)
+            .entry(table_name.clone())
             .or_default()
-            .push(view_name);
+            .push(view_name.clone());
     }
 
     /// Get all materialized views that depend on a given table
-    pub fn get_dependent_materialized_views(&self, table_name: &str) -> Vec<Identifier> {
+    pub fn get_dependent_materialized_views(&self, table_name: &Identifier) -> Vec<Identifier> {
         if self.table_to_materialized_views.is_empty() {
             return Vec::new();
         }
-        let table_name = Identifier::from(table_name);
         self.table_to_materialized_views
-            .get(&table_name)
+            .get(table_name)
             .cloned()
             .unwrap_or_default()
     }
@@ -744,31 +739,29 @@ impl Schema {
     }
 
     /// Get a regular view by name
-    pub fn get_view(&self, name: &str) -> Option<Arc<View>> {
-        let name = Identifier::from(name);
-        self.views.get(&name).cloned()
+    pub fn get_view(&self, name: &Identifier) -> Option<Arc<View>> {
+        self.views.get(name).cloned()
     }
 
-    pub fn add_trigger(&mut self, trigger: Trigger, table_name: &str) -> Result<()> {
+    pub fn add_trigger(&mut self, trigger: Trigger, table_name: &Identifier) -> Result<()> {
         // Triggers have their own namespace and duplicate trigger names
         // are checked in `translate_create_trigger`
-        let table_name = Identifier::from(table_name);
 
         // See [Schema::add_index] for why we push to the front of the deque.
         self.triggers
-            .entry(table_name)
+            .entry(table_name.clone())
             .or_default()
             .push_front(Arc::new(trigger));
 
         Ok(())
     }
 
-    pub fn remove_trigger(&mut self, name: &str) -> Result<()> {
+    pub fn remove_trigger(&mut self, name: &Identifier) -> Result<()> {
         let mut removed = false;
         for triggers_list in self.triggers.values_mut() {
             for i in 0..triggers_list.len() {
                 let trigger = &triggers_list[i];
-                if trigger.name.as_str().eq_ignore_ascii_case(name) {
+                if *name == *trigger.name {
                     removed = true;
                     triggers_list.remove(i);
                     break;
@@ -785,9 +778,8 @@ impl Schema {
         }
         Ok(())
     }
-    pub fn remove_triggers_for_table(&mut self, table_name: &str) {
-        let table_name = Identifier::from(table_name);
-        self.triggers.remove(&table_name);
+    pub fn remove_triggers_for_table(&mut self, table_name: &Identifier) {
+        self.triggers.remove(table_name);
     }
 
     /// Like [`remove_triggers_for_table`] but only removes triggers whose
@@ -797,15 +789,14 @@ impl Schema {
     /// without accidentally removing ones that target `temp.t` or
     /// `aux.t` (the plain `remove_triggers_for_table` keys only on
     /// table name).
-    pub fn remove_triggers_for_table_with_db(&mut self, table_name: &str, target_db: usize) {
-        let table_name = Identifier::from(table_name);
-        let Some(bucket) = self.triggers.get_mut(&table_name) else {
+    pub fn remove_triggers_for_table_with_db(&mut self, table_name: &Identifier, target_db: usize) {
+        let Some(bucket) = self.triggers.get_mut(table_name) else {
             return;
         };
         // Check once whether this schema has a table with the same name.
         // If it does, unqualified triggers resolve to that local table,
         // not to the one being dropped in `target_db`.
-        let has_shadow_table = self.tables.contains_key(&table_name);
+        let has_shadow_table = self.tables.contains_key(table_name);
         bucket.retain(|trigger| {
             match trigger.target_database_id {
                 Some(db) => db != target_db,
@@ -815,36 +806,35 @@ impl Schema {
             }
         });
         if bucket.is_empty() {
-            self.triggers.remove(&table_name);
+            self.triggers.remove(table_name);
         }
     }
 
-    pub fn get_trigger_for_table(&self, table_name: &str, name: &str) -> Option<Arc<Trigger>> {
-        let table_name = Identifier::from(table_name);
-        self.triggers.get(&table_name).and_then(|triggers| {
-            triggers
-                .iter()
-                .find(|t| t.name.as_str().eq_ignore_ascii_case(name))
-                .cloned()
-        })
+    pub fn get_trigger_for_table(
+        &self,
+        table_name: &Identifier,
+        name: &Identifier,
+    ) -> Option<Arc<Trigger>> {
+        self.triggers
+            .get(table_name)
+            .and_then(|triggers| triggers.iter().find(|t| *name == *t.name).cloned())
     }
 
     pub fn get_triggers_for_table(
         &self,
-        table_name: &str,
+        table_name: &Identifier,
     ) -> impl Iterator<Item = &Arc<Trigger>> + Clone {
-        let table_name = Identifier::from(table_name);
         self.triggers
-            .get(&table_name)
+            .get(table_name)
             .map(|triggers| triggers.iter())
             .unwrap_or_default()
     }
 
-    pub fn get_trigger(&self, name: &str) -> Option<Arc<Trigger>> {
+    pub fn get_trigger(&self, name: &Identifier) -> Option<Arc<Trigger>> {
         self.triggers
             .values()
             .flatten()
-            .find(|t| t.name.as_str().eq_ignore_ascii_case(name))
+            .find(|t| *name == *t.name)
             .cloned()
     }
 
@@ -862,25 +852,24 @@ impl Schema {
         Ok(())
     }
 
-    pub fn get_table(&self, name: &str) -> Option<Arc<Table>> {
+    pub fn get_table(&self, name: &Identifier) -> Option<Arc<Table>> {
         let name = self.normalize_table_lookup_name(name);
-        self.tables.get(&name).cloned()
+        self.tables.get(&*name).cloned()
     }
 
-    pub fn remove_table(&mut self, table_name: &str) {
-        let name = Identifier::from(table_name);
-        self.tables.remove(&name);
-        self.analyze_stats.remove_table(&name);
+    pub fn remove_table(&mut self, table_name: &Identifier) {
+        self.tables.remove(table_name);
+        self.analyze_stats.remove_table(table_name);
 
-        if self.materialized_view_names.remove(&name) {
-            self.incremental_views.remove(&name);
-            self.materialized_view_sql.remove(&name);
+        if self.materialized_view_names.remove(table_name) {
+            self.incremental_views.remove(table_name);
+            self.materialized_view_sql.remove(table_name);
         }
     }
 
-    pub fn get_btree_table(&self, name: &str) -> Option<Arc<BTreeTable>> {
+    pub fn get_btree_table(&self, name: &Identifier) -> Option<Arc<BTreeTable>> {
         let name = self.normalize_table_lookup_name(name);
-        if let Some(table) = self.tables.get(&name) {
+        if let Some(table) = self.tables.get(&*name) {
             table.btree()
         } else {
             None
@@ -924,17 +913,16 @@ impl Schema {
         Ok(())
     }
 
-    pub fn get_indices(&self, table_name: &str) -> impl Iterator<Item = &Arc<Index>> {
-        let name = Identifier::from(table_name);
+    pub fn get_indices(&self, table_name: &Identifier) -> impl Iterator<Item = &Arc<Index>> {
         self.indexes
-            .get(&name)
+            .get(table_name)
             .map(|v| v.iter())
             .unwrap_or_default()
             .filter(|i| !i.is_backing_btree_index())
     }
 
     #[cfg(all(feature = "fts", not(target_family = "wasm")))]
-    pub fn has_fts_index(&self, table_name: &str) -> bool {
+    pub fn has_fts_index(&self, table_name: &Identifier) -> bool {
         use crate::index_method::fts::FTS_INDEX_METHOD_NAME;
         self.get_indices(table_name).any(|idx| {
             idx.index_method
@@ -943,36 +931,36 @@ impl Schema {
         })
     }
 
-    pub fn get_index(&self, table_name: &str, index_name: &str) -> Option<&Arc<Index>> {
-        let name = Identifier::from(table_name);
+    pub fn get_index(
+        &self,
+        table_name: &Identifier,
+        index_name: &Identifier,
+    ) -> Option<&Arc<Index>> {
         self.indexes
-            .get(&name)?
+            .get(table_name)?
             .iter()
-            .find(|index| index.name == index_name)
+            .find(|index| index.name == *index_name)
     }
 
-    pub fn remove_indices_for_table(&mut self, table_name: &str) {
-        let name = Identifier::from(table_name);
-        self.indexes.remove(&name);
-        self.analyze_stats.remove_table(&name);
+    pub fn remove_indices_for_table(&mut self, table_name: &Identifier) {
+        self.indexes.remove(table_name);
+        self.analyze_stats.remove_table(table_name);
     }
 
     pub fn remove_index(&mut self, idx: &Index) {
-        let name = Identifier::from(idx.table_name.as_str());
         self.indexes
-            .get_mut(&name)
+            .get_mut(&idx.table_name)
             .expect("Must have the index")
             .retain_mut(|other_idx| other_idx.name != idx.name);
-        self.analyze_stats.remove_index(&name, &idx.name);
+        self.analyze_stats.remove_index(&idx.table_name, &idx.name);
     }
 
-    pub fn table_has_indexes(&self, table_name: &str) -> bool {
-        let name = Identifier::from(table_name);
-        self.has_indexes.contains(&name)
+    pub fn table_has_indexes(&self, table_name: &Identifier) -> bool {
+        self.has_indexes.contains(table_name)
     }
 
-    pub fn table_set_has_index(&mut self, table_name: &str) {
-        self.has_indexes.insert(Identifier::from(table_name));
+    pub fn table_set_has_index(&mut self, table_name: &Identifier) {
+        self.has_indexes.insert(table_name.clone());
     }
 
     /// Update [Schema] by scanning the first root page (sqlite_schema)
@@ -1151,7 +1139,9 @@ impl Schema {
     ) -> Result<()> {
         for unparsed_sql_from_index in from_sql_indexes {
             let table = self
-                .get_btree_table(&unparsed_sql_from_index.table_name)
+                .get_btree_table(&Identifier::from(
+                    unparsed_sql_from_index.table_name.as_str(),
+                ))
                 .unwrap();
             let index = Index::from_sql(
                 syms,
@@ -1170,7 +1160,7 @@ impl Schema {
             // The SQL statement parser enforces that the column definitions come first, and compounds are defined after that,
             // e.g. CREATE TABLE t (a, b, UNIQUE(a, b)), and you can't do something like CREATE TABLE t (a, b, UNIQUE(a, b), c);
             // Hence, we can process the singles first (unique_set.columns.len() == 1), and then the compounds (unique_set.columns.len() > 1).
-            let table = self.get_btree_table(automatic_index.0.as_str()).unwrap();
+            let table = self.get_btree_table(&automatic_index.0).unwrap();
             let mut automatic_indexes = automatic_index.1;
             automatic_indexes.reverse(); // reverse so we can pop() without shifting array elements, while still processing in left-to-right order
 
@@ -1340,7 +1330,10 @@ impl Schema {
 
             // Register dependencies regardless of compatibility
             for table_name in referenced_tables {
-                self.add_materialized_view_dependency(table_name.as_str(), view_name.as_str());
+                self.add_materialized_view_dependency(
+                    &Identifier::from(table_name.as_str()),
+                    &view_name,
+                );
             }
         }
         Ok(())
@@ -1589,7 +1582,7 @@ impl Schema {
                         temporary,
                         target_database_id,
                     ),
-                    tbl_name.name.as_str(),
+                    tbl_name.name.identifier(),
                 )?;
             }
             // Types are stored in sqlite_turso_types, not sqlite_schema
@@ -1602,21 +1595,20 @@ impl Schema {
     /// Compute all resolved FKs *referencing* `table_name` (arg: `table_name` is the parent).
     /// Each item contains the child table, normalized columns/positions, and the parent lookup
     /// strategy (rowid vs. UNIQUE index or PK).
-    pub fn resolved_fks_referencing(&self, table_name: &str) -> Result<Vec<ResolvedFkRef>> {
+    pub fn resolved_fks_referencing(&self, table_name: &Identifier) -> Result<Vec<ResolvedFkRef>> {
         let fk_mismatch_err = |child: &str, parent: &str| -> crate::LimboError {
             crate::LimboError::ForeignKeyConstraint(format!(
                 "foreign key mismatch - \"{child}\" referencing \"{parent}\""
             ))
         };
-        let target = Identifier::from(table_name);
         let mut out = Vec::with_capacity(4); // arbitrary estimate
         let parent_tbl = self
-            .get_btree_table(target.as_str())
-            .ok_or_else(|| fk_mismatch_err("<unknown>", target.as_str()))?;
+            .get_btree_table(table_name)
+            .ok_or_else(|| fk_mismatch_err("<unknown>", table_name.as_str()))?;
 
         // Precompute helper to find parent unique index, if it's not the rowid
         let find_parent_unique = |cols: &Vec<String>| -> Option<Arc<Index>> {
-            self.get_indices(parent_tbl.name.as_str())
+            self.get_indices(&parent_tbl.name)
                 .find(|idx| {
                     idx.unique
                         && idx.columns.len() == cols.len()
@@ -1634,7 +1626,7 @@ impl Schema {
                 continue;
             };
             for fk in &child.foreign_keys {
-                if !fk.parent_table.eq_ignore_ascii_case(target.as_str()) {
+                if !fk.parent_table.eq_ignore_ascii_case(table_name.as_str()) {
                     continue;
                 }
                 if fk.child_columns.is_empty() {
@@ -1732,23 +1724,25 @@ impl Schema {
     }
 
     /// Compute all resolved FKs *declared by* `child_table`
-    pub fn resolved_fks_for_child(&self, child_table: &str) -> crate::Result<Vec<ResolvedFkRef>> {
+    pub fn resolved_fks_for_child(
+        &self,
+        child_table: &Identifier,
+    ) -> crate::Result<Vec<ResolvedFkRef>> {
         let fk_mismatch_err = |child: &str, parent: &str| -> crate::LimboError {
             crate::LimboError::ForeignKeyConstraint(format!(
                 "foreign key mismatch - \"{child}\" referencing \"{parent}\""
             ))
         };
-        let child_name = Identifier::from(child_table);
         let child = self
-            .get_btree_table(child_name.as_str())
-            .ok_or_else(|| fk_mismatch_err(child_name.as_str(), "<unknown>"))?;
+            .get_btree_table(child_table)
+            .ok_or_else(|| fk_mismatch_err(child_table.as_str(), "<unknown>"))?;
 
         let mut out = Vec::with_capacity(child.foreign_keys.len());
 
         for fk in &child.foreign_keys {
             let parent_name = Identifier::from(fk.parent_table.as_str());
             let parent_tbl = self
-                .get_btree_table(parent_name.as_str())
+                .get_btree_table(&parent_name)
                 .ok_or_else(|| fk_mismatch_err(child.name.as_str(), parent_name.as_str()))?;
 
             let child_cols: Vec<String> = fk.child_columns.clone();
@@ -1827,7 +1821,7 @@ impl Schema {
             let parent_unique_index = if parent_uses_rowid {
                 None
             } else {
-                self.get_indices(parent_tbl.name.as_str())
+                self.get_indices(&parent_tbl.name)
                     .find(|idx| {
                         idx.unique
                             && idx.where_clause.is_none()
@@ -1859,26 +1853,26 @@ impl Schema {
     }
 
     /// Returns if any table declares a FOREIGN KEY whose parent is `table_name`.
-    pub fn any_resolved_fks_referencing(&self, table_name: &str) -> bool {
+    pub fn any_resolved_fks_referencing(&self, table_name: &Identifier) -> bool {
         self.tables.values().any(|t| {
             let Some(bt) = t.btree() else {
                 return false;
             };
             bt.foreign_keys
                 .iter()
-                .any(|fk| fk.parent_table == table_name)
+                .any(|fk| fk.parent_table.eq_ignore_ascii_case(table_name.as_str()))
         })
     }
 
     /// Returns true if `table_name` declares any FOREIGN KEYs
-    pub fn has_child_fks(&self, table_name: &str) -> bool {
+    pub fn has_child_fks(&self, table_name: &Identifier) -> bool {
         self.get_table(table_name)
             .and_then(|t| t.btree())
             .is_some_and(|t| !t.foreign_keys.is_empty())
     }
 
     fn check_object_name_conflict(&self, name: &Identifier) -> Result<()> {
-        if let Some(object_type) = self.get_object_type(name.as_str()) {
+        if let Some(object_type) = self.get_object_type(name) {
             let type_str = match object_type {
                 SchemaObjectType::Table => "table",
                 SchemaObjectType::View => "view",
@@ -1893,19 +1887,19 @@ impl Schema {
 
     /// Returns the type of schema object with the given name, if one exists.
     /// Checks tables, views, and indexes.
-    pub fn get_object_type(&self, name: &str) -> Option<SchemaObjectType> {
+    pub fn get_object_type(&self, name: &Identifier) -> Option<SchemaObjectType> {
         let normalized_name = self.normalize_table_lookup_name(name);
 
-        if self.tables.contains_key(&normalized_name) {
+        if self.tables.contains_key(&*normalized_name) {
             return Some(SchemaObjectType::Table);
         }
 
-        if self.views.contains_key(&normalized_name) {
+        if self.views.contains_key(&*normalized_name) {
             return Some(SchemaObjectType::View);
         }
 
         for index_list in self.indexes.values() {
-            if index_list.iter().any(|i| i.name == name) {
+            if index_list.iter().any(|i| i.name == *name) {
                 return Some(SchemaObjectType::Index);
             }
         }
@@ -2149,6 +2143,7 @@ impl Table {
     }
 
     /// Returns the column position and column for a given column name.
+    //TODO Identifier
     pub fn get_column_by_name(&self, name: &str) -> Option<(usize, &Column)> {
         match self {
             Self::BTree(table) => table.get_column(name),
@@ -2229,11 +2224,13 @@ pub struct UniqueSet {
 #[derive(Clone, Debug)]
 pub struct CheckConstraint {
     /// Optional constraint name
+    //TODO Identifier
     pub name: Option<String>,
     /// CHECK expression
     pub expr: ast::Expr,
     /// Column name if this is a column-level CHECK constraint (defined inline with the column).
     /// None if this is a table-level CHECK constraint.
+    //TODO Identifier
     pub column: Option<String>,
 }
 
@@ -2278,10 +2275,12 @@ impl BTreeTable {
     /// correct base type (e.g., BLOB) rather than accepting any STRICT type via the wildcard arm.
     pub fn type_check_table_ref(table: &Arc<BTreeTable>, schema: &Schema) -> Arc<BTreeTable> {
         let has_virtual = table.has_virtual_columns();
-        let has_custom = table
-            .columns
-            .iter()
-            .any(|c| c.is_array() || schema.get_type_def(&c.ty_str, table.is_strict).is_some());
+        let has_custom = table.columns.iter().any(|c| {
+            c.is_array()
+                || schema
+                    .get_type_def(c.ty_str.as_str(), table.is_strict)
+                    .is_some()
+        });
         if !has_custom && !has_virtual {
             return Arc::clone(table);
         }
@@ -2294,7 +2293,8 @@ impl BTreeTable {
             if col.is_array() {
                 // Arrays are stored as record-format blobs.
                 col.ty_str = "BLOB".to_string();
-            } else if let Some(type_def) = schema.get_type_def(&col.ty_str, table.is_strict) {
+            } else if let Some(type_def) = schema.get_type_def(col.ty_str.as_str(), table.is_strict)
+            {
                 col.ty_str = type_def.base.to_uppercase();
             }
         }
@@ -2311,10 +2311,12 @@ impl BTreeTable {
         only_columns: Option<&ColumnMask>,
     ) -> Arc<BTreeTable> {
         let has_virtual = table.has_virtual_columns();
-        let has_custom = table
-            .columns
-            .iter()
-            .any(|c| c.is_array() || schema.get_type_def(&c.ty_str, table.is_strict).is_some());
+        let has_custom = table.columns.iter().any(|c| {
+            c.is_array()
+                || schema
+                    .get_type_def(c.ty_str.as_str(), table.is_strict)
+                    .is_some()
+        });
         if !has_custom && !has_virtual {
             return Arc::clone(table);
         }
@@ -2352,7 +2354,8 @@ impl BTreeTable {
                 // Pre-encode: user input can be text ('[1,2]') or blob (ARRAY[]),
                 // so accept ANY here; the encoder handles conversion.
                 col.ty_str = "ANY".to_string();
-            } else if let Some(type_def) = schema.get_type_def(&col.ty_str, table.is_strict) {
+            } else if let Some(type_def) = schema.get_type_def(col.ty_str.as_str(), table.is_strict)
+            {
                 col.ty_str = type_def.value_input_type().to_uppercase();
             }
         }
@@ -2374,7 +2377,7 @@ impl BTreeTable {
                 col.set_base_affinity(Affinity::Blob);
                 continue;
             }
-            if let Some(type_def) = schema.get_type_def_unchecked(&col.ty_str) {
+            if let Some(type_def) = schema.get_type_def_unchecked(col.ty_str.as_str()) {
                 let (base_ty, _) = type_from_name(&type_def.base);
                 col.set_ty(base_ty);
                 col.set_base_affinity(Affinity::affinity(&type_def.base));
@@ -5357,9 +5360,9 @@ mod tests {
     #[test]
     fn test_has_indexes_case_insensitive() {
         let mut schema = Schema::new();
-        schema.table_set_has_index("MyTable");
-        assert!(schema.table_has_indexes("mytable"));
-        assert!(schema.table_has_indexes("MYTABLE"));
-        assert!(schema.table_has_indexes("MyTable"));
+        schema.table_set_has_index(&Identifier::from("MyTable"));
+        assert!(schema.table_has_indexes(&Identifier::from("mytable")));
+        assert!(schema.table_has_indexes(&Identifier::from("MYTABLE")));
+        assert!(schema.table_has_indexes(&Identifier::from("MyTable")));
     }
 }

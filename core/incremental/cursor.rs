@@ -377,6 +377,7 @@ mod tests {
     use crate::sync::Arc;
     use crate::util::IOExt;
     use crate::{Connection, Database, OpenFlags};
+    use turso_parser::identifier::Identifier;
 
     /// Helper to create a test connection with a table and materialized view
     fn create_test_connection() -> Result<Arc<Connection>> {
@@ -422,7 +423,7 @@ mod tests {
         let view_mutex = conn
             .schema
             .read()
-            .get_materialized_view("test_view")
+            .get_materialized_view(&Identifier::from("test_view"))
             .ok_or_else(|| crate::LimboError::InternalError("View not found".to_string()))?;
 
         // Get the view's root page
@@ -1914,7 +1915,7 @@ mod tests {
             let view_mutex = conn
                 .schema
                 .read()
-                .get_materialized_view("test_view")
+                .get_materialized_view(&Identifier::from("test_view"))
                 .ok_or_else(|| crate::LimboError::InternalError("View not found".to_string()))?;
 
             let pager = conn.get_pager();

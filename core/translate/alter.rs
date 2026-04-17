@@ -164,7 +164,7 @@ fn emit_rename_sqlite_sequence_entry(
     new_table_name: &str,
 ) {
     let Some(sqlite_sequence) = resolver.with_schema(database_id, |s| {
-        s.get_btree_table(crate::schema::SQLITE_SEQUENCE_TABLE_NAME)
+        s.get_btree_table(&Identifier::from(crate::schema::SQLITE_SEQUENCE_TABLE_NAME))
     }) else {
         return;
     };
@@ -663,11 +663,12 @@ pub fn translate_alter_table(
     let schema_version = resolver.with_schema(database_id, |s| s.schema_version);
     validate(&alter_table, table_name)?;
 
+    let table_name_id = Identifier::from(table_name);
     let table_indexes = resolver.with_schema(database_id, |s| {
-        s.get_indices(table_name).cloned().collect::<Vec<_>>()
+        s.get_indices(&table_name_id).cloned().collect::<Vec<_>>()
     });
 
-    let Some(table) = resolver.with_schema(database_id, |s| s.get_table(table_name)) else {
+    let Some(table) = resolver.with_schema(database_id, |s| s.get_table(&table_name_id)) else {
         return Err(LimboError::ParseError(format!(
             "no such table: {table_name}"
         )));
@@ -692,7 +693,7 @@ pub fn translate_alter_table(
 
     // Check if this table has dependent materialized views
     let dependent_views = resolver.with_schema(database_id, |s| {
-        s.get_dependent_materialized_views(table_name)
+        s.get_dependent_materialized_views(&table_name_id)
     });
     if !dependent_views.is_empty() {
         return Err(LimboError::ParseError(format!(
@@ -1314,7 +1315,7 @@ pub fn translate_alter_table(
             let mut temp_triggers_to_rewrite: Vec<(String, String)> = Vec::new();
 
             if resolver.with_schema(database_id, |s| {
-                s.get_table(new_name).is_some()
+                s.get_table(&new_name_id).is_some()
                     || s.indexes
                         .values()
                         .flatten()
@@ -1370,7 +1371,9 @@ pub fn translate_alter_table(
             };
 
             let sqlite_schema = resolver
-                .with_schema(database_id, |s| s.get_btree_table(SQLITE_TABLEID))
+                .with_schema(database_id, |s| {
+                    s.get_btree_table(&Identifier::from(SQLITE_TABLEID))
+                })
                 .ok_or_else(|| {
                     LimboError::ParseError("sqlite_schema table not found in schema".to_string())
                 })?;
@@ -1766,7 +1769,9 @@ pub fn translate_alter_table(
             };
 
             let sqlite_schema = resolver
-                .with_schema(database_id, |s| s.get_btree_table(SQLITE_TABLEID))
+                .with_schema(database_id, |s| {
+                    s.get_btree_table(&Identifier::from(SQLITE_TABLEID))
+                })
                 .ok_or_else(|| {
                     LimboError::ParseError("sqlite_schema table not found in schema".to_string())
                 })?;
@@ -2079,7 +2084,7 @@ fn translate_rename_virtual_table(
     // Rewrite sqlite_schema entry
     let sqlite_schema = resolver
         .schema()
-        .get_btree_table(SQLITE_TABLEID)
+        .get_btree_table(&Identifier::from(SQLITE_TABLEID))
         .ok_or_else(|| {
             LimboError::ParseError("sqlite_schema table not found in schema".to_string())
         })?;
@@ -2296,9 +2301,10 @@ fn rewrite_trigger_sql_for_column_rename(
     // Get the trigger's owning table to check unqualified column references
     let trigger_table_name_raw = tbl_name.name.as_str();
     let trigger_table_name = trigger_table_name_raw.to_owned();
+    let trigger_table_name_id = Identifier::from(trigger_table_name.as_str());
     let trigger_table = resolver
         .with_schema(trigger_database_id, |schema| {
-            schema.get_btree_table(&trigger_table_name)
+            schema.get_btree_table(&trigger_table_name_id)
         })
         .ok_or_else(|| {
             LimboError::ParseError(format!("trigger table not found: {trigger_table_name}"))
@@ -2307,9 +2313,10 @@ fn rewrite_trigger_sql_for_column_rename(
     // Check if this trigger references the column being renamed
     // We need to check if the column exists in the table being renamed
     let target_table_name = table_name.to_owned();
+    let target_table_name_id = Identifier::from(target_table_name.as_str());
     if resolver
         .with_schema(target_database_id, |schema| {
-            schema.get_btree_table(&target_table_name)
+            schema.get_btree_table(&target_table_name_id)
         })
         .is_none()
     {
@@ -3652,8 +3659,9 @@ fn validate_trigger_columns_after_drop(
                     .collect(),
             )
         } else {
+            let trigger_table_id = Identifier::from(trigger_table.as_str());
             resolver.with_schema(trigger_database_id, |s| {
-                s.get_table(trigger_table).and_then(|t| {
+                s.get_table(&trigger_table_id).and_then(|t| {
                     t.btree().map(|bt| {
                         bt.columns
                             .iter()
@@ -4455,6 +4463,7 @@ fn table_reference_exists_after_rename(
     trigger_database_id: usize,
     altered_database_id: usize,
 ) -> bool {
+    let table_name_id = Identifier::from(table_name);
     let lookup_database_id = if let Some(db_name) = explicit_db_name {
         resolver
             .resolve_database_id(&ast::QualifiedName::fullname(
@@ -4464,9 +4473,9 @@ fn table_reference_exists_after_rename(
             .ok()
     } else if trigger_database_id == crate::TEMP_DB_ID {
         if resolver.with_schema(crate::TEMP_DB_ID, |s| {
-            s.get_table(table_name).is_some()
-                || s.get_view(table_name).is_some()
-                || s.get_materialized_view(table_name).is_some()
+            s.get_table(&table_name_id).is_some()
+                || s.get_view(&table_name_id).is_some()
+                || s.get_materialized_view(&table_name_id).is_some()
         }) {
             Some(crate::TEMP_DB_ID)
         } else {
@@ -4485,9 +4494,9 @@ fn table_reference_exists_after_rename(
     }
 
     resolver.with_schema(lookup_database_id, |s| {
-        s.get_table(table_name).is_some()
-            || s.get_view(table_name).is_some()
-            || s.get_materialized_view(table_name).is_some()
+        s.get_table(&table_name_id).is_some()
+            || s.get_view(&table_name_id).is_some()
+            || s.get_materialized_view(&table_name_id).is_some()
     })
 }
 
@@ -5259,6 +5268,7 @@ fn get_table_columns(
     altered_database_id: usize,
     explicit_db_name: Option<&str>,
 ) -> Option<Vec<String>> {
+    let table_name_id = Identifier::from(table_name);
     let lookup_database_id = if let Some(db_name) = explicit_db_name {
         resolver
             .resolve_database_id(&ast::QualifiedName::fullname(
@@ -5267,7 +5277,7 @@ fn get_table_columns(
             ))
             .ok()?
     } else if trigger_database_id == crate::TEMP_DB_ID {
-        if resolver.with_schema(crate::TEMP_DB_ID, |s| s.get_table(table_name).is_some()) {
+        if resolver.with_schema(crate::TEMP_DB_ID, |s| s.get_table(&table_name_id).is_some()) {
             crate::TEMP_DB_ID
         } else {
             crate::MAIN_DB_ID
@@ -5286,7 +5296,7 @@ fn get_table_columns(
         )
     } else {
         resolver.with_schema(lookup_database_id, |s| {
-            s.get_table(table_name).and_then(|t| {
+            s.get_table(&table_name_id).and_then(|t| {
                 t.btree().map(|bt| {
                     bt.columns
                         .iter()
@@ -5303,19 +5313,20 @@ fn resolve_trigger_command_table_for_alter(
     trigger_database_id: usize,
     table_name: &str,
 ) -> Option<Arc<BTreeTable>> {
+    let table_name_id = Identifier::from(table_name);
     if trigger_database_id == crate::TEMP_DB_ID {
         resolver
             .with_schema(crate::TEMP_DB_ID, |schema| {
-                schema.get_btree_table(table_name)
+                schema.get_btree_table(&table_name_id)
             })
             .or_else(|| {
                 resolver.with_schema(crate::MAIN_DB_ID, |schema| {
-                    schema.get_btree_table(table_name)
+                    schema.get_btree_table(&table_name_id)
                 })
             })
     } else {
         resolver.with_schema(trigger_database_id, |schema| {
-            schema.get_btree_table(table_name)
+            schema.get_btree_table(&table_name_id)
         })
     }
 }

@@ -709,6 +709,7 @@ fn validate_check_types_in_expr(
 
 fn validate(
     body: &ast::CreateTableBody,
+    //TODO Identifier
     table_name: &str,
     resolver: &Resolver,
     conn: &Connection,
@@ -886,6 +887,7 @@ pub fn translate_create_table(
     if !connection.is_mvcc_bootstrap_connection()
         && RESERVED_TABLE_PREFIXES
             .iter()
+            //TODO Identifier
             .any(|prefix| tbl_name_str.to_ascii_lowercase().starts_with(prefix))
         && !connection.is_nested_stmt()
     {
@@ -896,9 +898,9 @@ pub fn translate_create_table(
     }
 
     // Check for name conflicts with existing schema objects
-    if let Some(object_type) =
-        resolver.with_schema(database_id, |s| s.get_object_type(tbl_name_str))
-    {
+    if let Some(object_type) = resolver.with_schema(database_id, |s| {
+        s.get_object_type(tbl_name.name.identifier())
+    }) {
         match object_type {
             // IF NOT EXISTS suppresses errors for table/view conflicts
             SchemaObjectType::Table | SchemaObjectType::View if if_not_exists => {
@@ -987,9 +989,13 @@ pub fn translate_create_table(
 
     let created_sequence_table = if has_autoincrement
         && resolver.with_schema(database_id, |s| {
-            s.get_table(SQLITE_SEQUENCE_TABLE_NAME).is_none()
+            s.get_table(&Identifier::from(SQLITE_SEQUENCE_TABLE_NAME))
+                .is_none()
         }) {
-        let schema_master_table = resolver.schema().get_btree_table(SQLITE_TABLEID).unwrap();
+        let schema_master_table = resolver
+            .schema()
+            .get_btree_table(&Identifier::from(SQLITE_TABLEID))
+            .unwrap();
         let sqlite_schema_cursor_id =
             program.alloc_cursor_id(CursorType::BTreeTable(schema_master_table));
         program.emit_insn(Insn::OpenWrite {
@@ -1067,7 +1073,10 @@ pub fn translate_create_table(
         }
     }
 
-    let table = resolver.schema().get_btree_table(SQLITE_TABLEID).unwrap();
+    let table = resolver
+        .schema()
+        .get_btree_table(&Identifier::from(SQLITE_TABLEID))
+        .unwrap();
     let sqlite_schema_cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(table));
     program.emit_insn(Insn::OpenWrite {
         cursor_id: sqlite_schema_cursor_id,
@@ -1164,7 +1173,9 @@ pub fn emit_schema_entry(
     sqlite_schema_cursor_id: usize,
     cdc_table_cursor_id: Option<usize>,
     entry_type: SchemaEntryType,
+    //TODO Identifier
     name: &str,
+    //TODO Identifier
     tbl_name: &str,
     root_page_reg: usize,
     sql: Option<String>,
@@ -1252,6 +1263,7 @@ pub fn emit_schema_entry(
 fn collect_autoindexes(
     body: &ast::CreateTableBody,
     program: &mut ProgramBuilder,
+    //TODO Identifier
     tbl_name: &str,
 ) -> Result<Option<Vec<usize>>> {
     let table = create_table(tbl_name, body, 0)?;
@@ -1373,7 +1385,11 @@ pub fn translate_create_virtual_table(
     if !vtab_module.module_kind.eq(&VTabKind::VirtualTable) {
         bail_parse_error!("module {} is not a virtual table", module_name_str);
     };
-    if resolver.schema().get_table(&table_name).is_some() {
+    if resolver
+        .schema()
+        .get_table(tbl_name.name.identifier())
+        .is_some()
+    {
         if *if_not_exists {
             return Ok(());
         }
@@ -1415,7 +1431,10 @@ pub fn translate_create_virtual_table(
         table_name: table_name_reg,
         args_reg,
     });
-    let table = resolver.schema().get_btree_table(SQLITE_TABLEID).unwrap();
+    let table = resolver
+        .schema()
+        .get_btree_table(&Identifier::from(SQLITE_TABLEID))
+        .unwrap();
     let sqlite_schema_cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(table));
     program.emit_insn(Insn::OpenWrite {
         cursor_id: sqlite_schema_cursor_id,
@@ -1469,7 +1488,9 @@ fn validate_drop_table(
         bail_parse_error!("Cannot drop system table {}", tbl_name);
     }
     // Check if this is a materialized view - if so, refuse to drop it with DROP TABLE
-    if resolver.with_schema(database_id, |schema| schema.is_materialized_view(tbl_name)) {
+    if resolver.with_schema(database_id, |schema| {
+        schema.is_materialized_view(&Identifier::from(tbl_name))
+    }) {
         bail_parse_error!(
             "Cannot DROP TABLE on materialized view {tbl_name}. Use DROP VIEW instead.",
         );
@@ -1496,7 +1517,8 @@ pub fn translate_drop_table(
     let schema_cookie = resolver.with_schema(database_id, |s| s.schema_version);
     program.begin_write_on_database(database_id, schema_cookie);
 
-    let Some(table) = resolver.with_schema(database_id, |s| s.get_table(name)) else {
+    let name_id = tbl_name.name.identifier().clone();
+    let Some(table) = resolver.with_schema(database_id, |s| s.get_table(&name_id)) else {
         if if_exists {
             return Ok(());
         }
@@ -1506,7 +1528,7 @@ pub fn translate_drop_table(
     // Check if foreign keys are enabled and if this table is referenced by foreign keys
     // Fire FK actions (CASCADE, SET NULL, SET DEFAULT) or check for violations (RESTRICT, NO ACTION)
     if connection.foreign_keys_enabled()
-        && resolver.with_schema(database_id, |s| s.any_resolved_fks_referencing(name))
+        && resolver.with_schema(database_id, |s| s.any_resolved_fks_referencing(&name_id))
     {
         emit_fk_drop_table_check(program, resolver, name, connection, database_id)?;
     }
@@ -1521,7 +1543,10 @@ pub fn translate_drop_table(
     program.mark_last_insn_constant();
     let row_id_reg = program.alloc_register(); //  r5
 
-    let schema_table = resolver.schema().get_btree_table(SQLITE_TABLEID).unwrap();
+    let schema_table = resolver
+        .schema()
+        .get_btree_table(&Identifier::from(SQLITE_TABLEID))
+        .unwrap();
     let sqlite_schema_cursor_id_0 = program.alloc_cursor_id(
         //  cursor 0
         CursorType::BTreeTable(schema_table.clone()),
@@ -1631,11 +1656,12 @@ pub fn translate_drop_table(
         //   - it is unqualified AND dropping from main AND temp has no
         //     shadow table of the same name (in which case the
         //     unqualified reference resolves to main).
+        let tbl_name_ident = tbl_name.name.identifier().clone();
         let temp_has_shadow = resolver.with_schema(crate::TEMP_DB_ID, |s| {
-            s.get_table(tbl_name.name.as_str()).is_some()
+            s.get_table(&tbl_name_ident).is_some()
         });
         let trigger_names_to_drop: Vec<String> = resolver.with_schema(crate::TEMP_DB_ID, |s| {
-            s.get_triggers_for_table(tbl_name.name.as_str())
+            s.get_triggers_for_table(&tbl_name_ident)
                 .filter(|trigger| match trigger.target_database_id {
                     Some(db_id) => db_id == database_id,
                     None => !temp_has_shadow && database_id == crate::MAIN_DB_ID,
@@ -1647,8 +1673,9 @@ pub fn translate_drop_table(
         if !trigger_names_to_drop.is_empty() {
             let temp_schema_cookie = resolver.with_schema(crate::TEMP_DB_ID, |s| s.schema_version);
             program.begin_write_on_database(crate::TEMP_DB_ID, temp_schema_cookie);
-            let temp_schema_table =
-                resolver.with_schema(crate::TEMP_DB_ID, |s| s.get_btree_table(SQLITE_TABLEID));
+            let temp_schema_table = resolver.with_schema(crate::TEMP_DB_ID, |s| {
+                s.get_btree_table(&Identifier::from(SQLITE_TABLEID))
+            });
             if let Some(temp_schema_table) = temp_schema_table {
                 let temp_cursor =
                     program.alloc_cursor_id(CursorType::BTreeTable(temp_schema_table));
@@ -1725,7 +1752,7 @@ pub fn translate_drop_table(
     }
 
     //  2. Destroy the indices within a loop
-    let indices = resolver.schema().get_indices(tbl_name.name.as_str());
+    let indices = resolver.schema().get_indices(tbl_name.name.identifier());
     for index in indices {
         if index.index_method.is_some() && !index.is_backing_btree_index() {
             // Index methods without backing btree need special destroy handling
@@ -1950,7 +1977,7 @@ pub fn translate_drop_table(
     // if drops table, sequence table should reset.
     if let Some(seq_table) = resolver
         .schema()
-        .get_table(SQLITE_SEQUENCE_TABLE_NAME)
+        .get_table(&Identifier::from(SQLITE_SEQUENCE_TABLE_NAME))
         .and_then(|t| t.btree())
     {
         let seq_cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(seq_table.clone()));
@@ -2004,7 +2031,9 @@ pub fn translate_drop_table(
     // Clean up turso_cdc_version entry for the dropped table (if version table exists)
     if let Some(version_table) = resolver
         .schema()
-        .get_table(crate::translate::pragma::TURSO_CDC_VERSION_TABLE_NAME)
+        .get_table(&Identifier::from(
+            crate::translate::pragma::TURSO_CDC_VERSION_TABLE_NAME,
+        ))
         .and_then(|t| t.btree())
     {
         let ver_cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(version_table.clone()));
@@ -2168,7 +2197,10 @@ pub fn translate_create_type(
     let types_table: Arc<BTreeTable>;
     let types_root_page: RegisterOrLiteral<i64>;
 
-    if let Some(existing) = resolver.schema().get_btree_table(TURSO_TYPES_TABLE_NAME) {
+    if let Some(existing) = resolver
+        .schema()
+        .get_btree_table(&Identifier::from(TURSO_TYPES_TABLE_NAME))
+    {
         types_table = existing.clone();
         types_root_page = RegisterOrLiteral::Literal(existing.root_page);
     } else {
@@ -2185,7 +2217,10 @@ pub fn translate_create_type(
         types_root_page = RegisterOrLiteral::Register(table_root_reg);
 
         // Register it in sqlite_schema so it persists
-        let schema_table = resolver.schema().get_btree_table(SQLITE_TABLEID).unwrap();
+        let schema_table = resolver
+            .schema()
+            .get_btree_table(&Identifier::from(SQLITE_TABLEID))
+            .unwrap();
         let schema_cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(schema_table));
         program.emit_insn(Insn::OpenWrite {
             cursor_id: schema_cursor_id,
@@ -2300,7 +2335,7 @@ pub fn translate_drop_type(
     // Open cursor to sqlite_turso_types table
     let types_table = resolver
         .schema()
-        .get_btree_table(TURSO_TYPES_TABLE_NAME)
+        .get_btree_table(&Identifier::from(TURSO_TYPES_TABLE_NAME))
         .ok_or_else(|| crate::LimboError::ParseError(format!("no such type: {type_name}")))?;
     let types_cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(types_table.clone()));
     program.emit_insn(Insn::OpenWrite {

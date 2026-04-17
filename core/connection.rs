@@ -837,9 +837,11 @@ impl Connection {
         };
         // Resolver so attached-db qualifiers in temp triggers can be
         // mapped to their actual index on this connection (Phase 1.4c).
+        //TODO Identifier
         let attached_resolver = |name: &str| -> Option<usize> {
             self.attached_databases
                 .read()
+                //TODO Identifier
                 .get_database_by_name(&name.to_ascii_lowercase())
                 .map(|(idx, _)| idx)
         };
@@ -1691,6 +1693,7 @@ impl Connection {
             let mut dbsp_state_index_roots = HashMap::default();
             let mut materialized_view_info = HashMap::default();
 
+            //TODO Identifier
             let attached_resolver = |name: &str| -> Option<usize> {
                 self.attached_databases
                     .read()
@@ -1964,6 +1967,7 @@ impl Connection {
     }
 
     /// Get the database id for a schema name ("main", "temp", or an attached db alias).
+    //TODO Identifier
     pub(crate) fn get_database_id_by_name(&self, name: &str) -> Result<usize> {
         let normalized: String = name.to_ascii_lowercase();
         match normalized.as_str() {

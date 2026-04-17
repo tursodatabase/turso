@@ -4,6 +4,7 @@ use std::{
 };
 
 use turso_parser::ast::{self, SortOrder};
+use turso_parser::identifier::Identifier;
 
 use crate::numeric::Numeric;
 use crate::util::quote_identifier;
@@ -483,23 +484,23 @@ impl IndexMethodCursor for VectorSparseInvertedIndexMethodCursor {
         self.inverted_index_cursor = Some(open_index_cursor(
             connection,
             database_id,
-            &self.configuration.table_name,
-            &self.inverted_index_btree,
+            &Identifier::from(self.configuration.table_name.as_str()),
+            &Identifier::from(self.inverted_index_btree.as_str()),
             // component, length, rowid
             vec![key_info(), key_info(), key_info()],
         )?);
         self.stats_cursor = Some(open_index_cursor(
             connection,
             database_id,
-            &self.configuration.table_name,
-            &self.stats_btree,
+            &Identifier::from(self.configuration.table_name.as_str()),
+            &Identifier::from(self.stats_btree.as_str()),
             // component
             vec![key_info()],
         )?);
         self.main_btree = Some(open_table_cursor(
             connection,
             database_id,
-            &self.configuration.table_name,
+            &Identifier::from(self.configuration.table_name.as_str()),
         )?);
         Ok(IOResult::Done(()))
     }
@@ -512,16 +513,16 @@ impl IndexMethodCursor for VectorSparseInvertedIndexMethodCursor {
         self.inverted_index_cursor = Some(open_index_cursor(
             connection,
             database_id,
-            &self.configuration.table_name,
-            &self.inverted_index_btree,
+            &Identifier::from(self.configuration.table_name.as_str()),
+            &Identifier::from(self.inverted_index_btree.as_str()),
             // component, length, rowid
             vec![key_info(), key_info(), key_info()],
         )?);
         self.stats_cursor = Some(open_index_cursor(
             connection,
             database_id,
-            &self.configuration.table_name,
-            &self.stats_btree,
+            &Identifier::from(self.configuration.table_name.as_str()),
+            &Identifier::from(self.stats_btree.as_str()),
             // component
             vec![key_info()],
         )?);

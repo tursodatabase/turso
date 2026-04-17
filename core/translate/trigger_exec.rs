@@ -18,6 +18,7 @@ use crate::{bail_parse_error, QueryMode, Result};
 use std::cell::RefCell;
 use std::num::NonZero;
 use turso_parser::ast::{self, Expr, TriggerEvent, TriggerTime};
+use turso_parser::identifier::Identifier;
 
 /// Context for trigger execution
 #[derive(Debug)]
@@ -676,7 +677,7 @@ pub fn has_relevant_triggers_type_only(
     updated_column_indices: Option<&ColumnMask>,
     table: &BTreeTable,
 ) -> bool {
-    let mut triggers = schema.get_triggers_for_table(table.name.as_str());
+    let mut triggers = schema.get_triggers_for_table(&table.name);
 
     // Filter triggers by event
     triggers.any(|trigger| {
@@ -717,7 +718,7 @@ pub fn get_relevant_triggers_type_and_time<'a>(
     updated_column_indices: Option<ColumnMask>,
     table: &'a BTreeTable,
 ) -> impl Iterator<Item = Arc<Trigger>> + 'a + Clone {
-    let triggers = schema.get_triggers_for_table(table.name.as_str());
+    let triggers = schema.get_triggers_for_table(&table.name);
 
     // Filter triggers by event
     triggers
@@ -796,7 +797,9 @@ pub fn get_triggers_including_temp(
                     // Unqualified: the trigger targets the temp schema's table if one
                     // exists, otherwise it targets main/attached. Include it only when
                     // no temp table with that name shadows it.
-                    None => s.get_table(&trigger.table_name).is_none(),
+                    None => s
+                        .get_table(&Identifier::from(trigger.table_name.as_str()))
+                        .is_none(),
                 })
                 .collect()
         });
@@ -822,10 +825,12 @@ pub fn has_triggers_including_temp(
     if database_id != crate::TEMP_DB_ID && resolver.has_temp_database() {
         // Check temp schema for triggers that target this database.
         let has_temp = resolver.with_schema(crate::TEMP_DB_ID, |s| {
-            s.get_triggers_for_table(table.name.as_str())
+            s.get_triggers_for_table(&table.name)
                 .any(|trigger| match trigger.target_database_id {
                     Some(target_db) => target_db == database_id,
-                    None => s.get_table(&trigger.table_name).is_none(),
+                    None => s
+                        .get_table(&Identifier::from(trigger.table_name.as_str()))
+                        .is_none(),
                 })
         });
         if has_temp {

@@ -1,4 +1,5 @@
 use crate::sync::Arc;
+use turso_parser::identifier::Identifier;
 
 use crate::{
     bail_parse_error,
@@ -103,8 +104,9 @@ fn resolve_targets_in_db(
     resolver: &Resolver,
 ) -> Result<Vec<AnalyzeTarget>> {
     // Try as a table first
+    let name_id = Identifier::from(name);
     let table_opt: Option<Arc<BTreeTable>> =
-        resolver.with_schema(database_id, |s| s.get_btree_table(name));
+        resolver.with_schema(database_id, |s| s.get_btree_table(&name_id));
     if let Some(table) = table_opt {
         return Ok(vec![(table, None)]);
     }
@@ -114,7 +116,7 @@ fn resolve_targets_in_db(
         resolver.with_schema(database_id, |schema| {
             for (table_name, indexes) in schema.indexes.iter() {
                 if let Some(index) = indexes.iter().find(|idx| idx.name == name) {
-                    if let Some(table) = schema.get_btree_table(table_name.as_str()) {
+                    if let Some(table) = schema.get_btree_table(table_name) {
                         return Some((table, index.clone()));
                     }
                 }
@@ -160,8 +162,9 @@ pub fn translate_analyze(
     let sqlite_stat1_btreetable: Arc<BTreeTable>;
     let sqlite_stat1_source: RegisterOrLiteral<_>;
 
-    let stat1_table: Option<Arc<BTreeTable>> =
-        resolver.with_schema(database_id, |s| s.get_btree_table("sqlite_stat1"));
+    let stat1_table: Option<Arc<BTreeTable>> = resolver.with_schema(database_id, |s| {
+        s.get_btree_table(&Identifier::from("sqlite_stat1"))
+    });
     if let Some(sqlite_stat1) = stat1_table {
         sqlite_stat1_btreetable = sqlite_stat1.clone();
         sqlite_stat1_source = RegisterOrLiteral::Literal(sqlite_stat1.root_page);
@@ -193,7 +196,9 @@ pub fn translate_analyze(
         sqlite_stat1_source = RegisterOrLiteral::Register(table_root_reg);
 
         let table = resolver
-            .with_schema(database_id, |s| s.get_btree_table(SQLITE_TABLEID))
+            .with_schema(database_id, |s| {
+                s.get_btree_table(&Identifier::from(SQLITE_TABLEID))
+            })
             .unwrap();
         let sqlite_schema_cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(table));
         program.emit_insn(Insn::OpenWrite {
@@ -405,7 +410,7 @@ pub fn translate_analyze(
         let indexes: Vec<Arc<Index>> = match target_index {
             Some(idx) => vec![idx],
             None => resolver.with_schema(database_id, |s| {
-                s.get_indices(target_table.name.as_str())
+                s.get_indices(&target_table.name)
                     .filter(|idx| idx.index_method.is_none()) // skip custom for now
                     .cloned()
                     .collect()

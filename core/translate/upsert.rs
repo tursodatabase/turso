@@ -101,6 +101,7 @@ fn extract_target_key(e: &ast::Expr) -> Option<ConflictTarget> {
         ast::Expr::Parenthesized(v) if v.len() == 1 => extract_target_key(&v[0]),
 
         ast::Expr::Id(name) => Some(ConflictTarget {
+            //TODO I think this pattern can be simplified
             col_name: name.as_str().to_owned(),
             collate: None,
         }),
@@ -239,6 +240,7 @@ fn index_expression_cols(table: &Table, out: &mut ColumnMask, expr: &ast::Expr) 
                 }
             }
             Expr::Qualified(ns, c) | Expr::DoublyQualified(_, ns, c) => {
+                //TODO Identifier wtf
                 if ns.as_str() == table.get_name().as_str() {
                     if let Some((i, _)) = table.get_column_by_name(c.as_str()) {
                         out.set(i);
@@ -279,6 +281,7 @@ pub fn upsert_matches_index(upsert: &Upsert, index: &Index, table: &Table) -> bo
                 if matched[i] || ic.expr.is_some() {
                     continue;
                 }
+                //TODO Identifier wtf
                 let iname = Identifier::from(ic.name.as_str());
                 let icoll = effective_collation_for_index_col(ic, table);
                 if iname == **tname
@@ -351,7 +354,7 @@ pub fn resolve_upsert_target(
     }
 
     // Otherwise match a UNIQUE index, also covering non-rowid PRIMARY KEYs
-    for idx in schema.get_indices(table.get_name().as_str()) {
+    for idx in schema.get_indices(table.get_name()) {
         if idx.unique && upsert_matches_index(upsert, idx, table) {
             return Ok(ResolvedUpsertTarget::Index(Arc::clone(idx)));
         }
@@ -787,7 +790,7 @@ pub fn emit_upsert(
             let rowid_new_reg = new_rowid_reg.unwrap_or(ctx.conflict_rowid_reg);
 
             // Child-side checks
-            if resolver.with_schema(upsert_database_id, |s| s.has_child_fks(bt.name.as_str())) {
+            if resolver.with_schema(upsert_database_id, |s| s.has_child_fks(&bt.name)) {
                 emit_fk_child_update_counters(
                     program,
                     &bt,
@@ -802,7 +805,7 @@ pub fn emit_upsert(
                 )?;
             }
             let upsert_indices: Vec<_> = resolver.with_schema(upsert_database_id, |s| {
-                s.get_indices(table.get_name().as_str()).cloned().collect()
+                s.get_indices(table.get_name()).cloned().collect()
             });
             let _ = emit_fk_update_parent_actions(
                 program,
@@ -828,8 +831,7 @@ pub fn emit_upsert(
         for (idx_name, _root, idx_cid) in &ctx.idx_cursors {
             let idx_meta = resolver
                 .with_schema(ctx.database_id, |s| {
-                    s.get_index(table.get_name().as_str(), idx_name.as_str())
-                        .cloned()
+                    s.get_index(table.get_name(), idx_name).cloned()
                 })
                 .expect("index exists");
 
@@ -1126,7 +1128,7 @@ pub fn emit_upsert(
     if let Some(bt) = table.btree() {
         if connection.foreign_keys_enabled()
             && resolver.with_schema(upsert_database_id, |s| {
-                s.any_resolved_fks_referencing(bt.name.as_str())
+                s.any_resolved_fks_referencing(&bt.name)
             })
         {
             fire_fk_update_actions(
@@ -1316,6 +1318,7 @@ pub fn collect_set_clauses_for_upsert(
         .columns()
         .iter()
         .enumerate()
+        //TODO Identifier wtf
         .filter_map(|(i, c)| c.name.as_ref().map(|n| (Identifier::from(n.as_str()), i)))
         .collect();
 
@@ -1334,6 +1337,7 @@ pub fn collect_set_clauses_for_upsert(
             );
         }
         for (cn, e) in set.col_names.iter().zip(values.into_iter()) {
+            //TODO Identifier wtf
             let Some(idx) = lookup.get(&Identifier::from(cn.as_str())) else {
                 bail_parse_error!("no such column: {}", cn);
             };
@@ -1401,6 +1405,7 @@ fn rewrite_expr_to_registers(
     table: &Table,
     base_start: usize,
     rowid_reg: usize,
+    //TODO Identifier
     table_name: Option<&str>,
     insertion: Option<&Insertion>,
     allow_excluded: bool,
@@ -1411,7 +1416,9 @@ fn rewrite_expr_to_registers(
     let table_name_id = table_name.map(Identifier::from);
 
     // Map a column name to a register within the row image at `base_start`.
+    //TODO Identifier
     let col_reg_from_row_image = |name: &str| -> Option<usize> {
+        //TODO Identifier
         if ROWID_STRS.iter().any(|s| s.eq_ignore_ascii_case(name)) {
             return Some(rowid_reg);
         }

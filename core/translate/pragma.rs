@@ -146,7 +146,8 @@ fn emit_table_list_rows_for_schema(
     };
 
     if let Some(filter_name) = filter_name {
-        let lookup_name = normalize_table_pragma_lookup_name(database_id, filter_name);
+        let lookup_name =
+            Identifier::from(normalize_table_pragma_lookup_name(database_id, filter_name));
         if let Some(table) = schema.get_table(&lookup_name) {
             let (wr, strict) = match table.btree() {
                 Some(bt) => (!bt.has_rowid, bt.is_strict),
@@ -1010,6 +1011,7 @@ fn query_pragma(
             Ok(TransactionMode::None)
         }
         PragmaName::IndexXinfo => {
+            //TODO Identifier
             let index_name = match value {
                 Some(ast::Expr::Name(name)) => Some(name.as_str().to_owned()),
                 _ => None,
@@ -1082,11 +1084,12 @@ fn query_pragma(
             program.alloc_registers(4);
 
             if let Some(table_name) = table_name {
+                let table_name = Identifier::from(table_name);
                 let table_database_id = resolve_table_pragma_database_id(
                     resolver,
                     database_id,
                     schema_was_explicit,
-                    &table_name,
+                    table_name.as_str(),
                 )?;
                 resolver.with_schema(table_database_id, |schema| {
                     if let Some(table) = schema.get_table(&table_name) {
@@ -1188,7 +1191,8 @@ fn query_pragma(
                     schema_was_explicit,
                     &name,
                 )?;
-                let lookup_name = normalize_table_pragma_lookup_name(table_database_id, &name);
+                let lookup_name =
+                    Identifier::from(normalize_table_pragma_lookup_name(table_database_id, &name));
                 resolver.with_schema(table_database_id, |db_schema| {
                     if let Some(table) = db_schema.get_table(&lookup_name) {
                         emit_columns_for_table_info(program, table.columns(), base_reg, false);
@@ -1209,6 +1213,7 @@ fn query_pragma(
         }
         PragmaName::TableXinfo => {
             let name = match value {
+                //TODO everywhere, the pattern .as_str().to_owned() can likely be simplified to .to_string()
                 Some(ast::Expr::Name(name)) => Some(name.as_str().to_owned()),
                 _ => None,
             };
@@ -1223,7 +1228,8 @@ fn query_pragma(
                     schema_was_explicit,
                     &name,
                 )?;
-                let lookup_name = normalize_table_pragma_lookup_name(table_database_id, &name);
+                let lookup_name =
+                    Identifier::from(normalize_table_pragma_lookup_name(table_database_id, &name));
                 resolver.with_schema(table_database_id, |db_schema| {
                     if let Some(table) = db_schema.get_table(&lookup_name) {
                         emit_columns_for_table_info(program, table.columns(), base_reg, true);
@@ -1494,6 +1500,7 @@ fn query_pragma(
                 let mut type_names: Vec<_> = schema
                     .type_registry
                     .iter()
+                    //TODO can be simplified?
                     .filter(|(key, td)| key.as_str() == td.name.to_lowercase())
                     .map(|(key, _)| key)
                     .collect();

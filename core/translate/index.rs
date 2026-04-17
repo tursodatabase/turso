@@ -116,8 +116,7 @@ pub fn translate_create_index(
 
     // Check if the index is being created on a valid btree table and
     // the name is globally unique in the schema.
-    let schema_unique =
-        resolver.with_schema(database_id, |s| s.is_unique_idx_name(idx_name.as_str()));
+    let schema_unique = resolver.with_schema(database_id, |s| s.is_unique_idx_name(&idx_name));
     if !schema_unique {
         // If IF NOT EXISTS is specified, silently return without error
         if if_not_exists {
@@ -125,7 +124,7 @@ pub fn translate_create_index(
         }
         crate::bail_parse_error!("Error: index with name '{idx_name}' already exists.");
     }
-    let table = resolver.with_schema(database_id, |s| s.get_table(tbl_name.as_str()));
+    let table = resolver.with_schema(database_id, |s| s.get_table(&tbl_name));
     let Some(table) = table else {
         crate::bail_parse_error!("Error: table '{tbl_name}' does not exist.");
     };
@@ -213,7 +212,10 @@ pub fn translate_create_index(
     // 3. table_cursor_id         - table we are creating the index on
     // 4. sorter_cursor_id        - sorter
     // 5. pseudo_cursor_id        - pseudo table to store the sorted index values
-    let sqlite_table = resolver.schema().get_btree_table(SQLITE_TABLEID).unwrap();
+    let sqlite_table = resolver
+        .schema()
+        .get_btree_table(&Identifier::from(SQLITE_TABLEID))
+        .unwrap();
     let sqlite_schema_cursor_id =
         program.alloc_cursor_id(CursorType::BTreeTable(sqlite_table.clone()));
     let table_ref = program.table_reference_counter.next();
@@ -965,7 +967,10 @@ pub fn translate_drop_index(
     let row_id_reg = program.alloc_register();
 
     // We're going to use this cursor to search through sqlite_schema
-    let sqlite_table = resolver.schema().get_btree_table(SQLITE_TABLEID).unwrap();
+    let sqlite_table = resolver
+        .schema()
+        .get_btree_table(&Identifier::from(SQLITE_TABLEID))
+        .unwrap();
     let sqlite_schema_cursor_id =
         program.alloc_cursor_id(CursorType::BTreeTable(sqlite_table.clone()));
 
@@ -1124,6 +1129,7 @@ pub fn translate_optimize(
 
     if let Some(name) = idx_name {
         // Optimize a specific index
+        //TODO Identifier wtf
         let idx_name = name.name.as_str();
         let idx_id = Identifier::from(idx_name);
         let database_id = resolver.resolve_existing_index_database_id(&name)?;

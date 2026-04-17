@@ -27,6 +27,7 @@ use crate::translate::trigger_exec::has_triggers_including_temp;
 use crate::vdbe::builder::ProgramBuilder;
 use crate::{sync::Arc, Connection, Result};
 use turso_parser::ast::{ResolveType, TriggerEvent};
+use turso_parser::identifier::Identifier;
 
 /// Check whether any DDL-level constraint (IPK or index) uses REPLACE.
 pub(crate) fn any_index_or_ipk_has_replace(
@@ -59,7 +60,7 @@ fn table_has_fks(
     connection: &crate::Connection,
     resolver: &Resolver,
     database_id: usize,
-    table_name: &str,
+    table_name: &Identifier,
 ) -> bool {
     connection.foreign_keys_enabled()
         && (resolver.with_schema(database_id, |s| s.has_child_fks(table_name))
@@ -137,7 +138,7 @@ pub(crate) fn set_insert_stmt_journal_flags(
     has_unique: bool,
 ) {
     let index_modes: Vec<(Option<ResolveType>, bool)> = resolver.with_schema(database_id, |s| {
-        s.get_indices(table.name.as_str())
+        s.get_indices(&table.name)
             .map(|idx| (idx.on_conflict, idx.unique))
             .collect()
     });
@@ -203,7 +204,7 @@ pub(crate) fn set_update_stmt_journal_flags(
         Some(&updated_cols),
         &btree_table,
     );
-    let has_fks = table_has_fks(connection, resolver, database_id, btree_table.name.as_str());
+    let has_fks = table_has_fks(connection, resolver, database_id, &btree_table.name);
 
     let or_conflict = plan.or_conflict.unwrap_or(ResolveType::Abort);
     let has_statement_conflict = plan.or_conflict.is_some();
@@ -268,7 +269,7 @@ pub(crate) fn set_delete_stmt_journal_flags(
         return Ok(()); // Virtual table — keep conservative defaults.
     };
     let has_triggers = plan.safety.reasons.contains(&DmlSafetyReason::Trigger);
-    let has_fks = table_has_fks(connection, resolver, database_id, btree_table.name.as_str());
+    let has_fks = table_has_fks(connection, resolver, database_id, &btree_table.name);
 
     // After rowset rewriting (for triggers/safety), the target table op is reset to a
     // Scan, so affects_max_1_row correctly returns false — no false optimization.

@@ -85,6 +85,7 @@ fn emit_row_missing_from_index_error(
     row_number_reg: usize,
     scratch_reg: usize,
     message_reg: usize,
+    //TODO Identifier
     index_name: &str,
     remaining_errors_reg: usize,
     had_error_reg: usize,

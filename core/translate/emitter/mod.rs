@@ -449,9 +449,10 @@ impl<'a> Resolver<'a> {
     }
 
     fn schema_has_table_like_object(schema: &Schema, table_name: &str) -> bool {
-        schema.get_table(table_name).is_some()
-            || schema.get_view(table_name).is_some()
-            || schema.get_materialized_view(table_name).is_some()
+        let id = Identifier::from(table_name);
+        schema.get_table(&id).is_some()
+            || schema.get_view(&id).is_some()
+            || schema.get_materialized_view(&id).is_some()
     }
 
     fn schema_has_index(schema: &Schema, index_name: &str) -> bool {
@@ -463,7 +464,9 @@ impl<'a> Resolver<'a> {
     }
 
     fn schema_has_trigger(schema: &Schema, trigger_name: &str) -> bool {
-        schema.get_trigger(trigger_name).is_some()
+        schema
+            .get_trigger(&Identifier::from(trigger_name))
+            .is_some()
     }
 
     fn resolve_schema_table_database_id(table_name: &str) -> Option<usize> {
@@ -934,7 +937,7 @@ pub fn prepare_cdc_if_necessary(
     {
         return Ok(None);
     }
-    let Some(turso_cdc_table) = schema.get_table(cdc_table) else {
+    let Some(turso_cdc_table) = schema.get_table(&Identifier::from(cdc_table)) else {
         crate::bail_parse_error!("no such table: {}", cdc_table);
     };
     let Some(cdc_btree) = turso_cdc_table.btree() else {
@@ -1065,6 +1068,7 @@ pub fn emit_cdc_insns(
     before_record_reg: Option<usize>,
     after_record_reg: Option<usize>,
     updates_record_reg: Option<usize>,
+    //TODO Identifier
     table_name: &str,
 ) -> Result<()> {
     let cdc_info = program.capture_data_changes_info().as_ref();
@@ -1929,8 +1933,10 @@ pub(crate) fn emit_check_constraints<'a>(
     program: &mut ProgramBuilder,
     check_constraints: &[CheckConstraint],
     resolver: &mut Resolver,
+    //TODO Identifier
     table_name: &str,
     rowid_reg: usize,
+    //TODO Identifier
     column_mappings: impl Iterator<Item = (&'a str, usize)>,
     connection: &Arc<Connection>,
     or_conflict: ResolveType,

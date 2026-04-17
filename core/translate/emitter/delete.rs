@@ -36,6 +36,7 @@ use crate::{
 };
 use tracing::{instrument, Level};
 use turso_parser::ast::TriggerEvent;
+use turso_parser::identifier::Identifier;
 
 #[instrument(skip_all, level = Level::DEBUG)]
 pub fn emit_program_for_delete(
@@ -158,9 +159,7 @@ pub fn emit_program_for_delete(
 
             // Open all indexes for writing (needed for DELETE)
             let write_indices: Vec<_> = resolver.with_schema(table_ref.database_id, |s| {
-                s.get_indices(table_ref.table.get_name().as_str())
-                    .cloned()
-                    .collect()
+                s.get_indices(table_ref.table.get_name()).cloned().collect()
             });
             for index in &write_indices {
                 let index_cursor_id = program.alloc_cursor_index(
@@ -290,9 +289,9 @@ pub fn emit_fk_child_decrement_on_delete(
     database_id: usize,
     resolver: &Resolver,
 ) -> crate::Result<()> {
-    for fk_ref in
-        resolver.with_schema(database_id, |s| s.resolved_fks_for_child(child_table_name))?
-    {
+    for fk_ref in resolver.with_schema(database_id, |s| {
+        s.resolved_fks_for_child(&Identifier::from(child_table_name))
+    })? {
         if !fk_ref.fk.deferred {
             continue;
         }
@@ -321,7 +320,9 @@ pub fn emit_fk_child_decrement_on_delete(
         if fk_ref.parent_uses_rowid {
             // Probe parent table by rowid
             let parent_tbl = resolver
-                .with_schema(database_id, |s| s.get_btree_table(&fk_ref.fk.parent_table))
+                .with_schema(database_id, |s| {
+                    s.get_btree_table(&Identifier::from(fk_ref.fk.parent_table.as_str()))
+                })
                 .expect("parent btree");
             let pcur = open_read_table(program, &parent_tbl, database_id);
 
@@ -368,7 +369,9 @@ pub fn emit_fk_child_decrement_on_delete(
         } else {
             // Probe parent unique index
             let parent_tbl = resolver
-                .with_schema(database_id, |s| s.get_btree_table(&fk_ref.fk.parent_table))
+                .with_schema(database_id, |s| {
+                    s.get_btree_table(&Identifier::from(fk_ref.fk.parent_table.as_str()))
+                })
                 .expect("parent btree");
             let idx = fk_ref.parent_unique_index.as_ref().expect("unique index");
             let icur = open_read_index(program, idx, database_id);
@@ -627,17 +630,17 @@ fn emit_delete_row_common(
     returning_buffer: Option<&ReturningBufferCtx>,
 ) -> Result<()> {
     let internal_id = unsafe { (*table_reference).internal_id };
-    let table_name = unsafe { &*table_reference }.table.get_name().as_str();
+    let table_name_id = unsafe { &*table_reference }.table.get_name();
+    let table_name = table_name_id.as_str();
 
     // Phase 1: Before Delete - build parent key registers and handle NoAction/Restrict.
     // CASCADE/SetNull/SetDefault actions are prepared but deferred until after Delete.
     let prepared_fk_actions = if connection.foreign_keys_enabled() {
         let delete_db_id = unsafe { (*table_reference).database_id };
         if let Some(table) = unsafe { &*table_reference }.btree() {
-            let prepared = if t_ctx
-                .resolver
-                .with_schema(delete_db_id, |s| s.any_resolved_fks_referencing(table_name))
-            {
+            let prepared = if t_ctx.resolver.with_schema(delete_db_id, |s| {
+                s.any_resolved_fks_referencing(table_name_id)
+            }) {
                 ForeignKeyActions::prepare_fk_delete_actions(
                     program,
                     &mut t_ctx.resolver,
@@ -652,7 +655,7 @@ fn emit_delete_row_common(
             };
             if t_ctx
                 .resolver
-                .with_schema(delete_db_id, |s| s.has_child_fks(table_name))
+                .with_schema(delete_db_id, |s| s.has_child_fks(table_name_id))
             {
                 emit_fk_child_decrement_on_delete(
                     program,
@@ -687,7 +690,7 @@ fn emit_delete_row_common(
         let db_id = unsafe { (*table_reference).database_id };
         let all_indices: Vec<_> = t_ctx
             .resolver
-            .with_schema(db_id, |s| s.get_indices(table_name).cloned().collect());
+            .with_schema(db_id, |s| s.get_indices(table_name_id).cloned().collect());
 
         // Get indexes to delete from (skip the iteration index if specified)
         let indexes_to_delete = all_indices

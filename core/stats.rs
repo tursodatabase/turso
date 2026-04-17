@@ -109,7 +109,10 @@ pub fn refresh_analyze_stats(conn: &Arc<Connection>) {
 
     // Need a snapshot of the current schema to validate tables/indexes.
     let schema_snapshot = { conn.schema.read().clone() };
-    if schema_snapshot.get_btree_table(STATS_TABLE).is_none() {
+    if schema_snapshot
+        .get_btree_table(&Identifier::from(STATS_TABLE))
+        .is_none()
+    {
         return;
     }
 
@@ -142,7 +145,8 @@ fn load_sqlite_stat1_from_stmt(
         };
 
         // Skip if table is not a regular B-tree.
-        if schema.get_btree_table(table_name).is_none() {
+        let table_id = Identifier::from(table_name);
+        if schema.get_btree_table(&table_id).is_none() {
             return Ok(());
         }
         let Some(numbers) = parse_stat_numbers(stat) else {
@@ -160,7 +164,10 @@ fn load_sqlite_stat1_from_stmt(
 
         // Index-level entry: only keep if the index exists on this table.
         let idx_name = idx_name.unwrap();
-        if schema.get_index(table_name, idx_name).is_none() {
+        if schema
+            .get_index(&table_id, &Identifier::from(idx_name))
+            .is_none()
+        {
             return Ok(());
         }
 

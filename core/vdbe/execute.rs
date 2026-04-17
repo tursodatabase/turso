@@ -7120,7 +7120,7 @@ pub fn op_function(
                     };
                     let table = {
                         let schema = program.connection.schema.read();
-                        match schema.get_table(table.as_str()) {
+                        match schema.get_table(&Identifier::from(table.as_str())) {
                             Some(table) => table,
                             None => {
                                 return Err(LimboError::InvalidArgument(format!(
@@ -7906,6 +7906,7 @@ pub fn op_function(
 
             let (new_name, new_tbl_name, new_sql) = match alter_func {
                 AlterTableFunc::RenameTable => {
+                    //TODO Identifier
                     let rename_from = {
                         match &state.registers[*start_reg + 5].get_value() {
                             Value::Text(rename_from) => rename_from.to_string(),
@@ -7925,10 +7926,12 @@ pub fn op_function(
                         let autoindex_prefix = format!("sqlite_autoindex_{rename_from}_");
                         if name.len() > autoindex_prefix.len()
                             && name[..autoindex_prefix.len()]
+                                //TODO Identifier
                                 .eq_ignore_ascii_case(&autoindex_prefix)
                         {
                             let suffix = &name[autoindex_prefix.len()..];
                             format!("sqlite_autoindex_{rename_to}_{suffix}")
+                        //TODO Identifier
                         } else if name.eq_ignore_ascii_case(&rename_from) {
                             rename_to.clone()
                         } else {
@@ -7936,6 +7939,7 @@ pub fn op_function(
                         }
                     };
 
+                    //TODO Identifier
                     let new_tbl_name = if tbl_name.eq_ignore_ascii_case(&rename_from) {
                         rename_to.clone()
                     } else {
@@ -7968,6 +7972,7 @@ pub fn op_function(
                                 using,
                                 with_clause,
                             } => {
+                                //TODO Identifier
                                 if !tbl_name.as_str().eq_ignore_ascii_case(&rename_from) {
                                     break 'sql None;
                                 }
@@ -8231,6 +8236,7 @@ pub fn op_function(
                                 using,
                                 with_clause,
                             } => {
+                                //TODO Identifier
                                 if !tbl_name.as_str().eq_ignore_ascii_case(&table) {
                                     break 'sql None;
                                 }
@@ -8238,6 +8244,7 @@ pub fn op_function(
                                 for column in &mut columns {
                                     match column.expr.as_mut() {
                                         ast::Expr::Id(id)
+                                        //TODO Identifier
                                             if id.as_str().eq_ignore_ascii_case(&rename_from) =>
                                         {
                                             *id = Name::exact(
@@ -8292,6 +8299,7 @@ pub fn op_function(
                                     // This is the table being altered - update its column
                                     let Some(column) = columns
                                         .iter_mut()
+                                        //TODO Identifier
                                         .find(|column| column.col_name == rename_from.as_str())
                                     else {
                                         // MVCC/temp-schema rewrite can reach an already-updated
@@ -8321,6 +8329,7 @@ pub fn op_function(
                                                     else {
                                                         return Err(LimboError::ParseError("Unexpected expression in PRIMARY KEY constraint".to_string()));
                                                     };
+                                                    //TODO Identifier
                                                     if *name == rename_from.as_str() {
                                                         *col.expr = ast::Expr::Name(Name::exact(
                                                             column_def.col_name.as_str().to_owned(),
@@ -8338,6 +8347,7 @@ pub fn op_function(
                                                     else {
                                                         return Err(LimboError::ParseError("Unexpected expression in UNIQUE constraint".to_string()));
                                                     };
+                                                    //TODO Identifier
                                                     if *name == rename_from.as_str() {
                                                         *col.expr = ast::Expr::Name(Name::exact(
                                                             column_def.col_name.as_str().to_owned(),
@@ -8352,6 +8362,7 @@ pub fn op_function(
                                             } => {
                                                 // Update child columns in this table's FK definitions
                                                 for child_col in child_cols {
+                                                    //TODO Identifier
                                                     if child_col.col_name == rename_from.as_str() {
                                                         child_col.col_name = Name::exact(
                                                             column_def.col_name.as_str().to_owned(),
@@ -8400,9 +8411,11 @@ pub fn op_function(
                                         } = &mut constraint.constraint
                                         {
                                             // Check if this FK references the table being altered
+                                            //TODO Identifier
                                             if tbl_name == table.as_str() {
                                                 // Update parent column references if they match the renamed column
                                                 for parent_col in parent_cols {
+                                                    //TODO Identifier
                                                     if parent_col.col_name == rename_from.as_str() {
                                                         parent_col.col_name = Name::exact(
                                                             column_def.col_name.as_str().to_owned(),
@@ -8783,6 +8796,7 @@ pub fn op_insert(
         },
         insn
     );
+    let table_id = Identifier::from(table_name.as_str());
 
     loop {
         match &state.op_insert_state.sub_state {
@@ -8790,7 +8804,7 @@ pub fn op_insert(
                 let has_dependent_views = {
                     let schema = program.connection.schema.read();
                     !schema
-                        .get_dependent_materialized_views(table_name)
+                        .get_dependent_materialized_views(&table_id)
                         .is_empty()
                 };
                 // If there are no dependent views, we don't need to capture the old record.
@@ -8827,7 +8841,7 @@ pub fn op_insert(
                 let has_dependent_views = {
                     let schema = program.connection.schema.read();
                     !schema
-                        .get_dependent_materialized_views(table_name)
+                        .get_dependent_materialized_views(&table_id)
                         .is_empty()
                 };
                 let needs_capture =
@@ -8854,7 +8868,7 @@ pub fn op_insert(
                         if let Some(record) = maybe_record {
                             let mut values = record.get_values_owned()?;
                             let schema = program.connection.schema.read();
-                            if let Some(table) = schema.get_table(table_name) {
+                            if let Some(table) = schema.get_table(&table_id) {
                                 for (i, col) in table.columns().iter().enumerate() {
                                     if col.is_rowid_alias() && i < values.len() {
                                         values[i] = Value::from_i64(key);
@@ -8984,7 +8998,7 @@ pub fn op_insert(
                         .fetch_add(1, crate::sync::atomic::Ordering::SeqCst);
                 }
                 let schema = program.connection.schema.read();
-                let dependent_views = schema.get_dependent_materialized_views(table_name);
+                let dependent_views = schema.get_dependent_materialized_views(&table_id);
                 if !dependent_views.is_empty() {
                     state.op_insert_state.sub_state = OpInsertSubState::ApplyViewChange;
                     continue;
@@ -8993,7 +9007,7 @@ pub fn op_insert(
             }
             OpInsertSubState::ApplyViewChange => {
                 let schema = program.connection.schema.read();
-                let dependent_views = schema.get_dependent_materialized_views(table_name);
+                let dependent_views = schema.get_dependent_materialized_views(&table_id);
                 assert!(!dependent_views.is_empty());
 
                 let (key, values) = {
@@ -9019,7 +9033,7 @@ pub fn op_insert(
 
                     // Fix rowid alias columns: replace Null with actual rowid value
                     let schema = program.connection.schema.read();
-                    if let Some(table) = schema.get_table(table_name) {
+                    if let Some(table) = schema.get_table(&table_id) {
                         for (i, col) in table.columns().iter().enumerate() {
                             if col.is_rowid_alias() && i < new_values.len() {
                                 new_values[i] = Value::from_i64(key);
@@ -9107,12 +9121,13 @@ pub fn op_delete(
         },
         insn
     );
+    let table_id = Identifier::from(table_name.as_str());
 
     loop {
         match &state.op_delete_state.sub_state {
             OpDeleteSubState::MaybeCaptureRecord => {
                 let schema = program.connection.schema.read();
-                let dependent_views = schema.get_dependent_materialized_views(table_name);
+                let dependent_views = schema.get_dependent_materialized_views(&table_id);
                 if dependent_views.is_empty() {
                     state.op_delete_state.sub_state = OpDeleteSubState::Delete;
                     continue;
@@ -9132,7 +9147,7 @@ pub fn op_delete(
                         let mut values = record.get_values_owned()?;
 
                         // Fix rowid alias columns: replace Null with actual rowid value
-                        if let Some(table) = schema.get_table(table_name) {
+                        if let Some(table) = schema.get_table(&table_id) {
                             for (i, col) in table.columns().iter().enumerate() {
                                 if col.is_rowid_alias() && i < values.len() {
                                     values[i] = Value::from_i64(key);
@@ -9157,7 +9172,7 @@ pub fn op_delete(
                 // Increment metrics for row write (DELETE is a write operation)
                 state.record_rows_written(1);
                 let schema = program.connection.schema.read();
-                let dependent_views = schema.get_dependent_materialized_views(table_name);
+                let dependent_views = schema.get_dependent_materialized_views(&table_id);
                 if dependent_views.is_empty() {
                     break;
                 }
@@ -9166,7 +9181,7 @@ pub fn op_delete(
             }
             OpDeleteSubState::ApplyViewChange => {
                 let schema = program.connection.schema.read();
-                let dependent_views = schema.get_dependent_materialized_views(table_name);
+                let dependent_views = schema.get_dependent_materialized_views(&table_id);
                 assert!(!dependent_views.is_empty());
                 let maybe_deleted_record = state.op_delete_state.deleted_record.take();
                 if let Some((key, values)) = maybe_deleted_record {
@@ -10387,6 +10402,7 @@ pub fn op_drop_table(
     load_insn!(DropTable { db, table_name, .. }, insn);
     let conn = program.connection.clone();
     let is_mvcc = conn.mv_store_for_db(*db).is_some();
+    let table_id = Identifier::from(table_name.as_str());
     {
         conn.with_database_schema_mut(*db, |schema| {
             // In MVCC mode, track dropped root pages so integrity_check knows about them.
@@ -10394,7 +10410,7 @@ pub fn op_drop_table(
             // to include them to avoid "page never used" false positives.
             if is_mvcc {
                 let table = schema
-                    .get_table(table_name)
+                    .get_table(&table_id)
                     .expect("DROP TABLE: table must exist in schema");
                 if let Some(btree) = table.btree() {
                     // Only track positive root pages (checkpointed tables).
@@ -10404,7 +10420,7 @@ pub fn op_drop_table(
                     }
                 }
                 // Capture index root pages (table may not have indexes)
-                if let Some(indexes) = schema.indexes.get(&Identifier::from(table_name.as_str())) {
+                if let Some(indexes) = schema.indexes.get(&table_id) {
                     for index in indexes.iter() {
                         if index.root_page > 0 {
                             schema.dropped_root_pages.insert(index.root_page);
@@ -10412,9 +10428,9 @@ pub fn op_drop_table(
                     }
                 }
             }
-            schema.remove_indices_for_table(table_name);
-            schema.remove_triggers_for_table(table_name);
-            schema.remove_table(table_name);
+            schema.remove_indices_for_table(&table_id);
+            schema.remove_triggers_for_table(&table_id);
+            schema.remove_table(&table_id);
         });
         // SQLite also removes temp triggers that target the dropped table.
         // Only needed when dropping from a non-temp database. We must
@@ -10424,7 +10440,7 @@ pub fn op_drop_table(
         if *db != crate::TEMP_DB_ID && conn.temp.database.read().is_some() {
             let dropped_db = *db;
             conn.with_database_schema_mut(crate::TEMP_DB_ID, |temp_schema| {
-                temp_schema.remove_triggers_for_table_with_db(table_name, dropped_db);
+                temp_schema.remove_triggers_for_table_with_db(&table_id, dropped_db);
             });
         }
     }
@@ -10440,8 +10456,9 @@ pub fn op_drop_view(
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(DropView { db, view_name }, insn);
     let conn = program.connection.clone();
+    let view_id = Identifier::from(view_name.as_str());
     conn.with_database_schema_mut(*db, |schema| {
-        schema.remove_view(view_name).ok();
+        schema.remove_view(&view_id).ok();
     });
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
@@ -10456,7 +10473,7 @@ pub fn op_drop_type(
     load_insn!(DropType { db, type_name }, insn);
     let conn = program.connection.clone();
     conn.with_database_schema_mut(*db, |schema| {
-        schema.remove_type(type_name);
+        schema.remove_type(type_name.as_str());
         Ok::<(), crate::LimboError>(())
     })?;
     state.pc += 1;
@@ -10483,10 +10500,11 @@ pub fn op_drop_trigger(
     _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(DropTrigger { db, trigger_name }, insn);
+    let trigger_id = Identifier::from(trigger_name.as_str());
 
     let conn = program.connection.clone();
     conn.with_database_schema_mut(*db, |schema| {
-        schema.remove_trigger(trigger_name).ok();
+        schema.remove_trigger(&trigger_id).ok();
     });
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
@@ -11000,7 +11018,7 @@ pub fn op_populate_materialized_views(
     // Now populate the views (after releasing the schema borrow)
     for (view_name, _root_page, cursor_id) in view_info {
         let schema = conn.schema.read();
-        if let Some(view) = schema.get_materialized_view(&view_name) {
+        if let Some(view) = schema.get_materialized_view(&Identifier::from(view_name.as_str())) {
             let mut view = view.lock();
             // Drop the schema borrow before calling populate_from_table
             drop(schema);
@@ -12099,6 +12117,7 @@ fn with_relevant_trigger_schemas_mut(
     Ok(())
 }
 
+//TODO Identifier
 fn rewrite_trigger_for_table_rename(trigger: &mut crate::schema::Trigger, from: &str, to: &str) {
     let old_sql = trigger.sql.clone();
     for cmd in &mut trigger.commands {
@@ -12215,6 +12234,7 @@ pub fn op_rename_table(
             if let Table::BTree(ref mut child_btree_arc) = Arc::make_mut(t_arc) {
                 let child_btree = Arc::make_mut(child_btree_arc);
                 for fk_arc in &mut child_btree.foreign_keys {
+                    //TODO Identifier
                     if from_ident == fk_arc.parent_table.as_str() {
                         let fk = Arc::make_mut(fk_arc);
                         fk.parent_table.clone_from(to);
@@ -12437,6 +12457,7 @@ pub fn op_alter_column(
     load_insn!(
         AlterColumn {
             db,
+            //TODO Identifier
             table: table_name,
             column_index,
             definition,
@@ -14391,6 +14412,7 @@ fn op_vacuum_into_inner(
                 // Capture source custom type definitions so that STRICT tables with
                 // custom type columns can resolve those types during CREATE TABLE
                 // replay on the destination.
+                //TODO Identifier?
                 let source_custom_types: Vec<(String, Arc<crate::schema::TypeDef>)> = program
                     .connection
                     .with_schema(database_id, |source_schema| {

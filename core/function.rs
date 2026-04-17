@@ -1181,6 +1181,7 @@ impl Func {
     pub fn needs_star_expansion(&self) -> bool {
         false
     }
+    //TODO Identifier
     pub fn resolve_function(name: &str, arg_count: usize) -> Result<Option<Self>, LimboError> {
         let normalized_name = name.to_ascii_lowercase();
         match normalized_name.as_str() {

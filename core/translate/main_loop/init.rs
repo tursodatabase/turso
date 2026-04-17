@@ -174,9 +174,7 @@ impl InitLoop {
                         }
                         // For delete, we need to open all the other indexes too for writing
                         let indices: Vec<_> = t_ctx.resolver.with_schema(table.database_id, |s| {
-                            s.get_indices(table.table.get_name().as_str())
-                                .cloned()
-                                .collect()
+                            s.get_indices(table.table.get_name()).cloned().collect()
                         });
                         for index in &indices {
                             if table
@@ -292,9 +290,7 @@ impl InitLoop {
                             if matches!(mode, OperationMode::DELETE) {
                                 let indices: Vec<_> =
                                     t_ctx.resolver.with_schema(table.database_id, |s| {
-                                        s.get_indices(table.table.get_name().as_str())
-                                            .cloned()
-                                            .collect()
+                                        s.get_indices(table.table.get_name()).cloned().collect()
                                     });
                                 for index in &indices {
                                     if table
@@ -395,9 +391,7 @@ impl InitLoop {
                             db: table.database_id,
                         });
                         let indices: Vec<_> = t_ctx.resolver.with_schema(table.database_id, |s| {
-                            s.get_indices(table.table.get_name().as_str())
-                                .cloned()
-                                .collect()
+                            s.get_indices(table.table.get_name()).cloned().collect()
                         });
                         for index in &indices {
                             if table

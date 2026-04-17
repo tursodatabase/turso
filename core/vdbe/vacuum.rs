@@ -330,6 +330,7 @@ fn vacuum_into_step(
                         for (name, td) in &config.source_custom_types {
                             dest_schema
                                 .type_registry
+                                //TODO Identifier wtf
                                 .insert(Identifier::from(name.as_str()), td.clone());
                         }
                     });
@@ -397,7 +398,10 @@ fn vacuum_into_step(
                                     .source_conn
                                     .with_schema(config.database_id, |schema| {
                                         schema
-                                            .get_index(&entry.tbl_name, &entry.name)
+                                            .get_index(
+                                                &Identifier::from(entry.tbl_name.as_str()),
+                                                &Identifier::from(entry.name.as_str()),
+                                            )
                                             .is_some_and(|idx| idx.is_backing_btree_index())
                                     })
                             })
@@ -510,7 +514,9 @@ fn vacuum_into_step(
                         .dest_conn
                         .schema
                         .read()
-                        .get_btree_table(crate::schema::SQLITE_SEQUENCE_TABLE_NAME)
+                        .get_btree_table(&Identifier::from(
+                            crate::schema::SQLITE_SEQUENCE_TABLE_NAME,
+                        ))
                         .is_some();
                     if !dest_has_sequence {
                         state.sub_state = VacuumIntoSubState::StartCopyTable {
@@ -527,7 +533,7 @@ fn vacuum_into_step(
                 let source_btree_table = config
                     .source_conn
                     .with_schema(config.database_id, |schema| {
-                        schema.get_btree_table(table_name)
+                        schema.get_btree_table(&Identifier::from(table_name.as_str()))
                     });
 
                 let (select_sql, insert_sql) = build_copy_sql(

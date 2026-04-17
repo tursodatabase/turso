@@ -2,6 +2,7 @@ use std::sync::Arc;
 
 use rustc_hash::FxHashMap as HashMap;
 use turso_parser::ast;
+use turso_parser::identifier::Identifier;
 
 use crate::{
     schema::IndexColumn,
@@ -32,12 +33,15 @@ pub trait IndexMethod: std::fmt::Debug + Send + Sync {
 #[derive(Debug, Clone)]
 pub struct IndexMethodConfiguration {
     /// table name for which index_method is defined
+    //TODO Identifier
     pub table_name: String,
     /// index name
+    //TODO Identifier
     pub index_name: String,
     /// columns c1, c2, c3, ... provided to the index method (e.g. create index t_idx on t using method (c1, c2, c3, ...))
     pub columns: Vec<IndexColumn>,
     /// optional parameters provided to the index method through WITH clause
+    //TODO Identifier?
     pub parameters: HashMap<String, Value>,
 }
 
@@ -175,7 +179,7 @@ pub trait IndexMethodCursor {
 pub(crate) fn open_table_cursor(
     connection: &Connection,
     database_id: usize,
-    table: &str,
+    table: &Identifier,
 ) -> Result<BTreeCursor> {
     let pager = connection.get_pager_from_database_index(&database_id);
     let Some(table) = connection.with_schema(database_id, |schema| schema.get_table(table)) else {
@@ -191,8 +195,8 @@ pub(crate) fn open_table_cursor(
 pub(crate) fn open_index_cursor(
     connection: &Connection,
     database_id: usize,
-    table: &str,
-    index: &str,
+    table: &Identifier,
+    index: &Identifier,
     keys: Vec<KeyInfo>,
 ) -> Result<BTreeCursor> {
     let pager = connection.get_pager_from_database_index(&database_id);

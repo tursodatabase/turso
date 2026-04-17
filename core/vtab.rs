@@ -153,6 +153,7 @@ impl VirtualTable {
         ]
     }
 
+    //TODO Identifier
     pub(crate) fn function(name: &str, syms: &SymbolTable) -> crate::Result<Arc<VirtualTable>> {
         let module = syms.vtab_modules.get(name);
         let (vtab_type, schema) = if module.is_some() {
@@ -176,7 +177,9 @@ impl VirtualTable {
     }
 
     pub fn table(
+        //TODO Identifier
         tbl_name: Option<&str>,
+        //TODO Identifier
         module_name: &str,
         args: Vec<turso_ext::Value>,
         syms: &SymbolTable,

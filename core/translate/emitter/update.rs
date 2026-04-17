@@ -315,9 +315,10 @@ pub fn emit_program_for_update(
         plan.indexes_to_update.iter().map(|idx| idx.on_conflict),
     );
     let all_index_cursors = if any_replace {
-        let table_name = target_table.table.get_name().as_str();
         let all_indexes: Vec<_> = resolver.with_schema(target_database_id, |s| {
-            s.get_indices(table_name).cloned().collect()
+            s.get_indices(target_table.table.get_name())
+                .cloned()
+                .collect()
         });
         let source_table = plan
             .table_references
@@ -1024,7 +1025,8 @@ fn emit_update_insns<'a>(
     } else {
         None
     };
-    let table_name = target_table.table.get_name().as_str();
+    let table_name_id = target_table.table.get_name();
+    let table_name = table_name_id.as_str();
     let start = if is_virtual_table { beg + 2 } else { beg + 1 };
     let layout = ColumnLayout::from_table(&target_table.as_ref().table);
     let skip_set_clauses = false;
@@ -1103,7 +1105,7 @@ fn emit_update_insns<'a>(
 
         let has_fk_cascade = connection.foreign_keys_enabled()
             && t_ctx.resolver.with_schema(update_database_id, |s| {
-                s.any_resolved_fks_referencing(table_name)
+                s.any_resolved_fks_referencing(table_name_id)
             });
 
         has_before_triggers = !relevant_before_update_triggers.is_empty();
@@ -1301,7 +1303,7 @@ fn emit_update_insns<'a>(
             // This checks that no child rows reference the old parent key values.
             // CASCADE/SET NULL actions are fired AFTER the update (see below after Insert).
             if t_ctx.resolver.with_schema(update_database_id, |s| {
-                s.any_resolved_fks_referencing(table_name)
+                s.any_resolved_fks_referencing(table_name_id)
             }) {
                 let new_key_probe_mode = if any_effective_replace(
                     program.has_statement_conflict,
@@ -1569,7 +1571,11 @@ fn emit_update_insns<'a>(
     // being probed against the parent's index are encoded (matching the index contents).
     if connection.foreign_keys_enabled() {
         if let Some(table_btree) = target_table.table.btree() {
-            if t_ctx.resolver.schema().has_child_fks(table_name) {
+            if t_ctx
+                .resolver
+                .schema()
+                .has_child_fks(&Identifier::from(table_name))
+            {
                 let rowid_new_reg = rowid_set_clause_reg.unwrap_or(beg);
                 let directly_and_indirectly_updated_columns: ColumnMask = set_clauses
                     .iter()
@@ -1810,7 +1816,7 @@ fn emit_update_insns<'a>(
                     // CASCADE/SetNull/SetDefault actions are prepared but deferred until after Delete.
                     let prepared_fk_actions = if connection.foreign_keys_enabled() {
                         let prepared = if t_ctx.resolver.with_schema(update_database_id, |s| {
-                            s.any_resolved_fks_referencing(table_name)
+                            s.any_resolved_fks_referencing(table_name_id)
                         }) {
                             ForeignKeyActions::prepare_fk_delete_actions(
                                 program,
@@ -1826,7 +1832,7 @@ fn emit_update_insns<'a>(
                         };
                         if t_ctx
                             .resolver
-                            .with_schema(update_database_id, |s| s.has_child_fks(table_name))
+                            .with_schema(update_database_id, |s| s.has_child_fks(table_name_id))
                         {
                             emit_fk_child_decrement_on_delete(
                                 program,
@@ -1986,7 +1992,7 @@ fn emit_update_insns<'a>(
         // Before Delete - prepare FK cascade actions for implicitly-deleted row.
         let prepared_fk_actions = if connection.foreign_keys_enabled() {
             let prepared = if t_ctx.resolver.with_schema(update_database_id, |s| {
-                s.any_resolved_fks_referencing(table_name)
+                s.any_resolved_fks_referencing(table_name_id)
             }) {
                 ForeignKeyActions::prepare_fk_delete_actions(
                     program,
@@ -2002,7 +2008,7 @@ fn emit_update_insns<'a>(
             };
             if t_ctx
                 .resolver
-                .with_schema(update_database_id, |s| s.has_child_fks(table_name))
+                .with_schema(update_database_id, |s| s.has_child_fks(table_name_id))
             {
                 emit_fk_child_decrement_on_delete(
                     program,
@@ -2239,7 +2245,7 @@ fn emit_update_insns<'a>(
             // This ensures the new parent key exists when cascade actions update child rows
             if connection.foreign_keys_enabled()
                 && t_ctx.resolver.with_schema(update_database_id, |s| {
-                    s.any_resolved_fks_referencing(table_name)
+                    s.any_resolved_fks_referencing(table_name_id)
                 })
             {
                 let new_rowid_reg = rowid_set_clause_reg.unwrap_or(beg);

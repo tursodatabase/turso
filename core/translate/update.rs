@@ -184,12 +184,13 @@ fn validate_update(
         bail_parse_error!("ORDER BY is not supported in UPDATE");
     }
     // Check if this is a materialized view
-    if schema.is_materialized_view(table_name) {
+    let table_name_id = Identifier::from(table_name);
+    if schema.is_materialized_view(&table_name_id) {
         bail_parse_error!("cannot modify materialized view {}", table_name);
     }
 
     // Check if this table has any incompatible dependent views
-    let incompatible_views = schema.has_incompatible_dependent_views(table_name);
+    let incompatible_views = schema.has_incompatible_dependent_views(&table_name_id);
     if !incompatible_views.is_empty() {
         use crate::incremental::compiler::DBSP_CIRCUIT_VERSION;
         bail_parse_error!(
@@ -214,7 +215,7 @@ pub fn prepare_update_plan(
     let database_id = resolver.resolve_existing_table_database_id_qualified(&body.tbl_name)?;
     let schema = resolver.schema();
     let table_name = &body.tbl_name.name;
-    let table = match resolver.with_schema(database_id, |s| s.get_table(table_name.as_str())) {
+    let table = match resolver.with_schema(database_id, |s| s.get_table(table_name.identifier())) {
         Some(table) => table,
         None => bail_parse_error!("Parse error: no such table: {}", table_name),
     };
@@ -239,6 +240,7 @@ pub fn prepare_update_plan(
     let or_conflict = body.or_conflict.take();
     let indexed = body.indexed.take();
 
+    //TODO Identifier wtf
     let table_name = table.get_name().as_str();
     let iter_dir = body
         .order_by
@@ -282,6 +284,7 @@ pub fn prepare_update_plan(
         .filter_map(|(i, col)| {
             col.name
                 .as_ref()
+                //TODO Identifier wtf
                 .map(|name| (Identifier::from(name.as_str()), i))
         })
         .collect();
@@ -440,7 +443,7 @@ pub fn prepare_update_plan(
 
     // Determine which indexes need updating
     let indexes: Vec<_> = resolver.with_schema(database_id, |s| {
-        s.get_indices(table_name).cloned().collect()
+        s.get_indices(table.get_name()).cloned().collect()
     });
     let target_table_ref = table_references
         .joined_tables()

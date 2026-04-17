@@ -143,8 +143,9 @@ pub fn prepare_delete_plan(
     database_id: usize,
 ) -> Result<Plan> {
     let table_name = tbl_name.name.as_str();
+    let table_name_id = tbl_name.name.identifier().clone();
     let schema = resolver.schema();
-    let table = match resolver.with_schema(database_id, |s| s.get_table(table_name)) {
+    let table = match resolver.with_schema(database_id, |s| s.get_table(&table_name_id)) {
         Some(table) => table,
         None => crate::bail_parse_error!("no such table: {}", table_name),
     };
@@ -153,12 +154,12 @@ pub fn prepare_delete_plan(
     }
 
     // Check if this is a materialized view
-    if schema.is_materialized_view(table_name) {
+    if schema.is_materialized_view(&table_name_id) {
         crate::bail_parse_error!("cannot modify materialized view {}", table_name);
     }
 
     // Check if this table has any incompatible dependent views
-    let incompatible_views = schema.has_incompatible_dependent_views(table_name);
+    let incompatible_views = schema.has_incompatible_dependent_views(&table_name_id);
     if !incompatible_views.is_empty() {
         use crate::incremental::compiler::DBSP_CIRCUIT_VERSION;
         crate::bail_parse_error!(
@@ -180,10 +181,7 @@ pub fn prepare_delete_plan(
     } else {
         crate::bail_parse_error!("Table is neither a virtual table nor a btree table");
     };
-    let indexes = schema
-        .get_indices(table.get_name().as_str())
-        .cloned()
-        .collect();
+    let indexes = schema.get_indices(table.get_name()).cloned().collect();
     let joined_tables = vec![JoinedTable {
         op: Operation::default_scan_for(&table),
         table,

@@ -89,6 +89,7 @@ fn collect_from_one_select(one: &ast::OneSelect, out: &mut Vec<String>) {
     }
 }
 
+//TODO Identifier
 fn collect_from_select_table(table: &ast::SelectTable, out: &mut Vec<String>) {
     match table {
         ast::SelectTable::Table(qualified_name, _, _)
@@ -605,12 +606,14 @@ pub fn plan_ctes_as_outer_refs(
     }
 
     for cte in with.ctes {
+        //TODO Identifier
         let explicit_columns: Vec<String> = cte
             .columns
             .iter()
             .map(|c| c.col_name.as_str().to_owned())
             .collect();
 
+        //TODO clone is redundant
         let cte_name = cte.tbl_name.identifier().clone();
 
         // Check for duplicate CTE names
@@ -817,6 +820,7 @@ fn parse_table(
 ) -> Result<()> {
     let database_id = resolver.resolve_existing_table_database_id_qualified(qualified_name)?;
     let table_name = &qualified_name.name;
+    //TODO Identifier redundant? and renamd?
     let qualified_name_str = table_name.identifier().clone();
 
     // Check if the FROM clause table is referring to a CTE in the current scope.
@@ -948,7 +952,9 @@ fn parse_table(
     }
 
     // Resolve table using connection's with_schema method
-    let table = resolver.with_schema(database_id, |schema| schema.get_table(table_name.as_str()));
+    let table = resolver.with_schema(database_id, |schema| {
+        schema.get_table(table_name.identifier())
+    });
 
     if let Some(table) = table {
         let alias = maybe_alias.map(|a| Identifier::from(a.name().as_str()));
@@ -978,8 +984,9 @@ fn parse_table(
         return Ok(());
     };
 
-    let regular_view =
-        resolver.with_schema(database_id, |schema| schema.get_view(table_name.as_str()));
+    let regular_view = resolver.with_schema(database_id, |schema| {
+        schema.get_view(table_name.identifier())
+    });
     if let Some(view) = regular_view {
         // Views are essentially query aliases, so just Expand the view as a subquery
         view.process()?;
@@ -1024,12 +1031,12 @@ fn parse_table(
     }
 
     let view = resolver.with_schema(database_id, |schema| {
-        schema.get_materialized_view(table_name.as_str())
+        schema.get_materialized_view(table_name.identifier())
     });
     if let Some(view) = view {
         // First check if the DBSP state table exists with the correct version
         let has_compatible_state = resolver.with_schema(database_id, |schema| {
-            schema.has_compatible_dbsp_state_table(table_name.as_str())
+            schema.has_compatible_dbsp_state_table(table_name.identifier())
         });
 
         if !has_compatible_state {

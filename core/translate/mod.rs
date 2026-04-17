@@ -439,7 +439,7 @@ mod tests {
 
         let mut schema = db.schema.lock().as_ref().clone();
         let seq_root_page = schema
-            .get_btree_table(SQLITE_SEQUENCE_TABLE_NAME)
+            .get_btree_table(&Identifier::from(SQLITE_SEQUENCE_TABLE_NAME))
             .expect("sqlite_sequence should exist after creating AUTOINCREMENT table")
             .root_page;
         let malformed_seq =

@@ -80,6 +80,7 @@ impl TursoTypesCursor {
             let mut names: Vec<_> = schema
                 .type_registry
                 .iter()
+                //TODO Identifier
                 .filter(|(key, td)| key.as_str() == td.name.to_lowercase())
                 .map(|(key, _)| key.clone())
                 .collect();

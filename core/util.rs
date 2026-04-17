@@ -140,6 +140,7 @@ pub const PRIMARY_KEY_AUTOMATIC_INDEX_NAME_PREFIX: &str = "sqlite_autoindex_";
 ///
 /// CREATE INDEX idx ON table_name(sql)
 pub struct UnparsedFromSqlIndex {
+    //TODO Identifier
     pub table_name: String,
     pub root_page: i64,
     pub sql: String,
@@ -1848,7 +1849,9 @@ pub fn extract_view_columns(
                 ast::ResultColumn::Star => {
                     // For SELECT *, expand to all columns from all tables
                     for (table_idx, table) in tables.iter().enumerate() {
-                        if let Some(table_obj) = schema.get_table(&table.name) {
+                        if let Some(table_obj) =
+                            schema.get_table(&Identifier::from(table.name.as_str()))
+                        {
                             for table_column in table_obj.columns() {
                                 let col_name =
                                     table_column.name.clone().unwrap_or_else(|| "?".to_string());
@@ -1894,7 +1897,9 @@ pub fn extract_view_columns(
                 ast::ResultColumn::TableStar(table_ref) => {
                     // For table.*, expand to all columns from the specified table
                     if let Some(table_idx) = find_table_index(table_ref.as_str()) {
-                        if let Some(table) = schema.get_table(&tables[table_idx].name) {
+                        if let Some(table) =
+                            schema.get_table(&Identifier::from(tables[table_idx].name.as_str()))
+                        {
                             for table_column in table.columns() {
                                 let col_name =
                                     table_column.name.clone().unwrap_or_else(|| "?".to_string());
@@ -2047,11 +2052,16 @@ pub fn rename_identifiers_scoped_when_clause(
 /// are renamed — used when the enclosing SELECT's FROM clause does NOT reference the target table.
 fn rename_identifiers_scoped_inner(
     expr: &mut ast::Expr,
+    //TODO Identifier
     target_table: &str,
+    //TODO Identifier
     trigger_table: &str,
+    //TODO Identifier
     from: &str,
+    //TODO Identifier
     to: &str,
     rename_unqualified: bool,
+    //TODO Identifier
     target_qualifiers: Option<&[String]>,
 ) {
     let is_renaming_trigger_table = target_table.eq_ignore_ascii_case(trigger_table);
@@ -2144,9 +2154,13 @@ mod rename_column_view {
     fn rewrite_view_sql_for_column_rename_inner(
         view_sql: &str,
         schema: &Schema,
+        //TODO Identifier
         target_table: &str,
+        //TODO Identifier
         target_db_name: &str,
+        //TODO Identifier
         old_column: &str,
+        //TODO Identifier
         new_column: &str,
         visiting_views: &mut HashSet<Identifier>,
     ) -> Result<Option<RewrittenView>> {
@@ -2279,6 +2293,7 @@ mod rename_column_view {
     struct ViewSourceInfo {
         qualifiers: Vec<Identifier>,
         columns_before: HashSet<Identifier>,
+        //TODO Identifier
         rename_map: HashMap<Identifier, String>,
         is_target_table: bool,
         db_name: Option<Identifier>,
@@ -2302,18 +2317,26 @@ mod rename_column_view {
 
     struct ViewRewriteCtx<'a> {
         schema: &'a Schema,
+        //TODO Identifier
         target_table: &'a str,
+        //TODO Identifier
         target_db: &'a str,
+        //TODO Identifier
         old_column: &'a str,
+        //TODO Identifier
         new_column: &'a str,
     }
 
     impl<'a> ViewRewriteCtx<'a> {
         fn new(
             schema: &'a Schema,
+            //TODO Identifier
             target_table: &'a str,
+            //TODO Identifier
             target_db: &'a str,
+            //TODO Identifier
             old_column: &'a str,
+            //TODO Identifier
             new_column: &'a str,
         ) -> Self {
             Self {
@@ -2821,8 +2844,11 @@ mod rename_column_view {
         expr: &mut ast::Expr,
         sources: &[ViewSourceInfo],
         outer_scopes: &[&[ViewSourceInfo]],
+        //TODO Identifier
         target_db: &str,
+        //TODO Identifier
         old_column: &str,
+        //TODO Identifier
         new_column: &str,
     ) -> bool {
         let old_col_ident = Identifier::from(old_column);
@@ -2843,6 +2869,7 @@ mod rename_column_view {
                 if *col != old_column {
                     return false;
                 }
+                //TODO Identifier wtf
                 let ns_ident = Identifier::from(ns.as_str());
                 let target_db_ident = Identifier::from(target_db);
                 let (source, local_ambiguous) =
@@ -2874,7 +2901,9 @@ mod rename_column_view {
                 if *col != old_column {
                     return false;
                 }
+                //TODO Identifier wtf
                 let ns_ident = Identifier::from(ns.as_str());
+                //TODO Identifier wtf
                 let schema_ident = Identifier::from(schema.as_str());
                 let (source, local_ambiguous) =
                     resolve_qualified(sources, &ns_ident, &schema_ident);
@@ -3062,9 +3091,13 @@ mod rename_column_view {
     }
 
     fn build_rename_map(
+        //TODO Identifier
         before_cols: &[String],
+        //TODO Identifier
         after_cols: &[String],
+        //TODO Identifier
         old_column: &str,
+        //TODO Identifier
     ) -> HashMap<Identifier, String> {
         let mut map = HashMap::default();
         for (before, after) in before_cols.iter().zip(after_cols.iter()) {
@@ -3080,7 +3113,9 @@ mod rename_column_view {
     fn build_rename_map_from_columns(
         before_cols: &[Column],
         after_cols: &[Column],
+        //TODO Identifier
         old_column: &str,
+        //TODO Identifier
     ) -> HashMap<Identifier, String> {
         if before_cols.len() != after_cols.len() {
             return HashMap::default();
@@ -3103,9 +3138,13 @@ mod rename_column_view {
     }
 
     fn table_name_matches_target(
+        //TODO Identifier
         table_name: &str,
+        //TODO Identifier
         table_db: Option<&str>,
+        //TODO Identifier
         target_table: &str,
+        //TODO Identifier
         target_db: &str,
     ) -> bool {
         if !table_name.eq_ignore_ascii_case(target_table) {
@@ -3118,7 +3157,7 @@ mod rename_column_view {
     }
 
     fn table_source_columns(schema: &Schema, table_name: &str) -> Option<Vec<String>> {
-        if let Some(table) = schema.get_table(table_name) {
+        if let Some(table) = schema.get_table(&Identifier::from(table_name)) {
             return Some(
                 table
                     .columns()
@@ -3145,6 +3184,7 @@ pub use rename_column_view::{rewrite_view_sql_for_column_rename, RewrittenView};
 /// replacing the table name from `from` to `to`. For example, `t1.a > 0` becomes
 /// `t2.a > 0` when renaming t1 to t2. This matches SQLite 3.49.1+ behavior which
 /// rewrites qualified refs during ALTER TABLE RENAME instead of rejecting them.
+//TODO Identifier
 pub fn rewrite_check_expr_table_refs(expr: &mut ast::Expr, from: &str, to: &str) {
     let _ = walk_expr_mut(
         expr,
@@ -3400,7 +3440,9 @@ fn from_clause_target_qualifiers(
 
 fn from_clause_target_qualifiers_inner(
     from_clause: &ast::FromClause,
+    //TODO Identifier
     target_table: &str,
+    //TODO Identifier
 ) -> Vec<String> {
     let mut qualifiers = Vec::new();
     let mut seen = HashSet::default();
@@ -3418,7 +3460,9 @@ fn from_clause_target_qualifiers_inner(
 
 fn collect_target_qualifiers(
     st: &ast::SelectTable,
+    //TODO Identifier
     target_table: &str,
+    //TODO Identifier
     qualifiers: &mut Vec<String>,
     seen: &mut HashSet<Identifier>,
 ) {
@@ -3548,11 +3592,16 @@ fn rewrite_one_select_column_refs_scoped(
 
 fn rename_result_identifiers_scoped(
     expr: &mut ast::Expr,
+    //TODO Identifier
     target_table: &str,
+    //TODO Identifier
     trigger_table: &str,
+    //TODO Identifier
     from: &str,
+    //TODO Identifier
     to: &str,
     rename_unqualified: bool,
+    //TODO Identifier
     target_qualifiers: Option<&[String]>,
 ) {
     let is_renaming_trigger_table = target_table.eq_ignore_ascii_case(trigger_table);
@@ -3590,6 +3639,7 @@ fn rename_result_identifiers_scoped(
                     *e = ast::Expr::Id(ast::Name::exact(to.to_owned()));
                 }
                 ast::Expr::Qualified(ref tbl, ref col_name)
+                //TODO Identifier
                     if col_name.as_str().eq_ignore_ascii_case(from) =>
                 {
                     let should_rename = if *tbl == "new" || *tbl == "old" {

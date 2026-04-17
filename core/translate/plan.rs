@@ -2307,13 +2307,12 @@ impl JoinedTable {
                     ))
                 } else {
                     // Check if this is a materialized view
-                    let cursor_type = if let Some(view_mutex) =
-                        schema.get_materialized_view(btree.name.as_str())
-                    {
-                        CursorType::MaterializedView(btree.clone(), view_mutex)
-                    } else {
-                        CursorType::BTreeTable(btree.clone())
-                    };
+                    let cursor_type =
+                        if let Some(view_mutex) = schema.get_materialized_view(&btree.name) {
+                            CursorType::MaterializedView(btree.clone(), view_mutex)
+                        } else {
+                            CursorType::BTreeTable(btree.clone())
+                        };
                     Some(program.alloc_cursor_id_keyed_if_not_exists(
                         CursorKey::table(self.internal_id),
                         cursor_type,
@@ -2907,6 +2906,7 @@ impl NonFromClauseSubquery {
             && matches!(self.eval_phase, SubqueryEvalPhase::PostWriteReturning)
     }
 
+    //TODO Identifier
     pub fn reads_table(&self, database_id: usize, table_name: &str) -> bool {
         match &self.state {
             SubqueryState::Unevaluated { plan: Some(plan) } => {

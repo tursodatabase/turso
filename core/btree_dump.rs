@@ -10,6 +10,7 @@ use crate::{Connection, Result, Value};
 use turso_ext::{
     ConstraintInfo, ConstraintOp, ConstraintUsage, IndexInfo, OrderByInfo, ResultCode,
 };
+use turso_parser::identifier::Identifier;
 
 #[derive(Debug)]
 pub struct BtreeDumpTable;
@@ -120,7 +121,7 @@ impl BtreeDumpCursor {
             }
         }
         // Then search tables
-        if let Some(table) = self.schema.get_table(name) {
+        if let Some(table) = self.schema.get_table(&Identifier::from(name)) {
             return table.get_root_page().ok();
         }
         None

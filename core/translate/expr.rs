@@ -5875,7 +5875,9 @@ pub fn bind_and_rewrite_expr<'a>(
 
                     // Get the table from the specified database
                     let table = resolver
-                        .with_schema(database_id, |schema| schema.get_table(tbl_name.as_str()))
+                        .with_schema(database_id, |schema| {
+                            schema.get_table(tbl_name.identifier())
+                        })
                         .ok_or_else(|| {
                             LimboError::ParseError(format!(
                                 "no such table: {}.{}",
@@ -7653,6 +7655,7 @@ pub(crate) fn emit_custom_type_encode_columns(
     columns: &[Column],
     start_reg: usize,
     only_columns: Option<&ColumnMask>,
+    //TODO Identifier
     table_name: &str,
     layout: &ColumnLayout,
 ) -> Result<()> {
