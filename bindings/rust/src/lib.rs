@@ -486,6 +486,11 @@ impl Statement {
         Ok(())
     }
 
+    /// Returns the number of rows modified (insert/delete operations) by the most recent executed statement.
+    pub fn n_change(&self) -> u64 {
+        self.inner.lock().unwrap().n_change() as u64
+    }
+
     /// Execute a query that returns the first [`Row`].
     ///
     /// # Errors
