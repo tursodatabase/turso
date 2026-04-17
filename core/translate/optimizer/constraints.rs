@@ -1251,26 +1251,32 @@ pub struct AnalyzedTerm {
     pub constraint_refs: Vec<RangeConstraintRef>,
 }
 
-/// Analyzes a single binary expression to determine if it can use an index.
-///
-/// This is a shared helper for both OR and AND multi-index analysis.
-/// Returns `Some(AnalyzedTerm)` if the expression is a usable indexed constraint,
-/// `None` otherwise.
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn analyze_binary_term_for_index(
-    expr: &ast::Expr,
-    where_term_idx: usize,
+/// Lightweight prepass result for a binary term that can seed a multi-index branch.
+#[derive(Debug, Clone)]
+pub struct IndexableTermSummary {
+    /// The constrained table column, if any.
+    pub table_col_pos: Option<usize>,
+    /// The other tables referenced by the constraining expression.
+    pub lhs_mask: TableMask,
+    /// The chosen index for this term, or `None` for rowid access.
+    pub best_index: Option<Arc<Index>>,
+}
+
+struct BinaryTermIndexInfo<'a> {
+    lhs: &'a ast::Expr,
+    rhs: &'a ast::Expr,
+    operator: ConstraintOperator,
+    table_col_pos: Option<usize>,
+    constraining_expr: &'a ast::Expr,
+    side: BinaryExprSide,
+    is_rowid: bool,
+}
+
+fn analyze_binary_term_index_info<'a>(
+    expr: &'a ast::Expr,
     table_id: TableInternalId,
-    table_reference: &JoinedTable,
-    indexes: Option<&VecDeque<Arc<Index>>>,
     rowid_alias_column: Option<usize>,
-    available_indexes: &HashMap<String, VecDeque<Arc<Index>>>,
-    table_references: &TableReferences,
-    subqueries: &[NonFromClauseSubquery],
-    schema: &Schema,
-    params: &CostModelParams,
-) -> Option<AnalyzedTerm> {
-    // Try to extract a binary comparison
+) -> Option<BinaryTermIndexInfo<'a>> {
     let (lhs, operator, rhs) = as_binary_components(expr).ok().flatten()?;
 
     // Check if the operator is usable for index seeks
@@ -1292,17 +1298,17 @@ pub(crate) fn analyze_binary_term_for_index(
     // Check if this is an indexable constraint on our table
     let (table_col_pos, constraining_expr, side, is_rowid) = match lhs {
         ast::Expr::Column { table, column, .. } if *table == table_id => {
-            (Some(*column), rhs.clone(), BinaryExprSide::Rhs, false)
+            (Some(*column), rhs, BinaryExprSide::Rhs, false)
         }
         ast::Expr::RowId { table, .. } if *table == table_id => {
-            (rowid_alias_column, rhs.clone(), BinaryExprSide::Rhs, true)
+            (rowid_alias_column, rhs, BinaryExprSide::Rhs, true)
         }
         _ => match rhs {
             ast::Expr::Column { table, column, .. } if *table == table_id => {
-                (Some(*column), lhs.clone(), BinaryExprSide::Lhs, false)
+                (Some(*column), lhs, BinaryExprSide::Lhs, false)
             }
             ast::Expr::RowId { table, .. } if *table == table_id => {
-                (rowid_alias_column, lhs.clone(), BinaryExprSide::Lhs, true)
+                (rowid_alias_column, lhs, BinaryExprSide::Lhs, true)
             }
             _ => return None, // Doesn't reference our table
         },
@@ -1315,6 +1321,93 @@ pub(crate) fn analyze_binary_term_for_index(
     } else {
         operator
     };
+
+    Some(BinaryTermIndexInfo {
+        lhs,
+        rhs,
+        operator,
+        table_col_pos,
+        constraining_expr,
+        side,
+        is_rowid,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn summarize_binary_term_for_index(
+    expr: &ast::Expr,
+    table_id: TableInternalId,
+    indexes: Option<&VecDeque<Arc<Index>>>,
+    rowid_alias_column: Option<usize>,
+    table_references: &TableReferences,
+    subqueries: &[NonFromClauseSubquery],
+) -> Option<IndexableTermSummary> {
+    let BinaryTermIndexInfo {
+        operator,
+        table_col_pos,
+        constraining_expr,
+        is_rowid,
+        ..
+    } = analyze_binary_term_index_info(expr, table_id, rowid_alias_column)?;
+
+    let (best_index, constraint_refs) = find_best_index_for_constraint(
+        table_col_pos,
+        operator,
+        indexes,
+        rowid_alias_column,
+        is_rowid,
+    );
+    if constraint_refs.is_empty() {
+        return None;
+    }
+
+    let lhs_mask = table_mask_from_expr(constraining_expr, table_references, subqueries)
+        .unwrap_or_else(|_| TableMask::default());
+
+    let table_pos = table_references
+        .joined_tables()
+        .iter()
+        .position(|t| t.internal_id == table_id)
+        .expect("target table must exist in table_references");
+    if lhs_mask.get(table_pos) {
+        return None;
+    }
+
+    Some(IndexableTermSummary {
+        table_col_pos,
+        lhs_mask,
+        best_index,
+    })
+}
+
+/// Analyzes a single binary expression to determine if it can use an index.
+///
+/// This is a shared helper for both OR and AND multi-index analysis.
+/// Returns `Some(AnalyzedTerm)` if the expression is a usable indexed constraint,
+/// `None` otherwise.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn analyze_binary_term_for_index(
+    expr: &ast::Expr,
+    where_term_idx: usize,
+    table_id: TableInternalId,
+    table_reference: &JoinedTable,
+    indexes: Option<&VecDeque<Arc<Index>>>,
+    rowid_alias_column: Option<usize>,
+    available_indexes: &HashMap<String, VecDeque<Arc<Index>>>,
+    table_references: &TableReferences,
+    subqueries: &[NonFromClauseSubquery],
+    schema: &Schema,
+    params: &CostModelParams,
+) -> Option<AnalyzedTerm> {
+    let BinaryTermIndexInfo {
+        lhs,
+        rhs,
+        operator,
+        table_col_pos,
+        constraining_expr,
+        side,
+        is_rowid,
+    } = analyze_binary_term_index_info(expr, table_id, rowid_alias_column)?;
 
     // Find the best index for this constraint
     let (best_index, constraint_refs) = find_best_index_for_constraint(
@@ -1342,7 +1435,7 @@ pub(crate) fn analyze_binary_term_for_index(
         is_rowid,
     );
 
-    let lhs_mask = table_mask_from_expr(&constraining_expr, table_references, subqueries)
+    let lhs_mask = table_mask_from_expr(constraining_expr, table_references, subqueries)
         .unwrap_or_else(|_| TableMask::default());
 
     // Cannot use index seek if the constraining expression references the same table
