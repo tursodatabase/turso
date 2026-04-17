@@ -1,16 +1,19 @@
-use strumbra::UniqueString;
+use strumbra::SharedString;
 
 /// A SQL identifier with ASCII-only case-insensitive equality, ordering, and hashing.
 /// Stores the original-case string; comparisons fold only A-Z to a-z.
 ///
-/// Backed by [`UniqueString`] (Umbra-style string) for compact storage:
+/// Backed by [`SharedString`] (Umbra-style string) for compact storage:
 /// 16 bytes vs String's 24, with inline storage for identifiers up to 12 bytes.
+/// Cloning is O(1) (refcount bump) for heap-allocated strings.
 #[derive(Clone, Debug)]
-pub struct Identifier(UniqueString);
+pub struct Identifier(GermanString);
+
+pub type GermanString = SharedString;
 
 impl Identifier {
     pub fn new(s: String) -> Self {
-        Self(UniqueString::try_from(s).unwrap())
+        Self(GermanString::try_from(s).unwrap())
     }
 
     pub fn as_str(&self) -> &str {
@@ -72,13 +75,13 @@ impl std::fmt::Display for Identifier {
 
 impl From<String> for Identifier {
     fn from(s: String) -> Self {
-        Self(UniqueString::try_from(s).unwrap())
+        Self(GermanString::try_from(s).unwrap())
     }
 }
 
 impl From<&str> for Identifier {
     fn from(s: &str) -> Self {
-        Self(UniqueString::try_from(s).unwrap())
+        Self(GermanString::try_from(s).unwrap())
     }
 }
 

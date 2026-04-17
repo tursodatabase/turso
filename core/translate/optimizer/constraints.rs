@@ -1394,7 +1394,7 @@ pub(crate) fn analyze_binary_term_for_index(
     table_reference: &JoinedTable,
     indexes: Option<&VecDeque<Arc<Index>>>,
     rowid_alias_column: Option<usize>,
-    available_indexes: &HashMap<String, VecDeque<Arc<Index>>>,
+    available_indexes: &HashMap<Identifier, VecDeque<Arc<Index>>>,
     table_references: &TableReferences,
     subqueries: &[NonFromClauseSubquery],
     schema: &Schema,
