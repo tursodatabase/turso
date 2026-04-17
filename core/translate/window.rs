@@ -455,8 +455,7 @@ pub struct WindowMetadata<'a> {
     /// Maps expressions in the current query that reference subquery columns
     /// to their corresponding column indexes in the subquery’s result.
     pub expressions_referencing_subquery: Vec<(&'a Expr, usize)>,
-    //TODO Identifier (?)
-    pub buffer_table_name: String,
+    pub buffer_table_name: Identifier,
 }
 
 #[derive(Debug)]
@@ -634,7 +633,7 @@ impl EmitWindow {
             },
             src_column_count,
             expressions_referencing_subquery,
-            buffer_table_name: buffer_table.name.to_string(),
+            buffer_table_name: buffer_table.name.clone(),
         });
 
         Ok(())
@@ -954,7 +953,7 @@ fn emit_insert_row_into_buffer(
     registers: &WindowRegisters,
     cursors: &WindowCursors,
     input_column_count: &usize,
-    table_name: &str,
+    table_name: &Identifier,
 ) {
     let reg_record = program.alloc_register();
 

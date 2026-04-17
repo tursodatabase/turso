@@ -240,8 +240,7 @@ pub fn prepare_update_plan(
     let or_conflict = body.or_conflict.take();
     let indexed = body.indexed.take();
 
-    //TODO Identifier wtf
-    let table_name = table.get_name().as_str();
+    let table_name = table.get_name();
     let iter_dir = body
         .order_by
         .first()
@@ -260,7 +259,7 @@ pub fn prepare_update_plan(
             _ => unreachable!(),
         },
         identifier: body.tbl_name.alias.as_ref().map_or_else(
-            || Identifier::from(table_name),
+            || table_name.clone(),
             |alias| Identifier::from(alias.as_str()),
         ),
         internal_id: program.table_reference_counter.next(),
@@ -284,7 +283,6 @@ pub fn prepare_update_plan(
         .filter_map(|(i, col)| {
             col.name
                 .as_ref()
-                //TODO Identifier wtf
                 .map(|name| (Identifier::from(name.as_str()), i))
         })
         .collect();

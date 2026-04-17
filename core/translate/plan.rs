@@ -424,7 +424,7 @@ impl Plan {
 
     /// Returns true if this plan or any of its subplans read from the given table.
     /// (Not for Delete/Update plans)
-    fn reads_table(&self, database_id: usize, table_name: &str) -> bool {
+    fn reads_table(&self, database_id: usize, table_name: &Identifier) -> bool {
         match self {
             Plan::Select(select_plan) => select_plan.reads_table(database_id, table_name),
             Plan::CompoundSelect {
@@ -680,7 +680,7 @@ impl SelectPlan {
                 })
     }
 
-    fn reads_table(&self, database_id: usize, table_name: &str) -> bool {
+    fn reads_table(&self, database_id: usize, table_name: &Identifier) -> bool {
         self.table_references.joined_tables().iter().any(|table| {
             table.matches(database_id, table_name)
                 || match &table.table {
@@ -2011,7 +2011,7 @@ impl JoinedTable {
         }
     }
 
-    fn matches(&self, database_id: usize, table_name: &str) -> bool {
+    fn matches(&self, database_id: usize, table_name: &Identifier) -> bool {
         self.database_id == database_id
             && matches!(self.table, Table::BTree(_) | Table::Virtual(_))
             && *self.table.get_name() == *table_name
@@ -2906,8 +2906,7 @@ impl NonFromClauseSubquery {
             && matches!(self.eval_phase, SubqueryEvalPhase::PostWriteReturning)
     }
 
-    //TODO Identifier
-    pub fn reads_table(&self, database_id: usize, table_name: &str) -> bool {
+    pub fn reads_table(&self, database_id: usize, table_name: &Identifier) -> bool {
         match &self.state {
             SubqueryState::Unevaluated { plan: Some(plan) } => {
                 Plan::reads_table(plan, database_id, table_name)

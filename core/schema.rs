@@ -27,7 +27,7 @@ pub enum ViewState {
 /// Simple view structure for non-materialized views
 #[derive(Debug)]
 pub struct View {
-    pub name: String, // TODO: Identifier
+    pub name: Identifier,
     pub sql: String,
     pub select_stmt: ast::Select,
     pub columns: Vec<Column>,
@@ -35,7 +35,7 @@ pub struct View {
 }
 
 impl View {
-    fn new(name: String, sql: String, select_stmt: ast::Select, columns: Vec<Column>) -> Self {
+    fn new(name: Identifier, sql: String, select_stmt: ast::Select, columns: Vec<Column>) -> Self {
         Self {
             name,
             sql,
@@ -87,9 +87,9 @@ pub type ViewsMap = HashMap<Identifier, Arc<View>>;
 /// Trigger structure
 #[derive(Debug, Clone)]
 pub struct Trigger {
-    pub name: String, // TODO: Identifier
+    pub name: Identifier,
     pub sql: String,
-    pub table_name: String, // TODO: Identifier
+    pub table_name: Identifier,
     pub time: turso_parser::ast::TriggerTime,
     pub event: turso_parser::ast::TriggerEvent,
     pub for_each_row: bool,
@@ -113,9 +113,9 @@ pub struct Trigger {
 impl Trigger {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
-        name: String,
+        name: Identifier,
         sql: String,
-        table_name: String,
+        table_name: Identifier,
         time: Option<turso_parser::ast::TriggerTime>,
         event: turso_parser::ast::TriggerEvent,
         for_each_row: bool,
@@ -187,11 +187,9 @@ fn quote_string_literal(s: &str) -> String {
 /// Custom type definition, loaded from sqlite_turso_types
 #[derive(Debug, Clone)]
 pub struct TypeDef {
-    //TODO Identifier
-    pub name: String,
+    pub name: Identifier,
     pub params: Vec<ast::TypeParam>,
-    //TODO Identifier
-    pub base: String,
+    pub base: Identifier,
     pub encode: Option<Box<ast::Expr>>,
     pub decode: Option<Box<ast::Expr>>,
     pub operators: Vec<TypeOperator>,
@@ -200,13 +198,12 @@ pub struct TypeDef {
 }
 
 impl TypeDef {
-    /// Construct a TypeDef from a parsed CREATE TYPE statement.
-    //TODO Identifier
+    /// Construct a [TypeDef] from a parsed CREATE TYPE statement.
     pub fn from_create_type(type_name: &str, body: &ast::CreateTypeBody, is_builtin: bool) -> Self {
         Self {
-            name: type_name.to_string(),
+            name: Identifier::from(type_name),
             params: body.params.clone(),
-            base: body.base.clone(),
+            base: Identifier::from(body.base.as_str()),
             encode: body.encode.clone(),
             decode: body.decode.clone(),
             operators: body.operators.clone(),
@@ -221,10 +218,10 @@ impl TypeDef {
     pub fn value_input_type(&self) -> &str {
         for p in &self.params {
             if p.name.eq_ignore_ascii_case("value") {
-                return p.ty.as_deref().unwrap_or(&self.base);
+                return p.ty.as_deref().unwrap_or(self.base.as_str());
             }
         }
-        &self.base
+        self.base.as_str()
     }
 
     /// The non-value params (user-provided at column declaration time).
@@ -239,8 +236,8 @@ impl TypeDef {
         let mut sql = if self.params.is_empty() {
             format!(
                 "CREATE TYPE {} BASE {}",
-                quote_ident(&self.name),
-                quote_ident(&self.base)
+                quote_ident(self.name.as_str()),
+                quote_ident(self.base.as_str())
             )
         } else {
             let params: Vec<String> = self
@@ -253,9 +250,9 @@ impl TypeDef {
                 .collect();
             format!(
                 "CREATE TYPE {}({}) BASE {}",
-                quote_ident(&self.name),
+                quote_ident(self.name.as_str()),
                 params.join(", "),
-                quote_ident(&self.base)
+                quote_ident(self.base.as_str())
             )
         };
         if let Some(ref encode) = self.encode {
@@ -732,7 +729,7 @@ impl Schema {
 
     /// Add a regular (non-materialized) view
     pub fn add_view(&mut self, view: View) -> Result<()> {
-        let name = Identifier::from(view.name.as_str());
+        let name = view.name.clone();
         self.check_object_name_conflict(&name)?;
         self.views.insert(name, Arc::new(view));
         Ok(())
@@ -761,7 +758,7 @@ impl Schema {
         for triggers_list in self.triggers.values_mut() {
             for i in 0..triggers_list.len() {
                 let trigger = &triggers_list[i];
-                if *name == *trigger.name {
+                if *name == trigger.name {
                     removed = true;
                     triggers_list.remove(i);
                     break;
@@ -817,7 +814,7 @@ impl Schema {
     ) -> Option<Arc<Trigger>> {
         self.triggers
             .get(table_name)
-            .and_then(|triggers| triggers.iter().find(|t| *name == *t.name).cloned())
+            .and_then(|triggers| triggers.iter().find(|t| *name == t.name).cloned())
     }
 
     pub fn get_triggers_for_table(
@@ -834,7 +831,7 @@ impl Schema {
         self.triggers
             .values()
             .flatten()
-            .find(|t| *name == *t.name)
+            .find(|t| *name == t.name)
             .cloned()
     }
 
@@ -1139,9 +1136,7 @@ impl Schema {
     ) -> Result<()> {
         for unparsed_sql_from_index in from_sql_indexes {
             let table = self
-                .get_btree_table(&Identifier::from(
-                    unparsed_sql_from_index.table_name.as_str(),
-                ))
+                .get_btree_table(&unparsed_sql_from_index.table_name)
                 .unwrap();
             let index = Index::from_sql(
                 syms,
@@ -1431,7 +1426,7 @@ impl Schema {
                 match maybe_sql {
                     Some(sql) => {
                         from_sql_indexes.push(UnparsedFromSqlIndex {
-                            table_name: table_name.to_string(),
+                            table_name: Identifier::from(table_name),
                             root_page,
                             sql: sql.to_string(),
                         });
@@ -1517,8 +1512,12 @@ impl Schema {
                             }
 
                             // Create regular view
-                            let view =
-                                View::new(name.to_string(), sql.to_string(), select, final_columns);
+                            let view = View::new(
+                                Identifier::from(name),
+                                sql.to_string(),
+                                select,
+                                final_columns,
+                            );
                             self.add_view(view)?;
                         }
                         _ => {}
@@ -1571,9 +1570,9 @@ impl Schema {
                 });
                 self.add_trigger(
                     Trigger::new(
-                        trigger_name,
+                        Identifier::from(trigger_name),
                         sql.to_string(),
-                        tbl_name.name.to_string(),
+                        Identifier::from(tbl_name.name.as_str()),
                         time,
                         event,
                         for_each_row,
@@ -1607,7 +1606,7 @@ impl Schema {
             .ok_or_else(|| fk_mismatch_err("<unknown>", table_name.as_str()))?;
 
         // Precompute helper to find parent unique index, if it's not the rowid
-        let find_parent_unique = |cols: &Vec<String>| -> Option<Arc<Index>> {
+        let find_parent_unique = |cols: &[Identifier]| -> Option<Arc<Index>> {
             self.get_indices(&parent_tbl.name)
                 .find(|idx| {
                     idx.unique
@@ -1616,7 +1615,7 @@ impl Schema {
                             .columns
                             .iter()
                             .zip(cols.iter())
-                            .all(|(ic, pc)| ic.name.eq_ignore_ascii_case(pc))
+                            .all(|(ic, pc)| ic.name == *pc)
                 })
                 .cloned()
         };
@@ -1626,7 +1625,7 @@ impl Schema {
                 continue;
             };
             for fk in &child.foreign_keys {
-                if !fk.parent_table.eq_ignore_ascii_case(table_name.as_str()) {
+                if fk.parent_table != *table_name {
                     continue;
                 }
                 if fk.child_columns.is_empty() {
@@ -1636,22 +1635,21 @@ impl Schema {
                         parent_tbl.name.as_str(),
                     ));
                 }
-                let child_cols: Vec<String> = fk.child_columns.clone();
+                let child_cols = fk.child_columns.clone();
                 let mut child_pos = Vec::with_capacity(child_cols.len());
 
                 for cname in &child_cols {
-                    let (i, _) = child.get_column(cname).ok_or_else(|| {
+                    let (i, _) = child.get_column(cname.as_str()).ok_or_else(|| {
                         fk_mismatch_err(child.name.as_str(), parent_tbl.name.as_str())
                     })?;
                     child_pos.push(i);
                 }
-                let parent_cols: Vec<String> = if fk.parent_columns.is_empty() {
+                let parent_cols: Vec<Identifier> = if fk.parent_columns.is_empty() {
                     if !parent_tbl.primary_key_columns.is_empty() {
                         parent_tbl
                             .primary_key_columns
                             .iter()
-                            .map(|(col, _)| col)
-                            .cloned()
+                            .map(|(col, _)| Identifier::from(col.as_str()))
                             .collect()
                     } else {
                         return Err(fk_mismatch_err(
@@ -1673,12 +1671,10 @@ impl Schema {
 
                 let mut parent_pos = Vec::with_capacity(parent_cols.len());
                 for pc in &parent_cols {
-                    let pos = parent_tbl.get_column(pc).map(|(i, _)| i).or_else(|| {
-                        ROWID_STRS
-                            .iter()
-                            .any(|s| pc.eq_ignore_ascii_case(s))
-                            .then_some(0)
-                    });
+                    let pos = parent_tbl
+                        .get_column(pc.as_str())
+                        .map(|(i, _)| i)
+                        .or_else(|| ROWID_STRS.iter().any(|&s| *pc == s).then_some(0));
                     let Some(p) = pos else {
                         return Err(fk_mismatch_err(
                             child.name.as_str(),
@@ -1691,12 +1687,12 @@ impl Schema {
                 // Determine if the FK's parent key is the ROWID or a rowid alias.
                 let parent_uses_rowid = if parent_cols.len() == 1 {
                     let pc = &parent_cols[0];
-                    ROWID_STRS.iter().any(|&r| r.eq_ignore_ascii_case(pc))
+                    ROWID_STRS.iter().any(|&r| *pc == r)
                         || parent_tbl.columns.iter().any(|c| {
                             c.is_rowid_alias()
                                 && c.name
                                     .as_deref()
-                                    .is_some_and(|n| n.eq_ignore_ascii_case(pc))
+                                    .is_some_and(|n| n.eq_ignore_ascii_case(pc.as_str()))
                         })
                 } else {
                     false
@@ -1740,12 +1736,11 @@ impl Schema {
         let mut out = Vec::with_capacity(child.foreign_keys.len());
 
         for fk in &child.foreign_keys {
-            let parent_name = Identifier::from(fk.parent_table.as_str());
             let parent_tbl = self
-                .get_btree_table(&parent_name)
-                .ok_or_else(|| fk_mismatch_err(child.name.as_str(), parent_name.as_str()))?;
+                .get_btree_table(&fk.parent_table)
+                .ok_or_else(|| fk_mismatch_err(child.name.as_str(), fk.parent_table.as_str()))?;
 
-            let child_cols: Vec<String> = fk.child_columns.clone();
+            let child_cols = fk.child_columns.clone();
             if child_cols.is_empty() {
                 return Err(fk_mismatch_err(
                     child.name.as_str(),
@@ -1756,19 +1751,18 @@ impl Schema {
             // Child positions exist
             let mut child_pos = Vec::with_capacity(child_cols.len());
             for cname in &child_cols {
-                let (i, _) = child.get_column(cname).ok_or_else(|| {
+                let (i, _) = child.get_column(cname.as_str()).ok_or_else(|| {
                     fk_mismatch_err(child.name.as_str(), parent_tbl.name.as_str())
                 })?;
                 child_pos.push(i);
             }
 
-            let parent_cols: Vec<String> = if fk.parent_columns.is_empty() {
+            let parent_cols: Vec<Identifier> = if fk.parent_columns.is_empty() {
                 if !parent_tbl.primary_key_columns.is_empty() {
                     parent_tbl
                         .primary_key_columns
                         .iter()
-                        .map(|(col, _)| col)
-                        .cloned()
+                        .map(|(col, _)| Identifier::from(col.as_str()))
                         .collect()
                 } else {
                     return Err(fk_mismatch_err(
@@ -1790,12 +1784,10 @@ impl Schema {
             // Parent positions exist, or rowid sentinel
             let mut parent_pos = Vec::with_capacity(parent_cols.len());
             for pc in &parent_cols {
-                let pos = parent_tbl.get_column(pc).map(|(i, _)| i).or_else(|| {
-                    ROWID_STRS
-                        .iter()
-                        .any(|&r| r.eq_ignore_ascii_case(pc))
-                        .then_some(0)
-                });
+                let pos = parent_tbl
+                    .get_column(pc.as_str())
+                    .map(|(i, _)| i)
+                    .or_else(|| ROWID_STRS.iter().any(|&r| *pc == r).then_some(0));
                 let Some(p) = pos else {
                     return Err(fk_mismatch_err(
                         child.name.as_str(),
@@ -1830,7 +1822,7 @@ impl Schema {
                                 .columns
                                 .iter()
                                 .zip(parent_cols.iter())
-                                .all(|(ic, pc)| ic.name.eq_ignore_ascii_case(pc))
+                                .all(|(ic, pc)| ic.name == *pc)
                     })
                     .cloned()
                     .ok_or_else(|| fk_mismatch_err(child.name.as_str(), parent_tbl.name.as_str()))?
@@ -1860,7 +1852,7 @@ impl Schema {
             };
             bt.foreign_keys
                 .iter()
-                .any(|fk| fk.parent_table.eq_ignore_ascii_case(table_name.as_str()))
+                .any(|fk| fk.parent_table == *table_name)
         })
     }
 
@@ -2143,7 +2135,6 @@ impl Table {
     }
 
     /// Returns the column position and column for a given column name.
-    //TODO Identifier
     pub fn get_column_by_name(&self, name: &str) -> Option<(usize, &Column)> {
         match self {
             Self::BTree(table) => table.get_column(name),
@@ -2224,22 +2215,20 @@ pub struct UniqueSet {
 #[derive(Clone, Debug)]
 pub struct CheckConstraint {
     /// Optional constraint name
-    //TODO Identifier
-    pub name: Option<String>,
+    pub name: Option<Identifier>,
     /// CHECK expression
     pub expr: ast::Expr,
     /// Column name if this is a column-level CHECK constraint (defined inline with the column).
     /// None if this is a table-level CHECK constraint.
-    //TODO Identifier
-    pub column: Option<String>,
+    pub column: Option<Identifier>,
 }
 
 impl CheckConstraint {
     pub fn new(name: Option<&ast::Name>, expr: &ast::Expr, column: Option<&str>) -> Self {
         Self {
-            name: name.map(|n| n.as_str().to_string()),
+            name: name.map(|n| Identifier::from(n.as_str())),
             expr: expr.clone(),
-            column: column.map(|s| s.to_string()),
+            column: column.map(Identifier::from),
         }
     }
 
@@ -2295,7 +2284,7 @@ impl BTreeTable {
                 col.ty_str = "BLOB".to_string();
             } else if let Some(type_def) = schema.get_type_def(col.ty_str.as_str(), table.is_strict)
             {
-                col.ty_str = type_def.base.to_uppercase();
+                col.ty_str = type_def.base.as_str().to_uppercase();
             }
         }
         Arc::new(modified)
@@ -2378,9 +2367,9 @@ impl BTreeTable {
                 continue;
             }
             if let Some(type_def) = schema.get_type_def_unchecked(col.ty_str.as_str()) {
-                let (base_ty, _) = type_from_name(&type_def.base);
+                let (base_ty, _) = type_from_name(type_def.base.as_str());
                 col.set_ty(base_ty);
-                col.set_base_affinity(Affinity::affinity(&type_def.base));
+                col.set_base_affinity(Affinity::affinity(type_def.base.as_str()));
             }
         }
     }
@@ -2473,11 +2462,15 @@ impl BTreeTable {
 
             // Add column-level CHECK constraints inline
             for check_constraint in &self.check_constraints {
-                if check_constraint.column.as_deref() == Some(column_name) {
+                if check_constraint
+                    .column
+                    .as_ref()
+                    .is_some_and(|c| *c == column_name.as_str())
+                {
                     sql.push(' ');
                     if let Some(name) = &check_constraint.name {
                         sql.push_str("CONSTRAINT ");
-                        sql.push_str(&Name::exact(name.clone()).as_ident());
+                        sql.push_str(&Name::exact(name.to_string()).as_ident());
                         sql.push(' ');
                     }
                     sql.push_str(&check_constraint.sql());
@@ -2504,16 +2497,16 @@ impl BTreeTable {
                 if i > 0 {
                     sql.push_str(", ");
                 }
-                sql.push_str(col);
+                sql.push_str(col.as_str());
             }
             sql.push_str(") REFERENCES ");
-            sql.push_str(&fk.parent_table);
+            sql.push_str(fk.parent_table.as_str());
             sql.push('(');
             for (i, col) in fk.parent_columns.iter().enumerate() {
                 if i > 0 {
                     sql.push_str(", ");
                 }
-                sql.push_str(col);
+                sql.push_str(col.as_str());
             }
             sql.push(')');
 
@@ -2551,7 +2544,7 @@ impl BTreeTable {
             sql.push_str(", ");
             if let Some(name) = &check_constraint.name {
                 sql.push_str("CONSTRAINT ");
-                sql.push_str(&Name::exact(name.clone()).as_ident());
+                sql.push_str(&Name::exact(name.to_string()).as_ident());
                 sql.push(' ');
             }
             sql.push_str(&check_constraint.sql());
@@ -3207,16 +3200,16 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
                     defer_clause,
                 } = &c.constraint
                 {
-                    let child_columns: Vec<String> = columns
+                    let child_columns: Vec<Identifier> = columns
                         .iter()
-                        .map(|ic| ic.col_name.as_str().to_owned())
+                        .map(|ic| Identifier::from(ic.col_name.as_str()))
                         .collect();
                     // derive parent columns: explicit or default to parent PK
-                    let parent_table = clause.tbl_name.as_str().to_owned();
-                    let parent_columns: Vec<String> = clause
+                    let parent_table = Identifier::from(clause.tbl_name.as_str());
+                    let parent_columns: Vec<Identifier> = clause
                         .columns
                         .iter()
-                        .map(|ic| ic.col_name.as_str().to_owned())
+                        .map(|ic| Identifier::from(ic.col_name.as_str()))
                         .collect();
 
                     // Only check arity if parent columns were explicitly listed
@@ -3410,11 +3403,11 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
                                 );
                             }
                             let fk = ForeignKey {
-                                parent_table: clause.tbl_name.as_str().to_owned(),
+                                parent_table: Identifier::from(clause.tbl_name.as_str()),
                                 parent_columns: clause
                                     .columns
                                     .iter()
-                                    .map(|c| c.col_name.as_str().to_owned())
+                                    .map(|c| Identifier::from(c.col_name.as_str()))
                                     .collect(),
                                 on_delete: clause
                                     .args
@@ -3438,7 +3431,7 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
                                         }
                                     })
                                     .unwrap_or(RefAct::NoAction),
-                                child_columns: vec![name.clone()],
+                                child_columns: vec![Identifier::from(name.as_str())],
                                 deferred: match defer_clause {
                                     Some(d) => {
                                         d.deferrable
@@ -3691,11 +3684,11 @@ pub fn _build_pseudo_table(columns: &[ResultColumn]) -> PseudoCursorType {
 #[derive(Debug, Clone)]
 pub struct ForeignKey {
     /// Columns in this table (child side)
-    pub child_columns: Vec<String>, // TODO: Vec<Identifier>
+    pub child_columns: Vec<Identifier>,
     /// Referenced (parent) table
-    pub parent_table: String, // TODO: Identifier
+    pub parent_table: Identifier,
     /// Parent-side referenced columns
-    pub parent_columns: Vec<String>, // TODO: Vec<Identifier>
+    pub parent_columns: Vec<Identifier>,
     pub on_delete: RefAct,
     pub on_update: RefAct,
     /// DEFERRABLE INITIALLY DEFERRED
@@ -3706,7 +3699,7 @@ impl ForeignKey {
         if self
             .parent_columns
             .iter()
-            .any(|c| ROWID_STRS.iter().any(|&r| r.eq_ignore_ascii_case(c)))
+            .any(|c| ROWID_STRS.iter().any(|&r| c == r))
         {
             return Err(crate::LimboError::ForeignKeyConstraint(format!(
                 "foreign key mismatch referencing \"{}\"",
@@ -3726,7 +3719,7 @@ pub struct ResolvedFkRef {
     pub fk: Arc<ForeignKey>,
 
     /// Resolved, normalized column names.
-    pub child_cols: Vec<String>,
+    pub child_cols: Vec<Identifier>,
     /// Column positions in the child/parent tables (pos_in_table)
     pub child_pos: Vec<usize>,
     pub parent_pos: Vec<usize>,
@@ -3777,7 +3770,7 @@ impl ResolvedFkRef {
         }
         // special case: if FK uses a rowid alias on child, and rowid changed
         if self.child_cols.len() == 1 {
-            let (i, col) = child_tbl.get_column(&self.child_cols[0]).unwrap();
+            let (i, col) = child_tbl.get_column(self.child_cols[0].as_str()).unwrap();
             if col.is_rowid_alias() && updated_child_positions.get(i) {
                 return true;
             }
@@ -4287,7 +4280,7 @@ pub struct Index {
 #[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct IndexColumn {
-    pub name: String, // TODO: Identifier
+    pub name: Identifier,
     pub order: SortOrder,
     /// the position of the column in the source table.
     /// for example:
@@ -4335,8 +4328,8 @@ impl Index {
                         bail_parse_error!("unknown module name: '{}'", using);
                     };
                     let configuration = IndexMethodConfiguration {
-                        table_name: table.name.to_string(),
-                        index_name: index_name.to_string(),
+                        table_name: table.name.clone(),
+                        index_name: index_name.clone(),
                         columns: index_columns.clone(),
                         parameters,
                     };
@@ -4405,7 +4398,7 @@ impl Index {
             };
             let (_, column) = table.get_column(col_name).unwrap();
             primary_keys.push(IndexColumn {
-                name: col_name.clone(),
+                name: Identifier::from(col_name.as_str()),
                 order: *order,
                 pos_in_table,
                 collation: column.collation_opt(),
@@ -4452,7 +4445,7 @@ impl Index {
                 )));
             };
             unique_cols.push(IndexColumn {
-                name: col.name.as_ref().unwrap().clone(),
+                name: Identifier::from(col.name.as_deref().unwrap()),
                 order: *sort_order,
                 pos_in_table,
                 collation: col.collation_opt(),

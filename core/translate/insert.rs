@@ -662,7 +662,7 @@ pub fn translate_insert(
         });
 
         // Encode values for columns with custom types.
-        emit_custom_type_encode(program, resolver, &insertion, ctx.table.name.as_str())?;
+        emit_custom_type_encode(program, resolver, &insertion, &ctx.table.name)?;
 
         // Post-encode TypeCheck: validate that encode produced the correct
         // storage type (BASE).
@@ -1055,7 +1055,7 @@ pub fn translate_insert(
             None,
             after_record_reg,
             None,
-            table_name.as_str(),
+            table_name.identifier(),
         )?;
     }
 
@@ -1077,10 +1077,8 @@ pub fn translate_insert(
                 .iter_mut()
                 .filter(|s| !s.has_been_evaluated())
             {
-                let rerun_for_target_scan = subquery.reads_table(
-                    target_table.database_id,
-                    target_table.table.get_name().as_str(),
-                );
+                let rerun_for_target_scan =
+                    subquery.reads_table(target_table.database_id, target_table.table.get_name());
                 let subquery_plan = subquery.consume_plan(EvalAt::Loop(0));
                 emit_non_from_clause_subquery(
                     program,
@@ -3293,10 +3291,11 @@ pub(crate) fn halt_desc_and_on_error(
 
 pub fn format_unique_violation_desc(table_name: &str, index: &Index) -> String {
     if index.columns.len() == 1 {
-        let mut s = String::with_capacity(table_name.len() + 1 + index.columns[0].name.len());
+        let col_name = index.columns[0].name.as_str();
+        let mut s = String::with_capacity(table_name.len() + 1 + col_name.len());
         s.push_str(table_name);
         s.push('.');
-        s.push_str(&index.columns[0].name);
+        s.push_str(col_name);
         s
     } else {
         let mut s = String::with_capacity(table_name.len() + 3 + 4 * index.columns.len());
@@ -3416,7 +3415,7 @@ fn emit_index_column_value_for_insert(
             Ok(())
         })?;
     } else {
-        let Some(cm) = insertion.get_col_mapping_by_name(&idx_col.name) else {
+        let Some(cm) = insertion.get_col_mapping_by_name(idx_col.name.as_str()) else {
             return Err(LimboError::PlanningError(
                 "Column not found in INSERT".to_string(),
             ));
@@ -3672,7 +3671,7 @@ fn emit_replace_delete_conflicting_row(
     };
 
     let table = &ctx.table;
-    let table_name = table.name.as_str();
+    let table_name = &table.name;
     let main_cursor_id = ctx.cursor_id;
 
     for (name, _, index_cursor_id) in ctx.idx_cursors.iter() {
@@ -3793,16 +3792,12 @@ pub fn emit_fk_child_insert_checks(
     for fk_ref in
         resolver.with_schema(database_id, |s| s.resolved_fks_for_child(&child_tbl.name))?
     {
-        //TODO Identifier
-        let is_self_ref = fk_ref
-            .fk
-            .parent_table
-            .eq_ignore_ascii_case(child_tbl.name.as_str());
+        let is_self_ref = child_tbl.name == fk_ref.fk.parent_table;
 
         // Short-circuit if any NEW component is NULL
         let fk_ok = program.allocate_label();
         for cname in &fk_ref.child_cols {
-            let (i, col) = child_tbl.get_column(cname).unwrap();
+            let (i, col) = child_tbl.get_column(cname.as_str()).unwrap();
             let src = if col.is_rowid_alias() {
                 new_rowid_reg
             } else {
@@ -3814,15 +3809,13 @@ pub fn emit_fk_child_insert_checks(
             });
         }
         let parent_tbl = resolver
-            .with_schema(database_id, |s| {
-                s.get_btree_table(&Identifier::from(fk_ref.fk.parent_table.as_str()))
-            })
+            .with_schema(database_id, |s| s.get_btree_table(&fk_ref.fk.parent_table))
             .expect("parent btree");
         if fk_ref.parent_uses_rowid {
             let pcur = open_read_table(program, &parent_tbl, database_id);
 
             // first child col carries rowid
-            let (i_child, col_child) = child_tbl.get_column(&fk_ref.child_cols[0]).unwrap();
+            let (i_child, col_child) = child_tbl.get_column(fk_ref.child_cols[0].as_str()).unwrap();
             let val_reg = if col_child.is_rowid_alias() {
                 new_rowid_reg
             } else {
@@ -3880,7 +3873,7 @@ pub fn emit_fk_child_insert_checks(
             let probe = {
                 let start = program.alloc_registers(ncols);
                 for (k, cname) in fk_ref.child_cols.iter().enumerate() {
-                    let (i, col) = child_tbl.get_column(cname).unwrap();
+                    let (i, col) = child_tbl.get_column(cname.as_str()).unwrap();
                     program.emit_insn(Insn::Copy {
                         src_reg: if col.is_rowid_alias() {
                             new_rowid_reg
@@ -3983,8 +3976,8 @@ fn build_parent_key_image_for_insert(
     insertion: &Insertion,
 ) -> crate::Result<(usize, usize)> {
     // Decide column list
-    let parent_cols: Vec<String> = if pref.parent_uses_rowid {
-        vec!["rowid".to_string()]
+    let parent_cols: Vec<Identifier> = if pref.parent_uses_rowid {
+        vec![Identifier::from("rowid")]
     } else if !pref.fk.parent_columns.is_empty() {
         pref.fk.parent_columns.clone()
     } else {
@@ -3992,7 +3985,7 @@ fn build_parent_key_image_for_insert(
         parent_table
             .primary_key_columns
             .iter()
-            .map(|(n, _)| n.clone())
+            .map(|(n, _)| Identifier::from(n.as_str()))
             .collect()
     };
 
@@ -4000,13 +3993,13 @@ fn build_parent_key_image_for_insert(
     let start = program.alloc_registers(ncols);
     // Copy from the would-be parent insertion
     for (i, pname) in parent_cols.iter().enumerate() {
-        let src = if pname.eq_ignore_ascii_case("rowid") {
+        let src = if *pname == "rowid" {
             insertion.key_register()
         } else {
             // For rowid-alias parents, get_col_mapping_by_name will return the key mapping,
             // not the NULL placeholder in col_mappings.
             insertion
-                .get_col_mapping_by_name(pname)
+                .get_col_mapping_by_name(pname.as_str())
                 .ok_or_else(|| {
                     crate::LimboError::PlanningError(format!(
                         "Column '{}' not present in INSERT image for parent {}",
@@ -4029,7 +4022,7 @@ fn build_parent_key_image_for_insert(
         parent_cols
             .iter()
             .map(|name| {
-                let (_, col) = parent_table.get_column(name).ok_or_else(|| {
+                let (_, col) = parent_table.get_column(name.as_str()).ok_or_else(|| {
                     crate::LimboError::InternalError(format!("parent col {name} missing"))
                 })?;
                 Ok::<_, crate::LimboError>(
@@ -4084,8 +4077,7 @@ pub fn emit_parent_side_fk_decrement_on_insert(
                     .columns
                     .iter()
                     .zip(child_cols.iter())
-                    //TODO Identifier
-                    .all(|(ic, cc)| ic.name.eq_ignore_ascii_case(cc))
+                    .all(|(ic, cc)| ic.name == cc.as_str())
         });
 
         if let Some(ix) = idx {
@@ -4138,7 +4130,7 @@ pub fn emit_parent_side_fk_decrement_on_insert(
             program.resolve_label(loop_top, program.offset());
 
             for (i, child_name) in child_cols.iter().enumerate() {
-                let (pos, _) = child_tbl.get_column(child_name).ok_or_else(|| {
+                let (pos, _) = child_tbl.get_column(child_name.as_str()).ok_or_else(|| {
                     crate::LimboError::InternalError(format!("child col {child_name} missing"))
                 })?;
                 let tmp = program.alloc_register();
@@ -4188,8 +4180,7 @@ fn emit_custom_type_encode(
     program: &mut ProgramBuilder,
     resolver: &Resolver,
     insertion: &Insertion,
-    //TODO Identifier
-    table_name: &str,
+    table_name: &Identifier,
 ) -> Result<()> {
     let columns: Vec<_> = insertion
         .col_mappings

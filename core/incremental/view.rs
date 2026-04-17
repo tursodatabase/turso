@@ -155,7 +155,6 @@ impl AllViewsTxState {
 
     /// Get or create a transaction state for a view
     #[allow(clippy::arc_with_non_send_sync)]
-    //TODO Identifier
     pub fn get_or_create(&self, view_name: &str) -> Arc<ViewTransactionState> {
         let mut states = self.states.borrow_mut();
         // ViewTransactionState uses RefCell (not Sync), but AllViewsTxState is
@@ -168,7 +167,6 @@ impl AllViewsTxState {
     }
 
     /// Get a transaction state for a view if it exists
-    //TODO Identifier
     pub fn get(&self, view_name: &str) -> Option<Arc<ViewTransactionState>> {
         self.states.borrow().get(view_name).cloned()
     }

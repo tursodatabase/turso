@@ -738,7 +738,7 @@ fn get_subquery_parser<'a>(
                     .map(|(i, c)| {
                         let rhs_collation = get_collseq_from_expr(&c.expr, table_references)?;
                         Ok(IndexColumn {
-                            name: c.name(table_references).unwrap_or("").to_string(),
+                            name: Identifier::from(c.name(table_references).unwrap_or("")),
                             order: SortOrder::Asc,
                             pos_in_table: i,
                             collation: lhs_collations[i].or(rhs_collation),

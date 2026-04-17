@@ -33,15 +33,12 @@ pub trait IndexMethod: std::fmt::Debug + Send + Sync {
 #[derive(Debug, Clone)]
 pub struct IndexMethodConfiguration {
     /// table name for which index_method is defined
-    //TODO Identifier
-    pub table_name: String,
+    pub table_name: Identifier,
     /// index name
-    //TODO Identifier
-    pub index_name: String,
+    pub index_name: Identifier,
     /// columns c1, c2, c3, ... provided to the index method (e.g. create index t_idx on t using method (c1, c2, c3, ...))
     pub columns: Vec<IndexColumn>,
     /// optional parameters provided to the index method through WITH clause
-    //TODO Identifier?
     pub parameters: HashMap<String, Value>,
 }
 

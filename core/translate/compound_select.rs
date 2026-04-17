@@ -507,10 +507,7 @@ fn create_dedupe_index(
         .iter()
         .enumerate()
         .map(|(i, c)| IndexColumn {
-            name: c
-                .name(&right_select.table_references)
-                .map(|n| n.to_string())
-                .unwrap_or_default(),
+            name: Identifier::from(c.name(&right_select.table_references).unwrap_or("")),
             order: SortOrder::Asc,
             pos_in_table: i,
             default: None,
@@ -728,10 +725,7 @@ fn create_collection_index(
         .iter()
         .enumerate()
         .map(|(i, c)| IndexColumn {
-            name: c
-                .name(&right_select.table_references)
-                .map(|n| n.to_string())
-                .unwrap_or_default(),
+            name: Identifier::from(c.name(&right_select.table_references).unwrap_or("")),
             order: SortOrder::Asc,
             pos_in_table: i,
             default: None,

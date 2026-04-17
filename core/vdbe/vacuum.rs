@@ -157,7 +157,7 @@ pub(crate) struct VacuumIntoConfig {
     /// Source `application_id` pragma value to copy to destination.
     pub source_application_id: i32,
     /// Pre-captured source custom type definitions for STRICT table replay.
-    pub source_custom_types: Vec<(String, Arc<TypeDef>)>,
+    pub source_custom_types: Vec<(Identifier, Arc<TypeDef>)>,
     /// Whether the source database has MVCC enabled.
     pub source_mvcc_enabled: bool,
 }
@@ -328,10 +328,7 @@ fn vacuum_into_step(
                 if !config.source_custom_types.is_empty() {
                     state.dest_conn.with_schema_mut(|dest_schema| {
                         for (name, td) in &config.source_custom_types {
-                            dest_schema
-                                .type_registry
-                                //TODO Identifier wtf
-                                .insert(Identifier::from(name.as_str()), td.clone());
+                            dest_schema.type_registry.insert(name.clone(), td.clone());
                         }
                     });
                 }

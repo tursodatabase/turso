@@ -49,7 +49,7 @@ pub fn create_dbsp_state_index(root_page: i64) -> Index {
         root_page,
         columns: vec![
             IndexColumn {
-                name: "operator_id".to_string(),
+                name: Identifier::from("operator_id"),
                 order: turso_parser::ast::SortOrder::Asc,
                 collation: None,
                 pos_in_table: 0,
@@ -57,7 +57,7 @@ pub fn create_dbsp_state_index(root_page: i64) -> Index {
                 expr: None,
             },
             IndexColumn {
-                name: "zset_id".to_string(),
+                name: Identifier::from("zset_id"),
                 order: turso_parser::ast::SortOrder::Asc,
                 collation: None,
                 pos_in_table: 1,
@@ -65,7 +65,7 @@ pub fn create_dbsp_state_index(root_page: i64) -> Index {
                 expr: None,
             },
             IndexColumn {
-                name: "element_id".to_string(),
+                name: Identifier::from("element_id"),
                 order: turso_parser::ast::SortOrder::Asc,
                 collation: None,
                 pos_in_table: 2,

@@ -7,6 +7,7 @@ use chrono::Datelike;
 use turso_macros::match_ignore_ascii_case;
 use turso_parser::ast::PragmaName;
 use turso_parser::ast::{self, Expr, Literal};
+use turso_parser::identifier::Identifier;
 
 use super::integrity_check::{
     translate_integrity_check, translate_quick_check, MAX_INTEGRITY_CHECK_ERRORS,
@@ -27,7 +28,6 @@ use crate::vdbe::insn::{Cookie, Insn};
 use crate::{bail_parse_error, CaptureDataChangesInfo, LimboError, Numeric, Value};
 use std::str::FromStr;
 use strum::IntoEnumIterator;
-use turso_parser::identifier::Identifier;
 
 fn list_pragmas(program: &mut ProgramBuilder) {
     for x in PragmaName::iter() {
@@ -108,7 +108,7 @@ fn resolve_index_pragma_database_id(
     resolver: &Resolver,
     default_database_id: usize,
     schema_was_explicit: bool,
-    index_name: &str,
+    index_name: &Identifier,
 ) -> crate::Result<usize> {
     if schema_was_explicit {
         return Ok(default_database_id);
@@ -164,7 +164,7 @@ fn emit_table_list_rows_for_schema(
         } else if let Some(view) = schema.get_view(&lookup_name) {
             emit_table_row(
                 program,
-                &view.name,
+                view.name.as_str(),
                 "view",
                 view.columns.len(),
                 false,
@@ -190,7 +190,7 @@ fn emit_table_list_rows_for_schema(
     for view in schema.views.values() {
         emit_table_row(
             program,
-            &view.name,
+            view.name.as_str(),
             "view",
             view.columns.len(),
             false,
@@ -971,7 +971,7 @@ fn query_pragma(
         }
         PragmaName::IndexInfo => {
             let index_name = match value {
-                Some(ast::Expr::Name(name)) => Some(name.as_str().to_owned()),
+                Some(ast::Expr::Name(name)) => Some(name.into_identifier()),
                 _ => None,
             };
 
@@ -991,13 +991,13 @@ fn query_pragma(
                         .indexes
                         .values()
                         .flatten()
-                        .find(|idx| idx.name == index_name.as_str());
+                        .find(|idx| idx.name == index_name);
 
                     if let Some(index) = index {
                         for (seqno, col) in index.columns.iter().enumerate() {
                             program.emit_int(seqno as i64, base_reg);
                             program.emit_int(col.pos_in_table as i64, base_reg + 1);
-                            program.emit_string8(col.name.clone(), base_reg + 2);
+                            program.emit_string8(col.name.to_string(), base_reg + 2);
                             program.emit_result_row(base_reg, 3);
                         }
                     }
@@ -1011,9 +1011,8 @@ fn query_pragma(
             Ok(TransactionMode::None)
         }
         PragmaName::IndexXinfo => {
-            //TODO Identifier
             let index_name = match value {
-                Some(ast::Expr::Name(name)) => Some(name.as_str().to_owned()),
+                Some(ast::Expr::Name(name)) => Some(name.into_identifier()),
                 _ => None,
             };
 
@@ -1033,7 +1032,7 @@ fn query_pragma(
                         .indexes
                         .values()
                         .flatten()
-                        .find(|idx| idx.name == index_name.as_str());
+                        .find(|idx| idx.name == index_name);
 
                     if let Some(index) = index {
                         for (seqno, col) in index.columns.iter().enumerate() {
@@ -1045,7 +1044,7 @@ fn query_pragma(
 
                             program.emit_int(seqno as i64, base_reg);
                             program.emit_int(col.pos_in_table as i64, base_reg + 1);
-                            program.emit_string8(col.name.clone(), base_reg + 2);
+                            program.emit_string8(col.name.to_string(), base_reg + 2);
                             program.emit_int(desc as i64, base_reg + 3);
                             program.emit_string8(coll, base_reg + 4);
                             program.emit_int(1, base_reg + 5); // key column
@@ -1500,15 +1499,14 @@ fn query_pragma(
                 let mut type_names: Vec<_> = schema
                     .type_registry
                     .iter()
-                    //TODO can be simplified?
-                    .filter(|(key, td)| key.as_str() == td.name.to_lowercase())
+                    .filter(|(key, td)| *key == &td.name)
                     .map(|(key, _)| key)
                     .collect();
                 type_names.sort();
                 for type_name in type_names {
                     let type_def = &schema.type_registry[type_name];
                     let display_name = if type_def.params.is_empty() {
-                        type_def.name.clone()
+                        type_def.name.to_string()
                     } else {
                         let params: Vec<String> = type_def
                             .params
@@ -1521,7 +1519,7 @@ fn query_pragma(
                         format!("{}({})", type_def.name, params.join(", "))
                     };
                     program.emit_string8(display_name, base_reg);
-                    program.emit_string8(type_def.base.clone(), base_reg + 1);
+                    program.emit_string8(type_def.base.to_string(), base_reg + 1);
                     if let Some(ref expr) = type_def.encode {
                         program.emit_string8(expr.to_string(), base_reg + 2);
                     } else {

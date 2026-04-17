@@ -28,7 +28,7 @@ pub(super) fn open_in_seek_source_cursor(
                 table_name: Identifier::from(""),
                 root_page: 0,
                 columns: vec![IndexColumn {
-                    name: String::new(),
+                    name: Identifier::from(""),
                     order: SortOrder::Asc,
                     pos_in_table: 0,
                     collation,

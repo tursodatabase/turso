@@ -206,7 +206,7 @@ impl EmitOrderBy {
                 let collation = get_collseq_from_expr(column, referenced_tables)?;
                 let pos_in_table = index_columns.len();
                 index_columns.push(IndexColumn {
-                    name: pos_in_table.to_string(),
+                    name: Identifier::from(pos_in_table.to_string()),
                     order: *order,
                     pos_in_table,
                     collation,
@@ -217,7 +217,7 @@ impl EmitOrderBy {
             let pos_in_table = index_columns.len();
             // add sequence number between ORDER BY columns and result column
             index_columns.push(IndexColumn {
-                name: pos_in_table.to_string(),
+                name: Identifier::from(pos_in_table.to_string()),
                 order: SortOrder::Asc,
                 pos_in_table,
                 collation: None,
@@ -227,7 +227,7 @@ impl EmitOrderBy {
             for _ in remappings.iter().filter(|r| !r.deduplicated) {
                 let pos_in_table = index_columns.len();
                 index_columns.push(IndexColumn {
-                    name: pos_in_table.to_string(),
+                    name: Identifier::from(pos_in_table.to_string()),
                     order: SortOrder::Asc,
                     pos_in_table,
                     collation: None,

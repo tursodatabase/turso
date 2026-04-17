@@ -578,7 +578,7 @@ fn execute_trigger_commands(
         database_id
     };
     let prev_trigger_context = resolver.trigger_context.clone();
-    resolver.set_trigger_context(trigger_database_id, trigger.name.clone());
+    resolver.set_trigger_context(trigger_database_id, trigger.name.to_string());
     let compile_result = (|| -> Result<()> {
         for command in trigger.commands.iter() {
             let stmt = trigger_cmd_to_stmt_for_subprogram(command, &subprogram_ctx)?;

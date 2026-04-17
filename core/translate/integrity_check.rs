@@ -15,6 +15,7 @@ use crate::{
     },
 };
 use turso_parser::ast;
+use turso_parser::identifier::Identifier;
 
 /// Maximum number of errors to report with integrity check. If we exceed this number we will
 /// short circuit the procedure and return early to not waste time. SQLite uses 100 as default.
@@ -85,8 +86,7 @@ fn emit_row_missing_from_index_error(
     row_number_reg: usize,
     scratch_reg: usize,
     message_reg: usize,
-    //TODO Identifier
-    index_name: &str,
+    index_name: &Identifier,
     remaining_errors_reg: usize,
     had_error_reg: usize,
 ) {
@@ -483,7 +483,7 @@ fn translate_integrity_check_impl(
                     row_number_reg,
                     scratch_reg,
                     message_reg,
-                    bound_index.index.name.as_str(),
+                    &bound_index.index.name,
                     remaining_errors_reg,
                     had_error_reg,
                 );

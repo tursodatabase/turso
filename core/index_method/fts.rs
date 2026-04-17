@@ -1408,7 +1408,7 @@ impl FtsIndexAttachment {
                         ),
                 )
                 .set_stored();
-            let field = schema_builder.add_text_field(&col.name, opts);
+            let field = schema_builder.add_text_field(col.name.as_str(), opts);
             text_fields.push((col.clone(), field));
         }
 
@@ -1489,7 +1489,7 @@ impl IndexMethodAttachment for FtsIndexAttachment {
     fn definition<'a>(&'a self) -> IndexMethodDefinition<'a> {
         IndexMethodDefinition {
             method_name: FTS_INDEX_METHOD_NAME,
-            index_name: &self.cfg.index_name,
+            index_name: self.cfg.index_name.as_str(),
             patterns: &self.patterns,
             backing_btree: false,
             results_materialized: true,
@@ -1812,7 +1812,11 @@ impl FtsCursor {
         let default_fields: Vec<Field> = text_fields.iter().map(|(_, f)| *f).collect();
         let field_boosts: Vec<(Field, f32)> = text_fields
             .iter()
-            .filter_map(|(col, field)| field_weights.get(&col.name).map(|&boost| (*field, boost)))
+            .filter_map(|(col, field)| {
+                field_weights
+                    .get(col.name.as_str())
+                    .map(|&boost| (*field, boost))
+            })
             .collect();
         Self {
             schema,

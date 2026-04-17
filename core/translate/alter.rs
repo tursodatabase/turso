@@ -856,7 +856,7 @@ pub fn translate_alter_table(
             // SQLite does not allow dropping a column that is part of a FK constraint
             let column_name_id = Identifier::from(column_name);
             for fk in &btree.foreign_keys {
-                if fk.child_columns.iter().any(|c| column_name_id == **c) {
+                if fk.child_columns.contains(&column_name_id) {
                     return Err(LimboError::ParseError(format!(
                         "error in table {table_name} after drop column: unknown column \"{column_name}\" in foreign key definition"
                     )));
@@ -1128,11 +1128,11 @@ pub fn translate_alter_table(
                             )));
                         }
                         let fk = ForeignKey {
-                            parent_table: clause.tbl_name.as_str().to_owned(),
+                            parent_table: Identifier::from(clause.tbl_name.as_str()),
                             parent_columns: clause
                                 .columns
                                 .iter()
-                                .map(|c| c.col_name.as_str().to_owned())
+                                .map(|c| Identifier::from(c.col_name.as_str()))
                                 .collect(),
                             on_delete: clause
                                 .args
@@ -1156,7 +1156,7 @@ pub fn translate_alter_table(
                                     }
                                 })
                                 .unwrap_or(ast::RefAct::NoAction),
-                            child_columns: vec![new_column_name.to_string()],
+                            child_columns: vec![Identifier::from(new_column_name.as_str())],
                             deferred: match defer_clause {
                                 Some(d) => {
                                     d.deferrable
@@ -1312,7 +1312,7 @@ pub fn translate_alter_table(
             let new_name = new_name.as_str();
             let old_name_str = table_name.to_owned();
             let new_name_id = Identifier::from(new_name);
-            let mut temp_triggers_to_rewrite: Vec<(String, String)> = Vec::new();
+            let mut temp_triggers_to_rewrite: Vec<(Identifier, String)> = Vec::new();
 
             if resolver.with_schema(database_id, |s| {
                 s.get_table(&new_name_id).is_some()
@@ -1454,7 +1454,7 @@ pub fn translate_alter_table(
 
             for (trigger_name, new_sql) in temp_triggers_to_rewrite {
                 let escaped_sql = escape_sql_string_literal(&new_sql);
-                let escaped_trigger_name = escape_sql_string_literal(&trigger_name);
+                let escaped_trigger_name = escape_sql_string_literal(trigger_name.as_str());
                 let qualified_schema_table = schema_table_name_for_db(resolver, crate::TEMP_DB_ID);
                 let update_stmt = format!(
                     r#"
@@ -1635,7 +1635,7 @@ pub fn translate_alter_table(
 
             // If renaming, rewrite trigger SQL for all triggers that reference this column
             // We'll collect the triggers to rewrite and update them in sqlite_schema
-            let mut triggers_to_rewrite: Vec<(usize, String, String)> = Vec::new();
+            let mut triggers_to_rewrite: Vec<(usize, Identifier, String)> = Vec::new();
             let mut views_to_rewrite: Vec<(usize, String, String)> = Vec::new();
             if rename {
                 // Try to rewrite every trigger's SQL for the column rename.
@@ -1707,16 +1707,19 @@ pub fn translate_alter_table(
                             "unknown database id {database_id} during ALTER TABLE"
                         ))
                     })?;
+                let target_db_ident = Identifier::from(target_db_name.as_str());
                 views_to_rewrite = resolver.with_schema(database_id, |s| -> Result<_> {
                     let mut rewrites = Vec::new();
+                    let from_ident = Identifier::from(from);
+                    let col_name_ident = Identifier::from(col_name);
                     for (view_name, view) in s.views.iter() {
                         if let Some(rewritten) = rewrite_view_sql_for_column_rename(
                             &view.sql,
                             s,
-                            table_name,
-                            &target_db_name,
-                            from,
-                            col_name,
+                            &table_name_id,
+                            &target_db_ident,
+                            &from_ident,
+                            &col_name_ident,
                         )? {
                             rewrites.push((
                                 database_id,
@@ -1733,14 +1736,16 @@ pub fn translate_alter_table(
                     let temp_rewrites =
                         resolver.with_schema(crate::TEMP_DB_ID, |s| -> Result<_> {
                             let mut rewrites = Vec::new();
+                            let from_ident = Identifier::from(from);
+                            let col_name_ident = Identifier::from(col_name);
                             for (view_name, view) in s.views.iter() {
                                 if let Some(rewritten) = rewrite_view_sql_for_column_rename(
                                     &view.sql,
                                     s,
-                                    table_name,
-                                    &target_db_name,
-                                    from,
-                                    col_name,
+                                    &table_name_id,
+                                    &target_db_ident,
+                                    &from_ident,
+                                    &col_name_ident,
                                 )? {
                                     rewrites.push((
                                         crate::TEMP_DB_ID,
@@ -1851,7 +1856,7 @@ pub fn translate_alter_table(
             // Update trigger SQL for renamed columns
             for (trigger_database_id, trigger_name, new_sql) in triggers_to_rewrite {
                 let escaped_sql = escape_sql_string_literal(&new_sql);
-                let escaped_trigger_name = escape_sql_string_literal(&trigger_name);
+                let escaped_trigger_name = escape_sql_string_literal(trigger_name.as_str());
                 let qualified_schema_table =
                     schema_table_name_for_db(resolver, trigger_database_id);
                 let update_stmt = format!(
@@ -2239,12 +2244,14 @@ fn rewrite_trigger_sql_for_table_rename(
             tbl_name
         };
 
+    let old_tbl_ident = Identifier::from(old_table_name);
+    let new_tbl_ident = Identifier::from(new_table_name);
     if let Some(ref mut when) = when_clause {
-        rewrite_check_expr_table_refs(when, old_table_name, new_table_name);
+        rewrite_check_expr_table_refs(when, &old_tbl_ident, &new_tbl_ident);
     }
 
     for cmd in &mut commands {
-        rewrite_trigger_cmd_table_refs(cmd, old_table_name, new_table_name);
+        rewrite_trigger_cmd_table_refs(cmd, &old_tbl_ident, &new_tbl_ident);
     }
 
     Ok(ast::Stmt::CreateTrigger {
@@ -2457,9 +2464,9 @@ fn rewrite_trigger_sql_for_column_rename(
     // breaking cross-table body refs.
     if trigger_database_id == crate::TEMP_DB_ID && is_renaming_trigger_table {
         let rewritten_trigger = crate::schema::Trigger::new(
-            trigger_name.name.as_str().to_string(),
+            Identifier::from(trigger_name.name.as_str()),
             new_sql.clone(),
-            tbl_name.name.as_str().to_string(),
+            Identifier::from(tbl_name.name.as_str()),
             time,
             new_event,
             for_each_row,
@@ -3822,14 +3829,14 @@ fn validate_trigger_table_refs_after_rename(
     altered_database_id: usize,
 ) -> Result<Option<String>> {
     if !table_reference_exists_after_rename(
-        &trigger.table_name,
+        trigger.table_name.as_str(),
         None,
         altered_table,
         resolver,
         trigger_database_id,
         altered_database_id,
     ) {
-        return Ok(Some(trigger.table_name.clone()));
+        return Ok(Some(trigger.table_name.as_str().to_owned()));
     }
 
     if let Some(when_expr) = &trigger.when_clause {

@@ -1320,7 +1320,7 @@ mod tests {
                 table_name: Identifier::from("item"),
                 where_clause: None,
                 columns: vec![IndexColumn {
-                    name: "id".to_string(),
+                    name: Identifier::from("id"),
                     order: SortOrder::Asc,
                     pos_in_table: 0,
                     collation: None,
@@ -1469,7 +1469,7 @@ mod tests {
                 table_name: Identifier::from("item"),
                 where_clause: None,
                 columns: vec![IndexColumn {
-                    name: "a".to_string(),
+                    name: Identifier::from("a"),
                     order: SortOrder::Asc,
                     pos_in_table: 1,
                     collation: None,
@@ -1583,7 +1583,7 @@ mod tests {
                 where_clause: None,
                 columns: vec![
                     IndexColumn {
-                        name: "id".to_string(),
+                        name: Identifier::from("id"),
                         order: SortOrder::Asc,
                         pos_in_table: 0,
                         collation: None,
@@ -1591,7 +1591,7 @@ mod tests {
                         expr: None,
                     },
                     IndexColumn {
-                        name: "kind".to_string(),
+                        name: Identifier::from("kind"),
                         order: SortOrder::Asc,
                         pos_in_table: 1,
                         collation: None,
@@ -1778,7 +1778,7 @@ mod tests {
                 table_name: Identifier::from("item"),
                 where_clause: None,
                 columns: vec![IndexColumn {
-                    name: "id".to_string(),
+                    name: Identifier::from("id"),
                     order: SortOrder::Asc,
                     pos_in_table: 0,
                     collation: None,

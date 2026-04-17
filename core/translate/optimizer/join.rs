@@ -2003,7 +2003,7 @@ mod tests {
             table_name: Identifier::from("test_table"),
             where_clause: None,
             columns: vec![IndexColumn {
-                name: "id".to_string(),
+                name: Identifier::from("id"),
                 order: SortOrder::Asc,
                 pos_in_table: 0,
                 collation: None,
@@ -2096,7 +2096,7 @@ mod tests {
             table_name: Identifier::from("table1"),
             where_clause: None,
             columns: vec![IndexColumn {
-                name: "id".to_string(),
+                name: Identifier::from("id"),
                 order: SortOrder::Asc,
                 pos_in_table: 0,
                 collation: None,
@@ -2238,7 +2238,7 @@ mod tests {
                     where_clause: None,
                     table_name: Identifier::from(*table_name),
                     columns: vec![IndexColumn {
-                        name: "id".to_string(),
+                        name: Identifier::from("id"),
                         order: SortOrder::Asc,
                         pos_in_table: 0,
                         collation: None,
@@ -2259,7 +2259,7 @@ mod tests {
             table_name: Identifier::from("orders"),
             where_clause: None,
             columns: vec![IndexColumn {
-                name: "customer_id".to_string(),
+                name: Identifier::from("customer_id"),
                 order: SortOrder::Asc,
                 pos_in_table: 1,
                 collation: None,
@@ -2278,7 +2278,7 @@ mod tests {
             table_name: Identifier::from("order_items"),
             where_clause: None,
             columns: vec![IndexColumn {
-                name: "order_id".to_string(),
+                name: Identifier::from("order_id"),
                 order: SortOrder::Asc,
                 pos_in_table: 1,
                 collation: None,
@@ -2773,7 +2773,7 @@ mod tests {
             where_clause: None,
             columns: vec![
                 IndexColumn {
-                    name: "x".to_string(),
+                    name: Identifier::from("x"),
                     order: SortOrder::Asc,
                     pos_in_table: 0,
                     collation: None,
@@ -2781,7 +2781,7 @@ mod tests {
                     expr: None,
                 },
                 IndexColumn {
-                    name: "y".to_string(),
+                    name: Identifier::from("y"),
                     order: SortOrder::Asc,
                     pos_in_table: 1,
                     collation: None,
@@ -2885,7 +2885,7 @@ mod tests {
             where_clause: None,
             columns: vec![
                 IndexColumn {
-                    name: "c1".to_string(),
+                    name: Identifier::from("c1"),
                     order: SortOrder::Asc,
                     pos_in_table: 0,
                     collation: None,
@@ -2893,7 +2893,7 @@ mod tests {
                     expr: None,
                 },
                 IndexColumn {
-                    name: "c2".to_string(),
+                    name: Identifier::from("c2"),
                     order: SortOrder::Asc,
                     pos_in_table: 1,
                     collation: None,
@@ -2901,7 +2901,7 @@ mod tests {
                     expr: None,
                 },
                 IndexColumn {
-                    name: "c3".to_string(),
+                    name: Identifier::from("c3"),
                     order: SortOrder::Asc,
                     pos_in_table: 2,
                     collation: None,
@@ -3024,7 +3024,7 @@ mod tests {
             where_clause: None,
             columns: vec![
                 IndexColumn {
-                    name: "c1".to_string(),
+                    name: Identifier::from("c1"),
                     order: SortOrder::Asc,
                     pos_in_table: 0,
                     collation: None,
@@ -3032,7 +3032,7 @@ mod tests {
                     expr: None,
                 },
                 IndexColumn {
-                    name: "c2".to_string(),
+                    name: Identifier::from("c2"),
                     order: SortOrder::Asc,
                     pos_in_table: 1,
                     collation: None,
@@ -3040,7 +3040,7 @@ mod tests {
                     expr: None,
                 },
                 IndexColumn {
-                    name: "c3".to_string(),
+                    name: Identifier::from("c3"),
                     order: SortOrder::Asc,
                     pos_in_table: 2,
                     collation: None,
@@ -3324,7 +3324,7 @@ mod tests {
             table_name: Identifier::from("t2"),
             where_clause: None,
             columns: vec![IndexColumn {
-                name: "a".to_string(),
+                name: Identifier::from("a"),
                 order: SortOrder::Asc,
                 pos_in_table: 0,
                 collation: None,

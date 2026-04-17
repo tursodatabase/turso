@@ -298,7 +298,7 @@ pub fn emit_fk_child_decrement_on_delete(
         // Fast path: if any FK column is NULL can't be a violation
         let null_skip = program.allocate_label();
         for cname in &fk_ref.child_cols {
-            let (pos, col) = child_tbl.get_column(cname).unwrap();
+            let (pos, col) = child_tbl.get_column(cname.as_str()).unwrap();
             let src = if col.is_rowid_alias() {
                 child_rowid_reg
             } else {
@@ -326,7 +326,7 @@ pub fn emit_fk_child_decrement_on_delete(
                 .expect("parent btree");
             let pcur = open_read_table(program, &parent_tbl, database_id);
 
-            let (pos, col) = child_tbl.get_column(&fk_ref.child_cols[0]).unwrap();
+            let (pos, col) = child_tbl.get_column(fk_ref.child_cols[0].as_str()).unwrap();
             let val = if col.is_rowid_alias() {
                 child_rowid_reg
             } else {
@@ -380,7 +380,7 @@ pub fn emit_fk_child_decrement_on_delete(
             let n = fk_ref.child_cols.len();
             let probe = program.alloc_registers(n);
             for (i, cname) in fk_ref.child_cols.iter().enumerate() {
-                let (pos, col) = child_tbl.get_column(cname).unwrap();
+                let (pos, col) = child_tbl.get_column(cname.as_str()).unwrap();
                 let src = if col.is_rowid_alias() {
                     child_rowid_reg
                 } else {
@@ -630,21 +630,21 @@ fn emit_delete_row_common(
     returning_buffer: Option<&ReturningBufferCtx>,
 ) -> Result<()> {
     let internal_id = unsafe { (*table_reference).internal_id };
-    let table_name_id = unsafe { &*table_reference }.table.get_name();
-    let table_name = table_name_id.as_str();
+    let table_name = unsafe { &*table_reference }.table.get_name();
 
     // Phase 1: Before Delete - build parent key registers and handle NoAction/Restrict.
     // CASCADE/SetNull/SetDefault actions are prepared but deferred until after Delete.
     let prepared_fk_actions = if connection.foreign_keys_enabled() {
         let delete_db_id = unsafe { (*table_reference).database_id };
         if let Some(table) = unsafe { &*table_reference }.btree() {
-            let prepared = if t_ctx.resolver.with_schema(delete_db_id, |s| {
-                s.any_resolved_fks_referencing(table_name_id)
-            }) {
+            let prepared = if t_ctx
+                .resolver
+                .with_schema(delete_db_id, |s| s.any_resolved_fks_referencing(table_name))
+            {
                 ForeignKeyActions::prepare_fk_delete_actions(
                     program,
                     &mut t_ctx.resolver,
-                    table_name,
+                    table_name.as_str(),
                     main_table_cursor_id,
                     rowid_reg,
                     None,
@@ -655,12 +655,12 @@ fn emit_delete_row_common(
             };
             if t_ctx
                 .resolver
-                .with_schema(delete_db_id, |s| s.has_child_fks(table_name_id))
+                .with_schema(delete_db_id, |s| s.has_child_fks(table_name))
             {
                 emit_fk_child_decrement_on_delete(
                     program,
                     &table,
-                    table_name,
+                    table_name.as_str(),
                     main_table_cursor_id,
                     rowid_reg,
                     delete_db_id,
@@ -690,7 +690,7 @@ fn emit_delete_row_common(
         let db_id = unsafe { (*table_reference).database_id };
         let all_indices: Vec<_> = t_ctx
             .resolver
-            .with_schema(db_id, |s| s.get_indices(table_name_id).cloned().collect());
+            .with_schema(db_id, |s| s.get_indices(table_name).cloned().collect());
 
         // Get indexes to delete from (skip the iteration index if specified)
         let indexes_to_delete = all_indices
@@ -819,10 +819,8 @@ fn emit_delete_row_common(
                 .iter_mut()
                 .filter(|s| !s.has_been_evaluated() && s.is_post_write_returning())
             {
-                let rerun_for_target_scan = subquery.reads_table(
-                    delete_table.database_id,
-                    delete_table.table.get_name().as_str(),
-                );
+                let rerun_for_target_scan =
+                    subquery.reads_table(delete_table.database_id, delete_table.table.get_name());
                 let subquery_plan = subquery.consume_plan(EvalAt::Loop(0));
                 emit_non_from_clause_subquery(
                     program,

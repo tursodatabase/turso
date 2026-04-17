@@ -1068,8 +1068,7 @@ pub fn emit_cdc_insns(
     before_record_reg: Option<usize>,
     after_record_reg: Option<usize>,
     updates_record_reg: Option<usize>,
-    //TODO Identifier
-    table_name: &str,
+    table_name: &Identifier,
 ) -> Result<()> {
     let cdc_info = program.capture_data_changes_info().as_ref();
     match cdc_info.map(|info| info.cdc_version()) {
@@ -1082,7 +1081,7 @@ pub fn emit_cdc_insns(
             before_record_reg,
             after_record_reg,
             updates_record_reg,
-            table_name,
+            table_name.as_str(),
         ),
         Some(crate::CdcVersion::V1) => emit_cdc_insns_v1(
             program,
@@ -1093,7 +1092,7 @@ pub fn emit_cdc_insns(
             before_record_reg,
             after_record_reg,
             updates_record_reg,
-            table_name,
+            table_name.as_str(),
         ),
         None => Err(crate::LimboError::InternalError(
             "cdc info not set".to_string(),
@@ -1886,7 +1885,7 @@ fn emit_check_constraint_bytecode(
         });
 
         let constraint_name = match &check_constraint.name {
-            Some(name) => name.clone(),
+            Some(name) => name.to_string(),
             None => format!("{}", check_constraint.expr),
         };
 
@@ -1933,10 +1932,8 @@ pub(crate) fn emit_check_constraints<'a>(
     program: &mut ProgramBuilder,
     check_constraints: &[CheckConstraint],
     resolver: &mut Resolver,
-    //TODO Identifier
     table_name: &str,
     rowid_reg: usize,
-    //TODO Identifier
     column_mappings: impl Iterator<Item = (&'a str, usize)>,
     connection: &Arc<Connection>,
     or_conflict: ResolveType,

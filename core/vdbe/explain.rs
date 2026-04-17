@@ -578,23 +578,20 @@ pub fn insn_to_row(
                 default,
             } => {
                 let cursor_type = &program.cursor_ref[*cursor_id].1;
-                let column_name: Option<&String> = match cursor_type {
+                let column_name: Option<&str> = match cursor_type {
                     CursorType::BTreeTable(table) => {
-                        let name = table.columns.get(*column).and_then(|v| v.name.as_ref());
-                        name
+                        table.columns.get(*column).and_then(|v| v.name.as_deref())
                     }
                     CursorType::BTreeIndex(index) => {
-                        let name = &index.columns.get(*column).expect("column index out of bounds").name;
-                        Some(name)
+                        Some(index.columns.get(*column).expect("column index out of bounds").name.as_str())
                     }
                     CursorType::MaterializedView(table, _) => {
-                        let name = table.columns.get(*column).and_then(|v| v.name.as_ref());
-                        name
+                        table.columns.get(*column).and_then(|v| v.name.as_deref())
                     }
                     CursorType::Pseudo(_) => None,
                     CursorType::Sorter => None,
                     CursorType::IndexMethod(..) => None,
-                    CursorType::VirtualTable(v) => v.columns.get(*column).expect("column index out of bounds").name.as_ref(),
+                    CursorType::VirtualTable(v) => v.columns.get(*column).expect("column index out of bounds").name.as_deref(),
                 };
                 (
                     "Column",

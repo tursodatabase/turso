@@ -24,7 +24,7 @@ impl IndexMethod for BackingBtreeIndexMethod {
         configuration: &IndexMethodConfiguration,
     ) -> Result<Arc<dyn IndexMethodAttachment>> {
         Ok(Arc::new(BackingBTreeIndexMethodAttachment(
-            configuration.index_name.clone(),
+            configuration.index_name.to_string(),
         )))
     }
 }

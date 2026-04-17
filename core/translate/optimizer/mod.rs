@@ -2937,7 +2937,7 @@ fn ephemeral_index_build(
                 GeneratedType::NotGenerated => None,
             };
             IndexColumn {
-                name: c.name.clone().unwrap(),
+                name: Identifier::from(c.name.as_deref().unwrap()),
                 order: SortOrder::Asc,
                 pos_in_table: i,
                 collation: c.collation_opt(),

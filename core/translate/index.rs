@@ -173,8 +173,8 @@ pub fn translate_create_index(
         if let Some(index_module) = index_module {
             let parameters = resolve_index_method_parameters(with_clause)?;
             index_method = Some(index_module.attach(&IndexMethodConfiguration {
-                table_name: tbl.name.to_string(),
-                index_name: idx_name.to_string(),
+                table_name: tbl.name.clone(),
+                index_name: idx_name.clone(),
                 columns: columns.clone(),
                 parameters,
             })?);
@@ -593,7 +593,7 @@ pub fn resolve_sorted_columns(
                 GeneratedType::NotGenerated => None,
             };
             resolved.push(IndexColumn {
-                name: column_name,
+                name: Identifier::from(column_name),
                 order,
                 pos_in_table: pos,
                 collation,
@@ -606,7 +606,7 @@ pub fn resolve_sorted_columns(
             crate::bail_parse_error!("Error: invalid expression in CREATE INDEX: {}", sc.expr);
         }
         resolved.push(IndexColumn {
-            name: sc.expr.to_string(),
+            name: Identifier::from(sc.expr.to_string()),
             order,
             pos_in_table: EXPR_INDEX_SENTINEL,
             collation: explicit_collation,
@@ -1048,7 +1048,7 @@ pub fn translate_drop_index(
             before_record_reg,
             None,
             None,
-            SQLITE_TABLEID,
+            &Identifier::from(SQLITE_TABLEID),
         )?;
     }
 
@@ -1127,24 +1127,22 @@ pub fn translate_optimize(
 
     let mut indexes_to_optimize = Vec::new();
 
-    if let Some(name) = idx_name {
+    if let Some(ref name) = idx_name {
         // Optimize a specific index
-        //TODO Identifier wtf
-        let idx_name = name.name.as_str();
-        let idx_id = Identifier::from(idx_name);
-        let database_id = resolver.resolve_existing_index_database_id(&name)?;
+        let idx_id = name.name.identifier();
+        let database_id = resolver.resolve_existing_index_database_id(name)?;
         let mut found = false;
 
         resolver.with_schema(database_id, |schema| {
             for val in schema.indexes.values() {
                 for idx in val {
-                    if idx_id == idx.name {
+                    if *idx_id == idx.name {
                         if idx.index_method.is_some() && !idx.is_backing_btree_index() {
                             indexes_to_optimize.push((database_id, idx.clone()));
                         } else {
                             tracing::debug!(
                                 "OPTIMIZE INDEX: {} is not an index method index, nothing to optimize",
-                                idx_name
+                                idx_id
                             );
                         }
                         found = true;
@@ -1159,7 +1157,7 @@ pub fn translate_optimize(
 
         if !found {
             return Err(LimboError::InvalidArgument(format!(
-                "No such index: {idx_name}"
+                "No such index: {idx_name:?}"
             )));
         }
     } else {

@@ -5394,6 +5394,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "strumbra"
+version = "0.6.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9b498044485e2789b38e047fdb4c7ac827bd72d66407af9e5d15626f9c45364e"
+
+[[package]]
 name = "subtle"
 version = "2.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6465,6 +6471,7 @@ dependencies = [
  "serde",
  "strum",
  "strum_macros",
+ "strumbra",
  "thiserror 2.0.16",
  "turso_macros",
 ]

@@ -3,6 +3,7 @@ use crate::translate::optimizer::constraints::ConstraintOperator;
 use crate::turso_assert;
 use tracing::{instrument, Level};
 use turso_parser::ast::{self, Expr, ResolveType, SubqueryType, TableInternalId, UnaryOperator};
+use turso_parser::identifier::Identifier;
 
 use super::collate::{get_collseq_from_expr, CollationSeq};
 use super::emitter::Resolver;
@@ -7578,7 +7579,7 @@ fn emit_array_encode(
     reg: usize,
     col: &Column,
     resolver: &Resolver,
-    table_name: &str,
+    table_name: &Identifier,
 ) -> Result<()> {
     if let Some(type_def) = resolver.schema().get_type_def_unchecked(&col.ty_str) {
         if let Some(encode_expr) = type_def.encode.as_ref() {
@@ -7587,7 +7588,7 @@ fn emit_array_encode(
                 reg,
                 element_affinity: Affinity::Blob,
                 element_type: "ANY".into(),
-                table_name: table_name.into(),
+                table_name: table_name.as_str().into(),
                 col_name: col.name.as_deref().unwrap_or("").into(),
             });
 
@@ -7616,7 +7617,7 @@ fn emit_array_encode(
         reg,
         element_affinity,
         element_type,
-        table_name: table_name.into(),
+        table_name: table_name.as_str().into(),
         col_name: col_name.into(),
     });
     Ok(())
@@ -7655,8 +7656,7 @@ pub(crate) fn emit_custom_type_encode_columns(
     columns: &[Column],
     start_reg: usize,
     only_columns: Option<&ColumnMask>,
-    //TODO Identifier
-    table_name: &str,
+    table_name: &Identifier,
     layout: &ColumnLayout,
 ) -> Result<()> {
     for (i, col) in columns.iter().enumerate() {

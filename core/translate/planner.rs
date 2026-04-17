@@ -63,19 +63,19 @@ struct CteDefinition {
 
 /// Collect all table names referenced in a SELECT's FROM clause.
 /// Used to determine which earlier CTEs a CTE directly depends on.
-fn collect_from_clause_table_refs(select: &Select, out: &mut Vec<String>) {
+fn collect_from_clause_table_refs(select: &Select, out: &mut Vec<Identifier>) {
     collect_from_select_body(&select.body, out);
     collect_subquery_table_refs_in_select_exprs(select, out);
 }
 
-fn collect_from_select_body(body: &ast::SelectBody, out: &mut Vec<String>) {
+fn collect_from_select_body(body: &ast::SelectBody, out: &mut Vec<Identifier>) {
     collect_from_one_select(&body.select, out);
     for compound in &body.compounds {
         collect_from_one_select(&compound.select, out);
     }
 }
 
-fn collect_from_one_select(one: &ast::OneSelect, out: &mut Vec<String>) {
+fn collect_from_one_select(one: &ast::OneSelect, out: &mut Vec<Identifier>) {
     match one {
         ast::OneSelect::Select { from, .. } => {
             if let Some(from_clause) = from {
@@ -89,12 +89,11 @@ fn collect_from_one_select(one: &ast::OneSelect, out: &mut Vec<String>) {
     }
 }
 
-//TODO Identifier
-fn collect_from_select_table(table: &ast::SelectTable, out: &mut Vec<String>) {
+fn collect_from_select_table(table: &ast::SelectTable, out: &mut Vec<Identifier>) {
     match table {
         ast::SelectTable::Table(qualified_name, _, _)
         | ast::SelectTable::TableCall(qualified_name, _, _) => {
-            out.push(qualified_name.name.as_str().to_owned());
+            out.push(qualified_name.name.identifier().clone());
         }
         ast::SelectTable::Select(subselect, _) => {
             collect_from_clause_table_refs(subselect, out);
@@ -109,7 +108,7 @@ fn collect_from_select_table(table: &ast::SelectTable, out: &mut Vec<String>) {
 }
 
 /// Collect table references from subqueries embedded in expressions.
-fn collect_subquery_table_refs_in_select_exprs(select: &Select, out: &mut Vec<String>) {
+fn collect_subquery_table_refs_in_select_exprs(select: &Select, out: &mut Vec<Identifier>) {
     collect_subquery_table_refs_in_one_select(&select.body.select, out);
     for compound in &select.body.compounds {
         collect_subquery_table_refs_in_one_select(&compound.select, out);
@@ -127,7 +126,7 @@ fn collect_subquery_table_refs_in_select_exprs(select: &Select, out: &mut Vec<St
     }
 }
 
-fn collect_subquery_table_refs_in_one_select(one: &ast::OneSelect, out: &mut Vec<String>) {
+fn collect_subquery_table_refs_in_one_select(one: &ast::OneSelect, out: &mut Vec<Identifier>) {
     match one {
         ast::OneSelect::Select {
             columns,
@@ -162,7 +161,7 @@ fn collect_subquery_table_refs_in_one_select(one: &ast::OneSelect, out: &mut Vec
     }
 }
 
-fn collect_subquery_table_refs_in_expr(expr: &Expr, out: &mut Vec<String>) {
+fn collect_subquery_table_refs_in_expr(expr: &Expr, out: &mut Vec<Identifier>) {
     let _ = walk_expr(expr, &mut |node: &Expr| -> Result<WalkControl> {
         match node {
             Expr::Exists(select) | Expr::Subquery(select) => {
@@ -529,7 +528,7 @@ fn plan_cte(
     // planning of its body. Without this, a same-named view would be expanded
     // recursively (stack overflow) and a same-named table would give wrong
     // results. `parse_table` checks this and produces "circular reference".
-    program.push_cte_being_defined(cte_def.name.to_string());
+    program.push_cte_being_defined(cte_def.name.clone());
 
     // Plan this CTE with fresh IDs
     let cte_plan = prepare_select_plan(
@@ -606,15 +605,11 @@ pub fn plan_ctes_as_outer_refs(
     }
 
     for cte in with.ctes {
-        //TODO Identifier
         let explicit_columns: Vec<String> = cte
             .columns
             .iter()
             .map(|c| c.col_name.as_str().to_owned())
             .collect();
-
-        //TODO clone is redundant
-        let cte_name = cte.tbl_name.identifier().clone();
 
         // Check for duplicate CTE names
         if table_references
@@ -625,6 +620,8 @@ pub fn plan_ctes_as_outer_refs(
             crate::bail_parse_error!("duplicate WITH table name: {}", cte.tbl_name.as_str());
         }
 
+        let cte_name = cte.tbl_name.into_identifier();
+
         // Clone the CTE select AST before planning, so we can store it for re-planning
         let cte_select_ast = cte.select.clone();
         // AS MATERIALIZED forces materialization
@@ -632,7 +629,7 @@ pub fn plan_ctes_as_outer_refs(
 
         // Block the CTE's own name from resolving to a schema object during
         // planning of its body (see push_cte_being_defined).
-        program.push_cte_being_defined(cte_name.to_string());
+        program.push_cte_being_defined(cte_name.clone());
 
         // Plan the CTE SELECT
         let cte_plan = prepare_select_plan(
@@ -820,8 +817,7 @@ fn parse_table(
 ) -> Result<()> {
     let database_id = resolver.resolve_existing_table_database_id_qualified(qualified_name)?;
     let table_name = &qualified_name.name;
-    //TODO Identifier redundant? and renamd?
-    let qualified_name_str = table_name.identifier().clone();
+    let table_identifier = table_name.identifier().clone();
 
     // Check if the FROM clause table is referring to a CTE in the current scope.
     // Each reference gets a freshly planned CTE to ensure unique internal_ids and cursor IDs.
@@ -910,7 +906,7 @@ fn parse_table(
                 if cols.len() != result_col_count {
                     crate::bail_parse_error!(
                         "table {} has {} columns but {} column names were provided",
-                        qualified_name_str,
+                        table_identifier,
                         result_col_count,
                         cols.len()
                     );
@@ -920,7 +916,7 @@ fn parse_table(
             // "SCAN cte_name AS alias" instead of just "SCAN alias".
             #[allow(clippy::redundant_clone)]
             let mut jt = JoinedTable::new_subquery_from_plan(
-                qualified_name_str.clone(),
+                table_identifier.clone(),
                 cte_plan,
                 None,
                 program.table_reference_counter.next(),
@@ -938,7 +934,7 @@ fn parse_table(
             table_references.add_joined_table(JoinedTable {
                 op: Operation::default_scan_for(&outer_table),
                 table: outer_table,
-                identifier: alias.unwrap_or(qualified_name_str),
+                identifier: alias.unwrap_or(table_identifier),
                 internal_id,
                 join_info: None,
                 col_used_mask: ColumnUsedMask::default(),
@@ -972,7 +968,7 @@ fn parse_table(
         table_references.add_joined_table(JoinedTable {
             op: Operation::default_scan_for(&tbl_ref),
             table: tbl_ref,
-            identifier: alias.unwrap_or(qualified_name_str),
+            identifier: alias.unwrap_or(table_identifier),
             internal_id,
             join_info: None,
             col_used_mask: ColumnUsedMask::default(),
@@ -1090,7 +1086,7 @@ fn parse_table(
                 index: None,
             }),
             table: Table::BTree(btree_table),
-            identifier: alias.unwrap_or_else(|| qualified_name_str.clone()),
+            identifier: alias.unwrap_or_else(|| table_identifier.clone()),
             internal_id: program.table_reference_counter.next(),
             join_info: None,
             col_used_mask: ColumnUsedMask::default(),
@@ -1109,8 +1105,7 @@ fn parse_table(
     // For other types of tables in the outer query references, we do not add them as joined tables,
     // because the query can simply _reference_ them in e.g. the SELECT columns or the WHERE clause,
     // but it's not part of the join order.
-    if let Some(outer_ref) =
-        table_references.find_outer_query_ref_by_identifier(&qualified_name_str)
+    if let Some(outer_ref) = table_references.find_outer_query_ref_by_identifier(&table_identifier)
     {
         if matches!(outer_ref.table, Table::FromClauseSubquery(_)) {
             table_references.add_joined_table(JoinedTable {
@@ -1131,7 +1126,7 @@ fn parse_table(
 
     // Check if this is an incompatible view
     let is_incompatible = resolver.with_schema(database_id, |schema| {
-        schema.incompatible_views.contains(&qualified_name_str)
+        schema.incompatible_views.contains(&table_identifier)
     });
 
     if is_incompatible {
@@ -1140,12 +1135,12 @@ fn parse_table(
             "Materialized view '{}' has an incompatible version. \n\
              The view was created with a different DBSP version than the current version ({}). \n\
              Please DROP and recreate the view to use it.",
-            qualified_name_str,
+            table_identifier,
             DBSP_CIRCUIT_VERSION
         );
     }
 
-    crate::bail_parse_error!("no such table: {}", qualified_name_str);
+    crate::bail_parse_error!("no such table: {}", table_identifier);
 }
 
 fn transform_args_into_where_terms(
@@ -1257,7 +1252,7 @@ pub fn parse_from(
                 .filter(|&i| {
                     referenced_tables
                         .iter()
-                        .any(|r| cte_definitions[i].name == **r)
+                        .any(|r| cte_definitions[i].name == *r)
                 })
                 .collect();
 

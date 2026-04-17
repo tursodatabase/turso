@@ -709,8 +709,7 @@ fn validate_check_types_in_expr(
 
 fn validate(
     body: &ast::CreateTableBody,
-    //TODO Identifier
-    table_name: &str,
+    table_name: &Identifier,
     resolver: &Resolver,
     conn: &Connection,
 ) -> Result<()> {
@@ -729,7 +728,7 @@ fn validate(
             for constraint in &col_i.constraints {
                 match &constraint.constraint {
                     ast::ColumnConstraint::Check(expr) => {
-                        validate_check_expr(expr, table_name, &column_names, resolver)?;
+                        validate_check_expr(expr, table_name.as_str(), &column_names, resolver)?;
                     }
                     ast::ColumnConstraint::Generated { .. }
                         if !conn.experimental_generated_columns_enabled() =>
@@ -747,18 +746,14 @@ fn validate(
                 }
             }
             for j in &columns[(i + 1)..] {
-                if col_i
-                    .col_name
-                    .as_str()
-                    .eq_ignore_ascii_case(j.col_name.as_str())
-                {
+                if col_i.col_name == j.col_name {
                     bail_parse_error!("duplicate column name: {}", j.col_name.as_str());
                 }
             }
         }
         for constraint in constraints {
             if let ast::TableConstraint::Check(ref expr) = constraint.constraint {
-                validate_check_expr(expr, table_name, &column_names, resolver)?;
+                validate_check_expr(expr, table_name.as_str(), &column_names, resolver)?;
             }
         }
 
@@ -862,7 +857,7 @@ pub fn translate_create_table(
     let schema_cookie = resolver.with_schema(database_id, |s| s.schema_version);
     program.begin_write_on_database(database_id, schema_cookie);
     let tbl_name_str = tbl_name.name.as_str();
-    validate(&body, tbl_name_str, resolver, connection)?;
+    validate(&body, tbl_name.name.identifier(), resolver, connection)?;
 
     // Gate array column types behind the experimental custom types flag.
     if !connection.experimental_custom_types_enabled() {
@@ -887,7 +882,6 @@ pub fn translate_create_table(
     if !connection.is_mvcc_bootstrap_connection()
         && RESERVED_TABLE_PREFIXES
             .iter()
-            //TODO Identifier
             .any(|prefix| tbl_name_str.to_ascii_lowercase().starts_with(prefix))
         && !connection.is_nested_stmt()
     {
@@ -1173,9 +1167,7 @@ pub fn emit_schema_entry(
     sqlite_schema_cursor_id: usize,
     cdc_table_cursor_id: Option<usize>,
     entry_type: SchemaEntryType,
-    //TODO Identifier
     name: &str,
-    //TODO Identifier
     tbl_name: &str,
     root_page_reg: usize,
     sql: Option<String>,
@@ -1244,7 +1236,7 @@ pub fn emit_schema_entry(
             None,
             after_record_reg,
             None,
-            SQLITE_TABLEID,
+            &Identifier::from(SQLITE_TABLEID),
         )?;
         emit_cdc_autocommit_commit(program, resolver, cdc_table_cursor_id)?;
     }
@@ -1263,7 +1255,6 @@ pub fn emit_schema_entry(
 fn collect_autoindexes(
     body: &ast::CreateTableBody,
     program: &mut ProgramBuilder,
-    //TODO Identifier
     tbl_name: &str,
 ) -> Result<Option<Vec<usize>>> {
     let table = create_table(tbl_name, body, 0)?;
@@ -1620,7 +1611,7 @@ pub fn translate_drop_table(
             before_record_reg,
             None,
             None,
-            SQLITE_TABLEID,
+            &Identifier::from(SQLITE_TABLEID),
         )?;
         program.resolve_label(skip_cdc_label, program.offset());
     }
@@ -1666,7 +1657,7 @@ pub fn translate_drop_table(
                     Some(db_id) => db_id == database_id,
                     None => !temp_has_shadow && database_id == crate::MAIN_DB_ID,
                 })
-                .map(|trigger| trigger.name.clone())
+                .map(|trigger| trigger.name.to_string())
                 .collect()
         });
 

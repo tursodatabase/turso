@@ -138,7 +138,7 @@ fn effective_collation_for_index_col(idx_col: &IndexColumn, table: &Table) -> St
     }
     // Otherwise use the table default, or default to BINARY
     table
-        .get_column_by_name(&idx_col.name)
+        .get_column_by_name(idx_col.name.as_str())
         .map(|s| s.1.collation().to_string())
         .unwrap_or_else(|| "binary".to_string())
 }
@@ -240,8 +240,7 @@ fn index_expression_cols(table: &Table, out: &mut ColumnMask, expr: &ast::Expr) 
                 }
             }
             Expr::Qualified(ns, c) | Expr::DoublyQualified(_, ns, c) => {
-                //TODO Identifier wtf
-                if ns.as_str() == table.get_name().as_str() {
+                if ns.identifier() == table.get_name() {
                     if let Some((i, _)) = table.get_column_by_name(c.as_str()) {
                         out.set(i);
                     }
@@ -281,10 +280,8 @@ pub fn upsert_matches_index(upsert: &Upsert, index: &Index, table: &Table) -> bo
                 if matched[i] || ic.expr.is_some() {
                     continue;
                 }
-                //TODO Identifier wtf
-                let iname = Identifier::from(ic.name.as_str());
                 let icoll = effective_collation_for_index_col(ic, table);
-                if iname == **tname
+                if ic.name == tname.as_str()
                     && match tk.collate.as_ref() {
                         Some(c) => c.eq_ignore_ascii_case(&icoll),
                         None => true, // unspecified collation -> accept any
@@ -520,7 +517,7 @@ pub fn emit_upsert(
             table,
             expr_current_start,
             ctx.conflict_rowid_reg,
-            Some(table.get_name().as_str()),
+            Some(table.get_name()),
             Some(insertion),
             true,
             excluded_decoded_start,
@@ -543,7 +540,7 @@ pub fn emit_upsert(
             table,
             expr_current_start,
             ctx.conflict_rowid_reg,
-            Some(table.get_name().as_str()),
+            Some(table.get_name()),
             Some(insertion),
             true,
             excluded_decoded_start,
@@ -610,7 +607,7 @@ pub fn emit_upsert(
                 &bt.columns,
                 new_start,
                 None,
-                bt.name.as_str(),
+                &bt.name,
                 &layout,
             )?;
 
@@ -875,7 +872,7 @@ pub fn emit_upsert(
                         table,
                         before,
                         ctx.conflict_rowid_reg,
-                        Some(table.get_name().as_str()),
+                        Some(table.get_name()),
                         None,
                         false,
                         None,
@@ -890,7 +887,7 @@ pub fn emit_upsert(
                         NoConstantOptReason::RegisterReuse,
                     )?;
                 } else {
-                    let (ci, _) = table.get_column_by_name(&ic.name).unwrap();
+                    let (ci, _) = table.get_column_by_name(ic.name.as_str()).unwrap();
                     program.emit_insn(Insn::Copy {
                         src_reg: layout.to_register(before, ci),
                         dst_reg: del + i,
@@ -934,7 +931,7 @@ pub fn emit_upsert(
                         table,
                         new_start,
                         new_rowid,
-                        Some(table.get_name().as_str()),
+                        Some(table.get_name()),
                         None,
                         false,
                         None,
@@ -949,7 +946,7 @@ pub fn emit_upsert(
                         NoConstantOptReason::RegisterReuse,
                     )?;
                 } else {
-                    let (ci, _) = table.get_column_by_name(&ic.name).unwrap();
+                    let (ci, _) = table.get_column_by_name(ic.name.as_str()).unwrap();
                     program.emit_insn(Insn::Copy {
                         src_reg: layout.to_register(new_start, ci),
                         dst_reg: ins + i,
@@ -982,7 +979,7 @@ pub fn emit_upsert(
                         c.expr.as_ref().map_or_else(
                             || {
                                 table
-                                    .get_column_by_name(&c.name)
+                                    .get_column_by_name(c.name.as_str())
                                     .map(|(_, col)| {
                                         let is_strict =
                                             table.btree().is_some_and(|btree| btree.is_strict);
@@ -1170,7 +1167,7 @@ pub fn emit_upsert(
                 before_rec,
                 None,
                 None,
-                table.get_name().as_str(),
+                table.get_name(),
             )?;
 
             // INSERT (after)
@@ -1190,7 +1187,7 @@ pub fn emit_upsert(
                 None,
                 after_rec,
                 None,
-                table.get_name().as_str(),
+                table.get_name(),
             )?;
         } else {
             let after_rec = if program.capture_data_changes_info().has_after() {
@@ -1225,7 +1222,7 @@ pub fn emit_upsert(
                 before_rec,
                 after_rec,
                 None,
-                table.get_name().as_str(),
+                table.get_name(),
             )?;
         }
     }
@@ -1318,8 +1315,7 @@ pub fn collect_set_clauses_for_upsert(
         .columns()
         .iter()
         .enumerate()
-        //TODO Identifier wtf
-        .filter_map(|(i, c)| c.name.as_ref().map(|n| (Identifier::from(n.as_str()), i)))
+        .filter_map(|(i, c)| c.name.as_deref().map(|n| (Identifier::from(n), i)))
         .collect();
 
     let mut out: Vec<(usize, Box<ast::Expr>)> = vec![];
@@ -1337,8 +1333,7 @@ pub fn collect_set_clauses_for_upsert(
             );
         }
         for (cn, e) in set.col_names.iter().zip(values.into_iter()) {
-            //TODO Identifier wtf
-            let Some(idx) = lookup.get(&Identifier::from(cn.as_str())) else {
+            let Some(idx) = lookup.get(cn.identifier()) else {
                 bail_parse_error!("no such column: {}", cn);
             };
             // cannot upsert generated column
@@ -1405,20 +1400,15 @@ fn rewrite_expr_to_registers(
     table: &Table,
     base_start: usize,
     rowid_reg: usize,
-    //TODO Identifier
-    table_name: Option<&str>,
+    table_name: Option<&Identifier>,
     insertion: Option<&Insertion>,
     allow_excluded: bool,
     excluded_decoded_start: Option<usize>,
     layout: &ColumnLayout,
 ) -> crate::Result<WalkControl> {
     use ast::Expr;
-    let table_name_id = table_name.map(Identifier::from);
 
-    // Map a column name to a register within the row image at `base_start`.
-    //TODO Identifier
     let col_reg_from_row_image = |name: &str| -> Option<usize> {
-        //TODO Identifier
         if ROWID_STRS.iter().any(|s| s.eq_ignore_ascii_case(name)) {
             return Some(rowid_reg);
         }
@@ -1462,7 +1452,7 @@ fn rewrite_expr_to_registers(
                     }
 
                     // Match the target table namespace if provided
-                    if let Some(ref tn) = table_name_id {
+                    if let Some(tn) = table_name {
                         if *tn == *ns.as_str() {
                             if let Some(r) = col_reg_from_row_image(c.as_str()) {
                                 *expr = Expr::Register(r);
