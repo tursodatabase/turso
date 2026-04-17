@@ -503,6 +503,18 @@ pub enum QueryDestination {
         /// The register that holds the RowSet object.
         rowset_reg: usize,
     },
+    /// The results of a recursive CTE are stored in both a result table and a queue table.
+    /// Used during recursive CTE execution for both base case and recursive step.
+    RecursiveCte {
+        /// The cursor ID of the result table (stores all results for final output and deduplication).
+        result_cursor: CursorID,
+        /// The cursor ID of the queue table (stores rows to be processed in the next iteration).
+        queue_cursor: CursorID,
+        /// The number of columns in the CTE.
+        num_cols: usize,
+        /// Whether this is UNION ALL (no deduplication) or UNION (with deduplication).
+        is_union_all: bool,
+    },
     /// Decision made at some point after query plan construction.
     Unset,
 }
@@ -686,7 +698,7 @@ impl SelectPlan {
                     Table::FromClauseSubquery(subquery) => {
                         subquery.plan.reads_table(database_id, table_name)
                     }
-                    Table::BTree(_) | Table::Virtual(_) => false,
+                    Table::BTree(_) | Table::Virtual(_) | Table::RecursiveCte(_) => false,
                 }
         }) || self
             .non_from_clause_subqueries
@@ -1945,6 +1957,9 @@ impl Operation {
             Table::FromClauseSubquery(_) => Operation::Scan(Scan::Subquery {
                 iter_dir: IterationDirection::Forwards,
             }),
+            Table::RecursiveCte(cte) => Operation::Scan(Scan::RecursiveCte {
+                cursor_id: cte.cursor_id,
+            }),
         }
     }
 
@@ -2347,6 +2362,8 @@ impl JoinedTable {
                     .transpose()?;
                 Ok((None, index_cursor_id))
             }
+            // RecursiveCte cursors are managed externally by the recursive CTE execution loop
+            Table::RecursiveCte(..) => Ok((None, None)),
         }
     }
 
@@ -2621,13 +2638,13 @@ pub enum Scan {
         /// The index that we are using to scan the table, if any.
         index: Option<Arc<Index>>,
     },
-    /// A scan of a virtual table, delegated to the table’s `filter` and related methods.
+    /// A scan of a virtual table, delegated to the table's `filter` and related methods.
     VirtualTable {
         /// Index identifier returned by the table's `best_index` method.
         idx_num: i32,
-        /// Optional index name returned by the table’s `best_index` method.
+        /// Optional index name returned by the table's `best_index` method.
         idx_str: Option<String>,
-        /// Constraining expressions to be passed to the table’s `filter` method.
+        /// Constraining expressions to be passed to the table's `filter` method.
         /// The order of expressions matches the argument order expected by the virtual table.
         constraints: Vec<Expr>,
     },
@@ -2637,6 +2654,11 @@ pub enum Scan {
         /// also be scanned backwards when the planner relies on intrinsic
         /// subquery order for an extremum fast path.
         iter_dir: IterationDirection,
+    },
+    /// A scan of a recursive CTE table backed by an ephemeral queue cursor.
+    RecursiveCte {
+        /// The cursor ID of the ephemeral queue to scan.
+        cursor_id: usize,
     },
 }
 

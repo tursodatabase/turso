@@ -2186,10 +2186,15 @@ fn optimize_table_access(
                 )?;
             }
             AccessMethodParams::Subquery { iter_dir } => {
-                table_references.joined_tables_mut()[table_idx].op =
-                    Operation::Scan(Scan::Subquery {
+                let table = &table_references.joined_tables()[table_idx].table;
+                table_references.joined_tables_mut()[table_idx].op = match table {
+                    Table::RecursiveCte(cte) => Operation::Scan(Scan::RecursiveCte {
+                        cursor_id: cte.cursor_id,
+                    }),
+                    _ => Operation::Scan(Scan::Subquery {
                         iter_dir: *iter_dir,
-                    });
+                    }),
+                };
             }
             AccessMethodParams::MaterializedSubquery {
                 index,
