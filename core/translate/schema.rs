@@ -4,8 +4,9 @@ use crate::HashMap;
 use crate::ext::VTabImpl;
 use crate::function::{Deterministic, Func, MathFunc, ScalarFunc};
 use crate::schema::{
-    create_table, translate_ident_to_string_literal, BTreeTable, ColDef, Column, SchemaObjectType,
-    Table, Type, RESERVED_TABLE_PREFIXES, SQLITE_SEQUENCE_TABLE_NAME, TURSO_TYPES_TABLE_NAME,
+    create_table, translate_ident_to_string_literal, BTreeCharacteristics, BTreeTable, ColDef,
+    Column, SchemaObjectType, Table, Type, RESERVED_TABLE_PREFIXES, SQLITE_SEQUENCE_TABLE_NAME,
+    TURSO_TYPES_TABLE_NAME,
 };
 use crate::stats::STATS_TABLE;
 use crate::storage::pager::CreateBTreeFlags;
@@ -2057,23 +2058,17 @@ pub fn translate_drop_table(
             None,
             ColDef::default(),
         )];
-        let logical_to_physical_map = BTreeTable::build_logical_to_physical_map(&columns);
-        let simple_table_rc = Arc::new(BTreeTable {
-            root_page: 0, // Not relevant for ephemeral table definition
-            name: "ephemeral_scratch".to_string(),
-            has_rowid: true,
-            has_autoincrement: false,
-            primary_key_columns: vec![],
+        let simple_table_rc = Arc::new(BTreeTable::new(
+            0, // root_page, not relevant for ephemeral table definition
+            "ephemeral_scratch".to_string(),
+            vec![],
             columns,
-            is_strict: false,
-            unique_sets: vec![],
-            foreign_keys: vec![],
-            check_constraints: vec![],
-            rowid_alias_conflict_clause: None,
-            has_virtual_columns: false,
-            logical_to_physical_map,
-            column_dependencies: Default::default(),
-        });
+            BTreeCharacteristics::HAS_ROWID,
+            vec![],
+            vec![],
+            vec![],
+            None,
+        ));
         // cursor id 2
         let ephemeral_cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(simple_table_rc));
         program.emit_insn(Insn::OpenEphemeral {

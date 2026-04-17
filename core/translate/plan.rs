@@ -1411,6 +1411,14 @@ impl ColumnMask {
         }
     }
 
+    /// Sets every bit that is set in `other`. Inner word-granularity loop
+    /// (via [`BitSet::union_with`]) is written in a shape that LLVM
+    /// auto-vectorizes when the `overflow` vecs are long enough to matter.
+    pub fn set_all(&mut self, other: &ColumnMask) {
+        self.bitset.union_with(&other.bitset);
+        self.has_rowid_sentinel |= other.has_rowid_sentinel;
+    }
+
     pub fn get(&self, idx: usize) -> bool {
         if idx == ROWID_SENTINEL {
             self.has_rowid_sentinel
@@ -1432,10 +1440,6 @@ impl ColumnMask {
         self.bitset.iter().chain(rowid_sentinel)
     }
 
-    pub fn union_with(&mut self, other: &ColumnMask) {
-        self.bitset.union_with(&other.bitset);
-        self.has_rowid_sentinel |= other.has_rowid_sentinel;
-    }
 }
 
 impl FromIterator<usize> for ColumnMask {

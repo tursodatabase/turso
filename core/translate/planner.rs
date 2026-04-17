@@ -1055,25 +1055,17 @@ fn parse_table(
         // This is a materialized view with storage - treat it as a regular BTree table
         // Create a BTreeTable from the view's metadata
         let columns = view_guard.column_schema.flat_columns();
-        let logical_to_physical_map =
-            crate::schema::BTreeTable::build_logical_to_physical_map(&columns);
-        let btree_table = Arc::new(crate::schema::BTreeTable {
-            name: view_guard.name().to_string(),
+        let btree_table = Arc::new(crate::schema::BTreeTable::new(
             root_page,
+            view_guard.name().to_string(),
+            Vec::new(),
             columns,
-            primary_key_columns: Vec::new(),
-            has_rowid: true,
-            is_strict: false,
-            has_autoincrement: false,
-
-            unique_sets: vec![],
-            foreign_keys: vec![],
-            check_constraints: vec![],
-            rowid_alias_conflict_clause: None,
-            has_virtual_columns: false,
-            logical_to_physical_map,
-            column_dependencies: Default::default(),
-        });
+            crate::schema::BTreeCharacteristics::HAS_ROWID,
+            vec![],
+            vec![],
+            vec![],
+            None,
+        ));
         drop(view_guard);
 
         let alias = maybe_alias.map(|a| normalize_ident(a.name().as_str()));

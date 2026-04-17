@@ -5,7 +5,7 @@ use turso_parser::ast::{self, SortOrder, SubqueryType};
 
 use crate::{
     emit_explain,
-    schema::{BTreeTable, Column, Index, IndexColumn, Table},
+    schema::{BTreeCharacteristics, BTreeTable, Column, Index, IndexColumn, Table},
     translate::{
         collate::get_collseq_from_expr,
         compound_select::emit_program_for_compound_select,
@@ -1528,23 +1528,17 @@ fn emit_materialized_subquery_table(
     // insertion order, which SQL semantics require for UNION ALL. It also
     // needs the subquery's column layout so later Column opcodes can read
     // materialized rows through the normal table-cursor path.
-    let logical_to_physical_map = BTreeTable::build_logical_to_physical_map(columns);
-    let ephemeral_table = Arc::new(BTreeTable {
-        root_page: 0,
-        name: String::new(),
-        columns: columns.to_vec(),
-        primary_key_columns: vec![],
-        has_rowid: true,
-        is_strict: false,
-        has_autoincrement: false,
-        unique_sets: vec![],
-        foreign_keys: vec![],
-        check_constraints: vec![],
-        rowid_alias_conflict_clause: None,
-        has_virtual_columns: false,
-        logical_to_physical_map,
-        column_dependencies: Default::default(),
-    });
+    let ephemeral_table = Arc::new(BTreeTable::new(
+        0,
+        String::new(),
+        vec![],
+        columns.to_vec(),
+        BTreeCharacteristics::HAS_ROWID,
+        vec![],
+        vec![],
+        vec![],
+        None,
+    ));
 
     let cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(ephemeral_table.clone()));
 

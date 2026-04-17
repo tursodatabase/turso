@@ -1421,7 +1421,9 @@ impl IncrementalView {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::schema::{BTreeTable, ColDef, Column as SchemaColumn, Schema, Type};
+    use crate::schema::{
+        BTreeCharacteristics, BTreeTable, ColDef, Column as SchemaColumn, Schema, Type,
+    };
     use crate::sync::Arc;
     use turso_parser::ast;
     use turso_parser::parser::Parser;
@@ -1450,23 +1452,17 @@ mod tests {
             ),
             SchemaColumn::new_default_text(Some("name".to_string()), "TEXT".to_string(), None),
         ];
-        let logical_to_physical_map = BTreeTable::build_logical_to_physical_map(&columns);
-        let customers_table = BTreeTable {
-            name: "customers".to_string(),
-            root_page: 2,
-            primary_key_columns: vec![("id".to_string(), ast::SortOrder::Asc)],
+        let customers_table = BTreeTable::new(
+            2,
+            "customers".to_string(),
+            vec![("id".to_string(), ast::SortOrder::Asc)],
             columns,
-            has_rowid: true,
-            is_strict: false,
-            unique_sets: vec![],
-            foreign_keys: vec![],
-            check_constraints: vec![],
-            rowid_alias_conflict_clause: None,
-            has_autoincrement: false,
-            has_virtual_columns: false,
-            logical_to_physical_map,
-            column_dependencies: Default::default(),
-        };
+            BTreeCharacteristics::HAS_ROWID,
+            vec![],
+            vec![],
+            vec![],
+            None,
+        );
 
         // Create orders table
         let columns = vec![
@@ -1501,23 +1497,17 @@ mod tests {
                 None,
             ),
         ];
-        let logical_to_physical_map = BTreeTable::build_logical_to_physical_map(&columns);
-        let orders_table = BTreeTable {
-            name: "orders".to_string(),
-            root_page: 3,
-            primary_key_columns: vec![("id".to_string(), ast::SortOrder::Asc)],
+        let orders_table = BTreeTable::new(
+            3,
+            "orders".to_string(),
+            vec![("id".to_string(), ast::SortOrder::Asc)],
             columns,
-            has_rowid: true,
-            is_strict: false,
-            has_autoincrement: false,
-            foreign_keys: vec![],
-            check_constraints: vec![],
-            rowid_alias_conflict_clause: None,
-            unique_sets: vec![],
-            has_virtual_columns: false,
-            logical_to_physical_map,
-            column_dependencies: Default::default(),
-        };
+            BTreeCharacteristics::HAS_ROWID,
+            vec![],
+            vec![],
+            vec![],
+            None,
+        );
 
         // Create products table
         let columns = vec![
@@ -1548,23 +1538,17 @@ mod tests {
                 ColDef::default(),
             ),
         ];
-        let logical_to_physical_map = BTreeTable::build_logical_to_physical_map(&columns);
-        let products_table = BTreeTable {
-            name: "products".to_string(),
-            root_page: 4,
-            primary_key_columns: vec![("id".to_string(), ast::SortOrder::Asc)],
+        let products_table = BTreeTable::new(
+            4,
+            "products".to_string(),
+            vec![("id".to_string(), ast::SortOrder::Asc)],
             columns,
-            has_rowid: true,
-            is_strict: false,
-            has_autoincrement: false,
-            foreign_keys: vec![],
-            check_constraints: vec![],
-            rowid_alias_conflict_clause: None,
-            unique_sets: vec![],
-            has_virtual_columns: false,
-            logical_to_physical_map,
-            column_dependencies: Default::default(),
-        };
+            BTreeCharacteristics::HAS_ROWID,
+            vec![],
+            vec![],
+            vec![],
+            None,
+        );
 
         // Create logs table - without a rowid alias (no INTEGER PRIMARY KEY)
         let columns = vec![
@@ -1588,23 +1572,18 @@ mod tests {
                 None,
             ),
         ];
-        let logical_to_physical_map = BTreeTable::build_logical_to_physical_map(&columns);
-        let logs_table = BTreeTable {
-            name: "logs".to_string(),
-            root_page: 5,
-            primary_key_columns: vec![], // No primary key, so no rowid alias
+        // logs has no primary key (no rowid alias) but does have an implicit rowid.
+        let logs_table = BTreeTable::new(
+            5,
+            "logs".to_string(),
+            vec![],
             columns,
-            has_rowid: true, // Has implicit rowid but no alias
-            is_strict: false,
-            has_autoincrement: false,
-            foreign_keys: vec![],
-            check_constraints: vec![],
-            rowid_alias_conflict_clause: None,
-            unique_sets: vec![],
-            has_virtual_columns: false,
-            logical_to_physical_map,
-            column_dependencies: Default::default(),
-        };
+            BTreeCharacteristics::HAS_ROWID,
+            vec![],
+            vec![],
+            vec![],
+            None,
+        );
 
         schema
             .add_btree_table(Arc::new(customers_table))
