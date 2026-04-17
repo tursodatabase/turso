@@ -90,11 +90,7 @@ pub fn translate(
         query_mode,
         connection.get_capture_data_changes_info().clone(),
         // These options will be extended whithin each translate program
-        ProgramBuilderOpts {
-            num_cursors: 1,
-            approx_num_insns: 32,
-            approx_num_labels: 2,
-        },
+        ProgramBuilderOpts::new(1, 32, 2),
     );
 
     program.prologue();

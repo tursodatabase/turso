@@ -1,23 +1,21 @@
-use crate::sync::Arc;
-use rustc_hash::FxHashMap as HashMap;
-
 use crate::error::SQLITE_CONSTRAINT_UNIQUE;
 use crate::function::{Deterministic, Func, ScalarFunc};
 use crate::index_method::IndexMethodConfiguration;
 use crate::numeric::Numeric;
 use crate::schema::{Column, GeneratedType, Table, EXPR_INDEX_SENTINEL, RESERVED_TABLE_PREFIXES};
-use crate::translate::collate::CollationSeq;
-use crate::translate::emitter::{
-    emit_cdc_autocommit_commit, emit_cdc_full_record, emit_cdc_insns, prepare_cdc_if_necessary,
-    OperationMode, Resolver,
-};
-use crate::translate::expr::{
-    bind_and_rewrite_expr, translate_condition_expr, translate_expr, unwrap_parens, walk_expr,
-    BindingBehavior, ConditionMetadata, WalkControl,
-};
-use crate::translate::insert::format_unique_violation_desc;
-use crate::translate::plan::{
-    ColumnUsedMask, IterationDirection, JoinedTable, Operation, Scan, TableReferences,
+use crate::sync::Arc;
+use crate::translate::{
+    collate::CollationSeq,
+    emitter::{
+        emit_cdc_autocommit_commit, emit_cdc_full_record, emit_cdc_insns, prepare_cdc_if_necessary,
+        OperationMode, Resolver,
+    },
+    expr::{
+        bind_and_rewrite_expr, translate_condition_expr, translate_expr, unwrap_parens, walk_expr,
+        BindingBehavior, ConditionMetadata, WalkControl,
+    },
+    insert::format_unique_violation_desc,
+    plan::{ColumnUsedMask, IterationDirection, JoinedTable, Operation, Scan, TableReferences},
 };
 use crate::vdbe::builder::{CursorKey, ProgramBuilderOpts, SelfTableContext};
 use crate::vdbe::insn::{to_u16, CmpInsFlags, Cookie};
@@ -31,6 +29,7 @@ use crate::{
         insn::{IdxInsertFlags, Insn, RegisterOrLiteral},
     },
 };
+use rustc_hash::FxHashMap as HashMap;
 use turso_parser::ast::{self, Expr, QualifiedName, SortOrder, SortedColumn};
 
 use super::schema::{emit_schema_entry, SchemaEntryType, SQLITE_TABLEID};
@@ -46,6 +45,40 @@ fn canonical_create_index_sql(stmt: &ast::Stmt) -> String {
     // e.g. CREATE INDEX aux.idx1 ON t1 (name) -> CREATE INDEX idx1 ON t1 (name)
     idx_name.db_name = None;
     canonical_stmt.to_string()
+}
+
+fn validate(
+    tbl_name: &str,
+    idx_name: &str,
+    original_idx_name: &QualifiedName,
+    using: &Option<ast::Name>,
+    with_clause: &[(ast::Name, Box<Expr>)],
+    connection: &Arc<crate::Connection>,
+) -> crate::Result<()> {
+    if !connection.experimental_index_method_enabled()
+        && (using.is_some() || !with_clause.is_empty())
+    {
+        bail_parse_error!(
+            "index method is an experimental feature. Enable with --experimental-index-method flag"
+        )
+    }
+    if connection.mvcc_enabled() && using.is_some() {
+        bail_parse_error!("Custom index modules are not supported in MVCC mode");
+    }
+    if tbl_name.eq_ignore_ascii_case("sqlite_sequence") {
+        crate::bail_parse_error!("table sqlite_sequence may not be indexed");
+    }
+    if RESERVED_TABLE_PREFIXES
+        .iter()
+        .any(|prefix| idx_name.starts_with(prefix) || tbl_name.starts_with(prefix))
+        && !connection.is_nested_stmt()
+    {
+        bail_parse_error!(
+            "Object name reserved for internal use: {}",
+            original_idx_name
+        );
+    }
+    Ok(())
 }
 
 pub fn translate_create_index(
@@ -69,18 +102,6 @@ pub fn translate_create_index(
         panic!("translate_create_index must be called with CreateIndex AST node");
     };
 
-    if !connection.experimental_index_method_enabled()
-        && (using.is_some() || !with_clause.is_empty())
-    {
-        bail_parse_error!(
-            "index method is an experimental feature. Enable with --experimental-index-method flag"
-        )
-    }
-
-    if connection.mvcc_enabled() && using.is_some() {
-        bail_parse_error!("Custom index modules are not supported in MVCC mode");
-    }
-
     let original_idx_name = idx_name;
     let database_id = if original_idx_name.db_name.is_some() {
         resolver.resolve_database_id(&original_idx_name)?
@@ -90,24 +111,15 @@ pub fn translate_create_index(
     let idx_name = normalize_ident(original_idx_name.name.as_str());
     let tbl_name = normalize_ident(tbl_name.as_str());
 
-    if tbl_name.eq_ignore_ascii_case("sqlite_sequence") {
-        crate::bail_parse_error!("table sqlite_sequence may not be indexed");
-    }
-    if RESERVED_TABLE_PREFIXES
-        .iter()
-        .any(|prefix| idx_name.starts_with(prefix) || tbl_name.starts_with(prefix))
-        && !connection.is_nested_stmt()
-    {
-        bail_parse_error!(
-            "Object name reserved for internal use: {}",
-            original_idx_name
-        );
-    }
-    let opts = ProgramBuilderOpts {
-        num_cursors: 5,
-        approx_num_insns: 40,
-        approx_num_labels: 5,
-    };
+    validate(
+        &tbl_name,
+        &idx_name,
+        &original_idx_name,
+        &using,
+        &with_clause,
+        connection,
+    )?;
+    let opts = ProgramBuilderOpts::new(5, 40, 5);
     program.extend(&opts);
 
     let schema_cookie = resolver.with_schema(database_id, |s| s.schema_version);
@@ -903,11 +915,7 @@ pub fn translate_drop_index(
 ) -> crate::Result<()> {
     let database_id = resolver.resolve_existing_index_database_id(qualified_name)?;
     let idx_name = normalize_ident(qualified_name.name.as_str());
-    let opts = ProgramBuilderOpts {
-        num_cursors: 5,
-        approx_num_insns: 40,
-        approx_num_labels: 5,
-    };
+    let opts = ProgramBuilderOpts::new(5, 40, 5);
     program.extend(&opts);
 
     let schema_cookie = resolver.with_schema(database_id, |s| s.schema_version);
@@ -1117,11 +1125,7 @@ pub fn translate_optimize(
         )
     }
 
-    let opts = ProgramBuilderOpts {
-        num_cursors: 5,
-        approx_num_insns: 20,
-        approx_num_labels: 2,
-    };
+    let opts = ProgramBuilderOpts::new(5, 20, 2);
     program.extend(&opts);
 
     let mut indexes_to_optimize = Vec::new();

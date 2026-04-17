@@ -1336,11 +1336,7 @@ fn emit_key_change_check(
 }
 
 /// Common options for FK action subprogram builders.
-const FK_SUBPROGRAM_OPTS: ProgramBuilderOpts = ProgramBuilderOpts {
-    num_cursors: 2,
-    approx_num_insns: 32,
-    approx_num_labels: 4,
-};
+const FK_SUBPROGRAM_OPTS: ProgramBuilderOpts = ProgramBuilderOpts::new(2, 32, 4);
 
 /// Compile and emit an FK action as a sub-program.
 /// This is the common implementation for CASCADE DELETE, SET NULL, SET DEFAULT, and CASCADE UPDATE.

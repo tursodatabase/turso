@@ -1,13 +1,8 @@
-use rustc_hash::FxHashMap as HashMap;
-use smallvec::SmallVec;
-use std::{cmp::Ordering, marker::PhantomData, sync::Arc};
-use turso_parser::ast::{
-    self, FrameBound, FrameClause, FrameExclude, FrameMode, ResolveType, SortOrder, SubqueryType,
-};
-
 use crate::{
     function::{AggFunc, WindowFunc},
-    schema::{BTreeTable, ColDef, Column, FromClauseSubquery, Index, Schema, Table},
+    schema::{
+        BTreeTable, ColDef, Column, FromClauseSubquery, Index, Schema, Table, Type, ROWID_SENTINEL,
+    },
     translate::{
         collate::{get_collseq_from_expr, CollationSeq},
         emitter::UpdateRowSource,
@@ -16,15 +11,23 @@ use crate::{
         optimizer::constraints::{BinaryExprSide, SeekRangeConstraint},
         planner::determine_where_to_eval_term,
     },
+    types::SeekOp,
+    util::exprs_are_equivalent,
     vdbe::{
         affinity::{self, Affinity},
         builder::{CursorKey, CursorType, ProgramBuilder},
         insn::{HashDistinctData, Insn},
         BranchOffset, CursorID,
     },
-    Result, VirtualTable,
+    Result, VirtualTable, MAIN_DB_ID,
 };
-use crate::{schema::Type, types::SeekOp, MAIN_DB_ID};
+use rustc_hash::FxHashMap as HashMap;
+use smallvec::SmallVec;
+use std::{cmp::Ordering, marker::PhantomData, sync::Arc};
+use turso_parser::ast::{
+    self, Expr, FrameBound, FrameClause, FrameExclude, FrameMode, ResolveType, SortOrder,
+    SubqueryType,
+};
 
 use turso_parser::ast::TableInternalId;
 
@@ -219,10 +222,6 @@ impl From<Expr> for WhereTerm {
         }
     }
 }
-
-use crate::ast::Expr;
-use crate::schema::ROWID_SENTINEL;
-use crate::util::exprs_are_equivalent;
 
 /// The loop index where to evaluate the condition.
 /// For example, in `SELECT * FROM u JOIN p WHERE u.id = 5`, the condition can already be evaluated at the first loop (idx 0),

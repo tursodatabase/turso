@@ -883,11 +883,7 @@ pub fn translate_create_table(
         }
     }
 
-    let opts = ProgramBuilderOpts {
-        num_cursors: 1,
-        approx_num_insns: 30,
-        approx_num_labels: 1,
-    };
+    let opts = ProgramBuilderOpts::new(1, 30, 1);
     program.extend(&opts);
 
     if !connection.is_mvcc_bootstrap_connection()
@@ -1387,11 +1383,7 @@ pub fn translate_create_virtual_table(
         bail_parse_error!("Table {} already exists", tbl_name);
     }
 
-    let opts = ProgramBuilderOpts {
-        num_cursors: 2,
-        approx_num_insns: 40,
-        approx_num_labels: 2,
-    };
+    let opts = ProgramBuilderOpts::new(2, 40, 2);
     program.extend(&opts);
     let module_name_reg = program.emit_string8_new_reg(module_name_str.clone());
     let table_name_reg = program.emit_string8_new_reg(table_name.clone());
@@ -1493,11 +1485,7 @@ pub fn translate_drop_table(
 ) -> Result<()> {
     let database_id = resolver.resolve_existing_table_database_id_qualified(&tbl_name)?;
     let name = tbl_name.name.as_str();
-    let opts = ProgramBuilderOpts {
-        num_cursors: 4,
-        approx_num_insns: 40,
-        approx_num_labels: 4,
-    };
+    let opts = ProgramBuilderOpts::new(4, 40, 4);
     program.extend(&opts);
 
     let schema_cookie = resolver.with_schema(database_id, |s| s.schema_version);

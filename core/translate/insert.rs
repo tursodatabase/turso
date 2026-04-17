@@ -247,11 +247,7 @@ pub fn translate_insert(
     program: &mut ProgramBuilder,
     connection: &Arc<crate::Connection>,
 ) -> Result<()> {
-    let opts = ProgramBuilderOpts {
-        num_cursors: 1,
-        approx_num_insns: 30,
-        approx_num_labels: 5,
-    };
+    let opts = ProgramBuilderOpts::new(1, 30, 5);
     program.extend(&opts);
 
     // Merge INSERT's WITH clause into the SELECT source's WITH clause.

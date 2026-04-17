@@ -476,6 +476,20 @@ pub struct ProgramBuilderOpts {
     pub approx_num_labels: usize,
 }
 
+impl ProgramBuilderOpts {
+    pub const fn new(
+        num_cursors: usize,
+        approx_num_insns: usize,
+        approx_num_labels: usize,
+    ) -> Self {
+        Self {
+            num_cursors,
+            approx_num_insns,
+            approx_num_labels,
+        }
+    }
+}
+
 /// Use this macro to emit an OP_Explain instruction.
 /// Please use this macro instead of calling emit_explain() directly,
 /// because we want to avoid allocating a String if we are not in explain mode.

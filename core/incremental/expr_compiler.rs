@@ -301,15 +301,8 @@ impl CompiledExpression {
 
         // Fall back to VDBE compilation for complex expressions
         // Create a minimal program builder for expression compilation
-        let mut builder = ProgramBuilder::new(
-            QueryMode::Normal,
-            None,
-            ProgramBuilderOpts {
-                num_cursors: 0,
-                approx_num_insns: 5,  // Most expressions are simple
-                approx_num_labels: 0, // Expressions don't need labels
-            },
-        );
+        let mut builder =
+            ProgramBuilder::new(QueryMode::Normal, None, ProgramBuilderOpts::new(0, 5, 0));
 
         // Allocate registers for input values
         let input_count = input_column_names.len();

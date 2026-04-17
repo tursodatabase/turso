@@ -165,11 +165,7 @@ pub fn translate_delete(
         connection,
         database_id,
     )?;
-    let opts = ProgramBuilderOpts {
-        num_cursors: 1,
-        approx_num_insns: estimate_num_instructions(delete),
-        approx_num_labels: 0,
-    };
+    let opts = ProgramBuilderOpts::new(1, estimate_num_instructions(delete), 0);
     program.extend(&opts);
     emit_program(connection, resolver, program, delete_plan, |_| {})?;
     Ok(())

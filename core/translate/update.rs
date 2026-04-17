@@ -102,11 +102,7 @@ pub fn translate_update(
         )?;
     }
 
-    let opts = ProgramBuilderOpts {
-        num_cursors: 1,
-        approx_num_insns: 20,
-        approx_num_labels: 4,
-    };
+    let opts = ProgramBuilderOpts::new(1, 20, 4);
     program.extend(&opts);
     emit_program(connection, resolver, program, plan, |_| {})?;
     Ok(())
@@ -152,11 +148,7 @@ pub fn translate_update_for_schema_change(
     }
 
     optimize_plan(program, &mut plan, resolver)?;
-    let opts = ProgramBuilderOpts {
-        num_cursors: 1,
-        approx_num_insns: 20,
-        approx_num_labels: 4,
-    };
+    let opts = ProgramBuilderOpts::new(1, 20, 4);
     program.extend(&opts);
     emit_program(connection, resolver, program, plan, after)?;
     Ok(())
