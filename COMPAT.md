@@ -307,7 +307,8 @@ Feature support of [sqlite expr syntax](https://www.sqlite.org/lang_expr.html).
 | unicode(X)                   | ✅ Yes     |                                                      |
 | unlikely(X)                  | ✅ Yes     |                                                      |
 | upper(X)                     | ✅ Yes     |                                                      |
-| unistr(X)                    | ❌ No      |                                                      |
+| unistr(X)                    | ✅ Yes     |                                                      |
+| unistr_quote(X)              | ✅ Yes     |                                                      |
 | zeroblob(N)                  | ✅ Yes     |                                                      |
 
 #### Mathematical functions
