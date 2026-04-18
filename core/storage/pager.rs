@@ -83,15 +83,7 @@ impl HeaderRef {
         let content = page.get_contents();
         let header =
             bytemuck::from_bytes::<DatabaseHeader>(&content.as_ptr()[0..DatabaseHeader::SIZE]);
-        // Only refresh cached header fields from a real on-disk page1.
-        // Before the DB is initialized, read_header_page returns the in-memory
-        // bootstrap `init_page_1` (with default reserved_space=0 / default page_size).
-        // Caching from that page would clobber values the caller just set via
-        // e.g. `set_reserved_space_bytes` / `set_initial_page_size` and cause
-        // the first on-disk page1 to be written with the wrong header fields.
-        if pager.db_initialized() {
-            pager.cache_header_fields(header);
-        }
+        pager.cache_header_fields_preserving_bootstrap(header);
         Ok(IOResult::Done(Self(page)))
     }
 
@@ -111,12 +103,7 @@ impl HeaderRefMut {
         let content = page.get_contents();
         let header =
             bytemuck::from_bytes::<DatabaseHeader>(&content.as_ptr()[0..DatabaseHeader::SIZE]);
-        // See HeaderRef::from_pager: skip caching bootstrap header fields so
-        // caller-provided reserved_space/page_size are preserved through the
-        // initial allocate_page1.
-        if pager.db_initialized() {
-            pager.cache_header_fields(header);
-        }
+        pager.cache_header_fields_preserving_bootstrap(header);
         pager.add_dirty(&page)?;
         Ok(IOResult::Done(Self(page)))
     }
@@ -5155,17 +5142,34 @@ impl Pager {
             .store(header.default_page_cache_size.get(), Ordering::SeqCst);
     }
 
+    /// Cache header fields while preserving caller-set `page_size` / `reserved_space`
+    /// when the database isn't initialized yet.
+    ///
+    /// Before allocate_page1 runs, `read_header_page` returns the in-memory bootstrap
+    /// page (reserved_space=0, default page_size). Blindly caching those would clobber
+    /// values the caller just set via e.g. `set_reserved_space_bytes` / `set_initial_page_size`
+    /// and cause the on-disk page 1 to be written with the wrong header fields.
+    /// The other cached fields (schema_cookie, database_size, freelist_pages,
+    /// default_page_cache_size) are not user-settable pre-init and must still be cached
+    /// so downstream code sees sentinel-initialized caches populated.
+    fn cache_header_fields_preserving_bootstrap(&self, header: &DatabaseHeader) {
+        if self.db_initialized() {
+            self.cache_header_fields(header);
+            return;
+        }
+        self.set_schema_cookie(Some(header.schema_cookie.get()));
+        self.database_size_cache
+            .store(header.database_size.get(), Ordering::SeqCst);
+        self.freelist_pages_cache
+            .store(header.freelist_pages.get(), Ordering::SeqCst);
+        self.default_page_cache_size_cache
+            .store(header.default_page_cache_size.get(), Ordering::SeqCst);
+    }
+
     pub fn with_header<T>(&self, f: impl Fn(&DatabaseHeader) -> T) -> Result<IOResult<T>> {
         let header_ref = return_if_io!(HeaderRef::from_pager(self));
         let header = header_ref.borrow();
-        // Only refresh cached header fields from a real on-disk page1.
-        // Before the DB is initialized, this reads the in-memory bootstrap header
-        // (reserved_space=0, default page_size), and caching that would clobber
-        // caller-provided values (e.g. set via set_reserved_space_bytes by the
-        // sync engine or encryption setup) on the very next allocate_page1.
-        if self.db_initialized() {
-            self.cache_header_fields(header);
-        }
+        self.cache_header_fields_preserving_bootstrap(header);
         Ok(IOResult::Done(f(header)))
     }
 
@@ -5173,10 +5177,7 @@ impl Pager {
         let header_ref = return_if_io!(HeaderRefMut::from_pager(self));
         let header = header_ref.borrow_mut();
         let result = f(header);
-        // See with_header: do not cache bootstrap header fields while uninitialized.
-        if self.db_initialized() {
-            self.cache_header_fields(header);
-        }
+        self.cache_header_fields_preserving_bootstrap(header);
         Ok(IOResult::Done(result))
     }
 
