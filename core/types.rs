@@ -345,14 +345,14 @@ impl<V: AsValueRef> AsValueRef for &V {
 }
 
 impl Value {
-    pub fn from_f64(f: f64) -> Self {
+    pub const fn from_f64(f: f64) -> Self {
         match NonNan::new(f) {
             Some(nn) => Self::Numeric(Numeric::Float(nn)),
             None => Self::Null,
         }
     }
 
-    pub fn from_i64(i: i64) -> Self {
+    pub const fn from_i64(i: i64) -> Self {
         Self::Numeric(Numeric::Integer(i))
     }
 
@@ -391,14 +391,14 @@ impl Value {
         }
     }
 
-    pub fn as_blob(&self) -> &Vec<u8> {
+    pub const fn as_blob(&self) -> &Vec<u8> {
         match self {
             Value::Blob(b) => b,
             _ => panic!("as_blob must be called only for Value::Blob"),
         }
     }
 
-    pub fn as_blob_mut(&mut self) -> &mut Vec<u8> {
+    pub const fn as_blob_mut(&mut self) -> &mut Vec<u8> {
         match self {
             Value::Blob(b) => b,
             _ => panic!("as_blob must be called only for Value::Blob"),
@@ -420,14 +420,14 @@ impl Value {
         }
     }
 
-    pub fn as_int(&self) -> Option<i64> {
+    pub const fn as_int(&self) -> Option<i64> {
         match self {
             Value::Numeric(Numeric::Integer(i)) => Some(*i),
             _ => None,
         }
     }
 
-    pub fn as_uint(&self) -> u64 {
+    pub const fn as_uint(&self) -> u64 {
         match self {
             Value::Numeric(Numeric::Integer(i)) => (*i).cast_unsigned(),
             _ => 0,
@@ -438,7 +438,7 @@ impl Value {
         Value::Text(Text::new(text))
     }
 
-    pub fn value_type(&self) -> ValueType {
+    pub const fn value_type(&self) -> ValueType {
         match self {
             Value::Null => ValueType::Null,
             Value::Numeric(Numeric::Integer(_)) => ValueType::Integer,

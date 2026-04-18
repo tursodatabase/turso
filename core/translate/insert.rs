@@ -395,7 +395,9 @@ pub fn translate_insert(
         None,
         database_id,
     )?;
-    program.has_statement_conflict = on_conflict.is_some();
+    program
+        .flags
+        .set_has_statement_conflict(on_conflict.is_some());
 
     // Open an ephemeral table for buffering RETURNING results.
     // All DML completes before any RETURNING rows are yielded to the caller.
@@ -2754,7 +2756,7 @@ fn emit_pk_uniqueness_check(
         let (description, on_error) = halt_desc_and_on_error(
             &raw_desc,
             preflight.effective_on_conflict,
-            program.has_statement_conflict,
+            program.flags.has_statement_conflict(),
         );
         program.emit_insn(Insn::Halt {
             err_code: SQLITE_CONSTRAINT_PRIMARYKEY,
@@ -2924,7 +2926,7 @@ fn emit_unique_index_check(
         let (description, on_error) = halt_desc_and_on_error(
             &raw_desc,
             preflight.effective_on_conflict,
-            program.has_statement_conflict,
+            program.flags.has_statement_conflict(),
         );
         program.emit_insn(Insn::Halt {
             err_code: SQLITE_CONSTRAINT_UNIQUE,
@@ -2969,7 +2971,7 @@ fn emit_unique_index_check(
             let (description, on_error) = halt_desc_and_on_error(
                 &raw_desc,
                 preflight.effective_on_conflict,
-                program.has_statement_conflict,
+                program.flags.has_statement_conflict(),
             );
             program.emit_insn(Insn::Halt {
                 err_code: SQLITE_CONSTRAINT_UNIQUE,

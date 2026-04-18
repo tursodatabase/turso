@@ -507,7 +507,7 @@ impl EmitOrderBy {
                     result_column_custom_type_info(expr, &plan.table_references, resolver.schema())
                         .is_some_and(|(_, td)| td.decode.is_some());
                 if is_custom {
-                    program.suppress_custom_type_decode = true;
+                    program.flags.set_suppress_custom_type_decode(true);
                 }
                 let result = translate_expr(
                     program,
@@ -517,7 +517,7 @@ impl EmitOrderBy {
                     resolver,
                 );
                 if is_custom {
-                    program.suppress_custom_type_decode = false;
+                    program.flags.set_suppress_custom_type_decode(false);
                 }
                 result?;
             }

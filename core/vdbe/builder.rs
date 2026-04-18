@@ -226,14 +226,7 @@ impl DmlColumnContext {
     }
 }
 
-#[allow(dead_code)]
 pub struct ProgramBuilder {
-    pub table_reference_counter: TableRefIdCounter,
-    next_free_register: usize,
-    next_free_cursor_id: usize,
-    next_hash_table_id: usize,
-    /// Instruction, the function to execute it with, and its original index in the vector.
-    pub insns: Vec<(Insn, usize)>,
     /// A span of instructions from (offset_start_inclusive, offset_end_exclusive),
     /// that are deemed to be compile-time constant and can be hoisted out of loops
     /// so that they get evaluated only once at the start of the program.
@@ -245,19 +238,27 @@ pub struct ProgramBuilder {
     pub cursor_ref: Vec<(Option<CursorKey>, CursorType)>,
     /// A vector where index=label number, value=resolved offset. Resolved in build().
     label_to_resolved_offset: Vec<Option<(InsnReference, JumpTarget)>>,
-    // Bitmask of cursors that have emitted a SeekRowid instruction.
-    seekrowid_emitted_bitmask: u64,
     // map of instruction index to manual comment (used in EXPLAIN only)
     comments: Vec<(InsnReference, &'static str)>,
     pub parameters: Parameters,
     pub result_columns: Vec<ResultSetColumn>,
-    pub table_references: TableReferences,
+    /// Instruction, the function to execute it with, and its original index in the vector.
+    pub insns: Vec<(Insn, usize)>,
+    /// Registry of materialized CTEs, keyed by cte_id.
+    /// Used to share materialized data across multiple CTE references via OpenDup.
+    materialized_ctes: HashMap<usize, MaterializedCteInfo>,
+    /// Global count of references to each CTE across the entire query.
+    /// Used to determine whether a CTE should be materialized (multi-ref) or use coroutine (single-ref).
+    cte_reference_counts: HashMap<usize, usize>,
+    /// Stack of CTE names currently being planned. Used to detect circular
+    /// references in non-recursive CTEs and to prevent fallthrough to schema
+    /// resolution for same-named tables/views.
+    ctes_being_defined: Vec<String>,
+    /// If this ProgramBuilder is building trigger subprogram, a ref to the trigger is stored here.
+    pub trigger: Option<Arc<Trigger>>,
+    pub table_reference_counter: TableRefIdCounter,
     /// Curr collation sequence. Bool indicates whether it was set by a COLLATE expr
     collation: Option<(CollationSeq, bool)>,
-    /// Current parsing nesting level
-    nested_level: usize,
-    init_label: BranchOffset,
-    start_offset: BranchOffset,
     capture_data_changes_info: Option<CaptureDataChangesInfo>,
     // TODO: when we support multiple dbs, this should be a write mask to track which DBs need to be written
     txn_mode: TransactionMode,
@@ -269,38 +270,6 @@ pub struct ProgramBuilder {
     write_database_cookies: HashMap<usize, u32>,
     /// Schema cookies for attached databases opened for reading.
     read_database_cookies: HashMap<usize, u32>,
-    rollback: bool,
-    /// The mode in which the query is being executed.
-    query_mode: QueryMode,
-    /// Current parent explain address, if any.
-    current_parent_explain_idx: Option<usize>,
-    pub(crate) reg_result_cols_start: Option<usize>,
-    /// Mirrors SQLite's isMultiWrite: true if the statement may modify/insert multiple rows.
-    /// If a non-autocommit transaction can modify multiple rows, statement subjournaling is always
-    /// required for proper cleanup on abort. If only one row can be modified, then journaling is not
-    /// necessary because on abort there is nothing to clean up.
-    /// Defaults to true for safety; specific translate paths (e.g., single-row INSERT) set false.
-    is_multi_write: bool,
-    /// Mirrors SQLite's mayAbort: true if the statement may throw an ABORT exception.
-    /// This flag is used in combination with is_multi_write to determine if statement subjournaling is required.
-    /// Defaults to true for safety; specific translate paths (e.g., INSERT with no constraints) set false.
-    may_abort: bool,
-    /// True until the builder emits an opcode that may directly modify persistent
-    /// database contents, mirroring sqlite3_stmt_readonly() classification over
-    /// compiled bytecode.
-    readonly: bool,
-    /// If this ProgramBuilder is building trigger subprogram, a ref to the trigger is stored here.
-    pub trigger: Option<Arc<Trigger>>,
-    /// Whether this is a subprogram (trigger or FK action). Subprograms skip Transaction instructions.
-    pub is_subprogram: bool,
-    pub resolve_type: ResolveType,
-    /// Whether the resolve_type was explicitly set from a statement-level OR clause.
-    /// When false, per-constraint ON CONFLICT clauses from CREATE TABLE should be used.
-    pub has_statement_conflict: bool,
-    /// When set, all triggers fired from this program should use this conflict resolution.
-    /// This is used in UPSERT DO UPDATE context to ensure nested trigger's OR IGNORE/REPLACE
-    /// clauses don't suppress errors.
-    pub trigger_conflict_override: Option<ResolveType>,
     /// Temporary cursor overrides maps table internal IDs to cursor IDs that should be used instead of the normal resolution.
     /// This allows for things like hash build to use a separate cursor for iterating the same table.
     cursor_overrides: HashMap<usize, CursorID>,
@@ -308,14 +277,6 @@ pub struct ProgramBuilder {
     /// When set, `Expr::Id("value")` resolves to the register holding the input value,
     /// and type parameter names resolve to registers holding their concrete values.
     pub id_register_overrides: HashMap<String, usize>,
-    /// When set, translate_expr will skip custom type decode for Expr::Column.
-    /// This is used when building ORDER BY sort keys so the sorter compares
-    /// encoded (on-disk) values. Decode is presentation-only.
-    pub suppress_custom_type_decode: bool,
-    /// When true, the next `emit_column` call will not bake the default value
-    /// into the Column instruction. Used for custom type columns where the default
-    /// needs to be encoded before use.
-    pub suppress_column_default: bool,
     /// Hash join build signatures keyed by hash table id.
     hash_build_signatures: HashMap<usize, HashBuildSignature>,
     /// Hash tables to keep open across subplans (e.g. materialization).
@@ -325,21 +286,162 @@ pub struct ProgramBuilder {
     subquery_result_regs: HashMap<TableInternalId, usize>,
     /// Context for resolving an Expr::Column that has a [TableInternalId::SELF_TABLE] placeholder.
     self_table_context: Option<SelfTableContext>,
+    /// The mode in which the query is being executed.
+    query_mode: QueryMode,
+    pub flags: ProgramBuilderFlags,
+    next_free_register: usize,
+    next_free_cursor_id: usize,
+    next_hash_table_id: usize,
+    pub table_references: TableReferences,
+    /// Current parsing nesting level
+    nested_level: usize,
+    init_label: BranchOffset,
+    start_offset: BranchOffset,
+    /// Current parent explain address, if any.
+    current_parent_explain_idx: Option<usize>,
+    pub(crate) reg_result_cols_start: Option<usize>,
+    pub resolve_type: ResolveType,
+    /// When set, all triggers fired from this program should use this conflict resolution.
+    /// This is used in UPSERT DO UPDATE context to ensure nested trigger's OR IGNORE/REPLACE
+    /// clauses don't suppress errors.
+    pub trigger_conflict_override: Option<ResolveType>,
     /// Counter for CTE identity tracking. Each CTE definition gets a unique ID
     /// so that multiple references to the same CTE can share materialized data.
     next_cte_id: usize,
-    /// Registry of materialized CTEs, keyed by cte_id.
-    /// Used to share materialized data across multiple CTE references via OpenDup.
-    materialized_ctes: HashMap<usize, MaterializedCteInfo>,
-    /// Global count of references to each CTE across the entire query.
-    /// Used to determine whether a CTE should be materialized (multi-ref) or use coroutine (single-ref).
-    cte_reference_counts: HashMap<usize, usize>,
-    /// Stack of CTE names currently being planned. Used to detect circular
-    /// references in non-recursive CTEs and to prevent fallthrough to schema
-    /// resolution for same-named tables/views.
-    ctes_being_defined: Vec<String>,
     /// Counter for subquery numbering in EXPLAIN QUERY PLAN output.
     next_subquery_eqp_id: usize,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[repr(transparent)]
+pub struct ProgramBuilderFlags(u8);
+
+impl ProgramBuilderFlags {
+    const ROLLBACK: u8 = 1 << 0;
+    const IS_MULTI_WRITE: u8 = 1 << 1;
+    const MAY_ABORT: u8 = 1 << 2;
+    const READONLY: u8 = 1 << 3;
+    const IS_SUBPROGRAM: u8 = 1 << 4;
+    const HAS_STATEMENT_CONFLICT: u8 = 1 << 5;
+    const SUPPRESS_CUSTOM_TYPE_DECODE: u8 = 1 << 6;
+    const SUPPRESS_COLUMN_DEFAULT: u8 = 1 << 7;
+
+    const fn new(is_subprogram: bool) -> Self {
+        let mut new = Self(0);
+        new.set_is_multi_write(true);
+        new.set_may_abort(true);
+        new.set_readonly(true);
+        new.set_is_subprogram(is_subprogram);
+        new.set_is_multi_write(true);
+        new.set_may_abort(true);
+        new
+    }
+
+    #[inline]
+    const fn get(self, bit: u8) -> bool {
+        (self.0 & bit) != 0
+    }
+
+    #[inline]
+    const fn set(&mut self, bit: u8, value: bool) {
+        if value {
+            self.0 |= bit;
+        } else {
+            self.0 &= !bit;
+        }
+    }
+
+    #[inline]
+    pub const fn rollback(self) -> bool {
+        self.get(Self::ROLLBACK)
+    }
+    #[inline]
+    pub const fn set_rollback(&mut self, v: bool) {
+        self.set(Self::ROLLBACK, v)
+    }
+
+    #[inline]
+    /// Mirrors SQLite's isMultiWrite: true if the statement may modify/insert multiple rows.
+    /// If a non-autocommit transaction can modify multiple rows, statement subjournaling is always
+    /// required for proper cleanup on abort. If only one row can be modified, then journaling is not
+    /// necessary because on abort there is nothing to clean up.
+    /// Defaults to true for safety; specific translate paths (e.g., single-row INSERT) set false.
+    pub const fn is_multi_write(self) -> bool {
+        self.get(Self::IS_MULTI_WRITE)
+    }
+    #[inline]
+    pub const fn set_is_multi_write(&mut self, v: bool) {
+        self.set(Self::IS_MULTI_WRITE, v)
+    }
+
+    #[inline]
+    /// Mirrors SQLite's mayAbort: true if the statement may throw an ABORT exception.
+    /// This flag is used in combination with is_multi_write to determine if statement subjournaling is required.
+    /// Defaults to true for safety; specific translate paths (e.g., INSERT with no constraints) set false.
+    pub const fn may_abort(self) -> bool {
+        self.get(Self::MAY_ABORT)
+    }
+    #[inline]
+    pub const fn set_may_abort(&mut self, v: bool) {
+        self.set(Self::MAY_ABORT, v)
+    }
+
+    #[inline]
+    /// True until the builder emits an opcode that may directly modify persistent
+    /// database contents, mirroring sqlite3_stmt_readonly() classification over
+    /// compiled bytecode.
+    pub const fn readonly(self) -> bool {
+        self.get(Self::READONLY)
+    }
+    #[inline]
+    pub const fn set_readonly(&mut self, v: bool) {
+        self.set(Self::READONLY, v)
+    }
+
+    #[inline]
+    /// Whether this is a subprogram (trigger or FK action). Subprograms skip Transaction instructions.
+    pub const fn is_subprogram(self) -> bool {
+        self.get(Self::IS_SUBPROGRAM)
+    }
+    #[inline]
+    pub const fn set_is_subprogram(&mut self, v: bool) {
+        self.set(Self::IS_SUBPROGRAM, v)
+    }
+
+    #[inline]
+    /// Whether the resolve_type was explicitly set from a statement-level OR clause.
+    /// When false, per-constraint ON CONFLICT clauses from CREATE TABLE should be used.
+    pub fn has_statement_conflict(self) -> bool {
+        self.get(Self::HAS_STATEMENT_CONFLICT)
+    }
+    #[inline]
+    pub fn set_has_statement_conflict(&mut self, v: bool) {
+        self.set(Self::HAS_STATEMENT_CONFLICT, v)
+    }
+
+    #[inline]
+    /// When set, translate_expr will skip custom type decode for Expr::Column.
+    /// This is used when building ORDER BY sort keys so the sorter compares
+    /// encoded (on-disk) values. Decode is presentation-only.
+    pub const fn suppress_custom_type_decode(self) -> bool {
+        self.get(Self::SUPPRESS_CUSTOM_TYPE_DECODE)
+    }
+    #[inline]
+    pub const fn set_suppress_custom_type_decode(&mut self, v: bool) {
+        self.set(Self::SUPPRESS_CUSTOM_TYPE_DECODE, v)
+    }
+
+    #[inline]
+    /// When true, the next `emit_column` call will not bake the default value
+    /// into the Column instruction. Used for custom type columns where the default
+    /// needs to be encoded before use.
+    pub const fn suppress_column_default(self) -> bool {
+        self.get(Self::SUPPRESS_COLUMN_DEFAULT)
+    }
+    #[inline]
+    pub const fn set_suppress_column_default(&mut self, v: bool) {
+        self.set(Self::SUPPRESS_COLUMN_DEFAULT, v)
+    }
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -561,7 +663,6 @@ impl ProgramBuilder {
             cursor_ref: Vec::with_capacity(opts.num_cursors),
             constant_spans: Vec::new(),
             label_to_resolved_offset: Vec::with_capacity(opts.approx_num_labels),
-            seekrowid_emitted_bitmask: 0,
             comments: Vec::new(),
             parameters: Parameters::new(),
             result_columns: Vec::new(),
@@ -577,22 +678,15 @@ impl ProgramBuilder {
             read_databases: BitSet::default(),
             write_database_cookies: HashMap::default(),
             read_database_cookies: HashMap::default(),
-            rollback: false,
             query_mode,
             current_parent_explain_idx: None,
             reg_result_cols_start: None,
-            is_multi_write: true,
-            may_abort: true,
-            readonly: true,
+            flags: ProgramBuilderFlags::new(is_subprogram),
             trigger,
-            is_subprogram,
             resolve_type: ResolveType::Abort,
-            has_statement_conflict: false,
             trigger_conflict_override: None,
             cursor_overrides: HashMap::default(),
             id_register_overrides: HashMap::default(),
-            suppress_custom_type_decode: false,
-            suppress_column_default: false,
             hash_build_signatures: HashMap::default(),
             hash_tables_to_keep_open: BitSet::default(),
             subquery_result_regs: HashMap::default(),
@@ -749,12 +843,12 @@ impl ProgramBuilder {
     /// Mark that this statement may modify/insert multiple rows (mirrors SQLite's sqlite3MultiWrite).
     /// When false, statement journals are skipped since single-write statements are atomic.
     pub const fn set_multi_write(&mut self, is_multi_write: bool) {
-        self.is_multi_write = is_multi_write;
+        self.flags.set_is_multi_write(is_multi_write);
     }
 
     /// Mark that this statement may throw an ABORT exception (mirrors SQLite's sqlite3MayAbort).
     pub const fn set_may_abort(&mut self, may_abort: bool) {
-        self.may_abort = may_abort;
+        self.flags.set_may_abort(may_abort);
     }
 
     pub const fn capture_data_changes_info(&self) -> &Option<CaptureDataChangesInfo> {
@@ -927,7 +1021,8 @@ impl ProgramBuilder {
     pub fn emit_insn(&mut self, insn: Insn) {
         // This seemingly empty trace here is needed so that a function span is emmited with it
         tracing::trace!("");
-        self.readonly &= insn.is_readonly();
+        self.flags
+            .set_readonly(self.flags.readonly() & insn.is_readonly());
         self.insns.push((insn, self.insns.len()));
     }
 
@@ -1527,7 +1622,7 @@ impl ProgramBuilder {
 
     /// Initialize the program with basic setup and return initial metadata and labels
     pub fn prologue(&mut self) {
-        if self.is_subprogram {
+        if self.flags.is_subprogram() {
             // Subprograms (triggers, FK actions) don't need Transaction - they run within parent's tx
             self.init_label = self.allocate_label();
             self.emit_insn(Insn::Init {
@@ -1588,14 +1683,14 @@ impl ProgramBuilder {
 
     /// Indicates the rollback behvaiour for the halt instruction in epilogue
     pub const fn rollback(&mut self) {
-        self.rollback = true;
+        self.flags.set_rollback(true);
     }
 
     /// Clean up and finalize the program, resolving any remaining labels
     /// Note that although these are the final instructions, typically an SQLite
     /// query will jump to the Transaction instruction via init_label.
     pub fn epilogue(&mut self, schema: &Schema) {
-        if self.is_subprogram {
+        if self.flags.is_subprogram() {
             // Subprograms (triggers, FK actions) just emit Halt without Transaction
             let description = if self.trigger.is_some() {
                 "trigger"
@@ -1612,7 +1707,7 @@ impl ProgramBuilder {
         }
         if self.nested_level == 0 {
             // "rollback" flag is used to determine if halt should rollback the transaction.
-            self.emit_halt(self.rollback);
+            self.emit_halt(self.flags.rollback());
             self.preassign_label_to_next_insn(self.init_label);
 
             if !matches!(self.txn_mode, TransactionMode::None) {
@@ -1720,7 +1815,7 @@ impl ProgramBuilder {
             if column_def.is_rowid_alias() {
                 // Consume the suppress_column_default flag so it doesn't
                 // leak to the next column (emit_column normally consumes it).
-                self.suppress_column_default = false;
+                self.flags.set_suppress_column_default(false);
                 self.emit_insn(Insn::RowId {
                     cursor_id,
                     dest: out,
@@ -1805,8 +1900,8 @@ impl ProgramBuilder {
             Some(value)
         };
 
-        let default = if self.suppress_column_default {
-            self.suppress_column_default = false;
+        let default = if self.flags.suppress_column_default() {
+            self.flags.set_suppress_column_default(false);
             None
         } else {
             default
@@ -1836,8 +1931,8 @@ impl ProgramBuilder {
         // need statement-level rollback. Both flags default to true; specific translate paths
         // (e.g., single-row INSERT) set is_multi_write=false to opt out.
         let needs_stmt_subtransactions = matches!(self.txn_mode, TransactionMode::Write)
-            && self.is_multi_write
-            && self.may_abort;
+            && self.flags.is_multi_write()
+            && self.flags.may_abort();
 
         let contains_trigger_subprograms = self
             .insns
@@ -1851,7 +1946,7 @@ impl ProgramBuilder {
             comments: self.comments,
             parameters: self.parameters,
             change_cnt_on,
-            readonly: self.readonly,
+            readonly: self.flags.readonly(),
             result_columns: self.result_columns,
             table_references: self.table_references,
             sql: sql.to_string(),
@@ -1859,7 +1954,7 @@ impl ProgramBuilder {
                 needs_stmt_subtransactions,
             )),
             trigger: self.trigger.take(),
-            is_subprogram: self.is_subprogram,
+            is_subprogram: self.flags.is_subprogram(),
             contains_trigger_subprograms,
             resolve_type: self.resolve_type,
             prepare_context,

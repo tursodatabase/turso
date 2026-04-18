@@ -995,7 +995,7 @@ pub fn translate_expr(
         });
         // Hash join payloads store raw encoded values; apply DECODE for custom
         // type columns so the result set contains human-readable text.
-        if needs_decode && !program.suppress_custom_type_decode {
+        if needs_decode && !program.flags.suppress_custom_type_decode() {
             if let ast::Expr::Column {
                 table: table_ref_id,
                 column,
@@ -3244,7 +3244,7 @@ pub fn translate_expr(
                                             .get_type_def(&col.ty_str, table.is_strict())
                                             .is_some()
                                     {
-                                        program.suppress_column_default = true;
+                                        program.flags.set_suppress_column_default(true);
                                     }
                                 }
                                 program.emit_column_or_rowid(read_cursor, column, target_register);
@@ -3272,7 +3272,7 @@ pub fn translate_expr(
 
                         // Decode custom type columns (skipped when building ORDER BY sort keys
                         // for types without a `<` operator, so the sorter sorts on encoded values)
-                        if !program.suppress_custom_type_decode {
+                        if !program.flags.suppress_custom_type_decode() {
                             // For custom type columns with a default, the Column
                             // instruction returns NULL for pre-existing rows
                             // (since we suppressed the default). Load the default

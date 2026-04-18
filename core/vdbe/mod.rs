@@ -473,35 +473,15 @@ pub struct ProgramState {
     /// Marker which tells about auto transaction cleanup necessary for that connection in case of reset
     /// This is used when statement in auto-commit mode reseted after previous uncomplete execution - in which case we may need to rollback transaction started on previous attempt
     pub(crate) auto_txn_cleanup: TxnCleanup,
-    /// Number of deferred foreign key violations when the statement started.
-    /// When a statement subtransaction rolls back, the connection's deferred foreign key violations counter
-    /// is reset to this value.
-    fk_deferred_violations_when_stmt_started: AtomicIsize,
-    /// Number of immediate foreign key violations that occurred during the active statement. If nonzero,
-    /// the statement subtransactionwill roll back.
-    fk_immediate_violations_during_stmt: AtomicIsize,
-    /// RowSet objects stored by register index
-    rowsets: HashMap<usize, RowSet>,
-    /// Bloom filters stored by cursor ID for probabilistic set membership testing
-    /// Used to avoid unnecessary seeks on ephemeral indexes and hash tables
-    pub(crate) bloom_filters: HashMap<usize, BloomFilter>,
-    op_hash_build_state: Option<OpHashBuildState>,
-    op_hash_probe_state: Option<OpHashProbeState>,
+    pub explain_state: RwLock<ExplainState>,
     /// Scratch buffer for [Insn::HashDistinct] to avoid per-row allocations.
     distinct_key_values: Vec<Value>,
     hash_tables: HashMap<usize, HashTable>,
     /// TempFile handles for ephemeral cursors, keyed by cursor_id.
     /// Dropping removes the temp file from disk.
     ephemeral_temp_files: HashMap<usize, TempFile>,
-    uses_subjournal: bool,
-    /// Whether this statement is an active write inside an explicit transaction.
-    pub(crate) is_active_write: bool,
-    /// Whether begin_statement was called (savepoint + FK bookkeeping active).
-    has_stmt_transaction: bool,
     /// Attached pagers that have open savepoints for statement rollback.
     attached_savepoint_pagers: Vec<Arc<Pager>>,
-    pub n_change: AtomicI64,
-    pub explain_state: RwLock<ExplainState>,
     /// Pending error to return after FAIL mode commit completes.
     /// When a constraint error occurs with FAIL resolve type in autocommit mode,
     /// we need to commit partial changes before returning the error.
@@ -517,6 +497,26 @@ pub struct ProgramState {
     /// Cached subprogram Statements keyed by the PC of the Program instruction.
     /// Avoids re-allocating ProgramState on each trigger/FK-action fire.
     pub(crate) subprogram_stmt_cache: HashMap<usize, Box<Statement>>,
+    /// RowSet objects stored by register index
+    rowsets: HashMap<usize, RowSet>,
+    /// Bloom filters stored by cursor ID for probabilistic set membership testing
+    /// Used to avoid unnecessary seeks on ephemeral indexes and hash tables
+    pub(crate) bloom_filters: HashMap<usize, BloomFilter>,
+    op_hash_build_state: Option<OpHashBuildState>,
+    op_hash_probe_state: Option<OpHashProbeState>,
+    /// Number of deferred foreign key violations when the statement started.
+    /// When a statement subtransaction rolls back, the connection's deferred foreign key violations counter
+    /// is reset to this value.
+    fk_deferred_violations_when_stmt_started: AtomicIsize,
+    /// Number of immediate foreign key violations that occurred during the active statement. If nonzero,
+    /// the statement subtransactionwill roll back.
+    fk_immediate_violations_during_stmt: AtomicIsize,
+    uses_subjournal: bool,
+    /// Whether this statement is an active write inside an explicit transaction.
+    pub(crate) is_active_write: bool,
+    /// Whether begin_statement was called (savepoint + FK bookkeeping active).
+    has_stmt_transaction: bool,
+    pub n_change: AtomicI64,
 }
 
 impl std::fmt::Debug for Program {
