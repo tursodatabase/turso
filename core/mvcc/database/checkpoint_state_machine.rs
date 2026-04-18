@@ -1363,8 +1363,14 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                                 "global_header not initialized during checkpoint".to_string(),
                             )
                         })?;
-                    checkpoint_header.schema_cookie =
-                        self.connection.db.schema.lock().schema_version.into();
+                    checkpoint_header.schema_cookie = self
+                        .connection
+                        .db
+                        .schema
+                        .lock()
+                        .schema_version
+                        .wrapping_add(1)
+                        .into();
                     let staged_header = self.pager.io.block(|| {
                         self.pager.with_header_mut(|header| {
                             // Keep pager-maintained fields (for example database_size/change_counter)
@@ -1516,6 +1522,19 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
 
             CheckpointState::Finalize => {
                 tracing::info!("Releasing blocking checkpoint lock");
+                let checkpoint_schema_cookie = self
+                    .mvstore
+                    .global_header
+                    .read()
+                    .as_ref()
+                    .ok_or_else(|| {
+                        LimboError::InternalError(
+                            "global_header not initialized during checkpoint finalization"
+                                .to_string(),
+                        )
+                    })?
+                    .schema_cookie
+                    .get();
                 // Patch sqlite_schema in MV Store to contain positive rootpages instead of negative ones
                 // for tables and indexes that were flushed to the physical database
                 for (sqlite_schema_rowid, (_, row_version)) in self.created_btrees.drain() {
@@ -1585,20 +1604,21 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                         }
                     }
 
-                    schema.schema_version += 1;
+                    schema.schema_version = checkpoint_schema_cookie;
                     // Clear dropped root pages now that the checkpoint has completed.
                     // The btree pages for dropped tables have been freed, so integrity_check
                     // no longer needs to track them.
                     schema.dropped_root_pages.clear();
                     let _ = self.pager.io.block(|| {
                         self.pager.with_header_mut(|header| {
-                            header.schema_cookie = schema.schema_version.into();
+                            header.schema_cookie = checkpoint_schema_cookie.into();
                             self.mvstore.global_header.write().replace(*header);
                             IOResult::Done(())
                         })
                     })?;
                     Ok(())
                 })?;
+                *self.connection.schema.write() = self.connection.db.clone_schema();
 
                 self.mvstore
                     .durable_txid_max
