@@ -41,9 +41,9 @@ export declare class Database {
    *
    * # Returns
    *
-   * A `Statement` instance.
+   * A promise resolving to a `Statement` instance.
    */
-  prepare(sql: string): Statement
+  prepare(sql: string): Promise<Statement>
   executor(sql: string, queryOptions?: QueryOptions | undefined | null): BatchExecutor
   /**
    * Returns the rowid of the last row inserted.
