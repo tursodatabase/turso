@@ -192,18 +192,31 @@ static void tcl_scalar_bridge(void *ctx, int argc, void **argv)
     Tcl_Interp  *interp = func->interp;
     int          i, rc;
 
-    /* Bind argument variables in the calling scope. */
-    for (i = 0; i < argc && i < func->n_args; i++) {
-        Tcl_Obj *val = value_to_obj(argv[i]);
-        if (Tcl_ObjSetVar2(interp, func->arg_names[i], NULL, val,
-                           TCL_LEAVE_ERR_MSG) == NULL) {
-            sqlite3_result_error(ctx, Tcl_GetString(Tcl_GetObjResult(interp)), -1);
-            return;
+    if (func->n_args > 0) {
+        /* Custom Turso behavior: Bind argument variables in the calling scope. */
+        for (i = 0; i < argc && i < func->n_args; i++) {
+            Tcl_Obj *val = value_to_obj(argv[i]);
+            if (Tcl_ObjSetVar2(interp, func->arg_names[i], NULL, val,
+                               TCL_LEAVE_ERR_MSG) == NULL) {
+                sqlite3_result_error(ctx, Tcl_GetString(Tcl_GetObjResult(interp)), -1);
+                return;
+            }
         }
-    }
 
-    /* Evaluate the script body. */
-    rc = Tcl_EvalObjEx(interp, func->script, 0);
+        /* Evaluate the script body. */
+        rc = Tcl_EvalObjEx(interp, func->script, 0);
+    } else {
+        /* Standard SQLite behavior: Append SQL arguments to the script prefix. */
+        Tcl_Obj *cmd = Tcl_DuplicateObj(func->script);
+        Tcl_IncrRefCount(cmd);
+
+        for (i = 0; i < argc; i++) {
+            Tcl_ListObjAppendElement(interp, cmd, value_to_obj(argv[i]));
+        }
+
+        rc = Tcl_EvalObjEx(interp, cmd, TCL_EVAL_DIRECT);
+        Tcl_DecrRefCount(cmd);
+    }
 
     if (rc == TCL_ERROR) {
         const char *err = Tcl_GetString(Tcl_GetObjResult(interp));
