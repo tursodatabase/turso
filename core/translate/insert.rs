@@ -1799,9 +1799,9 @@ fn resolve_defaults_in_row(
         };
         *expr = match col {
             Some(col) => col.default.clone().unwrap_or_else(|| {
-                if let Some(type_def) = resolver.schema().get_type_def(&col.ty_str, is_strict) {
-                    if let Some(ref default_expr) = type_def.default {
-                        return default_expr.clone();
+                if let Ok(Some(resolved)) = resolver.schema().resolve_type(&col.ty_str, is_strict) {
+                    if let Some(default_expr) = resolved.default_expr() {
+                        return Box::new(default_expr.clone());
                     }
                 }
                 Box::new(ast::Expr::Literal(ast::Literal::Null))
@@ -1835,10 +1835,11 @@ fn bind_insert(
                 .filter(|c| !c.hidden() && !c.is_generated())
                 .map(|c| {
                     c.default.clone().unwrap_or_else(|| {
-                        if let Some(type_def) = resolver.schema().get_type_def(&c.ty_str, is_strict)
+                        if let Ok(Some(resolved)) =
+                            resolver.schema().resolve_type(&c.ty_str, is_strict)
                         {
-                            if let Some(ref default_expr) = type_def.default {
-                                return default_expr.clone();
+                            if let Some(default_expr) = resolved.default_expr() {
+                                return Box::new(default_expr.clone());
                             }
                         }
                         Box::new(ast::Expr::Literal(ast::Literal::Null))
@@ -2206,9 +2207,10 @@ fn init_source_emission<'a>(
             let is_strict = table.is_strict();
             values.extend(storable_columns.iter().map(|c| {
                 c.default.clone().unwrap_or_else(|| {
-                    if let Some(type_def) = resolver.schema().get_type_def(&c.ty_str, is_strict) {
-                        if let Some(ref default_expr) = type_def.default {
-                            return default_expr.clone();
+                    if let Ok(Some(resolved)) = resolver.schema().resolve_type(&c.ty_str, is_strict)
+                    {
+                        if let Some(default_expr) = resolved.default_expr() {
+                            return Box::new(default_expr.clone());
                         }
                     }
                     Box::new(ast::Expr::Literal(ast::Literal::Null))
@@ -2662,8 +2664,8 @@ fn translate_column(
         });
     } else if let Some(default_expr) = column.default.as_ref() {
         translate_expr(program, None, default_expr, column_register, resolver)?;
-    } else if let Some(type_def) = resolver.schema().get_type_def(&column.ty_str, is_strict) {
-        if let Some(ref default_expr) = type_def.default {
+    } else if let Ok(Some(resolved)) = resolver.schema().resolve_type(&column.ty_str, is_strict) {
+        if let Some(default_expr) = resolved.default_expr() {
             translate_expr(program, None, default_expr, column_register, resolver)?;
         } else {
             program.emit_insn(Insn::Null {

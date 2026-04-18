@@ -99,7 +99,7 @@ impl TursoTypesCursor {
                         .collect();
                     format!("{}({})", td.name, params.join(", "))
                 };
-                self.entries.push((display_name, td.to_sql()));
+                self.entries.push((display_name, td.to_sql().to_string()));
             }
         });
     }

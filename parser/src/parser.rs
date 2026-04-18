@@ -1,15 +1,16 @@
 use crate::ast::{
     check::ColumnCount, AlterTable, AlterTableBody, As, Cmd, ColumnConstraint, ColumnDefinition,
     CommonTableExpr, CompoundOperator, CompoundSelect, CreateTableBody, CreateTypeBody,
-    CreateVirtualTable, DeferSubclause, Distinctness, Expr, ForeignKeyClause, FrameBound,
-    FrameClause, FrameExclude, FrameMode, FromClause, FunctionTail, GeneratedColumnType, GroupBy,
-    Indexed, IndexedColumn, InitDeferredPred, InsertBody, JoinConstraint, JoinOperator, JoinType,
-    JoinedSelectTable, LikeOperator, Limit, Literal, Materialized, Name, NamedColumnConstraint,
-    NamedTableConstraint, NullsOrder, OneSelect, Operator, Over, PragmaBody, PragmaValue,
-    QualifiedName, RefAct, RefArg, ResolveType, ResultColumn, Select, SelectBody, SelectTable, Set,
-    SortOrder, SortedColumn, Stmt, TableConstraint, TableOptions, TransactionType, TriggerCmd,
-    TriggerEvent, TriggerTime, Type, TypeOperator, TypeParam, TypeSize, UnaryOperator, Update,
-    Upsert, UpsertDo, UpsertIndex, Variable, Window, WindowDef, With,
+    CreateVirtualTable, DeferSubclause, Distinctness, DomainConstraint, Expr, ForeignKeyClause,
+    FrameBound, FrameClause, FrameExclude, FrameMode, FromClause, FunctionTail,
+    GeneratedColumnType, GroupBy, Indexed, IndexedColumn, InitDeferredPred, InsertBody,
+    JoinConstraint, JoinOperator, JoinType, JoinedSelectTable, LikeOperator, Limit, Literal,
+    Materialized, Name, NamedColumnConstraint, NamedTableConstraint, NullsOrder, OneSelect,
+    Operator, Over, PragmaBody, PragmaValue, QualifiedName, RefAct, RefArg, ResolveType,
+    ResultColumn, Select, SelectBody, SelectTable, Set, SortOrder, SortedColumn, Stmt,
+    TableConstraint, TableOptions, TransactionType, TriggerCmd, TriggerEvent, TriggerTime, Type,
+    TypeOperator, TypeParam, TypeSize, UnaryOperator, Update, Upsert, UpsertDo, UpsertIndex,
+    Variable, Window, WindowDef, With,
 };
 use crate::error::Error;
 use crate::lexer::{Lexer, Token};
@@ -941,7 +942,8 @@ impl<'a> Parser<'a> {
             TK_UNIQUE,
             TK_TRIGGER,
             TK_MATERIALIZED,
-            TK_TYPE
+            TK_TYPE,
+            TK_ID
         );
         let mut temp = false;
         if first_tok.token_type == TK_TEMP {
@@ -958,7 +960,13 @@ impl<'a> Parser<'a> {
             TK_VIRTUAL => self.parse_create_virtual(),
             TK_INDEX | TK_UNIQUE => self.parse_create_index(),
             TK_TYPE => self.parse_create_type(),
-            _ => unreachable!(),
+            TK_ID if first_tok.to_utf8().eq_ignore_ascii_case("DOMAIN") => {
+                self.parse_create_domain()
+            }
+            _ => Err(Error::ParseError(format!(
+                "unexpected token: {}",
+                first_tok.to_utf8()
+            )))?,
         }
     }
 
@@ -4467,9 +4475,119 @@ impl<'a> Parser<'a> {
         })
     }
 
+    /// Parse `CREATE DOMAIN [IF NOT EXISTS] name AS base_type
+    ///     [DEFAULT expr]
+    ///     [NOT NULL | NULL]
+    ///     [[CONSTRAINT name] CHECK (expr)]...`
+    fn parse_create_domain(&mut self) -> Result<Stmt> {
+        // Eat 'DOMAIN' (which is TK_ID)
+        eat_assert!(self, TK_ID);
+        let if_not_exists = self.parse_if_not_exists()?;
+
+        // Parse domain name
+        let name_tok = self.eat()?;
+        let domain_name = match name_tok {
+            Some(tok) if tok.token_type == TK_ID => from_bytes(tok.as_bytes()),
+            _ => return Err(Error::ParseError("expected domain name".to_owned())),
+        };
+
+        // Eat AS keyword
+        eat_expect!(self, TK_AS);
+
+        // Parse base type name (any identifier — primitive, custom type, or another domain)
+        let base_tok = self.eat()?;
+        let base_type = match base_tok {
+            Some(tok) if tok.token_type == TK_ID => from_bytes(tok.as_bytes()),
+            _ => return Err(Error::ParseError("expected base type name".to_owned())),
+        };
+
+        let mut default = None;
+        let mut not_null = false;
+        let mut has_null = false;
+        let mut has_default = false;
+        let mut constraints = Vec::new();
+
+        // Parse optional clauses: DEFAULT, NOT NULL, NULL, CONSTRAINT/CHECK
+        loop {
+            match self.peek()? {
+                Some(tok) if tok.token_type == TK_DEFAULT => {
+                    eat_assert!(self, TK_DEFAULT);
+                    if has_default {
+                        return Err(Error::ParseError(
+                            "multiple DEFAULT clauses in domain definition".to_owned(),
+                        ));
+                    }
+                    let expr = self.parse_expr(0)?;
+                    default = Some(expr);
+                    has_default = true;
+                }
+                Some(tok) if tok.token_type == TK_NOT => {
+                    eat_assert!(self, TK_NOT);
+                    eat_expect!(self, TK_NULL);
+                    if has_null {
+                        return Err(Error::ParseError(
+                            "conflicting NULL/NOT NULL clauses in domain definition".to_owned(),
+                        ));
+                    }
+                    if not_null {
+                        return Err(Error::ParseError(
+                            "duplicate NOT NULL clause in domain definition".to_owned(),
+                        ));
+                    }
+                    not_null = true;
+                }
+                Some(tok) if tok.token_type == TK_NULL => {
+                    eat_assert!(self, TK_NULL);
+                    if not_null {
+                        return Err(Error::ParseError(
+                            "conflicting NULL/NOT NULL clauses in domain definition".to_owned(),
+                        ));
+                    }
+                    has_null = true;
+                }
+                Some(tok) if tok.token_type == TK_CONSTRAINT => {
+                    eat_assert!(self, TK_CONSTRAINT);
+                    let cname_tok = self.eat()?;
+                    let cname = match cname_tok {
+                        Some(t) if t.token_type == TK_ID => from_bytes(t.as_bytes()),
+                        _ => return Err(Error::ParseError("expected constraint name".to_owned())),
+                    };
+                    eat_expect!(self, TK_CHECK);
+                    eat_expect!(self, TK_LP);
+                    let check_expr = self.parse_expr(0)?;
+                    eat_expect!(self, TK_RP);
+                    constraints.push(DomainConstraint {
+                        name: Some(cname),
+                        check: check_expr,
+                    });
+                }
+                Some(tok) if tok.token_type == TK_CHECK => {
+                    eat_assert!(self, TK_CHECK);
+                    eat_expect!(self, TK_LP);
+                    let check_expr = self.parse_expr(0)?;
+                    eat_expect!(self, TK_RP);
+                    constraints.push(DomainConstraint {
+                        name: None,
+                        check: check_expr,
+                    });
+                }
+                _ => break,
+            }
+        }
+
+        Ok(Stmt::CreateDomain {
+            if_not_exists,
+            domain_name,
+            base_type,
+            default,
+            not_null,
+            constraints,
+        })
+    }
+
     fn parse_drop_stmt(&mut self) -> Result<Stmt> {
         eat_assert!(self, TK_DROP);
-        let tok = peek_expect!(self, TK_TABLE, TK_INDEX, TK_TRIGGER, TK_VIEW, TK_TYPE);
+        let tok = peek_expect!(self, TK_TABLE, TK_INDEX, TK_TRIGGER, TK_VIEW, TK_TYPE, TK_ID);
 
         match tok.token_type {
             TK_TABLE => {
@@ -4521,7 +4639,23 @@ impl<'a> Parser<'a> {
                     type_name,
                 })
             }
-            _ => unreachable!(),
+            TK_ID if tok.to_utf8().eq_ignore_ascii_case("DOMAIN") => {
+                eat_assert!(self, TK_ID);
+                let if_exists = self.parse_if_exists()?;
+                let name_tok = self.eat()?;
+                let domain_name = match name_tok {
+                    Some(tok) if tok.token_type == TK_ID => from_bytes(tok.as_bytes()),
+                    _ => return Err(Error::ParseError("expected domain name".to_owned())),
+                };
+                Ok(Stmt::DropDomain {
+                    if_exists,
+                    domain_name,
+                })
+            }
+            _ => Err(Error::ParseError(format!(
+                "unexpected token: {}",
+                tok.to_utf8()
+            )))?,
         }
     }
 

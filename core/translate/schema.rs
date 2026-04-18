@@ -601,11 +601,12 @@ fn resolve_type_name(type_name: &str, resolver: &Resolver) -> Result<CheckExprTy
         return Ok(ty);
     }
     // Check if it's a known custom type
-    if resolver
-        .schema()
-        .get_type_def_unchecked(type_name)
-        .is_some()
-    {
+    if let Ok(Some(resolved)) = resolver.schema().resolve_type_unchecked(type_name) {
+        // Domains are transparent wrappers — resolve to the base primitive type
+        // so CHECK constraint type checking compares primitives, not domain names.
+        if resolved.is_domain() {
+            return resolve_type_name(&resolved.primitive, resolver);
+        }
         return Ok(CheckExprType::CustomType(type_name.to_lowercase()));
     }
     bail_parse_error!("unknown type '{}' in CHECK constraint", type_name);
@@ -793,10 +794,22 @@ fn validate(
                     );
                 }
 
+                // Domain types require STRICT tables because domain constraints
+                // (CHECK, NOT NULL, DEFAULT) are only enforced on STRICT tables.
+                if !is_builtin && !is_strict {
+                    let type_def = resolver.schema().get_type_def_unchecked(type_name);
+                    if let Some(td) = type_def {
+                        if td.is_domain {
+                            bail_parse_error!(
+                                "domain type columns require STRICT tables: {}.{}",
+                                table_name,
+                                c.col_name
+                            );
+                        }
+                    }
+                }
+
                 if !is_builtin && is_strict {
-                    // On non-STRICT tables any type name is allowed and is
-                    // treated as a plain affinity hint (no encode/decode).
-                    // Custom type validation only applies to STRICT tables.
                     let type_def = resolver.schema().get_type_def_unchecked(type_name);
                     {
                         match type_def {
@@ -2370,50 +2383,14 @@ fn validate_type_expr(expr: &ast::Expr, kind: &str, resolver: &Resolver) -> Resu
     Ok(())
 }
 
-pub fn translate_create_type(
-    type_name: &str,
-    body: &ast::CreateTypeBody,
-    if_not_exists: bool,
+/// Shared persistence logic for CREATE TYPE / CREATE DOMAIN.
+/// Persists the type SQL into __turso_internal_types and registers it in memory.
+fn persist_type_definition(
+    normalized_name: String,
+    sql: String,
     resolver: &Resolver,
     program: &mut ProgramBuilder,
 ) -> Result<()> {
-    let normalized_name = normalize_ident(type_name);
-
-    // Reject names that shadow SQLite base types — these are not in the
-    // type_registry but are handled by the column type system. Allowing
-    // them would create confusion and undropable types.
-    let is_base_type = turso_macros::match_ignore_ascii_case!(match normalized_name.as_bytes() {
-        b"INT" | b"INTEGER" | b"REAL" | b"TEXT" | b"BLOB" | b"ANY" => true,
-        _ => false,
-    });
-    if is_base_type {
-        bail_parse_error!("cannot create type \"{normalized_name}\": name is a built-in type");
-    }
-
-    // Check if type already exists
-    if resolver
-        .schema()
-        .get_type_def_unchecked(&normalized_name)
-        .is_some()
-    {
-        if if_not_exists {
-            return Ok(());
-        }
-        bail_parse_error!("type {normalized_name} already exists");
-    }
-
-    // Validate encode/decode expressions for safety
-    if let Some(ref encode) = body.encode {
-        validate_type_expr(encode, "ENCODE", resolver)?;
-    }
-    if let Some(ref decode) = body.decode {
-        validate_type_expr(decode, "DECODE", resolver)?;
-    }
-
-    // Reconstruct the SQL string (without IF NOT EXISTS) using TypeDef::to_sql()
-    let type_def = crate::schema::TypeDef::from_create_type(&normalized_name, body, false);
-    let sql = type_def.to_sql();
-
     // Ensure sqlite_turso_types table exists (lazy creation)
     let types_table: Arc<BTreeTable>;
     let types_root_page: RegisterOrLiteral<i64>;
@@ -2512,13 +2489,195 @@ pub fn translate_create_type(
     Ok(())
 }
 
-pub fn translate_drop_type(
+pub fn translate_create_type(
     type_name: &str,
-    if_exists: bool,
+    body: &ast::CreateTypeBody,
+    if_not_exists: bool,
     resolver: &Resolver,
     program: &mut ProgramBuilder,
 ) -> Result<()> {
     let normalized_name = normalize_ident(type_name);
+
+    // Reject names that shadow SQLite base types
+    let is_base_type = turso_macros::match_ignore_ascii_case!(match normalized_name.as_bytes() {
+        b"INT" | b"INTEGER" | b"REAL" | b"TEXT" | b"BLOB" | b"ANY" => true,
+        _ => false,
+    });
+    if is_base_type {
+        bail_parse_error!("cannot create type \"{normalized_name}\": name is a built-in type");
+    }
+
+    // Check if type already exists
+    if resolver
+        .schema()
+        .get_type_def_unchecked(&normalized_name)
+        .is_some()
+    {
+        if if_not_exists {
+            return Ok(());
+        }
+        bail_parse_error!("type {normalized_name} already exists");
+    }
+
+    // Validate encode/decode expressions for safety
+    if let Some(ref encode) = body.encode {
+        validate_type_expr(encode, "ENCODE", resolver)?;
+    }
+    if let Some(ref decode) = body.decode {
+        validate_type_expr(decode, "DECODE", resolver)?;
+    }
+
+    // Build canonical SQL (without IF NOT EXISTS) for persistence
+    let sql = build_create_type_sql(&normalized_name, body);
+
+    persist_type_definition(normalized_name, sql, resolver, program)
+}
+
+/// Build canonical CREATE TYPE SQL from a normalized name and parsed body.
+fn build_create_type_sql(name: &str, body: &ast::CreateTypeBody) -> String {
+    use crate::util::quote_identifier as quote_ident;
+    fn quote_string_literal(s: &str) -> String {
+        s.replace('\'', "''")
+    }
+
+    let mut sql = if body.params.is_empty() {
+        format!(
+            "CREATE TYPE {} BASE {}",
+            quote_ident(name),
+            quote_ident(&body.base)
+        )
+    } else {
+        let params: Vec<String> = body
+            .params
+            .iter()
+            .map(|p| match &p.ty {
+                Some(ty) => format!("{} {}", quote_ident(&p.name), ty),
+                None => quote_ident(&p.name),
+            })
+            .collect();
+        format!(
+            "CREATE TYPE {}({}) BASE {}",
+            quote_ident(name),
+            params.join(", "),
+            quote_ident(&body.base)
+        )
+    };
+    if let Some(ref encode) = body.encode {
+        sql.push_str(&format!(" ENCODE {encode}"));
+    }
+    if let Some(ref decode) = body.decode {
+        sql.push_str(&format!(" DECODE {decode}"));
+    }
+    if let Some(ref default) = body.default {
+        sql.push_str(&format!(" DEFAULT {default}"));
+    }
+    for op in &body.operators {
+        match &op.func_name {
+            Some(func_name) => sql.push_str(&format!(
+                " OPERATOR '{}' {}",
+                quote_string_literal(&op.op),
+                quote_ident(func_name)
+            )),
+            None => sql.push_str(&format!(" OPERATOR '{}'", quote_string_literal(&op.op),)),
+        }
+    }
+    sql
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn translate_create_domain(
+    domain_name: &str,
+    base_type: &str,
+    not_null: bool,
+    constraints: &[ast::DomainConstraint],
+    default: Option<Box<ast::Expr>>,
+    if_not_exists: bool,
+    resolver: &Resolver,
+    program: &mut ProgramBuilder,
+) -> Result<()> {
+    let normalized_name = normalize_ident(domain_name);
+
+    // Reject names that shadow SQLite base types
+    let is_base_type = turso_macros::match_ignore_ascii_case!(match normalized_name.as_bytes() {
+        b"INT" | b"INTEGER" | b"REAL" | b"TEXT" | b"BLOB" | b"ANY" => true,
+        _ => false,
+    });
+    if is_base_type {
+        bail_parse_error!("cannot create domain \"{normalized_name}\": name is a built-in type");
+    }
+
+    // Check if type/domain already exists
+    if resolver
+        .schema()
+        .get_type_def_unchecked(&normalized_name)
+        .is_some()
+    {
+        if if_not_exists {
+            return Ok(());
+        }
+        bail_parse_error!("type {normalized_name} already exists");
+    }
+
+    // Validate base type exists — must be a primitive or a registered type
+    let base_normalized = normalize_ident(base_type);
+    let is_primitive = turso_macros::match_ignore_ascii_case!(match base_normalized.as_bytes() {
+        b"INT" | b"INTEGER" | b"REAL" | b"TEXT" | b"BLOB" => true,
+        _ => false,
+    });
+    if !is_primitive
+        && resolver
+            .schema()
+            .get_type_def_unchecked(&base_normalized)
+            .is_none()
+    {
+        bail_parse_error!("base type \"{base_type}\" does not exist");
+    }
+
+    // Validate no cycles — check if base type chain is acyclic
+    if !is_primitive {
+        resolver
+            .schema()
+            .resolve_base_type_chain(&base_normalized)?;
+    }
+
+    // Validate CHECK and DEFAULT expressions (reject subqueries, aggregates, etc.)
+    for c in constraints {
+        validate_type_expr(&c.check, "domain CHECK", resolver)?;
+    }
+    if let Some(ref def) = default {
+        validate_type_expr(def, "domain DEFAULT", resolver)?;
+    }
+
+    // Build the CREATE DOMAIN SQL for persistence
+    let sql = {
+        let mut s = format!("CREATE DOMAIN {normalized_name} AS {base_type}");
+        if let Some(ref def) = default {
+            s.push_str(&format!(" DEFAULT {def}"));
+        }
+        if not_null {
+            s.push_str(" NOT NULL");
+        }
+        for c in constraints {
+            if let Some(ref name) = c.name {
+                s.push_str(&format!(" CONSTRAINT {name}"));
+            }
+            s.push_str(&format!(" CHECK ({})", c.check));
+        }
+        s
+    };
+
+    persist_type_definition(normalized_name, sql, resolver, program)
+}
+
+pub fn translate_drop_type(
+    type_name: &str,
+    if_exists: bool,
+    is_domain_drop: bool,
+    resolver: &Resolver,
+    program: &mut ProgramBuilder,
+) -> Result<()> {
+    let normalized_name = normalize_ident(type_name);
+    let kind = if is_domain_drop { "domain" } else { "type" };
 
     // Check if type exists
     let type_def = resolver.schema().get_type_def_unchecked(&normalized_name);
@@ -2526,11 +2685,22 @@ pub fn translate_drop_type(
         if if_exists {
             return Ok(());
         }
-        bail_parse_error!("no such type: {normalized_name}");
+        bail_parse_error!("no such {kind}: {normalized_name}");
+    }
+
+    let type_def = type_def.unwrap();
+
+    // Validate that DROP TYPE targets a type and DROP DOMAIN targets a domain
+    let target_is_domain = type_def.is_domain;
+    if is_domain_drop && !target_is_domain {
+        bail_parse_error!("{normalized_name} is a type, not a domain. Use DROP TYPE instead");
+    }
+    if !is_domain_drop && target_is_domain {
+        bail_parse_error!("{normalized_name} is a domain, not a type. Use DROP DOMAIN instead");
     }
 
     // Check if built-in type
-    if type_def.unwrap().is_builtin {
+    if type_def.is_builtin {
         bail_parse_error!("cannot drop built-in type: {normalized_name}");
     }
 
@@ -2544,6 +2714,17 @@ pub fn translate_drop_type(
                     table.get_name()
                 );
             }
+        }
+    }
+
+    // Check if any other type/domain depends on this type
+    for (name, td) in resolver.schema().type_registry.iter() {
+        if normalize_ident(&td.base) == normalized_name {
+            bail_parse_error!(
+                "cannot drop type {}: type {} depends on it",
+                normalized_name,
+                name
+            );
         }
     }
 

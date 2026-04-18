@@ -179,13 +179,50 @@ pub const TURSO_INTERNAL_PREFIX: &str = "__turso_internal_";
 
 use crate::util::quote_identifier as quote_ident;
 
-/// Escape a string literal for SQL single-quote context.
-/// The value goes inside the surrounding quotes already present in the format string.
-fn quote_string_literal(s: &str) -> String {
-    s.replace('\'', "''")
+/// Recursively rewrite `Expr::Id("value")` (case-insensitive) to `Expr::Id(col_name)`.
+fn rewrite_value_to_column(expr: &ast::Expr, col_name: &str) -> Box<ast::Expr> {
+    let mut cloned = expr.clone();
+    let _ = walk_expr_mut(&mut cloned, &mut |e| {
+        if let ast::Expr::Id(name) = e {
+            if name.as_str().eq_ignore_ascii_case("value") {
+                *e = ast::Expr::Id(ast::Name::exact(col_name.to_string()));
+            }
+        }
+        Ok(WalkControl::Continue)
+    });
+    Box::new(cloned)
 }
 
 /// Custom type definition, loaded from sqlite_turso_types
+#[derive(Debug, Clone)]
+/// A fully-resolved custom type: the chain of TypeDefs from the named type
+/// up to the ultimate primitive, plus the primitive name itself.
+pub struct ResolvedType {
+    /// The ultimate primitive type name (e.g., "integer", "text", "blob").
+    pub primitive: String,
+    /// TypeDefs from child (the named type) to ancestor (closest to primitive).
+    pub chain: Vec<Arc<TypeDef>>,
+}
+
+impl ResolvedType {
+    /// The leaf (directly named) type definition.
+    pub fn leaf(&self) -> &TypeDef {
+        &self.chain[0]
+    }
+
+    /// Whether the leaf type is a domain.
+    pub fn is_domain(&self) -> bool {
+        self.chain[0].is_domain
+    }
+
+    /// Find the first DEFAULT expression in the type chain (child first, then ancestors).
+    /// Matches PostgreSQL: a child domain inherits the parent's DEFAULT when it
+    /// doesn't declare its own.
+    pub fn default_expr(&self) -> Option<&ast::Expr> {
+        self.chain.iter().find_map(|td| td.default.as_deref())
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct TypeDef {
     pub name: String,
@@ -196,11 +233,24 @@ pub struct TypeDef {
     pub operators: Vec<TypeOperator>,
     pub default: Option<Box<ast::Expr>>,
     pub is_builtin: bool,
+    pub not_null: bool,
+    /// Whether this is a domain (CREATE DOMAIN) vs a custom type (CREATE TYPE).
+    pub is_domain: bool,
+    /// Original SQL for round-trip persistence. Stored verbatim from creation.
+    pub sql: String,
+    /// CHECK constraints from CREATE DOMAIN, stored as first-class data.
+    /// Empty for regular CREATE TYPE definitions.
+    pub domain_checks: Vec<ast::DomainConstraint>,
 }
 
 impl TypeDef {
     /// Construct a TypeDef from a parsed CREATE TYPE statement.
-    pub fn from_create_type(type_name: &str, body: &ast::CreateTypeBody, is_builtin: bool) -> Self {
+    pub fn from_create_type(
+        type_name: &str,
+        body: &ast::CreateTypeBody,
+        is_builtin: bool,
+        sql: String,
+    ) -> Self {
         Self {
             name: type_name.to_string(),
             params: body.params.clone(),
@@ -210,6 +260,36 @@ impl TypeDef {
             operators: body.operators.clone(),
             default: body.default.clone(),
             is_builtin,
+            not_null: false,
+            is_domain: false,
+            sql,
+            domain_checks: Vec::new(),
+        }
+    }
+
+    /// Construct a TypeDef from a parsed CREATE DOMAIN statement.
+    /// Stores constraints as first-class data for propagation to table CHECK constraints.
+    pub fn from_domain(
+        domain_name: &str,
+        base_type: &str,
+        not_null: bool,
+        constraints: &[ast::DomainConstraint],
+        default: Option<Box<ast::Expr>>,
+        sql: String,
+    ) -> Self {
+        Self {
+            name: domain_name.to_string(),
+            params: Vec::new(),
+            base: base_type.to_string(),
+            encode: None,
+            decode: None,
+            operators: Vec::new(),
+            default,
+            is_builtin: false,
+            not_null,
+            is_domain: true,
+            sql,
+            domain_checks: constraints.to_vec(),
         }
     }
 
@@ -232,50 +312,9 @@ impl TypeDef {
             .filter(|p| !p.name.eq_ignore_ascii_case("value"))
     }
 
-    /// Reconstruct the CREATE TYPE SQL string from this definition.
-    pub fn to_sql(&self) -> String {
-        let mut sql = if self.params.is_empty() {
-            format!(
-                "CREATE TYPE {} BASE {}",
-                quote_ident(&self.name),
-                quote_ident(&self.base)
-            )
-        } else {
-            let params: Vec<String> = self
-                .params
-                .iter()
-                .map(|p| match &p.ty {
-                    Some(ty) => format!("{} {}", quote_ident(&p.name), ty),
-                    None => quote_ident(&p.name),
-                })
-                .collect();
-            format!(
-                "CREATE TYPE {}({}) BASE {}",
-                quote_ident(&self.name),
-                params.join(", "),
-                quote_ident(&self.base)
-            )
-        };
-        if let Some(ref encode) = self.encode {
-            sql.push_str(&format!(" ENCODE {encode}"));
-        }
-        if let Some(ref decode) = self.decode {
-            sql.push_str(&format!(" DECODE {decode}"));
-        }
-        if let Some(ref default) = self.default {
-            sql.push_str(&format!(" DEFAULT {default}"));
-        }
-        for op in &self.operators {
-            match &op.func_name {
-                Some(func_name) => sql.push_str(&format!(
-                    " OPERATOR '{}' {}",
-                    quote_string_literal(&op.op),
-                    quote_ident(func_name)
-                )),
-                None => sql.push_str(&format!(" OPERATOR '{}'", quote_string_literal(&op.op),)),
-            }
-        }
-        sql
+    /// Returns the original SQL used to create this type or domain.
+    pub fn to_sql(&self) -> &str {
+        &self.sql
     }
 }
 
@@ -445,7 +484,7 @@ fn bootstrap_builtin_types(registry: &mut HashMap<String, Arc<TypeDef>>) {
             panic!("Failed to parse built-in type SQL: {sql}");
         };
 
-        let type_def = TypeDef::from_create_type(&type_name, &body, true);
+        let type_def = TypeDef::from_create_type(&type_name, &body, true, sql.to_string());
         registry.insert(type_name.to_lowercase(), Arc::new(type_def));
     }
 
@@ -543,8 +582,64 @@ impl Schema {
         self.type_registry.get(&type_name.to_lowercase())
     }
 
+    /// Resolve a custom type fully: look it up (with strictness gate) and chase
+    /// the base-type chain to the ultimate primitive.
+    /// Returns `Ok(None)` if the type is not registered (or the table isn't strict).
+    pub fn resolve_type(
+        &self,
+        type_name: &str,
+        is_strict: bool,
+    ) -> crate::Result<Option<ResolvedType>> {
+        if !is_strict {
+            return Ok(None);
+        }
+        self.resolve_type_unchecked(type_name)
+    }
+
+    /// Resolve a custom type fully without a strictness check.
+    /// Returns `Ok(None)` if the type is not in the registry.
+    pub fn resolve_type_unchecked(&self, type_name: &str) -> crate::Result<Option<ResolvedType>> {
+        let key = type_name.to_lowercase();
+        if !self.type_registry.contains_key(&key) {
+            return Ok(None);
+        }
+        let (primitive, chain) = self.resolve_base_type_chain(type_name)?;
+        Ok(Some(ResolvedType { primitive, chain }))
+    }
+
     pub fn remove_type(&mut self, type_name: &str) {
         self.type_registry.remove(&type_name.to_lowercase());
+    }
+
+    /// Chase the base type chain: domain_a → domain_b → integer
+    /// Returns (ultimate_primitive, ordered_chain_of_TypeDefs)
+    /// The chain is ordered from child to ancestor.
+    /// Errors on cycles or missing intermediate types.
+    pub fn resolve_base_type_chain(
+        &self,
+        type_name: &str,
+    ) -> crate::Result<(String, Vec<Arc<TypeDef>>)> {
+        let mut chain = Vec::new();
+        let mut visited = std::collections::HashSet::new();
+        let mut current = type_name.to_lowercase();
+
+        loop {
+            if !visited.insert(current.clone()) {
+                return Err(crate::LimboError::ParseError(format!(
+                    "circular type dependency detected: {current}"
+                )));
+            }
+            match self.type_registry.get(&current) {
+                Some(td) => {
+                    chain.push(Arc::clone(td));
+                    current = td.base.to_lowercase();
+                }
+                None => {
+                    // current is not in the registry — it's a primitive
+                    return Ok((current, chain));
+                }
+            }
+        }
     }
 
     /// Parse a CREATE TYPE SQL string and add the type to the in-memory registry.
@@ -553,18 +648,40 @@ impl Schema {
         use turso_parser::parser::Parser;
 
         let mut parser = Parser::new(sql.as_bytes());
-        let Ok(Some(Cmd::Stmt(Stmt::CreateType {
-            type_name, body, ..
-        }))) = parser.next_cmd()
-        else {
-            return Err(crate::LimboError::ParseError(format!(
-                "invalid type sql: {sql}"
-            )));
-        };
-
-        let type_def = TypeDef::from_create_type(&type_name, &body, false);
-        self.type_registry
-            .insert(type_name.to_lowercase(), Arc::new(type_def));
+        let cmd = parser.next_cmd();
+        match cmd {
+            Ok(Some(Cmd::Stmt(Stmt::CreateType {
+                type_name, body, ..
+            }))) => {
+                let type_def = TypeDef::from_create_type(&type_name, &body, false, sql.to_string());
+                self.type_registry
+                    .insert(type_name.to_lowercase(), Arc::new(type_def));
+            }
+            Ok(Some(Cmd::Stmt(Stmt::CreateDomain {
+                domain_name,
+                base_type,
+                default,
+                not_null,
+                constraints,
+                ..
+            }))) => {
+                let type_def = TypeDef::from_domain(
+                    &domain_name,
+                    &base_type,
+                    not_null,
+                    &constraints,
+                    default,
+                    sql.to_string(),
+                );
+                self.type_registry
+                    .insert(domain_name.to_lowercase(), Arc::new(type_def));
+            }
+            _ => {
+                return Err(crate::LimboError::ParseError(format!(
+                    "invalid type sql: {sql}"
+                )));
+            }
+        }
         Ok(())
     }
 
@@ -595,6 +712,7 @@ impl Schema {
             let bt = table.btree().expect("checked btree table");
             let mut modified = (*bt).clone();
             modified.resolve_custom_type_affinities(self);
+            modified.propagate_domain_constraints(self);
             tables.push((name.clone(), Arc::new(Table::BTree(Arc::new(modified)))));
         }
         for (name, table) in tables {
@@ -1411,6 +1529,7 @@ impl Schema {
 
                     let mut table = table;
                     table.resolve_custom_type_affinities(self);
+                    table.propagate_domain_constraints(self);
                     self.add_btree_table(Arc::new(table))?;
                 }
             }
@@ -2279,8 +2398,8 @@ impl BTreeTable {
             if col.is_array() {
                 // Arrays are stored as record-format blobs.
                 col.ty_str = "BLOB".to_string();
-            } else if let Some(type_def) = schema.get_type_def(&col.ty_str, table.is_strict) {
-                col.ty_str = type_def.base.to_uppercase();
+            } else if let Ok(Some(resolved)) = schema.resolve_type(&col.ty_str, table.is_strict) {
+                col.ty_str = resolved.primitive.to_uppercase();
             }
         }
         Arc::new(modified)
@@ -2359,12 +2478,58 @@ impl BTreeTable {
                 col.set_base_affinity(Affinity::Blob);
                 continue;
             }
-            if let Some(type_def) = schema.get_type_def_unchecked(&col.ty_str) {
-                let (base_ty, _) = type_from_name(&type_def.base);
+            if let Ok(Some(resolved)) = schema.resolve_type_unchecked(&col.ty_str) {
+                let (base_ty, _) = type_from_name(&resolved.primitive);
                 col.set_ty(base_ty);
-                col.set_base_affinity(Affinity::affinity(&type_def.base));
+                col.set_base_affinity(Affinity::affinity(&resolved.primitive));
             }
         }
+    }
+
+    /// Propagate domain NOT NULL and CHECK constraints to table columns.
+    /// For each column whose type resolves to a domain, this:
+    /// - Sets the column's NOT NULL flag if any domain in the chain has NOT NULL
+    /// - Adds domain CHECK constraints (with `value` rewritten to the column name)
+    ///   to the table's check_constraints list
+    pub fn propagate_domain_constraints(&mut self, schema: &Schema) {
+        if !self.is_strict {
+            return;
+        }
+        // Collect new constraints and notnull flags to avoid borrowing issues
+        let mut new_checks = Vec::new();
+        let mut notnull_cols = Vec::new();
+
+        for (col_idx, col) in self.columns.iter().enumerate() {
+            let Ok(Some(resolved)) = schema.resolve_type_unchecked(&col.ty_str) else {
+                continue;
+            };
+            if !resolved.is_domain() {
+                continue;
+            }
+            let col_name = col.name.as_deref().unwrap_or("").to_string();
+            for td in &resolved.chain {
+                if td.not_null {
+                    notnull_cols.push(col_idx);
+                }
+                for (i, dc) in td.domain_checks.iter().enumerate() {
+                    let rewritten = rewrite_value_to_column(&dc.check, &col_name);
+                    let name = dc
+                        .name
+                        .clone()
+                        .unwrap_or_else(|| format!("{}_{}", td.name, i));
+                    new_checks.push(CheckConstraint {
+                        name: Some(name),
+                        expr: *rewritten,
+                        column: Some(col_name.clone()),
+                    });
+                }
+            }
+        }
+
+        for col_idx in notnull_cols {
+            self.columns[col_idx].set_notnull(true);
+        }
+        self.check_constraints.extend(new_checks);
     }
 
     pub fn get_rowid_alias_column(&self) -> Option<(usize, &Column)> {

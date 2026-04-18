@@ -1053,14 +1053,14 @@ pub fn translate_alter_table(
                 ));
             }
 
-            let new_column_name = column.name.as_ref().ok_or_else(|| {
+            let new_column_name = column.name.clone().ok_or_else(|| {
                 LimboError::ParseError(
                     "column name is missing in ALTER TABLE ADD COLUMN".to_string(),
                 )
             })?;
-            if btree.get_column(new_column_name).is_some() {
+            if btree.get_column(&new_column_name).is_some() {
                 return Err(LimboError::ParseError(
-                    "duplicate column name: ".to_string() + new_column_name,
+                    "duplicate column name: ".to_string() + &new_column_name,
                 ));
             }
 
@@ -1079,10 +1079,22 @@ pub fn translate_alter_table(
                     || ty.eq_ignore_ascii_case("TEXT")
                     || ty.eq_ignore_ascii_case("BLOB")
                     || ty.eq_ignore_ascii_case("ANY");
+                // Domain types require STRICT tables because domain constraints
+                // (CHECK, NOT NULL, DEFAULT) are only enforced on STRICT tables.
+                if !is_builtin && !btree.is_strict {
+                    let type_def = resolver
+                        .schema()
+                        .get_type_def_unchecked(&normalize_ident(ty));
+                    if let Some(td) = type_def {
+                        if td.is_domain {
+                            return Err(LimboError::ParseError(format!(
+                                "domain type columns require STRICT tables: {table_name}.{new_column_name}"
+                            )));
+                        }
+                    }
+                }
+
                 if !is_builtin && btree.is_strict {
-                    // On non-STRICT tables any type name is allowed and is
-                    // treated as a plain affinity hint (no encode/decode).
-                    // Custom type validation only applies to STRICT tables.
                     let type_def = resolver
                         .schema()
                         .get_type_def_unchecked(&normalize_ident(ty));
@@ -1100,12 +1112,12 @@ pub fn translate_alter_table(
             // one, propagate the type-level DEFAULT to the column so that
             // existing rows get the type default instead of NULL.
             if column.default.is_none() {
-                if let Some(type_def) = resolver
+                if let Ok(Some(resolved)) = resolver
                     .schema()
-                    .get_type_def(&column.ty_str, btree.is_strict)
+                    .resolve_type(&column.ty_str, btree.is_strict)
                 {
-                    if let Some(ref type_default) = type_def.default {
-                        column.default = Some(type_default.clone());
+                    if let Some(type_default) = resolved.default_expr() {
+                        column.default = Some(Box::new(type_default.clone()));
                     }
                 }
             }
@@ -1180,7 +1192,7 @@ pub fn translate_alter_table(
                         btree.check_constraints.push(CheckConstraint::new(
                             constraint.name.as_ref(),
                             expr,
-                            Some(new_column_name),
+                            Some(&new_column_name),
                         ));
                     }
                     _ => {
@@ -1188,6 +1200,16 @@ pub fn translate_alter_table(
                     }
                 }
             }
+
+            // Propagate domain CHECK and NOT NULL constraints to the newly
+            // added column. Without this, columns typed with a domain would
+            // silently skip domain-level enforcement after ALTER TABLE.
+            resolver.with_schema(database_id, |schema| {
+                btree.propagate_domain_constraints(schema);
+            });
+            // Refresh local `column` from btree so that domain NOT NULL is
+            // visible to the empty-table check below.
+            column = btree.columns().last().unwrap().clone();
 
             let escaped = escape_sql_string_literal(&btree.to_sql());
             let escaped_table_name = escape_sql_string_literal(table_name);
@@ -1221,15 +1243,15 @@ pub fn translate_alter_table(
                 )?;
             } else {
                 // Check if we need to verify the table is empty at runtime.
-                let effective_default = column.default.as_ref().or_else(|| {
-                    resolver
-                        .schema()
-                        .get_type_def(&column.ty_str, btree.is_strict)
-                        .and_then(|td| td.default.as_ref())
-                });
+                let type_default = resolver
+                    .schema()
+                    .resolve_type(&column.ty_str, btree.is_strict)
+                    .ok()
+                    .flatten()
+                    .and_then(|r| r.default_expr().cloned());
+                let effective_default = column.default.as_deref().or(type_default.as_ref());
                 let needs_notnull_check = column.notnull()
-                    && effective_default
-                        .is_none_or(|default| crate::util::expr_contains_null(default));
+                    && effective_default.is_none_or(crate::util::expr_contains_null);
 
                 let needs_nondeterministic_check = column
                     .default
@@ -1277,7 +1299,7 @@ pub fn translate_alter_table(
                     program,
                     &btree,
                     &original_btree,
-                    new_column_name,
+                    &new_column_name,
                     &column,
                     &constraints,
                     resolver,
