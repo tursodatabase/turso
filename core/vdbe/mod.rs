@@ -1175,7 +1175,7 @@ impl PreparedProgram {
     }
 
     #[inline]
-    pub fn is_readonly(&self) -> bool {
+    pub const fn is_readonly(&self) -> bool {
         self.readonly
     }
 }

@@ -329,7 +329,7 @@ impl TableInternalId {
     /// used in generated columns to signify "the table that the column belongs to"
     pub const SELF_TABLE: Self = Self(0);
 
-    pub fn is_self_table(&self) -> bool {
+    pub const fn is_self_table(&self) -> bool {
         self.0 == 0
     }
 }
@@ -557,7 +557,7 @@ pub struct Variable {
 }
 
 impl Variable {
-    pub fn indexed(index: NonZeroU32) -> Self {
+    pub const fn indexed(index: NonZeroU32) -> Self {
         Self { index, name: None }
     }
 
@@ -659,7 +659,7 @@ impl Expr {
         Expr::Raise(resolve_type, expr.map(Box::new))
     }
 
-    pub fn can_be_null(&self) -> bool {
+    pub const fn can_be_null(&self) -> bool {
         // todo: better handling columns. Check sqlite3ExprCanBeNull
         match self {
             Expr::Literal(literal) => !matches!(
@@ -772,7 +772,7 @@ pub enum Operator {
 
 impl Operator {
     /// returns whether order of operations can be ignored
-    pub fn is_commutative(&self) -> bool {
+    pub const fn is_commutative(&self) -> bool {
         matches!(
             self,
             Operator::Add
@@ -785,7 +785,7 @@ impl Operator {
     }
 
     /// Returns true if this operator is a comparison operator that may need affinity conversion
-    pub fn is_comparison(&self) -> bool {
+    pub const fn is_comparison(&self) -> bool {
         matches!(
             self,
             Self::Equals
@@ -1102,6 +1102,12 @@ impl Name {
     pub fn from_bytes(s: &[u8]) -> Self {
         Self::from_string(unsafe { std::str::from_utf8_unchecked(s) })
     }
+    pub const fn empty() -> Self {
+        Self {
+            value: String::new(),
+            quote: None,
+        }
+    }
     /// Parse name from the string (e.g. handle quoting and handle escaped quotes)
     pub fn from_string(s: impl AsRef<str>) -> Self {
         let s = s.as_ref();
@@ -1150,7 +1156,9 @@ impl Name {
         if let Some(quote) = self.quote {
             let single = quote.to_string();
             let double = single.clone() + &single;
-            return format!("{}{}{}", quote, self.value.replace(&single, &double), quote);
+            return quote.to_string()
+                + self.value.replace(&single, &double).as_str()
+                + quote.to_string().as_str();
         }
         let value = self.value.as_bytes();
         let safe_char = |&c: &u8| c.is_ascii_alphanumeric() || c == b'_';
@@ -1170,7 +1178,7 @@ impl Name {
         self.quote == Some(quote)
     }
 
-    pub fn quoted(&self) -> bool {
+    pub const fn quoted(&self) -> bool {
         self.quote.is_some()
     }
 }
@@ -1189,7 +1197,7 @@ pub struct QualifiedName {
 
 impl QualifiedName {
     /// Constructor
-    pub fn single(name: Name) -> Self {
+    pub const fn single(name: Name) -> Self {
         Self {
             db_name: None,
             name,
@@ -1197,7 +1205,7 @@ impl QualifiedName {
         }
     }
     /// Constructor
-    pub fn fullname(db_name: Name, name: Name) -> Self {
+    pub const fn fullname(db_name: Name, name: Name) -> Self {
         Self {
             db_name: Some(db_name),
             name,
@@ -1205,7 +1213,7 @@ impl QualifiedName {
         }
     }
     /// Constructor
-    pub fn xfullname(db_name: Name, name: Name, alias: Name) -> Self {
+    pub const fn xfullname(db_name: Name, name: Name, alias: Name) -> Self {
         Self {
             db_name: Some(db_name),
             name,
@@ -1213,7 +1221,7 @@ impl QualifiedName {
         }
     }
     /// Constructor
-    pub fn alias(name: Name, alias: Name) -> Self {
+    pub const fn alias(name: Name, alias: Name) -> Self {
         Self {
             db_name: None,
             name,

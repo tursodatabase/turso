@@ -1921,12 +1921,12 @@ impl Insn {
     // SAFETY: If the enumeration specifies a primitive representation,
     // then the discriminant may be reliably accessed via unsafe pointer casting
     #[inline(always)]
-    fn discriminant(&self) -> u8 {
+    const fn discriminant(&self) -> u8 {
         unsafe { *(self as *const Self as *const u8) }
     }
 
     #[inline(always)]
-    pub fn to_function(&self) -> InsnFunction {
+    pub const fn to_function(&self) -> InsnFunction {
         // dont use this because its still using match
         // InsnVariants::from(self).to_function_fast()
         INSN_VTABLE[self.discriminant() as usize]

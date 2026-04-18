@@ -1089,7 +1089,7 @@ impl TableReferences {
     /// which can represent up to 128 tables.
     /// Even at 63 tables we currently cannot handle the optimization performantly, hence the arbitrary cap.
     pub const MAX_JOINED_TABLES: usize = 63;
-    pub fn new(
+    pub const fn new(
         joined_tables: Vec<JoinedTable>,
         outer_query_refs: Vec<OuterQueryReference>,
     ) -> Self {
@@ -1099,7 +1099,8 @@ impl TableReferences {
             right_join_swapped: false,
         }
     }
-    pub fn new_empty() -> Self {
+
+    pub const fn new_empty() -> Self {
         Self {
             joined_tables: Vec::new(),
             outer_query_refs: Vec::new(),
@@ -1112,12 +1113,12 @@ impl TableReferences {
     }
 
     /// Mark that tables were swapped for a RIGHT-to-LEFT JOIN rewrite.
-    pub fn set_right_join_swapped(&mut self) {
+    pub const fn set_right_join_swapped(&mut self) {
         self.right_join_swapped = true;
     }
 
     /// Whether tables were swapped for a RIGHT JOIN rewrite.
-    pub fn right_join_swapped(&self) -> bool {
+    pub const fn right_join_swapped(&self) -> bool {
         self.right_join_swapped
     }
 
@@ -1137,7 +1138,7 @@ impl TableReferences {
     }
 
     /// Returns a mutable reference to the [JoinedTable]s in the query plan.
-    pub fn joined_tables_mut(&mut self) -> &mut Vec<JoinedTable> {
+    pub const fn joined_tables_mut(&mut self) -> &mut Vec<JoinedTable> {
         &mut self.joined_tables
     }
 

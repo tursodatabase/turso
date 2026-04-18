@@ -143,11 +143,11 @@ impl Sorter {
         }
     }
 
-    pub fn is_empty(&self) -> bool {
+    pub const fn is_empty(&self) -> bool {
         self.records.is_empty() && self.chunks.is_empty()
     }
 
-    pub fn has_more(&self) -> bool {
+    pub const fn has_more(&self) -> bool {
         self.current.is_some()
     }
 
@@ -253,7 +253,7 @@ impl Sorter {
         Ok(IOResult::Done(()))
     }
 
-    pub fn record(&self) -> Option<&ImmutableRecord> {
+    pub const fn record(&self) -> Option<&ImmutableRecord> {
         self.current.as_ref()
     }
 
@@ -794,13 +794,13 @@ impl ArenaSortableRecord {
     }
 
     #[inline]
-    fn key_values(&self) -> &[ValueRef<'static>] {
+    const fn key_values(&self) -> &[ValueRef<'static>] {
         // SAFETY: valid from construction, arena not reset
         unsafe { self.key_values.as_ref() }
     }
 
     #[inline]
-    fn payload(&self) -> &[u8] {
+    const fn payload(&self) -> &[u8] {
         // SAFETY: valid from construction, arena not reset
         unsafe { self.payload.as_ref() }
     }

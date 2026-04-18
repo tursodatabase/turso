@@ -392,7 +392,7 @@ pub enum CursorType {
 }
 
 impl CursorType {
-    pub fn is_index(&self) -> bool {
+    pub const fn is_index(&self) -> bool {
         matches!(self, CursorType::BTreeIndex(_))
     }
 
@@ -461,7 +461,7 @@ pub enum QueryMode {
 }
 
 impl QueryMode {
-    pub fn new(cmd: &ast::Cmd) -> Self {
+    pub const fn new(cmd: &ast::Cmd) -> Self {
         match cmd {
             ast::Cmd::ExplainQueryPlan(_) => QueryMode::ExplainQueryPlan,
             ast::Cmd::Explain(_) => QueryMode::Explain,
@@ -605,13 +605,13 @@ impl ProgramBuilder {
         }
     }
 
-    pub fn next_subquery_eqp_id(&mut self) -> usize {
+    pub const fn next_subquery_eqp_id(&mut self) -> usize {
         let id = self.next_subquery_eqp_id;
         self.next_subquery_eqp_id += 1;
         id
     }
 
-    pub fn alloc_hash_table_id(&mut self) -> usize {
+    pub const fn alloc_hash_table_id(&mut self) -> usize {
         let id = self.next_hash_table_id;
         self.next_hash_table_id = self
             .next_hash_table_id
@@ -622,7 +622,7 @@ impl ProgramBuilder {
 
     /// Allocate a unique CTE identity. Each CTE definition in a query gets a unique ID
     /// so that multiple references to the same CTE can share materialized data via OpenDup.
-    pub fn alloc_cte_id(&mut self) -> usize {
+    pub const fn alloc_cte_id(&mut self) -> usize {
         let id = self.next_cte_id;
         self.next_cte_id += 1;
         id
@@ -679,13 +679,13 @@ impl ProgramBuilder {
         self.ctes_being_defined = saved;
     }
 
-    pub fn set_resolve_type(&mut self, resolve_type: ResolveType) {
+    pub const fn set_resolve_type(&mut self, resolve_type: ResolveType) {
         self.resolve_type = resolve_type;
     }
 
     /// Set the trigger conflict override. When set, all triggers fired from this program
     /// should use this conflict resolution instead of their own OR clauses.
-    pub fn set_trigger_conflict_override(&mut self, resolve_type: ResolveType) {
+    pub const fn set_trigger_conflict_override(&mut self, resolve_type: ResolveType) {
         self.trigger_conflict_override = Some(resolve_type);
     }
 
@@ -748,16 +748,16 @@ impl ProgramBuilder {
 
     /// Mark that this statement may modify/insert multiple rows (mirrors SQLite's sqlite3MultiWrite).
     /// When false, statement journals are skipped since single-write statements are atomic.
-    pub fn set_multi_write(&mut self, is_multi_write: bool) {
+    pub const fn set_multi_write(&mut self, is_multi_write: bool) {
         self.is_multi_write = is_multi_write;
     }
 
     /// Mark that this statement may throw an ABORT exception (mirrors SQLite's sqlite3MayAbort).
-    pub fn set_may_abort(&mut self, may_abort: bool) {
+    pub const fn set_may_abort(&mut self, may_abort: bool) {
         self.may_abort = may_abort;
     }
 
-    pub fn capture_data_changes_info(&self) -> &Option<CaptureDataChangesInfo> {
+    pub const fn capture_data_changes_info(&self) -> &Option<CaptureDataChangesInfo> {
         &self.capture_data_changes_info
     }
 
@@ -807,7 +807,7 @@ impl ProgramBuilder {
     /// Get the index of the next constant span.
     /// Used in [crate::translate::expr::translate_expr_no_constant_opt()] to invalidate
     /// all constant spans after the given index.
-    pub fn constant_spans_next_idx(&self) -> usize {
+    pub const fn constant_spans_next_idx(&self) -> usize {
         self.constant_spans.len()
     }
 
@@ -818,20 +818,20 @@ impl ProgramBuilder {
         self.constant_spans.truncate(idx);
     }
 
-    pub fn alloc_register(&mut self) -> usize {
+    pub const fn alloc_register(&mut self) -> usize {
         let reg = self.next_free_register;
         self.next_free_register += 1;
         reg
     }
 
-    pub fn alloc_registers(&mut self, amount: usize) -> usize {
+    pub const fn alloc_registers(&mut self, amount: usize) -> usize {
         let reg = self.next_free_register;
         self.next_free_register += amount;
         reg
     }
 
     /// Returns the next register that will be allocated by alloc_register/alloc_registers.
-    pub fn peek_next_register(&self) -> usize {
+    pub const fn peek_next_register(&self) -> usize {
         self.next_free_register
     }
 
@@ -914,7 +914,7 @@ impl ProgramBuilder {
     pub fn add_pragma_result_column(&mut self, col_name: String) {
         // TODO figure out a better type definition for ResultSetColumn
         // or invent another way to set pragma result columns
-        let expr = ast::Expr::Id(ast::Name::exact("".to_string()));
+        let expr = ast::Expr::Id(ast::Name::empty());
         self.result_columns.push(ResultSetColumn {
             expr,
             alias: Some(col_name),
@@ -1009,7 +1009,7 @@ impl ProgramBuilder {
         }
     }
 
-    pub fn get_query_mode(&self) -> QueryMode {
+    pub const fn get_query_mode(&self) -> QueryMode {
         self.query_mode
     }
 
@@ -1122,7 +1122,7 @@ impl ProgramBuilder {
         }
     }
 
-    pub fn offset(&self) -> BranchOffset {
+    pub const fn offset(&self) -> BranchOffset {
         BranchOffset::Offset(self.insns.len() as InsnReference)
     }
 
@@ -1485,11 +1485,11 @@ impl ProgramBuilder {
             .map(|(_, cursor_type)| cursor_type)
     }
 
-    pub fn set_collation(&mut self, c: Option<(CollationSeq, bool)>) {
+    pub const fn set_collation(&mut self, c: Option<(CollationSeq, bool)>) {
         self.collation = c
     }
 
-    pub fn curr_collation_ctx(&self) -> Option<(CollationSeq, bool)> {
+    pub const fn curr_collation_ctx(&self) -> Option<(CollationSeq, bool)> {
         self.collation
     }
 
@@ -1497,7 +1497,7 @@ impl ProgramBuilder {
         self.collation.map(|c| c.0)
     }
 
-    pub fn reset_collation(&mut self) {
+    pub const fn reset_collation(&mut self) {
         self.collation = None;
     }
 
@@ -1510,18 +1510,18 @@ impl ProgramBuilder {
     }
 
     #[inline]
-    fn incr_nesting(&mut self) {
+    const fn incr_nesting(&mut self) {
         self.nested_level += 1;
     }
 
     #[inline]
-    fn decr_nesting(&mut self) {
+    const fn decr_nesting(&mut self) {
         self.nested_level -= 1;
     }
 
     /// Returns true if we are inside a nested subquery context.
     #[inline]
-    pub fn is_nested(&self) -> bool {
+    pub const fn is_nested(&self) -> bool {
         self.nested_level > 0
     }
 
@@ -1582,12 +1582,12 @@ impl ProgramBuilder {
             .insert(database_id, schema_cookie);
     }
 
-    pub fn begin_concurrent_operation(&mut self) {
+    pub const fn begin_concurrent_operation(&mut self) {
         self.txn_mode = TransactionMode::Concurrent;
     }
 
     /// Indicates the rollback behvaiour for the halt instruction in epilogue
-    pub fn rollback(&mut self) {
+    pub const fn rollback(&mut self) {
         self.rollback = true;
     }
 
@@ -1904,7 +1904,7 @@ impl ProgramBuilder {
         result
     }
 
-    pub fn self_table_context(&self) -> &Option<SelfTableContext> {
+    pub const fn self_table_context(&self) -> &Option<SelfTableContext> {
         &self.self_table_context
     }
 }
