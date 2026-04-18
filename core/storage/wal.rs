@@ -2051,8 +2051,9 @@ impl Wal for WalFile {
     fn finalize_committed_pages(&self, prepared: &[PreparedFrames]) {
         for batch in prepared {
             for (page, frame_id, _) in &batch.metadata {
-                page.clear_dirty();
-                page.set_wal_tag(*frame_id, batch.epoch);
+                if page.try_set_wal_tag(*frame_id, batch.epoch) {
+                    page.clear_dirty_keep_wal_tag();
+                }
             }
         }
     }
@@ -2166,8 +2167,9 @@ impl Wal for WalFile {
             );
 
             for (page, fid, _csum) in &page_frame_for_cb {
-                page.clear_dirty();
-                page.set_wal_tag(*fid, epoch);
+                if page.try_set_wal_tag(*fid, epoch) {
+                    page.clear_dirty_keep_wal_tag();
+                }
             }
         };
 
