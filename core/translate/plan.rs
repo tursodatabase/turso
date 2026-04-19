@@ -1075,7 +1075,7 @@ impl OuterQueryReference {
     }
 
     pub fn sync_access_path_from_outer_ref(&mut self, outer_ref: &OuterQueryReference) {
-        self.index = outer_ref.index.clone();
+        self.index.clone_from(&outer_ref.index);
         self.use_covering_index = outer_ref.use_covering_index;
     }
 }

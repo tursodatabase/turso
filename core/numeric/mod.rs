@@ -979,7 +979,10 @@ fn test_decode_float() {
 #[test]
 fn test_format_float_for_quote_matches_sqlite_3_53() {
     assert_eq!(format_float_for_quote(12.34), "12.34");
-    assert_eq!(format_float_for_quote(3.14), "3.14");
+    assert_eq!(
+        format_float_for_quote(str_to_f64("3.14").map(f64::from).unwrap()),
+        "3.14"
+    );
     assert_eq!(format_float_for_quote(0.0), "0.0");
     assert_eq!(format_float_for_quote(-20228007.0), "-20228007.0");
     assert_eq!(
@@ -991,7 +994,7 @@ fn test_format_float_for_quote_matches_sqlite_3_53() {
         "204274.77951022191"
     );
     assert_eq!(
-        format_float_for_quote(4.9406564584124654e-322),
+        format_float_for_quote(str_to_f64("4.9406564584124654e-322").map(f64::from).unwrap()),
         "4.9406564584124654e-322"
     );
     assert_eq!(
