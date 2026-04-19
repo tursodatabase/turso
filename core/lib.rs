@@ -2205,8 +2205,8 @@ impl Database {
                     match UringIO::new() {
                         Ok(io) => Arc::new(io),
                         Err(e) => {
-                            tracing::error!(
-                                "Failed to initialize io_uring: {e}. Falling back to SyscallIO."
+                            tracing::info!(
+                                "unable to initialize io_uring, falling back to platform IO: {e}"
                             );
                             Arc::new(PlatformIO::new()?)
                         }
