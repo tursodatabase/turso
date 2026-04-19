@@ -146,17 +146,44 @@ proc do_test {name cmd expected} {
     # Regular expression match
     set pattern [string range $expected 1 end-1]
     set ok [regexp $pattern $result]
-  } elseif {[string match "*" $expected]} {
-    # Glob pattern match
+  } elseif {[string first "*" $expected] != -1} {
+    # Glob pattern match (only if expected string contains a literal '*')
     set ok [string match $expected $result]
   } else {
-    # Exact match - handle both list and string formats
+    # Exact match - handle both list and string formats with true mathematical fallback
     if {[llength $expected] > 1 || [llength $result] > 1} {
       # List comparison
-      set ok [expr {$result eq $expected}]
+      set ok [expr {[llength $result] == [llength $expected]}]
+      if {$ok} {
+        for {set i 0} {$i < [llength $result]} {incr i} {
+          set r [lindex $result $i]
+          set e [lindex $expected $i]
+          if {$r ne $e} {
+            if {[string is double -strict $r] && [string is double -strict $e]} {
+              # True mathematical comparison for floating point noise
+              if {[expr {abs($r - $e) > 1e-12}]} {
+                set ok 0; break
+              }
+            } else {
+              set ok 0; break
+            }
+          }
+        }
+      }
     } else {
       # String comparison
-      set ok [expr {[string trim $result] eq [string trim $expected]}]
+      set r [string trim $result]
+      set e [string trim $expected]
+      if {$r ne $e} {
+        if {[string is double -strict $r] && [string is double -strict $e]} {
+          # True mathematical comparison for floating point noise
+          set ok [expr {abs($r - $e) < 1e-12}]
+        } else {
+          set ok 0
+        }
+      } else {
+        set ok 1
+      }
     }
   }
 

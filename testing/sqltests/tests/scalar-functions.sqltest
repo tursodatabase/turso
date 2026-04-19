@@ -2463,3 +2463,27 @@ test func9-160 {
 expect error {
     wrong number of arguments to function concat_ws()
 }
+
+test func7-pg-180 {
+    SELECT log10(1000.0);
+}
+expect {
+    3.0
+}
+expect @js {
+    3
+}
+
+test func7-pg-401 {
+   SELECT cos( radians(60.0) );
+} 
+expect {
+    0.5
+}
+
+test func7-pg-411 {
+   SELECT sin( radians(30) );
+} 
+expect {
+    0.5
+}

@@ -1374,3 +1374,17 @@ test printf-blob-s-nul {
 expect {
     1
 }
+
+test func7-pg-301 {
+   SELECT format('%f',degrees(acos(0.5)));
+} 
+expect {
+    60.000000
+}
+
+test func7-pg-311 {
+   SELECT format('%f',degrees( asin(0.5) ));
+} 
+expect {
+    30.000000
+}
