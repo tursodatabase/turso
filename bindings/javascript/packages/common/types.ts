@@ -59,7 +59,10 @@ export const STEP_IO = 3;
 
 export interface TableColumn {
     name: string,
-    type: string
+    type: string | null,
+    column: null,
+    table: null,
+    database: null
 }
 
 export interface NativeExecutor {

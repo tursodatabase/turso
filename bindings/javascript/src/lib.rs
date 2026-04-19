@@ -187,6 +187,16 @@ pub struct QueryOptions {
     pub query_timeout: Option<u32>,
 }
 
+#[napi(object)]
+pub struct TableColumn {
+    pub name: String,
+    #[napi(ts_type = "string | null")]
+    pub r#type: Option<String>,
+    pub column: Option<()>,
+    pub table: Option<()>,
+    pub database: Option<()>,
+}
+
 fn step_sync(stmt: &StatementHandle) -> napi::Result<u32> {
     let mut guard = stmt.borrow_mut();
     let core_stmt = guard
@@ -872,7 +882,7 @@ impl Statement {
     }
 
     /// Get column information for the statement
-    #[napi(ts_return_type = "Promise<any>")]
+    #[napi(ts_return_type = "Promise<TableColumn[]>")]
     pub fn columns<'env>(&self, env: &'env Env) -> Result<Array<'env>> {
         let guard = self.statement_handle()?.borrow();
         let stmt = guard
