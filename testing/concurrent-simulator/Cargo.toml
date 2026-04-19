@@ -38,5 +38,12 @@ serde_json = { workspace = true }
 hex = "0.4.3"
 twox-hash = { version = "2.1.1", optional = true }
 
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61.2", features = [
+    "Win32_Foundation",
+    "Win32_System_IO",
+    "Win32_Storage_FileSystem",
+] }
+
 [features]
 checksum = ["turso_core/checksum", "twox-hash"]

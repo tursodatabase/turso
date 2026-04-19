@@ -10,6 +10,37 @@ use turso_core::{
     Clock, Completion, File, IO, MonotonicInstant, OpenFlags, Result, WallClockInstant,
 };
 
+#[cfg(windows)]
+fn mark_sparse(file: &StdFile, file_path: &str) {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::System::IO::DeviceIoControl;
+
+    // FSCTL_SET_SPARSE = CTL_CODE(FILE_DEVICE_FILE_SYSTEM=9, 49, METHOD_BUFFERED=0, FILE_ANY_ACCESS=0)
+    const FSCTL_SET_SPARSE: u32 = 0x900C4;
+
+    let handle = file.as_raw_handle() as windows_sys::Win32::Foundation::HANDLE;
+    let mut bytes_returned: u32 = 0;
+    // SAFETY: `handle` is a valid file handle owned by `file` for the duration of the call.
+    // The input/output buffers are null because FSCTL_SET_SPARSE takes no input struct
+    // when defaulting to "make sparse" and writes no output payload.
+    let ok = unsafe {
+        DeviceIoControl(
+            handle,
+            FSCTL_SET_SPARSE,
+            std::ptr::null(),
+            0,
+            std::ptr::null_mut(),
+            0,
+            &mut bytes_returned,
+            std::ptr::null_mut(),
+        )
+    };
+    if ok == 0 {
+        let err = std::io::Error::last_os_error();
+        panic!("Failed to mark file sparse {file_path}: {err}");
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct IOFaultConfig {
     /// Probability of a cosmic ray bit flip on write (0.0-1.0)
@@ -249,6 +280,13 @@ impl SimulatorFile {
             .truncate(true)
             .open(file_path)
             .unwrap_or_else(|e| panic!("Failed to create file {file_path}: {e}"));
+
+        // NTFS doesn't treat `set_len`-extended files as sparse by default — it
+        // allocates real clusters for the whole range. Mark the file sparse
+        // before extending so the 8 GiB backing range doesn't actually consume
+        // disk space (otherwise Windows CI runners run out of temp storage).
+        #[cfg(windows)]
+        mark_sparse(&file, file_path);
 
         file.set_len(MAX_FILE_SIZE as u64)
             .unwrap_or_else(|e| panic!("Failed to truncate file {file_path}: {e}"));
