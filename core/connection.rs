@@ -3430,4 +3430,32 @@ mod tests {
         assert_eq!(query_single_i64(&conn, "SELECT COUNT(*) FROM temp.u"), 0);
         assert_eq!(query_single_i64(&conn, "SELECT COUNT(*) FROM temp.t"), 0);
     }
+
+    #[test]
+    fn test_distinct_triggers_with_same_name_in_different_schemas_can_fire_nested() {
+        let temp_dir = TempDir::new().unwrap();
+        let db_path = temp_dir.path().join("main.db");
+        let conn = open_connection(&db_path);
+
+        conn.execute("CREATE TABLE src(x INTEGER)").unwrap();
+        conn.execute("CREATE TABLE dst(y INTEGER)").unwrap();
+        conn.execute("CREATE TABLE audit(z INTEGER)").unwrap();
+        conn.execute(
+            "CREATE TRIGGER shared_name AFTER INSERT ON dst BEGIN \
+             INSERT INTO audit VALUES (NEW.y); \
+             END;",
+        )
+        .unwrap();
+        conn.execute(
+            "CREATE TEMP TRIGGER shared_name AFTER INSERT ON main.src BEGIN \
+             INSERT INTO dst VALUES (NEW.x); \
+             END;",
+        )
+        .unwrap();
+
+        conn.execute("INSERT INTO src VALUES(7)").unwrap();
+
+        assert_eq!(query_single_i64(&conn, "SELECT COUNT(*) FROM main.dst"), 1);
+        assert_eq!(query_single_i64(&conn, "SELECT SUM(z) FROM main.audit"), 7);
+    }
 }

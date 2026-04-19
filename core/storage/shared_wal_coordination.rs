@@ -3291,11 +3291,19 @@ mod tests {
         );
 
         let mapped_b = create_mapping(&path);
-        assert_eq!(
-            mapped_b.open_mode(),
-            SharedWalCoordinationOpenMode::MultiProcess,
-            "lifetime lock probe must leave the original mapping holding the shared lifetime lock"
-        );
+        if mapped_a.uses_linux_ofd_locking() {
+            assert_eq!(
+                mapped_b.open_mode(),
+                SharedWalCoordinationOpenMode::MultiProcess,
+                "lifetime lock probe must leave the original mapping holding the shared lifetime lock"
+            );
+        } else {
+            assert_eq!(
+                mapped_b.open_mode(),
+                SharedWalCoordinationOpenMode::Exclusive,
+                "process-scoped fcntl locks are per-process, so a same-process duplicate open cannot observe the lifetime shared lock"
+            );
+        }
     }
 
     #[test]
