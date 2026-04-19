@@ -452,8 +452,8 @@ impl Database {
     ///
     /// # Returns
     ///
-    /// A `Statement` instance.
-    #[napi]
+    /// A promise resolving to a `Statement` instance.
+    #[napi(ts_return_type = "Promise<Statement>")]
     pub fn prepare(&self, sql: String) -> napi::Result<Statement> {
         let inner = self.inner()?;
         let stmt = self
