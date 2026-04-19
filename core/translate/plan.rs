@@ -1353,8 +1353,26 @@ impl TableReferences {
     }
 
     pub fn extend(&mut self, other: TableReferences) {
-        self.joined_tables.extend(other.joined_tables);
-        self.outer_query_refs.extend(other.outer_query_refs);
+        fn take_or_append<T>(dst: &mut Vec<T>, mut src: Vec<T>) {
+            if dst.is_empty() {
+                *dst = src;
+            } else if !src.is_empty() {
+                dst.append(&mut src);
+            }
+        }
+
+        let TableReferences {
+            joined_tables,
+            outer_query_refs,
+            right_join_swapped: _,
+        } = other;
+
+        // Avoid `Vec::extend` here: `JoinedTable` is large, and many prepare
+        // paths append into an empty `TableReferences`. Taking ownership of the
+        // source vectors lets us reuse their allocation instead of reallocating
+        // and copying every element into a fresh buffer.
+        take_or_append(&mut self.joined_tables, joined_tables);
+        take_or_append(&mut self.outer_query_refs, outer_query_refs);
     }
 }
 
