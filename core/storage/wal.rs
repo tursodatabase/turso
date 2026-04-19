@@ -1256,8 +1256,11 @@ impl ShmWalCoordination {
         Self::local_authority_snapshot_from_shared(&shared, authority_snapshot)
     }
 
-    fn sync_local_from_authority(&self, snapshot: SharedWalCoordinationHeader) {
-        let mut shared = self.shared.write();
+    fn install_local_snapshot(
+        shared: &mut WalFileShared,
+        snapshot: SharedWalCoordinationHeader,
+        install_header: bool,
+    ) {
         shared
             .metadata
             .max_frame
@@ -1275,8 +1278,8 @@ impl ShmWalCoordination {
             .runtime
             .epoch
             .store(snapshot.checkpoint_epoch, Ordering::Release);
-        let mut header = shared.metadata.wal_header.lock();
-        if snapshot.page_size != 0 {
+        if install_header {
+            let mut header = shared.metadata.wal_header.lock();
             header.checkpoint_seq = snapshot.checkpoint_seq;
             header.page_size = snapshot.page_size;
             header.salt_1 = snapshot.salt_1;
@@ -1284,6 +1287,11 @@ impl ShmWalCoordination {
             header.checksum_1 = snapshot.checksum_1;
             header.checksum_2 = snapshot.checksum_2;
         }
+    }
+
+    fn sync_local_from_authority(&self, snapshot: SharedWalCoordinationHeader) {
+        let mut shared = self.shared.write();
+        Self::install_local_snapshot(&mut shared, snapshot, snapshot.page_size != 0);
     }
 
     fn sync_authority_from_local(&self) {
@@ -1293,33 +1301,8 @@ impl ShmWalCoordination {
 
     fn sync_local_to_zero_frame_authority(&self, snapshot: SharedWalCoordinationHeader) {
         let mut shared = self.shared.write();
-        shared
-            .metadata
-            .max_frame
-            .store(snapshot.max_frame, Ordering::Release);
-        shared
-            .metadata
-            .nbackfills
-            .store(snapshot.nbackfills, Ordering::Release);
-        shared.metadata.last_checksum = (snapshot.checksum_1, snapshot.checksum_2);
-        shared
-            .metadata
-            .transaction_count
-            .store(snapshot.transaction_count, Ordering::Release);
-        shared
-            .runtime
-            .epoch
-            .store(snapshot.checkpoint_epoch, Ordering::Release);
+        Self::install_local_snapshot(&mut shared, snapshot, true);
         shared.metadata.initialized.store(false, Ordering::Release);
-        {
-            let mut header = shared.metadata.wal_header.lock();
-            header.checkpoint_seq = snapshot.checkpoint_seq;
-            header.page_size = snapshot.page_size;
-            header.salt_1 = snapshot.salt_1;
-            header.salt_2 = snapshot.salt_2;
-            header.checksum_1 = snapshot.checksum_1;
-            header.checksum_2 = snapshot.checksum_2;
-        }
         shared.runtime.frame_cache.lock().clear();
         shared.runtime.overflow_fallback_coverage.lock().clear();
     }
@@ -1592,32 +1575,25 @@ impl ShmWalCoordination {
         let checkpoint_seq = snapshot.checkpoint_seq.wrapping_add(1);
         let salt_1 = snapshot.salt_1.wrapping_add(1);
         let salt_2 = io.generate_random_number() as u32;
+        let restarted = SharedWalCoordinationHeader {
+            max_frame: 0,
+            nbackfills: 0,
+            transaction_count: snapshot.transaction_count,
+            visibility_generation: snapshot.visibility_generation,
+            checkpoint_seq,
+            checkpoint_epoch: snapshot.checkpoint_epoch,
+            page_size: snapshot.page_size,
+            salt_1,
+            salt_2,
+            checksum_1: snapshot.checksum_1,
+            checksum_2: snapshot.checksum_2,
+            reader_slot_count: snapshot.reader_slot_count,
+        };
 
         {
             let mut shared = self.shared.write();
-            shared.metadata.max_frame.store(0, Ordering::Release);
-            shared.metadata.nbackfills.store(0, Ordering::Release);
-            shared.metadata.last_checksum = (snapshot.checksum_1, snapshot.checksum_2);
-            shared
-                .metadata
-                .transaction_count
-                .store(snapshot.transaction_count, Ordering::Release);
-            shared
-                .runtime
-                .epoch
-                .store(snapshot.checkpoint_epoch, Ordering::Release);
+            Self::install_local_snapshot(&mut shared, restarted, true);
             shared.metadata.initialized.store(false, Ordering::Release);
-
-            {
-                let mut header = shared.metadata.wal_header.lock();
-                header.checkpoint_seq = checkpoint_seq;
-                header.page_size = snapshot.page_size;
-                header.salt_1 = salt_1;
-                header.salt_2 = salt_2;
-                header.checksum_1 = snapshot.checksum_1;
-                header.checksum_2 = snapshot.checksum_2;
-            }
-
             shared.runtime.frame_cache.lock().clear();
             shared.runtime.overflow_fallback_coverage.lock().clear();
             shared.runtime.read_locks[0].set_value_exclusive(0);
@@ -1628,28 +1604,14 @@ impl ShmWalCoordination {
         }
 
         self.authority.rollback_frames(0);
-        self.authority
-            .install_snapshot(SharedWalCoordinationHeader {
-                max_frame: 0,
-                nbackfills: 0,
-                transaction_count: snapshot.transaction_count,
-                visibility_generation: snapshot.visibility_generation,
-                checkpoint_seq,
-                checkpoint_epoch: snapshot.checkpoint_epoch,
-                page_size: snapshot.page_size,
-                salt_1,
-                salt_2,
-                checksum_1: snapshot.checksum_1,
-                checksum_2: snapshot.checksum_2,
-                reader_slot_count: snapshot.reader_slot_count,
-            });
+        self.authority.install_snapshot(restarted);
 
         WalSnapshot {
-            max_frame: 0,
-            nbackfills: 0,
-            last_checksum: (snapshot.checksum_1, snapshot.checksum_2),
-            checkpoint_seq,
-            transaction_count: snapshot.transaction_count,
+            max_frame: restarted.max_frame,
+            nbackfills: restarted.nbackfills,
+            last_checksum: (restarted.checksum_1, restarted.checksum_2),
+            checkpoint_seq: restarted.checkpoint_seq,
+            transaction_count: restarted.transaction_count,
         }
     }
 
