@@ -435,6 +435,8 @@ fn plan_subqueries_with_outer_query_access<'a>(
                     cte_definition_only: false,
                     rowid_referenced: false,
                     scope_depth: 0,
+                    index: t.op.index().cloned(),
+                    use_covering_index: t.utilizes_covering_index(),
                 }
             })
             .chain(
@@ -452,6 +454,8 @@ fn plan_subqueries_with_outer_query_access<'a>(
                         cte_definition_only: t.cte_definition_only,
                         rowid_referenced: false,
                         scope_depth: t.scope_depth + 1,
+                        index: t.index.clone(),
+                        use_covering_index: t.use_covering_index,
                     }),
             )
             .collect::<Vec<_>>()
@@ -1072,6 +1076,42 @@ fn choose_from_clause_subquery_execution_mode(
     }
 }
 
+pub(crate) fn ensure_outer_query_ref_cursors_allocated(
+    program: &mut ProgramBuilder,
+    table_references: &TableReferences,
+) -> Result<()> {
+    for outer_ref in table_references
+        .outer_query_refs()
+        .iter()
+        .filter(|r| r.is_used())
+    {
+        match &outer_ref.table {
+            Table::BTree(btree) => {
+                if !outer_ref.use_covering_index {
+                    program.alloc_cursor_id_keyed_if_not_exists(
+                        CursorKey::table(outer_ref.internal_id),
+                        CursorType::BTreeTable(btree.clone()),
+                    );
+                }
+                if let Some(index) = &outer_ref.index {
+                    program.alloc_cursor_index_if_not_exists(
+                        CursorKey::index(outer_ref.internal_id, index.clone()),
+                        index,
+                    )?;
+                }
+            }
+            Table::Virtual(virtual_table) => {
+                let _ = program.alloc_cursor_id_keyed_if_not_exists(
+                    CursorKey::table(outer_ref.internal_id),
+                    CursorType::VirtualTable(virtual_table.clone()),
+                );
+            }
+            Table::FromClauseSubquery(_) => {}
+        }
+    }
+    Ok(())
+}
+
 /// Emit the subqueries contained in the FROM clause.
 /// This is done first so the results can be read in the main query loop.
 pub fn emit_from_clause_subqueries(
@@ -1384,6 +1424,7 @@ pub fn emit_from_clause_subquery(
 
     let result_column_start_reg = match plan {
         Plan::Select(select_plan) => {
+            ensure_outer_query_ref_cursors_allocated(program, &select_plan.table_references)?;
             let mut metadata = TranslateCtx {
                 labels_main_loop: (0..select_plan.joined_tables().len())
                     .map(|_| LoopLabels::new(program))

@@ -787,6 +787,8 @@ pub fn translate_alter_table(
                             cte_definition_only: false,
                             rowid_referenced: false,
                             scope_depth: 0,
+                            index: None,
+                            use_covering_index: false,
                         }],
                     );
                     let where_copy = index

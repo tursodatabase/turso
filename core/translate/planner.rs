@@ -521,6 +521,8 @@ fn plan_cte(
             cte_definition_only: false,
             rowid_referenced: false,
             scope_depth: 0,
+            index: referenced_table.op.index().cloned(),
+            use_covering_index: referenced_table.utilizes_covering_index(),
         });
     }
 
@@ -670,6 +672,8 @@ pub fn plan_ctes_as_outer_refs(
         // (e.g. UPDATE t SET b = (SELECT v FROM c)), not for direct column
         // resolution (e.g. UPDATE t SET b = c.v which SQLite rejects as
         // "no such column").
+        let joined_table_uses_covering_index = joined_table.utilizes_covering_index();
+        let joined_table_index = joined_table.op.index().cloned();
         table_references.add_outer_query_reference(OuterQueryReference {
             identifier: cte_name,
             internal_id: joined_table.internal_id,
@@ -681,6 +685,8 @@ pub fn plan_ctes_as_outer_refs(
             cte_definition_only: true,
             rowid_referenced: false,
             scope_depth: 0,
+            index: joined_table_index,
+            use_covering_index: joined_table_uses_covering_index,
         });
     }
 
@@ -740,6 +746,8 @@ fn parse_from_clause_table(
                     connection,
                     false,
                 )?;
+                let cte_table_uses_covering_index = cte_table.utilizes_covering_index();
+                let cte_table_index = cte_table.op.index().cloned();
                 outer_query_refs_for_subquery.push(OuterQueryReference {
                     identifier: cte_def.name.clone(),
                     internal_id: cte_table.internal_id,
@@ -751,6 +759,8 @@ fn parse_from_clause_table(
                     cte_definition_only: false,
                     rowid_referenced: false,
                     scope_depth: 0,
+                    index: cte_table_index,
+                    use_covering_index: cte_table_uses_covering_index,
                 });
             }
 
@@ -1276,6 +1286,8 @@ pub fn parse_from(
                     connection,
                     false,
                 )?;
+                let cte_table_uses_covering_index = cte_table.utilizes_covering_index();
+                let cte_table_index = cte_table.op.index().cloned();
                 table_references.add_outer_query_reference(OuterQueryReference {
                     identifier: cte_def.name.clone(),
                     internal_id: cte_table.internal_id,
@@ -1290,6 +1302,8 @@ pub fn parse_from(
                     cte_definition_only: true,
                     rowid_referenced: false,
                     scope_depth: 0,
+                    index: cte_table_index,
+                    use_covering_index: cte_table_uses_covering_index,
                 });
             }
         }

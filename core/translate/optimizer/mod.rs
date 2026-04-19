@@ -724,6 +724,7 @@ pub fn optimize_select_plan(plan: &mut SelectPlan, schema: &Schema) -> Result<()
     }
 
     reoptimize_correlated_subqueries(plan, schema)?;
+    refresh_outer_query_access_paths(plan);
 
     Ok(())
 }
@@ -1000,6 +1001,8 @@ fn add_ephemeral_table_to_update_plan(
                 cte_definition_only: false,
                 rowid_referenced: false,
                 scope_depth: 0,
+                index: table.op.index().cloned(),
+                use_covering_index: table.utilizes_covering_index(),
             });
     }
 
@@ -1162,6 +1165,62 @@ fn reoptimize_correlated_subqueries(plan: &mut SelectPlan, schema: &Schema) -> R
     }
 
     Ok(())
+}
+
+fn refresh_outer_query_access_paths(plan: &mut SelectPlan) {
+    fn sync_child_outer_refs(parent_refs: &TableReferences, child_refs: &mut TableReferences) {
+        for outer_ref in child_refs.outer_query_refs_mut() {
+            if let Some(joined_table) =
+                parent_refs.find_joined_table_by_internal_id(outer_ref.internal_id)
+            {
+                outer_ref.sync_access_path_from_joined_table(joined_table);
+            } else if let Some(parent_outer_ref) =
+                parent_refs.find_outer_query_ref_by_internal_id(outer_ref.internal_id)
+            {
+                outer_ref.sync_access_path_from_outer_ref(parent_outer_ref);
+            }
+        }
+    }
+
+    fn refresh_child_plan(parent_refs: &TableReferences, plan: &mut Plan) {
+        match plan {
+            Plan::Select(select_plan) => {
+                sync_child_outer_refs(parent_refs, &mut select_plan.table_references);
+                refresh_outer_query_access_paths(select_plan);
+            }
+            Plan::CompoundSelect {
+                left, right_most, ..
+            } => {
+                for (select_plan, _) in left {
+                    sync_child_outer_refs(parent_refs, &mut select_plan.table_references);
+                    refresh_outer_query_access_paths(select_plan);
+                }
+                sync_child_outer_refs(parent_refs, &mut right_most.table_references);
+                refresh_outer_query_access_paths(right_most);
+            }
+            Plan::Delete(_) | Plan::Update(_) => {}
+        }
+    }
+
+    let parent_refs = plan.table_references.clone();
+
+    for subquery in &mut plan.non_from_clause_subqueries {
+        let SubqueryState::Unevaluated {
+            plan: Some(child_plan),
+        } = &mut subquery.state
+        else {
+            continue;
+        };
+        refresh_child_plan(&parent_refs, child_plan.as_mut());
+    }
+
+    for joined_table in plan.table_references.joined_tables_mut() {
+        let Table::FromClauseSubquery(from_clause_subquery) = &mut joined_table.table else {
+            continue;
+        };
+        let subquery = Arc::make_mut(from_clause_subquery);
+        refresh_child_plan(&parent_refs, subquery.plan.as_mut());
+    }
 }
 
 /// Return whether this plan contains any FROM-clause CTE reference whose

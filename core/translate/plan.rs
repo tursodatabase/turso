@@ -1045,6 +1045,11 @@ pub struct OuterQueryReference {
     /// 1 = grandparent scope, etc. Used to avoid false "ambiguous column"
     /// errors when the same column name exists at different nesting depths.
     pub scope_depth: usize,
+    /// Resolved access path of the referenced outer table after optimization.
+    /// Needed when nested correlated subqueries emit before the enclosing loop
+    /// opens its cursors, so they can reserve the correct cursor keys up front.
+    pub index: Option<Arc<Index>>,
+    pub use_covering_index: bool,
 }
 
 impl OuterQueryReference {
@@ -1062,6 +1067,16 @@ impl OuterQueryReference {
     /// This is used primarily to determine at what loop depth a subquery should be evaluated.
     pub fn is_used(&self) -> bool {
         !self.col_used_mask.is_empty() || self.rowid_referenced
+    }
+
+    pub fn sync_access_path_from_joined_table(&mut self, table: &JoinedTable) {
+        self.index = table.op.index().cloned();
+        self.use_covering_index = table.utilizes_covering_index();
+    }
+
+    pub fn sync_access_path_from_outer_ref(&mut self, outer_ref: &OuterQueryReference) {
+        self.index = outer_ref.index.clone();
+        self.use_covering_index = outer_ref.use_covering_index;
     }
 }
 
@@ -1191,6 +1206,10 @@ impl TableReferences {
     /// Returns an immutable reference to the [OuterQueryReference]s in the query plan.
     pub fn outer_query_refs(&self) -> &[OuterQueryReference] {
         &self.outer_query_refs
+    }
+
+    pub fn outer_query_refs_mut(&mut self) -> &mut [OuterQueryReference] {
+        &mut self.outer_query_refs
     }
 
     /// Returns an immutable reference to the [OuterQueryReference] with the given internal ID.
