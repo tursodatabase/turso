@@ -67,7 +67,9 @@ pub fn emit_program_for_update(
     after: impl FnOnce(&mut ProgramBuilder),
 ) -> Result<()> {
     program.set_resolve_type(plan.or_conflict.unwrap_or(ResolveType::Abort));
-    program.has_statement_conflict = plan.or_conflict.is_some();
+    program
+        .flags
+        .set_has_statement_conflict(plan.or_conflict.is_some());
 
     let mut t_ctx = TranslateCtx::new(
         program,
@@ -309,7 +311,7 @@ pub fn emit_program_for_update(
         None
     };
     let any_replace = any_effective_replace(
-        program.has_statement_conflict,
+        program.flags.has_statement_conflict(),
         program.resolve_type,
         rowid_alias_conflict,
         plan.indexes_to_update.iter().map(|idx| idx.on_conflict),
@@ -564,7 +566,7 @@ fn emit_update_column_values<'a>(
                                 )?;
                             }
                             if table_column.notnull() && !skip_notnull_checks {
-                                let notnull_conflict = if program.has_statement_conflict {
+                                let notnull_conflict = if program.flags.has_statement_conflict() {
                                     or_conflict
                                 } else {
                                     table_column
@@ -932,7 +934,7 @@ fn emit_update_insns<'a>(
         .table
         .btree()
         .and_then(|bt| bt.rowid_alias_conflict_clause);
-    let effective_rowid_alias_conflict = if program.has_statement_conflict {
+    let effective_rowid_alias_conflict = if program.flags.has_statement_conflict() {
         or_conflict
     } else {
         constraint_rowid_alias_conflict.unwrap_or(ResolveType::Abort)
@@ -1304,7 +1306,7 @@ fn emit_update_insns<'a>(
                 s.any_resolved_fks_referencing(table_name)
             }) {
                 let new_key_probe_mode = if any_effective_replace(
-                    program.has_statement_conflict,
+                    program.flags.has_statement_conflict(),
                     or_conflict,
                     table_btree.rowid_alias_conflict_clause,
                     indexes_to_update.iter().map(|idx| idx.on_conflict),
@@ -1436,7 +1438,7 @@ fn emit_update_insns<'a>(
                 let (description, on_error) = halt_desc_and_on_error(
                     &raw_desc,
                     effective_rowid_alias_conflict,
-                    program.has_statement_conflict,
+                    program.flags.has_statement_conflict(),
                 );
                 program.emit_insn(Insn::Halt {
                     err_code: SQLITE_CONSTRAINT_PRIMARYKEY,
@@ -1728,7 +1730,7 @@ fn emit_update_insns<'a>(
         // If the constraint check fails (Halt/Ignore/Replace), the old index
         // entry is still intact — no statement journal needed for rollback.
         if index.unique {
-            let idx_conflict = if program.has_statement_conflict {
+            let idx_conflict = if program.flags.has_statement_conflict() {
                 or_conflict
             } else {
                 index.on_conflict.unwrap_or(ResolveType::Abort)
@@ -1923,7 +1925,7 @@ fn emit_update_insns<'a>(
                     let (description, on_error) = halt_desc_and_on_error(
                         &column_names,
                         idx_conflict,
-                        program.has_statement_conflict,
+                        program.flags.has_statement_conflict(),
                     );
                     program.emit_insn(Insn::Halt {
                         err_code: SQLITE_CONSTRAINT_UNIQUE,

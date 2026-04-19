@@ -813,10 +813,6 @@ impl Connection {
         fresh.generated_columns_enabled = self.db.experimental_generated_columns_enabled();
         fresh.schema_version = cookie;
 
-        // Preserve existing views to avoid expensive repopulation.
-        // TODO: We may not need to do this if we materialize our views.
-        let existing_views = self.schema.read().incremental_views.clone();
-
         // TODO: this is hack to avoid a cyclical problem with schema reprepare
         // The problem here is that we prepare a statement here, but when the statement tries
         // to execute it, it first checks the schema cookie to see if it needs to reprepare the statement.
@@ -848,7 +844,6 @@ impl Connection {
             &mut fresh,
             &self.syms.read(),
             mv_tx,
-            existing_views,
             &attached_resolver,
         )?;
 

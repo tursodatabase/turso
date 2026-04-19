@@ -1132,7 +1132,8 @@ pub fn translate_alter_table(
                                 .columns
                                 .iter()
                                 .map(|c| normalize_ident(c.col_name.as_str()))
-                                .collect(),
+                                .collect::<Vec<_>>()
+                                .into_boxed_slice(),
                             on_delete: clause
                                 .args
                                 .iter()
@@ -1155,7 +1156,7 @@ pub fn translate_alter_table(
                                     }
                                 })
                                 .unwrap_or(ast::RefAct::NoAction),
-                            child_columns: vec![new_column_name.to_string()],
+                            child_columns: Box::from([new_column_name.to_string()]),
                             deferred: match defer_clause {
                                 Some(d) => {
                                     d.deferrable

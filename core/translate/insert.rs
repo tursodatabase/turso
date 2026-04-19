@@ -19,7 +19,8 @@ use crate::{
             bind_and_rewrite_expr, emit_returning_results, emit_returning_scan_back,
             process_returning_clause, restore_returning_row_image_in_cache,
             seed_returning_row_image_in_cache, translate_expr, translate_expr_no_constant_opt,
-            walk_expr_mut, BindingBehavior, NoConstantOptReason, ReturningBufferCtx, WalkControl,
+            walk_expr, walk_expr_mut, BindingBehavior, NoConstantOptReason, ReturningBufferCtx,
+            WalkControl,
         },
         fkeys::{
             build_index_affinity_string, emit_fk_restrict_halt, emit_fk_violation,
@@ -76,26 +77,11 @@ fn validate(
     // Check if this is a system table that should be protected from direct writes
     if !conn.is_nested_stmt()
         && !conn.is_mvcc_bootstrap_connection()
-        && !crate::schema::can_write_to_table(table_name)
+        && !crate::schema::allow_user_dml(table_name)
     {
         crate::bail_parse_error!("table {} may not be modified", table_name);
     }
     // Check if this table has any incompatible dependent views
-    let incompatible_views = resolver
-        .schema()
-        .has_incompatible_dependent_views(table_name);
-    if !incompatible_views.is_empty() {
-        use crate::incremental::compiler::DBSP_CIRCUIT_VERSION;
-        crate::bail_parse_error!(
-            "Cannot INSERT into table '{}' because it has incompatible dependent materialized view(s): {}. \n\
-             These views were created with a different DBSP version than the current version ({}). \n\
-             Please DROP and recreate the view(s) before modifying this table.",
-            table_name,
-            incompatible_views.join(", "),
-            DBSP_CIRCUIT_VERSION
-        );
-    }
-
     // Check if this is a materialized view
     if resolver.schema().is_materialized_view(table_name) {
         crate::bail_parse_error!("cannot modify materialized view {}", table_name);
@@ -110,8 +96,18 @@ fn validate(
             "AUTOINCREMENT is not supported in MVCC mode (journal_mode=experimental_mvcc)"
         );
     }
-
+    resolver.schema().with_incompatible_dependent_views(table_name, |views| {
+    if !views.is_empty() {
+        use crate::incremental::compiler::DBSP_CIRCUIT_VERSION;
+        crate::bail_parse_error!(
+            "Cannot DELETE from table '{table_name}' because it has incompatible dependent materialized view(s): {}. \n\
+             These views were created with a different DBSP version than the current version ({DBSP_CIRCUIT_VERSION}). \n\
+             Please DROP and recreate the view(s) before modifying this table.",
+            views.iter().fold(String::new(), |_, s| s.to_string() + ", "),
+        );
+    }
     Ok(())
+    })
 }
 
 pub struct TempTableCtx {
@@ -195,7 +191,6 @@ impl<'a> InsertEmitCtx<'a> {
         num_values: usize,
         temp_table_ctx: Option<TempTableCtx>,
         database_id: usize,
-        _connection: &Arc<crate::Connection>,
     ) -> Result<Self> {
         // allocate cursor id's for each btree index cursor we'll need to populate the indexes
         let indices: Vec<_> = resolver.with_schema(database_id, |s| {
@@ -252,11 +247,7 @@ pub fn translate_insert(
     program: &mut ProgramBuilder,
     connection: &Arc<crate::Connection>,
 ) -> Result<()> {
-    let opts = ProgramBuilderOpts {
-        num_cursors: 1,
-        approx_num_insns: 30,
-        approx_num_labels: 5,
-    };
+    let opts = ProgramBuilderOpts::new(1, 30, 5);
     program.extend(&opts);
 
     // Merge INSERT's WITH clause into the SELECT source's WITH clause.
@@ -403,9 +394,10 @@ pub fn translate_insert(
         values.len(),
         None,
         database_id,
-        connection,
     )?;
-    program.has_statement_conflict = on_conflict.is_some();
+    program
+        .flags
+        .set_has_statement_conflict(on_conflict.is_some());
 
     // Open an ephemeral table for buffering RETURNING results.
     // All DML completes before any RETURNING rows are yielded to the caller.
@@ -616,25 +608,7 @@ pub fn translate_insert(
     }
 
     if has_user_provided_rowid {
-        let must_be_int_label = program.allocate_label();
-
-        program.emit_insn(Insn::NotNull {
-            reg: insertion.key_register(),
-            target_pc: must_be_int_label,
-        });
-
-        program.emit_insn(Insn::Goto {
-            target_pc: ctx.key_labels.key_generation,
-        });
-
-        program.preassign_label_to_next_insn(must_be_int_label);
-        program.emit_insn(Insn::MustBeInt {
-            reg: insertion.key_register(),
-        });
-
-        program.emit_insn(Insn::Goto {
-            target_pc: ctx.key_labels.key_ready_for_check,
-        });
+        emit_check_for_user_provided_rowid(program, &insertion, &ctx);
     }
 
     program.preassign_label_to_next_insn(ctx.key_labels.key_generation);
@@ -794,7 +768,6 @@ pub fn translate_insert(
         &upsert_actions,
         has_user_provided_rowid,
         resolver,
-        connection,
         ctx.database_id,
         ctx.table.rowid_alias_conflict_clause,
         ctx.statement_on_conflict.is_some(),
@@ -1153,6 +1126,32 @@ pub fn translate_insert(
     program.result_columns = result_columns;
     program.table_references.extend(table_references);
     Ok(())
+}
+
+/// If the user provided an explicit rowid for this insert, we must validate that it is an Integer and non-null
+fn emit_check_for_user_provided_rowid(
+    program: &mut ProgramBuilder,
+    insertion: &Insertion,
+    ctx: &InsertEmitCtx,
+) {
+    let must_be_int_label = program.allocate_label();
+    program.emit_insn(Insn::NotNull {
+        reg: insertion.key_register(),
+        target_pc: must_be_int_label,
+    });
+
+    program.emit_insn(Insn::Goto {
+        target_pc: ctx.key_labels.key_generation,
+    });
+
+    program.preassign_label_to_next_insn(must_be_int_label);
+    program.emit_insn(Insn::MustBeInt {
+        reg: insertion.key_register(),
+    });
+
+    program.emit_insn(Insn::Goto {
+        target_pc: ctx.key_labels.key_ready_for_check,
+    });
 }
 
 fn emit_epilogue(
@@ -1761,7 +1760,6 @@ struct BoundInsertResult {
 /// This is used to detect when single-row VALUES should be routed through the
 /// multi-row path which has proper subquery handling.
 fn expr_contains_subquery(expr: &Expr) -> bool {
-    use crate::translate::expr::{walk_expr, WalkControl};
     let mut found_subquery = false;
     let _ = walk_expr(expr, &mut |e| {
         if matches!(
@@ -2758,7 +2756,7 @@ fn emit_pk_uniqueness_check(
         let (description, on_error) = halt_desc_and_on_error(
             &raw_desc,
             preflight.effective_on_conflict,
-            program.has_statement_conflict,
+            program.flags.has_statement_conflict(),
         );
         program.emit_insn(Insn::Halt {
             err_code: SQLITE_CONSTRAINT_PRIMARYKEY,
@@ -2928,7 +2926,7 @@ fn emit_unique_index_check(
         let (description, on_error) = halt_desc_and_on_error(
             &raw_desc,
             preflight.effective_on_conflict,
-            program.has_statement_conflict,
+            program.flags.has_statement_conflict(),
         );
         program.emit_insn(Insn::Halt {
             err_code: SQLITE_CONSTRAINT_UNIQUE,
@@ -2973,7 +2971,7 @@ fn emit_unique_index_check(
             let (description, on_error) = halt_desc_and_on_error(
                 &raw_desc,
                 preflight.effective_on_conflict,
-                program.has_statement_conflict,
+                program.flags.has_statement_conflict(),
             );
             program.emit_insn(Insn::Halt {
                 err_code: SQLITE_CONSTRAINT_UNIQUE,
@@ -3465,13 +3463,11 @@ struct PreflightCtx<'a, 'b> {
     table_references: &'b mut TableReferences,
 }
 
-#[allow(clippy::too_many_arguments)]
 fn build_constraints_to_check(
     table_name: &str,
     upsert_actions: &[(ResolvedUpsertTarget, BranchOffset, Box<Upsert>)],
     has_user_provided_rowid: bool,
     resolver: &Resolver,
-    _connection: &Arc<crate::Connection>,
     database_id: usize,
     rowid_alias_conflict_clause: Option<ResolveType>,
     has_statement_conflict: bool,
@@ -3802,7 +3798,7 @@ pub fn emit_fk_child_insert_checks(
 
         // Short-circuit if any NEW component is NULL
         let fk_ok = program.allocate_label();
-        for cname in &fk_ref.child_cols {
+        for cname in &fk_ref.fk.child_columns {
             let (i, col) = child_tbl.get_column(cname).unwrap();
             let src = if col.is_rowid_alias() {
                 new_rowid_reg
@@ -3821,7 +3817,7 @@ pub fn emit_fk_child_insert_checks(
             let pcur = open_read_table(program, &parent_tbl, database_id);
 
             // first child col carries rowid
-            let (i_child, col_child) = child_tbl.get_column(&fk_ref.child_cols[0]).unwrap();
+            let (i_child, col_child) = child_tbl.get_column(&fk_ref.fk.child_columns[0]).unwrap();
             let val_reg = if col_child.is_rowid_alias() {
                 new_rowid_reg
             } else {
@@ -3873,12 +3869,12 @@ pub fn emit_fk_child_insert_checks(
                 .as_ref()
                 .expect("parent unique index required");
             let icur = open_read_index(program, idx, database_id);
-            let ncols = fk_ref.child_cols.len();
+            let ncols = fk_ref.fk.child_columns.len();
 
             // Build NEW child probe from child NEW values, apply parent-index affinities.
             let probe = {
                 let start = program.alloc_registers(ncols);
-                for (k, cname) in fk_ref.child_cols.iter().enumerate() {
+                for (k, cname) in fk_ref.fk.child_columns.iter().enumerate() {
                     let (i, col) = child_tbl.get_column(cname).unwrap();
                     program.emit_insn(Insn::Copy {
                         src_reg: if col.is_rowid_alias() {
@@ -3981,18 +3977,15 @@ fn build_parent_key_image_for_insert(
     pref: &ResolvedFkRef,
     insertion: &Insertion,
 ) -> crate::Result<(usize, usize)> {
-    // Decide column list
-    let parent_cols: Vec<String> = if pref.parent_uses_rowid {
-        vec!["rowid".to_string()]
-    } else if !pref.fk.parent_columns.is_empty() {
-        pref.fk.parent_columns.clone()
+    // Decide column list. When the parent is the rowid we force the literal name
+    // "rowid" so the loop below routes through `insertion.key_register()`; otherwise
+    // we reuse the already-resolved columns that `ResolvedFkRef` carries.
+    let rowid_slot: [String; 1];
+    let parent_cols: &[String] = if pref.parent_uses_rowid {
+        rowid_slot = ["rowid".to_string()];
+        &rowid_slot
     } else {
-        // fall back to the declared PK of the parent table, in schema order
-        parent_table
-            .primary_key_columns
-            .iter()
-            .map(|(n, _)| n.clone())
-            .collect()
+        &pref.parent_cols
     };
 
     let ncols = parent_cols.len();

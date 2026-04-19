@@ -172,11 +172,7 @@ pub fn translate_create_trigger(
         bail_parse_error!("INSTEAD OF triggers are not supported yet");
     }
 
-    let opts = ProgramBuilderOpts {
-        num_cursors: 1,
-        approx_num_insns: 30,
-        approx_num_labels: 1,
-    };
+    let opts = ProgramBuilderOpts::new(1, 30, 1);
     program.extend(&opts);
 
     // Open cursor to sqlite_schema table (in the trigger's database)
@@ -493,11 +489,7 @@ pub fn translate_drop_trigger(
         bail_parse_error!("no such trigger: {}", normalized_trigger_name);
     }
 
-    let opts = ProgramBuilderOpts {
-        num_cursors: 1,
-        approx_num_insns: 30,
-        approx_num_labels: 1,
-    };
+    let opts = ProgramBuilderOpts::new(1, 30, 1);
     program.extend(&opts);
 
     // Open cursor to sqlite_schema table (structure is the same for all databases)

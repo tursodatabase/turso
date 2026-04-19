@@ -561,11 +561,7 @@ fn execute_trigger_commands(
     let mut subprogram_builder = ProgramBuilder::new_for_trigger(
         QueryMode::Normal,
         program.capture_data_changes_info().clone(),
-        ProgramBuilderOpts {
-            num_cursors: 1,
-            approx_num_insns: 32,
-            approx_num_labels: 2,
-        },
+        ProgramBuilderOpts::new(1, 32, 2),
         trigger.clone(),
     );
     // If we have an override_conflict (e.g. from UPSERT DO UPDATE context),

@@ -803,11 +803,13 @@ pub fn emit_fk_child_update_counters(
             continue;
         }
 
-        let ncols = fk_ref.child_cols.len();
+        let ncols = fk_ref.fk.child_columns.len();
 
         // Pass 1: OLD tuple handling only for deferred FKs
         if fk_ref.fk.deferred {
-            if let Some((old_start, _, null_skip)) = load_old_tuple(program, &fk_ref.child_cols) {
+            if let Some((old_start, _, null_skip)) =
+                load_old_tuple(program, &fk_ref.fk.child_columns)
+            {
                 if fk_ref.parent_uses_rowid {
                     // Parent key is rowid: probe parent table by rowid
                     let parent_tbl = resolver
@@ -900,7 +902,7 @@ pub fn emit_fk_child_update_counters(
             let pcur = open_read_table(program, &parent_tbl, database_id);
 
             // Take the first child column value from NEW image
-            let (i_child, col_child) = child_tbl.get_column(&fk_ref.child_cols[0]).unwrap();
+            let (i_child, col_child) = child_tbl.get_column(&fk_ref.fk.child_columns[0]).unwrap();
             let val_reg = if col_child.is_rowid_alias() {
                 new_rowid_reg
             } else {
@@ -942,7 +944,7 @@ pub fn emit_fk_child_update_counters(
             // Build NEW probe (in FK child column order, aligns with parent index columns)
             let probe = {
                 let start = program.alloc_registers(ncols);
-                for (k, cname) in fk_ref.child_cols.iter().enumerate() {
+                for (k, cname) in fk_ref.fk.child_columns.iter().enumerate() {
                     let (i, col) = child_tbl.get_column(cname).unwrap();
                     program.emit_insn(Insn::Copy {
                         src_reg: if col.is_rowid_alias() {
@@ -1010,22 +1012,14 @@ fn emit_fk_delete_parent_existence_check_single(
     let is_restrict = matches!(fk_ref.fk.on_delete, RefAct::Restrict);
 
     // Build parent key in FK's parent-column order
-    let parent_cols: Vec<String> = if fk_ref.fk.parent_columns.is_empty() {
-        parent_bt
-            .primary_key_columns
-            .iter()
-            .map(|(n, _)| n.clone())
-            .collect()
-    } else {
-        fk_ref.fk.parent_columns.clone()
-    };
+    let parent_cols: &[String] = &fk_ref.parent_cols;
     let ncols = parent_cols.len();
 
     let parent_key_start = program.alloc_registers(ncols);
     build_parent_key(
         program,
         parent_bt,
-        &parent_cols,
+        parent_cols,
         parent_cursor_id,
         parent_rowid_reg,
         parent_key_start,
@@ -1256,21 +1250,6 @@ fn decode_fk_key_registers(
     Ok(())
 }
 
-/// Get the parent column names for an FK reference.
-/// Uses primary key columns if parent_columns is empty.
-#[inline]
-fn get_fk_parent_cols(fk_ref: &ResolvedFkRef, parent_bt: &BTreeTable) -> Vec<String> {
-    if fk_ref.fk.parent_columns.is_empty() {
-        parent_bt
-            .primary_key_columns
-            .iter()
-            .map(|(n, _)| n.clone())
-            .collect()
-    } else {
-        fk_ref.fk.parent_columns.clone()
-    }
-}
-
 /// Copy key values from value registers into destination registers.
 /// Handles rowid aliasing for columns that are rowid aliases.
 fn copy_key_from_values(
@@ -1336,11 +1315,7 @@ fn emit_key_change_check(
 }
 
 /// Common options for FK action subprogram builders.
-const FK_SUBPROGRAM_OPTS: ProgramBuilderOpts = ProgramBuilderOpts {
-    num_cursors: 2,
-    approx_num_insns: 32,
-    approx_num_labels: 4,
-};
+const FK_SUBPROGRAM_OPTS: ProgramBuilderOpts = ProgramBuilderOpts::new(2, 32, 4);
 
 /// Compile and emit an FK action as a sub-program.
 /// This is the common implementation for CASCADE DELETE, SET NULL, SET DEFAULT, and CASCADE UPDATE.
@@ -1722,14 +1697,14 @@ impl ForeignKeyActions<PreparedFkDeleteAction> {
         for fk_ref in resolver.with_schema(database_id, |s| {
             s.resolved_fks_referencing(parent_table_name)
         })? {
-            let parent_cols = get_fk_parent_cols(&fk_ref, &parent_bt);
+            let parent_cols: &[String] = &fk_ref.parent_cols;
             let ncols = parent_cols.len();
             let key_regs_start = program.alloc_registers(ncols);
 
             build_parent_key(
                 program,
                 &parent_bt,
-                &parent_cols,
+                parent_cols,
                 parent_cursor_id,
                 parent_rowid_reg,
                 key_regs_start,
@@ -1751,7 +1726,7 @@ impl ForeignKeyActions<PreparedFkDeleteAction> {
                             copy_key_from_values(
                                 program,
                                 &parent_bt,
-                                &parent_cols,
+                                parent_cols,
                                 replace_values_start,
                                 replace_rowid_reg,
                                 new_key_start,
@@ -1808,7 +1783,7 @@ impl ForeignKeyActions<PreparedFkDeleteAction> {
                         program,
                         resolver,
                         &parent_bt,
-                        &parent_cols,
+                        parent_cols,
                         key_regs_start,
                     )?;
                     let old_key_registers: Vec<usize> =
@@ -1897,7 +1872,7 @@ pub fn fire_fk_update_actions(
     for fk_ref in resolver.with_schema(database_id, |s| {
         s.resolved_fks_referencing(parent_table_name)
     })? {
-        let parent_cols = get_fk_parent_cols(&fk_ref, &parent_bt);
+        let parent_cols: &[String] = &fk_ref.parent_cols;
         let ncols = parent_cols.len();
 
         // Copy OLD and NEW parent key values using the helper
@@ -1905,7 +1880,7 @@ pub fn fire_fk_update_actions(
         copy_key_from_values(
             program,
             &parent_bt,
-            &parent_cols,
+            parent_cols,
             old_values_start,
             old_rowid_reg,
             old_key_start,
@@ -1915,15 +1890,15 @@ pub fn fire_fk_update_actions(
         copy_key_from_values(
             program,
             &parent_bt,
-            &parent_cols,
+            parent_cols,
             new_values_start,
             new_rowid_reg,
             new_key_start,
         )?;
 
         // Decode encoded values so they match the subprogram's decoded column reads
-        decode_fk_key_registers(program, resolver, &parent_bt, &parent_cols, old_key_start)?;
-        decode_fk_key_registers(program, resolver, &parent_bt, &parent_cols, new_key_start)?;
+        decode_fk_key_registers(program, resolver, &parent_bt, parent_cols, old_key_start)?;
+        decode_fk_key_registers(program, resolver, &parent_bt, parent_cols, new_key_start)?;
 
         let old_key_registers: Vec<usize> = (old_key_start..old_key_start + ncols).collect();
         let new_key_registers: Vec<usize> = (new_key_start..new_key_start + ncols).collect();
@@ -2083,14 +2058,14 @@ pub fn emit_fk_drop_table_check(
 
     // Fire FK actions for CASCADE, SET NULL, SET DEFAULT
     for fk_ref in &action_fk_refs {
-        let parent_cols = get_fk_parent_cols(fk_ref, &parent_tbl);
+        let parent_cols: &[String] = &fk_ref.parent_cols;
         let ncols = parent_cols.len();
         let key_regs_start = program.alloc_registers(ncols);
 
         build_parent_key(
             program,
             &parent_tbl,
-            &parent_cols,
+            parent_cols,
             parent_write_cur,
             current_rowid_reg,
             key_regs_start,
@@ -2098,7 +2073,7 @@ pub fn emit_fk_drop_table_check(
         )?;
 
         // Decode encoded values so they match the subprogram's decoded column reads
-        decode_fk_key_registers(program, resolver, &parent_tbl, &parent_cols, key_regs_start)?;
+        decode_fk_key_registers(program, resolver, &parent_tbl, parent_cols, key_regs_start)?;
 
         let old_key_registers: Vec<usize> = (key_regs_start..key_regs_start + ncols).collect();
         let ctx = FkActionContext::new_for_delete(old_key_registers);
@@ -2125,7 +2100,7 @@ pub fn emit_fk_drop_table_check(
         let child_cols = &fk_ref.fk.child_columns;
 
         // Determine which parent columns are referenced
-        let parent_cols = get_fk_parent_cols(fk_ref, &parent_tbl);
+        let parent_cols: &[String] = &fk_ref.parent_cols;
         let ncols = parent_cols.len();
 
         // Build the parent key vector from the current parent row
@@ -2133,7 +2108,7 @@ pub fn emit_fk_drop_table_check(
         build_parent_key(
             program,
             &parent_tbl,
-            &parent_cols,
+            parent_cols,
             parent_write_cur,
             current_rowid_reg,
             parent_key_start,

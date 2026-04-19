@@ -345,14 +345,14 @@ impl<V: AsValueRef> AsValueRef for &V {
 }
 
 impl Value {
-    pub fn from_f64(f: f64) -> Self {
+    pub const fn from_f64(f: f64) -> Self {
         match NonNan::new(f) {
             Some(nn) => Self::Numeric(Numeric::Float(nn)),
             None => Self::Null,
         }
     }
 
-    pub fn from_i64(i: i64) -> Self {
+    pub const fn from_i64(i: i64) -> Self {
         Self::Numeric(Numeric::Integer(i))
     }
 
@@ -391,14 +391,14 @@ impl Value {
         }
     }
 
-    pub fn as_blob(&self) -> &Vec<u8> {
+    pub const fn as_blob(&self) -> &Vec<u8> {
         match self {
             Value::Blob(b) => b,
             _ => panic!("as_blob must be called only for Value::Blob"),
         }
     }
 
-    pub fn as_blob_mut(&mut self) -> &mut Vec<u8> {
+    pub const fn as_blob_mut(&mut self) -> &mut Vec<u8> {
         match self {
             Value::Blob(b) => b,
             _ => panic!("as_blob must be called only for Value::Blob"),
@@ -420,14 +420,14 @@ impl Value {
         }
     }
 
-    pub fn as_int(&self) -> Option<i64> {
+    pub const fn as_int(&self) -> Option<i64> {
         match self {
             Value::Numeric(Numeric::Integer(i)) => Some(*i),
             _ => None,
         }
     }
 
-    pub fn as_uint(&self) -> u64 {
+    pub const fn as_uint(&self) -> u64 {
         match self {
             Value::Numeric(Numeric::Integer(i)) => (*i).cast_unsigned(),
             _ => 0,
@@ -438,7 +438,7 @@ impl Value {
         Value::Text(Text::new(text))
     }
 
-    pub fn value_type(&self) -> ValueType {
+    pub const fn value_type(&self) -> ValueType {
         match self {
             Value::Null => ValueType::Null,
             Value::Numeric(Numeric::Integer(_)) => ValueType::Integer,
@@ -1066,7 +1066,7 @@ impl ImmutableRecord {
         }
     }
 
-    pub fn from_bin_record(payload: Vec<u8>) -> Self {
+    pub const fn from_bin_record(payload: Vec<u8>) -> Self {
         Self {
             payload: Value::Blob(payload),
         }
@@ -1278,7 +1278,7 @@ impl ImmutableRecord {
     }
 
     #[inline]
-    pub fn as_blob(&self) -> &Vec<u8> {
+    pub const fn as_blob(&self) -> &Vec<u8> {
         match &self.payload {
             Value::Blob(b) => b,
             _ => panic!("payload must be a blob"),
@@ -1286,7 +1286,7 @@ impl ImmutableRecord {
     }
 
     #[inline]
-    pub fn as_blob_mut(&mut self) -> &mut Vec<u8> {
+    pub const fn as_blob_mut(&mut self) -> &mut Vec<u8> {
         match &mut self.payload {
             Value::Blob(b) => b,
             _ => panic!("payload must be a blob"),
@@ -1294,7 +1294,7 @@ impl ImmutableRecord {
     }
 
     #[inline]
-    pub fn as_blob_value(&self) -> &Value {
+    pub const fn as_blob_value(&self) -> &Value {
         &self.payload
     }
 
@@ -1309,7 +1309,7 @@ impl ImmutableRecord {
     }
 
     #[inline]
-    pub fn is_invalidated(&self) -> bool {
+    pub const fn is_invalidated(&self) -> bool {
         self.as_blob().is_empty()
     }
 
@@ -1466,19 +1466,19 @@ impl<'a> ValueIterator<'a> {
     }
 
     /// Returns `true` if the payload is empty or the record has no columns.
-    pub fn is_empty(&self) -> bool {
+    pub const fn is_empty(&self) -> bool {
         self.header_section.get().is_empty()
     }
 
     /// Returns a reference to the current header section.
     #[inline(always)]
-    pub fn header_section_ref(&self) -> &'a [u8] {
+    pub const fn header_section_ref(&self) -> &'a [u8] {
         self.header_section.get()
     }
 
     /// Returns a reference to the current data section.
     #[inline(always)]
-    pub fn data_section_ref(&self) -> &'a [u8] {
+    pub const fn data_section_ref(&self) -> &'a [u8] {
         self.data_section.get()
     }
 
@@ -1686,14 +1686,14 @@ impl<'a> ValueRef<'a> {
         }
     }
 
-    pub fn as_int(&self) -> Option<i64> {
+    pub const fn as_int(&self) -> Option<i64> {
         match self {
             Self::Numeric(Numeric::Integer(i)) => Some(*i),
             _ => None,
         }
     }
 
-    pub fn as_uint(&self) -> u64 {
+    pub const fn as_uint(&self) -> u64 {
         match self {
             Self::Numeric(Numeric::Integer(i)) => (*i).cast_unsigned(),
             _ => 0,

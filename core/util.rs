@@ -1,7 +1,5 @@
-use crate::incremental::view::IncrementalView;
 use crate::numeric::StrToF64;
 use crate::schema::ColDef;
-use crate::sync::Mutex;
 use crate::translate::emitter::TransactionMode;
 use crate::translate::expr::{walk_expr, walk_expr_mut, WalkControl};
 use crate::translate::plan::{BitSet, JoinedTable, TableReferences};
@@ -16,7 +14,6 @@ use crate::{
 use either::Either;
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use std::future::Future;
-use std::sync::Arc;
 use tracing::{instrument, Level};
 use turso_macros::match_ignore_ascii_case;
 use turso_parser::ast::{self, CreateTableBody, Expr, Literal, UnaryOperator};
@@ -164,7 +161,6 @@ pub fn parse_schema_rows(
     schema: &mut Schema,
     syms: &SymbolTable,
     mv_tx: Option<(u64, TransactionMode)>,
-    _existing_views: HashMap<String, Arc<Mutex<IncrementalView>>>,
     resolve_attached_db: &dyn Fn(&str) -> Option<usize>,
 ) -> Result<()> {
     rows.set_mv_tx(mv_tx);

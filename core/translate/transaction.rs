@@ -96,11 +96,7 @@ pub fn translate_tx_commit(
     resolver: &Resolver,
     program: &mut ProgramBuilder,
 ) -> Result<()> {
-    program.extend(&ProgramBuilderOpts {
-        num_cursors: 0,
-        approx_num_insns: 0,
-        approx_num_labels: 0,
-    });
+    program.extend(&ProgramBuilderOpts::new(0, 0, 0));
 
     let cdc_info = program.capture_data_changes_info().as_ref();
     if cdc_info.is_some_and(|info| info.cdc_version().has_commit_record()) {

@@ -1,13 +1,8 @@
-use rustc_hash::FxHashMap as HashMap;
-use smallvec::SmallVec;
-use std::{cmp::Ordering, marker::PhantomData, sync::Arc};
-use turso_parser::ast::{
-    self, FrameBound, FrameClause, FrameExclude, FrameMode, ResolveType, SortOrder, SubqueryType,
-};
-
 use crate::{
     function::{AggFunc, WindowFunc},
-    schema::{BTreeTable, ColDef, Column, FromClauseSubquery, Index, Schema, Table},
+    schema::{
+        BTreeTable, ColDef, Column, FromClauseSubquery, Index, Schema, Table, Type, ROWID_SENTINEL,
+    },
     translate::{
         collate::{get_collseq_from_expr, CollationSeq},
         emitter::UpdateRowSource,
@@ -16,15 +11,23 @@ use crate::{
         optimizer::constraints::{BinaryExprSide, SeekRangeConstraint},
         planner::determine_where_to_eval_term,
     },
+    types::SeekOp,
+    util::exprs_are_equivalent,
     vdbe::{
         affinity::{self, Affinity},
         builder::{CursorKey, CursorType, ProgramBuilder},
         insn::{HashDistinctData, Insn},
         BranchOffset, CursorID,
     },
-    Result, VirtualTable,
+    Result, VirtualTable, MAIN_DB_ID,
 };
-use crate::{schema::Type, types::SeekOp, MAIN_DB_ID};
+use rustc_hash::FxHashMap as HashMap;
+use smallvec::SmallVec;
+use std::{cmp::Ordering, marker::PhantomData, sync::Arc};
+use turso_parser::ast::{
+    self, Expr, FrameBound, FrameClause, FrameExclude, FrameMode, ResolveType, SortOrder,
+    SubqueryType,
+};
 
 use turso_parser::ast::TableInternalId;
 
@@ -219,10 +222,6 @@ impl From<Expr> for WhereTerm {
         }
     }
 }
-
-use crate::ast::Expr;
-use crate::schema::ROWID_SENTINEL;
-use crate::util::exprs_are_equivalent;
 
 /// The loop index where to evaluate the condition.
 /// For example, in `SELECT * FROM u JOIN p WHERE u.id = 5`, the condition can already be evaluated at the first loop (idx 0),
@@ -1090,7 +1089,7 @@ impl TableReferences {
     /// which can represent up to 128 tables.
     /// Even at 63 tables we currently cannot handle the optimization performantly, hence the arbitrary cap.
     pub const MAX_JOINED_TABLES: usize = 63;
-    pub fn new(
+    pub const fn new(
         joined_tables: Vec<JoinedTable>,
         outer_query_refs: Vec<OuterQueryReference>,
     ) -> Self {
@@ -1100,7 +1099,8 @@ impl TableReferences {
             right_join_swapped: false,
         }
     }
-    pub fn new_empty() -> Self {
+
+    pub const fn new_empty() -> Self {
         Self {
             joined_tables: Vec::new(),
             outer_query_refs: Vec::new(),
@@ -1113,12 +1113,12 @@ impl TableReferences {
     }
 
     /// Mark that tables were swapped for a RIGHT-to-LEFT JOIN rewrite.
-    pub fn set_right_join_swapped(&mut self) {
+    pub const fn set_right_join_swapped(&mut self) {
         self.right_join_swapped = true;
     }
 
     /// Whether tables were swapped for a RIGHT JOIN rewrite.
-    pub fn right_join_swapped(&self) -> bool {
+    pub const fn right_join_swapped(&self) -> bool {
         self.right_join_swapped
     }
 
@@ -1138,7 +1138,7 @@ impl TableReferences {
     }
 
     /// Returns a mutable reference to the [JoinedTable]s in the query plan.
-    pub fn joined_tables_mut(&mut self) -> &mut Vec<JoinedTable> {
+    pub const fn joined_tables_mut(&mut self) -> &mut Vec<JoinedTable> {
         &mut self.joined_tables
     }
 

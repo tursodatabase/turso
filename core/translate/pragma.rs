@@ -205,11 +205,7 @@ pub fn translate_pragma(
     connection: Arc<crate::Connection>,
     program: &mut ProgramBuilder,
 ) -> crate::Result<()> {
-    let opts = ProgramBuilderOpts {
-        num_cursors: 0,
-        approx_num_insns: 20,
-        approx_num_labels: 0,
-    };
+    let opts = ProgramBuilderOpts::new(0, 20, 0);
     program.extend(&opts);
 
     if name.name.as_str().eq_ignore_ascii_case("pragma_list") {

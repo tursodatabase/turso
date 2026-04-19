@@ -48,6 +48,21 @@ use crate::vector::{
     vector_distance_dot, vector_distance_jaccard, vector_distance_l2, vector_extract, vector_slice,
 };
 use crate::{
+    connection::Row,
+    get_cursor, info, is_attached_db,
+    storage::wal::CheckpointResult,
+    turso_assert,
+    types::{AggContext, Cursor, ExternalAggState, SeekKey, SeekOp, SumAggState, Value, ValueType},
+    util::{cast_real_to_integer, checked_cast_text_to_numeric},
+    vdbe::{
+        builder::CursorType,
+        insn::{IdxInsertFlags, Insn, SavepointOp},
+    },
+    CaptureDataChangesInfo, CdcVersion, CheckpointMode, Completion, Connection, DatabaseStorage,
+    IOExt, MvCursor, NonNan, OpenFlags, QueryMode, Statement, TransactionState, ValueRef,
+    MAIN_DB_ID, TEMP_DB_ID,
+};
+use crate::{
     error::{
         LimboError, SQLITE_CONSTRAINT, SQLITE_CONSTRAINT_CHECK, SQLITE_CONSTRAINT_FOREIGNKEY,
         SQLITE_CONSTRAINT_NOTNULL, SQLITE_CONSTRAINT_PRIMARYKEY, SQLITE_CONSTRAINT_TRIGGER,
@@ -64,11 +79,6 @@ use crate::{
     stats::StatAccum,
     translate::emitter::TransactionMode,
 };
-use crate::{
-    get_cursor, CaptureDataChangesInfo, CheckpointMode, Completion, Connection, DatabaseStorage,
-    IOExt, MvCursor, NonNan, QueryMode,
-};
-use crate::{CdcVersion, Statement};
 use branches::{mark_unlikely, unlikely};
 use either::Either;
 use smallvec::SmallVec;
@@ -85,19 +95,6 @@ use crate::pseudo::PseudoCursor;
 
 use crate::storage::btree::{BTreeCursor, BTreeKey};
 
-use crate::{
-    storage::wal::CheckpointResult,
-    types::{AggContext, Cursor, ExternalAggState, SeekKey, SeekOp, SumAggState, Value, ValueType},
-    util::{cast_real_to_integer, checked_cast_text_to_numeric},
-    vdbe::{
-        builder::CursorType,
-        insn::{IdxInsertFlags, Insn, SavepointOp},
-    },
-};
-
-use crate::{connection::Row, info, turso_assert, OpenFlags, TransactionState, ValueRef};
-use crate::{is_attached_db, MAIN_DB_ID, TEMP_DB_ID};
-
 use super::{
     array::{
         array_values_from_blob, compare_arrays, compute_array_length, exec_array_append,
@@ -106,7 +103,7 @@ use super::{
         exec_array_to_string, exec_string_to_array, make_array_from_registers, parse_text_array,
         serialize_array_from_blob, values_to_record_blob,
     },
-    insn::{Cookie, RegisterOrLiteral},
+    insn::{Cookie, RegisterOrLiteral, SortComparatorType},
     CommitState,
 };
 use crate::sync::{Mutex, RwLock};
@@ -193,11 +190,7 @@ fn value_to_bigdecimal(val: &Value) -> Result<bigdecimal::BigDecimal> {
 }
 
 /// Create a sort comparator closure from a SortComparatorType enum.
-fn make_sort_comparator(
-    cmp_type: &crate::vdbe::insn::SortComparatorType,
-) -> crate::vdbe::sorter::SortComparator {
-    use crate::types::ValueRef;
-    use crate::vdbe::insn::SortComparatorType;
+fn make_sort_comparator(cmp_type: &SortComparatorType) -> crate::vdbe::sorter::SortComparator {
     use std::cmp::Ordering;
     match cmp_type {
         SortComparatorType::NumericLt => {
@@ -13282,6 +13275,7 @@ pub fn op_hash_next(
     );
 
     let hash_table = state.hash_tables.get_mut(hash_table_id).ok_or_else(|| {
+        mark_unlikely();
         LimboError::InternalError(format!("Hash table not found with ID: {hash_table_id}"))
     })?;
     match hash_table.next_match() {
