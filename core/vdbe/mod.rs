@@ -238,7 +238,7 @@ pub enum Register {
 
 impl Register {
     #[inline]
-    pub fn is_null(&self) -> bool {
+    pub const fn is_null(&self) -> bool {
         matches!(self, Register::Value(Value::Null))
     }
 
@@ -374,13 +374,13 @@ pub enum ProgramExecutionState {
 }
 
 impl ProgramExecutionState {
-    pub fn is_running(&self) -> bool {
+    pub const fn is_running(&self) -> bool {
         matches!(
             self,
             ProgramExecutionState::Interrupting | ProgramExecutionState::Running
         )
     }
-    pub fn is_terminal(&self) -> bool {
+    pub const fn is_terminal(&self) -> bool {
         matches!(
             self,
             ProgramExecutionState::Interrupted
