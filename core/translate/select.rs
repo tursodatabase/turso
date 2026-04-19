@@ -38,7 +38,7 @@ pub fn translate_select(
     query_destination: QueryDestination,
     connection: &Arc<crate::Connection>,
 ) -> Result<usize> {
-    let mut select_plan = prepare_select_plan(
+    let plan = prepare_select_plan(
         select,
         resolver,
         program,
@@ -47,13 +47,23 @@ pub fn translate_select(
         connection,
     )?;
     if program.trigger.is_some() {
-        if let Some(virtual_table) = plan_first_virtual_table_name(&select_plan) {
+        if let Some(virtual_table) = plan_first_virtual_table_name(&plan) {
             crate::bail_parse_error!("unsafe use of virtual table \"{}\"", virtual_table);
         }
     }
-    optimize_plan(program, &mut select_plan, resolver)?;
+    emit_select_plan(plan, resolver, program, connection)
+}
+
+/// Optimize and emit bytecode for an already-prepared select plan.
+pub fn emit_select_plan(
+    mut plan: Plan,
+    resolver: &Resolver,
+    program: &mut ProgramBuilder,
+    connection: &Arc<crate::Connection>,
+) -> Result<usize> {
+    optimize_plan(program, &mut plan, resolver)?;
     let num_result_cols;
-    let opts = match &select_plan {
+    let opts = match &plan {
         Plan::Select(select) => {
             num_result_cols = select.result_columns.len();
             ProgramBuilderOpts {
@@ -86,11 +96,11 @@ pub fn translate_select(
                         .sum::<usize>(),
             }
         }
-        other => panic!("plan is not a SelectPlan: {other:?}"),
+        _ => crate::bail_parse_error!("emit_select_plan called with non-SELECT plan"),
     };
 
     program.extend(&opts);
-    emit_program(connection, resolver, program, select_plan, |_| {})?;
+    emit_program(connection, resolver, program, plan, |_| {})?;
     Ok(num_result_cols)
 }
 

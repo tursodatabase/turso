@@ -95,13 +95,15 @@ expect {
     2
 }
 
-@skip-if sqlite "supported in sqlite"
-test create-temp-table-as-select-not-yet-supported {
+test create-temp-table-as-select {
     CREATE TABLE src(x INTEGER);
     INSERT INTO src VALUES (3), (4);
     CREATE TEMP TABLE t_as AS SELECT x * 2 AS y FROM src ORDER BY x;
+    SELECT * FROM t_as;
 }
-expect error {
+expect {
+    6
+    8
 }
 
 test temp-schema-visible-only-via-temp-sqlite-schema {

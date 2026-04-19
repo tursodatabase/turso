@@ -113,6 +113,19 @@ impl ResultSetColumn {
             _ => self.implicit_column_name.as_deref(),
         }
     }
+
+    /// Returns the column name, falling back to the expression's display form.
+    pub fn name_or_expr(&self, tables: &TableReferences) -> String {
+        self.name(tables)
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| self.expr.to_string())
+    }
+
+    /// Returns the canonical short type name for this column's affinity,
+    /// matching SQLite's `azType[]` in `createTableStmt()` (build.c).
+    pub fn declared_type(&self, tables: &TableReferences) -> &'static str {
+        get_expr_affinity(&self.expr, Some(tables), None).short_type_name()
+    }
 }
 
 #[derive(Debug, Clone)]

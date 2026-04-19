@@ -1,4 +1,5 @@
 use crate::sync::Arc;
+use crate::HashMap;
 
 use crate::ext::VTabImpl;
 use crate::function::{Deterministic, Func, MathFunc, ScalarFunc};
@@ -14,10 +15,13 @@ use crate::translate::emitter::{
 };
 use crate::translate::expr::{walk_expr, WalkControl};
 use crate::translate::fkeys::emit_fk_drop_table_check;
+use crate::translate::plan::{Plan, QueryDestination};
 use crate::translate::planner::ROWID_STRS;
+use crate::translate::select::{emit_select_plan, prepare_select_plan};
 use crate::translate::{ProgramBuilder, ProgramBuilderOpts};
 use crate::util::{
-    escape_sql_string_literal, normalize_ident, PRIMARY_KEY_AUTOMATIC_INDEX_NAME_PREFIX,
+    escape_sql_string_literal, normalize_ident, quote_identifier,
+    PRIMARY_KEY_AUTOMATIC_INDEX_NAME_PREFIX,
 };
 use crate::vdbe::builder::CursorType;
 use crate::vdbe::insn::{
@@ -851,6 +855,210 @@ fn validate(
     Ok(())
 }
 
+/// Schema information derived from a CTAS SELECT.
+struct CtasInfo {
+    plan: Plan,
+    schema_sql: String,
+}
+
+/// Pre-plan the SELECT to derive the schema for a CTAS table.
+/// Returns the plan (for reuse in emission) along with the complete schema SQL and column definitions.
+fn derive_ctas_schema(
+    select: ast::Select,
+    table_name: &str,
+    resolver: &Resolver,
+    program: &mut ProgramBuilder,
+    connection: &Arc<Connection>,
+) -> Result<(CtasInfo, Vec<ColumnDefinition>)> {
+    let plan = prepare_select_plan(
+        select,
+        resolver,
+        program,
+        &[],
+        QueryDestination::ResultRows,
+        connection,
+    )?;
+
+    // For compound selects, use the leftmost select's columns for naming (matching SQLite).
+    // The planner guarantees `left` is always non-empty in a CompoundSelect.
+    let (result_columns, table_refs) = match &plan {
+        Plan::Select(sp) => (&sp.result_columns, &sp.table_references),
+        Plan::CompoundSelect { left, .. } => {
+            (&left[0].0.result_columns, &left[0].0.table_references)
+        }
+        _ => bail_parse_error!("unexpected plan type for CTAS"),
+    };
+
+    // Collect names first, then deduplicate using SQLite's :N suffix convention.
+    let mut names: Vec<String> = result_columns
+        .iter()
+        .map(|col| col.name_or_expr(table_refs))
+        .collect();
+
+    let mut seen: HashMap<String, usize> = HashMap::default();
+    for name in &mut names {
+        let lower = name.to_lowercase();
+        let count = seen.entry(lower).or_insert(0);
+        if *count > 0 {
+            *name = format!("{name}:{count}");
+        }
+        *count += 1;
+    }
+
+    let mut sql_parts = Vec::with_capacity(result_columns.len());
+    let mut col_defs = Vec::with_capacity(result_columns.len());
+
+    for (col, name) in result_columns.iter().zip(names) {
+        let ty = col.declared_type(table_refs);
+
+        let quoted = quote_identifier(&name);
+        if ty.is_empty() {
+            sql_parts.push(quoted);
+        } else {
+            sql_parts.push(format!("{quoted} {ty}"));
+        }
+
+        let col_type = if ty.is_empty() {
+            None
+        } else {
+            Some(ast::Type {
+                name: ty.to_string(),
+                size: None,
+                array_dimensions: 0,
+            })
+        };
+        col_defs.push(ColumnDefinition {
+            col_name: ast::Name::exact(name),
+            col_type,
+            constraints: vec![],
+        });
+    }
+
+    let info = CtasInfo {
+        plan,
+        schema_sql: format!("CREATE TABLE {table_name}({})", sql_parts.join(",")),
+    };
+    Ok((info, col_defs))
+}
+
+/// Emit bytecode to populate a newly-created CTAS table from the SELECT.
+/// Uses a coroutine to run the SELECT and insert each result row.
+/// Takes an already-prepared plan (from `derive_ctas_schema`) to avoid double planning.
+#[allow(clippy::too_many_arguments)]
+fn emit_ctas_insert(
+    program: &mut ProgramBuilder,
+    resolver: &Resolver,
+    mut plan: Plan,
+    body: &ast::CreateTableBody,
+    table_root_reg: usize,
+    col_count: usize,
+    database_id: usize,
+    table_name: &str,
+    connection: &Arc<Connection>,
+) -> Result<()> {
+    let opts = ProgramBuilderOpts {
+        num_cursors: 2,
+        approx_num_insns: 20,
+        approx_num_labels: 3,
+    };
+    program.extend(&opts);
+
+    // Set up coroutine for the SELECT
+    let yield_reg = program.alloc_register();
+    let jump_on_definition_label = program.allocate_label();
+    let start_offset_label = program.allocate_label();
+    let halt_label = program.allocate_label();
+
+    program.emit_insn(Insn::InitCoroutine {
+        yield_reg,
+        jump_on_definition: jump_on_definition_label,
+        start_offset: start_offset_label,
+    });
+    program.preassign_label_to_next_insn(start_offset_label);
+
+    // Switch the plan's destination to coroutine yield mode.
+    let dest = plan.select_query_destination_mut().ok_or_else(|| {
+        crate::LimboError::InternalError("CTAS plan must be a SELECT or CompoundSelect".into())
+    })?;
+    *dest = QueryDestination::CoroutineYield {
+        yield_reg,
+        coroutine_implementation_start: halt_label,
+    };
+
+    let num_result_cols =
+        program.nested(|program| emit_select_plan(plan, resolver, program, connection))?;
+
+    if num_result_cols != col_count {
+        bail_parse_error!(
+            "CTAS internal error: expected {} columns from SELECT but got {}",
+            col_count,
+            num_result_cols
+        );
+    }
+
+    program.emit_insn(Insn::EndCoroutine { yield_reg });
+    program.preassign_label_to_next_insn(jump_on_definition_label);
+
+    // Open the new table for writing using the root page from CreateBtree.
+    let ctas_btree = Arc::new(create_table(table_name, body, 0)?);
+    let new_table_cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(ctas_btree));
+    program.emit_insn(Insn::OpenWrite {
+        cursor_id: new_table_cursor_id,
+        root_page: RegisterOrLiteral::Register(table_root_reg),
+        db: database_id,
+    });
+
+    // Main insert loop: yield from coroutine, make record, insert
+    let loop_start = program.allocate_label();
+    let loop_end = program.allocate_label();
+
+    program.preassign_label_to_next_insn(loop_start);
+    program.emit_insn(Insn::Yield {
+        yield_reg,
+        end_offset: loop_end,
+        subtype_clear_start_reg: 0,
+        subtype_clear_count: 0,
+    });
+
+    let result_start_reg = program.reg_result_cols_start.ok_or_else(|| {
+        crate::LimboError::InternalError(
+            "CTAS internal error: result column start register not set".into(),
+        )
+    })?;
+    let record_reg = program.alloc_register();
+    program.emit_insn(Insn::MakeRecord {
+        start_reg: to_u16(result_start_reg),
+        count: to_u16(col_count),
+        dest_reg: to_u16(record_reg),
+        index_name: None,
+        affinity_str: None,
+    });
+
+    let rowid_reg = program.alloc_register();
+    program.emit_insn(Insn::NewRowid {
+        cursor: new_table_cursor_id,
+        rowid_reg,
+        prev_largest_reg: 0,
+    });
+
+    program.emit_insn(Insn::Insert {
+        cursor: new_table_cursor_id,
+        key_reg: rowid_reg,
+        record_reg,
+        flag: InsertFlags::new(),
+        table_name: table_name.to_string(),
+    });
+
+    program.emit_insn(Insn::Goto {
+        target_pc: loop_start,
+    });
+
+    program.preassign_label_to_next_insn(loop_end);
+    program.preassign_label_to_next_insn(halt_label);
+
+    Ok(())
+}
+
 pub fn translate_create_table(
     tbl_name: ast::QualifiedName,
     resolver: &Resolver,
@@ -858,8 +1066,29 @@ pub fn translate_create_table(
     if_not_exists: bool,
     body: ast::CreateTableBody,
     program: &mut ProgramBuilder,
-    connection: &Connection,
+    connection: &Arc<Connection>,
 ) -> Result<()> {
+    // For CTAS, extract the SELECT, determine column info, and convert to a
+    // regular ColumnsAndConstraints body + separate SELECT for data insertion.
+    let (body, ctas_info) = match body {
+        ast::CreateTableBody::AsSelect(select) => {
+            let (info, col_defs) = derive_ctas_schema(
+                select,
+                &tbl_name.name.as_ident(),
+                resolver,
+                program,
+                connection,
+            )?;
+            let body = ast::CreateTableBody::ColumnsAndConstraints {
+                columns: col_defs,
+                constraints: vec![],
+                options: ast::TableOptions::empty(),
+            };
+            (body, Some(info))
+        }
+        other => (other, None),
+    };
+
     let database_id = if temporary {
         crate::TEMP_DB_ID
     } else {
@@ -1024,7 +1253,12 @@ pub fn translate_create_table(
         false
     };
 
-    let sql = create_table_body_to_str(&tbl_name, &body)?;
+    // For CTAS, use the pre-built SQL string; for regular CREATE TABLE, build it from the body.
+    let sql = if let Some(ref info) = ctas_info {
+        info.schema_sql.clone()
+    } else {
+        create_table_body_to_str(&tbl_name, &body)?
+    };
 
     let parse_schema_label = program.allocate_label();
 
@@ -1135,7 +1369,24 @@ pub fn translate_create_table(
         where_clause: Some(parse_schema_where_clause),
     });
 
-    // TODO: SqlExec
+    // For CTAS, emit bytecode to populate the new table from the SELECT
+    if let Some(info) = ctas_info {
+        let col_count = match &body {
+            ast::CreateTableBody::ColumnsAndConstraints { columns, .. } => columns.len(),
+            _ => unreachable!("CTAS body was converted to ColumnsAndConstraints above"),
+        };
+        emit_ctas_insert(
+            program,
+            resolver,
+            info.plan,
+            &body,
+            table_root_reg,
+            col_count,
+            database_id,
+            &normalized_tbl_name,
+            connection,
+        )?;
+    }
 
     Ok(())
 }
