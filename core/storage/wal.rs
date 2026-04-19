@@ -4497,4 +4497,43 @@ pub mod test {
             "checkpoint must succeed after rollback, not return Busy"
         );
     }
+
+    #[test]
+    fn test_wal_append_frames_race_repro() {
+        use crate::io::DelayedFile;
+        use std::time::Duration;
+
+        let io: Arc<dyn IO> = Arc::new(crate::PlatformIO::new().unwrap());
+        let mut path = tempfile::tempdir().unwrap().keep();
+        path.push("test.db-wal");
+        
+        let file = io.open_file(path.to_str().unwrap(), crate::OpenFlags::Create | crate::OpenFlags::ReadWrite, false).unwrap();
+        let delayed_file = Arc::new(DelayedFile::new(file, Duration::from_millis(50)));
+        let shared = WalFileShared::new_shared(delayed_file).unwrap();
+        let buffer_pool = BufferPool::begin_init(&io, BufferPool::TEST_ARENA_SIZE);
+        
+        let wal = WalFile::new(io.clone(), shared.clone(), ((0, 0), 0), buffer_pool.clone());
+        wal.prepare_wal_start(PageSize::new(4096).unwrap()).unwrap();
+        wal.prepare_wal_finish(crate::io::FileSyncType::Full).unwrap();
+
+        let page = buffer_pool.get_page();
+        let page_ref = PageRef::new(1, Arc::new(page));
+        page_ref.set_dirty();
+
+        // Start async append
+        let c = wal.append_frames_vectored(vec![page_ref.clone()], PageSize::new(4096).unwrap()).unwrap();
+        
+        // While IO is in flight, writer modifies page again
+        page_ref.set_dirty(); 
+        assert_eq!(page_ref.get().wal_tag.load(Ordering::Acquire), u64::MAX);
+
+        io.wait_for_completion(c).unwrap();
+
+        // If bug exists, the callback incorrectly cleared dirty and set tag
+        let tag = page_ref.get().wal_tag.load(Ordering::Acquire);
+        let is_dirty = page_ref.is_dirty();
+        
+        assert!(is_dirty, "Page should remain dirty because it was modified during IO");
+        assert_eq!(tag, u64::MAX, "Tag should remain TAG_UNSET because writer raced with completion");
+    }
 }
