@@ -115,11 +115,11 @@ jobs:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: |
           for dir in \
-            packages/turso-cli/npm/darwin-arm64 \
-            packages/turso-cli/npm/darwin-x64 \
-            packages/turso-cli/npm/linux-arm64-gnu \
-            packages/turso-cli/npm/linux-x64-gnu \
-            packages/turso-cli/npm/win32-x64-msvc; do
+            ./packages/turso-cli/npm/darwin-arm64 \
+            ./packages/turso-cli/npm/darwin-x64 \
+            ./packages/turso-cli/npm/linux-arm64-gnu \
+            ./packages/turso-cli/npm/linux-x64-gnu \
+            ./packages/turso-cli/npm/win32-x64-msvc; do
             npm publish "$dir" --access public --provenance --tag ${{ steps.npm-tag.outputs.tag }}
           done
 
@@ -127,4 +127,4 @@ jobs:
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: |
-          npm publish packages/turso-cli --access public --provenance --tag ${{ steps.npm-tag.outputs.tag }}
+          npm publish ./packages/turso-cli --access public --provenance --tag ${{ steps.npm-tag.outputs.tag }}
