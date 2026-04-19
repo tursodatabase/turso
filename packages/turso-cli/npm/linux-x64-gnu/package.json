@@ -1,6 +1,6 @@
 {
   "name": "@tursodatabase/cli-linux-x64-gnu",
-  "version": "0.6.0-pre.20",
+  "version": "0.6.0-pre.21",
   "description": "Turso CLI binary for Linux x64 (glibc)",
   "os": [
     "linux"
