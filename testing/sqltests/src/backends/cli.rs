@@ -161,6 +161,8 @@ pub struct CliDatabaseInstance {
 
 impl CliDatabaseInstance {
     const DOT_COMMANDS: &[&str] = &[".schema", ".tables"];
+    const SQLITE_DB_CONFIG_MARKER: &str = "__SQLITE_DB_CONFIG_MARKER_37f0f10b__";
+    const SQLITE_DB_CONFIG_MARKER_SQL: &str = "SELECT '__SQLITE_DB_CONFIG_MARKER_37f0f10b__';";
 
     fn final_supported_sqlite_dot_command(sql: &str) -> Option<&str> {
         sql.lines().rev().map(str::trim).find(|line| {
@@ -224,6 +226,22 @@ impl CliDatabaseInstance {
                 _ => vec![line.to_string()],
             })
             .collect()
+    }
+
+    fn sqlite_preamble() -> String {
+        format!(
+            ".dbconfig fp_digits 15\n{}\n",
+            Self::SQLITE_DB_CONFIG_MARKER_SQL
+        )
+    }
+
+    fn strip_sqlite_preamble_output(output: &str) -> &str {
+        output
+            .split_once(Self::SQLITE_DB_CONFIG_MARKER)
+            // Drop only the marker line terminator. Additional leading newlines
+            // are real sqlite3 list-mode NULL rows and must be preserved.
+            .map(|(_, rest)| rest.strip_prefix('\n').unwrap_or(rest))
+            .unwrap_or(output)
     }
 
     /// Execute SQL by spawning a CLI process
@@ -294,6 +312,11 @@ impl CliDatabaseInstance {
         } else {
             sql_to_execute
         };
+        let sql_to_execute = if self.is_sqlite {
+            format!("{}{}", Self::sqlite_preamble(), sql_to_execute)
+        } else {
+            sql_to_execute
+        };
 
         // Write SQL to stdin
         if let Some(stdin) = child.stdin.as_mut() {
@@ -314,6 +337,11 @@ impl CliDatabaseInstance {
         let stdout = String::from_utf8_lossy(&output.stdout);
         let stderr = String::from_utf8_lossy(&output.stderr);
         let exit_success = output.status.success();
+        let stdout = if self.is_sqlite {
+            Self::strip_sqlite_preamble_output(&stdout)
+        } else {
+            &stdout
+        };
 
         // Detect errors from output text
         let has_stderr_error =
@@ -340,12 +368,12 @@ impl CliDatabaseInstance {
         if is_sqlite_dot_command {
             let rows = Self::normalize_sqlite_dot_command_output(
                 sqlite_dot_command.expect("checked above"),
-                &stdout,
+                stdout,
             );
 
             Ok(QueryResult::success(rows))
         } else {
-            let mut rows = parse_list_output(&stdout);
+            let mut rows = parse_list_output(stdout);
 
             // Filter out MVCC pragma output if present
             if self.mvcc && !rows.is_empty() {
@@ -451,6 +479,24 @@ mod tests {
                 vec!["CREATE TABLE t1 (a CHECK(abs(a) > 0));".to_string()],
                 vec!["CREATE TRIGGER trg AFTER INSERT ON t1 BEGIN SELECT 1; END;".to_string()]
             ]
+        );
+    }
+
+    #[test]
+    fn strip_sqlite_preamble_output_removes_dbconfig_banner_and_marker() {
+        let output = "          fp_digits 15\n__SQLITE_DB_CONFIG_MARKER_37f0f10b__\n1|2\n";
+        assert_eq!(
+            CliDatabaseInstance::strip_sqlite_preamble_output(output),
+            "1|2\n"
+        );
+    }
+
+    #[test]
+    fn strip_sqlite_preamble_output_preserves_leading_null_rows() {
+        let output = "          fp_digits 15\n__SQLITE_DB_CONFIG_MARKER_37f0f10b__\n\n1\n3\n";
+        assert_eq!(
+            CliDatabaseInstance::strip_sqlite_preamble_output(output),
+            "\n1\n3\n"
         );
     }
 }

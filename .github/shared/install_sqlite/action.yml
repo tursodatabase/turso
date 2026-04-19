@@ -5,11 +5,11 @@ runs:
   using: "composite"
   steps:
     - name: Install SQLite
-      env:
-        SQLITE_VERSION: "3510100"
-        YEAR: 2025
       run: |
-        curl -o /tmp/sqlite.zip https://sqlite.org/$YEAR/sqlite-tools-linux-x64-$SQLITE_VERSION.zip > /dev/null
+        SQLITE_VERSION_FILE="$GITHUB_WORKSPACE/scripts/sqlite-version.env"
+        # shellcheck source=/dev/null
+        . "$SQLITE_VERSION_FILE"
+        curl -o /tmp/sqlite.zip "https://sqlite.org/$SQLITE_YEAR/sqlite-tools-linux-x64-$SQLITE_VERSION.zip" > /dev/null
         echo "y" | unzip -j /tmp/sqlite.zip sqlite3 -d /usr/local/bin/
         sqlite3 --version
       shell: bash

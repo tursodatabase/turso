@@ -917,7 +917,7 @@ test uniq_constraint {
     insert into test values (1);
 }
 expect error {
-    UNIQUE constraint failed: test.id \(19\)
+    UNIQUE constraint failed: test.id
 }
 
 @cross-check-integrity
@@ -927,7 +927,7 @@ test insert-explicit-rowid-conflict {
     insert into t(rowid, x) values (1, 2);
 }
 expect error {
-    UNIQUE constraint failed: t.rowid \(19\)
+    UNIQUE constraint failed: t.rowid
 }
 
 # RETURNING clause tests
