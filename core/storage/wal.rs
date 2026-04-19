@@ -2016,6 +2016,7 @@ impl Wal for WalFile {
                 &data,
             );
             bufs.push(frame_buf);
+            page.set_write_pending();
             metadata.push((page.clone(), next_frame_id, checksum));
             rolling_checksum = checksum;
             next_frame_id += 1;
@@ -2141,6 +2142,7 @@ impl Wal for WalFile {
                 &data_to_write,
             );
             iovecs.push(frame_bytes);
+            page.set_write_pending();
 
             // (page, assigned_frame_id, cumulative_checksum_at_this_frame)
             page_frame_and_checksum.push((page.clone(), next_frame_id, new_checksum));
