@@ -57,6 +57,6 @@ tokio = { workspace = true, features = ["full"] }
 rand.workspace = true
 rand_chacha = { workspace = true }
 anyhow.workspace = true
-reqwest = { version = "0.12.28", features = ["json"] }
+reqwest = { version = "0.13.2", features = ["json"] }
 serde_json.workspace = true
 
