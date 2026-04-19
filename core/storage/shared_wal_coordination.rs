@@ -23,13 +23,14 @@
 //! conservatism, never correctness: if the authority cannot prove a slot is
 //! dead, it must leave that slot in place.
 
-use crate::io::{
-    Completion, File, FileSyncType, OpenFlags, SharedWalLockKind, SharedWalMappedRegion, IO,
+use crate::{
+    io::{Completion, File, FileSyncType, OpenFlags, SharedWalLockKind, SharedWalMappedRegion, IO},
+    sync::{
+        atomic::{AtomicU32, AtomicU64, Ordering},
+        Arc, LazyLock, Mutex, RwLock,
+    },
+    turso_assert, CompletionError, HashMap, LimboError, Result,
 };
-use crate::sync::atomic::{AtomicU32, AtomicU64, Ordering};
-use crate::sync::{Arc, LazyLock, Mutex, RwLock};
-use crate::HashMap;
-use crate::{turso_assert, CompletionError, LimboError, Result};
 use std::mem::size_of;
 use std::path::{Path, PathBuf};
 use std::ptr::NonNull;
@@ -37,7 +38,7 @@ use std::ptr::NonNull;
 /// Durable file-format magic stored at the start of every `.tshm` mapping.
 const SHARED_WAL_COORDINATION_MAGIC: [u8; 8] = *b"TSHMWAL\0";
 /// Durable `.tshm` file-format version. Bump whenever persisted layout changes.
-const SHARED_WAL_COORDINATION_VERSION: u32 = 10;
+const SHARED_WAL_COORDINATION_VERSION: u32 = 1;
 /// Version for the optional persisted backfill-proof payload.
 const SHARED_WAL_BACKFILL_PROOF_VERSION: u32 = 1;
 /// Sentinel meaning a reader slot is not currently pinning any WAL frame.
@@ -735,6 +736,45 @@ impl MappedSharedWalCoordination {
         Self::lock_kind_for_mode(self.ownership_mode)
     }
 
+    fn new_region(
+        file: Arc<dyn File>,
+        base_mapping: Box<dyn SharedWalMappedRegion>,
+        base_ptr: NonNull<u8>,
+        base_len: usize,
+        reader_slot_count: u32,
+        ownership_mode: SharedWalOwnershipMode,
+        open_mode: SharedWalCoordinationOpenMode,
+    ) -> Self {
+        Self {
+            file,
+            _base_mapping: base_mapping,
+            base_ptr,
+            base_len,
+            owner_record: SharedOwnerRecord::current_process(next_shared_owner_instance_id()),
+            ownership_mode,
+            frame_index_blocks: RwLock::new(Vec::new()),
+            frame_index_publish_lock: Arc::new(Mutex::new(())),
+            process_local_ownership: Arc::new(Mutex::new(ProcessLocalOwnershipState::new(
+                reader_slot_count,
+            ))),
+            local_lock_state: Mutex::new(LocalLockState {
+                writer_lock_held: false,
+                checkpoint_lock_held: false,
+                reader_locks: vec![0; reader_slot_count as usize],
+            }),
+            open_mode,
+            sanitized_backfill_proof_on_open: false,
+            registry_path: None,
+        }
+    }
+
+    fn reacquire_shared_lifetime_lock(
+        file: &Arc<dyn File>,
+        lock_kind: SharedWalLockKind,
+    ) -> Result<()> {
+        file.shared_wal_lock_byte(PROCESS_LIFETIME_LOCK_OFFSET, false, lock_kind)
+    }
+
     /// Register this mapping in `PROCESS_LOCAL_COORDINATION_OPENS`.
     ///
     /// Returns shared Arcs for locks and ownership state so that multiple
@@ -874,27 +914,15 @@ impl MappedSharedWalCoordination {
         let base_mapping = file.shared_wal_map(0, base_len)?;
         let base_ptr = base_mapping.ptr();
 
-        let mut region = Self {
+        let mut region = Self::new_region(
             file,
-            _base_mapping: base_mapping,
+            base_mapping,
             base_ptr,
             base_len,
-            owner_record: SharedOwnerRecord::current_process(next_shared_owner_instance_id()),
+            reader_slot_count,
             ownership_mode,
-            frame_index_blocks: RwLock::new(Vec::new()),
-            frame_index_publish_lock: Arc::new(Mutex::new(())),
-            process_local_ownership: Arc::new(Mutex::new(ProcessLocalOwnershipState::new(
-                reader_slot_count,
-            ))),
-            local_lock_state: Mutex::new(LocalLockState {
-                writer_lock_held: false,
-                checkpoint_lock_held: false,
-                reader_locks: vec![0; reader_slot_count as usize],
-            }),
             open_mode,
-            sanitized_backfill_proof_on_open: false,
-            registry_path: None,
-        };
+        );
         if initialize {
             region.initialize(reader_slot_count);
         } else if let Err(err) = region.validate_existing(reader_slot_count, metadata_len) {
@@ -962,27 +990,15 @@ impl MappedSharedWalCoordination {
 
         let base_mapping = file.shared_wal_map(0, base_len)?;
         let base_ptr = base_mapping.ptr();
-        let mut region = Self {
+        let mut region = Self::new_region(
             file,
-            _base_mapping: base_mapping,
+            base_mapping,
             base_ptr,
             base_len,
-            owner_record: SharedOwnerRecord::current_process(next_shared_owner_instance_id()),
+            reader_slot_count,
             ownership_mode,
-            frame_index_blocks: RwLock::new(Vec::new()),
-            frame_index_publish_lock: Arc::new(Mutex::new(())),
-            process_local_ownership: Arc::new(Mutex::new(ProcessLocalOwnershipState::new(
-                reader_slot_count,
-            ))),
-            local_lock_state: Mutex::new(LocalLockState {
-                writer_lock_held: false,
-                checkpoint_lock_held: false,
-                reader_locks: vec![0; reader_slot_count as usize],
-            }),
             open_mode,
-            sanitized_backfill_proof_on_open: false,
-            registry_path: None,
-        };
+        );
         if let Err(err) = region.validate_existing(reader_slot_count, metadata_len) {
             region
                 .file
@@ -1017,7 +1033,7 @@ impl MappedSharedWalCoordination {
         match file.shared_wal_try_lock_byte(PROCESS_LIFETIME_LOCK_OFFSET, true, lock_kind)? {
             true => {
                 file.shared_wal_unlock_byte(PROCESS_LIFETIME_LOCK_OFFSET, lock_kind)?;
-                file.shared_wal_lock_byte(PROCESS_LIFETIME_LOCK_OFFSET, false, lock_kind)?;
+                Self::reacquire_shared_lifetime_lock(file, lock_kind)?;
                 let metadata_len_after_probe = file.size()? as usize;
                 if metadata_len_before_probe < base_len && metadata_len_after_probe >= base_len {
                     Ok(SharedWalCoordinationOpenMode::MultiProcess)
@@ -1026,7 +1042,7 @@ impl MappedSharedWalCoordination {
                 }
             }
             false => {
-                file.shared_wal_lock_byte(PROCESS_LIFETIME_LOCK_OFFSET, false, lock_kind)?;
+                Self::reacquire_shared_lifetime_lock(file, lock_kind)?;
                 Ok(SharedWalCoordinationOpenMode::MultiProcess)
             }
         }
@@ -1051,9 +1067,7 @@ impl MappedSharedWalCoordination {
         let _ = self
             .file
             .shared_wal_unlock_byte(PROCESS_LIFETIME_LOCK_OFFSET, self.lock_kind());
-        let _ =
-            self.file
-                .shared_wal_lock_byte(PROCESS_LIFETIME_LOCK_OFFSET, false, self.lock_kind());
+        let _ = Self::reacquire_shared_lifetime_lock(&self.file, self.lock_kind());
         true
     }
 
