@@ -901,44 +901,39 @@ expect {
     1
 }
 
-# Overflows 2**32 is equivalent to 0
-test json_extract_overflow_int32_1 {
+# Oversized positive array index saturates out of range and returns NULL.
+test json_extract_saturating_overflow_positive_int32_1 {
     SELECT json_extract('[1,2,3]', '$[4294967296]')
 }
 expect {
-    1
 }
 
-# Overflows 2**32 + 1 is equivalent to 1
-test json_extract_overflow_int32_2 {
+# Larger oversized positive array index also saturates out of range and returns NULL.
+test json_extract_saturating_overflow_positive_int32_2 {
     SELECT json_extract('[1,2,3]', '$[4294967297]')
 }
 expect {
-    2
 }
 
-# Overflows -2**32 - 1 is equivalent to -1
-test json_extract_overflow_int32_3 {
+# Oversized negative-from-end array index saturates out of range and returns NULL.
+test json_extract_saturating_overflow_negative_int32_1 {
     SELECT json_extract('[1,2,3]', '$[#-4294967297]')
 }
 expect {
-    3
 }
 
-# Overflows -2**32 - 2 is equivalent to -2
-test json_extract_overflow_int32_3-2 {
+# Larger oversized negative-from-end array index also saturates out of range and returns NULL.
+test json_extract_saturating_overflow_negative_int32_2 {
     SELECT json_extract('[1,2,3]', '$[#-4294967298]')
 }
 expect {
-    2
 }
 
-# pow(2,63) + 1 == 9223372036854775808
-test json_extract_overflow_int64 {
+# Oversized 64-bit array index saturates out of range and returns NULL.
+test json_extract_saturating_overflow_positive_int64 {
     SELECT json_extract('[1,2,3]', '$[9223372036854775808]');
 }
 expect {
-    1
 }
 
 # TODO: fix me - this passes on SQLite and needs to be fixed in Limbo.

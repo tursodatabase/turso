@@ -56,6 +56,10 @@ fn collect_num(current: i128, adding: i128, negative: bool) -> (i128, IsMaxNumbe
     (result, is_max)
 }
 
+fn clamp_array_index(index: i128) -> i32 {
+    index.clamp(i32::MIN as i128, i32::MAX as i128) as i32
+}
+
 fn estimate_path_capacity(input: &str) -> usize {
     // After $ we need either . or [ for each component
     // So divide remaining length by 2 (minimum chars per component)
@@ -286,7 +290,9 @@ fn handle_array_index<'a>(
         (ArrayIndexState::IsMax, '0'..='9') => (),
         (ArrayIndexState::CollectingNumbers | ArrayIndexState::IsMax, ']') => {
             *parser_state = PPState::ExpectDotOrBracket;
-            path_components.push(PathElement::ArrayLocator(Some(*index_buffer as i32)));
+            path_components.push(PathElement::ArrayLocator(Some(clamp_array_index(
+                *index_buffer,
+            ))));
         }
         (_, _) => bail_parse_error!("Bad json path: {}", path),
     }
@@ -491,12 +497,21 @@ mod tests {
     }
 
     #[test]
-    fn test_large_index_wrapping() {
+    fn test_large_index_saturates() {
         let path = json_path("$[4294967296]").unwrap();
-        assert_eq!(path.elements[1], PathElement::ArrayLocator(Some(0)));
+        assert_eq!(path.elements[1], PathElement::ArrayLocator(Some(i32::MAX)));
 
         let path = json_path("$[4294967297]").unwrap();
-        assert_eq!(path.elements[1], PathElement::ArrayLocator(Some(1)));
+        assert_eq!(path.elements[1], PathElement::ArrayLocator(Some(i32::MAX)));
+    }
+
+    #[test]
+    fn test_large_negative_index_saturates() {
+        let path = json_path("$[#-4294967297]").unwrap();
+        assert_eq!(path.elements[1], PathElement::ArrayLocator(Some(i32::MIN)));
+
+        let path = json_path("$[#-4294967298]").unwrap();
+        assert_eq!(path.elements[1], PathElement::ArrayLocator(Some(i32::MIN)));
     }
 
     #[test]

@@ -709,7 +709,9 @@ fn json_path_from_db_value<'a>(
             ValueRef::Numeric(Numeric::Integer(i)) => JsonPath {
                 elements: vec![
                     PathElement::Root(),
-                    PathElement::ArrayLocator(Some(i as i32)),
+                    PathElement::ArrayLocator(Some(
+                        i.clamp(i32::MIN as i64, i32::MAX as i64) as i32
+                    )),
                 ],
             },
             ValueRef::Numeric(Numeric::Float(f)) => JsonPath {
@@ -1262,6 +1264,7 @@ mod tests {
             _ => panic!("Expected null result, got: {result:?}"),
         }
     }
+
     #[test]
     fn test_json_extract_null_path() {
         let json_cache = JsonCacheCell::new();
