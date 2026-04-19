@@ -1684,15 +1684,11 @@ pub(crate) fn emit_index_column_value_old_image(
             BindingBehavior::ResultColumnsNotAllowed,
         )?;
 
-        let self_table_context =
-            table_references
-                .joined_tables()
-                .first()
-                .map(|jt| SelfTableContext::ForSelect {
-                    table_ref_id: jt.internal_id,
-                    referenced_tables: table_references.clone(),
-                });
-        program.with_self_table_context(self_table_context.as_ref(), |program, _| {
+        let self_table_context = SelfTableContext::ForSelect {
+            table_ref_id: table_internal_id,
+            referenced_tables: table_references.clone(),
+        };
+        program.with_self_table_context(Some(&self_table_context), |program, _| {
             translate_expr_no_constant_opt(
                 program,
                 Some(table_references),
