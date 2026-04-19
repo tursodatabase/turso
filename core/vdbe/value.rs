@@ -2010,7 +2010,7 @@ mod tests {
                 .map(f64::from)
                 .unwrap(),
         );
-        let expected = Value::build_text("2.042747795102219097e+05");
+        let expected = Value::build_text("204274.77951022191");
         assert_eq!(input.exec_quote(), expected);
     }
 

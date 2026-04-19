@@ -805,76 +805,164 @@ fn decompose_float(v: f64, precision: usize) -> FloatParts {
     }
 }
 
-fn format_float_scientific(v: f64, precision: usize) -> String {
+fn decompose_quote_float(v: f64, precision: usize) -> FloatParts {
+    if v.is_nan() {
+        return FloatParts::Special("".to_string());
+    }
+
+    if v.is_infinite() {
+        return FloatParts::Special(if v.is_sign_negative() { "-Inf" } else { "Inf" }.to_string());
+    }
+
+    if v == 0.0 {
+        return FloatParts::Special("0.0".to_string());
+    }
+
+    let negative = v.is_sign_negative();
+    let scientific = format!("{:.*e}", precision.saturating_sub(1), v.abs());
+    let (mantissa, exp) = scientific
+        .split_once('e')
+        .expect("scientific notation always contains an exponent");
+    let mut digits = mantissa
+        .bytes()
+        .filter(|ch| *ch != b'.')
+        .collect::<Vec<_>>();
+    while digits.len() > 1 && digits[digits.len() - 1] == b'0' {
+        digits.pop();
+    }
+    let exp = exp
+        .parse::<i32>()
+        .expect("scientific exponent should parse as signed integer");
+
+    FloatParts::Normal {
+        negative,
+        digits,
+        exp,
+    }
+}
+
+fn format_float_scientific_parts(negative: bool, digits: &[u8], exp: i32) -> String {
+    let first = digits.first().cloned().unwrap_or(b'0') as char;
+    let rest = digits
+        .get(1..)
+        .filter(|v| !v.is_empty())
+        .map(|v| unsafe { str::from_utf8_unchecked(v) })
+        .unwrap_or("0");
+    format!(
+        "{}{}.{}e{}{:0width$}",
+        if negative { "-" } else { "" },
+        first,
+        rest,
+        if exp.is_positive() { "+" } else { "-" },
+        exp.abs(),
+        width = if exp.abs() > 99 { 3 } else { 2 }
+    )
+}
+
+fn format_float_parts(
+    negative: bool,
+    digits: &[u8],
+    exp: i32,
+    fixed_cutoff_precision: usize,
+) -> String {
+    let decimal_pos = exp + 1;
+    let max_fixed_exp = fixed_cutoff_precision.saturating_sub(1) as i32;
+    if (-4..=max_fixed_exp).contains(&exp) {
+        format!(
+            "{}{}.{}{}",
+            if negative { "-" } else { Default::default() },
+            if decimal_pos > 0 {
+                let zeroes = (decimal_pos - digits.len() as i32).max(0) as usize;
+                let digits = digits
+                    .get(0..(decimal_pos.min(digits.len() as i32) as usize))
+                    .unwrap();
+                (unsafe { str::from_utf8_unchecked(digits) }).to_owned() + &"0".repeat(zeroes)
+            } else {
+                "0".to_string()
+            },
+            "0".repeat(decimal_pos.min(0).unsigned_abs() as usize),
+            digits
+                .get((decimal_pos.max(0) as usize)..)
+                .filter(|v| !v.is_empty())
+                .map(|v| unsafe { str::from_utf8_unchecked(v) })
+                .unwrap_or("0")
+        )
+    } else {
+        format_float_scientific_parts(negative, digits, exp)
+    }
+}
+
+fn format_float_with_precision_and_cutoff(
+    v: f64,
+    precision: usize,
+    fixed_cutoff_precision: usize,
+) -> String {
     match decompose_float(v, precision) {
         FloatParts::Special(s) => s,
         FloatParts::Normal {
             negative,
             digits,
             exp,
-        } => {
-            let first = digits.first().cloned().unwrap_or(b'0') as char;
-            let rest = digits
-                .get(1..)
-                .filter(|v| !v.is_empty())
-                .map(|v| unsafe { str::from_utf8_unchecked(v) })
-                .unwrap_or("0");
-            format!(
-                "{}{}.{}e{}{:0width$}",
-                if negative { "-" } else { "" },
-                first,
-                rest,
-                if exp.is_positive() { "+" } else { "-" },
-                exp.abs(),
-                width = if exp.abs() > 99 { 3 } else { 2 }
-            )
-        }
+        } => format_float_parts(negative, &digits, exp, fixed_cutoff_precision),
     }
 }
 
-pub fn format_float(v: f64) -> String {
-    match decompose_float(v, 15) {
+fn format_float_with_precision(v: f64, precision: usize) -> String {
+    format_float_with_precision_and_cutoff(v, precision, precision)
+}
+
+fn format_quote_with_precision_and_cutoff(
+    v: f64,
+    precision: usize,
+    fixed_cutoff_precision: usize,
+) -> String {
+    match decompose_quote_float(v, precision) {
         FloatParts::Special(s) => s,
         FloatParts::Normal {
             negative,
             digits,
             exp,
-        } => {
-            let decimal_pos = exp + 1;
-            if (-4..=14).contains(&exp) {
-                format!(
-                    "{}{}.{}{}",
-                    if negative { "-" } else { Default::default() },
-                    if decimal_pos > 0 {
-                        let zeroes = (decimal_pos - digits.len() as i32).max(0) as usize;
-                        let digits = digits
-                            .get(0..(decimal_pos.min(digits.len() as i32) as usize))
-                            .unwrap();
-                        (unsafe { str::from_utf8_unchecked(digits) }).to_owned()
-                            + &"0".repeat(zeroes)
-                    } else {
-                        "0".to_string()
-                    },
-                    "0".repeat(decimal_pos.min(0).unsigned_abs() as usize),
-                    digits
-                        .get((decimal_pos.max(0) as usize)..)
-                        .filter(|v| !v.is_empty())
-                        .map(|v| unsafe { str::from_utf8_unchecked(v) })
-                        .unwrap_or("0")
-                )
-            } else {
-                format_float_scientific(v, 15)
-            }
-        }
+        } => format_float_parts(negative, &digits, exp, fixed_cutoff_precision),
     }
 }
 
+pub fn format_float(v: f64) -> String {
+    format_float_with_precision(v, 15)
+}
+
 pub fn format_float_for_quote(v: f64) -> String {
-    let default = format_float(v);
-    if str_to_f64(&default).map(f64::from) == Some(v) {
-        return default;
+    match decompose_quote_float(v, 17) {
+        FloatParts::Special(s) => s,
+        FloatParts::Normal { digits, exp, .. } => {
+            if digits.len() >= 17 {
+                if digits[15] == b'9' && digits[14] == b'9' {
+                    let mut jj = 14;
+                    while jj > 0 && digits[jj - 1] == b'9' {
+                        jj -= 1;
+                    }
+
+                    let candidate = format_quote_with_precision_and_cutoff(v, jj + 1, 17);
+                    if str_to_f64(&candidate).map(f64::from) == Some(v) {
+                        return candidate;
+                    }
+                } else if exp + 1 >= digits.len() as i32
+                    || (digits[15] == b'0' && digits[14] == b'0' && digits[13] == b'0')
+                {
+                    let mut jj = 13;
+                    while jj > 0 && digits[jj - 1] == b'0' {
+                        jj -= 1;
+                    }
+
+                    let candidate = format_quote_with_precision_and_cutoff(v, jj + 1, 17);
+                    if str_to_f64(&candidate).map(f64::from) == Some(v) {
+                        return candidate;
+                    }
+                }
+            }
+
+            format_quote_with_precision_and_cutoff(v, 17, 17)
+        }
     }
-    format_float_scientific(v, 19)
 }
 
 #[test]
@@ -886,4 +974,40 @@ fn test_decode_float() {
     assert_eq!(format_float(0.0), "0.0");
     assert_eq!(format_float(4.94e-322), "4.94065645841247e-322");
     assert_eq!(format_float(-20228007.0), "-20228007.0");
+}
+
+#[test]
+fn test_format_float_for_quote_matches_sqlite_3_53() {
+    assert_eq!(format_float_for_quote(12.34), "12.34");
+    assert_eq!(format_float_for_quote(3.14), "3.14");
+    assert_eq!(format_float_for_quote(0.0), "0.0");
+    assert_eq!(format_float_for_quote(-20228007.0), "-20228007.0");
+    assert_eq!(
+        format_float_for_quote(
+            str_to_f64("2.042747795102219097e+05")
+                .map(f64::from)
+                .unwrap()
+        ),
+        "204274.77951022191"
+    );
+    assert_eq!(
+        format_float_for_quote(4.9406564584124654e-322),
+        "4.9406564584124654e-322"
+    );
+    assert_eq!(
+        format_float_for_quote(str_to_f64("9.93071948140905e-322").map(f64::from).unwrap()),
+        "9.9307194814090555e-322"
+    );
+    assert_eq!(
+        format_float_for_quote(str_to_f64("1e15").map(f64::from).unwrap()),
+        "1000000000000000.0"
+    );
+    assert_eq!(
+        format_float_for_quote(9007199254740991.0),
+        "9007199254740991.0"
+    );
+    assert_eq!(
+        format_float_for_quote(9007199254740992.0),
+        "9007199254740992.0"
+    );
 }

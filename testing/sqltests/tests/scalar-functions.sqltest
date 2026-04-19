@@ -1474,7 +1474,28 @@ test quote-float-scientific-format {
     SELECT quote(CAST('2.042747795102219097e+05' AS REAL))
 }
 expect {
-    2.042747795102219097e+05
+    204274.77951022191
+}
+
+test quote-float-large-integer-valued {
+    SELECT quote(9007199254740991.0)
+}
+expect {
+    9007199254740991.0
+}
+
+test quote-float-denormal-roundtrip {
+    SELECT quote(CAST('9.93071948140905e-322' AS REAL))
+}
+expect {
+    9.9307194814090555e-322
+}
+
+test quote-float-large-fixed-format-roundtrip {
+    SELECT quote(CAST('1e15' AS REAL))
+}
+expect {
+    1000000000000000.0
 }
 
 # Regression: QUOTE() should return TEXT type for floats, not REAL
