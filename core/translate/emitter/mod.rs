@@ -27,6 +27,7 @@ use crate::instrument;
 use crate::schema::{
     BTreeTable, CheckConstraint, Column, ColumnLayout, GeneratedType, IndexColumn, Schema, Table,
 };
+use crate::translate::plan::ColumnMask;
 use crate::vdbe::{
     affinity::Affinity,
     builder::{CursorType, DmlColumnContext, ProgramBuilder, SelfTableContext},
@@ -1637,6 +1638,16 @@ fn rewrite_where_for_update_registers(
 /// Emits  `target_columns`, plus the stored columns needed by `target_columns`, into compact
 /// registers. This takes into account stored columns, and any stored columns required
 /// by virtual columns in `target_columns`.
+///
+/// Target columns are guaranteed to be in a contiguous block, in the given order, at the start of
+/// registers
+/// Load column values from cursor into registers, handling virtual generated columns.
+///
+/// The following postcondition holds:
+///
+///     dml_ctx.to_column_reg(target_columns[i]) == dml_ctx.to_column_reg(target_columns[0]) + i
+///
+/// This way, target_columns[0] can be used as a base for opcodes that require unpacked records.
 pub(crate) fn emit_columns_and_dependencies(
     program: &mut ProgramBuilder,
     table: &BTreeTable,
@@ -1644,16 +1655,38 @@ pub(crate) fn emit_columns_and_dependencies(
     rowid_reg: usize,
     target_columns: impl IntoIterator<Item = usize>,
 ) -> Result<DmlColumnContext> {
-    let dependencies = table.dependencies_of_columns(target_columns)?;
-    let base = program.alloc_registers(dependencies.count());
-    let mut next_reg = base;
+    let targets: Vec<usize> = target_columns.into_iter().collect();
+    let dependencies = table.dependencies_of_columns(targets.iter().copied())?;
+
+    let target_base = program.alloc_registers(targets.len());
+    let extra_base = {
+        let mut dependencies_not_in_targets: ColumnMask = dependencies.clone();
+        let target_mask = targets.iter().copied().collect();
+        dependencies_not_in_targets -= &target_mask;
+
+        let extra_count = dependencies_not_in_targets.count();
+
+        if extra_count > 0 {
+            program.alloc_registers(extra_count)
+        } else {
+            0
+        }
+    };
+
+    let mut extra_idx = 0;
     let pairs = table.columns().iter().enumerate().map(|(idx, col)| {
         let reg = if col.is_rowid_alias() {
             rowid_reg
+        } else if let Some(pos) = targets.iter().position(|&t| t == idx) {
+            let reg = target_base + pos;
+            if !col.is_virtual_generated() {
+                program.emit_column_or_rowid(cursor_id, idx, reg);
+            }
+            reg
         } else if dependencies.get(idx) {
-            let reg = next_reg;
+            let reg = extra_base + extra_idx;
             program.emit_column_or_rowid(cursor_id, idx, reg);
-            next_reg += 1;
+            extra_idx += 1;
             reg
         } else {
             0

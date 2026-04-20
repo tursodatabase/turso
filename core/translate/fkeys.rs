@@ -785,12 +785,7 @@ pub fn emit_fk_child_update_counters(
 
         let fk_col_positions: Vec<usize> = fk_cols
             .iter()
-            .filter_map(|col_name| {
-                match child_tbl.get_column(col_name) {
-                    Some((pos, _)) => Some(pos),
-                    None => None, //TODO I think this is impossible
-                }
-            })
+            .filter_map(|col_name| child_tbl.get_column(col_name).map(|(pos, _)| pos))
             .collect();
 
         let dml_ctx = emit_columns_and_dependencies(
@@ -873,21 +868,10 @@ pub fn emit_fk_child_update_counters(
                         .expect("parent unique index required");
                     let icur = open_read_index(program, idx, database_id);
 
-                    // index_probe emits opcode Found, which needs an unpacked record (with
-                    // contiguous registers), so we copy the potentially unordered registers.
-                    // We might be able to avoid this copy if we modify emit_columns_and_dependencies
-                    // to guarantee that its target_columns parameter is stored contiguously in
-                    // the first registers.
-                    let probe_start = program.alloc_registers(ncols);
-                    for (i, &pos) in fk_col_positions.iter().enumerate() {
-                        program.emit_insn(Insn::Copy {
-                            src_reg: dml_ctx.to_column_reg(pos),
-                            dst_reg: probe_start + i,
-                            extra_amount: 0,
-                        });
-                    }
-                    // Apply parent index affinities
-                    let probe = copy_with_affinity(program, probe_start, ncols, idx, &parent_tbl);
+                    // this is safe because emit_columns_and_dependencies
+                    // guarantees target columns are contiguous.
+                    let old_start = dml_ctx.to_column_reg(fk_col_positions[0]);
+                    let probe = copy_with_affinity(program, old_start, ncols, idx, &parent_tbl);
                     // Found: nothing; Not found: guarded decrement
                     index_probe(
                         program,
