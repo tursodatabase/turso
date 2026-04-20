@@ -187,7 +187,7 @@ mod tests {
     fn fuzz_arbitrary_table_true_simple_predicate() {
         let seed = get_seed();
         let mut rng = ChaCha8Rng::seed_from_u64(seed);
-        let context = &TestContext::no_gencol();
+        let context = &TestContext::default();
 
         for _ in 0..10000 {
             let table = Table::arbitrary(&mut rng, context);
@@ -216,7 +216,7 @@ mod tests {
     fn fuzz_arbitrary_table_false_simple_predicate() {
         let seed = get_seed();
         let mut rng = ChaCha8Rng::seed_from_u64(seed);
-        let context = &TestContext::no_gencol();
+        let context = &TestContext::default();
 
         for _ in 0..10000 {
             let table = Table::arbitrary(&mut rng, context);
@@ -245,7 +245,7 @@ mod tests {
     fn fuzz_arbitrary_row_table_predicate() {
         let seed = get_seed();
         let mut rng = ChaCha8Rng::seed_from_u64(seed);
-        let context = &TestContext::no_gencol();
+        let context = &TestContext::default();
 
         for _ in 0..10000 {
             let table = Table::arbitrary(&mut rng, context);
@@ -273,7 +273,7 @@ mod tests {
     fn fuzz_arbitrary_true_table_predicate() {
         let seed = get_seed();
         let mut rng = ChaCha8Rng::seed_from_u64(seed);
-        let context = &TestContext::no_gencol();
+        let context = &TestContext::default();
 
         for _ in 0..10000 {
             let mut table = Table::arbitrary(&mut rng, context);
@@ -302,7 +302,7 @@ mod tests {
     fn fuzz_arbitrary_false_table_predicate() {
         let seed = get_seed();
         let mut rng = ChaCha8Rng::seed_from_u64(seed);
-        let context = &TestContext::no_gencol();
+        let context = &TestContext::default();
 
         for _ in 0..10000 {
             let mut table = Table::arbitrary(&mut rng, context);

@@ -208,18 +208,21 @@ pub mod tests {
         model::table::Table,
     };
 
-    #[derive(Debug, Default, Clone)]
+    #[derive(Debug, Clone)]
     pub struct TestContext {
         pub opts: Opts,
         pub tables: Vec<Table>,
     }
 
     impl TestContext {
-        /// Create a test context with generated columns disabled.
-        /// These tests create random values for all columns, which doesn't work correctly
-        /// with generated columns since their values should be computed from expressions.
-        pub fn no_gencol() -> Self {
-            let mut ctx = Self::default();
+        pub fn default() -> Self {
+            // Create a test context with generated columns disabled.
+            // Predicate ests create random values for all columns, which doesn't work correctly
+            // with generated columns since their values should be computed from expressions.
+            let mut ctx = Self {
+                opts: Default::default(),
+                tables: Default::default(),
+            };
             ctx.opts.table.generated_columns.enable = false;
             ctx
         }
