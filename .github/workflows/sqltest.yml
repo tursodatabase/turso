@@ -45,9 +45,25 @@ jobs:
       - name: Build test runner
         run: make -C testing/sqltests build-runner
       - name: Run tests
+        env:
+          TURSO_TRACE_FILE: ${{ github.workspace }}/turso-sqltest-cli.log
+          RUST_LOG: turso_core=debug
         run: make -C testing/sqltests run-cli CROSS_CHECK_BINARY=sqlite3
       - name: Run tests (MVCC)
+        env:
+          TURSO_TRACE_FILE: ${{ github.workspace }}/turso-sqltest-cli-mvcc.log
+          RUST_LOG: turso_core=debug
         run: make -C testing/sqltests run-cli MVCC=1
+      - name: Upload trace logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sqltest-cli-trace
+          path: |
+            ${{ github.workspace }}/turso-sqltest-cli.log
+            ${{ github.workspace }}/turso-sqltest-cli-mvcc.log
+          if-no-files-found: ignore
+          retention-days: 7
 
   sqltest-run-rust:
     name: Run SQL tests (Rust backend)
