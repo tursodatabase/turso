@@ -998,12 +998,23 @@ impl<Clock: LogicalClock> CommitStateMachine<Clock> {
         sync_mode: SyncMode,
     ) -> Self {
         let pager = connection.pager.load().clone();
+        // Use the connection's tx-level schema_did_change flag as the
+        // single source of truth.  This flag is set by SetCookie(SchemaVersion)
+        // which every DDL emits, so it covers all schema-changing operations
+        // including ones that don't write to sqlite_schema (e.g. AddType
+        // writing to __turso_internal_types for custom types).
+        let schema_did_change_from_tx = matches!(
+            connection.get_tx_state(),
+            crate::connection::TransactionState::Write {
+                schema_did_change: true
+            }
+        );
         Self {
             state,
             is_finalized: false,
             #[cfg(any(test, injected_yields))]
             yield_instance_id: connection.next_yield_instance_id(),
-            did_commit_schema_change: false,
+            did_commit_schema_change: schema_did_change_from_tx,
             tx_id,
             connection,
             write_set: Vec::new(),
@@ -1303,9 +1314,7 @@ impl<Clock: LogicalClock> CommitStateMachine<Clock> {
             }
         };
 
-        let collect_versions = |id: &RowID,
-                                log_record: &mut LogRecord,
-                                did_commit_schema: &mut bool| {
+        let collect_versions = |id: &RowID, log_record: &mut LogRecord| {
             if let Some(row_versions) = mvcc_store.rows.get(id) {
                 let row_versions = row_versions.value().read();
                 for row_version in row_versions.iter() {
@@ -1317,9 +1326,6 @@ impl<Clock: LogicalClock> CommitStateMachine<Clock> {
                             // transaction's end timestamp. See Hekaton page 299.
                             committed_version.begin = Some(TxTimestampOrID::Timestamp(end_ts));
                             changed = true;
-                            if committed_version.row.id.table_id == SQLITE_SCHEMA_MVCC_TABLE_ID {
-                                *did_commit_schema = true;
-                            }
                         }
                     }
                     if let Some(TxTimestampOrID::TxID(vid)) = committed_version.end {
@@ -1328,9 +1334,6 @@ impl<Clock: LogicalClock> CommitStateMachine<Clock> {
                             // transaction's end timestamp. See Hekaton page 299.
                             committed_version.end = Some(TxTimestampOrID::Timestamp(end_ts));
                             changed = true;
-                            if committed_version.row.id.table_id == SQLITE_SCHEMA_MVCC_TABLE_ID {
-                                *did_commit_schema = true;
-                            }
                         }
                     }
                     if changed {
@@ -1379,16 +1382,16 @@ impl<Clock: LogicalClock> CommitStateMachine<Clock> {
             }
         };
 
-        // First pass: schema rows only
+        // First pass: schema rows only (ordering matters for recovery)
         for id in &self.write_set {
             if id.table_id == SQLITE_SCHEMA_MVCC_TABLE_ID {
-                collect_versions(id, &mut log_record, &mut self.did_commit_schema_change);
+                collect_versions(id, &mut log_record);
             }
         }
         // Second pass: all non-schema rows
         for id in &self.write_set {
             if id.table_id != SQLITE_SCHEMA_MVCC_TABLE_ID {
-                collect_versions(id, &mut log_record, &mut self.did_commit_schema_change);
+                collect_versions(id, &mut log_record);
             }
         }
 

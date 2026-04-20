@@ -1423,7 +1423,7 @@ pub fn translate_expr(
 
             // Check if casting to a custom type
             if let Some(ref tn) = type_name {
-                if let Some(type_def) = resolver.schema().get_type_def_unchecked(&tn.name) {
+                if let Some(resolved) = resolver.schema().resolve_type_unchecked(&tn.name)? {
                     // Build ty_params from AST TypeSize so parametric types
                     // (e.g. numeric(10,2)) get their parameters passed through.
                     let ty_params: Vec<Box<ast::Expr>> = match &tn.size {
@@ -1434,6 +1434,44 @@ pub fn translate_expr(
                         None => Vec::new(),
                     };
 
+                    // Domains: apply parent encode chain, then validate constraints
+                    // on the encoded value (domain CHECK sees the stored representation).
+                    if resolved.is_domain() {
+                        // Apply encode from parent custom types (domain itself has encode: None)
+                        let cast_col = Column::new(
+                            None,
+                            tn.name.clone(),
+                            None,
+                            None,
+                            Type::Null,
+                            None,
+                            ColDef::default(),
+                        );
+                        for td in &resolved.chain {
+                            if let Some(ref encode_expr) = td.encode {
+                                emit_type_expr(
+                                    program,
+                                    encode_expr,
+                                    target_register,
+                                    target_register,
+                                    &cast_col,
+                                    td,
+                                    resolver,
+                                )?;
+                            }
+                        }
+
+                        // Validate domain constraints on the encoded value
+                        emit_domain_cast_constraints(
+                            program,
+                            &resolved.chain,
+                            target_register,
+                            resolver,
+                        )?;
+                        return Ok(target_register);
+                    }
+
+                    let type_def = resolved.leaf();
                     // If the custom type requires parameters but the CAST
                     // doesn't provide them (e.g. CAST(x AS NUMERIC) vs
                     // CAST(x AS numeric(10,2))), fall through to regular CAST.
@@ -3231,20 +3269,27 @@ pub fn translate_expr(
                                     *column
                                 };
 
-                                // For custom type columns with a default, suppress the
-                                // default in the Column instruction so we can encode it
-                                // ourselves. Without this, pre-existing rows (from before
-                                // ALTER TABLE ADD COLUMN) would get the raw un-encoded
-                                // default, causing decode to fail.
+                                // For custom type columns with ENCODE/DECODE and a
+                                // default, suppress the default in the Column
+                                // instruction so we can encode it ourselves.  Without
+                                // this, pre-existing rows (from before ALTER TABLE ADD
+                                // COLUMN) would get the raw un-encoded default, causing
+                                // decode to fail.  Pure domain types (CREATE DOMAIN)
+                                // have no encoding, so their defaults must NOT be
+                                // suppressed.  Check the full type chain because a
+                                // domain built on top of a custom type inherits its
+                                // ENCODE/DECODE.
                                 let col_ref = table.get_column_at(column);
                                 if let Some(col) = col_ref {
-                                    if col.default.is_some()
-                                        && resolver
+                                    if col.default.is_some() {
+                                        if let Ok(Some(resolved)) = resolver
                                             .schema()
-                                            .get_type_def(&col.ty_str, table.is_strict())
-                                            .is_some()
-                                    {
-                                        program.flags.set_suppress_column_default(true);
+                                            .resolve_type(&col.ty_str, table.is_strict())
+                                        {
+                                            if resolved.chain.iter().any(|td| td.encode.is_some()) {
+                                                program.flags.set_suppress_column_default(true);
+                                            }
+                                        }
                                     }
                                 }
                                 program.emit_column_or_rowid(read_cursor, column, target_register);
@@ -7273,24 +7318,29 @@ pub(crate) fn emit_user_facing_column_value(
     if column.is_array() {
         return Ok(());
     }
-    if let Some(type_def) = resolver.schema().get_type_def(&column.ty_str, is_strict) {
-        if let Some(ref decode_expr) = type_def.decode {
-            let skip_label = program.allocate_label();
-            program.emit_insn(Insn::IsNull {
-                reg: dest_reg,
-                target_pc: skip_label,
-            });
-            emit_type_expr(
-                program,
-                decode_expr,
-                dest_reg,
-                dest_reg,
-                column,
-                type_def,
-                resolver,
-            )?;
-            program.preassign_label_to_next_insn(skip_label);
+    if let Ok(Some(resolved)) = resolver.schema().resolve_type(&column.ty_str, is_strict) {
+        let skip_label = program.allocate_label();
+        program.emit_insn(Insn::IsNull {
+            reg: dest_reg,
+            target_pc: skip_label,
+        });
+
+        // Apply decode in reverse order (parent/ancestor first, then child)
+        for td in resolved.chain.iter().rev() {
+            if let Some(ref decode_expr) = td.decode {
+                emit_type_expr(
+                    program,
+                    decode_expr,
+                    dest_reg,
+                    dest_reg,
+                    column,
+                    td,
+                    resolver,
+                )?;
+            }
         }
+
+        program.preassign_label_to_next_insn(skip_label);
     }
     Ok(())
 }
@@ -7349,6 +7399,76 @@ pub(crate) fn decode_custom_type_registers_in_expr(
         }
         Ok(WalkControl::Continue)
     })?;
+    Ok(())
+}
+
+/// Emit domain constraint checks for CAST(expr AS domain).
+/// Validates NOT NULL and CHECK constraints from the domain type chain.
+fn emit_domain_cast_constraints(
+    program: &mut ProgramBuilder,
+    chain: &[crate::sync::Arc<TypeDef>],
+    reg: usize,
+    resolver: &Resolver,
+) -> Result<()> {
+    use crate::error::{SQLITE_CONSTRAINT_CHECK, SQLITE_CONSTRAINT_NOTNULL};
+
+    let any_not_null = chain.iter().any(|td| td.not_null);
+
+    if any_not_null {
+        program.emit_insn(Insn::HaltIfNull {
+            target_reg: reg,
+            err_code: SQLITE_CONSTRAINT_NOTNULL,
+            description: format!(
+                "domain {} does not allow null values",
+                chain.first().map(|td| td.name.as_str()).unwrap_or("?")
+            ),
+        });
+    }
+
+    for td in chain {
+        for (i, dc) in td.domain_checks.iter().enumerate() {
+            let constraint_name = dc
+                .name
+                .clone()
+                .unwrap_or_else(|| format!("{}_{}", td.name, i));
+
+            // Bind `value` → reg, translate check expr, verify truthy
+            program
+                .id_register_overrides
+                .insert("value".to_string(), reg);
+
+            let expr_result_reg = program.alloc_register();
+            translate_expr(program, None, &dc.check, expr_result_reg, resolver)?;
+
+            program.id_register_overrides.remove("value");
+
+            let passed_label = program.allocate_label();
+
+            // NULL result passes CHECK constraints (SQLite semantics)
+            program.emit_insn(Insn::IsNull {
+                reg: expr_result_reg,
+                target_pc: passed_label,
+            });
+
+            program.emit_insn(Insn::If {
+                reg: expr_result_reg,
+                target_pc: passed_label,
+                jump_if_null: false,
+            });
+
+            program.emit_insn(Insn::Halt {
+                err_code: SQLITE_CONSTRAINT_CHECK,
+                description: format!(
+                    "value for domain {} violates check constraint \"{}\"",
+                    td.name, constraint_name
+                ),
+                on_error: None,
+                description_reg: None,
+            });
+
+            program.preassign_label_to_next_insn(passed_label);
+        }
+    }
     Ok(())
 }
 
@@ -7693,23 +7813,35 @@ pub(crate) fn emit_custom_type_encode_columns(
         if type_name.is_empty() {
             continue;
         }
-        let Some(type_def) = resolver.schema().get_type_def_unchecked(type_name) else {
-            continue;
-        };
-        let Some(ref encode_expr) = type_def.encode else {
+        let Ok(Some(resolved)) = resolver.schema().resolve_type_unchecked(type_name) else {
             continue;
         };
 
-        // Skip NULL values: jump over encode if NULL
-        let skip_label = program.allocate_label();
-        program.emit_insn(Insn::IsNull {
-            reg,
-            target_pc: skip_label,
-        });
+        // Check if any type in the chain has not_null — if so, don't skip NULLs
+        let any_not_null = resolved.chain.iter().any(|td| td.not_null);
 
-        emit_type_expr(program, encode_expr, reg, reg, col, type_def, resolver)?;
+        let skip_label = if !any_not_null {
+            // Skip NULL values: jump over encode if NULL
+            let label = program.allocate_label();
+            program.emit_insn(Insn::IsNull {
+                reg,
+                target_pc: label,
+            });
+            Some(label)
+        } else {
+            None
+        };
 
-        program.preassign_label_to_next_insn(skip_label);
+        // Apply encode for each type in the chain (child first, then parent)
+        for td in &resolved.chain {
+            if let Some(ref encode_expr) = td.encode {
+                emit_type_expr(program, encode_expr, reg, reg, col, td, resolver)?;
+            }
+        }
+
+        if let Some(label) = skip_label {
+            program.preassign_label_to_next_insn(label);
+        }
     }
     Ok(())
 }
@@ -7752,10 +7884,7 @@ pub(crate) fn emit_custom_type_decode_columns(
         if type_name.is_empty() {
             continue;
         }
-        let Some(type_def) = resolver.schema().get_type_def_unchecked(type_name) else {
-            continue;
-        };
-        let Some(ref decode_expr) = type_def.decode else {
+        let Ok(Some(resolved)) = resolver.schema().resolve_type_unchecked(type_name) else {
             continue;
         };
 
@@ -7766,7 +7895,12 @@ pub(crate) fn emit_custom_type_decode_columns(
             target_pc: skip_label,
         });
 
-        emit_type_expr(program, decode_expr, reg, reg, col, type_def, resolver)?;
+        // Apply decode in reverse order (parent/ancestor first, then child)
+        for td in resolved.chain.iter().rev() {
+            if let Some(ref decode_expr) = td.decode {
+                emit_type_expr(program, decode_expr, reg, reg, col, td, resolver)?;
+            }
+        }
 
         program.preassign_label_to_next_insn(skip_label);
     }

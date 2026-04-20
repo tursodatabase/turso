@@ -759,6 +759,44 @@ impl ToTokens for Stmt {
                 }
                 Ok(())
             }
+            Self::CreateDomain {
+                if_not_exists,
+                domain_name,
+                base_type,
+                default,
+                not_null,
+                constraints,
+            } => {
+                s.append(TK_CREATE, None)?;
+                s.append(TK_ID, Some("DOMAIN"))?;
+                if *if_not_exists {
+                    s.append(TK_IF, None)?;
+                    s.append(TK_NOT, None)?;
+                    s.append(TK_EXISTS, None)?;
+                }
+                s.append(TK_ID, Some(domain_name))?;
+                s.append(TK_AS, None)?;
+                s.append(TK_ID, Some(base_type))?;
+                if let Some(ref def) = default {
+                    s.append(TK_DEFAULT, None)?;
+                    def.to_tokens(s, context)?;
+                }
+                if *not_null {
+                    s.append(TK_NOT, None)?;
+                    s.append(TK_NULL, None)?;
+                }
+                for c in constraints {
+                    if let Some(ref name) = c.name {
+                        s.append(TK_CONSTRAINT, None)?;
+                        s.append(TK_ID, Some(name))?;
+                    }
+                    s.append(TK_CHECK, None)?;
+                    s.append(TK_LP, None)?;
+                    c.check.to_tokens(s, context)?;
+                    s.append(TK_RP, None)?;
+                }
+                Ok(())
+            }
             Self::DropType {
                 if_exists,
                 type_name,
@@ -770,6 +808,19 @@ impl ToTokens for Stmt {
                     s.append(TK_EXISTS, None)?;
                 }
                 s.append(TK_ID, Some(type_name))?;
+                Ok(())
+            }
+            Self::DropDomain {
+                if_exists,
+                domain_name,
+            } => {
+                s.append(TK_DROP, None)?;
+                s.append(TK_ID, Some("DOMAIN"))?;
+                if *if_exists {
+                    s.append(TK_IF, None)?;
+                    s.append(TK_EXISTS, None)?;
+                }
+                s.append(TK_ID, Some(domain_name))?;
                 Ok(())
             }
         }

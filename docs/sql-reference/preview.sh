@@ -84,6 +84,8 @@ cat > src/SUMMARY.md << 'EOF'
 - [CREATE VIRTUAL TABLE](statements/create-virtual-table.md)
 - [CREATE TYPE](statements/create-type.md)
 - [DROP TYPE](statements/drop-type.md)
+- [CREATE DOMAIN](statements/create-domain.md)
+- [DROP DOMAIN](statements/drop-domain.md)
 - [Transactions](statements/transactions.md)
 - [ATTACH DATABASE](statements/attach-database.md)
 - [DETACH DATABASE](statements/detach-database.md)

@@ -145,10 +145,12 @@ pub fn translate_inner(
             | ast::Stmt::CreateMaterializedView { .. }
             | ast::Stmt::CreateVirtualTable(..)
             | ast::Stmt::CreateType { .. }
+            | ast::Stmt::CreateDomain { .. }
             | ast::Stmt::Delete { .. }
             | ast::Stmt::DropIndex { .. }
             | ast::Stmt::DropTable { .. }
             | ast::Stmt::DropType { .. }
+            | ast::Stmt::DropDomain { .. }
             | ast::Stmt::DropView { .. }
             | ast::Stmt::Reindex { .. }
             | ast::Stmt::Optimize { .. }
@@ -308,6 +310,28 @@ pub fn translate_inner(
             }
             schema::translate_create_type(&type_name, &body, if_not_exists, resolver, program)?
         }
+        ast::Stmt::CreateDomain {
+            if_not_exists,
+            domain_name,
+            base_type,
+            default,
+            not_null,
+            constraints,
+        } => {
+            if !connection.experimental_custom_types_enabled() {
+                bail_parse_error!("Custom types require --experimental-custom-types flag");
+            }
+            schema::translate_create_domain(
+                &domain_name,
+                &base_type,
+                not_null,
+                &constraints,
+                default,
+                if_not_exists,
+                resolver,
+                program,
+            )?
+        }
         ast::Stmt::DropType {
             if_exists,
             type_name,
@@ -315,7 +339,16 @@ pub fn translate_inner(
             if !connection.experimental_custom_types_enabled() {
                 bail_parse_error!("Custom types require --experimental-custom-types flag");
             }
-            schema::translate_drop_type(&type_name, if_exists, resolver, program)?
+            schema::translate_drop_type(&type_name, if_exists, false, resolver, program)?
+        }
+        ast::Stmt::DropDomain {
+            if_exists,
+            domain_name,
+        } => {
+            if !connection.experimental_custom_types_enabled() {
+                bail_parse_error!("Custom types require --experimental-custom-types flag");
+            }
+            schema::translate_drop_type(&domain_name, if_exists, true, resolver, program)?
         }
         ast::Stmt::Pragma { .. } => {
             bail_parse_error!("PRAGMA statement cannot be evaluated in a nested context")

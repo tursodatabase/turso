@@ -194,6 +194,21 @@ pub enum Stmt {
         /// type body
         body: CreateTypeBody,
     },
+    /// `CREATE DOMAIN`
+    CreateDomain {
+        /// `IF NOT EXISTS`
+        if_not_exists: bool,
+        /// domain name
+        domain_name: String,
+        /// base type (primitive or another domain/custom type)
+        base_type: String,
+        /// default expression
+        default: Option<Box<Expr>>,
+        /// NOT NULL constraint
+        not_null: bool,
+        /// CHECK constraints
+        constraints: Vec<DomainConstraint>,
+    },
     /// `DELETE`
     Delete {
         /// CTE
@@ -250,6 +265,13 @@ pub enum Stmt {
         if_exists: bool,
         /// type name
         type_name: String,
+    },
+    /// `DROP DOMAIN`
+    DropDomain {
+        /// `IF EXISTS`
+        if_exists: bool,
+        /// domain name
+        domain_name: String,
     },
     /// `INSERT`
     Insert {
@@ -1278,6 +1300,16 @@ pub struct TypeParam {
     pub name: String,
     /// Type annotation. None means untyped (backward compat).
     pub ty: Option<String>,
+}
+
+/// A single named CHECK constraint on a domain
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct DomainConstraint {
+    /// CONSTRAINT name (optional)
+    pub name: Option<String>,
+    /// CHECK expression using `value` placeholder
+    pub check: Box<Expr>,
 }
 
 /// Body of a `CREATE TYPE` statement
