@@ -1436,7 +1436,6 @@ impl ColumnMask {
         let rowid_sentinel = self.has_rowid_sentinel.then_some(ROWID_SENTINEL);
         self.bitset.iter().chain(rowid_sentinel)
     }
-
 }
 
 impl FromIterator<usize> for ColumnMask {
