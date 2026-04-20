@@ -135,6 +135,23 @@ expect {
 }
 
 @cross-check-integrity
+test savepoint-rollback-restores-uncommitted-schema {
+    BEGIN;
+    CREATE TABLE keep_t(x);
+    SAVEPOINT sp;
+    CREATE TABLE rolled_back_t(y);
+    ROLLBACK TO sp;
+    SELECT name FROM sqlite_schema WHERE type = 'table' ORDER BY name;
+    INSERT INTO keep_t VALUES (1);
+    SELECT x FROM keep_t;
+    ROLLBACK;
+}
+expect {
+    keep_t
+    1
+}
+
+@cross-check-integrity
 test savepoint-release-outer-removes-inner {
     CREATE TABLE t(x);
     SAVEPOINT outer;

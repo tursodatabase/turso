@@ -21,8 +21,14 @@ use turso_parser::ast::{ColumnConstraint, SortOrder};
 pub mod chaotic_elle;
 pub mod elle;
 mod io;
-mod operations;
+#[cfg(all(unix, target_pointer_width = "64"))]
+pub mod multiprocess;
+pub mod operations;
 pub mod properties;
+#[cfg(all(unix, target_pointer_width = "64"))]
+pub mod protocol;
+#[cfg(all(unix, target_pointer_width = "64"))]
+pub mod worker;
 pub mod workloads;
 mod yield_injection;
 
@@ -353,6 +359,8 @@ pub struct Stats {
     pub elle_writes: usize,
     /// Elle-mode: read operations (list-read + rw-read)
     pub elle_reads: usize,
+    /// Multiprocess: corruption events detected and survived
+    pub corruption_events: usize,
 }
 
 /// Result of a single simulation step.
@@ -715,6 +723,18 @@ impl Whopper {
             let txn_id = ctx.fiber.txn_id;
 
             let op_result = step_result.map(|_| rows);
+
+            if matches!(
+                &op_result,
+                Err(turso_core::LimboError::Busy
+                    | turso_core::LimboError::BusySnapshot
+                    | turso_core::LimboError::WriteWriteConflict
+                    | turso_core::LimboError::CommitDependencyAborted)
+            ) && ctx.fiber.connection.get_auto_commit()
+            {
+                let _ = ctx.fiber.connection.execute("ROLLBACK");
+            }
+
             completed_op.finish_op(&mut ctx, &op_result);
 
             for property in &self.properties {
@@ -1096,7 +1116,7 @@ fn may_be_set_encryption(
     Ok(conn)
 }
 
-fn create_initial_indexes(rng: &mut ChaCha8Rng, tables: &[Table]) -> Vec<CreateIndex> {
+pub fn create_initial_indexes(rng: &mut ChaCha8Rng, tables: &[Table]) -> Vec<CreateIndex> {
     let mut indexes = Vec::new();
 
     // Create 0-3 indexes per table
@@ -1141,7 +1161,7 @@ fn create_initial_indexes(rng: &mut ChaCha8Rng, tables: &[Table]) -> Vec<CreateI
     indexes
 }
 
-fn create_initial_schema(rng: &mut ChaCha8Rng) -> Vec<Create> {
+pub fn create_initial_schema(rng: &mut ChaCha8Rng) -> Vec<Create> {
     let mut schema = Vec::new();
 
     // Generate random number of tables (1-5)

@@ -7,7 +7,6 @@ use crate::sync::{
     atomic::{AtomicBool, AtomicI32, AtomicI64, AtomicIsize, AtomicU16, AtomicU64, Ordering},
     Arc, RwLock,
 };
-use crate::turso_assert;
 #[cfg(all(feature = "fs", feature = "conn_raw_api"))]
 use crate::types::{WalFrameInfo, WalState};
 #[cfg(feature = "fs")]
@@ -25,19 +24,39 @@ use crate::{
     BusyHandlerCallback, CaptureDataChangesInfo, CheckpointMode, CheckpointResult, CipherMode, Cmd,
     Completion, ConnectionMetrics, Database, DatabaseCatalog, DatabaseOpts, Duration,
     EncryptionKey, EncryptionOpts, IndexMethod, LimboError, MvStore, OpenFlags, PageSize, Pager,
-    Parser, QueryMode, QueryRunner, Result, Schema, Statement, SyncMode, TransactionMode, Trigger,
-    Value, VirtualTable,
+    Parser, Program, QueryMode, QueryRunner, Result, Schema, Statement, SyncMode, TransactionMode,
+    Trigger, Value, VirtualTable,
 };
+use crate::{is_memory_like, turso_assert};
 use crate::{MAIN_DB_ID, TEMP_DB_ID};
 use arc_swap::ArcSwap;
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use smallvec::SmallVec;
 use std::fmt::Display;
 use std::ops::Deref;
+#[cfg(feature = "simulator")]
+use std::path::Path;
 #[cfg(not(target_family = "wasm"))]
 use tempfile::TempDir;
 use tracing::{instrument, Level};
 use turso_macros::{turso_assert_ne, AtomicEnum};
+
+#[cfg(feature = "simulator")]
+fn db_identity_for_testing(db_path: &Path) -> Result<(u32, u32)> {
+    let bytes =
+        std::fs::read(db_path).map_err(|e| io_error(e, "read db header for simulator testing"))?;
+    let db_header_size = crate::storage::sqlite3_ondisk::DatabaseHeader::SIZE;
+    if bytes.len() < db_header_size {
+        return Err(LimboError::InternalError(format!(
+            "database file is smaller than the header: got {}, need at least {}",
+            bytes.len(),
+            db_header_size
+        )));
+    }
+    let db_size_pages = u32::from_be_bytes(bytes[28..32].try_into().unwrap());
+    let crc = crc32c::crc32c(&bytes[..db_header_size]);
+    Ok((db_size_pages, crc))
+}
 
 #[derive(Clone, AtomicEnum, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum TransactionState {
@@ -275,16 +294,18 @@ impl Drop for Connection {
             }
 
             // Also release WAL locks on all attached database pagers
-            for attached_pager in self.get_all_attached_pagers() {
-                if let Some(wal) = &attached_pager.wal {
-                    if wal.holds_write_lock() {
-                        wal.end_write_tx();
-                    }
-                    if wal.holds_read_lock() {
-                        wal.end_read_tx();
+            self.with_all_attached_pagers_with_index(|attached_pagers| {
+                for (_, attached_pager) in attached_pagers {
+                    if let Some(wal) = &attached_pager.wal {
+                        if wal.holds_write_lock() {
+                            wal.end_write_tx();
+                        }
+                        if wal.holds_read_lock() {
+                            wal.end_read_tx();
+                        }
                     }
                 }
-            }
+            });
 
             // if connection wasn't properly closed, decrement the connection counter
             self.db
@@ -560,8 +581,9 @@ impl Connection {
     /// Check if a specific trigger is currently executing (for recursive trigger prevention)
     pub fn is_trigger_executing(&self, trigger: &Arc<Trigger>) -> bool {
         let executing = self.executing_triggers.read();
-        if let Some(trigger) = executing.iter().find(|t| Arc::ptr_eq(t, trigger)) {
+        if let Some(active_trigger) = executing.iter().find(|t| Arc::ptr_eq(t, trigger)) {
             tracing::debug!("Trigger is already executing: {}", trigger.name);
+            debug_assert!(Arc::ptr_eq(active_trigger, trigger));
             return true;
         }
         false
@@ -579,6 +601,78 @@ impl Connection {
         );
         self.executing_triggers.write().pop();
     }
+
+    fn should_retry_cross_process_schema_lookup(
+        self: &Arc<Connection>,
+        err: &LimboError,
+    ) -> Result<bool> {
+        let LimboError::ParseError(msg) = err else {
+            return Ok(false);
+        };
+        if !msg.contains("no such table") && !msg.contains("table not found") {
+            return Ok(false);
+        }
+        if self.get_tx_state() != TransactionState::None {
+            return Ok(false);
+        }
+        if self.db.shared_wal_coordination()?.is_none() {
+            return Ok(false);
+        }
+        self.maybe_reparse_schema()?;
+        Ok(true)
+    }
+
+    fn compile_cmd(
+        self: &Arc<Connection>,
+        cmd: Cmd,
+        input: &str,
+    ) -> Result<(Program, Arc<Pager>, QueryMode)> {
+        self.maybe_update_schema();
+        let syms = self.syms.read();
+        let pager = self.pager.load().clone();
+        let mode = QueryMode::new(&cmd);
+        let (Cmd::Stmt(stmt) | Cmd::Explain(stmt) | Cmd::ExplainQueryPlan(stmt)) = cmd;
+        let schema = self.schema.read().clone();
+        match translate::translate(
+            &schema,
+            stmt,
+            pager.clone(),
+            self.clone(),
+            &syms,
+            mode,
+            input,
+        ) {
+            Ok(program) => Ok((program, pager, mode)),
+            Err(err) if self.should_retry_cross_process_schema_lookup(&err)? => {
+                // Cold path: re-parse the SQL from scratch after schema refresh rather
+                // than cloning the original AST, which can overflow the stack
+                // on deeply nested expression trees.
+                drop(syms);
+                let mut parser = Parser::new(input.as_bytes());
+                let Some(cmd) = parser.next_cmd()? else {
+                    return Err(err);
+                };
+                self.maybe_update_schema();
+                let syms = self.syms.read();
+                let pager = self.pager.load().clone();
+                let mode = QueryMode::new(&cmd);
+                let (Cmd::Stmt(stmt) | Cmd::Explain(stmt) | Cmd::ExplainQueryPlan(stmt)) = cmd;
+                let schema = self.schema.read().clone();
+                translate::translate(
+                    &schema,
+                    stmt,
+                    pager.clone(),
+                    self.clone(),
+                    &syms,
+                    mode,
+                    input,
+                )
+                .map(|program| (program, pager, mode))
+            }
+            Err(err) => Err(err),
+        }
+    }
+
     pub fn prepare(self: &Arc<Connection>, sql: impl AsRef<str>) -> Result<Statement> {
         self._prepare(sql)
     }
@@ -625,29 +719,11 @@ impl Connection {
                     ));
                 }
             };
-            let syms = self.syms.read();
             let byte_offset_end = parser.offset();
             let input = str::from_utf8(&sql.as_bytes()[..byte_offset_end])
                 .unwrap()
                 .trim();
-            self.maybe_update_schema();
-            let pager = self.pager.load().clone();
-            let mode = QueryMode::new(&cmd);
-            let (Cmd::Stmt(stmt) | Cmd::Explain(stmt) | Cmd::ExplainQueryPlan(stmt)) = cmd;
-
-            // Read lock + Arc::Clone the schema here to avoid a possible recursive read lock in `op_parse_schema`,
-            // where we try to read the schema again there
-            let schema = self.schema.read().clone();
-
-            let program = translate::translate(
-                &schema,
-                stmt,
-                pager.clone(),
-                self.clone(),
-                &syms,
-                mode,
-                input,
-            )?;
+            let (program, pager, mode) = self.compile_cmd(cmd, input)?;
             Ok(Statement::new_with_origin(
                 program,
                 pager,
@@ -730,30 +806,54 @@ impl Connection {
             .store(true, Ordering::SeqCst);
     }
 
-    /// Parse schema from scratch if version of schema for the connection differs from the schema cookie in the root page
-    /// This function must be called outside of any transaction because internally it will start transaction session by itself
-    #[allow(dead_code)]
-    fn maybe_reparse_schema(self: &Arc<Connection>) -> Result<()> {
+    /// Parse schema from scratch if version of schema for the connection differs from the schema cookie in the root page.
+    /// This function must be called outside of any transaction because internally it will start transaction session by itself.
+    /// In multi-process mode, this is the only way to discover schema changes made by other processes.
+    pub fn maybe_reparse_schema(self: &Arc<Connection>) -> Result<()> {
         let pager = self.pager.load().clone();
+        let mv_store = self.mv_store();
 
-        // first, quickly read schema_version from the root page in order to check if schema changed
-        pager.begin_read_tx()?;
-        let on_disk_schema_version = pager
-            .io
-            .block(|| pager.with_header(|header| header.schema_cookie));
+        // maybe_reparse_schema must be called outside any explicit transaction
+        // because it starts its own read transaction to load a fresh view of
+        // sqlite_schema from disk.
+        if self.get_tx_state() != TransactionState::None {
+            return Ok(());
+        }
 
-        let on_disk_schema_version = match on_disk_schema_version {
-            Ok(db_schema_version) => db_schema_version.get(),
-            Err(LimboError::Page1NotAlloc) => {
-                // this means this is a fresh db, so return a schema version of 0
-                0
-            }
-            Err(err) => {
-                pager.end_read_tx();
-                return Err(err);
-            }
+        if self.db.shared_wal_coordination()?.is_some() {
+            // Cross-process schema changes can leave page 1 and sqlite_schema
+            // pages cached from an earlier WAL snapshot. Drop the cache before
+            // probing the cookie so reparsing observes the current committed view.
+            pager.clear_page_cache(false);
+            pager.set_schema_cookie(None);
+        }
+
+        let on_disk_schema_version = if mv_store.as_ref().is_some() {
+            self.read_current_schema_cookie().or_else(|err| match err {
+                LimboError::Page1NotAlloc => Ok(0),
+                other => Err(other),
+            })?
+        } else {
+            // first, quickly read schema_version from the root page in order to check if schema changed
+            pager.begin_read_tx()?;
+            let on_disk_schema_version = pager
+                .io
+                .block(|| pager.with_header(|header| header.schema_cookie));
+
+            let on_disk_schema_version = match on_disk_schema_version {
+                Ok(db_schema_version) => db_schema_version.get(),
+                Err(LimboError::Page1NotAlloc) => {
+                    // this means this is a fresh db, so return a schema version of 0
+                    0
+                }
+                Err(err) => {
+                    pager.end_read_tx();
+                    return Err(err);
+                }
+            };
+            pager.end_read_tx();
+            on_disk_schema_version
         };
-        pager.end_read_tx();
 
         let db_schema_version = self.db.schema.lock().schema_version;
         tracing::debug!(
@@ -766,11 +866,6 @@ impl Connection {
         if db_schema_version == on_disk_schema_version {
             return Ok(());
         }
-        // maybe_reparse_schema must be called outside of any transaction
-        turso_assert!(
-            self.get_tx_state() == TransactionState::None,
-            "unexpected start transaction"
-        );
         // start read transaction manually, because we will read schema cookie once again and
         // we must be sure that it will consistent with schema content
         //
@@ -800,18 +895,34 @@ impl Connection {
     }
 
     pub(crate) fn reparse_schema(self: &Arc<Connection>) -> Result<()> {
-        let pager = self.pager.load().clone();
-
         // read cookie before consuming statement program - otherwise we can end up reading cookie with closed transaction state
-        let cookie = pager
-            .io
-            .block(|| pager.with_header(|header| header.schema_cookie))?
-            .get();
+        let cookie = self.read_current_schema_cookie()?;
+        self.reparse_schema_with_cookie(cookie)
+    }
 
+    pub(crate) fn reparse_schema_with_cookie(self: &Arc<Connection>, cookie: u32) -> Result<()> {
         // create fresh schema as some objects can be deleted
         let mut fresh = Schema::with_options(self.experimental_custom_types_enabled());
         fresh.generated_columns_enabled = self.db.experimental_generated_columns_enabled();
         fresh.schema_version = cookie;
+
+        // Capture built-in table-valued functions (e.g. generate_series, json_each)
+        // before dropping the old schema. These are registered programmatically and
+        // don't survive re-parsing from sqlite_schema alone.
+        let table_valued_functions: Vec<_> = self
+            .schema
+            .read()
+            .tables
+            .values()
+            .filter_map(|table| match table.as_ref() {
+                crate::schema::Table::Virtual(vtab)
+                    if matches!(vtab.kind, turso_ext::VTabKind::TableValuedFunction) =>
+                {
+                    Some(vtab.clone())
+                }
+                _ => None,
+            })
+            .collect();
 
         // TODO: this is hack to avoid a cyclical problem with schema reprepare
         // The problem here is that we prepare a statement here, but when the statement tries
@@ -846,6 +957,15 @@ impl Connection {
             mv_tx,
             &attached_resolver,
         )?;
+
+        // Rehydrate built-in table-valued functions that were captured above.
+        for vtab in &table_valued_functions {
+            let normalized = crate::util::normalize_ident(&vtab.name);
+            fresh
+                .tables
+                .entry(normalized)
+                .or_insert_with(|| Arc::new(crate::schema::Table::Virtual(vtab.clone())));
+        }
 
         // Load custom types from __turso_internal_types if the table exists
         // and custom types are enabled. Type loading errors are non-fatal: we log
@@ -883,6 +1003,19 @@ impl Connection {
         Result::Ok(())
     }
 
+    pub(crate) fn read_current_schema_cookie(&self) -> Result<u32> {
+        if let Some(mv_store) = self.mv_store().as_ref() {
+            let tx_id = self.get_mv_tx_id();
+            mv_store.with_header(|header| header.schema_cookie.get(), tx_id.as_ref())
+        } else {
+            let pager = self.pager.load();
+            pager
+                .io
+                .block(|| pager.with_header(|header| header.schema_cookie))
+                .map(|cookie| cookie.get())
+        }
+    }
+
     #[instrument(skip_all, level = Level::INFO)]
     pub fn prepare_execute_batch(self: &Arc<Connection>, sql: impl AsRef<str>) -> Result<()> {
         if self.is_closed() {
@@ -893,29 +1026,15 @@ impl Connection {
                 "The supplied SQL string contains no statements".to_string(),
             ));
         }
-        self.maybe_update_schema();
         let sql = sql.as_ref();
         tracing::trace!("Preparing and executing batch: {}", sql);
         let mut parser = Parser::new(sql.as_bytes());
         while let Some(cmd) = parser.next_cmd()? {
-            let syms = self.syms.read();
-            let pager = self.pager.load().clone();
             let byte_offset_end = parser.offset();
             let input = str::from_utf8(&sql.as_bytes()[..byte_offset_end])
                 .unwrap()
                 .trim();
-            let mode = QueryMode::new(&cmd);
-            let (Cmd::Stmt(stmt) | Cmd::Explain(stmt) | Cmd::ExplainQueryPlan(stmt)) = cmd;
-            let schema = self.schema.read().clone();
-            let program = translate::translate(
-                &schema,
-                stmt,
-                pager.clone(),
-                self.clone(),
-                &syms,
-                mode,
-                input,
-            )?;
+            let (program, pager, mode) = self.compile_cmd(cmd, input)?;
             Statement::new(program, pager.clone(), mode, 0).run_ignore_rows()?;
         }
         Ok(())
@@ -927,7 +1046,6 @@ impl Connection {
             return Err(LimboError::InternalError("Connection closed".to_string()));
         }
         let sql = sql.as_ref();
-        self.maybe_update_schema();
         tracing::trace!("Querying: {}", sql);
         let mut parser = Parser::new(sql.as_bytes());
         let cmd = parser.next_cmd()?;
@@ -950,20 +1068,7 @@ impl Connection {
         if self.is_closed() {
             return Err(LimboError::InternalError("Connection closed".to_string()));
         }
-        let syms = self.syms.read();
-        let pager = self.pager.load().clone();
-        let mode = QueryMode::new(&cmd);
-        let (Cmd::Stmt(stmt) | Cmd::Explain(stmt) | Cmd::ExplainQueryPlan(stmt)) = cmd;
-        let schema = self.schema.read().clone();
-        let program = translate::translate(
-            &schema,
-            stmt,
-            pager.clone(),
-            self.clone(),
-            &syms,
-            mode,
-            input,
-        )?;
+        let (program, pager, mode) = self.compile_cmd(cmd, input)?;
         let stmt = Statement::new(program, pager, mode, 0);
         Ok(Some(stmt))
     }
@@ -980,27 +1085,13 @@ impl Connection {
             return Err(LimboError::InternalError("Connection closed".to_string()));
         }
         let sql = sql.as_ref();
-        self.maybe_update_schema();
         let mut parser = Parser::new(sql.as_bytes());
         while let Some(cmd) = parser.next_cmd()? {
-            let syms = self.syms.read();
-            let pager = self.pager.load().clone();
             let byte_offset_end = parser.offset();
             let input = str::from_utf8(&sql.as_bytes()[..byte_offset_end])
                 .unwrap()
                 .trim();
-            let mode = QueryMode::new(&cmd);
-            let (Cmd::Stmt(stmt) | Cmd::Explain(stmt) | Cmd::ExplainQueryPlan(stmt)) = cmd;
-            let schema = self.schema.read().clone();
-            let program = translate::translate(
-                &schema,
-                stmt,
-                pager.clone(),
-                self.clone(),
-                &syms,
-                mode,
-                input,
-            )?;
+            let (program, pager, mode) = self.compile_cmd(cmd, input)?;
             Statement::new(program, pager.clone(), mode, 0).run_ignore_rows()?;
         }
         Ok(())
@@ -1015,24 +1106,11 @@ impl Connection {
         let Some(cmd) = parser.next_cmd()? else {
             return Ok(None);
         };
-        let syms = self.syms.read();
-        let pager = self.pager.load().clone();
         let byte_offset_end = parser.offset();
         let input = str::from_utf8(&sql.as_ref().as_bytes()[..byte_offset_end])
             .unwrap()
             .trim();
-        let mode = QueryMode::new(&cmd);
-        let (Cmd::Stmt(stmt) | Cmd::Explain(stmt) | Cmd::ExplainQueryPlan(stmt)) = cmd;
-        let schema = self.schema.read().clone();
-        let program = translate::translate(
-            &schema,
-            stmt,
-            pager.clone(),
-            self.clone(),
-            &syms,
-            mode,
-            input,
-        )?;
+        let (program, pager, mode) = self.compile_cmd(cmd, input)?;
         let stmt = Statement::new(program, pager, mode, 0);
         Ok(Some((stmt, parser.offset())))
     }
@@ -1053,12 +1131,12 @@ impl Connection {
             (Some(_), None) => {
                 return Err(LimboError::InvalidArgument(
                     "hexkey is required when cipher is provided".to_string(),
-                ))
+                ));
             }
             (None, Some(_)) => {
                 return Err(LimboError::InvalidArgument(
                     "cipher is required when hexkey is provided".to_string(),
-                ))
+                ));
             }
             (None, None) => None,
         };
@@ -1101,12 +1179,12 @@ impl Connection {
             (Some(_), None) => {
                 return Err(LimboError::InvalidArgument(
                     "hexkey is required when cipher is provided".to_string(),
-                ))
+                ));
             }
             (None, Some(_)) => {
                 return Err(LimboError::InvalidArgument(
                     "cipher is required when hexkey is provided".to_string(),
-                ))
+                ));
             }
             (None, None) => None,
         };
@@ -1187,6 +1265,8 @@ impl Connection {
         let current_schema_version = self.schema.read().schema_version;
         let schema = self.db.schema.lock();
         if matches!(self.get_tx_state(), TransactionState::None)
+            && self.get_mv_tx().is_none()
+            && self.next_attached_mv_tx().is_none()
             && current_schema_version != schema.schema_version
         {
             *self.schema.write() = schema.clone();
@@ -1481,7 +1561,16 @@ impl Connection {
             }
         }
 
-        if self.db.n_connections.fetch_sub(1, Ordering::SeqCst).eq(&1) && !self.db.is_readonly() {
+        let is_memory_db = is_memory_like(&self.db.path);
+        let should_checkpoint_on_close = pager
+            .wal
+            .as_ref()
+            .is_none_or(|wal| wal.should_checkpoint_on_close());
+        if self.db.n_connections.fetch_sub(1, Ordering::SeqCst).eq(&1)
+            && !self.db.is_readonly()
+            && !is_memory_db
+            && should_checkpoint_on_close
+        {
             self.pager.load().checkpoint_shutdown(
                 self.is_wal_auto_checkpoint_disabled(),
                 self.get_sync_mode(),
@@ -1497,6 +1586,46 @@ impl Connection {
 
     pub fn is_wal_auto_checkpoint_disabled(&self) -> bool {
         self.wal_auto_checkpoint_disabled.load(Ordering::SeqCst) || self.db.get_mv_store().is_some()
+    }
+
+    #[cfg(feature = "simulator")]
+    pub fn checkpoint_for_testing(&self, mode: CheckpointMode) -> Result<CheckpointResult> {
+        let pager = self.pager.load();
+        pager
+            .io
+            .block(|| pager.checkpoint(mode, SyncMode::Full, true))
+    }
+
+    #[cfg(all(feature = "simulator", target_pointer_width = "64", unix))]
+    pub fn install_unpublished_backfill_proof_for_testing(
+        &self,
+        upper_bound_inclusive: u64,
+    ) -> Result<()> {
+        let pager = self.pager.load();
+        let proof_nbackfills =
+            pager.run_checkpoint_until_post_sync_gap_for_testing(CheckpointMode::Passive {
+                upper_bound_inclusive: Some(upper_bound_inclusive),
+            })?;
+        let authority = self.db.shared_wal_coordination()?.ok_or_else(|| {
+            LimboError::InternalError("shared WAL authority is unavailable".into())
+        })?;
+        let snapshot_before_publish = authority.snapshot();
+        if snapshot_before_publish.nbackfills != 0 {
+            return Err(LimboError::InternalError(
+                "unpublished-proof setup requires nbackfills to remain unpublished".into(),
+            ));
+        }
+
+        let (db_size_pages, db_header_crc32c) = db_identity_for_testing(Path::new(&self.db.path))?;
+        authority.install_backfill_proof(
+            crate::storage::shared_wal_coordination::SharedWalCoordinationHeader {
+                nbackfills: proof_nbackfills,
+                ..snapshot_before_publish
+            },
+            db_size_pages,
+            db_header_crc32c,
+        );
+        Ok(())
     }
 
     pub fn last_insert_rowid(&self) -> i64 {
@@ -1926,23 +2055,23 @@ impl Connection {
         self.db.initialized()
     }
 
-    pub(crate) fn get_pager_from_database_index(&self, index: &usize) -> Arc<Pager> {
+    pub(crate) fn get_pager_from_database_index(&self, index: &usize) -> Result<Arc<Pager>> {
         match *index {
-            crate::MAIN_DB_ID => self.pager.load().clone(),
+            crate::MAIN_DB_ID => Ok(self.pager.load().clone()),
             crate::TEMP_DB_ID => {
                 // Lazily initialize the temp database if it hasn't been created yet.
                 if self.temp.database.read().is_none() {
-                    self.ensure_temp_database()
-                        .expect("failed to initialize temp database");
+                    self.ensure_temp_database()?;
                 }
-                self.temp
+                Ok(self
+                    .temp
                     .database
                     .read()
                     .as_ref()
                     .map(|temp_db| temp_db.pager.clone())
-                    .expect("temp database should be initialized")
+                    .expect("temp database should be initialized after ensure_temp_database"))
             }
-            _ => self.attached_databases.read().get_pager_by_index(index),
+            _ => Ok(self.attached_databases.read().get_pager_by_index(index)),
         }
     }
 
@@ -2302,7 +2431,9 @@ impl Connection {
         // Rollback any active transaction on this database before detaching.
         // After the Database is removed from the catalog, the MvStore / Pager
         // become unreachable and the transaction would leak forever.
-        let pager = self.get_pager_from_database_index(&database_id);
+        let pager = self
+            .get_pager_from_database_index(&database_id)
+            .expect("attached database should always have a pager");
         if let Some((tx_id, _mode)) = self.get_mv_tx_for_db(database_id) {
             if let Some(mv_store) = self.mv_store_for_db(database_id) {
                 mv_store.rollback_tx(tx_id, pager.clone(), self, database_id);
@@ -2338,22 +2469,6 @@ impl Connection {
             .keys()
             .cloned()
             .collect()
-    }
-
-    /// Get all non-main database pagers (temp + attached).
-    pub fn get_all_attached_pagers(&self) -> Vec<Arc<Pager>> {
-        let mut pagers = Vec::new();
-        if let Some(temp_db) = self.temp.database.read().as_ref() {
-            pagers.push(temp_db.pager.clone());
-        }
-        let catalog = self.attached_databases.read();
-        pagers.extend(
-            catalog
-                .index_to_data
-                .values()
-                .map(|(_db, pager)| pager.clone()),
-        );
-        pagers
     }
 
     /// Invoke `f` with a slice of all non-main database (index, pager) pairs
@@ -2833,7 +2948,9 @@ impl Connection {
         let mut cleared_any_schema = false;
         for (&db_id, &(tx_id, _mode)) in &txs {
             if let Some(attached_mv_store) = self.mv_store_for_db(db_id) {
-                let attached_pager = self.get_pager_from_database_index(&db_id);
+                let attached_pager = self
+                    .get_pager_from_database_index(&db_id)
+                    .expect("attached MVCC transaction should always have a pager");
                 if attached_mv_store.is_tx_rollbackable(tx_id) {
                     attached_mv_store.rollback_tx(tx_id, attached_pager.clone(), self, db_id);
                 } else {
@@ -2944,6 +3061,32 @@ impl Connection {
 
     pub(crate) fn clear_named_savepoints(&self) {
         self.named_savepoints.write().clear();
+    }
+
+    /// Roll back the current main-db transaction state and any attached-db
+    /// transaction state on this connection.
+    pub(crate) fn rollback_current_txn_state(
+        &self,
+        pager: &Arc<Pager>,
+        clear_attached_schemas: bool,
+    ) {
+        if let Some(mv_store) = self.mv_store().as_ref() {
+            if let Some(tx_id) = self.get_mv_tx_id() {
+                self.auto_commit.store(true, Ordering::SeqCst);
+                if mv_store.is_tx_rollbackable(tx_id) {
+                    mv_store.rollback_tx(tx_id, pager.clone(), self, crate::MAIN_DB_ID);
+                } else {
+                    self.set_mv_tx(None);
+                }
+            }
+            pager.end_read_tx();
+            self.rollback_attached_mvcc_txs(clear_attached_schemas);
+        } else {
+            pager.rollback_tx(self);
+            self.auto_commit.store(true, Ordering::SeqCst);
+        }
+        self.rollback_attached_wal_txns();
+        self.set_tx_state(TransactionState::None);
     }
 
     /// Iterate over all attached MVCC transactions, calling `f(db_id, tx_id)` for each.
@@ -3283,5 +3426,33 @@ mod tests {
         assert_eq!(query_single_i64(&conn, "SELECT COUNT(*) FROM main.m"), 0);
         assert_eq!(query_single_i64(&conn, "SELECT COUNT(*) FROM temp.u"), 0);
         assert_eq!(query_single_i64(&conn, "SELECT COUNT(*) FROM temp.t"), 0);
+    }
+
+    #[test]
+    fn test_distinct_triggers_with_same_name_in_different_schemas_can_fire_nested() {
+        let temp_dir = TempDir::new().unwrap();
+        let db_path = temp_dir.path().join("main.db");
+        let conn = open_connection(&db_path);
+
+        conn.execute("CREATE TABLE src(x INTEGER)").unwrap();
+        conn.execute("CREATE TABLE dst(y INTEGER)").unwrap();
+        conn.execute("CREATE TABLE audit(z INTEGER)").unwrap();
+        conn.execute(
+            "CREATE TRIGGER shared_name AFTER INSERT ON dst BEGIN \
+             INSERT INTO audit VALUES (NEW.y); \
+             END;",
+        )
+        .unwrap();
+        conn.execute(
+            "CREATE TEMP TRIGGER shared_name AFTER INSERT ON main.src BEGIN \
+             INSERT INTO dst VALUES (NEW.x); \
+             END;",
+        )
+        .unwrap();
+
+        conn.execute("INSERT INTO src VALUES(7)").unwrap();
+
+        assert_eq!(query_single_i64(&conn, "SELECT COUNT(*) FROM main.dst"), 1);
+        assert_eq!(query_single_i64(&conn, "SELECT SUM(z) FROM main.audit"), 7);
     }
 }
