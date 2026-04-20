@@ -994,7 +994,11 @@ fn test_format_float_for_quote_matches_sqlite_3_53() {
         "204274.77951022191"
     );
     assert_eq!(
-        format_float_for_quote(str_to_f64("4.9406564584124654e-322").map(f64::from).unwrap()),
+        format_float_for_quote(
+            str_to_f64("4.9406564584124654e-322")
+                .map(f64::from)
+                .unwrap()
+        ),
         "4.9406564584124654e-322"
     );
     assert_eq!(
