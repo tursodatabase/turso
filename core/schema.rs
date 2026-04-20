@@ -181,7 +181,7 @@ pub const TURSO_INTERNAL_PREFIX: &str = "__turso_internal_";
 use crate::util::quote_identifier as quote_ident;
 
 /// Recursively rewrite `Expr::Id("value")` (case-insensitive) to `Expr::Id(col_name)`.
-fn rewrite_value_to_column(expr: &ast::Expr, col_name: &str) -> Box<ast::Expr> {
+pub fn rewrite_value_to_column(expr: &ast::Expr, col_name: &str) -> Box<ast::Expr> {
     let mut cloned = expr.clone();
     let _ = walk_expr_mut(&mut cloned, &mut |e| {
         if let ast::Expr::Id(name) = e {
