@@ -74,7 +74,12 @@ pub struct Opts {
         help = "Enable experimental custom types (CREATE TYPE / DROP TYPE)"
     )]
     pub experimental_custom_types: bool,
-    #[clap(short = 't', long, help = "specify output file for log traces")]
+    #[clap(
+        short = 't',
+        long,
+        env = "TURSO_TRACE_FILE",
+        help = "specify output file for log traces (also reads TURSO_TRACE_FILE)"
+    )]
     pub tracing_output: Option<String>,
     #[clap(long, help = "Start MCP server instead of interactive shell")]
     pub mcp: bool,

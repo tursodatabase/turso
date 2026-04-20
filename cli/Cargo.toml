@@ -20,7 +20,7 @@ path = "main.rs"
 [dependencies]
 anyhow.workspace = true
 cfg-if = { workspace = true }
-clap = { workspace = true, features = ["derive"] }
+clap = { workspace = true, features = ["derive", "env"] }
 clap_complete = { version = "=4.5.47", features = ["unstable-dynamic"] }
 comfy-table = "7.1.4"
 csv = "1.3.1"
