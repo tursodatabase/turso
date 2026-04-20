@@ -24,6 +24,9 @@ cargo run --release -p memory-benchmark -- --mode wal --workload insert-heavy -i
 # MVCC with concurrent connections
 cargo run --release -p memory-benchmark -- --mode mvcc --workload mixed -i 100 -b 100 --connections 4
 
+# Run a final checkpoint after the workload
+cargo run --release -p memory-benchmark -- --mode wal --workload read-heavy --checkpoint
+
 # All CLI options
 cargo run --release -p memory-benchmark -- \
   --mode wal|mvcc \
@@ -31,6 +34,7 @@ cargo run --release -p memory-benchmark -- \
   -i <iterations> \
   -b <batch-size> \
   --connections <N> \
+  --checkpoint \
   --timeout <ms> \
   --cache-size <pages> \
   --format human|json|csv
@@ -146,6 +150,7 @@ When investigating memory usage or a suspected regression:
 When `--connections > 1`:
 - Setup phase (schema creation, seeding) always runs on a single connection sequentially
 - Run phase spawns one tokio task per connection, each executing its batch concurrently
+- `--checkpoint` adds a final single-connection `PRAGMA wal_checkpoint(TRUNCATE)` phase after the run phase
 - Each connection gets `busy_timeout` set (default 30s, configurable via `--timeout`)
 - WAL mode uses `BEGIN`, MVCC uses `BEGIN CONCURRENT`
 - The `Profile` trait's `next_batch(connections)` returns one batch per connection with non-overlapping row IDs
