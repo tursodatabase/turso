@@ -1695,6 +1695,37 @@ expect {
     [123,456]
 }
 
+test json_set_append_hash_empty_array {
+    SELECT json_set('[]', '$[#]', 'x');
+}
+expect {
+    ["x"]
+}
+
+test json_set_append_hash_existing_array {
+    SELECT json_set('[1,2,3]', '$[#]', 'x');
+}
+expect {
+    [1,2,3,"x"]
+}
+
+test json_set_append_hash_nested_array {
+    SELECT json_set('[1,[2,3],4]', '$[1][#]', 'AAA');
+}
+expect {
+    [1,[2,3,"AAA"],4]
+}
+
+test json_set_append_hash_multi_pair_relookup {
+    SELECT
+      json_set('[]', '$[#]', 0, '$[#]', 1),
+      json_extract(json_set('[]', '$[#]', 0, '$[#]', 1), '$[0]'),
+      json_extract(json_set('[]', '$[#]', 0, '$[#]', 1), '$[1]');
+}
+expect {
+    [0,1]|0|1
+}
+
 test json_set_add_value_to_array_out_of_bounds {
     SELECT json_set('[123]', '$[200]', 456);
 }
@@ -1806,6 +1837,86 @@ test json_insert_array_append {
 }
 expect {
     [1,2,3,4]
+}
+
+test json_insert_array_append_hash {
+    SELECT json_insert('[]', '$[#]', 'x');
+}
+expect {
+    ["x"]
+}
+
+test json_insert_array_append_hash_existing {
+    SELECT json_insert('["a","b"]', '$[#]', 'x');
+}
+expect {
+    ["a","b","x"]
+}
+
+test json_insert_array_append_hash_jsonb_input {
+    SELECT json_insert(jsonb('[]'), '$[#]', 'x');
+}
+expect {
+    ["x"]
+}
+
+test json_insert_array_append_hash_integer {
+    SELECT json_insert('[]', '$[#]', 42);
+}
+expect {
+    [42]
+}
+
+test json_insert_array_append_hash_typeof {
+    SELECT typeof(json_insert('[]', '$[#]', 'x'));
+}
+expect {
+    text
+}
+
+test json_insert_array_append_hash_nested_array {
+    SELECT json_insert('[1,[2,3],4]', '$[1][#]', 'AAA');
+}
+expect {
+    [1,[2,3,"AAA"],4]
+}
+
+test json_insert_array_append_hash_existing_object_array {
+    SELECT json_insert('{"a":[1,2]}', '$.a[#]', 'x');
+}
+expect {
+    {"a":[1,2,"x"]}
+}
+
+test json_insert_array_append_index_existing_object_array {
+    SELECT json_insert('{"a":[1,2]}', '$.a[2]', 'x');
+}
+expect {
+    {"a":[1,2,"x"]}
+}
+
+test json_insert_array_hash_negative_does_not_replace {
+    SELECT json_insert('[1,2,3]', '$[#-1]', 'x');
+}
+expect {
+    [1,2,3]
+}
+
+test json_insert_array_append_hash_multi_pair_relookup {
+    SELECT
+      json_insert('[]', '$[#]', 0, '$[#]', 1),
+      json_extract(json_insert('[]', '$[#]', 0, '$[#]', 1), '$[0]'),
+      json_extract(json_insert('[]', '$[#]', 0, '$[#]', 1), '$[1]');
+}
+expect {
+    [0,1]|0|1
+}
+
+test json_replace_array_append_hash_noop {
+    SELECT json_replace('[1,2,3]', '$[#]', 'x');
+}
+expect {
+    [1,2,3]
 }
 
 test json_insert_array_existing_not_replaced {
