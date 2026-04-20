@@ -1457,7 +1457,7 @@ impl Extend<usize> for ColumnMask {
 }
 
 pub struct ColumnMaskIter<B: std::borrow::Borrow<BitSet>> {
-    inner: BitSetIter<B>,
+    inner: BitSetIter<usize, B>,
     pending_rowid: bool,
 }
 
@@ -1504,25 +1504,37 @@ impl IntoIterator for ColumnMask {
 ///
 /// *WARNING*: This bitset occupies `O(max_num)` space when `max_num > 64`,
 /// so it is best used for smaller numbers.
-#[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
-pub struct BitSet {
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct BitSet<T = usize> {
     inline: u64,
     /// invariant: `overflow` is `None` iff no bits ≥ 64 are set.
     overflow: Option<Vec<u64>>,
+    _phantom: PhantomData<fn() -> T>,
+}
+
+impl<T> Default for BitSet<T> {
+    fn default() -> Self {
+        Self {
+            inline: 0,
+            overflow: None,
+            _phantom: PhantomData,
+        }
+    }
 }
 
 /// This iterator, inspired by Kernighan's bit-counting algorighm, is `O(num_words + popcount)`
 /// for the whole bitset.
-pub struct BitSetIter<B: std::borrow::Borrow<BitSet>> {
+pub struct BitSetIter<T, B: std::borrow::Borrow<BitSet<T>>> {
     bitset: B,
     /// Remaining bits to drain from the word currently pointed at by `word`.
     current: u64,
     /// `0` = inline word, `1..=overflow.len()` = `overflow[word - 1]`.
     word: usize,
+    _phantom: PhantomData<fn() -> T>,
 }
 
-impl<B: std::borrow::Borrow<BitSet>> Iterator for BitSetIter<B> {
-    type Item = usize;
+impl<T: From<usize>, B: std::borrow::Borrow<BitSet<T>>> Iterator for BitSetIter<T, B> {
+    type Item = T;
 
     fn next(&mut self) -> Option<Self::Item> {
         loop {
@@ -1532,9 +1544,9 @@ impl<B: std::borrow::Borrow<BitSet>> Iterator for BitSetIter<B> {
                 let base = if self.word == 0 {
                     0
                 } else {
-                    BitSet::INLINE_BITS + (self.word - 1) * 64
+                    BitSet::<T>::INLINE_BITS + (self.word - 1) * 64
                 };
-                return Some(base + bit);
+                return Some(T::from(base + bit));
             }
             self.word += 1;
             let overflow = self.bitset.borrow().overflow.as_ref()?;
@@ -1543,36 +1555,44 @@ impl<B: std::borrow::Borrow<BitSet>> Iterator for BitSetIter<B> {
     }
 }
 
-impl<'a> IntoIterator for &'a BitSet {
-    type Item = usize;
-    type IntoIter = BitSetIter<&'a BitSet>;
+impl<'a, T: From<usize>> IntoIterator for &'a BitSet<T> {
+    type Item = T;
+    type IntoIter = BitSetIter<T, &'a BitSet<T>>;
 
     fn into_iter(self) -> Self::IntoIter {
         BitSetIter {
             current: self.inline,
             bitset: self,
             word: 0,
+            _phantom: PhantomData,
         }
     }
 }
 
-impl IntoIterator for BitSet {
-    type Item = usize;
-    type IntoIter = BitSetIter<BitSet>;
+impl<T: From<usize>> IntoIterator for BitSet<T> {
+    type Item = T;
+    type IntoIter = BitSetIter<T, BitSet<T>>;
 
     fn into_iter(self) -> Self::IntoIter {
         BitSetIter {
             current: self.inline,
             bitset: self,
             word: 0,
+            _phantom: PhantomData,
         }
     }
 }
 
-impl BitSet {
+impl<T> BitSet<T> {
     const INLINE_BITS: usize = 64;
+}
 
-    pub fn set(&mut self, index: usize) {
+impl<T: From<usize>> BitSet<T>
+where
+    usize: From<T>,
+{
+    pub fn set(&mut self, index: T) {
+        let index: usize = index.into();
         if index < Self::INLINE_BITS {
             self.inline |= 1 << index;
         } else {
@@ -1586,7 +1606,8 @@ impl BitSet {
         }
     }
 
-    pub fn get(&self, index: usize) -> bool {
+    pub fn get(&self, index: T) -> bool {
+        let index: usize = index.into();
         if index < Self::INLINE_BITS {
             (self.inline >> index) & 1 != 0
         } else {
@@ -1601,7 +1622,8 @@ impl BitSet {
         }
     }
 
-    pub fn clear(&mut self, index: usize) {
+    pub fn clear(&mut self, index: T) {
+        let index: usize = index.into();
         if index < Self::INLINE_BITS {
             self.inline &= !(1 << index);
         } else if let Some(overflow) = &mut self.overflow {
@@ -1637,7 +1659,8 @@ impl BitSet {
         self.inline == 0 && self.overflow.is_none()
     }
 
-    pub fn is_only(&self, index: usize) -> bool {
+    pub fn is_only(&self, index: T) -> bool {
+        let index: usize = index.into();
         if index < Self::INLINE_BITS {
             self.inline == (1 << index)
                 && self
@@ -1690,11 +1713,12 @@ impl BitSet {
         }
     }
 
-    pub fn iter(&self) -> impl Iterator<Item = usize> + '_ {
+    pub fn iter(&self) -> BitSetIter<T, &Self> {
         BitSetIter {
             current: self.inline,
             bitset: self,
             word: 0,
+            _phantom: PhantomData,
         }
     }
 
@@ -1710,7 +1734,8 @@ impl BitSet {
     }
 
     /// Returns the number of set bits strictly below `index`.
-    pub fn rank(&self, index: usize) -> usize {
+    pub fn rank(&self, index: T) -> usize {
+        let index: usize = index.into();
         if index == 0 {
             return 0;
         }
@@ -1765,7 +1790,7 @@ impl BitSet {
     }
 }
 
-impl std::ops::BitOrAssign<&Self> for ColumnUsedMask {
+impl<T> std::ops::BitOrAssign<&Self> for BitSet<T> {
     fn bitor_assign(&mut self, rhs: &Self) {
         self.inline |= rhs.inline;
         if let Some(rhs_ov) = &rhs.overflow {
@@ -1780,8 +1805,11 @@ impl std::ops::BitOrAssign<&Self> for ColumnUsedMask {
     }
 }
 
-impl FromIterator<usize> for BitSet {
-    fn from_iter<I: IntoIterator<Item = usize>>(iter: I) -> Self {
+impl<T: From<usize>> FromIterator<T> for BitSet<T>
+where
+    usize: From<T>,
+{
+    fn from_iter<I: IntoIterator<Item = T>>(iter: I) -> Self {
         let mut set = Self::default();
         for index in iter {
             set.set(index);
@@ -1790,20 +1818,24 @@ impl FromIterator<usize> for BitSet {
     }
 }
 
-impl Extend<usize> for BitSet {
-    fn extend<I: IntoIterator<Item = usize>>(&mut self, iter: I) {
+impl<T: From<usize>> Extend<T> for BitSet<T>
+where
+    usize: From<T>,
+{
+    fn extend<I: IntoIterator<Item = T>>(&mut self, iter: I) {
         for index in iter {
             self.set(index);
         }
     }
 }
 
-impl From<u128> for BitSet {
+impl<T> From<u128> for BitSet<T> {
     fn from(from: u128) -> Self {
         let high = (from >> 64) as u64;
         Self {
             inline: from as u64,
             overflow: (high != 0).then(|| vec![high]),
+            _phantom: PhantomData,
         }
     }
 }
@@ -3801,8 +3833,8 @@ mod tests {
                     );
                     // From<u128>(0) must equal default (equality anchor)
                     assert_eq!(
-                        BitSet::from(0u128),
-                        BitSet::default(),
+                        BitSet::<usize>::from(0u128),
+                        BitSet::<usize>::default(),
                         "step={step} seed={seed} From<u128>(0) != default"
                     );
                 }
@@ -3871,5 +3903,35 @@ mod tests {
             reference.len(),
             "final count mismatch, seed={seed}"
         );
+    }
+
+    #[test]
+    fn test_bitset_with_table_internal_id() {
+        let a = TableInternalId::from(3);
+        let b = TableInternalId::from(70); // exercises overflow path
+        let c = TableInternalId::from(200);
+
+        let mut mask: BitSet<TableInternalId> = BitSet::default();
+        mask.set(a);
+        mask.set(b);
+        mask.set(c);
+
+        assert!(mask.get(a));
+        assert!(mask.get(b));
+        assert!(mask.get(c));
+        assert!(!mask.get(TableInternalId::from(4)));
+        assert_eq!(mask.count(), 3);
+
+        mask.clear(b);
+        assert!(!mask.get(b));
+        assert_eq!(mask.count(), 2);
+
+        // Iterator yields TableInternalId, not usize.
+        let collected: Vec<TableInternalId> = (&mask).into_iter().collect();
+        assert_eq!(collected, vec![a, c]);
+
+        // FromIterator<TableInternalId> works.
+        let rebuilt: BitSet<TableInternalId> = [a, c].into_iter().collect();
+        assert_eq!(rebuilt, mask);
     }
 }
