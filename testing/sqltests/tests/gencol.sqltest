@@ -4525,5 +4525,5 @@ test update-deferred-fk-on-child-virtual-column {
   INSERT INTO c VALUES (1);
   UPDATE c SET a=2;
 } expect error {
-    deferred foreign key constraint failed
+    (FOREIGN KEY|deferred foreign key) constraint failed
 }
