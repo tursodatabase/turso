@@ -1585,7 +1585,7 @@ impl Jsonb {
                 return Err(PError::Message {
                     msg: "Unexpected character".to_string(),
                     location: Some(pos),
-                })
+                });
             }
         }
 
@@ -2609,6 +2609,11 @@ impl Jsonb {
         delta: isize,
     ) -> Result<()> {
         let mut delta = delta;
+        // Track the container whose header was already updated in the previous
+        // (deeper) iteration. If the current array parent points to that same
+        // container via `get_array_index()`, updating it again would double-apply
+        // the delta for 3+ nested array traversals.
+        let mut updated_child_container_idx: Option<usize> = None;
         for parent in stack.iter().rev() {
             let (JsonbHeader(el_type, el_size), el_header_len) =
                 self.read_header(parent.field_value_index)?;
@@ -2617,17 +2622,19 @@ impl Jsonb {
                 let arr_element_idx = parent.get_array_index().ok_or_else(|| {
                     LimboError::InternalError("array element should have index".to_string())
                 })?;
-                let (JsonbHeader(arr_el_type, arr_el_size), arr_el_header_len) =
-                    self.read_header(arr_element_idx)?;
+                if Some(arr_element_idx) != updated_child_container_idx {
+                    let (JsonbHeader(arr_el_type, arr_el_size), arr_el_header_len) =
+                        self.read_header(arr_element_idx)?;
 
-                let new_arr_el_header_len = self.write_element_header(
-                    arr_element_idx,
-                    arr_el_type,
-                    (arr_el_size as isize + delta) as usize,
-                    true,
-                )?;
+                    let new_arr_el_header_len = self.write_element_header(
+                        arr_element_idx,
+                        arr_el_type,
+                        (arr_el_size as isize + delta) as usize,
+                        true,
+                    )?;
 
-                delta += (new_arr_el_header_len - arr_el_header_len) as isize;
+                    delta += (new_arr_el_header_len - arr_el_header_len) as isize;
+                }
             }
             let new_size = el_size as isize + delta;
             let new_header_size = self.write_element_header(
@@ -2641,6 +2648,7 @@ impl Jsonb {
 
             delta += parent.delta;
             delta += header_diff;
+            updated_child_container_idx = Some(parent.field_value_index);
         }
 
         Ok(())

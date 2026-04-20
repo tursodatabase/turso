@@ -15,6 +15,7 @@ enum ArrayIndexState {
     Start,
     AfterHash,
     CollectingNumbers,
+    CollectingNegativeZeros,
     IsMax,
 }
 
@@ -274,6 +275,17 @@ fn handle_array_index<'a>(
             *parser_state = PPState::ExpectDotOrBracket;
             path_components.push(PathElement::ArrayLocator(None));
         }
+        (ArrayIndexState::CollectingNegativeZeros, '0') => {}
+        (ArrayIndexState::CollectingNegativeZeros, '1'..='9') => {
+            *index_buffer = -(ch.1.to_digit(10).ok_or_else(|| {
+                crate::LimboError::ParseError(format!("failed to parse digit: {ch}", ch = ch.1))
+            })? as i128);
+            *index_state = ArrayIndexState::CollectingNumbers;
+        }
+        (ArrayIndexState::CollectingNegativeZeros, ']') => {
+            *parser_state = PPState::ExpectDotOrBracket;
+            path_components.push(PathElement::ArrayLocator(None));
+        }
         (ArrayIndexState::CollectingNumbers, '0'..='9') => {
             let (new_num, is_max) = collect_num(
                 *index_buffer,
@@ -357,10 +369,17 @@ fn handle_negative_index(
 ) -> crate::Result<()> {
     if let Some((_, next_c)) = path_iter.next() {
         if next_c.is_ascii_digit() {
-            *index_buffer = -(next_c.to_digit(10).ok_or_else(|| {
+            let digit = next_c.to_digit(10).ok_or_else(|| {
                 crate::LimboError::ParseError(format!("failed to parse digit: {next_c}"))
-            })? as i128);
-            *index_state = ArrayIndexState::CollectingNumbers;
+            })? as i128;
+            if digit == 0 {
+                // Preserve `[#-0]` (and `[#-00..0]`) as the append locator.
+                *index_buffer = 0;
+                *index_state = ArrayIndexState::CollectingNegativeZeros;
+            } else {
+                *index_buffer = -digit;
+                *index_state = ArrayIndexState::CollectingNumbers;
+            }
             Ok(())
         } else {
             bail_parse_error!("Bad json path: {}", path)
@@ -456,6 +475,30 @@ mod tests {
         assert_eq!(path.elements.len(), 2);
         assert_eq!(path.elements[0], PathElement::Root());
         assert_eq!(path.elements[1], PathElement::ArrayLocator(Some(-2)));
+    }
+
+    #[test]
+    fn test_json_path_negative_zero_array_locator() {
+        let path = json_path("$[#-0]").unwrap();
+        assert_eq!(path.elements.len(), 2);
+        assert_eq!(path.elements[0], PathElement::Root());
+        assert_eq!(path.elements[1], PathElement::ArrayLocator(None));
+    }
+
+    #[test]
+    fn test_json_path_negative_zero_with_leading_zeros() {
+        let path = json_path("$[#-00]").unwrap();
+        assert_eq!(path.elements.len(), 2);
+        assert_eq!(path.elements[0], PathElement::Root());
+        assert_eq!(path.elements[1], PathElement::ArrayLocator(None));
+    }
+
+    #[test]
+    fn test_json_path_negative_with_leading_zeros() {
+        let path = json_path("$[#-01]").unwrap();
+        assert_eq!(path.elements.len(), 2);
+        assert_eq!(path.elements[0], PathElement::Root());
+        assert_eq!(path.elements[1], PathElement::ArrayLocator(Some(-1)));
     }
 
     #[test]
