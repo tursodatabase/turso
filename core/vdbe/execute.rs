@@ -14331,7 +14331,6 @@ fn op_vacuum_into_inner(
                 // Pin source metadata before building the destination. The
                 // BEGIN and pragma helpers here are blocking convenience wrappers;
                 // async work starts with the schema scan in vacuum_into_step.
-                let io: Arc<dyn crate::IO> = Arc::new(crate::io::PlatformIO::new()?);
                 let source_db = program.connection.get_source_database(database_id);
                 program.connection.execute("BEGIN")?;
                 state.auto_txn_cleanup = TxnCleanup::RollbackTxn;
@@ -14360,7 +14359,9 @@ fn op_vacuum_into_inner(
                         Some(val) => val,
                         None => {
                             let pager = program.connection.pager.load();
-                            io.block(|| pager.with_header(|header| header.reserved_space))?
+                            pager
+                                .io
+                                .block(|| pager.with_header(|header| header.reserved_space))?
                         }
                     }
                 } else {
@@ -14368,7 +14369,9 @@ fn op_vacuum_into_inner(
                     let pager = program
                         .connection
                         .get_pager_from_database_index(&database_id);
-                    io.block(|| pager.with_header(|header| header.reserved_space))?
+                    pager
+                        .io
+                        .block(|| pager.with_header(|header| header.reserved_space))?
                 };
 
                 // Mirror source feature flags to the destination so schema replay
