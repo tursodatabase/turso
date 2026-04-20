@@ -1645,7 +1645,9 @@ fn rewrite_where_for_update_registers(
 ///
 /// The following postcondition holds:
 ///
-///     dml_ctx.to_column_reg(target_columns[i]) == dml_ctx.to_column_reg(target_columns[0]) + i
+/// ```text
+/// dml_ctx.to_column_reg(target_columns[i]) == dml_ctx.to_column_reg(target_columns[0]) + i
+/// ```
 ///
 /// This way, target_columns[0] can be used as a base for opcodes that require unpacked records.
 pub(crate) fn emit_columns_and_dependencies(
@@ -1693,7 +1695,11 @@ pub(crate) fn emit_columns_and_dependencies(
         };
         (col, reg)
     });
-    Ok(DmlColumnContext::from_column_reg_mapping(pairs))
+    let dml_ctx = DmlColumnContext::from_column_reg_mapping(pairs);
+    debug_assert!(targets
+        .windows(2)
+        .all(|w| { dml_ctx.to_column_reg(w[1]) == dml_ctx.to_column_reg(w[0]) + 1 }));
+    Ok(dml_ctx)
 }
 
 /// Emit code to load the value of an IndexColumn from the OLD image of the row being updated.
