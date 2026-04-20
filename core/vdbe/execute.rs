@@ -1724,6 +1724,8 @@ pub fn op_column(
                         }
                     }
                 }
+                state.metrics.btree_seeks = state.metrics.btree_seeks.saturating_add(1);
+                state.metrics.search_count = state.metrics.search_count.saturating_add(1);
                 state.op_column_state = OpColumnState::GetColumn;
             }
             OpColumnState::GetColumn => {
@@ -2551,6 +2553,7 @@ pub fn op_next(
         // Increment metrics for row read
         state.record_rows_read(1);
         state.metrics.btree_next = state.metrics.btree_next.saturating_add(1);
+        state.metrics.search_count = state.metrics.search_count.saturating_add(1);
         // Track if this is a full table scan or index scan
         if let Some((_, cursor_type)) = program.cursor_ref.get(*cursor_id) {
             if cursor_type.is_index() {
@@ -2598,6 +2601,7 @@ pub fn op_prev(
         // Increment metrics for row read
         state.record_rows_read(1);
         state.metrics.btree_prev = state.metrics.btree_prev.saturating_add(1);
+        state.metrics.search_count = state.metrics.search_count.saturating_add(1);
         // Track if this is a full table scan or index scan
         if let Some((_, cursor_type)) = program.cursor_ref.get(*cursor_id) {
             if cursor_type.is_index() {
@@ -4711,10 +4715,12 @@ pub fn op_seek(
         op,
     ) {
         Ok(SeekInternalResult::Found) => {
+            state.metrics.search_count = state.metrics.search_count.saturating_add(1);
             state.pc += 1;
             Ok(InsnFunctionStepResult::Step)
         }
         Ok(SeekInternalResult::NotFound) => {
+            state.metrics.search_count = state.metrics.search_count.saturating_add(1);
             state.pc = target_pc.as_offset_int();
             Ok(InsnFunctionStepResult::Step)
         }
@@ -6164,6 +6170,7 @@ pub fn op_sorter_sort(
     if did_sort {
         state.metrics.sort_operations = state.metrics.sort_operations.saturating_add(1);
     }
+    state.metrics.search_count = state.metrics.search_count.saturating_sub(1);
     if is_empty {
         state.pc = pc_if_empty.as_offset_int();
     } else {
@@ -6193,6 +6200,7 @@ pub fn op_sorter_next(
         cursor.has_more()
     };
     if has_more {
+        state.metrics.search_count = state.metrics.search_count.saturating_add(1);
         state.pc = pc_if_next.as_offset_int();
     } else {
         state.pc += 1;

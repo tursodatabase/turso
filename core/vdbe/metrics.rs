@@ -90,6 +90,10 @@ pub struct StatementMetrics {
     pub btree_next: u64,
     pub btree_prev: u64,
 
+    /// Signed counter tracking seeks and cursor advances, decremented on sort
+    /// rewind to avoid double-counting. Exposed as `sqlite3_search_count`.
+    pub search_count: i64,
+
     // Hash join spill/probe metrics
     pub hash_join: HashJoinMetrics,
 }
@@ -120,6 +124,7 @@ impl StatementMetrics {
         self.btree_seeks = self.btree_seeks.saturating_add(other.btree_seeks);
         self.btree_next = self.btree_next.saturating_add(other.btree_next);
         self.btree_prev = self.btree_prev.saturating_add(other.btree_prev);
+        self.search_count = self.search_count.saturating_add(other.search_count);
         self.hash_join.merge(&other.hash_join);
     }
 
