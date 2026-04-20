@@ -3,7 +3,7 @@ use crate::json::Conv;
 use crate::{bail_parse_error, LimboError, Result};
 use std::{
     borrow::Cow,
-    collections::{HashMap, VecDeque},
+    collections::VecDeque,
     fmt::Write,
     str::{from_utf8, from_utf8_unchecked},
 };
@@ -2467,6 +2467,142 @@ impl Jsonb {
         Ok(())
     }
 
+    fn append_array_placeholder(
+        &mut self,
+        array_value_idx: usize,
+        array_payload_size: usize,
+        array_header_size: usize,
+        insertion_point: usize,
+        field_key_index: JsonLocationKind,
+    ) -> Result<JsonTraversalResult> {
+        let placeholder = JsonbHeader::new(ElementType::OBJECT, 0).into_bytes();
+        let placeholder_bytes = placeholder.as_bytes();
+
+        self.data.splice(
+            insertion_point..insertion_point,
+            placeholder_bytes.iter().copied(),
+        );
+
+        let mut adjusted_insertion_point = insertion_point;
+        if matches!(
+            field_key_index,
+            JsonLocationKind::ObjectProperty(_) | JsonLocationKind::DocumentRoot
+        ) {
+            let new_header_size = self.write_element_header(
+                array_value_idx,
+                ElementType::ARRAY,
+                array_payload_size + placeholder_bytes.len(),
+                true,
+            )?;
+            let header_shift = new_header_size as isize - array_header_size as isize;
+            adjusted_insertion_point = insertion_point
+                .checked_add_signed(header_shift)
+                .ok_or_else(|| {
+                    LimboError::InternalError(
+                        "array insertion point shifted outside valid range".to_string(),
+                    )
+                })?;
+        }
+
+        Ok(JsonTraversalResult::with_array_index(
+            array_value_idx,
+            field_key_index,
+            placeholder_bytes.len() as isize,
+            adjusted_insertion_point,
+        ))
+    }
+
+    fn resolve_array_locator(
+        &mut self,
+        array_value_idx: usize,
+        field_key_index: JsonLocationKind,
+        idx: &Option<i32>,
+        mode: PathOperationMode,
+    ) -> Result<JsonTraversalResult> {
+        let (JsonbHeader(value_type, value_size), value_header_size) =
+            self.read_header(array_value_idx)?;
+        if value_type != ElementType::ARRAY {
+            bail_parse_error!("Should be array")
+        }
+
+        let array_start = array_value_idx + value_header_size;
+        let array_end = array_start + value_size;
+
+        match idx {
+            Some(idx) if *idx >= 0 => {
+                let target_idx = *idx as usize;
+                let mut count = 0;
+                let mut arr_pos = array_start;
+
+                while arr_pos < array_end && count != target_idx {
+                    arr_pos = self.skip_element(arr_pos)?;
+                    count += 1;
+                }
+
+                if arr_pos == array_end {
+                    if mode.allows_insert() && count == target_idx {
+                        return self.append_array_placeholder(
+                            array_value_idx,
+                            value_size,
+                            value_header_size,
+                            arr_pos,
+                            field_key_index,
+                        );
+                    }
+                    bail_parse_error!("Not found!");
+                }
+
+                if mode.allows_replace() {
+                    return Ok(JsonTraversalResult::with_array_index(
+                        array_value_idx,
+                        field_key_index,
+                        0,
+                        arr_pos,
+                    ));
+                }
+
+                bail_parse_error!("Not found!")
+            }
+            Some(idx) => {
+                let mut positions: Vec<usize> = Vec::with_capacity(16);
+                let mut arr_pos = array_start;
+                while arr_pos < array_end {
+                    positions.push(arr_pos);
+                    arr_pos = self.skip_element(arr_pos)?;
+                }
+
+                let real_idx = positions.len() as i64 + i64::from(*idx);
+                if real_idx < 0 || real_idx >= positions.len() as i64 {
+                    bail_parse_error!("Element with negative index not found");
+                }
+
+                if mode.allows_replace() {
+                    return Ok(JsonTraversalResult::with_array_index(
+                        array_value_idx,
+                        field_key_index,
+                        0,
+                        positions[real_idx as usize],
+                    ));
+                }
+
+                bail_parse_error!("Not found!")
+            }
+            None => {
+                if mode.allows_insert() {
+                    return self.append_array_placeholder(
+                        array_value_idx,
+                        value_size,
+                        value_header_size,
+                        array_end,
+                        field_key_index,
+                    );
+                }
+
+                bail_parse_error!("Not found!")
+            }
+        }
+    }
+
     fn update_parent_references(
         &mut self,
         stack: Vec<JsonTraversalResult>,
@@ -2531,71 +2667,12 @@ impl Jsonb {
                     self.read_header(pos)?;
 
                 if root_type == ElementType::ARRAY {
-                    let end_pos = pos + root_header_size + root_size;
-
-                    match idx {
-                        Some(idx) if *idx >= 0 => {
-                            let mut count = 0;
-                            let mut arr_pos = pos + root_header_size;
-
-                            while arr_pos < end_pos && count != *idx as usize {
-                                arr_pos = self.skip_element(arr_pos)?;
-                                count += 1;
-                            }
-
-                            if mode.allows_insert() && arr_pos == end_pos {
-                                let placeholder =
-                                    JsonbHeader::new(ElementType::OBJECT, 0).into_bytes();
-                                let placeholder_bytes = placeholder.as_bytes();
-
-                                self.data
-                                    .splice(arr_pos..arr_pos, placeholder_bytes.iter().copied());
-
-                                return Ok(JsonTraversalResult::with_array_index(
-                                    pos,
-                                    JsonLocationKind::ArrayEntry,
-                                    placeholder_bytes.len() as isize,
-                                    arr_pos,
-                                ));
-                            }
-
-                            if arr_pos != end_pos && mode.allows_replace() {
-                                return Ok(JsonTraversalResult::with_array_index(
-                                    pos,
-                                    JsonLocationKind::ArrayEntry,
-                                    0,
-                                    arr_pos,
-                                ));
-                            }
-
-                            bail_parse_error!("Not found!");
-                        }
-                        Some(idx) if *idx < 0 => {
-                            let mut idx_map: HashMap<i32, usize> = HashMap::with_capacity(100);
-                            let mut element_idx = 0;
-                            let mut arr_pos = pos + root_header_size;
-
-                            while arr_pos < end_pos {
-                                idx_map.insert(element_idx, arr_pos);
-                                arr_pos = self.skip_element(arr_pos)?;
-                                element_idx += 1;
-                            }
-
-                            let real_idx = element_idx + idx;
-
-                            if let Some(index) = idx_map.get(&real_idx) {
-                                return Ok(JsonTraversalResult::with_array_index(
-                                    pos,
-                                    JsonLocationKind::ArrayEntry,
-                                    0,
-                                    *index,
-                                ));
-                            } else {
-                                bail_parse_error!("Element with negative index not found")
-                            }
-                        }
-                        _ => unreachable!(),
-                    }
+                    return self.resolve_array_locator(
+                        pos,
+                        JsonLocationKind::ArrayEntry,
+                        idx,
+                        mode,
+                    );
                 } else {
                     if root_type == ElementType::OBJECT
                         && root_size == 0
@@ -2705,76 +2782,15 @@ impl Jsonb {
                 PathElement::Root(),
                 PathElement::ArrayLocator(idx),
             ) => {
-                let (JsonbHeader(root_type, root_size), root_header_size) =
-                    self.read_header(pos)?;
+                let (JsonbHeader(root_type, _), _) = self.read_header(pos)?;
 
                 if root_type == ElementType::ARRAY {
-                    let end_pos = pos + root_header_size + root_size;
-
-                    match idx {
-                        Some(idx) if *idx >= 0 => {
-                            let mut count = 0;
-                            let mut arr_pos = pos + root_header_size;
-
-                            while arr_pos < end_pos && count != *idx as usize {
-                                arr_pos = self.skip_element(arr_pos)?;
-                                count += 1;
-                            }
-
-                            if mode.allows_insert() && arr_pos == end_pos && count == *idx as usize
-                            {
-                                let placeholder =
-                                    JsonbHeader::new(ElementType::OBJECT, 0).into_bytes();
-                                let placeholder_bytes = placeholder.as_bytes();
-
-                                self.data
-                                    .splice(arr_pos..arr_pos, placeholder_bytes.iter().copied());
-
-                                return Ok(JsonTraversalResult::with_array_index(
-                                    pos,
-                                    JsonLocationKind::DocumentRoot,
-                                    placeholder_bytes.len() as isize,
-                                    arr_pos,
-                                ));
-                            }
-
-                            if arr_pos != end_pos && mode.allows_replace() {
-                                return Ok(JsonTraversalResult::with_array_index(
-                                    pos,
-                                    JsonLocationKind::DocumentRoot,
-                                    0,
-                                    arr_pos,
-                                ));
-                            }
-
-                            bail_parse_error!("Not found!");
-                        }
-                        Some(idx) if *idx < 0 => {
-                            let mut idx_map: HashMap<i32, usize> = HashMap::with_capacity(100);
-                            let mut element_idx = 0;
-                            let mut arr_pos = pos + root_header_size;
-
-                            while arr_pos < end_pos {
-                                idx_map.insert(element_idx, arr_pos);
-                                arr_pos = self.skip_element(arr_pos)?;
-                                element_idx += 1;
-                            }
-
-                            let real_idx = element_idx + idx;
-
-                            if let Some(index) = idx_map.get(&real_idx) {
-                                return Ok(JsonTraversalResult::with_array_index(
-                                    pos,
-                                    JsonLocationKind::DocumentRoot,
-                                    0,
-                                    *index,
-                                ));
-                            } else {
-                                bail_parse_error!("Element with negative index not found")
-                            }
-                        }
-                        _ => unreachable!(),
-                    }
+                    return self.resolve_array_locator(
+                        pos,
+                        JsonLocationKind::DocumentRoot,
+                        idx,
+                        mode,
+                    );
                 } else {
                     bail_parse_error!("Root is not an array");
                 }
@@ -2862,105 +2878,18 @@ impl Jsonb {
                     ));
                 }
 
-                if current_pos != end_pos && mode.allows_replace() {
+                if current_pos != end_pos {
                     let key_idx = current_pos;
 
                     current_pos = self.skip_element(current_pos)?;
                     let value_idx = current_pos;
 
-                    let (JsonbHeader(value_type, value_size), value_header_size) =
-                        self.read_header(value_idx)?;
-
-                    if value_type != ElementType::ARRAY {
-                        bail_parse_error!("Should be array")
-                    }
-
-                    let end_pos = current_pos + value_header_size + value_size;
-
-                    match idx {
-                        Some(idx) if *idx >= 0 => {
-                            let mut count = 0;
-                            let mut arr_pos = value_idx + value_header_size;
-
-                            while arr_pos < end_pos && count != *idx as usize {
-                                arr_pos = self.skip_element(arr_pos)?;
-                                count += 1;
-                            }
-
-                            if mode.allows_insert() && arr_pos == end_pos && count == *idx as usize
-                            {
-                                let placeholder =
-                                    JsonbHeader::new(ElementType::OBJECT, 0).into_bytes();
-                                let placeholder_bytes = placeholder.as_bytes();
-
-                                self.data
-                                    .splice(arr_pos..arr_pos, placeholder_bytes.iter().copied());
-                                self.write_element_header(
-                                    value_idx,
-                                    ElementType::ARRAY,
-                                    value_size + placeholder_bytes.len(),
-                                    true,
-                                )?;
-                                return Ok(JsonTraversalResult::with_array_index(
-                                    value_idx,
-                                    JsonLocationKind::ObjectProperty(key_idx),
-                                    placeholder_bytes.len() as isize,
-                                    arr_pos,
-                                ));
-                            }
-
-                            if arr_pos != end_pos && mode.allows_replace() {
-                                return Ok(JsonTraversalResult::with_array_index(
-                                    value_idx,
-                                    JsonLocationKind::ObjectProperty(key_idx),
-                                    0,
-                                    arr_pos,
-                                ));
-                            }
-
-                            bail_parse_error!("Not found!");
-                        }
-                        Some(idx) if *idx < 0 => {
-                            let mut idx_map: HashMap<i32, usize> = HashMap::with_capacity(100);
-                            let mut element_idx = 0;
-                            let mut arr_pos = value_idx + value_header_size;
-
-                            while arr_pos < end_pos {
-                                idx_map.insert(element_idx, arr_pos);
-                                arr_pos = self.skip_element(arr_pos)?;
-                                element_idx += 1;
-                            }
-
-                            let real_idx = element_idx + idx;
-
-                            if let Some(index) = idx_map.get(&real_idx) {
-                                return Ok(JsonTraversalResult::with_array_index(
-                                    value_idx,
-                                    JsonLocationKind::ObjectProperty(key_idx),
-                                    0,
-                                    *index,
-                                ));
-                            } else {
-                                bail_parse_error!(
-                                    "ERROR: Element at negative index {} not found",
-                                    idx
-                                );
-                            }
-                        }
-                        Some(_) => unreachable!(),
-                        None => {
-                            if mode.allows_insert() {
-                                let placeholder =
-                                    JsonbHeader::new(ElementType::OBJECT, 0).into_bytes();
-                                let placeholder_bytes = placeholder.as_bytes();
-                                let insertion_point = value_idx + value_size + value_header_size;
-
-                                self.data.insert(insertion_point, placeholder_bytes[0]);
-                            } else {
-                                bail_parse_error!("Cant insert")
-                            }
-                        }
-                    }
+                    return self.resolve_array_locator(
+                        value_idx,
+                        JsonLocationKind::ObjectProperty(key_idx),
+                        idx,
+                        mode,
+                    );
                 }
             }
             _ => {
