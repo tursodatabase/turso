@@ -429,9 +429,6 @@ fn emit_add_virtual_column_validation(
     original_table
         .columns_mut()
         .retain(|c| !c.is_virtual_generated());
-    original_table.has_virtual_columns = false;
-    original_table.logical_to_physical_map =
-        BTreeTable::build_logical_to_physical_map(original_table.columns());
     let original_table = Arc::new(original_table);
     let cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(original_table.clone()));
     program.emit_insn(Insn::OpenRead {
@@ -1646,8 +1643,6 @@ pub fn translate_alter_table(
                 table.columns_mut()[column_index] =
                     replacement_column.expect("replacement_column must exist for ALTER COLUMN");
                 table.prepare_generated_columns()?;
-                table.logical_to_physical_map =
-                    BTreeTable::build_logical_to_physical_map(table.columns());
                 Some(table)
             } else {
                 None

@@ -12320,8 +12320,6 @@ pub fn op_drop_column(
 
         let btree = Arc::make_mut(btree);
         btree.columns_mut().remove(*column_index);
-        btree.logical_to_physical_map =
-            crate::schema::BTreeTable::build_logical_to_physical_map(btree.columns());
         // Remove column-level CHECK constraints for the dropped column
         let col_name = column_name.clone();
         btree.check_constraints.retain(|c| {
@@ -12330,7 +12328,6 @@ pub fn op_drop_column(
                 .is_none_or(|col| normalize_ident(col) != normalize_ident(&col_name))
         });
 
-        btree.has_virtual_columns = btree.columns().iter().any(|c| c.is_virtual_generated());
         btree.shift_generated_column_indices_after_drop(*column_index)?;
         Ok(())
     })?;
@@ -12418,8 +12415,6 @@ pub fn op_add_column(
 
         let btree = Arc::make_mut(btree);
         btree.columns_mut().push((**column).clone());
-        btree.logical_to_physical_map =
-            crate::schema::BTreeTable::build_logical_to_physical_map(btree.columns());
         // Update CHECK constraints to include any constraints from the new column
         btree.check_constraints.clone_from(check_constraints);
         // Update foreign keys to include any FK constraints from the new column
@@ -12564,8 +12559,6 @@ pub fn op_alter_column(
         }
 
         btree.prepare_generated_columns()?;
-        btree.logical_to_physical_map =
-            crate::schema::BTreeTable::build_logical_to_physical_map(btree.columns());
 
         // Keep primary_key_columns consistent (names may change on rename)
         for (pk_name, _ord) in &mut btree.primary_key_columns {

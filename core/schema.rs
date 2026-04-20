@@ -153,6 +153,7 @@ use crate::{
     bail_parse_error, contains_ignore_ascii_case, eq_ignore_ascii_case, match_ignore_ascii_case,
     LimboError, MvCursor, Pager, SymbolTable, ValueRef, VirtualTable,
 };
+use bitflags::bitflags;
 use core::fmt;
 use rustc_hash::{FxBuildHasher, FxHashMap as HashMap, FxHashSet as HashSet};
 use std::collections::VecDeque;
@@ -2258,6 +2259,18 @@ impl<T: Default> Clone for ResetOnClone<T> {
     }
 }
 
+bitflags! {
+    #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+    pub struct BTreeCharacteristics: u8 {
+        /// Table has a rowid column (i.e. not `WITHOUT ROWID`).
+        const HAS_ROWID         = 0b0000_0001;
+        /// Table is declared `STRICT`.
+        const STRICT            = 0b0000_0010;
+        /// Table has an `AUTOINCREMENT` column.
+        const HAS_AUTOINCREMENT = 0b0000_0100;
+    }
+}
+
 #[derive(Debug)]
 pub(crate) struct GeneratedColGraph {
     /// `dependencies[j]` = columns `j` transitively reads from (excludes `j`).
@@ -2281,14 +2294,15 @@ impl GeneratedColGraph {
             };
             let mut direct = BitSet::default();
             collect_column_dependencies_of_gencol(expr, columns, &mut direct);
+            if direct.get(j) {
+                bail_parse_error!(
+                    "generated column \"{}\" cannot reference itself",
+                    col.name.as_deref().unwrap_or("?")
+                );
+            }
+            let direct_mask: ColumnMask = ColumnMask::from_iter(direct.iter());
+            direct_deps[j].union_with(&direct_mask);
             for i in direct.iter() {
-                if i == j {
-                    bail_parse_error!(
-                        "generated column \"{}\" cannot reference itself",
-                        col.name.as_deref().unwrap_or("?")
-                    );
-                }
-                direct_deps[j].set(i);
                 direct_dependents[i].set(j);
                 in_degree[j] += 1;
             }
@@ -2351,7 +2365,7 @@ pub struct BTreeTable {
     pub root_page: i64,
     pub name: String,
     pub primary_key_columns: Vec<(String, SortOrder)>,
-    pub(crate) columns: Vec<Column>,
+    columns: Vec<Column>,
     pub has_rowid: bool,
     pub is_strict: bool,
     pub has_autoincrement: bool,
@@ -2363,17 +2377,75 @@ pub struct BTreeTable {
     pub rowid_alias_conflict_clause: Option<ResolveType>,
     pub has_virtual_columns: bool,
     pub logical_to_physical_map: Vec<usize>,
-    pub(crate) column_dependencies: ResetOnClone<OnceLock<GeneratedColGraph>>,
+    column_dependencies: ResetOnClone<OnceLock<GeneratedColGraph>>,
+}
+
+pub struct ColumnsMut<'a> {
+    table: &'a mut BTreeTable,
+}
+
+impl std::ops::Deref for ColumnsMut<'_> {
+    type Target = Vec<Column>;
+    fn deref(&self) -> &Vec<Column> {
+        &self.table.columns
+    }
+}
+
+impl std::ops::DerefMut for ColumnsMut<'_> {
+    fn deref_mut(&mut self) -> &mut Vec<Column> {
+        &mut self.table.columns
+    }
+}
+
+impl Drop for ColumnsMut<'_> {
+    fn drop(&mut self) {
+        self.table.column_dependencies.0 = OnceLock::new();
+        self.table.has_virtual_columns =
+            self.table.columns.iter().any(|c| c.is_virtual_generated());
+        self.table.logical_to_physical_map =
+            BTreeTable::build_logical_to_physical_map(&self.table.columns);
+    }
 }
 
 impl BTreeTable {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        root_page: i64,
+        name: String,
+        primary_key_columns: Vec<(String, SortOrder)>,
+        columns: Vec<Column>,
+        characteristics: BTreeCharacteristics,
+        unique_sets: Vec<UniqueSet>,
+        foreign_keys: Vec<Arc<ForeignKey>>,
+        check_constraints: Vec<CheckConstraint>,
+        rowid_alias_conflict_clause: Option<ResolveType>,
+    ) -> Self {
+        let has_virtual_columns = columns.iter().any(|c| c.is_virtual_generated());
+        let logical_to_physical_map = Self::build_logical_to_physical_map(&columns);
+        Self {
+            root_page,
+            name,
+            primary_key_columns,
+            columns,
+            has_rowid: characteristics.contains(BTreeCharacteristics::HAS_ROWID),
+            is_strict: characteristics.contains(BTreeCharacteristics::STRICT),
+            has_autoincrement: characteristics.contains(BTreeCharacteristics::HAS_AUTOINCREMENT),
+            unique_sets,
+            foreign_keys,
+            check_constraints,
+            rowid_alias_conflict_clause,
+            has_virtual_columns,
+            logical_to_physical_map,
+            column_dependencies: Default::default(),
+        }
+    }
+
     pub fn columns(&self) -> &[Column] {
         &self.columns
     }
 
-    pub fn columns_mut(&mut self) -> &mut Vec<Column> {
-        self.column_dependencies.0 = OnceLock::new();
-        &mut self.columns
+    pub fn columns_mut(&mut self) -> ColumnsMut<'_> {
+        ColumnsMut { table: self }
     }
 
     /// Create a table reference for TypeCheck where custom type columns have
@@ -2764,16 +2836,14 @@ impl BTreeTable {
     }
 
     pub fn prepare_generated_columns(&mut self) -> Result<()> {
-        self.column_dependencies.0 = OnceLock::new();
-        self.has_virtual_columns = self.columns.iter().any(|c| c.is_virtual_generated());
-        if !self.has_virtual_columns {
-            return Ok(());
-        }
-        for i in 0..self.columns.len() {
-            if self.columns[i].is_virtual_generated() {
-                let mut expr = self.columns[i].generated_expr().cloned().unwrap();
-                resolve_gencol_expr_columns(&mut expr, &self.columns)?;
-                *self.columns[i].generated_expr_mut().unwrap() = expr;
+        {
+            let mut guard = self.columns_mut();
+            for i in 0..guard.len() {
+                if guard[i].is_virtual_generated() {
+                    let mut expr = guard[i].generated_expr().cloned().unwrap();
+                    resolve_gencol_expr_columns(&mut expr, &guard)?;
+                    *guard[i].generated_expr_mut().unwrap() = expr;
+                }
             }
         }
         self.column_graph()?;
@@ -2828,7 +2898,12 @@ impl BTreeTable {
             .column_dependencies
             .0
             .get()
-            .expect("cached_graph was just initialized"))
+            .expect("column_dependencies was just initialized"))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn peek_column_dependencies(&self) -> Option<&GeneratedColGraph> {
+        self.column_dependencies.0.get()
     }
 
     pub(crate) fn columns_affected_by_update(
@@ -5653,22 +5728,22 @@ mod tests {
         let original = BTreeTable::from_sql("CREATE TABLE t(a, b AS (a) VIRTUAL)", 0)?;
         // Force the cache to be populated on the original.
         let _ = original.columns_affected_by_update([0])?;
-        assert!(original.column_dependencies.0.get().is_some());
+        assert!(original.peek_column_dependencies().is_some());
 
         // Clone: ResetOnClone makes the cloned cache empty. We keep a real clone
         // (not a move) because the point of the test is that Clone produces a
         // fresh cache independently from the original.
         let cloned = original.clone();
-        assert!(cloned.column_dependencies.0.get().is_none());
+        assert!(cloned.peek_column_dependencies().is_none());
         // Original's cache is still populated — clone didn't touch it.
-        assert!(original.column_dependencies.0.get().is_some());
+        assert!(original.peek_column_dependencies().is_some());
 
         // The clone still returns correct results — cache rebuilds lazily.
         assert_eq!(
             indices(&cloned.columns_affected_by_update([0])?),
             vec![0, 1]
         );
-        assert!(cloned.column_dependencies.0.get().is_some());
+        assert!(cloned.peek_column_dependencies().is_some());
         Ok(())
     }
 
@@ -5677,11 +5752,11 @@ mod tests {
         let mut t = BTreeTable::from_sql("CREATE TABLE t(a, b AS (a) VIRTUAL)", 0)?;
         // Force the cache to be populated.
         let _ = t.columns_affected_by_update([0])?;
-        assert!(t.column_dependencies.0.get().is_some());
+        assert!(t.peek_column_dependencies().is_some());
 
         // Any access through columns_mut() wipes the cache, even if we don't mutate.
         let _ = t.columns_mut();
-        assert!(t.column_dependencies.0.get().is_none());
+        assert!(t.peek_column_dependencies().is_none());
         Ok(())
     }
 }

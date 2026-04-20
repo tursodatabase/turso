@@ -1411,6 +1411,11 @@ impl ColumnMask {
         }
     }
 
+    pub fn union_with(&mut self, other: &ColumnMask) {
+        self.bitset.union_with(&other.bitset);
+        self.has_rowid_sentinel |= other.has_rowid_sentinel;
+    }
+
     pub fn get(&self, idx: usize) -> bool {
         if idx == ROWID_SENTINEL {
             self.has_rowid_sentinel
@@ -1430,11 +1435,6 @@ impl ColumnMask {
     pub fn iter(&self) -> impl Iterator<Item = usize> + '_ {
         let rowid_sentinel = self.has_rowid_sentinel.then_some(ROWID_SENTINEL);
         self.bitset.iter().chain(rowid_sentinel)
-    }
-
-    pub fn union_with(&mut self, other: &ColumnMask) {
-        self.bitset.union_with(&other.bitset);
-        self.has_rowid_sentinel |= other.has_rowid_sentinel;
     }
 }
 

@@ -1139,7 +1139,10 @@ mod tests {
         MultiIndexBranchParams,
     };
     use crate::{
-        schema::{BTreeTable, ColDef, Column, Index, IndexColumn, Schema, Table, Type},
+        schema::{
+            BTreeCharacteristics, BTreeTable, ColDef, Column, Index, IndexColumn, Schema, Table,
+            Type,
+        },
         translate::{
             optimizer::{
                 access_method::AccessMethodParams,
@@ -1194,23 +1197,17 @@ mod tests {
     }
 
     fn create_btree_table(name: &str, columns: Vec<Column>) -> Arc<BTreeTable> {
-        let logical_to_physical_map = BTreeTable::build_logical_to_physical_map(&columns);
-        Arc::new(BTreeTable {
-            root_page: 1,
-            name: name.to_string(),
-            has_autoincrement: false,
-            primary_key_columns: vec![],
+        Arc::new(BTreeTable::new(
+            1,
+            name.to_string(),
+            vec![],
             columns,
-            has_rowid: true,
-            is_strict: false,
-            unique_sets: vec![],
-            foreign_keys: vec![],
-            check_constraints: vec![],
-            rowid_alias_conflict_clause: None,
-            has_virtual_columns: false,
-            logical_to_physical_map,
-            column_dependencies: Default::default(),
-        })
+            BTreeCharacteristics::HAS_ROWID,
+            vec![],
+            vec![],
+            vec![],
+            None,
+        ))
     }
 
     fn create_table_reference(

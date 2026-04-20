@@ -1,5 +1,5 @@
 use crate::function::WindowFunc;
-use crate::schema::{BTreeTable, Table};
+use crate::schema::{BTreeCharacteristics, BTreeTable, Table};
 use crate::sync::Arc;
 use crate::translate::aggregation::{translate_aggregation_step, AggArgumentSource};
 use crate::translate::collate::{get_collseq_from_expr, CollationSeq};
@@ -539,27 +539,21 @@ impl EmitWindow {
         let window_function_count = window.functions.len();
 
         // An ephemeral table used to buffer rows for the current frame
-        let logical_to_physical_map = BTreeTable::build_logical_to_physical_map(&src_columns);
-        let buffer_table = Arc::new(BTreeTable {
-            root_page: 0,
+        let buffer_table = Arc::new(BTreeTable::new(
+            0,
             // TODO: Generating the name this way may cause collisions with real tables in the
-            //  attached database. Other ephemeral tables are created similarly, so it’s left
+            //  attached database. Other ephemeral tables are created similarly, so it's left
             //  as-is for now. Ideally, there should be a way to mark tables as ephemeral so
             //  they can be handled differently from regular tables.
-            name: format!("buffer_table_{window_name}"),
-            has_rowid: true,
-            primary_key_columns: vec![],
-            columns: src_columns,
-            is_strict: false,
-            unique_sets: vec![],
-            has_autoincrement: false,
-            foreign_keys: vec![],
-            check_constraints: vec![],
-            rowid_alias_conflict_clause: None,
-            has_virtual_columns: false,
-            logical_to_physical_map,
-            column_dependencies: Default::default(),
-        });
+            format!("buffer_table_{window_name}"),
+            vec![],
+            src_columns,
+            BTreeCharacteristics::HAS_ROWID,
+            vec![],
+            vec![],
+            vec![],
+            None,
+        ));
         let cursor_buffer_read =
             program.alloc_cursor_id(CursorType::BTreeTable(buffer_table.clone()));
         let cursor_buffer_write =

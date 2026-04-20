@@ -1,6 +1,6 @@
 use crate::{
     emit_explain,
-    schema::BTreeTable,
+    schema::{BTreeCharacteristics, BTreeTable},
     sync::Arc,
     translate::{
         aggregation::emit_ungrouped_aggregation,
@@ -449,23 +449,17 @@ fn emit_materialized_build_inputs(
                 payload_columns,
             } => build_materialized_input_columns(*num_keys, payload_columns),
         };
-        let logical_to_physical_map = BTreeTable::build_logical_to_physical_map(&columns);
-        let ephemeral_table = Arc::new(BTreeTable {
-            root_page: 0,
-            name: format!("hash_build_input_{internal_id}"),
-            has_rowid: true,
-            has_autoincrement: false,
-            primary_key_columns: vec![],
+        let ephemeral_table = Arc::new(BTreeTable::new(
+            0,
+            format!("hash_build_input_{internal_id}"),
+            vec![],
             columns,
-            is_strict: false,
-            unique_sets: vec![],
-            foreign_keys: vec![],
-            check_constraints: vec![],
-            rowid_alias_conflict_clause: None,
-            has_virtual_columns: false,
-            logical_to_physical_map,
-            column_dependencies: Default::default(),
-        });
+            BTreeCharacteristics::HAS_ROWID,
+            vec![],
+            vec![],
+            vec![],
+            None,
+        ));
         let cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(ephemeral_table.clone()));
 
         // Build a plan that emits only rowids for the build table using the join prefix

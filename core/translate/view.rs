@@ -1,5 +1,7 @@
 use crate::incremental::{compiler::DBSP_CIRCUIT_VERSION, view::IncrementalView};
-use crate::schema::{BTreeTable, SchemaObjectType, DBSP_TABLE_PREFIX, RESERVED_TABLE_PREFIXES};
+use crate::schema::{
+    BTreeCharacteristics, BTreeTable, SchemaObjectType, DBSP_TABLE_PREFIX, RESERVED_TABLE_PREFIXES,
+};
 use crate::storage::pager::CreateBTreeFlags;
 use crate::sync::Arc;
 use crate::translate::{
@@ -99,24 +101,17 @@ pub fn translate_create_materialized_view(
     });
 
     // Create a proper BTreeTable for the cursor with the actual view columns
-    let logical_to_physical_map = BTreeTable::build_logical_to_physical_map(&view_columns);
-    let view_table = Arc::new(BTreeTable {
-        root_page: 0, // Will be set to actual root page after creation
-        name: normalized_view_name.clone(),
-        columns: view_columns,
-        primary_key_columns: vec![], // Materialized views use implicit rowid
-        has_rowid: true,
-        is_strict: false,
-        has_autoincrement: false,
-
-        unique_sets: vec![],
-        foreign_keys: vec![],
-        check_constraints: vec![],
-        rowid_alias_conflict_clause: None,
-        has_virtual_columns: false,
-        logical_to_physical_map,
-        column_dependencies: Default::default(),
-    });
+    let view_table = Arc::new(BTreeTable::new(
+        0, // root_page, will be set to actual root page after creation
+        normalized_view_name.clone(),
+        vec![], // primary_key_columns — materialized views use implicit rowid
+        view_columns,
+        BTreeCharacteristics::HAS_ROWID,
+        vec![],
+        vec![],
+        vec![],
+        None,
+    ));
 
     // Allocate a cursor for writing to the view's btree during population
     let view_cursor_id =

@@ -15,7 +15,7 @@ use crate::{
     function::{AggFunc, Deterministic},
     index_method::IndexMethodCostEstimate,
     numeric::Numeric,
-    schema::{BTreeTable, Index, IndexColumn, Schema, Table, ROWID_SENTINEL},
+    schema::{BTreeCharacteristics, BTreeTable, Index, IndexColumn, Schema, Table, ROWID_SENTINEL},
     translate::{
         insert::ROWID_COLUMN,
         optimizer::{
@@ -944,23 +944,17 @@ fn add_ephemeral_table_to_update_plan(
 ) -> Result<()> {
     let internal_id = program.table_reference_counter.next();
     let columns = vec![(*ROWID_COLUMN).clone()];
-    let logical_to_physical_map = BTreeTable::build_logical_to_physical_map(&columns);
-    let ephemeral_table = Arc::new(BTreeTable {
-        root_page: 0, // Not relevant for ephemeral table definition
-        name: "ephemeral_scratch".to_string(),
-        has_rowid: true,
-        has_autoincrement: false,
-        primary_key_columns: vec![],
+    let ephemeral_table = Arc::new(BTreeTable::new(
+        0, // root_page, not relevant for ephemeral table definition
+        "ephemeral_scratch".to_string(),
+        vec![],
         columns,
-        is_strict: false,
-        unique_sets: vec![],
-        foreign_keys: vec![],
-        check_constraints: vec![],
-        rowid_alias_conflict_clause: None,
-        has_virtual_columns: false,
-        logical_to_physical_map,
-        column_dependencies: Default::default(),
-    });
+        BTreeCharacteristics::HAS_ROWID,
+        vec![],
+        vec![],
+        vec![],
+        None,
+    ));
 
     let temp_cursor_id = program.alloc_cursor_id_keyed(
         CursorKey::table(internal_id),
