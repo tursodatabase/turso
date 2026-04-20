@@ -10624,7 +10624,7 @@ pub fn op_freelist_count(
     _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(FreelistCount { db, dest }, insn);
-    let pager = program.get_pager_from_database_index(db);
+    let pager = program.get_pager_from_database_index(db)?;
     let mv_store = program.connection.mv_store_for_db(*db);
     let count = if mv_store.is_none() {
         if let Some(cached) = pager.get_freelist_pages_cached() {

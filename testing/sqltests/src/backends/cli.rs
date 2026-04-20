@@ -262,7 +262,6 @@ impl CliDatabaseInstance {
             cmd.arg(&self.db_path);
             cmd.arg("-q"); // Quiet mode - suppress banner
             cmd.arg("-m").arg("list"); // List mode for pipe-separated output
-            cmd.arg("--vfs").arg("syscall"); // io_uring can spuriously hang in CI
             cmd.arg("--experimental-views");
             cmd.arg("--experimental-custom-types");
             cmd.arg("--experimental-attach");

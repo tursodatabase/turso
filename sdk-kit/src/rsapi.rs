@@ -613,7 +613,8 @@ impl TursoDatabase {
                 }
                 None => match self.config.path.as_str() {
                     ":memory:" => Arc::new(turso_core::MemoryIO::new()),
-                    _ => Arc::new(turso_core::PlatformIO::new()?),
+                    _ => turso_core::Database::io_for_path(&self.config.path)
+                        .map_err(|e| TursoError::Error(format!("unable to initialize IO: {e}")))?,
                 },
             }
         };
