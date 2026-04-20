@@ -552,19 +552,38 @@ fn emit_add_column_check_validation(
         _ => return Ok(()),
     };
 
-    // Collect CHECK constraints from the column constraints being added.
-    let check_exprs: Vec<(&Option<ast::Name>, &Box<ast::Expr>)> = constraints
+    // Collect CHECK constraints from column-level constraints + domain CHECKs.
+    // Domain CHECKs use `value` as placeholder which must be rewritten to the column name.
+    let mut all_checks: Vec<(Option<String>, Box<ast::Expr>)> = constraints
         .iter()
         .filter_map(|c| {
             if let ast::ColumnConstraint::Check(expr) = &c.constraint {
-                Some((&c.name, expr))
+                Some((
+                    c.name.as_ref().map(|n| n.as_str().to_string()),
+                    expr.clone(),
+                ))
             } else {
                 None
             }
         })
         .collect();
 
-    if check_exprs.is_empty() {
+    if let Ok(Some(resolved)) = resolver
+        .schema()
+        .resolve_type(&column.ty_str, btree.is_strict)
+    {
+        if resolved.is_domain() {
+            for td in &resolved.chain {
+                for dc in &td.domain_checks {
+                    let rewritten =
+                        crate::schema::rewrite_value_to_column(&dc.check, new_column_name);
+                    all_checks.push((dc.name.clone(), rewritten));
+                }
+            }
+        }
+    }
+
+    if all_checks.is_empty() {
         return Ok(());
     }
 
@@ -586,8 +605,8 @@ fn emit_add_column_check_validation(
     });
 
     // Table has rows -- evaluate each CHECK constraint with the default value substituted.
-    for (constraint_name, check_expr) in &check_exprs {
-        let mut substituted = (*check_expr).clone();
+    for (constraint_name, check_expr) in &all_checks {
+        let mut substituted = *check_expr.clone();
 
         // Replace references to the new column with the default value expression.
         let _ = walk_expr_mut(
@@ -629,7 +648,7 @@ fn emit_add_column_check_validation(
 
         // CHECK failed -- halt with constraint error.
         let name = match constraint_name {
-            Some(name) => name.as_str().to_string(),
+            Some(name) => name.clone(),
             None => format!("{check_expr}"),
         };
         program.emit_insn(Insn::Halt {
