@@ -5,7 +5,6 @@ use bitflags::bitflags;
 use indexmap::IndexSet;
 use serde::{Deserialize, Serialize};
 use sql_generation::generation::generated_expr::rename_column_refs_in_expr;
-use sql_generation::generation::generated_expr::rename_column_refs_in_expr;
 use sql_generation::model::query::predicate::expr_to_value;
 use sql_generation::model::query::select::SelectTable;
 use sql_generation::model::{
