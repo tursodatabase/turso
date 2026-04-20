@@ -1470,7 +1470,7 @@ impl Wal for WalFile {
         let frame = page.clone();
         let page_idx = page.get().id;
         let shared_file = self.shared.clone();
-        let complete = Box::new(move |res: Result<(Arc<Buffer>, i32), CompletionError>| {
+        let complete = Box::new(move |res: Result<(Arc<Buffer>, i64), CompletionError>| {
             let Ok((buf, bytes_read)) = res else {
                 tracing::debug!(err = ?res.unwrap_err());
                 page.clear_locked();
@@ -1478,7 +1478,7 @@ impl Wal for WalFile {
                 return None; // IO error already captured in completion
             };
             let buf_len = buf.len();
-            if bytes_read != buf_len as i32 {
+            if bytes_read != buf_len as i64 {
                 tracing::debug!(
                     "WAL short read at offset {offset}, page {page_idx}, frame_id={frame_id}: expected {buf_len} bytes, got {bytes_read}"
                 );
@@ -1539,12 +1539,12 @@ impl Wal for WalFile {
             let io_ctx = self.io_ctx.read();
             io_ctx.encryption_context().cloned()
         };
-        let complete = Box::new(move |res: Result<(Arc<Buffer>, i32), CompletionError>| {
+        let complete = Box::new(move |res: Result<(Arc<Buffer>, i64), CompletionError>| {
             let Ok((buf, bytes_read)) = res else {
                 return None; // IO error already captured in completion
             };
             let buf_len = buf.len();
-            if bytes_read != buf_len as i32 {
+            if bytes_read != buf_len as i64 {
                 tracing::debug!(
                     "short read on WAL frame {frame_id} at offset {offset}: expected {buf_len} bytes, got {bytes_read}"
                 );
@@ -1639,12 +1639,12 @@ impl Wal for WalFile {
 
             let complete = Box::new({
                 let conflict = conflict.clone();
-                move |res: Result<(Arc<Buffer>, i32), CompletionError>| {
+                move |res: Result<(Arc<Buffer>, i64), CompletionError>| {
                     let Ok((buf, bytes_read)) = res else {
                         return None; // IO error already captured in completion
                     };
                     let buf_len = buf.len();
-                    if bytes_read != buf_len as i32 {
+                    if bytes_read != buf_len as i64 {
                         tracing::debug!(
                             "short read on WAL frame validation at offset {offset}, page_id={page_id}: expected {buf_len} bytes, got {bytes_read}"
                         );
@@ -2153,9 +2153,9 @@ impl Wal for WalFile {
         let start_off = self.frame_offset(first_frame_id);
 
         // single completion for the whole batch
-        let total_len: i32 = iovecs.iter().map(|b| b.len() as i32).sum();
+        let total_len: i64 = iovecs.iter().map(|b| b.len() as i64).sum();
         let page_frame_for_cb = page_frame_and_checksum.clone();
-        let cmp = move |res: Result<i32, CompletionError>| {
+        let cmp = move |res: Result<i64, CompletionError>| {
             let Ok(bytes_written) = res else {
                 return;
             };
@@ -2914,13 +2914,13 @@ impl WalFile {
 
         let complete = {
             let buf_slot = buf_slot.clone();
-            Box::new(move |res: Result<(Arc<Buffer>, i32), CompletionError>| {
+            Box::new(move |res: Result<(Arc<Buffer>, i64), CompletionError>| {
                 let Ok((buf, read)) = res else {
                     return None;
                 };
                 let buf_len = buf.len();
                 turso_assert!(
-                    read == buf_len as i32,
+                    read == buf_len as i64,
                     "read bytes does not match expected buffer length",
                     { "read": read, "expected": buf_len, "frame_id": frame_id }
                 );

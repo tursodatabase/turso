@@ -123,7 +123,7 @@ impl DatabaseStorage for DatabaseFile {
                 let read_buffer = r.buf_arc();
                 let original_c = c.clone();
                 let decrypt_complete =
-                    Box::new(move |res: Result<(Arc<Buffer>, i32), CompletionError>| {
+                    Box::new(move |res: Result<(Arc<Buffer>, i64), CompletionError>| {
                         let (buf, bytes_read) = match res {
                             Ok((buf, bytes_read)) => (buf, bytes_read),
                             Err(err) => {
@@ -166,7 +166,7 @@ impl DatabaseStorage for DatabaseFile {
                 let original_c = c.clone();
 
                 let verify_complete =
-                    Box::new(move |res: Result<(Arc<Buffer>, i32), CompletionError>| {
+                    Box::new(move |res: Result<(Arc<Buffer>, i64), CompletionError>| {
                         let (buf, bytes_read) = match res {
                             Ok((buf, bytes_read)) => (buf, bytes_read),
                             Err(err) => {
@@ -303,7 +303,7 @@ mod tests {
     use crate::File;
 
     struct MockFile {
-        read_result: std::result::Result<i32, CompletionError>,
+        read_result: std::result::Result<i64, CompletionError>,
     }
 
     impl File for MockFile {

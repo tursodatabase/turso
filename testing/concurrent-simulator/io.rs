@@ -220,7 +220,7 @@ impl IO for SimulatorIO {
 
 struct PendingCompletion {
     completion: Completion,
-    result: i32,
+    result: i64,
 }
 type PendingQueue = Arc<Mutex<Vec<PendingCompletion>>>;
 
@@ -293,7 +293,7 @@ impl File for SimulatorFile {
         let result = if pos + len <= MAX_FILE_SIZE {
             let mmap = self.mmap.lock().unwrap();
             buffer.as_mut_slice().copy_from_slice(&mmap[pos..pos + len]);
-            len as i32
+            len as i64
         } else {
             0
         };
@@ -324,7 +324,7 @@ impl File for SimulatorFile {
                     sizes.insert(self.path.clone(), *size as u64);
                 }
             }
-            len as i32
+            len as i64
         } else {
             0
         };
@@ -373,7 +373,7 @@ impl File for SimulatorFile {
 
         self.pending.lock().unwrap().push(PendingCompletion {
             completion: c.clone(),
-            result: total_written as i32,
+            result: total_written as i64,
         });
         Ok(c)
     }

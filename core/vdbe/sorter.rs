@@ -663,7 +663,7 @@ impl SortedChunk {
         let stored_buffer_copy = self.buffer.clone();
         let stored_buffer_len_copy = self.buffer_len.clone();
         let total_bytes_read_copy = self.total_bytes_read.clone();
-        let read_complete = Box::new(move |res: Result<(Arc<Buffer>, i32), CompletionError>| {
+        let read_complete = Box::new(move |res: Result<(Arc<Buffer>, i64), CompletionError>| {
             let Ok((buf, bytes_read)) = res else {
                 return None;
             };
@@ -726,13 +726,13 @@ impl SortedChunk {
 
         let buffer_ref_copy = buffer_ref.clone();
         let chunk_io_state_copy = self.io_state.clone();
-        let write_complete = Box::new(move |res: Result<i32, CompletionError>| {
+        let write_complete = Box::new(move |res: Result<i64, CompletionError>| {
             let Ok(bytes_written) = res else {
                 *chunk_io_state_copy.write() = SortedChunkIOState::WriteError;
                 return;
             };
             let buf_len = buffer_ref_copy.len();
-            if bytes_written < buf_len as i32 {
+            if bytes_written < buf_len as i64 {
                 tracing::error!("wrote({bytes_written}) less than expected({buf_len})");
                 *chunk_io_state_copy.write() = SortedChunkIOState::WriteError;
             } else {
