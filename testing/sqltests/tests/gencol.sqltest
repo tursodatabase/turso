@@ -4527,3 +4527,10 @@ test update-deferred-fk-on-child-virtual-column {
 } expect error {
     deferred foreign key constraint failed
 }
+
+test integrity-check-unique-virtual-column {
+    CREATE TABLE t (x INTEGER, a BLOB UNIQUE AS (X'aa'));
+    PRAGMA integrity_check;
+} expect {
+    ok
+}
