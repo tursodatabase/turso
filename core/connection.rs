@@ -7,7 +7,6 @@ use crate::sync::{
     atomic::{AtomicBool, AtomicI32, AtomicI64, AtomicIsize, AtomicU16, AtomicU64, Ordering},
     Arc, RwLock,
 };
-use crate::turso_assert;
 #[cfg(all(feature = "fs", feature = "conn_raw_api"))]
 use crate::types::{WalFrameInfo, WalState};
 #[cfg(feature = "fs")]
@@ -28,6 +27,7 @@ use crate::{
     Parser, Program, QueryMode, QueryRunner, Result, Schema, Statement, SyncMode, TransactionMode,
     Trigger, Value, VirtualTable,
 };
+use crate::{is_memory_like, turso_assert};
 use crate::{MAIN_DB_ID, TEMP_DB_ID};
 use arc_swap::ArcSwap;
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
@@ -558,9 +558,8 @@ impl Connection {
     /// Check if a specific trigger is currently compiling (for recursive trigger prevention)
     pub fn trigger_is_compiling(&self, trigger: &Arc<Trigger>) -> bool {
         let compiling = self.compiling_triggers.read();
-        if let Some(active_trigger) = compiling.iter().find(|t| Arc::ptr_eq(t, trigger)) {
+        if let Some(trigger) = compiling.iter().find(|t| Arc::ptr_eq(t, trigger)) {
             tracing::debug!("Trigger is already compiling: {}", trigger.name);
-            debug_assert!(Arc::ptr_eq(active_trigger, trigger));
             return true;
         }
         false
@@ -1562,9 +1561,7 @@ impl Connection {
             }
         }
 
-        let is_memory_db = self.db.path == ":memory:"
-            || self.db.path.starts_with("file::memory:")
-            || self.db.path.is_empty();
+        let is_memory_db = is_memory_like(&self.db.path);
         let should_checkpoint_on_close = pager
             .wal
             .as_ref()
