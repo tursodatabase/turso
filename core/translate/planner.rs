@@ -20,7 +20,7 @@ use crate::{
     ast::Limit,
     function::Func,
     schema::Table,
-    util::{exprs_are_equivalent, normalize_ident, validate_aggregate_function_tail},
+    util::{exprs_are_equivalent, normalize_ident},
     Result,
 };
 use crate::{
@@ -212,7 +212,11 @@ pub fn resolve_window_and_aggregate_functions(
                 filter_over,
                 order_by,
             } => {
-                validate_aggregate_function_tail(filter_over, order_by)?;
+                if !order_by.is_empty() {
+                    crate::bail_parse_error!(
+                        "ORDER BY clause is not supported yet in aggregate functions"
+                    );
+                }
                 let args_count = args.len();
                 let distinctness = Distinctness::from_ast(distinctness.as_ref());
 
@@ -294,7 +298,6 @@ pub fn resolve_window_and_aggregate_functions(
                 }
             }
             Expr::FunctionCallStar { name, filter_over } => {
-                validate_aggregate_function_tail(filter_over, &[])?;
                 match Func::resolve_function(name.as_str(), 0)? {
                     Some(Func::Agg(f)) => {
                         if let Some(over_clause) = filter_over.over_clause.as_ref() {
