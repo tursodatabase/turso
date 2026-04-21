@@ -34,4 +34,4 @@ QUERY PLAN
 `--SCAN previous_points
    |--SCAN ordered_points AS p1
    `--CORRELATED SCALAR SUBQUERY 1
-      `--SCAN ordered_points AS p2
+      `--SEARCH p2 USING INDEX ephemeral_subquery_t5 (point_key<?)

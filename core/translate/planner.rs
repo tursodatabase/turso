@@ -455,22 +455,6 @@ fn add_aggregate_if_not_exists(
 /// multiple references to the same CTE get independent cursor IDs,
 /// yield registers and so on.
 ///
-/// `count_reference`: Controls whether this call increments the CTE reference count.
-///
-/// **Reference counting determines materialization strategy:**
-/// - ref_count = 1: CTE can use efficient coroutine (no materialization needed)
-/// - ref_count > 1: CTE must be materialized into ephemeral table for sharing
-///
-/// **When to count (true):**
-/// - CTE appears in a FROM/JOIN clause (actual usage site)
-/// - CTE is referenced via outer_query_refs (e.g., in scalar subqueries)
-///
-/// **When NOT to count (false):**
-/// - Pre-planning CTEs for outer_query_refs visibility (making CTEs available
-///   for potential use by nested subqueries - not actual usage)
-/// - Recursively planning CTE dependencies (CTE A references CTE B internally -
-///   B needs to be visible to A's planning, but this isn't a usage from the
-///   main query's perspective)
 #[allow(clippy::too_many_arguments)]
 fn plan_cte(
     cte_idx: usize,
@@ -479,7 +463,7 @@ fn plan_cte(
     resolver: &Resolver,
     program: &mut ProgramBuilder,
     connection: &Arc<crate::Connection>,
-    count_reference: bool,
+    actual_reference: bool,
 ) -> Result<JoinedTable> {
     let cte_def = &cte_definitions[cte_idx];
 
@@ -499,8 +483,8 @@ fn plan_cte(
         }
         // Recursively plan the referenced CTE so it's visible within this CTE's body.
         // Example: WITH a AS (...), b AS (SELECT * FROM a) - when planning b, we need
-        // a to be in scope. But this internal dependency doesn't count as a "reference"
-        // for materialization purposes - only actual usage in the main query counts.
+        // a to be in scope. This visibility-only copy is not itself a read that can
+        // share a materialized result, so it must not be treated as one here.
         let referenced_table = plan_cte(
             ref_idx,
             cte_definitions,
@@ -549,14 +533,9 @@ fn plan_cte(
         Some(cte_def.explicit_columns.as_slice())
     };
 
-    // Track CTE reference count globally for materialization decisions during emission.
-    // Multi-ref CTEs should be materialized; single-ref CTEs can use coroutine.
-    // Only count actual references (FROM/JOIN usage), not pre-planning or recursive deps.
-    if count_reference {
-        program.increment_cte_reference(cte_def.cte_id);
-
-        // Validate explicit column count only on actual references (matching SQLite behavior,
-        // which defers this check until the CTE is used).
+    // SQLite defers explicit column-count validation until the CTE is actually
+    // referenced, so preplanned visibility-only copies must not raise here.
+    if actual_reference {
         if let Some(cols) = explicit_cols {
             let result_col_count = cte_plan.select_result_columns().len();
             if cols.len() != result_col_count {
@@ -657,7 +636,7 @@ pub fn plan_ctes_as_outer_refs(
                 None,
                 program.table_reference_counter.next(),
                 explicit_cols,
-                None, // CTEs in DML don't share materialized data (TODO: implement if needed)
+                None, // DML CTEs don't share materialized data (TODO: implement if needed)
                 materialize_hint,
             )?,
             Plan::Delete(_) | Plan::Update(_) => {
@@ -867,11 +846,6 @@ fn parse_table(
     if let Some(outer_ref) =
         table_references.find_outer_query_ref_by_identifier(&normalized_qualified_name)
     {
-        // If this is a CTE reference (via outer_query_refs), count it for materialization decisions.
-        // This handles scalar subqueries that reference CTEs.
-        if let Some(cte_id) = outer_ref.cte_id {
-            program.increment_cte_reference(cte_id);
-        }
         let alias = maybe_alias.map(|a| normalize_ident(a.name().as_str()));
         // Clone fields we need before dropping the borrow on table_references.
         let cte_select = outer_ref.cte_select.clone();

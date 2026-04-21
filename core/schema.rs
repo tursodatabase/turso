@@ -2985,8 +2985,8 @@ pub struct FromClauseSubquery {
 pub struct FromClauseSubqueryCteMetadata {
     /// Identity shared by all references to the same CTE definition.
     pub id: usize,
-    /// True when this CTE is referenced more than once inside the enclosing
-    /// query tree and therefore must be materialized once and shared.
+    /// True when more than one read in the same query tree can reuse one
+    /// materialized result for this CTE.
     pub shared_materialization: bool,
     /// True for explicit WITH ... AS MATERIALIZED.
     pub materialize_hint: bool,
