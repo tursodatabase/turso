@@ -40,3 +40,24 @@ test concat-blob {
 expect {
     0102
 }
+
+test concat-no-args-error {
+    SELECT concat();
+}
+expect error {
+    wrong number of arguments to function concat()
+}
+
+test concat-ws-no-args-error {
+    SELECT concat_ws();
+}
+expect error {
+    wrong number of arguments to function concat_ws()
+}
+
+test concat-ws-one-arg-error {
+    SELECT concat_ws(',');
+}
+expect error {
+    wrong number of arguments to function concat_ws()
+}
