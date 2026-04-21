@@ -32,7 +32,7 @@ jobs:
       matrix:
         os:
           - blacksmith-4vcpu-ubuntu-2404
-          - macos-latest
+          - blacksmith-6vcpu-macos-latest
           - windows-latest
     env:
       CARGO_TERM_COLOR: always

@@ -18,12 +18,12 @@ jobs:
           artifact-name: linux64
           target: x86_64-unknown-linux-gnu
 
-        - os: macos-latest
+        - os: blacksmith-6vcpu-macos-latest
           make-target: build-rust-macos64
           artifact-name: macos64
           target: x86_64-apple-darwin
 
-        - os: macos-latest
+        - os: blacksmith-6vcpu-macos-latest
           make-target: build-rust-macosarm64
           target: aarch64-apple-darwin
           artifact-name: macosarm64

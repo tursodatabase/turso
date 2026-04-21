@@ -59,7 +59,7 @@ jobs:
     timeout-minutes: ${{ matrix.os == 'windows-latest' && 120 || 30 }}
     strategy:
       matrix:
-        os: [blacksmith-4vcpu-ubuntu-2404, macos-latest, windows-latest]
+        os: [blacksmith-4vcpu-ubuntu-2404, blacksmith-6vcpu-macos-latest, windows-latest]
 
     runs-on: ${{ matrix.os }}
 
