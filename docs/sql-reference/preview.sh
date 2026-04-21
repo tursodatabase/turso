@@ -109,6 +109,7 @@ cat > src/SUMMARY.md << 'EOF'
 - [PRAGMAs](pragmas.md)
 - [Extensions](extensions.md)
 - [Experimental Features](experimental-features.md)
+- [Multi-Process Access](multiprocess-access.md)
 - [Compatibility](compatibility.md)
 EOF
 

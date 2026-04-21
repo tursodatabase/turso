@@ -19,6 +19,7 @@ Some Turso features are still experimental and must be explicitly enabled before
 | Index Methods | `index_method` | [CREATE INDEX ... USING](/docs/sql-reference/statements/create-index#using-clause) for FTS and custom index types |
 | Autovacuum | `autovacuum` | Automatic database file compaction |
 | Attach | `attach` | [ATTACH DATABASE](/docs/sql-reference/statements/attach-database) and [DETACH DATABASE](/docs/sql-reference/statements/detach-database) |
+| Multi-Process WAL | `multiprocess_wal` | [Multi-Process Access](/docs/sql-reference/multiprocess-access) — share a database file between OS processes via a shared WAL coordinator |
 
 ## CLI
 
@@ -54,6 +55,7 @@ let db = Builder::new_local("database.db")
     .experimental_custom_types(true)
     .experimental_index_method(true)
     .experimental_attach(true)
+    .experimental_multiprocess_wal(true)
     .build()?;
 ```
 
