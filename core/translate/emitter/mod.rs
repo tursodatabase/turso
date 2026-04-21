@@ -1653,6 +1653,7 @@ pub(crate) fn emit_columns_and_dependencies(
     cursor_id: usize,
     rowid_reg: usize,
     target_columns: impl IntoIterator<Item = usize>,
+    resolver: &Resolver,
 ) -> Result<DmlColumnContext> {
     let targets: Vec<usize> = target_columns.into_iter().collect();
     let dependencies = table.dependencies_of_columns(targets.iter().copied())?;
@@ -1696,6 +1697,9 @@ pub(crate) fn emit_columns_and_dependencies(
     debug_assert!(targets
         .windows(2)
         .all(|w| { dml_ctx.to_column_reg(w[1]) == dml_ctx.to_column_reg(w[0]) + 1 }));
+
+    gencol::compute_virtual_columns(program, &table.columns_topo_sort()?, &dml_ctx, resolver)?;
+
     Ok(dml_ctx)
 }
 
@@ -1833,33 +1837,16 @@ fn emit_index_column_value_new_image(
         let col_in_table = columns
             .get(idx_col.pos_in_table)
             .expect("column index out of bounds");
-        match col_in_table.generated_type() {
-            GeneratedType::Virtual { ref expr, .. } => {
-                gencol::emit_gencol_expr_from_registers(
-                    program,
-                    expr,
-                    dest_reg,
-                    columns_start_reg,
-                    columns,
-                    resolver,
-                    rowid_reg,
-                    layout,
-                )?;
-                program.emit_column_affinity(dest_reg, col_in_table.affinity());
-            }
-            GeneratedType::NotGenerated => {
-                let src_reg = if col_in_table.is_rowid_alias() {
-                    rowid_reg
-                } else {
-                    layout.to_register(columns_start_reg, idx_col.pos_in_table)
-                };
-                program.emit_insn(Insn::Copy {
-                    src_reg,
-                    dst_reg: dest_reg,
-                    extra_amount: 0,
-                });
-            }
-        }
+        let src_reg = if col_in_table.is_rowid_alias() {
+            rowid_reg
+        } else {
+            layout.to_register(columns_start_reg, idx_col.pos_in_table)
+        };
+        program.emit_insn(Insn::Copy {
+            src_reg,
+            dst_reg: dest_reg,
+            extra_amount: 0,
+        });
     }
     Ok(())
 }
