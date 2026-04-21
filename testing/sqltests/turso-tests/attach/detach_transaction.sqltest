@@ -1,0 +1,24 @@
+@database :default:
+
+# Test detach during active transaction
+test detach-active-transaction {
+    ATTACH DATABASE ':memory:' AS test;
+    CREATE TABLE test.t1 (a INT);
+    BEGIN;
+    SELECT * FROM test.t1;
+    DETACH DATABASE test;
+}
+expect error {
+    is locked
+}
+
+# Test detach without active transaction
+test detach-no-transaction {
+    ATTACH DATABASE ':memory:' AS test2;
+    CREATE TABLE test2.t1 (a INT);
+    BEGIN;
+    ROLLBACK;
+    DETACH DATABASE test2;
+}
+expect success {
+}

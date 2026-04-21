@@ -2434,6 +2434,19 @@ impl Connection {
         let pager = self
             .get_pager_from_database_index(&database_id)
             .expect("attached database should always have a pager");
+
+        let is_locked = if self.get_mv_tx_for_db(database_id).is_some() {
+            true
+        } else {
+            pager.holds_read_lock() || pager.holds_write_lock()
+        };
+
+        if is_locked {
+            return Err(LimboError::InvalidArgument(format!(
+                "database {} is locked", alias
+            )));
+        }
+
         if let Some((tx_id, _mode)) = self.get_mv_tx_for_db(database_id) {
             if let Some(mv_store) = self.mv_store_for_db(database_id) {
                 mv_store.rollback_tx(tx_id, pager.clone(), self, database_id);
