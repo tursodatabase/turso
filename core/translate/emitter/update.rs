@@ -512,12 +512,12 @@ impl UpdateColumnCtx<'_> {
 /// Emit the VDBE instructions that enforce a `NOT NULL` constraint on the
 /// value currently in `target_reg`, honoring the UPDATE's OR conflict clause:
 ///
-/// - `OR IGNORE`  : branch to `skip_row_label` when the value is NULL, leaving
-///                  the existing row untouched.
-/// - `OR REPLACE` : if the column has a DEFAULT, evaluate it into `target_reg`;
-///                  otherwise halt with `SQLITE_CONSTRAINT_NOTNULL`.
+/// - `OR IGNORE`: branch to `skip_row_label` when the value is NULL, leaving
+///   the existing row untouched.
+/// - `OR REPLACE`: if the column has a DEFAULT, evaluate it into `target_reg`;
+///   otherwise halt with `SQLITE_CONSTRAINT_NOTNULL`.
 /// - everything else (ABORT/ROLLBACK/FAIL, or the default): halt with
-///                  `SQLITE_CONSTRAINT_NOTNULL`.
+///   `SQLITE_CONSTRAINT_NOTNULL`.
 #[allow(clippy::too_many_arguments)]
 fn emit_notnull_constraint_check(
     program: &mut ProgramBuilder,
