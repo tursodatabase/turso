@@ -20,5 +20,5 @@ test detach-no-transaction {
     ROLLBACK;
     DETACH DATABASE test2;
 }
-expect success {
+expect {
 }
