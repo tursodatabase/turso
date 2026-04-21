@@ -125,6 +125,7 @@ impl Arbitrary for SelectInner {
             from: Some(from),
             where_clause: Predicate::arbitrary_from(rng, env, &join_table),
             order_by,
+            group_by: None,
         }
     }
 }
@@ -237,6 +238,7 @@ impl Arbitrary for Select {
                     .collect(),
             },
             limit: None,
+            raw_sql_override: None,
         }
     }
 }
@@ -281,10 +283,12 @@ impl Arbitrary for Insert {
                             }),
                             where_clause: Predicate::true_(),
                             order_by: None,
+                            group_by: None,
                         }),
                         compounds: Vec::new(),
                     },
                     limit: None,
+                    raw_sql_override: None,
                 };
             }
 

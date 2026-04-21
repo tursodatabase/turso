@@ -40,6 +40,12 @@ impl Display for ResultColumn {
 pub struct Select {
     pub body: SelectBody,
     pub limit: Option<usize>,
+    /// When set, this raw SQL string is used for Display instead of
+    /// generating from the AST. This allows properties to test SQL
+    /// patterns (like correlated subqueries with GROUP BY) that the
+    /// model's AST builder does not yet support.
+    #[serde(default)]
+    pub raw_sql_override: Option<String>,
 }
 
 impl Select {
@@ -62,10 +68,12 @@ impl Select {
                     from: None,
                     where_clause: Predicate::true_(),
                     order_by: None,
+                    group_by: None,
                 }),
                 compounds: Vec::new(),
             },
             limit: None,
+            raw_sql_override: None,
         }
     }
 
@@ -87,10 +95,12 @@ impl Select {
                     }),
                     where_clause,
                     order_by: None,
+                    group_by: None,
                 }),
                 compounds: Vec::new(),
             },
             limit,
+            raw_sql_override: None,
         }
     }
 
@@ -103,6 +113,31 @@ impl Select {
         Select {
             body,
             limit: left.limit.or(right.limit),
+            raw_sql_override: None,
+        }
+    }
+
+    /// Create a Select that outputs the given raw SQL string verbatim.
+    /// Used for SQL patterns the model AST cannot yet express (e.g.
+    /// correlated subqueries with GROUP BY and table aliases).
+    pub fn raw(sql: String, table_dependency: String) -> Self {
+        Select {
+            body: SelectBody {
+                select: Box::new(SelectInner {
+                    distinctness: Distinctness::All,
+                    columns: vec![ResultColumn::Star],
+                    from: Some(FromClause {
+                        table: SelectTable::Table(table_dependency),
+                        joins: Vec::new(),
+                    }),
+                    where_clause: Predicate::true_(),
+                    order_by: None,
+                    group_by: None,
+                }),
+                compounds: Vec::new(),
+            },
+            limit: None,
+            raw_sql_override: Some(sql),
         }
     }
 
@@ -156,6 +191,8 @@ pub struct SelectInner {
     pub where_clause: Predicate,
     /// `ORDER BY` clause
     pub order_by: Option<OrderBy>,
+    /// `GROUP BY` clause
+    pub group_by: Option<Vec<String>>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -342,7 +379,13 @@ impl Select {
                         .collect(),
                     from: self.body.select.from.as_ref().map(|f| f.to_sql_ast()),
                     where_clause: Some(self.body.select.where_clause.0.clone().into_boxed()),
-                    group_by: None,
+                    group_by: self.body.select.group_by.as_ref().map(|cols| ast::GroupBy {
+                        exprs: cols
+                            .iter()
+                            .map(|c| column_qualified_expr(c).into_boxed())
+                            .collect(),
+                        having: None,
+                    }),
                     window_clause: Vec::new(),
                 },
                 compounds: self
@@ -408,6 +451,9 @@ impl Select {
 
 impl Display for Select {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if let Some(raw) = &self.raw_sql_override {
+            return write!(f, "{raw}");
+        }
         self.to_sql_ast().displayer(&BlankContext).fmt(f)
     }
 }

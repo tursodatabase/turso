@@ -182,6 +182,23 @@ pub enum Property {
     FaultyQuery {
         query: Query,
     },
+    /// CorrelatedSubqueryAggregate tests that correlated subqueries inside
+    /// aggregate functions work correctly with GROUP BY.
+    /// This verifies the fix for bug #6485 where the subquery was evaluated
+    /// during the scan loop and its result register held the value from the
+    /// LAST scanned row by the time the sorter loop ran aggregation.
+    ///
+    /// Execution:
+    ///     SELECT col, COUNT(*) FROM t GROUP BY col ORDER BY col
+    ///     SELECT col, COUNT((SELECT 1 FROM t AS t2 WHERE t2.col = t_outer.col LIMIT 1))
+    ///         FROM t AS t_outer GROUP BY col ORDER BY col
+    ///
+    /// Assertion:
+    /// - Both queries must return the same results
+    CorrelatedSubqueryAggregate {
+        table: String,
+        group_column: String,
+    },
     /// Property used to subsititute a property with its queries only
     Queries {
         queries: Vec<Query>,
@@ -228,7 +245,8 @@ impl Property {
             | Property::UnionAllPreservesCardinality { .. }
             | Property::ReadYourUpdatesBack { .. }
             | Property::TableHasExpectedContent { .. }
-            | Property::AllTableHaveExpectedContent { .. } => None,
+            | Property::AllTableHaveExpectedContent { .. }
+            | Property::CorrelatedSubqueryAggregate { .. } => None,
         }
     }
 }

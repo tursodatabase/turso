@@ -1,0 +1,49 @@
+@database :memory:
+
+# Regression test for #6485: correlated subquery inside aggregate
+# returns wrong grouped result. The subquery was evaluated during the
+# scan loop and its result register held the value from the LAST
+# scanned row by the time the sorter loop ran aggregation.
+
+setup schema {
+    CREATE TABLE t1(grp TEXT, val INTEGER);
+    CREATE TABLE t2(grp TEXT, factor INTEGER);
+    INSERT INTO t1 VALUES ('a',1),('a',2),('b',3),('b',4);
+    INSERT INTO t2 VALUES ('a',10),('b',20);
+}
+
+@setup schema
+test correlated-subquery-in-sum-group-by {
+    SELECT grp, sum((SELECT factor FROM t2 WHERE t2.grp = t1.grp)) FROM t1 GROUP BY grp;
+}
+expect {
+    a|20
+    b|40
+}
+
+@setup schema
+test correlated-subquery-in-count-group-by {
+    SELECT grp, count((SELECT factor FROM t2 WHERE t2.grp = t1.grp)) FROM t1 GROUP BY grp;
+}
+expect {
+    a|2
+    b|2
+}
+
+@setup schema
+test correlated-subquery-in-avg-group-by {
+    SELECT grp, avg((SELECT factor FROM t2 WHERE t2.grp = t1.grp)) FROM t1 GROUP BY grp;
+}
+expect {
+    a|10.0
+    b|20.0
+}
+
+@setup schema
+test correlated-subquery-in-min-max-group-by {
+    SELECT grp, min((SELECT factor FROM t2 WHERE t2.grp = t1.grp)), max((SELECT factor FROM t2 WHERE t2.grp = t1.grp)) FROM t1 GROUP BY grp;
+}
+expect {
+    a|10|10
+    b|20|20
+}

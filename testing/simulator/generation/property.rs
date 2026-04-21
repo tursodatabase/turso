@@ -239,7 +239,8 @@ impl Property {
             | Property::UnionAllPreservesCardinality { .. }
             | Property::ReadYourUpdatesBack { .. }
             | Property::TableHasExpectedContent { .. }
-            | Property::AllTableHaveExpectedContent { .. } => {
+            | Property::AllTableHaveExpectedContent { .. }
+            | Property::CorrelatedSubqueryAggregate { .. } => {
                 unreachable!("No extensional queries")
             }
         }
@@ -928,6 +929,96 @@ impl Property {
                     InteractionBuilder::with_interaction(assertion),
                 ]
             }
+            Property::CorrelatedSubqueryAggregate {
+                table,
+                group_column,
+            } => {
+                let table_dependency = table.clone();
+                let assumption = InteractionType::Assumption(Assertion::new(
+                    format!("table {table} exists"),
+                    {
+                        let table = table.clone();
+                        move |_: &Vec<ResultSet>, env: &mut SimulatorEnv| {
+                            let conn_tables = env.get_conn_tables(connection_index);
+                            if conn_tables.iter().any(|t| t.name == table) {
+                                Ok(Ok(()))
+                            } else {
+                                Ok(Err(format!(
+                                    "table '{table}' not found for CorrelatedSubqueryAggregate"
+                                )))
+                            }
+                        }
+                    },
+                    vec![table_dependency.clone()],
+                ));
+
+                // Reference query: SELECT <col>, COUNT(*) FROM <table> GROUP BY <col> ORDER BY <col>
+                let ref_sql = format!(
+                    "SELECT \"{group_column}\", COUNT(*) FROM \"{table}\" GROUP BY \"{group_column}\" ORDER BY \"{group_column}\""
+                );
+                let select_ref = Select::raw(ref_sql, table.clone());
+                let select_ref_interaction = InteractionType::Query(Query::Select(select_ref));
+
+                // Correlated subquery query:
+                // SELECT <col>, COUNT((SELECT 1 FROM <table> AS t2 WHERE t2.<col> = t_outer.<col> LIMIT 1))
+                //   FROM <table> AS t_outer GROUP BY <col> ORDER BY <col>
+                // The subquery always returns 1 when there is at least one matching row (which is always
+                // true since t_outer's own row matches), so COUNT(...) == COUNT(*).
+                let corr_sql = format!(
+                    "SELECT t_outer.\"{group_column}\", COUNT((SELECT 1 FROM \"{table}\" AS t2 \
+                     WHERE t2.\"{group_column}\" = t_outer.\"{group_column}\" LIMIT 1)) \
+                     FROM \"{table}\" AS t_outer GROUP BY t_outer.\"{group_column}\" \
+                     ORDER BY t_outer.\"{group_column}\""
+                );
+                let select_corr = Select::raw(corr_sql, table.clone());
+                let select_corr_interaction = InteractionType::Query(Query::Select(select_corr));
+
+                let assertion = InteractionType::Assertion(Assertion::new(
+                    format!(
+                        "correlated subquery aggregate GROUP BY on {table}.{group_column} \
+                         should match plain COUNT(*) GROUP BY"
+                    ),
+                    move |stack: &Vec<ResultSet>, _| {
+                        let corr_result = stack.last().unwrap();
+                        let ref_result = stack.get(stack.len() - 2).unwrap();
+                        match (ref_result, corr_result) {
+                            (Ok(ref_rows), Ok(corr_rows)) => {
+                                if ref_rows.len() != corr_rows.len() {
+                                    return Ok(Err(format!(
+                                        "row count mismatch: reference={}, correlated={}",
+                                        ref_rows.len(),
+                                        corr_rows.len()
+                                    )));
+                                }
+                                for (i, (r, c)) in ref_rows.iter().zip(corr_rows.iter()).enumerate()
+                                {
+                                    if r != c {
+                                        return Ok(Err(format!(
+                                            "row {i} mismatch: reference={r:?}, correlated={c:?}"
+                                        )));
+                                    }
+                                }
+                                Ok(Ok(()))
+                            }
+                            (Err(e1), Err(e2)) => {
+                                tracing::debug!("Both queries errored: ref={}, corr={}", e1, e2);
+                                Ok(Ok(()))
+                            }
+                            (Err(e), _) | (_, Err(e)) => {
+                                Err(LimboError::InternalError(e.to_string()))
+                            }
+                        }
+                    },
+                    vec![table_dependency],
+                ));
+
+                vec![
+                    InteractionBuilder::with_interaction(assumption),
+                    InteractionBuilder::with_interaction(select_ref_interaction),
+                    InteractionBuilder::with_interaction(select_corr_interaction),
+                    InteractionBuilder::with_interaction(assertion),
+                ]
+            }
             Property::FsyncNoWait { query } => {
                 vec![InteractionBuilder::with_interaction(
                     InteractionType::FsyncQuery(query.clone()),
@@ -1033,6 +1124,7 @@ impl Property {
                             from: select.body.select.from.clone(),
                             where_clause: p_true,
                             order_by: None,
+                            group_by: None,
                         }),
                         compounds: vec![
                             CompoundSelect {
@@ -1043,6 +1135,7 @@ impl Property {
                                     from: select.body.select.from.clone(),
                                     where_clause: p_false,
                                     order_by: None,
+                                    group_by: None,
                                 }),
                             },
                             CompoundSelect {
@@ -1053,11 +1146,13 @@ impl Property {
                                     from: select.body.select.from.clone(),
                                     where_clause: p_null,
                                     order_by: None,
+                                    group_by: None,
                                 }),
                             },
                         ],
                     },
                     limit: None,
+                    raw_sql_override: None,
                 };
 
                 let select = InteractionType::Query(Query::Select(select.clone()));
@@ -1594,6 +1689,24 @@ fn property_faulty_query<R: rand::Rng + ?Sized>(
     }
 }
 
+fn property_correlated_subquery_aggregate<R: rand::Rng + ?Sized>(
+    rng: &mut R,
+    _query_distr: &QueryDistribution,
+    ctx: &impl GenerationContext,
+    _mvcc: bool,
+) -> Property {
+    assert!(!ctx.tables().is_empty());
+    let table = pick(ctx.tables(), rng);
+    // Pick a random column to GROUP BY
+    let col_idx = pick_index(table.columns.len(), rng);
+    let group_column = table.columns[col_idx].name.clone();
+
+    Property::CorrelatedSubqueryAggregate {
+        table: table.name.clone(),
+        group_column,
+    }
+}
+
 type PropertyGenFunc<R, G> = fn(&mut R, &QueryDistribution, &G, bool) -> Property;
 
 impl PropertyDiscriminants {
@@ -1620,6 +1733,9 @@ impl PropertyDiscriminants {
             }
             PropertyDiscriminants::FsyncNoWait => property_fsync_no_wait,
             PropertyDiscriminants::FaultyQuery => property_faulty_query,
+            PropertyDiscriminants::CorrelatedSubqueryAggregate => {
+                property_correlated_subquery_aggregate
+            }
             PropertyDiscriminants::Queries => {
                 unreachable!("should not try to generate queries property")
             }
@@ -1725,6 +1841,13 @@ impl PropertyDiscriminants {
                     0
                 }
             }
+            PropertyDiscriminants::CorrelatedSubqueryAggregate => {
+                if !ctx.tables().is_empty() {
+                    remaining.select / 3
+                } else {
+                    0
+                }
+            }
             PropertyDiscriminants::Queries => {
                 unreachable!("queries property should not be generated")
             }
@@ -1765,6 +1888,7 @@ impl PropertyDiscriminants {
             PropertyDiscriminants::UnionAllPreservesCardinality => QueryCapabilities::SELECT,
             PropertyDiscriminants::FsyncNoWait => QueryCapabilities::all(),
             PropertyDiscriminants::FaultyQuery => QueryCapabilities::all(),
+            PropertyDiscriminants::CorrelatedSubqueryAggregate => QueryCapabilities::SELECT,
             PropertyDiscriminants::Queries => panic!("queries property should not be generated"),
         }
     }

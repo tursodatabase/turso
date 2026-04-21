@@ -337,6 +337,12 @@ pub fn compute_group_by_sort_order(
 /// These are the base table columns that aggregate expressions depend on.
 /// By storing only these in the GROUP BY sorter (instead of pre-computed expression
 /// results), we reduce sorter record size and avoid redundant B-tree column reads.
+///
+/// Correlated subquery results (`SubqueryResult`) inside aggregate arguments are
+/// also collected as leaf expressions.  Their value is computed per-row during the
+/// scan loop, stored in the sorter, and read back during the sorter loop so that
+/// each sorted row sees the correct subquery result instead of a stale register
+/// value left over from the last scanned row.
 fn collect_agg_leaf_columns(aggregates: &[Aggregate], plan: &SelectPlan) -> Result<Vec<ast::Expr>> {
     let mut leaf_columns: Vec<ast::Expr> = Vec::new();
     for agg in aggregates {
@@ -352,6 +358,23 @@ fn collect_agg_leaf_columns(aggregates: &[Aggregate], plan: &SelectPlan) -> Resu
                         {
                             leaf_columns.push(expr.clone());
                         }
+                        Ok(WalkControl::SkipChildren)
+                    }
+                    // Correlated subquery results must be materialized in the
+                    // sorter so the sorter loop reads the per-row value instead
+                    // of the stale last-scanned register.
+                    ast::Expr::SubqueryResult { subquery_id, .. } => {
+                        let is_correlated = plan
+                            .non_from_clause_subqueries
+                            .iter()
+                            .find(|s| s.internal_id == *subquery_id)
+                            .is_some_and(|s| s.correlated);
+                        if is_correlated
+                            && !leaf_columns.iter().any(|e| exprs_are_equivalent(e, expr))
+                        {
+                            leaf_columns.push(expr.clone());
+                        }
+                        // Skip children — the subquery is an opaque value here.
                         Ok(WalkControl::SkipChildren)
                     }
                     _ => Ok(WalkControl::Continue),
