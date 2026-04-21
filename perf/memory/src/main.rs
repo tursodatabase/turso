@@ -14,6 +14,10 @@ use turso::params::Params;
 
 use crate::measure::{MemoryReport, MemorySnapshot, file_size, take_snapshot};
 
+// Workspace Clippy runs with `--all-features`, which enables `turso`'s
+// mimalloc-backed global allocator. Skip the benchmark-only dhat allocator
+// under Clippy so the lint build does not try to link two allocators.
+#[cfg(not(clippy))]
 #[global_allocator]
 static ALLOC: dhat::Alloc = dhat::Alloc;
 
@@ -98,6 +102,7 @@ struct Args {
 }
 
 fn main() -> Result<()> {
+    #[cfg(not(clippy))]
     let _profiler = dhat::Profiler::new_heap();
 
     tracing_subscriber::fmt()
