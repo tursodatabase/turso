@@ -597,9 +597,9 @@ pub fn translate_condition_expr(
             emit_cond_jump(program, condition_metadata, between_result_reg);
         }
         ast::Expr::Variable(_) => {
-            crate::bail_parse_error!(
-                "Variable as a direct predicate in WHERE clause is not supported"
-            );
+            let reg = program.alloc_register();
+            translate_expr(program, Some(referenced_tables), expr, reg, resolver)?;
+            emit_cond_jump(program, condition_metadata, reg);
         }
         ast::Expr::Name(_) => {
             crate::bail_parse_error!("Name as a direct predicate in WHERE clause is not supported");
