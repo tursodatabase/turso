@@ -43,7 +43,7 @@
 
 #![allow(clippy::arc_with_non_send_sync)]
 
-use crate::{turso_assert, turso_assert_eq, turso_assert_greater_than};
+use crate::{turso_assert, turso_assert_eq};
 use branches::{mark_unlikely, unlikely};
 use bytemuck::{Pod, Zeroable};
 use pack1::{I32BE, U16BE, U32BE};
@@ -1516,6 +1516,7 @@ struct StreamingState {
     last_valid_checksum: (u32, u32),
     last_valid_frame: u64,
     pending_frames: FxHashMap<u64, Vec<u64>>,
+    pending_checksums: FxHashMap<u64, (u32, u32)>,
     page_size: usize,
     use_native_endian: bool,
     header_valid: bool,
@@ -1542,6 +1543,7 @@ impl StreamingWalReader {
                 last_valid_checksum: (0, 0),
                 last_valid_frame: 0,
                 pending_frames: FxHashMap::default(),
+                pending_checksums: FxHashMap::default(),
                 page_size: 0,
                 use_native_endian: false,
                 header_valid: false,
@@ -1744,6 +1746,7 @@ impl StreamingWalReader {
                 .entry(page_no as u64)
                 .or_default()
                 .push(frame_idx);
+            st.pending_checksums.insert(frame_idx, calc);
 
             if db_size > 0 {
                 st.last_valid_frame = st.frame_idx;
@@ -1769,11 +1772,17 @@ impl StreamingWalReader {
         let wfs = self.wal_shared.read();
         {
             let mut frame_cache = wfs.runtime.frame_cache.lock();
+            let mut checksum_cache = wfs.frame_checksums.lock();
             for (page, mut frames) in state.pending_frames.drain() {
                 // Only include frames up to last valid commit
                 frames.retain(|&f| f <= state.last_valid_frame);
                 if !frames.is_empty() {
                     frame_cache.entry(page).or_default().extend(frames);
+                }
+            }
+            for (frame, checksum) in state.pending_checksums.drain() {
+                if frame <= state.last_valid_frame {
+                    checksum_cache.insert(frame, checksum);
                 }
             }
         }
@@ -1796,10 +1805,12 @@ impl StreamingWalReader {
         let max_frame = st.last_valid_frame;
         if max_frame > 0 {
             let mut frame_cache = wfs.runtime.frame_cache.lock();
+            let mut checksum_cache = wfs.frame_checksums.lock();
             for frames in frame_cache.values_mut() {
                 frames.retain(|&f| f <= max_frame);
             }
             frame_cache.retain(|_, frames| !frames.is_empty());
+            checksum_cache.retain(|&f, _| f <= max_frame);
             let header = wfs.metadata.wal_header.lock();
             wfs.runtime.overflow_fallback_coverage.lock().record(
                 header.checkpoint_seq,
@@ -1842,6 +1853,7 @@ pub fn begin_read_wal_frame_raw<F: File + ?Sized>(
     Ok(c)
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn begin_read_wal_frame<F: File + ?Sized>(
     io: &F,
     offset: u64,
@@ -1849,84 +1861,95 @@ pub fn begin_read_wal_frame<F: File + ?Sized>(
     complete: Box<ReadComplete>,
     page_idx: usize,
     io_ctx: &IOContext,
+    expected_checksum: Option<(u32, u32)>,
+    frame_id: u64,
 ) -> Result<Completion> {
     tracing::trace!(
         "begin_read_wal_frame(offset={}, page_idx={})",
         offset,
         page_idx
     );
-    let buf = buffer_pool.get_page();
-    let buf = Arc::new(buf);
+    let wal_buf = Arc::new(buffer_pool.get_wal_frame());
 
-    match io_ctx.encryption_or_checksum() {
+    let original_complete = complete;
+    let wrapper_complete = Box::new(move |res: Result<(Arc<Buffer>, i32), CompletionError>| {
+        let Ok((buf, bytes_read)) = res else {
+            return original_complete(res);
+        };
+        if bytes_read <= WAL_FRAME_HEADER_SIZE as i32 {
+            return original_complete(Ok((buf, bytes_read)));
+        }
+
+        let frame_slice = &buf.as_slice()[..bytes_read as usize];
+        let (header, raw_page) = parse_wal_frame_header(frame_slice);
+
+        if let Some((c1, c2)) = expected_checksum {
+            if header.checksum_1 != c1 || header.checksum_2 != c2 {
+                tracing::error!("WAL checksum mismatch for frame {frame_id}");
+                return original_complete(Err(CompletionError::WalChecksumMismatch {
+                    frame_id,
+                    expected_1: c1,
+                    expected_2: c2,
+                    actual_1: header.checksum_1,
+                    actual_2: header.checksum_2,
+                }));
+            }
+        }
+
+        let payload_len = raw_page.len();
+        let payload_buf = buffer_pool.get_page();
+        let payload_buf = Arc::new(payload_buf);
+        unsafe {
+            std::ptr::copy_nonoverlapping(raw_page.as_ptr(), payload_buf.as_mut_ptr(), payload_len);
+        }
+        original_complete(Ok((payload_buf, payload_len as i32)))
+    });
+
+    let new_complete: Box<ReadComplete> = match io_ctx.encryption_or_checksum() {
         EncryptionOrChecksum::Encryption(ctx) => {
             let encryption_ctx = ctx.clone();
-            let original_complete = complete;
-
-            let decrypt_complete =
-                Box::new(move |res: Result<(Arc<Buffer>, i32), CompletionError>| {
-                    let Ok((encrypted_buf, bytes_read)) = res else {
-                        return original_complete(res);
-                    };
-                    turso_assert_greater_than!(
-                        bytes_read, 0,
-                        "expected to read data for encrypted page",
-                        { "page_idx": page_idx }
-                    );
-                    match encryption_ctx.decrypt_page(encrypted_buf.as_slice(), page_idx) {
-                        Ok(decrypted_data) => {
-                            encrypted_buf
-                                .as_mut_slice()
-                                .copy_from_slice(&decrypted_data);
-                            original_complete(Ok((encrypted_buf, bytes_read)))
-                        }
-                        Err(e) => {
-                            tracing::error!(
-                                "Failed to decrypt WAL frame data for page_idx={page_idx}: {e}"
-                            );
-                            let err = CompletionError::DecryptionError { page_idx };
-                            original_complete(Err(err));
-                            Some(err)
-                        }
+            Box::new(move |res: Result<(Arc<Buffer>, i32), CompletionError>| {
+                let Ok((payload_buf, bytes_read)) = res else {
+                    return wrapper_complete(res);
+                };
+                match encryption_ctx
+                    .decrypt_page(&payload_buf.as_slice()[..bytes_read as usize], page_idx)
+                {
+                    Ok(decrypted_data) => {
+                        payload_buf.as_mut_slice().copy_from_slice(&decrypted_data);
+                        wrapper_complete(Ok((payload_buf, bytes_read)))
                     }
-                });
-
-            let new_completion = Completion::new_read(buf, decrypt_complete);
-            io.pread(offset, new_completion)
+                    Err(_e) => {
+                        let err = CompletionError::DecryptionError { page_idx };
+                        wrapper_complete(Err(err));
+                        Some(err)
+                    }
+                }
+            })
         }
         EncryptionOrChecksum::Checksum(ctx) => {
             let checksum_ctx = ctx.clone();
-            let original_c = complete;
-            let verify_complete =
-                Box::new(move |res: Result<(Arc<Buffer>, i32), CompletionError>| {
-                    let Ok((buf, bytes_read)) = res else {
-                        return original_c(res);
-                    };
-                    if bytes_read <= 0 {
-                        tracing::trace!("Read page {page_idx} with {} bytes", bytes_read);
-                        return original_c(Ok((buf, bytes_read)));
+            Box::new(move |res: Result<(Arc<Buffer>, i32), CompletionError>| {
+                let Ok((payload_buf, bytes_read)) = res else {
+                    return wrapper_complete(res);
+                };
+                match checksum_ctx.verify_checksum(
+                    &mut payload_buf.as_mut_slice()[..bytes_read as usize],
+                    page_idx,
+                ) {
+                    Ok(_) => wrapper_complete(Ok((payload_buf, bytes_read))),
+                    Err(e) => {
+                        wrapper_complete(Err(e));
+                        Some(e)
                     }
+                }
+            })
+        }
+        EncryptionOrChecksum::None => wrapper_complete,
+    };
 
-                    match checksum_ctx.verify_checksum(buf.as_mut_slice(), page_idx) {
-                        Ok(_) => original_c(Ok((buf, bytes_read))),
-                        Err(e) => {
-                            mark_unlikely();
-                            tracing::error!(
-                                "Failed to verify checksum for page_id={page_idx}: {e}"
-                            );
-                            original_c(Err(e));
-                            Some(e)
-                        }
-                    }
-                });
-            let c = Completion::new_read(buf, verify_complete);
-            io.pread(offset, c)
-        }
-        EncryptionOrChecksum::None => {
-            let c = Completion::new_read(buf, complete);
-            io.pread(offset, c)
-        }
-    }
+    let c = Completion::new_read(wal_buf, new_complete);
+    io.pread(offset, c)
 }
 
 pub fn parse_wal_frame_header(frame: &[u8]) -> (WalFrameHeader, &[u8]) {
