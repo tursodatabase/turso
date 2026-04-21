@@ -316,6 +316,7 @@ impl SubqueryOrigin {
 
 /// A query plan is either a SELECT or a DELETE (for now)
 #[derive(Debug, Clone)]
+#[allow(clippy::large_enum_variant)]
 pub enum Plan {
     Select(SelectPlan),
     CompoundSelect {
@@ -710,6 +711,9 @@ impl SelectPlan {
 /// Why an UPDATE/DELETE must gather target rowids first, then apply writes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DmlSafetyReason {
+    /// UPDATE ... FROM computes writes from a joined rowset, so we must
+    /// materialize that rowset before mutating the target table.
+    UpdateFrom,
     /// Triggers exist, so we lock in target rows before writing.
     Trigger,
     /// WHERE has a subquery, so we lock in target rows before writing.
@@ -773,33 +777,78 @@ pub struct DeletePlan {
 }
 
 #[derive(Debug, Clone)]
+pub struct UpdateSetClause {
+    pub column_index: usize,
+    /// Original user-visible SET expression.
+    pub expr: Box<ast::Expr>,
+    /// In UPDATE FROM, SET clause expressions are rewritten to read from the
+    /// scratch table populated before the write loop.
+    pub scratch_table_expr: Option<Box<ast::Expr>>,
+}
+
+impl UpdateSetClause {
+    pub fn new(column_index: usize, expr: Box<ast::Expr>) -> Self {
+        Self {
+            column_index,
+            expr,
+            scratch_table_expr: None,
+        }
+    }
+
+    pub fn emitted_expr(&self) -> &ast::Expr {
+        self.scratch_table_expr.as_deref().unwrap_or(&self.expr)
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct WriteSetPlan {
+    pub select: SelectPlan,
+    pub scratch_table_id: TableInternalId,
+}
+
+#[derive(Debug, Clone)]
 pub struct UpdatePlan {
-    pub table_references: TableReferences,
+    /// The table whose rows this UPDATE mutates.
+    pub target_table: JoinedTable,
+    /// The read-side FROM graph for `UPDATE ... FROM`.
+    ///
+    /// Plain UPDATE statements keep this empty except for any outer-query
+    /// references (for example preplanned CTE definitions) that are still needed
+    /// when binding subqueries later in the pipeline.
+    pub from_tables: TableReferences,
     /// Conflict resolution strategy (e.g., OR IGNORE, OR REPLACE)
     pub or_conflict: Option<ResolveType>,
-    // (column index, new value) pairs
-    pub set_clauses: Vec<(usize, Box<ast::Expr>)>,
+    /// SET clause assignments
+    pub set_clauses: Vec<UpdateSetClause>,
     pub where_clause: Vec<WhereTerm>,
-    pub order_by: Vec<(Box<ast::Expr>, SortOrder, Option<ast::NullsOrder>)>,
     pub limit: Option<Box<Expr>>,
     pub offset: Option<Box<Expr>>,
-    // TODO: optional RETURNING clause
+    /// Optional RETURNING clause.
     pub returning: Option<Vec<ResultSetColumn>>,
-    // whether the WHERE clause is always false
+    /// Whether the WHERE clause is always false.
     pub contains_constant_false_condition: bool,
     pub indexes_to_update: Vec<Arc<Index>>,
-    // If the UPDATE modifies any column that is present in the key of the btree used to iterate over the table (either the table itself or an index),
-    // gather all the target rowids into an ephemeral table, and then use that table as the single JoinedTable for the actual UPDATE loop.
-    // This ensures the keys of the btree used to iterate cannot be changed during the UPDATE loop itself, ensuring all the intended rows actually get
-    // updated and none are skipped.
-    pub ephemeral_plan: Option<SelectPlan>,
-    // For ALTER TABLE turso-db emits appropriate DDL statement in the "updates" cell of CDC table
-    // This field is present only for update plan created for ALTER TABLE when CDC mode has "updates" values
+    /// Prebuilt write-set SELECT for Halloween protection / UPDATE FROM.
+    pub write_set_plan: Option<WriteSetPlan>,
+    /// For ALTER TABLE turso-db emits appropriate DDL statement in the "updates"
+    /// cell of CDC table. This field is present only for update plans created for
+    /// ALTER TABLE when CDC mode has "updates" values.
     pub cdc_update_alter_statement: Option<String>,
     /// Subqueries that appear in the WHERE clause (for non-ephemeral path)
     pub non_from_clause_subqueries: Vec<NonFromClauseSubquery>,
     /// Whether this UPDATE plan uses the safer pre-materialization path, and why.
     pub safety: DmlSafety,
+}
+
+impl UpdatePlan {
+    pub fn build_read_scope_tables(&self) -> TableReferences {
+        let mut read_scope_tables = TableReferences::new(vec![self.target_table.clone()], vec![]);
+        if self.from_tables.right_join_swapped() {
+            read_scope_tables.set_right_join_swapped();
+        }
+        read_scope_tables.extend(self.from_tables.clone());
+        read_scope_tables
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1315,23 +1364,6 @@ impl TableReferences {
         {
             outer_ref.cte_definition_only = true;
         }
-    }
-
-    /// Returns the internal ID and immutable reference to the [Table] with the given identifier,
-    pub fn find_table_and_internal_id_by_identifier(
-        &self,
-        identifier: &str,
-    ) -> Option<(TableInternalId, &Table)> {
-        self.joined_tables
-            .iter()
-            .find(|t| t.identifier == identifier)
-            .map(|t| (t.internal_id, &t.table))
-            .or_else(|| {
-                self.outer_query_refs
-                    .iter()
-                    .find(|t| t.identifier == identifier && !t.cte_definition_only)
-                    .map(|t| (t.internal_id, &t.table))
-            })
     }
 
     /// Returns an immutable reference to the [JoinedTable] with the given internal ID.
