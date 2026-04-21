@@ -1975,7 +1975,7 @@ pub fn translate_expr(
                         ScalarFunc::Concat => {
                             if args.is_empty() {
                                 crate::bail_parse_error!(
-                                    "{} function with no arguments",
+                                    "wrong number of arguments to function {}()",
                                     srf.to_string()
                                 );
                             };
@@ -2000,7 +2000,12 @@ pub fn translate_expr(
                             Ok(target_register)
                         }
                         ScalarFunc::ConcatWs => {
-                            let args = expect_arguments_min!(args, 2, srf);
+                            if args.len() < 2 {
+                                crate::bail_parse_error!(
+                                    "wrong number of arguments to function {}()",
+                                    srf.to_string()
+                                );
+                            }
 
                             let temp_register = program.alloc_registers(args.len() + 1);
                             for (i, arg) in args.iter().enumerate() {
