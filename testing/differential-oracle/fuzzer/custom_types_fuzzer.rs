@@ -1004,9 +1004,10 @@ fn gen_expr_index(
             ))
         }
         CustomColKind::Domain(_) | CustomColKind::CustomType(_) => {
-            // Skip expression indexes on custom type / domain columns for now.
-            // There is a known engine bug where IdxDelete fails to find matching
-            // index entries for ENCODE/DECODE custom type columns.
+            // Skip expression indexes on domain/custom type columns for now.
+            // The pre-encoded default fix handles NULLs correctly, but the
+            // consistency check (scan vs index) can't easily verify custom type
+            // expression indexes since the CAST semantics depend on the type.
             None
         }
     }
