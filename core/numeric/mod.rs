@@ -811,7 +811,14 @@ fn decompose_quote_float(v: f64, precision: usize) -> FloatParts {
     }
 
     if v.is_infinite() {
-        return FloatParts::Special(if v.is_sign_negative() { "-Inf" } else { "Inf" }.to_string());
+        return FloatParts::Special(
+            if v.is_sign_negative() {
+                "-9.0e+999"
+            } else {
+                "9.0e+999"
+            }
+            .to_string(),
+        );
     }
 
     if v == 0.0 {

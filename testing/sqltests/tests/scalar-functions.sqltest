@@ -1498,6 +1498,29 @@ expect {
     1000000000000000.0
 }
 
+test quote-float-positive-infinity {
+    SELECT quote(CAST('1e999' AS REAL))
+}
+expect {
+    9.0e+999
+}
+
+test quote-float-negative-infinity {
+    SELECT quote(CAST('-1e999' AS REAL))
+}
+expect {
+    -9.0e+999
+}
+
+test quote-float-infinity-matches-sqlite-printf {
+    SELECT
+        quote(CAST('1e999' AS REAL)) = printf('%!0.17g', CAST('1e999' AS REAL)),
+        quote(CAST('-1e999' AS REAL)) = printf('%!0.17g', CAST('-1e999' AS REAL));
+}
+expect {
+    1|1
+}
+
 # Regression: QUOTE() should return TEXT type for floats, not REAL
 test quote-float-typeof {
     SELECT typeof(quote(12.34))
