@@ -11,6 +11,7 @@ use std::{
 };
 
 use anyhow::Result;
+use sql_gen::Schema;
 use sql_gen_prop::SqlValue;
 use sql_gen_prop::result::diff_results;
 use turso_core::{Numeric, Value};
@@ -298,26 +299,107 @@ impl DifferentialOracle {
             Some(rusqlite::types::ValueRef::Blob(b)) => SqlValue::Blob(b.to_vec()),
         }
     }
+
+    fn snapshot_query(table: &sql_gen::Table) -> String {
+        format!(
+            "SELECT rowid, * FROM {} ORDER BY rowid",
+            table.qualified_name()
+        )
+    }
+
+    fn verify_table_snapshots(
+        turso_conn: &Arc<turso_core::Connection>,
+        sqlite_conn: &rusqlite::Connection,
+        schema: &Schema,
+        stmt: &GeneratedStatement,
+    ) -> OracleResult {
+        for table in &schema.tables {
+            let snapshot_sql = Self::snapshot_query(table);
+            let turso_rows = Self::execute_turso(turso_conn, &snapshot_sql);
+            let sqlite_rows = Self::execute_sqlite(sqlite_conn, &snapshot_sql);
+            match (turso_rows, sqlite_rows) {
+                (QueryResult::Rows(turso_rows), QueryResult::Rows(sqlite_rows)) => {
+                    let diff = diff_results(&turso_rows, &sqlite_rows);
+                    if !diff.is_empty() {
+                        return OracleResult::Fail(format!(
+                            "Post-DML table snapshot mismatch for {}:\n  SQL: {stmt}\n  Only in Turso: {:?}\n  Only in SQLite: {:?}",
+                            table.qualified_name(),
+                            diff.only_in_first,
+                            diff.only_in_second
+                        ));
+                    }
+                }
+                (QueryResult::Ok, QueryResult::Ok) => {}
+                (QueryResult::Error(turso_err), QueryResult::Error(sqlite_err)) => {
+                    return OracleResult::Fail(format!(
+                        "Post-DML snapshot failed on both engines for {}:\n  SQL: {stmt}\n  Turso: {turso_err}\n  SQLite: {sqlite_err}",
+                        table.qualified_name()
+                    ));
+                }
+                (QueryResult::Error(turso_err), _) => {
+                    return OracleResult::Fail(format!(
+                        "Turso snapshot failed for {} after DML:\n  SQL: {stmt}\n  Error: {turso_err}",
+                        table.qualified_name()
+                    ));
+                }
+                (_, QueryResult::Error(sqlite_err)) => {
+                    return OracleResult::Fail(format!(
+                        "SQLite snapshot failed for {} after DML:\n  SQL: {stmt}\n  Error: {sqlite_err}",
+                        table.qualified_name()
+                    ));
+                }
+                (QueryResult::Rows(turso_rows), QueryResult::Ok) => {
+                    if !turso_rows.is_empty() {
+                        return OracleResult::Fail(format!(
+                            "Turso snapshot returned rows for {} but SQLite returned none:\n  SQL: {stmt}",
+                            table.qualified_name()
+                        ));
+                    }
+                }
+                (QueryResult::Ok, QueryResult::Rows(sqlite_rows)) => {
+                    if !sqlite_rows.is_empty() {
+                        return OracleResult::Fail(format!(
+                            "SQLite snapshot returned rows for {} but Turso returned none:\n  SQL: {stmt}",
+                            table.qualified_name()
+                        ));
+                    }
+                }
+            }
+        }
+
+        OracleResult::Pass
+    }
 }
 
 /// Execute a statement on both databases and check the differential oracle.
 pub fn check_differential(
     turso_conn: &Arc<turso_core::Connection>,
     sqlite_conn: &rusqlite::Connection,
+    schema: &Schema,
     stmt: &GeneratedStatement,
 ) -> OracleResult {
     let turso_result = DifferentialOracle::execute_turso(turso_conn, &stmt.sql);
     let sqlite_result = DifferentialOracle::execute_sqlite(sqlite_conn, &stmt.sql);
 
     let oracle = DifferentialOracle;
-    oracle.check(stmt, &turso_result, &sqlite_result)
+    let direct_result = oracle.check(stmt, &turso_result, &sqlite_result);
+    if !stmt.mutates_data || !direct_result.is_pass() {
+        return direct_result;
+    }
+
+    DifferentialOracle::verify_table_snapshots(turso_conn, sqlite_conn, schema, stmt)
 }
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use core::f64;
 
     use super::*;
+    use crate::memory::MemorySimIO;
+    use sql_gen::{ColumnDef, DataType, SchemaBuilder, Table};
+    use turso_core::Database;
 
     #[test]
     fn test_sql_value_equality() {
@@ -354,6 +436,7 @@ mod tests {
         let stmt = GeneratedStatement {
             sql: "SELECT 1 LIMIT 1".to_string(),
             is_ddl: false,
+            mutates_data: false,
             has_unordered_limit: true,
             unordered_limit_reason: Some("limit_order_by_scalar_subquery".to_string()),
         };
@@ -372,5 +455,63 @@ mod tests {
             }
             other => panic!("expected warning, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn test_check_differential_fails_on_hidden_table_state_mismatch() {
+        let io = Arc::new(MemorySimIO::new(123));
+        let turso_db = Database::open_file_with_flags(
+            io,
+            "oracle-state-mismatch.db",
+            turso_core::OpenFlags::default(),
+            turso_core::DatabaseOpts::new(),
+            None,
+        )
+        .unwrap();
+        let turso_conn = turso_db.connect().unwrap();
+        let sqlite_conn = rusqlite::Connection::open_in_memory().unwrap();
+
+        let schema = SchemaBuilder::new()
+            .table(Table::new(
+                "t",
+                vec![
+                    ColumnDef::new("id", DataType::Integer).primary_key(),
+                    ColumnDef::new("v", DataType::Integer),
+                ],
+            ))
+            .build();
+
+        for sql in [
+            "CREATE TABLE t(id INTEGER PRIMARY KEY, v INTEGER)",
+            "INSERT INTO t VALUES (1, 10)",
+        ] {
+            assert!(matches!(
+                DifferentialOracle::execute_turso(&turso_conn, sql),
+                QueryResult::Ok
+            ));
+            assert!(matches!(
+                DifferentialOracle::execute_sqlite(&sqlite_conn, sql),
+                QueryResult::Ok
+            ));
+        }
+
+        assert!(matches!(
+            DifferentialOracle::execute_turso(&turso_conn, "UPDATE t SET v = 11 WHERE id = 1"),
+            QueryResult::Ok
+        ));
+
+        let stmt = GeneratedStatement {
+            sql: "UPDATE t SET v = v WHERE id = 999".to_string(),
+            is_ddl: false,
+            mutates_data: true,
+            has_unordered_limit: false,
+            unordered_limit_reason: None,
+        };
+
+        let result = check_differential(&turso_conn, &sqlite_conn, &schema, &stmt);
+        assert!(
+            result.is_fail(),
+            "post-DML state verification should catch hidden row mismatches"
+        );
     }
 }
