@@ -6269,6 +6269,16 @@ pub(crate) fn get_expr_affinity_info(
                     }
                 }
             }
+            // SELF_TABLE fallback: during DML expression index evaluation,
+            // referenced_tables is None but column affinities are available
+            // via the resolver's self_table_column_affinities.
+            if table.is_self_table() {
+                if let Some(resolver) = resolver {
+                    if let Some(aff) = resolver.self_table_column_affinities.get(*column) {
+                        return ExprAffinityInfo::with_affinity(*aff);
+                    }
+                }
+            }
             ExprAffinityInfo::no_affinity()
         }
         ast::Expr::RowId { .. } => ExprAffinityInfo::with_affinity(Affinity::Integer),
