@@ -185,6 +185,12 @@ expect { 1 }
 test glob-57 { SELECT glob('[-c]', 'x'); }
 expect { 0 }
 
+test glob-embedded-nul-1 { SELECT 'a' || char(0) || 'b' GLOB 'a?b'; }
+expect { 0 }
+
+test glob-embedded-nul-2 { SELECT 'a' || char(0) || 'b' GLOB 'a??'; }
+expect { 0 }
+
 # Unenclosed bracket tests (unrolled from foreach loop)
 test glob-unenclosed-1 { SELECT glob('abc[', 'abc['); }
 expect { 0 }

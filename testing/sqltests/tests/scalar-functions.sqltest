@@ -1288,6 +1288,17 @@ expect {
     |null
 }
 
+test substr-embedded-nul {
+    SELECT hex(substr('a' || char(0) || 'b' || char(0) || 'c', 1, 2));
+    SELECT hex(substr('a' || char(0) || 'b' || char(0) || 'c', 2, 1));
+    SELECT hex(substr('a' || char(0) || 'b' || char(0) || 'c', 3, 1));
+}
+expect {
+    61
+
+
+}
+
 test typeof-null {
     SELECT typeof(null);
 }

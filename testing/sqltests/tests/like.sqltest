@@ -125,6 +125,15 @@ expect {
     0
 }
 
+test like-embedded-nul {
+    SELECT 'a' || char(0) || 'b' LIKE 'a_b';
+    SELECT 'a' || char(0) || 'b' LIKE 'a__';
+}
+expect {
+    0
+    0
+}
+
 test like-fn-esc-1 {
     SELECT like('abcX%', 'abc%' , 'X')
 }
@@ -377,4 +386,3 @@ test like-perf {
 expect {
    0
 }
-
