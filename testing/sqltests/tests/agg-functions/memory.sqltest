@@ -151,11 +151,11 @@ expect {
 @cross-check-integrity
 test filter-avg {
     CREATE TABLE t(x INTEGER, grp TEXT);
-    INSERT INTO t VALUES (10, 'a'), (20, 'a'), (30, 'b'), (40, 'b');
+    INSERT INTO t VALUES (11, 'a'), (20, 'a'), (30, 'b'), (40, 'b');
     SELECT AVG(x), AVG(x) FILTER (WHERE grp = 'a') FROM t;
 }
 expect {
-    25.0|15.0
+    25.25|15.5
 }
 
 @cross-check-integrity
@@ -171,11 +171,11 @@ expect {
 @cross-check-integrity
 test filter-total {
     CREATE TABLE t(x REAL, grp TEXT);
-    INSERT INTO t VALUES (1.5, 'a'), (2.5, 'a'), (3.5, 'b');
+    INSERT INTO t VALUES (1.5, 'a'), (2.3, 'a'), (3.5, 'b');
     SELECT TOTAL(x), TOTAL(x) FILTER (WHERE grp = 'a') FROM t;
 }
 expect {
-    7.5|4.0
+    7.3|3.8
 }
 
 @cross-check-integrity
@@ -202,16 +202,16 @@ expect {
 @cross-check-integrity
 test filter-multiple-different-conditions {
     CREATE TABLE t(val INTEGER, cat TEXT);
-    INSERT INTO t VALUES (1, 'x'), (2, 'y'), (3, 'x'), (4, 'y'), (5, 'x');
+    INSERT INTO t VALUES (1, 'x'), (2, 'y'), (4, 'x'), (5, 'y'), (7, 'x');
     SELECT
         COUNT(*) FILTER (WHERE cat = 'x'),
         COUNT(*) FILTER (WHERE cat = 'y'),
         SUM(val) FILTER (WHERE val > 2),
-        AVG(val) FILTER (WHERE val <= 3)
+        AVG(val) FILTER (WHERE val <= 2)
     FROM t;
 }
 expect {
-    3|2|12|2.0
+    3|2|16|1.5
 }
 
 @cross-check-integrity
@@ -385,8 +385,8 @@ expect {
 
 @cross-check-integrity
 test filter-all-agg-types-same-table {
-    CREATE TABLE t(x INTEGER, flag INTEGER);
-    INSERT INTO t VALUES (5, 1), (10, 0), (15, 1), (20, 0), (25, 1);
+    CREATE TABLE t(x REAL, flag INTEGER);
+    INSERT INTO t VALUES (5.5, 1), (10.2, 0), (15.3, 1), (20.1, 0), (25.7, 1);
     SELECT
         COUNT(x) FILTER (WHERE flag = 1),
         SUM(x) FILTER (WHERE flag = 1),
@@ -397,7 +397,7 @@ test filter-all-agg-types-same-table {
     FROM t;
 }
 expect {
-    3|45|15.0|5|25|45.0
+    3|46.5|15.5|5.5|25.7|46.5
 }
 
 @cross-check-integrity
