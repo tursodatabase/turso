@@ -4,7 +4,7 @@ use crate::{turso_assert, turso_assert_greater_than_or_equal};
 use super::{
     expr::{walk_expr, walk_expr_mut},
     plan::{
-        Aggregate, ColumnUsedMask, Distinctness, EvalAt, IterationDirection, JoinInfo,
+        Aggregate, ColumnMask, ColumnUsedMask, Distinctness, EvalAt, IterationDirection, JoinInfo,
         JoinOrderMember, JoinType as PlanJoinType, JoinedTable, Operation, OuterQueryReference,
         Plan, QueryDestination, ResultSetColumn, Scan, TableReferences, WhereTerm,
     },
@@ -498,6 +498,7 @@ fn plan_cte(
             identifier: referenced_table.identifier.clone(),
             internal_id: referenced_table.internal_id,
             table: referenced_table.table.clone(),
+            using_dedup_hidden_cols: referenced_table.using_dedup_hidden_cols(),
             col_used_mask: ColumnUsedMask::default(),
             cte_select: None,
             cte_explicit_columns: vec![],
@@ -653,10 +654,11 @@ pub fn plan_ctes_as_outer_refs(
             identifier: cte_name,
             internal_id: joined_table.internal_id,
             table: joined_table.table,
+            using_dedup_hidden_cols: ColumnMask::default(),
             col_used_mask: ColumnUsedMask::default(),
             cte_select: Some(cte_select_ast),
             cte_explicit_columns: explicit_columns,
-            cte_id: None, // DML CTEs don't track CTE sharing (TODO: implement if needed)
+            cte_id: None, // DML CTEs don't share materialized data (TODO: implement if needed)
             cte_definition_only: true,
             rowid_referenced: false,
             scope_depth: 0,
@@ -723,6 +725,7 @@ fn parse_from_clause_table(
                     identifier: cte_def.name.clone(),
                     internal_id: cte_table.internal_id,
                     table: cte_table.table,
+                    using_dedup_hidden_cols: ColumnMask::default(),
                     col_used_mask: ColumnUsedMask::default(),
                     cte_select: Some(cte_def.select.clone()),
                     cte_explicit_columns: cte_def.explicit_columns.clone(),
@@ -1254,6 +1257,7 @@ pub fn parse_from(
                     identifier: cte_def.name.clone(),
                     internal_id: cte_table.internal_id,
                     table: cte_table.table,
+                    using_dedup_hidden_cols: ColumnMask::default(),
                     col_used_mask: ColumnUsedMask::default(),
                     cte_select: Some(cte_def.select.clone()),
                     cte_explicit_columns: cte_def.explicit_columns.clone(),
