@@ -663,6 +663,11 @@ pub struct SelectPlan {
     /// When set, this query is a simple aggregate (COUNT(*), MIN, or MAX)
     /// that can be satisfied without a full table scan.
     pub simple_aggregate: Option<SimpleAggregate>,
+    /// Parameters from EXISTS subquery result columns that were dropped during
+    /// semi/anti-join unnesting. These need to be registered in the program's
+    /// parameter list even though no code is emitted for them, so that bind-time
+    /// validation (`has_slot`) succeeds.
+    pub phantom_params: Vec<ast::Variable>,
 }
 
 impl SelectPlan {

@@ -1078,6 +1078,7 @@ fn add_ephemeral_table_to_update_plan(
             ephemeral_subs
         },
         simple_aggregate: None,
+        phantom_params: vec![],
     };
 
     plan.ephemeral_plan = Some(ephemeral_plan);

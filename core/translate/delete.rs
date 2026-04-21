@@ -396,6 +396,7 @@ fn ensure_delete_uses_rowset(program: &mut ProgramBuilder, plan: &mut DeletePlan
         input_cardinality_hint: None,
         estimated_output_rows: None,
         simple_aggregate: None,
+        phantom_params: vec![],
     };
     plan.rowset_plan = Some(rowset_plan);
 }

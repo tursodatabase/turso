@@ -358,6 +358,7 @@ fn prepare_one_select_plan(
                 input_cardinality_hint: None,
                 estimated_output_rows: None,
                 simple_aggregate: None,
+                phantom_params: vec![],
             };
 
             let mut windows = Vec::with_capacity(window_clause.len());
@@ -788,6 +789,7 @@ fn prepare_one_select_plan(
                 input_cardinality_hint: None,
                 estimated_output_rows: None,
                 simple_aggregate: None,
+                phantom_params: vec![],
             };
 
             validate_expr_correct_column_counts(&plan)?;

@@ -3813,15 +3813,7 @@ pub fn translate_expr(
             }
         },
         ast::Expr::Variable(variable) => {
-            let index = usize::try_from(variable.index.get())
-                .expect("u32 variable index must fit into usize")
-                .try_into()
-                .expect("variable index must be non-zero");
-            if let Some(name) = variable.name.as_deref() {
-                program.parameters.push_named_at(name, index);
-            } else {
-                program.parameters.push_index(index);
-            }
+            let index = program.register_variable(variable);
             program.emit_insn(Insn::Variable {
                 index,
                 dest: target_register,
