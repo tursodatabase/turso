@@ -1076,6 +1076,8 @@ pub fn op_open_read(
         insn
     );
 
+    invalidate_deferred_seeks_for_cursor(state, *cursor_id);
+
     let pager = program.get_pager_from_database_index(db)?;
     let mv_store = program.connection.mv_store_for_db(*db);
 
@@ -9988,6 +9990,7 @@ pub fn op_open_write(
         },
         insn
     );
+    invalidate_deferred_seeks_for_cursor(state, *cursor_id);
     if program.connection.is_readonly(*db) {
         return Err(LimboError::ReadOnly);
     }
@@ -10138,6 +10141,22 @@ pub fn op_copy(
     }
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
+}
+
+/// Reopening a cursor slot invalidates any deferred seek that points to it or
+/// uses it as the driving index cursor. For example, UPDATE ... FROM may use a
+/// target-table cursor in the collection phase behind a DeferredSeek, then
+/// reopen that same slot for the write phase. If the stale deferred seek
+/// survives, the first Column/RowId read in the write loop can jump back to the
+/// collection-phase index cursor and read the wrong row.
+fn invalidate_deferred_seeks_for_cursor(state: &mut ProgramState, cursor_id: usize) {
+    for deferred_seek in &mut state.deferred_seeks {
+        if let Some(ds) = deferred_seek {
+            if ds.index_cursor_id == cursor_id || ds.table_cursor_id == cursor_id {
+                *deferred_seek = None;
+            }
+        }
+    }
 }
 
 pub fn op_create_btree(
@@ -11509,15 +11528,7 @@ pub fn op_open_ephemeral(
             let btree_cursor = cursor.as_btree_mut();
             btree_cursor.set_null_flag(false);
             return_if_io!(btree_cursor.clear_btree());
-            // iterate over existing deferred seeks and clear them as well,
-            // as any deferred seek on this cursor is now invalid.
-            for deferred_seek in &mut state.deferred_seeks {
-                if let Some(ds) = deferred_seek {
-                    if ds.index_cursor_id == cursor_id || ds.table_cursor_id == cursor_id {
-                        *deferred_seek = None;
-                    }
-                }
-            }
+            invalidate_deferred_seeks_for_cursor(state, cursor_id);
             state.op_open_ephemeral_state = OpOpenEphemeralState::RewindExisting;
         }
         OpOpenEphemeralState::RewindExisting => {
