@@ -1,0 +1,69 @@
+@database :memory:
+
+@cross-check-integrity
+test partial-index-affinity-insert {
+    CREATE TABLE t(a INTEGER, b TEXT);
+    CREATE INDEX idx ON t(b) WHERE a < '2';
+    INSERT INTO t VALUES(10, 'ten');
+    INSERT INTO t VALUES(1, 'one');
+    INSERT INTO t VALUES(20, 'twenty');
+    SELECT b FROM t WHERE a < '2' ORDER BY b;
+}
+expect {
+    one
+}
+
+@cross-check-integrity
+test partial-index-affinity-insert-text-column {
+    CREATE TABLE t2(x TEXT, y INTEGER);
+    CREATE INDEX idx2 ON t2(y) WHERE x > 5;
+    INSERT INTO t2 VALUES('abc', 1);
+    INSERT INTO t2 VALUES('3', 2);
+    INSERT INTO t2 VALUES('100', 3);
+    SELECT y FROM t2 WHERE x > 5 ORDER BY y;
+}
+expect {
+    1
+}
+
+@cross-check-integrity
+test partial-index-affinity-update {
+    CREATE TABLE t3(a INTEGER, b TEXT, c INT);
+    CREATE INDEX idx3 ON t3(b) WHERE a < '2';
+    INSERT INTO t3 VALUES(10, 'ten', 1);
+    INSERT INTO t3 VALUES(1, 'one', 2);
+    UPDATE t3 SET a = 0 WHERE b = 'ten';
+    SELECT b FROM t3 WHERE a < '2' ORDER BY b;
+}
+expect {
+    one
+    ten
+}
+
+@cross-check-integrity
+test partial-index-affinity-upsert {
+    CREATE TABLE t4(id INTEGER PRIMARY KEY, a INTEGER, b TEXT);
+    CREATE INDEX idx4 ON t4(b) WHERE a < '2';
+    INSERT INTO t4 VALUES(1, 10, 'ten');
+    INSERT INTO t4 VALUES(2, 1, 'one');
+    INSERT INTO t4 VALUES(1, 0, 'ten') ON CONFLICT(id) DO UPDATE SET a = excluded.a;
+    SELECT b FROM t4 WHERE a < '2' ORDER BY b;
+}
+expect {
+    one
+    ten
+}
+
+@cross-check-integrity
+test expression-index-affinity {
+    CREATE TABLE t5(a INTEGER, b TEXT);
+    CREATE INDEX idx5 ON t5(CASE WHEN a < '2' THEN 'small' ELSE 'big' END);
+    INSERT INTO t5 VALUES(1, 'one');
+    INSERT INTO t5 VALUES(10, 'ten');
+    INSERT INTO t5 VALUES(20, 'twenty');
+    SELECT a, b FROM t5 WHERE CASE WHEN a < '2' THEN 'small' ELSE 'big' END = 'big' ORDER BY a;
+}
+expect {
+    10|ten
+    20|twenty
+}

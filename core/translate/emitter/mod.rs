@@ -151,6 +151,11 @@ pub struct Resolver<'a> {
     /// mechanism, but operates as a side-channel since limbo rewrites the AST rather
     /// than redirecting column reads at codegen time.
     pub register_affinities: HashMap<usize, Affinity>,
+    /// Column affinities for the SELF_TABLE context (DML expression index evaluation).
+    /// Indexed by table column position. Populated alongside `register_affinities`
+    /// so that `get_expr_affinity_info` can resolve `Expr::Column { SELF_TABLE }`
+    /// affinities when `referenced_tables` is `None`.
+    pub self_table_column_affinities: Vec<Affinity>,
     /// Affinity metadata for planned scalar subqueries keyed by their internal ID.
     /// This lets comparison affinity follow SQLite rules for expressions like
     /// `(SELECT text_col FROM ...) > some_numeric_expr`.
@@ -217,6 +222,7 @@ impl<'a> Resolver<'a> {
             expr_to_reg_cache_enabled: false,
             expr_to_reg_cache: Vec::new(),
             register_affinities: HashMap::default(),
+            self_table_column_affinities: Vec::new(),
             subquery_affinities: RefCell::new(HashMap::default()),
             enable_custom_types,
             dqs_dml,
@@ -244,6 +250,7 @@ impl<'a> Resolver<'a> {
             expr_to_reg_cache_enabled: false,
             expr_to_reg_cache: Vec::new(),
             register_affinities: HashMap::default(),
+            self_table_column_affinities: Vec::new(),
             subquery_affinities: RefCell::new(self.subquery_affinities.borrow().clone()),
             enable_custom_types: self.enable_custom_types,
             dqs_dml: self.dqs_dml,
@@ -263,6 +270,7 @@ impl<'a> Resolver<'a> {
             expr_to_reg_cache_enabled: self.expr_to_reg_cache_enabled,
             expr_to_reg_cache: self.expr_to_reg_cache.clone(),
             register_affinities: self.register_affinities.clone(),
+            self_table_column_affinities: self.self_table_column_affinities.clone(),
             subquery_affinities: RefCell::new(self.subquery_affinities.borrow().clone()),
             enable_custom_types: self.enable_custom_types,
             dqs_dml: self.dqs_dml,
