@@ -3893,29 +3893,73 @@ pub fn op_savepoint(
             // cached schema cookie and check if a schema reparse is needed.
             pager.set_schema_cookie(None);
             let in_memory_version = conn.schema.read().schema_version;
+            let mv_snapshot_cookie = mv_store.as_ref().and_then(|mv_store| {
+                conn.get_mv_tx_id().and_then(|tx_id| {
+                    mv_store
+                        .with_header(|h| h.schema_cookie.get(), Some(&tx_id))
+                        .ok()
+                })
+            });
             let pager_ref = conn.pager.load().clone();
-            match pager_ref
-                .io
-                .block(|| pager.with_header(|h| h.schema_cookie.get()))
-            {
+            let current_cookie = if let Some(cookie) = mv_snapshot_cookie {
+                Ok(cookie)
+            } else {
+                pager_ref
+                    .io
+                    .block(|| pager.with_header(|h| h.schema_cookie.get()))
+            };
+            match current_cookie {
                 Ok(on_disk_cookie) if in_memory_version != on_disk_cookie => {
+                    tracing::debug!(
+                        tx_state = ?conn.get_tx_state(),
+                        mv_tx_id = ?conn.get_mv_tx_id(),
+                        in_memory_version,
+                        pager_cookie = on_disk_cookie,
+                        mv_snapshot_cookie = ?mv_snapshot_cookie,
+                        "savepoint rollback: schema cookie mismatch, reparsing schema"
+                    );
                     // Schema was modified during the savepoint. Try to reparse
                     // from the restored database pages. If that fails (e.g. the
                     // database was empty at the savepoint), use an empty schema.
-                    if conn.reparse_schema().is_err() {
+                    if let Err(err) = conn.reparse_schema() {
+                        tracing::debug!(
+                            tx_state = ?conn.get_tx_state(),
+                            mv_tx_id = ?conn.get_mv_tx_id(),
+                            in_memory_version,
+                            pager_cookie = on_disk_cookie,
+                            mv_snapshot_cookie = ?mv_snapshot_cookie,
+                            error = %err,
+                            "savepoint rollback: reparse_schema failed, resetting schema to empty"
+                        );
                         conn.with_schema_mut(|schema| {
                             *schema = Schema::new();
                         });
                     }
                 }
                 Err(_) => {
+                    tracing::debug!(
+                        tx_state = ?conn.get_tx_state(),
+                        mv_tx_id = ?conn.get_mv_tx_id(),
+                        in_memory_version,
+                        mv_snapshot_cookie = ?mv_snapshot_cookie,
+                        "savepoint rollback: schema cookie unreadable, resetting schema to empty"
+                    );
                     // Header page is not readable (database empty after rollback).
                     // Reset to an empty schema.
                     conn.with_schema_mut(|schema| {
                         *schema = Schema::new();
                     });
                 }
-                _ => {} // Schema unchanged, nothing to do.
+                Ok(on_disk_cookie) => {
+                    tracing::debug!(
+                        tx_state = ?conn.get_tx_state(),
+                        mv_tx_id = ?conn.get_mv_tx_id(),
+                        in_memory_version,
+                        pager_cookie = on_disk_cookie,
+                        mv_snapshot_cookie = ?mv_snapshot_cookie,
+                        "savepoint rollback: schema cookie unchanged"
+                    );
+                }
             }
 
             state.pc += 1;
