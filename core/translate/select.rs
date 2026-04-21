@@ -1,7 +1,7 @@
 use super::emitter::{emit_program, TranslateCtx};
 use super::plan::{
     select_star, Distinctness, InSeekSource, JoinOrderMember, Operation, OuterQueryReference,
-    QueryDestination, Search, TableReferences, WhereTerm, Window,
+    QueryDestination, Search, TableReferences, Window,
 };
 use crate::schema::Table;
 use crate::sync::Arc;
@@ -13,8 +13,8 @@ use crate::translate::group_by::compute_group_by_sort_order;
 use crate::translate::optimizer::optimize_plan;
 use crate::translate::plan::{GroupBy, Plan, ResultSetColumn, SelectPlan, SubqueryState};
 use crate::translate::planner::{
-    break_predicate_at_and_boundaries, parse_from, parse_limit, parse_where,
-    plan_ctes_as_outer_refs, resolve_window_and_aggregate_functions,
+    append_vtab_predicates_to_where_clause, break_predicate_at_and_boundaries, parse_from,
+    parse_limit, parse_where, plan_ctes_as_outer_refs, resolve_window_and_aggregate_functions,
 };
 use crate::translate::result_row::emit_select_result;
 use crate::translate::subquery::{plan_subqueries_from_select_plan, plan_subqueries_from_values};
@@ -1027,48 +1027,13 @@ fn add_vtab_predicates_to_where_clause(
     plan: &mut SelectPlan,
     resolver: &Resolver,
 ) -> Result<()> {
-    for expr in vtab_predicates.iter_mut() {
-        bind_and_rewrite_expr(
-            expr,
-            Some(&mut plan.table_references),
-            Some(&plan.result_columns),
-            resolver,
-            BindingBehavior::TryCanonicalColumnsFirst,
-        )?;
-    }
-    for expr in vtab_predicates.drain(..) {
-        // Virtual table argument predicates (e.g. the 't2' in pragma_table_info('t2'))
-        // must be associated with the virtual table's outer join context if the table is
-        // the RHS of a LEFT JOIN. Otherwise the optimizer may incorrectly simplify the
-        // LEFT JOIN into an INNER JOIN, breaking NULL row emission for unmatched rows.
-        let from_outer_join = vtab_predicate_table_id(&expr).and_then(|table_id| {
-            plan.table_references
-                .find_joined_table_by_internal_id(table_id)
-                .and_then(|t| {
-                    t.join_info
-                        .as_ref()
-                        .and_then(|ji| ji.is_outer().then_some(table_id))
-                })
-        });
-        plan.where_clause.push(WhereTerm {
-            expr,
-            from_outer_join,
-            consumed: false,
-        });
-    }
-    Ok(())
-}
-
-/// Extract the table internal_id from a virtual table argument predicate.
-/// These are always of the form `Column { table, .. } = literal` or `IsNull(Column { table, .. })`.
-fn vtab_predicate_table_id(expr: &Expr) -> Option<ast::TableInternalId> {
-    match expr {
-        Expr::Binary(lhs, _, _) | Expr::IsNull(lhs) => match lhs.as_ref() {
-            Expr::Column { table, .. } => Some(*table),
-            _ => None,
-        },
-        _ => None,
-    }
+    append_vtab_predicates_to_where_clause(
+        vtab_predicates,
+        &mut plan.table_references,
+        &plan.result_columns,
+        &mut plan.where_clause,
+        resolver,
+    )
 }
 
 /// Replaces a column number in an ORDER BY or GROUP BY expression with a copy of the column expression.

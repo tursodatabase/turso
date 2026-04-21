@@ -358,7 +358,7 @@ pub fn plan_subqueries_from_where_clause(
         non_from_clause_subqueries,
         table_references,
         resolver,
-        where_clause.iter_mut().map(|t| &mut t.expr),
+        where_clause.iter_mut().map(|term| &mut term.expr),
         connection,
         SubqueryPosition::Where,
         SubqueryOrigin::DmlWhere,
@@ -400,11 +400,11 @@ pub fn plan_subqueries_from_values(
 /// Compute query plans for subqueries in UPDATE SET clause expressions.
 /// This is used by UPDATE statements where SET clause values contain scalar subqueries.
 /// e.g. `UPDATE t SET col = (SELECT max(id) FROM t2)`
-pub fn plan_subqueries_from_set_clauses(
+pub fn plan_subqueries_from_update_sets(
     program: &mut ProgramBuilder,
     non_from_clause_subqueries: &mut Vec<NonFromClauseSubquery>,
     table_references: &mut TableReferences,
-    set_clauses: &mut [(usize, Box<ast::Expr>)],
+    sets: &mut [ast::Set],
     resolver: &Resolver,
     connection: &Arc<Connection>,
 ) -> Result<()> {
@@ -413,9 +413,9 @@ pub fn plan_subqueries_from_set_clauses(
         non_from_clause_subqueries,
         table_references,
         resolver,
-        set_clauses.iter_mut().map(|(_, expr)| expr.as_mut()),
+        sets.iter_mut().map(|set| set.expr.as_mut()),
         connection,
-        SubqueryPosition::ResultColumn, // SET clause subqueries are similar to result columns
+        SubqueryPosition::ResultColumn,
         SubqueryOrigin::DmlSet,
         SubqueryPosition::ResultColumn.allow_correlated(),
     )?;
@@ -568,7 +568,7 @@ fn get_subquery_parser<'a>(
     referenced_tables: &'a mut TableReferences,
     resolver: &'a Resolver,
     connection: &'a Arc<Connection>,
-    get_outer_query_refs: fn(&TableReferences) -> Vec<OuterQueryReference>,
+    get_outer_query_refs: impl Fn(&TableReferences) -> Vec<OuterQueryReference> + 'a,
     position: SubqueryPosition,
     origin: SubqueryOrigin,
     allow_correlated: bool,
@@ -985,7 +985,9 @@ fn update_column_used_masks(
                 }
                 propagate_outer_refs_from_select_plan(table_refs, right_most);
             }
-            Plan::Delete(_) | Plan::Update(_) => {}
+            Plan::Delete(_) | Plan::Update(_) => {
+                unreachable!("DELETE/UPDATE plans should not appear in FROM clause subqueries")
+            }
         }
     }
 
