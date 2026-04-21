@@ -339,24 +339,28 @@ pub fn compute_group_by_sort_order(
 /// results), we reduce sorter record size and avoid redundant B-tree column reads.
 fn collect_agg_leaf_columns(aggregates: &[Aggregate], plan: &SelectPlan) -> Result<Vec<ast::Expr>> {
     let mut leaf_columns: Vec<ast::Expr> = Vec::new();
+    let mut collect = |expr: &ast::Expr| -> Result<WalkControl> {
+        match expr {
+            ast::Expr::Column { table, .. } | ast::Expr::RowId { table, .. } => {
+                if plan
+                    .table_references
+                    .find_joined_table_by_internal_id(*table)
+                    .is_some()
+                    && !leaf_columns.iter().any(|e| exprs_are_equivalent(e, expr))
+                {
+                    leaf_columns.push(expr.clone());
+                }
+                Ok(WalkControl::SkipChildren)
+            }
+            _ => Ok(WalkControl::Continue),
+        }
+    };
     for agg in aggregates {
         for arg in &agg.args {
-            walk_expr(arg, &mut |expr: &ast::Expr| -> Result<WalkControl> {
-                match expr {
-                    ast::Expr::Column { table, .. } | ast::Expr::RowId { table, .. } => {
-                        if plan
-                            .table_references
-                            .find_joined_table_by_internal_id(*table)
-                            .is_some()
-                            && !leaf_columns.iter().any(|e| exprs_are_equivalent(e, expr))
-                        {
-                            leaf_columns.push(expr.clone());
-                        }
-                        Ok(WalkControl::SkipChildren)
-                    }
-                    _ => Ok(WalkControl::Continue),
-                }
-            })?;
+            walk_expr(arg, &mut collect)?;
+        }
+        if let Some(filter_expr) = &agg.filter_expr {
+            walk_expr(filter_expr, &mut collect)?;
         }
     }
     Ok(leaf_columns)

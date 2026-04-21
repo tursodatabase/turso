@@ -568,6 +568,7 @@ fn detect_simple_aggregate(plan: &SelectPlan) -> Option<SimpleAggregate> {
         || plan.result_columns.len() != 1
         || plan.group_by.is_some()
         || plan.contains_constant_false_condition
+        || plan.aggregates.first().unwrap().filter_expr.is_some()
     {
         return None;
     }

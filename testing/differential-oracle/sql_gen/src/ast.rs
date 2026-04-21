@@ -1488,7 +1488,26 @@ impl Expr {
     /// Create a function call (records to context).
     pub fn function_call(ctx: &mut Context, name: String, args: Vec<Expr>) -> Self {
         ctx.record(ExprKind::FunctionCall);
-        Expr::FunctionCall(FunctionCallExpr { name, args })
+        Expr::FunctionCall(FunctionCallExpr {
+            name,
+            args,
+            filter: None,
+        })
+    }
+
+    /// Create a function call with a FILTER clause (records to context).
+    pub fn function_call_with_filter(
+        ctx: &mut Context,
+        name: String,
+        args: Vec<Expr>,
+        filter: Expr,
+    ) -> Self {
+        ctx.record(ExprKind::FunctionCall);
+        Expr::FunctionCall(FunctionCallExpr {
+            name,
+            args,
+            filter: Some(Box::new(filter)),
+        })
     }
 
     /// Create a subquery (records to context).
@@ -1832,6 +1851,7 @@ pub enum UnaryOp {
 pub struct FunctionCallExpr {
     pub name: String,
     pub args: Vec<Expr>,
+    pub filter: Option<Box<Expr>>,
 }
 
 impl fmt::Display for FunctionCallExpr {
@@ -1843,7 +1863,11 @@ impl fmt::Display for FunctionCallExpr {
             }
             write!(f, "{arg}")?;
         }
-        write!(f, ")")
+        write!(f, ")")?;
+        if let Some(filter_expr) = &self.filter {
+            write!(f, " FILTER (WHERE {filter_expr})")?;
+        }
+        Ok(())
     }
 }
 
