@@ -1640,10 +1640,7 @@ fn rewrite_where_for_update_registers(
 /// by virtual columns in `target_columns`.
 ///
 /// Target columns are guaranteed to be in a contiguous block, in the given order, at the start of
-/// registers
-/// Load column values from cursor into registers, handling virtual generated columns.
-///
-/// The following postcondition holds:
+/// registers. The following postcondition holds:
 ///
 /// ```text
 /// dml_ctx.to_column_reg(target_columns[i]) == dml_ctx.to_column_reg(target_columns[0]) + i
