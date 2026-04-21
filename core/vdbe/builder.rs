@@ -1397,6 +1397,9 @@ impl ProgramBuilder {
                 } => {
                     resolve(target_pc, "NotNull")?;
                 }
+                Insn::ColumnHasField { target_pc, .. } => {
+                    resolve(target_pc, "ColumnHasField")?;
+                }
                 Insn::IfPos { target_pc, .. } => {
                     resolve(target_pc, "IfPos")?;
                 }
@@ -1829,6 +1832,27 @@ impl ProgramBuilder {
         } else {
             self.emit_column(cursor_id, column, out);
         }
+    }
+
+    /// Emit a ColumnHasField instruction that jumps to `target_pc` if the
+    /// cursor's record has a field at the given logical column index.
+    /// Falls through if the record is short (ALTER TABLE ADD COLUMN).
+    pub fn emit_column_has_field(
+        &mut self,
+        cursor_id: CursorID,
+        column: usize,
+        target_pc: BranchOffset,
+    ) {
+        let (_, cursor_type) = self.cursor_ref.get(cursor_id).expect("cursor_id is valid");
+        let physical_column = match cursor_type {
+            CursorType::BTreeTable(btree) => btree.logical_to_physical_column(column),
+            _ => column,
+        };
+        self.emit_insn(Insn::ColumnHasField {
+            cursor_id,
+            column: physical_column,
+            target_pc,
+        });
     }
 
     /// Emit an Affinity instruction for a single register with the given column affinity.

@@ -611,6 +611,22 @@ pub fn insn_to_row(
                     ),
                 )
             }
+            Insn::ColumnHasField {
+                cursor_id,
+                column,
+                target_pc,
+            } => (
+                "ColumnHasField",
+                *cursor_id as i64,
+                *column as i64,
+                target_pc.as_debug_int().into(),
+                Value::build_text(""),
+                0,
+                format!(
+                    "if cursor {} record has field {} goto {}",
+                    cursor_id, column, target_pc.as_debug_int()
+                ),
+            ),
             Insn::TypeCheck {
                 start_reg,
                 count,

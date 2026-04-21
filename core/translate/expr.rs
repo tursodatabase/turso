@@ -3374,15 +3374,9 @@ pub fn translate_expr(
                                 };
 
                                 // For custom type columns with ENCODE/DECODE and a
-                                // default, suppress the default in the Column
-                                // instruction so we can encode it ourselves.  Without
-                                // this, pre-existing rows (from before ALTER TABLE ADD
-                                // COLUMN) would get the raw un-encoded default, causing
-                                // decode to fail.  Pure domain types (CREATE DOMAIN)
-                                // have no encoding, so their defaults must NOT be
-                                // suppressed.  Check the full type chain because a
-                                // domain built on top of a custom type inherits its
-                                // ENCODE/DECODE.
+                                // default, suppress the Column instruction's default.
+                                // We handle short records (ALTER TABLE ADD COLUMN) via
+                                // ColumnHasField after the Column instruction.
                                 let col_ref = table.get_column_at(column);
                                 if let Some(col) = col_ref {
                                     if col.default.is_some() {
@@ -3400,7 +3394,8 @@ pub fn translate_expr(
                                 program.emit_column_or_rowid(read_cursor, column, target_register);
                             }
                         }
-                        let Some(column) = table.get_column_at(*column) else {
+                        let table_col_idx = *column;
+                        let Some(column) = table.get_column_at(table_col_idx) else {
                             crate::bail_parse_error!("column index out of bounds");
                         };
                         // Skip affinity for custom types — the stored value is
@@ -3423,21 +3418,34 @@ pub fn translate_expr(
                         // Decode custom type columns (skipped when building ORDER BY sort keys
                         // for types without a `<` operator, so the sorter sorts on encoded values)
                         if !program.flags.suppress_custom_type_decode() {
-                            // For custom type columns with a default, the Column
-                            // instruction returns NULL for pre-existing rows
-                            // (since we suppressed the default). Load the default
-                            // and encode it so decode produces the correct value.
+                            // For custom type columns with ENCODE and a DEFAULT,
+                            // we suppressed the Column default so short records
+                            // (ALTER TABLE ADD COLUMN) return NULL.  Use
+                            // ColumnHasField to detect short records and compute
+                            // ENCODE(DEFAULT) at runtime via bytecode.
                             if let Some(type_def) = resolver
                                 .schema()
                                 .get_type_def(&column.ty_str, table.is_strict())
                             {
-                                if let Some(ref default_expr) = column.default {
-                                    if type_def.encode().is_some() {
-                                        let skip_default_label = program.allocate_label();
-                                        program.emit_insn(Insn::NotNull {
-                                            reg: target_register,
-                                            target_pc: skip_default_label,
-                                        });
+                                if type_def.encode().is_some() {
+                                    if let Some(ref default_expr) = column.default {
+                                        // Reconstruct the cursor id used for reading
+                                        let read_cursor = if read_from_index {
+                                            index_cursor_id.expect("index cursor should be opened")
+                                        } else {
+                                            table_cursor_id
+                                                .or(index_cursor_id)
+                                                .expect("cursor should be opened")
+                                        };
+                                        let done_label = program.allocate_label();
+                                        // Jump past the default block if the record
+                                        // actually has this column (not a short record).
+                                        program.emit_column_has_field(
+                                            read_cursor,
+                                            table_col_idx,
+                                            done_label,
+                                        );
+                                        // Short record: compute DEFAULT then ENCODE it
                                         translate_expr_no_constant_opt(
                                             program,
                                             referenced_tables,
@@ -3457,7 +3465,7 @@ pub fn translate_expr(
                                                 resolver,
                                             )?;
                                         }
-                                        program.preassign_label_to_next_insn(skip_default_label);
+                                        program.preassign_label_to_next_insn(done_label);
                                     }
                                 }
                             }
@@ -8036,14 +8044,6 @@ pub(crate) fn emit_user_facing_column_value(
     Ok(())
 }
 
-/// Walk an expression tree that has been rewritten to use `Expr::Register` for column
-/// references (e.g. by `rewrite_index_expr_for_insertion`). For each register that maps
-/// to a custom type column, emit decode bytecode into a fresh temporary register and
-/// rewrite the expression node to reference the decoded register.
-///
-/// This ensures expression indexes on custom type columns evaluate the expression on
-/// **decoded** (user-facing) values, matching what SELECT / CREATE INDEX see.
-#[allow(clippy::too_many_arguments)]
 /// Emit domain constraint checks for CAST(expr AS domain).
 /// Validates NOT NULL and CHECK constraints from the domain type chain.
 fn emit_domain_cast_constraints(

@@ -1867,6 +1867,57 @@ pub fn op_column(
     Ok(InsnFunctionStepResult::Step)
 }
 
+pub fn op_column_has_field(
+    program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+    _pager: &Arc<Pager>,
+) -> Result<InsnFunctionStepResult> {
+    load_insn!(
+        ColumnHasField {
+            cursor_id,
+            column,
+            target_pc,
+        },
+        insn
+    );
+    if !target_pc.is_offset() {
+        crate::bail_corrupt_error!("Unresolved label: {target_pc:?}");
+    }
+
+    let (_, cursor_type) = program
+        .cursor_ref
+        .get(*cursor_id)
+        .expect("cursor_id should exist in cursor_ref");
+
+    let has_field = match cursor_type {
+        CursorType::BTreeTable(_)
+        | CursorType::BTreeIndex(_)
+        | CursorType::MaterializedView(_, _) => {
+            let cursor_ref =
+                must_be_btree_cursor!(*cursor_id, program.cursor_ref, state, "ColumnHasField");
+            let cursor = cursor_ref.as_btree_mut();
+            if cursor.get_null_flag() {
+                false
+            } else {
+                match return_if_io!(cursor.record()) {
+                    Some(record) => record.column_count() > *column,
+                    None => false,
+                }
+            }
+        }
+        // Non-btree cursors always "have" all fields
+        _ => true,
+    };
+
+    if has_field {
+        state.pc = target_pc.as_offset_int();
+    } else {
+        state.pc += 1;
+    }
+    Ok(InsnFunctionStepResult::Step)
+}
+
 pub fn op_type_check(
     _program: &Program,
     state: &mut ProgramState,
