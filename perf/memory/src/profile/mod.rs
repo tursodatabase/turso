@@ -1,3 +1,4 @@
+pub mod checkpoint;
 pub mod insert;
 pub mod mixed;
 pub mod read;
@@ -11,6 +12,8 @@ pub enum Phase {
     Setup,
     /// The measured workload
     Run,
+    /// A final checkpoint pass after the measured workload completes
+    Checkpoint,
     /// No more work
     Done,
 }
