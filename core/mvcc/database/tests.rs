@@ -6391,6 +6391,42 @@ fn test_savepoint_index_multiple_statements() {
     assert_eq!(&rows[0][0].to_string(), "ok");
 }
 
+/// issue #5936 hypothesis:
+/// rollback to a named savepoint inside BEGIN CONCURRENT invalidates schema
+/// state and then repopulates from the current global schema cookie instead of
+/// the transaction snapshot, making pre-existing tables disappear after
+/// concurrent DDL on another connection.
+#[test_log::test]
+fn test_rollback_to_savepoint_preserves_schema_during_concurrent_ddl() {
+    let db = MvccTestDbNoConn::new();
+    let conn0 = db.connect();
+    conn0.execute("CREATE TABLE t1(x INT)").unwrap();
+    conn0.execute("INSERT INTO t1 VALUES (1)").unwrap();
+
+    let conn1 = db.connect();
+    conn1.execute("BEGIN CONCURRENT").unwrap();
+
+    let rows = get_rows(&conn1, "SELECT * FROM t1");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0][0].as_int().unwrap(), 1);
+
+    conn1.execute("SAVEPOINT sp1").unwrap();
+    conn1.execute("INSERT INTO t1 VALUES (2)").unwrap();
+
+    conn0.execute("CREATE TABLE t2(a INT)").unwrap();
+    conn1.execute("ROLLBACK TO sp1").unwrap();
+
+    let rows = get_rows(&conn1, "SELECT * FROM t1");
+    assert_eq!(
+        rows.len(),
+        1,
+        "t1 should still be visible after savepoint rollback despite concurrent DDL"
+    );
+    assert_eq!(rows[0][0].as_int().unwrap(), 1);
+
+    conn1.execute("ROLLBACK").unwrap();
+}
+
 /// Test INSERT followed by DELETE of same row, then another statement fails.
 /// The insert+delete should be preserved (row shouldn't exist).
 #[test]
