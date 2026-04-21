@@ -532,6 +532,14 @@ trait WalCoordination: Debug + Send + Sync {
     /// Record a newly appended frame in the backend's page-to-frame lookup state.
     fn cache_frame(&self, page_id: u64, frame_id: u64);
 
+    /// Record a verified checksum for a newly appended frame.
+    fn cache_frame_checksum(&self, _frame_id: u64, _checksums: (u32, u32)) {}
+
+    /// Retrieve the verified checksum for a frame if available.
+    fn get_frame_checksum(&self, _frame_id: u64) -> Option<(u32, u32)> {
+        None
+    }
+
     /// Drop any cached frame mappings newer than `max_frame`.
     fn rollback_cache(&self, max_frame: u64);
 
@@ -1123,6 +1131,23 @@ impl WalCoordination for InProcessWalCoordination {
                 frame_cache.insert(page_id, vec![frame_id]);
             }
         }
+    }
+
+    fn cache_frame_checksum(&self, frame_id: u64, checksums: (u32, u32)) {
+        self.shared
+            .read()
+            .frame_checksums
+            .lock()
+            .insert(frame_id, checksums);
+    }
+
+    fn get_frame_checksum(&self, frame_id: u64) -> Option<(u32, u32)> {
+        self.shared
+            .read()
+            .frame_checksums
+            .lock()
+            .get(&frame_id)
+            .copied()
     }
 
     fn rollback_cache(&self, max_frame: u64) {
@@ -2530,7 +2555,6 @@ pub struct WalSharedRuntime {
 pub struct WalFileShared {
     pub metadata: WalSharedMetadata,
     pub runtime: WalSharedRuntime,
-    // Maps Frame ID -> (checksum_1, checksum_2)
     pub frame_checksums: SpinLock<FxHashMap<u64, (u32, u32)>>,
 }
 
@@ -3024,6 +3048,7 @@ impl Wal for WalFile {
                     actual: bytes_read as usize,
                 });
             }
+
             let cloned = frame.clone();
             finish_read_page(page.get().id, buf, cloned);
             frame.set_wal_tag(frame_id, epoch_at_issue);
@@ -3032,13 +3057,17 @@ impl Wal for WalFile {
         // important not to hold shared state locks beyond this point to avoid deadlock with
         // completions that re-enter WAL state while a writer is waiting.
         let file = self.coordination.wal_file()?;
+        let expected_checksum = self.coordination.get_frame_checksum(frame_id);
+
         begin_read_wal_frame(
             file.as_ref(),
-            offset + WAL_FRAME_HEADER_SIZE as u64,
+            offset,
             buffer_pool,
             complete,
             page_idx,
             &self.io_ctx.read(),
+            expected_checksum,
+            frame_id,
         )
     }
 
@@ -3057,6 +3086,7 @@ impl Wal for WalFile {
             let io_ctx = self.io_ctx.read();
             io_ctx.encryption_context().cloned()
         };
+        let expected_checksum = self.coordination.get_frame_checksum(frame_id);
         let complete = Box::new(move |res: Result<(Arc<Buffer>, i32), CompletionError>| {
             let Ok((buf, bytes_read)) = res else {
                 return None; // IO error already captured in completion
@@ -3084,6 +3114,19 @@ impl Wal for WalFile {
 
             // Now parse the header from the freshly-copied data
             let (header, raw_page) = sqlite3_ondisk::parse_wal_frame_header(frame_ref);
+
+            if let Some((c1, c2)) = expected_checksum {
+                if header.checksum_1 != c1 || header.checksum_2 != c2 {
+                    tracing::error!("WAL checksum mismatch for frame {frame_id}");
+                    return Some(CompletionError::WalChecksumMismatch {
+                        frame_id,
+                        expected_1: c1,
+                        expected_2: c2,
+                        actual_1: header.checksum_1,
+                        actual_2: header.checksum_2,
+                    });
+                }
+            }
 
             if let Some(ctx) = encryption_ctx.clone() {
                 match ctx.decrypt_page(raw_page, header.page_number as usize) {
@@ -3176,11 +3219,13 @@ impl Wal for WalFile {
             let file = self.coordination.wal_file()?;
             let c = begin_read_wal_frame(
                 file.as_ref(),
-                offset + WAL_FRAME_HEADER_SIZE as u64,
+                offset,
                 buffer_pool,
                 complete,
                 page_id as usize,
                 &self.io_ctx.read(),
+                None,
+                frame_id,
             )?;
             self.io.wait_for_completion(c)?;
             return if *conflict.lock() {
@@ -3830,6 +3875,7 @@ impl WalFile {
         *self.last_checksum.write() = checksums;
         self.max_frame.store(frame_id, Ordering::Release);
         self.coordination.cache_frame(page_id, frame_id);
+        self.coordination.cache_frame_checksum(frame_id, checksums);
     }
 
     /// Reset connection-private WAL state.
@@ -4009,8 +4055,12 @@ impl WalFile {
                         }
                         // Issue read if page wasn't found in the page cache or doesnt meet
                         // the frame requirements
-                        let inflight =
-                            self.issue_wal_read_into_buffer(page_id as usize, target_frame)?;
+                        let checksums = self.coordination.get_frame_checksum(target_frame);
+                        let inflight = self.issue_wal_read_into_buffer(
+                            page_id as usize,
+                            target_frame,
+                            checksums,
+                        )?;
                         group.add(&inflight.completion);
                         nr_completions += 1;
                         ongoing_chkpt.inflight_reads.push(inflight);
@@ -4318,7 +4368,12 @@ impl WalFile {
         Ok(())
     }
 
-    fn issue_wal_read_into_buffer(&self, page_id: usize, frame_id: u64) -> Result<InflightRead> {
+    fn issue_wal_read_into_buffer(
+        &self,
+        page_id: usize,
+        frame_id: u64,
+        expected_checksum: Option<(u32, u32)>,
+    ) -> Result<InflightRead> {
         let offset = self.frame_offset(frame_id);
         let buf_slot = Arc::new(SpinLock::new(None));
         tracing::debug!(
@@ -4348,11 +4403,13 @@ impl WalFile {
         let file = self.coordination.wal_file()?;
         let c = begin_read_wal_frame(
             file.as_ref(),
-            offset + WAL_FRAME_HEADER_SIZE as u64,
+            offset,
             self.buffer_pool.clone(),
             complete,
             page_id,
             &self.io_ctx.read(),
+            expected_checksum,
+            frame_id,
         )?;
 
         Ok(InflightRead {
@@ -4752,6 +4809,7 @@ impl WalFileShared {
                     OverflowFallbackCoverage::default(),
                 )),
             },
+            frame_checksums: SpinLock::new(FxHashMap::default()),
         };
         Ok(Arc::new(RwLock::new(shared)))
     }
@@ -4819,6 +4877,7 @@ impl WalFileShared {
                     OverflowFallbackCoverage::default(),
                 )),
             },
+            frame_checksums: SpinLock::new(FxHashMap::default()),
         };
         Arc::new(RwLock::new(shared))
     }
@@ -4859,6 +4918,7 @@ impl WalFileShared {
                     OverflowFallbackCoverage::default(),
                 )),
             },
+            frame_checksums: SpinLock::new(FxHashMap::default()),
         };
         Ok(Arc::new(RwLock::new(shared)))
     }
