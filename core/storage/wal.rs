@@ -2530,6 +2530,8 @@ pub struct WalSharedRuntime {
 pub struct WalFileShared {
     pub metadata: WalSharedMetadata,
     pub runtime: WalSharedRuntime,
+    // Maps Frame ID -> (checksum_1, checksum_2)
+    pub frame_checksums: SpinLock<FxHashMap<u64, (u32, u32)>>,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]

@@ -1452,6 +1452,7 @@ pub fn build_shared_wal(
                 SpinLock::new(OverflowFallbackCoverage::default()),
             ),
         },
+        frame_checksums: SpinLock::new(FxHashMap::default()),
     }));
 
     if size < WAL_HEADER_SIZE as u64 {
