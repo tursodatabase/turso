@@ -326,10 +326,18 @@ fn trigger_cmd_to_stmt_for_subprogram(
             from,
             where_clause,
         } => {
-            // Rewrite NEW/OLD references in SET clauses and WHERE clause
+            // Rewrite NEW/OLD references anywhere an UPDATE trigger body can
+            // legally read them: SET, FROM-derived sources, and WHERE.
             let mut sets_clone = sets.clone();
             for set in &mut sets_clone {
                 rewrite_trigger_expr_for_subprogram(&mut set.expr, subprogram_ctx)?;
+            }
+
+            let mut from_clone = from.clone();
+            if let Some(ref mut from_clause) = from_clone {
+                rewrite_from_clause_expressions(from_clause, &mut |e: &mut ast::Expr| {
+                    rewrite_trigger_expr_single_for_subprogram(e, subprogram_ctx)
+                })?;
             }
 
             let mut where_clause_clone = where_clause.clone();
@@ -350,7 +358,7 @@ fn trigger_cmd_to_stmt_for_subprogram(
                 },
                 indexed: None,
                 sets: sets_clone,
-                from: from.clone(),
+                from: from_clone,
                 where_clause: where_clause_clone,
                 returning: vec![],
                 order_by: vec![],
