@@ -5682,9 +5682,10 @@ pub fn bind_and_rewrite_expr<'a>(
                         }
                     }
                     let mut match_result = None;
+                    let joined_tables = referenced_tables.joined_tables();
 
                     // First check joined tables
-                    for joined_table in referenced_tables.joined_tables().iter() {
+                    for joined_table in joined_tables.iter() {
                         let col_idx = joined_table.table.columns().iter().position(|c| {
                             c.name
                                 .as_ref()
@@ -5719,11 +5720,11 @@ pub fn bind_and_rewrite_expr<'a>(
                             }
                         // only if we haven't found a match, check for explicit rowid reference
                         } else if let Table::BTree(btree) = &joined_table.table {
-                            if let Some(row_id_expr) = parse_row_id(
-                                &normalized_id,
-                                referenced_tables.joined_tables()[0].internal_id,
-                                || referenced_tables.joined_tables().len() != 1,
-                            )? {
+                            if let Some(row_id_expr) =
+                                parse_row_id(&normalized_id, joined_tables[0].internal_id, || {
+                                    joined_tables.len() != 1
+                                })?
+                            {
                                 if !btree.has_rowid {
                                     crate::bail_parse_error!("no such column: {}", id.as_str());
                                 }
@@ -5830,23 +5831,135 @@ pub fn bind_and_rewrite_expr<'a>(
                         );
                     };
                     let normalized_table_name = normalize_ident(tbl.as_str());
-                    // Check for duplicate table aliases — if multiple joined tables
-                    // share the same identifier, the qualified column ref is ambiguous.
-                    let duplicate_count = referenced_tables
-                        .joined_tables()
+                    let normalized_id = normalize_ident(id.as_str());
+                    let joined_tables = referenced_tables.joined_tables();
+                    let mut matching_tbl = None;
+                    let mut identifier_matched = false;
+
+                    for joined_table in joined_tables
                         .iter()
                         .filter(|t| t.identifier == normalized_table_name)
-                        .count();
-                    if duplicate_count > 1 {
-                        crate::bail_parse_error!(
-                            "ambiguous column name: {}.{}",
-                            tbl.as_str(),
-                            id.as_str()
-                        );
+                    {
+                        identifier_matched = true;
+                        let col_idx = joined_table.table.columns().iter().position(|c| {
+                            c.name
+                                .as_ref()
+                                .is_some_and(|name| name.eq_ignore_ascii_case(&normalized_id))
+                        });
+                        if let Some(col_idx) = col_idx {
+                            if matching_tbl.is_some() {
+                                let deduped_by_using =
+                                    joined_table.join_info.as_ref().is_some_and(|join_info| {
+                                        join_info.using.iter().any(|using_col| {
+                                            using_col.as_str().eq_ignore_ascii_case(&normalized_id)
+                                        })
+                                    });
+                                if !deduped_by_using {
+                                    crate::bail_parse_error!(
+                                        "ambiguous column name: {}.{}",
+                                        tbl.as_str(),
+                                        id.as_str()
+                                    );
+                                }
+                                continue;
+                            }
+                            let col = joined_table.table.columns().get(col_idx).unwrap();
+                            matching_tbl = Some((
+                                joined_table.internal_id,
+                                Some((col_idx, col.is_rowid_alias())),
+                            ));
+                            continue;
+                        }
+
+                        if let Table::BTree(btree) = &joined_table.table {
+                            if parse_row_id(&normalized_id, joined_table.internal_id, || false)?
+                                .is_some()
+                            {
+                                if !btree.has_rowid {
+                                    crate::bail_parse_error!("no such column: {}", normalized_id);
+                                }
+                                if matching_tbl.is_some() {
+                                    crate::bail_parse_error!(
+                                        "ambiguous column name: {}.{}",
+                                        tbl.as_str(),
+                                        id.as_str()
+                                    );
+                                }
+                                matching_tbl = Some((joined_table.internal_id, None));
+                            }
+                        }
                     }
-                    let matching_tbl = referenced_tables
-                        .find_table_and_internal_id_by_identifier(&normalized_table_name);
-                    if matching_tbl.is_none() {
+
+                    if !identifier_matched {
+                        let nearest_outer_scope = referenced_tables
+                            .outer_query_refs()
+                            .iter()
+                            .filter(|t| {
+                                t.identifier == normalized_table_name && !t.cte_definition_only
+                            })
+                            .map(|t| t.scope_depth)
+                            .min();
+
+                        if let Some(scope_depth) = nearest_outer_scope {
+                            identifier_matched = true;
+                            for outer_ref in
+                                referenced_tables.outer_query_refs().iter().filter(|t| {
+                                    t.identifier == normalized_table_name
+                                        && !t.cte_definition_only
+                                        && t.scope_depth == scope_depth
+                                })
+                            {
+                                let col_idx = outer_ref.table.columns().iter().position(|c| {
+                                    c.name.as_ref().is_some_and(|name| {
+                                        name.eq_ignore_ascii_case(&normalized_id)
+                                    })
+                                });
+                                if let Some(col_idx) = col_idx {
+                                    if outer_ref.using_dedup_hidden_cols.get(col_idx) {
+                                        continue;
+                                    }
+                                    if matching_tbl.is_some() {
+                                        crate::bail_parse_error!(
+                                            "ambiguous column name: {}.{}",
+                                            tbl.as_str(),
+                                            id.as_str()
+                                        );
+                                    }
+                                    let col = outer_ref.table.columns().get(col_idx).unwrap();
+                                    matching_tbl = Some((
+                                        outer_ref.internal_id,
+                                        Some((col_idx, col.is_rowid_alias())),
+                                    ));
+                                    continue;
+                                }
+
+                                if let Table::BTree(btree) = &outer_ref.table {
+                                    if parse_row_id(&normalized_id, outer_ref.internal_id, || {
+                                        false
+                                    })?
+                                    .is_some()
+                                    {
+                                        if !btree.has_rowid {
+                                            crate::bail_parse_error!(
+                                                "no such column: {}",
+                                                normalized_id
+                                            );
+                                        }
+                                        if matching_tbl.is_some() {
+                                            crate::bail_parse_error!(
+                                                "ambiguous column name: {}.{}",
+                                                tbl.as_str(),
+                                                id.as_str()
+                                            );
+                                        }
+                                        matching_tbl = Some((outer_ref.internal_id, None));
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    if matching_tbl.is_none() && !identifier_matched {
                         // CTEs preplanned for subquery FROM visibility are kept as
                         // definition-only outer refs. They are not valid column sources
                         // unless explicitly referenced in this scope's FROM clause.
@@ -5868,45 +5981,25 @@ pub fn bind_and_rewrite_expr<'a>(
                         }
                         crate::bail_parse_error!("no such table: {}", normalized_table_name);
                     }
-                    let (tbl_id, tbl) = matching_tbl.unwrap();
-                    let normalized_id = normalize_ident(id.as_str());
-                    let col_idx = tbl.columns().iter().position(|c| {
-                        c.name
-                            .as_ref()
-                            .is_some_and(|name| name.eq_ignore_ascii_case(&normalized_id))
-                    });
-                    // User-defined columns take precedence over rowid aliases
-                    // (oid, rowid, _rowid_). Only fall back to parse_row_id()
-                    // when no matching user column exists.
-                    // Note: Only BTree tables have rowid; derived tables (FromClauseSubquery)
-                    // don't have a rowid.
-                    let Some(col_idx) = col_idx else {
-                        if let Table::BTree(btree) = tbl {
-                            if let Some(row_id_expr) =
-                                parse_row_id(&normalized_id, tbl_id, || false)?
-                            {
-                                if !btree.has_rowid {
-                                    crate::bail_parse_error!("no such column: {}", normalized_id);
-                                }
-                                *expr = row_id_expr;
-                                // Mark the table's rowid as referenced so correlated
-                                // subquery detection works correctly when a rowid
-                                // reference is the only link to the outer query.
-                                referenced_tables.mark_rowid_referenced(tbl_id);
-                                return Ok(WalkControl::Continue);
-                            }
-                        }
+                    let Some((tbl_id, col_binding)) = matching_tbl else {
                         crate::bail_parse_error!("no such column: {}", normalized_id);
                     };
-                    let col = tbl.columns().get(col_idx).unwrap();
-                    *expr = Expr::Column {
-                        database: None, // TODO: support different databases
-                        table: tbl_id,
-                        column: col_idx,
-                        is_rowid_alias: col.is_rowid_alias(),
-                    };
-                    tracing::debug!("rewritten to column");
-                    referenced_tables.mark_column_used(tbl_id, col_idx);
+                    if let Some((col_idx, is_rowid_alias)) = col_binding {
+                        *expr = Expr::Column {
+                            database: None, // TODO: support different databases
+                            table: tbl_id,
+                            column: col_idx,
+                            is_rowid_alias,
+                        };
+                        tracing::debug!("rewritten to column");
+                        referenced_tables.mark_column_used(tbl_id, col_idx);
+                    } else {
+                        *expr = Expr::RowId {
+                            database: None, // TODO: support different databases
+                            table: tbl_id,
+                        };
+                        referenced_tables.mark_rowid_referenced(tbl_id);
+                    }
                     return Ok(WalkControl::Continue);
                 }
                 Expr::DoublyQualified(db_name, tbl_name, col_name) => {
@@ -5969,8 +6062,20 @@ pub fn bind_and_rewrite_expr<'a>(
                     // we need to create a synthetic table reference for it
                     // For now, we'll error if the table isn't already in the referenced tables
                     let normalized_tbl_name = normalize_ident(tbl_name.as_str());
-                    let matching_tbl = referenced_tables
-                        .find_table_and_internal_id_by_identifier(&normalized_tbl_name);
+                    let joined_tables = referenced_tables.joined_tables();
+                    let matching_tbl = joined_tables
+                        .iter()
+                        .find(|t| t.identifier == normalized_tbl_name)
+                        .map(|t| (t.internal_id, &t.table))
+                        .or_else(|| {
+                            referenced_tables
+                                .outer_query_refs()
+                                .iter()
+                                .find(|t| {
+                                    t.identifier == normalized_tbl_name && !t.cte_definition_only
+                                })
+                                .map(|t| (t.internal_id, &t.table))
+                        });
 
                     if let Some((tbl_id, _)) = matching_tbl {
                         // Table is already in referenced tables, use existing internal ID
@@ -5996,10 +6101,12 @@ pub fn bind_and_rewrite_expr<'a>(
                             if func.needs_star_expansion() {
                                 // Only expand if there are actual tables - otherwise leave as
                                 // FunctionCallStar so translate_expr can generate the error
-                                if !referenced_tables.joined_tables().is_empty() {
+                                let joined_tables = referenced_tables.joined_tables();
+                                if !joined_tables.is_empty() {
                                     // Mark all columns as used so the optimizer doesn't
                                     // create partial covering indexes that would miss columns
-                                    for table in referenced_tables.joined_tables_mut().iter_mut() {
+                                    let joined_tables = referenced_tables.joined_tables_mut();
+                                    for table in joined_tables.iter_mut() {
                                         for col_idx in 0..table.columns().len() {
                                             table.mark_column_used(col_idx);
                                         }
@@ -6008,7 +6115,8 @@ pub fn bind_and_rewrite_expr<'a>(
                                     // Build arguments: alternating column_name (as string literal), column_value (as column reference)
                                     let mut args: Vec<Box<ast::Expr>> = Vec::new();
 
-                                    for table in referenced_tables.joined_tables().iter() {
+                                    let joined_tables = referenced_tables.joined_tables();
+                                    for table in joined_tables.iter() {
                                         for (col_idx, col) in table.columns().iter().enumerate() {
                                             // Skip hidden columns (like rowid in some cases)
                                             if col.hidden() {
