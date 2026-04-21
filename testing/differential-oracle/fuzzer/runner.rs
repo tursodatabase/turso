@@ -366,7 +366,7 @@ impl Fuzzer {
             }));
 
             let oracle_result = std::panic::catch_unwind(|| {
-                check_differential(&self.turso_conn, &self.sqlite_conn, &stmt)
+                check_differential(&self.turso_conn, &self.sqlite_conn, &schema, &stmt)
             });
 
             std::panic::set_hook(prev_hook);
