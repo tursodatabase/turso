@@ -6,7 +6,7 @@ use crate::translate::expr::emit_table_column_for_dml;
 use crate::translate::plan::ColumnMask;
 use crate::{
     error::SQLITE_CONSTRAINT_FOREIGNKEY,
-    schema::{BTreeTable, ColumnLayout, ForeignKey, Index, ResolvedFkRef, ROWID_SENTINEL},
+    schema::{BTreeTable, ColumnLayout, ForeignKey, Index, ResolvedFkRef},
     translate::{collate::CollationSeq, emitter::Resolver, planner::ROWID_STRS},
     vdbe::{
         builder::{CursorType, QueryMode},
@@ -364,7 +364,7 @@ pub fn emit_fk_restrict_halt(program: &mut ProgramBuilder) -> Result<()> {
 pub fn stabilize_new_row_for_fk(
     program: &mut ProgramBuilder,
     table_btree: &BTreeTable,
-    set_clauses: &[(usize, Box<Expr>)],
+    set_cols: &ColumnMask,
     cursor_id: usize,
     start: usize,
     rowid_new_reg: usize,
@@ -372,10 +372,6 @@ pub fn stabilize_new_row_for_fk(
     if table_btree.primary_key_columns.is_empty() {
         return Ok(());
     }
-    let set_cols: ColumnMask = set_clauses
-        .iter()
-        .filter_map(|(i, _)| if *i == ROWID_SENTINEL { None } else { Some(*i) })
-        .collect();
 
     let layout = table_btree.column_layout();
     for (pk_name, _) in &table_btree.primary_key_columns {
@@ -1107,19 +1103,18 @@ pub fn emit_fk_update_parent_actions(
     start: usize,
     rowid_new_reg: usize,
     rowid_set_clause_reg: Option<usize>,
-    set_clauses: &[(usize, Box<Expr>)],
+    updated_positions: &ColumnMask,
     new_key_probe_mode: ParentKeyNewProbeMode,
     database_id: usize,
     resolver: &Resolver,
 ) -> Result<Vec<DeferredNewKeyProbePlan>> {
     let mut deferred_new_key_plans = Vec::new();
-    let updated_positions: ColumnMask = set_clauses.iter().map(|(i, _)| *i).collect();
     let mut check_fks: Vec<_> = Vec::new();
     let referencing = resolver.with_schema(database_id, |s| {
         s.resolved_fks_referencing(&table_btree.name)
     })?;
     for fk in referencing {
-        if !fk.parent_key_may_change(&updated_positions, table_btree)? {
+        if !fk.parent_key_may_change(updated_positions, table_btree)? {
             continue;
         }
         if !matches!(fk.fk.on_update, RefAct::NoAction | RefAct::Restrict) {

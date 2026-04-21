@@ -486,8 +486,10 @@ impl fmt::Display for UpdatePlan {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         writeln!(f, "QUERY PLAN")?;
 
-        for (i, reference) in self.table_references.joined_tables().iter().enumerate() {
-            let is_last = i == self.table_references.joined_tables().len() - 1;
+        let read_scope_tables = self.build_read_scope_tables();
+
+        for (i, reference) in read_scope_tables.joined_tables().iter().enumerate() {
+            let is_last = i == read_scope_tables.joined_tables().len() - 1;
             let indent = if i == 0 {
                 if is_last { "`--" } else { "|--" }.to_string()
             } else {
@@ -585,12 +587,6 @@ impl fmt::Display for UpdatePlan {
                 Operation::MultiIndexScan(_) => {
                     unreachable!("Update plan should not have multi-index scans");
                 }
-            }
-        }
-        if !self.order_by.is_empty() {
-            writeln!(f, "ORDER BY:")?;
-            for (expr, dir, nulls) in &self.order_by {
-                fmt_order_by_item(f, expr, *dir, *nulls)?;
             }
         }
         if let Some(limit) = self.limit.as_ref() {
@@ -958,12 +954,9 @@ impl ToTokens for UpdatePlan {
         s: &mut S,
         _: &C,
     ) -> Result<(), S::Error> {
-        let table = self
-            .table_references
-            .joined_tables()
-            .first()
-            .expect("UPDATE Plan should have only one table reference");
-        let context = [&self.table_references];
+        let table = &self.target_table;
+        let read_scope_tables = self.build_read_scope_tables();
+        let context = [&read_scope_tables];
         let context = &PlanContext(&context);
 
         s.append(TokenType::TK_UPDATE, None)?;
@@ -971,10 +964,10 @@ impl ToTokens for UpdatePlan {
         s.append(TokenType::TK_SET, None)?;
 
         s.comma(
-            self.set_clauses.iter().map(|(col_idx, set_expr)| {
+            self.set_clauses.iter().map(|set_clause| {
                 let col_name = table
                     .table
-                    .get_column_at(*col_idx)
+                    .get_column_at(set_clause.column_index)
                     .as_ref()
                     .unwrap()
                     .name
@@ -983,7 +976,7 @@ impl ToTokens for UpdatePlan {
 
                 ast::Set {
                     col_names: vec![ast::Name::exact(col_name.clone())],
-                    expr: set_expr.clone(),
+                    expr: set_clause.expr.clone(),
                 }
             }),
             context,
@@ -1003,22 +996,6 @@ impl ToTokens for UpdatePlan {
                 s.append(TokenType::TK_AND, None)?;
                 expr.to_tokens(s, context)?;
             }
-        }
-
-        if !self.order_by.is_empty() {
-            s.append(TokenType::TK_ORDER, None)?;
-            s.append(TokenType::TK_BY, None)?;
-
-            s.comma(
-                self.order_by
-                    .iter()
-                    .map(|(expr, order, nulls)| ast::SortedColumn {
-                        expr: expr.clone(),
-                        order: Some(*order),
-                        nulls: *nulls,
-                    }),
-                context,
-            )?;
         }
 
         if let Some(limit) = &self.limit {

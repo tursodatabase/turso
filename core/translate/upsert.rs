@@ -782,6 +782,7 @@ pub fn emit_upsert(
     } else {
         None
     };
+    let updated_positions: ColumnMask = set_pairs.iter().map(|(col_idx, _)| *col_idx).collect();
     if let Some(bt) = table.btree() {
         if connection.foreign_keys_enabled() {
             let rowid_new_reg = new_rowid_reg.unwrap_or(ctx.conflict_rowid_reg);
@@ -821,7 +822,7 @@ pub fn emit_upsert(
                 new_start,
                 new_rowid_reg.unwrap_or(ctx.conflict_rowid_reg),
                 rowid_set_clause_reg,
-                set_pairs,
+                &updated_positions,
                 ParentKeyNewProbeMode::BeforeWrite,
                 upsert_database_id,
                 resolver,
