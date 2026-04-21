@@ -757,6 +757,9 @@ static int TursoOpenCmd(ClientData cd, Tcl_Interp *interp,
 /* Extension initialisation                                             */
 /* ------------------------------------------------------------------ */
 
+/* Defined in the sqlite3 Rust crate (sqlite3/src/lib.rs) */
+extern int sqlite3_search_count;
+
 int Tursotcl_Init(Tcl_Interp *interp)
 {
     if (Tcl_InitStubs(interp, TCL_VERSION, 0) == NULL) {
@@ -766,6 +769,10 @@ int Tursotcl_Init(Tcl_Interp *interp)
     turso_enable_experimental();
 
     Tcl_CreateObjCommand(interp, "sqlite3", TursoOpenCmd, NULL, NULL);
+
+    /* Link the global B-tree search counter so TCL tests can read/reset it. */
+    Tcl_LinkVar(interp, "sqlite_search_count",
+                (char *)&sqlite3_search_count, TCL_LINK_INT);
 
     Tcl_PkgProvide(interp, "tursotcl", TURSO_TCL_VERSION);
     return TCL_OK;
