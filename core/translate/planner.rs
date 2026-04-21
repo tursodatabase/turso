@@ -621,7 +621,6 @@ pub fn plan_ctes_as_outer_refs(
         let cte_select_ast = cte.select.clone();
         // AS MATERIALIZED forces materialization
         let materialize_hint = cte.materialized == Materialized::Yes;
-
         // Block the CTE's own name from resolving to a schema object during
         // planning of its body (see push_cte_being_defined).
         program.push_cte_being_defined(cte_name.clone());
@@ -672,7 +671,7 @@ pub fn plan_ctes_as_outer_refs(
             col_used_mask: ColumnUsedMask::default(),
             cte_select: Some(cte_select_ast),
             cte_explicit_columns: explicit_columns,
-            cte_id: None, // DML CTEs don't share materialized data (TODO: implement if needed)
+            cte_id: None, // DML CTEs don't track CTE sharing (TODO: implement if needed)
             cte_definition_only: true,
             rowid_referenced: false,
             scope_depth: 0,
@@ -1765,7 +1764,7 @@ fn parse_join(
                     turso_assert!(!left_tables.is_empty());
                     let right_table = table_references.joined_tables().last().unwrap();
                     let mut left_col = None;
-                    for (left_table_idx, left_table) in left_tables.iter().enumerate() {
+                    for (left_table_offset, left_table) in left_tables.iter().enumerate() {
                         left_col = left_table
                             .columns()
                             .iter()
@@ -1776,7 +1775,9 @@ fn parse_join(
                                     .as_ref()
                                     .is_some_and(|name| *name == name_normalized)
                             })
-                            .map(|(idx, col)| (left_table_idx, left_table.internal_id, idx, col));
+                            .map(|(idx, col)| {
+                                (left_table_offset, left_table.internal_id, idx, col)
+                            });
                         if left_col.is_some() {
                             break;
                         }
@@ -1863,6 +1864,56 @@ fn parse_join(
     Ok(())
 }
 
+pub(crate) fn append_vtab_predicates_to_where_clause(
+    vtab_predicates: &mut Vec<Expr>,
+    table_references: &mut TableReferences,
+    result_columns: &[ResultSetColumn],
+    out_where_clause: &mut Vec<WhereTerm>,
+    resolver: &Resolver,
+) -> Result<()> {
+    for mut expr in vtab_predicates.drain(..) {
+        bind_and_rewrite_expr(
+            &mut expr,
+            Some(table_references),
+            Some(result_columns),
+            resolver,
+            BindingBehavior::TryCanonicalColumnsFirst,
+        )?;
+
+        // Virtual table argument predicates (e.g. the 't2' in pragma_table_info('t2'))
+        // must be associated with the virtual table's outer join context if the table is
+        // the RHS of a LEFT JOIN. Otherwise the optimizer may incorrectly simplify the
+        // LEFT JOIN into an INNER JOIN, breaking NULL row emission for unmatched rows.
+        let from_outer_join = vtab_predicate_table_id(&expr).and_then(|table_id| {
+            table_references
+                .find_joined_table_by_internal_id(table_id)
+                .and_then(|table_ref| {
+                    table_ref
+                        .join_info
+                        .as_ref()
+                        .and_then(|join_info| join_info.is_outer().then_some(table_id))
+                })
+        });
+        out_where_clause.push(WhereTerm {
+            expr,
+            from_outer_join,
+            consumed: false,
+        });
+    }
+    Ok(())
+}
+
+/// Extract the table internal_id from a virtual table argument predicate.
+/// These are always of the form `Column { table, .. } = literal` or `IsNull(Column { table, .. })`.
+fn vtab_predicate_table_id(expr: &Expr) -> Option<TableInternalId> {
+    match expr {
+        Expr::Binary(lhs, _, _) | Expr::IsNull(lhs) => match lhs.as_ref() {
+            Expr::Column { table, .. } => Some(*table),
+            _ => None,
+        },
+        _ => None,
+    }
+}
 pub fn break_predicate_at_and_boundaries<T: From<Expr>>(
     predicate: &Expr,
     out_predicates: &mut Vec<T>,
