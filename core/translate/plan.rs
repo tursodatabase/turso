@@ -663,6 +663,11 @@ pub struct SelectPlan {
     /// When set, this query is a simple aggregate (COUNT(*), MIN, or MAX)
     /// that can be satisfied without a full table scan.
     pub simple_aggregate: Option<SimpleAggregate>,
+    /// Parameters from EXISTS subquery result columns that were dropped during
+    /// semi/anti-join unnesting. These need to be registered in the program's
+    /// parameter list even though no code is emitted for them, so that bind-time
+    /// validation (`has_slot`) succeeds.
+    pub phantom_params: Vec<ast::Variable>,
 }
 
 impl SelectPlan {
@@ -2819,15 +2824,23 @@ pub struct Aggregate {
     pub args: Vec<ast::Expr>,
     pub original_expr: ast::Expr,
     pub distinctness: Distinctness,
+    pub filter_expr: Option<ast::Expr>,
 }
 
 impl Aggregate {
-    pub fn new(func: AggFunc, args: &[Box<Expr>], expr: &Expr, distinctness: Distinctness) -> Self {
+    pub fn new(
+        func: AggFunc,
+        args: &[Box<Expr>],
+        expr: &Expr,
+        distinctness: Distinctness,
+        filter_expr: Option<ast::Expr>,
+    ) -> Self {
         Aggregate {
             func,
             args: args.iter().map(|arg| *arg.clone()).collect(),
             original_expr: expr.clone(),
             distinctness,
+            filter_expr,
         }
     }
 

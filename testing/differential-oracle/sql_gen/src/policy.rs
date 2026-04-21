@@ -1939,7 +1939,7 @@ impl Default for ExprConfig {
             // Stubs
             like_escape_probability: 0.0,
             aggregate_distinct_probability: 0.0,
-            aggregate_filter_probability: 0.0,
+            aggregate_filter_probability: 0.3,
         }
     }
 }

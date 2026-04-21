@@ -81,6 +81,13 @@ pub fn emit_query<'a>(
     let after_main_loop_label = program.allocate_label();
     t_ctx.label_main_loop_end = Some(after_main_loop_label);
 
+    // Register parameters from EXISTS subquery result columns that were dropped
+    // during semi/anti-join unnesting. No code is emitted for these, but the
+    // parameter slots must exist for bind-time validation to succeed.
+    for variable in &plan.phantom_params {
+        program.register_variable(variable);
+    }
+
     // Evaluate uncorrelated subqueries as early as possible, because even LIMIT can reference a subquery.
     // This must happen before VALUES emission since VALUES expressions may contain scalar subqueries.
     emit_non_from_clause_subqueries_for_eval_at(
@@ -974,6 +981,7 @@ fn build_materialized_build_input_plan(
         input_cardinality_hint: None,
         estimated_output_rows: None,
         simple_aggregate: None,
+        phantom_params: vec![],
     };
 
     prune_join_order_for_materialized_inputs(&mut materialize_plan, materialized_build_inputs)?;

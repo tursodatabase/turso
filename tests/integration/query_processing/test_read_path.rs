@@ -934,3 +934,57 @@ fn test_too_many_columns_in_select(tmp_db: TempDatabase) {
         "Expected error for UNION with 2001 columns"
     );
 }
+
+#[turso_macros::test(
+    init_sql = "CREATE TABLE profiles (id INTEGER PRIMARY KEY, bio TEXT, user_id INTEGER NOT NULL)"
+)]
+fn test_bind_in_exists_subquery(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let query = "SELECT id, bio, user_id FROM profiles WHERE EXISTS (SELECT ?2 AS column1 FROM (VALUES (?1)) AS tbl_1_0 WHERE tbl_1_0.column1 = profiles.user_id)";
+
+    // Verify expected behavior against sqlite (rusqlite) first.
+    // init_sql already created the table via rusqlite; insert test data and
+    // checkpoint so the row is visible to both engines.
+    {
+        let sqlite_conn = rusqlite::Connection::open(&tmp_db.path)?;
+        sqlite_conn.execute(
+            "INSERT INTO profiles (bio, user_id) VALUES ('Hello', 42)",
+            [],
+        )?;
+        sqlite_conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")?;
+
+        let mut stmt = sqlite_conn.prepare(query)?;
+        let sqlite_rows: Vec<(i64, String, i64)> = stmt
+            .query_map(rusqlite::params![42, 1], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        assert_eq!(sqlite_rows.len(), 1);
+        assert_eq!(sqlite_rows[0].2, 42);
+    }
+
+    // Now verify turso matches sqlite with the same bound parameters.
+    // Use has_slot() assertions to validate parameter registration — this is
+    // the same check that bind_positional() performs in the Rust binding.
+    // bind_at() alone silently succeeds even when parameters are unregistered,
+    // which masked the bug this test is meant to catch.
+    let conn = tmp_db.connect_limbo();
+    let mut stmt = conn.prepare(query)?;
+    assert!(
+        stmt.parameters().has_slot(1.try_into().unwrap()),
+        "parameter ?1 should be registered"
+    );
+    assert!(
+        stmt.parameters().has_slot(2.try_into().unwrap()),
+        "parameter ?2 should be registered"
+    );
+    stmt.bind_at(1.try_into()?, Value::from_i64(42));
+    stmt.bind_at(2.try_into()?, Value::from_i64(1));
+    let mut turso_rows = Vec::new();
+    stmt.run_with_row_callback(|row| {
+        turso_rows.push(row.get::<&Value>(2).unwrap().clone());
+        Ok(())
+    })?;
+    assert_eq!(turso_rows.len(), 1);
+    assert_eq!(turso_rows[0], Value::from_i64(42));
+    Ok(())
+}

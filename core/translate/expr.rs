@@ -597,9 +597,9 @@ pub fn translate_condition_expr(
             emit_cond_jump(program, condition_metadata, between_result_reg);
         }
         ast::Expr::Variable(_) => {
-            crate::bail_parse_error!(
-                "Variable as a direct predicate in WHERE clause is not supported"
-            );
+            let reg = program.alloc_register();
+            translate_expr(program, Some(referenced_tables), expr, reg, resolver)?;
+            emit_cond_jump(program, condition_metadata, reg);
         }
         ast::Expr::Name(_) => {
             crate::bail_parse_error!("Name as a direct predicate in WHERE clause is not supported");
@@ -3813,15 +3813,7 @@ pub fn translate_expr(
             }
         },
         ast::Expr::Variable(variable) => {
-            let index = usize::try_from(variable.index.get())
-                .expect("u32 variable index must fit into usize")
-                .try_into()
-                .expect("variable index must be non-zero");
-            if let Some(name) = variable.name.as_deref() {
-                program.parameters.push_named_at(name, index);
-            } else {
-                program.parameters.push_index(index);
-            }
+            let index = program.register_variable(variable);
             program.emit_insn(Insn::Variable {
                 index,
                 dest: target_register,
