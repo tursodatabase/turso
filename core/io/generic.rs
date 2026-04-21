@@ -16,7 +16,7 @@ impl GenericIO {
 
 impl IO for GenericIO {
     #[instrument(skip_all, level = Level::TRACE)]
-    fn open_file(&self, path: &str, flags: OpenFlags, direct: bool) -> Result<Arc<dyn File>> {
+    fn open_file(&self, path: &str, flags: OpenFlags, _direct: bool) -> Result<Arc<dyn File>> {
         trace!("open_file(path = {})", path);
         let mut file = std::fs::File::options();
         file.read(true);
@@ -61,7 +61,7 @@ pub struct GenericFile {
 
 impl File for GenericFile {
     #[instrument(err, skip_all, level = Level::TRACE)]
-    fn lock_file(&self, exclusive: bool) -> Result<()> {
+    fn lock_file(&self, _exclusive: bool) -> Result<()> {
         Ok(())
     }
 

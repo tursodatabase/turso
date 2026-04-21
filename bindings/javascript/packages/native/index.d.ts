@@ -137,7 +137,7 @@ export declare class Statement {
    */
   safeIntegers(toggle?: boolean | undefined | null): void
   /** Get column information for the statement */
-  columns(): Promise<any>
+  columns(): Promise<TableColumn[]>
   /** Finalizes the statement. */
   finalize(): void
 }
@@ -179,4 +179,12 @@ export interface EncryptionOpts {
 
 export interface QueryOptions {
   queryTimeout?: number
+}
+
+export interface TableColumn {
+  name: string
+  type?: string | null
+  column?: undefined
+  table?: undefined
+  database?: undefined
 }

@@ -1550,7 +1550,7 @@ impl Database {
         #[cfg(all(unix, target_pointer_width = "64"))]
         let shared_authority = self.open_shared_wal_coordination_for_open()?;
         #[cfg(not(all(unix, target_pointer_width = "64")))]
-        let shared_authority: Option<()> = None;
+        let _shared_authority: Option<()> = None;
 
         let shared_wal = {
             #[cfg(all(unix, target_pointer_width = "64"))]
@@ -2065,7 +2065,7 @@ impl Database {
     }
 
     #[cfg(feature = "simulator")]
-    pub fn shared_wal_find_frame_for_testing(&self, page_id: u64) -> Result<Option<u64>> {
+    pub fn shared_wal_find_frame_for_testing(&self, _page_id: u64) -> Result<Option<u64>> {
         #[cfg(all(unix, target_pointer_width = "64"))]
         if let Some(authority) = self.shared_wal_coordination()? {
             let snapshot = authority.snapshot();

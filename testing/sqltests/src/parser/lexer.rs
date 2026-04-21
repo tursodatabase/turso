@@ -14,14 +14,32 @@ fn extract_block_content(lexer: &mut Lexer<'_, Token>) -> Option<String> {
 
     while let Some((idx, ch)) = chars.next() {
         // Skip first character if it's a newline (structural, after `{`)
+        // Handle both LF (\n) and CRLF (\r\n)
         if is_first_char {
             is_first_char = false;
             if ch == '\n' {
                 continue;
             }
+            if ch == '\r' {
+                if let Some(&(_, next_ch)) = chars.peek() {
+                    if next_ch == '\n' {
+                        chars.next();
+                        continue;
+                    }
+                }
+                continue;
+            }
         }
 
         match ch {
+            '\r' => {
+                if let Some(&(_, next_ch)) = chars.peek() {
+                    if next_ch == '\n' {
+                        chars.next();
+                    }
+                }
+                content.push('\n');
+            }
             '\\' => {
                 // Escape sequence: check next character
                 if let Some(&(_, next_ch)) = chars.peek() {
@@ -45,7 +63,13 @@ fn extract_block_content(lexer: &mut Lexer<'_, Token>) -> Option<String> {
                     // Bump past the content and the closing brace
                     lexer.bump(idx + 1);
                     // Strip trailing newline if present (structural, before `}`)
+                    // Handle both LF (\n) and CRLF (\r\n)
                     if content.ends_with('\n') {
+                        content.pop();
+                        if content.ends_with('\r') {
+                            content.pop();
+                        }
+                    } else if content.ends_with('\r') {
                         content.pop();
                     }
                     return Some(content);

@@ -1,20 +1,12 @@
 use rand_chacha::ChaCha8Rng;
 use rand_chacha::rand_core::SeedableRng;
+#[cfg(all(unix, target_pointer_width = "64"))]
 use std::path::Path;
 use std::sync::Arc;
-use turso_core::{
-    Connection, Database, DatabaseOpts, IO, LimboError, OpenFlags, PlatformIO, Statement,
-};
+use turso_core::{Database, DatabaseOpts, IO, OpenFlags, Statement};
 #[cfg(all(unix, target_pointer_width = "64"))]
 use turso_whopper::multiprocess::{MultiprocessOpts, MultiprocessWhopper};
-use turso_whopper::{
-    IOFaultConfig, SimulatorIO,
-    workloads::{
-        BeginWorkload, CommitWorkload, CreateIndexWorkload, CreateSimpleTableWorkload,
-        DeleteWorkload, DropIndexWorkload, IntegrityCheckWorkload, RollbackWorkload,
-        SimpleInsertWorkload, SimpleSelectWorkload, UpdateWorkload, WalCheckpointWorkload,
-    },
-};
+use turso_whopper::{IOFaultConfig, SimulatorIO};
 
 /// Helper: run a SQL statement to completion with round-robin IO stepping.
 fn run_to_done(stmt: &mut Statement, io: &SimulatorIO) {
@@ -27,6 +19,7 @@ fn run_to_done(stmt: &mut Statement, io: &SimulatorIO) {
     }
 }
 
+#[cfg(all(unix, target_pointer_width = "64"))]
 fn wait_for_file(path: &Path) {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
     while std::time::Instant::now() < deadline {

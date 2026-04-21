@@ -4,6 +4,7 @@ use std::io::{self, IsTerminal, Read, Write};
 use std::time::Duration;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
+#[allow(dead_code)]
 pub enum TerminalTheme {
     Light,
     Dark,
@@ -224,6 +225,7 @@ impl TerminalDetector {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
     use super::*;
 
     #[cfg(unix)]

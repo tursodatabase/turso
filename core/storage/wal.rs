@@ -27,7 +27,7 @@ use crate::fast_lock::SpinLock;
 use crate::io::clock::MonotonicInstant;
 use crate::io::CompletionGroup;
 use crate::io::{File, IO};
-use crate::storage::database::{DatabaseStorage, EncryptionOrChecksum};
+use crate::storage::database::EncryptionOrChecksum;
 #[cfg(all(unix, target_pointer_width = "64"))]
 use crate::storage::shared_wal_coordination::SharedWalCoordinationOpenMode;
 #[cfg(all(unix, target_pointer_width = "64"))]
@@ -538,13 +538,13 @@ trait WalCoordination: Debug + Send + Sync {
     /// Whether a process-local "last connection" close may run shutdown checkpointing.
     fn should_checkpoint_on_close(&self) -> bool;
 
-    #[cfg(test)]
+    #[cfg(all(test, feature = "fs", unix, target_pointer_width = "64"))]
     fn backend_name(&self) -> &'static str;
 
     #[cfg(test)]
     fn shared_ptr(&self) -> usize;
 
-    #[cfg(test)]
+    #[cfg(all(test, feature = "fs", unix, target_pointer_width = "64"))]
     fn open_mode_name(&self) -> Option<&'static str> {
         None
     }
@@ -1140,7 +1140,7 @@ impl WalCoordination for InProcessWalCoordination {
         true
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, feature = "fs", unix, target_pointer_width = "64"))]
     fn backend_name(&self) -> &'static str {
         "in_process"
     }
@@ -3799,12 +3799,12 @@ impl WalFile {
         self.coordination.shared_ptr()
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, feature = "fs", unix, target_pointer_width = "64"))]
     pub(crate) fn coordination_backend_name(&self) -> &'static str {
         self.coordination.backend_name()
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, feature = "fs", unix, target_pointer_width = "64"))]
     pub(crate) fn coordination_open_mode_name(&self) -> Option<&'static str> {
         self.coordination.open_mode_name()
     }
@@ -4470,6 +4470,7 @@ pub(crate) fn database_identity_from_header_bytes(header_bytes: &[u8]) -> Result
     Ok((db_size_pages, header_crc32c))
 }
 
+#[cfg(all(unix, target_pointer_width = "64"))]
 fn read_database_identity_from_storage(
     io: &Arc<dyn IO>,
     db_file: &Arc<dyn DatabaseStorage>,
@@ -4914,26 +4915,25 @@ pub mod test {
         AuthoritySnapshotValidation, ShmWalCoordination,
     };
     use super::{
-        InProcessWalCoordination, ReadGuardKind, Wal, WalCommitState, WalConnectionState,
+        InProcessWalCoordination, ReadGuardKind, WalCommitState, WalConnectionState,
         WalCoordination, WalFile, WalSnapshot,
     };
+    #[cfg(all(unix, target_pointer_width = "64"))]
+    use crate::storage::database::{DatabaseFile, DatabaseStorage};
     #[cfg(all(unix, target_pointer_width = "64"))]
     use crate::storage::shared_wal_coordination::{
         MappedSharedWalCoordination, SharedWalCoordinationHeader, SharedWalCoordinationOpenMode,
     };
+    use crate::storage::{
+        buffer_pool::BufferPool,
+        sqlite3_ondisk::{self, PageSize, WAL_HEADER_SIZE},
+        wal::READMARK_NOT_USED,
+    };
     use crate::sync::{atomic::Ordering, Arc};
     use crate::sync::{Mutex, RwLock};
     use crate::{
-        storage::{
-            buffer_pool::BufferPool,
-            database::{DatabaseFile, DatabaseStorage},
-            sqlite3_ondisk::{self, PageSize, WAL_HEADER_SIZE},
-            wal::READMARK_NOT_USED,
-        },
-        types::IOResult,
-        util::IOExt,
-        Buffer, CheckpointMode, CheckpointResult, Completion, Connection, Database, File,
-        LimboError, PlatformIO, SyncMode, WalFileShared, IO,
+        types::IOResult, util::IOExt, CheckpointMode, CheckpointResult, Completion, Connection,
+        Database, LimboError, PlatformIO, SyncMode, WalFileShared, IO,
     };
     use std::num::NonZeroUsize;
     #[cfg(unix)]
@@ -4962,11 +4962,13 @@ pub mod test {
         (db, dbpath)
     }
 
+    #[cfg(all(unix, target_pointer_width = "64"))]
     struct DeferredReadFile {
         inner: Arc<dyn File>,
         pending_reads: Mutex<Vec<(u64, Completion)>>,
     }
 
+    #[cfg(all(unix, target_pointer_width = "64"))]
     impl DeferredReadFile {
         fn new(inner: Arc<dyn File>) -> Self {
             Self {
@@ -4983,6 +4985,7 @@ pub mod test {
         }
     }
 
+    #[cfg(all(unix, target_pointer_width = "64"))]
     impl File for DeferredReadFile {
         fn lock_file(&self, exclusive: bool) -> crate::Result<()> {
             self.inner.lock_file(exclusive)

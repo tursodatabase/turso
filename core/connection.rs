@@ -42,7 +42,7 @@ use tracing::{instrument, Level};
 use turso_macros::{turso_assert_ne, AtomicEnum};
 
 #[cfg(feature = "simulator")]
-fn db_identity_for_testing(db_path: &Path) -> Result<(u32, u32)> {
+fn _db_identity_for_testing(db_path: &Path) -> Result<(u32, u32)> {
     let bytes =
         std::fs::read(db_path).map_err(|e| io_error(e, "read db header for simulator testing"))?;
     let db_header_size = crate::storage::sqlite3_ondisk::DatabaseHeader::SIZE;
@@ -2443,7 +2443,7 @@ impl Connection {
 
         if is_locked {
             return Err(LimboError::InvalidArgument(format!(
-                "database {} is locked", alias
+                "database {alias} is locked"
             )));
         }
 

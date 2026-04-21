@@ -108,6 +108,11 @@ fn main() -> anyhow::Result<()> {
     {
         #[cfg(all(unix, target_pointer_width = "64"))]
         return turso_whopper::worker::run_worker(db_path, *enable_mvcc, *connections_per_process);
+        #[cfg(not(all(unix, target_pointer_width = "64")))]
+        {
+            let _ = (db_path, enable_mvcc, connections_per_process);
+            anyhow::bail!("Worker mode only supported on 64-bit Unix");
+        }
     }
 
     init_logger();

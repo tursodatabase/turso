@@ -474,11 +474,11 @@ mod arena {
 
 #[cfg(any(not(unix), miri))]
 mod arena {
-    pub fn alloc(len: usize) -> *mut u8 {
+    pub unsafe fn alloc(len: usize) -> *mut u8 {
         let layout = std::alloc::Layout::from_size_align(len, std::mem::size_of::<u8>()).unwrap();
         unsafe { std::alloc::alloc_zeroed(layout) }
     }
-    pub fn dealloc(ptr: *mut u8, len: usize) {
+    pub unsafe fn dealloc(ptr: *mut u8, len: usize) {
         let layout = std::alloc::Layout::from_size_align(len, std::mem::size_of::<u8>()).unwrap();
         unsafe { std::alloc::dealloc(ptr, layout) };
     }
