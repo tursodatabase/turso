@@ -581,6 +581,66 @@ expect {
 }
 
 @cross-check-integrity
+test row-values-from-subquery {
+    CREATE TABLE target(id INTEGER PRIMARY KEY, name TEXT, value INTEGER);
+    CREATE TABLE src(id INTEGER, new_name TEXT, new_value INTEGER);
+    INSERT INTO target VALUES (1, 'old', 1), (2, 'older', 2);
+    INSERT INTO src VALUES (1, 'new', 10), (2, 'newer', 20);
+    UPDATE target
+       SET (name, value) = (
+           SELECT src.new_name, src.new_value
+             FROM src
+            WHERE src.id = target.id
+       );
+    SELECT id, name, value FROM target ORDER BY id;
+}
+expect {
+    1|new|10
+    2|newer|20
+}
+
+@cross-check-integrity
+test row-values-from-subquery-star {
+    CREATE TABLE target(id INTEGER PRIMARY KEY, name TEXT, value INTEGER);
+    CREATE TABLE src(new_name TEXT, new_value INTEGER);
+    INSERT INTO target VALUES (1, 'old', 1);
+    INSERT INTO src VALUES ('new', 10);
+    UPDATE target
+       SET (name, value) = (SELECT * FROM src);
+    SELECT id, name, value FROM target;
+}
+expect {
+    1|new|10
+}
+
+@cross-check-integrity
+test row-values-from-volatile-subquery-project-same-row {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, a INTEGER, b INTEGER);
+    INSERT INTO t VALUES (1, 0, 0);
+    UPDATE t
+       SET (a, b) = (
+           SELECT x, x
+             FROM (SELECT abs(random()) AS x)
+       );
+    SELECT a = b, a IS NOT NULL, b IS NOT NULL FROM t;
+}
+expect {
+    1|1|1
+}
+
+@cross-check-integrity
+test row-values-from-subquery-star-width-mismatch {
+    CREATE TABLE target(id INTEGER PRIMARY KEY, name TEXT, value INTEGER);
+    CREATE TABLE src(new_name TEXT, new_value INTEGER, ignored INTEGER);
+    INSERT INTO target VALUES (1, 'old', 1);
+    INSERT INTO src VALUES ('new', 10, 99);
+    UPDATE target
+       SET (name, value) = (SELECT * FROM src);
+}
+expect error {
+}
+
+@cross-check-integrity
 test rowid-update-updates-all-indexes {
     CREATE TABLE t (a INTEGER PRIMARY KEY, b UNIQUE, c UNIQUE);
     INSERT INTO t VALUES (1,1,1);
@@ -594,6 +654,21 @@ expect {
     2|3|1
     2|3|1
     2|3|1
+}
+
+@cross-check-integrity
+test update-with-trigger-and-index-scan-preserves-unchanged-indexed-columns {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, a INTEGER, b INTEGER, c INTEGER);
+    CREATE INDEX t_a ON t(a);
+    CREATE TRIGGER trg BEFORE UPDATE ON t BEGIN SELECT 1; END;
+    INSERT INTO t VALUES (1, 1, 10, 100), (2, 2, 20, 200), (3, 3, 30, 300);
+    UPDATE t SET b = b + 1 WHERE a = 2;
+    SELECT * FROM t ORDER BY id;
+}
+expect {
+    1|1|10|100
+    2|2|21|200
+    3|3|30|300
 }
 
 # https://github.com/tursodatabase/turso/issues/3276
@@ -1018,4 +1093,3 @@ expect {
     1|2
     2|1
 }
-

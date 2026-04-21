@@ -993,9 +993,13 @@ impl fmt::Display for InsertStmt {
 pub struct UpdateStmt {
     pub with_clause: Option<WithClause>,
     pub table: String,
+    pub alias: Option<String>,
     pub sets: Vec<(String, Expr)>,
+    pub from: Option<FromClause>,
+    pub joins: Vec<JoinClause>,
     pub where_clause: Option<Expr>,
     pub conflict: Option<ConflictClause>,
+    pub returning: Option<Vec<Expr>>,
 }
 
 impl fmt::Display for UpdateStmt {
@@ -1007,7 +1011,11 @@ impl fmt::Display for UpdateStmt {
         if let Some(conflict) = &self.conflict {
             write!(f, "{conflict}")?;
         }
-        write!(f, " {} SET ", self.table)?;
+        write!(f, " {}", self.table)?;
+        if let Some(alias) = &self.alias {
+            write!(f, " AS {alias}")?;
+        }
+        write!(f, " SET ")?;
 
         for (i, (col, val)) in self.sets.iter().enumerate() {
             if i > 0 {
@@ -1016,8 +1024,40 @@ impl fmt::Display for UpdateStmt {
             write!(f, "{col} = {val}")?;
         }
 
+        if let Some(from) = &self.from {
+            write!(f, " FROM {}", from.table)?;
+            if let Some(alias) = &from.alias {
+                write!(f, " AS {alias}")?;
+            }
+        }
+
+        for join in &self.joins {
+            match join.join_type {
+                JoinType::Inner => write!(f, " JOIN {}", join.table)?,
+                JoinType::Left => write!(f, " LEFT JOIN {}", join.table)?,
+                JoinType::Cross => write!(f, " CROSS JOIN {}", join.table)?,
+                JoinType::Natural => write!(f, " NATURAL JOIN {}", join.table)?,
+            }
+            if let Some(alias) = &join.alias {
+                write!(f, " AS {alias}")?;
+            }
+            if let Some(JoinConstraint::On(expr)) = &join.constraint {
+                write!(f, " ON {expr}")?;
+            }
+        }
+
         if let Some(where_clause) = &self.where_clause {
             write!(f, " WHERE {where_clause}")?;
+        }
+
+        if let Some(returning) = &self.returning {
+            write!(f, " RETURNING ")?;
+            for (i, expr) in returning.iter().enumerate() {
+                if i > 0 {
+                    write!(f, ", ")?;
+                }
+                write!(f, "{expr}")?;
+            }
         }
 
         Ok(())

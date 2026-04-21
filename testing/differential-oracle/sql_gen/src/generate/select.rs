@@ -811,7 +811,7 @@ fn select_nulls_order(
 /// Picks a random number of joins (1..=max_joins), selects join types by weight,
 /// and generates ON conditions for INNER/LEFT joins. Each joined table is pushed
 /// into the current scope before generating its ON condition.
-fn generate_join_clauses<C: Capabilities>(
+pub(crate) fn generate_join_clauses<C: Capabilities>(
     generator: &SqlGen<C>,
     ctx: &mut Context,
 ) -> Result<Vec<JoinClause>, GenError> {
@@ -929,7 +929,7 @@ fn generate_join_clauses<C: Capabilities>(
 /// using compatible columns. Otherwise generates a general boolean expression.
 /// Both tables are read from the current scope: the primary table is `[0]` and the
 /// just-pushed joined table is the last entry.
-fn generate_join_on_condition<C: Capabilities>(
+pub(crate) fn generate_join_on_condition<C: Capabilities>(
     generator: &SqlGen<C>,
     ctx: &mut Context,
 ) -> Result<Expr, GenError> {
