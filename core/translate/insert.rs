@@ -1,6 +1,5 @@
-use crate::schema::{ColumnLayout, GeneratedType};
+use crate::schema::ColumnLayout;
 use crate::translate::emitter::{emit_index_column_value_old_image, gencol};
-use crate::translate::optimizer::Optimizable;
 use crate::turso_debug_assert;
 use crate::{
     error::{SQLITE_CONSTRAINT_NOTNULL, SQLITE_CONSTRAINT_PRIMARYKEY, SQLITE_CONSTRAINT_UNIQUE},
@@ -2648,16 +2647,9 @@ fn translate_column(
         program.emit_insn(Insn::SoftNull {
             reg: column_register,
         });
-    } else if matches!(
-        column.generated_type(),
-        GeneratedType::Virtual { expr, .. } if expr.is_constant(resolver)
-    ) {
-        // Constant virtual generated columns are hoisted to the program init
-        // section by translate_expr in compute_virtual_columns. Emitting NULL
-        // here would clobber the hoisted value before constraint checks
-        // (e.g. NOT NULL) and triggers read it.
-    } else if column.hidden() || column.is_virtual_generated() {
-        // Emit NULL for not-explicitly-mentioned hidden or virtual columns, even ignoring DEFAULT.
+    } else if column.is_virtual_generated() {
+        // virtual columns are computed in a separate pass in compute_virtual_columns
+    } else if column.hidden() {
         program.emit_insn(Insn::Null {
             dest: column_register,
             dest_end: None,

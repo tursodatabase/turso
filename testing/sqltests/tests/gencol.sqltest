@@ -4534,3 +4534,12 @@ test integrity-check-unique-virtual-column {
 } expect {
     ok
 }
+
+@cross-check-integrity
+test insert-transitive-unique-index {
+    CREATE TABLE t (a UNIQUE AS (b), b AS ('x'), c);
+    INSERT INTO t(c) VALUES (1);
+    INSERT INTO t(c) VALUES (2);
+} expect error {
+    UNIQUE constraint failed: t.a
+}
