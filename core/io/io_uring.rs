@@ -69,6 +69,12 @@ struct WrappedIOUring {
     ring: io_uring::IoUring,
     pending_ops: usize,
     writev_states: HashMap<u64, WritevState>,
+    /// Opcode name recorded at submit time, keyed by user_data. Consumed on CQE
+    /// so error messages and tracing can identify which op produced a given
+    /// errno (pread / pwrite / pwritev / fsync / ftruncate / ...). Without
+    /// this a kernel-returned EINVAL comes back as a bare "io_uring_cqe" with
+    /// zero signal about which SQE was malformed.
+    op_tags: HashMap<u64, &'static str>,
     overflow: VecDeque<io_uring::squeue::Entry>,
     iov_pool: IovecPool,
 }
@@ -144,6 +150,7 @@ impl UringIO {
                 overflow: VecDeque::new(),
                 pending_ops: 0,
                 writev_states: HashMap::default(),
+                op_tags: HashMap::default(),
                 iov_pool: IovecPool::new(),
             },
             free_arenas: [const { None }; ARENA_COUNT],
@@ -243,8 +250,12 @@ impl InnerUringIO {
 }
 
 impl WrappedIOUring {
-    fn submit_entry(&mut self, entry: &io_uring::squeue::Entry) {
-        trace!("submit_entry({:?})", entry);
+    fn submit_entry(&mut self, entry: &io_uring::squeue::Entry, op_name: &'static str) {
+        trace!("submit_entry({:?}) op={}", entry, op_name);
+        let user_data = entry.get_user_data();
+        if user_data != CANCEL_TAG {
+            self.op_tags.insert(user_data, op_name);
+        }
         // we cannot push current entries before any overflow
         if self.flush_overflow().is_ok() {
             let pushed = unsafe {
@@ -259,6 +270,23 @@ impl WrappedIOUring {
         // if we were unable to push, add to overflow
         self.overflow.push_back(entry.clone());
         self.ring.submit().expect("submitting when full");
+    }
+
+    /// Consume the opcode tag recorded at submit time. Missing entries fall
+    /// back to a distinct label so a stray "untagged" CQE is obvious in logs
+    /// (it signals either a double-processed CQE or a SQE that bypassed
+    /// `submit_entry`).
+    fn take_op_tag(&mut self, user_data: u64) -> &'static str {
+        match self.op_tags.remove(&user_data) {
+            Some(name) => name,
+            None => {
+                tracing::warn!(
+                    "io_uring CQE without op_tag (user_data={:#x}) — double CQE or bypassed submit_entry",
+                    user_data
+                );
+                "io_uring_cqe_untagged"
+            }
+        }
     }
 
     fn submit_cancel_urgent(&mut self, entry: &io_uring::squeue::Entry) -> Result<()> {
@@ -364,6 +392,13 @@ impl WrappedIOUring {
             }
         }
 
+        let _bufs_len = st.bufs.len();
+        let _current_idx = st.current_buffer_idx;
+        let _remaining = st.remaining();
+        turso_assert!(
+            iov_count > 0,
+            "submit_writev built a zero-iovec Writev — kernel would return EINVAL (current_buffer_idx={_current_idx} bufs.len()={_bufs_len} remaining={_remaining})"
+        );
         let ptr = iov_allocation.as_ptr() as *mut libc::iovec;
         st.last_iov_allocation = Some(iov_allocation);
         let entry = io_uring::opcode::Writev::new(st.file_id, ptr, iov_count as u32)
@@ -371,14 +406,22 @@ impl WrappedIOUring {
             .build()
             .user_data(key);
         self.writev_states.insert(key, st);
-        self.submit_entry(&entry);
+        self.submit_entry(&entry, "pwritev");
     }
 
     fn handle_writev_completion(&mut self, mut state: WritevState, user_data: u64, result: i32) {
         if result < 0 {
             let err = std::io::Error::from_raw_os_error(-result);
-            tracing::error!("writev failed (user_data: {}): {}", user_data, err);
+            tracing::error!(
+                "writev failed (user_data={:#x} file_pos={} bufs.len()={} remaining={}): {}",
+                user_data,
+                state.file_pos,
+                state.bufs.len(),
+                state.remaining(),
+                err
+            );
             state.free_last_iov(&mut self.iov_pool);
+            self.op_tags.remove(&user_data);
             completion_from_key(user_data).error(CompletionError::IOError(err.kind(), "pwritev"));
             return;
         }
@@ -388,6 +431,7 @@ impl WrappedIOUring {
         // guard against no-progress loop
         if written == 0 && state.remaining() > 0 {
             state.free_last_iov(&mut self.iov_pool);
+            self.op_tags.remove(&user_data);
             completion_from_key(user_data).error(CompletionError::ShortWrite);
             return;
         }
@@ -401,6 +445,7 @@ impl WrappedIOUring {
                 );
                 // write complete, return iovec to pool
                 state.free_last_iov(&mut self.iov_pool);
+                self.op_tags.remove(&user_data);
                 completion_from_key(user_data).complete(state.total_written as i32);
             }
             remaining => {
@@ -493,11 +538,19 @@ impl IO for UringIO {
                     ring.handle_writev_completion(state, user_data, result);
                     continue 'inner;
                 }
+                drop(cq);
+                let op = ring.take_op_tag(user_data);
                 if result < 0 {
                     let errno = -result;
                     let err = std::io::Error::from_raw_os_error(errno);
-                    completion_from_key(user_data)
-                        .error(CompletionError::IOError(err.kind(), "io_uring_cqe"));
+                    tracing::error!(
+                        "io_uring CQE error: op={} user_data={:#x} errno={} ({})",
+                        op,
+                        user_data,
+                        errno,
+                        err
+                    );
+                    completion_from_key(user_data).error(CompletionError::IOError(err.kind(), op));
                 } else {
                     completion_from_key(user_data).complete(result)
                 }
@@ -548,11 +601,19 @@ impl IO for UringIO {
                 ring.handle_writev_completion(state, user_data, result);
                 continue;
             }
+            drop(cq);
+            let op = ring.take_op_tag(user_data);
             if result < 0 {
                 let errno = -result;
                 let err = std::io::Error::from_raw_os_error(errno);
-                completion_from_key(user_data)
-                    .error(CompletionError::IOError(err.kind(), "io_uring_cqe"));
+                tracing::error!(
+                    "io_uring CQE error: op={} user_data={:#x} errno={} ({})",
+                    op,
+                    user_data,
+                    errno,
+                    err
+                );
+                completion_from_key(user_data).error(CompletionError::IOError(err.kind(), op));
             } else {
                 completion_from_key(user_data).complete(result)
             }
@@ -672,10 +733,10 @@ impl File for UringFile {
 
     fn pread(&self, pos: u64, c: Completion) -> Result<Completion> {
         let r = c.as_read();
-        let read_e = {
+        let fd = io_uring::types::Fd(self.file.as_raw_fd());
+        let (read_e, op_name) = {
             let buf = r.buf();
             let ptr = buf.as_mut_ptr();
-            let fd = io_uring::types::Fd(self.file.as_raw_fd());
             let len = buf.len();
             if let Some(idx) = buf.fixed_id() {
                 trace!(
@@ -688,29 +749,30 @@ impl File for UringFile {
                 {
                     self.io.lock().debug_check_fixed(idx, ptr, len);
                 }
-                io_uring::opcode::ReadFixed::new(fd, ptr, len as u32, idx as u16)
+                let e = io_uring::opcode::ReadFixed::new(fd, ptr, len as u32, idx as u16)
                     .offset(pos)
                     .build()
-                    .user_data(get_key(c.clone()))
+                    .user_data(get_key(c.clone()));
+                (e, "pread_fixed")
             } else {
                 trace!("pread(pos = {}, length = {})", pos, len);
-                // Use Read opcode if fixed buffer is not available
-                io_uring::opcode::Read::new(fd, buf.as_mut_ptr(), len as u32)
+                let e = io_uring::opcode::Read::new(fd, buf.as_mut_ptr(), len as u32)
                     .offset(pos)
                     .build()
-                    .user_data(get_key(c.clone()))
+                    .user_data(get_key(c.clone()));
+                (e, "pread")
             }
         };
-        self.io.lock().ring.submit_entry(&read_e);
+        self.io.lock().ring.submit_entry(&read_e, op_name);
         Ok(c)
     }
 
     fn pwrite(&self, pos: u64, buffer: Arc<crate::Buffer>, c: Completion) -> Result<Completion> {
         let mut io = self.io.lock();
-        let write = {
+        let fd = io_uring::types::Fd(self.file.as_raw_fd());
+        let (write, op_name) = {
             let ptr = buffer.as_ptr();
             let len = buffer.len();
-            let fd = io_uring::types::Fd(self.file.as_raw_fd());
             if let Some(idx) = buffer.fixed_id() {
                 trace!(
                     "pwrite_fixed(pos = {}, length = {}, idx= {})",
@@ -722,16 +784,18 @@ impl File for UringFile {
                 {
                     io.debug_check_fixed(idx, ptr, len);
                 }
-                io_uring::opcode::WriteFixed::new(fd, ptr, len as u32, idx as u16)
+                let e = io_uring::opcode::WriteFixed::new(fd, ptr, len as u32, idx as u16)
                     .offset(pos)
                     .build()
-                    .user_data(get_key(c.clone()))
+                    .user_data(get_key(c.clone()));
+                (e, "pwrite_fixed")
             } else {
                 trace!("pwrite(pos = {}, length = {})", pos, buffer.len());
-                io_uring::opcode::Write::new(fd, ptr, len as u32)
+                let e = io_uring::opcode::Write::new(fd, ptr, len as u32)
                     .offset(pos)
                     .build()
-                    .user_data(get_key(c.clone()))
+                    .user_data(get_key(c.clone()));
+                (e, "pwrite")
             }
         };
 
@@ -739,7 +803,7 @@ impl File for UringFile {
         // buffers the SQE holds a raw pointer; without this the Arc would drop
         // here and the kernel could read freed memory.
         c.keep_write_buffer_alive(buffer);
-        io.ring.submit_entry(&write);
+        io.ring.submit_entry(&write, op_name);
         Ok(c)
     }
 
@@ -749,7 +813,7 @@ impl File for UringFile {
         let sync = io_uring::opcode::Fsync::new(fd)
             .build()
             .user_data(get_key(c.clone()));
-        self.io.lock().ring.submit_entry(&sync);
+        self.io.lock().ring.submit_entry(&sync, "fsync");
         Ok(c)
     }
 
@@ -781,7 +845,7 @@ impl File for UringFile {
             let truncate = io_uring::opcode::Ftruncate::new(fd, len)
                 .build()
                 .user_data(get_key(c.clone()));
-            self.io.lock().ring.submit_entry(&truncate);
+            self.io.lock().ring.submit_entry(&truncate, "ftruncate");
             Ok(c)
         } else {
             let result = self.file.set_len(len);
