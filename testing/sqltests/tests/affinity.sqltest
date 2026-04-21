@@ -528,3 +528,25 @@ expect {
     1.5|text
     1a|text
 }
+
+@cross-check-integrity
+test cast-text-to-numeric-integral-float {
+    SELECT CAST('3.0' AS NUMERIC), typeof(CAST('3.0' AS NUMERIC));
+    SELECT CAST('3.5' AS NUMERIC), typeof(CAST('3.5' AS NUMERIC));
+    SELECT CAST('1e10' AS NUMERIC), typeof(CAST('1e10' AS NUMERIC));
+    SELECT CAST('1e-10' AS NUMERIC), typeof(CAST('1e-10' AS NUMERIC));
+    SELECT CAST('-0.0' AS NUMERIC), typeof(CAST('-0.0' AS NUMERIC));
+    SELECT CAST('1e100' AS NUMERIC), typeof(CAST('1e100' AS NUMERIC));
+    SELECT CAST('2251799813685247.0' AS NUMERIC), typeof(CAST('2251799813685247.0' AS NUMERIC));
+    SELECT CAST('2251799813685248.0' AS NUMERIC), typeof(CAST('2251799813685248.0' AS NUMERIC));
+}
+expect {
+    3|integer
+    3.5|real
+    10000000000|integer
+    1.0e-10|real
+    0|integer
+    1.0e+100|real
+    2251799813685247|integer
+    2.25179981368525e+15|real
+}

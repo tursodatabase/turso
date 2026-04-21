@@ -1208,11 +1208,32 @@ pub fn checked_cast_text_to_numeric(text: &str, lossless: bool) -> std::result::
                 }
             }
         },
-        ValueType::Float => Ok(text
-            .parse::<f64>()
-            .map_or(Value::from_f64(0.0), Value::from_f64)),
+        ValueType::Float => {
+            let value = text.parse::<f64>().unwrap_or(0.0);
+            Ok(real_to_numeric_value(value))
+        }
         _ => unreachable!(),
     }
+}
+
+/// Applies the same normalization strategy as SQLite:
+/// converts a `f64` to an integer when it represents an exact integral value.
+///
+/// The conversion is restricted to 51-bit signed integers to ensure the value
+/// can round-trip through a text representation without losing precision,
+/// staying below the 52-bit mantissa limit of IEEE 754 `f64`.
+fn real_to_numeric_value(value: f64) -> Value {
+    const INT51_MAX: i64 = 1 << 51;
+    if value == 0.0 {
+        return Value::from_i64(0);
+    }
+    if value.is_finite() {
+        let i = value as i64;
+        if (i as f64) == value && (-INT51_MAX..INT51_MAX).contains(&i) {
+            return Value::from_i64(i);
+        }
+    }
+    Value::from_f64(value)
 }
 
 fn parse_numeric_str(text: &str) -> Result<(ValueType, &str), ()> {
@@ -5688,19 +5709,19 @@ pub mod tests {
         );
         assert_eq!(
             checked_cast_text_to_numeric("1.0", false).unwrap(),
-            Value::from_f64(1.0)
+            Value::from_i64(1)
         );
         assert_eq!(
             checked_cast_text_to_numeric("-1.0", false).unwrap(),
-            Value::from_f64(-1.0)
+            Value::from_i64(-1)
         );
         assert_eq!(
             checked_cast_text_to_numeric("1e10", false).unwrap(),
-            Value::from_f64(1e10)
+            Value::from_i64(10_000_000_000)
         );
         assert_eq!(
             checked_cast_text_to_numeric("-1e10", false).unwrap(),
-            Value::from_f64(-1e10)
+            Value::from_i64(-10_000_000_000)
         );
         assert_eq!(
             checked_cast_text_to_numeric("1e-10", false).unwrap(),
@@ -5712,11 +5733,11 @@ pub mod tests {
         );
         assert_eq!(
             checked_cast_text_to_numeric("1.123e10", false).unwrap(),
-            Value::from_f64(1.123e10)
+            Value::from_i64(11_230_000_000)
         );
         assert_eq!(
             checked_cast_text_to_numeric("-1.123e10", false).unwrap(),
-            Value::from_f64(-1.123e10)
+            Value::from_i64(-11_230_000_000)
         );
         assert_eq!(
             checked_cast_text_to_numeric("1.123e-10", false).unwrap(),
@@ -5744,23 +5765,23 @@ pub mod tests {
         );
         assert_eq!(
             checked_cast_text_to_numeric("1E", false).unwrap(),
-            Value::from_f64(1.0)
+            Value::from_i64(1)
         );
         assert_eq!(
             checked_cast_text_to_numeric("1EE", false).unwrap(),
-            Value::from_f64(1.0)
+            Value::from_i64(1)
         );
         assert_eq!(
             checked_cast_text_to_numeric("-1E", false).unwrap(),
-            Value::from_f64(-1.0)
+            Value::from_i64(-1)
         );
         assert_eq!(
             checked_cast_text_to_numeric("1.", false).unwrap(),
-            Value::from_f64(1.0)
+            Value::from_i64(1)
         );
         assert_eq!(
             checked_cast_text_to_numeric("-1.", false).unwrap(),
-            Value::from_f64(-1.0)
+            Value::from_i64(-1)
         );
         assert_eq!(
             checked_cast_text_to_numeric("1.23E", false).unwrap(),
@@ -5784,11 +5805,11 @@ pub mod tests {
         );
         assert_eq!(
             checked_cast_text_to_numeric("-0.0", false).unwrap(),
-            Value::from_f64(0.0)
+            Value::from_i64(0)
         );
         assert_eq!(
             checked_cast_text_to_numeric("0.0", false).unwrap(),
-            Value::from_f64(0.0)
+            Value::from_i64(0)
         );
         assert!(checked_cast_text_to_numeric("-", false).is_err());
     }
@@ -5834,19 +5855,19 @@ pub mod tests {
 
         assert_eq!(
             checked_cast_text_to_numeric("1.0", false).unwrap(),
-            Value::from_f64(1.0)
+            Value::from_i64(1)
         );
         assert_eq!(
             checked_cast_text_to_numeric("-1.0", false).unwrap(),
-            Value::from_f64(-1.0)
+            Value::from_i64(-1)
         );
         assert_eq!(
             checked_cast_text_to_numeric("1e10", false).unwrap(),
-            Value::from_f64(1e10)
+            Value::from_i64(10_000_000_000)
         );
         assert_eq!(
             checked_cast_text_to_numeric("-1e10", false).unwrap(),
-            Value::from_f64(-1e10)
+            Value::from_i64(-10_000_000_000)
         );
         assert_eq!(
             checked_cast_text_to_numeric("1e-10", false).unwrap(),
@@ -5858,11 +5879,11 @@ pub mod tests {
         );
         assert_eq!(
             checked_cast_text_to_numeric("1.123e10", false).unwrap(),
-            Value::from_f64(1.123e10)
+            Value::from_i64(11_230_000_000)
         );
         assert_eq!(
             checked_cast_text_to_numeric("-1.123e10", false).unwrap(),
-            Value::from_f64(-1.123e10)
+            Value::from_i64(-11_230_000_000)
         );
         assert_eq!(
             checked_cast_text_to_numeric("1.123e-10", false).unwrap(),
@@ -5892,23 +5913,23 @@ pub mod tests {
 
         assert_eq!(
             checked_cast_text_to_numeric("1E", false).unwrap(),
-            Value::from_f64(1.0)
+            Value::from_i64(1)
         );
         assert_eq!(
             checked_cast_text_to_numeric("1EE", false).unwrap(),
-            Value::from_f64(1.0)
+            Value::from_i64(1)
         );
         assert_eq!(
             checked_cast_text_to_numeric("-1E", false).unwrap(),
-            Value::from_f64(-1.0)
+            Value::from_i64(-1)
         );
         assert_eq!(
             checked_cast_text_to_numeric("1.", false).unwrap(),
-            Value::from_f64(1.0)
+            Value::from_i64(1)
         );
         assert_eq!(
             checked_cast_text_to_numeric("-1.", false).unwrap(),
-            Value::from_f64(-1.0)
+            Value::from_i64(-1)
         );
         assert_eq!(
             checked_cast_text_to_numeric("1.23E", false).unwrap(),
@@ -5929,11 +5950,11 @@ pub mod tests {
         );
         assert_eq!(
             checked_cast_text_to_numeric("-0.0", false).unwrap(),
-            Value::from_f64(0.0)
+            Value::from_i64(0)
         );
         assert_eq!(
             checked_cast_text_to_numeric("0.0", false).unwrap(),
-            Value::from_f64(0.0)
+            Value::from_i64(0)
         );
         assert!(checked_cast_text_to_numeric("-", false).is_err());
         assert_eq!(
@@ -6277,7 +6298,7 @@ pub mod tests {
         );
         assert_eq!(
             checked_cast_text_to_numeric("1.0", true),
-            Ok(Value::from_f64(1.0))
+            Ok(Value::from_i64(1))
         );
         assert_eq!(
             checked_cast_text_to_numeric("-3.22", true),
@@ -6289,7 +6310,7 @@ pub mod tests {
         );
         assert_eq!(
             checked_cast_text_to_numeric("2e3", true),
-            Ok(Value::from_f64(2000.0))
+            Ok(Value::from_i64(2000))
         );
         assert_eq!(
             checked_cast_text_to_numeric("-5.5e-2", true),
