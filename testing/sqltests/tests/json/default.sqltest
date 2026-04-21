@@ -1726,6 +1726,33 @@ expect {
     [0,1]|0|1
 }
 
+test jsonb_set_append_hash_boundary_extract {
+    SELECT json_extract(
+      jsonb_set(jsonb('{"a":[0,0,0,0,0,true]}'), '$.a[#]', 1),
+      '$.a[6]'
+    );
+}
+expect {
+    1
+}
+
+test jsonb_set_append_hash_boundary_hex {
+    SELECT hex(jsonb_set(jsonb('{"a":[0,0,0,0,0,true]}'), '$.a[#]', 1));
+}
+expect {
+    CC111761CB0D13301330133013301330011331
+}
+
+test jsonb_set_append_hash_nested_boundary_extract {
+    SELECT json_extract(
+      jsonb_set(jsonb('{"o":{"a":[0,0,0,0,0,true]}}'), '$.o.a[#]', 1),
+      '$.o.a[6]'
+    );
+}
+expect {
+    1
+}
+
 test json_set_add_value_to_array_out_of_bounds {
     SELECT json_set('[123]', '$[200]', 456);
 }
@@ -1738,6 +1765,13 @@ test json_set_replace_value_in_array {
 }
 expect {
     [456]
+}
+
+test json_set_replace_value_in_array_header_shrink {
+    SELECT json_set('{"a":[0,0,0,0,0,1]}', '$.a[5]', json('null'));
+}
+expect {
+    {"a":[0,0,0,0,0,null]}
 }
 
 test json_set_null_path {
@@ -1917,6 +1951,13 @@ test json_replace_array_append_hash_noop {
 }
 expect {
     [1,2,3]
+}
+
+test json_replace_value_in_array_header_shrink {
+    SELECT json_replace('{"a":[0,0,0,0,0,1]}', '$.a[5]', json('null'));
+}
+expect {
+    {"a":[0,0,0,0,0,null]}
 }
 
 test json_insert_array_existing_not_replaced {
@@ -2389,6 +2430,13 @@ test json_remove_root {
     SELECT json_remove('{"a": 1}', '$')
 }
 expect {
+}
+
+test jsonb_remove_nested_array_header_shrink {
+    SELECT json(jsonb_remove(jsonb('[["abcdefghijk"]]'), '$[0][0]'));
+}
+expect {
+    [[]]
 }
 
 test jsonb_remove_root {

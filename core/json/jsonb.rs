@@ -174,6 +174,26 @@ const fn make_character_type_ok_table() -> [u8; 256] {
 
 static CHARACTER_TYPE_OK: [u8; 256] = make_character_type_ok_table();
 
+fn checked_size_add_delta(base: usize, delta: isize, context: &'static str) -> Result<usize> {
+    base.checked_add_signed(delta).ok_or_else(|| {
+        LimboError::InternalError(format!("jsonb size update overflow while {context}"))
+    })
+}
+
+fn checked_len_diff(new_len: usize, old_len: usize, context: &'static str) -> Result<isize> {
+    let new_len = isize::try_from(new_len).map_err(|_| {
+        LimboError::InternalError(format!("jsonb header length out of range while {context}"))
+    })?;
+    let old_len = isize::try_from(old_len).map_err(|_| {
+        LimboError::InternalError(format!("jsonb header length out of range while {context}"))
+    })?;
+    new_len.checked_sub(old_len).ok_or_else(|| {
+        LimboError::InternalError(format!(
+            "jsonb header length delta overflow while {context}"
+        ))
+    })
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct Jsonb {
     data: Vec<u8>,
@@ -357,13 +377,19 @@ impl PathOperation for SetOperation {
                 target.field_key_index,
                 JsonLocationKind::ObjectProperty(_) | JsonLocationKind::DocumentRoot
             ) {
+                let new_obj_size =
+                    checked_size_add_delta(obj_value_size, delta, "setting array item")?;
                 let new_h_delta = json.write_element_header(
                     obj_value_idx,
                     ElementType::ARRAY,
-                    (obj_value_size as isize + delta) as usize,
+                    new_obj_size,
                     true,
                 )?;
-                (new_h_delta - obj_value_header_size) as isize
+                checked_len_diff(
+                    new_h_delta,
+                    obj_value_header_size,
+                    "updating array header while setting array item",
+                )?
             } else {
                 0
             };
@@ -433,13 +459,19 @@ impl PathOperation for DeleteOperation {
                 target.field_key_index,
                 JsonLocationKind::ObjectProperty(_) | JsonLocationKind::DocumentRoot
             ) {
+                let new_obj_size =
+                    checked_size_add_delta(obj_value_size, delta, "deleting array item")?;
                 let new_h_delta = json.write_element_header(
                     obj_value_idx,
                     ElementType::ARRAY,
-                    (obj_value_size as isize + delta) as usize,
+                    new_obj_size,
                     true,
                 )?;
-                new_h_delta as isize - obj_value_header_size as isize
+                checked_len_diff(
+                    new_h_delta,
+                    obj_value_header_size,
+                    "updating array header while deleting array item",
+                )?
             } else {
                 0
             };
@@ -455,7 +487,7 @@ impl PathOperation for DeleteOperation {
 
             json.update_parent_references(stack, delta + target.delta)?;
         } else {
-            let nul = JsonbHeader::make_null().into_bytes();
+            let nul = JsonbHeader::make_null().into_bytes()?;
             let nul_bytes = nul.as_bytes();
             json.data.clear();
             json.data.extend_from_slice(nul_bytes);
@@ -516,13 +548,19 @@ impl PathOperation for ReplaceOperation {
                 target.field_key_index,
                 JsonLocationKind::ObjectProperty(_) | JsonLocationKind::DocumentRoot
             ) {
+                let new_obj_size =
+                    checked_size_add_delta(obj_value_size, delta, "replacing array item")?;
                 let new_h_delta = json.write_element_header(
                     obj_value_idx,
                     ElementType::ARRAY,
-                    (obj_value_size as isize + delta) as usize,
+                    new_obj_size,
                     true,
                 )?;
-                (new_h_delta - obj_value_header_size) as isize
+                checked_len_diff(
+                    new_h_delta,
+                    obj_value_header_size,
+                    "updating array header while replacing array item",
+                )?
             } else {
                 0
             };
@@ -597,13 +635,19 @@ impl PathOperation for InsertOperation {
                 target.field_key_index,
                 JsonLocationKind::ObjectProperty(_) | JsonLocationKind::DocumentRoot
             ) {
+                let new_obj_size =
+                    checked_size_add_delta(obj_value_size, delta, "inserting array item")?;
                 let new_h_delta = json.write_element_header(
                     obj_value_idx,
                     ElementType::ARRAY,
-                    (obj_value_size as isize + delta) as usize,
+                    new_obj_size,
                     true,
                 )?;
-                (new_h_delta - obj_value_header_size) as isize
+                checked_len_diff(
+                    new_h_delta,
+                    obj_value_header_size,
+                    "updating array header while inserting array item",
+                )?
             } else {
                 0
             };
@@ -835,44 +879,45 @@ impl JsonbHeader {
         }
     }
 
-    pub fn into_bytes(self) -> HeaderFormat {
+    pub fn into_bytes(self) -> Result<HeaderFormat> {
         let (element_type, payload_size) = (self.0, self.1);
 
         match payload_size {
             // Small payload (fits in 4 bits)
-            size if size <= 11 => {
-                HeaderFormat::Inline([(element_type as u8) | ((size as u8) << 4)])
-            }
+            size if size <= 11 => Ok(HeaderFormat::Inline([
+                (element_type as u8) | ((size as u8) << 4)
+            ])),
 
             // Medium payload (fits in 1 byte)
-            size if size <= 0xFF => {
-                HeaderFormat::OneByte([(element_type as u8) | (SIZE_MARKER_8BIT << 4), size as u8])
-            }
+            size if size <= 0xFF => Ok(HeaderFormat::OneByte([
+                (element_type as u8) | (SIZE_MARKER_8BIT << 4),
+                size as u8,
+            ])),
 
             // Large payload (fits in 2 bytes)
             size if size <= 0xFFFF => {
                 let size_bytes = (size as u16).to_be_bytes();
-                HeaderFormat::TwoBytes([
+                Ok(HeaderFormat::TwoBytes([
                     (element_type as u8) | (SIZE_MARKER_16BIT << 4),
                     size_bytes[0],
                     size_bytes[1],
-                ])
+                ]))
             }
 
             // Extra large payload (fits in 4 bytes)
             size if size <= 0xFFFFFFFF => {
                 let size_bytes = (size as u32).to_be_bytes();
-                HeaderFormat::FourBytes([
+                Ok(HeaderFormat::FourBytes([
                     (element_type as u8) | (SIZE_MARKER_32BIT << 4),
                     size_bytes[0],
                     size_bytes[1],
                     size_bytes[2],
                     size_bytes[3],
-                ])
+                ]))
             }
 
             // Payload too large
-            _ => panic!("Payload size too large for encoding"),
+            _ => bail_parse_error!("Payload size too large for encoding"),
         }
     }
 
@@ -2288,7 +2333,7 @@ impl Jsonb {
             return Ok(1);
         }
 
-        let header = JsonbHeader::new(element_type, payload_size).into_bytes();
+        let header = JsonbHeader::new(element_type, payload_size).into_bytes()?;
         let header_bytes = header.as_bytes();
         let header_len = header_bytes.len();
 
@@ -2475,8 +2520,11 @@ impl Jsonb {
         insertion_point: usize,
         field_key_index: JsonLocationKind,
     ) -> Result<JsonTraversalResult> {
-        let placeholder = JsonbHeader::new(ElementType::OBJECT, 0).into_bytes();
+        let placeholder = JsonbHeader::new(ElementType::OBJECT, 0).into_bytes()?;
         let placeholder_bytes = placeholder.as_bytes();
+        let placeholder_delta = isize::try_from(placeholder_bytes.len()).map_err(|_| {
+            LimboError::InternalError("placeholder length does not fit in isize".to_string())
+        })?;
 
         self.data.splice(
             insertion_point..insertion_point,
@@ -2484,6 +2532,7 @@ impl Jsonb {
         );
 
         let mut adjusted_insertion_point = insertion_point;
+        let mut header_shift = 0isize;
         if matches!(
             field_key_index,
             JsonLocationKind::ObjectProperty(_) | JsonLocationKind::DocumentRoot
@@ -2494,7 +2543,11 @@ impl Jsonb {
                 array_payload_size + placeholder_bytes.len(),
                 true,
             )?;
-            let header_shift = new_header_size as isize - array_header_size as isize;
+            header_shift = checked_len_diff(
+                new_header_size,
+                array_header_size,
+                "updating parent array header while appending placeholder",
+            )?;
             adjusted_insertion_point = insertion_point
                 .checked_add_signed(header_shift)
                 .ok_or_else(|| {
@@ -2503,11 +2556,14 @@ impl Jsonb {
                     )
                 })?;
         }
+        let total_delta = placeholder_delta.checked_add(header_shift).ok_or_else(|| {
+            LimboError::InternalError("placeholder delta overflow after header shift".to_string())
+        })?;
 
         Ok(JsonTraversalResult::with_array_index(
             array_value_idx,
             field_key_index,
-            placeholder_bytes.len() as isize,
+            total_delta,
             adjusted_insertion_point,
         ))
     }
@@ -2625,26 +2681,36 @@ impl Jsonb {
                 if Some(arr_element_idx) != updated_child_container_idx {
                     let (JsonbHeader(arr_el_type, arr_el_size), arr_el_header_len) =
                         self.read_header(arr_element_idx)?;
+                    let new_arr_el_size = checked_size_add_delta(
+                        arr_el_size,
+                        delta,
+                        "updating array element header from parent delta",
+                    )?;
 
                     let new_arr_el_header_len = self.write_element_header(
                         arr_element_idx,
                         arr_el_type,
-                        (arr_el_size as isize + delta) as usize,
+                        new_arr_el_size,
                         true,
                     )?;
 
-                    delta += (new_arr_el_header_len - arr_el_header_len) as isize;
+                    delta += checked_len_diff(
+                        new_arr_el_header_len,
+                        arr_el_header_len,
+                        "updating array element header from parent delta",
+                    )?;
                 }
             }
-            let new_size = el_size as isize + delta;
-            let new_header_size = self.write_element_header(
-                parent.field_value_index,
-                el_type,
-                new_size as usize,
-                true,
-            )?;
+            let new_size =
+                checked_size_add_delta(el_size, delta, "updating parent container size")?;
+            let new_header_size =
+                self.write_element_header(parent.field_value_index, el_type, new_size, true)?;
 
-            let header_diff = new_header_size as isize - el_header_len as isize;
+            let header_diff = checked_len_diff(
+                new_header_size,
+                el_header_len,
+                "updating parent container header",
+            )?;
 
             delta += parent.delta;
             delta += header_diff;
@@ -2687,9 +2753,9 @@ impl Jsonb {
                         && (*idx == Some(0) || idx.is_none())
                         && mode.allows_insert()
                     {
-                        let array = JsonbHeader::new(ElementType::ARRAY, 0).into_bytes();
+                        let array = JsonbHeader::new(ElementType::ARRAY, 0).into_bytes()?;
                         let array_bytes = array.as_bytes();
-                        let placeholder = JsonbHeader::new(ElementType::OBJECT, 0).into_bytes();
+                        let placeholder = JsonbHeader::new(ElementType::OBJECT, 0).into_bytes()?;
                         let placeholder_bytes = placeholder.as_bytes();
                         self.data.splice(
                             pos..pos + root_header_size,
@@ -2754,10 +2820,10 @@ impl Jsonb {
                             ElementType::TEXT
                         };
 
-                        let key_header = JsonbHeader::new(key_type, path_key.len()).into_bytes();
+                        let key_header = JsonbHeader::new(key_type, path_key.len()).into_bytes()?;
                         let key_header_bytes = key_header.as_bytes();
                         let key_bytes = path_key.as_bytes();
-                        let value_header = JsonbHeader::new(ElementType::OBJECT, 0).into_bytes();
+                        let value_header = JsonbHeader::new(ElementType::OBJECT, 0).into_bytes()?;
                         let value_header_bytes = value_header.as_bytes();
 
                         self.data.splice(
@@ -2851,12 +2917,14 @@ impl Jsonb {
                         ElementType::TEXT
                     };
 
-                    let key_header = JsonbHeader::new(key_header_type, path_key.len()).into_bytes();
+                    let key_header =
+                        JsonbHeader::new(key_header_type, path_key.len()).into_bytes()?;
                     let key_header_bytes = key_header.as_bytes();
                     let key_bytes = path_key.as_bytes();
-                    let array_header = JsonbHeader::new(ElementType::ARRAY, 1).into_bytes();
+                    let array_header = JsonbHeader::new(ElementType::ARRAY, 1).into_bytes()?;
                     let array_header_bytes = array_header.as_bytes();
-                    let array_value_header = JsonbHeader::new(ElementType::OBJECT, 0).into_bytes();
+                    let array_value_header =
+                        JsonbHeader::new(ElementType::OBJECT, 0).into_bytes()?;
                     let array_value_header_bytes = array_value_header.as_bytes();
 
                     let delta = key_header_bytes.len()
@@ -3025,7 +3093,7 @@ impl Jsonb {
                         } else {
                             let empty_obj = Jsonb::new(
                                 1,
-                                Some(JsonbHeader::make_obj().into_bytes().as_bytes()),
+                                Some(JsonbHeader::make_obj().into_bytes()?.as_bytes()),
                             );
                             let mut op = SetOperation::new(empty_obj);
                             let _ = result.operate_on_path(&key_path, &mut op);
@@ -3829,12 +3897,12 @@ world""#,
     fn test_header_encoding() {
         // Small payload (fits in 4 bits)
         let header = JsonbHeader::new(ElementType::TEXT, 5);
-        let bytes = header.into_bytes().as_bytes().to_vec();
+        let bytes = header.into_bytes().unwrap().as_bytes().to_vec();
         assert_eq!(bytes[0], (5 << 4) | (ElementType::TEXT as u8));
 
         // Medium payload (8-bit)
         let header = JsonbHeader::new(ElementType::TEXT, 200);
-        let bytes = header.into_bytes().as_bytes().to_vec();
+        let bytes = header.into_bytes().unwrap().as_bytes().to_vec();
         assert_eq!(
             bytes[0],
             (SIZE_MARKER_8BIT << 4) | (ElementType::TEXT as u8)
@@ -3843,7 +3911,7 @@ world""#,
 
         // Large payload (16-bit)
         let header = JsonbHeader::new(ElementType::TEXT, 40000);
-        let bytes = header.into_bytes().as_bytes().to_vec();
+        let bytes = header.into_bytes().unwrap().as_bytes().to_vec();
         assert_eq!(
             bytes[0],
             (SIZE_MARKER_16BIT << 4) | (ElementType::TEXT as u8)
@@ -3853,7 +3921,7 @@ world""#,
 
         // Extra large payload (32-bit)
         let header = JsonbHeader::new(ElementType::TEXT, 70000);
-        let bytes = header.into_bytes().as_bytes().to_vec();
+        let bytes = header.into_bytes().unwrap().as_bytes().to_vec();
         assert_eq!(
             bytes[0],
             (SIZE_MARKER_32BIT << 4) | (ElementType::TEXT as u8)

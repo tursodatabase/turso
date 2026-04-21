@@ -1,5 +1,4 @@
 use crate::sync::{Arc, RwLock};
-use std::iter::successors;
 use std::result::Result;
 
 use turso_ext::{ConstraintOp, ConstraintUsage, ResultCode};
@@ -779,11 +778,16 @@ impl InPlaceJsonPath {
         match element {
             PathElement::Root() => 1,
             PathElement::Key(key, _) => key.len() + 1,
-            PathElement::ArrayLocator(idx) => {
-                let digit_count = successors(*idx, |&n| (n >= 10).then_some(n / 10)).count();
-                let bracket_count = 2; // []
-
-                digit_count + bracket_count
+            PathElement::ArrayLocator(None) => 3, // [#]
+            PathElement::ArrayLocator(Some(idx)) => {
+                let mut n = i64::from(*idx).unsigned_abs();
+                let mut digit_count = 1;
+                while n >= 10 {
+                    n /= 10;
+                    digit_count += 1;
+                }
+                let sign_count = usize::from(*idx < 0);
+                digit_count + sign_count + 2 // [] + optional '-'
             }
             PathElement::BracketQuotedKey(key) => key.len() + 4, // ["..."]
         }

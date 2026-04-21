@@ -187,7 +187,7 @@ pub fn convert_ref_dbtype_to_jsonb(val: ValueRef<'_>, strict: Conv) -> crate::Re
             Ok(json)
         }
         ValueRef::Null => Ok(Jsonb::from_raw_data(
-            JsonbHeader::make_null().into_bytes().as_bytes(),
+            JsonbHeader::make_null().into_bytes()?.as_bytes(),
         )),
         ValueRef::Numeric(Numeric::Float(float)) => {
             let float: f64 = float.into();
@@ -527,7 +527,7 @@ where
     V: AsValueRef,
     E: ExactSizeIterator<Item = V>,
 {
-    let null = Jsonb::from_raw_data(JsonbHeader::make_null().into_bytes().as_bytes());
+    let null = Jsonb::from_raw_data(JsonbHeader::make_null().into_bytes()?.as_bytes());
     if paths.len() == 1 {
         let first_path = paths.next().ok_or_else(|| {
             crate::LimboError::InternalError("paths should have one element".to_string())
@@ -565,7 +565,7 @@ where
             if res.is_ok() {
                 result.append_to_array_unsafe(&extracted.data());
             } else {
-                result.append_to_array_unsafe(JsonbHeader::make_null().into_bytes().as_bytes());
+                result.append_to_array_unsafe(JsonbHeader::make_null().into_bytes()?.as_bytes());
             }
         } else {
             return Ok((null, ElementType::NULL));
