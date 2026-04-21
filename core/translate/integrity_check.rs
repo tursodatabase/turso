@@ -1,3 +1,4 @@
+use crate::translate::expr::emit_table_column;
 use crate::vdbe::builder::SelfTableContext;
 use crate::{
     schema::{GeneratedType, Index, Schema, Table},
@@ -433,7 +434,16 @@ fn translate_integrity_check_impl(
                 let target = key_start_reg + i;
                 match col {
                     BoundIndexColumn::Column(pos) => {
-                        program.emit_column_or_rowid(table_cursor_id, *pos, target);
+                        emit_table_column(
+                            program,
+                            table_cursor_id,
+                            table_ref_id,
+                            &table_references,
+                            &btree_table.columns()[*pos],
+                            *pos,
+                            target,
+                            resolver,
+                        )?;
                     }
                     BoundIndexColumn::Expr(expr) => {
                         let self_table_context =

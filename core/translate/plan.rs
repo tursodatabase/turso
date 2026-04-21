@@ -1463,6 +1463,13 @@ impl ColumnMask {
     }
 }
 
+impl std::ops::SubAssign<&Self> for ColumnMask {
+    fn sub_assign(&mut self, rhs: &Self) {
+        self.bitset -= &rhs.bitset;
+        self.has_rowid_sentinel &= !rhs.has_rowid_sentinel;
+    }
+}
+
 impl FromIterator<usize> for ColumnMask {
     fn from_iter<I: IntoIterator<Item = usize>>(iter: I) -> Self {
         let mut mask = ColumnMask::default();
@@ -1812,6 +1819,15 @@ where
                 self.overflow = None;
             }
         }
+    }
+}
+
+impl<T: From<usize>> std::ops::SubAssign<&Self> for BitSet<T>
+where
+    usize: From<T>,
+{
+    fn sub_assign(&mut self, rhs: &Self) {
+        self.subtract(rhs);
     }
 }
 
@@ -3874,9 +3890,9 @@ mod tests {
                     );
                 }
                 11 => {
-                    // Subtract
+                    // SubAssign (delegates to subtract)
                     let (other_mask, other_ref) = sample_other(&mut rng, max_index);
-                    mask.subtract(&other_mask);
+                    mask -= &other_mask;
                     for i in &other_ref {
                         reference.remove(i);
                     }
@@ -3968,5 +3984,25 @@ mod tests {
         // FromIterator<TableInternalId> works.
         let rebuilt: BitSet<TableInternalId> = [a, c].into_iter().collect();
         assert_eq!(rebuilt, mask);
+    }
+
+    #[test]
+    fn test_column_mask_sub_assign() {
+        let mut a: ColumnMask = [1, 3, ROWID_SENTINEL].into_iter().collect();
+        let b: ColumnMask = [3, ROWID_SENTINEL].into_iter().collect();
+        a -= &b;
+        assert!(a.get(1));
+        assert!(!a.get(3));
+        assert!(!a.get(ROWID_SENTINEL));
+        assert_eq!(a.count(), 1);
+
+        // Subtracting without rowid sentinel leaves it intact
+        let mut a: ColumnMask = [2, 4, ROWID_SENTINEL].into_iter().collect();
+        let b: ColumnMask = [2].into_iter().collect();
+        a -= &b;
+        assert!(!a.get(2));
+        assert!(a.get(4));
+        assert!(a.get(ROWID_SENTINEL));
+        assert_eq!(a.count(), 2);
     }
 }

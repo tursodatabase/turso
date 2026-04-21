@@ -4516,3 +4516,21 @@ test upsert-unique-virtual-column-ipk {
 } expect error {
     UNIQUE constraint failed: t.c
 }
+
+test update-deferred-fk-on-child-virtual-column {
+  PRAGMA foreign_keys=on;
+  CREATE TABLE p(x PRIMARY KEY);
+  CREATE TABLE c(a, b AS (a), FOREIGN KEY(b) REFERENCES p DEFERRABLE INITIALLY DEFERRED);
+  INSERT INTO p VALUES (1);
+  INSERT INTO c VALUES (1);
+  UPDATE c SET a=2;
+} expect error {
+    (FOREIGN KEY|deferred foreign key) constraint failed
+}
+
+test integrity-check-unique-virtual-column {
+    CREATE TABLE t (x INTEGER, a BLOB UNIQUE AS (X'aa'));
+    PRAGMA integrity_check;
+} expect {
+    ok
+}

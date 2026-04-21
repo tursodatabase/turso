@@ -9,7 +9,7 @@ use crate::{
     schema::{BTreeTable, ColumnLayout, ForeignKey, Index, ResolvedFkRef, ROWID_SENTINEL},
     translate::{collate::CollationSeq, emitter::Resolver, planner::ROWID_STRS},
     vdbe::{
-        builder::{CursorType, QueryMode},
+        builder::{CursorType, DmlColumnContext, QueryMode},
         insn::{CmpInsFlags, Insn},
         BranchOffset,
     },
@@ -768,31 +768,42 @@ pub fn emit_fk_child_update_counters(
     resolver: &Resolver,
     layout: &ColumnLayout,
 ) -> Result<()> {
-    // Helper: materialize OLD tuple for this FK; returns (start_reg, ncols, null_skip_label).
+    // Helper: materialize OLD FK column values.
+    // Returns (dml_ctx, fk_col_positions, null_skip_label).
     // The null_skip_label is unresolved and must be resolved by the caller after the FK check
     // block, so that when any OLD column is NULL the entire FK check is skipped.
-    let load_old_tuple = |program: &mut ProgramBuilder,
-                          fk_cols: &[String]|
-     -> Option<(usize, usize, BranchOffset)> {
-        let n = fk_cols.len();
-        let start = program.alloc_registers(n);
-        let null_jmp = program.allocate_label();
+    let load_old_fk_values = |program: &mut ProgramBuilder,
+                              fk_cols: &[String]|
+     -> Result<Option<(DmlColumnContext, Vec<usize>, BranchOffset)>> {
+        let null_skip_label = program.allocate_label();
 
-        for (k, cname) in fk_cols.iter().enumerate() {
-            let (pos, _col) = match child_tbl.get_column(cname) {
-                Some(v) => v,
-                None => {
-                    return None;
-                }
-            };
-            program.emit_column_or_rowid(child_cursor_id, pos, start + k);
+        let old_rowid_reg = program.alloc_register();
+        program.emit_insn(Insn::RowId {
+            cursor_id: child_cursor_id,
+            dest: old_rowid_reg,
+        });
+
+        let fk_col_positions: Vec<usize> = fk_cols
+            .iter()
+            .filter_map(|col_name| child_tbl.get_column(col_name).map(|(pos, _)| pos))
+            .collect();
+
+        let dml_ctx = emit_columns_and_dependencies(
+            program,
+            child_tbl,
+            child_cursor_id,
+            old_rowid_reg,
+            fk_col_positions.clone(),
+        )?;
+
+        for &pos in &fk_col_positions {
             program.emit_insn(Insn::IsNull {
-                reg: start + k,
-                target_pc: null_jmp,
+                reg: dml_ctx.to_column_reg(pos),
+                target_pc: null_skip_label,
             });
         }
 
-        Some((start, n, null_jmp))
+        Ok(Some((dml_ctx, fk_col_positions, null_skip_label)))
     };
 
     for fk_ref in
@@ -807,8 +818,8 @@ pub fn emit_fk_child_update_counters(
 
         // Pass 1: OLD tuple handling only for deferred FKs
         if fk_ref.fk.deferred {
-            if let Some((old_start, _, null_skip)) =
-                load_old_tuple(program, &fk_ref.fk.child_columns)
+            if let Some((dml_ctx, fk_col_positions, null_skip)) =
+                load_old_fk_values(program, &fk_ref.fk.child_columns)?
             {
                 if fk_ref.parent_uses_rowid {
                     // Parent key is rowid: probe parent table by rowid
@@ -820,7 +831,7 @@ pub fn emit_fk_child_update_counters(
                     // first FK col is the rowid value
                     let rid = program.alloc_register();
                     program.emit_insn(Insn::Copy {
-                        src_reg: old_start,
+                        src_reg: dml_ctx.to_column_reg(fk_col_positions[0]),
                         dst_reg: rid,
                         extra_amount: 0,
                     });
@@ -847,7 +858,7 @@ pub fn emit_fk_child_update_counters(
 
                     program.preassign_label_to_next_insn(join);
                 } else {
-                    // Parent key is a unique index: use index probe and guarded decrement on NOT FOUND
+                    // Parent key is a unique index: use index probe
                     let parent_tbl = resolver
                         .with_schema(database_id, |s| s.get_btree_table(&fk_ref.fk.parent_table))
                         .expect("parent btree");
@@ -857,7 +868,9 @@ pub fn emit_fk_child_update_counters(
                         .expect("parent unique index required");
                     let icur = open_read_index(program, idx, database_id);
 
-                    // Copy OLD tuple and apply parent index affinities
+                    // this is safe because emit_columns_and_dependencies
+                    // guarantees target columns are contiguous.
+                    let old_start = dml_ctx.to_column_reg(fk_col_positions[0]);
                     let probe = copy_with_affinity(program, old_start, ncols, idx, &parent_tbl);
                     // Found: nothing; Not found: guarded decrement
                     index_probe(
