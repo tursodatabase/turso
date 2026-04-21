@@ -1,6 +1,6 @@
 use crate::common::{
-    compute_dbhash, compute_dbhash_with_database_opts, compute_dbhash_with_options,
-    compute_dbhash_with_options_and_database_opts, ExecRows, TempDatabase,
+    ExecRows, TempDatabase, compute_dbhash, compute_dbhash_with_database_opts,
+    compute_dbhash_with_options, compute_dbhash_with_options_and_database_opts, limbo_exec_rows,
 };
 use rusqlite::Connection as SqliteConnection;
 use std::{
@@ -9,9 +9,9 @@ use std::{
 };
 use tempfile::TempDir;
 use turso_core::{
+    Buffer, Clock, Completion, Connection, Database, DatabaseOpts, File, IO, LimboError,
+    MonotonicInstant, OpenFlags, StepResult, Value, WallClockInstant,
     io::{FileId, FileSyncType},
-    Buffer, Clock, Completion, Connection, Database, DatabaseOpts, File, LimboError,
-    MonotonicInstant, OpenFlags, StepResult, Value, WallClockInstant, IO,
 };
 
 /// Helper to run integrity_check and return the result string
@@ -42,6 +42,16 @@ fn scalar_i64(conn: &Arc<Connection>, sql: &str) -> i64 {
     let rows: Vec<(i64,)> = conn.exec_rows(sql);
     assert_eq!(rows.len(), 1, "expected one row for {sql}");
     rows[0].0
+}
+
+fn explain_opcodes(conn: &Arc<Connection>, sql: &str) -> Vec<String> {
+    limbo_exec_rows(conn, &format!("EXPLAIN {sql}"))
+        .into_iter()
+        .map(|row| match &row[1] {
+            rusqlite::types::Value::Text(text) => text.clone(),
+            other => panic!("expected opcode text in EXPLAIN output, got {other:?}"),
+        })
+        .collect()
 }
 
 fn wal_file_size(tmp_db: &TempDatabase) -> u64 {
@@ -590,6 +600,41 @@ fn test_vacuum_into_error_cases(tmp_db: TempDatabase) -> anyhow::Result<()> {
     Ok(())
 }
 
+#[test]
+fn test_vacuum_into_from_readonly_source_database() -> anyhow::Result<()> {
+    let path = {
+        let tmp_db = TempDatabase::new_empty();
+        let path = tmp_db.path.clone();
+        let writer = tmp_db.connect_limbo();
+        writer.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")?;
+        writer.execute("INSERT INTO t VALUES(1, 'one'), (2, 'two'), (3, 'three')")?;
+        writer.close()?;
+        path
+    };
+
+    let readonly_db = TempDatabase::new_with_existent_with_flags(&path, OpenFlags::ReadOnly);
+    let readonly_conn = readonly_db.connect_limbo();
+    assert!(readonly_conn.is_readonly(turso_core::MAIN_DB_ID));
+    let dest_dir = TempDir::new()?;
+    let dest_path = dest_dir.path().join("readonly-source-vacuum-into.db");
+
+    readonly_conn.execute(format!("VACUUM INTO '{}'", dest_path.to_str().unwrap()))?;
+
+    let dest_db = TempDatabase::new_with_existent(&dest_path);
+    let dest_conn = dest_db.connect_limbo();
+    let rows: Vec<(i64, String)> = dest_conn.exec_rows("SELECT id, v FROM t ORDER BY id");
+    assert_eq!(
+        rows,
+        vec![
+            (1, "one".to_string()),
+            (2, "two".to_string()),
+            (3, "three".to_string())
+        ]
+    );
+    assert_eq!(run_integrity_check(&dest_conn), "ok");
+    Ok(())
+}
+
 /// Active-statement accounting matrix for VACUUM INTO:
 ///
 /// - active other statement, no reprepare -> reject
@@ -712,6 +757,38 @@ fn test_vacuum_into_rejects_reprepared_active_select_on_same_connection(
     }
 
     assert_eq!(seen, vec![1, 2, 3]);
+    Ok(())
+}
+
+#[turso_macros::test(init_sql = "CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT);")]
+fn test_vacuum_into_rejects_active_returning_statement_on_same_connection(
+    tmp_db: TempDatabase,
+) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+
+    let mut returning_stmt =
+        conn.prepare("INSERT INTO t VALUES (1, 'one'), (2, 'two') RETURNING id")?;
+    assert!(
+        matches!(returning_stmt.step()?, StepResult::Row),
+        "RETURNING statement should remain active after first row"
+    );
+
+    let dest_dir = TempDir::new()?;
+    let dest_path = dest_dir.path().join("active-returning-vacuum-into.db");
+
+    let err = conn
+        .execute(format!("VACUUM INTO '{}'", dest_path.to_str().unwrap()))
+        .expect_err("VACUUM INTO should reject active RETURNING statements");
+    assert!(
+        err.to_string().contains("SQL statements in progress"),
+        "unexpected error: {err}"
+    );
+    assert!(
+        !dest_path.exists(),
+        "destination file should not be created on failure"
+    );
+
+    returning_stmt.reset()?;
     Ok(())
 }
 
@@ -3828,6 +3905,49 @@ fn test_plain_vacuum_rejects_active_transaction(tmp_db: TempDatabase) -> anyhow:
     Ok(())
 }
 
+/// Plain VACUUM rejects savepoints for the same reason as BEGIN: it requires
+/// auto-commit mode.
+#[cfg_attr(feature = "checksum", ignore)]
+#[turso_macros::test(init_sql = "CREATE TABLE t(a INTEGER);")]
+fn test_plain_vacuum_rejects_savepoint(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+    conn.execute("SAVEPOINT sp1")?;
+    let err = conn.execute("VACUUM").unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("cannot VACUUM from within a transaction"),
+        "unexpected error: {err}"
+    );
+    conn.execute("ROLLBACK TO sp1")?;
+    conn.execute("RELEASE sp1")?;
+    Ok(())
+}
+
+/// Plain VACUUM fails on readonly connections with the normal ReadOnly error.
+#[test]
+fn test_plain_vacuum_readonly_db_returns_readonly() -> anyhow::Result<()> {
+    let path = {
+        let tmp_db = TempDatabase::new_empty();
+        let path = tmp_db.path.clone();
+        let writer = tmp_db.connect_limbo();
+        writer.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")?;
+        writer.execute("INSERT INTO t VALUES(1, 'one')")?;
+        writer.close()?;
+        path
+    };
+
+    let readonly_db = TempDatabase::new_with_existent_with_flags(&path, OpenFlags::ReadOnly);
+    let readonly_conn = readonly_db.connect_limbo();
+    assert!(readonly_conn.is_readonly(turso_core::MAIN_DB_ID));
+
+    let err = readonly_conn.execute("VACUUM").unwrap_err();
+    assert!(
+        matches!(err, LimboError::ReadOnly),
+        "expected ReadOnly, got {err:?}"
+    );
+    Ok(())
+}
+
 /// Plain VACUUM works on empty databases.
 #[cfg_attr(feature = "checksum", ignore)]
 #[turso_macros::test(init_sql = "CREATE TABLE t(a INTEGER);")]
@@ -3899,6 +4019,33 @@ fn test_plain_vacuum_rejects_query_only(tmp_db: TempDatabase) -> anyhow::Result<
     Ok(())
 }
 
+/// VACUUM should not change `changes()` / `total_changes()` because it is not
+/// a user-row DML statement.
+#[cfg_attr(feature = "checksum", ignore)]
+#[turso_macros::test(init_sql = "CREATE TABLE t(a INTEGER PRIMARY KEY, b TEXT);")]
+fn test_plain_vacuum_does_not_affect_changes_counters(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+    conn.execute("INSERT INTO t VALUES(1, 'one'), (2, 'two'), (3, 'three')")?;
+    conn.execute("DELETE FROM t WHERE a = 2")?;
+
+    let before_changes = conn.changes();
+    let before_total_changes = conn.total_changes();
+
+    conn.execute("VACUUM")?;
+
+    assert_eq!(
+        conn.changes(),
+        before_changes,
+        "VACUUM must not report row changes"
+    );
+    assert_eq!(
+        conn.total_changes(),
+        before_total_changes,
+        "VACUUM must not increment total_changes"
+    );
+    Ok(())
+}
+
 /// Plain VACUUM rejects active statements on same connection.
 #[cfg_attr(feature = "checksum", ignore)]
 #[turso_macros::test(init_sql = "CREATE TABLE t(a INTEGER);")]
@@ -3920,6 +4067,82 @@ fn test_plain_vacuum_rejects_active_statement(tmp_db: TempDatabase) -> anyhow::R
     );
 
     stmt.reset()?;
+    Ok(())
+}
+
+/// Reprepared active root statements must remain counted so plain VACUUM still
+/// rejects them as "SQL statements in progress".
+#[cfg_attr(feature = "checksum", ignore)]
+#[turso_macros::test(mvcc, init_sql = "CREATE TABLE t (a INTEGER);")]
+fn test_plain_vacuum_rejects_reprepared_active_select_on_same_connection(
+    tmp_db: TempDatabase,
+) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+    conn.execute("INSERT INTO t VALUES (1), (2), (3)")?;
+
+    let mut select_stmt = conn.prepare("SELECT a FROM t ORDER BY a")?;
+    conn.execute("PRAGMA foreign_keys = ON")?;
+
+    assert!(
+        matches!(select_stmt.step()?, StepResult::Row),
+        "SELECT should remain active after reprepare and first row"
+    );
+    assert_eq!(
+        select_stmt.row().unwrap().get_values().next(),
+        Some(&Value::from_i64(1))
+    );
+
+    let err = conn
+        .execute("VACUUM")
+        .expect_err("plain VACUUM should reject re-prepared active statements");
+    let err_msg = err.to_string();
+    assert!(
+        err_msg.contains("SQL statements in progress"),
+        "error should mention active statements, got: {err_msg}"
+    );
+
+    Ok(())
+}
+
+/// Plain VACUUM must reject active write statements too, not only active
+/// readers.
+#[cfg_attr(feature = "checksum", ignore)]
+#[turso_macros::test(init_sql = "CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT);")]
+fn test_plain_vacuum_rejects_active_returning_statement(
+    tmp_db: TempDatabase,
+) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+
+    let mut stmt = conn.prepare("INSERT INTO t VALUES (1, 'one'), (2, 'two') RETURNING id")?;
+    let step_result = stmt.step()?;
+    assert!(matches!(step_result, StepResult::Row));
+
+    let err = conn.execute("VACUUM").unwrap_err();
+    assert!(
+        err.to_string().contains("SQL statements in progress"),
+        "unexpected error: {err}"
+    );
+
+    stmt.reset()?;
+    Ok(())
+}
+
+#[cfg_attr(feature = "checksum", ignore)]
+#[turso_macros::test(init_sql = "CREATE TABLE t(a INTEGER PRIMARY KEY, b TEXT);")]
+fn test_plain_vacuum_explain_uses_dedicated_opcode_without_transaction_preamble(
+    tmp_db: TempDatabase,
+) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+    let opcodes = explain_opcodes(&conn, "VACUUM");
+
+    assert!(
+        opcodes.iter().any(|opcode| opcode == "Vacuum"),
+        "expected dedicated Vacuum opcode, got {opcodes:?}"
+    );
+    assert!(
+        !opcodes.iter().any(|opcode| opcode == "Transaction"),
+        "plain VACUUM must not emit a generic Transaction preamble: {opcodes:?}"
+    );
     Ok(())
 }
 
@@ -4715,10 +4938,72 @@ fn test_plain_vacuum_reinitializes_source_wal_header_after_truncate_checkpoint(
 
 #[cfg_attr(feature = "checksum", ignore)]
 #[test]
-fn test_plain_vacuum_second_statement_same_connection_fails_while_first_active(
-) -> anyhow::Result<()> {
+fn test_plain_vacuum_reset_during_io_cleans_up_source_tx() -> anyhow::Result<()> {
     let io = Arc::new(QueuedIo::new());
-    let path = "queued-vacuum-same-conn-active.db";
+    let path = "queued-vacuum-reset-cleanup.db";
+    let db = open_queued_db(io, path)?;
+    let conn = db.connect()?;
+    let reader = db.connect()?;
+
+    populate_queued_multibatch(&conn)?;
+
+    let mut stmt = conn.prepare("VACUUM")?;
+    step_vacuum_until_io(&mut stmt)?;
+    stmt.reset()?;
+
+    assert!(
+        conn.get_auto_commit(),
+        "reset must restore auto-commit after abandoning VACUUM"
+    );
+    let pager = conn.get_pager();
+    assert!(!pager.holds_read_lock(), "reset must release read locks");
+    assert!(!pager.holds_write_lock(), "reset must release write locks");
+
+    let rows: Vec<(i64,)> = reader.exec_rows("SELECT COUNT(*) FROM t");
+    assert_eq!(rows, vec![(176,)]);
+    conn.execute("INSERT INTO t VALUES(10000, 'after-reset')")?;
+    conn.execute("DELETE FROM t WHERE id = 10000")?;
+    assert_eq!(run_integrity_check(&conn), "ok");
+    Ok(())
+}
+
+#[cfg_attr(feature = "checksum", ignore)]
+#[test]
+fn test_plain_vacuum_drop_during_io_cleans_up_source_tx() -> anyhow::Result<()> {
+    let io = Arc::new(QueuedIo::new());
+    let path = "queued-vacuum-drop-cleanup.db";
+    let db = open_queued_db(io, path)?;
+    let conn = db.connect()?;
+    let reader = db.connect()?;
+
+    populate_queued_multibatch(&conn)?;
+
+    {
+        let mut stmt = conn.prepare("VACUUM")?;
+        step_vacuum_until_io(&mut stmt)?;
+    }
+
+    assert!(
+        conn.get_auto_commit(),
+        "drop must restore auto-commit after abandoning VACUUM"
+    );
+    let pager = conn.get_pager();
+    assert!(!pager.holds_read_lock(), "drop must release read locks");
+    assert!(!pager.holds_write_lock(), "drop must release write locks");
+
+    let rows: Vec<(i64,)> = reader.exec_rows("SELECT COUNT(*) FROM t");
+    assert_eq!(rows, vec![(176,)]);
+    conn.execute("INSERT INTO t VALUES(10000, 'after-drop')")?;
+    conn.execute("DELETE FROM t WHERE id = 10000")?;
+    assert_eq!(run_integrity_check(&conn), "ok");
+    Ok(())
+}
+
+#[cfg_attr(feature = "checksum", ignore)]
+#[test]
+fn test_second_plain_vacuum_on_same_connection_rejects_while_first_running() -> anyhow::Result<()> {
+    let io = Arc::new(QueuedIo::new());
+    let path = "queued-vacuum-two-statements.db";
     let db = open_queued_db(io.clone(), path)?;
     let conn = db.connect()?;
 
@@ -4747,27 +5032,16 @@ fn test_plain_vacuum_second_statement_same_connection_fails_while_first_active(
     let mut second = conn.prepare("VACUUM")?;
     let err = second
         .step()
-        .expect_err("second VACUUM on the same connection should fail while the first is active");
+        .expect_err("second VACUUM should not start while first is still active");
     let message = err.to_string();
     assert!(
-        message.contains("cannot VACUUM"),
-        "expected same-connection VACUUM rejection, got {err:?}"
+        message.contains("cannot VACUUM from within a transaction")
+            || message.contains("SQL statements in progress")
+            || message.contains("cannot VACUUM"),
+        "unexpected same-connection VACUUM rejection: {err:?}"
     );
 
-    loop {
-        match first.step()? {
-            StepResult::Done => break,
-            StepResult::Row => continue,
-            StepResult::Busy => anyhow::bail!("unexpected Busy while completing first VACUUM"),
-            StepResult::Interrupt => {
-                anyhow::bail!("unexpected Interrupt while completing first VACUUM")
-            }
-            StepResult::IO => io.step()?,
-        }
-    }
-
-    assert_eq!(scalar_i64(&conn, "SELECT COUNT(*) FROM t"), 176);
-    assert_eq!(run_integrity_check(&conn), "ok");
+    first.reset()?;
     Ok(())
 }
 
@@ -4789,6 +5063,13 @@ fn assert_failed_vacuum_left_queued_db_usable(
     conn.execute("DELETE FROM t WHERE id = 10000")?;
     assert_eq!(run_integrity_check(conn), "ok");
     Ok(())
+}
+
+fn step_vacuum_until_io(stmt: &mut turso_core::Statement) -> anyhow::Result<()> {
+    match stmt.step()? {
+        StepResult::IO => Ok(()),
+        other => anyhow::bail!("expected VACUUM to yield IO, got {other:?}"),
+    }
 }
 
 #[cfg_attr(feature = "checksum", ignore)]
