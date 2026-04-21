@@ -123,3 +123,13 @@ expect {
     42
 }
 
+
+@cross-check-integrity
+test count-filter-clause {
+    CREATE TABLE todos(id INTEGER PRIMARY KEY, title TEXT, user_id INTEGER);
+    INSERT INTO todos VALUES (1, 'A', 1), (2, 'B', 1), (3, 'C', 2);
+    SELECT COUNT(*) AS total, COUNT(*) FILTER (WHERE user_id = 1) AS user_count FROM todos;
+}
+expect {
+    3|2
+}

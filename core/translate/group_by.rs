@@ -721,6 +721,28 @@ pub fn group_by_process_single_group(
                     .reg_agg_start
                     .expect("aggregate registers must be initialized");
                 let agg_result_reg = agg_start_reg + i;
+
+                // FILTER: skip AggStep if filter condition is false
+                let filter_skip_label = if let Some(filter_expr) = &agg.filter_expr {
+                    let label = program.allocate_label();
+                    let filter_reg = program.alloc_register();
+                    translate_expr(
+                        program,
+                        Some(&plan.table_references),
+                        filter_expr,
+                        filter_reg,
+                        &t_ctx.resolver,
+                    )?;
+                    program.emit_insn(Insn::IfNot {
+                        reg: filter_reg,
+                        target_pc: label,
+                        jump_if_null: true,
+                    });
+                    Some(label)
+                } else {
+                    None
+                };
+
                 let agg_arg_source =
                     AggArgumentSource::new_from_expression(&agg.func, &agg.args, &agg.distinctness);
                 translate_aggregation_step(
@@ -736,6 +758,10 @@ pub fn group_by_process_single_group(
                         .expect("distinct aggregate context not populated");
                     program.preassign_label_to_next_insn(ctx.label_on_conflict);
                 }
+
+                if let Some(label) = filter_skip_label {
+                    program.preassign_label_to_next_insn(label);
+                }
             }
 
             t_ctx.resolver.expr_to_reg_cache.truncate(cache_len);
@@ -748,6 +774,28 @@ pub fn group_by_process_single_group(
                     .reg_agg_start
                     .expect("aggregate registers must be initialized");
                 let agg_result_reg = agg_start_reg + i;
+
+                // FILTER: skip AggStep if filter condition is false
+                let filter_skip_label = if let Some(filter_expr) = &agg.filter_expr {
+                    let label = program.allocate_label();
+                    let filter_reg = program.alloc_register();
+                    translate_expr(
+                        program,
+                        Some(&plan.table_references),
+                        filter_expr,
+                        filter_reg,
+                        &t_ctx.resolver,
+                    )?;
+                    program.emit_insn(Insn::IfNot {
+                        reg: filter_reg,
+                        target_pc: label,
+                        jump_if_null: true,
+                    });
+                    Some(label)
+                } else {
+                    None
+                };
+
                 let start_reg_aggs = start_reg_src + t_ctx.non_aggregate_expressions.len();
                 let agg_arg_source =
                     AggArgumentSource::new_from_registers(start_reg_aggs + offset, agg);
@@ -764,6 +812,11 @@ pub fn group_by_process_single_group(
                         .expect("distinct aggregate context not populated");
                     program.preassign_label_to_next_insn(ctx.label_on_conflict);
                 }
+
+                if let Some(label) = filter_skip_label {
+                    program.preassign_label_to_next_insn(label);
+                }
+
                 offset += agg.args.len();
             }
         }

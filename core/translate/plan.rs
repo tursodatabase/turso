@@ -2819,15 +2819,23 @@ pub struct Aggregate {
     pub args: Vec<ast::Expr>,
     pub original_expr: ast::Expr,
     pub distinctness: Distinctness,
+    pub filter_expr: Option<ast::Expr>,
 }
 
 impl Aggregate {
-    pub fn new(func: AggFunc, args: &[Box<Expr>], expr: &Expr, distinctness: Distinctness) -> Self {
+    pub fn new(
+        func: AggFunc,
+        args: &[Box<Expr>],
+        expr: &Expr,
+        distinctness: Distinctness,
+        filter_expr: Option<ast::Expr>,
+    ) -> Self {
         Aggregate {
             func,
             args: args.iter().map(|arg| *arg.clone()).collect(),
             original_expr: expr.clone(),
             distinctness,
+            filter_expr,
         }
     }
 

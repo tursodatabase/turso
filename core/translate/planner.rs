@@ -227,7 +227,14 @@ pub fn resolve_window_and_aggregate_functions(
                                 distinctness,
                             )?;
                         } else {
-                            add_aggregate_if_not_exists(aggs, expr, args, distinctness, f)?;
+                            add_aggregate_if_not_exists(
+                                aggs,
+                                expr,
+                                args,
+                                distinctness,
+                                f,
+                                filter_over.filter_clause.as_deref().cloned(),
+                            )?;
                             contains_aggregates = true;
                         }
                         return Ok(WalkControl::SkipChildren);
@@ -268,6 +275,7 @@ pub fn resolve_window_and_aggregate_functions(
                                         args,
                                         distinctness,
                                         func,
+                                        filter_over.filter_clause.as_deref().cloned(),
                                     )?;
                                     contains_aggregates = true;
                                 }
@@ -304,6 +312,7 @@ pub fn resolve_window_and_aggregate_functions(
                                 &[],
                                 Distinctness::NonDistinct,
                                 f,
+                                filter_over.filter_clause.as_deref().cloned(),
                             )?;
                             contains_aggregates = true;
                         }
@@ -360,6 +369,7 @@ pub fn resolve_window_and_aggregate_functions(
                                         &[],
                                         Distinctness::NonDistinct,
                                         func,
+                                        filter_over.filter_clause.as_deref().cloned(),
                                     )?;
                                     contains_aggregates = true;
                                 }
@@ -437,6 +447,7 @@ fn add_aggregate_if_not_exists(
     args: &[Box<Expr>],
     distinctness: Distinctness,
     func: AggFunc,
+    filter_expr: Option<ast::Expr>,
 ) -> Result<()> {
     if distinctness.is_distinct() && args.len() != 1 {
         crate::bail_parse_error!("DISTINCT aggregate functions must have exactly one argument");
@@ -445,7 +456,7 @@ fn add_aggregate_if_not_exists(
         .iter()
         .all(|a| !exprs_are_equivalent(&a.original_expr, expr))
     {
-        aggs.push(Aggregate::new(func, args, expr, distinctness));
+        aggs.push(Aggregate::new(func, args, expr, distinctness, filter_expr));
     }
     Ok(())
 }

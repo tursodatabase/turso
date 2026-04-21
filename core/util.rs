@@ -1456,14 +1456,11 @@ pub fn validate_aggregate_function_tail(
     filter_over: &ast::FunctionTail,
     order_by: &[ast::SortedColumn],
 ) -> Result<()> {
-    if filter_over.filter_clause.is_some() {
-        crate::bail_parse_error!("FILTER clause is not supported yet in aggregate functions");
-    }
-
     if !order_by.is_empty() {
         crate::bail_parse_error!("ORDER BY clause is not supported yet in aggregate functions");
     }
 
+    _ = filter_over;
     Ok(())
 }
 
