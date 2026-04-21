@@ -247,9 +247,6 @@ pub struct ProgramBuilder {
     /// Registry of materialized CTEs, keyed by cte_id.
     /// Used to share materialized data across multiple CTE references via OpenDup.
     materialized_ctes: HashMap<usize, MaterializedCteInfo>,
-    /// Global count of references to each CTE across the entire query.
-    /// Used to determine whether a CTE should be materialized (multi-ref) or use coroutine (single-ref).
-    cte_reference_counts: HashMap<usize, usize>,
     /// Stack of CTE names currently being planned. Used to detect circular
     /// references in non-recursive CTEs and to prevent fallthrough to schema
     /// resolution for same-named tables/views.
@@ -693,7 +690,6 @@ impl ProgramBuilder {
             self_table_context: None,
             next_cte_id: 0,
             materialized_ctes: HashMap::default(),
-            cte_reference_counts: HashMap::default(),
             ctes_being_defined: Vec::new(),
             next_subquery_eqp_id: 1,
         }
@@ -731,18 +727,6 @@ impl ProgramBuilder {
     /// Register a materialized CTE so that subsequent references can share it via OpenDup.
     pub fn register_materialized_cte(&mut self, cte_id: usize, info: MaterializedCteInfo) {
         self.materialized_ctes.insert(cte_id, info);
-    }
-
-    /// Increment the global reference count for a CTE.
-    /// Called during planning when a CTE reference is created.
-    pub fn increment_cte_reference(&mut self, cte_id: usize) {
-        *self.cte_reference_counts.entry(cte_id).or_insert(0) += 1;
-    }
-
-    /// Get the global reference count for a CTE.
-    /// Used during emission to decide whether to materialize (multi-ref) or use coroutine (single-ref).
-    pub fn get_cte_reference_count(&self, cte_id: usize) -> usize {
-        self.cte_reference_counts.get(&cte_id).copied().unwrap_or(0)
     }
 
     /// Mark a CTE name as currently being planned. While on the stack,
