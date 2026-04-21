@@ -5761,18 +5761,19 @@ pub fn bind_and_rewrite_expr<'a>(
                                     .is_some_and(|name| name.eq_ignore_ascii_case(&normalized_id))
                             });
                             if col_idx.is_some() {
+                                let col_idx = col_idx.unwrap();
+                                if outer_ref.using_dedup_hidden_cols.get(col_idx) {
+                                    continue;
+                                }
                                 if match_result.is_some() {
                                     crate::bail_parse_error!(
                                         "ambiguous column name: {}",
                                         id.as_str()
                                     );
                                 }
-                                let col = outer_ref.table.columns().get(col_idx.unwrap()).unwrap();
-                                match_result = Some((
-                                    outer_ref.internal_id,
-                                    col_idx.unwrap(),
-                                    col.is_rowid_alias(),
-                                ));
+                                let col = outer_ref.table.columns().get(col_idx).unwrap();
+                                match_result =
+                                    Some((outer_ref.internal_id, col_idx, col.is_rowid_alias()));
                                 matched_scope_depth = Some(outer_ref.scope_depth);
                             }
                         }

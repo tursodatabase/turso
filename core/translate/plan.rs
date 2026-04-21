@@ -1009,6 +1009,29 @@ pub struct JoinedTable {
     pub indexed: Option<ast::Indexed>,
 }
 
+impl JoinedTable {
+    pub fn using_dedup_hidden_cols(&self) -> ColumnMask {
+        self.join_info
+            .as_ref()
+            .map(|join_info| {
+                self.table
+                    .columns()
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(idx, col)| {
+                        let col_name = col.name.as_deref()?;
+                        join_info
+                            .using
+                            .iter()
+                            .any(|using_col| using_col.as_str().eq_ignore_ascii_case(col_name))
+                            .then_some(idx)
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct OuterQueryReference {
     /// The name of the table as referred to in the query, either the literal name or an alias e.g. "users" or "u"
@@ -1017,6 +1040,8 @@ pub struct OuterQueryReference {
     pub internal_id: TableInternalId,
     /// Table object, which contains metadata about the table, e.g. columns.
     pub table: Table,
+    /// Columns hidden by USING/NATURAL deduplication in the outer scope.
+    pub using_dedup_hidden_cols: ColumnMask,
     /// Bitmask of columns that are referenced in the query.
     /// Used to track dependencies, so that it can be resolved
     /// when a WHERE clause subquery should be evaluated;

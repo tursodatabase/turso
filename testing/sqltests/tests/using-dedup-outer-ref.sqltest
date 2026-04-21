@@ -1,0 +1,22 @@
+@database :memory:
+
+# Correlated subquery referencing a USING-deduplicated column from the outer
+# scope. Without proper USING dedup tracking in outer query refs, the
+# unqualified "key" resolves to both t1.key and t2.key and is rejected as
+# ambiguous even though USING already deduplicated them.
+@cross-check-integrity
+test correlated-subquery-using-dedup-outer-ref {
+    CREATE TABLE t1(key INT, val TEXT);
+    CREATE TABLE t2(key INT, label TEXT);
+    CREATE TABLE t3(id INT, note TEXT);
+    INSERT INTO t1 VALUES(1,'a'),(2,'b');
+    INSERT INTO t2 VALUES(1,'x'),(2,'y');
+    INSERT INTO t3 VALUES(1,'note1'),(2,'note2');
+    SELECT val, (SELECT note FROM t3 WHERE t3.id = key)
+    FROM t1 JOIN t2 USING(key)
+    ORDER BY val;
+}
+expect {
+    a|note1
+    b|note2
+}
