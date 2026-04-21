@@ -1354,6 +1354,16 @@ fn vacuum_completion_error(completion: &Completion, context: &'static str) -> Li
     )
 }
 
+fn vacuum_completion_error(
+    completion: &crate::io::Completion,
+    context: &'static str,
+) -> LimboError {
+    completion.get_error().map_or_else(
+        || LimboError::InternalError(format!("VACUUM: {context} failed")),
+        LimboError::CompletionError,
+    )
+}
+
 /// Coalesce `(page_ref, frame_id)` pairs into contiguous-frame-id runs.
 ///
 /// Plain `VACUUM` relies on the temp-WAL-only invariant: every temp page
