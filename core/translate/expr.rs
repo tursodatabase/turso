@@ -5814,6 +5814,64 @@ pub enum BindingBehavior {
     AllowUnboundIdentifiers,
 }
 
+/// The result of resolving the `<id>` half of a qualified `<tbl>.<id>`
+/// reference against a single candidate table whose identifier already
+/// matches `<tbl>`.
+#[derive(Debug, Clone, Copy)]
+enum QualifiedMatch {
+    /// `<id>` named a real column on the candidate table.
+    Column {
+        col_idx: usize,
+        is_rowid_alias: bool,
+    },
+    /// `<id>` named the rowid alias (`rowid`/`oid`/`_rowid_`) of a btree
+    /// with rowids. There is no column index — the result must become an
+    /// `Expr::RowId`, not an `Expr::Column`.
+    RowId,
+}
+
+/// Resolve `<id>` against a single table reference.
+///
+/// The caller is responsible for:
+///   * filtering candidate refs down to those whose identifier matches `<tbl>`,
+///   * detecting ambiguity across multiple candidate refs,
+///   * applying any scope-specific USING/NATURAL dedup rules.
+///
+/// Returns:
+///   * `Ok(Some(Column { .. }))` — `<id>` is a real column on `table`.
+///   * `Ok(Some(RowId))` — `<id>` is a rowid alias on a rowid btree.
+///   * `Ok(None)` — `<id>` is not present on this ref.
+///   * `Err(_)` — `<id>` is a rowid alias but the btree has no rowid
+///     (definitively invalid; reported as "no such column: <id>" per SQLite).
+fn resolve_qualified_on_ref(
+    table: &Table,
+    internal_id: TableInternalId,
+    normalized_id: &str,
+) -> Result<Option<QualifiedMatch>> {
+    if let Some(col_idx) = table.columns().iter().position(|c| {
+        c.name
+            .as_ref()
+            .is_some_and(|name| name.eq_ignore_ascii_case(normalized_id))
+    }) {
+        let col = table.columns().get(col_idx).unwrap();
+        return Ok(Some(QualifiedMatch::Column {
+            col_idx,
+            is_rowid_alias: col.is_rowid_alias(),
+        }));
+    }
+
+    if let Table::BTree(btree) = table {
+        if parse_row_id(normalized_id, internal_id, || false)?.is_some() {
+            if !btree.has_rowid {
+                crate::bail_parse_error!("no such column: {}", normalized_id);
+            }
+            return Ok(Some(QualifiedMatch::RowId));
+        }
+    }
+
+    Ok(None)
+}
+
 /// Rewrite ast::Expr in place, binding Column references/rewriting Expr::Id -> Expr::Column
 /// using the provided TableReferences, and replacing anonymous parameters with internal named
 /// ones
@@ -5850,9 +5908,10 @@ pub fn bind_and_rewrite_expr<'a>(
                         }
                     }
                     let mut match_result = None;
+                    let joined_tables = referenced_tables.joined_tables();
 
                     // First check joined tables
-                    for joined_table in referenced_tables.joined_tables().iter() {
+                    for joined_table in joined_tables.iter() {
                         let col_idx = joined_table.table.columns().iter().position(|c| {
                             c.name
                                 .as_ref()
@@ -5887,11 +5946,11 @@ pub fn bind_and_rewrite_expr<'a>(
                             }
                         // only if we haven't found a match, check for explicit rowid reference
                         } else if let Table::BTree(btree) = &joined_table.table {
-                            if let Some(row_id_expr) = parse_row_id(
-                                &normalized_id,
-                                referenced_tables.joined_tables()[0].internal_id,
-                                || referenced_tables.joined_tables().len() != 1,
-                            )? {
+                            if let Some(row_id_expr) =
+                                parse_row_id(&normalized_id, joined_tables[0].internal_id, || {
+                                    joined_tables.len() != 1
+                                })?
+                            {
                                 if !btree.has_rowid {
                                     crate::bail_parse_error!("no such column: {}", id.as_str());
                                 }
@@ -5986,6 +6045,16 @@ pub fn bind_and_rewrite_expr<'a>(
                     }
                 }
                 Expr::Qualified(tbl, id) => {
+                    // Resolve a `<tbl>.<id>` reference.
+                    //
+                    // Two-stage lookup with shadowing:
+                    //   1. Search the current scope's FROM tables (`joined_tables`).
+                    //   2. Fall back to enclosing scopes (`outer_query_refs`), restricted to
+                    //      the *nearest* scope whose identifier matches — so an inner alias
+                    //      shadows a same-named alias in an outer scope instead of conflicting.
+                    //
+                    // Produces either `Expr::Column` (real column) or `Expr::RowId`
+                    // (bare rowid alias like `t.rowid` on a btree with rowids).
                     tracing::debug!("bind_and_rewrite_expr({:?}, {:?})", tbl, id);
                     let Some(referenced_tables) = &mut referenced_tables else {
                         if binding_behavior == BindingBehavior::AllowUnboundIdentifiers {
@@ -5998,40 +6067,127 @@ pub fn bind_and_rewrite_expr<'a>(
                         );
                     };
                     let normalized_table_name = normalize_ident(tbl.as_str());
-                    // Check for duplicate table aliases — if multiple joined tables
-                    // share the same identifier, the qualified column ref is ambiguous.
-                    let duplicate_count = referenced_tables
-                        .joined_tables()
-                        .iter()
-                        .filter(|t| t.identifier == normalized_table_name)
-                        .count();
-                    if duplicate_count > 1 {
-                        crate::bail_parse_error!(
+                    let normalized_id = normalize_ident(id.as_str());
+
+                    // `resolved` holds the accepted binding (at most one).
+                    // `identifier_matched` is true once *any* scope produced a table whose
+                    // identifier equals `tbl`; it distinguishes "no such table" from
+                    // "no such column" in error reporting below.
+                    let mut resolved: Option<(TableInternalId, QualifiedMatch)> = None;
+                    let mut identifier_matched = false;
+
+                    let ambiguous = || -> LimboError {
+                        LimboError::ParseError(format!(
                             "ambiguous column name: {}.{}",
                             tbl.as_str(),
                             id.as_str()
-                        );
-                    }
-                    // search joined_tables first, then outer_query_refs, returning
-                    // (internal_id, &table) of the first match.
-                    let matching_tbl = referenced_tables
+                        ))
+                    };
+
+                    // --- Stage 1: search the current scope's FROM tables. ---
+                    for joined_table in referenced_tables
                         .joined_tables()
                         .iter()
-                        .find(|t| t.identifier == normalized_table_name)
-                        .map(|t| (t.internal_id, &t.table))
-                        .or_else(|| {
-                            referenced_tables
-                                .outer_query_refs()
-                                .iter()
-                                .find(|t| t.identifier == normalized_table_name)
-                                .map(|t| (t.internal_id, &t.table))
-                        });
-                    if matching_tbl.is_none() {
-                        // CTEs preplanned for subquery FROM visibility are kept as
-                        // definition-only outer refs. They are not valid column sources
-                        // unless explicitly referenced in this scope's FROM clause.
-                        // Restrict this branch to actual CTE definition refs so other
-                        // definition-only uses (if added later) still report "no such table".
+                        .filter(|t| t.identifier == normalized_table_name)
+                    {
+                        identifier_matched = true;
+                        let Some(candidate) = resolve_qualified_on_ref(
+                            &joined_table.table,
+                            joined_table.internal_id,
+                            &normalized_id,
+                        )?
+                        else {
+                            continue;
+                        };
+
+                        // Multiple FROM tables share this identifier and both contain `id`.
+                        // For column matches, a USING/NATURAL join on `id` lets the first
+                        // match stand (the duplicate side is implicitly merged). Rowid
+                        // matches never get this exception (rowid isn't a USING column).
+                        if resolved.is_some() {
+                            let allowed_by_using =
+                                matches!(candidate, QualifiedMatch::Column { .. })
+                                    && joined_table.join_info.as_ref().is_some_and(|ji| {
+                                        ji.using.iter().any(|u| {
+                                            u.as_str().eq_ignore_ascii_case(&normalized_id)
+                                        })
+                                    });
+                            if !allowed_by_using {
+                                return Err(ambiguous());
+                            }
+                            continue;
+                        }
+                        resolved = Some((joined_table.internal_id, candidate));
+                    }
+                    // --- Stage 2: fall back to enclosing scopes ---
+                    // Only attempted if no inner-scope table matched the identifier — an
+                    // inner alias of the same name shadows everything outside.
+                    //
+                    // We pick the *nearest* outer scope that contains a matching identifier
+                    // (smallest `scope_depth`) and search only refs at that depth. This lets
+                    // the same alias be reused at different nesting levels without triggering
+                    // spurious "ambiguous column" errors across unrelated scopes.
+                    //
+                    // `cte_definition_only` refs are excluded: those entries exist purely so
+                    // that a subquery's FROM clause can *look up* the CTE by name; once the
+                    // CTE is consumed into a FROM, column resolution must go through the
+                    // corresponding `joined_table`, not the definition-only ref.
+                    if !identifier_matched {
+                        let nearest_outer_scope = referenced_tables
+                            .outer_query_refs()
+                            .iter()
+                            .filter(|t| {
+                                t.identifier == normalized_table_name && !t.cte_definition_only
+                            })
+                            .map(|t| t.scope_depth)
+                            .min();
+
+                        if let Some(scope_depth) = nearest_outer_scope {
+                            identifier_matched = true;
+                            for outer_ref in
+                                referenced_tables.outer_query_refs().iter().filter(|t| {
+                                    t.identifier == normalized_table_name
+                                        && !t.cte_definition_only
+                                        && t.scope_depth == scope_depth
+                                })
+                            {
+                                let Some(candidate) = resolve_qualified_on_ref(
+                                    &outer_ref.table,
+                                    outer_ref.internal_id,
+                                    &normalized_id,
+                                )?
+                                else {
+                                    continue;
+                                };
+
+                                // Columns hidden by a USING/NATURAL join in the outer scope
+                                // are invisible here too. Rowid matches are not subject to
+                                // USING hiding (rowid isn't a real column).
+                                if let QualifiedMatch::Column { col_idx, .. } = candidate {
+                                    if outer_ref.using_dedup_hidden_cols.get(col_idx) {
+                                        continue;
+                                    }
+                                }
+                                if resolved.is_some() {
+                                    return Err(ambiguous());
+                                }
+                                resolved = Some((outer_ref.internal_id, candidate));
+                            }
+                        }
+                    }
+
+                    // --- Error reporting. ---
+                    if resolved.is_none() && !identifier_matched {
+                        // No scope contains a table with this identifier. Normally we
+                        // report "no such table", but there is one case where SQLite
+                        // reports "no such column" instead: when the identifier names a
+                        // CTE that was preplanned for subquery FROM visibility and kept
+                        // as a definition-only outer ref. The CTE *name* is valid in
+                        // principle; it's the column access through it that isn't,
+                        // because the CTE hasn't been brought into this scope's FROM.
+                        // The `cte_id`/`cte_select` check restricts this to real CTE
+                        // definition refs so any other future use of `cte_definition_only`
+                        // still falls through to "no such table".
                         if referenced_tables
                             .find_outer_query_ref_by_identifier(&normalized_table_name)
                             .is_some_and(|outer_ref| {
@@ -6078,45 +6234,34 @@ pub fn bind_and_rewrite_expr<'a>(
                         }
                         crate::bail_parse_error!("no such table: {}", normalized_table_name);
                     }
-                    let (tbl_id, tbl) = matching_tbl.unwrap();
-                    let normalized_id = normalize_ident(id.as_str());
-                    let col_idx = tbl.columns().iter().position(|c| {
-                        c.name
-                            .as_ref()
-                            .is_some_and(|name| name.eq_ignore_ascii_case(&normalized_id))
-                    });
-                    // User-defined columns take precedence over rowid aliases
-                    // (oid, rowid, _rowid_). Only fall back to parse_row_id()
-                    // when no matching user column exists.
-                    // Note: Only BTree tables have rowid; derived tables (FromClauseSubquery)
-                    // don't have a rowid.
-                    let Some(col_idx) = col_idx else {
-                        if let Table::BTree(btree) = tbl {
-                            if let Some(row_id_expr) =
-                                parse_row_id(&normalized_id, tbl_id, || false)?
-                            {
-                                if !btree.has_rowid {
-                                    crate::bail_parse_error!("no such column: {}", normalized_id);
-                                }
-                                *expr = row_id_expr;
-                                // Mark the table's rowid as referenced so correlated
-                                // subquery detection works correctly when a rowid
-                                // reference is the only link to the outer query.
-                                referenced_tables.mark_rowid_referenced(tbl_id);
-                                return Ok(WalkControl::Continue);
-                            }
-                        }
+                    // Identifier matched somewhere but no column/rowid binding was
+                    // produced — the table exists, the column doesn't.
+                    let Some((tbl_id, binding)) = resolved else {
                         crate::bail_parse_error!("no such column: {}", normalized_id);
                     };
-                    let col = tbl.columns().get(col_idx).unwrap();
-                    *expr = Expr::Column {
-                        database: None, // TODO: support different databases
-                        table: tbl_id,
-                        column: col_idx,
-                        is_rowid_alias: col.is_rowid_alias(),
-                    };
-                    tracing::debug!("rewritten to column");
-                    referenced_tables.mark_column_used(tbl_id, col_idx);
+
+                    match binding {
+                        QualifiedMatch::Column {
+                            col_idx,
+                            is_rowid_alias,
+                        } => {
+                            *expr = Expr::Column {
+                                database: None, // TODO: support different databases
+                                table: tbl_id,
+                                column: col_idx,
+                                is_rowid_alias,
+                            };
+                            tracing::debug!("rewritten to column");
+                            referenced_tables.mark_column_used(tbl_id, col_idx);
+                        }
+                        QualifiedMatch::RowId => {
+                            *expr = Expr::RowId {
+                                database: None, // TODO: support different databases
+                                table: tbl_id,
+                            };
+                            referenced_tables.mark_rowid_referenced(tbl_id);
+                        }
+                    }
                     return Ok(WalkControl::Continue);
                 }
                 Expr::DoublyQualified(db_name, tbl_name, col_name) => {
@@ -6267,10 +6412,12 @@ pub fn bind_and_rewrite_expr<'a>(
                             if func.needs_star_expansion() {
                                 // Only expand if there are actual tables - otherwise leave as
                                 // FunctionCallStar so translate_expr can generate the error
-                                if !referenced_tables.joined_tables().is_empty() {
+                                let joined_tables = referenced_tables.joined_tables();
+                                if !joined_tables.is_empty() {
                                     // Mark all columns as used so the optimizer doesn't
                                     // create partial covering indexes that would miss columns
-                                    for table in referenced_tables.joined_tables_mut().iter_mut() {
+                                    let joined_tables = referenced_tables.joined_tables_mut();
+                                    for table in joined_tables.iter_mut() {
                                         for col_idx in 0..table.columns().len() {
                                             table.mark_column_used(col_idx);
                                         }
@@ -6279,7 +6426,8 @@ pub fn bind_and_rewrite_expr<'a>(
                                     // Build arguments: alternating column_name (as string literal), column_value (as column reference)
                                     let mut args: Vec<Box<ast::Expr>> = Vec::new();
 
-                                    for table in referenced_tables.joined_tables().iter() {
+                                    let joined_tables = referenced_tables.joined_tables();
+                                    for table in joined_tables.iter() {
                                         for (col_idx, col) in table.columns().iter().enumerate() {
                                             // Skip hidden columns (like rowid in some cases)
                                             if col.hidden() {
