@@ -101,7 +101,7 @@ ongoing work to pass the full SQLite TCL test suite.
 | CREATE VIRTUAL TABLE      | ✅ Yes     |                                                                                   |
 | DELETE                    | ✅ Yes     |                                                                                   |
 | DETACH DATABASE           | ✅ Yes     |                                                                                   |
-| DROP INDEX                | 🚧 Partial | Disabled by default.                                                              |
+| DROP INDEX                | ✅ Yes     |                                                                                   |
 | DROP TABLE                | ✅ Yes     |                                                                                   |
 | DROP TRIGGER              | ✅ Yes     |                                                                                   |
 | DROP VIEW                 | ✅ Yes     |                                                                                   |
