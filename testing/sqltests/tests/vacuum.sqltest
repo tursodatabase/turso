@@ -24,6 +24,38 @@ expect {
 }
 
 @backend rust
+test vacuum-generated-columns {
+    CREATE TABLE t1(a INTEGER, b AS (a * 2));
+    INSERT INTO t1(a) VALUES(1), (2), (3), (4), (5);
+    DELETE FROM t1 WHERE a IN (2, 4);
+    VACUUM;
+    SELECT a, b FROM t1;
+}
+expect {
+    1|2
+    3|6
+    5|10
+}
+
+@backend rust
+@skip-if mvcc "Expression indexes are not supported with MVCC"
+test vacuum-generated-columns-with-index {
+    CREATE TABLE t1(a INTEGER, b AS (a * 2));
+    CREATE INDEX idx1 ON t1(b);
+    INSERT INTO t1(a) VALUES(1), (2), (3), (4), (5);
+    DELETE FROM t1 WHERE a IN (2, 4);
+    VACUUM;
+    SELECT a, b FROM t1;
+    PRAGMA integrity_check;
+}
+expect {
+    1|2
+    3|6
+    5|10
+    ok
+}
+
+@backend rust
 test vacuum-schema-qualified-rejected {
     VACUUM temp;
 }

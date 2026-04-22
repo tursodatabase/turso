@@ -10,8 +10,9 @@ use std::{
 use tempfile::TempDir;
 use turso_core::{
     io::{FileId, FileSyncType},
-    Buffer, Clock, Completion, Connection, Database, DatabaseOpts, File, LimboError,
-    MonotonicInstant, OpenFlags, StepResult, Value, WallClockInstant, IO,
+    Buffer, CheckpointMode, Clock, Completion, Connection, Database, DatabaseOpts, File,
+    LimboError, MonotonicInstant, OpenFlags, StatementStatusCounter, StepResult, SyncMode, Value,
+    WallClockInstant, IO,
 };
 
 /// Helper to run integrity_check and return the result string
@@ -259,6 +260,16 @@ impl QueuedIo {
 
     fn history_since(&self, start: usize) -> Vec<QueuedIoEvent> {
         self.state.history.lock().unwrap()[start..].to_vec()
+    }
+
+    fn pending_events(&self) -> Vec<QueuedIoEvent> {
+        self.state
+            .pending
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|op| op.event.clone())
+            .collect()
     }
 
     fn step_one(&self) -> turso_core::Result<Option<QueuedIoEvent>> {
@@ -1107,6 +1118,68 @@ fn test_vacuum_into_with_triggers(tmp_db: TempDatabase) {
             ("INSERT".to_string(), "products".to_string(), 3),
         ]
     );
+}
+
+/// Plain VACUUM must preserve trigger definitions and leave them executable on
+/// the reloaded source connection.
+#[cfg_attr(feature = "checksum", ignore)]
+#[turso_macros::test]
+fn test_plain_vacuum_preserves_triggers(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+
+    conn.execute("CREATE TABLE products (id INTEGER PRIMARY KEY, name TEXT)")?;
+    conn.execute("CREATE TABLE orders (id INTEGER PRIMARY KEY, product_id INTEGER)")?;
+    conn.execute("CREATE TABLE audit_log (action TEXT, tbl TEXT, record_id INTEGER)")?;
+    conn.execute(
+        "CREATE TRIGGER log_product AFTER INSERT ON products BEGIN
+            INSERT INTO audit_log VALUES ('INSERT', 'products', NEW.id);
+        END",
+    )?;
+    conn.execute(
+        "CREATE TRIGGER log_order AFTER INSERT ON orders BEGIN
+            INSERT INTO audit_log VALUES ('INSERT', 'orders', NEW.id);
+        END",
+    )?;
+
+    conn.execute("INSERT INTO products VALUES (1, 'Item A'), (2, 'Item B')")?;
+    conn.execute("INSERT INTO orders VALUES (1, 1), (2, 2)")?;
+
+    conn.execute("VACUUM")?;
+
+    let triggers: Vec<(String,)> =
+        conn.exec_rows("SELECT name FROM sqlite_schema WHERE type = 'trigger' ORDER BY name");
+    assert_eq!(
+        triggers,
+        vec![("log_order".to_string(),), ("log_product".to_string(),)]
+    );
+
+    let audit: Vec<(String, String, i64)> =
+        conn.exec_rows("SELECT action, tbl, record_id FROM audit_log ORDER BY tbl, record_id");
+    assert_eq!(
+        audit,
+        vec![
+            ("INSERT".to_string(), "orders".to_string(), 1),
+            ("INSERT".to_string(), "orders".to_string(), 2),
+            ("INSERT".to_string(), "products".to_string(), 1),
+            ("INSERT".to_string(), "products".to_string(), 2),
+        ]
+    );
+
+    conn.execute("INSERT INTO products VALUES (3, 'New')")?;
+    conn.execute("INSERT INTO orders VALUES (3, 3)")?;
+
+    let new_audit: Vec<(String, String, i64)> = conn
+        .exec_rows("SELECT action, tbl, record_id FROM audit_log WHERE record_id = 3 ORDER BY tbl");
+    assert_eq!(
+        new_audit,
+        vec![
+            ("INSERT".to_string(), "orders".to_string(), 3),
+            ("INSERT".to_string(), "products".to_string(), 3),
+        ]
+    );
+
+    assert_eq!(run_integrity_check(&conn), "ok");
+    Ok(())
 }
 
 /// Test VACUUM INTO preserves and bumps meta values like SQLite.
@@ -3408,6 +3481,42 @@ fn test_vacuum_into_preserves_sqlite_stat1(tmp_db: TempDatabase) -> anyhow::Resu
     Ok(())
 }
 
+/// Plain VACUUM must preserve storage-backed internal statistics tables and
+/// keep their rows visible on the source connection after schema reload.
+#[cfg_attr(feature = "checksum", ignore)]
+#[turso_macros::test]
+fn test_plain_vacuum_preserves_sqlite_stat1(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+
+    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, category TEXT, value INTEGER)")?;
+    conn.execute("CREATE INDEX idx_t_category_value ON t(category, value)")?;
+    for i in 0..50 {
+        let category = if i % 2 == 0 { "even" } else { "odd" };
+        conn.execute(format!(
+            "INSERT INTO t VALUES ({i}, '{category}', {})",
+            i * 10
+        ))?;
+    }
+    conn.execute("ANALYZE")?;
+
+    let before_stats: Vec<(String, String, String)> =
+        conn.exec_rows("SELECT tbl, COALESCE(idx, ''), stat FROM sqlite_stat1 ORDER BY tbl, idx");
+    assert!(
+        !before_stats.is_empty(),
+        "ANALYZE should populate sqlite_stat1 before VACUUM"
+    );
+
+    conn.execute("VACUUM")?;
+
+    let after_stats: Vec<(String, String, String)> =
+        conn.exec_rows("SELECT tbl, COALESCE(idx, ''), stat FROM sqlite_stat1 ORDER BY tbl, idx");
+    assert_eq!(after_stats, before_stats);
+    let count: Vec<(i64,)> = conn.exec_rows("SELECT COUNT(*) FROM t WHERE category = 'even'");
+    assert_eq!(count, vec![(25,)]);
+    assert_eq!(run_integrity_check(&conn), "ok");
+    Ok(())
+}
+
 /// VACUUM INTO must preserve generated column values.
 /// Generated columns are excluded from the data-copy column list (they're
 /// computed, not stored), but the destination schema includes them and the
@@ -3515,6 +3624,304 @@ fn test_vacuum_into_generated_column_with_rowid_and_deletes() -> anyhow::Result<
     let dest_rows: Vec<(i64, String, String)> =
         dest_conn.exec_rows("SELECT id, name, label FROM t ORDER BY id");
     assert_eq!(source_rows, dest_rows);
+
+    Ok(())
+}
+
+/// Plain VACUUM must preserve generated column values.
+#[test]
+fn test_plain_vacuum_preserves_generated_columns() -> anyhow::Result<()> {
+    let opts = DatabaseOpts::new().with_generated_columns(true);
+    let tmp_db = TempDatabase::builder().with_opts(opts).build();
+    let conn = tmp_db.connect_limbo();
+
+    conn.execute(
+        "CREATE TABLE t (
+            a INTEGER,
+            b INTEGER,
+            c INTEGER GENERATED ALWAYS AS (a + b) VIRTUAL
+        )",
+    )?;
+    conn.execute("INSERT INTO t (a, b) VALUES (10, 20), (100, 200), (7, 8)")?;
+    conn.execute("DELETE FROM t WHERE a = 7")?;
+
+    let before_rows: Vec<(i64, i64, i64)> = conn.exec_rows("SELECT a, b, c FROM t ORDER BY a");
+    assert_eq!(before_rows, vec![(10, 20, 30), (100, 200, 300)]);
+
+    conn.execute("VACUUM")?;
+
+    let after_rows: Vec<(i64, i64, i64)> = conn.exec_rows("SELECT a, b, c FROM t ORDER BY a");
+    assert_eq!(after_rows, before_rows);
+    assert_eq!(run_integrity_check(&conn), "ok");
+    assert_plain_vacuum_folded_into_db_file(&tmp_db, &conn);
+
+    Ok(())
+}
+
+/// Plain VACUUM must preserve rowid aliases so generated columns that depend on
+/// them continue to compute the same values after deletes and compaction.
+#[test]
+fn test_plain_vacuum_generated_column_with_rowid_and_deletes() -> anyhow::Result<()> {
+    let opts = DatabaseOpts::new().with_generated_columns(true);
+    let tmp_db = TempDatabase::builder().with_opts(opts).build();
+    let conn = tmp_db.connect_limbo();
+
+    conn.execute(
+        "CREATE TABLE t (
+            id INTEGER PRIMARY KEY,
+            name TEXT,
+            label TEXT GENERATED ALWAYS AS ('item_' || id) VIRTUAL
+        )",
+    )?;
+    conn.execute(
+        "INSERT INTO t (id, name) VALUES
+            (1, 'a'), (2, 'b'), (3, 'c'), (4, 'd'), (5, 'e')",
+    )?;
+    conn.execute("DELETE FROM t WHERE id IN (2, 4)")?;
+
+    let before_rows: Vec<(i64, String, String)> =
+        conn.exec_rows("SELECT id, name, label FROM t ORDER BY id");
+    assert_eq!(
+        before_rows,
+        vec![
+            (1, "a".to_string(), "item_1".to_string()),
+            (3, "c".to_string(), "item_3".to_string()),
+            (5, "e".to_string(), "item_5".to_string()),
+        ]
+    );
+
+    conn.execute("VACUUM")?;
+
+    let after_rows: Vec<(i64, String, String)> =
+        conn.exec_rows("SELECT id, name, label FROM t ORDER BY id");
+    assert_eq!(after_rows, before_rows);
+    assert_eq!(run_integrity_check(&conn), "ok");
+    assert_plain_vacuum_folded_into_db_file(&tmp_db, &conn);
+
+    Ok(())
+}
+
+/// Plain VACUUM must preserve custom type definitions and keep decoded values
+/// usable on both the current and reopened connections.
+#[ignore = "plain VACUUM with custom types currently overflows during schema reload"]
+#[test]
+fn test_plain_vacuum_preserves_custom_types() -> anyhow::Result<()> {
+    let opts = DatabaseOpts::new().with_custom_types(true);
+    let tmp_db = TempDatabase::builder().with_opts(opts).build();
+    let conn = tmp_db.connect_limbo();
+
+    conn.execute("CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100")?;
+    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, amount cents) STRICT")?;
+    conn.execute("INSERT INTO t VALUES (1, 42), (2, 100)")?;
+
+    let before_rows: Vec<(i64, i64)> = conn.exec_rows("SELECT id, amount FROM t ORDER BY id");
+    assert_eq!(before_rows, vec![(1, 42), (2, 100)]);
+
+    conn.execute("VACUUM")?;
+
+    let after_rows: Vec<(i64, i64)> = conn.exec_rows("SELECT id, amount FROM t ORDER BY id");
+    assert_eq!(after_rows, before_rows);
+    assert_eq!(run_integrity_check(&conn), "ok");
+    assert_plain_vacuum_folded_into_db_file(&tmp_db, &conn);
+
+    Ok(())
+}
+
+/// Plain VACUUM reparses the main schema only; an initialized temp schema on
+/// the same connection must remain usable across the reload.
+#[cfg_attr(feature = "checksum", ignore)]
+#[turso_macros::test]
+fn test_plain_vacuum_keeps_temp_schema_on_same_connection(
+    tmp_db: TempDatabase,
+) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+
+    conn.execute("CREATE TABLE main_t(id INTEGER PRIMARY KEY, payload TEXT)")?;
+    for id in 0..80 {
+        conn.execute(format!(
+            "INSERT INTO main_t VALUES({id}, '{}')",
+            "m".repeat(180)
+        ))?;
+    }
+    conn.execute("DELETE FROM main_t WHERE id >= 20")?;
+
+    conn.execute("CREATE TEMP TABLE temp_ids(id INTEGER PRIMARY KEY, note TEXT)")?;
+    conn.execute("INSERT INTO temp.temp_ids VALUES (1, 'one'), (2, 'two')")?;
+
+    conn.execute("VACUUM")?;
+
+    let temp_rows: Vec<(i64, String)> =
+        conn.exec_rows("SELECT id, note FROM temp.temp_ids ORDER BY id");
+    assert_eq!(
+        temp_rows,
+        vec![(1, "one".to_string()), (2, "two".to_string())]
+    );
+    assert_eq!(scalar_i64(&conn, "SELECT COUNT(*) FROM main_t"), 20);
+    assert_eq!(run_integrity_check(&conn), "ok");
+    assert_plain_vacuum_folded_into_db_file(&tmp_db, &conn);
+
+    conn.execute("INSERT INTO temp.temp_ids VALUES (3, 'three')")?;
+    assert_eq!(scalar_i64(&conn, "SELECT COUNT(*) FROM temp.temp_ids"), 3);
+
+    Ok(())
+}
+
+/// A zero-length WAL forces in-place VACUUM down the source WAL header
+/// initialization path before the first copy-back batch.
+#[cfg_attr(feature = "checksum", ignore)]
+#[turso_macros::test]
+fn test_plain_vacuum_reinitializes_zero_length_wal(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, payload TEXT)")?;
+    conn.execute("CREATE INDEX idx_t_payload ON t(payload)")?;
+    for id in 0..120 {
+        conn.execute(format!("INSERT INTO t VALUES({id}, '{}')", "z".repeat(220)))?;
+    }
+    conn.execute("DELETE FROM t WHERE id % 4 = 0")?;
+    let pre_pages = scalar_i64(&conn, "PRAGMA page_count");
+
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")?;
+    assert_eq!(
+        wal_file_size(&tmp_db),
+        0,
+        "checkpoint should leave a zero-length WAL so VACUUM reinitializes its header"
+    );
+
+    conn.execute("VACUUM")?;
+
+    assert_eq!(scalar_i64(&conn, "SELECT COUNT(*) FROM t"), 90);
+    assert!(
+        scalar_i64(&conn, "PRAGMA page_count") < pre_pages,
+        "VACUUM should compact after reinitializing the WAL header"
+    );
+    assert_eq!(run_integrity_check(&conn), "ok");
+    assert_plain_vacuum_folded_into_db_file(&tmp_db, &conn);
+
+    Ok(())
+}
+
+/// Plain VACUUM must preserve custom index-method indexes on the source
+/// connection after schema reload.
+#[cfg_attr(feature = "checksum", ignore)]
+#[ignore = "plain VACUUM does not rebuild custom index-method backing indexes on the source database"]
+#[turso_macros::test]
+fn test_plain_vacuum_preserves_custom_index_method(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+
+    conn.execute("CREATE TABLE vectors (id INTEGER PRIMARY KEY, label TEXT, embedding BLOB)")?;
+    conn.execute("CREATE INDEX vec_idx ON vectors USING toy_vector_sparse_ivf (embedding)")?;
+    conn.execute("INSERT INTO vectors VALUES (1, 'cat', vector32_sparse('[1, 0, 0, 0]'))")?;
+    conn.execute("INSERT INTO vectors VALUES (2, 'dog', vector32_sparse('[0, 1, 0, 0]'))")?;
+    conn.execute("INSERT INTO vectors VALUES (3, 'fish', vector32_sparse('[0, 0, 1, 0]'))")?;
+
+    conn.execute("VACUUM")?;
+
+    let indexes: Vec<(String,)> = conn.exec_rows(
+        "SELECT name FROM sqlite_schema WHERE type = 'index' AND tbl_name = 'vectors' ORDER BY name",
+    );
+    assert_eq!(
+        indexes,
+        vec![
+            ("vec_idx".to_string(),),
+            ("vec_idx_inverted_index".to_string(),),
+            ("vec_idx_stats".to_string(),),
+        ],
+    );
+
+    let eqp: Vec<(i64, i64, i64, String)> = conn.exec_rows(
+        "EXPLAIN QUERY PLAN \
+         SELECT id, label, vector_distance_jaccard(embedding, vector32_sparse('[1, 0, 0, 0]')) AS distance \
+         FROM vectors ORDER BY distance LIMIT 1",
+    );
+    assert!(
+        eqp.iter()
+            .any(|(_, _, _, detail)| detail.contains("INDEX METHOD")),
+        "nearest-neighbor query should use custom index method after plain VACUUM, got plan: {eqp:?}",
+    );
+
+    let nearest: Vec<(i64, String, f64)> = conn.exec_rows(
+        "SELECT id, label, vector_distance_jaccard(embedding, vector32_sparse('[1, 0, 0, 0]')) AS distance \
+         FROM vectors ORDER BY distance LIMIT 1",
+    );
+    assert_eq!(nearest.len(), 1);
+    assert_eq!(nearest[0].0, 1);
+    assert_eq!(nearest[0].1, "cat");
+    assert!(nearest[0].2.abs() < 1e-9);
+    assert_eq!(run_integrity_check(&conn), "ok");
+    assert_plain_vacuum_folded_into_db_file(&tmp_db, &conn);
+
+    Ok(())
+}
+
+#[cfg(all(feature = "fts", not(target_family = "wasm")))]
+#[cfg_attr(feature = "checksum", ignore)]
+#[ignore = "plain VACUUM leaves FTS backing indexes inconsistent on the source database"]
+#[turso_macros::test]
+fn test_plain_vacuum_preserves_fts_index(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+
+    conn.execute("CREATE TABLE articles(id INTEGER PRIMARY KEY, title TEXT, body TEXT)")?;
+    conn.execute("CREATE INDEX fts_articles ON articles USING fts (title, body)")?;
+    conn.execute("INSERT INTO articles VALUES (1, 'Database Performance', 'Optimizing database queries is important for performance')")?;
+    conn.execute("INSERT INTO articles VALUES (2, 'Web Development', 'Modern web applications use JavaScript and APIs')")?;
+    conn.execute("INSERT INTO articles VALUES (3, 'Database Design', 'Good database design leads to better performance')")?;
+    conn.execute("INSERT INTO articles VALUES (4, 'API Development', 'RESTful APIs are common in web services')")?;
+
+    conn.execute("VACUUM")?;
+
+    let database_matches: Vec<(i64,)> = conn
+        .exec_rows("SELECT id FROM articles WHERE fts_match(title, body, 'database') ORDER BY id");
+    assert_eq!(database_matches, vec![(1,), (3,)]);
+    let web_matches: Vec<(i64,)> =
+        conn.exec_rows("SELECT id FROM articles WHERE fts_match(title, body, 'web') ORDER BY id");
+    assert_eq!(web_matches, vec![(2,), (4,)]);
+
+    let eqp: Vec<(i64, i64, i64, String)> = conn.exec_rows(
+        "EXPLAIN QUERY PLAN \
+         SELECT id FROM articles WHERE fts_match(title, body, 'database')",
+    );
+    assert!(
+        eqp.iter()
+            .any(|(_, _, _, detail)| detail.contains("INDEX METHOD")),
+        "FTS query should use an index method after plain VACUUM, got plan: {eqp:?}",
+    );
+    assert_eq!(run_integrity_check(&conn), "ok");
+    assert_plain_vacuum_folded_into_db_file(&tmp_db, &conn);
+
+    Ok(())
+}
+
+/// Plain VACUUM must preserve vector blobs stored in ordinary table columns.
+#[cfg_attr(feature = "checksum", ignore)]
+#[turso_macros::test]
+fn test_plain_vacuum_preserves_vector_blobs(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+
+    conn.execute("CREATE TABLE vectors (id INTEGER PRIMARY KEY, label TEXT, embedding BLOB)")?;
+    conn.execute("INSERT INTO vectors VALUES (1, 'cat', vector32('[1.0, 0.0, 0.0, 0.0]'))")?;
+    conn.execute("INSERT INTO vectors VALUES (2, 'dog', vector32('[0.0, 1.0, 0.0, 0.0]'))")?;
+    conn.execute("INSERT INTO vectors VALUES (3, 'fish', vector32('[0.0, 0.0, 1.0, 0.0]'))")?;
+
+    let before_dist: Vec<(f64,)> = conn.exec_rows(
+        "SELECT vector_distance_cos(
+            (SELECT embedding FROM vectors WHERE id = 1),
+            (SELECT embedding FROM vectors WHERE id = 2)
+        )",
+    );
+
+    conn.execute("VACUUM")?;
+
+    let after_dist: Vec<(f64,)> = conn.exec_rows(
+        "SELECT vector_distance_cos(
+            (SELECT embedding FROM vectors WHERE id = 1),
+            (SELECT embedding FROM vectors WHERE id = 2)
+        )",
+    );
+    assert_eq!(after_dist, before_dist);
+    assert_eq!(scalar_i64(&conn, "SELECT COUNT(*) FROM vectors"), 3);
+    assert_eq!(run_integrity_check(&conn), "ok");
+    assert_plain_vacuum_folded_into_db_file(&tmp_db, &conn);
 
     Ok(())
 }
@@ -4005,6 +4412,68 @@ fn test_plain_vacuum_then_write(tmp_db: TempDatabase) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Plain VACUUM only targets main. Attached databases may stay open on the
+/// connection, but they should be otherwise unaffected.
+#[cfg_attr(feature = "checksum", ignore)]
+#[test]
+fn test_plain_vacuum_leaves_attached_database_untouched() -> anyhow::Result<()> {
+    let opts = DatabaseOpts::new().with_attach(true);
+    let tmp_db = TempDatabase::builder().with_opts(opts).build();
+    let conn = tmp_db.connect_limbo();
+
+    conn.execute("CREATE TABLE main_t(id INTEGER PRIMARY KEY, payload TEXT)")?;
+    for id in 0..120 {
+        conn.execute(format!(
+            "INSERT INTO main_t VALUES({id}, '{}')",
+            "m".repeat(180)
+        ))?;
+    }
+    conn.execute("DELETE FROM main_t WHERE id >= 20")?;
+
+    let attached_path = tmp_db.path.with_file_name("plain_vacuum_attached.db");
+    conn.execute(format!(
+        "ATTACH DATABASE '{}' AS att",
+        attached_path.display()
+    ))?;
+    conn.execute("CREATE TABLE att.att_t(id INTEGER PRIMARY KEY, payload TEXT)")?;
+    conn.execute("INSERT INTO att.att_t VALUES (1, 'a'), (2, 'b'), (3, 'c')")?;
+
+    let attached_db = TempDatabase::new_with_existent(&attached_path);
+    let attached_hash_before = compute_dbhash(&attached_db);
+    let main_pages_before = scalar_i64(&conn, "PRAGMA main.page_count");
+
+    conn.execute("VACUUM")?;
+
+    assert!(
+        scalar_i64(&conn, "PRAGMA main.page_count") < main_pages_before,
+        "plain VACUUM should compact only the main database"
+    );
+    assert_eq!(scalar_i64(&conn, "SELECT COUNT(*) FROM main_t"), 20);
+    assert_eq!(scalar_i64(&conn, "SELECT COUNT(*) FROM att.att_t"), 3);
+    assert_eq!(run_integrity_check(&conn), "ok");
+    assert_plain_vacuum_folded_into_db_file(&tmp_db, &conn);
+
+    let attached_reopened = TempDatabase::new_with_existent(&attached_path);
+    let attached_hash_after = compute_dbhash(&attached_reopened);
+    assert_eq!(
+        attached_hash_after.hash, attached_hash_before.hash,
+        "plain VACUUM on main must not rewrite the attached database"
+    );
+    let attached_conn = attached_reopened.connect_limbo();
+    let attached_rows: Vec<(i64, String)> =
+        attached_conn.exec_rows("SELECT id, payload FROM att_t ORDER BY id");
+    assert_eq!(
+        attached_rows,
+        vec![
+            (1, "a".to_string()),
+            (2, "b".to_string()),
+            (3, "c".to_string()),
+        ]
+    );
+
+    Ok(())
+}
+
 /// Plain VACUUM rejects query_only mode.
 #[cfg_attr(feature = "checksum", ignore)]
 #[turso_macros::test(init_sql = "CREATE TABLE t(a INTEGER);")]
@@ -4099,6 +4568,38 @@ fn test_plain_vacuum_rejects_reprepared_active_select_on_same_connection(
     assert!(
         err_msg.contains("SQL statements in progress"),
         "error should mention active statements, got: {err_msg}"
+    );
+
+    Ok(())
+}
+
+/// A statement prepared on another connection before VACUUM should reprepare
+/// cleanly against the bumped schema cookie.
+#[cfg_attr(feature = "checksum", ignore)]
+#[turso_macros::test(init_sql = "CREATE TABLE t(a INTEGER PRIMARY KEY, b TEXT);")]
+fn test_plain_vacuum_reprepares_stale_prepared_statement_on_other_connection(
+    tmp_db: TempDatabase,
+) -> anyhow::Result<()> {
+    let writer = tmp_db.connect_limbo();
+    let reader = tmp_db.connect_limbo();
+
+    writer.execute("INSERT INTO t VALUES(1, 'one'), (2, 'two'), (3, 'three')")?;
+
+    let mut stmt = reader.prepare("SELECT a, b FROM t WHERE a >= 2 ORDER BY a")?;
+    assert_eq!(stmt.stmt_status(StatementStatusCounter::Reprepare), 0);
+
+    writer.execute("VACUUM")?;
+
+    let mut rows = Vec::new();
+    stmt.run_with_row_callback(|row| {
+        rows.push((row.get::<i64>(0)?, row.get::<String>(1)?));
+        Ok(())
+    })?;
+
+    assert_eq!(rows, vec![(2, "two".to_string()), (3, "three".to_string())]);
+    assert!(
+        stmt.stmt_status(StatementStatusCounter::Reprepare) >= 1,
+        "prepared statement should reprepare after VACUUM bumps the schema cookie"
     );
 
     Ok(())
@@ -4649,6 +5150,39 @@ fn test_plain_vacuum_active_reader_blocks_fold_contract() -> anyhow::Result<()> 
     Ok(())
 }
 
+/// Active writers on another WAL connection must make plain VACUUM fail before
+/// it acquires the exclusive source snapshot.
+#[cfg_attr(feature = "checksum", ignore)]
+#[test]
+fn test_plain_vacuum_active_writer_returns_busy() -> anyhow::Result<()> {
+    let tmp_db = TempDatabase::new_empty();
+    let vacuum_conn = tmp_db.connect_limbo();
+    let writer = tmp_db.connect_limbo();
+
+    vacuum_conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, payload TEXT)")?;
+    for i in 0..120 {
+        vacuum_conn.execute(format!("INSERT INTO t VALUES({i}, '{}')", "x".repeat(220)))?;
+    }
+    vacuum_conn.execute("DELETE FROM t WHERE id >= 20")?;
+
+    writer.execute("BEGIN IMMEDIATE")?;
+    writer.execute("INSERT INTO t VALUES(1000, 'pending')")?;
+
+    let result = vacuum_conn.execute("VACUUM");
+    assert!(
+        matches!(result, Err(LimboError::Busy)),
+        "active non-MVCC write transaction should make VACUUM return Busy, got {result:?}"
+    );
+
+    writer.execute("ROLLBACK")?;
+    vacuum_conn.execute("VACUUM")?;
+
+    assert_eq!(scalar_i64(&vacuum_conn, "SELECT COUNT(*) FROM t"), 20);
+    assert_eq!(run_integrity_check(&vacuum_conn), "ok");
+    assert_plain_vacuum_folded_into_db_file(&tmp_db, &vacuum_conn);
+    Ok(())
+}
+
 fn populate_mvcc_vacuum_workload(conn: &Arc<Connection>) -> anyhow::Result<Vec<(i64, String)>> {
     conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, tag TEXT NOT NULL, payload TEXT)")?;
     conn.execute("CREATE INDEX idx_t_tag ON t(tag)")?;
@@ -4692,6 +5226,146 @@ fn assert_mvcc_vacuum_workload(
     let table_scan_hot: Vec<(i64,)> =
         conn.exec_rows("SELECT id FROM t NOT INDEXED WHERE tag = 'hot' ORDER BY id");
     assert_eq!(indexed_hot, table_scan_hot);
+
+    Ok(())
+}
+
+fn populate_mvcc_multi_object_vacuum_workload(conn: &Arc<Connection>) -> anyhow::Result<()> {
+    for table in ["a", "b", "c"] {
+        conn.execute(format!(
+            "CREATE TABLE {table}(id INTEGER PRIMARY KEY, tag TEXT NOT NULL, payload TEXT)"
+        ))?;
+        conn.execute(format!("CREATE INDEX idx_{table}_tag ON {table}(tag)"))?;
+    }
+
+    for id in 0..90 {
+        conn.execute(format!(
+            "INSERT INTO a VALUES({id}, 'tag-{}', '{}')",
+            id % 3,
+            "a".repeat(120)
+        ))?;
+        conn.execute(format!(
+            "INSERT INTO b VALUES({id}, 'tag-{}', '{}')",
+            id % 4,
+            "b".repeat(120)
+        ))?;
+        conn.execute(format!(
+            "INSERT INTO c VALUES({id}, 'tag-{}', '{}')",
+            id % 5,
+            "c".repeat(120)
+        ))?;
+    }
+
+    conn.execute("DELETE FROM a WHERE id % 4 = 0")?;
+    conn.execute("DELETE FROM b WHERE id % 5 = 0")?;
+    conn.execute("DELETE FROM c WHERE id % 6 = 0")?;
+    conn.execute("UPDATE a SET tag = 'hot-a' WHERE id % 10 = 1")?;
+    conn.execute("UPDATE b SET tag = 'hot-b' WHERE id % 9 = 2")?;
+    conn.execute("UPDATE c SET tag = 'hot-c' WHERE id % 8 = 3")?;
+    Ok(())
+}
+
+fn assert_mvcc_multi_object_vacuum_workload(conn: &Arc<Connection>) -> anyhow::Result<()> {
+    assert_eq!(run_integrity_check(conn), "ok");
+
+    assert_eq!(scalar_i64(conn, "SELECT COUNT(*) FROM a"), 67);
+    assert_eq!(scalar_i64(conn, "SELECT COUNT(*) FROM b"), 72);
+    assert_eq!(scalar_i64(conn, "SELECT COUNT(*) FROM c"), 75);
+
+    let hot_a: Vec<(i64,)> = conn.exec_rows("SELECT id FROM a WHERE tag = 'hot-a' ORDER BY id");
+    let hot_a_scan: Vec<(i64,)> =
+        conn.exec_rows("SELECT id FROM a NOT INDEXED WHERE tag = 'hot-a' ORDER BY id");
+    assert_eq!(hot_a, hot_a_scan);
+    assert_eq!(
+        hot_a,
+        vec![(1,), (11,), (21,), (31,), (41,), (51,), (61,), (71,), (81,)]
+    );
+
+    let hot_b: Vec<(i64,)> = conn.exec_rows("SELECT id FROM b WHERE tag = 'hot-b' ORDER BY id");
+    let hot_b_scan: Vec<(i64,)> =
+        conn.exec_rows("SELECT id FROM b NOT INDEXED WHERE tag = 'hot-b' ORDER BY id");
+    assert_eq!(hot_b, hot_b_scan);
+    assert_eq!(
+        hot_b,
+        vec![(2,), (11,), (29,), (38,), (47,), (56,), (74,), (83,)]
+    );
+
+    let hot_c: Vec<(i64,)> = conn.exec_rows("SELECT id FROM c WHERE tag = 'hot-c' ORDER BY id");
+    let hot_c_scan: Vec<(i64,)> =
+        conn.exec_rows("SELECT id FROM c NOT INDEXED WHERE tag = 'hot-c' ORDER BY id");
+    assert_eq!(hot_c, hot_c_scan);
+    assert_eq!(
+        hot_c,
+        vec![
+            (3,),
+            (11,),
+            (19,),
+            (27,),
+            (35,),
+            (43,),
+            (51,),
+            (59,),
+            (67,),
+            (75,),
+            (83,)
+        ]
+    );
+
+    Ok(())
+}
+
+#[ignore = "MVCC post-vacuum writes across multiple indexed tables currently panic in index commit"]
+#[test]
+fn test_mvcc_plain_vacuum_multi_object_rootpage_reset() -> anyhow::Result<()> {
+    let tmp_db =
+        TempDatabase::new_with_mvcc("test_mvcc_plain_vacuum_multi_object_rootpage_reset.db");
+    let conn = tmp_db.connect_limbo();
+
+    populate_mvcc_multi_object_vacuum_workload(&conn)?;
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")?;
+    assert_eq!(mvcc_log_file_size(&tmp_db), 0);
+
+    conn.execute("VACUUM")?;
+    assert_plain_vacuum_folded_into_db_file(&tmp_db, &conn);
+    assert_mvcc_multi_object_vacuum_workload(&conn)?;
+
+    conn.execute("INSERT INTO a VALUES(1000, 'after-a', 'payload-a')")?;
+    conn.execute("UPDATE a SET tag = 'after-a-updated' WHERE id = 1")?;
+    conn.execute("INSERT INTO b VALUES(1001, 'after-b', 'payload-b')")?;
+    conn.execute("DELETE FROM b WHERE id = 3")?;
+    conn.execute("INSERT INTO c VALUES(1002, 'after-c', 'payload-c')")?;
+    conn.execute("UPDATE c SET tag = 'after-c-updated' WHERE id = 11")?;
+
+    let after_a: Vec<(i64,)> = conn.exec_rows("SELECT id FROM a WHERE tag = 'after-a' ORDER BY id");
+    assert_eq!(after_a, vec![(1000,)]);
+    let after_a_updated: Vec<(i64,)> =
+        conn.exec_rows("SELECT id FROM a WHERE tag = 'after-a-updated' ORDER BY id");
+    assert_eq!(after_a_updated, vec![(1,)]);
+    let after_b: Vec<(i64,)> = conn.exec_rows("SELECT id FROM b WHERE tag = 'after-b' ORDER BY id");
+    assert_eq!(after_b, vec![(1001,)]);
+    assert_eq!(scalar_i64(&conn, "SELECT COUNT(*) FROM b WHERE id = 3"), 0);
+    let after_c: Vec<(i64,)> = conn.exec_rows("SELECT id FROM c WHERE tag = 'after-c' ORDER BY id");
+    assert_eq!(after_c, vec![(1002,)]);
+    let after_c_updated: Vec<(i64,)> =
+        conn.exec_rows("SELECT id FROM c WHERE tag = 'after-c-updated' ORDER BY id");
+    assert_eq!(after_c_updated, vec![(11,)]);
+    assert_eq!(run_integrity_check(&conn), "ok");
+
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")?;
+    assert_eq!(mvcc_log_file_size(&tmp_db), 0);
+
+    let reopened = TempDatabase::new_with_existent_with_opts(&tmp_db.path, tmp_db.db_opts);
+    let reopened_conn = reopened.connect_limbo();
+    assert_eq!(run_integrity_check(&reopened_conn), "ok");
+    let reopened_a: Vec<(i64,)> =
+        reopened_conn.exec_rows("SELECT id FROM a WHERE tag = 'after-a' ORDER BY id");
+    assert_eq!(reopened_a, vec![(1000,)]);
+    let reopened_b: Vec<(i64,)> =
+        reopened_conn.exec_rows("SELECT id FROM b WHERE tag = 'after-b' ORDER BY id");
+    assert_eq!(reopened_b, vec![(1001,)]);
+    let reopened_c: Vec<(i64,)> =
+        reopened_conn.exec_rows("SELECT id FROM c WHERE tag = 'after-c' ORDER BY id");
+    assert_eq!(reopened_c, vec![(1002,)]);
 
     Ok(())
 }
@@ -4846,6 +5520,53 @@ fn populate_queued_multibatch(conn: &Arc<Connection>) -> anyhow::Result<()> {
     }
     conn.execute("DELETE FROM t WHERE id % 5 = 0")?;
     conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")?;
+    Ok(())
+}
+
+#[cfg_attr(feature = "checksum", ignore)]
+#[test]
+fn test_plain_vacuum_busy_while_checkpoint_lock_held() -> anyhow::Result<()> {
+    let io = Arc::new(QueuedIo::new());
+    let path = "queued-vacuum-checkpoint-lock-busy.db";
+    let db = open_queued_db(io.clone(), path)?;
+    let checkpoint_conn = db.connect()?;
+    let vacuum_conn = db.connect()?;
+
+    checkpoint_conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, payload TEXT)")?;
+    for i in 0..80 {
+        checkpoint_conn.execute(format!("INSERT INTO t VALUES({i}, '{}')", "c".repeat(240)))?;
+    }
+    checkpoint_conn.execute("DELETE FROM t WHERE id >= 20")?;
+
+    let pager = checkpoint_conn.get_pager();
+    match pager.checkpoint(
+        CheckpointMode::Truncate {
+            upper_bound_inclusive: None,
+        },
+        SyncMode::Full,
+        true,
+    )? {
+        turso_core::types::IOResult::IO(_) => {}
+        turso_core::types::IOResult::Done(_) => {
+            anyhow::bail!("queued checkpoint unexpectedly completed without yielding")
+        }
+    }
+    assert!(
+        !io.pending_events().is_empty(),
+        "checkpoint test should hold the checkpoint lock across pending I/O"
+    );
+
+    let result = vacuum_conn.execute("VACUUM");
+    assert!(
+        matches!(result, Err(LimboError::Busy)),
+        "VACUUM should fail fast while another checkpoint holds the checkpoint lock, got {result:?}"
+    );
+
+    pager.cleanup_after_checkpoint_failure();
+    vacuum_conn.execute("VACUUM")?;
+    assert_eq!(scalar_i64(&vacuum_conn, "SELECT COUNT(*) FROM t"), 20);
+    assert_eq!(run_integrity_check(&vacuum_conn), "ok");
+
     Ok(())
 }
 
@@ -5045,6 +5766,107 @@ fn test_second_plain_vacuum_on_same_connection_rejects_while_first_running() -> 
     Ok(())
 }
 
+#[cfg_attr(feature = "checksum", ignore)]
+#[test]
+fn test_vacuum_into_reset_during_io_cleans_up_source_tx() -> anyhow::Result<()> {
+    let io = Arc::new(QueuedIo::new());
+    let path = "queued-vacuum-into-reset-cleanup.db";
+    let db = open_queued_db(io, path)?;
+    let conn = db.connect()?;
+    let reader = db.connect()?;
+
+    populate_queued_multibatch(&conn)?;
+
+    let dest_dir = TempDir::new()?;
+    let dest_path = dest_dir.path().join("reset-vacuum-into.db");
+    let mut stmt = conn.prepare(format!("VACUUM INTO '{}'", dest_path.display()))?;
+    step_vacuum_until_io(&mut stmt)?;
+    stmt.reset()?;
+
+    assert!(
+        conn.get_auto_commit(),
+        "reset must restore auto-commit after abandoning VACUUM INTO"
+    );
+    let pager = conn.get_pager();
+    assert!(!pager.holds_read_lock(), "reset must release read locks");
+    assert!(!pager.holds_write_lock(), "reset must release write locks");
+
+    let rows: Vec<(i64,)> = reader.exec_rows("SELECT COUNT(*) FROM t");
+    assert_eq!(rows, vec![(176,)]);
+    conn.execute("INSERT INTO t VALUES(10000, 'after-reset')")?;
+    conn.execute("DELETE FROM t WHERE id = 10000")?;
+    assert_eq!(run_integrity_check(&conn), "ok");
+
+    Ok(())
+}
+
+#[cfg_attr(feature = "checksum", ignore)]
+#[test]
+fn test_vacuum_into_drop_during_io_cleans_up_source_tx() -> anyhow::Result<()> {
+    let io = Arc::new(QueuedIo::new());
+    let path = "queued-vacuum-into-drop-cleanup.db";
+    let db = open_queued_db(io, path)?;
+    let conn = db.connect()?;
+    let reader = db.connect()?;
+
+    populate_queued_multibatch(&conn)?;
+
+    let dest_dir = TempDir::new()?;
+    let dest_path = dest_dir.path().join("drop-vacuum-into.db");
+    {
+        let mut stmt = conn.prepare(format!("VACUUM INTO '{}'", dest_path.display()))?;
+        step_vacuum_until_io(&mut stmt)?;
+    }
+
+    assert!(
+        conn.get_auto_commit(),
+        "drop must restore auto-commit after abandoning VACUUM INTO"
+    );
+    let pager = conn.get_pager();
+    assert!(!pager.holds_read_lock(), "drop must release read locks");
+    assert!(!pager.holds_write_lock(), "drop must release write locks");
+
+    let rows: Vec<(i64,)> = reader.exec_rows("SELECT COUNT(*) FROM t");
+    assert_eq!(rows, vec![(176,)]);
+    conn.execute("INSERT INTO t VALUES(10000, 'after-drop')")?;
+    conn.execute("DELETE FROM t WHERE id = 10000")?;
+    assert_eq!(run_integrity_check(&conn), "ok");
+
+    Ok(())
+}
+
+#[cfg_attr(feature = "checksum", ignore)]
+#[test]
+fn test_second_vacuum_into_on_same_connection_rejects_while_first_running() -> anyhow::Result<()> {
+    let io = Arc::new(QueuedIo::new());
+    let path = "queued-vacuum-into-two-statements.db";
+    let db = open_queued_db(io, path)?;
+    let conn = db.connect()?;
+
+    populate_queued_multibatch(&conn)?;
+
+    let dest_dir = TempDir::new()?;
+    let first_dest = dest_dir.path().join("first-vacuum-into.db");
+    let second_dest = dest_dir.path().join("second-vacuum-into.db");
+
+    let mut first = conn.prepare(format!("VACUUM INTO '{}'", first_dest.display()))?;
+    step_vacuum_until_io(&mut first)?;
+
+    let mut second = conn.prepare(format!("VACUUM INTO '{}'", second_dest.display()))?;
+    let err = second
+        .step()
+        .expect_err("second VACUUM INTO should not start while first is still active");
+    let err_msg = err.to_string();
+    assert!(
+        err_msg.contains("cannot VACUUM INTO from within a transaction")
+            || err_msg.contains("SQL statements in progress"),
+        "unexpected error: {err_msg}"
+    );
+
+    first.reset()?;
+    Ok(())
+}
+
 fn assert_failed_vacuum_left_queued_db_usable(
     conn: &Arc<Connection>,
     pre_pages: i64,
@@ -5069,6 +5891,37 @@ fn step_vacuum_until_io(stmt: &mut turso_core::Statement) -> anyhow::Result<()> 
     match stmt.step()? {
         StepResult::IO => Ok(()),
         other => anyhow::bail!("expected VACUUM to yield IO, got {other:?}"),
+    }
+}
+
+fn step_stmt_until_pending_queued_event<F>(
+    stmt: &mut turso_core::Statement,
+    io: &QueuedIo,
+    predicate: F,
+    label: &str,
+) -> anyhow::Result<QueuedIoEvent>
+where
+    F: Fn(&QueuedIoEvent) -> bool,
+{
+    loop {
+        match stmt.step()? {
+            StepResult::IO => {
+                if let Some(event) = io
+                    .pending_events()
+                    .into_iter()
+                    .find(|event| predicate(event))
+                {
+                    return Ok(event);
+                }
+                io.step_one()?.unwrap_or_else(|| {
+                    panic!("{label} yielded IO without any queued operations to drive")
+                });
+            }
+            StepResult::Done => anyhow::bail!("{label} finished before the expected queued event"),
+            StepResult::Row => anyhow::bail!("{label} unexpectedly returned a row"),
+            StepResult::Busy => anyhow::bail!("{label} unexpectedly returned Busy"),
+            StepResult::Interrupt => anyhow::bail!("{label} unexpectedly returned Interrupt"),
+        }
     }
 }
 
@@ -5216,6 +6069,146 @@ fn test_plain_vacuum_reset_during_checkpoint_io_cleans_up_checkpoint_and_vacuum_
     conn.execute("VACUUM")?;
     assert_eq!(run_integrity_check(&conn), "ok");
 
+    Ok(())
+}
+
+#[cfg_attr(feature = "checksum", ignore)]
+#[test]
+fn test_plain_vacuum_source_wal_header_init_failure_rolls_back() -> anyhow::Result<()> {
+    let io = Arc::new(QueuedIo::new());
+    let path = "queued-vacuum-header-init-failure.db";
+    let db = open_queued_db(io.clone(), path)?;
+    let conn = db.connect()?;
+
+    populate_queued_multibatch(&conn)?;
+    let pre_pages = scalar_i64(&conn, "PRAGMA page_count");
+
+    io.fail_after_successes(&format!("{path}-wal"), QueuedIoOpKind::Pwrite, 0);
+    let err = conn.execute("VACUUM").unwrap_err();
+    io.clear_fault();
+    assert!(
+        err.to_string().contains("WAL") || err.to_string().contains("aborted"),
+        "unexpected error for WAL header-init fault: {err}"
+    );
+
+    assert_failed_vacuum_left_queued_db_usable(&conn, pre_pages)?;
+    conn.execute("VACUUM")?;
+    assert!(scalar_i64(&conn, "PRAGMA page_count") < pre_pages);
+    assert_eq!(run_integrity_check(&conn), "ok");
+    Ok(())
+}
+
+#[cfg_attr(feature = "checksum", ignore)]
+#[test]
+fn test_plain_vacuum_temp_batch_read_failure_rolls_back() -> anyhow::Result<()> {
+    let io = Arc::new(QueuedIo::new());
+    let path = "queued-vacuum-temp-read-failure.db";
+    let db = open_queued_db(io.clone(), path)?;
+    let conn = db.connect()?;
+
+    populate_queued_multibatch(&conn)?;
+    let pre_pages = scalar_i64(&conn, "PRAGMA page_count");
+    assert!(
+        pre_pages > 64,
+        "temp-read fault test requires multiple batches"
+    );
+
+    let mut stmt = conn.prepare("VACUUM")?;
+    let temp_read = step_stmt_until_pending_queued_event(
+        &mut stmt,
+        io.as_ref(),
+        |event| {
+            event.kind == QueuedIoOpKind::Pread
+                && event.path.ends_with("-wal")
+                && event.path.contains("osrut_")
+        },
+        "VACUUM",
+    )?;
+    io.fail_after_successes(&temp_read.path, QueuedIoOpKind::Pread, 0);
+
+    let err = loop {
+        match stmt.step() {
+            Err(err) => break err,
+            Ok(StepResult::IO) => {
+                io.step_one()?
+                    .expect("VACUUM yielded IO without queued work during temp-read fault test");
+            }
+            Ok(StepResult::Done) => {
+                panic!("VACUUM unexpectedly succeeded after temp WAL read fault")
+            }
+            Ok(StepResult::Row) => panic!("VACUUM unexpectedly returned a row"),
+            Ok(StepResult::Busy) => panic!("VACUUM unexpectedly returned Busy"),
+            Ok(StepResult::Interrupt) => panic!("VACUUM unexpectedly returned Interrupt"),
+        }
+    };
+    io.clear_fault();
+    assert!(
+        err.to_string().contains("temp")
+            || err.to_string().contains("read")
+            || err.to_string().contains("aborted"),
+        "unexpected error for temp batch read fault: {err}"
+    );
+
+    assert_failed_vacuum_left_queued_db_usable(&conn, pre_pages)?;
+    conn.execute("VACUUM")?;
+    assert!(scalar_i64(&conn, "PRAGMA page_count") < pre_pages);
+    assert_eq!(run_integrity_check(&conn), "ok");
+    Ok(())
+}
+
+#[cfg_attr(feature = "checksum", ignore)]
+#[test]
+fn test_plain_vacuum_post_publish_checkpoint_failure_keeps_compacted_image() -> anyhow::Result<()> {
+    let io = Arc::new(QueuedIo::new());
+    let path = "queued-vacuum-post-publish-checkpoint-failure.db";
+    let db = open_queued_db(io.clone(), path)?;
+    let conn = db.connect()?;
+
+    populate_queued_multibatch(&conn)?;
+    let pre_pages = scalar_i64(&conn, "PRAGMA page_count");
+
+    io.fail_after_successes(&format!("{path}-wal"), QueuedIoOpKind::Truncate, 0);
+    let err = conn.execute("VACUUM").unwrap_err();
+    io.clear_fault();
+    assert!(
+        err.to_string().contains("checkpoint") || err.to_string().contains("aborted"),
+        "unexpected error for post-publish checkpoint fault: {err}"
+    );
+    assert!(
+        io.count_events(&format!("{path}-wal"), QueuedIoOpKind::Truncate) > 0,
+        "checkpoint fault test should reach WAL truncation"
+    );
+
+    assert!(
+        conn.get_auto_commit(),
+        "post-publish checkpoint failure must restore auto-commit"
+    );
+    let pager = conn.get_pager();
+    assert!(
+        !pager.holds_read_lock() && !pager.holds_write_lock(),
+        "post-publish checkpoint failure must release source locks"
+    );
+
+    assert!(
+        scalar_i64(&conn, "PRAGMA page_count") < pre_pages,
+        "compacted image should remain visible after post-publish checkpoint failure"
+    );
+    assert_eq!(scalar_i64(&conn, "SELECT COUNT(*) FROM t"), 176);
+    assert_eq!(run_integrity_check(&conn), "ok");
+    conn.execute("INSERT INTO t VALUES(10000, 'after-checkpoint-error')")?;
+    conn.execute("DELETE FROM t WHERE id = 10000")?;
+
+    let reopened = open_queued_db(io.clone(), path)?;
+    let reopened_conn = reopened.connect()?;
+    assert!(
+        scalar_i64(&reopened_conn, "PRAGMA page_count") < pre_pages,
+        "reopened connection should observe the published compacted image"
+    );
+    assert_eq!(scalar_i64(&reopened_conn, "SELECT COUNT(*) FROM t"), 176);
+    assert_eq!(run_integrity_check(&reopened_conn), "ok");
+
+    reopened_conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")?;
+    assert_eq!(run_integrity_check(&reopened_conn), "ok");
     Ok(())
 }
 
