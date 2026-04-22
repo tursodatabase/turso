@@ -625,19 +625,21 @@ fn collect_indexes_to_update(
 
 /// Proactive column-ambiguity check for UPDATE FROM.
 ///
-/// SQLite rejects UPDATE FROM when a NATURAL JOIN (or USING) introduces a column
-/// name that also exists in another FROM-side table without deduplication. In a
-/// regular SELECT this is only caught when an unqualified reference is resolved,
-/// but UPDATE FROM checks it eagerly regardless of whether the column is referenced.
+/// SQLite rejects UPDATE FROM when:
+/// 1. The same table identifier appears more than once in the FROM clause
+///    (duplicate unaliased tables or duplicate aliases).
+/// 2. A NATURAL JOIN or USING deduplicates a column, but another table in
+///    the FROM graph also exposes that column without deduplication.
+///
+/// In a regular SELECT these are only caught when an unqualified reference
+/// is resolved, but UPDATE FROM checks eagerly regardless of whether the
+/// column is actually referenced.
 fn check_update_from_column_ambiguity(
     joined_tables: &[JoinedTable],
     connection: &Connection,
 ) -> crate::Result<()> {
+    // Check 1: reject duplicate table identifiers (e.g. FROM t2, t2).
     for (i, table) in joined_tables.iter().enumerate() {
-        let using = match &table.join_info {
-            Some(info) if !info.using.is_empty() => &info.using,
-            _ => continue,
-        };
         if joined_tables[..i]
             .iter()
             .any(|preceding| preceding.identifier == table.identifier)
@@ -650,13 +652,27 @@ fn check_update_from_column_ambiguity(
                 table.identifier
             );
         }
+    }
+
+    // Check 2: for each USING/NATURAL-deduplicated column, verify that no
+    // other table in the FROM graph (preceding or following) exposes the
+    // same column without its own deduplication.
+    for (i, table) in joined_tables.iter().enumerate() {
+        let using = match &table.join_info {
+            Some(info) if !info.using.is_empty() => &info.using,
+            _ => continue,
+        };
         for using_col in using {
             let col_name = normalize_ident(using_col.as_str());
-            // Count how many preceding FROM-side tables expose this column
-            // without it already being deduplicated by their own USING clause.
+
+            // Count how many *other* tables expose this column without it
+            // being covered by their own USING clause.
             let mut found_count = 0usize;
-            for preceding in &joined_tables[..i] {
-                let has_col = preceding.columns().iter().any(|c| {
+            for (j, other) in joined_tables.iter().enumerate() {
+                if j == i {
+                    continue;
+                }
+                let has_col = other.columns().iter().any(|c| {
                     c.name
                         .as_ref()
                         .is_some_and(|n| n.eq_ignore_ascii_case(&col_name))
@@ -664,9 +680,9 @@ fn check_update_from_column_ambiguity(
                 if !has_col {
                     continue;
                 }
-                // If this preceding table's own USING already covers the column,
-                // it was deduplicated by an earlier NATURAL/USING JOIN — skip it.
-                let already_deduped = preceding.join_info.as_ref().is_some_and(|info| {
+                // If this table's own USING already covers the column,
+                // it was deduplicated by its own NATURAL/USING JOIN — skip.
+                let already_deduped = other.join_info.as_ref().is_some_and(|info| {
                     info.using
                         .iter()
                         .any(|u| u.as_str().eq_ignore_ascii_case(&col_name))
