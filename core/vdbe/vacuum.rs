@@ -548,10 +548,8 @@ pub(crate) fn vacuum_target_build_step(
                 state.target_conn.execute("BEGIN IMMEDIATE")?;
 
                 // Query sqlite_schema with rootpage, ordered by rowid.
-                // Decide whether schema replay should include the internal MVCC metadata table.
-                // VACUUM INTO excludes it because an MVCC destination bootstraps that table
-                // itself. In-place VACUUM includes it because the temp image is the future
-                // physical source database and must preserve the table as-is.
+                // VACUUM INTO recreates MVCC metadata in the destination; in-place
+                // VACUUM preserves the source metadata table in the physical image.
                 let escaped_schema_name = &config.escaped_schema_name;
                 let schema_sql = if config.copy_mvcc_metadata_table {
                     format!(
@@ -1170,7 +1168,7 @@ impl Drop for MvccVacuumGuard {
 /// 2. `checkpoint_cleanup = ReleaseRaw` immediately after acquiring the raw
 ///    checkpoint lock in `Preflight`.
 /// 3. `source_tx_open = true` and `vacuum_lock_held = true` together after
-///    `begin_blocking_tx()` succeeds in `BeginSourceTx`.
+///    `begin_exclusive_tx()` succeeds in `BeginSourceTx`.
 /// 4. `source_tx_open` is cleared immediately after
 ///    `finish_append_frames_commit()` and `end_write_tx()` in `PublishWalCommit`.
 /// 5. `checkpoint_cleanup` transitions from `ReleaseRaw` to
@@ -1198,7 +1196,7 @@ enum VacuumInPlacePhase {
     /// MVCC, WAL-backed pager). Then acquire check_point lock
     Preflight,
     /// Acquire exclusive source access on the source WAL via
-    /// `begin_blocking_tx`: checkpoint_lock is already held from Preflight;
+    /// `begin_exclusive_tx`: checkpoint_lock is already held from Preflight;
     /// this acquires the exclusive VACUUM lock and installs the source snapshot.
     BeginSourceTx,
     /// Read source database header metadata for the target-build config.
@@ -1704,7 +1702,7 @@ fn vacuum_in_place_step(
                 // Acquire exclusive WAL access in one shot:
                 // vacuum lock + WAL write lock + connection snapshot.
                 // Checkpoint lock was already acquired in Preflight.
-                match source_pager.begin_blocking_tx()? {
+                match source_pager.begin_exclusive_tx()? {
                     crate::IOResult::Done(()) => {
                         connection.auto_commit.store(false, Ordering::SeqCst);
                         connection.set_tx_state(crate::connection::TransactionState::Write {
