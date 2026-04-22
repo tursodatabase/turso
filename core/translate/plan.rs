@@ -1515,6 +1515,11 @@ impl ColumnMask {
         self.has_rowid_sentinel |= other.has_rowid_sentinel;
     }
 
+    pub fn intersect_with(&mut self, other: &ColumnMask) {
+        self.bitset.intersect_with(&other.bitset);
+        self.has_rowid_sentinel &= other.has_rowid_sentinel;
+    }
+
     pub fn get(&self, idx: usize) -> bool {
         if idx == ROWID_SENTINEL {
             self.has_rowid_sentinel
@@ -1816,6 +1821,23 @@ where
             for (s, &o) in self_ov.iter_mut().zip(other_ov.iter()) {
                 *s |= o;
             }
+        }
+    }
+
+    pub fn intersect_with(&mut self, other: &Self) {
+        self.inline &= other.inline;
+        match (&mut self.overflow, &other.overflow) {
+            (Some(self_ov), Some(other_ov)) => {
+                self_ov.truncate(other_ov.len());
+                for (s, &o) in self_ov.iter_mut().zip(other_ov.iter()) {
+                    *s &= o;
+                }
+                self.trim_overflow();
+            }
+            (Some(_), None) => {
+                self.overflow = None;
+            }
+            (None, _) => {}
         }
     }
 

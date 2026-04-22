@@ -157,7 +157,7 @@ use bitflags::bitflags;
 use core::fmt;
 use rustc_hash::{FxBuildHasher, FxHashMap as HashMap, FxHashSet as HashSet};
 use std::collections::VecDeque;
-use std::ops::Deref;
+use std::ops::{BitOrAssign, Deref};
 use std::sync::OnceLock;
 use tracing::trace;
 use turso_parser::ast::{
@@ -2657,6 +2657,12 @@ impl Drop for ColumnsMut<'_> {
     }
 }
 
+impl BitOrAssign<&Self> for ColumnMask {
+    fn bitor_assign(&mut self, rhs: &Self) {
+        self.union_with(rhs);
+    }
+}
+
 impl BTreeTable {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
@@ -3234,16 +3240,8 @@ impl BTreeTable {
     ) -> Result<ColumnMask> {
         let graph = self.column_graph()?;
         let mut deps = ColumnMask::default();
-        for j in targets {
-            if !self.columns[j].is_virtual_generated() {
-                deps.set(j);
-                continue;
-            }
-            for i in graph.dependencies[j].iter() {
-                if !self.columns[i].is_virtual_generated() {
-                    deps.set(i);
-                }
-            }
+        for target in targets {
+            deps |= &graph.dependencies[target];
         }
         Ok(deps)
     }

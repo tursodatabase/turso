@@ -1,5 +1,6 @@
 use rustc_hash::FxHashMap as HashMap;
 use std::num::NonZeroUsize;
+use std::ops::BitAndAssign;
 use std::sync::Arc;
 
 use turso_parser::ast::{self, TriggerEvent, TriggerTime, Upsert};
@@ -180,6 +181,12 @@ fn collect_changed_cols(
     (cols_changed, rowid_changed)
 }
 
+impl BitAndAssign<&ColumnMask> for ColumnMask {
+    fn bitand_assign(&mut self, rhs: &ColumnMask) {
+        self.intersect_with(rhs);
+    }
+}
+
 #[inline]
 fn upsert_index_is_affected(
     table: &Table,
@@ -191,12 +198,13 @@ fn upsert_index_is_affected(
         return Ok(true);
     }
 
-    for c in referenced_index_cols(idx, table)? {
-        if directly_changed_cols.get(c) {
-            return Ok(true);
-        }
-    }
-    Ok(false)
+    let directly_changed_referenced_index_cols = {
+        let mut intersection = referenced_index_cols(idx, table)?;
+        intersection &= directly_changed_cols;
+        intersection
+    };
+
+    Ok(!directly_changed_referenced_index_cols.is_empty())
 }
 
 /// Collect the set of columns referenced by the partial WHERE (empty if none), or
