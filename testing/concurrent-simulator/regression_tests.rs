@@ -1,3 +1,5 @@
+#![cfg(all(unix, target_pointer_width = "64"))]
+
 use rand_chacha::ChaCha8Rng;
 use rand_chacha::rand_core::SeedableRng;
 use std::path::Path;

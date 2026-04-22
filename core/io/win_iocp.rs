@@ -1210,7 +1210,7 @@ mod tests {
 
         buffer.as_mut_slice().copy_from_slice(write);
 
-        let _ = file.pwrite(0, buffer, comp).unwrap();
+        drop(file.pwrite(0, buffer, comp).unwrap());
         drop(iocp);
         drop(file);
     }

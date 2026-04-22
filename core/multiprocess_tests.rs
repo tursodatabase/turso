@@ -23,7 +23,7 @@ const DEFAULT_LOCKED_DB_CHILD_TEST: &str = "multiprocess_tests::default_locked_d
 fn multiprocess_test_io() -> Arc<dyn IO> {
     #[cfg(all(target_os = "windows", feature = "experimental_win_iocp"))]
     {
-        return Arc::new(WindowsIOCP::new().unwrap());
+        Arc::new(WindowsIOCP::new().unwrap())
     }
 
     #[cfg(not(all(target_os = "windows", feature = "experimental_win_iocp")))]
