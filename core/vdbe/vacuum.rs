@@ -2492,6 +2492,11 @@ mod tests {
         ranges
     }
 
+    fn coalesce_frame_runs_empty_returns_empty() {
+        let runs = coalesce_frame_runs(Vec::new());
+        assert!(runs.is_empty());
+    }
+
     #[test]
     fn coalesce_frame_runs_single_page_is_one_run_of_one() {
         let runs = coalesce_frame_runs(vec![(page_ref(1), 42)]);
