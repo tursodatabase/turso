@@ -60,7 +60,7 @@ test vacuum-schema-qualified-rejected {
     VACUUM temp;
 }
 expect error {
-    VACUUM of schema 'temp' is not supported
+    VACUUM is only supported for the main database; schema 'temp' is not supported yet
 }
 
 @backend rust

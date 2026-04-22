@@ -2459,6 +2459,25 @@ impl<Clock: LogicalClock> MvStore<Clock> {
             self.finalized_tx_states.is_empty(),
             "MVCC VACUUM reset requires finalized transaction cache to be cleared"
         );
+        // Root pages are reused after VACUUM. Empty stale version buckets keyed by
+        // old root-page-derived table/index ids must not survive the reset or a
+        // later write can misclassify a table row as an index row.
+        let stale_row_ids = self
+            .rows
+            .iter()
+            .map(|entry| entry.key().clone())
+            .collect::<Vec<_>>();
+        for row_id in stale_row_ids {
+            self.rows.remove(&row_id);
+        }
+        let stale_index_ids = self
+            .index_rows
+            .iter()
+            .map(|entry| *entry.key())
+            .collect::<Vec<_>>();
+        for index_id in stale_index_ids {
+            self.index_rows.remove(&index_id);
+        }
         let root_pages = schema
             .tables
             .values()

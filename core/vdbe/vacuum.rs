@@ -1354,16 +1354,6 @@ fn vacuum_completion_error(completion: &Completion, context: &'static str) -> Li
     )
 }
 
-fn vacuum_completion_error(
-    completion: &crate::io::Completion,
-    context: &'static str,
-) -> LimboError {
-    completion.get_error().map_or_else(
-        || LimboError::InternalError(format!("VACUUM: {context} failed")),
-        LimboError::CompletionError,
-    )
-}
-
 /// Coalesce `(page_ref, frame_id)` pairs into contiguous-frame-id runs.
 ///
 /// Plain `VACUUM` relies on the temp-WAL-only invariant: every temp page
@@ -1511,12 +1501,7 @@ struct VacuumCommittedImageMeta {
 }
 
 fn replace_shared_schema_after_vacuum(source_db: &Database, schema: Arc<Schema>) {
-    source_db
-        .with_schema_mut(|current| {
-            *current = schema.as_ref().clone();
-            Ok(())
-        })
-        .expect("VACUUM shared schema replacement should be infallible");
+    *source_db.schema.lock() = schema;
 }
 
 fn install_mvcc_state_after_vacuum_commit(
@@ -1645,6 +1630,11 @@ fn vacuum_in_place_step(
                 let wal = source_pager.wal.as_ref().ok_or_else(|| {
                     LimboError::InternalError("VACUUM requires a WAL-mode database".to_string())
                 })?;
+                if source_db.experimental_multiprocess_wal_enabled() {
+                    return Err(LimboError::TxError(
+                        "cannot VACUUM experimental multiprocess WAL databases".to_string(),
+                    ));
+                }
                 // 7. In MVCC mode, hold the existing MVCC stop-the-world
                 // gate for the full VACUUM. Callers are expected to run MVCC
                 // checkpoint before VACUUM; this gate only enforces that no

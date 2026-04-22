@@ -233,25 +233,14 @@ fn truncate_checkpoint_until_stable(whopper: &mut MultiprocessWhopper, connectio
     panic!("TRUNCATE checkpoint did not stabilize after transient multiprocess errors");
 }
 
-#[cfg(all(any(unix, target_os = "windows"), target_pointer_width = "64"))]
-fn plain_vacuum_until_stable(whopper: &mut MultiprocessWhopper, connection_idx: usize) {
-    for _ in 0..32 {
-        let result = whopper
-            .execute_sql_direct(connection_idx, "VACUUM")
-            .expect("run plain VACUUM");
-        match result {
-            Ok(_) => return,
-            Err(
-                LimboError::Busy
-                | LimboError::BusySnapshot
-                | LimboError::SchemaUpdated
-                | LimboError::SchemaConflict
-                | LimboError::TableLocked,
-            ) => continue,
-            Err(err) => panic!("plain VACUUM should stabilize: {err}"),
+#[cfg(all(unix, target_pointer_width = "64"))]
+fn is_multiprocess_vacuum_rejection(err: &LimboError) -> bool {
+    match err {
+        LimboError::TxError(msg) | LimboError::InternalError(msg) => {
+            msg.contains("cannot VACUUM experimental multiprocess WAL databases")
         }
+        _ => false,
     }
-    panic!("plain VACUUM did not stabilize after transient multiprocess errors");
 }
 
 #[cfg(all(any(unix, target_os = "windows"), target_pointer_width = "64"))]
@@ -389,9 +378,8 @@ fn multiprocess_same_process_sibling_reader_keeps_shared_snapshot_live_until_las
 }
 
 #[cfg(all(unix, target_pointer_width = "64"))]
-#[ignore = "multiprocess plain VACUUM currently panics with writer registry underflow"]
 #[test]
-fn multiprocess_plain_vacuum_round_trips_data() {
+fn multiprocess_plain_vacuum_rejects_enabled_multiprocess_wal() {
     let mut whopper = create_multiprocess_whopper_with_shape(2, 1);
 
     for connection_idx in 0..2 {
@@ -421,18 +409,15 @@ fn multiprocess_plain_vacuum_round_trips_data() {
         .expect("delete rows")
         .expect("delete should succeed");
 
-    plain_vacuum_until_stable(&mut whopper, 0);
-
-    assert_eq!(
-        count_test_rows(&mut whopper, 0),
-        120,
-        "VACUUM should preserve visible rows in multiprocess WAL mode"
+    let vacuum_result = whopper
+        .execute_sql_direct(0, "VACUUM")
+        .expect("run VACUUM on multiprocess WAL database");
+    assert!(
+        matches!(vacuum_result, Err(ref err) if is_multiprocess_vacuum_rejection(err)),
+        "multiprocess VACUUM should reject unconditionally, got {vacuum_result:?}"
     );
-    assert_eq!(
-        count_test_rows(&mut whopper, 1),
-        120,
-        "other processes should observe the vacuumed image in multiprocess WAL mode"
-    );
+    assert_eq!(count_test_rows(&mut whopper, 0), 120);
+    assert_eq!(count_test_rows(&mut whopper, 1), 120);
     assert_integrity_check_ok(&mut whopper, 0);
     assert_integrity_check_ok(&mut whopper, 1);
 
@@ -440,9 +425,8 @@ fn multiprocess_plain_vacuum_round_trips_data() {
 }
 
 #[cfg(all(unix, target_pointer_width = "64"))]
-#[ignore = "multiprocess plain VACUUM currently panics with writer registry underflow"]
 #[test]
-fn multiprocess_plain_vacuum_returns_busy_with_active_reader() {
+fn multiprocess_plain_vacuum_rejects_even_with_active_reader() {
     let mut whopper = create_multiprocess_whopper_with_shape(2, 1);
 
     for connection_idx in 0..2 {
@@ -482,18 +466,14 @@ fn multiprocess_plain_vacuum_returns_busy_with_active_reader() {
         .execute_sql_direct(0, "VACUUM")
         .expect("run VACUUM with active reader");
     assert!(
-        matches!(
-            vacuum_result,
-            Err(LimboError::Busy | LimboError::BusySnapshot)
-        ),
-        "multiprocess VACUUM should fail while another process holds a read snapshot, got {vacuum_result:?}"
+        matches!(vacuum_result, Err(ref err) if is_multiprocess_vacuum_rejection(err)),
+        "multiprocess VACUUM should reject before reader-state checks, got {vacuum_result:?}"
     );
 
     whopper
         .execute_sql_direct(1, "rollback")
         .expect("rollback reader")
         .expect("reader rollback should succeed");
-    plain_vacuum_until_stable(&mut whopper, 0);
     assert_eq!(count_test_rows(&mut whopper, 0), 20);
     assert_integrity_check_ok(&mut whopper, 0);
 
