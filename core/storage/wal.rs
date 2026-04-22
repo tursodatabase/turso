@@ -590,6 +590,23 @@ pub trait Wal: Debug + Send + Sync {
         buffer_pool: Arc<BufferPool>,
     ) -> Result<Completion>;
 
+    /// Read a contiguous run of WAL frames with a single `pread`.
+    /// For each `i`, `pages[i]` receives the decoded page body of frame
+    /// `start_frame + i`. This method is a batched version of `read_frame`.
+    ///
+    /// If `scratch_buf` is `Some`, it is used as the pread destination (must
+    /// have length exactly `(page_size + WAL_FRAME_HEADER_SIZE) * pages.len()`).
+    /// Otherwise a fresh temporary buffer is allocated. VACUUM passes a
+    /// pre-allocated buffer to amortize the ~batch-size allocation across
+    /// batches.
+    fn read_frames_batch(
+        &self,
+        start_frame: u64,
+        pages: &[PageRef],
+        buffer_pool: Arc<BufferPool>,
+        scratch_buf: Option<Arc<Buffer>>,
+    ) -> Result<Completion>;
+
     /// Read a raw frame (header included) from the WAL.
     fn read_frame_raw(&self, frame_id: u64, frame: &mut [u8]) -> Result<Completion>;
 
@@ -3038,6 +3055,157 @@ impl Wal for WalFile {
             page_idx,
             &self.io_ctx.read(),
         )
+    }
+
+    #[instrument(skip_all, level = Level::DEBUG)]
+    fn read_frames_batch(
+        &self,
+        start_frame: u64,
+        pages: &[PageRef],
+        buffer_pool: Arc<BufferPool>,
+        scratch_buf: Option<Arc<Buffer>>,
+    ) -> Result<Completion> {
+        turso_assert!(
+            !pages.is_empty(),
+            "read_frames_batch requires at least one page"
+        );
+        let page_size = self.page_size() as usize;
+        turso_assert!(page_size > 0, "WAL page size must be initialized");
+        let frame_size = WAL_FRAME_HEADER_SIZE + page_size;
+        let count = pages.len();
+        let total = frame_size * count;
+        let offset = self.frame_offset(start_frame);
+        if let Some(buf) = &scratch_buf {
+            turso_assert!(
+                buf.len() == total,
+                "read_frames_batch scratch_buf size must match expected pread length",
+                { "buf_len": buf.len(), "expected": total }
+            );
+        }
+
+        // Lock each target page and pre-allocate its destination buffer so the
+        // completion callback only parses headers, decrypts/verifies, and copies.
+        let mut slots: Vec<(PageRef, Arc<Buffer>)> = Vec::with_capacity(count);
+        for page in pages.iter() {
+            #[cfg(debug_assertions)]
+            {
+                turso_assert!(
+                    !page.is_locked(), "read_frames_batch target page must not already be locked",
+                    { "page_id": page.get().id }
+                );
+                turso_assert!(
+                    !page.is_loaded(), "read_frames_batch target page must be an unloaded scratch page",
+                    { "page_id": page.get().id }
+                );
+                turso_assert!(
+                    page.get().buffer.is_none(),
+                    "read_frames_batch target page must not already retain a buffer",
+                    { "page_id": page.get().id }
+                );
+            }
+            page.set_locked();
+            slots.push((page.clone(), Arc::new(buffer_pool.get_page())));
+        }
+
+        let epoch = self.coordination.checkpoint_epoch();
+        let enc_or_csum = self.io_ctx.read().encryption_or_checksum().clone();
+        let raw_buf = scratch_buf.unwrap_or_else(|| Arc::new(Buffer::new_temporary(total)));
+
+        let complete = Box::new(move |res: Result<(Arc<Buffer>, i32), CompletionError>| {
+            let clear_slots_on_err = |slots: &[(PageRef, Arc<Buffer>)]| {
+                for (page, _) in slots {
+                    page.clear_locked();
+                    page.clear_wal_tag();
+                }
+            };
+
+            let Ok((buf, bytes_read)) = res else {
+                tracing::debug!(err = ?res.unwrap_err());
+                clear_slots_on_err(&slots);
+                return None;
+            };
+            if bytes_read != total as i32 {
+                tracing::debug!(
+                    "short read on WAL batch at offset {offset}: expected {total} bytes, got {bytes_read}"
+                );
+                clear_slots_on_err(&slots);
+                return Some(CompletionError::ShortReadWalFrame {
+                    offset,
+                    expected: total,
+                    actual: bytes_read as usize,
+                });
+            }
+            let raw = buf.as_slice();
+            for (i, (page, page_buf)) in slots.iter().enumerate() {
+                let frame_start = i * frame_size;
+                let frame = &raw[frame_start..frame_start + frame_size];
+                let (header, page_body) = sqlite3_ondisk::parse_wal_frame_header(frame);
+                let expected_page_id = page.get().id;
+                if header.page_number as usize != expected_page_id {
+                    mark_unlikely();
+                    tracing::error!(
+                        frame_id = start_frame + i as u64,
+                        expected = expected_page_id,
+                        got = header.page_number,
+                        "WAL batch frame page_no mismatch"
+                    );
+                    clear_slots_on_err(&slots);
+                    return Some(CompletionError::WalFramePageMismatch {
+                        frame_id: start_frame + i as u64,
+                        expected: expected_page_id,
+                        actual: header.page_number,
+                    });
+                }
+
+                let body_slice = page_buf.as_mut_slice();
+                turso_assert!(
+                    body_slice.len() == page_size,
+                    "read_frames_batch buffer size must match WAL page size",
+                    { "buffer_len": body_slice.len(), "page_size": page_size }
+                );
+                body_slice.copy_from_slice(page_body);
+
+                match &enc_or_csum {
+                    EncryptionOrChecksum::Encryption(ctx) => {
+                        match ctx.decrypt_page(body_slice, expected_page_id) {
+                            Ok(decrypted) => body_slice.copy_from_slice(&decrypted),
+                            Err(e) => {
+                                mark_unlikely();
+                                tracing::error!(
+                                    "Failed to decrypt WAL batch frame for page_idx={expected_page_id}: {e}"
+                                );
+                                clear_slots_on_err(&slots);
+                                return Some(CompletionError::DecryptionError {
+                                    page_idx: expected_page_id,
+                                });
+                            }
+                        }
+                    }
+                    EncryptionOrChecksum::Checksum(ctx) => {
+                        if let Err(e) = ctx.verify_checksum(body_slice, expected_page_id) {
+                            mark_unlikely();
+                            tracing::error!(
+                                "Failed to verify checksum for page_id={expected_page_id}: {e}"
+                            );
+                            clear_slots_on_err(&slots);
+                            return Some(e);
+                        }
+                    }
+                    EncryptionOrChecksum::None => {}
+                }
+            }
+
+            for (i, (page, page_buf)) in slots.iter().enumerate() {
+                let page_id = page.get().id;
+                finish_read_page(page_id, page_buf.clone(), page.clone());
+                page.set_wal_tag(start_frame + i as u64, epoch);
+            }
+            None
+        });
+
+        let c = Completion::new_read(raw_buf, complete);
+        let file = self.coordination.wal_file()?;
+        file.pread(offset, c)
     }
 
     #[instrument(skip_all, level = Level::DEBUG)]
