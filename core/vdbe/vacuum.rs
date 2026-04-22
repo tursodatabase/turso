@@ -2332,7 +2332,6 @@ fn vacuum_in_place_cleanup(
     drop(cleanup_state.mvcc_guard.take());
     Ok(())
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;
