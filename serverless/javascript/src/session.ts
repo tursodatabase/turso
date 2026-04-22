@@ -35,7 +35,7 @@ export interface SessionConfig {
 }
 
 function normalizeUrl(url: string): string {
-  return url.replace(/^libsql:\/\//, 'https://');
+  return url.replace(/^(libsql|turso):\/\//, 'https://');
 }
 
 function isValidIdentifier(str: string): boolean {
