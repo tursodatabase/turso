@@ -1695,7 +1695,7 @@ impl Connection {
     }
 
     pub fn get_database_canonical_path(&self) -> String {
-        if self.db.path == ":memory:" {
+        if self.db.is_in_memory_db() {
             // For in-memory databases, SQLite shows empty string
             String::new()
         } else {
@@ -2342,11 +2342,10 @@ impl Connection {
         //   file-based (important for simulator fault injection and WAL coordination)
         // - If the parent is :memory: (MemoryIO) but the attached DB is file-based,
         //   we need a file-capable IO layer since MemoryIO can't read real files
-        let is_memory_db =
-            path == ":memory:" || path.starts_with("file::memory:") || path.is_empty();
+        let is_memory_db = Database::is_memory_path(path);
         let io: Arc<dyn IO> = if is_memory_db {
             Arc::new(MemoryIO::new())
-        } else if self.db.path.starts_with(":memory:") {
+        } else if self.db.is_in_memory_db() {
             Database::io_for_path(path)?
         } else {
             self.db.io.clone()
@@ -2571,7 +2570,7 @@ impl Connection {
 
     // Get the canonical path for a database given its Database object
     fn get_canonical_path_for_database(db: &Database) -> String {
-        if db.path == ":memory:" {
+        if db.is_in_memory_db() {
             // For in-memory databases, SQLite shows empty string
             String::new()
         } else {
@@ -3232,17 +3231,21 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
 
-    fn open_connection(path: &std::path::Path) -> Arc<Connection> {
+    fn open_connection_with_opts(path: &std::path::Path, opts: DatabaseOpts) -> Arc<Connection> {
         let io: Arc<dyn IO> = Arc::new(crate::PlatformIO::new().unwrap());
         let db = Database::open_file_with_flags(
             io,
             path.to_str().unwrap(),
             OpenFlags::default(),
-            DatabaseOpts::new(),
+            opts,
             None,
         )
         .unwrap();
         db.connect().unwrap()
+    }
+
+    fn open_connection(path: &std::path::Path) -> Arc<Connection> {
+        open_connection_with_opts(path, DatabaseOpts::new())
     }
 
     fn query_single_i64(conn: &Arc<Connection>, sql: &str) -> i64 {
@@ -3253,11 +3256,106 @@ mod tests {
         }
     }
 
+    fn text_value(value: &Value) -> &str {
+        match value {
+            Value::Text(text) => text.as_str(),
+            other => panic!("expected text value, got {other:?}"),
+        }
+    }
+
     // given a attached 'alias', return the Database and Pager for that attached database
     fn attached_entry(conn: &Connection, alias: &str) -> (Arc<Database>, Arc<Pager>) {
         let catalog = conn.attached_databases.read();
         let index = *catalog.name_to_index.get(alias).unwrap();
         catalog.index_to_data.get(&index).unwrap().clone()
+    }
+
+    #[test]
+    fn test_named_memory_databases_on_same_io_are_distinct() {
+        let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+        let draft_db = Database::open_file(io.clone(), ":memory:sync-draft").unwrap();
+        let synced_db = Database::open_file(io, ":memory:sync-synced").unwrap();
+        assert!(!Arc::ptr_eq(&draft_db, &synced_db));
+
+        let draft = draft_db.connect().unwrap();
+        let synced = synced_db.connect().unwrap();
+
+        for conn in [&draft, &synced] {
+            assert_eq!(conn.get_database_canonical_path(), "");
+            assert_eq!(
+                conn.list_all_databases(),
+                vec![(MAIN_DB_ID, "main".to_string(), String::new())]
+            );
+        }
+
+        draft
+            .execute("CREATE TABLE t(x INTEGER); INSERT INTO t VALUES(11)")
+            .unwrap();
+        synced
+            .execute("CREATE TABLE t(x INTEGER); INSERT INTO t VALUES(22)")
+            .unwrap();
+
+        assert_eq!(query_single_i64(&draft, "SELECT x FROM t"), 11);
+        assert_eq!(query_single_i64(&synced, "SELECT x FROM t"), 22);
+    }
+
+    #[test]
+    fn test_named_memory_database_reopened_on_same_io_sees_same_rows() {
+        let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+
+        let first_db = Database::open_file(io.clone(), ":memory:reopen").unwrap();
+        let first = first_db.connect().unwrap();
+        first
+            .execute("CREATE TABLE t(x INTEGER); INSERT INTO t VALUES(99)")
+            .unwrap();
+
+        let second_db = Database::open_file(io, ":memory:reopen").unwrap();
+        let second = second_db.connect().unwrap();
+        assert_eq!(query_single_i64(&second, "SELECT x FROM t"), 99);
+    }
+
+    #[test]
+    fn test_attach_named_memory_database_reports_empty_path() {
+        let temp_dir = TempDir::new().unwrap();
+        let main_path = temp_dir.path().join("main.db");
+        let conn = open_connection_with_opts(&main_path, DatabaseOpts::new().with_attach(true));
+
+        conn.execute("ATTACH ':memory:aux' AS aux").unwrap();
+        conn.execute("CREATE TABLE aux.t(x INTEGER); INSERT INTO aux.t VALUES(5)")
+            .unwrap();
+
+        assert_eq!(query_single_i64(&conn, "SELECT x FROM aux.t"), 5);
+        let database_list = conn.pragma_query("database_list").unwrap();
+        let aux = database_list
+            .iter()
+            .find(|row| text_value(&row[1]) == "aux")
+            .expect("attached aux database must be listed");
+        assert_eq!(text_value(&aux[2]), "");
+    }
+
+    #[test]
+    fn test_named_memory_parent_can_attach_real_file_database() {
+        let temp_dir = TempDir::new().unwrap();
+        let aux_path = temp_dir.path().join("aux.db");
+        let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+        let db = Database::open_file_with_flags(
+            io,
+            ":memory:named-main",
+            OpenFlags::default(),
+            DatabaseOpts::new().with_attach(true),
+            None,
+        )
+        .unwrap();
+        let conn = db.connect().unwrap();
+
+        conn.execute(format!("ATTACH '{}' AS aux", aux_path.to_str().unwrap()))
+            .unwrap();
+        conn.execute("CREATE TABLE aux.t(x INTEGER); INSERT INTO aux.t VALUES(7)")
+            .unwrap();
+        conn.execute("DETACH aux").unwrap();
+
+        let reopened = open_connection(&aux_path);
+        assert_eq!(query_single_i64(&reopened, "SELECT x FROM t"), 7);
     }
 
     #[test]

@@ -276,8 +276,7 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                 table.columns().len(),
             )
         });
-        let durable_mvcc_metadata =
-            !connection.db.path.starts_with(":memory:") && mvcc_meta_table.is_some();
+        let durable_mvcc_metadata = !connection.db.is_in_memory_db() && mvcc_meta_table.is_some();
         let durable_tx_max = mvstore.durable_txid_max.load(Ordering::SeqCst);
         let durable_txid_max_old = NonZeroU64::new(durable_tx_max);
         Self {
