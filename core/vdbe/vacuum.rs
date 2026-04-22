@@ -530,6 +530,9 @@ pub(crate) fn vacuum_target_build_step(
                 // Enable MVCC on targets that should persist as MVCC.
                 if config.target_mvcc_enabled {
                     state.target_conn.execute("PRAGMA journal_mode = 'mvcc'")?;
+                    if let Some(mv_store) = state.target_conn.mv_store().as_ref() {
+                        mv_store.set_checkpoint_threshold(i64::MAX);
+                    }
                 }
 
                 // Performance optimizations for the target database (matches SQLite vacuum.c):
