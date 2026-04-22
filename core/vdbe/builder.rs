@@ -1,15 +1,12 @@
 use crate::{turso_assert, turso_assert_eq, turso_debug_assert};
 use rustc_hash::FxHashMap as HashMap;
 use tracing::{instrument, Level};
-use turso_parser::ast::{self, Expr, ResolveType, SortOrder, TableInternalId};
+use turso_parser::ast::{self, ResolveType, SortOrder, TableInternalId};
 
 use crate::{
     index_method::IndexMethodAttachment,
     parameters::Parameters,
-    schema::{
-        BTreeTable, Column, ColumnLayout, GeneratedType, Index, PseudoCursorType, Schema, Table,
-        Trigger,
-    },
+    schema::{BTreeTable, Column, ColumnLayout, Index, PseudoCursorType, Schema, Table, Trigger},
     translate::{
         collate::CollationSeq,
         emitter::{MaterializedColumnRef, TransactionMode},
@@ -135,10 +132,6 @@ enum DmlColumnRegisters {
 pub struct DmlColumnContext {
     registers: DmlColumnRegisters,
     rowid_alias_col: Option<usize>,
-    /// Bitset marking which columns are virtual generated.
-    virtual_mask: BitSet,
-    /// rank-indexed by `virtual_mask`.
-    virtual_data: Vec<(Box<Expr>, Affinity)>,
 }
 
 impl DmlColumnContext {
@@ -148,19 +141,7 @@ impl DmlColumnContext {
         rowid_reg: usize,
         layout: ColumnLayout,
     ) -> Self {
-        let mut rowid_alias_col = None;
-        let mut virtual_mask = BitSet::default();
-        let mut virtual_data = Vec::new();
-
-        for (idx, col) in columns.iter().enumerate() {
-            if col.is_rowid_alias() {
-                rowid_alias_col = Some(idx);
-            }
-            if let GeneratedType::Virtual { expr: resolved, .. } = col.generated_type() {
-                virtual_mask.set(idx);
-                virtual_data.push((resolved.clone(), col.affinity()));
-            }
-        }
+        let rowid_alias_col = columns.iter().position(|c| c.is_rowid_alias());
 
         Self {
             registers: DmlColumnRegisters::Layout {
@@ -169,43 +150,22 @@ impl DmlColumnContext {
                 layout,
             },
             rowid_alias_col,
-            virtual_mask,
-            virtual_data,
         }
     }
 
     pub fn from_column_reg_mapping<'a>(pairs: impl Iterator<Item = (&'a Column, usize)>) -> Self {
         let mut rowid_alias_col = None;
-        let mut virtual_mask = BitSet::default();
-        let mut virtual_data = Vec::new();
         let mut column_regs = Vec::new();
         for (idx, (col, reg)) in pairs.enumerate() {
             column_regs.push(reg);
             if col.is_rowid_alias() {
                 rowid_alias_col = Some(idx);
             }
-            if let GeneratedType::Virtual { expr, .. } = col.generated_type() {
-                virtual_mask.set(idx);
-                virtual_data.push((expr.clone(), col.affinity()));
-            }
         }
         Self {
             registers: DmlColumnRegisters::Indexed { column_regs },
             rowid_alias_col,
-            virtual_mask,
-            virtual_data,
         }
-    }
-
-    /// returns the expression and affinity of a virtual column, if the column index points to a
-    /// virtual column
-    pub(crate) fn virtual_column_info(&self, col_idx: usize) -> Option<(&Expr, Affinity)> {
-        if !self.virtual_mask.get(col_idx) {
-            return None;
-        }
-        let rank = self.virtual_mask.rank(col_idx);
-        let (ref expr, affinity) = self.virtual_data[rank];
-        Some((expr, affinity))
     }
 
     pub fn to_column_reg(&self, col_idx: usize) -> usize {

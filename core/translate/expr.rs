@@ -3035,21 +3035,13 @@ pub fn translate_expr(
                         )
                     }
                     Some(SelfTableContext::ForDML(dml_ctx)) => {
-                        if let Some((resolved, affinity)) = dml_ctx.virtual_column_info(*column) {
-                            translate_expr(program, None, resolved, target_register, resolver)?;
-                            if affinity != Affinity::Blob {
-                                program.emit_column_affinity(target_register, affinity);
-                            }
-                            Ok(target_register)
-                        } else {
-                            let src_reg = dml_ctx.to_column_reg(*column);
-                            program.emit_insn(Insn::Copy {
-                                src_reg,
-                                dst_reg: target_register,
-                                extra_amount: 0,
-                            });
-                            Ok(target_register)
-                        }
+                        let src_reg = dml_ctx.to_column_reg(*column);
+                        program.emit_insn(Insn::Copy {
+                            src_reg,
+                            dst_reg: target_register,
+                            extra_amount: 0,
+                        });
+                        Ok(target_register)
                     }
                     None => {
                         // This error means that a program.with_self_table_context() was missing

@@ -588,7 +588,7 @@ pub fn emit_upsert(
         let rowid_reg = new_rowid_reg.unwrap_or(ctx.conflict_rowid_reg);
         let dml_ctx =
             DmlColumnContext::layout(ctx.table.columns(), new_start, rowid_reg, layout.clone());
-        compute_virtual_columns(program, ctx.table.columns().iter(), &dml_ctx, resolver)?;
+        compute_virtual_columns(program, &ctx.table.columns_topo_sort()?, &dml_ctx, resolver)?;
     }
 
     if let Some(bt) = table.btree() {
@@ -1306,7 +1306,7 @@ pub fn emit_upsert(
         let rowid_reg = new_rowid_reg.unwrap_or(ctx.conflict_rowid_reg);
         let dml_ctx =
             DmlColumnContext::layout(ctx.table.columns(), new_start, rowid_reg, layout.clone());
-        compute_virtual_columns(program, ctx.table.columns().iter(), &dml_ctx, resolver)?;
+        compute_virtual_columns(program, &ctx.table.columns_topo_sort()?, &dml_ctx, resolver)?;
     }
 
     // RETURNING from NEW image + final rowid

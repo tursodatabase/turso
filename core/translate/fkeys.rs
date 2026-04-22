@@ -468,6 +468,7 @@ pub fn emit_parent_index_key_change_checks(
                 cursor_id,
                 old_rowid_reg,
                 idx_target_cols,
+                resolver,
             )
         })
         .transpose()?;
@@ -714,6 +715,7 @@ fn build_parent_key(
                 parent_cursor_id,
                 parent_rowid_reg,
                 fk_target_cols,
+                resolver,
             )
         })
         .transpose()?;
@@ -794,6 +796,7 @@ pub fn emit_fk_child_update_counters(
             child_cursor_id,
             old_rowid_reg,
             fk_col_positions.clone(),
+            resolver,
         )?;
 
         for &pos in &fk_col_positions {

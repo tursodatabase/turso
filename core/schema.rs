@@ -2277,6 +2277,8 @@ pub(crate) struct GeneratedColGraph {
     dependencies: Vec<ColumnMask>,
     /// `dependents[i]` = columns that transitively read from `i` (excludes `i`).
     dependents: Vec<ColumnMask>,
+    /// Column indices in topological (dependency) order. Contains all columns.
+    topological_sort: Vec<usize>,
 }
 
 impl GeneratedColGraph {
@@ -2309,10 +2311,10 @@ impl GeneratedColGraph {
         }
 
         // Kahn's algorithm (topological sort) over direct_deps.
-        let mut topo: Vec<usize> = Vec::with_capacity(n);
+        let mut topological_sort: Vec<usize> = Vec::with_capacity(n);
         let mut ready: Vec<usize> = (0..n).filter(|&i| in_degree[i] == 0).collect();
         while let Some(i) = ready.pop() {
-            topo.push(i);
+            topological_sort.push(i);
             for j in direct_dependents[i].iter() {
                 in_degree[j] -= 1;
                 if in_degree[j] == 0 {
@@ -2322,7 +2324,7 @@ impl GeneratedColGraph {
         }
 
         // see if there's cycles in the graph
-        if topo.len() != n {
+        if topological_sort.len() != n {
             let cycle_names: Vec<&str> = (0..n)
                 .filter(|i| in_degree[*i] > 0)
                 .filter_map(|i| columns[i].name.as_deref())
@@ -2335,7 +2337,7 @@ impl GeneratedColGraph {
 
         // compute transitive closures.
         let mut dependencies = vec![ColumnMask::default(); n];
-        for &j in &topo {
+        for &j in &topological_sort {
             dependencies[j] = direct_deps[j].clone();
             for i in direct_deps[j].iter() {
                 let snapshot = dependencies[i].clone();
@@ -2345,7 +2347,7 @@ impl GeneratedColGraph {
 
         // compute transitive closures of the transpose graph (dependents)
         let mut dependents = vec![ColumnMask::default(); n];
-        for &i in topo.iter().rev() {
+        for &i in topological_sort.iter().rev() {
             dependents[i] = direct_dependents[i].clone();
             for j in direct_dependents[i].iter() {
                 let snapshot = dependents[j].clone();
@@ -2356,6 +2358,7 @@ impl GeneratedColGraph {
         Ok(Self {
             dependencies,
             dependents,
+            topological_sort,
         })
     }
 }
@@ -2901,6 +2904,17 @@ impl BTreeTable {
             .expect("column_dependencies was just initialized"))
     }
 
+    /// Returns an iterator over columns in topological (dependency) order. Processing
+    /// columns in this order guarantees that all dependencies of generated columns are computed
+    /// before the columns that reference them.
+    pub(crate) fn columns_topo_sort(&self) -> Result<ColumnsTopologicalSort<'_>> {
+        let topo = self.column_graph()?.topological_sort.to_vec();
+        Ok(ColumnsTopologicalSort {
+            columns: &self.columns,
+            topological_sort: topo,
+        })
+    }
+
     #[cfg(test)]
     pub(crate) fn peek_column_dependencies(&self) -> Option<&GeneratedColGraph> {
         self.column_dependencies.0.get()
@@ -2940,6 +2954,19 @@ impl BTreeTable {
             }
         }
         Ok(deps)
+    }
+}
+
+/// Topologically sorted generated columns, yielding `(column_index, &Column)`.
+pub(crate) struct ColumnsTopologicalSort<'a> {
+    columns: &'a [Column],
+    /// indices of `columns`
+    topological_sort: Vec<usize>,
+}
+
+impl<'a> ColumnsTopologicalSort<'a> {
+    pub fn iter(&self) -> impl Iterator<Item = (usize, &'a Column)> + '_ {
+        self.topological_sort.iter().map(|&idx| (idx, &self.columns[idx]))
     }
 }
 
