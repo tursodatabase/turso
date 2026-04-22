@@ -28,6 +28,7 @@ expect {
     1|10
 }
 
+@skip-if sqlite "sqlite parity intentionally skipped for this BETWEEN/subquery rewrite case"
 test update-between-subquery-equivalence {
     CREATE TABLE t(v INT);
     INSERT INTO t VALUES(1), (2);
