@@ -9101,3 +9101,35 @@ fn test_create_type_visible_to_second_connection_under_mvcc() {
     assert_eq!(rows[0][0].to_string(), "my_uint(value any)");
     conn2.close().unwrap();
 }
+
+#[test]
+fn test_integrity_check_ignores_dropped_root_that_is_live_after_recovery() {
+    let mut db = MvccTestDbNoConn::new_with_random_db();
+    {
+        let conn = db.connect();
+        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")
+            .unwrap();
+        conn.execute("INSERT INTO t VALUES (1, 'x')").unwrap();
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+        conn.close().unwrap();
+    }
+
+    db.restart();
+
+    let conn = db.connect();
+
+    let rows = get_rows(
+        &conn,
+        "SELECT rootpage FROM sqlite_schema WHERE type = 'table' AND name = 't'",
+    );
+    let root_page = rows[0][0].as_int().unwrap();
+    assert!(root_page > 0);
+
+    conn.with_schema_mut(|schema| {
+        schema.dropped_root_pages.insert(root_page);
+    });
+
+    let rows = get_rows(&conn, "PRAGMA integrity_check");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(&rows[0][0].to_string(), "ok");
+}
