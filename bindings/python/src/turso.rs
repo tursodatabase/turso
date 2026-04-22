@@ -275,6 +275,21 @@ impl PyTursoStatement {
         Ok(())
     }
 
+    /// bind one positional parameter (1-based index)
+    pub fn bind_positional(&mut self, index: usize, parameter: Bound<PyAny>) -> PyResult<()> {
+        self.statement
+            .bind_positional(index, py_to_db_value(parameter)?)
+            .map_err(turso_error_to_py_err)?;
+        Ok(())
+    }
+
+    /// get statement parameter slot by name (e.g. :name, @name, $name, ?1)
+    pub fn named_position(&mut self, name: &str) -> PyResult<usize> {
+        self.statement
+            .named_position(name)
+            .map_err(turso_error_to_py_err)
+    }
+
     /// step one iteration of the statement execution
     /// Returns [PyTursoStatusCode::Done] when execution is finished
     /// Returns [PyTursoStatusCode::Row] when execution generated a row which can be consumed with [Self::row] method
