@@ -2055,7 +2055,7 @@ fn test_vacuum_into_with_mixed_index_types(tmp_db: TempDatabase) -> anyhow::Resu
 /// Test VACUUM INTO preserves MVCC journal mode from source database.
 /// If source has mvcc enabled, destination should too.
 #[turso_macros::test]
-fn test_vacuum_into_preserves_mvcc(tmp_db: TempDatabase) -> anyhow::Result<()> {
+fn test_vacuum_into_preserves_mvcc_after_reopen(tmp_db: TempDatabase) -> anyhow::Result<()> {
     let conn = tmp_db.connect_limbo();
     conn.execute("PRAGMA journal_mode = 'mvcc'")?;
     let source_mode: Vec<(String,)> = conn.exec_rows("PRAGMA journal_mode");
@@ -2098,6 +2098,49 @@ fn test_vacuum_into_preserves_mvcc(tmp_db: TempDatabase) -> anyhow::Result<()> {
         rows,
         vec![(1, "hello".to_string()), (2, "world".to_string())]
     );
+
+    drop(dest_conn);
+    drop(dest_db);
+
+    let reopened = TempDatabase::new_with_existent_with_opts(&dest_path, tmp_db.db_opts);
+    let reopened_conn = reopened.connect_limbo();
+    let reopened_mode: Vec<(String,)> = reopened_conn.exec_rows("PRAGMA journal_mode");
+    assert_eq!(reopened_mode, vec![("mvcc".to_string(),)]);
+    assert_eq!(run_integrity_check(&reopened_conn), "ok");
+    let reopened_rows: Vec<(i64, String)> =
+        reopened_conn.exec_rows("SELECT id, data FROM t ORDER BY id");
+    assert_eq!(
+        reopened_rows,
+        vec![(1, "hello".to_string()), (2, "world".to_string())]
+    );
+
+    Ok(())
+}
+
+#[turso_macros::test]
+fn test_plain_vacuum_preserves_mvcc_after_reopen(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+    conn.execute("PRAGMA journal_mode = 'mvcc'")?;
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, data TEXT)")?;
+    conn.execute("INSERT INTO t VALUES (1, 'hello'), (2, 'world')")?;
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")?;
+
+    conn.execute("VACUUM")?;
+    assert_eq!(run_integrity_check(&conn), "ok");
+    let journal_mode: Vec<(String,)> = conn.exec_rows("PRAGMA journal_mode");
+    assert_eq!(journal_mode, vec![("mvcc".to_string(),)]);
+
+    let path = tmp_db.path.clone();
+    let opts = tmp_db.db_opts;
+    drop(conn);
+    drop(tmp_db);
+
+    let reopened = TempDatabase::new_with_existent_with_opts(&path, opts);
+    let reopened_conn = reopened.connect_limbo();
+    let journal_mode: Vec<(String,)> = reopened_conn.exec_rows("PRAGMA journal_mode");
+    assert_eq!(journal_mode, vec![("mvcc".to_string(),)]);
+    assert_eq!(run_integrity_check(&reopened_conn), "ok");
+    assert_eq!(scalar_i64(&reopened_conn, "SELECT COUNT(*) FROM t"), 2);
 
     Ok(())
 }
