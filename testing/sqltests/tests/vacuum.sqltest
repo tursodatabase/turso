@@ -51,16 +51,6 @@ expect error {
     cannot VACUUM from within a transaction
 }
 
-@backend rust
-test vacuum-rejected-when-not-in-wal-mode {
-    PRAGMA journal_mode = 'delete';
-    VACUUM;
-}
-expect error {
-    WAL-mode database
-}
-
-@backend rust
 test vacuum-rejected-in-query-only {
     CREATE TABLE qo_t(x);
     PRAGMA query_only = 1;

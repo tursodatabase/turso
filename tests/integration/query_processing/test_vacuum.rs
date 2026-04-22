@@ -1,6 +1,6 @@
 use crate::common::{
-    ExecRows, TempDatabase, compute_dbhash, compute_dbhash_with_database_opts,
-    compute_dbhash_with_options, compute_dbhash_with_options_and_database_opts, limbo_exec_rows,
+    compute_dbhash, compute_dbhash_with_database_opts, compute_dbhash_with_options,
+    compute_dbhash_with_options_and_database_opts, limbo_exec_rows, ExecRows, TempDatabase,
 };
 use rusqlite::Connection as SqliteConnection;
 use std::{
@@ -9,9 +9,9 @@ use std::{
 };
 use tempfile::TempDir;
 use turso_core::{
-    Buffer, Clock, Completion, Connection, Database, DatabaseOpts, File, IO, LimboError,
-    MonotonicInstant, OpenFlags, StepResult, Value, WallClockInstant,
     io::{FileId, FileSyncType},
+    Buffer, Clock, Completion, Connection, Database, DatabaseOpts, File, LimboError,
+    MonotonicInstant, OpenFlags, StepResult, Value, WallClockInstant, IO,
 };
 
 /// Helper to run integrity_check and return the result string
