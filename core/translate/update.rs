@@ -1,7 +1,7 @@
 use crate::sync::Arc;
 use rustc_hash::FxHashMap as HashMap;
 
-use crate::schema::ROWID_SENTINEL;
+use crate::schema::{EXPR_INDEX_SENTINEL, ROWID_SENTINEL};
 use crate::translate::emitter::Resolver;
 use crate::translate::expr::{bind_and_rewrite_expr, BindingBehavior};
 use crate::translate::expression_index::expression_index_column_usage;
@@ -491,8 +491,22 @@ pub fn prepare_update_plan(
         }
 
         if must_update {
+            // mark as used dependencies of expression indexes
             for col_idx in expression_cols_used.iter() {
                 table_references.mark_column_used(target_table_internal_id, col_idx);
+            }
+            // mark as used dependencies of virtual columns
+            if let Some(btree) = target_table_ref.table.btree() {
+                let virtual_cols_in_index = idx
+                    .columns
+                    .iter()
+                    .filter(|c| c.pos_in_table != EXPR_INDEX_SENTINEL)
+                    .map(|c| c.pos_in_table)
+                    .filter(|&pos| btree.columns()[pos].is_virtual_generated());
+                let deps = btree.dependencies_of_columns(virtual_cols_in_index)?;
+                for dep_idx in deps.iter() {
+                    table_references.mark_column_used(target_table_internal_id, dep_idx);
+                }
             }
             indexes_to_update.push(idx);
         }
