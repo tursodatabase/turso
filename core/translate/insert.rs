@@ -81,9 +81,6 @@ fn validate(
     if resolver.schema().is_materialized_view(table_name) {
         crate::bail_parse_error!("cannot modify materialized view {}", table_name);
     }
-    if table.btree().is_some_and(|t| !t.has_rowid) {
-        crate::bail_parse_error!("INSERT into WITHOUT ROWID table is not supported");
-    }
     if table.btree().is_some_and(|t| t.has_autoincrement)
         && conn.mv_store_for_db(database_id).is_some()
     {
@@ -379,6 +376,33 @@ pub fn translate_insert(
             || resolver.with_schema(database_id, |s| {
                 s.any_resolved_fks_referencing(table_name.as_str())
             }));
+    if !btree_table.has_rowid {
+        if has_fks {
+            crate::bail_parse_error!("foreign keys on WITHOUT ROWID tables are not supported");
+        }
+        if on_conflict == Some(ResolveType::Replace) || !upsert_actions.is_empty() {
+            crate::bail_parse_error!(
+                "UPSERT and REPLACE on WITHOUT ROWID tables are not supported"
+            );
+        }
+        if cdc_table.is_some() {
+            crate::bail_parse_error!("CDC on WITHOUT ROWID tables is not supported");
+        }
+        if !resolver
+            .schema()
+            .get_dependent_materialized_views(table_name.as_str())
+            .is_empty()
+        {
+            crate::bail_parse_error!(
+                "materialized views on WITHOUT ROWID tables are not supported"
+            );
+        }
+        if resolver.with_schema(database_id, |s| {
+            s.get_indices(table_name.as_str()).next().is_some()
+        }) {
+            crate::bail_parse_error!("secondary indexes on WITHOUT ROWID tables are not supported");
+        }
+    }
 
     let mut ctx = InsertEmitCtx::new(
         program,
@@ -448,7 +472,7 @@ pub fn translate_insert(
         |_| true,
     )?;
 
-    let has_user_provided_rowid = insertion.key.is_provided_by_user();
+    let has_user_provided_rowid = ctx.table.has_rowid && insertion.key.is_provided_by_user();
 
     if ctx.table.has_autoincrement {
         init_autoincrement(program, &mut ctx, resolver)?;
@@ -609,7 +633,9 @@ pub fn translate_insert(
 
     program.preassign_label_to_next_insn(ctx.key_labels.key_generation);
 
-    emit_rowid_generation(program, &ctx, &insertion, resolver)?;
+    if ctx.table.has_rowid {
+        emit_rowid_generation(program, &ctx, &insertion, resolver)?;
+    }
 
     program.preassign_label_to_next_insn(ctx.key_labels.key_ready_for_check);
 
@@ -763,6 +789,7 @@ pub fn translate_insert(
     let constraints = build_constraints_to_check(
         table_name.as_str(),
         &upsert_actions,
+        ctx.table.has_rowid,
         has_user_provided_rowid,
         resolver,
         ctx.database_id,
@@ -2292,6 +2319,7 @@ pub static ROWID_COLUMN: std::sync::LazyLock<Column> = std::sync::LazyLock::new(
             primary_key: true,
             rowid_alias: true,
             notnull: true,
+            explicit_notnull: false,
             hidden: false,
             unique: false,
             notnull_conflict_clause: None,
@@ -2732,6 +2760,77 @@ fn emit_pk_uniqueness_check(
     upsert_catch_all: Option<usize>,
     preflight: &mut PreflightCtx,
 ) -> Result<()> {
+    if !ctx.table.has_rowid {
+        let pk_regs = program.alloc_registers(ctx.table.primary_key_columns.len());
+        let pk_affinities = ctx
+            .table
+            .primary_key_columns
+            .iter()
+            .map(|(name, _)| {
+                let col = insertion
+                    .get_col_mapping_by_name(name)
+                    .unwrap_or_else(|| panic!("primary key column missing from insertion: {name}"));
+                col.column
+                    .affinity_with_strict(ctx.table.is_strict)
+                    .aff_mask()
+            })
+            .collect::<String>();
+        for (i, (name, _)) in ctx.table.primary_key_columns.iter().enumerate() {
+            let src_reg = insertion
+                .get_col_mapping_by_name(name)
+                .unwrap_or_else(|| panic!("primary key column missing from insertion: {name}"))
+                .register;
+            program.emit_insn(Insn::Copy {
+                src_reg,
+                dst_reg: pk_regs + i,
+                extra_amount: 0,
+            });
+        }
+        program.emit_insn(Insn::Affinity {
+            start_reg: pk_regs,
+            count: NonZeroUsize::new(ctx.table.primary_key_columns.len())
+                .expect("WITHOUT ROWID tables must have a primary key"),
+            affinities: pk_affinities,
+        });
+        let no_conflict = program.allocate_label();
+        program.emit_insn(Insn::NoConflict {
+            cursor_id: ctx.cursor_id,
+            target_pc: no_conflict,
+            record_reg: pk_regs,
+            num_regs: ctx.table.primary_key_columns.len(),
+        });
+        if let Some(position) = position.or(upsert_catch_all) {
+            program.emit_insn(Insn::Goto {
+                target_pc: preflight.upsert_actions[position].1,
+            });
+        } else if matches!(preflight.effective_on_conflict, ResolveType::Ignore) {
+            program.emit_insn(Insn::Goto {
+                target_pc: ctx.loop_labels.row_done,
+            });
+        } else {
+            let raw_desc = ctx
+                .table
+                .primary_key_columns
+                .iter()
+                .map(|(name, _)| format!("{}.{}", ctx.table.name, name))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let (description, on_error) = halt_desc_and_on_error(
+                &raw_desc,
+                preflight.effective_on_conflict,
+                program.flags.has_statement_conflict(),
+            );
+            program.emit_insn(Insn::Halt {
+                err_code: SQLITE_CONSTRAINT_PRIMARYKEY,
+                description,
+                on_error,
+                description_reg: None,
+            });
+        }
+        program.preassign_label_to_next_insn(no_conflict);
+        return Ok(());
+    }
+
     let make_record_label = program.allocate_label();
     program.emit_insn(Insn::NotExists {
         cursor: ctx.cursor_id,
@@ -3430,6 +3529,7 @@ struct PreflightCtx<'a, 'b> {
 fn build_constraints_to_check(
     table_name: &str,
     upsert_actions: &[(ResolvedUpsertTarget, BranchOffset, Box<Upsert>)],
+    has_rowid: bool,
     has_user_provided_rowid: bool,
     resolver: &Resolver,
     database_id: usize,
@@ -3437,7 +3537,7 @@ fn build_constraints_to_check(
     has_statement_conflict: bool,
 ) -> ConstraintsToCheck {
     let mut constraints_to_check = Vec::new();
-    if has_user_provided_rowid {
+    if !has_rowid || has_user_provided_rowid {
         // Check uniqueness constraint for rowid if it was provided by user.
         // When the DB allocates it there are no need for separate uniqueness checks.
         let position = upsert_actions

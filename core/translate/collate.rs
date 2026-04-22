@@ -645,6 +645,7 @@ mod tests {
                 primary_key: true,
                 rowid_alias: true,
                 notnull: false,
+                explicit_notnull: false,
                 unique: true,
                 hidden: false,
                 notnull_conflict_clause: None,
