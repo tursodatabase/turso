@@ -139,6 +139,18 @@ pub(crate) struct RollbackFrameInfo {
     pub(crate) staged_schema_snapshot: HashMap<usize, Arc<Schema>>,
 }
 
+struct SchemaReparseGuard {
+    connection: Arc<Connection>,
+}
+
+impl Drop for SchemaReparseGuard {
+    fn drop(&mut self) {
+        self.connection
+            .schema_reparse_in_progress
+            .store(false, Ordering::SeqCst);
+    }
+}
+
 /// Database connection handle.
 ///
 /// If you add a setting that affects SQL compilation or execution, call
@@ -247,6 +259,10 @@ pub struct Connection {
     /// Connection-level named savepoint stack used to mirror savepoint state
     /// onto temp/attached databases that start participating after SAVEPOINT.
     pub(crate) named_savepoints: RwLock<Vec<NamedSavepointFrame>>,
+    /// True while this connection is rebuilding its schema from sqlite_schema.
+    /// Internal helper statements used during reload must not recursively
+    /// trigger another schema reparse on the same connection.
+    pub(crate) schema_reparse_in_progress: AtomicBool,
     /// Generation counter bumped whenever any setting that affects PrepareContext
     /// changes. Allows prepared statements to cheaply detect when they need to be
     /// reprepared (single u64 comparison instead of rebuilding the full context).
@@ -316,6 +332,21 @@ impl Drop for Connection {
 }
 
 impl Connection {
+    fn schema_reparse_guard(self: &Arc<Connection>) -> SchemaReparseGuard {
+        let was_reparsing = self.schema_reparse_in_progress.swap(true, Ordering::SeqCst);
+        turso_assert!(
+            !was_reparsing,
+            "schema reparse must not recurse on the same connection"
+        );
+        SchemaReparseGuard {
+            connection: self.clone(),
+        }
+    }
+
+    pub(crate) fn schema_reparse_in_progress(&self) -> bool {
+        self.schema_reparse_in_progress.load(Ordering::Acquire)
+    }
+
     pub(crate) fn empty_temp_schema(&self) -> Arc<Schema> {
         // with_options only fails if built-in type SQL is malformed (programmer bug).
         let mut schema = Schema::with_options(self.db.experimental_custom_types_enabled())
@@ -904,6 +935,8 @@ impl Connection {
     }
 
     pub(crate) fn reparse_schema_with_cookie(self: &Arc<Connection>, cookie: u32) -> Result<()> {
+        let _reparse_guard = self.schema_reparse_guard();
+        self.pager.load().set_schema_cookie(Some(cookie));
         // create fresh schema as some objects can be deleted
         let mut fresh = Schema::with_options(self.experimental_custom_types_enabled())?;
         fresh.generated_columns_enabled = self.db.experimental_generated_columns_enabled();
@@ -1252,7 +1285,7 @@ impl Connection {
         if !has_types_table {
             return Ok(Vec::new());
         }
-        let mut type_stmt = self.prepare(format!(
+        let mut type_stmt = self.prepare_internal(format!(
             "SELECT name, sql FROM {}",
             crate::schema::TURSO_TYPES_TABLE_NAME
         ))?;
@@ -1265,6 +1298,9 @@ impl Connection {
     }
 
     pub fn maybe_update_schema(&self) {
+        if self.schema_reparse_in_progress() {
+            return;
+        }
         let current_schema_version = self.schema.read().schema_version;
         let schema = self.db.schema.lock();
         if matches!(self.get_tx_state(), TransactionState::None)
