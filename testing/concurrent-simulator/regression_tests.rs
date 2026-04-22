@@ -2,7 +2,7 @@
 
 use std::path::Path;
 use std::sync::Arc;
-use turso_core::{Connection, Database, DatabaseOpts, IO, LimboError, OpenFlags};
+use turso_core::{Connection, Database, DatabaseOpts, LimboError, OpenFlags, IO};
 use turso_whopper::multiprocess::{MultiprocessOpts, MultiprocessWhopper};
 use turso_whopper::{
     multiprocess_platform_io,
@@ -233,6 +233,19 @@ fn truncate_checkpoint_until_stable(whopper: &mut MultiprocessWhopper, connectio
     panic!("TRUNCATE checkpoint did not stabilize after transient multiprocess errors");
 }
 
+#[cfg(all(unix, target_pointer_width = "64"))]
+fn is_multiprocess_vacuum_rejection(err: &LimboError) -> bool {
+    match err {
+        LimboError::ParseError(msg) => {
+            msg.contains("VACUUM is incompatible with experimental multiprocess WAL")
+        }
+        LimboError::TxError(msg) | LimboError::InternalError(msg) => {
+            msg.contains("cannot VACUUM experimental multiprocess WAL databases")
+        }
+        _ => false,
+    }
+}
+
 #[cfg(all(any(unix, target_os = "windows"), target_pointer_width = "64"))]
 fn assert_integrity_check_ok(whopper: &mut MultiprocessWhopper, worker_idx: usize) {
     let rows = whopper
@@ -363,6 +376,109 @@ fn multiprocess_same_process_sibling_reader_keeps_shared_snapshot_live_until_las
         2,
         "writer process should observe both committed rows after the shared reader snapshot is released",
     );
+
+    whopper.finalize().expect("finalize multiprocess whopper");
+}
+
+#[cfg(all(unix, target_pointer_width = "64"))]
+#[test]
+fn multiprocess_plain_vacuum_rejects_enabled_multiprocess_wal() {
+    let mut whopper = create_multiprocess_whopper_with_shape(2, 1);
+
+    for connection_idx in 0..2 {
+        whopper
+            .disable_auto_checkpoint_direct(connection_idx)
+            .expect("disable auto checkpoint");
+    }
+
+    whopper
+        .execute_sql_direct(
+            0,
+            "create table test(id integer primary key, value text not null)",
+        )
+        .expect("create table")
+        .expect("create table should succeed");
+    for i in 0..160 {
+        whopper
+            .execute_sql_direct(
+                0,
+                format!("insert into test values ({i}, '{}')", "x".repeat(220)),
+            )
+            .expect("insert row")
+            .expect("insert should succeed");
+    }
+    whopper
+        .execute_sql_direct(0, "delete from test where id % 4 = 0")
+        .expect("delete rows")
+        .expect("delete should succeed");
+
+    let vacuum_result = whopper
+        .execute_sql_direct(0, "VACUUM")
+        .expect("run VACUUM on multiprocess WAL database");
+    assert!(
+        matches!(vacuum_result, Err(ref err) if is_multiprocess_vacuum_rejection(err)),
+        "multiprocess VACUUM should reject unconditionally, got {vacuum_result:?}"
+    );
+    assert_eq!(count_test_rows(&mut whopper, 0), 120);
+    assert_eq!(count_test_rows(&mut whopper, 1), 120);
+    assert_integrity_check_ok(&mut whopper, 0);
+    assert_integrity_check_ok(&mut whopper, 1);
+
+    whopper.finalize().expect("finalize multiprocess whopper");
+}
+
+#[cfg(all(unix, target_pointer_width = "64"))]
+#[test]
+fn multiprocess_plain_vacuum_rejects_even_with_active_reader() {
+    let mut whopper = create_multiprocess_whopper_with_shape(2, 1);
+
+    for connection_idx in 0..2 {
+        whopper
+            .disable_auto_checkpoint_direct(connection_idx)
+            .expect("disable auto checkpoint");
+    }
+
+    whopper
+        .execute_sql_direct(
+            0,
+            "create table test(id integer primary key, value text not null)",
+        )
+        .expect("create table")
+        .expect("create table should succeed");
+    for i in 0..120 {
+        whopper
+            .execute_sql_direct(
+                0,
+                format!("insert into test values ({i}, '{}')", "y".repeat(200)),
+            )
+            .expect("insert row")
+            .expect("insert should succeed");
+    }
+    whopper
+        .execute_sql_direct(0, "delete from test where id >= 20")
+        .expect("delete rows")
+        .expect("delete should succeed");
+
+    whopper
+        .execute_sql_direct(1, "begin")
+        .expect("begin reader")
+        .expect("reader begin should succeed");
+    assert_eq!(count_test_rows(&mut whopper, 1), 20);
+
+    let vacuum_result = whopper
+        .execute_sql_direct(0, "VACUUM")
+        .expect("run VACUUM with active reader");
+    assert!(
+        matches!(vacuum_result, Err(ref err) if is_multiprocess_vacuum_rejection(err)),
+        "multiprocess VACUUM should reject before reader-state checks, got {vacuum_result:?}"
+    );
+
+    whopper
+        .execute_sql_direct(1, "rollback")
+        .expect("rollback reader")
+        .expect("reader rollback should succeed");
+    assert_eq!(count_test_rows(&mut whopper, 0), 20);
+    assert_integrity_check_ok(&mut whopper, 0);
 
     whopper.finalize().expect("finalize multiprocess whopper");
 }
@@ -1105,8 +1221,8 @@ fn multiprocess_restart_rebuilds_from_disk_after_partial_checkpoint_proof_is_cle
 
 #[cfg(all(any(unix, target_os = "windows"), target_pointer_width = "64"))]
 #[test]
-fn multiprocess_restart_rebuilds_from_disk_after_db_header_mismatch_invalidates_partial_checkpoint_proof()
- {
+fn multiprocess_restart_rebuilds_from_disk_after_db_header_mismatch_invalidates_partial_checkpoint_proof(
+) {
     let mut whopper = create_multiprocess_whopper(1);
     create_partial_checkpoint_state(&mut whopper);
 

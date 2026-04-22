@@ -218,6 +218,76 @@ pub async fn test_execute_batch() {
 }
 
 #[tokio::test]
+async fn test_plain_vacuum_file_backed_smoke() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("vacuum-smoke.db");
+    let db = Builder::new_local(db_path.to_str().unwrap())
+        .experimental_vacuum(true)
+        .build()
+        .await
+        .unwrap();
+    let conn = db.connect().unwrap();
+
+    conn.execute(
+        "CREATE TABLE t(id INTEGER PRIMARY KEY, payload TEXT NOT NULL)",
+        (),
+    )
+    .await
+    .unwrap();
+    for i in 0..80 {
+        conn.execute(
+            "INSERT INTO t(id, payload) VALUES (?, ?)",
+            vec![Value::Integer(i), Value::Text("payload".repeat(20))],
+        )
+        .await
+        .unwrap();
+    }
+    conn.execute("DELETE FROM t WHERE id % 4 = 0", ())
+        .await
+        .unwrap();
+
+    conn.execute("VACUUM", ()).await.unwrap();
+
+    let mut count_rows = conn.query("SELECT COUNT(*) FROM t", ()).await.unwrap();
+    let count_row = count_rows.next().await.unwrap().unwrap();
+    assert_eq!(count_row.get_value(0).unwrap(), Value::Integer(60));
+    assert!(count_rows.next().await.unwrap().is_none());
+
+    let mut integrity_rows = conn.query("PRAGMA integrity_check", ()).await.unwrap();
+    let integrity_row = integrity_rows.next().await.unwrap().unwrap();
+    assert_eq!(
+        integrity_row.get_value(0).unwrap(),
+        Value::Text("ok".into())
+    );
+    assert!(integrity_rows.next().await.unwrap().is_none());
+}
+
+#[tokio::test]
+async fn test_plain_vacuum_rejects_active_transaction_smoke() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("vacuum-active-txn.db");
+    let db = Builder::new_local(db_path.to_str().unwrap())
+        .build()
+        .await
+        .unwrap();
+    let conn = db.connect().unwrap();
+
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY)", ())
+        .await
+        .unwrap();
+    conn.execute("BEGIN", ()).await.unwrap();
+
+    let err = conn.execute("VACUUM", ()).await.unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("cannot VACUUM from within a transaction"),
+        "unexpected VACUUM-in-transaction binding error: {err}"
+    );
+
+    conn.execute("ROLLBACK", ()).await.unwrap();
+}
+
+#[tokio::test]
 async fn test_query_row_returns_first_row() {
     let db = Builder::new_local(":memory:").build().await.unwrap();
     let conn = db.connect().unwrap();

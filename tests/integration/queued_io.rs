@@ -65,8 +65,74 @@ impl QueuedIo {
         }
     }
 
+    pub(crate) fn fail_after_successes(
+        &self,
+        path_suffix: &str,
+        kind: QueuedIoOpKind,
+        allowed_successes: usize,
+    ) {
+        *self.state.fault.lock().unwrap() = Some(QueuedIoFault {
+            path_suffix: path_suffix.to_string(),
+            kind,
+            allowed_successes,
+            seen: 0,
+        });
+    }
+
+    pub(crate) fn clear_fault(&self) {
+        *self.state.fault.lock().unwrap() = None;
+    }
+
+    pub(crate) fn count_events(&self, path_suffix: &str, kind: QueuedIoOpKind) -> usize {
+        self.state
+            .history
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|event| event.path.ends_with(path_suffix) && event.kind == kind)
+            .count()
+    }
+
+    pub(crate) fn history_len(&self) -> usize {
+        self.state.history.lock().unwrap().len()
+    }
+
+    pub(crate) fn history_since(&self, start: usize) -> Vec<QueuedIoEvent> {
+        self.state.history.lock().unwrap()[start..].to_vec()
+    }
+
+    pub(crate) fn pending_events(&self) -> Vec<QueuedIoEvent> {
+        self.state
+            .pending
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|op| op.event.clone())
+            .collect()
+    }
+
     pub(crate) fn step_one(&self) -> turso_core::Result<Option<QueuedIoEvent>> {
         let Some(op) = self.state.pending.lock().unwrap().pop_front() else {
+            return Ok(None);
+        };
+        let event = op.event.clone();
+        (op.action)()?;
+        self.state.history.lock().unwrap().push(event.clone());
+        Ok(Some(event))
+    }
+
+    pub(crate) fn step_last_matching<F>(
+        &self,
+        predicate: F,
+    ) -> turso_core::Result<Option<QueuedIoEvent>>
+    where
+        F: Fn(&QueuedIoEvent) -> bool,
+    {
+        let Some(op) = ({
+            let mut pending = self.state.pending.lock().unwrap();
+            let idx = pending.iter().rposition(|op| predicate(&op.event));
+            idx.and_then(|idx| pending.remove(idx))
+        }) else {
             return Ok(None);
         };
         let event = op.event.clone();

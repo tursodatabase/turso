@@ -1,0 +1,278 @@
+@database :temp:
+
+@backend rust
+test vacuum-uninitialized-file-backed-db-rejected {
+    VACUUM;
+}
+expect error {
+    initialized
+}
+
+@backend rust
+test vacuum-basic-success {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT);
+    INSERT INTO t VALUES (1, 'one'), (2, 'two'), (3, 'three');
+    DELETE FROM t WHERE id = 2;
+    VACUUM;
+    SELECT id, v FROM t ORDER BY id;
+    PRAGMA integrity_check;
+}
+expect {
+    1|one
+    3|three
+    ok
+}
+
+@backend rust
+test vacuum-generated-columns {
+    CREATE TABLE t1(a INTEGER, b AS (a * 2));
+    INSERT INTO t1(a) VALUES(1), (2), (3), (4), (5);
+    DELETE FROM t1 WHERE a IN (2, 4);
+    VACUUM;
+    SELECT a, b FROM t1;
+}
+expect {
+    1|2
+    3|6
+    5|10
+}
+
+@backend rust
+@skip-if mvcc "Expression indexes are not supported with MVCC"
+test vacuum-generated-columns-with-index {
+    CREATE TABLE t1(a INTEGER, b AS (a * 2));
+    CREATE INDEX idx1 ON t1(b);
+    INSERT INTO t1(a) VALUES(1), (2), (3), (4), (5);
+    DELETE FROM t1 WHERE a IN (2, 4);
+    VACUUM;
+    SELECT a, b FROM t1;
+    PRAGMA integrity_check;
+}
+expect {
+    1|2
+    3|6
+    5|10
+    ok
+}
+
+@backend rust
+test vacuum-schema-qualified-rejected {
+    VACUUM temp;
+}
+expect error {
+    VACUUM is only supported for the main database; schema 'temp' is not supported yet
+}
+
+@backend rust
+test vacuum-rejected-in-begin {
+    CREATE TABLE tx_t(x);
+    BEGIN;
+    VACUUM;
+}
+expect error {
+    cannot VACUUM from within a transaction
+}
+
+@backend rust
+test vacuum-rejected-in-savepoint {
+    CREATE TABLE sp_t(x);
+    SAVEPOINT sp1;
+    VACUUM;
+}
+expect error {
+    cannot VACUUM from within a transaction
+}
+
+test vacuum-rejected-in-query-only {
+    CREATE TABLE qo_t(x);
+    PRAGMA query_only = 1;
+    VACUUM;
+}
+expect error {
+    Cannot execute VACUUM in query_only mode
+}
+
+# Adapted from SQLite vacuum5.test: an explicit main schema qualifier should
+# behave like plain VACUUM.
+test vacuum-explicit-main-schema {
+    CREATE TABLE t1(a INTEGER PRIMARY KEY, b TEXT);
+    INSERT INTO t1 VALUES(1, 'one'), (2, 'two'), (3, 'three');
+    DELETE FROM t1 WHERE a = 2;
+    VACUUM main;
+    SELECT a, b FROM t1 ORDER BY a;
+    PRAGMA integrity_check;
+}
+expect {
+    1|one
+    3|three
+    ok
+}
+
+# Adapted from SQLite vacuum6.test: duplicate indexes on the same column remain
+# valid across VACUUM.
+test vacuum-duplicate-indexes-same-column {
+    CREATE TABLE t1(x, b);
+    CREATE INDEX x1 ON t1(x);
+    CREATE INDEX x2 ON t1(x);
+    CREATE INDEX x3 ON t1(x);
+    INSERT INTO t1 VALUES(2, '');
+    VACUUM;
+    SELECT count(*) FROM t1 WHERE x = 2;
+    PRAGMA integrity_check;
+}
+expect {
+    1
+    ok
+}
+
+# Adapted from SQLite vacuum.test ticket #873: a database filename containing
+# an apostrophe can be vacuumed.
+@backend cli
+test vacuum-database-name-with-quote {
+    .open a'z.db
+    CREATE TABLE t1(t);
+    VACUUM;
+    PRAGMA integrity_check;
+}
+expect {
+    ok
+}
+
+# Regression for the currently supported WAL VACUUM behavior: pending page-size
+# changes do not rewrite the source database page size.
+test vacuum-preserves-wal-page-size {
+    PRAGMA page_size = 1024;
+    CREATE TABLE t1(a INTEGER PRIMARY KEY, b TEXT, c BLOB);
+    INSERT INTO t1 VALUES(1, 'one', randomblob(1000));
+    PRAGMA page_size;
+
+    PRAGMA page_size = 2048;
+    VACUUM;
+    PRAGMA page_size;
+    SELECT a, b, length(c) FROM t1;
+    PRAGMA integrity_check;
+
+    PRAGMA page_size = 512;
+    VACUUM;
+    PRAGMA page_size;
+    SELECT a, b, length(c) FROM t1;
+    PRAGMA integrity_check;
+}
+expect {
+    1024
+    1024
+    1|one|1000
+    ok
+    1024
+    1|one|1000
+    ok
+}
+
+# Adapted from SQLite vacuum3.test: SQLite can apply pending page-size changes
+# during VACUUM. Turso intentionally does not support changing page size yet.
+@skip "missing feature: VACUUM does not support changing page size; see missing_feature.txt"
+test vacuum-page-size-transitions-from-sqlite {
+    PRAGMA page_size = 1024;
+    CREATE TABLE t1(a INTEGER PRIMARY KEY, b TEXT, c BLOB);
+    INSERT INTO t1 VALUES(1, 'one', randomblob(1000));
+    PRAGMA page_size;
+
+    PRAGMA page_size = 2048;
+    VACUUM;
+    PRAGMA page_size;
+    SELECT a, b, length(c) FROM t1;
+    PRAGMA integrity_check;
+
+    PRAGMA page_size = 512;
+    VACUUM;
+    PRAGMA page_size;
+    SELECT a, b, length(c) FROM t1;
+    PRAGMA integrity_check;
+}
+expect {
+    1024
+    2048
+    1|one|1000
+    ok
+    512
+    1|one|1000
+    ok
+}
+
+# Adapted from SQLite vacuum5.test/e_vacuum.test: SQLite supports schema-
+# qualified VACUUM for attached databases.
+@skip "missing feature: schema-qualified VACUUM is only supported for main; see missing_feature.txt"
+@backend cli
+test vacuum-attached-schema-from-sqlite {
+    ATTACH 'vacuum_attached_schema_aux.db' AS aux;
+    CREATE TABLE aux.t1(a INTEGER PRIMARY KEY, b TEXT);
+    INSERT INTO aux.t1 VALUES(1, 'one'), (2, 'two'), (3, 'three');
+    DELETE FROM aux.t1 WHERE a = 2;
+    VACUUM aux;
+    SELECT a, b FROM aux.t1 ORDER BY a;
+    PRAGMA aux.integrity_check;
+}
+expect {
+    1|one
+    3|three
+    ok
+}
+
+# Adapted from SQLite vacuum5.test: VACUUM temp is a no-op on the temp schema.
+@skip "missing feature: schema-qualified VACUUM is only supported for main; see missing_feature.txt"
+test vacuum-temp-schema-from-sqlite {
+    CREATE TEMP TABLE t1(a INTEGER PRIMARY KEY, b TEXT);
+    INSERT INTO temp.t1 VALUES(1, 'one'), (2, 'two');
+    VACUUM temp;
+    SELECT a, b FROM temp.t1 ORDER BY a;
+}
+expect {
+    1|one
+    2|two
+}
+
+# Adapted from SQLite e_vacuum.test: SQLite may renumber ordinary rowid tables
+# that do not have an INTEGER PRIMARY KEY or indexes.
+@skip "missing feature: plain VACUUM does not match SQLite rowid renumbering for ordinary unindexed rowid tables; see missing_feature.txt"
+test vacuum-rowid-renumbering-from-sqlite {
+    CREATE TABLE t4(x);
+    INSERT INTO t4(x) VALUES('x'), ('y'), ('z');
+    DELETE FROM t4 WHERE x = 'y';
+    SELECT rowid, x FROM t4 ORDER BY rowid;
+    VACUUM;
+    SELECT rowid, x FROM t4 ORDER BY rowid;
+
+    CREATE TABLE t5(x, y INTEGER PRIMARY KEY);
+    INSERT INTO t5(x) VALUES('x'), ('y'), ('z');
+    DELETE FROM t5 WHERE x = 'y';
+    SELECT rowid, x FROM t5 ORDER BY rowid;
+    VACUUM;
+    SELECT rowid, x FROM t5 ORDER BY rowid;
+
+    CREATE TABLE t6(x, y, z);
+    INSERT INTO t6(x) VALUES('x'), ('y'), ('z');
+    UPDATE t6 SET y = x, z = rowid * 10;
+    DELETE FROM t6 WHERE x = 'y';
+    CREATE INDEX t6x ON t6(x);
+    CREATE UNIQUE INDEX t6y ON t6(y);
+    CREATE INDEX t6zxy ON t6(z, x, y);
+    SELECT rowid, x FROM t6 ORDER BY rowid;
+    VACUUM;
+    SELECT rowid, x FROM t6 ORDER BY rowid;
+    PRAGMA integrity_check;
+}
+expect {
+    1|x
+    3|z
+    1|x
+    2|z
+    1|x
+    3|z
+    1|x
+    3|z
+    1|x
+    3|z
+    1|x
+    3|z
+    ok
+}

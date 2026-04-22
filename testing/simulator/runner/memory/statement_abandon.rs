@@ -329,6 +329,48 @@ fn sim_vacuum_into_cleans_up_source_transaction() -> Result<()> {
     Ok(())
 }
 
+/// Verify that a completed plain VACUUM restores auto-commit and leaves the
+/// connection usable for new writes.
+#[test]
+fn sim_plain_vacuum_cleans_up_source_transaction() -> Result<()> {
+    let io = make_io(70);
+    let path = "sim_stmt_vacuum_reopen.db";
+    {
+        let conn = open_conn(io.clone(), path)?;
+        conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)")?;
+        let payload = "x".repeat(256);
+        for i in 0..400 {
+            conn.execute(format!("INSERT INTO t VALUES ({i}, '{payload}')"))?;
+        }
+        conn.execute("DELETE FROM t WHERE id % 5 = 0")?;
+    }
+
+    let conn = open_conn(io.clone(), path)?;
+    assert!(
+        conn.get_auto_commit(),
+        "should be in auto-commit before plain VACUUM"
+    );
+
+    let mut stmt = conn.prepare("VACUUM")?;
+    loop {
+        match stmt.step()? {
+            StepResult::IO => io.step()?,
+            StepResult::Done => break,
+            other => panic!("unexpected step result: {other:?}"),
+        }
+    }
+    drop(stmt);
+
+    assert!(
+        conn.get_auto_commit(),
+        "plain VACUUM should restore auto-commit after completion"
+    );
+    conn.execute("INSERT INTO t VALUES (999, 'after_vacuum')")?;
+    let count = query_count(&conn, io.as_ref())?;
+    assert_eq!(count, 321);
+    Ok(())
+}
+
 /// Abandoning VACUUM INTO while it is still running must roll back the manually
 /// owned source transaction.
 #[test]
@@ -376,5 +418,46 @@ fn sim_abandon_vacuum_into_cleans_up_source_transaction() -> Result<()> {
         count, 401,
         "should have 400 original rows + 1 new row after abandoned vacuum"
     );
+    Ok(())
+}
+
+/// Abandoning plain VACUUM while it is still running must roll back the
+/// manually owned source transaction.
+#[test]
+fn sim_abandon_plain_vacuum_cleans_up_source_transaction() -> Result<()> {
+    let io = make_io(71);
+    let path = "sim_stmt_abandon_plain_vacuum_reopen.db";
+    {
+        let conn = open_conn(io.clone(), path)?;
+        conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)")?;
+        let payload = "x".repeat(256);
+        for i in 0..400 {
+            conn.execute(format!("INSERT INTO t VALUES ({i}, '{payload}')"))?;
+        }
+        conn.execute("DELETE FROM t WHERE id % 5 = 0")?;
+    }
+
+    let conn = open_conn(io.clone(), path)?;
+    let mut stmt = conn.prepare("VACUUM")?;
+    let first = stmt.step()?;
+    assert!(
+        matches!(first, StepResult::IO),
+        "expected IO while plain VACUUM is running, got {first:?}"
+    );
+    assert!(
+        !conn.get_auto_commit(),
+        "plain VACUUM should own a source transaction while it is running"
+    );
+
+    drop(stmt);
+    io.step()?;
+
+    assert!(
+        conn.get_auto_commit(),
+        "plain VACUUM abandon cleanup should restore auto-commit"
+    );
+    conn.execute("INSERT INTO t VALUES (999, 'after_abandon')")?;
+    let count = query_count(&conn, io.as_ref())?;
+    assert_eq!(count, 321);
     Ok(())
 }
