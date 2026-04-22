@@ -1500,6 +1500,7 @@ def test_pragma_integrity_check(provider):
 
     conn.close()
 
+
 def test_encryption_enabled(tmp_path):
     tmp_path = tmp_path / "local.db"
     conn = turso.connect(
@@ -1584,3 +1585,127 @@ def test_encryption(tmp_path):
         cursor5 = conn5.cursor()
         cursor5.execute("select * from t")
         cursor5.fetchone()  # trigger actual data read to cause decryption error
+
+
+@pytest.mark.parametrize("provider", ["sqlite3", "turso"])
+def test_named_params_update_with_dict(provider):
+    conn = connect(provider, ":memory:")
+    cur = conn.cursor()
+    cur.execute("CREATE TABLE users(name TEXT, email TEXT)")
+    cur.execute("INSERT INTO users VALUES ('old', 'alice@example.com')")
+    cur.execute(
+        "UPDATE users SET name = :name WHERE email = :email",
+        {"name": "Alice", "email": "alice@example.com"},
+    )
+    cur.execute("SELECT name FROM users WHERE email = 'alice@example.com'")
+    assert cur.fetchone() == ("Alice",)
+    conn.close()
+
+
+@pytest.mark.parametrize("provider", ["sqlite3", "turso"])
+def test_named_params_reused_placeholder(provider):
+    conn = connect(provider, ":memory:")
+    cur = conn.cursor()
+    cur.execute("SELECT :x + :x", {"x": 7})
+    assert cur.fetchone() == (14,)
+    conn.close()
+
+
+@pytest.mark.parametrize("provider", ["sqlite3", "turso"])
+def test_named_params_extra_key_ignored(provider):
+    conn = connect(provider, ":memory:")
+    cur = conn.cursor()
+    cur.execute("SELECT :x", {"x": 1, "unused": 999})
+    assert cur.fetchone() == (1,)
+    conn.close()
+
+
+@pytest.mark.parametrize("provider", ["sqlite3", "turso"])
+def test_executemany_named_params_dicts(provider):
+    conn = connect(provider, ":memory:")
+    cur = conn.cursor()
+    cur.execute("CREATE TABLE users(name TEXT, age INTEGER)")
+    cur.executemany(
+        "INSERT INTO users(name, age) VALUES (:name, :age)",
+        [
+            {"name": "alice", "age": 31},
+            {"name": "bob", "age": 29},
+        ],
+    )
+    cur.execute("SELECT name, age FROM users ORDER BY age DESC")
+    assert cur.fetchall() == [("alice", 31), ("bob", 29)]
+    conn.close()
+
+
+@pytest.mark.parametrize("provider", ["sqlite3", "turso"])
+def test_named_params_dict_with_indexed_qmark_is_allowed(provider):
+    conn = connect(provider, ":memory:")
+    cur = conn.cursor()
+    cur.execute("SELECT ?1 + :x", {"1": 2, "x": 3})
+    assert cur.fetchone() == (5,)
+    conn.close()
+
+
+@pytest.mark.parametrize("provider", ["sqlite3", "turso"])
+def test_named_params_at_and_dollar_styles(provider):
+    conn = connect(provider, ":memory:")
+    cur = conn.cursor()
+    cur.execute("SELECT @x", {"x": 11})
+    assert cur.fetchone() == (11,)
+    cur.execute("SELECT $x", {"x": 12})
+    assert cur.fetchone() == (12,)
+    conn.close()
+
+
+@pytest.mark.parametrize("provider", ["sqlite3", "turso"])
+def test_named_params_non_string_key_is_ignored(provider):
+    conn = connect(provider, ":memory:")
+    cur = conn.cursor()
+    cur.execute("SELECT :x", {1: "ignored", "x": 7})
+    assert cur.fetchone() == (7,)
+    conn.close()
+
+
+@pytest.mark.parametrize("provider", ["sqlite3", "turso"])
+def test_named_params_prefixed_key_currently_allowed_difference(provider):
+    conn = connect(provider, ":memory:")
+    cur = conn.cursor()
+    if provider == "sqlite3":
+        # sqlite3 expects unprefixed mapping keys and raises here.
+        with pytest.raises(Exception):
+            cur.execute("SELECT :x", {":x": 1})
+    else:
+        # NOTE: Turso currently allows this path and returns NULL instead of raising.
+        cur.execute("SELECT :x", {":x": 1})
+        assert cur.fetchone() == (None,)
+    conn.close()
+
+
+@pytest.mark.parametrize("provider", ["sqlite3", "turso"])
+def test_named_params_plain_qmark_mapping_currently_allowed_difference(provider):
+    conn = connect(provider, ":memory:")
+    cur = conn.cursor()
+    if provider == "sqlite3":
+        # sqlite3 raises: plain '?' is positional and mapping should fail.
+        with pytest.raises(Exception):
+            cur.execute("SELECT ?", {"x": 1})
+    else:
+        # NOTE: Turso currently allows this and leaves the parameter as NULL.
+        cur.execute("SELECT ?", {"x": 1})
+        assert cur.fetchone() == (None,)
+    conn.close()
+
+
+@pytest.mark.parametrize("provider", ["sqlite3", "turso"])
+def test_named_params_missing_indexed_qmark_currently_allowed_difference(provider):
+    conn = connect(provider, ":memory:")
+    cur = conn.cursor()
+    if provider == "sqlite3":
+        # sqlite3 raises when a required indexed parameter is not supplied.
+        with pytest.raises(Exception):
+            cur.execute("SELECT ?1, ?2", {"1": "ONE"})
+    else:
+        # NOTE: Turso currently allows partial binding and keeps missing values as NULL.
+        cur.execute("SELECT ?1, ?2", {"1": "ONE"})
+        assert cur.fetchone() == ("ONE", None)
+    conn.close()
