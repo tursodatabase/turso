@@ -548,10 +548,8 @@ pub(crate) fn vacuum_target_build_step(
                 state.target_conn.execute("BEGIN IMMEDIATE")?;
 
                 // Query sqlite_schema with rootpage, ordered by rowid.
-                // Decide whether schema replay should include the internal MVCC metadata table.
-                // VACUUM INTO excludes it because an MVCC destination bootstraps that table
-                // itself. In-place VACUUM includes it because the temp image is the future
-                // physical source database and must preserve the table as-is.
+                // VACUUM INTO recreates MVCC metadata in the destination; in-place
+                // VACUUM preserves the source metadata table in the physical image.
                 let escaped_schema_name = &config.escaped_schema_name;
                 let schema_sql = if config.copy_mvcc_metadata_table {
                     format!(
