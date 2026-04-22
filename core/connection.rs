@@ -3097,6 +3097,39 @@ impl Connection {
         self.set_tx_state(TransactionState::None);
     }
 
+    /// Roll back transaction state for helpers that start a manual `BEGIN`
+    /// outside the normal Transaction opcode path.
+    ///
+    /// Unlike `rollback_current_txn_state`, this tolerates the attached-only
+    /// case where the connection flipped `auto_commit` off but never opened a
+    /// main-db read transaction.
+    pub(crate) fn rollback_manual_txn_cleanup(
+        &self,
+        pager: &Arc<Pager>,
+        clear_attached_schemas: bool,
+    ) {
+        let main_has_implicit_state = self.get_tx_state() != TransactionState::None
+            || self.get_mv_tx().is_some()
+            || pager.holds_read_lock()
+            || pager.holds_write_lock();
+
+        if main_has_implicit_state {
+            self.rollback_current_txn_state(pager, clear_attached_schemas);
+        } else {
+            if self.next_attached_mv_tx().is_some() {
+                self.rollback_attached_mvcc_txs(clear_attached_schemas);
+            }
+            self.rollback_attached_wal_txns();
+            self.set_tx_state(TransactionState::None);
+            self.auto_commit.store(true, Ordering::SeqCst);
+        }
+
+        self.rollback_temp_schema();
+        self.set_cdc_transaction_id(-1);
+        self.clear_named_savepoints();
+        self.clear_deferred_foreign_key_violations();
+    }
+
     /// Iterate over all attached MVCC transactions, calling `f(db_id, tx_id)` for each.
     pub(crate) fn for_each_attached_mv_tx(&self, mut f: impl FnMut(usize, u64)) {
         let txs = self.attached_mv_txs.read();
