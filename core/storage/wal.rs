@@ -6045,6 +6045,51 @@ pub mod test {
         }
     }
 
+    #[test]
+    fn read_frames_batch_accepts_exact_size_scratch_buffer() {
+        let page_size = 512;
+        let (io, buffer_pool, wal) = make_initialized_memory_wal(page_size);
+        let source_pages = vec![
+            page_with_pattern(40, 0x40, &buffer_pool),
+            page_with_pattern(41, 0x41, &buffer_pool),
+        ];
+        let expected = append_test_pages(&io, &wal, page_size, &source_pages);
+
+        let target_pages = vec![
+            Arc::new(crate::Page::new(40)),
+            Arc::new(crate::Page::new(41)),
+        ];
+        let scratch_len = (crate::storage::sqlite3_ondisk::WAL_FRAME_HEADER_SIZE
+            + page_size as usize)
+            * target_pages.len();
+        let scratch = Arc::new(Buffer::new_temporary(scratch_len));
+        let c = wal
+            .read_frames_batch(1, &target_pages, buffer_pool, Some(scratch))
+            .unwrap();
+        io.wait_for_completion(c).unwrap();
+
+        for (idx, page) in target_pages.iter().enumerate() {
+            assert!(page.is_loaded(), "page {} should be loaded", page.get().id);
+            assert_eq!(page.get_contents().as_ptr(), expected[idx].as_slice());
+        }
+    }
+
+    #[test]
+    #[should_panic(
+        expected = "read_frames_batch scratch_buf size must match expected pread length"
+    )]
+    fn read_frames_batch_rejects_wrong_size_scratch_buffer() {
+        let page_size = 512;
+        let (_io, buffer_pool, wal) = make_initialized_memory_wal(page_size);
+        let target_pages = vec![
+            Arc::new(crate::Page::new(50)),
+            Arc::new(crate::Page::new(51)),
+        ];
+        let wrong_size = crate::storage::sqlite3_ondisk::WAL_FRAME_HEADER_SIZE + page_size as usize;
+        let scratch = Arc::new(Buffer::new_temporary(wrong_size));
+        let _ = wal.read_frames_batch(1, &target_pages, buffer_pool, Some(scratch));
+    }
+
     fn set_shared_snapshot(shared: &Arc<RwLock<WalFileShared>>, snapshot: WalSnapshot) {
         let mut guard = shared.write();
         guard

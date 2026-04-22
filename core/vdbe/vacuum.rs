@@ -2588,6 +2588,28 @@ mod tests {
     }
 
     #[test]
+    fn coalesce_frame_runs_handles_frame_gaps_larger_than_u32() {
+        let runs = coalesce_frame_runs(vec![
+            (page_ref(1), 1),
+            (page_ref(2), 2),
+            (page_ref(3), u32::MAX as u64 + 10),
+            (page_ref(4), u32::MAX as u64 + 11),
+        ]);
+
+        assert_eq!(runs.len(), 2);
+        assert_eq!(runs[0].0, 1);
+        assert_eq!(
+            runs[0].1.iter().map(|p| p.get().id).collect::<Vec<_>>(),
+            vec![1, 2]
+        );
+        assert_eq!(runs[1].0, u32::MAX as u64 + 10);
+        assert_eq!(
+            runs[1].1.iter().map(|p| p.get().id).collect::<Vec<_>>(),
+            vec![3, 4]
+        );
+    }
+
+    #[test]
     fn vacuum_copy_batch_ranges_cover_boundary_page_counts() {
         let size = VACUUM_COPY_BATCH_SIZE;
         assert!(vacuum_copy_batch_ranges(0).is_empty());
@@ -2611,6 +2633,17 @@ mod tests {
                 (size * 2 + 1, size * 2 + 2),
             ]
         );
+    }
+
+    #[test]
+    fn vacuum_copy_batch_end_accepts_u32_max_minus_one_total_pages() {
+        assert_eq!(vacuum_copy_batch_end(u32::MAX - 1, u32::MAX - 1), u32::MAX);
+    }
+
+    #[test]
+    #[should_panic(expected = "vacuum copy batch requires a representable exclusive end page")]
+    fn vacuum_copy_batch_end_panics_when_total_pages_is_u32_max() {
+        let _ = vacuum_copy_batch_end(1, u32::MAX);
     }
 
     #[test]
@@ -2877,6 +2910,18 @@ mod tests {
         );
 
         Ok(())
+    }
+
+    #[test]
+    fn vacuum_db_header_meta_preserves_non_utf8_text_encoding() {
+        let mut source = DatabaseHeader::default();
+        source.text_encoding = TextEncoding::Utf16Le;
+
+        let header_meta = VacuumDbHeaderMeta::from_source_header(&source);
+        let mut target = DatabaseHeader::default();
+        header_meta.apply_to(&mut target);
+
+        assert_eq!(target.text_encoding, TextEncoding::Utf16Le);
     }
 
     #[cfg(not(target_family = "wasm"))]

@@ -234,6 +234,27 @@ fn truncate_checkpoint_until_stable(whopper: &mut MultiprocessWhopper, connectio
 }
 
 #[cfg(all(any(unix, target_os = "windows"), target_pointer_width = "64"))]
+fn plain_vacuum_until_stable(whopper: &mut MultiprocessWhopper, connection_idx: usize) {
+    for _ in 0..32 {
+        let result = whopper
+            .execute_sql_direct(connection_idx, "VACUUM")
+            .expect("run plain VACUUM");
+        match result {
+            Ok(_) => return,
+            Err(
+                LimboError::Busy
+                | LimboError::BusySnapshot
+                | LimboError::SchemaUpdated
+                | LimboError::SchemaConflict
+                | LimboError::TableLocked,
+            ) => continue,
+            Err(err) => panic!("plain VACUUM should stabilize: {err}"),
+        }
+    }
+    panic!("plain VACUUM did not stabilize after transient multiprocess errors");
+}
+
+#[cfg(all(any(unix, target_os = "windows"), target_pointer_width = "64"))]
 fn assert_integrity_check_ok(whopper: &mut MultiprocessWhopper, worker_idx: usize) {
     let rows = whopper
         .execute_sql_direct(worker_idx, "PRAGMA integrity_check")
@@ -363,6 +384,118 @@ fn multiprocess_same_process_sibling_reader_keeps_shared_snapshot_live_until_las
         2,
         "writer process should observe both committed rows after the shared reader snapshot is released",
     );
+
+    whopper.finalize().expect("finalize multiprocess whopper");
+}
+
+#[cfg(all(unix, target_pointer_width = "64"))]
+#[ignore = "multiprocess plain VACUUM currently panics with writer registry underflow"]
+#[test]
+fn multiprocess_plain_vacuum_round_trips_data() {
+    let mut whopper = create_multiprocess_whopper_with_shape(2, 1);
+
+    for connection_idx in 0..2 {
+        whopper
+            .disable_auto_checkpoint_direct(connection_idx)
+            .expect("disable auto checkpoint");
+    }
+
+    whopper
+        .execute_sql_direct(
+            0,
+            "create table test(id integer primary key, value text not null)",
+        )
+        .expect("create table")
+        .expect("create table should succeed");
+    for i in 0..160 {
+        whopper
+            .execute_sql_direct(
+                0,
+                format!("insert into test values ({i}, '{}')", "x".repeat(220)),
+            )
+            .expect("insert row")
+            .expect("insert should succeed");
+    }
+    whopper
+        .execute_sql_direct(0, "delete from test where id % 4 = 0")
+        .expect("delete rows")
+        .expect("delete should succeed");
+
+    plain_vacuum_until_stable(&mut whopper, 0);
+
+    assert_eq!(
+        count_test_rows(&mut whopper, 0),
+        120,
+        "VACUUM should preserve visible rows in multiprocess WAL mode"
+    );
+    assert_eq!(
+        count_test_rows(&mut whopper, 1),
+        120,
+        "other processes should observe the vacuumed image in multiprocess WAL mode"
+    );
+    assert_integrity_check_ok(&mut whopper, 0);
+    assert_integrity_check_ok(&mut whopper, 1);
+
+    whopper.finalize().expect("finalize multiprocess whopper");
+}
+
+#[cfg(all(unix, target_pointer_width = "64"))]
+#[ignore = "multiprocess plain VACUUM currently panics with writer registry underflow"]
+#[test]
+fn multiprocess_plain_vacuum_returns_busy_with_active_reader() {
+    let mut whopper = create_multiprocess_whopper_with_shape(2, 1);
+
+    for connection_idx in 0..2 {
+        whopper
+            .disable_auto_checkpoint_direct(connection_idx)
+            .expect("disable auto checkpoint");
+    }
+
+    whopper
+        .execute_sql_direct(
+            0,
+            "create table test(id integer primary key, value text not null)",
+        )
+        .expect("create table")
+        .expect("create table should succeed");
+    for i in 0..120 {
+        whopper
+            .execute_sql_direct(
+                0,
+                format!("insert into test values ({i}, '{}')", "y".repeat(200)),
+            )
+            .expect("insert row")
+            .expect("insert should succeed");
+    }
+    whopper
+        .execute_sql_direct(0, "delete from test where id >= 20")
+        .expect("delete rows")
+        .expect("delete should succeed");
+
+    whopper
+        .execute_sql_direct(1, "begin")
+        .expect("begin reader")
+        .expect("reader begin should succeed");
+    assert_eq!(count_test_rows(&mut whopper, 1), 20);
+
+    let vacuum_result = whopper
+        .execute_sql_direct(0, "VACUUM")
+        .expect("run VACUUM with active reader");
+    assert!(
+        matches!(
+            vacuum_result,
+            Err(LimboError::Busy | LimboError::BusySnapshot)
+        ),
+        "multiprocess VACUUM should fail while another process holds a read snapshot, got {vacuum_result:?}"
+    );
+
+    whopper
+        .execute_sql_direct(1, "rollback")
+        .expect("rollback reader")
+        .expect("reader rollback should succeed");
+    plain_vacuum_until_stable(&mut whopper, 0);
+    assert_eq!(count_test_rows(&mut whopper, 0), 20);
+    assert_integrity_check_ok(&mut whopper, 0);
 
     whopper.finalize().expect("finalize multiprocess whopper");
 }

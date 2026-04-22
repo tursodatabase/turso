@@ -92,6 +92,8 @@ fn extract_path_from_expr(expr: &Expr) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{Database, DatabaseOpts, MemoryIO, OpenFlags};
+    use std::sync::Arc;
 
     #[test]
     fn test_extract_path_from_string_literal() {
@@ -118,5 +120,54 @@ mod tests {
     fn test_extract_path_empty_fails() {
         let expr = Expr::Literal(Literal::String("''".to_string()));
         assert!(extract_path_from_expr(&expr).is_err());
+    }
+
+    fn test_connection(opts: DatabaseOpts) -> Arc<Connection> {
+        let io = Arc::new(MemoryIO::new());
+        let db =
+            Database::open_file_with_flags(io, ":memory:", OpenFlags::Create, opts, None).unwrap();
+        db.connect().unwrap()
+    }
+
+    fn test_program() -> ProgramBuilder {
+        ProgramBuilder::new(
+            crate::QueryMode::Normal,
+            None,
+            crate::vdbe::builder::ProgramBuilderOpts::new(0, 8, 2),
+        )
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    fn debug_build_plain_vacuum_does_not_require_feature_flag() {
+        let conn = test_connection(DatabaseOpts::new().with_vacuum(false));
+        let mut program = test_program();
+
+        translate_vacuum(&mut program, None, None, conn)
+            .expect("debug/test builds should translate plain VACUUM without a feature flag");
+    }
+
+    #[cfg(not(debug_assertions))]
+    #[test]
+    fn release_build_plain_vacuum_requires_feature_flag() {
+        let conn = test_connection(DatabaseOpts::new().with_vacuum(false));
+        let mut program = test_program();
+
+        let err = translate_vacuum(&mut program, None, None, conn).unwrap_err();
+        assert!(
+            err.to_string().contains("experimental feature"),
+            "unexpected release-gate error: {err}"
+        );
+    }
+
+    #[cfg(not(debug_assertions))]
+    #[test]
+    fn release_build_plain_vacuum_translates_with_feature_flag() {
+        let conn = test_connection(DatabaseOpts::new().with_vacuum(true));
+        let mut program = test_program();
+
+        translate_vacuum(&mut program, None, None, conn).expect(
+            "release builds should translate plain VACUUM when the feature flag is enabled",
+        );
     }
 }

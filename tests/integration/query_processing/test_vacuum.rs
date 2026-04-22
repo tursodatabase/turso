@@ -45,6 +45,12 @@ fn scalar_i64(conn: &Arc<Connection>, sql: &str) -> i64 {
     rows[0].0
 }
 
+fn scalar_string(conn: &Arc<Connection>, sql: &str) -> String {
+    let rows: Vec<(String,)> = conn.exec_rows(sql);
+    assert_eq!(rows.len(), 1, "expected one row for {sql}");
+    rows[0].0.clone()
+}
+
 fn explain_opcodes(conn: &Arc<Connection>, sql: &str) -> Vec<String> {
     limbo_exec_rows(conn, &format!("EXPLAIN {sql}"))
         .into_iter()
@@ -53,6 +59,16 @@ fn explain_opcodes(conn: &Arc<Connection>, sql: &str) -> Vec<String> {
             other => panic!("expected opcode text in EXPLAIN output, got {other:?}"),
         })
         .collect()
+}
+
+fn step_stmt_until_terminal(stmt: &mut turso_core::Statement) -> turso_core::Result<StepResult> {
+    loop {
+        match stmt.step()? {
+            StepResult::IO => stmt.get_pager().io.step()?,
+            StepResult::Row => continue,
+            terminal => return Ok(terminal),
+        }
+    }
 }
 
 fn wal_file_size(tmp_db: &TempDatabase) -> u64 {
@@ -4228,6 +4244,41 @@ fn test_plain_vacuum_preserves_metadata(tmp_db: TempDatabase) -> anyhow::Result<
     Ok(())
 }
 
+#[ignore = "opening UTF-16 databases is not supported by the current integration harness; covered by vacuum header-meta unit tests instead"]
+#[test]
+fn test_plain_vacuum_preserves_utf16_text_encoding() -> anyhow::Result<()> {
+    let temp_dir = TempDir::new()?;
+    let db_path = temp_dir.path().join("utf16-vacuum.db");
+
+    let sqlite = SqliteConnection::open(&db_path)?;
+    sqlite.pragma_update(None, "encoding", "UTF-16le")?;
+    sqlite.pragma_update(None, "journal_mode", "wal")?;
+    sqlite.execute(
+        "CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT NOT NULL, n INTEGER)",
+        (),
+    )?;
+    sqlite.execute("INSERT INTO t VALUES (1, 'alpha', 10), (2, 'beta', 20)", ())?;
+    sqlite.execute("DELETE FROM t WHERE id = 2", ())?;
+    drop(sqlite);
+
+    let tmp_db = TempDatabase::new_with_existent(&db_path);
+    let conn = tmp_db.connect_limbo();
+    assert_eq!(scalar_string(&conn, "PRAGMA encoding"), "UTF-16le");
+
+    conn.execute("VACUUM")?;
+
+    assert_eq!(scalar_string(&conn, "PRAGMA encoding"), "UTF-16le");
+    let rows: Vec<(i64, String, i64)> = conn.exec_rows("SELECT id, v, n FROM t ORDER BY id");
+    assert_eq!(rows, vec![(1, "alpha".to_string(), 10)]);
+    assert_eq!(run_integrity_check(&conn), "ok");
+
+    let reopened = TempDatabase::new_with_existent(&db_path);
+    let reopened_conn = reopened.connect_limbo();
+    assert_eq!(scalar_string(&reopened_conn, "PRAGMA encoding"), "UTF-16le");
+    assert_eq!(run_integrity_check(&reopened_conn), "ok");
+    Ok(())
+}
+
 /// Plain VACUUM preserves AUTOINCREMENT counters.
 #[cfg_attr(feature = "checksum", ignore)]
 #[turso_macros::test(init_sql = "CREATE TABLE t1(a INTEGER PRIMARY KEY AUTOINCREMENT, b TEXT);")]
@@ -4293,6 +4344,63 @@ fn test_plain_vacuum_preserves_views(tmp_db: TempDatabase) -> anyhow::Result<()>
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0], (3, "three".into()));
 
+    Ok(())
+}
+
+#[test]
+fn test_plain_vacuum_preserves_strict_composite_pk() -> anyhow::Result<()> {
+    let tmp_db = TempDatabase::new_empty();
+    let conn = tmp_db.connect_limbo();
+
+    conn.execute(
+        "CREATE TABLE ledger(
+            account TEXT,
+            seq INTEGER,
+            amount INTEGER,
+            note TEXT,
+            PRIMARY KEY(account, seq)
+        ) STRICT",
+    )?;
+    conn.execute(
+        "INSERT INTO ledger VALUES
+            ('acct-a', 1, 100, 'first'),
+            ('acct-a', 2, 250, 'second'),
+            ('acct-b', 1, 75, 'third')",
+    )?;
+    conn.execute("DELETE FROM ledger WHERE account = 'acct-a' AND seq = 1")?;
+
+    let before_rows: Vec<(String, i64, i64, String)> =
+        conn.exec_rows("SELECT account, seq, amount, note FROM ledger ORDER BY account, seq");
+    assert_eq!(
+        before_rows,
+        vec![
+            ("acct-a".to_string(), 2, 250, "second".to_string()),
+            ("acct-b".to_string(), 1, 75, "third".to_string()),
+        ]
+    );
+
+    conn.execute("VACUUM")?;
+
+    let schema_sql: Vec<(String,)> =
+        conn.exec_rows("SELECT sql FROM sqlite_schema WHERE name = 'ledger'");
+    assert_eq!(schema_sql.len(), 1);
+    assert!(schema_sql[0].0.contains("STRICT"));
+    let after_rows: Vec<(String, i64, i64, String)> =
+        conn.exec_rows("SELECT account, seq, amount, note FROM ledger ORDER BY account, seq");
+    assert_eq!(after_rows, before_rows);
+    let err = conn
+        .execute("INSERT INTO ledger VALUES('acct-z', 9, 'bad', 'type mismatch')")
+        .expect_err("STRICT table should still reject incorrect types after VACUUM");
+    assert!(
+        err.to_string().contains("cannot store")
+            || err.to_string().contains("ledger.amount")
+            || err.to_string().contains("datatype mismatch")
+            || err.to_string().contains("STRICT")
+            || err.to_string().contains("type"),
+        "unexpected STRICT error: {err}"
+    );
+    assert_eq!(run_integrity_check(&conn), "ok");
+    assert_plain_vacuum_folded_into_db_file(&tmp_db, &conn);
     Ok(())
 }
 
@@ -4386,6 +4494,61 @@ fn test_plain_vacuum_repeated(tmp_db: TempDatabase) -> anyhow::Result<()> {
     assert_eq!(rows[0], (1, "one".into()));
     assert_eq!(rows[1], (3, "three".into()));
 
+    assert_eq!(run_integrity_check(&conn), "ok");
+    Ok(())
+}
+
+#[cfg_attr(feature = "checksum", ignore)]
+#[turso_macros::test(init_sql = "CREATE TABLE t(a INTEGER PRIMARY KEY, b TEXT);")]
+fn test_plain_vacuum_prepared_statement_can_be_reset_and_reused(
+    tmp_db: TempDatabase,
+) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+    conn.execute("INSERT INTO t VALUES(1, 'one'), (2, 'two'), (3, 'three')")?;
+    conn.execute("DELETE FROM t WHERE a = 2")?;
+
+    let mut stmt = conn.prepare("VACUUM")?;
+    assert!(matches!(
+        step_stmt_until_terminal(&mut stmt)?,
+        StepResult::Done
+    ));
+
+    conn.execute("INSERT INTO t VALUES(4, 'four')")?;
+    conn.execute("DELETE FROM t WHERE a = 1")?;
+    stmt.reset()?;
+    assert!(matches!(
+        step_stmt_until_terminal(&mut stmt)?,
+        StepResult::Done
+    ));
+
+    let rows: Vec<(i64, String)> = conn.exec_rows("SELECT a, b FROM t ORDER BY a");
+    assert_eq!(rows, vec![(3, "three".into()), (4, "four".into())]);
+    assert_eq!(run_integrity_check(&conn), "ok");
+    Ok(())
+}
+
+#[cfg_attr(feature = "checksum", ignore)]
+#[turso_macros::test(init_sql = "CREATE TABLE t(a INTEGER PRIMARY KEY, b TEXT);")]
+fn test_plain_vacuum_execute_batch_runs_multiple_statements(
+    tmp_db: TempDatabase,
+) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+    for i in 0..120 {
+        conn.execute(format!(
+            "INSERT INTO t VALUES({i}, '{}')",
+            "batch".repeat(40)
+        ))?;
+    }
+    conn.execute("DELETE FROM t WHERE a >= 20")?;
+    let pre_pages = scalar_i64(&conn, "PRAGMA page_count");
+
+    conn.execute("VACUUM; VACUUM;")?;
+
+    assert_eq!(scalar_i64(&conn, "SELECT COUNT(*) FROM t"), 20);
+    assert!(
+        scalar_i64(&conn, "PRAGMA page_count") <= pre_pages,
+        "batched execute should not skip either VACUUM statement"
+    );
     assert_eq!(run_integrity_check(&conn), "ok");
     Ok(())
 }
@@ -4696,6 +4859,118 @@ fn test_plain_vacuum_reduces_page_count(tmp_db: TempDatabase) -> anyhow::Result<
     Ok(())
 }
 
+#[cfg_attr(feature = "checksum", ignore)]
+#[test]
+fn test_plain_vacuum_matches_sqlite_reference_for_compacted_output() -> anyhow::Result<()> {
+    let temp_dir = TempDir::new()?;
+    let turso_path = temp_dir.path().join("plain-vacuum-turso.db");
+    let sqlite_path = temp_dir.path().join("plain-vacuum-sqlite.db");
+
+    let sql = [
+        "PRAGMA page_size = 1024",
+        "CREATE TABLE docs(id INTEGER PRIMARY KEY, category TEXT, payload TEXT, score INTEGER)",
+        "CREATE INDEX idx_docs_category_score ON docs(category, score)",
+        "CREATE INDEX idx_docs_payload_partial ON docs(payload) WHERE score >= 50",
+        "INSERT INTO docs VALUES (1, 'a', 'alpha', 10)",
+        "INSERT INTO docs VALUES (2, 'a', 'beta', 80)",
+        "INSERT INTO docs VALUES (3, 'b', 'gamma', 75)",
+        "INSERT INTO docs VALUES (4, 'b', 'delta', 20)",
+        "INSERT INTO docs VALUES (5, 'c', 'epsilon', 95)",
+        "DELETE FROM docs WHERE id IN (1, 4)",
+        "CREATE TABLE notes(id INTEGER PRIMARY KEY, body TEXT)",
+        "INSERT INTO notes VALUES (1, 'n1'), (2, 'n2'), (3, 'n3')",
+        "DELETE FROM notes WHERE id = 2",
+    ];
+
+    let sqlite = SqliteConnection::open(&sqlite_path)?;
+    for stmt in sql {
+        sqlite.execute(stmt, ())?;
+    }
+    sqlite.execute_batch("VACUUM")?;
+    drop(sqlite);
+
+    let tmp_db = TempDatabase::builder().with_db_path(&turso_path).build();
+    let conn = tmp_db.connect_limbo();
+    for stmt in sql {
+        conn.execute(stmt)?;
+    }
+    conn.execute("VACUUM")?;
+    assert_eq!(run_integrity_check(&conn), "ok");
+
+    let normalize_sql = |sql: &str| {
+        sql.chars()
+            .filter(|ch| !ch.is_whitespace())
+            .collect::<String>()
+    };
+    let turso_schema: Vec<(String, String, String)> = conn.exec_rows(
+        "SELECT type, name, COALESCE(sql, '') FROM sqlite_schema
+         WHERE type IN ('table', 'index')
+         ORDER BY type, name",
+    );
+    let sqlite = SqliteConnection::open(&sqlite_path)?;
+    let sqlite_schema = crate::common::sqlite_exec_rows(
+        &sqlite,
+        "SELECT type, name, COALESCE(sql, '') FROM sqlite_schema
+         WHERE type IN ('table', 'index')
+         ORDER BY type, name",
+    )
+    .into_iter()
+    .map(|row| match row.as_slice() {
+        [
+            rusqlite::types::Value::Text(ty),
+            rusqlite::types::Value::Text(name),
+            rusqlite::types::Value::Text(sql),
+        ] => (ty.clone(), name.clone(), sql.clone()),
+        other => panic!("unexpected sqlite_schema row: {other:?}"),
+    })
+    .collect::<Vec<_>>();
+    let turso_schema = turso_schema
+        .into_iter()
+        .map(|(ty, name, sql)| (ty, name, normalize_sql(&sql)))
+        .collect::<Vec<_>>();
+    let sqlite_schema = sqlite_schema
+        .into_iter()
+        .map(|(ty, name, sql)| (ty, name, normalize_sql(&sql)))
+        .collect::<Vec<_>>();
+    assert_eq!(turso_schema, sqlite_schema);
+
+    let turso_docs: Vec<(i64, String, String, i64)> =
+        conn.exec_rows("SELECT id, category, payload, score FROM docs ORDER BY id");
+    let sqlite_docs = crate::common::sqlite_exec_rows(
+        &sqlite,
+        "SELECT id, category, payload, score FROM docs ORDER BY id",
+    )
+    .into_iter()
+    .map(|row| match row.as_slice() {
+        [
+            rusqlite::types::Value::Integer(id),
+            rusqlite::types::Value::Text(category),
+            rusqlite::types::Value::Text(payload),
+            rusqlite::types::Value::Integer(score),
+        ] => (*id, category.clone(), payload.clone(), *score),
+        other => panic!("unexpected docs row: {other:?}"),
+    })
+    .collect::<Vec<_>>();
+    assert_eq!(turso_docs, sqlite_docs);
+
+    let turso_notes: Vec<(i64, String)> = conn.exec_rows("SELECT id, body FROM notes ORDER BY id");
+    let sqlite_notes =
+        crate::common::sqlite_exec_rows(&sqlite, "SELECT id, body FROM notes ORDER BY id")
+            .into_iter()
+            .map(|row| match row.as_slice() {
+                [rusqlite::types::Value::Integer(id), rusqlite::types::Value::Text(body)] => {
+                    (*id, body.clone())
+                }
+                other => panic!("unexpected notes row: {other:?}"),
+            })
+            .collect::<Vec<_>>();
+    assert_eq!(turso_notes, sqlite_notes);
+
+    let sqlite_page_count: i64 = sqlite.pragma_query_value(None, "page_count", |row| row.get(0))?;
+    assert_eq!(scalar_i64(&conn, "PRAGMA page_count"), sqlite_page_count);
+    Ok(())
+}
+
 /// Plain VACUUM copy-back batch boundaries. The core unit tests assert the
 /// exact range math; this integration test builds compacted images around the
 /// 64-page boundary so the read/write batch state machine crosses one-page,
@@ -4900,6 +5175,34 @@ fn test_plain_vacuum_page_size_variants_fold_and_integrity() -> anyhow::Result<(
     Ok(())
 }
 
+#[cfg_attr(feature = "checksum", ignore)]
+#[test]
+fn test_plain_vacuum_documented_page_size_pragma_behavior() -> anyhow::Result<()> {
+    let tmp_db = TempDatabase::new_empty();
+    let conn = tmp_db.connect_limbo();
+
+    conn.execute("PRAGMA page_size = 1024")?;
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, payload TEXT)")?;
+    for i in 0..120 {
+        conn.execute(format!("INSERT INTO t VALUES({i}, '{}')", "p".repeat(180)))?;
+    }
+    conn.execute("DELETE FROM t WHERE id % 4 = 0")?;
+    assert_eq!(scalar_i64(&conn, "PRAGMA page_size"), 1024);
+
+    conn.execute("PRAGMA page_size = 4096")?;
+    conn.execute("VACUUM")?;
+
+    assert_eq!(
+        scalar_i64(&conn, "PRAGMA page_size"),
+        1024,
+        "plain VACUUM currently keeps the source pager page size instead of applying a pending PRAGMA page_size change"
+    );
+    assert_eq!(scalar_i64(&conn, "SELECT COUNT(*) FROM t"), 90);
+    assert_eq!(run_integrity_check(&conn), "ok");
+    assert_plain_vacuum_folded_into_db_file(&tmp_db, &conn);
+    Ok(())
+}
+
 /// Stress the storage shapes that make batched VACUUM risky: overflow chains,
 /// freelist pages, table and index b-trees, triggers, views, and a second
 /// primary-key table all in one compacted image.
@@ -4987,6 +5290,80 @@ fn test_plain_vacuum_complex_batched_storage_shapes() -> anyhow::Result<()> {
     Ok(())
 }
 
+#[cfg_attr(feature = "checksum", ignore)]
+#[test]
+fn test_plain_vacuum_preserves_partial_and_expression_indexes() -> anyhow::Result<()> {
+    let tmp_db = TempDatabase::new_empty();
+    let conn = tmp_db.connect_limbo();
+
+    conn.execute(
+        "CREATE TABLE products(
+            id INTEGER PRIMARY KEY,
+            name TEXT NOT NULL,
+            category TEXT NOT NULL,
+            stock INTEGER NOT NULL,
+            discontinued INTEGER NOT NULL,
+            price REAL NOT NULL
+        )",
+    )?;
+    conn.execute("CREATE UNIQUE INDEX idx_products_name ON products(name)")?;
+    conn.execute(
+        "CREATE INDEX idx_products_active_stock ON products(category, stock)
+         WHERE discontinued = 0 AND stock > 0",
+    )?;
+    conn.execute("CREATE INDEX idx_products_name_lower ON products(lower(name))")?;
+
+    conn.execute(
+        "INSERT INTO products VALUES
+            (1, 'Apple', 'fruit', 10, 0, 1.5),
+            (2, 'Banana', 'fruit', 0, 0, 2.0),
+            (3, 'Carrot', 'vegetable', 8, 0, 0.8),
+            (4, 'Desk', 'furniture', 3, 1, 80.0),
+            (5, 'Eggplant', 'vegetable', 5, 0, 3.1)",
+    )?;
+
+    conn.execute("VACUUM")?;
+
+    let index_defs: Vec<(String, String)> = conn.exec_rows(
+        "SELECT name, sql FROM sqlite_schema WHERE type = 'index' AND tbl_name = 'products' ORDER BY name",
+    );
+    assert_eq!(index_defs.len(), 3);
+    assert!(index_defs
+        .iter()
+        .any(|(name, sql)| name == "idx_products_active_stock" && sql.contains("WHERE")));
+    assert!(index_defs
+        .iter()
+        .any(|(name, _)| name == "idx_products_name_lower"));
+
+    let partial_rows: Vec<(i64,)> = conn.exec_rows(
+        "SELECT id FROM products
+         WHERE discontinued = 0 AND stock > 0 AND category = 'vegetable'
+         ORDER BY id",
+    );
+    assert_eq!(partial_rows, vec![(3,), (5,)]);
+    let partial_scan: Vec<(i64,)> = conn.exec_rows(
+        "SELECT id FROM products NOT INDEXED
+         WHERE discontinued = 0 AND stock > 0 AND category = 'vegetable'
+         ORDER BY id",
+    );
+    assert_eq!(partial_rows, partial_scan);
+
+    let eqp_expr: Vec<(i64, i64, i64, String)> =
+        conn.exec_rows("EXPLAIN QUERY PLAN SELECT id FROM products WHERE lower(name) = 'apple'");
+    assert!(
+        eqp_expr
+            .iter()
+            .any(|(_, _, _, detail)| detail.contains("idx_products_name_lower")),
+        "expression-index lookup should use the preserved index, got {eqp_expr:?}",
+    );
+    let expr_rows: Vec<(i64,)> =
+        conn.exec_rows("SELECT id FROM products WHERE lower(name) = 'apple'");
+    assert_eq!(expr_rows, vec![(1,)]);
+    assert_eq!(run_integrity_check(&conn), "ok");
+    assert_plain_vacuum_folded_into_db_file(&tmp_db, &conn);
+    Ok(())
+}
+
 /// Plain VACUUM on an encrypted source database. Exercises the per-frame
 /// decrypt branch inside `Wal::read_frames_batch`: encryption is
 /// propagated to the temp pager (see `vacuum_temp_db_encryption`), so the
@@ -5025,9 +5402,66 @@ fn test_plain_vacuum_encrypted() -> anyhow::Result<()> {
     Ok(())
 }
 
+#[cfg_attr(feature = "checksum", ignore)]
+#[test]
+fn test_plain_vacuum_preserves_reserved_space_on_encrypted_db() -> anyhow::Result<()> {
+    use std::fs::File;
+    use std::io::{Read, Seek, SeekFrom};
+
+    const RESERVED_SPACE_OFFSET: u64 = 20;
+    let tmp_db = TempDatabase::new_empty();
+    let conn = tmp_db.connect_limbo();
+
+    conn.execute(
+        "PRAGMA hexkey = 'b1bbfda4f589dc9daaf004fe21111e00dc00c98237102f5c7002a5669fc76327'",
+    )?;
+    conn.execute("PRAGMA cipher = 'aegis256'")?;
+    conn.execute("CREATE TABLE secrets(id INTEGER PRIMARY KEY, payload TEXT)")?;
+    conn.execute("INSERT INTO secrets VALUES (1, 'alpha'), (2, 'beta')")?;
+    let reserved_bytes = conn
+        .get_reserved_bytes()
+        .expect("encrypted connection should expose reserved bytes");
+    assert!(
+        reserved_bytes > 0,
+        "encrypted pager should reserve tail bytes"
+    );
+
+    conn.execute("VACUUM")?;
+
+    assert_eq!(conn.get_reserved_bytes(), Some(reserved_bytes));
+    {
+        let mut file = File::open(&tmp_db.path)?;
+        file.seek(SeekFrom::Start(RESERVED_SPACE_OFFSET))?;
+        let mut buf = [0u8; 1];
+        file.read_exact(&mut buf)?;
+        assert_eq!(buf[0], reserved_bytes);
+    }
+
+    let reopened = TempDatabase::new_with_existent(&tmp_db.path);
+    let reopened_conn = reopened.connect_limbo();
+    reopened_conn.execute(
+        "PRAGMA hexkey = 'b1bbfda4f589dc9daaf004fe21111e00dc00c98237102f5c7002a5669fc76327'",
+    )?;
+    reopened_conn.execute("PRAGMA cipher = 'aegis256'")?;
+    assert_eq!(reopened_conn.get_reserved_bytes(), Some(reserved_bytes));
+    let rows: Vec<(i64, String)> =
+        reopened_conn.exec_rows("SELECT id, payload FROM secrets ORDER BY id");
+    assert_eq!(
+        rows,
+        vec![(1, "alpha".to_string()), (2, "beta".to_string())]
+    );
+    assert_eq!(run_integrity_check(&reopened_conn), "ok");
+    Ok(())
+}
+
 #[test]
 fn test_plain_vacuum_preserves_full_autovacuum() -> anyhow::Result<()> {
     assert_plain_vacuum_preserves_autovacuum_mode("full", 1)
+}
+
+#[test]
+fn test_plain_vacuum_preserves_no_autovacuum() -> anyhow::Result<()> {
+    assert_plain_vacuum_preserves_autovacuum_mode("none", 0)
 }
 
 #[test]
@@ -5507,8 +5941,87 @@ fn test_mvcc_plain_vacuum_active_write_tx_returns_busy() -> anyhow::Result<()> {
     Ok(())
 }
 
+#[cfg_attr(feature = "checksum", ignore)]
+#[test]
+fn test_mvcc_plain_vacuum_another_vacuum_returns_busy() -> anyhow::Result<()> {
+    let io = Arc::new(QueuedIo::new());
+    let path = "queued-mvcc-vacuum-busy.db";
+    let db = open_queued_db_with_opts(io, path, DatabaseOpts::new())?;
+    let first = db.connect()?;
+    let second = db.connect()?;
+
+    first.execute("PRAGMA journal_mode = 'mvcc'")?;
+    second.execute("PRAGMA journal_mode = 'mvcc'")?;
+    populate_mvcc_vacuum_workload(&first)?;
+    first.execute("PRAGMA wal_checkpoint(TRUNCATE)")?;
+
+    let mut first_stmt = first.prepare("VACUUM")?;
+    step_vacuum_until_io(&mut first_stmt)?;
+
+    let err = second.execute("VACUUM").expect_err(
+        "second MVCC VACUUM should not start while the first one holds the vacuum gate",
+    );
+    assert!(
+        matches!(err, LimboError::Busy)
+            || err.to_string().contains("checkpointed")
+            || err.to_string().contains("VACUUM"),
+        "unexpected second-VACUUM error: {err}"
+    );
+
+    first_stmt.reset()?;
+    Ok(())
+}
+
+#[cfg_attr(feature = "checksum", ignore)]
+#[test]
+fn test_mvcc_plain_vacuum_failure_restores_regular_connection_state() -> anyhow::Result<()> {
+    let io = Arc::new(QueuedIo::new());
+    let path = "queued-mvcc-vacuum-failure-restores-connection.db";
+    let db = open_queued_db_with_opts(io.clone(), path, DatabaseOpts::new())?;
+    let conn = db.connect()?;
+
+    conn.execute("PRAGMA journal_mode = 'mvcc'")?;
+    populate_mvcc_vacuum_workload(&conn)?;
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")?;
+
+    io.fail_after_successes(&format!("{path}-wal"), QueuedIoOpKind::Pwritev, 0);
+    let err = conn.execute("VACUUM").unwrap_err();
+    io.clear_fault();
+    assert!(
+        err.to_string().contains("VACUUM")
+            || err.to_string().contains("WAL")
+            || err.to_string().contains("aborted"),
+        "unexpected MVCC VACUUM fault error: {err}"
+    );
+    assert!(
+        !conn.is_mvcc_bootstrap_connection(),
+        "MVCC fault cleanup must promote the connection back to regular reads"
+    );
+    assert_eq!(scalar_i64(&conn, "SELECT COUNT(*) FROM t"), 133);
+    conn.execute("INSERT INTO t VALUES(2000, 'after-failure', 'payload')")?;
+    assert_eq!(
+        scalar_i64(&conn, "SELECT COUNT(*) FROM t WHERE id = 2000"),
+        1
+    );
+    Ok(())
+}
+
 fn open_queued_db(io: Arc<QueuedIo>, path: &str) -> anyhow::Result<Arc<Database>> {
     Ok(Database::open_file(io, path)?)
+}
+
+fn open_queued_db_with_opts(
+    io: Arc<QueuedIo>,
+    path: &str,
+    opts: DatabaseOpts,
+) -> anyhow::Result<Arc<Database>> {
+    Ok(Database::open_file_with_flags(
+        io,
+        path,
+        OpenFlags::Create,
+        opts,
+        None,
+    )?)
 }
 
 fn populate_queued_multibatch(conn: &Arc<Connection>) -> anyhow::Result<()> {
@@ -5567,6 +6080,178 @@ fn test_plain_vacuum_busy_while_checkpoint_lock_held() -> anyhow::Result<()> {
     assert_eq!(scalar_i64(&vacuum_conn, "SELECT COUNT(*) FROM t"), 20);
     assert_eq!(run_integrity_check(&vacuum_conn), "ok");
 
+    Ok(())
+}
+
+#[cfg_attr(feature = "checksum", ignore)]
+#[ignore = "same-process queued harness does not deterministically hold the checkpoint lock across VACUUM overlap yet"]
+#[test]
+fn test_plain_vacuum_running_blocks_checkpoint_on_other_connection() -> anyhow::Result<()> {
+    let io = Arc::new(QueuedIo::new());
+    let path = "queued-vacuum-blocks-checkpoint.db";
+    let db = open_queued_db(io, path)?;
+    let vacuum_conn = db.connect()?;
+    let checkpoint_conn = db.connect()?;
+
+    populate_queued_multibatch(&vacuum_conn)?;
+
+    let mut stmt = vacuum_conn.prepare("VACUUM")?;
+    step_vacuum_until_io(&mut stmt)?;
+
+    let err = checkpoint_conn
+        .execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        .expect_err("checkpoint should fail while VACUUM holds the checkpoint/vacuum lock set");
+    assert!(
+        matches!(err, LimboError::Busy),
+        "unexpected checkpoint error while VACUUM is active: {err}"
+    );
+
+    stmt.reset()?;
+    checkpoint_conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")?;
+    Ok(())
+}
+
+#[cfg_attr(feature = "checksum", ignore)]
+#[test]
+fn test_second_plain_vacuum_on_other_connection_rejects_while_first_running() -> anyhow::Result<()>
+{
+    let io = Arc::new(QueuedIo::new());
+    let path = "queued-vacuum-two-connections.db";
+    let db = open_queued_db(io, path)?;
+    let first_conn = db.connect()?;
+    let second_conn = db.connect()?;
+
+    populate_queued_multibatch(&first_conn)?;
+
+    let mut first = first_conn.prepare("VACUUM")?;
+    step_vacuum_until_io(&mut first)?;
+
+    let err = second_conn
+        .execute("VACUUM")
+        .expect_err("second connection should not start VACUUM while the first is running");
+    assert!(
+        matches!(err, LimboError::Busy),
+        "unexpected second-connection VACUUM error: {err}"
+    );
+
+    first.reset()?;
+    Ok(())
+}
+
+#[cfg_attr(feature = "checksum", ignore)]
+#[test]
+fn test_plain_vacuum_running_blocks_new_reader() -> anyhow::Result<()> {
+    let io = Arc::new(QueuedIo::new());
+    let path = "queued-vacuum-blocks-reader.db";
+    let db = open_queued_db(io, path)?;
+    let vacuum_conn = db.connect()?;
+    let reader = db.connect()?;
+
+    populate_queued_multibatch(&vacuum_conn)?;
+
+    let mut stmt = vacuum_conn.prepare("VACUUM")?;
+    step_vacuum_until_io(&mut stmt)?;
+
+    let err = reader
+        .execute("SELECT COUNT(*) FROM t")
+        .expect_err("new reader should not start while VACUUM holds the exclusive snapshot");
+    assert!(
+        matches!(err, LimboError::Busy),
+        "unexpected new-reader error while VACUUM is active: {err}"
+    );
+
+    stmt.reset()?;
+    assert_eq!(scalar_i64(&reader, "SELECT COUNT(*) FROM t"), 176);
+    Ok(())
+}
+
+#[cfg_attr(feature = "checksum", ignore)]
+#[test]
+fn test_plain_vacuum_running_blocks_new_writer() -> anyhow::Result<()> {
+    let io = Arc::new(QueuedIo::new());
+    let path = "queued-vacuum-blocks-writer.db";
+    let db = open_queued_db(io, path)?;
+    let vacuum_conn = db.connect()?;
+    let writer = db.connect()?;
+
+    populate_queued_multibatch(&vacuum_conn)?;
+
+    let mut stmt = vacuum_conn.prepare("VACUUM")?;
+    step_vacuum_until_io(&mut stmt)?;
+
+    let err = writer
+        .execute("BEGIN IMMEDIATE")
+        .expect_err("new writer should not start while VACUUM holds the exclusive snapshot");
+    assert!(
+        matches!(err, LimboError::Busy),
+        "unexpected new-writer error while VACUUM is active: {err}"
+    );
+
+    stmt.reset()?;
+    writer.execute("BEGIN IMMEDIATE")?;
+    writer.execute("ROLLBACK")?;
+    Ok(())
+}
+
+#[cfg_attr(feature = "checksum", ignore)]
+#[ignore = "dropping the last connection mid-VACUUM currently corrupts queued-IO cleanup state"]
+#[test]
+fn test_plain_vacuum_connection_drop_mid_io_releases_locks() -> anyhow::Result<()> {
+    let io = Arc::new(QueuedIo::new());
+    let path = ":memory:queued-vacuum-connection-drop.db";
+    let db = open_queued_db(io, path)?;
+    let conn = db.connect()?;
+    let verifier = db.connect()?;
+
+    populate_queued_multibatch(&conn)?;
+
+    let mut stmt = conn.prepare("VACUUM")?;
+    step_vacuum_until_io(&mut stmt)?;
+
+    drop(stmt);
+    drop(conn);
+
+    assert_eq!(scalar_i64(&verifier, "SELECT COUNT(*) FROM t"), 176);
+    verifier.execute("INSERT INTO t VALUES(10000, 'after-connection-drop')")?;
+    verifier.execute("DELETE FROM t WHERE id = 10000")?;
+    assert_eq!(run_integrity_check(&verifier), "ok");
+    Ok(())
+}
+
+#[cfg_attr(feature = "checksum", ignore)]
+#[test]
+fn test_plain_vacuum_interrupt_mid_io_cleans_up_source_tx() -> anyhow::Result<()> {
+    let io = Arc::new(QueuedIo::new());
+    let path = "queued-vacuum-interrupt.db";
+    let db = open_queued_db(io, path)?;
+    let conn = db.connect()?;
+    let reader = db.connect()?;
+
+    populate_queued_multibatch(&conn)?;
+
+    let mut stmt = conn.prepare("VACUUM")?;
+    step_vacuum_until_io(&mut stmt)?;
+    conn.interrupt();
+
+    let result = step_stmt_until_terminal(&mut stmt)?;
+    assert!(
+        matches!(result, StepResult::Interrupt),
+        "explicit connection interrupt should stop VACUUM, got {result:?}"
+    );
+    assert!(conn.get_auto_commit(), "interrupt must restore auto-commit");
+    let pager = conn.get_pager();
+    assert!(
+        !pager.holds_read_lock(),
+        "interrupt must release read locks"
+    );
+    assert!(
+        !pager.holds_write_lock(),
+        "interrupt must release write locks"
+    );
+    assert_eq!(scalar_i64(&reader, "SELECT COUNT(*) FROM t"), 176);
+    conn.execute("INSERT INTO t VALUES(10000, 'after-interrupt')")?;
+    conn.execute("DELETE FROM t WHERE id = 10000")?;
+    assert_eq!(run_integrity_check(&conn), "ok");
     Ok(())
 }
 
@@ -5884,6 +6569,24 @@ fn assert_failed_vacuum_left_queued_db_usable(
     conn.execute("INSERT INTO t VALUES(10000, 'after-failure')")?;
     conn.execute("DELETE FROM t WHERE id = 10000")?;
     assert_eq!(run_integrity_check(conn), "ok");
+    Ok(())
+}
+
+fn assert_reopened_compacted_queued_db(
+    io: Arc<QueuedIo>,
+    path: &str,
+    pre_pages: i64,
+) -> anyhow::Result<()> {
+    let reopened = open_queued_db(io, path)?;
+    let reopened_conn = reopened.connect()?;
+    assert!(
+        scalar_i64(&reopened_conn, "PRAGMA page_count") < pre_pages,
+        "recovery should keep the published compacted image visible from WAL"
+    );
+    assert_eq!(scalar_i64(&reopened_conn, "SELECT COUNT(*) FROM t"), 176);
+    assert_eq!(run_integrity_check(&reopened_conn), "ok");
+    reopened_conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")?;
+    assert_eq!(run_integrity_check(&reopened_conn), "ok");
     Ok(())
 }
 
@@ -6209,6 +6912,134 @@ fn test_plain_vacuum_post_publish_checkpoint_failure_keeps_compacted_image() -> 
 
     reopened_conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")?;
     assert_eq!(run_integrity_check(&reopened_conn), "ok");
+    Ok(())
+}
+
+#[cfg_attr(feature = "checksum", ignore)]
+#[test]
+fn test_plain_vacuum_crash_after_source_wal_sync_before_publish_recovers_original(
+) -> anyhow::Result<()> {
+    let io = Arc::new(QueuedIo::new());
+    let path = ":memory:queued-vacuum-crash-after-sync-before-publish.db";
+    let db = open_queued_db(io.clone(), path)?;
+    let conn = db.connect()?;
+
+    populate_queued_multibatch(&conn)?;
+    let pre_pages = scalar_i64(&conn, "PRAGMA page_count");
+
+    let mut stmt = conn.prepare("VACUUM")?;
+    let sync_event = step_stmt_until_pending_queued_event(
+        &mut stmt,
+        io.as_ref(),
+        |event| event.path == format!("{path}-wal") && event.kind == QueuedIoOpKind::Sync,
+        "VACUUM",
+    )?;
+    assert_eq!(sync_event.path, format!("{path}-wal"));
+    io.step_one()?
+        .expect("source WAL sync should remain pending before simulated crash");
+
+    std::mem::forget(stmt);
+    std::mem::forget(conn);
+    std::mem::forget(db);
+
+    let reopened = open_queued_db(io.clone(), path)?;
+    let reopened_conn = reopened.connect()?;
+    assert_eq!(
+        scalar_i64(&reopened_conn, "PRAGMA page_count"),
+        pre_pages,
+        "sync without publish must leave the original image authoritative after crash recovery"
+    );
+    assert_eq!(scalar_i64(&reopened_conn, "SELECT COUNT(*) FROM t"), 176);
+    assert_eq!(run_integrity_check(&reopened_conn), "ok");
+    Ok(())
+}
+
+#[cfg_attr(feature = "checksum", ignore)]
+#[test]
+fn test_plain_vacuum_crash_after_publish_during_checkpoint_backfill_recovers_compacted_image(
+) -> anyhow::Result<()> {
+    let io = Arc::new(QueuedIo::new());
+    let path = ":memory:queued-vacuum-crash-during-checkpoint-backfill.db";
+    let db = open_queued_db(io.clone(), path)?;
+    let conn = db.connect()?;
+
+    populate_queued_multibatch(&conn)?;
+    let pre_pages = scalar_i64(&conn, "PRAGMA page_count");
+
+    let mut stmt = conn.prepare("VACUUM")?;
+    let db_path = path.to_string();
+    step_stmt_until_pending_queued_event(
+        &mut stmt,
+        io.as_ref(),
+        |event| {
+            event.path == db_path
+                && matches!(event.kind, QueuedIoOpKind::Pwrite | QueuedIoOpKind::Pwritev)
+        },
+        "VACUUM",
+    )?;
+
+    std::mem::forget(stmt);
+    std::mem::forget(conn);
+    std::mem::forget(db);
+
+    assert_reopened_compacted_queued_db(io.clone(), path, pre_pages)?;
+    Ok(())
+}
+
+#[cfg_attr(feature = "checksum", ignore)]
+#[test]
+fn test_plain_vacuum_crash_after_publish_during_checkpoint_db_sync_recovers_compacted_image(
+) -> anyhow::Result<()> {
+    let io = Arc::new(QueuedIo::new());
+    let path = ":memory:queued-vacuum-crash-during-checkpoint-db-sync.db";
+    let db = open_queued_db(io.clone(), path)?;
+    let conn = db.connect()?;
+
+    populate_queued_multibatch(&conn)?;
+    let pre_pages = scalar_i64(&conn, "PRAGMA page_count");
+
+    let mut stmt = conn.prepare("VACUUM")?;
+    let db_path = path.to_string();
+    step_stmt_until_pending_queued_event(
+        &mut stmt,
+        io.as_ref(),
+        |event| event.path == db_path && event.kind == QueuedIoOpKind::Sync,
+        "VACUUM",
+    )?;
+
+    std::mem::forget(stmt);
+    std::mem::forget(conn);
+    std::mem::forget(db);
+
+    assert_reopened_compacted_queued_db(io.clone(), path, pre_pages)?;
+    Ok(())
+}
+
+#[cfg_attr(feature = "checksum", ignore)]
+#[test]
+fn test_plain_vacuum_crash_after_publish_during_checkpoint_truncate_recovers_compacted_image(
+) -> anyhow::Result<()> {
+    let io = Arc::new(QueuedIo::new());
+    let path = ":memory:queued-vacuum-crash-during-checkpoint-truncate.db";
+    let db = open_queued_db(io.clone(), path)?;
+    let conn = db.connect()?;
+
+    populate_queued_multibatch(&conn)?;
+    let pre_pages = scalar_i64(&conn, "PRAGMA page_count");
+
+    let mut stmt = conn.prepare("VACUUM")?;
+    step_stmt_until_pending_queued_event(
+        &mut stmt,
+        io.as_ref(),
+        |event| event.path == format!("{path}-wal") && event.kind == QueuedIoOpKind::Truncate,
+        "VACUUM",
+    )?;
+
+    std::mem::forget(stmt);
+    std::mem::forget(conn);
+    std::mem::forget(db);
+
+    assert_reopened_compacted_queued_db(io.clone(), path, pre_pages)?;
     Ok(())
 }
 
