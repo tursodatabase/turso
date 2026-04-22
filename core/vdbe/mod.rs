@@ -2770,6 +2770,26 @@ mod tests {
 ///
 /// These tests verify that the implementation correctly upholds these invariants
 /// under concurrent access patterns.
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn program_state_reset_clears_in_place_vacuum_state() {
+        let mut state = ProgramState::new(0, 0);
+        state.op_vacuum_in_place = Some(Box::new(
+            crate::vdbe::vacuum::VacuumInPlaceOpContext::new(crate::MAIN_DB_ID),
+        ));
+
+        state.reset(None, None);
+
+        assert!(
+            state.op_vacuum_in_place.is_none(),
+            "ProgramState::reset must clear in-place VACUUM state"
+        );
+    }
+}
+
 #[cfg(all(shuttle, test))]
 mod shuttle_tests {
     use super::*;
