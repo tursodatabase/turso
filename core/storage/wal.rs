@@ -8468,6 +8468,17 @@ pub mod test {
     }
 
     #[test]
+    #[should_panic(expected = "release_vacuum_lock called while source write lock is still held")]
+    fn test_release_vacuum_lock_requires_end_write_tx_first() {
+        let (_shared, vacuum_wal) = make_test_wal();
+
+        vacuum_wal.try_begin_checkpoint_lock().unwrap();
+        vacuum_wal.begin_exclusive_tx().unwrap();
+
+        vacuum_wal.release_vacuum_lock();
+    }
+
+    #[test]
     fn test_held_vacuum_checkpoint_locks_do_not_release_vacuum_lock() {
         let (shared, vacuum_wal) = make_test_wal();
         let contender_wal = make_test_wal_from_shared(shared);

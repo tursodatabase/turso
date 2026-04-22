@@ -2345,6 +2345,7 @@ fn vacuum_in_place_cleanup(
 mod tests {
     use super::*;
     use crate::io::{FileId, FileSyncType};
+    use crate::schema::BTreeTable;
     use crate::schema::Schema;
     use crate::storage::encryption::{CipherMode, EncryptionKey};
     use crate::storage::pager::Page;
@@ -2606,6 +2607,65 @@ mod tests {
         assert_eq!(
             runs[1].1.iter().map(|p| p.get().id).collect::<Vec<_>>(),
             vec![3, 4]
+        );
+    }
+
+    #[test]
+    fn build_copy_sql_or_replace_for_regular_table_still_generates_insert_sql() {
+        let table = BTreeTable::from_sql("CREATE TABLE t(id INTEGER PRIMARY KEY, payload TEXT)", 2)
+            .unwrap();
+
+        let (select_sql, insert_sql) = build_copy_sql("main", "t", Some(&table), true).unwrap();
+
+        assert!(
+            select_sql.starts_with("SELECT "),
+            "unexpected SELECT SQL: {select_sql}"
+        );
+        assert!(
+            select_sql.ends_with(" FROM \"main\".\"t\""),
+            "unexpected source table reference: {select_sql}"
+        );
+        assert!(
+            insert_sql.starts_with("INSERT OR REPLACE INTO \"t\""),
+            "unexpected insert SQL for or_replace helper misuse: {insert_sql}"
+        );
+        assert!(
+            insert_sql.contains("VALUES"),
+            "unexpected placeholder/column layout: {insert_sql}"
+        );
+    }
+
+    #[test]
+    fn mvcc_vacuum_guard_drop_promotes_demoted_connection() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let db_path = temp_dir.path().join("mvcc-vacuum-guard.db");
+        let io: Arc<dyn crate::IO> = Arc::new(crate::PlatformIO::new().unwrap());
+        let db = Database::open_file(io, db_path.to_str().unwrap()).unwrap();
+        let conn = db.connect().unwrap();
+        conn.execute("PRAGMA journal_mode = 'mvcc'").unwrap();
+
+        let mv_store = db
+            .get_mv_store()
+            .as_ref()
+            .cloned()
+            .expect("MVCC mode should materialize an MV store");
+        let mut guard = MvccVacuumGuard::acquire(conn.clone(), mv_store).unwrap();
+
+        assert!(
+            !conn.is_mvcc_bootstrap_connection(),
+            "fresh MVCC connection should not start demoted"
+        );
+        guard.demote_connection();
+        assert!(
+            conn.is_mvcc_bootstrap_connection(),
+            "guard demotion should put the connection into bootstrap mode"
+        );
+
+        drop(guard);
+
+        assert!(
+            !conn.is_mvcc_bootstrap_connection(),
+            "dropping the MVCC vacuum guard must restore a regular connection"
         );
     }
 

@@ -297,6 +297,23 @@ impl QueuedIo {
         self.state.history.lock().unwrap().push(event.clone());
         Ok(Some(event))
     }
+
+    fn step_last_matching<F>(&self, predicate: F) -> turso_core::Result<Option<QueuedIoEvent>>
+    where
+        F: Fn(&QueuedIoEvent) -> bool,
+    {
+        let Some(op) = ({
+            let mut pending = self.state.pending.lock().unwrap();
+            let idx = pending.iter().rposition(|op| predicate(&op.event));
+            idx.and_then(|idx| pending.remove(idx))
+        }) else {
+            return Ok(None);
+        };
+        let event = op.event.clone();
+        (op.action)()?;
+        self.state.history.lock().unwrap().push(event.clone());
+        Ok(Some(event))
+    }
 }
 
 impl Clock for QueuedIo {
@@ -4307,6 +4324,46 @@ fn test_plain_vacuum_preserves_autoincrement(tmp_db: TempDatabase) -> anyhow::Re
     Ok(())
 }
 
+/// Plain VACUUM disables foreign-key checks only on the private target
+/// connection. The source connection must keep FK enforcement enabled after the
+/// compacted image is copied back.
+#[cfg_attr(feature = "checksum", ignore)]
+#[test]
+fn test_plain_vacuum_preserves_source_foreign_key_enforcement() -> anyhow::Result<()> {
+    let tmp_db = TempDatabase::new_empty();
+    let conn = tmp_db.connect_limbo();
+
+    conn.execute("PRAGMA foreign_keys = ON")?;
+    conn.execute("CREATE TABLE parent(id INTEGER PRIMARY KEY)")?;
+    conn.execute(
+        "CREATE TABLE child(
+            id INTEGER PRIMARY KEY,
+            parent_id INTEGER NOT NULL REFERENCES parent(id)
+        )",
+    )?;
+    conn.execute("INSERT INTO parent VALUES(1)")?;
+    conn.execute("INSERT INTO child VALUES(1, 1)")?;
+
+    conn.execute("VACUUM")?;
+
+    assert!(
+        conn.foreign_keys_enabled(),
+        "VACUUM must not leak target-side foreign_keys=OFF onto the source connection"
+    );
+    let err = conn
+        .execute("INSERT INTO child VALUES(2, 999)")
+        .expect_err("foreign key violation should still be enforced after VACUUM");
+    assert!(
+        err.to_string().contains("foreign key") || err.to_string().contains("constraint"),
+        "unexpected FK error after VACUUM: {err}"
+    );
+    let child_rows: Vec<(i64, i64)> = conn.exec_rows("SELECT id, parent_id FROM child");
+    assert_eq!(child_rows, vec![(1, 1)]);
+    assert_eq!(run_integrity_check(&conn), "ok");
+
+    Ok(())
+}
+
 /// Plain VACUUM preserves indexes (queries using them still work).
 #[cfg_attr(feature = "checksum", ignore)]
 #[turso_macros::test(init_sql = "CREATE TABLE t1(a INTEGER PRIMARY KEY, b TEXT);")]
@@ -6036,6 +6093,26 @@ fn populate_queued_multibatch(conn: &Arc<Connection>) -> anyhow::Result<()> {
     Ok(())
 }
 
+fn populate_queued_multirun_temp_wal(conn: &Arc<Connection>) -> anyhow::Result<()> {
+    conn.execute("PRAGMA page_size = 512")?;
+    conn.execute("CREATE TABLE a(id INTEGER PRIMARY KEY, payload TEXT)")?;
+    conn.execute("CREATE TABLE b(id INTEGER PRIMARY KEY, payload TEXT)")?;
+    conn.execute("CREATE TABLE c(id INTEGER PRIMARY KEY, payload TEXT)")?;
+    conn.execute("CREATE INDEX idx_a_payload ON a(payload)")?;
+    conn.execute("CREATE INDEX idx_b_payload ON b(payload)")?;
+    conn.execute("CREATE INDEX idx_c_payload ON c(payload)")?;
+    for i in 0..220 {
+        conn.execute(format!("INSERT INTO a VALUES({i}, '{}')", "a".repeat(320)))?;
+        conn.execute(format!("INSERT INTO b VALUES({i}, '{}')", "b".repeat(320)))?;
+        conn.execute(format!("INSERT INTO c VALUES({i}, '{}')", "c".repeat(320)))?;
+    }
+    conn.execute("DELETE FROM a WHERE id % 2 = 0")?;
+    conn.execute("DELETE FROM b WHERE id % 3 = 0")?;
+    conn.execute("DELETE FROM c WHERE id % 5 = 0")?;
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")?;
+    Ok(())
+}
+
 #[cfg_attr(feature = "checksum", ignore)]
 #[test]
 fn test_plain_vacuum_busy_while_checkpoint_lock_held() -> anyhow::Result<()> {
@@ -6162,6 +6239,122 @@ fn test_plain_vacuum_running_blocks_new_reader() -> anyhow::Result<()> {
 
     stmt.reset()?;
     assert_eq!(scalar_i64(&reader, "SELECT COUNT(*) FROM t"), 176);
+    Ok(())
+}
+
+#[cfg_attr(feature = "checksum", ignore)]
+#[test]
+#[ignore = "queued VACUUM workload does not currently reach a multi-run temp-read CompletionGroup in one batch"]
+fn test_plain_vacuum_temp_read_completion_group_waits_for_all_runs() -> anyhow::Result<()> {
+    let io = Arc::new(QueuedIo::new());
+    let path = "queued-vacuum-temp-read-group.db";
+    let db = open_queued_db(io.clone(), path)?;
+    let conn = db.connect()?;
+
+    populate_queued_multirun_temp_wal(&conn)?;
+
+    let mut stmt = conn.prepare("VACUUM")?;
+    let pending_temp_reads = loop {
+        match stmt.step()? {
+            StepResult::IO => {
+                let pending_temp_reads = io
+                    .pending_events()
+                    .into_iter()
+                    .filter(|event| {
+                        event.kind == QueuedIoOpKind::Pread
+                            && event.path.ends_with("-wal")
+                            && event.path.contains("osrut_")
+                    })
+                    .count();
+                if pending_temp_reads > 1 {
+                    break pending_temp_reads;
+                }
+                io.step_one()?.expect(
+                    "VACUUM yielded IO without a queued operation while searching for a multi-run temp batch",
+                );
+            }
+            StepResult::Done => {
+                anyhow::bail!("VACUUM finished without ever producing a multi-run temp-read batch")
+            }
+            StepResult::Row => anyhow::bail!("VACUUM unexpectedly returned a row"),
+            StepResult::Busy => anyhow::bail!("VACUUM unexpectedly returned Busy"),
+            StepResult::Interrupt => anyhow::bail!("VACUUM unexpectedly returned Interrupt"),
+        }
+    };
+
+    for remaining in (1..pending_temp_reads).rev() {
+        io.step_last_matching(|event| {
+            event.kind == QueuedIoOpKind::Pread
+                && event.path.ends_with("-wal")
+                && event.path.contains("osrut_")
+        })?
+        .expect("expected another temp WAL read to complete out of order");
+        let result = stmt.step()?;
+        assert!(
+            matches!(result, StepResult::IO),
+            "VACUUM should keep yielding until every completion in the temp-read group finishes; remaining={remaining}, got {result:?}"
+        );
+    }
+
+    io.step_last_matching(|event| {
+        event.kind == QueuedIoOpKind::Pread
+            && event.path.ends_with("-wal")
+            && event.path.contains("osrut_")
+    })?
+    .expect("expected final temp WAL read to remain pending");
+
+    let terminal = step_stmt_until_terminal(&mut stmt)?;
+    assert!(
+        matches!(terminal, StepResult::Done),
+        "VACUUM should complete after the last temp-read completion, got {terminal:?}"
+    );
+    assert_eq!(run_integrity_check(&conn), "ok");
+    Ok(())
+}
+
+#[cfg_attr(feature = "checksum", ignore)]
+#[test]
+fn test_plain_vacuum_reader_blocked_during_final_checkpoint_sees_final_state() -> anyhow::Result<()>
+{
+    let io = Arc::new(QueuedIo::new());
+    let path = "queued-vacuum-reader-during-final-checkpoint.db";
+    let db = open_queued_db(io.clone(), path)?;
+    let vacuum_conn = db.connect()?;
+    let reader = db.connect()?;
+
+    populate_queued_multibatch(&vacuum_conn)?;
+    let pre_pages = scalar_i64(&vacuum_conn, "PRAGMA page_count");
+
+    let mut stmt = vacuum_conn.prepare("VACUUM")?;
+    step_stmt_until_pending_queued_event(
+        &mut stmt,
+        io.as_ref(),
+        |event| {
+            event.path == path
+                && matches!(event.kind, QueuedIoOpKind::Pwrite | QueuedIoOpKind::Pwritev)
+        },
+        "VACUUM",
+    )?;
+
+    let err = reader
+        .execute("SELECT COUNT(*) FROM t")
+        .expect_err("reader should stay blocked while final TRUNCATE checkpoint is still running");
+    assert!(
+        matches!(err, LimboError::Busy),
+        "unexpected reader error during final checkpoint: {err}"
+    );
+
+    let terminal = step_stmt_until_terminal(&mut stmt)?;
+    assert!(matches!(terminal, StepResult::Done));
+
+    assert_eq!(scalar_i64(&reader, "SELECT COUNT(*) FROM t"), 176);
+    assert!(
+        scalar_i64(&reader, "PRAGMA page_count") < pre_pages,
+        "reader should observe the post-checkpoint compacted image after VACUUM completes"
+    );
+    let verifier = db.connect()?;
+    assert_eq!(scalar_i64(&verifier, "SELECT COUNT(*) FROM t"), 176);
+    assert_eq!(run_integrity_check(&verifier), "ok");
     Ok(())
 }
 
