@@ -2,10 +2,13 @@ use std::sync::Arc;
 
 use crate::error::LimboError;
 use crate::schema::TypeDef;
-use crate::types::IOResult;
+use crate::storage::pager::AutoVacuumMode;
+use crate::storage::sqlite3_ondisk::{CacheSize, DatabaseHeader, TextEncoding};
+use crate::util::IOExt;
+use crate::vdbe::execute::InsnFunctionStepResult;
 use crate::Result;
-use crate::{Connection, Database};
-use turso_macros::turso_assert;
+use crate::{Connection, Database, DatabaseOpts, EncryptionOpts, OpenFlags};
+use turso_macros::{turso_assert, turso_assert_eq};
 
 /// A representation of a row from `sqlite_schema`.
 ///
@@ -98,7 +101,7 @@ pub(crate) fn classify_schema_entries(
                 // All storage-backed tables get their data copied, including
                 // sqlite_stat1 and other internal storage-backed tables.
                 // sqlite_sequence data copy is handled specially by the caller
-                // (only if destination materialized it).
+                // (only if the target materialized it).
                 tables_to_copy.push(idx);
             }
             SchemaEntryType::Index if entry.is_storage_backed() => {
@@ -141,74 +144,259 @@ pub(crate) fn classify_schema_entries(
     )
 }
 
-/// Configuration for the VACUUM INTO engine. Provided by the caller (opcode
-/// handler) after reading source metadata and setting up the destination DB.
-pub(crate) struct VacuumIntoConfig {
-    /// Source connection - used for `prepare_internal` and `with_schema` during
-    /// schema collection and data copy.
+/// Target database feature flags needed for schema replay during a vacuum build.
+pub(crate) fn vacuum_target_opts_from_source(source_db: &Database) -> DatabaseOpts {
+    DatabaseOpts::new()
+        .with_views(source_db.experimental_views_enabled())
+        .with_index_method(source_db.experimental_index_method_enabled())
+        .with_custom_types(source_db.experimental_custom_types_enabled())
+        .with_encryption(source_db.experimental_encryption_enabled())
+        .with_autovacuum(source_db.experimental_autovacuum_enabled())
+        .with_attach(source_db.experimental_attach_enabled())
+        .with_generated_columns(source_db.experimental_generated_columns_enabled())
+}
+
+pub(crate) fn reject_unsupported_vacuum_auto_vacuum_mode(mode: AutoVacuumMode) -> Result<()> {
+    if matches!(mode, AutoVacuumMode::Incremental) {
+        return Err(LimboError::InternalError(
+            "Incremental auto-vacuum is not supported".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+/// Database header metadata that the target build must finalize before commit.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct VacuumDbHeaderMeta {
+    schema_cookie: u32,
+    default_page_cache_size: CacheSize,
+    text_encoding: TextEncoding,
+    user_version: i32,
+    application_id: i32,
+}
+
+impl VacuumDbHeaderMeta {
+    pub(crate) fn from_source_header(source: &DatabaseHeader) -> Self {
+        Self {
+            schema_cookie: source.schema_cookie.get().wrapping_add(1),
+            default_page_cache_size: source.default_page_cache_size,
+            text_encoding: source.text_encoding,
+            user_version: source.user_version.get(),
+            application_id: source.application_id.get(),
+        }
+    }
+
+    fn apply_to(self, header: &mut DatabaseHeader) {
+        header.schema_cookie = self.schema_cookie.into();
+        header.default_page_cache_size = self.default_page_cache_size;
+        header.text_encoding = self.text_encoding;
+        header.user_version = self.user_version.into();
+        header.application_id = self.application_id.into();
+    }
+}
+
+/// File-backed internal temp database used by in-place `VACUUM`.
+///
+/// The temp directory is dropped after the connection and database handles so
+/// host files can be closed before the directory cleanup runs.
+pub(crate) struct VacuumTempDb {
+    pub conn: Arc<Connection>,
+    _db: Arc<Database>,
+    #[cfg(test)]
+    path: String,
+    #[cfg(not(target_family = "wasm"))]
+    _temp_dir: tempfile::TempDir,
+}
+
+#[cfg(not(target_family = "wasm"))]
+fn vacuum_temp_db_encryption(
+    source_conn: &Arc<Connection>,
+) -> Result<(Option<EncryptionOpts>, Option<crate::EncryptionKey>)> {
+    let Some(cipher_mode) = source_conn.get_encryption_cipher_mode() else {
+        return Ok((None, None));
+    };
+    let encryption_key = source_conn.encryption_key.read().clone().ok_or_else(|| {
+        LimboError::InternalError(
+            "encrypted in-place VACUUM temp database requires source encryption key".to_string(),
+        )
+    })?;
+    let encryption_opts = EncryptionOpts {
+        cipher: cipher_mode.to_string(),
+        hexkey: hex::encode(encryption_key.as_slice()),
+    };
+    Ok((Some(encryption_opts), Some(encryption_key)))
+}
+
+#[cfg(not(target_family = "wasm"))]
+pub(crate) fn open_vacuum_temp_db(
+    source_conn: &Arc<Connection>,
+    source_db: &Arc<Database>,
+    page_size: u32,
+    reserved_space: u8,
+) -> Result<VacuumTempDb> {
+    // todo: let users specify the temp dir path
+    let temp_dir = tempfile::tempdir().map_err(|e| crate::error::io_error(e, "tempdir"))?;
+    let source_db_name = std::path::Path::new(&source_db.path)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("tursodb_vacuum_temp.db");
+    // all temp files we will prefix with `osrut_` (i.e. turso but reversed)
+    let path = temp_dir.path().join(format!("osrut_{source_db_name}"));
+    let path = path
+        .to_str()
+        .ok_or_else(|| LimboError::InternalError("vacuum temp path is not valid UTF-8".into()))?
+        .to_string();
+    #[cfg(test)]
+    let test_path = path.clone();
+
+    let (encryption_opts, encryption_key) = vacuum_temp_db_encryption(source_conn)?;
+    let db = Database::open_file_with_flags(
+        source_db.io.clone(),
+        &path,
+        OpenFlags::Create,
+        vacuum_target_opts_from_source(source_db),
+        encryption_opts,
+    )?;
+    let conn = db.connect_with_encryption(encryption_key)?;
+    conn.reset_page_size(page_size)?;
+    conn.set_reserved_bytes(reserved_space)?;
+    conn.wal_auto_checkpoint_disable();
+
+    Ok(VacuumTempDb {
+        conn,
+        _db: db,
+        #[cfg(test)]
+        path: test_path,
+        _temp_dir: temp_dir,
+    })
+}
+
+#[cfg(target_family = "wasm")]
+pub(crate) fn open_vacuum_temp_db(
+    _source_conn: &Arc<Connection>,
+    _source_db: &Arc<Database>,
+    _page_size: u32,
+    _reserved_space: u8,
+) -> Result<VacuumTempDb> {
+    Err(LimboError::InternalError(
+        "in-place VACUUM requires a file-backed internal temp database".to_string(),
+    ))
+}
+
+fn finalize_vacuum_target_header(
+    target_conn: &Arc<Connection>,
+    header_meta: &VacuumDbHeaderMeta,
+) -> Result<crate::IOResult<()>> {
+    if let Some(mv_store) = target_conn.mv_store_for_db(crate::MAIN_DB_ID) {
+        let tx_id = target_conn.get_mv_tx_id_for_db(crate::MAIN_DB_ID);
+        return mv_store
+            .with_header_mut(|header| header_meta.apply_to(header), tx_id.as_ref())
+            .map(crate::IOResult::Done);
+    }
+    let pager = target_conn.pager.load();
+    pager.with_header_mut(|header| header_meta.apply_to(header))
+}
+
+/// Finish a VACUUM INTO output database with durable on-disk state.
+///
+/// Target build runs with `synchronous=OFF` for speed, so its commit alone is
+/// not the durability boundary. Before reporting success, VACUUM INTO forces a
+/// final TRUNCATE checkpoint under `SyncMode::Full` so the destination's main
+/// database file is self-contained and synced.
+pub(crate) fn finalize_vacuum_into_output(target: &VacuumTargetBuildContext) -> Result<()> {
+    target.target_conn.set_sync_mode(crate::SyncMode::Full);
+    target
+        .target_conn
+        .checkpoint(crate::CheckpointMode::Truncate {
+            upper_bound_inclusive: None,
+        })?;
+    Ok(())
+}
+
+/// Copy functions, vtab modules, and index methods from one connection to
+/// another so that schema replay on the target sees the same symbols as
+/// the source.
+pub(crate) fn mirror_symbols(source: &Connection, target: &Connection) {
+    let source_syms = source.syms.read();
+    let mut target_syms = target.syms.write();
+    target_syms.functions.extend(
+        source_syms
+            .functions
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone())),
+    );
+    target_syms.vtab_modules.extend(
+        source_syms
+            .vtab_modules
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone())),
+    );
+    target_syms.index_methods.extend(
+        source_syms
+            .index_methods
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone())),
+    );
+}
+
+/// Capture non-builtin custom type definitions from the source schema.
+pub(crate) fn capture_custom_types(
+    source: &Connection,
+    db_id: usize,
+) -> Vec<(String, Arc<TypeDef>)> {
+    source.with_schema(db_id, |schema| {
+        schema
+            .type_registry
+            .iter()
+            .filter(|(_, td)| !td.is_builtin)
+            .map(|(name, td)| (name.clone(), td.clone()))
+            .collect()
+    })
+}
+
+/// Configuration for building a compacted vacuum target database.
+/// Callers must mirror source symbols (functions, vtab modules, index methods)
+/// directly into the target connection before starting the state machine.
+pub(crate) struct VacuumTargetBuildConfig {
     pub source_conn: Arc<Connection>,
     /// Escaped schema name for safe SQL interpolation (e.g. `"main"`).
     pub escaped_schema_name: String,
     /// Database index for schema lookups on the source connection.
-    pub database_id: usize,
-    /// Source `user_version` pragma value to copy to destination.
-    pub source_user_version: i32,
-    /// Source `application_id` pragma value to copy to destination.
-    pub source_application_id: i32,
+    pub source_db_id: usize,
+    /// Database header metadata to write before committing the target database.
+    pub header_meta: VacuumDbHeaderMeta,
     /// Pre-captured source custom type definitions for STRICT table replay.
     pub source_custom_types: Vec<(String, Arc<TypeDef>)>,
-    /// Whether the source database has MVCC enabled.
-    pub source_mvcc_enabled: bool,
+    /// Whether the target database should be placed in MVCC journal mode.
+    pub target_mvcc_enabled: bool,
+    /// Auto-vacuum mode to use while rebuilding the target image.
+    pub target_auto_vacuum_mode: AutoVacuumMode,
+    /// Whether to copy the source MVCC metadata table into the target image.
+    pub copy_mvcc_metadata_table: bool,
 }
 
-pub(crate) struct VacuumInto {
-    config: VacuumIntoConfig,
-    state: VacuumIntoState,
-}
-
-impl VacuumInto {
-    pub fn new(
-        config: VacuumIntoConfig,
-        dest_db: Arc<Database>,
-        dest_conn: Arc<Connection>,
-    ) -> Self {
-        Self {
-            config,
-            state: VacuumIntoState::new(dest_db, dest_conn),
-        }
-    }
-
-    pub fn step(&mut self) -> Result<IOResult<()>> {
-        vacuum_into_step(&self.config, &mut self.state)
-    }
-}
-
-/// State for the VACUUM INTO engine. Holds the destination connection and all
+/// Context for the vacuum target build. Holds the target connection and all
 /// intermediate state needed across async yields.
-struct VacuumIntoState {
-    /// Keep the destination database alive while VACUUM INTO is in progress.
-    #[allow(dead_code)]
-    dest_db: Arc<Database>,
-    dest_conn: Arc<Connection>,
-    sub_state: VacuumIntoSubState,
+pub(crate) struct VacuumTargetBuildContext {
+    target_conn: Arc<Connection>,
+    phase: VacuumTargetBuildPhase,
     /// Typed schema entries collected from sqlite_schema, ordered by rowid.
     schema_entries: Vec<SchemaEntry>,
     /// Storage-backed tables to CREATE (excludes sqlite_sequence).
     tables_to_create: Vec<usize>,
     /// Storage-backed tables whose data to copy.
     tables_to_copy: Vec<usize>,
-    /// User-defined secondary indexes to CREATE.
+    /// User-defined secondary indexes to CREATE
     indexes_to_create: Vec<usize>,
-    /// Triggers, views, custom indexes, and rootpage = 0 objects.
+    /// Triggers, views, and rootpage = 0 objects
     post_data_entries: Vec<usize>,
 }
 
-impl VacuumIntoState {
-    fn new(dest_db: Arc<Database>, dest_conn: Arc<Connection>) -> Self {
+impl VacuumTargetBuildContext {
+    pub fn new(target_conn: Arc<Connection>) -> Self {
         Self {
-            dest_db,
-            dest_conn,
-            sub_state: VacuumIntoSubState::Init,
+            target_conn,
+            phase: VacuumTargetBuildPhase::Init,
             schema_entries: Vec::new(),
             tables_to_create: Vec::new(),
             tables_to_copy: Vec::new(),
@@ -216,163 +404,169 @@ impl VacuumIntoState {
             post_data_entries: Vec::new(),
         }
     }
+
+    pub(crate) fn cleanup_after_error(&mut self) -> Result<()> {
+        self.phase = VacuumTargetBuildPhase::Done;
+        if !self.target_conn.get_auto_commit() {
+            // Target-build connections are disposable. On error we only need to
+            // unwind connection-local transaction state before the caller drops
+            // the target database handle.
+            let pager = self.target_conn.pager.load();
+            self.target_conn.rollback_manual_txn_cleanup(&pager, true);
+        }
+        Ok(())
+    }
 }
 
-/// Sub-states for the VACUUM INTO engine state machine.
+/// Phases for the vacuum target build state machine.
 #[derive(Default)]
-enum VacuumIntoSubState {
-    /// Mirror symbols/types, set perf flags, begin dest tx, prepare schema query.
+pub(crate) enum VacuumTargetBuildPhase {
+    /// Mirror symbols/types, set perf flags, begin target tx, prepare schema query.
     #[default]
     Init,
     /// Step through schema query to collect rows
     CollectSchemaRows { schema_stmt: Box<crate::Statement> },
-    /// Prepare CREATE TABLE statement on destination (idx into tables_to_create)
+    /// Prepare CREATE TABLE statement on the target (idx into tables_to_create)
     PrepareCreateTable { idx: usize },
-    /// Step through CREATE TABLE statement on destination (async)
+    /// Step through CREATE TABLE statement on the target (async)
     StepCreateTable {
-        dest_schema_stmt: Box<crate::Statement>,
+        target_schema_stmt: Box<crate::Statement>,
         idx: usize,
     },
     /// Start copying a table's data
     StartCopyTable { table_idx: usize },
-    /// Select rows from source table and insert into destination
+    /// Select rows from source table and insert into the target.
     CopyRows {
         select_stmt: Box<crate::Statement>,
-        dest_insert_stmt: Box<crate::Statement>,
+        target_insert_stmt: Box<crate::Statement>,
         table_idx: usize,
     },
-    /// Step through INSERT statement on destination
-    StepDestInsert {
+    /// Step through INSERT statement on the target.
+    StepTargetInsert {
         select_stmt: Box<crate::Statement>,
-        dest_insert_stmt: Box<crate::Statement>,
+        target_insert_stmt: Box<crate::Statement>,
         table_idx: usize,
     },
-    /// Copy meta values (user_version, application_id) from source to destination
-    CopyMetaValues,
-    /// Prepare CREATE INDEX statement on destination (idx into indexes_to_create)
+    /// Prepare CREATE INDEX statement on the target (idx into indexes_to_create)
     PrepareCreateIndex { idx: usize },
-    /// Step through CREATE INDEX statement on destination
+    /// Step through CREATE INDEX statement on the target.
     StepCreateIndex {
-        dest_schema_stmt: Box<crate::Statement>,
+        target_schema_stmt: Box<crate::Statement>,
         idx: usize,
     },
     /// Prepare post-data schema objects (triggers, views, rootpage = 0 entries)
     PreparePostData { idx: usize },
-    /// Step through post-data CREATE statement on destination
+    /// Step through post-data CREATE statement on the target.
     StepPostData {
-        dest_schema_stmt: Box<crate::Statement>,
+        target_schema_stmt: Box<crate::Statement>,
         idx: usize,
     },
+    /// Finalize database header metadata before committing the target database.
+    FinalizeTargetHeader,
     /// Operation complete
     Done,
 }
 
-/// VACUUM INTO - create a compacted copy of the database at the specified path.
+/// Build a compacted vacuum target database.
 ///
 /// This is an async state machine implementation that yields on I/O operations.
-/// The caller creates a new database at the destination path with matching
+/// The caller creates a target database with matching
 /// page_size, reserved bytes, source feature flags, and schema-replay symbols.
 ///
 /// It:
-/// 1. Mirrors source symbols and custom types to destination
+/// 1. Mirrors source symbols and custom types to the target
 /// 2. Queries sqlite_schema for all schema objects including rootpage, ordered by rowid
-/// 3. Creates storage-backed tables (rootpage != 0) in destination, excluding
+/// 3. Creates storage-backed tables (rootpage != 0) in the target, excluding
 ///    sqlite_sequence (auto-created when AUTOINCREMENT tables are created)
 /// 4. Copies data for all storage-backed tables, including sqlite_stat1 and other
 ///    internal storage-backed tables
 /// 5. Creates user-defined secondary indexes after data copy for performance
 ///    (backing-btree indexes for custom index methods are excluded here)
-/// 6. Copies meta values (user_version, application_id) from source to destination
-/// 7. Creates triggers, views, and rootpage = 0 objects last (after data copy).
+/// 6. Creates triggers, views, and rootpage = 0 objects last (after data copy).
 ///    Custom index methods (FTS, vector) recreate and backfill their backing
 ///    indexes from the copied table data in this phase.
-fn vacuum_into_step(
-    config: &VacuumIntoConfig,
-    state: &mut VacuumIntoState,
-) -> Result<IOResult<()>> {
+/// 7. Finalizes target database header metadata, then commits the target transaction.
+pub(crate) fn vacuum_target_build_step(
+    config: &VacuumTargetBuildConfig,
+    state: &mut VacuumTargetBuildContext,
+) -> Result<crate::IOResult<()>> {
     loop {
-        let current_sub_state = std::mem::take(&mut state.sub_state);
+        let current_phase = std::mem::take(&mut state.phase);
 
-        match current_sub_state {
-            VacuumIntoSubState::Init => {
-                // Mirror source symbols needed for schema replay (functions, vtab
-                // modules, index methods). We skip vtabs - those are live instances
-                // tied to the source connection and not needed for compiling schema SQL.
-                {
-                    let source_syms = config.source_conn.syms.read();
-                    let mut dest_syms = state.dest_conn.syms.write();
-                    dest_syms.functions.extend(
-                        source_syms
-                            .functions
-                            .iter()
-                            .map(|(k, v)| (k.clone(), v.clone())),
-                    );
-                    dest_syms.vtab_modules.extend(
-                        source_syms
-                            .vtab_modules
-                            .iter()
-                            .map(|(k, v)| (k.clone(), v.clone())),
-                    );
-                    dest_syms.index_methods.extend(
-                        source_syms
-                            .index_methods
-                            .iter()
-                            .map(|(k, v)| (k.clone(), v.clone())),
-                    );
-                }
-
-                // Mirror source custom type definitions into destination schema
+        match current_phase {
+            VacuumTargetBuildPhase::Init => {
+                // Mirror source custom type definitions into the target schema
                 // so that STRICT tables with custom type columns can resolve
                 // those types during CREATE TABLE replay.
                 if !config.source_custom_types.is_empty() {
-                    state.dest_conn.with_schema_mut(|dest_schema| {
+                    state.target_conn.with_schema_mut(|target_schema| {
                         for (name, td) in &config.source_custom_types {
-                            dest_schema.type_registry.insert(name.clone(), td.clone());
+                            target_schema.type_registry.insert(name.clone(), td.clone());
                         }
                     });
                 }
 
-                // Enable MVCC on destination if source has it enabled
-                // Must be done before any schema operations to ensure the log file is created
-                if config.source_mvcc_enabled {
-                    state.dest_conn.execute("PRAGMA journal_mode = 'mvcc'")?;
+                // Enable MVCC on target if source has it enabled
+                if config.target_mvcc_enabled {
+                    state.target_conn.execute("PRAGMA journal_mode = 'mvcc'")?;
                 }
 
-                // Performance optimizations for destination database (matches SQLite vacuum.c):
-                // 1. Disable fsync - destination is a new file, if crash occurs we just delete it
+                // Performance optimizations for the target database (matches SQLite vacuum.c):
+                // 1. Disable fsync - the target is a new output/temp database, if crash occurs we just delete it
                 // 2. Disable foreign key checks - source data is already consistent
+                // 3. Defer auto-checkpoint until the caller performs the final durable checkpoint
                 // These match SQLite's vacuum.c optimizations (PAGER_SYNCHRONOUS_OFF, ~SQLITE_ForeignKeys)
-                state.dest_conn.set_sync_mode(crate::SyncMode::Off);
-                state.dest_conn.set_foreign_keys_enabled(false);
+                state.target_conn.set_sync_mode(crate::SyncMode::Off);
+                state.target_conn.set_foreign_keys_enabled(false);
+                state.target_conn.set_check_constraints_ignored(true);
+                state.target_conn.wal_auto_checkpoint_disable();
 
-                // Wrap all operations in a single transaction for atomicity.
-                state.dest_conn.execute("BEGIN")?;
+                // Wrap all operations in a single write transaction so helper
+                // statements share one durable target build and cleanup can
+                // roll it back reliably on error.
+                state.target_conn.execute("BEGIN IMMEDIATE")?;
+                state
+                    .target_conn
+                    .pager
+                    .load()
+                    .persist_auto_vacuum_mode(config.target_auto_vacuum_mode)?;
 
                 // Query sqlite_schema with rootpage, ordered by rowid.
-                // Exclude the MVCC metadata table - it is an internal artifact.
+                // Decide whether schema replay should include the internal MVCC metadata table.
+                // VACUUM INTO excludes it because an MVCC destination bootstraps that table
+                // itself. In-place VACUUM includes it because the temp image is the future
+                // physical source database and must preserve the table as-is.
                 let escaped_schema_name = &config.escaped_schema_name;
-                let schema_sql = format!(
-                    "SELECT type, name, tbl_name, rootpage, sql \
-                     FROM \"{escaped_schema_name}\".sqlite_schema \
-                     WHERE sql IS NOT NULL AND name <> '{}' ORDER BY rowid",
-                    crate::mvcc::database::MVCC_META_TABLE_NAME
-                );
+                let schema_sql = if config.copy_mvcc_metadata_table {
+                    format!(
+                        "SELECT type, name, tbl_name, rootpage, sql \
+                         FROM \"{escaped_schema_name}\".sqlite_schema \
+                         WHERE sql IS NOT NULL ORDER BY rowid"
+                    )
+                } else {
+                    format!(
+                        "SELECT type, name, tbl_name, rootpage, sql \
+                         FROM \"{escaped_schema_name}\".sqlite_schema \
+                         WHERE sql IS NOT NULL AND name <> '{}' ORDER BY rowid",
+                        crate::mvcc::database::MVCC_META_TABLE_NAME
+                    )
+                };
                 let schema_stmt = config.source_conn.prepare_internal(schema_sql.as_str())?;
 
-                state.sub_state = VacuumIntoSubState::CollectSchemaRows {
+                state.phase = VacuumTargetBuildPhase::CollectSchemaRows {
                     schema_stmt: Box::new(schema_stmt),
                 };
                 continue;
             }
 
-            VacuumIntoSubState::CollectSchemaRows { mut schema_stmt } => {
+            VacuumTargetBuildPhase::CollectSchemaRows { mut schema_stmt } => {
                 match schema_stmt.step()? {
                     crate::StepResult::Row => {
                         let row = schema_stmt
                             .row()
                             .expect("StepResult::Row but row() returned None");
                         state.schema_entries.push(SchemaEntry::from_row(row)?);
-                        state.sub_state = VacuumIntoSubState::CollectSchemaRows { schema_stmt };
+                        state.phase = VacuumTargetBuildPhase::CollectSchemaRows { schema_stmt };
                         continue;
                     }
                     crate::StepResult::Done => {
@@ -392,7 +586,7 @@ fn vacuum_into_step(
                                 let entry = &state.schema_entries[*entry_ordinal];
                                 !config
                                     .source_conn
-                                    .with_schema(config.database_id, |schema| {
+                                    .with_schema(config.source_db_id, |schema| {
                                         schema
                                             .get_index(&entry.tbl_name, &entry.name)
                                             .is_some_and(|idx| idx.is_backing_btree_index())
@@ -401,15 +595,15 @@ fn vacuum_into_step(
                             .collect();
                         state.post_data_entries = post_data;
 
-                        state.sub_state = VacuumIntoSubState::PrepareCreateTable { idx: 0 };
+                        state.phase = VacuumTargetBuildPhase::PrepareCreateTable { idx: 0 };
                         continue;
                     }
                     crate::StepResult::IO => {
                         let io = schema_stmt
                             .take_io_completions()
                             .expect("StepResult::IO returned but no completions available");
-                        state.sub_state = VacuumIntoSubState::CollectSchemaRows { schema_stmt };
-                        return Ok(IOResult::IO(io));
+                        state.phase = VacuumTargetBuildPhase::CollectSchemaRows { schema_stmt };
+                        return Ok(crate::IOResult::IO(io));
                     }
                     crate::StepResult::Busy | crate::StepResult::Interrupt => {
                         return Err(LimboError::Busy);
@@ -419,11 +613,11 @@ fn vacuum_into_step(
 
             // Phase 1: Create storage-backed tables (rootpage != 0, type=table),
             // excluding sqlite_sequence (auto-created by AUTOINCREMENT tables).
-            VacuumIntoSubState::PrepareCreateTable { idx } => {
+            VacuumTargetBuildPhase::PrepareCreateTable { idx } => {
                 let entries_len = state.tables_to_create.len();
                 if idx >= entries_len {
                     // Done creating tables, start copying data
-                    state.sub_state = VacuumIntoSubState::StartCopyTable { table_idx: 0 };
+                    state.phase = VacuumTargetBuildPhase::StartCopyTable { table_idx: 0 };
                     continue;
                 }
 
@@ -433,47 +627,47 @@ fn vacuum_into_step(
 
                 // System tables (sqlite_stat1, __turso_internal_types, etc.) have
                 // reserved name prefixes that translate_create_table rejects for
-                // user SQL. Temporarily mark the dest connection as nested during
+                // user SQL. Temporarily mark the target connection as nested during
                 // prepare() so the reserved-name check is bypassed at compile
                 // time. The guard is only for prepare: keeping it during step()
                 // would make this CREATE TABLE look nested, so its Transaction
                 // opcode would skip write setup.
                 let is_system = crate::schema::is_system_table(&entry.name);
                 if is_system {
-                    state.dest_conn.start_nested();
+                    state.target_conn.start_nested();
                 }
-                let dest_stmt = state.dest_conn.prepare(sql_str);
+                let target_stmt = state.target_conn.prepare(sql_str);
                 if is_system {
-                    state.dest_conn.end_nested();
+                    state.target_conn.end_nested();
                 }
-                let dest_stmt = dest_stmt?;
-                state.sub_state = VacuumIntoSubState::StepCreateTable {
-                    dest_schema_stmt: Box::new(dest_stmt),
+                let target_stmt = target_stmt?;
+                state.phase = VacuumTargetBuildPhase::StepCreateTable {
+                    target_schema_stmt: Box::new(target_stmt),
                     idx,
                 };
                 continue;
             }
 
-            VacuumIntoSubState::StepCreateTable {
-                mut dest_schema_stmt,
+            VacuumTargetBuildPhase::StepCreateTable {
+                mut target_schema_stmt,
                 idx,
-            } => match dest_schema_stmt.step()? {
+            } => match target_schema_stmt.step()? {
                 crate::StepResult::Row => {
                     unreachable!("CREATE TABLE statement unexpectedly returned a row");
                 }
                 crate::StepResult::Done => {
-                    state.sub_state = VacuumIntoSubState::PrepareCreateTable { idx: idx + 1 };
+                    state.phase = VacuumTargetBuildPhase::PrepareCreateTable { idx: idx + 1 };
                     continue;
                 }
                 crate::StepResult::IO => {
-                    let io = dest_schema_stmt
+                    let io = target_schema_stmt
                         .take_io_completions()
                         .expect("StepResult::IO returned but no completions available");
-                    state.sub_state = VacuumIntoSubState::StepCreateTable {
-                        dest_schema_stmt,
+                    state.phase = VacuumTargetBuildPhase::StepCreateTable {
+                        target_schema_stmt,
                         idx,
                     };
-                    return Ok(IOResult::IO(io));
+                    return Ok(crate::IOResult::IO(io));
                 }
                 crate::StepResult::Busy | crate::StepResult::Interrupt => {
                     return Err(LimboError::Busy);
@@ -484,11 +678,11 @@ fn vacuum_into_step(
             // Column lists are derived from BTreeTable.columns in the schema,
             // not PRAGMA table_info, because table_info omits generated columns
             // while SELECT * includes them - causing a column count mismatch.
-            VacuumIntoSubState::StartCopyTable { table_idx } => {
+            VacuumTargetBuildPhase::StartCopyTable { table_idx } => {
                 let tables_len = state.tables_to_copy.len();
                 if table_idx >= tables_len {
-                    // Done copying all tables, proceed to meta values
-                    state.sub_state = VacuumIntoSubState::CopyMetaValues;
+                    // Done copying all tables, proceed to deferred indexes.
+                    state.phase = VacuumTargetBuildPhase::PrepareCreateIndex { idx: 0 };
                     continue;
                 }
 
@@ -496,21 +690,21 @@ fn vacuum_into_step(
                 let entry = &state.schema_entries[entry_ordinal];
                 let table_name = &entry.name;
 
-                // sqlite_sequence: only copy data if the destination has it
+                // sqlite_sequence: only copy data if the target has it
                 // (auto-created when an AUTOINCREMENT table was created in
                 // phase 1). If not present, skip — no AUTOINCREMENT tables
                 // means no counters to preserve. The explicit copy is needed
                 // because inserting rows with the `rowid` pseudo-column does
                 // not update sqlite_sequence counters automatically.
                 if entry.is_sqlite_sequence() {
-                    let dest_has_sequence = state
-                        .dest_conn
+                    let target_has_sequence = state
+                        .target_conn
                         .schema
                         .read()
                         .get_btree_table(crate::schema::SQLITE_SEQUENCE_TABLE_NAME)
                         .is_some();
-                    if !dest_has_sequence {
-                        state.sub_state = VacuumIntoSubState::StartCopyTable {
+                    if !target_has_sequence {
+                        state.phase = VacuumTargetBuildPhase::StartCopyTable {
                             table_idx: table_idx + 1,
                         };
                         continue;
@@ -523,17 +717,23 @@ fn vacuum_into_step(
                 // INSERT arities stay aligned.
                 let source_btree_table = config
                     .source_conn
-                    .with_schema(config.database_id, |schema| {
+                    .with_schema(config.source_db_id, |schema| {
                         schema.get_btree_table(table_name)
                     });
 
+                // sqlite_sequence may already have rows from the AUTOINCREMENT
+                // tracking that ran during the table data copy. Use INSERT OR
+                // REPLACE so the source counter values overwrite any stale
+                // auto-generated ones (matches SQLite vacuum.c behavior).
+                // todo: sqlite disables AUTOINCREMENT during vacuum, but we don't have such a way yet
                 let (select_sql, insert_sql) = build_copy_sql(
                     &config.escaped_schema_name,
                     &escaped_table_name,
                     source_btree_table.as_deref(),
+                    entry.is_sqlite_sequence(),
                 )?;
 
-                // SELECT from source, INSERT into destination.
+                // SELECT from source, INSERT into the target.
                 let select_stmt = config.source_conn.prepare_internal(&select_sql)?;
 
                 // System tables need nested mode during prepare() to bypass
@@ -542,25 +742,25 @@ fn vacuum_into_step(
                 // Transaction opcode needs to run for page-level write setup.
                 let is_system = crate::schema::is_system_table(table_name);
                 if is_system {
-                    state.dest_conn.start_nested();
+                    state.target_conn.start_nested();
                 }
-                let dest_insert_stmt = state.dest_conn.prepare(&insert_sql);
+                let target_insert_stmt = state.target_conn.prepare(&insert_sql);
                 if is_system {
-                    state.dest_conn.end_nested();
+                    state.target_conn.end_nested();
                 }
-                let dest_insert_stmt = dest_insert_stmt?;
+                let target_insert_stmt = target_insert_stmt?;
 
-                state.sub_state = VacuumIntoSubState::CopyRows {
+                state.phase = VacuumTargetBuildPhase::CopyRows {
                     select_stmt: Box::new(select_stmt),
-                    dest_insert_stmt: Box::new(dest_insert_stmt),
+                    target_insert_stmt: Box::new(target_insert_stmt),
                     table_idx,
                 };
                 continue;
             }
 
-            VacuumIntoSubState::CopyRows {
+            VacuumTargetBuildPhase::CopyRows {
                 mut select_stmt,
-                mut dest_insert_stmt,
+                mut target_insert_stmt,
                 table_idx,
             } => match select_stmt.step()? {
                 crate::StepResult::Row => {
@@ -568,24 +768,24 @@ fn vacuum_into_step(
                         .row()
                         .expect("StepResult::Row but row() returned None");
 
-                    dest_insert_stmt.reset()?;
-                    dest_insert_stmt.clear_bindings();
+                    target_insert_stmt.reset()?;
+                    target_insert_stmt.clear_bindings();
                     for (i, value) in row.get_values().cloned().enumerate() {
                         let index =
                             std::num::NonZero::new(i + 1).expect("i + 1 is always non-zero");
-                        dest_insert_stmt.bind_at(index, value);
+                        target_insert_stmt.bind_at(index, value);
                     }
 
-                    state.sub_state = VacuumIntoSubState::StepDestInsert {
+                    state.phase = VacuumTargetBuildPhase::StepTargetInsert {
                         select_stmt,
-                        dest_insert_stmt,
+                        target_insert_stmt,
                         table_idx,
                     };
                     continue;
                 }
                 crate::StepResult::Done => {
                     // Move to next table
-                    state.sub_state = VacuumIntoSubState::StartCopyTable {
+                    state.phase = VacuumTargetBuildPhase::StartCopyTable {
                         table_idx: table_idx + 1,
                     };
                     continue;
@@ -594,76 +794,57 @@ fn vacuum_into_step(
                     let io = select_stmt
                         .take_io_completions()
                         .expect("StepResult::IO returned but no completions available");
-                    state.sub_state = VacuumIntoSubState::CopyRows {
+                    state.phase = VacuumTargetBuildPhase::CopyRows {
                         select_stmt,
-                        dest_insert_stmt,
+                        target_insert_stmt,
                         table_idx,
                     };
-                    return Ok(IOResult::IO(io));
+                    return Ok(crate::IOResult::IO(io));
                 }
                 crate::StepResult::Busy | crate::StepResult::Interrupt => {
                     return Err(LimboError::Busy);
                 }
             },
 
-            VacuumIntoSubState::StepDestInsert {
+            VacuumTargetBuildPhase::StepTargetInsert {
                 select_stmt,
-                mut dest_insert_stmt,
+                mut target_insert_stmt,
                 table_idx,
-            } => match dest_insert_stmt.step()? {
+            } => match target_insert_stmt.step()? {
                 crate::StepResult::Row => {
                     unreachable!("INSERT statement unexpectedly returned a row");
                 }
                 crate::StepResult::Done => {
                     // Go back to get next row from source
-                    state.sub_state = VacuumIntoSubState::CopyRows {
+                    state.phase = VacuumTargetBuildPhase::CopyRows {
                         select_stmt,
-                        dest_insert_stmt,
+                        target_insert_stmt,
                         table_idx,
                     };
                     continue;
                 }
                 crate::StepResult::IO => {
-                    let io = dest_insert_stmt
+                    let io = target_insert_stmt
                         .take_io_completions()
                         .expect("StepResult::IO returned but no completions available");
-                    state.sub_state = VacuumIntoSubState::StepDestInsert {
+                    state.phase = VacuumTargetBuildPhase::StepTargetInsert {
                         select_stmt,
-                        dest_insert_stmt,
+                        target_insert_stmt,
                         table_idx,
                     };
-                    return Ok(IOResult::IO(io));
+                    return Ok(crate::IOResult::IO(io));
                 }
                 crate::StepResult::Busy | crate::StepResult::Interrupt => {
                     return Err(LimboError::Busy);
                 }
             },
 
-            VacuumIntoSubState::CopyMetaValues => {
-                // Copy meta values to destination database
-                // Use pragma_update to set user_version and application_id
-                // Note: schema_version is not copied - VACUUM INTO creates a new file so
-                // there's no cache to invalidate. The destination will have its own
-                // schema_version based on the schema operations performed.
-                state
-                    .dest_conn
-                    .pragma_update("user_version", config.source_user_version.to_string())?;
-                state
-                    .dest_conn
-                    .pragma_update("application_id", config.source_application_id.to_string())?;
-
-                // Phase 3: Create user-defined secondary indexes after data copy
-                // for performance (avoids maintaining indexes during bulk insert).
-                state.sub_state = VacuumIntoSubState::PrepareCreateIndex { idx: 0 };
-                continue;
-            }
-
             // Phase 3: Create user-defined secondary indexes.
-            VacuumIntoSubState::PrepareCreateIndex { idx } => {
+            VacuumTargetBuildPhase::PrepareCreateIndex { idx } => {
                 let entries_len = state.indexes_to_create.len();
                 if idx >= entries_len {
                     // Done creating indexes, move to post-data objects
-                    state.sub_state = VacuumIntoSubState::PreparePostData { idx: 0 };
+                    state.phase = VacuumTargetBuildPhase::PreparePostData { idx: 0 };
                     continue;
                 }
 
@@ -672,34 +853,34 @@ fn vacuum_into_step(
                 // Backing-btree indexes for custom index methods were filtered
                 // out when indexes_to_create was built. The remaining CREATE
                 // INDEX statements are user-visible and can use ordinary prepare.
-                let dest_stmt = state.dest_conn.prepare(&entry.sql)?;
-                state.sub_state = VacuumIntoSubState::StepCreateIndex {
-                    dest_schema_stmt: Box::new(dest_stmt),
+                let target_stmt = state.target_conn.prepare(&entry.sql)?;
+                state.phase = VacuumTargetBuildPhase::StepCreateIndex {
+                    target_schema_stmt: Box::new(target_stmt),
                     idx,
                 };
                 continue;
             }
 
-            VacuumIntoSubState::StepCreateIndex {
-                mut dest_schema_stmt,
+            VacuumTargetBuildPhase::StepCreateIndex {
+                mut target_schema_stmt,
                 idx,
-            } => match dest_schema_stmt.step()? {
+            } => match target_schema_stmt.step()? {
                 crate::StepResult::Row => {
                     unreachable!("CREATE INDEX statement unexpectedly returned a row");
                 }
                 crate::StepResult::Done => {
-                    state.sub_state = VacuumIntoSubState::PrepareCreateIndex { idx: idx + 1 };
+                    state.phase = VacuumTargetBuildPhase::PrepareCreateIndex { idx: idx + 1 };
                     continue;
                 }
                 crate::StepResult::IO => {
-                    let io = dest_schema_stmt
+                    let io = target_schema_stmt
                         .take_io_completions()
                         .expect("StepResult::IO returned but no completions available");
-                    state.sub_state = VacuumIntoSubState::StepCreateIndex {
-                        dest_schema_stmt,
+                    state.phase = VacuumTargetBuildPhase::StepCreateIndex {
+                        target_schema_stmt,
                         idx,
                     };
-                    return Ok(IOResult::IO(io));
+                    return Ok(crate::IOResult::IO(io));
                 }
                 crate::StepResult::Busy | crate::StepResult::Interrupt => {
                     return Err(LimboError::Busy);
@@ -707,53 +888,66 @@ fn vacuum_into_step(
             },
 
             // Phase 4: Create triggers, views, and rootpage=0 schema objects.
-            VacuumIntoSubState::PreparePostData { idx } => {
+            VacuumTargetBuildPhase::PreparePostData { idx } => {
                 let entries_len = state.post_data_entries.len();
                 if idx >= entries_len {
-                    state.sub_state = VacuumIntoSubState::Done;
+                    state.phase = VacuumTargetBuildPhase::FinalizeTargetHeader;
                     continue;
                 }
 
                 let entry_ordinal = state.post_data_entries[idx];
                 let entry = &state.schema_entries[entry_ordinal];
-                let dest_stmt = state.dest_conn.prepare(&entry.sql)?;
-                state.sub_state = VacuumIntoSubState::StepPostData {
-                    dest_schema_stmt: Box::new(dest_stmt),
+                let target_stmt = state.target_conn.prepare(&entry.sql)?;
+                state.phase = VacuumTargetBuildPhase::StepPostData {
+                    target_schema_stmt: Box::new(target_stmt),
                     idx,
                 };
                 continue;
             }
 
-            VacuumIntoSubState::StepPostData {
-                mut dest_schema_stmt,
+            VacuumTargetBuildPhase::StepPostData {
+                mut target_schema_stmt,
                 idx,
-            } => match dest_schema_stmt.step()? {
+            } => match target_schema_stmt.step()? {
                 crate::StepResult::Row => {
                     unreachable!("CREATE statement unexpectedly returned a row");
                 }
                 crate::StepResult::Done => {
-                    state.sub_state = VacuumIntoSubState::PreparePostData { idx: idx + 1 };
+                    state.phase = VacuumTargetBuildPhase::PreparePostData { idx: idx + 1 };
                     continue;
                 }
                 crate::StepResult::IO => {
-                    let io = dest_schema_stmt
+                    let io = target_schema_stmt
                         .take_io_completions()
                         .expect("StepResult::IO returned but no completions available");
-                    state.sub_state = VacuumIntoSubState::StepPostData {
-                        dest_schema_stmt,
+                    state.phase = VacuumTargetBuildPhase::StepPostData {
+                        target_schema_stmt,
                         idx,
                     };
-                    return Ok(IOResult::IO(io));
+                    return Ok(crate::IOResult::IO(io));
                 }
                 crate::StepResult::Busy | crate::StepResult::Interrupt => {
                     return Err(LimboError::Busy);
                 }
             },
 
-            VacuumIntoSubState::Done => {
-                // Commit the destination transaction started in Init state.
-                state.dest_conn.execute("COMMIT")?;
-                return Ok(IOResult::Done(()));
+            VacuumTargetBuildPhase::FinalizeTargetHeader => {
+                match finalize_vacuum_target_header(&state.target_conn, &config.header_meta)? {
+                    crate::IOResult::Done(()) => {}
+                    crate::IOResult::IO(io) => {
+                        state.phase = VacuumTargetBuildPhase::FinalizeTargetHeader;
+                        return Ok(crate::IOResult::IO(io));
+                    }
+                }
+
+                state.phase = VacuumTargetBuildPhase::Done;
+                continue;
+            }
+
+            VacuumTargetBuildPhase::Done => {
+                // Commit the target transaction started in Init phase.
+                state.target_conn.execute("COMMIT")?;
+                return Ok(crate::IOResult::Done(()));
             }
         }
     }
@@ -780,7 +974,8 @@ fn vacuum_into_step(
 pub(crate) fn build_copy_sql(
     escaped_schema_name: &str,
     escaped_table_name: &str,
-    source_btree_table: Option<&crate::schema::BTreeTable>,
+    source_btree_table: Option<&BTreeTable>,
+    or_replace: bool,
 ) -> Result<(String, String)> {
     let Some(btree) = source_btree_table else {
         // Storage-backed tables must have schema metadata. If we get here,
