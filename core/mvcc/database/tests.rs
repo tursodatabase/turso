@@ -208,6 +208,55 @@ fn mvcc_reset_after_vacuum_installs_header_and_rootpages() {
 }
 
 #[test]
+fn mvcc_reset_after_vacuum_clears_stale_empty_version_buckets() {
+    let db = MvccTestDb::new();
+    db.conn
+        .execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")
+        .unwrap();
+    db.conn.execute("CREATE INDEX idx_t_v ON t(v)").unwrap();
+    db.conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+
+    db.conn.demote_to_mvcc_connection();
+    db.conn.reparse_schema().unwrap();
+    let schema = db.conn.schema.read().clone();
+    db.conn.promote_to_regular_connection();
+
+    let stale_table_id = MVTableId::from(-999_i64);
+    let stale_row_id = RowID::new(stale_table_id, RowKey::Int(999));
+    let stale_index_id = MVTableId::from(-1000_i64);
+
+    db.mvcc_store
+        .rows
+        .insert(stale_row_id.clone(), parking_lot::RwLock::new(Vec::new()));
+    db.mvcc_store
+        .index_rows
+        .insert(stale_index_id, crossbeam_skiplist::SkipMap::new());
+    db.mvcc_store
+        .insert_table_id_to_rootpage(stale_table_id, Some(999));
+
+    db.mvcc_store.try_begin_vacuum_gate().unwrap();
+    db.mvcc_store
+        .reset_after_vacuum(DatabaseHeader::default(), schema.as_ref());
+    db.mvcc_store.release_vacuum_gate();
+
+    assert!(
+        db.mvcc_store.rows.get(&stale_row_id).is_none(),
+        "stale table row buckets must be cleared across VACUUM root-page reset"
+    );
+    assert!(
+        db.mvcc_store.index_rows.get(&stale_index_id).is_none(),
+        "stale index buckets must be cleared across VACUUM root-page reset"
+    );
+    assert!(
+        db.mvcc_store
+            .table_id_to_rootpage
+            .get(&stale_table_id)
+            .is_none(),
+        "stale root-page mappings must be cleared across VACUUM root-page reset"
+    );
+}
+
+#[test]
 fn mvcc_reset_after_vacuum_clears_checkpointed_empty_version_buckets() {
     let db = MvccTestDb::new();
     db.conn

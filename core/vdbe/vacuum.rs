@@ -530,9 +530,6 @@ pub(crate) fn vacuum_target_build_step(
                 // Enable MVCC on targets that should persist as MVCC.
                 if config.target_mvcc_enabled {
                     state.target_conn.execute("PRAGMA journal_mode = 'mvcc'")?;
-                    if let Some(mv_store) = state.target_conn.mv_store().as_ref() {
-                        mv_store.set_checkpoint_threshold(i64::MAX);
-                    }
                 }
 
                 // Performance optimizations for the target database (matches SQLite vacuum.c):
@@ -1367,16 +1364,6 @@ fn vacuum_completion_error(completion: &Completion, context: &'static str) -> Li
     )
 }
 
-fn vacuum_completion_error(
-    completion: &crate::io::Completion,
-    context: &'static str,
-) -> LimboError {
-    completion.get_error().map_or_else(
-        || LimboError::InternalError(format!("VACUUM: {context} failed")),
-        LimboError::CompletionError,
-    )
-}
-
 /// Coalesce `(page_ref, frame_id)` pairs into contiguous-frame-id runs.
 ///
 /// Plain `VACUUM` relies on the temp-WAL-only invariant: every temp page
@@ -1524,12 +1511,7 @@ struct VacuumCommittedImageMeta {
 }
 
 fn replace_shared_schema_after_vacuum(source_db: &Database, schema: Arc<Schema>) {
-    source_db
-        .with_schema_mut(|current| {
-            *current = schema.as_ref().clone();
-            Ok(())
-        })
-        .expect("VACUUM shared schema replacement should be infallible");
+    *source_db.schema.lock() = schema;
 }
 
 fn install_mvcc_state_after_vacuum_commit(
@@ -1658,6 +1640,11 @@ fn vacuum_in_place_step(
                 let wal = source_pager.wal.as_ref().ok_or_else(|| {
                     LimboError::InternalError("VACUUM requires a WAL-mode database".to_string())
                 })?;
+                if source_db.experimental_multiprocess_wal_enabled() {
+                    return Err(LimboError::TxError(
+                        "cannot VACUUM experimental multiprocess WAL databases".to_string(),
+                    ));
+                }
                 // 7. In MVCC mode, hold the existing MVCC stop-the-world
                 // gate for the full VACUUM. Callers are expected to run MVCC
                 // checkpoint before VACUUM; this gate only enforces that no
@@ -2358,6 +2345,7 @@ fn vacuum_in_place_cleanup(
 mod tests {
     use super::*;
     use crate::io::{FileId, FileSyncType};
+    use crate::schema::BTreeTable;
     use crate::schema::Schema;
     use crate::storage::encryption::{CipherMode, EncryptionKey};
     use crate::storage::pager::Page;
@@ -2503,6 +2491,7 @@ mod tests {
         ranges
     }
 
+    #[test]
     fn coalesce_frame_runs_empty_returns_empty() {
         let runs = coalesce_frame_runs(Vec::new());
         assert!(runs.is_empty());
@@ -2600,6 +2589,87 @@ mod tests {
     }
 
     #[test]
+    fn coalesce_frame_runs_handles_frame_gaps_larger_than_u32() {
+        let runs = coalesce_frame_runs(vec![
+            (page_ref(1), 1),
+            (page_ref(2), 2),
+            (page_ref(3), u32::MAX as u64 + 10),
+            (page_ref(4), u32::MAX as u64 + 11),
+        ]);
+
+        assert_eq!(runs.len(), 2);
+        assert_eq!(runs[0].0, 1);
+        assert_eq!(
+            runs[0].1.iter().map(|p| p.get().id).collect::<Vec<_>>(),
+            vec![1, 2]
+        );
+        assert_eq!(runs[1].0, u32::MAX as u64 + 10);
+        assert_eq!(
+            runs[1].1.iter().map(|p| p.get().id).collect::<Vec<_>>(),
+            vec![3, 4]
+        );
+    }
+
+    #[test]
+    fn build_copy_sql_or_replace_for_regular_table_still_generates_insert_sql() {
+        let table = BTreeTable::from_sql("CREATE TABLE t(id INTEGER PRIMARY KEY, payload TEXT)", 2)
+            .unwrap();
+
+        let (select_sql, insert_sql) = build_copy_sql("main", "t", Some(&table), true).unwrap();
+
+        assert!(
+            select_sql.starts_with("SELECT "),
+            "unexpected SELECT SQL: {select_sql}"
+        );
+        assert!(
+            select_sql.ends_with(" FROM \"main\".\"t\""),
+            "unexpected source table reference: {select_sql}"
+        );
+        assert!(
+            insert_sql.starts_with("INSERT OR REPLACE INTO \"t\""),
+            "unexpected insert SQL for or_replace helper misuse: {insert_sql}"
+        );
+        assert!(
+            insert_sql.contains("VALUES"),
+            "unexpected placeholder/column layout: {insert_sql}"
+        );
+    }
+
+    #[test]
+    fn mvcc_vacuum_guard_drop_promotes_demoted_connection() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let db_path = temp_dir.path().join("mvcc-vacuum-guard.db");
+        let io: Arc<dyn crate::IO> = Arc::new(crate::PlatformIO::new().unwrap());
+        let db = Database::open_file(io, db_path.to_str().unwrap()).unwrap();
+        let conn = db.connect().unwrap();
+        conn.execute("PRAGMA journal_mode = 'mvcc'").unwrap();
+
+        let mv_store = db
+            .get_mv_store()
+            .as_ref()
+            .cloned()
+            .expect("MVCC mode should materialize an MV store");
+        let mut guard = MvccVacuumGuard::acquire(conn.clone(), mv_store).unwrap();
+
+        assert!(
+            !conn.is_mvcc_bootstrap_connection(),
+            "fresh MVCC connection should not start demoted"
+        );
+        guard.demote_connection();
+        assert!(
+            conn.is_mvcc_bootstrap_connection(),
+            "guard demotion should put the connection into bootstrap mode"
+        );
+
+        drop(guard);
+
+        assert!(
+            !conn.is_mvcc_bootstrap_connection(),
+            "dropping the MVCC vacuum guard must restore a regular connection"
+        );
+    }
+
+    #[test]
     fn vacuum_copy_batch_ranges_cover_boundary_page_counts() {
         let size = VACUUM_COPY_BATCH_SIZE;
         assert!(vacuum_copy_batch_ranges(0).is_empty());
@@ -2623,6 +2693,20 @@ mod tests {
                 (size * 2 + 1, size * 2 + 2),
             ]
         );
+    }
+
+    #[test]
+    fn next_vacuum_copy_batch_start_accepts_u32_max_minus_one_total_pages() {
+        assert_eq!(
+            next_vacuum_copy_batch_start(u32::MAX - 1, u32::MAX - 1),
+            u32::MAX
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "vacuum copy batch requires a representable exclusive end page")]
+    fn next_vacuum_copy_batch_start_panics_when_total_pages_is_u32_max() {
+        let _ = next_vacuum_copy_batch_start(1, u32::MAX);
     }
 
     #[test]
@@ -2898,6 +2982,18 @@ mod tests {
         );
 
         Ok(())
+    }
+
+    #[test]
+    fn vacuum_db_header_meta_preserves_non_utf8_text_encoding() {
+        let mut source = DatabaseHeader::default();
+        source.text_encoding = TextEncoding::Utf16Le;
+
+        let header_meta = VacuumDbHeaderMeta::from_source_header(&source);
+        let mut target = DatabaseHeader::default();
+        header_meta.apply_to(&mut target);
+
+        assert_eq!(target.text_encoding, TextEncoding::Utf16Le);
     }
 
     #[cfg(not(target_family = "wasm"))]

@@ -101,8 +101,38 @@ impl QueuedIo {
         self.state.history.lock().unwrap()[start..].to_vec()
     }
 
+    pub(crate) fn pending_events(&self) -> Vec<QueuedIoEvent> {
+        self.state
+            .pending
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|op| op.event.clone())
+            .collect()
+    }
+
     pub(crate) fn step_one(&self) -> turso_core::Result<Option<QueuedIoEvent>> {
         let Some(op) = self.state.pending.lock().unwrap().pop_front() else {
+            return Ok(None);
+        };
+        let event = op.event.clone();
+        (op.action)()?;
+        self.state.history.lock().unwrap().push(event.clone());
+        Ok(Some(event))
+    }
+
+    pub(crate) fn step_last_matching<F>(
+        &self,
+        predicate: F,
+    ) -> turso_core::Result<Option<QueuedIoEvent>>
+    where
+        F: Fn(&QueuedIoEvent) -> bool,
+    {
+        let Some(op) = ({
+            let mut pending = self.state.pending.lock().unwrap();
+            let idx = pending.iter().rposition(|op| predicate(&op.event));
+            idx.and_then(|idx| pending.remove(idx))
+        }) else {
             return Ok(None);
         };
         let event = op.event.clone();

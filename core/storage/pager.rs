@@ -5563,6 +5563,65 @@ mod ptrmap_tests {
     }
 
     #[test]
+    fn persist_auto_vacuum_mode_updates_initialized_header_and_leaves_page_one_dirty() {
+        let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+        let db_file: Arc<dyn DatabaseStorage> = Arc::new(DatabaseFile::new(
+            io.open_file("initialized-auto-vacuum.db", OpenFlags::Create, true)
+                .unwrap(),
+        ));
+        let buffer_pool = BufferPool::begin_init(&io, 65536);
+        let pager = Pager::new(
+            db_file,
+            None,
+            io,
+            PageCache::new(4),
+            buffer_pool,
+            Arc::new(Mutex::new(())),
+            Arc::new(ArcSwapOption::new(Some(default_page1(None)))),
+        )
+        .unwrap();
+
+        run_until_done(|| pager.allocate_page1(), &pager).unwrap();
+        pager.dirty_pages.write().clear();
+        assert!(pager.db_initialized());
+        assert!(
+            pager.dirty_pages.read().is_empty(),
+            "initialized-db test setup should start with no dirty pages"
+        );
+
+        pager
+            .persist_auto_vacuum_mode(AutoVacuumMode::Full)
+            .unwrap();
+
+        let (largest_root_page, incremental_vacuum_enabled) = run_until_done(
+            || {
+                pager.with_header(|header| {
+                    (
+                        header.vacuum_mode_largest_root_page.get(),
+                        header.incremental_vacuum_enabled.get(),
+                    )
+                })
+            },
+            &pager,
+        )
+        .unwrap();
+
+        assert_eq!(largest_root_page, 1);
+        assert_eq!(incremental_vacuum_enabled, 0);
+        assert_eq!(pager.get_auto_vacuum_mode(), AutoVacuumMode::Full);
+        let dirty_pages = pager.dirty_pages.read();
+        assert!(
+            dirty_pages.contains(1),
+            "initialized-db auto-vacuum setup should dirty page 1"
+        );
+        assert_eq!(
+            dirty_pages.len(),
+            1,
+            "initialized-db auto-vacuum setup should only dirty page 1 in this test"
+        );
+    }
+
+    #[test]
     fn test_ptrmap_page_allocation() {
         let page_size = 4096;
         let initial_db_pages = 10;

@@ -45,6 +45,18 @@ fn count_test_rows(conn: &Arc<Connection>) -> i64 {
     count
 }
 
+fn is_multiprocess_vacuum_rejection(err: &LimboError) -> bool {
+    match err {
+        LimboError::ParseError(msg) => {
+            msg.contains("VACUUM is incompatible with experimental multiprocess WAL")
+        }
+        LimboError::TxError(msg) | LimboError::InternalError(msg) => {
+            msg.contains("cannot VACUUM experimental multiprocess WAL databases")
+        }
+        _ => false,
+    }
+}
+
 fn get_rows(conn: &Arc<Connection>, query: &str) -> Vec<Vec<Value>> {
     for _attempt in 0..3 {
         let mut stmt = match conn.prepare(query) {
@@ -967,8 +979,8 @@ fn plain_vacuum_rejects_multiprocess_wal_database_without_peer_process() {
         .execute("VACUUM")
         .expect_err("VACUUM should reject multiprocess-WAL databases");
     assert!(
-        matches!(err, LimboError::TxError(ref msg) if msg.contains("cannot VACUUM experimental multiprocess WAL databases")),
-        "expected explicit multiprocess VACUUM rejection, got {err:?}"
+        is_multiprocess_vacuum_rejection(&err),
+        "expected multiprocess VACUUM rejection, got {err:?}"
     );
     assert_eq!(
         count_test_rows(&conn),
@@ -1015,8 +1027,8 @@ fn plain_vacuum_rejects_live_multiprocess_peer_process() {
         .execute("VACUUM")
         .expect_err("VACUUM should reject while another multiprocess-WAL process is live");
     assert!(
-        matches!(err, LimboError::TxError(ref msg) if msg.contains("cannot VACUUM experimental multiprocess WAL databases")),
-        "expected explicit multiprocess VACUUM rejection, got {err:?}"
+        is_multiprocess_vacuum_rejection(&err),
+        "expected multiprocess VACUUM rejection, got {err:?}"
     );
 
     std::fs::write(&release_file, b"release").unwrap();

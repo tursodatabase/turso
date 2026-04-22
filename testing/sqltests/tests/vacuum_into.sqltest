@@ -1,4 +1,4 @@
-@database :memory:
+@database :temp:
 
 @backend rust
 test vacuum-into-empty-path-rejected {
@@ -19,9 +19,159 @@ expect error {
 }
 
 @backend rust
+test vacuum-into-rejected-in-savepoint {
+    CREATE TABLE t(a TEXT);
+    SAVEPOINT sp1;
+    VACUUM INTO 'limbo_vacuum_into_savepoint_should_fail.db';
+}
+expect error {
+    cannot VACUUM INTO from within a transaction
+}
+
+@backend rust
+test vacuum-into-invalid-path-expression {
+    VACUUM INTO 1 + 2;
+}
+expect error {
+    VACUUM INTO requires a string literal path
+}
+
+@backend rust
 test vacuum-into-nonexistent-schema {
     VACUUM bogus INTO 'limbo_vacuum_bogus_schema.db';
 }
 expect error {
     no such database: bogus
+}
+
+# Adapted from SQLite vacuum-into.test: VACUUM INTO must preserve tables with
+# generated columns and CHECK constraints.
+@backend cli
+test vacuum-into-generated-column-and-check-constraint {
+    CREATE TABLE t1(
+        a INTEGER PRIMARY KEY,
+        b BLOB,
+        c INT AS (length(b)),
+        CHECK(typeof(b) != 'integer' OR b > a - 5)
+    );
+    INSERT INTO t1(a, b) VALUES(1, randomblob(600));
+    INSERT INTO t1 SELECT a + 1, randomblob(600) FROM t1;
+    INSERT INTO t1 SELECT a + 2, randomblob(600) FROM t1;
+    INSERT INTO t1 SELECT a + 4, randomblob(600) FROM t1;
+    INSERT INTO t1 SELECT a + 8, randomblob(600) FROM t1;
+    INSERT INTO t1 SELECT a + 16, randomblob(600) FROM t1;
+    INSERT INTO t1 SELECT a + 32, randomblob(600) FROM t1;
+    INSERT INTO t1 SELECT a + 64, randomblob(600) FROM t1;
+    DELETE FROM t1 WHERE a > 100;
+    CREATE INDEX t1b ON t1(b);
+    DELETE FROM t1 WHERE a % 2;
+    SELECT count(*), sum(a), sum(c) FROM t1;
+    PRAGMA integrity_check;
+
+    VACUUM main INTO 'vacuum_into_generated_check.db';
+    PRAGMA integrity_check;
+    .open vacuum_into_generated_check.db
+    SELECT count(*), sum(a), sum(c) FROM t1;
+    PRAGMA integrity_check;
+}
+expect {
+    50|2550|30000
+    ok
+    ok
+    50|2550|30000
+    ok
+}
+
+# Adapted from SQLite vacuum-into.test: existing output files are rejected.
+@backend cli
+test vacuum-into-existing-output-file-rejected {
+    CREATE TABLE t1(a INTEGER PRIMARY KEY, b TEXT);
+    INSERT INTO t1 VALUES(1, 'one');
+    VACUUM INTO 'vacuum_into_existing_output.db';
+    VACUUM INTO 'vacuum_into_existing_output.db';
+}
+expect error {
+    output file already exists
+}
+
+# Adapted from SQLite vacuum-into.test: ':memory:' is accepted as an INTO
+# target expression.
+@backend cli
+test vacuum-into-memory-target {
+    CREATE TABLE t1(a INTEGER PRIMARY KEY, b TEXT);
+    INSERT INTO t1 VALUES(19, 'nineteen');
+    VACUUM main INTO ':memory:';
+    SELECT * FROM t1;
+}
+expect {
+    19|nineteen
+}
+
+# Adapted from SQLite vacuum-into.test: SQLite accepts an arbitrary expression
+# for the INTO target.
+@skip "missing feature: VACUUM INTO does not support arbitrary target expressions; see missing_feature.txt"
+@backend cli
+test vacuum-into-expression-target-from-sqlite {
+    CREATE TABLE t2(name TEXT);
+    INSERT INTO t2 VALUES(':memory:');
+    VACUUM main INTO (SELECT name FROM t2);
+}
+expect {
+}
+
+# Adapted from SQLite vacuum-into.test: target identifiers, NULL, and function
+# calls are evaluated as expressions instead of being treated as literal paths.
+@skip "missing feature: VACUUM INTO does not support arbitrary target expressions; see missing_feature.txt"
+@backend cli
+test vacuum-into-identifier-target-error-from-sqlite {
+    VACUUM INTO x;
+}
+expect error {
+    no such column: x
+}
+
+@skip "missing feature: VACUUM INTO does not support arbitrary target expressions; see missing_feature.txt"
+@backend cli
+test vacuum-into-null-target-error-from-sqlite {
+    VACUUM INTO null;
+}
+expect error {
+    non-text filename
+}
+
+@skip "missing feature: VACUUM INTO does not support arbitrary target expressions; see missing_feature.txt"
+@backend cli
+test vacuum-into-function-target-from-sqlite {
+    VACUUM INTO target();
+}
+expect {
+}
+
+# Adapted from SQLite vacuum-into.test: changing page-size for the output works
+# even when the source database is in WAL mode.
+@skip "missing feature: VACUUM INTO does not support changing page size; see missing_feature.txt"
+@backend cli
+test vacuum-into-page-size-change-from-wal-source {
+    PRAGMA page_size = 4096;
+    PRAGMA journal_mode = WAL;
+    CREATE TABLE t1(a);
+    INSERT INTO t1 VALUES(19);
+    CREATE INDEX t1a ON t1(a);
+    PRAGMA integrity_check;
+    PRAGMA page_size;
+
+    PRAGMA page_size = 1024;
+    VACUUM INTO 'vacuum_into_page_size.db';
+    .open vacuum_into_page_size.db
+    PRAGMA page_size;
+    PRAGMA integrity_check;
+    SELECT a FROM t1;
+}
+expect {
+    wal
+    ok
+    4096
+    1024
+    ok
+    19
 }

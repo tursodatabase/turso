@@ -2370,6 +2370,12 @@ mod tests {
     use super::*;
 
     #[test]
+    fn test_opts_parses_experimental_vacuum_flag() {
+        let opts = Opts::parse_from(["turso", "--experimental-vacuum"]);
+        assert!(opts.experimental_vacuum);
+    }
+
+    #[test]
     fn test_normalize_db_path_adds_file_prefix_for_query_params() {
         assert_eq!(
             normalize_db_path("test.db?locking=shared_reads".into()),
