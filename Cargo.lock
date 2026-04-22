@@ -1927,7 +1927,6 @@ checksum = "4e7f34442dbe69c60fe8eaf58a8cafff81a1f278816d8ab4db255b3bef4ac3c4"
 dependencies = [
  "getrandom 0.3.2",
  "libm",
- "rand 0.9.4",
  "siphasher",
 ]
 
