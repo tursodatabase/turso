@@ -132,6 +132,6 @@ test analyze-table-without-rowid-fails {
     ANALYZE temp;
 }
 expect error {
-    Parse error: WITHOUT ROWID tables are not supported
+    Parse error: ANALYZE on tables without rowid is not supported
 }
 
