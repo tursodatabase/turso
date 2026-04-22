@@ -329,6 +329,7 @@ impl Connection {
             .with_views(self.db.experimental_views_enabled())
             .with_custom_types(self.db.experimental_custom_types_enabled())
             .with_index_method(self.db.experimental_index_method_enabled())
+            .with_vacuum(self.db.experimental_vacuum_enabled())
             .with_generated_columns(self.db.experimental_generated_columns_enabled())
     }
 
@@ -1908,6 +1909,14 @@ impl Connection {
         self.db.experimental_attach_enabled()
     }
 
+    pub fn experimental_vacuum_enabled(&self) -> bool {
+        self.db.experimental_vacuum_enabled()
+    }
+
+    pub fn experimental_multiprocess_wal_enabled(&self) -> bool {
+        self.db.experimental_multiprocess_wal_enabled()
+    }
+
     pub fn experimental_generated_columns_enabled(&self) -> bool {
         self.db.experimental_generated_columns_enabled()
     }
@@ -2337,6 +2346,7 @@ impl Connection {
             .with_views(self.db.experimental_views_enabled())
             .with_custom_types(self.db.experimental_custom_types_enabled())
             .with_index_method(self.db.experimental_index_method_enabled())
+            .with_vacuum(self.db.experimental_vacuum_enabled())
             .with_generated_columns(self.db.experimental_generated_columns_enabled());
         // Select the IO layer for the attached database:
         // - :memory: databases always get a fresh MemoryIO

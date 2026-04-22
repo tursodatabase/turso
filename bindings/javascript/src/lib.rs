@@ -279,6 +279,7 @@ fn connect_sync(db: &DatabaseInner) -> napi::Result<()> {
                     "encryption" => core_opts.with_encryption(true),
                     "index_method" => core_opts.with_index_method(true),
                     "autovacuum" => core_opts.with_autovacuum(true),
+                    "vacuum" => core_opts.with_vacuum(true),
                     "attach" => core_opts.with_attach(true),
                     "generated_columns" => core_opts.with_generated_columns(true),
                     "multiprocess_wal" => core_opts.with_multiprocess_wal(true),

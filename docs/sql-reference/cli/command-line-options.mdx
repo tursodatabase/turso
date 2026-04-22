@@ -146,12 +146,13 @@ Experimental features may have incomplete implementations or known limitations. 
 | `--experimental-encryption` | Enable at-rest database encryption |
 | `--experimental-index-method` | Enable custom index methods. Necessary for FTS and Sparse Vector indexes |
 | `--experimental-autovacuum` | Enable automatic database vacuuming |
+| `--experimental-vacuum` | Enable in-place `VACUUM` |
 | `--experimental-triggers` | Enable triggers (`CREATE TRIGGER` / `DROP TRIGGER`) |
 | `--experimental-attach` | Enable `ATTACH DATABASE` / `DETACH DATABASE` |
 
 ```bash
-# Enable views and triggers
-tursodb --experimental-views --experimental-triggers mydata.db
+# Enable views, triggers, and in-place VACUUM
+tursodb --experimental-views --experimental-triggers --experimental-vacuum mydata.db
 ```
 
 ## Other Flags
