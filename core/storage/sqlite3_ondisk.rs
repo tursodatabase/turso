@@ -1450,6 +1450,7 @@ pub fn build_shared_wal(
             frame_cache: Arc::new(SpinLock::new(FxHashMap::default())),
             file: Some(file.clone()),
             read_locks,
+            vacuum_lock: TursoRwLock::new(),
             write_lock: TursoRwLock::new(),
             checkpoint_lock: TursoRwLock::new(),
             epoch: AtomicU32::new(0),
