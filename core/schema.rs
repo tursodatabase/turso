@@ -2251,7 +2251,7 @@ impl ColumnLayout {
             .filter(|c| !c.is_virtual_generated())
             .count();
         let offsets = btree.logical_to_physical_map.clone();
-        let is_identity = offsets.iter().copied().eq(0..total);
+        let is_identity = non_virtual_col_count == total && offsets.iter().copied().eq(0..total);
         if is_identity {
             Self::Identity {
                 column_count: total,

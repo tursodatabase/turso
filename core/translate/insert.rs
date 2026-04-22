@@ -3526,6 +3526,7 @@ struct PreflightCtx<'a, 'b> {
     table_references: &'b mut TableReferences,
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_constraints_to_check(
     table_name: &str,
     upsert_actions: &[(ResolvedUpsertTarget, BranchOffset, Box<Upsert>)],
