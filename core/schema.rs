@@ -3036,6 +3036,13 @@ impl BTreeTable {
         if self.is_strict {
             sql.push_str(" STRICT");
         }
+        if !self.has_rowid {
+            if self.is_strict {
+                sql.push_str(", WITHOUT ROWID");
+            } else {
+                sql.push_str(" WITHOUT ROWID");
+            }
+        }
 
         sql
     }
@@ -3515,7 +3522,7 @@ pub(crate) fn validate_generated_expr(expr: &Expr) -> Result<()> {
 pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> Result<BTreeTable> {
     let table_name = normalize_ident(tbl_name);
     trace!("Creating table {}", table_name);
-    let has_rowid = true;
+    let has_rowid;
     let mut has_autoincrement = false;
     let mut primary_key_columns = vec![];
     let mut foreign_keys = vec![];
@@ -3530,6 +3537,7 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
             constraints,
             options,
         } => {
+            has_rowid = !options.contains_without_rowid();
             is_strict = options.contains_strict();
 
             // we need to preserve order of unique sets definition
@@ -3918,10 +3926,6 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
                     }
                 }
                 cols.push(col);
-            }
-
-            if options.contains_without_rowid() {
-                crate::bail_parse_error!("WITHOUT ROWID tables are not supported");
             }
         }
         CreateTableBody::AsSelect(_) => {
@@ -4674,8 +4678,8 @@ pub struct Index {
     /// Does the index have a rowid as the last column?
     /// This is the case for btree indexes (persistent or ephemeral) that
     /// have been created based on a table with a rowid.
-    /// For example, WITHOUT ROWID tables (not supported in Limbo yet),
-    /// and  SELECT DISTINCT ephemeral indexes will not have a rowid.
+    /// For example, WITHOUT ROWID tables and SELECT DISTINCT ephemeral indexes
+    /// will not have a rowid.
     pub has_rowid: bool,
     pub where_clause: Option<Box<Expr>>,
     pub index_method: Option<Arc<dyn IndexMethodAttachment>>,
@@ -5016,7 +5020,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "WITHOUT ROWID not supported"]
     pub fn test_has_rowid_false() -> Result<()> {
         let sql = r#"CREATE TABLE t1 (a INTEGER PRIMARY KEY, b TEXT) WITHOUT ROWID;"#;
         let table = BTreeTable::from_sql(sql, 0)?;
@@ -5062,7 +5065,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "WITHOUT ROWID not supported"]
     pub fn test_column_is_rowid_alias_single_integer_separate_primary_key_definition_without_rowid(
     ) -> Result<()> {
         let sql = r#"CREATE TABLE t1 (a INTEGER, b TEXT, PRIMARY KEY(a)) WITHOUT ROWID;"#;
@@ -5076,7 +5078,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "WITHOUT ROWID not supported"]
     pub fn test_column_is_rowid_alias_single_integer_without_rowid() -> Result<()> {
         let sql = r#"CREATE TABLE t1 (a INTEGER PRIMARY KEY, b TEXT) WITHOUT ROWID;"#;
         let table = BTreeTable::from_sql(sql, 0)?;
@@ -5683,13 +5684,25 @@ mod tests {
     }
 
     #[test]
-    fn test_without_rowid_rejected() {
+    fn test_without_rowid_preserved_in_sql() -> Result<()> {
         let sql = r#"CREATE TABLE t(code TEXT PRIMARY KEY, val TEXT) WITHOUT ROWID"#;
-        let result = BTreeTable::from_sql(sql, 0);
+        let table = BTreeTable::from_sql(sql, 0)?;
         assert_eq!(
-            "Parse error: WITHOUT ROWID tables are not supported",
-            format!("{}", result.unwrap_err())
+            table.to_sql(),
+            "CREATE TABLE t (code TEXT PRIMARY KEY, val TEXT) WITHOUT ROWID"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn test_strict_without_rowid_preserved_in_sql() -> Result<()> {
+        let sql = r#"CREATE TABLE t(code TEXT PRIMARY KEY, val TEXT) STRICT, WITHOUT ROWID"#;
+        let table = BTreeTable::from_sql(sql, 0)?;
+        assert_eq!(
+            table.to_sql(),
+            "CREATE TABLE t (code TEXT PRIMARY KEY, val TEXT) STRICT, WITHOUT ROWID"
+        );
+        Ok(())
     }
 
     #[test]
