@@ -144,6 +144,12 @@ pub enum CompletionError {
         expected: usize,
         actual: usize,
     },
+    #[error("WAL frame page mismatch at frame {frame_id}: expected page {expected}, got {actual}")]
+    WalFramePageMismatch {
+        frame_id: u64,
+        expected: usize,
+        actual: u32,
+    },
     #[error("Checksum mismatch on page {page_id}: expected {expected}, got {actual}")]
     ChecksumMismatch {
         page_id: usize,
