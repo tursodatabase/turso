@@ -1018,6 +1018,18 @@ struct CheckpointState {
     result: Option<CheckpointResult>,
     /// The checkpoint mode, used to determine if WAL truncation is needed
     mode: Option<CheckpointMode>,
+    /// The checkpoint state machine should acquire the lock or use the one by caller
+    lock_source: CheckpointLockSource,
+}
+
+/// CheckpointLockSource says whether the checkpoint state machine should acquire checkpoint_lock
+/// itself or consume checkpoint_lock already held by the caller.
+/// Most of the time, the default `Acquire` is used, except for VACUUM.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum CheckpointLockSource {
+    #[default]
+    Acquire,
+    HeldByCaller,
 }
 
 #[derive(Clone, Debug)]
@@ -2675,6 +2687,29 @@ impl Pager {
         Ok(IOResult::Done(wal.begin_write_tx()?))
     }
 
+    /// Acquire exclusive WAL access + block new transactions (used by VACUUM).
+    ///
+    /// This is a blocking alternative to normal `begin_read_tx`.
+    ///
+    /// VACUUM runs on an existing database, so page 1 must already be allocated
+    /// and a WAL must be present.
+    pub fn begin_blocking_tx(&self) -> Result<IOResult<()>> {
+        if !self.db_initialized() {
+            return Err(LimboError::InternalError(
+                "begin_blocking_tx can be done on an initialized database (page 1 must already be allocated)".into(),
+            ));
+        }
+        let wal = self.wal.as_ref().ok_or_else(|| {
+            LimboError::InternalError("begin_blocking_tx requires WAL mode".into())
+        })?;
+        wal.begin_blocking_tx()?;
+        // let's be conservative and clear all cache for vacuum
+        // todo: clear cache only if we detect that new writes have occurred like `begin_read_tx`
+        self.clear_page_cache(false);
+        self.set_schema_cookie(None);
+        Ok(IOResult::Done(()))
+    }
+
     /// commit dirty pages from current transaction in WAL mode if this is not nested statement (for nested statements, parent will do the commit)
     /// if update_transaction_state set to false, then [Connection::transaction_state] left unchanged
     /// if update_transaction_state set to true, then [Connection::transaction_state] reset to [TransactionState::None] in case when method completes without error
@@ -3985,11 +4020,16 @@ impl Pager {
         state.phase = CheckpointPhase::NotCheckpointing;
         state.result = None;
         state.mode = None;
+        state.lock_source = CheckpointLockSource::Acquire;
     }
 
     /// Clean up after a auto-checkpoint failure.
     /// Auto-checkpoint executed outside of the main transaction - so WAL transaction was already finalized
     pub fn cleanup_after_auto_checkpoint_failure(&self) {
+        self.cleanup_after_checkpoint_failure();
+    }
+
+    pub fn cleanup_after_checkpoint_failure(&self) {
         self.reset_checkpoint_state();
         if let Some(wal) = self.wal.as_ref() {
             wal.abort_checkpoint();
@@ -4035,6 +4075,35 @@ impl Pager {
         sync_mode: crate::SyncMode,
         clear_page_cache: bool,
     ) -> Result<IOResult<CheckpointResult>> {
+        self.checkpoint_inner(
+            mode,
+            sync_mode,
+            clear_page_cache,
+            CheckpointLockSource::Acquire,
+        )
+    }
+
+    pub fn checkpoint_with_held_checkpoint_lock(
+        &self,
+        mode: CheckpointMode,
+        sync_mode: crate::SyncMode,
+        clear_page_cache: bool,
+    ) -> Result<IOResult<CheckpointResult>> {
+        self.checkpoint_inner(
+            mode,
+            sync_mode,
+            clear_page_cache,
+            CheckpointLockSource::HeldByCaller,
+        )
+    }
+
+    fn checkpoint_inner(
+        &self,
+        mode: CheckpointMode,
+        sync_mode: crate::SyncMode,
+        clear_page_cache: bool,
+        lock_source: CheckpointLockSource,
+    ) -> Result<IOResult<CheckpointResult>> {
         let Some(wal) = self.wal.as_ref() else {
             turso_soft_unreachable!("checkpoint() called on database without WAL");
             return Err(LimboError::InternalError(
@@ -4055,13 +4124,20 @@ impl Pager {
                         clear_page_cache,
                     };
                     state.mode = Some(mode);
+                    state.lock_source = lock_source;
                 }
                 CheckpointPhase::Checkpoint {
                     mode,
                     sync_mode,
                     clear_page_cache,
                 } => {
-                    let res = return_if_io!(wal.checkpoint(self, mode));
+                    let checkpoint_lock_source = self.checkpoint_state.read().lock_source;
+                    let res = return_if_io!(match checkpoint_lock_source {
+                        CheckpointLockSource::Acquire => wal.checkpoint(self, mode),
+                        CheckpointLockSource::HeldByCaller => {
+                            wal.checkpoint_with_held_checkpoint_lock(self, mode)
+                        }
+                    });
                     let mut state = self.checkpoint_state.write();
                     if matches!(mode, CheckpointMode::Truncate { .. })
                         // `should_truncate` will be true for successful truncate checkpoint
@@ -4307,6 +4383,7 @@ impl Pager {
                     let mut res = state.result.take().expect("result should be set");
                     state.phase = CheckpointPhase::NotCheckpointing;
                     state.mode = None;
+                    state.lock_source = CheckpointLockSource::Acquire;
 
                     // Clear page cache only if requested (explicit checkpoints do this, auto-checkpoint does not)
                     if clear_page_cache {
