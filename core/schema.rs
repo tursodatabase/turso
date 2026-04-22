@@ -663,9 +663,7 @@ impl Default for Schema {
     }
 }
 
-fn bootstrap_builtin_types(
-    registry: &mut HashMap<String, Arc<TypeDef>>,
-) -> crate::Result<()> {
+fn bootstrap_builtin_types(registry: &mut HashMap<String, Arc<TypeDef>>) -> crate::Result<()> {
     use turso_parser::ast::{Cmd, Stmt};
     use turso_parser::parser::Parser;
 

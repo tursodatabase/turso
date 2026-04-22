@@ -3833,10 +3833,7 @@ pub fn translate_expr(
                     td.name
                 );
             } else {
-                crate::bail_parse_error!(
-                    "type '{}' is not a struct or union type",
-                    td.name
-                );
+                crate::bail_parse_error!("type '{}' is not a struct or union type", td.name);
             }
         }
         ast::Expr::Raise(resolve_type, msg_expr) => {
@@ -6064,55 +6061,19 @@ pub fn bind_and_rewrite_expr<'a>(
                         // the combinatorial explosion (CREATE TYPE, CREATE TABLE, ALTER TABLE)
                         // makes that impractical. Deterministic precedence is sufficient.
                         let field_name = normalize_ident(id.as_str());
-                        let mut match_count = 0usize;
-                        let mut matched_table_id = turso_parser::ast::TableInternalId::default();
-                        let mut matched_col_idx = 0;
-                        let mut matched_is_rowid_alias = false;
-                        let mut matched_type_def: Option<Arc<crate::schema::TypeDef>> = None;
-                        for joined_table in referenced_tables.joined_tables().iter() {
-                            let cols = joined_table.table.columns();
-                            if let Some(col_idx) = cols.iter().position(|c| {
-                                c.name
-                                    .as_ref()
-                                    .is_some_and(|n| n.eq_ignore_ascii_case(&normalized_table_name))
-                            }) {
-                                let col = &cols[col_idx];
-                                // Check if the column type is a struct or union
-                                let type_def =
-                                    resolver.schema().get_type_def_unchecked(&col.ty_str);
-                                let is_struct_or_union = type_def
-                                    .map(|td| td.is_struct() || td.is_union())
-                                    .unwrap_or(false);
-                                if is_struct_or_union {
-                                    match_count += 1;
-                                    matched_table_id = joined_table.internal_id;
-                                    matched_col_idx = col_idx;
-                                    matched_is_rowid_alias = col.is_rowid_alias();
-                                    matched_type_def = type_def.cloned();
-                                }
-                            }
-                        }
-                        if match_count > 1 {
-                            crate::bail_parse_error!(
-                                "ambiguous column reference: '{}' — multiple tables have a struct/union column with this name",
-                                normalized_table_name
+                        if let Some(m) = find_custom_type_column(
+                            referenced_tables,
+                            &normalized_table_name,
+                            resolver,
+                        )? {
+                            *expr = make_field_access_expr(
+                                m.table_id,
+                                m.col_idx,
+                                m.is_rowid_alias,
+                                &field_name,
+                                m.type_def,
                             );
-                        }
-                        if match_count == 1 {
-                            let resolved = matched_type_def
-                                .as_ref()
-                                .and_then(|td| resolve_field_access(td, &field_name));
-                            *expr = Expr::FieldAccess {
-                                base: Box::new(Expr::Column {
-                                    database: None,
-                                    table: matched_table_id,
-                                    column: matched_col_idx,
-                                    is_rowid_alias: matched_is_rowid_alias,
-                                }),
-                                field: ast::Name::from_bytes(field_name.as_bytes()),
-                                resolved,
-                            };
-                            referenced_tables.mark_column_used(matched_table_id, matched_col_idx);
+                            referenced_tables.mark_column_used(m.table_id, m.col_idx);
                             return Ok(WalkControl::Continue);
                         }
                         crate::bail_parse_error!("no such table: {}", normalized_table_name);
@@ -6254,18 +6215,13 @@ pub fn bind_and_rewrite_expr<'a>(
                                     .map(|td| td.is_struct() || td.is_union())
                                     .unwrap_or(false);
                                 if is_struct_or_union {
-                                    let resolved = type_def
-                                        .and_then(|td| resolve_field_access(td, &field_name));
-                                    *expr = Expr::FieldAccess {
-                                        base: Box::new(Expr::Column {
-                                            database: None,
-                                            table: tbl_id,
-                                            column: col_idx,
-                                            is_rowid_alias: col.is_rowid_alias(),
-                                        }),
-                                        field: ast::Name::from_bytes(field_name.as_bytes()),
-                                        resolved,
-                                    };
+                                    *expr = make_field_access_expr(
+                                        tbl_id,
+                                        col_idx,
+                                        col.is_rowid_alias(),
+                                        &field_name,
+                                        type_def.unwrap(),
+                                    );
                                     referenced_tables.mark_column_used(tbl_id, col_idx);
                                     return Ok(WalkControl::Continue);
                                 } else {
@@ -6284,57 +6240,18 @@ pub fn bind_and_rewrite_expr<'a>(
                         let col_name_norm = normalize_ident(&db_name_str);
                         let mid_name = normalize_ident(&tbl_name_str);
                         let leaf_field = normalize_ident(&col_name_str);
-                        let mut resolved_nested = false;
-                        for tbl in referenced_tables.joined_tables() {
-                            let col_match = tbl.columns().iter().enumerate().find(|(_, c)| {
-                                c.name
-                                    .as_ref()
-                                    .is_some_and(|n| n.eq_ignore_ascii_case(&col_name_norm))
-                            });
-                            let Some((col_idx, col)) = col_match else {
-                                continue;
-                            };
-                            let Some(td) = resolver.schema().get_type_def_unchecked(&col.ty_str)
-                            else {
-                                continue;
-                            };
-
-                            // Resolve the inner type name reached via mid_name:
-                            // Case A: UNION column — mid_name is a variant tag
-                            // Case B: STRUCT column — mid_name is a struct field
-                            let inner_type_name = td
-                                .find_union_variant(&mid_name)
-                                .map(|(_, v)| v.type_name.as_str())
-                                .or_else(|| {
-                                    td.find_struct_field(&mid_name)
-                                        .map(|(_, f)| f.type_name.as_str())
-                                });
-
-                            let has_leaf = inner_type_name
-                                .and_then(|tn| resolver.schema().get_type_def_unchecked(tn))
-                                .is_some_and(|itd| itd.find_struct_field(&leaf_field).is_some());
-
-                            if has_leaf {
-                                *expr = Expr::FieldAccess {
-                                    base: Box::new(Expr::FieldAccess {
-                                        base: Box::new(Expr::Column {
-                                            database: None,
-                                            table: tbl.internal_id,
-                                            column: col_idx,
-                                            is_rowid_alias: col.is_rowid_alias(),
-                                        }),
-                                        field: ast::Name::from_bytes(mid_name.as_bytes()),
-                                        resolved: None,
-                                    }),
-                                    field: ast::Name::from_bytes(leaf_field.as_bytes()),
-                                    resolved: None,
-                                };
-                                referenced_tables.mark_column_used(tbl.internal_id, col_idx);
-                                resolved_nested = true;
-                                break;
-                            }
-                        }
-                        if !resolved_nested {
+                        if let Some((nested_expr, tbl_id, col_idx)) =
+                            try_resolve_nested_field_access(
+                                referenced_tables,
+                                &col_name_norm,
+                                &mid_name,
+                                &leaf_field,
+                                resolver,
+                            )?
+                        {
+                            *expr = nested_expr;
+                            referenced_tables.mark_column_used(tbl_id, col_idx);
+                        } else {
                             return Err(LimboError::ParseError(format!(
                                 "no such column or database: {db_name_str}.{tbl_name_str}.{col_name_str}"
                             )));
@@ -6540,6 +6457,132 @@ fn resolve_column_type_str(
     None
 }
 
+/// Result of finding a column with a custom (struct/union) type across joined tables.
+struct CustomTypeColumnMatch<'a> {
+    table_id: TableInternalId,
+    col_idx: usize,
+    is_rowid_alias: bool,
+    type_def: &'a crate::schema::TypeDef,
+}
+
+/// Search all joined tables for a column named `col_name` with a struct/union type.
+/// Errors on ambiguity (>1 match). Returns `None` if no match.
+fn find_custom_type_column<'a>(
+    referenced_tables: &TableReferences,
+    col_name: &str,
+    resolver: &'a Resolver<'a>,
+) -> crate::Result<Option<CustomTypeColumnMatch<'a>>> {
+    let mut result: Option<CustomTypeColumnMatch<'a>> = None;
+    let mut match_count = 0usize;
+    for joined_table in referenced_tables.joined_tables().iter() {
+        let cols = joined_table.table.columns();
+        if let Some(col_idx) = cols.iter().position(|c| {
+            c.name
+                .as_ref()
+                .is_some_and(|n| n.eq_ignore_ascii_case(col_name))
+        }) {
+            let col = &cols[col_idx];
+            let type_def = resolver.schema().get_type_def_unchecked(&col.ty_str);
+            let is_struct_or_union = type_def
+                .map(|td| td.is_struct() || td.is_union())
+                .unwrap_or(false);
+            if is_struct_or_union {
+                match_count += 1;
+                result = Some(CustomTypeColumnMatch {
+                    table_id: joined_table.internal_id,
+                    col_idx,
+                    is_rowid_alias: col.is_rowid_alias(),
+                    type_def: type_def.unwrap(),
+                });
+            }
+        }
+    }
+    if match_count > 1 {
+        crate::bail_parse_error!(
+            "ambiguous column reference: '{}' — multiple tables have a struct/union column with this name",
+            col_name
+        );
+    }
+    Ok(result)
+}
+
+/// Build an `Expr::FieldAccess { base: Expr::Column { ... }, field, resolved }` node,
+/// pre-resolving the field index via `resolve_field_access`.
+fn make_field_access_expr(
+    table_id: TableInternalId,
+    col_idx: usize,
+    is_rowid_alias: bool,
+    field_name: &str,
+    td: &crate::schema::TypeDef,
+) -> Expr {
+    let resolved = resolve_field_access(td, field_name);
+    Expr::FieldAccess {
+        base: Box::new(Expr::Column {
+            database: None,
+            table: table_id,
+            column: col_idx,
+            is_rowid_alias,
+        }),
+        field: ast::Name::from_bytes(field_name.as_bytes()),
+        resolved,
+    }
+}
+
+/// Try to resolve `col_name.mid_name.leaf_name` as 2-level deep field access
+/// (e.g. `data.telegram.chat_id` where `data` is a UNION column, `telegram` is
+/// a variant with struct type, and `chat_id` is a struct field).
+///
+/// Returns the nested FieldAccess expr plus table_id/col_idx for `mark_column_used`.
+fn try_resolve_nested_field_access<'a>(
+    referenced_tables: &TableReferences,
+    col_name: &str,
+    mid_name: &str,
+    leaf_name: &str,
+    resolver: &'a Resolver<'a>,
+) -> crate::Result<Option<(Expr, TableInternalId, usize)>> {
+    let m = find_custom_type_column(referenced_tables, col_name, resolver)?;
+    let Some(m) = m else {
+        return Ok(None);
+    };
+    let td = m.type_def;
+
+    // Resolve the inner type name reached via mid_name:
+    // Case A: UNION column — mid_name is a variant tag
+    // Case B: STRUCT column — mid_name is a struct field
+    let inner_type_name = td
+        .find_union_variant(mid_name)
+        .map(|(_, v)| v.type_name.as_str())
+        .or_else(|| {
+            td.find_struct_field(mid_name)
+                .map(|(_, f)| f.type_name.as_str())
+        });
+
+    let has_leaf = inner_type_name
+        .and_then(|tn| resolver.schema().get_type_def_unchecked(tn))
+        .is_some_and(|itd| itd.find_struct_field(leaf_name).is_some());
+
+    if !has_leaf {
+        return Ok(None);
+    }
+
+    let nested_expr = Expr::FieldAccess {
+        base: Box::new(Expr::FieldAccess {
+            base: Box::new(Expr::Column {
+                database: None,
+                table: m.table_id,
+                column: m.col_idx,
+                is_rowid_alias: m.is_rowid_alias,
+            }),
+            field: ast::Name::from_bytes(mid_name.as_bytes()),
+            resolved: None,
+        }),
+        field: ast::Name::from_bytes(leaf_name.as_bytes()),
+        resolved: None,
+    };
+
+    Ok(Some((nested_expr, m.table_id, m.col_idx)))
+}
+
 /// Resolve a field/variant name against a TypeDef to produce a FieldAccessResolution.
 fn resolve_field_access(
     td: &crate::schema::TypeDef,
@@ -6570,8 +6613,7 @@ fn resolve_expr_output_type<'a>(
             let Some(referenced_tables) = referenced_tables else {
                 crate::bail_parse_error!("cannot resolve type: no table context");
             };
-            let Some((_is_outer, tbl)) = referenced_tables.find_table_by_internal_id(*table)
-            else {
+            let Some((_is_outer, tbl)) = referenced_tables.find_table_by_internal_id(*table) else {
                 crate::bail_parse_error!("cannot resolve type: table not found");
             };
             let col = &tbl.columns()[*column];
