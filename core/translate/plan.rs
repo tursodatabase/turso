@@ -1,13 +1,8 @@
-use rustc_hash::FxHashMap as HashMap;
-use smallvec::SmallVec;
-use std::{cmp::Ordering, marker::PhantomData, sync::Arc};
-use turso_parser::ast::{
-    self, FrameBound, FrameClause, FrameExclude, FrameMode, ResolveType, SortOrder, SubqueryType,
-};
-
 use crate::{
     function::{AggFunc, WindowFunc},
-    schema::{BTreeTable, ColDef, Column, FromClauseSubquery, Index, Schema, Table},
+    schema::{
+        BTreeTable, ColDef, Column, FromClauseSubquery, Index, Schema, Table, Type, ROWID_SENTINEL,
+    },
     translate::{
         collate::{get_collseq_from_expr, CollationSeq},
         emitter::UpdateRowSource,
@@ -16,15 +11,23 @@ use crate::{
         optimizer::constraints::{BinaryExprSide, SeekRangeConstraint},
         planner::determine_where_to_eval_term,
     },
+    types::SeekOp,
+    util::exprs_are_equivalent,
     vdbe::{
         affinity::{self, Affinity},
         builder::{CursorKey, CursorType, ProgramBuilder},
         insn::{HashDistinctData, Insn},
         BranchOffset, CursorID,
     },
-    Result, VirtualTable,
+    Result, VirtualTable, MAIN_DB_ID,
 };
-use crate::{schema::Type, types::SeekOp, MAIN_DB_ID};
+use rustc_hash::FxHashMap as HashMap;
+use smallvec::SmallVec;
+use std::{cmp::Ordering, marker::PhantomData, sync::Arc};
+use turso_parser::ast::{
+    self, Expr, FrameBound, FrameClause, FrameExclude, FrameMode, ResolveType, SortOrder,
+    SubqueryType,
+};
 
 use turso_parser::ast::TableInternalId;
 
@@ -55,7 +58,9 @@ fn infer_type_from_expr(
 
 #[derive(Debug, Clone)]
 pub struct ResultSetColumn {
+    /// `a + 1` in `SELECT a + 1 FROM t`
     pub expr: ast::Expr,
+    /// `col` in `SELECT a AS col FROM t`
     pub alias: Option<String>,
     /// Original SQL expression text for display as column name.
     /// Only used when there is no explicit alias and the expression is not
@@ -107,6 +112,19 @@ impl ResultSetColumn {
             }
             _ => self.implicit_column_name.as_deref(),
         }
+    }
+
+    /// Returns the column name, falling back to the expression's display form.
+    pub fn name_or_expr(&self, tables: &TableReferences) -> String {
+        self.name(tables)
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| self.expr.to_string())
+    }
+
+    /// Returns the canonical short type name for this column's affinity,
+    /// matching SQLite's `azType[]` in `createTableStmt()` (build.c).
+    pub fn declared_type(&self, tables: &TableReferences) -> &'static str {
+        get_expr_affinity(&self.expr, Some(tables), None).short_type_name()
     }
 }
 
@@ -217,9 +235,6 @@ impl From<Expr> for WhereTerm {
         }
     }
 }
-
-use crate::ast::Expr;
-use crate::util::exprs_are_equivalent;
 
 /// The loop index where to evaluate the condition.
 /// For example, in `SELECT * FROM u JOIN p WHERE u.id = 5`, the condition can already be evaluated at the first loop (idx 0),
@@ -648,6 +663,11 @@ pub struct SelectPlan {
     /// When set, this query is a simple aggregate (COUNT(*), MIN, or MAX)
     /// that can be satisfied without a full table scan.
     pub simple_aggregate: Option<SimpleAggregate>,
+    /// Parameters from EXISTS subquery result columns that were dropped during
+    /// semi/anti-join unnesting. These need to be registered in the program's
+    /// parameter list even though no code is emitted for them, so that bind-time
+    /// validation (`has_slot`) succeeds.
+    pub phantom_params: Vec<ast::Variable>,
 }
 
 impl SelectPlan {
@@ -994,6 +1014,29 @@ pub struct JoinedTable {
     pub indexed: Option<ast::Indexed>,
 }
 
+impl JoinedTable {
+    pub fn using_dedup_hidden_cols(&self) -> ColumnMask {
+        self.join_info
+            .as_ref()
+            .map(|join_info| {
+                self.table
+                    .columns()
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(idx, col)| {
+                        let col_name = col.name.as_deref()?;
+                        join_info
+                            .using
+                            .iter()
+                            .any(|using_col| using_col.as_str().eq_ignore_ascii_case(col_name))
+                            .then_some(idx)
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct OuterQueryReference {
     /// The name of the table as referred to in the query, either the literal name or an alias e.g. "users" or "u"
@@ -1002,6 +1045,8 @@ pub struct OuterQueryReference {
     pub internal_id: TableInternalId,
     /// Table object, which contains metadata about the table, e.g. columns.
     pub table: Table,
+    /// Columns hidden by USING/NATURAL deduplication in the outer scope.
+    pub using_dedup_hidden_cols: ColumnMask,
     /// Bitmask of columns that are referenced in the query.
     /// Used to track dependencies, so that it can be resolved
     /// when a WHERE clause subquery should be evaluated;
@@ -1087,7 +1132,7 @@ impl TableReferences {
     /// which can represent up to 128 tables.
     /// Even at 63 tables we currently cannot handle the optimization performantly, hence the arbitrary cap.
     pub const MAX_JOINED_TABLES: usize = 63;
-    pub fn new(
+    pub const fn new(
         joined_tables: Vec<JoinedTable>,
         outer_query_refs: Vec<OuterQueryReference>,
     ) -> Self {
@@ -1097,7 +1142,8 @@ impl TableReferences {
             right_join_swapped: false,
         }
     }
-    pub fn new_empty() -> Self {
+
+    pub const fn new_empty() -> Self {
         Self {
             joined_tables: Vec::new(),
             outer_query_refs: Vec::new(),
@@ -1110,12 +1156,12 @@ impl TableReferences {
     }
 
     /// Mark that tables were swapped for a RIGHT-to-LEFT JOIN rewrite.
-    pub fn set_right_join_swapped(&mut self) {
+    pub const fn set_right_join_swapped(&mut self) {
         self.right_join_swapped = true;
     }
 
     /// Whether tables were swapped for a RIGHT JOIN rewrite.
-    pub fn right_join_swapped(&self) -> bool {
+    pub const fn right_join_swapped(&self) -> bool {
         self.right_join_swapped
     }
 
@@ -1135,7 +1181,7 @@ impl TableReferences {
     }
 
     /// Returns a mutable reference to the [JoinedTable]s in the query plan.
-    pub fn joined_tables_mut(&mut self) -> &mut Vec<JoinedTable> {
+    pub const fn joined_tables_mut(&mut self) -> &mut Vec<JoinedTable> {
         &mut self.joined_tables
     }
 
@@ -1350,23 +1396,240 @@ impl TableReferences {
     }
 
     pub fn extend(&mut self, other: TableReferences) {
-        self.joined_tables.extend(other.joined_tables);
-        self.outer_query_refs.extend(other.outer_query_refs);
+        fn take_or_append<T>(dst: &mut Vec<T>, mut src: Vec<T>) {
+            if dst.is_empty() {
+                *dst = src;
+            } else if !src.is_empty() {
+                dst.append(&mut src);
+            }
+        }
+
+        let TableReferences {
+            joined_tables,
+            outer_query_refs,
+            right_join_swapped: _,
+        } = other;
+
+        // Avoid `Vec::extend` here: `JoinedTable` is large, and many prepare
+        // paths append into an empty `TableReferences`. Taking ownership of the
+        // source vectors lets us reuse their allocation instead of reallocating
+        // and copying every element into a fresh buffer.
+        take_or_append(&mut self.joined_tables, joined_tables);
+        take_or_append(&mut self.outer_query_refs, outer_query_refs);
     }
 }
 
-/// Tracks which columns are used in a query. Optimized for the common case
-/// of ≤64 columns (single u64), with heap-allocated overflow
-#[derive(Clone, Debug, Default, PartialEq)]
-pub struct ColumnUsedMask {
-    inline: u64,
-    overflow: Option<Vec<u64>>,
+/// Tracks which columns are used in a query.
+pub type ColumnUsedMask = BitSet;
+
+/// ColumnMask wraps [BitSet] and adds a special-case so that it can store [ROWID_SENTINEL]
+/// in `O(1)` space
+//TODO instead of carrying naked usize's around, we should ideally have a `ColumnID` type alias,
+// just like we have `CursorID`, so that we can make [ColumnMask] type-safe.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
+pub struct ColumnMask {
+    bitset: BitSet,
+    has_rowid_sentinel: bool,
 }
 
-impl ColumnUsedMask {
-    const INLINE_BITS: usize = 64;
+impl ColumnMask {
+    pub fn set(&mut self, idx: usize) {
+        if idx == ROWID_SENTINEL {
+            self.has_rowid_sentinel = true;
+        } else {
+            self.bitset.set(idx);
+        }
+    }
 
-    pub fn set(&mut self, index: usize) {
+    pub fn union_with(&mut self, other: &ColumnMask) {
+        self.bitset.union_with(&other.bitset);
+        self.has_rowid_sentinel |= other.has_rowid_sentinel;
+    }
+
+    pub fn get(&self, idx: usize) -> bool {
+        if idx == ROWID_SENTINEL {
+            self.has_rowid_sentinel
+        } else {
+            self.bitset.get(idx)
+        }
+    }
+
+    pub fn count(&self) -> usize {
+        self.bitset.count() + self.has_rowid_sentinel as usize
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.bitset.is_empty() && !self.has_rowid_sentinel
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = usize> + '_ {
+        let rowid_sentinel = self.has_rowid_sentinel.then_some(ROWID_SENTINEL);
+        self.bitset.iter().chain(rowid_sentinel)
+    }
+}
+
+impl std::ops::SubAssign<&Self> for ColumnMask {
+    fn sub_assign(&mut self, rhs: &Self) {
+        self.bitset -= &rhs.bitset;
+        self.has_rowid_sentinel &= !rhs.has_rowid_sentinel;
+    }
+}
+
+impl FromIterator<usize> for ColumnMask {
+    fn from_iter<I: IntoIterator<Item = usize>>(iter: I) -> Self {
+        let mut mask = ColumnMask::default();
+        for idx in iter {
+            mask.set(idx);
+        }
+        mask
+    }
+}
+
+impl Extend<usize> for ColumnMask {
+    fn extend<I: IntoIterator<Item = usize>>(&mut self, iter: I) {
+        for idx in iter {
+            self.set(idx);
+        }
+    }
+}
+
+pub struct ColumnMaskIter<B: std::borrow::Borrow<BitSet>> {
+    inner: BitSetIter<usize, B>,
+    pending_rowid: bool,
+}
+
+impl<B: std::borrow::Borrow<BitSet>> Iterator for ColumnMaskIter<B> {
+    type Item = usize;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if let Some(v) = self.inner.next() {
+            return Some(v);
+        }
+        if self.pending_rowid {
+            self.pending_rowid = false;
+            return Some(ROWID_SENTINEL);
+        }
+        None
+    }
+}
+
+impl<'a> IntoIterator for &'a ColumnMask {
+    type Item = usize;
+    type IntoIter = ColumnMaskIter<&'a BitSet>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        ColumnMaskIter {
+            inner: (&self.bitset).into_iter(),
+            pending_rowid: self.has_rowid_sentinel,
+        }
+    }
+}
+
+impl IntoIterator for ColumnMask {
+    type Item = usize;
+    type IntoIter = ColumnMaskIter<BitSet>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        ColumnMaskIter {
+            inner: self.bitset.into_iter(),
+            pending_rowid: self.has_rowid_sentinel,
+        }
+    }
+}
+
+/// Dense bitset optimized for the common case where all elements ≤64, with heap-allocated overflow.
+///
+/// *WARNING*: This bitset occupies `O(max_num)` space when `max_num > 64`,
+/// so it is best used for smaller numbers.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct BitSet<T = usize> {
+    inline: u64,
+    /// invariant: `overflow` is `None` iff no bits ≥ 64 are set.
+    overflow: Option<Vec<u64>>,
+    _phantom: PhantomData<fn() -> T>,
+}
+
+impl<T> Default for BitSet<T> {
+    fn default() -> Self {
+        Self {
+            inline: 0,
+            overflow: None,
+            _phantom: PhantomData,
+        }
+    }
+}
+
+/// This iterator, inspired by Kernighan's bit-counting algorighm, is `O(num_words + popcount)`
+/// for the whole bitset.
+pub struct BitSetIter<T, B: std::borrow::Borrow<BitSet<T>>> {
+    bitset: B,
+    /// Remaining bits to drain from the word currently pointed at by `word`.
+    current: u64,
+    /// `0` = inline word, `1..=overflow.len()` = `overflow[word - 1]`.
+    word: usize,
+    _phantom: PhantomData<fn() -> T>,
+}
+
+impl<T: From<usize>, B: std::borrow::Borrow<BitSet<T>>> Iterator for BitSetIter<T, B> {
+    type Item = T;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            if self.current != 0 {
+                let bit = self.current.trailing_zeros() as usize;
+                self.current &= self.current - 1;
+                let base = if self.word == 0 {
+                    0
+                } else {
+                    BitSet::<T>::INLINE_BITS + (self.word - 1) * 64
+                };
+                return Some(T::from(base + bit));
+            }
+            self.word += 1;
+            let overflow = self.bitset.borrow().overflow.as_ref()?;
+            self.current = *overflow.get(self.word - 1)?;
+        }
+    }
+}
+
+impl<'a, T: From<usize>> IntoIterator for &'a BitSet<T> {
+    type Item = T;
+    type IntoIter = BitSetIter<T, &'a BitSet<T>>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        BitSetIter {
+            current: self.inline,
+            bitset: self,
+            word: 0,
+            _phantom: PhantomData,
+        }
+    }
+}
+
+impl<T: From<usize>> IntoIterator for BitSet<T> {
+    type Item = T;
+    type IntoIter = BitSetIter<T, BitSet<T>>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        BitSetIter {
+            current: self.inline,
+            bitset: self,
+            word: 0,
+            _phantom: PhantomData,
+        }
+    }
+}
+
+impl<T> BitSet<T> {
+    const INLINE_BITS: usize = 64;
+}
+
+impl<T: From<usize>> BitSet<T>
+where
+    usize: From<T>,
+{
+    pub fn set(&mut self, index: T) {
+        let index: usize = index.into();
         if index < Self::INLINE_BITS {
             self.inline |= 1 << index;
         } else {
@@ -1380,7 +1643,8 @@ impl ColumnUsedMask {
         }
     }
 
-    pub fn get(&self, index: usize) -> bool {
+    pub fn get(&self, index: T) -> bool {
+        let index: usize = index.into();
         if index < Self::INLINE_BITS {
             (self.inline >> index) & 1 != 0
         } else {
@@ -1395,7 +1659,8 @@ impl ColumnUsedMask {
         }
     }
 
-    pub fn clear(&mut self, index: usize) {
+    pub fn clear(&mut self, index: T) {
+        let index: usize = index.into();
         if index < Self::INLINE_BITS {
             self.inline &= !(1 << index);
         } else if let Some(overflow) = &mut self.overflow {
@@ -1404,6 +1669,7 @@ impl ColumnUsedMask {
             if let Some(word) = overflow.get_mut(overflow_idx) {
                 *word &= !(1 << bit);
             }
+            self.trim_overflow();
         }
     }
 
@@ -1412,25 +1678,26 @@ impl ColumnUsedMask {
             return false;
         }
         match (&self.overflow, &other.overflow) {
-            (None, None) => true,
-            (None, Some(other_ov)) => other_ov.iter().all(|&w| w == 0),
-            (Some(_), None) => true,
-            (Some(self_ov), Some(other_ov)) => other_ov.iter().enumerate().all(|(i, &other_w)| {
-                let self_w = self_ov.get(i).copied().unwrap_or(0);
-                (self_w & other_w) == other_w
-            }),
+            (_, None) => true,
+            (None, Some(_)) => false,
+            (Some(self_ov), Some(other_ov)) => {
+                if other_ov.len() > self_ov.len() {
+                    return false;
+                }
+                self_ov
+                    .iter()
+                    .zip(other_ov.iter())
+                    .all(|(&s, &o)| (s & o) == o)
+            }
         }
     }
 
     pub fn is_empty(&self) -> bool {
-        self.inline == 0
-            && self
-                .overflow
-                .as_ref()
-                .is_none_or(|ov| ov.iter().all(|&w| w == 0))
+        self.inline == 0 && self.overflow.is_none()
     }
 
-    pub fn is_only(&self, index: usize) -> bool {
+    pub fn is_only(&self, index: T) -> bool {
+        let index: usize = index.into();
         if index < Self::INLINE_BITS {
             self.inline == (1 << index)
                 && self
@@ -1463,34 +1730,113 @@ impl ColumnUsedMask {
     pub fn subtract(&mut self, other: &Self) {
         self.inline &= !other.inline;
         if let (Some(self_ov), Some(other_ov)) = (&mut self.overflow, &other.overflow) {
-            for (i, other_w) in other_ov.iter().enumerate() {
-                if let Some(self_w) = self_ov.get_mut(i) {
-                    *self_w &= !other_w;
-                }
+            for (s, &o) in self_ov.iter_mut().zip(other_ov.iter()) {
+                *s &= !o;
+            }
+            self.trim_overflow();
+        }
+    }
+
+    pub fn union_with(&mut self, other: &Self) {
+        self.inline |= other.inline;
+        if let Some(other_ov) = &other.overflow {
+            let self_ov = self.overflow.get_or_insert_with(Vec::new);
+            if self_ov.len() < other_ov.len() {
+                self_ov.resize(other_ov.len(), 0);
+            }
+            for (s, &o) in self_ov.iter_mut().zip(other_ov.iter()) {
+                *s |= o;
             }
         }
     }
 
-    pub fn iter(&self) -> impl Iterator<Item = usize> + '_ {
-        let inline_iter = (0..Self::INLINE_BITS).filter(|&i| (self.inline >> i) & 1 != 0);
-        let overflow_iter = self
-            .overflow
-            .iter()
-            .flat_map(|ov| ov.iter().enumerate())
-            .flat_map(|(word_idx, &word)| {
-                (0..64).filter_map(move |bit| {
-                    if (word >> bit) & 1 != 0 {
-                        Some(Self::INLINE_BITS + word_idx * 64 + bit)
-                    } else {
-                        None
-                    }
-                })
-            });
-        inline_iter.chain(overflow_iter)
+    pub fn iter(&self) -> BitSetIter<T, &Self> {
+        BitSetIter {
+            current: self.inline,
+            bitset: self,
+            word: 0,
+            _phantom: PhantomData,
+        }
+    }
+
+    /// returns the number of set bits
+    pub fn count(&self) -> usize {
+        let mut count = self.inline.count_ones() as usize;
+        if let Some(ref ov) = self.overflow {
+            for &word in ov {
+                count += word.count_ones() as usize;
+            }
+        }
+        count
+    }
+
+    /// Returns the number of set bits strictly below `index`.
+    pub fn rank(&self, index: T) -> usize {
+        let index: usize = index.into();
+        if index == 0 {
+            return 0;
+        }
+        if index <= Self::INLINE_BITS {
+            let mask = if index < 64 {
+                (1u64 << index) - 1
+            } else {
+                u64::MAX
+            };
+            return (self.inline & mask).count_ones() as usize;
+        }
+        let mut count = self.inline.count_ones() as usize;
+        let Some(ref ov) = self.overflow else {
+            return count;
+        };
+        let remaining = index - Self::INLINE_BITS;
+        let full_words = remaining / 64;
+        let extra_bits = remaining % 64;
+        for &word in ov.iter().take(full_words) {
+            count += word.count_ones() as usize;
+        }
+        if extra_bits > 0 {
+            if let Some(&word) = ov.get(full_words) {
+                count += (word & ((1u64 << extra_bits) - 1)).count_ones() as usize;
+            }
+        }
+        count
+    }
+
+    pub(crate) fn intersects(&self, other: &Self) -> bool {
+        if (self.inline & other.inline) != 0 {
+            return true;
+        }
+        match (&self.overflow, &other.overflow) {
+            (Some(self_ov), Some(other_ov)) => self_ov
+                .iter()
+                .zip(other_ov.iter())
+                .any(|(&a, &b)| (a & b) != 0),
+            _ => false,
+        }
+    }
+
+    fn trim_overflow(&mut self) {
+        if let Some(overflow) = &mut self.overflow {
+            while overflow.last() == Some(&0) {
+                overflow.pop();
+            }
+            if overflow.is_empty() {
+                self.overflow = None;
+            }
+        }
     }
 }
 
-impl std::ops::BitOrAssign<&Self> for ColumnUsedMask {
+impl<T: From<usize>> std::ops::SubAssign<&Self> for BitSet<T>
+where
+    usize: From<T>,
+{
+    fn sub_assign(&mut self, rhs: &Self) {
+        self.subtract(rhs);
+    }
+}
+
+impl<T> std::ops::BitOrAssign<&Self> for BitSet<T> {
     fn bitor_assign(&mut self, rhs: &Self) {
         self.inline |= rhs.inline;
         if let Some(rhs_ov) = &rhs.overflow {
@@ -1498,9 +1844,44 @@ impl std::ops::BitOrAssign<&Self> for ColumnUsedMask {
             if self_ov.len() < rhs_ov.len() {
                 self_ov.resize(rhs_ov.len(), 0);
             }
-            for (i, &rhs_w) in rhs_ov.iter().enumerate() {
-                self_ov[i] |= rhs_w;
+            for (s, &r) in self_ov.iter_mut().zip(rhs_ov.iter()) {
+                *s |= r;
             }
+        }
+    }
+}
+
+impl<T: From<usize>> FromIterator<T> for BitSet<T>
+where
+    usize: From<T>,
+{
+    fn from_iter<I: IntoIterator<Item = T>>(iter: I) -> Self {
+        let mut set = Self::default();
+        for index in iter {
+            set.set(index);
+        }
+        set
+    }
+}
+
+impl<T: From<usize>> Extend<T> for BitSet<T>
+where
+    usize: From<T>,
+{
+    fn extend<I: IntoIterator<Item = T>>(&mut self, iter: I) {
+        for index in iter {
+            self.set(index);
+        }
+    }
+}
+
+impl<T> From<u128> for BitSet<T> {
+    fn from(from: u128) -> Self {
+        let high = (from >> 64) as u64;
+        Self {
+            inline: from as u64,
+            overflow: (high != 0).then(|| vec![high]),
+            _phantom: PhantomData,
         }
     }
 }
@@ -1593,9 +1974,7 @@ pub enum SetOperation {
     Union,
     /// Intersection: rowid appears in result only if it's in ALL branches (AND).
     /// Carries the indices of additional WHERE terms consumed beyond the primary one.
-    Intersection {
-        additional_consumed_terms: Vec<usize>,
-    },
+    Intersection { additional_consumed_terms: BitSet },
 }
 
 /// Multi-index scan operation metadata for OR-by-union or AND-by-intersection optimization.
@@ -2177,7 +2556,20 @@ impl JoinedTable {
                 // rowid is always implicitly covered by the index
                 continue;
             }
-            let covered_by_index = index.columns.iter().any(|c| c.pos_in_table == required_col);
+            let covered_by_index = index
+                .columns
+                .iter()
+                .filter(|c| c.pos_in_table == required_col)
+                .any(|c| {
+                    // SQLite doesn't consider fulfill covering indexes with virtual columns,
+                    // see `recomputeColumnsNotIndexed` in `build.c`. We might be able to improve this
+                    // in the future, but for now we do this to ensure correctness.
+                    !btree
+                        .columns()
+                        .get(c.pos_in_table)
+                        .expect("column should be in table")
+                        .is_virtual_generated()
+                });
             if !covered_by_index {
                 return false;
             }
@@ -2432,15 +2824,23 @@ pub struct Aggregate {
     pub args: Vec<ast::Expr>,
     pub original_expr: ast::Expr,
     pub distinctness: Distinctness,
+    pub filter_expr: Option<ast::Expr>,
 }
 
 impl Aggregate {
-    pub fn new(func: AggFunc, args: &[Box<Expr>], expr: &Expr, distinctness: Distinctness) -> Self {
+    pub fn new(
+        func: AggFunc,
+        args: &[Box<Expr>],
+        expr: &Expr,
+        distinctness: Distinctness,
+        filter_expr: Option<ast::Expr>,
+    ) -> Self {
         Aggregate {
             func,
             args: args.iter().map(|arg| *arg.clone()).collect(),
             original_expr: expr.clone(),
             distinctness,
+            filter_expr,
         }
     }
 
@@ -2741,6 +3141,83 @@ pub fn plan_is_correlated(plan: &Plan) -> bool {
     }
 }
 
+fn select_plan_has_outer_scope_dependency_with_tables(
+    plan: &SelectPlan,
+    accessible_table_ids: &mut Vec<TableInternalId>,
+) -> bool {
+    let outer_scope_base_len = accessible_table_ids.len();
+    accessible_table_ids.extend(
+        plan.table_references
+            .joined_tables()
+            .iter()
+            .map(|table| table.internal_id),
+    );
+
+    let has_outer_scope_dependency =
+        plan.table_references
+            .outer_query_refs()
+            .iter()
+            .any(|outer_ref| {
+                outer_ref.is_used() && !accessible_table_ids.contains(&outer_ref.internal_id)
+            })
+            || plan
+                .non_from_clause_subqueries
+                .iter()
+                .any(|subquery| match &subquery.state {
+                    SubqueryState::Unevaluated {
+                        plan: Some(subquery_plan),
+                    } => plan_has_outer_scope_dependency_with_tables(
+                        subquery_plan,
+                        accessible_table_ids,
+                    ),
+                    SubqueryState::Unevaluated { plan: None } => false,
+                    SubqueryState::Evaluated { outer_ref_ids, .. } => outer_ref_ids
+                        .iter()
+                        .any(|outer_ref_id| !accessible_table_ids.contains(outer_ref_id)),
+                })
+            || plan
+                .table_references
+                .joined_tables()
+                .iter()
+                .any(|table| match &table.table {
+                    Table::FromClauseSubquery(subquery) => {
+                        plan_has_outer_scope_dependency_with_tables(
+                            subquery.plan.as_ref(),
+                            accessible_table_ids,
+                        )
+                    }
+                    _ => false,
+                });
+
+    accessible_table_ids.truncate(outer_scope_base_len);
+    has_outer_scope_dependency
+}
+
+fn plan_has_outer_scope_dependency_with_tables(
+    plan: &Plan,
+    accessible_table_ids: &mut Vec<TableInternalId>,
+) -> bool {
+    match plan {
+        Plan::Select(select_plan) => {
+            select_plan_has_outer_scope_dependency_with_tables(select_plan, accessible_table_ids)
+        }
+        Plan::CompoundSelect {
+            left, right_most, ..
+        } => {
+            left.iter().any(|(select_plan, _)| {
+                select_plan_has_outer_scope_dependency_with_tables(
+                    select_plan,
+                    accessible_table_ids,
+                )
+            }) || select_plan_has_outer_scope_dependency_with_tables(
+                right_most,
+                accessible_table_ids,
+            )
+        }
+        Plan::Delete(_) | Plan::Update(_) => false,
+    }
+}
+
 /// Returns true when evaluating this plan depends on table values from an
 /// enclosing query scope outside the plan itself.
 ///
@@ -2749,78 +3226,11 @@ pub fn plan_is_correlated(plan: &Plan) -> bool {
 /// references another table in the same CTE) without depending on an enclosing
 /// query row. Those plans are still safe to materialize once and reuse.
 pub fn plan_has_outer_scope_dependency(plan: &Plan) -> bool {
-    fn select_plan_has_outer_scope_dependency(
-        plan: &SelectPlan,
-        accessible_table_ids: &mut Vec<TableInternalId>,
-    ) -> bool {
-        let outer_scope_base_len = accessible_table_ids.len();
-        accessible_table_ids.extend(
-            plan.table_references
-                .joined_tables()
-                .iter()
-                .map(|table| table.internal_id),
-        );
-
-        let has_outer_scope_dependency =
-            plan.table_references
-                .outer_query_refs()
-                .iter()
-                .any(|outer_ref| {
-                    outer_ref.is_used() && !accessible_table_ids.contains(&outer_ref.internal_id)
-                })
-                || plan
-                    .non_from_clause_subqueries
-                    .iter()
-                    .any(|subquery| match &subquery.state {
-                        SubqueryState::Unevaluated {
-                            plan: Some(subquery_plan),
-                        } => plan_has_outer_scope_dependency_with_tables(
-                            subquery_plan,
-                            accessible_table_ids,
-                        ),
-                        SubqueryState::Unevaluated { plan: None } => false,
-                        SubqueryState::Evaluated { outer_ref_ids, .. } => outer_ref_ids
-                            .iter()
-                            .any(|outer_ref_id| !accessible_table_ids.contains(outer_ref_id)),
-                    })
-                || plan
-                    .table_references
-                    .joined_tables()
-                    .iter()
-                    .any(|table| match &table.table {
-                        Table::FromClauseSubquery(subquery) => {
-                            plan_has_outer_scope_dependency_with_tables(
-                                subquery.plan.as_ref(),
-                                accessible_table_ids,
-                            )
-                        }
-                        _ => false,
-                    });
-
-        accessible_table_ids.truncate(outer_scope_base_len);
-        has_outer_scope_dependency
-    }
-
-    fn plan_has_outer_scope_dependency_with_tables(
-        plan: &Plan,
-        accessible_table_ids: &mut Vec<TableInternalId>,
-    ) -> bool {
-        match plan {
-            Plan::Select(select_plan) => {
-                select_plan_has_outer_scope_dependency(select_plan, accessible_table_ids)
-            }
-            Plan::CompoundSelect {
-                left, right_most, ..
-            } => {
-                left.iter().any(|(select_plan, _)| {
-                    select_plan_has_outer_scope_dependency(select_plan, accessible_table_ids)
-                }) || select_plan_has_outer_scope_dependency(right_most, accessible_table_ids)
-            }
-            Plan::Delete(_) | Plan::Update(_) => false,
-        }
-    }
-
     plan_has_outer_scope_dependency_with_tables(plan, &mut Vec::new())
+}
+
+pub fn select_plan_has_outer_scope_dependency(plan: &SelectPlan) -> bool {
+    select_plan_has_outer_scope_dependency_with_tables(plan, &mut Vec::new())
 }
 
 /// Determine when a SELECT plan can be evaluated, including nested non-FROM and FROM-clause subqueries.
@@ -3161,6 +3571,50 @@ mod tests {
         assert!(mask3.is_only(64));
     }
 
+    #[test]
+    fn test_column_mask_rowid_sentinel() {
+        // ColumnMask stores `usize::MAX` (ROWID_SENTINEL) in an out-of-band bool
+        // so that the underlying dense BitSet never sees it. The small API surface
+        // that ColumnMask exposes must all honor the sentinel consistently.
+
+        // set / get round-trip on the sentinel alone
+        let mut mask = ColumnMask::default();
+        assert!(!mask.get(usize::MAX));
+        mask.set(usize::MAX);
+        assert!(mask.get(usize::MAX));
+        assert_eq!(mask.count(), 1);
+
+        // sentinel coexists with dense bits
+        let mut mixed = ColumnMask::default();
+        mixed.set(0);
+        mixed.set(63);
+        mixed.set(64); // crosses into overflow
+        mixed.set(500);
+        mixed.set(usize::MAX);
+        assert!(mixed.get(0));
+        assert!(mixed.get(63));
+        assert!(mixed.get(64));
+        assert!(mixed.get(500));
+        assert!(mixed.get(usize::MAX));
+        assert_eq!(mixed.count(), 5);
+
+        // iter yields dense positions in ascending order, then usize::MAX at the end
+        let collected: Vec<usize> = (&mixed).into_iter().collect();
+        assert_eq!(collected, vec![0, 63, 64, 500, usize::MAX]);
+        // count() and iter().count() must agree
+        assert_eq!(mixed.count(), (&mixed).into_iter().count());
+
+        // FromIterator round-trip through the sentinel
+        let built: ColumnMask = [0usize, 63, 64, 500, usize::MAX].into_iter().collect();
+        assert_eq!(built, mixed);
+        let round: ColumnMask = (&mixed).into_iter().collect();
+        assert_eq!(round, mixed);
+
+        // owned IntoIterator (used by flat_map in the UPDATE emitter)
+        let mixed_owned: Vec<usize> = mixed.clone().into_iter().collect();
+        assert_eq!(mixed_owned, vec![0, 63, 64, 500, usize::MAX]);
+    }
+
     fn rng_from_env_or_time() -> (ChaCha8Rng, u64) {
         let seed = std::env::var("TEST_SEED")
             .ok()
@@ -3213,6 +3667,10 @@ mod tests {
 
     #[test]
     fn test_column_used_mask_fuzz() {
+        fn pick_index(rng: &mut ChaCha8Rng, max_index: u32) -> usize {
+            (rng.next_u32() % max_index) as usize
+        }
+
         let (mut rng, seed) = rng_from_env_or_time();
         eprintln!("test_column_used_mask_random_ops seed: {seed}");
 
@@ -3224,7 +3682,7 @@ mod tests {
 
         for _ in 0..num_ops {
             let op = rng.next_u32() % 10;
-            let idx = (rng.next_u32() % max_index) as usize;
+            let idx = pick_index(&mut rng, max_index);
 
             match op {
                 0..=2 => {
@@ -3266,7 +3724,7 @@ mod tests {
                     let mut other_mask = ColumnUsedMask::default();
                     let mut other_ref = ReferenceMask::new();
                     for _ in 0..(rng.next_u32() % 20) {
-                        let other_idx = (rng.next_u32() % max_index) as usize;
+                        let other_idx = pick_index(&mut rng, max_index);
                         other_mask.set(other_idx);
                         other_ref.set(other_idx);
                     }
@@ -3281,7 +3739,7 @@ mod tests {
                     let mut other_mask = ColumnUsedMask::default();
                     let mut other_ref = ReferenceMask::new();
                     for _ in 0..(rng.next_u32() % 20) {
-                        let other_idx = (rng.next_u32() % max_index) as usize;
+                        let other_idx = pick_index(&mut rng, max_index);
                         other_mask.set(other_idx);
                         other_ref.set(other_idx);
                     }
@@ -3293,7 +3751,7 @@ mod tests {
                     let mut other_mask = ColumnUsedMask::default();
                     let mut other_ref = ReferenceMask::new();
                     for _ in 0..(rng.next_u32() % 20) {
-                        let other_idx = (rng.next_u32() % max_index) as usize;
+                        let other_idx = pick_index(&mut rng, max_index);
                         other_mask.set(other_idx);
                         other_ref.set(other_idx);
                     }
@@ -3307,5 +3765,257 @@ mod tests {
         // Final verification: iter should produce same results
         let mask_set: std::collections::BTreeSet<usize> = mask.iter().collect();
         assert_eq!(mask_set, reference.0, "final iter mismatch, seed={seed}");
+    }
+
+    #[test]
+    fn test_bitset_properties_fuzz() {
+        fn sample_other(
+            rng: &mut ChaCha8Rng,
+            max_index: usize,
+        ) -> (BitSet, std::collections::BTreeSet<usize>) {
+            let mut m = BitSet::default();
+            let mut r = std::collections::BTreeSet::new();
+            for _ in 0..(rng.next_u32() % 20) {
+                let i = (rng.next_u32() as usize) % max_index;
+                m.set(i);
+                r.insert(i);
+            }
+            (m, r)
+        }
+
+        let (mut rng, seed) = rng_from_env_or_time();
+        eprintln!("test_bitset_properties_fuzz seed: {seed}");
+
+        let mut mask = BitSet::default();
+        let mut reference = std::collections::BTreeSet::<usize>::new();
+        let max_index: usize = 2048;
+        let num_ops = 30_000;
+
+        for step in 0..num_ops {
+            let op = rng.next_u32() % 16;
+            let idx = (rng.next_u32() as usize) % max_index;
+
+            match op {
+                0..=3 => {
+                    // Set (weighted to grow the set)
+                    mask.set(idx);
+                    reference.insert(idx);
+                }
+                4 => {
+                    // Clear
+                    mask.clear(idx);
+                    reference.remove(&idx);
+                }
+                5 => {
+                    // count() agrees with reference size
+                    assert_eq!(
+                        mask.count(),
+                        reference.len(),
+                        "step={step} seed={seed} op=count"
+                    );
+                }
+                6 => {
+                    // rank(k) agrees with |{x in ref : x < k}|
+                    let expected = reference.range(..idx).count();
+                    assert_eq!(
+                        mask.rank(idx),
+                        expected,
+                        "step={step} seed={seed} op=rank({idx})"
+                    );
+                }
+                7 => {
+                    // intersects() agrees with BTreeSet intersection
+                    let (other_mask, other_ref) = sample_other(&mut rng, max_index);
+                    let expected = reference.intersection(&other_ref).next().is_some();
+                    assert_eq!(
+                        mask.intersects(&other_mask),
+                        expected,
+                        "step={step} seed={seed} op=intersects"
+                    );
+                    // Symmetry: intersects is commutative
+                    assert_eq!(
+                        other_mask.intersects(&mask),
+                        expected,
+                        "step={step} seed={seed} op=intersects-symmetric"
+                    );
+                }
+                8 => {
+                    // FromIterator: building a fresh BitSet from the reference
+                    // must compare equal to the mask.
+                    let built: BitSet = reference.iter().copied().collect();
+                    assert_eq!(built, mask, "step={step} seed={seed} op=FromIterator");
+                }
+                9 => {
+                    // iter() -> collect::<BitSet>() round trip is the identity
+                    let round: BitSet = mask.iter().collect();
+                    assert_eq!(round, mask, "step={step} seed={seed} op=iter-roundtrip");
+
+                    // iter() yields bits in strictly increasing order, matching the reference
+                    let collected: Vec<usize> = mask.iter().collect();
+                    for w in collected.windows(2) {
+                        assert!(
+                            w[0] < w[1],
+                            "step={step} seed={seed} iter not strictly increasing"
+                        );
+                    }
+                    let ref_vec: Vec<usize> = reference.iter().copied().collect();
+                    assert_eq!(
+                        collected, ref_vec,
+                        "step={step} seed={seed} iter contents vs ref"
+                    );
+                }
+                10 => {
+                    // From<u128>: sample a random u128, verify per-bit and count
+                    let val = ((rng.next_u32() as u128) << 96)
+                        | ((rng.next_u32() as u128) << 64)
+                        | ((rng.next_u32() as u128) << 32)
+                        | (rng.next_u32() as u128);
+                    let bs = BitSet::from(val);
+                    assert_eq!(
+                        bs.count(),
+                        val.count_ones() as usize,
+                        "step={step} seed={seed} From<u128>({val:#x}) count"
+                    );
+                    for i in 0..128 {
+                        let expected = (val >> i) & 1 != 0;
+                        assert_eq!(
+                            bs.get(i),
+                            expected,
+                            "step={step} seed={seed} From<u128>({val:#x}) get({i})"
+                        );
+                    }
+                    // Path equivalence: same bits via set() must compare equal
+                    let mut manual = BitSet::default();
+                    for i in 0..128 {
+                        if (val >> i) & 1 != 0 {
+                            manual.set(i);
+                        }
+                    }
+                    assert_eq!(
+                        bs, manual,
+                        "step={step} seed={seed} From<u128>({val:#x}) vs manual"
+                    );
+                    // From<u128>(0) must equal default (equality anchor)
+                    assert_eq!(
+                        BitSet::<usize>::from(0u128),
+                        BitSet::<usize>::default(),
+                        "step={step} seed={seed} From<u128>(0) != default"
+                    );
+                }
+                11 => {
+                    // SubAssign (delegates to subtract)
+                    let (other_mask, other_ref) = sample_other(&mut rng, max_index);
+                    mask -= &other_mask;
+                    for i in &other_ref {
+                        reference.remove(i);
+                    }
+                }
+                12 => {
+                    // BitOrAssign
+                    let (other_mask, other_ref) = sample_other(&mut rng, max_index);
+                    mask |= &other_mask;
+                    for i in other_ref {
+                        reference.insert(i);
+                    }
+                }
+                13 => {
+                    // Cross-method: count() == iter().count() == rank(usize::MAX)
+                    let c = mask.count();
+                    assert_eq!(
+                        c,
+                        mask.iter().count(),
+                        "step={step} seed={seed} count vs iter().count()"
+                    );
+                    assert_eq!(
+                        c,
+                        mask.rank(usize::MAX),
+                        "step={step} seed={seed} count vs rank(MAX)"
+                    );
+                }
+                14 => {
+                    // Cross-method: contains_all(other) && !other.is_empty() => intersects(other)
+                    let (other_mask, other_ref) = sample_other(&mut rng, max_index);
+                    if mask.contains_all_set_bits_of(&other_mask) && !other_ref.is_empty() {
+                        assert!(
+                            mask.intersects(&other_mask),
+                            "step={step} seed={seed} contains_all should imply intersects"
+                        );
+                    }
+                }
+                15 => {
+                    // Cross-method: is_empty() iff count() == 0
+                    assert_eq!(
+                        mask.is_empty(),
+                        mask.count() == 0,
+                        "step={step} seed={seed} is_empty vs count==0"
+                    );
+                    assert_eq!(
+                        mask.is_empty(),
+                        reference.is_empty(),
+                        "step={step} seed={seed} is_empty vs ref"
+                    );
+                }
+                _ => unreachable!(),
+            }
+        }
+
+        // Final verification: complete iter vs reference, and count agreement
+        let collected: std::collections::BTreeSet<usize> = mask.iter().collect();
+        assert_eq!(collected, reference, "final iter mismatch, seed={seed}");
+        assert_eq!(
+            mask.count(),
+            reference.len(),
+            "final count mismatch, seed={seed}"
+        );
+    }
+
+    #[test]
+    fn test_bitset_with_table_internal_id() {
+        let a = TableInternalId::from(3);
+        let b = TableInternalId::from(70); // exercises overflow path
+        let c = TableInternalId::from(200);
+
+        let mut mask: BitSet<TableInternalId> = BitSet::default();
+        mask.set(a);
+        mask.set(b);
+        mask.set(c);
+
+        assert!(mask.get(a));
+        assert!(mask.get(b));
+        assert!(mask.get(c));
+        assert!(!mask.get(TableInternalId::from(4)));
+        assert_eq!(mask.count(), 3);
+
+        mask.clear(b);
+        assert!(!mask.get(b));
+        assert_eq!(mask.count(), 2);
+
+        // Iterator yields TableInternalId, not usize.
+        let collected: Vec<TableInternalId> = (&mask).into_iter().collect();
+        assert_eq!(collected, vec![a, c]);
+
+        // FromIterator<TableInternalId> works.
+        let rebuilt: BitSet<TableInternalId> = [a, c].into_iter().collect();
+        assert_eq!(rebuilt, mask);
+    }
+
+    #[test]
+    fn test_column_mask_sub_assign() {
+        let mut a: ColumnMask = [1, 3, ROWID_SENTINEL].into_iter().collect();
+        let b: ColumnMask = [3, ROWID_SENTINEL].into_iter().collect();
+        a -= &b;
+        assert!(a.get(1));
+        assert!(!a.get(3));
+        assert!(!a.get(ROWID_SENTINEL));
+        assert_eq!(a.count(), 1);
+
+        // Subtracting without rowid sentinel leaves it intact
+        let mut a: ColumnMask = [2, 4, ROWID_SENTINEL].into_iter().collect();
+        let b: ColumnMask = [2].into_iter().collect();
+        a -= &b;
+        assert!(!a.get(2));
+        assert!(a.get(4));
+        assert!(a.get(ROWID_SENTINEL));
+        assert_eq!(a.count(), 2);
     }
 }

@@ -10,7 +10,7 @@ use turso_parser::ast::{Name, TransactionType};
 pub fn translate_tx_begin(
     tx_type: Option<TransactionType>,
     _tx_name: Option<Name>,
-    schema: &Schema,
+    resolver: &Resolver,
     program: &mut ProgramBuilder,
 ) -> Result<()> {
     program.extend(&ProgramBuilderOpts {
@@ -18,21 +18,41 @@ pub fn translate_tx_begin(
         approx_num_insns: 0,
         approx_num_labels: 0,
     });
+    let schema = resolver.schema();
     let tx_type = tx_type.unwrap_or(TransactionType::Deferred);
     match tx_type {
         TransactionType::Deferred => {
+            // SQLite emits only AutoCommit for deferred — no
+            // Transaction opcodes at all (for any database).
             program.emit_insn(Insn::AutoCommit {
                 auto_commit: false,
                 rollback: false,
             });
         }
         TransactionType::Immediate | TransactionType::Exclusive => {
+            // SQLite emits Transaction for every open database (main, temp, each attached)
+            // on BEGIN IMMEDIATE / EXCLUSIVE. We match that exactly. For temp, this may
+            // trigger lazy initialization via `ensure_temp_database` in op_transaction:
+            // an acceptable one-time cost that keeps the opcode sequence identical to SQLite.
             program.emit_insn(Insn::Transaction {
                 db: crate::MAIN_DB_ID,
                 tx_mode: TransactionMode::Write,
                 schema_cookie: schema.schema_version,
             });
-            // TODO: Emit transaction instruction on temporary tables when we support them.
+            let temp_schema_cookie = resolver.with_schema(crate::TEMP_DB_ID, |s| s.schema_version);
+            program.emit_insn(Insn::Transaction {
+                db: crate::TEMP_DB_ID,
+                tx_mode: TransactionMode::Write,
+                schema_cookie: temp_schema_cookie,
+            });
+            for db_id in resolver.attached_database_ids_in_search_order() {
+                let cookie = resolver.with_schema(db_id, |s| s.schema_version);
+                program.emit_insn(Insn::Transaction {
+                    db: db_id,
+                    tx_mode: TransactionMode::Write,
+                    schema_cookie: cookie,
+                });
+            }
             program.emit_insn(Insn::AutoCommit {
                 auto_commit: false,
                 rollback: false,
@@ -44,7 +64,23 @@ pub fn translate_tx_begin(
                 tx_mode: TransactionMode::Concurrent,
                 schema_cookie: schema.schema_version,
             });
-            // TODO: Emit transaction instruction on temporary tables when we support them.
+            // Temp has no MVCC, so it uses a plain write lock even in
+            // Concurrent mode. The op_transaction handler detects this via
+            // `mv_store_for_db(TEMP) == None` and skips the MVCC path.
+            let temp_schema_cookie = resolver.with_schema(crate::TEMP_DB_ID, |s| s.schema_version);
+            program.emit_insn(Insn::Transaction {
+                db: crate::TEMP_DB_ID,
+                tx_mode: TransactionMode::Write,
+                schema_cookie: temp_schema_cookie,
+            });
+            for db_id in resolver.attached_database_ids_in_search_order() {
+                let cookie = resolver.with_schema(db_id, |s| s.schema_version);
+                program.emit_insn(Insn::Transaction {
+                    db: db_id,
+                    tx_mode: TransactionMode::Write,
+                    schema_cookie: cookie,
+                });
+            }
             program.emit_insn(Insn::AutoCommit {
                 auto_commit: false,
                 rollback: false,
@@ -60,11 +96,7 @@ pub fn translate_tx_commit(
     resolver: &Resolver,
     program: &mut ProgramBuilder,
 ) -> Result<()> {
-    program.extend(&ProgramBuilderOpts {
-        num_cursors: 0,
-        approx_num_insns: 0,
-        approx_num_labels: 0,
-    });
+    program.extend(&ProgramBuilderOpts::new(0, 0, 0));
 
     let cdc_info = program.capture_data_changes_info().as_ref();
     if cdc_info.is_some_and(|info| info.cdc_version().has_commit_record()) {

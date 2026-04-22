@@ -312,14 +312,18 @@ def test_crypto():
     )
     turso.run_test_fn(
         "SELECT crypto_encode(crypto_sha384('abc'), 'hex');",
-        lambda a: a
-        == "cb00753f45a35e8bb5a03d699ac65007272c32ab0eded1631a8b605a43ff5bed8086072ba1e7cc2358baeca134c825a7",
+        lambda a: (
+            a == "cb00753f45a35e8bb5a03d699ac65007272c32ab0eded1631a8b605a43ff5bed8086072ba1e7cc2358baeca134c825a7"
+        ),
         "sha384 should encrypt correctly",
     )
     turso.run_test_fn(
         "SELECT crypto_encode(crypto_sha512('abc'), 'hex');",
-        lambda a: a
-        == "ddaf35a193617abacc417349ae20413112e6fa4e89a97ea20a9eeee64b55d39a2192992a274fc1a836ba3c23a3feebbd454d4423643ce80e2a9ac94fa54ca49f",  # noqa: E501
+        lambda a: (
+            a
+            == "ddaf35a193617abacc417349ae20413112e6fa4e89a97ea20a9eeee64b55d39a2192992a274fc1a"
+            + "836ba3c23a3feebbd454d4423643ce80e2a9ac94fa54ca49f"
+        ),  # noqa: E501
         "sha512 should encrypt correctly",
     )
 
@@ -404,14 +408,8 @@ def _test_series(limbo: TestTursoShell):
         "SELECT * FROM generate_series(10, 1, -2);",
         lambda res: res == "10\n8\n6\n4\n2",
     )
-    limbo.run_test_fn(
-        "SELECT * FROM generate_series(-1, 2);",
-        lambda res: res == "-1\n0\n1\n2"
-    )
-    limbo.run_test_fn(
-        "SELECT * FROM generate_series(-3, -1);",
-        lambda res: res == "-3\n-2\n-1"
-    )
+    limbo.run_test_fn("SELECT * FROM generate_series(-1, 2);", lambda res: res == "-1\n0\n1\n2")
+    limbo.run_test_fn("SELECT * FROM generate_series(-3, -1);", lambda res: res == "-3\n-2\n-1")
     limbo.run_test_fn(
         "SELECT * FROM generate_series(b.start, b.stop) b;",
         lambda res: "Invalid Argument" in res or 'first argument to "generate_series()" missing or unusable' in res,
@@ -522,7 +520,7 @@ def _test_kv(exec_name, ext_path):
     turso.run_test_fn("alter table t rename to renamed;", lambda res: "" == res, "can rename virtual table")
     turso.run_test_fn(
         "select sql from sqlite_schema where name = 'renamed';",
-        lambda res: "CREATE VIRTUAL TABLE renamed USING kv_store ()",
+        lambda res: 'CREATE VIRTUAL TABLE "renamed" USING kv_store',
         "renamed table shows up in sqlite_schema",
     )
     turso.quit()
@@ -790,38 +788,38 @@ def test_csv():
     test_module_list(turso, "target/debug/liblimbo_csv", "csv")
 
     turso.run_test_fn(
-        "CREATE VIRTUAL TABLE temp.csv USING csv(filename=./testing/cli_tests/test_files/test.csv);",
+        "CREATE VIRTUAL TABLE csv USING csv(filename=./testing/cli_tests/test_files/test.csv);",
         null,
         "Create virtual table from CSV file",
     )
     turso.run_test_fn(
-        "SELECT * FROM temp.csv;",
+        "SELECT * FROM csv;",
         lambda res: res == "1|2.0|String'1\n3|4.0|String2",
         "Read all rows from CSV table",
     )
     turso.run_test_fn(
-        "SELECT * FROM temp.csv WHERE c2 = 'String2';",
+        "SELECT * FROM csv WHERE c2 = 'String2';",
         lambda res: res == "3|4.0|String2",
         "Filter rows with WHERE clause",
     )
     turso.run_test_fn(
-        "INSERT INTO temp.csv VALUES (5, 6.0, 'String3');",
+        "INSERT INTO csv VALUES (5, 6.0, 'String3');",
         lambda res: "Table is read-only" in res,
         "INSERT into CSV table should fail",
     )
     turso.run_test_fn(
-        "UPDATE temp.csv SET c0 = 10 WHERE c1 = '2.0';",
+        "UPDATE csv SET c0 = 10 WHERE c1 = '2.0';",
         lambda res: "is read-only" in res,
         "UPDATE on CSV table should fail",
     )
     turso.run_test_fn(
-        "DELETE FROM temp.csv WHERE c1 = '2.0';",
+        "DELETE FROM csv WHERE c1 = '2.0';",
         lambda res: "is read-only" in res,
         "DELETE on CSV table should fail",
     )
-    turso.run_test_fn("DROP TABLE temp.csv;", null, "Drop CSV table")
+    turso.run_test_fn("DROP TABLE csv;", null, "Drop CSV table")
     turso.run_test_fn(
-        "SELECT * FROM temp.csv;",
+        "SELECT * FROM csv;",
         lambda res: "Parse error: no such table: csv" in res,
         "Query dropped CSV table should fail",
     )

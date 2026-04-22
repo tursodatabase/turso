@@ -5,10 +5,6 @@ export declare class BatchExecutor {
   reset(): void
 }
 
-export interface QueryOptions {
-  queryTimeout?: number
-}
-
 /** A database connection. */
 export declare class Database {
   /**
@@ -45,9 +41,9 @@ export declare class Database {
    *
    * # Returns
    *
-   * A `Statement` instance.
+   * A promise resolving to a `Statement` instance.
    */
-  prepare(sql: string): Statement
+  prepare(sql: string): Promise<Statement>
   executor(sql: string, queryOptions?: QueryOptions | undefined | null): BatchExecutor
   /**
    * Returns the rowid of the last row inserted.
@@ -179,4 +175,8 @@ export interface EncryptionOpts {
   cipher: EncryptionCipher
   /** The hex-encoded encryption key */
   hexkey: string
+}
+
+export interface QueryOptions {
+  queryTimeout?: number
 }

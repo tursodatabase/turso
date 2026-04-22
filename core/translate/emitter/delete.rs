@@ -8,7 +8,8 @@ use crate::{
         emitter::{
             emit_cdc_autocommit_commit, emit_cdc_full_record, emit_cdc_insns,
             emit_index_column_value_old_image, emit_program_for_select,
-            get_relevant_triggers_type_and_time, init_limit, OperationMode, TriggerTime,
+            get_triggers_including_temp, has_triggers_including_temp, init_limit, OperationMode,
+            TriggerTime,
         },
         expr::{
             emit_returning_results, emit_returning_scan_back, emit_table_column,
@@ -25,7 +26,7 @@ use crate::{
             ResultSetColumn, Search, TableReferences,
         },
         subquery::{emit_non_from_clause_subqueries_for_eval_at, emit_non_from_clause_subquery},
-        trigger_exec::{fire_trigger, has_relevant_triggers_type_only, TriggerContext},
+        trigger_exec::{fire_trigger, TriggerContext},
     },
     vdbe::{
         builder::{CursorKey, CursorType, ProgramBuilder},
@@ -295,7 +296,7 @@ pub fn emit_fk_child_decrement_on_delete(
         }
         // Fast path: if any FK column is NULL can't be a violation
         let null_skip = program.allocate_label();
-        for cname in &fk_ref.child_cols {
+        for cname in &fk_ref.fk.child_columns {
             let (pos, col) = child_tbl.get_column(cname).unwrap();
             let src = if col.is_rowid_alias() {
                 child_rowid_reg
@@ -322,7 +323,7 @@ pub fn emit_fk_child_decrement_on_delete(
                 .expect("parent btree");
             let pcur = open_read_table(program, &parent_tbl, database_id);
 
-            let (pos, col) = child_tbl.get_column(&fk_ref.child_cols[0]).unwrap();
+            let (pos, col) = child_tbl.get_column(&fk_ref.fk.child_columns[0]).unwrap();
             let val = if col.is_rowid_alias() {
                 child_rowid_reg
             } else {
@@ -371,9 +372,9 @@ pub fn emit_fk_child_decrement_on_delete(
             let icur = open_read_index(program, idx, database_id);
 
             // Build probe from current child row
-            let n = fk_ref.child_cols.len();
+            let n = fk_ref.fk.child_columns.len();
             let probe = program.alloc_registers(n);
-            for (i, cname) in fk_ref.child_cols.iter().enumerate() {
+            for (i, cname) in fk_ref.fk.child_columns.iter().enumerate() {
                 let (pos, col) = child_tbl.get_column(cname).unwrap();
                 let src = if col.is_rowid_alias() {
                     child_rowid_reg
@@ -467,9 +468,13 @@ fn emit_delete_insns<'a>(
     let main_table_cursor_id = program.resolve_cursor_id(&CursorKey::table(internal_id));
     let has_returning = !result_columns.is_empty();
     let has_delete_triggers = if let Some(btree_table) = btree_table {
-        t_ctx.resolver.with_schema(database_id, |s| {
-            has_relevant_triggers_type_only(s, TriggerEvent::Delete, None, &btree_table)
-        })
+        has_triggers_including_temp(
+            &t_ctx.resolver,
+            database_id,
+            TriggerEvent::Delete,
+            None,
+            &btree_table,
+        )
     } else {
         false
     };
@@ -544,6 +549,7 @@ fn emit_delete_insns<'a>(
                 &t_ctx.resolver,
                 table_references,
                 main_table_cursor_id,
+                internal_id,
                 column_index,
                 start_reg + reg_offset,
             )?;
@@ -636,6 +642,7 @@ fn emit_delete_row_common(
                     table_name,
                     main_table_cursor_id,
                     rowid_reg,
+                    None,
                     delete_db_id,
                 )?
             } else {
@@ -728,6 +735,7 @@ fn emit_delete_row_common(
                     &t_ctx.resolver,
                     table_references,
                     main_table_cursor_id,
+                    internal_id,
                     column_index,
                     start_reg + reg_offset,
                 )?;
@@ -886,9 +894,13 @@ fn emit_delete_insns_when_triggers_present(
     let database_id = unsafe { (*table_reference).database_id };
     let has_returning = !result_columns.is_empty();
     let has_delete_triggers = if let Some(btree_table) = btree_table {
-        t_ctx.resolver.with_schema(database_id, |s| {
-            has_relevant_triggers_type_only(s, TriggerEvent::Delete, None, &btree_table)
-        })
+        has_triggers_including_temp(
+            &t_ctx.resolver,
+            database_id,
+            TriggerEvent::Delete,
+            None,
+            &btree_table,
+        )
     } else {
         false
     };
@@ -918,16 +930,14 @@ fn emit_delete_insns_when_triggers_present(
 
     // Fire BEFORE DELETE triggers
     if let Some(btree_table) = unsafe { &*table_reference }.btree() {
-        let relevant_triggers: Vec<_> = t_ctx.resolver.with_schema(database_id, |s| {
-            get_relevant_triggers_type_and_time(
-                s,
-                TriggerEvent::Delete,
-                TriggerTime::Before,
-                None,
-                &btree_table,
-            )
-            .collect()
-        });
+        let relevant_triggers = get_triggers_including_temp(
+            &t_ctx.resolver,
+            database_id,
+            TriggerEvent::Delete,
+            TriggerTime::Before,
+            None,
+            &btree_table,
+        );
         if !relevant_triggers.is_empty() {
             let columns_start_reg = columns_start_reg
                 .expect("columns_start_reg must be provided when there are triggers or RETURNING");
@@ -991,16 +1001,14 @@ fn emit_delete_insns_when_triggers_present(
 
     // Fire AFTER DELETE triggers
     if let Some(btree_table) = unsafe { &*table_reference }.btree() {
-        let relevant_triggers: Vec<_> = t_ctx.resolver.with_schema(database_id, |s| {
-            get_relevant_triggers_type_and_time(
-                s,
-                TriggerEvent::Delete,
-                TriggerTime::After,
-                None,
-                &btree_table,
-            )
-            .collect()
-        });
+        let relevant_triggers = get_triggers_including_temp(
+            &t_ctx.resolver,
+            database_id,
+            TriggerEvent::Delete,
+            TriggerTime::After,
+            None,
+            &btree_table,
+        );
         if !relevant_triggers.is_empty() {
             let columns_start_reg = columns_start_reg
                 .expect("columns_start_reg must be provided when there are triggers or RETURNING");

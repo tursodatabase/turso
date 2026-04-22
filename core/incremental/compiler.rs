@@ -2267,7 +2267,9 @@ mod tests {
     use super::*;
     use crate::incremental::dbsp::Delta;
     use crate::incremental::operator::{FilterOperator, FilterPredicate};
-    use crate::schema::{BTreeTable, ColDef, Column as SchemaColumn, Schema, Type};
+    use crate::schema::{
+        BTreeCharacteristics, BTreeTable, ColDef, Column as SchemaColumn, Schema, Type,
+    };
     use crate::storage::pager::CreateBTreeFlags;
     use crate::sync::Arc;
     use crate::translate::logical::{ColumnInfo, LogicalPlanBuilder, LogicalSchema};
@@ -2303,22 +2305,17 @@ mod tests {
                     None,
                 ),
             ];
-            let logical_to_physical_map = BTreeTable::build_logical_to_physical_map(&columns);
-            let users_table = BTreeTable {
-                name: "users".to_string(),
-                root_page: 2,
-                primary_key_columns: vec![("id".to_string(), turso_parser::ast::SortOrder::Asc)],
+            let users_table = BTreeTable::new(
+                2,
+                "users".to_string(),
+                vec![("id".to_string(), turso_parser::ast::SortOrder::Asc)],
                 columns,
-                has_rowid: true,
-                is_strict: false,
-                has_autoincrement: false,
-                unique_sets: vec![],
-                foreign_keys: vec![],
-                check_constraints: vec![],
-                rowid_alias_conflict_clause: None,
-                has_virtual_columns: false,
-                logical_to_physical_map,
-            };
+                BTreeCharacteristics::HAS_ROWID,
+                vec![],
+                vec![],
+                vec![],
+                None,
+            );
             schema
                 .add_btree_table(Arc::new(users_table))
                 .expect("Test setup: failed to add users table");
@@ -2350,25 +2347,17 @@ mod tests {
                     None,
                 ),
             ];
-            let logical_to_physical_map = BTreeTable::build_logical_to_physical_map(&columns);
-            let products_table = BTreeTable {
-                name: "products".to_string(),
-                root_page: 3,
-                primary_key_columns: vec![(
-                    "product_id".to_string(),
-                    turso_parser::ast::SortOrder::Asc,
-                )],
+            let products_table = BTreeTable::new(
+                3,
+                "products".to_string(),
+                vec![("product_id".to_string(), turso_parser::ast::SortOrder::Asc)],
                 columns,
-                has_rowid: true,
-                is_strict: false,
-                has_autoincrement: false,
-                unique_sets: vec![],
-                foreign_keys: vec![],
-                check_constraints: vec![],
-                rowid_alias_conflict_clause: None,
-                has_virtual_columns: false,
-                logical_to_physical_map,
-            };
+                BTreeCharacteristics::HAS_ROWID,
+                vec![],
+                vec![],
+                vec![],
+                None,
+            );
             schema
                 .add_btree_table(Arc::new(products_table))
                 .expect("Test setup: failed to add products table");
@@ -2405,25 +2394,17 @@ mod tests {
                     None,
                 ),
             ];
-            let logical_to_physical_map = BTreeTable::build_logical_to_physical_map(&columns);
-            let orders_table = BTreeTable {
-                name: "orders".to_string(),
-                root_page: 4,
-                primary_key_columns: vec![(
-                    "order_id".to_string(),
-                    turso_parser::ast::SortOrder::Asc,
-                )],
+            let orders_table = BTreeTable::new(
+                4,
+                "orders".to_string(),
+                vec![("order_id".to_string(), turso_parser::ast::SortOrder::Asc)],
                 columns,
-                has_rowid: true,
-                has_autoincrement: false,
-                is_strict: false,
-                unique_sets: vec![],
-                foreign_keys: vec![],
-                check_constraints: vec![],
-                rowid_alias_conflict_clause: None,
-                has_virtual_columns: false,
-                logical_to_physical_map,
-            };
+                BTreeCharacteristics::HAS_ROWID,
+                vec![],
+                vec![],
+                vec![],
+                None,
+            );
             schema
                 .add_btree_table(Arc::new(orders_table))
                 .expect("Test setup: failed to add orders table");
@@ -2446,22 +2427,17 @@ mod tests {
                 ),
                 SchemaColumn::new_default_text(Some("name".to_string()), "TEXT".to_string(), None),
             ];
-            let logical_to_physical_map = BTreeTable::build_logical_to_physical_map(&columns);
-            let customers_table = BTreeTable {
-                name: "customers".to_string(),
-                root_page: 6,
-                primary_key_columns: vec![("id".to_string(), turso_parser::ast::SortOrder::Asc)],
+            let customers_table = BTreeTable::new(
+                6,
+                "customers".to_string(),
+                vec![("id".to_string(), turso_parser::ast::SortOrder::Asc)],
                 columns,
-                has_rowid: true,
-                is_strict: false,
-                has_autoincrement: false,
-                unique_sets: vec![],
-                foreign_keys: vec![],
-                check_constraints: vec![],
-                rowid_alias_conflict_clause: None,
-                has_virtual_columns: false,
-                logical_to_physical_map,
-            };
+                BTreeCharacteristics::HAS_ROWID,
+                vec![],
+                vec![],
+                vec![],
+                None,
+            );
             schema
                 .add_btree_table(Arc::new(customers_table))
                 .expect("Test setup: failed to add customers table");
@@ -2498,22 +2474,17 @@ mod tests {
                     None,
                 ),
             ];
-            let logical_to_physical_map = BTreeTable::build_logical_to_physical_map(&columns);
-            let purchases_table = BTreeTable {
-                name: "purchases".to_string(),
-                root_page: 7,
-                primary_key_columns: vec![("id".to_string(), turso_parser::ast::SortOrder::Asc)],
+            let purchases_table = BTreeTable::new(
+                7,
+                "purchases".to_string(),
+                vec![("id".to_string(), turso_parser::ast::SortOrder::Asc)],
                 columns,
-                has_rowid: true,
-                is_strict: false,
-                has_autoincrement: false,
-                unique_sets: vec![],
-                foreign_keys: vec![],
-                check_constraints: vec![],
-                rowid_alias_conflict_clause: None,
-                has_virtual_columns: false,
-                logical_to_physical_map,
-            };
+                BTreeCharacteristics::HAS_ROWID,
+                vec![],
+                vec![],
+                vec![],
+                None,
+            );
             schema
                 .add_btree_table(Arc::new(purchases_table))
                 .expect("Test setup: failed to add purchases table");
@@ -2541,22 +2512,17 @@ mod tests {
                     None,
                 ),
             ];
-            let logical_to_physical_map = BTreeTable::build_logical_to_physical_map(&columns);
-            let vendors_table = BTreeTable {
-                name: "vendors".to_string(),
-                root_page: 8,
-                primary_key_columns: vec![("id".to_string(), turso_parser::ast::SortOrder::Asc)],
+            let vendors_table = BTreeTable::new(
+                8,
+                "vendors".to_string(),
+                vec![("id".to_string(), turso_parser::ast::SortOrder::Asc)],
                 columns,
-                has_rowid: true,
-                is_strict: false,
-                has_autoincrement: false,
-                unique_sets: vec![],
-                foreign_keys: vec![],
-                check_constraints: vec![],
-                rowid_alias_conflict_clause: None,
-                has_virtual_columns: false,
-                logical_to_physical_map,
-            };
+                BTreeCharacteristics::HAS_ROWID,
+                vec![],
+                vec![],
+                vec![],
+                None,
+            );
             schema
                 .add_btree_table(Arc::new(vendors_table))
                 .expect("Test setup: failed to add vendors table");
@@ -2573,22 +2539,17 @@ mod tests {
                     None,
                 ),
             ];
-            let logical_to_physical_map = BTreeTable::build_logical_to_physical_map(&columns);
-            let sales_table = BTreeTable {
-                name: "sales".to_string(),
-                root_page: 2,
-                primary_key_columns: vec![],
+            let sales_table = BTreeTable::new(
+                2,
+                "sales".to_string(),
+                vec![],
                 columns,
-                has_rowid: true,
-                is_strict: false,
-                has_autoincrement: false,
-                unique_sets: vec![],
-                foreign_keys: vec![],
-                check_constraints: vec![],
-                rowid_alias_conflict_clause: None,
-                has_virtual_columns: false,
-                logical_to_physical_map,
-            };
+                BTreeCharacteristics::HAS_ROWID,
+                vec![],
+                vec![],
+                vec![],
+                None,
+            );
             schema
                 .add_btree_table(Arc::new(sales_table))
                 .expect("Test setup: failed to add sales table");

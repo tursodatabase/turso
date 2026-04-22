@@ -84,7 +84,7 @@ fn constraint_output_multipliers(
     };
 
     for constraint in rhs_constraints.constraints.iter().filter(|constraint| {
-        (lhs_mask.contains_all(&constraint.lhs_mask)
+        (lhs_mask.contains_all_set_bits_of(&constraint.lhs_mask)
             || constraint.lhs_mask == rhs_self_mask
             || constraint.lhs_mask.is_empty())
             && !consumed_where_terms.contains(&constraint.where_clause_pos.0)
@@ -207,13 +207,12 @@ pub fn join_lhs_and_rhs<'a>(
     {
         if constraint_refs.is_empty() {
             // Check if there are usable constraints that will create an ephemeral index
-            let lhs_mask_for_ephemeral = lhs.map_or_else(TableMask::new, |l| {
-                TableMask::from_table_number_iter(l.table_numbers())
-            });
+            let lhs_mask_for_ephemeral: TableMask =
+                lhs.map_or_else(TableMask::default, |l| l.table_numbers().collect());
             let has_usable_constraints = rhs_constraints.constraints.iter().any(|c| {
                 c.usable
                     && c.table_col_pos.is_some()
-                    && lhs_mask_for_ephemeral.contains_all(&c.lhs_mask)
+                    && lhs_mask_for_ephemeral.contains_all_set_bits_of(&c.lhs_mask)
             });
 
             if has_usable_constraints && lhs.is_some() {
@@ -230,15 +229,13 @@ pub fn join_lhs_and_rhs<'a>(
     let mut best_access_method = method;
 
     // Reuse for hash cost and output cardinality computation
-    let lhs_mask = lhs.map_or_else(TableMask::new, |l| {
-        TableMask::from_table_number_iter(l.table_numbers())
-    });
+    let lhs_mask = lhs.map_or_else(TableMask::default, |l| l.table_numbers().collect());
 
     // Self-constraints are conditions comparing columns within the same table
     // (e.g., t.col1 < t.col2). Include them in selectivity since they filter rows.
     let rhs_self_mask = {
-        let mut m = TableMask::new();
-        m.add_table(rhs_table_number);
+        let mut m = TableMask::default();
+        m.set(rhs_table_number);
         m
     };
 
@@ -277,7 +274,7 @@ pub fn join_lhs_and_rhs<'a>(
     if let Some(lhs) = lhs {
         let rhs_table_idx = join_order.last().unwrap().original_idx;
         let last_lhs_table_idx = join_order[join_order.len() - 2].original_idx;
-        let lhs_table_numbers: Vec<usize> = lhs.table_numbers().collect();
+        let lhs_table_numbers: TableMask = lhs.table_numbers().collect();
 
         let rhs_has_selective_seek = matches!(
             best_access_method.params,
@@ -343,7 +340,12 @@ pub fn join_lhs_and_rhs<'a>(
                 build_self_constraint_selectivity(build_constraints, build_table_idx);
             let build_cardinality = (*build_base_rows) * build_self_selectivity;
             let probe_cardinality = *rhs_base_rows;
-            let prior_mask = lhs_mask.without_table(build_table_idx);
+
+            let prior_mask = {
+                let mut mask = lhs_mask.clone();
+                mask.clear(build_table_idx);
+                mask
+            };
             let prior_constraint_selectivity =
                 build_prior_constraint_selectivity(build_constraints, &prior_mask);
             let probe_multiplier = if lhs.data.len() == 1 && lhs.data[0].0 == build_table_idx {
@@ -373,7 +375,7 @@ pub fn join_lhs_and_rhs<'a>(
             // - products has constraint from items, BUT items is build of an earlier hash join where products was probe
             // - So the constraint IS consumed, and products cursor IS positioned via SeekRowid
             // Get the set of tables that are build tables for hash joins where build_table_idx was probe
-            let tables_already_hash_joined_as_build: Vec<usize> = {
+            let prior_hash_build_mask: TableMask = {
                 let arena = &access_methods_arena;
                 lhs.data
                     .iter()
@@ -397,9 +399,6 @@ pub fn join_lhs_and_rhs<'a>(
                     })
                     .collect()
             };
-            let prior_hash_build_mask = TableMask::from_table_number_iter(
-                tables_already_hash_joined_as_build.iter().copied(),
-            );
 
             let build_has_prior_constraints = {
                 build_constraints.constraints.iter().any(|c| {
@@ -411,9 +410,9 @@ pub fn join_lhs_and_rhs<'a>(
                     // Check if ALL referenced prior tables are already hash-joined with us as probe
                     // If so, the constraint is consumed and we're OK
                     for table_idx in 0..64 {
-                        if c.lhs_mask.contains_table(table_idx)
-                            && prior_mask.contains_table(table_idx)
-                            && !tables_already_hash_joined_as_build.contains(&table_idx)
+                        if c.lhs_mask.get(table_idx)
+                            && prior_mask.get(table_idx)
+                            && !prior_hash_build_mask.get(table_idx)
                         {
                             // This prior table is NOT handled by a hash join, constraint not consumed
                             return true;
@@ -628,7 +627,7 @@ pub fn join_lhs_and_rhs<'a>(
                                 // toward chaining a more selective prefix without changing
                                 // the primary cost model.
                                 let tie_breaker =
-                                    prior_mask.tables_iter().min().unwrap_or(0) as f64 * 1.0e-6;
+                                    prior_mask.iter().min().unwrap_or(0) as f64 * 1.0e-6;
                                 hash_join_method.cost = hash_join_method.cost + Cost(tie_breaker);
                             } else {
                                 *materialize_build_input = false;
@@ -797,10 +796,8 @@ fn build_has_uncovered_prior_constraints(
         if !constraint.lhs_mask.intersects(prior_hash_build_mask) {
             return true;
         }
-        for table_idx in prior_mask.tables_iter() {
-            if constraint.lhs_mask.contains_table(table_idx)
-                && !prior_hash_build_mask.contains_table(table_idx)
-            {
+        for table_idx in prior_mask.iter() {
+            if constraint.lhs_mask.get(table_idx) && !prior_hash_build_mask.get(table_idx) {
                 return true;
             }
         }
@@ -841,11 +838,11 @@ fn build_self_constraint_selectivity(
     build_constraints: &TableConstraints,
     build_table_idx: usize,
 ) -> f64 {
-    let build_only_mask = TableMask::from_table_number_iter([build_table_idx].into_iter());
+    let build_only_mask: TableMask = [build_table_idx].into_iter().collect();
     let mut selectivity = 1.0;
     let mut saw_constraint = false;
     for constraint in build_constraints.constraints.iter() {
-        if !build_only_mask.contains_all(&constraint.lhs_mask) {
+        if !build_only_mask.contains_all_set_bits_of(&constraint.lhs_mask) {
             continue;
         }
         selectivity *= constraint.selectivity;
@@ -1046,8 +1043,8 @@ pub(crate) fn compute_best_join_order_with_context<'a>(
     // Dynamic programming base case: calculate the best way to access each single table, as if
     // there were no other tables.
     for i in 0..num_tables {
-        let mut mask = TableMask::new();
-        mask.add_table(i);
+        let mut mask = TableMask::default();
+        mask.set(i);
         let table_ref = &joined_tables[i];
         join_order[0] = JoinOrderMember {
             table_id: table_ref.internal_id,
@@ -1113,10 +1110,10 @@ pub(crate) fn compute_best_join_order_with_context<'a>(
                     {
                         // bitwise OR the masks
                         if let Some(illegal_lhs) = left_join_illegal_map.get_mut(&i) {
-                            illegal_lhs.add_table(j);
+                            illegal_lhs.set(j);
                         } else {
-                            let mut mask = TableMask::new();
-                            mask.add_table(j);
+                            let mut mask = TableMask::default();
+                            mask.set(j);
                             left_join_illegal_map.insert(i, mask);
                         }
                     }
@@ -1142,12 +1139,16 @@ pub(crate) fn compute_best_join_order_with_context<'a>(
             // In this block, LHS is always (n-1) tables, and RHS is a single table.
             for rhs_idx in 0..num_tables {
                 // If the RHS table isn't a member of this join subset, skip.
-                if !mask.contains_table(rhs_idx) {
+                if !mask.get(rhs_idx) {
                     continue;
                 }
 
                 // If there are no other tables except RHS, skip.
-                let lhs_mask = mask.without_table(rhs_idx);
+                let lhs_mask = {
+                    let mut copy = mask.clone();
+                    copy.clear(rhs_idx);
+                    copy
+                };
                 if lhs_mask.is_empty() {
                     continue;
                 }
@@ -1168,9 +1169,8 @@ pub(crate) fn compute_best_join_order_with_context<'a>(
                 };
 
                 // Stable iteration keeps tie-breaks consistent across runs.
-                let mut lhs_keys: Vec<usize> = lhs_variants.keys().copied().collect();
-                lhs_keys.sort_unstable();
-                for lhs_key in lhs_keys {
+                let lhs_keys: TableMask = lhs_variants.keys().copied().collect();
+                for lhs_key in &lhs_keys {
                     let lhs = &lhs_variants[&lhs_key];
                     // Build a JoinOrder out of the table bitmask under consideration.
                     for table_no in lhs.table_numbers() {
@@ -1260,7 +1260,7 @@ pub(crate) fn compute_best_join_order_with_context<'a>(
                 }
             }
 
-            let has_all_tables = mask.table_count() == num_tables;
+            let has_all_tables = mask.count() == num_tables;
             if has_all_tables {
                 for rel in best_for_mask_by_last.into_values() {
                     if cost_upper_bound <= rel.cost {
@@ -1383,15 +1383,15 @@ pub fn compute_greedy_join_order<'a>(
                 .is_some_and(|ji| ji.is_ordering_constrained())
         })
         .map(|(j, _)| {
-            let mut required = TableMask::new();
+            let mut required = TableMask::default();
             for k in 0..j {
-                required.add_table(k);
+                required.set(k);
             }
             (j, required)
         })
         .collect();
 
-    let mut remaining: Vec<usize> = (0..num_tables).collect();
+    let mut remaining: TableMask = (0..num_tables).collect();
     let mut join_order: Vec<JoinOrderMember> = Vec::with_capacity(num_tables);
 
     // Pick starting table: prefer tables with high "hub score" (referenced by many constraints).
@@ -1403,7 +1403,7 @@ pub fn compute_greedy_join_order<'a>(
         original_idx: first_idx,
         is_outer: false, // First table cannot be outer join RHS
     });
-    remaining.retain(|&x| x != first_idx);
+    remaining.clear(first_idx);
 
     let mut current_plan: Option<JoinN> = join_lhs_and_rhs(
         None,
@@ -1436,8 +1436,7 @@ pub fn compute_greedy_join_order<'a>(
 
     // Greedily add remaining tables, always picking lowest marginal cost.
     while !remaining.is_empty() {
-        let current_mask =
-            TableMask::from_table_number_iter(join_order.iter().map(|m| m.original_idx));
+        let current_mask: TableMask = join_order.iter().map(|m| m.original_idx).collect();
 
         // Placeholder for candidate evaluation (avoids cloning)
         join_order.push(JoinOrderMember::default());
@@ -1445,10 +1444,10 @@ pub fn compute_greedy_join_order<'a>(
         let mut best: Option<(usize, JoinN)> = None;
 
         let mut has_connected_candidate = false;
-        for &idx in &remaining {
+        for idx in &remaining {
             // Outer join RHS requires all preceding tables joined first
             if let Some(required) = left_join_deps.get(&idx) {
-                if !current_mask.contains_all(required) {
+                if !current_mask.contains_all_set_bits_of(required) {
                     continue;
                 }
             }
@@ -1456,7 +1455,7 @@ pub fn compute_greedy_join_order<'a>(
                 let table_id = joined_tables[idx].internal_id;
                 table_ids.contains(&table_id)
                     && current_mask
-                        .tables_iter()
+                        .iter()
                         .map(|table_no| joined_tables[table_no].internal_id)
                         .any(|id| table_ids.contains(&id))
             });
@@ -1466,10 +1465,10 @@ pub fn compute_greedy_join_order<'a>(
             }
         }
 
-        for &idx in &remaining {
+        for idx in &remaining {
             // Outer join RHS requires all preceding tables joined first
             if let Some(required) = left_join_deps.get(&idx) {
-                if !current_mask.contains_all(required) {
+                if !current_mask.contains_all_set_bits_of(required) {
                     continue;
                 }
             }
@@ -1478,7 +1477,7 @@ pub fn compute_greedy_join_order<'a>(
                     let table_id = joined_tables[idx].internal_id;
                     table_ids.contains(&table_id)
                         && current_mask
-                            .tables_iter()
+                            .iter()
                             .map(|table_no| joined_tables[table_no].internal_id)
                             .any(|id| table_ids.contains(&id))
                 });
@@ -1536,7 +1535,7 @@ pub fn compute_greedy_join_order<'a>(
                 .as_ref()
                 .is_some_and(|ji| ji.is_outer()),
         });
-        remaining.retain(|&x| x != next_idx);
+        remaining.clear(next_idx);
         current_plan = Some(next_plan);
     }
 
@@ -1567,7 +1566,7 @@ fn find_best_starting_table(
     for (t, tc) in constraints.iter().enumerate() {
         for c in &tc.constraints {
             if c.usable && c.table_col_pos.is_some() {
-                for other in (0..num_tables).filter(|&x| x != t && c.lhs_mask.contains_table(x)) {
+                for other in (0..num_tables).filter(|&x| x != t && c.lhs_mask.get(x)) {
                     hub_score[other] += 1;
                 }
             }
@@ -1584,8 +1583,8 @@ fn find_best_starting_table(
 
         // Self-constraints compare columns within the same table (e.g., t.col1 < t.col2).
         let self_mask = {
-            let mut m = TableMask::new();
-            m.add_table(t);
+            let mut m = TableMask::default();
+            m.set(t);
             m
         };
 
@@ -1763,7 +1762,7 @@ impl Iterator for JoinBitmaskIter {
             return None;
         }
 
-        let result = TableMask::from_bits(self.current);
+        let result = self.current.into();
 
         // Gosper's hack: compute next k-bit combination in lexicographic order
         let c = self.current & (!self.current + 1); // rightmost set bit
@@ -1789,7 +1788,10 @@ mod tests {
 
     use super::*;
     use crate::{
-        schema::{BTreeTable, ColDef, Column, Index, IndexColumn, Schema, Table, Type},
+        schema::{
+            BTreeCharacteristics, BTreeTable, ColDef, Column, Index, IndexColumn, Schema, Table,
+            Type,
+        },
         stats::AnalyzeStats,
         translate::{
             optimizer::{
@@ -1801,7 +1803,6 @@ mod tests {
                 ColumnUsedMask, IterationDirection, JoinInfo, JoinType, Operation, TableReferences,
                 WhereTerm,
             },
-            planner::TableMask,
         },
         vdbe::builder::TableRefIdCounter,
         MAIN_DB_ID,
@@ -1818,12 +1819,12 @@ mod tests {
     #[test]
     fn test_generate_bitmasks() {
         let bitmasks = generate_join_bitmasks(4, 2).collect::<Vec<_>>();
-        assert!(bitmasks.contains(&TableMask(0b110))); // {0,1} -- first bit is always set to 0 so that a Mask with value 0 means "no tables are referenced".
-        assert!(bitmasks.contains(&TableMask(0b1010))); // {0,2}
-        assert!(bitmasks.contains(&TableMask(0b1100))); // {1,2}
-        assert!(bitmasks.contains(&TableMask(0b10010))); // {0,3}
-        assert!(bitmasks.contains(&TableMask(0b10100))); // {1,3}
-        assert!(bitmasks.contains(&TableMask(0b11000))); // {2,3}
+        assert!(bitmasks.contains(&0b0011.into())); // {0,1}
+        assert!(bitmasks.contains(&0b0101.into())); // {0,2}
+        assert!(bitmasks.contains(&0b0110.into())); // {1,2}
+        assert!(bitmasks.contains(&0b1001.into())); // {0,3}
+        assert!(bitmasks.contains(&0b1010.into())); // {1,3}
+        assert!(bitmasks.contains(&0b1100.into())); // {2,3}
     }
 
     #[test]
@@ -2382,7 +2383,7 @@ mod tests {
         assert!(constraint_refs.len() == 1);
         let constraint = &table_constraints[TABLE_NO_ORDERS].constraints
             [constraint_refs[0].eq.as_ref().unwrap().constraint_pos];
-        assert!(constraint.lhs_mask.contains_table(TABLE_NO_CUSTOMERS));
+        assert!(constraint.lhs_mask.get(TABLE_NO_CUSTOMERS));
 
         let access_method = &access_methods_arena[best_plan.data[2].1];
         let (iter_dir, index, constraint_refs) = _as_btree(access_method);
@@ -2391,7 +2392,7 @@ mod tests {
         assert!(constraint_refs.len() == 1);
         let constraint = &table_constraints[TABLE_NO_ORDER_ITEMS].constraints
             [constraint_refs[0].eq.as_ref().unwrap().constraint_pos];
-        assert!(constraint.lhs_mask.contains_table(TABLE_NO_ORDERS));
+        assert!(constraint.lhs_mask.get(TABLE_NO_ORDERS));
     }
 
     struct TestColumn {
@@ -2640,7 +2641,7 @@ mod tests {
             assert!(constraint_refs.len() == 1);
             let constraint = &table_constraints[*table_number].constraints
                 [constraint_refs[0].eq.as_ref().unwrap().constraint_pos];
-            assert!(constraint.lhs_mask.contains_table(FACT_TABLE_IDX));
+            assert!(constraint.lhs_mask.get(FACT_TABLE_IDX));
             assert!(constraint.operator.as_ast_operator() == Some(ast::Operator::Equals));
         }
     }
@@ -2751,7 +2752,7 @@ mod tests {
             assert!(constraint_refs.len() == 1);
             let constraint = &table_constraints.constraints
                 [constraint_refs[0].eq.as_ref().unwrap().constraint_pos];
-            assert!(constraint.lhs_mask.contains_table(i - 1));
+            assert!(constraint.lhs_mask.get(i - 1));
             assert!(constraint.operator.as_ast_operator() == Some(ast::Operator::Equals));
         }
     }
@@ -3205,22 +3206,17 @@ mod tests {
 
     /// Creates a BTreeTable with the given name and columns
     fn _create_btree_table(name: &str, columns: Vec<Column>) -> Arc<BTreeTable> {
-        let logical_to_physical_map = BTreeTable::build_logical_to_physical_map(&columns);
-        Arc::new(BTreeTable {
-            root_page: 1, // Page number doesn't matter for tests
-            name: name.to_string(),
-            has_autoincrement: false,
-            primary_key_columns: vec![],
+        Arc::new(BTreeTable::new(
+            1, // root_page, doesn't matter for tests
+            name.to_string(),
+            vec![],
             columns,
-            has_rowid: true,
-            is_strict: false,
-            unique_sets: vec![],
-            foreign_keys: vec![],
-            check_constraints: vec![],
-            rowid_alias_conflict_clause: None,
-            has_virtual_columns: false,
-            logical_to_physical_map,
-        })
+            BTreeCharacteristics::HAS_ROWID,
+            vec![],
+            vec![],
+            vec![],
+            None,
+        ))
     }
 
     /// Creates a TableReference for a BTreeTable

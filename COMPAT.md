@@ -101,7 +101,7 @@ ongoing work to pass the full SQLite TCL test suite.
 | CREATE VIRTUAL TABLE      | ✅ Yes     |                                                                                   |
 | DELETE                    | ✅ Yes     |                                                                                   |
 | DETACH DATABASE           | ✅ Yes     |                                                                                   |
-| DROP INDEX                | 🚧 Partial | Disabled by default.                                                              |
+| DROP INDEX                | ✅ Yes     |                                                                                   |
 | DROP TABLE                | ✅ Yes     |                                                                                   |
 | DROP TRIGGER              | ✅ Yes     |                                                                                   |
 | DROP VIEW                 | ✅ Yes     |                                                                                   |
@@ -307,7 +307,8 @@ Feature support of [sqlite expr syntax](https://www.sqlite.org/lang_expr.html).
 | unicode(X)                   | ✅ Yes     |                                                      |
 | unlikely(X)                  | ✅ Yes     |                                                      |
 | upper(X)                     | ✅ Yes     |                                                      |
-| unistr(X)                    | ❌ No      |                                                      |
+| unistr(X)                    | ✅ Yes     |                                                      |
+| unistr_quote(X)              | ✅ Yes     |                                                      |
 | zeroblob(N)                  | ✅ Yes     |                                                      |
 
 #### Mathematical functions

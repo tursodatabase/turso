@@ -1,0 +1,297 @@
+---
+title: CREATE DOMAIN
+description: Define a named constraint wrapper over a base type for use in STRICT tables
+sidebarTitle: CREATE DOMAIN
+---
+
+# CREATE DOMAIN
+
+<Info>
+**Turso Extension**: CREATE DOMAIN is a Turso-specific statement not available in standard SQLite. Domains require STRICT tables and the custom types experimental feature. This feature must be [enabled before use](/docs/sql-reference/experimental-features).
+</Info>
+
+The CREATE DOMAIN statement defines a named type alias with optional constraints. Unlike [CREATE TYPE](/docs/sql-reference/statements/create-type), a domain does not specify custom ENCODE/DECODE logic or OPERATORs. Instead, a domain adds NOT NULL and CHECK constraints on top of a base type, and values are stored using the base type's native storage format.
+
+## Syntax
+
+```sql
+CREATE DOMAIN [IF NOT EXISTS] domain-name AS base-type
+    [DEFAULT default-expr]
+    [NOT NULL]
+    [[CONSTRAINT constraint-name] CHECK (expr)]
+    ...;
+```
+
+## Description
+
+A domain wraps a base type with validation constraints. When a value is written to a column of a domain type, the CHECK constraints and NOT NULL restriction (if any) are verified. If validation passes, the value is stored using the base type's native format. When a value is read, it is returned unchanged.
+
+Domains are transparent to the query engine for operations like ORDER BY, indexing, arithmetic, and aggregation. A domain column behaves exactly like a column of its base type, with the addition of input validation.
+
+Domains work only with STRICT tables. Using a domain name in a non-STRICT table has no effect.
+
+## Clauses
+
+### IF NOT EXISTS
+
+Suppresses the error that would occur if a domain with the same name already exists. The existing domain is left unchanged.
+
+```sql
+CREATE DOMAIN IF NOT EXISTS positive_int AS integer CHECK (value > 0);
+```
+
+### AS base-type
+
+Specifies the underlying type. The base type can be a primitive type (`integer`, `real`, `text`, `blob`) or another domain, allowing domains to be layered.
+
+```sql
+CREATE DOMAIN percentage AS integer
+    CHECK (value >= 0)
+    CHECK (value <= 100);
+```
+
+### DEFAULT
+
+Sets a default value for columns of this domain type. A column-level DEFAULT overrides the domain-level DEFAULT.
+
+```sql
+CREATE DOMAIN status AS text DEFAULT 'active';
+
+CREATE TABLE accounts (
+    id INTEGER PRIMARY KEY,
+    state status
+) STRICT;
+
+INSERT INTO accounts(id) VALUES (1);
+SELECT state FROM accounts;
+-- active
+```
+
+### NOT NULL
+
+Adds a NOT NULL constraint to the domain. Any attempt to insert or update a NULL value into a column of this domain type will fail, even if the column definition does not specify NOT NULL.
+
+```sql
+CREATE DOMAIN required_text AS text NOT NULL;
+
+CREATE TABLE contacts (
+    id INTEGER PRIMARY KEY,
+    name required_text
+) STRICT;
+
+INSERT INTO contacts VALUES (1, 'Alice');
+-- OK
+
+INSERT INTO contacts VALUES (2, NULL);
+-- Error: domain required_text does not allow null values
+```
+
+A column-level NULL declaration does not override the domain's NOT NULL constraint.
+
+### CHECK
+
+Adds a validation constraint. The expression can reference `value` to refer to the input value being checked. Multiple CHECK constraints can be specified and all must pass.
+
+```sql
+CREATE DOMAIN positive_int AS integer CHECK (value > 0);
+
+CREATE TABLE measurements (
+    id INTEGER PRIMARY KEY,
+    reading positive_int
+) STRICT;
+
+INSERT INTO measurements VALUES (1, 42);
+-- OK
+
+INSERT INTO measurements VALUES (2, -5);
+-- Error: domain positive_int constraint violation
+```
+
+### CONSTRAINT name CHECK
+
+CHECK constraints can optionally be given a name for documentation purposes.
+
+```sql
+CREATE DOMAIN valid_score AS integer
+    CONSTRAINT non_negative CHECK (value >= 0)
+    CONSTRAINT max_hundred CHECK (value <= 100);
+```
+
+## Domain Chaining
+
+A domain can use another domain as its base type. When domains are chained, all constraints in the chain are enforced from child to ancestor.
+
+```sql
+CREATE DOMAIN base_amount AS integer CHECK (value > 0);
+CREATE DOMAIN small_amount AS base_amount CHECK (value < 1000);
+
+CREATE TABLE orders (
+    id INTEGER PRIMARY KEY,
+    quantity small_amount
+) STRICT;
+
+INSERT INTO orders VALUES (1, 50);
+-- OK: passes both value > 0 and value < 1000
+
+INSERT INTO orders VALUES (2, -1);
+-- Error: fails base_amount's CHECK (value > 0)
+
+INSERT INTO orders VALUES (3, 5000);
+-- Error: fails small_amount's CHECK (value < 1000)
+```
+
+Three or more levels of chaining are supported:
+
+```sql
+CREATE DOMAIN text_val AS text;
+CREATE DOMAIN nonempty AS text_val CHECK (length(value) > 0);
+CREATE DOMAIN short_text AS nonempty CHECK (length(value) < 50);
+
+CREATE TABLE labels (
+    id INTEGER PRIMARY KEY,
+    name short_text
+) STRICT;
+
+INSERT INTO labels VALUES (1, 'OK');
+-- OK
+
+INSERT INTO labels VALUES (2, '');
+-- Error: fails nonempty's CHECK (length(value) > 0)
+```
+
+## UPDATE Enforcement
+
+Domain constraints are enforced on UPDATE as well as INSERT.
+
+```sql
+CREATE DOMAIN positive_int AS integer CHECK (value > 0);
+
+CREATE TABLE items (
+    id INTEGER PRIMARY KEY,
+    stock positive_int
+) STRICT;
+
+INSERT INTO items VALUES (1, 10);
+UPDATE items SET stock = 20 WHERE id = 1;
+SELECT stock FROM items;
+-- 20
+
+UPDATE items SET stock = -1 WHERE id = 1;
+-- Error: domain positive_int constraint violation
+```
+
+## CAST Support
+
+CAST applies the domain's validation constraints:
+
+```sql
+CREATE DOMAIN positive_int AS integer CHECK (value > 0);
+
+SELECT CAST(42 AS positive_int);
+-- 42
+
+SELECT CAST(-1 AS positive_int);
+-- Error: domain positive_int constraint violation
+```
+
+Casting NULL to a NOT NULL domain is rejected:
+
+```sql
+CREATE DOMAIN notnull_int AS integer NOT NULL;
+
+SELECT CAST(NULL AS notnull_int);
+-- Error: domain notnull_int does not allow null values
+```
+
+## CHECK Constraints with Table-Level Checks
+
+Domain CHECK constraints and table-level CHECK constraints both apply. The domain constraint is checked during encoding and the table CHECK is checked separately.
+
+```sql
+CREATE DOMAIN positive_int AS integer CHECK (value > 0);
+
+CREATE TABLE bounded (
+    id INTEGER PRIMARY KEY,
+    val positive_int CHECK (val < 100)
+) STRICT;
+
+INSERT INTO bounded VALUES (1, 50);
+-- OK: passes domain CHECK (> 0) and table CHECK (< 100)
+
+INSERT INTO bounded VALUES (2, -1);
+-- Error: fails domain CHECK
+
+INSERT INTO bounded VALUES (3, 200);
+-- Error: fails table CHECK
+```
+
+## Operations on Domain Columns
+
+Domain columns support the same operations as their base type: arithmetic, comparisons, ordering, and aggregation.
+
+```sql
+CREATE DOMAIN myint AS integer;
+
+CREATE TABLE data (
+    id INTEGER PRIMARY KEY,
+    a myint,
+    b myint
+) STRICT;
+
+INSERT INTO data VALUES (1, 10, 3);
+SELECT a + b, a - b, a * b FROM data;
+-- 13|7|30
+```
+
+```sql
+CREATE DOMAIN myint AS integer;
+
+CREATE TABLE scores (
+    id INTEGER PRIMARY KEY,
+    val myint
+) STRICT;
+
+INSERT INTO scores VALUES (1, 30);
+INSERT INTO scores VALUES (2, 10);
+INSERT INTO scores VALUES (3, 20);
+SELECT val FROM scores ORDER BY val;
+-- 10
+-- 20
+-- 30
+```
+
+## Dropping Domains
+
+Domains are dropped with [DROP DOMAIN](/docs/sql-reference/statements/drop-domain), not DROP TYPE. Attempting to use DROP TYPE on a domain (or DROP DOMAIN on a type) results in an error.
+
+A domain cannot be dropped while any table column or another domain references it.
+
+```sql
+CREATE DOMAIN my_domain AS integer;
+CREATE TABLE t(x my_domain) STRICT;
+
+DROP DOMAIN my_domain;
+-- Error: type 'my_domain' is in use
+
+DROP TABLE t;
+DROP DOMAIN my_domain;
+-- OK
+```
+
+## Restrictions
+
+- **STRICT tables only**: Using a domain type on a non-STRICT table is rejected at CREATE TABLE and ALTER TABLE ADD COLUMN time. Non-STRICT tables allow arbitrary type names as affinity hints, but domain constraints (CHECK, NOT NULL, DEFAULT) are only enforced on STRICT tables, so permitting them would be misleading.
+- **Cannot drop while in use**: A domain cannot be dropped while any table column or another domain references it.
+
+<Note>
+If a non-STRICT table was created with a type name that did not exist at the time (e.g., `CREATE TABLE t(x mydom)`), and a domain with that name is created afterwards (`CREATE DOMAIN mydom AS ...`), the domain constraints will **not** be retroactively enforced on the existing table. This is not a bug: non-STRICT tables treat all type names as plain affinity hints regardless of whether a matching domain exists. STRICT tables prevent this scenario because they reject unknown type names at CREATE TABLE time.
+</Note>
+- **No UNIQUE, PRIMARY KEY, or REFERENCES**: These constraints are not supported in domain definitions. Use table-level constraints instead.
+- **No duplicate clauses**: Multiple DEFAULT or NOT NULL clauses in the same definition are rejected. Conflicting NULL and NOT NULL clauses are also rejected.
+
+## See Also
+
+- [DROP DOMAIN](/docs/sql-reference/statements/drop-domain) for removing domains
+- [CREATE TYPE](/docs/sql-reference/statements/create-type) for defining custom types with ENCODE/DECODE logic
+- [Data Types](/docs/sql-reference/data-types) for an overview of the type system
+- [CREATE TABLE](/docs/sql-reference/statements/create-table) for STRICT table definitions

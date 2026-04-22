@@ -1942,3 +1942,11 @@ test glob-is-not-null-precedence {
 expect {
     1
 }
+
+test where-variable-predicate {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, name TEXT);
+    INSERT INTO t VALUES (1, 'Alice'), (2, 'Bob');
+    SELECT id, name FROM t WHERE ?1;
+}
+expect {
+}

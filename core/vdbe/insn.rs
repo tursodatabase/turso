@@ -740,6 +740,11 @@ pub enum Insn {
         ignore_jump_target: BranchOffset,
     },
 
+    /// Copy the current VM change counter to the connection-level counters, then reset it.
+    /// SQLite emits this between trigger-body DML statements so `changes()` and
+    /// `total_changes()` observe the just-completed statement without leaking into the next one.
+    ResetCount,
+
     /// Write an integer value into a register.
     Integer {
         value: i64,
@@ -1786,6 +1791,7 @@ impl InsnVariants {
             InsnVariants::Return => execute::op_return,
             InsnVariants::Integer => execute::op_integer,
             InsnVariants::Program => execute::op_program,
+            InsnVariants::ResetCount => execute::op_reset_count,
             InsnVariants::Real => execute::op_real,
             InsnVariants::RealAffinity => execute::op_real_affinity,
             InsnVariants::String8 => execute::op_string8,
@@ -1915,12 +1921,12 @@ impl Insn {
     // SAFETY: If the enumeration specifies a primitive representation,
     // then the discriminant may be reliably accessed via unsafe pointer casting
     #[inline(always)]
-    fn discriminant(&self) -> u8 {
+    const fn discriminant(&self) -> u8 {
         unsafe { *(self as *const Self as *const u8) }
     }
 
     #[inline(always)]
-    pub fn to_function(&self) -> InsnFunction {
+    pub const fn to_function(&self) -> InsnFunction {
         // dont use this because its still using match
         // InsnVariants::from(self).to_function_fast()
         INSN_VTABLE[self.discriminant() as usize]

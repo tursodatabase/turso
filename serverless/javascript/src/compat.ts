@@ -104,11 +104,10 @@ export class LibsqlError extends Error {
 }
 
 /**
- * Interactive transaction interface (not implemented in serverless mode).
- * 
+ * Interactive transaction interface.
+ *
  * @remarks
- * Transactions are not supported in the serverless compatibility layer.
- * Calling transaction() will throw a LibsqlError.
+ * A transaction keeps a dedicated session open until commit/rollback/close.
  */
 export interface Transaction {
   execute(stmt: InStatement): Promise<ResultSet>;
@@ -141,6 +140,7 @@ export interface Client {
 
 class LibSQLClient implements Client {
   private session: Session;
+  private sessionConfig: SessionConfig;
   private execLock: AsyncLock = new AsyncLock();
   private _closed = false;
   private _defaultSafeIntegers = false;
@@ -153,6 +153,7 @@ class LibSQLClient implements Client {
       authToken: config.authToken || '',
       remoteEncryptionKey: config.remoteEncryptionKey
     };
+    this.sessionConfig = sessionConfig;
     this.session = new Session(sessionConfig);
   }
 
@@ -306,8 +307,122 @@ class LibSQLClient implements Client {
     return this.batch(stmts, "write");
   }
 
+  private modeToBeginSql(mode?: TransactionMode): string {
+    switch (mode) {
+      case "write":
+        return "BEGIN IMMEDIATE";
+      case "deferred":
+        return "BEGIN DEFERRED";
+      case "read":
+      default:
+        return "BEGIN";
+    }
+  }
+
   async transaction(mode?: TransactionMode): Promise<Transaction> {
-    throw new LibsqlError("Transactions not implemented", "NOT_IMPLEMENTED");
+    await this.execLock.acquire();
+
+    if (this._closed) {
+      this.execLock.release();
+      throw new LibsqlError("Client is closed", "CLIENT_CLOSED");
+    }
+
+    const txSession = new Session(this.sessionConfig);
+    let txClosed = false;
+    let cleanupStarted = false;
+
+    const ensureOpen = () => {
+      if (txClosed) {
+        throw new LibsqlError("Transaction is closed", "TRANSACTION_CLOSED");
+      }
+    };
+
+    const closeTx = async () => {
+      if (cleanupStarted) return;
+      cleanupStarted = true;
+      txClosed = true;
+      try {
+        await txSession.close();
+      } finally {
+        this.execLock.release();
+      }
+    };
+
+    const executeInTx = async (stmt: InStatement): Promise<ResultSet> => {
+      ensureOpen();
+      const normalized = this.normalizeStatement(stmt);
+      try {
+        const result = await txSession.execute(normalized.sql, normalized.args, this._defaultSafeIntegers);
+        return this.convertResult(result);
+      } catch (error: any) {
+        throw mapDatabaseError(error, "EXECUTE_ERROR");
+      }
+    };
+
+    try {
+      await txSession.sequence(this.modeToBeginSql(mode));
+    } catch (error: any) {
+      await closeTx();
+      throw mapDatabaseError(error, "BEGIN_ERROR");
+    }
+
+    return {
+      execute: async (stmtOrSql: InStatement | string, args?: InArgs): Promise<ResultSet> => {
+        if (typeof stmtOrSql === "string") {
+          const normalizedArgs = args ? (Array.isArray(args) ? args : Object.values(args)) : [];
+          return executeInTx({ sql: stmtOrSql, args: normalizedArgs });
+        }
+        return executeInTx(stmtOrSql);
+      },
+      batch: async (stmts: Array<InStatement>): Promise<Array<ResultSet>> => {
+        ensureOpen();
+        const results: Array<ResultSet> = [];
+        for (const stmt of stmts) {
+          results.push(await executeInTx(stmt));
+        }
+        return results;
+      },
+      executeMultiple: async (sql: string): Promise<void> => {
+        ensureOpen();
+        try {
+          await txSession.sequence(sql);
+        } catch (error: any) {
+          throw mapDatabaseError(error, "EXECUTE_MULTIPLE_ERROR");
+        }
+      },
+      commit: async (): Promise<void> => {
+        ensureOpen();
+        try {
+          await txSession.sequence("COMMIT");
+        } catch (error: any) {
+          throw mapDatabaseError(error, "COMMIT_ERROR");
+        } finally {
+          await closeTx();
+        }
+      },
+      rollback: async (): Promise<void> => {
+        ensureOpen();
+        try {
+          await txSession.sequence("ROLLBACK");
+        } catch (error: any) {
+          throw mapDatabaseError(error, "ROLLBACK_ERROR");
+        } finally {
+          await closeTx();
+        }
+      },
+      close: (): void => {
+        if (txClosed) return;
+        txClosed = true;
+        void txSession.sequence("ROLLBACK")
+          .catch(() => undefined)
+          .finally(() => {
+            void closeTx();
+          });
+      },
+      get closed(): boolean {
+        return txClosed;
+      },
+    };
   }
 
   async executeMultiple(sql: string): Promise<void> {

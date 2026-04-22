@@ -77,32 +77,54 @@ info:
   database: ':memory:'
 ---
 QUERY PLAN
-|--CORRELATED SCALAR SUBQUERY 1
+|--SCALAR SUBQUERY 1
 |  |--SCALAR SUBQUERY 2
-|  |  |--SCAN (subquery-0)
-|  |  |  `--COMPOUND QUERY
-|  |  |     |--LEFT-MOST SUBQUERY
-|  |  |     |  `--SCAN user_messages
-|  |  |     |--UNION ALL
-|  |  |     |  `--SCAN session_starts
-|  |  |     |--UNION ALL
-|  |  |     |  `--SCAN observed_items
-|  |  |     |--UNION ALL
-|  |  |     |  `--SCAN observed_items
-|  |  |     |--UNION ALL
-|  |  |     |  `--SCAN observed_items
-|  |  |     `--UNION ALL
-|  |  |        `--SCAN journal_entries
-|  |  |--USE HASH TABLE FOR DISTINCT
-|  |  |--USE SORTER FOR ORDER BY
 |  |  `--SCAN signal_days
-|  |--SCAN signal_days AS d1
-|  |--CORRELATED SCALAR SUBQUERY 3
-|  |  `--SCAN signal_days AS d2
-|  |--SCAN prior_days
-|  |--SCAN window_subquery_0
-|  |  `--SCAN run_boundaries
-|  `--SEARCH run_ids USING INDEX ephemeral_subquery_t111 (signal_day=?)
+|  |     |--SCAN (subquery-0)
+|  |     |  `--COMPOUND QUERY
+|  |     |     |--LEFT-MOST SUBQUERY
+|  |     |     |  `--SCAN user_messages
+|  |     |     |--UNION ALL
+|  |     |     |  `--SCAN session_starts
+|  |     |     |--UNION ALL
+|  |     |     |  `--SCAN observed_items
+|  |     |     |--UNION ALL
+|  |     |     |  `--SCAN observed_items
+|  |     |     |--UNION ALL
+|  |     |     |  `--SCAN observed_items
+|  |     |     `--UNION ALL
+|  |     |        `--SCAN journal_entries
+|  |     |--USE HASH TABLE FOR DISTINCT
+|  |     `--USE SORTER FOR ORDER BY
+|  |--SCAN (subquery-0)
+|  |  `--COMPOUND QUERY
+|  |     |--LEFT-MOST SUBQUERY
+|  |     |  `--SCAN user_messages
+|  |     |--UNION ALL
+|  |     |  `--SCAN session_starts
+|  |     |--UNION ALL
+|  |     |  `--SCAN observed_items
+|  |     |--UNION ALL
+|  |     |  `--SCAN observed_items
+|  |     |--UNION ALL
+|  |     |  `--SCAN observed_items
+|  |     `--UNION ALL
+|  |        `--SCAN journal_entries
+|  |--USE HASH TABLE FOR DISTINCT
+|  |--USE SORTER FOR ORDER BY
+|  `--SCAN run_ids
+|     `--SCAN window_subquery_0
+|        `--SCAN run_boundaries
+|           `--SCAN prior_days
+|              |--SCAN signal_days AS d1
+|              `--CORRELATED SCALAR SUBQUERY 3
+|                 `--SEARCH d2 USING INDEX ephemeral_subquery_t107 (signal_day<?)
 `--SCAN run_lengths
    |--SCAN run_ids
+   |  `--SCAN window_subquery_0
+   |     `--SCAN run_boundaries
+   |        `--SCAN prior_days
+   |           |--SCAN signal_days AS d1
+   |           `--CORRELATED SCALAR SUBQUERY 4
+   |              `--SEARCH d2 USING INDEX ephemeral_subquery_t81 (signal_day<?)
    `--USE SORTER FOR GROUP BY

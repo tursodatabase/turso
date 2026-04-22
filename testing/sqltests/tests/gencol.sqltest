@@ -1246,6 +1246,15 @@ expect {
     1|9|90
 }
 
+test gencol_insert_or_replace_not_null_no_default {
+    CREATE TABLE t(a, b AS (a) NOT NULL);
+    INSERT INTO t VALUES (1);
+    UPDATE OR REPLACE t SET a = null;
+}
+expect error {
+    NOT NULL constraint failed: t.b
+}
+
 test gencol_insert_or_ignore {
     CREATE TABLE t1(a INTEGER PRIMARY KEY, b INTEGER, c AS (b + 100));
     INSERT INTO t1(a, b) VALUES(1, 5);
@@ -4208,4 +4217,336 @@ test fk-child-references-parent-virtual-col-using-rowid-missing {
     INSERT INTO child VALUES(1, 99);
 }
 expect error {
+}
+@cross-check-integrity
+test delete_with_unique_gencol {
+    create table t(a, b as (a + 1) unique);
+    delete from t;
+}
+expect {
+}
+
+# DELETE with transitive virtual column dependency (c depends on b which depends on a)
+@cross-check-integrity
+test delete-transitive-virtual-dep {
+    CREATE TABLE t(a INTEGER, b AS (a * 2) VIRTUAL, c AS (b + 1) VIRTUAL);
+    CREATE UNIQUE INDEX idx_c ON t(c);
+    INSERT INTO t(a) VALUES(10);
+    DELETE FROM t WHERE a = 10;
+    SELECT count(*) FROM t;
+}
+expect {
+    0
+}
+
+# FK CASCADE through transitive virtual columns
+@cross-check-integrity
+test fk-transitive-virtual-cascade {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE p(a INTEGER, b AS (a * 2) VIRTUAL, c AS (b + 10) VIRTUAL);
+    CREATE UNIQUE INDEX idx_p_c ON p(c);
+    CREATE TABLE child(x INTEGER REFERENCES p(c) ON DELETE CASCADE);
+    INSERT INTO p(a) VALUES(5);
+    INSERT INTO child(x) VALUES(20);
+    DELETE FROM p WHERE a = 5;
+    SELECT count(*) FROM child;
+}
+expect {
+    0
+}
+
+test update-virtual-not-null {
+    CREATE TABLE t(a, b AS (a) NOT NULL);
+    INSERT INTO t VALUES (1);
+    UPDATE t SET a = null;
+}
+expect error {
+    NOT NULL constraint failed: t.b
+}
+
+test update-virtual-not-null-transitive {
+    CREATE TABLE t(a, b AS (a), c as (b) NOT NULL);
+    INSERT INTO t VALUES (1);
+    UPDATE t SET a = null;
+}
+expect error {
+    NOT NULL constraint failed: t.c
+}
+
+# Deferred NOT NULL: BEFORE UPDATE trigger fires before the NOT NULL check on
+# a virtual column, so RAISE(IGNORE) silently skips the update and the row is
+# left intact. If the NOT NULL check ran first, this would error out with
+# "NOT NULL constraint failed: t.b".
+@requires trigger "needs triggers"
+test update-virtual-not-null-deferred-trigger-ignore {
+    CREATE TABLE t(a, b AS (a) NOT NULL);
+    INSERT INTO t VALUES (1);
+    CREATE TRIGGER trg BEFORE UPDATE ON t WHEN NEW.a IS NULL BEGIN
+        SELECT RAISE(IGNORE);
+    END;
+    UPDATE t SET a = null;
+    SELECT a, b FROM t;
+}
+expect {
+    1|1
+}
+
+# Same deferred-ordering check for a transitively-computed virtual column.
+@requires trigger "needs triggers"
+test update-virtual-not-null-transitive-deferred-trigger-ignore {
+    CREATE TABLE t(a, b AS (a), c AS (b) NOT NULL);
+    INSERT INTO t VALUES (1);
+    CREATE TRIGGER trg BEFORE UPDATE ON t WHEN NEW.a IS NULL BEGIN
+        SELECT RAISE(IGNORE);
+    END;
+    UPDATE t SET a = null;
+    SELECT a, b, c FROM t;
+}
+expect {
+    1|1|1
+}
+
+# Deferred NOT NULL: BEFORE UPDATE trigger raises a custom abort error, which
+# must surface instead of the NOT NULL constraint error — proving the trigger
+# ran before the deferred check.
+@requires trigger "needs triggers"
+test update-virtual-not-null-deferred-trigger-abort {
+    CREATE TABLE t(a, b AS (a) NOT NULL);
+    INSERT INTO t VALUES (1);
+    CREATE TRIGGER trg BEFORE UPDATE ON t WHEN NEW.a IS NULL BEGIN
+        SELECT RAISE(ABORT, 'trigger rejects null');
+    END;
+    UPDATE t SET a = null;
+}
+expect error {
+    trigger rejects null
+}
+
+# Same deferred-ordering check for a transitively-computed virtual column.
+@requires trigger "needs triggers"
+test update-virtual-not-null-transitive-deferred-trigger-abort {
+    CREATE TABLE t(a, b AS (a), c AS (b) NOT NULL);
+    INSERT INTO t VALUES (1);
+    CREATE TRIGGER trg BEFORE UPDATE ON t WHEN NEW.a IS NULL BEGIN
+        SELECT RAISE(ABORT, 'trigger rejects null');
+    END;
+    UPDATE t SET a = null;
+}
+expect error {
+    trigger rejects null
+}
+
+test gencol-virtual-join-inner-inner {
+    CREATE TABLE t1(a, b AS (a*2));
+    CREATE TABLE t2(x);
+    CREATE TABLE t3(y);
+    INSERT INTO t1(a) VALUES(1),(2),(3);
+    INSERT INTO t2 VALUES(1),(2),(3);
+    INSERT INTO t3 VALUES(1),(2),(3);
+    SELECT t1.a FROM t1 JOIN t2 ON t1.a = t2.x JOIN t3 ON t1.a = t3.y;
+}
+expect {
+    1
+    2
+    3
+}
+
+test gencol-virtual-join-left-inner {
+    CREATE TABLE t1(a, b AS (a*2));
+    CREATE TABLE t2(x);
+    CREATE TABLE t3(y);
+    INSERT INTO t1(a) VALUES(1),(2),(3);
+    INSERT INTO t2 VALUES(1),(2),(3);
+    INSERT INTO t3 VALUES(1),(2),(3);
+    SELECT t1.a FROM t1 LEFT JOIN t2 ON t1.a = t2.x JOIN t3 ON t1.a = t3.y;
+}
+expect {
+    1
+    2
+    3
+}
+
+test gencol-virtual-join-t1-second {
+    CREATE TABLE t1(a, b AS (a*2));
+    CREATE TABLE t2(x);
+    CREATE TABLE t3(y);
+    INSERT INTO t1(a) VALUES(1),(2),(3);
+    INSERT INTO t2 VALUES(1),(2),(3);
+    INSERT INTO t3 VALUES(1),(2),(3);
+    SELECT t1.a FROM t2 JOIN t1 ON t2.x = t1.a JOIN t3 ON t1.a = t3.y;
+}
+expect {
+    1
+    2
+    3
+}
+
+test gencol-virtual-join-two-table {
+    CREATE TABLE t1(a, b AS (a*2));
+    CREATE TABLE t2(x);
+    INSERT INTO t1(a) VALUES(1),(2),(3);
+    INSERT INTO t2 VALUES(1),(2),(3);
+    SELECT t1.a FROM t1 JOIN t2 ON t1.a = t2.x;
+}
+expect {
+    1
+    2
+    3
+}
+
+test gencol-virtual-join-cross {
+    CREATE TABLE t1(a, b AS (a*2));
+    CREATE TABLE t2(x);
+    CREATE TABLE t3(y);
+    INSERT INTO t1(a) VALUES(1),(2),(3);
+    INSERT INTO t2 VALUES(1),(2),(3);
+    INSERT INTO t3 VALUES(1),(2),(3);
+    SELECT t1.a FROM t1 CROSS JOIN t2 CROSS JOIN t3 WHERE t1.a = t2.x AND t2.x = t3.y;
+}
+expect {
+    1
+    2
+    3
+}
+
+test gencol-virtual-join-comma {
+    CREATE TABLE t1(a, b AS (a*2));
+    CREATE TABLE t2(x);
+    CREATE TABLE t3(y);
+    INSERT INTO t1(a) VALUES(1),(2),(3);
+    INSERT INTO t2 VALUES(1),(2),(3);
+    INSERT INTO t3 VALUES(1),(2),(3);
+    SELECT t1.a FROM t1, t2, t3 WHERE t1.a = t2.x AND t2.x = t3.y;
+}
+expect {
+    1
+    2
+    3
+}
+
+test gencol-virtual-join-all-left {
+    CREATE TABLE t1(a, b AS (a*2));
+    CREATE TABLE t2(x);
+    CREATE TABLE t3(y);
+    INSERT INTO t1(a) VALUES(1),(2),(3);
+    INSERT INTO t2 VALUES(1),(2),(3);
+    INSERT INTO t3 VALUES(1),(2),(3);
+    SELECT t1.a FROM t1 LEFT JOIN t2 ON t1.a = t2.x LEFT JOIN t3 ON t1.a = t3.y;
+}
+expect {
+    1
+    2
+    3
+}
+
+test gencol-notnull-autogenerated-rowid-alias {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, a, b AS (id) CHECK(b IS NOT NULL));
+    INSERT INTO t(a) VALUES('a');
+    SELECT * FROM t;
+} expect {
+    1|a|1
+}
+
+test gencol-notnull-autogenerated-rowid-alias-default-values {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, a, b AS (id) CHECK(b IS NOT NULL));
+    INSERT INTO t DEFAULT VALUES;
+    SELECT * FROM t;
+} expect {
+    1||1
+}
+
+test replace-conflict-on-virtual-column {
+    CREATE TABLE t(a INTEGER, b AS (a*2) UNIQUE);
+    INSERT INTO t(a) VALUES(1),(2),(3);
+    INSERT OR REPLACE INTO t(a) VALUES(2);
+    SELECT * FROM t ORDER BY a;
+} expect {
+    1|2
+    2|4
+    3|6
+}
+
+test delete-using-indexed-virtual-column {
+    CREATE TABLE t(a, b AS (a * 2));
+    CREATE INDEX idx ON t(b);
+    INSERT INTO t VALUES (1);
+    DELETE FROM t WHERE b = 2;
+} expect {
+}
+
+test update-with-virtual-column-before-pk {
+    PRAGMA foreign_keys = ON;
+    CREATE TABLE t(a AS (1), b, c, PRIMARY KEY (b));
+    INSERT INTO t(b, c) VALUES (2, 3);
+    UPDATE t SET c = 99;
+    SELECT * FROM t;
+} expect {
+    1|2|99
+}
+
+test update-ipk-with-indexed-virtual-col {
+    CREATE TABLE t(a INTEGER PRIMARY KEY, b, c AS (b * 2));
+    CREATE INDEX idx ON t(c);
+    INSERT INTO t(a, b) VALUES (1, 5);
+    UPDATE t SET a = 100 WHERE a = 1;
+} expect {
+}
+
+test upsert-unique-virtual-column {
+    create table t(a unique, b, c as (b) unique);
+    insert into t values (1, 1), (2, 2);
+    insert into t values (1, 2) on conflict(a) do update set b = excluded.b;
+} expect error {
+    UNIQUE constraint failed: t.c
+}
+
+test upsert-unique-virtual-column-ipk-autoindex {
+    create table t(a integer primary key, b, c as (b) unique);
+    insert into t values (1, 1), (2, 2);
+    insert into t values (1, 2) on conflict(a) do update set b = excluded.b;
+} expect error {
+    UNIQUE constraint failed: t.c
+}
+
+test upsert-unique-virtual-column-ipk {
+    create table t(a integer primary key, b, c as (b));
+    create unique index idx on t(c);
+    insert into t values (1, 1), (2, 2);
+    insert into t values (1, 2) on conflict(a) do update set b = excluded.b;
+} expect error {
+    UNIQUE constraint failed: t.c
+}
+
+test update-deferred-fk-on-child-virtual-column {
+  PRAGMA foreign_keys=on;
+  CREATE TABLE p(x PRIMARY KEY);
+  CREATE TABLE c(a, b AS (a), FOREIGN KEY(b) REFERENCES p DEFERRABLE INITIALLY DEFERRED);
+  INSERT INTO p VALUES (1);
+  INSERT INTO c VALUES (1);
+  UPDATE c SET a=2;
+} expect error {
+    (FOREIGN KEY|deferred foreign key) constraint failed
+}
+
+test integrity-check-unique-virtual-column {
+    CREATE TABLE t (x INTEGER, a BLOB UNIQUE AS (X'aa'));
+    PRAGMA integrity_check;
+} expect {
+    ok
+}
+
+@cross-check-integrity
+test insert-transitive-unique-index {
+    CREATE TABLE t (a UNIQUE AS (b), b AS ('x'), c);
+    INSERT INTO t(c) VALUES (1);
+    INSERT INTO t(c) VALUES (2);
+} expect error {
+    UNIQUE constraint failed: t.a
+}
+
+@cross-check-integrity
+test update-virtual-column-index-via-single-column-unique-index-scan {
+    CREATE TABLE t (a, b, c UNIQUE, f UNIQUE AS (b));
+    UPDATE t SET b = 42 WHERE c = 'x';
+} expect {
 }

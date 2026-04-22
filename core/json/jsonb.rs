@@ -2964,7 +2964,8 @@ impl Jsonb {
                 }
             }
             _ => {
-                unreachable!()
+                // BracketQuotedKey: SQLite compat — never matches,
+                // falls through to "Not found" → NULL
             }
         };
 

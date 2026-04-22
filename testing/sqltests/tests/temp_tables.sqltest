@@ -1,0 +1,335 @@
+@database :memory:
+
+test create-temp-table-behaves-like-temp-schema {
+    CREATE TEMP TABLE t(x INTEGER);
+    INSERT INTO t VALUES (7);
+    SELECT x FROM temp.t;
+    SELECT name FROM temp.sqlite_schema WHERE type = 'table' AND name = 't';
+}
+expect {
+    7
+    t
+}
+
+test create-temp-table-if-not-exists {
+    CREATE TEMP TABLE IF NOT EXISTS t_ifne(x INTEGER);
+    CREATE TEMP TABLE IF NOT EXISTS t_ifne(x INTEGER);
+    INSERT INTO t_ifne VALUES (1);
+    SELECT x FROM temp.t_ifne;
+}
+expect {
+    1
+}
+
+test create-temp-table-qualified-main-is-rejected {
+    CREATE TEMP TABLE main.bad(x INTEGER);
+}
+expect error {
+}
+
+test create-table-explicit-temp-schema {
+    CREATE TABLE temp.u(y INTEGER);
+    INSERT INTO u VALUES (9);
+    SELECT y FROM u;
+    SELECT y FROM temp.u;
+}
+expect {
+    9
+    9
+}
+
+test temp-and-main-can-share-table-name-both-directions {
+    CREATE TEMP TABLE same_name(x INTEGER);
+    INSERT INTO temp.same_name VALUES (5);
+    CREATE TABLE same_name(x INTEGER);
+    INSERT INTO main.same_name VALUES (6);
+    SELECT x FROM same_name;
+    SELECT x FROM main.same_name;
+    SELECT x FROM temp.same_name;
+}
+expect {
+    5
+    6
+    5
+}
+
+test temp-table-shadows-main-for-unqualified-lookups {
+    CREATE TABLE t(x INTEGER);
+    INSERT INTO main.t VALUES (1);
+    CREATE TEMP TABLE t(x INTEGER);
+    INSERT INTO temp.t VALUES (2);
+    SELECT x FROM t;
+    SELECT x FROM main.t;
+    SELECT x FROM temp.t;
+}
+expect {
+    2
+    1
+    2
+}
+
+test temp-table-shadowing-applies-to-update-and-delete {
+    CREATE TABLE t_shadow(x INTEGER);
+    INSERT INTO main.t_shadow VALUES (1), (2);
+    CREATE TEMP TABLE t_shadow(x INTEGER);
+    INSERT INTO temp.t_shadow VALUES (10), (20);
+    UPDATE t_shadow SET x = x + 1;
+    DELETE FROM t_shadow WHERE x = 11;
+    SELECT x FROM temp.t_shadow ORDER BY x;
+    SELECT x FROM main.t_shadow ORDER BY x;
+}
+expect {
+    21
+    1
+    2
+}
+
+test insert-into-temp-select-from-temp-self {
+    CREATE TEMP TABLE self_copy(x INTEGER);
+    INSERT INTO self_copy VALUES (1);
+    INSERT INTO self_copy SELECT x + 1 FROM self_copy;
+    SELECT x FROM self_copy ORDER BY x;
+}
+expect {
+    1
+    2
+}
+
+test create-temp-table-as-select {
+    CREATE TABLE src(x INTEGER);
+    INSERT INTO src VALUES (3), (4);
+    CREATE TEMP TABLE t_as AS SELECT x * 2 AS y FROM src ORDER BY x;
+    SELECT * FROM t_as;
+}
+expect {
+    6
+    8
+}
+
+test temp-schema-visible-only-via-temp-sqlite-schema {
+    CREATE TABLE schema_split(x INTEGER);
+    CREATE TEMP TABLE schema_split(x INTEGER);
+    SELECT count(*) FROM sqlite_schema WHERE type = 'table' AND name = 'schema_split';
+    SELECT count(*) FROM temp.sqlite_schema WHERE type = 'table' AND name = 'schema_split';
+}
+expect {
+    1
+    1
+}
+
+test sqlite-temp-schema-aliases-are-supported {
+    CREATE TEMP TABLE t_alias(x INTEGER);
+    SELECT name FROM sqlite_temp_master WHERE type = 'table' AND name = 't_alias';
+    SELECT name FROM sqlite_temp_schema WHERE type = 'table' AND name = 't_alias';
+}
+expect {
+    t_alias
+    t_alias
+}
+
+test sqlite-master-remains-main-schema-with-temp-present {
+    CREATE TABLE main_only(x INTEGER);
+    CREATE TEMP TABLE temp_only(x INTEGER);
+    SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = 'main_only';
+    SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = 'temp_only';
+    SELECT count(*) FROM temp.sqlite_master WHERE type = 'table' AND name = 'temp_only';
+}
+expect {
+    1
+    0
+    1
+}
+
+test create-index-on-temp-table-uses-temp-schema {
+    CREATE TEMP TABLE idx_t(x INTEGER, y INTEGER);
+    CREATE INDEX idx_temp_only ON idx_t(x);
+    INSERT INTO idx_t VALUES (1, 11), (2, 22);
+    SELECT name, type, tbl_name FROM temp.sqlite_schema WHERE name = 'idx_temp_only';
+    SELECT x FROM idx_t WHERE x = 2;
+}
+expect {
+    idx_temp_only|index|idx_t
+    2
+}
+
+test temp-and-main-can-share-index-name {
+    CREATE TABLE main_t(x INTEGER);
+    CREATE INDEX dup_idx ON main_t(x);
+    CREATE TEMP TABLE temp_t(x INTEGER);
+    CREATE INDEX dup_idx ON temp_t(x);
+    SELECT count(*) FROM sqlite_schema WHERE type = 'index' AND name = 'dup_idx';
+    SELECT count(*) FROM temp.sqlite_schema WHERE type = 'index' AND name = 'dup_idx';
+}
+expect {
+    1
+    1
+}
+
+test drop-index-prefers-temp-schema {
+    CREATE TABLE main_t2(x INTEGER);
+    CREATE INDEX dup_idx2 ON main_t2(x);
+    CREATE TEMP TABLE temp_t2(x INTEGER);
+    CREATE INDEX dup_idx2 ON temp_t2(x);
+    DROP INDEX dup_idx2;
+    SELECT count(*) FROM sqlite_schema WHERE type = 'index' AND name = 'dup_idx2';
+    SELECT count(*) FROM temp.sqlite_schema WHERE type = 'index' AND name = 'dup_idx2';
+}
+expect {
+    1
+    0
+}
+
+test drop-table-prefers-temp-schema {
+    CREATE TABLE t(x INTEGER);
+    INSERT INTO main.t VALUES (3);
+    CREATE TEMP TABLE t(x INTEGER);
+    DROP TABLE t;
+    SELECT x FROM main.t;
+    SELECT name FROM temp.sqlite_schema WHERE type = 'table' AND name = 't';
+}
+expect {
+    3
+}
+
+test drop-table-explicit-temp-schema {
+    CREATE TEMP TABLE drop_me(x INTEGER);
+    DROP TABLE temp.drop_me;
+    SELECT count(*) FROM temp.sqlite_schema WHERE type = 'table' AND name = 'drop_me';
+}
+expect {
+    0
+}
+
+test alter-temp-table-add-column {
+    CREATE TEMP TABLE alter_me(a INTEGER);
+    ALTER TABLE alter_me ADD COLUMN b TEXT;
+    INSERT INTO alter_me(a, b) VALUES (1, 'x');
+    SELECT EXISTS(SELECT 1 FROM temp.sqlite_schema WHERE type = 'table' AND name = 'alter_me');
+    SELECT a, b FROM alter_me;
+}
+expect {
+	1
+    1|x
+}
+
+test temp-table-join-can-distinguish-main-and-temp {
+    CREATE TABLE join_t(x INTEGER);
+    INSERT INTO main.join_t VALUES (1);
+    CREATE TEMP TABLE join_t(x INTEGER);
+    INSERT INTO temp.join_t VALUES (2);
+    SELECT m.x, t.x FROM main.join_t AS m, temp.join_t AS t;
+}
+expect {
+    1|2
+}
+
+test temp-store-memory-still-supports-temp-tables {
+    PRAGMA temp_store = MEMORY;
+    CREATE TEMP TABLE mem_only(v INTEGER);
+    INSERT INTO mem_only VALUES (11);
+    SELECT v FROM mem_only;
+}
+expect {
+    11
+}
+
+test temp-store-file-still-supports-temp-tables {
+    PRAGMA temp_store = FILE;
+    CREATE TEMP TABLE file_backed(v INTEGER);
+    INSERT INTO file_backed VALUES (12);
+    SELECT v FROM file_backed;
+}
+expect {
+    12
+}
+
+test database-list-includes-temp-after-temp-init {
+    CREATE TEMP TABLE listed(v INTEGER);
+    PRAGMA database_list;
+}
+expect {
+    0|main|
+    1|temp|
+}
+
+test pragma-temp-wal-checkpoint-without-temp-db-matches-sqlite {
+    PRAGMA temp.wal_checkpoint;
+}
+expect {
+    0|-1|-1
+}
+
+@cross-check-integrity
+test temp-store-change-outside-transaction-resets-temp-schema {
+    CREATE TEMP TABLE reset_me(v INTEGER);
+    PRAGMA temp_store = MEMORY;
+    SELECT count(*) FROM temp.sqlite_schema WHERE type = 'table' AND name = 'reset_me';
+}
+expect {
+    0
+}
+
+test temp-store-change-survives-rollback-before-temp-db-exists {
+    BEGIN;
+    PRAGMA temp_store = MEMORY;
+    ROLLBACK;
+    PRAGMA temp_store;
+}
+expect {
+    2
+}
+
+test temp-store-change-inside-active-temp-transaction-errors {
+    BEGIN;
+    CREATE TEMP TABLE tx_temp(v INTEGER);
+    PRAGMA temp_store = FILE;
+}
+expect error {
+}
+
+# Regression: two CREATE TEMP TABLE inside the same explicit transaction used
+# to leave database_schemas[TEMP] frozen at the first DDL's schema_version
+# while temp_db.db.schema advanced, triggering a spurious SchemaUpdated ->
+# reprepare -> rollback_attached() loop that wiped the in-flight dirty pages.
+# Both tables must survive and both INSERTs must be visible on COMMIT.
+test multi-ddl-in-temp-transaction-preserves-data {
+    BEGIN;
+    CREATE TEMP TABLE multi_ddl_t(x INTEGER);
+    CREATE TEMP TABLE multi_ddl_u(y INTEGER);
+    INSERT INTO multi_ddl_t VALUES (1);
+    INSERT INTO multi_ddl_u VALUES (2);
+    SELECT x FROM multi_ddl_t;
+    SELECT y FROM multi_ddl_u;
+    COMMIT;
+    SELECT x FROM multi_ddl_t;
+    SELECT y FROM multi_ddl_u;
+}
+expect {
+    1
+    2
+    1
+    2
+}
+
+# regression: full-txn ROLLBACK must restore the in-memory TEMP
+# schema from a committed snapshot. Previously the main pager's rollback()
+# only reinstated `connection.schema` (main) from the shared Database;
+# temp had no snapshot anywhere, so the in-memory temp schema kept DDL
+# that the disk-level rollback had undone. The sentinel created before
+# BEGIN must survive; the table created inside the rolled-back txn must
+# be gone.
+test full-txn-rollback-restores-temp-schema {
+    CREATE TEMP TABLE ft_sentinel(x INTEGER);
+    INSERT INTO temp.ft_sentinel VALUES(99);
+    BEGIN;
+    CREATE TEMP TABLE ft_rolled_back(y INTEGER);
+    INSERT INTO ft_rolled_back VALUES(1);
+    ROLLBACK;
+    SELECT name FROM temp.sqlite_schema
+        WHERE type='table' AND name LIKE 'ft_%' ORDER BY name;
+    SELECT x FROM temp.ft_sentinel;
+}
+expect {
+    ft_sentinel
+    99
+}

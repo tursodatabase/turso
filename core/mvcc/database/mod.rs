@@ -383,6 +383,8 @@ enum SavepointKind {
 pub struct Savepoint {
     kind: SavepointKind,
     deferred_fk_violations: isize,
+    header: DatabaseHeader,
+    header_dirty: bool,
     /// Versions CREATED during this savepoint (insert operations).
     /// On rollback: these versions are removed from their chains.
     created_table_versions: Vec<(RowID, u64)>,
@@ -398,18 +400,30 @@ pub struct Savepoint {
 
 impl Savepoint {
     /// Creates an internal statement savepoint used for per-statement rollback.
-    fn statement() -> Self {
-        Self::default()
+    fn statement(header: DatabaseHeader, header_dirty: bool) -> Self {
+        Self {
+            header,
+            header_dirty,
+            ..Default::default()
+        }
     }
 
     /// Creates a user-visible named savepoint snapshot.
-    fn named(name: String, starts_transaction: bool, deferred_fk_violations: isize) -> Self {
+    fn named(
+        name: String,
+        starts_transaction: bool,
+        deferred_fk_violations: isize,
+        header: DatabaseHeader,
+        header_dirty: bool,
+    ) -> Self {
         Self {
             kind: SavepointKind::Named {
                 name,
                 starts_transaction,
             },
             deferred_fk_violations,
+            header,
+            header_dirty,
             ..Default::default()
         }
     }
@@ -512,7 +526,11 @@ impl Transaction {
     fn begin_savepoint(&self) {
         let depth = self.savepoint_stack.read().len();
         tracing::debug!("begin_savepoint(tx_id={}, depth={})", self.tx_id, depth);
-        self.savepoint_stack.write().push(Savepoint::statement());
+        let header = *self.header.read();
+        let header_dirty = self.header_dirty.load(Ordering::Acquire);
+        self.savepoint_stack
+            .write()
+            .push(Savepoint::statement(header, header_dirty));
     }
 
     /// Begin a new named savepoint. If `starts_transaction` is true, this savepoint represents the
@@ -531,10 +549,14 @@ impl Transaction {
             depth,
             name
         );
+        let header = *self.header.read();
+        let header_dirty = self.header_dirty.load(Ordering::Acquire);
         self.savepoint_stack.write().push(Savepoint::named(
             name,
             starts_transaction,
             deferred_fk_violations,
+            header,
+            header_dirty,
         ));
     }
 
@@ -636,12 +658,16 @@ impl Transaction {
             }
         );
         let deferred_fk_violations = savepoints[target_idx].deferred_fk_violations;
+        let header = savepoints[target_idx].header;
+        let header_dirty = savepoints[target_idx].header_dirty;
 
         let drained: Vec<Savepoint> = savepoints.drain(target_idx..).collect();
         savepoints.push(Savepoint::named(
             target_name,
             starts_transaction,
             deferred_fk_violations,
+            header,
+            header_dirty,
         ));
         Some(SavepointRollbackResult {
             rolledback_savepoints: drained,
@@ -998,12 +1024,23 @@ impl<Clock: LogicalClock> CommitStateMachine<Clock> {
         sync_mode: SyncMode,
     ) -> Self {
         let pager = connection.pager.load().clone();
+        // Use the connection's tx-level schema_did_change flag as the
+        // single source of truth.  This flag is set by SetCookie(SchemaVersion)
+        // which every DDL emits, so it covers all schema-changing operations
+        // including ones that don't write to sqlite_schema (e.g. AddType
+        // writing to __turso_internal_types for custom types).
+        let schema_did_change_from_tx = matches!(
+            connection.get_tx_state(),
+            crate::connection::TransactionState::Write {
+                schema_did_change: true
+            }
+        );
         Self {
             state,
             is_finalized: false,
             #[cfg(any(test, injected_yields))]
             yield_instance_id: connection.next_yield_instance_id(),
-            did_commit_schema_change: false,
+            did_commit_schema_change: schema_did_change_from_tx,
             tx_id,
             connection,
             write_set: Vec::new(),
@@ -1278,35 +1315,55 @@ impl<Clock: LogicalClock> CommitStateMachine<Clock> {
             log_record.header = Some(*tx.header.read());
         }
 
-        for id in &self.write_set {
+        // Process schema rows (sqlite_schema) before data rows so that during log
+        // replay the table_id_to_rootpage map is populated before data row inserts
+        // reference it. The SkipSet iteration order sorts by table_id (most negative
+        // first), which would otherwise place data table rows (e.g. table_id=-3)
+        // before schema rows (table_id=-1).
+
+        // Remap a table_id to its canonical form for the log. After checkpoint,
+        // a table's in-memory table_id (e.g. -53) may differ from -(root_page)
+        // (e.g. -58). On recovery, bootstrap reconstructs the map using
+        // -(root_page), so log records must use that canonical form to be found.
+        let canonicalize_table_id = |version: &mut RowVersion| {
+            let table_id = version.row.id.table_id;
+            if table_id == SQLITE_SCHEMA_MVCC_TABLE_ID {
+                return;
+            }
+            if let Some(entry) = mvcc_store.table_id_to_rootpage.get(&table_id) {
+                if let Some(root_page) = *entry.value() {
+                    let canonical = MVTableId::from(-(root_page as i64));
+                    if canonical != table_id {
+                        version.row.id.table_id = canonical;
+                    }
+                }
+            }
+        };
+
+        let collect_versions = |id: &RowID, log_record: &mut LogRecord| {
             if let Some(row_versions) = mvcc_store.rows.get(id) {
                 let row_versions = row_versions.value().read();
                 for row_version in row_versions.iter() {
                     let mut committed_version = row_version.clone();
                     let mut changed = false;
-                    if let Some(TxTimestampOrID::TxID(id)) = committed_version.begin {
-                        if id == self.tx_id {
+                    if let Some(TxTimestampOrID::TxID(vid)) = committed_version.begin {
+                        if vid == self.tx_id {
                             // New version is valid STARTING FROM the committing
                             // transaction's end timestamp. See Hekaton page 299.
                             committed_version.begin = Some(TxTimestampOrID::Timestamp(end_ts));
                             changed = true;
-                            if committed_version.row.id.table_id == SQLITE_SCHEMA_MVCC_TABLE_ID {
-                                self.did_commit_schema_change = true;
-                            }
                         }
                     }
-                    if let Some(TxTimestampOrID::TxID(id)) = committed_version.end {
-                        if id == self.tx_id {
+                    if let Some(TxTimestampOrID::TxID(vid)) = committed_version.end {
+                        if vid == self.tx_id {
                             // Old version is valid UNTIL the committing
                             // transaction's end timestamp. See Hekaton page 299.
                             committed_version.end = Some(TxTimestampOrID::Timestamp(end_ts));
                             changed = true;
-                            if committed_version.row.id.table_id == SQLITE_SCHEMA_MVCC_TABLE_ID {
-                                self.did_commit_schema_change = true;
-                            }
                         }
                     }
                     if changed {
+                        canonicalize_table_id(&mut committed_version);
                         mvcc_store
                             .insert_version_raw(&mut log_record.row_versions, committed_version);
                     }
@@ -1323,16 +1380,16 @@ impl<Clock: LogicalClock> CommitStateMachine<Clock> {
                     for row_version in row_versions.iter() {
                         let mut committed_version = row_version.clone();
                         let mut changed = false;
-                        if let Some(TxTimestampOrID::TxID(id)) = committed_version.begin {
-                            if id == self.tx_id {
+                        if let Some(TxTimestampOrID::TxID(vid)) = committed_version.begin {
+                            if vid == self.tx_id {
                                 // New version is valid STARTING FROM the committing
                                 // transaction's end timestamp. See Hekaton page 299.
                                 committed_version.begin = Some(TxTimestampOrID::Timestamp(end_ts));
                                 changed = true;
                             }
                         }
-                        if let Some(TxTimestampOrID::TxID(id)) = committed_version.end {
-                            if id == self.tx_id {
+                        if let Some(TxTimestampOrID::TxID(vid)) = committed_version.end {
+                            if vid == self.tx_id {
                                 // Old version is valid UNTIL the committing
                                 // transaction's end timestamp. See Hekaton page 299.
                                 committed_version.end = Some(TxTimestampOrID::Timestamp(end_ts));
@@ -1340,6 +1397,7 @@ impl<Clock: LogicalClock> CommitStateMachine<Clock> {
                             }
                         }
                         if changed {
+                            canonicalize_table_id(&mut committed_version);
                             mvcc_store.insert_version_raw(
                                 &mut log_record.row_versions,
                                 committed_version,
@@ -1347,6 +1405,19 @@ impl<Clock: LogicalClock> CommitStateMachine<Clock> {
                         }
                     }
                 }
+            }
+        };
+
+        // First pass: schema rows only (ordering matters for recovery)
+        for id in &self.write_set {
+            if id.table_id == SQLITE_SCHEMA_MVCC_TABLE_ID {
+                collect_versions(id, &mut log_record);
+            }
+        }
+        // Second pass: all non-schema rows
+        for id in &self.write_set {
+            if id.table_id != SQLITE_SCHEMA_MVCC_TABLE_ID {
+                collect_versions(id, &mut log_record);
             }
         }
 
@@ -1762,17 +1833,24 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
             }
             CommitState::EndCommitLogicalLog { end_ts } => {
                 let connection = self.connection.clone();
-                let schema_did_change = self.did_commit_schema_change;
-                if schema_did_change {
-                    let schema = connection.schema.read().clone();
-                    connection.db.update_schema_if_newer(schema);
-                }
                 let tx = mvcc_store
                     .txs
                     .get(&self.tx_id)
                     .ok_or_else(|| LimboError::NoSuchTransactionID(self.tx_id.to_string()))?;
                 let tx_unlocked = tx.value();
-                self.header.write().replace(*tx_unlocked.header.read());
+                let tx_header = *tx_unlocked.header.read();
+                let schema_did_change = self.did_commit_schema_change
+                    || self
+                        .header
+                        .read()
+                        .as_ref()
+                        .map(|header| header.schema_cookie.get())
+                        != Some(tx_header.schema_cookie.get());
+                if schema_did_change {
+                    let schema = connection.schema.read().clone();
+                    connection.db.update_schema_if_newer(schema);
+                }
+                self.header.write().replace(tx_header);
                 tracing::trace!("end_commit_logical_log(tx_id={})", self.tx_id);
                 self.state = CommitState::CommitEnd { end_ts: *end_ts };
                 return Ok(TransitionResult::Continue);
@@ -2205,7 +2283,7 @@ pub struct MvStore<Clock: LogicalClock> {
 
 impl<Clock: LogicalClock> MvStore<Clock> {
     fn uses_durable_mvcc_metadata(&self, connection: &Arc<Connection>) -> bool {
-        !connection.db.path.starts_with(":memory:")
+        !connection.db.is_in_memory_db()
     }
 
     /// Captures table-valued functions (e.g. generate_series) from the schema before
@@ -3664,6 +3742,8 @@ impl<Clock: LogicalClock> MvStore<Clock> {
 
     fn rollback_savepoint_changes(&self, tx_id: TxID, savepoint: Savepoint) {
         let Savepoint {
+            header,
+            header_dirty,
             created_table_versions,
             created_index_versions,
             deleted_table_versions,
@@ -3751,6 +3831,14 @@ impl<Clock: LogicalClock> MvStore<Clock> {
 
         touched_rowids.extend(newly_added_to_write_set);
         self.remove_rolled_back_rows_from_write_set(tx_id, touched_rowids.clone());
+
+        let tx = self
+            .txs
+            .get(&tx_id)
+            .unwrap_or_else(|| panic!("Transaction {tx_id} not found while restoring savepoint"));
+        let tx = tx.value();
+        *tx.header.write() = header;
+        tx.header_dirty.store(header_dirty, Ordering::Release);
     }
 
     fn row_has_uncommitted_version_for_tx(&self, rowid: &RowID, tx_id: TxID) -> bool {
@@ -4512,6 +4600,13 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                         Some(ValueRef::Text(v)) => Some(v.as_str()),
                         _ => None,
                     };
+                    let attached_resolver = |alias: &str| -> Option<usize> {
+                        connection
+                            .attached_databases()
+                            .read()
+                            .get_database_by_name(&crate::util::normalize_ident(alias))
+                            .map(|(idx, _)| idx)
+                    };
                     fresh.handle_schema_row(
                         ty,
                         name,
@@ -4524,6 +4619,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                         &mut dbsp_state_roots,
                         &mut dbsp_state_index_roots,
                         &mut materialized_view_info,
+                        &attached_resolver,
                     )?;
                 }
                 fresh.populate_indices(
@@ -4670,12 +4766,14 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                         let rowid_int = rowid.row_id.to_int_or_panic();
                         schema_rows.insert(rowid_int, record);
                         needs_schema_rebuild.set(true);
-                    } else {
-                        turso_assert!(self.table_id_to_rootpage.get(&rowid.table_id).is_some(),
-                        "Logical log contains a row version insert with a table id that does not exist in the table_id_to_rootpage map",
-                        {"table_id": rowid.table_id,
-                            "table_id_to_rootpage_map": format!("{:?}", self.table_id_to_rootpage.iter().collect::<Vec<_>>())
-                        });
+                    } else if self.table_id_to_rootpage.get(&rowid.table_id).is_none() {
+                        // Data row references a table_id not yet in the map. This can happen
+                        // with logs written before the schema-first serialization fix: in a
+                        // same-transaction CREATE TABLE + INSERT + DROP TABLE, data rows were
+                        // serialized before the schema INSERT that registers the table_id.
+                        // The schema INSERT (or DELETE) for this table will follow later in
+                        // this transaction frame, so we register the table_id now.
+                        self.insert_table_id_to_rootpage(rowid.table_id, None);
                     }
 
                     let version_id = self.get_version_id();
@@ -4705,9 +4803,27 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                     if commit_ts <= replay_cutoff_ts {
                         continue;
                     }
-                    turso_assert!(self.table_id_to_rootpage.get(&rowid.table_id).is_some(),
-                        "Logical log contains a row version delete with a table id that does not exist in the table_id_to_rootpage map",
-                        {"rootpage_map": rowid.table_id});
+                    if self.table_id_to_rootpage.get(&rowid.table_id).is_none() {
+                        // See comment in UpsertTableRow: old logs may have data rows
+                        // serialized before the schema INSERT that registers the table_id.
+                        self.insert_table_id_to_rootpage(rowid.table_id, None);
+                    }
+                    let tombstone_row = if rowid.table_id == SQLITE_SCHEMA_MVCC_TABLE_ID {
+                        let rowid_int = rowid.row_id.to_int_or_panic();
+                        if let Some(record) = schema_rows.get(&rowid_int) {
+                            // Preserve the pre-delete sqlite_schema record in recovered
+                            // tombstones so checkpoint can still recover B-tree identity.
+                            Row::new_table_row(
+                                rowid.clone(),
+                                record.as_blob().clone(),
+                                record.column_count(),
+                            )
+                        } else {
+                            Row::new_table_row(rowid.clone(), Vec::new(), 0)
+                        }
+                    } else {
+                        Row::new_table_row(rowid.clone(), Vec::new(), 0)
+                    };
                     if let Some(versions) = self.rows.get(&rowid) {
                         // Row exists in memory — try to find the current (non-ended) version
                         // that was committed before this delete, and mark it as ended. If no
@@ -4721,24 +4837,22 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                             existing.end = Some(TxTimestampOrID::Timestamp(commit_ts));
                         } else {
                             let version_id = self.get_version_id();
-                            let row = Row::new_table_row(rowid.clone(), Vec::new(), 0);
                             let row_version = RowVersion {
                                 id: version_id,
                                 begin: None,
                                 end: Some(TxTimestampOrID::Timestamp(commit_ts)),
-                                row,
+                                row: tombstone_row.clone(),
                                 btree_resident,
                             };
                             self.insert_version_raw(&mut versions, row_version);
                         }
                     } else {
                         let version_id = self.get_version_id();
-                        let row = Row::new_table_row(rowid.clone(), Vec::new(), 0);
                         let row_version = RowVersion {
                             id: version_id,
                             begin: None,
                             end: Some(TxTimestampOrID::Timestamp(commit_ts)),
-                            row,
+                            row: tombstone_row,
                             btree_resident,
                         };
                         let versions = self

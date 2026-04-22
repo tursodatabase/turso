@@ -26,6 +26,24 @@ expect {
 }
 
 @cross-check-integrity
+test savepoint-rollback-reverts-temp-table-changes {
+    CREATE TABLE main_t(x INTEGER);
+    CREATE TEMP TABLE temp_t(x INTEGER);
+    BEGIN;
+    INSERT INTO main_t VALUES (1);
+    SAVEPOINT sp1;
+    INSERT INTO temp.temp_t VALUES (2);
+    ROLLBACK TO sp1;
+    RELEASE sp1;
+    COMMIT;
+    SELECT x FROM main_t ORDER BY x;
+    SELECT x FROM temp.temp_t ORDER BY x;
+}
+expect {
+    1
+}
+
+@cross-check-integrity
 test savepoint-nested-release-outer {
     CREATE TABLE t(x);
     SAVEPOINT outer_sp;
@@ -114,6 +132,23 @@ test savepoint-case-insensitive-name-resolution {
 }
 expect {
     2
+}
+
+@cross-check-integrity
+test savepoint-rollback-restores-uncommitted-schema {
+    BEGIN;
+    CREATE TABLE keep_t(x);
+    SAVEPOINT sp;
+    CREATE TABLE rolled_back_t(y);
+    ROLLBACK TO sp;
+    SELECT name FROM sqlite_schema WHERE type = 'table' ORDER BY name;
+    INSERT INTO keep_t VALUES (1);
+    SELECT x FROM keep_t;
+    ROLLBACK;
+}
+expect {
+    keep_t
+    1
 }
 
 @cross-check-integrity
@@ -269,4 +304,49 @@ test savepoint-not-reusable-after-transaction-boundary {
 }
 expect error {
     no such savepoint
+}
+
+# regression: ROLLBACK TO must restore the in-memory TEMP schema
+# after the on-disk pages are rolled back. Previously the mirror call would
+# undo the temp pages but the in-memory temp schema kept the DDL that no
+# longer existed on disk.
+@cross-check-integrity
+test savepoint-rollback-to-removes-temp-ddl {
+    CREATE TEMP TABLE sp_temp_sentinel(x);
+    SAVEPOINT a;
+    CREATE TEMP TABLE sp_temp_t(x);
+    ROLLBACK TO a;
+    SELECT name FROM temp.sqlite_schema WHERE type='table' ORDER BY name;
+}
+expect {
+    sp_temp_sentinel
+}
+
+@cross-check-integrity
+test savepoint-rollback-to-removes-temp-ddl-with-dml {
+    CREATE TEMP TABLE sp_temp_keep(x);
+    INSERT INTO sp_temp_keep VALUES(99);
+    SAVEPOINT b;
+    CREATE TEMP TABLE sp_temp_u(y);
+    INSERT INTO sp_temp_u VALUES(1);
+    ROLLBACK TO b;
+    SELECT name FROM temp.sqlite_schema WHERE type='table' ORDER BY name;
+    SELECT x FROM temp.sp_temp_keep;
+}
+expect {
+    sp_temp_keep
+    99
+}
+
+# Temp DDL created inside a savepoint must be unreachable after ROLLBACK TO
+# (the whole point of the fix: in-memory schema must match on-disk state).
+@cross-check-integrity
+test savepoint-rollback-to-temp-table-unreachable {
+    SAVEPOINT c;
+    CREATE TEMP TABLE sp_temp_gone(z);
+    ROLLBACK TO c;
+    SELECT * FROM temp.sp_temp_gone;
+}
+expect error {
+    no such table
 }

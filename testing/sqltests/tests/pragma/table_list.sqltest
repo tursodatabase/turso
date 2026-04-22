@@ -63,6 +63,44 @@ expect {
     main|sqlite_schema|table|5|0|0
 }
 
+test pragma-table-list-includes-temp-schema {
+    SELECT schema, name, type, ncol, wr, strict FROM pragma_table_list WHERE schema = 'temp';
+}
+expect {
+    temp|sqlite_temp_schema|table|5|0|0
+}
+
+@cross-check-integrity
+test pragma-table-list-unqualified-includes-main-and-temp-matches {
+    CREATE TABLE t(a INTEGER);
+    CREATE TEMP TABLE t(b TEXT);
+    SELECT schema, name, type, ncol, wr, strict FROM pragma_table_list('t') ORDER BY schema;
+}
+expect {
+    main|t|table|1|0|0
+    temp|t|table|1|0|0
+}
+
+@cross-check-integrity
+test pragma-table-info-prefers-temp-shadow {
+    CREATE TABLE t(a INTEGER);
+    CREATE TEMP TABLE t(b TEXT);
+    SELECT cid, name FROM pragma_table_info('t');
+}
+expect {
+    0|b
+}
+
+@cross-check-integrity
+test pragma-table-xinfo-prefers-temp-shadow {
+    CREATE TABLE t(a INTEGER);
+    CREATE TEMP TABLE t(b TEXT);
+    SELECT cid, name, hidden FROM pragma_table_xinfo('t');
+}
+expect {
+    0|b|0
+}
+
 @cross-check-integrity
 test pragma-table-list-function-syntax {
     CREATE TABLE t1(a, b, c);
@@ -70,4 +108,27 @@ test pragma-table-list-function-syntax {
 }
 expect {
     main|t1|table|3|0|0
+}
+
+@skip-if mvcc "attach is not supported for mvcc"
+@cross-check-integrity
+test pragma-table-list-attached-database {
+    ATTACH ':memory:' AS aux;
+    CREATE TABLE aux.t1(a, b, c);
+    PRAGMA aux.table_list('t1');
+}
+expect {
+    aux|t1|table|3|0|0
+}
+
+@cross-check-integrity
+test pragma-table-list-explicit-main-vs-temp {
+    CREATE TABLE t(a INTEGER);
+    CREATE TEMP TABLE t(b TEXT);
+    PRAGMA main.table_list('t');
+    PRAGMA temp.table_list('t');
+}
+expect {
+    main|t|table|1|0|0
+    temp|t|table|1|0|0
 }

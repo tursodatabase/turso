@@ -133,7 +133,7 @@ impl fmt::Display for ColumnDef {
 pub struct Table {
     pub name: String,
     pub columns: Vec<ColumnDef>,
-    /// The database this table belongs to (e.g. "aux" for attached databases).
+    /// The database this table belongs to (e.g. "temp" or "aux").
     /// `None` means the main database.
     #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Option::is_none"))]
     pub database: Option<String>,
@@ -165,6 +165,11 @@ impl Table {
             Some(db) => format!("{}.{}", db, self.name),
             None => self.name.clone(),
         }
+    }
+
+    /// Returns the unqualified table name.
+    pub fn unqualified_name(&self) -> &str {
+        &self.name
     }
 
     /// Set the database this table belongs to.
@@ -201,6 +206,8 @@ pub struct Index {
     pub table_name: String,
     pub columns: Vec<String>,
     pub unique: bool,
+    #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Option::is_none"))]
+    pub database: Option<String>,
 }
 
 impl Index {
@@ -214,12 +221,25 @@ impl Index {
             table_name: table_name.into(),
             columns,
             unique: false,
+            database: None,
         }
     }
 
     pub fn unique(mut self) -> Self {
         self.unique = true;
         self
+    }
+
+    pub fn in_database(mut self, db: impl Into<String>) -> Self {
+        self.database = Some(db.into());
+        self
+    }
+
+    pub fn qualified_name(&self) -> String {
+        match &self.database {
+            Some(db) => format!("{}.{}", db, self.name),
+            None => self.name.clone(),
+        }
     }
 }
 
@@ -270,7 +290,10 @@ impl SchemaBuilder {
     }
 
     pub fn database(mut self, name: impl Into<String>) -> Self {
-        self.attached_databases.push(name.into());
+        let name = name.into();
+        if !self.attached_databases.contains(&name) {
+            self.attached_databases.push(name);
+        }
         self
     }
 
@@ -303,9 +326,27 @@ impl Schema {
         self.tables.iter().map(|t| t.name.clone()).collect()
     }
 
+    /// Returns all table names in a specific database scope.
+    pub fn table_names_in_database(&self, database: Option<&str>) -> HashSet<String> {
+        self.tables
+            .iter()
+            .filter(|t| t.database.as_deref() == database)
+            .map(|t| t.name.clone())
+            .collect()
+    }
+
     /// Returns all index names in the schema.
     pub fn index_names(&self) -> HashSet<String> {
         self.indexes.iter().map(|i| i.name.clone()).collect()
+    }
+
+    /// Returns all index names in a specific database scope.
+    pub fn index_names_in_database(&self, database: Option<&str>) -> HashSet<String> {
+        self.indexes
+            .iter()
+            .filter(|i| i.database.as_deref() == database)
+            .map(|i| i.name.clone())
+            .collect()
     }
 
     /// Returns all trigger names in the schema.
@@ -323,6 +364,18 @@ impl Schema {
         self.indexes
             .iter()
             .filter(|i| i.table_name == table_name)
+            .collect()
+    }
+
+    /// Returns indexes for a specific table in a specific database.
+    pub fn indexes_for_table_in_database(
+        &self,
+        table_name: &str,
+        database: Option<&str>,
+    ) -> Vec<&Index> {
+        self.indexes
+            .iter()
+            .filter(|i| i.table_name == table_name && i.database.as_deref() == database)
             .collect()
     }
 
@@ -382,5 +435,45 @@ mod tests {
         assert_eq!(schema.indexes.len(), 1);
         assert!(schema.table_names().contains("users"));
         assert!(schema.index_names().contains("idx_users_id"));
+    }
+
+    #[test]
+    fn test_scoped_names_keep_main_and_temp_separate() {
+        let schema = SchemaBuilder::new()
+            .database("temp")
+            .table(Table::new(
+                "shadowed",
+                vec![ColumnDef::new("id", DataType::Integer)],
+            ))
+            .table(
+                Table::new("shadowed", vec![ColumnDef::new("id", DataType::Integer)])
+                    .in_database("temp"),
+            )
+            .index(Index::new(
+                "shadowed_idx",
+                "shadowed",
+                vec!["id".to_string()],
+            ))
+            .index(
+                Index::new("shadowed_idx", "shadowed", vec!["id".to_string()]).in_database("temp"),
+            )
+            .build();
+
+        assert_eq!(
+            schema.table_names_in_database(None),
+            HashSet::from([String::from("shadowed")])
+        );
+        assert_eq!(
+            schema.table_names_in_database(Some("temp")),
+            HashSet::from([String::from("shadowed")])
+        );
+        assert_eq!(
+            schema.index_names_in_database(None),
+            HashSet::from([String::from("shadowed_idx")])
+        );
+        assert_eq!(
+            schema.index_names_in_database(Some("temp")),
+            HashSet::from([String::from("shadowed_idx")])
+        );
     }
 }

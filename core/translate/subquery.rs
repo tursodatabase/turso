@@ -1,11 +1,11 @@
 use std::sync::Arc;
 
-use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
+use rustc_hash::FxHashMap as HashMap;
 use turso_parser::ast::{self, SortOrder, SubqueryType};
 
 use crate::{
     emit_explain,
-    schema::{BTreeTable, Column, Index, IndexColumn, Table},
+    schema::{BTreeCharacteristics, BTreeTable, Column, Index, IndexColumn, Table},
     translate::{
         collate::get_collseq_from_expr,
         compound_select::emit_program_for_compound_select,
@@ -17,10 +17,10 @@ use crate::{
         },
         optimizer::optimize_select_plan,
         plan::{
-            plan_has_outer_scope_dependency, plan_is_correlated, ColumnUsedMask, EvalAt,
-            JoinOrderMember, NonFromClauseSubquery, OuterQueryReference, Plan, SetOperation,
-            SubqueryEvalPhase, SubqueryOrigin, SubqueryPosition, SubqueryState, TableReferences,
-            WhereTerm,
+            plan_has_outer_scope_dependency, plan_is_correlated,
+            select_plan_has_outer_scope_dependency, ColumnUsedMask, EvalAt, JoinOrderMember,
+            NonFromClauseSubquery, OuterQueryReference, Plan, SetOperation, SubqueryEvalPhase,
+            SubqueryOrigin, SubqueryPosition, SubqueryState, TableReferences, WhereTerm,
         },
         select::prepare_select_plan,
     },
@@ -38,7 +38,7 @@ use super::{
     emitter::{Resolver, TranslateCtx},
     main_loop::LoopLabels,
     plan::{Aggregate, Operation, QueryDestination, Scan, Search, SelectPlan},
-    planner::resolve_window_and_aggregate_functions,
+    planner::{resolve_window_and_aggregate_functions, TableMask},
 };
 
 struct DirectMaterializedSubquery {
@@ -72,41 +72,121 @@ pub(crate) fn materialized_from_clause_subquery_storage(
     }
 }
 
+// Count the CTE reads in this query tree that can share one materialized
+// result.
+//
+// Reads from correlated post-write RETURNING subqueries are skipped because
+// they run once per updated row instead of once for the statement.
+fn count_shared_cte_references(
+    counts: &mut HashMap<usize, usize>,
+    table_references: &TableReferences,
+    non_from_clause_subqueries: &[NonFromClauseSubquery],
+) {
+    for table in table_references.joined_tables() {
+        if let Table::FromClauseSubquery(from_clause_subquery) = &table.table {
+            if let Some(cte_id) = from_clause_subquery.cte_id() {
+                *counts.entry(cte_id).or_default() += 1;
+                continue;
+            }
+            count_shared_cte_references_in_plan(counts, from_clause_subquery.plan.as_ref());
+        }
+    }
+
+    for subquery in non_from_clause_subqueries {
+        let SubqueryState::Unevaluated {
+            plan: Some(subquery_plan),
+        } = &subquery.state
+        else {
+            continue;
+        };
+        // A correlated RETURNING subquery runs after each updated row is
+        // written, so its CTE reads must not be counted as part of the shared
+        // pre-write snapshot used by earlier readers in the same statement.
+        if subquery.origin.is_post_write_returning()
+            && plan_has_outer_scope_dependency(subquery_plan)
+        {
+            continue;
+        }
+        count_shared_cte_references_in_plan(counts, subquery_plan);
+    }
+}
+
+fn count_shared_cte_references_in_plan(counts: &mut HashMap<usize, usize>, plan: &Plan) {
+    match plan {
+        Plan::Select(select_plan) => count_shared_cte_references(
+            counts,
+            &select_plan.table_references,
+            &select_plan.non_from_clause_subqueries,
+        ),
+        Plan::CompoundSelect {
+            left, right_most, ..
+        } => {
+            for (select_plan, _) in left {
+                count_shared_cte_references(
+                    counts,
+                    &select_plan.table_references,
+                    &select_plan.non_from_clause_subqueries,
+                );
+            }
+            count_shared_cte_references(
+                counts,
+                &right_most.table_references,
+                &right_most.non_from_clause_subqueries,
+            );
+        }
+        Plan::Delete(_) | Plan::Update(_) => {}
+    }
+}
+
 /// Mark CTE references that must be materialized once and shared across
 /// multiple reads of the same query tree.
-///
-/// Correlated plans are explicitly excluded: they must re-run for each outer
-/// row, so sharing a single materialized result would be semantically wrong.
-fn mark_shared_cte_materialization_requirements(program: &ProgramBuilder, plan: &mut SelectPlan) {
-    fn annotate_plan(program: &ProgramBuilder, plan: &mut Plan) {
+pub(crate) fn mark_shared_cte_materialization_requirements(
+    table_references: &mut TableReferences,
+    non_from_clause_subqueries: &mut [NonFromClauseSubquery],
+) {
+    fn annotate_plan(plan: &mut Plan) {
         match plan {
-            Plan::Select(select_plan) => {
-                mark_shared_cte_materialization_requirements(program, select_plan)
-            }
+            Plan::Select(select_plan) => mark_shared_cte_materialization_requirements(
+                &mut select_plan.table_references,
+                &mut select_plan.non_from_clause_subqueries,
+            ),
             Plan::CompoundSelect {
                 left, right_most, ..
             } => {
                 for (select_plan, _) in left.iter_mut() {
-                    mark_shared_cte_materialization_requirements(program, select_plan);
+                    mark_shared_cte_materialization_requirements(
+                        &mut select_plan.table_references,
+                        &mut select_plan.non_from_clause_subqueries,
+                    );
                 }
-                mark_shared_cte_materialization_requirements(program, right_most);
+                mark_shared_cte_materialization_requirements(
+                    &mut right_most.table_references,
+                    &mut right_most.non_from_clause_subqueries,
+                );
             }
-            Plan::Delete(_) | Plan::Update(_) => unreachable!("DML plans cannot be subqueries"),
+            Plan::Delete(_) | Plan::Update(_) => {}
         }
     }
 
-    for table in plan.table_references.joined_tables_mut().iter_mut() {
+    let mut shared_ref_counts = HashMap::default();
+    count_shared_cte_references(
+        &mut shared_ref_counts,
+        table_references,
+        non_from_clause_subqueries,
+    );
+
+    for table in table_references.joined_tables_mut().iter_mut() {
         if let Table::FromClauseSubquery(from_clause_subquery) = &mut table.table {
             let from_clause_subquery = Arc::make_mut(from_clause_subquery);
             let shared_materialization = from_clause_subquery.cte_id().is_some_and(|cte_id| {
-                program.get_cte_reference_count(cte_id) > 1
+                shared_ref_counts.get(&cte_id).copied().unwrap_or_default() > 1
                     && !plan_has_outer_scope_dependency(&from_clause_subquery.plan)
             });
             from_clause_subquery.set_shared_materialization(shared_materialization);
             if let Some(cte_id) = from_clause_subquery.cte_id() {
                 tracing::trace!(
                     cte_id,
-                    reference_count = program.get_cte_reference_count(cte_id),
+                    shared_ref_count = shared_ref_counts.get(&cte_id).copied().unwrap_or_default(),
                     shared_materialization,
                     outer_scope_dependency = plan_has_outer_scope_dependency(
                         &from_clause_subquery.plan,
@@ -116,18 +196,18 @@ fn mark_shared_cte_materialization_requirements(program: &ProgramBuilder, plan: 
                     "annotated CTE materialization requirements"
                 );
             }
-            annotate_plan(program, from_clause_subquery.plan.as_mut());
+            annotate_plan(from_clause_subquery.plan.as_mut());
         }
     }
 
-    for subquery in plan.non_from_clause_subqueries.iter_mut() {
+    for subquery in non_from_clause_subqueries.iter_mut() {
         let SubqueryState::Unevaluated {
             plan: Some(subquery_plan),
         } = &mut subquery.state
         else {
             continue;
         };
-        annotate_plan(program, subquery_plan);
+        annotate_plan(subquery_plan);
     }
 }
 
@@ -249,7 +329,10 @@ pub fn plan_subqueries_from_select_plan(
     }
 
     assign_select_subquery_eval_phases(plan);
-    mark_shared_cte_materialization_requirements(program, plan);
+    mark_shared_cte_materialization_requirements(
+        &mut plan.table_references,
+        &mut plan.non_from_clause_subqueries,
+    );
 
     update_column_used_masks(
         &mut plan.table_references,
@@ -428,6 +511,7 @@ fn plan_subqueries_with_outer_query_access<'a>(
                     table: t.table.clone(),
                     identifier: t.identifier.clone(),
                     internal_id: t.internal_id,
+                    using_dedup_hidden_cols: t.using_dedup_hidden_cols(),
                     col_used_mask: ColumnUsedMask::default(),
                     cte_select: None,
                     cte_explicit_columns: vec![],
@@ -445,6 +529,7 @@ fn plan_subqueries_with_outer_query_access<'a>(
                         table: t.table.clone(),
                         identifier: t.identifier.clone(),
                         internal_id: t.internal_id,
+                        using_dedup_hidden_cols: t.using_dedup_hidden_cols.clone(),
                         col_used_mask: ColumnUsedMask::default(),
                         cte_select: t.cte_select.clone(),
                         cte_explicit_columns: t.cte_explicit_columns.clone(),
@@ -531,7 +616,7 @@ fn get_subquery_parser<'a>(
                     );
                 };
                 optimize_select_plan(&mut plan, resolver.schema())?;
-                let correlated = plan.is_correlated();
+                let correlated = select_plan_has_outer_scope_dependency(&plan);
                 handle_unsupported_correlation(correlated, position, allow_correlated)?;
                 out_subqueries.push(NonFromClauseSubquery {
                     internal_id: subquery_id,
@@ -580,6 +665,20 @@ fn get_subquery_parser<'a>(
                 let reg_count = plan.result_columns.len();
                 let reg_start = program.alloc_registers(reg_count);
 
+                if reg_count == 1 {
+                    if let Some(result_col) = plan.result_columns.first() {
+                        let affinity = get_expr_affinity_info(
+                            &result_col.expr,
+                            Some(&plan.table_references),
+                            None,
+                        );
+                        resolver
+                            .subquery_affinities
+                            .borrow_mut()
+                            .insert(subquery_id, affinity);
+                    }
+                }
+
                 plan.query_destination = QueryDestination::RowValueSubqueryResult {
                     result_reg_start: reg_start,
                     num_regs: reg_count,
@@ -618,7 +717,7 @@ fn get_subquery_parser<'a>(
                 *result_reg_start = reg_start;
                 *num_regs = reg_count;
 
-                let correlated = plan.is_correlated();
+                let correlated = select_plan_has_outer_scope_dependency(&plan);
                 handle_unsupported_correlation(correlated, position, allow_correlated)?;
 
                 out_subqueries.push(NonFromClauseSubquery {
@@ -766,7 +865,7 @@ fn get_subquery_parser<'a>(
                     },
                 };
 
-                let correlated = plan_is_correlated(&plan);
+                let correlated = plan_has_outer_scope_dependency(&plan);
                 handle_unsupported_correlation(correlated, position, allow_correlated)?;
 
                 out_subqueries.push(NonFromClauseSubquery {
@@ -1081,18 +1180,18 @@ pub fn emit_from_clause_subqueries(
         .iter()
         .map(|member| member.original_idx)
         .collect();
-    let visit_set: HashSet<usize> = visit_order.iter().copied().collect();
+    let visit_set: TableMask = visit_order.iter().copied().collect();
     for table in tables.joined_tables().iter() {
         if let Operation::HashJoin(hash_join_op) = &table.op {
             let build_idx = hash_join_op.build_table_idx;
-            if !visit_set.contains(&build_idx) {
+            if !visit_set.get(build_idx) {
                 visit_order.push(build_idx);
             }
         }
     }
 
     // Build lookup from table index to is_outer for LEFT-JOIN annotations
-    let outer_table_set: HashSet<usize> = join_order
+    let outer_table_set: TableMask = join_order
         .iter()
         .filter(|m| m.is_outer)
         .map(|m| m.original_idx)
@@ -1100,7 +1199,7 @@ pub fn emit_from_clause_subqueries(
 
     for table_index in visit_order {
         let table_reference = &mut tables.joined_tables_mut()[table_index];
-        let left_join_suffix = if outer_table_set.contains(&table_index) {
+        let left_join_suffix = if outer_table_set.get(table_index) {
             " LEFT-JOIN"
         } else {
             ""
@@ -1514,22 +1613,17 @@ fn emit_materialized_subquery_table(
     // insertion order, which SQL semantics require for UNION ALL. It also
     // needs the subquery's column layout so later Column opcodes can read
     // materialized rows through the normal table-cursor path.
-    let logical_to_physical_map = BTreeTable::build_logical_to_physical_map(columns);
-    let ephemeral_table = Arc::new(BTreeTable {
-        root_page: 0,
-        name: String::new(),
-        columns: columns.to_vec(),
-        primary_key_columns: vec![],
-        has_rowid: true,
-        is_strict: false,
-        has_autoincrement: false,
-        unique_sets: vec![],
-        foreign_keys: vec![],
-        check_constraints: vec![],
-        rowid_alias_conflict_clause: None,
-        has_virtual_columns: false,
-        logical_to_physical_map,
-    });
+    let ephemeral_table = Arc::new(BTreeTable::new(
+        0,
+        String::new(),
+        vec![],
+        columns.to_vec(),
+        BTreeCharacteristics::HAS_ROWID,
+        vec![],
+        vec![],
+        vec![],
+        None,
+    ));
 
     let cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(ephemeral_table.clone()));
 

@@ -1,0 +1,95 @@
+---
+title: DROP DOMAIN
+description: Remove a user-defined domain from the database
+sidebarTitle: DROP DOMAIN
+---
+
+# DROP DOMAIN
+
+<Info>
+**Turso Extension**: DROP DOMAIN is a Turso-specific statement not available in standard SQLite. This feature is experimental and must be [enabled before use](/docs/sql-reference/experimental-features).
+</Info>
+
+The DROP DOMAIN statement removes a user-defined domain from the database. Once dropped, the domain name can no longer be used in new column definitions.
+
+## Syntax
+
+```sql
+DROP DOMAIN [IF EXISTS] domain-name;
+```
+
+## Description
+
+DROP DOMAIN removes the named domain from the database. The domain must exist unless the `IF EXISTS` clause is specified.
+
+### Clauses
+
+| Clause | Description |
+|--------|-------------|
+| `IF EXISTS` | Suppresses the error that would occur if the domain does not exist. The statement is a no-op when the domain is not found. |
+| `domain-name` | The name of the domain to remove. |
+
+### Restrictions
+
+A domain cannot be dropped while any table column uses it or while another domain references it as a base type. Remove all dependents before dropping.
+
+```sql
+CREATE DOMAIN base_d AS integer;
+CREATE DOMAIN child_d AS base_d CHECK (value > 0);
+
+-- Fails: child_d depends on base_d
+DROP DOMAIN base_d;
+
+-- Drop child first, then base
+DROP DOMAIN child_d;
+DROP DOMAIN base_d;
+```
+
+### DROP DOMAIN vs DROP TYPE
+
+DROP DOMAIN can only remove domains created with CREATE DOMAIN. Attempting to use DROP DOMAIN on a type created with CREATE TYPE results in an error, and vice versa.
+
+```sql
+CREATE TYPE my_type BASE integer ENCODE value DECODE value;
+DROP DOMAIN my_type;
+-- Error: 'my_type' is a type, not a domain. Use DROP TYPE instead
+
+CREATE DOMAIN my_domain AS integer;
+DROP TYPE my_domain;
+-- Error: 'my_domain' is a domain, not a type. Use DROP DOMAIN instead
+```
+
+## Examples
+
+### Drop a Domain
+
+```sql
+CREATE DOMAIN positive_int AS integer CHECK (value > 0);
+DROP DOMAIN positive_int;
+```
+
+### Drop with IF EXISTS
+
+```sql
+-- Safe to run even if the domain does not exist
+DROP DOMAIN IF EXISTS nonexistent_domain;
+```
+
+### Drop After Removing Table Dependency
+
+```sql
+CREATE DOMAIN score AS integer CHECK (value >= 0);
+CREATE TABLE results (id INTEGER PRIMARY KEY, val score) STRICT;
+
+-- Fails: table 'results' uses domain 'score'
+-- DROP DOMAIN score;
+
+DROP TABLE results;
+DROP DOMAIN score;
+-- OK
+```
+
+## See Also
+
+- [CREATE DOMAIN](/docs/sql-reference/statements/create-domain) for defining domains
+- [DROP TYPE](/docs/sql-reference/statements/drop-type) for removing custom types

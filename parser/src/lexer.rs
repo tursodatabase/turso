@@ -166,12 +166,12 @@ fn keyword_or_id_token(input: &[u8]) -> TokenType {
 }
 
 #[inline(always)]
-pub fn is_identifier_start(b: u8) -> bool {
+pub const fn is_identifier_start(b: u8) -> bool {
     b.is_ascii_uppercase() || b == b'_' || b.is_ascii_lowercase() || b > b'\x7F'
 }
 
 #[inline(always)]
-pub fn is_identifier_continue(b: u8) -> bool {
+pub const fn is_identifier_continue(b: u8) -> bool {
     b == b'$'
         || b.is_ascii_digit()
         || b.is_ascii_uppercase()
@@ -282,7 +282,7 @@ const fn cold() {}
 
 impl<'a> Lexer<'a> {
     #[inline(always)]
-    pub fn new(input: &'a [u8]) -> Self {
+    pub const fn new(input: &'a [u8]) -> Self {
         Lexer { input, offset: 0 }
     }
 
@@ -306,7 +306,7 @@ impl<'a> Lexer<'a> {
 
     /// Returns the current offset in the input without consuming.
     #[inline(always)]
-    pub fn peek(&self) -> Option<u8> {
+    pub const fn peek(&self) -> Option<u8> {
         if self.offset < self.input.len() {
             Some(self.input[self.offset])
         } else {
@@ -316,7 +316,7 @@ impl<'a> Lexer<'a> {
 
     /// Returns the current offset in the input and consumes it.
     #[inline(always)]
-    pub fn eat(&mut self) -> Option<u8> {
+    pub const fn eat(&mut self) -> Option<u8> {
         if let Some(b) = self.peek() {
             self.offset += 1;
             Some(b)

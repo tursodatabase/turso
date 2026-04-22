@@ -7,17 +7,15 @@ use super::{
         SeekDef, SeekKey, SelectPlan, SetOperation, SimpleAggregate, TableReferences, UpdatePlan,
         WhereTerm,
     },
-    planner::TableMask,
 };
 use crate::translate::expression_index::expression_index_column_usage;
-use crate::translate::plan::MultiIndexBranchAccess;
+use crate::translate::plan::{BitSet, ColumnMask, MultiIndexBranchAccess};
+use crate::translate::planner::TableMask;
 use crate::{
     function::{AggFunc, Deterministic},
     index_method::IndexMethodCostEstimate,
     numeric::Numeric,
-    schema::{
-        columns_affected_by_update, BTreeTable, Index, IndexColumn, Schema, Table, ROWID_SENTINEL,
-    },
+    schema::{BTreeCharacteristics, BTreeTable, Index, IndexColumn, Schema, Table, ROWID_SENTINEL},
     translate::{
         insert::ROWID_COLUMN,
         optimizer::{
@@ -34,7 +32,7 @@ use crate::{
             NonFromClauseSubquery, OuterQueryReference, QueryDestination, ResultSetColumn, Scan,
             SeekKeyComponent, SubqueryState,
         },
-        trigger_exec::has_relevant_triggers_type_only,
+        trigger_exec::has_triggers_including_temp,
     },
     types::SeekOp,
     util::{
@@ -570,6 +568,7 @@ fn detect_simple_aggregate(plan: &SelectPlan) -> Option<SimpleAggregate> {
         || plan.result_columns.len() != 1
         || plan.group_by.is_some()
         || plan.contains_constant_false_condition
+        || plan.aggregates.first().unwrap().filter_expr.is_some()
     {
         return None;
     }
@@ -836,16 +835,15 @@ fn first_update_safety_reason(
         }
 
         // Check if there are UPDATE triggers
-        let updated_cols: HashSet<usize> = plan.set_clauses.iter().map(|(i, _)| *i).collect();
+        let updated_cols: ColumnMask = plan.set_clauses.iter().map(|(i, _)| *i).collect();
         let database_id = table_ref.database_id;
-        if resolver.with_schema(database_id, |s| {
-            has_relevant_triggers_type_only(
-                s,
-                TriggerEvent::Update,
-                Some(&updated_cols),
-                btree_table,
-            )
-        }) {
+        if has_triggers_including_temp(
+            resolver,
+            database_id,
+            TriggerEvent::Update,
+            Some(&updated_cols),
+            btree_table,
+        ) {
             break 'requires Some(DmlSafetyReason::Trigger);
         }
 
@@ -860,7 +858,7 @@ fn first_update_safety_reason(
 
         let Some(index) = table_ref.op.index() else {
             let rowid_alias_used = plan.set_clauses.iter().fold(false, |accum, (idx, _)| {
-                accum || (*idx != ROWID_SENTINEL && btree_table.columns[*idx].is_rowid_alias())
+                accum || (*idx != ROWID_SENTINEL && btree_table.columns()[*idx].is_rowid_alias())
             });
             if rowid_alias_used {
                 break 'requires Some(DmlSafetyReason::KeyMutation);
@@ -887,11 +885,11 @@ fn first_update_safety_reason(
             }
         }
 
-        let affected_cols = columns_affected_by_update(&btree_table.columns, &updated_cols);
+        let affected_cols = btree_table.columns_affected_by_update(&updated_cols)?;
         if index
             .columns
             .iter()
-            .any(|c| affected_cols.contains(&c.pos_in_table))
+            .any(|c| affected_cols.get(c.pos_in_table))
         {
             break 'requires Some(DmlSafetyReason::KeyMutation);
         }
@@ -947,22 +945,17 @@ fn add_ephemeral_table_to_update_plan(
 ) -> Result<()> {
     let internal_id = program.table_reference_counter.next();
     let columns = vec![(*ROWID_COLUMN).clone()];
-    let logical_to_physical_map = BTreeTable::build_logical_to_physical_map(&columns);
-    let ephemeral_table = Arc::new(BTreeTable {
-        root_page: 0, // Not relevant for ephemeral table definition
-        name: "ephemeral_scratch".to_string(),
-        has_rowid: true,
-        has_autoincrement: false,
-        primary_key_columns: vec![],
+    let ephemeral_table = Arc::new(BTreeTable::new(
+        0, // root_page, not relevant for ephemeral table definition
+        "ephemeral_scratch".to_string(),
+        vec![],
         columns,
-        is_strict: false,
-        unique_sets: vec![],
-        foreign_keys: vec![],
-        check_constraints: vec![],
-        rowid_alias_conflict_clause: None,
-        has_virtual_columns: false,
-        logical_to_physical_map,
-    });
+        BTreeCharacteristics::HAS_ROWID,
+        vec![],
+        vec![],
+        vec![],
+        None,
+    ));
 
     let temp_cursor_id = program.alloc_cursor_id_keyed(
         CursorKey::table(internal_id),
@@ -1001,6 +994,7 @@ fn add_ephemeral_table_to_update_plan(
                 identifier: table.identifier.clone(),
                 internal_id: table.internal_id,
                 table: table.table.clone(),
+                using_dedup_hidden_cols: ColumnMask::default(),
                 col_used_mask: table.col_used_mask.clone(),
                 cte_select: None,
                 cte_explicit_columns: vec![],
@@ -1085,6 +1079,7 @@ fn add_ephemeral_table_to_update_plan(
             ephemeral_subs
         },
         simple_aggregate: None,
+        phantom_params: vec![],
     };
 
     plan.ephemeral_plan = Some(ephemeral_plan);
@@ -1883,7 +1878,7 @@ fn optimize_table_access(
     // Collect hash join build/probe table indices. Build tables are excluded from the main
     // join order because they are consumed during hash build. A table may appear as both
     // probe and build (probe->build chaining) only when the build input is materialized.
-    let (hash_join_build_tables, hash_join_probe_tables): (Vec<usize>, Vec<usize>) =
+    let (hash_join_build_tables, hash_join_probe_tables): (TableMask, TableMask) =
         best_access_methods
             .iter()
             .filter_map(|&am_idx| {
@@ -1904,7 +1899,7 @@ fn optimize_table_access(
             .unzip();
     #[cfg(debug_assertions)]
     {
-        let mut probe_tables: HashSet<usize> = HashSet::default();
+        let mut probe_tables: TableMask = TableMask::default();
         let mut build_tables: HashMap<usize, bool> = HashMap::default();
         let mut pos_by_table: Vec<Option<usize>> =
             vec![None; table_references.joined_tables().len()];
@@ -1933,13 +1928,13 @@ fn optimize_table_access(
                         "hash join build/probe tables are not adjacent in join order"
                     );
                 }
-                probe_tables.insert(*probe_table_idx);
+                probe_tables.set(*probe_table_idx);
                 build_tables.insert(*build_table_idx, *materialize_build_input);
             }
         }
 
         for (build_table_idx, materialize_build_input) in build_tables {
-            if probe_tables.contains(&build_table_idx) {
+            if probe_tables.get(build_table_idx) {
                 turso_assert!(
                     materialize_build_input,
                     "probe->build chaining requires materialized build input"
@@ -1947,17 +1942,16 @@ fn optimize_table_access(
             }
         }
     }
-    let hash_join_build_only_tables: HashSet<usize> = hash_join_build_tables
+    let hash_join_build_only_tables: TableMask = hash_join_build_tables
         .iter()
-        .copied()
-        .filter(|table_idx| !hash_join_probe_tables.contains(table_idx))
+        .filter(|table_idx| !hash_join_probe_tables.get(*table_idx))
         .collect();
 
     let best_join_order: Vec<JoinOrderMember> = best_table_numbers
         .iter()
         .filter(|table_number| {
-            !hash_join_build_tables.contains(table_number)
-                || hash_join_probe_tables.contains(table_number)
+            !hash_join_build_tables.get(**table_number)
+                || hash_join_probe_tables.get(**table_number)
         })
         .map(|&table_number| JoinOrderMember {
             table_id: table_references.joined_tables_mut()[table_number].internal_id,
@@ -2053,12 +2047,10 @@ fn optimize_table_access(
                     // assigned sequential index positions (0, 1, 2), the seek key would include
                     // 3 components but the ephemeral index only has 2 key columns (t2.a, t2.c),
                     // causing the seek to compare against the wrong columns and return no results.
-                    let mut unique_col_positions: Vec<usize> = usable
+                    let unique_col_positions: BitSet = usable
                         .iter()
                         .map(|(_, c)| c.table_col_pos.expect("table_col_pos was Some above"))
                         .collect();
-                    unique_col_positions.sort_unstable();
-                    unique_col_positions.dedup();
                     // Map each usable constraint to a ConstraintRef.
                     // Multiple constraints with the same table_col_pos share the same index_col_pos.
                     let mut temp_constraint_refs: Vec<ConstraintRef> = usable
@@ -2066,9 +2058,7 @@ fn optimize_table_access(
                         .map(|(orig_idx, c)| {
                             let table_col_pos =
                                 c.table_col_pos.expect("table_col_pos was Some above");
-                            let index_col_pos = unique_col_positions
-                                .binary_search(&table_col_pos)
-                                .expect("table_col_pos must exist in unique_col_positions");
+                            let index_col_pos = unique_col_positions.rank(table_col_pos);
                             ConstraintRef {
                                 constraint_vec_pos: *orig_idx, // index in the original constraints vec
                                 index_col_pos,
@@ -2105,7 +2095,7 @@ fn optimize_table_access(
                             .join_info
                             .as_ref()
                             .is_some_and(|ji| ji.is_outer()),
-                        hash_join_build_only_tables.contains(&table_idx),
+                        hash_join_build_only_tables.get(table_idx),
                     );
 
                     let ephemeral_index = Arc::new(ephemeral_index);
@@ -2125,8 +2115,7 @@ fn optimize_table_access(
                         .join_info
                         .as_ref()
                         .is_some_and(|join_info| join_info.is_outer());
-                    let defer_cross_table_constraints =
-                        hash_join_build_only_tables.contains(&table_idx);
+                    let defer_cross_table_constraints = hash_join_build_only_tables.get(table_idx);
                     mark_seek_constraints_consumed(
                         &constraints_per_table[table_idx].constraints,
                         constraint_refs,
@@ -2281,7 +2270,7 @@ fn optimize_table_access(
                 } = set_op
                 {
                     for term_idx in additional_consumed_terms.iter() {
-                        where_clause[*term_idx].consumed = true;
+                        where_clause[term_idx].consumed = true;
                     }
                 }
 
@@ -2390,12 +2379,11 @@ fn optimize_table_access(
         if build_table_was_prior_probe {
             continue;
         }
-        let prior_mask = TableMask::from_table_number_iter(
-            best_join_order[..probe_pos]
-                .iter()
-                .map(|member| member.original_idx),
-        );
-        let join_key_indices: HashSet<usize> = hash_join_op
+        let prior_mask = best_join_order[..probe_pos]
+            .iter()
+            .map(|member| member.original_idx)
+            .collect();
+        let join_key_indices: BitSet = hash_join_op
             .join_keys
             .iter()
             .map(|key| key.where_clause_idx)
@@ -2406,7 +2394,7 @@ fn optimize_table_access(
             if !constraint.lhs_mask.intersects(&prior_mask) {
                 continue;
             }
-            if join_key_indices.contains(&constraint.where_clause_pos.0) {
+            if join_key_indices.get(constraint.where_clause_pos.0) {
                 continue;
             }
             has_prior_constraints = true;
@@ -3447,12 +3435,14 @@ mod tests {
     fn empty_resolver<'a>(
         schema: &'a Schema,
         database_schemas: &'a RwLock<HashMap<usize, crate::sync::Arc<Schema>>>,
+        temp_database: &'a RwLock<Option<crate::connection::TempDatabase>>,
         attached_databases: &'a RwLock<DatabaseCatalog>,
         syms: &'a SymbolTable,
     ) -> Resolver<'a> {
         Resolver::new(
             schema,
             database_schemas,
+            temp_database,
             attached_databases,
             syms,
             true,
@@ -3483,7 +3473,14 @@ mod tests {
         let syms = SymbolTable::new();
         let database_schemas = RwLock::new(HashMap::default());
         let attached_databases = RwLock::new(DatabaseCatalog::new());
-        let resolver = empty_resolver(&schema, &database_schemas, &attached_databases, &syms);
+        let temp_database = RwLock::new(None);
+        let resolver = empty_resolver(
+            &schema,
+            &database_schemas,
+            &temp_database,
+            &attached_databases,
+            &syms,
+        );
 
         let expr = fn_call(
             "coalesce",
@@ -3512,7 +3509,14 @@ mod tests {
         let syms = SymbolTable::new();
         let database_schemas = RwLock::new(HashMap::default());
         let attached_databases = RwLock::new(DatabaseCatalog::new());
-        let resolver = empty_resolver(&schema, &database_schemas, &attached_databases, &syms);
+        let temp_database = RwLock::new(None);
+        let resolver = empty_resolver(
+            &schema,
+            &database_schemas,
+            &temp_database,
+            &attached_databases,
+            &syms,
+        );
 
         let expr = fn_call(
             "quote",

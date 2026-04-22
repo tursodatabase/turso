@@ -1,6 +1,6 @@
 [project]
 dependencies = [
-    "rich>=14.0.0",
+    "rich>=15.0.0",
 ]
 name = "limbo"
 readme = "README.md"

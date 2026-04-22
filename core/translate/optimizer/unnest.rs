@@ -207,6 +207,20 @@ fn try_unnest_exists(plan: &mut SelectPlan, subquery_idx: usize) -> bool {
         plan.non_from_clause_subqueries.push(inner_subquery);
     }
 
+    // The inner plan's result columns are dropped (a semi/anti-join only tests
+    // for row existence, not column values). However, those result column
+    // expressions may contain bound parameters (e.g. `SELECT ?2 AS col`).
+    // We must remember these so the emitter registers them in the program's
+    // parameter list; otherwise bind-time validation (`has_slot`) fails.
+    for rc in &inner_plan.result_columns {
+        let _ = walk_expr(&rc.expr, &mut |e: &Expr| -> Result<WalkControl> {
+            if let Expr::Variable(variable) = e {
+                plan.phantom_params.push(variable.clone());
+            }
+            Ok(WalkControl::Continue)
+        });
+    }
+
     // Replace the EXISTS/NOT EXISTS expression in the outer WHERE with a no-op (true).
     // The semi/anti-join handles the filtering.
     replace_exists_with_true(&mut plan.where_clause, where_info.where_term_idx);

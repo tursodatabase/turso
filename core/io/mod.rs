@@ -119,6 +119,21 @@ pub enum FileSyncType {
     FullFsync,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SharedWalLockKind {
+    LinuxOfd,
+    ProcessScopedFcntl,
+}
+
+pub trait SharedWalMappedRegion: Send + Sync {
+    fn ptr(&self) -> NonNull<u8>;
+    fn len(&self) -> usize;
+
+    fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
+
 pub trait File: Send + Sync {
     fn lock_file(&self, exclusive: bool) -> Result<()>;
     fn unlock_file(&self) -> Result<()>;
@@ -183,6 +198,46 @@ pub trait File: Send + Sync {
     fn punch_hole(&self, _pos: usize, _len: usize) -> Result<()> {
         panic!("punch_hole is not supported for the given IO implementation")
     }
+
+    fn shared_wal_lock_byte(
+        &self,
+        _offset: u64,
+        _exclusive: bool,
+        _kind: SharedWalLockKind,
+    ) -> Result<()> {
+        Err(crate::LimboError::InternalError(
+            "shared WAL coordination byte locking is not supported for this file".into(),
+        ))
+    }
+
+    fn shared_wal_try_lock_byte(
+        &self,
+        _offset: u64,
+        _exclusive: bool,
+        _kind: SharedWalLockKind,
+    ) -> Result<bool> {
+        Err(crate::LimboError::InternalError(
+            "shared WAL coordination byte locking is not supported for this file".into(),
+        ))
+    }
+
+    fn shared_wal_unlock_byte(&self, _offset: u64, _kind: SharedWalLockKind) -> Result<()> {
+        Err(crate::LimboError::InternalError(
+            "shared WAL coordination byte unlocking is not supported for this file".into(),
+        ))
+    }
+
+    fn shared_wal_set_len(&self, _len: u64) -> Result<()> {
+        Err(crate::LimboError::InternalError(
+            "shared WAL coordination resizing is not supported for this file".into(),
+        ))
+    }
+
+    fn shared_wal_map(&self, _offset: u64, _len: usize) -> Result<Box<dyn SharedWalMappedRegion>> {
+        Err(crate::LimboError::InternalError(
+            "shared WAL coordination memory mapping is not supported for this file".into(),
+        ))
+    }
 }
 
 pub struct TempFile {
@@ -224,21 +279,36 @@ impl TempFile {
 
     /// Creates a TempFile respecting the temp_store setting.
     /// When temp_store is Memory, uses in-memory storage.
-    /// When temp_store is Default or File, uses file-based storage.
+    /// When temp_store is Default or File, uses file-based storage when
+    /// available. In `no-fs` builds, temp storage always falls back to memory.
     pub fn with_temp_store(io: &Arc<dyn IO>, temp_store: crate::TempStore) -> Result<Self> {
         #[cfg(not(target_family = "wasm"))]
         {
-            if matches!(temp_store, crate::TempStore::Memory) {
+            #[cfg(not(feature = "fs"))]
+            {
+                let _ = (io, temp_store);
                 let memory_io = Arc::new(MemoryIO::new());
                 let memory_file =
                     memory_io.open_file("tursodb_temp_file", OpenFlags::Create, false)?;
-                return Ok(TempFile {
+                Ok(TempFile {
                     _temp_dir: None,
                     file: memory_file,
-                });
+                })
             }
-            // Fall through to file-based for Default and File modes
-            Self::new(io)
+            #[cfg(feature = "fs")]
+            {
+                if matches!(temp_store, crate::TempStore::Memory) {
+                    let memory_io = Arc::new(MemoryIO::new());
+                    let memory_file =
+                        memory_io.open_file("tursodb_temp_file", OpenFlags::Create, false)?;
+                    return Ok(TempFile {
+                        _temp_dir: None,
+                        file: memory_file,
+                    });
+                }
+                // Fall through to file-based for Default and File modes
+                Self::new(io)
+            }
         }
         #[cfg(target_family = "wasm")]
         {
@@ -269,6 +339,7 @@ bitflags! {
         const None = 0b00000000;
         const Create = 0b0000001;
         const ReadOnly = 0b0000010;
+        const NoLock = 0b0000100;
     }
 }
 
@@ -281,8 +352,17 @@ impl Default for OpenFlags {
 pub trait IO: Clock + Send + Sync {
     fn open_file(&self, path: &str, flags: OpenFlags, direct: bool) -> Result<Arc<dyn File>>;
 
+    fn open_shared_wal_file(&self, path: &str) -> Result<Arc<dyn File>> {
+        self.open_file(path, OpenFlags::Create | OpenFlags::NoLock, false)
+    }
+
     // remove_file is used in the sync-engine
     fn remove_file(&self, path: &str) -> Result<()>;
+
+    /// Whether this IO backend can back host-filesystem shared WAL coordination.
+    fn supports_shared_wal_coordination(&self) -> bool {
+        false
+    }
 
     fn step(&self) -> Result<()> {
         Ok(())

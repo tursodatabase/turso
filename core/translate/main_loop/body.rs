@@ -280,6 +280,28 @@ fn emit_loop_source<'a>(
             // Instead, we accumulate the intermediate results of all aggreagates, and evaluate any expressions that do not contain aggregates.
             for (i, agg) in plan.aggregates.iter().enumerate() {
                 let reg = start_reg + i;
+
+                // FILTER: skip AggStep if filter condition is false
+                let filter_skip_label = if let Some(filter_expr) = &agg.filter_expr {
+                    let label = program.allocate_label();
+                    let filter_reg = program.alloc_register();
+                    translate_expr(
+                        program,
+                        Some(&plan.table_references),
+                        filter_expr,
+                        filter_reg,
+                        &t_ctx.resolver,
+                    )?;
+                    program.emit_insn(Insn::IfNot {
+                        reg: filter_reg,
+                        target_pc: label,
+                        jump_if_null: true,
+                    });
+                    Some(label)
+                } else {
+                    None
+                };
+
                 translate_aggregation_step(
                     program,
                     &plan.table_references,
@@ -292,6 +314,10 @@ fn emit_loop_source<'a>(
                         .as_ref()
                         .expect("distinct aggregate context not populated");
                     program.preassign_label_to_next_insn(ctx.label_on_conflict);
+                }
+
+                if let Some(label) = filter_skip_label {
+                    program.preassign_label_to_next_insn(label);
                 }
             }
 
@@ -435,9 +461,9 @@ pub(super) fn emit_unmatched_row_conditions_and_loop<'a>(
 ) -> Result<()> {
     let has_gosub = gosub.is_some();
     let allowed_tables = {
-        let mut m = TableMask::new();
-        m.add_table(build_table_idx);
-        m.add_table(probe_table_idx);
+        let mut m = TableMask::default();
+        m.set(build_table_idx);
+        m.set(probe_table_idx);
         // When there's a gosub wrapping inner tables, we must also allow
         // conditions that reference outer tables (those appearing before the
         // hash join probe in the join order), since their cursors are valid
@@ -449,7 +475,7 @@ pub(super) fn emit_unmatched_row_conditions_and_loop<'a>(
                 .position(|j| j.original_idx == probe_table_idx)
                 .expect("probe table must be in join order");
             for join in &plan.join_order[..probe_pos] {
-                m.add_table(join.original_idx);
+                m.set(join.original_idx);
             }
         }
         m

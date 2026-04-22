@@ -1216,6 +1216,126 @@ expect {
     1|20
 }
 
+@cross-check-integrity
+test fk-deferred-update-or-replace-parent-pk-resolves-without-conflict {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE p(id INTEGER PRIMARY KEY);
+    CREATE TABLE c(id INTEGER PRIMARY KEY, pid INT REFERENCES p(id) DEFERRABLE INITIALLY DEFERRED);
+    INSERT INTO p VALUES(10);
+    BEGIN;
+    INSERT INTO c VALUES(1, 20);   -- violation
+    UPDATE OR REPLACE p SET id=20 WHERE id=10; -- resolve via parent without triggering REPLACE
+    COMMIT;
+    SELECT * FROM c;
+}
+expect {
+    1|20
+}
+
+@cross-check-integrity
+test fk-deferred-update-or-replace-parent-unique-key-resolves {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE p(id INTEGER PRIMARY KEY, u TEXT UNIQUE);
+    CREATE TABLE c(id INTEGER PRIMARY KEY, pu TEXT REFERENCES p(u) DEFERRABLE INITIALLY DEFERRED);
+    INSERT INTO p VALUES(1, 'a');
+    BEGIN;
+    INSERT INTO c VALUES(1, 'b');   -- violation: no parent with u='b'
+    UPDATE OR REPLACE p SET u='b' WHERE id=1; -- resolve via UNIQUE key change
+    COMMIT;
+    SELECT * FROM c;
+}
+expect {
+    1|b
+}
+
+@cross-check-integrity
+test fk-deferred-update-or-replace-parent-pk-conflict-does-not-clear-unrelated {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE p(id INTEGER PRIMARY KEY);
+    CREATE TABLE c(id INTEGER PRIMARY KEY, pid INT REFERENCES p(id) DEFERRABLE INITIALLY DEFERRED);
+    INSERT INTO p VALUES(10), (20);
+    INSERT INTO c VALUES(1, 20);   -- valid child of the row REPLACE will delete
+    BEGIN;
+    INSERT INTO c VALUES(2, 30);   -- unrelated violation
+    UPDATE OR REPLACE p SET id=20 WHERE id=10; -- deletes the old parent at 20, then inserts the new one
+    COMMIT;
+}
+expect error {
+}
+
+@cross-check-integrity
+test fk-deferred-update-or-replace-parent-unique-key-conflict-does-not-clear-unrelated {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE p(id INTEGER PRIMARY KEY, u TEXT UNIQUE);
+    CREATE TABLE c(id INTEGER PRIMARY KEY, pu TEXT REFERENCES p(u) DEFERRABLE INITIALLY DEFERRED);
+    INSERT INTO p VALUES(1, 'a'), (2, 'b');
+    INSERT INTO c VALUES(1, 'b');   -- valid child of the row REPLACE will delete
+    BEGIN;
+    INSERT INTO c VALUES(2, 'missing');   -- unrelated violation
+    UPDATE OR REPLACE p SET u='b' WHERE id=1; -- deletes the old parent with u='b', then inserts the new one
+    COMMIT;
+}
+expect error {
+}
+
+@cross-check-integrity
+test fk-deferred-update-or-replace-parent-unique-key-noop-does-not-clear {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE p(id INTEGER PRIMARY KEY, u TEXT UNIQUE);
+    CREATE TABLE c(id INTEGER PRIMARY KEY, pu TEXT REFERENCES p(u) DEFERRABLE INITIALLY DEFERRED);
+    INSERT INTO p VALUES(1, 'a');
+    BEGIN;
+    INSERT INTO c VALUES(1, 'b');   -- violation: no parent with u='b'
+    UPDATE OR REPLACE p SET u='a' WHERE id=1; -- no-op, must not repair the violation
+    COMMIT;
+}
+expect error {
+}
+
+@cross-check-integrity
+test fk-deferred-update-or-replace-parent-unique-key-noop-does-not-clear-unrelated {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE p(id INTEGER PRIMARY KEY, u TEXT UNIQUE);
+    CREATE TABLE c(id INTEGER PRIMARY KEY, pu TEXT REFERENCES p(u) DEFERRABLE INITIALLY DEFERRED);
+    INSERT INTO p VALUES(1, 'a');
+    INSERT INTO c VALUES(1, 'a');   -- valid child of the unchanged parent row
+    BEGIN;
+    INSERT INTO c VALUES(2, 'missing');   -- unrelated violation
+    UPDATE OR REPLACE p SET u='a' WHERE id=1; -- no-op, must not clear the unrelated violation
+    COMMIT;
+}
+expect error {
+}
+
+@cross-check-integrity
+test fk-deferred-update-or-replace-parent-pk-noop-does-not-clear {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE p(id INTEGER PRIMARY KEY);
+    CREATE TABLE c(id INTEGER PRIMARY KEY, pid INT REFERENCES p(id) DEFERRABLE INITIALLY DEFERRED);
+    INSERT INTO p VALUES(10);
+    BEGIN;
+    INSERT INTO c VALUES(1, 20);   -- violation
+    UPDATE OR REPLACE p SET id=10 WHERE id=10; -- no-op, must not repair the violation
+    COMMIT;
+}
+expect error {
+}
+
+@cross-check-integrity
+test fk-deferred-update-or-replace-parent-pk-noop-does-not-clear-unrelated {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE p(id INTEGER PRIMARY KEY);
+    CREATE TABLE c(id INTEGER PRIMARY KEY, pid INT REFERENCES p(id) DEFERRABLE INITIALLY DEFERRED);
+    INSERT INTO p VALUES(10);
+    INSERT INTO c VALUES(1, 10);   -- valid child of the unchanged parent row
+    BEGIN;
+    INSERT INTO c VALUES(2, 20);   -- unrelated violation
+    UPDATE OR REPLACE p SET id=10 WHERE id=10; -- no-op, must not clear the unrelated violation
+    COMMIT;
+}
+expect error {
+}
+
 # Two-table cycle; both inserted before COMMIT -> OK
 @cross-check-integrity
 test fk-deferred-cycle-two-tables-ok {
@@ -2864,6 +2984,167 @@ test fk-update-or-replace-cascade-on-rowid-conflict {
 }
 expect {
     1|20
+}
+
+# UPDATE OR REPLACE on rowid conflict should fire FK SET NULL on the
+# implicitly-deleted conflicting parent row before the surviving parent row is
+# updated into that key.
+@cross-check-integrity
+test fk-update-or-replace-set-null-on-rowid-conflict {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE parent(id INTEGER PRIMARY KEY, name TEXT);
+    CREATE TABLE child(
+        id INTEGER PRIMARY KEY,
+        parent_id INT REFERENCES parent(id) ON DELETE SET NULL ON UPDATE CASCADE
+    );
+    INSERT INTO parent VALUES (10, 'x'), (20, 'y');
+    INSERT INTO child VALUES (1, 10), (2, 20);
+    UPDATE OR REPLACE parent SET id = 20 WHERE id = 10;
+    SELECT * FROM child ORDER BY id;
+}
+expect {
+    1|20
+    2|
+}
+
+# UPDATE OR REPLACE on rowid conflict should fire FK SET DEFAULT on the
+# implicitly-deleted conflicting parent row before the surviving parent row is
+# updated into that key.
+@cross-check-integrity
+test fk-update-or-replace-set-default-on-rowid-conflict {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE parent(id INTEGER PRIMARY KEY, name TEXT);
+    CREATE TABLE child(
+        id INTEGER PRIMARY KEY,
+        parent_id INT DEFAULT NULL REFERENCES parent(id) ON DELETE SET DEFAULT ON UPDATE CASCADE
+    );
+    INSERT INTO parent VALUES (10, 'x'), (20, 'y');
+    INSERT INTO child VALUES (1, 10), (2, 20);
+    UPDATE OR REPLACE parent SET id = 20 WHERE id = 10;
+    SELECT * FROM child ORDER BY id;
+}
+expect {
+    1|20
+    2|
+}
+
+# UPDATE OR REPLACE on rowid conflict should honor FK RESTRICT on the
+# implicitly-deleted conflicting parent row.
+@cross-check-integrity
+test fk-update-or-replace-restrict-on-rowid-conflict {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE parent(id INTEGER PRIMARY KEY, name TEXT);
+    CREATE TABLE child(
+        id INTEGER PRIMARY KEY,
+        parent_id INT REFERENCES parent(id) ON DELETE RESTRICT ON UPDATE CASCADE
+    );
+    INSERT INTO parent VALUES (10, 'x'), (20, 'y');
+    INSERT INTO child VALUES (1, 10), (2, 20);
+    UPDATE OR REPLACE parent SET id = 20 WHERE id = 10;
+}
+expect error {
+}
+
+# UPDATE OR REPLACE on rowid conflict should still apply the child's ON UPDATE
+# action for rows that referenced the updated parent, while preserving rows
+# that referenced the surviving conflicting parent key.
+@cross-check-integrity
+test fk-update-or-replace-set-null-update-on-rowid-conflict {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE parent(id INTEGER PRIMARY KEY, name TEXT);
+    CREATE TABLE child(
+        id INTEGER PRIMARY KEY,
+        parent_id INT REFERENCES parent(id) ON DELETE NO ACTION ON UPDATE SET NULL
+    );
+    INSERT INTO parent VALUES (10, 'x'), (20, 'y');
+    INSERT INTO child VALUES (1, 10), (2, 20);
+    UPDATE OR REPLACE parent SET id = 20 WHERE id = 10;
+    SELECT * FROM child ORDER BY id;
+}
+expect {
+    1|
+    2|20
+}
+
+# UPDATE OR REPLACE on rowid conflict should still apply the child's ON UPDATE
+# action for rows that referenced the updated parent, while preserving rows
+# that referenced the surviving conflicting parent key.
+@cross-check-integrity
+test fk-update-or-replace-set-default-update-on-rowid-conflict {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE parent(id INTEGER PRIMARY KEY, name TEXT);
+    CREATE TABLE child(
+        id INTEGER PRIMARY KEY,
+        parent_id INT DEFAULT 999 REFERENCES parent(id) ON DELETE NO ACTION ON UPDATE SET DEFAULT
+    );
+    INSERT INTO parent VALUES (10, 'x'), (20, 'y'), (999, 'd');
+    INSERT INTO child VALUES (1, 10), (2, 20);
+    UPDATE OR REPLACE parent SET id = 20 WHERE id = 10;
+    SELECT * FROM child ORDER BY id;
+}
+expect {
+    1|999
+    2|20
+}
+
+# UPDATE OR REPLACE on rowid conflict should still fail when the child's
+# ON UPDATE action is NO ACTION, even if the conflicting row's ON DELETE check
+# is skipped.
+@cross-check-integrity
+test fk-update-or-replace-restrict-update-on-rowid-conflict-blocks {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE parent(id INTEGER PRIMARY KEY, name TEXT);
+    CREATE TABLE child(
+        id INTEGER PRIMARY KEY,
+        parent_id INT REFERENCES parent(id) ON DELETE CASCADE ON UPDATE RESTRICT
+    );
+    INSERT INTO parent VALUES (10, 'x'), (20, 'y');
+    INSERT INTO child VALUES (1, 10), (2, 20);
+    UPDATE OR REPLACE parent SET id = 20 WHERE id = 10;
+}
+expect error {
+}
+
+# UPDATE OR REPLACE on rowid conflict should still fail when the child's
+# ON UPDATE action is NO ACTION, even if the conflicting row's ON DELETE check
+# is skipped.
+@cross-check-integrity
+test fk-update-or-replace-no-action-update-on-rowid-conflict-blocks {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE parent(id INTEGER PRIMARY KEY, name TEXT);
+    CREATE TABLE child(
+        id INTEGER PRIMARY KEY,
+        parent_id INT REFERENCES parent(id) ON DELETE CASCADE ON UPDATE NO ACTION
+    );
+    INSERT INTO parent VALUES (10, 'x'), (20, 'y');
+    INSERT INTO child VALUES (1, 10), (2, 20);
+    UPDATE OR REPLACE parent SET id = 20 WHERE id = 10;
+}
+expect error {
+}
+
+# UPDATE OR REPLACE that retargets an INTEGER PRIMARY KEY onto an existing row.
+# This is a regression test for a case where REPLACE used to raise an immediate FK error
+# while deleting the conflicting parent row, even though the surviving parent
+# row kept the same key and the children should remain valid. The child FK only
+# declares ON UPDATE CASCADE, so the omitted ON DELETE clause still defaults to
+# NO ACTION.
+@cross-check-integrity
+test fk-update-or-replace-rowid-conflict-with-update-cascade-only {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE parent(id INTEGER PRIMARY KEY, name TEXT UNIQUE);
+    CREATE TABLE child(
+        id INTEGER PRIMARY KEY,
+        parent_id INT REFERENCES parent(id) ON UPDATE CASCADE
+    );
+    INSERT INTO parent VALUES (1, 'x'), (2, 'y');
+    INSERT INTO child VALUES (1, 1), (2, 2);
+    UPDATE OR REPLACE parent SET id = 2, name = 'z' WHERE id = 1;
+    SELECT * FROM child ORDER BY id;
+}
+expect {
+    1|2
+    2|2
 }
 
 # UPDATE OR REPLACE with NO ACTION FK should block the implicit delete

@@ -23,7 +23,7 @@ concurrency:
 jobs:
   build-ios:
     name: Build iOS libraries
-    runs-on: macos-latest
+    runs-on: blacksmith-6vcpu-macos-latest
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
@@ -125,7 +125,7 @@ jobs:
 
   build-example-ios:
     name: Build example app (iOS)
-    runs-on: macos-latest
+    runs-on: blacksmith-6vcpu-macos-latest
     timeout-minutes: 45
     needs:
       - build-ios

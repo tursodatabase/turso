@@ -17,8 +17,9 @@
 //!
 //! https://www.sqlite.org/opcode.html
 
+use crate::translate::plan::BitSet;
 use crate::types::{Extendable, Text};
-use crate::{turso_assert, turso_assert_ne, turso_debug_assert, HashSet, NonNan};
+use crate::{turso_assert, turso_assert_ne, turso_debug_assert, NonNan};
 pub mod affinity;
 pub mod array;
 pub mod bloom_filter;
@@ -31,6 +32,7 @@ pub mod insn;
 pub mod metrics;
 pub mod rowset;
 pub mod sorter;
+pub mod vacuum;
 pub mod value;
 // for benchmarks
 pub use crate::translate::collate::CollationSeq;
@@ -236,7 +238,7 @@ pub enum Register {
 
 impl Register {
     #[inline]
-    pub fn is_null(&self) -> bool {
+    pub const fn is_null(&self) -> bool {
         matches!(self, Register::Value(Value::Null))
     }
 
@@ -372,13 +374,13 @@ pub enum ProgramExecutionState {
 }
 
 impl ProgramExecutionState {
-    pub fn is_running(&self) -> bool {
+    pub const fn is_running(&self) -> bool {
         matches!(
             self,
             ProgramExecutionState::Interrupting | ProgramExecutionState::Running
         )
     }
-    pub fn is_terminal(&self) -> bool {
+    pub const fn is_terminal(&self) -> bool {
         matches!(
             self,
             ProgramExecutionState::Interrupted
@@ -471,35 +473,15 @@ pub struct ProgramState {
     /// Marker which tells about auto transaction cleanup necessary for that connection in case of reset
     /// This is used when statement in auto-commit mode reseted after previous uncomplete execution - in which case we may need to rollback transaction started on previous attempt
     pub(crate) auto_txn_cleanup: TxnCleanup,
-    /// Number of deferred foreign key violations when the statement started.
-    /// When a statement subtransaction rolls back, the connection's deferred foreign key violations counter
-    /// is reset to this value.
-    fk_deferred_violations_when_stmt_started: AtomicIsize,
-    /// Number of immediate foreign key violations that occurred during the active statement. If nonzero,
-    /// the statement subtransactionwill roll back.
-    fk_immediate_violations_during_stmt: AtomicIsize,
-    /// RowSet objects stored by register index
-    rowsets: HashMap<usize, RowSet>,
-    /// Bloom filters stored by cursor ID for probabilistic set membership testing
-    /// Used to avoid unnecessary seeks on ephemeral indexes and hash tables
-    pub(crate) bloom_filters: HashMap<usize, BloomFilter>,
-    op_hash_build_state: Option<OpHashBuildState>,
-    op_hash_probe_state: Option<OpHashProbeState>,
+    pub explain_state: RwLock<ExplainState>,
     /// Scratch buffer for [Insn::HashDistinct] to avoid per-row allocations.
     distinct_key_values: Vec<Value>,
     hash_tables: HashMap<usize, HashTable>,
     /// TempFile handles for ephemeral cursors, keyed by cursor_id.
     /// Dropping removes the temp file from disk.
     ephemeral_temp_files: HashMap<usize, TempFile>,
-    uses_subjournal: bool,
-    /// Whether this statement is an active write inside an explicit transaction.
-    pub(crate) is_active_write: bool,
-    /// Whether begin_statement was called (savepoint + FK bookkeeping active).
-    has_stmt_transaction: bool,
     /// Attached pagers that have open savepoints for statement rollback.
     attached_savepoint_pagers: Vec<Arc<Pager>>,
-    pub n_change: AtomicI64,
-    pub explain_state: RwLock<ExplainState>,
     /// Pending error to return after FAIL mode commit completes.
     /// When a constraint error occurs with FAIL resolve type in autocommit mode,
     /// we need to commit partial changes before returning the error.
@@ -515,6 +497,26 @@ pub struct ProgramState {
     /// Cached subprogram Statements keyed by the PC of the Program instruction.
     /// Avoids re-allocating ProgramState on each trigger/FK-action fire.
     pub(crate) subprogram_stmt_cache: HashMap<usize, Box<Statement>>,
+    /// RowSet objects stored by register index
+    rowsets: HashMap<usize, RowSet>,
+    /// Bloom filters stored by cursor ID for probabilistic set membership testing
+    /// Used to avoid unnecessary seeks on ephemeral indexes and hash tables
+    pub(crate) bloom_filters: HashMap<usize, BloomFilter>,
+    op_hash_build_state: Option<OpHashBuildState>,
+    op_hash_probe_state: Option<OpHashProbeState>,
+    /// Number of deferred foreign key violations when the statement started.
+    /// When a statement subtransaction rolls back, the connection's deferred foreign key violations counter
+    /// is reset to this value.
+    fk_deferred_violations_when_stmt_started: AtomicIsize,
+    /// Number of immediate foreign key violations that occurred during the active statement. If nonzero,
+    /// the statement subtransactionwill roll back.
+    fk_immediate_violations_during_stmt: AtomicIsize,
+    uses_subjournal: bool,
+    /// Whether this statement is an active write inside an explicit transaction.
+    pub(crate) is_active_write: bool,
+    /// Whether begin_statement was called (savepoint + FK bookkeeping active).
+    has_stmt_transaction: bool,
+    pub n_change: AtomicI64,
 }
 
 impl std::fmt::Debug for Program {
@@ -889,8 +891,10 @@ impl ProgramState {
                         }
                     });
                     Ok(())
-                } else if self.uses_subjournal {
-                    pager.release_savepoint()?;
+                } else if self.uses_subjournal || !attached_pagers.is_empty() {
+                    if self.uses_subjournal {
+                        pager.release_savepoint()?;
+                    }
                     for p in &attached_pagers {
                         p.release_savepoint()?;
                     }
@@ -932,6 +936,14 @@ impl ProgramState {
                         }
                         Err(e) => Some(e),
                     }
+                } else if !attached_pagers.is_empty() {
+                    let mut err = None;
+                    for p in &attached_pagers {
+                        if let Err(e) = p.rollback_to_newest_savepoint() {
+                            err = Some(e);
+                        }
+                    }
+                    err
                 } else {
                     None
                 };
@@ -1101,9 +1113,9 @@ pub struct PreparedProgram {
     pub resolve_type: ResolveType,
     pub prepare_context: PrepareContext,
     /// Set of attached database indices that need write transactions.
-    pub write_databases: HashSet<usize>,
+    pub write_databases: BitSet,
     /// Set of attached database indices that need read transactions.
-    pub read_databases: HashSet<usize>,
+    pub read_databases: BitSet,
 }
 
 #[derive(Clone)]
@@ -1163,7 +1175,7 @@ impl PreparedProgram {
     }
 
     #[inline]
-    pub fn is_readonly(&self) -> bool {
+    pub const fn is_readonly(&self) -> bool {
         self.readonly
     }
 }
@@ -1188,7 +1200,7 @@ impl Program {
 }
 
 impl Program {
-    fn get_pager_from_database_index(&self, idx: &usize) -> Arc<Pager> {
+    fn get_pager_from_database_index(&self, idx: &usize) -> Result<Arc<Pager>> {
         self.connection.get_pager_from_database_index(idx)
     }
 
@@ -1621,11 +1633,19 @@ impl Program {
         if tx_state == TransactionState::None
             && matches!(program_state.commit_state, CommitState::Ready)
         {
-            // No active transaction and no in-progress commit — nothing to do.
-            // Attached MVCC transactions are only started after the main DB's
-            // Transaction opcode runs, so tx_state==None implies no attached
-            // MVCC txs either.
-            return Ok(IOResult::Done(()));
+            // No main transaction and no in-progress commit — check whether
+            // any attached/temp database still has an active transaction before
+            // bailing out. Defer these checks to here so the common case
+            // (active main transaction) doesn't pay for the lock reads.
+            let has_attached_mv_tx = self.connection.next_attached_mv_tx().is_some();
+            let has_attached_wal_tx =
+                self.connection
+                    .with_all_attached_pagers_with_index(|pagers| {
+                        pagers.iter().any(|(_, pager)| pager.holds_read_lock())
+                    });
+            if !has_attached_mv_tx && !has_attached_wal_tx {
+                return Ok(IOResult::Done(()));
+            }
         }
         if self.connection.is_nested_stmt() {
             // We don't want to commit on nested statements. Let parent handle it.
@@ -1636,9 +1656,25 @@ impl Program {
         } else {
             self.commit_txn_wal(pager, program_state, rollback)
         }?;
-        if !res.is_io() && self.change_cnt_on {
-            self.connection
-                .set_changes(program_state.n_change.load(Ordering::SeqCst));
+        if !res.is_io() {
+            if self.change_cnt_on {
+                self.connection
+                    .set_changes(program_state.n_change.load(Ordering::SeqCst));
+            }
+            let transaction_finished = self.connection.auto_commit.load(Ordering::SeqCst)
+                && self.connection.get_tx_state() == TransactionState::None;
+            if transaction_finished {
+                // Finalize the in-memory TEMP schema only when the outer
+                // transaction actually finishes. Updating the committed temp
+                // snapshot after every statement inside an explicit
+                // transaction would make a later full ROLLBACK restore
+                // uncommitted temp DDL.
+                if rollback {
+                    self.connection.rollback_temp_schema();
+                } else {
+                    self.connection.commit_temp_schema();
+                }
+            }
         }
         Ok(res)
     }
@@ -1698,7 +1734,17 @@ impl Program {
                     self.end_attached_read_txns(&connection);
                     Ok(IOResult::Done(()))
                 }
-                TransactionState::None => Ok(IOResult::Done(())),
+                TransactionState::None => {
+                    match self.end_attached_write_txns(&connection, rollback)? {
+                        IOResult::Done(_) => {}
+                        IOResult::IO(io) => {
+                            program_state.commit_state = CommitState::CommittingAttached;
+                            return Ok(IOResult::IO(io));
+                        }
+                    }
+                    self.end_attached_read_txns(&connection);
+                    Ok(IOResult::Done(()))
+                }
                 TransactionState::PendingUpgrade { .. } => {
                     panic!("Unexpected transaction state: {tx_state:?} during auto-commit",)
                 }
@@ -1784,8 +1830,10 @@ impl Program {
             };
             match step_result {
                 IOResult::Done(_) => {
-                    let attached_pager = conn.get_pager_from_database_index(&db_id);
-                    conn.publish_attached_schema(db_id);
+                    let attached_pager = conn
+                        .get_pager_from_database_index(&db_id)
+                        .expect("attached MVCC transaction should always have a pager");
+                    conn.publish_database_schema(db_id);
                     conn.set_mv_tx_for_db(db_id, None);
                     attached_pager.end_read_tx();
                     // Fall through to look for more
@@ -1819,8 +1867,10 @@ impl Program {
             };
             match state_machine.step(&attached_mv_store)? {
                 IOResult::Done(_) => {
-                    let attached_pager = conn.get_pager_from_database_index(&db_id);
-                    conn.publish_attached_schema(db_id);
+                    let attached_pager = conn
+                        .get_pager_from_database_index(&db_id)
+                        .expect("attached MVCC transaction should always have a pager");
+                    conn.publish_database_schema(db_id);
                     conn.set_mv_tx_for_db(db_id, None);
                     attached_pager.end_read_tx();
                     continue;
@@ -1930,51 +1980,63 @@ impl Program {
         connection: &Connection,
         rollback: bool,
     ) -> Result<IOResult<()>> {
-        let pagers = connection.get_all_attached_pagers_with_index();
-        for (db_id, attached_pager) in pagers {
-            // MVCC-enabled attached DBs are committed in commit_txn_mvcc phase 2
-            if connection.mv_store_for_db(db_id).is_some() {
-                continue;
-            }
-            if !attached_pager.holds_write_lock() {
-                continue;
-            }
-            if !rollback {
-                // Commit dirty pages to WAL, then end write+read transactions.
-                // We disable auto-checkpoint and avoid pager.commit_tx() since
-                // the checkpoint logic can leave read locks held.
-                match attached_pager.commit_dirty_pages(true, SyncMode::Normal, false) {
-                    Ok(IOResult::Done(_)) => {}
-                    Ok(IOResult::IO(io)) => {
-                        // IO pending — return so the caller can yield and re-enter.
-                        // commit_dirty_pages tracks its own internal state, so calling
-                        // it again on re-entry will resume correctly.
-                        return Ok(IOResult::IO(io));
-                    }
-                    Err(e) => return Err(e),
+        connection.with_all_attached_pagers_with_index(|pagers| {
+            for (db_id, attached_pager) in pagers {
+                let db_id = *db_id;
+                // MVCC-enabled attached DBs are committed in commit_txn_mvcc phase 2
+                if connection.mv_store_for_db(db_id).is_some() {
+                    continue;
                 }
-                // WAL commit succeeded — publish the connection-local schema
-                // changes to the shared Database so other connections can see them.
-                connection.publish_attached_schema(db_id);
-                attached_pager.end_write_tx();
-                attached_pager.end_read_tx();
-                attached_pager.commit_dirty_pages_end();
-            } else {
-                // Discard any local schema changes on rollback
-                connection.database_schemas().write().remove(&db_id);
-                attached_pager.rollback_attached();
+                if !attached_pager.holds_write_lock() {
+                    continue;
+                }
+                if !rollback {
+                    // Commit dirty pages to WAL, then end write+read transactions.
+                    // We disable auto-checkpoint and avoid pager.commit_tx() since
+                    // the checkpoint logic can leave read locks held.
+                    match attached_pager.commit_dirty_pages(true, SyncMode::Normal, false) {
+                        Ok(IOResult::Done(_)) => {}
+                        Ok(IOResult::IO(io)) => {
+                            // IO pending — return so the caller can yield and re-enter.
+                            // commit_dirty_pages tracks its own internal state, so calling
+                            // it again on re-entry will resume correctly.
+                            return Ok(IOResult::IO(io));
+                        }
+                        Err(e) => return Err(e),
+                    }
+                    // WAL commit succeeded — publish the connection-local schema
+                    // changes to the shared Database so other connections can see them.
+                    connection.publish_database_schema(db_id);
+                    attached_pager.end_write_tx();
+                    attached_pager.end_read_tx();
+                    attached_pager.commit_dirty_pages_end();
+                } else {
+                    // Discard any local schema changes on rollback
+                    connection.database_schemas().write().remove(&db_id);
+                    attached_pager.rollback_attached();
+                }
             }
-        }
-        Ok(IOResult::Done(()))
+            Ok(IOResult::Done(()))
+        })
     }
 
     /// End read transactions on all attached databases that had transactions started.
     fn end_attached_read_txns(&self, connection: &Connection) {
-        for attached_pager in connection.get_all_attached_pagers() {
-            if attached_pager.holds_read_lock() {
-                attached_pager.end_read_tx();
-            }
-        }
+        connection.with_all_attached_pagers_with_index(|pagers| {
+            pagers.iter().for_each(|(db_id, attached_pager)| {
+                if connection.mv_store_for_db(*db_id).is_some() {
+                    // MVCC-enabled attached DBs don't use WAL read transactions, so skip.
+                    return;
+                }
+                if attached_pager.holds_write_lock() {
+                    // Attached pager has a write lock, so its read transaction was ended by end_attached_write_txns: skip.
+                    return;
+                }
+                if attached_pager.holds_read_lock() {
+                    attached_pager.end_read_tx();
+                }
+            });
+        })
     }
 
     #[instrument(skip(self, commit_state, mv_store), level = Level::DEBUG)]
@@ -2007,6 +2069,11 @@ impl Program {
         }
 
         let mut abort_error: Option<LimboError> = None;
+
+        // VACUUM INTO state can own internal helper statements whose drop path
+        // releases nested guards. Drop them before checking whether this program
+        // is itself nested; otherwise abort could skip top-level cleanup.
+        state.op_vacuum_into_state = None;
 
         // Only end trigger execution if the subprogram was actually running.
         // Cached (pooled) statements may be dropped after their trigger execution
@@ -2060,6 +2127,7 @@ impl Program {
                     if self.connection.get_auto_commit() {
                         self.rollback_current_txn(pager);
                     }
+                    self.connection.set_changes_without_total(0);
                 }
                 // Constraint and RAISE errors: behavior depends on the effective resolve type.
                 // For normal constraints, the resolve type comes from the statement (ON CONFLICT).
@@ -2146,6 +2214,11 @@ impl Program {
                             }
                         }
                     }
+                    let last_change = match effective_resolve {
+                        ResolveType::Fail => state.n_change.load(Ordering::SeqCst),
+                        _ => 0,
+                    };
+                    self.connection.set_changes_without_total(last_change);
                 }
                 Some(LimboError::RaiseIgnore) => {
                     tracing::error!(
@@ -2175,19 +2248,7 @@ impl Program {
     }
 
     fn rollback_current_txn(&self, pager: &Arc<Pager>) {
-        if let Some(mv_store) = self.connection.mv_store().as_ref() {
-            if let Some(tx_id) = self.connection.get_mv_tx_id() {
-                self.connection.auto_commit.store(true, Ordering::SeqCst);
-                mv_store.rollback_tx(tx_id, pager.clone(), &self.connection, crate::MAIN_DB_ID);
-            }
-            pager.end_read_tx();
-            self.connection.rollback_attached_mvcc_txs(true);
-        } else {
-            pager.rollback_tx(&self.connection);
-            self.connection.auto_commit.store(true, Ordering::SeqCst);
-        }
-        self.connection.rollback_attached_wal_txns();
-        self.connection.set_tx_state(TransactionState::None);
+        self.connection.rollback_current_txn_state(pager, true);
     }
 
     pub fn is_trigger_subprogram(&self) -> bool {

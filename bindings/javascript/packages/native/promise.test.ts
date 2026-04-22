@@ -270,6 +270,45 @@ test('blobs', async () => {
     expect(rows).toEqual([{ x: Buffer.from([16, 32]) }])
 })
 
+test('encryption', async () => {
+    const path = `test-encryption-${(Math.random() * 10000) | 0}.db`;
+    const hexkey = 'b1bbfda4f589dc9daaf004fe21111e00dc00c98237102f5c7002a5669fc76327';
+    const wrongKey = 'aaaaaaa4f589dc9daaf004fe21111e00dc00c98237102f5c7002a5669fc76327';
+    try {
+        const db = await connect(path, {
+            encryption: { cipher: 'aegis256', hexkey }
+        });
+        await db.exec("CREATE TABLE t(x)");
+        await db.exec("INSERT INTO t SELECT 'secret' FROM generate_series(1, 1024)");
+        await db.exec("PRAGMA wal_checkpoint(truncate)");
+        db.close();
+
+        // Re-open with the same key - should work
+        const db2 = await connect(path, {
+            encryption: { cipher: 'aegis256', hexkey }
+        });
+        const rows = await db2.prepare("SELECT COUNT(*) as cnt FROM t").all();
+        expect(rows).toEqual([{ cnt: 1024 }]);
+        db2.close();
+
+        // Opening with wrong key MUST fail
+        await expect(async () => {
+            const db3 = await connect(path, {
+                encryption: { cipher: 'aegis256', hexkey: wrongKey }
+            });
+            await db3.prepare("SELECT * FROM t").all();
+        }).rejects.toThrow();
+
+        // Opening without encryption MUST fail
+        await expect(async () => {
+            const db4 = await connect(path);
+            await db4.prepare("SELECT * FROM t").all();
+        }).rejects.toThrow();
+    } finally {
+        unlinkSync(path);
+    }
+})
+
 
 test('example-1', async () => {
     const db = await connect(':memory:');

@@ -366,7 +366,7 @@ fn expression_matches_table(
             .joined_tables()
             .iter()
             .position(|t| t.internal_id == table_reference.internal_id)
-            .is_some_and(|idx| mask.contains_table(idx) && mask.table_count() == 1),
+            .is_some_and(|idx| mask.get(idx) && mask.count() == 1),
         Err(_) => false,
     }
 }
@@ -627,9 +627,9 @@ pub fn constraints_from_where_clause(
             // Handle IN list: col IN (val1, val2, ...)
             if let ast::Expr::InList { lhs, not, rhs } = &term.expr {
                 let estimated_values = rhs.len() as f64;
-                let mut rhs_mask = TableMask::new();
+                let mut rhs_mask = TableMask::default();
                 for rhs_expr in rhs.iter() {
-                    rhs_mask |= table_mask_from_expr(rhs_expr, table_references, subqueries)?;
+                    rhs_mask |= &table_mask_from_expr(rhs_expr, table_references, subqueries)?;
                 }
                 let table_stats = schema
                     .analyze_stats
@@ -719,7 +719,7 @@ pub fn constraints_from_where_clause(
                                 table_col_pos: Some(*column),
                                 expr: None,
                                 constraining_expr: None,
-                                lhs_mask: TableMask::new(), // non-correlated = no dependencies
+                                lhs_mask: TableMask::default(), // non-correlated = no dependencies
                                 selectivity,
                                 usable: false, // IN uses a separate seek path (consider_in_list_seek)
                                 is_rowid,
@@ -735,7 +735,7 @@ pub fn constraints_from_where_clause(
                                 table_col_pos: rowid_alias_column,
                                 expr: None,
                                 constraining_expr: None,
-                                lhs_mask: TableMask::new(),
+                                lhs_mask: TableMask::default(),
                                 selectivity,
                                 usable: false,
                                 is_rowid: true,
@@ -1001,7 +1001,7 @@ pub fn usable_constraints_for_lhs_mask(
     let mut current_required_column_pos = 0;
     for cref in refs.iter() {
         let constraint = &constraints[cref.constraint_vec_pos];
-        let other_side_refers_to_self = constraint.lhs_mask.contains_table(table_idx);
+        let other_side_refers_to_self = constraint.lhs_mask.get(table_idx);
         if other_side_refers_to_self {
             // Self-referential constraints cannot seed a lookup, but if they are
             // on a later index column they also terminate the usable prefix.
@@ -1010,7 +1010,7 @@ pub fn usable_constraints_for_lhs_mask(
             }
             continue;
         }
-        if !lhs_mask.contains_all(&constraint.lhs_mask) {
+        if !lhs_mask.contains_all_set_bits_of(&constraint.lhs_mask) {
             // Join-dependent constraints are only usable when every referenced
             // outer table is already on the left side of the join order. As
             // above, a missing earlier prefix column terminates the prefix.
@@ -1114,12 +1114,11 @@ pub fn usable_constraints_for_join_order<'a>(
     turso_debug_assert!(refs.is_sorted_by_key(|x| x.index_col_pos));
 
     let table_idx = join_order.last().unwrap().original_idx;
-    let lhs_mask = TableMask::from_table_number_iter(
-        join_order
-            .iter()
-            .take(join_order.len() - 1)
-            .map(|j| j.original_idx),
-    );
+    let lhs_mask = join_order
+        .iter()
+        .take(join_order.len() - 1)
+        .map(|j| j.original_idx)
+        .collect();
     usable_constraints_for_lhs_mask(constraints, refs, &lhs_mask, table_idx)
 }
 
@@ -1181,22 +1180,22 @@ pub fn convert_to_vtab_constraint(
     join_order: &[JoinOrderMember],
 ) -> Vec<ConstraintInfo> {
     let table_idx = join_order.last().unwrap().original_idx;
-    let lhs_mask = TableMask::from_table_number_iter(
-        join_order
-            .iter()
-            .take(join_order.len() - 1)
-            .map(|j| j.original_idx),
-    );
+    let lhs_mask: TableMask = join_order
+        .iter()
+        .take(join_order.len() - 1)
+        .map(|j| j.original_idx)
+        .collect();
     constraints
         .iter()
         .enumerate()
         .filter_map(|(i, constraint)| {
             let table_col_pos = constraint.table_col_pos?;
-            let other_side_refers_to_self = constraint.lhs_mask.contains_table(table_idx);
+            let other_side_refers_to_self = constraint.lhs_mask.get(table_idx);
             if other_side_refers_to_self {
                 return None;
             }
-            let all_required_tables_are_on_left_side = lhs_mask.contains_all(&constraint.lhs_mask);
+            let all_required_tables_are_on_left_side =
+                lhs_mask.contains_all_set_bits_of(&constraint.lhs_mask);
             to_ext_constraint_op(&constraint.operator).map(|op| ConstraintInfo {
                 column_index: table_col_pos as u32,
                 op,
@@ -1252,26 +1251,32 @@ pub struct AnalyzedTerm {
     pub constraint_refs: Vec<RangeConstraintRef>,
 }
 
-/// Analyzes a single binary expression to determine if it can use an index.
-///
-/// This is a shared helper for both OR and AND multi-index analysis.
-/// Returns `Some(AnalyzedTerm)` if the expression is a usable indexed constraint,
-/// `None` otherwise.
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn analyze_binary_term_for_index(
-    expr: &ast::Expr,
-    where_term_idx: usize,
+/// Lightweight prepass result for a binary term that can seed a multi-index branch.
+#[derive(Debug, Clone)]
+pub struct IndexableTermSummary {
+    /// The constrained table column, if any.
+    pub table_col_pos: Option<usize>,
+    /// The other tables referenced by the constraining expression.
+    pub lhs_mask: TableMask,
+    /// The chosen index for this term, or `None` for rowid access.
+    pub best_index: Option<Arc<Index>>,
+}
+
+struct BinaryTermIndexInfo<'a> {
+    lhs: &'a ast::Expr,
+    rhs: &'a ast::Expr,
+    operator: ConstraintOperator,
+    table_col_pos: Option<usize>,
+    constraining_expr: &'a ast::Expr,
+    side: BinaryExprSide,
+    is_rowid: bool,
+}
+
+fn analyze_binary_term_index_info<'a>(
+    expr: &'a ast::Expr,
     table_id: TableInternalId,
-    table_reference: &JoinedTable,
-    indexes: Option<&VecDeque<Arc<Index>>>,
     rowid_alias_column: Option<usize>,
-    available_indexes: &HashMap<String, VecDeque<Arc<Index>>>,
-    table_references: &TableReferences,
-    subqueries: &[NonFromClauseSubquery],
-    schema: &Schema,
-    params: &CostModelParams,
-) -> Option<AnalyzedTerm> {
-    // Try to extract a binary comparison
+) -> Option<BinaryTermIndexInfo<'a>> {
     let (lhs, operator, rhs) = as_binary_components(expr).ok().flatten()?;
 
     // Check if the operator is usable for index seeks
@@ -1293,17 +1298,17 @@ pub(crate) fn analyze_binary_term_for_index(
     // Check if this is an indexable constraint on our table
     let (table_col_pos, constraining_expr, side, is_rowid) = match lhs {
         ast::Expr::Column { table, column, .. } if *table == table_id => {
-            (Some(*column), rhs.clone(), BinaryExprSide::Rhs, false)
+            (Some(*column), rhs, BinaryExprSide::Rhs, false)
         }
         ast::Expr::RowId { table, .. } if *table == table_id => {
-            (rowid_alias_column, rhs.clone(), BinaryExprSide::Rhs, true)
+            (rowid_alias_column, rhs, BinaryExprSide::Rhs, true)
         }
         _ => match rhs {
             ast::Expr::Column { table, column, .. } if *table == table_id => {
-                (Some(*column), lhs.clone(), BinaryExprSide::Lhs, false)
+                (Some(*column), lhs, BinaryExprSide::Lhs, false)
             }
             ast::Expr::RowId { table, .. } if *table == table_id => {
-                (rowid_alias_column, lhs.clone(), BinaryExprSide::Lhs, true)
+                (rowid_alias_column, lhs, BinaryExprSide::Lhs, true)
             }
             _ => return None, // Doesn't reference our table
         },
@@ -1316,6 +1321,93 @@ pub(crate) fn analyze_binary_term_for_index(
     } else {
         operator
     };
+
+    Some(BinaryTermIndexInfo {
+        lhs,
+        rhs,
+        operator,
+        table_col_pos,
+        constraining_expr,
+        side,
+        is_rowid,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn summarize_binary_term_for_index(
+    expr: &ast::Expr,
+    table_id: TableInternalId,
+    indexes: Option<&VecDeque<Arc<Index>>>,
+    rowid_alias_column: Option<usize>,
+    table_references: &TableReferences,
+    subqueries: &[NonFromClauseSubquery],
+) -> Option<IndexableTermSummary> {
+    let BinaryTermIndexInfo {
+        operator,
+        table_col_pos,
+        constraining_expr,
+        is_rowid,
+        ..
+    } = analyze_binary_term_index_info(expr, table_id, rowid_alias_column)?;
+
+    let (best_index, constraint_refs) = find_best_index_for_constraint(
+        table_col_pos,
+        operator,
+        indexes,
+        rowid_alias_column,
+        is_rowid,
+    );
+    if constraint_refs.is_empty() {
+        return None;
+    }
+
+    let lhs_mask = table_mask_from_expr(constraining_expr, table_references, subqueries)
+        .unwrap_or_else(|_| TableMask::default());
+
+    let table_pos = table_references
+        .joined_tables()
+        .iter()
+        .position(|t| t.internal_id == table_id)
+        .expect("target table must exist in table_references");
+    if lhs_mask.get(table_pos) {
+        return None;
+    }
+
+    Some(IndexableTermSummary {
+        table_col_pos,
+        lhs_mask,
+        best_index,
+    })
+}
+
+/// Analyzes a single binary expression to determine if it can use an index.
+///
+/// This is a shared helper for both OR and AND multi-index analysis.
+/// Returns `Some(AnalyzedTerm)` if the expression is a usable indexed constraint,
+/// `None` otherwise.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn analyze_binary_term_for_index(
+    expr: &ast::Expr,
+    where_term_idx: usize,
+    table_id: TableInternalId,
+    table_reference: &JoinedTable,
+    indexes: Option<&VecDeque<Arc<Index>>>,
+    rowid_alias_column: Option<usize>,
+    available_indexes: &HashMap<String, VecDeque<Arc<Index>>>,
+    table_references: &TableReferences,
+    subqueries: &[NonFromClauseSubquery],
+    schema: &Schema,
+    params: &CostModelParams,
+) -> Option<AnalyzedTerm> {
+    let BinaryTermIndexInfo {
+        lhs,
+        rhs,
+        operator,
+        table_col_pos,
+        constraining_expr,
+        side,
+        is_rowid,
+    } = analyze_binary_term_index_info(expr, table_id, rowid_alias_column)?;
 
     // Find the best index for this constraint
     let (best_index, constraint_refs) = find_best_index_for_constraint(
@@ -1343,8 +1435,8 @@ pub(crate) fn analyze_binary_term_for_index(
         is_rowid,
     );
 
-    let lhs_mask = table_mask_from_expr(&constraining_expr, table_references, subqueries)
-        .unwrap_or_else(|_| TableMask::new());
+    let lhs_mask = table_mask_from_expr(constraining_expr, table_references, subqueries)
+        .unwrap_or_else(|_| TableMask::default());
 
     // Cannot use index seek if the constraining expression references the same table
     // being scanned, since the expression value varies per row and cannot be evaluated
@@ -1355,7 +1447,7 @@ pub(crate) fn analyze_binary_term_for_index(
         .iter()
         .position(|t| t.internal_id == table_id)
     {
-        if lhs_mask.contains_table(table_pos) {
+        if lhs_mask.get(table_pos) {
             return None;
         }
     }

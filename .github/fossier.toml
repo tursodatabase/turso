@@ -16,6 +16,10 @@ label = "fossier:spam-likely"
 comment = true
 label = "fossier:needs-review"
 
+[actions.allow]
+comment = true
+label = "fossier:verified"
+
 [weights]
 prior_interaction = 0.3
 
@@ -24,7 +28,9 @@ url = "https://registry.fossier.io"
 report_denials = true
 check_before_scoring = true
 block_threshold = 3
+report_score_denials = false
 
 [trust]
 flood_threshold = 4
 flood_window_hours = 1
+bot_policy = 'allow'

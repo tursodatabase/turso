@@ -81,14 +81,23 @@ pub struct IndexMethodCostEstimate {
 /// cursor opened for index method and capable of executing DML/DDL/DQL queries for the index method over fixed table
 pub trait IndexMethodCursor {
     /// create necessary components for index method (usually, this is a bunch of btree-s)
-    fn create(&mut self, connection: &Arc<Connection>) -> Result<IOResult<()>>;
+    fn create(&mut self, connection: &Arc<Connection>, database_id: usize) -> Result<IOResult<()>>;
     /// destroy components created in the create(...) call for index method
-    fn destroy(&mut self, connection: &Arc<Connection>) -> Result<IOResult<()>>;
+    fn destroy(&mut self, connection: &Arc<Connection>, database_id: usize)
+        -> Result<IOResult<()>>;
 
     /// open necessary components for reading the index
-    fn open_read(&mut self, connection: &Arc<Connection>) -> Result<IOResult<()>>;
+    fn open_read(
+        &mut self,
+        connection: &Arc<Connection>,
+        database_id: usize,
+    ) -> Result<IOResult<()>>;
     /// open necessary components for writing the index
-    fn open_write(&mut self, connection: &Arc<Connection>) -> Result<IOResult<()>>;
+    fn open_write(
+        &mut self,
+        connection: &Arc<Connection>,
+        database_id: usize,
+    ) -> Result<IOResult<()>>;
 
     /// handle insert action
     /// "values" argument contains registers with values for index columns followed by rowid Integer register
@@ -140,7 +149,11 @@ pub trait IndexMethodCursor {
     }
 
     /// Optimize the index by merging segments or performing other maintenance.
-    fn optimize(&mut self, _connection: &Arc<Connection>) -> Result<IOResult<()>> {
+    fn optimize(
+        &mut self,
+        _connection: &Arc<Connection>,
+        _database_id: usize,
+    ) -> Result<IOResult<()>> {
         Ok(IOResult::Done(()))
     }
 
@@ -159,10 +172,13 @@ pub trait IndexMethodCursor {
 }
 
 /// helper method to open table BTree cursor in the index method implementation
-pub(crate) fn open_table_cursor(connection: &Connection, table: &str) -> Result<BTreeCursor> {
-    let pager = connection.pager.load().clone();
-    let schema = connection.schema.read();
-    let Some(table) = schema.get_table(table) else {
+pub(crate) fn open_table_cursor(
+    connection: &Connection,
+    database_id: usize,
+    table: &str,
+) -> Result<BTreeCursor> {
+    let pager = connection.get_pager_from_database_index(&database_id)?;
+    let Some(table) = connection.with_schema(database_id, |schema| schema.get_table(table)) else {
         return Err(LimboError::InternalError(format!(
             "table {table} not found",
         )));
@@ -174,13 +190,15 @@ pub(crate) fn open_table_cursor(connection: &Connection, table: &str) -> Result<
 /// helper method to open index BTree cursor in the index method implementation
 pub(crate) fn open_index_cursor(
     connection: &Connection,
+    database_id: usize,
     table: &str,
     index: &str,
     keys: Vec<KeyInfo>,
 ) -> Result<BTreeCursor> {
-    let pager = connection.pager.load().clone();
-    let schema = connection.schema.read();
-    let Some(scratch) = schema.get_index(table, index) else {
+    let pager = connection.get_pager_from_database_index(&database_id)?;
+    let Some(scratch) = connection.with_schema(database_id, |schema| {
+        schema.get_index(table, index).cloned()
+    }) else {
         return Err(LimboError::InternalError(format!(
             "index {index} for table {table} not found",
         )));

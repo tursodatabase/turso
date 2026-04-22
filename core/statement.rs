@@ -18,12 +18,12 @@ use crate::{
     parameters,
     schema::Trigger,
     stats::refresh_analyze_stats,
-    translate::{self, display::PlanContext, emitter::TransactionMode},
+    translate::{self, display::PlanContext, emitter::TransactionMode, plan::BitSet},
     vdbe::{
         self,
         explain::{EXPLAIN_COLUMNS_TYPE, EXPLAIN_QUERY_PLAN_COLUMNS_TYPE},
     },
-    LimboError, MvStore, Pager, QueryMode, Result, Value, EXPLAIN_COLUMNS,
+    LimboError, MvStore, Pager, QueryMode, Result, TransactionState, Value, EXPLAIN_COLUMNS,
     EXPLAIN_QUERY_PLAN_COLUMNS,
 };
 
@@ -323,6 +323,19 @@ impl Statement {
             if !matches!(res, Err(LimboError::SchemaUpdated)) {
                 break;
             }
+            // In a write transaction, reprepare may not help (e.g. cross-process
+            // schema change where the in-memory schema hasn't been refreshed from
+            // disk). Allow a few retries for the in-process case where reprepare
+            // *can* resolve the issue, but bail early to avoid burning 50 attempts.
+            if attempt >= 2
+                && !self.program.connection.get_auto_commit()
+                && matches!(
+                    self.program.connection.get_tx_state(),
+                    TransactionState::Write { .. } | TransactionState::PendingUpgrade { .. }
+                )
+            {
+                break;
+            }
             tracing::debug!("reprepare: attempt={}", attempt);
             if let Err(err) = self.reprepare() {
                 self.release_active_root_if_counted();
@@ -490,26 +503,52 @@ impl Statement {
     fn reprepare(&mut self) -> Result<()> {
         tracing::trace!("repreparing statement");
         let conn = self.program.connection.clone();
+        let main_pager = conn.pager.load().clone();
+
+        // SchemaUpdated bypasses the normal abort rollback path, so in
+        // autocommit mode we must unwind any implicit transaction state here
+        // before reparsing. This must clear both pager locks and MVCC tx ids;
+        // otherwise the retried statement can stack a fresh snapshot on top of
+        // leaked transaction state from the failed attempt.
+        let attached_leaked = conn.with_all_attached_pagers_with_index(|pagers| {
+            pagers
+                .iter()
+                .any(|(_, pager)| pager.holds_write_lock() || pager.holds_read_lock())
+        });
+        let has_implicit_txn_state = conn.get_tx_state() != TransactionState::None
+            || conn.get_mv_tx().is_some()
+            || conn.next_attached_mv_tx().is_some()
+            || attached_leaked
+            || self.state.auto_txn_cleanup != vdbe::TxnCleanup::None;
+        if conn.get_auto_commit() && has_implicit_txn_state {
+            conn.rollback_current_txn_state(&main_pager, true);
+            self.state.auto_txn_cleanup = vdbe::TxnCleanup::None;
+        }
+        if conn.get_auto_commit() {
+            conn.maybe_reparse_schema()?;
+        }
 
         // End transactions on attached database pagers so they get a fresh view
         // of the database. Without this, the pager would still see the old page 1
         // with the stale schema cookie, causing an infinite SchemaUpdated loop.
         // SchemaUpdated can occur at different points in the Transaction opcode,
         // so the attached pager may or may not hold locks at this point.
-        let attached_db_ids: Vec<usize> = self
+        let attached_db_ids: BitSet = self
             .program
             .prepared
             .write_databases
             .iter()
             .chain(self.program.prepared.read_databases.iter())
-            .filter(|&&id| crate::is_attached_db(id))
-            .copied()
+            .filter(|&id| id != crate::MAIN_DB_ID)
             .collect();
-        for db_id in attached_db_ids {
-            let pager = conn.get_pager_from_database_index(&db_id);
-            // Discard any connection-local schema changes for this attached DB
-            // so the re-translate reads the committed schema.
+        for db_id in &attached_db_ids {
+            // Discard any connection-local schema changes for this non-main DB
+            // (temp or attached) so the re-translate reads the committed schema.
             conn.database_schemas().write().remove(&db_id);
+            if db_id == crate::TEMP_DB_ID && conn.temp.database.read().is_none() {
+                continue;
+            }
+            let pager = conn.get_pager_from_database_index(&db_id)?;
             if pager.holds_read_lock() {
                 pager.rollback_attached();
             }
@@ -523,7 +562,7 @@ impl Statement {
                 *conn_schema = conn.db.clone_schema();
             }
         }
-        self.program = {
+        let new_program = {
             let mut parser = Parser::new(self.program.sql.as_bytes());
             let cmd = parser.next_cmd()?;
             let cmd = cmd.expect("Same SQL string should be able to be parsed");
@@ -548,7 +587,7 @@ impl Statement {
         // Save parameters before they are reset
         let parameters = std::mem::take(&mut self.state.parameters);
         let (max_registers, cursor_count) = match self.query_mode {
-            QueryMode::Normal => (self.program.max_registers, self.program.cursor_ref.len()),
+            QueryMode::Normal => (new_program.max_registers, new_program.cursor_ref.len()),
             QueryMode::Explain => (EXPLAIN_COLUMNS.len(), 0),
             QueryMode::ExplainQueryPlan => (EXPLAIN_QUERY_PLAN_COLUMNS.len(), 0),
         };
@@ -560,6 +599,7 @@ impl Statement {
             self.counted_as_active_root,
         )?;
         self.state.metrics.reprepares = self.state.metrics.reprepares.saturating_add(1);
+        self.program = new_program;
         // Load the parameters back into the state
         self.state.parameters = parameters;
         Ok(())

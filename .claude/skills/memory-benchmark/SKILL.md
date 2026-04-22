@@ -24,13 +24,17 @@ cargo run --release -p memory-benchmark -- --mode wal --workload insert-heavy -i
 # MVCC with concurrent connections
 cargo run --release -p memory-benchmark -- --mode mvcc --workload mixed -i 100 -b 100 --connections 4
 
+# Run a final checkpoint after the workload
+cargo run --release -p memory-benchmark -- --mode wal --workload read-heavy --checkpoint
+
 # All CLI options
 cargo run --release -p memory-benchmark -- \
   --mode wal|mvcc \
-  --workload insert-heavy|read-heavy|mixed|scan-heavy \
+  --workload insert-heavy|read-heavy|mixed|scan-heavy|series-blob \
   -i <iterations> \
   -b <batch-size> \
   --connections <N> \
+  --checkpoint \
   --timeout <ms> \
   --cache-size <pages> \
   --format human|json|csv
@@ -46,6 +50,7 @@ Every run produces a `dhat-heap.json` in the current directory. This file contai
 | `read-heavy` | 90% SELECT by id / 10% INSERT | Seeds 10k rows |
 | `mixed` | 50% SELECT / 50% INSERT | Seeds 10k rows |
 | `scan-heavy` | Full table scans with LIKE | Seeds 10k rows |
+| `series-blob` | `INSERT INTO bench(data) SELECT zeroblob(2048) FROM generate_series(1, ?)` | Creates `bench`; `batch-size` is the series length |
 
 Profiles implement the `Profile` trait in `perf/memory/src/profile/`. To add a new workload, create a new file implementing the trait and wire it into the `WorkloadProfile` enum in `main.rs`.
 
@@ -145,6 +150,7 @@ When investigating memory usage or a suspected regression:
 When `--connections > 1`:
 - Setup phase (schema creation, seeding) always runs on a single connection sequentially
 - Run phase spawns one tokio task per connection, each executing its batch concurrently
+- `--checkpoint` adds a final single-connection `PRAGMA wal_checkpoint(TRUNCATE)` phase after the run phase
 - Each connection gets `busy_timeout` set (default 30s, configurable via `--timeout`)
 - WAL mode uses `BEGIN`, MVCC uses `BEGIN CONCURRENT`
 - The `Profile` trait's `next_batch(connections)` returns one batch per connection with non-overlapping row IDs

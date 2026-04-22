@@ -145,3 +145,26 @@ expect {
     world
     ok
 }
+
+# Expression index CAST(col AS TEXT) with numeric literal WHERE clause.
+# The index stores TEXT values; a numeric comparison literal must be
+# coerced to TEXT before the index lookup. SQLite returns the row for
+# both scan and indexed paths; Turso must match.
+test cast-expr-index-numeric-literal-lookup {
+    CREATE TABLE t7 (id INTEGER PRIMARY KEY, v REAL);
+    INSERT INTO t7 VALUES (1, -22.51);
+    INSERT INTO t7 VALUES (2, 36.04);
+    CREATE INDEX ix7 ON t7(CAST(v AS TEXT));
+    -- TEXT literal: both scan and index should find id=1
+    SELECT id FROM t7 WHERE CAST(v AS TEXT) = '-22.51' ORDER BY id;
+    SELECT id FROM t7 INDEXED BY ix7 WHERE CAST(v AS TEXT) = '-22.51' ORDER BY id;
+    -- NUMERIC literal: scan and index must agree (coerce to text)
+    SELECT id FROM t7 WHERE CAST(v AS TEXT) = -22.51 ORDER BY id;
+    SELECT id FROM t7 INDEXED BY ix7 WHERE CAST(v AS TEXT) = -22.51 ORDER BY id;
+}
+expect {
+    1
+    1
+    1
+    1
+}

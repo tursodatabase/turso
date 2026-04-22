@@ -6,7 +6,7 @@
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
-use sql_gen::{ColumnDef, DataType, Schema, SchemaBuilder, Table};
+use sql_gen::{ColumnDef, DataType, Index, Schema, SchemaBuilder, Table};
 
 /// Introspects schema from a database connection.
 pub struct SchemaIntrospector;
@@ -14,42 +14,12 @@ pub struct SchemaIntrospector;
 impl SchemaIntrospector {
     /// Introspect schema from a Turso connection.
     pub fn from_turso(conn: &Arc<turso_core::Connection>) -> Result<Schema> {
-        let table_info = Self::get_table_info_turso(conn, None)?;
-        let mut builder = SchemaBuilder::new();
-
-        for (table_name, strict) in table_info {
-            let columns = Self::get_columns_turso(conn, &table_name)?;
-            if !columns.is_empty() {
-                let table = if strict {
-                    Table::new_strict(table_name, columns)
-                } else {
-                    Table::new(table_name, columns)
-                };
-                builder = builder.table(table);
-            }
-        }
-
-        Ok(builder.build())
+        Self::populate_turso_schema(conn, SchemaBuilder::new(), None).map(SchemaBuilder::build)
     }
 
     /// Introspect schema from a SQLite connection.
     pub fn from_sqlite(conn: &rusqlite::Connection) -> Result<Schema> {
-        let table_info = Self::get_table_info_sqlite(conn, None)?;
-        let mut builder = SchemaBuilder::new();
-
-        for (table_name, strict) in table_info {
-            let columns = Self::get_columns_sqlite(conn, &table_name)?;
-            if !columns.is_empty() {
-                let table = if strict {
-                    Table::new_strict(table_name, columns)
-                } else {
-                    Table::new(table_name, columns)
-                };
-                builder = builder.table(table);
-            }
-        }
-
-        Ok(builder.build())
+        Self::populate_sqlite_schema(conn, SchemaBuilder::new(), None).map(SchemaBuilder::build)
     }
 
     /// Get table names and STRICT flags from a Turso connection.
@@ -128,131 +98,17 @@ impl SchemaIntrospector {
         }
     }
 
-    fn get_columns_turso(
-        conn: &Arc<turso_core::Connection>,
-        table_name: &str,
-    ) -> Result<Vec<ColumnDef>> {
-        let mut columns = Vec::new();
-        // Use PRAGMA table_info to get column information
-        let query = format!("PRAGMA table_info(\"{table_name}\")");
-        let mut rows = conn
-            .query(&query)
-            .context("Failed to query column info")?
-            .context("Expected rows from PRAGMA")?;
-
-        rows.run_with_row_callback(|row| {
-            // PRAGMA table_info returns: cid, name, type, notnull, dflt_value, pk
-            let name = match row.get_value(1) {
-                turso_core::Value::Text(s) => s.as_str().to_string(),
-                _ => return Ok(()),
-            };
-
-            let type_str = match row.get_value(2) {
-                turso_core::Value::Text(s) => s.as_str().to_uppercase(),
-                _ => "TEXT".to_string(),
-            };
-
-            let notnull = match row.get_value(3) {
-                turso_core::Value::Numeric(turso_core::Numeric::Integer(i)) => *i != 0,
-                _ => false,
-            };
-
-            let pk = match row.get_value(5) {
-                turso_core::Value::Numeric(turso_core::Numeric::Integer(i)) => *i != 0,
-                _ => false,
-            };
-
-            let data_type = Self::parse_type(&type_str);
-            let mut column = ColumnDef::new(name, data_type);
-
-            if !notnull && !pk {
-                // Column is nullable (default)
-            } else {
-                column = column.not_null();
-            }
-
-            if pk {
-                column = column.primary_key();
-            }
-
-            columns.push(column);
-            Ok(())
-        })
-        .context("Failed to iterate columns")?;
-
-        Ok(columns)
-    }
-
-    fn get_columns_sqlite(conn: &rusqlite::Connection, table_name: &str) -> Result<Vec<ColumnDef>> {
-        let query = format!("PRAGMA table_info(\"{table_name}\")");
-        let mut stmt = conn.prepare(&query).context("Failed to prepare PRAGMA")?;
-
-        let columns = stmt
-            .query_map([], |row| {
-                let name: String = row.get(1)?;
-                let type_str: String = row.get::<_, String>(2).unwrap_or_else(|_| "TEXT".into());
-                let notnull: i64 = row.get(3)?;
-                let pk: i64 = row.get(5)?;
-
-                Ok((name, type_str, notnull != 0, pk != 0))
-            })
-            .context("Failed to query columns")?
-            .collect::<std::result::Result<Vec<_>, _>>()
-            .context("Failed to collect columns")?;
-
-        let mut result = Vec::new();
-        for (name, type_str, notnull, pk) in columns {
-            let data_type = Self::parse_type(&type_str.to_uppercase());
-            let mut column = ColumnDef::new(name, data_type);
-
-            if notnull || pk {
-                column = column.not_null();
-            }
-
-            if pk {
-                column = column.primary_key();
-            }
-
-            result.push(column);
-        }
-
-        Ok(result)
-    }
-
     /// Introspect schema from a Turso connection, including attached databases.
     pub fn from_turso_with_attached(conn: &Arc<turso_core::Connection>) -> Result<Schema> {
-        let table_info = Self::get_table_info_turso(conn, None)?;
         let mut builder = SchemaBuilder::new();
+        builder = Self::populate_turso_schema(conn, builder, None)?;
+        builder = Self::populate_turso_schema(conn, builder, Some("temp"))?;
 
-        for (table_name, strict) in table_info {
-            let columns = Self::get_columns_turso(conn, &table_name)?;
-            if !columns.is_empty() {
-                let table = if strict {
-                    Table::new_strict(table_name, columns)
-                } else {
-                    Table::new(table_name, columns)
-                };
-                builder = builder.table(table);
+        for db_name in Self::get_attached_databases_turso(conn)? {
+            if db_name == "temp" {
+                continue;
             }
-        }
-
-        // Discover attached databases
-        let attached_dbs = Self::get_attached_databases_turso(conn)?;
-        for db_name in &attached_dbs {
-            builder = builder.database(db_name.clone());
-            let attached_tables = Self::get_table_info_turso(conn, Some(db_name))?;
-            for (table_name, strict) in attached_tables {
-                let query = format!("PRAGMA {db_name}.table_info(\"{table_name}\")");
-                let columns = Self::get_columns_turso_query(conn, &query)?;
-                if !columns.is_empty() {
-                    let table = if strict {
-                        Table::new_strict(table_name, columns)
-                    } else {
-                        Table::new(table_name, columns)
-                    };
-                    builder = builder.table(table.in_database(db_name));
-                }
-            }
+            builder = Self::populate_turso_schema(conn, builder, Some(&db_name))?;
         }
 
         Ok(builder.build())
@@ -260,73 +116,21 @@ impl SchemaIntrospector {
 
     /// Introspect schema from a SQLite connection, including attached databases.
     pub fn from_sqlite_with_attached(conn: &rusqlite::Connection) -> Result<Schema> {
-        let table_info = Self::get_table_info_sqlite(conn, None)?;
         let mut builder = SchemaBuilder::new();
+        builder = Self::populate_sqlite_schema(conn, builder, None)?;
+        builder = Self::populate_sqlite_schema(conn, builder, Some("temp"))?;
 
-        for (table_name, strict) in table_info {
-            let columns = Self::get_columns_sqlite(conn, &table_name)?;
-            if !columns.is_empty() {
-                let table = if strict {
-                    Table::new_strict(table_name, columns)
-                } else {
-                    Table::new(table_name, columns)
-                };
-                builder = builder.table(table);
+        for db_name in Self::get_attached_databases_sqlite(conn)? {
+            if db_name == "temp" {
+                continue;
             }
-        }
-
-        // Discover attached databases
-        let attached_dbs = Self::get_attached_databases_sqlite(conn)?;
-        for db_name in &attached_dbs {
-            builder = builder.database(db_name.clone());
-            let attached_tables = Self::get_table_info_sqlite(conn, Some(db_name))?;
-
-            for (table_name, strict) in attached_tables {
-                let col_query = format!("PRAGMA {db_name}.table_info(\"{table_name}\")");
-                let mut col_stmt = conn
-                    .prepare(&col_query)
-                    .context("Failed to prepare attached PRAGMA")?;
-                let columns = col_stmt
-                    .query_map([], |row| {
-                        let name: String = row.get(1)?;
-                        let type_str: String =
-                            row.get::<_, String>(2).unwrap_or_else(|_| "TEXT".into());
-                        let notnull: i64 = row.get(3)?;
-                        let pk: i64 = row.get(5)?;
-                        Ok((name, type_str, notnull != 0, pk != 0))
-                    })
-                    .context("Failed to query attached columns")?
-                    .collect::<std::result::Result<Vec<_>, _>>()
-                    .context("Failed to collect attached columns")?;
-
-                let mut result = Vec::new();
-                for (name, type_str, notnull, pk) in columns {
-                    let data_type = Self::parse_type(&type_str.to_uppercase());
-                    let mut column = ColumnDef::new(name, data_type);
-                    if notnull || pk {
-                        column = column.not_null();
-                    }
-                    if pk {
-                        column = column.primary_key();
-                    }
-                    result.push(column);
-                }
-
-                if !result.is_empty() {
-                    let table = if strict {
-                        Table::new_strict(table_name, result)
-                    } else {
-                        Table::new(table_name, result)
-                    };
-                    builder = builder.table(table.in_database(db_name));
-                }
-            }
+            builder = Self::populate_sqlite_schema(conn, builder, Some(&db_name))?;
         }
 
         Ok(builder.build())
     }
 
-    /// Get names of attached databases (excluding "main" and "temp") from Turso.
+    /// Get names of non-main databases, including `temp`, from Turso.
     fn get_attached_databases_turso(conn: &Arc<turso_core::Connection>) -> Result<Vec<String>> {
         let mut databases = Vec::new();
         let mut rows = conn
@@ -337,7 +141,7 @@ impl SchemaIntrospector {
         rows.run_with_row_callback(|row| {
             if let turso_core::Value::Text(name) = row.get_value(1) {
                 let name = name.as_str();
-                if name != "main" && name != "temp" {
+                if name != "main" {
                     databases.push(name.to_string());
                 }
             }
@@ -348,7 +152,7 @@ impl SchemaIntrospector {
         Ok(databases)
     }
 
-    /// Get names of attached databases (excluding "main" and "temp") from SQLite.
+    /// Get names of non-main databases, including `temp`, from SQLite.
     fn get_attached_databases_sqlite(conn: &rusqlite::Connection) -> Result<Vec<String>> {
         let mut stmt = conn
             .prepare("PRAGMA database_list")
@@ -358,7 +162,7 @@ impl SchemaIntrospector {
             .query_map([], |row| row.get::<_, String>(1))
             .context("Failed to query database_list")?
             .filter_map(|r| r.ok())
-            .filter(|name| name != "main" && name != "temp")
+            .filter(|name| name != "main")
             .collect();
 
         Ok(databases)
@@ -417,6 +221,271 @@ impl SchemaIntrospector {
         Ok(columns)
     }
 
+    fn populate_turso_schema(
+        conn: &Arc<turso_core::Connection>,
+        mut builder: SchemaBuilder,
+        db_name: Option<&str>,
+    ) -> Result<SchemaBuilder> {
+        if let Some(db_name) = db_name {
+            builder = builder.database(db_name.to_string());
+        }
+
+        for (table_name, strict) in Self::get_table_info_turso(conn, db_name)? {
+            let columns_query = match db_name {
+                Some(db_name) => format!("PRAGMA {db_name}.table_info(\"{table_name}\")"),
+                None => format!("PRAGMA table_info(\"{table_name}\")"),
+            };
+            let columns = Self::get_columns_turso_query(conn, &columns_query)?;
+            if !columns.is_empty() {
+                let table = if strict {
+                    Table::new_strict(table_name.clone(), columns)
+                } else {
+                    Table::new(table_name.clone(), columns)
+                };
+                let table = match db_name {
+                    Some(db_name) => table.in_database(db_name.to_string()),
+                    None => table,
+                };
+                builder = builder.table(table);
+            }
+
+            for index in Self::get_indexes_turso(conn, db_name, &table_name)? {
+                builder = builder.index(index);
+            }
+        }
+
+        Ok(builder)
+    }
+
+    fn populate_sqlite_schema(
+        conn: &rusqlite::Connection,
+        mut builder: SchemaBuilder,
+        db_name: Option<&str>,
+    ) -> Result<SchemaBuilder> {
+        if let Some(db_name) = db_name {
+            builder = builder.database(db_name.to_string());
+        }
+
+        for (table_name, strict) in Self::get_table_info_sqlite(conn, db_name)? {
+            let columns = Self::get_columns_sqlite_query(conn, db_name, &table_name)?;
+            if !columns.is_empty() {
+                let table = if strict {
+                    Table::new_strict(table_name.clone(), columns)
+                } else {
+                    Table::new(table_name.clone(), columns)
+                };
+                let table = match db_name {
+                    Some(db_name) => table.in_database(db_name.to_string()),
+                    None => table,
+                };
+                builder = builder.table(table);
+            }
+
+            for index in Self::get_indexes_sqlite(conn, db_name, &table_name)? {
+                builder = builder.index(index);
+            }
+        }
+
+        Ok(builder)
+    }
+
+    fn get_columns_sqlite_query(
+        conn: &rusqlite::Connection,
+        db_name: Option<&str>,
+        table_name: &str,
+    ) -> Result<Vec<ColumnDef>> {
+        let query = match db_name {
+            Some(db_name) => format!("PRAGMA {db_name}.table_info(\"{table_name}\")"),
+            None => format!("PRAGMA table_info(\"{table_name}\")"),
+        };
+        let mut stmt = conn.prepare(&query).context("Failed to prepare PRAGMA")?;
+
+        let columns = stmt
+            .query_map([], |row| {
+                let name: String = row.get(1)?;
+                let type_str: String = row.get::<_, String>(2).unwrap_or_else(|_| "TEXT".into());
+                let notnull: i64 = row.get(3)?;
+                let pk: i64 = row.get(5)?;
+
+                Ok((name, type_str, notnull != 0, pk != 0))
+            })
+            .context("Failed to query columns")?
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .context("Failed to collect columns")?;
+
+        let mut result = Vec::new();
+        for (name, type_str, notnull, pk) in columns {
+            let data_type = Self::parse_type(&type_str.to_uppercase());
+            let mut column = ColumnDef::new(name, data_type);
+
+            if notnull || pk {
+                column = column.not_null();
+            }
+
+            if pk {
+                column = column.primary_key();
+            }
+
+            result.push(column);
+        }
+
+        Ok(result)
+    }
+
+    fn get_indexes_turso(
+        conn: &Arc<turso_core::Connection>,
+        db_name: Option<&str>,
+        table_name: &str,
+    ) -> Result<Vec<Index>> {
+        let query = match db_name {
+            Some(db_name) => format!("PRAGMA {db_name}.index_list(\"{table_name}\")"),
+            None => format!("PRAGMA index_list(\"{table_name}\")"),
+        };
+        let mut indexes = Vec::new();
+        let mut rows = conn
+            .query(&query)
+            .context("Failed to query index info")?
+            .context("Expected rows from PRAGMA index_list")?;
+
+        rows.run_with_row_callback(|row| {
+            let name = match row.get_value(1) {
+                turso_core::Value::Text(s) => s.as_str().to_string(),
+                _ => return Ok(()),
+            };
+            let unique = match row.get_value(2) {
+                turso_core::Value::Numeric(turso_core::Numeric::Integer(i)) => *i != 0,
+                _ => false,
+            };
+            let origin = match row.get_value(3) {
+                turso_core::Value::Text(s) => Some(s.as_str().to_string()),
+                _ => None,
+            };
+            if origin.as_deref().is_some_and(|origin| origin != "c")
+                || name.starts_with("sqlite_autoindex_")
+            {
+                return Ok(());
+            }
+
+            let columns = Self::get_index_columns_turso(conn, db_name, &name).map_err(|err| {
+                turso_core::LimboError::InternalError(format!(
+                    "Failed to introspect index columns for {name}: {err}"
+                ))
+            })?;
+            let mut index = Index::new(name, table_name.to_string(), columns);
+            if unique {
+                index = index.unique();
+            }
+            if let Some(db_name) = db_name {
+                index = index.in_database(db_name.to_string());
+            }
+            indexes.push(index);
+            Ok(())
+        })
+        .context("Failed to iterate index_list")?;
+
+        Ok(indexes)
+    }
+
+    fn get_indexes_sqlite(
+        conn: &rusqlite::Connection,
+        db_name: Option<&str>,
+        table_name: &str,
+    ) -> Result<Vec<Index>> {
+        let query = match db_name {
+            Some(db_name) => format!("PRAGMA {db_name}.index_list(\"{table_name}\")"),
+            None => format!("PRAGMA index_list(\"{table_name}\")"),
+        };
+        let mut stmt = conn
+            .prepare(&query)
+            .context("Failed to prepare PRAGMA index_list")?;
+
+        let mut indexes = Vec::new();
+        let rows = stmt
+            .query_map([], |row| {
+                let name: String = row.get(1)?;
+                let unique: i64 = row.get(2)?;
+                let origin: String = row.get::<_, String>(3)?;
+                Ok((name, unique != 0, origin))
+            })
+            .context("Failed to query index_list")?;
+
+        for row in rows {
+            let (name, unique, origin) = row.context("Failed to read index_list row")?;
+            if origin != "c" || name.starts_with("sqlite_autoindex_") {
+                continue;
+            }
+            let columns = Self::get_index_columns_sqlite(conn, db_name, &name)?;
+            let mut index = Index::new(name, table_name.to_string(), columns);
+            if unique {
+                index = index.unique();
+            }
+            if let Some(db_name) = db_name {
+                index = index.in_database(db_name.to_string());
+            }
+            indexes.push(index);
+        }
+
+        Ok(indexes)
+    }
+
+    fn get_index_columns_turso(
+        conn: &Arc<turso_core::Connection>,
+        db_name: Option<&str>,
+        index_name: &str,
+    ) -> Result<Vec<String>> {
+        let query = match db_name {
+            Some(db_name) => format!("PRAGMA {db_name}.index_info(\"{index_name}\")"),
+            None => format!("PRAGMA index_info(\"{index_name}\")"),
+        };
+        let mut columns = Vec::new();
+        let mut rows = conn
+            .query(&query)
+            .context("Failed to query index columns")?
+            .context("Expected rows from PRAGMA index_info")?;
+
+        rows.run_with_row_callback(|row| {
+            // Expression index columns have cid < 0 (typically -2).
+            // Skip them since they don't map to a named column.
+            let cid = match row.get_value(1) {
+                turso_core::Value::Numeric(turso_core::Numeric::Integer(i)) => *i,
+                _ => return Ok(()),
+            };
+            if cid < 0 {
+                return Ok(());
+            }
+            if let turso_core::Value::Text(name) = row.get_value(2) {
+                columns.push(name.as_str().to_string());
+            }
+            Ok(())
+        })
+        .context("Failed to iterate index_info")?;
+
+        Ok(columns)
+    }
+
+    fn get_index_columns_sqlite(
+        conn: &rusqlite::Connection,
+        db_name: Option<&str>,
+        index_name: &str,
+    ) -> Result<Vec<String>> {
+        let query = match db_name {
+            Some(db_name) => format!("PRAGMA {db_name}.index_info(\"{index_name}\")"),
+            None => format!("PRAGMA index_info(\"{index_name}\")"),
+        };
+        let mut stmt = conn
+            .prepare(&query)
+            .context("Failed to prepare PRAGMA index_info")?;
+
+        // Expression index columns return NULL for the column name.
+        // We skip them since they don't map to a named column.
+        let columns = stmt
+            .query_map([], |row| row.get::<_, Option<String>>(2))
+            .context("Failed to query index_info")?
+            .filter_map(|r| r.ok().flatten())
+            .collect();
+        Ok(columns)
+    }
+
     fn parse_type(type_str: &str) -> DataType {
         // SQLite type affinity rules (simplified)
         let upper = type_str.to_uppercase();
@@ -451,6 +520,7 @@ impl SchemaIntrospector {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashSet;
 
     #[test]
     fn test_parse_type() {
@@ -490,5 +560,28 @@ mod tests {
             SchemaIntrospector::parse_type("BLOB"),
             DataType::Blob
         ));
+    }
+
+    #[test]
+    fn test_sqlite_with_attached_always_includes_temp_database() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+
+        let schema = SchemaIntrospector::from_sqlite_with_attached(&conn).unwrap();
+
+        assert!(
+            schema.attached_databases.contains(&"temp".to_string()),
+            "temp should be available as a fuzz target even before temp objects exist"
+        );
+    }
+
+    #[test]
+    fn test_sqlite_with_attached_discovers_temp_tables() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute("CREATE TEMP TABLE t(x INTEGER)", []).unwrap();
+
+        let schema = SchemaIntrospector::from_sqlite_with_attached(&conn).unwrap();
+        let temp_tables = schema.table_names_in_database(Some("temp"));
+
+        assert_eq!(temp_tables, HashSet::from([String::from("t")]));
     }
 }

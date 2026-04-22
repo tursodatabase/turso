@@ -32,8 +32,12 @@ pub enum Expression {
     Value(SqlValue),
     /// A column reference.
     Column(String),
-    /// A function call with arguments.
-    FunctionCall { name: String, args: Vec<Expression> },
+    /// A function call with arguments, optionally with a FILTER clause (aggregates only).
+    FunctionCall {
+        name: String,
+        args: Vec<Expression>,
+        filter: Option<Box<Expression>>,
+    },
     /// A binary operation (e.g., `a + b`, `a || b`).
     BinaryOp {
         left: Box<Expression>,
@@ -224,7 +228,7 @@ impl fmt::Display for Expression {
         match self {
             Expression::Value(v) => write!(f, "{v}"),
             Expression::Column(name) => write!(f, "{name}"),
-            Expression::FunctionCall { name, args } => {
+            Expression::FunctionCall { name, args, filter } => {
                 write!(f, "{name}(")?;
                 for (i, arg) in args.iter().enumerate() {
                     if i > 0 {
@@ -232,7 +236,11 @@ impl fmt::Display for Expression {
                     }
                     write!(f, "{arg}")?;
                 }
-                write!(f, ")")
+                write!(f, ")")?;
+                if let Some(filter_expr) = filter {
+                    write!(f, " FILTER (WHERE {filter_expr})")?;
+                }
+                Ok(())
             }
             Expression::BinaryOp { left, op, right } => {
                 write!(f, "{left} {op} {right}")
@@ -291,6 +299,7 @@ impl Expression {
         Expression::FunctionCall {
             name: name.into(),
             args,
+            filter: None,
         }
     }
 
@@ -1182,12 +1191,25 @@ fn function_call_for_def(
     depth: u32,
 ) -> BoxedStrategy<Expression> {
     let name = func.name.to_string();
+    let is_aggregate = func.is_aggregate;
+    let has_columns = !ctx.columns.is_empty();
 
     if func.min_args == 0 && func.max_args == 0 {
+        let name_clone = name.clone();
+        if is_aggregate && has_columns {
+            return filter_clause_strategy(&ctx)
+                .prop_map(move |filter| Expression::FunctionCall {
+                    name: name_clone.clone(),
+                    args: vec![],
+                    filter,
+                })
+                .boxed();
+        }
         return Just(Expression::function_call(name, vec![])).boxed();
     }
 
     let int_arg_max = func.int_arg_max;
+    let ctx_for_filter = ctx.clone();
     (func.min_args..=func.max_args)
         .prop_flat_map(move |n| {
             (0..n)
@@ -1207,8 +1229,69 @@ fn function_call_for_def(
                 })
                 .collect::<Vec<_>>()
         })
-        .prop_map(move |args| Expression::function_call(name.clone(), args))
+        .prop_flat_map(move |args| {
+            let name = name.clone();
+            if is_aggregate && has_columns {
+                let ctx = ctx_for_filter.clone();
+                filter_clause_strategy(&ctx)
+                    .prop_map(move |filter| Expression::FunctionCall {
+                        name: name.clone(),
+                        args: args.clone(),
+                        filter,
+                    })
+                    .boxed()
+            } else {
+                Just(Expression::function_call(name, args)).boxed()
+            }
+        })
         .boxed()
+}
+
+/// Generate an optional FILTER clause for aggregate functions.
+/// Returns `Some(condition)` ~30% of the time, `None` otherwise.
+fn filter_clause_strategy(ctx: &ExpressionContext) -> BoxedStrategy<Option<Box<Expression>>> {
+    let filterable: Vec<_> = ctx
+        .columns
+        .iter()
+        .filter(|c| c.data_type == DataType::Integer || c.data_type == DataType::Real)
+        .cloned()
+        .collect();
+
+    if filterable.is_empty() {
+        return Just(None).boxed();
+    }
+
+    // 30% chance of generating a FILTER clause
+    proptest::prop_oneof![
+        70 => Just(None),
+        30 => proptest::sample::select(filterable)
+            .prop_flat_map(|col| {
+                let col_name = col.name.clone();
+                match col.data_type {
+                    DataType::Integer | DataType::Real => {
+                        let ops = vec![
+                            BinaryOperator::Gt,
+                            BinaryOperator::Lt,
+                            BinaryOperator::Eq,
+                            BinaryOperator::Ge,
+                            BinaryOperator::Le,
+                            BinaryOperator::Ne,
+                        ];
+                        (proptest::sample::select(ops), -100i64..=100i64)
+                            .prop_map(move |(op, val)| {
+                                Some(Box::new(Expression::binary(
+                                    Expression::Column(col_name.clone()),
+                                    op,
+                                    Expression::Value(SqlValue::Integer(val)),
+                                )))
+                            })
+                            .boxed()
+                    }
+                    _ => Just(None).boxed(),
+                }
+            })
+    ]
+    .boxed()
 }
 
 /// Generate a binary operation expression.

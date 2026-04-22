@@ -1020,7 +1020,15 @@ struct CheckpointState {
     mode: Option<CheckpointMode>,
 }
 
-#[derive(Clone, Debug, Default, PartialEq)]
+#[derive(Clone, Debug)]
+struct PendingCheckpointDbIdentityRead {
+    max_frame: u64,
+    header_buf: Arc<Buffer>,
+    bytes_read: Arc<AtomicUsize>,
+    read_sent: bool,
+}
+
+#[derive(Clone, Debug, Default)]
 enum CheckpointPhase {
     #[default]
     NotCheckpointing,
@@ -1039,6 +1047,21 @@ enum CheckpointPhase {
     },
     /// Sync the database file after checkpoint (if sync_mode != Off and we backfilled any frames from the WAL).
     SyncDbFile { clear_page_cache: bool },
+    /// Read the synced database header before installing the durable backfill proof.
+    ReadDbIdentity {
+        clear_page_cache: bool,
+        read: PendingCheckpointDbIdentityRead,
+    },
+    /// Wait for backend-specific durable proof sync to finish before publishing nbackfills.
+    SyncBackfillProof {
+        clear_page_cache: bool,
+        max_frame: u64,
+    },
+    /// Publish the durable backfill progress after the proof is installed and synced.
+    PublishBackfill {
+        clear_page_cache: bool,
+        max_frame: u64,
+    },
     /// Truncate the WAL file after DB file is safely synced (only for TRUNCATE checkpoint mode).
     /// This must happen AFTER SyncDbFile to ensure data durability.
     TruncateWalFile { clear_page_cache: bool },
@@ -1730,7 +1753,7 @@ impl Pager {
             Some(SavepointKind::Statement)
         ) {
             return Ok(());
-        };
+        }
         let savepoint = savepoints.pop().expect("savepoint must exist");
         if let Some(parent) = savepoints.last() {
             parent.set_write_offset(savepoint.write_offset());
@@ -2503,7 +2526,6 @@ impl Pager {
         PageSize::new(value).expect("invalid page size stored")
     }
 
-    #[cfg(test)]
     pub(crate) fn has_wal(&self) -> bool {
         self.wal.is_some()
     }
@@ -2732,6 +2754,16 @@ impl Pager {
         wal.end_read_tx();
     }
 
+    pub(crate) fn cleanup_read_tx(&self) {
+        let Some(wal) = self.wal.as_ref() else {
+            return;
+        };
+        self.reset_internal_states();
+        if wal.holds_read_lock() {
+            wal.end_read_tx();
+        }
+    }
+
     #[instrument(skip_all, level = Level::DEBUG)]
     pub fn end_read_tx(&self) {
         let Some(wal) = self.wal.as_ref() else {
@@ -2781,10 +2813,7 @@ impl Pager {
             wal.rollback(None);
             wal.end_write_tx();
         } else {
-            // For read-only transactions, pager state machines (e.g. header_ref_state)
-            // can be left in intermediate states if an IO completion was aborted.
-            // Reset them so the next query on this attached DB starts clean.
-            self.reset_internal_states();
+            self.cleanup_read_tx();
         }
         if wal.holds_read_lock() {
             wal.end_read_tx();
@@ -3902,7 +3931,10 @@ impl Pager {
     }
 
     pub fn is_checkpointing(&self) -> bool {
-        self.checkpoint_state.read().phase != CheckpointPhase::NotCheckpointing
+        !matches!(
+            self.checkpoint_state.read().phase.clone(),
+            CheckpointPhase::NotCheckpointing
+        )
     }
 
     fn reset_checkpoint_state(&self) {
@@ -3925,6 +3957,33 @@ impl Pager {
         self.reset_checkpoint_state();
         if let Some(wal) = self.wal.as_ref() {
             wal.abort_checkpoint();
+        }
+    }
+
+    fn next_post_sync_checkpoint_phase(&self, clear_page_cache: bool) -> CheckpointPhase {
+        let state = self.checkpoint_state.read();
+        let result = state.result.as_ref().expect("result should be set");
+        let mode = state.mode.expect("mode should be set");
+        if result.wal_checkpoint_backfilled > 0
+            && !matches!(
+                mode,
+                CheckpointMode::Restart | CheckpointMode::Truncate { .. }
+            )
+        {
+            return CheckpointPhase::ReadDbIdentity {
+                clear_page_cache,
+                read: PendingCheckpointDbIdentityRead {
+                    max_frame: result.wal_total_backfilled,
+                    header_buf: Arc::new(Buffer::new_temporary(PageSize::MIN as usize)),
+                    bytes_read: Arc::new(AtomicUsize::new(usize::MAX)),
+                    read_sent: false,
+                },
+            };
+        }
+        if matches!(mode, CheckpointMode::Truncate { .. }) {
+            CheckpointPhase::TruncateWalFile { clear_page_cache }
+        } else {
+            CheckpointPhase::Finalize { clear_page_cache }
         }
     }
 
@@ -4083,18 +4142,8 @@ impl Pager {
                             !self.syncing.load(Ordering::SeqCst),
                             "syncing should be done"
                         );
-                        // After DB is synced, truncate WAL if in TRUNCATE mode
-                        let is_truncate_mode = {
-                            let state = self.checkpoint_state.read();
-                            matches!(state.mode, Some(CheckpointMode::Truncate { .. }))
-                        };
-                        if is_truncate_mode {
-                            self.checkpoint_state.write().phase =
-                                CheckpointPhase::TruncateWalFile { clear_page_cache };
-                        } else {
-                            self.checkpoint_state.write().phase =
-                                CheckpointPhase::Finalize { clear_page_cache };
-                        }
+                        self.checkpoint_state.write().phase =
+                            self.next_post_sync_checkpoint_phase(clear_page_cache);
                         continue;
                     }
 
@@ -4110,6 +4159,83 @@ impl Pager {
                         .expect("result should be set")
                         .db_sync_sent = true;
                     io_yield_one!(c);
+                }
+                CheckpointPhase::ReadDbIdentity {
+                    clear_page_cache,
+                    mut read,
+                } => {
+                    if !read.read_sent {
+                        let header_buf = read.header_buf.clone();
+                        let bytes_read = read.bytes_read.clone();
+                        let c = self.db_file.read_header(Completion::new_read(header_buf, {
+                            Box::new(move |res| {
+                                if let Ok((_buf, count)) = res {
+                                    bytes_read.store(count as usize, Ordering::Release);
+                                }
+                                None
+                            })
+                        }))?;
+                        read.read_sent = true;
+                        self.checkpoint_state.write().phase = CheckpointPhase::ReadDbIdentity {
+                            clear_page_cache,
+                            read,
+                        };
+                        io_yield_one!(c);
+                    }
+
+                    let bytes_read = read.bytes_read.load(Ordering::Acquire);
+                    if bytes_read < DatabaseHeader::SIZE {
+                        return Err(LimboError::Corrupt(
+                            "database header unreadable after checkpoint sync".into(),
+                        ));
+                    }
+                    let (db_size_pages, db_header_crc32c) =
+                        super::wal::database_identity_from_header_bytes(
+                            &read.header_buf.as_slice()[..DatabaseHeader::SIZE],
+                        )?;
+                    if let Some(c) = wal.install_durable_backfill_proof(
+                        read.max_frame,
+                        db_size_pages,
+                        db_header_crc32c,
+                        self.get_sync_type(),
+                    )? {
+                        self.checkpoint_state.write().phase = CheckpointPhase::SyncBackfillProof {
+                            clear_page_cache,
+                            max_frame: read.max_frame,
+                        };
+                        io_yield_one!(c);
+                    }
+                    self.checkpoint_state.write().phase = CheckpointPhase::PublishBackfill {
+                        clear_page_cache,
+                        max_frame: read.max_frame,
+                    };
+                    continue;
+                }
+                CheckpointPhase::SyncBackfillProof {
+                    clear_page_cache,
+                    max_frame,
+                } => {
+                    self.checkpoint_state.write().phase = CheckpointPhase::PublishBackfill {
+                        clear_page_cache,
+                        max_frame,
+                    };
+                    continue;
+                }
+                CheckpointPhase::PublishBackfill {
+                    clear_page_cache,
+                    max_frame,
+                } => {
+                    wal.publish_backfill(max_frame);
+                    let next_phase = {
+                        let state = self.checkpoint_state.read();
+                        if matches!(state.mode, Some(CheckpointMode::Truncate { .. })) {
+                            CheckpointPhase::TruncateWalFile { clear_page_cache }
+                        } else {
+                            CheckpointPhase::Finalize { clear_page_cache }
+                        }
+                    };
+                    self.checkpoint_state.write().phase = next_phase;
+                    continue;
                 }
                 CheckpointPhase::TruncateWalFile { clear_page_cache } => {
                     // Truncate WAL file after DB is safely synced - this ensures data durability.
@@ -4159,6 +4285,35 @@ impl Pager {
 
                     return Ok(IOResult::Done(res));
                 }
+            }
+        }
+    }
+
+    #[cfg(feature = "simulator")]
+    pub fn run_checkpoint_until_post_sync_gap_for_testing(
+        &self,
+        mode: CheckpointMode,
+    ) -> Result<u64> {
+        loop {
+            match self.checkpoint(mode, crate::SyncMode::Full, true)? {
+                IOResult::Done(_) => {
+                    return Err(LimboError::InternalError(
+                        "checkpoint completed before reaching the post-sync pre-publish gap"
+                            .to_string(),
+                    ));
+                }
+                IOResult::IO(io) => io.wait(self.io.as_ref())?,
+            }
+
+            let state = self.checkpoint_state.read();
+            let Some(result) = state.result.as_ref() else {
+                continue;
+            };
+            if matches!(state.phase, CheckpointPhase::ReadDbIdentity { .. })
+                && result.db_sync_sent
+                && !self.syncing.load(Ordering::SeqCst)
+            {
+                return Ok(result.wal_total_backfilled);
             }
         }
     }
@@ -5345,6 +5500,136 @@ mod ptrmap_tests {
         assert_eq!(
             get_ptrmap_offset_in_page(108, 105, page_size).unwrap(),
             2 * PTRMAP_ENTRY_SIZE
+        );
+    }
+}
+
+#[cfg(all(test, feature = "fs", unix, target_pointer_width = "64"))]
+mod checkpoint_phase_tests {
+    use super::*;
+    use crate::io::{PlatformIO, IO};
+    use crate::storage::sqlite3_ondisk::DatabaseHeader;
+    use crate::storage::wal::CheckpointMode;
+    use crate::sync::atomic::Ordering;
+    use crate::types::IOResult;
+    use crate::Database;
+
+    fn open_checkpoint_test_database() -> (Arc<Database>, std::path::PathBuf) {
+        let dir = tempfile::tempdir().unwrap().keep();
+        let db_path = dir.join("test.db");
+        {
+            let connection = rusqlite::Connection::open(&db_path).unwrap();
+            connection
+                .pragma_update(None, "journal_mode", "wal")
+                .unwrap();
+        }
+        let io: Arc<dyn IO> = Arc::new(PlatformIO::new().unwrap());
+        let db = Database::open_file_with_flags(
+            io,
+            db_path.to_str().unwrap(),
+            crate::OpenFlags::default(),
+            crate::DatabaseOpts::new().with_multiprocess_wal(true),
+            None,
+        )
+        .unwrap();
+        (db, dir)
+    }
+
+    fn db_identity(db_path: &std::path::Path) -> (u32, u32) {
+        let bytes = std::fs::read(db_path).unwrap();
+        assert!(bytes.len() >= DatabaseHeader::SIZE);
+        let db_size_pages = u32::from_be_bytes(bytes[28..32].try_into().unwrap());
+        let crc = crc32c::crc32c(&bytes[..DatabaseHeader::SIZE]);
+        (db_size_pages, crc)
+    }
+
+    #[test]
+    fn checkpoint_db_sync_completion_still_leaves_backfill_unpublished_until_proof_install() {
+        let (db, dir) = open_checkpoint_test_database();
+        let db_path = dir.join("test.db");
+        let conn = db.connect().unwrap();
+        conn.wal_auto_checkpoint_disable();
+        conn.execute("create table test(id integer primary key, value blob)")
+            .unwrap();
+        conn.execute("begin immediate").unwrap();
+        for _ in 0..32 {
+            conn.execute("insert into test(value) values (randomblob(2048))")
+                .unwrap();
+        }
+        conn.execute("commit").unwrap();
+        assert!(
+            db.shared_wal
+                .read()
+                .metadata
+                .max_frame
+                .load(Ordering::SeqCst)
+                > 1,
+            "checkpoint setup requires more than one WAL frame"
+        );
+
+        let pager = conn.pager.load();
+        let mode = CheckpointMode::Passive {
+            upper_bound_inclusive: Some(1),
+        };
+
+        loop {
+            match pager.checkpoint(mode, crate::SyncMode::Full, true).unwrap() {
+                IOResult::Done(_) => {
+                    panic!("checkpoint should not finish before we observe the post-sync gap")
+                }
+                IOResult::IO(io) => io.wait(pager.io.as_ref()).unwrap(),
+            }
+
+            let state = pager.checkpoint_state.read();
+            let Some(result) = state.result.as_ref() else {
+                continue;
+            };
+            if matches!(state.phase, CheckpointPhase::ReadDbIdentity { .. })
+                && result.db_sync_sent
+                && !pager.syncing.load(Ordering::SeqCst)
+            {
+                break;
+            }
+        }
+
+        let authority = db.shared_wal_coordination().unwrap().unwrap();
+        let snapshot_before_publish = authority.snapshot();
+        let (db_size_pages, db_header_crc32c) = db_identity(&db_path);
+        assert_eq!(
+            snapshot_before_publish.nbackfills, 0,
+            "DB sync completion alone must not publish positive nbackfills"
+        );
+        assert!(
+            !authority.validate_backfill_proof(
+                snapshot_before_publish,
+                db_size_pages,
+                db_header_crc32c
+            ),
+            "DB sync completion must still leave the durable backfill proof absent"
+        );
+
+        let result = pager
+            .io
+            .block(|| pager.checkpoint(mode, crate::SyncMode::Full, true))
+            .unwrap();
+        assert!(
+            result.wal_total_backfilled > 0 && !result.everything_backfilled(),
+            "resumed checkpoint should complete the partial checkpoint after proof installation"
+        );
+
+        let snapshot_after_publish = authority.snapshot();
+        let (db_size_pages_after, db_header_crc32c_after) = db_identity(&db_path);
+        assert!(
+            snapshot_after_publish.nbackfills > 0,
+            "proof installation step must publish positive nbackfills"
+        );
+        assert!(
+            authority.validate_backfill_proof(
+                snapshot_after_publish,
+                db_size_pages_after,
+                db_header_crc32c_after
+            ),
+            "resuming after the post-sync gap must install a valid durable backfill proof"
         );
     }
 }

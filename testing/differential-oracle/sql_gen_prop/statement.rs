@@ -7,6 +7,7 @@ use std::rc::Rc;
 use crate::alter_table::{AlterTableStatement, alter_table_for_schema};
 use crate::create_index::{CreateIndexStatement, create_index, create_index_for_table};
 use crate::create_table::{CreateTableStatement, create_table};
+use crate::create_table_as::{CreateTableAsStatement, create_table_as};
 use crate::create_trigger::{CreateTriggerStatement, create_trigger_for_schema};
 use crate::delete::{DeleteStatement, delete_for_table};
 use crate::drop_index::DropIndexStatement;
@@ -50,6 +51,7 @@ pub enum SqlStatement {
 
     // DDL - Tables
     CreateTable(CreateTableStatement),
+    CreateTableAs(CreateTableAsStatement),
     DropTable(DropTableStatement),
     AlterTable(AlterTableStatement),
 
@@ -86,6 +88,7 @@ impl fmt::Display for SqlStatement {
             SqlStatement::Update(s) => write!(f, "{s}"),
             SqlStatement::Delete(s) => write!(f, "{s}"),
             SqlStatement::CreateTable(s) => write!(f, "{s}"),
+            SqlStatement::CreateTableAs(s) => write!(f, "{s}"),
             SqlStatement::DropTable(s) => write!(f, "{s}"),
             SqlStatement::AlterTable(s) => write!(f, "{s}"),
             SqlStatement::CreateIndex(s) => write!(f, "{s}"),
@@ -125,6 +128,7 @@ impl StatementKind {
         matches!(
             self,
             StatementKind::CreateTable
+                | StatementKind::CreateTableAs
                 | StatementKind::DropTable
                 | StatementKind::AlterTable
                 | StatementKind::CreateIndex
@@ -175,6 +179,7 @@ impl SqlGeneratorKind for StatementKind {
 
             // DDL - Table operations
             StatementKind::CreateTable => true,
+            StatementKind::CreateTableAs => !schema.tables.is_empty(),
             StatementKind::DropTable | StatementKind::AlterTable => !schema.tables.is_empty(),
 
             // DDL - Index operations
@@ -211,6 +216,7 @@ impl SqlGeneratorKind for StatementKind {
 
             // DDL - Table operations
             StatementKind::CreateTable => true,
+            StatementKind::CreateTableAs => true,
             StatementKind::DropTable | StatementKind::AlterTable => true,
 
             // DDL - Index operations
@@ -275,6 +281,9 @@ impl SqlGeneratorKind for StatementKind {
             StatementKind::CreateTable => create_table(schema, profile)
                 .prop_map(SqlStatement::CreateTable)
                 .boxed(),
+            StatementKind::CreateTableAs => create_table_as(schema)
+                .prop_map(SqlStatement::CreateTableAs)
+                .boxed(),
             StatementKind::DropTable => drop_table_for_schema(schema)
                 .prop_map(SqlStatement::DropTable)
                 .boxed(),
@@ -290,7 +299,7 @@ impl SqlGeneratorKind for StatementKind {
                 .boxed(),
             StatementKind::DropIndex => {
                 let index_names: Vec<String> =
-                    schema.indexes.iter().map(|i| i.name.clone()).collect();
+                    schema.indexes.iter().map(|i| i.qualified_name()).collect();
                 (proptest::sample::select(index_names), any::<bool>())
                     .prop_map(|(name, if_exists)| {
                         SqlStatement::DropIndex(DropIndexStatement {

@@ -1,11 +1,17 @@
 #![allow(clippy::arc_with_non_send_sync)]
 
-use super::{common, Completion, CompletionInner, File, OpenFlags, IO};
+use super::{
+    common, Completion, CompletionInner, File, OpenFlags, SharedWalLockKind, SharedWalMappedRegion,
+    IO,
+};
+use crate::error::io_error;
 use crate::io::clock::{Clock, DefaultClock, MonotonicInstant, WallClockInstant};
+use crate::io::unix::{
+    unix_shared_wal_lock_byte, unix_shared_wal_map, unix_shared_wal_unlock_byte,
+};
 use crate::storage::wal::CKPT_BATCH_PAGES;
 use crate::sync::Mutex;
 use crate::turso_assert;
-use crate::error::io_error;
 use crate::{CompletionError, LimboError, Result};
 use rustix::fs::{self, FlockOperation, OFlags};
 use std::ptr::NonNull;
@@ -25,10 +31,6 @@ const ENTRIES: u32 = 512;
 /// to be woken back up by a call IORING_ENTER_SQ_WAKEUP flag.
 /// (handled by the io_uring crate in `submit_and_wait`)
 const SQPOLL_IDLE: u32 = 1000;
-
-/// Number of file descriptors we preallocate for io_uring.
-/// NOTE: we may need to increase this when `attach` is fully implemented.
-const FILES: u32 = 8;
 
 /// Number of Vec<Box<[iovec]>> we preallocate on initialization
 const IOVEC_POOL_SIZE: usize = 64;
@@ -73,7 +75,6 @@ struct WrappedIOUring {
 
 struct InnerUringIO {
     ring: WrappedIOUring,
-    free_files: VecDeque<u32>,
     free_arenas: [Option<(NonNull<u8>, usize)>; ARENA_COUNT],
 }
 
@@ -119,13 +120,12 @@ impl UringIO {
             Ok(ring) => ring,
             Err(_) => io_uring::IoUring::new(ENTRIES).map_err(|e| io_error(e, "io_uring_setup"))?,
         };
-        // we only ever have 2 files open at a time for the moment
-        ring.submitter().register_files_sparse(FILES).map_err(|e| io_error(e, "register_files"))?;
         // RL_MEMLOCK cap is typically 8MB, the current design is to have one large arena
         // registered at startup and therefore we can simply use the zero index, falling back
         // to similar logic as the existing buffer pool for cases where it is over capacity.
         ring.submitter()
-            .register_buffers_sparse(ARENA_COUNT as u32).map_err(|e| io_error(e, "register_buffers"))?;
+            .register_buffers_sparse(ARENA_COUNT as u32)
+            .map_err(|e| io_error(e, "register_buffers"))?;
         // Probe supported opcodes so we can fall back to POSIX for unsupported ones.
         let mut probe = io_uring::register::Probe::new();
         let caps = if ring.submitter().register_probe(&mut probe).is_ok() {
@@ -146,7 +146,6 @@ impl UringIO {
                 writev_states: HashMap::default(),
                 iov_pool: IovecPool::new(),
             },
-            free_files: (0..FILES).collect(),
             free_arenas: [const { None }; ARENA_COUNT],
         };
         debug!("Using IO backend 'io-uring'");
@@ -157,54 +156,11 @@ impl UringIO {
     }
 }
 
-/// io_uring crate decides not to export their `UseFixed` trait, so we
-/// are forced to use a macro here to handle either fixed or raw file descriptors.
-macro_rules! with_fd {
-    ($file:expr, |$fd:ident| $body:expr) => {
-        match $file.id() {
-            Some(id) => {
-                let $fd = io_uring::types::Fixed(id);
-                $body
-            }
-            None => {
-                let $fd = io_uring::types::Fd($file.as_raw_fd());
-                $body
-            }
-        }
-    };
-}
-
-/// wrapper type to represent a possibly registered file descriptor,
-/// only used in WritevState, and piggy-backs on the available methods from
-/// `UringFile`, so we don't have to store the file on `WritevState`.
-#[derive(Clone)]
-enum Fd {
-    Fixed(u32),
-    RawFd(i32),
-}
-
-impl Fd {
-    /// to match the behavior of the File, we need to implement the same methods
-    fn id(&self) -> Option<u32> {
-        match self {
-            Fd::Fixed(id) => Some(*id),
-            Fd::RawFd(_) => None,
-        }
-    }
-    /// ONLY to be called by the macro, in the case where id() is None
-    fn as_raw_fd(&self) -> i32 {
-        match self {
-            Fd::RawFd(fd) => *fd,
-            _ => panic!("Cannot call as_raw_fd on a Fixed Fd"),
-        }
-    }
-}
-
 /// State to track an ongoing writev operation in
 /// the case of a partial write.
 struct WritevState {
     /// File descriptor/id of the file we are writing to
-    file_id: Fd,
+    file_id: io_uring::types::Fd,
     /// absolute file offset for next submit
     file_pos: u64,
     /// current buffer index in `bufs`
@@ -223,13 +179,10 @@ struct WritevState {
 
 impl WritevState {
     fn new(file: &UringFile, pos: u64, bufs: Vec<Arc<crate::Buffer>>) -> Self {
-        let file_id = file
-            .id()
-            .map(Fd::Fixed)
-            .unwrap_or_else(|| Fd::RawFd(file.as_raw_fd()));
+        let file_id = file.file.as_raw_fd();
         let total_len = bufs.iter().map(|b| b.len()).sum();
         Self {
-            file_id,
+            file_id: io_uring::types::Fd(file_id),
             file_pos: pos,
             current_buffer_idx: 0,
             current_buffer_offset: 0,
@@ -276,28 +229,6 @@ impl WritevState {
 }
 
 impl InnerUringIO {
-    fn register_file(&mut self, fd: i32) -> Result<u32> {
-        if let Some(slot) = self.free_files.pop_front() {
-            self.ring
-                .ring
-                .submitter()
-                .register_files_update(slot, &[fd.as_raw_fd()]).map_err(|e| io_error(e, "register_files_update"))?;
-            return Ok(slot);
-        }
-        Err(crate::error::CompletionError::UringIOError(
-            "unable to register file, no free slots available",
-        )
-        .into())
-    }
-    fn unregister_file(&mut self, id: u32) -> Result<()> {
-        self.ring
-            .ring
-            .submitter()
-            .register_files_update(id, &[-1]).map_err(|e| io_error(e, "register_files_update"))?;
-        self.free_files.push_back(id);
-        Ok(())
-    }
-
     #[cfg(debug_assertions)]
     fn debug_check_fixed(&self, idx: u32, ptr: *const u8, len: usize) {
         let (base, blen) = self.free_arenas[idx as usize].expect("slot not registered");
@@ -338,7 +269,9 @@ impl WrappedIOUring {
         }
         // place cancel op at the front, if overflowed
         self.overflow.push_front(entry.clone());
-        self.ring.submit().map_err(|e| io_error(e, "io_uring_submit"))?;
+        self.ring
+            .submit()
+            .map_err(|e| io_error(e, "io_uring_submit"))?;
         Ok(())
     }
 
@@ -374,7 +307,9 @@ impl WrappedIOUring {
         }
         let wants = std::cmp::min(self.pending_ops, MAX_WAIT);
         tracing::trace!("submit_and_wait for {wants} pending operations to complete");
-        self.ring.submit_and_wait(wants).map_err(|e| io_error(e, "io_uring_submit_and_wait"))?;
+        self.ring
+            .submit_and_wait(wants)
+            .map_err(|e| io_error(e, "io_uring_submit_and_wait"))?;
         Ok(())
     }
 
@@ -431,12 +366,10 @@ impl WrappedIOUring {
 
         let ptr = iov_allocation.as_ptr() as *mut libc::iovec;
         st.last_iov_allocation = Some(iov_allocation);
-        let entry = with_fd!(st.file_id, |fd| {
-            io_uring::opcode::Writev::new(fd, ptr, iov_count as u32)
-                .offset(st.file_pos)
-                .build()
-                .user_data(key)
-        });
+        let entry = io_uring::opcode::Writev::new(st.file_id, ptr, iov_count as u32)
+            .offset(st.file_pos)
+            .build()
+            .user_data(key);
         self.writev_states.insert(key, st);
         self.submit_entry(&entry);
     }
@@ -484,6 +417,10 @@ impl WrappedIOUring {
 }
 
 impl IO for UringIO {
+    fn supports_shared_wal_coordination(&self) -> bool {
+        true
+    }
+
     fn open_file(&self, path: &str, flags: OpenFlags, direct: bool) -> Result<Arc<dyn File>> {
         trace!("open_file(path = {})", path);
         let mut file = std::fs::File::options();
@@ -504,15 +441,13 @@ impl IO for UringIO {
                 Err(error) => debug!("Error {error:?} returned when setting O_DIRECT flag to read file. The performance of the system may be affected"),
             }
         }
-        let id = self.inner.lock().register_file(file.as_raw_fd()).ok();
         let uring_file = Arc::new(UringFile {
             io: self.inner.clone(),
             caps: self.caps.clone(),
             file,
-            id,
         });
         if std::env::var(common::ENV_DISABLE_FILE_LOCK).is_err()
-            || !flags.contains(OpenFlags::ReadOnly)
+            && !flags.intersects(OpenFlags::ReadOnly | OpenFlags::NoLock)
         {
             uring_file.lock_file(true)?;
         }
@@ -561,7 +496,8 @@ impl IO for UringIO {
                 if result < 0 {
                     let errno = -result;
                     let err = std::io::Error::from_raw_os_error(errno);
-                    completion_from_key(user_data).error(CompletionError::IOError(err.kind(), "io_uring_cqe"));
+                    completion_from_key(user_data)
+                        .error(CompletionError::IOError(err.kind(), "io_uring_cqe"));
                 } else {
                     completion_from_key(user_data).complete(result)
                 }
@@ -615,7 +551,8 @@ impl IO for UringIO {
             if result < 0 {
                 let errno = -result;
                 let err = std::io::Error::from_raw_os_error(errno);
-                completion_from_key(user_data).error(CompletionError::IOError(err.kind(), "io_uring_cqe"));
+                completion_from_key(user_data)
+                    .error(CompletionError::IOError(err.kind(), "io_uring_cqe"));
             } else {
                 completion_from_key(user_data).complete(result)
             }
@@ -633,14 +570,19 @@ impl IO for UringIO {
                 crate::error::CompletionError::UringIOError("no free fixed buffer slots")
             })?;
         unsafe {
-            inner.ring.ring.submitter().register_buffers_update(
-                slot as u32,
-                &[libc::iovec {
-                    iov_base: ptr.as_ptr() as *mut libc::c_void,
-                    iov_len: len,
-                }],
-                None,
-            ).map_err(|e| io_error(e, "register_buffers_update"))?
+            inner
+                .ring
+                .ring
+                .submitter()
+                .register_buffers_update(
+                    slot as u32,
+                    &[libc::iovec {
+                        iov_base: ptr.as_ptr() as *mut libc::c_void,
+                        iov_len: len,
+                    }],
+                    None,
+                )
+                .map_err(|e| io_error(e, "register_buffers_update"))?
         };
         inner.free_arenas[slot] = Some((ptr, len));
         Ok(slot as u32)
@@ -677,7 +619,6 @@ pub struct UringFile {
     io: Arc<Mutex<InnerUringIO>>,
     caps: Arc<UringCapabilities>,
     file: std::fs::File,
-    id: Option<u32>,
 }
 
 impl Deref for UringFile {
@@ -687,11 +628,6 @@ impl Deref for UringFile {
     }
 }
 
-impl UringFile {
-    fn id(&self) -> Option<u32> {
-        self.id
-    }
-}
 unsafe impl Send for UringFile {}
 unsafe impl Sync for UringFile {}
 crate::assert::assert_send_sync!(UringFile);
@@ -739,32 +675,31 @@ impl File for UringFile {
         let read_e = {
             let buf = r.buf();
             let ptr = buf.as_mut_ptr();
+            let fd = io_uring::types::Fd(self.file.as_raw_fd());
             let len = buf.len();
-            with_fd!(self, |fd| {
-                if let Some(idx) = buf.fixed_id() {
-                    trace!(
-                        "pread_fixed(pos = {}, length = {}, idx = {})",
-                        pos,
-                        len,
-                        idx
-                    );
-                    #[cfg(debug_assertions)]
-                    {
-                        self.io.lock().debug_check_fixed(idx, ptr, len);
-                    }
-                    io_uring::opcode::ReadFixed::new(fd, ptr, len as u32, idx as u16)
-                        .offset(pos)
-                        .build()
-                        .user_data(get_key(c.clone()))
-                } else {
-                    trace!("pread(pos = {}, length = {})", pos, len);
-                    // Use Read opcode if fixed buffer is not available
-                    io_uring::opcode::Read::new(fd, buf.as_mut_ptr(), len as u32)
-                        .offset(pos)
-                        .build()
-                        .user_data(get_key(c.clone()))
+            if let Some(idx) = buf.fixed_id() {
+                trace!(
+                    "pread_fixed(pos = {}, length = {}, idx = {})",
+                    pos,
+                    len,
+                    idx
+                );
+                #[cfg(debug_assertions)]
+                {
+                    self.io.lock().debug_check_fixed(idx, ptr, len);
                 }
-            })
+                io_uring::opcode::ReadFixed::new(fd, ptr, len as u32, idx as u16)
+                    .offset(pos)
+                    .build()
+                    .user_data(get_key(c.clone()))
+            } else {
+                trace!("pread(pos = {}, length = {})", pos, len);
+                // Use Read opcode if fixed buffer is not available
+                io_uring::opcode::Read::new(fd, buf.as_mut_ptr(), len as u32)
+                    .offset(pos)
+                    .build()
+                    .user_data(get_key(c.clone()))
+            }
         };
         self.io.lock().ring.submit_entry(&read_e);
         Ok(c)
@@ -775,30 +710,29 @@ impl File for UringFile {
         let write = {
             let ptr = buffer.as_ptr();
             let len = buffer.len();
-            with_fd!(self, |fd| {
-                if let Some(idx) = buffer.fixed_id() {
-                    trace!(
-                        "pwrite_fixed(pos = {}, length = {}, idx= {})",
-                        pos,
-                        len,
-                        idx
-                    );
-                    #[cfg(debug_assertions)]
-                    {
-                        io.debug_check_fixed(idx, ptr, len);
-                    }
-                    io_uring::opcode::WriteFixed::new(fd, ptr, len as u32, idx as u16)
-                        .offset(pos)
-                        .build()
-                        .user_data(get_key(c.clone()))
-                } else {
-                    trace!("pwrite(pos = {}, length = {})", pos, buffer.len());
-                    io_uring::opcode::Write::new(fd, ptr, len as u32)
-                        .offset(pos)
-                        .build()
-                        .user_data(get_key(c.clone()))
+            let fd = io_uring::types::Fd(self.file.as_raw_fd());
+            if let Some(idx) = buffer.fixed_id() {
+                trace!(
+                    "pwrite_fixed(pos = {}, length = {}, idx= {})",
+                    pos,
+                    len,
+                    idx
+                );
+                #[cfg(debug_assertions)]
+                {
+                    io.debug_check_fixed(idx, ptr, len);
                 }
-            })
+                io_uring::opcode::WriteFixed::new(fd, ptr, len as u32, idx as u16)
+                    .offset(pos)
+                    .build()
+                    .user_data(get_key(c.clone()))
+            } else {
+                trace!("pwrite(pos = {}, length = {})", pos, buffer.len());
+                io_uring::opcode::Write::new(fd, ptr, len as u32)
+                    .offset(pos)
+                    .build()
+                    .user_data(get_key(c.clone()))
+            }
         };
 
         // Keep the buffer alive until the completion is processed. For non-fixed
@@ -811,11 +745,10 @@ impl File for UringFile {
 
     fn sync(&self, c: Completion, _sync_type: crate::io::FileSyncType) -> Result<Completion> {
         trace!("sync()");
-        let sync = with_fd!(self, |fd| {
-            io_uring::opcode::Fsync::new(fd)
-                .build()
-                .user_data(get_key(c.clone()))
-        });
+        let fd = io_uring::types::Fd(self.file.as_raw_fd());
+        let sync = io_uring::opcode::Fsync::new(fd)
+            .build()
+            .user_data(get_key(c.clone()));
         self.io.lock().ring.submit_entry(&sync);
         Ok(c)
     }
@@ -835,16 +768,19 @@ impl File for UringFile {
     }
 
     fn size(&self) -> Result<u64> {
-        Ok(self.file.metadata().map_err(|e| io_error(e, "metadata"))?.len())
+        Ok(self
+            .file
+            .metadata()
+            .map_err(|e| io_error(e, "metadata"))?
+            .len())
     }
 
     fn truncate(&self, len: u64, c: Completion) -> Result<Completion> {
+        let fd = io_uring::types::Fd(self.file.as_raw_fd());
         if self.caps.ftruncate {
-            let truncate = with_fd!(self, |fd| {
-                io_uring::opcode::Ftruncate::new(fd, len)
-                    .build()
-                    .user_data(get_key(c.clone()))
-            });
+            let truncate = io_uring::opcode::Ftruncate::new(fd, len)
+                .build()
+                .user_data(get_key(c.clone()));
             self.io.lock().ring.submit_entry(&truncate);
             Ok(c)
         } else {
@@ -859,20 +795,43 @@ impl File for UringFile {
             }
         }
     }
+
+    fn shared_wal_lock_byte(
+        &self,
+        offset: u64,
+        exclusive: bool,
+        kind: SharedWalLockKind,
+    ) -> Result<()> {
+        unix_shared_wal_lock_byte(self.file.as_raw_fd(), offset, exclusive, true, kind).map(|_| ())
+    }
+
+    fn shared_wal_try_lock_byte(
+        &self,
+        offset: u64,
+        exclusive: bool,
+        kind: SharedWalLockKind,
+    ) -> Result<bool> {
+        unix_shared_wal_lock_byte(self.file.as_raw_fd(), offset, exclusive, false, kind)
+    }
+
+    fn shared_wal_unlock_byte(&self, offset: u64, kind: SharedWalLockKind) -> Result<()> {
+        unix_shared_wal_unlock_byte(self.file.as_raw_fd(), offset, kind)
+    }
+
+    fn shared_wal_set_len(&self, len: u64) -> Result<()> {
+        self.file
+            .set_len(len)
+            .map_err(|err| io_error(err, "resize shared WAL coordination file"))
+    }
+
+    fn shared_wal_map(&self, offset: u64, len: usize) -> Result<Box<dyn SharedWalMappedRegion>> {
+        unix_shared_wal_map(offset, len, self.file.as_raw_fd())
+    }
 }
 
 impl Drop for UringFile {
     fn drop(&mut self) {
         self.unlock_file().expect("Failed to unlock file");
-        if let Some(id) = self.id {
-            self.io
-                .lock()
-                .unregister_file(id)
-                .inspect_err(|e| {
-                    debug!("Failed to unregister file: {e}");
-                })
-                .ok();
-        }
     }
 }
 

@@ -19,7 +19,7 @@ use crate::sync::Arc;
 use crate::translate::expression_index::{
     normalize_expr_for_index_matching, single_table_column_usage,
 };
-use crate::translate::plan::{Operation, ResultSetColumn, Search};
+use crate::translate::plan::{ColumnMask, Operation, ResultSetColumn, Search};
 use crate::translate::planner::parse_row_id;
 use crate::util::{exprs_are_equivalent, normalize_ident, parse_numeric_literal};
 use crate::vdbe::affinity::Affinity;
@@ -30,7 +30,6 @@ use crate::vdbe::{
     BranchOffset, CursorID,
 };
 use crate::{LimboError, Numeric, Result, Value};
-use std::collections::HashSet;
 
 #[derive(Debug, Clone, Copy)]
 pub struct ConditionMetadata {
@@ -598,9 +597,9 @@ pub fn translate_condition_expr(
             emit_cond_jump(program, condition_metadata, between_result_reg);
         }
         ast::Expr::Variable(_) => {
-            crate::bail_parse_error!(
-                "Variable as a direct predicate in WHERE clause is not supported"
-            );
+            let reg = program.alloc_register();
+            translate_expr(program, Some(referenced_tables), expr, reg, resolver)?;
+            emit_cond_jump(program, condition_metadata, reg);
         }
         ast::Expr::Name(_) => {
             crate::bail_parse_error!("Name as a direct predicate in WHERE clause is not supported");
@@ -996,7 +995,7 @@ pub fn translate_expr(
         });
         // Hash join payloads store raw encoded values; apply DECODE for custom
         // type columns so the result set contains human-readable text.
-        if needs_decode && !program.suppress_custom_type_decode {
+        if needs_decode && !program.flags.suppress_custom_type_decode() {
             if let ast::Expr::Column {
                 table: table_ref_id,
                 column,
@@ -1424,7 +1423,7 @@ pub fn translate_expr(
 
             // Check if casting to a custom type
             if let Some(ref tn) = type_name {
-                if let Some(type_def) = resolver.schema().get_type_def_unchecked(&tn.name) {
+                if let Some(resolved) = resolver.schema().resolve_type_unchecked(&tn.name)? {
                     // Build ty_params from AST TypeSize so parametric types
                     // (e.g. numeric(10,2)) get their parameters passed through.
                     let ty_params: Vec<Box<ast::Expr>> = match &tn.size {
@@ -1435,6 +1434,44 @@ pub fn translate_expr(
                         None => Vec::new(),
                     };
 
+                    // Domains: apply parent encode chain, then validate constraints
+                    // on the encoded value (domain CHECK sees the stored representation).
+                    if resolved.is_domain() {
+                        // Apply encode from parent custom types (domain itself has encode: None)
+                        let cast_col = Column::new(
+                            None,
+                            tn.name.clone(),
+                            None,
+                            None,
+                            Type::Null,
+                            None,
+                            ColDef::default(),
+                        );
+                        for td in &resolved.chain {
+                            if let Some(ref encode_expr) = td.encode {
+                                emit_type_expr(
+                                    program,
+                                    encode_expr,
+                                    target_register,
+                                    target_register,
+                                    &cast_col,
+                                    td,
+                                    resolver,
+                                )?;
+                            }
+                        }
+
+                        // Validate domain constraints on the encoded value
+                        emit_domain_cast_constraints(
+                            program,
+                            &resolved.chain,
+                            target_register,
+                            resolver,
+                        )?;
+                        return Ok(target_register);
+                    }
+
+                    let type_def = resolved.leaf();
                     // If the custom type requires parameters but the CAST
                     // doesn't provide them (e.g. CAST(x AS NUMERIC) vs
                     // CAST(x AS numeric(10,2))), fall through to regular CAST.
@@ -1938,7 +1975,7 @@ pub fn translate_expr(
                         ScalarFunc::Concat => {
                             if args.is_empty() {
                                 crate::bail_parse_error!(
-                                    "{} function with no arguments",
+                                    "wrong number of arguments to function {}()",
                                     srf.to_string()
                                 );
                             };
@@ -1963,7 +2000,12 @@ pub fn translate_expr(
                             Ok(target_register)
                         }
                         ScalarFunc::ConcatWs => {
-                            let args = expect_arguments_min!(args, 2, srf);
+                            if args.len() < 2 {
+                                crate::bail_parse_error!(
+                                    "wrong number of arguments to function {}()",
+                                    srf.to_string()
+                                );
+                            }
 
                             let temp_register = program.alloc_registers(args.len() + 1);
                             for (i, arg) in args.iter().enumerate() {
@@ -2573,22 +2615,22 @@ pub fn translate_expr(
                                 if let Ok(probability) = value.parse::<f64>() {
                                     if !(0.0..=1.0).contains(&probability) {
                                         crate::bail_parse_error!(
-                                            "second argument of likelihood() must be between 0.0 and 1.0",
+                                            "second argument to likelihood() must be a constant between 0.0 and 1.0",
                                         );
                                     }
                                     if !value.contains('.') {
                                         crate::bail_parse_error!(
-                                            "second argument of likelihood() must be a floating point number with decimal point",
+                                            "second argument to likelihood() must be a floating point number with decimal point",
                                         );
                                     }
                                 } else {
                                     crate::bail_parse_error!(
-                                        "second argument of likelihood() must be a floating point constant",
+                                        "second argument to likelihood() must be a floating point constant",
                                     );
                                 }
                             } else {
                                 crate::bail_parse_error!(
-                                    "second argument of likelihood() must be a numeric literal",
+                                    "second argument to likelihood() must be a constant between 0.0 and 1.0",
                                 );
                             }
                             translate_expr(
@@ -2993,29 +3035,17 @@ pub fn translate_expr(
                         )
                     }
                     Some(SelfTableContext::ForDML(dml_ctx)) => {
-                        let col = &dml_ctx.columns[*column];
-                        match col.generated_type() {
-                            GeneratedType::Virtual {
-                                resolved: gen_expr, ..
-                            } => {
-                                translate_expr(program, None, gen_expr, target_register, resolver)?;
-                                if col.affinity() != Affinity::Blob {
-                                    program.emit_column_affinity(target_register, col.affinity());
-                                }
-                                Ok(target_register)
-                            }
-                            GeneratedType::NotGenerated => {
-                                let src_reg = dml_ctx.to_column_reg(*column);
-                                program.emit_insn(Insn::Copy {
-                                    src_reg,
-                                    dst_reg: target_register,
-                                    extra_amount: 0,
-                                });
-                                Ok(target_register)
-                            }
-                        }
+                        let src_reg = dml_ctx.to_column_reg(*column);
+                        program.emit_insn(Insn::Copy {
+                            src_reg,
+                            dst_reg: target_register,
+                            extra_amount: 0,
+                        });
+                        Ok(target_register)
                     }
                     None => {
+                        // This error means that a program.with_self_table_context() was missing
+                        // somewhere in the call stack.
                         crate::bail_parse_error!(
                             "SELF_TABLE column reference outside of generated column context"
                         );
@@ -3188,7 +3218,7 @@ pub fn translate_expr(
                         match table_column.generated_type() {
                             // if we're reading from an index that contains this virtual column,
                             // the index already has the computed value, so read it from the index
-                            GeneratedType::Virtual { resolved: expr, .. } if !read_from_index => {
+                            GeneratedType::Virtual { expr, .. } if !read_from_index => {
                                 program.with_self_table_context(
                                     Some(&SelfTableContext::ForSelect {
                                         table_ref_id: *table_ref_id,
@@ -3236,20 +3266,27 @@ pub fn translate_expr(
                                     *column
                                 };
 
-                                // For custom type columns with a default, suppress the
-                                // default in the Column instruction so we can encode it
-                                // ourselves. Without this, pre-existing rows (from before
-                                // ALTER TABLE ADD COLUMN) would get the raw un-encoded
-                                // default, causing decode to fail.
+                                // For custom type columns with ENCODE/DECODE and a
+                                // default, suppress the default in the Column
+                                // instruction so we can encode it ourselves.  Without
+                                // this, pre-existing rows (from before ALTER TABLE ADD
+                                // COLUMN) would get the raw un-encoded default, causing
+                                // decode to fail.  Pure domain types (CREATE DOMAIN)
+                                // have no encoding, so their defaults must NOT be
+                                // suppressed.  Check the full type chain because a
+                                // domain built on top of a custom type inherits its
+                                // ENCODE/DECODE.
                                 let col_ref = table.get_column_at(column);
                                 if let Some(col) = col_ref {
-                                    if col.default.is_some()
-                                        && resolver
+                                    if col.default.is_some() {
+                                        if let Ok(Some(resolved)) = resolver
                                             .schema()
-                                            .get_type_def(&col.ty_str, table.is_strict())
-                                            .is_some()
-                                    {
-                                        program.suppress_column_default = true;
+                                            .resolve_type(&col.ty_str, table.is_strict())
+                                        {
+                                            if resolved.chain.iter().any(|td| td.encode.is_some()) {
+                                                program.flags.set_suppress_column_default(true);
+                                            }
+                                        }
                                     }
                                 }
                                 program.emit_column_or_rowid(read_cursor, column, target_register);
@@ -3277,7 +3314,7 @@ pub fn translate_expr(
 
                         // Decode custom type columns (skipped when building ORDER BY sort keys
                         // for types without a `<` operator, so the sorter sorts on encoded values)
-                        if !program.suppress_custom_type_decode {
+                        if !program.flags.suppress_custom_type_decode() {
                             // For custom type columns with a default, the Column
                             // instruction returns NULL for pre-existing rows
                             // (since we suppressed the default). Load the default
@@ -3768,15 +3805,7 @@ pub fn translate_expr(
             }
         },
         ast::Expr::Variable(variable) => {
-            let index = usize::try_from(variable.index.get())
-                .expect("u32 variable index must fit into usize")
-                .try_into()
-                .expect("variable index must be non-zero");
-            if let Some(name) = variable.name.as_deref() {
-                program.parameters.push_named_at(name, index);
-            } else {
-                program.parameters.push_index(index);
-            }
+            let index = program.register_variable(variable);
             program.emit_insn(Insn::Variable {
                 index,
                 dest: target_register,
@@ -5264,7 +5293,7 @@ fn do_emit_table_column(
     resolver: &Resolver,
 ) -> Result<()> {
     match column.generated_type() {
-        GeneratedType::Virtual { resolved: expr, .. } => {
+        GeneratedType::Virtual { expr, .. } => {
             program.with_self_table_context(Some(self_table_context), |program, _| {
                 translate_expr(program, referenced_tables, expr, target_register, resolver)?;
                 Ok(())
@@ -5589,19 +5618,15 @@ where
 }
 
 /// The precedence of binding identifiers to columns.
-///
-/// TryResultColumnsFirst means that result columns (e.g. SELECT x AS y, ...) take precedence over canonical columns (e.g. SELECT x, y AS z, ...). This is the default behavior.
-///
-/// TryCanonicalColumnsFirst means that canonical columns take precedence over result columns. This is used for e.g. WHERE clauses.
-///
-/// ResultColumnsNotAllowed means that referring to result columns is not allowed. This is used e.g. for DML statements.
-///
-/// AllowUnboundIdentifiers means that unbound identifiers are allowed. This is used for INSERT ... ON CONFLICT DO UPDATE SET ... where binding is handled later than this phase.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BindingBehavior {
+    /// `TryResultColumnsFirst` means that result columns (e.g. SELECT x AS y, ...) take precedence over canonical columns (e.g. SELECT x, y AS z, ...). This is the default behavior.
     TryResultColumnsFirst,
+    /// `TryCanonicalColumnsFirst` means that canonical columns take precedence over result columns. This is used for e.g. WHERE clauses.
     TryCanonicalColumnsFirst,
+    /// `ResultColumnsNotAllowed` means that referring to result columns is not allowed. This is used e.g. for DML statements.
     ResultColumnsNotAllowed,
+    /// `AllowUnboundIdentifiers` means that unbound identifiers are allowed. This is used for INSERT ... ON CONFLICT DO UPDATE SET ... where binding is handled later than this phase.
     AllowUnboundIdentifiers,
 }
 
@@ -5725,18 +5750,19 @@ pub fn bind_and_rewrite_expr<'a>(
                                     .is_some_and(|name| name.eq_ignore_ascii_case(&normalized_id))
                             });
                             if col_idx.is_some() {
+                                let col_idx = col_idx.unwrap();
+                                if outer_ref.using_dedup_hidden_cols.get(col_idx) {
+                                    continue;
+                                }
                                 if match_result.is_some() {
                                     crate::bail_parse_error!(
                                         "ambiguous column name: {}",
                                         id.as_str()
                                     );
                                 }
-                                let col = outer_ref.table.columns().get(col_idx.unwrap()).unwrap();
-                                match_result = Some((
-                                    outer_ref.internal_id,
-                                    col_idx.unwrap(),
-                                    col.is_rowid_alias(),
-                                ));
+                                let col = outer_ref.table.columns().get(col_idx).unwrap();
+                                match_result =
+                                    Some((outer_ref.internal_id, col_idx, col.is_rowid_alias()));
                                 matched_scope_depth = Some(outer_ref.scope_depth);
                             }
                         }
@@ -6266,6 +6292,18 @@ pub(crate) fn get_expr_affinity_info(
             if let Some(resolver) = resolver {
                 if let Some(aff) = resolver.register_affinities.get(reg) {
                     return ExprAffinityInfo::with_affinity(*aff);
+                }
+            }
+            ExprAffinityInfo::no_affinity()
+        }
+        ast::Expr::SubqueryResult {
+            subquery_id,
+            query_type: ast::SubqueryType::RowValue { num_regs, .. },
+            ..
+        } if *num_regs == 1 => {
+            if let Some(resolver) = resolver {
+                if let Some(aff) = resolver.subquery_affinities.borrow().get(subquery_id) {
+                    return *aff;
                 }
             }
             ExprAffinityInfo::no_affinity()
@@ -7270,24 +7308,29 @@ pub(crate) fn emit_user_facing_column_value(
     if column.is_array() {
         return Ok(());
     }
-    if let Some(type_def) = resolver.schema().get_type_def(&column.ty_str, is_strict) {
-        if let Some(ref decode_expr) = type_def.decode {
-            let skip_label = program.allocate_label();
-            program.emit_insn(Insn::IsNull {
-                reg: dest_reg,
-                target_pc: skip_label,
-            });
-            emit_type_expr(
-                program,
-                decode_expr,
-                dest_reg,
-                dest_reg,
-                column,
-                type_def,
-                resolver,
-            )?;
-            program.preassign_label_to_next_insn(skip_label);
+    if let Ok(Some(resolved)) = resolver.schema().resolve_type(&column.ty_str, is_strict) {
+        let skip_label = program.allocate_label();
+        program.emit_insn(Insn::IsNull {
+            reg: dest_reg,
+            target_pc: skip_label,
+        });
+
+        // Apply decode in reverse order (parent/ancestor first, then child)
+        for td in resolved.chain.iter().rev() {
+            if let Some(ref decode_expr) = td.decode {
+                emit_type_expr(
+                    program,
+                    decode_expr,
+                    dest_reg,
+                    dest_reg,
+                    column,
+                    td,
+                    resolver,
+                )?;
+            }
         }
+
+        program.preassign_label_to_next_insn(skip_label);
     }
     Ok(())
 }
@@ -7346,6 +7389,76 @@ pub(crate) fn decode_custom_type_registers_in_expr(
         }
         Ok(WalkControl::Continue)
     })?;
+    Ok(())
+}
+
+/// Emit domain constraint checks for CAST(expr AS domain).
+/// Validates NOT NULL and CHECK constraints from the domain type chain.
+fn emit_domain_cast_constraints(
+    program: &mut ProgramBuilder,
+    chain: &[crate::sync::Arc<TypeDef>],
+    reg: usize,
+    resolver: &Resolver,
+) -> Result<()> {
+    use crate::error::{SQLITE_CONSTRAINT_CHECK, SQLITE_CONSTRAINT_NOTNULL};
+
+    let any_not_null = chain.iter().any(|td| td.not_null);
+
+    if any_not_null {
+        program.emit_insn(Insn::HaltIfNull {
+            target_reg: reg,
+            err_code: SQLITE_CONSTRAINT_NOTNULL,
+            description: format!(
+                "domain {} does not allow null values",
+                chain.first().map(|td| td.name.as_str()).unwrap_or("?")
+            ),
+        });
+    }
+
+    for td in chain {
+        for (i, dc) in td.domain_checks.iter().enumerate() {
+            let constraint_name = dc
+                .name
+                .clone()
+                .unwrap_or_else(|| format!("{}_{}", td.name, i));
+
+            // Bind `value` → reg, translate check expr, verify truthy
+            program
+                .id_register_overrides
+                .insert("value".to_string(), reg);
+
+            let expr_result_reg = program.alloc_register();
+            translate_expr(program, None, &dc.check, expr_result_reg, resolver)?;
+
+            program.id_register_overrides.remove("value");
+
+            let passed_label = program.allocate_label();
+
+            // NULL result passes CHECK constraints (SQLite semantics)
+            program.emit_insn(Insn::IsNull {
+                reg: expr_result_reg,
+                target_pc: passed_label,
+            });
+
+            program.emit_insn(Insn::If {
+                reg: expr_result_reg,
+                target_pc: passed_label,
+                jump_if_null: false,
+            });
+
+            program.emit_insn(Insn::Halt {
+                err_code: SQLITE_CONSTRAINT_CHECK,
+                description: format!(
+                    "value for domain {} violates check constraint \"{}\"",
+                    td.name, constraint_name
+                ),
+                on_error: None,
+                description_reg: None,
+            });
+
+            program.preassign_label_to_next_insn(passed_label);
+        }
+    }
     Ok(())
 }
 
@@ -7661,13 +7774,13 @@ pub(crate) fn emit_custom_type_encode_columns(
     resolver: &Resolver,
     columns: &[Column],
     start_reg: usize,
-    only_columns: Option<&HashSet<usize>>,
+    only_columns: Option<&ColumnMask>,
     table_name: &str,
     layout: &ColumnLayout,
 ) -> Result<()> {
     for (i, col) in columns.iter().enumerate() {
         if let Some(filter) = only_columns {
-            if !filter.contains(&i) {
+            if !filter.get(i) {
                 continue;
             }
         }
@@ -7690,23 +7803,35 @@ pub(crate) fn emit_custom_type_encode_columns(
         if type_name.is_empty() {
             continue;
         }
-        let Some(type_def) = resolver.schema().get_type_def_unchecked(type_name) else {
-            continue;
-        };
-        let Some(ref encode_expr) = type_def.encode else {
+        let Ok(Some(resolved)) = resolver.schema().resolve_type_unchecked(type_name) else {
             continue;
         };
 
-        // Skip NULL values: jump over encode if NULL
-        let skip_label = program.allocate_label();
-        program.emit_insn(Insn::IsNull {
-            reg,
-            target_pc: skip_label,
-        });
+        // Check if any type in the chain has not_null — if so, don't skip NULLs
+        let any_not_null = resolved.chain.iter().any(|td| td.not_null);
 
-        emit_type_expr(program, encode_expr, reg, reg, col, type_def, resolver)?;
+        let skip_label = if !any_not_null {
+            // Skip NULL values: jump over encode if NULL
+            let label = program.allocate_label();
+            program.emit_insn(Insn::IsNull {
+                reg,
+                target_pc: label,
+            });
+            Some(label)
+        } else {
+            None
+        };
 
-        program.preassign_label_to_next_insn(skip_label);
+        // Apply encode for each type in the chain (child first, then parent)
+        for td in &resolved.chain {
+            if let Some(ref encode_expr) = td.encode {
+                emit_type_expr(program, encode_expr, reg, reg, col, td, resolver)?;
+            }
+        }
+
+        if let Some(label) = skip_label {
+            program.preassign_label_to_next_insn(label);
+        }
     }
     Ok(())
 }
@@ -7721,12 +7846,12 @@ pub(crate) fn emit_custom_type_decode_columns(
     resolver: &Resolver,
     columns: &[Column],
     start_reg: usize,
-    only_columns: Option<&HashSet<usize>>,
+    only_columns: Option<&ColumnMask>,
     layout: &ColumnLayout,
 ) -> Result<()> {
     for (i, col) in columns.iter().enumerate() {
         if let Some(filter) = only_columns {
-            if !filter.contains(&i) {
+            if !filter.get(i) {
                 continue;
             }
         }
@@ -7749,10 +7874,7 @@ pub(crate) fn emit_custom_type_decode_columns(
         if type_name.is_empty() {
             continue;
         }
-        let Some(type_def) = resolver.schema().get_type_def_unchecked(type_name) else {
-            continue;
-        };
-        let Some(ref decode_expr) = type_def.decode else {
+        let Ok(Some(resolved)) = resolver.schema().resolve_type_unchecked(type_name) else {
             continue;
         };
 
@@ -7763,7 +7885,12 @@ pub(crate) fn emit_custom_type_decode_columns(
             target_pc: skip_label,
         });
 
-        emit_type_expr(program, decode_expr, reg, reg, col, type_def, resolver)?;
+        // Apply decode in reverse order (parent/ancestor first, then child)
+        for td in resolved.chain.iter().rev() {
+            if let Some(ref decode_expr) = td.decode {
+                emit_type_expr(program, decode_expr, reg, reg, col, td, resolver)?;
+            }
+        }
 
         program.preassign_label_to_next_insn(skip_label);
     }

@@ -1,11 +1,11 @@
 use crate::sync::Arc;
-use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
+use rustc_hash::FxHashMap as HashMap;
 
-use crate::schema::{columns_affected_by_update, ROWID_SENTINEL};
+use crate::schema::{EXPR_INDEX_SENTINEL, ROWID_SENTINEL};
 use crate::translate::emitter::Resolver;
 use crate::translate::expr::{bind_and_rewrite_expr, BindingBehavior};
 use crate::translate::expression_index::expression_index_column_usage;
-use crate::translate::plan::{Operation, Scan};
+use crate::translate::plan::{ColumnMask, Operation, Scan};
 use crate::translate::planner::{parse_limit, ROWID_STRS};
 use crate::{
     bail_parse_error,
@@ -102,11 +102,7 @@ pub fn translate_update(
         )?;
     }
 
-    let opts = ProgramBuilderOpts {
-        num_cursors: 1,
-        approx_num_insns: 20,
-        approx_num_labels: 4,
-    };
+    let opts = ProgramBuilderOpts::new(1, 20, 4);
     program.extend(&opts);
     emit_program(connection, resolver, program, plan, |_| {})?;
     Ok(())
@@ -152,11 +148,7 @@ pub fn translate_update_for_schema_change(
     }
 
     optimize_plan(program, &mut plan, resolver)?;
-    let opts = ProgramBuilderOpts {
-        num_cursors: 1,
-        approx_num_insns: 20,
-        approx_num_labels: 4,
-    };
+    let opts = ProgramBuilderOpts::new(1, 20, 4);
     program.extend(&opts);
     emit_program(connection, resolver, program, plan, after)?;
     Ok(())
@@ -173,7 +165,7 @@ fn validate_update(
     if !is_internal_schema_change
         && !conn.is_nested_stmt()
         && !conn.is_mvcc_bootstrap_connection()
-        && !crate::schema::can_write_to_table(table_name)
+        && !crate::schema::allow_user_dml(table_name)
     {
         crate::bail_parse_error!("table {} may not be modified", table_name);
     }
@@ -189,19 +181,18 @@ fn validate_update(
     }
 
     // Check if this table has any incompatible dependent views
-    let incompatible_views = schema.has_incompatible_dependent_views(table_name);
-    if !incompatible_views.is_empty() {
+    schema.with_incompatible_dependent_views(table_name, |views| {
+    if !views.is_empty() {
         use crate::incremental::compiler::DBSP_CIRCUIT_VERSION;
-        bail_parse_error!(
-            "Cannot UPDATE table '{}' because it has incompatible dependent materialized view(s): {}. \n\
-             These views were created with a different DBSP version than the current version ({}). \n\
+        crate::bail_parse_error!(
+            "Cannot DELETE from table '{table_name}' because it has incompatible dependent materialized view(s): {}. \n\
+             These views were created with a different DBSP version than the current version ({DBSP_CIRCUIT_VERSION}). \n\
              Please DROP and recreate the view(s) before modifying this table.",
-            table_name,
-            incompatible_views.join(", "),
-            DBSP_CIRCUIT_VERSION
+            views.iter().fold(String::new(), |_, s| s.to_string() + ", "),
         );
     }
     Ok(())
+    })
 }
 
 pub fn prepare_update_plan(
@@ -211,7 +202,7 @@ pub fn prepare_update_plan(
     connection: &Arc<crate::Connection>,
     is_internal_schema_change: bool,
 ) -> crate::Result<Plan> {
-    let database_id = resolver.resolve_database_id(&body.tbl_name)?;
+    let database_id = resolver.resolve_existing_table_database_id_qualified(&body.tbl_name)?;
     let schema = resolver.schema();
     let table_name = &body.tbl_name.name;
     let table = match resolver.with_schema(database_id, |s| s.get_table(table_name.as_str())) {
@@ -224,10 +215,8 @@ pub fn prepare_update_plan(
             body.tbl_name.name.as_str()
         );
     }
-    if crate::is_attached_db(database_id) {
-        let schema_cookie = resolver.with_schema(database_id, |s| s.schema_version);
-        program.begin_write_on_database(database_id, schema_cookie);
-    }
+    let schema_cookie = resolver.with_schema(database_id, |s| s.schema_version);
+    program.begin_write_on_database(database_id, schema_cookie);
     validate_update(
         schema,
         &body,
@@ -259,10 +248,7 @@ pub fn prepare_update_plan(
             Table::BTree(btree_table) => Table::BTree(btree_table.clone()),
             _ => unreachable!(),
         },
-        identifier: body.tbl_name.alias.as_ref().map_or_else(
-            || table_name.to_string(),
-            |alias| alias.as_str().to_string(),
-        ),
+        identifier: body.tbl_name.identifier(),
         internal_id: program.table_reference_counter.next(),
         op: build_scan_op(&table, iter_dir),
         join_info: None,
@@ -451,10 +437,13 @@ pub fn prepare_update_plan(
     let rowid_alias_used = set_clauses
         .iter()
         .any(|(idx, _)| *idx == ROWID_SENTINEL || columns[*idx].is_rowid_alias());
-    let updated_cols = (!rowid_alias_used).then(|| set_clauses.iter().map(|(i, _)| *i).collect());
-    let affected_cols = updated_cols
-        .as_ref()
-        .map(|updated_cols: &HashSet<usize>| columns_affected_by_update(columns, updated_cols));
+    let updated_cols: Option<ColumnMask> =
+        (!rowid_alias_used).then(|| set_clauses.iter().map(|(i, _)| *i).collect());
+    let affected_cols = match (table.btree(), updated_cols.as_ref()) {
+        (Some(bt), Some(updated)) => Some(bt.columns_affected_by_update(updated)?),
+        (None, Some(updated)) => Some(updated.clone()),
+        _ => None,
+    };
     let mut indexes_to_update = Vec::new();
 
     for idx in indexes {
@@ -471,7 +460,7 @@ pub fn prepare_update_plan(
 
                 if !must_update
                     && affected_cols.as_ref().is_some_and(|affected_cols| {
-                        cols_used.iter().any(|cidx| affected_cols.contains(&cidx))
+                        cols_used.iter().any(|cidx| affected_cols.get(cidx))
                     })
                 {
                     // an index must be updated if any of the affected columns is used in an indexed expression
@@ -480,7 +469,7 @@ pub fn prepare_update_plan(
             } else if !must_update
                 && affected_cols
                     .as_ref()
-                    .is_some_and(|affected_cols| affected_cols.contains(&col.pos_in_table))
+                    .is_some_and(|affected_cols| affected_cols.get(col.pos_in_table))
             {
                 // an index must be updated if any of its columns is affected by the update
                 must_update = true;
@@ -496,14 +485,28 @@ pub fn prepare_update_plan(
                 )?;
                 // a partial index must be updated if any column of its WHERE clause is affected
                 must_update = affected_cols.as_ref().is_some_and(|affected_cols| {
-                    cols_used.iter().any(|cidx| affected_cols.contains(&cidx))
+                    cols_used.iter().any(|cidx| affected_cols.get(cidx))
                 });
             }
         }
 
         if must_update {
+            // mark as used dependencies of expression indexes
             for col_idx in expression_cols_used.iter() {
                 table_references.mark_column_used(target_table_internal_id, col_idx);
+            }
+            // mark as used dependencies of virtual columns
+            if let Some(btree) = target_table_ref.table.btree() {
+                let virtual_cols_in_index = idx
+                    .columns
+                    .iter()
+                    .filter(|c| c.pos_in_table != EXPR_INDEX_SENTINEL)
+                    .map(|c| c.pos_in_table)
+                    .filter(|&pos| btree.columns()[pos].is_virtual_generated());
+                let deps = btree.dependencies_of_columns(virtual_cols_in_index)?;
+                for dep_idx in deps.iter() {
+                    table_references.mark_column_used(target_table_internal_id, dep_idx);
+                }
             }
             indexes_to_update.push(idx);
         }

@@ -1,16 +1,16 @@
 use crate::sync::Arc;
-use crate::{turso_assert, turso_assert_greater_than_or_equal, turso_assert_less_than};
-use std::cmp::PartialEq;
+use crate::{turso_assert, turso_assert_greater_than_or_equal};
 
 use super::{
     expr::{walk_expr, walk_expr_mut},
     plan::{
-        Aggregate, ColumnUsedMask, Distinctness, EvalAt, IterationDirection, JoinInfo,
+        Aggregate, ColumnMask, ColumnUsedMask, Distinctness, EvalAt, IterationDirection, JoinInfo,
         JoinOrderMember, JoinType as PlanJoinType, JoinedTable, Operation, OuterQueryReference,
         Plan, QueryDestination, ResultSetColumn, Scan, TableReferences, WhereTerm,
     },
     select::prepare_select_plan,
 };
+use crate::translate::plan::BitSet;
 use crate::translate::{
     emitter::Resolver,
     expr::{expr_vector_size, unwrap_parens, BindingBehavior, WalkControl},
@@ -20,7 +20,7 @@ use crate::{
     ast::Limit,
     function::Func,
     schema::Table,
-    util::{exprs_are_equivalent, normalize_ident, validate_aggregate_function_tail},
+    util::{exprs_are_equivalent, normalize_ident},
     Result,
 };
 use crate::{
@@ -212,7 +212,11 @@ pub fn resolve_window_and_aggregate_functions(
                 filter_over,
                 order_by,
             } => {
-                validate_aggregate_function_tail(filter_over, order_by)?;
+                if !order_by.is_empty() {
+                    crate::bail_parse_error!(
+                        "ORDER BY clause is not supported yet in aggregate functions"
+                    );
+                }
                 let args_count = args.len();
                 let distinctness = Distinctness::from_ast(distinctness.as_ref());
 
@@ -227,7 +231,14 @@ pub fn resolve_window_and_aggregate_functions(
                                 distinctness,
                             )?;
                         } else {
-                            add_aggregate_if_not_exists(aggs, expr, args, distinctness, f)?;
+                            add_aggregate_if_not_exists(
+                                aggs,
+                                expr,
+                                args,
+                                distinctness,
+                                f,
+                                filter_over.filter_clause.as_deref().cloned(),
+                            )?;
                             contains_aggregates = true;
                         }
                         return Ok(WalkControl::SkipChildren);
@@ -268,6 +279,7 @@ pub fn resolve_window_and_aggregate_functions(
                                         args,
                                         distinctness,
                                         func,
+                                        filter_over.filter_clause.as_deref().cloned(),
                                     )?;
                                     contains_aggregates = true;
                                 }
@@ -286,7 +298,6 @@ pub fn resolve_window_and_aggregate_functions(
                 }
             }
             Expr::FunctionCallStar { name, filter_over } => {
-                validate_aggregate_function_tail(filter_over, &[])?;
                 match Func::resolve_function(name.as_str(), 0)? {
                     Some(Func::Agg(f)) => {
                         if let Some(over_clause) = filter_over.over_clause.as_ref() {
@@ -304,6 +315,7 @@ pub fn resolve_window_and_aggregate_functions(
                                 &[],
                                 Distinctness::NonDistinct,
                                 f,
+                                filter_over.filter_clause.as_deref().cloned(),
                             )?;
                             contains_aggregates = true;
                         }
@@ -360,6 +372,7 @@ pub fn resolve_window_and_aggregate_functions(
                                         &[],
                                         Distinctness::NonDistinct,
                                         func,
+                                        filter_over.filter_clause.as_deref().cloned(),
                                     )?;
                                     contains_aggregates = true;
                                 }
@@ -437,6 +450,7 @@ fn add_aggregate_if_not_exists(
     args: &[Box<Expr>],
     distinctness: Distinctness,
     func: AggFunc,
+    filter_expr: Option<ast::Expr>,
 ) -> Result<()> {
     if distinctness.is_distinct() && args.len() != 1 {
         crate::bail_parse_error!("DISTINCT aggregate functions must have exactly one argument");
@@ -445,7 +459,7 @@ fn add_aggregate_if_not_exists(
         .iter()
         .all(|a| !exprs_are_equivalent(&a.original_expr, expr))
     {
-        aggs.push(Aggregate::new(func, args, expr, distinctness));
+        aggs.push(Aggregate::new(func, args, expr, distinctness, filter_expr));
     }
     Ok(())
 }
@@ -455,22 +469,6 @@ fn add_aggregate_if_not_exists(
 /// multiple references to the same CTE get independent cursor IDs,
 /// yield registers and so on.
 ///
-/// `count_reference`: Controls whether this call increments the CTE reference count.
-///
-/// **Reference counting determines materialization strategy:**
-/// - ref_count = 1: CTE can use efficient coroutine (no materialization needed)
-/// - ref_count > 1: CTE must be materialized into ephemeral table for sharing
-///
-/// **When to count (true):**
-/// - CTE appears in a FROM/JOIN clause (actual usage site)
-/// - CTE is referenced via outer_query_refs (e.g., in scalar subqueries)
-///
-/// **When NOT to count (false):**
-/// - Pre-planning CTEs for outer_query_refs visibility (making CTEs available
-///   for potential use by nested subqueries - not actual usage)
-/// - Recursively planning CTE dependencies (CTE A references CTE B internally -
-///   B needs to be visible to A's planning, but this isn't a usage from the
-///   main query's perspective)
 #[allow(clippy::too_many_arguments)]
 fn plan_cte(
     cte_idx: usize,
@@ -479,7 +477,7 @@ fn plan_cte(
     resolver: &Resolver,
     program: &mut ProgramBuilder,
     connection: &Arc<crate::Connection>,
-    count_reference: bool,
+    actual_reference: bool,
 ) -> Result<JoinedTable> {
     let cte_def = &cte_definitions[cte_idx];
 
@@ -499,8 +497,8 @@ fn plan_cte(
         }
         // Recursively plan the referenced CTE so it's visible within this CTE's body.
         // Example: WITH a AS (...), b AS (SELECT * FROM a) - when planning b, we need
-        // a to be in scope. But this internal dependency doesn't count as a "reference"
-        // for materialization purposes - only actual usage in the main query counts.
+        // a to be in scope. This visibility-only copy is not itself a read that can
+        // share a materialized result, so it must not be treated as one here.
         let referenced_table = plan_cte(
             ref_idx,
             cte_definitions,
@@ -514,6 +512,7 @@ fn plan_cte(
             identifier: referenced_table.identifier.clone(),
             internal_id: referenced_table.internal_id,
             table: referenced_table.table.clone(),
+            using_dedup_hidden_cols: referenced_table.using_dedup_hidden_cols(),
             col_used_mask: ColumnUsedMask::default(),
             cte_select: None,
             cte_explicit_columns: vec![],
@@ -549,14 +548,9 @@ fn plan_cte(
         Some(cte_def.explicit_columns.as_slice())
     };
 
-    // Track CTE reference count globally for materialization decisions during emission.
-    // Multi-ref CTEs should be materialized; single-ref CTEs can use coroutine.
-    // Only count actual references (FROM/JOIN usage), not pre-planning or recursive deps.
-    if count_reference {
-        program.increment_cte_reference(cte_def.cte_id);
-
-        // Validate explicit column count only on actual references (matching SQLite behavior,
-        // which defers this check until the CTE is used).
+    // SQLite defers explicit column-count validation until the CTE is actually
+    // referenced, so preplanned visibility-only copies must not raise here.
+    if actual_reference {
         if let Some(cols) = explicit_cols {
             let result_col_count = cte_plan.select_result_columns().len();
             if cols.len() != result_col_count {
@@ -657,7 +651,7 @@ pub fn plan_ctes_as_outer_refs(
                 None,
                 program.table_reference_counter.next(),
                 explicit_cols,
-                None, // CTEs in DML don't share materialized data (TODO: implement if needed)
+                None, // DML CTEs don't share materialized data (TODO: implement if needed)
                 materialize_hint,
             )?,
             Plan::Delete(_) | Plan::Update(_) => {
@@ -674,10 +668,11 @@ pub fn plan_ctes_as_outer_refs(
             identifier: cte_name,
             internal_id: joined_table.internal_id,
             table: joined_table.table,
+            using_dedup_hidden_cols: ColumnMask::default(),
             col_used_mask: ColumnUsedMask::default(),
             cte_select: Some(cte_select_ast),
             cte_explicit_columns: explicit_columns,
-            cte_id: None, // DML CTEs don't track CTE sharing (TODO: implement if needed)
+            cte_id: None, // DML CTEs don't share materialized data (TODO: implement if needed)
             cte_definition_only: true,
             rowid_referenced: false,
             scope_depth: 0,
@@ -744,6 +739,7 @@ fn parse_from_clause_table(
                     identifier: cte_def.name.clone(),
                     internal_id: cte_table.internal_id,
                     table: cte_table.table,
+                    using_dedup_hidden_cols: ColumnMask::default(),
                     col_used_mask: ColumnUsedMask::default(),
                     cte_select: Some(cte_def.select.clone()),
                     cte_explicit_columns: cte_def.explicit_columns.clone(),
@@ -817,7 +813,7 @@ fn parse_table(
     connection: &Arc<crate::Connection>,
 ) -> Result<()> {
     let normalized_qualified_name = normalize_ident(qualified_name.name.as_str());
-    let database_id = resolver.resolve_database_id(qualified_name)?;
+    let database_id = resolver.resolve_existing_table_database_id_qualified(qualified_name)?;
     let table_name = &qualified_name.name;
 
     // Check if the FROM clause table is referring to a CTE in the current scope.
@@ -867,11 +863,6 @@ fn parse_table(
     if let Some(outer_ref) =
         table_references.find_outer_query_ref_by_identifier(&normalized_qualified_name)
     {
-        // If this is a CTE reference (via outer_query_refs), count it for materialization decisions.
-        // This handles scalar subqueries that reference CTEs.
-        if let Some(cte_id) = outer_ref.cte_id {
-            program.increment_cte_reference(cte_id);
-        }
         let alias = maybe_alias.map(|a| normalize_ident(a.name().as_str()));
         // Clone fields we need before dropping the borrow on table_references.
         let cte_select = outer_ref.cte_select.clone();
@@ -1055,24 +1046,17 @@ fn parse_table(
         // This is a materialized view with storage - treat it as a regular BTree table
         // Create a BTreeTable from the view's metadata
         let columns = view_guard.column_schema.flat_columns();
-        let logical_to_physical_map =
-            crate::schema::BTreeTable::build_logical_to_physical_map(&columns);
-        let btree_table = Arc::new(crate::schema::BTreeTable {
-            name: view_guard.name().to_string(),
+        let btree_table = Arc::new(crate::schema::BTreeTable::new(
             root_page,
+            view_guard.name().to_string(),
+            Vec::new(),
             columns,
-            primary_key_columns: Vec::new(),
-            has_rowid: true,
-            is_strict: false,
-            has_autoincrement: false,
-
-            unique_sets: vec![],
-            foreign_keys: vec![],
-            check_constraints: vec![],
-            rowid_alias_conflict_clause: None,
-            has_virtual_columns: false,
-            logical_to_physical_map,
-        });
+            crate::schema::BTreeCharacteristics::HAS_ROWID,
+            vec![],
+            vec![],
+            vec![],
+            None,
+        ));
         drop(view_guard);
 
         let alias = maybe_alias.map(|a| normalize_ident(a.name().as_str()));
@@ -1287,6 +1271,7 @@ pub fn parse_from(
                     identifier: cte_def.name.clone(),
                     internal_id: cte_table.internal_id,
                     table: cte_table.table,
+                    using_dedup_hidden_cols: ColumnMask::default(),
                     col_used_mask: ColumnUsedMask::default(),
                     cte_select: Some(cte_def.select.clone()),
                     cte_explicit_columns: cte_def.explicit_columns.clone(),
@@ -1477,82 +1462,7 @@ pub fn determine_where_to_eval_term(
 /// the [TableMask] refers to the index of the table in the original join order, not the internal ID.
 /// This is simply because we want to represent the tables as a contiguous set of bits, and the internal ID
 /// might not be contiguous after e.g. subquery unnesting or other transformations.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct TableMask(pub u128);
-
-impl std::ops::BitOrAssign for TableMask {
-    fn bitor_assign(&mut self, rhs: Self) {
-        self.0 |= rhs.0;
-    }
-}
-
-impl TableMask {
-    /// Creates a new empty table mask.
-    ///
-    /// The initial mask represents an empty set of tables.
-    pub fn new() -> Self {
-        Self(0)
-    }
-
-    /// Returns true if the mask represents an empty set of tables.
-    pub fn is_empty(&self) -> bool {
-        self.0 == 0
-    }
-
-    /// Creates a new mask that is the same as this one but without the specified table.
-    pub fn without_table(&self, table_no: usize) -> Self {
-        turso_assert_less_than!(table_no, 127, "table_no must be less than 127");
-        Self(self.0 ^ (1 << (table_no + 1)))
-    }
-
-    /// Creates a table mask from raw bits.
-    ///
-    /// The bits are shifted left by 1 to maintain the convention that table 0 is at bit 1.
-    pub fn from_bits(bits: u128) -> Self {
-        Self(bits << 1)
-    }
-
-    /// Creates a table mask from an iterator of table numbers.
-    pub fn from_table_number_iter(iter: impl Iterator<Item = usize>) -> Self {
-        iter.fold(Self::new(), |mut mask, table_no| {
-            turso_assert_less_than!(table_no, 127, "table_no must be less than 127");
-            mask.add_table(table_no);
-            mask
-        })
-    }
-
-    /// Adds a table to the mask.
-    pub fn add_table(&mut self, table_no: usize) {
-        turso_assert_less_than!(table_no, 127, "table_no must be less than 127");
-        self.0 |= 1 << (table_no + 1);
-    }
-
-    /// Returns true if the mask contains the specified table.
-    pub fn contains_table(&self, table_no: usize) -> bool {
-        turso_assert_less_than!(table_no, 127, "table_no must be less than 127");
-        self.0 & (1 << (table_no + 1)) != 0
-    }
-
-    /// Returns true if this mask contains all tables in the other mask.
-    pub fn contains_all(&self, other: &TableMask) -> bool {
-        self.0 & other.0 == other.0
-    }
-
-    /// Returns the number of tables in the mask.
-    pub fn table_count(&self) -> usize {
-        self.0.count_ones() as usize
-    }
-
-    /// Returns true if this mask shares any tables with the other mask.
-    pub fn intersects(&self, other: &TableMask) -> bool {
-        self.0 & other.0 != 0
-    }
-
-    /// Iterate the table indices present in this mask.
-    pub fn tables_iter(&self) -> impl Iterator<Item = usize> + '_ {
-        (0..127).filter(move |table_no| self.contains_table(*table_no))
-    }
-}
+pub type TableMask = BitSet;
 
 /// Returns a [TableMask] representing the tables referenced in the given expression.
 ///
@@ -1564,7 +1474,7 @@ pub fn table_mask_from_expr(
     table_references: &TableReferences,
     subqueries: &[NonFromClauseSubquery],
 ) -> Result<TableMask> {
-    let mut mask = TableMask::new();
+    let mut mask = TableMask::default();
     walk_expr(top_level_expr, &mut |expr: &Expr| -> Result<WalkControl> {
         match expr {
             Expr::Column { table, .. } | Expr::RowId { table, .. } => {
@@ -1573,7 +1483,7 @@ pub fn table_mask_from_expr(
                     .iter()
                     .position(|t| t.internal_id == *table)
                 {
-                    mask.add_table(table_idx);
+                    mask.set(table_idx);
                 } else if table_references
                     .find_outer_query_ref_by_internal_id(*table)
                     .is_none()
@@ -1601,7 +1511,7 @@ pub fn table_mask_from_expr(
                                 .iter()
                                 .position(|t| t.internal_id == *outer_ref_id)
                             {
-                                mask.add_table(table_idx);
+                                mask.set(table_idx);
                             }
                         }
                     }
@@ -1619,7 +1529,7 @@ pub fn table_mask_from_expr(
                                 .iter()
                                 .position(|t| t.internal_id == *outer_ref_id)
                             {
-                                mask.add_table(table_idx);
+                                mask.set(table_idx);
                             }
                         }
                     }
@@ -1782,7 +1692,7 @@ fn parse_join(
     };
 
     if natural && constraint.is_some() {
-        crate::bail_parse_error!("NATURAL JOIN cannot be combined with ON or USING clause");
+        crate::bail_parse_error!("a NATURAL join may not have an ON or USING clause");
     }
 
     // SQLite allows duplicate table names/aliases in FROM clauses.
@@ -1873,7 +1783,7 @@ fn parse_join(
                     }
                     if left_col.is_none() {
                         crate::bail_parse_error!(
-                            "cannot join using column {} - column not present in all tables",
+                            "cannot join using column {} - column not present in both tables",
                             distinct_name.as_str()
                         );
                     }
@@ -1884,7 +1794,7 @@ fn parse_join(
                     });
                     if right_col.is_none() {
                         crate::bail_parse_error!(
-                            "cannot join using column {} - column not present in all tables",
+                            "cannot join using column {} - column not present in both tables",
                             distinct_name.as_str()
                         );
                     }

@@ -94,6 +94,6 @@ QUERY PLAN
 |  |        `--SCAN prior_days
 |  |           |--SCAN signal_days AS d1
 |  |           `--CORRELATED SCALAR SUBQUERY 1
-|  |              `--SCAN signal_days AS d2
+|  |              `--SEARCH d2 USING INDEX ephemeral_subquery_t11 (signal_day<?)
 |  `--USE SORTER FOR GROUP BY
 `--USE SORTER FOR ORDER BY

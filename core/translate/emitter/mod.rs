@@ -1,49 +1,58 @@
-use crate::translate::collate::{get_expr_collation_ctx, CollationSeq};
-use crate::translate::emitter::delete::emit_program_for_delete;
-use crate::translate::emitter::select::emit_program_for_select;
-use crate::translate::emitter::update::emit_program_for_update;
-use crate::translate::main_loop::SemiAntiJoinMetadata;
 // This module contains code for emitting bytecode instructions for SQL query execution.
 // It handles translating high-level SQL operations into low-level bytecode that can be executed by the virtual machine.
-
-use crate::sync::Arc;
+use super::{
+    collate::{get_expr_collation_ctx, CollationSeq},
+    compound_select::emit_program_for_compound_select,
+    emitter::{
+        delete::emit_program_for_delete, select::emit_program_for_select,
+        update::emit_program_for_update,
+    },
+    expr::{
+        bind_and_rewrite_expr, emit_table_column, translate_expr, translate_expr_no_constant_opt,
+        walk_expr, walk_expr_mut, BindingBehavior, ExprAffinityInfo, NoConstantOptReason,
+        WalkControl,
+    },
+    group_by::GroupByMetadata,
+    main_loop::{LeftJoinMetadata, LoopLabels, SemiAntiJoinMetadata},
+    order_by::SortMetadata,
+    plan::{
+        BitSet, HashJoinType, JoinedTable, NonFromClauseSubquery, Plan, ResultSetColumn,
+        TableReferences,
+    },
+    planner::{TableMask, ROWID_STRS},
+    trigger_exec::{get_triggers_including_temp, has_triggers_including_temp},
+    window::WindowMetadata,
+};
+use crate::instrument;
+use crate::schema::{
+    BTreeTable, CheckConstraint, Column, ColumnLayout, IndexColumn, Schema, Table,
+};
+use crate::translate::plan::ColumnMask;
+use crate::vdbe::{
+    affinity::Affinity,
+    builder::{CursorType, DmlColumnContext, ProgramBuilder, SelfTableContext},
+    insn::{to_u16, InsertFlags, Insn},
+    BranchOffset, CursorID,
+};
+use crate::{
+    bail_parse_error,
+    error::SQLITE_CONSTRAINT_CHECK,
+    function::Func,
+    sync::Arc,
+    turso_assert_ne,
+    util::{
+        check_expr_references_column, exprs_are_equivalent, normalize_ident, parse_numeric_literal,
+    },
+    CaptureDataChangesExt, Connection, Database, DatabaseCatalog, LimboError, Result, RwLock,
+    SymbolTable,
+};
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use std::borrow::Cow;
-use turso_macros::match_ignore_ascii_case;
-
-use super::expr::translate_expr;
-use super::group_by::GroupByMetadata;
-use super::main_loop::{LeftJoinMetadata, LoopLabels};
-use super::order_by::SortMetadata;
-use super::plan::{HashJoinType, TableReferences};
-use crate::error::SQLITE_CONSTRAINT_CHECK;
-use crate::function::Func;
-use crate::schema::{
-    BTreeTable, CheckConstraint, Column, ColumnLayout, GeneratedType, IndexColumn, Schema, Table,
-};
-use crate::translate::compound_select::emit_program_for_compound_select;
-use crate::translate::expr::{
-    bind_and_rewrite_expr, translate_expr_no_constant_opt, walk_expr, walk_expr_mut,
-    BindingBehavior, NoConstantOptReason, WalkControl,
-};
-use crate::translate::plan::{JoinedTable, NonFromClauseSubquery, Plan, ResultSetColumn};
-use crate::translate::planner::TableMask;
-use crate::translate::planner::ROWID_STRS;
-use crate::translate::trigger_exec::get_relevant_triggers_type_and_time;
-use crate::translate::window::WindowMetadata;
-use crate::util::{
-    check_expr_references_column, exprs_are_equivalent, normalize_ident, parse_numeric_literal,
-};
-use crate::vdbe::affinity::Affinity;
-use crate::vdbe::builder::{CursorType, DmlColumnContext, ProgramBuilder, SelfTableContext};
-use crate::vdbe::insn::{to_u16, InsertFlags};
-use crate::vdbe::{insn::Insn, BranchOffset, CursorID};
-use crate::{bail_parse_error, Database, DatabaseCatalog, LimboError, Result, RwLock, SymbolTable};
-use crate::{CaptureDataChangesExt, Connection};
-use tracing::instrument;
+use std::cell::RefCell;
 use turso_parser::ast::{
     self, Expr, Literal, ResolveType, SubqueryType, TableInternalId, TriggerTime,
 };
+
 pub(crate) mod delete;
 pub(crate) mod gencol;
 pub(crate) mod select;
@@ -126,7 +135,9 @@ impl From<bool> for DoubleQuotedDml {
 pub struct Resolver<'a> {
     schema: &'a Schema,
     database_schemas: &'a RwLock<HashMap<usize, Arc<Schema>>>,
+    temp_database: &'a RwLock<Option<crate::connection::TempDatabase>>,
     attached_databases: &'a RwLock<DatabaseCatalog>,
+    non_main_schema_cache: RefCell<HashMap<usize, Arc<Schema>>>,
     pub symbol_table: &'a SymbolTable,
     pub expr_to_reg_cache_enabled: bool,
     /// Cache entries for previously translated expressions.
@@ -140,14 +151,31 @@ pub struct Resolver<'a> {
     /// mechanism, but operates as a side-channel since limbo rewrites the AST rather
     /// than redirecting column reads at codegen time.
     pub register_affinities: HashMap<usize, Affinity>,
+    /// Affinity metadata for planned scalar subqueries keyed by their internal ID.
+    /// This lets comparison affinity follow SQLite rules for expressions like
+    /// `(SELECT text_col FROM ...) > some_numeric_expr`.
+    pub(crate) subquery_affinities: RefCell<HashMap<TableInternalId, ExprAffinityInfo>>,
     pub enable_custom_types: bool,
     /// Controls whether unresolved double-quoted identifiers fall back to string
     /// literals (SQLite's DQS misfeature) in DML statements.
     pub dqs_dml: DoubleQuotedDml,
     /// When set, we are compiling a trigger subprogram for this database.
-    /// All table references must resolve to this same database; cross-database
-    /// references are forbidden (matching SQLite's behavior).
+    /// Ordinary triggers are restricted to their own database, but temp-backed
+    /// triggers follow SQLite's looser resolution rules and may access objects
+    /// across schemas.
     pub(crate) trigger_context: Option<TriggerDatabaseContext>,
+    /// Cached flag: true when this connection has an active temp database.
+    ///
+    /// Computed once at Resolver construction to avoid repeated
+    /// `RwLock` reads on every table-name resolution. Safe because a
+    /// `Resolver` is short-lived (single translate pass) and a
+    /// connection is single-threaded at the VDBE layer: the temp
+    /// database can only be initialized / torn down *between*
+    /// Resolvers on the same connection, not during. If you add a
+    /// path that can initialize the temp database *inside* translate
+    /// (e.g. via a nested sub-program), update this field on that
+    /// path or switch to a live read.
+    has_temp_schema: bool,
 }
 
 /// Context for restricting table resolution during trigger subprogram compilation.
@@ -159,6 +187,12 @@ pub(crate) struct TriggerDatabaseContext {
     trigger_name: String,
 }
 
+impl TriggerDatabaseContext {
+    fn restricts_db_references(&self) -> bool {
+        self.database_id != crate::TEMP_DB_ID
+    }
+}
+
 impl<'a> Resolver<'a> {
     const MAIN_DB: &'static str = "main";
     const TEMP_DB: &'static str = "temp";
@@ -166,22 +200,28 @@ impl<'a> Resolver<'a> {
     pub(crate) fn new(
         schema: &'a Schema,
         database_schemas: &'a RwLock<HashMap<usize, Arc<Schema>>>,
+        temp_database: &'a RwLock<Option<crate::connection::TempDatabase>>,
         attached_databases: &'a RwLock<DatabaseCatalog>,
         symbol_table: &'a SymbolTable,
         enable_custom_types: bool,
         dqs_dml: DoubleQuotedDml,
     ) -> Self {
+        let has_temp_schema = temp_database.read().is_some();
         Self {
             schema,
             database_schemas,
+            temp_database,
             attached_databases,
+            non_main_schema_cache: RefCell::new(HashMap::default()),
             symbol_table,
             expr_to_reg_cache_enabled: false,
             expr_to_reg_cache: Vec::new(),
             register_affinities: HashMap::default(),
+            subquery_affinities: RefCell::new(HashMap::default()),
             enable_custom_types,
             dqs_dml,
             trigger_context: None,
+            has_temp_schema,
         }
     }
 
@@ -189,18 +229,26 @@ impl<'a> Resolver<'a> {
         self.schema
     }
 
+    pub fn has_temp_database(&self) -> bool {
+        self.has_temp_schema
+    }
+
     pub fn fork(&self) -> Resolver<'a> {
         Resolver {
             schema: self.schema,
             database_schemas: self.database_schemas,
+            temp_database: self.temp_database,
             attached_databases: self.attached_databases,
+            non_main_schema_cache: RefCell::new(HashMap::default()),
             symbol_table: self.symbol_table,
             expr_to_reg_cache_enabled: false,
             expr_to_reg_cache: Vec::new(),
             register_affinities: HashMap::default(),
+            subquery_affinities: RefCell::new(self.subquery_affinities.borrow().clone()),
             enable_custom_types: self.enable_custom_types,
             dqs_dml: self.dqs_dml,
             trigger_context: self.trigger_context.clone(),
+            has_temp_schema: self.has_temp_schema,
         }
     }
 
@@ -208,14 +256,18 @@ impl<'a> Resolver<'a> {
         Resolver {
             schema: self.schema,
             database_schemas: self.database_schemas,
+            temp_database: self.temp_database,
             attached_databases: self.attached_databases,
+            non_main_schema_cache: RefCell::new(HashMap::default()),
             symbol_table: self.symbol_table,
             expr_to_reg_cache_enabled: self.expr_to_reg_cache_enabled,
             expr_to_reg_cache: self.expr_to_reg_cache.clone(),
             register_affinities: self.register_affinities.clone(),
+            subquery_affinities: RefCell::new(self.subquery_affinities.borrow().clone()),
             enable_custom_types: self.enable_custom_types,
             dqs_dml: self.dqs_dml,
             trigger_context: self.trigger_context.clone(),
+            has_temp_schema: self.has_temp_schema,
         }
     }
 
@@ -224,6 +276,53 @@ impl<'a> Resolver<'a> {
             crate::bail_parse_error!("{} require --experimental-custom-types flag", feature);
         }
         Ok(())
+    }
+
+    fn cached_non_main_schema(&self, database_id: usize) -> Arc<Schema> {
+        turso_assert_ne!(database_id, crate::MAIN_DB_ID);
+
+        if let Some(schema) = self
+            .non_main_schema_cache
+            .borrow()
+            .get(&database_id)
+            .cloned()
+        {
+            return schema;
+        }
+
+        // TEMP uses `temp_db.db.schema` as its single source of truth; skip
+        // `database_schemas` which is never populated for TEMP.
+        if database_id != crate::TEMP_DB_ID {
+            if let Some(schema) = self.database_schemas.read().get(&database_id).cloned() {
+                self.non_main_schema_cache
+                    .borrow_mut()
+                    .insert(database_id, schema.clone());
+                return schema;
+            }
+        }
+
+        let loaded_schema = match database_id {
+            crate::TEMP_DB_ID => self
+                .temp_database
+                .read()
+                .as_ref()
+                .map(|temp_db| temp_db.db.schema.lock().clone())
+                .unwrap_or_else(|| Arc::new(Schema::with_options(self.enable_custom_types))),
+            _ => {
+                let attached_dbs = self.attached_databases.read();
+                let (db, _pager) = attached_dbs
+                    .index_to_data
+                    .get(&database_id)
+                    .expect("Database ID should be valid after resolve_database_id");
+                let schema = db.schema.lock().clone();
+                schema
+            }
+        };
+
+        self.non_main_schema_cache
+            .borrow_mut()
+            .insert(database_id, loaded_schema.clone());
+        loaded_schema
     }
 
     /// Set trigger database context to restrict table resolution to the trigger's database.
@@ -300,40 +399,158 @@ impl<'a> Resolver<'a> {
 
     /// Access schema for a database using a closure pattern to avoid cloning
     pub(crate) fn with_schema<T>(&self, database_id: usize, f: impl FnOnce(&Schema) -> T) -> T {
-        if database_id == crate::MAIN_DB_ID || database_id == crate::TEMP_DB_ID {
-            f(self.schema)
-        } else {
-            // Attached database: prefer the connection-local copy (which may contain
-            // uncommitted schema changes from this connection's transaction), falling
-            // back to the shared Database schema (last committed state).
-            let schemas = self.database_schemas.read();
-            if let Some(local_schema) = schemas.get(&database_id) {
-                return f(local_schema);
+        match database_id {
+            crate::MAIN_DB_ID => f(self.schema),
+            _ => {
+                let schema = self.cached_non_main_schema(database_id);
+                f(&schema)
             }
-            drop(schemas);
-
-            let attached_dbs = self.attached_databases.read();
-            let (db, _pager) = attached_dbs
-                .index_to_data
-                .get(&database_id)
-                .expect("Database ID should be valid after resolve_database_id");
-
-            let schema = db.schema.lock().clone();
-            f(&schema)
         }
+    }
+
+    pub(crate) fn attached_database_ids_in_search_order(&self) -> BitSet {
+        self.attached_databases
+            .read()
+            .index_to_data
+            .keys()
+            .copied()
+            .collect()
+    }
+
+    fn resolve_unqualified_existing_database_id<F>(
+        &self,
+        object_name: &str,
+        schema_contains_object: F,
+    ) -> usize
+    where
+        F: Fn(&Schema, &str) -> bool,
+    {
+        // Only check the temp schema when a temp database actually exists.
+        // This avoids expensive schema construction/lookup on every table
+        // resolution when no temp objects have been created.
+        if self.has_temp_schema
+            && self.with_schema(crate::TEMP_DB_ID, |schema| {
+                schema_contains_object(schema, object_name)
+            })
+        {
+            return crate::TEMP_DB_ID;
+        }
+
+        if self.with_schema(crate::MAIN_DB_ID, |schema| {
+            schema_contains_object(schema, object_name)
+        }) {
+            return crate::MAIN_DB_ID;
+        }
+
+        for database_id in self.attached_database_ids_in_search_order() {
+            if self.with_schema(database_id, |schema| {
+                schema_contains_object(schema, object_name)
+            }) {
+                return database_id;
+            }
+        }
+
+        crate::MAIN_DB_ID
+    }
+
+    fn schema_has_table_like_object(schema: &Schema, table_name: &str) -> bool {
+        schema.get_table(table_name).is_some()
+            || schema.get_view(table_name).is_some()
+            || schema.get_materialized_view(table_name).is_some()
+    }
+
+    fn schema_has_index(schema: &Schema, index_name: &str) -> bool {
+        schema
+            .indexes
+            .values()
+            .flat_map(|indexes| indexes.iter())
+            .any(|index| index.name.eq_ignore_ascii_case(index_name))
+    }
+
+    fn schema_has_trigger(schema: &Schema, trigger_name: &str) -> bool {
+        schema.get_trigger(trigger_name).is_some()
+    }
+
+    fn resolve_schema_table_database_id(table_name: &str) -> Option<usize> {
+        if table_name.eq_ignore_ascii_case(crate::schema::TEMP_SCHEMA_TABLE_NAME)
+            || table_name.eq_ignore_ascii_case(crate::schema::TEMP_SCHEMA_TABLE_NAME_ALT)
+        {
+            return Some(crate::TEMP_DB_ID);
+        }
+
+        if table_name.eq_ignore_ascii_case(crate::schema::SCHEMA_TABLE_NAME)
+            || table_name.eq_ignore_ascii_case(crate::schema::SCHEMA_TABLE_NAME_ALT)
+        {
+            return Some(crate::MAIN_DB_ID);
+        }
+
+        None
+    }
+
+    pub(crate) fn resolve_existing_table_database_id_qualified(
+        &self,
+        qualified_name: &ast::QualifiedName,
+    ) -> Result<usize> {
+        if qualified_name.db_name.is_some() {
+            return self.resolve_database_id(qualified_name);
+        }
+        self.resolve_existing_table_database_id(qualified_name.name.as_str())
+    }
+
+    pub(crate) fn resolve_existing_table_database_id(&self, table_name: &str) -> Result<usize> {
+        if let Some(ref ctx) = self.trigger_context {
+            if ctx.restricts_db_references() {
+                return Ok(ctx.database_id);
+            }
+
+            return Ok(self.resolve_unqualified_existing_database_id(
+                table_name,
+                Self::schema_has_table_like_object,
+            ));
+        }
+
+        if let Some(database_id) = Self::resolve_schema_table_database_id(table_name) {
+            return Ok(database_id);
+        }
+
+        Ok(self.resolve_unqualified_existing_database_id(
+            table_name,
+            Self::schema_has_table_like_object,
+        ))
+    }
+
+    pub(crate) fn resolve_existing_index_database_id(
+        &self,
+        qualified_name: &ast::QualifiedName,
+    ) -> Result<usize> {
+        if qualified_name.db_name.is_some() {
+            return self.resolve_database_id(qualified_name);
+        }
+
+        let index_name = normalize_ident(qualified_name.name.as_str());
+        Ok(self.resolve_unqualified_existing_database_id(&index_name, Self::schema_has_index))
+    }
+
+    pub(crate) fn resolve_existing_trigger_database_id(
+        &self,
+        qualified_name: &ast::QualifiedName,
+    ) -> Result<usize> {
+        if qualified_name.db_name.is_some() {
+            return self.resolve_database_id(qualified_name);
+        }
+
+        let trigger_name = qualified_name.name.as_str();
+        Ok(self.resolve_unqualified_existing_database_id(trigger_name, Self::schema_has_trigger))
     }
 
     /// Resolve database ID from a qualified name
     pub(crate) fn resolve_database_id(&self, qualified_name: &ast::QualifiedName) -> Result<usize> {
-        use crate::util::normalize_ident;
-
         // Check if this is a qualified name (database.table) or unqualified
         let resolved_id = if let Some(db_name) = &qualified_name.db_name {
             let db_name_normalized = normalize_ident(db_name.as_str());
-            let name_bytes = db_name_normalized.as_bytes();
-            match_ignore_ascii_case!(match name_bytes {
-                b"main" => Ok(0),
-                b"temp" => Ok(1),
+            match db_name_normalized.as_str() {
+                "main" => Ok(crate::MAIN_DB_ID),
+                "temp" => Ok(crate::TEMP_DB_ID),
                 _ => {
                     // Look up attached database
                     if let Some((idx, _attached_db)) =
@@ -346,13 +563,17 @@ impl<'a> Resolver<'a> {
                         )))
                     }
                 }
-            })
+            }
         } else {
             // Unqualified table name — when compiling a trigger subprogram,
             // resolve to the trigger's database (matching SQLite behavior).
             // Otherwise default to main.
             if let Some(ref ctx) = self.trigger_context {
-                Ok(ctx.database_id)
+                if ctx.restricts_db_references() {
+                    Ok(ctx.database_id)
+                } else {
+                    Ok(crate::MAIN_DB_ID)
+                }
             } else {
                 Ok(0)
             }
@@ -362,6 +583,9 @@ impl<'a> Resolver<'a> {
         // This only fires for explicitly qualified names (e.g. "aux.table")
         // since unqualified names already resolve to the trigger's database above.
         if let Some(ref ctx) = self.trigger_context {
+            if !ctx.restricts_db_references() {
+                return Ok(resolved_id);
+            }
             if resolved_id != ctx.database_id {
                 let db_name = qualified_name
                     .db_name
@@ -453,7 +677,7 @@ pub struct MaterializedBuildInput {
     /// Encoding mode for the materialized rows.
     pub mode: MaterializedBuildInputMode,
     /// Join-prefix table indices folded into this materialization.
-    pub prefix_tables: Vec<usize>,
+    pub prefix_tables: TableMask,
 }
 
 impl LimitCtx {
@@ -1411,6 +1635,74 @@ fn rewrite_where_for_update_registers(
     })
 }
 
+/// Emits  `target_columns`, plus the stored columns needed by `target_columns`, into compact
+/// registers. This takes into account stored columns, and any stored columns required
+/// by virtual columns in `target_columns`.
+///
+/// Target columns are guaranteed to be in a contiguous block, in the given order, at the start of
+/// registers. The following postcondition holds:
+///
+/// ```text
+/// dml_ctx.to_column_reg(target_columns[i]) == dml_ctx.to_column_reg(target_columns[0]) + i
+/// ```
+///
+/// This way, target_columns[0] can be used as a base for opcodes that require unpacked records.
+pub(crate) fn emit_columns_and_dependencies(
+    program: &mut ProgramBuilder,
+    table: &BTreeTable,
+    cursor_id: usize,
+    rowid_reg: usize,
+    target_columns: impl IntoIterator<Item = usize>,
+    resolver: &Resolver,
+) -> Result<DmlColumnContext> {
+    let targets: Vec<usize> = target_columns.into_iter().collect();
+    let dependencies = table.dependencies_of_columns(targets.iter().copied())?;
+
+    let target_base = program.alloc_registers(targets.len());
+    let extra_base = {
+        let mut dependencies_not_in_targets: ColumnMask = dependencies.clone();
+        let target_mask = targets.iter().copied().collect();
+        dependencies_not_in_targets -= &target_mask;
+
+        let extra_count = dependencies_not_in_targets.count();
+
+        if extra_count > 0 {
+            program.alloc_registers(extra_count)
+        } else {
+            0
+        }
+    };
+
+    let mut extra_idx = 0;
+    let pairs = table.columns().iter().enumerate().map(|(idx, col)| {
+        let reg = if col.is_rowid_alias() {
+            rowid_reg
+        } else if let Some(pos) = targets.iter().position(|&t| t == idx) {
+            let reg = target_base + pos;
+            if !col.is_virtual_generated() {
+                program.emit_column_or_rowid(cursor_id, idx, reg);
+            }
+            reg
+        } else if dependencies.get(idx) {
+            let reg = extra_base + extra_idx;
+            program.emit_column_or_rowid(cursor_id, idx, reg);
+            extra_idx += 1;
+            reg
+        } else {
+            0
+        };
+        (col, reg)
+    });
+    let dml_ctx = DmlColumnContext::from_column_reg_mapping(pairs);
+    debug_assert!(targets
+        .windows(2)
+        .all(|w| { dml_ctx.to_column_reg(w[1]) == dml_ctx.to_column_reg(w[0]) + 1 }));
+
+    gencol::compute_virtual_columns(program, &table.columns_topo_sort()?, &dml_ctx, resolver)?;
+
+    Ok(dml_ctx)
+}
+
 /// Emit code to load the value of an IndexColumn from the OLD image of the row being updated.
 /// Handling expression indexes and regular columns
 pub(crate) fn emit_index_column_value_old_image(
@@ -1418,6 +1710,7 @@ pub(crate) fn emit_index_column_value_old_image(
     resolver: &Resolver,
     table_references: &mut TableReferences,
     table_cursor_id: usize,
+    table_internal_id: TableInternalId,
     idx_col: &IndexColumn,
     dest_reg: usize,
 ) -> Result<()> {
@@ -1431,15 +1724,11 @@ pub(crate) fn emit_index_column_value_old_image(
             BindingBehavior::ResultColumnsNotAllowed,
         )?;
 
-        let self_table_context =
-            table_references
-                .joined_tables()
-                .first()
-                .map(|jt| SelfTableContext::ForSelect {
-                    table_ref_id: jt.internal_id,
-                    referenced_tables: table_references.clone(),
-                });
-        program.with_self_table_context(self_table_context.as_ref(), |program, _| {
+        let self_table_context = SelfTableContext::ForSelect {
+            table_ref_id: table_internal_id,
+            referenced_tables: table_references.clone(),
+        };
+        program.with_self_table_context(Some(&self_table_context), |program, _| {
             translate_expr_no_constant_opt(
                 program,
                 Some(table_references),
@@ -1450,10 +1739,40 @@ pub(crate) fn emit_index_column_value_old_image(
             )?;
             Ok(())
         })?;
+    } else if let Some(generated_column) = generated_column(program, table_cursor_id, idx_col) {
+        emit_table_column(
+            program,
+            table_cursor_id,
+            table_internal_id,
+            table_references,
+            &generated_column,
+            idx_col.pos_in_table,
+            dest_reg,
+            resolver,
+        )?;
     } else {
         program.emit_column_or_rowid(table_cursor_id, idx_col.pos_in_table, dest_reg);
     }
     Ok(())
+}
+
+fn generated_column(
+    program: &mut ProgramBuilder,
+    table_cursor_id: usize,
+    idx_col: &IndexColumn,
+) -> Option<Column> {
+    program
+        .btree_table_from_cursor(table_cursor_id)
+        .iter()
+        .cloned()
+        .flat_map(|table| {
+            table
+                .columns()
+                .get(idx_col.pos_in_table)
+                .filter(|col| col.is_virtual_generated())
+                .cloned()
+        })
+        .next()
 }
 
 /// Emit code to load the value of an IndexColumn from the NEW image of the row being updated.
@@ -1518,33 +1837,16 @@ fn emit_index_column_value_new_image(
         let col_in_table = columns
             .get(idx_col.pos_in_table)
             .expect("column index out of bounds");
-        match col_in_table.generated_type() {
-            GeneratedType::Virtual { ref resolved, .. } => {
-                gencol::emit_gencol_expr_from_registers(
-                    program,
-                    resolved,
-                    dest_reg,
-                    columns_start_reg,
-                    columns,
-                    resolver,
-                    rowid_reg,
-                    layout,
-                )?;
-                program.emit_column_affinity(dest_reg, col_in_table.affinity());
-            }
-            GeneratedType::NotGenerated => {
-                let src_reg = if col_in_table.is_rowid_alias() {
-                    rowid_reg
-                } else {
-                    layout.to_register(columns_start_reg, idx_col.pos_in_table)
-                };
-                program.emit_insn(Insn::Copy {
-                    src_reg,
-                    dst_reg: dest_reg,
-                    extra_amount: 0,
-                });
-            }
-        }
+        let src_reg = if col_in_table.is_rowid_alias() {
+            rowid_reg
+        } else {
+            layout.to_register(columns_start_reg, idx_col.pos_in_table)
+        };
+        program.emit_insn(Insn::Copy {
+            src_reg,
+            dst_reg: dest_reg,
+            extra_amount: 0,
+        });
     }
     Ok(())
 }
