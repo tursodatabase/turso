@@ -4749,6 +4749,9 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                                 }
                                 self.insert_table_id_to_rootpage(table_id, None);
                             } else {
+                                dropped_root_pages.remove(&root_page);
+                                // later schema upsert makes this root page non-dropped again, so remove from dropped_root_pages
+                                // set if it was previously added by an earlier schema row
                                 let table_id = self.get_table_id_from_root_page(root_page);
                                 let Some(entry) = self.table_id_to_rootpage.get(&table_id) else {
                                     panic!("Logical log contains root page reference {root_page} that does not exist in the table_id_to_rootpage map");
