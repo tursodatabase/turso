@@ -28,9 +28,9 @@ use crate::io::clock::MonotonicInstant;
 use crate::io::CompletionGroup;
 use crate::io::{File, IO};
 use crate::storage::database::{DatabaseStorage, EncryptionOrChecksum};
-#[cfg(all(unix, target_pointer_width = "64"))]
+#[cfg(host_shared_wal)]
 use crate::storage::shared_wal_coordination::SharedWalCoordinationOpenMode;
-#[cfg(all(unix, target_pointer_width = "64"))]
+#[cfg(host_shared_wal)]
 use crate::storage::shared_wal_coordination::{
     MappedSharedWalCoordination, SharedOwnerRecord, SharedReaderSlot, SharedWalCoordinationHeader,
 };
@@ -108,7 +108,7 @@ impl CheckpointResult {
     }
 }
 
-#[cfg(all(unix, target_pointer_width = "64"))]
+#[cfg(host_shared_wal)]
 pub(crate) fn coordination_path_for_wal_path(wal_path: &str) -> String {
     if let Some(db_path) = wal_path.strip_suffix("-wal") {
         format!("{db_path}-tshm")
@@ -1162,7 +1162,7 @@ impl WalCoordination for InProcessWalCoordination {
 /// cross-process shared state (reader slots, frame index, snapshot metadata).
 /// Both are consulted: the fallback serializes same-process connections, the
 /// authority serializes across processes.
-#[cfg(all(unix, target_pointer_width = "64"))]
+#[cfg(host_shared_wal)]
 #[derive(Debug)]
 struct ShmWalCoordination {
     shared: Arc<RwLock<WalFileShared>>,
@@ -1175,7 +1175,7 @@ struct ShmWalCoordination {
     owner: SharedOwnerRecord,
 }
 
-#[cfg(all(unix, target_pointer_width = "64"))]
+#[cfg(host_shared_wal)]
 impl ShmWalCoordination {
     fn overflow_fallback_covers(
         &self,
@@ -1643,7 +1643,7 @@ impl ShmWalCoordination {
     }
 }
 
-#[cfg(all(unix, target_pointer_width = "64"))]
+#[cfg(host_shared_wal)]
 impl WalCoordination for ShmWalCoordination {
     fn load_snapshot(&self) -> WalSnapshot {
         let snapshot = self.authority.snapshot();
@@ -2558,7 +2558,7 @@ impl OverflowFallbackCoverage {
         self.valid = true;
     }
 
-    #[cfg(all(unix, target_pointer_width = "64"))]
+    #[cfg(host_shared_wal)]
     pub(crate) fn record_snapshot(
         &mut self,
         snapshot: SharedWalCoordinationHeader,
@@ -2572,7 +2572,7 @@ impl OverflowFallbackCoverage {
         );
     }
 
-    #[cfg(all(unix, target_pointer_width = "64"))]
+    #[cfg(host_shared_wal)]
     pub(crate) fn same_generation(&self, snapshot: SharedWalCoordinationHeader) -> bool {
         self.valid
             && self.checkpoint_seq == snapshot.checkpoint_seq
@@ -2580,7 +2580,7 @@ impl OverflowFallbackCoverage {
             && self.salt_2 == snapshot.salt_2
     }
 
-    #[cfg(all(unix, target_pointer_width = "64"))]
+    #[cfg(host_shared_wal)]
     pub(crate) fn covers(&self, snapshot: SharedWalCoordinationHeader, max_frame: u64) -> bool {
         self.same_generation(snapshot) && self.max_frame >= max_frame
     }
@@ -3725,7 +3725,7 @@ impl Wal for WalFile {
 }
 
 impl WalFile {
-    #[cfg(all(unix, target_pointer_width = "64"))]
+    #[cfg(host_shared_wal)]
     pub(crate) fn new_with_shared_coordination(
         io: Arc<dyn IO>,
         shared: Arc<RwLock<WalFileShared>>,
@@ -4378,7 +4378,7 @@ impl WalFile {
     }
 }
 
-#[cfg(all(unix, target_pointer_width = "64"))]
+#[cfg(host_shared_wal)]
 fn read_exact_bytes_from_file(
     io: &Arc<dyn IO>,
     file: &Arc<dyn File>,
@@ -4406,7 +4406,7 @@ fn read_exact_bytes_from_file(
     Ok(Some(read_buf.as_slice()[..len].to_vec()))
 }
 
-#[cfg(all(unix, target_pointer_width = "64"))]
+#[cfg(host_shared_wal)]
 fn read_validated_wal_header_from_file(
     io: &Arc<dyn IO>,
     file: &Arc<dyn File>,
@@ -4443,7 +4443,7 @@ fn read_validated_wal_header_from_file(
     Ok(Some(header))
 }
 
-#[cfg(all(unix, target_pointer_width = "64"))]
+#[cfg(host_shared_wal)]
 fn wal_header_matches_authority_snapshot(
     wal_header: WalHeader,
     snapshot: SharedWalCoordinationHeader,
@@ -4494,7 +4494,7 @@ fn read_database_identity_from_storage(
     )?))
 }
 
-#[cfg(all(test, unix, target_pointer_width = "64"))]
+#[cfg(all(test, host_shared_wal))]
 fn read_database_identity_from_file_path(
     io: &Arc<dyn IO>,
     wal_path: &str,
@@ -4517,14 +4517,14 @@ fn read_database_identity_from_file_path(
     Ok(Some(database_identity_from_header_bytes(&bytes)?))
 }
 
-#[cfg(all(unix, target_pointer_width = "64"))]
+#[cfg(host_shared_wal)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum AuthoritySnapshotValidation {
     Trusted,
     RebuildFromDisk(AuthoritySnapshotRebuildReason),
 }
 
-#[cfg(all(unix, target_pointer_width = "64"))]
+#[cfg(host_shared_wal)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum AuthoritySnapshotRebuildReason {
     WalHeaderUnreadable,
@@ -4537,7 +4537,7 @@ enum AuthoritySnapshotRebuildReason {
     LastFrameChecksumMismatch,
 }
 
-#[cfg(all(unix, target_pointer_width = "64"))]
+#[cfg(host_shared_wal)]
 fn classify_authority_snapshot_against_wal(
     io: &Arc<dyn IO>,
     file: &Arc<dyn File>,
@@ -4631,7 +4631,7 @@ impl WalFileShared {
         )
     }
 
-    #[cfg(all(unix, target_pointer_width = "64"))]
+    #[cfg(host_shared_wal)]
     pub(crate) fn open_shared_from_authority_if_exists(
         io: &Arc<dyn IO>,
         path: &str,
@@ -4908,7 +4908,7 @@ impl WalFileShared {
 
 #[cfg(test)]
 pub mod test {
-    #[cfg(all(unix, target_pointer_width = "64"))]
+    #[cfg(host_shared_wal)]
     use super::{
         classify_authority_snapshot_against_wal, AuthoritySnapshotRebuildReason,
         AuthoritySnapshotValidation, ShmWalCoordination,
@@ -4917,7 +4917,7 @@ pub mod test {
         InProcessWalCoordination, ReadGuardKind, Wal, WalCommitState, WalConnectionState,
         WalCoordination, WalFile, WalSnapshot,
     };
-    #[cfg(all(unix, target_pointer_width = "64"))]
+    #[cfg(host_shared_wal)]
     use crate::storage::shared_wal_coordination::{
         MappedSharedWalCoordination, SharedWalCoordinationHeader, SharedWalCoordinationOpenMode,
     };
@@ -5242,7 +5242,7 @@ pub mod test {
         InProcessWalCoordination::new(shared.clone())
     }
 
-    #[cfg(all(unix, target_pointer_width = "64"))]
+    #[cfg(host_shared_wal)]
     fn make_test_shm_coordination(
         shared: &Arc<RwLock<WalFileShared>>,
         path: &std::path::Path,
@@ -5254,7 +5254,7 @@ pub mod test {
         (authority, coordination)
     }
 
-    #[cfg(all(unix, target_pointer_width = "64"))]
+    #[cfg(host_shared_wal)]
     fn active_shared_reader_slot_count(authority: &MappedSharedWalCoordination) -> usize {
         let reader_slot_count = authority.snapshot().reader_slot_count;
         (0..reader_slot_count)
@@ -5262,7 +5262,7 @@ pub mod test {
             .count()
     }
 
-    #[cfg(all(unix, target_pointer_width = "64"))]
+    #[cfg(host_shared_wal)]
     fn write_test_wal_with_single_commit_frame(
         io: &Arc<dyn IO>,
         wal_path: &std::path::Path,
@@ -5343,7 +5343,7 @@ pub mod test {
         }
     }
 
-    #[cfg(all(unix, target_pointer_width = "64"))]
+    #[cfg(host_shared_wal)]
     fn open_test_db_file_for_wal(
         io: &Arc<dyn IO>,
         wal_path: &std::path::Path,
@@ -5356,7 +5356,7 @@ pub mod test {
     }
 
     #[test]
-    #[cfg(all(unix, target_pointer_width = "64"))]
+    #[cfg(host_shared_wal)]
     fn test_read_frame_keeps_epoch_from_issue_time() {
         let dir = tempfile::tempdir().unwrap();
         let wal_path = dir.path().join("epoch-race.db-wal");
@@ -5652,7 +5652,7 @@ pub mod test {
         coordination.end_write_tx();
     }
 
-    #[cfg(all(unix, target_pointer_width = "64"))]
+    #[cfg(host_shared_wal)]
     #[test]
     fn test_shm_coordination_uses_shared_authority() {
         let dir = tempfile::tempdir().unwrap();
@@ -5741,7 +5741,7 @@ pub mod test {
         assert!(shm_path.exists());
     }
 
-    #[cfg(all(unix, target_pointer_width = "64"))]
+    #[cfg(host_shared_wal)]
     #[test]
     fn test_shm_coordination_many_same_snapshot_readers_share_one_published_slot() {
         let dir = tempfile::tempdir().unwrap();
@@ -5798,7 +5798,7 @@ pub mod test {
         assert_eq!(active_shared_reader_slot_count(&authority), 0);
     }
 
-    #[cfg(all(unix, target_pointer_width = "64"))]
+    #[cfg(host_shared_wal)]
     #[test]
     fn test_shm_coordination_uses_one_published_slot_per_active_snapshot_generation() {
         let dir = tempfile::tempdir().unwrap();
@@ -5882,7 +5882,7 @@ pub mod test {
         assert_eq!(active_shared_reader_slot_count(&authority), 0);
     }
 
-    #[cfg(all(unix, target_pointer_width = "64"))]
+    #[cfg(host_shared_wal)]
     #[test]
     fn test_shm_coordination_shared_index_grows_past_old_fixed_limit() {
         const OLD_FIXED_LIMIT: u64 = 65_536;
@@ -5939,7 +5939,7 @@ pub mod test {
             .contains(&(7, OLD_FIXED_LIMIT + 2)));
     }
 
-    #[cfg(all(unix, target_pointer_width = "64"))]
+    #[cfg(host_shared_wal)]
     #[test]
     fn test_shm_coordination_restart_uses_authority_snapshot() {
         let dir = tempfile::tempdir().unwrap();
@@ -6050,7 +6050,7 @@ pub mod test {
         assert!(shared.runtime.frame_cache.lock().is_empty());
     }
 
-    #[cfg(all(unix, target_pointer_width = "64"))]
+    #[cfg(host_shared_wal)]
     #[test]
     fn test_shm_coordination_exclusive_reopen_reuses_persisted_authority() {
         let dir = tempfile::tempdir().unwrap();
@@ -6120,7 +6120,7 @@ pub mod test {
         assert_eq!(reopened_authority.min_active_reader_frame(), None);
     }
 
-    #[cfg(all(unix, target_pointer_width = "64"))]
+    #[cfg(host_shared_wal)]
     #[test]
     fn test_open_shared_from_authority_reuses_trusted_snapshot_after_exclusive_reopen() {
         let dir = tempfile::tempdir().unwrap();
@@ -6173,7 +6173,7 @@ pub mod test {
         assert!(shared.runtime.frame_cache.lock().is_empty());
     }
 
-    #[cfg(all(unix, target_pointer_width = "64"))]
+    #[cfg(host_shared_wal)]
     #[test]
     fn test_shm_coordination_live_overflow_returns_busy_without_runtime_disk_scan() {
         let dir = tempfile::tempdir().unwrap();
@@ -6227,7 +6227,7 @@ pub mod test {
         );
     }
 
-    #[cfg(all(unix, target_pointer_width = "64"))]
+    #[cfg(host_shared_wal)]
     #[test]
     fn test_open_shared_from_authority_exclusive_rebuilds_positive_snapshot_from_disk() {
         let dir = tempfile::tempdir().unwrap();
@@ -6278,7 +6278,7 @@ pub mod test {
         );
     }
 
-    #[cfg(all(unix, target_pointer_width = "64"))]
+    #[cfg(host_shared_wal)]
     #[test]
     fn test_shared_coordination_open_uses_reconciled_snapshot_for_local_wal_state() {
         let dir = tempfile::tempdir().unwrap();
@@ -6319,7 +6319,7 @@ pub mod test {
         assert_eq!(wal.get_last_checksum(), (31, 37));
     }
 
-    #[cfg(all(unix, target_pointer_width = "64"))]
+    #[cfg(host_shared_wal)]
     #[test]
     fn test_open_shared_from_authority_rebuilds_from_disk_when_snapshot_is_stale() {
         let dir = tempfile::tempdir().unwrap();
@@ -6369,7 +6369,7 @@ pub mod test {
         );
     }
 
-    #[cfg(all(unix, target_pointer_width = "64"))]
+    #[cfg(host_shared_wal)]
     #[test]
     fn test_open_shared_from_authority_rebuilt_authority_persists_across_exclusive_reopen() {
         let dir = tempfile::tempdir().unwrap();
@@ -6430,7 +6430,7 @@ pub mod test {
         assert_eq!(reopened_coordination.find_frame(7, 0, 1, None), Some(1));
     }
 
-    #[cfg(all(unix, target_pointer_width = "64"))]
+    #[cfg(host_shared_wal)]
     #[test]
     fn test_open_shared_from_authority_exclusive_disk_scan_does_not_downgrade_newer_zero_frame_generation(
     ) {
@@ -6490,7 +6490,7 @@ pub mod test {
         );
     }
 
-    #[cfg(all(unix, target_pointer_width = "64"))]
+    #[cfg(host_shared_wal)]
     #[test]
     fn test_open_shared_from_authority_ignores_unpublished_backfill_proof_after_exclusive_reopen() {
         let dir = tempfile::tempdir().unwrap();
@@ -6536,7 +6536,7 @@ pub mod test {
             .load(Ordering::Acquire));
     }
 
-    #[cfg(all(unix, target_pointer_width = "64"))]
+    #[cfg(host_shared_wal)]
     #[test]
     fn test_restart_checkpoint_clears_backfill_proof_and_later_replaces_it() {
         let (db, path) = get_database();
@@ -6624,7 +6624,7 @@ pub mod test {
         );
     }
 
-    #[cfg(all(unix, target_pointer_width = "64"))]
+    #[cfg(host_shared_wal)]
     #[test]
     fn test_truncate_checkpoint_clears_backfill_proof_and_later_replaces_it() {
         let (db, path) = get_database();
@@ -6722,7 +6722,7 @@ pub mod test {
         );
     }
 
-    #[cfg(all(unix, target_pointer_width = "64"))]
+    #[cfg(host_shared_wal)]
     #[test]
     fn test_classify_authority_snapshot_marks_truncated_wal_for_rebuild() {
         let dir = tempfile::tempdir().unwrap();
@@ -6752,7 +6752,7 @@ pub mod test {
         );
     }
 
-    #[cfg(all(unix, target_pointer_width = "64"))]
+    #[cfg(host_shared_wal)]
     #[test]
     fn test_classify_authority_snapshot_marks_corrupt_header_for_rebuild() {
         let dir = tempfile::tempdir().unwrap();
@@ -6789,7 +6789,7 @@ pub mod test {
         );
     }
 
-    #[cfg(all(unix, target_pointer_width = "64"))]
+    #[cfg(host_shared_wal)]
     #[test]
     fn test_open_shared_from_authority_keeps_zero_length_wal_uninitialized_after_exclusive_reopen()
     {
@@ -6844,7 +6844,7 @@ pub mod test {
             .load(Ordering::Acquire));
     }
 
-    #[cfg(all(unix, target_pointer_width = "64"))]
+    #[cfg(host_shared_wal)]
     #[test]
     fn test_shm_coordination_secondary_disk_scan_does_not_reseed_authority_while_writer_active() {
         let dir = tempfile::tempdir().unwrap();
@@ -6917,7 +6917,7 @@ pub mod test {
         authority.release_writer(authority.owner_record());
     }
 
-    #[cfg(all(unix, target_pointer_width = "64"))]
+    #[cfg(host_shared_wal)]
     #[test]
     fn test_shm_coordination_disk_scan_matching_authority_keeps_frame_index() {
         let dir = tempfile::tempdir().unwrap();
@@ -6991,7 +6991,7 @@ pub mod test {
         );
     }
 
-    #[cfg(all(unix, target_pointer_width = "64"))]
+    #[cfg(host_shared_wal)]
     #[test]
     fn test_shm_coordination_disk_scan_matching_snapshot_rebuilds_stale_frame_index() {
         let dir = tempfile::tempdir().unwrap();
@@ -7070,7 +7070,7 @@ pub mod test {
         );
     }
 
-    #[cfg(all(unix, target_pointer_width = "64"))]
+    #[cfg(host_shared_wal)]
     #[test]
     fn test_shm_coordination_empty_disk_scan_keeps_zero_frame_authority_metadata() {
         let dir = tempfile::tempdir().unwrap();
@@ -7118,7 +7118,7 @@ pub mod test {
         assert_eq!(header.salt_2, authoritative.salt_2);
     }
 
-    #[cfg(all(unix, target_pointer_width = "64"))]
+    #[cfg(host_shared_wal)]
     #[test]
     fn test_shm_coordination_empty_disk_scan_does_not_clobber_positive_authority() {
         let dir = tempfile::tempdir().unwrap();
@@ -7185,7 +7185,7 @@ pub mod test {
         );
     }
 
-    #[cfg(all(unix, target_pointer_width = "64"))]
+    #[cfg(host_shared_wal)]
     #[test]
     fn test_shm_zero_frame_authority_invalidates_stale_local_initialized_state() {
         let dir = tempfile::tempdir().unwrap();
@@ -7266,7 +7266,7 @@ pub mod test {
         );
     }
 
-    #[cfg(all(unix, target_pointer_width = "64"))]
+    #[cfg(host_shared_wal)]
     #[test]
     fn test_shm_prepare_wal_header_seeds_uninitialized_authority_from_prepared_header() {
         let dir = tempfile::tempdir().unwrap();
@@ -7299,7 +7299,7 @@ pub mod test {
         assert_eq!(snapshot.salt_2, prepared.salt_2);
     }
 
-    #[cfg(all(unix, target_pointer_width = "64"))]
+    #[cfg(host_shared_wal)]
     #[test]
     fn test_shm_prepare_wal_header_does_not_clobber_zero_frame_authority_snapshot() {
         let dir = tempfile::tempdir().unwrap();

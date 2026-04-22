@@ -335,12 +335,16 @@ fn next_shared_owner_instance_id() -> u32 {
     }
 }
 
-/// Check whether a process is still running via `kill(pid, 0)`.
-/// Signal 0 is a no-op probe: the kernel checks permissions and existence
-/// without delivering a signal. Returns true if the process exists (or we
-/// lack permission to signal it — EPERM means it's alive but owned by
-/// another user). False-negatives are impossible; false-positives can occur
-/// if the PID has been recycled by an unrelated process.
+/// Check whether a process is still running.
+///
+/// On Unix this uses `kill(pid, 0)`, which is a no-op probe that checks
+/// permissions and existence without delivering a signal. On Windows this
+/// uses `OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION)` and
+/// `GetExitCodeProcess`.
+///
+/// False-negatives are avoided; false-positives are still possible if a PID
+/// has been recycled by an unrelated process.
+#[cfg(unix)]
 fn pid_is_alive(pid: u32) -> bool {
     if pid == 0 || pid > i32::MAX as u32 {
         return false;
@@ -350,6 +354,32 @@ fn pid_is_alive(pid: u32) -> bool {
         return true;
     }
     std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+}
+
+#[cfg(target_os = "windows")]
+fn pid_is_alive(pid: u32) -> bool {
+    use windows_sys::Win32::Foundation::{CloseHandle, ERROR_ACCESS_DENIED, FALSE, STILL_ACTIVE};
+    use windows_sys::Win32::System::Threading::{
+        GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+
+    if pid == 0 {
+        return false;
+    }
+
+    let process = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid) };
+    if process.is_null() {
+        return std::io::Error::last_os_error().raw_os_error() == Some(ERROR_ACCESS_DENIED as i32);
+    }
+
+    let mut exit_code = 0u32;
+    let result = unsafe { GetExitCodeProcess(process, &raw mut exit_code) };
+    let close_result = unsafe { CloseHandle(process) };
+    turso_assert!(
+        close_result != FALSE,
+        "failed to close Windows process handle"
+    );
+    result != FALSE && exit_code == STILL_ACTIVE as u32
 }
 
 /// Serializable snapshot of the authoritative shared WAL coordination state.
@@ -2901,7 +2931,9 @@ impl MappedSharedWalCoordination {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::io::{PlatformIO, IO};
+    #[cfg(not(all(target_os = "windows", feature = "experimental_win_iocp")))]
+    use crate::io::PlatformIO;
+    use crate::io::IO;
     use std::sync::Arc;
 
     fn colliding_page_ids(count: usize) -> Vec<u64> {
@@ -2919,7 +2951,15 @@ mod tests {
     }
 
     fn test_shared_wal_io() -> Arc<dyn IO> {
-        Arc::new(PlatformIO::new().unwrap())
+        #[cfg(all(target_os = "windows", feature = "experimental_win_iocp"))]
+        {
+            return Arc::new(crate::WindowsIOCP::new().unwrap());
+        }
+
+        #[cfg(not(all(target_os = "windows", feature = "experimental_win_iocp")))]
+        {
+            Arc::new(PlatformIO::new().unwrap())
+        }
     }
 
     fn create_mapping(path: &Path) -> MappedSharedWalCoordination {
@@ -2936,16 +2976,31 @@ mod tests {
     }
 
     fn exited_child_pid() -> u32 {
-        let child = unsafe { libc::fork() };
-        assert!(child >= 0, "fork failed");
-        if child == 0 {
-            unsafe { libc::_exit(0) };
+        #[cfg(unix)]
+        {
+            let child = unsafe { libc::fork() };
+            assert!(child >= 0, "fork failed");
+            if child == 0 {
+                unsafe { libc::_exit(0) };
+            }
+            let mut status: libc::c_int = 0;
+            let waited = unsafe { libc::waitpid(child, &mut status, 0) };
+            assert_eq!(waited, child, "waitpid failed");
+            assert!(libc::WIFEXITED(status), "child did not exit cleanly");
+            return child as u32;
         }
-        let mut status: libc::c_int = 0;
-        let waited = unsafe { libc::waitpid(child, &mut status, 0) };
-        assert_eq!(waited, child, "waitpid failed");
-        assert!(libc::WIFEXITED(status), "child did not exit cleanly");
-        child as u32
+
+        #[cfg(windows)]
+        {
+            let mut child = std::process::Command::new("cmd")
+                .args(["/C", "exit", "0"])
+                .spawn()
+                .expect("spawn exited child");
+            let pid = child.id();
+            let status = child.wait().expect("wait exited child");
+            assert!(status.success(), "child did not exit cleanly");
+            pid
+        }
     }
 
     #[test]

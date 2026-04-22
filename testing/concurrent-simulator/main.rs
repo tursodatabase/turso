@@ -5,7 +5,7 @@ use std::sync::Arc;
 use clap::{Parser, Subcommand, ValueEnum};
 use rand::{Rng, RngCore};
 use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitExt};
-#[cfg(all(unix, target_pointer_width = "64"))]
+#[cfg(all(any(unix, target_os = "windows"), target_pointer_width = "64"))]
 use turso_whopper::multiprocess::{MultiprocessOpts, MultiprocessWhopper};
 use turso_whopper::{
     StepResult, Whopper, WhopperOpts,
@@ -106,8 +106,20 @@ fn main() -> anyhow::Result<()> {
         connections_per_process,
     }) = &args.subcommand
     {
-        #[cfg(all(unix, target_pointer_width = "64"))]
-        return turso_whopper::worker::run_worker(db_path, *enable_mvcc, *connections_per_process);
+        #[cfg(all(any(unix, target_os = "windows"), target_pointer_width = "64"))]
+        {
+            return turso_whopper::worker::run_worker(
+                db_path,
+                *enable_mvcc,
+                *connections_per_process,
+            );
+        }
+        #[cfg(not(all(any(unix, target_os = "windows"), target_pointer_width = "64")))]
+        {
+            return Err(anyhow::anyhow!(
+                "worker mode is only supported on 64-bit Unix and Windows hosts"
+            ));
+        }
     }
 
     init_logger();
@@ -125,14 +137,13 @@ fn main() -> anyhow::Result<()> {
     println!("seed = {seed}");
 
     if args.multiprocess {
-        #[cfg(all(unix, target_pointer_width = "64"))]
         return run_multiprocess(&args, seed);
     }
 
     run_inprocess(&args, seed)
 }
 
-#[cfg(all(unix, target_pointer_width = "64"))]
+#[cfg(all(any(unix, target_os = "windows"), target_pointer_width = "64"))]
 fn run_multiprocess(args: &Args, seed: u64) -> anyhow::Result<()> {
     if args.enable_mvcc {
         eprintln!("MVCC mode not yet supported with multiprocess mode");
@@ -216,6 +227,13 @@ fn run_multiprocess(args: &Args, seed: u64) -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(not(all(any(unix, target_os = "windows"), target_pointer_width = "64")))]
+fn run_multiprocess(_args: &Args, _seed: u64) -> anyhow::Result<()> {
+    Err(anyhow::anyhow!(
+        "multiprocess mode is only supported on 64-bit Unix and Windows hosts"
+    ))
 }
 
 fn run_inprocess(args: &Args, seed: u64) -> anyhow::Result<()> {

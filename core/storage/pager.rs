@@ -5504,7 +5504,7 @@ mod ptrmap_tests {
     }
 }
 
-#[cfg(all(test, feature = "fs", unix, target_pointer_width = "64"))]
+#[cfg(all(test, feature = "fs", host_shared_wal))]
 mod checkpoint_phase_tests {
     use super::*;
     use crate::io::{PlatformIO, IO};

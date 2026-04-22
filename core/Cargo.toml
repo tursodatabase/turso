@@ -45,6 +45,9 @@ optimizer_params = ["serde", "dep:serde_json"]
 [target.'cfg(target_os = "windows")'.dependencies]
 windows-sys = { version = "0.61.2", features = [
     "Win32_System_IO",
+    "Win32_System_Memory",
+    "Win32_System_SystemInformation",
+    "Win32_System_Threading",
     "Win32_Storage_FileSystem",
     "Win32_Security",
     "Win32_System_Diagnostics_Debug",
