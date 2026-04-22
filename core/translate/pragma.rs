@@ -537,9 +537,9 @@ fn update_pragma(
                 }
             };
             match auto_vacuum_mode {
-                0 => update_auto_vacuum_mode(AutoVacuumMode::None, 0, pager)?,
-                1 => update_auto_vacuum_mode(AutoVacuumMode::Full, 1, pager)?,
-                2 => update_auto_vacuum_mode(AutoVacuumMode::Incremental, 1, pager)?,
+                0 => pager.persist_auto_vacuum_mode(AutoVacuumMode::None)?,
+                1 => pager.persist_auto_vacuum_mode(AutoVacuumMode::Full)?,
+                2 => pager.persist_auto_vacuum_mode(AutoVacuumMode::Incremental)?,
                 _ => {
                     return Err(LimboError::InvalidArgument(
                         "invalid auto vacuum mode".to_string(),
@@ -1623,20 +1623,6 @@ fn emit_columns_for_table_info(
 
         program.emit_result_row(base_reg, 6 + if extended { 1 } else { 0 });
     }
-}
-
-fn update_auto_vacuum_mode(
-    auto_vacuum_mode: AutoVacuumMode,
-    largest_root_page_number: u32,
-    pager: Arc<Pager>,
-) -> crate::Result<()> {
-    pager.io.block(|| {
-        pager.with_header_mut(|header| {
-            header.vacuum_mode_largest_root_page = largest_root_page_number.into()
-        })
-    })?;
-    pager.set_auto_vacuum_mode(auto_vacuum_mode);
-    Ok(())
 }
 
 fn update_cache_size(
