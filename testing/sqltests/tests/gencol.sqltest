@@ -4543,3 +4543,10 @@ test insert-transitive-unique-index {
 } expect error {
     UNIQUE constraint failed: t.a
 }
+
+@cross-check-integrity
+test update-virtual-column-index-via-single-column-unique-index-scan {
+    CREATE TABLE t (a, b, c UNIQUE, f UNIQUE AS (b));
+    UPDATE t SET b = 42 WHERE c = 'x';
+} expect {
+}
