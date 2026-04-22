@@ -382,7 +382,7 @@ pub fn translate_inner(
             translate_update(update, resolver, program, connection)?
         }
         ast::Stmt::Vacuum { name, into } => {
-            vacuum::translate_vacuum(program, name.as_ref(), into.as_deref())?
+            vacuum::translate_vacuum(program, name.as_ref(), into.as_deref(), connection.clone())?
         }
         ast::Stmt::Insert {
             with,
