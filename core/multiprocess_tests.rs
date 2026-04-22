@@ -12,6 +12,8 @@ const MULTIPROCESS_SHM_COUNT_CHILD_TEST: &str =
     "multiprocess_tests::multiprocess_shm_count_child_process";
 const MULTIPROCESS_SHM_HOLD_READ_TX_CHILD_TEST: &str =
     "multiprocess_tests::multiprocess_shm_hold_read_tx_child_process";
+const MULTIPROCESS_SHM_HOLD_OPEN_CHILD_TEST: &str =
+    "multiprocess_tests::multiprocess_shm_hold_open_child_process";
 const MULTIPROCESS_SHM_SCHEMA_CHILD_TEST: &str =
     "multiprocess_tests::multiprocess_shm_schema_child_process";
 const MULTIPROCESS_SHM_INSERT_AND_CLOSE_CHILD_TEST: &str =
@@ -948,11 +950,11 @@ fn subprocess_database_open_selects_multiprocess_shm_backend() {
 }
 
 #[test]
-fn plain_vacuum_rejects_multiprocess_wal_database() {
+fn plain_vacuum_rejects_multiprocess_wal_database_without_peer_process() {
     let dir = tempfile::tempdir().unwrap();
-    let db_path = dir.path().join("vacuum-multiprocess.db");
+    let db_path = dir.path().join("vacuum-multiprocess-no-peer.db");
     let db_path_str = db_path.to_str().unwrap();
-    let io: Arc<dyn IO> = Arc::new(PlatformIO::new().unwrap());
+    let io: Arc<dyn IO> = multiprocess_test_io();
 
     let db = open_multiprocess_db(io, db_path_str).unwrap();
     let conn = db.connect().unwrap();
@@ -963,15 +965,67 @@ fn plain_vacuum_rejects_multiprocess_wal_database() {
 
     let err = conn
         .execute("VACUUM")
-        .expect_err("VACUUM should reject on a multiprocess-WAL database");
+        .expect_err("VACUUM should reject multiprocess-WAL databases");
     assert!(
-        matches!(err, LimboError::ParseError(ref msg) if msg.contains("experimental multiprocess WAL")),
+        matches!(err, LimboError::TxError(ref msg) if msg.contains("cannot VACUUM experimental multiprocess WAL databases")),
         "expected explicit multiprocess VACUUM rejection, got {err:?}"
     );
     assert_eq!(
         count_test_rows(&conn),
         1,
-        "rejecting VACUUM on a multiprocess-WAL database must not disturb the existing connection"
+        "rejecting VACUUM on multiprocess-WAL databases must not disturb existing rows"
+    );
+}
+
+#[test]
+fn plain_vacuum_rejects_live_multiprocess_peer_process() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("vacuum-multiprocess-peer.db");
+    let db_path_str = db_path.to_str().unwrap();
+    let ready_file = dir.path().join("vacuum-peer-ready");
+    let release_file = dir.path().join("vacuum-peer-release");
+    let io: Arc<dyn IO> = multiprocess_test_io();
+
+    let db = open_multiprocess_db(io, db_path_str).unwrap();
+    let conn = db.connect().unwrap();
+    conn.execute("create table test(id integer primary key, value text)")
+        .unwrap();
+    conn.execute("insert into test(value) values ('parent')")
+        .unwrap();
+
+    let current_exe = std::env::current_exe().unwrap();
+    let mut child = Command::new(&current_exe)
+        .arg(MULTIPROCESS_SHM_HOLD_OPEN_CHILD_TEST)
+        .arg("--exact")
+        .arg("--nocapture")
+        .env("TURSO_MULTIPROCESS_DB_PATH", db_path_str)
+        .env("TURSO_MULTIPROCESS_READY_FILE", &ready_file)
+        .env("TURSO_MULTIPROCESS_RELEASE_FILE", &release_file)
+        .spawn()
+        .unwrap();
+    wait_for_file(&ready_file);
+
+    let authority = db.shared_wal_coordination().unwrap().unwrap();
+    assert!(
+        !authority.is_last_process_mapping(),
+        "live child process should make the parent authority observe another process mapping"
+    );
+
+    let err = conn
+        .execute("VACUUM")
+        .expect_err("VACUUM should reject while another multiprocess-WAL process is live");
+    assert!(
+        matches!(err, LimboError::TxError(ref msg) if msg.contains("cannot VACUUM experimental multiprocess WAL databases")),
+        "expected explicit multiprocess VACUUM rejection, got {err:?}"
+    );
+
+    std::fs::write(&release_file, b"release").unwrap();
+    let status = child.wait().unwrap();
+    assert!(status.success(), "child process failed: status={status:?}");
+    assert_eq!(
+        count_test_rows(&conn),
+        1,
+        "rejecting VACUUM while a peer process is live must not disturb the existing connection"
     );
 }
 
