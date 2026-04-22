@@ -75,6 +75,138 @@ impl MvccTestDb {
     }
 }
 
+#[test]
+fn mvcc_active_read_tx_blocks_vacuum_gate() {
+    let db = MvccTestDb::new();
+    let pager = db.conn.pager.load().clone();
+    let tx_id = db.mvcc_store.begin_tx(pager).unwrap();
+
+    assert!(matches!(
+        db.mvcc_store.try_begin_vacuum_gate(),
+        Err(LimboError::Busy)
+    ));
+
+    db.mvcc_store.remove_tx(tx_id);
+    db.mvcc_store.try_begin_vacuum_gate().unwrap();
+    db.mvcc_store.release_vacuum_gate();
+}
+
+#[test]
+fn mvcc_active_write_tx_blocks_vacuum_gate() {
+    let db = MvccTestDb::new();
+    let pager = db.conn.pager.load().clone();
+    let tx_id = db
+        .mvcc_store
+        .begin_exclusive_tx(pager.clone(), None)
+        .unwrap();
+
+    assert!(matches!(
+        db.mvcc_store.try_begin_vacuum_gate(),
+        Err(LimboError::Busy)
+    ));
+
+    db.mvcc_store
+        .rollback_tx(tx_id, pager, &db.conn, crate::MAIN_DB_ID);
+    db.mvcc_store.try_begin_vacuum_gate().unwrap();
+    db.mvcc_store.release_vacuum_gate();
+}
+
+#[test]
+fn mvcc_vacuum_gate_blocks_new_read_and_write_tx() {
+    let db = MvccTestDb::new();
+    let pager = db.conn.pager.load().clone();
+
+    db.mvcc_store.try_begin_vacuum_gate().unwrap();
+
+    assert!(matches!(
+        db.mvcc_store.begin_tx(pager.clone()),
+        Err(LimboError::Busy)
+    ));
+    assert!(matches!(
+        db.mvcc_store.begin_exclusive_tx(pager, None),
+        Err(LimboError::Busy)
+    ));
+
+    db.mvcc_store.release_vacuum_gate();
+}
+
+#[test]
+fn mvcc_reset_after_vacuum_installs_header_and_rootpages() {
+    let db = MvccTestDb::new();
+    db.conn
+        .execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")
+        .unwrap();
+    db.conn.execute("CREATE INDEX idx_t_v ON t(v)").unwrap();
+    db.conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+
+    db.conn.demote_to_mvcc_connection();
+    db.conn.reparse_schema().unwrap();
+    let schema = db.conn.schema.read().clone();
+    db.conn.promote_to_regular_connection();
+    let table_root = match schema.tables.get("t").expect("table t").as_ref() {
+        Table::BTree(btree) => btree.root_page,
+        _ => panic!("expected btree table"),
+    };
+    let index_root = schema
+        .indexes
+        .get("t")
+        .and_then(|indexes| indexes.front())
+        .map(|index| index.root_page)
+        .expect("index idx_t_v");
+
+    let mut header = DatabaseHeader::default();
+    header.schema_cookie = 77.into();
+
+    db.mvcc_store
+        .global_header
+        .write()
+        .replace(DatabaseHeader::default());
+    db.mvcc_store
+        .insert_table_id_to_rootpage(MVTableId::from(-999_i64), Some(999));
+
+    db.mvcc_store.try_begin_vacuum_gate().unwrap();
+    db.mvcc_store.reset_after_vacuum(header, schema.as_ref());
+    db.mvcc_store.release_vacuum_gate();
+
+    assert_eq!(
+        db.mvcc_store
+            .with_header(|header| header.schema_cookie.get(), None)
+            .unwrap(),
+        77
+    );
+    assert_eq!(
+        *db.mvcc_store
+            .table_id_to_rootpage
+            .get(&SQLITE_SCHEMA_MVCC_TABLE_ID)
+            .expect("sqlite_schema mapping")
+            .value(),
+        Some(1)
+    );
+    assert_eq!(
+        *db.mvcc_store
+            .table_id_to_rootpage
+            .get(&MVTableId::from(-(table_root)))
+            .expect("table root mapping")
+            .value(),
+        Some(table_root as u64)
+    );
+    assert_eq!(
+        *db.mvcc_store
+            .table_id_to_rootpage
+            .get(&MVTableId::from(-(index_root)))
+            .expect("index root mapping")
+            .value(),
+        Some(index_root as u64)
+    );
+    assert!(
+        db.mvcc_store
+            .table_id_to_rootpage
+            .get(&MVTableId::from(-999_i64))
+            .is_none(),
+        "stale root-page entries must be cleared"
+    );
+}
+
 impl MvccTestDbNoConn {
     pub fn new() -> Self {
         let io = Arc::new(MemoryIO::new());
