@@ -2434,6 +2434,15 @@ pub fn insn_to_row(
             0,
             format!("schema={schema_name}, dest={dest_path}"),
         ),
+        Insn::Vacuum { db } => (
+            "Vacuum",
+            *db as i64,
+            0,
+            0,
+            Value::Null,
+            0,
+            format!("db={db}"),
+        ),
         Insn::InitCdcVersion { cdc_table_name, version, cdc_mode } => (
             "InitCdcVersion",
             0,

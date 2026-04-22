@@ -131,7 +131,7 @@ ongoing work to pass the full SQLite TCL test suite.
 | SELECT ... JOIN USING     | ✅ Yes     |                                                                                   |
 | SELECT ... NATURAL JOIN   | ✅ Yes     |                                                                                   |
 | UPDATE                    | ✅ Yes     |                                                                                   |
-| VACUUM                    | 🚧 Partial | VACUUM INTO supported, plain VACUUM not yet                                       |
+| VACUUM                    | 🚧 Partial | VACUUM INTO supported; plain in-place VACUUM is experimental                       |
 | WITH clause               | 🚧 Partial | ❌ No RECURSIVE, no MATERIALIZED, only SELECT supported in CTEs                      |
 | WINDOW functions             | 🚧 Partial | ROW_NUMBER() supported; RANK(), DENSE_RANK(), LAG(), LEAD(), NTILE() not yet     |
 | GENERATED                 | 🚧 Partial      | virtual columns only (no ALTER, partial affinity support)                |

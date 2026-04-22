@@ -658,6 +658,7 @@ impl TursoDatabase {
                                 "strict" => opts, // strict is always enabled, kept for backwards compatibility
                                 "custom_types" => opts.with_custom_types(true),
                                 "autovacuum" => opts.with_autovacuum(true),
+                                "vacuum" => opts.with_vacuum(true),
                                 "encryption" => opts.with_encryption(true),
                                 "attach" => opts.with_attach(true),
                                 "generated_columns" => opts.with_generated_columns(true),
