@@ -1153,6 +1153,14 @@ impl From<u8> for AutoVacuumMode {
     }
 }
 
+const fn auto_vacuum_header_fields(mode: AutoVacuumMode) -> (u32, u32) {
+    match mode {
+        AutoVacuumMode::None => (0, 0),
+        AutoVacuumMode::Full => (1, 0),
+        AutoVacuumMode::Incremental => (1, 1),
+    }
+}
+
 #[derive(Debug, Clone)]
 #[cfg(not(feature = "omit_autovacuum"))]
 enum PtrMapGetState {
@@ -2081,6 +2089,34 @@ impl Pager {
 
     pub fn set_auto_vacuum_mode(&self, mode: AutoVacuumMode) {
         self.auto_vacuum_mode.store(mode.into(), Ordering::SeqCst);
+    }
+
+    /// Persist the auto-vacuum mode to page 1 and keep the pager cache in sync.
+    pub fn persist_auto_vacuum_mode(&self, mode: AutoVacuumMode) -> Result<()> {
+        let (largest_root_page, incremental_vacuum_enabled) = auto_vacuum_header_fields(mode);
+
+        if self.db_initialized() {
+            self.io.block(|| {
+                self.with_header_mut(|header| {
+                    header.vacuum_mode_largest_root_page = largest_root_page.into();
+                    header.incremental_vacuum_enabled = incremental_vacuum_enabled.into();
+                })
+            })?;
+        } else {
+            let IOResult::Done(_) = self.with_header_mut(|header| {
+                header.vacuum_mode_largest_root_page = largest_root_page.into();
+                header.incremental_vacuum_enabled = incremental_vacuum_enabled.into();
+            })?
+            else {
+                panic!("fresh database auto-vacuum setup should not do any IO");
+            };
+            // Clear dirty pages since this is pre-initialization setup, not a real write transaction.
+            // with_header_mut marks page 1 dirty as a side effect, but no transaction is active.
+            self.dirty_pages.write().clear();
+        }
+
+        self.set_auto_vacuum_mode(mode);
+        Ok(())
     }
 
     /// Retrieves the pointer map entry for a given database page.
@@ -5364,12 +5400,8 @@ mod ptrmap_tests {
             );
         }
         pager
-            .io
-            .block(|| {
-                pager.with_header_mut(|header| header.vacuum_mode_largest_root_page = 1.into())
-            })
+            .persist_auto_vacuum_mode(AutoVacuumMode::Full)
             .unwrap();
-        pager.set_auto_vacuum_mode(AutoVacuumMode::Full);
 
         //  Allocate all the pages as btree root pages
         const EXPECTED_FIRST_ROOT_PAGE_ID: u32 = 3; // page1 = 1,  first ptrmap page = 2, root page = 3
@@ -5398,6 +5430,50 @@ mod ptrmap_tests {
         }
 
         pager
+    }
+
+    #[test]
+    fn persist_auto_vacuum_mode_updates_fresh_header_without_dirty_pages() {
+        let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+        let db_file: Arc<dyn DatabaseStorage> = Arc::new(DatabaseFile::new(
+            io.open_file("fresh-auto-vacuum.db", OpenFlags::Create, true)
+                .unwrap(),
+        ));
+        let buffer_pool = BufferPool::begin_init(&io, 65536);
+        let pager = Pager::new(
+            db_file,
+            None,
+            io,
+            PageCache::new(4),
+            buffer_pool,
+            Arc::new(Mutex::new(())),
+            Arc::new(ArcSwapOption::new(Some(default_page1(None)))),
+        )
+        .unwrap();
+
+        pager
+            .persist_auto_vacuum_mode(AutoVacuumMode::Incremental)
+            .unwrap();
+
+        let IOResult::Done((largest_root_page, incremental_vacuum_enabled)) = pager
+            .with_header(|header| {
+                (
+                    header.vacuum_mode_largest_root_page.get(),
+                    header.incremental_vacuum_enabled.get(),
+                )
+            })
+            .unwrap()
+        else {
+            panic!("fresh database header reads should not do any IO");
+        };
+
+        assert_eq!(largest_root_page, 1);
+        assert_eq!(incremental_vacuum_enabled, 1);
+        assert_eq!(pager.get_auto_vacuum_mode(), AutoVacuumMode::Incremental);
+        assert!(
+            pager.dirty_pages.read().is_empty(),
+            "fresh-db auto-vacuum setup must not leave dirty pages behind"
+        );
     }
 
     #[test]
