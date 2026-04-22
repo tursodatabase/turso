@@ -1716,6 +1716,7 @@ impl Database {
             check_constraints_pragma: AtomicBool::new(false),
             vtab_txn_states: RwLock::new(HashSet::default()),
             named_savepoints: RwLock::new(Vec::new()),
+            schema_reparse_in_progress: AtomicBool::new(false),
             prepare_context_generation: AtomicU64::new(0),
         });
         self.n_connections

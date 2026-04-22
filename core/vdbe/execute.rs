@@ -38,6 +38,7 @@ use crate::vdbe::hash_table::{
 };
 use crate::vdbe::insn::InsertFlags;
 use crate::vdbe::metrics::HashJoinMetrics;
+use crate::vdbe::vacuum::VacuumInPlaceOpContext;
 use crate::vdbe::value::ComparisonOp;
 use crate::vdbe::ValueIteratorExt;
 use crate::vdbe::{
@@ -59,9 +60,9 @@ use crate::{
         builder::CursorType,
         insn::{IdxInsertFlags, Insn, SavepointOp},
     },
-    CaptureDataChangesInfo, CdcVersion, CheckpointMode, Completion, Connection, DatabaseStorage,
-    IOExt, MvCursor, NonNan, OpenFlags, QueryMode, Statement, TransactionState, ValueRef,
-    MAIN_DB_ID, TEMP_DB_ID,
+    CaptureDataChangesInfo, CdcVersion, CheckpointMode, Completion, Connection, Database,
+    DatabaseStorage, IOExt, MvCursor, NonNan, OpenFlags, QueryMode, Statement, TransactionState,
+    ValueRef, MAIN_DB_ID, TEMP_DB_ID,
 };
 use crate::{
     error::{
@@ -14683,11 +14684,11 @@ pub(crate) struct VacuumIntoOpContext {
     /// Escaped schema name for safe SQL interpolation.
     escaped_schema_name: String,
     /// Keep output database alive while vacuum is in progress.
-    _output_db: Option<Arc<crate::Database>>,
+    _output_db: Option<Arc<Database>>,
     /// Configuration for the shared vacuum target build state machine.
-    target_build_config: Option<crate::vdbe::vacuum::VacuumTargetBuildConfig>,
+    target_build_config: Option<VacuumTargetBuildConfig>,
     /// Context for the shared vacuum target build state machine.
-    target_build_context: Option<crate::vdbe::vacuum::VacuumTargetBuildContext>,
+    target_build_context: Option<VacuumTargetBuildContext>,
 }
 
 /// VACUUM INTO - create a compacted copy of the database at the specified path.
@@ -14975,6 +14976,54 @@ fn op_vacuum_into_inner(
             }
         }
     }
+}
+
+/// In-place VACUUM - compact the database via target build + direct-WAL
+/// copy-back. The opcode owns the source transaction lifecycle.
+pub fn op_vacuum(
+    program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+    _pager: &Arc<Pager>,
+) -> Result<InsnFunctionStepResult> {
+    load_insn!(Vacuum { db }, insn);
+
+    if state.op_vacuum_in_place.is_none() {
+        state.op_vacuum_in_place = Some(Box::new(VacuumInPlaceOpContext::new(*db)));
+    }
+
+    let vacuum_state = state.op_vacuum_in_place.as_mut().unwrap();
+
+    match vacuum_state.step(&program.connection) {
+        Ok(InsnFunctionStepResult::Step) => {
+            state.op_vacuum_in_place = None;
+            state.pc += 1;
+            Ok(InsnFunctionStepResult::Step)
+        }
+        Ok(InsnFunctionStepResult::IO(io)) => Ok(InsnFunctionStepResult::IO(io)),
+        Ok(InsnFunctionStepResult::Done | InsnFunctionStepResult::Row) => {
+            unreachable!("in-place VACUUM only returns Step or IO")
+        }
+        Err(err) => {
+            if let Err(cleanup_err) = cleanup_op_vacuum_in_place(&program.connection, state) {
+                tracing::error!("VACUUM cleanup failed after error: {cleanup_err}");
+            }
+            Err(err)
+        }
+    }
+}
+
+/// Clean up in-place VACUUM state on error or abort. Rolls back the source
+/// transaction if it was acquired, restores connection state, and drops
+/// temp resources.
+fn cleanup_op_vacuum_in_place(
+    connection: &Arc<Connection>,
+    state: &mut ProgramState,
+) -> Result<()> {
+    let Some(vacuum_state) = state.op_vacuum_in_place.take() else {
+        return Ok(());
+    };
+    vacuum_state.cleanup(connection)
 }
 
 fn with_header<T, F>(
