@@ -921,6 +921,34 @@ fn subprocess_database_open_selects_multiprocess_shm_backend() {
 }
 
 #[test]
+fn plain_vacuum_rejects_multiprocess_wal_database() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("vacuum-multiprocess.db");
+    let db_path_str = db_path.to_str().unwrap();
+    let io: Arc<dyn IO> = Arc::new(PlatformIO::new().unwrap());
+
+    let db = open_multiprocess_db(io, db_path_str).unwrap();
+    let conn = db.connect().unwrap();
+    conn.execute("create table test(id integer primary key, value text)")
+        .unwrap();
+    conn.execute("insert into test(value) values ('parent')")
+        .unwrap();
+
+    let err = conn
+        .execute("VACUUM")
+        .expect_err("VACUUM should reject on a multiprocess-WAL database");
+    assert!(
+        matches!(err, LimboError::ParseError(ref msg) if msg.contains("experimental multiprocess WAL")),
+        "expected explicit multiprocess VACUUM rejection, got {err:?}"
+    );
+    assert_eq!(
+        count_test_rows(&conn),
+        1,
+        "rejecting VACUUM on a multiprocess-WAL database must not disturb the existing connection"
+    );
+}
+
+#[test]
 fn subprocess_child_close_skips_shutdown_checkpoint_in_multiprocess_wal_mode() {
     let dir = tempfile::tempdir().unwrap();
     let db_path = dir.path().join("close-skip-shutdown-checkpoint.db");
