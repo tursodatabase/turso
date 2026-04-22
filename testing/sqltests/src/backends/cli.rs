@@ -1,5 +1,5 @@
 use super::{
-    BackendError, DatabaseFileHandle, DatabaseInstance, QueryResult, SqlBackend, parse_list_output,
+    parse_list_output, BackendError, DatabaseFileHandle, DatabaseInstance, QueryResult, SqlBackend,
 };
 use crate::backends::DefaultDatabaseResolver;
 use crate::parser::ast::{Backend, Capability, DatabaseConfig, DatabaseLocation};
