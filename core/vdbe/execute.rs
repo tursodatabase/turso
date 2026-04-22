@@ -1182,7 +1182,7 @@ pub fn op_open_read(
         CursorType::BTreeIndex(index) => {
             let btree_cursor = Box::new(BTreeCursor::new_index(
                 pager,
-                *root_page,
+                maybe_transform_root_page_to_positive(mv_store.as_ref(), *root_page),
                 index.as_ref(),
                 num_columns,
             ));
