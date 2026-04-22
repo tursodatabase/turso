@@ -554,7 +554,6 @@ impl ActiveOpStateSlot {
             _ => None,
         }
     }
-
 }
 
 #[derive(Debug, Clone)]
@@ -2767,6 +2766,7 @@ mod tests {
 ///
 /// These tests verify that the implementation correctly upholds these invariants
 /// under concurrent access patterns.
+
 #[cfg(all(shuttle, test))]
 mod shuttle_tests {
     use super::*;
