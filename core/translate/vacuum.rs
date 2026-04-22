@@ -8,7 +8,7 @@ use turso_parser::ast::{Expr, Literal, Name};
 
 /// Translate a VACUUM statement into VDBE bytecode.
 ///
-/// We have `VACUUM INTO`. The in-place `VACUUM` is experimental:
+/// `VACUUM INTO` is always available. Plain in-place `VACUUM` is experimental:
 /// it is enabled by default in debug/test builds and gated behind the
 /// experimental vacuum feature flag in release builds.
 ///
