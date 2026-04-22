@@ -1018,13 +1018,11 @@ struct CheckpointState {
     result: Option<CheckpointResult>,
     /// The checkpoint mode, used to determine if WAL truncation is needed
     mode: Option<CheckpointMode>,
-    /// The checkpoint state machine should acquire the lock or use the one by caller
+    /// Whether this checkpoint should acquire checkpoint_lock itself or consume
+    /// a checkpoint_lock already held by the caller.
     lock_source: CheckpointLockSource,
 }
 
-/// CheckpointLockSource says whether the checkpoint state machine should acquire checkpoint_lock
-/// itself or consume checkpoint_lock already held by the caller.
-/// Most of the time, the default `Acquire` is used, except for VACUUM.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 enum CheckpointLockSource {
     #[default]
@@ -2690,22 +2688,30 @@ impl Pager {
         Ok(IOResult::Done(wal.begin_write_tx()?))
     }
 
-    /// Acquire exclusive WAL access + block new transactions (used by VACUUM).
+    /// Acquire exclusive WAL access (used by VACUUM).
     ///
-    /// This is a blocking alternative to normal `begin_read_tx`.
+    /// This replaces the normal `begin_read_tx` source snapshot acquisition for
+    /// VACUUM. VACUUM first reserves the checkpoint lock so no checkpointer can
+    /// race the source snapshot. This method then takes the VACUUM lock
+    /// exclusively to keep new readers out, takes the WAL write lock, and
+    /// installs the source snapshot that VACUUM will copy from. It does not
+    /// take a read-mark lock.
+    ///
+    /// The final TRUNCATE checkpoint takes read0 and write_lock inside the
+    /// checkpoint path after this source transaction has ended.
     ///
     /// VACUUM runs on an existing database, so page 1 must already be allocated
     /// and a WAL must be present.
-    pub fn begin_blocking_tx(&self) -> Result<IOResult<()>> {
+    pub fn begin_exclusive_tx(&self) -> Result<IOResult<()>> {
         if !self.db_initialized() {
             return Err(LimboError::InternalError(
-                "begin_blocking_tx can be done on an initialized database (page 1 must already be allocated)".into(),
+                "begin_exclusive_tx can be done on an initialized database (page 1 must already be allocated)".into(),
             ));
         }
         let wal = self.wal.as_ref().ok_or_else(|| {
-            LimboError::InternalError("begin_blocking_tx requires WAL mode".into())
+            LimboError::InternalError("begin_exclusive_tx requires WAL mode".into())
         })?;
-        wal.begin_blocking_tx()?;
+        wal.begin_exclusive_tx()?;
         // let's be conservative and clear all cache for vacuum
         // todo: clear cache only if we detect that new writes have occurred like `begin_read_tx`
         self.clear_page_cache(false);
