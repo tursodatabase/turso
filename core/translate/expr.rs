@@ -5534,6 +5534,22 @@ pub fn expr_references_any_subquery(expr: &ast::Expr) -> bool {
     found
 }
 
+/// Check if an expression contains a subquery (Subquery, InSelect, or Exists).
+pub fn expr_contains_subquery(expr: &ast::Expr) -> bool {
+    let mut found = false;
+    let _ = walk_expr(expr, &mut |e: &ast::Expr| -> Result<WalkControl> {
+        if matches!(
+            e,
+            ast::Expr::Subquery(_) | ast::Expr::InSelect { .. } | ast::Expr::Exists(_)
+        ) {
+            found = true;
+            return Ok(WalkControl::SkipChildren);
+        }
+        Ok(WalkControl::Continue)
+    });
+    found
+}
+
 fn walk_expr_frame_bound<'a, F>(bound: &'a ast::FrameBound, func: &mut F) -> Result<WalkControl>
 where
     F: FnMut(&'a ast::Expr) -> Result<WalkControl>,

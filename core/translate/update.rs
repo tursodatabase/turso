@@ -16,7 +16,7 @@ use crate::{
 use turso_parser::ast::{self, Expr, SortOrder};
 
 use super::emitter::emit_program;
-use super::expr::{WalkControl, process_returning_clause, walk_expr};
+use super::expr::{expr_contains_subquery, process_returning_clause};
 use super::optimizer::optimize_plan;
 use super::plan::{
     ColumnUsedMask, DmlSafety, DmlSafetyReason, IterationDirection, JoinedTable, Plan,
@@ -538,26 +538,7 @@ pub fn prepare_update_plan(
 
 /// Check if any WHERE predicate contains a subquery (Subquery, InSelect, or Exists).
 fn where_clause_has_subquery(predicates: &[WhereTerm]) -> bool {
-    for pred in predicates {
-        let mut found = false;
-        let _ = walk_expr(&pred.expr, &mut |e| {
-            if matches!(
-                e,
-                Expr::Subquery(_) | Expr::InSelect { .. } | Expr::Exists(_)
-            ) {
-                found = true;
-            }
-            Ok(if found {
-                WalkControl::SkipChildren
-            } else {
-                WalkControl::Continue
-            })
-        });
-        if found {
-            return true;
-        }
-    }
-    false
+    predicates.iter().any(|pred| expr_contains_subquery(&pred.expr))
 }
 
 fn build_scan_op(table: &Table, iter_dir: IterationDirection) -> Operation {

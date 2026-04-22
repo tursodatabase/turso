@@ -1,7 +1,7 @@
 use crate::schema::Table;
 use crate::sync::Arc;
 use crate::translate::emitter::{emit_program, Resolver};
-use crate::translate::expr::{process_returning_clause, walk_expr, WalkControl};
+use crate::translate::expr::{expr_contains_subquery, process_returning_clause};
 use crate::translate::optimizer::optimize_plan;
 use crate::translate::plan::{
     DeletePlan, DmlSafety, DmlSafetyReason, IterationDirection, JoinOrderMember, Operation, Plan,
@@ -279,26 +279,7 @@ pub fn prepare_delete_plan(
 
 /// Check if any WHERE predicate contains a subquery (Subquery, InSelect, or Exists).
 fn where_clause_has_subquery(predicates: &[WhereTerm]) -> bool {
-    for pred in predicates {
-        let mut found = false;
-        let _ = walk_expr(&pred.expr, &mut |e| {
-            if matches!(
-                e,
-                Expr::Subquery(_) | Expr::InSelect { .. } | Expr::Exists(_)
-            ) {
-                found = true;
-            }
-            Ok(if found {
-                WalkControl::SkipChildren
-            } else {
-                WalkControl::Continue
-            })
-        });
-        if found {
-            return true;
-        }
-    }
-    false
+    predicates.iter().any(|pred| expr_contains_subquery(&pred.expr))
 }
 
 fn estimate_num_instructions(plan: &DeletePlan) -> usize {
