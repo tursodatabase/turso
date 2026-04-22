@@ -2104,17 +2104,13 @@ impl Pager {
     }
 
     /// Persist the auto-vacuum mode to page 1 and keep the pager cache in sync.
-    pub fn persist_auto_vacuum_mode(&self, mode: AutoVacuumMode) -> Result<()> {
+    ///
+    /// Fresh databases still backed by `init_page_1` must not retain dirty pages
+    /// after this setup. Initialized databases use the normal live-header path.
+    pub(crate) fn persist_auto_vacuum_mode(&self, mode: AutoVacuumMode) -> Result<()> {
         let (largest_root_page, incremental_vacuum_enabled) = auto_vacuum_header_fields(mode);
 
-        if self.db_initialized() {
-            self.io.block(|| {
-                self.with_header_mut(|header| {
-                    header.vacuum_mode_largest_root_page = largest_root_page.into();
-                    header.incremental_vacuum_enabled = incremental_vacuum_enabled.into();
-                })
-            })?;
-        } else {
+        if !self.db_initialized() {
             let IOResult::Done(_) = self.with_header_mut(|header| {
                 header.vacuum_mode_largest_root_page = largest_root_page.into();
                 header.incremental_vacuum_enabled = incremental_vacuum_enabled.into();
@@ -2122,9 +2118,16 @@ impl Pager {
             else {
                 panic!("fresh database auto-vacuum setup should not do any IO");
             };
-            // Clear dirty pages since this is pre-initialization setup, not a real write transaction.
-            // with_header_mut marks page 1 dirty as a side effect, but no transaction is active.
+            // with_header_mut marks page 1 dirty as a side effect, but fresh-db
+            // bootstrap is not a real transaction.
             self.dirty_pages.write().clear();
+        } else {
+            self.io.block(|| {
+                self.with_header_mut(|header| {
+                    header.vacuum_mode_largest_root_page = largest_root_page.into();
+                    header.incremental_vacuum_enabled = incremental_vacuum_enabled.into();
+                })
+            })?;
         }
 
         self.set_auto_vacuum_mode(mode);
