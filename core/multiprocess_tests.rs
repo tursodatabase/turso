@@ -846,6 +846,33 @@ fn multiprocess_shm_hold_read_tx_child_process() {
 }
 
 #[test]
+fn multiprocess_shm_hold_open_child_process() {
+    let Some(db_path) = std::env::var_os("TURSO_MULTIPROCESS_DB_PATH") else {
+        return;
+    };
+    let ready_file = std::env::var_os("TURSO_MULTIPROCESS_READY_FILE")
+        .map(std::path::PathBuf::from)
+        .unwrap();
+    let release_file = std::env::var_os("TURSO_MULTIPROCESS_RELEASE_FILE")
+        .map(std::path::PathBuf::from)
+        .unwrap();
+
+    let io: Arc<dyn IO> = Arc::new(PlatformIO::new().unwrap());
+    let db = open_multiprocess_db(io, db_path.to_str().unwrap()).unwrap();
+    let last_checksum_and_max_frame = db.shared_wal.read().last_checksum_and_max_frame();
+    let wal = db
+        .build_wal(last_checksum_and_max_frame, db.buffer_pool.clone())
+        .unwrap();
+    let wal_file = wal.as_any().downcast_ref::<WalFile>().unwrap();
+    assert_eq!(wal_file.coordination_backend_name(), "tshm");
+    assert_eq!(wal_file.coordination_open_mode_name(), Some("multiprocess"));
+
+    let _conn = db.connect().unwrap();
+    std::fs::write(&ready_file, b"ready").unwrap();
+    wait_for_file(&release_file);
+}
+
+#[test]
 fn multiprocess_shm_schema_child_process() {
     let Some(db_path) = std::env::var_os("TURSO_MULTIPROCESS_DB_PATH") else {
         return;
