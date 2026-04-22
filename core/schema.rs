@@ -663,9 +663,7 @@ impl Default for Schema {
     }
 }
 
-fn bootstrap_builtin_types(
-    registry: &mut HashMap<String, Arc<TypeDef>>,
-) -> crate::Result<()> {
+fn bootstrap_builtin_types(registry: &mut HashMap<String, Arc<TypeDef>>) -> crate::Result<()> {
     use turso_parser::ast::{Cmd, Stmt};
     use turso_parser::parser::Parser;
 
@@ -3194,7 +3192,9 @@ pub(crate) struct ColumnsTopologicalSort<'a> {
 
 impl<'a> ColumnsTopologicalSort<'a> {
     pub fn iter(&self) -> impl Iterator<Item = (usize, &'a Column)> + '_ {
-        self.topological_sort.iter().map(|&idx| (idx, &self.columns[idx]))
+        self.topological_sort
+            .iter()
+            .map(|&idx| (idx, &self.columns[idx]))
     }
 }
 

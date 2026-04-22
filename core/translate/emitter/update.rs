@@ -1162,7 +1162,13 @@ fn emit_update_insns<'a>(
                 crate::LimboError::InternalError("UPDATE on virtual table has no btree".into())
             })?;
             let new_ctx = DmlColumnContext::layout(columns, start, new_rowid_reg, layout.clone());
-            compute_virtual_columns(program, &bt.columns_topo_sort()?, &new_ctx, &t_ctx.resolver, &bt)?;
+            compute_virtual_columns(
+                program,
+                &bt.columns_topo_sort()?,
+                &new_ctx,
+                &t_ctx.resolver,
+                &bt,
+            )?;
 
             let new_registers = (0..col_len)
                 .map(|i| layout.to_register(start, i))

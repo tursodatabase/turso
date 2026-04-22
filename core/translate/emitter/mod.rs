@@ -1654,7 +1654,13 @@ pub(crate) fn emit_columns_and_dependencies(
         .all(|w| { dml_ctx.to_column_reg(w[1]) == dml_ctx.to_column_reg(w[0]) + 1 }));
 
     let table_arc = Arc::new(table.clone());
-    gencol::compute_virtual_columns(program, &table.columns_topo_sort()?, &dml_ctx, resolver, &table_arc)?;
+    gencol::compute_virtual_columns(
+        program,
+        &table.columns_topo_sort()?,
+        &dml_ctx,
+        resolver,
+        &table_arc,
+    )?;
 
     Ok(dml_ctx)
 }
