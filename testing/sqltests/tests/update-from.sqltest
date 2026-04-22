@@ -1863,3 +1863,901 @@ test update-from-duplicate-source-alias-natural-is-ambiguous {
 expect error {
     ambiguous column name: main.x._ROWID_
 }
+
+#-----------------------------------------------------------------------
+# Duplicate unaliased table in FROM should error (same table name, no alias).
+#-----------------------------------------------------------------------
+
+test update-from-dup-unaliased-comma {
+    CREATE TABLE t1(a INTEGER PRIMARY KEY, b TEXT);
+    CREATE TABLE t2(id INT);
+    INSERT INTO t1 VALUES(1,'x');
+    INSERT INTO t2 VALUES(1);
+    UPDATE t1 SET b = 'changed' FROM t2, t2 WHERE t1.a = 1;
+}
+expect error {
+    ambiguous column name
+}
+
+test update-from-dup-unaliased-cross-join {
+    CREATE TABLE t1(a INTEGER PRIMARY KEY, b TEXT);
+    CREATE TABLE t2(id INT);
+    INSERT INTO t1 VALUES(1,'x');
+    INSERT INTO t2 VALUES(1);
+    UPDATE t1 SET b = 'changed' FROM t2 CROSS JOIN t2 WHERE t1.a = 1;
+}
+expect error {
+    ambiguous column name
+}
+
+test update-from-dup-unaliased-triple {
+    CREATE TABLE t1(a INTEGER PRIMARY KEY, b TEXT);
+    CREATE TABLE t2(id INT);
+    INSERT INTO t1 VALUES(1,'x');
+    INSERT INTO t2 VALUES(1);
+    UPDATE t1 SET b = 'changed' FROM t2, t2, t2 WHERE t1.a = 1;
+}
+expect error {
+    ambiguous column name
+}
+
+#-----------------------------------------------------------------------
+# NATURAL/USING + additional JOIN: column shared by the deduplicated pair
+# and another table is ambiguous.
+#-----------------------------------------------------------------------
+
+test update-from-natural-plus-join-ambiguous {
+    CREATE TABLE t1(a INTEGER PRIMARY KEY, b TEXT);
+    CREATE TABLE s1(x INT, y TEXT);
+    CREATE TABLE s2(x INT, z TEXT);
+    CREATE TABLE s3(x INT, w TEXT);
+    INSERT INTO t1 VALUES(1,'orig');
+    INSERT INTO s1 VALUES(1,'hello');
+    INSERT INTO s2 VALUES(1,'world');
+    INSERT INTO s3 VALUES(1,'extra');
+    UPDATE t1 SET b = s1.y
+    FROM s1 NATURAL JOIN s2 JOIN s3 ON s1.x = s3.x
+    WHERE s1.x = t1.a;
+}
+expect error {
+    ambiguous column name
+}
+
+test update-from-using-plus-join-ambiguous {
+    CREATE TABLE t1(a INTEGER PRIMARY KEY, b TEXT);
+    CREATE TABLE s1(x INT, y TEXT);
+    CREATE TABLE s2(x INT, z TEXT);
+    CREATE TABLE s3(x INT, w TEXT);
+    INSERT INTO t1 VALUES(1,'orig');
+    INSERT INTO s1 VALUES(1,'hello');
+    INSERT INTO s2 VALUES(1,'world');
+    INSERT INTO s3 VALUES(1,'extra');
+    UPDATE t1 SET b = s1.y
+    FROM s1 JOIN s2 USING(x) JOIN s3 ON s1.x = s3.x
+    WHERE s1.x = t1.a;
+}
+expect error {
+    ambiguous column name
+}
+
+test update-from-natural-plus-left-join-ambiguous {
+    CREATE TABLE t1(a INTEGER PRIMARY KEY, b TEXT, c INT);
+    INSERT INTO t1 VALUES(1,'x',10);
+    UPDATE t1 SET b = 'new'
+    FROM t1 AS t8 NATURAL JOIN t1 AS t9 LEFT JOIN t1 AS t10 ON t8.c = t10.c
+    WHERE t1.a = t8.a;
+}
+expect error {
+    ambiguous column name
+}
+
+test update-from-natural-plus-inner-join-ambiguous {
+    CREATE TABLE t1(a INTEGER PRIMARY KEY, b TEXT, c INT);
+    INSERT INTO t1 VALUES(1,'x',10);
+    UPDATE t1 SET b = 'new'
+    FROM t1 AS t8 NATURAL JOIN t1 AS t9 JOIN t1 AS t10 ON t8.c = t10.c
+    WHERE t1.a = t8.a;
+}
+expect error {
+    ambiguous column name
+}
+
+#-----------------------------------------------------------------------
+# Additional positive edge-case coverage.
+#-----------------------------------------------------------------------
+
+# Subquery as FROM source with expression
+@cross-check-integrity
+test update-from-subquery-source {
+    CREATE TABLE t1(a INTEGER PRIMARY KEY, b TEXT);
+    CREATE TABLE t2(id INTEGER, val TEXT);
+    INSERT INTO t1 VALUES(1,'a'),(2,'b'),(3,'c');
+    INSERT INTO t2 VALUES(1,'X'),(2,'Y');
+    UPDATE t1 SET b = sub.val
+    FROM (SELECT id, upper(val) as val FROM t2) AS sub
+    WHERE sub.id = t1.a;
+    SELECT * FROM t1 ORDER BY a;
+}
+expect {
+    1|X
+    2|Y
+    3|c
+}
+
+# Three-way join in FROM
+@cross-check-integrity
+test update-from-three-way-join {
+    CREATE TABLE t1(a INTEGER PRIMARY KEY, b TEXT);
+    CREATE TABLE t2(x INTEGER, y TEXT);
+    CREATE TABLE t3(x INTEGER, z TEXT);
+    INSERT INTO t1 VALUES(1,'a'),(2,'b'),(3,'c');
+    INSERT INTO t2 VALUES(1,'X'),(2,'Y');
+    INSERT INTO t3 VALUES(1,'Z1'),(2,'Z2');
+    UPDATE t1 SET b = t2.y || t3.z FROM t2 JOIN t3 ON t2.x = t3.x WHERE t2.x = t1.a;
+    SELECT * FROM t1 ORDER BY a;
+}
+expect {
+    1|XZ1
+    2|YZ2
+    3|c
+}
+
+# Cross join with no WHERE (single-row FROM)
+@cross-check-integrity
+test update-from-cross-join-no-where {
+    CREATE TABLE t1(a INTEGER PRIMARY KEY, b TEXT);
+    CREATE TABLE t2(val TEXT);
+    INSERT INTO t1 VALUES(1,'a'),(2,'b');
+    INSERT INTO t2 VALUES('ONLY');
+    UPDATE t1 SET b = t2.val FROM t2;
+    SELECT * FROM t1 ORDER BY a;
+}
+expect {
+    1|ONLY
+    2|ONLY
+}
+
+# No matching rows between target and source
+@cross-check-integrity
+test update-from-no-matches-extra {
+    CREATE TABLE t1(a INTEGER PRIMARY KEY, b TEXT);
+    CREATE TABLE t2(id INT, val TEXT);
+    INSERT INTO t1 VALUES(1,'a'),(2,'b');
+    INSERT INTO t2 VALUES(10,'X'),(20,'Y');
+    UPDATE t1 SET b = t2.val FROM t2 WHERE t2.id = t1.a;
+    SELECT * FROM t1 ORDER BY a;
+}
+expect {
+    1|a
+    2|b
+}
+
+# NULL source value
+@cross-check-integrity
+test update-from-null-source-value {
+    CREATE TABLE t1(a INTEGER PRIMARY KEY, b TEXT);
+    CREATE TABLE t2(id INT, val TEXT);
+    INSERT INTO t1 VALUES(1,'a'),(2,'b');
+    INSERT INTO t2 VALUES(1,NULL),(2,'X');
+    UPDATE t1 SET b = t2.val FROM t2 WHERE t2.id = t1.a;
+    SELECT a, b, typeof(b) FROM t1 ORDER BY a;
+}
+expect {
+    1||null
+    2|X|text
+}
+
+# NULL join key (NULL = NULL is false)
+@cross-check-integrity
+test update-from-null-join-key-extra {
+    CREATE TABLE t1(a INT, b TEXT);
+    CREATE TABLE t2(id INT, val TEXT);
+    INSERT INTO t1 VALUES(NULL,'a'),(1,'b'),(2,'c');
+    INSERT INTO t2 VALUES(NULL,'X'),(1,'Y');
+    UPDATE t1 SET b = t2.val FROM t2 WHERE t2.id = t1.a;
+    SELECT a, b FROM t1 ORDER BY rowid;
+}
+expect {
+    |a
+    1|Y
+    2|c
+}
+
+# IS join (NULL matches NULL)
+@cross-check-integrity
+test update-from-is-join {
+    CREATE TABLE t1(a INT, b TEXT);
+    CREATE TABLE t2(id INT, val TEXT);
+    INSERT INTO t1 VALUES(NULL,'a'),(1,'b'),(2,'c');
+    INSERT INTO t2 VALUES(NULL,'X'),(1,'Y');
+    UPDATE t1 SET b = t2.val FROM t2 WHERE t2.id IS t1.a;
+    SELECT a, b FROM t1 ORDER BY rowid;
+}
+expect {
+    |X
+    1|Y
+    2|c
+}
+
+# Range/inequality join
+@cross-check-integrity
+test update-from-range-join {
+    CREATE TABLE t1(a INTEGER PRIMARY KEY, b INT);
+    CREATE TABLE t2(threshold INT, label TEXT);
+    INSERT INTO t1 VALUES(1,10),(2,20),(3,30);
+    INSERT INTO t2 VALUES(15,'high');
+    UPDATE t1 SET b = 0 FROM t2 WHERE t1.b > t2.threshold;
+    SELECT * FROM t1 ORDER BY a;
+}
+expect {
+    1|10
+    2|0
+    3|0
+}
+
+# View as FROM source
+@cross-check-integrity
+test update-from-view-source {
+    CREATE TABLE t1(a INTEGER PRIMARY KEY, b TEXT);
+    INSERT INTO t1 VALUES(1,'a'),(2,'b'),(3,'c');
+    CREATE VIEW v2 AS SELECT 1 as id, 'VIEW' as val;
+    UPDATE t1 SET b = v2.val FROM v2 WHERE v2.id = t1.a;
+    SELECT * FROM t1 ORDER BY a;
+}
+expect {
+    1|VIEW
+    2|b
+    3|c
+}
+
+# Aggregate subquery in FROM
+@cross-check-integrity
+test update-from-aggregate-subquery-extra {
+    CREATE TABLE t1(a INTEGER PRIMARY KEY, b INT);
+    CREATE TABLE t2(grp INT, val INT);
+    INSERT INTO t1 VALUES(1,0),(2,0),(3,0);
+    INSERT INTO t2 VALUES(1,10),(1,20),(2,30),(2,40),(3,50);
+    UPDATE t1 SET b = sub.s
+    FROM (SELECT grp, SUM(val) as s FROM t2 GROUP BY grp) AS sub
+    WHERE sub.grp = t1.a;
+    SELECT * FROM t1 ORDER BY a;
+}
+expect {
+    1|30
+    2|70
+    3|50
+}
+
+# HAVING in FROM subquery
+@cross-check-integrity
+test update-from-having-subquery {
+    CREATE TABLE t1(a INTEGER PRIMARY KEY, b INT);
+    CREATE TABLE t2(grp INT, val INT);
+    INSERT INTO t1 VALUES(1,0),(2,0),(3,0);
+    INSERT INTO t2 VALUES(1,5),(1,10),(2,3),(2,7),(3,1);
+    UPDATE t1 SET b = src.total
+    FROM (SELECT grp, SUM(val) as total FROM t2 GROUP BY grp HAVING SUM(val) > 5) AS src
+    WHERE src.grp = t1.a;
+    SELECT * FROM t1 ORDER BY a;
+}
+expect {
+    1|15
+    2|10
+    3|0
+}
+
+# Window function in FROM subquery
+@cross-check-integrity
+test update-from-window-function-extra {
+    CREATE TABLE t1(a INTEGER PRIMARY KEY, b INT);
+    CREATE TABLE t2(id INT, val INT);
+    INSERT INTO t1 VALUES(1,0),(2,0),(3,0);
+    INSERT INTO t2 VALUES(1,10),(2,20),(3,30);
+    UPDATE t1 SET b = sub.running_sum
+    FROM (SELECT id, SUM(val) OVER (ORDER BY id) as running_sum FROM t2) AS sub
+    WHERE sub.id = t1.a;
+    SELECT * FROM t1 ORDER BY a;
+}
+expect {
+    1|10
+    2|30
+    3|60
+}
+
+# UNION ALL in FROM subquery
+@cross-check-integrity
+test update-from-union-all {
+    CREATE TABLE t1(a INTEGER PRIMARY KEY, b TEXT);
+    INSERT INTO t1 VALUES(1,'a'),(2,'b'),(3,'c');
+    UPDATE t1 SET b = src.val
+    FROM (SELECT 1 as id, 'U1' as val UNION ALL SELECT 2, 'U2') AS src
+    WHERE src.id = t1.a;
+    SELECT * FROM t1 ORDER BY a;
+}
+expect {
+    1|U1
+    2|U2
+    3|c
+}
+
+# INTERSECT in FROM subquery
+@cross-check-integrity
+test update-from-intersect {
+    CREATE TABLE t1(a INTEGER PRIMARY KEY, b TEXT);
+    CREATE TABLE t2(id INT, val TEXT);
+    CREATE TABLE t3(id INT, val TEXT);
+    INSERT INTO t1 VALUES(1,'a'),(2,'b');
+    INSERT INTO t2 VALUES(1,'X'),(2,'Y'),(3,'Z');
+    INSERT INTO t3 VALUES(1,'X'),(4,'W');
+    UPDATE t1 SET b = src.val
+    FROM (SELECT id, val FROM t2 INTERSECT SELECT id, val FROM t3) AS src
+    WHERE src.id = t1.a;
+    SELECT * FROM t1 ORDER BY a;
+}
+expect {
+    1|X
+    2|b
+}
+
+# EXCEPT in FROM subquery
+@cross-check-integrity
+test update-from-except {
+    CREATE TABLE t1(a INTEGER PRIMARY KEY, b TEXT);
+    CREATE TABLE t2(id INT, val TEXT);
+    CREATE TABLE t3(id INT, val TEXT);
+    INSERT INTO t1 VALUES(1,'a'),(2,'b'),(3,'c');
+    INSERT INTO t2 VALUES(1,'X'),(2,'Y'),(3,'Z');
+    INSERT INTO t3 VALUES(2,'Y');
+    UPDATE t1 SET b = src.val
+    FROM (SELECT id, val FROM t2 EXCEPT SELECT id, val FROM t3) AS src
+    WHERE src.id = t1.a;
+    SELECT * FROM t1 ORDER BY a;
+}
+expect {
+    1|X
+    2|b
+    3|Z
+}
+
+# Multiple CTEs, one referencing another
+@cross-check-integrity
+test update-from-cte-chain {
+    CREATE TABLE t1(a INTEGER PRIMARY KEY, b TEXT);
+    INSERT INTO t1 VALUES(1,'a'),(2,'b'),(3,'c');
+    WITH
+      base AS (SELECT 1 as id, 'X' as val UNION ALL SELECT 2, 'Y' UNION ALL SELECT 3, 'Z'),
+      derived AS (SELECT id, val || '!' as val FROM base WHERE id <= 2)
+    UPDATE t1 SET b = derived.val FROM derived WHERE derived.id = t1.a;
+    SELECT * FROM t1 ORDER BY a;
+}
+expect {
+    1|X!
+    2|Y!
+    3|c
+}
+
+# Self-join shift: each row gets the value of the next row
+@cross-check-integrity
+test update-from-self-join-shift {
+    CREATE TABLE t1(a INTEGER PRIMARY KEY, c INT);
+    INSERT INTO t1 VALUES(1,10),(2,20),(3,30);
+    UPDATE t1 SET c = t1_src.c FROM t1 AS t1_src WHERE t1_src.a = t1.a + 1;
+    SELECT * FROM t1 ORDER BY a;
+}
+expect {
+    1|20
+    2|30
+    3|30
+}
+
+# Value rotation using CASE in self-join
+@cross-check-integrity
+test update-from-rotate-values {
+    CREATE TABLE t1(a INTEGER PRIMARY KEY, b INT);
+    INSERT INTO t1 VALUES(1,100),(2,200),(3,300);
+    UPDATE t1 SET b = src.b FROM t1 AS src
+    WHERE src.a = CASE t1.a WHEN 1 THEN 2 WHEN 2 THEN 3 WHEN 3 THEN 1 END;
+    SELECT * FROM t1 ORDER BY a;
+}
+expect {
+    1|200
+    2|300
+    3|100
+}
+
+# Self-referential aggregate: each row gets average of all original values
+@cross-check-integrity
+test update-from-self-ref-aggregate {
+    CREATE TABLE t1(a INTEGER PRIMARY KEY, b INT);
+    INSERT INTO t1 VALUES(1,10),(2,20),(3,30);
+    UPDATE t1 SET b = src.avg_b FROM (SELECT AVG(b) as avg_b FROM t1) AS src;
+    SELECT a, CAST(b AS INT) FROM t1 ORDER BY a;
+}
+expect {
+    1|20
+    2|20
+    3|20
+}
+
+# Snapshot semantics: WHERE references column being SET
+@cross-check-integrity
+test update-from-snapshot-where-set-same-col {
+    CREATE TABLE t1(a INTEGER PRIMARY KEY, b INT, c TEXT);
+    INSERT INTO t1 VALUES(1,100,'a'),(2,200,'b'),(3,300,'c');
+    UPDATE t1 SET b = 999 FROM (SELECT 1 as x) AS src WHERE t1.b = 200;
+    SELECT * FROM t1 ORDER BY a;
+}
+expect {
+    1|100|a
+    2|999|b
+    3|300|c
+}
+
+# Correlated subquery in SET referencing FROM table
+@cross-check-integrity
+test update-from-correlated-sub-refs-from-extra {
+    CREATE TABLE t1(a INTEGER PRIMARY KEY, b INT);
+    CREATE TABLE t2(id INT, multiplier INT);
+    CREATE TABLE t3(ref_id INT, bonus INT);
+    INSERT INTO t1 VALUES(1,0),(2,0),(3,0);
+    INSERT INTO t2 VALUES(1,2),(2,3);
+    INSERT INTO t3 VALUES(1,5),(2,10),(3,15);
+    UPDATE t1 SET b = (SELECT t3.bonus FROM t3 WHERE t3.ref_id = t2.id) FROM t2 WHERE t2.id = t1.a;
+    SELECT * FROM t1 ORDER BY a;
+}
+expect {
+    1|5
+    2|10
+    3|0
+}
+
+# Scalar subquery referencing FROM + third table
+@cross-check-integrity
+test update-from-nested-join-subquery {
+    CREATE TABLE t1(a INTEGER PRIMARY KEY, b INT);
+    CREATE TABLE t2(id INT, group_id INT);
+    CREATE TABLE t3(group_id INT, value INT);
+    INSERT INTO t1 VALUES(1,0),(2,0);
+    INSERT INTO t2 VALUES(1,10),(2,20);
+    INSERT INTO t3 VALUES(10,1000),(20,2000);
+    UPDATE t1 SET b = (SELECT t3.value FROM t3 WHERE t3.group_id = t2.group_id)
+    FROM t2 WHERE t2.id = t1.a;
+    SELECT * FROM t1 ORDER BY a;
+}
+expect {
+    1|1000
+    2|2000
+}
+
+# Deeply nested join chain (4 FROM tables)
+@cross-check-integrity
+test update-from-deep-join-chain {
+    CREATE TABLE t1(a INTEGER PRIMARY KEY, b TEXT);
+    CREATE TABLE j1(id INT, v1 TEXT);
+    CREATE TABLE j2(id INT, v2 TEXT);
+    CREATE TABLE j3(id INT, v3 TEXT);
+    CREATE TABLE j4(id INT, v4 TEXT);
+    INSERT INTO t1 VALUES(1,'a'),(2,'b');
+    INSERT INTO j1 VALUES(1,'j1_1'),(2,'j1_2');
+    INSERT INTO j2 VALUES(1,'j2_1'),(2,'j2_2');
+    INSERT INTO j3 VALUES(1,'j3_1'),(2,'j3_2');
+    INSERT INTO j4 VALUES(1,'j4_1'),(2,'j4_2');
+    UPDATE t1 SET b = j1.v1 || ',' || j2.v2 || ',' || j3.v3 || ',' || j4.v4
+    FROM j1 JOIN j2 ON j1.id = j2.id JOIN j3 ON j2.id = j3.id JOIN j4 ON j3.id = j4.id
+    WHERE j1.id = t1.a;
+    SELECT * FROM t1 ORDER BY a;
+}
+expect {
+    1|j1_1,j2_1,j3_1,j4_1
+    2|j1_2,j2_2,j3_2,j4_2
+}
+
+# FROM subquery with LIMIT
+@cross-check-integrity
+test update-from-subquery-with-limit {
+    CREATE TABLE t1(a INTEGER PRIMARY KEY, b TEXT);
+    CREATE TABLE t2(id INT, val TEXT);
+    INSERT INTO t1 VALUES(1,'a'),(2,'b'),(3,'c');
+    INSERT INTO t2 VALUES(1,'X'),(2,'Y'),(3,'Z');
+    UPDATE t1 SET b = sub.val
+    FROM (SELECT id, val FROM t2 ORDER BY id LIMIT 2) AS sub
+    WHERE sub.id = t1.a;
+    SELECT * FROM t1 ORDER BY a;
+}
+expect {
+    1|X
+    2|Y
+    3|c
+}
+
+# CASE expression with FROM columns
+@cross-check-integrity
+test update-from-case-expression {
+    CREATE TABLE t1(a INTEGER PRIMARY KEY, b TEXT);
+    CREATE TABLE t2(id INT, val TEXT);
+    INSERT INTO t1 VALUES(1,'a'),(2,'b'),(3,'c');
+    INSERT INTO t2 VALUES(1,'X'),(2,'Y'),(3,'Z');
+    UPDATE t1 SET b = CASE WHEN t2.val = 'X' THEN 'matched_x' WHEN t2.val = 'Y' THEN 'matched_y' ELSE 'other' END
+    FROM t2 WHERE t2.id = t1.a;
+    SELECT * FROM t1 ORDER BY a;
+}
+expect {
+    1|matched_x
+    2|matched_y
+    3|other
+}
+
+# Mixed target+source in SET expression
+@cross-check-integrity
+test update-from-mixed-target-source-set {
+    CREATE TABLE t1(a INTEGER PRIMARY KEY, b INT, c TEXT);
+    CREATE TABLE t2(id INT, factor INT);
+    INSERT INTO t1 VALUES(1,10,'x'),(2,20,'y'),(3,30,'z');
+    INSERT INTO t2 VALUES(1,2),(2,3);
+    UPDATE t1 SET b = t1.b * t2.factor, c = t1.c || cast(t2.factor as text) FROM t2 WHERE t2.id = t1.a;
+    SELECT * FROM t1 ORDER BY a;
+}
+expect {
+    1|20|x2
+    2|60|y3
+    3|30|z
+}
+
+# Multiple FROM tables (comma-join)
+@cross-check-integrity
+test update-from-multi-tables {
+    CREATE TABLE t1(a INTEGER PRIMARY KEY, b TEXT, c INT);
+    CREATE TABLE t2(id INT, name TEXT);
+    CREATE TABLE t3(id INT, score INT);
+    INSERT INTO t1 VALUES(1,'a',0),(2,'b',0),(3,'c',0);
+    INSERT INTO t2 VALUES(1,'alpha'),(2,'beta');
+    INSERT INTO t3 VALUES(1,100),(2,200);
+    UPDATE t1 SET b = t2.name, c = t3.score FROM t2, t3 WHERE t2.id = t1.a AND t3.id = t1.a;
+    SELECT * FROM t1 ORDER BY a;
+}
+expect {
+    1|alpha|100
+    2|beta|200
+    3|c|0
+}
+
+# GROUP_CONCAT in FROM subquery
+@cross-check-integrity
+test update-from-group-concat {
+    CREATE TABLE t1(a INTEGER PRIMARY KEY, b TEXT);
+    CREATE TABLE t2(grp INT, item TEXT);
+    INSERT INTO t1 VALUES(1,''),(2,''),(3,'');
+    INSERT INTO t2 VALUES(1,'a'),(1,'b'),(1,'c'),(2,'x'),(2,'y'),(3,'z');
+    UPDATE t1 SET b = src.items
+    FROM (SELECT grp, GROUP_CONCAT(item, ',') as items FROM t2 GROUP BY grp) AS src
+    WHERE src.grp = t1.a;
+    SELECT * FROM t1 ORDER BY a;
+}
+expect {
+    1|a,b,c
+    2|x,y
+    3|z
+}
+
+# Complex multi-column expression update
+@cross-check-integrity
+test update-from-complex-multi-col {
+    CREATE TABLE t1(a INTEGER PRIMARY KEY, b TEXT, c INT, d REAL);
+    CREATE TABLE t2(id INT, category TEXT, weight REAL);
+    INSERT INTO t1 VALUES(1,'alpha',10,1.1),(2,'beta',20,2.2),(3,'gamma',30,3.3);
+    INSERT INTO t2 VALUES(1,'A',0.5),(2,'B',1.5),(3,'A',2.5);
+    UPDATE t1 SET
+      b = CASE t2.category
+        WHEN 'A' THEN upper(t1.b)
+        WHEN 'B' THEN lower(t1.b)
+        ELSE t1.b
+      END,
+      c = CAST(t1.c * t2.weight AS INT),
+      d = ROUND(t1.d + t2.weight, 2)
+    FROM t2 WHERE t2.id = t1.a;
+    SELECT * FROM t1 ORDER BY a;
+}
+expect {
+    1|ALPHA|5|1.6
+    2|beta|30|3.7
+    3|GAMMA|75|5.8
+}
+
+# Sequential UPDATE FROMs building on each other
+@cross-check-integrity
+test update-from-sequential-visibility {
+    CREATE TABLE t1(a INTEGER PRIMARY KEY, b INT, c TEXT);
+    CREATE TABLE t2(id INT, val INT);
+    INSERT INTO t1 VALUES(1,0,'a'),(2,0,'b'),(3,0,'c');
+    INSERT INTO t2 VALUES(1,100),(2,200),(3,300);
+    BEGIN;
+    UPDATE t1 SET b = t2.val FROM t2 WHERE t2.id = t1.a;
+    UPDATE t1 SET c = 'updated_' || t1.b FROM t2 WHERE t2.id = t1.a;
+    COMMIT;
+    SELECT * FROM t1 ORDER BY a;
+}
+expect {
+    1|100|updated_100
+    2|200|updated_200
+    3|300|updated_300
+}
+
+# Repeated UPDATE FROMs accumulating changes
+@cross-check-integrity
+test update-from-repeated-accumulate {
+    CREATE TABLE t1(a INTEGER PRIMARY KEY, b INT);
+    CREATE TABLE deltas(id INT, delta INT);
+    INSERT INTO t1 VALUES(1,0),(2,0),(3,0);
+    INSERT INTO deltas VALUES(1,1),(2,2),(3,3);
+    UPDATE t1 SET b = t1.b + deltas.delta FROM deltas WHERE deltas.id = t1.a;
+    UPDATE t1 SET b = t1.b + deltas.delta FROM deltas WHERE deltas.id = t1.a;
+    UPDATE t1 SET b = t1.b + deltas.delta FROM deltas WHERE deltas.id = t1.a;
+    SELECT * FROM t1 ORDER BY a;
+}
+expect {
+    1|3
+    2|6
+    3|9
+}
+
+# LIKE in join condition
+@cross-check-integrity
+test update-from-like-join {
+    CREATE TABLE t1(a INTEGER PRIMARY KEY, b TEXT, c TEXT);
+    CREATE TABLE t2(pattern TEXT, replacement TEXT);
+    INSERT INTO t1 VALUES(1,'hello','old'),(2,'world','old'),(3,'help','old');
+    INSERT INTO t2 VALUES('hel%','matched');
+    UPDATE t1 SET c = t2.replacement FROM t2 WHERE t1.b LIKE t2.pattern;
+    SELECT * FROM t1 ORDER BY a;
+}
+expect {
+    1|hello|matched
+    2|world|old
+    3|help|matched
+}
+
+# NATURAL JOIN of same table is OK when all joins are NATURAL
+@cross-check-integrity
+test update-from-double-natural-join-ok {
+    CREATE TABLE t1(a INTEGER PRIMARY KEY, b TEXT);
+    CREATE TABLE s1(x INT, y TEXT);
+    CREATE TABLE s2(x INT, z TEXT);
+    CREATE TABLE s3(x INT, w TEXT);
+    INSERT INTO t1 VALUES(1,'orig');
+    INSERT INTO s1 VALUES(1,'s1');
+    INSERT INTO s2 VALUES(1,'s2');
+    INSERT INTO s3 VALUES(1,'s3');
+    UPDATE t1 SET b = s1.y FROM s1 NATURAL JOIN s2 NATURAL JOIN s3 WHERE s1.x = t1.a;
+    SELECT * FROM t1;
+}
+expect {
+    1|s1
+}
+
+# Multiple USING columns
+@cross-check-integrity
+test update-from-multi-using-cols {
+    CREATE TABLE t1(a INTEGER PRIMARY KEY, b TEXT);
+    CREATE TABLE t2(x INT, y INT, val TEXT);
+    CREATE TABLE t3(x INT, y INT, extra TEXT);
+    INSERT INTO t1 VALUES(1,'a'),(2,'b');
+    INSERT INTO t2 VALUES(1,10,'X'),(2,20,'Y');
+    INSERT INTO t3 VALUES(1,10,'E1'),(2,20,'E2');
+    UPDATE t1 SET b = t2.val || t3.extra FROM t2 JOIN t3 USING(x, y) WHERE t2.x = t1.a;
+    SELECT * FROM t1 ORDER BY a;
+}
+expect {
+    1|XE1
+    2|YE2
+}
+
+# LEFT JOIN in FROM with COALESCE
+@cross-check-integrity
+test update-from-left-join-coalesce {
+    CREATE TABLE t1(a INTEGER PRIMARY KEY, b TEXT);
+    CREATE TABLE t2(id INT, x TEXT);
+    CREATE TABLE t3(id INT, y TEXT);
+    INSERT INTO t1 VALUES(1,'orig');
+    INSERT INTO t2 VALUES(1,'X1');
+    INSERT INTO t3 VALUES(1,'Y1'),(2,'Y2');
+    UPDATE t1 SET b = COALESCE(t2.x, '') || COALESCE(t3.y, '')
+    FROM t2 LEFT JOIN t3 ON t2.id = t3.id WHERE t2.id = t1.a;
+    SELECT * FROM t1;
+}
+expect {
+    1|X1Y1
+}
+
+# Mixed types from UNION subquery
+@cross-check-integrity
+test update-from-mixed-types-union {
+    CREATE TABLE t1(a INTEGER PRIMARY KEY, b);
+    INSERT INTO t1 VALUES(1,NULL),(2,NULL),(3,NULL);
+    UPDATE t1 SET b = src.val
+    FROM (SELECT 1 as id, 42 as val UNION ALL SELECT 2, 'text' UNION ALL SELECT 3, 3.14) AS src
+    WHERE src.id = t1.a;
+    SELECT a, b, typeof(b) FROM t1 ORDER BY a;
+}
+expect {
+    1|42|integer
+    2|text|text
+    3|3.14|real
+}
+
+# All value types through UPDATE FROM
+@cross-check-integrity
+test update-from-all-types {
+    CREATE TABLE t1(a INTEGER PRIMARY KEY, b);
+    CREATE TABLE t2(id INT, val);
+    INSERT INTO t1 VALUES(1,NULL),(2,NULL),(3,NULL),(4,NULL),(5,NULL);
+    INSERT INTO t2 VALUES(1, 42);
+    INSERT INTO t2 VALUES(2, 3.14);
+    INSERT INTO t2 VALUES(3, 'hello');
+    INSERT INTO t2 VALUES(4, x'DEADBEEF');
+    INSERT INTO t2 VALUES(5, NULL);
+    UPDATE t1 SET b = t2.val FROM t2 WHERE t2.id = t1.a;
+    SELECT a, typeof(b) FROM t1 ORDER BY a;
+}
+expect {
+    1|integer
+    2|real
+    3|text
+    4|blob
+    5|null
+}
+
+# NUMERIC affinity through ephemeral table
+@cross-check-integrity
+test update-from-numeric-affinity {
+    CREATE TABLE t1(a INTEGER PRIMARY KEY, b NUMERIC);
+    CREATE TABLE t2(id INT, val);
+    INSERT INTO t1 VALUES(1,0),(2,0),(3,0);
+    INSERT INTO t2 VALUES(1, '123');
+    INSERT INTO t2 VALUES(2, '12.5');
+    INSERT INTO t2 VALUES(3, 'abc');
+    UPDATE t1 SET b = t2.val FROM t2 WHERE t2.id = t1.a;
+    SELECT a, b, typeof(b) FROM t1 ORDER BY a;
+}
+expect {
+    1|123|integer
+    2|12.5|real
+    3|abc|text
+}
+
+# INTEGER affinity
+@cross-check-integrity
+test update-from-integer-affinity {
+    CREATE TABLE t1(a INTEGER PRIMARY KEY, b INTEGER);
+    CREATE TABLE t2(id INT, val);
+    INSERT INTO t1 VALUES(1,0),(2,0),(3,0);
+    INSERT INTO t2 VALUES(1, 3.0);
+    INSERT INTO t2 VALUES(2, 3.5);
+    INSERT INTO t2 VALUES(3, '42');
+    UPDATE t1 SET b = t2.val FROM t2 WHERE t2.id = t1.a;
+    SELECT a, b, typeof(b) FROM t1 ORDER BY a;
+}
+expect {
+    1|3|integer
+    2|3.5|real
+    3|42|integer
+}
+
+# Trigger (BEFORE + AFTER) with UPDATE FROM
+@cross-check-integrity
+test update-from-before-after-triggers {
+    CREATE TABLE t1(a INTEGER PRIMARY KEY, b TEXT);
+    CREATE TABLE t2(id INT, val TEXT);
+    CREATE TABLE audit(msg TEXT);
+    INSERT INTO t1 VALUES(1,'a'),(2,'b');
+    INSERT INTO t2 VALUES(1,'X'),(2,'Y');
+    CREATE TRIGGER tr_before BEFORE UPDATE ON t1 BEGIN
+      INSERT INTO audit VALUES('before: old=' || OLD.b || ' new=' || NEW.b);
+    END;
+    CREATE TRIGGER tr_after AFTER UPDATE ON t1 BEGIN
+      INSERT INTO audit VALUES('after: old=' || OLD.b || ' new=' || NEW.b);
+    END;
+    UPDATE t1 SET b = t2.val FROM t2 WHERE t2.id = t1.a;
+    SELECT * FROM t1 ORDER BY a;
+    SELECT * FROM audit ORDER BY rowid;
+}
+expect {
+    1|X
+    2|Y
+    before: old=a new=X
+    after: old=a new=X
+    before: old=b new=Y
+    after: old=b new=Y
+}
+
+# Trigger doing cascading UPDATE
+@cross-check-integrity
+test update-from-trigger-cascading-update {
+    CREATE TABLE t1(a INTEGER PRIMARY KEY, b INT);
+    CREATE TABLE t2(id INT, val INT);
+    CREATE TABLE t3(x INT);
+    INSERT INTO t1 VALUES(1,10),(2,20),(3,30);
+    INSERT INTO t2 VALUES(1,100);
+    INSERT INTO t3 VALUES(0);
+    CREATE TRIGGER tr AFTER UPDATE ON t1 BEGIN
+      UPDATE t3 SET x = x + 1;
+    END;
+    UPDATE t1 SET b = t2.val FROM t2 WHERE t2.id = t1.a;
+    SELECT * FROM t1 ORDER BY a;
+    SELECT * FROM t3;
+}
+expect {
+    1|100
+    2|20
+    3|30
+    1
+}
+
+# FK cascade via UPDATE FROM
+@cross-check-integrity
+test update-from-fk-cascade-extra {
+    CREATE TABLE parent(id INTEGER PRIMARY KEY, name TEXT);
+    CREATE TABLE child(id INTEGER PRIMARY KEY, pid INTEGER REFERENCES parent(id) ON UPDATE CASCADE, val TEXT);
+    CREATE TABLE src(old_id INTEGER, new_id INTEGER);
+    INSERT INTO parent VALUES(1,'p1'),(2,'p2');
+    INSERT INTO child VALUES(10,1,'c1'),(20,2,'c2');
+    INSERT INTO src VALUES(1,100);
+    PRAGMA foreign_keys = ON;
+    UPDATE parent SET id = src.new_id FROM src WHERE src.old_id = parent.id;
+    SELECT * FROM parent ORDER BY id;
+    SELECT * FROM child ORDER BY id;
+}
+expect {
+    2|p2
+    100|p1
+    10|100|c1
+    20|2|c2
+}
+
+# Savepoint + rollback
+@cross-check-integrity
+test update-from-savepoint-rollback {
+    CREATE TABLE t1(a INTEGER PRIMARY KEY, b TEXT);
+    CREATE TABLE t2(id INT, val TEXT);
+    INSERT INTO t1 VALUES(1,'a'),(2,'b');
+    INSERT INTO t2 VALUES(1,'X'),(2,'Y');
+    SAVEPOINT sp1;
+    UPDATE t1 SET b = t2.val FROM t2 WHERE t2.id = t1.a;
+    ROLLBACK TO sp1;
+    SELECT * FROM t1 ORDER BY a;
+    RELEASE sp1;
+}
+expect {
+    1|a
+    2|b
+}
+
+# WHERE 0 should match nothing
+@cross-check-integrity
+test update-from-where-false {
+    CREATE TABLE t1(a INTEGER PRIMARY KEY, b TEXT);
+    CREATE TABLE t2(id INT, val TEXT);
+    INSERT INTO t1 VALUES(1,'a'),(2,'b'),(3,'c');
+    INSERT INTO t2 VALUES(1,'X'),(2,'Y'),(3,'Z');
+    UPDATE t1 SET b = t2.val FROM t2 WHERE 0;
+    SELECT * FROM t1 ORDER BY a;
+}
+expect {
+    1|a
+    2|b
+    3|c
+}
+
+# json_extract in SET
+@cross-check-integrity
+test update-from-json-extract {
+    CREATE TABLE t1(a INTEGER PRIMARY KEY, b TEXT);
+    CREATE TABLE t2(id INT, data TEXT);
+    INSERT INTO t1 VALUES(1,'old'),(2,'old');
+    INSERT INTO t2 VALUES(1,'{"name":"hello"}'),(2,'{"name":"world"}');
+    UPDATE t1 SET b = json_extract(t2.data, '$.name') FROM t2 WHERE t2.id = t1.a;
+    SELECT * FROM t1 ORDER BY a;
+}
+expect {
+    1|hello
+    2|world
+}
