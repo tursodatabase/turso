@@ -9171,3 +9171,73 @@ fn test_immediate_not_blocked_by_concurrent_speculative_write() {
     let rows = get_rows(&conn3, "SELECT val FROM t1 WHERE id = 1");
     assert_eq!(rows[0][0].to_string(), "immediate_val");
 }
+
+#[test]
+fn test_immediate_and_concurrent_non_conflicting_updates_both_commit() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let conn0 = db.connect();
+    conn0
+        .execute("CREATE TABLE t1(id INTEGER PRIMARY KEY, val TEXT)")
+        .unwrap();
+    conn0
+        .execute("INSERT INTO t1 VALUES(1, 'row1'), (2, 'row2')")
+        .unwrap();
+    conn0.close().unwrap();
+
+    let conn1 = db.connect();
+    let conn2 = db.connect();
+
+    conn1.execute("BEGIN IMMEDIATE").unwrap();
+    conn2.execute("BEGIN CONCURRENT").unwrap();
+    conn2
+        .execute("UPDATE t1 SET val = 'concurrent_val' WHERE id = 1")
+        .unwrap();
+    conn1
+        .execute("UPDATE t1 SET val = 'immediate_val' WHERE id = 2")
+        .unwrap();
+    conn1.execute("COMMIT").unwrap();
+    conn2.execute("COMMIT").unwrap();
+
+    let conn3 = db.connect();
+    let rows = get_rows(&conn3, "SELECT id, val FROM t1 ORDER BY id");
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0][0].as_int().unwrap(), 1);
+    assert_eq!(rows[0][1].to_string(), "concurrent_val");
+    assert_eq!(rows[1][0].as_int().unwrap(), 2);
+    assert_eq!(rows[1][1].to_string(), "immediate_val");
+}
+
+#[test]
+fn test_concurrent_commit_survives_immediate_rollback_on_disjoint_rows() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let conn0 = db.connect();
+    conn0
+        .execute("CREATE TABLE t1(id INTEGER PRIMARY KEY, val TEXT)")
+        .unwrap();
+    conn0
+        .execute("INSERT INTO t1 VALUES(1, 'row1'), (2, 'row2')")
+        .unwrap();
+    conn0.close().unwrap();
+
+    let conn1 = db.connect();
+    let conn2 = db.connect();
+
+    conn1.execute("BEGIN IMMEDIATE").unwrap();
+    conn2.execute("BEGIN CONCURRENT").unwrap();
+    conn2
+        .execute("UPDATE t1 SET val = 'concurrent_val' WHERE id = 1")
+        .unwrap();
+    conn1
+        .execute("UPDATE t1 SET val = 'immediate_val' WHERE id = 2")
+        .unwrap();
+    conn1.execute("ROLLBACK").unwrap();
+    conn2.execute("COMMIT").unwrap();
+
+    let conn3 = db.connect();
+    let rows = get_rows(&conn3, "SELECT id, val FROM t1 ORDER BY id");
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0][0].as_int().unwrap(), 1);
+    assert_eq!(rows[0][1].to_string(), "concurrent_val");
+    assert_eq!(rows[1][0].as_int().unwrap(), 2);
+    assert_eq!(rows[1][1].to_string(), "row2");
+}
