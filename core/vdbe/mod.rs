@@ -50,8 +50,8 @@ use crate::{
         execute::{
             OpColumnState, OpDeleteState, OpDeleteSubState, OpDestroyState, OpIdxInsertState,
             OpInsertState, OpInsertSubState, OpJournalModeState, OpNewRowidState,
-            OpNoConflictState, OpProgramState, OpRowIdState, OpSeekState, OpTransactionState,
-            OpVacuumIntoState,
+            OpNoConflictState, OpParseSchemaState, OpProgramState, OpRowIdState, OpSeekState,
+            OpTransactionState, OpVacuumIntoState,
         },
         hash_table::HashTable,
         metrics::StatementMetrics,
@@ -419,6 +419,153 @@ pub struct OpHashProbeState {
     pub probe_buffered: bool,
 }
 
+enum ActiveOpState {
+    None,
+    Delete(OpDeleteState),
+    Destroy(OpDestroyState),
+    IdxDelete(Option<OpIdxDeleteState>),
+    IntegrityCheck(OpIntegrityCheckState),
+    OpenEphemeral(OpOpenEphemeralState),
+    Program(OpProgramState),
+    NewRowid(OpNewRowidState),
+    IdxInsert(OpIdxInsertState),
+    Insert(OpInsertState),
+    NoConflict(OpNoConflictState),
+    Column(OpColumnState),
+    RowId(OpRowIdState),
+    Transaction(OpTransactionState),
+    JournalMode(OpJournalModeState),
+    VacuumInto(Option<OpVacuumIntoState>),
+    ParseSchema(OpParseSchemaState),
+    HashBuild(Option<OpHashBuildState>),
+    HashProbe(Option<OpHashProbeState>),
+}
+
+#[derive(Default)]
+struct ActiveOpStateSlot {
+    state: ActiveOpState,
+}
+
+macro_rules! active_state_accessor {
+    ($name:ident, $variant:ident, $ty:ty, $init:expr) => {
+        fn $name(&mut self) -> &mut $ty {
+            if matches!(self.state, ActiveOpState::None) {
+                self.state = ActiveOpState::$variant($init);
+            }
+            match &mut self.state {
+                ActiveOpState::$variant(state) => state,
+                _ => unreachable!(
+                    "active opcode state mismatch: expected {}",
+                    stringify!($variant)
+                ),
+            }
+        }
+    };
+}
+
+impl Default for ActiveOpState {
+    fn default() -> Self {
+        Self::None
+    }
+}
+
+impl ActiveOpStateSlot {
+    fn clear(&mut self) {
+        self.state = ActiveOpState::None;
+    }
+
+    active_state_accessor!(
+        delete,
+        Delete,
+        OpDeleteState,
+        OpDeleteState {
+            sub_state: OpDeleteSubState::MaybeCaptureRecord,
+            deleted_record: None,
+        }
+    );
+    active_state_accessor!(
+        destroy,
+        Destroy,
+        OpDestroyState,
+        OpDestroyState::CreateCursor
+    );
+    active_state_accessor!(idx_delete, IdxDelete, Option<OpIdxDeleteState>, None);
+    active_state_accessor!(
+        integrity_check,
+        IntegrityCheck,
+        OpIntegrityCheckState,
+        OpIntegrityCheckState::Start
+    );
+    active_state_accessor!(
+        open_ephemeral,
+        OpenEphemeral,
+        OpOpenEphemeralState,
+        OpOpenEphemeralState::Start
+    );
+    active_state_accessor!(program, Program, OpProgramState, OpProgramState::Start);
+    active_state_accessor!(new_rowid, NewRowid, OpNewRowidState, OpNewRowidState::Start);
+    active_state_accessor!(
+        idx_insert,
+        IdxInsert,
+        OpIdxInsertState,
+        OpIdxInsertState::MaybeSeek
+    );
+    active_state_accessor!(
+        insert,
+        Insert,
+        OpInsertState,
+        OpInsertState {
+            sub_state: OpInsertSubState::MaybeCaptureRecord,
+            old_record: None,
+            is_noop_update: false,
+        }
+    );
+    active_state_accessor!(
+        no_conflict,
+        NoConflict,
+        OpNoConflictState,
+        OpNoConflictState::Start
+    );
+    active_state_accessor!(column, Column, OpColumnState, OpColumnState::Start);
+    active_state_accessor!(row_id, RowId, OpRowIdState, OpRowIdState::Start);
+    active_state_accessor!(
+        transaction,
+        Transaction,
+        OpTransactionState,
+        OpTransactionState::Start
+    );
+    active_state_accessor!(
+        journal_mode,
+        JournalMode,
+        OpJournalModeState,
+        OpJournalModeState::default()
+    );
+    active_state_accessor!(vacuum_into, VacuumInto, Option<OpVacuumIntoState>, None);
+    active_state_accessor!(parse_schema, ParseSchema, OpParseSchemaState, None);
+    active_state_accessor!(hash_build, HashBuild, Option<OpHashBuildState>, None);
+    active_state_accessor!(hash_probe, HashProbe, Option<OpHashProbeState>, None);
+
+    fn program_ref(&self) -> Option<&OpProgramState> {
+        match &self.state {
+            ActiveOpState::Program(state) => Some(state),
+            _ => None,
+        }
+    }
+
+    fn program_mut(&mut self) -> Option<&mut OpProgramState> {
+        match &mut self.state {
+            ActiveOpState::Program(state) => Some(state),
+            _ => None,
+        }
+    }
+
+    fn reset_vacuum_into(&mut self) {
+        if matches!(self.state, ActiveOpState::VacuumInto(_)) {
+            self.clear();
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct DeferredSeekState {
     pub index_cursor_id: CursorID,
@@ -448,26 +595,12 @@ pub struct ProgramState {
     commit_state: CommitState,
     #[cfg(feature = "json")]
     json_cache: JsonCacheCell,
-    op_delete_state: OpDeleteState,
-    op_destroy_state: OpDestroyState,
-    op_idx_delete_state: Option<OpIdxDeleteState>,
-    op_integrity_check_state: OpIntegrityCheckState,
+    active_op_state: ActiveOpStateSlot,
+    seek_state: OpSeekState,
     /// Metrics collected for the lifetime of this prepared statement.
     pub metrics: StatementMetrics,
-    op_open_ephemeral_state: OpOpenEphemeralState,
-    op_program_state: OpProgramState,
-    op_new_rowid_state: OpNewRowidState,
-    op_idx_insert_state: OpIdxInsertState,
-    op_insert_state: OpInsertState,
-    op_no_conflict_state: OpNoConflictState,
-    seek_state: OpSeekState,
     /// Current collation sequence set by OP_CollSeq instruction
     current_collation: Option<CollationSeq>,
-    op_column_state: OpColumnState,
-    op_row_id_state: OpRowIdState,
-    op_transaction_state: OpTransactionState,
-    op_journal_mode_state: OpJournalModeState,
-    op_vacuum_into_state: Option<OpVacuumIntoState>,
     /// State machine for committing view deltas with I/O handling
     view_delta_state: ViewDeltaCommitState,
     /// Marker which tells about auto transaction cleanup necessary for that connection in case of reset
@@ -493,7 +626,6 @@ pub struct ProgramState {
     /// capture_data_changes has type Option<CaptureDataChangesInfo> (off mode is None)
     /// so, for pending_cdc_info we wrap it in one more Option<...> layer to represent if mode changed during program execution
     pub(crate) pending_cdc_info: Option<Option<CaptureDataChangesInfo>>,
-    pub(crate) op_parse_schema_state: execute::OpParseSchemaState,
     /// Cached subprogram Statements keyed by the PC of the Program instruction.
     /// Avoids re-allocating ProgramState on each trigger/FK-action fire.
     pub(crate) subprogram_stmt_cache: HashMap<usize, Box<Statement>>,
@@ -502,8 +634,6 @@ pub struct ProgramState {
     /// Bloom filters stored by cursor ID for probabilistic set membership testing
     /// Used to avoid unnecessary seeks on ephemeral indexes and hash tables
     pub(crate) bloom_filters: HashMap<usize, BloomFilter>,
-    op_hash_build_state: Option<OpHashBuildState>,
-    op_hash_probe_state: Option<OpHashProbeState>,
     /// Number of deferred foreign key violations when the statement started.
     /// When a statement subtransaction rolls back, the connection's deferred foreign key violations counter
     /// is reset to this value.
@@ -556,34 +686,11 @@ impl ProgramState {
             commit_state: CommitState::Ready,
             #[cfg(feature = "json")]
             json_cache: JsonCacheCell::new(),
-            op_delete_state: OpDeleteState {
-                sub_state: OpDeleteSubState::MaybeCaptureRecord,
-                deleted_record: None,
-            },
-            op_destroy_state: OpDestroyState::CreateCursor,
-            op_idx_delete_state: None,
-            op_integrity_check_state: OpIntegrityCheckState::Start,
-            metrics: StatementMetrics::new(),
-            op_open_ephemeral_state: OpOpenEphemeralState::Start,
-            op_program_state: OpProgramState::Start,
-            op_new_rowid_state: OpNewRowidState::Start,
-            op_idx_insert_state: OpIdxInsertState::MaybeSeek,
-            op_insert_state: OpInsertState {
-                sub_state: OpInsertSubState::MaybeCaptureRecord,
-                old_record: None,
-                is_noop_update: false,
-            },
-            op_no_conflict_state: OpNoConflictState::Start,
-            op_hash_build_state: None,
-            op_hash_probe_state: None,
-            distinct_key_values: Vec::new(),
+            active_op_state: ActiveOpStateSlot::default(),
             seek_state: OpSeekState::Start,
+            metrics: StatementMetrics::new(),
+            distinct_key_values: Vec::new(),
             current_collation: None,
-            op_column_state: OpColumnState::Start,
-            op_row_id_state: OpRowIdState::Start,
-            op_transaction_state: OpTransactionState::Start,
-            op_journal_mode_state: OpJournalModeState::default(),
-            op_vacuum_into_state: None,
             view_delta_state: ViewDeltaCommitState::NotStarted,
             auto_txn_cleanup: TxnCleanup::None,
             fk_deferred_violations_when_stmt_started: AtomicIsize::new(0),
@@ -600,7 +707,6 @@ impl ProgramState {
             explain_state: RwLock::new(ExplainState::default()),
             pending_fail_error: None,
             pending_cdc_info: None,
-            op_parse_schema_state: None,
             subprogram_stmt_cache: HashMap::default(),
         }
     }
@@ -696,31 +802,10 @@ impl ProgramState {
         self.json_cache.clear();
 
         // Reset state machines
-        self.op_delete_state = OpDeleteState {
-            sub_state: OpDeleteSubState::MaybeCaptureRecord,
-            deleted_record: None,
-        };
-        self.op_idx_delete_state = None;
-        self.op_integrity_check_state = OpIntegrityCheckState::Start;
-        self.op_open_ephemeral_state = OpOpenEphemeralState::Start;
-        self.op_new_rowid_state = OpNewRowidState::Start;
-        self.op_idx_insert_state = OpIdxInsertState::MaybeSeek;
-        self.op_insert_state = OpInsertState {
-            sub_state: OpInsertSubState::MaybeCaptureRecord,
-            old_record: None,
-            is_noop_update: false,
-        };
-        self.op_no_conflict_state = OpNoConflictState::Start;
+        self.active_op_state.clear();
         self.seek_state = OpSeekState::Start;
         self.current_collation = None;
-        self.op_column_state = OpColumnState::Start;
-        self.op_row_id_state = OpRowIdState::Start;
         self.commit_state = CommitState::Ready;
-        self.op_destroy_state = OpDestroyState::CreateCursor;
-        self.op_program_state = OpProgramState::Start;
-        self.op_transaction_state = OpTransactionState::Start;
-        self.op_journal_mode_state = OpJournalModeState::default();
-        self.op_vacuum_into_state = None;
         self.view_delta_state = ViewDeltaCommitState::NotStarted;
         self.auto_txn_cleanup = TxnCleanup::None;
         self.fk_immediate_violations_during_stmt
@@ -731,8 +816,6 @@ impl ProgramState {
         self.bloom_filters.clear();
         self.hash_tables.clear();
         self.ephemeral_temp_files.clear();
-        self.op_hash_build_state = None;
-        self.op_hash_probe_state = None;
         self.uses_subjournal = false;
         self.is_active_write = false;
         self.has_stmt_transaction = false;
@@ -757,7 +840,7 @@ impl ProgramState {
 
     pub(crate) fn metrics(&self) -> StatementMetrics {
         let mut metrics = self.metrics.clone();
-        if let OpProgramState::Step { statement, .. } = &self.op_program_state {
+        if let Some(OpProgramState::Step { statement, .. }) = self.active_op_state.program_ref() {
             metrics.merge(&statement.metrics());
         }
         for statement in self.subprogram_stmt_cache.values() {
@@ -768,7 +851,7 @@ impl ProgramState {
 
     pub(crate) fn reset_metrics(&mut self) {
         self.metrics.reset();
-        if let OpProgramState::Step { statement, .. } = &mut self.op_program_state {
+        if let Some(OpProgramState::Step { statement, .. }) = self.active_op_state.program_mut() {
             statement.reset_metrics();
         }
         for statement in self.subprogram_stmt_cache.values_mut() {
@@ -787,7 +870,7 @@ impl ProgramState {
             crate::statement::StatementStatusCounter::RowsRead => self.metrics.rows_read = 0,
             crate::statement::StatementStatusCounter::RowsWritten => self.metrics.rows_written = 0,
         }
-        if let OpProgramState::Step { statement, .. } = &mut self.op_program_state {
+        if let Some(OpProgramState::Step { statement, .. }) = self.active_op_state.program_mut() {
             statement.reset_stmt_status(counter);
         }
         for statement in self.subprogram_stmt_cache.values_mut() {
@@ -2073,7 +2156,7 @@ impl Program {
         // VACUUM INTO state can own internal helper statements whose drop path
         // releases nested guards. Drop them before checking whether this program
         // is itself nested; otherwise abort could skip top-level cleanup.
-        state.op_vacuum_into_state = None;
+        state.active_op_state.reset_vacuum_into();
 
         // Only end trigger execution if the subprogram was actually running.
         // Cached (pooled) statements may be dropped after their trigger execution
@@ -2605,6 +2688,56 @@ impl<'a> ValueIteratorExt for crate::types::ValueIterator<'a> {
         }
 
         Some(Ok(()))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::panic::{catch_unwind, AssertUnwindSafe};
+
+    #[test]
+    fn active_opcode_helpers_initialize_defaults() {
+        let mut state = ProgramState::new(1, 0);
+
+        assert!(matches!(state.active_op_state.state, ActiveOpState::None));
+        assert!(matches!(
+            state.active_op_state.column(),
+            OpColumnState::Start
+        ));
+        state.active_op_state.clear();
+        assert!(state.active_op_state.vacuum_into().is_none());
+        state.active_op_state.clear();
+        assert!(state.active_op_state.parse_schema().is_none());
+    }
+
+    #[test]
+    fn active_opcode_helpers_reject_mismatched_resumes() {
+        let mut state = ProgramState::new(1, 0);
+        *state.active_op_state.column() = OpColumnState::GetColumn;
+
+        let panic = catch_unwind(AssertUnwindSafe(|| {
+            let _ = state.active_op_state.vacuum_into();
+        }));
+        assert!(panic.is_err(), "mismatched opcode resume should panic");
+    }
+
+    #[test]
+    fn seek_state_is_independent_from_active_opcode_slot() {
+        let mut state = ProgramState::new(1, 0);
+
+        *state.active_op_state.insert() = OpInsertState {
+            sub_state: OpInsertSubState::Seek,
+            old_record: None,
+            is_noop_update: false,
+        };
+        state.seek_state = OpSeekState::MoveLast;
+
+        assert!(matches!(
+            state.active_op_state.insert().sub_state,
+            OpInsertSubState::Seek
+        ));
+        assert!(matches!(state.seek_state, OpSeekState::MoveLast));
     }
 }
 
