@@ -13918,7 +13918,7 @@ pub struct OpJournalModeState {
     /// The new journal mode we're changing to
     pub new_mode: Option<journal_mode::JournalMode>,
     /// Checkpoint state machine for MVCC mode
-    pub checkpoint_sm: Option<StateMachine<CheckpointStateMachine<MvccClock>>>,
+    pub checkpoint_sm: Option<StateMachine<Box<CheckpointStateMachine<MvccClock>>>>,
     /// Page reference for writing header
     pub page_ref: Option<PageRef>,
 }
@@ -14026,13 +14026,13 @@ fn op_journal_mode_inner(
                     // MVCC checkpoint using state machine
                     if state.active_op_state.journal_mode().checkpoint_sm.is_none() {
                         state.active_op_state.journal_mode().checkpoint_sm =
-                            Some(StateMachine::new(CheckpointStateMachine::new(
+                            Some(StateMachine::new(Box::new(CheckpointStateMachine::new(
                                 pager.clone(),
                                 mv_store.clone(),
                                 program.connection.clone(),
                                 true,
                                 program.connection.get_sync_mode(),
-                            )));
+                            ))));
                     }
 
                     let ckpt_sm = state
