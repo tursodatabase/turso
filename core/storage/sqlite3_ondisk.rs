@@ -753,11 +753,16 @@ pub fn begin_sync(
 ) -> Result<Completion> {
     turso_assert!(!syncing.load(Ordering::SeqCst));
     syncing.store(true, Ordering::SeqCst);
-    let completion = Completion::new_sync(move |_| {
-        syncing.store(false, Ordering::SeqCst);
+    let completion = Completion::new_sync({
+        let syncing = syncing.clone();
+        move |_| {
+            syncing.store(false, Ordering::SeqCst);
+        }
     });
     #[allow(clippy::arc_with_non_send_sync)]
-    db_file.sync(completion, sync_type)
+    db_file.sync(completion, sync_type).inspect_err(|_| {
+        syncing.store(false, Ordering::SeqCst);
+    })
 }
 
 #[allow(clippy::enum_variant_names)]
