@@ -182,26 +182,14 @@ impl<'a> Parser<'a> {
     }
 
     fn create_variable(&mut self, token: &'a [u8]) -> Result<Expr> {
-        if token.is_empty() {
+        debug_assert!(!token.is_empty());
+        if token == b"?" {
             // Rewrite anonymous variables in encounter order
             self.last_variable_id += 1;
             let index = NonZeroU32::new(self.last_variable_id).unwrap();
             Ok(Expr::Variable(Variable::indexed(index)))
-        } else if matches!(token[0], b':' | b'@' | b'$') {
-            let index = if let Some(index) = self.named_variables.get(token).copied() {
-                index
-            } else {
-                self.last_variable_id += 1;
-                let index = NonZeroU32::new(self.last_variable_id).unwrap();
-                self.named_variables.insert(token, index);
-                index
-            };
-            Ok(Expr::Variable(Variable::named(
-                from_bytes_as_str(token),
-                index,
-            )))
-        } else {
-            let variable_str = std::str::from_utf8(token)
+        } else if token[0] == b'?' {
+            let variable_str = std::str::from_utf8(&token[1..])
                 .map_err(|e| Error::Custom(format!("non-utf8 positional variable id: {e}")))?;
             let variable_id = variable_str
                 .parse::<u32>()
@@ -219,6 +207,20 @@ impl<'a> Parser<'a> {
             self.last_variable_id = self.last_variable_id.max(variable_id);
             let index = NonZeroU32::new(variable_id).unwrap();
             Ok(Expr::Variable(Variable::indexed(index)))
+        } else {
+            debug_assert!(matches!(token[0], b':' | b'@' | b'$'));
+            let index = if let Some(index) = self.named_variables.get(token).copied() {
+                index
+            } else {
+                self.last_variable_id += 1;
+                let index = NonZeroU32::new(self.last_variable_id).unwrap();
+                self.named_variables.insert(token, index);
+                index
+            };
+            Ok(Expr::Variable(Variable::named(
+                from_bytes_as_str(token),
+                index,
+            )))
         }
     }
 

@@ -988,3 +988,41 @@ fn test_bind_in_exists_subquery(tmp_db: TempDatabase) -> anyhow::Result<()> {
     assert_eq!(turso_rows[0], Value::from_i64(42));
     Ok(())
 }
+
+/// Column names for bound parameters must match SQLite:
+///   bare `?` → "?", explicit `?NNN` → "?NNN", named → verbatim text.
+#[turso_macros::test(mvcc)]
+fn test_parameter_column_names(tmp_db: TempDatabase) {
+    let cases: &[(&str, &[&str])] = &[
+        ("SELECT ?, ?", &["?", "?"]),
+        ("SELECT ?1, ?2", &["?1", "?2"]),
+        ("SELECT ?999", &["?999"]),
+        ("SELECT :foo", &[":foo"]),
+        ("SELECT @bar", &["@bar"]),
+        ("SELECT $baz", &["$baz"]),
+        (
+            "SELECT ?, ?1, :foo, @bar, $baz",
+            &["?", "?1", ":foo", "@bar", "$baz"],
+        ),
+        ("SELECT ? AS alias", &["alias"]),
+    ];
+
+    // Verify expected values against rusqlite (bundled SQLite)
+    let sqlite_conn = rusqlite::Connection::open_in_memory().unwrap();
+    for (sql, expected) in cases {
+        let stmt = sqlite_conn.prepare(sql).unwrap();
+        let names: Vec<&str> = stmt.column_names();
+        assert_eq!(names, *expected, "SQLite column names mismatch for: {sql}");
+    }
+
+    // Verify Turso matches
+    let conn = tmp_db.connect_limbo();
+    for (sql, expected) in cases {
+        let stmt = conn.prepare(sql).unwrap();
+        let names: Vec<String> = (0..stmt.num_columns())
+            .map(|i| stmt.get_column_name(i).to_string())
+            .collect();
+        let expected: Vec<String> = expected.iter().map(|s| s.to_string()).collect();
+        assert_eq!(names, expected, "Turso column names mismatch for: {sql}");
+    }
+}
