@@ -67,14 +67,14 @@ fn rowid_update_info(
     target_table: &JoinedTable,
     set_clauses: &[UpdateSetClause],
 ) -> RowidUpdateInfo {
+    let has_direct_rowid_update = set_clauses
+        .iter()
+        .any(|set_clause| set_clause.column_index == ROWID_SENTINEL);
     let rowid_alias_index = target_table
         .table
         .columns()
         .iter()
         .position(|column| column.is_rowid_alias());
-    let has_direct_rowid_update = set_clauses
-        .iter()
-        .any(|set_clause| set_clause.column_index == ROWID_SENTINEL);
     let updates_rowid = has_direct_rowid_update
         || rowid_alias_index.is_some_and(|alias_idx| {
             set_clauses
@@ -128,13 +128,16 @@ pub fn emit_program_for_update(
         plan.from_tables.outer_query_refs().to_vec(),
     );
     let write_set_plan = plan.write_set_plan.take();
-    let temp_cursor_id = write_set_plan.as_ref().map(|plan| {
-        let QueryDestination::EphemeralTable { cursor_id, .. } = &plan.select.query_destination
-        else {
-            unreachable!()
-        };
-        *cursor_id
-    });
+    let temp_cursor_id = match write_set_plan.as_ref() {
+        Some(plan) => {
+            let QueryDestination::EphemeralTable { cursor_id, .. } = &plan.select.query_destination
+            else {
+                crate::bail_parse_error!("write set plan must use an ephemeral table destination");
+            };
+            Some(*cursor_id)
+        }
+        None => None,
+    };
     // If an ephemeral scratch table is used (either for UPDATE...FROM or general Halloween protection)
     // then the write phase will just iterate and read from the scratch table.
     // The target table is kept as an outer query reference so that RETURNING can reference the target table
@@ -146,7 +149,7 @@ pub fn emit_program_for_update(
             ..
         } = &write_set_plan.select.query_destination
         else {
-            unreachable!()
+            crate::bail_parse_error!("write set plan must use an ephemeral table destination");
         };
         let scratch_table = scratch_table.clone();
         let scratch_table_internal_id = write_set_plan.scratch_table_id;
@@ -529,14 +532,16 @@ fn emit_notnull_constraint_check(
     skip_row_label: BranchOffset,
     resolver: &Resolver,
 ) -> crate::Result<()> {
-    let description = format!(
-        "{}.{}",
-        table_name,
-        table_column
-            .name
-            .as_ref()
-            .expect("Column name must be present")
-    );
+    let description = || {
+        format!(
+            "{}.{}",
+            table_name,
+            table_column
+                .name
+                .as_ref()
+                .expect("Column name must be present")
+        )
+    };
     match or_conflict {
         ResolveType::Ignore => {
             program.emit_insn(Insn::IsNull {
@@ -564,7 +569,7 @@ fn emit_notnull_constraint_check(
                 program.emit_insn(Insn::HaltIfNull {
                     target_reg,
                     err_code: SQLITE_CONSTRAINT_NOTNULL,
-                    description,
+                    description: description(),
                 });
             }
         }
@@ -572,7 +577,7 @@ fn emit_notnull_constraint_check(
             program.emit_insn(Insn::HaltIfNull {
                 target_reg,
                 err_code: SQLITE_CONSTRAINT_NOTNULL,
-                description,
+                description: description(),
             });
         }
     }
@@ -593,12 +598,13 @@ fn update_trigger_context(
     new_registers: Option<Vec<usize>>,
     old_registers: Option<Vec<usize>>,
     or_conflict: ResolveType,
-    after: bool,
+    timing: TriggerTime,
 ) -> TriggerContext {
     let override_conflict = program
         .trigger_conflict_override
         .or_else(|| (!matches!(or_conflict, ResolveType::Abort)).then_some(or_conflict));
 
+    let after = matches!(timing, TriggerTime::After);
     match (after, override_conflict) {
         (true, Some(override_conflict)) => TriggerContext::new_after_with_override_conflict(
             btree_table.clone(),
@@ -1085,10 +1091,14 @@ fn emit_update_insns<'a>(
             (None, false)
         }
         Operation::HashJoin(_) => {
-            unreachable!("access through HashJoin is not supported for update operations")
+            crate::bail_parse_error!(
+                "access through HashJoin is not supported for update operations"
+            )
         }
         Operation::MultiIndexScan(_) => {
-            unreachable!("access through MultiIndexScan is not supported for update operations")
+            crate::bail_parse_error!(
+                "access through MultiIndexScan is not supported for update operations"
+            )
         }
     };
     turso_assert!(
@@ -1370,7 +1380,7 @@ fn emit_update_insns<'a>(
                     Some(new_registers),
                     Some(old_registers.clone()),
                     or_conflict,
-                    false,
+                    TriggerTime::Before,
                 );
 
                 for trigger in relevant_before_update_triggers {
@@ -2357,7 +2367,7 @@ fn emit_update_insns<'a>(
                         Some(new_registers_after),
                         old_registers_after,
                         or_conflict,
-                        true,
+                        TriggerTime::After,
                     );
 
                     // RAISE(IGNORE) in an AFTER trigger should only abort the trigger body,
@@ -2517,7 +2527,7 @@ fn emit_update_insns<'a>(
                 conflict_action: 0u16,
             });
         }
-        _ => unreachable!("cannot UPDATE a subquery table"),
+        _ => crate::bail_parse_error!("cannot UPDATE a subquery table"),
     }
 
     if let Some(limit_ctx) = t_ctx.limit_ctx {
