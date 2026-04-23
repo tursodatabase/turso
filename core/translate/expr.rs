@@ -6160,8 +6160,20 @@ pub fn bind_and_rewrite_expr<'a>(
                                     continue;
                                 };
 
+                                // When multiple outer refs share this identifier
+                                // (e.g. self-join `t1 JOIN t1 USING(a)`), a USING-hidden
+                                // column on the duplicate side lets the first match stand,
+                                // mirroring the Stage 1 logic for local-scope tables.
                                 if resolved.is_some() {
-                                    return Err(ambiguous());
+                                    let allowed_by_using = matches!(
+                                        candidate,
+                                        QualifiedMatch::Column { col_idx, .. }
+                                            if outer_ref.using_dedup_hidden_cols.get(col_idx)
+                                    );
+                                    if !allowed_by_using {
+                                        return Err(ambiguous());
+                                    }
+                                    continue;
                                 }
                                 resolved = Some((outer_ref.internal_id, candidate));
                             }
