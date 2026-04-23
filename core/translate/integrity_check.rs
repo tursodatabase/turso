@@ -14,6 +14,7 @@ use crate::{
         builder::{CursorKey, CursorType, ProgramBuilder},
         insn::{CmpInsFlags, Insn},
     },
+    HashSet,
 };
 use turso_parser::ast;
 
@@ -139,6 +140,7 @@ fn translate_integrity_check_impl(
     // SQLite's OP_IntegrityCk front-pass and can already emit corruption errors
     // before any row-by-row semantic checks run.
     let mut root_pages = Vec::with_capacity(schema.tables.len() + schema.indexes.len());
+    let mut live_root_pages = HashSet::default();
 
     for table in schema.tables.values() {
         if let Table::BTree(btree_table) = table.as_ref() {
@@ -146,10 +148,12 @@ fn translate_integrity_check_impl(
                 continue;
             }
             root_pages.push(btree_table.root_page);
+            live_root_pages.insert(btree_table.root_page);
             if let Some(indexes) = schema.indexes.get(btree_table.name.as_str()) {
                 for index in indexes {
                     if index.root_page > 0 {
                         root_pages.push(index.root_page);
+                        live_root_pages.insert(index.root_page);
                     }
                 }
             }
@@ -157,7 +161,9 @@ fn translate_integrity_check_impl(
     }
 
     for &dropped_root in &schema.dropped_root_pages {
-        root_pages.push(dropped_root);
+        if !live_root_pages.contains(&dropped_root) {
+            root_pages.push(dropped_root);
+        }
     }
 
     let remaining_errors_reg = program.alloc_register();
