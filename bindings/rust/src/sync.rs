@@ -10,6 +10,9 @@ use std::{
 use bytes::Bytes;
 use http_body_util::{BodyExt, Full};
 use hyper::{header::AUTHORIZATION, Request};
+#[cfg(feature = "sync-rustls")]
+use hyper_rustls::{HttpsConnector, HttpsConnectorBuilder};
+#[cfg(feature = "sync")]
 use hyper_tls::HttpsConnector;
 use hyper_util::{
     client::legacy::{connect::HttpConnector, Client},
@@ -18,6 +21,12 @@ use hyper_util::{
 use tokio::sync::mpsc;
 
 use crate::{connection::Connection, Error, Result};
+
+#[cfg(all(feature = "sync", feature = "sync-rustls"))]
+compile_error!("features `sync` and `sync-rustls` are mutually exclusive");
+
+type SyncHttpConnector = HttpsConnector<HttpConnector>;
+type SyncHttpClient = Client<SyncHttpConnector, Full<Bytes>>;
 
 // Public re-exports of sync types for users of this crate.
 pub use turso_sync_sdk_kit::rsapi::DatabaseSyncStats;
@@ -431,6 +440,23 @@ struct IoWorker {
 }
 
 impl IoWorker {
+    #[cfg(feature = "sync")]
+    fn build_http_client() -> SyncHttpClient {
+        let https = HttpsConnector::new();
+        Client::builder(TokioExecutor::new()).build::<_, Full<Bytes>>(https)
+    }
+
+    #[cfg(feature = "sync-rustls")]
+    fn build_http_client() -> SyncHttpClient {
+        let https = HttpsConnectorBuilder::new()
+            .with_provider_and_webpki_roots(rustls::crypto::aws_lc_rs::default_provider())
+            .expect("aws-lc-rs crypto provider should support the configured rustls versions")
+            .https_or_http()
+            .enable_http1()
+            .build();
+        Client::builder(TokioExecutor::new()).build::<_, Full<Bytes>>(https)
+    }
+
     fn spawn(
         sync: Arc<turso_sync_sdk_kit::rsapi::TursoDatabaseSync<Bytes>>,
         base_url: Option<String>,
@@ -493,12 +519,7 @@ impl IoWorker {
         mut rx: mpsc::UnboundedReceiver<()>,
         wakers: Arc<Mutex<Vec<Waker>>>,
     ) {
-        // Create HTTPS-capable Hyper client.
-        let mut http_connector = HttpConnector::new();
-        http_connector.enforce_http(false);
-        let https: HttpsConnector<HttpConnector> = HttpsConnector::new();
-        let client: Client<HttpsConnector<HttpConnector>, Full<Bytes>> =
-            Client::builder(TokioExecutor::new()).build::<_, Full<Bytes>>(https);
+        let client = IoWorker::build_http_client();
 
         while rx.recv().await.is_some() {
             // Process all pending items in the sync IO queue.
@@ -570,7 +591,7 @@ impl IoWorker {
     #[allow(clippy::too_many_arguments)]
     async fn process_http(
         this: &Arc<IoWorker>,
-        client: &Client<HttpsConnector<HttpConnector>, Full<Bytes>>,
+        client: &SyncHttpClient,
         url: Option<&str>,
         method: &str,
         path: &str,
@@ -729,6 +750,18 @@ mod tests {
 
     const ADMIN_URL: &str = "http://localhost:8081";
     const USER_URL: &str = "http://localhost:8080";
+
+    #[cfg(feature = "sync")]
+    #[test]
+    fn sync_http_client_builds_with_native_tls() {
+        let _client = super::IoWorker::build_http_client();
+    }
+
+    #[cfg(feature = "sync-rustls")]
+    #[test]
+    fn sync_http_client_builds_with_rustls() {
+        let _client = super::IoWorker::build_http_client();
+    }
 
     fn random_str() -> String {
         rand::rng()
