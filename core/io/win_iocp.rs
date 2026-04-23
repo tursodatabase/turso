@@ -64,7 +64,7 @@ use crate::io::completions::CompletionInner;
 use crate::io::{SharedWalLockKind, SharedWalMappedRegion};
 use windows_sys::Win32::Foundation::{
     CloseHandle, GetLastError, LocalFree, ERROR_HANDLE_EOF, ERROR_IO_PENDING,
-    ERROR_LOCK_VIOLATION,
+    ERROR_LOCK_VIOLATION, ERROR_NOT_LOCKED,
     ERROR_OPERATION_ABORTED, FALSE, GENERIC_READ, GENERIC_WRITE, HANDLE, INVALID_HANDLE_VALUE,
     TRUE, WAIT_TIMEOUT,
 };
@@ -91,8 +91,7 @@ use windows_sys::Win32::System::Threading::CreateEventW;
 const CACHING_CAPACITY: usize = 128;
 //TODO: enable this or remove when direct IO stabilized
 const ENABLE_DIRECT_IO: bool = false;
-//TODO: enable this or remove when windows locking stabilized
-const ENABLE_LOCK_ON_OPEN: bool = false;
+const ENABLE_LOCK_ON_OPEN: bool = true;
 
 // Types
 
@@ -334,7 +333,7 @@ impl IO for WindowsIOCP {
             );
 
             if file_handle == INVALID_HANDLE_VALUE {
-                return Err(get_generic_limboerror_from_last_os_err());
+                return Err(io_error(io::Error::last_os_error(), "open"));
             };
 
             let windows_file = Arc::new(WindowsFile {
@@ -346,12 +345,15 @@ impl IO for WindowsIOCP {
             let result = CreateIoCompletionPort(file_handle, self.instance.iocp_queue_handle, 0, 0);
 
             if result.is_null() {
-                return Err(get_generic_limboerror_from_last_os_err());
+                return Err(io_error(
+                    io::Error::last_os_error(),
+                    "associate file with iocp",
+                ));
             };
 
             if ENABLE_LOCK_ON_OPEN
-                && (std::env::var(common::ENV_DISABLE_FILE_LOCK).is_err()
-                    || !open_flags.contains(OpenFlags::ReadOnly))
+                && !open_flags.intersects(OpenFlags::ReadOnly | OpenFlags::NoLock)
+                && std::env::var(common::ENV_DISABLE_FILE_LOCK).is_err()
             {
                 windows_file.lock_file(true)?;
             }
@@ -785,6 +787,9 @@ impl WindowsFile {
             }
 
             let initial_error = unsafe { GetLastError() };
+            if initial_error == ERROR_NOT_LOCKED {
+                return Ok(());
+            }
             if initial_error != ERROR_IO_PENDING {
                 return Err(LimboError::LockingError(
                     io::Error::from_raw_os_error(initial_error as i32).to_string(),
@@ -804,8 +809,12 @@ impl WindowsFile {
                 }
             }
 
+            let completion_error = unsafe { GetLastError() };
+            if completion_error == ERROR_NOT_LOCKED {
+                return Ok(());
+            }
             Err(LimboError::LockingError(
-                io::Error::last_os_error().to_string(),
+                io::Error::from_raw_os_error(completion_error as i32).to_string(),
             ))
         })();
 

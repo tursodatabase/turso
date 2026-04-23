@@ -364,7 +364,10 @@ fn execute_sql_inner(conn: &Arc<Connection>, sql: &str) -> WorkerResponse {
                 }
                 Ok(StepResult::IO) => {
                     io_count += 1;
-                    // Real I/O: the operation needs more I/O, keep stepping
+                    stmt.get_pager()
+                        .io
+                        .step()
+                        .expect("worker should advance statement IO");
                     continue;
                 }
                 Err(turso_core::LimboError::SchemaUpdated) => {
