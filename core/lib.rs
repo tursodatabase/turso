@@ -7,7 +7,12 @@ pub mod index_method;
 pub mod io;
 #[cfg(all(feature = "json", any(feature = "fuzz", feature = "bench")))]
 pub mod json;
-#[cfg(all(test, feature = "fs", unix, target_pointer_width = "64"))]
+#[cfg(all(
+    test,
+    feature = "fs",
+    host_shared_wal,
+    any(not(target_os = "windows"), feature = "experimental_win_iocp")
+))]
 mod multiprocess_tests;
 pub mod mvcc;
 #[cfg(any(feature = "fuzz", feature = "bench"))]
@@ -91,9 +96,9 @@ use arc_swap::{ArcSwap, ArcSwapOption};
 use core::str;
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use schema::Schema;
-#[cfg(all(unix, target_pointer_width = "64"))]
+#[cfg(host_shared_wal)]
 use std::path::Path;
-#[cfg(all(unix, target_pointer_width = "64"))]
+#[cfg(host_shared_wal)]
 use std::sync::OnceLock;
 use std::{
     fmt::{self},
@@ -102,7 +107,7 @@ use std::{
 };
 #[cfg(feature = "fs")]
 use storage::database::DatabaseFile;
-#[cfg(all(unix, target_pointer_width = "64"))]
+#[cfg(host_shared_wal)]
 use storage::shared_wal_coordination::MappedSharedWalCoordination;
 use storage::{page_cache::PageCache, sqlite3_ondisk::PageSize};
 use tracing::{instrument, Level};
@@ -469,7 +474,7 @@ pub struct Database {
     /// (commit, sync, checkpoint thresholds, etc.) instead of the built-in storage.
     durable_storage: Option<Arc<dyn crate::mvcc::persistent_storage::DurableStorage>>,
     shared_wal: Arc<RwLock<WalFileShared>>,
-    #[cfg(all(unix, target_pointer_width = "64"))]
+    #[cfg(host_shared_wal)]
     shared_wal_coordination: OnceLock<Arc<MappedSharedWalCoordination>>,
     init_lock: Arc<Mutex<()>>,
     open_flags: OpenFlags,
@@ -598,7 +603,7 @@ impl Database {
             }))),
             _shared_page_cache: shared_page_cache,
             shared_wal,
-            #[cfg(all(unix, target_pointer_width = "64"))]
+            #[cfg(host_shared_wal)]
             shared_wal_coordination: OnceLock::new(),
             db_file,
             builtin_syms: parking_lot::RwLock::new(syms),
@@ -658,7 +663,7 @@ impl Database {
     }
 
     #[cfg(feature = "fs")]
-    #[cfg(all(unix, target_pointer_width = "64"))]
+    #[cfg(host_shared_wal)]
     fn effective_open_flags_for_path(
         io: &Arc<dyn IO>,
         path: &str,
@@ -693,7 +698,7 @@ impl Database {
     }
 
     #[cfg(feature = "fs")]
-    #[cfg(not(all(unix, target_pointer_width = "64")))]
+    #[cfg(not(host_shared_wal))]
     fn effective_open_flags_for_path(
         _io: &Arc<dyn IO>,
         _path: &str,
@@ -707,7 +712,7 @@ impl Database {
     }
 
     #[cfg(feature = "fs")]
-    #[cfg(all(unix, target_pointer_width = "64"))]
+    #[cfg(host_shared_wal)]
     fn reject_live_multiprocess_wal_for_legacy_open(
         io: &Arc<dyn IO>,
         path: &str,
@@ -742,7 +747,7 @@ impl Database {
     }
 
     #[cfg(feature = "fs")]
-    #[cfg(not(all(unix, target_pointer_width = "64")))]
+    #[cfg(not(host_shared_wal))]
     fn reject_live_multiprocess_wal_for_legacy_open(
         _io: &Arc<dyn IO>,
         _path: &str,
@@ -752,7 +757,7 @@ impl Database {
     }
 
     #[cfg(feature = "fs")]
-    #[cfg(all(unix, target_pointer_width = "64"))]
+    #[cfg(host_shared_wal)]
     fn reject_live_legacy_wal_for_multiprocess_open(
         io: &Arc<dyn IO>,
         path: &str,
@@ -774,7 +779,7 @@ impl Database {
     }
 
     #[cfg(feature = "fs")]
-    #[cfg(not(all(unix, target_pointer_width = "64")))]
+    #[cfg(not(host_shared_wal))]
     fn reject_live_legacy_wal_for_multiprocess_open(
         _io: &Arc<dyn IO>,
         _path: &str,
@@ -1556,13 +1561,13 @@ impl Database {
 
         // Always Open shared wal and set it in the Database and Pager.
         // MVCC currently requires a WAL open to function
-        #[cfg(all(unix, target_pointer_width = "64"))]
+        #[cfg(host_shared_wal)]
         let shared_authority = self.open_shared_wal_coordination_for_open()?;
-        #[cfg(not(all(unix, target_pointer_width = "64")))]
+        #[cfg(not(host_shared_wal))]
         let shared_authority: Option<()> = None;
 
         let shared_wal = {
-            #[cfg(all(unix, target_pointer_width = "64"))]
+            #[cfg(host_shared_wal)]
             {
                 if let Some(authority) = shared_authority.as_ref() {
                     // The no-scan open path only works if the shared frame index
@@ -1583,7 +1588,7 @@ impl Database {
                     WalFileShared::open_shared_if_exists(&self.io, &self.wal_path, flags)?
                 }
             }
-            #[cfg(not(all(unix, target_pointer_width = "64")))]
+            #[cfg(not(host_shared_wal))]
             {
                 WalFileShared::open_shared_if_exists(&self.io, &self.wal_path, flags)?
             }
@@ -1933,7 +1938,60 @@ impl Database {
         Ok(Self::filesystem_type_allows_shared_wal(fs_type))
     }
 
-    #[cfg(all(unix, target_pointer_width = "64"))]
+    #[cfg(all(target_os = "windows", target_pointer_width = "64"))]
+    fn path_allows_shared_wal_coordination(path: &Path) -> Result<bool> {
+        use std::iter::once;
+        use std::os::windows::ffi::OsStrExt;
+        use windows_sys::Win32::Storage::FileSystem::{GetDriveTypeW, GetVolumePathNameW};
+
+        const DRIVE_REMOVABLE: u32 = 2;
+        const DRIVE_FIXED: u32 = 3;
+        const DRIVE_REMOTE: u32 = 4;
+        const DRIVE_RAMDISK: u32 = 6;
+
+        let probe_path = if path.exists() {
+            path.to_path_buf()
+        } else {
+            path.parent()
+                .filter(|parent| !parent.as_os_str().is_empty())
+                .unwrap_or_else(|| Path::new("."))
+                .to_path_buf()
+        };
+        let probe_path = if probe_path.is_absolute() {
+            probe_path
+        } else {
+            std::env::current_dir()
+                .map_err(|err| io_error(err, "resolve shared WAL coordination path"))?
+                .join(probe_path)
+        };
+        let probe_path_wide: Vec<u16> = probe_path
+            .as_os_str()
+            .encode_wide()
+            .chain(once(0))
+            .collect();
+        let mut volume_path = vec![0u16; 261];
+        let result = unsafe {
+            GetVolumePathNameW(
+                probe_path_wide.as_ptr(),
+                volume_path.as_mut_ptr(),
+                volume_path.len() as u32,
+            )
+        };
+        if result == 0 {
+            return Err(io_error(
+                std::io::Error::last_os_error(),
+                "GetVolumePathNameW shared WAL coordination path",
+            ));
+        }
+
+        let drive_type = unsafe { GetDriveTypeW(volume_path.as_ptr()) };
+        Ok(
+            matches!(drive_type, DRIVE_FIXED | DRIVE_RAMDISK | DRIVE_REMOVABLE)
+                && drive_type != DRIVE_REMOTE,
+        )
+    }
+
+    #[cfg(host_shared_wal)]
     pub(crate) fn shared_wal_coordination(
         &self,
     ) -> Result<Option<Arc<MappedSharedWalCoordination>>> {
@@ -1945,19 +2003,19 @@ impl Database {
         self.open_shared_wal_coordination_inner()
     }
 
-    #[cfg(not(all(unix, target_pointer_width = "64")))]
+    #[cfg(not(host_shared_wal))]
     pub(crate) fn shared_wal_coordination(&self) -> Result<Option<()>> {
         Ok(None)
     }
 
-    #[cfg(all(unix, target_pointer_width = "64"))]
+    #[cfg(host_shared_wal)]
     pub(crate) fn open_shared_wal_coordination_for_open(
         &self,
     ) -> Result<Option<Arc<MappedSharedWalCoordination>>> {
         self.open_shared_wal_coordination_inner()
     }
 
-    #[cfg(all(unix, target_pointer_width = "64"))]
+    #[cfg(host_shared_wal)]
     fn open_shared_wal_coordination_inner(
         &self,
     ) -> Result<Option<Arc<MappedSharedWalCoordination>>> {
@@ -2029,7 +2087,7 @@ impl Database {
         let reopened_checkpoint_seq = shared_wal.metadata.wal_header.lock().checkpoint_seq;
         drop(shared_wal);
 
-        #[cfg(all(unix, target_pointer_width = "64"))]
+        #[cfg(host_shared_wal)]
         let (coordination_open_mode, sanitized_backfill_proof_on_open) =
             if let Some(authority) = self.shared_wal_coordination()? {
                 let mode = match authority.open_mode() {
@@ -2044,7 +2102,7 @@ impl Database {
             } else {
                 (None, false)
             };
-        #[cfg(not(all(unix, target_pointer_width = "64")))]
+        #[cfg(not(host_shared_wal))]
         let (coordination_open_mode, sanitized_backfill_proof_on_open) = (None, false);
 
         Ok(SharedWalOpenTelemetry {
@@ -2059,7 +2117,7 @@ impl Database {
 
     #[cfg(feature = "simulator")]
     pub fn shared_wal_snapshot_for_testing(&self) -> Result<Option<SharedWalTestingSnapshot>> {
-        #[cfg(all(unix, target_pointer_width = "64"))]
+        #[cfg(host_shared_wal)]
         if let Some(authority) = self.shared_wal_coordination()? {
             let snapshot = authority.snapshot();
             return Ok(Some(SharedWalTestingSnapshot {
@@ -2075,7 +2133,7 @@ impl Database {
 
     #[cfg(feature = "simulator")]
     pub fn shared_wal_find_frame_for_testing(&self, page_id: u64) -> Result<Option<u64>> {
-        #[cfg(all(unix, target_pointer_width = "64"))]
+        #[cfg(host_shared_wal)]
         if let Some(authority) = self.shared_wal_coordination()? {
             let snapshot = authority.snapshot();
             return Ok(authority.find_frame(page_id, 0, snapshot.max_frame, None));
@@ -2109,7 +2167,7 @@ impl Database {
 
     #[cfg(feature = "simulator")]
     pub fn clear_backfill_proof_for_testing(&self) -> Result<()> {
-        #[cfg(all(unix, target_pointer_width = "64"))]
+        #[cfg(host_shared_wal)]
         {
             let authority = self.shared_wal_coordination()?.ok_or_else(|| {
                 LimboError::InternalError("shared WAL authority is unavailable".into())
@@ -2118,7 +2176,7 @@ impl Database {
             Ok(())
         }
 
-        #[cfg(not(all(unix, target_pointer_width = "64")))]
+        #[cfg(not(host_shared_wal))]
         {
             Err(LimboError::InternalError(
                 "shared WAL authority is unavailable on this platform".into(),
@@ -2131,7 +2189,7 @@ impl Database {
         last_checksum_and_max_frame: ((u32, u32), u64),
         buffer_pool: Arc<BufferPool>,
     ) -> Result<Arc<dyn Wal>> {
-        #[cfg(all(unix, target_pointer_width = "64"))]
+        #[cfg(host_shared_wal)]
         if let Some(authority) = self.shared_wal_coordination()? {
             return Ok(Arc::new(WalFile::new_with_shared_coordination(
                 self.io.clone(),

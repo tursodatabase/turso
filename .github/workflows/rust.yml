@@ -352,6 +352,28 @@ jobs:
             ./target/release/turso_whopper ${{ matrix.profile.args }} || exit 1
           done
 
+  concurrent-simulator-windows:
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: "v1-rust"
+          cache-on-failure: true
+      - uses: "./.github/shared/setup-sccache"
+      - name: Run Windows concurrent simulator multiprocess regressions
+        run: cargo test -q -p turso_whopper --test regression_tests
+      - name: Run Windows concurrent simulator cross-platform regression
+        run: cargo test -q -p turso_whopper --test regression_tests_cross_platform
+      - name: Run Windows CLI multiprocess VFS regression
+        run: cargo test -q -p turso_cli input::tests::experimental_win_iocp_backend_is_available_for_path_databases -- --exact
+      - name: Run Windows core multiprocess regressions
+        run: cargo test -q -p turso_core --features "fs experimental_win_iocp" multiprocess_tests:: -- --nocapture
+      - name: Run Windows multiprocess startup smoke
+          run: cargo run -q -p turso_whopper -- --mode fast --multiprocess --connections-per-process 4 --processes 4 --kill-probability 0.01
+
   test-sqlite:
     runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 30

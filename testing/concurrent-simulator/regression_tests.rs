@@ -1,31 +1,17 @@
-use rand_chacha::ChaCha8Rng;
-use rand_chacha::rand_core::SeedableRng;
+#![cfg(all(any(unix, target_os = "windows"), target_pointer_width = "64"))]
+
 use std::path::Path;
 use std::sync::Arc;
-use turso_core::{
-    Connection, Database, DatabaseOpts, IO, LimboError, OpenFlags, PlatformIO, Statement,
-};
-#[cfg(all(unix, target_pointer_width = "64"))]
+use turso_core::{Connection, Database, DatabaseOpts, IO, LimboError, OpenFlags};
 use turso_whopper::multiprocess::{MultiprocessOpts, MultiprocessWhopper};
 use turso_whopper::{
-    IOFaultConfig, SimulatorIO,
+    multiprocess_platform_io,
     workloads::{
         BeginWorkload, CommitWorkload, CreateIndexWorkload, CreateSimpleTableWorkload,
         DeleteWorkload, DropIndexWorkload, IntegrityCheckWorkload, RollbackWorkload,
         SimpleInsertWorkload, SimpleSelectWorkload, UpdateWorkload, WalCheckpointWorkload,
     },
 };
-
-/// Helper: run a SQL statement to completion with round-robin IO stepping.
-fn run_to_done(stmt: &mut Statement, io: &SimulatorIO) {
-    loop {
-        match stmt.step().expect("step") {
-            turso_core::StepResult::Done => return,
-            turso_core::StepResult::IO => io.step().expect("io step"),
-            _ => {}
-        }
-    }
-}
 
 fn wait_for_file(path: &Path) {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
@@ -38,12 +24,17 @@ fn wait_for_file(path: &Path) {
     panic!("timed out waiting for {}", path.display());
 }
 
-#[cfg(all(unix, target_pointer_width = "64"))]
+#[cfg(all(any(unix, target_os = "windows"), target_pointer_width = "64"))]
+fn multiprocess_test_io() -> Arc<dyn IO> {
+    multiprocess_platform_io().expect("multiprocess io")
+}
+
+#[cfg(all(any(unix, target_os = "windows"), target_pointer_width = "64"))]
 fn multiprocess_wal_db_opts() -> DatabaseOpts {
     DatabaseOpts::new().with_multiprocess_wal(true)
 }
 
-#[cfg(all(unix, target_pointer_width = "64"))]
+#[cfg(all(any(unix, target_os = "windows"), target_pointer_width = "64"))]
 fn flip_db_header_reserved_byte(path: &Path) {
     use std::io::{Read, Seek, SeekFrom, Write};
 
@@ -83,7 +74,7 @@ fn flip_db_header_reserved_byte(path: &Path) {
     file.sync_all().expect("sync db header mutation");
 }
 
-#[cfg(all(unix, target_pointer_width = "64"))]
+#[cfg(all(any(unix, target_os = "windows"), target_pointer_width = "64"))]
 fn configure_worker_exe() {
     unsafe {
         std::env::set_var(
@@ -93,12 +84,12 @@ fn configure_worker_exe() {
     }
 }
 
-#[cfg(all(unix, target_pointer_width = "64"))]
+#[cfg(all(any(unix, target_os = "windows"), target_pointer_width = "64"))]
 fn create_multiprocess_whopper(max_connections: usize) -> MultiprocessWhopper {
     create_multiprocess_whopper_with_keep(max_connections, false)
 }
 
-#[cfg(all(unix, target_pointer_width = "64"))]
+#[cfg(all(any(unix, target_os = "windows"), target_pointer_width = "64"))]
 fn create_multiprocess_whopper_with_shape(
     process_count: usize,
     connections_per_process: usize,
@@ -106,7 +97,7 @@ fn create_multiprocess_whopper_with_shape(
     create_multiprocess_whopper_with_shape_and_keep(process_count, connections_per_process, false)
 }
 
-#[cfg(all(unix, target_pointer_width = "64"))]
+#[cfg(all(any(unix, target_os = "windows"), target_pointer_width = "64"))]
 fn create_multiprocess_whopper_with_keep(
     max_connections: usize,
     keep_files: bool,
@@ -114,7 +105,7 @@ fn create_multiprocess_whopper_with_keep(
     create_multiprocess_whopper_with_shape_and_keep(max_connections, 1, keep_files)
 }
 
-#[cfg(all(unix, target_pointer_width = "64"))]
+#[cfg(all(any(unix, target_os = "windows"), target_pointer_width = "64"))]
 fn create_multiprocess_whopper_with_shape_and_keep(
     process_count: usize,
     connections_per_process: usize,
@@ -139,7 +130,7 @@ fn create_multiprocess_whopper_with_shape_and_keep(
     .expect("create multiprocess whopper")
 }
 
-#[cfg(all(unix, target_pointer_width = "64"))]
+#[cfg(all(any(unix, target_os = "windows"), target_pointer_width = "64"))]
 fn populate_blob_test_rows(whopper: &mut MultiprocessWhopper) {
     whopper
         .disable_auto_checkpoint_direct(0)
@@ -164,7 +155,7 @@ fn populate_blob_test_rows(whopper: &mut MultiprocessWhopper) {
         .expect("commit should succeed");
 }
 
-#[cfg(all(unix, target_pointer_width = "64"))]
+#[cfg(all(any(unix, target_os = "windows"), target_pointer_width = "64"))]
 fn create_partial_checkpoint_state(whopper: &mut MultiprocessWhopper) -> (u64, u64) {
     populate_blob_test_rows(whopper);
 
@@ -200,7 +191,7 @@ fn create_partial_checkpoint_state(whopper: &mut MultiprocessWhopper) -> (u64, u
     )
 }
 
-#[cfg(all(unix, target_pointer_width = "64"))]
+#[cfg(all(any(unix, target_os = "windows"), target_pointer_width = "64"))]
 fn count_test_rows(whopper: &mut MultiprocessWhopper, worker_idx: usize) -> i64 {
     for _ in 0..32 {
         let rows = whopper
@@ -221,7 +212,7 @@ fn count_test_rows(whopper: &mut MultiprocessWhopper, worker_idx: usize) -> i64 
     panic!("count rows did not stabilize after transient multiprocess errors");
 }
 
-#[cfg(all(unix, target_pointer_width = "64"))]
+#[cfg(all(any(unix, target_os = "windows"), target_pointer_width = "64"))]
 fn truncate_checkpoint_until_stable(whopper: &mut MultiprocessWhopper, connection_idx: usize) {
     for _ in 0..32 {
         let result = whopper
@@ -242,7 +233,7 @@ fn truncate_checkpoint_until_stable(whopper: &mut MultiprocessWhopper, connectio
     panic!("TRUNCATE checkpoint did not stabilize after transient multiprocess errors");
 }
 
-#[cfg(all(unix, target_pointer_width = "64"))]
+#[cfg(all(any(unix, target_os = "windows"), target_pointer_width = "64"))]
 fn assert_integrity_check_ok(whopper: &mut MultiprocessWhopper, worker_idx: usize) {
     let rows = whopper
         .execute_sql_direct(worker_idx, "PRAGMA integrity_check")
@@ -261,7 +252,7 @@ fn assert_integrity_check_ok(whopper: &mut MultiprocessWhopper, worker_idx: usiz
     );
 }
 
-#[cfg(all(unix, target_pointer_width = "64"))]
+#[cfg(all(any(unix, target_os = "windows"), target_pointer_width = "64"))]
 #[test]
 fn multiprocess_same_process_sibling_reader_keeps_shared_snapshot_live_until_last_release() {
     let mut whopper = create_multiprocess_whopper_with_shape(2, 2);
@@ -376,7 +367,7 @@ fn multiprocess_same_process_sibling_reader_keeps_shared_snapshot_live_until_las
     whopper.finalize().expect("finalize multiprocess whopper");
 }
 
-#[cfg(all(unix, target_pointer_width = "64"))]
+#[cfg(all(any(unix, target_os = "windows"), target_pointer_width = "64"))]
 fn count_rows_in_table(conn: &Arc<Connection>, table_name: &str) -> i64 {
     let mut stmt = conn
         .prepare(format!("select count(*) from {table_name}"))
@@ -390,9 +381,9 @@ fn count_rows_in_table(conn: &Arc<Connection>, table_name: &str) -> i64 {
     count
 }
 
-#[cfg(all(unix, target_pointer_width = "64"))]
+#[cfg(all(any(unix, target_os = "windows"), target_pointer_width = "64"))]
 fn read_simple_kv_length(db_path: &Path, table_name: &str, key: &str) -> Option<i64> {
-    let io: Arc<dyn IO> = Arc::new(PlatformIO::new().expect("platform io"));
+    let io: Arc<dyn IO> = multiprocess_test_io();
     let reopened = Database::open_file_with_flags(
         io,
         db_path.to_str().expect("db path utf8"),
@@ -437,7 +428,7 @@ fn read_simple_kv_length(db_path: &Path, table_name: &str, key: &str) -> Option<
     panic!("observer query did not stabilize after transient multiprocess errors");
 }
 
-#[cfg(all(unix, target_pointer_width = "64"))]
+#[cfg(all(any(unix, target_os = "windows"), target_pointer_width = "64"))]
 fn probe_optional_int_via_fresh_worker(whopper: &MultiprocessWhopper, sql: String) -> Option<i64> {
     for _ in 0..8 {
         let (_startup, result) = whopper
@@ -464,7 +455,7 @@ fn probe_optional_int_via_fresh_worker(whopper: &MultiprocessWhopper, sql: Strin
     panic!("fresh-worker probe did not stabilize after transient multiprocess errors");
 }
 
-#[cfg(all(unix, target_pointer_width = "64"))]
+#[cfg(all(any(unix, target_os = "windows"), target_pointer_width = "64"))]
 fn probe_table_rootpage_via_fresh_worker(
     whopper: &MultiprocessWhopper,
     table_name: &str,
@@ -475,7 +466,7 @@ fn probe_table_rootpage_via_fresh_worker(
     )
 }
 
-#[cfg(all(unix, target_pointer_width = "64"))]
+#[cfg(all(any(unix, target_os = "windows"), target_pointer_width = "64"))]
 fn probe_simple_kv_length_via_fresh_worker(
     whopper: &MultiprocessWhopper,
     table_name: &str,
@@ -487,130 +478,14 @@ fn probe_simple_kv_length_via_fresh_worker(
     )
 }
 
-#[cfg(all(unix, target_pointer_width = "64"))]
+#[cfg(all(any(unix, target_os = "windows"), target_pointer_width = "64"))]
 fn advance_seeded_whopper_to_step(whopper: &mut MultiprocessWhopper, step_after_execution: usize) {
     while whopper.current_step < step_after_execution {
         whopper.step().expect("seeded whopper step");
     }
 }
 
-/// Regression test for MVCC concurrent commit yield-spin deadlock.
-///
-/// Under round-robin cooperative scheduling, when two BEGIN CONCURRENT
-/// transactions commit simultaneously, the VDBE must yield (return
-/// StepResult::IO) when pager_commit_lock is held by the other connection.
-///
-/// Before the fix in core/vdbe/mod.rs, Completion::new_yield() had
-/// finished()==true, so the VDBE inner loop retried without ever returning
-/// — starving the first connection and deadlocking both.
-#[test]
-fn test_concurrent_commit_no_yield_spin() {
-    let io_rng = ChaCha8Rng::seed_from_u64(42);
-    let fault_config = IOFaultConfig {
-        cosmic_ray_probability: 0.0,
-    };
-    let io = Arc::new(SimulatorIO::new(false, io_rng, fault_config));
-
-    let db_path = format!("test-yield-spin-{}.db", std::process::id());
-    let db = Database::open_file_with_flags(
-        io.clone(),
-        &db_path,
-        OpenFlags::default(),
-        DatabaseOpts::new(),
-        None,
-    )
-    .expect("open db");
-
-    let setup = db.connect().expect("setup conn");
-    setup
-        .execute("PRAGMA journal_mode = 'mvcc'")
-        .expect("enable mvcc");
-    setup
-        .execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")
-        .expect("create table");
-    setup.close().expect("close setup");
-
-    let conn1 = db.connect().expect("conn1");
-    let conn2 = db.connect().expect("conn2");
-
-    // Both connections start concurrent transactions with non-conflicting writes
-    let mut s = conn1.prepare("BEGIN CONCURRENT").expect("prepare");
-    run_to_done(&mut s, &io);
-    let mut s = conn2.prepare("BEGIN CONCURRENT").expect("prepare");
-    run_to_done(&mut s, &io);
-
-    let mut s = conn1
-        .prepare("INSERT INTO t VALUES (1, 'a')")
-        .expect("prepare");
-    run_to_done(&mut s, &io);
-    let mut s = conn2
-        .prepare("INSERT INTO t VALUES (2, 'b')")
-        .expect("prepare");
-    run_to_done(&mut s, &io);
-
-    // Commit both using round-robin stepping — the pattern that triggers
-    // the bug. Each connection gets one step() call, then IO is advanced.
-    let mut commit1 = conn1.prepare("COMMIT").expect("prepare commit1");
-    let mut commit2 = conn2.prepare("COMMIT").expect("prepare commit2");
-
-    let mut done1 = false;
-    let mut done2 = false;
-    let max_steps = 10_000;
-
-    for i in 0..max_steps {
-        if done1 && done2 {
-            break;
-        }
-
-        // Round-robin: step each connection once, then advance IO
-        if !done1 {
-            match commit1.step().expect("commit1 step") {
-                turso_core::StepResult::Done => done1 = true,
-                turso_core::StepResult::IO => {}
-                _ => {}
-            }
-        }
-        io.step().expect("io step");
-
-        if !done2 {
-            match commit2.step().expect("commit2 step") {
-                turso_core::StepResult::Done => done2 = true,
-                turso_core::StepResult::IO => {}
-                _ => {}
-            }
-        }
-        io.step().expect("io step");
-
-        assert!(
-            i < max_steps - 1,
-            "concurrent commits did not complete within {max_steps} steps — \
-             likely stuck in yield-spin loop (done1={done1}, done2={done2})"
-        );
-    }
-
-    assert!(done1, "commit1 should have completed");
-    assert!(done2, "commit2 should have completed");
-
-    // Verify both rows are visible
-    let verify = db.connect().expect("verify conn");
-    let mut stmt = verify.prepare("SELECT COUNT(*) FROM t").expect("prepare");
-    let mut count = 0i64;
-    loop {
-        match stmt.step().expect("step") {
-            turso_core::StepResult::Row => {
-                if let Some(row) = stmt.row() {
-                    count = row.get_values().next().unwrap().as_int().unwrap();
-                }
-            }
-            turso_core::StepResult::Done => break,
-            turso_core::StepResult::IO => io.step().expect("io"),
-            _ => {}
-        }
-    }
-    assert_eq!(count, 2, "both inserts should be visible");
-}
-
-#[cfg(all(unix, target_pointer_width = "64"))]
+#[cfg(all(any(unix, target_os = "windows"), target_pointer_width = "64"))]
 #[test]
 fn multiprocess_restart_reuses_persisted_tshm_without_disk_scan() {
     let mut whopper = create_multiprocess_whopper(2);
@@ -678,7 +553,7 @@ fn multiprocess_restart_reuses_persisted_tshm_without_disk_scan() {
     whopper.finalize().expect("finalize multiprocess whopper");
 }
 
-#[cfg(all(unix, target_pointer_width = "64"))]
+#[cfg(all(any(unix, target_os = "windows"), target_pointer_width = "64"))]
 #[test]
 fn multiprocess_finalize_after_restart_preserves_simple_kv_rows() {
     let mut whopper = create_multiprocess_whopper_with_keep(16, true);
@@ -729,7 +604,7 @@ fn multiprocess_finalize_after_restart_preserves_simple_kv_rows() {
         .expect("restart after post-restart insert");
     whopper.finalize().expect("finalize multiprocess whopper");
 
-    let io: Arc<dyn IO> = Arc::new(PlatformIO::new().expect("platform io"));
+    let io: Arc<dyn IO> = multiprocess_test_io();
     let reopened = Database::open_file(io, db_path.to_str().expect("db path utf8"))
         .expect("reopen finalized database");
     let conn = reopened.connect().expect("connect reopened db");
@@ -745,7 +620,7 @@ fn multiprocess_finalize_after_restart_preserves_simple_kv_rows() {
     let _ = std::fs::remove_file(format!("{db_str}-tshm"));
 }
 
-#[cfg(all(unix, target_pointer_width = "64"))]
+#[cfg(all(any(unix, target_os = "windows"), target_pointer_width = "64"))]
 #[test]
 fn multiprocess_seed_5724542806254236599_restart_then_finalize_preserves_key_684() {
     configure_worker_exe();
@@ -840,7 +715,7 @@ fn multiprocess_seed_5724542806254236599_restart_then_finalize_preserves_key_684
         .finalize()
         .expect("finalize seeded multiprocess whopper");
 
-    let io: Arc<dyn IO> = Arc::new(PlatformIO::new().expect("platform io"));
+    let io: Arc<dyn IO> = multiprocess_test_io();
     let reopened = Database::open_file(io, db_path.to_str().expect("db path utf8"))
         .expect("reopen finalized seeded database");
     let conn = reopened.connect().expect("connect reopened seeded db");
@@ -865,7 +740,7 @@ fn multiprocess_seed_5724542806254236599_restart_then_finalize_preserves_key_684
     let _ = std::fs::remove_file(format!("{db_str}-tshm"));
 }
 
-#[cfg(all(unix, target_pointer_width = "64"))]
+#[cfg(all(any(unix, target_os = "windows"), target_pointer_width = "64"))]
 #[test]
 fn multiprocess_seed_5724542806254236599_localizes_key_4994_loss() {
     configure_worker_exe();
@@ -918,7 +793,7 @@ fn multiprocess_seed_5724542806254236599_localizes_key_4994_loss() {
             .shared_wal_snapshot_direct(10)
             .expect("read shared WAL snapshot after insert")
     );
-    let observer_io: Arc<dyn IO> = Arc::new(PlatformIO::new().expect("platform io"));
+    let observer_io: Arc<dyn IO> = multiprocess_test_io();
     let observer_db = Database::open_file_with_flags(
         observer_io,
         db_path.to_str().expect("db path utf8"),
@@ -963,7 +838,7 @@ fn multiprocess_seed_5724542806254236599_localizes_key_4994_loss() {
     );
 }
 
-#[cfg(all(unix, target_pointer_width = "64"))]
+#[cfg(all(any(unix, target_os = "windows"), target_pointer_width = "64"))]
 #[test]
 fn multiprocess_seed_8849519299024683634_localizes_schema_loss_boundary() {
     configure_worker_exe();
@@ -1020,7 +895,7 @@ fn multiprocess_seed_8849519299024683634_localizes_schema_loss_boundary() {
         .expect("finalize seeded multiprocess whopper");
 }
 
-#[cfg(all(unix, target_pointer_width = "64"))]
+#[cfg(all(any(unix, target_os = "windows"), target_pointer_width = "64"))]
 #[test]
 fn multiprocess_truncate_generation_survives_foreign_first_append_and_restart() {
     let mut whopper = create_multiprocess_whopper(2);
@@ -1107,7 +982,7 @@ fn multiprocess_truncate_generation_survives_foreign_first_append_and_restart() 
     whopper.finalize().expect("finalize multiprocess whopper");
 }
 
-#[cfg(all(unix, target_pointer_width = "64"))]
+#[cfg(all(any(unix, target_os = "windows"), target_pointer_width = "64"))]
 #[test]
 fn multiprocess_restart_rebuilds_from_disk_when_partial_checkpoint_publishes_positive_nbackfills() {
     let mut whopper = create_multiprocess_whopper(1);
@@ -1149,7 +1024,7 @@ fn multiprocess_restart_rebuilds_from_disk_when_partial_checkpoint_publishes_pos
     whopper.finalize().expect("finalize multiprocess whopper");
 }
 
-#[cfg(all(unix, target_pointer_width = "64"))]
+#[cfg(all(any(unix, target_os = "windows"), target_pointer_width = "64"))]
 #[test]
 fn multiprocess_restart_rebuilds_from_disk_after_wal_append_invalidates_partial_checkpoint_proof() {
     let mut whopper = create_multiprocess_whopper(1);
@@ -1197,7 +1072,7 @@ fn multiprocess_restart_rebuilds_from_disk_after_wal_append_invalidates_partial_
     whopper.finalize().expect("finalize multiprocess whopper");
 }
 
-#[cfg(all(unix, target_pointer_width = "64"))]
+#[cfg(all(any(unix, target_os = "windows"), target_pointer_width = "64"))]
 #[test]
 fn multiprocess_restart_rebuilds_from_disk_after_partial_checkpoint_proof_is_cleared() {
     let mut whopper = create_multiprocess_whopper(1);
@@ -1228,7 +1103,7 @@ fn multiprocess_restart_rebuilds_from_disk_after_partial_checkpoint_proof_is_cle
     whopper.finalize().expect("finalize multiprocess whopper");
 }
 
-#[cfg(all(unix, target_pointer_width = "64"))]
+#[cfg(all(any(unix, target_os = "windows"), target_pointer_width = "64"))]
 #[test]
 fn multiprocess_restart_rebuilds_from_disk_after_db_header_mismatch_invalidates_partial_checkpoint_proof()
  {
@@ -1260,7 +1135,7 @@ fn multiprocess_restart_rebuilds_from_disk_after_db_header_mismatch_invalidates_
     whopper.finalize().expect("finalize multiprocess whopper");
 }
 
-#[cfg(all(unix, target_pointer_width = "64"))]
+#[cfg(all(any(unix, target_os = "windows"), target_pointer_width = "64"))]
 #[test]
 fn multiprocess_restart_stays_conservative_after_unpublished_backfill_proof_install() {
     let mut whopper = create_multiprocess_whopper(1);
@@ -1305,7 +1180,7 @@ fn multiprocess_restart_stays_conservative_after_unpublished_backfill_proof_inst
     whopper.finalize().expect("finalize multiprocess whopper");
 }
 
-#[cfg(all(unix, target_pointer_width = "64"))]
+#[cfg(all(any(unix, target_os = "windows"), target_pointer_width = "64"))]
 #[test]
 fn multiprocess_restart_rebuilds_from_disk_after_restart_checkpoint_changes_generation() {
     let mut whopper = create_multiprocess_whopper(1);

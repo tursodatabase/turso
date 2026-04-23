@@ -93,7 +93,10 @@ pub struct Opts {
     pub experimental_attach: bool,
     #[clap(long, help = "Enable experimental generated columns feature")]
     pub experimental_generated_columns: bool,
-    #[clap(long, help = "Enable experimental multiprocess WAL coordination")]
+    #[clap(
+        long,
+        help = "Enable experimental multiprocess WAL coordination (on Windows, use --vfs experimental_win_iocp)"
+    )]
     pub experimental_multiprocess_wal: bool,
     #[cfg(feature = "mvcc_repl")]
     #[clap(long, help = "Start MVCC concurrent transaction harness")]

@@ -13,6 +13,8 @@ use std::collections::{BTreeMap, HashMap};
 use std::ops::Bound;
 use std::sync::Arc;
 use tracing::{debug, error, trace};
+#[cfg(target_os = "windows")]
+use turso_core::WindowsIOCP;
 use turso_core::{
     CipherMode, Connection, Database, DatabaseOpts, EncryptionOpts, IO, OpenFlags, Statement, Value,
 };
@@ -21,13 +23,13 @@ use turso_parser::ast::{ColumnConstraint, SortOrder};
 pub mod chaotic_elle;
 pub mod elle;
 mod io;
-#[cfg(all(unix, target_pointer_width = "64"))]
+#[cfg(all(any(unix, target_os = "windows"), target_pointer_width = "64"))]
 pub mod multiprocess;
 pub mod operations;
 pub mod properties;
-#[cfg(all(unix, target_pointer_width = "64"))]
+#[cfg(all(any(unix, target_os = "windows"), target_pointer_width = "64"))]
 pub mod protocol;
-#[cfg(all(unix, target_pointer_width = "64"))]
+#[cfg(all(any(unix, target_os = "windows"), target_pointer_width = "64"))]
 pub mod worker;
 pub mod workloads;
 mod yield_injection;
@@ -38,6 +40,19 @@ use crate::{
     properties::Property,
     workloads::{Workload, WorkloadContext},
 };
+
+#[cfg(all(any(unix, target_os = "windows"), target_pointer_width = "64"))]
+pub fn multiprocess_platform_io() -> anyhow::Result<Arc<dyn IO>> {
+    #[cfg(target_os = "windows")]
+    {
+        return Ok(Arc::new(WindowsIOCP::new()?));
+    }
+
+    #[cfg(unix)]
+    {
+        Ok(Arc::new(turso_core::PlatformIO::new()?))
+    }
+}
 pub use io::{IOFaultConfig, SimulatorIO};
 pub use operations::{FiberState, OpContext, OpResult, Operation, TxMode};
 use yield_injection::{SimulatorYieldInjector, fiber_yield_seed};

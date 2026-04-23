@@ -156,7 +156,7 @@ The SQL shell supports the following command line options:
 | `--mcp` | Start a MCP server instead of the interactive shell |
 | `--experimental-encryption` | Enable experimental encryption at rest feature. **Note:** the feature is not production ready so do not use it for critical data right now. |
 | `--experimental-views` | Enable experimental views feature. **Note**: the feature is not production ready so do not use it for critical data right now. |
-| `--experimental-multiprocess-wal` | Enable experimental multi-process WAL coordination via the `.tshm` sidecar. **Note:** the feature is not production ready so do not use it for critical data right now. |
+| `--experimental-multiprocess-wal` | Enable experimental multi-process WAL coordination via the `.tshm` sidecar. Supported on 64-bit Unix, and on 64-bit Windows when used with `--vfs experimental_win_iocp`. **Note:** the feature is not production ready so do not use it for critical data right now. |
 
 ## Transactions
 
