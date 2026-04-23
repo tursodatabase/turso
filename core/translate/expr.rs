@@ -5824,8 +5824,8 @@ enum QualifiedMatch {
         col_idx: usize,
         is_rowid_alias: bool,
     },
-    /// `<id>` named the rowid alias (`rowid`/`oid`/`_rowid_`) of a btree
-    /// with rowids. There is no column index — the result must become an
+    /// `<id>` named the rowid (`rowid`/`oid`/`_rowid_`) of a btree.
+    /// There is no column index — the result must become an
     /// `Expr::RowId`, not an `Expr::Column`.
     RowId,
 }
@@ -6137,7 +6137,7 @@ pub fn bind_and_rewrite_expr<'a>(
                             .outer_query_refs()
                             .iter()
                             .filter(|t| {
-                                t.identifier == normalized_table_name && !t.cte_definition_only
+                                !t.cte_definition_only && t.identifier == normalized_table_name
                             })
                             .map(|t| t.scope_depth)
                             .min();
@@ -6146,9 +6146,9 @@ pub fn bind_and_rewrite_expr<'a>(
                             identifier_matched = true;
                             for outer_ref in
                                 referenced_tables.outer_query_refs().iter().filter(|t| {
-                                    t.identifier == normalized_table_name
-                                        && !t.cte_definition_only
+                                    !t.cte_definition_only
                                         && t.scope_depth == scope_depth
+                                        && t.identifier == normalized_table_name
                                 })
                             {
                                 let Some(candidate) = resolve_qualified_on_ref(
@@ -6160,14 +6160,6 @@ pub fn bind_and_rewrite_expr<'a>(
                                     continue;
                                 };
 
-                                // Columns hidden by a USING/NATURAL join in the outer scope
-                                // are invisible here too. Rowid matches are not subject to
-                                // USING hiding (rowid isn't a real column).
-                                if let QualifiedMatch::Column { col_idx, .. } = candidate {
-                                    if outer_ref.using_dedup_hidden_cols.get(col_idx) {
-                                        continue;
-                                    }
-                                }
                                 if resolved.is_some() {
                                     return Err(ambiguous());
                                 }
@@ -6259,6 +6251,7 @@ pub fn bind_and_rewrite_expr<'a>(
                                 database: None, // TODO: support different databases
                                 table: tbl_id,
                             };
+                            tracing::debug!("rewritten to rowid");
                             referenced_tables.mark_rowid_referenced(tbl_id);
                         }
                     }

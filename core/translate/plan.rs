@@ -790,6 +790,12 @@ pub struct UpdateSetClause {
     pub expr: Box<ast::Expr>,
     /// In UPDATE FROM, SET clause expressions are rewritten to read from the
     /// scratch table populated before the write loop.
+    ///
+    /// For example, `UPDATE t SET a = s.x + 1 FROM s WHERE t.id = s.id` rewrites
+    /// the SET expression `s.x + 1` (a column reference into the FROM table + a literal 1) into a
+    /// `Column` read from the ephemeral scratch table that was populated during
+    /// the collection phase. That column in the scratch table contains the evaluated result
+    /// of s.x + 1.
     pub update_from_result: Option<Box<ast::Expr>>,
 }
 
