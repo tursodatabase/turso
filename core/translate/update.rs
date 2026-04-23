@@ -195,7 +195,7 @@ fn prepare_and_optimize_update_plan(
     update_plan.target_table = read_scope_tables.joined_tables_mut().remove(0);
     update_plan.from_tables = read_scope_tables;
 
-    let mut plan = Plan::Update(update_plan);
+    let mut plan = Plan::Update(Box::new(update_plan));
     optimize_plan(program, &mut plan, resolver)?;
     Ok(plan)
 }
