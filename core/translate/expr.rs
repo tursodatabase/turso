@@ -2777,6 +2777,7 @@ pub fn translate_expr(
                             )
                         }
                         ScalarFunc::UnionValueFunc => {
+                            let args = expect_arguments_exact!(args, 2, srf);
                             let tag_name = extract_string_literal(&args[0])?;
                             // union_value('tag', val): resolve the tag against the
                             // target column's union type. The target is set by
@@ -2822,8 +2823,9 @@ pub fn translate_expr(
                         }
                         ScalarFunc::UnionTagFunc => {
                             // union_tag(col): resolve col's union type for index→name lookup.
+                            let args = expect_arguments_exact!(args, 1, srf);
                             let td = resolve_union_from_column(
-                                &args[0],
+                                &*args[0],
                                 referenced_tables,
                                 resolver,
                                 program,
@@ -2838,10 +2840,11 @@ pub fn translate_expr(
                                 Insn::UnionTag { src_reg, dest: target_register, tag_names })
                         }
                         ScalarFunc::UnionExtractFunc => {
-                            let tag_name = extract_string_literal(&args[1])?;
+                            let args = expect_arguments_exact!(args, 2, srf);
+                            let tag_name = extract_string_literal(&*args[1])?;
                             // union_extract(col, 'tag'): resolve col's union type for name→index.
                             let td = resolve_union_from_column(
-                                &args[0],
+                                &*args[0],
                                 referenced_tables,
                                 resolver,
                                 program,
@@ -2859,9 +2862,10 @@ pub fn translate_expr(
                                 Insn::UnionExtract { src_reg, expected_tag: tag_index, dest: target_register })
                         }
                         ScalarFunc::StructExtractFunc => {
-                            let field_name = extract_string_literal(&args[1])?;
+                            let args = expect_arguments_exact!(args, 2, srf);
+                            let field_name = extract_string_literal(&*args[1])?;
                             let td = resolve_struct_from_expr(
-                                &args[0],
+                                &*args[0],
                                 referenced_tables,
                                 resolver,
                                 program,

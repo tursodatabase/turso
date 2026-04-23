@@ -24,7 +24,7 @@ use super::{
 };
 use crate::instrument;
 use crate::schema::{
-    BTreeTable, CheckConstraint, Column, ColumnLayout, IndexColumn, Schema, Table,
+    BTreeTable, CheckConstraint, Column, ColumnLayout, GeneratedType, IndexColumn, Schema, Table,
 };
 use crate::translate::plan::ColumnMask;
 use crate::vdbe::{
