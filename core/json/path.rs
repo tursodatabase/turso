@@ -15,6 +15,7 @@ enum ArrayIndexState {
     Start,
     AfterHash,
     CollectingNumbers,
+    CollectingNegativeZeros,
     IsMax,
 }
 
@@ -54,6 +55,10 @@ fn collect_num(current: i128, adding: i128, negative: bool) -> (i128, IsMaxNumbe
 
     let is_max = result == i128::MAX || result == i128::MIN;
     (result, is_max)
+}
+
+fn clamp_array_index(index: i128) -> i32 {
+    index.clamp(i32::MIN as i128, i32::MAX as i128) as i32
 }
 
 fn estimate_path_capacity(input: &str) -> usize {
@@ -270,6 +275,17 @@ fn handle_array_index<'a>(
             *parser_state = PPState::ExpectDotOrBracket;
             path_components.push(PathElement::ArrayLocator(None));
         }
+        (ArrayIndexState::CollectingNegativeZeros, '0') => {}
+        (ArrayIndexState::CollectingNegativeZeros, '1'..='9') => {
+            *index_buffer = -(ch.1.to_digit(10).ok_or_else(|| {
+                crate::LimboError::ParseError(format!("failed to parse digit: {ch}", ch = ch.1))
+            })? as i128);
+            *index_state = ArrayIndexState::CollectingNumbers;
+        }
+        (ArrayIndexState::CollectingNegativeZeros, ']') => {
+            *parser_state = PPState::ExpectDotOrBracket;
+            path_components.push(PathElement::ArrayLocator(None));
+        }
         (ArrayIndexState::CollectingNumbers, '0'..='9') => {
             let (new_num, is_max) = collect_num(
                 *index_buffer,
@@ -286,7 +302,9 @@ fn handle_array_index<'a>(
         (ArrayIndexState::IsMax, '0'..='9') => (),
         (ArrayIndexState::CollectingNumbers | ArrayIndexState::IsMax, ']') => {
             *parser_state = PPState::ExpectDotOrBracket;
-            path_components.push(PathElement::ArrayLocator(Some(*index_buffer as i32)));
+            path_components.push(PathElement::ArrayLocator(Some(clamp_array_index(
+                *index_buffer,
+            ))));
         }
         (_, _) => bail_parse_error!("Bad json path: {}", path),
     }
@@ -351,10 +369,17 @@ fn handle_negative_index(
 ) -> crate::Result<()> {
     if let Some((_, next_c)) = path_iter.next() {
         if next_c.is_ascii_digit() {
-            *index_buffer = -(next_c.to_digit(10).ok_or_else(|| {
+            let digit = next_c.to_digit(10).ok_or_else(|| {
                 crate::LimboError::ParseError(format!("failed to parse digit: {next_c}"))
-            })? as i128);
-            *index_state = ArrayIndexState::CollectingNumbers;
+            })? as i128;
+            if digit == 0 {
+                // Preserve `[#-0]` (and `[#-00..0]`) as the append locator.
+                *index_buffer = 0;
+                *index_state = ArrayIndexState::CollectingNegativeZeros;
+            } else {
+                *index_buffer = -digit;
+                *index_state = ArrayIndexState::CollectingNumbers;
+            }
             Ok(())
         } else {
             bail_parse_error!("Bad json path: {}", path)
@@ -453,6 +478,30 @@ mod tests {
     }
 
     #[test]
+    fn test_json_path_negative_zero_array_locator() {
+        let path = json_path("$[#-0]").unwrap();
+        assert_eq!(path.elements.len(), 2);
+        assert_eq!(path.elements[0], PathElement::Root());
+        assert_eq!(path.elements[1], PathElement::ArrayLocator(None));
+    }
+
+    #[test]
+    fn test_json_path_negative_zero_with_leading_zeros() {
+        let path = json_path("$[#-00]").unwrap();
+        assert_eq!(path.elements.len(), 2);
+        assert_eq!(path.elements[0], PathElement::Root());
+        assert_eq!(path.elements[1], PathElement::ArrayLocator(None));
+    }
+
+    #[test]
+    fn test_json_path_negative_with_leading_zeros() {
+        let path = json_path("$[#-01]").unwrap();
+        assert_eq!(path.elements.len(), 2);
+        assert_eq!(path.elements[0], PathElement::Root());
+        assert_eq!(path.elements[1], PathElement::ArrayLocator(Some(-1)));
+    }
+
+    #[test]
     fn test_json_path_invalid() {
         let invalid_values = vec![
             "", "$$$", "$.", "$ ", "$[", "$]", "$[-1]", "x", "[]", "$[0", "$[0x]", "$\"",
@@ -491,12 +540,21 @@ mod tests {
     }
 
     #[test]
-    fn test_large_index_wrapping() {
+    fn test_large_index_saturates() {
         let path = json_path("$[4294967296]").unwrap();
-        assert_eq!(path.elements[1], PathElement::ArrayLocator(Some(0)));
+        assert_eq!(path.elements[1], PathElement::ArrayLocator(Some(i32::MAX)));
 
         let path = json_path("$[4294967297]").unwrap();
-        assert_eq!(path.elements[1], PathElement::ArrayLocator(Some(1)));
+        assert_eq!(path.elements[1], PathElement::ArrayLocator(Some(i32::MAX)));
+    }
+
+    #[test]
+    fn test_large_negative_index_saturates() {
+        let path = json_path("$[#-4294967297]").unwrap();
+        assert_eq!(path.elements[1], PathElement::ArrayLocator(Some(i32::MIN)));
+
+        let path = json_path("$[#-4294967298]").unwrap();
+        assert_eq!(path.elements[1], PathElement::ArrayLocator(Some(i32::MIN)));
     }
 
     #[test]

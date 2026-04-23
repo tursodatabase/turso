@@ -44,9 +44,9 @@ fn setup_rusqlite(temp_dir: &TempDir, query: &str) -> rusqlite::Connection {
         .unwrap();
     assert_eq!(journal_mode.to_lowercase(), "wal");
     let synchronous = sqlite_conn
-        .pragma_query_value(None, "synchronous", |row| row.get::<_, usize>(0))
+        .pragma_query_value(None, "synchronous", |row| row.get::<_, i64>(0))
         .unwrap();
-    const FULL: usize = 2;
+    const FULL: i64 = 2;
     assert_eq!(synchronous, FULL);
 
     // load the generate_series extension
@@ -639,9 +639,9 @@ fn bench_insert_rows(criterion: &mut Criterion) {
                 .unwrap();
             assert_eq!(journal_mode.to_lowercase(), "wal");
             let synchronous = sqlite_conn
-                .pragma_query_value(None, "synchronous", |row| row.get::<_, usize>(0))
+                .pragma_query_value(None, "synchronous", |row| row.get::<_, i64>(0))
                 .unwrap();
-            const FULL: usize = 2;
+            const FULL: i64 = 2;
             assert_eq!(synchronous, FULL);
 
             // Create test table

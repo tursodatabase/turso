@@ -5,13 +5,22 @@
 
 set -e
 
-SQLITE_VERSION="${SQLITE_VERSION:-3490100}"
-SQLITE_YEAR="${SQLITE_YEAR:-2025}"
-
 # Get the directory where this script is located
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(dirname "$SCRIPT_DIR")"
 INSTALL_DIR="${INSTALL_DIR:-$PROJECT_ROOT/.sqlite3}"
+SQLITE_VERSION_FILE="$PROJECT_ROOT/scripts/sqlite-version.env"
+
+OVERRIDE_SQLITE_VERSION="${SQLITE_VERSION:-}"
+OVERRIDE_SQLITE_YEAR="${SQLITE_YEAR:-}"
+
+# Keep one version source for local installs and CI while still allowing
+# explicit environment overrides when needed.
+# shellcheck source=/dev/null
+. "$SQLITE_VERSION_FILE"
+
+SQLITE_VERSION="${OVERRIDE_SQLITE_VERSION:-$SQLITE_VERSION}"
+SQLITE_YEAR="${OVERRIDE_SQLITE_YEAR:-$SQLITE_YEAR}"
 
 # Detect OS and architecture
 detect_platform() {
@@ -58,9 +67,11 @@ get_download_url() {
         linux-x64)
             echo "$base_url/sqlite-tools-linux-x64-$SQLITE_VERSION.zip"
             ;;
-        macos-x64|macos-arm64)
-            # macOS uses a universal binary (works on both x64 and arm64)
+        macos-x64)
             echo "$base_url/sqlite-tools-osx-x64-$SQLITE_VERSION.zip"
+            ;;
+        macos-arm64)
+            echo "$base_url/sqlite-tools-osx-arm64-$SQLITE_VERSION.zip"
             ;;
         win32-x64)
             echo "$base_url/sqlite-tools-win-x64-$SQLITE_VERSION.zip"

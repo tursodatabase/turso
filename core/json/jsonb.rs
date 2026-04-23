@@ -3,7 +3,7 @@ use crate::json::Conv;
 use crate::{bail_parse_error, LimboError, Result};
 use std::{
     borrow::Cow,
-    collections::{HashMap, VecDeque},
+    collections::VecDeque,
     fmt::Write,
     str::{from_utf8, from_utf8_unchecked},
 };
@@ -173,6 +173,26 @@ const fn make_character_type_ok_table() -> [u8; 256] {
 }
 
 static CHARACTER_TYPE_OK: [u8; 256] = make_character_type_ok_table();
+
+fn checked_size_add_delta(base: usize, delta: isize, context: &'static str) -> Result<usize> {
+    base.checked_add_signed(delta).ok_or_else(|| {
+        LimboError::InternalError(format!("jsonb size update overflow while {context}"))
+    })
+}
+
+fn checked_len_diff(new_len: usize, old_len: usize, context: &'static str) -> Result<isize> {
+    let new_len = isize::try_from(new_len).map_err(|_| {
+        LimboError::InternalError(format!("jsonb header length out of range while {context}"))
+    })?;
+    let old_len = isize::try_from(old_len).map_err(|_| {
+        LimboError::InternalError(format!("jsonb header length out of range while {context}"))
+    })?;
+    new_len.checked_sub(old_len).ok_or_else(|| {
+        LimboError::InternalError(format!(
+            "jsonb header length delta overflow while {context}"
+        ))
+    })
+}
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Jsonb {
@@ -357,13 +377,19 @@ impl PathOperation for SetOperation {
                 target.field_key_index,
                 JsonLocationKind::ObjectProperty(_) | JsonLocationKind::DocumentRoot
             ) {
+                let new_obj_size =
+                    checked_size_add_delta(obj_value_size, delta, "setting array item")?;
                 let new_h_delta = json.write_element_header(
                     obj_value_idx,
                     ElementType::ARRAY,
-                    (obj_value_size as isize + delta) as usize,
+                    new_obj_size,
                     true,
                 )?;
-                (new_h_delta - obj_value_header_size) as isize
+                checked_len_diff(
+                    new_h_delta,
+                    obj_value_header_size,
+                    "updating array header while setting array item",
+                )?
             } else {
                 0
             };
@@ -433,13 +459,19 @@ impl PathOperation for DeleteOperation {
                 target.field_key_index,
                 JsonLocationKind::ObjectProperty(_) | JsonLocationKind::DocumentRoot
             ) {
+                let new_obj_size =
+                    checked_size_add_delta(obj_value_size, delta, "deleting array item")?;
                 let new_h_delta = json.write_element_header(
                     obj_value_idx,
                     ElementType::ARRAY,
-                    (obj_value_size as isize + delta) as usize,
+                    new_obj_size,
                     true,
                 )?;
-                new_h_delta as isize - obj_value_header_size as isize
+                checked_len_diff(
+                    new_h_delta,
+                    obj_value_header_size,
+                    "updating array header while deleting array item",
+                )?
             } else {
                 0
             };
@@ -455,7 +487,7 @@ impl PathOperation for DeleteOperation {
 
             json.update_parent_references(stack, delta + target.delta)?;
         } else {
-            let nul = JsonbHeader::make_null().into_bytes();
+            let nul = JsonbHeader::make_null().into_bytes()?;
             let nul_bytes = nul.as_bytes();
             json.data.clear();
             json.data.extend_from_slice(nul_bytes);
@@ -516,13 +548,19 @@ impl PathOperation for ReplaceOperation {
                 target.field_key_index,
                 JsonLocationKind::ObjectProperty(_) | JsonLocationKind::DocumentRoot
             ) {
+                let new_obj_size =
+                    checked_size_add_delta(obj_value_size, delta, "replacing array item")?;
                 let new_h_delta = json.write_element_header(
                     obj_value_idx,
                     ElementType::ARRAY,
-                    (obj_value_size as isize + delta) as usize,
+                    new_obj_size,
                     true,
                 )?;
-                (new_h_delta - obj_value_header_size) as isize
+                checked_len_diff(
+                    new_h_delta,
+                    obj_value_header_size,
+                    "updating array header while replacing array item",
+                )?
             } else {
                 0
             };
@@ -597,13 +635,19 @@ impl PathOperation for InsertOperation {
                 target.field_key_index,
                 JsonLocationKind::ObjectProperty(_) | JsonLocationKind::DocumentRoot
             ) {
+                let new_obj_size =
+                    checked_size_add_delta(obj_value_size, delta, "inserting array item")?;
                 let new_h_delta = json.write_element_header(
                     obj_value_idx,
                     ElementType::ARRAY,
-                    (obj_value_size as isize + delta) as usize,
+                    new_obj_size,
                     true,
                 )?;
-                (new_h_delta - obj_value_header_size) as isize
+                checked_len_diff(
+                    new_h_delta,
+                    obj_value_header_size,
+                    "updating array header while inserting array item",
+                )?
             } else {
                 0
             };
@@ -835,44 +879,45 @@ impl JsonbHeader {
         }
     }
 
-    pub fn into_bytes(self) -> HeaderFormat {
+    pub fn into_bytes(self) -> Result<HeaderFormat> {
         let (element_type, payload_size) = (self.0, self.1);
 
         match payload_size {
             // Small payload (fits in 4 bits)
-            size if size <= 11 => {
-                HeaderFormat::Inline([(element_type as u8) | ((size as u8) << 4)])
-            }
+            size if size <= 11 => Ok(HeaderFormat::Inline([
+                (element_type as u8) | ((size as u8) << 4)
+            ])),
 
             // Medium payload (fits in 1 byte)
-            size if size <= 0xFF => {
-                HeaderFormat::OneByte([(element_type as u8) | (SIZE_MARKER_8BIT << 4), size as u8])
-            }
+            size if size <= 0xFF => Ok(HeaderFormat::OneByte([
+                (element_type as u8) | (SIZE_MARKER_8BIT << 4),
+                size as u8,
+            ])),
 
             // Large payload (fits in 2 bytes)
             size if size <= 0xFFFF => {
                 let size_bytes = (size as u16).to_be_bytes();
-                HeaderFormat::TwoBytes([
+                Ok(HeaderFormat::TwoBytes([
                     (element_type as u8) | (SIZE_MARKER_16BIT << 4),
                     size_bytes[0],
                     size_bytes[1],
-                ])
+                ]))
             }
 
             // Extra large payload (fits in 4 bytes)
             size if size <= 0xFFFFFFFF => {
                 let size_bytes = (size as u32).to_be_bytes();
-                HeaderFormat::FourBytes([
+                Ok(HeaderFormat::FourBytes([
                     (element_type as u8) | (SIZE_MARKER_32BIT << 4),
                     size_bytes[0],
                     size_bytes[1],
                     size_bytes[2],
                     size_bytes[3],
-                ])
+                ]))
             }
 
             // Payload too large
-            _ => panic!("Payload size too large for encoding"),
+            _ => bail_parse_error!("Payload size too large for encoding"),
         }
     }
 
@@ -1585,7 +1630,7 @@ impl Jsonb {
                 return Err(PError::Message {
                     msg: "Unexpected character".to_string(),
                     location: Some(pos),
-                })
+                });
             }
         }
 
@@ -2288,7 +2333,7 @@ impl Jsonb {
             return Ok(1);
         }
 
-        let header = JsonbHeader::new(element_type, payload_size).into_bytes();
+        let header = JsonbHeader::new(element_type, payload_size).into_bytes()?;
         let header_bytes = header.as_bytes();
         let header_len = header_bytes.len();
 
@@ -2467,12 +2512,164 @@ impl Jsonb {
         Ok(())
     }
 
+    fn append_array_placeholder(
+        &mut self,
+        array_value_idx: usize,
+        array_payload_size: usize,
+        array_header_size: usize,
+        insertion_point: usize,
+        field_key_index: JsonLocationKind,
+    ) -> Result<JsonTraversalResult> {
+        let placeholder = JsonbHeader::new(ElementType::OBJECT, 0).into_bytes()?;
+        let placeholder_bytes = placeholder.as_bytes();
+        let placeholder_delta = isize::try_from(placeholder_bytes.len()).map_err(|_| {
+            LimboError::InternalError("placeholder length does not fit in isize".to_string())
+        })?;
+
+        self.data.splice(
+            insertion_point..insertion_point,
+            placeholder_bytes.iter().copied(),
+        );
+
+        let mut adjusted_insertion_point = insertion_point;
+        let mut header_shift = 0isize;
+        if matches!(
+            field_key_index,
+            JsonLocationKind::ObjectProperty(_) | JsonLocationKind::DocumentRoot
+        ) {
+            let new_header_size = self.write_element_header(
+                array_value_idx,
+                ElementType::ARRAY,
+                array_payload_size + placeholder_bytes.len(),
+                true,
+            )?;
+            header_shift = checked_len_diff(
+                new_header_size,
+                array_header_size,
+                "updating parent array header while appending placeholder",
+            )?;
+            adjusted_insertion_point = insertion_point
+                .checked_add_signed(header_shift)
+                .ok_or_else(|| {
+                    LimboError::InternalError(
+                        "array insertion point shifted outside valid range".to_string(),
+                    )
+                })?;
+        }
+        let total_delta = placeholder_delta.checked_add(header_shift).ok_or_else(|| {
+            LimboError::InternalError("placeholder delta overflow after header shift".to_string())
+        })?;
+
+        Ok(JsonTraversalResult::with_array_index(
+            array_value_idx,
+            field_key_index,
+            total_delta,
+            adjusted_insertion_point,
+        ))
+    }
+
+    fn resolve_array_locator(
+        &mut self,
+        array_value_idx: usize,
+        field_key_index: JsonLocationKind,
+        idx: &Option<i32>,
+        mode: PathOperationMode,
+    ) -> Result<JsonTraversalResult> {
+        let (JsonbHeader(value_type, value_size), value_header_size) =
+            self.read_header(array_value_idx)?;
+        if value_type != ElementType::ARRAY {
+            bail_parse_error!("Should be array")
+        }
+
+        let array_start = array_value_idx + value_header_size;
+        let array_end = array_start + value_size;
+
+        match idx {
+            Some(idx) if *idx >= 0 => {
+                let target_idx = *idx as usize;
+                let mut count = 0;
+                let mut arr_pos = array_start;
+
+                while arr_pos < array_end && count != target_idx {
+                    arr_pos = self.skip_element(arr_pos)?;
+                    count += 1;
+                }
+
+                if arr_pos == array_end {
+                    if mode.allows_insert() && count == target_idx {
+                        return self.append_array_placeholder(
+                            array_value_idx,
+                            value_size,
+                            value_header_size,
+                            arr_pos,
+                            field_key_index,
+                        );
+                    }
+                    bail_parse_error!("Not found!");
+                }
+
+                if mode.allows_replace() {
+                    return Ok(JsonTraversalResult::with_array_index(
+                        array_value_idx,
+                        field_key_index,
+                        0,
+                        arr_pos,
+                    ));
+                }
+
+                bail_parse_error!("Not found!")
+            }
+            Some(idx) => {
+                let mut positions: Vec<usize> = Vec::with_capacity(16);
+                let mut arr_pos = array_start;
+                while arr_pos < array_end {
+                    positions.push(arr_pos);
+                    arr_pos = self.skip_element(arr_pos)?;
+                }
+
+                let real_idx = positions.len() as i64 + i64::from(*idx);
+                if real_idx < 0 || real_idx >= positions.len() as i64 {
+                    bail_parse_error!("Element with negative index not found");
+                }
+
+                if mode.allows_replace() {
+                    return Ok(JsonTraversalResult::with_array_index(
+                        array_value_idx,
+                        field_key_index,
+                        0,
+                        positions[real_idx as usize],
+                    ));
+                }
+
+                bail_parse_error!("Not found!")
+            }
+            None => {
+                if mode.allows_insert() {
+                    return self.append_array_placeholder(
+                        array_value_idx,
+                        value_size,
+                        value_header_size,
+                        array_end,
+                        field_key_index,
+                    );
+                }
+
+                bail_parse_error!("Not found!")
+            }
+        }
+    }
+
     fn update_parent_references(
         &mut self,
         stack: Vec<JsonTraversalResult>,
         delta: isize,
     ) -> Result<()> {
         let mut delta = delta;
+        // Track the container whose header was already updated in the previous
+        // (deeper) iteration. If the current array parent points to that same
+        // container via `get_array_index()`, updating it again would double-apply
+        // the delta for 3+ nested array traversals.
+        let mut updated_child_container_idx: Option<usize> = None;
         for parent in stack.iter().rev() {
             let (JsonbHeader(el_type, el_size), el_header_len) =
                 self.read_header(parent.field_value_index)?;
@@ -2481,30 +2678,43 @@ impl Jsonb {
                 let arr_element_idx = parent.get_array_index().ok_or_else(|| {
                     LimboError::InternalError("array element should have index".to_string())
                 })?;
-                let (JsonbHeader(arr_el_type, arr_el_size), arr_el_header_len) =
-                    self.read_header(arr_element_idx)?;
+                if Some(arr_element_idx) != updated_child_container_idx {
+                    let (JsonbHeader(arr_el_type, arr_el_size), arr_el_header_len) =
+                        self.read_header(arr_element_idx)?;
+                    let new_arr_el_size = checked_size_add_delta(
+                        arr_el_size,
+                        delta,
+                        "updating array element header from parent delta",
+                    )?;
 
-                let new_arr_el_header_len = self.write_element_header(
-                    arr_element_idx,
-                    arr_el_type,
-                    (arr_el_size as isize + delta) as usize,
-                    true,
-                )?;
+                    let new_arr_el_header_len = self.write_element_header(
+                        arr_element_idx,
+                        arr_el_type,
+                        new_arr_el_size,
+                        true,
+                    )?;
 
-                delta += (new_arr_el_header_len - arr_el_header_len) as isize;
+                    delta += checked_len_diff(
+                        new_arr_el_header_len,
+                        arr_el_header_len,
+                        "updating array element header from parent delta",
+                    )?;
+                }
             }
-            let new_size = el_size as isize + delta;
-            let new_header_size = self.write_element_header(
-                parent.field_value_index,
-                el_type,
-                new_size as usize,
-                true,
-            )?;
+            let new_size =
+                checked_size_add_delta(el_size, delta, "updating parent container size")?;
+            let new_header_size =
+                self.write_element_header(parent.field_value_index, el_type, new_size, true)?;
 
-            let header_diff = new_header_size as isize - el_header_len as isize;
+            let header_diff = checked_len_diff(
+                new_header_size,
+                el_header_len,
+                "updating parent container header",
+            )?;
 
             delta += parent.delta;
             delta += header_diff;
+            updated_child_container_idx = Some(parent.field_value_index);
         }
 
         Ok(())
@@ -2531,80 +2741,21 @@ impl Jsonb {
                     self.read_header(pos)?;
 
                 if root_type == ElementType::ARRAY {
-                    let end_pos = pos + root_header_size + root_size;
-
-                    match idx {
-                        Some(idx) if *idx >= 0 => {
-                            let mut count = 0;
-                            let mut arr_pos = pos + root_header_size;
-
-                            while arr_pos < end_pos && count != *idx as usize {
-                                arr_pos = self.skip_element(arr_pos)?;
-                                count += 1;
-                            }
-
-                            if mode.allows_insert() && arr_pos == end_pos {
-                                let placeholder =
-                                    JsonbHeader::new(ElementType::OBJECT, 0).into_bytes();
-                                let placeholder_bytes = placeholder.as_bytes();
-
-                                self.data
-                                    .splice(arr_pos..arr_pos, placeholder_bytes.iter().copied());
-
-                                return Ok(JsonTraversalResult::with_array_index(
-                                    pos,
-                                    JsonLocationKind::ArrayEntry,
-                                    placeholder_bytes.len() as isize,
-                                    arr_pos,
-                                ));
-                            }
-
-                            if arr_pos != end_pos && mode.allows_replace() {
-                                return Ok(JsonTraversalResult::with_array_index(
-                                    pos,
-                                    JsonLocationKind::ArrayEntry,
-                                    0,
-                                    arr_pos,
-                                ));
-                            }
-
-                            bail_parse_error!("Not found!");
-                        }
-                        Some(idx) if *idx < 0 => {
-                            let mut idx_map: HashMap<i32, usize> = HashMap::with_capacity(100);
-                            let mut element_idx = 0;
-                            let mut arr_pos = pos + root_header_size;
-
-                            while arr_pos < end_pos {
-                                idx_map.insert(element_idx, arr_pos);
-                                arr_pos = self.skip_element(arr_pos)?;
-                                element_idx += 1;
-                            }
-
-                            let real_idx = element_idx + idx;
-
-                            if let Some(index) = idx_map.get(&real_idx) {
-                                return Ok(JsonTraversalResult::with_array_index(
-                                    pos,
-                                    JsonLocationKind::ArrayEntry,
-                                    0,
-                                    *index,
-                                ));
-                            } else {
-                                bail_parse_error!("Element with negative index not found")
-                            }
-                        }
-                        _ => unreachable!(),
-                    }
+                    return self.resolve_array_locator(
+                        pos,
+                        JsonLocationKind::ArrayEntry,
+                        idx,
+                        mode,
+                    );
                 } else {
                     if root_type == ElementType::OBJECT
                         && root_size == 0
                         && (*idx == Some(0) || idx.is_none())
                         && mode.allows_insert()
                     {
-                        let array = JsonbHeader::new(ElementType::ARRAY, 0).into_bytes();
+                        let array = JsonbHeader::new(ElementType::ARRAY, 0).into_bytes()?;
                         let array_bytes = array.as_bytes();
-                        let placeholder = JsonbHeader::new(ElementType::OBJECT, 0).into_bytes();
+                        let placeholder = JsonbHeader::new(ElementType::OBJECT, 0).into_bytes()?;
                         let placeholder_bytes = placeholder.as_bytes();
                         self.data.splice(
                             pos..pos + root_header_size,
@@ -2669,10 +2820,10 @@ impl Jsonb {
                             ElementType::TEXT
                         };
 
-                        let key_header = JsonbHeader::new(key_type, path_key.len()).into_bytes();
+                        let key_header = JsonbHeader::new(key_type, path_key.len()).into_bytes()?;
                         let key_header_bytes = key_header.as_bytes();
                         let key_bytes = path_key.as_bytes();
-                        let value_header = JsonbHeader::new(ElementType::OBJECT, 0).into_bytes();
+                        let value_header = JsonbHeader::new(ElementType::OBJECT, 0).into_bytes()?;
                         let value_header_bytes = value_header.as_bytes();
 
                         self.data.splice(
@@ -2705,76 +2856,15 @@ impl Jsonb {
                 PathElement::Root(),
                 PathElement::ArrayLocator(idx),
             ) => {
-                let (JsonbHeader(root_type, root_size), root_header_size) =
-                    self.read_header(pos)?;
+                let (JsonbHeader(root_type, _), _) = self.read_header(pos)?;
 
                 if root_type == ElementType::ARRAY {
-                    let end_pos = pos + root_header_size + root_size;
-
-                    match idx {
-                        Some(idx) if *idx >= 0 => {
-                            let mut count = 0;
-                            let mut arr_pos = pos + root_header_size;
-
-                            while arr_pos < end_pos && count != *idx as usize {
-                                arr_pos = self.skip_element(arr_pos)?;
-                                count += 1;
-                            }
-
-                            if mode.allows_insert() && arr_pos == end_pos && count == *idx as usize
-                            {
-                                let placeholder =
-                                    JsonbHeader::new(ElementType::OBJECT, 0).into_bytes();
-                                let placeholder_bytes = placeholder.as_bytes();
-
-                                self.data
-                                    .splice(arr_pos..arr_pos, placeholder_bytes.iter().copied());
-
-                                return Ok(JsonTraversalResult::with_array_index(
-                                    pos,
-                                    JsonLocationKind::DocumentRoot,
-                                    placeholder_bytes.len() as isize,
-                                    arr_pos,
-                                ));
-                            }
-
-                            if arr_pos != end_pos && mode.allows_replace() {
-                                return Ok(JsonTraversalResult::with_array_index(
-                                    pos,
-                                    JsonLocationKind::DocumentRoot,
-                                    0,
-                                    arr_pos,
-                                ));
-                            }
-
-                            bail_parse_error!("Not found!");
-                        }
-                        Some(idx) if *idx < 0 => {
-                            let mut idx_map: HashMap<i32, usize> = HashMap::with_capacity(100);
-                            let mut element_idx = 0;
-                            let mut arr_pos = pos + root_header_size;
-
-                            while arr_pos < end_pos {
-                                idx_map.insert(element_idx, arr_pos);
-                                arr_pos = self.skip_element(arr_pos)?;
-                                element_idx += 1;
-                            }
-
-                            let real_idx = element_idx + idx;
-
-                            if let Some(index) = idx_map.get(&real_idx) {
-                                return Ok(JsonTraversalResult::with_array_index(
-                                    pos,
-                                    JsonLocationKind::DocumentRoot,
-                                    0,
-                                    *index,
-                                ));
-                            } else {
-                                bail_parse_error!("Element with negative index not found")
-                            }
-                        }
-                        _ => unreachable!(),
-                    }
+                    return self.resolve_array_locator(
+                        pos,
+                        JsonLocationKind::DocumentRoot,
+                        idx,
+                        mode,
+                    );
                 } else {
                     bail_parse_error!("Root is not an array");
                 }
@@ -2827,12 +2917,14 @@ impl Jsonb {
                         ElementType::TEXT
                     };
 
-                    let key_header = JsonbHeader::new(key_header_type, path_key.len()).into_bytes();
+                    let key_header =
+                        JsonbHeader::new(key_header_type, path_key.len()).into_bytes()?;
                     let key_header_bytes = key_header.as_bytes();
                     let key_bytes = path_key.as_bytes();
-                    let array_header = JsonbHeader::new(ElementType::ARRAY, 1).into_bytes();
+                    let array_header = JsonbHeader::new(ElementType::ARRAY, 1).into_bytes()?;
                     let array_header_bytes = array_header.as_bytes();
-                    let array_value_header = JsonbHeader::new(ElementType::OBJECT, 0).into_bytes();
+                    let array_value_header =
+                        JsonbHeader::new(ElementType::OBJECT, 0).into_bytes()?;
                     let array_value_header_bytes = array_value_header.as_bytes();
 
                     let delta = key_header_bytes.len()
@@ -2862,105 +2954,18 @@ impl Jsonb {
                     ));
                 }
 
-                if current_pos != end_pos && mode.allows_replace() {
+                if current_pos != end_pos {
                     let key_idx = current_pos;
 
                     current_pos = self.skip_element(current_pos)?;
                     let value_idx = current_pos;
 
-                    let (JsonbHeader(value_type, value_size), value_header_size) =
-                        self.read_header(value_idx)?;
-
-                    if value_type != ElementType::ARRAY {
-                        bail_parse_error!("Should be array")
-                    }
-
-                    let end_pos = current_pos + value_header_size + value_size;
-
-                    match idx {
-                        Some(idx) if *idx >= 0 => {
-                            let mut count = 0;
-                            let mut arr_pos = value_idx + value_header_size;
-
-                            while arr_pos < end_pos && count != *idx as usize {
-                                arr_pos = self.skip_element(arr_pos)?;
-                                count += 1;
-                            }
-
-                            if mode.allows_insert() && arr_pos == end_pos && count == *idx as usize
-                            {
-                                let placeholder =
-                                    JsonbHeader::new(ElementType::OBJECT, 0).into_bytes();
-                                let placeholder_bytes = placeholder.as_bytes();
-
-                                self.data
-                                    .splice(arr_pos..arr_pos, placeholder_bytes.iter().copied());
-                                self.write_element_header(
-                                    value_idx,
-                                    ElementType::ARRAY,
-                                    value_size + placeholder_bytes.len(),
-                                    true,
-                                )?;
-                                return Ok(JsonTraversalResult::with_array_index(
-                                    value_idx,
-                                    JsonLocationKind::ObjectProperty(key_idx),
-                                    placeholder_bytes.len() as isize,
-                                    arr_pos,
-                                ));
-                            }
-
-                            if arr_pos != end_pos && mode.allows_replace() {
-                                return Ok(JsonTraversalResult::with_array_index(
-                                    value_idx,
-                                    JsonLocationKind::ObjectProperty(key_idx),
-                                    0,
-                                    arr_pos,
-                                ));
-                            }
-
-                            bail_parse_error!("Not found!");
-                        }
-                        Some(idx) if *idx < 0 => {
-                            let mut idx_map: HashMap<i32, usize> = HashMap::with_capacity(100);
-                            let mut element_idx = 0;
-                            let mut arr_pos = value_idx + value_header_size;
-
-                            while arr_pos < end_pos {
-                                idx_map.insert(element_idx, arr_pos);
-                                arr_pos = self.skip_element(arr_pos)?;
-                                element_idx += 1;
-                            }
-
-                            let real_idx = element_idx + idx;
-
-                            if let Some(index) = idx_map.get(&real_idx) {
-                                return Ok(JsonTraversalResult::with_array_index(
-                                    value_idx,
-                                    JsonLocationKind::ObjectProperty(key_idx),
-                                    0,
-                                    *index,
-                                ));
-                            } else {
-                                bail_parse_error!(
-                                    "ERROR: Element at negative index {} not found",
-                                    idx
-                                );
-                            }
-                        }
-                        Some(_) => unreachable!(),
-                        None => {
-                            if mode.allows_insert() {
-                                let placeholder =
-                                    JsonbHeader::new(ElementType::OBJECT, 0).into_bytes();
-                                let placeholder_bytes = placeholder.as_bytes();
-                                let insertion_point = value_idx + value_size + value_header_size;
-
-                                self.data.insert(insertion_point, placeholder_bytes[0]);
-                            } else {
-                                bail_parse_error!("Cant insert")
-                            }
-                        }
-                    }
+                    return self.resolve_array_locator(
+                        value_idx,
+                        JsonLocationKind::ObjectProperty(key_idx),
+                        idx,
+                        mode,
+                    );
                 }
             }
             _ => {
@@ -3088,7 +3093,7 @@ impl Jsonb {
                         } else {
                             let empty_obj = Jsonb::new(
                                 1,
-                                Some(JsonbHeader::make_obj().into_bytes().as_bytes()),
+                                Some(JsonbHeader::make_obj().into_bytes()?.as_bytes()),
                             );
                             let mut op = SetOperation::new(empty_obj);
                             let _ = result.operate_on_path(&key_path, &mut op);
@@ -3892,12 +3897,12 @@ world""#,
     fn test_header_encoding() {
         // Small payload (fits in 4 bits)
         let header = JsonbHeader::new(ElementType::TEXT, 5);
-        let bytes = header.into_bytes().as_bytes().to_vec();
+        let bytes = header.into_bytes().unwrap().as_bytes().to_vec();
         assert_eq!(bytes[0], (5 << 4) | (ElementType::TEXT as u8));
 
         // Medium payload (8-bit)
         let header = JsonbHeader::new(ElementType::TEXT, 200);
-        let bytes = header.into_bytes().as_bytes().to_vec();
+        let bytes = header.into_bytes().unwrap().as_bytes().to_vec();
         assert_eq!(
             bytes[0],
             (SIZE_MARKER_8BIT << 4) | (ElementType::TEXT as u8)
@@ -3906,7 +3911,7 @@ world""#,
 
         // Large payload (16-bit)
         let header = JsonbHeader::new(ElementType::TEXT, 40000);
-        let bytes = header.into_bytes().as_bytes().to_vec();
+        let bytes = header.into_bytes().unwrap().as_bytes().to_vec();
         assert_eq!(
             bytes[0],
             (SIZE_MARKER_16BIT << 4) | (ElementType::TEXT as u8)
@@ -3916,7 +3921,7 @@ world""#,
 
         // Extra large payload (32-bit)
         let header = JsonbHeader::new(ElementType::TEXT, 70000);
-        let bytes = header.into_bytes().as_bytes().to_vec();
+        let bytes = header.into_bytes().unwrap().as_bytes().to_vec();
         assert_eq!(
             bytes[0],
             (SIZE_MARKER_32BIT << 4) | (ElementType::TEXT as u8)

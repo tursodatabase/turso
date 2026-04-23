@@ -19,6 +19,7 @@ declare -A SQLITE_TIMES_WITH_ANALYZE
 # Install sqlite3 locally if needed
 "$REPO_ROOT/scripts/install-sqlite3.sh"
 SQLITE_BIN="$REPO_ROOT/.sqlite3/sqlite3"
+SQLITE_DB_CONFIG_MARKER="__SQLITE_DB_CONFIG_MARKER_37f0f10b__"
 
 # Function to clear system caches based on OS
 clear_caches() {
@@ -70,7 +71,22 @@ run_query_with_sqlite() {
     local query_file=$1
     local query_sql
     query_sql=$(load_query_sql "$query_file")
-    { time -p "$SQLITE_BIN" "$DB_FILE" "$query_sql" 2>&1; } 2>&1
+    {
+        time -p "$SQLITE_BIN" "$DB_FILE" \
+            ".dbconfig fp_digits 15" \
+            "SELECT '$SQLITE_DB_CONFIG_MARKER';" \
+            "$query_sql" 2>&1
+    } 2>&1
+}
+
+strip_sqlite_preamble_output() {
+    local output=$1
+    if [[ "$output" == *"$SQLITE_DB_CONFIG_MARKER"* ]]; then
+        output="${output#*"$SQLITE_DB_CONFIG_MARKER"}"
+        output="${output#$'\n'}"
+    fi
+
+    printf '%s' "$output"
 }
 
 log_query_outputs() {
@@ -178,6 +194,7 @@ run_queries() {
             clear_caches
             sqlite_output=$(run_query_with_sqlite "$query_file")
             sqlite_non_time_lines=$(echo "$sqlite_output" | grep -v -e "^real" -e "^user" -e "^sys")
+            sqlite_non_time_lines=$(strip_sqlite_preamble_output "$sqlite_non_time_lines")
             sqlite_real_time=$(echo "$sqlite_output" | grep "^real" | awk '{print $2}')
         fi
 

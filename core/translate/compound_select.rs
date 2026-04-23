@@ -6,6 +6,7 @@ use crate::translate::expr::translate_expr;
 use crate::translate::order_by::{custom_type_comparator, sorter_insert};
 use crate::translate::plan::{Plan, QueryDestination, SelectPlan};
 use crate::translate::result_row::emit_columns_to_destination;
+use crate::translate::subquery::ensure_outer_query_ref_cursors_allocated;
 use crate::vdbe::builder::{CursorType, ProgramBuilder};
 use crate::vdbe::insn::Insn;
 use crate::{emit_explain, LimboError};
@@ -304,6 +305,7 @@ fn emit_compound_select(
                     right_most_ctx.reg_offset = offset_reg;
                 }
 
+                ensure_outer_query_ref_cursors_allocated(program, &right_most.table_references)?;
                 emit_explain!(program, true, "UNION ALL".to_owned());
                 emit_query(program, &mut right_most, &mut right_most_ctx)?;
                 program.pop_current_parent_explain();
@@ -350,6 +352,7 @@ fn emit_compound_select(
                     is_delete: false,
                 };
 
+                ensure_outer_query_ref_cursors_allocated(program, &right_most.table_references)?;
                 emit_explain!(program, true, "UNION USING TEMP B-TREE".to_owned());
                 emit_query(program, &mut right_most, &mut right_most_ctx)?;
                 program.pop_current_parent_explain();
@@ -406,6 +409,7 @@ fn emit_compound_select(
                     query_destination,
                 )?;
 
+                ensure_outer_query_ref_cursors_allocated(program, &right_most.table_references)?;
                 emit_explain!(program, true, "INTERSECT USING TEMP B-TREE".to_owned());
                 emit_query(program, &mut right_most, &mut right_most_ctx)?;
                 program.pop_current_parent_explain();
@@ -459,6 +463,7 @@ fn emit_compound_select(
                     affinity_str: None,
                     is_delete: true,
                 };
+                ensure_outer_query_ref_cursors_allocated(program, &right_most.table_references)?;
                 emit_explain!(program, true, "EXCEPT USING TEMP B-TREE".to_owned());
                 emit_query(program, &mut right_most, &mut right_most_ctx)?;
                 program.pop_current_parent_explain();
@@ -484,6 +489,7 @@ fn emit_compound_select(
                 right_most.offset = offset;
                 right_most_ctx.reg_offset = offset_reg;
             }
+            ensure_outer_query_ref_cursors_allocated(program, &right_most.table_references)?;
             emit_explain!(program, true, "LEFT-MOST SUBQUERY".to_owned());
             emit_query(program, &mut right_most, &mut right_most_ctx)?;
             program.pop_current_parent_explain();

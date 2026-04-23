@@ -588,8 +588,8 @@ expect {
     South|Alice|150
 }
 
-# Correlated outer reference in GROUP BY inside an IN-subquery should fail.
-# SQLite errors with "no such column: t2.d".
+# SQLite 3.53 allows a correlated outer reference in GROUP BY inside this
+# IN-subquery and returns the outer row.
 @cross-check-integrity
 test subquery-correlated-outer-ref-in-group-by-in-subquery {
     create table t1(b, c);
@@ -601,12 +601,12 @@ test subquery-correlated-outer-ref-in-group-by-in-subquery {
       select t1.c from t1 as x group by t2.d having sum(x.b) > 100
     ) order by 1;
 }
-expect error {
-    no such column: t2\.d
+expect {
+    2
 }
 
-# Correlated outer reference wrapped in a scalar function in GROUP BY
-# should also be rejected.
+# SQLite 3.53 also allows the same pattern when the GROUP BY term is wrapped
+# in a scalar function.
 @cross-check-integrity
 test subquery-correlated-outer-ref-in-group-by-function-call {
     create table t1(b, c);
@@ -620,12 +620,11 @@ test subquery-correlated-outer-ref-in-group-by-function-call {
       group by abs(t2.d)
     );
 }
-expect error {
-    no such column: t2\.d
+expect {
+    2
 }
 
-# Correlated outer rowid aliases in GROUP BY are invalid.
-# SQLite reports the original alias token; Turso canonicalizes to rowid.
+# SQLite 3.53 accepts correlated outer rowid aliases in GROUP BY as well.
 @cross-check-integrity
 test subquery-correlated-outer-ref-in-group-by-rowid-alias-oid {
     create table t1(b, c);
@@ -639,8 +638,8 @@ test subquery-correlated-outer-ref-in-group-by-rowid-alias-oid {
       group by t2.oid
     );
 }
-expect error {
-    no such column: t2\.(oid|rowid)
+expect {
+    2
 }
 
 @cross-check-integrity
@@ -656,12 +655,12 @@ test subquery-correlated-outer-ref-in-group-by-rowid-alias-underscore {
       group by t2._rowid_
     );
 }
-expect error {
-    no such column: t2\.(_rowid_|rowid)
+expect {
+    2
 }
 
-# Correlated outer reference hidden in a nested scalar subquery in GROUP BY
-# should also fail with the same SQLite error.
+# SQLite 3.53 still allows the correlated outer reference when it is wrapped
+# in a nested scalar subquery inside GROUP BY.
 @cross-check-integrity
 test subquery-correlated-outer-ref-in-nested-group-by-subquery {
     create table t1(b, c);
@@ -675,8 +674,70 @@ test subquery-correlated-outer-ref-in-nested-group-by-subquery {
       group by (select t2.d)
     );
 }
-expect error {
-    no such column: t2\.d
+expect {
+    2
+}
+
+@cross-check-integrity
+test subquery-correlated-outer-ref-in-group-by-from-subquery {
+    create table t1(x);
+    insert into t1 values(1), (2);
+    create table t2(d);
+    insert into t2 values(10), (20);
+
+    select d
+      from t2
+     where exists (
+           select 1
+             from (select count(*) from t1 group by t2.d)
+     )
+     order by d;
+}
+expect {
+    10
+    20
+}
+
+@cross-check-integrity
+test subquery-correlated-outer-ref-in-group-by-from-subquery-scalar {
+    create table t1(x);
+    insert into t1 values(1), (2);
+    create table t2(d);
+    insert into t2 values(10), (20);
+
+    select d,
+           (select count(*)
+              from (select count(*) from t1 group by t2.d))
+      from t2
+     order by d;
+}
+expect {
+    10|1
+    20|1
+}
+
+@cross-check-integrity
+test subquery-correlated-outer-ref-in-group-by-from-compound-subquery-exists {
+    create table t1(x);
+    insert into t1 values(1), (2);
+    create table t2(d);
+    insert into t2 values(10), (20);
+
+    select d
+      from t2
+     where exists (
+           select 1
+             from (
+                   select count(*) from t1 group by t2.d
+                   union all
+                   select count(*) from t1 group by t2.d
+             )
+     )
+     order by d;
+}
+expect {
+    10
+    20
 }
 
 # Uncorrelated IN-subquery in ORDER BY clause

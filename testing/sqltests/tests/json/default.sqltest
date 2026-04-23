@@ -901,44 +901,39 @@ expect {
     1
 }
 
-# Overflows 2**32 is equivalent to 0
-test json_extract_overflow_int32_1 {
+# Oversized positive array index saturates out of range and returns NULL.
+test json_extract_saturating_overflow_positive_int32_1 {
     SELECT json_extract('[1,2,3]', '$[4294967296]')
 }
 expect {
-    1
 }
 
-# Overflows 2**32 + 1 is equivalent to 1
-test json_extract_overflow_int32_2 {
+# Larger oversized positive array index also saturates out of range and returns NULL.
+test json_extract_saturating_overflow_positive_int32_2 {
     SELECT json_extract('[1,2,3]', '$[4294967297]')
 }
 expect {
-    2
 }
 
-# Overflows -2**32 - 1 is equivalent to -1
-test json_extract_overflow_int32_3 {
+# Oversized negative-from-end array index saturates out of range and returns NULL.
+test json_extract_saturating_overflow_negative_int32_1 {
     SELECT json_extract('[1,2,3]', '$[#-4294967297]')
 }
 expect {
-    3
 }
 
-# Overflows -2**32 - 2 is equivalent to -2
-test json_extract_overflow_int32_3-2 {
+# Larger oversized negative-from-end array index also saturates out of range and returns NULL.
+test json_extract_saturating_overflow_negative_int32_2 {
     SELECT json_extract('[1,2,3]', '$[#-4294967298]')
 }
 expect {
-    2
 }
 
-# pow(2,63) + 1 == 9223372036854775808
-test json_extract_overflow_int64 {
+# Oversized 64-bit array index saturates out of range and returns NULL.
+test json_extract_saturating_overflow_positive_int64 {
     SELECT json_extract('[1,2,3]', '$[9223372036854775808]');
 }
 expect {
-    1
 }
 
 # TODO: fix me - this passes on SQLite and needs to be fixed in Limbo.
@@ -1700,6 +1695,64 @@ expect {
     [123,456]
 }
 
+test json_set_append_hash_empty_array {
+    SELECT json_set('[]', '$[#]', 'x');
+}
+expect {
+    ["x"]
+}
+
+test json_set_append_hash_existing_array {
+    SELECT json_set('[1,2,3]', '$[#]', 'x');
+}
+expect {
+    [1,2,3,"x"]
+}
+
+test json_set_append_hash_nested_array {
+    SELECT json_set('[1,[2,3],4]', '$[1][#]', 'AAA');
+}
+expect {
+    [1,[2,3,"AAA"],4]
+}
+
+test json_set_append_hash_multi_pair_relookup {
+    SELECT
+      json_set('[]', '$[#]', 0, '$[#]', 1),
+      json_extract(json_set('[]', '$[#]', 0, '$[#]', 1), '$[0]'),
+      json_extract(json_set('[]', '$[#]', 0, '$[#]', 1), '$[1]');
+}
+expect {
+    [0,1]|0|1
+}
+
+test jsonb_set_append_hash_boundary_extract {
+    SELECT json_extract(
+      jsonb_set(jsonb('{"a":[0,0,0,0,0,true]}'), '$.a[#]', 1),
+      '$.a[6]'
+    );
+}
+expect {
+    1
+}
+
+test jsonb_set_append_hash_boundary_hex {
+    SELECT hex(jsonb_set(jsonb('{"a":[0,0,0,0,0,true]}'), '$.a[#]', 1));
+}
+expect {
+    CC111761CB0D13301330133013301330011331
+}
+
+test jsonb_set_append_hash_nested_boundary_extract {
+    SELECT json_extract(
+      jsonb_set(jsonb('{"o":{"a":[0,0,0,0,0,true]}}'), '$.o.a[#]', 1),
+      '$.o.a[6]'
+    );
+}
+expect {
+    1
+}
+
 test json_set_add_value_to_array_out_of_bounds {
     SELECT json_set('[123]', '$[200]', 456);
 }
@@ -1712,6 +1765,13 @@ test json_set_replace_value_in_array {
 }
 expect {
     [456]
+}
+
+test json_set_replace_value_in_array_header_shrink {
+    SELECT json_set('{"a":[0,0,0,0,0,1]}', '$.a[5]', json('null'));
+}
+expect {
+    {"a":[0,0,0,0,0,null]}
 }
 
 test json_set_null_path {
@@ -1811,6 +1871,93 @@ test json_insert_array_append {
 }
 expect {
     [1,2,3,4]
+}
+
+test json_insert_array_append_hash {
+    SELECT json_insert('[]', '$[#]', 'x');
+}
+expect {
+    ["x"]
+}
+
+test json_insert_array_append_hash_existing {
+    SELECT json_insert('["a","b"]', '$[#]', 'x');
+}
+expect {
+    ["a","b","x"]
+}
+
+test json_insert_array_append_hash_jsonb_input {
+    SELECT json_insert(jsonb('[]'), '$[#]', 'x');
+}
+expect {
+    ["x"]
+}
+
+test json_insert_array_append_hash_integer {
+    SELECT json_insert('[]', '$[#]', 42);
+}
+expect {
+    [42]
+}
+
+test json_insert_array_append_hash_typeof {
+    SELECT typeof(json_insert('[]', '$[#]', 'x'));
+}
+expect {
+    text
+}
+
+test json_insert_array_append_hash_nested_array {
+    SELECT json_insert('[1,[2,3],4]', '$[1][#]', 'AAA');
+}
+expect {
+    [1,[2,3,"AAA"],4]
+}
+
+test json_insert_array_append_hash_existing_object_array {
+    SELECT json_insert('{"a":[1,2]}', '$.a[#]', 'x');
+}
+expect {
+    {"a":[1,2,"x"]}
+}
+
+test json_insert_array_append_index_existing_object_array {
+    SELECT json_insert('{"a":[1,2]}', '$.a[2]', 'x');
+}
+expect {
+    {"a":[1,2,"x"]}
+}
+
+test json_insert_array_hash_negative_does_not_replace {
+    SELECT json_insert('[1,2,3]', '$[#-1]', 'x');
+}
+expect {
+    [1,2,3]
+}
+
+test json_insert_array_append_hash_multi_pair_relookup {
+    SELECT
+      json_insert('[]', '$[#]', 0, '$[#]', 1),
+      json_extract(json_insert('[]', '$[#]', 0, '$[#]', 1), '$[0]'),
+      json_extract(json_insert('[]', '$[#]', 0, '$[#]', 1), '$[1]');
+}
+expect {
+    [0,1]|0|1
+}
+
+test json_replace_array_append_hash_noop {
+    SELECT json_replace('[1,2,3]', '$[#]', 'x');
+}
+expect {
+    [1,2,3]
+}
+
+test json_replace_value_in_array_header_shrink {
+    SELECT json_replace('{"a":[0,0,0,0,0,1]}', '$.a[5]', json('null'));
+}
+expect {
+    {"a":[0,0,0,0,0,null]}
 }
 
 test json_insert_array_existing_not_replaced {
@@ -2283,6 +2430,13 @@ test json_remove_root {
     SELECT json_remove('{"a": 1}', '$')
 }
 expect {
+}
+
+test jsonb_remove_nested_array_header_shrink {
+    SELECT json(jsonb_remove(jsonb('[["abcdefghijk"]]'), '$[0][0]'));
+}
+expect {
+    [[]]
 }
 
 test jsonb_remove_root {

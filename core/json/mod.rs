@@ -160,7 +160,7 @@ pub fn convert_ref_dbtype_to_jsonb(val: ValueRef<'_>, strict: Conv) -> crate::Re
                         let total_expected = match header_offset.checked_add(payload_size) {
                             Some(t) => t,
                             None => {
-                                return Err(LimboError::ParseError("malformed JSON".to_string()))
+                                return Err(LimboError::ParseError("malformed JSON".to_string()));
                             }
                         };
 
@@ -187,7 +187,7 @@ pub fn convert_ref_dbtype_to_jsonb(val: ValueRef<'_>, strict: Conv) -> crate::Re
             Ok(json)
         }
         ValueRef::Null => Ok(Jsonb::from_raw_data(
-            JsonbHeader::make_null().into_bytes().as_bytes(),
+            JsonbHeader::make_null().into_bytes()?.as_bytes(),
         )),
         ValueRef::Numeric(Numeric::Float(float)) => {
             let float: f64 = float.into();
@@ -527,7 +527,7 @@ where
     V: AsValueRef,
     E: ExactSizeIterator<Item = V>,
 {
-    let null = Jsonb::from_raw_data(JsonbHeader::make_null().into_bytes().as_bytes());
+    let null = Jsonb::from_raw_data(JsonbHeader::make_null().into_bytes()?.as_bytes());
     if paths.len() == 1 {
         let first_path = paths.next().ok_or_else(|| {
             crate::LimboError::InternalError("paths should have one element".to_string())
@@ -565,7 +565,7 @@ where
             if res.is_ok() {
                 result.append_to_array_unsafe(&extracted.data());
             } else {
-                result.append_to_array_unsafe(JsonbHeader::make_null().into_bytes().as_bytes());
+                result.append_to_array_unsafe(JsonbHeader::make_null().into_bytes()?.as_bytes());
             }
         } else {
             return Ok((null, ElementType::NULL));
@@ -709,7 +709,9 @@ fn json_path_from_db_value<'a>(
             ValueRef::Numeric(Numeric::Integer(i)) => JsonPath {
                 elements: vec![
                     PathElement::Root(),
-                    PathElement::ArrayLocator(Some(i as i32)),
+                    PathElement::ArrayLocator(Some(
+                        i.clamp(i32::MIN as i64, i32::MAX as i64) as i32
+                    )),
                 ],
             },
             ValueRef::Numeric(Numeric::Float(f)) => JsonPath {
@@ -1262,6 +1264,7 @@ mod tests {
             _ => panic!("Expected null result, got: {result:?}"),
         }
     }
+
     #[test]
     fn test_json_extract_null_path() {
         let json_cache = JsonCacheCell::new();
@@ -1742,6 +1745,98 @@ mod tests {
         assert!(result.is_ok());
 
         assert_eq!(result.unwrap().to_text().unwrap(), "[123,456]");
+    }
+
+    #[test]
+    fn test_json_set_append_to_three_level_nested_array() {
+        let json_cache = JsonCacheCell::new();
+        let result = json_set(
+            &[
+                Value::build_text("[[[1]]]"),
+                Value::build_text("$[0][0][#]"),
+                Value::from_i64(99),
+            ],
+            &json_cache,
+        );
+
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap().to_text().unwrap(), "[[[1,99]]]");
+    }
+
+    #[test]
+    fn test_json_set_append_to_three_level_nested_array_with_prefix_values() {
+        let json_cache = JsonCacheCell::new();
+        let result = json_set(
+            &[
+                Value::build_text("[1,[2,[3]]]"),
+                Value::build_text("$[1][1][#]"),
+                Value::from_i64(99),
+            ],
+            &json_cache,
+        );
+
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap().to_text().unwrap(), "[1,[2,[3,99]]]");
+    }
+
+    #[test]
+    fn test_json_insert_append_to_three_level_nested_array() {
+        let json_cache = JsonCacheCell::new();
+        let result = json_insert(
+            &[
+                Value::build_text("[[[1]]]"),
+                Value::build_text("$[0][0][#]"),
+                Value::from_i64(99),
+            ],
+            &json_cache,
+        );
+
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap().to_text().unwrap(), "[[[1,99]]]");
+    }
+
+    #[test]
+    fn test_json_extract_negative_zero_array_locator_returns_null() {
+        let json_cache = JsonCacheCell::new();
+        let result = json_extract(
+            Value::build_text("[1,2,3]"),
+            &[Value::build_text("$[#-0]")],
+            &json_cache,
+        )
+        .unwrap();
+        assert_eq!(result, Value::Null);
+    }
+
+    #[test]
+    fn test_json_set_negative_zero_array_locator_appends() {
+        let json_cache = JsonCacheCell::new();
+        let result = json_set(
+            &[
+                Value::build_text("[1,2,3]"),
+                Value::build_text("$[#-0]"),
+                Value::from_i64(9),
+            ],
+            &json_cache,
+        );
+
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap().to_text().unwrap(), "[1,2,3,9]");
+    }
+
+    #[test]
+    fn test_json_insert_negative_zero_array_locator_appends() {
+        let json_cache = JsonCacheCell::new();
+        let result = json_insert(
+            &[
+                Value::build_text("[1,2,3]"),
+                Value::build_text("$[#-0]"),
+                Value::from_i64(9),
+            ],
+            &json_cache,
+        );
+
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap().to_text().unwrap(), "[1,2,3,9]");
     }
 
     #[test]

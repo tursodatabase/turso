@@ -34,6 +34,27 @@ mod fuzz_tests {
 
     use super::grammar_generator::SymbolHandle;
 
+    fn sqlite_set_fp_digits(conn: &rusqlite::Connection, digits: i32) {
+        let mut applied = 0;
+        let rc = unsafe {
+            rusqlite::ffi::sqlite3_db_config(
+                conn.handle(),
+                rusqlite::ffi::SQLITE_DBCONFIG_FP_DIGITS,
+                digits,
+                &mut applied,
+            )
+        };
+        assert_eq!(
+            rc,
+            rusqlite::ffi::SQLITE_OK,
+            "sqlite3_db_config(SQLITE_DBCONFIG_FP_DIGITS, {digits}) failed with rc={rc}"
+        );
+        assert_eq!(
+            applied, digits,
+            "sqlite3_db_config(SQLITE_DBCONFIG_FP_DIGITS) applied unexpected value {applied}"
+        );
+    }
+
     #[turso_macros::test(mvcc)]
     pub fn arithmetic_expression_fuzz_ex1(db: TempDatabase) {
         let limbo_conn = db.connect_limbo();
@@ -7738,6 +7759,7 @@ mod fuzz_tests {
             let turso_db = TempDatabase::builder().with_db_path(turso_path).build();
             let turso_conn = turso_db.connect_limbo();
             let sqlite_conn = rusqlite::Connection::open(sqlite_path).unwrap();
+            sqlite_set_fp_digits(&sqlite_conn, 15);
             for _ in 0..INNER {
                 let action = pick_action(&mut rng, &state);
                 match action {
