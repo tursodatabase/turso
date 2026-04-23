@@ -44,12 +44,12 @@ pub fn emit_program_for_delete(
     program: &mut ProgramBuilder,
     mut plan: DeletePlan,
 ) -> Result<()> {
-    let mut t_ctx = TranslateCtx::new(
+    let mut t_ctx = Box::new(TranslateCtx::new(
         program,
         resolver.fork(),
         plan.table_references.joined_tables().len(),
         connection.db.opts.unsafe_testing,
-    );
+    ));
 
     let after_main_loop_label = program.allocate_label();
     t_ctx.label_main_loop_end = Some(after_main_loop_label);

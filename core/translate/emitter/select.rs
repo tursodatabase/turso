@@ -56,12 +56,13 @@ fn emit_program_for_select_with_inputs(
     materialized_build_inputs: HashMap<usize, MaterializedBuildInput>,
 ) -> Result<()> {
     let result_cols_start = program.with_scoped_result_cols_start(|program| {
-        let mut t_ctx = TranslateCtx::new(
+        // Boxed to keep ~960 B off the prepare-path stack; see TranslateCtx size.
+        let mut t_ctx = Box::new(TranslateCtx::new(
             program,
             resolver.fork_with_expr_cache(),
             plan.table_references.joined_tables().len(),
             false,
-        );
+        ));
         t_ctx.materialized_build_inputs = materialized_build_inputs;
         emit_query(program, &mut plan, &mut t_ctx)
     })?;
