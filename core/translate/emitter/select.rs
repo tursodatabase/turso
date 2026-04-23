@@ -56,12 +56,13 @@ fn emit_program_for_select_with_inputs(
     materialized_build_inputs: HashMap<usize, MaterializedBuildInput>,
 ) -> Result<()> {
     let result_cols_start = program.with_scoped_result_cols_start(|program| {
-        let mut t_ctx = TranslateCtx::new(
+        // Boxed to keep ~960 B off the prepare-path stack; see TranslateCtx size.
+        let mut t_ctx = Box::new(TranslateCtx::new(
             program,
             resolver.fork_with_expr_cache(),
             plan.table_references.joined_tables().len(),
             false,
-        );
+        ));
         t_ctx.materialized_build_inputs = materialized_build_inputs;
         emit_query(program, &mut plan, &mut t_ctx)
     })?;
@@ -80,6 +81,13 @@ pub fn emit_query<'a>(
 ) -> Result<usize> {
     let after_main_loop_label = program.allocate_label();
     t_ctx.label_main_loop_end = Some(after_main_loop_label);
+
+    // Register parameters from EXISTS subquery result columns that were dropped
+    // during semi/anti-join unnesting. No code is emitted for these, but the
+    // parameter slots must exist for bind-time validation to succeed.
+    for variable in &plan.phantom_params {
+        program.register_variable(variable);
+    }
 
     // Evaluate uncorrelated subqueries as early as possible, because even LIMIT can reference a subquery.
     // This must happen before VALUES emission since VALUES expressions may contain scalar subqueries.
@@ -974,6 +982,7 @@ fn build_materialized_build_input_plan(
         input_cardinality_hint: None,
         estimated_output_rows: None,
         simple_aggregate: None,
+        phantom_params: vec![],
     };
 
     prune_join_order_for_materialized_inputs(&mut materialize_plan, materialized_build_inputs)?;

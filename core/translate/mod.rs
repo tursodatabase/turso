@@ -86,12 +86,13 @@ pub fn translate(
             | ast::Stmt::Update { .. }
     );
 
-    let mut program = ProgramBuilder::new(
+    // Boxed so the ~800 B builder sits on the heap instead of the prepare frame.
+    let mut program = Box::new(ProgramBuilder::new(
         query_mode,
         connection.get_capture_data_changes_info().clone(),
         // These options will be extended whithin each translate program
         ProgramBuilderOpts::new(1, 32, 2),
-    );
+    ));
 
     program.prologue();
     let mut resolver = Resolver::new(

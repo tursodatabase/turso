@@ -427,7 +427,11 @@ impl PragmaVirtualTableCursor {
             sql.push_str(&format!("=\"{arg}\""));
         }
 
-        self.stmt = Some(self.conn.prepare(sql)?);
+        // Table-valued pragma helpers execute inside the parent statement's VM step.
+        // For example, UPDATE ... FROM pragma_table_info('dst') runs this helper while the
+        // outer UPDATE still has an active MVCC transaction and write cursor open on `dst`.
+        // The helper must stay nested so it does not disturb the parent's transaction state.
+        self.stmt = Some(self.conn.prepare_internal(sql)?);
 
         self.next()
     }

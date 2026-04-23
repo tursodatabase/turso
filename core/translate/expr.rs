@@ -597,9 +597,9 @@ pub fn translate_condition_expr(
             emit_cond_jump(program, condition_metadata, between_result_reg);
         }
         ast::Expr::Variable(_) => {
-            crate::bail_parse_error!(
-                "Variable as a direct predicate in WHERE clause is not supported"
-            );
+            let reg = program.alloc_register();
+            translate_expr(program, Some(referenced_tables), expr, reg, resolver)?;
+            emit_cond_jump(program, condition_metadata, reg);
         }
         ast::Expr::Name(_) => {
             crate::bail_parse_error!("Name as a direct predicate in WHERE clause is not supported");
@@ -3035,21 +3035,13 @@ pub fn translate_expr(
                         )
                     }
                     Some(SelfTableContext::ForDML(dml_ctx)) => {
-                        if let Some((resolved, affinity)) = dml_ctx.virtual_column_info(*column) {
-                            translate_expr(program, None, resolved, target_register, resolver)?;
-                            if affinity != Affinity::Blob {
-                                program.emit_column_affinity(target_register, affinity);
-                            }
-                            Ok(target_register)
-                        } else {
-                            let src_reg = dml_ctx.to_column_reg(*column);
-                            program.emit_insn(Insn::Copy {
-                                src_reg,
-                                dst_reg: target_register,
-                                extra_amount: 0,
-                            });
-                            Ok(target_register)
-                        }
+                        let src_reg = dml_ctx.to_column_reg(*column);
+                        program.emit_insn(Insn::Copy {
+                            src_reg,
+                            dst_reg: target_register,
+                            extra_amount: 0,
+                        });
+                        Ok(target_register)
                     }
                     None => {
                         // This error means that a program.with_self_table_context() was missing
@@ -3813,15 +3805,7 @@ pub fn translate_expr(
             }
         },
         ast::Expr::Variable(variable) => {
-            let index = usize::try_from(variable.index.get())
-                .expect("u32 variable index must fit into usize")
-                .try_into()
-                .expect("variable index must be non-zero");
-            if let Some(name) = variable.name.as_deref() {
-                program.parameters.push_named_at(name, index);
-            } else {
-                program.parameters.push_index(index);
-            }
+            let index = program.register_variable(variable);
             program.emit_insn(Insn::Variable {
                 index,
                 dest: target_register,
@@ -5766,18 +5750,19 @@ pub fn bind_and_rewrite_expr<'a>(
                                     .is_some_and(|name| name.eq_ignore_ascii_case(&normalized_id))
                             });
                             if col_idx.is_some() {
+                                let col_idx = col_idx.unwrap();
+                                if outer_ref.using_dedup_hidden_cols.get(col_idx) {
+                                    continue;
+                                }
                                 if match_result.is_some() {
                                     crate::bail_parse_error!(
                                         "ambiguous column name: {}",
                                         id.as_str()
                                     );
                                 }
-                                let col = outer_ref.table.columns().get(col_idx.unwrap()).unwrap();
-                                match_result = Some((
-                                    outer_ref.internal_id,
-                                    col_idx.unwrap(),
-                                    col.is_rowid_alias(),
-                                ));
+                                let col = outer_ref.table.columns().get(col_idx).unwrap();
+                                match_result =
+                                    Some((outer_ref.internal_id, col_idx, col.is_rowid_alias()));
                                 matched_scope_depth = Some(outer_ref.scope_depth);
                             }
                         }

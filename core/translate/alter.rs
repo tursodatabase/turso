@@ -16,7 +16,7 @@ use crate::{
     translate::{
         emitter::{emit_check_constraints, gencol::compute_virtual_columns, Resolver},
         expr::{translate_expr, walk_expr, walk_expr_mut, WalkControl},
-        plan::{ColumnUsedMask, OuterQueryReference, TableReferences},
+        plan::{ColumnMask, ColumnUsedMask, OuterQueryReference, TableReferences},
         trigger::create_trigger_to_sql,
     },
     util::{
@@ -467,7 +467,12 @@ fn emit_add_virtual_column_validation(
 
     let dml_ctx =
         DmlColumnContext::layout(resolved_table.columns(), base_dest_reg, rowid_reg, layout);
-    compute_virtual_columns(program, resolved_table.columns().iter(), &dml_ctx, resolver)?;
+    compute_virtual_columns(
+        program,
+        &resolved_table.columns_topo_sort()?,
+        &dml_ctx,
+        resolver,
+    )?;
     let result_reg = dml_ctx.to_column_reg(new_column_idx);
 
     if !check_constraints.is_empty() {
@@ -780,6 +785,7 @@ pub fn translate_alter_table(
                             identifier: table_name.to_string(),
                             internal_id: TableInternalId::from(0),
                             table: Table::BTree(Arc::new(btree.clone())),
+                            using_dedup_hidden_cols: ColumnMask::default(),
                             col_used_mask: ColumnUsedMask::default(),
                             cte_select: None,
                             cte_explicit_columns: vec![],

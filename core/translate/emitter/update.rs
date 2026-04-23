@@ -71,12 +71,12 @@ pub fn emit_program_for_update(
         .flags
         .set_has_statement_conflict(plan.or_conflict.is_some());
 
-    let mut t_ctx = TranslateCtx::new(
+    let mut t_ctx = Box::new(TranslateCtx::new(
         program,
         resolver.fork(),
         plan.table_references.joined_tables().len(),
         connection.db.opts.unsafe_testing,
-    );
+    ));
 
     let after_main_loop_label = program.allocate_label();
     t_ctx.label_main_loop_end = Some(after_main_loop_label);
@@ -1145,8 +1145,16 @@ fn emit_update_insns<'a>(
 
             // Compute virtual columns for NEW values
             //TODO only emit required virtual columns
-            let new_ctx = DmlColumnContext::layout(columns, start, new_rowid_reg, layout.clone());
-            compute_virtual_columns(program, columns.iter(), &new_ctx, &t_ctx.resolver)?;
+            if let Table::BTree(ref btree) = target_table.table {
+                let new_ctx =
+                    DmlColumnContext::layout(columns, start, new_rowid_reg, layout.clone());
+                compute_virtual_columns(
+                    program,
+                    &btree.columns_topo_sort()?,
+                    &new_ctx,
+                    &t_ctx.resolver,
+                )?;
+            }
 
             let new_registers = (0..col_len)
                 .map(|i| layout.to_register(start, i))
@@ -1361,22 +1369,27 @@ fn emit_update_insns<'a>(
     };
     let update_affects_virtual_columns = affected_columns.count() > set_clause_cols.count();
     let has_returning = returning.as_ref().is_some_and(|r| !r.is_empty());
-    let has_check_constraints = target_table
-        .table
-        .btree()
-        .is_some_and(|bt| !bt.check_constraints.is_empty());
-    if update_affects_virtual_columns
-        || has_before_triggers
-        || has_after_triggers
-        || has_returning
-        || has_check_constraints
-    {
-        let columns = target_table.table.columns();
-        let rowid_reg = rowid_set_clause_reg.unwrap_or(beg);
+    if let Table::BTree(ref btree) = target_table.table {
+        let has_check_constraints = !btree.check_constraints.is_empty();
 
-        //TODO don't emit all virtual columns
-        let dml_ctx = DmlColumnContext::layout(columns, start, rowid_reg, layout.clone());
-        compute_virtual_columns(program, columns.iter(), &dml_ctx, &t_ctx.resolver)?;
+        if update_affects_virtual_columns
+            || has_before_triggers
+            || has_after_triggers
+            || has_returning
+            || has_check_constraints
+        {
+            let columns = target_table.table.columns();
+            let rowid_reg = rowid_set_clause_reg.unwrap_or(beg);
+
+            //TODO don't emit all virtual columns
+            let dml_ctx = DmlColumnContext::layout(columns, start, rowid_reg, layout.clone());
+            compute_virtual_columns(
+                program,
+                &btree.columns_topo_sort()?,
+                &dml_ctx,
+                &t_ctx.resolver,
+            )?;
+        }
     }
 
     let target_is_strict = target_table
@@ -2278,7 +2291,12 @@ fn emit_update_insns<'a>(
                     // Compute VIRTUAL columns for NEW values
                     //TODO only emit required virtual columns
                     let new_ctx = DmlColumnContext::layout(columns, start, beg, layout.clone());
-                    compute_virtual_columns(program, columns.iter(), &new_ctx, &t_ctx.resolver)?;
+                    compute_virtual_columns(
+                        program,
+                        &btree_table.columns_topo_sort()?,
+                        &new_ctx,
+                        &t_ctx.resolver,
+                    )?;
 
                     // Compute VIRTUAL columns for OLD values if we have preserved OLD registers
                     if let Some(ref old_regs) = preserved_old_registers {
@@ -2287,7 +2305,7 @@ fn emit_update_insns<'a>(
                         let old_ctx = DmlColumnContext::from_column_reg_mapping(pairs);
                         compute_virtual_columns(
                             program,
-                            columns.iter(),
+                            &btree_table.columns_topo_sort()?,
                             &old_ctx,
                             &t_ctx.resolver,
                         )?;

@@ -153,7 +153,7 @@ pub fn prepare_select_plan(
 ) -> Result<Plan> {
     let compounds = select.body.compounds;
     match compounds.is_empty() {
-        true => Ok(Plan::Select(prepare_one_select_plan(
+        true => Ok(Plan::Select(Box::new(prepare_one_select_plan(
             select.body.select,
             resolver,
             program,
@@ -163,7 +163,7 @@ pub fn prepare_select_plan(
             outer_query_refs,
             query_destination,
             connection,
-        )?)),
+        )?))),
         false => {
             // For compound SELECTs, the WITH clause applies to all parts.
             // We clone the WITH clause for each SELECT in the compound so that
@@ -237,7 +237,7 @@ pub fn prepare_select_plan(
 
             Ok(Plan::CompoundSelect {
                 left,
-                right_most: last,
+                right_most: Box::new(last),
                 limit,
                 offset,
                 order_by,
@@ -358,6 +358,7 @@ fn prepare_one_select_plan(
                 input_cardinality_hint: None,
                 estimated_output_rows: None,
                 simple_aggregate: None,
+                phantom_params: vec![],
             };
 
             let mut windows = Vec::with_capacity(window_clause.len());
@@ -788,6 +789,7 @@ fn prepare_one_select_plan(
                 input_cardinality_hint: None,
                 estimated_output_rows: None,
                 simple_aggregate: None,
+                phantom_params: vec![],
             };
 
             validate_expr_correct_column_counts(&plan)?;

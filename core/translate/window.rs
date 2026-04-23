@@ -229,6 +229,7 @@ fn prepare_window_subquery(
         input_cardinality_hint: None,
         estimated_output_rows: None,
         simple_aggregate: None,
+        phantom_params: vec![],
     };
 
     prepare_window_subquery(

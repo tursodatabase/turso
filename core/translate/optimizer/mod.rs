@@ -568,6 +568,7 @@ fn detect_simple_aggregate(plan: &SelectPlan) -> Option<SimpleAggregate> {
         || plan.result_columns.len() != 1
         || plan.group_by.is_some()
         || plan.contains_constant_false_condition
+        || plan.aggregates.first().unwrap().filter_expr.is_some()
     {
         return None;
     }
@@ -993,6 +994,7 @@ fn add_ephemeral_table_to_update_plan(
                 identifier: table.identifier.clone(),
                 internal_id: table.internal_id,
                 table: table.table.clone(),
+                using_dedup_hidden_cols: ColumnMask::default(),
                 col_used_mask: table.col_used_mask.clone(),
                 cte_select: None,
                 cte_explicit_columns: vec![],
@@ -1077,6 +1079,7 @@ fn add_ephemeral_table_to_update_plan(
             ephemeral_subs
         },
         simple_aggregate: None,
+        phantom_params: vec![],
     };
 
     plan.ephemeral_plan = Some(ephemeral_plan);

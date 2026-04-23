@@ -323,6 +323,10 @@ pub(crate) type MvStore = mvcc::MvStore<mvcc::MvccClock>;
 
 pub(crate) type MvCursor = mvcc::cursor::MvccLazyCursor<mvcc::MvccClock>;
 
+/// Returns true for in memory databases (i.e. databases backed by MemoryIO)
+///
+/// Turso treats every path with the `:memory:` prefix as a named
+/// in-memory database.
 fn is_memory_like(path: &str) -> bool {
     path.starts_with(":memory:") || path.starts_with("file::memory:") || path.is_empty()
 }
@@ -540,6 +544,11 @@ impl fmt::Debug for Database {
 }
 
 impl Database {
+    /// Returns true if this database is backed by MemoryIO.
+    pub fn is_in_memory_db(&self) -> bool {
+        is_memory_like(&self.path)
+    }
+
     fn new(
         opts: DatabaseOpts,
         flags: OpenFlags,
@@ -783,7 +792,7 @@ impl Database {
         path: &str,
         encryption_opts: &Option<EncryptionOpts>,
     ) -> Result<Option<Arc<Database>>> {
-        if path.starts_with(":memory:") {
+        if is_memory_like(path) {
             return Ok(None);
         }
         let file_id = match io::get_file_id(path) {
@@ -970,9 +979,9 @@ impl Database {
     ) -> Result<IOResult<Arc<Database>>> {
         // turso-sync-engine creates 2 databases with different names in the same IO if MemoryIO is used
         // in this case we need to bypass registry (as this is MemoryIO DB) but also preserve original distinction in names (e.g. :memory:-draft and :memory:-synced)
-        // so, we bypass registry for all db paths which starts with ":memory:"
+        // so, we bypass registry for all in memory dbs (i.e. db paths which starts with ":memory:")
 
-        if matches!(state.phase, OpenDbAsyncPhase::Init) && !path.starts_with(":memory:") {
+        if matches!(state.phase, OpenDbAsyncPhase::Init) && !is_memory_like(path) {
             // Briefly lock the registry to check/reserve — never hold across I/O yields.
             let mut registry = DATABASE_MANAGER.lock();
 
@@ -2198,10 +2207,10 @@ impl Database {
 
     #[cfg(feature = "fs")]
     pub fn io_for_path(path: &str) -> Result<Arc<dyn IO>> {
-        use crate::util::MEMORY_PATH;
-        let io: Arc<dyn IO> = match path.trim() {
-            MEMORY_PATH => Arc::new(MemoryIO::new()),
-            _ => Arc::new(PlatformIO::new()?),
+        let io: Arc<dyn IO> = if is_memory_like(path.trim()) {
+            Arc::new(MemoryIO::new())
+        } else {
+            Arc::new(PlatformIO::new()?)
         };
         Ok(io)
     }
@@ -2614,5 +2623,32 @@ impl Iterator for QueryRunner<'_> {
             Ok(None) => None,
             Err(err) => Some(Result::Err(LimboError::from(err))),
         }
+    }
+}
+
+#[cfg(test)]
+mod database_tests {
+    use super::{is_memory_like, Database};
+
+    #[test]
+    fn memory_path_classifies_named_memory_databases() {
+        assert!(is_memory_like(":memory:"));
+        assert!(is_memory_like(":memory:sync-draft"));
+        assert!(is_memory_like("file::memory:?cache=shared"));
+        assert!(is_memory_like(""));
+        assert!(!is_memory_like("memory.db"));
+        assert!(!is_memory_like("file:memory.db"));
+    }
+
+    #[cfg(feature = "fs")]
+    #[test]
+    fn io_for_path_uses_memory_io_for_named_memory_database() {
+        let path = format!(":memory:named-io-selection-{}", std::process::id());
+        assert!(std::fs::metadata(&path).is_err());
+
+        let io = Database::io_for_path(&path).unwrap();
+
+        assert!(io.file_id(&path).is_ok());
+        assert!(std::fs::metadata(&path).is_err());
     }
 }

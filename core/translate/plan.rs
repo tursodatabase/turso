@@ -315,20 +315,23 @@ impl SubqueryOrigin {
 }
 
 /// A query plan is either a SELECT or a DELETE (for now)
+/// Variants are boxed so that moving a `Plan` around the prepare path
+/// (returns from plan builders, argument to emitters) costs a pointer
+/// move rather than ~880 B on the stack.
 #[derive(Debug, Clone)]
 pub enum Plan {
-    Select(SelectPlan),
+    Select(Box<SelectPlan>),
     CompoundSelect {
         left: Vec<(SelectPlan, ast::CompoundOperator)>,
-        right_most: SelectPlan,
+        right_most: Box<SelectPlan>,
         limit: Option<Box<Expr>>,
         offset: Option<Box<Expr>>,
         /// ORDER BY for compound selects. Each entry is (result_column_index, sort_order, nulls_order).
         /// The column index is 0-based into the result set.
         order_by: Option<Vec<(usize, SortOrder, Option<ast::NullsOrder>)>>,
     },
-    Delete(DeletePlan),
-    Update(UpdatePlan),
+    Delete(Box<DeletePlan>),
+    Update(Box<UpdatePlan>),
 }
 
 impl Plan {
@@ -663,6 +666,11 @@ pub struct SelectPlan {
     /// When set, this query is a simple aggregate (COUNT(*), MIN, or MAX)
     /// that can be satisfied without a full table scan.
     pub simple_aggregate: Option<SimpleAggregate>,
+    /// Parameters from EXISTS subquery result columns that were dropped during
+    /// semi/anti-join unnesting. These need to be registered in the program's
+    /// parameter list even though no code is emitted for them, so that bind-time
+    /// validation (`has_slot`) succeeds.
+    pub phantom_params: Vec<ast::Variable>,
 }
 
 impl SelectPlan {
@@ -1009,6 +1017,29 @@ pub struct JoinedTable {
     pub indexed: Option<ast::Indexed>,
 }
 
+impl JoinedTable {
+    pub fn using_dedup_hidden_cols(&self) -> ColumnMask {
+        self.join_info
+            .as_ref()
+            .map(|join_info| {
+                self.table
+                    .columns()
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(idx, col)| {
+                        let col_name = col.name.as_deref()?;
+                        join_info
+                            .using
+                            .iter()
+                            .any(|using_col| using_col.as_str().eq_ignore_ascii_case(col_name))
+                            .then_some(idx)
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct OuterQueryReference {
     /// The name of the table as referred to in the query, either the literal name or an alias e.g. "users" or "u"
@@ -1017,6 +1048,8 @@ pub struct OuterQueryReference {
     pub internal_id: TableInternalId,
     /// Table object, which contains metadata about the table, e.g. columns.
     pub table: Table,
+    /// Columns hidden by USING/NATURAL deduplication in the outer scope.
+    pub using_dedup_hidden_cols: ColumnMask,
     /// Bitmask of columns that are referenced in the query.
     /// Used to track dependencies, so that it can be resolved
     /// when a WHERE clause subquery should be evaluated;
@@ -1438,6 +1471,13 @@ impl ColumnMask {
     }
 }
 
+impl std::ops::SubAssign<&Self> for ColumnMask {
+    fn sub_assign(&mut self, rhs: &Self) {
+        self.bitset -= &rhs.bitset;
+        self.has_rowid_sentinel &= !rhs.has_rowid_sentinel;
+    }
+}
+
 impl FromIterator<usize> for ColumnMask {
     fn from_iter<I: IntoIterator<Item = usize>>(iter: I) -> Self {
         let mut mask = ColumnMask::default();
@@ -1787,6 +1827,15 @@ where
                 self.overflow = None;
             }
         }
+    }
+}
+
+impl<T: From<usize>> std::ops::SubAssign<&Self> for BitSet<T>
+where
+    usize: From<T>,
+{
+    fn sub_assign(&mut self, rhs: &Self) {
+        self.subtract(rhs);
     }
 }
 
@@ -2142,7 +2191,7 @@ impl JoinedTable {
 
         let table = Table::FromClauseSubquery(Arc::new(FromClauseSubquery {
             name: identifier.clone(),
-            plan: Box::new(Plan::Select(plan)),
+            plan: Box::new(Plan::Select(Box::new(plan))),
             columns,
             result_columns_start_reg: None,
             materialized_cursor_id: None,
@@ -2778,15 +2827,23 @@ pub struct Aggregate {
     pub args: Vec<ast::Expr>,
     pub original_expr: ast::Expr,
     pub distinctness: Distinctness,
+    pub filter_expr: Option<ast::Expr>,
 }
 
 impl Aggregate {
-    pub fn new(func: AggFunc, args: &[Box<Expr>], expr: &Expr, distinctness: Distinctness) -> Self {
+    pub fn new(
+        func: AggFunc,
+        args: &[Box<Expr>],
+        expr: &Expr,
+        distinctness: Distinctness,
+        filter_expr: Option<ast::Expr>,
+    ) -> Self {
         Aggregate {
             func,
             args: args.iter().map(|arg| *arg.clone()).collect(),
             original_expr: expr.clone(),
             distinctness,
+            filter_expr,
         }
     }
 
@@ -3849,9 +3906,9 @@ mod tests {
                     );
                 }
                 11 => {
-                    // Subtract
+                    // SubAssign (delegates to subtract)
                     let (other_mask, other_ref) = sample_other(&mut rng, max_index);
-                    mask.subtract(&other_mask);
+                    mask -= &other_mask;
                     for i in &other_ref {
                         reference.remove(i);
                     }
@@ -3943,5 +4000,25 @@ mod tests {
         // FromIterator<TableInternalId> works.
         let rebuilt: BitSet<TableInternalId> = [a, c].into_iter().collect();
         assert_eq!(rebuilt, mask);
+    }
+
+    #[test]
+    fn test_column_mask_sub_assign() {
+        let mut a: ColumnMask = [1, 3, ROWID_SENTINEL].into_iter().collect();
+        let b: ColumnMask = [3, ROWID_SENTINEL].into_iter().collect();
+        a -= &b;
+        assert!(a.get(1));
+        assert!(!a.get(3));
+        assert!(!a.get(ROWID_SENTINEL));
+        assert_eq!(a.count(), 1);
+
+        // Subtracting without rowid sentinel leaves it intact
+        let mut a: ColumnMask = [2, 4, ROWID_SENTINEL].into_iter().collect();
+        let b: ColumnMask = [2].into_iter().collect();
+        a -= &b;
+        assert!(!a.get(2));
+        assert!(a.get(4));
+        assert!(a.get(ROWID_SENTINEL));
+        assert_eq!(a.count(), 2);
     }
 }

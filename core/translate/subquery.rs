@@ -511,6 +511,7 @@ fn plan_subqueries_with_outer_query_access<'a>(
                     table: t.table.clone(),
                     identifier: t.identifier.clone(),
                     internal_id: t.internal_id,
+                    using_dedup_hidden_cols: t.using_dedup_hidden_cols(),
                     col_used_mask: ColumnUsedMask::default(),
                     cte_select: None,
                     cte_explicit_columns: vec![],
@@ -528,6 +529,7 @@ fn plan_subqueries_with_outer_query_access<'a>(
                         table: t.table.clone(),
                         identifier: t.identifier.clone(),
                         internal_id: t.internal_id,
+                        using_dedup_hidden_cols: t.using_dedup_hidden_cols.clone(),
                         col_used_mask: ColumnUsedMask::default(),
                         cte_select: t.cte_select.clone(),
                         cte_explicit_columns: t.cte_explicit_columns.clone(),
@@ -1467,7 +1469,7 @@ pub fn emit_from_clause_subquery(
 
     let result_column_start_reg = match plan {
         Plan::Select(select_plan) => {
-            let mut metadata = TranslateCtx {
+            let mut metadata = Box::new(TranslateCtx {
                 labels_main_loop: (0..select_plan.joined_tables().len())
                     .map(|_| LoopLabels::new(program))
                     .collect(),
@@ -1497,7 +1499,7 @@ pub fn emit_from_clause_subquery(
                 materialized_build_inputs: HashMap::default(),
                 hash_table_contexts: HashMap::default(),
                 unsafe_testing: t_ctx.unsafe_testing,
-            };
+            });
             emit_query(program, select_plan, &mut metadata)?
         }
         Plan::CompoundSelect { .. } => {
@@ -1553,7 +1555,7 @@ fn emit_indexed_materialized_subquery(
 
     match plan {
         Plan::Select(select_plan) => {
-            let mut metadata = TranslateCtx {
+            let mut metadata = Box::new(TranslateCtx {
                 labels_main_loop: (0..select_plan.joined_tables().len())
                     .map(|_| LoopLabels::new(program))
                     .collect(),
@@ -1583,7 +1585,7 @@ fn emit_indexed_materialized_subquery(
                 materialized_build_inputs: HashMap::default(),
                 hash_table_contexts: HashMap::default(),
                 unsafe_testing: t_ctx.unsafe_testing,
-            };
+            });
             emit_query(program, select_plan, &mut metadata)?;
         }
         Plan::CompoundSelect { .. } => {
@@ -1646,7 +1648,7 @@ fn emit_materialized_subquery_table(
     // Emit the subquery - it will insert rows into the ephemeral table
     match plan {
         Plan::Select(select_plan) => {
-            let mut metadata = TranslateCtx {
+            let mut metadata = Box::new(TranslateCtx {
                 labels_main_loop: (0..select_plan.joined_tables().len())
                     .map(|_| LoopLabels::new(program))
                     .collect(),
@@ -1676,7 +1678,7 @@ fn emit_materialized_subquery_table(
                 materialized_build_inputs: HashMap::default(),
                 hash_table_contexts: HashMap::default(),
                 unsafe_testing: t_ctx.unsafe_testing,
-            };
+            });
             emit_query(program, select_plan, &mut metadata)?;
         }
         Plan::CompoundSelect { .. } => {
@@ -1759,10 +1761,10 @@ pub fn emit_non_from_clause_subquery(
                         emit_program_for_select_with_resolver(
                             program,
                             resolver.fork_with_expr_cache(),
-                            select_plan,
+                            *select_plan,
                         )
                     } else {
-                        emit_program_for_select(program, resolver, select_plan)
+                        emit_program_for_select(program, resolver, *select_plan)
                     }
                 }
                 compound @ Plan::CompoundSelect { .. } => {

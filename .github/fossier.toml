@@ -33,3 +33,4 @@ report_score_denials = false
 [trust]
 flood_threshold = 4
 flood_window_hours = 1
+bot_policy = 'allow'

@@ -2283,7 +2283,7 @@ pub struct MvStore<Clock: LogicalClock> {
 
 impl<Clock: LogicalClock> MvStore<Clock> {
     fn uses_durable_mvcc_metadata(&self, connection: &Arc<Connection>) -> bool {
-        !connection.db.path.starts_with(":memory:")
+        !connection.db.is_in_memory_db()
     }
 
     /// Captures table-valued functions (e.g. generate_series) from the schema before
@@ -4749,6 +4749,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                                 }
                                 self.insert_table_id_to_rootpage(table_id, None);
                             } else {
+                                dropped_root_pages.remove(&root_page);
                                 let table_id = self.get_table_id_from_root_page(root_page);
                                 let Some(entry) = self.table_id_to_rootpage.get(&table_id) else {
                                     panic!("Logical log contains root page reference {root_page} that does not exist in the table_id_to_rootpage map");

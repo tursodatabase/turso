@@ -1,6 +1,5 @@
-use crate::schema::{ColumnLayout, GeneratedType};
+use crate::schema::ColumnLayout;
 use crate::translate::emitter::{emit_index_column_value_old_image, gencol};
-use crate::translate::optimizer::Optimizable;
 use crate::turso_debug_assert;
 use crate::{
     error::{SQLITE_CONSTRAINT_NOTNULL, SQLITE_CONSTRAINT_PRIMARYKEY, SQLITE_CONSTRAINT_UNIQUE},
@@ -342,7 +341,7 @@ pub fn translate_insert(
                     .btree()
                     .expect("we shouldn't have got here without a BTree table"),
             ),
-            identifier: table_name.to_string(),
+            identifier: normalize_ident(table_name.as_str()),
             internal_id: program.table_reference_counter.next(),
             op: Operation::default_scan_for(&table),
             join_info: None,
@@ -508,12 +507,7 @@ pub fn translate_insert(
 
     let has_before_triggers = !relevant_before_triggers.is_empty();
     if has_before_triggers {
-        compute_virtual_columns(
-            program,
-            insertion.col_mappings.iter().map(|cm| cm.column),
-            &dml_ctx,
-            resolver,
-        )?;
+        compute_virtual_columns(program, &ctx.table.columns_topo_sort()?, &dml_ctx, resolver)?;
 
         // In SQLite, NEW.<rowid_alias> returns -1 in BEFORE INSERT triggers when the rowid
         // hasn't been assigned yet (i.e., it's NULL). We need to temporarily set the key
@@ -728,12 +722,7 @@ pub fn translate_insert(
     // Make computed virtual columns accessible to CHECK and NOT NULL constraint evaluation
     if insertion.has_virtual_columns() {
         //TODO only compute the necessary virtual columns for CHECK and NOT NULL evaluation
-        compute_virtual_columns(
-            program,
-            insertion.col_mappings.iter().map(|cm| cm.column),
-            &dml_ctx,
-            resolver,
-        )?;
+        compute_virtual_columns(program, &ctx.table.columns_topo_sort()?, &dml_ctx, resolver)?;
     }
 
     // Evaluate CHECK constraints after type affinity/TypeCheck but before other constraints
@@ -889,12 +878,7 @@ pub fn translate_insert(
     );
     let has_after_triggers = !relevant_after_triggers.is_empty();
     if has_after_triggers {
-        compute_virtual_columns(
-            program,
-            insertion.col_mappings.iter().map(|cm| cm.column),
-            &dml_ctx,
-            resolver,
-        )?;
+        compute_virtual_columns(program, &ctx.table.columns_topo_sort()?, &dml_ctx, resolver)?;
 
         // Build raw NEW registers for AFTER triggers. Values are encoded at this point;
         // fire_trigger will decode them via decode_trigger_registers.
@@ -2648,16 +2632,9 @@ fn translate_column(
         program.emit_insn(Insn::SoftNull {
             reg: column_register,
         });
-    } else if matches!(
-        column.generated_type(),
-        GeneratedType::Virtual { expr, .. } if expr.is_constant(resolver)
-    ) {
-        // Constant virtual generated columns are hoisted to the program init
-        // section by translate_expr in compute_virtual_columns. Emitting NULL
-        // here would clobber the hoisted value before constraint checks
-        // (e.g. NOT NULL) and triggers read it.
-    } else if column.hidden() || column.is_virtual_generated() {
-        // Emit NULL for not-explicitly-mentioned hidden or virtual columns, even ignoring DEFAULT.
+    } else if column.is_virtual_generated() {
+        // virtual columns are computed in a separate pass in compute_virtual_columns
+    } else if column.hidden() {
         program.emit_insn(Insn::Null {
             dest: column_register,
             dest_end: None,

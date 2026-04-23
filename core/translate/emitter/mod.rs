@@ -25,8 +25,9 @@ use super::{
 };
 use crate::instrument;
 use crate::schema::{
-    BTreeTable, CheckConstraint, Column, ColumnLayout, GeneratedType, IndexColumn, Schema, Table,
+    BTreeTable, CheckConstraint, Column, ColumnLayout, IndexColumn, Schema, Table,
 };
+use crate::translate::plan::ColumnMask;
 use crate::vdbe::{
     affinity::Affinity,
     builder::{CursorType, DmlColumnContext, ProgramBuilder, SelfTableContext},
@@ -907,9 +908,9 @@ pub fn emit_program(
     after: impl FnOnce(&mut ProgramBuilder),
 ) -> Result<()> {
     match plan {
-        Plan::Select(plan) => emit_program_for_select(program, resolver, plan),
-        Plan::Delete(plan) => emit_program_for_delete(connection, resolver, program, plan),
-        Plan::Update(plan) => emit_program_for_update(connection, resolver, program, plan, after),
+        Plan::Select(plan) => emit_program_for_select(program, resolver, *plan),
+        Plan::Delete(plan) => emit_program_for_delete(connection, resolver, program, *plan),
+        Plan::Update(plan) => emit_program_for_update(connection, resolver, program, *plan, after),
         Plan::CompoundSelect { .. } => {
             emit_program_for_compound_select(program, resolver, plan).map(|_| ())
         }
@@ -1637,30 +1638,69 @@ fn rewrite_where_for_update_registers(
 /// Emits  `target_columns`, plus the stored columns needed by `target_columns`, into compact
 /// registers. This takes into account stored columns, and any stored columns required
 /// by virtual columns in `target_columns`.
+///
+/// Target columns are guaranteed to be in a contiguous block, in the given order, at the start of
+/// registers. The following postcondition holds:
+///
+/// ```text
+/// dml_ctx.to_column_reg(target_columns[i]) == dml_ctx.to_column_reg(target_columns[0]) + i
+/// ```
+///
+/// This way, target_columns[0] can be used as a base for opcodes that require unpacked records.
 pub(crate) fn emit_columns_and_dependencies(
     program: &mut ProgramBuilder,
     table: &BTreeTable,
     cursor_id: usize,
     rowid_reg: usize,
     target_columns: impl IntoIterator<Item = usize>,
+    resolver: &Resolver,
 ) -> Result<DmlColumnContext> {
-    let dependencies = table.dependencies_of_columns(target_columns)?;
-    let base = program.alloc_registers(dependencies.count());
-    let mut next_reg = base;
+    let targets: Vec<usize> = target_columns.into_iter().collect();
+    let dependencies = table.dependencies_of_columns(targets.iter().copied())?;
+
+    let target_base = program.alloc_registers(targets.len());
+    let extra_base = {
+        let mut dependencies_not_in_targets: ColumnMask = dependencies.clone();
+        let target_mask = targets.iter().copied().collect();
+        dependencies_not_in_targets -= &target_mask;
+
+        let extra_count = dependencies_not_in_targets.count();
+
+        if extra_count > 0 {
+            program.alloc_registers(extra_count)
+        } else {
+            0
+        }
+    };
+
+    let mut extra_idx = 0;
     let pairs = table.columns().iter().enumerate().map(|(idx, col)| {
         let reg = if col.is_rowid_alias() {
             rowid_reg
+        } else if let Some(pos) = targets.iter().position(|&t| t == idx) {
+            let reg = target_base + pos;
+            if !col.is_virtual_generated() {
+                program.emit_column_or_rowid(cursor_id, idx, reg);
+            }
+            reg
         } else if dependencies.get(idx) {
-            let reg = next_reg;
+            let reg = extra_base + extra_idx;
             program.emit_column_or_rowid(cursor_id, idx, reg);
-            next_reg += 1;
+            extra_idx += 1;
             reg
         } else {
             0
         };
         (col, reg)
     });
-    Ok(DmlColumnContext::from_column_reg_mapping(pairs))
+    let dml_ctx = DmlColumnContext::from_column_reg_mapping(pairs);
+    debug_assert!(targets
+        .windows(2)
+        .all(|w| { dml_ctx.to_column_reg(w[1]) == dml_ctx.to_column_reg(w[0]) + 1 }));
+
+    gencol::compute_virtual_columns(program, &table.columns_topo_sort()?, &dml_ctx, resolver)?;
+
+    Ok(dml_ctx)
 }
 
 /// Emit code to load the value of an IndexColumn from the OLD image of the row being updated.
@@ -1797,33 +1837,16 @@ fn emit_index_column_value_new_image(
         let col_in_table = columns
             .get(idx_col.pos_in_table)
             .expect("column index out of bounds");
-        match col_in_table.generated_type() {
-            GeneratedType::Virtual { ref expr, .. } => {
-                gencol::emit_gencol_expr_from_registers(
-                    program,
-                    expr,
-                    dest_reg,
-                    columns_start_reg,
-                    columns,
-                    resolver,
-                    rowid_reg,
-                    layout,
-                )?;
-                program.emit_column_affinity(dest_reg, col_in_table.affinity());
-            }
-            GeneratedType::NotGenerated => {
-                let src_reg = if col_in_table.is_rowid_alias() {
-                    rowid_reg
-                } else {
-                    layout.to_register(columns_start_reg, idx_col.pos_in_table)
-                };
-                program.emit_insn(Insn::Copy {
-                    src_reg,
-                    dst_reg: dest_reg,
-                    extra_amount: 0,
-                });
-            }
-        }
+        let src_reg = if col_in_table.is_rowid_alias() {
+            rowid_reg
+        } else {
+            layout.to_register(columns_start_reg, idx_col.pos_in_table)
+        };
+        program.emit_insn(Insn::Copy {
+            src_reg,
+            dst_reg: dest_reg,
+            extra_amount: 0,
+        });
     }
     Ok(())
 }

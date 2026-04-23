@@ -264,14 +264,15 @@ expect {
     A|250
 }
 
-@skip-if sqlite "sqlite supports FILTER in aggregate functions"
 @cross-check-integrity
-test view-rejects-filter-clause {
+test view-filter-clause {
     CREATE TABLE t(val INT, status TEXT);
+    INSERT INTO t VALUES (100, 'ok'), (200, 'ok'), (50, 'bad');
     CREATE VIEW v AS SELECT SUM(val) FILTER (WHERE status = 'ok') FROM t;
+    SELECT * FROM v;
 }
-expect error {
-    FILTER clause is not supported yet in aggregate functions
+expect {
+    300
 }
 
 @skip-if sqlite "sqlite supports ORDER BY in aggregate functions"

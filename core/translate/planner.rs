@@ -4,7 +4,7 @@ use crate::{turso_assert, turso_assert_greater_than_or_equal};
 use super::{
     expr::{walk_expr, walk_expr_mut},
     plan::{
-        Aggregate, ColumnUsedMask, Distinctness, EvalAt, IterationDirection, JoinInfo,
+        Aggregate, ColumnMask, ColumnUsedMask, Distinctness, EvalAt, IterationDirection, JoinInfo,
         JoinOrderMember, JoinType as PlanJoinType, JoinedTable, Operation, OuterQueryReference,
         Plan, QueryDestination, ResultSetColumn, Scan, TableReferences, WhereTerm,
     },
@@ -20,7 +20,7 @@ use crate::{
     ast::Limit,
     function::Func,
     schema::Table,
-    util::{exprs_are_equivalent, normalize_ident, validate_aggregate_function_tail},
+    util::{exprs_are_equivalent, normalize_ident},
     Result,
 };
 use crate::{
@@ -212,7 +212,11 @@ pub fn resolve_window_and_aggregate_functions(
                 filter_over,
                 order_by,
             } => {
-                validate_aggregate_function_tail(filter_over, order_by)?;
+                if !order_by.is_empty() {
+                    crate::bail_parse_error!(
+                        "ORDER BY clause is not supported yet in aggregate functions"
+                    );
+                }
                 let args_count = args.len();
                 let distinctness = Distinctness::from_ast(distinctness.as_ref());
 
@@ -227,7 +231,14 @@ pub fn resolve_window_and_aggregate_functions(
                                 distinctness,
                             )?;
                         } else {
-                            add_aggregate_if_not_exists(aggs, expr, args, distinctness, f)?;
+                            add_aggregate_if_not_exists(
+                                aggs,
+                                expr,
+                                args,
+                                distinctness,
+                                f,
+                                filter_over.filter_clause.as_deref().cloned(),
+                            )?;
                             contains_aggregates = true;
                         }
                         return Ok(WalkControl::SkipChildren);
@@ -268,6 +279,7 @@ pub fn resolve_window_and_aggregate_functions(
                                         args,
                                         distinctness,
                                         func,
+                                        filter_over.filter_clause.as_deref().cloned(),
                                     )?;
                                     contains_aggregates = true;
                                 }
@@ -286,7 +298,6 @@ pub fn resolve_window_and_aggregate_functions(
                 }
             }
             Expr::FunctionCallStar { name, filter_over } => {
-                validate_aggregate_function_tail(filter_over, &[])?;
                 match Func::resolve_function(name.as_str(), 0)? {
                     Some(Func::Agg(f)) => {
                         if let Some(over_clause) = filter_over.over_clause.as_ref() {
@@ -304,6 +315,7 @@ pub fn resolve_window_and_aggregate_functions(
                                 &[],
                                 Distinctness::NonDistinct,
                                 f,
+                                filter_over.filter_clause.as_deref().cloned(),
                             )?;
                             contains_aggregates = true;
                         }
@@ -360,6 +372,7 @@ pub fn resolve_window_and_aggregate_functions(
                                         &[],
                                         Distinctness::NonDistinct,
                                         func,
+                                        filter_over.filter_clause.as_deref().cloned(),
                                     )?;
                                     contains_aggregates = true;
                                 }
@@ -437,6 +450,7 @@ fn add_aggregate_if_not_exists(
     args: &[Box<Expr>],
     distinctness: Distinctness,
     func: AggFunc,
+    filter_expr: Option<ast::Expr>,
 ) -> Result<()> {
     if distinctness.is_distinct() && args.len() != 1 {
         crate::bail_parse_error!("DISTINCT aggregate functions must have exactly one argument");
@@ -445,7 +459,7 @@ fn add_aggregate_if_not_exists(
         .iter()
         .all(|a| !exprs_are_equivalent(&a.original_expr, expr))
     {
-        aggs.push(Aggregate::new(func, args, expr, distinctness));
+        aggs.push(Aggregate::new(func, args, expr, distinctness, filter_expr));
     }
     Ok(())
 }
@@ -498,6 +512,7 @@ fn plan_cte(
             identifier: referenced_table.identifier.clone(),
             internal_id: referenced_table.internal_id,
             table: referenced_table.table.clone(),
+            using_dedup_hidden_cols: referenced_table.using_dedup_hidden_cols(),
             col_used_mask: ColumnUsedMask::default(),
             cte_select: None,
             cte_explicit_columns: vec![],
@@ -653,10 +668,11 @@ pub fn plan_ctes_as_outer_refs(
             identifier: cte_name,
             internal_id: joined_table.internal_id,
             table: joined_table.table,
+            using_dedup_hidden_cols: ColumnMask::default(),
             col_used_mask: ColumnUsedMask::default(),
             cte_select: Some(cte_select_ast),
             cte_explicit_columns: explicit_columns,
-            cte_id: None, // DML CTEs don't track CTE sharing (TODO: implement if needed)
+            cte_id: None, // DML CTEs don't share materialized data (TODO: implement if needed)
             cte_definition_only: true,
             rowid_referenced: false,
             scope_depth: 0,
@@ -723,6 +739,7 @@ fn parse_from_clause_table(
                     identifier: cte_def.name.clone(),
                     internal_id: cte_table.internal_id,
                     table: cte_table.table,
+                    using_dedup_hidden_cols: ColumnMask::default(),
                     col_used_mask: ColumnUsedMask::default(),
                     cte_select: Some(cte_def.select.clone()),
                     cte_explicit_columns: cte_def.explicit_columns.clone(),
@@ -1254,6 +1271,7 @@ pub fn parse_from(
                     identifier: cte_def.name.clone(),
                     internal_id: cte_table.internal_id,
                     table: cte_table.table,
+                    using_dedup_hidden_cols: ColumnMask::default(),
                     col_used_mask: ColumnUsedMask::default(),
                     cte_select: Some(cte_def.select.clone()),
                     cte_explicit_columns: cte_def.explicit_columns.clone(),
