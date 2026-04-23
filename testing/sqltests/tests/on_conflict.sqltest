@@ -111,6 +111,35 @@ expect {
     2|two
 }
 
+@cross-check-integrity
+test insert-or-ignore-omitted-notnull-no-default {
+    CREATE TABLE t0 (c0 INT, c1 INT NOT NULL);
+    INSERT OR IGNORE INTO t0(c0) VALUES (1);
+    SELECT COUNT(*) FROM t0;
+}
+expect {
+    0
+}
+
+@cross-check-integrity
+test insert-or-ignore-omitted-notnull-continues {
+    CREATE TABLE t0 (c0 INT, c1 INT NOT NULL);
+    INSERT OR IGNORE INTO t0(c0) VALUES (1);
+    INSERT INTO t0 VALUES (2, 99);
+    SELECT COUNT(*) FROM t0;
+}
+expect {
+    1
+}
+
+@cross-check-integrity
+test insert-omitted-notnull-no-default {
+    CREATE TABLE t0 (c0 INT, c1 INT NOT NULL);
+    INSERT INTO t0(c0) VALUES (1);
+}
+expect error {
+}
+
 # =============================================================================
 # INSERT OR REPLACE tests
 # =============================================================================

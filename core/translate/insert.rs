@@ -2651,17 +2651,6 @@ fn translate_column(
             });
         }
     } else {
-        let nullable = !column.notnull() && !column.is_rowid_alias();
-        if !nullable {
-            crate::bail_parse_error!(
-                "column {} is not nullable",
-                column
-                    .name
-                    .as_ref()
-                    .expect("column name must be present")
-                    .as_str()
-            );
-        }
         program.emit_insn(Insn::Null {
             dest: column_register,
             dest_end: None,
