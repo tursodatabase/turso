@@ -1761,10 +1761,10 @@ pub fn emit_non_from_clause_subquery(
                         emit_program_for_select_with_resolver(
                             program,
                             resolver.fork_with_expr_cache(),
-                            select_plan,
+                            *select_plan,
                         )
                     } else {
-                        emit_program_for_select(program, resolver, select_plan)
+                        emit_program_for_select(program, resolver, *select_plan)
                     }
                 }
                 compound @ Plan::CompoundSelect { .. } => {

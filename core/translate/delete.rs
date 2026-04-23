@@ -280,7 +280,7 @@ pub fn prepare_delete_plan(
         ensure_delete_uses_rowset(program, &mut delete_plan);
     }
 
-    Ok(Plan::Delete(delete_plan))
+    Ok(Plan::Delete(Box::new(delete_plan)))
 }
 
 /// Check if any WHERE predicate contains a subquery (Subquery, InSelect, or Exists).
