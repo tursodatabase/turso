@@ -2273,6 +2273,22 @@ pub(crate) fn make_record(
     ImmutableRecord::from_registers(regs, regs.len())
 }
 
+/// Split a register slice into an immutable ref and a mutable ref at two distinct indices.
+pub(crate) fn split_registers(
+    registers: &mut [Register],
+    src: usize,
+    dst: usize,
+) -> (&Register, &mut Register) {
+    debug_assert_ne!(src, dst, "split_registers: src and dst must differ");
+    if src < dst {
+        let (left, right) = registers.split_at_mut(dst);
+        (&left[src], &mut right[0])
+    } else {
+        let (left, right) = registers.split_at_mut(src);
+        (&right[0], &mut left[dst])
+    }
+}
+
 pub fn registers_to_ref_values<'a>(
     registers: &'a [Register],
 ) -> impl ExactSizeIterator<Item = ValueRef<'a>> {

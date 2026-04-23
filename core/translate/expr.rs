@@ -14,7 +14,9 @@ use crate::function::FtsFunc;
 use crate::function::JsonFunc;
 use crate::function::{AggFunc, Func, FuncCtx, MathFuncArity, ScalarFunc, VectorFunc};
 use crate::functions::datetime;
-use crate::schema::{ColDef, Column, ColumnLayout, GeneratedType, Table, Type, TypeDef};
+use crate::schema::{
+    BTreeTable, ColDef, Column, ColumnLayout, GeneratedType, Table, Type, TypeDef,
+};
 use crate::sync::Arc;
 use crate::translate::expression_index::{
     normalize_expr_for_index_matching, single_table_column_usage,
@@ -227,6 +229,47 @@ macro_rules! expect_arguments_max {
         };
 
         args
+    }};
+}
+
+/// Translate a function that is desugared into a dedicated variadic-argument instruction.
+/// Evaluates all args into consecutive registers, then emits the instruction.
+/// The instruction must have fields `start_reg`, `count`, and `dest`.
+///
+/// Used by: Array (MakeArray), struct_pack (also MakeArray).
+macro_rules! translate_variadic_insn {
+    ($program:expr, $referenced_tables:expr, $resolver:expr, $args:expr, $dest:expr,
+     $Insn:ident) => {{
+        let start_reg = $program.alloc_registers($args.len());
+        for (i, arg) in $args.iter().enumerate() {
+            translate_expr($program, $referenced_tables, arg, start_reg + i, $resolver)?;
+        }
+        $program.emit_insn(Insn::$Insn {
+            start_reg,
+            count: $args.len(),
+            dest: $dest,
+        });
+        Ok($dest)
+    }};
+}
+
+/// Translate a function that is desugared into a dedicated fixed-argument instruction.
+/// Evaluates each arg into its own register, then emits the instruction using a
+/// caller-provided expression that can reference the allocated registers by index.
+///
+/// `$reg_names` is a comma-separated list of identifiers bound to allocated
+/// registers for the corresponding arg indices.
+///
+/// Used by: ArrayElement, ArraySetElement, UnionTag, UnionExtract, UnionValue.
+macro_rules! translate_fixed_insn {
+    ($program:expr, $referenced_tables:expr, $resolver:expr, $args:expr, $dest:expr,
+     [$($reg_name:ident <- $idx:expr),+], $insn_expr:expr) => {{
+        $(
+            let $reg_name = $program.alloc_register();
+            translate_expr($program, $referenced_tables, &$args[$idx], $reg_name, $resolver)?;
+        )+
+        $program.emit_insn($insn_expr);
+        Ok($dest)
     }};
 }
 
@@ -564,7 +607,12 @@ pub fn translate_condition_expr(
         }
         ast::Expr::DoublyQualified(_, _, _) | ast::Expr::Id(_) | ast::Expr::Qualified(_, _) => {
             crate::bail_parse_error!(
-                "DoublyQualified/Id/Qualified should have been rewritten in optimizer"
+                "DoublyQualified/Id/Qualified should have been rewritten to Column during binding"
+            );
+        }
+        ast::Expr::FieldAccess { .. } => {
+            crate::bail_parse_error!(
+                "struct/union field access cannot be used as a bare boolean condition in WHERE"
             );
         }
         ast::Expr::Exists(_) => {
@@ -1011,7 +1059,7 @@ pub fn translate_expr(
                                 .schema()
                                 .get_type_def(&col.ty_str, table.is_strict())
                             {
-                                if let Some(ref decode_expr) = type_def.decode {
+                                if let Some(decode_expr) = type_def.decode() {
                                     let skip_label = program.allocate_label();
                                     program.emit_insn(Insn::IsNull {
                                         reg: target_register,
@@ -1448,7 +1496,7 @@ pub fn translate_expr(
                             ColDef::default(),
                         );
                         for td in &resolved.chain {
-                            if let Some(ref encode_expr) = td.encode {
+                            if let Some(encode_expr) = td.encode() {
                                 emit_type_expr(
                                     program,
                                     encode_expr,
@@ -1491,7 +1539,7 @@ pub fn translate_expr(
                         // CAST to custom type applies only the encode function,
                         // producing the stored representation.
                         // e.g. CAST(42 AS cents) → 4200
-                        if let Some(ref encode_expr) = type_def.encode {
+                        if let Some(encode_expr) = type_def.encode() {
                             emit_type_expr(
                                 program,
                                 encode_expr,
@@ -1832,85 +1880,27 @@ pub fn translate_expr(
                         ScalarFunc::Cast => {
                             unreachable!("this is always ast::Expr::Cast")
                         }
+                        // Arity and custom-types checks are done at bind time
+                        // in validate_custom_type_function_call.
                         ScalarFunc::Array => {
-                            resolver.require_custom_types("Array features")?;
-                            let start_reg = program.alloc_registers(args.len());
-                            for (i, arg) in args.iter().enumerate() {
-                                translate_expr(
-                                    program,
-                                    referenced_tables,
-                                    arg,
-                                    start_reg + i,
-                                    resolver,
-                                )?;
-                            }
-                            program.emit_insn(Insn::MakeArray {
-                                start_reg,
-                                count: args.len(),
-                                dest: target_register,
-                            });
-                            Ok(target_register)
+                            translate_variadic_insn!(
+                                program,
+                                referenced_tables,
+                                resolver,
+                                args,
+                                target_register,
+                                MakeArray
+                            )
                         }
                         ScalarFunc::ArrayElement => {
-                            resolver.require_custom_types("Array features")?;
-                            let args = expect_arguments_exact!(args, 2, srf);
-                            let base_reg = program.alloc_register();
-                            translate_expr(
-                                program,
-                                referenced_tables,
-                                &args[0],
-                                base_reg,
-                                resolver,
-                            )?;
-                            let index_reg = program.alloc_register();
-                            translate_expr(
-                                program,
-                                referenced_tables,
-                                &args[1],
-                                index_reg,
-                                resolver,
-                            )?;
-                            program.emit_insn(Insn::ArrayElement {
-                                array_reg: base_reg,
-                                index_reg,
-                                dest: target_register,
-                            });
-                            Ok(target_register)
+                            translate_fixed_insn!(program, referenced_tables, resolver, args, target_register,
+                                [array_reg <- 0, index_reg <- 1],
+                                Insn::ArrayElement { array_reg, index_reg, dest: target_register })
                         }
                         ScalarFunc::ArraySetElement => {
-                            resolver.require_custom_types("Array features")?;
-                            let args = expect_arguments_exact!(args, 3, srf);
-                            let array_reg = program.alloc_register();
-                            translate_expr(
-                                program,
-                                referenced_tables,
-                                &args[0],
-                                array_reg,
-                                resolver,
-                            )?;
-                            let index_reg = program.alloc_register();
-                            translate_expr(
-                                program,
-                                referenced_tables,
-                                &args[1],
-                                index_reg,
-                                resolver,
-                            )?;
-                            let value_reg = program.alloc_register();
-                            translate_expr(
-                                program,
-                                referenced_tables,
-                                &args[2],
-                                value_reg,
-                                resolver,
-                            )?;
-                            program.emit_insn(Insn::ArraySetElement {
-                                array_reg,
-                                index_reg,
-                                value_reg,
-                                dest: target_register,
-                            });
-                            Ok(target_register)
+                            translate_fixed_insn!(program, referenced_tables, resolver, args, target_register,
+                                [array_reg <- 0, index_reg <- 1, value_reg <- 2],
+                                Insn::ArraySetElement { array_reg, index_reg, value_reg, dest: target_register })
                         }
                         ScalarFunc::Changes => {
                             if !args.is_empty() {
@@ -2768,16 +2758,129 @@ pub fn translate_expr(
                         | ScalarFunc::StringToArray
                         | ScalarFunc::ArrayToString
                         | ScalarFunc::ArrayOverlap
-                        | ScalarFunc::ArrayContainsAll => {
-                            resolver.require_custom_types("Array features")?;
-                            translate_function(
+                        | ScalarFunc::ArrayContainsAll => translate_function(
+                            program,
+                            args,
+                            referenced_tables,
+                            resolver,
+                            target_register,
+                            func_ctx,
+                        ),
+                        ScalarFunc::StructPack => {
+                            translate_variadic_insn!(
                                 program,
-                                args,
                                 referenced_tables,
                                 resolver,
+                                args,
                                 target_register,
-                                func_ctx,
+                                MakeArray
                             )
+                        }
+                        ScalarFunc::UnionValueFunc => {
+                            let args = expect_arguments_exact!(args, 2, srf);
+                            let tag_name = extract_string_literal(&args[0])?;
+                            // union_value('tag', val): resolve the tag against the
+                            // target column's union type. The target is set by
+                            // INSERT/UPDATE/UPSERT before translating the value.
+                            let Some(ref union_td) = program.target_union_type else {
+                                return Err(crate::LimboError::ParseError(
+                                    "union_value() can only be used in INSERT/UPDATE targeting a union-typed column".to_string()
+                                ));
+                            };
+                            let Some((tag_index, variant)) = union_td.find_union_variant(&tag_name)
+                            else {
+                                return Err(crate::LimboError::ParseError(format!(
+                                    "unknown variant '{}' in union type '{}'",
+                                    tag_name, union_td.name
+                                )));
+                            };
+                            // If the variant's type is itself a union, set
+                            // target_union_type so nested union_value() resolves
+                            // against the inner union type, not the outer one.
+                            let inner_union_td = resolver
+                                .schema()
+                                .get_type_def_unchecked(&variant.type_name)
+                                .filter(|td| td.is_union())
+                                .cloned();
+                            let prev = program.target_union_type.take();
+                            program.target_union_type = inner_union_td;
+                            let value_reg = program.alloc_register();
+                            let result = translate_expr(
+                                program,
+                                referenced_tables,
+                                &args[1],
+                                value_reg,
+                                resolver,
+                            );
+                            program.target_union_type = prev;
+                            result?;
+                            program.emit_insn(Insn::UnionPack {
+                                tag_index,
+                                value_reg,
+                                dest: target_register,
+                            });
+                            Ok(target_register)
+                        }
+                        ScalarFunc::UnionTagFunc => {
+                            // union_tag(col): resolve col's union type for index→name lookup.
+                            let args = expect_arguments_exact!(args, 1, srf);
+                            let td = resolve_union_from_column(
+                                &*args[0],
+                                referenced_tables,
+                                resolver,
+                                program,
+                            );
+                            let tag_names = td
+                                .as_ref()
+                                .and_then(|td| td.union_def())
+                                .map(|ud| Arc::clone(&ud.tag_names))
+                                .unwrap_or_else(|| Arc::from(Vec::<String>::new()));
+                            translate_fixed_insn!(program, referenced_tables, resolver, args, target_register,
+                                [src_reg <- 0],
+                                Insn::UnionTag { src_reg, dest: target_register, tag_names })
+                        }
+                        ScalarFunc::UnionExtractFunc => {
+                            let args = expect_arguments_exact!(args, 2, srf);
+                            let tag_name = extract_string_literal(&*args[1])?;
+                            // union_extract(col, 'tag'): resolve col's union type for name→index.
+                            let td = resolve_union_from_column(
+                                &*args[0],
+                                referenced_tables,
+                                resolver,
+                                program,
+                            );
+                            let tag_index = td
+                                .as_ref()
+                                .and_then(|td| td.resolve_union_tag_index(&tag_name))
+                                .ok_or_else(|| {
+                                    crate::LimboError::ParseError(format!(
+                                        "cannot resolve union variant '{tag_name}' for union_extract"
+                                    ))
+                                })?;
+                            translate_fixed_insn!(program, referenced_tables, resolver, args, target_register,
+                                [src_reg <- 0],
+                                Insn::UnionExtract { src_reg, expected_tag: tag_index, dest: target_register })
+                        }
+                        ScalarFunc::StructExtractFunc => {
+                            let args = expect_arguments_exact!(args, 2, srf);
+                            let field_name = extract_string_literal(&*args[1])?;
+                            let td = resolve_struct_from_expr(
+                                &*args[0],
+                                referenced_tables,
+                                resolver,
+                                program,
+                            );
+                            let (field_index, _) = td
+                                .as_ref()
+                                .and_then(|td| td.find_struct_field(&field_name))
+                                .ok_or_else(|| {
+                                    crate::LimboError::ParseError(format!(
+                                        "cannot resolve struct field '{field_name}' for struct_extract"
+                                    ))
+                                })?;
+                            translate_fixed_insn!(program, referenced_tables, resolver, args, target_register,
+                                [src_reg <- 0],
+                                Insn::StructField { src_reg, field_index, dest: target_register })
                         }
                     }
                 }
@@ -3034,7 +3137,7 @@ pub fn translate_expr(
                             resolver,
                         )
                     }
-                    Some(SelfTableContext::ForDML(dml_ctx)) => {
+                    Some(SelfTableContext::ForDML { dml_ctx, .. }) => {
                         let src_reg = dml_ctx.to_column_reg(*column);
                         program.emit_insn(Insn::Copy {
                             src_reg,
@@ -3267,15 +3370,9 @@ pub fn translate_expr(
                                 };
 
                                 // For custom type columns with ENCODE/DECODE and a
-                                // default, suppress the default in the Column
-                                // instruction so we can encode it ourselves.  Without
-                                // this, pre-existing rows (from before ALTER TABLE ADD
-                                // COLUMN) would get the raw un-encoded default, causing
-                                // decode to fail.  Pure domain types (CREATE DOMAIN)
-                                // have no encoding, so their defaults must NOT be
-                                // suppressed.  Check the full type chain because a
-                                // domain built on top of a custom type inherits its
-                                // ENCODE/DECODE.
+                                // default, suppress the Column instruction's default.
+                                // We handle short records (ALTER TABLE ADD COLUMN) via
+                                // ColumnHasField after the Column instruction.
                                 let col_ref = table.get_column_at(column);
                                 if let Some(col) = col_ref {
                                     if col.default.is_some() {
@@ -3283,7 +3380,8 @@ pub fn translate_expr(
                                             .schema()
                                             .resolve_type(&col.ty_str, table.is_strict())
                                         {
-                                            if resolved.chain.iter().any(|td| td.encode.is_some()) {
+                                            if resolved.chain.iter().any(|td| td.encode().is_some())
+                                            {
                                                 program.flags.set_suppress_column_default(true);
                                             }
                                         }
@@ -3292,7 +3390,8 @@ pub fn translate_expr(
                                 program.emit_column_or_rowid(read_cursor, column, target_register);
                             }
                         }
-                        let Some(column) = table.get_column_at(*column) else {
+                        let table_col_idx = *column;
+                        let Some(column) = table.get_column_at(table_col_idx) else {
                             crate::bail_parse_error!("column index out of bounds");
                         };
                         // Skip affinity for custom types — the stored value is
@@ -3315,21 +3414,34 @@ pub fn translate_expr(
                         // Decode custom type columns (skipped when building ORDER BY sort keys
                         // for types without a `<` operator, so the sorter sorts on encoded values)
                         if !program.flags.suppress_custom_type_decode() {
-                            // For custom type columns with a default, the Column
-                            // instruction returns NULL for pre-existing rows
-                            // (since we suppressed the default). Load the default
-                            // and encode it so decode produces the correct value.
+                            // For custom type columns with ENCODE and a DEFAULT,
+                            // we suppressed the Column default so short records
+                            // (ALTER TABLE ADD COLUMN) return NULL.  Use
+                            // ColumnHasField to detect short records and compute
+                            // ENCODE(DEFAULT) at runtime via bytecode.
                             if let Some(type_def) = resolver
                                 .schema()
                                 .get_type_def(&column.ty_str, table.is_strict())
                             {
-                                if let Some(ref default_expr) = column.default {
-                                    if type_def.encode.is_some() {
-                                        let skip_default_label = program.allocate_label();
-                                        program.emit_insn(Insn::NotNull {
-                                            reg: target_register,
-                                            target_pc: skip_default_label,
-                                        });
+                                if type_def.encode().is_some() {
+                                    if let Some(ref default_expr) = column.default {
+                                        // Reconstruct the cursor id used for reading
+                                        let read_cursor = if read_from_index {
+                                            index_cursor_id.expect("index cursor should be opened")
+                                        } else {
+                                            table_cursor_id
+                                                .or(index_cursor_id)
+                                                .expect("cursor should be opened")
+                                        };
+                                        let done_label = program.allocate_label();
+                                        // Jump past the default block if the record
+                                        // actually has this column (not a short record).
+                                        program.emit_column_has_field(
+                                            read_cursor,
+                                            table_col_idx,
+                                            done_label,
+                                        );
+                                        // Short record: compute DEFAULT then ENCODE it
                                         translate_expr_no_constant_opt(
                                             program,
                                             referenced_tables,
@@ -3338,7 +3450,7 @@ pub fn translate_expr(
                                             resolver,
                                             NoConstantOptReason::RegisterReuse,
                                         )?;
-                                        if let Some(ref encode_expr) = type_def.encode {
+                                        if let Some(encode_expr) = type_def.encode() {
                                             emit_type_expr(
                                                 program,
                                                 encode_expr,
@@ -3349,7 +3461,7 @@ pub fn translate_expr(
                                                 resolver,
                                             )?;
                                         }
-                                        program.preassign_label_to_next_insn(skip_default_label);
+                                        program.preassign_label_to_next_insn(done_label);
                                     }
                                 }
                             }
@@ -3654,6 +3766,71 @@ pub fn translate_expr(
         }
         ast::Expr::Qualified(_, _) => {
             unreachable!("Qualified should be resolved to a Column before translation")
+        }
+        ast::Expr::FieldAccess {
+            base,
+            field,
+            resolved,
+        } => {
+            let base_reg = program.alloc_register();
+            translate_expr(program, referenced_tables, base, base_reg, resolver)?;
+
+            // Fast path: if the field was resolved during binding, emit directly.
+            if let Some(resolution) = resolved {
+                match resolution {
+                    ast::FieldAccessResolution::StructField { field_index } => {
+                        program.emit_insn(Insn::StructField {
+                            src_reg: base_reg,
+                            field_index: *field_index,
+                            dest: target_register,
+                        });
+                        return Ok(target_register);
+                    }
+                    ast::FieldAccessResolution::UnionVariant { tag_index } => {
+                        program.emit_insn(Insn::UnionExtract {
+                            src_reg: base_reg,
+                            expected_tag: *tag_index,
+                            dest: target_register,
+                        });
+                        return Ok(target_register);
+                    }
+                }
+            }
+
+            // Slow path: recursively resolve the base expression's output type,
+            // then look up the field/variant in that type.
+            let td = resolve_expr_output_type(base, referenced_tables, resolver)?;
+            let field_name = normalize_ident(field.as_str());
+
+            if let Some((idx, _)) = td.find_struct_field(&field_name) {
+                program.emit_insn(Insn::StructField {
+                    src_reg: base_reg,
+                    field_index: idx,
+                    dest: target_register,
+                });
+                return Ok(target_register);
+            } else if let Some(tag_index) = td.resolve_union_tag_index(&field_name) {
+                program.emit_insn(Insn::UnionExtract {
+                    src_reg: base_reg,
+                    expected_tag: tag_index,
+                    dest: target_register,
+                });
+                return Ok(target_register);
+            } else if td.is_struct() {
+                crate::bail_parse_error!(
+                    "no such field '{}' in struct type '{}'",
+                    field_name,
+                    td.name
+                );
+            } else if td.is_union() {
+                crate::bail_parse_error!(
+                    "no such variant '{}' in union type '{}'",
+                    field_name,
+                    td.name
+                );
+            } else {
+                crate::bail_parse_error!("type '{}' is not a struct or union type", td.name);
+            }
         }
         ast::Expr::Raise(resolve_type, msg_expr) => {
             let in_trigger = program.trigger.is_some();
@@ -5267,11 +5444,15 @@ pub fn emit_table_column_for_dml(
     column_index: usize,
     target_register: usize,
     resolver: &Resolver,
+    table: &Arc<BTreeTable>,
 ) -> Result<()> {
     do_emit_table_column(
         program,
         cursor_id,
-        &SelfTableContext::ForDML(dml_column_context),
+        &SelfTableContext::ForDML {
+            dml_ctx: dml_column_context,
+            table: Arc::clone(table),
+        },
         None,
         column,
         column_index,
@@ -5565,6 +5746,9 @@ where
                 | ast::Expr::Default => {
                     // No nested expressions
                 }
+                ast::Expr::FieldAccess { base, .. } => {
+                    walk_expr(base, func)?;
+                }
             }
         }
         WalkControl::SkipChildren => return Ok(WalkControl::Continue),
@@ -5850,6 +6034,36 @@ pub fn bind_and_rewrite_expr<'a>(
                                 id.as_str()
                             );
                         }
+                        // Dot-notation fallback for struct/union field access (DuckDB-style precedence).
+                        //
+                        // For `a.b`, resolution order is:
+                        //   1. a=table, b=column       (handled above — if we're here, this failed)
+                        //   2. a=column, b=struct field (handled below)
+                        //
+                        // This means table references always win over struct field access.
+                        // If a table `t` has a struct column also named `t` with field `x`,
+                        // `t.x` resolves as table.column, not column.field. The user can
+                        // disambiguate with an alias: `SELECT s.t.x FROM t AS s`.
+                        //
+                        // We do NOT reject ambiguous schemas at CREATE TABLE time because
+                        // the combinatorial explosion (CREATE TYPE, CREATE TABLE, ALTER TABLE)
+                        // makes that impractical. Deterministic precedence is sufficient.
+                        let field_name = normalize_ident(id.as_str());
+                        if let Some(m) = find_custom_type_column(
+                            referenced_tables,
+                            &normalized_table_name,
+                            resolver,
+                        )? {
+                            *expr = make_field_access_expr(
+                                m.table_id,
+                                m.col_idx,
+                                m.is_rowid_alias,
+                                &field_name,
+                                m.type_def,
+                            );
+                            referenced_tables.mark_column_used(m.table_id, m.col_idx);
+                            return Ok(WalkControl::Continue);
+                        }
                         crate::bail_parse_error!("no such table: {}", normalized_table_name);
                     }
                     let (tbl_id, tbl) = matching_tbl.unwrap();
@@ -5894,81 +6108,142 @@ pub fn bind_and_rewrite_expr<'a>(
                     return Ok(WalkControl::Continue);
                 }
                 Expr::DoublyQualified(db_name, tbl_name, col_name) => {
+                    // Clone the names upfront so we can reassign *expr later
+                    // without lifetime conflicts.
+                    let db_name_str = db_name.as_str().to_string();
+                    let tbl_name_str = tbl_name.as_str().to_string();
+                    let col_name_str = col_name.as_str().to_string();
+                    let tbl_name_clone = tbl_name.clone();
+                    let db_name_clone = db_name.clone();
+
                     let Some(referenced_tables) = &mut referenced_tables else {
                         if binding_behavior == BindingBehavior::AllowUnboundIdentifiers {
                             return Ok(WalkControl::Continue);
                         }
                         crate::bail_parse_error!(
                             "no such column: {}.{}.{}",
-                            db_name.as_str(),
-                            tbl_name.as_str(),
-                            col_name.as_str()
+                            db_name_str,
+                            tbl_name_str,
+                            col_name_str
                         );
                     };
-                    let normalized_col_name = normalize_ident(col_name.as_str());
+                    let normalized_col_name = normalize_ident(&col_name_str);
 
-                    // Create a QualifiedName and use existing resolve_database_id method
+                    // DoublyQualified: `a.b.c` — DuckDB-style precedence:
+                    //   1. a=database, b=table, c=column     (tried first)
+                    //   2. a=table,    b=column, c=struct field  (fallback)
+                    //
+                    // Same principle as Qualified: schema-level references always win.
                     let qualified_name = ast::QualifiedName {
-                        db_name: Some(db_name.clone()),
-                        name: tbl_name.clone(),
+                        db_name: Some(db_name_clone),
+                        name: tbl_name_clone,
                         alias: None,
                     };
-                    let database_id = resolver.resolve_database_id(&qualified_name)?;
+                    let db_resolution = resolver.resolve_database_id(&qualified_name);
 
-                    // Get the table from the specified database
-                    let table = resolver
-                        .with_schema(database_id, |schema| schema.get_table(tbl_name.as_str()))
-                        .ok_or_else(|| {
-                            LimboError::ParseError(format!(
-                                "no such table: {}.{}",
-                                db_name.as_str(),
-                                tbl_name.as_str()
-                            ))
-                        })?;
+                    // Try db.table.column interpretation first. If database resolves AND
+                    // the table+column exist, use that. Otherwise fall through to
+                    // table.column.field for struct/union field access.
+                    let mut resolved_as_db_table_col = false;
+                    if let Ok(database_id) = db_resolution {
+                        let table = resolver
+                            .with_schema(database_id, |schema| schema.get_table(&tbl_name_str));
 
-                    // Find the column in the table
-                    let col_idx = table
-                        .columns()
-                        .iter()
-                        .position(|c| {
-                            c.name
-                                .as_ref()
-                                .is_some_and(|name| name.eq_ignore_ascii_case(&normalized_col_name))
-                        })
-                        .ok_or_else(|| {
-                            LimboError::ParseError(format!(
-                                "Column: {}.{}.{} not found",
-                                db_name.as_str(),
-                                tbl_name.as_str(),
-                                col_name.as_str()
-                            ))
-                        })?;
+                        if let Some(table) = table {
+                            let col_idx = table.columns().iter().position(|c| {
+                                c.name.as_ref().is_some_and(|name| {
+                                    name.eq_ignore_ascii_case(&normalized_col_name)
+                                })
+                            });
 
-                    let col = table.columns().get(col_idx).unwrap();
+                            if let Some(col_idx) = col_idx {
+                                let col = table.columns().get(col_idx).unwrap();
+                                let is_rowid_alias = col.is_rowid_alias();
+                                let normalized_tbl_name = normalize_ident(&tbl_name_str);
+                                let matching_tbl = referenced_tables
+                                    .find_table_and_internal_id_by_identifier(&normalized_tbl_name);
 
-                    // Check if this is a rowid alias
-                    let is_rowid_alias = col.is_rowid_alias();
-
-                    // Convert to Column expression - since this is a cross-database reference,
-                    // we need to create a synthetic table reference for it
-                    // For now, we'll error if the table isn't already in the referenced tables
-                    let normalized_tbl_name = normalize_ident(tbl_name.as_str());
-                    let matching_tbl = referenced_tables
-                        .find_table_and_internal_id_by_identifier(&normalized_tbl_name);
-
-                    if let Some((tbl_id, _)) = matching_tbl {
-                        // Table is already in referenced tables, use existing internal ID
-                        *expr = Expr::Column {
-                            database: Some(database_id),
-                            table: tbl_id,
-                            column: col_idx,
-                            is_rowid_alias,
-                        };
-                        referenced_tables.mark_column_used(tbl_id, col_idx);
-                    } else {
-                        return Err(LimboError::ParseError(format!(
-                            "table {normalized_tbl_name} is not in FROM clause - cross-database column references require the table to be explicitly joined"
-                        )));
+                                if let Some((tbl_id, _)) = matching_tbl {
+                                    *expr = Expr::Column {
+                                        database: Some(database_id),
+                                        table: tbl_id,
+                                        column: col_idx,
+                                        is_rowid_alias,
+                                    };
+                                    referenced_tables.mark_column_used(tbl_id, col_idx);
+                                    resolved_as_db_table_col = true;
+                                } else {
+                                    // Table exists in database but not in FROM clause
+                                    return Err(LimboError::ParseError(format!(
+                                        "table {normalized_tbl_name} is not in FROM clause — \
+                                         cross-database column references require the table to be explicitly joined"
+                                    )));
+                                }
+                            }
+                        }
+                    }
+                    if !resolved_as_db_table_col {
+                        // db.table.column failed — try table.column.field for struct/union
+                        let normalized_tbl_name = normalize_ident(&db_name_str);
+                        let normalized_col = normalize_ident(&tbl_name_str);
+                        let field_name = normalize_ident(&col_name_str);
+                        let matching_tbl = referenced_tables
+                            .find_table_and_internal_id_by_identifier(&normalized_tbl_name);
+                        if let Some((tbl_id, tbl)) = matching_tbl {
+                            let col_idx = tbl.columns().iter().position(|c| {
+                                c.name
+                                    .as_ref()
+                                    .is_some_and(|n| n.eq_ignore_ascii_case(&normalized_col))
+                            });
+                            if let Some(col_idx) = col_idx {
+                                let col = &tbl.columns()[col_idx];
+                                let type_def =
+                                    resolver.schema().get_type_def_unchecked(&col.ty_str);
+                                let is_struct_or_union = type_def
+                                    .map(|td| td.is_struct() || td.is_union())
+                                    .unwrap_or(false);
+                                if is_struct_or_union {
+                                    *expr = make_field_access_expr(
+                                        tbl_id,
+                                        col_idx,
+                                        col.is_rowid_alias(),
+                                        &field_name,
+                                        type_def.unwrap(),
+                                    );
+                                    referenced_tables.mark_column_used(tbl_id, col_idx);
+                                    return Ok(WalkControl::Continue);
+                                } else {
+                                    // Column exists but is not a struct/union type
+                                    return Err(LimboError::ParseError(format!(
+                                        "column '{normalized_col}' is not a STRUCT or UNION type; \
+                                         cannot access field '{field_name}'"
+                                    )));
+                                }
+                            }
+                        }
+                        // Fallback (3): column.field.subfield for nested struct/union access
+                        // Handles:
+                        //   data.telegram.chat_id — UNION column, variant with struct type
+                        //   data.sub.a            — STRUCT column, struct-typed field, sub-field
+                        let col_name_norm = normalize_ident(&db_name_str);
+                        let mid_name = normalize_ident(&tbl_name_str);
+                        let leaf_field = normalize_ident(&col_name_str);
+                        if let Some((nested_expr, tbl_id, col_idx)) =
+                            try_resolve_nested_field_access(
+                                referenced_tables,
+                                &col_name_norm,
+                                &mid_name,
+                                &leaf_field,
+                                resolver,
+                            )?
+                        {
+                            *expr = nested_expr;
+                            referenced_tables.mark_column_used(tbl_id, col_idx);
+                        } else {
+                            return Err(LimboError::ParseError(format!(
+                                "no such column or database: {db_name_str}.{tbl_name_str}.{col_name_str}"
+                            )));
+                        }
                     }
                 }
                 Expr::FunctionCallStar { name, filter_over } => {
@@ -6031,11 +6306,411 @@ pub fn bind_and_rewrite_expr<'a>(
                         }
                     }
                 }
+                // Validate struct/union function calls at bind time.
+                // Principle: compile-time checks belong in the earliest phase that
+                // has enough context. Binding has the resolver (for custom-types
+                // gate) and the raw AST args (for arity and literal checks).
+                // Catching errors here avoids wasting optimizer and translation
+                // cycles on invalid queries, and keeps the translate_expr match
+                // arms focused on code generation.
+                Expr::FunctionCall { name, args, .. } => {
+                    validate_custom_type_function_call(name.as_str(), args, resolver)?;
+                }
                 _ => {}
             }
             Ok(WalkControl::Continue)
         },
     )?;
+    Ok(())
+}
+
+/// Extract a string literal value from an expression that has already been
+/// validated as `Expr::Literal(Literal::String(_))` during bind-time checks.
+fn extract_string_literal(expr: &ast::Expr) -> crate::Result<String> {
+    match expr {
+        ast::Expr::Literal(ast::Literal::String(s)) => Ok(s.trim_matches('\'').to_string()),
+        _ => crate::bail_parse_error!("expected a string literal argument"),
+    }
+}
+
+/// Resolve the UnionDef for a column expression. Returns the variant names list
+/// and optionally resolves a tag name to its numeric index.
+/// Used by union_value, union_tag, union_extract function translation.
+///
+/// In the DML index-maintenance path (INSERT with expression indexes),
+/// `referenced_tables` is `None` and columns use `SELF_TABLE`. We fall back
+/// to the ProgramBuilder's `SelfTableContext::ForDML` to obtain column metadata.
+/// Resolve the TypeDef for a column expression (Column or DML self-table column).
+fn resolve_typedef_from_column(
+    expr: &ast::Expr,
+    referenced_tables: Option<&TableReferences>,
+    resolver: &Resolver,
+    program: &ProgramBuilder,
+) -> Option<Arc<TypeDef>> {
+    let ty_str = match expr {
+        ast::Expr::Column { table, column, .. } => {
+            resolve_column_type_str(*table, *column, referenced_tables, resolver, program)?
+        }
+        ast::Expr::Variable(var) => var.col_type.as_ref()?.to_string(),
+        _ => return None,
+    };
+    let td = resolver.schema().get_type_def_unchecked(&ty_str)?;
+    Some(Arc::clone(td))
+}
+
+fn resolve_union_from_column(
+    expr: &ast::Expr,
+    referenced_tables: Option<&TableReferences>,
+    resolver: &Resolver,
+    program: &ProgramBuilder,
+) -> Option<Arc<TypeDef>> {
+    resolve_typedef_from_column(expr, referenced_tables, resolver, program)
+        .filter(|td| td.is_union())
+}
+
+/// Resolve the struct TypeDef that an expression evaluates to.
+///
+/// Handles column references (direct struct column),
+/// `union_extract(...)` (variant's struct type), and
+/// `struct_extract(...)` (field's struct type for nested extraction).
+fn resolve_struct_from_expr(
+    expr: &ast::Expr,
+    referenced_tables: Option<&TableReferences>,
+    resolver: &Resolver,
+    program: &ProgramBuilder,
+) -> Option<Arc<TypeDef>> {
+    match expr {
+        ast::Expr::Column { .. } => {
+            resolve_typedef_from_column(expr, referenced_tables, resolver, program)
+                .filter(|td| td.is_struct())
+        }
+        ast::Expr::FunctionCall { name, args, .. } => {
+            let normalized = crate::util::normalize_ident(name.as_str());
+            match normalized.as_str() {
+                // union_extract(col, 'tag') → variant's type
+                "union_extract" if args.len() == 2 => {
+                    let tag_name = extract_string_literal(&args[1]).ok()?;
+                    let union_td =
+                        resolve_union_from_column(&args[0], referenced_tables, resolver, program)?;
+                    let (_, variant) = union_td.find_union_variant(&tag_name)?;
+                    let struct_td = resolver
+                        .schema()
+                        .get_type_def_unchecked(&variant.type_name)?;
+                    if struct_td.is_struct() {
+                        Some(Arc::clone(struct_td))
+                    } else {
+                        None
+                    }
+                }
+                // struct_extract(expr, 'field') → field's type (if it's a struct)
+                "struct_extract" if args.len() == 2 => {
+                    let field_name = extract_string_literal(&args[1]).ok()?;
+                    let parent_td =
+                        resolve_struct_from_expr(&args[0], referenced_tables, resolver, program)?;
+                    let (_, field_def) = parent_td.find_struct_field(&field_name)?;
+                    let field_td = resolver
+                        .schema()
+                        .get_type_def_unchecked(&field_def.type_name)?;
+                    if field_td.is_struct() {
+                        Some(Arc::clone(field_td))
+                    } else {
+                        None
+                    }
+                }
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
+/// Get the type string for a column, handling both referenced_tables and DML context.
+fn resolve_column_type_str(
+    table: ast::TableInternalId,
+    column: usize,
+    referenced_tables: Option<&TableReferences>,
+    _resolver: &Resolver,
+    program: &ProgramBuilder,
+) -> Option<String> {
+    if let Some(rt) = referenced_tables {
+        if let Some((_, tbl)) = rt.find_table_by_internal_id(table) {
+            return Some(tbl.columns().get(column)?.ty_str.clone());
+        }
+    }
+    if table.is_self_table() {
+        if let Some(SelfTableContext::ForDML { table, .. }) = program.current_self_table_context() {
+            return Some(table.columns().get(column)?.ty_str.clone());
+        }
+    }
+    None
+}
+
+/// Result of finding a column with a custom (struct/union) type across joined tables.
+struct CustomTypeColumnMatch<'a> {
+    table_id: TableInternalId,
+    col_idx: usize,
+    is_rowid_alias: bool,
+    type_def: &'a crate::schema::TypeDef,
+}
+
+/// Search all joined tables for a column named `col_name` with a struct/union type.
+/// Errors on ambiguity (>1 match). Returns `None` if no match.
+fn find_custom_type_column<'a>(
+    referenced_tables: &TableReferences,
+    col_name: &str,
+    resolver: &'a Resolver<'a>,
+) -> crate::Result<Option<CustomTypeColumnMatch<'a>>> {
+    let mut result: Option<CustomTypeColumnMatch<'a>> = None;
+    let mut match_count = 0usize;
+    for joined_table in referenced_tables.joined_tables().iter() {
+        let cols = joined_table.table.columns();
+        if let Some(col_idx) = cols.iter().position(|c| {
+            c.name
+                .as_ref()
+                .is_some_and(|n| n.eq_ignore_ascii_case(col_name))
+        }) {
+            let col = &cols[col_idx];
+            let type_def = resolver.schema().get_type_def_unchecked(&col.ty_str);
+            let is_struct_or_union = type_def
+                .map(|td| td.is_struct() || td.is_union())
+                .unwrap_or(false);
+            if is_struct_or_union {
+                match_count += 1;
+                result = Some(CustomTypeColumnMatch {
+                    table_id: joined_table.internal_id,
+                    col_idx,
+                    is_rowid_alias: col.is_rowid_alias(),
+                    type_def: type_def.unwrap(),
+                });
+            }
+        }
+    }
+    if match_count > 1 {
+        crate::bail_parse_error!(
+            "ambiguous column reference: '{}' — multiple tables have a struct/union column with this name",
+            col_name
+        );
+    }
+    Ok(result)
+}
+
+/// Build an `Expr::FieldAccess { base: Expr::Column { ... }, field, resolved }` node,
+/// pre-resolving the field index via `resolve_field_access`.
+fn make_field_access_expr(
+    table_id: TableInternalId,
+    col_idx: usize,
+    is_rowid_alias: bool,
+    field_name: &str,
+    td: &crate::schema::TypeDef,
+) -> Expr {
+    let resolved = resolve_field_access(td, field_name);
+    Expr::FieldAccess {
+        base: Box::new(Expr::Column {
+            database: None,
+            table: table_id,
+            column: col_idx,
+            is_rowid_alias,
+        }),
+        field: ast::Name::from_bytes(field_name.as_bytes()),
+        resolved,
+    }
+}
+
+/// Try to resolve `col_name.mid_name.leaf_name` as 2-level deep field access
+/// (e.g. `data.telegram.chat_id` where `data` is a UNION column, `telegram` is
+/// a variant with struct type, and `chat_id` is a struct field).
+///
+/// Returns the nested FieldAccess expr plus table_id/col_idx for `mark_column_used`.
+fn try_resolve_nested_field_access<'a>(
+    referenced_tables: &TableReferences,
+    col_name: &str,
+    mid_name: &str,
+    leaf_name: &str,
+    resolver: &'a Resolver<'a>,
+) -> crate::Result<Option<(Expr, TableInternalId, usize)>> {
+    let m = find_custom_type_column(referenced_tables, col_name, resolver)?;
+    let Some(m) = m else {
+        return Ok(None);
+    };
+    let td = m.type_def;
+
+    // Resolve the inner type name reached via mid_name:
+    // Case A: UNION column — mid_name is a variant tag
+    // Case B: STRUCT column — mid_name is a struct field
+    let inner_type_name = td
+        .find_union_variant(mid_name)
+        .map(|(_, v)| v.type_name.as_str())
+        .or_else(|| {
+            td.find_struct_field(mid_name)
+                .map(|(_, f)| f.type_name.as_str())
+        });
+
+    let has_leaf = inner_type_name
+        .and_then(|tn| resolver.schema().get_type_def_unchecked(tn))
+        .is_some_and(|itd| itd.find_struct_field(leaf_name).is_some());
+
+    if !has_leaf {
+        return Ok(None);
+    }
+
+    let nested_expr = Expr::FieldAccess {
+        base: Box::new(Expr::FieldAccess {
+            base: Box::new(Expr::Column {
+                database: None,
+                table: m.table_id,
+                column: m.col_idx,
+                is_rowid_alias: m.is_rowid_alias,
+            }),
+            field: ast::Name::from_bytes(mid_name.as_bytes()),
+            resolved: None,
+        }),
+        field: ast::Name::from_bytes(leaf_name.as_bytes()),
+        resolved: None,
+    };
+
+    Ok(Some((nested_expr, m.table_id, m.col_idx)))
+}
+
+/// Resolve a field/variant name against a TypeDef to produce a FieldAccessResolution.
+fn resolve_field_access(
+    td: &crate::schema::TypeDef,
+    field_name: &str,
+) -> Option<ast::FieldAccessResolution> {
+    if let Some((idx, _)) = td.find_struct_field(field_name) {
+        Some(ast::FieldAccessResolution::StructField { field_index: idx })
+    } else if let Some((tag_idx, _)) = td.find_union_variant(field_name) {
+        Some(ast::FieldAccessResolution::UnionVariant { tag_index: tag_idx })
+    } else {
+        None
+    }
+}
+
+/// Recursively resolve the output TypeDef of an expression.
+///
+/// For `Expr::Column`, returns the column's declared custom type.
+/// For `Expr::FieldAccess`, recurses into the base to find the parent type,
+/// then looks up what type the accessed field/variant produces.
+/// Returns `None` for expressions that don't produce a known custom type.
+fn resolve_expr_output_type<'a>(
+    expr: &ast::Expr,
+    referenced_tables: Option<&TableReferences>,
+    resolver: &'a Resolver<'a>,
+) -> crate::Result<&'a crate::schema::TypeDef> {
+    match expr {
+        ast::Expr::Column { table, column, .. } => {
+            let Some(referenced_tables) = referenced_tables else {
+                crate::bail_parse_error!("cannot resolve type: no table context");
+            };
+            let Some((_is_outer, tbl)) = referenced_tables.find_table_by_internal_id(*table) else {
+                crate::bail_parse_error!("cannot resolve type: table not found");
+            };
+            let col = &tbl.columns()[*column];
+            let Some(td) = resolver.schema().get_type_def_unchecked(&col.ty_str) else {
+                crate::bail_parse_error!(
+                    "column '{}' has type '{}' which is not a known struct or union type",
+                    col.name.as_deref().unwrap_or("?"),
+                    col.ty_str
+                );
+            };
+            Ok(td)
+        }
+        ast::Expr::FieldAccess { base, field, .. } => {
+            let parent_td = resolve_expr_output_type(base, referenced_tables, resolver)?;
+            let field_name = normalize_ident(field.as_str());
+            // Find what type this field/variant produces
+            let inner_type_name =
+                if let Some((_, variant)) = parent_td.find_union_variant(&field_name) {
+                    &variant.type_name
+                } else if let Some((_, f)) = parent_td.find_struct_field(&field_name) {
+                    &f.type_name
+                } else {
+                    let kind = if parent_td.is_union() {
+                        "variant"
+                    } else {
+                        "field"
+                    };
+                    crate::bail_parse_error!("no such {} '{}' in type", kind, field_name);
+                };
+            let Some(td) = resolver.schema().get_type_def_unchecked(inner_type_name) else {
+                crate::bail_parse_error!(
+                    "'{}' resolves to type '{}' which is not a known type",
+                    field_name,
+                    inner_type_name
+                );
+            };
+            Ok(td)
+        }
+        _ => {
+            crate::bail_parse_error!("expression does not produce a known custom type");
+        }
+    }
+}
+
+/// Validates custom-type function calls (arrays, structs, unions) at bind time.
+///
+/// Compile-time checks belong in the earliest phase that has enough context.
+/// Binding has the resolver (for the custom-types gate) and the raw AST args
+/// (for arity and literal checks). Catching errors here avoids wasting
+/// optimizer and translation cycles on invalid queries, and keeps the
+/// translate_expr match arms focused purely on register allocation and codegen.
+fn validate_custom_type_function_call(
+    name: &str,
+    args: &[Box<ast::Expr>],
+    resolver: &Resolver<'_>,
+) -> Result<()> {
+    let normalized = crate::util::normalize_ident(name);
+    match normalized.as_str() {
+        // Arrays
+        "array" | "array_element" | "array_set_element" | "array_length" | "array_append"
+        | "array_prepend" | "array_cat" | "array_remove" | "array_contains" | "array_position"
+        | "array_slice" | "string_to_array" | "array_to_string" | "array_overlap"
+        | "array_contains_all" => {
+            resolver.require_custom_types("Array features")?;
+        }
+        // Structs
+        "struct_pack" => {
+            resolver.require_custom_types("Struct features")?;
+        }
+        "struct_extract" => {
+            resolver.require_custom_types("Struct features")?;
+            if args.len() != 2 {
+                crate::bail_parse_error!("struct_extract() requires exactly 2 arguments");
+            }
+            if !matches!(&*args[1], ast::Expr::Literal(ast::Literal::String(_))) {
+                crate::bail_parse_error!(
+                    "struct_extract() second argument must be a string literal"
+                );
+            }
+        }
+        // Unions
+        "union_value" => {
+            resolver.require_custom_types("Union features")?;
+            if args.len() != 2 {
+                crate::bail_parse_error!("union_value() requires exactly 2 arguments");
+            }
+            if !matches!(&*args[0], ast::Expr::Literal(ast::Literal::String(_))) {
+                crate::bail_parse_error!("union_value() first argument must be a string literal");
+            }
+        }
+        "union_tag" => {
+            resolver.require_custom_types("Union features")?;
+            if args.len() != 1 {
+                crate::bail_parse_error!("union_tag() requires exactly 1 argument");
+            }
+        }
+        "union_extract" => {
+            resolver.require_custom_types("Union features")?;
+            if args.len() != 2 {
+                crate::bail_parse_error!("union_extract() requires exactly 2 arguments");
+            }
+            if !matches!(&*args[1], ast::Expr::Literal(ast::Literal::String(_))) {
+                crate::bail_parse_error!(
+                    "union_extract() second argument must be a string literal"
+                );
+            }
+        }
+        _ => {}
+    }
     Ok(())
 }
 
@@ -6205,6 +6880,9 @@ where
                 | ast::Expr::Default => {
                     // No nested expressions
                 }
+                ast::Expr::FieldAccess { base, .. } => {
+                    walk_expr_mut(base, func)?;
+                }
             }
         }
         WalkControl::SkipChildren => return Ok(WalkControl::Continue),
@@ -6266,6 +6944,16 @@ pub(crate) fn get_expr_affinity_info(
                             );
                         }
                         return ExprAffinityInfo::with_affinity(col.affinity());
+                    }
+                }
+            }
+            // SELF_TABLE fallback: during DML expression index evaluation,
+            // referenced_tables is None but column affinities are available
+            // via the resolver's self_table_column_affinities.
+            if table.is_self_table() {
+                if let Some(resolver) = resolver {
+                    if let Some(aff) = resolver.self_table_column_affinities.get(*column) {
+                        return ExprAffinityInfo::with_affinity(*aff);
                     }
                 }
             }
@@ -6935,6 +7623,7 @@ pub fn expr_vector_size(expr: &Expr) -> Result<usize> {
         }
         Expr::Parenthesized(exprs) => exprs.len(),
         Expr::Qualified(..) => 1,
+        Expr::FieldAccess { .. } => 1,
         Expr::Raise(..) => 1,
         Expr::Subquery(_) => {
             crate::bail_parse_error!("Scalar subquery is not supported in this context")
@@ -7005,7 +7694,7 @@ fn emit_custom_type_operator(
     // registers (constant optimization), and encoding in-place would clobber
     // that register — breaking subsequent loop iterations.
     let func_start = if let Some(ref encode_info) = resolved.encode_info {
-        if let Some(ref encode_expr) = encode_info.type_def.encode {
+        if let Some(encode_expr) = encode_info.type_def.encode() {
             // Translate operands into temporary registers first.
             let tmp1 = program.alloc_register();
             let tmp2 = program.alloc_register();
@@ -7188,7 +7877,7 @@ fn find_custom_type_operator(
     // Try to find a direct or derived operator match on a type definition.
     let find_in_type_def = |type_def: &TypeDef| -> Option<(String, bool, bool)> {
         // Direct match: just check op symbol (no right_type constraint)
-        for op_def in &type_def.operators {
+        for op_def in type_def.operators() {
             if op_def.op == op_str {
                 // Naked operator (func_name = None): fall through to standard comparison
                 let func_name = op_def.func_name.as_ref()?;
@@ -7199,7 +7888,7 @@ fn find_custom_type_operator(
         // Derive missing operators from < and =
         let find_op = |sym: &str| -> Option<String> {
             type_def
-                .operators
+                .operators()
                 .iter()
                 .find(|o| o.op == sym)
                 .and_then(|o| o.func_name.clone())
@@ -7277,6 +7966,56 @@ fn find_custom_type_operator(
     None
 }
 
+/// Evaluate an expression-index expression in a DML context (INSERT/UPDATE/UPSERT).
+///
+/// Shared logic: decode custom-type column registers into temps (so the
+/// expression sees user-facing values), build a `SelfTableContext::ForDML`,
+/// and translate the expression.
+///
+/// The caller must:
+/// 1. Clone the expression from `idx_col.expr`
+/// 2. Build the initial `column_regs` mapping (before decode)
+///
+/// The expression is resolved via `resolve_gencol_expr_columns` and custom-type
+/// columns are decoded in-place in `column_regs`.
+pub(crate) fn emit_dml_expr_index_value(
+    program: &mut ProgramBuilder,
+    resolver: &Resolver,
+    mut expr: ast::Expr,
+    columns: &[Column],
+    column_regs: &mut [usize],
+    table: &Arc<BTreeTable>,
+    dest_reg: usize,
+) -> Result<()> {
+    crate::schema::resolve_gencol_expr_columns(&mut expr, columns)?;
+
+    let is_strict = table.is_strict;
+    for (i, col) in columns.iter().enumerate() {
+        if col.is_rowid_alias() {
+            continue;
+        }
+        if let Some(type_def) = resolver.schema().get_type_def(&col.ty_str, is_strict) {
+            if type_def.decode().is_some() {
+                let src_reg = column_regs[i];
+                let tmp = program.alloc_register();
+                emit_user_facing_column_value(program, src_reg, tmp, col, is_strict, resolver)?;
+                column_regs[i] = tmp;
+            }
+        }
+    }
+
+    let pairs = columns.iter().zip(column_regs.iter().copied());
+    let ctx = SelfTableContext::ForDML {
+        dml_ctx: DmlColumnContext::from_column_reg_mapping(pairs),
+        table: Arc::clone(table),
+    };
+    program.with_self_table_context(Some(&ctx), |program, _| {
+        translate_expr(program, None, &expr, dest_reg, resolver)?;
+        Ok(())
+    })?;
+    Ok(())
+}
+
 /// Emit bytecode that transforms a stored column value into its user-facing
 /// representation.
 ///
@@ -7317,7 +8056,7 @@ pub(crate) fn emit_user_facing_column_value(
 
         // Apply decode in reverse order (parent/ancestor first, then child)
         for td in resolved.chain.iter().rev() {
-            if let Some(ref decode_expr) = td.decode {
+            if let Some(decode_expr) = td.decode() {
                 emit_type_expr(
                     program,
                     decode_expr,
@@ -7332,63 +8071,6 @@ pub(crate) fn emit_user_facing_column_value(
 
         program.preassign_label_to_next_insn(skip_label);
     }
-    Ok(())
-}
-
-/// Walk an expression tree that has been rewritten to use `Expr::Register` for column
-/// references (e.g. by `rewrite_index_expr_for_insertion`). For each register that maps
-/// to a custom type column, emit decode bytecode into a fresh temporary register and
-/// rewrite the expression node to reference the decoded register.
-///
-/// This ensures expression indexes on custom type columns evaluate the expression on
-/// **decoded** (user-facing) values, matching what SELECT / CREATE INDEX see.
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn decode_custom_type_registers_in_expr(
-    program: &mut ProgramBuilder,
-    resolver: &Resolver,
-    expr: &mut ast::Expr,
-    columns: &[Column],
-    start_reg: usize,
-    key_reg: Option<usize>,
-    is_strict: bool,
-    layout: &ColumnLayout,
-) -> Result<()> {
-    walk_expr_mut(expr, &mut |e| {
-        if let ast::Expr::Register(reg) = e {
-            let reg_val = *reg;
-            // Skip the rowid register — it's not a custom type column.
-            if key_reg == Some(reg_val) {
-                return Ok(WalkControl::Continue);
-            }
-            // Map register back to column index.
-            if reg_val >= start_reg {
-                let col_idx = layout
-                    .column_idx_for_offset(reg_val - start_reg)
-                    .ok_or_else(|| {
-                        LimboError::ParseError("layout should return a col_idx".to_string())
-                    })?;
-                if let Some(column) = columns.get(col_idx) {
-                    if let Some(type_def) =
-                        resolver.schema().get_type_def(&column.ty_str, is_strict)
-                    {
-                        if type_def.decode.is_some() {
-                            let decoded_reg = program.alloc_register();
-                            emit_user_facing_column_value(
-                                program,
-                                reg_val,
-                                decoded_reg,
-                                column,
-                                is_strict,
-                                resolver,
-                            )?;
-                            *e = ast::Expr::Register(decoded_reg);
-                        }
-                    }
-                }
-            }
-        }
-        Ok(WalkControl::Continue)
-    })?;
     Ok(())
 }
 
@@ -7537,7 +8219,7 @@ pub(crate) fn emit_trigger_decode_registers(
         .map(|(i, col)| -> Result<usize> {
             let type_def = resolver.schema().get_type_def(&col.ty_str, is_strict);
             if let Some(type_def) = type_def {
-                if let Some(ref decode_expr) = type_def.decode {
+                if let Some(decode_expr) = type_def.decode() {
                     let src = source_regs(i);
                     let decoded_reg = program.alloc_register();
                     program.emit_insn(Insn::Copy {
@@ -7701,7 +8383,7 @@ fn emit_array_encode(
     table_name: &str,
 ) -> Result<()> {
     if let Some(type_def) = resolver.schema().get_type_def_unchecked(&col.ty_str) {
-        if let Some(encode_expr) = type_def.encode.as_ref() {
+        if let Some(encode_expr) = type_def.encode() {
             // Normalize input (text or blob) to blob with ANY affinity first
             program.emit_insn(Insn::ArrayEncode {
                 reg,
@@ -7753,7 +8435,7 @@ pub(crate) fn emit_array_decode(
     resolver: &Resolver,
 ) -> Result<()> {
     if let Some(type_def) = resolver.schema().get_type_def_unchecked(&col.ty_str) {
-        if let Some(decode_expr) = type_def.decode.as_ref() {
+        if let Some(decode_expr) = type_def.decode() {
             emit_array_element_loop(program, reg, decode_expr, col, type_def, resolver)?;
         }
     }
@@ -7824,7 +8506,7 @@ pub(crate) fn emit_custom_type_encode_columns(
 
         // Apply encode for each type in the chain (child first, then parent)
         for td in &resolved.chain {
-            if let Some(ref encode_expr) = td.encode {
+            if let Some(encode_expr) = td.encode() {
                 emit_type_expr(program, encode_expr, reg, reg, col, td, resolver)?;
             }
         }
@@ -7887,7 +8569,7 @@ pub(crate) fn emit_custom_type_decode_columns(
 
         // Apply decode in reverse order (parent/ancestor first, then child)
         for td in resolved.chain.iter().rev() {
-            if let Some(ref decode_expr) = td.decode {
+            if let Some(decode_expr) = td.decode() {
                 emit_type_expr(program, decode_expr, reg, reg, col, td, resolver)?;
             }
         }

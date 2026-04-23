@@ -69,7 +69,7 @@ fn encode_seek_keys_for_custom_types(
             Some(td) => td,
             None => continue,
         };
-        let encode_expr = match &type_def.encode {
+        let encode_expr = match type_def.encode() {
             Some(e) => e,
             None => continue,
         };

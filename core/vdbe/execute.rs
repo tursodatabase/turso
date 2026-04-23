@@ -39,6 +39,7 @@ use crate::vdbe::hash_table::{
 use crate::vdbe::insn::InsertFlags;
 use crate::vdbe::metrics::HashJoinMetrics;
 use crate::vdbe::value::ComparisonOp;
+use crate::vdbe::ValueIteratorExt;
 use crate::vdbe::{
     registers_to_ref_values, DeferredSeekState, EndStatement, OpHashBuildState, OpHashProbeState,
     StepResult, TxnCleanup,
@@ -1780,7 +1781,7 @@ pub fn op_column(
                             // Parse the header for serial types incrementally until we have the target column
                             // Use nth_into_register to write directly to the register without
                             // creating intermediate ValueRef allocations
-                            use crate::vdbe::ValueIteratorExt;
+
                             match payload_iterator
                                 .nth_into_register(*column, &mut state.registers[*dest])
                             {
@@ -1863,6 +1864,57 @@ pub fn op_column(
 
     state.op_column_state = OpColumnState::Start;
     state.pc += 1;
+    Ok(InsnFunctionStepResult::Step)
+}
+
+pub fn op_column_has_field(
+    program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+    _pager: &Arc<Pager>,
+) -> Result<InsnFunctionStepResult> {
+    load_insn!(
+        ColumnHasField {
+            cursor_id,
+            column,
+            target_pc,
+        },
+        insn
+    );
+    if !target_pc.is_offset() {
+        crate::bail_corrupt_error!("Unresolved label: {target_pc:?}");
+    }
+
+    let (_, cursor_type) = program
+        .cursor_ref
+        .get(*cursor_id)
+        .expect("cursor_id should exist in cursor_ref");
+
+    let has_field = match cursor_type {
+        CursorType::BTreeTable(_)
+        | CursorType::BTreeIndex(_)
+        | CursorType::MaterializedView(_, _) => {
+            let cursor_ref =
+                must_be_btree_cursor!(*cursor_id, program.cursor_ref, state, "ColumnHasField");
+            let cursor = cursor_ref.as_btree_mut();
+            if cursor.get_null_flag() {
+                false
+            } else {
+                match return_if_io!(cursor.record()) {
+                    Some(record) => record.column_count() > *column,
+                    None => false,
+                }
+            }
+        }
+        // Non-btree cursors always "have" all fields
+        _ => true,
+    };
+
+    if has_field {
+        state.pc = target_pc.as_offset_int();
+    } else {
+        state.pc += 1;
+    }
     Ok(InsnFunctionStepResult::Step)
 }
 
@@ -2246,6 +2298,169 @@ pub fn op_make_array_dynamic(
         *start_reg,
         count,
     ));
+
+    state.pc += 1;
+    Ok(InsnFunctionStepResult::Step)
+}
+
+/// Split the register file to get a shared reference to `src` and a mutable
+/// reference to `dst`. Panics if `src == dst`.
+#[inline]
+/// Extract a field from a struct blob by field index.
+pub fn op_struct_field(
+    _program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+    _pager: &Arc<Pager>,
+) -> Result<InsnFunctionStepResult> {
+    load_insn!(
+        StructField {
+            src_reg,
+            field_index,
+            dest,
+        },
+        insn
+    );
+
+    let (src, dst) = super::split_registers(&mut state.registers, *src_reg, *dest);
+
+    match src.get_value() {
+        Value::Blob(blob) => {
+            let mut iter = ValueIterator::new(blob)?;
+            match iter.nth_into_register(*field_index, dst) {
+                Some(result) => result?,
+                None => dst.set_null(),
+            }
+        }
+        _ => dst.set_null(),
+    };
+
+    state.pc += 1;
+    Ok(InsnFunctionStepResult::Step)
+}
+
+/// Pack a tag name and a value into a union blob.
+/// Format: [tag_name_len: 1 byte][tag_name: N bytes][record-format value]
+/// The tag name is embedded directly in the instruction as a String.
+pub fn op_union_pack(
+    _program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+    _pager: &Arc<Pager>,
+) -> Result<InsnFunctionStepResult> {
+    load_insn!(
+        UnionPack {
+            tag_index,
+            value_reg,
+            dest,
+        },
+        insn
+    );
+
+    let record =
+        ImmutableRecord::from_registers(std::slice::from_ref(&state.registers[*value_reg]), 1);
+    let record_bytes = record.into_payload();
+
+    // Format: [tag_index: 1 byte][record bytes]
+    let mut blob = Vec::with_capacity(1 + record_bytes.len());
+    blob.push(*tag_index);
+    blob.extend_from_slice(&record_bytes);
+    state.registers[*dest].set_value(Value::Blob(blob));
+
+    state.pc += 1;
+    Ok(InsnFunctionStepResult::Step)
+}
+
+/// Extract the tag name from a union blob as text.
+/// Format: [tag_index: 1 byte][record-format value]
+/// Looks up tag_index in tag_names to return the variant name.
+pub fn op_union_tag(
+    _program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+    _pager: &Arc<Pager>,
+) -> Result<InsnFunctionStepResult> {
+    load_insn!(
+        UnionTag {
+            src_reg,
+            dest,
+            tag_names
+        },
+        insn
+    );
+
+    let val = state.registers[*src_reg].get_value();
+    let result = match val {
+        Value::Blob(blob) if !blob.is_empty() => {
+            let tag_index = blob[0] as usize;
+            debug_assert!(
+                tag_index < tag_names.len(),
+                "union tag index {tag_index} out of range (len={})",
+                tag_names.len()
+            );
+            match tag_names.get(tag_index) {
+                Some(name) => Value::build_text(name.clone()),
+                None => Value::Null,
+            }
+        }
+        _ => Value::Null,
+    };
+
+    state.registers[*dest].set_value(result);
+    state.pc += 1;
+    Ok(InsnFunctionStepResult::Step)
+}
+
+/// Extract the value from a union blob if the tag name matches.
+pub fn op_union_extract(
+    _program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+    _pager: &Arc<Pager>,
+) -> Result<InsnFunctionStepResult> {
+    load_insn!(
+        UnionExtract {
+            src_reg,
+            expected_tag,
+            dest,
+        },
+        insn
+    );
+
+    // First pass: check tag index and compute record slice bounds (immutable borrow only)
+    let record_range = match state.registers[*src_reg].get_value() {
+        Value::Null => {
+            state.registers[*dest].set_null();
+            state.pc += 1;
+            return Ok(InsnFunctionStepResult::Step);
+        }
+        Value::Blob(blob) if !blob.is_empty() => {
+            if blob[0] == *expected_tag && blob.len() > 1 {
+                Some(1..blob.len())
+            } else {
+                None
+            }
+        }
+        _ => None,
+    };
+
+    // Second pass: extract value using nth_into_register (needs split mutable borrow)
+    match record_range {
+        Some(range) => {
+            let (src, dst) = super::split_registers(&mut state.registers, *src_reg, *dest);
+
+            if let Value::Blob(blob) = src.get_value() {
+                let mut iter = ValueIterator::new(&blob[range])?;
+                match iter.nth_into_register(0, dst) {
+                    Some(result) => result?,
+                    None => dst.set_null(),
+                }
+            } else {
+                dst.set_null();
+            }
+        }
+        None => state.registers[*dest].set_null(),
+    };
 
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
@@ -7757,6 +7972,15 @@ pub fn op_function(
                 let a_val = state.registers[*start_reg].get_value().clone();
                 let b_val = state.registers[*start_reg + 1].get_value().clone();
                 state.registers[*dest].set_value(exec_array_contains_all(&a_val, &b_val));
+            }
+            ScalarFunc::StructPack
+            | ScalarFunc::StructExtractFunc
+            | ScalarFunc::UnionValueFunc
+            | ScalarFunc::UnionTagFunc
+            | ScalarFunc::UnionExtractFunc => {
+                return Err(LimboError::InternalError(format!(
+                    "{scalar_func} should be desugared to a dedicated instruction, not Function"
+                )))
             }
         },
         crate::function::Func::Vector(vector_func) => {

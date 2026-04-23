@@ -112,7 +112,10 @@ pub enum SelfTableContext {
         table_ref_id: TableInternalId,
         referenced_tables: TableReferences,
     },
-    ForDML(DmlColumnContext),
+    ForDML {
+        dml_ctx: DmlColumnContext,
+        table: Arc<BTreeTable>,
+    },
 }
 
 #[derive(Clone)]
@@ -267,6 +270,21 @@ pub struct ProgramBuilder {
     next_cte_id: usize,
     /// Counter for subquery numbering in EXPLAIN QUERY PLAN output.
     next_subquery_eqp_id: usize,
+    /// Write-context for union-typed columns: tells `union_value('tag', val)`
+    /// which union TypeDef to resolve the tag against.
+    ///
+    /// Unlike read-path functions (`union_tag(col)`, `union_extract(col, 'tag')`)
+    /// which resolve the union type from the column expression they operate on,
+    /// `union_value()` constructs a *new* value — the SQL syntax doesn't reference
+    /// the target column, so the type must come from the INSERT/UPDATE/UPSERT context.
+    ///
+    /// This follows the same save/restore pattern as `id_register_overrides`
+    /// (ENCODE/DECODE context) and `self_table_context` (DML column resolution).
+    /// Callers must save with `.take()`, set the new value, translate the expression,
+    /// then restore the saved value. For nested unions (union-in-union), the
+    /// `UnionValueFunc` handler in expr.rs saves/restores this to the inner union
+    /// type before translating the value argument.
+    pub(crate) target_union_type: Option<Arc<crate::schema::TypeDef>>,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -667,6 +685,7 @@ impl ProgramBuilder {
             materialized_ctes: HashMap::default(),
             ctes_being_defined: Vec::new(),
             next_subquery_eqp_id: 1,
+            target_union_type: None,
         }
     }
 
@@ -1353,6 +1372,9 @@ impl ProgramBuilder {
                 } => {
                     resolve(target_pc, "NotNull")?;
                 }
+                Insn::ColumnHasField { target_pc, .. } => {
+                    resolve(target_pc, "ColumnHasField")?;
+                }
                 Insn::IfPos { target_pc, .. } => {
                     resolve(target_pc, "IfPos")?;
                 }
@@ -1787,6 +1809,27 @@ impl ProgramBuilder {
         }
     }
 
+    /// Emit a ColumnHasField instruction that jumps to `target_pc` if the
+    /// cursor's record has a field at the given logical column index.
+    /// Falls through if the record is short (ALTER TABLE ADD COLUMN).
+    pub fn emit_column_has_field(
+        &mut self,
+        cursor_id: CursorID,
+        column: usize,
+        target_pc: BranchOffset,
+    ) {
+        let (_, cursor_type) = self.cursor_ref.get(cursor_id).expect("cursor_id is valid");
+        let physical_column = match cursor_type {
+            CursorType::BTreeTable(btree) => btree.logical_to_physical_column(column),
+            _ => column,
+        };
+        self.emit_insn(Insn::ColumnHasField {
+            cursor_id,
+            column: physical_column,
+            target_pc,
+        });
+    }
+
     /// Emit an Affinity instruction for a single register with the given column affinity.
     pub fn emit_column_affinity(&mut self, register: usize, affinity: Affinity) {
         self.emit_insn(Insn::Affinity {
@@ -1958,7 +2001,7 @@ impl ProgramBuilder {
         result
     }
 
-    pub const fn self_table_context(&self) -> &Option<SelfTableContext> {
-        &self.self_table_context
+    pub fn current_self_table_context(&self) -> Option<&SelfTableContext> {
+        self.self_table_context.as_ref()
     }
 }

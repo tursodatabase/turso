@@ -1,0 +1,113 @@
+@database :memory:
+@requires-file custom_types "uses custom types"
+
+@requires strict "uses custom types which require STRICT tables"
+
+test custom-type-explicit-null-stays-null {
+    CREATE TYPE ct_lower BASE text ENCODE (lower(value)) DECODE (value) OPERATOR '<';
+    CREATE TABLE t1(id INT PRIMARY KEY, x0 ct_lower DEFAULT ('hello')) STRICT;
+    INSERT INTO t1 VALUES (1, 'World');
+    INSERT INTO t1 VALUES (2, NULL);
+    INSERT INTO t1 VALUES (3, 'Test');
+    SELECT id, x0, x0 IS NULL as is_null FROM t1;
+}
+expect {
+    1|world|0
+    2||1
+    3|test|0
+}
+
+test custom-type-alter-table-default-works {
+    CREATE TYPE ct_lower2 BASE text ENCODE (lower(value)) DECODE (value);
+    CREATE TABLE t2(id INT PRIMARY KEY, c0 TEXT) STRICT;
+    INSERT INTO t2 VALUES (1, 'existing');
+    ALTER TABLE t2 ADD COLUMN x0 ct_lower2 DEFAULT ('MyDefault');
+    SELECT id, c0, x0 FROM t2;
+}
+expect {
+    1|existing|mydefault
+}
+
+test custom-type-alter-table-null-after-add {
+    CREATE TYPE ct_lower3 BASE text ENCODE (lower(value)) DECODE (value);
+    CREATE TABLE t3(id INT PRIMARY KEY, c0 TEXT) STRICT;
+    INSERT INTO t3 VALUES (1, 'before');
+    ALTER TABLE t3 ADD COLUMN x0 ct_lower3 DEFAULT ('Dflt');
+    INSERT INTO t3 VALUES (2, 'after', NULL);
+    INSERT INTO t3 VALUES (3, 'with_val', 'HI');
+    SELECT id, c0, x0, x0 IS NULL as is_null FROM t3;
+}
+expect {
+    1|before|dflt|0
+    2|after||1
+    3|with_val|hi|0
+}
+
+test custom-type-arithmetic-null {
+    CREATE TYPE doubled BASE integer ENCODE (value * 2) DECODE (value / 2);
+    CREATE TABLE t4(id INT PRIMARY KEY, x0 doubled DEFAULT (7)) STRICT;
+    INSERT INTO t4 VALUES (1, 10);
+    INSERT INTO t4 VALUES (2, NULL);
+    SELECT id, x0, x0 IS NULL as is_null FROM t4;
+}
+expect {
+    1|10|0
+    2||1
+}
+
+test custom-type-arithmetic-alter-default {
+    CREATE TYPE doubled2 BASE integer ENCODE (value * 2) DECODE (value / 2);
+    CREATE TABLE t5(id INT PRIMARY KEY, c0 TEXT) STRICT;
+    INSERT INTO t5 VALUES (1, 'old');
+    ALTER TABLE t5 ADD COLUMN x0 doubled2 DEFAULT (7);
+    SELECT id, x0 FROM t5;
+}
+expect {
+    1|7
+}
+
+test custom-type-expr-index-with-null {
+    CREATE TYPE ct_low BASE text ENCODE (lower(value)) DECODE (value) OPERATOR '<';
+    CREATE TABLE t6(id INT PRIMARY KEY, x0 ct_low DEFAULT ('fallback')) STRICT;
+    CREATE INDEX ix6 ON t6(CAST(x0 AS TEXT));
+    INSERT INTO t6 VALUES (1, 'Hello');
+    INSERT INTO t6 VALUES (2, NULL);
+    INSERT INTO t6 VALUES (3, 'World');
+    DELETE FROM t6 WHERE id = 2;
+    SELECT id, x0 FROM t6;
+}
+expect {
+    1|hello
+    3|world
+}
+
+test custom-type-expr-index-delete-non-null {
+    CREATE TYPE ct_low2 BASE text ENCODE (lower(value)) DECODE (value) OPERATOR '<';
+    CREATE TABLE t7(id INT PRIMARY KEY, x0 ct_low2 DEFAULT ('dflt')) STRICT;
+    CREATE INDEX ix7 ON t7(CAST(x0 AS TEXT));
+    INSERT INTO t7 VALUES (1, 'AAA');
+    INSERT INTO t7 VALUES (2, 'BBB');
+    INSERT INTO t7 VALUES (3, NULL);
+    DELETE FROM t7 WHERE COALESCE(CAST(x0 AS TEXT), -999) != -999;
+    SELECT id, x0 FROM t7;
+}
+expect {
+    3|
+}
+
+test custom-type-complex-encode-alter-null {
+    CREATE TYPE validated BASE text
+        ENCODE (CASE WHEN length(value) > 0 THEN lower(value) ELSE RAISE(ABORT, 'empty') END)
+        DECODE (value);
+    CREATE TABLE t8(id INT PRIMARY KEY, c0 TEXT) STRICT;
+    INSERT INTO t8 VALUES (1, 'before_alter');
+    ALTER TABLE t8 ADD COLUMN x0 validated DEFAULT ('Complex');
+    INSERT INTO t8 VALUES (2, 'after_alter', NULL);
+    INSERT INTO t8 VALUES (3, 'with_val', 'HELLO');
+    SELECT id, c0, x0, x0 IS NULL as is_null FROM t8;
+}
+expect {
+    1|before_alter|complex|0
+    2|after_alter||1
+    3|with_val|hello|0
+}
