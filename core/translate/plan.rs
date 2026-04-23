@@ -315,20 +315,23 @@ impl SubqueryOrigin {
 }
 
 /// A query plan is either a SELECT or a DELETE (for now)
+/// Variants are boxed so that moving a `Plan` around the prepare path
+/// (returns from plan builders, argument to emitters) costs a pointer
+/// move rather than ~880 B on the stack.
 #[derive(Debug, Clone)]
 pub enum Plan {
-    Select(SelectPlan),
+    Select(Box<SelectPlan>),
     CompoundSelect {
         left: Vec<(SelectPlan, ast::CompoundOperator)>,
-        right_most: SelectPlan,
+        right_most: Box<SelectPlan>,
         limit: Option<Box<Expr>>,
         offset: Option<Box<Expr>>,
         /// ORDER BY for compound selects. Each entry is (result_column_index, sort_order, nulls_order).
         /// The column index is 0-based into the result set.
         order_by: Option<Vec<(usize, SortOrder, Option<ast::NullsOrder>)>>,
     },
-    Delete(DeletePlan),
-    Update(UpdatePlan),
+    Delete(Box<DeletePlan>),
+    Update(Box<UpdatePlan>),
 }
 
 impl Plan {
@@ -2188,7 +2191,7 @@ impl JoinedTable {
 
         let table = Table::FromClauseSubquery(Arc::new(FromClauseSubquery {
             name: identifier.clone(),
-            plan: Box::new(Plan::Select(plan)),
+            plan: Box::new(Plan::Select(Box::new(plan))),
             columns,
             result_columns_start_reg: None,
             materialized_cursor_id: None,

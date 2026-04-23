@@ -512,7 +512,7 @@ pub fn prepare_update_plan(
         }
     }
 
-    Ok(Plan::Update(UpdatePlan {
+    Ok(Plan::Update(Box::new(UpdatePlan {
         table_references,
         or_conflict,
         set_clauses,
@@ -531,7 +531,7 @@ pub fn prepare_update_plan(
         cdc_update_alter_statement: None,
         non_from_clause_subqueries,
         safety: DmlSafety::default(),
-    }))
+    })))
 }
 
 fn build_scan_op(table: &Table, iter_dir: IterationDirection) -> Operation {
