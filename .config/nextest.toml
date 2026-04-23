@@ -1,3 +1,9 @@
+[profile.default]
+# Exclude memory-benchmark from default test runs — it uses dhat as global
+# allocator which conflicts with mimalloc from the turso crate when built
+# with --all-features.
+default-filter = 'not package(memory-benchmark)'
+
 [profile.loom]
 # Filter to only run tests with "loom_" in the name
 default-filter = 'test(/loom_/)'

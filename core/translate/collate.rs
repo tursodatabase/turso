@@ -127,14 +127,20 @@ pub fn get_expr_collation_ctx(
                 return Ok(WalkControl::SkipChildren);
             }
             Expr::Column { table, column, .. } => {
-                let (_, table_ref) = referenced_tables
-                    .find_table_by_internal_id(*table)
-                    .ok_or_else(|| crate::LimboError::ParseError("table not found".to_string()))?;
-                let column = table_ref
-                    .get_column_at(*column)
-                    .ok_or_else(|| crate::LimboError::ParseError("column not found".to_string()))?;
-                if maybe_column_collseq.is_none() {
-                    maybe_column_collseq = Some(column.collation());
+                // generated columns (the SELF_TABLE placeholder) don't inherit an implicit
+                // collation from their expression, so we skip them
+                if !table.is_self_table() {
+                    let (_, table_ref) = referenced_tables
+                        .find_table_by_internal_id(*table)
+                        .ok_or_else(|| {
+                            crate::LimboError::ParseError("table not found".to_string())
+                        })?;
+                    let column = table_ref.get_column_at(*column).ok_or_else(|| {
+                        crate::LimboError::ParseError("column not found".to_string())
+                    })?;
+                    if maybe_column_collseq.is_none() {
+                        maybe_column_collseq = Some(column.collation());
+                    }
                 }
             }
             _ => {}
@@ -222,12 +228,12 @@ fn get_collseq_parts_from_expr(
 
 #[cfg(test)]
 mod tests {
-    use crate::sync::Arc;
+    use crate::{sync::Arc, MAIN_DB_ID};
 
     use turso_parser::ast::{Literal, Name, Operator, TableInternalId, UnaryOperator};
 
     use crate::{
-        schema::{BTreeTable, ColDef, Column, Table, Type},
+        schema::{BTreeCharacteristics, BTreeTable, ColDef, Column, Table, Type},
         translate::plan::{ColumnUsedMask, IterationDirection, JoinedTable, Operation, Scan},
     };
 
@@ -506,27 +512,26 @@ mod tests {
         collation: Option<CollationSeq>,
     ) -> TableReferences {
         let mut table_references = TableReferences::new_empty();
-        let table = Table::BTree(Arc::new(BTreeTable {
-            root_page: 0,
-            has_autoincrement: false,
-            has_rowid: false,
-            is_strict: false,
-            name: "foo".to_string(),
-            primary_key_columns: vec![],
-            columns: vec![Column::new(
-                Some("foo".to_string()),
-                "text".to_string(),
-                None,
-                None,
-                Type::Text,
-                collation,
-                ColDef::default(),
-            )],
-            unique_sets: vec![],
-            foreign_keys: vec![],
-            check_constraints: vec![],
-            rowid_alias_conflict_clause: None,
-        }));
+        let columns = vec![Column::new(
+            Some("foo".to_string()),
+            "text".to_string(),
+            None,
+            None,
+            Type::Text,
+            collation,
+            ColDef::default(),
+        )];
+        let table = Table::BTree(Arc::new(BTreeTable::new(
+            0,
+            "foo".to_string(),
+            vec![],
+            columns,
+            BTreeCharacteristics::empty(),
+            vec![],
+            vec![],
+            vec![],
+            None,
+        )));
         table_references.add_joined_table(JoinedTable {
             op: Operation::Scan(Scan::BTreeTable {
                 iter_dir: IterationDirection::Forwards,
@@ -535,7 +540,7 @@ mod tests {
             col_used_mask: ColumnUsedMask::default(),
             column_use_counts: Vec::new(),
             expression_index_usages: Vec::new(),
-            database_id: 0,
+            database_id: MAIN_DB_ID,
             identifier: "foo".to_string(),
             internal_id: TableInternalId::from(1),
             join_info: None,
@@ -552,6 +557,15 @@ mod tests {
     ) -> TableReferences {
         let mut table_references = TableReferences::new_empty();
         // Left table t1(id=1)
+        let columns = vec![Column::new(
+            Some("a".to_string()),
+            "text".to_string(),
+            None,
+            None,
+            Type::Text,
+            left,
+            ColDef::default(),
+        )];
         table_references.add_joined_table(JoinedTable {
             op: Operation::Scan(Scan::BTreeTable {
                 iter_dir: IterationDirection::Forwards,
@@ -560,34 +574,33 @@ mod tests {
             col_used_mask: ColumnUsedMask::default(),
             column_use_counts: Vec::new(),
             expression_index_usages: Vec::new(),
-            database_id: 0,
+            database_id: MAIN_DB_ID,
             identifier: "t1".to_string(),
             internal_id: TableInternalId::from(1),
             join_info: None,
-            table: Table::BTree(Arc::new(BTreeTable {
-                root_page: 0,
-                has_autoincrement: false,
-                has_rowid: true,
-                is_strict: false,
-                name: "t1".to_string(),
-                primary_key_columns: vec![],
-                columns: vec![Column::new(
-                    Some("a".to_string()),
-                    "text".to_string(),
-                    None,
-                    None,
-                    Type::Text,
-                    left,
-                    ColDef::default(),
-                )],
-                unique_sets: vec![],
-                foreign_keys: vec![],
-                check_constraints: vec![],
-                rowid_alias_conflict_clause: None,
-            })),
+            table: Table::BTree(Arc::new(BTreeTable::new(
+                0,
+                "t1".to_string(),
+                vec![],
+                columns,
+                BTreeCharacteristics::HAS_ROWID,
+                vec![],
+                vec![],
+                vec![],
+                None,
+            ))),
             indexed: None,
         });
         // Right table t2(id=2)
+        let columns = vec![Column::new(
+            Some("b".to_string()),
+            "text".to_string(),
+            None,
+            None,
+            Type::Text,
+            right,
+            ColDef::default(),
+        )];
         table_references.add_joined_table(JoinedTable {
             op: Operation::Scan(Scan::BTreeTable {
                 iter_dir: IterationDirection::Forwards,
@@ -596,31 +609,21 @@ mod tests {
             col_used_mask: ColumnUsedMask::default(),
             column_use_counts: Vec::new(),
             expression_index_usages: Vec::new(),
-            database_id: 0,
+            database_id: MAIN_DB_ID,
             identifier: "t2".to_string(),
             internal_id: TableInternalId::from(2),
             join_info: None,
-            table: Table::BTree(Arc::new(BTreeTable {
-                root_page: 0,
-                has_autoincrement: false,
-                has_rowid: true,
-                is_strict: false,
-                name: "t2".to_string(),
-                primary_key_columns: vec![],
-                columns: vec![Column::new(
-                    Some("b".to_string()),
-                    "text".to_string(),
-                    None,
-                    None,
-                    Type::Text,
-                    right,
-                    ColDef::default(),
-                )],
-                unique_sets: vec![],
-                foreign_keys: vec![],
-                check_constraints: vec![],
-                rowid_alias_conflict_clause: None,
-            })),
+            table: Table::BTree(Arc::new(BTreeTable::new(
+                0,
+                "t2".to_string(),
+                vec![],
+                columns,
+                BTreeCharacteristics::HAS_ROWID,
+                vec![],
+                vec![],
+                vec![],
+                None,
+            ))),
             indexed: None,
         });
         table_references
@@ -631,6 +634,22 @@ mod tests {
     ) -> TableReferences {
         use turso_parser::ast::SortOrder;
         let mut table_references = TableReferences::new_empty();
+        let columns = vec![Column::new(
+            Some("id".to_string()),
+            "INTEGER".to_string(),
+            None,
+            None,
+            Type::Integer,
+            collation,
+            ColDef {
+                primary_key: true,
+                rowid_alias: true,
+                notnull: false,
+                unique: true,
+                hidden: false,
+                notnull_conflict_clause: None,
+            },
+        )];
         table_references.add_joined_table(JoinedTable {
             op: Operation::Scan(Scan::BTreeTable {
                 iter_dir: IterationDirection::Forwards,
@@ -639,39 +658,22 @@ mod tests {
             col_used_mask: ColumnUsedMask::default(),
             column_use_counts: Vec::new(),
             expression_index_usages: Vec::new(),
-            database_id: 0,
+            database_id: MAIN_DB_ID,
             identifier: "bar".to_string(),
             internal_id: TableInternalId::from(1),
             join_info: None,
             indexed: None,
-            table: Table::BTree(Arc::new(BTreeTable {
-                root_page: 0,
-                has_autoincrement: false,
-                has_rowid: true,
-                is_strict: false,
-                name: "bar".to_string(),
-                primary_key_columns: vec![("id".to_string(), SortOrder::Asc)],
-                columns: vec![Column::new(
-                    Some("id".to_string()),
-                    "INTEGER".to_string(),
-                    None,
-                    None,
-                    Type::Integer,
-                    collation,
-                    ColDef {
-                        primary_key: true,
-                        rowid_alias: true,
-                        notnull: false,
-                        unique: true,
-                        hidden: false,
-                        notnull_conflict_clause: None,
-                    },
-                )],
-                unique_sets: vec![],
-                foreign_keys: vec![],
-                check_constraints: vec![],
-                rowid_alias_conflict_clause: None,
-            })),
+            table: Table::BTree(Arc::new(BTreeTable::new(
+                0,
+                "bar".to_string(),
+                vec![("id".to_string(), SortOrder::Asc)],
+                columns,
+                BTreeCharacteristics::HAS_ROWID,
+                vec![],
+                vec![],
+                vec![],
+                None,
+            ))),
         });
         table_references
     }

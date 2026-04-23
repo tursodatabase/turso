@@ -1,5 +1,5 @@
 use crate::function::WindowFunc;
-use crate::schema::{BTreeTable, Table};
+use crate::schema::{BTreeCharacteristics, BTreeTable, Table};
 use crate::sync::Arc;
 use crate::translate::aggregation::{translate_aggregation_step, AggArgumentSource};
 use crate::translate::collate::{get_collseq_from_expr, CollationSeq};
@@ -12,13 +12,15 @@ use crate::translate::plan::{
 };
 use crate::translate::planner::resolve_window_and_aggregate_functions;
 use crate::translate::result_row::emit_select_result;
+use crate::translate::subquery::plan_subqueries_from_select_plan;
 use crate::types::KeyInfo;
 use crate::util::exprs_are_equivalent;
-use crate::vdbe::builder::{CursorType, ProgramBuilder, TableRefIdCounter};
+use crate::vdbe::builder::{CursorType, ProgramBuilder};
 use crate::vdbe::insn::{
     to_u16, {InsertFlags, Insn},
 };
 use crate::vdbe::{BranchOffset, CursorID};
+use crate::Connection;
 use crate::Result;
 use crate::{turso_assert, turso_assert_eq};
 use std::mem;
@@ -29,7 +31,7 @@ const SUBQUERY_DATABASE_ID: usize = 0;
 
 struct WindowSubqueryContext<'a> {
     resolver: &'a Resolver<'a>,
-    subquery_order_by: &'a mut Vec<(Box<Expr>, SortOrder)>,
+    subquery_order_by: &'a mut Vec<(Box<Expr>, SortOrder, Option<turso_parser::ast::NullsOrder>)>,
     subquery_result_columns: &'a mut Vec<ResultSetColumn>,
     subquery_id: &'a TableInternalId,
 }
@@ -87,9 +89,10 @@ struct WindowSubqueryContext<'a> {
 /// );
 /// ```
 pub fn plan_windows(
+    program: &mut ProgramBuilder,
     plan: &mut SelectPlan,
     resolver: &Resolver,
-    table_ref_counter: &mut TableRefIdCounter,
+    connection: &Arc<Connection>,
     windows: &mut Vec<Window>,
 ) -> crate::Result<()> {
     // Remove named windows that are not referenced by any function, as they can be ignored.
@@ -103,24 +106,30 @@ pub fn plan_windows(
         );
     }
 
-    prepare_window_subquery(plan, resolver, table_ref_counter, windows, 0)
+    prepare_window_subquery(program, plan, resolver, connection, windows, 0)
 }
 
 fn prepare_window_subquery(
+    program: &mut ProgramBuilder,
     outer_plan: &mut SelectPlan,
     resolver: &Resolver,
-    table_ref_counter: &mut TableRefIdCounter,
+    connection: &Arc<Connection>,
     windows: &mut Vec<Window>,
     processed_window_count: usize,
 ) -> crate::Result<()> {
     if windows.is_empty() {
+        // The innermost plan holds the original FROM/WHERE/GROUP BY plus any
+        // raw subquery expressions pushed down from outer window layers.
+        // Plan them now so they become SubqueryResult nodes with entries in
+        // non_from_clause_subqueries.
+        plan_subqueries_from_select_plan(program, outer_plan, resolver, connection)?;
         return Ok(());
     }
 
     let mut current_window = windows.swap_remove(0);
     let mut subquery_result_columns = Vec::new();
     let mut subquery_order_by = Vec::new();
-    let subquery_id = table_ref_counter.next();
+    let subquery_id = program.table_reference_counter.next();
 
     if current_window.name.is_none() {
         // This is part of normalizing the window definition. The remaining logic lives in
@@ -152,11 +161,11 @@ fn prepare_window_subquery(
     // columns with its ORDER BY columns.This ensures that rows in the subquery are returned
     // in the correct order for partitioning and window function evaluation.
     for expr in current_window.partition_by.iter_mut() {
-        append_order_by(outer_plan, expr, &SortOrder::Asc, &mut ctx)?;
+        append_order_by(outer_plan, expr, &SortOrder::Asc, None, &mut ctx)?;
         current_window.deduplicated_partition_by_len = Some(ctx.subquery_result_columns.len())
     }
-    for (expr, order) in current_window.order_by.iter_mut() {
-        append_order_by(outer_plan, expr, order, &mut ctx)?;
+    for (expr, order, nulls) in current_window.order_by.iter_mut() {
+        append_order_by(outer_plan, expr, order, *nulls, &mut ctx)?;
     }
 
     // Rewrite expressions from the outer query’s result columns and ORDER BY clause so that
@@ -170,7 +179,7 @@ fn prepare_window_subquery(
             &mut ctx,
         )?;
     }
-    for (expr, _) in outer_plan.order_by.iter_mut() {
+    for (expr, _, _) in outer_plan.order_by.iter_mut() {
         rewrite_terminal_expr(
             &mut outer_plan.aggregates,
             expr,
@@ -186,6 +195,7 @@ fn prepare_window_subquery(
         subquery_result_columns.push(ResultSetColumn {
             expr: Expr::Literal(Literal::Numeric("0".to_string())),
             alias: None,
+            implicit_column_name: None,
             contains_aggregates: false,
         });
     }
@@ -219,12 +229,14 @@ fn prepare_window_subquery(
         input_cardinality_hint: None,
         estimated_output_rows: None,
         simple_aggregate: None,
+        phantom_params: vec![],
     };
 
     prepare_window_subquery(
+        program,
         &mut inner_plan,
         resolver,
-        table_ref_counter,
+        connection,
         windows,
         processed_window_count + 1,
     )?;
@@ -255,6 +267,7 @@ fn append_order_by(
     plan: &mut SelectPlan,
     expr: &mut Expr,
     sort_order: &SortOrder,
+    nulls_order: Option<turso_parser::ast::NullsOrder>,
     ctx: &mut WindowSubqueryContext,
 ) -> crate::Result<()> {
     // Deduplicate: if an equivalent expression already exists in the subquery ORDER BY,
@@ -264,10 +277,10 @@ fn append_order_by(
     let already_exists = ctx
         .subquery_order_by
         .iter()
-        .any(|(existing, _)| exprs_are_equivalent(existing, expr));
+        .any(|(existing, _, _)| exprs_are_equivalent(existing, expr));
     if !already_exists {
         ctx.subquery_order_by
-            .push((Box::new(expr.clone()), *sort_order));
+            .push((Box::new(expr.clone()), *sort_order, nulls_order));
     }
 
     let contains_aggregates =
@@ -327,6 +340,13 @@ fn rewrite_terminal_expr(
                 }
                 Expr::RowId { .. } | Expr::Column { .. } => {
                     rewrite_expr_as_subquery_column(expr, ctx, false);
+                }
+                Expr::SubqueryResult { .. }
+                | Expr::Exists(..)
+                | Expr::InSelect { .. }
+                | Expr::Subquery(..) => {
+                    rewrite_expr_as_subquery_column(expr, ctx, false);
+                    return Ok(WalkControl::SkipChildren);
                 }
                 _ => {}
             }
@@ -419,6 +439,7 @@ fn rewrite_expr_as_subquery_column(
         ctx.subquery_result_columns.push(ResultSetColumn {
             expr: subquery_expr,
             alias: None,
+            implicit_column_name: None,
             contains_aggregates,
         });
     }
@@ -492,7 +513,7 @@ impl EmitWindow {
         window: &'a Window,
         plan: &SelectPlan,
         result_columns: &'a [ResultSetColumn],
-        order_by: &'a [(Box<Expr>, SortOrder)],
+        order_by: &'a [(Box<Expr>, SortOrder, Option<turso_parser::ast::NullsOrder>)],
     ) -> crate::Result<()> {
         let joined_tables = &plan.joined_tables();
         turso_assert_eq!(joined_tables.len(), 1, "expected only one joined table");
@@ -519,23 +540,21 @@ impl EmitWindow {
         let window_function_count = window.functions.len();
 
         // An ephemeral table used to buffer rows for the current frame
-        let buffer_table = Arc::new(BTreeTable {
-            root_page: 0,
+        let buffer_table = Arc::new(BTreeTable::new(
+            0,
             // TODO: Generating the name this way may cause collisions with real tables in the
-            //  attached database. Other ephemeral tables are created similarly, so it’s left
+            //  attached database. Other ephemeral tables are created similarly, so it's left
             //  as-is for now. Ideally, there should be a way to mark tables as ephemeral so
             //  they can be handled differently from regular tables.
-            name: format!("buffer_table_{window_name}"),
-            has_rowid: true,
-            primary_key_columns: vec![],
-            columns: src_columns,
-            is_strict: false,
-            unique_sets: vec![],
-            has_autoincrement: false,
-            foreign_keys: vec![],
-            check_constraints: vec![],
-            rowid_alias_conflict_clause: None,
-        });
+            format!("buffer_table_{window_name}"),
+            vec![],
+            src_columns,
+            BTreeCharacteristics::HAS_ROWID,
+            vec![],
+            vec![],
+            vec![],
+            None,
+        ));
         let cursor_buffer_read =
             program.alloc_cursor_id(CursorType::BTreeTable(buffer_table.clone()));
         let cursor_buffer_write =
@@ -672,7 +691,7 @@ fn alloc_optional_registers(program: &mut ProgramBuilder, count: usize) -> Optio
 
 fn collect_expressions_referencing_subquery<'a>(
     result_columns: &'a [ResultSetColumn],
-    order_by: &'a [(Box<Expr>, SortOrder)],
+    order_by: &'a [(Box<Expr>, SortOrder, Option<turso_parser::ast::NullsOrder>)],
     subquery_id: &TableInternalId,
 ) -> crate::Result<Vec<(&'a Expr, usize)>> {
     let mut expressions_referencing_subquery: Vec<(&'a Expr, usize)> = Vec::new();
@@ -680,7 +699,7 @@ fn collect_expressions_referencing_subquery<'a>(
     for root_expr in result_columns
         .iter()
         .map(|col| &col.expr)
-        .chain(order_by.iter().map(|(e, _)| e.as_ref()))
+        .chain(order_by.iter().map(|(e, _, _)| e.as_ref()))
     {
         walk_expr(
             root_expr,
@@ -740,6 +759,7 @@ fn emit_flush_buffer_if_new_partition(
             .map(|_| KeyInfo {
                 sort_order: SortOrder::Asc,
                 collation: CollationSeq::default(),
+                nulls_order: None,
             })
             .collect::<Vec<_>>();
         for (i, c) in compare_key_info
@@ -857,6 +877,7 @@ fn emit_flush_buffer_if_not_peer(
             .map(|_| KeyInfo {
                 sort_order: SortOrder::Asc,
                 collation: CollationSeq::default(),
+                nulls_order: None,
             })
             .collect::<Vec<_>>();
         for (i, c) in compare_key_info
@@ -907,7 +928,7 @@ fn emit_load_order_by_columns(
         // Source columns are deduplicated and may appear in a different order than
         // the ORDER BY terms. Therefore, we must restore the original ORDER BY layout
         // here by copying the values into an array of registers.
-        for (i, (expr, _)) in window.order_by.iter().enumerate() {
+        for (i, (expr, _, _)) in window.order_by.iter().enumerate() {
             match expr {
                 Expr::Column { column, .. } => {
                     program.emit_insn(Insn::Copy {

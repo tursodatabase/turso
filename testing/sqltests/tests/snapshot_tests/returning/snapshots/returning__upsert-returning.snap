@@ -23,12 +23,12 @@ addr  opcode         p1  p2  p3  p4   p5  comment
    4  SoftNull        3   0   0        0
    5  String8         0   4   0  new   0  r[4]='new'
    6  Integer         0   5   0        0  r[5]=0
-   7  NotNull         2   9   0        0  r[2]!=NULL -> goto 9
-   8  Goto            0  11   0        0
-   9  MustBeInt       2   0   0        0
-  10  Goto            0  12   0        0
-  11  NewRowid        1   2   0        0  r[2]=rowid
-  12  Affinity        3   3   0        0  r[3..6] = D, B, D
+   7  Affinity        3   3   0        0  r[3..6] = D, B, D
+   8  NotNull         2  10   0        0  r[2]!=NULL -> goto 10
+   9  Goto            0  12   0        0
+  10  MustBeInt       2   0   0        0
+  11  Goto            0  13   0        0
+  12  NewRowid        1   2   0        0  r[2]=rowid
   13  NotExists       1  16   2        0
   14  Copy            2   1   0        0  r[1]=r[2]
   15  Goto            0  28   0        0
@@ -47,7 +47,7 @@ addr  opcode         p1  p2  p3  p4   p5  comment
   28  SeekRowid       1   1  49        0  if (r[1]!=cursor 1 for table t2.rowid) goto 49
   29  RowId           1  15   0        0  r[15]=t2.rowid
   30  Column          1   1  16        0  r[16]=t2.name
-  31  Column          1   2  17        0  r[17]=t2.counter
+  31  Column          1   2  17  0     0  r[17]=t2.counter
   32  Copy           15  18   2        0  r[18]=r[15]
   33  Copy           17  21   0        0  r[21]=r[17]
   34  Integer         1  22   0        0  r[22]=1

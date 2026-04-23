@@ -1,0 +1,149 @@
+@database :memory:
+
+setup schema {
+    CREATE TABLE test1(f1 int, f2 int);
+    CREATE TABLE test2(t1 text, t2 text);
+    INSERT INTO test1 VALUES(11, 22);
+    INSERT INTO test1 VALUES(33, 44);
+    INSERT INTO test2 VALUES('abc', 'xyz');
+}
+
+# full_column_names=ON: explicit column refs use TABLE.COLUMN
+@setup schema
+@backend cli
+test full-column-names-explicit {
+    .headers on
+    PRAGMA full_column_names=ON;
+    SELECT f1 FROM test1 ORDER BY f2;
+}
+expect {
+    test1.f1
+    11
+    33
+}
+
+# AS alias overrides full_column_names
+@setup schema
+@backend cli
+test full-column-names-alias-overrides {
+    .headers on
+    PRAGMA full_column_names=ON;
+    SELECT f1 as 'f1' FROM test1 ORDER BY f2;
+}
+expect {
+    f1
+    11
+    33
+}
+
+# SELECT * with full=ON, short=ON (default): no table prefix
+@setup schema
+@backend cli
+test full-column-names-star-short-on {
+    .headers on
+    PRAGMA full_column_names=ON;
+    PRAGMA short_column_names=ON;
+    SELECT * FROM test1 WHERE f1==11;
+}
+expect {
+    f1|f2
+    11|22
+}
+
+# short=OFF, full=OFF: use original expression text
+@setup schema
+@backend cli
+test both-off-expression-text {
+    .headers on
+    PRAGMA short_column_names=OFF;
+    PRAGMA full_column_names=OFF;
+    SELECT test1 . f1, test1 . f2 FROM test1 LIMIT 1;
+}
+expect {
+    test1 . f1|test1 . f2
+    11|22
+}
+
+# short=OFF, full=ON: fully qualified names
+@setup schema
+@backend cli
+test short-off-full-on {
+    .headers on
+    PRAGMA short_column_names=OFF;
+    PRAGMA full_column_names=ON;
+    SELECT test1 . f1, test1 . f2 FROM test1 LIMIT 1;
+}
+expect {
+    test1.f1|test1.f2
+    11|22
+}
+
+# longNames (full=ON, short=OFF): SELECT * uses alias prefix
+@setup schema
+@backend cli
+test long-names-star-with-aliases {
+    .headers on
+    PRAGMA full_column_names=ON;
+    PRAGMA short_column_names=OFF;
+    SELECT * FROM test1 a, test1 b LIMIT 1;
+}
+expect {
+    a.f1|a.f2|b.f1|b.f2
+    11|22|11|22
+}
+
+# full=ON: explicit refs use real table name, not alias
+@setup schema
+@backend cli
+test full-on-uses-real-table-name {
+    .headers on
+    PRAGMA full_column_names=ON;
+    PRAGMA short_column_names=OFF;
+    SELECT a.f1, b.f2 FROM test1 a, test1 b LIMIT 1;
+}
+expect {
+    test1.f1|test1.f2
+    11|22
+}
+
+# full=ON: columns from different tables
+@setup schema
+@backend cli
+test full-on-different-tables {
+    .headers on
+    PRAGMA full_column_names=ON;
+    PRAGMA short_column_names=OFF;
+    SELECT f1, t1 FROM test1, test2 LIMIT 1;
+}
+expect {
+    test1.f1|test2.t1
+    11|abc
+}
+
+# short=ON, full=OFF (default): just column names
+@setup schema
+@backend cli
+test default-short-column-names {
+    .headers on
+    PRAGMA short_column_names=ON;
+    PRAGMA full_column_names=OFF;
+    SELECT a.f1, b.f1 FROM test1 a, test1 b LIMIT 1;
+}
+expect {
+    f1|f1
+    11|11
+}
+
+# longNames with subquery
+@setup schema
+@backend cli
+test full-column-names-subquery-naming {
+    .headers on
+    PRAGMA full_column_names=ON;
+    PRAGMA short_column_names=OFF;
+    SELECT * FROM test1 a, (SELECT 5, 6) LIMIT 1;
+}
+expect {
+    a.f1|a.f2|(subquery-1).5|(subquery-1).6
+    11|22|5|6
+}

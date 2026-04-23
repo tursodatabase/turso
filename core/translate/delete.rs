@@ -12,13 +12,57 @@ use crate::translate::subquery::{
     plan_subqueries_from_returning, plan_subqueries_from_select_plan,
     plan_subqueries_from_where_clause,
 };
-use crate::translate::trigger_exec::has_relevant_triggers_type_only;
+use crate::translate::trigger_exec::has_triggers_including_temp;
 use crate::util::normalize_ident;
 use crate::vdbe::builder::{ProgramBuilder, ProgramBuilderOpts};
 use crate::Result;
 use turso_parser::ast::{Expr, Limit, QualifiedName, ResultColumn, TriggerEvent, With};
 
 use super::plan::{ColumnUsedMask, JoinedTable, TableReferences, WhereTerm};
+
+// validate the delete statment, returning the underlying table if validation passes
+fn validate_delete(
+    resolver: &Resolver,
+    tbl_name: &str,
+    database_id: usize,
+    program: &mut ProgramBuilder,
+    connection: &Arc<crate::Connection>,
+) -> Result<Arc<Table>> {
+    // Check if this is a system table that should be protected from direct writes
+    if !connection.is_nested_stmt()
+        && !connection.is_mvcc_bootstrap_connection()
+        && crate::schema::is_system_table(tbl_name)
+    {
+        crate::bail_parse_error!("table {tbl_name} may not be modified");
+    }
+    let table = match resolver.with_schema(database_id, |s| s.get_table(tbl_name)) {
+        Some(table) => table,
+        None => crate::bail_parse_error!("no such table: {}", tbl_name),
+    };
+    if program.trigger.is_some() && table.virtual_table().is_some() {
+        crate::bail_parse_error!("unsafe use of virtual table \"{}\"", tbl_name);
+    }
+
+    // Check if this is a materialized view
+    if resolver.schema().is_materialized_view(tbl_name) {
+        crate::bail_parse_error!("cannot modify materialized view {}", tbl_name);
+    }
+
+    // Check if this table has any incompatible dependent views
+    resolver.schema().with_incompatible_dependent_views(tbl_name, |views| {
+    if !views.is_empty() {
+        use crate::incremental::compiler::DBSP_CIRCUIT_VERSION;
+        crate::bail_parse_error!(
+            "Cannot DELETE from table '{tbl_name}' because it has incompatible dependent materialized view(s): {}. \n\
+             These views were created with a different DBSP version than the current version ({DBSP_CIRCUIT_VERSION}). \n\
+             Please DROP and recreate the view(s) before modifying this table.",
+            views.iter().fold(String::new(), |_, s| s.to_string() + ", "),
+        );
+    }
+    Ok(())
+    })?;
+    Ok(table)
+}
 
 #[allow(clippy::too_many_arguments)]
 pub fn translate_delete(
@@ -32,26 +76,24 @@ pub fn translate_delete(
     program: &mut ProgramBuilder,
     connection: &Arc<crate::Connection>,
 ) -> Result<()> {
-    let database_id = resolver.resolve_database_id(tbl_name)?;
+    let database_id = resolver.resolve_existing_table_database_id_qualified(tbl_name)?;
     let normalized_table_name = normalize_ident(tbl_name.name.as_str());
+    let table = validate_delete(
+        resolver,
+        &normalized_table_name,
+        database_id,
+        program,
+        connection,
+    )?;
 
-    // Check if this is a system table that should be protected from direct writes
-    if !connection.is_nested_stmt()
-        && !connection.is_mvcc_bootstrap_connection()
-        && crate::schema::is_system_table(&normalized_table_name)
-    {
-        crate::bail_parse_error!("table {} may not be modified", normalized_table_name);
-    }
-
-    if crate::is_attached_db(database_id) {
-        let schema_cookie = resolver.with_schema(database_id, |s| s.schema_version);
-        program.begin_write_on_database(database_id, schema_cookie);
-    }
+    let schema_cookie = resolver.with_schema(database_id, |s| s.schema_version);
+    program.begin_write_on_database(database_id, schema_cookie);
 
     let mut delete_plan = prepare_delete_plan(
         program,
         resolver,
         tbl_name,
+        table,
         where_clause,
         limit,
         returning,
@@ -123,11 +165,7 @@ pub fn translate_delete(
         connection,
         database_id,
     )?;
-    let opts = ProgramBuilderOpts {
-        num_cursors: 1,
-        approx_num_insns: estimate_num_instructions(delete),
-        approx_num_labels: 0,
-    };
+    let opts = ProgramBuilderOpts::new(1, estimate_num_instructions(delete), 0);
     program.extend(&opts);
     emit_program(connection, resolver, program, delete_plan, |_| {})?;
     Ok(())
@@ -137,7 +175,8 @@ pub fn translate_delete(
 pub fn prepare_delete_plan(
     program: &mut ProgramBuilder,
     resolver: &Resolver,
-    tbl_name: &QualifiedName,
+    qualified_name: &QualifiedName,
+    table: Arc<Table>,
     where_clause: Option<Box<Expr>>,
     limit: Option<Limit>,
     mut returning: Vec<ResultColumn>,
@@ -146,37 +185,9 @@ pub fn prepare_delete_plan(
     connection: &Arc<crate::Connection>,
     database_id: usize,
 ) -> Result<Plan> {
-    let table_name = normalize_ident(tbl_name.name.as_str());
     let schema = resolver.schema();
-    let table = match resolver.with_schema(database_id, |s| s.get_table(&table_name)) {
-        Some(table) => table,
-        None => crate::bail_parse_error!("no such table: {}", table_name),
-    };
-    if program.trigger.is_some() && table.virtual_table().is_some() {
-        crate::bail_parse_error!("unsafe use of virtual table \"{}\"", table_name);
-    }
-
-    // Check if this is a materialized view
-    if schema.is_materialized_view(&table_name) {
-        crate::bail_parse_error!("cannot modify materialized view {}", table_name);
-    }
-
-    // Check if this table has any incompatible dependent views
-    let incompatible_views = schema.has_incompatible_dependent_views(&table_name);
-    if !incompatible_views.is_empty() {
-        use crate::incremental::compiler::DBSP_CIRCUIT_VERSION;
-        crate::bail_parse_error!(
-            "Cannot DELETE from table '{}' because it has incompatible dependent materialized view(s): {}. \n\
-             These views were created with a different DBSP version than the current version ({}). \n\
-             Please DROP and recreate the view(s) before modifying this table.",
-            table_name,
-            incompatible_views.join(", "),
-            DBSP_CIRCUIT_VERSION
-        );
-    }
 
     let btree_table_for_triggers = table.btree();
-
     let table = if let Some(table) = table.virtual_table() {
         Table::Virtual(table)
     } else if let Some(table) = table.btree() {
@@ -188,10 +199,7 @@ pub fn prepare_delete_plan(
     let joined_tables = vec![JoinedTable {
         op: Operation::default_scan_for(&table),
         table,
-        identifier: tbl_name
-            .alias
-            .as_ref()
-            .map_or_else(|| table_name.clone(), |alias| alias.as_str().to_string()),
+        identifier: qualified_name.identifier(),
         internal_id: program.table_reference_counter.next(),
         join_info: None,
         col_used_mask: ColumnUsedMask::default(),
@@ -241,9 +249,7 @@ pub fn prepare_delete_plan(
     let has_delete_triggers = btree_table_for_triggers
         .as_ref()
         .map(|bt| {
-            resolver.with_schema(database_id, |s| {
-                has_relevant_triggers_type_only(s, TriggerEvent::Delete, None, bt)
-            })
+            has_triggers_including_temp(resolver, database_id, TriggerEvent::Delete, None, bt)
         })
         .unwrap_or(false);
 
@@ -274,7 +280,7 @@ pub fn prepare_delete_plan(
         ensure_delete_uses_rowset(program, &mut delete_plan);
     }
 
-    Ok(Plan::Delete(delete_plan))
+    Ok(Plan::Delete(Box::new(delete_plan)))
 }
 
 /// Check if any WHERE predicate contains a subquery (Subquery, InSelect, or Exists).
@@ -360,6 +366,7 @@ fn ensure_delete_uses_rowset(program: &mut ProgramBuilder, plan: &mut DeletePlan
                 table: rowid_internal_id,
             },
             alias: None,
+            implicit_column_name: None,
             contains_aggregates: false,
         }],
         where_clause: std::mem::take(&mut plan.where_clause),
@@ -389,6 +396,7 @@ fn ensure_delete_uses_rowset(program: &mut ProgramBuilder, plan: &mut DeletePlan
         input_cardinality_hint: None,
         estimated_output_rows: None,
         simple_aggregate: None,
+        phantom_params: vec![],
     };
     plan.rowset_plan = Some(rowset_plan);
 }

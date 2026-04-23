@@ -63,6 +63,9 @@ impl IO for TestIo {
     fn remove_file(&self, path: &str) -> turso_core::Result<()> {
         self.io.remove_file(path)
     }
+    fn file_id(&self, path: &str) -> turso_core::Result<turso_core::io::FileId> {
+        self.io.file_id(path)
+    }
     fn cancel(&self, c: &[turso_core::Completion]) -> turso_core::Result<()> {
         self.io.cancel(c)
     }
@@ -588,6 +591,29 @@ pub fn compute_dbhash_with_options(
 ) -> turso_dbhash::DbHashResult {
     let path = tmp_db.path.to_str().unwrap();
     turso_dbhash::hash_database(path, options).expect("dbhash failed")
+}
+
+/// Compute dbhash while opening the database with explicit feature flags.
+pub fn compute_dbhash_with_database_opts(
+    tmp_db: &TempDatabase,
+    database_opts: turso_core::DatabaseOpts,
+) -> turso_dbhash::DbHashResult {
+    compute_dbhash_with_options_and_database_opts(
+        tmp_db,
+        &turso_dbhash::DbHashOptions::default(),
+        database_opts,
+    )
+}
+
+/// Compute dbhash with custom hash options and explicit database feature flags.
+pub fn compute_dbhash_with_options_and_database_opts(
+    tmp_db: &TempDatabase,
+    options: &turso_dbhash::DbHashOptions,
+    database_opts: turso_core::DatabaseOpts,
+) -> turso_dbhash::DbHashResult {
+    let path = tmp_db.path.to_str().unwrap();
+    turso_dbhash::hash_database_with_database_opts(path, options, database_opts)
+        .expect("dbhash failed")
 }
 
 /// Assert that checkpoint does not change database content.

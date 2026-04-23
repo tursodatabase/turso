@@ -102,3 +102,34 @@ expect {
     4
 }
 
+@cross-check-integrity
+test total-changes-includes-trigger-body-rows {
+    create table t(a);
+    create table log(msg);
+    create trigger tr after insert on t begin
+        insert into log values('x');
+    end;
+
+    insert into t values(1);
+    select total_changes();
+}
+expect {
+    2
+}
+
+@cross-check-integrity
+test total-changes-includes-fk-cascade-rows {
+    pragma foreign_keys = on;
+    create table p(id integer primary key);
+    create table c(pid integer references p(id) on delete cascade);
+
+    insert into p values(1);
+    insert into c values(1);
+    delete from p where id = 1;
+    select changes();
+    select total_changes();
+}
+expect {
+    1
+    4
+}

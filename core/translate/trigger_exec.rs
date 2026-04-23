@@ -1,12 +1,13 @@
 use crate::schema::{BTreeTable, Trigger};
 use crate::sync::Arc;
 use crate::translate::expr::WalkControl;
+use crate::translate::plan::ColumnMask;
 use crate::translate::subquery::{
     emit_non_from_clause_subquery, plan_subqueries_from_trigger_when_clause,
 };
 use crate::translate::{
     emitter::Resolver,
-    expr::{self, rewrite_between_expr, translate_expr, walk_expr_mut},
+    expr::{self, translate_expr, walk_expr_mut},
     planner::ROWID_STRS,
     translate_inner, ProgramBuilder, ProgramBuilderOpts,
 };
@@ -14,8 +15,8 @@ use crate::util::normalize_ident;
 use crate::vdbe::affinity::Affinity;
 use crate::vdbe::insn::Insn;
 use crate::vdbe::BranchOffset;
-use crate::HashSet;
 use crate::{bail_parse_error, QueryMode, Result};
+use std::cell::RefCell;
 use std::num::NonZero;
 use turso_parser::ast::{self, Expr, TriggerEvent, TriggerTime};
 
@@ -105,22 +106,89 @@ impl TriggerContext {
     }
 }
 
+/// Allocates parameter indices on demand for NEW/OLD column references.
+/// Only columns actually referenced in the trigger body get assigned a parameter,
+/// reducing bind_at calls from N (total columns) to K (referenced columns).
 #[derive(Debug)]
-struct ParamMap(Vec<NonZero<usize>>);
+struct ParamAllocator {
+    /// For each column index, the assigned 1-based parameter index, or None if unreferenced.
+    new_entries: Vec<Option<NonZero<usize>>>,
+    /// Parameter index for NEW.rowid, if referenced.
+    new_rowid: Option<NonZero<usize>>,
+    /// For each column index, the assigned 1-based parameter index, or None if unreferenced.
+    old_entries: Vec<Option<NonZero<usize>>>,
+    /// Parameter index for OLD.rowid, if referenced.
+    old_rowid: Option<NonZero<usize>>,
+    /// Next parameter index to assign (starts at 1).
+    next_param: usize,
+}
 
-impl ParamMap {
-    pub fn len(&self) -> usize {
-        self.0.len()
+impl ParamAllocator {
+    fn new(num_cols: usize, has_new: bool, has_old: bool) -> Self {
+        Self {
+            new_entries: if has_new {
+                vec![None; num_cols]
+            } else {
+                vec![]
+            },
+            new_rowid: None,
+            old_entries: if has_old {
+                vec![None; num_cols]
+            } else {
+                vec![]
+            },
+            old_rowid: None,
+            next_param: 1,
+        }
+    }
+
+    fn alloc_new(&mut self, col_idx: usize) -> NonZero<usize> {
+        *self.new_entries[col_idx].get_or_insert_with(|| {
+            let p = NonZero::new(self.next_param).unwrap();
+            self.next_param += 1;
+            p
+        })
+    }
+
+    fn alloc_new_rowid(&mut self) -> NonZero<usize> {
+        *self.new_rowid.get_or_insert_with(|| {
+            let p = NonZero::new(self.next_param).unwrap();
+            self.next_param += 1;
+            p
+        })
+    }
+
+    fn alloc_old(&mut self, col_idx: usize) -> NonZero<usize> {
+        *self.old_entries[col_idx].get_or_insert_with(|| {
+            let p = NonZero::new(self.next_param).unwrap();
+            self.next_param += 1;
+            p
+        })
+    }
+
+    fn alloc_old_rowid(&mut self) -> NonZero<usize> {
+        *self.old_rowid.get_or_insert_with(|| {
+            let p = NonZero::new(self.next_param).unwrap();
+            self.next_param += 1;
+            p
+        })
+    }
+
+    /// Total number of parameters allocated so far.
+    fn num_params(&self) -> usize {
+        self.next_param - 1
     }
 }
 
 /// Context for compiling trigger subprograms - maps NEW/OLD to parameter indices
 #[derive(Debug)]
 struct TriggerSubprogramContext {
-    /// Map from column index to parameter index for NEW values (1-indexed)
-    new_param_map: Option<ParamMap>,
-    /// Map from column index to parameter index for OLD values (1-indexed)
-    old_param_map: Option<ParamMap>,
+    /// Sparse parameter allocator (allocates on demand during AST rewrite)
+    param_alloc: RefCell<ParamAllocator>,
+    /// Whether this trigger has NEW registers
+    has_new: bool,
+    /// Whether this trigger has OLD registers
+    has_old: bool,
     table: Arc<BTreeTable>,
     /// Override conflict resolution for statements within this trigger.
     override_conflict: Option<ast::ResolveType>,
@@ -139,27 +207,31 @@ fn variable_from_parameter_index(index: NonZero<usize>) -> Expr {
 
 impl TriggerSubprogramContext {
     pub fn get_new_param(&self, idx: usize) -> Option<NonZero<usize>> {
-        self.new_param_map
-            .as_ref()
-            .and_then(|map| map.0.get(idx).copied())
+        if !self.has_new {
+            return None;
+        }
+        Some(self.param_alloc.borrow_mut().alloc_new(idx))
     }
 
     pub fn get_new_rowid_param(&self) -> Option<NonZero<usize>> {
-        self.new_param_map
-            .as_ref()
-            .and_then(|map| map.0.last().copied())
+        if !self.has_new {
+            return None;
+        }
+        Some(self.param_alloc.borrow_mut().alloc_new_rowid())
     }
 
     pub fn get_old_param(&self, idx: usize) -> Option<NonZero<usize>> {
-        self.old_param_map
-            .as_ref()
-            .and_then(|map| map.0.get(idx).copied())
+        if !self.has_old {
+            return None;
+        }
+        Some(self.param_alloc.borrow_mut().alloc_old(idx))
     }
 
     pub fn get_old_rowid_param(&self) -> Option<NonZero<usize>> {
-        self.old_param_map
-            .as_ref()
-            .and_then(|map| map.0.last().copied())
+        if !self.has_old {
+            return None;
+        }
+        Some(self.param_alloc.borrow_mut().alloc_old_rowid())
     }
 }
 
@@ -346,7 +418,8 @@ fn rewrite_trigger_expr_single_for_subprogram(
 
             // Handle NEW.column references
             if ns.eq_ignore_ascii_case("new") {
-                if let Some(new_params) = &ctx.new_param_map {
+                if ctx.has_new {
+                    let num_cols = ctx.table.columns().len();
                     if let Some((idx, col_def)) = ctx.table.get_column(&col) {
                         if col_def.is_rowid_alias() {
                             *e = variable_from_parameter_index(
@@ -355,14 +428,14 @@ fn rewrite_trigger_expr_single_for_subprogram(
                             );
                             return Ok(());
                         }
-                        if idx < new_params.len() {
+                        if idx < num_cols {
                             *e = variable_from_parameter_index(
                                 ctx.get_new_param(idx)
                                     .expect("NEW parameters must be provided"),
                             );
                             return Ok(());
                         } else {
-                            crate::bail_parse_error!("no such column in NEW: {}", col);
+                            crate::bail_parse_error!("no such column: {}.{}", ns, col);
                         }
                     }
                     // Handle NEW.rowid
@@ -373,7 +446,7 @@ fn rewrite_trigger_expr_single_for_subprogram(
                         );
                         return Ok(());
                     }
-                    bail_parse_error!("no such column in NEW: {}", col);
+                    bail_parse_error!("no such column: {}.{}", ns, col);
                 } else {
                     bail_parse_error!(
                         "NEW references are only valid in INSERT and UPDATE triggers"
@@ -383,7 +456,8 @@ fn rewrite_trigger_expr_single_for_subprogram(
 
             // Handle OLD.column references
             if ns.eq_ignore_ascii_case("old") {
-                if let Some(old_params) = &ctx.old_param_map {
+                if ctx.has_old {
+                    let num_cols = ctx.table.columns().len();
                     if let Some((idx, col_def)) = ctx.table.get_column(&col) {
                         if col_def.is_rowid_alias() {
                             *e = variable_from_parameter_index(
@@ -392,14 +466,14 @@ fn rewrite_trigger_expr_single_for_subprogram(
                             );
                             return Ok(());
                         }
-                        if idx < old_params.len() {
+                        if idx < num_cols {
                             *e = variable_from_parameter_index(
                                 ctx.get_old_param(idx)
                                     .expect("OLD parameters must be provided"),
                             );
                             return Ok(());
                         } else {
-                            crate::bail_parse_error!("no such column in OLD: {}", col)
+                            crate::bail_parse_error!("no such column: {}.{}", ns, col)
                         }
                     }
                     // Handle OLD.rowid
@@ -410,7 +484,7 @@ fn rewrite_trigger_expr_single_for_subprogram(
                         );
                         return Ok(());
                     }
-                    bail_parse_error!("no such column in OLD: {}", col);
+                    bail_parse_error!("no such column: {}.{}", ns, col);
                 } else {
                     bail_parse_error!(
                         "OLD references are only valid in UPDATE and DELETE triggers"
@@ -440,48 +514,46 @@ fn execute_trigger_commands(
     database_id: usize,
     ignore_jump_target: BranchOffset,
 ) -> Result<bool> {
+    struct TriggerCompilationGuard {
+        connection: Arc<crate::Connection>,
+    }
+
+    impl Drop for TriggerCompilationGuard {
+        fn drop(&mut self) {
+            self.connection.end_trigger_compilation();
+        }
+    }
+
     if connection.trigger_is_compiling(trigger) {
         // Do not recursively compile the same trigger
         return Ok(false);
     }
     connection.start_trigger_compilation(trigger.clone());
-    // Build parameter mapping: parameters are 1-indexed and sequential
-    // Order: [NEW values..., OLD values..., rowid]
-    // So if we have 2 NEW columns, 2 OLD columns: NEW params are 1,2; OLD params are 3,4; rowid is 5
-    let num_new = ctx.new_registers.as_ref().map(|r| r.len()).unwrap_or(0);
+    let _trigger_compilation_guard = TriggerCompilationGuard {
+        connection: connection.clone(),
+    };
 
-    let new_param_map = ctx
-        .new_registers
-        .as_ref()
-        .map(|new_regs| {
-            (1..=new_regs.len())
-                .map(|i| NonZero::new(i).unwrap())
-                .collect()
-        })
-        .map(ParamMap);
+    let has_new = ctx.new_registers.is_some();
+    let has_old = ctx.old_registers.is_some();
+    let num_cols = ctx.table.columns().len();
 
-    let old_param_map = ctx
-        .old_registers
-        .as_ref()
-        .map(|old_regs| {
-            (1..=old_regs.len())
-                .map(|i| NonZero::new(i + num_new).unwrap())
-                .collect()
-        })
-        .map(ParamMap);
-
-    // For triggers on attached databases, resolve the database name so unqualified
-    // table references in the trigger body are correctly qualified to the trigger's database.
-    let db_name = if database_id == crate::MAIN_DB_ID {
+    // Ordinary non-main triggers need unqualified DML targets rewritten into the
+    // trigger's schema. Temp-backed triggers intentionally keep unqualified names
+    // unresolved so they can follow SQLite's normal temp/main lookup rules.
+    let db_name = if database_id == crate::MAIN_DB_ID || database_id == crate::TEMP_DB_ID {
         None
     } else {
         resolver
             .get_database_name_by_index(database_id)
             .map(ast::Name::exact)
     };
+    // Parameter indices are allocated on demand during the AST rewrite.
+    // Only columns actually referenced in the trigger body get a parameter,
+    // reducing bind_at calls from N (all columns) to K (referenced columns).
     let subprogram_ctx = TriggerSubprogramContext {
-        new_param_map,
-        old_param_map,
+        param_alloc: RefCell::new(ParamAllocator::new(num_cols, has_new, has_old)),
+        has_new,
+        has_old,
         table: ctx.table.clone(),
         override_conflict: ctx.override_conflict,
         db_name,
@@ -489,11 +561,7 @@ fn execute_trigger_commands(
     let mut subprogram_builder = ProgramBuilder::new_for_trigger(
         QueryMode::Normal,
         program.capture_data_changes_info().clone(),
-        ProgramBuilderOpts {
-            num_cursors: 1,
-            approx_num_insns: 32,
-            approx_num_labels: 2,
-        },
+        ProgramBuilderOpts::new(1, 32, 2),
         trigger.clone(),
     );
     // If we have an override_conflict (e.g. from UPSERT DO UPDATE context),
@@ -502,8 +570,14 @@ fn execute_trigger_commands(
         subprogram_builder.set_trigger_conflict_override(override_conflict);
     }
     // Restrict table resolution to the trigger's database during subprogram compilation.
+    // Temp triggers live in TEMP_DB_ID, regardless of which database the target table is in.
+    let trigger_database_id = if trigger.temporary {
+        crate::TEMP_DB_ID
+    } else {
+        database_id
+    };
     let prev_trigger_context = resolver.trigger_context.clone();
-    resolver.set_trigger_context(database_id, trigger.name.clone());
+    resolver.set_trigger_context(trigger_database_id, trigger.name.clone());
     let compile_result = (|| -> Result<()> {
         for command in trigger.commands.iter() {
             let stmt = trigger_cmd_to_stmt_for_subprogram(command, &subprogram_ctx)?;
@@ -515,6 +589,14 @@ fn execute_trigger_commands(
                 connection,
                 "trigger subprogram",
             )?;
+            if matches!(
+                command,
+                ast::TriggerCmd::Insert { .. }
+                    | ast::TriggerCmd::Update { .. }
+                    | ast::TriggerCmd::Delete { .. }
+            ) {
+                subprogram_builder.emit_insn(Insn::ResetCount);
+            }
         }
         Ok(())
     })();
@@ -524,34 +606,64 @@ fn execute_trigger_commands(
     subprogram_builder.epilogue(resolver.schema());
     let built_subprogram =
         subprogram_builder.build(connection.clone(), true, "trigger subprogram")?;
+    let subprogram_prepared = built_subprogram.prepared();
 
-    let mut params = Vec::with_capacity(
-        ctx.new_registers.as_ref().map(|r| r.len()).unwrap_or(0)
-            + ctx.old_registers.as_ref().map(|r| r.len()).unwrap_or(0),
-    );
+    // Trigger subprograms do not emit Transaction opcodes, so the parent statement
+    // must acquire any attached/temp database transactions the trigger body needs
+    // before OP_Program enters the subprogram.
+    for db_id in &subprogram_prepared.write_databases {
+        if db_id == crate::MAIN_DB_ID {
+            program.begin_write_operation();
+        } else {
+            let schema_cookie = resolver.with_schema(db_id, |s| s.schema_version);
+            program.begin_write_on_database(db_id, schema_cookie);
+        }
+    }
+    for db_id in &subprogram_prepared.read_databases {
+        if subprogram_prepared.write_databases.get(db_id) {
+            continue;
+        }
+        if db_id == crate::MAIN_DB_ID {
+            program.begin_read_operation();
+        } else {
+            let schema_cookie = resolver.with_schema(db_id, |s| s.schema_version);
+            program.begin_read_on_database(db_id, schema_cookie);
+        }
+    }
+
+    // Build the param_registers Vec from the sparse allocator: maps each parameter
+    // index to the parent register that holds the value.
+    let alloc = subprogram_ctx.param_alloc.borrow();
+    let total_params = alloc.num_params();
+    let mut param_registers = vec![0usize; total_params];
+
     if let Some(new_regs) = &ctx.new_registers {
-        params.extend(
-            new_regs
-                .iter()
-                .copied()
-                .map(|reg_idx| crate::types::Value::from_i64(reg_idx as i64)),
-        );
+        for (col_idx, opt_param) in alloc.new_entries.iter().enumerate() {
+            if let Some(param_idx) = opt_param {
+                param_registers[param_idx.get() - 1] = new_regs[col_idx];
+            }
+        }
+        if let Some(param_idx) = alloc.new_rowid {
+            param_registers[param_idx.get() - 1] = *new_regs.last().unwrap();
+        }
     }
     if let Some(old_regs) = &ctx.old_registers {
-        params.extend(
-            old_regs
-                .iter()
-                .copied()
-                .map(|reg_idx| crate::types::Value::from_i64(reg_idx as i64)),
-        );
+        for (col_idx, opt_param) in alloc.old_entries.iter().enumerate() {
+            if let Some(param_idx) = opt_param {
+                param_registers[param_idx.get() - 1] = old_regs[col_idx];
+            }
+        }
+        if let Some(param_idx) = alloc.old_rowid {
+            param_registers[param_idx.get() - 1] = *old_regs.last().unwrap();
+        }
     }
+    drop(alloc);
 
     program.emit_insn(Insn::Program {
-        params,
+        param_registers,
         program: built_subprogram.prepared().clone(),
         ignore_jump_target,
     });
-    connection.end_trigger_compilation();
 
     Ok(true)
 }
@@ -561,7 +673,7 @@ fn execute_trigger_commands(
 pub fn has_relevant_triggers_type_only(
     schema: &crate::schema::Schema,
     event: TriggerEvent,
-    updated_column_indices: Option<&HashSet<usize>>,
+    updated_column_indices: Option<&ColumnMask>,
     table: &BTreeTable,
 ) -> bool {
     let mut triggers = schema.get_triggers_for_table(table.name.as_str());
@@ -582,7 +694,7 @@ pub fn has_relevant_triggers_type_only(
                 trigger_cols.iter().any(|col_name| {
                     let normalized_col = normalize_ident(col_name.as_str());
                     if let Some((col_idx, _)) = table.get_column(&normalized_col) {
-                        updated_cols.contains(&col_idx)
+                        updated_cols.get(col_idx)
                     } else {
                         // Column doesn't exist - according to SQLite docs, unrecognized
                         // column names in UPDATE OF are silently ignored
@@ -603,7 +715,7 @@ pub fn get_relevant_triggers_type_and_time<'a>(
     schema: &'a crate::schema::Schema,
     event: TriggerEvent,
     time: TriggerTime,
-    updated_column_indices: Option<HashSet<usize>>,
+    updated_column_indices: Option<ColumnMask>,
     table: &'a BTreeTable,
 ) -> impl Iterator<Item = Arc<Trigger>> + 'a + Clone {
     let triggers = schema.get_triggers_for_table(table.name.as_str());
@@ -624,7 +736,7 @@ pub fn get_relevant_triggers_type_and_time<'a>(
                         trigger_cols.iter().any(|col_name| {
                             let normalized_col = normalize_ident(col_name.as_str());
                             if let Some((col_idx, _)) = table.get_column(&normalized_col) {
-                                updated_cols.contains(&col_idx)
+                                updated_cols.get(col_idx)
                             } else {
                                 // Column doesn't exist - according to SQLite docs, unrecognized
                                 // column names in UPDATE OF are silently ignored
@@ -647,6 +759,84 @@ pub fn get_relevant_triggers_type_and_time<'a>(
         .cloned()
 }
 
+/// Like [`get_relevant_triggers_type_and_time`], but also searches the temp
+/// schema when `database_id != TEMP_DB_ID`.  Temp triggers on a non-temp
+/// table are stored in the temp schema, so both schemas must be consulted
+/// for DML on any table.  Returns a combined, de-duplicated list.
+pub fn get_triggers_including_temp(
+    resolver: &Resolver,
+    database_id: usize,
+    event: TriggerEvent,
+    time: TriggerTime,
+    updated_column_indices: Option<ColumnMask>,
+    table: &BTreeTable,
+) -> Vec<Arc<Trigger>> {
+    let mut triggers: Vec<Arc<Trigger>> = resolver.with_schema(database_id, |s| {
+        get_relevant_triggers_type_and_time(
+            s,
+            event.clone(),
+            time,
+            updated_column_indices.clone(),
+            table,
+        )
+        .filter(|trigger| {
+            // In the temp schema, triggers may target a different database.
+            // Only include triggers whose target matches this database.
+            match trigger.target_database_id {
+                Some(target_db) => target_db == database_id,
+                None => true, // unqualified → targets this schema's own table
+            }
+        })
+        .collect()
+    });
+    if database_id != crate::TEMP_DB_ID && resolver.has_temp_database() {
+        let temp_triggers: Vec<Arc<Trigger>> = resolver.with_schema(crate::TEMP_DB_ID, |s| {
+            get_relevant_triggers_type_and_time(s, event, time, updated_column_indices, table)
+                .filter(|trigger| match trigger.target_database_id {
+                    // Explicit qualifier: include if it matches this database.
+                    Some(target_db) => target_db == database_id,
+                    // Unqualified: the trigger targets the temp schema's table if one
+                    // exists, otherwise it targets main/attached. Include it only when
+                    // no temp table with that name shadows it.
+                    None => s.get_table(&trigger.table_name).is_none(),
+                })
+                .collect()
+        });
+        triggers.extend(temp_triggers);
+    }
+    triggers
+}
+
+/// Like [`has_relevant_triggers_type_only`], but also checks the temp schema.
+pub fn has_triggers_including_temp(
+    resolver: &Resolver,
+    database_id: usize,
+    event: TriggerEvent,
+    updated_column_indices: Option<&ColumnMask>,
+    table: &BTreeTable,
+) -> bool {
+    let found = resolver.with_schema(database_id, |s| {
+        has_relevant_triggers_type_only(s, event.clone(), updated_column_indices, table)
+    });
+    if found {
+        return true;
+    }
+    if database_id != crate::TEMP_DB_ID && resolver.has_temp_database() {
+        // Check temp schema for triggers that target this database.
+        let has_temp = resolver.with_schema(crate::TEMP_DB_ID, |s| {
+            s.get_triggers_for_table(table.name.as_str())
+                .any(|trigger| match trigger.target_database_id {
+                    Some(target_db) => target_db == database_id,
+                    None => s.get_table(&trigger.table_name).is_none(),
+                })
+        });
+        if has_temp {
+            return true;
+        }
+    }
+    false
+}
+
 pub fn fire_trigger(
     program: &mut ProgramBuilder,
     resolver: &mut Resolver,
@@ -660,22 +850,18 @@ pub fn fire_trigger(
     // not raw encoded blobs from disk.
     // - OLD registers always come from cursor reads → always encoded → always decode
     // - NEW registers are only encoded for AFTER triggers (post-encode) → decode when new_encoded
-    let decoded_ctx = decode_trigger_registers(program, resolver, ctx)?;
-    // Apply column affinity to copies of NEW values so that both WHEN clauses
-    // and trigger bodies see affinity-applied values (e.g., integer 42 becomes
-    // real 42.0 for REAL columns). SQLite applies affinity before trigger
-    // evaluation via OP_Affinity + OP_Copy before OP_Program.
-    let affinity_ctx = apply_new_column_affinity(program, &decoded_ctx)?;
-    let ctx = &affinity_ctx;
+    //
+    // Column affinity for NEW registers is handled by the parent statement:
+    // - Non-STRICT tables: INSERT/UPDATE emit Insn::Affinity before any trigger fires
+    // - STRICT tables: no column affinity needed (apply_new_column_affinity was a no-op)
+    // So we can use the decoded registers directly, skipping N Copy + 1 Affinity per fire.
+    let ctx = &decode_trigger_registers(program, resolver, ctx)?;
 
     let saved_register_affinities = std::mem::take(&mut resolver.register_affinities);
     populate_trigger_register_affinities(resolver, ctx);
     let result = (|| -> Result<()> {
         // Evaluate WHEN clause if present
         if let Some(mut when_expr) = trigger.when_clause.clone() {
-            // Rewrite BETWEEN expressions to AND/OR form before translation,
-            // since translate_expr expects this rewrite to have already happened.
-            rewrite_between_expr(&mut when_expr);
             // Rewrite NEW/OLD references in WHEN clause to use registers
             rewrite_trigger_expr_for_when_clause(&mut when_expr, &ctx.table, ctx)?;
 
@@ -764,7 +950,7 @@ fn decode_trigger_registers(
         });
     }
 
-    let columns = &ctx.table.columns;
+    let columns = ctx.table.columns();
 
     let decoded_new = if ctx.new_encoded {
         if let Some(new_regs) = &ctx.new_registers {
@@ -807,62 +993,6 @@ fn decode_trigger_registers(
     })
 }
 
-/// Apply column affinity to copies of NEW registers for non-strict tables.
-/// This ensures both WHEN clauses and trigger bodies see affinity-applied values
-/// (e.g., integer 42 becomes real 42.0 for REAL columns), matching SQLite's behavior.
-fn apply_new_column_affinity(
-    program: &mut ProgramBuilder,
-    ctx: &TriggerContext,
-) -> Result<TriggerContext> {
-    let new_registers = if let Some(new_regs) = &ctx.new_registers {
-        let num_cols = ctx.table.columns.len();
-        if !ctx.table.is_strict && num_cols > 0 {
-            let affinities: String = ctx
-                .table
-                .columns
-                .iter()
-                .map(|c| c.affinity().aff_mask())
-                .collect();
-            if affinities.chars().any(|c| c != Affinity::Blob.aff_mask()) {
-                let temp_start = program.alloc_registers(num_cols);
-                for (i, &reg) in new_regs.iter().take(num_cols).enumerate() {
-                    program.emit_insn(Insn::Copy {
-                        src_reg: reg,
-                        dst_reg: temp_start + i,
-                        extra_amount: 0,
-                    });
-                }
-                if let Ok(count) = std::num::NonZeroUsize::try_from(num_cols) {
-                    program.emit_insn(Insn::Affinity {
-                        start_reg: temp_start,
-                        count,
-                        affinities,
-                    });
-                }
-                let mut regs: Vec<usize> = (temp_start..temp_start + num_cols).collect();
-                // Preserve the rowid register (always last in the NEW registers list)
-                if new_regs.len() > num_cols {
-                    regs.push(*new_regs.last().unwrap());
-                }
-                Some(regs)
-            } else {
-                Some(new_regs.clone())
-            }
-        } else {
-            Some(new_regs.clone())
-        }
-    } else {
-        None
-    };
-    Ok(TriggerContext {
-        table: ctx.table.clone(),
-        new_registers,
-        old_registers: ctx.old_registers.clone(),
-        override_conflict: ctx.override_conflict,
-        new_encoded: ctx.new_encoded,
-    })
-}
-
 fn populate_trigger_register_affinities(resolver: &mut Resolver, ctx: &TriggerContext) {
     populate_trigger_row_register_affinities(resolver, &ctx.table, ctx.new_registers.as_deref());
     populate_trigger_row_register_affinities(resolver, &ctx.table, ctx.old_registers.as_deref());
@@ -877,7 +1007,7 @@ fn populate_trigger_row_register_affinities(
         return;
     };
 
-    for (idx, column) in table.columns.iter().enumerate() {
+    for (idx, column) in table.columns().iter().enumerate() {
         let affinity = if column.is_rowid_alias() {
             Affinity::Integer
         } else {

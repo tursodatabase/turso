@@ -1,6 +1,8 @@
-use crate::translate::emitter::HashLabels;
-
 use super::*;
+use crate::schema::GeneratedType;
+use crate::translate::emitter::HashLabels;
+use crate::translate::plan::ColumnUsedMask;
+use crate::vdbe::builder::SelfTableContext;
 
 #[derive(Debug, Clone)]
 /// Payload layout metadata recorded during hash-build planning or reuse.
@@ -34,7 +36,7 @@ fn expr_references_outer_query(expr: &Expr, table_references: &TableReferences) 
 /// Static configuration for a fresh hash-table build.
 struct HashBuildConfig {
     payload_columns: Vec<MaterializedColumnRef>,
-    payload_signature_columns: Vec<usize>,
+    payload_signature_columns: ColumnUsedMask,
     key_affinities: String,
     collations: Vec<CollationSeq>,
     use_bloom_filter: bool,
@@ -154,7 +156,7 @@ impl<'a, 'plan> HashBuildPlanner<'a, 'plan> {
                         *payload_num_keys == num_keys,
                         "materialized hash build input key count mismatch"
                     );
-                    let payload_signature_columns = (0..payload_columns.len())
+                    let payload_signature_columns: ColumnUsedMask = (0..payload_columns.len())
                         .map(|i| *payload_num_keys + i)
                         .collect();
                     (
@@ -165,18 +167,18 @@ impl<'a, 'plan> HashBuildPlanner<'a, 'plan> {
                     )
                 }
                 _ => {
-                    let payload_signature_columns: Vec<usize> =
-                        build_table.col_used_mask.iter().collect();
+                    let payload_signature_columns: ColumnUsedMask =
+                        build_table.col_used_mask.clone();
                     let payload_columns = payload_signature_columns
                         .iter()
                         .map(|col_idx| {
                             let column = build_table
                                 .columns()
-                                .get(*col_idx)
+                                .get(col_idx)
                                 .expect("build table column missing");
                             MaterializedColumnRef::Column {
                                 table_id: build_table.internal_id,
-                                column_idx: *col_idx,
+                                column_idx: col_idx,
                                 is_rowid_alias: column.is_rowid_alias(),
                             }
                         })
@@ -338,9 +340,8 @@ impl<'a, 'plan> PreparedHashBuild<'a, 'plan> {
         }
 
         if !config.use_materialized_keys {
-            let build_only_mask = TableMask::from_table_number_iter(
-                [planner.hash_join_op.build_table_idx].into_iter(),
-            );
+            let build_only_mask: TableMask =
+                [planner.hash_join_op.build_table_idx].into_iter().collect();
             for cond in planner.predicates.iter() {
                 if cond.from_outer_join.is_some() {
                     // OUTER JOIN predicates must stay on the right-table loop
@@ -354,8 +355,8 @@ impl<'a, 'plan> PreparedHashBuild<'a, 'plan> {
                     planner.table_references,
                     planner.non_from_clause_subqueries,
                 )?;
-                if !mask.contains_table(planner.hash_join_op.build_table_idx)
-                    || !build_only_mask.contains_all(&mask)
+                if !mask.get(planner.hash_join_op.build_table_idx)
+                    || !build_only_mask.contains_all_set_bits_of(&mask)
                 {
                     continue;
                 }
@@ -414,12 +415,41 @@ impl<'a, 'plan> PreparedHashBuild<'a, 'plan> {
         let num_payload = config.payload_columns.len();
         let (payload_start_reg, mut payload_info) = if num_payload > 0 {
             let payload_reg = planner.program.alloc_registers(num_payload);
-            for (i, &col_idx) in config.payload_signature_columns.iter().enumerate() {
-                planner.program.emit_column_or_rowid(
-                    payload_source_cursor_id,
-                    col_idx,
-                    payload_reg + i,
-                );
+            for (i, col_idx) in config.payload_signature_columns.iter().enumerate() {
+                match build_table
+                    .columns()
+                    .get(col_idx)
+                    .map(|c| c.generated_type())
+                {
+                    Some(GeneratedType::Virtual { expr, .. }) if !config.use_materialized_keys => {
+                        planner.program.with_self_table_context(
+                            Some(&SelfTableContext::ForSelect {
+                                table_ref_id: build_table.internal_id,
+                                referenced_tables: planner.table_references.clone(),
+                            }),
+                            |program, _| -> Result<()> {
+                                translate_expr(
+                                    program,
+                                    Some(planner.table_references),
+                                    expr,
+                                    payload_reg + i,
+                                    &planner.t_ctx.resolver,
+                                )?;
+                                Ok(())
+                            },
+                        )?;
+
+                        planner.program.emit_column_affinity(
+                            payload_reg + i,
+                            build_table.columns()[col_idx].affinity(),
+                        );
+                    }
+                    _ => planner.program.emit_column_or_rowid(
+                        payload_source_cursor_id,
+                        col_idx,
+                        payload_reg + i,
+                    ),
+                };
             }
             (
                 Some(payload_reg),

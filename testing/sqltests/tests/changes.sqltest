@@ -276,3 +276,161 @@ expect {
     12|y
     3
 }
+
+@cross-check-integrity
+test changes-with-trigger-body-statements {
+    create table t(a);
+    create table log(msg);
+    create trigger tr after insert on t begin
+        insert into log values('x');
+        insert into log values(changes());
+    end;
+
+    insert into t values(1);
+    select msg from log;
+    select changes();
+}
+expect {
+    x
+    1
+    1
+}
+
+@cross-check-integrity
+test changes-restores-previous-value-between-trigger-invocations {
+    create table seed(x);
+    insert into seed values(1), (2);
+    create table t(a);
+    create table log(msg);
+    create trigger tr after insert on t begin
+        insert into log values(changes());
+        insert into log values('x');
+    end;
+
+    insert into t values(10), (20);
+    select msg from log;
+    select changes();
+    select total_changes();
+}
+expect {
+    2
+    x
+    2
+    x
+    2
+    8
+}
+
+@cross-check-integrity
+test changes-trigger-body-constraint-ignore-keeps-outer-count {
+    create table u(x unique);
+    insert into u values(1);
+    create table t(a);
+    create trigger tr after insert on t begin
+        insert into u values(1);
+    end;
+
+    insert or ignore into t values(10);
+    select count(*) from t;
+    select changes();
+    select total_changes();
+}
+expect {
+    1
+    1
+    2
+}
+
+@cross-check-integrity
+test changes-sub-trigger-isolation {
+    create table t(a);
+    create table u(b);
+    create table log(msg);
+    create trigger tr_t after insert on t begin
+        insert into u values(1);
+        insert into log values(changes());
+    end;
+    create trigger tr_u after insert on u begin
+        insert into log values('sub:' || changes());
+        insert into log values('sub:' || changes());
+    end;
+
+    insert into t values(1);
+    select msg from log;
+    select changes();
+    select total_changes();
+}
+expect {
+    sub:0
+    sub:1
+    1
+    1
+    5
+}
+
+@cross-check-integrity
+test changes-update-trigger-body-reset-count {
+    create table t(a);
+    insert into t values(1), (2), (3);
+    create table log(msg);
+    create trigger tr after update on t begin
+        insert into log values(changes());
+        insert into log values('u');
+    end;
+
+    update t set a = a * 10;
+    select msg from log;
+    select changes();
+    select total_changes();
+}
+expect {
+    3
+    u
+    3
+    u
+    3
+    u
+    3
+    12
+}
+
+@cross-check-integrity
+test changes-delete-trigger-body-reset-count {
+    create table t(a);
+    insert into t values(1), (2), (3);
+    create table log(msg);
+    create trigger tr after delete on t begin
+        insert into log values(changes());
+        insert into log values('d');
+    end;
+
+    delete from t;
+    select msg from log;
+    select changes();
+    select total_changes();
+}
+expect {
+    3
+    d
+    3
+    d
+    3
+    d
+    3
+    12
+}
+
+@cross-check-integrity
+test changes-insert-select-from-same-table-no-double-count {
+    create table t(a);
+    insert into t values(1), (2), (3);
+    insert into t select a + 10 from t;
+    select count(*) from t;
+    select changes();
+    select total_changes();
+}
+expect {
+    6
+    3
+    6
+}

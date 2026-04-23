@@ -94,7 +94,11 @@ impl EmitGroupBy {
         group_by: &'a GroupBy,
         plan: &SelectPlan,
         result_columns: &'a [ResultSetColumn],
-        order_by: &'a [(Box<ast::Expr>, ast::SortOrder)],
+        order_by: &'a [(
+            Box<ast::Expr>,
+            ast::SortOrder,
+            Option<turso_parser::ast::NullsOrder>,
+        )],
     ) -> Result<()> {
         collect_non_aggregate_expressions(
             &mut t_ctx.non_aggregate_expressions,
@@ -154,13 +158,18 @@ impl EmitGroupBy {
              * then the collating sequence of the column is used to determine sort order.
              * If the expression is not a column and has no COLLATE clause, then the BINARY collating sequence is used.
              */
-            let order_and_collations: Vec<(SortOrder, Option<CollationSeq>)> = group_by
+            let order_collations_nulls: Vec<(
+                SortOrder,
+                Option<CollationSeq>,
+                Option<turso_parser::ast::NullsOrder>,
+            )> = group_by
                 .exprs
                 .iter()
                 .zip(sort_order.iter())
-                .map(|(expr, ord)| {
+                .zip(group_by.nulls_order.iter())
+                .map(|((expr, ord), nulls)| {
                     let collation = get_collseq_from_expr(expr, &plan.table_references)?;
-                    Ok((*ord, collation))
+                    Ok((*ord, collation, *nulls))
                 })
                 .collect::<Result<Vec<_>>>()?;
 
@@ -176,7 +185,7 @@ impl EmitGroupBy {
             program.emit_insn(Insn::SorterOpen {
                 cursor_id: sort_cursor,
                 columns: column_count,
-                order_and_collations,
+                order_collations_nulls,
                 comparators,
             });
             emit_explain!(program, false, "USE SORTER FOR GROUP BY".to_owned());
@@ -285,33 +294,43 @@ pub fn is_orderby_agg_or_const(resolver: &Resolver, e: &ast::Expr, aggs: &[Aggre
 /// appears in ORDER BY, and the remaining keys default to `ASC`.
 pub fn compute_group_by_sort_order(
     group_by_exprs: &[ast::Expr],
-    order_by: &[(Box<ast::Expr>, SortOrder)],
+    order_by: &[(
+        Box<ast::Expr>,
+        SortOrder,
+        Option<turso_parser::ast::NullsOrder>,
+    )],
     aggs: &[Aggregate],
     resolver: &Resolver,
-) -> Vec<SortOrder> {
+) -> (Vec<SortOrder>, Vec<Option<ast::NullsOrder>>) {
     let groupby_len = group_by_exprs.len();
     if groupby_len == 0 || order_by.is_empty() {
-        return vec![SortOrder::Asc; groupby_len];
+        return (vec![SortOrder::Asc; groupby_len], vec![None; groupby_len]);
     }
     let only_agg_or_const = order_by
         .iter()
-        .all(|(e, _)| is_orderby_agg_or_const(resolver, e, aggs));
+        .all(|(e, _, _)| is_orderby_agg_or_const(resolver, e, aggs));
 
     if only_agg_or_const {
         let first_direction = order_by[0].1;
-        return vec![first_direction; groupby_len];
+        let first_nulls = order_by[0].2;
+        return (
+            vec![first_direction; groupby_len],
+            vec![first_nulls; groupby_len],
+        );
     }
 
-    let mut result = vec![SortOrder::Asc; groupby_len];
+    let mut sort_order = vec![SortOrder::Asc; groupby_len];
+    let mut nulls_order = vec![None; groupby_len];
     for (idx, groupby_expr) in group_by_exprs.iter().enumerate() {
-        if let Some((_, direction)) = order_by
+        if let Some((_, direction, nulls)) = order_by
             .iter()
-            .find(|(expr, _)| exprs_are_equivalent(expr, groupby_expr))
+            .find(|(expr, _, _)| exprs_are_equivalent(expr, groupby_expr))
         {
-            result[idx] = *direction;
+            sort_order[idx] = *direction;
+            nulls_order[idx] = *nulls;
         }
     }
-    result
+    (sort_order, nulls_order)
 }
 
 /// Extracts unique leaf column references from all aggregate function arguments.
@@ -320,24 +339,28 @@ pub fn compute_group_by_sort_order(
 /// results), we reduce sorter record size and avoid redundant B-tree column reads.
 fn collect_agg_leaf_columns(aggregates: &[Aggregate], plan: &SelectPlan) -> Result<Vec<ast::Expr>> {
     let mut leaf_columns: Vec<ast::Expr> = Vec::new();
+    let mut collect = |expr: &ast::Expr| -> Result<WalkControl> {
+        match expr {
+            ast::Expr::Column { table, .. } | ast::Expr::RowId { table, .. } => {
+                if plan
+                    .table_references
+                    .find_joined_table_by_internal_id(*table)
+                    .is_some()
+                    && !leaf_columns.iter().any(|e| exprs_are_equivalent(e, expr))
+                {
+                    leaf_columns.push(expr.clone());
+                }
+                Ok(WalkControl::SkipChildren)
+            }
+            _ => Ok(WalkControl::Continue),
+        }
+    };
     for agg in aggregates {
         for arg in &agg.args {
-            walk_expr(arg, &mut |expr: &ast::Expr| -> Result<WalkControl> {
-                match expr {
-                    ast::Expr::Column { table, .. } | ast::Expr::RowId { table, .. } => {
-                        if plan
-                            .table_references
-                            .find_joined_table_by_internal_id(*table)
-                            .is_some()
-                            && !leaf_columns.iter().any(|e| exprs_are_equivalent(e, expr))
-                        {
-                            leaf_columns.push(expr.clone());
-                        }
-                        Ok(WalkControl::SkipChildren)
-                    }
-                    _ => Ok(WalkControl::Continue),
-                }
-            })?;
+            walk_expr(arg, &mut collect)?;
+        }
+        if let Some(filter_expr) = &agg.filter_expr {
+            walk_expr(filter_expr, &mut collect)?;
         }
     }
     Ok(leaf_columns)
@@ -348,13 +371,17 @@ fn collect_non_aggregate_expressions<'a>(
     group_by: &'a GroupBy,
     plan: &SelectPlan,
     root_result_columns: &'a [ResultSetColumn],
-    order_by: &'a [(Box<ast::Expr>, ast::SortOrder)],
+    order_by: &'a [(
+        Box<ast::Expr>,
+        ast::SortOrder,
+        Option<turso_parser::ast::NullsOrder>,
+    )],
 ) -> Result<()> {
     let mut result_columns = Vec::new();
     for expr in root_result_columns
         .iter()
         .map(|col| &col.expr)
-        .chain(order_by.iter().map(|(e, _)| e.as_ref()))
+        .chain(order_by.iter().map(|(e, _, _)| e.as_ref()))
         .chain(group_by.having.iter().flatten())
     {
         collect_result_columns(expr, plan, &mut result_columns)?;
@@ -606,6 +633,7 @@ pub fn group_by_process_single_group(
         .map(|_| KeyInfo {
             sort_order: SortOrder::Asc,
             collation: CollationSeq::default(),
+            nulls_order: None,
         })
         .collect::<Vec<_>>();
     for (i, c) in compare_key_info
@@ -697,6 +725,28 @@ pub fn group_by_process_single_group(
                     .reg_agg_start
                     .expect("aggregate registers must be initialized");
                 let agg_result_reg = agg_start_reg + i;
+
+                // FILTER: skip AggStep if filter condition is false
+                let filter_skip_label = if let Some(filter_expr) = &agg.filter_expr {
+                    let label = program.allocate_label();
+                    let filter_reg = program.alloc_register();
+                    translate_expr(
+                        program,
+                        Some(&plan.table_references),
+                        filter_expr,
+                        filter_reg,
+                        &t_ctx.resolver,
+                    )?;
+                    program.emit_insn(Insn::IfNot {
+                        reg: filter_reg,
+                        target_pc: label,
+                        jump_if_null: true,
+                    });
+                    Some(label)
+                } else {
+                    None
+                };
+
                 let agg_arg_source =
                     AggArgumentSource::new_from_expression(&agg.func, &agg.args, &agg.distinctness);
                 translate_aggregation_step(
@@ -712,6 +762,10 @@ pub fn group_by_process_single_group(
                         .expect("distinct aggregate context not populated");
                     program.preassign_label_to_next_insn(ctx.label_on_conflict);
                 }
+
+                if let Some(label) = filter_skip_label {
+                    program.preassign_label_to_next_insn(label);
+                }
             }
 
             t_ctx.resolver.expr_to_reg_cache.truncate(cache_len);
@@ -724,6 +778,28 @@ pub fn group_by_process_single_group(
                     .reg_agg_start
                     .expect("aggregate registers must be initialized");
                 let agg_result_reg = agg_start_reg + i;
+
+                // FILTER: skip AggStep if filter condition is false
+                let filter_skip_label = if let Some(filter_expr) = &agg.filter_expr {
+                    let label = program.allocate_label();
+                    let filter_reg = program.alloc_register();
+                    translate_expr(
+                        program,
+                        Some(&plan.table_references),
+                        filter_expr,
+                        filter_reg,
+                        &t_ctx.resolver,
+                    )?;
+                    program.emit_insn(Insn::IfNot {
+                        reg: filter_reg,
+                        target_pc: label,
+                        jump_if_null: true,
+                    });
+                    Some(label)
+                } else {
+                    None
+                };
+
                 let start_reg_aggs = start_reg_src + t_ctx.non_aggregate_expressions.len();
                 let agg_arg_source =
                     AggArgumentSource::new_from_registers(start_reg_aggs + offset, agg);
@@ -740,6 +816,11 @@ pub fn group_by_process_single_group(
                         .expect("distinct aggregate context not populated");
                     program.preassign_label_to_next_insn(ctx.label_on_conflict);
                 }
+
+                if let Some(label) = filter_skip_label {
+                    program.preassign_label_to_next_insn(label);
+                }
+
                 offset += agg.args.len();
             }
         }

@@ -1,0 +1,83 @@
+name: Conformance tests
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+
+env:
+  CARGO_INCREMENTAL: "0"
+  CARGO_NET_RETRY: 10
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  javascript:
+    name: JavaScript conformance tests
+    timeout-minutes: 30
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    steps:
+      - uses: actions/checkout@v4
+      - name: Setup node
+        uses: useblacksmith/setup-node@v5
+        with:
+          node-version: 20
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: conformance-js-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            conformance-js-cargo-
+          save-always: true
+      - name: Install JS binding dependencies
+        working-directory: bindings/javascript
+        run: yarn install
+      - name: Build JS native module
+        working-directory: bindings/javascript
+        run: yarn build:native
+      - name: Install test dependencies
+        working-directory: testing/javascript
+        run: npm install
+      - name: Run conformance tests
+        working-directory: testing/javascript
+        run: npm run test:turso
+
+  sqlite-tcl:
+    name: SQLite TCL conformance tests
+    timeout-minutes: 30
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: conformance-sqlite-tcl-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            conformance-sqlite-tcl-cargo-
+          save-always: true
+      - name: Install TCL dev headers
+        run: sudo apt-get update && sudo apt-get install -y tcl-dev tcl
+      - name: Build libturso_tcl
+        run: make -C bindings/tcl build
+      - name: Run SQLite TCL conformance tests
+        run: tclsh testing/conformance/sqlite3/all.test

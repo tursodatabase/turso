@@ -1,6 +1,6 @@
 {
   "name": "@tursodatabase/database-wasm-common",
-  "version": "0.6.0-pre.3",
+  "version": "0.6.0-pre.22",
   "repository": {
     "type": "git",
     "url": "https://github.com/tursodatabase/turso"
@@ -29,6 +29,8 @@
     "test": "echo 'no tests'"
   },
   "dependencies": {
-    "@napi-rs/wasm-runtime": "^1.0.5"
+    "@emnapi/core": "1.8.1",
+    "@emnapi/runtime": "1.8.1",
+    "@napi-rs/wasm-runtime": "1.0.7"
   }
 }

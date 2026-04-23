@@ -9,6 +9,7 @@ repository.workspace = true
 
 [features]
 encryption = ["turso_core/encryption"]
+pure-rust-crypto = ["turso_core/pure-rust-crypto"]
 
 [lib]
 doc = false
@@ -20,6 +21,7 @@ turso_core = { workspace = true, features = [
     "conn_raw_api",
     "io_uring",
     "experimental_win_iocp",
+	"fts",
 ] }
 turso_sdk_kit_macros = { workspace = true }
 tracing = { workspace = true }

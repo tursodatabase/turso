@@ -50,12 +50,12 @@ info:
   database: ':memory:'
 ---
 QUERY PLAN
-|--CORRELATED LIST SUBQUERY 1
+|--LIST SUBQUERY 1
 |  |--LIST SUBQUERY 2
 |  |  `--SCAN part
 |  |--SEARCH partsupp USING INDEX sqlite_autoindex_partsupp_1 (ps_partkey=?)
 |  `--CORRELATED SCALAR SUBQUERY 3
 |     `--SCAN lineitem
-|--SCAN supplier
+|--SEARCH supplier USING INTEGER PRIMARY KEY (rowid=?)
 |--SEARCH nation USING INTEGER PRIMARY KEY (rowid=?)
 `--USE SORTER FOR ORDER BY

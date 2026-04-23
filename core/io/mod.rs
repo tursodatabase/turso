@@ -50,6 +50,63 @@ mod completions;
 pub use clock::Clock;
 pub use completions::*;
 
+/// Platform-independent file identity, analogous to SQLite's `struct unixFileId`.
+/// On Unix: (st_dev, st_ino). On Windows: (dwVolumeSerialNumber, nFileIndex).
+/// On non-filesystem backends: synthetic hash-based identity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct FileId {
+    pub dev: u64,
+    pub ino: u64,
+}
+
+impl FileId {
+    /// Synthetic identity from a path hash, for backends without real inodes
+    /// (MemoryIO, OPFS, simulators).
+    pub fn from_path_hash(path: &str) -> Self {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        path.hash(&mut hasher);
+        FileId {
+            dev: 0,
+            ino: hasher.finish(),
+        }
+    }
+}
+
+/// Return the OS-level file identity for a path.
+#[cfg(unix)]
+pub fn get_file_id(path: &str) -> Result<FileId, std::io::Error> {
+    use std::os::unix::fs::MetadataExt;
+    let m = std::fs::metadata(path)?;
+    Ok(FileId {
+        dev: m.dev(),
+        ino: m.ino(),
+    })
+}
+
+#[cfg(windows)]
+pub fn get_file_id(path: &str) -> Result<FileId, std::io::Error> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::{
+        GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION,
+    };
+    let file = std::fs::File::open(path)?;
+    let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+    let ret = unsafe { GetFileInformationByHandle(file.as_raw_handle() as _, &mut info) };
+    if ret == 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(FileId {
+        dev: info.dwVolumeSerialNumber as u64,
+        ino: (info.nFileIndexHigh as u64) << 32 | info.nFileIndexLow as u64,
+    })
+}
+
+#[cfg(not(any(unix, windows)))]
+pub fn get_file_id(path: &str) -> Result<FileId, std::io::Error> {
+    Ok(FileId::from_path_hash(path))
+}
+
 /// Controls which sync mechanism to use for durability.
 /// `FullFsync` only has effect on Apple platforms (uses F_FULLFSYNC fcntl).
 /// On other platforms, both variants behave the same (regular fsync).
@@ -60,6 +117,21 @@ pub enum FileSyncType {
     /// Full fsync - on macOS uses F_FULLFSYNC to flush disk write cache.
     /// On other platforms, behaves the same as Fsync.
     FullFsync,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SharedWalLockKind {
+    LinuxOfd,
+    ProcessScopedFcntl,
+}
+
+pub trait SharedWalMappedRegion: Send + Sync {
+    fn ptr(&self) -> NonNull<u8>;
+    fn len(&self) -> usize;
+
+    fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
 }
 
 pub trait File: Send + Sync {
@@ -126,6 +198,46 @@ pub trait File: Send + Sync {
     fn punch_hole(&self, _pos: usize, _len: usize) -> Result<()> {
         panic!("punch_hole is not supported for the given IO implementation")
     }
+
+    fn shared_wal_lock_byte(
+        &self,
+        _offset: u64,
+        _exclusive: bool,
+        _kind: SharedWalLockKind,
+    ) -> Result<()> {
+        Err(crate::LimboError::InternalError(
+            "shared WAL coordination byte locking is not supported for this file".into(),
+        ))
+    }
+
+    fn shared_wal_try_lock_byte(
+        &self,
+        _offset: u64,
+        _exclusive: bool,
+        _kind: SharedWalLockKind,
+    ) -> Result<bool> {
+        Err(crate::LimboError::InternalError(
+            "shared WAL coordination byte locking is not supported for this file".into(),
+        ))
+    }
+
+    fn shared_wal_unlock_byte(&self, _offset: u64, _kind: SharedWalLockKind) -> Result<()> {
+        Err(crate::LimboError::InternalError(
+            "shared WAL coordination byte unlocking is not supported for this file".into(),
+        ))
+    }
+
+    fn shared_wal_set_len(&self, _len: u64) -> Result<()> {
+        Err(crate::LimboError::InternalError(
+            "shared WAL coordination resizing is not supported for this file".into(),
+        ))
+    }
+
+    fn shared_wal_map(&self, _offset: u64, _len: usize) -> Result<Box<dyn SharedWalMappedRegion>> {
+        Err(crate::LimboError::InternalError(
+            "shared WAL coordination memory mapping is not supported for this file".into(),
+        ))
+    }
 }
 
 pub struct TempFile {
@@ -167,21 +279,36 @@ impl TempFile {
 
     /// Creates a TempFile respecting the temp_store setting.
     /// When temp_store is Memory, uses in-memory storage.
-    /// When temp_store is Default or File, uses file-based storage.
+    /// When temp_store is Default or File, uses file-based storage when
+    /// available. In `no-fs` builds, temp storage always falls back to memory.
     pub fn with_temp_store(io: &Arc<dyn IO>, temp_store: crate::TempStore) -> Result<Self> {
         #[cfg(not(target_family = "wasm"))]
         {
-            if matches!(temp_store, crate::TempStore::Memory) {
+            #[cfg(not(feature = "fs"))]
+            {
+                let _ = (io, temp_store);
                 let memory_io = Arc::new(MemoryIO::new());
                 let memory_file =
                     memory_io.open_file("tursodb_temp_file", OpenFlags::Create, false)?;
-                return Ok(TempFile {
+                Ok(TempFile {
                     _temp_dir: None,
                     file: memory_file,
-                });
+                })
             }
-            // Fall through to file-based for Default and File modes
-            Self::new(io)
+            #[cfg(feature = "fs")]
+            {
+                if matches!(temp_store, crate::TempStore::Memory) {
+                    let memory_io = Arc::new(MemoryIO::new());
+                    let memory_file =
+                        memory_io.open_file("tursodb_temp_file", OpenFlags::Create, false)?;
+                    return Ok(TempFile {
+                        _temp_dir: None,
+                        file: memory_file,
+                    });
+                }
+                // Fall through to file-based for Default and File modes
+                Self::new(io)
+            }
         }
         #[cfg(target_family = "wasm")]
         {
@@ -212,6 +339,7 @@ bitflags! {
         const None = 0b00000000;
         const Create = 0b0000001;
         const ReadOnly = 0b0000010;
+        const NoLock = 0b0000100;
     }
 }
 
@@ -224,8 +352,17 @@ impl Default for OpenFlags {
 pub trait IO: Clock + Send + Sync {
     fn open_file(&self, path: &str, flags: OpenFlags, direct: bool) -> Result<Arc<dyn File>>;
 
+    fn open_shared_wal_file(&self, path: &str) -> Result<Arc<dyn File>> {
+        self.open_file(path, OpenFlags::Create | OpenFlags::NoLock, false)
+    }
+
     // remove_file is used in the sync-engine
     fn remove_file(&self, path: &str) -> Result<()>;
+
+    /// Whether this IO backend can back host-filesystem shared WAL coordination.
+    fn supports_shared_wal_coordination(&self) -> bool {
+        false
+    }
 
     fn step(&self) -> Result<()> {
         Ok(())
@@ -281,6 +418,17 @@ pub trait IO: Clock + Send + Sync {
     /// Used for progressive backoff in contended lock acquisition.
     fn sleep(&self, duration: std::time::Duration) {
         crate::thread::sleep(duration);
+    }
+
+    /// Return the file identity for the given path.
+    /// Default uses OS-level metadata; non-filesystem backends override
+    /// with synthetic hash-based identity.
+    fn file_id(&self, path: &str) -> Result<FileId> {
+        get_file_id(path).map_err(|e| {
+            crate::LimboError::InternalError(format!(
+                "failed to get file identity for '{path}': {e}"
+            ))
+        })
     }
 }
 

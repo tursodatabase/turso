@@ -1,4 +1,6 @@
-use crate::common::{do_flush, run_query, run_query_on_row, ExecRows, TempDatabase};
+use crate::common::{
+    do_flush, run_query, run_query_on_row, ExecRows, TempDatabase, TempDatabaseBuilder,
+};
 use rand::{rng, RngCore};
 use std::sync::Arc;
 use turso_core::{
@@ -7,6 +9,149 @@ use turso_core::{
 };
 
 const ENABLE_ENCRYPTION: bool = true;
+
+fn run_non_4k_page_size_encryption_test(
+    tmp_db: &TempDatabase,
+    enable_mvcc: bool,
+) -> anyhow::Result<()> {
+    let _ = env_logger::try_init();
+    let db_path = tmp_db.path.clone();
+
+    {
+        let conn = tmp_db.connect_limbo();
+        // Set page size to 8k (8192 bytes) and test encryption. Default page size is 4k.
+        run_query(tmp_db, &conn, "PRAGMA page_size = 8192;")?;
+        run_query(
+            tmp_db,
+            &conn,
+            "PRAGMA hexkey = 'b1bbfda4f589dc9daaf004fe21111e00dc00c98237102f5c7002a5669fc76327';",
+        )?;
+        run_query(tmp_db, &conn, "PRAGMA cipher = 'aegis256';")?;
+        if enable_mvcc {
+            run_query(tmp_db, &conn, "PRAGMA journal_mode = 'mvcc';")?;
+        }
+        run_query(
+            tmp_db,
+            &conn,
+            "CREATE TABLE test (id INTEGER PRIMARY KEY, value TEXT);",
+        )?;
+        run_query(
+            tmp_db,
+            &conn,
+            "INSERT INTO test (value) VALUES ('Hello, World!')",
+        )?;
+        let mut row_count = 0;
+        run_query_on_row(tmp_db, &conn, "SELECT * FROM test", |row: &Row| {
+            assert_eq!(row.get::<i64>(0).unwrap(), 1);
+            assert_eq!(row.get::<String>(1).unwrap(), "Hello, World!");
+            row_count += 1;
+        })?;
+
+        assert_eq!(row_count, 1);
+        do_flush(&conn, tmp_db)?;
+    }
+
+    {
+        // Reopen the existing db with 8k page size and test encryption
+        let uri = format!(
+            "file:{}?cipher=aegis256&hexkey=b1bbfda4f589dc9daaf004fe21111e00dc00c98237102f5c7002a5669fc76327",
+            db_path.to_str().unwrap()
+        );
+        let (_io, conn) = turso_core::Connection::from_uri(
+            &uri,
+            DatabaseOpts::new().with_encryption(ENABLE_ENCRYPTION),
+        )?;
+        run_query_on_row(tmp_db, &conn, "SELECT * FROM test", |row: &Row| {
+            assert_eq!(row.get::<i64>(0).unwrap(), 1);
+            assert_eq!(row.get::<String>(1).unwrap(), "Hello, World!");
+        })?;
+    }
+
+    Ok(())
+}
+
+fn run_corruption_associated_data_bytes_test(
+    tmp_db: &TempDatabase,
+    enable_mvcc: bool,
+) -> anyhow::Result<()> {
+    let _ = env_logger::try_init();
+    let db_path = tmp_db.path.clone();
+
+    {
+        let conn = tmp_db.connect_limbo();
+        run_query(
+            tmp_db,
+            &conn,
+            "PRAGMA hexkey = 'b1bbfda4f589dc9daaf004fe21111e00dc00c98237102f5c7002a5669fc76327';",
+        )?;
+        run_query(tmp_db, &conn, "PRAGMA cipher = 'aegis256';")?;
+        if enable_mvcc {
+            run_query(tmp_db, &conn, "PRAGMA journal_mode = 'mvcc';")?;
+        }
+        run_query(
+            tmp_db,
+            &conn,
+            "CREATE TABLE test (id INTEGER PRIMARY KEY, value TEXT);",
+        )?;
+        run_query(
+            tmp_db,
+            &conn,
+            "INSERT INTO test (value) VALUES ('Test AD corruption')",
+        )?;
+        run_query(tmp_db, &conn, "PRAGMA wal_checkpoint(TRUNCATE);")?;
+        do_flush(&conn, tmp_db)?;
+    }
+
+    // test corruption at different positions in the header (the first 100 bytes)
+    let corruption_positions = [3, 7, 16, 30, 50, 70, 99];
+
+    for &corrupt_pos in &corruption_positions {
+        let test_tmp_db = TempDatabaseBuilder::new().build();
+        let test_db_path = test_tmp_db.path.clone();
+        std::fs::copy(&db_path, &test_db_path)?;
+
+        {
+            // corrupt one byte
+            use std::fs::OpenOptions;
+            use std::io::{Read, Seek, SeekFrom, Write};
+
+            let mut file = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&test_db_path)?;
+
+            file.seek(SeekFrom::Start(corrupt_pos as u64))?;
+            let mut original_byte = [0u8; 1];
+            file.read_exact(&mut original_byte)?;
+
+            // corrupt it by flipping all bits
+            let corrupted_byte = [!original_byte[0]];
+
+            file.seek(SeekFrom::Start(corrupt_pos as u64))?;
+            file.write_all(&corrupted_byte)?;
+        }
+
+        let uri = format!(
+            "file:{}?cipher=aegis256&hexkey=b1bbfda4f589dc9daaf004fe21111e00dc00c98237102f5c7002a5669fc76327",
+            test_db_path.to_str().unwrap()
+        );
+
+        let (_io, conn) = turso_core::Connection::from_uri(
+            &uri,
+            DatabaseOpts::new().with_encryption(ENABLE_ENCRYPTION),
+        )
+        .expect("opening the corrupted DB should not fail at the URI level");
+
+        let result = run_query_on_row(tmp_db, &conn, "SELECT * FROM test", |_row: &Row| {});
+
+        assert!(
+            result.is_err(),
+            "should return error when accessing encrypted DB with corrupted associated data at position {corrupt_pos}",
+        );
+    }
+
+    Ok(())
+}
 
 // TODO: mvcc does not error here
 #[turso_macros::test]
@@ -140,57 +285,81 @@ fn test_per_page_encryption(tmp_db: TempDatabase) -> anyhow::Result<()> {
     Ok(())
 }
 
-#[turso_macros::test(mvcc)]
+#[turso_macros::test]
 fn test_non_4k_page_size_encryption(tmp_db: TempDatabase) -> anyhow::Result<()> {
-    let _ = env_logger::try_init();
-    let db_path = tmp_db.path.clone();
+    run_non_4k_page_size_encryption_test(&tmp_db, false)
+}
 
-    {
-        let conn = tmp_db.connect_limbo();
-        // Set page size to 8k (8192 bytes) and test encryption. Default page size is 4k.
-        run_query(&tmp_db, &conn, "PRAGMA page_size = 8192;")?;
-        run_query(
-            &tmp_db,
-            &conn,
-            "PRAGMA hexkey = 'b1bbfda4f589dc9daaf004fe21111e00dc00c98237102f5c7002a5669fc76327';",
-        )?;
-        run_query(&tmp_db, &conn, "PRAGMA cipher = 'aegis256';")?;
-        run_query(
-            &tmp_db,
-            &conn,
-            "CREATE TABLE test (id INTEGER PRIMARY KEY, value TEXT);",
-        )?;
-        run_query(
-            &tmp_db,
-            &conn,
-            "INSERT INTO test (value) VALUES ('Hello, World!')",
-        )?;
-        let mut row_count = 0;
-        run_query_on_row(&tmp_db, &conn, "SELECT * FROM test", |row: &Row| {
-            assert_eq!(row.get::<i64>(0).unwrap(), 1);
-            assert_eq!(row.get::<String>(1).unwrap(), "Hello, World!");
-            row_count += 1;
-        })?;
+#[turso_macros::test]
+fn test_non_4k_page_size_encryption_mvcc(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    run_non_4k_page_size_encryption_test(&tmp_db, true)
+}
 
-        assert_eq!(row_count, 1);
-        do_flush(&conn, &tmp_db)?;
-    }
+#[turso_macros::test]
+fn test_mvcc_rejects_late_encryption_pragmas(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+    run_query(&tmp_db, &conn, "PRAGMA journal_mode = 'mvcc';")?;
 
-    {
-        // Reopen the existing db with 8k page size and test encryption
-        let uri = format!(
-            "file:{}?cipher=aegis256&hexkey=b1bbfda4f589dc9daaf004fe21111e00dc00c98237102f5c7002a5669fc76327",
-            db_path.to_str().unwrap()
-        );
-        let (_io, conn) = turso_core::Connection::from_uri(
-            &uri,
-            DatabaseOpts::new().with_encryption(ENABLE_ENCRYPTION),
-        )?;
-        run_query_on_row(&tmp_db, &conn, "SELECT * FROM test", |row: &Row| {
-            assert_eq!(row.get::<i64>(0).unwrap(), 1);
-            assert_eq!(row.get::<String>(1).unwrap(), "Hello, World!");
-        })?;
-    }
+    // Insert data before the (rejected) late encryption pragmas.
+    run_query(
+        &tmp_db,
+        &conn,
+        "CREATE TABLE pre (id INTEGER PRIMARY KEY, v TEXT);",
+    )?;
+    run_query(
+        &tmp_db,
+        &conn,
+        "INSERT INTO pre (v) VALUES ('before_late_pragma')",
+    )?;
+
+    let key_err = run_query(
+        &tmp_db,
+        &conn,
+        "PRAGMA hexkey = 'b1bbfda4f589dc9daaf004fe21111e00dc00c98237102f5c7002a5669fc76327';",
+    )
+    .unwrap_err();
+    assert!(
+        key_err
+            .to_string()
+            .contains("configure encryption before PRAGMA journal_mode='mvcc'"),
+        "unexpected error: {key_err:?}"
+    );
+
+    let cipher_err = run_query(&tmp_db, &conn, "PRAGMA cipher = 'aegis256';").unwrap_err();
+    assert!(
+        cipher_err
+            .to_string()
+            .contains("configure encryption before PRAGMA journal_mode='mvcc'"),
+        "unexpected error: {cipher_err:?}"
+    );
+
+    // Data inserted before the rejected pragmas must still be readable.
+    let mut pre_count = 0;
+    run_query_on_row(&tmp_db, &conn, "SELECT v FROM pre", |row: &Row| {
+        assert_eq!(row.get::<String>(0).unwrap(), "before_late_pragma");
+        pre_count += 1;
+    })?;
+    assert_eq!(pre_count, 1);
+
+    run_query(
+        &tmp_db,
+        &conn,
+        "CREATE TABLE test (id INTEGER PRIMARY KEY, value TEXT);",
+    )?;
+    run_query(
+        &tmp_db,
+        &conn,
+        "INSERT INTO test (value) VALUES ('still plaintext')",
+    )?;
+    do_flush(&conn, &tmp_db)?;
+
+    let reopened = tmp_db.connect_limbo();
+    let mut row_count = 0;
+    run_query_on_row(&tmp_db, &reopened, "SELECT value FROM test", |row: &Row| {
+        assert_eq!(row.get::<String>(0).unwrap(), "still plaintext");
+        row_count += 1;
+    })?;
+    assert_eq!(row_count, 1);
 
     Ok(())
 }
@@ -260,91 +429,14 @@ fn test_corruption_turso_magic_bytes(tmp_db: TempDatabase) -> anyhow::Result<()>
     Ok(())
 }
 
-#[turso_macros::test(mvcc)]
+#[turso_macros::test]
 fn test_corruption_associated_data_bytes(tmp_db: TempDatabase) -> anyhow::Result<()> {
-    let _ = env_logger::try_init();
-    let db_path = tmp_db.path.clone();
+    run_corruption_associated_data_bytes_test(&tmp_db, false)
+}
 
-    {
-        let conn = tmp_db.connect_limbo();
-        run_query(
-            &tmp_db,
-            &conn,
-            "PRAGMA hexkey = 'b1bbfda4f589dc9daaf004fe21111e00dc00c98237102f5c7002a5669fc76327';",
-        )?;
-        run_query(&tmp_db, &conn, "PRAGMA cipher = 'aegis256';")?;
-        run_query(
-            &tmp_db,
-            &conn,
-            "CREATE TABLE test (id INTEGER PRIMARY KEY, value TEXT);",
-        )?;
-        run_query(
-            &tmp_db,
-            &conn,
-            "INSERT INTO test (value) VALUES ('Test AD corruption')",
-        )?;
-        run_query(&tmp_db, &conn, "PRAGMA wal_checkpoint(TRUNCATE);")?;
-        do_flush(&conn, &tmp_db)?;
-    }
-
-    // test corruption at different positions in the header (the first 100 bytes)
-    let corruption_positions = [3, 7, 16, 30, 50, 70, 99];
-
-    for &corrupt_pos in &corruption_positions {
-        let test_db_name = format!(
-            "test-corruption-ad-pos-{}-{}.db",
-            corrupt_pos,
-            rng().next_u32()
-        );
-        let test_tmp_db = TempDatabase::new(&test_db_name);
-        let test_db_path = test_tmp_db.path.clone();
-        std::fs::copy(&db_path, &test_db_path)?;
-
-        // corrupt one byte
-        {
-            use std::fs::OpenOptions;
-            use std::io::{Read, Seek, SeekFrom, Write};
-
-            let mut file = OpenOptions::new()
-                .read(true)
-                .write(true)
-                .open(&test_db_path)?;
-
-            file.seek(SeekFrom::Start(corrupt_pos as u64))?;
-            let mut original_byte = [0u8; 1];
-            file.read_exact(&mut original_byte)?;
-
-            // corrupt it by flipping all bits
-            let corrupted_byte = [!original_byte[0]];
-
-            file.seek(SeekFrom::Start(corrupt_pos as u64))?;
-            file.write_all(&corrupted_byte)?;
-        }
-
-        // this should fail
-        {
-            let uri = format!(
-                "file:{}?cipher=aegis256&hexkey=b1bbfda4f589dc9daaf004fe21111e00dc00c98237102f5c7002a5669fc76327",
-                test_db_path.to_str().unwrap()
-            );
-
-            let result = (|| -> anyhow::Result<()> {
-                let (_io, conn) = turso_core::Connection::from_uri(
-                    &uri,
-                    DatabaseOpts::new().with_encryption(ENABLE_ENCRYPTION),
-                )?;
-                run_query_on_row(&test_tmp_db, &conn, "SELECT * FROM test", |_row: &Row| {})?;
-                Ok(())
-            })();
-
-            assert!(
-                result.is_err(),
-                "should return error when accessing encrypted DB with corrupted associated data at position {corrupt_pos}",
-            );
-        }
-    }
-
-    Ok(())
+#[turso_macros::test]
+fn test_corruption_associated_data_bytes_mvcc(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    run_corruption_associated_data_bytes_test(&tmp_db, true)
 }
 
 #[turso_macros::test(mvcc)]
@@ -1067,4 +1159,195 @@ fn test_vacuum_into_unencrypts(tmp_db: TempDatabase) -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+#[test]
+fn test_encrypted_db_then_enable_mvcc_large_payload_chunked() -> anyhow::Result<()> {
+    let _ = env_logger::try_init();
+
+    let temp_dir = tempfile::tempdir()?;
+    let db_path = temp_dir.path().join("test.db");
+    let db_path_str = db_path.to_str().unwrap();
+
+    let hex_key = "b1bbfda4f589dc9daaf004fe21111e00dc00c98237102f5c7002a5669fc76327";
+    let large_value = "x".repeat(100_000);
+    let io = Arc::new(PlatformIO::new()?);
+    let opts = DatabaseOpts::new().with_encryption(true);
+    let enc_opts = Some(EncryptionOpts {
+        cipher: "aes256gcm".to_string(),
+        hexkey: hex_key.to_string(),
+    });
+
+    {
+        let db = Database::open_file_with_flags(
+            io.clone(),
+            db_path_str,
+            OpenFlags::Create,
+            opts,
+            enc_opts.clone(),
+        )?;
+        let key = EncryptionKey::from_hex_string(hex_key)?;
+        let conn = db.connect_with_encryption(Some(key))?;
+        conn.execute("PRAGMA journal_mode = 'mvcc'")?;
+        conn.execute("CREATE TABLE test (id INTEGER PRIMARY KEY, value TEXT)")?;
+        conn.execute(format!("INSERT INTO test (value) VALUES ('{large_value}')"))?;
+        for c in conn.cacheflush()? {
+            io.wait_for_completion(c)?;
+        }
+    }
+
+    let log_path = db_path.with_extension("db-log");
+    let log_bytes = std::fs::read(&log_path)?;
+    assert!(
+        log_bytes.len() > 64 * 1024,
+        "multi-chunk encrypted MVCC log should exceed 64 KiB"
+    );
+
+    {
+        let db = Database::open_file_with_flags(
+            io.clone(),
+            db_path_str,
+            OpenFlags::default(),
+            opts,
+            enc_opts,
+        )?;
+        let key = EncryptionKey::from_hex_string(hex_key)?;
+        let conn = db.connect_with_encryption(Some(key))?;
+
+        let rows: Vec<(i64, i64, String, String)> = conn.exec_rows(
+            "SELECT id, length(value), substr(value, 1, 16), substr(value, length(value) - 15, 16) FROM test",
+        );
+        assert_eq!(
+            rows.len(),
+            1,
+            "Should recover multi-chunk MVCC payload after restart"
+        );
+        assert_eq!(rows[0].0, 1);
+        assert_eq!(rows[0].1, large_value.len() as i64);
+        assert_eq!(rows[0].2, "xxxxxxxxxxxxxxxx");
+        assert_eq!(rows[0].3, "xxxxxxxxxxxxxxxx");
+    }
+
+    Ok(())
+}
+
+/// Create an encrypted database with existing data, then switch to MVCC mode.
+/// Verifies that pre-existing rows survive the journal mode switch and that
+/// new MVCC writes produce an encrypted log.
+#[test]
+fn test_encrypted_db_with_data_then_enable_mvcc() -> anyhow::Result<()> {
+    let _ = env_logger::try_init();
+
+    let temp_dir = tempfile::tempdir()?;
+    let db_path = temp_dir.path().join("test.db");
+    let db_path_str = db_path.to_str().unwrap();
+
+    let hex_key = "b1bbfda4f589dc9daaf004fe21111e00dc00c98237102f5c7002a5669fc76327";
+    let io = Arc::new(PlatformIO::new()?);
+    let opts = DatabaseOpts::new().with_encryption(true);
+    let enc_opts = Some(EncryptionOpts {
+        cipher: "aes256gcm".to_string(),
+        hexkey: hex_key.to_string(),
+    });
+
+    // Phase 1: Create encrypted DB in WAL mode, insert data
+    {
+        let db = Database::open_file_with_flags(
+            io.clone(),
+            db_path_str,
+            OpenFlags::Create,
+            opts,
+            enc_opts.clone(),
+        )?;
+        let key = EncryptionKey::from_hex_string(hex_key)?;
+        let conn = db.connect_with_encryption(Some(key))?;
+        conn.execute("CREATE TABLE test (id INTEGER PRIMARY KEY, value TEXT)")?;
+        conn.execute("INSERT INTO test (value) VALUES ('before mvcc')")?;
+        for c in conn.cacheflush()? {
+            io.wait_for_completion(c)?;
+        }
+    }
+
+    // Phase 2: Reopen, switch to MVCC, insert more data
+    {
+        let db = Database::open_file_with_flags(
+            io.clone(),
+            db_path_str,
+            OpenFlags::default(),
+            opts,
+            enc_opts.clone(),
+        )?;
+        let key = EncryptionKey::from_hex_string(hex_key)?;
+        let conn = db.connect_with_encryption(Some(key))?;
+
+        // Pre-existing row should be readable
+        let rows: Vec<(String,)> = conn.exec_rows("SELECT value FROM test");
+        assert_eq!(rows.len(), 1, "pre-existing row must be readable");
+        assert_eq!(rows[0].0, "before mvcc");
+
+        // Switch to MVCC
+        conn.execute("PRAGMA journal_mode = 'mvcc'")?;
+        conn.execute("INSERT INTO test (value) VALUES ('after mvcc')")?;
+        for c in conn.cacheflush()? {
+            io.wait_for_completion(c)?;
+        }
+    }
+
+    // Verify the MVCC log is encrypted
+    {
+        let log_path = db_path.with_extension("db-log");
+        let log_bytes = std::fs::read(&log_path)?;
+        assert!(
+            log_bytes.len() > 56,
+            "MVCC log should contain data beyond the header"
+        );
+        for plaintext in [b"before mvcc" as &[u8], b"after mvcc"] {
+            assert!(
+                !log_bytes.windows(plaintext.len()).any(|w| w == plaintext),
+                "MVCC log must not contain plaintext '{}' when encryption is enabled",
+                std::str::from_utf8(plaintext).unwrap()
+            );
+        }
+    }
+
+    // Phase 3: Reopen — MVCC recovery should replay, both rows visible
+    {
+        let db = Database::open_file_with_flags(
+            io.clone(),
+            db_path_str,
+            OpenFlags::default(),
+            opts,
+            enc_opts.clone(),
+        )?;
+        let key = EncryptionKey::from_hex_string(hex_key)?;
+        let conn = db.connect_with_encryption(Some(key))?;
+
+        let rows: Vec<(String,)> = conn.exec_rows("SELECT value FROM test ORDER BY id");
+        assert_eq!(
+            rows.iter().map(|r| r.0.as_str()).collect::<Vec<_>>(),
+            vec!["before mvcc", "after mvcc"]
+        );
+    }
+
+    Ok(())
+}
+
+#[turso_macros::test]
+fn test_non_4k_page_size_encryption_enable_mvcc_after_encryption(
+    tmp_db: TempDatabase,
+) -> anyhow::Result<()> {
+    let _ = env_logger::try_init();
+    let conn = tmp_db.connect_limbo();
+
+    [
+        "PRAGMA page_size = 8192;",
+        "PRAGMA hexkey = 'b1bbfda4f589dc9daaf004fe21111e00dc00c98237102f5c7002a5669fc76327';",
+        "PRAGMA cipher = 'aegis256';",
+        "PRAGMA journal_mode = 'mvcc';",
+        "CREATE TABLE test (id INTEGER PRIMARY KEY, value TEXT);",
+        "INSERT INTO test (value) VALUES ('Hello, World!')",
+    ]
+    .iter()
+    .try_for_each(|query| run_query(&tmp_db, &conn, query))?;
+    do_flush(&conn, &tmp_db)
 }

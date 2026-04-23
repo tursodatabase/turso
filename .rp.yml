@@ -1,0 +1,83 @@
+version: 1
+
+verify-cmd: cargo test
+
+tests:
+  - testing/sqltests/tests
+
+guidance: |
+  ## Adding SQL Tests
+
+  Every SQL bug fix MUST include a regression test in `testing/sqltests/tests/`.
+  Use the `.sqltest` format — it is the preferred test format for new tests.
+
+  ### How to run sqltests
+
+  ```bash
+  make -C testing/sqltests run-cli
+  ```
+
+  ### How to determine expected output
+
+  Use `scripts/diff.sh` to compare sqlite3 vs tursodb output:
+
+  ```bash
+  scripts/diff.sh "CREATE TABLE t(a); INSERT INTO t VALUES(1),(2); SELECT * FROM t;"
+  ```
+
+  The sqlite3 output is the expected output for the test.
+
+  ### .sqltest format
+
+  Place new test files in `testing/sqltests/tests/<descriptive-name>.sqltest`.
+  Name files after the bug or feature (e.g., `issue_5116.sqltest`, `correlated-subquery-hash-join.sqltest`).
+
+  Basic structure:
+
+  ```
+  @database :memory:
+
+  test <test-name> {
+      CREATE TABLE t(a INT, b TEXT);
+      INSERT INTO t VALUES (1, 'hello'), (2, 'world');
+      SELECT * FROM t ORDER BY a;
+  }
+  expect {
+      1|hello
+      2|world
+  }
+  ```
+
+  ### Key patterns
+
+  - **In-memory database**: Always use `@database :memory:` at the top.
+  - **Setup blocks**: Use `setup <name> { ... }` and `@setup <name>` to share schema across tests.
+  - **Unordered results**: Use `expect unordered { ... }` when row order is non-deterministic.
+  - **Error expectations**: Use `expect error { ... }` for queries that should fail.
+  - **Multiple tests per file**: Group related test cases in a single file.
+  - **Comments**: Use `#` for comments explaining what the test covers.
+  - **Result format**: Columns are separated by `|`. NULL is empty (e.g., `1||three` means second column is NULL).
+
+  ### Example: regression test for a bug
+
+  ```
+  @database :memory:
+
+  # Regression test for #1234: incorrect NULL handling in LEFT JOIN
+
+  setup schema {
+      CREATE TABLE t1(id INT PRIMARY KEY, val TEXT);
+      CREATE TABLE t2(id INT, ref_id INT);
+      INSERT INTO t1 VALUES (1, 'a'), (2, 'b');
+      INSERT INTO t2 VALUES (1, 1);
+  }
+
+  @setup schema
+  test left-join-null-handling {
+      SELECT t1.id, t2.ref_id FROM t1 LEFT JOIN t2 ON t1.id = t2.ref_id ORDER BY t1.id;
+  }
+  expect {
+      1|1
+      2|
+  }
+  ```

@@ -1,6 +1,6 @@
 {
   "name": "@tursodatabase/sync-react-native",
-  "version": "0.6.0-pre.3",
+  "version": "0.6.0-pre.22",
   "description": "React Native bindings for TursoDB",
   "main": "lib/commonjs/index.js",
   "module": "lib/module/index.js",
@@ -64,7 +64,7 @@
   "devDependencies": {
     "@types/react": "^18.2.0",
     "del-cli": "^5.1.0",
-    "eslint": "^8.57.0",
+    "eslint": "^10.2.0",
     "react": "^18.2.0",
     "react-native": "^0.76.0",
     "react-native-builder-bob": "^0.30.0",

@@ -9,6 +9,7 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use std::array;
 use std::borrow::Cow;
 use std::collections::BTreeMap;
+use std::num::NonZeroUsize;
 use strum::EnumString;
 use tracing::{instrument, Level};
 
@@ -19,12 +20,20 @@ use std::{fmt, sync::Arc};
 
 use super::buffer_pool::BufferPool;
 use super::pager::{PageRef, Pager};
-use super::sqlite3_ondisk::{self, checksum_wal, WalHeader, WAL_MAGIC_BE, WAL_MAGIC_LE};
+use super::sqlite3_ondisk::{
+    self, checksum_wal, DatabaseHeader, WalHeader, WAL_MAGIC_BE, WAL_MAGIC_LE,
+};
 use crate::fast_lock::SpinLock;
 use crate::io::clock::MonotonicInstant;
 use crate::io::CompletionGroup;
 use crate::io::{File, IO};
-use crate::storage::database::EncryptionOrChecksum;
+use crate::storage::database::{DatabaseStorage, EncryptionOrChecksum};
+#[cfg(all(unix, target_pointer_width = "64"))]
+use crate::storage::shared_wal_coordination::SharedWalCoordinationOpenMode;
+#[cfg(all(unix, target_pointer_width = "64"))]
+use crate::storage::shared_wal_coordination::{
+    MappedSharedWalCoordination, SharedOwnerRecord, SharedReaderSlot, SharedWalCoordinationHeader,
+};
 use crate::storage::sqlite3_ondisk::{
     begin_read_wal_frame, begin_read_wal_frame_raw, finish_read_page, prepare_wal_frame,
     write_pages_vectored, PageSize, WAL_FRAME_HEADER_SIZE, WAL_HEADER_SIZE,
@@ -99,6 +108,15 @@ impl CheckpointResult {
     }
 }
 
+#[cfg(all(unix, target_pointer_width = "64"))]
+pub(crate) fn coordination_path_for_wal_path(wal_path: &str) -> String {
+    if let Some(db_path) = wal_path.strip_suffix("-wal") {
+        format!("{db_path}-tshm")
+    } else {
+        format!("{wal_path}-tshm")
+    }
+}
+
 #[derive(Debug, Copy, Clone, PartialEq, EnumString)]
 #[strum(ascii_case_insensitive)]
 pub enum CheckpointMode {
@@ -126,9 +144,79 @@ impl CheckpointMode {
         )
     }
     /// All modes other than Passive require a complete backfilling of all available frames
-    /// from `shared.nbackfills + 1 -> shared.max_frame`
+    /// from `shared.metadata.nbackfills + 1 -> shared.metadata.max_frame`
     fn require_all_backfilled(&self) -> bool {
         !matches!(self, CheckpointMode::Passive { .. })
+    }
+}
+
+/// Immutable view of the WAL metadata a connection snapshots from shared state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct WalSnapshot {
+    max_frame: u64,
+    nbackfills: u64,
+    last_checksum: (u32, u32),
+    checkpoint_seq: u32,
+    transaction_count: u64,
+}
+
+impl WalSnapshot {
+    /// First frame that is still visible in the WAL after checkpoint backfill.
+    const fn min_frame(self) -> u64 {
+        self.nbackfills + 1
+    }
+}
+
+/// Which read-mark, if any, currently protects this connection's snapshot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReadGuardKind {
+    None,
+    DbFile,
+    ReadMark(NonZeroUsize),
+}
+
+impl ReadGuardKind {
+    /// Convert the lock index stored on `WalFile` into a semantic guard kind.
+    const fn from_lock_index(lock_index: usize) -> Self {
+        match lock_index {
+            NO_LOCK_HELD => Self::None,
+            0 => Self::DbFile,
+            idx => Self::ReadMark(NonZeroUsize::new(idx).expect("idx checked to be non-zero")),
+        }
+    }
+
+    /// Convert the semantic guard kind back into the legacy lock index representation.
+    fn lock_index(self) -> usize {
+        match self {
+            Self::None => NO_LOCK_HELD,
+            Self::DbFile => 0,
+            Self::ReadMark(idx) => idx.into(),
+        }
+    }
+}
+
+/// Connection-local WAL state derived from a shared snapshot plus a held read guard.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct WalConnectionState {
+    snapshot: WalSnapshot,
+    read_guard: ReadGuardKind,
+}
+
+impl WalConnectionState {
+    /// Build a new connection-local WAL state bundle.
+    const fn new(snapshot: WalSnapshot, read_guard: ReadGuardKind) -> Self {
+        Self {
+            snapshot,
+            read_guard,
+        }
+    }
+
+    /// Replace just the shared snapshot while preserving the current read guard.
+    const fn with_snapshot(self, snapshot: WalSnapshot) -> Self {
+        Self {
+            snapshot,
+            read_guard: self.read_guard,
+        }
     }
 }
 
@@ -258,7 +346,20 @@ impl TursoRwLock {
         turso_debug_assert!(Self::has_writer(cur));
         // Preserve value bits, replace writer with one reader
         let desired = (cur & Self::VALUE_MASK) | Self::READER_INC;
-        self.0.store(desired, Ordering::Release);
+        #[cfg(debug_assertions)]
+        {
+            let prev = self
+                .0
+                .compare_exchange(cur, desired, Ordering::AcqRel, Ordering::Relaxed);
+            turso_debug_assert!(
+                prev.is_ok(),
+                "downgrade CAS failed — lock was mutated concurrently"
+            );
+        }
+        #[cfg(not(debug_assertions))]
+        {
+            self.0.store(desired, Ordering::Release);
+        }
     }
 
     #[inline]
@@ -315,6 +416,140 @@ pub struct PreparedFrames {
     pub epoch: u32,
 }
 
+/// Metadata published by the coordination backend once a WAL commit becomes visible.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct WalCommitState {
+    max_frame: u64,
+    last_checksum: (u32, u32),
+    transaction_count: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CoordinationCheckpointGuardKind {
+    Read0,
+    Writer,
+}
+
+/// Coordination operations that back the WAL's authoritative state.
+trait WalCoordination: Debug + Send + Sync {
+    /// Load the current authoritative WAL snapshot.
+    fn load_snapshot(&self) -> WalSnapshot;
+
+    /// Ensure any process-local fallback cache is complete for `snapshot`.
+    fn ensure_local_frame_cache_covers(
+        &self,
+        _io: &Arc<dyn IO>,
+        _snapshot: WalSnapshot,
+    ) -> Result<()> {
+        Ok(())
+    }
+
+    /// Publish a newly committed WAL state snapshot.
+    fn publish_commit(&self, commit: WalCommitState);
+
+    /// Publish the highest frame durably backfilled during checkpoint.
+    fn publish_backfill(&self, max_frame: u64);
+
+    /// Install any backend-specific durable proof before publishing backfill.
+    /// Returns an optional completion that must finish before `publish_backfill`.
+    fn install_durable_backfill_proof(
+        &self,
+        max_frame: u64,
+        db_size_pages: u32,
+        db_header_crc32c: u32,
+        sync_type: FileSyncType,
+    ) -> Result<Option<Completion>>;
+
+    /// Find the newest frame for `page_id` within the caller's visible range.
+    fn find_frame(
+        &self,
+        page_id: u64,
+        min_frame: u64,
+        max_frame: u64,
+        frame_watermark: Option<u64>,
+    ) -> Option<u64>;
+
+    /// Enumerate the latest visible frame per page in the requested frame range.
+    fn iter_latest_frames(&self, min_frame: u64, max_frame: u64) -> Vec<(u64, u64)>;
+
+    /// Read the current checkpoint epoch used to tag cached WAL pages.
+    fn checkpoint_epoch(&self) -> u32;
+
+    /// Advance the checkpoint epoch after checkpoint or restart invalidates cached pages.
+    fn bump_checkpoint_epoch(&self) -> u32;
+
+    /// Try to acquire the reader protection needed for `snapshot`.
+    fn try_begin_read_tx(&self, snapshot: WalSnapshot) -> Option<ReadGuardKind>;
+
+    /// Release a read guard previously returned by `try_begin_read_tx`.
+    fn end_read_tx(&self, guard: ReadGuardKind);
+
+    /// Try to acquire the WAL writer guard.
+    fn try_begin_write_tx(&self) -> bool;
+
+    /// Release a previously acquired WAL writer guard.
+    fn end_write_tx(&self);
+
+    /// Acquire the checkpoint-related locks needed for `mode`.
+    fn acquire_checkpoint_guard(
+        &self,
+        mode: CheckpointMode,
+    ) -> Result<CoordinationCheckpointGuardKind>;
+
+    /// Release the checkpoint-related locks previously acquired for `guard`.
+    fn release_checkpoint_guard(&self, guard: CoordinationCheckpointGuardKind);
+
+    /// Compute the highest frame a checkpoint may safely backfill and refresh read marks.
+    fn determine_max_safe_checkpoint_frame(&self, max_frame: u64) -> u64;
+
+    /// Begin a restart while the caller holds the required external checkpoint/write guards.
+    fn begin_restart(&self, io: &dyn IO) -> Result<WalSnapshot>;
+
+    /// Release any restart-only coordination state held by `begin_restart`.
+    fn end_restart(&self);
+
+    /// Attempt the restart path used by a writer holding read-mark 0.
+    fn try_restart_log_for_write(&self, io: &dyn IO) -> Result<Option<WalSnapshot>>;
+
+    /// Mark the WAL uninitialized before truncation and return the WAL file handle.
+    fn prepare_truncate(&self) -> Result<Arc<dyn File>>;
+
+    /// Return the current WAL header snapshot.
+    fn wal_header(&self) -> WalHeader;
+
+    /// Return the WAL file used for durable reads and writes.
+    fn wal_file(&self) -> Result<Arc<dyn File>>;
+
+    /// Report whether the WAL header has already been written and synced.
+    fn wal_is_initialized(&self) -> bool;
+
+    /// Initialize or refresh the WAL header before the first append after restart/truncate.
+    fn prepare_wal_header(&self, io: &dyn IO, page_size: PageSize) -> Option<WalHeader>;
+
+    /// Mark the WAL header durable after the header sync completes.
+    fn mark_initialized(&self);
+
+    /// Record a newly appended frame in the backend's page-to-frame lookup state.
+    fn cache_frame(&self, page_id: u64, frame_id: u64);
+
+    /// Drop any cached frame mappings newer than `max_frame`.
+    fn rollback_cache(&self, max_frame: u64);
+
+    /// Whether a process-local "last connection" close may run shutdown checkpointing.
+    fn should_checkpoint_on_close(&self) -> bool;
+
+    #[cfg(test)]
+    fn backend_name(&self) -> &'static str;
+
+    #[cfg(test)]
+    fn shared_ptr(&self) -> usize;
+
+    #[cfg(test)]
+    fn open_mode_name(&self) -> Option<&'static str> {
+        None
+    }
+}
+
 /// Write-ahead log (WAL).
 pub trait Wal: Debug + Send + Sync {
     /// Begin a read transaction.
@@ -337,6 +572,9 @@ pub trait Wal: Debug + Send + Sync {
 
     /// Returns true if this WAL instance currently holds the write lock.
     fn holds_write_lock(&self) -> bool;
+
+    /// Whether shutdown checkpointing is valid when this process closes its last connection.
+    fn should_checkpoint_on_close(&self) -> bool;
 
     /// Find the latest frame containing a page.
     ///
@@ -405,6 +643,14 @@ pub trait Wal: Debug + Send + Sync {
     fn should_checkpoint(&self) -> bool;
     fn checkpoint(&self, pager: &Pager, mode: CheckpointMode)
         -> Result<IOResult<CheckpointResult>>;
+    fn install_durable_backfill_proof(
+        &self,
+        max_frame: u64,
+        db_size_pages: u32,
+        db_header_crc32c: u32,
+        sync_type: FileSyncType,
+    ) -> Result<Option<Completion>>;
+    fn publish_backfill(&self, max_frame: u64);
     fn sync(&self, sync_type: FileSyncType) -> Result<Completion>;
     fn is_syncing(&self) -> bool;
     fn get_max_frame_in_wal(&self) -> u64;
@@ -434,8 +680,1434 @@ pub trait Wal: Debug + Send + Sync {
         sync_type: FileSyncType,
     ) -> Result<IOResult<()>>;
 
-    #[cfg(debug_assertions)]
+    #[cfg(any(test, debug_assertions))]
     fn as_any(&self) -> &dyn std::any::Any;
+}
+
+#[derive(Debug)]
+struct InProcessWalCoordination {
+    shared: Arc<RwLock<WalFileShared>>,
+}
+
+impl InProcessWalCoordination {
+    /// Build the in-process coordination backend over the existing shared WAL state.
+    fn new(shared: Arc<RwLock<WalFileShared>>) -> Self {
+        Self { shared }
+    }
+
+    fn try_read_mark_shared(&self, slot: usize) -> bool {
+        self.shared.read().runtime.read_locks[slot].read()
+    }
+
+    fn try_read_mark_exclusive(&self, slot: usize) -> bool {
+        self.shared.read().runtime.read_locks[slot].write()
+    }
+
+    fn unlock_read_mark(&self, slot: usize) {
+        self.shared.read().runtime.read_locks[slot].unlock();
+    }
+
+    fn read_mark_value(&self, slot: usize) -> u32 {
+        self.shared.read().runtime.read_locks[slot].get_value()
+    }
+
+    fn set_read_mark_value_exclusive(&self, slot: usize, value: u32) {
+        self.shared.read().runtime.read_locks[slot].set_value_exclusive(value);
+    }
+
+    fn try_upgrade_read_mark(&self, slot: usize) -> bool {
+        self.shared.read().runtime.read_locks[slot].upgrade()
+    }
+
+    fn downgrade_read_mark(&self, slot: usize) {
+        self.shared.read().runtime.read_locks[slot].downgrade();
+    }
+
+    fn try_write_lock(&self) -> bool {
+        self.shared.read().runtime.write_lock.write()
+    }
+
+    fn unlock_write_lock(&self) {
+        self.shared.read().runtime.write_lock.unlock();
+    }
+
+    fn try_checkpoint_lock(&self) -> bool {
+        self.shared.read().runtime.checkpoint_lock.write()
+    }
+
+    fn unlock_checkpoint_lock(&self) {
+        self.shared.read().runtime.checkpoint_lock.unlock();
+    }
+}
+
+impl WalCoordination for InProcessWalCoordination {
+    fn load_snapshot(&self) -> WalSnapshot {
+        let shared = self.shared.read();
+        let checkpoint_seq = shared.metadata.wal_header.lock().checkpoint_seq;
+        WalSnapshot {
+            max_frame: shared.metadata.max_frame.load(Ordering::Acquire),
+            nbackfills: shared.metadata.nbackfills.load(Ordering::Acquire),
+            last_checksum: shared.metadata.last_checksum,
+            checkpoint_seq,
+            transaction_count: shared.metadata.transaction_count.load(Ordering::Acquire),
+        }
+    }
+
+    fn publish_commit(&self, commit: WalCommitState) {
+        let mut shared = self.shared.write();
+        shared
+            .metadata
+            .max_frame
+            .store(commit.max_frame, Ordering::Release);
+        shared.metadata.last_checksum = commit.last_checksum;
+        shared
+            .metadata
+            .transaction_count
+            .store(commit.transaction_count, Ordering::Release);
+    }
+
+    fn publish_backfill(&self, max_frame: u64) {
+        self.shared
+            .write()
+            .metadata
+            .nbackfills
+            .store(max_frame, Ordering::Release);
+    }
+
+    fn install_durable_backfill_proof(
+        &self,
+        _max_frame: u64,
+        _db_size_pages: u32,
+        _db_header_crc32c: u32,
+        _sync_type: FileSyncType,
+    ) -> Result<Option<Completion>> {
+        Ok(None)
+    }
+
+    fn find_frame(
+        &self,
+        page_id: u64,
+        min_frame: u64,
+        max_frame: u64,
+        frame_watermark: Option<u64>,
+    ) -> Option<u64> {
+        let shared = self.shared.read();
+        let frame_cache = shared.runtime.frame_cache.lock();
+        let range = frame_watermark
+            .map(|x| 0..=x)
+            .unwrap_or(min_frame..=max_frame);
+        frame_cache.get(&page_id).and_then(|frames| {
+            frames
+                .iter()
+                .rfind(|&&frame| range.contains(&frame))
+                .copied()
+        })
+    }
+
+    fn iter_latest_frames(&self, min_frame: u64, max_frame: u64) -> Vec<(u64, u64)> {
+        let shared = self.shared.read();
+        let frame_cache = shared.runtime.frame_cache.lock();
+        let mut list = Vec::with_capacity(frame_cache.len());
+        for (&page_id, frames) in frame_cache.iter() {
+            if let Some(&frame_id) = frames
+                .iter()
+                .rfind(|&&frame| (min_frame..=max_frame).contains(&frame))
+            {
+                list.push((page_id, frame_id));
+            }
+        }
+        list.sort_unstable_by_key(|&(page_id, _)| page_id);
+        list
+    }
+
+    fn checkpoint_epoch(&self) -> u32 {
+        self.shared.read().runtime.epoch.load(Ordering::Acquire)
+    }
+
+    fn bump_checkpoint_epoch(&self) -> u32 {
+        self.shared
+            .read()
+            .runtime
+            .epoch
+            .fetch_add(1, Ordering::Release)
+    }
+
+    fn try_begin_read_tx(&self, snapshot: WalSnapshot) -> Option<ReadGuardKind> {
+        turso_assert!(
+            snapshot.max_frame <= u32::MAX as u64,
+            "max_frame exceeds u32 read mark range"
+        );
+        if snapshot.max_frame == snapshot.nbackfills {
+            if !self.try_read_mark_shared(0) {
+                return None;
+            }
+            if self.load_snapshot() != snapshot {
+                self.unlock_read_mark(0);
+                return None;
+            }
+            return Some(ReadGuardKind::DbFile);
+        }
+
+        let mut best_idx: i64 = -1;
+        let mut best_mark: u32 = 0;
+        for idx in 1..5 {
+            let mark = self.read_mark_value(idx);
+            if mark != READMARK_NOT_USED && mark <= snapshot.max_frame as u32 && mark > best_mark {
+                best_mark = mark;
+                best_idx = idx as i64;
+            }
+        }
+
+        if best_idx == -1 || (best_mark as u64) < snapshot.max_frame {
+            for idx in 1..5 {
+                if !self.try_read_mark_exclusive(idx) {
+                    continue;
+                }
+                self.set_read_mark_value_exclusive(idx, snapshot.max_frame as u32);
+                best_idx = idx as i64;
+                best_mark = snapshot.max_frame as u32;
+                self.unlock_read_mark(idx);
+                break;
+            }
+        }
+
+        if best_idx == -1 || !self.try_read_mark_shared(best_idx as usize) {
+            return None;
+        }
+
+        let snapshot_after_lock = self.load_snapshot();
+        let current_slot_mark = self.read_mark_value(best_idx as usize);
+        if current_slot_mark != best_mark || snapshot_after_lock != snapshot {
+            self.unlock_read_mark(best_idx as usize);
+            return None;
+        }
+
+        Some(ReadGuardKind::ReadMark(
+            NonZeroUsize::new(best_idx as usize)
+                .expect("best_idx checked to be non-negative and non-zero"),
+        ))
+    }
+
+    fn end_read_tx(&self, guard: ReadGuardKind) {
+        match guard {
+            ReadGuardKind::None => {}
+            ReadGuardKind::DbFile => self.unlock_read_mark(0),
+            ReadGuardKind::ReadMark(slot) => self.unlock_read_mark(slot.into()),
+        }
+    }
+
+    fn try_begin_write_tx(&self) -> bool {
+        self.try_write_lock()
+    }
+
+    fn end_write_tx(&self) {
+        self.unlock_write_lock();
+    }
+
+    fn acquire_checkpoint_guard(
+        &self,
+        mode: CheckpointMode,
+    ) -> Result<CoordinationCheckpointGuardKind> {
+        if !self.try_checkpoint_lock() {
+            tracing::trace!("CheckpointGuard::new: checkpoint lock failed, returning Busy");
+            return Err(LimboError::Busy);
+        }
+        match mode {
+            CheckpointMode::Passive { .. } => {
+                if !self.try_read_mark_exclusive(0) {
+                    self.unlock_checkpoint_lock();
+                    tracing::trace!("CheckpointGuard: read0 lock failed, returning Busy");
+                    return Err(LimboError::Busy);
+                }
+                Ok(CoordinationCheckpointGuardKind::Read0)
+            }
+            CheckpointMode::Full => {
+                if !self.try_read_mark_exclusive(0) {
+                    self.unlock_checkpoint_lock();
+                    tracing::trace!("CheckpointGuard: read0 lock failed (Full), Busy");
+                    return Err(LimboError::Busy);
+                }
+                if !self.try_write_lock() {
+                    self.unlock_read_mark(0);
+                    self.unlock_checkpoint_lock();
+                    tracing::trace!("CheckpointGuard: write lock failed (Full), Busy");
+                    return Err(LimboError::Busy);
+                }
+                Ok(CoordinationCheckpointGuardKind::Writer)
+            }
+            CheckpointMode::Restart | CheckpointMode::Truncate { .. } => {
+                if !self.try_read_mark_exclusive(0) {
+                    self.unlock_checkpoint_lock();
+                    tracing::trace!("CheckpointGuard: read0 lock failed, returning Busy");
+                    return Err(LimboError::Busy);
+                }
+                if !self.try_write_lock() {
+                    self.unlock_checkpoint_lock();
+                    self.unlock_read_mark(0);
+                    tracing::trace!("CheckpointGuard: write lock failed, returning Busy");
+                    return Err(LimboError::Busy);
+                }
+                Ok(CoordinationCheckpointGuardKind::Writer)
+            }
+        }
+    }
+
+    fn release_checkpoint_guard(&self, guard: CoordinationCheckpointGuardKind) {
+        match guard {
+            CoordinationCheckpointGuardKind::Writer => {
+                self.unlock_write_lock();
+                self.unlock_read_mark(0);
+                self.unlock_checkpoint_lock();
+            }
+            CoordinationCheckpointGuardKind::Read0 => {
+                self.unlock_read_mark(0);
+                self.unlock_checkpoint_lock();
+            }
+        }
+    }
+
+    fn determine_max_safe_checkpoint_frame(&self, max_frame: u64) -> u64 {
+        turso_assert!(
+            max_frame <= u32::MAX as u64,
+            "max_frame exceeds u32 read mark range"
+        );
+        let mut max_safe_frame = max_frame;
+        for read_lock_idx in 1..5 {
+            let this_mark = self.read_mark_value(read_lock_idx);
+            if this_mark < max_safe_frame as u32 {
+                let busy = !self.try_read_mark_exclusive(read_lock_idx);
+                if !busy {
+                    let val = if read_lock_idx == 1 {
+                        max_safe_frame as u32
+                    } else {
+                        READMARK_NOT_USED
+                    };
+                    self.set_read_mark_value_exclusive(read_lock_idx, val);
+                    self.unlock_read_mark(read_lock_idx);
+                } else {
+                    max_safe_frame = this_mark as u64;
+                }
+            }
+        }
+        max_safe_frame
+    }
+
+    fn begin_restart(&self, io: &dyn IO) -> Result<WalSnapshot> {
+        for idx in 1..5 {
+            if !self.try_read_mark_exclusive(idx) {
+                for j in 1..idx {
+                    self.unlock_read_mark(j);
+                }
+                return Err(LimboError::Busy);
+            }
+            self.set_read_mark_value_exclusive(idx, READMARK_NOT_USED);
+        }
+        let mut shared = self.shared.write();
+        shared.restart_wal_header(io);
+        let checkpoint_seq = shared.metadata.wal_header.lock().checkpoint_seq;
+        Ok(WalSnapshot {
+            max_frame: shared.metadata.max_frame.load(Ordering::Acquire),
+            nbackfills: shared.metadata.nbackfills.load(Ordering::Acquire),
+            last_checksum: shared.metadata.last_checksum,
+            checkpoint_seq,
+            transaction_count: shared.metadata.transaction_count.load(Ordering::Acquire),
+        })
+    }
+
+    fn end_restart(&self) {
+        for idx in 1..5 {
+            self.unlock_read_mark(idx);
+        }
+    }
+
+    fn try_restart_log_for_write(&self, io: &dyn IO) -> Result<Option<WalSnapshot>> {
+        if !self.try_upgrade_read_mark(0) {
+            return Ok(None);
+        }
+        let result = self.begin_restart(io);
+        self.downgrade_read_mark(0);
+        match result {
+            Ok(snapshot) => {
+                self.end_restart();
+                Ok(Some(snapshot))
+            }
+            Err(err) => Err(err),
+        }
+    }
+
+    fn prepare_truncate(&self) -> Result<Arc<dyn File>> {
+        let shared = self.shared.read();
+        turso_assert!(
+            shared.metadata.enabled.load(Ordering::Relaxed),
+            "WAL must be enabled"
+        );
+        shared.metadata.initialized.store(false, Ordering::Release);
+        shared.runtime.file.as_ref().cloned().ok_or_else(|| {
+            mark_unlikely();
+            LimboError::InternalError("WAL file not open".into())
+        })
+    }
+
+    fn wal_header(&self) -> WalHeader {
+        *self.shared.read().metadata.wal_header.lock()
+    }
+
+    fn wal_file(&self) -> Result<Arc<dyn File>> {
+        let shared = self.shared.read();
+        turso_assert!(
+            shared.metadata.enabled.load(Ordering::Relaxed),
+            "WAL must be enabled"
+        );
+        shared.runtime.file.as_ref().cloned().ok_or_else(|| {
+            mark_unlikely();
+            LimboError::InternalError("WAL file not open".into())
+        })
+    }
+
+    fn wal_is_initialized(&self) -> bool {
+        self.shared
+            .read()
+            .metadata
+            .initialized
+            .load(Ordering::Acquire)
+    }
+
+    fn prepare_wal_header(&self, io: &dyn IO, page_size: PageSize) -> Option<WalHeader> {
+        let mut shared: crate::sync::RwLockWriteGuard<'_, WalFileShared> = self.shared.write();
+        if shared.metadata.initialized.load(Ordering::Acquire) {
+            return None;
+        }
+
+        let (header, checksum) = {
+            let mut hdr = shared.metadata.wal_header.lock();
+            hdr.magic = if cfg!(target_endian = "big") {
+                WAL_MAGIC_BE
+            } else {
+                WAL_MAGIC_LE
+            };
+            if hdr.page_size == 0 {
+                hdr.page_size = page_size.get();
+            }
+            if hdr.salt_1 == 0 && hdr.salt_2 == 0 {
+                hdr.salt_1 = io.generate_random_number() as u32;
+                hdr.salt_2 = io.generate_random_number() as u32;
+            }
+
+            let prefix = &hdr.as_bytes()[..WAL_HEADER_SIZE - 8];
+            let use_native = (hdr.magic & 1) != 0;
+            let (c1, c2) = checksum_wal(prefix, &hdr, (0, 0), use_native);
+            hdr.checksum_1 = c1;
+            hdr.checksum_2 = c2;
+            (*hdr, (c1, c2))
+        };
+        shared.metadata.last_checksum = checksum;
+        Some(header)
+    }
+
+    fn mark_initialized(&self) {
+        self.shared
+            .read()
+            .metadata
+            .initialized
+            .store(true, Ordering::Release);
+    }
+
+    fn cache_frame(&self, page_id: u64, frame_id: u64) {
+        let shared = self.shared.read();
+        let mut frame_cache = shared.runtime.frame_cache.lock();
+        match frame_cache.get_mut(&page_id) {
+            Some(frames) => {
+                frames.push(frame_id);
+            }
+            None => {
+                frame_cache.insert(page_id, vec![frame_id]);
+            }
+        }
+    }
+
+    fn rollback_cache(&self, max_frame: u64) {
+        let shared = self.shared.read();
+        let mut frame_cache = shared.runtime.frame_cache.lock();
+        frame_cache.retain(|_page_id, frames| {
+            while frames.last().is_some_and(|&frame| frame > max_frame) {
+                frames.pop();
+            }
+            !frames.is_empty()
+        });
+    }
+
+    fn should_checkpoint_on_close(&self) -> bool {
+        true
+    }
+
+    #[cfg(test)]
+    fn backend_name(&self) -> &'static str {
+        "in_process"
+    }
+
+    #[cfg(test)]
+    fn shared_ptr(&self) -> usize {
+        Arc::as_ptr(&self.shared) as usize
+    }
+}
+
+/// Per-connection WAL coordination that delegates to the mmap'd tshm authority.
+///
+/// One instance exists per `WalFile` (i.e. per `Connection`). All instances
+/// within a process share the same `Arc<MappedSharedWalCoordination>` and the
+/// same `SharedOwnerRecord` (derived from the authority at construction time).
+///
+/// `fallback` provides the process-local read-mark / write-lock layer (the
+/// same locks used in single-process mode). `authority` provides the
+/// cross-process shared state (reader slots, frame index, snapshot metadata).
+/// Both are consulted: the fallback serializes same-process connections, the
+/// authority serializes across processes.
+#[cfg(all(unix, target_pointer_width = "64"))]
+#[derive(Debug)]
+struct ShmWalCoordination {
+    shared: Arc<RwLock<WalFileShared>>,
+    fallback: InProcessWalCoordination,
+    authority: Arc<MappedSharedWalCoordination>,
+    /// This connection's currently held reader slot, if any.
+    active_reader: Mutex<Option<SharedReaderSlot>>,
+    /// Copied from `authority.owner_record()` at construction — all connections
+    /// in the same process share the same owner identity.
+    owner: SharedOwnerRecord,
+}
+
+#[cfg(all(unix, target_pointer_width = "64"))]
+impl ShmWalCoordination {
+    fn overflow_fallback_covers(
+        &self,
+        snapshot: SharedWalCoordinationHeader,
+        max_frame: u64,
+    ) -> bool {
+        self.shared
+            .read()
+            .runtime
+            .overflow_fallback_coverage
+            .lock()
+            .covers(snapshot, max_frame)
+    }
+
+    fn clear_overflow_fallback_coverage(&self) {
+        self.shared
+            .read()
+            .runtime
+            .overflow_fallback_coverage
+            .lock()
+            .clear();
+    }
+
+    fn local_authority_snapshot_from_shared(
+        shared: &WalFileShared,
+        authority_snapshot: SharedWalCoordinationHeader,
+    ) -> SharedWalCoordinationHeader {
+        let header = shared.metadata.wal_header.lock();
+        SharedWalCoordinationHeader {
+            max_frame: shared.metadata.max_frame.load(Ordering::Acquire),
+            nbackfills: shared.metadata.nbackfills.load(Ordering::Acquire),
+            transaction_count: shared.metadata.transaction_count.load(Ordering::Acquire),
+            visibility_generation: authority_snapshot.visibility_generation,
+            checkpoint_seq: header.checkpoint_seq,
+            checkpoint_epoch: shared.runtime.epoch.load(Ordering::Acquire),
+            page_size: header.page_size,
+            salt_1: header.salt_1,
+            salt_2: header.salt_2,
+            checksum_1: shared.metadata.last_checksum.0,
+            checksum_2: shared.metadata.last_checksum.1,
+            reader_slot_count: authority_snapshot.reader_slot_count,
+        }
+    }
+
+    fn new(
+        shared: Arc<RwLock<WalFileShared>>,
+        authority: Arc<MappedSharedWalCoordination>,
+    ) -> Self {
+        let fallback = InProcessWalCoordination::new(shared.clone());
+        let coordination = Self {
+            shared,
+            fallback,
+            owner: authority.owner_record(),
+            authority,
+            active_reader: Mutex::new(None),
+        };
+        coordination.seed_or_sync_authority();
+        coordination
+    }
+
+    fn authority_is_uninitialized(snapshot: SharedWalCoordinationHeader) -> bool {
+        snapshot.max_frame == 0
+            && snapshot.nbackfills == 0
+            && snapshot.transaction_count == 0
+            && snapshot.visibility_generation == 0
+            && snapshot.checkpoint_seq == 0
+            && snapshot.checkpoint_epoch == 0
+            && snapshot.page_size == 0
+            && snapshot.salt_1 == 0
+            && snapshot.salt_2 == 0
+            && snapshot.checksum_1 == 0
+            && snapshot.checksum_2 == 0
+    }
+
+    fn local_authority_snapshot(&self) -> SharedWalCoordinationHeader {
+        let authority_snapshot = self.authority.snapshot();
+        let shared = self.shared.read();
+        Self::local_authority_snapshot_from_shared(&shared, authority_snapshot)
+    }
+
+    fn install_local_snapshot(
+        shared: &mut WalFileShared,
+        snapshot: SharedWalCoordinationHeader,
+        install_header: bool,
+    ) {
+        shared
+            .metadata
+            .max_frame
+            .store(snapshot.max_frame, Ordering::Release);
+        shared
+            .metadata
+            .nbackfills
+            .store(snapshot.nbackfills, Ordering::Release);
+        shared.metadata.last_checksum = (snapshot.checksum_1, snapshot.checksum_2);
+        shared
+            .metadata
+            .transaction_count
+            .store(snapshot.transaction_count, Ordering::Release);
+        shared
+            .runtime
+            .epoch
+            .store(snapshot.checkpoint_epoch, Ordering::Release);
+        if install_header {
+            let mut header = shared.metadata.wal_header.lock();
+            header.checkpoint_seq = snapshot.checkpoint_seq;
+            header.page_size = snapshot.page_size;
+            header.salt_1 = snapshot.salt_1;
+            header.salt_2 = snapshot.salt_2;
+            header.checksum_1 = snapshot.checksum_1;
+            header.checksum_2 = snapshot.checksum_2;
+        }
+    }
+
+    fn sync_local_from_authority(&self, snapshot: SharedWalCoordinationHeader) {
+        let mut shared = self.shared.write();
+        Self::install_local_snapshot(&mut shared, snapshot, snapshot.page_size != 0);
+    }
+
+    fn sync_authority_from_local(&self) {
+        self.authority
+            .install_snapshot(self.local_authority_snapshot());
+    }
+
+    fn sync_local_to_zero_frame_authority(&self, snapshot: SharedWalCoordinationHeader) {
+        let mut shared = self.shared.write();
+        Self::install_local_snapshot(&mut shared, snapshot, true);
+        shared.metadata.initialized.store(false, Ordering::Release);
+        shared.runtime.frame_cache.lock().clear();
+        shared.runtime.overflow_fallback_coverage.lock().clear();
+    }
+
+    fn sync_authority_frames_from_local(&self) {
+        let entries = {
+            let shared = self.shared.read();
+            let frame_cache = shared.runtime.frame_cache.lock();
+            let mut entries = Vec::new();
+            for (&page_id, frames) in frame_cache.iter() {
+                for &frame_id in frames {
+                    entries.push((frame_id, page_id));
+                }
+            }
+            entries
+        };
+        let mut entries = entries;
+        entries.sort_unstable();
+        for (frame_id, page_id) in entries {
+            self.authority.record_frame(page_id, frame_id);
+        }
+    }
+
+    fn repair_or_reseed_authority_from_local_disk_scan(
+        &self,
+        mut authority_snapshot: SharedWalCoordinationHeader,
+    ) {
+        self.authority.repair_transient_state_for_exclusive_open();
+        if authority_snapshot.nbackfills != 0 {
+            // A local WAL scan can rebuild the visible WAL tail, but it cannot
+            // prove that positive checkpoint progress is durable in the main DB
+            // file. Stay on the conservative reopen path until we implement a
+            // SQLite-equivalent recovery protocol for trusting partial-checkpoint state.
+            authority_snapshot.nbackfills = 0;
+            self.authority.install_snapshot(authority_snapshot);
+        }
+        let local_snapshot = self.local_authority_snapshot();
+        if Self::local_scan_predates_zero_frame_authority(authority_snapshot, local_snapshot) {
+            self.sync_local_to_zero_frame_authority(authority_snapshot);
+            return;
+        }
+        if Self::local_scan_cannot_disprove_zero_frame_authority(authority_snapshot, local_snapshot)
+        {
+            self.sync_local_from_authority(authority_snapshot);
+            return;
+        }
+        if Self::local_scan_cannot_disprove_positive_authority(authority_snapshot, local_snapshot) {
+            self.sync_local_from_authority(authority_snapshot);
+            return;
+        }
+        if Self::authority_matches_local_wal_scan(authority_snapshot, local_snapshot) {
+            self.sync_local_from_authority(authority_snapshot);
+            // Matching header metadata is not enough to trust the durable
+            // frame index. A restart or interrupted reopen can leave stale or
+            // empty page->frame mappings behind while max_frame/checksums
+            // still match the scanned WAL. When both snapshots describe the
+            // same visible WAL generation, compare the latest per-page
+            // mappings directly and rebuild if they diverge.
+            if self.authority.frame_index_overflowed()
+                || (self.authority.open_mode() == SharedWalCoordinationOpenMode::Exclusive
+                    && !self.authority_frame_index_matches_local_wal_scan(local_snapshot.max_frame))
+            {
+                self.authority
+                    .discard_durable_frame_index_for_exclusive_rebuild();
+                self.sync_authority_frames_from_local();
+            }
+            return;
+        }
+        // The authority and disk scan are from the same generation (matching
+        // checkpoint_seq/salts) but disagree on max_frame or checksums. This
+        // happens when a concurrent write advances the authority between the
+        // snapshot read and the disk scan.  Or the authority is from a strictly
+        // newer generation (higher checkpoint_seq) because the WAL was
+        // restarted but the on-disk header hasn't been rewritten yet.
+        //
+        // In both cases the authority's header fields are at least as current
+        // as the disk, so adopt them.  As above, preserve the authority's
+        // frame index — it is maintained by writers and must not be replaced
+        // with a potentially incomplete reconstruction.
+        if Self::authority_is_same_or_newer_generation(authority_snapshot, local_snapshot) {
+            self.sync_local_from_authority(authority_snapshot);
+            if authority_snapshot.checkpoint_seq == local_snapshot.checkpoint_seq
+                && self.authority.frame_index_overflowed()
+            {
+                self.authority
+                    .discard_durable_frame_index_for_exclusive_rebuild();
+                self.sync_authority_frames_from_local();
+            }
+            return;
+        }
+
+        self.authority
+            .discard_durable_frame_index_for_exclusive_rebuild();
+        self.sync_authority_from_local();
+        self.sync_authority_frames_from_local();
+    }
+
+    fn local_scan_cannot_disprove_zero_frame_authority(
+        authority_snapshot: SharedWalCoordinationHeader,
+        local_snapshot: SharedWalCoordinationHeader,
+    ) -> bool {
+        !Self::authority_is_uninitialized(authority_snapshot)
+            && authority_snapshot.max_frame == 0
+            && local_snapshot.max_frame == 0
+    }
+
+    fn local_scan_predates_zero_frame_authority(
+        authority_snapshot: SharedWalCoordinationHeader,
+        local_snapshot: SharedWalCoordinationHeader,
+    ) -> bool {
+        !Self::authority_is_uninitialized(authority_snapshot)
+            && authority_snapshot.max_frame == 0
+            && local_snapshot.max_frame > 0
+            && local_snapshot.checkpoint_seq < authority_snapshot.checkpoint_seq
+    }
+
+    fn local_scan_cannot_disprove_positive_authority(
+        authority_snapshot: SharedWalCoordinationHeader,
+        local_snapshot: SharedWalCoordinationHeader,
+    ) -> bool {
+        authority_snapshot.max_frame > 0
+            && local_snapshot.max_frame == 0
+            && local_snapshot.checkpoint_seq == authority_snapshot.checkpoint_seq
+            && local_snapshot.page_size == authority_snapshot.page_size
+            && local_snapshot.salt_1 == authority_snapshot.salt_1
+            && local_snapshot.salt_2 == authority_snapshot.salt_2
+    }
+
+    /// The authority is from a strictly newer WAL generation (higher
+    /// checkpoint_seq), OR from the same generation with at least as many
+    /// frames.  In either case the authority's header fields were updated
+    /// atomically by writers and are at least as current as a point-in-time
+    /// disk scan of the WAL file.
+    ///
+    /// When the generations match but the authority has a *lower* max_frame,
+    /// the authority was likely rolled back or corrupted; the disk scan's
+    /// higher max_frame is more accurate, so we must NOT match here.
+    fn authority_is_same_or_newer_generation(
+        authority_snapshot: SharedWalCoordinationHeader,
+        local_snapshot: SharedWalCoordinationHeader,
+    ) -> bool {
+        if Self::authority_is_uninitialized(authority_snapshot) {
+            return false;
+        }
+        // Strictly newer generation — always trust authority.
+        if authority_snapshot.checkpoint_seq > local_snapshot.checkpoint_seq {
+            return true;
+        }
+        // Same generation: the authority is atomically updated by writers,
+        // so its max_frame is at least as current as what the disk scan
+        // observed.  Only match when authority.max_frame >= local to
+        // avoid masking a genuinely rolled-back authority.
+        authority_snapshot.checkpoint_seq == local_snapshot.checkpoint_seq
+            && authority_snapshot.salt_1 == local_snapshot.salt_1
+            && authority_snapshot.salt_2 == local_snapshot.salt_2
+            && authority_snapshot.max_frame >= local_snapshot.max_frame
+    }
+
+    fn authority_matches_local_wal_scan(
+        authority_snapshot: SharedWalCoordinationHeader,
+        local_snapshot: SharedWalCoordinationHeader,
+    ) -> bool {
+        authority_snapshot.max_frame == local_snapshot.max_frame
+            && authority_snapshot.checkpoint_seq == local_snapshot.checkpoint_seq
+            && authority_snapshot.page_size == local_snapshot.page_size
+            && authority_snapshot.salt_1 == local_snapshot.salt_1
+            && authority_snapshot.salt_2 == local_snapshot.salt_2
+            && authority_snapshot.checksum_1 == local_snapshot.checksum_1
+            && authority_snapshot.checksum_2 == local_snapshot.checksum_2
+    }
+
+    fn authority_frame_index_matches_local_wal_scan(&self, max_frame: u64) -> bool {
+        self.authority.iter_latest_frames(0, max_frame)
+            == self.fallback.iter_latest_frames(0, max_frame)
+    }
+
+    fn local_zero_frame_generation_is_initialized(
+        &self,
+        authority_snapshot: SharedWalCoordinationHeader,
+    ) -> bool {
+        let shared = self.shared.read();
+        if !shared.metadata.initialized.load(Ordering::Acquire) {
+            return false;
+        }
+        Self::local_zero_frame_generation_matches_authority_snapshot(authority_snapshot, &shared)
+    }
+
+    fn local_zero_frame_generation_matches_authority_snapshot(
+        authority_snapshot: SharedWalCoordinationHeader,
+        shared: &WalFileShared,
+    ) -> bool {
+        let header = shared.metadata.wal_header.lock();
+        header.checkpoint_seq == authority_snapshot.checkpoint_seq
+            && header.page_size == authority_snapshot.page_size
+            && header.salt_1 == authority_snapshot.salt_1
+            && header.salt_2 == authority_snapshot.salt_2
+    }
+
+    fn authority_needs_local_header_seed(snapshot: SharedWalCoordinationHeader) -> bool {
+        Self::authority_is_uninitialized(snapshot) || snapshot.page_size == 0
+    }
+
+    /// Called once at `ShmWalCoordination` construction to reconcile the
+    /// process-local WAL view (built from a WAL file scan or inherited from
+    /// a previous connection) with the shared tshm authority.
+    ///
+    /// Three cases:
+    ///
+    /// 1. **Authority uninitialized** (fresh tshm): seed it from our local
+    ///    WAL scan — we are the first process.
+    ///
+    /// 2. **Authority initialized and we opened from a local disk scan**
+    ///    (no writer/checkpoint is active): repair transient owner/reader
+    ///    state first. If the scan only sees an empty WAL and the durable
+    ///    authority is already at frame 0, keep the durable authority because
+    ///    the scan cannot prove newer header metadata. Otherwise, if the
+    ///    local scan agrees with the WAL-provable subset of the durable
+    ///    snapshot, keep the durable authority. If not, discard the durable
+    ///    frame index and rebuild it from the local scan.
+    ///
+    /// 3. **Authority initialized and trustworthy**: adopt the authority's
+    ///    snapshot as our local state. If our local view also came from a
+    ///    disk scan and the authority's frame index is empty, backfill it
+    ///    from our local frame cache.
+    fn seed_or_sync_authority(&self) {
+        let snapshot = self.authority.snapshot();
+        let local_wal_view_loaded_from_disk = self
+            .shared
+            .read()
+            .metadata
+            .loaded_from_disk_scan
+            .load(Ordering::Acquire);
+        if Self::authority_is_uninitialized(snapshot) {
+            self.sync_authority_from_local();
+            self.sync_authority_frames_from_local();
+        } else if local_wal_view_loaded_from_disk
+            && !self.authority.writer_or_checkpoint_lock_active()
+        {
+            self.repair_or_reseed_authority_from_local_disk_scan(snapshot);
+        } else {
+            let needs_zero_frame_header_rewrite = snapshot.max_frame == 0 && {
+                let shared = self.shared.read();
+                !shared.metadata.initialized.load(Ordering::Acquire)
+                    || !Self::local_zero_frame_generation_matches_authority_snapshot(
+                        snapshot, &shared,
+                    )
+            };
+            self.sync_local_from_authority(snapshot);
+            if needs_zero_frame_header_rewrite {
+                self.shared
+                    .read()
+                    .metadata
+                    .initialized
+                    .store(false, Ordering::Release);
+            }
+            if local_wal_view_loaded_from_disk
+                && !self.authority.writer_or_checkpoint_lock_active()
+                && self.authority.iter_latest_frames(0, u64::MAX).is_empty()
+            {
+                self.sync_authority_frames_from_local();
+            }
+        }
+    }
+
+    fn restart_snapshot_from_authority(
+        &self,
+        snapshot: SharedWalCoordinationHeader,
+        io: &dyn IO,
+    ) -> WalSnapshot {
+        let checkpoint_seq = snapshot.checkpoint_seq.wrapping_add(1);
+        let salt_1 = snapshot.salt_1.wrapping_add(1);
+        let salt_2 = io.generate_random_number() as u32;
+        let restarted = SharedWalCoordinationHeader {
+            max_frame: 0,
+            nbackfills: 0,
+            transaction_count: snapshot.transaction_count,
+            visibility_generation: snapshot.visibility_generation,
+            checkpoint_seq,
+            checkpoint_epoch: snapshot.checkpoint_epoch,
+            page_size: snapshot.page_size,
+            salt_1,
+            salt_2,
+            checksum_1: snapshot.checksum_1,
+            checksum_2: snapshot.checksum_2,
+            reader_slot_count: snapshot.reader_slot_count,
+        };
+
+        {
+            let mut shared = self.shared.write();
+            Self::install_local_snapshot(&mut shared, restarted, true);
+            shared.metadata.initialized.store(false, Ordering::Release);
+            shared.runtime.frame_cache.lock().clear();
+            shared.runtime.overflow_fallback_coverage.lock().clear();
+            shared.runtime.read_locks[0].set_value_exclusive(0);
+            shared.runtime.read_locks[1].set_value_exclusive(0);
+            for lock in &shared.runtime.read_locks[2..] {
+                lock.set_value_exclusive(READMARK_NOT_USED);
+            }
+        }
+
+        self.authority.rollback_frames(0);
+        self.authority.install_snapshot(restarted);
+
+        WalSnapshot {
+            max_frame: restarted.max_frame,
+            nbackfills: restarted.nbackfills,
+            last_checksum: (restarted.checksum_1, restarted.checksum_2),
+            checkpoint_seq: restarted.checkpoint_seq,
+            transaction_count: restarted.transaction_count,
+        }
+    }
+
+    fn ensure_local_frame_cache_covers_snapshot(
+        &self,
+        io: &Arc<dyn IO>,
+        required_snapshot: WalSnapshot,
+    ) -> Result<()> {
+        if required_snapshot.max_frame == 0 || !self.authority.frame_index_overflowed() {
+            return Ok(());
+        }
+
+        let authority_snapshot = self.authority.snapshot();
+        if authority_snapshot.checkpoint_seq != required_snapshot.checkpoint_seq {
+            return Err(LimboError::Busy);
+        }
+        if self.overflow_fallback_covers(authority_snapshot, required_snapshot.max_frame) {
+            return Ok(());
+        }
+
+        let _ = io;
+        tracing::debug!(
+            required_max_frame = required_snapshot.max_frame,
+            authority_max_frame = authority_snapshot.max_frame,
+            authority_checkpoint_seq = authority_snapshot.checkpoint_seq,
+            "refusing live overflow fallback refresh on a read path because it would require blocking WAL scan I/O"
+        );
+        Err(LimboError::Busy)
+    }
+}
+
+#[cfg(all(unix, target_pointer_width = "64"))]
+impl WalCoordination for ShmWalCoordination {
+    fn load_snapshot(&self) -> WalSnapshot {
+        let snapshot = self.authority.snapshot();
+        WalSnapshot {
+            max_frame: snapshot.max_frame,
+            nbackfills: snapshot.nbackfills,
+            last_checksum: (snapshot.checksum_1, snapshot.checksum_2),
+            checkpoint_seq: snapshot.checkpoint_seq,
+            transaction_count: snapshot.transaction_count,
+        }
+    }
+
+    fn ensure_local_frame_cache_covers(
+        &self,
+        io: &Arc<dyn IO>,
+        snapshot: WalSnapshot,
+    ) -> Result<()> {
+        self.ensure_local_frame_cache_covers_snapshot(io, snapshot)
+    }
+
+    fn publish_commit(&self, commit: WalCommitState) {
+        {
+            let mut shared = self.shared.write();
+            shared
+                .metadata
+                .max_frame
+                .store(commit.max_frame, Ordering::Release);
+            shared.metadata.last_checksum = commit.last_checksum;
+            shared
+                .metadata
+                .transaction_count
+                .store(commit.transaction_count, Ordering::Release);
+            let mut header = shared.metadata.wal_header.lock();
+            header.checksum_1 = commit.last_checksum.0;
+            header.checksum_2 = commit.last_checksum.1;
+        }
+        self.authority.publish_commit(
+            commit.max_frame,
+            commit.last_checksum.0,
+            commit.last_checksum.1,
+            commit.transaction_count,
+        );
+        if self.authority.frame_index_overflowed() {
+            let snapshot = self.authority.snapshot();
+            let shared = self.shared.read();
+            let mut coverage = shared.runtime.overflow_fallback_coverage.lock();
+            if coverage.covers(snapshot, commit.max_frame.saturating_sub(1)) {
+                coverage.record_snapshot(snapshot, commit.max_frame);
+            }
+        }
+    }
+
+    fn publish_backfill(&self, max_frame: u64) {
+        self.shared
+            .write()
+            .metadata
+            .nbackfills
+            .store(max_frame, Ordering::Release);
+        self.authority.publish_backfill(max_frame);
+    }
+
+    fn install_durable_backfill_proof(
+        &self,
+        nbackfills: u64,
+        db_size_pages: u32,
+        db_header_crc32c: u32,
+        sync_type: FileSyncType,
+    ) -> Result<Option<Completion>> {
+        let snapshot = self.authority.snapshot();
+        turso_assert!(
+            (snapshot.nbackfills..=snapshot.max_frame).contains(&nbackfills),
+            "durable backfill proof requires nbackfills within the authoritative WAL range",
+            {
+                "nbackfills": nbackfills,
+                "authority_nbackfills": snapshot.nbackfills,
+                "authority_max_frame": snapshot.max_frame
+            }
+        );
+        let proof_snapshot = SharedWalCoordinationHeader {
+            nbackfills,
+            ..snapshot
+        };
+        self.authority
+            .install_backfill_proof(proof_snapshot, db_size_pages, db_header_crc32c);
+        Ok(Some(self.authority.begin_sync(sync_type)?))
+    }
+
+    fn find_frame(
+        &self,
+        page_id: u64,
+        min_frame: u64,
+        max_frame: u64,
+        frame_watermark: Option<u64>,
+    ) -> Option<u64> {
+        // Exhausting the reserved shared index space leaves the authority
+        // incomplete. Fall back to the local scanned cache rather than trusting
+        // a truncated shared index.
+        if self.authority.frame_index_overflowed() {
+            return self
+                .fallback
+                .find_frame(page_id, min_frame, max_frame, frame_watermark);
+        }
+        self.authority
+            .find_frame(page_id, min_frame, max_frame, frame_watermark)
+    }
+
+    fn iter_latest_frames(&self, min_frame: u64, max_frame: u64) -> Vec<(u64, u64)> {
+        // Same trade-off as find_frame(): if the reserved shared index space is
+        // exhausted, keep correctness by consulting the local scanned cache.
+        if self.authority.frame_index_overflowed() {
+            return self.fallback.iter_latest_frames(min_frame, max_frame);
+        }
+        self.authority.iter_latest_frames(min_frame, max_frame)
+    }
+
+    fn checkpoint_epoch(&self) -> u32 {
+        self.authority.checkpoint_epoch()
+    }
+
+    fn bump_checkpoint_epoch(&self) -> u32 {
+        let prev = self.authority.bump_checkpoint_epoch();
+        self.shared
+            .write()
+            .runtime
+            .epoch
+            .store(prev + 1, Ordering::Release);
+        prev
+    }
+
+    fn try_begin_read_tx(&self, snapshot: WalSnapshot) -> Option<ReadGuardKind> {
+        turso_assert!(
+            snapshot.max_frame <= u32::MAX as u64,
+            "max_frame exceeds u32 read mark range"
+        );
+        let shared = self.shared.read();
+        let read_locks = &shared.runtime.read_locks;
+
+        if snapshot.max_frame == snapshot.nbackfills {
+            if !read_locks[0].read() {
+                return None;
+            }
+            if self.load_snapshot() != snapshot {
+                read_locks[0].unlock();
+                return None;
+            }
+            return Some(ReadGuardKind::DbFile);
+        }
+
+        let mut best_idx: i64 = -1;
+        let mut best_mark: u32 = 0;
+        for (idx, lock) in read_locks.iter().enumerate().take(5).skip(1) {
+            let mark = lock.get_value();
+            if mark != READMARK_NOT_USED && mark <= snapshot.max_frame as u32 && mark > best_mark {
+                best_mark = mark;
+                best_idx = idx as i64;
+            }
+        }
+
+        if best_idx == -1 || (best_mark as u64) < snapshot.max_frame {
+            for (idx, lock) in read_locks.iter().enumerate().take(5).skip(1) {
+                if !lock.write() {
+                    continue;
+                }
+                lock.set_value_exclusive(snapshot.max_frame as u32);
+                best_idx = idx as i64;
+                best_mark = snapshot.max_frame as u32;
+                read_locks[idx].unlock();
+                break;
+            }
+        }
+
+        if best_idx == -1 || !read_locks[best_idx as usize].read() {
+            return None;
+        }
+
+        let current_slot_mark = read_locks[best_idx as usize].get_value();
+        if current_slot_mark != best_mark || self.load_snapshot() != snapshot {
+            read_locks[best_idx as usize].unlock();
+            return None;
+        }
+
+        let read_mark_index =
+            NonZeroUsize::new(best_idx as usize).expect("best_idx checked to be positive");
+        let reader = self
+            .authority
+            .register_reader_for_snapshot(self.owner, snapshot.max_frame)?;
+        if self.load_snapshot() != snapshot {
+            self.authority.unregister_reader_for_snapshot(reader);
+            read_locks[best_idx as usize].unlock();
+            return None;
+        }
+
+        let mut active_reader = self.active_reader.lock();
+        turso_assert!(active_reader.is_none(), "shared reader registration leaked");
+        *active_reader = Some(reader);
+        Some(ReadGuardKind::ReadMark(read_mark_index))
+    }
+
+    fn end_read_tx(&self, guard: ReadGuardKind) {
+        if let Some(reader) = self.active_reader.lock().take() {
+            self.authority.unregister_reader_for_snapshot(reader);
+        }
+        self.fallback.end_read_tx(guard);
+    }
+
+    fn try_begin_write_tx(&self) -> bool {
+        if !self.authority.try_acquire_writer(self.owner) {
+            return false;
+        }
+        if !self.fallback.try_write_lock() {
+            self.authority.release_writer(self.owner);
+            return false;
+        }
+        true
+    }
+
+    fn end_write_tx(&self) {
+        self.fallback.unlock_write_lock();
+        self.authority.release_writer(self.owner);
+    }
+
+    fn acquire_checkpoint_guard(
+        &self,
+        mode: CheckpointMode,
+    ) -> Result<CoordinationCheckpointGuardKind> {
+        if !self.authority.try_acquire_checkpoint(self.owner) {
+            return Err(LimboError::Busy);
+        }
+        let needs_writer = !matches!(mode, CheckpointMode::Passive { .. });
+        if needs_writer && !self.authority.try_acquire_writer(self.owner) {
+            self.authority.release_checkpoint(self.owner);
+            return Err(LimboError::Busy);
+        }
+        if !self.fallback.try_checkpoint_lock() {
+            if needs_writer {
+                self.authority.release_writer(self.owner);
+            }
+            self.authority.release_checkpoint(self.owner);
+            return Err(LimboError::Busy);
+        }
+        match mode {
+            CheckpointMode::Passive { .. } => {
+                if !self.fallback.try_read_mark_exclusive(0) {
+                    self.fallback.unlock_checkpoint_lock();
+                    if needs_writer {
+                        self.authority.release_writer(self.owner);
+                    }
+                    self.authority.release_checkpoint(self.owner);
+                    return Err(LimboError::Busy);
+                }
+                Ok(CoordinationCheckpointGuardKind::Read0)
+            }
+            CheckpointMode::Full | CheckpointMode::Restart | CheckpointMode::Truncate { .. } => {
+                if !self.fallback.try_read_mark_exclusive(0) {
+                    self.fallback.unlock_checkpoint_lock();
+                    self.authority.release_writer(self.owner);
+                    self.authority.release_checkpoint(self.owner);
+                    return Err(LimboError::Busy);
+                }
+                if !self.fallback.try_write_lock() {
+                    self.fallback.unlock_read_mark(0);
+                    self.fallback.unlock_checkpoint_lock();
+                    self.authority.release_writer(self.owner);
+                    self.authority.release_checkpoint(self.owner);
+                    return Err(LimboError::Busy);
+                }
+                Ok(CoordinationCheckpointGuardKind::Writer)
+            }
+        }
+    }
+
+    fn release_checkpoint_guard(&self, guard: CoordinationCheckpointGuardKind) {
+        match guard {
+            CoordinationCheckpointGuardKind::Writer => {
+                self.fallback.unlock_write_lock();
+                self.fallback.unlock_read_mark(0);
+                self.fallback.unlock_checkpoint_lock();
+                self.authority.release_writer(self.owner);
+                self.authority.release_checkpoint(self.owner);
+            }
+            CoordinationCheckpointGuardKind::Read0 => {
+                self.fallback.unlock_read_mark(0);
+                self.fallback.unlock_checkpoint_lock();
+                self.authority.release_checkpoint(self.owner);
+            }
+        }
+    }
+
+    fn determine_max_safe_checkpoint_frame(&self, max_frame: u64) -> u64 {
+        turso_assert!(
+            max_frame <= u32::MAX as u64,
+            "max_frame exceeds u32 read mark range"
+        );
+        let mut max_safe_frame = max_frame;
+        for read_lock_idx in 1..5 {
+            let this_mark = self.fallback.read_mark_value(read_lock_idx);
+            if this_mark < max_safe_frame as u32 {
+                let busy = !self.fallback.try_read_mark_exclusive(read_lock_idx);
+                if !busy {
+                    let val = if read_lock_idx == 1 {
+                        max_safe_frame as u32
+                    } else {
+                        READMARK_NOT_USED
+                    };
+                    self.fallback
+                        .set_read_mark_value_exclusive(read_lock_idx, val);
+                    self.fallback.unlock_read_mark(read_lock_idx);
+                } else {
+                    max_safe_frame = this_mark as u64;
+                }
+            }
+        }
+        match self.authority.min_active_reader_frame() {
+            Some(shared_min) => max_safe_frame.min(shared_min),
+            None => max_safe_frame,
+        }
+    }
+
+    fn begin_restart(&self, io: &dyn IO) -> Result<WalSnapshot> {
+        for idx in 1..5 {
+            if !self.fallback.try_read_mark_exclusive(idx) {
+                for held_idx in 1..idx {
+                    self.fallback.unlock_read_mark(held_idx);
+                }
+                return Err(LimboError::Busy);
+            }
+        }
+        // In multi-process mode, readers register with the authority (tshm shared
+        // memory), not with fallback OFD byte-range locks. We must also check for
+        // active cross-process readers before proceeding with the WAL restart,
+        // otherwise we reset the shared WAL state while another process still has
+        // an active read transaction, leading to data loss.
+        if self.authority.min_active_reader_frame().is_some() {
+            for idx in 1..5 {
+                self.fallback.unlock_read_mark(idx);
+            }
+            return Err(LimboError::Busy);
+        }
+        Ok(self.restart_snapshot_from_authority(self.authority.snapshot(), io))
+    }
+
+    fn end_restart(&self) {
+        self.fallback.end_restart();
+    }
+
+    fn try_restart_log_for_write(&self, io: &dyn IO) -> Result<Option<WalSnapshot>> {
+        if !self.fallback.try_upgrade_read_mark(0) {
+            return Ok(None);
+        }
+        let result = self.begin_restart(io);
+        self.fallback.downgrade_read_mark(0);
+        match result {
+            Ok(snapshot) => {
+                self.end_restart();
+                Ok(Some(snapshot))
+            }
+            Err(err) => Err(err),
+        }
+    }
+
+    fn prepare_truncate(&self) -> Result<Arc<dyn File>> {
+        self.fallback.prepare_truncate()
+    }
+
+    fn wal_header(&self) -> WalHeader {
+        let snapshot = self.authority.snapshot();
+        let mut header = self.fallback.wal_header();
+        if snapshot.page_size == 0 {
+            return header;
+        }
+        header.page_size = snapshot.page_size;
+        header.checkpoint_seq = snapshot.checkpoint_seq;
+        header.salt_1 = snapshot.salt_1;
+        header.salt_2 = snapshot.salt_2;
+        header.checksum_1 = snapshot.checksum_1;
+        header.checksum_2 = snapshot.checksum_2;
+        header
+    }
+
+    fn wal_file(&self) -> Result<Arc<dyn File>> {
+        self.fallback.wal_file()
+    }
+
+    fn wal_is_initialized(&self) -> bool {
+        let authority_snapshot = self.authority.snapshot();
+        if Self::authority_needs_local_header_seed(authority_snapshot) {
+            return self.fallback.wal_is_initialized();
+        }
+        if authority_snapshot.max_frame > 0 {
+            self.sync_local_from_authority(authority_snapshot);
+            self.fallback.mark_initialized();
+            return true;
+        }
+        if self.local_zero_frame_generation_is_initialized(authority_snapshot) {
+            return true;
+        }
+
+        self.sync_local_from_authority(authority_snapshot);
+        self.shared
+            .read()
+            .metadata
+            .initialized
+            .store(false, Ordering::Release);
+        false
+    }
+
+    fn prepare_wal_header(&self, io: &dyn IO, page_size: PageSize) -> Option<WalHeader> {
+        let authority_snapshot = self.authority.snapshot();
+        // A zero-frame authority snapshot after RESTART/TRUNCATE is still
+        // authoritative: it carries the latest transaction_count,
+        // checkpoint_seq, salts, and checksums for readers. Sync from it
+        // before preparing the header so the bytes written to disk belong to
+        // the same generation as the authority snapshot.
+        if Self::authority_needs_local_header_seed(authority_snapshot) {
+            let header = self.fallback.prepare_wal_header(io, page_size);
+            if header.is_some() {
+                self.sync_authority_from_local();
+            }
+            return header;
+        }
+        self.sync_local_from_authority(authority_snapshot);
+        let header = self.fallback.prepare_wal_header(io, page_size);
+        if header.is_some() {
+            self.sync_authority_from_local();
+        }
+        header
+    }
+
+    fn mark_initialized(&self) {
+        self.fallback.mark_initialized();
+    }
+
+    fn cache_frame(&self, page_id: u64, frame_id: u64) {
+        self.fallback.cache_frame(page_id, frame_id);
+        self.authority.record_frame(page_id, frame_id);
+    }
+
+    fn rollback_cache(&self, max_frame: u64) {
+        self.fallback.rollback_cache(max_frame);
+        self.authority.rollback_frames(max_frame);
+        self.clear_overflow_fallback_coverage();
+    }
+
+    fn should_checkpoint_on_close(&self) -> bool {
+        self.authority.is_last_process_mapping()
+    }
+
+    #[cfg(test)]
+    fn backend_name(&self) -> &'static str {
+        "tshm"
+    }
+
+    #[cfg(test)]
+    fn shared_ptr(&self) -> usize {
+        Arc::as_ptr(&self.shared) as usize
+    }
+
+    #[cfg(test)]
+    fn open_mode_name(&self) -> Option<&'static str> {
+        Some(match self.authority.open_mode() {
+            SharedWalCoordinationOpenMode::Exclusive => "exclusive",
+            SharedWalCoordinationOpenMode::MultiProcess => "multiprocess",
+        })
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -708,11 +2380,11 @@ impl fmt::Debug for OngoingCheckpoint {
 pub struct WalFile {
     io: Arc<dyn IO>,
     buffer_pool: Arc<BufferPool>,
+    coordination: Arc<dyn WalCoordination>,
 
     syncing: Arc<AtomicBool>,
     write_lock_held: AtomicBool,
 
-    shared: Arc<RwLock<WalFileShared>>,
     ongoing_checkpoint: RwLock<OngoingCheckpoint>,
     checkpoint_threshold: usize,
     /// This is the index to the read_lock in WalFileShared that we are holding. This lock contains
@@ -731,6 +2403,12 @@ pub struct WalFile {
     checkpoint_guard: RwLock<Option<CheckpointLocks>>,
 
     io_ctx: RwLock<IOContext>,
+
+    /// Set when `write_frame_raw` appends frames without a commit marker
+    /// (`db_size == 0`), meaning the coordination backend's max_frame is
+    /// behind our connection-local max_frame. Cleared once
+    /// `finish_append_frames_commit` publishes the state.
+    has_unpublished_frames: AtomicBool,
 }
 
 impl fmt::Debug for WalFile {
@@ -738,7 +2416,6 @@ impl fmt::Debug for WalFile {
         f.debug_struct("WalFile")
             .field("syncing", &self.syncing.load(Ordering::Relaxed))
             .field("page_size", &self.page_size())
-            .field("shared", &self.shared)
             .field("ongoing_checkpoint", &*self.ongoing_checkpoint.read())
             .field("checkpoint_threshold", &self.checkpoint_threshold)
             .field("max_frame_read_lock_index", &self.max_frame_read_lock_index)
@@ -804,16 +2481,22 @@ impl fmt::Debug for WalFile {
 ** writing new content beginning at frame 1.
 */
 
-// TODO(pere): lock only important parts + pin WalFileShared
-/// WalFileShared is the part of a WAL that will be shared between threads. A wal has information
-/// that needs to be communicated between threads so this struct does the job.
-pub struct WalFileShared {
+/// Authoritative WAL metadata currently shared by all connections in a process.
+pub struct WalSharedMetadata {
     pub enabled: AtomicBool,
     pub wal_header: Arc<SpinLock<WalHeader>>,
     pub min_frame: AtomicU64,
     pub max_frame: AtomicU64,
     pub nbackfills: AtomicU64,
     pub transaction_count: AtomicU64,
+    pub last_checksum: (u32, u32), // Check of last frame in WAL, this is a cumulative checksum over all frames in the WAL
+    pub loaded: AtomicBool,
+    pub loaded_from_disk_scan: AtomicBool,
+    pub initialized: AtomicBool,
+}
+
+/// Process-local coordination and caches layered around the shared WAL metadata.
+pub struct WalSharedRuntime {
     // Frame cache maps a Page to all the frames it has stored in WAL in ascending order.
     // This is to easily find the frame it must checkpoint each connection if a checkpoint is
     // necessary.
@@ -821,7 +2504,6 @@ pub struct WalFileShared {
     // we don't need WAL's index file. So we can do stuff like this without shared memory.
     // TODO: this will need refactoring because this is incredible memory inefficient.
     pub frame_cache: Arc<SpinLock<FxHashMap<u64, Vec<u64>>>>,
-    pub last_checksum: (u32, u32), // Check of last frame in WAL, this is a cumulative checksum over all frames in the WAL
     pub file: Option<Arc<dyn File>>,
     /// Read locks advertise the maximum WAL frame a reader may access.
     /// Slot 0 is special, when it is held (shared) the reader bypasses the WAL and uses the main DB file.
@@ -836,23 +2518,84 @@ pub struct WalFileShared {
 
     /// Serialises checkpointer threads, only one checkpoint can be in flight at any time. Blocking and exclusive only
     pub checkpoint_lock: TursoRwLock,
-    pub loaded: AtomicBool,
-    pub initialized: AtomicBool,
     /// Increments on each checkpoint, used to prevent stale cached pages being used for
     /// backfilling.
     pub epoch: AtomicU32,
+    /// Tracks how far the process-local `frame_cache` is known to be complete
+    /// for overflow fallback in the current WAL generation.
+    pub overflow_fallback_coverage: Arc<SpinLock<OverflowFallbackCoverage>>,
+}
+
+/// WalFileShared holds process-wide WAL metadata plus process-local coordination state.
+pub struct WalFileShared {
+    pub metadata: WalSharedMetadata,
+    pub runtime: WalSharedRuntime,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct OverflowFallbackCoverage {
+    checkpoint_seq: u32,
+    salt_1: u32,
+    salt_2: u32,
+    max_frame: u64,
+    valid: bool,
+}
+
+impl OverflowFallbackCoverage {
+    pub(crate) fn clear(&mut self) {
+        *self = Self::default();
+    }
+
+    pub(crate) fn record(&mut self, checkpoint_seq: u32, salt_1: u32, salt_2: u32, max_frame: u64) {
+        if max_frame == 0 {
+            self.clear();
+            return;
+        }
+        self.checkpoint_seq = checkpoint_seq;
+        self.salt_1 = salt_1;
+        self.salt_2 = salt_2;
+        self.max_frame = max_frame;
+        self.valid = true;
+    }
+
+    #[cfg(all(unix, target_pointer_width = "64"))]
+    pub(crate) fn record_snapshot(
+        &mut self,
+        snapshot: SharedWalCoordinationHeader,
+        max_frame: u64,
+    ) {
+        self.record(
+            snapshot.checkpoint_seq,
+            snapshot.salt_1,
+            snapshot.salt_2,
+            max_frame,
+        );
+    }
+
+    #[cfg(all(unix, target_pointer_width = "64"))]
+    pub(crate) fn same_generation(&self, snapshot: SharedWalCoordinationHeader) -> bool {
+        self.valid
+            && self.checkpoint_seq == snapshot.checkpoint_seq
+            && self.salt_1 == snapshot.salt_1
+            && self.salt_2 == snapshot.salt_2
+    }
+
+    #[cfg(all(unix, target_pointer_width = "64"))]
+    pub(crate) fn covers(&self, snapshot: SharedWalCoordinationHeader, max_frame: u64) -> bool {
+        self.same_generation(snapshot) && self.max_frame >= max_frame
+    }
 }
 
 impl fmt::Debug for WalFileShared {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("WalFileShared")
-            .field("enabled", &self.enabled.load(Ordering::Relaxed))
-            .field("wal_header", &self.wal_header)
-            .field("min_frame", &self.min_frame)
-            .field("max_frame", &self.max_frame)
-            .field("nbackfills", &self.nbackfills)
-            .field("frame_cache", &self.frame_cache)
-            .field("last_checksum", &self.last_checksum)
+            .field("enabled", &self.metadata.enabled.load(Ordering::Relaxed))
+            .field("wal_header", &self.metadata.wal_header)
+            .field("min_frame", &self.metadata.min_frame)
+            .field("max_frame", &self.metadata.max_frame)
+            .field("nbackfills", &self.metadata.nbackfills)
+            .field("frame_cache", &self.runtime.frame_cache)
+            .field("last_checksum", &self.metadata.last_checksum)
             // Excluding `file`, `read_locks`, and `write_lock`
             .finish()
     }
@@ -863,8 +2606,12 @@ impl fmt::Debug for WalFileShared {
 /// the case of errors. It is held by the WalFile while checkpoint is ongoing
 /// then transferred to the CheckpointResult if necessary.
 enum CheckpointLocks {
-    Writer { ptr: Arc<RwLock<WalFileShared>> },
-    Read0 { ptr: Arc<RwLock<WalFileShared>> },
+    Writer {
+        coordination: Arc<dyn WalCoordination>,
+    },
+    Read0 {
+        coordination: Arc<dyn WalCoordination>,
+    },
 }
 
 /// Database checkpointers takes the following locks, in order:
@@ -875,73 +2622,23 @@ enum CheckpointLocks {
 /// Exclusive lock on read-mark slots 1-N again. These are immediately released after being taken (RESTART and TRUNCATE only).
 /// All of the above use blocking locks.
 impl CheckpointLocks {
-    fn new(ptr: Arc<RwLock<WalFileShared>>, mode: CheckpointMode) -> Result<Self> {
-        let ptr_clone = ptr.clone();
-        {
-            let shared = ptr.write();
-            if !shared.checkpoint_lock.write() {
-                tracing::trace!("CheckpointGuard::new: checkpoint lock failed, returning Busy");
-                return Err(LimboError::Busy);
-            }
-            match mode {
-                CheckpointMode::Passive { .. } => {
-                    if !shared.read_locks[0].write() {
-                        shared.checkpoint_lock.unlock();
-                        tracing::trace!("CheckpointGuard: read0 lock failed, returning Busy");
-                        return Err(LimboError::Busy);
-                    }
-                }
-                CheckpointMode::Full => {
-                    if !shared.read_locks[0].write() {
-                        shared.checkpoint_lock.unlock();
-                        tracing::trace!("CheckpointGuard: read0 lock failed (Full), Busy");
-                        return Err(LimboError::Busy);
-                    }
-                    if !shared.write_lock.write() {
-                        shared.read_locks[0].unlock();
-                        shared.checkpoint_lock.unlock();
-                        tracing::trace!("CheckpointGuard: write lock failed (Full), Busy");
-                        return Err(LimboError::Busy);
-                    }
-                }
-                CheckpointMode::Restart | CheckpointMode::Truncate { .. } => {
-                    if !shared.read_locks[0].write() {
-                        shared.checkpoint_lock.unlock();
-                        tracing::trace!("CheckpointGuard: read0 lock failed, returning Busy");
-                        return Err(LimboError::Busy);
-                    }
-                    if !shared.write_lock.write() {
-                        shared.checkpoint_lock.unlock();
-                        shared.read_locks[0].unlock();
-                        tracing::trace!("CheckpointGuard: write lock failed, returning Busy");
-                        return Err(LimboError::Busy);
-                    }
-                }
-            }
-        }
-
-        match mode {
-            CheckpointMode::Passive { .. } => Ok(Self::Read0 { ptr: ptr_clone }),
-            CheckpointMode::Full | CheckpointMode::Restart | CheckpointMode::Truncate { .. } => {
-                Ok(Self::Writer { ptr: ptr_clone })
-            }
-        }
+    fn new(coordination: Arc<dyn WalCoordination>, mode: CheckpointMode) -> Result<Self> {
+        let guard = coordination.acquire_checkpoint_guard(mode)?;
+        Ok(match guard {
+            CoordinationCheckpointGuardKind::Read0 => Self::Read0 { coordination },
+            CoordinationCheckpointGuardKind::Writer => Self::Writer { coordination },
+        })
     }
 }
 
 impl Drop for CheckpointLocks {
     fn drop(&mut self) {
         match self {
-            CheckpointLocks::Writer { ptr: shared } => {
-                let guard = shared.write();
-                guard.write_lock.unlock();
-                guard.read_locks[0].unlock();
-                guard.checkpoint_lock.unlock();
+            CheckpointLocks::Writer { coordination } => {
+                coordination.release_checkpoint_guard(CoordinationCheckpointGuardKind::Writer);
             }
-            CheckpointLocks::Read0 { ptr: shared } => {
-                let guard = shared.write();
-                guard.read_locks[0].unlock();
-                guard.checkpoint_lock.unlock();
+            CheckpointLocks::Read0 { coordination } => {
+                coordination.release_checkpoint_guard(CoordinationCheckpointGuardKind::Read0);
             }
         }
     }
@@ -953,9 +2650,50 @@ enum TryBeginReadResult {
     Ok(bool),
     /// Transient condition, caller should retry immediately (like SQLite's WAL_RETRY)
     Retry,
+    /// Non-retriable failure while preparing the local WAL view.
+    Err(LimboError),
 }
 
 impl WalFile {
+    /// Load the authoritative WAL snapshot through the coordination backend.
+    fn load_coordination_snapshot(&self) -> WalSnapshot {
+        self.coordination.load_snapshot()
+    }
+
+    /// Reconstruct the connection-local WAL state stored on this `WalFile`.
+    fn connection_state(&self) -> WalConnectionState {
+        WalConnectionState::new(
+            WalSnapshot {
+                max_frame: self.max_frame.load(Ordering::Acquire),
+                nbackfills: self.min_frame.load(Ordering::Acquire).saturating_sub(1),
+                last_checksum: *self.last_checksum.read(),
+                checkpoint_seq: self.checkpoint_seq.load(Ordering::Acquire),
+                transaction_count: self.transaction_count.load(Ordering::Acquire),
+            },
+            ReadGuardKind::from_lock_index(self.max_frame_read_lock_index.load(Ordering::Acquire)),
+        )
+    }
+
+    /// Persist a connection-local WAL snapshot bundle back into the legacy fields on `WalFile`.
+    fn install_connection_state(&self, state: WalConnectionState) {
+        self.max_frame
+            .store(state.snapshot.max_frame, Ordering::Release);
+        self.min_frame
+            .store(state.snapshot.min_frame(), Ordering::Release);
+        *self.last_checksum.write() = state.snapshot.last_checksum;
+        self.checkpoint_seq
+            .store(state.snapshot.checkpoint_seq, Ordering::Release);
+        self.transaction_count
+            .store(state.snapshot.transaction_count, Ordering::Release);
+        self.max_frame_read_lock_index
+            .store(state.read_guard.lock_index(), Ordering::Release);
+    }
+
+    /// Compare a freshly loaded shared snapshot against the connection's current snapshot.
+    fn db_changed_against(&self, snapshot: WalSnapshot, local_state: WalConnectionState) -> bool {
+        snapshot != local_state.snapshot
+    }
+
     /// Try to begin a read transaction. Returns Retry for transient conditions
     /// that should be retried immediately, Ok for success.
     fn try_begin_read_tx(&self) -> TryBeginReadResult {
@@ -969,178 +2707,51 @@ impl WalFile {
 
         // Snapshot the shared WAL state. We haven't taken a read lock yet, so we need
         // to validate these values later.
-        let (shared_max, nbackfills, last_checksum, checkpoint_seq, transaction_count) = self
-            .with_shared(|shared| {
-                (
-                    shared.max_frame.load(Ordering::Acquire),
-                    shared.nbackfills.load(Ordering::Acquire),
-                    shared.last_checksum,
-                    shared.wal_header.lock().checkpoint_seq,
-                    shared.transaction_count.load(Ordering::Acquire),
-                )
-            });
+        let shared_snapshot = self.load_coordination_snapshot();
         tracing::debug!(
             "try_begin_read_tx: shared_max={}, nbackfills={}, last_checksum={:?}, checkpoint_seq={:?}, transaction_count={}",
-            shared_max,
-            nbackfills,
-            last_checksum,
-            checkpoint_seq,
-            transaction_count
+            shared_snapshot.max_frame,
+            shared_snapshot.nbackfills,
+            shared_snapshot.last_checksum,
+            shared_snapshot.checkpoint_seq,
+            shared_snapshot.transaction_count
         );
+        if let Err(err) = self
+            .coordination
+            .ensure_local_frame_cache_covers(&self.io, shared_snapshot)
+        {
+            return match err {
+                LimboError::Busy => TryBeginReadResult::Retry,
+                other => TryBeginReadResult::Err(other),
+            };
+        }
 
         // Check if database changed since this connection's last read transaction.
         // If it has, the connection will invalidate its page cache.
-        let db_changed = self.with_shared(|shared: &WalFileShared| self.db_changed(shared));
+        let db_changed = self.db_changed_against(shared_snapshot, self.connection_state());
 
         tracing::debug!("try_begin_read_tx: db_changed={}", db_changed);
 
         // If WAL is fully checkpointed (shared_max == nbackfills), readers can ignore
         // the WAL and read directly from the DB file by holding read_locks[0].
-        if shared_max == nbackfills {
+        if shared_snapshot.max_frame == shared_snapshot.nbackfills {
             tracing::debug!(
                 "begin_read_tx: WAL fully checkpointed, shared_max={}, nbackfills={}",
-                shared_max,
-                nbackfills
+                shared_snapshot.max_frame,
+                shared_snapshot.nbackfills
             );
-            if !self.with_shared(|shared| shared.read_locks[0].read()) {
-                tracing::debug!("begin_read_tx: unable to acquire read-0 lock slot, retrying");
-                return TryBeginReadResult::Retry;
-            }
-            // Re-validate: a writer could have appended frames between our snapshot
-            // and lock acquisition. If so, we cannot proceed because we'd not be reading
-            // up to date committed content from the WAL.
-            let (mx2, nb2, cksm2, ckpt_seq2) = self.with_shared(|shared| {
-                (
-                    shared.max_frame.load(Ordering::Acquire),
-                    shared.nbackfills.load(Ordering::Acquire),
-                    shared.last_checksum,
-                    shared.wal_header.lock().checkpoint_seq,
-                )
-            });
-            if mx2 != shared_max
-                || nb2 != nbackfills
-                || cksm2 != last_checksum
-                || ckpt_seq2 != checkpoint_seq
-            {
-                tracing::debug!("begin_read_tx: shared data changed ({shared_max}, {nbackfills}, {last_checksum:?}, {checkpoint_seq}) != ({mx2}, {nb2}, {cksm2:?}, {ckpt_seq2}), retrying");
-                self.with_shared(|shared| shared.read_locks[0].unlock());
-                return TryBeginReadResult::Retry;
-            }
-            self.max_frame.store(shared_max, Ordering::Release);
-            self.max_frame_read_lock_index.store(0, Ordering::Release);
-            self.min_frame.store(nbackfills + 1, Ordering::Release);
-            *self.last_checksum.write() = last_checksum;
-            self.checkpoint_seq.store(checkpoint_seq, Ordering::Release);
-            self.transaction_count
-                .store(transaction_count, Ordering::Release);
-            return TryBeginReadResult::Ok(db_changed);
         }
 
-        // If we get this far, it means that the reader will want to use
-        // the WAL to get at content from recent commits.  The job now is
-        // to select one of the aReadMark[] entries that is closest to
-        // but not exceeding pWal->hdr.mxFrame and lock that entry.
-        // Find largest mark <= mx among slots 1..N
-        let mut best_idx: i64 = -1;
-        let mut best_mark: u32 = 0;
-        self.with_shared(|shared| {
-            for (idx, lock) in shared.read_locks.iter().enumerate().skip(1) {
-                let m = lock.get_value();
-                if m != READMARK_NOT_USED && m <= shared_max as u32 && m > best_mark {
-                    best_mark = m;
-                    best_idx = idx as i64;
-                }
-            }
-        });
-        tracing::debug!(
-            "try_begin_read_tx: best_idx={}, best_mark={}",
-            best_idx,
-            best_mark
-        );
-
-        // If none found or lagging, try to claim/update a slot
-        if best_idx == -1 || (best_mark as u64) < shared_max {
-            self.with_shared(|shared| {
-                for (idx, lock) in shared.read_locks.iter().enumerate().skip(1) {
-                    if !lock.write() {
-                        continue; // busy slot
-                    }
-                    // claim or bump this slot
-                    lock.set_value_exclusive(shared_max as u32);
-                    best_idx = idx as i64;
-                    best_mark = shared_max as u32;
-                    lock.unlock();
-                    break;
-                }
-            })
-        }
-
-        // SQLite only requires finding SOME slot (mxI != 0), not that the mark equals mxFrame.
-        // A stale mark is fine - the reader uses shared_max for reading,
-        // and the mark just tells the checkpointer what frames are protected.
-        if best_idx == -1 {
-            return TryBeginReadResult::Retry;
-        }
-
-        // Now acquire shared read lock on the chosen slot.
-        let read_result = self.with_shared(|shared| {
-            if !shared.read_locks[best_idx as usize].read() {
-                return None;
-            }
-            Some((
-                shared.max_frame.load(Ordering::Acquire),
-                shared.nbackfills.load(Ordering::Acquire),
-                shared.last_checksum,
-                shared.wal_header.lock().checkpoint_seq,
-                shared.read_locks[best_idx as usize].get_value(),
-            ))
-        });
-
-        tracing::debug!("try_begin_read_tx: read_result={:?}", read_result);
-
-        let Some((mx2, nb2, cksm2, ckpt_seq2, current_slot_mark)) = read_result else {
+        let Some(read_guard) = self.coordination.try_begin_read_tx(shared_snapshot) else {
             return TryBeginReadResult::Retry;
         };
-
-        // Re-validate state after acquiring the lock. Each check prevents a correctness violation:
-        //
-        // - current_slot_mark != best_mark: Between releasing the exclusive lock (after updating
-        //   the slot) and acquiring this shared lock, another thread can exclusively lock and
-        //   modify the slot. The checkpointer uses the slot's value to decide how far it can
-        //   checkpoint. If the slot now says 700 but we recorded 500, the checkpointer may
-        //   overwrite DB pages for frames 501-700 that we expect to read from the WAL.
-        //
-        // - mx2 != shared_max: A writer appended frames. We must retry to see them.
-        //
-        // - nb2 != nbackfills: A checkpointer advanced. We'd set min_frame wrong, potentially
-        //   trying to read frames from WAL that were already overwritten.
-        //
-        // - cksm2 != last_checksum: WAL content changed (e.g., rollback reused frame slots).
-        //
-        // - ckpt_seq2 != checkpoint_seq: WAL was reset. Frame numbers are now meaningless.
-        if current_slot_mark != best_mark
-            || mx2 != shared_max
-            || nb2 != nbackfills
-            || cksm2 != last_checksum
-            || ckpt_seq2 != checkpoint_seq
-        {
-            self.with_shared(|shared| shared.read_locks[best_idx as usize].unlock());
-            return TryBeginReadResult::Retry;
-        }
-        self.min_frame.store(nb2 + 1, Ordering::Release);
-        self.max_frame.store(shared_max, Ordering::Release);
-        self.max_frame_read_lock_index
-            .store(best_idx as usize, Ordering::Release);
-        *self.last_checksum.write() = last_checksum;
-        self.checkpoint_seq.store(checkpoint_seq, Ordering::Release);
-        self.transaction_count
-            .store(transaction_count, Ordering::Release);
+        self.install_connection_state(WalConnectionState::new(shared_snapshot, read_guard));
         tracing::debug!(
             "begin_read_tx(min={}, max={}, slot={}, max_frame_in_wal={})",
             self.min_frame.load(Ordering::Acquire),
             self.max_frame.load(Ordering::Acquire),
-            best_idx,
-            shared_max
+            read_guard.lock_index(),
+            shared_snapshot.max_frame
         );
         TryBeginReadResult::Ok(db_changed)
     }
@@ -1158,6 +2769,7 @@ impl Wal for WalFile {
             tracing::trace!("begin_read_tx: cnt={cnt}");
             match self.try_begin_read_tx() {
                 TryBeginReadResult::Ok(changed) => return Ok(changed),
+                TryBeginReadResult::Err(err) => return Err(err),
                 TryBeginReadResult::Retry => {
                     cnt += 1;
                     if cnt > 100 {
@@ -1192,7 +2804,8 @@ impl Wal for WalFile {
     fn end_read_tx(&self) {
         let slot = self.max_frame_read_lock_index.load(Ordering::Acquire);
         if slot != NO_LOCK_HELD {
-            self.with_shared(|shared| shared.read_locks[slot].unlock());
+            self.coordination
+                .end_read_tx(ReadGuardKind::from_lock_index(slot));
             self.max_frame_read_lock_index
                 .store(NO_LOCK_HELD, Ordering::Release);
             tracing::debug!("end_read_tx(slot={slot})");
@@ -1205,7 +2818,7 @@ impl Wal for WalFile {
     #[instrument(skip_all, level = Level::DEBUG)]
     fn begin_write_tx(&self) -> Result<()> {
         tracing::debug!("begin_write_tx");
-        self.with_shared(|shared| {
+        let begin_write_result: Result<()> = {
             // sqlite/src/wal.c 3702
             // Cannot start a write transaction without first holding a read
             // transaction.
@@ -1219,28 +2832,34 @@ impl Wal for WalFile {
                 !self.holds_write_lock(),
                 "write lock already held by this connection"
             );
-            if !shared.write_lock.write() {
+            if !self.coordination.try_begin_write_tx() {
                 return Err(LimboError::Busy);
             }
-            let db_changed = self.db_changed(shared);
+            let db_changed =
+                self.db_changed_against(self.load_coordination_snapshot(), self.connection_state());
             if db_changed {
                 // Snapshot is stale, give up and let caller retry from scratch.
                 // Return BusySnapshot instead of Busy so the caller knows it must
                 // restart the read transaction to get a fresh snapshot.
                 // Retrying with busy_timeout will NEVER HELP.
-                tracing::debug!("unable to upgrade transaction from read to write: snapshot is stale, give up and let caller retry from scratch, self.max_frame={}, shared_max={}", self.max_frame.load(Ordering::Acquire), shared.max_frame.load(Ordering::Acquire));
-                shared.write_lock.unlock();
+                tracing::info!(
+                    "unable to upgrade transaction from read to write: snapshot is stale, give up and let caller retry from scratch, self.max_frame={}, shared_max={}",
+                    self.max_frame.load(Ordering::Acquire),
+                    self.load_coordination_snapshot().max_frame
+                );
+                self.coordination.end_write_tx();
                 return Err(LimboError::BusySnapshot);
             }
 
             Ok(())
-        })?;
+        };
+        begin_write_result?;
         if self
             .write_lock_held
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
             .is_err()
         {
-            self.with_shared(|shared| shared.write_lock.unlock());
+            self.coordination.end_write_tx();
             turso_assert!(
                 false,
                 "begin_write_tx called while write lock already held according to connection state"
@@ -1254,9 +2873,7 @@ impl Wal for WalFile {
         }
 
         // don't forget to release the write-lock if
-        self.with_shared(|shared| {
-            shared.write_lock.unlock();
-        });
+        self.coordination.end_write_tx();
         turso_assert!(
             self.write_lock_held
                 .compare_exchange(true, false, Ordering::AcqRel, Ordering::Acquire)
@@ -1276,7 +2893,7 @@ impl Wal for WalFile {
                 .is_ok(),
             "end_write_tx called while write lock not held according to connection state"
         );
-        self.with_shared(|shared| shared.write_lock.unlock());
+        self.coordination.end_write_tx();
     }
 
     /// Returns true if this WAL instance currently holds a read lock.
@@ -1287,6 +2904,10 @@ impl Wal for WalFile {
     /// Returns true if this WAL instance currently holds the write lock.
     fn holds_write_lock(&self) -> bool {
         self.write_lock_held.load(Ordering::Acquire)
+    }
+
+    fn should_checkpoint_on_close(&self) -> bool {
+        self.coordination.should_checkpoint_on_close()
     }
 
     /// Find the latest frame containing a page.
@@ -1307,14 +2928,12 @@ impl Wal for WalFile {
         //
         // if it's not, than pages from WAL range [frame_watermark..nBackfill] are already in the DB file,
         // and in case if page first occurrence in WAL was after frame_watermark - we will be unable to read proper previous version of the page
-        self.with_shared(|shared| {
-            let nbackfills = shared.nbackfills.load(Ordering::Acquire);
-            turso_assert!(
-                frame_watermark.is_none() || frame_watermark.unwrap() >= nbackfills,
-                "frame_watermark must be >= than current WAL backfill amount",
-                { "frame_watermark": frame_watermark, "nbackfills": nbackfills }
-            );
-        });
+        let nbackfills = self.load_coordination_snapshot().nbackfills;
+        turso_assert!(
+            frame_watermark.is_none() || frame_watermark.unwrap() >= nbackfills,
+            "frame_watermark must be >= than current WAL backfill amount",
+            { "frame_watermark": frame_watermark, "nbackfills": nbackfills }
+        );
 
         // if we are holding read_lock 0 and didn't write anything to the WAL, skip and read right from db file.
         //
@@ -1332,31 +2951,37 @@ impl Wal for WalFile {
             );
             return Ok(None);
         }
-        self.with_shared(|shared| {
-            let frames = shared.frame_cache.lock();
-            let range = frame_watermark.map(|x| 0..=x).unwrap_or_else(|| {
-                self.min_frame.load(Ordering::Acquire)..=self.max_frame.load(Ordering::Acquire)
-            });
+        let min_frame = self.min_frame.load(Ordering::Acquire);
+        let max_frame = self.max_frame.load(Ordering::Acquire);
+        self.coordination.ensure_local_frame_cache_covers(
+            &self.io,
+            WalSnapshot {
+                max_frame,
+                nbackfills: self.min_frame.load(Ordering::Acquire).saturating_sub(1),
+                last_checksum: *self.last_checksum.read(),
+                checkpoint_seq: self.coordination.wal_header().checkpoint_seq,
+                transaction_count: self.transaction_count.load(Ordering::Acquire),
+            },
+        )?;
+        tracing::debug!(
+            "find_frame(page_id={}, frame_watermark={:?}): min_frame={}, max_frame={}",
+            page_id,
+            frame_watermark,
+            min_frame,
+            max_frame
+        );
+        let frame = self
+            .coordination
+            .find_frame(page_id, min_frame, max_frame, frame_watermark);
+        if let Some(frame) = frame {
             tracing::debug!(
-                "find_frame(page_id={}, frame_watermark={:?}): min_frame={}, max_frame={}",
+                "find_frame(page_id={}, frame_watermark={:?}): found frame={}",
                 page_id,
                 frame_watermark,
-                self.min_frame.load(Ordering::Acquire),
-                self.max_frame.load(Ordering::Acquire)
+                frame
             );
-            if let Some(list) = frames.get(&page_id) {
-                if let Some(f) = list.iter().rfind(|&&f| range.contains(&f)) {
-                    tracing::debug!(
-                        "find_frame(page_id={}, frame_watermark={:?}): found frame={}",
-                        page_id,
-                        frame_watermark,
-                        *f
-                    );
-                    return Ok(Some(*f));
-                }
-            }
-            Ok(None)
-        })
+        }
+        Ok(frame)
     }
 
     /// Read a frame from the WAL.
@@ -1376,7 +3001,7 @@ impl Wal for WalFile {
         page.set_locked();
         let frame = page.clone();
         let page_idx = page.get().id;
-        let shared_file = self.shared.clone();
+        let epoch_at_issue = self.coordination.checkpoint_epoch();
         let complete = Box::new(move |res: Result<(Arc<Buffer>, i32), CompletionError>| {
             let Ok((buf, bytes_read)) = res else {
                 tracing::debug!(err = ?res.unwrap_err());
@@ -1399,28 +3024,12 @@ impl Wal for WalFile {
             }
             let cloned = frame.clone();
             finish_read_page(page.get().id, buf, cloned);
-            let epoch = shared_file.read().epoch.load(Ordering::Acquire);
-            frame.set_wal_tag(frame_id, epoch);
+            frame.set_wal_tag(frame_id, epoch_at_issue);
             None
         });
-        let file = self.with_shared(|shared| {
-            turso_assert!(
-                shared.enabled.load(Ordering::Relaxed),
-                "WAL must be enabled"
-            );
-            // important not to hold shared lock beyond this point to avoid deadlock scenario where:
-            // thread 1: takes readlock here, passes reference to shared.file to begin_read_wal_frame
-            // thread 2: tries to acquire write lock elsewhere
-            // thread 1: tries to re-acquire read lock in the completion (see 'complete' above)
-            //
-            // this causes a deadlock due to the locking policy in parking_lot:
-            // from https://docs.rs/parking_lot/latest/parking_lot/type.RwLock.html:
-            // "This lock uses a task-fair locking policy which avoids both reader and writer starvation.
-            // This means that readers trying to acquire the lock will block even if the lock is unlocked
-            // when there are writers waiting to acquire the lock.
-            // Because of this, attempts to recursively acquire a read lock within a single thread may result in a deadlock."
-            shared.file.as_ref().unwrap().clone()
-        });
+        // important not to hold shared state locks beyond this point to avoid deadlock with
+        // completions that re-enter WAL state while a writer is waiting.
+        let file = self.coordination.wal_file()?;
         begin_read_wal_frame(
             file.as_ref(),
             offset + WAL_FRAME_HEADER_SIZE as u64,
@@ -1491,13 +3100,7 @@ impl Wal for WalFile {
             }
             None
         });
-        let file = self.with_shared(|shared| {
-            turso_assert!(
-                shared.enabled.load(Ordering::Relaxed),
-                "WAL must be enabled"
-            );
-            shared.file.as_ref().unwrap().clone()
-        });
+        let file = self.coordination.wal_file()?;
         let c = begin_read_wal_frame_raw(&self.buffer_pool, file.as_ref(), offset, complete)?;
         Ok(c)
     }
@@ -1568,13 +3171,7 @@ impl Wal for WalFile {
                     None
                 }
             });
-            let file = self.with_shared(|shared| {
-                turso_assert!(
-                    shared.enabled.load(Ordering::Relaxed),
-                    "WAL must be enabled"
-                );
-                shared.file.as_ref().unwrap().clone()
-            });
+            let file = self.coordination.wal_file()?;
             let c = begin_read_wal_frame(
                 file.as_ref(),
                 offset + WAL_FRAME_HEADER_SIZE as u64,
@@ -1595,16 +3192,8 @@ impl Wal for WalFile {
 
         // perform actual write
         let offset = self.frame_offset(frame_id);
-        let (header, file) = self.with_shared(|shared| {
-            let header = shared.wal_header.clone();
-            turso_assert!(
-                shared.enabled.load(Ordering::Relaxed),
-                "WAL must be enabled"
-            );
-            let file = shared.file.as_ref().unwrap().clone();
-            (header, file)
-        });
-        let header = header.lock();
+        let header = self.coordination.wal_header();
+        let file = self.coordination.wal_file()?;
         let checksums = *self.last_checksum.read();
         let (checksums, frame_bytes) = prepare_wal_frame(
             &self.buffer_pool,
@@ -1621,17 +3210,16 @@ impl Wal for WalFile {
         self.complete_append_frame(page_id, frame_id, checksums);
         if db_size > 0 {
             self.finish_append_frames_commit()?;
+        } else {
+            self.has_unpublished_frames.store(true, Ordering::Release);
         }
         Ok(())
     }
 
     #[instrument(skip_all, level = Level::DEBUG)]
     fn should_checkpoint(&self) -> bool {
-        self.with_shared(|shared| {
-            let frame_id = shared.max_frame.load(Ordering::Acquire) as usize;
-            let nbackfills = shared.nbackfills.load(Ordering::Acquire) as usize;
-            frame_id > self.checkpoint_threshold + nbackfills
-        })
+        let snapshot = self.load_coordination_snapshot();
+        snapshot.max_frame as usize > self.checkpoint_threshold + snapshot.nbackfills as usize
     }
 
     #[instrument(skip_all, level = Level::DEBUG)]
@@ -1641,10 +3229,29 @@ impl Wal for WalFile {
         mode: CheckpointMode,
     ) -> Result<IOResult<CheckpointResult>> {
         self.checkpoint_inner(pager, mode).inspect_err(|e| {
-            tracing::debug!("Wal Checkpoint failed: {e}");
+            tracing::info!("Wal Checkpoint failed: {e}");
             let _ = self.checkpoint_guard.write().take();
             self.ongoing_checkpoint.write().state = CheckpointState::Start;
         })
+    }
+
+    fn install_durable_backfill_proof(
+        &self,
+        max_frame: u64,
+        db_size_pages: u32,
+        db_header_crc32c: u32,
+        sync_type: FileSyncType,
+    ) -> Result<Option<Completion>> {
+        self.coordination.install_durable_backfill_proof(
+            max_frame,
+            db_size_pages,
+            db_header_crc32c,
+            sync_type,
+        )
+    }
+
+    fn publish_backfill(&self, max_frame: u64) {
+        self.coordination.publish_backfill(max_frame);
     }
 
     #[instrument(err, skip_all, level = Level::DEBUG)]
@@ -1658,13 +3265,7 @@ impl Wal for WalFile {
             }
             syncing.store(false, Ordering::Release);
         });
-        let file = self.with_shared(|shared| {
-            turso_assert!(
-                shared.enabled.load(Ordering::Relaxed),
-                "WAL must be enabled"
-            );
-            shared.file.as_ref().unwrap().clone()
-        });
+        let file = self.coordination.wal_file()?;
         self.syncing.store(true, Ordering::Release);
         let c = file.sync(completion, sync_type)?;
         Ok(c)
@@ -1676,11 +3277,11 @@ impl Wal for WalFile {
     }
 
     fn get_max_frame_in_wal(&self) -> u64 {
-        self.with_shared(|shared| shared.max_frame.load(Ordering::Acquire))
+        self.load_coordination_snapshot().max_frame
     }
 
     fn get_checkpoint_seq(&self) -> u32 {
-        self.with_shared(|shared| shared.wal_header.lock().checkpoint_seq)
+        self.load_coordination_snapshot().checkpoint_seq
     }
 
     fn get_max_frame(&self) -> u64 {
@@ -1698,25 +3299,16 @@ impl Wal for WalFile {
 
     fn rollback(&self, rollback_to: Option<RollbackTo>) {
         let is_savepoint = rollback_to.is_some();
-        let (max_frame, last_checksum) = self.with_shared(|shared| {
-            let max_frame = rollback_to
-                .as_ref()
-                .map(|r| r.frame)
-                .unwrap_or_else(|| shared.max_frame.load(Ordering::Acquire));
-            let last_checksum = rollback_to
-                .as_ref()
-                .map(|r| r.checksum)
-                .unwrap_or(shared.last_checksum);
-            let mut frame_cache = shared.frame_cache.lock();
-            frame_cache.retain(|_page_id, frames| {
-                // keep frames <= max_frame
-                while frames.last().is_some_and(|&f| f > max_frame) {
-                    frames.pop();
-                }
-                !frames.is_empty()
-            });
-            (max_frame, last_checksum)
-        });
+        let snapshot = self.load_coordination_snapshot();
+        let max_frame = rollback_to
+            .as_ref()
+            .map(|r| r.frame)
+            .unwrap_or(snapshot.max_frame);
+        let last_checksum = rollback_to
+            .as_ref()
+            .map(|r| r.checksum)
+            .unwrap_or(snapshot.last_checksum);
+        self.coordination.rollback_cache(max_frame);
         *self.last_checksum.write() = last_checksum;
         self.max_frame.store(max_frame, Ordering::Release);
         if !is_savepoint {
@@ -1731,20 +3323,17 @@ impl Wal for WalFile {
 
     #[instrument(skip_all, level = Level::DEBUG)]
     fn finish_append_frames_commit(&self) -> Result<()> {
-        self.with_shared_mut_dangerous(|shared| {
-            shared
-                .max_frame
-                .store(self.max_frame.load(Ordering::Acquire), Ordering::Release);
-            let last_checksum = *self.last_checksum.read();
-            tracing::trace!(
-                max_frame = self.max_frame.load(Ordering::Acquire),
-                ?last_checksum
-            );
-            shared.last_checksum = last_checksum;
-            let new_count = self.transaction_count.fetch_add(1, Ordering::AcqRel) + 1;
-            shared.transaction_count.store(new_count, Ordering::Release);
-            Ok(())
-        })
+        let max_frame = self.max_frame.load(Ordering::Acquire);
+        let last_checksum = *self.last_checksum.read();
+        tracing::trace!(max_frame, ?last_checksum);
+        let transaction_count = self.transaction_count.fetch_add(1, Ordering::AcqRel) + 1;
+        self.coordination.publish_commit(WalCommitState {
+            max_frame,
+            last_checksum,
+            transaction_count,
+        });
+        self.has_unpublished_frames.store(false, Ordering::Release);
+        Ok(())
     }
 
     fn changed_pages_after(&self, frame_watermark: u64) -> Result<Vec<u32>> {
@@ -1770,65 +3359,58 @@ impl Wal for WalFile {
     }
 
     fn prepare_wal_start(&self, page_size: PageSize) -> Result<Option<Completion>> {
-        if self.with_shared(|shared| shared.is_initialized())? {
+        if self.coordination.wal_is_initialized() {
             return Ok(None);
         }
         tracing::debug!("ensure_header_if_needed");
-        *self.last_checksum.write() = self.with_shared_mut_dangerous(|shared| {
-            let checksum = {
-                let mut hdr = shared.wal_header.lock();
-                hdr.magic = if cfg!(target_endian = "big") {
-                    WAL_MAGIC_BE
-                } else {
-                    WAL_MAGIC_LE
-                };
-                if hdr.page_size == 0 {
-                    hdr.page_size = page_size.get();
-                }
-                if hdr.salt_1 == 0 && hdr.salt_2 == 0 {
-                    hdr.salt_1 = self.io.generate_random_number() as u32;
-                    hdr.salt_2 = self.io.generate_random_number() as u32;
-                }
-
-                // recompute header checksum
-                let prefix = &hdr.as_bytes()[..WAL_HEADER_SIZE - 8];
-                let use_native = (hdr.magic & 1) != 0;
-                let (c1, c2) = checksum_wal(prefix, &hdr, (0, 0), use_native);
-                hdr.checksum_1 = c1;
-                hdr.checksum_2 = c2;
-                (c1, c2)
-            };
-            shared.last_checksum = checksum;
-            checksum
-        });
+        let Some(header) = self
+            .coordination
+            .prepare_wal_header(self.io.as_ref(), page_size)
+        else {
+            return Ok(None);
+        };
+        *self.last_checksum.write() = (header.checksum_1, header.checksum_2);
 
         self.max_frame.store(0, Ordering::Release);
-        let (header, file) = self.with_shared(|shared| {
-            turso_assert!(
-                shared.enabled.load(Ordering::Relaxed),
-                "WAL must be enabled"
-            );
-            (
-                *shared.wal_header.lock(),
-                shared.file.as_ref().unwrap().clone(),
-            )
-        });
-        let c = sqlite3_ondisk::begin_write_wal_header(file.as_ref(), &header)?;
-        Ok(Some(c))
+        let file = self.coordination.wal_file()?;
+        let header_c = sqlite3_ondisk::begin_write_wal_header(file.as_ref(), &header)?;
+
+        // After a RESTART or try_restart_log_before_write the WAL file may
+        // still contain orphaned frames from the previous epoch. Truncate
+        // them so that classify_authority_snapshot_against_wal does not see a
+        // length mismatch and unnecessarily fall back to a full disk scan
+        // (which can race with concurrent writers and corrupt the authority).
+        let should_skip_truncate = match file.size() {
+            Ok(size) => size <= WAL_HEADER_SIZE as u64,
+            Err(_) => {
+                tracing::warn!("Failed to get WAL file size");
+                true
+            }
+        };
+        if !should_skip_truncate {
+            let trunc_c = file.truncate(
+                WAL_HEADER_SIZE as u64,
+                Completion::new_trunc(|res| {
+                    if let Err(err) = res {
+                        tracing::warn!("WAL truncate of orphaned frames failed: {err}");
+                    }
+                }),
+            )?;
+            let mut group = CompletionGroup::new(|_| {});
+            group.add(&header_c);
+            group.add(&trunc_c);
+            Ok(Some(group.build()))
+        } else {
+            Ok(Some(header_c))
+        }
     }
 
     fn prepare_wal_finish(&self, sync_type: FileSyncType) -> Result<Completion> {
-        let file = self.with_shared(|shared| {
-            turso_assert!(
-                shared.enabled.load(Ordering::Relaxed),
-                "WAL must be enabled"
-            );
-            shared.file.as_ref().unwrap().clone()
-        });
-        let shared = self.shared.clone();
+        let file = self.coordination.wal_file()?;
+        let coordination = self.coordination.clone();
         let c = file.sync(
             Completion::new_sync(move |_| {
-                shared.read().initialized.store(true, Ordering::Release);
+                coordination.mark_initialized();
             }),
             sync_type,
         )?;
@@ -1858,15 +3440,12 @@ impl Wal for WalFile {
             "supported up to IOV_MAX pages at once"
         );
         turso_assert!(
-            self.with_shared(|shared| shared.is_initialized())?,
+            self.coordination.wal_is_initialized(),
             "WAL must be initialized"
         );
 
-        let (header, epoch) = self.with_shared(|shared| {
-            let hdr = *shared.wal_header.lock();
-            let epoch = shared.epoch.load(Ordering::Acquire);
-            (hdr, epoch)
-        });
+        let header = self.coordination.wal_header();
+        let epoch = self.coordination.checkpoint_epoch();
 
         turso_assert!(
             header.page_size == page_sz.get(),
@@ -1874,13 +3453,56 @@ impl Wal for WalFile {
             { "header_page_size": header.page_size, "requested_page_size": page_sz.get() }
         );
 
-        // Either chain from previous batch of PreparedFrames or use committed WAL state
+        // Either chain from previous batch of PreparedFrames or use committed WAL state.
+        // For the first batch, also check the authority's max_frame to handle
+        // cross-process WAL restarts where our local max_frame is stale.
         let (mut rolling_checksum, mut next_frame_id) = match prev {
             Some(p) => (p.final_checksum, p.final_max_frame + 1),
-            None => (
-                *self.last_checksum.read(),
-                self.max_frame.load(Ordering::Acquire) + 1,
-            ),
+            None => {
+                let snapshot = self.load_coordination_snapshot();
+                let local_state = self.connection_state();
+                let local_prepared_zero_frame_header = snapshot.max_frame == 0
+                    && self.coordination.wal_is_initialized()
+                    && local_state.snapshot.max_frame == 0
+                    && local_state.snapshot.checkpoint_seq == snapshot.checkpoint_seq
+                    && local_state.snapshot.transaction_count == snapshot.transaction_count
+                    && local_state.snapshot.last_checksum != snapshot.last_checksum;
+                if local_prepared_zero_frame_header {
+                    // We already prepared the WAL header for the current
+                    // zero-frame generation locally, but the authority snapshot
+                    // still carries the pre-header checksum until the first
+                    // commit publishes it. Seed the checksum chain from the
+                    // prepared local header, not the stale authority checksum.
+                    (
+                        local_state.snapshot.last_checksum,
+                        local_state.snapshot.max_frame + 1,
+                    )
+                } else if snapshot != local_state.snapshot {
+                    if self.has_unpublished_frames.load(Ordering::Acquire) {
+                        // write_frame_raw appended frames without a commit
+                        // marker (db_size == 0), so the coordination backend's
+                        // max_frame is behind our local max_frame. Chain from
+                        // local state so we don't overwrite those frames.
+                        (
+                            local_state.snapshot.last_checksum,
+                            local_state.snapshot.max_frame + 1,
+                        )
+                    } else {
+                        // The current generation was restarted/truncated back to
+                        // frame 0 or another process changed the durable WAL
+                        // state. Re-seed this connection from the authoritative
+                        // snapshot so replacement generations after
+                        // RESTART/TRUNCATE do not append using stale local state.
+                        self.install_connection_state(local_state.with_snapshot(snapshot));
+                        (snapshot.last_checksum, snapshot.max_frame + 1)
+                    }
+                } else {
+                    (
+                        local_state.snapshot.last_checksum,
+                        local_state.snapshot.max_frame + 1,
+                    )
+                }
+            }
         };
 
         let first_frame_id = next_frame_id;
@@ -1966,16 +3588,7 @@ impl Wal for WalFile {
 
     /// Get WAL file for durable writes.
     fn wal_file(&self) -> Result<Arc<dyn File>> {
-        self.with_shared(|shared| {
-            turso_assert!(
-                shared.enabled.load(Ordering::Relaxed),
-                "WAL must be enabled"
-            );
-            shared.file.as_ref().cloned().ok_or_else(|| {
-                mark_unlikely();
-                LimboError::InternalError("WAL file not open".into())
-            })
-        })
+        self.coordination.wal_file()
     }
 
     /// Use pwritev to append many frames to the log at once.
@@ -1990,17 +3603,13 @@ impl Wal for WalFile {
             "we limit number of iovecs to IOV_MAX"
         );
         turso_assert!(
-            self.with_shared(|shared| shared.is_initialized())?,
+            self.coordination.wal_is_initialized(),
             "WAL must be prepared with prepare_wal_start/prepare_wal_finish method"
         );
 
-        let (header, shared_page_size, epoch) = self.with_shared(|shared| {
-            let hdr_guard = shared.wal_header.lock();
-            let header: WalHeader = *hdr_guard;
-            let shared_page_size = header.page_size;
-            let epoch = shared.epoch.load(Ordering::Acquire);
-            (header, shared_page_size, epoch)
-        });
+        let header = self.coordination.wal_header();
+        let shared_page_size = header.page_size;
+        let epoch = self.coordination.checkpoint_epoch();
         turso_assert!(
             shared_page_size == page_sz.get(),
             "page size mismatch, tried to change page size after WAL header was already initialized",
@@ -2080,13 +3689,7 @@ impl Wal for WalFile {
 
         let c = Completion::new_write(cmp);
 
-        let file = self.with_shared(|shared| {
-            turso_assert!(
-                shared.enabled.load(Ordering::Relaxed),
-                "WAL must be enabled"
-            );
-            shared.file.as_ref().unwrap().clone()
-        });
+        let file = self.coordination.wal_file()?;
         let c = file.pwritev(start_off, iovecs, c)?;
 
         self.io.drain()?;
@@ -2098,7 +3701,7 @@ impl Wal for WalFile {
         Ok(c)
     }
 
-    #[cfg(debug_assertions)]
+    #[cfg(any(test, debug_assertions))]
     fn as_any(&self) -> &dyn std::any::Any {
         self
     }
@@ -2108,10 +3711,8 @@ impl Wal for WalFile {
     }
 
     fn update_max_frame(&self) {
-        self.with_shared(|shared| {
-            let new_max_frame = shared.max_frame.load(Ordering::Acquire);
-            self.max_frame.store(new_max_frame, Ordering::Release);
-        })
+        let new_max_frame = self.load_coordination_snapshot().max_frame;
+        self.max_frame.store(new_max_frame, Ordering::Release);
     }
 
     fn truncate_wal(
@@ -2124,18 +3725,49 @@ impl Wal for WalFile {
 }
 
 impl WalFile {
+    #[cfg(all(unix, target_pointer_width = "64"))]
+    pub(crate) fn new_with_shared_coordination(
+        io: Arc<dyn IO>,
+        shared: Arc<RwLock<WalFileShared>>,
+        authority: Arc<MappedSharedWalCoordination>,
+        _last_checksum_and_max_frame: ((u32, u32), u64),
+        buffer_pool: Arc<BufferPool>,
+    ) -> Self {
+        let coordination: Arc<dyn WalCoordination> =
+            Arc::new(ShmWalCoordination::new(shared, authority));
+        let snapshot = coordination.load_snapshot();
+        Self::new_with_coordination(
+            io,
+            coordination,
+            (snapshot.last_checksum, snapshot.max_frame),
+            buffer_pool,
+        )
+    }
+
     pub fn new(
         io: Arc<dyn IO>,
         shared: Arc<RwLock<WalFileShared>>,
         (last_checksum, max_frame): ((u32, u32), u64),
         buffer_pool: Arc<BufferPool>,
     ) -> Self {
+        let coordination: Arc<dyn WalCoordination> =
+            Arc::new(InProcessWalCoordination::new(shared));
+        Self::new_with_coordination(io, coordination, (last_checksum, max_frame), buffer_pool)
+    }
+
+    /// Construct a WAL using an explicit coordination backend.
+    fn new_with_coordination(
+        io: Arc<dyn IO>,
+        coordination: Arc<dyn WalCoordination>,
+        (last_checksum, max_frame): ((u32, u32), u64),
+        buffer_pool: Arc<BufferPool>,
+    ) -> Self {
         let now = io.current_time_monotonic();
         Self {
             io,
+            coordination,
             // default to max frame in WAL, so that when we read schema we can read from WAL too if it's there.
             max_frame: AtomicU64::new(max_frame),
-            shared,
             ongoing_checkpoint: RwLock::new(OngoingCheckpoint {
                 time: now,
                 pending_writes: WriteBatch::new(),
@@ -2158,11 +3790,27 @@ impl WalFile {
             last_checksum: RwLock::new(last_checksum),
             checkpoint_guard: RwLock::new(None),
             io_ctx: RwLock::new(IOContext::default()),
+            has_unpublished_frames: AtomicBool::new(false),
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn shared_ptr(&self) -> usize {
+        self.coordination.shared_ptr()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn coordination_backend_name(&self) -> &'static str {
+        self.coordination.backend_name()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn coordination_open_mode_name(&self) -> Option<&'static str> {
+        self.coordination.open_mode_name()
+    }
+
     fn page_size(&self) -> u32 {
-        self.with_shared(|shared| shared.wal_header.lock().page_size)
+        self.coordination.wal_header().page_size
     }
 
     fn frame_offset(&self, frame_id: u64) -> u64 {
@@ -2171,87 +3819,15 @@ impl WalFile {
         WAL_HEADER_SIZE as u64 + page_offset
     }
 
-    fn _get_shared_mut(&self) -> crate::sync::RwLockWriteGuard<'_, WalFileShared> {
-        // WASM in browser main thread doesn't have a way to "park" a thread
-        // so, we spin way here instead of calling blocking lock
-        #[cfg(target_family = "wasm")]
-        {
-            loop {
-                let Some(lock) = self.shared.try_write() else {
-                    std::hint::spin_loop();
-                    continue;
-                };
-                return lock;
-            }
-        }
-        #[cfg(not(target_family = "wasm"))]
-        {
-            self.shared.write()
-        }
-    }
-
-    fn _get_shared(&self) -> crate::sync::RwLockReadGuard<'_, WalFileShared> {
-        // WASM in browser main thread doesn't have a way to "park" a thread
-        // so, we spin way here instead of calling blocking lock
-        #[cfg(target_family = "wasm")]
-        {
-            loop {
-                let Some(lock) = self.shared.try_read() else {
-                    std::hint::spin_loop();
-                    continue;
-                };
-                return lock;
-            }
-        }
-        #[cfg(not(target_family = "wasm"))]
-        {
-            self.shared.read()
-        }
-    }
-
-    #[inline]
-    /// Get a mutable shared lock on the WAL file shared state.
-    /// Be very intentional about when you need this because it can easily cause a deadlock.
-    /// If you're modifying e.g. the WAL locks, all of those operations are atomic and do not
-    /// need shared_mut.
-    fn with_shared_mut_dangerous<F, R>(&self, func: F) -> R
-    where
-        F: FnOnce(&mut WalFileShared) -> R,
-    {
-        let mut shared = self._get_shared_mut();
-        func(&mut shared)
-    }
-
-    #[inline]
-    fn with_shared<F, R>(&self, func: F) -> R
-    where
-        F: FnOnce(&WalFileShared) -> R,
-    {
-        let shared = self._get_shared();
-        func(&shared)
-    }
-
     fn increment_checkpoint_epoch(&self) {
-        self.with_shared(|shared| {
-            let prev = shared.epoch.fetch_add(1, Ordering::Release);
-            tracing::debug!("increment checkpoint epoch: prev={}", prev);
-        });
+        let prev = self.coordination.bump_checkpoint_epoch();
+        tracing::info!("increment checkpoint epoch: prev={}", prev);
     }
 
     fn complete_append_frame(&self, page_id: u64, frame_id: u64, checksums: (u32, u32)) {
         *self.last_checksum.write() = checksums;
         self.max_frame.store(frame_id, Ordering::Release);
-        self.with_shared(|shared| {
-            let mut frame_cache = shared.frame_cache.lock();
-            match frame_cache.get_mut(&page_id) {
-                Some(frames) => {
-                    frames.push(frame_id);
-                }
-                None => {
-                    frame_cache.insert(page_id, vec![frame_id]);
-                }
-            }
-        })
+        self.coordination.cache_frame(page_id, frame_id);
     }
 
     /// Reset connection-private WAL state.
@@ -2285,12 +3861,10 @@ impl WalFile {
                 // so no other checkpointer can run. fsync WAL if there are unapplied frames.
                 // Decide the largest frame we are allowed to back‑fill.
                 CheckpointState::Start => {
-                    let (max_frame, nbackfills) = self.with_shared(|shared| {
-                        let max_frame = shared.max_frame.load(Ordering::Acquire);
-                        let n_backfills = shared.nbackfills.load(Ordering::Acquire);
-                        (max_frame, n_backfills)
-                    });
-                    tracing::debug!("shared_wal: max_frame={max_frame}, nbackfills={nbackfills}");
+                    let snapshot = self.load_coordination_snapshot();
+                    let max_frame = snapshot.max_frame;
+                    let nbackfills = snapshot.nbackfills;
+                    tracing::info!("shared_wal: max_frame={max_frame}, nbackfills={nbackfills}");
                     let needs_backfill = max_frame > nbackfills;
                     if !needs_backfill && !mode.should_restart_log() {
                         // there are no frames to copy over and we don't need to reset
@@ -2308,7 +3882,9 @@ impl WalFile {
                     } = mode
                     {
                         if max_frame > upper_bound {
-                            tracing::info!("abort checkpoint because latest frame in WAL is greater than upper_bound in TRUNCATE mode: {max_frame} != {upper_bound}");
+                            tracing::info!(
+                                "abort checkpoint because latest frame in WAL is greater than upper_bound in TRUNCATE mode: {max_frame} != {upper_bound}"
+                            );
                             return Err(LimboError::Busy);
                         }
                     }
@@ -2328,27 +3904,21 @@ impl WalFile {
                         let oc = self.ongoing_checkpoint.read();
                         (oc.min_frame, oc.max_frame)
                     };
-                    tracing::debug!("checkpoint_inner::Start: min_frame={oc_min_frame}, max_frame={oc_max_frame}");
-                    let to_checkpoint = self.with_shared(|shared| {
-                        let frame_cache = shared.frame_cache.lock();
-                        let mut list = Vec::with_capacity(
-                            oc_max_frame.checked_sub(nbackfills).unwrap_or_default() as usize,
-                        );
-                        for (&page_id, frames) in frame_cache.iter() {
-                            // for each page in the frame cache, grab the last (latest) frame for
-                            // that page that falls in the range of our safe min..max frame
-                            if let Some(&frame) = frames
-                                .iter()
-                                .rev()
-                                .find(|&&f| f >= oc_min_frame && f <= oc_max_frame)
-                            {
-                                list.push((page_id, frame));
-                            }
-                        }
-                        // sort by frame_id for read locality
-                        list.sort_unstable_by(|a, b| (a.1, a.0).cmp(&(b.1, b.0)));
-                        list
-                    });
+                    self.coordination.ensure_local_frame_cache_covers(
+                        &self.io,
+                        WalSnapshot {
+                            max_frame: oc_max_frame,
+                            ..self.load_coordination_snapshot()
+                        },
+                    )?;
+                    tracing::info!(
+                        "checkpoint_inner::Start: min_frame={oc_min_frame}, max_frame={oc_max_frame}"
+                    );
+                    let mut to_checkpoint = self
+                        .coordination
+                        .iter_latest_frames(oc_min_frame, oc_max_frame);
+                    // sort by frame_id for read locality
+                    to_checkpoint.sort_unstable_by(|a, b| (a.1, a.0).cmp(&(b.1, b.0)));
                     {
                         let mut oc = self.ongoing_checkpoint.write();
                         oc.pages_to_checkpoint = to_checkpoint;
@@ -2395,7 +3965,7 @@ impl WalFile {
                         pager.io.drain()?;
                         return Err(LimboError::CompletionError(e));
                     }
-                    let epoch = self.with_shared(|shared| shared.epoch.load(Ordering::Acquire));
+                    let epoch = self.coordination.checkpoint_epoch();
                     // Issue reads until we hit limits
                     'inner: while ongoing_chkpt.should_issue_reads() {
                         let (page_id, target_frame) = {
@@ -2484,30 +4054,21 @@ impl WalFile {
                         ongoing_chkpt.complete(),
                         "checkpoint pending flush must have finished"
                     );
-                    let checkpoint_result = self.with_shared(|shared| {
-                        let wal_max_frame = shared.max_frame.load(Ordering::Acquire);
-                        let wal_total_backfilled = ongoing_chkpt.max_frame;
-                        // Record two num pages fields to return as checkpoint result to caller.
-                        // Ref: pnLog, pnCkpt on https://www.sqlite.org/c3ref/wal_checkpoint_v2.html
+                    let wal_max_frame = self.load_coordination_snapshot().max_frame;
+                    let wal_total_backfilled = ongoing_chkpt.max_frame;
+                    // Record two num pages fields to return as checkpoint result to caller.
+                    // Ref: pnLog, pnCkpt on https://www.sqlite.org/c3ref/wal_checkpoint_v2.html
 
-                        // the total # of frames we actually backfilled
-                        let wal_checkpoint_backfilled =
-                            wal_total_backfilled.saturating_sub(ongoing_chkpt.min_frame - 1);
+                    // the total # of frames we actually backfilled
+                    let wal_checkpoint_backfilled =
+                        wal_total_backfilled.saturating_sub(ongoing_chkpt.min_frame - 1);
 
-                        tracing::debug!("checkpoint: wal_max_frame={wal_max_frame}, wal_total_backfilled={wal_total_backfilled}, wal_checkpoint_backfilled={wal_checkpoint_backfilled}");
-
-                        CheckpointResult::new(wal_max_frame, wal_total_backfilled, wal_checkpoint_backfilled)
-                    });
-                    tracing::debug!("checkpoint_result={:?}, mode={:?}", checkpoint_result, mode);
-
-                    // store the max frame we were able to successfully checkpoint.
-                    // NOTE: we don't have a .shm file yet, so it's safe to update nbackfills here
-                    // before we sync, because if we crash and then recover, we will checkpoint the entire db anyway.
-                    self.with_shared(|shared| {
-                        shared
-                            .nbackfills
-                            .store(ongoing_chkpt.max_frame, Ordering::Release)
-                    });
+                    let checkpoint_result = CheckpointResult::new(
+                        wal_max_frame,
+                        wal_total_backfilled,
+                        wal_checkpoint_backfilled,
+                    );
+                    tracing::info!("checkpoint_result={:?}, mode={:?}", checkpoint_result, mode);
                     if mode.require_all_backfilled() && !checkpoint_result.everything_backfilled() {
                         return Err(LimboError::Busy);
                     }
@@ -2534,7 +4095,7 @@ impl WalFile {
                     // but before DB sync, the data would be lost. By truncating the WAL
                     // only after the DB is safely synced, we guarantee recoverability.
                     if mode.should_restart_log() {
-                        Self::unlock_after_restart(&self.shared, None);
+                        Self::unlock_after_restart(&self.coordination, None);
                     }
                     let mut checkpoint_result = {
                         let mut oc = self.ongoing_checkpoint.write();
@@ -2549,7 +4110,7 @@ impl WalFile {
                     // increment wal epoch to ensure no stale pages are used for backfilling
                     self.increment_checkpoint_epoch();
 
-                    tracing::debug!("checkpoint_result={:?}", checkpoint_result);
+                    tracing::info!("checkpoint_result={:?}", checkpoint_result);
                     // we cannot truncate the db file here because we are currently inside a
                     // mut borrow of pager.wal, and accessing the header will attempt a borrow
                     // during 'read_page', so the caller will use the result to determine if:
@@ -2612,30 +4173,8 @@ impl WalFile {
     /// We never modify slot values while a reader holds that slot's lock.
     /// TOOD: implement proper BUSY handling behavior
     fn determine_max_safe_checkpoint_frame(&self) -> u64 {
-        self.with_shared(|shared| {
-            let shared_max = shared.max_frame.load(Ordering::Acquire);
-            let mut max_safe_frame = shared_max;
-
-            for (read_lock_idx, read_lock) in shared.read_locks.iter().enumerate().skip(1) {
-                let this_mark = read_lock.get_value();
-                if this_mark < max_safe_frame as u32 {
-                    let busy = !read_lock.write();
-                    if !busy {
-                        let val = if read_lock_idx == 1 {
-                            // store the max_frame for the default read slot 1
-                            max_safe_frame as u32
-                        } else {
-                            READMARK_NOT_USED
-                        };
-                        read_lock.set_value_exclusive(val);
-                        read_lock.unlock();
-                    } else {
-                        max_safe_frame = this_mark as u64;
-                    }
-                }
-            }
-            max_safe_frame
-        })
+        self.coordination
+            .determine_max_safe_checkpoint_frame(self.load_coordination_snapshot().max_frame)
     }
 
     /// attempt to restart WAL header before write in order to keep WAL file size under the control
@@ -2647,17 +4186,18 @@ impl WalFile {
     pub fn try_restart_log_before_write(&self) -> Result<()> {
         let max_frame_read_lock_index = self.max_frame_read_lock_index.load(Ordering::Acquire);
         if max_frame_read_lock_index != 0 {
-            tracing::debug!("try_restart_log_before_write: max_frame_read_lock_index={max_frame_read_lock_index}, writer use WAL - can't restart the log");
+            tracing::debug!(
+                "try_restart_log_before_write: max_frame_read_lock_index={max_frame_read_lock_index}, writer use WAL - can't restart the log"
+            );
             return Ok(());
         }
-        let (max_frame, nbackfills) = self.with_shared(|s| {
-            (
-                s.max_frame.load(Ordering::Acquire),
-                s.nbackfills.load(Ordering::Acquire),
-            )
-        });
+        let snapshot = self.load_coordination_snapshot();
+        let max_frame = snapshot.max_frame;
+        let nbackfills = snapshot.nbackfills;
         if nbackfills == 0 {
-            tracing::debug!("try_restart_log_before_write: nbackfills={nbackfills}, nothing were backfilled - can't restart the log");
+            tracing::debug!(
+                "try_restart_log_before_write: nbackfills={nbackfills}, nothing were backfilled - can't restart the log"
+            );
             return Ok(());
         }
         turso_assert!(
@@ -2670,48 +4210,23 @@ impl WalFile {
             );
             return Ok(());
         }
-        let read_lock_0 = self.with_shared(|s| s.read_locks[0].upgrade());
-        if !read_lock_0 {
+        let Some(snapshot) = self
+            .coordination
+            .try_restart_log_for_write(self.io.as_ref())?
+        else {
             return Ok(());
-        }
-        let result = self.restart_log();
-        if result.is_ok() {
-            self.increment_checkpoint_epoch();
-            let shared = self.shared.clone();
-            Self::unlock_after_restart(&shared, result.as_ref().err());
-        }
-        self.with_shared(|s| s.read_locks[0].downgrade());
+        };
+        self.apply_restart_snapshot(snapshot);
+        self.increment_checkpoint_epoch();
+        let result = Ok(());
         tracing::debug!("try_restart_log_before_write: result={:?}", result);
         result
     }
 
     fn restart_log(&self) -> Result<()> {
-        tracing::debug!("restart_log");
-        self.with_shared(|shared| {
-            // Block all readers
-            for idx in 1..shared.read_locks.len() {
-                let lock = &shared.read_locks[idx];
-                if !lock.write() {
-                    // release everything we got so far
-                    for j in 1..idx {
-                        shared.read_locks[j].unlock();
-                    }
-                    // Reader is active, cannot proceed
-                    return Err(LimboError::Busy);
-                }
-                // after the log is reset, we must set all secondary marks to READMARK_NOT_USED so the next reader selects a fresh slot
-                lock.set_value_exclusive(READMARK_NOT_USED);
-            }
-            Ok(())
-        })?;
-
-        // reinitialize in‑memory state
-        self.with_shared_mut_dangerous(|shared| shared.restart_wal_header(&self.io));
-        let cksm = self.with_shared(|shared| shared.last_checksum);
-        *self.last_checksum.write() = cksm;
-        self.max_frame.store(0, Ordering::Release);
-        self.min_frame.store(0, Ordering::Release);
-        self.checkpoint_seq.fetch_add(1, Ordering::Release);
+        tracing::info!("restart_log");
+        let snapshot = self.coordination.begin_restart(self.io.as_ref())?;
+        self.apply_restart_snapshot(snapshot);
         Ok(())
     }
 
@@ -2721,14 +4236,7 @@ impl WalFile {
         result: &mut CheckpointResult,
         sync_type: FileSyncType,
     ) -> Result<IOResult<()>> {
-        let file = self.with_shared(|shared| {
-            turso_assert!(
-                shared.enabled.load(Ordering::Relaxed),
-                "WAL must be enabled"
-            );
-            shared.initialized.store(false, Ordering::Release);
-            shared.file.as_ref().unwrap().clone()
-        });
+        let file = self.coordination.prepare_truncate()?;
 
         if !result.wal_truncate_sent {
             let c = Completion::new_trunc({
@@ -2763,13 +4271,17 @@ impl WalFile {
         Ok(IOResult::Done(()))
     }
 
+    fn apply_restart_snapshot(&self, snapshot: WalSnapshot) {
+        *self.last_checksum.write() = snapshot.last_checksum;
+        self.max_frame.store(snapshot.max_frame, Ordering::Release);
+        self.min_frame.store(0, Ordering::Release);
+        self.checkpoint_seq
+            .store(snapshot.checkpoint_seq, Ordering::Release);
+    }
+
     // unlock shared read locks taken by RESTART/TRUNCATE checkpoint modes
-    fn unlock_after_restart(shared: &Arc<RwLock<WalFileShared>>, e: Option<&LimboError>) {
-        // release all read locks we just acquired, the caller will take care of the others
-        let shared = shared.write();
-        for idx in 1..shared.read_locks.len() {
-            shared.read_locks[idx].unlock();
-        }
+    fn unlock_after_restart(coordination: &Arc<dyn WalCoordination>, e: Option<&LimboError>) {
+        coordination.end_restart();
         if let Some(e) = e {
             mark_unlikely();
             tracing::debug!(
@@ -2798,7 +4310,7 @@ impl WalFile {
             if self.checkpoint_guard.read().is_some() {
                 let _ = self.checkpoint_guard.write().take();
             }
-            let guard = CheckpointLocks::new(self.shared.clone(), mode)?;
+            let guard = CheckpointLocks::new(self.coordination.clone(), mode)?;
             *self.checkpoint_guard.write() = Some(guard);
         }
         Ok(())
@@ -2831,13 +4343,7 @@ impl WalFile {
             })
         };
         // schedule read of the page payload
-        let file = self.with_shared(|shared| {
-            turso_assert!(
-                shared.enabled.load(Ordering::Relaxed),
-                "WAL must be enabled"
-            );
-            shared.file.as_ref().unwrap().clone()
-        });
+        let file = self.coordination.wal_file()?;
         let c = begin_read_wal_frame(
             file.as_ref(),
             offset + WAL_FRAME_HEADER_SIZE as u64,
@@ -2854,21 +4360,6 @@ impl WalFile {
         })
     }
 
-    /// Check if database changed since this connection's last read transaction.
-    fn db_changed(&self, shared: &WalFileShared) -> bool {
-        let shared_max = shared.max_frame.load(Ordering::Acquire);
-        let nbackfills = shared.nbackfills.load(Ordering::Acquire);
-        let last_checksum = shared.last_checksum;
-        let checkpoint_seq = shared.wal_header.lock().checkpoint_seq;
-        let transaction_count = shared.transaction_count.load(Ordering::Acquire);
-
-        shared_max != self.max_frame.load(Ordering::Acquire)
-            || last_checksum != *self.last_checksum.read()
-            || checkpoint_seq != self.checkpoint_seq.load(Ordering::Acquire)
-            || transaction_count != self.transaction_count.load(Ordering::Acquire)
-            || nbackfills + 1 != self.min_frame.load(Ordering::Acquire)
-    }
-
     /// MVCC helper: check if WAL state changed and refresh local snapshot without starting a read tx.
     /// FIXME: this isn't TOCTOU safe because we're not taking WAL read locks.
     ///
@@ -2877,35 +4368,392 @@ impl WalFile {
     /// FIXME: MVCC should start using pager read transactions anyway so that we can get rid of
     /// the stop-the-world MVCC checkpoint that blocks all reads.
     pub fn mvcc_refresh_if_db_changed(&self) -> bool {
-        self.with_shared(|shared| {
-            let shared_max = shared.max_frame.load(Ordering::Acquire);
-            let nbackfills = shared.nbackfills.load(Ordering::Acquire);
-            let last_checksum = shared.last_checksum;
-            let checkpoint_seq = shared.wal_header.lock().checkpoint_seq;
-            let transaction_count = shared.transaction_count.load(Ordering::Acquire);
-
-            let changed = shared_max != self.max_frame.load(Ordering::Acquire)
-                || last_checksum != *self.last_checksum.read()
-                || checkpoint_seq != self.checkpoint_seq.load(Ordering::Acquire)
-                || transaction_count != self.transaction_count.load(Ordering::Acquire)
-                || nbackfills + 1 != self.min_frame.load(Ordering::Acquire);
-            if changed {
-                self.max_frame.store(shared_max, Ordering::Release);
-                self.min_frame.store(nbackfills + 1, Ordering::Release);
-                *self.last_checksum.write() = last_checksum;
-                self.checkpoint_seq.store(checkpoint_seq, Ordering::Release);
-                self.transaction_count
-                    .store(transaction_count, Ordering::Release);
-            }
-            changed
-        })
+        let snapshot = self.load_coordination_snapshot();
+        let local_state = self.connection_state();
+        let changed = self.db_changed_against(snapshot, local_state);
+        if changed {
+            self.install_connection_state(local_state.with_snapshot(snapshot));
+        }
+        changed
     }
+}
+
+#[cfg(all(unix, target_pointer_width = "64"))]
+fn read_exact_bytes_from_file(
+    io: &Arc<dyn IO>,
+    file: &Arc<dyn File>,
+    offset: u64,
+    len: usize,
+) -> Result<Option<Vec<u8>>> {
+    let read_buf = Arc::new(Buffer::new_temporary(len));
+    let bytes_read = Arc::new(AtomicUsize::new(usize::MAX));
+    let c = file.pread(
+        offset,
+        Completion::new_read(read_buf.clone(), {
+            let bytes_read = bytes_read.clone();
+            Box::new(move |res| {
+                if let Ok((_buf, count)) = res {
+                    bytes_read.store(count as usize, Ordering::Release);
+                }
+                None
+            })
+        }),
+    )?;
+    io.wait_for_completion(c)?;
+    if bytes_read.load(Ordering::Acquire) != len {
+        return Ok(None);
+    }
+    Ok(Some(read_buf.as_slice()[..len].to_vec()))
+}
+
+#[cfg(all(unix, target_pointer_width = "64"))]
+fn read_validated_wal_header_from_file(
+    io: &Arc<dyn IO>,
+    file: &Arc<dyn File>,
+) -> Result<Option<WalHeader>> {
+    let Some(bytes) = read_exact_bytes_from_file(io, file, 0, WAL_HEADER_SIZE)? else {
+        return Ok(None);
+    };
+    let header = WalHeader {
+        magic: u32::from_be_bytes(bytes[0..4].try_into().unwrap()),
+        file_format: u32::from_be_bytes(bytes[4..8].try_into().unwrap()),
+        page_size: u32::from_be_bytes(bytes[8..12].try_into().unwrap()),
+        checkpoint_seq: u32::from_be_bytes(bytes[12..16].try_into().unwrap()),
+        salt_1: u32::from_be_bytes(bytes[16..20].try_into().unwrap()),
+        salt_2: u32::from_be_bytes(bytes[20..24].try_into().unwrap()),
+        checksum_1: u32::from_be_bytes(bytes[24..28].try_into().unwrap()),
+        checksum_2: u32::from_be_bytes(bytes[28..32].try_into().unwrap()),
+    };
+    if !matches!(header.magic, WAL_MAGIC_LE | WAL_MAGIC_BE) {
+        return Ok(None);
+    }
+    if PageSize::new(header.page_size).is_none() {
+        return Ok(None);
+    }
+    let use_native_endian = cfg!(target_endian = "big") == ((header.magic & 1) != 0);
+    let calc = checksum_wal(
+        &bytes[..WAL_HEADER_SIZE - 8],
+        &header,
+        (0, 0),
+        use_native_endian,
+    );
+    if calc != (header.checksum_1, header.checksum_2) {
+        return Ok(None);
+    }
+    Ok(Some(header))
+}
+
+#[cfg(all(unix, target_pointer_width = "64"))]
+fn wal_header_matches_authority_snapshot(
+    wal_header: WalHeader,
+    snapshot: SharedWalCoordinationHeader,
+) -> bool {
+    wal_header.page_size == snapshot.page_size
+        && wal_header.checkpoint_seq == snapshot.checkpoint_seq
+        && wal_header.salt_1 == snapshot.salt_1
+        && wal_header.salt_2 == snapshot.salt_2
+}
+
+pub(crate) fn database_identity_from_header_bytes(header_bytes: &[u8]) -> Result<(u32, u32)> {
+    if header_bytes.len() < DatabaseHeader::SIZE {
+        return Err(LimboError::Corrupt(format!(
+            "database header must be at least {} bytes, got {}",
+            DatabaseHeader::SIZE,
+            header_bytes.len()
+        )));
+    }
+    if header_bytes[0..16] != *b"SQLite format 3\0" {
+        return Err(LimboError::Corrupt("database header magic mismatch".into()));
+    }
+    let db_size_pages = u32::from_be_bytes(header_bytes[28..32].try_into().unwrap());
+    let header_crc32c = crc32c::crc32c(&header_bytes[..DatabaseHeader::SIZE]);
+    Ok((db_size_pages, header_crc32c))
+}
+
+fn read_database_identity_from_storage(
+    io: &Arc<dyn IO>,
+    db_file: &Arc<dyn DatabaseStorage>,
+) -> Result<Option<(u32, u32)>> {
+    let read_buf = Arc::new(Buffer::new_temporary(PageSize::MIN as usize));
+    let bytes_read = Arc::new(AtomicUsize::new(usize::MAX));
+    let c = db_file.read_header(Completion::new_read(read_buf.clone(), {
+        let bytes_read = bytes_read.clone();
+        Box::new(move |res| {
+            if let Ok((_buf, count)) = res {
+                bytes_read.store(count as usize, Ordering::Release);
+            }
+            None
+        })
+    }))?;
+    io.wait_for_completion(c)?;
+    if bytes_read.load(Ordering::Acquire) < DatabaseHeader::SIZE {
+        return Ok(None);
+    }
+    Ok(Some(database_identity_from_header_bytes(
+        &read_buf.as_slice()[..DatabaseHeader::SIZE],
+    )?))
+}
+
+#[cfg(all(test, unix, target_pointer_width = "64"))]
+fn read_database_identity_from_file_path(
+    io: &Arc<dyn IO>,
+    wal_path: &str,
+) -> Result<Option<(u32, u32)>> {
+    let db_path = wal_path
+        .strip_suffix("-wal")
+        .unwrap_or(wal_path)
+        .to_string();
+    let file = match io.open_file(&db_path, crate::OpenFlags::None, false) {
+        Ok(file) => file,
+        Err(LimboError::CompletionError(CompletionError::IOError(
+            std::io::ErrorKind::NotFound,
+            _,
+        ))) => return Ok(None),
+        Err(err) => return Err(err),
+    };
+    let Some(bytes) = read_exact_bytes_from_file(io, &file, 0, DatabaseHeader::SIZE)? else {
+        return Ok(None);
+    };
+    Ok(Some(database_identity_from_header_bytes(&bytes)?))
+}
+
+#[cfg(all(unix, target_pointer_width = "64"))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AuthoritySnapshotValidation {
+    Trusted,
+    RebuildFromDisk(AuthoritySnapshotRebuildReason),
+}
+
+#[cfg(all(unix, target_pointer_width = "64"))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AuthoritySnapshotRebuildReason {
+    WalHeaderUnreadable,
+    WalHeaderMismatch,
+    WalTooShortForSnapshot,
+    WalLengthMismatch,
+    LastFrameMissing,
+    LastFrameNotCommit,
+    LastFrameSaltMismatch,
+    LastFrameChecksumMismatch,
+}
+
+#[cfg(all(unix, target_pointer_width = "64"))]
+fn classify_authority_snapshot_against_wal(
+    io: &Arc<dyn IO>,
+    file: &Arc<dyn File>,
+    snapshot: SharedWalCoordinationHeader,
+) -> Result<AuthoritySnapshotValidation> {
+    let wal_size = file.size()?;
+    if snapshot.max_frame == 0 {
+        if wal_size == 0 {
+            return Ok(AuthoritySnapshotValidation::Trusted);
+        }
+        if wal_size == WAL_HEADER_SIZE as u64 {
+            let Some(wal_header) = read_validated_wal_header_from_file(io, file)? else {
+                return Ok(AuthoritySnapshotValidation::RebuildFromDisk(
+                    AuthoritySnapshotRebuildReason::WalHeaderUnreadable,
+                ));
+            };
+            return Ok(
+                if wal_header_matches_authority_snapshot(wal_header, snapshot) {
+                    AuthoritySnapshotValidation::Trusted
+                } else {
+                    AuthoritySnapshotValidation::RebuildFromDisk(
+                        AuthoritySnapshotRebuildReason::WalHeaderMismatch,
+                    )
+                },
+            );
+        }
+        return Ok(AuthoritySnapshotValidation::RebuildFromDisk(
+            AuthoritySnapshotRebuildReason::WalLengthMismatch,
+        ));
+    }
+
+    if wal_size < WAL_HEADER_SIZE as u64 {
+        return Ok(AuthoritySnapshotValidation::RebuildFromDisk(
+            AuthoritySnapshotRebuildReason::WalTooShortForSnapshot,
+        ));
+    }
+
+    let Some(wal_header) = read_validated_wal_header_from_file(io, file)? else {
+        return Ok(AuthoritySnapshotValidation::RebuildFromDisk(
+            AuthoritySnapshotRebuildReason::WalHeaderUnreadable,
+        ));
+    };
+    if !wal_header_matches_authority_snapshot(wal_header, snapshot) {
+        return Ok(AuthoritySnapshotValidation::RebuildFromDisk(
+            AuthoritySnapshotRebuildReason::WalHeaderMismatch,
+        ));
+    }
+
+    let frame_size = WAL_FRAME_HEADER_SIZE as u64 + wal_header.page_size as u64;
+    let expected_wal_len = WAL_HEADER_SIZE as u64 + snapshot.max_frame * frame_size;
+    if wal_size != expected_wal_len {
+        return Ok(AuthoritySnapshotValidation::RebuildFromDisk(
+            AuthoritySnapshotRebuildReason::WalLengthMismatch,
+        ));
+    }
+
+    let last_frame_offset = WAL_HEADER_SIZE as u64 + (snapshot.max_frame - 1) * frame_size;
+    let Some(frame_bytes) =
+        read_exact_bytes_from_file(io, file, last_frame_offset, frame_size as usize)?
+    else {
+        return Ok(AuthoritySnapshotValidation::RebuildFromDisk(
+            AuthoritySnapshotRebuildReason::LastFrameMissing,
+        ));
+    };
+    let (frame_header, _) = sqlite3_ondisk::parse_wal_frame_header(&frame_bytes);
+    if !frame_header.is_commit_frame() {
+        return Ok(AuthoritySnapshotValidation::RebuildFromDisk(
+            AuthoritySnapshotRebuildReason::LastFrameNotCommit,
+        ));
+    }
+    if frame_header.salt_1 != snapshot.salt_1 || frame_header.salt_2 != snapshot.salt_2 {
+        return Ok(AuthoritySnapshotValidation::RebuildFromDisk(
+            AuthoritySnapshotRebuildReason::LastFrameSaltMismatch,
+        ));
+    }
+    if frame_header.checksum_1 != snapshot.checksum_1
+        || frame_header.checksum_2 != snapshot.checksum_2
+    {
+        return Ok(AuthoritySnapshotValidation::RebuildFromDisk(
+            AuthoritySnapshotRebuildReason::LastFrameChecksumMismatch,
+        ));
+    }
+    Ok(AuthoritySnapshotValidation::Trusted)
 }
 
 impl WalFileShared {
     pub fn last_checksum_and_max_frame(&self) -> ((u32, u32), u64) {
-        (self.last_checksum, self.max_frame.load(Ordering::Acquire))
+        (
+            self.metadata.last_checksum,
+            self.metadata.max_frame.load(Ordering::Acquire),
+        )
     }
+
+    #[cfg(all(unix, target_pointer_width = "64"))]
+    pub(crate) fn open_shared_from_authority_if_exists(
+        io: &Arc<dyn IO>,
+        path: &str,
+        flags: crate::OpenFlags,
+        authority: &Arc<MappedSharedWalCoordination>,
+        db_file: &Arc<dyn DatabaseStorage>,
+    ) -> Result<Arc<RwLock<WalFileShared>>> {
+        let snapshot = authority.snapshot();
+        let file = match io.open_file(path, flags, false) {
+            Ok(file) => file,
+            Err(LimboError::CompletionError(CompletionError::IOError(
+                std::io::ErrorKind::NotFound,
+                _,
+            ))) if flags.contains(crate::OpenFlags::ReadOnly) => {
+                return Ok(WalFileShared::new_noop());
+            }
+            Err(e) => return Err(e),
+        };
+        let wal_size = file.size()?;
+
+        match classify_authority_snapshot_against_wal(io, &file, snapshot)? {
+            AuthoritySnapshotValidation::Trusted => {}
+            AuthoritySnapshotValidation::RebuildFromDisk(reason) => {
+                tracing::debug!(
+                    ?reason,
+                    "rebuilding WAL state from disk because persisted authority is not provably reusable"
+                );
+                return sqlite3_ondisk::build_shared_wal(&file, io);
+            }
+        }
+        if authority.frame_index_overflowed() {
+            tracing::debug!(
+                "rebuilding WAL state from disk because the persisted tshm frame index is marked overflowed"
+            );
+            return sqlite3_ondisk::build_shared_wal(&file, io);
+        }
+        if snapshot.nbackfills != 0
+            && authority.open_mode() == SharedWalCoordinationOpenMode::Exclusive
+        {
+            tracing::debug!(
+                nbackfills = snapshot.nbackfills,
+                max_frame = snapshot.max_frame,
+                "rebuilding WAL state from disk because an exclusive reopen must conservatively clear published backfill progress"
+            );
+            return sqlite3_ondisk::build_shared_wal(&file, io);
+        }
+        if snapshot.max_frame > snapshot.nbackfills
+            && authority
+                .iter_latest_frames(0, snapshot.max_frame)
+                .is_empty()
+        {
+            tracing::debug!(
+                max_frame = snapshot.max_frame,
+                nbackfills = snapshot.nbackfills,
+                "rebuilding WAL state from disk because the persisted tshm frame index has no entries for a visible WAL tail"
+            );
+            return sqlite3_ondisk::build_shared_wal(&file, io);
+        }
+        if snapshot.nbackfills != 0 {
+            let Some((db_size_pages, db_header_crc32c)) =
+                read_database_identity_from_storage(io, db_file)?
+            else {
+                tracing::debug!(
+                    nbackfills = snapshot.nbackfills,
+                    "rebuilding WAL state from disk because the main database header is unavailable for backfill-proof validation"
+                );
+                return sqlite3_ondisk::build_shared_wal(&file, io);
+            };
+            if !authority.validate_backfill_proof(snapshot, db_size_pages, db_header_crc32c) {
+                tracing::debug!(
+                    nbackfills = snapshot.nbackfills,
+                    "rebuilding WAL state from disk because persisted tshm backfill proof is not valid for the current database header"
+                );
+                return sqlite3_ondisk::build_shared_wal(&file, io);
+            }
+        }
+        let wal_is_initialized = wal_size >= WAL_HEADER_SIZE as u64;
+
+        let wal_header = WalHeader {
+            page_size: snapshot.page_size,
+            checkpoint_seq: snapshot.checkpoint_seq,
+            salt_1: snapshot.salt_1,
+            salt_2: snapshot.salt_2,
+            checksum_1: snapshot.checksum_1,
+            checksum_2: snapshot.checksum_2,
+            ..WalHeader::new()
+        };
+        let read_locks = array::from_fn(|_| TursoRwLock::new());
+        for (i, lock) in read_locks.iter().enumerate() {
+            lock.write();
+            lock.set_value_exclusive(if i < 2 { 0 } else { READMARK_NOT_USED });
+            lock.unlock();
+        }
+
+        let shared = WalFileShared {
+            metadata: WalSharedMetadata {
+                enabled: AtomicBool::new(true),
+                wal_header: Arc::new(SpinLock::new(wal_header)),
+                min_frame: AtomicU64::new(0),
+                max_frame: AtomicU64::new(snapshot.max_frame),
+                nbackfills: AtomicU64::new(snapshot.nbackfills),
+                transaction_count: AtomicU64::new(snapshot.transaction_count),
+                last_checksum: (snapshot.checksum_1, snapshot.checksum_2),
+                loaded: AtomicBool::new(true),
+                loaded_from_disk_scan: AtomicBool::new(false),
+                initialized: AtomicBool::new(wal_is_initialized),
+            },
+            runtime: WalSharedRuntime {
+                frame_cache: Arc::new(SpinLock::new(FxHashMap::default())),
+                file: Some(file),
+                read_locks,
+                write_lock: TursoRwLock::new(),
+                checkpoint_lock: TursoRwLock::new(),
+                epoch: AtomicU32::new(snapshot.checkpoint_epoch),
+                overflow_fallback_coverage: Arc::new(SpinLock::new(
+                    OverflowFallbackCoverage::default(),
+                )),
+            },
+        };
+        Ok(Arc::new(RwLock::new(shared)))
+    }
+
     pub fn open_shared_if_exists(
         io: &Arc<dyn IO>,
         path: &str,
@@ -2927,14 +4775,14 @@ impl WalFileShared {
         turso_assert!(
             wal_file_shared
                 .try_read()
-                .is_some_and(|wfs| wfs.loaded.load(Ordering::Acquire)),
+                .is_some_and(|wfs| wfs.metadata.loaded.load(Ordering::Acquire)),
             "Unable to read WAL shared state"
         );
         Ok(wal_file_shared)
     }
 
     pub fn is_initialized(&self) -> Result<bool> {
-        Ok(self.initialized.load(Ordering::Acquire))
+        Ok(self.metadata.initialized.load(Ordering::Acquire))
     }
 
     pub fn new_noop() -> Arc<RwLock<WalFileShared>> {
@@ -2946,21 +4794,29 @@ impl WalFileShared {
             lock.unlock();
         }
         let shared = WalFileShared {
-            enabled: AtomicBool::new(false),
-            wal_header: Arc::new(SpinLock::new(wal_header)),
-            min_frame: AtomicU64::new(0),
-            max_frame: AtomicU64::new(0),
-            nbackfills: AtomicU64::new(0),
-            transaction_count: AtomicU64::new(0),
-            frame_cache: Arc::new(SpinLock::new(FxHashMap::default())),
-            last_checksum: (0, 0),
-            file: None,
-            read_locks,
-            write_lock: TursoRwLock::new(),
-            checkpoint_lock: TursoRwLock::new(),
-            loaded: AtomicBool::new(true),
-            initialized: AtomicBool::new(false),
-            epoch: AtomicU32::new(0),
+            metadata: WalSharedMetadata {
+                enabled: AtomicBool::new(false),
+                wal_header: Arc::new(SpinLock::new(wal_header)),
+                min_frame: AtomicU64::new(0),
+                max_frame: AtomicU64::new(0),
+                nbackfills: AtomicU64::new(0),
+                transaction_count: AtomicU64::new(0),
+                last_checksum: (0, 0),
+                loaded: AtomicBool::new(true),
+                loaded_from_disk_scan: AtomicBool::new(false),
+                initialized: AtomicBool::new(false),
+            },
+            runtime: WalSharedRuntime {
+                frame_cache: Arc::new(SpinLock::new(FxHashMap::default())),
+                file: None,
+                read_locks,
+                write_lock: TursoRwLock::new(),
+                checkpoint_lock: TursoRwLock::new(),
+                epoch: AtomicU32::new(0),
+                overflow_fallback_coverage: Arc::new(SpinLock::new(
+                    OverflowFallbackCoverage::default(),
+                )),
+            },
         };
         Arc::new(RwLock::new(shared))
     }
@@ -2978,27 +4834,35 @@ impl WalFileShared {
             lock.unlock();
         }
         let shared = WalFileShared {
-            enabled: AtomicBool::new(true),
-            wal_header: Arc::new(SpinLock::new(wal_header)),
-            min_frame: AtomicU64::new(0),
-            max_frame: AtomicU64::new(0),
-            nbackfills: AtomicU64::new(0),
-            transaction_count: AtomicU64::new(0),
-            frame_cache: Arc::new(SpinLock::new(FxHashMap::default())),
-            last_checksum: (0, 0),
-            file: Some(file),
-            read_locks,
-            write_lock: TursoRwLock::new(),
-            checkpoint_lock: TursoRwLock::new(),
-            loaded: AtomicBool::new(true),
-            initialized: AtomicBool::new(false),
-            epoch: AtomicU32::new(0),
+            metadata: WalSharedMetadata {
+                enabled: AtomicBool::new(true),
+                wal_header: Arc::new(SpinLock::new(wal_header)),
+                min_frame: AtomicU64::new(0),
+                max_frame: AtomicU64::new(0),
+                nbackfills: AtomicU64::new(0),
+                transaction_count: AtomicU64::new(0),
+                last_checksum: (0, 0),
+                loaded: AtomicBool::new(true),
+                loaded_from_disk_scan: AtomicBool::new(false),
+                initialized: AtomicBool::new(false),
+            },
+            runtime: WalSharedRuntime {
+                frame_cache: Arc::new(SpinLock::new(FxHashMap::default())),
+                file: Some(file),
+                read_locks,
+                write_lock: TursoRwLock::new(),
+                checkpoint_lock: TursoRwLock::new(),
+                epoch: AtomicU32::new(0),
+                overflow_fallback_coverage: Arc::new(SpinLock::new(
+                    OverflowFallbackCoverage::default(),
+                )),
+            },
         };
         Ok(Arc::new(RwLock::new(shared)))
     }
 
     pub fn page_size(&self) -> u32 {
-        self.wal_header.lock().page_size
+        self.metadata.wal_header.lock().page_size
     }
 
     /// Called after a successful RESTART/TRUNCATE mode checkpoint
@@ -3016,27 +4880,27 @@ impl WalFileShared {
     /// This function updates the shared-memory structures so that the next
     /// client to write to the database (which may be this one) does so by
     /// writing frames into the start of the log file.
-    fn restart_wal_header(&mut self, io: &Arc<dyn IO>) {
+    fn restart_wal_header(&mut self, io: &dyn IO) {
         {
-            let mut hdr = self.wal_header.lock();
+            let mut hdr = self.metadata.wal_header.lock();
             hdr.checkpoint_seq = hdr.checkpoint_seq.wrapping_add(1);
             // keep hdr.magic, hdr.file_format, hdr.page_size as-is
             hdr.salt_1 = hdr.salt_1.wrapping_add(1);
             hdr.salt_2 = io.generate_random_number() as u32;
 
-            self.max_frame.store(0, Ordering::Release);
-            self.nbackfills.store(0, Ordering::Release);
-            self.last_checksum = (hdr.checksum_1, hdr.checksum_2);
+            self.metadata.max_frame.store(0, Ordering::Release);
+            self.metadata.nbackfills.store(0, Ordering::Release);
+            self.metadata.last_checksum = (hdr.checksum_1, hdr.checksum_2);
             // `prepare_wal_start` (used in the `commit_dirty_pages_inner`) do the work only if WAL is not initialized yet (so, self.initialized is false)
             // we change WAL state here, so on next write attempt `prepare_wal_start` will update WAL header
-            self.initialized.store(false, Ordering::Release);
+            self.metadata.initialized.store(false, Ordering::Release);
         }
 
-        self.frame_cache.lock().clear();
+        self.runtime.frame_cache.lock().clear();
         // read-marks
-        self.read_locks[0].set_value_exclusive(0);
-        self.read_locks[1].set_value_exclusive(0);
-        for lock in &self.read_locks[2..] {
+        self.runtime.read_locks[0].set_value_exclusive(0);
+        self.runtime.read_locks[1].set_value_exclusive(0);
+        for lock in &self.runtime.read_locks[2..] {
             lock.set_value_exclusive(READMARK_NOT_USED);
         }
     }
@@ -3044,18 +4908,34 @@ impl WalFileShared {
 
 #[cfg(test)]
 pub mod test {
+    #[cfg(all(unix, target_pointer_width = "64"))]
+    use super::{
+        classify_authority_snapshot_against_wal, AuthoritySnapshotRebuildReason,
+        AuthoritySnapshotValidation, ShmWalCoordination,
+    };
+    use super::{
+        InProcessWalCoordination, ReadGuardKind, Wal, WalCommitState, WalConnectionState,
+        WalCoordination, WalFile, WalSnapshot,
+    };
+    #[cfg(all(unix, target_pointer_width = "64"))]
+    use crate::storage::shared_wal_coordination::{
+        MappedSharedWalCoordination, SharedWalCoordinationHeader, SharedWalCoordinationOpenMode,
+    };
     use crate::sync::{atomic::Ordering, Arc};
     use crate::sync::{Mutex, RwLock};
     use crate::{
         storage::{
-            sqlite3_ondisk::{self, WAL_HEADER_SIZE},
+            buffer_pool::BufferPool,
+            database::{DatabaseFile, DatabaseStorage},
+            sqlite3_ondisk::{self, PageSize, WAL_HEADER_SIZE},
             wal::READMARK_NOT_USED,
         },
         types::IOResult,
         util::IOExt,
-        CheckpointMode, CheckpointResult, Completion, Connection, Database, LimboError, PlatformIO,
-        WalFileShared, IO,
+        Buffer, CheckpointMode, CheckpointResult, Completion, Connection, Database, File,
+        LimboError, PlatformIO, SyncMode, WalFileShared, IO,
     };
+    use std::num::NonZeroUsize;
     #[cfg(unix)]
     use std::os::unix::fs::MetadataExt;
     #[allow(clippy::arc_with_non_send_sync)]
@@ -3070,9 +4950,77 @@ pub mod test {
                 .unwrap();
         }
         let io: Arc<dyn IO> = Arc::new(PlatformIO::new().unwrap());
-        let db = Database::open_file(io.clone(), path.to_str().unwrap()).unwrap();
+        let db = Database::open_file_with_flags(
+            io.clone(),
+            path.to_str().unwrap(),
+            crate::OpenFlags::default(),
+            crate::DatabaseOpts::new().with_multiprocess_wal(true),
+            None,
+        )
+        .unwrap();
         // db + tmp directory
         (db, dbpath)
+    }
+
+    struct DeferredReadFile {
+        inner: Arc<dyn File>,
+        pending_reads: Mutex<Vec<(u64, Completion)>>,
+    }
+
+    impl DeferredReadFile {
+        fn new(inner: Arc<dyn File>) -> Self {
+            Self {
+                inner,
+                pending_reads: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn complete_pending_reads(&self) {
+            let pending_reads = std::mem::take(&mut *self.pending_reads.lock());
+            for (pos, completion) in pending_reads {
+                std::mem::drop(self.inner.pread(pos, completion).unwrap());
+            }
+        }
+    }
+
+    impl File for DeferredReadFile {
+        fn lock_file(&self, exclusive: bool) -> crate::Result<()> {
+            self.inner.lock_file(exclusive)
+        }
+
+        fn unlock_file(&self) -> crate::Result<()> {
+            self.inner.unlock_file()
+        }
+
+        fn pread(&self, pos: u64, c: Completion) -> crate::Result<Completion> {
+            self.pending_reads.lock().push((pos, c.clone()));
+            Ok(c)
+        }
+
+        fn pwrite(
+            &self,
+            pos: u64,
+            buffer: Arc<Buffer>,
+            c: Completion,
+        ) -> crate::Result<Completion> {
+            self.inner.pwrite(pos, buffer, c)
+        }
+
+        fn sync(
+            &self,
+            c: Completion,
+            sync_type: crate::io::FileSyncType,
+        ) -> crate::Result<Completion> {
+            self.inner.sync(c, sync_type)
+        }
+
+        fn size(&self) -> crate::Result<u64> {
+            self.inner.size()
+        }
+
+        fn truncate(&self, len: u64, c: Completion) -> crate::Result<Completion> {
+            self.inner.truncate(len, c)
+        }
     }
     #[test]
     fn test_truncate_file() {
@@ -3082,7 +5030,7 @@ pub mod test {
             .unwrap();
         let _ = conn.execute("insert into test (value) values ('test1'), ('test2'), ('test3')");
         let wal = db.shared_wal.write();
-        let wal_file = wal.file.as_ref().unwrap().clone();
+        let wal_file = wal.runtime.file.as_ref().unwrap().clone();
         let done = Arc::new(Mutex::new(false));
         let _done = done.clone();
         let _ = wal_file.truncate(
@@ -3200,9 +5148,269 @@ pub mod test {
             .unwrap()
     }
 
+    fn run_wal_checkpoint_until_done(
+        db: &Database,
+        pager: &crate::Pager,
+        mode: CheckpointMode,
+    ) -> CheckpointResult {
+        let wal = pager.wal.as_ref().expect("wal should be present");
+        loop {
+            match wal.checkpoint(pager, mode) {
+                Ok(IOResult::IO(io)) => io.wait(db.io.as_ref()).unwrap(),
+                Ok(IOResult::Done(result)) => return result,
+                Err(err) => panic!("checkpoint should succeed: {err:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn test_wal_checkpoint_defers_backfill_publication_until_db_sync() {
+        let (db, _path) = get_database();
+        let wal_shared = db.shared_wal.clone();
+        let conn = db.connect().unwrap();
+        conn.execute("create table test(id integer primary key, value text)")
+            .unwrap();
+        bulk_inserts(&conn, 8, 2);
+
+        let pager = conn.pager.load();
+        let result = run_wal_checkpoint_until_done(&db, &pager, CheckpointMode::Full);
+        assert!(
+            result.wal_total_backfilled > 0,
+            "checkpoint setup should backfill frames before DB sync"
+        );
+        assert_eq!(
+            wal_shared.read().metadata.nbackfills.load(Ordering::SeqCst),
+            0,
+            "wal.checkpoint() must not publish positive nbackfills before DB sync completes"
+        );
+    }
+
+    #[test]
+    fn test_checkpoint_sync_mode_off_leaves_backfill_unpublished() {
+        let (db, _path) = get_database();
+        let wal_shared = db.shared_wal.clone();
+        let conn = db.connect().unwrap();
+        conn.execute("create table test(id integer primary key, value text)")
+            .unwrap();
+        bulk_inserts(&conn, 8, 2);
+
+        let pager = conn.pager.load();
+        let result = pager
+            .io
+            .block(|| pager.checkpoint(CheckpointMode::Full, SyncMode::Off, true))
+            .unwrap();
+        assert!(
+            result.wal_total_backfilled > 0,
+            "sync-mode-off checkpoint setup should still backfill frames into the DB file"
+        );
+        assert_eq!(
+            wal_shared.read().metadata.nbackfills.load(Ordering::SeqCst),
+            0,
+            "SyncMode::Off must not publish positive nbackfills as durable shared state"
+        );
+    }
+
+    fn make_test_wal() -> (Arc<RwLock<WalFileShared>>, WalFile) {
+        let io: Arc<dyn IO> = Arc::new(PlatformIO::new().unwrap());
+        let buffer_pool = BufferPool::begin_init(&io, BufferPool::TEST_ARENA_SIZE);
+        let shared = WalFileShared::new_noop();
+        let coordination: Arc<dyn WalCoordination> =
+            Arc::new(InProcessWalCoordination::new(shared.clone()));
+        let wal = WalFile::new_with_coordination(io, coordination, ((0, 0), 0), buffer_pool);
+        (shared, wal)
+    }
+
+    fn set_shared_snapshot(shared: &Arc<RwLock<WalFileShared>>, snapshot: WalSnapshot) {
+        let mut guard = shared.write();
+        guard
+            .metadata
+            .max_frame
+            .store(snapshot.max_frame, Ordering::Release);
+        guard
+            .metadata
+            .nbackfills
+            .store(snapshot.nbackfills, Ordering::Release);
+        guard.metadata.last_checksum = snapshot.last_checksum;
+        guard.metadata.wal_header.lock().checkpoint_seq = snapshot.checkpoint_seq;
+        guard
+            .metadata
+            .transaction_count
+            .store(snapshot.transaction_count, Ordering::Release);
+    }
+
+    fn make_test_coordination(shared: &Arc<RwLock<WalFileShared>>) -> InProcessWalCoordination {
+        InProcessWalCoordination::new(shared.clone())
+    }
+
+    #[cfg(all(unix, target_pointer_width = "64"))]
+    fn make_test_shm_coordination(
+        shared: &Arc<RwLock<WalFileShared>>,
+        path: &std::path::Path,
+    ) -> (Arc<MappedSharedWalCoordination>, ShmWalCoordination) {
+        let io: Arc<dyn IO> = Arc::new(PlatformIO::new().unwrap());
+        let authority =
+            Arc::new(MappedSharedWalCoordination::create_or_open(&io, path, 64).unwrap());
+        let coordination = ShmWalCoordination::new(shared.clone(), authority.clone());
+        (authority, coordination)
+    }
+
+    #[cfg(all(unix, target_pointer_width = "64"))]
+    fn active_shared_reader_slot_count(authority: &MappedSharedWalCoordination) -> usize {
+        let reader_slot_count = authority.snapshot().reader_slot_count;
+        (0..reader_slot_count)
+            .filter(|&slot_index| authority.reader_owner(slot_index).is_some())
+            .count()
+    }
+
+    #[cfg(all(unix, target_pointer_width = "64"))]
+    fn write_test_wal_with_single_commit_frame(
+        io: &Arc<dyn IO>,
+        wal_path: &std::path::Path,
+    ) -> SharedWalCoordinationHeader {
+        let file = io
+            .open_file(wal_path.to_str().unwrap(), crate::OpenFlags::Create, false)
+            .unwrap();
+        let mut wal_header = sqlite3_ondisk::WalHeader {
+            page_size: 4096,
+            checkpoint_seq: 5,
+            salt_1: 17,
+            salt_2: 23,
+            ..sqlite3_ondisk::WalHeader::new()
+        };
+        let use_native_endian = cfg!(target_endian = "big") == ((wal_header.magic & 1) != 0);
+        let mut header_prefix = [0u8; WAL_HEADER_SIZE - 8];
+        header_prefix[0..4].copy_from_slice(&wal_header.magic.to_be_bytes());
+        header_prefix[4..8].copy_from_slice(&wal_header.file_format.to_be_bytes());
+        header_prefix[8..12].copy_from_slice(&wal_header.page_size.to_be_bytes());
+        header_prefix[12..16].copy_from_slice(&wal_header.checkpoint_seq.to_be_bytes());
+        header_prefix[16..20].copy_from_slice(&wal_header.salt_1.to_be_bytes());
+        header_prefix[20..24].copy_from_slice(&wal_header.salt_2.to_be_bytes());
+        let header_checksum =
+            sqlite3_ondisk::checksum_wal(&header_prefix, &wal_header, (0, 0), use_native_endian);
+        wal_header.checksum_1 = header_checksum.0;
+        wal_header.checksum_2 = header_checksum.1;
+
+        io.wait_for_completion(
+            sqlite3_ondisk::begin_write_wal_header(file.as_ref(), &wal_header).unwrap(),
+        )
+        .unwrap();
+
+        let buffer_pool = BufferPool::begin_init(io, BufferPool::TEST_ARENA_SIZE);
+        buffer_pool
+            .finalize_with_page_size(wal_header.page_size as usize)
+            .unwrap();
+        #[allow(unused_mut)]
+        let mut page = vec![0x5a; wal_header.page_size as usize];
+        #[cfg(feature = "checksum")]
+        crate::storage::checksum::ChecksumContext::new()
+            .add_checksum_to_page(&mut page, 7)
+            .unwrap();
+        let (frame_checksum, frame_buf) = sqlite3_ondisk::prepare_wal_frame(
+            &buffer_pool,
+            &wal_header,
+            header_checksum,
+            wal_header.page_size,
+            7,
+            1,
+            &page,
+        );
+        let c = file
+            .pwrite(
+                WAL_HEADER_SIZE as u64,
+                frame_buf,
+                Completion::new_write(|_| {}),
+            )
+            .unwrap();
+        io.wait_for_completion(c).unwrap();
+        let c = file
+            .sync(Completion::new_sync(|_| {}), crate::io::FileSyncType::Fsync)
+            .unwrap();
+        io.wait_for_completion(c).unwrap();
+
+        SharedWalCoordinationHeader {
+            max_frame: 1,
+            nbackfills: 0,
+            transaction_count: 9,
+            visibility_generation: 3,
+            checkpoint_seq: wal_header.checkpoint_seq,
+            checkpoint_epoch: 7,
+            page_size: wal_header.page_size,
+            salt_1: wal_header.salt_1,
+            salt_2: wal_header.salt_2,
+            checksum_1: frame_checksum.0,
+            checksum_2: frame_checksum.1,
+            reader_slot_count: 64,
+        }
+    }
+
+    #[cfg(all(unix, target_pointer_width = "64"))]
+    fn open_test_db_file_for_wal(
+        io: &Arc<dyn IO>,
+        wal_path: &std::path::Path,
+    ) -> Arc<dyn DatabaseStorage> {
+        let db_path = wal_path.with_extension("db");
+        Arc::new(DatabaseFile::new(
+            io.open_file(db_path.to_str().unwrap(), crate::OpenFlags::Create, false)
+                .unwrap(),
+        ))
+    }
+
+    #[test]
+    #[cfg(all(unix, target_pointer_width = "64"))]
+    fn test_read_frame_keeps_epoch_from_issue_time() {
+        let dir = tempfile::tempdir().unwrap();
+        let wal_path = dir.path().join("epoch-race.db-wal");
+        let io: Arc<dyn IO> = Arc::new(PlatformIO::new().unwrap());
+        let snapshot = write_test_wal_with_single_commit_frame(&io, &wal_path);
+
+        let file = io
+            .open_file(wal_path.to_str().unwrap(), crate::OpenFlags::Create, false)
+            .unwrap();
+        let shared = WalFileShared::new_shared(file.clone()).unwrap();
+        let deferred_file = Arc::new(DeferredReadFile::new(file));
+        {
+            let mut shared = shared.write();
+            shared.runtime.file = Some(deferred_file.clone());
+            shared
+                .runtime
+                .epoch
+                .store(snapshot.checkpoint_epoch, Ordering::Release);
+        }
+
+        let coordination: Arc<dyn WalCoordination> = Arc::new(make_test_coordination(&shared));
+        let buffer_pool = BufferPool::begin_init(&io, BufferPool::TEST_ARENA_SIZE);
+        buffer_pool
+            .finalize_with_page_size(snapshot.page_size as usize)
+            .unwrap();
+        let wal = WalFile::new_with_coordination(
+            io.clone(),
+            coordination,
+            (
+                (snapshot.checksum_1, snapshot.checksum_2),
+                snapshot.max_frame,
+            ),
+            buffer_pool.clone(),
+        );
+
+        let page = Arc::new(crate::storage::pager::Page::new(7));
+        let issued_epoch = wal.coordination.checkpoint_epoch();
+        let completion = wal.read_frame(1, page.clone(), buffer_pool).unwrap();
+
+        wal.increment_checkpoint_epoch();
+        deferred_file.complete_pending_reads();
+        io.wait_for_completion(completion).unwrap();
+
+        assert_eq!(
+            page.wal_tag_pair(),
+            (1, issued_epoch),
+            "WAL reads must retain the epoch from when the read was issued"
+        );
+    }
+
     #[cfg(test)]
     fn read_slots_with_readers(shared: &WalFileShared) -> Vec<usize> {
         shared
+            .runtime
             .read_locks
             .iter()
             .enumerate()
@@ -3217,8 +5425,2070 @@ pub mod test {
     fn wal_header_snapshot(shared: &Arc<RwLock<WalFileShared>>) -> (u32, u32, u32, u32) {
         // (checkpoint_seq, salt1, salt2, page_size)
         let shared_guard = shared.read();
-        let hdr = shared_guard.wal_header.lock();
+        let hdr = shared_guard.metadata.wal_header.lock();
         (hdr.checkpoint_seq, hdr.salt_1, hdr.salt_2, hdr.page_size)
+    }
+
+    #[test]
+    fn test_wal_connection_state_round_trip() {
+        let (_shared, wal) = make_test_wal();
+        let state = WalConnectionState::new(
+            WalSnapshot {
+                max_frame: 11,
+                nbackfills: 7,
+                last_checksum: (31, 47),
+                checkpoint_seq: 5,
+                transaction_count: 13,
+            },
+            ReadGuardKind::ReadMark(NonZeroUsize::new(3).unwrap()),
+        );
+
+        wal.install_connection_state(state);
+
+        assert_eq!(wal.connection_state(), state);
+        assert_eq!(wal.connection_state().snapshot.min_frame(), 8);
+    }
+
+    #[test]
+    fn test_wal_explicit_backend_constructor_does_not_keep_shared_handle() {
+        let io: Arc<dyn IO> = Arc::new(PlatformIO::new().unwrap());
+        let buffer_pool = BufferPool::begin_init(&io, BufferPool::TEST_ARENA_SIZE);
+        let shared = WalFileShared::new_noop();
+        let coordination: Arc<dyn WalCoordination> =
+            Arc::new(InProcessWalCoordination::new(shared.clone()));
+
+        assert_eq!(Arc::strong_count(&shared), 2);
+
+        let _wal = WalFile::new_with_coordination(io, coordination, ((0, 0), 0), buffer_pool);
+
+        assert_eq!(Arc::strong_count(&shared), 2);
+    }
+
+    #[test]
+    fn test_mvcc_refresh_updates_snapshot_without_changing_read_guard() {
+        let (shared, wal) = make_test_wal();
+        let initial = WalSnapshot {
+            max_frame: 4,
+            nbackfills: 2,
+            last_checksum: (9, 10),
+            checkpoint_seq: 1,
+            transaction_count: 3,
+        };
+        set_shared_snapshot(&shared, initial);
+        wal.install_connection_state(WalConnectionState::new(
+            initial,
+            ReadGuardKind::ReadMark(NonZeroUsize::new(2).unwrap()),
+        ));
+
+        assert!(!wal.mvcc_refresh_if_db_changed());
+
+        let updated = WalSnapshot {
+            max_frame: 8,
+            nbackfills: 5,
+            last_checksum: (21, 34),
+            checkpoint_seq: 7,
+            transaction_count: 4,
+        };
+        set_shared_snapshot(&shared, updated);
+
+        assert!(wal.mvcc_refresh_if_db_changed());
+        assert_eq!(
+            wal.connection_state(),
+            WalConnectionState::new(
+                updated,
+                ReadGuardKind::ReadMark(NonZeroUsize::new(2).unwrap())
+            )
+        );
+    }
+
+    #[test]
+    fn test_in_process_coordination_uses_shared_authority() {
+        let (shared, _wal) = make_test_wal();
+        let coordination = make_test_coordination(&shared);
+        let snapshot = WalSnapshot {
+            max_frame: 9,
+            nbackfills: 3,
+            last_checksum: (55, 89),
+            checkpoint_seq: 7,
+            transaction_count: 11,
+        };
+        set_shared_snapshot(&shared, snapshot);
+        {
+            let guard = shared.write();
+            guard.runtime.epoch.store(5, Ordering::Release);
+            guard.runtime.frame_cache.lock().extend([
+                (1, vec![1, 4, 8]),
+                (2, vec![2, 6]),
+                (3, vec![3]),
+            ]);
+        }
+
+        assert_eq!(coordination.load_snapshot(), snapshot);
+        assert_eq!(coordination.checkpoint_epoch(), 5);
+        assert_eq!(coordination.find_frame(1, 4, 9, None), Some(8));
+        assert_eq!(coordination.find_frame(2, 4, 9, Some(5)), Some(2));
+        assert_eq!(coordination.iter_latest_frames(4, 9), vec![(1, 8), (2, 6)]);
+
+        coordination.publish_commit(WalCommitState {
+            max_frame: 12,
+            last_checksum: (144, 233),
+            transaction_count: 12,
+        });
+        let published = coordination.load_snapshot();
+        assert_eq!(published.max_frame, 12);
+        assert_eq!(published.last_checksum, (144, 233));
+        assert_eq!(published.transaction_count, 12);
+        assert_eq!(published.nbackfills, snapshot.nbackfills);
+        assert_eq!(published.checkpoint_seq, snapshot.checkpoint_seq);
+    }
+
+    #[test]
+    fn test_in_process_coordination_publishes_checkpoint_and_restart_state() {
+        let (shared, _wal) = make_test_wal();
+        let coordination = make_test_coordination(&shared);
+        let io = PlatformIO::new().unwrap();
+        let snapshot = WalSnapshot {
+            max_frame: 9,
+            nbackfills: 3,
+            last_checksum: (55, 89),
+            checkpoint_seq: 7,
+            transaction_count: 11,
+        };
+        set_shared_snapshot(&shared, snapshot);
+        {
+            let guard = shared.write();
+            let mut header = guard.metadata.wal_header.lock();
+            header.page_size = 4096;
+            header.checksum_1 = 144;
+            header.checksum_2 = 233;
+            guard.metadata.initialized.store(true, Ordering::Release);
+            guard.runtime.epoch.store(5, Ordering::Release);
+            guard
+                .runtime
+                .frame_cache
+                .lock()
+                .extend([(1, vec![1, 4, 8]), (2, vec![2, 6])]);
+        }
+
+        coordination.publish_backfill(8);
+        assert_eq!(coordination.load_snapshot().nbackfills, 8);
+        assert_eq!(coordination.bump_checkpoint_epoch(), 5);
+        assert_eq!(coordination.checkpoint_epoch(), 6);
+
+        assert!(coordination.try_read_mark_exclusive(0));
+        let restarted = coordination.begin_restart(&io).unwrap();
+        coordination.end_restart();
+        coordination.unlock_read_mark(0);
+
+        assert_eq!(restarted.max_frame, 0);
+        assert_eq!(restarted.nbackfills, 0);
+        assert_eq!(restarted.last_checksum, (144, 233));
+        assert_eq!(restarted.checkpoint_seq, 8);
+        assert_eq!(restarted.transaction_count, 11);
+
+        let guard = shared.read();
+        assert_eq!(guard.runtime.read_locks[0].get_value(), 0);
+        assert_eq!(guard.runtime.read_locks[1].get_value(), 0);
+        for lock in &guard.runtime.read_locks[2..] {
+            assert_eq!(lock.get_value(), READMARK_NOT_USED);
+        }
+        assert!(guard.runtime.frame_cache.lock().is_empty());
+        assert!(!guard.metadata.initialized.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn test_in_process_coordination_manages_frame_cache() {
+        let (shared, _wal) = make_test_wal();
+        let coordination = make_test_coordination(&shared);
+
+        coordination.cache_frame(7, 2);
+        coordination.cache_frame(7, 5);
+        coordination.cache_frame(9, 4);
+
+        assert_eq!(coordination.find_frame(7, 0, 5, None), Some(5));
+        assert_eq!(coordination.iter_latest_frames(0, 5), vec![(7, 5), (9, 4)]);
+
+        coordination.rollback_cache(4);
+
+        assert_eq!(coordination.find_frame(7, 0, 5, None), Some(2));
+        assert_eq!(coordination.iter_latest_frames(0, 5), vec![(7, 2), (9, 4)]);
+        assert_eq!(
+            shared.read().runtime.frame_cache.lock().get(&7),
+            Some(&vec![2])
+        );
+    }
+
+    #[test]
+    fn test_in_process_coordination_transaction_guards() {
+        let (shared, _wal) = make_test_wal();
+        let coordination = make_test_coordination(&shared);
+
+        let db_file_snapshot = WalSnapshot {
+            max_frame: 0,
+            nbackfills: 0,
+            last_checksum: (0, 0),
+            checkpoint_seq: 0,
+            transaction_count: 0,
+        };
+        set_shared_snapshot(&shared, db_file_snapshot);
+        let read_guard = coordination.try_begin_read_tx(db_file_snapshot).unwrap();
+        assert_eq!(read_guard, ReadGuardKind::DbFile);
+        coordination.end_read_tx(read_guard);
+
+        let wal_snapshot = WalSnapshot {
+            max_frame: 5,
+            nbackfills: 2,
+            last_checksum: (11, 13),
+            checkpoint_seq: 1,
+            transaction_count: 2,
+        };
+        set_shared_snapshot(&shared, wal_snapshot);
+        let read_guard = coordination.try_begin_read_tx(wal_snapshot).unwrap();
+        assert!(matches!(read_guard, ReadGuardKind::ReadMark(_)));
+        coordination.end_read_tx(read_guard);
+
+        assert!(coordination.try_begin_write_tx());
+        assert!(!coordination.try_begin_write_tx());
+        coordination.end_write_tx();
+    }
+
+    #[cfg(all(unix, target_pointer_width = "64"))]
+    #[test]
+    fn test_shm_coordination_uses_shared_authority() {
+        let dir = tempfile::tempdir().unwrap();
+        let wal_path = dir.path().join("test.db-wal");
+        let shm_path = dir.path().join("test.db-tshm");
+        let io: Arc<dyn IO> = Arc::new(PlatformIO::new().unwrap());
+        let file_a = io
+            .open_file(wal_path.to_str().unwrap(), crate::OpenFlags::Create, false)
+            .unwrap();
+        let file_b = io
+            .open_file(wal_path.to_str().unwrap(), crate::OpenFlags::Create, false)
+            .unwrap();
+        let shared_a = WalFileShared::new_shared(file_a).unwrap();
+        let shared_b = WalFileShared::new_shared(file_b).unwrap();
+        let snapshot = WalSnapshot {
+            max_frame: 14,
+            nbackfills: 8,
+            last_checksum: (31, 37),
+            checkpoint_seq: 5,
+            transaction_count: 9,
+        };
+        set_shared_snapshot(&shared_a, snapshot);
+        {
+            let shared = shared_a.write();
+            let mut header = shared.metadata.wal_header.lock();
+            header.page_size = 4096;
+            header.salt_1 = 17;
+            header.salt_2 = 23;
+            header.checksum_1 = snapshot.last_checksum.0;
+            header.checksum_2 = snapshot.last_checksum.1;
+        }
+
+        let (_authority_a, coordination_a) = make_test_shm_coordination(&shared_a, &shm_path);
+        let (authority_b, coordination_b) = make_test_shm_coordination(&shared_b, &shm_path);
+        coordination_a.cache_frame(7, 2);
+        coordination_a.cache_frame(9, 4);
+        coordination_a.cache_frame(7, 5);
+
+        assert_eq!(coordination_b.load_snapshot(), snapshot);
+        assert_eq!(coordination_b.wal_header().page_size, 4096);
+        assert_eq!(coordination_b.wal_header().salt_1, 17);
+        assert_eq!(coordination_b.wal_header().salt_2, 23);
+        assert_eq!(coordination_b.find_frame(7, 0, 5, None), Some(5));
+        assert_eq!(
+            coordination_b.iter_latest_frames(0, 5),
+            vec![(7, 5), (9, 4)]
+        );
+        assert_eq!(coordination_a.checkpoint_epoch(), 0);
+        assert_eq!(coordination_b.bump_checkpoint_epoch(), 0);
+        assert_eq!(coordination_a.checkpoint_epoch(), 1);
+
+        assert!(coordination_a.try_begin_write_tx());
+        assert!(!coordination_b.try_begin_write_tx());
+        coordination_a.end_write_tx();
+
+        let read_guard = coordination_a.try_begin_read_tx(snapshot).unwrap();
+        assert_eq!(
+            authority_b.min_active_reader_frame(),
+            Some(snapshot.max_frame)
+        );
+        coordination_a.end_read_tx(read_guard);
+        assert_eq!(authority_b.min_active_reader_frame(), None);
+
+        coordination_b.publish_commit(WalCommitState {
+            max_frame: 21,
+            last_checksum: (55, 89),
+            transaction_count: 10,
+        });
+        assert_eq!(
+            coordination_a.load_snapshot(),
+            WalSnapshot {
+                max_frame: 21,
+                nbackfills: 8,
+                last_checksum: (55, 89),
+                checkpoint_seq: 5,
+                transaction_count: 10,
+            }
+        );
+
+        coordination_b.rollback_cache(4);
+        assert_eq!(coordination_a.find_frame(7, 0, 5, None), Some(2));
+        assert_eq!(
+            coordination_a.iter_latest_frames(0, 5),
+            vec![(7, 2), (9, 4)]
+        );
+        assert!(shm_path.exists());
+    }
+
+    #[cfg(all(unix, target_pointer_width = "64"))]
+    #[test]
+    fn test_shm_coordination_many_same_snapshot_readers_share_one_published_slot() {
+        let dir = tempfile::tempdir().unwrap();
+        let wal_path = dir.path().join("test-many-same-snapshot-readers.db-wal");
+        let shm_path = dir.path().join("test-many-same-snapshot-readers.db-tshm");
+        let io: Arc<dyn IO> = Arc::new(PlatformIO::new().unwrap());
+        let file = io
+            .open_file(wal_path.to_str().unwrap(), crate::OpenFlags::Create, false)
+            .unwrap();
+        let shared = WalFileShared::new_shared(file).unwrap();
+        let snapshot = WalSnapshot {
+            max_frame: 9,
+            nbackfills: 2,
+            last_checksum: (31, 37),
+            checkpoint_seq: 5,
+            transaction_count: 9,
+        };
+        set_shared_snapshot(&shared, snapshot);
+        {
+            let shared = shared.write();
+            let mut header = shared.metadata.wal_header.lock();
+            header.page_size = 4096;
+            header.salt_1 = 17;
+            header.salt_2 = 23;
+            header.checksum_1 = snapshot.last_checksum.0;
+            header.checksum_2 = snapshot.last_checksum.1;
+        }
+
+        let authority =
+            Arc::new(MappedSharedWalCoordination::create_or_open(&io, &shm_path, 64).unwrap());
+        let mut readers = Vec::new();
+        for _ in 0..128 {
+            let coordination = ShmWalCoordination::new(shared.clone(), authority.clone());
+            let read_guard = coordination
+                .try_begin_read_tx(snapshot)
+                .expect("same-snapshot readers should share a published reader barrier");
+            readers.push((coordination, read_guard));
+        }
+
+        assert_eq!(
+            authority.min_active_reader_frame(),
+            Some(snapshot.max_frame)
+        );
+        assert_eq!(
+            active_shared_reader_slot_count(&authority),
+            1,
+            "same-snapshot readers should collapse onto one shared reader slot"
+        );
+
+        for (coordination, read_guard) in readers {
+            coordination.end_read_tx(read_guard);
+        }
+        assert_eq!(authority.min_active_reader_frame(), None);
+        assert_eq!(active_shared_reader_slot_count(&authority), 0);
+    }
+
+    #[cfg(all(unix, target_pointer_width = "64"))]
+    #[test]
+    fn test_shm_coordination_uses_one_published_slot_per_active_snapshot_generation() {
+        let dir = tempfile::tempdir().unwrap();
+        let wal_path = dir.path().join("test-mixed-snapshot-readers.db-wal");
+        let shm_path = dir.path().join("test-mixed-snapshot-readers.db-tshm");
+        let io: Arc<dyn IO> = Arc::new(PlatformIO::new().unwrap());
+        let file = io
+            .open_file(wal_path.to_str().unwrap(), crate::OpenFlags::Create, false)
+            .unwrap();
+        let shared = WalFileShared::new_shared(file).unwrap();
+        let snapshot_a = WalSnapshot {
+            max_frame: 5,
+            nbackfills: 2,
+            last_checksum: (31, 37),
+            checkpoint_seq: 5,
+            transaction_count: 9,
+        };
+        set_shared_snapshot(&shared, snapshot_a);
+        {
+            let shared = shared.write();
+            let mut header = shared.metadata.wal_header.lock();
+            header.page_size = 4096;
+            header.salt_1 = 17;
+            header.salt_2 = 23;
+            header.checksum_1 = snapshot_a.last_checksum.0;
+            header.checksum_2 = snapshot_a.last_checksum.1;
+        }
+
+        let authority =
+            Arc::new(MappedSharedWalCoordination::create_or_open(&io, &shm_path, 64).unwrap());
+        let reader_a1 = ShmWalCoordination::new(shared.clone(), authority.clone());
+        let guard_a1 = reader_a1.try_begin_read_tx(snapshot_a).unwrap();
+        let reader_a2 = ShmWalCoordination::new(shared.clone(), authority.clone());
+        let guard_a2 = reader_a2.try_begin_read_tx(snapshot_a).unwrap();
+        assert_eq!(
+            authority.min_active_reader_frame(),
+            Some(snapshot_a.max_frame)
+        );
+        assert_eq!(active_shared_reader_slot_count(&authority), 1);
+
+        let snapshot_b = WalSnapshot {
+            max_frame: 9,
+            nbackfills: 2,
+            last_checksum: (41, 43),
+            checkpoint_seq: 5,
+            transaction_count: 10,
+        };
+        reader_a1.publish_commit(WalCommitState {
+            max_frame: snapshot_b.max_frame,
+            last_checksum: snapshot_b.last_checksum,
+            transaction_count: snapshot_b.transaction_count,
+        });
+
+        let reader_b1 = ShmWalCoordination::new(shared.clone(), authority.clone());
+        let guard_b1 = reader_b1.try_begin_read_tx(snapshot_b).unwrap();
+        let reader_b2 = ShmWalCoordination::new(shared, authority.clone());
+        let guard_b2 = reader_b2.try_begin_read_tx(snapshot_b).unwrap();
+
+        assert_eq!(
+            active_shared_reader_slot_count(&authority),
+            2,
+            "distinct live snapshots should each publish one shared reader slot"
+        );
+        assert_eq!(
+            authority.min_active_reader_frame(),
+            Some(snapshot_a.max_frame),
+            "checkpoint barrier should stay pinned to the oldest active snapshot"
+        );
+
+        reader_a1.end_read_tx(guard_a1);
+        reader_a2.end_read_tx(guard_a2);
+        assert_eq!(
+            authority.min_active_reader_frame(),
+            Some(snapshot_b.max_frame)
+        );
+        assert_eq!(active_shared_reader_slot_count(&authority), 1);
+
+        reader_b1.end_read_tx(guard_b1);
+        reader_b2.end_read_tx(guard_b2);
+        assert_eq!(authority.min_active_reader_frame(), None);
+        assert_eq!(active_shared_reader_slot_count(&authority), 0);
+    }
+
+    #[cfg(all(unix, target_pointer_width = "64"))]
+    #[test]
+    fn test_shm_coordination_shared_index_grows_past_old_fixed_limit() {
+        const OLD_FIXED_LIMIT: u64 = 65_536;
+
+        let dir = tempfile::tempdir().unwrap();
+        let wal_path = dir.path().join("test.db-wal");
+        let shm_path = dir.path().join("test.db-tshm");
+        let io: Arc<dyn IO> = Arc::new(PlatformIO::new().unwrap());
+        let file_a = io
+            .open_file(wal_path.to_str().unwrap(), crate::OpenFlags::Create, false)
+            .unwrap();
+        let file_b = io
+            .open_file(wal_path.to_str().unwrap(), crate::OpenFlags::Create, false)
+            .unwrap();
+        let shared_a = WalFileShared::new_shared(file_a).unwrap();
+        let shared_b = WalFileShared::new_shared(file_b).unwrap();
+        let snapshot = WalSnapshot {
+            max_frame: OLD_FIXED_LIMIT + 2,
+            nbackfills: 0,
+            last_checksum: (31, 37),
+            checkpoint_seq: 5,
+            transaction_count: OLD_FIXED_LIMIT + 2,
+        };
+        set_shared_snapshot(&shared_a, snapshot);
+        {
+            let shared = shared_a.write();
+            let mut header = shared.metadata.wal_header.lock();
+            header.page_size = 4096;
+            header.salt_1 = 17;
+            header.salt_2 = 23;
+            header.checksum_1 = snapshot.last_checksum.0;
+            header.checksum_2 = snapshot.last_checksum.1;
+        }
+
+        let (_authority_a, coordination_a) = make_test_shm_coordination(&shared_a, &shm_path);
+        let (_authority_b, coordination_b) = make_test_shm_coordination(&shared_b, &shm_path);
+
+        coordination_a.cache_frame(7, 2);
+        for frame_id in 3..=OLD_FIXED_LIMIT + 1 {
+            coordination_a.cache_frame(100 + (frame_id % 31), frame_id);
+        }
+        coordination_a.cache_frame(7, OLD_FIXED_LIMIT + 2);
+
+        assert_eq!(
+            coordination_b.find_frame(7, 0, OLD_FIXED_LIMIT + 2, None),
+            Some(OLD_FIXED_LIMIT + 2)
+        );
+        assert_eq!(
+            coordination_b.find_frame(7, 0, OLD_FIXED_LIMIT + 2, Some(OLD_FIXED_LIMIT + 1)),
+            Some(2)
+        );
+        assert!(coordination_b
+            .iter_latest_frames(0, OLD_FIXED_LIMIT + 2)
+            .contains(&(7, OLD_FIXED_LIMIT + 2)));
+    }
+
+    #[cfg(all(unix, target_pointer_width = "64"))]
+    #[test]
+    fn test_shm_coordination_restart_uses_authority_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let wal_path = dir.path().join("test.db-wal");
+        let shm_path = dir.path().join("test.db-tshm");
+        let io = PlatformIO::new().unwrap();
+        let file_a = io
+            .open_file(wal_path.to_str().unwrap(), crate::OpenFlags::Create, false)
+            .unwrap();
+        let file_b = io
+            .open_file(wal_path.to_str().unwrap(), crate::OpenFlags::Create, false)
+            .unwrap();
+        let shared_a = WalFileShared::new_shared(file_a).unwrap();
+        let shared_b = WalFileShared::new_shared(file_b).unwrap();
+        let snapshot = WalSnapshot {
+            max_frame: 12,
+            nbackfills: 12,
+            last_checksum: (31, 37),
+            checkpoint_seq: 5,
+            transaction_count: 9,
+        };
+        set_shared_snapshot(&shared_a, snapshot);
+        {
+            let shared = shared_a.write();
+            let mut header = shared.metadata.wal_header.lock();
+            header.page_size = 4096;
+            header.salt_1 = 17;
+            header.salt_2 = 23;
+            header.checksum_1 = snapshot.last_checksum.0;
+            header.checksum_2 = snapshot.last_checksum.1;
+            shared.metadata.initialized.store(true, Ordering::Release);
+            shared.runtime.epoch.store(5, Ordering::Release);
+        }
+
+        let (_authority_a, coordination_a) = make_test_shm_coordination(&shared_a, &shm_path);
+        let (_authority_b, coordination_b) = make_test_shm_coordination(&shared_b, &shm_path);
+        coordination_a.cache_frame(7, 2);
+        coordination_a.cache_frame(9, 4);
+
+        {
+            let mut shared = shared_b.write();
+            shared.metadata.max_frame.store(99, Ordering::Release);
+            shared.metadata.nbackfills.store(77, Ordering::Release);
+            shared.metadata.last_checksum = (1, 2);
+            shared
+                .metadata
+                .transaction_count
+                .store(42, Ordering::Release);
+            shared.runtime.epoch.store(99, Ordering::Release);
+            shared.metadata.initialized.store(true, Ordering::Release);
+            let mut header = shared.metadata.wal_header.lock();
+            header.checkpoint_seq = 88;
+            header.page_size = 2048;
+            header.salt_1 = 91;
+            header.salt_2 = 92;
+            header.checksum_1 = 93;
+            header.checksum_2 = 94;
+        }
+
+        assert!(coordination_b.fallback.try_read_mark_exclusive(0));
+        let restarted = coordination_b.begin_restart(&io).unwrap();
+        coordination_b.end_restart();
+        coordination_b.fallback.unlock_read_mark(0);
+
+        assert_eq!(
+            restarted,
+            WalSnapshot {
+                max_frame: 0,
+                nbackfills: 0,
+                last_checksum: snapshot.last_checksum,
+                checkpoint_seq: snapshot.checkpoint_seq.wrapping_add(1),
+                transaction_count: snapshot.transaction_count,
+            }
+        );
+        assert_eq!(
+            coordination_a.load_snapshot(),
+            WalSnapshot {
+                max_frame: 0,
+                nbackfills: 0,
+                last_checksum: snapshot.last_checksum,
+                checkpoint_seq: snapshot.checkpoint_seq.wrapping_add(1),
+                transaction_count: snapshot.transaction_count,
+            }
+        );
+        let header = coordination_a.wal_header();
+        assert_eq!(header.page_size, 4096);
+        assert_eq!(
+            header.checkpoint_seq,
+            snapshot.checkpoint_seq.wrapping_add(1)
+        );
+        assert_eq!(header.salt_1, 18);
+        assert_ne!(header.salt_2, 23);
+        assert_eq!(header.checksum_1, snapshot.last_checksum.0);
+        assert_eq!(header.checksum_2, snapshot.last_checksum.1);
+        assert_eq!(coordination_a.iter_latest_frames(0, u64::MAX), Vec::new());
+        assert_eq!(coordination_a.checkpoint_epoch(), 5);
+
+        let shared = shared_b.read();
+        assert_eq!(shared.metadata.max_frame.load(Ordering::Acquire), 0);
+        assert_eq!(shared.metadata.nbackfills.load(Ordering::Acquire), 0);
+        assert_eq!(shared.metadata.last_checksum, snapshot.last_checksum);
+        assert_eq!(
+            shared.metadata.transaction_count.load(Ordering::Acquire),
+            snapshot.transaction_count
+        );
+        assert_eq!(shared.runtime.epoch.load(Ordering::Acquire), 5);
+        assert!(!shared.metadata.initialized.load(Ordering::Acquire));
+        assert!(shared.runtime.frame_cache.lock().is_empty());
+    }
+
+    #[cfg(all(unix, target_pointer_width = "64"))]
+    #[test]
+    fn test_shm_coordination_exclusive_reopen_reuses_persisted_authority() {
+        let dir = tempfile::tempdir().unwrap();
+        let wal_path = dir.path().join("test.db-wal");
+        let shm_path = dir.path().join("test.db-tshm");
+        let io: Arc<dyn IO> = Arc::new(PlatformIO::new().unwrap());
+
+        {
+            let file = io
+                .open_file(wal_path.to_str().unwrap(), crate::OpenFlags::Create, false)
+                .unwrap();
+            let shared = WalFileShared::new_shared(file).unwrap();
+            let snapshot = WalSnapshot {
+                max_frame: 12,
+                nbackfills: 8,
+                last_checksum: (31, 37),
+                checkpoint_seq: 5,
+                transaction_count: 9,
+            };
+            set_shared_snapshot(&shared, snapshot);
+            {
+                let shared = shared.write();
+                let mut header = shared.metadata.wal_header.lock();
+                header.page_size = 4096;
+                header.salt_1 = 17;
+                header.salt_2 = 23;
+                header.checksum_1 = snapshot.last_checksum.0;
+                header.checksum_2 = snapshot.last_checksum.1;
+            }
+
+            let (authority, coordination) = make_test_shm_coordination(&shared, &shm_path);
+            coordination.cache_frame(7, 2);
+            coordination.cache_frame(7, 5);
+            assert_eq!(
+                authority.open_mode(),
+                SharedWalCoordinationOpenMode::Exclusive
+            );
+            assert_eq!(coordination.load_snapshot(), snapshot);
+            assert_eq!(coordination.find_frame(7, 0, 5, None), Some(5));
+        }
+
+        let reopened_file = io
+            .open_file(wal_path.to_str().unwrap(), crate::OpenFlags::Create, false)
+            .unwrap();
+        let reopened_shared = WalFileShared::new_shared(reopened_file).unwrap();
+        let (reopened_authority, reopened_coordination) =
+            make_test_shm_coordination(&reopened_shared, &shm_path);
+
+        assert_eq!(
+            reopened_authority.open_mode(),
+            SharedWalCoordinationOpenMode::Exclusive
+        );
+        assert_eq!(
+            reopened_coordination.load_snapshot(),
+            WalSnapshot {
+                max_frame: 12,
+                nbackfills: 8,
+                last_checksum: (31, 37),
+                checkpoint_seq: 5,
+                transaction_count: 9,
+            }
+        );
+        assert_eq!(
+            reopened_coordination.iter_latest_frames(0, u64::MAX),
+            vec![(7, 5)]
+        );
+        assert_eq!(reopened_authority.min_active_reader_frame(), None);
+    }
+
+    #[cfg(all(unix, target_pointer_width = "64"))]
+    #[test]
+    fn test_open_shared_from_authority_reuses_trusted_snapshot_after_exclusive_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let wal_path = dir.path().join("test.db-wal");
+        let shm_path = dir.path().join("test.db-tshm");
+        let io: Arc<dyn IO> = Arc::new(PlatformIO::new().unwrap());
+        let snapshot = write_test_wal_with_single_commit_frame(&io, &wal_path);
+        {
+            let authority =
+                Arc::new(MappedSharedWalCoordination::create_or_open(&io, &shm_path, 64).unwrap());
+            authority.install_snapshot(snapshot);
+            authority.record_frame(7, 1);
+        }
+        let reopened_authority =
+            Arc::new(MappedSharedWalCoordination::create_or_open(&io, &shm_path, 64).unwrap());
+        assert_eq!(
+            reopened_authority.open_mode(),
+            SharedWalCoordinationOpenMode::Exclusive
+        );
+
+        let shared = WalFileShared::open_shared_from_authority_if_exists(
+            &io,
+            wal_path.to_str().unwrap(),
+            crate::OpenFlags::Create,
+            &reopened_authority,
+            &open_test_db_file_for_wal(&io, &wal_path),
+        )
+        .unwrap();
+
+        let shared = shared.read();
+        assert_eq!(shared.metadata.max_frame.load(Ordering::Acquire), 1);
+        assert_eq!(shared.metadata.nbackfills.load(Ordering::Acquire), 0);
+        assert_eq!(
+            shared.metadata.transaction_count.load(Ordering::Acquire),
+            snapshot.transaction_count
+        );
+        assert_eq!(
+            shared.metadata.last_checksum,
+            (snapshot.checksum_1, snapshot.checksum_2)
+        );
+        assert_eq!(
+            shared.runtime.epoch.load(Ordering::Acquire),
+            snapshot.checkpoint_epoch
+        );
+        assert!(shared.metadata.initialized.load(Ordering::Acquire));
+        assert!(!shared
+            .metadata
+            .loaded_from_disk_scan
+            .load(Ordering::Acquire));
+        assert!(shared.runtime.frame_cache.lock().is_empty());
+    }
+
+    #[cfg(all(unix, target_pointer_width = "64"))]
+    #[test]
+    fn test_shm_coordination_live_overflow_returns_busy_without_runtime_disk_scan() {
+        let dir = tempfile::tempdir().unwrap();
+        let wal_path = dir.path().join("test-live-overflow.db-wal");
+        let shm_path = dir.path().join("test-live-overflow.db-tshm");
+        let io: Arc<dyn IO> = Arc::new(PlatformIO::new().unwrap());
+        let snapshot = write_test_wal_with_single_commit_frame(&io, &wal_path);
+        let authority =
+            Arc::new(MappedSharedWalCoordination::create_or_open(&io, &shm_path, 64).unwrap());
+        authority.install_snapshot(snapshot);
+        authority.record_frame(7, 1);
+
+        let reopened_authority =
+            Arc::new(MappedSharedWalCoordination::create_or_open(&io, &shm_path, 64).unwrap());
+        let shared = WalFileShared::open_shared_from_authority_if_exists(
+            &io,
+            wal_path.to_str().unwrap(),
+            crate::OpenFlags::Create,
+            &reopened_authority,
+            &open_test_db_file_for_wal(&io, &wal_path),
+        )
+        .unwrap();
+        assert!(shared.read().runtime.frame_cache.lock().is_empty());
+
+        let buffer_pool = BufferPool::begin_init(&io, BufferPool::TEST_ARENA_SIZE);
+        buffer_pool.finalize_with_page_size(4096).unwrap();
+        let wal = WalFile::new_with_shared_coordination(
+            io.clone(),
+            shared.clone(),
+            reopened_authority.clone(),
+            ((0, 0), 0),
+            buffer_pool,
+        );
+
+        wal.begin_read_tx().unwrap();
+        reopened_authority.mark_frame_index_overflowed_for_tests();
+
+        assert!(
+            matches!(wal.find_frame(7, None), Err(LimboError::Busy)),
+            "page lookup must refuse the overflowed path instead of rescanning the WAL synchronously"
+        );
+        assert!(
+            shared.read().runtime.frame_cache.lock().is_empty(),
+            "refusing the overflow refresh must leave the local fallback cache untouched"
+        );
+
+        wal.end_read_tx();
+        assert!(
+            matches!(wal.begin_read_tx(), Err(LimboError::Busy)),
+            "new readers must also refuse an uncovered overflowed frame index without blocking"
+        );
+    }
+
+    #[cfg(all(unix, target_pointer_width = "64"))]
+    #[test]
+    fn test_open_shared_from_authority_exclusive_rebuilds_positive_snapshot_from_disk() {
+        let dir = tempfile::tempdir().unwrap();
+        let wal_path = dir.path().join("test-exclusive-positive.db-wal");
+        let shm_path = dir.path().join("test-exclusive-positive.db-tshm");
+        let io: Arc<dyn IO> = Arc::new(PlatformIO::new().unwrap());
+        let snapshot = write_test_wal_with_single_commit_frame(&io, &wal_path);
+        {
+            let authority =
+                Arc::new(MappedSharedWalCoordination::create_or_open(&io, &shm_path, 64).unwrap());
+            authority.install_snapshot(SharedWalCoordinationHeader {
+                nbackfills: snapshot.max_frame,
+                ..snapshot
+            });
+            authority.record_frame(7, 1);
+            assert_eq!(
+                authority.open_mode(),
+                SharedWalCoordinationOpenMode::Exclusive
+            );
+        }
+
+        let reopened_authority =
+            Arc::new(MappedSharedWalCoordination::create_or_open(&io, &shm_path, 64).unwrap());
+        assert_eq!(
+            reopened_authority.open_mode(),
+            SharedWalCoordinationOpenMode::Exclusive
+        );
+
+        let shared = WalFileShared::open_shared_from_authority_if_exists(
+            &io,
+            wal_path.to_str().unwrap(),
+            crate::OpenFlags::Create,
+            &reopened_authority,
+            &open_test_db_file_for_wal(&io, &wal_path),
+        )
+        .unwrap();
+
+        let shared = shared.read();
+        assert_eq!(shared.metadata.max_frame.load(Ordering::Acquire), 1);
+        assert_eq!(shared.metadata.nbackfills.load(Ordering::Acquire), 0);
+        assert!(shared
+            .metadata
+            .loaded_from_disk_scan
+            .load(Ordering::Acquire));
+        assert_eq!(
+            shared.runtime.frame_cache.lock().get(&7).cloned(),
+            Some(vec![1])
+        );
+    }
+
+    #[cfg(all(unix, target_pointer_width = "64"))]
+    #[test]
+    fn test_shared_coordination_open_uses_reconciled_snapshot_for_local_wal_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let wal_path = dir.path().join("test.db-wal");
+        let shm_path = dir.path().join("test.db-tshm");
+        let io: Arc<dyn IO> = Arc::new(PlatformIO::new().unwrap());
+
+        let file = io
+            .open_file(wal_path.to_str().unwrap(), crate::OpenFlags::Create, false)
+            .unwrap();
+        let shared = WalFileShared::new_shared(file).unwrap();
+
+        let authority =
+            Arc::new(MappedSharedWalCoordination::create_or_open(&io, &shm_path, 64).unwrap());
+        let snapshot = SharedWalCoordinationHeader {
+            max_frame: 1,
+            nbackfills: 0,
+            transaction_count: 9,
+            visibility_generation: 3,
+            checkpoint_seq: 5,
+            checkpoint_epoch: 7,
+            page_size: 4096,
+            salt_1: 17,
+            salt_2: 23,
+            checksum_1: 31,
+            checksum_2: 37,
+            reader_slot_count: 64,
+        };
+        authority.install_snapshot(snapshot);
+        authority.record_frame(7, 1);
+
+        let buffer_pool = BufferPool::begin_init(&io, BufferPool::TEST_ARENA_SIZE);
+        buffer_pool.finalize_with_page_size(4096).unwrap();
+        let wal =
+            WalFile::new_with_shared_coordination(io, shared, authority, ((0, 0), 0), buffer_pool);
+
+        assert_eq!(wal.get_max_frame(), 1);
+        assert_eq!(wal.get_last_checksum(), (31, 37));
+    }
+
+    #[cfg(all(unix, target_pointer_width = "64"))]
+    #[test]
+    fn test_open_shared_from_authority_rebuilds_from_disk_when_snapshot_is_stale() {
+        let dir = tempfile::tempdir().unwrap();
+        let wal_path = dir.path().join("test-stale.db-wal");
+        let shm_path = dir.path().join("test-stale.db-tshm");
+        let io: Arc<dyn IO> = Arc::new(PlatformIO::new().unwrap());
+        let valid_snapshot = write_test_wal_with_single_commit_frame(&io, &wal_path);
+        let authority =
+            Arc::new(MappedSharedWalCoordination::create_or_open(&io, &shm_path, 64).unwrap());
+        authority.install_snapshot(SharedWalCoordinationHeader {
+            max_frame: 0,
+            nbackfills: 0,
+            transaction_count: 0,
+            visibility_generation: 0,
+            checkpoint_seq: valid_snapshot.checkpoint_seq,
+            checkpoint_epoch: 0,
+            page_size: valid_snapshot.page_size,
+            salt_1: valid_snapshot.salt_1,
+            salt_2: valid_snapshot.salt_2,
+            checksum_1: 0,
+            checksum_2: 0,
+            reader_slot_count: 64,
+        });
+
+        let shared = WalFileShared::open_shared_from_authority_if_exists(
+            &io,
+            wal_path.to_str().unwrap(),
+            crate::OpenFlags::Create,
+            &authority,
+            &open_test_db_file_for_wal(&io, &wal_path),
+        )
+        .unwrap();
+
+        let shared = shared.read();
+        assert_eq!(shared.metadata.max_frame.load(Ordering::Acquire), 1);
+        assert_eq!(
+            shared.metadata.last_checksum,
+            (valid_snapshot.checksum_1, valid_snapshot.checksum_2)
+        );
+        assert!(shared
+            .metadata
+            .loaded_from_disk_scan
+            .load(Ordering::Acquire));
+        assert_eq!(
+            shared.runtime.frame_cache.lock().get(&7).cloned(),
+            Some(vec![1])
+        );
+    }
+
+    #[cfg(all(unix, target_pointer_width = "64"))]
+    #[test]
+    fn test_open_shared_from_authority_rebuilt_authority_persists_across_exclusive_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let wal_path = dir.path().join("test-republish.db-wal");
+        let shm_path = dir.path().join("test-republish.db-tshm");
+        let io: Arc<dyn IO> = Arc::new(PlatformIO::new().unwrap());
+        let snapshot = write_test_wal_with_single_commit_frame(&io, &wal_path);
+        let authority =
+            Arc::new(MappedSharedWalCoordination::create_or_open(&io, &shm_path, 64).unwrap());
+        authority.install_snapshot(snapshot);
+
+        let exclusive = WalFileShared::open_shared_from_authority_if_exists(
+            &io,
+            wal_path.to_str().unwrap(),
+            crate::OpenFlags::Create,
+            &authority,
+            &open_test_db_file_for_wal(&io, &wal_path),
+        )
+        .unwrap();
+        assert!(exclusive
+            .read()
+            .metadata
+            .loaded_from_disk_scan
+            .load(Ordering::Acquire));
+        assert!(
+            authority.iter_latest_frames(0, u64::MAX).is_empty(),
+            "open_shared_from_authority_if_exists should not republish authority before coordination reconciliation"
+        );
+
+        let exclusive_coordination = ShmWalCoordination::new(exclusive, authority.clone());
+        assert_eq!(authority.iter_latest_frames(0, u64::MAX), vec![(7, 1)]);
+        assert_eq!(exclusive_coordination.find_frame(7, 0, 1, None), Some(1));
+
+        drop(exclusive_coordination);
+        drop(authority);
+
+        let reopened_authority =
+            Arc::new(MappedSharedWalCoordination::create_or_open(&io, &shm_path, 64).unwrap());
+        assert_eq!(
+            reopened_authority.open_mode(),
+            SharedWalCoordinationOpenMode::Exclusive
+        );
+
+        let reopened_shared = WalFileShared::open_shared_from_authority_if_exists(
+            &io,
+            wal_path.to_str().unwrap(),
+            crate::OpenFlags::Create,
+            &reopened_authority,
+            &open_test_db_file_for_wal(&io, &wal_path),
+        )
+        .unwrap();
+        assert!(!reopened_shared
+            .read()
+            .metadata
+            .loaded_from_disk_scan
+            .load(Ordering::Acquire));
+        let reopened_coordination = ShmWalCoordination::new(reopened_shared, reopened_authority);
+        assert_eq!(reopened_coordination.find_frame(7, 0, 1, None), Some(1));
+    }
+
+    #[cfg(all(unix, target_pointer_width = "64"))]
+    #[test]
+    fn test_open_shared_from_authority_exclusive_disk_scan_does_not_downgrade_newer_zero_frame_generation(
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let wal_path = dir.path().join("test-zero-frame-reopen.db-wal");
+        let shm_path = dir.path().join("test-zero-frame-reopen.db-tshm");
+        let io: Arc<dyn IO> = Arc::new(PlatformIO::new().unwrap());
+        let prior_generation = write_test_wal_with_single_commit_frame(&io, &wal_path);
+        let authority =
+            Arc::new(MappedSharedWalCoordination::create_or_open(&io, &shm_path, 64).unwrap());
+        let restarted_generation = SharedWalCoordinationHeader {
+            max_frame: 0,
+            nbackfills: 0,
+            transaction_count: prior_generation.transaction_count,
+            visibility_generation: prior_generation.visibility_generation,
+            checkpoint_seq: prior_generation.checkpoint_seq.wrapping_add(1),
+            checkpoint_epoch: prior_generation.checkpoint_epoch,
+            page_size: prior_generation.page_size,
+            salt_1: prior_generation.salt_1.wrapping_add(1),
+            salt_2: prior_generation.salt_2.wrapping_add(1),
+            checksum_1: prior_generation.checksum_1,
+            checksum_2: prior_generation.checksum_2,
+            reader_slot_count: prior_generation.reader_slot_count,
+        };
+        authority.install_snapshot(restarted_generation);
+
+        let shared = WalFileShared::open_shared_from_authority_if_exists(
+            &io,
+            wal_path.to_str().unwrap(),
+            crate::OpenFlags::Create,
+            &authority,
+            &open_test_db_file_for_wal(&io, &wal_path),
+        )
+        .unwrap();
+        assert!(shared
+            .read()
+            .metadata
+            .loaded_from_disk_scan
+            .load(Ordering::Acquire));
+
+        let coordination = ShmWalCoordination::new(shared.clone(), authority.clone());
+        let reopened = coordination.load_snapshot();
+        assert_eq!(reopened.max_frame, 0);
+        assert_eq!(reopened.nbackfills, 0);
+        assert_eq!(reopened.checkpoint_seq, restarted_generation.checkpoint_seq);
+        assert_eq!(
+            authority.snapshot().checkpoint_seq,
+            restarted_generation.checkpoint_seq
+        );
+        assert!(
+            !coordination.wal_is_initialized(),
+            "preserving a newer zero-frame generation must require the first append to rewrite the WAL header"
+        );
+        assert!(
+            shared.read().runtime.frame_cache.lock().is_empty(),
+            "older WAL frames from a prior generation must not survive zero-frame authority recovery"
+        );
+    }
+
+    #[cfg(all(unix, target_pointer_width = "64"))]
+    #[test]
+    fn test_open_shared_from_authority_ignores_unpublished_backfill_proof_after_exclusive_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let wal_path = dir.path().join("test-unpublished-proof.db-wal");
+        let shm_path = dir.path().join("test-unpublished-proof.db-tshm");
+        let io: Arc<dyn IO> = Arc::new(PlatformIO::new().unwrap());
+        let snapshot = write_test_wal_with_single_commit_frame(&io, &wal_path);
+        {
+            let authority =
+                Arc::new(MappedSharedWalCoordination::create_or_open(&io, &shm_path, 64).unwrap());
+            authority.install_snapshot(snapshot);
+            authority.install_backfill_proof(
+                SharedWalCoordinationHeader {
+                    nbackfills: snapshot.max_frame,
+                    ..snapshot
+                },
+                11,
+                0xAABB_CCDD,
+            );
+        }
+        let reopened_authority =
+            Arc::new(MappedSharedWalCoordination::create_or_open(&io, &shm_path, 64).unwrap());
+        assert_eq!(
+            reopened_authority.open_mode(),
+            SharedWalCoordinationOpenMode::Exclusive
+        );
+
+        let shared = WalFileShared::open_shared_from_authority_if_exists(
+            &io,
+            wal_path.to_str().unwrap(),
+            crate::OpenFlags::Create,
+            &reopened_authority,
+            &open_test_db_file_for_wal(&io, &wal_path),
+        )
+        .unwrap();
+
+        let shared = shared.read();
+        assert_eq!(shared.metadata.max_frame.load(Ordering::Acquire), 1);
+        assert_eq!(shared.metadata.nbackfills.load(Ordering::Acquire), 0);
+        assert!(shared
+            .metadata
+            .loaded_from_disk_scan
+            .load(Ordering::Acquire));
+    }
+
+    #[cfg(all(unix, target_pointer_width = "64"))]
+    #[test]
+    fn test_restart_checkpoint_clears_backfill_proof_and_later_replaces_it() {
+        let (db, path) = get_database();
+        let wal_path = path.join("test.db-wal");
+        let wal_path_str = wal_path.to_str().unwrap();
+        let conn = db.connect().unwrap();
+        conn.wal_auto_checkpoint_disable();
+        conn.execute("create table test(id integer primary key, value text)")
+            .unwrap();
+        bulk_inserts(&conn, 8, 2);
+
+        let pager = conn.pager.load();
+        let partial = run_checkpoint_until_done(
+            &pager,
+            CheckpointMode::Passive {
+                upper_bound_inclusive: Some(1),
+            },
+        );
+        assert!(
+            partial.wal_total_backfilled > 0 && !partial.everything_backfilled(),
+            "setup must create a partial checkpoint with a positive durable backfill proof"
+        );
+
+        let authority = db.shared_wal_coordination().unwrap().unwrap();
+        let snapshot_before_restart = authority.snapshot();
+        let (db_size_before, db_crc_before) =
+            super::read_database_identity_from_file_path(&db.io, wal_path_str)
+                .unwrap()
+                .unwrap();
+        assert!(
+            authority.validate_backfill_proof(
+                snapshot_before_restart,
+                db_size_before,
+                db_crc_before
+            ),
+            "setup must install a valid proof before RESTART"
+        );
+
+        let restart = run_checkpoint_until_done(&pager, CheckpointMode::Restart);
+        assert!(
+            restart.everything_backfilled(),
+            "RESTART should fully backfill before resetting the WAL generation"
+        );
+
+        let snapshot_after_restart = authority.snapshot();
+        assert_eq!(snapshot_after_restart.max_frame, 0);
+        assert_eq!(snapshot_after_restart.nbackfills, 0);
+        assert!(
+            !authority.validate_backfill_proof(
+                snapshot_before_restart,
+                db_size_before,
+                db_crc_before
+            ),
+            "RESTART must clear the proof for the old WAL generation"
+        );
+
+        bulk_inserts(&conn, 6, 2);
+        let replacement = run_checkpoint_until_done(
+            &pager,
+            CheckpointMode::Passive {
+                upper_bound_inclusive: Some(1),
+            },
+        );
+        assert!(
+            replacement.wal_total_backfilled > 0 && !replacement.everything_backfilled(),
+            "replacement setup must create a new partial checkpoint after RESTART"
+        );
+
+        let snapshot_after_replacement = authority.snapshot();
+        let (db_size_after, db_crc_after) =
+            super::read_database_identity_from_file_path(&db.io, wal_path_str)
+                .unwrap()
+                .unwrap();
+        assert!(
+            authority.validate_backfill_proof(
+                snapshot_after_replacement,
+                db_size_after,
+                db_crc_after
+            ),
+            "partial checkpoint after RESTART must install a replacement proof for the new generation"
+        );
+        assert_ne!(
+            snapshot_after_replacement.checkpoint_seq, snapshot_before_restart.checkpoint_seq,
+            "replacement proof must belong to the restarted WAL generation"
+        );
+    }
+
+    #[cfg(all(unix, target_pointer_width = "64"))]
+    #[test]
+    fn test_truncate_checkpoint_clears_backfill_proof_and_later_replaces_it() {
+        let (db, path) = get_database();
+        let wal_path = path.join("test.db-wal");
+        let wal_path_str = wal_path.to_str().unwrap();
+        let conn = db.connect().unwrap();
+        conn.wal_auto_checkpoint_disable();
+        conn.execute("create table test(id integer primary key, value text)")
+            .unwrap();
+        bulk_inserts(&conn, 8, 2);
+
+        let pager = conn.pager.load();
+        let partial = run_checkpoint_until_done(
+            &pager,
+            CheckpointMode::Passive {
+                upper_bound_inclusive: Some(1),
+            },
+        );
+        assert!(
+            partial.wal_total_backfilled > 0 && !partial.everything_backfilled(),
+            "setup must create a partial checkpoint with a positive durable backfill proof"
+        );
+
+        let authority = db.shared_wal_coordination().unwrap().unwrap();
+        let snapshot_before_truncate = authority.snapshot();
+        let (db_size_before, db_crc_before) =
+            super::read_database_identity_from_file_path(&db.io, wal_path_str)
+                .unwrap()
+                .unwrap();
+        assert!(
+            authority.validate_backfill_proof(
+                snapshot_before_truncate,
+                db_size_before,
+                db_crc_before
+            ),
+            "setup must install a valid proof before TRUNCATE"
+        );
+
+        let truncate = run_checkpoint_until_done(
+            &pager,
+            CheckpointMode::Truncate {
+                upper_bound_inclusive: None,
+            },
+        );
+        assert!(
+            truncate.everything_backfilled(),
+            "TRUNCATE should fully backfill before truncating the WAL"
+        );
+
+        let snapshot_after_truncate = authority.snapshot();
+        assert_eq!(snapshot_after_truncate.max_frame, 0);
+        assert_eq!(snapshot_after_truncate.nbackfills, 0);
+        assert!(
+            !authority.validate_backfill_proof(
+                snapshot_before_truncate,
+                db_size_before,
+                db_crc_before
+            ),
+            "TRUNCATE must clear the proof for the truncated WAL generation"
+        );
+        assert_eq!(
+            std::fs::metadata(&wal_path).unwrap().len(),
+            0,
+            "TRUNCATE must leave the WAL file empty before the new generation begins"
+        );
+
+        bulk_inserts(&conn, 6, 2);
+        let replacement = run_checkpoint_until_done(
+            &pager,
+            CheckpointMode::Passive {
+                upper_bound_inclusive: Some(1),
+            },
+        );
+        assert!(
+            replacement.wal_total_backfilled > 0 && !replacement.everything_backfilled(),
+            "replacement setup must create a new partial checkpoint after TRUNCATE"
+        );
+
+        let snapshot_after_replacement = authority.snapshot();
+        let (db_size_after, db_crc_after) =
+            super::read_database_identity_from_file_path(&db.io, wal_path_str)
+                .unwrap()
+                .unwrap();
+        assert!(
+            authority.validate_backfill_proof(
+                snapshot_after_replacement,
+                db_size_after,
+                db_crc_after
+            ),
+            "partial checkpoint after TRUNCATE must install a replacement proof for the new generation"
+        );
+        assert_ne!(
+            snapshot_after_replacement.checkpoint_seq, snapshot_before_truncate.checkpoint_seq,
+            "replacement proof must belong to the truncated WAL generation"
+        );
+    }
+
+    #[cfg(all(unix, target_pointer_width = "64"))]
+    #[test]
+    fn test_classify_authority_snapshot_marks_truncated_wal_for_rebuild() {
+        let dir = tempfile::tempdir().unwrap();
+        let wal_path = dir.path().join("test-truncated.db-wal");
+        let io: Arc<dyn IO> = Arc::new(PlatformIO::new().unwrap());
+        let snapshot = write_test_wal_with_single_commit_frame(&io, &wal_path);
+
+        let wal_len = std::fs::metadata(&wal_path).unwrap().len();
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&wal_path)
+            .unwrap()
+            .set_len(wal_len - 1)
+            .unwrap();
+
+        assert_eq!(
+            classify_authority_snapshot_against_wal(
+                &io,
+                &io.open_file(wal_path.to_str().unwrap(), crate::OpenFlags::Create, false)
+                    .unwrap(),
+                snapshot,
+            )
+            .unwrap(),
+            AuthoritySnapshotValidation::RebuildFromDisk(
+                AuthoritySnapshotRebuildReason::WalLengthMismatch
+            )
+        );
+    }
+
+    #[cfg(all(unix, target_pointer_width = "64"))]
+    #[test]
+    fn test_classify_authority_snapshot_marks_corrupt_header_for_rebuild() {
+        let dir = tempfile::tempdir().unwrap();
+        let wal_path = dir.path().join("test-corrupt-header.db-wal");
+        let io: Arc<dyn IO> = Arc::new(PlatformIO::new().unwrap());
+        std::fs::write(&wal_path, [0u8; WAL_HEADER_SIZE]).unwrap();
+
+        let snapshot = SharedWalCoordinationHeader {
+            max_frame: 0,
+            nbackfills: 0,
+            transaction_count: 9,
+            visibility_generation: 1,
+            checkpoint_seq: 5,
+            checkpoint_epoch: 7,
+            page_size: 4096,
+            salt_1: 17,
+            salt_2: 23,
+            checksum_1: 31,
+            checksum_2: 37,
+            reader_slot_count: 64,
+        };
+
+        assert_eq!(
+            classify_authority_snapshot_against_wal(
+                &io,
+                &io.open_file(wal_path.to_str().unwrap(), crate::OpenFlags::Create, false)
+                    .unwrap(),
+                snapshot,
+            )
+            .unwrap(),
+            AuthoritySnapshotValidation::RebuildFromDisk(
+                AuthoritySnapshotRebuildReason::WalHeaderUnreadable
+            )
+        );
+    }
+
+    #[cfg(all(unix, target_pointer_width = "64"))]
+    #[test]
+    fn test_open_shared_from_authority_keeps_zero_length_wal_uninitialized_after_exclusive_reopen()
+    {
+        let dir = tempfile::tempdir().unwrap();
+        let wal_path = dir.path().join("test-empty.db-wal");
+        let shm_path = dir.path().join("test-empty.db-tshm");
+        let io: Arc<dyn IO> = Arc::new(PlatformIO::new().unwrap());
+
+        io.open_file(wal_path.to_str().unwrap(), crate::OpenFlags::Create, false)
+            .unwrap();
+        {
+            let authority =
+                Arc::new(MappedSharedWalCoordination::create_or_open(&io, &shm_path, 64).unwrap());
+            authority.install_snapshot(SharedWalCoordinationHeader {
+                max_frame: 0,
+                nbackfills: 0,
+                transaction_count: 9,
+                visibility_generation: 1,
+                checkpoint_seq: 5,
+                checkpoint_epoch: 7,
+                page_size: 4096,
+                salt_1: 17,
+                salt_2: 23,
+                checksum_1: 31,
+                checksum_2: 37,
+                reader_slot_count: 64,
+            });
+        }
+        let reopened_authority =
+            Arc::new(MappedSharedWalCoordination::create_or_open(&io, &shm_path, 64).unwrap());
+        assert_eq!(
+            reopened_authority.open_mode(),
+            SharedWalCoordinationOpenMode::Exclusive
+        );
+
+        let shared = WalFileShared::open_shared_from_authority_if_exists(
+            &io,
+            wal_path.to_str().unwrap(),
+            crate::OpenFlags::Create,
+            &reopened_authority,
+            &open_test_db_file_for_wal(&io, &wal_path),
+        )
+        .unwrap();
+
+        let shared = shared.read();
+        assert_eq!(shared.metadata.max_frame.load(Ordering::Acquire), 0);
+        assert_eq!(shared.metadata.last_checksum, (31, 37));
+        assert!(!shared.metadata.initialized.load(Ordering::Acquire));
+        assert!(!shared
+            .metadata
+            .loaded_from_disk_scan
+            .load(Ordering::Acquire));
+    }
+
+    #[cfg(all(unix, target_pointer_width = "64"))]
+    #[test]
+    fn test_shm_coordination_secondary_disk_scan_does_not_reseed_authority_while_writer_active() {
+        let dir = tempfile::tempdir().unwrap();
+        let wal_path = dir.path().join("test.db-wal");
+        let shm_path = dir.path().join("test.db-tshm");
+        let io: Arc<dyn IO> = Arc::new(PlatformIO::new().unwrap());
+
+        let file_a = io
+            .open_file(wal_path.to_str().unwrap(), crate::OpenFlags::Create, false)
+            .unwrap();
+        let shared_a = WalFileShared::new_shared(file_a).unwrap();
+        let authoritative = WalSnapshot {
+            max_frame: 5,
+            nbackfills: 0,
+            last_checksum: (31, 37),
+            checkpoint_seq: 5,
+            transaction_count: 9,
+        };
+        set_shared_snapshot(&shared_a, authoritative);
+        {
+            let shared = shared_a.write();
+            let mut header = shared.metadata.wal_header.lock();
+            header.page_size = 4096;
+            header.salt_1 = 17;
+            header.salt_2 = 23;
+            header.checksum_1 = authoritative.last_checksum.0;
+            header.checksum_2 = authoritative.last_checksum.1;
+        }
+        let (authority, coordination_a) = make_test_shm_coordination(&shared_a, &shm_path);
+        coordination_a.cache_frame(7, 2);
+        coordination_a.cache_frame(7, 5);
+        assert!(authority.try_acquire_writer(authority.owner_record()));
+
+        let file_b = io
+            .open_file(wal_path.to_str().unwrap(), crate::OpenFlags::Create, false)
+            .unwrap();
+        let shared_b = WalFileShared::new_shared(file_b).unwrap();
+        let stale = WalSnapshot {
+            max_frame: 2,
+            nbackfills: 0,
+            last_checksum: (11, 13),
+            checkpoint_seq: 4,
+            transaction_count: 3,
+        };
+        set_shared_snapshot(&shared_b, stale);
+        {
+            let shared = shared_b.write();
+            shared
+                .metadata
+                .loaded_from_disk_scan
+                .store(true, Ordering::Release);
+            let mut header = shared.metadata.wal_header.lock();
+            header.page_size = 4096;
+            header.salt_1 = 17;
+            header.salt_2 = 23;
+            header.checksum_1 = stale.last_checksum.0;
+            header.checksum_2 = stale.last_checksum.1;
+            shared.runtime.frame_cache.lock().insert(7, vec![2]);
+        }
+
+        let (_authority_b, coordination_b) = make_test_shm_coordination(&shared_b, &shm_path);
+
+        assert_eq!(coordination_b.load_snapshot(), authoritative);
+        assert_eq!(authority.snapshot().max_frame, authoritative.max_frame);
+        assert_eq!(
+            authority.snapshot().transaction_count,
+            authoritative.transaction_count
+        );
+        assert_eq!(coordination_b.find_frame(7, 0, 5, None), Some(5));
+        authority.release_writer(authority.owner_record());
+    }
+
+    #[cfg(all(unix, target_pointer_width = "64"))]
+    #[test]
+    fn test_shm_coordination_disk_scan_matching_authority_keeps_frame_index() {
+        let dir = tempfile::tempdir().unwrap();
+        let wal_path = dir.path().join("test.db-wal");
+        let shm_path = dir.path().join("test.db-tshm");
+        let io: Arc<dyn IO> = Arc::new(PlatformIO::new().unwrap());
+
+        let file_a = io
+            .open_file(wal_path.to_str().unwrap(), crate::OpenFlags::Create, false)
+            .unwrap();
+        let shared_a = WalFileShared::new_shared(file_a).unwrap();
+        let authoritative = WalSnapshot {
+            max_frame: 5,
+            nbackfills: 2,
+            last_checksum: (31, 37),
+            checkpoint_seq: 5,
+            transaction_count: 9,
+        };
+        set_shared_snapshot(&shared_a, authoritative);
+        {
+            let shared = shared_a.write();
+            let mut header = shared.metadata.wal_header.lock();
+            header.page_size = 4096;
+            header.salt_1 = 17;
+            header.salt_2 = 23;
+            header.checksum_1 = authoritative.last_checksum.0;
+            header.checksum_2 = authoritative.last_checksum.1;
+        }
+        let (authority, coordination_a) = make_test_shm_coordination(&shared_a, &shm_path);
+        coordination_a.cache_frame(7, 2);
+        coordination_a.cache_frame(9, 5);
+
+        let file_b = io
+            .open_file(wal_path.to_str().unwrap(), crate::OpenFlags::Create, false)
+            .unwrap();
+        let shared_b = WalFileShared::new_shared(file_b).unwrap();
+        set_shared_snapshot(&shared_b, authoritative);
+        {
+            let shared = shared_b.write();
+            shared
+                .metadata
+                .loaded_from_disk_scan
+                .store(true, Ordering::Release);
+            let mut header = shared.metadata.wal_header.lock();
+            header.page_size = 4096;
+            header.salt_1 = 17;
+            header.salt_2 = 23;
+            header.checksum_1 = authoritative.last_checksum.0;
+            header.checksum_2 = authoritative.last_checksum.1;
+            let mut frame_cache = shared.runtime.frame_cache.lock();
+            frame_cache.insert(7, vec![2]);
+            frame_cache.insert(9, vec![5]);
+        }
+
+        let (_authority_b, coordination_b) = make_test_shm_coordination(&shared_b, &shm_path);
+
+        let reopened = coordination_b.load_snapshot();
+        assert_eq!(reopened.max_frame, authoritative.max_frame);
+        assert_eq!(reopened.last_checksum, authoritative.last_checksum);
+        assert_eq!(reopened.checkpoint_seq, authoritative.checkpoint_seq);
+        assert_eq!(reopened.transaction_count, authoritative.transaction_count);
+        assert_eq!(
+            reopened.nbackfills, 0,
+            "disk-scan reconciliation must preserve the frame index without reviving positive nbackfills"
+        );
+        assert_eq!(authority.find_frame(7, 0, 5, None), Some(2));
+        assert_eq!(authority.find_frame(9, 0, 5, None), Some(5));
+        assert_eq!(
+            authority.iter_latest_frames(0, authoritative.max_frame),
+            vec![(7, 2), (9, 5)]
+        );
+    }
+
+    #[cfg(all(unix, target_pointer_width = "64"))]
+    #[test]
+    fn test_shm_coordination_disk_scan_matching_snapshot_rebuilds_stale_frame_index() {
+        let dir = tempfile::tempdir().unwrap();
+        let wal_path = dir.path().join("test.db-wal");
+        let shm_path = dir.path().join("test.db-tshm");
+        let io: Arc<dyn IO> = Arc::new(PlatformIO::new().unwrap());
+
+        let file_a = io
+            .open_file(wal_path.to_str().unwrap(), crate::OpenFlags::Create, false)
+            .unwrap();
+        let shared_a = WalFileShared::new_shared(file_a).unwrap();
+        let authoritative = WalSnapshot {
+            max_frame: 5,
+            nbackfills: 0,
+            last_checksum: (31, 37),
+            checkpoint_seq: 5,
+            transaction_count: 9,
+        };
+        set_shared_snapshot(&shared_a, authoritative);
+        {
+            let shared = shared_a.write();
+            let mut header = shared.metadata.wal_header.lock();
+            header.page_size = 4096;
+            header.salt_1 = 17;
+            header.salt_2 = 23;
+            header.checksum_1 = authoritative.last_checksum.0;
+            header.checksum_2 = authoritative.last_checksum.1;
+        }
+        {
+            let (_authority, coordination_a) = make_test_shm_coordination(&shared_a, &shm_path);
+            coordination_a.cache_frame(7, 2);
+            coordination_a.cache_frame(9, 4);
+        }
+
+        let file_b = io
+            .open_file(wal_path.to_str().unwrap(), crate::OpenFlags::Create, false)
+            .unwrap();
+        let shared_b = WalFileShared::new_shared(file_b).unwrap();
+        set_shared_snapshot(&shared_b, authoritative);
+        {
+            let shared = shared_b.write();
+            shared
+                .metadata
+                .loaded_from_disk_scan
+                .store(true, Ordering::Release);
+            let mut header = shared.metadata.wal_header.lock();
+            header.page_size = 4096;
+            header.salt_1 = 17;
+            header.salt_2 = 23;
+            header.checksum_1 = authoritative.last_checksum.0;
+            header.checksum_2 = authoritative.last_checksum.1;
+            shared.runtime.frame_cache.lock().insert(7, vec![2]);
+            shared.runtime.frame_cache.lock().insert(9, vec![5]);
+        }
+
+        let (authority, coordination_b) = make_test_shm_coordination(&shared_b, &shm_path);
+        assert_eq!(
+            authority.open_mode(),
+            SharedWalCoordinationOpenMode::Exclusive
+        );
+
+        let reopened = coordination_b.load_snapshot();
+        assert_eq!(reopened.max_frame, authoritative.max_frame);
+        assert_eq!(reopened.last_checksum, authoritative.last_checksum);
+        assert_eq!(reopened.checkpoint_seq, authoritative.checkpoint_seq);
+        assert_eq!(reopened.transaction_count, authoritative.transaction_count);
+        assert_eq!(authority.find_frame(7, 0, 5, None), Some(2));
+        assert_eq!(
+            authority.find_frame(9, 0, 5, None),
+            Some(5),
+            "matching snapshot metadata must not preserve a stale shared frame index across restart recovery"
+        );
+        assert_eq!(
+            authority.iter_latest_frames(0, authoritative.max_frame),
+            vec![(7, 2), (9, 5)]
+        );
+    }
+
+    #[cfg(all(unix, target_pointer_width = "64"))]
+    #[test]
+    fn test_shm_coordination_empty_disk_scan_keeps_zero_frame_authority_metadata() {
+        let dir = tempfile::tempdir().unwrap();
+        let wal_path = dir.path().join("test.db-wal");
+        let shm_path = dir.path().join("test.db-tshm");
+        let io: Arc<dyn IO> = Arc::new(PlatformIO::new().unwrap());
+
+        let authority =
+            Arc::new(MappedSharedWalCoordination::create_or_open(&io, &shm_path, 64).unwrap());
+        let authoritative = SharedWalCoordinationHeader {
+            max_frame: 0,
+            nbackfills: 0,
+            transaction_count: 9,
+            visibility_generation: 3,
+            checkpoint_seq: 5,
+            checkpoint_epoch: 7,
+            page_size: 4096,
+            salt_1: 17,
+            salt_2: 23,
+            checksum_1: 31,
+            checksum_2: 37,
+            reader_slot_count: 64,
+        };
+        authority.install_snapshot(authoritative);
+
+        let file = io
+            .open_file(wal_path.to_str().unwrap(), crate::OpenFlags::Create, false)
+            .unwrap();
+        let shared = WalFileShared::new_shared(file).unwrap();
+        {
+            let shared = shared.write();
+            shared
+                .metadata
+                .loaded_from_disk_scan
+                .store(true, Ordering::Release);
+        }
+
+        let coordination = ShmWalCoordination::new(shared, authority.clone());
+        let snapshot = authority.snapshot();
+        assert_eq!(snapshot, authoritative);
+        let header = coordination.wal_header();
+        assert_eq!(header.page_size, 4096);
+        assert_eq!(header.checkpoint_seq, authoritative.checkpoint_seq);
+        assert_eq!(header.salt_1, authoritative.salt_1);
+        assert_eq!(header.salt_2, authoritative.salt_2);
+    }
+
+    #[cfg(all(unix, target_pointer_width = "64"))]
+    #[test]
+    fn test_shm_coordination_empty_disk_scan_does_not_clobber_positive_authority() {
+        let dir = tempfile::tempdir().unwrap();
+        let wal_path = dir.path().join("test.db-wal");
+        let shm_path = dir.path().join("test.db-tshm");
+        let io: Arc<dyn IO> = Arc::new(PlatformIO::new().unwrap());
+
+        let file_a = io
+            .open_file(wal_path.to_str().unwrap(), crate::OpenFlags::Create, false)
+            .unwrap();
+        let shared_a = WalFileShared::new_shared(file_a).unwrap();
+        let authoritative = WalSnapshot {
+            max_frame: 5,
+            nbackfills: 0,
+            last_checksum: (31, 37),
+            checkpoint_seq: 5,
+            transaction_count: 9,
+        };
+        set_shared_snapshot(&shared_a, authoritative);
+        {
+            let shared = shared_a.write();
+            let mut header = shared.metadata.wal_header.lock();
+            header.page_size = 4096;
+            header.salt_1 = 17;
+            header.salt_2 = 23;
+            header.checksum_1 = authoritative.last_checksum.0;
+            header.checksum_2 = authoritative.last_checksum.1;
+        }
+        let (authority, coordination_a) = make_test_shm_coordination(&shared_a, &shm_path);
+        coordination_a.cache_frame(7, 2);
+        coordination_a.cache_frame(9, 5);
+
+        let file_b = io
+            .open_file(wal_path.to_str().unwrap(), crate::OpenFlags::Create, false)
+            .unwrap();
+        let shared_b = WalFileShared::new_shared(file_b).unwrap();
+        {
+            let shared = shared_b.write();
+            shared
+                .metadata
+                .loaded_from_disk_scan
+                .store(true, Ordering::Release);
+            let mut header = shared.metadata.wal_header.lock();
+            header.page_size = 4096;
+            header.checkpoint_seq = authoritative.checkpoint_seq;
+            header.salt_1 = 17;
+            header.salt_2 = 23;
+            header.checksum_1 = 11;
+            header.checksum_2 = 13;
+        }
+
+        let (_authority_b, coordination_b) = make_test_shm_coordination(&shared_b, &shm_path);
+        let reopened = coordination_b.load_snapshot();
+        assert_eq!(reopened.max_frame, authoritative.max_frame);
+        assert_eq!(reopened.checkpoint_seq, authoritative.checkpoint_seq);
+        assert_eq!(reopened.transaction_count, authoritative.transaction_count);
+        assert_eq!(
+            authority.find_frame(7, 0, authoritative.max_frame, None),
+            Some(2)
+        );
+        assert_eq!(
+            authority.find_frame(9, 0, authoritative.max_frame, None),
+            Some(5)
+        );
+    }
+
+    #[cfg(all(unix, target_pointer_width = "64"))]
+    #[test]
+    fn test_shm_zero_frame_authority_invalidates_stale_local_initialized_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let wal_path = dir.path().join("test.db-wal");
+        let shm_path = dir.path().join("test.db-tshm");
+        let io: Arc<dyn IO> = Arc::new(PlatformIO::new().unwrap());
+
+        let authority =
+            Arc::new(MappedSharedWalCoordination::create_or_open(&io, &shm_path, 64).unwrap());
+        let authoritative = SharedWalCoordinationHeader {
+            max_frame: 0,
+            nbackfills: 0,
+            transaction_count: 9,
+            visibility_generation: 3,
+            checkpoint_seq: 5,
+            checkpoint_epoch: 7,
+            page_size: 4096,
+            salt_1: 17,
+            salt_2: 23,
+            checksum_1: 31,
+            checksum_2: 37,
+            reader_slot_count: 64,
+        };
+        authority.install_snapshot(authoritative);
+
+        let file = io
+            .open_file(wal_path.to_str().unwrap(), crate::OpenFlags::Create, false)
+            .unwrap();
+        let shared = WalFileShared::new_shared(file).unwrap();
+        {
+            let mut shared = shared.write();
+            shared.metadata.max_frame.store(11, Ordering::Release);
+            shared.metadata.nbackfills.store(11, Ordering::Release);
+            shared.metadata.last_checksum = (11, 13);
+            shared
+                .metadata
+                .transaction_count
+                .store(3, Ordering::Release);
+            shared.metadata.initialized.store(true, Ordering::Release);
+            let mut header = shared.metadata.wal_header.lock();
+            header.checkpoint_seq = 2;
+            header.page_size = 4096;
+            header.salt_1 = 7;
+            header.salt_2 = 13;
+            header.checksum_1 = 11;
+            header.checksum_2 = 13;
+            shared.runtime.epoch.store(1, Ordering::Release);
+        }
+
+        let coordination = ShmWalCoordination::new(shared.clone(), authority);
+        assert!(
+            !coordination.wal_is_initialized(),
+            "a stale local initialized bit must not suppress the first header rewrite after RESTART/TRUNCATE"
+        );
+        {
+            let shared = shared.read();
+            assert!(
+                !shared.metadata.initialized.load(Ordering::Acquire),
+                "stale local initialized state must be cleared"
+            );
+            let header = shared.metadata.wal_header.lock();
+            assert_eq!(header.checkpoint_seq, authoritative.checkpoint_seq);
+            assert_eq!(header.page_size, authoritative.page_size);
+            assert_eq!(header.salt_1, authoritative.salt_1);
+            assert_eq!(header.salt_2, authoritative.salt_2);
+            assert_eq!(header.checksum_1, authoritative.checksum_1);
+            assert_eq!(header.checksum_2, authoritative.checksum_2);
+        }
+
+        let prepared = coordination
+            .prepare_wal_header(io.as_ref(), PageSize::new(4096).unwrap())
+            .expect("zero-frame authority should force a header rewrite");
+        assert_eq!(prepared.checkpoint_seq, authoritative.checkpoint_seq);
+        coordination.mark_initialized();
+        assert!(
+            coordination.wal_is_initialized(),
+            "once the current-generation header is durably rewritten, wal_is_initialized should succeed"
+        );
+    }
+
+    #[cfg(all(unix, target_pointer_width = "64"))]
+    #[test]
+    fn test_shm_prepare_wal_header_seeds_uninitialized_authority_from_prepared_header() {
+        let dir = tempfile::tempdir().unwrap();
+        let wal_path = dir.path().join("test.db-wal");
+        let shm_path = dir.path().join("test.db-tshm");
+        let io: Arc<dyn IO> = Arc::new(PlatformIO::new().unwrap());
+
+        let authority =
+            Arc::new(MappedSharedWalCoordination::create_or_open(&io, &shm_path, 64).unwrap());
+        let file = io
+            .open_file(wal_path.to_str().unwrap(), crate::OpenFlags::Create, false)
+            .unwrap();
+        let shared = WalFileShared::new_shared(file).unwrap();
+        let coordination = ShmWalCoordination::new(shared, authority.clone());
+
+        let prepared = coordination
+            .prepare_wal_header(io.as_ref(), PageSize::new(4096).unwrap())
+            .expect("fresh authority should accept the first prepared header");
+
+        let snapshot = authority.snapshot();
+        assert_eq!(
+            snapshot.page_size, prepared.page_size,
+            "authority must publish the prepared page size for later writers and checkpointers"
+        );
+        assert_eq!(
+            snapshot.checkpoint_seq, prepared.checkpoint_seq,
+            "authority must publish the prepared checkpoint generation"
+        );
+        assert_eq!(snapshot.salt_1, prepared.salt_1);
+        assert_eq!(snapshot.salt_2, prepared.salt_2);
+    }
+
+    #[cfg(all(unix, target_pointer_width = "64"))]
+    #[test]
+    fn test_shm_prepare_wal_header_does_not_clobber_zero_frame_authority_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let wal_path = dir.path().join("test.db-wal");
+        let shm_path = dir.path().join("test.db-tshm");
+        let io: Arc<dyn IO> = Arc::new(PlatformIO::new().unwrap());
+
+        let file_a = io
+            .open_file(wal_path.to_str().unwrap(), crate::OpenFlags::Create, false)
+            .unwrap();
+        let shared_a = WalFileShared::new_shared(file_a).unwrap();
+        let authoritative = SharedWalCoordinationHeader {
+            max_frame: 0,
+            nbackfills: 0,
+            transaction_count: 9,
+            visibility_generation: 3,
+            checkpoint_seq: 5,
+            checkpoint_epoch: 7,
+            page_size: 4096,
+            salt_1: 17,
+            salt_2: 23,
+            checksum_1: 31,
+            checksum_2: 37,
+            reader_slot_count: 64,
+        };
+        {
+            let mut shared = shared_a.write();
+            shared.metadata.max_frame.store(0, Ordering::Release);
+            shared.metadata.nbackfills.store(0, Ordering::Release);
+            shared
+                .metadata
+                .transaction_count
+                .store(authoritative.transaction_count, Ordering::Release);
+            shared.metadata.last_checksum = (31, 37);
+            let mut header = shared.metadata.wal_header.lock();
+            header.checkpoint_seq = authoritative.checkpoint_seq;
+            header.page_size = authoritative.page_size;
+            header.salt_1 = authoritative.salt_1;
+            header.salt_2 = authoritative.salt_2;
+            header.checksum_1 = authoritative.checksum_1;
+            header.checksum_2 = authoritative.checksum_2;
+            shared
+                .runtime
+                .epoch
+                .store(authoritative.checkpoint_epoch, Ordering::Release);
+            shared.metadata.initialized.store(false, Ordering::Release);
+        }
+        let authority =
+            Arc::new(MappedSharedWalCoordination::create_or_open(&io, &shm_path, 64).unwrap());
+        authority.install_snapshot(authoritative);
+
+        let file_b = io
+            .open_file(wal_path.to_str().unwrap(), crate::OpenFlags::Create, false)
+            .unwrap();
+        let shared_b = WalFileShared::new_shared(file_b).unwrap();
+        let coordination_b = ShmWalCoordination::new(shared_b.clone(), authority.clone());
+        // Simulate a long-lived process whose process-wide shared WAL metadata
+        // fell behind the authority after another process checkpointed and
+        // restarted the WAL back to frame 0.
+        {
+            let mut shared = shared_b.write();
+            shared.metadata.max_frame.store(0, Ordering::Release);
+            shared.metadata.nbackfills.store(0, Ordering::Release);
+            shared.metadata.last_checksum = (11, 13);
+            shared
+                .metadata
+                .transaction_count
+                .store(3, Ordering::Release);
+            let mut header = shared.metadata.wal_header.lock();
+            header.checkpoint_seq = 2;
+            header.page_size = 4096;
+            header.salt_1 = 17;
+            header.salt_2 = 23;
+            header.checksum_1 = 11;
+            header.checksum_2 = 13;
+            shared.runtime.epoch.store(1, Ordering::Release);
+            shared.metadata.initialized.store(false, Ordering::Release);
+        }
+
+        let page_size = PageSize::new(4096).unwrap();
+        let prepared = coordination_b
+            .prepare_wal_header(io.as_ref(), page_size)
+            .expect("prepare_wal_header should produce a header");
+
+        let snapshot = authority.snapshot();
+        assert_eq!(
+            snapshot.transaction_count, authoritative.transaction_count,
+            "first writer after restart must not downgrade authority transaction_count"
+        );
+        assert_eq!(
+            snapshot.checkpoint_seq, authoritative.checkpoint_seq,
+            "first writer after restart must not downgrade checkpoint metadata"
+        );
+        assert_eq!(
+            prepared.checkpoint_seq, authoritative.checkpoint_seq,
+            "header written after restart must use authority checkpoint metadata"
+        );
+        assert_eq!(prepared.page_size, authoritative.page_size);
+        assert_eq!(prepared.salt_1, authoritative.salt_1);
+        assert_eq!(prepared.salt_2, authoritative.salt_2);
+        let refreshed = authority.snapshot();
+        assert_eq!(
+            refreshed.checksum_1, prepared.checksum_1,
+            "preparing the first zero-frame header must refresh the authoritative checksum seed"
+        );
+        assert_eq!(
+            refreshed.checksum_2, prepared.checksum_2,
+            "preparing the first zero-frame header must refresh the authoritative checksum seed"
+        );
+    }
+
+    #[test]
+    fn test_in_process_coordination_lock_primitives() {
+        let (shared, _wal) = make_test_wal();
+        let coordination = make_test_coordination(&shared);
+
+        assert!(coordination.try_checkpoint_lock());
+        coordination.unlock_checkpoint_lock();
+
+        assert!(coordination.try_write_lock());
+        assert!(!coordination.try_write_lock());
+        coordination.unlock_write_lock();
+
+        assert!(coordination.try_read_mark_exclusive(1));
+        coordination.set_read_mark_value_exclusive(1, 42);
+        assert_eq!(coordination.read_mark_value(1), 42);
+        coordination.unlock_read_mark(1);
+
+        assert!(coordination.try_read_mark_shared(1));
+        assert!(coordination.try_upgrade_read_mark(1));
+        coordination.downgrade_read_mark(1);
+        coordination.unlock_read_mark(1);
+
+        // The coordination backend should still observe the shared state underneath.
+        assert_eq!(shared.read().runtime.read_locks[1].get_value(), 42);
+    }
+
+    #[test]
+    fn test_in_process_coordination_prepare_truncate_marks_wal_uninitialized() {
+        let io: Arc<dyn IO> = Arc::new(PlatformIO::new().unwrap());
+        let dir = tempfile::tempdir().unwrap();
+        let wal_path = dir.path().join("test.wal");
+        let file = io
+            .open_file(wal_path.to_str().unwrap(), crate::OpenFlags::Create, false)
+            .unwrap();
+        let shared = WalFileShared::new_shared(file).unwrap();
+        let coordination = make_test_coordination(&shared);
+
+        shared
+            .read()
+            .metadata
+            .initialized
+            .store(true, Ordering::Release);
+        let file = coordination.prepare_truncate().unwrap();
+
+        assert!(file.size().is_ok());
+        assert!(!shared.read().metadata.initialized.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn test_in_process_coordination_exposes_wal_io_state() {
+        let io: Arc<dyn IO> = Arc::new(PlatformIO::new().unwrap());
+        let dir = tempfile::tempdir().unwrap();
+        let wal_path = dir.path().join("test.wal");
+        let file = io
+            .open_file(wal_path.to_str().unwrap(), crate::OpenFlags::Create, false)
+            .unwrap();
+        let shared = WalFileShared::new_shared(file).unwrap();
+        let coordination = make_test_coordination(&shared);
+
+        assert!(!coordination.wal_is_initialized());
+        assert_eq!(coordination.wal_header().page_size, 0);
+        assert!(coordination.wal_file().unwrap().size().is_ok());
+
+        let header = coordination
+            .prepare_wal_header(io.as_ref(), PageSize::new(4096).unwrap())
+            .unwrap();
+        assert_eq!(header.page_size, 4096);
+        assert_eq!(
+            coordination.load_snapshot().last_checksum,
+            (header.checksum_1, header.checksum_2)
+        );
+        assert!(!coordination.wal_is_initialized());
+
+        coordination.mark_initialized();
+        assert!(coordination.wal_is_initialized());
+        assert!(coordination
+            .prepare_wal_header(io.as_ref(), PageSize::new(4096).unwrap())
+            .is_none());
     }
 
     #[test]
@@ -3248,8 +7518,8 @@ pub mod test {
         let (mx_before, backfill_before) = {
             let s = wal_shared.read();
             (
-                s.max_frame.load(Ordering::SeqCst),
-                s.nbackfills.load(Ordering::SeqCst),
+                s.metadata.max_frame.load(Ordering::SeqCst),
+                s.metadata.nbackfills.load(Ordering::SeqCst),
             )
         };
         assert!(mx_before > 0);
@@ -3287,8 +7557,8 @@ pub mod test {
         let (mx_after, backfill_after) = {
             let s = wal_shared.read();
             (
-                s.max_frame.load(Ordering::SeqCst),
-                s.nbackfills.load(Ordering::SeqCst),
+                s.metadata.max_frame.load(Ordering::SeqCst),
+                s.metadata.nbackfills.load(Ordering::SeqCst),
             )
         };
         assert_eq!(mx_after, 0, "mxFrame reset to 0 after RESTART");
@@ -3315,7 +7585,7 @@ pub mod test {
             .unwrap()
             .finish_append_frames_commit()
             .unwrap();
-        let new_max = wal_shared.read().max_frame.load(Ordering::SeqCst);
+        let new_max = wal_shared.read().metadata.max_frame.load(Ordering::SeqCst);
         assert_eq!(new_max, 1, "first append after RESTART starts at frame 1");
 
         std::fs::remove_dir_all(path).unwrap();
@@ -3364,7 +7634,12 @@ pub mod test {
                     upper_bound_inclusive: None,
                 },
             );
-            let maxf = db.shared_wal.read().max_frame.load(Ordering::SeqCst);
+            let maxf = db
+                .shared_wal
+                .read()
+                .metadata
+                .max_frame
+                .load(Ordering::SeqCst);
             (res, maxf)
         };
         assert_eq!(res1.wal_max_frame, max_before);
@@ -3485,7 +7760,9 @@ pub mod test {
         // Verify read marks after restart
         let read_marks_after: Vec<_> = {
             let s = wal_shared.read();
-            (0..5).map(|i| s.read_locks[i].get_value()).collect()
+            (0..5)
+                .map(|i| s.runtime.read_locks[i].get_value())
+                .collect()
         };
 
         assert_eq!(read_marks_after[0], 0, "Slot 0 should remain 0");
@@ -3571,7 +7848,7 @@ pub mod test {
         bulk_inserts(&conn, 10, 5);
 
         // get max frame before checkpoint
-        let max_frame_before = wal_shared.read().max_frame.load(Ordering::SeqCst);
+        let max_frame_before = wal_shared.read().metadata.max_frame.load(Ordering::SeqCst);
 
         {
             let pager = conn.pager.load();
@@ -3584,7 +7861,7 @@ pub mod test {
         }
 
         // check that read mark 1 (default reader) was updated to max_frame
-        let read_mark_1 = wal_shared.read().read_locks[1].get_value();
+        let read_mark_1 = wal_shared.read().runtime.read_locks[1].get_value();
 
         assert_eq!(
             read_mark_1 as u64, max_frame_before,
@@ -4016,7 +8293,7 @@ pub mod test {
 
         // Snapshot the current mxFrame before running FULL
         let wal_shared = db.shared_wal.clone();
-        let mx_before = wal_shared.read().max_frame.load(Ordering::SeqCst);
+        let mx_before = wal_shared.read().metadata.max_frame.load(Ordering::SeqCst);
         assert!(mx_before > 0, "expected frames in WAL before FULL");
 
         // Run FULL checkpoint - must backfill *all* frames up to mx_before
@@ -4068,7 +8345,12 @@ pub mod test {
         for c in completions {
             db.io.wait_for_completion(c).unwrap();
         }
-        let mx_now = db.shared_wal.read().max_frame.load(Ordering::SeqCst);
+        let mx_now = db
+            .shared_wal
+            .read()
+            .metadata
+            .max_frame
+            .load(Ordering::SeqCst);
         assert!(mx_now > r_snapshot);
 
         // FULL must return Busy while a reader is stuck behind
@@ -4088,6 +8370,15 @@ pub mod test {
                 }
             }
         }
+        assert_eq!(
+            db.shared_wal
+                .read()
+                .metadata
+                .nbackfills
+                .load(Ordering::SeqCst),
+            0,
+            "a FULL checkpoint that returns Busy must not publish positive nbackfills before DB sync"
+        );
 
         // Release the reader, now full mode should succeed and backfill everything
         {
@@ -4101,7 +8392,10 @@ pub mod test {
             run_checkpoint_until_done(&pager, CheckpointMode::Full)
         };
 
-        assert_eq!(result.wal_checkpoint_backfilled, mx_now - r_snapshot);
+        assert_eq!(
+            result.wal_checkpoint_backfilled, mx_now,
+            "the successful FULL reruns from the last durable backfill point because the Busy attempt did not publish progress"
+        );
         assert!(result.everything_backfilled());
     }
 

@@ -160,6 +160,8 @@ pub struct StatementProfile {
     // DDL weights - Tables
     /// CREATE TABLE weight and optional generation profile.
     pub create_table: WeightedProfile<CreateTableProfile>,
+    /// CREATE TABLE AS SELECT weight (no extra profile needed).
+    pub create_table_as_weight: u32,
     /// DROP TABLE weight (no extra profile needed).
     pub drop_table_weight: u32,
     /// ALTER TABLE weight and optional operation-level weights.
@@ -211,6 +213,7 @@ impl Default for StatementProfile {
 
             // DDL - less frequent
             create_table: WeightedProfile::new(2),
+            create_table_as_weight: 1,
             drop_table_weight: 1,
             alter_table: WeightedProfile::new(1),
             create_index: WeightedProfile::new(2),
@@ -247,6 +250,7 @@ impl StatementProfile {
             update: WeightedProfile::new(0),
             delete: WeightedProfile::new(0),
             create_table: WeightedProfile::new(0),
+            create_table_as_weight: 0,
             drop_table_weight: 0,
             alter_table: WeightedProfile::new(0),
             create_index: WeightedProfile::new(0),
@@ -403,6 +407,12 @@ impl StatementProfile {
         self
     }
 
+    /// Builder method to set CREATE TABLE AS SELECT weight.
+    pub fn with_create_table_as(mut self, weight: u32) -> Self {
+        self.create_table_as_weight = weight;
+        self
+    }
+
     /// Builder method to set DROP TABLE weight.
     pub fn with_drop_table(mut self, weight: u32) -> Self {
         self.drop_table_weight = weight;
@@ -552,6 +562,7 @@ impl StatementProfile {
     /// Returns the total DDL weight.
     pub fn ddl_weight(&self) -> u32 {
         self.create_table.weight
+            + self.create_table_as_weight
             + self.drop_table_weight
             + self.alter_table.weight
             + self.create_index.weight
@@ -609,6 +620,7 @@ impl StatementProfile {
             StatementKind::Update => self.update.weight,
             StatementKind::Delete => self.delete.weight,
             StatementKind::CreateTable => self.create_table.weight,
+            StatementKind::CreateTableAs => self.create_table_as_weight,
             StatementKind::DropTable => self.drop_table_weight,
             StatementKind::AlterTable => self.alter_table.weight,
             StatementKind::CreateIndex => self.create_index.weight,

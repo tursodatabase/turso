@@ -22,11 +22,11 @@ COPY parser ./parser/
 COPY perf/encryption ./perf/encryption
 COPY perf/throughput/rusqlite ./perf/throughput/rusqlite
 COPY perf/throughput/turso ./perf/throughput/turso
+COPY perf/memory ./perf/memory/
 COPY cli ./cli/
 COPY sqlite3 ./sqlite3/
 COPY testing/stress ./testing/stress/
 COPY tests ./tests/
-COPY packages ./packages/
 COPY testing/sqlite_test_ext ./testing/sqlite_test_ext
 COPY sql_generation ./sql_generation/
 COPY testing/concurrent-simulator ./testing/concurrent-simulator
@@ -52,8 +52,8 @@ COPY --from=planner /app/parser ./parser/
 COPY --from=planner /app/perf/encryption ./perf/encryption
 COPY --from=planner /app/perf/throughput/rusqlite ./perf/throughput/rusqlite
 COPY --from=planner /app/perf/throughput/turso ./perf/throughput/turso
+COPY --from=planner /app/perf/memory ./perf/memory/
 COPY --from=planner /app/testing/simulator ./testing/simulator/
-COPY --from=planner /app/packages ./packages/
 COPY --from=planner /app/sql_generation ./sql_generation/
 COPY --from=planner /app/testing/differential-oracle ./testing/differential-oracle/
 COPY --from=planner /app/testing/sqltests ./testing/sqltests/

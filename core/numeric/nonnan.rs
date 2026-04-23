@@ -4,7 +4,7 @@
 pub struct NonNan(f64);
 
 impl NonNan {
-    pub fn new(value: f64) -> Option<Self> {
+    pub const fn new(value: f64) -> Option<Self> {
         if value.is_nan() {
             return None;
         }

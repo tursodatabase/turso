@@ -283,6 +283,10 @@ The `uuid`, `json`, and `jsonb` types require their respective extensions to be 
 
 - **STRICT tables only**: Custom type names are ignored in non-STRICT tables. The column uses standard type affinity rules instead.
 - **Cannot drop while in use**: A type cannot be dropped with DROP TYPE while any table has a column of that type.
+
+<Note>
+If a non-STRICT table was created with a type name that did not exist at the time (e.g., `CREATE TABLE t(x mytype)`), and a custom type with that name is created afterwards (`CREATE TYPE mytype ...`), the type's ENCODE/DECODE logic will **not** be retroactively applied to the existing table. This is not a bug: non-STRICT tables treat all type names as plain affinity hints regardless of whether a matching custom type exists. STRICT tables prevent this scenario because they reject unknown type names at CREATE TABLE time.
+</Note>
 - **No subqueries in expressions**: The ENCODE, DECODE, and DEFAULT expressions cannot contain subqueries, aggregate functions, or window functions.
 
 ## Examples
@@ -385,5 +389,6 @@ SELECT amount + tax FROM transactions;
 ## See Also
 
 - [DROP TYPE](/docs/sql-reference/statements/drop-type) for removing custom types
+- [CREATE DOMAIN](/docs/sql-reference/statements/create-domain) for defining constrained type aliases without ENCODE/DECODE logic
 - [Data Types](/docs/sql-reference/data-types) for an overview of the type system and type affinity
 - [CREATE TABLE](/docs/sql-reference/statements/create-table) for STRICT table definitions

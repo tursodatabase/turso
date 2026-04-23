@@ -60,8 +60,6 @@ impl SqlGenBackend {
             .with_function_config(
                 sql_gen::FunctionConfig::deterministic().disable(&["LIKELY", "UNLIKELY"]),
             );
-        policy.select_config.nulls_order_weights.first = 0;
-        policy.select_config.nulls_order_weights.last = 0;
         policy.select_config.require_order_by_with_limit = true;
         // Disable expression values and conflict clauses for now
         policy.insert_config.expression_value_probability = 0.0;
@@ -152,6 +150,9 @@ impl SqlGenerator for PropTestBackend {
 /// Convert a `sql_gen::Schema` to a `sql_gen_prop::Schema`.
 fn to_prop_schema(schema: &sql_gen::Schema) -> sql_gen_prop::Schema {
     let mut builder = sql_gen_prop::SchemaBuilder::new();
+    for db in &schema.attached_databases {
+        builder = builder.add_database(db.clone());
+    }
     for table in &schema.tables {
         let columns: Vec<sql_gen_prop::ColumnDef> = table
             .columns
@@ -189,6 +190,10 @@ fn to_prop_schema(schema: &sql_gen::Schema) -> sql_gen_prop::Schema {
         } else {
             sql_gen_prop::Table::new(table.name.clone(), columns)
         };
+        let prop_table = match &table.database {
+            Some(db) => prop_table.in_database(db.clone()),
+            None => prop_table,
+        };
         builder = builder.add_table(prop_table);
     }
     for index in &schema.indexes {
@@ -199,6 +204,9 @@ fn to_prop_schema(schema: &sql_gen::Schema) -> sql_gen_prop::Schema {
         );
         if index.unique {
             idx = idx.unique();
+        }
+        if let Some(db) = &index.database {
+            idx = idx.in_database(db.clone());
         }
         builder = builder.add_index(idx);
     }

@@ -555,6 +555,75 @@ class Cursor:
         # Convert arbitrary sequences to tuple efficiently
         return tuple(parameters)
 
+    @staticmethod
+    def _bind_named_params(stmt: PyTursoStatement, parameters: Mapping[str, Any]) -> None:
+        """
+        Bind mapping-style parameters to a prepared SQLite statement, emulating
+        the behavior of Python's ``sqlite3`` module for named parameters.
+
+        SQLite supports the following parameter syntaxes:
+
+            :name
+            @name
+            $name
+            ?NNN
+
+        When a mapping (dict-like object) is supplied:
+
+        1. Keys are interpreted as parameter names without the prefix.
+           For example:
+
+                {"name": "Alice"}
+
+           can bind to any of:
+
+                :name
+                @name
+                $name
+
+        2. Extra keys in the mapping that do not correspond to parameters in
+           the SQL statement are ignored.
+
+        3. Missing keys for parameters present in the SQL statement result in
+           an error raised by the underlying SQLite engine.
+
+        4. Positional parameters using '?' are NOT supported with mappings and
+           must be bound using positional sequences (tuple/list).
+
+        5. Numeric parameters of the form '?NNN' may be bound using a mapping
+           key of the numeric portion as a string:
+
+                {"1": value}  -> binds to ?1
+
+           This mirrors Python's sqlite3 behavior where numeric parameters can
+           be addressed via their 1-based index.
+
+        6. Keys that already include a prefix (e.g. ":name") are not required
+           and are not relied upon for matching; plain names are preferred.
+        """
+        for key, value in parameters.items():
+            if not isinstance(key, str):
+                continue
+            candidates = [f":{key}", f"@{key}", f"${key}"]
+            if key.isdigit():
+                candidates.append(f"?{key}")
+            for candidate in candidates:
+                try:
+                    index = stmt.named_position(candidate)
+                except TursoError:
+                    continue
+                stmt.bind_positional(index, value)
+                break
+
+    @staticmethod
+    def _bind_params(stmt: PyTursoStatement, parameters: Sequence[Any] | Mapping[str, Any]) -> None:
+        if isinstance(parameters, Mapping):
+            Cursor._bind_named_params(stmt, parameters)
+            return
+        params = Cursor._to_positional_params(parameters)
+        if params:
+            stmt.bind(params)
+
     def _maybe_implicit_begin(self, sql: str) -> None:
         self._connection._maybe_implicit_begin(sql)
 
@@ -576,10 +645,7 @@ class Cursor:
 
         stmt = prepared.stmt
         try:
-            # Bind positional parameters
-            params = self._to_positional_params(parameters)
-            if params:
-                stmt.bind(params)
+            self._bind_params(stmt, parameters)
 
             if prepared.has_columns:
                 # Stepped statement (e.g., SELECT or DML with RETURNING)
@@ -659,9 +725,7 @@ class Cursor:
             for parameters in seq_of_parameters:
                 # Reset previous bindings and program memory before reusing
                 stmt.reset()
-                params = self._to_positional_params(parameters)
-                if params:
-                    stmt.bind(params)
+                self._bind_params(stmt, parameters)
                 result = _run_execute_with_io(stmt, self._connection.extra_io)
                 # rowcount is "the number of modified rows" for the LAST executed statement only
                 self._rowcount = int(result.rows_changed) + (self._rowcount if self._rowcount != -1 else 0)

@@ -86,24 +86,23 @@ pub fn translate(
             | ast::Stmt::Update { .. }
     );
 
-    let mut program = ProgramBuilder::new(
+    // Boxed so the ~800 B builder sits on the heap instead of the prepare frame.
+    let mut program = Box::new(ProgramBuilder::new(
         query_mode,
         connection.get_capture_data_changes_info().clone(),
         // These options will be extended whithin each translate program
-        ProgramBuilderOpts {
-            num_cursors: 1,
-            approx_num_insns: 32,
-            approx_num_labels: 2,
-        },
-    );
+        ProgramBuilderOpts::new(1, 32, 2),
+    ));
 
     program.prologue();
     let mut resolver = Resolver::new(
         schema,
         connection.database_schemas(),
+        &connection.temp.database,
         connection.attached_databases(),
         syms,
         connection.experimental_custom_types_enabled(),
+        connection.get_dqs_dml().into(),
     );
 
     match stmt {
@@ -147,16 +146,23 @@ pub fn translate_inner(
             | ast::Stmt::CreateMaterializedView { .. }
             | ast::Stmt::CreateVirtualTable(..)
             | ast::Stmt::CreateType { .. }
+            | ast::Stmt::CreateDomain { .. }
             | ast::Stmt::Delete { .. }
             | ast::Stmt::DropIndex { .. }
             | ast::Stmt::DropTable { .. }
             | ast::Stmt::DropType { .. }
+            | ast::Stmt::DropDomain { .. }
             | ast::Stmt::DropView { .. }
             | ast::Stmt::Reindex { .. }
             | ast::Stmt::Optimize { .. }
             | ast::Stmt::Update { .. }
             | ast::Stmt::Insert { .. }
     );
+    let is_vacuum = matches!(stmt, ast::Stmt::Vacuum { .. });
+
+    if is_vacuum && connection.get_query_only() {
+        bail_parse_error!("Cannot execute VACUUM in query_only mode")
+    }
 
     if is_write && connection.get_query_only() {
         bail_parse_error!("Cannot execute write statement in query_only mode")
@@ -172,9 +178,7 @@ pub fn translate_inner(
         ast::Stmt::Attach { expr, db_name, key } => {
             attach::translate_attach(&expr, resolver, &db_name, &key, program, connection.clone())?;
         }
-        ast::Stmt::Begin { typ, name } => {
-            translate_tx_begin(typ, name, resolver.schema(), program)?
-        }
+        ast::Stmt::Begin { typ, name } => translate_tx_begin(typ, name, resolver, program)?,
         ast::Stmt::Commit { name } => {
             translate_tx_commit(name, resolver.schema(), resolver, program)?
         }
@@ -307,6 +311,28 @@ pub fn translate_inner(
             }
             schema::translate_create_type(&type_name, &body, if_not_exists, resolver, program)?
         }
+        ast::Stmt::CreateDomain {
+            if_not_exists,
+            domain_name,
+            base_type,
+            default,
+            not_null,
+            constraints,
+        } => {
+            if !connection.experimental_custom_types_enabled() {
+                bail_parse_error!("Custom types require --experimental-custom-types flag");
+            }
+            schema::translate_create_domain(
+                &domain_name,
+                &base_type,
+                not_null,
+                &constraints,
+                default,
+                if_not_exists,
+                resolver,
+                program,
+            )?
+        }
         ast::Stmt::DropType {
             if_exists,
             type_name,
@@ -314,7 +340,16 @@ pub fn translate_inner(
             if !connection.experimental_custom_types_enabled() {
                 bail_parse_error!("Custom types require --experimental-custom-types flag");
             }
-            schema::translate_drop_type(&type_name, if_exists, resolver, program)?
+            schema::translate_drop_type(&type_name, if_exists, false, resolver, program)?
+        }
+        ast::Stmt::DropDomain {
+            if_exists,
+            domain_name,
+        } => {
+            if !connection.experimental_custom_types_enabled() {
+                bail_parse_error!("Custom types require --experimental-custom-types flag");
+            }
+            schema::translate_drop_type(&domain_name, if_exists, true, resolver, program)?
         }
         ast::Stmt::Pragma { .. } => {
             bail_parse_error!("PRAGMA statement cannot be evaluated in a nested context")
@@ -499,5 +534,34 @@ mod tests {
             }
             other => panic!("expected LimboError::Corrupt, got: {other}"),
         }
+    }
+
+    #[test]
+    fn test_trigger_compile_error_does_not_poison_future_insert_compilation() {
+        let io = Arc::new(MemoryIO::new());
+        let db = Database::open_file(io, ":memory:").unwrap();
+        let conn = db.connect().unwrap();
+
+        conn.execute("CREATE TABLE ref(x);").unwrap();
+        conn.execute("CREATE TABLE t(a INTEGER);").unwrap();
+        conn.execute("CREATE TRIGGER tr AFTER INSERT ON t BEGIN SELECT * FROM ref; END;")
+            .unwrap();
+        conn.execute("DROP TABLE ref;").unwrap();
+
+        let err = conn
+            .execute("INSERT INTO t VALUES (1);")
+            .expect_err("single-row insert should fail while trigger references dropped table");
+        assert!(
+            err.to_string().contains("no such table: ref"),
+            "expected missing-table error, got: {err}"
+        );
+
+        let err = conn.execute("INSERT INTO t VALUES (2), (3);").expect_err(
+            "multi-row insert should still fail instead of skipping the poisoned trigger",
+        );
+        assert!(
+            err.to_string().contains("no such table: ref"),
+            "expected missing-table error, got: {err}"
+        );
     }
 }

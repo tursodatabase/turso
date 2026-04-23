@@ -394,6 +394,8 @@ mod tests {
                 enable_index_method: false,
                 enable_autovacuum: false,
                 enable_attach: false,
+                enable_generated_columns: false,
+                enable_multiprocess_wal: false,
                 unsafe_testing: false,
             },
             None,

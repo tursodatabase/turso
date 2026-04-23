@@ -118,9 +118,9 @@ test('avg-bug', async () => {
         'value 6', null, null, 150,
     );
 
-    expect(await db.prepare(`select avg("a") from "aggregate_table";`).get()).toEqual({ 'avg (aggregate_table.a)': 24 });
-    expect(await db.prepare(`select avg("null_only") from "aggregate_table";`).get()).toEqual({ 'avg (aggregate_table.null_only)': null });
-    expect(await db.prepare(`select avg(distinct "b") from "aggregate_table";`).get()).toEqual({ 'avg (DISTINCT aggregate_table.b)': 42.5 });
+    expect(await db.prepare(`select avg("a") from "aggregate_table";`).get()).toEqual({ 'avg("a")': 24 });
+    expect(await db.prepare(`select avg("null_only") from "aggregate_table";`).get()).toEqual({ 'avg("null_only")': null });
+    expect(await db.prepare(`select avg(distinct "b") from "aggregate_table";`).get()).toEqual({ 'avg(distinct "b")': 42.5 });
 })
 
 test('insert returning test', async () => {
@@ -268,6 +268,45 @@ test('blobs', async () => {
     const db = await connect(":memory:");
     const rows = await db.prepare("SELECT x'1020' as x").all();
     expect(rows).toEqual([{ x: Buffer.from([16, 32]) }])
+})
+
+test('encryption', async () => {
+    const path = `test-encryption-${(Math.random() * 10000) | 0}.db`;
+    const hexkey = 'b1bbfda4f589dc9daaf004fe21111e00dc00c98237102f5c7002a5669fc76327';
+    const wrongKey = 'aaaaaaa4f589dc9daaf004fe21111e00dc00c98237102f5c7002a5669fc76327';
+    try {
+        const db = await connect(path, {
+            encryption: { cipher: 'aegis256', hexkey }
+        });
+        await db.exec("CREATE TABLE t(x)");
+        await db.exec("INSERT INTO t SELECT 'secret' FROM generate_series(1, 1024)");
+        await db.exec("PRAGMA wal_checkpoint(truncate)");
+        db.close();
+
+        // Re-open with the same key - should work
+        const db2 = await connect(path, {
+            encryption: { cipher: 'aegis256', hexkey }
+        });
+        const rows = await db2.prepare("SELECT COUNT(*) as cnt FROM t").all();
+        expect(rows).toEqual([{ cnt: 1024 }]);
+        db2.close();
+
+        // Opening with wrong key MUST fail
+        await expect(async () => {
+            const db3 = await connect(path, {
+                encryption: { cipher: 'aegis256', hexkey: wrongKey }
+            });
+            await db3.prepare("SELECT * FROM t").all();
+        }).rejects.toThrow();
+
+        // Opening without encryption MUST fail
+        await expect(async () => {
+            const db4 = await connect(path);
+            await db4.prepare("SELECT * FROM t").all();
+        }).rejects.toThrow();
+    } finally {
+        unlinkSync(path);
+    }
 })
 
 

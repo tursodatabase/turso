@@ -15,6 +15,7 @@
 pub mod alter_table;
 pub mod create_index;
 pub mod create_table;
+pub mod create_table_as;
 pub mod create_trigger;
 pub mod cte;
 pub mod delete;
@@ -40,8 +41,9 @@ pub mod view;
 pub use alter_table::{
     AlterTableContext, AlterTableOp, AlterTableOpKind, AlterTableOpWeights, AlterTableStatement,
 };
-pub use create_index::{CreateIndexStatement, IndexColumn};
+pub use create_index::{CreateIndexStatement, IndexColumn, IndexColumnKind};
 pub use create_table::{ColumnProfile, CreateTableStatement, DataTypeWeights, PrimaryKeyProfile};
+pub use create_table_as::CreateTableAsStatement;
 pub use create_trigger::{
     CreateTriggerContext, CreateTriggerKind, CreateTriggerOpWeights, CreateTriggerStatement,
     TriggerEvent, TriggerTiming,
@@ -95,6 +97,8 @@ pub mod strategies {
         column_def, create_table, data_type, identifier, identifier_excluding,
         primary_key_column_def,
     };
+    // CREATE TABLE AS SELECT
+    pub use crate::create_table_as::create_table_as;
     // DELETE
     pub use crate::delete::delete_for_table;
     // DROP INDEX
@@ -223,7 +227,7 @@ mod tests {
             // Should not generate a table named "users" or "posts"
             prop_assert!(stmt.table_name != "users");
             prop_assert!(stmt.table_name != "posts");
-            prop_assert!(stmt.to_string().starts_with("CREATE TABLE"));
+            prop_assert!(stmt.to_string().starts_with("CREATE "));
         }
 
         #[test]

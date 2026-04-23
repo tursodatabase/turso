@@ -362,3 +362,29 @@ expect {
     2|2
     3|3
 }
+
+# GROUP BY column-number out-of-range errors must mention "GROUP BY",
+# not "ORDER BY". Regression test for select3-2.10 in testing/sqlite3/select3.test.
+test group-by-zero {
+    CREATE TABLE t_gb_zero(n INT, log INT);
+    SELECT log, count(*) FROM t_gb_zero GROUP BY 0 ORDER BY log;
+}
+expect error {
+    1st GROUP BY term out of range - should be between 1 and 2
+}
+
+test group-by-out-of-range {
+    CREATE TABLE t_gb_oor(n INT, log INT);
+    SELECT log, count(*) FROM t_gb_oor GROUP BY 3 ORDER BY log;
+}
+expect error {
+    1st GROUP BY term out of range - should be between 1 and 2
+}
+
+test group-by-negative {
+    CREATE TABLE t_gb_neg(n INT, log INT);
+    SELECT log, count(*) FROM t_gb_neg GROUP BY -1 ORDER BY log;
+}
+expect error {
+    1st GROUP BY term out of range - should be between 1 and 2
+}

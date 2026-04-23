@@ -35,6 +35,8 @@
 use smallvec::SmallVec;
 use turso_parser::ast::{self, Expr, TableInternalId, UnaryOperator};
 
+use crate::translate::plan::Plan;
+
 use crate::function::{Deterministic, Func};
 use crate::translate::{
     expr::{walk_expr, WalkControl},
@@ -78,6 +80,10 @@ fn try_unnest_exists(plan: &mut SelectPlan, subquery_idx: usize) -> bool {
             return false;
         };
         let Some(inner) = inner.as_ref() else {
+            return false;
+        };
+        let Plan::Select(inner) = inner.as_ref() else {
+            // Compound selects cannot be unnested.
             return false;
         };
         inner.clone()
@@ -199,6 +205,20 @@ fn try_unnest_exists(plan: &mut SelectPlan, subquery_idx: usize) -> bool {
     // Move any inner non-FROM subqueries to the outer plan.
     for inner_subquery in inner_plan.non_from_clause_subqueries {
         plan.non_from_clause_subqueries.push(inner_subquery);
+    }
+
+    // The inner plan's result columns are dropped (a semi/anti-join only tests
+    // for row existence, not column values). However, those result column
+    // expressions may contain bound parameters (e.g. `SELECT ?2 AS col`).
+    // We must remember these so the emitter registers them in the program's
+    // parameter list; otherwise bind-time validation (`has_slot`) fails.
+    for rc in &inner_plan.result_columns {
+        let _ = walk_expr(&rc.expr, &mut |e: &Expr| -> Result<WalkControl> {
+            if let Expr::Variable(variable) = e {
+                plan.phantom_params.push(variable.clone());
+            }
+            Ok(WalkControl::Continue)
+        });
     }
 
     // Replace the EXISTS/NOT EXISTS expression in the outer WHERE with a no-op (true).
@@ -419,7 +439,7 @@ fn contains_nondeterministic_function(expr: &Expr) -> bool {
     let _ = walk_expr(expr, &mut |e: &Expr| -> Result<WalkControl> {
         match e {
             Expr::FunctionCall { name, args, .. } => {
-                if let Ok(func) = Func::resolve_function(name.as_str(), args.len()) {
+                if let Ok(Some(func)) = Func::resolve_function(name.as_str(), args.len()) {
                     if !func.is_deterministic() {
                         found = true;
                     }
@@ -427,7 +447,7 @@ fn contains_nondeterministic_function(expr: &Expr) -> bool {
             }
             Expr::FunctionCallStar { name, .. } => {
                 // Star functions like count(*) — resolve with 0 args
-                if let Ok(func) = Func::resolve_function(name.as_str(), 0) {
+                if let Ok(Some(func)) = Func::resolve_function(name.as_str(), 0) {
                     if !func.is_deterministic() {
                         found = true;
                     }

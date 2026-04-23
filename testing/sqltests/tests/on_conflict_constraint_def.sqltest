@@ -172,6 +172,15 @@ expect {
     a|99
 }
 
+test gencol_insert_or_replace_not_null_no_default {
+    CREATE TABLE t(a NOT NULL);
+    INSERT INTO t VALUES (1);
+    UPDATE OR REPLACE t SET a = null;
+}
+expect error {
+    NOT NULL constraint failed: t.a
+}
+
 # ---- Statement-level OR overrides constraint-level ----
 
 setup stmt-override {

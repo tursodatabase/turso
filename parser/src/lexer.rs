@@ -4,8 +4,9 @@ use turso_macros::match_ignore_ascii_case;
 /// Returns true if the given identifier (case-insensitive) is a SQL keyword.
 /// This is used to determine whether an identifier needs to be quoted when
 /// rendered back to SQL text.
-pub fn is_keyword(input: &[u8]) -> bool {
-    keyword_or_id_token(input) != TokenType::TK_ID
+pub fn is_quotable_keyword(input: &[u8]) -> bool {
+    let token = keyword_or_id_token(input);
+    token != TokenType::TK_ID && token != TokenType::TK_TYPE
 }
 
 fn keyword_or_id_token(input: &[u8]) -> TokenType {
@@ -165,12 +166,12 @@ fn keyword_or_id_token(input: &[u8]) -> TokenType {
 }
 
 #[inline(always)]
-pub fn is_identifier_start(b: u8) -> bool {
+pub const fn is_identifier_start(b: u8) -> bool {
     b.is_ascii_uppercase() || b == b'_' || b.is_ascii_lowercase() || b > b'\x7F'
 }
 
 #[inline(always)]
-pub fn is_identifier_continue(b: u8) -> bool {
+pub const fn is_identifier_continue(b: u8) -> bool {
     b == b'$'
         || b.is_ascii_digit()
         || b.is_ascii_uppercase()
@@ -251,7 +252,16 @@ impl<'a> Iterator for Lexer<'a> {
                         Some(self.mark(|l| l.eat_var()))
                     }
                 }
-                b'?' | b'$' | b'#' => Some(self.mark(|l| l.eat_var())),
+                b'?' | b'$' => Some(self.mark(|l| l.eat_var())),
+                b'#' => {
+                    let start = self.offset;
+                    self.eat(); // consume '#'
+                    self.eat_while(is_identifier_continue);
+                    Some(Ok(Token::new(
+                        &self.input[start..self.offset],
+                        TokenType::TK_ILLEGAL,
+                    )))
+                }
                 b':' => {
                     // `:name` is a named parameter, but `:` followed by a digit
                     // or non-identifier char is a standalone colon (used in slice syntax).
@@ -272,7 +282,7 @@ const fn cold() {}
 
 impl<'a> Lexer<'a> {
     #[inline(always)]
-    pub fn new(input: &'a [u8]) -> Self {
+    pub const fn new(input: &'a [u8]) -> Self {
         Lexer { input, offset: 0 }
     }
 
@@ -296,7 +306,7 @@ impl<'a> Lexer<'a> {
 
     /// Returns the current offset in the input without consuming.
     #[inline(always)]
-    pub fn peek(&self) -> Option<u8> {
+    pub const fn peek(&self) -> Option<u8> {
         if self.offset < self.input.len() {
             Some(self.input[self.offset])
         } else {
@@ -306,7 +316,7 @@ impl<'a> Lexer<'a> {
 
     /// Returns the current offset in the input and consumes it.
     #[inline(always)]
-    pub fn eat(&mut self) -> Option<u8> {
+    pub const fn eat(&mut self) -> Option<u8> {
         if let Some(b) = self.peek() {
             self.offset += 1;
             Some(b)
@@ -822,7 +832,7 @@ impl<'a> Lexer<'a> {
     fn eat_var(&mut self) -> Result<Token<'a>> {
         let start = self.offset;
         let tok = self.eat().unwrap();
-        debug_assert!(tok == b'?' || tok == b'$' || tok == b'@' || tok == b'#' || tok == b':');
+        debug_assert!(tok == b'?' || tok == b'$' || tok == b'@' || tok == b':');
 
         match tok {
             b'?' => {
@@ -1048,10 +1058,6 @@ mod tests {
             (
                 b"@param".as_slice(),
                 Token::new(b"@param", TokenType::TK_VARIABLE),
-            ),
-            (
-                b"#comment".as_slice(),
-                Token::new(b"#comment", TokenType::TK_VARIABLE),
             ),
             (
                 b":named_param".as_slice(),

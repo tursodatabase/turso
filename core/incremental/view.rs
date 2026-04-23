@@ -472,10 +472,10 @@ impl IncrementalView {
 
                 // Store the alias mapping if there is an alias
                 if let Some(alias_enum) = alias {
-                    let alias_name = match alias_enum {
-                        ast::As::As(name) | ast::As::Elided(name) => name.as_str(),
-                    };
-                    aliases.insert(alias_name.to_string(), table_name.to_string());
+                    aliases.insert(
+                        alias_enum.name().as_str().to_string(),
+                        table_name.to_string(),
+                    );
                 }
             } else {
                 return Err(LimboError::ParseError(format!(
@@ -703,7 +703,7 @@ impl IncrementalView {
 
         for table in referenced_tables {
             // Check if the table has a rowid alias (INTEGER PRIMARY KEY column)
-            let has_rowid_alias = table.columns.iter().any(|col| col.is_rowid_alias());
+            let has_rowid_alias = table.columns().iter().any(|col| col.is_rowid_alias());
 
             // Select all columns. The circuit will handle filtering and projection
             // If there's a rowid alias, we don't need to select rowid separately
@@ -1098,7 +1098,7 @@ impl IncrementalView {
                     for table_name in all_tables {
                         if let Some(table) = schema.get_btree_table(table_name) {
                             if table
-                                .columns
+                                .columns()
                                 .iter()
                                 .any(|col| col.name.as_deref() == Some(column.as_str()))
                             {
@@ -1421,7 +1421,9 @@ impl IncrementalView {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::schema::{BTreeTable, ColDef, Column as SchemaColumn, Schema, Type};
+    use crate::schema::{
+        BTreeCharacteristics, BTreeTable, ColDef, Column as SchemaColumn, Schema, Type,
+    };
     use crate::sync::Arc;
     use turso_parser::ast;
     use turso_parser::parser::Parser;
@@ -1431,160 +1433,157 @@ mod tests {
         let mut schema = Schema::new();
 
         // Create customers table
-        let customers_table = BTreeTable {
-            name: "customers".to_string(),
-            root_page: 2,
-            primary_key_columns: vec![("id".to_string(), ast::SortOrder::Asc)],
-            columns: vec![
-                SchemaColumn::new(
-                    Some("id".to_string()),
-                    "INTEGER".to_string(),
-                    None,
-                    None,
-                    Type::Integer,
-                    None,
-                    ColDef {
-                        primary_key: true,
-                        rowid_alias: true,
-                        notnull: true,
-                        unique: false,
-                        hidden: false,
-                        notnull_conflict_clause: None,
-                    },
-                ),
-                SchemaColumn::new_default_text(Some("name".to_string()), "TEXT".to_string(), None),
-            ],
-            has_rowid: true,
-            is_strict: false,
-            unique_sets: vec![],
-            foreign_keys: vec![],
-            check_constraints: vec![],
-            rowid_alias_conflict_clause: None,
-            has_autoincrement: false,
-        };
+        let columns = vec![
+            SchemaColumn::new(
+                Some("id".to_string()),
+                "INTEGER".to_string(),
+                None,
+                None,
+                Type::Integer,
+                None,
+                ColDef {
+                    primary_key: true,
+                    rowid_alias: true,
+                    notnull: true,
+                    unique: false,
+                    hidden: false,
+                    notnull_conflict_clause: None,
+                },
+            ),
+            SchemaColumn::new_default_text(Some("name".to_string()), "TEXT".to_string(), None),
+        ];
+        let customers_table = BTreeTable::new(
+            2,
+            "customers".to_string(),
+            vec![("id".to_string(), ast::SortOrder::Asc)],
+            columns,
+            BTreeCharacteristics::HAS_ROWID,
+            vec![],
+            vec![],
+            vec![],
+            None,
+        );
 
         // Create orders table
-        let orders_table = BTreeTable {
-            name: "orders".to_string(),
-            root_page: 3,
-            primary_key_columns: vec![("id".to_string(), ast::SortOrder::Asc)],
-            columns: vec![
-                SchemaColumn::new(
-                    Some("id".to_string()),
-                    "INTEGER".to_string(),
-                    None,
-                    None,
-                    Type::Integer,
-                    None,
-                    ColDef {
-                        primary_key: true,
-                        rowid_alias: true,
-                        notnull: true,
-                        unique: false,
-                        hidden: false,
-                        notnull_conflict_clause: None,
-                    },
-                ),
-                SchemaColumn::new(
-                    Some("customer_id".to_string()),
-                    "INTEGER".to_string(),
-                    None,
-                    None,
-                    Type::Integer,
-                    None,
-                    ColDef::default(),
-                ),
-                SchemaColumn::new_default_integer(
-                    Some("total".to_string()),
-                    "INTEGER".to_string(),
-                    None,
-                ),
-            ],
-            has_rowid: true,
-            is_strict: false,
-            has_autoincrement: false,
-            foreign_keys: vec![],
-            check_constraints: vec![],
-            rowid_alias_conflict_clause: None,
-            unique_sets: vec![],
-        };
+        let columns = vec![
+            SchemaColumn::new(
+                Some("id".to_string()),
+                "INTEGER".to_string(),
+                None,
+                None,
+                Type::Integer,
+                None,
+                ColDef {
+                    primary_key: true,
+                    rowid_alias: true,
+                    notnull: true,
+                    unique: false,
+                    hidden: false,
+                    notnull_conflict_clause: None,
+                },
+            ),
+            SchemaColumn::new(
+                Some("customer_id".to_string()),
+                "INTEGER".to_string(),
+                None,
+                None,
+                Type::Integer,
+                None,
+                ColDef::default(),
+            ),
+            SchemaColumn::new_default_integer(
+                Some("total".to_string()),
+                "INTEGER".to_string(),
+                None,
+            ),
+        ];
+        let orders_table = BTreeTable::new(
+            3,
+            "orders".to_string(),
+            vec![("id".to_string(), ast::SortOrder::Asc)],
+            columns,
+            BTreeCharacteristics::HAS_ROWID,
+            vec![],
+            vec![],
+            vec![],
+            None,
+        );
 
         // Create products table
-        let products_table = BTreeTable {
-            name: "products".to_string(),
-            root_page: 4,
-            primary_key_columns: vec![("id".to_string(), ast::SortOrder::Asc)],
-            columns: vec![
-                SchemaColumn::new(
-                    Some("id".to_string()),
-                    "INTEGER".to_string(),
-                    None,
-                    None,
-                    Type::Integer,
-                    None,
-                    ColDef {
-                        primary_key: true,
-                        rowid_alias: true,
-                        notnull: true,
-                        unique: false,
-                        hidden: false,
-                        notnull_conflict_clause: None,
-                    },
-                ),
-                SchemaColumn::new_default_text(Some("name".to_string()), "TEXT".to_string(), None),
-                SchemaColumn::new(
-                    Some("price".to_string()),
-                    "REAL".to_string(),
-                    None,
-                    None,
-                    Type::Real,
-                    None,
-                    ColDef::default(),
-                ),
-            ],
-            has_rowid: true,
-            is_strict: false,
-            has_autoincrement: false,
-            foreign_keys: vec![],
-            check_constraints: vec![],
-            rowid_alias_conflict_clause: None,
-            unique_sets: vec![],
-        };
+        let columns = vec![
+            SchemaColumn::new(
+                Some("id".to_string()),
+                "INTEGER".to_string(),
+                None,
+                None,
+                Type::Integer,
+                None,
+                ColDef {
+                    primary_key: true,
+                    rowid_alias: true,
+                    notnull: true,
+                    unique: false,
+                    hidden: false,
+                    notnull_conflict_clause: None,
+                },
+            ),
+            SchemaColumn::new_default_text(Some("name".to_string()), "TEXT".to_string(), None),
+            SchemaColumn::new(
+                Some("price".to_string()),
+                "REAL".to_string(),
+                None,
+                None,
+                Type::Real,
+                None,
+                ColDef::default(),
+            ),
+        ];
+        let products_table = BTreeTable::new(
+            4,
+            "products".to_string(),
+            vec![("id".to_string(), ast::SortOrder::Asc)],
+            columns,
+            BTreeCharacteristics::HAS_ROWID,
+            vec![],
+            vec![],
+            vec![],
+            None,
+        );
 
         // Create logs table - without a rowid alias (no INTEGER PRIMARY KEY)
-        let logs_table = BTreeTable {
-            name: "logs".to_string(),
-            root_page: 5,
-            primary_key_columns: vec![], // No primary key, so no rowid alias
-            columns: vec![
-                SchemaColumn::new(
-                    Some("message".to_string()),
-                    "TEXT".to_string(),
-                    None,
-                    None,
-                    Type::Text,
-                    None,
-                    ColDef::default(),
-                ),
-                SchemaColumn::new_default_integer(
-                    Some("level".to_string()),
-                    "INTEGER".to_string(),
-                    None,
-                ),
-                SchemaColumn::new_default_integer(
-                    Some("timestamp".to_string()),
-                    "INTEGER".to_string(),
-                    None,
-                ),
-            ],
-            has_rowid: true, // Has implicit rowid but no alias
-            is_strict: false,
-            has_autoincrement: false,
-            foreign_keys: vec![],
-            check_constraints: vec![],
-            rowid_alias_conflict_clause: None,
-            unique_sets: vec![],
-        };
+        let columns = vec![
+            SchemaColumn::new(
+                Some("message".to_string()),
+                "TEXT".to_string(),
+                None,
+                None,
+                Type::Text,
+                None,
+                ColDef::default(),
+            ),
+            SchemaColumn::new_default_integer(
+                Some("level".to_string()),
+                "INTEGER".to_string(),
+                None,
+            ),
+            SchemaColumn::new_default_integer(
+                Some("timestamp".to_string()),
+                "INTEGER".to_string(),
+                None,
+            ),
+        ];
+        // logs has no primary key (no rowid alias) but does have an implicit rowid.
+        let logs_table = BTreeTable::new(
+            5,
+            "logs".to_string(),
+            vec![],
+            columns,
+            BTreeCharacteristics::HAS_ROWID,
+            vec![],
+            vec![],
+            vec![],
+            None,
+        );
 
         schema
             .add_btree_table(Arc::new(customers_table))

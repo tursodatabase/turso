@@ -23,9 +23,9 @@
 
 use crate::translate::emitter::Resolver;
 use crate::translate::plan::{DeletePlan, DmlSafetyReason, UpdatePlan};
-use crate::translate::trigger_exec::has_relevant_triggers_type_only;
+use crate::translate::trigger_exec::has_triggers_including_temp;
 use crate::vdbe::builder::ProgramBuilder;
-use crate::{sync::Arc, Connection, HashSet, Result};
+use crate::{sync::Arc, Connection, Result};
 use turso_parser::ast::{ResolveType, TriggerEvent};
 
 /// Check whether any DDL-level constraint (IPK or index) uses REPLACE.
@@ -195,10 +195,14 @@ pub(crate) fn set_update_stmt_journal_flags(
     };
     let database_id = target_table.database_id;
 
-    let updated_cols: HashSet<usize> = plan.set_clauses.iter().map(|(i, _)| *i).collect();
-    let has_triggers = resolver.with_schema(database_id, |s| {
-        has_relevant_triggers_type_only(s, TriggerEvent::Update, Some(&updated_cols), &btree_table)
-    });
+    let updated_cols = plan.set_clauses.iter().map(|(i, _)| *i).collect();
+    let has_triggers = has_triggers_including_temp(
+        resolver,
+        database_id,
+        TriggerEvent::Update,
+        Some(&updated_cols),
+        &btree_table,
+    );
     let has_fks = table_has_fks(connection, resolver, database_id, btree_table.name.as_str());
 
     let or_conflict = plan.or_conflict.unwrap_or(ResolveType::Abort);
@@ -224,7 +228,7 @@ pub(crate) fn set_update_stmt_journal_flags(
             return false;
         }
         btree_table
-            .columns
+            .columns()
             .get(*col_idx)
             .is_some_and(|c| c.notnull() && !c.is_rowid_alias())
     });

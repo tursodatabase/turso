@@ -3,15 +3,13 @@ use pyo3::{
     types::{PyBytes, PyTuple},
 };
 use std::sync::Arc;
-use turso_sdk_kit::rsapi::{
-    self, EncryptionOpts, Numeric, TursoError, TursoStatusCode, Value, ValueRef,
-};
+use turso_sdk_kit::rsapi::{self, EncryptionOpts, Numeric, TursoError, TursoStatusCode, Value};
 
 use pyo3::create_exception;
 use pyo3::exceptions::PyException;
 
 // support equality for status codes
-#[pyclass(eq, eq_int)]
+#[pyclass(eq, eq_int, skip_from_py_object)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)] // Add necessary traits for your use case
 pub enum PyTursoStatusCode {
     Ok = 0,
@@ -99,7 +97,7 @@ impl PyTursoSetupConfig {
     }
 }
 
-#[pyclass]
+#[pyclass(skip_from_py_object)]
 #[derive(Clone)]
 pub struct PyTursoEncryptionConfig {
     pub cipher: String,
@@ -277,6 +275,21 @@ impl PyTursoStatement {
         Ok(())
     }
 
+    /// bind one positional parameter (1-based index)
+    pub fn bind_positional(&mut self, index: usize, parameter: Bound<PyAny>) -> PyResult<()> {
+        self.statement
+            .bind_positional(index, py_to_db_value(parameter)?)
+            .map_err(turso_error_to_py_err)?;
+        Ok(())
+    }
+
+    /// get statement parameter slot by name (e.g. :name, @name, $name, ?1)
+    pub fn named_position(&mut self, name: &str) -> PyResult<usize> {
+        self.statement
+            .named_position(name)
+            .map_err(turso_error_to_py_err)
+    }
+
     /// step one iteration of the statement execution
     /// Returns [PyTursoStatusCode::Done] when execution is finished
     /// Returns [PyTursoStatusCode::Row] when execution generated a row which can be consumed with [Self::row] method
@@ -359,13 +372,13 @@ impl PyTursoStatement {
     }
 }
 
-fn db_value_to_py(py: Python, value: rsapi::ValueRef) -> PyResult<Py<PyAny>> {
+fn db_value_to_py(py: Python, value: Value) -> PyResult<Py<PyAny>> {
     match value {
-        ValueRef::Null => Ok(py.None()),
-        ValueRef::Numeric(Numeric::Integer(i)) => Ok(i.into_pyobject(py)?.into()),
-        ValueRef::Numeric(Numeric::Float(f)) => Ok(f64::from(f).into_pyobject(py)?.into()),
-        ValueRef::Text(s) => Ok(s.as_str().into_pyobject(py)?.into()),
-        ValueRef::Blob(b) => Ok(PyBytes::new(py, b).into()),
+        Value::Null => Ok(py.None()),
+        Value::Numeric(Numeric::Integer(i)) => Ok(i.into_pyobject(py)?.into()),
+        Value::Numeric(Numeric::Float(f)) => Ok(f64::from(f).into_pyobject(py)?.into()),
+        Value::Text(s) => Ok(s.value.as_ref().into_pyobject(py)?.into()),
+        Value::Blob(b) => Ok(PyBytes::new(py, &b).into()),
     }
 }
 

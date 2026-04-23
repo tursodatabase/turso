@@ -580,7 +580,7 @@ pub fn insn_to_row(
                 let cursor_type = &program.cursor_ref[*cursor_id].1;
                 let column_name: Option<&String> = match cursor_type {
                     CursorType::BTreeTable(table) => {
-                        let name = table.columns.get(*column).and_then(|v| v.name.as_ref());
+                        let name = table.columns().get(*column).and_then(|v| v.name.as_ref());
                         name
                     }
                     CursorType::BTreeIndex(index) => {
@@ -588,7 +588,7 @@ pub fn insn_to_row(
                         Some(name)
                     }
                     CursorType::MaterializedView(table, _) => {
-                        let name = table.columns.get(*column).and_then(|v| v.name.as_ref());
+                        let name = table.columns().get(*column).and_then(|v| v.name.as_ref());
                         name
                     }
                     CursorType::Pseudo(_) => None,
@@ -886,23 +886,29 @@ pub fn insn_to_row(
                 format!("r[{dest}]={value}"),
             ),
             Insn::Program {
-                params,
+                param_registers,
                 ignore_jump_target,
                 ..
             } => (
                 "Program",
-                // P1: first register that contains a param
-                params.first().map(|v| match v {
-                    crate::types::Value::Numeric(crate::numeric::Numeric::Integer(i)) if *i < 0 => -i - 1,
-                    _ => 0,
-                }).unwrap_or(0),
+                // P1: first parent register that contains a param
+                param_registers.first().copied().unwrap_or(0) as i64,
                 // P2: ignore jump target (for RAISE(IGNORE))
                 ignore_jump_target.as_debug_int() as i64,
                 // P3: number of registers that contain params
-                params.len() as i64,
+                param_registers.len() as i64,
                 Value::build_text(program.sql.clone()),
                 0,
                 format!("subprogram={}", program.sql),
+            ),
+            Insn::ResetCount => (
+                "ResetCount",
+                0,
+                0,
+                0,
+                Value::build_text(""),
+                0,
+                "".to_string(),
             ),
             Insn::Real { value, dest } => (
                 "Real",
@@ -1166,20 +1172,25 @@ pub fn insn_to_row(
             Insn::SorterOpen {
                 cursor_id,
                 columns,
-                order_and_collations,
+                order_collations_nulls,
                 ..
             } => {
-                let to_print: Vec<String> = order_and_collations
+                let to_print: Vec<String> = order_collations_nulls
                     .iter()
-                    .map(|(order, collation)| {
+                    .map(|(order, collation, nulls)| {
                         let sign = match order {
                             SortOrder::Asc => "",
                             SortOrder::Desc => "-",
                         };
-                        if let Some(coll) = collation {
+                        let coll_str = if let Some(coll) = collation {
                             format!("{sign}{coll}")
                         } else {
                             format!("{sign}B")
+                        };
+                        match nulls {
+                            Some(turso_parser::ast::NullsOrder::First) => format!("{coll_str} NF"),
+                            Some(turso_parser::ast::NullsOrder::Last) => format!("{coll_str} NL"),
+                            None => coll_str,
                         }
                     })
                     .collect();
@@ -1188,7 +1199,7 @@ pub fn insn_to_row(
                     *cursor_id as i64,
                     *columns as i64,
                     0,
-                    Value::build_text(format!("k({},{})", order_and_collations.len(), to_print.join(","))),
+                    Value::build_text(format!("k({},{})", order_collations_nulls.len(), to_print.join(","))),
                     0,
                     format!("cursor={cursor_id}"),
                 )
@@ -2346,14 +2357,14 @@ pub fn insn_to_row(
                 format!("hash_table_id={hash_table_id}"),
             )
         },
-        Insn::VacuumInto { dest_path } => (
+        Insn::VacuumInto { schema_name, dest_path } => (
             "VacuumInto",
             0,
             0,
             0,
             Value::build_text(dest_path.to_string()),
             0,
-            format!("dest={dest_path}"),
+            format!("schema={schema_name}, dest={dest_path}"),
         ),
         Insn::InitCdcVersion { cdc_table_name, version, cdc_mode } => (
             "InitCdcVersion",

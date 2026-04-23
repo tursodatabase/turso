@@ -13,7 +13,7 @@ use turso_core::{
     schema::IndexColumn,
     types::IOResult,
     vector::{self, vector_types::VectorType},
-    Numeric, Register, Result, Value,
+    Numeric, Register, Result, Value, MAIN_DB_ID,
 };
 use turso_parser::ast::SortOrder;
 
@@ -75,7 +75,7 @@ fn test_vector_sparse_ivf_create_destroy(tmp_db: TempDatabase) {
     conn.wal_insert_begin().unwrap();
     {
         let mut cursor = attached.init().unwrap();
-        run(&tmp_db, || cursor.create(&conn)).unwrap();
+        run(&tmp_db, || cursor.create(&conn, MAIN_DB_ID)).unwrap();
     }
     conn.wal_insert_end(true).unwrap();
     assert_eq!(
@@ -86,7 +86,7 @@ fn test_vector_sparse_ivf_create_destroy(tmp_db: TempDatabase) {
     conn.wal_insert_begin().unwrap();
     {
         let mut cursor = attached.init().unwrap();
-        run(&tmp_db, || cursor.destroy(&conn)).unwrap();
+        run(&tmp_db, || cursor.destroy(&conn, MAIN_DB_ID)).unwrap();
     }
     conn.wal_insert_end(true).unwrap();
     assert_eq!(schema_rows(), vec!["t"]);
@@ -118,7 +118,7 @@ fn test_vector_sparse_ivf_insert_query(tmp_db: TempDatabase) {
     conn.wal_insert_begin().unwrap();
     {
         let mut cursor = attached.init().unwrap();
-        run(&tmp_db, || cursor.create(&conn)).unwrap();
+        run(&tmp_db, || cursor.create(&conn, MAIN_DB_ID)).unwrap();
     }
     conn.wal_insert_end(true).unwrap();
 
@@ -132,7 +132,7 @@ fn test_vector_sparse_ivf_insert_query(tmp_db: TempDatabase) {
     .enumerate()
     {
         let mut cursor = attached.init().unwrap();
-        run(&tmp_db, || cursor.open_write(&conn)).unwrap();
+        run(&tmp_db, || cursor.open_write(&conn, MAIN_DB_ID)).unwrap();
 
         let values = [
             Register::Value(sparse_vector(vector_str)),
@@ -156,7 +156,7 @@ fn test_vector_sparse_ivf_insert_query(tmp_db: TempDatabase) {
         ),
     ] {
         let mut cursor = attached.init().unwrap();
-        run(&tmp_db, || cursor.open_read(&conn)).unwrap();
+        run(&tmp_db, || cursor.open_read(&conn, MAIN_DB_ID)).unwrap();
 
         let values = [
             Register::Value(Value::from_i64(0)),
@@ -208,12 +208,12 @@ fn test_vector_sparse_ivf_update(tmp_db: TempDatabase) {
     conn.wal_insert_begin().unwrap();
     {
         let mut cursor = attached.init().unwrap();
-        run(&tmp_db, || cursor.create(&conn)).unwrap();
+        run(&tmp_db, || cursor.create(&conn, MAIN_DB_ID)).unwrap();
     }
     conn.wal_insert_end(true).unwrap();
 
     let mut writer = attached.init().unwrap();
-    run(&tmp_db, || writer.open_write(&conn)).unwrap();
+    run(&tmp_db, || writer.open_write(&conn, MAIN_DB_ID)).unwrap();
 
     let v0_str = "[0, 1, 0, 0]";
     let v1_str = "[1, 0, 0, 1]";
@@ -240,7 +240,7 @@ fn test_vector_sparse_ivf_update(tmp_db: TempDatabase) {
     .unwrap();
 
     let mut reader = attached.init().unwrap();
-    run(&tmp_db, || reader.open_read(&conn)).unwrap();
+    run(&tmp_db, || reader.open_read(&conn, MAIN_DB_ID)).unwrap();
     assert!(!run(&tmp_db, || reader.query_start(&query_values)).unwrap());
 
     conn.execute(format!(
@@ -251,7 +251,7 @@ fn test_vector_sparse_ivf_update(tmp_db: TempDatabase) {
     run(&tmp_db, || writer.insert(&insert1_values)).unwrap();
 
     let mut reader = attached.init().unwrap();
-    run(&tmp_db, || reader.open_read(&conn)).unwrap();
+    run(&tmp_db, || reader.open_read(&conn, MAIN_DB_ID)).unwrap();
     assert!(run(&tmp_db, || reader.query_start(&query_values)).unwrap());
     assert_eq!(1, run(&tmp_db, || reader.query_rowid()).unwrap().unwrap());
     assert_eq!(
@@ -436,7 +436,7 @@ fn test_fts_create_destroy(tmp_db: TempDatabase) {
     conn.wal_insert_begin().unwrap();
     {
         let mut cursor = attached.init().unwrap();
-        run(&tmp_db, || cursor.create(&conn)).unwrap();
+        run(&tmp_db, || cursor.create(&conn, MAIN_DB_ID)).unwrap();
     }
     conn.wal_insert_end(true).unwrap();
 
@@ -449,7 +449,7 @@ fn test_fts_create_destroy(tmp_db: TempDatabase) {
     conn.wal_insert_begin().unwrap();
     {
         let mut cursor = attached.init().unwrap();
-        run(&tmp_db, || cursor.destroy(&conn)).unwrap();
+        run(&tmp_db, || cursor.destroy(&conn, MAIN_DB_ID)).unwrap();
     }
     conn.wal_insert_end(true).unwrap();
 
@@ -495,7 +495,7 @@ fn test_fts_insert_query(tmp_db: TempDatabase) {
     conn.wal_insert_begin().unwrap();
     {
         let mut cursor = attached.init().unwrap();
-        run(&tmp_db, || cursor.create(&conn)).unwrap();
+        run(&tmp_db, || cursor.create(&conn, MAIN_DB_ID)).unwrap();
     }
     conn.wal_insert_end(true).unwrap();
 
@@ -521,7 +521,7 @@ fn test_fts_insert_query(tmp_db: TempDatabase) {
 
     for (id, title, body) in docs {
         let mut cursor = attached.init().unwrap();
-        run(&tmp_db, || cursor.open_write(&conn)).unwrap();
+        run(&tmp_db, || cursor.open_write(&conn, MAIN_DB_ID)).unwrap();
 
         let values = [
             Register::Value(Value::Text(turso_core::types::Text::from(title))),
@@ -541,7 +541,7 @@ fn test_fts_insert_query(tmp_db: TempDatabase) {
     // Query for "Rust" - should match docs 1 and 3
     {
         let mut cursor = attached.init().unwrap();
-        run(&tmp_db, || cursor.open_read(&conn)).unwrap();
+        run(&tmp_db, || cursor.open_read(&conn, MAIN_DB_ID)).unwrap();
 
         // Pattern 0 = fts_score pattern with ORDER BY DESC LIMIT
         let values = [
@@ -575,7 +575,7 @@ fn test_fts_insert_query(tmp_db: TempDatabase) {
     // Query for "Python" - should match doc 2
     {
         let mut cursor = attached.init().unwrap();
-        run(&tmp_db, || cursor.open_read(&conn)).unwrap();
+        run(&tmp_db, || cursor.open_read(&conn, MAIN_DB_ID)).unwrap();
 
         let values = [
             Register::Value(Value::from_i64(0)),

@@ -41,12 +41,29 @@ impl fmt::Display for OrderDirection {
     }
 }
 
+/// NULLS FIRST/LAST ordering.
+#[derive(Debug, Clone, Copy)]
+pub enum NullsOrder {
+    First,
+    Last,
+}
+
+impl fmt::Display for NullsOrder {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            NullsOrder::First => write!(f, "NULLS FIRST"),
+            NullsOrder::Last => write!(f, "NULLS LAST"),
+        }
+    }
+}
+
 /// An ORDER BY clause item.
 #[derive(Debug, Clone)]
 pub struct OrderByItem {
     /// The expression to order by (can be a column, function call, etc.).
     pub expr: Expression,
     pub direction: OrderDirection,
+    pub nulls: Option<NullsOrder>,
 }
 
 impl OrderByItem {
@@ -55,19 +72,33 @@ impl OrderByItem {
         Self {
             expr: Expression::Column(name.into()),
             direction,
+            nulls: None,
         }
     }
 }
 
 impl fmt::Display for OrderByItem {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{} {}", self.expr, self.direction)
+        write!(f, "{} {}", self.expr, self.direction)?;
+        if let Some(nulls) = &self.nulls {
+            write!(f, " {nulls}")?;
+        }
+        Ok(())
     }
 }
 
 /// Generate an order direction.
 pub fn order_direction() -> impl Strategy<Value = OrderDirection> {
     prop_oneof![Just(OrderDirection::Asc), Just(OrderDirection::Desc),]
+}
+
+/// Generate an optional NULLS FIRST/LAST ordering.
+pub fn nulls_order() -> impl Strategy<Value = Option<NullsOrder>> {
+    prop_oneof![
+        8 => Just(None),
+        1 => Just(Some(NullsOrder::First)),
+        1 => Just(Some(NullsOrder::Last)),
+    ]
 }
 
 // =============================================================================
@@ -636,13 +667,21 @@ pub fn order_by_for_table(
         .with_profile(profile_for_order_by);
 
     proptest::collection::vec(
-        (crate::expression::expression(&ctx), order_direction()),
+        (
+            crate::expression::expression(&ctx),
+            order_direction(),
+            nulls_order(),
+        ),
         0..=max_items,
     )
     .prop_map(|items| {
         items
             .into_iter()
-            .map(|(expr, direction)| OrderByItem { expr, direction })
+            .map(|(expr, direction, nulls)| OrderByItem {
+                expr,
+                direction,
+                nulls,
+            })
             .collect()
     })
     .boxed()
@@ -708,6 +747,7 @@ mod tests {
             order_by: vec![OrderByItem {
                 expr: Expression::Value(SqlValue::Integer(1)),
                 direction: OrderDirection::Asc,
+                nulls: None,
             }],
             limit: Some(1),
             offset: None,
@@ -726,6 +766,7 @@ mod tests {
             order_by: vec![OrderByItem {
                 expr: Expression::Column("id".to_string()),
                 direction: OrderDirection::Asc,
+                nulls: None,
             }],
             limit: Some(1),
             offset: None,

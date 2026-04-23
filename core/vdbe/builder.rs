@@ -1,18 +1,17 @@
 use crate::{turso_assert, turso_assert_eq, turso_debug_assert};
-use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
+use rustc_hash::FxHashMap as HashMap;
 use tracing::{instrument, Level};
 use turso_parser::ast::{self, ResolveType, SortOrder, TableInternalId};
 
 use crate::{
     index_method::IndexMethodAttachment,
     parameters::Parameters,
-    schema::{BTreeTable, Index, PseudoCursorType, Schema, Table, Trigger},
+    schema::{BTreeTable, Column, ColumnLayout, Index, PseudoCursorType, Schema, Table, Trigger},
     translate::{
         collate::CollationSeq,
         emitter::{MaterializedColumnRef, TransactionMode},
         plan::{ResultSetColumn, TableReferences},
     },
-    vdbe::affinity::Affinity,
     Arc, CaptureDataChangesInfo, Connection, VirtualTable,
 };
 
@@ -40,9 +39,11 @@ impl TableRefIdCounter {
 }
 
 use super::{
-    BranchOffset, CursorID, Insn, InsnReference, JumpTarget, PrepareContext, PreparedProgram,
-    Program,
+    affinity::Affinity, BranchOffset, CursorID, Insn, InsnReference, JumpTarget, PrepareContext,
+    PreparedProgram, Program,
 };
+use crate::translate::plan::BitSet;
+use std::num::NonZeroUsize;
 
 /// A key that uniquely identifies a cursor.
 /// The key is a pair of table reference id and index.
@@ -104,14 +105,88 @@ impl CursorKey {
     }
 }
 
-#[allow(dead_code)]
+/// Context for resolving `Expr::Column` that has a `TableInternalId::SELF_TABLE` placeholder.
+#[derive(Clone)]
+pub enum SelfTableContext {
+    ForSelect {
+        table_ref_id: TableInternalId,
+        referenced_tables: TableReferences,
+    },
+    ForDML(DmlColumnContext),
+}
+
+#[derive(Clone)]
+enum DmlColumnRegisters {
+    // Used to compute column registers lazily
+    Layout {
+        base_reg: usize,
+        rowid_reg: usize,
+        layout: ColumnLayout,
+    },
+    Indexed {
+        column_regs: Vec<usize>,
+    },
+}
+
+#[derive(Clone)]
+pub struct DmlColumnContext {
+    registers: DmlColumnRegisters,
+    rowid_alias_col: Option<usize>,
+}
+
+impl DmlColumnContext {
+    pub fn layout(
+        columns: &[Column],
+        base_reg: usize,
+        rowid_reg: usize,
+        layout: ColumnLayout,
+    ) -> Self {
+        let rowid_alias_col = columns.iter().position(|c| c.is_rowid_alias());
+
+        Self {
+            registers: DmlColumnRegisters::Layout {
+                base_reg,
+                rowid_reg,
+                layout,
+            },
+            rowid_alias_col,
+        }
+    }
+
+    pub fn from_column_reg_mapping<'a>(pairs: impl Iterator<Item = (&'a Column, usize)>) -> Self {
+        let mut rowid_alias_col = None;
+        let mut column_regs = Vec::new();
+        for (idx, (col, reg)) in pairs.enumerate() {
+            column_regs.push(reg);
+            if col.is_rowid_alias() {
+                rowid_alias_col = Some(idx);
+            }
+        }
+        Self {
+            registers: DmlColumnRegisters::Indexed { column_regs },
+            rowid_alias_col,
+        }
+    }
+
+    pub fn to_column_reg(&self, col_idx: usize) -> usize {
+        match &self.registers {
+            DmlColumnRegisters::Layout {
+                base_reg,
+                rowid_reg,
+                layout,
+            } => {
+                if self.rowid_alias_col == Some(col_idx) {
+                    *rowid_reg
+                } else {
+                    layout.to_register(*base_reg, col_idx)
+                }
+            }
+            DmlColumnRegisters::Indexed { column_regs } => column_regs[col_idx],
+        }
+    }
+}
+
 pub struct ProgramBuilder {
-    pub table_reference_counter: TableRefIdCounter,
-    next_free_register: usize,
-    next_free_cursor_id: usize,
-    next_hash_table_id: usize,
-    /// Instruction, the function to execute it with, and its original index in the vector.
-    pub insns: Vec<(Insn, usize)>,
     /// A span of instructions from (offset_start_inclusive, offset_end_exclusive),
     /// that are deemed to be compile-time constant and can be hoisted out of loops
     /// so that they get evaluated only once at the start of the program.
@@ -123,58 +198,35 @@ pub struct ProgramBuilder {
     pub cursor_ref: Vec<(Option<CursorKey>, CursorType)>,
     /// A vector where index=label number, value=resolved offset. Resolved in build().
     label_to_resolved_offset: Vec<Option<(InsnReference, JumpTarget)>>,
-    // Bitmask of cursors that have emitted a SeekRowid instruction.
-    seekrowid_emitted_bitmask: u64,
     // map of instruction index to manual comment (used in EXPLAIN only)
     comments: Vec<(InsnReference, &'static str)>,
     pub parameters: Parameters,
     pub result_columns: Vec<ResultSetColumn>,
-    pub table_references: TableReferences,
+    /// Instruction, the function to execute it with, and its original index in the vector.
+    pub insns: Vec<(Insn, usize)>,
+    /// Registry of materialized CTEs, keyed by cte_id.
+    /// Used to share materialized data across multiple CTE references via OpenDup.
+    materialized_ctes: HashMap<usize, MaterializedCteInfo>,
+    /// Stack of CTE names currently being planned. Used to detect circular
+    /// references in non-recursive CTEs and to prevent fallthrough to schema
+    /// resolution for same-named tables/views.
+    ctes_being_defined: Vec<String>,
+    /// If this ProgramBuilder is building trigger subprogram, a ref to the trigger is stored here.
+    pub trigger: Option<Arc<Trigger>>,
+    pub table_reference_counter: TableRefIdCounter,
     /// Curr collation sequence. Bool indicates whether it was set by a COLLATE expr
     collation: Option<(CollationSeq, bool)>,
-    /// Current parsing nesting level
-    nested_level: usize,
-    init_label: BranchOffset,
-    start_offset: BranchOffset,
     capture_data_changes_info: Option<CaptureDataChangesInfo>,
     // TODO: when we support multiple dbs, this should be a write mask to track which DBs need to be written
     txn_mode: TransactionMode,
     /// Set of database IDs that need write transactions (for attached databases).
-    write_databases: HashSet<usize>,
+    write_databases: BitSet,
     /// Set of attached database IDs that need read transactions.
-    read_databases: HashSet<usize>,
+    read_databases: BitSet,
     /// Schema cookies for attached databases at prepare time.
     write_database_cookies: HashMap<usize, u32>,
     /// Schema cookies for attached databases opened for reading.
     read_database_cookies: HashMap<usize, u32>,
-    rollback: bool,
-    /// The mode in which the query is being executed.
-    query_mode: QueryMode,
-    /// Current parent explain address, if any.
-    current_parent_explain_idx: Option<usize>,
-    pub(crate) reg_result_cols_start: Option<usize>,
-    /// Mirrors SQLite's isMultiWrite: true if the statement may modify/insert multiple rows.
-    /// If a non-autocommit transaction can modify multiple rows, statement subjournaling is always
-    /// required for proper cleanup on abort. If only one row can be modified, then journaling is not
-    /// necessary because on abort there is nothing to clean up.
-    /// Defaults to true for safety; specific translate paths (e.g., single-row INSERT) set false.
-    is_multi_write: bool,
-    /// Mirrors SQLite's mayAbort: true if the statement may throw an ABORT exception.
-    /// This flag is used in combination with is_multi_write to determine if statement subjournaling is required.
-    /// Defaults to true for safety; specific translate paths (e.g., INSERT with no constraints) set false.
-    may_abort: bool,
-    /// If this ProgramBuilder is building trigger subprogram, a ref to the trigger is stored here.
-    pub trigger: Option<Arc<Trigger>>,
-    /// Whether this is a subprogram (trigger or FK action). Subprograms skip Transaction instructions.
-    pub is_subprogram: bool,
-    pub resolve_type: ResolveType,
-    /// Whether the resolve_type was explicitly set from a statement-level OR clause.
-    /// When false, per-constraint ON CONFLICT clauses from CREATE TABLE should be used.
-    pub has_statement_conflict: bool,
-    /// When set, all triggers fired from this program should use this conflict resolution.
-    /// This is used in UPSERT DO UPDATE context to ensure nested trigger's OR IGNORE/REPLACE
-    /// clauses don't suppress errors.
-    pub trigger_conflict_override: Option<ResolveType>,
     /// Temporary cursor overrides maps table internal IDs to cursor IDs that should be used instead of the normal resolution.
     /// This allows for things like hash build to use a separate cursor for iterating the same table.
     cursor_overrides: HashMap<usize, CursorID>,
@@ -182,36 +234,171 @@ pub struct ProgramBuilder {
     /// When set, `Expr::Id("value")` resolves to the register holding the input value,
     /// and type parameter names resolve to registers holding their concrete values.
     pub id_register_overrides: HashMap<String, usize>,
-    /// When set, translate_expr will skip custom type decode for Expr::Column.
-    /// This is used when building ORDER BY sort keys so the sorter compares
-    /// encoded (on-disk) values. Decode is presentation-only.
-    pub suppress_custom_type_decode: bool,
-    /// When true, the next `emit_column` call will not bake the default value
-    /// into the Column instruction. Used for custom type columns where the default
-    /// needs to be encoded before use.
-    pub suppress_column_default: bool,
     /// Hash join build signatures keyed by hash table id.
     hash_build_signatures: HashMap<usize, HashBuildSignature>,
     /// Hash tables to keep open across subplans (e.g. materialization).
-    hash_tables_to_keep_open: HashSet<usize>,
+    hash_tables_to_keep_open: BitSet,
     /// Maps table internal_id to result_columns_start_reg for FROM clause subqueries.
     /// Used when nested subqueries need to reference columns from outer query subqueries.
     subquery_result_regs: HashMap<TableInternalId, usize>,
+    /// Context for resolving an Expr::Column that has a [TableInternalId::SELF_TABLE] placeholder.
+    self_table_context: Option<SelfTableContext>,
+    /// The mode in which the query is being executed.
+    query_mode: QueryMode,
+    pub flags: ProgramBuilderFlags,
+    next_free_register: usize,
+    next_free_cursor_id: usize,
+    next_hash_table_id: usize,
+    pub table_references: TableReferences,
+    /// Current parsing nesting level
+    nested_level: usize,
+    init_label: BranchOffset,
+    start_offset: BranchOffset,
+    /// Current parent explain address, if any.
+    current_parent_explain_idx: Option<usize>,
+    pub(crate) reg_result_cols_start: Option<usize>,
+    pub resolve_type: ResolveType,
+    /// When set, all triggers fired from this program should use this conflict resolution.
+    /// This is used in UPSERT DO UPDATE context to ensure nested trigger's OR IGNORE/REPLACE
+    /// clauses don't suppress errors.
+    pub trigger_conflict_override: Option<ResolveType>,
     /// Counter for CTE identity tracking. Each CTE definition gets a unique ID
     /// so that multiple references to the same CTE can share materialized data.
     next_cte_id: usize,
-    /// Registry of materialized CTEs, keyed by cte_id.
-    /// Used to share materialized data across multiple CTE references via OpenDup.
-    materialized_ctes: HashMap<usize, MaterializedCteInfo>,
-    /// Global count of references to each CTE across the entire query.
-    /// Used to determine whether a CTE should be materialized (multi-ref) or use coroutine (single-ref).
-    cte_reference_counts: HashMap<usize, usize>,
-    /// Stack of CTE names currently being planned. Used to detect circular
-    /// references in non-recursive CTEs and to prevent fallthrough to schema
-    /// resolution for same-named tables/views.
-    ctes_being_defined: Vec<String>,
     /// Counter for subquery numbering in EXPLAIN QUERY PLAN output.
     next_subquery_eqp_id: usize,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[repr(transparent)]
+pub struct ProgramBuilderFlags(u8);
+
+impl ProgramBuilderFlags {
+    const ROLLBACK: u8 = 1 << 0;
+    const IS_MULTI_WRITE: u8 = 1 << 1;
+    const MAY_ABORT: u8 = 1 << 2;
+    const READONLY: u8 = 1 << 3;
+    const IS_SUBPROGRAM: u8 = 1 << 4;
+    const HAS_STATEMENT_CONFLICT: u8 = 1 << 5;
+    const SUPPRESS_CUSTOM_TYPE_DECODE: u8 = 1 << 6;
+    const SUPPRESS_COLUMN_DEFAULT: u8 = 1 << 7;
+
+    const fn new(is_subprogram: bool) -> Self {
+        let mut new = Self(0);
+        new.set_is_multi_write(true);
+        new.set_may_abort(true);
+        new.set_readonly(true);
+        new.set_is_subprogram(is_subprogram);
+        new.set_is_multi_write(true);
+        new.set_may_abort(true);
+        new
+    }
+
+    #[inline]
+    const fn get(self, bit: u8) -> bool {
+        (self.0 & bit) != 0
+    }
+
+    #[inline]
+    const fn set(&mut self, bit: u8, value: bool) {
+        if value {
+            self.0 |= bit;
+        } else {
+            self.0 &= !bit;
+        }
+    }
+
+    #[inline]
+    pub const fn rollback(self) -> bool {
+        self.get(Self::ROLLBACK)
+    }
+    #[inline]
+    pub const fn set_rollback(&mut self, v: bool) {
+        self.set(Self::ROLLBACK, v)
+    }
+
+    #[inline]
+    /// Mirrors SQLite's isMultiWrite: true if the statement may modify/insert multiple rows.
+    /// If a non-autocommit transaction can modify multiple rows, statement subjournaling is always
+    /// required for proper cleanup on abort. If only one row can be modified, then journaling is not
+    /// necessary because on abort there is nothing to clean up.
+    /// Defaults to true for safety; specific translate paths (e.g., single-row INSERT) set false.
+    pub const fn is_multi_write(self) -> bool {
+        self.get(Self::IS_MULTI_WRITE)
+    }
+    #[inline]
+    pub const fn set_is_multi_write(&mut self, v: bool) {
+        self.set(Self::IS_MULTI_WRITE, v)
+    }
+
+    #[inline]
+    /// Mirrors SQLite's mayAbort: true if the statement may throw an ABORT exception.
+    /// This flag is used in combination with is_multi_write to determine if statement subjournaling is required.
+    /// Defaults to true for safety; specific translate paths (e.g., INSERT with no constraints) set false.
+    pub const fn may_abort(self) -> bool {
+        self.get(Self::MAY_ABORT)
+    }
+    #[inline]
+    pub const fn set_may_abort(&mut self, v: bool) {
+        self.set(Self::MAY_ABORT, v)
+    }
+
+    #[inline]
+    /// True until the builder emits an opcode that may directly modify persistent
+    /// database contents, mirroring sqlite3_stmt_readonly() classification over
+    /// compiled bytecode.
+    pub const fn readonly(self) -> bool {
+        self.get(Self::READONLY)
+    }
+    #[inline]
+    pub const fn set_readonly(&mut self, v: bool) {
+        self.set(Self::READONLY, v)
+    }
+
+    #[inline]
+    /// Whether this is a subprogram (trigger or FK action). Subprograms skip Transaction instructions.
+    pub const fn is_subprogram(self) -> bool {
+        self.get(Self::IS_SUBPROGRAM)
+    }
+    #[inline]
+    pub const fn set_is_subprogram(&mut self, v: bool) {
+        self.set(Self::IS_SUBPROGRAM, v)
+    }
+
+    #[inline]
+    /// Whether the resolve_type was explicitly set from a statement-level OR clause.
+    /// When false, per-constraint ON CONFLICT clauses from CREATE TABLE should be used.
+    pub fn has_statement_conflict(self) -> bool {
+        self.get(Self::HAS_STATEMENT_CONFLICT)
+    }
+    #[inline]
+    pub fn set_has_statement_conflict(&mut self, v: bool) {
+        self.set(Self::HAS_STATEMENT_CONFLICT, v)
+    }
+
+    #[inline]
+    /// When set, translate_expr will skip custom type decode for Expr::Column.
+    /// This is used when building ORDER BY sort keys so the sorter compares
+    /// encoded (on-disk) values. Decode is presentation-only.
+    pub const fn suppress_custom_type_decode(self) -> bool {
+        self.get(Self::SUPPRESS_CUSTOM_TYPE_DECODE)
+    }
+    #[inline]
+    pub const fn set_suppress_custom_type_decode(&mut self, v: bool) {
+        self.set(Self::SUPPRESS_CUSTOM_TYPE_DECODE, v)
+    }
+
+    #[inline]
+    /// When true, the next `emit_column` call will not bake the default value
+    /// into the Column instruction. Used for custom type columns where the default
+    /// needs to be encoded before use.
+    pub const fn suppress_column_default(self) -> bool {
+        self.get(Self::SUPPRESS_COLUMN_DEFAULT)
+    }
+    #[inline]
+    pub const fn set_suppress_column_default(&mut self, v: bool) {
+        self.set(Self::SUPPRESS_COLUMN_DEFAULT, v)
+    }
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -264,21 +451,21 @@ pub enum CursorType {
 }
 
 impl CursorType {
-    pub fn is_index(&self) -> bool {
+    pub const fn is_index(&self) -> bool {
         matches!(self, CursorType::BTreeIndex(_))
     }
 
     pub fn get_explain_description(&self) -> String {
         let out = match self {
             CursorType::BTreeTable(btree_table) => {
-                let mut col_count = btree_table.columns.len();
+                let mut col_count = btree_table.columns().len();
                 if btree_table.get_rowid_alias_column().is_none() {
                     col_count += 1;
                 }
                 Some((
                     col_count,
                     btree_table
-                        .columns
+                        .columns()
                         .iter()
                         .map(|col| {
                             if let Some(coll) = col.collation_opt() {
@@ -333,7 +520,7 @@ pub enum QueryMode {
 }
 
 impl QueryMode {
-    pub fn new(cmd: &ast::Cmd) -> Self {
+    pub const fn new(cmd: &ast::Cmd) -> Self {
         match cmd {
             ast::Cmd::ExplainQueryPlan(_) => QueryMode::ExplainQueryPlan,
             ast::Cmd::Explain(_) => QueryMode::Explain,
@@ -346,6 +533,20 @@ pub struct ProgramBuilderOpts {
     pub num_cursors: usize,
     pub approx_num_insns: usize,
     pub approx_num_labels: usize,
+}
+
+impl ProgramBuilderOpts {
+    pub const fn new(
+        num_cursors: usize,
+        approx_num_insns: usize,
+        approx_num_labels: usize,
+    ) -> Self {
+        Self {
+            num_cursors,
+            approx_num_insns,
+            approx_num_labels,
+        }
+    }
 }
 
 /// Use this macro to emit an OP_Explain instruction.
@@ -361,6 +562,21 @@ macro_rules! emit_explain {
 }
 
 impl ProgramBuilder {
+    /// Register an `ast::Variable` in the parameter list. Returns the
+    /// `NonZeroUsize` index for use in `Insn::Variable`.
+    pub fn register_variable(&mut self, variable: &ast::Variable) -> NonZeroUsize {
+        let index = usize::try_from(variable.index.get())
+            .expect("u32 variable index must fit into usize")
+            .try_into()
+            .expect("variable index must be non-zero");
+        if let Some(name) = variable.name.as_deref() {
+            self.parameters.push_named_at(name, index);
+        } else {
+            self.parameters.push_index(index);
+        }
+        index
+    }
+
     /// Run a nested emission scope without leaking its result-column register base
     /// into the surrounding builder state.
     pub fn with_scoped_result_cols_start<T>(
@@ -419,7 +635,6 @@ impl ProgramBuilder {
             cursor_ref: Vec::with_capacity(opts.num_cursors),
             constant_spans: Vec::new(),
             label_to_resolved_offset: Vec::with_capacity(opts.approx_num_labels),
-            seekrowid_emitted_bitmask: 0,
             comments: Vec::new(),
             parameters: Parameters::new(),
             result_columns: Vec::new(),
@@ -431,43 +646,37 @@ impl ProgramBuilder {
             start_offset: BranchOffset::Placeholder,
             capture_data_changes_info,
             txn_mode: TransactionMode::None,
-            write_databases: HashSet::default(),
-            read_databases: HashSet::default(),
+            write_databases: BitSet::default(),
+            read_databases: BitSet::default(),
             write_database_cookies: HashMap::default(),
             read_database_cookies: HashMap::default(),
-            rollback: false,
             query_mode,
             current_parent_explain_idx: None,
             reg_result_cols_start: None,
-            is_multi_write: true,
-            may_abort: true,
+            flags: ProgramBuilderFlags::new(is_subprogram),
             trigger,
-            is_subprogram,
             resolve_type: ResolveType::Abort,
-            has_statement_conflict: false,
             trigger_conflict_override: None,
             cursor_overrides: HashMap::default(),
             id_register_overrides: HashMap::default(),
-            suppress_custom_type_decode: false,
-            suppress_column_default: false,
             hash_build_signatures: HashMap::default(),
-            hash_tables_to_keep_open: HashSet::default(),
+            hash_tables_to_keep_open: BitSet::default(),
             subquery_result_regs: HashMap::default(),
+            self_table_context: None,
             next_cte_id: 0,
             materialized_ctes: HashMap::default(),
-            cte_reference_counts: HashMap::default(),
             ctes_being_defined: Vec::new(),
             next_subquery_eqp_id: 1,
         }
     }
 
-    pub fn next_subquery_eqp_id(&mut self) -> usize {
+    pub const fn next_subquery_eqp_id(&mut self) -> usize {
         let id = self.next_subquery_eqp_id;
         self.next_subquery_eqp_id += 1;
         id
     }
 
-    pub fn alloc_hash_table_id(&mut self) -> usize {
+    pub const fn alloc_hash_table_id(&mut self) -> usize {
         let id = self.next_hash_table_id;
         self.next_hash_table_id = self
             .next_hash_table_id
@@ -478,7 +687,7 @@ impl ProgramBuilder {
 
     /// Allocate a unique CTE identity. Each CTE definition in a query gets a unique ID
     /// so that multiple references to the same CTE can share materialized data via OpenDup.
-    pub fn alloc_cte_id(&mut self) -> usize {
+    pub const fn alloc_cte_id(&mut self) -> usize {
         let id = self.next_cte_id;
         self.next_cte_id += 1;
         id
@@ -493,18 +702,6 @@ impl ProgramBuilder {
     /// Register a materialized CTE so that subsequent references can share it via OpenDup.
     pub fn register_materialized_cte(&mut self, cte_id: usize, info: MaterializedCteInfo) {
         self.materialized_ctes.insert(cte_id, info);
-    }
-
-    /// Increment the global reference count for a CTE.
-    /// Called during planning when a CTE reference is created.
-    pub fn increment_cte_reference(&mut self, cte_id: usize) {
-        *self.cte_reference_counts.entry(cte_id).or_insert(0) += 1;
-    }
-
-    /// Get the global reference count for a CTE.
-    /// Used during emission to decide whether to materialize (multi-ref) or use coroutine (single-ref).
-    pub fn get_cte_reference_count(&self, cte_id: usize) -> usize {
-        self.cte_reference_counts.get(&cte_id).copied().unwrap_or(0)
     }
 
     /// Mark a CTE name as currently being planned. While on the stack,
@@ -535,29 +732,29 @@ impl ProgramBuilder {
         self.ctes_being_defined = saved;
     }
 
-    pub fn set_resolve_type(&mut self, resolve_type: ResolveType) {
+    pub const fn set_resolve_type(&mut self, resolve_type: ResolveType) {
         self.resolve_type = resolve_type;
     }
 
     /// Set the trigger conflict override. When set, all triggers fired from this program
     /// should use this conflict resolution instead of their own OR clauses.
-    pub fn set_trigger_conflict_override(&mut self, resolve_type: ResolveType) {
+    pub const fn set_trigger_conflict_override(&mut self, resolve_type: ResolveType) {
         self.trigger_conflict_override = Some(resolve_type);
     }
 
     /// Returns true if the given hash table id should be kept open across subplans.
     pub fn should_keep_hash_table_open(&self, hash_table_id: usize) -> bool {
-        self.hash_tables_to_keep_open.contains(&hash_table_id)
+        self.hash_tables_to_keep_open.get(hash_table_id)
     }
 
     /// Set the set of hash tables to keep open across subplans.
-    pub fn set_hash_tables_to_keep_open(&mut self, tables: &HashSet<usize>) {
+    pub fn set_hash_tables_to_keep_open(&mut self, tables: &BitSet) {
         self.hash_tables_to_keep_open.clone_from(tables);
     }
 
     /// Reset the set of hash tables to keep open.
     pub fn clear_hash_tables_to_keep_open(&mut self) {
-        self.hash_tables_to_keep_open.clear();
+        self.hash_tables_to_keep_open = BitSet::default();
     }
 
     /// Returns true if the given hash build signature matches the recorded one for the given hash table id.
@@ -604,16 +801,16 @@ impl ProgramBuilder {
 
     /// Mark that this statement may modify/insert multiple rows (mirrors SQLite's sqlite3MultiWrite).
     /// When false, statement journals are skipped since single-write statements are atomic.
-    pub fn set_multi_write(&mut self, is_multi_write: bool) {
-        self.is_multi_write = is_multi_write;
+    pub const fn set_multi_write(&mut self, is_multi_write: bool) {
+        self.flags.set_is_multi_write(is_multi_write);
     }
 
     /// Mark that this statement may throw an ABORT exception (mirrors SQLite's sqlite3MayAbort).
-    pub fn set_may_abort(&mut self, may_abort: bool) {
-        self.may_abort = may_abort;
+    pub const fn set_may_abort(&mut self, may_abort: bool) {
+        self.flags.set_may_abort(may_abort);
     }
 
-    pub fn capture_data_changes_info(&self) -> &Option<CaptureDataChangesInfo> {
+    pub const fn capture_data_changes_info(&self) -> &Option<CaptureDataChangesInfo> {
         &self.capture_data_changes_info
     }
 
@@ -663,7 +860,7 @@ impl ProgramBuilder {
     /// Get the index of the next constant span.
     /// Used in [crate::translate::expr::translate_expr_no_constant_opt()] to invalidate
     /// all constant spans after the given index.
-    pub fn constant_spans_next_idx(&self) -> usize {
+    pub const fn constant_spans_next_idx(&self) -> usize {
         self.constant_spans.len()
     }
 
@@ -674,20 +871,20 @@ impl ProgramBuilder {
         self.constant_spans.truncate(idx);
     }
 
-    pub fn alloc_register(&mut self) -> usize {
+    pub const fn alloc_register(&mut self) -> usize {
         let reg = self.next_free_register;
         self.next_free_register += 1;
         reg
     }
 
-    pub fn alloc_registers(&mut self, amount: usize) -> usize {
+    pub const fn alloc_registers(&mut self, amount: usize) -> usize {
         let reg = self.next_free_register;
         self.next_free_register += amount;
         reg
     }
 
     /// Returns the next register that will be allocated by alloc_register/alloc_registers.
-    pub fn peek_next_register(&self) -> usize {
+    pub const fn peek_next_register(&self) -> usize {
         self.next_free_register
     }
 
@@ -770,10 +967,11 @@ impl ProgramBuilder {
     pub fn add_pragma_result_column(&mut self, col_name: String) {
         // TODO figure out a better type definition for ResultSetColumn
         // or invent another way to set pragma result columns
-        let expr = ast::Expr::Id(ast::Name::exact("".to_string()));
+        let expr = ast::Expr::Id(ast::Name::empty());
         self.result_columns.push(ResultSetColumn {
             expr,
             alias: Some(col_name),
+            implicit_column_name: None,
             contains_aggregates: false,
         });
     }
@@ -782,6 +980,8 @@ impl ProgramBuilder {
     pub fn emit_insn(&mut self, insn: Insn) {
         // This seemingly empty trace here is needed so that a function span is emmited with it
         tracing::trace!("");
+        self.flags
+            .set_readonly(self.flags.readonly() & insn.is_readonly());
         self.insns.push((insn, self.insns.len()));
     }
 
@@ -863,7 +1063,7 @@ impl ProgramBuilder {
         }
     }
 
-    pub fn get_query_mode(&self) -> QueryMode {
+    pub const fn get_query_mode(&self) -> QueryMode {
         self.query_mode
     }
 
@@ -976,7 +1176,7 @@ impl ProgramBuilder {
         }
     }
 
-    pub fn offset(&self) -> BranchOffset {
+    pub const fn offset(&self) -> BranchOffset {
         BranchOffset::Offset(self.insns.len() as InsnReference)
     }
 
@@ -1339,11 +1539,11 @@ impl ProgramBuilder {
             .map(|(_, cursor_type)| cursor_type)
     }
 
-    pub fn set_collation(&mut self, c: Option<(CollationSeq, bool)>) {
+    pub const fn set_collation(&mut self, c: Option<(CollationSeq, bool)>) {
         self.collation = c
     }
 
-    pub fn curr_collation_ctx(&self) -> Option<(CollationSeq, bool)> {
+    pub const fn curr_collation_ctx(&self) -> Option<(CollationSeq, bool)> {
         self.collation
     }
 
@@ -1351,7 +1551,7 @@ impl ProgramBuilder {
         self.collation.map(|c| c.0)
     }
 
-    pub fn reset_collation(&mut self) {
+    pub const fn reset_collation(&mut self) {
         self.collation = None;
     }
 
@@ -1364,24 +1564,24 @@ impl ProgramBuilder {
     }
 
     #[inline]
-    fn incr_nesting(&mut self) {
+    const fn incr_nesting(&mut self) {
         self.nested_level += 1;
     }
 
     #[inline]
-    fn decr_nesting(&mut self) {
+    const fn decr_nesting(&mut self) {
         self.nested_level -= 1;
     }
 
     /// Returns true if we are inside a nested subquery context.
     #[inline]
-    pub fn is_nested(&self) -> bool {
+    pub const fn is_nested(&self) -> bool {
         self.nested_level > 0
     }
 
     /// Initialize the program with basic setup and return initial metadata and labels
     pub fn prologue(&mut self) {
-        if self.is_subprogram {
+        if self.flags.is_subprogram() {
             // Subprograms (triggers, FK actions) don't need Transaction - they run within parent's tx
             self.init_label = self.allocate_label();
             self.emit_insn(Insn::Init {
@@ -1405,13 +1605,13 @@ impl ProgramBuilder {
     /// Tries to mirror: https://github.com/sqlite/sqlite/blob/e77e589a35862f6ac9c4141cfd1beb2844b84c61/src/build.c#L5379
     pub fn begin_write_operation(&mut self) {
         self.txn_mode = TransactionMode::Write;
-        self.write_databases.insert(0);
+        self.write_databases.set(crate::MAIN_DB_ID);
     }
 
     /// Begin a write operation on a specific database (for attached databases).
     pub fn begin_write_on_database(&mut self, database_id: usize, schema_cookie: u32) {
         self.txn_mode = TransactionMode::Write;
-        self.write_databases.insert(database_id);
+        self.write_databases.set(database_id);
         self.write_database_cookies
             .insert(database_id, schema_cookie);
     }
@@ -1421,34 +1621,35 @@ impl ProgramBuilder {
         if matches!(self.txn_mode, TransactionMode::None) {
             self.txn_mode = TransactionMode::Read;
         }
+        self.read_databases.set(crate::MAIN_DB_ID);
     }
 
     /// Begin a read operation on a specific attached database.
     /// This ensures a Transaction instruction is emitted for the attached pager
     /// so that a WAL read lock is acquired.
     pub fn begin_read_on_database(&mut self, database_id: usize, schema_cookie: u32) {
-        self.begin_read_operation();
-        if crate::is_attached_db(database_id) {
-            self.read_databases.insert(database_id);
-            self.read_database_cookies
-                .insert(database_id, schema_cookie);
+        if matches!(self.txn_mode, TransactionMode::None) {
+            self.txn_mode = TransactionMode::Read;
         }
+        self.read_databases.set(database_id);
+        self.read_database_cookies
+            .insert(database_id, schema_cookie);
     }
 
-    pub fn begin_concurrent_operation(&mut self) {
+    pub const fn begin_concurrent_operation(&mut self) {
         self.txn_mode = TransactionMode::Concurrent;
     }
 
     /// Indicates the rollback behvaiour for the halt instruction in epilogue
-    pub fn rollback(&mut self) {
-        self.rollback = true;
+    pub const fn rollback(&mut self) {
+        self.flags.set_rollback(true);
     }
 
     /// Clean up and finalize the program, resolving any remaining labels
     /// Note that although these are the final instructions, typically an SQLite
     /// query will jump to the Transaction instruction via init_label.
     pub fn epilogue(&mut self, schema: &Schema) {
-        if self.is_subprogram {
+        if self.flags.is_subprogram() {
             // Subprograms (triggers, FK actions) just emit Halt without Transaction
             let description = if self.trigger.is_some() {
                 "trigger"
@@ -1465,40 +1666,40 @@ impl ProgramBuilder {
         }
         if self.nested_level == 0 {
             // "rollback" flag is used to determine if halt should rollback the transaction.
-            self.emit_halt(self.rollback);
+            self.emit_halt(self.flags.rollback());
             self.preassign_label_to_next_insn(self.init_label);
 
             if !matches!(self.txn_mode, TransactionMode::None) {
-                // Emit Transaction for main database always
-                self.emit_insn(Insn::Transaction {
-                    db: crate::MAIN_DB_ID,
-                    tx_mode: self.txn_mode,
-                    schema_cookie: schema.schema_version,
-                });
-                // Emit Transaction for each attached database that needs a write
-                for &db_id in &self.write_databases.clone() {
-                    if crate::is_attached_db(db_id) {
-                        let cookie = self
-                            .write_database_cookies
+                let write_dbs = self.write_databases.clone();
+                for db_id in &write_dbs {
+                    let schema_cookie = if db_id == crate::MAIN_DB_ID {
+                        schema.schema_version
+                    } else {
+                        self.write_database_cookies
                             .get(&db_id)
                             .copied()
-                            .unwrap_or(0);
-                        self.emit_insn(Insn::Transaction {
-                            db: db_id,
-                            tx_mode: self.txn_mode,
-                            schema_cookie: cookie,
-                        });
-                    }
+                            .unwrap_or(0)
+                    };
+                    self.emit_insn(Insn::Transaction {
+                        db: db_id,
+                        tx_mode: self.txn_mode,
+                        schema_cookie,
+                    });
                 }
-                // Emit Transaction for each attached database that only needs a read
+                // Emit Transaction for each non-main database that only needs a read
                 // (skip databases already covered by write_databases)
-                for &db_id in &self.read_databases.clone() {
-                    if !self.write_databases.contains(&db_id) {
-                        let cookie = self.read_database_cookies.get(&db_id).copied().unwrap_or(0);
+                let read_dbs = self.read_databases.clone();
+                for db_id in &read_dbs {
+                    if !write_dbs.get(db_id) {
+                        let schema_cookie = if db_id == crate::MAIN_DB_ID {
+                            schema.schema_version
+                        } else {
+                            self.read_database_cookies.get(&db_id).copied().unwrap_or(0)
+                        };
                         self.emit_insn(Insn::Transaction {
                             db: db_id,
                             tx_mode: TransactionMode::Read,
-                            schema_cookie: cookie,
+                            schema_cookie,
                         });
                     }
                 }
@@ -1521,6 +1722,14 @@ impl ProgramBuilder {
     /// Returns true if the cursor is a BTreeTable cursor.
     pub fn cursor_is_btree(&self, cursor_id: CursorID) -> bool {
         matches!(self.cursor_ref[cursor_id].1, CursorType::BTreeTable(_))
+    }
+
+    /// Returns the BTreeTable for the given cursor, if it is a BTreeTable cursor.
+    pub fn btree_table_from_cursor(&self, cursor_id: CursorID) -> Option<&Arc<BTreeTable>> {
+        match &self.cursor_ref[cursor_id].1 {
+            CursorType::BTreeTable(t) => Some(t),
+            _ => None,
+        }
     }
 
     #[inline]
@@ -1559,13 +1768,13 @@ impl ProgramBuilder {
         let (_, cursor_type) = self.cursor_ref.get(cursor_id).expect("cursor_id is valid");
         if let CursorType::BTreeTable(btree) = cursor_type {
             let column_def = btree
-                .columns
+                .columns()
                 .get(column)
                 .expect("column index out of bounds");
             if column_def.is_rowid_alias() {
                 // Consume the suppress_column_default flag so it doesn't
                 // leak to the next column (emit_column normally consumes it).
-                self.suppress_column_default = false;
+                self.flags.set_suppress_column_default(false);
                 self.emit_insn(Insn::RowId {
                     cursor_id,
                     dest: out,
@@ -1578,14 +1787,40 @@ impl ProgramBuilder {
         }
     }
 
+    /// Emit an Affinity instruction for a single register with the given column affinity.
+    pub fn emit_column_affinity(&mut self, register: usize, affinity: Affinity) {
+        self.emit_insn(Insn::Affinity {
+            start_reg: register,
+            count: NonZeroUsize::MIN,
+            affinities: affinity.aff_mask().to_string(),
+        });
+    }
+
     fn emit_column(&mut self, cursor_id: CursorID, column: usize, out: usize) {
         let (_, cursor_type) = self.cursor_ref.get(cursor_id).expect("cursor_id is valid");
 
+        if let CursorType::BTreeTable(btree) = cursor_type {
+            let column_def = btree
+                .columns()
+                .get(column)
+                .expect("column index out of bounds");
+            turso_assert!(
+                !column_def.is_virtual_generated(),
+                "emit_column called with virtual generated column index",
+                {"column_index": column}
+            );
+        }
+
+        let physical_column = match cursor_type {
+            CursorType::BTreeTable(btree) => btree.logical_to_physical_column(column),
+            _ => column,
+        };
+
         let default = 'value: {
             let default = match cursor_type {
-                CursorType::BTreeTable(btree) => &btree.columns[column].default,
+                CursorType::BTreeTable(btree) => &btree.columns()[column].default,
                 CursorType::BTreeIndex(index) => &index.columns[column].default,
-                CursorType::MaterializedView(btree, _) => &btree.columns[column].default,
+                CursorType::MaterializedView(btree, _) => &btree.columns()[column].default,
                 _ => break 'value None,
             };
 
@@ -1610,8 +1845,8 @@ impl ProgramBuilder {
             // pCol->affinity. This ensures e.g. ALTER TABLE ADD COLUMN c TEXT
             // DEFAULT 0 returns text "0" rather than integer 0 for pre-existing rows.
             let affinity = match cursor_type {
-                CursorType::BTreeTable(btree) => btree.columns[column].affinity(),
-                CursorType::MaterializedView(btree, _) => btree.columns[column].affinity(),
+                CursorType::BTreeTable(btree) => btree.columns()[column].affinity(),
+                CursorType::MaterializedView(btree, _) => btree.columns()[column].affinity(),
                 _ => Affinity::Blob,
             };
             if let Some(converted) = affinity.convert(&value) {
@@ -1624,8 +1859,8 @@ impl ProgramBuilder {
             Some(value)
         };
 
-        let default = if self.suppress_column_default {
-            self.suppress_column_default = false;
+        let default = if self.flags.suppress_column_default() {
+            self.flags.set_suppress_column_default(false);
             None
         } else {
             default
@@ -1633,7 +1868,7 @@ impl ProgramBuilder {
 
         self.emit_insn(Insn::Column {
             cursor_id,
-            column,
+            column: physical_column,
             dest: out,
             default,
         });
@@ -1655,8 +1890,8 @@ impl ProgramBuilder {
         // need statement-level rollback. Both flags default to true; specific translate paths
         // (e.g., single-row INSERT) set is_multi_write=false to opt out.
         let needs_stmt_subtransactions = matches!(self.txn_mode, TransactionMode::Write)
-            && self.is_multi_write
-            && self.may_abort;
+            && self.flags.is_multi_write()
+            && self.flags.may_abort();
 
         let contains_trigger_subprograms = self
             .insns
@@ -1670,6 +1905,7 @@ impl ProgramBuilder {
             comments: self.comments,
             parameters: self.parameters,
             change_cnt_on,
+            readonly: self.flags.readonly(),
             result_columns: self.result_columns,
             table_references: self.table_references,
             sql: sql.to_string(),
@@ -1677,7 +1913,7 @@ impl ProgramBuilder {
                 needs_stmt_subtransactions,
             )),
             trigger: self.trigger.take(),
-            is_subprogram: self.is_subprogram,
+            is_subprogram: self.flags.is_subprogram(),
             contains_trigger_subprograms,
             resolve_type: self.resolve_type,
             prepare_context,
@@ -1696,5 +1932,33 @@ impl ProgramBuilder {
         let prepare_context = PrepareContext::from_connection(&connection);
         let prepared = self.build_prepared_program(prepare_context, change_cnt_on, sql)?;
         Ok(Program::from_prepared(Arc::new(prepared), connection))
+    }
+
+    pub fn with_existing_self_table_context<T>(
+        &mut self,
+        f: impl FnOnce(&mut ProgramBuilder, Option<&SelfTableContext>) -> crate::Result<T>,
+    ) -> crate::Result<T> {
+        let result = f(self, self.self_table_context.clone().as_ref())?;
+        Ok(result)
+    }
+
+    pub fn with_self_table_context<T>(
+        &mut self,
+        ctx: Option<&SelfTableContext>,
+        f: impl FnOnce(&mut ProgramBuilder, Option<&SelfTableContext>) -> crate::Result<T>,
+    ) -> crate::Result<T> {
+        if ctx.is_none() {
+            return f(self, ctx);
+        }
+
+        let prev = self.self_table_context.take();
+        self.self_table_context = ctx.cloned();
+        let result = f(self, ctx);
+        self.self_table_context = prev;
+        result
+    }
+
+    pub const fn self_table_context(&self) -> &Option<SelfTableContext> {
+        &self.self_table_context
     }
 }

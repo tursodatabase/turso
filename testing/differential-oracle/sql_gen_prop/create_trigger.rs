@@ -315,11 +315,19 @@ pub struct CreateTriggerStatement {
     pub name: String,
     /// Whether to use IF NOT EXISTS.
     pub if_not_exists: bool,
+    /// Whether this is a `CREATE TEMP TRIGGER`. TEMP triggers live in
+    /// the temp schema regardless of any qualifier on the trigger
+    /// name, and are the only way to target a temp table's name from
+    /// a trigger (ordinary CREATE TRIGGER can't say `ON temp.t`).
+    pub temporary: bool,
     /// When the trigger fires (BEFORE, AFTER).
     pub timing: TriggerTiming,
     /// What event fires the trigger (INSERT, UPDATE, DELETE).
     pub event: TriggerEvent,
-    /// Table name the trigger is on.
+    /// Table name the trigger is on. **Must be unqualified.** SQLite's
+    /// grammar does not accept `CREATE TRIGGER ... ON temp.t`; the
+    /// qualifier belongs on the trigger NAME or is implied by
+    /// `CREATE TEMP TRIGGER`.
     pub table_name: String,
     /// The trigger body (SQL statements).
     pub body: Vec<TriggerSqlStatement>,
@@ -327,7 +335,11 @@ pub struct CreateTriggerStatement {
 
 impl fmt::Display for CreateTriggerStatement {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "CREATE TRIGGER ")?;
+        if self.temporary {
+            write!(f, "CREATE TEMP TRIGGER ")?;
+        } else {
+            write!(f, "CREATE TRIGGER ")?;
+        }
         if self.if_not_exists {
             write!(f, "IF NOT EXISTS ")?;
         }
@@ -385,22 +397,32 @@ pub fn create_trigger_with_timing_event(
     timing: TriggerTiming,
     event: TriggerEvent,
 ) -> BoxedStrategy<CreateTriggerStatement> {
-    let table_name = table.name.clone();
+    let table_name = table.unqualified_name().to_string();
     let existing_triggers = schema.trigger_names();
+    // TEMP triggers are required for temp-schema targets (non-temp
+    // triggers can't `ON temp.t`) and are interesting on main too
+    // because they exercise the temp-trigger-on-main code path that
+    // Phase 1.4 tightened up. Always temporary for temp tables;
+    // random 50/50 otherwise.
+    let must_be_temp = matches!(table.database.as_deref(), Some("temp"));
 
     (
         identifier_excluding(existing_triggers),
         any::<bool>(),
+        any::<bool>(),
         trigger_body(table, schema, profile),
     )
-        .prop_map(move |(name, if_not_exists, body)| CreateTriggerStatement {
-            name,
-            if_not_exists,
-            timing,
-            event,
-            table_name: table_name.clone(),
-            body,
-        })
+        .prop_map(
+            move |(name, if_not_exists, rand_temp, body)| CreateTriggerStatement {
+                name,
+                if_not_exists,
+                temporary: must_be_temp || rand_temp,
+                timing,
+                event,
+                table_name: table_name.clone(),
+                body,
+            },
+        )
         .boxed()
 }
 
@@ -472,7 +494,9 @@ mod tests {
         #[test]
         fn create_trigger_generates_valid_sql(stmt in create_trigger_for_table(&test_table().into(), &test_schema(), &Default::default())) {
             let sql = stmt.to_string();
-            prop_assert!(sql.starts_with("CREATE TRIGGER"));
+            prop_assert!(
+                sql.starts_with("CREATE TRIGGER") || sql.starts_with("CREATE TEMP TRIGGER")
+            );
             prop_assert!(sql.contains("ON users"));
             prop_assert!(sql.contains("BEGIN") && sql.contains("END"));
         }
@@ -480,7 +504,9 @@ mod tests {
         #[test]
         fn create_trigger_for_schema_generates_valid_sql(stmt in create_trigger_for_schema(&test_schema(), &Default::default())) {
             let sql = stmt.to_string();
-            prop_assert!(sql.starts_with("CREATE TRIGGER"));
+            prop_assert!(
+                sql.starts_with("CREATE TRIGGER") || sql.starts_with("CREATE TEMP TRIGGER")
+            );
             prop_assert!(sql.contains("BEGIN") && sql.contains("END"));
         }
 

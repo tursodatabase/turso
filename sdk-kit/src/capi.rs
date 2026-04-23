@@ -2,7 +2,7 @@
 
 use std::time::Duration;
 
-use turso_core::{types::Text, IOResult};
+use turso_core::{types::AsValueRef, types::Text, IOResult};
 use turso_sdk_kit_macros::signature;
 
 use crate::rsapi::{
@@ -347,29 +347,55 @@ pub extern "C" fn turso_statement_column_decltype(
     }
 }
 
+/// Lock the statement handle and get a ValueRef for the given row index.
+/// Returns None if the statement is null, finalized, has no row, or index is out of bounds.
+/// The returned MutexGuard must be kept alive for the duration of ValueRef use.
+macro_rules! with_row_value {
+    ($statement:expr, $index:expr, $default:expr, $body:expr) => {{
+        let statement = match unsafe { TursoStatement::ref_from_capi($statement) } {
+            Ok(s) => s,
+            Err(_) => return $default,
+        };
+        let handle = statement.handle.lock().unwrap();
+        let Some(stmt) = handle.as_ref() else {
+            return $default;
+        };
+        let Some(row) = stmt.row() else {
+            return $default;
+        };
+        if $index >= row.len() {
+            return $default;
+        }
+        let value_ref = row.get_value($index).as_value_ref();
+        #[allow(clippy::redundant_closure_call)]
+        ($body)(value_ref)
+    }};
+}
+
 #[no_mangle]
 #[signature(c)]
 pub extern "C" fn turso_statement_row_value_kind(
     statement: *const c::turso_statement_t,
     index: usize,
 ) -> c::turso_type_t {
-    let statement = match unsafe { TursoStatement::ref_from_capi(statement) } {
-        Ok(statement) => statement,
-        Err(_) => return c::turso_type_t::TURSO_TYPE_UNKNOWN,
-    };
-    let value = statement.row_value(index);
-    match value {
-        Ok(turso_core::ValueRef::Null) => c::turso_type_t::TURSO_TYPE_NULL,
-        Ok(turso_core::ValueRef::Numeric(turso_core::Numeric::Integer(..))) => {
-            c::turso_type_t::TURSO_TYPE_INTEGER
+    with_row_value!(
+        statement,
+        index,
+        c::turso_type_t::TURSO_TYPE_UNKNOWN,
+        |value_ref: turso_core::ValueRef| {
+            match value_ref {
+                turso_core::ValueRef::Null => c::turso_type_t::TURSO_TYPE_NULL,
+                turso_core::ValueRef::Numeric(turso_core::Numeric::Integer(..)) => {
+                    c::turso_type_t::TURSO_TYPE_INTEGER
+                }
+                turso_core::ValueRef::Numeric(turso_core::Numeric::Float(..)) => {
+                    c::turso_type_t::TURSO_TYPE_REAL
+                }
+                turso_core::ValueRef::Text(..) => c::turso_type_t::TURSO_TYPE_TEXT,
+                turso_core::ValueRef::Blob(..) => c::turso_type_t::TURSO_TYPE_BLOB,
+            }
         }
-        Ok(turso_core::ValueRef::Numeric(turso_core::Numeric::Float(..))) => {
-            c::turso_type_t::TURSO_TYPE_REAL
-        }
-        Ok(turso_core::ValueRef::Text(..)) => c::turso_type_t::TURSO_TYPE_TEXT,
-        Ok(turso_core::ValueRef::Blob(..)) => c::turso_type_t::TURSO_TYPE_BLOB,
-        Err(_) => c::turso_type_t::TURSO_TYPE_UNKNOWN,
-    }
+    )
 }
 
 #[no_mangle]
@@ -378,16 +404,13 @@ pub extern "C" fn turso_statement_row_value_bytes_count(
     statement: *const c::turso_statement_t,
     index: usize,
 ) -> i64 {
-    let statement = match unsafe { TursoStatement::ref_from_capi(statement) } {
-        Ok(statement) => statement,
-        Err(_) => return -1,
-    };
-    let value = statement.row_value(index);
-    match value {
-        Ok(turso_core::ValueRef::Text(text)) => text.len() as i64,
-        Ok(turso_core::ValueRef::Blob(blob)) => blob.len() as i64,
-        _ => -1,
-    }
+    with_row_value!(statement, index, -1, |value_ref: turso_core::ValueRef| {
+        match value_ref {
+            turso_core::ValueRef::Text(text) => text.len() as i64,
+            turso_core::ValueRef::Blob(blob) => blob.len() as i64,
+            _ => -1,
+        }
+    })
 }
 
 #[no_mangle]
@@ -396,16 +419,20 @@ pub extern "C" fn turso_statement_row_value_bytes_ptr(
     statement: *const c::turso_statement_t,
     index: usize,
 ) -> *const std::ffi::c_char {
-    let statement = match unsafe { TursoStatement::ref_from_capi(statement) } {
-        Ok(statement) => statement,
-        Err(_) => return std::ptr::null(),
-    };
-    let value = statement.row_value(index);
-    match value {
-        Ok(turso_core::ValueRef::Text(text)) => text.as_bytes().as_ptr() as *const std::ffi::c_char,
-        Ok(turso_core::ValueRef::Blob(blob)) => blob.as_ptr() as *const std::ffi::c_char,
-        _ => std::ptr::null(),
-    }
+    with_row_value!(
+        statement,
+        index,
+        std::ptr::null(),
+        |value_ref: turso_core::ValueRef| {
+            match value_ref {
+                turso_core::ValueRef::Text(text) => {
+                    text.as_bytes().as_ptr() as *const std::ffi::c_char
+                }
+                turso_core::ValueRef::Blob(blob) => blob.as_ptr() as *const std::ffi::c_char,
+                _ => std::ptr::null(),
+            }
+        }
+    )
 }
 
 #[no_mangle]
@@ -414,15 +441,12 @@ pub extern "C" fn turso_statement_row_value_int(
     statement: *const c::turso_statement_t,
     index: usize,
 ) -> i64 {
-    let statement = match unsafe { TursoStatement::ref_from_capi(statement) } {
-        Ok(statement) => statement,
-        Err(_) => return 0,
-    };
-    let value = statement.row_value(index);
-    match value {
-        Ok(turso_core::ValueRef::Numeric(turso_core::Numeric::Integer(value))) => value,
-        _ => 0,
-    }
+    with_row_value!(statement, index, 0, |value_ref: turso_core::ValueRef| {
+        match value_ref {
+            turso_core::ValueRef::Numeric(turso_core::Numeric::Integer(value)) => value,
+            _ => 0,
+        }
+    })
 }
 
 #[no_mangle]
@@ -431,15 +455,12 @@ pub extern "C" fn turso_statement_row_value_double(
     statement: *const c::turso_statement_t,
     index: usize,
 ) -> f64 {
-    let statement = match unsafe { TursoStatement::ref_from_capi(statement) } {
-        Ok(statement) => statement,
-        Err(_) => return 0.0,
-    };
-    let value = statement.row_value(index);
-    match value {
-        Ok(turso_core::ValueRef::Numeric(turso_core::Numeric::Float(value))) => f64::from(value),
-        _ => 0.0,
-    }
+    with_row_value!(statement, index, 0.0, |value_ref: turso_core::ValueRef| {
+        match value_ref {
+            turso_core::ValueRef::Numeric(turso_core::Numeric::Float(value)) => f64::from(value),
+            _ => 0.0,
+        }
+    })
 }
 
 #[no_mangle]

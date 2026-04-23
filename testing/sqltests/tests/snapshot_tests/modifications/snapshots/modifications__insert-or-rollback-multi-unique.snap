@@ -23,12 +23,12 @@ addr  opcode         p1  p2  p3  p4             p5  comment
    6  String8         0   6   0  Widget          0  r[6]='Widget'
    7  OpenWrite       0  10   0                  0  root=10; iDb=0
    8  OpenWrite       1   9   0                  0  root=9; iDb=0
-   9  NotNull         2  11   0                  0  r[2]!=NULL -> goto 11
-  10  Goto            0  13   0                  0
-  11  MustBeInt       2   0   0                  0
-  12  Goto            0  14   0                  0
-  13  NewRowid        2   2   0                  0  r[2]=rowid
-  14  Affinity        3   4   0                  0  r[3..7] = D, B, B, B
+   9  Affinity        3   4   0                  0  r[3..7] = D, B, B, B
+  10  NotNull         2  12   0                  0  r[2]!=NULL -> goto 12
+  11  Goto            0  14   0                  0
+  12  MustBeInt       2   0   0                  0
+  13  Goto            0  15   0                  0
+  14  NewRowid        2   2   0                  0  r[2]=rowid
   15  HaltIfNull   1299   0   4  items.sku       0
   16  HaltIfNull   1299   0   5  items.barcode   0
   17  NotExists       2  19   2                  0

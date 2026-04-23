@@ -42,15 +42,17 @@ import { connect } from '@tursodatabase/database';
 const db = await connect(':memory:');
 
 // Create a table
-db.exec('CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT, email TEXT)');
+await db.exec(
+  'CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT, email TEXT)'
+);
 
 // Insert data
 const insert = db.prepare('INSERT INTO users (name, email) VALUES (?, ?)');
-insert.run('Alice', 'alice@example.com');
-insert.run('Bob', 'bob@example.com');
+await insert.run('Alice', 'alice@example.com');
+await insert.run('Bob', 'bob@example.com');
 
 // Query data
-const users = db.prepare('SELECT * FROM users').all();
+const users = await db.prepare('SELECT * FROM users').all();
 console.log(users);
 // Output: [
 //   { id: 1, name: 'Alice', email: 'alice@example.com' },
@@ -67,7 +69,7 @@ import { connect } from '@tursodatabase/database';
 const db = await connect('my-database.db');
 
 // Create a table
-db.exec(`
+await db.exec(`
   CREATE TABLE IF NOT EXISTS posts (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     title TEXT NOT NULL,
@@ -78,7 +80,7 @@ db.exec(`
 
 // Insert a post
 const insertPost = db.prepare('INSERT INTO posts (title, content) VALUES (?, ?)');
-const result = insertPost.run('Hello World', 'This is my first blog post!');
+const result = await insertPost.run('Hello World', 'This is my first blog post!');
 
 console.log(`Inserted post with ID: ${result.lastInsertRowid}`);
 ```
@@ -91,15 +93,15 @@ import { connect } from '@tursodatabase/database';
 const db = await connect('transactions.db');
 
 // Using transactions for atomic operations
-const transaction = db.transaction((users) => {
+const transaction = db.transaction(async (users) => {
   const insert = db.prepare('INSERT INTO users (name, email) VALUES (?, ?)');
   for (const user of users) {
-    insert.run(user.name, user.email);
+    await insert.run(user.name, user.email);
   }
 });
 
 // Execute transaction
-transaction([
+await transaction([
   { name: 'Alice', email: 'alice@example.com' },
   { name: 'Bob', email: 'bob@example.com' }
 ]);

@@ -11,6 +11,7 @@ use crate::numeric::Numeric;
 use crate::storage::btree::CursorTrait;
 use crate::sync::Arc;
 use crate::sync::Mutex;
+use crate::translate::plan::ColumnMask;
 use crate::types::{IOResult, ImmutableRecord, SeekKey, SeekOp, SeekResult, ValueRef};
 use crate::{return_and_restore_if_io, return_if_io, LimboError, Result, Value};
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
@@ -445,7 +446,7 @@ pub struct AggregateOperator {
     // Map from column index to aggregate info for quick lookup
     pub column_min_max: HashMap<usize, AggColumnInfo>,
     // Set of column indices that have distinct aggregates
-    pub distinct_columns: HashSet<usize>,
+    pub distinct_columns: ColumnMask,
     tracker: Option<Arc<Mutex<ComputationTracker>>>,
 
     // State machine for commit operation
@@ -1068,8 +1069,8 @@ impl AggregateState {
         // Track which columns have had their distinct counts/sums updated
         // This prevents double-counting when multiple distinct aggregates
         // operate on the same column (e.g., COUNT(DISTINCT col), SUM(DISTINCT col), AVG(DISTINCT col))
-        let mut processed_counts: HashSet<usize> = HashSet::default();
-        let mut processed_sums: HashSet<usize> = HashSet::default();
+        let mut processed_counts = ColumnMask::default();
+        let mut processed_sums = ColumnMask::default();
 
         // Update distinct aggregate state
         for agg in aggregates {
@@ -1079,7 +1080,7 @@ impl AggregateState {
                 }
                 AggregateFunction::CountDistinct(col_idx) => {
                     // Only update count if we haven't processed this column yet
-                    if !processed_counts.contains(col_idx) {
+                    if !processed_counts.get(*col_idx) {
                         if let Some(transition) = distinct_transitions.get(col_idx) {
                             let current_count =
                                 self.distinct_counts.get(col_idx).copied().unwrap_or(0);
@@ -1088,7 +1089,7 @@ impl AggregateState {
                                 TransitionType::Removed => current_count - 1,
                             };
                             self.distinct_counts.insert(*col_idx, new_count);
-                            processed_counts.insert(*col_idx);
+                            processed_counts.set(*col_idx);
                         }
                     }
                 }
@@ -1096,7 +1097,7 @@ impl AggregateState {
                 | AggregateFunction::AvgDistinct(col_idx) => {
                     if let Some(transition) = distinct_transitions.get(col_idx) {
                         // Update count if not already processed (needed for AVG)
-                        if !processed_counts.contains(col_idx) {
+                        if !processed_counts.get(*col_idx) {
                             let current_count =
                                 self.distinct_counts.get(col_idx).copied().unwrap_or(0);
                             let new_count = match transition.transition_type {
@@ -1104,11 +1105,11 @@ impl AggregateState {
                                 TransitionType::Removed => current_count - 1,
                             };
                             self.distinct_counts.insert(*col_idx, new_count);
-                            processed_counts.insert(*col_idx);
+                            processed_counts.set(*col_idx);
                         }
 
                         // Update sum if not already processed
-                        if !processed_sums.contains(col_idx) {
+                        if !processed_sums.get(*col_idx) {
                             let current_sum =
                                 self.distinct_sums.get(col_idx).copied().unwrap_or(0.0);
                             let value_as_float = match &transition.transitioned_value {
@@ -1122,7 +1123,7 @@ impl AggregateState {
                                 TransitionType::Removed => current_sum - value_as_float,
                             };
                             self.distinct_sums.insert(*col_idx, new_sum);
-                            processed_sums.insert(*col_idx);
+                            processed_sums.set(*col_idx);
                         }
                     }
                 }
@@ -1313,7 +1314,7 @@ impl AggregateOperator {
         }
 
         // Process each distinct column
-        for &col_idx in &self.distinct_columns {
+        for col_idx in &self.distinct_columns {
             let val = match row_values.get(col_idx) {
                 Some(v) => v,
                 None => continue,
@@ -1401,13 +1402,13 @@ impl AggregateOperator {
         }
 
         // Build the distinct columns set
-        let mut distinct_columns = HashSet::default();
+        let mut distinct_columns = ColumnMask::default();
         for agg in &aggregates {
             match agg {
                 AggregateFunction::CountDistinct(col_idx)
                 | AggregateFunction::SumDistinct(col_idx)
                 | AggregateFunction::AvgDistinct(col_idx) => {
-                    distinct_columns.insert(*col_idx);
+                    distinct_columns.set(*col_idx);
                 }
                 _ => {}
             }
@@ -1533,7 +1534,7 @@ impl AggregateOperator {
 
             // Update batch weights after detecting transitions
             if self.has_distinct() {
-                for &col_idx in &self.distinct_columns {
+                for col_idx in &self.distinct_columns {
                     if let Some(val) = row.values.get(col_idx) {
                         if val != &Value::Null {
                             let hashable_row = HashableRow::new(col_idx as i64, vec![val.clone()]);
@@ -1653,7 +1654,7 @@ impl AggregateOperator {
                 *value_entry += weight;
             } else {
                 // For DISTINCT aggregates, track individual column values
-                for &col_idx in &self.distinct_columns {
+                for col_idx in &self.distinct_columns {
                     if let Some(val) = row.values.get(col_idx) {
                         // Skip NULL values
                         if val == &Value::Null {
@@ -2566,9 +2567,9 @@ impl FetchDistinctState {
     fn add_aggregate_distinct_fetch(
         group_entry: &mut HashMap<usize, HashSet<HashableRow>>,
         row_values: &[Value],
-        distinct_columns: &HashSet<usize>,
+        distinct_columns: &ColumnMask,
     ) {
-        for &col_idx in distinct_columns {
+        for col_idx in distinct_columns {
             if let Some(val) = row_values.get(col_idx) {
                 if val != &Value::Null {
                     group_entry
@@ -2582,7 +2583,7 @@ impl FetchDistinctState {
 
     pub fn new(
         delta: &Delta,
-        distinct_columns: &HashSet<usize>,
+        distinct_columns: &ColumnMask,
         extract_group_key: impl Fn(&[Value]) -> Vec<Value>,
         group_key_to_string: impl Fn(&[Value]) -> String,
         existing_groups: &HashMap<String, AggregateState>,

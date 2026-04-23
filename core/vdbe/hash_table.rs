@@ -105,7 +105,7 @@ fn hash_join_key(key_values: &[ValueRef], collations: &[CollationSeq]) -> u64 {
 
 /// Normalize signed zero so 0.0 and -0.0 hash the same.
 #[inline]
-fn normalized_f64_bits(f: f64) -> u64 {
+const fn normalized_f64_bits(f: f64) -> u64 {
     if f == 0.0 {
         0.0f64.to_bits()
     } else {
@@ -231,7 +231,7 @@ pub(crate) enum HashInsertResult {
 }
 
 impl HashEntry {
-    fn new(hash: u64, key_values: Vec<Value>, rowid: i64) -> Self {
+    const fn new(hash: u64, key_values: Vec<Value>, rowid: i64) -> Self {
         Self {
             hash,
             key_values,
@@ -240,7 +240,7 @@ impl HashEntry {
         }
     }
 
-    fn new_with_payload(
+    const fn new_with_payload(
         hash: u64,
         key_values: Vec<Value>,
         rowid: i64,
@@ -255,7 +255,7 @@ impl HashEntry {
     }
 
     /// Returns true if this entry has payload values stored.
-    pub fn has_payload(&self) -> bool {
+    pub const fn has_payload(&self) -> bool {
         !self.payload_values.is_empty()
     }
 
@@ -574,7 +574,7 @@ pub struct HashBucket {
 }
 
 impl HashBucket {
-    fn new() -> Self {
+    const fn new() -> Self {
         Self {
             entries: Vec::new(),
         }
@@ -598,7 +598,7 @@ impl HashBucket {
             .collect()
     }
 
-    fn is_empty(&self) -> bool {
+    const fn is_empty(&self) -> bool {
         self.entries.is_empty()
     }
 
@@ -713,7 +713,7 @@ impl SpilledPartition {
     }
 
     /// Check if partition is ready for probing
-    pub fn is_loaded(&self) -> bool {
+    pub const fn is_loaded(&self) -> bool {
         matches!(
             self.state,
             PartitionState::Loaded | PartitionState::InMemory
@@ -721,7 +721,7 @@ impl SpilledPartition {
     }
 
     /// Check if there are more chunks to load
-    fn has_more_chunks(&self) -> bool {
+    const fn has_more_chunks(&self) -> bool {
         self.current_chunk_idx < self.chunks.len()
     }
 
@@ -741,7 +741,7 @@ struct PartitionBuffer {
 }
 
 impl PartitionBuffer {
-    fn new() -> Self {
+    const fn new() -> Self {
         Self {
             entries: Vec::new(),
             mem_used: 0,
@@ -758,7 +758,7 @@ impl PartitionBuffer {
         self.mem_used = 0;
     }
 
-    fn is_empty(&self) -> bool {
+    const fn is_empty(&self) -> bool {
         self.entries.is_empty()
     }
 }

@@ -133,6 +133,21 @@ impl Affinity {
         !matches!(self, Affinity::Blob)
     }
 
+    /// Returns the canonical short type name for this affinity, matching
+    /// SQLite's `azType[]` in `createTableStmt()` (`build.c`).
+    ///
+    /// Used when generating schema SQL (e.g. for `sqlite_schema.sql`).
+    /// Returns an empty string for BLOB affinity (no declared type).
+    pub fn short_type_name(&self) -> &'static str {
+        match self {
+            Affinity::Blob => "",
+            Affinity::Text => "TEXT",
+            Affinity::Numeric => "NUM",
+            Affinity::Integer => "INT",
+            Affinity::Real => "REAL",
+        }
+    }
+
     /// 3.1. Determination Of Column Affinity
     /// For tables not declared as STRICT, the affinity of a column is determined by the declared type of the column, according to the following rules in the order shown:
     ///

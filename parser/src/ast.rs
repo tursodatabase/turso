@@ -3,7 +3,7 @@ pub mod fmt;
 
 use std::{num::NonZeroU32, sync::Arc};
 
-use crate::lexer::is_keyword;
+use crate::lexer::is_quotable_keyword;
 use strum_macros::{EnumIter, EnumString};
 
 /// `?` or `$` Prepared statement arg placeholder(s)
@@ -194,6 +194,21 @@ pub enum Stmt {
         /// type body
         body: CreateTypeBody,
     },
+    /// `CREATE DOMAIN`
+    CreateDomain {
+        /// `IF NOT EXISTS`
+        if_not_exists: bool,
+        /// domain name
+        domain_name: String,
+        /// base type (primitive or another domain/custom type)
+        base_type: String,
+        /// default expression
+        default: Option<Box<Expr>>,
+        /// NOT NULL constraint
+        not_null: bool,
+        /// CHECK constraints
+        constraints: Vec<DomainConstraint>,
+    },
     /// `DELETE`
     Delete {
         /// CTE
@@ -250,6 +265,13 @@ pub enum Stmt {
         if_exists: bool,
         /// type name
         type_name: String,
+    },
+    /// `DROP DOMAIN`
+    DropDomain {
+        /// `IF EXISTS`
+        if_exists: bool,
+        /// domain name
+        domain_name: String,
     },
     /// `INSERT`
     Insert {
@@ -324,6 +346,15 @@ pub enum Stmt {
 ///
 /// FIXME: rename this to TableReferenceId.
 pub struct TableInternalId(usize);
+
+impl TableInternalId {
+    /// used in generated columns to signify "the table that the column belongs to"
+    pub const SELF_TABLE: Self = Self(0);
+
+    pub const fn is_self_table(&self) -> bool {
+        self.0 == 0
+    }
+}
 
 impl Default for TableInternalId {
     fn default() -> Self {
@@ -518,6 +549,8 @@ pub enum Expr {
         /// The type of subquery.
         query_type: SubqueryType,
     },
+    /// `DEFAULT` keyword in INSERT VALUES
+    Default,
     /// `ARRAY[expr, ...]` array literal
     Array {
         /// elements of the array
@@ -532,6 +565,12 @@ pub enum Expr {
     },
 }
 
+impl Default for Expr {
+    fn default() -> Self {
+        Self::Literal(Literal::Null)
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct Variable {
@@ -540,7 +579,7 @@ pub struct Variable {
 }
 
 impl Variable {
-    pub fn indexed(index: NonZeroU32) -> Self {
+    pub const fn indexed(index: NonZeroU32) -> Self {
         Self { index, name: None }
     }
 
@@ -642,7 +681,7 @@ impl Expr {
         Expr::Raise(resolve_type, expr.map(Box::new))
     }
 
-    pub fn can_be_null(&self) -> bool {
+    pub const fn can_be_null(&self) -> bool {
         // todo: better handling columns. Check sqlite3ExprCanBeNull
         match self {
             Expr::Literal(literal) => !matches!(
@@ -655,7 +694,7 @@ impl Expr {
 }
 
 /// SQL literal
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Default, Debug, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum Literal {
     /// Number
@@ -668,6 +707,7 @@ pub enum Literal {
     Blob(String),
     /// Keyword
     Keyword(String),
+    #[default]
     /// `NULL`
     Null,
     /// `TRUE` - SQLite boolean literal (equivalent to 1 but semantically distinct for IS TRUE)
@@ -754,7 +794,7 @@ pub enum Operator {
 
 impl Operator {
     /// returns whether order of operations can be ignored
-    pub fn is_commutative(&self) -> bool {
+    pub const fn is_commutative(&self) -> bool {
         matches!(
             self,
             Operator::Add
@@ -767,7 +807,7 @@ impl Operator {
     }
 
     /// Returns true if this operator is a comparison operator that may need affinity conversion
-    pub fn is_comparison(&self) -> bool {
+    pub const fn is_comparison(&self) -> bool {
         matches!(
             self,
             Self::Equals
@@ -913,6 +953,25 @@ pub enum As {
     As(Name),
     /// no `AS`
     Elided(Name), // FIXME Ids
+    /// Implicit column name from original SQL text (not serialized to SQL).
+    /// Used to preserve the original expression text as the column name
+    /// for unaliased expressions, matching SQLite behavior.
+    ImplicitColumnName(Name),
+}
+
+impl As {
+    /// Returns the inner `Name` regardless of variant.
+    pub fn name(&self) -> &Name {
+        match self {
+            As::As(name) | As::Elided(name) | As::ImplicitColumnName(name) => name,
+        }
+    }
+
+    /// Returns `true` if this is a user-provided alias (`AS foo` or elided `foo`),
+    /// not a system-generated implicit column name.
+    pub fn is_explicit(&self) -> bool {
+        matches!(self, As::As(_) | As::Elided(_))
+    }
 }
 
 /// `JOIN` clause
@@ -1065,6 +1124,12 @@ impl Name {
     pub fn from_bytes(s: &[u8]) -> Self {
         Self::from_string(unsafe { std::str::from_utf8_unchecked(s) })
     }
+    pub const fn empty() -> Self {
+        Self {
+            value: String::new(),
+            quote: None,
+        }
+    }
     /// Parse name from the string (e.g. handle quoting and handle escaped quotes)
     pub fn from_string(s: impl AsRef<str>) -> Self {
         let s = s.as_ref();
@@ -1113,11 +1178,13 @@ impl Name {
         if let Some(quote) = self.quote {
             let single = quote.to_string();
             let double = single.clone() + &single;
-            return format!("{}{}{}", quote, self.value.replace(&single, &double), quote);
+            return quote.to_string()
+                + self.value.replace(&single, &double).as_str()
+                + quote.to_string().as_str();
         }
         let value = self.value.as_bytes();
         let safe_char = |&c: &u8| c.is_ascii_alphanumeric() || c == b'_';
-        if !value.is_empty() && value.iter().all(safe_char) && !is_keyword(value) {
+        if !value.is_empty() && value.iter().all(safe_char) && !is_quotable_keyword(value) {
             self.value.clone()
         } else {
             format!("\"{}\"", self.value.replace("\"", "\"\""))
@@ -1133,7 +1200,7 @@ impl Name {
         self.quote == Some(quote)
     }
 
-    pub fn quoted(&self) -> bool {
+    pub const fn quoted(&self) -> bool {
         self.quote.is_some()
     }
 }
@@ -1152,7 +1219,7 @@ pub struct QualifiedName {
 
 impl QualifiedName {
     /// Constructor
-    pub fn single(name: Name) -> Self {
+    pub const fn single(name: Name) -> Self {
         Self {
             db_name: None,
             name,
@@ -1160,7 +1227,7 @@ impl QualifiedName {
         }
     }
     /// Constructor
-    pub fn fullname(db_name: Name, name: Name) -> Self {
+    pub const fn fullname(db_name: Name, name: Name) -> Self {
         Self {
             db_name: Some(db_name),
             name,
@@ -1168,7 +1235,7 @@ impl QualifiedName {
         }
     }
     /// Constructor
-    pub fn xfullname(db_name: Name, name: Name, alias: Name) -> Self {
+    pub const fn xfullname(db_name: Name, name: Name, alias: Name) -> Self {
         Self {
             db_name: Some(db_name),
             name,
@@ -1176,12 +1243,20 @@ impl QualifiedName {
         }
     }
     /// Constructor
-    pub fn alias(name: Name, alias: Name) -> Self {
+    pub const fn alias(name: Name, alias: Name) -> Self {
         Self {
             db_name: None,
             name,
             alias: Some(alias),
         }
+    }
+
+    /// Return the resolved identifier as a String
+    pub fn identifier(&self) -> String {
+        self.alias.as_ref().map_or_else(
+            || self.name.as_str().to_string(),
+            |alias| alias.as_str().to_string(),
+        )
     }
 }
 
@@ -1225,6 +1300,16 @@ pub struct TypeParam {
     pub name: String,
     /// Type annotation. None means untyped (backward compat).
     pub ty: Option<String>,
+}
+
+/// A single named CHECK constraint on a domain
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct DomainConstraint {
+    /// CONSTRAINT name (optional)
+    pub name: Option<String>,
+    /// CHECK expression using `value` placeholder
+    pub check: Box<Expr>,
 }
 
 /// Body of a `CREATE TYPE` statement
@@ -1337,8 +1422,18 @@ pub enum ColumnConstraint {
         /// expression
         expr: Box<Expr>,
         /// `STORED` / `VIRTUAL`
-        typ: Option<Name>,
+        typ: Option<GeneratedColumnType>,
     },
+}
+
+/// Generated column type
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub enum GeneratedColumnType {
+    /// `STORED`
+    Stored,
+    /// `VIRTUAL`
+    Virtual,
 }
 
 /// Named table constraint
@@ -1627,6 +1722,8 @@ pub enum PragmaName {
     FreelistCount,
     /// Enable or disable foreign key constraint enforcement
     ForeignKeys,
+    /// Deprecated: control whether column names include table name prefix
+    FullColumnNames,
     /// List all SQL functions known to the database connection
     FunctionList,
     /// Use F_FULLFSYNC instead of fsync on macOS (only supported on macOS)
@@ -1638,6 +1735,8 @@ pub enum PragmaName {
     IntegrityCheck,
     /// `journal_mode` pragma
     JournalMode,
+    /// `locking_mode` pragma
+    LockingMode,
     /// Run a quick integrity check (skips expensive index consistency validation)
     QuickCheck,
     /// encryption key for encrypted databases, specified as hexadecimal string.
@@ -1659,6 +1758,8 @@ pub enum PragmaName {
     QueryOnly,
     /// Returns schema version of the database file.
     SchemaVersion,
+    /// Deprecated: control whether unaliased column names omit the table name prefix
+    ShortColumnNames,
     /// Alias for `require_where` pragma, as an homage to MySQL (https://dev.mysql.com/doc/refman/9.6/en/mysql-tips.html#safe-updates)
     IAmADummy,
     /// Reject DELETE/UPDATE without WHERE clause
@@ -1696,6 +1797,8 @@ pub enum PragmaName {
     MvccCheckpointThreshold,
     /// List all available types (built-in and custom)
     ListTypes,
+    /// Deprecated no-op: control whether callback is invoked for empty result sets
+    EmptyResultCallbacks,
 }
 
 /// `CREATE TRIGGER` time

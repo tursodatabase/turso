@@ -53,7 +53,7 @@ info:
 ---
 QUERY PLAN
 |--SCALAR SUBQUERY 1
-|  `--SCAN subquery_0
+|  `--SCAN (subquery-0)
 |     |--SCAN lineitem
 |     `--USE SORTER FOR GROUP BY
 |--SCAN revenue

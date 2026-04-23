@@ -6,7 +6,7 @@ use crate::numeric::Numeric;
 use crate::schema::Schema;
 use crate::storage::pager::Pager;
 use crate::sync::Arc;
-use crate::translate::emitter::Resolver;
+use crate::translate::emitter::{DoubleQuotedDml, Resolver};
 use crate::translate::expr::translate_expr;
 use crate::types::Text;
 use crate::vdbe::builder::{ProgramBuilder, ProgramBuilderOpts};
@@ -301,15 +301,8 @@ impl CompiledExpression {
 
         // Fall back to VDBE compilation for complex expressions
         // Create a minimal program builder for expression compilation
-        let mut builder = ProgramBuilder::new(
-            QueryMode::Normal,
-            None,
-            ProgramBuilderOpts {
-                num_cursors: 0,
-                approx_num_insns: 5,  // Most expressions are simple
-                approx_num_labels: 0, // Expressions don't need labels
-            },
-        );
+        let mut builder =
+            ProgramBuilder::new(QueryMode::Normal, None, ProgramBuilderOpts::new(0, 5, 0));
 
         // Allocate registers for input values
         let input_count = input_column_names.len();
@@ -327,8 +320,17 @@ impl CompiledExpression {
 
         // Create a resolver for translate_expr
         let database_schemas = RwLock::new(HashMap::default());
+        let temp_database = RwLock::new(None);
         let attached_databases = RwLock::new(DatabaseCatalog::new());
-        let resolver = Resolver::new(schema, &database_schemas, &attached_databases, syms, true);
+        let resolver = Resolver::new(
+            schema,
+            &database_schemas,
+            &temp_database,
+            &attached_databases,
+            syms,
+            true,
+            DoubleQuotedDml::Enabled,
+        );
 
         // Translate the transformed expression to bytecode
         translate_expr(

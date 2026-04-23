@@ -14,9 +14,36 @@ mod savepoint_tests {
 
     const SAVEPOINT_NAMES: [&str; 8] = ["sp0", "sp1", "outer", "inner", "alpha", "beta", "x", "y"];
     const TAG_POOL: [&str; 8] = ["a", "b", "c", "d", "e", "foo", "bar", "baz"];
+    const TEMP_TABLE_NAMES: [&str; 3] = ["ttmp_a", "ttmp_b", "ttmp_c"];
 
     fn random_savepoint_name(rng: &mut ChaCha8Rng) -> &'static str {
         SAVEPOINT_NAMES.choose(rng).unwrap()
+    }
+
+    /// DDL targeting the TEMP schema. Used by the savepoint fuzzer to
+    /// exercise the Phase 1.2 rollback-to-savepoint restore path for
+    /// the connection-local temp schema.
+    ///
+    /// Scope is intentionally limited to CREATE/DROP TABLE + INSERT.
+    /// CREATE INDEX / CREATE TRIGGER are deferred to Phase 1.4 which
+    /// fixes DROP TABLE's cascade to dependent temp objects.
+    fn random_temp_ddl_stmt(rng: &mut ChaCha8Rng) -> String {
+        match rng.random_range(0..3) {
+            0 => {
+                let name = TEMP_TABLE_NAMES.choose(rng).unwrap();
+                format!("CREATE TEMP TABLE IF NOT EXISTS {name}(x INT, y INT)")
+            }
+            1 => {
+                let name = TEMP_TABLE_NAMES.choose(rng).unwrap();
+                format!("DROP TABLE IF EXISTS temp.{name}")
+            }
+            2 => {
+                let name = TEMP_TABLE_NAMES.choose(rng).unwrap();
+                let v = rng.random_range(1..=30);
+                format!("INSERT INTO temp.{name}(x, y) VALUES ({v}, {v})")
+            }
+            _ => unreachable!(),
+        }
     }
 
     fn random_where_clause(rng: &mut ChaCha8Rng) -> String {
@@ -254,16 +281,22 @@ mod savepoint_tests {
             ),
             ("p", "SELECT id, grp, tag FROM p ORDER BY id, grp, tag"),
             ("c", "SELECT id, pid, note FROM c ORDER BY id, pid, note"),
+            (
+                "temp_schema",
+                "SELECT type, name, tbl_name FROM temp.sqlite_schema \
+                 WHERE name NOT LIKE 'sqlite_%' ORDER BY type, name",
+            ),
         ];
 
         for step in 0..STEPS {
             helpers::log_progress("named_savepoint_differential_fuzz", step, STEPS, 8);
 
             let stmt = match rng.random_range(0..100) {
-                0..=29 => random_dml_stmt(&mut rng),
-                30..=49 => random_fk_dml_stmt(&mut rng),
+                0..=24 => random_dml_stmt(&mut rng),
+                25..=39 => random_fk_dml_stmt(&mut rng),
+                40..=49 => random_temp_ddl_stmt(&mut rng),
                 50..=74 => format!("SAVEPOINT {}", random_savepoint_name(&mut rng)),
-                75..=87 => {
+                75..=86 => {
                     let name = random_savepoint_name(&mut rng);
                     if rng.random_bool(0.5) {
                         format!("RELEASE {name}")
@@ -271,7 +304,7 @@ mod savepoint_tests {
                         format!("RELEASE SAVEPOINT {name}")
                     }
                 }
-                88..=99 => {
+                87..=99 => {
                     let name = random_savepoint_name(&mut rng);
                     if rng.random_bool(0.5) {
                         format!("ROLLBACK TO {name}")
@@ -400,6 +433,45 @@ mod savepoint_tests {
         );
     }
 
+    #[turso_macros::test]
+    fn release_root_named_savepoint_checks_deferred_fk(db: TempDatabase) {
+        let limbo_conn = db.connect_limbo();
+        let sqlite_conn = rusqlite::Connection::open_in_memory().unwrap();
+
+        limbo_conn.execute("PRAGMA foreign_keys = ON").unwrap();
+        sqlite_conn
+            .execute("PRAGMA foreign_keys = ON", params![])
+            .unwrap();
+
+        for schema in [
+            "CREATE TABLE p(id INTEGER PRIMARY KEY)",
+            "CREATE TABLE c(id INTEGER PRIMARY KEY, pid INT, FOREIGN KEY(pid) REFERENCES p(id) DEFERRABLE INITIALLY DEFERRED)",
+        ] {
+            limbo_conn.execute(schema).unwrap();
+            sqlite_conn.execute(schema, params![]).unwrap();
+        }
+
+        for stmt in ["SAVEPOINT s", "INSERT INTO c(id, pid) VALUES (1, 999)"] {
+            let sqlite_res = sqlite_conn.execute(stmt, params![]);
+            let limbo_res = limbo_exec_rows_fallible(&db, &limbo_conn, stmt);
+            assert!(
+                sqlite_res.is_ok() == limbo_res.is_ok(),
+                "statement outcome mismatch for `{stmt}`\nsqlite: {sqlite_res:?}\nlimbo: {limbo_res:?}"
+            );
+        }
+
+        let sqlite_release = sqlite_conn.execute("RELEASE s", params![]);
+        let limbo_release = limbo_exec_rows_fallible(&db, &limbo_conn, "RELEASE s");
+        assert!(
+            sqlite_release.is_ok() == limbo_release.is_ok(),
+            "release outcome mismatch\nsqlite: {sqlite_release:?}\nlimbo: {limbo_release:?}"
+        );
+        assert!(
+            sqlite_release.is_err(),
+            "expected deferred FK error while releasing root savepoint"
+        );
+    }
+
     #[turso_macros::test(mvcc)]
     fn release_root_deferred_fk_failure_can_recover_with_rollback_to(db: TempDatabase) {
         let limbo_conn = db.connect_limbo();
@@ -452,6 +524,97 @@ mod savepoint_tests {
         assert_eq!(
             limbo_rows, sqlite_rows,
             "final table state mismatch after rollback-to recovery"
+        );
+    }
+
+    #[turso_macros::test]
+    fn deferred_fk_parent_key_update_keeps_violation_until_commit(db: TempDatabase) {
+        let limbo_conn = db.connect_limbo();
+        let sqlite_conn = rusqlite::Connection::open_in_memory().unwrap();
+
+        limbo_conn.execute("PRAGMA foreign_keys = ON").unwrap();
+        sqlite_conn
+            .execute("PRAGMA foreign_keys = ON", params![])
+            .unwrap();
+
+        for schema in [
+            "CREATE TABLE p(id INTEGER PRIMARY KEY)",
+            "CREATE TABLE c(id INTEGER PRIMARY KEY, pid INT, FOREIGN KEY(pid) REFERENCES p(id) DEFERRABLE INITIALLY DEFERRED)",
+        ] {
+            limbo_conn.execute(schema).unwrap();
+            sqlite_conn.execute(schema, params![]).unwrap();
+        }
+
+        for stmt in [
+            "INSERT INTO p(id) VALUES (25), (40)",
+            "INSERT INTO c(id, pid) VALUES (1, 25), (2, 40)",
+            "BEGIN",
+            "DELETE FROM p WHERE id = 25",
+            "UPDATE p SET id = 25 WHERE id = 40",
+        ] {
+            let sqlite_res = sqlite_conn.execute(stmt, params![]);
+            let limbo_res = limbo_exec_rows_fallible(&db, &limbo_conn, stmt);
+            assert!(
+                sqlite_res.is_ok() == limbo_res.is_ok(),
+                "statement outcome mismatch for `{stmt}`\nsqlite: {sqlite_res:?}\nlimbo: {limbo_res:?}"
+            );
+        }
+
+        let sqlite_commit = sqlite_conn.execute("COMMIT", params![]);
+        let limbo_commit = limbo_exec_rows_fallible(&db, &limbo_conn, "COMMIT");
+        assert!(
+            sqlite_commit.is_ok() == limbo_commit.is_ok(),
+            "commit outcome mismatch\nsqlite: {sqlite_commit:?}\nlimbo: {limbo_commit:?}"
+        );
+        assert!(
+            sqlite_commit.is_err(),
+            "expected deferred FK error while committing parent-key update"
+        );
+    }
+
+    #[turso_macros::test]
+    fn deferred_fk_parent_key_update_keeps_violation_until_root_release(db: TempDatabase) {
+        let limbo_conn = db.connect_limbo();
+        let sqlite_conn = rusqlite::Connection::open_in_memory().unwrap();
+
+        limbo_conn.execute("PRAGMA foreign_keys = ON").unwrap();
+        sqlite_conn
+            .execute("PRAGMA foreign_keys = ON", params![])
+            .unwrap();
+
+        for schema in [
+            "CREATE TABLE p(id INTEGER PRIMARY KEY)",
+            "CREATE TABLE c(id INTEGER PRIMARY KEY, pid INT, FOREIGN KEY(pid) REFERENCES p(id) DEFERRABLE INITIALLY DEFERRED)",
+        ] {
+            limbo_conn.execute(schema).unwrap();
+            sqlite_conn.execute(schema, params![]).unwrap();
+        }
+
+        for stmt in [
+            "INSERT INTO p(id) VALUES (25), (40)",
+            "INSERT INTO c(id, pid) VALUES (1, 25), (2, 40)",
+            "SAVEPOINT sp1",
+            "DELETE FROM p WHERE id = 25",
+            "SAVEPOINT alpha",
+            "UPDATE p SET id = 25 WHERE id = 40",
+        ] {
+            let sqlite_res = sqlite_conn.execute(stmt, params![]);
+            let limbo_res = limbo_exec_rows_fallible(&db, &limbo_conn, stmt);
+            assert!(
+                sqlite_res.is_ok() == limbo_res.is_ok(),
+                "statement outcome mismatch for `{stmt}`\nsqlite: {sqlite_res:?}\nlimbo: {limbo_res:?}"
+            );
+        }
+
+        let sqlite_release = sqlite_conn.execute("RELEASE sp1", params![]);
+        let limbo_release = limbo_exec_rows_fallible(&db, &limbo_conn, "RELEASE sp1");
+        assert!(
+            sqlite_release.is_ok() == limbo_release.is_ok(),
+            "root release outcome mismatch\nsqlite: {sqlite_release:?}\nlimbo: {limbo_release:?}"
+        );
+        assert!(
+            sqlite_release.is_err(),
+            "expected deferred FK error while releasing root savepoint"
         );
     }
 }

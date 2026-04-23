@@ -1,0 +1,34 @@
+name: Fossier PR Check
+
+on:
+  pull_request_target:
+    types: [opened, synchronize]
+  issue_comment:
+    types: [created]
+
+permissions:
+  contents: write
+  pull-requests: write
+  issues: write
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check for fossier command
+        id: check-cmd
+        if: github.event_name == 'issue_comment'
+        shell: bash
+        run: |
+          if jq -r '.comment.body' "$GITHUB_EVENT_PATH" | grep -qP '^/fossier\s'; then
+            echo "has_command=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: PThorpe92/fossier@main
+        if: github.event_name != 'issue_comment' || steps.check-cmd.outputs.has_command == 'true'
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          registry-api-key: ${{ secrets.FOSSIER_REGISTRY_API_KEY }}
+          contact-url: "https://discord.gg/mNUkCHs2R"

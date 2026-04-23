@@ -804,10 +804,15 @@ mod tests {
                 let port: u16 = rand::rng().random_range(10_000..=65_535);
                 let server_bin = env::var("LOCAL_SYNC_SERVER").unwrap();
 
+                // IMPORTANT: do not use Stdio::piped() here. Nothing reads from
+                // those pipes, so once the kernel pipe buffer (~64 KiB on Linux)
+                // fills, the child blocks forever inside write() and stops
+                // servicing HTTP requests, deadlocking sync operations in
+                // long-running tests like test_sync_parallel_writes_with_sync_ops.
                 let child = Command::new(server_bin)
                     .args(["--sync-server", &format!("0.0.0.0:{port}")])
-                    .stdout(Stdio::piped())
-                    .stderr(Stdio::piped())
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
                     .spawn()
                     .context("failed to spawn local sync server")?;
 
@@ -1323,5 +1328,394 @@ mod tests {
             assert_eq!(all, vec![vec![Value::Integer(2000 * 1024)]]);
             assert!(partial_db.stats().await.unwrap().network_received_bytes > 2000 * 1024);
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    pub async fn test_sync_parallel_writes_with_sync_ops() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+        use tokio::sync::Mutex as TokioMutex;
+
+        let _ = tracing_subscriber::fmt::try_init();
+        let server = TursoServer::new().await.unwrap();
+
+        let db = crate::sync::Builder::new_remote(":memory:")
+            .with_remote_url(server.db_url())
+            .build()
+            .await
+            .unwrap();
+
+        let conn = db.connect().await.unwrap();
+        conn.execute(
+            "CREATE TABLE test_data (id INTEGER PRIMARY KEY AUTOINCREMENT, payload TEXT NOT NULL)",
+            (),
+        )
+        .await
+        .unwrap();
+
+        // ~200KB payload per row
+        let payload = "X".repeat(200 * 1024);
+
+        let done = Arc::new(AtomicBool::new(false));
+        let sync_lock = Arc::new(TokioMutex::new(()));
+
+        // Spawn periodic push/pull/checkpoint task (sequential, guarded by sync_lock)
+        let sync_db = db.clone();
+        let sync_done = done.clone();
+        let sync_lock_clone = sync_lock.clone();
+        let sync_task = tokio::spawn(async move {
+            let mut cycle = 0u32;
+            while !sync_done.load(Ordering::Relaxed) {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                let _guard = sync_lock_clone.lock().await;
+                eprintln!("sync cycle {cycle}: push");
+                if let Err(e) = sync_db.push().await {
+                    eprintln!("push error (cycle {cycle}): {e}");
+                }
+                eprintln!("sync cycle {cycle}: pull");
+                if let Err(e) = sync_db.pull().await {
+                    eprintln!("pull error (cycle {cycle}): {e}");
+                }
+                eprintln!("sync cycle {cycle}: checkpoint");
+                if let Err(e) = sync_db.checkpoint().await {
+                    eprintln!("checkpoint error (cycle {cycle}): {e}");
+                }
+                cycle += 1;
+            }
+            cycle
+        });
+
+        // Parallel writes: 4 connections, each inserting 5 rows (~200KB each)
+        let mut write_handles = Vec::new();
+        let mut connections = Vec::new();
+        let (conn_cnt, iterations_cnt, after_cnt) = (8u32, 100u32, 100u32);
+        for _ in 0..conn_cnt {
+            let db = db.clone();
+            let conn = db.connect().await.unwrap();
+            conn.execute("PRAGMA busy_timeout=5000", ()).await.unwrap();
+            connections.push(Some((db, conn)));
+        }
+        for conn_id in 0..conn_cnt {
+            let (_, conn) = connections[conn_id as usize].take().unwrap();
+            let payload = payload.clone();
+            write_handles.push(tokio::spawn(async move {
+                for row_id in 0..iterations_cnt {
+                    let tag = format!("conn{conn_id}_row{row_id}");
+                    let data = format!("{tag}_{payload}");
+                    loop {
+                        match conn
+                            .execute(
+                                "INSERT INTO test_data (payload) VALUES (?)",
+                                crate::params::Params::Positional(vec![Value::Text(data.clone())]),
+                            )
+                            .await
+                        {
+                            Ok(_) => break,
+                            Err(crate::Error::Busy(_)) => {
+                                tokio::time::sleep(Duration::from_millis(10)).await;
+                                continue;
+                            }
+                            Err(e) => panic!("insert failed (conn{conn_id}, row{row_id}): {e:?}"),
+                        }
+                    }
+                }
+            }));
+        }
+        for h in write_handles {
+            h.await.unwrap();
+        }
+
+        // Sequential writes: 3 more large inserts
+        for i in 0..after_cnt {
+            let data = format!("sequential_{i}_{payload}");
+            conn.execute(
+                "INSERT INTO test_data (payload) VALUES (?)",
+                crate::params::Params::Positional(vec![Value::Text(data)]),
+            )
+            .await
+            .unwrap();
+        }
+
+        // Signal sync task to stop and wait for it
+        done.store(true, Ordering::Relaxed);
+        let sync_cycles = sync_task.await.unwrap();
+        eprintln!("completed {sync_cycles} sync cycles during writes");
+
+        let rows = conn
+            .query("SELECT count(*) FROM test_data", ())
+            .await
+            .unwrap();
+        let all = all_rows(rows).await.unwrap();
+        assert_eq!(
+            all,
+            vec![vec![Value::Integer(
+                (after_cnt + conn_cnt * iterations_cnt) as i64
+            )]]
+        );
+
+        // Report WAL size via stats
+        let stats = db.stats().await.unwrap();
+        eprintln!(
+            "WAL size after all writes: {} bytes ({:.2} KB)",
+            stats.main_wal_size,
+            stats.main_wal_size as f64 / 1024.0
+        );
+    }
+
+    /// Reproducer for schema-divergence during sync.
+    ///
+    /// 1. Bootstrap a local client from the remote (table `t` with some rows).
+    /// 2. Push + pull so both sides are even.
+    /// 3. Locally: insert more rows, CREATE two new tables, insert into all three tables.
+    /// 4. Add data on the remote side (simulating another client).
+    /// 5. Push the local changes so the remote has the new schema too.
+    /// 6. Pull into the local client – this must succeed despite the schema having changed.
+    #[tokio::test]
+    pub async fn test_sync_pull_after_local_ddl_and_remote_writes() {
+        let _ = tracing_subscriber::fmt::try_init();
+        let server = TursoServer::new().await.unwrap();
+
+        server
+            .db_sql("CREATE TABLE t(x TEXT PRIMARY KEY, y)")
+            .await
+            .unwrap();
+        server
+            .db_sql("INSERT INTO t VALUES ('a', '1'), ('b', '2'), ('c', '3')")
+            .await
+            .unwrap();
+
+        let db = crate::sync::Builder::new_remote(":memory:")
+            .with_remote_url(server.db_url())
+            .build()
+            .await
+            .unwrap();
+        let conn = db.connect().await.unwrap();
+
+        let rows = all_rows(conn.query("SELECT * FROM t", ()).await.unwrap())
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 3);
+
+        db.push().await.unwrap();
+        db.pull().await.unwrap();
+
+        conn.execute(
+            "INSERT INTO t VALUES ('d', '4-local'), ('e', '5-local')",
+            (),
+        )
+        .await
+        .unwrap();
+
+        conn.execute("CREATE TABLE t2(y INTEGER, z TEXT)", ())
+            .await
+            .unwrap();
+        conn.execute("CREATE TABLE t3(id INTEGER PRIMARY KEY, payload TEXT)", ())
+            .await
+            .unwrap();
+        conn.execute("INSERT INTO t2 VALUES (1, 'hello'), (2, 'world')", ())
+            .await
+            .unwrap();
+        conn.execute(
+            "INSERT INTO t3 VALUES (100, 'payload1'), (200, 'payload2')",
+            (),
+        )
+        .await
+        .unwrap();
+
+        server
+            .db_sql("INSERT INTO t VALUES ('e', '5-remote'), ('f', '6-remote')")
+            .await
+            .unwrap();
+
+        db.pull().await.unwrap();
+
+        let rows_t = all_rows(
+            conn.query("SELECT x, y FROM t ORDER BY x", ())
+                .await
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            rows_t,
+            vec![
+                vec![Value::Text("a".to_string()), Value::Text("1".to_string())],
+                vec![Value::Text("b".to_string()), Value::Text("2".to_string())],
+                vec![Value::Text("c".to_string()), Value::Text("3".to_string())],
+                vec![
+                    Value::Text("d".to_string()),
+                    Value::Text("4-local".to_string())
+                ],
+                vec![
+                    Value::Text("e".to_string()),
+                    Value::Text("5-local".to_string())
+                ],
+                vec![
+                    Value::Text("f".to_string()),
+                    Value::Text("6-remote".to_string())
+                ],
+            ]
+        );
+
+        let rows_t2 = all_rows(
+            conn.query("SELECT y, z FROM t2 ORDER BY y", ())
+                .await
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            rows_t2,
+            vec![
+                vec![Value::Integer(1), Value::Text("hello".to_string())],
+                vec![Value::Integer(2), Value::Text("world".to_string())],
+            ]
+        );
+
+        let rows_t3 = all_rows(
+            conn.query("SELECT id, payload FROM t3 ORDER BY id", ())
+                .await
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            rows_t3,
+            vec![
+                vec![Value::Integer(100), Value::Text("payload1".to_string())],
+                vec![Value::Integer(200), Value::Text("payload2".to_string())],
+            ]
+        );
+    }
+
+    /// Pull test: remote adds a column that local already has.
+    /// The pull must succeed (idempotent ALTER TABLE ADD COLUMN).
+    #[tokio::test]
+    pub async fn test_sync_pull_alter_table_add_column_idempotent() {
+        let _ = tracing_subscriber::fmt::try_init();
+        let server = TursoServer::new().await.unwrap();
+
+        // Remote: create table with 2 columns and insert data
+        server
+            .db_sql("CREATE TABLE t(x TEXT PRIMARY KEY, y TEXT)")
+            .await
+            .unwrap();
+        server
+            .db_sql("INSERT INTO t VALUES ('a', 'alpha')")
+            .await
+            .unwrap();
+
+        // Local: bootstrap from remote
+        let db = crate::sync::Builder::new_remote(":memory:")
+            .with_remote_url(server.db_url())
+            .build()
+            .await
+            .unwrap();
+        let conn = db.connect().await.unwrap();
+
+        let rows = all_rows(conn.query("SELECT x, y FROM t", ()).await.unwrap())
+            .await
+            .unwrap();
+        assert_eq!(
+            rows,
+            vec![vec![
+                Value::Text("a".to_string()),
+                Value::Text("alpha".to_string())
+            ]]
+        );
+
+        // Both sides independently add the same column z
+        server
+            .db_sql("ALTER TABLE t ADD COLUMN z TEXT")
+            .await
+            .unwrap();
+        server
+            .db_sql("INSERT INTO t VALUES ('b', 'beta', 'from-remote')")
+            .await
+            .unwrap();
+
+        conn.execute("ALTER TABLE t ADD COLUMN z TEXT", ())
+            .await
+            .unwrap();
+
+        // Pull should succeed despite both sides having column z
+        db.pull().await.unwrap();
+
+        // Verify local data is accessible after pull
+        let rows = all_rows(
+            conn.query("SELECT x, y, z FROM t ORDER BY x", ())
+                .await
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0][0], Value::Text("a".to_string()));
+        assert_eq!(rows[1][0], Value::Text("b".to_string()));
+        assert_eq!(rows[1][2], Value::Text("from-remote".to_string()));
+    }
+
+    /// Push test: local adds a column that remote already has.
+    /// The push must succeed (ALTER TABLE ADD COLUMN error is ignored in the batch).
+    #[tokio::test]
+    pub async fn test_sync_push_alter_table_add_column_idempotent() {
+        let _ = tracing_subscriber::fmt::try_init();
+        let server = TursoServer::new().await.unwrap();
+
+        // Remote: create table with 2 columns and insert data
+        server
+            .db_sql("CREATE TABLE t(x TEXT PRIMARY KEY, y TEXT)")
+            .await
+            .unwrap();
+        server
+            .db_sql("INSERT INTO t VALUES ('a', 'alpha')")
+            .await
+            .unwrap();
+
+        // Local: bootstrap from remote
+        let db = crate::sync::Builder::new_remote(":memory:")
+            .with_remote_url(server.db_url())
+            .build()
+            .await
+            .unwrap();
+        let conn = db.connect().await.unwrap();
+
+        let rows = all_rows(conn.query("SELECT x, y FROM t", ()).await.unwrap())
+            .await
+            .unwrap();
+        assert_eq!(
+            rows,
+            vec![vec![
+                Value::Text("a".to_string()),
+                Value::Text("alpha".to_string())
+            ]]
+        );
+
+        // Remote adds column z first
+        server
+            .db_sql("ALTER TABLE t ADD COLUMN z TEXT")
+            .await
+            .unwrap();
+
+        // Local also adds column z and inserts data
+        conn.execute("ALTER TABLE t ADD COLUMN z TEXT", ())
+            .await
+            .unwrap();
+        conn.execute("INSERT INTO t VALUES ('b', 'beta', 'from-local')", ())
+            .await
+            .unwrap();
+
+        // Push should succeed despite remote already having column z
+        db.push().await.unwrap();
+
+        // Verify the data row made it to remote
+        let remote_rows = server
+            .db_sql("SELECT x, y, z FROM t ORDER BY x")
+            .await
+            .unwrap();
+        assert_eq!(remote_rows.len(), 2);
+        assert_eq!(remote_rows[1][0], Value::Text("b".to_string()));
+        assert_eq!(remote_rows[1][1], Value::Text("beta".to_string()));
+        assert_eq!(remote_rows[1][2], Value::Text("from-local".to_string()));
     }
 }

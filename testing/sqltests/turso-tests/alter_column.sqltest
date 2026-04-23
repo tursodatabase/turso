@@ -331,13 +331,13 @@ expect {
     CREATE TABLE c3 (x INTEGER PRIMARY KEY, fa INTEGER, fb INTEGER, FOREIGN KEY (fa, fb) REFERENCES p3_new (a, b))
 }
 
-# Adding a generated column via ALTER TABLE should error
+# Adding a stored generated column via ALTER TABLE should error
 test alter-table-add-generated-column-error {
     CREATE TABLE t(a);
-    ALTER TABLE t ADD COLUMN b AS (NULL);
+    ALTER TABLE t ADD COLUMN b AS (NULL) STORED;
 }
 expect error {
-    Parse error: Alter table does not support adding generated columns
+    cannot add a STORED column
 }
 
 test alter-column-only-to-generated-error {
@@ -364,6 +364,95 @@ test alter-column-to-generated-with-other-columns {
 }
 expect {
     CREATE TABLE t (c AS (123), b)
+}
+
+test alter-column-to-generated-rewrites-existing-rows {
+    CREATE TABLE t(a, b, c);
+    INSERT INTO t VALUES(1, 2, 3);
+    ALTER TABLE t ALTER COLUMN b TO d AS (a * 3);
+    SELECT a, d, c FROM t;
+}
+expect {
+    1|3|3
+}
+
+test alter-column-to-generated-missing-column-error {
+    CREATE TABLE t(a, b);
+    ALTER TABLE t ALTER COLUMN a TO c AS (missing + 1);
+}
+expect error {
+    no such column: missing
+}
+
+test alter-column-to-generated-nondeterministic-error {
+    CREATE TABLE t(a, b);
+    ALTER TABLE t ALTER COLUMN a TO c AS (random());
+}
+expect error {
+    non-deterministic functions prohibited in generated columns
+}
+
+# ALTER COLUMN to STORED should be rejected
+test alter-column-to-stored-error {
+    CREATE TABLE t(a, b);
+    ALTER TABLE t ALTER COLUMN a TO c AS (123) STORED;
+}
+expect error {
+    cannot add a STORED column
+}
+
+# ALTER COLUMN on table that already has virtual columns
+test alter-column-with-existing-virtual {
+    CREATE TABLE t(a, b AS (a * 2), c);
+    ALTER TABLE t ALTER COLUMN c TO d INTEGER;
+    INSERT INTO t(a, d) VALUES(5, 100);
+    SELECT a, b, d FROM t;
+}
+expect {
+    5|10|100
+}
+
+# ALTER COLUMN to make a column generated when other virtual columns exist
+test alter-column-to-generated-with-existing-virtual {
+    CREATE TABLE t(a, b, c AS (a + 1));
+    ALTER TABLE t ALTER COLUMN b TO d AS (a * 3);
+    INSERT INTO t(a) VALUES(10);
+    SELECT a, d, c FROM t;
+}
+expect {
+    10|30|11
+}
+
+# ALTER COLUMN to generated with NOT NULL should validate existing rows
+test alter-column-to-generated-notnull-violation {
+    CREATE TABLE t(a, b);
+    INSERT INTO t VALUES(NULL, 2);
+    ALTER TABLE t ALTER COLUMN b TO c AS (a * 3) NOT NULL;
+}
+expect error {
+    NOT NULL constraint failed
+}
+
+# ALTER COLUMN to generated with NOT NULL should succeed when all rows satisfy it
+test alter-column-to-generated-notnull-ok {
+    CREATE TABLE t(a, b);
+    INSERT INTO t VALUES(1, 2), (3, 4);
+    ALTER TABLE t ALTER COLUMN b TO c AS (a * 3) NOT NULL;
+    SELECT a, c FROM t ORDER BY a;
+}
+expect {
+    1|3
+    3|9
+}
+
+# ALTER COLUMN to generated with CHECK should validate existing rows
+test alter-column-to-generated-check-violation {
+    CREATE TABLE t(a, b);
+    INSERT INTO t VALUES(1, 2), (3, 4);
+    ALTER TABLE t ALTER COLUMN b TO c AS (a * 3) CHECK(c < 5);
+}
+expect error {
+    CHECK constraint failed
 }
 
 # Add column with a foreign key reference and verify schema SQL

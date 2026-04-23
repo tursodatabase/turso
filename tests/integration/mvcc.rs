@@ -1,7 +1,9 @@
 use crate::common::{ExecRows, TempDatabase};
 use std::path::Path;
 use std::sync::Arc;
-use turso_core::{Database, DatabaseOpts, OpenFlags, StepResult};
+use turso_core::{
+    Database, DatabaseOpts, EncryptionKey, EncryptionOpts, LimboError, OpenFlags, StepResult,
+};
 
 /// Create a new database file at `path` with MVCC journal mode enabled.
 /// This is needed because ATTACH requires the attached DB's journal mode
@@ -46,7 +48,7 @@ impl turso_core::mvcc::persistent_storage::DurableStorage for RecordingDurableSt
     fn log_tx(
         &self,
         m: &turso_core::mvcc::database::LogRecord,
-        on_serialization_complete: Option<&dyn Fn(&[u8], u32)>,
+        on_serialization_complete: Option<&dyn Fn(&[u8], u32) -> turso_core::Result<()>>,
     ) -> turso_core::Result<(turso_core::Completion, u64)> {
         self.used_log_tx
             .store(true, std::sync::atomic::Ordering::SeqCst);
@@ -169,6 +171,48 @@ fn test_mvcc_custom_durable_storage_injected(tmp_db: TempDatabase) -> anyhow::Re
     );
 
     conn.close()?;
+    Ok(())
+}
+
+#[turso_macros::test]
+fn test_mvcc_custom_durable_storage_rejects_encrypted_mode(
+    tmp_db: TempDatabase,
+) -> anyhow::Result<()> {
+    let db_path = tmp_db
+        .path
+        .with_extension("custom_durable_storage_encrypted.db");
+    let log_path = db_path.with_extension("db-log");
+    let hex_key = "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f";
+
+    let file = tmp_db
+        .io
+        .open_file(log_path.to_str().unwrap(), OpenFlags::default(), false)?;
+    let default_storage: Arc<dyn turso_core::mvcc::persistent_storage::DurableStorage> = Arc::new(
+        turso_core::mvcc::persistent_storage::Storage::new(file, tmp_db.io.clone(), None),
+    );
+    let recording = Arc::new(RecordingDurableStorage::new(default_storage));
+
+    let db = Database::open_file_with_flags_and_durable_storage(
+        tmp_db.io.clone(),
+        db_path.to_str().unwrap(),
+        OpenFlags::default(),
+        DatabaseOpts::new().with_encryption(true),
+        Some(EncryptionOpts {
+            cipher: "aes256gcm".to_string(),
+            hexkey: hex_key.to_string(),
+        }),
+        Some(recording),
+    )?;
+    let key = EncryptionKey::from_hex_string(hex_key)?;
+    let conn = db.connect_with_encryption(Some(key))?;
+
+    let err = conn.pragma_update("journal_mode", "'mvcc'").unwrap_err();
+    assert!(matches!(
+        err,
+        LimboError::InvalidArgument(message)
+            if message == "encrypted MVCC is not supported with custom DurableStorage"
+    ));
+
     Ok(())
 }
 
@@ -824,5 +868,215 @@ fn test_attach_memory_db_always_allowed(tmp_db: TempDatabase) -> anyhow::Result<
     conn.execute("INSERT INTO mem_aux.t VALUES (42)")?;
     let rows: Vec<(i64,)> = conn.exec_rows("SELECT x FROM mem_aux.t");
     assert_eq!(rows, vec![(42,)]);
+    Ok(())
+}
+
+/// The same attach-memory path must also work when the main database is both
+/// encrypted and running in MVCC mode.
+#[turso_macros::test]
+fn test_attach_memory_db_allowed_on_encrypted_mvcc_main(
+    tmp_db: TempDatabase,
+) -> anyhow::Result<()> {
+    let db_path = tmp_db.path.with_extension("encrypted_mvcc_main.db");
+    let hex_key = "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f";
+    let opts = DatabaseOpts::new().with_encryption(true).with_attach(true);
+    let enc_opts = Some(EncryptionOpts {
+        cipher: "aes256gcm".to_string(),
+        hexkey: hex_key.to_string(),
+    });
+    let db = Database::open_file_with_flags(
+        tmp_db.io.clone(),
+        db_path.to_str().unwrap(),
+        OpenFlags::default(),
+        opts,
+        enc_opts,
+    )?;
+    let key = EncryptionKey::from_hex_string(hex_key)?;
+    let conn = db.connect_with_encryption(Some(key))?;
+
+    conn.pragma_update("journal_mode", "'mvcc'")?;
+    conn.execute("CREATE TABLE main_t(x INTEGER)")?;
+    conn.execute("INSERT INTO main_t VALUES (7)")?;
+
+    conn.execute("ATTACH ':memory:' AS mem_aux")?;
+    conn.execute("CREATE TABLE mem_aux.t(x INTEGER)")?;
+    conn.execute("INSERT INTO mem_aux.t VALUES (42)")?;
+
+    let main_rows: Vec<(i64,)> = conn.exec_rows("SELECT x FROM main_t");
+    assert_eq!(main_rows, vec![(7,)]);
+    let aux_rows: Vec<(i64,)> = conn.exec_rows("SELECT x FROM mem_aux.t");
+    assert_eq!(aux_rows, vec![(42,)]);
+    Ok(())
+}
+
+#[turso_macros::test]
+fn test_add_then_drop_table_in_same_tx_then_recover(db: TempDatabase) -> anyhow::Result<()> {
+    let path = db.path.clone();
+    let io = db.io.clone();
+
+    {
+        let conn = db.connect_limbo();
+        [
+            "pragma journal_mode = 'mvcc'",
+            "begin",
+            "create table t(a)",
+            "drop table t",
+            "commit",
+        ]
+        .iter()
+        .try_for_each(|sql| conn.execute(sql))?;
+    }
+    drop(db);
+
+    Database::open_file(io, path.to_str().unwrap())?;
+
+    Ok(())
+}
+
+/// Reproducer for #6207-like panic: create table, insert data, drop table across
+/// transactions, checkpoint, then recover. The logical log may contain data row
+/// inserts for a table whose schema entry was checkpointed and then dropped,
+/// leaving the table_id absent from table_id_to_rootpage on recovery.
+#[turso_macros::test]
+fn test_create_insert_drop_checkpoint_recover(db: TempDatabase) -> anyhow::Result<()> {
+    let path = db.path.clone();
+    let io = db.io.clone();
+
+    {
+        let conn = db.connect_limbo();
+        conn.execute("pragma journal_mode = 'mvcc'")?;
+
+        // Tx1: create table and insert rows
+        conn.execute("begin")?;
+        conn.execute("create table t(a integer, b text)")?;
+        for i in 0..100 {
+            conn.execute(format!("insert into t values({i}, 'row_{i}')"))?;
+        }
+        conn.execute("commit")?;
+
+        // Tx2: drop the table
+        conn.execute("begin")?;
+        conn.execute("drop table t")?;
+        conn.execute("commit")?;
+
+        // Checkpoint to flush to btree and advance persistent_tx_ts_max
+        let conn2 = db.connect_limbo();
+        conn2.execute("PRAGMA wal_checkpoint(TRUNCATE)")?;
+
+        // Tx3: create another table and insert (this will be above cutoff if
+        // the pod is killed before next checkpoint)
+        conn.execute("begin")?;
+        conn.execute("create table t2(x integer)")?;
+        for i in 0..50 {
+            conn.execute(format!("insert into t2 values({i})"))?;
+        }
+        conn.execute("commit")?;
+    }
+    drop(db);
+
+    // Reopen — triggers bootstrap / log replay
+    Database::open_file(io.clone(), path.to_str().unwrap())?;
+
+    Ok(())
+}
+
+/// Same-tx CREATE INDEX + DROP INDEX: the index schema row is inserted and
+/// deleted in the same transaction, producing an insert-delete cycle in
+/// sqlite_schema that must not panic during log replay.
+#[turso_macros::test]
+fn test_create_drop_index_same_tx_recover(db: TempDatabase) -> anyhow::Result<()> {
+    let path = db.path.clone();
+    let io = db.io.clone();
+
+    {
+        let conn = db.connect_limbo();
+        conn.execute("pragma journal_mode = 'mvcc'")?;
+        conn.execute("create table t(id integer primary key, v text)")?;
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")?;
+
+        conn.execute("begin")?;
+        conn.execute("create index idx_t_v on t(v)")?;
+        conn.execute("drop index idx_t_v")?;
+        conn.execute("commit")?;
+    }
+    drop(db);
+
+    Database::open_file(io, path.to_str().unwrap())?;
+
+    Ok(())
+}
+
+/// Same-tx create + insert + drop: data rows reference a table_id whose schema
+/// entry is created and destroyed in the same transaction.
+#[turso_macros::test]
+fn test_create_insert_drop_same_tx_recover(db: TempDatabase) -> anyhow::Result<()> {
+    let path = db.path.clone();
+    let io = db.io.clone();
+
+    {
+        let conn = db.connect_limbo();
+        conn.execute("pragma journal_mode = 'mvcc'")?;
+
+        conn.execute("begin")?;
+        conn.execute("create table t(a integer)")?;
+        for i in 0..100 {
+            conn.execute(format!("insert into t values({i})"))?;
+        }
+        conn.execute("drop table t")?;
+        conn.execute("commit")?;
+    }
+    drop(db);
+
+    Database::open_file(io, path.to_str().unwrap())?;
+
+    Ok(())
+}
+
+/// Multiple create/drop cycles then recover: exercises the log replay path
+/// with multiple table_ids that may or may not be in table_id_to_rootpage.
+#[turso_macros::test]
+fn test_multiple_create_drop_cycles_recover(db: TempDatabase) -> anyhow::Result<()> {
+    let path = db.path.clone();
+    let io = db.io.clone();
+
+    {
+        let conn = db.connect_limbo();
+        conn.execute("pragma journal_mode = 'mvcc'")?;
+
+        for cycle in 0..5 {
+            conn.execute("begin")?;
+            conn.execute("create table t(a integer, b text)")?;
+            for i in 0..50 {
+                conn.execute(format!(
+                    "insert into t values({i}, 'cycle_{cycle}_row_{i}')"
+                ))?;
+            }
+            conn.execute("commit")?;
+
+            conn.execute("begin")?;
+            conn.execute("drop table t")?;
+            conn.execute("commit")?;
+        }
+
+        // Checkpoint midway
+        let conn2 = db.connect_limbo();
+        conn2.execute("PRAGMA wal_checkpoint(TRUNCATE)")?;
+
+        // One more cycle after checkpoint
+        conn.execute("begin")?;
+        conn.execute("create table t(a integer, b text)")?;
+        for i in 0..50 {
+            conn.execute(format!("insert into t values({i}, 'final_row_{i}')"))?;
+        }
+        conn.execute("commit")?;
+
+        conn.execute("begin")?;
+        conn.execute("drop table t")?;
+        conn.execute("commit")?;
+    }
+    drop(db);
+
+    Database::open_file(io, path.to_str().unwrap())?;
+
     Ok(())
 }

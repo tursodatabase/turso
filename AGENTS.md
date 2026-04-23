@@ -5,15 +5,16 @@ SQLite rewrite in Rust. 40+ crate workspace.
 ## Quick Reference
 
 ```bash
-cargo build                    # build. never build with release.
+cargo build                    # build. never build with --release
 cargo test                     # rust unit/integration tests
 cargo fmt                      # format (required)
 cargo clippy --workspace --all-features --all-targets -- --deny=warnings  # lint
-cargo run -q --bin tursodb -- -q # run the interactive cli
+cargo run -q --bin tursodb -- -q # run the interactive cli. never run with --release
 
 make test                      # TCL compat + sqlite3 + extensions + MVCC
 make test-single TEST=foo.test # single TCL test
-make -C testing/sqltests run-rust  # sqltest runner (preferred for new tests)
+make -C testing/sqltests run-rust ARGS='--snapshot-filter __never__'  # sqltest runner (preferred for new tests)
+CI=1 make -C testing/sqltests run-rust  # use only if snapshot tests are required
 
 scripts/diff.sh "SQL" [label]  # compare sqlite3 vs tursodb output
 ```

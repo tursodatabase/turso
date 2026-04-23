@@ -86,6 +86,10 @@ RCT_EXPORT_MODULE()
     turso::install(*runtime, callInvoker, [documentsPath UTF8String]);
 }
 
+- (void)invalidate {
+    turso::invalidate();
+}
+
 // Synchronous method to check if the module is installed
 RCT_EXPORT_BLOCKING_SYNCHRONOUS_METHOD(install) {
     [self installLibrary];

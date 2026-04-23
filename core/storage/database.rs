@@ -297,10 +297,11 @@ fn checksum_buffer(page_idx: usize, buffer: Arc<Buffer>, ctx: &ChecksumContext) 
     buffer
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "checksum"))]
 mod tests {
     use super::*;
-    use crate::{File, MemoryIO, IO};
+    use crate::File;
+    use crate::{io::IO, MemoryIO};
 
     struct MockFile {
         read_result: std::result::Result<i32, CompletionError>,
@@ -343,7 +344,6 @@ mod tests {
         }
     }
 
-    #[cfg(feature = "checksum")]
     #[test]
     fn checksum_read_wrapper_propagates_callback_errors() {
         let db_file = DatabaseFile {
@@ -383,7 +383,6 @@ mod tests {
         ));
     }
 
-    #[cfg(feature = "checksum")]
     #[test]
     fn checksum_read_wrapper_propagates_transport_errors_to_original_completion() {
         let db_file = DatabaseFile {

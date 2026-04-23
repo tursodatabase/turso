@@ -16,6 +16,26 @@ afterAll(() => {
     console.log('[afterAll] MainWorker terminated');
 })
 
+test('big schema test', async () => {
+    const N = 1024;
+    {
+        const db = await connect("local.db");
+        for (let i = 0; i < N; i++) {
+            console.info(`i = ${i}`);
+            const stmt = db.prepare(`CREATE TABLE t_${i} (x)`)
+            await stmt.all();
+            await stmt.close();
+        }
+        await db.close();
+    }
+    {
+        console.info('open db again');
+        const db = await connect("local.db");
+        const rows = await db.prepare("SELECT * FROM sqlite_master").all();
+        expect(rows).toHaveLength(N);
+    }
+})
+
 test('vector-test', async () => {
     const db = await connect(":memory:");
     const v1 = new Array(1024).fill(0).map((_, i) => i);
@@ -211,6 +231,13 @@ test('blobs', async () => {
     await db.close();
 })
 
+test("datetime('now')", async () => {
+    const db = await connect(":memory:");
+    const rows = await db.prepare("SELECT datetime('now') as now").all();
+    expect(rows).toHaveLength(1);
+    expect(rows[0].now).toMatch(/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$/);
+    await db.close();
+})
 
 test('example-1', async () => {
     const db = await connect(':memory:');

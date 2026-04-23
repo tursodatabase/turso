@@ -192,6 +192,19 @@ impl SelectStmt {
                 }
             }
         }
+        // Check compound arms' subquery expressions
+        for arm in &self.compounds {
+            for col in &arm.columns {
+                if let Some(reason) = col.expr.unordered_limit_reason() {
+                    return Some(reason);
+                }
+            }
+            if let Some(w) = &arm.where_clause {
+                if let Some(reason) = w.unordered_limit_reason() {
+                    return Some(reason);
+                }
+            }
+        }
         // Check ORDER BY expressions
         for item in &self.order_by {
             if let Some(reason) = item.expr.unordered_limit_reason() {
@@ -205,6 +218,12 @@ impl SelectStmt {
     /// with `ORDER BY` that doesn't include a unique column, meaning tie-breaking
     /// is engine-dependent.
     pub fn non_unique_order_by_reason(&self, schema: &Schema) -> Option<&'static str> {
+        // Compound SELECTs with LIMIT always flag as non-unique: ORDER BY uses
+        // positional indices so unique-column checking doesn't apply.
+        if self.limit.is_some() && !self.compounds.is_empty() {
+            return Some("compound_limit_non_unique_order_by");
+        }
+
         // Check THIS select: LIMIT + ORDER BY without a unique tiebreaker
         if self.limit.is_some()
             && !self.order_by.is_empty()
@@ -663,6 +682,61 @@ pub enum JoinConstraint {
     On(Expr),
 }
 
+/// A compound operator connecting two SELECT arms.
+#[derive(Debug, Clone, Copy)]
+pub enum CompoundOperator {
+    Union,
+    UnionAll,
+    Intersect,
+    Except,
+}
+
+impl fmt::Display for CompoundOperator {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            CompoundOperator::Union => write!(f, "UNION"),
+            CompoundOperator::UnionAll => write!(f, "UNION ALL"),
+            CompoundOperator::Intersect => write!(f, "INTERSECT"),
+            CompoundOperator::Except => write!(f, "EXCEPT"),
+        }
+    }
+}
+
+/// A compound SELECT arm (e.g. `UNION SELECT ...`).
+#[derive(Debug, Clone)]
+pub struct CompoundSelectArm {
+    pub operator: CompoundOperator,
+    pub distinct: bool,
+    pub columns: Vec<SelectColumn>,
+    pub from: Option<FromClause>,
+    pub where_clause: Option<Expr>,
+}
+
+impl fmt::Display for CompoundSelectArm {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, " {} SELECT ", self.operator)?;
+        if self.distinct {
+            write!(f, "DISTINCT ")?;
+        }
+        for (i, col) in self.columns.iter().enumerate() {
+            if i > 0 {
+                write!(f, ", ")?;
+            }
+            write!(f, "{col}")?;
+        }
+        if let Some(from) = &self.from {
+            write!(f, " FROM {}", from.table)?;
+            if let Some(alias) = &from.alias {
+                write!(f, " AS {alias}")?;
+            }
+        }
+        if let Some(where_clause) = &self.where_clause {
+            write!(f, " WHERE {where_clause}")?;
+        }
+        Ok(())
+    }
+}
+
 /// A SELECT statement.
 #[derive(Debug, Clone)]
 pub struct SelectStmt {
@@ -674,6 +748,8 @@ pub struct SelectStmt {
     pub joins: Vec<JoinClause>,
     pub where_clause: Option<Expr>,
     pub group_by: Option<GroupByClause>,
+    /// Compound arms (UNION/INTERSECT/EXCEPT) following the first SELECT core.
+    pub compounds: Vec<CompoundSelectArm>,
     pub order_by: Vec<OrderByItem>,
     pub limit: Option<u64>,
     pub offset: Option<u64>,
@@ -744,6 +820,10 @@ impl fmt::Display for SelectStmt {
             if let Some(having) = &group_by.having {
                 write!(f, " HAVING {having}")?;
             }
+        }
+
+        for arm in &self.compounds {
+            write!(f, "{arm}")?;
         }
 
         if !self.order_by.is_empty() {
@@ -974,11 +1054,16 @@ pub struct CreateTableStmt {
     pub columns: Vec<ColumnDefStmt>,
     pub if_not_exists: bool,
     pub strict: bool,
+    pub temporary: Option<TemporaryKeyword>,
 }
 
 impl fmt::Display for CreateTableStmt {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "CREATE TABLE ")?;
+        write!(f, "CREATE ")?;
+        if let Some(keyword) = self.temporary {
+            write!(f, "{keyword} ")?;
+        }
+        write!(f, "TABLE ")?;
         if self.if_not_exists {
             write!(f, "IF NOT EXISTS ")?;
         }
@@ -998,6 +1083,21 @@ impl fmt::Display for CreateTableStmt {
         }
 
         Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TemporaryKeyword {
+    Temp,
+    Temporary,
+}
+
+impl fmt::Display for TemporaryKeyword {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            TemporaryKeyword::Temp => write!(f, "TEMP"),
+            TemporaryKeyword::Temporary => write!(f, "TEMPORARY"),
+        }
     }
 }
 
@@ -1100,6 +1200,12 @@ impl fmt::Display for AlterTableAction {
 }
 
 /// A CREATE INDEX statement.
+//
+// NOTE: SQLite's grammar does NOT accept TEMP / TEMPORARY on CREATE
+// INDEX. Temp indexes come from either the `temp.` name qualifier or
+// from indexing a temp table. Do not add a `temporary` field here —
+// the oracle would score "both errored" as a pass and the fuzzer
+// would silently burn its statement budget.
 #[derive(Debug, Clone)]
 pub struct CreateIndexStmt {
     pub name: String,
@@ -1153,6 +1259,11 @@ impl fmt::Display for DropIndexStmt {
 #[derive(Debug, Clone)]
 pub struct CreateTriggerStmt {
     pub name: String,
+    /// **Must** be unqualified. The schema on which the trigger fires
+    /// is determined by `temporary` (TEMP triggers can target tables in
+    /// any schema) or by the schema of the non-temp trigger itself.
+    /// SQLite's grammar does NOT accept `CREATE TRIGGER ... ON temp.t`
+    /// — the qualifier belongs on the trigger NAME.
     pub table: String,
     pub timing: TriggerTiming,
     pub event: TriggerEvent,
@@ -1160,11 +1271,19 @@ pub struct CreateTriggerStmt {
     pub when_clause: Option<Expr>,
     pub body: Vec<TriggerStmt>,
     pub if_not_exists: bool,
+    /// When true, emit `CREATE TEMP TRIGGER`. TEMP triggers live in
+    /// the temp schema regardless of their name's qualifier and can
+    /// target tables in any attached database.
+    pub temporary: bool,
 }
 
 impl fmt::Display for CreateTriggerStmt {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "CREATE TRIGGER ")?;
+        if self.temporary {
+            write!(f, "CREATE TEMP TRIGGER ")?;
+        } else {
+            write!(f, "CREATE TRIGGER ")?;
+        }
         if self.if_not_exists {
             write!(f, "IF NOT EXISTS ")?;
         }
@@ -1246,7 +1365,7 @@ pub enum TriggerStmt {
     Insert(InsertStmt),
     Update(UpdateStmt),
     Delete(DeleteStmt),
-    Select(SelectStmt),
+    Select(Box<SelectStmt>),
 }
 
 impl fmt::Display for TriggerStmt {
@@ -1369,7 +1488,26 @@ impl Expr {
     /// Create a function call (records to context).
     pub fn function_call(ctx: &mut Context, name: String, args: Vec<Expr>) -> Self {
         ctx.record(ExprKind::FunctionCall);
-        Expr::FunctionCall(FunctionCallExpr { name, args })
+        Expr::FunctionCall(FunctionCallExpr {
+            name,
+            args,
+            filter: None,
+        })
+    }
+
+    /// Create a function call with a FILTER clause (records to context).
+    pub fn function_call_with_filter(
+        ctx: &mut Context,
+        name: String,
+        args: Vec<Expr>,
+        filter: Expr,
+    ) -> Self {
+        ctx.record(ExprKind::FunctionCall);
+        Expr::FunctionCall(FunctionCallExpr {
+            name,
+            args,
+            filter: Some(Box::new(filter)),
+        })
     }
 
     /// Create a subquery (records to context).
@@ -1713,6 +1851,7 @@ pub enum UnaryOp {
 pub struct FunctionCallExpr {
     pub name: String,
     pub args: Vec<Expr>,
+    pub filter: Option<Box<Expr>>,
 }
 
 impl fmt::Display for FunctionCallExpr {
@@ -1724,7 +1863,11 @@ impl fmt::Display for FunctionCallExpr {
             }
             write!(f, "{arg}")?;
         }
-        write!(f, ")")
+        write!(f, ")")?;
+        if let Some(filter_expr) = &self.filter {
+            write!(f, " FILTER (WHERE {filter_expr})")?;
+        }
+        Ok(())
     }
 }
 
@@ -1942,6 +2085,7 @@ mod tests {
             joins: vec![],
             where_clause: None,
             group_by: None,
+            compounds: vec![],
             order_by: vec![],
             limit: Some(10),
             offset: None,
@@ -1969,6 +2113,7 @@ mod tests {
             joins: vec![],
             where_clause: None,
             group_by: None,
+            compounds: vec![],
             order_by: vec![],
             limit: None,
             offset: None,
@@ -1998,6 +2143,7 @@ mod tests {
             }],
             where_clause: None,
             group_by: None,
+            compounds: vec![],
             order_by: vec![],
             limit: None,
             offset: None,
@@ -2071,6 +2217,7 @@ mod tests {
             joins: vec![],
             where_clause: None,
             group_by: None,
+            compounds: vec![],
             order_by: vec![OrderByItem {
                 expr: Expr::Literal(Literal::Integer(1)),
                 direction: OrderDirection::Asc,
@@ -2102,6 +2249,7 @@ mod tests {
             joins: vec![],
             where_clause: None,
             group_by: None,
+            compounds: vec![],
             order_by: vec![OrderByItem {
                 expr: Expr::ColumnRef(ColumnRef {
                     table: None,
@@ -2136,6 +2284,7 @@ mod tests {
             joins: vec![],
             where_clause: None,
             group_by: None,
+            compounds: vec![],
             order_by: vec![OrderByItem {
                 expr: Expr::BinaryOp(Box::new(BinaryOpExpr {
                     left: Expr::ColumnRef(ColumnRef {
@@ -2154,6 +2303,7 @@ mod tests {
                         joins: vec![],
                         where_clause: None,
                         group_by: None,
+                        compounds: vec![],
                         order_by: vec![],
                         limit: Some(1),
                         offset: None,
@@ -2192,6 +2342,7 @@ mod tests {
             joins: vec![],
             where_clause: None,
             group_by: None,
+            compounds: vec![],
             order_by: vec![OrderByItem {
                 expr: Expr::Literal(Literal::Integer(1)),
                 direction: OrderDirection::Asc,
@@ -2224,6 +2375,7 @@ mod tests {
                 joins: vec![],
                 where_clause: None,
                 group_by: None,
+                compounds: vec![],
                 order_by: vec![],
                 limit: None,
                 offset: None,
@@ -2252,6 +2404,7 @@ mod tests {
                         joins: vec![],
                         where_clause: None,
                         group_by: None,
+                        compounds: vec![],
                         order_by: vec![],
                         limit: None,
                         offset: None,
@@ -2272,6 +2425,7 @@ mod tests {
                         joins: vec![],
                         where_clause: None,
                         group_by: None,
+                        compounds: vec![],
                         order_by: vec![],
                         limit: None,
                         offset: None,
@@ -2305,6 +2459,7 @@ mod tests {
                         joins: vec![],
                         where_clause: None,
                         group_by: None,
+                        compounds: vec![],
                         order_by: vec![],
                         limit: None,
                         offset: None,
@@ -2320,6 +2475,7 @@ mod tests {
             joins: vec![],
             where_clause: None,
             group_by: None,
+            compounds: vec![],
             order_by: vec![],
             limit: None,
             offset: None,
@@ -2351,6 +2507,7 @@ mod tests {
                         joins: vec![],
                         where_clause: None,
                         group_by: None,
+                        compounds: vec![],
                         order_by: vec![],
                         limit: None,
                         offset: None,
@@ -2402,6 +2559,7 @@ mod tests {
                         joins: vec![],
                         where_clause: None,
                         group_by: None,
+                        compounds: vec![],
                         order_by: vec![],
                         limit: Some(5),
                         offset: None,
@@ -2417,6 +2575,7 @@ mod tests {
             joins: vec![],
             where_clause: None,
             group_by: None,
+            compounds: vec![],
             order_by: vec![],
             limit: None,
             offset: None,
@@ -2459,6 +2618,7 @@ mod tests {
             joins: vec![],
             where_clause: None,
             group_by: None,
+            compounds: vec![],
             order_by: vec![OrderByItem {
                 expr: Expr::ColumnRef(ColumnRef {
                     table: None,
@@ -2506,6 +2666,7 @@ mod tests {
             joins: vec![],
             where_clause: None,
             group_by: None,
+            compounds: vec![],
             order_by: vec![OrderByItem {
                 expr: Expr::ColumnRef(ColumnRef {
                     table: None,
@@ -2519,6 +2680,30 @@ mod tests {
         };
 
         assert_eq!(select.non_unique_order_by_reason(&schema), None);
+    }
+
+    #[test]
+    fn test_create_temp_table_display() {
+        let stmt = CreateTableStmt {
+            table: "t".to_string(),
+            columns: vec![ColumnDefStmt {
+                name: "id".to_string(),
+                data_type: DataType::Integer,
+                primary_key: true,
+                not_null: true,
+                unique: false,
+                default: None,
+                check: None,
+            }],
+            if_not_exists: false,
+            strict: false,
+            temporary: Some(TemporaryKeyword::Temp),
+        };
+
+        assert_eq!(
+            stmt.to_string(),
+            "CREATE TEMP TABLE t (id INTEGER PRIMARY KEY)"
+        );
     }
 
     #[test]
@@ -2556,6 +2741,7 @@ mod tests {
             joins: vec![],
             where_clause: None,
             group_by: None,
+            compounds: vec![],
             order_by: vec![OrderByItem {
                 expr: Expr::ColumnRef(ColumnRef {
                     table: None,
@@ -2580,6 +2766,7 @@ mod tests {
             joins: vec![],
             where_clause: Some(Expr::Subquery(Box::new(inner))),
             group_by: None,
+            compounds: vec![],
             order_by: vec![],
             limit: None,
             offset: None,

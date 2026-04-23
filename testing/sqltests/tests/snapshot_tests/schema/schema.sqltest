@@ -1,0 +1,41 @@
+# Schema And Trigger Bytecode Snapshots
+# These snapshots verify exact EXPLAIN bytecode for schema-changing statements
+# that previously lived as hard-coded sqltests.
+
+@database :memory:
+@skip-file-if mvcc "mvcc has slightly different cursor ids, so skipping it for now"
+
+snapshot explain-create-table-initializes-main-header-before-createbtree {
+    CREATE TABLE y(b);
+}
+
+snapshot explain-create-temp-table-initializes-temp-header-before-createbtree {
+    CREATE TEMP TABLE y(b);
+}
+
+setup temp_trigger_table {
+    CREATE TEMP TABLE t(a INTEGER PRIMARY KEY);
+}
+
+@setup temp_trigger_table
+snapshot explain-create-temp-trigger-opens-temp-transaction {
+    CREATE TRIGGER tr AFTER DELETE ON temp.t BEGIN
+        SELECT 1;
+    END;
+}
+
+setup temp_trigger_for_drop {
+    CREATE TEMP TABLE t(a INTEGER PRIMARY KEY);
+    CREATE TRIGGER tr AFTER DELETE ON temp.t BEGIN
+        SELECT 1;
+    END;
+}
+
+@setup temp_trigger_for_drop
+snapshot explain-drop-temp-trigger-opens-temp-transaction {
+    DROP TRIGGER temp.tr;
+}
+
+snapshot explain-begin-deferred-no-transaction-opcodes {
+    BEGIN DEFERRED;
+}

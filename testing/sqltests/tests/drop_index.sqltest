@@ -80,3 +80,54 @@ expect error {
     index associated with UNIQUE or PRIMARY KEY constraint cannot be dropped
 }
 
+@cross-check-integrity
+test drop-explicit-unique-index {
+    CREATE TABLE t16 (id INT);
+    CREATE UNIQUE INDEX t16_unique_idx ON t16(id);
+    DROP INDEX t16_unique_idx;
+    SELECT count(*) FROM sqlite_schema WHERE type='index' AND name='t16_unique_idx';
+}
+expect {
+    0
+}
+
+# Test dropping user-created UNIQUE index with IF EXISTS
+@cross-check-integrity
+test drop-index-user-unique-if-exists {
+    CREATE TABLE t16b (a INTEGER PRIMARY KEY, b TEXT);
+    CREATE UNIQUE INDEX ux_t16b_b ON t16b(b);
+    DROP INDEX IF EXISTS ux_t16b_b;
+    SELECT count(*) FROM sqlite_schema WHERE type='index' AND name='ux_t16b_b';
+}
+expect {
+    0
+}
+
+# Test data is still accessible after dropping user-created UNIQUE index
+@cross-check-integrity
+test drop-index-user-unique-data-intact {
+    CREATE TABLE t16c (a INTEGER PRIMARY KEY, b TEXT);
+    CREATE UNIQUE INDEX ux_t16c_b ON t16c(b);
+    INSERT INTO t16c VALUES (1, 'hello');
+    INSERT INTO t16c VALUES (2, 'world');
+    DROP INDEX ux_t16c_b;
+    SELECT a, b FROM t16c ORDER BY a;
+}
+expect {
+    1|hello
+    2|world
+}
+
+# Test dropping user-created UNIQUE composite index
+@cross-check-integrity
+test drop-index-user-unique-composite {
+    CREATE TABLE t16d (a INTEGER PRIMARY KEY, b TEXT, c INT);
+    CREATE UNIQUE INDEX ux_t16d_bc ON t16d(b, c);
+    INSERT INTO t16d VALUES (1, 'x', 10);
+    DROP INDEX ux_t16d_bc;
+    SELECT count(*) FROM sqlite_schema WHERE type='index' AND name='ux_t16d_bc';
+}
+expect {
+    0
+}
+

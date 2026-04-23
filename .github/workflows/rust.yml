@@ -59,7 +59,7 @@ jobs:
     timeout-minutes: ${{ matrix.os == 'windows-latest' && 120 || 30 }}
     strategy:
       matrix:
-        os: [blacksmith-4vcpu-ubuntu-2404, macos-latest, windows-latest]
+        os: [blacksmith-4vcpu-ubuntu-2404, blacksmith-6vcpu-macos-latest, windows-latest]
 
     runs-on: ${{ matrix.os }}
 
@@ -94,7 +94,7 @@ jobs:
           LOCAL_SYNC_SERVER: "../../target/debug/tursodb"
         # for some reason, test(test_busy_snapshot_immediate) hung with coverage - so let's exclude it from the run for now
         run: |
-          cargo llvm-cov nextest --workspace --all-features --locked --no-fail-fast -E 'not binary(fuzz_tests) and not test(test_busy_snapshot_immediate)' --failure-output=final --html --output-dir coverage
+          cargo llvm-cov nextest --workspace --all-features --locked --no-fail-fast --exclude memory-benchmark -E 'not binary(fuzz_tests) and not test(test_busy_snapshot_immediate)' --failure-output=final --html --output-dir coverage
           echo "::group::Coverage Summary"
           cargo llvm-cov report | tee coverage/summary.txt
           echo "::endgroup::"
@@ -104,7 +104,7 @@ jobs:
         env:
           RUST_LOG: ${{ runner.debug && 'turso_core::storage=trace' || '' }}
           LOCAL_SYNC_SERVER: "../../target/debug/tursodb"
-        run: cargo nextest run --workspace --all-features --locked --no-fail-fast -E 'not binary(fuzz_tests)' --failure-output=final
+        run: cargo nextest run --workspace --all-features --locked --no-fail-fast --exclude memory-benchmark -E 'not binary(fuzz_tests)' --failure-output=final
         timeout-minutes: 20
       - name: Test integrity_check corruption and short reads (no checksum feature because it interferes with the test)
         run: cargo nextest run -p core_tester --locked --no-fail-fast -E 'test(integrity_check) | test(short_read)' --failure-output=final
@@ -112,7 +112,7 @@ jobs:
       - name: Test doctests
         env:
           LOCAL_SYNC_SERVER: "../../target/debug/tursodb"
-        run: cargo test --workspace --all-features --doc --locked
+        run: cargo test --workspace --all-features --doc --locked --exclude memory-benchmark
       - name: Upload coverage report
         if: runner.os == 'Linux'
         uses: actions/upload-artifact@v4
@@ -173,7 +173,7 @@ jobs:
           cache-on-failure: true
       - name: Clippy
         run: |
-          cargo clippy --workspace --all-features --all-targets --locked -- --deny=warnings
+          cargo clippy --workspace --all-features --all-targets --locked --exclude memory-benchmark -- --deny=warnings
 
   simulator:
     runs-on: blacksmith-4vcpu-ubuntu-2404
@@ -318,7 +318,19 @@ jobs:
 
   concurrent-simulator:
     runs-on: blacksmith-4vcpu-ubuntu-2404
-    timeout-minutes: 30
+    timeout-minutes: 40
+    strategy:
+      matrix:
+        profile:
+          - name: in-process
+            iterations: 100
+            args: "--mode fast --reopen-probability 0.001"
+          - name: multiprocess
+            iterations: 20
+            args: "--mode fast --multiprocess --connections-per-process 4 --processes 4"
+          - name: multiprocess-kill
+            iterations: 10
+            args: "--mode fast --multiprocess --connections-per-process 4 --processes 4 --kill-probability 0.01"
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -330,13 +342,14 @@ jobs:
           cache-on-failure: true
       - uses: "./.github/shared/setup-sccache"
       - name: Run turso_whopper regression tests
+        if: matrix.profile.name == 'in-process'
         run: cargo test -p turso_whopper --test regression_tests
         timeout-minutes: 5
-      - name: Run turso_whopper
+      - name: Run turso_whopper (${{ matrix.profile.name }})
         run: |
-          cargo build -p turso_whopper
-          for i in $(seq 1 100); do
-            ./target/debug/turso_whopper --reopen-probability 0.001 || exit 1
+          cargo build -p turso_whopper --release
+          for i in $(seq 1 ${{ matrix.profile.iterations }}); do
+            ./target/release/turso_whopper ${{ matrix.profile.args }} || exit 1
           done
 
   test-sqlite:

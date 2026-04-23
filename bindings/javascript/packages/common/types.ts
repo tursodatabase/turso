@@ -1,4 +1,4 @@
-export type ExperimentalFeature = 'views' | 'strict' | 'encryption' | 'index_method' | 'autovacuum' | 'triggers' | 'attach';
+export type ExperimentalFeature = 'views' | 'strict' | 'encryption' | 'index_method' | 'autovacuum' | 'triggers' | 'attach' | 'multiprocess_wal';
 
 /** Supported encryption ciphers for local database encryption. */
 export type EncryptionCipher = 'aes128gcm' | 'aes256gcm' | 'aegis256' | 'aegis256x2' | 'aegis128l' | 'aegis128x2' | 'aegis128x4'
@@ -14,11 +14,18 @@ export interface DatabaseOpts {
     readonly?: boolean,
     fileMustExist?: boolean,
     timeout?: number
+    /** Default maximum query execution time in milliseconds before interruption. */
+    defaultQueryTimeout?: number
     tracing?: 'info' | 'debug' | 'trace'
     /** Experimental features to enable */
     experimental?: ExperimentalFeature[]
     /** Optional local encryption configuration */
     encryption?: EncryptionOpts
+}
+
+export interface QueryOptions {
+    /** Per-query timeout in milliseconds. Overrides defaultQueryTimeout for this call. */
+    queryTimeout?: number
 }
 
 export interface NativeDatabase {
@@ -35,7 +42,7 @@ export interface NativeDatabase {
     ioLoopAsync(): Promise<void>;
 
     prepare(sql: string): NativeStatement;
-    executor(sql: string): NativeExecutor;
+    executor(sql: string, queryOptions?: QueryOptions): NativeExecutor;
 
     defaultSafeIntegers(toggle: boolean);
     totalChanges(): number;
@@ -52,7 +59,10 @@ export const STEP_IO = 3;
 
 export interface TableColumn {
     name: string,
-    type: string
+    type: string | null,
+    column: null,
+    table: null,
+    database: null
 }
 
 export interface NativeExecutor {
@@ -60,6 +70,7 @@ export interface NativeExecutor {
     reset();
 }
 export interface NativeStatement {
+    setQueryTimeout(queryOptions?: QueryOptions): void;
     stepAsync(): Promise<number>;
     stepSync(): number;
 

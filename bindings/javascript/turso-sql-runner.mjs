@@ -83,7 +83,7 @@ async function main() {
     let db;
     try {
         const { connect } = await import('@tursodatabase/database');
-        db = await connect(dbPath, { readonly, experimental: ['triggers', 'attach'] });
+        db = await connect(dbPath, { readonly, experimental: ['triggers', 'attach', 'generated_columns'] });
         // Enable safe integers to preserve precision for large integers
         db.defaultSafeIntegers(true);
     } catch (err) {

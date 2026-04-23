@@ -1,0 +1,74 @@
+@database :memory:
+
+# Regression test: a VIRTUAL generated column whose expression is a constant
+# must produce the constant value when constraint checks (NOT NULL) and
+# index entries materialize the column register during INSERT.
+#
+# Previously, constant-folding hoisted the expression into the program init
+# section, but the main INSERT body re-initialized the column register to
+# NULL afterwards. NOT NULL checks then saw NULL and the INSERT failed.
+
+setup schema-notnull-text {
+    CREATE TABLE t1(a INTEGER, b AS ('Y') VIRTUAL NOT NULL);
+    INSERT INTO t1(a) VALUES(1);
+    INSERT INTO t1(a) VALUES(2);
+}
+
+@setup schema-notnull-text
+test gencol-virtual-constant-notnull-text-select {
+    SELECT a, b FROM t1 ORDER BY a;
+}
+expect {
+    1|Y
+    2|Y
+}
+
+setup schema-notnull-int {
+    CREATE TABLE t2(a INTEGER, b AS (42) VIRTUAL NOT NULL);
+    INSERT INTO t2(a) VALUES(10);
+    INSERT INTO t2(a) VALUES(20);
+}
+
+@setup schema-notnull-int
+test gencol-virtual-constant-notnull-int-select {
+    SELECT a, b FROM t2 ORDER BY a;
+}
+expect {
+    10|42
+    20|42
+}
+
+# Mixed: a NOT NULL constant virtual column alongside an expression virtual
+# column. The expression column is non-constant so its register must be
+# computed inline; the constant column is hoisted to init.
+setup schema-mixed-notnull {
+    CREATE TABLE t3(a INTEGER, b AS ('K') VIRTUAL NOT NULL, c AS (a*2) VIRTUAL);
+    INSERT INTO t3(a) VALUES(3);
+    INSERT INTO t3(a) VALUES(7);
+}
+
+@setup schema-mixed-notnull
+test gencol-virtual-mixed-notnull-select {
+    SELECT a, b, c FROM t3 ORDER BY a;
+}
+expect {
+    3|K|6
+    7|K|14
+}
+
+# Indexes on constant virtual columns should also produce the constant.
+setup schema-indexed {
+    CREATE TABLE t4(a INTEGER, b AS ('Z') VIRTUAL);
+    CREATE INDEX t4_b ON t4(b);
+    INSERT INTO t4(a) VALUES(1);
+    INSERT INTO t4(a) VALUES(2);
+}
+
+@setup schema-indexed
+test gencol-virtual-constant-index-lookup {
+    SELECT a FROM t4 WHERE b = 'Z' ORDER BY a;
+}
+expect {
+    1
+    2
+}

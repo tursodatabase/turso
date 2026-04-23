@@ -1,6 +1,6 @@
 use crate::{
     commands::{
-        args::{EchoMode, HeadersMode, ParameterArgs, ParameterCommand, TimerMode},
+        args::{DbConfigMode, EchoMode, HeadersMode, ParameterArgs, ParameterCommand, TimerMode},
         import::ImportFile,
         Command, CommandParser,
     },
@@ -91,6 +91,10 @@ pub struct Opts {
     pub experimental_autovacuum: bool,
     #[clap(long, help = "Enable experimental attach feature")]
     pub experimental_attach: bool,
+    #[clap(long, help = "Enable experimental generated columns feature")]
+    pub experimental_generated_columns: bool,
+    #[clap(long, help = "Enable experimental multiprocess WAL coordination")]
+    pub experimental_multiprocess_wal: bool,
     #[cfg(feature = "mvcc_repl")]
     #[clap(long, help = "Start MVCC concurrent transaction harness")]
     pub mvcc: bool,
@@ -230,6 +234,8 @@ impl Limbo {
             .with_index_method(opts.experimental_index_method)
             .with_autovacuum(opts.experimental_autovacuum)
             .with_attach(opts.experimental_attach)
+            .with_generated_columns(opts.experimental_generated_columns)
+            .with_multiprocess_wal(opts.experimental_multiprocess_wal)
             .with_unsafe_testing(opts.unsafe_testing);
 
         let db_file = normalize_db_path(db_file);
@@ -561,7 +567,7 @@ impl Limbo {
             // Capture metrics after stepping, before the Statement is dropped
             if capture_stats {
                 if let Ok(Some(ref stmt)) = output {
-                    last_stmt_metrics = Some(stmt.metrics().clone());
+                    last_stmt_metrics = Some(stmt.metrics());
                 }
             }
         }
@@ -875,9 +881,25 @@ impl Limbo {
                         let _ = self.writeln_fmt(format_args!("/****** ERROR: {e} ******/"));
                     }
                 }
-                Command::DbConfig(_args) => {
-                    let _ = self.writeln("dbconfig currently ignored");
-                }
+                Command::DbConfig(args) => match (args.config.as_deref(), args.mode) {
+                    (Some("dqs_dml"), Some(DbConfigMode::On)) => {
+                        self.conn.set_dqs_dml(true);
+                    }
+                    (Some("dqs_dml"), Some(DbConfigMode::Off)) => {
+                        self.conn.set_dqs_dml(false);
+                    }
+                    (Some("dqs_dml"), None) => {
+                        let val = if self.conn.get_dqs_dml() { "on" } else { "off" };
+                        let _ = self.writeln(format!("dqs_dml {val}"));
+                    }
+                    (Some(name), _) => {
+                        let _ = self.writeln(format!("unknown dbconfig: {name}"));
+                    }
+                    (None, _) => {
+                        let dqs = if self.conn.get_dqs_dml() { "on" } else { "off" };
+                        let _ = self.writeln(format!("dqs_dml {dqs}"));
+                    }
+                },
                 Command::ListVfs => {
                     let _ = self.writeln("Available VFS modules:");
                     self.conn.list_vfs().iter().for_each(|v| {
@@ -943,14 +965,14 @@ impl Limbo {
                 let output_mode = self.opts.output_mode;
 
                 match (output_mode, query_mode) {
+                    (OutputMode::List, _) => {
+                        self.print_list_mode(rows, statistics)?;
+                    }
                     (_, QueryMode::ExplainQueryPlan) => {
                         self.print_explain_query_plan(rows, statistics)?;
                     }
                     (_, QueryMode::Explain) => {
                         self.print_explain(rows, statistics)?;
-                    }
-                    (OutputMode::List, _) => {
-                        self.print_list_mode(rows, statistics)?;
                     }
                     (OutputMode::Pretty, _) => {
                         self.print_pretty_mode(rows, statistics)?;
@@ -1454,7 +1476,7 @@ impl Limbo {
             _ => {}
         }
         let sql = format!(
-            "SELECT sql, type, name FROM {db_prefix}.sqlite_schema WHERE type IN ('table', 'index', 'view') AND (tbl_name = '{table_name}' OR name = '{table_name}') AND name NOT LIKE 'sqlite_%' AND name NOT LIKE '__turso_internal_%' ORDER BY CASE type WHEN 'table' THEN 1 WHEN 'view' THEN 2 WHEN 'index' THEN 3 END, rowid"
+            "SELECT sql, type, name FROM {db_prefix}.sqlite_schema WHERE type IN ('table', 'index', 'view', 'trigger') AND (tbl_name = '{table_name}' OR name = '{table_name}') AND name NOT LIKE 'sqlite_%' AND name NOT LIKE '__turso_internal_%' ORDER BY CASE type WHEN 'table' THEN 1 WHEN 'view' THEN 2 WHEN 'index' THEN 3 WHEN 'trigger' THEN 4 END, rowid"
         );
 
         let mut found = false;
@@ -1486,7 +1508,7 @@ impl Limbo {
         db_prefix: &str,
         db_display_name: &str,
     ) -> anyhow::Result<()> {
-        let sql = format!("SELECT sql, type, name FROM {db_prefix}.sqlite_schema WHERE type IN ('table', 'index', 'view') AND name NOT LIKE 'sqlite_%' AND name NOT LIKE '__turso_internal_%' ORDER BY CASE type WHEN 'table' THEN 1 WHEN 'view' THEN 2 WHEN 'index' THEN 3 END, rowid");
+        let sql = format!("SELECT sql, type, name FROM {db_prefix}.sqlite_schema WHERE type IN ('table', 'index', 'view', 'trigger') AND name NOT LIKE 'sqlite_%' AND name NOT LIKE '__turso_internal_%' ORDER BY CASE type WHEN 'table' THEN 1 WHEN 'view' THEN 2 WHEN 'index' THEN 3 WHEN 'trigger' THEN 4 END, rowid");
 
         match self.conn.query(&sql) {
             Ok(Some(ref mut rows)) => {
@@ -1602,10 +1624,10 @@ impl Limbo {
             let prefix = (name != "main").then_some(&name);
             let sql = match pattern {
                 Some(pattern) => format!(
-                    "SELECT name FROM {name}.sqlite_schema WHERE type='table' AND name NOT LIKE 'sqlite_%' AND name LIKE '{pattern}' ORDER BY 1"
+                    "SELECT name FROM {name}.sqlite_schema WHERE type in ('table', 'view') AND name NOT LIKE 'sqlite_%' AND name LIKE '{pattern}' ORDER BY 1"
                 ),
                 None => format!(
-                    "SELECT name FROM {name}.sqlite_schema WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY 1"
+                    "SELECT name FROM {name}.sqlite_schema WHERE type in ('table', 'view') AND name NOT LIKE 'sqlite_%' ORDER BY 1"
                 ),
             };
             let handler = |row: &turso_core::Row| {

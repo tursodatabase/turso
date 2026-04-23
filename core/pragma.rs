@@ -59,8 +59,15 @@ pub fn pragma_for(pragma: &PragmaName) -> Pragma {
             PragmaFlags::NeedSchema | PragmaFlags::Result0 | PragmaFlags::SchemaReq,
             &["journal_mode"],
         ),
+        LockingMode => Pragma::new(PragmaFlags::Result0, &["locking_mode"]),
+        FullColumnNames | ShortColumnNames => {
+            unreachable!("pragma_for() called with FullColumnNames/ShortColumnNames, which are deprecated no-ops")
+        }
         LegacyFileFormat => {
             unreachable!("pragma_for() called with LegacyFileFormat, which is unsupported")
+        }
+        EmptyResultCallbacks => {
+            unreachable!("pragma_for() called with EmptyResultCallbacks, which is a no-op")
         }
         ModuleList => Pragma::new(
             PragmaFlags::NeedSchema | PragmaFlags::Result0 | PragmaFlags::SchemaReq,
@@ -210,7 +217,12 @@ pub(crate) struct PragmaVirtualTable {
 impl PragmaVirtualTable {
     pub(crate) fn functions() -> Vec<(PragmaVirtualTable, String)> {
         PragmaName::iter()
-            .filter(|name| *name != PragmaName::LegacyFileFormat)
+            .filter(|name| {
+                *name != PragmaName::LegacyFileFormat
+                    && *name != PragmaName::FullColumnNames
+                    && *name != PragmaName::ShortColumnNames
+                    && *name != PragmaName::EmptyResultCallbacks
+            })
             .filter_map(|name| {
                 let pragma = pragma_for(&name);
                 if pragma
@@ -415,7 +427,11 @@ impl PragmaVirtualTableCursor {
             sql.push_str(&format!("=\"{arg}\""));
         }
 
-        self.stmt = Some(self.conn.prepare(sql)?);
+        // Table-valued pragma helpers execute inside the parent statement's VM step.
+        // For example, UPDATE ... FROM pragma_table_info('dst') runs this helper while the
+        // outer UPDATE still has an active MVCC transaction and write cursor open on `dst`.
+        // The helper must stay nested so it does not disturb the parent's transaction state.
+        self.stmt = Some(self.conn.prepare_internal(sql)?);
 
         self.next()
     }

@@ -38,11 +38,13 @@ Turso Database is an in-process SQL database written in Rust, compatible with SQ
 ## Features and Roadmap
 
 * **SQLite compatibility** for SQL dialect, file formats, and the C API [see [document](COMPAT.md) for details]
+* **`BEGIN CONCURRENT`** for improved write throughput using multi-version concurrency control (MVCC).
 * **Change data capture (CDC)** for real-time tracking of database changes.
 * **Multi-language support** for
   * [Go](bindings/go)
   * [JavaScript](bindings/javascript)
   * [Java](bindings/java)
+  * [.NET](bindings/dotnet)
   * [Python](bindings/python)
   * [Rust](bindings/rust)
   * [WebAssembly](bindings/javascript)
@@ -53,10 +55,10 @@ Turso Database is an in-process SQL database written in Rust, compatible with SQ
 
 The database has the following experimental features:
 
-* **`BEGIN CONCURRENT`** for improved write throughput using multi-version concurrency control (MVCC).
 * **Encryption at rest** for protecting the data locally.
 * **Incremental computation** using DBSP for incremental view maintenance and query subscriptions.
 * **Full-Text-Search** powered by the awesome [tantivy](https://github.com/quickwit-oss/tantivy) library
+* **Multi-process WAL coordination** via the `.tshm` sidecar for cross-process WAL readers and writers.
 
 The following features are on our current roadmap:
 
@@ -201,6 +203,36 @@ for rows.Next() {
 }
 ```
 </details>
+
+
+<details>
+
+<summary>️#️⃣ .NET</summary>
+<br>
+
+Example usage:
+```cs
+using Turso;
+
+using var connection = new TursoConnection("Data Source=:memory:");
+connection.Open();
+
+connection.ExecuteNonQuery("CREATE TABLE t(a, b)");
+var rowsAffected = connection.ExecuteNonQuery("INSERT INTO t(a, b) VALUES (1, 2), (3, 4)");
+Console.WriteLine($"RowsAffected: {rowsAffected}");
+
+using var command = connection.CreateCommand();
+command.CommandText = "SELECT * FROM t";
+using var reader = command.ExecuteReader();
+while (reader.Read())
+{
+    var a = reader.GetInt32(0);
+    var b = reader.GetInt32(1);
+    Console.WriteLine($"Value1: {a}, Value2: {b}");
+}
+```
+</details>
+
 
 <details>
 
@@ -396,7 +428,7 @@ SQLite is loved because it is the most reliable database in the world. The next 
 to match or surpass this level of reliability. Turso is built with [Deterministic Simulation Testing](testing/simulator/README.md/)
 from the ground up, and is also tested by [Antithesis](https://antithesis.com).
 
-Even during Alpha, if you find a bug that leads to a data corruption and demonstrate
+Even during Beta, if you find a bug that leads to a data corruption and demonstrate
 how our simulator failed to catch it, you can get up to $1,000.00. As the project matures we will
 increase the size of the prize, and the scope of the bugs.
 

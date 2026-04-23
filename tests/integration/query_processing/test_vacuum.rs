@@ -1,8 +1,11 @@
-use crate::common::{compute_dbhash, ExecRows, TempDatabase};
+use crate::common::{
+    compute_dbhash, compute_dbhash_with_database_opts, compute_dbhash_with_options,
+    compute_dbhash_with_options_and_database_opts, ExecRows, TempDatabase,
+};
 use rusqlite::Connection as SqliteConnection;
 use std::sync::Arc;
 use tempfile::TempDir;
-use turso_core::{Connection, Value};
+use turso_core::{Connection, StepResult, Value};
 
 /// Helper to run integrity_check and return the result string
 fn run_integrity_check(conn: &Arc<Connection>) -> String {
@@ -98,7 +101,8 @@ fn test_vacuum_into_basic(tmp_db: TempDatabase) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Test VACUUM INTO error cases: plain VACUUM, existing file, within transaction
+/// Test VACUUM INTO error cases: plain VACUUM, existing file, within
+/// transaction, and query_only mode.
 #[turso_macros::test(mvcc, init_sql = "CREATE TABLE t (a INTEGER);")]
 fn test_vacuum_into_error_cases(tmp_db: TempDatabase) -> anyhow::Result<()> {
     let _ = env_logger::try_init();
@@ -143,6 +147,201 @@ fn test_vacuum_into_error_cases(tmp_db: TempDatabase) -> anyhow::Result<()> {
     let rows: Vec<(i64,)> = conn.exec_rows("SELECT a FROM t");
     assert_eq!(rows, vec![(1,)]);
 
+    // 4. VACUUM / VACUUM INTO should fail in query_only mode with a
+    // VACUUM-specific error message.
+    conn.set_query_only(true);
+    let query_only_path = dest_dir.path().join("query-only.db");
+    let escaped_query_only_path = escape_sqlite_string_literal(query_only_path.to_str().unwrap());
+    let result = conn.execute(format!("VACUUM INTO '{escaped_query_only_path}'"));
+    assert!(
+        result.is_err(),
+        "VACUUM INTO should fail in query_only mode"
+    );
+    let err_msg = result.unwrap_err().to_string();
+    assert!(
+        err_msg.contains("VACUUM") && err_msg.contains("query_only"),
+        "Error should mention VACUUM and query_only, got: {err_msg}"
+    );
+    assert!(
+        !query_only_path.exists(),
+        "File should not be created in query_only mode"
+    );
+    conn.set_query_only(false);
+
+    Ok(())
+}
+
+/// Active-statement accounting matrix for VACUUM INTO:
+///
+/// - active other statement, no reprepare -> reject
+/// - active other statement, with reprepare -> still reject
+/// Active-statement accounting for VACUUM INTO:
+///
+/// - active other statement, no reprepare -> reject
+/// - active other statement, with reprepare -> still reject
+///
+/// SQLite-compatible behavior: VACUUM INTO must reject if another statement is
+/// still active on the same connection.
+#[turso_macros::test(mvcc, init_sql = "CREATE TABLE t (a INTEGER);")]
+fn test_vacuum_into_rejects_active_select_on_same_connection(
+    tmp_db: TempDatabase,
+) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+    conn.execute("INSERT INTO t VALUES (1), (2), (3)")?;
+
+    let mut select_stmt = conn.prepare("SELECT a FROM t ORDER BY a")?;
+    assert!(
+        matches!(select_stmt.step()?, StepResult::Row),
+        "SELECT should remain active after yielding its first row"
+    );
+    assert_eq!(
+        select_stmt.row().unwrap().get_values().next(),
+        Some(&Value::from_i64(1))
+    );
+
+    let dest_dir = TempDir::new()?;
+    let dest_path = dest_dir.path().join("active-select-vacuum-into.db");
+
+    let err = conn
+        .execute(format!("VACUUM INTO '{}'", dest_path.to_str().unwrap()))
+        .expect_err("VACUUM INTO should reject same-connection active statements");
+    let err_msg = err.to_string();
+    assert!(
+        err_msg.contains("SQL statements in progress"),
+        "error should mention active statements, got: {err_msg}"
+    );
+    assert!(
+        !dest_path.exists(),
+        "destination file should not be created on failure"
+    );
+
+    let mut seen = vec![1];
+    loop {
+        match select_stmt.step()? {
+            StepResult::Row => {
+                let row = select_stmt.row().expect("row should be present");
+                match row.get_values().next() {
+                    Some(v) => seen.push(v.as_int().expect("expected integer row value")),
+                    other => panic!("unexpected row value after VACUUM INTO: {other:?}"),
+                }
+            }
+            StepResult::Done => break,
+            StepResult::IO => select_stmt.get_pager().io.step()?,
+            StepResult::Busy => anyhow::bail!("unexpected Busy while draining SELECT"),
+            StepResult::Interrupt => anyhow::bail!("unexpected Interrupt while draining SELECT"),
+        }
+    }
+
+    assert_eq!(seen, vec![1, 2, 3]);
+    Ok(())
+}
+
+/// Reprepared active root statements must remain counted so VACUUM INTO still
+/// rejects them as "SQL statements in progress".
+#[turso_macros::test(mvcc, init_sql = "CREATE TABLE t (a INTEGER);")]
+fn test_vacuum_into_rejects_reprepared_active_select_on_same_connection(
+    tmp_db: TempDatabase,
+) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+    conn.execute("INSERT INTO t VALUES (1), (2), (3)")?;
+
+    let mut select_stmt = conn.prepare("SELECT a FROM t ORDER BY a")?;
+    conn.execute("PRAGMA foreign_keys = ON")?;
+
+    assert!(
+        matches!(select_stmt.step()?, StepResult::Row),
+        "SELECT should remain active after reprepare and first row"
+    );
+    assert_eq!(
+        select_stmt.row().unwrap().get_values().next(),
+        Some(&Value::from_i64(1))
+    );
+
+    let dest_dir = TempDir::new()?;
+    let dest_path = dest_dir
+        .path()
+        .join("reprepared-active-select-vacuum-into.db");
+
+    let err = conn
+        .execute(format!("VACUUM INTO '{}'", dest_path.to_str().unwrap()))
+        .expect_err("VACUUM INTO should reject re-prepared active statements");
+    let err_msg = err.to_string();
+    assert!(
+        err_msg.contains("SQL statements in progress"),
+        "error should mention active statements, got: {err_msg}"
+    );
+    assert!(
+        !dest_path.exists(),
+        "destination file should not be created on failure"
+    );
+
+    let mut seen = vec![1];
+    loop {
+        match select_stmt.step()? {
+            StepResult::Row => {
+                let row = select_stmt.row().expect("row should be present");
+                match row.get_values().next() {
+                    Some(v) => seen.push(v.as_int().expect("expected integer row value")),
+                    other => panic!("unexpected row value after VACUUM INTO: {other:?}"),
+                }
+            }
+            StepResult::Done => break,
+            StepResult::IO => select_stmt.get_pager().io.step()?,
+            StepResult::Busy => anyhow::bail!("unexpected Busy while draining SELECT"),
+            StepResult::Interrupt => anyhow::bail!("unexpected Interrupt while draining SELECT"),
+        }
+    }
+
+    assert_eq!(seen, vec![1, 2, 3]);
+    Ok(())
+}
+
+/// Statement overlap: a live SELECT on one connection can continue after a
+/// same-connection write, and it keeps reading its original snapshot.
+#[turso_macros::test(mvcc, init_sql = "CREATE TABLE t (a INTEGER);")]
+fn test_same_connection_select_then_write_then_continue_select(
+    tmp_db: TempDatabase,
+) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+    conn.execute("INSERT INTO t VALUES (1), (2), (3)")?;
+
+    let mut select_stmt = conn.prepare("SELECT a FROM t ORDER BY a")?;
+    assert!(
+        matches!(select_stmt.step()?, StepResult::Row),
+        "SELECT should remain active after yielding its first row"
+    );
+    assert_eq!(
+        select_stmt.row().unwrap().get_values().next(),
+        Some(&Value::from_i64(1))
+    );
+
+    conn.execute("INSERT INTO t VALUES (4)")?;
+
+    let mut seen = vec![1];
+    loop {
+        match select_stmt.step()? {
+            StepResult::Row => {
+                let row = select_stmt.row().expect("row should be present");
+                match row.get_values().next() {
+                    Some(v) => seen.push(v.as_int().expect("expected integer row value")),
+                    other => panic!("unexpected row value after INSERT: {other:?}"),
+                }
+            }
+            StepResult::Done => break,
+            StepResult::IO => select_stmt.get_pager().io.step()?,
+            StepResult::Busy => anyhow::bail!("unexpected Busy while draining SELECT"),
+            StepResult::Interrupt => anyhow::bail!("unexpected Interrupt while draining SELECT"),
+        }
+    }
+
+    assert_eq!(
+        seen,
+        vec![1, 2, 3],
+        "active SELECT should continue reading its original snapshot"
+    );
+
+    let fresh_rows: Vec<(i64,)> = conn.exec_rows("SELECT a FROM t ORDER BY a");
+    assert_eq!(fresh_rows, vec![(1,), (2,), (3,), (4,)]);
     Ok(())
 }
 
@@ -687,12 +886,16 @@ fn test_vacuum_into_rowid_compat_with_sqlite_reference(tmp_db: TempDatabase) -> 
     conn.execute("CREATE TABLE t (a TEXT)")?;
     conn.execute("INSERT INTO t(rowid, a) VALUES(5, 'x')")?;
     conn.execute("INSERT INTO t(rowid, a) VALUES(42, 'y')")?;
+    let source_hash = compute_dbhash(&tmp_db);
 
     let dest_dir = TempDir::new()?;
     let turso_dest = dest_dir.path().join("turso_rowid_vacuum.db");
     conn.execute(format!("VACUUM INTO '{}'", turso_dest.to_str().unwrap()))?;
     let turso_dest_db = TempDatabase::new_with_existent(&turso_dest);
     let turso_dest_conn = turso_dest_db.connect_limbo();
+    if !tmp_db.enable_mvcc {
+        assert_eq!(source_hash.hash, compute_dbhash(&turso_dest_db).hash);
+    }
     let turso_rows: Vec<(i64, String)> =
         turso_dest_conn.exec_rows("SELECT rowid, a FROM t ORDER BY rowid");
 
@@ -742,12 +945,16 @@ fn test_vacuum_into_integer_pk_and_indexes_compat_with_sqlite(
     conn.execute("INSERT INTO t_idx(id, a, b) VALUES (10, 'alpha', 50)")?;
     conn.execute("INSERT INTO t_idx(id, a, b) VALUES (25, 'beta', 150)")?;
     conn.execute("INSERT INTO t_idx(id, a, b) VALUES (50, 'gamma', 200)")?;
+    let source_hash = compute_dbhash(&tmp_db);
 
     let dest_dir = TempDir::new()?;
     let turso_dest = dest_dir.path().join("turso_index_vacuum.db");
     conn.execute(format!("VACUUM INTO '{}'", turso_dest.to_str().unwrap()))?;
     let turso_dest_db = TempDatabase::new_with_existent(&turso_dest);
     let turso_dest_conn = turso_dest_db.connect_limbo();
+    if !tmp_db.enable_mvcc {
+        assert_eq!(source_hash.hash, compute_dbhash(&turso_dest_db).hash);
+    }
     let turso_rows: Vec<(i64, i64, String, i64)> =
         turso_dest_conn.exec_rows("SELECT rowid, id, a, b FROM t_idx ORDER BY id");
     let turso_index_names_rows: Vec<(String,)> = turso_dest_conn.exec_rows(
@@ -832,6 +1039,7 @@ fn test_vacuum_into_preserves_rowid_when_rowid_alias_is_shadowed(
         source_rows,
         vec![(77, "visible".to_string(), "x".to_string())]
     );
+    let source_hash = compute_dbhash(&tmp_db);
 
     let dest_dir = TempDir::new()?;
     let dest_path = dest_dir.path().join("vacuumed_rowid_shadowed.db");
@@ -840,6 +1048,9 @@ fn test_vacuum_into_preserves_rowid_when_rowid_alias_is_shadowed(
     let dest_db = TempDatabase::new_with_existent(&dest_path);
     let dest_conn = dest_db.connect_limbo();
     assert_eq!(run_integrity_check(&dest_conn), "ok");
+    if !tmp_db.enable_mvcc {
+        assert_eq!(source_hash.hash, compute_dbhash(&dest_db).hash);
+    }
 
     let dest_rows: Vec<(i64, String, String)> =
         dest_conn.exec_rows("SELECT _rowid_, rowid, a FROM t ORDER BY _rowid_");
@@ -881,6 +1092,7 @@ fn test_vacuum_into_when_all_rowid_aliases_are_shadowed(
             ),
         ]
     );
+    let source_hash = compute_dbhash(&tmp_db);
 
     let dest_dir = TempDir::new()?;
     let dest_path = dest_dir.path().join("vacuumed_all_aliases_shadowed.db");
@@ -889,6 +1101,9 @@ fn test_vacuum_into_when_all_rowid_aliases_are_shadowed(
     let dest_db = TempDatabase::new_with_existent(&dest_path);
     let dest_conn = dest_db.connect_limbo();
     assert_eq!(run_integrity_check(&dest_conn), "ok");
+    if !tmp_db.enable_mvcc {
+        assert_eq!(source_hash.hash, compute_dbhash(&dest_db).hash);
+    }
 
     let dest_rows: Vec<(String, String, String, String)> =
         dest_conn.exec_rows("SELECT rowid, _rowid_, oid, a FROM t ORDER BY a");
@@ -1259,6 +1474,63 @@ fn test_vacuum_into_large_data_multi_page(tmp_db: TempDatabase) -> anyhow::Resul
     Ok(())
 }
 
+/// VACUUM INTO must leave the main destination file self-contained, even when
+/// the copied image is larger than the WAL auto-checkpoint threshold.
+#[turso_macros::test]
+fn test_vacuum_into_large_destination_survives_without_wal(
+    tmp_db: TempDatabase,
+) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+
+    conn.execute("CREATE TABLE large_data (id INTEGER PRIMARY KEY, data BLOB)")?;
+    conn.execute(
+        "INSERT INTO large_data \
+         SELECT value, randomblob(4096) \
+         FROM generate_series(1, 1200)",
+    )?;
+
+    let source_pages: Vec<(i64,)> = conn.exec_rows("PRAGMA page_count");
+    assert!(
+        source_pages[0].0 > 1000,
+        "source should exceed the auto-checkpoint threshold, got {} pages",
+        source_pages[0].0
+    );
+    let source_hash = compute_dbhash(&tmp_db);
+
+    let dest_dir = TempDir::new()?;
+    let dest_path = dest_dir.path().join("vacuumed_large_no_wal.db");
+    let dest_path_str = dest_path.to_str().unwrap();
+
+    conn.execute(format!("VACUUM INTO '{dest_path_str}'"))?;
+
+    let copied_dir = TempDir::new()?;
+    let copied_path = copied_dir.path().join("copied.db");
+    std::fs::copy(&dest_path, &copied_path)?;
+    assert!(
+        !copied_dir.path().join("copied.db-wal").exists(),
+        "test must copy only the destination database file"
+    );
+
+    let copied_db = TempDatabase::new_with_existent(&copied_path);
+    let copied_conn = copied_db.connect_limbo();
+
+    assert_eq!(run_integrity_check(&copied_conn), "ok");
+    assert_eq!(source_hash.hash, compute_dbhash(&copied_db).hash);
+
+    let copied_pages: Vec<(i64,)> = copied_conn.exec_rows("PRAGMA page_count");
+    assert!(
+        copied_pages[0].0 > 1000,
+        "copied destination should remain large, got {} pages",
+        copied_pages[0].0
+    );
+
+    let stats: Vec<(i64, i64, i64)> = copied_conn
+        .exec_rows("SELECT COUNT(*), MIN(length(data)), MAX(length(data)) FROM large_data");
+    assert_eq!(stats, vec![(1200, 4096, 4096)]);
+
+    Ok(())
+}
+
 #[turso_macros::test(mvcc)]
 fn test_vacuum_into_with_foreign_keys(tmp_db: TempDatabase) -> anyhow::Result<()> {
     let conn = tmp_db.connect_limbo();
@@ -1477,6 +1749,45 @@ fn test_vacuum_into_with_table_valued_functions(tmp_db: TempDatabase) -> anyhow:
     Ok(())
 }
 
+/// VACUUM INTO must handle deferred index creation after a large
+/// generate_series-backed data load.
+#[turso_macros::test]
+fn test_vacuum_into_large_generate_series_with_index(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+
+    conn.execute("CREATE TABLE t1(a INTEGER PRIMARY KEY, b TEXT)")?;
+    conn.execute(
+        "INSERT INTO t1 \
+         SELECT value, 'padding_padding_padding_padding_' || value \
+         FROM generate_series(1, 10000)",
+    )?;
+    conn.execute("CREATE INDEX idx ON t1(b)")?;
+
+    let dest_dir = TempDir::new()?;
+    let dest_path = dest_dir.path().join("vacuumed_generate_series_index.db");
+
+    conn.execute(format!("VACUUM INTO '{}'", dest_path.to_str().unwrap()))?;
+
+    let dest_db = TempDatabase::new_with_existent(&dest_path);
+    let dest_conn = dest_db.connect_limbo();
+
+    assert_eq!(run_integrity_check(&dest_conn), "ok");
+
+    let count: Vec<(i64,)> = dest_conn.exec_rows("SELECT COUNT(*) FROM t1");
+    assert_eq!(count, vec![(10000,)]);
+
+    let row: Vec<(i64, String)> = dest_conn.exec_rows(
+        "SELECT a, b FROM t1 INDEXED BY idx \
+         WHERE b = 'padding_padding_padding_padding_9999'",
+    );
+    assert_eq!(
+        row,
+        vec![(9999, "padding_padding_padding_padding_9999".to_string())]
+    );
+
+    Ok(())
+}
+
 /// Test VACUUM INTO preserves reserved_space bytes from source database.
 /// Reserved space is used by encryption extensions and checksums.
 #[turso_macros::test(mvcc)]
@@ -1548,7 +1859,6 @@ fn test_vacuum_into_preserves_reserved_space(tmp_db: TempDatabase) -> anyhow::Re
 }
 
 /// Test VACUUM INTO with partial indexes (CREATE INDEX ... WHERE)
-/// NOTE: There is a bug with partial indexes which fails integrity_check on the destination.
 /// Note: Partial indexes are not supported with MVCC
 #[turso_macros::test]
 fn test_vacuum_into_with_partial_indexes(tmp_db: TempDatabase) -> anyhow::Result<()> {
@@ -1575,6 +1885,8 @@ fn test_vacuum_into_with_partial_indexes(tmp_db: TempDatabase) -> anyhow::Result
     conn.execute("INSERT INTO orders VALUES (4, 'Charlie', 'shipped', 2000.0)")?;
     conn.execute("INSERT INTO orders VALUES (5, 'Bob', 'pending', 100.0)")?;
 
+    assert_eq!(run_integrity_check(&conn), "ok");
+
     let source_hash = compute_dbhash(&tmp_db);
 
     let dest_dir = TempDir::new()?;
@@ -1586,15 +1898,7 @@ fn test_vacuum_into_with_partial_indexes(tmp_db: TempDatabase) -> anyhow::Result
     let dest_db = TempDatabase::new_with_existent(&dest_path);
     let dest_conn = dest_db.connect_limbo();
 
-    // this fails due to existing bug in the integrity_check with partial indexes
-    // ---- query_processing::test_vacuum::test_vacuum_into_with_partial_indexes stdout ----
-    //
-    // thread 'query_processing::test_vacuum::test_vacuum_into_with_partial_indexes' panicked at tests/integration/query_processing/test_vacuum.rs:1220:5:
-    // assertion `left == right` failed
-    //   left: "wrong # of entries in index idx_large_orders\nwrong # of entries in index idx_pending_orders\nrow 1 missing from index idx_large_orders\nrow 2 missing from index idx_large_orders\nrow 2 missing from index idx_pending_orders\nrow 4 missing from index idx_pending_orders\nrow 5 missing from index idx_large_orders"
-    //  right: "ok"
-
-    // assert_eq!(run_integrity_check(&dest_conn), "ok");
+    assert_eq!(run_integrity_check(&dest_conn), "ok");
 
     if !tmp_db.enable_mvcc {
         assert_eq!(source_hash.hash, compute_dbhash(&dest_db).hash);
@@ -1637,6 +1941,114 @@ fn test_vacuum_into_with_partial_indexes(tmp_db: TempDatabase) -> anyhow::Result
             (5, "Bob".to_string(), "pending".to_string(), 100.0)
         ]
     );
+    Ok(())
+}
+
+/// Test VACUUM INTO with mixed index types: normal, unique, partial, expression.
+/// Note: Partial indexes are not supported with MVCC.
+#[turso_macros::test]
+fn test_vacuum_into_with_mixed_index_types(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+    conn.execute(
+        "CREATE TABLE products (
+            id INTEGER PRIMARY KEY,
+            name TEXT NOT NULL,
+            category TEXT NOT NULL,
+            price REAL NOT NULL,
+            stock INTEGER NOT NULL,
+            discontinued INTEGER NOT NULL DEFAULT 0
+        )",
+    )?;
+
+    conn.execute("CREATE UNIQUE INDEX idx_products_name ON products(name)")?;
+    conn.execute("CREATE INDEX idx_products_category_price ON products(category, price)")?;
+    conn.execute(
+        "CREATE INDEX idx_products_instock ON products(category) WHERE stock > 0 AND discontinued = 0",
+    )?;
+    conn.execute("CREATE INDEX idx_products_name_expr ON products(lower(name), abs(price))")?;
+
+    conn.execute("INSERT INTO products VALUES (1, 'Widget A', 'tools', 10.5, 5, 0)")?;
+    conn.execute("INSERT INTO products VALUES (2, 'Widget B', 'tools', 12.0, 0, 0)")?;
+    conn.execute("INSERT INTO products VALUES (3, 'Gadget C', 'electronics', 99.9, 10, 0)")?;
+    conn.execute("INSERT INTO products VALUES (4, 'Legacy D', 'electronics', 49.5, 3, 1)")?;
+    conn.execute("INSERT INTO products VALUES (5, 'Spare E', 'parts', 4.25, 25, 0)")?;
+
+    assert_eq!(run_integrity_check(&conn), "ok");
+    let source_hash = compute_dbhash(&tmp_db);
+
+    let dest_dir = TempDir::new()?;
+    let dest_path = dest_dir.path().join("vacuumed_mixed_indexes.db");
+    conn.execute(format!("VACUUM INTO '{}'", dest_path.to_str().unwrap()))?;
+
+    let dest_db = TempDatabase::new_with_existent(&dest_path);
+    let dest_conn = dest_db.connect_limbo();
+
+    assert_eq!(run_integrity_check(&dest_conn), "ok");
+    assert_eq!(source_hash.hash, compute_dbhash(&dest_db).hash);
+
+    let index_defs: Vec<(String, String)> = dest_conn.exec_rows(
+        "SELECT name, sql FROM sqlite_schema
+         WHERE type = 'index'
+           AND name IN (
+               'idx_products_name',
+               'idx_products_category_price',
+               'idx_products_instock',
+               'idx_products_name_expr'
+           )
+         ORDER BY name",
+    );
+    assert_eq!(index_defs.len(), 4);
+
+    let partial_idx_sql = &index_defs
+        .iter()
+        .find(|(name, _)| name == "idx_products_instock")
+        .expect("partial index should exist")
+        .1;
+    let normalized_partial_sql = partial_idx_sql
+        .chars()
+        .filter(|c| !c.is_whitespace())
+        .collect::<String>()
+        .to_lowercase();
+    let has_expected_partial_predicate = normalized_partial_sql
+        .contains("wherestock>0anddiscontinued=0")
+        || normalized_partial_sql.contains("wherediscontinued=0andstock>0")
+        || normalized_partial_sql.contains("where(stock>0)and(discontinued=0)")
+        || normalized_partial_sql.contains("where(discontinued=0)and(stock>0)");
+    assert!(
+        has_expected_partial_predicate,
+        "partial index WHERE predicate should be preserved"
+    );
+
+    let expr_idx_sql = &index_defs
+        .iter()
+        .find(|(name, _)| name == "idx_products_name_expr")
+        .expect("expression index should exist")
+        .1;
+    let normalized_expr_sql = expr_idx_sql
+        .chars()
+        .filter(|c| !c.is_whitespace())
+        .collect::<String>()
+        .to_lowercase();
+    assert!(
+        normalized_expr_sql.contains("lower(name)") && normalized_expr_sql.contains("abs(price)"),
+        "expression index definition should be preserved"
+    );
+
+    let in_stock_products: Vec<(String,)> = dest_conn
+        .exec_rows("SELECT name FROM products WHERE stock > 0 AND discontinued = 0 ORDER BY name");
+    assert_eq!(
+        in_stock_products,
+        vec![
+            ("Gadget C".to_string(),),
+            ("Spare E".to_string(),),
+            ("Widget A".to_string(),)
+        ]
+    );
+
+    let expr_match: Vec<(i64,)> =
+        dest_conn.exec_rows("SELECT id FROM products WHERE lower(name) = 'widget a'");
+    assert_eq!(expr_match, vec![(1,)]);
+
     Ok(())
 }
 
@@ -2113,6 +2525,738 @@ fn test_vacuum_into_with_multiple_strict_tables(tmp_db: TempDatabase) -> anyhow:
 
     let logs: Vec<(i64, String)> = dest_conn.exec_rows("SELECT id, message FROM logs");
     assert_eq!(logs, vec![(1, "Order 1 created".to_string())]);
+
+    Ok(())
+}
+
+#[turso_macros::test(mvcc)]
+fn test_vacuum_into_compacts_fragmented_database(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let _ = env_logger::try_init();
+    let conn = tmp_db.connect_limbo();
+
+    conn.execute("CREATE TABLE fragmented_data (id INTEGER PRIMARY KEY, data BLOB)")?;
+
+    for i in 0..100 {
+        conn.execute(format!(
+            "INSERT INTO fragmented_data VALUES ({i}, randomblob(4096))",
+        ))?;
+    }
+
+    conn.execute("DELETE FROM fragmented_data WHERE id < 60")?;
+
+    for i in 60..100 {
+        conn.execute(format!(
+            "UPDATE fragmented_data SET data = randomblob(4096) WHERE id = {i}",
+        ))?;
+
+        conn.execute(format!(
+            "UPDATE fragmented_data SET data = randomblob(8192) WHERE id = {i}",
+        ))?;
+    }
+
+    let count: Vec<(i64,)> = conn.exec_rows("SELECT COUNT(*) FROM fragmented_data");
+    assert_eq!(count[0].0, 40, "Expected 40 rows after deletes");
+
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")?;
+
+    let source_size = std::fs::metadata(&tmp_db.path)?.len();
+    let source_hash = compute_dbhash(&tmp_db);
+
+    let dest_dir = TempDir::new()?;
+    let dest_path = dest_dir.path().join("vacuumed.db");
+    let dest_path_str = dest_path.to_str().unwrap();
+
+    conn.execute(format!("VACUUM INTO '{dest_path_str}'"))?;
+
+    let dest_db = TempDatabase::new_with_existent(&dest_path);
+    let dest_conn = dest_db.connect_limbo();
+
+    assert_eq!(
+        run_integrity_check(&dest_conn),
+        "ok",
+        "Vacuumed database should pass integrity check"
+    );
+
+    if !tmp_db.enable_mvcc {
+        assert_eq!(
+            source_hash.hash,
+            compute_dbhash(&dest_db).hash,
+            "Source and vacuumed database should have same content hash"
+        );
+    }
+
+    let source_pages: Vec<(i64,)> = conn.exec_rows("PRAGMA page_count");
+    let dest_pages: Vec<(i64,)> = dest_conn.exec_rows("PRAGMA page_count");
+
+    assert!(
+        dest_pages[0].0 < source_pages[0].0,
+        "Page count should reduce from {} to {}",
+        source_pages[0].0,
+        dest_pages[0].0
+    );
+
+    let dest_count: Vec<(i64,)> = dest_conn.exec_rows("SELECT COUNT(*) FROM fragmented_data");
+    assert_eq!(dest_count[0].0, 40, "Vacuumed db should have 40 rows");
+
+    let dest_size = std::fs::metadata(&dest_path)?.len();
+    assert!(
+        dest_size < source_size,
+        "VACUUM INTO should reduce file size. Source: {source_size} bytes, Destination: {dest_size} bytes"
+    );
+
+    Ok(())
+}
+
+// checksum feature changes reserved_space which breaks VACUUM INTO hash comparison
+#[cfg_attr(feature = "checksum", ignore)]
+#[turso_macros::test(init_sql = "CREATE TABLE main_t(x INTEGER);")]
+fn test_vacuum_into_attached_database(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+    conn.execute("INSERT INTO main_t VALUES (1), (2), (3)")?;
+
+    let attached_path = tmp_db.path.with_file_name("attached.db");
+    conn.execute(format!(
+        "ATTACH DATABASE '{}' AS att",
+        attached_path.display()
+    ))?;
+    conn.execute("CREATE TABLE att.att_t(y TEXT)")?;
+    conn.execute("INSERT INTO att.att_t VALUES ('a'), ('b'), ('c')")?;
+
+    let dest_dir = TempDir::new()?;
+    let dest_path = dest_dir.path().join("att_vacuumed.db");
+    let dest_path_str = dest_path.to_str().unwrap();
+
+    conn.execute(format!("VACUUM att INTO '{dest_path_str}'"))?;
+    assert!(dest_path.exists(), "Destination file should exist");
+
+    let dest_db = TempDatabase::new_with_existent(&dest_path);
+    let dest_conn = dest_db.connect_limbo();
+
+    let integrity = run_integrity_check(&dest_conn);
+    assert_eq!(
+        integrity, "ok",
+        "Vacuumed attached database should pass integrity check"
+    );
+
+    let attached_db = TempDatabase::new_with_existent(&attached_path);
+    let source_hash = compute_dbhash(&attached_db);
+    let dest_hash = compute_dbhash(&dest_db);
+    assert_eq!(
+        source_hash.hash, dest_hash.hash,
+        "Vacuumed database should have the same content hash as the attached source"
+    );
+
+    let rows: Vec<(String,)> = dest_conn.exec_rows("SELECT y FROM att_t ORDER BY y");
+    assert_eq!(rows.len(), 3);
+    assert_eq!(rows[0].0, "a");
+    assert_eq!(rows[1].0, "b");
+    assert_eq!(rows[2].0, "c");
+
+    let result = dest_conn.execute("SELECT * FROM main_t");
+    assert!(
+        result.is_err(),
+        "main_t should not exist in vacuumed attached database"
+    );
+
+    Ok(())
+}
+
+/// Column names containing commas must not confuse the
+/// bind-parameter count in the generated INSERT statement.
+#[turso_macros::test(mvcc)]
+fn test_vacuum_into_column_name_with_comma(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+
+    conn.execute("CREATE TABLE t(\"a,b\" INTEGER, c TEXT)")?;
+    conn.execute("INSERT INTO t VALUES (1, 'hello')")?;
+    conn.execute("INSERT INTO t VALUES (2, 'world')")?;
+    let source_hash = compute_dbhash(&tmp_db);
+
+    let dest_dir = TempDir::new()?;
+    let dest_path = dest_dir.path().join("comma_col.db");
+    let dest_path_str = dest_path.to_str().unwrap();
+
+    conn.execute(format!("VACUUM INTO '{dest_path_str}'"))?;
+
+    let dest_db = TempDatabase::new_with_existent(&dest_path);
+    let dest_conn = dest_db.connect_limbo();
+    if !tmp_db.enable_mvcc {
+        assert_eq!(source_hash.hash, compute_dbhash(&dest_db).hash);
+    }
+
+    let rows: Vec<(i64, String)> = dest_conn.exec_rows("SELECT \"a,b\", c FROM t ORDER BY \"a,b\"");
+    assert_eq!(
+        rows,
+        vec![(1, "hello".to_string()), (2, "world".to_string())]
+    );
+
+    Ok(())
+}
+
+// checksum feature changes reserved_space which breaks VACUUM INTO hash comparison
+#[cfg_attr(feature = "checksum", ignore)]
+#[turso_macros::test(init_sql = "CREATE TABLE main_t(x INTEGER);")]
+fn test_vacuum_main_into(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+    conn.execute("INSERT INTO main_t VALUES (10), (20), (30)")?;
+
+    let attached_path = tmp_db.path.with_file_name("attached.db");
+    conn.execute(format!(
+        "ATTACH DATABASE '{}' AS att",
+        attached_path.display()
+    ))?;
+    conn.execute("CREATE TABLE att.att_t(z INTEGER)")?;
+    conn.execute("INSERT INTO att.att_t VALUES (100)")?;
+
+    // Hash content only (without_schema) because
+    // vacuumed target (main) is created by init_sql
+    // which is executed by rusqlite and produces different
+    // schema than turso's VACUUM INTO
+    let hash_opts = turso_dbhash::DbHashOptions {
+        without_schema: true,
+        ..Default::default()
+    };
+    let source_hash = compute_dbhash_with_options(&tmp_db, &hash_opts);
+
+    let dest_dir = TempDir::new()?;
+    let dest_path = dest_dir.path().join("main_vacuumed.db");
+    let dest_path_str = dest_path.to_str().unwrap();
+
+    conn.execute(format!("VACUUM main INTO '{dest_path_str}'"))?;
+    assert!(dest_path.exists(), "Destination file should exist");
+
+    let dest_db = TempDatabase::new_with_existent(&dest_path);
+    let dest_conn = dest_db.connect_limbo();
+
+    let integrity = run_integrity_check(&dest_conn);
+    assert_eq!(
+        integrity, "ok",
+        "Vacuumed main database should pass integrity check"
+    );
+
+    let dest_hash = compute_dbhash_with_options(&dest_db, &hash_opts);
+    assert_eq!(
+        source_hash.hash, dest_hash.hash,
+        "Vacuumed database should have the same content hash as main"
+    );
+
+    let rows: Vec<(i64,)> = dest_conn.exec_rows("SELECT x FROM main_t ORDER BY x");
+    assert_eq!(rows.len(), 3);
+    assert_eq!(rows[0].0, 10);
+    assert_eq!(rows[1].0, 20);
+    assert_eq!(rows[2].0, 30);
+
+    let result = dest_conn.execute("SELECT * FROM att_t");
+    assert!(
+        result.is_err(),
+        "att_t should not exist in vacuumed main database"
+    );
+
+    Ok(())
+}
+
+#[turso_macros::test(mvcc)]
+fn test_vacuum_into_nonexistent_schema(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+    let result = conn.execute("VACUUM nonexistent INTO 'out.db'");
+
+    assert!(result.is_err(), "Should error on non-existent database");
+    let err_msg = format!("{}", result.unwrap_err());
+    assert!(
+        err_msg.contains("no such database: nonexistent"),
+        "Error should indicate database not found: {err_msg}"
+    );
+
+    Ok(())
+}
+
+#[turso_macros::test(mvcc)]
+fn test_vacuum_into_temp_is_noop(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+
+    let dest_dir = TempDir::new()?;
+    let dest_path = dest_dir.path().join("temp_vacuum.db");
+    let dest_path_str = dest_path.to_str().unwrap();
+
+    conn.execute(format!("VACUUM temp INTO '{dest_path_str}'"))?;
+    assert!(
+        !dest_path.exists(),
+        "VACUUM temp INTO should not create a file"
+    );
+
+    Ok(())
+}
+
+/// VACUUM INTO must correctly handle deferred index creation.
+/// Indexes are created after data copy for performance. Verify that the
+/// destination still has working indexes with correct data.
+#[turso_macros::test(mvcc)]
+fn test_vacuum_into_deferred_indexes(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+
+    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, a TEXT, b INTEGER)")?;
+    conn.execute("CREATE INDEX idx_a ON t (a)")?;
+    conn.execute("CREATE UNIQUE INDEX idx_b ON t (b)")?;
+
+    for i in 0..30 {
+        conn.execute(format!("INSERT INTO t VALUES ({i}, 'val_{i}', {i})"))?;
+    }
+    let source_hash = compute_dbhash(&tmp_db);
+
+    let dest_dir = TempDir::new()?;
+    let dest_path = dest_dir.path().join("deferred_idx.db");
+    let dest_path_str = dest_path.to_str().unwrap();
+
+    conn.execute(format!("VACUUM INTO '{dest_path_str}'"))?;
+
+    let dest_db = TempDatabase::new_with_existent(&dest_path);
+    let dest_conn = dest_db.connect_limbo();
+
+    assert_eq!(run_integrity_check(&dest_conn), "ok");
+    if !tmp_db.enable_mvcc {
+        assert_eq!(source_hash.hash, compute_dbhash(&dest_db).hash);
+    }
+
+    let indexes: Vec<(String,)> = dest_conn.exec_rows(
+        "SELECT name FROM sqlite_schema WHERE type = 'index' AND sql IS NOT NULL ORDER BY name",
+    );
+    assert_eq!(indexes.len(), 2);
+    assert_eq!(indexes[0].0, "idx_a");
+    assert_eq!(indexes[1].0, "idx_b");
+
+    let count: Vec<(i64,)> = dest_conn.exec_rows("SELECT COUNT(*) FROM t");
+    assert_eq!(count[0].0, 30);
+
+    let eqp_a: Vec<(i64, i64, i64, String)> =
+        dest_conn.exec_rows("EXPLAIN QUERY PLAN SELECT id, a FROM t WHERE a = 'val_15'");
+    assert!(
+        eqp_a
+            .iter()
+            .any(|(_, _, _, detail)| detail.contains("INDEX") && detail.contains("idx_a")),
+        "expected lookup by a to use idx_a, got plan: {eqp_a:?}",
+    );
+    let row: Vec<(i64, String)> = dest_conn.exec_rows("SELECT id, a FROM t WHERE a = 'val_15'");
+    assert_eq!(row, vec![(15, "val_15".to_string())]);
+    let row: Vec<(i64, String)> =
+        dest_conn.exec_rows("SELECT id, a FROM t INDEXED BY idx_a WHERE a = 'val_15'");
+    assert_eq!(row, vec![(15, "val_15".to_string())]);
+
+    let eqp_b: Vec<(i64, i64, i64, String)> =
+        dest_conn.exec_rows("EXPLAIN QUERY PLAN SELECT id, b FROM t WHERE b = 20");
+    assert!(
+        eqp_b
+            .iter()
+            .any(|(_, _, _, detail)| detail.contains("INDEX") && detail.contains("idx_b")),
+        "expected lookup by b to use idx_b, got plan: {eqp_b:?}",
+    );
+    let row: Vec<(i64, i64)> = dest_conn.exec_rows("SELECT id, b FROM t WHERE b = 20");
+    assert_eq!(row, vec![(20, 20)]);
+    let row: Vec<(i64, i64)> =
+        dest_conn.exec_rows("SELECT id, b FROM t INDEXED BY idx_b WHERE b = 20");
+    assert_eq!(row, vec![(20, 20)]);
+
+    Ok(())
+}
+
+/// VACUUM INTO must copy storage-backed internal tables such as sqlite_stat1.
+#[turso_macros::test]
+fn test_vacuum_into_preserves_sqlite_stat1(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+
+    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, category TEXT, value INTEGER)")?;
+    conn.execute("CREATE INDEX idx_t_category_value ON t(category, value)")?;
+    for i in 0..50 {
+        let category = if i % 2 == 0 { "even" } else { "odd" };
+        conn.execute(format!(
+            "INSERT INTO t VALUES ({i}, '{category}', {})",
+            i * 10
+        ))?;
+    }
+    conn.execute("ANALYZE")?;
+
+    let source_stats: Vec<(String, String, String)> =
+        conn.exec_rows("SELECT tbl, COALESCE(idx, ''), stat FROM sqlite_stat1 ORDER BY tbl, idx");
+    assert!(
+        !source_stats.is_empty(),
+        "ANALYZE should populate sqlite_stat1"
+    );
+
+    let dest_dir = TempDir::new()?;
+    let dest_path = dest_dir.path().join("sqlite_stat1.db");
+    let dest_path_str = dest_path.to_str().unwrap();
+
+    conn.execute(format!("VACUUM INTO '{dest_path_str}'"))?;
+
+    let dest_db = TempDatabase::new_with_existent(&dest_path);
+    let dest_conn = dest_db.connect_limbo();
+
+    assert_eq!(run_integrity_check(&dest_conn), "ok");
+    let dest_stats: Vec<(String, String, String)> = dest_conn
+        .exec_rows("SELECT tbl, COALESCE(idx, ''), stat FROM sqlite_stat1 ORDER BY tbl, idx");
+    assert_eq!(dest_stats, source_stats);
+
+    let count: Vec<(i64,)> = dest_conn.exec_rows("SELECT COUNT(*) FROM t WHERE category = 'even'");
+    assert_eq!(count, vec![(25,)]);
+
+    Ok(())
+}
+
+/// VACUUM INTO must preserve generated column values.
+/// Generated columns are excluded from the data-copy column list (they're
+/// computed, not stored), but the destination schema includes them and the
+/// values should be recomputed correctly from the copied base columns.
+#[test]
+fn test_vacuum_into_preserves_generated_columns() -> anyhow::Result<()> {
+    let _ = env_logger::try_init();
+    let opts = turso_core::DatabaseOpts::new().with_generated_columns(true);
+    let tmp_db = TempDatabase::builder().with_opts(opts).build();
+    let conn = tmp_db.connect_limbo();
+
+    conn.execute(
+        "CREATE TABLE t (
+            a INTEGER,
+            b INTEGER,
+            c INTEGER GENERATED ALWAYS AS (a + b) VIRTUAL
+        )",
+    )?;
+    conn.execute("INSERT INTO t (a, b) VALUES (10, 20)")?;
+    conn.execute("INSERT INTO t (a, b) VALUES (100, 200)")?;
+
+    // Verify generated column works on source
+    let source_rows: Vec<(i64, i64, i64)> = conn.exec_rows("SELECT a, b, c FROM t ORDER BY a");
+    assert_eq!(source_rows, vec![(10, 20, 30), (100, 200, 300)]);
+    let source_hash = compute_dbhash_with_database_opts(&tmp_db, opts);
+
+    let dest_dir = TempDir::new()?;
+    let dest_path = dest_dir.path().join("gencol.db");
+    let dest_path_str = dest_path.to_str().unwrap();
+
+    conn.execute(format!("VACUUM INTO '{dest_path_str}'"))?;
+
+    let dest_db = TempDatabase::new_with_existent_with_opts(&dest_path, opts);
+    let dest_conn = dest_db.connect_limbo();
+
+    assert_eq!(run_integrity_check(&dest_conn), "ok");
+    assert_eq!(
+        source_hash.hash,
+        compute_dbhash_with_database_opts(&dest_db, opts).hash
+    );
+
+    // Generated column values should be recomputed correctly on destination
+    let dest_rows: Vec<(i64, i64, i64)> = dest_conn.exec_rows("SELECT a, b, c FROM t ORDER BY a");
+    assert_eq!(dest_rows, vec![(10, 20, 30), (100, 200, 300)]);
+
+    Ok(())
+}
+
+/// VACUUM INTO with generated columns that reference the rowid
+/// alias, after deletes that create gaps. Verifies that rowid values are preserved
+/// and the generated column recomputes correctly from the rowid on the destination.
+#[test]
+fn test_vacuum_into_generated_column_with_rowid_and_deletes() -> anyhow::Result<()> {
+    let _ = env_logger::try_init();
+    let opts = turso_core::DatabaseOpts::new().with_generated_columns(true);
+    let tmp_db = TempDatabase::builder().with_opts(opts).build();
+    let conn = tmp_db.connect_limbo();
+
+    // id is INTEGER PRIMARY KEY (rowid alias), label is generated from id
+    conn.execute(
+        "CREATE TABLE t (
+            id INTEGER PRIMARY KEY,
+            name TEXT,
+            label TEXT GENERATED ALWAYS AS ('item_' || id) VIRTUAL
+        )",
+    )?;
+    conn.execute("INSERT INTO t (id, name) VALUES (1, 'a')")?;
+    conn.execute("INSERT INTO t (id, name) VALUES (2, 'b')")?;
+    conn.execute("INSERT INTO t (id, name) VALUES (3, 'c')")?;
+    conn.execute("INSERT INTO t (id, name) VALUES (4, 'd')")?;
+    conn.execute("INSERT INTO t (id, name) VALUES (5, 'e')")?;
+
+    // Delete some rows to create gaps in rowid space
+    conn.execute("DELETE FROM t WHERE id IN (2, 4)")?;
+
+    // Source should have rows 1, 3, 5 with correct generated labels
+    let source_rows: Vec<(i64, String, String)> =
+        conn.exec_rows("SELECT id, name, label FROM t ORDER BY id");
+    assert_eq!(
+        source_rows,
+        vec![
+            (1, "a".to_string(), "item_1".to_string()),
+            (3, "c".to_string(), "item_3".to_string()),
+            (5, "e".to_string(), "item_5".to_string()),
+        ]
+    );
+    let source_hash = compute_dbhash_with_database_opts(&tmp_db, opts);
+
+    let dest_dir = TempDir::new()?;
+    let dest_path = dest_dir.path().join("gencol_rowid.db");
+    let dest_path_str = dest_path.to_str().unwrap();
+
+    conn.execute(format!("VACUUM INTO '{dest_path_str}'"))?;
+
+    let dest_db = TempDatabase::new_with_existent_with_opts(&dest_path, opts);
+    let dest_conn = dest_db.connect_limbo();
+
+    assert_eq!(run_integrity_check(&dest_conn), "ok");
+    assert_eq!(
+        source_hash.hash,
+        compute_dbhash_with_database_opts(&dest_db, opts).hash
+    );
+
+    // Rowids must be preserved (not compacted), and generated labels must match
+    let dest_rows: Vec<(i64, String, String)> =
+        dest_conn.exec_rows("SELECT id, name, label FROM t ORDER BY id");
+    assert_eq!(source_rows, dest_rows);
+
+    Ok(())
+}
+
+/// VACUUM INTO must preserve custom type definitions so that
+/// STRICT tables with custom type columns are correctly created on the destination
+/// and encode/decode values properly.
+#[test]
+fn test_vacuum_into_preserves_custom_types() -> anyhow::Result<()> {
+    let _ = env_logger::try_init();
+    let opts = turso_core::DatabaseOpts::new().with_custom_types(true);
+    let tmp_db = TempDatabase::builder().with_opts(opts).build();
+    let conn = tmp_db.connect_limbo();
+
+    // Create a custom type with encode/decode transforms
+    conn.execute("CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100")?;
+    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, amount cents) STRICT")?;
+    conn.execute("INSERT INTO t VALUES (1, 42)")?;
+    conn.execute("INSERT INTO t VALUES (2, 100)")?;
+
+    // Verify decoded values on source
+    let source_rows: Vec<(i64, i64)> = conn.exec_rows("SELECT id, amount FROM t ORDER BY id");
+    assert_eq!(source_rows, vec![(1, 42), (2, 100)]);
+    let hash_opts = turso_dbhash::DbHashOptions {
+        table_filter: Some("t".to_string()),
+        ..Default::default()
+    };
+    let source_hash = compute_dbhash_with_options_and_database_opts(&tmp_db, &hash_opts, opts);
+
+    let dest_dir = TempDir::new()?;
+    let dest_path = dest_dir.path().join("custom_types.db");
+    let dest_path_str = dest_path.to_str().unwrap();
+
+    conn.execute(format!("VACUUM INTO '{dest_path_str}'"))?;
+
+    let dest_db = TempDatabase::new_with_existent_with_opts(&dest_path, opts);
+    let dest_conn = dest_db.connect_limbo();
+
+    assert_eq!(run_integrity_check(&dest_conn), "ok");
+    assert_eq!(
+        source_hash.hash,
+        compute_dbhash_with_options_and_database_opts(&dest_db, &hash_opts, opts).hash
+    );
+
+    // Destination must decode values correctly (42, 100 - not raw 4200, 10000)
+    let dest_rows: Vec<(i64, i64)> = dest_conn.exec_rows("SELECT id, amount FROM t ORDER BY id");
+    assert_eq!(dest_rows, source_rows);
+
+    Ok(())
+}
+
+/// VACUUM INTO must preserve AUTOINCREMENT counters so that
+/// new inserts on both source and destination get the same next rowid.
+#[turso_macros::test]
+fn test_vacuum_into_preserves_autoincrement_counter(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+
+    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY AUTOINCREMENT, val TEXT)")?;
+    conn.execute("INSERT INTO t (val) VALUES ('a')")?;
+    conn.execute("INSERT INTO t (val) VALUES ('b')")?;
+    conn.execute("INSERT INTO t (val) VALUES ('c')")?;
+    // Delete some rows to create a gap - AUTOINCREMENT should never reuse rowids
+    conn.execute("DELETE FROM t WHERE id = 2")?;
+    let source_hash = compute_dbhash(&tmp_db);
+
+    let dest_dir = TempDir::new()?;
+    let dest_path = dest_dir.path().join("autoincr.db");
+    let dest_path_str = dest_path.to_str().unwrap();
+
+    conn.execute(format!("VACUUM INTO '{dest_path_str}'"))?;
+
+    // Insert a new row on the source - should get id=4 (not 2, because AUTOINCREMENT)
+    conn.execute("INSERT INTO t (val) VALUES ('d')")?;
+    let source_new: Vec<(i64, String)> = conn.exec_rows("SELECT id, val FROM t WHERE val = 'd'");
+    assert_eq!(source_new, vec![(4, "d".to_string())]);
+
+    // Insert a new row on the destination - should also get id=4
+    let dest_db = TempDatabase::new_with_existent(&dest_path);
+    assert_eq!(source_hash.hash, compute_dbhash(&dest_db).hash);
+    let dest_conn = dest_db.connect_limbo();
+    dest_conn.execute("INSERT INTO t (val) VALUES ('d')")?;
+    let dest_new: Vec<(i64, String)> = dest_conn.exec_rows("SELECT id, val FROM t WHERE val = 'd'");
+    assert_eq!(
+        dest_new, source_new,
+        "AUTOINCREMENT counter should produce the same next rowid on both databases"
+    );
+
+    Ok(())
+}
+
+/// VACUUM INTO preserves custom index-method indexes by replaying the
+/// user-visible custom index after copying table data. The index method then
+/// recreates and backfills its backing storage from destination rows.
+#[turso_macros::test]
+fn test_vacuum_into_preserves_custom_index_method(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+
+    conn.execute("CREATE TABLE vectors (id INTEGER PRIMARY KEY, label TEXT, embedding BLOB)")?;
+    conn.execute("CREATE INDEX vec_idx ON vectors USING toy_vector_sparse_ivf (embedding)")?;
+    conn.execute("INSERT INTO vectors VALUES (1, 'cat', vector32_sparse('[1, 0, 0, 0]'))")?;
+    conn.execute("INSERT INTO vectors VALUES (2, 'dog', vector32_sparse('[0, 1, 0, 0]'))")?;
+    conn.execute("INSERT INTO vectors VALUES (3, 'fish', vector32_sparse('[0, 0, 1, 0]'))")?;
+    let source_hash = compute_dbhash_with_database_opts(&tmp_db, tmp_db.db_opts);
+
+    let dest_dir = TempDir::new()?;
+    let dest_path = dest_dir.path().join("vectors.db");
+    let dest_path_str = dest_path.to_str().unwrap();
+
+    conn.execute(format!("VACUUM INTO '{dest_path_str}'"))?;
+
+    let dest_db = TempDatabase::new_with_existent_with_opts(&dest_path, tmp_db.db_opts);
+    let dest_conn = dest_db.connect_limbo();
+    assert_eq!(
+        source_hash.hash,
+        compute_dbhash_with_database_opts(&dest_db, tmp_db.db_opts).hash
+    );
+
+    let indexes: Vec<(String,)> = dest_conn.exec_rows(
+        "SELECT name FROM sqlite_schema WHERE type = 'index' AND tbl_name = 'vectors' ORDER BY name",
+    );
+    assert_eq!(
+        indexes,
+        vec![
+            ("vec_idx".to_string(),),
+            ("vec_idx_inverted_index".to_string(),),
+            ("vec_idx_stats".to_string(),),
+        ],
+    );
+
+    let eqp: Vec<(i64, i64, i64, String)> = dest_conn.exec_rows(
+        "EXPLAIN QUERY PLAN \
+         SELECT id, label, vector_distance_jaccard(embedding, vector32_sparse('[1, 0, 0, 0]')) AS distance \
+         FROM vectors ORDER BY distance LIMIT 1",
+    );
+    assert!(
+        eqp.iter()
+            .any(|(_, _, _, detail)| detail.contains("INDEX METHOD")),
+        "nearest-neighbor query should use custom index method, got plan: {eqp:?}",
+    );
+
+    let nearest: Vec<(i64, String, f64)> = dest_conn.exec_rows(
+        "SELECT id, label, vector_distance_jaccard(embedding, vector32_sparse('[1, 0, 0, 0]')) AS distance \
+         FROM vectors ORDER BY distance LIMIT 1",
+    );
+    assert_eq!(nearest.len(), 1);
+    assert_eq!(nearest[0].0, 1);
+    assert_eq!(nearest[0].1, "cat");
+    assert!(nearest[0].2.abs() < 1e-9);
+
+    Ok(())
+}
+
+#[cfg(all(feature = "fts", not(target_family = "wasm")))]
+#[turso_macros::test]
+fn test_vacuum_into_preserves_fts_index(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+
+    conn.execute("CREATE TABLE articles(id INTEGER PRIMARY KEY, title TEXT, body TEXT)")?;
+    conn.execute("CREATE INDEX fts_articles ON articles USING fts (title, body)")?;
+    conn.execute("INSERT INTO articles VALUES (1, 'Database Performance', 'Optimizing database queries is important for performance')")?;
+    conn.execute("INSERT INTO articles VALUES (2, 'Web Development', 'Modern web applications use JavaScript and APIs')")?;
+    conn.execute("INSERT INTO articles VALUES (3, 'Database Design', 'Good database design leads to better performance')")?;
+    conn.execute("INSERT INTO articles VALUES (4, 'API Development', 'RESTful APIs are common in web services')")?;
+
+    let source_database_matches: Vec<(i64,)> = conn
+        .exec_rows("SELECT id FROM articles WHERE fts_match(title, body, 'database') ORDER BY id");
+    assert_eq!(source_database_matches, vec![(1,), (3,)]);
+
+    let dest_dir = TempDir::new()?;
+    let dest_path = dest_dir.path().join("fts_vacuumed.db");
+    let dest_path_str = dest_path.to_str().unwrap();
+
+    conn.execute(format!("VACUUM INTO '{dest_path_str}'"))?;
+
+    let dest_db = TempDatabase::new_with_existent_with_opts(&dest_path, tmp_db.db_opts);
+    let dest_conn = dest_db.connect_limbo();
+
+    let dest_database_matches: Vec<(i64,)> = dest_conn
+        .exec_rows("SELECT id FROM articles WHERE fts_match(title, body, 'database') ORDER BY id");
+    assert_eq!(dest_database_matches, source_database_matches);
+
+    let dest_web_matches: Vec<(i64,)> = dest_conn
+        .exec_rows("SELECT id FROM articles WHERE fts_match(title, body, 'web') ORDER BY id");
+    assert_eq!(dest_web_matches, vec![(2,), (4,)]);
+
+    let eqp: Vec<(i64, i64, i64, String)> = dest_conn.exec_rows(
+        "EXPLAIN QUERY PLAN \
+         SELECT id FROM articles WHERE fts_match(title, body, 'database')",
+    );
+    assert!(
+        eqp.iter()
+            .any(|(_, _, _, detail)| detail.contains("INDEX METHOD")),
+        "FTS query should use an index method after VACUUM INTO, got plan: {eqp:?}",
+    );
+
+    dest_conn.execute(
+        "INSERT INTO articles VALUES (5, 'Vacuum Export', 'Full text search stays usable after vacuum')",
+    )?;
+    let dest_vacuum_matches: Vec<(i64,)> = dest_conn
+        .exec_rows("SELECT id FROM articles WHERE fts_match(title, body, 'vacuum') ORDER BY id");
+    assert_eq!(dest_vacuum_matches, vec![(5,)]);
+
+    Ok(())
+}
+
+/// Test VACUUM INTO preserves vector data stored as blobs (without a vector index).
+/// Verifies that vector32() encoded blobs survive the vacuum round-trip
+/// and produce the same distance calculations on the destination.
+#[turso_macros::test]
+fn test_vacuum_into_preserves_vector_blobs(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+
+    conn.execute("CREATE TABLE vectors (id INTEGER PRIMARY KEY, label TEXT, embedding BLOB)")?;
+    conn.execute("INSERT INTO vectors VALUES (1, 'cat', vector32('[1.0, 0.0, 0.0, 0.0]'))")?;
+    conn.execute("INSERT INTO vectors VALUES (2, 'dog', vector32('[0.0, 1.0, 0.0, 0.0]'))")?;
+    conn.execute("INSERT INTO vectors VALUES (3, 'fish', vector32('[0.0, 0.0, 1.0, 0.0]'))")?;
+    let source_hash = compute_dbhash(&tmp_db);
+
+    // Compute a distance on the source for comparison
+    let source_dist: Vec<(f64,)> = conn.exec_rows(
+        "SELECT vector_distance_cos(
+            (SELECT embedding FROM vectors WHERE id = 1),
+            (SELECT embedding FROM vectors WHERE id = 2)
+        )",
+    );
+
+    let dest_dir = TempDir::new()?;
+    let dest_path = dest_dir.path().join("vectors.db");
+    let dest_path_str = dest_path.to_str().unwrap();
+
+    conn.execute(format!("VACUUM INTO '{dest_path_str}'"))?;
+
+    let dest_db = TempDatabase::new_with_existent(&dest_path);
+    let dest_conn = dest_db.connect_limbo();
+
+    assert_eq!(run_integrity_check(&dest_conn), "ok");
+    assert_eq!(source_hash.hash, compute_dbhash(&dest_db).hash);
+
+    let count: Vec<(i64,)> = dest_conn.exec_rows("SELECT COUNT(*) FROM vectors");
+    assert_eq!(count[0].0, 3);
+
+    // Verify vector distance matches source - confirms blobs survived intact
+    let dest_dist: Vec<(f64,)> = dest_conn.exec_rows(
+        "SELECT vector_distance_cos(
+            (SELECT embedding FROM vectors WHERE id = 1),
+            (SELECT embedding FROM vectors WHERE id = 2)
+        )",
+    );
+    assert_eq!(source_dist, dest_dist);
 
     Ok(())
 }

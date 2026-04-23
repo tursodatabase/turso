@@ -83,7 +83,7 @@ int sqlite3_trace_v2(sqlite3 *_db,
                      void (*_callback)(unsigned int, void*, void*, void*),
                      void *_context);
 
-int sqlite3_progress_handler(sqlite3 *_db, int _n, int (*_callback)(void), void *_context);
+void sqlite3_progress_handler(sqlite3 *_db, int _n, int (*_callback)(void *), void *_context);
 
 int sqlite3_busy_timeout(sqlite3 *_db, int _ms);
 
@@ -114,6 +114,22 @@ int64_t sqlite3_changes64(sqlite3 *_db);
 int sqlite3_stmt_readonly(sqlite3_stmt *_stmt);
 
 int sqlite3_stmt_busy(sqlite3_stmt *_stmt);
+
+int sqlite3_stmt_status(sqlite3_stmt *stmt, int op, int resetFlg);
+
+#define SQLITE_STMTSTATUS_FULLSCAN_STEP 1
+#define SQLITE_STMTSTATUS_SORT 2
+#define SQLITE_STMTSTATUS_AUTOINDEX 3
+#define SQLITE_STMTSTATUS_VM_STEP 4
+#define SQLITE_STMTSTATUS_REPREPARE 5
+#define SQLITE_STMTSTATUS_RUN 6
+#define SQLITE_STMTSTATUS_FILTER_MISS 7
+#define SQLITE_STMTSTATUS_FILTER_HIT 8
+#define SQLITE_STMTSTATUS_MEMUSED 99
+
+#define LIBSQL_STMTSTATUS_BASE 1024
+#define LIBSQL_STMTSTATUS_ROWS_READ (LIBSQL_STMTSTATUS_BASE + 1)
+#define LIBSQL_STMTSTATUS_ROWS_WRITTEN (LIBSQL_STMTSTATUS_BASE + 2)
 
 sqlite3_stmt *sqlite3_next_stmt(sqlite3 *db, sqlite3_stmt *stmt);
 
@@ -195,6 +211,8 @@ const void *sqlite3_column_blob(sqlite3_stmt *_stmt, int _idx);
 
 int sqlite3_column_bytes(sqlite3_stmt *_stmt, int _idx);
 
+void *sqlite3_column_value(sqlite3_stmt *_stmt, int _idx);
+
 int sqlite3_value_type(void *value);
 
 int64_t sqlite3_value_int64(void *value);
@@ -208,6 +226,10 @@ const unsigned char *sqlite3_value_text(void *value);
 const void *sqlite3_value_blob(void *value);
 
 int sqlite3_value_bytes(void *value);
+
+void *sqlite3_value_dup(void *value);
+
+void sqlite3_value_free(void *value);
 
 const unsigned char *sqlite3_column_text(sqlite3_stmt *stmt, int idx);
 
@@ -346,6 +368,11 @@ int sqlite3_table_column_metadata(
     int *pPrimaryKey,
     int *pAutoinc
 );
+
+/*
+** Enable all Turso experimental features for subsequently opened databases.
+*/
+void turso_enable_experimental(void);
 
 #ifdef __cplusplus
 }  // extern "C"

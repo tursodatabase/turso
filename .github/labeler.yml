@@ -98,7 +98,7 @@ vector:
 
 turso-serverless:
   - changed-files:
-    - any-glob-to-any-file: 'packages/turso-serverless'
+    - any-glob-to-any-file: 'serverless/javascript'
 
 turso-sync:
   - changed-files:

@@ -7,6 +7,8 @@ pub mod index_method;
 pub mod io;
 #[cfg(all(feature = "json", any(feature = "fuzz", feature = "bench")))]
 pub mod json;
+#[cfg(all(test, feature = "fs", unix, target_pointer_width = "64"))]
+mod multiprocess_tests;
 pub mod mvcc;
 #[cfg(any(feature = "fuzz", feature = "bench"))]
 pub mod numeric;
@@ -39,6 +41,7 @@ mod json;
 mod numeric;
 mod parameters;
 mod pragma;
+mod progress;
 mod pseudo;
 mod regexp;
 #[cfg(feature = "series")]
@@ -63,6 +66,7 @@ use crate::{
     busy::{BusyHandler, BusyHandlerCallback},
     incremental::view::AllViewsTxState,
     index_method::IndexMethod,
+    progress::ProgressHandler,
     schema::Trigger,
     stats::refresh_analyze_stats,
     storage::{
@@ -87,6 +91,10 @@ use arc_swap::{ArcSwap, ArcSwapOption};
 use core::str;
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use schema::Schema;
+#[cfg(all(unix, target_pointer_width = "64"))]
+use std::path::Path;
+#[cfg(all(unix, target_pointer_width = "64"))]
+use std::sync::OnceLock;
 use std::{
     fmt::{self},
     ops::Deref,
@@ -94,6 +102,8 @@ use std::{
 };
 #[cfg(feature = "fs")]
 use storage::database::DatabaseFile;
+#[cfg(all(unix, target_pointer_width = "64"))]
+use storage::shared_wal_coordination::MappedSharedWalCoordination;
 use storage::{page_cache::PageCache, sqlite3_ondisk::PageSize};
 use tracing::{instrument, Level};
 use turso_macros::{match_ignore_ascii_case, AtomicEnum};
@@ -120,7 +130,7 @@ pub use io::{
     SyscallIO, WriteCompletion, IO,
 };
 pub use numeric::{nonnan::NonNan, Numeric};
-pub use statement::Statement;
+pub use statement::{Statement, StatementStatusCounter};
 pub use storage::{
     buffer_pool::BufferPool,
     database::{DatabaseStorage, IOContext},
@@ -128,6 +138,7 @@ pub use storage::{
     pager::{Page, PageRef, Pager},
     wal::{CheckpointMode, CheckpointResult, Wal, WalFile, WalFileShared},
 };
+pub use translate::expr::{walk_expr_mut, WalkControl};
 pub use turso_macros::{
     turso_assert, turso_assert_all, turso_assert_eq, turso_assert_greater_than,
     turso_assert_greater_than_or_equal, turso_assert_less_than, turso_assert_less_than_or_equal,
@@ -156,6 +167,21 @@ pub const TEMP_DB_ID: usize = 1;
 /// start at index 2.
 pub const FIRST_ATTACHED_DB_ID: usize = 2;
 
+/// Sentinel used when a SQL schema qualifier references an attached
+/// database name that cannot be resolved against the current
+/// connection's attached catalog (e.g. after reloading a
+/// `CREATE TEMP TRIGGER tr ON aux.x ...` row from `temp.sqlite_schema`
+/// without `aux` being attached). Stored in
+/// `Trigger::target_database_id` so filters never accidentally match a
+/// real database. Never equal to any real db id — guaranteed by
+/// `usize::MAX`.
+pub const INVALID_DB_ID: usize = usize::MAX;
+
+/// Returns true if the database index refers to "main" or "temp"
+pub const fn is_main_or_temp_db(database_id: usize) -> bool {
+    database_id == MAIN_DB_ID || database_id == TEMP_DB_ID
+}
+
 /// Returns true if the database index refers to an attached database
 /// (i.e. not "main" and not "temp").
 pub const fn is_attached_db(database_id: usize) -> bool {
@@ -171,6 +197,8 @@ pub struct DatabaseOpts {
     pub enable_index_method: bool,
     pub enable_autovacuum: bool,
     pub enable_attach: bool,
+    pub enable_generated_columns: bool,
+    pub enable_multiprocess_wal: bool,
     pub unsafe_testing: bool,
     enable_load_extension: bool,
 }
@@ -216,10 +244,45 @@ impl DatabaseOpts {
         self
     }
 
+    pub fn with_generated_columns(mut self, enable: bool) -> Self {
+        self.enable_generated_columns = enable;
+        self
+    }
+
+    pub fn with_multiprocess_wal(mut self, enable: bool) -> Self {
+        self.enable_multiprocess_wal = enable;
+        self
+    }
+
     pub fn with_unsafe_testing(mut self, enable: bool) -> Self {
         self.unsafe_testing = enable;
         self
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SharedWalCoordinationOpenTelemetryMode {
+    Exclusive,
+    MultiProcess,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SharedWalOpenTelemetry {
+    pub loaded_from_disk_scan: bool,
+    pub reopened_max_frame: u64,
+    pub reopened_nbackfills: u64,
+    pub reopened_checkpoint_seq: u32,
+    pub coordination_open_mode: Option<SharedWalCoordinationOpenTelemetryMode>,
+    pub sanitized_backfill_proof_on_open: bool,
+}
+
+#[cfg(feature = "simulator")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SharedWalTestingSnapshot {
+    pub max_frame: u64,
+    pub nbackfills: u64,
+    pub checkpoint_seq: u32,
+    pub frame_index_overflowed: bool,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -259,6 +322,14 @@ pub enum TempStore {
 pub(crate) type MvStore = mvcc::MvStore<mvcc::MvccClock>;
 
 pub(crate) type MvCursor = mvcc::cursor::MvccLazyCursor<mvcc::MvccClock>;
+
+/// Returns true for in memory databases (i.e. databases backed by MemoryIO)
+///
+/// Turso treats every path with the `:memory:` prefix as a named
+/// in-memory database.
+fn is_memory_like(path: &str) -> bool {
+    path.starts_with(":memory:") || path.starts_with("file::memory:") || path.is_empty()
+}
 
 /// Creates a read completion for database header reads that checks for short reads.
 /// The header is always on page 1, so this function hardcodes that page index.
@@ -303,11 +374,8 @@ pub struct OpenDbAsyncState {
     make_from_btree_state: schema::MakeFromBtreeState,
     /// Schema lock held during LoadingSchema phase to ensure atomicity across IO yields
     schema_guard: Option<sync::ArcMutexGuard<Arc<Schema>>>,
-    /// Registry lock held during open_with_flags_async to prevent concurrent opens
-    registry_guard:
-        Option<parking_lot::ArcMutexGuard<parking_lot::RawMutex, HashMap<String, Weak<Database>>>>,
-    /// Canonical path for registry insertion (computed once at start)
-    canonical_path: Option<String>,
+    /// Registry key for insertion (computed once at start)
+    registry_key: Option<DatabaseKey>,
 }
 
 impl Default for OpenDbAsyncState {
@@ -326,10 +394,27 @@ impl OpenDbAsyncState {
             encryption_key: None,
             make_from_btree_state: schema::MakeFromBtreeState::new(),
             schema_guard: None,
-            registry_guard: None,
-            canonical_path: None,
+            registry_key: None,
         }
     }
+}
+
+impl Drop for OpenDbAsyncState {
+    fn drop(&mut self) {
+        if let Some(registry_key) = self.registry_key.take() {
+            let mut registry = DATABASE_MANAGER.lock();
+            registry.remove(&registry_key);
+        }
+    }
+}
+
+/// Per-path entry in the database registry.
+enum RegistryEntry {
+    /// Another caller is currently opening this database. Callers that see
+    /// this should yield and retry later.
+    Opening,
+    /// The database has been opened and is (or was) live.
+    Ready(Weak<Database>),
 }
 
 /// The database manager ensures that there is a single, shared
@@ -342,8 +427,23 @@ impl OpenDbAsyncState {
 /// state between iterations, but static variables persist - using shuttle's
 /// Mutex here would cause panics when the second iteration tries to lock a
 /// mutex that belongs to a stale execution context.
+/// Registry key for the process-wide database manager.
+/// File-backed databases are keyed by their OS-level identity (dev, ino),
+/// matching SQLite's inodeList approach. Shared in-memory databases use
+/// their name as the key.
+///
+/// IMPORTANT: The mutex must only be held for brief HashMap operations, never
+/// across I/O yields. Holding it across yields deadlocks single-threaded
+/// event loops because the blocked thread
+/// can never resume the coroutine that owns the lock.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum DatabaseKey {
+    File(io::FileId),
+    SharedMemory(String),
+}
+
 #[allow(clippy::type_complexity)]
-static DATABASE_MANAGER: LazyLock<Arc<parking_lot::Mutex<HashMap<String, Weak<Database>>>>> =
+static DATABASE_MANAGER: LazyLock<Arc<parking_lot::Mutex<HashMap<DatabaseKey, RegistryEntry>>>> =
     LazyLock::new(|| Arc::new(parking_lot::Mutex::new(HashMap::default())));
 
 /// The `Database` object contains per database file state that is shared
@@ -369,6 +469,8 @@ pub struct Database {
     /// (commit, sync, checkpoint thresholds, etc.) instead of the built-in storage.
     durable_storage: Option<Arc<dyn crate::mvcc::persistent_storage::DurableStorage>>,
     shared_wal: Arc<RwLock<WalFileShared>>,
+    #[cfg(all(unix, target_pointer_width = "64"))]
+    shared_wal_coordination: OnceLock<Arc<MappedSharedWalCoordination>>,
     init_lock: Arc<Mutex<()>>,
     open_flags: OpenFlags,
     // Use parking lot RwLock here and not `crate::sync::RwLock` because it relies on `data_ptr` and that is experimental
@@ -418,7 +520,7 @@ impl fmt::Debug for Database {
         debug_struct.field("init_lock", &init_lock_status);
 
         let wal_status = match self.shared_wal.try_read() {
-            Some(wal) if wal.enabled.load(Ordering::SeqCst) => "enabled",
+            Some(wal) if wal.metadata.enabled.load(Ordering::SeqCst) => "enabled",
             Some(_) => "disabled",
             None => "locked_for_write",
         };
@@ -442,6 +544,11 @@ impl fmt::Debug for Database {
 }
 
 impl Database {
+    /// Returns true if this database is backed by MemoryIO.
+    pub fn is_in_memory_db(&self) -> bool {
+        is_memory_like(&self.path)
+    }
+
     fn new(
         opts: DatabaseOpts,
         flags: OpenFlags,
@@ -451,6 +558,8 @@ impl Database {
         db_file: Arc<dyn DatabaseStorage>,
         encryption_opts: Option<EncryptionOpts>,
     ) -> Result<Self> {
+        let path = path.into();
+        let wal_path = wal_path.into();
         let shared_wal = WalFileShared::new_noop();
         let mv_store = ArcSwapOption::empty();
 
@@ -478,16 +587,19 @@ impl Database {
             None
         };
 
-        // opts is now passed as parameter
         let db = Database {
             mv_store,
-            path: path.into(),
-            wal_path: wal_path.into(),
-            schema: Arc::new(Mutex::new(Arc::new(Schema::with_options(
-                opts.enable_custom_types,
-            )))),
+            path,
+            wal_path,
+            schema: Arc::new(Mutex::new(Arc::new({
+                let mut s = Schema::with_options(opts.enable_custom_types);
+                s.generated_columns_enabled = opts.enable_generated_columns;
+                s
+            }))),
             _shared_page_cache: shared_page_cache,
             shared_wal,
+            #[cfg(all(unix, target_pointer_width = "64"))]
+            shared_wal_coordination: OnceLock::new(),
             db_file,
             builtin_syms: parking_lot::RwLock::new(syms),
             io: io.clone(),
@@ -516,7 +628,163 @@ impl Database {
         Self::open_file_with_flags(io, path, OpenFlags::default(), DatabaseOpts::new(), None)
     }
 
-    /// Look up a database in the process-wide registry by path.
+    /// Open or retrieve a shared named in-memory database.
+    /// Multiple connections to the same `name` share a single `Database`,
+    /// matching SQLite's `file:name?mode=memory&cache=shared` semantics.
+    #[cfg(feature = "fs")]
+    pub fn open_shared_memory(name: &str) -> Result<Arc<Database>> {
+        let key = DatabaseKey::SharedMemory(name.to_string());
+
+        {
+            let registry = DATABASE_MANAGER.lock();
+            if let Some(RegistryEntry::Ready(weak)) = registry.get(&key) {
+                if let Some(db) = weak.upgrade() {
+                    return Ok(db);
+                }
+            }
+        }
+        // `:memory:` paths bypass DATABASE_MANAGER internally, so no deadlock.
+        let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+        let db = Self::open_file(io, ":memory:")?;
+
+        let mut registry = DATABASE_MANAGER.lock();
+        if let Some(RegistryEntry::Ready(weak)) = registry.get(&key) {
+            if let Some(existing) = weak.upgrade() {
+                return Ok(existing);
+            }
+        }
+        registry.insert(key, RegistryEntry::Ready(Arc::downgrade(&db)));
+        Ok(db)
+    }
+
+    #[cfg(feature = "fs")]
+    #[cfg(all(unix, target_pointer_width = "64"))]
+    fn effective_open_flags_for_path(
+        io: &Arc<dyn IO>,
+        path: &str,
+        flags: OpenFlags,
+        opts: DatabaseOpts,
+    ) -> Result<OpenFlags> {
+        if !opts.enable_multiprocess_wal {
+            return Ok(flags);
+        }
+
+        if is_memory_like(path) {
+            return Err(LimboError::InvalidArgument(format!(
+                "experimental multiprocess WAL is not supported for in-memory database path '{path}'"
+            )));
+        }
+        if !io.supports_shared_wal_coordination() {
+            return Err(LimboError::InvalidArgument(format!(
+                "experimental multiprocess WAL is not supported by the active IO backend for '{path}'"
+            )));
+        }
+        if !Self::path_allows_shared_wal_coordination(Path::new(path))? {
+            return Err(LimboError::InvalidArgument(format!(
+                "experimental multiprocess WAL is not supported on the filesystem backing '{path}'"
+            )));
+        }
+
+        if !flags.contains(OpenFlags::ReadOnly) {
+            return Ok(flags | OpenFlags::NoLock);
+        }
+
+        Ok(flags)
+    }
+
+    #[cfg(feature = "fs")]
+    #[cfg(not(all(unix, target_pointer_width = "64")))]
+    fn effective_open_flags_for_path(
+        _io: &Arc<dyn IO>,
+        _path: &str,
+        flags: OpenFlags,
+        _opts: DatabaseOpts,
+    ) -> Result<OpenFlags> {
+        // On unsupported platforms, keep the flag as a no-op so generic
+        // cross-platform helpers/tests can request multiprocess WAL without
+        // breaking legacy single-process behavior.
+        Ok(flags)
+    }
+
+    #[cfg(feature = "fs")]
+    #[cfg(all(unix, target_pointer_width = "64"))]
+    fn reject_live_multiprocess_wal_for_legacy_open(
+        io: &Arc<dyn IO>,
+        path: &str,
+        opts: DatabaseOpts,
+    ) -> Result<()> {
+        if opts.enable_multiprocess_wal
+            || is_memory_like(path)
+            || !io.supports_shared_wal_coordination()
+            || !Self::path_allows_shared_wal_coordination(Path::new(path))?
+        {
+            return Ok(());
+        }
+
+        let coordination_path =
+            storage::wal::coordination_path_for_wal_path(&format!("{path}-wal"));
+        let Some(authority) =
+            MappedSharedWalCoordination::open_existing(io, Path::new(&coordination_path), 64)?
+        else {
+            return Ok(());
+        };
+
+        if matches!(
+            authority.open_mode(),
+            storage::shared_wal_coordination::SharedWalCoordinationOpenMode::MultiProcess
+        ) {
+            return Err(LimboError::LockingError(format!(
+                "Failed opening database '{path}'. Database is already open with experimental multiprocess WAL in another process"
+            )));
+        }
+
+        Ok(())
+    }
+
+    #[cfg(feature = "fs")]
+    #[cfg(not(all(unix, target_pointer_width = "64")))]
+    fn reject_live_multiprocess_wal_for_legacy_open(
+        _io: &Arc<dyn IO>,
+        _path: &str,
+        _opts: DatabaseOpts,
+    ) -> Result<()> {
+        Ok(())
+    }
+
+    #[cfg(feature = "fs")]
+    #[cfg(all(unix, target_pointer_width = "64"))]
+    fn reject_live_legacy_wal_for_multiprocess_open(
+        io: &Arc<dyn IO>,
+        path: &str,
+        flags: OpenFlags,
+        opts: DatabaseOpts,
+    ) -> Result<()> {
+        if !opts.enable_multiprocess_wal || flags.contains(OpenFlags::ReadOnly) {
+            return Ok(());
+        }
+
+        let probe_flags = (flags | OpenFlags::Create) & !OpenFlags::NoLock & !OpenFlags::ReadOnly;
+        match io.open_file(path, probe_flags, true) {
+            Ok(_probe_file) => Ok(()),
+            Err(LimboError::LockingError(_)) => Err(LimboError::LockingError(format!(
+                "Failed opening database '{path}'. Database is already open without experimental multiprocess WAL in another process"
+            ))),
+            Err(err) => Err(err),
+        }
+    }
+
+    #[cfg(feature = "fs")]
+    #[cfg(not(all(unix, target_pointer_width = "64")))]
+    fn reject_live_legacy_wal_for_multiprocess_open(
+        _io: &Arc<dyn IO>,
+        _path: &str,
+        _flags: OpenFlags,
+        _opts: DatabaseOpts,
+    ) -> Result<()> {
+        Ok(())
+    }
+
+    /// Look up a database in the process-wide registry by file identity.
     /// Returns the cached Database if found, with encryption validation.
     /// This avoids opening a file (and acquiring a file lock) when the
     /// database is already open in this process.
@@ -524,20 +792,21 @@ impl Database {
         path: &str,
         encryption_opts: &Option<EncryptionOpts>,
     ) -> Result<Option<Arc<Database>>> {
-        if path.starts_with(":memory:") {
+        if is_memory_like(path) {
             return Ok(None);
         }
-        let canonical = match std::fs::canonicalize(path)
-            .ok()
-            .and_then(|p| p.to_str().map(|s| s.to_string()))
-        {
-            Some(c) => c,
-            None => return Ok(None),
+        let file_id = match io::get_file_id(path) {
+            Ok(id) => id,
+            Err(_) => return Ok(None), // file doesn't exist yet
         };
-        let registry = DATABASE_MANAGER.lock_arc();
-        let db = match registry.get(&canonical).and_then(Weak::upgrade) {
-            Some(db) => db,
-            None => return Ok(None),
+        let key = DatabaseKey::File(file_id);
+        let registry = DATABASE_MANAGER.lock();
+        let db = match registry.get(&key) {
+            Some(RegistryEntry::Ready(weak)) => match weak.upgrade() {
+                Some(db) => db,
+                None => return Ok(None),
+            },
+            _ => return Ok(None),
         };
 
         // Validate encryption compatibility (key is not stored for security,
@@ -584,13 +853,28 @@ impl Database {
             }
             return Ok(db);
         }
-        let file = io.open_file(path, flags, true)?;
+        // Mixed legacy/multiprocess opens are incompatible, but the two modes
+        // advertise themselves through different lock domains (`.tshm` vs DB
+        // file lock). We therefore probe both directions around the actual file
+        // open to narrow the TOCTOU window:
+        //
+        // 1. legacy open rejects an already-live multiprocess authority
+        Self::reject_live_multiprocess_wal_for_legacy_open(&io, path, opts)?;
+        let effective_flags = Self::effective_open_flags_for_path(&io, path, flags, opts)?;
+
+        // 2. multiprocess open rejects an already-live legacy DB-file lock
+        Self::reject_live_legacy_wal_for_multiprocess_open(&io, path, flags, opts)?;
+        let file = io.open_file(path, effective_flags, true)?;
+
+        // 3. legacy open re-checks after `open_file()` in case a multiprocess
+        //    authority appeared between the initial probe and the actual open
+        Self::reject_live_multiprocess_wal_for_legacy_open(&io, path, opts)?;
         let db_file = Arc::new(DatabaseFile::new(file));
         Self::open_with_flags(
             io,
             path,
             db_file,
-            flags,
+            effective_flags,
             opts,
             encryption_opts,
             durable_storage,
@@ -649,7 +933,8 @@ impl Database {
     ///
     /// Uses the database registry to ensure single Database instance per file within a process.
     /// Caller must drive the IO loop and pass state between calls.
-    /// The registry lock is held for the entire duration to prevent concurrent opens.
+    /// An `Opening` sentinel in the registry prevents concurrent opens of the same path
+    /// without holding the mutex across I/O yields.
     #[allow(clippy::too_many_arguments)]
     pub fn open_with_flags_async(
         state: &mut OpenDbAsyncState,
@@ -672,8 +957,11 @@ impl Database {
             durable_storage,
         );
         if result.is_err() {
-            // registry_guard is set by the open_with_flags_async_internal - so we release it in case of error
-            let _ = state.registry_guard.take();
+            // On error, remove the Opening sentinel so other callers can proceed.
+            if let Some(registry_key) = state.registry_key.take() {
+                let mut registry = DATABASE_MANAGER.lock();
+                registry.remove(&registry_key);
+            }
         }
         result
     }
@@ -691,43 +979,56 @@ impl Database {
     ) -> Result<IOResult<Arc<Database>>> {
         // turso-sync-engine creates 2 databases with different names in the same IO if MemoryIO is used
         // in this case we need to bypass registry (as this is MemoryIO DB) but also preserve original distinction in names (e.g. :memory:-draft and :memory:-synced)
-        // so, we bypass registry for all db paths which starts with ":memory:"
+        // so, we bypass registry for all in memory dbs (i.e. db paths which starts with ":memory:")
 
-        if matches!(state.phase, OpenDbAsyncPhase::Init) && !path.starts_with(":memory:") {
-            // lock the database manager for the whole duration of open_with_flags_async method
-            let registry = DATABASE_MANAGER.lock_arc();
+        if matches!(state.phase, OpenDbAsyncPhase::Init) && !is_memory_like(path) {
+            // Briefly lock the registry to check/reserve — never hold across I/O yields.
+            let mut registry = DATABASE_MANAGER.lock();
 
-            let canonical_path = std::fs::canonicalize(path)
-                .ok()
-                .and_then(|p| p.to_str().map(|s| s.to_string()))
-                .unwrap_or_else(|| path.to_string());
+            // Look up by file identity (dev, ino). If file doesn't exist
+            // yet (CREATE mode), skip lookup — no cached entry is possible.
+            if let Ok(file_id) = io.file_id(path) {
+                let key = DatabaseKey::File(file_id);
+                match registry.get(&key) {
+                    Some(RegistryEntry::Ready(weak)) => {
+                        if let Some(db) = weak.upgrade() {
+                            tracing::debug!("took database {path:?} from the registry");
 
-            // Check if already in registry
-            if let Some(db) = registry.get(&canonical_path).and_then(Weak::upgrade) {
-                tracing::debug!("took database {canonical_path:?} from the registry");
-
-                // Check encryption compatibility using cipher mode (key is not stored in Database for security)
-                let db_is_encrypted = !matches!(db.encryption_cipher_mode.get(), CipherMode::None);
-
-                if db_is_encrypted && encryption_opts.is_none() {
-                    return Err(LimboError::InvalidArgument(
-                        "Database is encrypted but no encryption options provided".to_string(),
-                    ));
+                            let db_is_encrypted =
+                                !matches!(db.encryption_cipher_mode.get(), CipherMode::None);
+                            if db_is_encrypted && encryption_opts.is_none() {
+                                return Err(LimboError::InvalidArgument(
+                                    "Database is encrypted but no encryption options provided"
+                                        .to_string(),
+                                ));
+                            }
+                            return Ok(IOResult::Done(db));
+                        }
+                        // Weak ref expired — treat as absent, fall through to insert Opening.
+                        registry.insert(key.clone(), RegistryEntry::Opening);
+                    }
+                    Some(RegistryEntry::Opening) => {
+                        // Another caller is already opening this path. Yield so the
+                        // event loop can make progress and we retry later.
+                        return Ok(IOResult::IO(types::IOCompletions::Single(
+                            io::Completion::new_yield(),
+                        )));
+                    }
+                    None => {
+                        // Not in registry — mark as Opening and proceed.
+                        registry.insert(key.clone(), RegistryEntry::Opening);
+                    }
                 }
-
-                // Found in registry, no need to hold lock
-                return Ok(IOResult::Done(db));
+                state.registry_key = Some(key);
             }
-
-            // Not in registry, hold the lock and store canonical path for later insertion
-            state.registry_guard = Some(registry);
-            state.canonical_path = Some(canonical_path);
+            // Lock is dropped here — the Opening sentinel prevents concurrent opens
+            // of the same path without holding the mutex across yields.
         }
 
-        // Open the database asynchronously (registry lock is held in state for not `:memory:.*` pathes)
+        // Open the database asynchronously (no registry lock held).
         let result = Self::open_with_flags_bypass_registry_async(
             state,
-            io,
+            io.clone(),
             path,
             None,
             db_file,
@@ -738,11 +1039,10 @@ impl Database {
         )?;
 
         if let IOResult::Done(ref db) = result {
-            // will be unset in case of `:memory:.*` path
-            if let (Some(mut registry), Some(canonical_path)) =
-                (state.registry_guard.take(), state.canonical_path.take())
-            {
-                registry.insert(canonical_path, Arc::downgrade(db));
+            // Register the opened database and remove the Opening sentinel.
+            if let Some(registry_key) = state.registry_key.take() {
+                let mut registry = DATABASE_MANAGER.lock();
+                registry.insert(registry_key, RegistryEntry::Ready(Arc::downgrade(db)));
             }
         }
 
@@ -861,7 +1161,8 @@ impl Database {
 
                     #[cfg(debug_assertions)]
                     {
-                        let wal_enabled = db.shared_wal.read().enabled.load(Ordering::SeqCst);
+                        let wal_enabled =
+                            db.shared_wal.read().metadata.enabled.load(Ordering::SeqCst);
                         let mv_store_enabled = db.get_mv_store().is_some();
                         assert!(
                             db.is_readonly() || wal_enabled || mv_store_enabled,
@@ -899,9 +1200,10 @@ impl Database {
                         .schema_guard
                         .as_mut()
                         .expect("schema_guard must be acquired in Init phase");
-                    // while we logically exclusively own schema as we hold DATABASE_MANAGER lock in the top level `open_with_flags_async_internal` function
-                    // at the moment we already created connection which cloned the schema internally
-                    // so, we can't use get_mut here for now
+                    // We logically exclusively own schema via the Opening sentinel in the
+                    // registry which prevents concurrent opens of the same path.
+                    // At this point we already created a connection which cloned the schema
+                    // internally, so we can't use get_mut here.
                     //
                     // it's not ideal but correctness is OK - before prepare connection call maybe_update_schema and in case of divergence update schema ref from the db + we always check connection cookie in the VDBE program itself
                     let schema = Arc::make_mut(&mut **guard);
@@ -1038,9 +1340,25 @@ impl Database {
             pager.set_encryption_context(cipher_mode, key)?;
         }
 
-        // Start read transaction before reading page 1 to acquire a read lock
-        // that prevents concurrent checkpoints from truncating the WAL
-        pager.begin_read_tx()?;
+        // Start a read transaction before reading page 1 to prevent a concurrent
+        // checkpoint from truncating the WAL underneath bootstrap. Under heavy
+        // same-process connection churn, the shared WAL bootstrap path can
+        // briefly contend on short-lived in-process locks, so treat Busy here as
+        // a transient and retry rather than failing `connect()`.
+        let mut read_tx_attempts = 0u32;
+        loop {
+            match pager.begin_read_tx() {
+                Ok(()) => break,
+                Err(LimboError::Busy) => {
+                    read_tx_attempts += 1;
+                    if read_tx_attempts > 1 {
+                        return Err(LimboError::Busy);
+                    }
+                    pager.io.yield_now();
+                }
+                Err(err) => return Err(err),
+            }
+        }
 
         // Read header within the read transaction, ensuring cleanup on error
         let result = (|| -> Result<AutoVacuumMode> {
@@ -1089,8 +1407,8 @@ impl Database {
 
         if is_autovacuumed_db && !self.opts.enable_autovacuum {
             tracing::warn!(
-                        "Database has autovacuum enabled but --experimental-autovacuum flag is not set. Opening in readonly mode."
-                    );
+                "Database has autovacuum enabled but --experimental-autovacuum flag is not set. Opening in readonly mode."
+            );
             self.open_flags |= OpenFlags::ReadOnly;
         }
 
@@ -1198,7 +1516,10 @@ impl Database {
         let header_modified = match read_version {
             Version::Legacy => {
                 if is_readonly {
-                    tracing::warn!("Database {} is opened in readonly mode, cannot convert Legacy mode to WAL. Running in Legacy mode.", self.path);
+                    tracing::warn!(
+                        "Database {} is opened in readonly mode, cannot convert Legacy mode to WAL. Running in Legacy mode.",
+                        self.path
+                    );
                     false
                 } else {
                     // Convert Legacy to WAL mode
@@ -1235,17 +1556,41 @@ impl Database {
 
         // Always Open shared wal and set it in the Database and Pager.
         // MVCC currently requires a WAL open to function
-        let shared_wal = WalFileShared::open_shared_if_exists(&self.io, &self.wal_path, flags)?;
+        #[cfg(all(unix, target_pointer_width = "64"))]
+        let shared_authority = self.open_shared_wal_coordination_for_open()?;
+        #[cfg(not(all(unix, target_pointer_width = "64")))]
+        let shared_authority: Option<()> = None;
 
-        let last_checksum_and_max_frame = shared_wal.read().last_checksum_and_max_frame();
-        let wal = Arc::new(WalFile::new(
-            self.io.clone(),
-            Arc::clone(&shared_wal),
-            last_checksum_and_max_frame,
-            pager.buffer_pool.clone(),
-        ));
-
+        let shared_wal = {
+            #[cfg(all(unix, target_pointer_width = "64"))]
+            {
+                if let Some(authority) = shared_authority.as_ref() {
+                    // The no-scan open path only works if the shared frame index
+                    // is complete. If the reserved shared index space was fully
+                    // exhausted, rebuild local WAL state from the file instead.
+                    if !authority.frame_index_overflowed() {
+                        WalFileShared::open_shared_from_authority_if_exists(
+                            &self.io,
+                            &self.wal_path,
+                            flags,
+                            authority,
+                            &self.db_file,
+                        )?
+                    } else {
+                        WalFileShared::open_shared_if_exists(&self.io, &self.wal_path, flags)?
+                    }
+                } else {
+                    WalFileShared::open_shared_if_exists(&self.io, &self.wal_path, flags)?
+                }
+            }
+            #[cfg(not(all(unix, target_pointer_width = "64")))]
+            {
+                WalFileShared::open_shared_if_exists(&self.io, &self.wal_path, flags)?
+            }
+        };
         self.shared_wal = shared_wal;
+        let last_checksum_and_max_frame = self.shared_wal.read().last_checksum_and_max_frame();
+        let wal = self.build_wal(last_checksum_and_max_frame, pager.buffer_pool.clone())?;
         pager.set_wal(wal);
 
         // Clear page cache after attaching WAL since pages may have been cached
@@ -1255,13 +1600,13 @@ impl Database {
         pager.set_schema_cookie(None);
 
         if open_mv_store {
-            // todo(v): pass required encryption ctx to enable encryption with mvcc
+            let enc_ctx = pager.io_ctx.read().encryption_context().cloned();
             let mv_store = journal_mode::open_mv_store(
                 self.io.clone(),
                 &self.path,
                 self.open_flags,
                 self.durable_storage.clone(),
-                None,
+                enc_ctx,
             )?;
             self.mv_store.store(Some(mv_store));
         }
@@ -1307,7 +1652,6 @@ impl Database {
             .get();
 
         let encryption_cipher = self.encryption_cipher_mode.get();
-
         let conn = Arc::new(Connection {
             db: self.clone(),
             pager: ArcSwap::new(pager),
@@ -1316,7 +1660,7 @@ impl Database {
             auto_commit: AtomicBool::new(true),
             transaction_state: AtomicTransactionState::new(TransactionState::None),
             last_insert_rowid: AtomicI64::new(0),
-            last_change: AtomicI64::new(0),
+            changes: AtomicI64::new(0),
             total_changes: AtomicI64::new(0),
             syms: parking_lot::RwLock::new(SymbolTable::new()),
             _shared_cache: false,
@@ -1326,11 +1670,17 @@ impl Database {
             capture_data_changes: RwLock::new(None),
             cdc_transaction_id: AtomicI64::new(-1),
             closed: AtomicBool::new(false),
+            temp: crate::connection::TempDbContext::new(),
             attached_databases: RwLock::new(DatabaseCatalog::new()),
             query_only: AtomicBool::new(false),
             dml_require_where: AtomicBool::new(false),
+            dqs_dml: AtomicBool::new(true),
             mv_tx: RwLock::new(None),
             attached_mv_txs: RwLock::new(HashMap::default()),
+            #[cfg(any(test, injected_yields))]
+            yield_injector: RwLock::new(None),
+            #[cfg(any(test, injected_yields))]
+            yield_instance_id_counter: AtomicU64::new(1),
             view_transaction_states: AllViewsTxState::new(),
             metrics: RwLock::new(ConnectionMetrics::new()),
             nestedness: AtomicI32::new(0),
@@ -1342,12 +1692,19 @@ impl Database {
             temp_store: AtomicTempStore::new(TempStore::Default),
             data_sync_retry: AtomicBool::new(false),
             busy_handler: RwLock::new(BusyHandler::None),
+            progress_handler: ProgressHandler::new(),
+            query_timeout_ms: AtomicU64::new(0),
+            interrupt_requested: AtomicBool::new(false),
             is_mvcc_bootstrap_connection: AtomicBool::new(is_mvcc_bootstrap_connection),
+            full_column_names: AtomicBool::new(false),
+            short_column_names: AtomicBool::new(true),
             fk_pragma: AtomicBool::new(false),
             fk_deferred_violations: AtomicIsize::new(0),
             n_active_writes: AtomicI32::new(0),
+            n_active_root_statements: AtomicI32::new(0),
             check_constraints_pragma: AtomicBool::new(false),
             vtab_txn_states: RwLock::new(HashSet::default()),
+            named_savepoints: RwLock::new(Vec::new()),
             prepare_context_generation: AtomicU64::new(0),
         });
         self.n_connections
@@ -1412,7 +1769,7 @@ impl Database {
         shared_wal: &WalFileShared,
         requested_page_size: Option<usize>,
     ) -> Result<PageSize> {
-        if shared_wal.enabled.load(Ordering::SeqCst) {
+        if shared_wal.metadata.enabled.load(Ordering::SeqCst) {
             let size_in_wal = shared_wal.page_size();
             if size_in_wal != 0 {
                 let Some(page_size) = PageSize::new(size_in_wal) else {
@@ -1444,6 +1801,355 @@ impl Database {
         }
     }
 
+    #[cfg(all(unix, target_pointer_width = "64", target_os = "macos"))]
+    fn filesystem_type_allows_shared_wal(fs_type: &str) -> bool {
+        // Network and distributed filesystems where mmap'd shared memory
+        // cannot guarantee cross-process coherency.
+        !matches!(
+            fs_type,
+            "nfs" | "smbfs" | "afpfs" | "webdav" | "cifs" | "acfs"
+        )
+    }
+
+    #[cfg(all(
+        unix,
+        target_pointer_width = "64",
+        not(any(target_os = "linux", target_os = "android")),
+        not(target_os = "macos")
+    ))]
+    fn filesystem_type_allows_shared_wal(_fs_type: &str) -> bool {
+        true
+    }
+
+    #[cfg(all(
+        unix,
+        target_pointer_width = "64",
+        any(target_os = "linux", target_os = "android")
+    ))]
+    fn filesystem_magic_allows_shared_wal(filesystem_magic: libc::c_long) -> bool {
+        const AFS_SUPER_MAGIC: libc::c_long = 0x5346_414f;
+        const CIFS_SUPER_MAGIC: libc::c_long = 0xFF53_4D42u32 as libc::c_long;
+        const CODA_SUPER_MAGIC: libc::c_long = 0x7375_7245;
+        const CEPH_SUPER_MAGIC: libc::c_long = 0x00C3_6400;
+        const GFS2_SUPER_MAGIC: libc::c_long = 0x0116_1970;
+        const LUSTRE_SUPER_MAGIC: libc::c_long = 0x0BD0_0BD0;
+        const NCP_SUPER_MAGIC: libc::c_long = 0x564c;
+        const NFS_SUPER_MAGIC: libc::c_long = 0x6969;
+        const OCFS2_SUPER_MAGIC: libc::c_long = 0x7461_636f;
+        const SMB2_SUPER_MAGIC: libc::c_long = 0xFE53_4D42u32 as libc::c_long;
+        const V9FS_SUPER_MAGIC: libc::c_long = 0x0102_1997;
+
+        !matches!(
+            filesystem_magic,
+            AFS_SUPER_MAGIC
+                | CIFS_SUPER_MAGIC
+                | CODA_SUPER_MAGIC
+                | CEPH_SUPER_MAGIC
+                | GFS2_SUPER_MAGIC
+                | LUSTRE_SUPER_MAGIC
+                | NCP_SUPER_MAGIC
+                | NFS_SUPER_MAGIC
+                | OCFS2_SUPER_MAGIC
+                | SMB2_SUPER_MAGIC
+                | V9FS_SUPER_MAGIC
+        )
+    }
+
+    #[cfg(all(
+        unix,
+        target_pointer_width = "64",
+        any(target_os = "linux", target_os = "android")
+    ))]
+    fn path_allows_shared_wal_coordination(path: &Path) -> Result<bool> {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt;
+
+        let probe_path = if path.exists() {
+            path
+        } else {
+            path.parent()
+                .filter(|parent| !parent.as_os_str().is_empty())
+                .unwrap_or_else(|| Path::new("."))
+        };
+        let c_path = CString::new(probe_path.as_os_str().as_bytes()).map_err(|_| {
+            LimboError::InvalidArgument(format!(
+                "path contains interior NUL bytes: {}",
+                probe_path.display()
+            ))
+        })?;
+        let mut stat = std::mem::MaybeUninit::<libc::statfs>::uninit();
+        let rc = unsafe { libc::statfs(c_path.as_ptr(), stat.as_mut_ptr()) };
+        if rc != 0 {
+            return Err(io_error(
+                std::io::Error::last_os_error(),
+                "statfs shared WAL coordination path",
+            ));
+        }
+        let stat = unsafe { stat.assume_init() };
+        Ok(Self::filesystem_magic_allows_shared_wal(
+            stat.f_type as libc::c_long,
+        ))
+    }
+
+    #[cfg(all(
+        unix,
+        target_pointer_width = "64",
+        not(any(target_os = "linux", target_os = "android"))
+    ))]
+    fn path_allows_shared_wal_coordination(path: &Path) -> Result<bool> {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt;
+
+        let probe_path = if path.exists() {
+            path
+        } else {
+            path.parent()
+                .filter(|parent| !parent.as_os_str().is_empty())
+                .unwrap_or_else(|| Path::new("."))
+        };
+        let c_path = CString::new(probe_path.as_os_str().as_bytes()).map_err(|_| {
+            LimboError::InvalidArgument(format!(
+                "path contains interior NUL bytes: {}",
+                probe_path.display()
+            ))
+        })?;
+        let mut stat = std::mem::MaybeUninit::<libc::statfs>::uninit();
+        let rc = unsafe { libc::statfs(c_path.as_ptr(), stat.as_mut_ptr()) };
+        if rc != 0 {
+            return Err(io_error(
+                std::io::Error::last_os_error(),
+                "statfs shared WAL coordination path",
+            ));
+        }
+        let stat = unsafe { stat.assume_init() };
+        // macOS and other BSDs expose the filesystem type as a
+        // null-terminated string in f_fstypename rather than an
+        // integer magic number.
+        let fs_type = unsafe {
+            std::ffi::CStr::from_ptr(stat.f_fstypename.as_ptr())
+                .to_str()
+                .unwrap_or("")
+        };
+        Ok(Self::filesystem_type_allows_shared_wal(fs_type))
+    }
+
+    #[cfg(all(unix, target_pointer_width = "64"))]
+    pub(crate) fn shared_wal_coordination(
+        &self,
+    ) -> Result<Option<Arc<MappedSharedWalCoordination>>> {
+        let shared_wal = self.shared_wal.read();
+        if !shared_wal.metadata.enabled.load(Ordering::Acquire) {
+            return Ok(None);
+        }
+        drop(shared_wal);
+        self.open_shared_wal_coordination_inner()
+    }
+
+    #[cfg(not(all(unix, target_pointer_width = "64")))]
+    pub(crate) fn shared_wal_coordination(&self) -> Result<Option<()>> {
+        Ok(None)
+    }
+
+    #[cfg(all(unix, target_pointer_width = "64"))]
+    pub(crate) fn open_shared_wal_coordination_for_open(
+        &self,
+    ) -> Result<Option<Arc<MappedSharedWalCoordination>>> {
+        self.open_shared_wal_coordination_inner()
+    }
+
+    #[cfg(all(unix, target_pointer_width = "64"))]
+    fn open_shared_wal_coordination_inner(
+        &self,
+    ) -> Result<Option<Arc<MappedSharedWalCoordination>>> {
+        if !self.opts.enable_multiprocess_wal {
+            return Ok(None);
+        }
+        if !self.io.supports_shared_wal_coordination() {
+            return Err(LimboError::InvalidArgument(format!(
+                "experimental multiprocess WAL is not supported by the active IO backend for '{}'",
+                self.path
+            )));
+        }
+        if is_memory_like(&self.path) || is_memory_like(&self.wal_path) {
+            return Err(LimboError::InvalidArgument(format!(
+                "experimental multiprocess WAL is not supported for in-memory database path '{}'",
+                self.path
+            )));
+        }
+        if !Self::path_allows_shared_wal_coordination(Path::new(&self.path))? {
+            return Err(LimboError::InvalidArgument(format!(
+                "experimental multiprocess WAL is not supported on the filesystem backing '{}'",
+                self.path
+            )));
+        }
+        if let Some(authority) = self.shared_wal_coordination.get() {
+            return Ok(Some(authority.clone()));
+        }
+
+        let path = storage::wal::coordination_path_for_wal_path(&self.wal_path);
+        let authority = if self.open_flags.contains(OpenFlags::ReadOnly) {
+            let Some(authority) = MappedSharedWalCoordination::open_existing(
+                &self.io,
+                std::path::Path::new(&path),
+                64,
+            )?
+            else {
+                // Read-only opens cannot create `.tshm`. If no shared
+                // coordination file exists, degrade to the legacy read-only WAL
+                // path rather than failing the open. This keeps binding-level
+                // option plumbing advisory for readers while writable opens
+                // still enforce the stricter multiprocess contract.
+                return Ok(None);
+            };
+            Arc::new(authority)
+        } else {
+            Arc::new(MappedSharedWalCoordination::create_or_open(
+                &self.io,
+                std::path::Path::new(&path),
+                64,
+            )?)
+        };
+        let _ = self.shared_wal_coordination.set(authority.clone());
+        Ok(Some(
+            self.shared_wal_coordination
+                .get()
+                .cloned()
+                .unwrap_or(authority),
+        ))
+    }
+
+    pub fn shared_wal_open_telemetry(&self) -> Result<SharedWalOpenTelemetry> {
+        let shared_wal = self.shared_wal.read();
+        let loaded_from_disk_scan = shared_wal
+            .metadata
+            .loaded_from_disk_scan
+            .load(Ordering::Acquire);
+        let reopened_max_frame = shared_wal.metadata.max_frame.load(Ordering::Acquire);
+        let reopened_nbackfills = shared_wal.metadata.nbackfills.load(Ordering::Acquire);
+        let reopened_checkpoint_seq = shared_wal.metadata.wal_header.lock().checkpoint_seq;
+        drop(shared_wal);
+
+        #[cfg(all(unix, target_pointer_width = "64"))]
+        let (coordination_open_mode, sanitized_backfill_proof_on_open) =
+            if let Some(authority) = self.shared_wal_coordination()? {
+                let mode = match authority.open_mode() {
+                storage::shared_wal_coordination::SharedWalCoordinationOpenMode::Exclusive => {
+                    SharedWalCoordinationOpenTelemetryMode::Exclusive
+                }
+                storage::shared_wal_coordination::SharedWalCoordinationOpenMode::MultiProcess => {
+                    SharedWalCoordinationOpenTelemetryMode::MultiProcess
+                }
+            };
+                (Some(mode), authority.sanitized_backfill_proof_on_open())
+            } else {
+                (None, false)
+            };
+        #[cfg(not(all(unix, target_pointer_width = "64")))]
+        let (coordination_open_mode, sanitized_backfill_proof_on_open) = (None, false);
+
+        Ok(SharedWalOpenTelemetry {
+            loaded_from_disk_scan,
+            reopened_max_frame,
+            reopened_nbackfills,
+            reopened_checkpoint_seq,
+            coordination_open_mode,
+            sanitized_backfill_proof_on_open,
+        })
+    }
+
+    #[cfg(feature = "simulator")]
+    pub fn shared_wal_snapshot_for_testing(&self) -> Result<Option<SharedWalTestingSnapshot>> {
+        #[cfg(all(unix, target_pointer_width = "64"))]
+        if let Some(authority) = self.shared_wal_coordination()? {
+            let snapshot = authority.snapshot();
+            return Ok(Some(SharedWalTestingSnapshot {
+                max_frame: snapshot.max_frame,
+                nbackfills: snapshot.nbackfills,
+                checkpoint_seq: snapshot.checkpoint_seq,
+                frame_index_overflowed: authority.frame_index_overflowed(),
+            }));
+        }
+
+        Ok(None)
+    }
+
+    #[cfg(feature = "simulator")]
+    pub fn shared_wal_find_frame_for_testing(&self, page_id: u64) -> Result<Option<u64>> {
+        #[cfg(all(unix, target_pointer_width = "64"))]
+        if let Some(authority) = self.shared_wal_coordination()? {
+            let snapshot = authority.snapshot();
+            return Ok(authority.find_frame(page_id, 0, snapshot.max_frame, None));
+        }
+
+        Ok(None)
+    }
+
+    #[cfg(feature = "simulator")]
+    pub fn local_wal_find_frame_for_testing(&self, page_id: u64) -> Result<Option<u64>> {
+        let shared = self.shared_wal.read();
+        let max_frame = shared.metadata.max_frame.load(Ordering::Acquire);
+        let frame_cache = shared.runtime.frame_cache.lock();
+        Ok(frame_cache.get(&page_id).and_then(|frames| {
+            frames
+                .iter()
+                .rfind(|&&frame_id| frame_id <= max_frame)
+                .copied()
+        }))
+    }
+
+    #[cfg(feature = "simulator")]
+    pub fn local_wal_max_frame_for_testing(&self) -> Result<u64> {
+        Ok(self
+            .shared_wal
+            .read()
+            .metadata
+            .max_frame
+            .load(Ordering::Acquire))
+    }
+
+    #[cfg(feature = "simulator")]
+    pub fn clear_backfill_proof_for_testing(&self) -> Result<()> {
+        #[cfg(all(unix, target_pointer_width = "64"))]
+        {
+            let authority = self.shared_wal_coordination()?.ok_or_else(|| {
+                LimboError::InternalError("shared WAL authority is unavailable".into())
+            })?;
+            authority.clear_backfill_proof();
+            Ok(())
+        }
+
+        #[cfg(not(all(unix, target_pointer_width = "64")))]
+        {
+            Err(LimboError::InternalError(
+                "shared WAL authority is unavailable on this platform".into(),
+            ))
+        }
+    }
+
+    fn build_wal(
+        &self,
+        last_checksum_and_max_frame: ((u32, u32), u64),
+        buffer_pool: Arc<BufferPool>,
+    ) -> Result<Arc<dyn Wal>> {
+        #[cfg(all(unix, target_pointer_width = "64"))]
+        if let Some(authority) = self.shared_wal_coordination()? {
+            return Ok(Arc::new(WalFile::new_with_shared_coordination(
+                self.io.clone(),
+                self.shared_wal.clone(),
+                authority,
+                last_checksum_and_max_frame,
+                buffer_pool,
+            )));
+        }
+
+        Ok(Arc::new(WalFile::new(
+            self.io.clone(),
+            self.shared_wal.clone(),
+            last_checksum_and_max_frame,
+            buffer_pool,
+        )))
+    }
+
     fn init_pager(&self, requested_page_size: Option<usize>) -> Result<Pager> {
         let cipher = self.encryption_cipher_mode.get();
         let reserved_bytes = self.maybe_get_reserved_space_bytes()?.or_else(|| {
@@ -1451,8 +2157,6 @@ impl Database {
                 // For encryption, use the cipher's metadata size
                 Some(cipher.metadata_size() as u8)
             } else {
-                // For non-encrypted databases, don't set reserved_bytes here.
-                // This allows checksums to be enabled by default (disable_checksums will be false).
                 None
             }
         });
@@ -1472,13 +2176,11 @@ impl Database {
             buffer_pool.finalize_with_page_size(page_size.get() as usize)?;
         }
 
-        let pager_wal: Option<Arc<dyn Wal>> = if shared_wal.enabled.load(Ordering::SeqCst) {
-            Some(Arc::new(WalFile::new(
-                self.io.clone(),
-                self.shared_wal.clone(),
-                shared_wal.last_checksum_and_max_frame(),
-                buffer_pool.clone(),
-            )))
+        let wal_enabled = shared_wal.metadata.enabled.load(Ordering::SeqCst);
+        let last_checksum_and_max_frame = shared_wal.last_checksum_and_max_frame();
+        drop(shared_wal);
+        let pager_wal: Option<Arc<dyn Wal>> = if wal_enabled {
+            Some(self.build_wal(last_checksum_and_max_frame, buffer_pool.clone())?)
         } else {
             None
         };
@@ -1505,10 +2207,10 @@ impl Database {
 
     #[cfg(feature = "fs")]
     pub fn io_for_path(path: &str) -> Result<Arc<dyn IO>> {
-        use crate::util::MEMORY_PATH;
-        let io: Arc<dyn IO> = match path.trim() {
-            MEMORY_PATH => Arc::new(MemoryIO::new()),
-            _ => Arc::new(PlatformIO::new()?),
+        let io: Arc<dyn IO> = if is_memory_like(path.trim()) {
+            Arc::new(MemoryIO::new())
+        } else {
+            Arc::new(PlatformIO::new()?)
         };
         Ok(io)
     }
@@ -1616,6 +2318,14 @@ impl Database {
 
     pub fn experimental_attach_enabled(&self) -> bool {
         self.opts.enable_attach
+    }
+
+    pub fn experimental_generated_columns_enabled(&self) -> bool {
+        self.opts.enable_generated_columns
+    }
+
+    pub fn experimental_multiprocess_wal_enabled(&self) -> bool {
+        self.opts.enable_multiprocess_wal
     }
 
     /// check if database is currently in MVCC mode
@@ -1913,5 +2623,32 @@ impl Iterator for QueryRunner<'_> {
             Ok(None) => None,
             Err(err) => Some(Result::Err(LimboError::from(err))),
         }
+    }
+}
+
+#[cfg(test)]
+mod database_tests {
+    use super::{is_memory_like, Database};
+
+    #[test]
+    fn memory_path_classifies_named_memory_databases() {
+        assert!(is_memory_like(":memory:"));
+        assert!(is_memory_like(":memory:sync-draft"));
+        assert!(is_memory_like("file::memory:?cache=shared"));
+        assert!(is_memory_like(""));
+        assert!(!is_memory_like("memory.db"));
+        assert!(!is_memory_like("file:memory.db"));
+    }
+
+    #[cfg(feature = "fs")]
+    #[test]
+    fn io_for_path_uses_memory_io_for_named_memory_database() {
+        let path = format!(":memory:named-io-selection-{}", std::process::id());
+        assert!(std::fs::metadata(&path).is_err());
+
+        let io = Database::io_for_path(&path).unwrap();
+
+        assert!(io.file_id(&path).is_ok());
+        assert!(std::fs::metadata(&path).is_err());
     }
 }

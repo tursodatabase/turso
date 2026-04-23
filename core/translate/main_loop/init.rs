@@ -87,27 +87,25 @@ impl InitLoop {
             );
         }
         // Include hash-join build tables so their cursors are opened for hash build.
-        let mut required_tables: HashSet<usize> = join_order
+        let mut required_tables: TableMask = join_order
             .iter()
             .map(|member| member.original_idx)
             .collect();
         for table in tables.joined_tables().iter() {
             if let Operation::HashJoin(hash_join_op) = &table.op {
-                required_tables.insert(hash_join_op.build_table_idx);
+                required_tables.set(hash_join_op.build_table_idx);
             }
         }
 
         for (table_index, table) in tables.joined_tables().iter().enumerate() {
-            if !required_tables.contains(&table_index) {
+            if !required_tables.get(table_index) {
                 continue;
             }
-            // Ensure attached databases have a Transaction instruction for read access
-            if crate::is_attached_db(table.database_id) {
-                let schema_cookie = t_ctx
-                    .resolver
-                    .with_schema(table.database_id, |s| s.schema_version);
-                program.begin_read_on_database(table.database_id, schema_cookie);
-            }
+            // Ensure non-main databases have a Transaction instruction for read access.
+            let schema_cookie = t_ctx
+                .resolver
+                .with_schema(table.database_id, |s| s.schema_version);
+            program.begin_read_on_database(table.database_id, schema_cookie);
             // Initialize bookkeeping for OUTER JOIN
             if let Some(join_info) = table.join_info.as_ref() {
                 if join_info.is_outer() {

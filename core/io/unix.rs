@@ -1,15 +1,16 @@
-use super::{Completion, File, OpenFlags, IO};
+use super::{Completion, File, OpenFlags, SharedWalLockKind, SharedWalMappedRegion, IO};
 use crate::error::{io_error, CompletionError, LimboError};
 use crate::io::clock::{Clock, DefaultClock, MonotonicInstant, WallClockInstant};
 use crate::io::common;
 use crate::io::FileSyncType;
-use crate::Result;
 use crate::sync::Mutex;
+use crate::Result;
 use rustix::{
     fd::{AsFd, AsRawFd},
     fs::{self, FlockOperation},
 };
 use std::os::fd::RawFd;
+use std::ptr::NonNull;
 
 use std::{io::ErrorKind, sync::Arc};
 #[cfg(feature = "fs")]
@@ -92,6 +93,10 @@ fn try_pwritev_raw(
 }
 
 impl IO for UnixIO {
+    fn supports_shared_wal_coordination(&self) -> bool {
+        true
+    }
+
     fn open_file(&self, path: &str, flags: OpenFlags, _direct: bool) -> Result<Arc<dyn File>> {
         trace!("open_file(path = {})", path);
         let mut file = std::fs::File::options();
@@ -107,9 +112,10 @@ impl IO for UnixIO {
         #[allow(clippy::arc_with_non_send_sync)]
         let unix_file = Arc::new(UnixFile {
             file: Arc::new(Mutex::new(file)),
+            path: path.to_string(),
         });
         if std::env::var(common::ENV_DISABLE_FILE_LOCK).is_err()
-            && !flags.contains(OpenFlags::ReadOnly)
+            && !flags.intersects(OpenFlags::ReadOnly | OpenFlags::NoLock)
         {
             unix_file.lock_file(true)?;
         }
@@ -129,6 +135,189 @@ impl IO for UnixIO {
 
 pub struct UnixFile {
     file: Arc<Mutex<std::fs::File>>,
+    path: String,
+}
+
+pub(crate) struct UnixSharedWalMapping {
+    mapping_ptr: NonNull<u8>,
+    mapping_len: usize,
+    ptr: NonNull<u8>,
+    len: usize,
+}
+
+unsafe impl Send for UnixSharedWalMapping {}
+unsafe impl Sync for UnixSharedWalMapping {}
+
+impl SharedWalMappedRegion for UnixSharedWalMapping {
+    fn ptr(&self) -> NonNull<u8> {
+        self.ptr
+    }
+
+    fn len(&self) -> usize {
+        self.len
+    }
+}
+
+impl Drop for UnixSharedWalMapping {
+    fn drop(&mut self) {
+        let rc = unsafe { libc::munmap(self.mapping_ptr.as_ptr().cast(), self.mapping_len) };
+        if rc != 0 {
+            // Log rather than panic — panicking in Drop aborts if we're already
+            // unwinding (double panic).
+            tracing::error!(
+                "munmap failed for shared WAL coordination region: {}",
+                std::io::Error::last_os_error()
+            );
+        }
+    }
+}
+
+pub(crate) fn unix_shared_wal_lock_byte(
+    fd: RawFd,
+    offset: u64,
+    exclusive: bool,
+    blocking: bool,
+    kind: SharedWalLockKind,
+) -> Result<bool> {
+    let mut flock = libc::flock {
+        l_type: if exclusive {
+            libc::F_WRLCK as libc::c_short
+        } else {
+            libc::F_RDLCK as libc::c_short
+        },
+        l_whence: libc::SEEK_SET as libc::c_short,
+        l_start: offset as libc::off_t,
+        l_len: 1,
+        l_pid: 0,
+    };
+    let cmd = match (kind, blocking) {
+        #[cfg(target_os = "linux")]
+        (SharedWalLockKind::LinuxOfd, true) => libc::F_OFD_SETLKW,
+        #[cfg(target_os = "linux")]
+        (SharedWalLockKind::LinuxOfd, false) => libc::F_OFD_SETLK,
+        (SharedWalLockKind::ProcessScopedFcntl, true) => libc::F_SETLKW,
+        (SharedWalLockKind::ProcessScopedFcntl, false) => libc::F_SETLK,
+        #[cfg(not(target_os = "linux"))]
+        (SharedWalLockKind::LinuxOfd, _) => {
+            return Err(LimboError::InternalError(
+                "linux OFD locks are not supported on this platform".into(),
+            ))
+        }
+    };
+    loop {
+        let rc = unsafe { libc::fcntl(fd, cmd, &mut flock) };
+        if rc == -1 {
+            let error = std::io::Error::last_os_error();
+            if blocking && error.kind() == ErrorKind::Interrupted {
+                continue;
+            }
+            if !blocking && error.kind() == ErrorKind::WouldBlock {
+                return Ok(false);
+            }
+            let message = match error.kind() {
+                ErrorKind::WouldBlock => {
+                    "Failed locking shared WAL coordination file. File is locked by another process"
+                        .to_string()
+                }
+                _ => format!("Failed locking shared WAL coordination file, {error}"),
+            };
+            return Err(LimboError::LockingError(message));
+        }
+        return Ok(true);
+    }
+}
+
+pub(crate) fn unix_shared_wal_unlock_byte(
+    fd: RawFd,
+    offset: u64,
+    kind: SharedWalLockKind,
+) -> Result<()> {
+    let mut flock = libc::flock {
+        l_type: libc::F_UNLCK as libc::c_short,
+        l_whence: libc::SEEK_SET as libc::c_short,
+        l_start: offset as libc::off_t,
+        l_len: 1,
+        l_pid: 0,
+    };
+    let cmd = match kind {
+        #[cfg(target_os = "linux")]
+        SharedWalLockKind::LinuxOfd => libc::F_OFD_SETLK,
+        SharedWalLockKind::ProcessScopedFcntl => libc::F_SETLK,
+        #[cfg(not(target_os = "linux"))]
+        SharedWalLockKind::LinuxOfd => {
+            return Err(LimboError::InternalError(
+                "linux OFD locks are not supported on this platform".into(),
+            ))
+        }
+    };
+    let rc = unsafe { libc::fcntl(fd, cmd, &mut flock) };
+    if rc == -1 {
+        Err(LimboError::LockingError(format!(
+            "Failed to release shared WAL coordination lock: {}",
+            std::io::Error::last_os_error()
+        )))
+    } else {
+        Ok(())
+    }
+}
+
+pub(crate) fn unix_shared_wal_map(
+    offset: u64,
+    len: usize,
+    fd: RawFd,
+) -> Result<Box<dyn SharedWalMappedRegion>> {
+    if len == 0 {
+        return Err(LimboError::InternalError(
+            "cannot mmap shared WAL coordination region with zero length".into(),
+        ));
+    }
+    let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+    if page_size <= 0 {
+        return Err(LimboError::LockingError(format!(
+            "failed to determine shared WAL mmap page size: {}",
+            std::io::Error::last_os_error()
+        )));
+    }
+    let page_size = page_size as u64;
+    let aligned_offset = offset / page_size * page_size;
+    let prefix_len = (offset - aligned_offset) as usize;
+    let mapping_len = prefix_len
+        .checked_add(len)
+        .ok_or_else(|| LimboError::InternalError("shared WAL mmap length overflow".into()))?;
+    let mapping_ptr = unsafe {
+        libc::mmap(
+            std::ptr::null_mut(),
+            mapping_len,
+            libc::PROT_READ | libc::PROT_WRITE,
+            libc::MAP_SHARED,
+            fd,
+            aligned_offset as libc::off_t,
+        )
+    };
+    if mapping_ptr == libc::MAP_FAILED {
+        let error = std::io::Error::last_os_error();
+        let file_size = unsafe {
+            let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+            if libc::fstat(fd, stat.as_mut_ptr()) == 0 {
+                stat.assume_init().st_size
+            } else {
+                -1
+            }
+        };
+        return Err(LimboError::LockingError(format!(
+            "mmap shared WAL coordination file failed: {error} (offset={offset}, aligned_offset={aligned_offset}, len={len}, mapping_len={mapping_len}, fd={fd}, file_size={file_size})"
+        )));
+    }
+    let mapping_ptr =
+        NonNull::new(mapping_ptr.cast::<u8>()).expect("mmap returned null for shared WAL map");
+    let ptr = NonNull::new(unsafe { mapping_ptr.as_ptr().add(prefix_len) })
+        .expect("aligned mmap base plus prefix_len returned null");
+    Ok(Box::new(UnixSharedWalMapping {
+        mapping_ptr,
+        mapping_len,
+        ptr,
+        len,
+    }))
 }
 
 impl File for UnixFile {
@@ -148,10 +337,11 @@ impl File for UnixFile {
         .map_err(|e| {
             let io_error = std::io::Error::from(e);
             let message = match io_error.kind() {
-                ErrorKind::WouldBlock => {
-                    "Failed locking file. File is locked by another process".to_string()
-                }
-                _ => format!("Failed locking file, {io_error}"),
+                ErrorKind::WouldBlock => format!(
+                    "Failed locking file '{}'. File is locked by another process",
+                    self.path
+                ),
+                _ => format!("Failed locking file '{}', {io_error}", self.path),
             };
             LimboError::LockingError(message)
         })?;
@@ -363,6 +553,42 @@ impl File for UnixFile {
             Err(e) => Err(io_error(e, "truncate")),
         }
     }
+
+    fn shared_wal_lock_byte(
+        &self,
+        offset: u64,
+        exclusive: bool,
+        kind: SharedWalLockKind,
+    ) -> Result<()> {
+        let file = self.file.lock();
+        unix_shared_wal_lock_byte(file.as_raw_fd(), offset, exclusive, true, kind).map(|_| ())
+    }
+
+    fn shared_wal_try_lock_byte(
+        &self,
+        offset: u64,
+        exclusive: bool,
+        kind: SharedWalLockKind,
+    ) -> Result<bool> {
+        let file = self.file.lock();
+        unix_shared_wal_lock_byte(file.as_raw_fd(), offset, exclusive, false, kind)
+    }
+
+    fn shared_wal_unlock_byte(&self, offset: u64, kind: SharedWalLockKind) -> Result<()> {
+        let file = self.file.lock();
+        unix_shared_wal_unlock_byte(file.as_raw_fd(), offset, kind)
+    }
+
+    fn shared_wal_set_len(&self, len: u64) -> Result<()> {
+        let file = self.file.lock();
+        file.set_len(len)
+            .map_err(|err| io_error(err, "resize shared WAL coordination file"))
+    }
+
+    fn shared_wal_map(&self, offset: u64, len: usize) -> Result<Box<dyn SharedWalMappedRegion>> {
+        let file = self.file.lock();
+        unix_shared_wal_map(offset, len, file.as_raw_fd())
+    }
 }
 
 impl Drop for UnixFile {
@@ -374,9 +600,25 @@ impl Drop for UnixFile {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write;
 
     #[test]
     fn test_multiple_processes_cannot_open_file() {
         common::tests::test_multiple_processes_cannot_open_file(UnixIO::new);
+    }
+
+    #[test]
+    fn test_shared_wal_map_supports_unaligned_logical_offset() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let backing_len = 128 * 1024;
+        let bytes: Vec<u8> = (0..backing_len).map(|i| (i % 251) as u8).collect();
+        file.as_file().write_all(&bytes).unwrap();
+        file.as_file().sync_all().unwrap();
+
+        let mapped = unix_shared_wal_map(4096, 81920, file.as_file().as_raw_fd()).unwrap();
+        assert_eq!(mapped.len(), 81920);
+        let slice = unsafe { std::slice::from_raw_parts(mapped.ptr().as_ptr(), mapped.len()) };
+        assert_eq!(&slice[..128], &bytes[4096..4096 + 128]);
+        assert_eq!(&slice[mapped.len() - 128..], &bytes[4096 + 81920 - 128..4096 + 81920]);
     }
 }

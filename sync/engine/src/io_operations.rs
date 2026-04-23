@@ -27,6 +27,7 @@ impl IoOperations for Arc<dyn turso_core::IO> {
         let opts = DatabaseTapeOpts {
             cdc_table: None,
             cdc_mode: Some(if capture { "full" } else { "off" }.to_string()),
+            disable_auto_checkpoint: false,
         };
         tracing::debug!("initialize database tape connection: path={}", path);
         Ok(DatabaseTape::new_with_opts(clean, opts))

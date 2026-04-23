@@ -1,0 +1,130 @@
+name: Publish Turso CLI to npm
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Git tag to publish (e.g. v1.2.3 or v1.2.3-rc.1)
+        required: true
+        type: string
+  workflow_run:
+    workflows: ["Release"]
+    types: [completed]
+
+jobs:
+  publish:
+    name: Publish CLI npm packages
+    if: ${{ github.event_name == 'workflow_dispatch' || (github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'push') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      actions: read
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve release tag
+        id: release-tag
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG=""
+
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            TAG="${{ inputs.tag }}"
+          else
+            TAG_FROM_RUN="${{ github.event.workflow_run.head_branch }}"
+
+            if echo "$TAG_FROM_RUN" | grep -qE '^v[0-9]+\.[0-9]+\.[0-9]+'; then
+              TAG="$TAG_FROM_RUN"
+            fi
+
+            if [ -z "$TAG" ]; then
+              TAG=$(gh api "repos/${{ github.repository }}/releases?per_page=100" \
+                --jq '.[] | select(.target_commitish == "${{ github.event.workflow_run.head_sha }}") | .tag_name' | head -n 1)
+            fi
+
+            if [ -z "$TAG" ]; then
+              echo "Unable to resolve release tag for workflow run ${{ github.event.workflow_run.id }} (sha=${{ github.event.workflow_run.head_sha }})"
+              exit 1
+            fi
+          fi
+
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+
+      - name: Setup node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          registry-url: https://registry.npmjs.org
+
+      - name: Update npm
+        run: npm install -g npm@11
+
+      - name: Download and extract release binaries
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="${{ steps.release-tag.outputs.tag }}"
+          TMPDIR=$(mktemp -d)
+
+          # Download all platform archives
+          gh release download "$TAG" \
+            --pattern "turso_cli-aarch64-apple-darwin.tar.xz" \
+            --pattern "turso_cli-x86_64-apple-darwin.tar.xz" \
+            --pattern "turso_cli-aarch64-unknown-linux-gnu.tar.xz" \
+            --pattern "turso_cli-x86_64-unknown-linux-gnu.tar.xz" \
+            --pattern "turso_cli-x86_64-pc-windows-msvc.zip" \
+            --dir "$TMPDIR"
+
+          # Extract each binary into the corresponding npm package directory
+          tar -xf "$TMPDIR/turso_cli-aarch64-apple-darwin.tar.xz" -C "$TMPDIR"
+          cp "$TMPDIR/turso_cli-aarch64-apple-darwin/tursodb" packages/turso-cli/npm/darwin-arm64/tursodb
+
+          tar -xf "$TMPDIR/turso_cli-x86_64-apple-darwin.tar.xz" -C "$TMPDIR"
+          cp "$TMPDIR/turso_cli-x86_64-apple-darwin/tursodb" packages/turso-cli/npm/darwin-x64/tursodb
+
+          tar -xf "$TMPDIR/turso_cli-aarch64-unknown-linux-gnu.tar.xz" -C "$TMPDIR"
+          cp "$TMPDIR/turso_cli-aarch64-unknown-linux-gnu/tursodb" packages/turso-cli/npm/linux-arm64-gnu/tursodb
+
+          tar -xf "$TMPDIR/turso_cli-x86_64-unknown-linux-gnu.tar.xz" -C "$TMPDIR"
+          cp "$TMPDIR/turso_cli-x86_64-unknown-linux-gnu/tursodb" packages/turso-cli/npm/linux-x64-gnu/tursodb
+
+          unzip -o "$TMPDIR/turso_cli-x86_64-pc-windows-msvc.zip" -d "$TMPDIR/turso_cli-x86_64-pc-windows-msvc"
+          cp "$TMPDIR/turso_cli-x86_64-pc-windows-msvc/tursodb.exe" packages/turso-cli/npm/win32-x64-msvc/tursodb.exe
+
+          # Set executable permissions
+          chmod +x packages/turso-cli/npm/darwin-arm64/tursodb
+          chmod +x packages/turso-cli/npm/darwin-x64/tursodb
+          chmod +x packages/turso-cli/npm/linux-arm64-gnu/tursodb
+          chmod +x packages/turso-cli/npm/linux-x64-gnu/tursodb
+
+      - name: Determine npm tag
+        id: npm-tag
+        run: |
+          TAG="${{ steps.release-tag.outputs.tag }}"
+          if echo "$TAG" | grep -qE '^v[0-9]+\.[0-9]+\.[0-9]+$'; then
+            echo "tag=latest" >> "$GITHUB_OUTPUT"
+          else
+            echo "tag=next" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Publish platform packages
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          for dir in \
+            ./packages/turso-cli/npm/darwin-arm64 \
+            ./packages/turso-cli/npm/darwin-x64 \
+            ./packages/turso-cli/npm/linux-arm64-gnu \
+            ./packages/turso-cli/npm/linux-x64-gnu \
+            ./packages/turso-cli/npm/win32-x64-msvc; do
+            npm publish "$dir" --access public --provenance --tag ${{ steps.npm-tag.outputs.tag }}
+          done
+
+      - name: Publish main turso package
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          npm publish ./packages/turso-cli --access public --provenance --tag ${{ steps.npm-tag.outputs.tag }}

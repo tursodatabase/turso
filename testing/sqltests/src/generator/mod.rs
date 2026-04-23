@@ -56,6 +56,8 @@ pub const INTEGRITY_FIXTURE_FREELIST_TRUNK_CORRUPT_REL_PATH: &str =
     "database/integrity_freelist_trunk_corrupt.db";
 pub const INTEGRITY_FIXTURE_OVERFLOW_LIST_LENGTH_MISMATCH_REL_PATH: &str =
     "database/integrity_overflow_list_length_mismatch.db";
+pub const INTEGRITY_FIXTURE_GENCOL_NOT_NULL_VIOLATION_REL_PATH: &str =
+    "database/integrity_gencol_not_null_violation.db";
 
 pub const INTEGRITY_FIXTURE_RELATIVE_PATHS: &[&str] = &[
     INTEGRITY_FIXTURE_MISSING_INDEX_ENTRY_REL_PATH,
@@ -69,6 +71,7 @@ pub const INTEGRITY_FIXTURE_RELATIVE_PATHS: &[&str] = &[
     INTEGRITY_FIXTURE_FREELIST_COUNT_MISMATCH_REL_PATH,
     INTEGRITY_FIXTURE_FREELIST_TRUNK_CORRUPT_REL_PATH,
     INTEGRITY_FIXTURE_OVERFLOW_LIST_LENGTH_MISMATCH_REL_PATH,
+    INTEGRITY_FIXTURE_GENCOL_NOT_NULL_VIOLATION_REL_PATH,
 ];
 
 /// A fake user record
@@ -838,6 +841,116 @@ async fn generate_not_null_violation_fixture(db_path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Generate a fixture where a virtual generated NOT NULL column evaluates to NULL
+/// because its base column has been patched to NULL.
+///
+/// ```text
+/// CREATE TABLE t(a INTEGER, b GENERATED ALWAYS AS (a*2) VIRTUAL NOT NULL);
+/// INSERT INTO t(a) VALUES(0); -- a is then made NULL
+/// ```
+async fn generate_gencol_not_null_violation_fixture(db_path: &Path) -> Result<()> {
+    clear_existing_db_and_sidecars(db_path)?;
+
+    let db_path_str = db_path.to_string_lossy().to_string();
+    let db = Builder::new_local(&db_path_str)
+        .experimental_generated_columns(true)
+        .build()
+        .await
+        .with_context(|| {
+            format!(
+                "failed to create integrity fixture database at '{}'",
+                db_path.display()
+            )
+        })?;
+    let conn = db
+        .connect()
+        .with_context(|| format!("failed to connect to fixture '{}'", db_path.display()))?;
+
+    conn.execute_batch(
+        r#"
+        PRAGMA page_size=4096;
+        CREATE TABLE t(a INTEGER, b GENERATED ALWAYS AS (a*2) VIRTUAL NOT NULL);
+        INSERT INTO t(a) VALUES(0);
+        "#,
+    )
+    .await
+    .with_context(|| {
+        format!(
+            "failed to initialize fixture '{INTEGRITY_FIXTURE_GENCOL_NOT_NULL_VIOLATION_REL_PATH}'"
+        )
+    })?;
+    checkpoint_truncate(&conn, INTEGRITY_FIXTURE_GENCOL_NOT_NULL_VIOLATION_REL_PATH).await?;
+    let page_size =
+        get_page_size(&conn, INTEGRITY_FIXTURE_GENCOL_NOT_NULL_VIOLATION_REL_PATH).await?;
+    let table_root_page = get_root_page(
+        &conn,
+        "t",
+        INTEGRITY_FIXTURE_GENCOL_NOT_NULL_VIOLATION_REL_PATH,
+    )
+    .await?;
+
+    drop(conn);
+    drop(db);
+    patch_set_first_table_column_to_null_in_first_row(db_path, page_size, table_root_page)?;
+    remove_db_sidecars(db_path)?;
+    Ok(())
+}
+
+/// Patch the first column of the first row in the table to NULL.
+/// Expects the column to have serial type 8 (integer zero, 0 body bytes).
+fn patch_set_first_table_column_to_null_in_first_row(
+    db_path: &Path,
+    page_size: usize,
+    root_page: usize,
+) -> Result<()> {
+    let mut bytes = std::fs::read(db_path)
+        .with_context(|| format!("failed to read fixture '{}'", db_path.display()))?;
+    let page_start = (root_page - 1) * page_size;
+    anyhow::ensure!(
+        bytes.len() > page_start + 8,
+        "fixture too small to patch page {root_page}"
+    );
+
+    let cell_count = u16::from_be_bytes([bytes[page_start + 3], bytes[page_start + 4]]) as usize;
+    anyhow::ensure!(
+        cell_count >= 1,
+        "cannot patch table row on page {root_page}: no cells"
+    );
+
+    let ptr_array_start = page_start + 8;
+    let first_cell_ptr =
+        u16::from_be_bytes([bytes[ptr_array_start], bytes[ptr_array_start + 1]]) as usize;
+    let cell_start = page_start + first_cell_ptr;
+    anyhow::ensure!(
+        cell_start < bytes.len(),
+        "cell pointer out of bounds on page {root_page}"
+    );
+
+    let (_, payload_varint_len) = parse_sqlite_varint(&bytes, cell_start)?;
+    let (_, rowid_varint_len) = parse_sqlite_varint(&bytes, cell_start + payload_varint_len)?;
+    let payload_start = cell_start + payload_varint_len + rowid_varint_len;
+    anyhow::ensure!(
+        payload_start < bytes.len(),
+        "payload start out of bounds on page {root_page}"
+    );
+
+    let (_, header_size_varint_len) = parse_sqlite_varint(&bytes, payload_start)?;
+    let first_serial_offset = payload_start + header_size_varint_len;
+
+    // a=0 has serial type 8 (integer zero, 0 body bytes).
+    // Replacing with 0 (NULL, also 0 body bytes) is a clean swap.
+    anyhow::ensure!(
+        bytes[first_serial_offset] == 8,
+        "unexpected serial type {} for fixture row (expected 8 = integer zero)",
+        bytes[first_serial_offset]
+    );
+    bytes[first_serial_offset] = 0;
+
+    std::fs::write(db_path, bytes)
+        .with_context(|| format!("failed to write fixture '{}'", db_path.display()))?;
+    Ok(())
+}
+
 async fn generate_non_unique_index_entry_fixture(db_path: &Path) -> Result<()> {
     clear_existing_db_and_sidecars(db_path)?;
 
@@ -1146,6 +1259,9 @@ pub async fn generate_integrity_fixture(db_path: &Path, relative_path: &str) -> 
         }
         INTEGRITY_FIXTURE_OVERFLOW_LIST_LENGTH_MISMATCH_REL_PATH => {
             generate_overflow_list_length_mismatch_fixture(db_path).await
+        }
+        INTEGRITY_FIXTURE_GENCOL_NOT_NULL_VIOLATION_REL_PATH => {
+            generate_gencol_not_null_violation_fixture(db_path).await
         }
         _ => anyhow::bail!("unknown integrity fixture path '{relative_path}'"),
     }
