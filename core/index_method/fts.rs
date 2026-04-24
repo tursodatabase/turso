@@ -1128,7 +1128,8 @@ impl Directory for HybridBTreeDirectory {
     fn open_write(
         &self,
         path: &Path,
-    ) -> std::result::Result<BufWriter<Box<dyn TerminatingWrite>>, OpenWriteError> {
+    ) -> std::result::Result<BufWriter<Box<dyn TerminatingWrite + Send + Sync>>, OpenWriteError>
+    {
         // Tantivy's Directory trait documentation states files "may not previously exist",
         // and the standard MmapDirectory implementation uses OpenOptions::create_new(true)
         // which fails with FileAlreadyExists if the file is present.
@@ -1146,7 +1147,7 @@ impl Directory for HybridBTreeDirectory {
         if path != Path::new(TANTIVY_META_LOCK_FILE) {
             let _ = self.delete(path);
         }
-        let writer: Box<dyn TerminatingWrite> = Box::new(HybridWriter {
+        let writer: Box<dyn TerminatingWrite + Send + Sync> = Box::new(HybridWriter {
             path: path.to_path_buf(),
             buffer: Vec::new(),
             directory: self.clone(),
@@ -3168,7 +3169,10 @@ impl IndexMethodCursor for FtsCursor {
         };
 
         let top_docs = searcher
-            .search(&query, &tantivy::collector::TopDocs::with_limit(limit))
+            .search(
+                &query,
+                &tantivy::collector::TopDocs::with_limit(limit).order_by_score(),
+            )
             .map_err(|e| LimboError::InternalError(format!("FTS search error: {e}")))?;
 
         self.current_hits.clear();

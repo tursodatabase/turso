@@ -13,9 +13,10 @@ description = "Turso Rust API"
 workspace = true
 
 [features]
-default = ["mimalloc"]
+default = ["mimalloc", "fts"]
 mimalloc = ["dep:mimalloc"]
 pure-rust-crypto = ["turso_sdk_kit/pure-rust-crypto", "turso_sync_sdk_kit/pure-rust-crypto"]
+fts = ["turso_sdk_kit/fts"]
 sync = [
     "dep:hyper",
     "dep:tokio",
