@@ -1484,7 +1484,7 @@ pub fn emit_cdc_autocommit_commit(
 
         emit_cdc_commit_insns(program, resolver, cdc_cursor_id)?;
 
-        program.resolve_label(skip_label, program.offset());
+        program.preassign_label_to_next_insn(skip_label);
     }
 
     Ok(())

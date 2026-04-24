@@ -413,7 +413,7 @@ impl EmitOrderBy {
                             &type_def,
                             &t_ctx.resolver,
                         )?;
-                        program.resolve_label(skip_label, program.offset());
+                        program.preassign_label_to_next_insn(skip_label);
                     }
                 }
             }
@@ -440,7 +440,7 @@ impl EmitOrderBy {
             },
         )?;
 
-        program.resolve_label(sort_loop_next_label, program.offset());
+        program.preassign_label_to_next_insn(sort_loop_next_label);
         if !use_heap_sort {
             program.emit_insn(Insn::SorterNext {
                 cursor_id: sort_cursor,

@@ -39,7 +39,7 @@ impl TableRefIdCounter {
 }
 
 use super::{
-    affinity::Affinity, BranchOffset, CursorID, Insn, InsnReference, JumpTarget, PrepareContext,
+    affinity::Affinity, BranchOffset, CursorID, Insn, InsnReference, PrepareContext,
     PreparedProgram, Program,
 };
 use crate::translate::plan::BitSet;
@@ -200,7 +200,11 @@ pub struct ProgramBuilder {
     /// again. Hence, the key is optional.
     pub cursor_ref: Vec<(Option<CursorKey>, CursorType)>,
     /// A vector where index=label number, value=resolved offset. Resolved in build().
-    label_to_resolved_offset: Vec<Option<(InsnReference, JumpTarget)>>,
+    /// For each allocated label, the offset of the instruction emitted *just
+    /// before* the label's logical "next-insn" anchor. The label resolves to
+    /// `anchor_offset + 1` so it tracks whichever instruction ends up at that
+    /// position, even after `emit_constant_insns` reorders the program.
+    label_to_resolved_offset: Vec<Option<InsnReference>>,
     // map of instruction index to manual comment (used in EXPLAIN only)
     comments: Vec<(InsnReference, &'static str)>,
     pub parameters: Parameters,
@@ -1165,8 +1169,8 @@ impl ProgramBuilder {
         }
 
         for resolved_offset in self.label_to_resolved_offset.iter_mut() {
-            if let Some((old_offset, target)) = resolved_offset {
-                *resolved_offset = Some((old_to_new[*old_offset as usize] as u32, *target));
+            if let Some(old_offset) = resolved_offset {
+                *resolved_offset = Some(old_to_new[*old_offset as usize] as u32);
             }
         }
 
@@ -1218,29 +1222,35 @@ impl ProgramBuilder {
     /// reordering the emitted instructions.
     #[inline]
     pub fn preassign_label_to_next_insn(&mut self, label: BranchOffset) {
-        turso_assert!(label.is_label(), "BranchOffset should be a label", { "label": label });
-        self._resolve_label(label, self.offset().sub(1u32), JumpTarget::AfterThisInsn);
-    }
-
-    /// Resolve a label to exactly the instruction that was last emitted.
-    ///
-    /// Use this when your use case is: "the program should jump to the exact instruction
-    /// that was last emitted", and you don't care WHERE exactly that ends up being
-    /// once the order of the bytecode of the program is finalized. Examples include
-    /// "jump to the Halt instruction", or "jump to the Next instruction of a loop".
-    #[inline]
-    pub fn resolve_label(&mut self, label: BranchOffset, to_offset: BranchOffset) {
-        self._resolve_label(label, to_offset, JumpTarget::ExactlyThisInsn);
-    }
-
-    fn _resolve_label(&mut self, label: BranchOffset, to_offset: BranchOffset, target: JumpTarget) {
-        turso_assert!(matches!(label, BranchOffset::Label(_)));
-        turso_assert!(matches!(to_offset, BranchOffset::Offset(_)));
         let BranchOffset::Label(label_number) = label else {
-            unreachable!("Label is not a label");
+            unreachable!("preassign_label_to_next_insn requires a Label, got {label:?}");
         };
-        self.label_to_resolved_offset[label_number as usize] =
-            Some((to_offset.as_offset_int(), target));
+        let anchor = self.offset().as_offset_int().saturating_sub(1);
+        self.label_to_resolved_offset[label_number as usize] = Some(anchor);
+    }
+
+    /// Resolve `dest` so that it ends up pointing at the same final offset as
+    /// `anchor`. `anchor` must already be preassigned. Use when several labels
+    /// have to target the same logical program point but the point was
+    /// anchored earlier (or in a different function) and
+    /// `preassign_label_to_next_insn` cannot be called again at that moment.
+    ///
+    /// Using this helper (instead of capturing a raw `BranchOffset::Offset`
+    /// from `program.offset()` and passing it to multiple resolutions) keeps
+    /// all the linked labels correctly remapped when `emit_constant_insns`
+    /// hoists compile-time constants — raw offsets don't get remapped, but
+    /// label resolutions do.
+    #[inline]
+    pub fn link_label_to_other_label(&mut self, dest: BranchOffset, anchor: BranchOffset) {
+        let BranchOffset::Label(dest_n) = dest else {
+            unreachable!("link_label_to_other_label dest must be a Label, got {dest:?}");
+        };
+        let BranchOffset::Label(anchor_n) = anchor else {
+            unreachable!("link_label_to_other_label anchor must be a Label, got {anchor:?}");
+        };
+        let resolution = self.label_to_resolved_offset[anchor_n as usize]
+            .expect("anchor label must already be preassigned/resolved");
+        self.label_to_resolved_offset[dest_n as usize] = Some(resolution);
     }
 
     /// Resolve unresolved labels to a specific offset in the instruction list.
@@ -1251,21 +1261,12 @@ impl ProgramBuilder {
     pub fn resolve_labels(&mut self) -> crate::Result<()> {
         let resolve = |pc: &mut BranchOffset, insn_name: &str| -> crate::Result<()> {
             if let BranchOffset::Label(label) = pc {
-                let Some(Some((to_offset, target))) =
-                    self.label_to_resolved_offset.get(*label as usize)
-                else {
+                let Some(Some(anchor)) = self.label_to_resolved_offset.get(*label as usize) else {
                     crate::bail_corrupt_error!(
                         "Reference to undefined or unresolved label in {insn_name}: {label}"
                     );
                 };
-                *pc = BranchOffset::Offset(
-                    to_offset
-                        + if *target == JumpTarget::ExactlyThisInsn {
-                            0
-                        } else {
-                            1
-                        },
-                );
+                *pc = BranchOffset::Offset(anchor + 1);
             }
             Ok(())
         };

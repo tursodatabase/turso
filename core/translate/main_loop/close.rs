@@ -55,15 +55,14 @@ impl CloseLoop {
 
             let (table_cursor_id, index_cursor_id) =
                 table.resolve_cursors(program, mode.clone())?;
-            // Track the "next iteration" offset for semi/anti-join label resolution.
-            // For most operations this equals the loop_labels.next resolution offset;
-            // HashJoin overrides it to point at the Gosub Return or HashNext instead.
-            let mut semi_anti_next_pc = None;
-            // Helper: resolve loop_labels.next and record its offset for semi/anti-join.
+            // Track the "next iteration" anchor label for semi/anti-join label resolution.
+            // For most operations this is loop_labels.next itself;
+            // HashJoin overrides it to anchor at the Gosub Return or HashNext instead.
+            let mut semi_anti_next_anchor: Option<BranchOffset> = None;
+            // Helper: preassign loop_labels.next and record it as the semi/anti anchor.
             let mut resolve_next = |program: &mut ProgramBuilder| {
-                let pc = program.offset();
-                program.resolve_label(loop_labels.next, pc);
-                semi_anti_next_pc = Some(pc);
+                program.preassign_label_to_next_insn(loop_labels.next);
+                semi_anti_next_anchor = Some(loop_labels.next);
             };
             match &table.op {
                 Operation::Scan(scan) => {
@@ -215,7 +214,7 @@ impl CloseLoop {
 
                             // Once the current key is exhausted (or a seek found nothing),
                             // advance the outer ephemeral cursor and restart the equality seek.
-                            program.resolve_label(next_val_label, program.offset());
+                            program.preassign_label_to_next_insn(next_val_label);
                             program.emit_insn(Insn::Next {
                                 cursor_id: ephemeral_cursor_id,
                                 pc_if_next: outer_loop_start,
@@ -239,7 +238,7 @@ impl CloseLoop {
                         .cloned()
                     {
                         // Emit the close-loop teardown for a hash-join probe table.
-                        semi_anti_next_pc = HashProbeCloseEmitter::new(
+                        semi_anti_next_anchor = HashProbeCloseEmitter::new(
                             program,
                             t_ctx,
                             hash_join_op,
@@ -248,11 +247,11 @@ impl CloseLoop {
                             table_index,
                         )
                         .emit()?
-                        .semi_anti_next_pc;
+                        .semi_anti_next_anchor;
                     }
 
                     // Advance probe cursor.
-                    program.resolve_label(loop_labels.next, program.offset());
+                    program.preassign_label_to_next_insn(loop_labels.next);
                     let probe_cursor_id = table_cursor_id.expect("Probe table must have a cursor");
                     program.emit_insn(Insn::Next {
                         cursor_id: probe_cursor_id,
@@ -319,10 +318,10 @@ impl CloseLoop {
             }
 
             // Resolve any semi/anti-join "outer next" labels targeting this table.
-            if let Some(pc) = semi_anti_next_pc {
+            if let Some(anchor) = semi_anti_next_anchor {
                 for meta in t_ctx.meta_semi_anti_joins.iter().flatten() {
                     if meta.outer_table_idx == table_index {
-                        program.resolve_label(meta.label_next_outer, pc);
+                        program.link_label_to_other_label(meta.label_next_outer, anchor);
                     }
                 }
             }
@@ -365,7 +364,7 @@ impl CloseLoop {
                     // (e.g. SELECT * FROM t1 LEFT JOIN t2 ON t1.a = t2.a).
                     // If the left join match flag has been set to 1, we jump to the next row on the outer table,
                     // i.e. continue to the next row of t1 in our example.
-                    program.resolve_label(lj_meta.label_match_flag_check_value, program.offset());
+                    program.preassign_label_to_next_insn(lj_meta.label_match_flag_check_value);
                     let label_when_right_table_notnull = program.allocate_label();
                     program.emit_insn(Insn::IfPos {
                         reg: lj_meta.reg_match_flag,

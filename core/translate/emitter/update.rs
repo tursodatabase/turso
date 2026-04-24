@@ -2154,7 +2154,7 @@ fn emit_update_insns<'a>(
         });
 
         if let Some(label) = skip_delete_label {
-            program.resolve_label(label, program.offset());
+            program.preassign_label_to_next_insn(label);
         }
     }
 
@@ -2180,7 +2180,7 @@ fn emit_update_insns<'a>(
         });
 
         if let Some(label) = skip_insert_label {
-            program.resolve_label(label, program.offset());
+            program.preassign_label_to_next_insn(label);
         }
     }
 

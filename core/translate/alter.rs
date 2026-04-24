@@ -240,7 +240,7 @@ fn emit_rename_sqlite_sequence_entry(
             table_name: crate::schema::SQLITE_SEQUENCE_TABLE_NAME.to_string(),
         });
 
-        program.resolve_label(continue_loop_label, program.offset());
+        program.preassign_label_to_next_insn(continue_loop_label);
     });
 }
 
@@ -376,7 +376,7 @@ fn emit_add_column_default_type_validation(
         description_reg: None,
     });
 
-    program.resolve_label(skip_check_label, program.offset());
+    program.preassign_label_to_next_insn(skip_check_label);
     Ok(())
 }
 
@@ -514,7 +514,7 @@ fn emit_add_virtual_column_validation(
             on_error: None,
             description_reg: None,
         });
-        program.resolve_label(notnull_passed, program.offset());
+        program.preassign_label_to_next_insn(notnull_passed);
     }
 
     program.emit_insn(Insn::Next {
@@ -522,7 +522,7 @@ fn emit_add_virtual_column_validation(
         pc_if_next: loop_start,
     });
 
-    program.resolve_label(skip_label, program.offset());
+    program.preassign_label_to_next_insn(skip_label);
     Ok(())
 }
 
@@ -661,7 +661,7 @@ fn emit_add_column_check_validation(
         program.preassign_label_to_next_insn(check_passed_label);
     }
 
-    program.resolve_label(skip_check_label, program.offset());
+    program.preassign_label_to_next_insn(skip_check_label);
     Ok(())
 }
 
@@ -1312,7 +1312,7 @@ pub fn translate_alter_table(
                         description_reg: None,
                     });
 
-                    program.resolve_label(skip_error_label, program.offset());
+                    program.preassign_label_to_next_insn(skip_error_label);
                 }
 
                 if default_type_mismatch {

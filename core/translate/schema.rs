@@ -1241,7 +1241,7 @@ pub fn translate_create_table(
         value: 1,
         p5: 0,
     });
-    program.resolve_label(create_btree_label, program.offset());
+    program.preassign_label_to_next_insn(create_btree_label);
 
     let created_sequence_table = if has_autoincrement
         && resolver.with_schema(database_id, |s| {
@@ -1381,7 +1381,7 @@ pub fn translate_create_table(
         }
     }
 
-    program.resolve_label(parse_schema_label, program.offset());
+    program.preassign_label_to_next_insn(parse_schema_label);
     let schema_version = resolver.with_schema(database_id, |s| s.schema_version);
     program.emit_insn(Insn::SetCookie {
         db: database_id,
@@ -1883,7 +1883,7 @@ pub fn translate_drop_table(
             None,
             SQLITE_TABLEID,
         )?;
-        program.resolve_label(skip_cdc_label, program.offset());
+        program.preassign_label_to_next_insn(skip_cdc_label);
     }
     program.emit_insn(Insn::Delete {
         cursor_id: sqlite_schema_cursor_id_0,
@@ -1891,7 +1891,7 @@ pub fn translate_drop_table(
         is_part_of_update: false,
     });
 
-    program.resolve_label(next_label, program.offset());
+    program.preassign_label_to_next_insn(next_label);
     program.emit_insn(Insn::Next {
         cursor_id: sqlite_schema_cursor_id_0,
         pc_if_next: metadata_loop,
@@ -1994,13 +1994,13 @@ pub fn translate_drop_table(
                 program.emit_insn(Insn::Goto {
                     target_pc: temp_next_label,
                 });
-                program.resolve_label(temp_delete_label, program.offset());
+                program.preassign_label_to_next_insn(temp_delete_label);
                 program.emit_insn(Insn::Delete {
                     cursor_id: temp_cursor,
                     table_name: SQLITE_TABLEID.to_string(),
                     is_part_of_update: false,
                 });
-                program.resolve_label(temp_next_label, program.offset());
+                program.preassign_label_to_next_insn(temp_next_label);
                 program.emit_insn(Insn::Next {
                     cursor_id: temp_cursor,
                     pc_if_next: temp_loop_label,
@@ -2153,7 +2153,7 @@ pub fn translate_drop_table(
             table_name: "scratch_table".to_string(),
         });
 
-        program.resolve_label(next_label, program.offset());
+        program.preassign_label_to_next_insn(next_label);
         program.emit_insn(Insn::Next {
             cursor_id: sqlite_schema_cursor_id_1,
             pc_if_next: copy_schema_to_temp_table_loop,
@@ -2161,7 +2161,7 @@ pub fn translate_drop_table(
         program.preassign_label_to_next_insn(copy_schema_to_temp_table_loop_end_label);
         // End loop to copy over row id's from the schema table for rows that have the same root page as the one that was moved
 
-        program.resolve_label(if_not_label, program.offset());
+        program.preassign_label_to_next_insn(if_not_label);
 
         // 5. Open a write cursor to the schema table and re-insert the records placed in the ephemeral table but insert the correct root page now
         program.emit_insn(Insn::OpenWrite {
@@ -2219,7 +2219,7 @@ pub fn translate_drop_table(
             table_name: SQLITE_TABLEID.to_string(),
         });
 
-        program.resolve_label(next_label, program.offset());
+        program.preassign_label_to_next_insn(next_label);
         program.emit_insn(Insn::Next {
             cursor_id: ephemeral_cursor_id,
             pc_if_next: copy_temp_table_to_schema_loop,
@@ -2273,7 +2273,7 @@ pub fn translate_drop_table(
             is_part_of_update: false,
         });
 
-        program.resolve_label(continue_loop_label, program.offset());
+        program.preassign_label_to_next_insn(continue_loop_label);
         program.emit_insn(Insn::Next {
             cursor_id: seq_cursor_id,
             pc_if_next: loop_start_label,
@@ -2327,7 +2327,7 @@ pub fn translate_drop_table(
             is_part_of_update: false,
         });
 
-        program.resolve_label(continue_ver_label, program.offset());
+        program.preassign_label_to_next_insn(continue_ver_label);
         program.emit_insn(Insn::Next {
             cursor_id: ver_cursor_id,
             pc_if_next: ver_loop_start_label,
@@ -2850,7 +2850,7 @@ pub fn translate_drop_type(
         is_part_of_update: false,
     });
 
-    program.resolve_label(skip_delete_label, program.offset());
+    program.preassign_label_to_next_insn(skip_delete_label);
 
     program.emit_insn(Insn::Next {
         cursor_id: types_cursor_id,

@@ -171,7 +171,7 @@ pub fn emit_ungrouped_aggregation<'a>(
         program.preassign_label_to_next_insn(distinct_ctx.label_on_conflict);
     }
 
-    program.resolve_label(end_label, program.offset());
+    program.preassign_label_to_next_insn(end_label);
 
     Ok(())
 }

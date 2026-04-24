@@ -88,7 +88,7 @@ fn encode_seek_keys_for_custom_types(
             type_def,
             resolver,
         )?;
-        program.resolve_label(skip_label, program.offset());
+        program.preassign_label_to_next_insn(skip_label);
     }
     Ok(())
 }
