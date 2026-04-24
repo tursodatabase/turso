@@ -2686,14 +2686,17 @@ mod tests {
     }
 
     #[test]
-    fn vacuum_copy_batch_end_accepts_u32_max_minus_one_total_pages() {
-        assert_eq!(vacuum_copy_batch_end(u32::MAX - 1, u32::MAX - 1), u32::MAX);
+    fn next_vacuum_copy_batch_start_accepts_u32_max_minus_one_total_pages() {
+        assert_eq!(
+            next_vacuum_copy_batch_start(u32::MAX - 1, u32::MAX - 1),
+            u32::MAX
+        );
     }
 
     #[test]
     #[should_panic(expected = "vacuum copy batch requires a representable exclusive end page")]
-    fn vacuum_copy_batch_end_panics_when_total_pages_is_u32_max() {
-        let _ = vacuum_copy_batch_end(1, u32::MAX);
+    fn next_vacuum_copy_batch_start_panics_when_total_pages_is_u32_max() {
+        let _ = next_vacuum_copy_batch_start(1, u32::MAX);
     }
 
     #[test]

@@ -2,7 +2,7 @@
 
 use std::path::Path;
 use std::sync::Arc;
-use turso_core::{Connection, Database, DatabaseOpts, IO, LimboError, OpenFlags};
+use turso_core::{Connection, Database, DatabaseOpts, LimboError, OpenFlags, IO};
 use turso_whopper::multiprocess::{MultiprocessOpts, MultiprocessWhopper};
 use turso_whopper::{
     multiprocess_platform_io,
@@ -236,6 +236,9 @@ fn truncate_checkpoint_until_stable(whopper: &mut MultiprocessWhopper, connectio
 #[cfg(all(unix, target_pointer_width = "64"))]
 fn is_multiprocess_vacuum_rejection(err: &LimboError) -> bool {
     match err {
+        LimboError::ParseError(msg) => {
+            msg.contains("VACUUM is incompatible with experimental multiprocess WAL")
+        }
         LimboError::TxError(msg) | LimboError::InternalError(msg) => {
             msg.contains("cannot VACUUM experimental multiprocess WAL databases")
         }
@@ -1218,8 +1221,8 @@ fn multiprocess_restart_rebuilds_from_disk_after_partial_checkpoint_proof_is_cle
 
 #[cfg(all(any(unix, target_os = "windows"), target_pointer_width = "64"))]
 #[test]
-fn multiprocess_restart_rebuilds_from_disk_after_db_header_mismatch_invalidates_partial_checkpoint_proof()
- {
+fn multiprocess_restart_rebuilds_from_disk_after_db_header_mismatch_invalidates_partial_checkpoint_proof(
+) {
     let mut whopper = create_multiprocess_whopper(1);
     create_partial_checkpoint_state(&mut whopper);
 

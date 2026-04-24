@@ -557,7 +557,6 @@ impl ActiveOpStateSlot {
             _ => None,
         }
     }
-
 }
 
 #[derive(Debug, Clone)]
@@ -2759,20 +2758,6 @@ mod tests {
         ));
         assert!(matches!(state.seek_state, OpSeekState::MoveLast));
     }
-}
-
-/// Shuttle tests for validating the `unsafe impl Send + Sync for ProgramState` safety claims.
-///
-/// The safety claims are:
-/// 1. `Row` contains a `*const Register` pointing into `ProgramState.registers`
-/// 2. Only immutable references (`&Row`) are given out via `result_row.as_ref()`
-/// 3. `result_row` is invalidated (via `.take()`) at the start of each step iteration
-///
-/// These tests verify that the implementation correctly upholds these invariants
-/// under concurrent access patterns.
-#[cfg(test)]
-mod tests {
-    use super::*;
 
     #[test]
     fn program_state_reset_clears_in_place_vacuum_state() {
@@ -2790,6 +2775,15 @@ mod tests {
     }
 }
 
+/// Shuttle tests for validating the `unsafe impl Send + Sync for ProgramState` safety claims.
+///
+/// The safety claims are:
+/// 1. `Row` contains a `*const Register` pointing into `ProgramState.registers`
+/// 2. Only immutable references (`&Row`) are given out via `result_row.as_ref()`
+/// 3. `result_row` is invalidated (via `.take()`) at the start of each step iteration
+///
+/// These tests verify that the implementation correctly upholds these invariants
+/// under concurrent access patterns.
 #[cfg(all(shuttle, test))]
 mod shuttle_tests {
     use super::*;

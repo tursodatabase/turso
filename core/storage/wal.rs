@@ -2514,7 +2514,6 @@ pub struct WalFile {
 
     syncing: Arc<AtomicBool>,
     write_lock_held: AtomicBool,
-    vacuum_lock_guard: RwLock<Option<VacuumLockGuard>>,
 
     ongoing_checkpoint: RwLock<OngoingCheckpoint>,
     checkpoint_threshold: usize,
