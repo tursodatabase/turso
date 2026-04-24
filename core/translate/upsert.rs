@@ -1143,6 +1143,7 @@ pub fn emit_upsert(
                 new_rowid_reg.unwrap_or(ctx.conflict_rowid_reg), // new_rowid_reg
                 connection,
                 upsert_database_id,
+                &updated_positions,
             )?;
         }
     }

@@ -3188,3 +3188,53 @@ test fk-alter-table-add-column-rejects-missing {
 }
 expect error {
 }
+
+# Regression: self-referential FK ON UPDATE CASCADE used to blow the host
+# stack at translate-time. Emitting the cascade UPDATE on the child (same
+# table) recursively entered FK emission again for the same table, without
+# checking whether the cascade's SET list touched the parent key. Even the
+# minimal single-row no-child case crashed.
+@cross-check-integrity
+test fk-self-referential-cascade-on-update-single-row {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE t(id INTEGER PRIMARY KEY, pid INTEGER REFERENCES t(id) ON UPDATE CASCADE);
+    INSERT INTO t VALUES(1, NULL);
+    UPDATE t SET id = 100 WHERE id = 1;
+    SELECT * FROM t;
+}
+expect {
+    100|
+}
+
+# Self-referential cascade with real child references: both child rows
+# should follow the parent key mutation.
+@cross-check-integrity
+test fk-self-referential-cascade-on-update-with-children {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE t(id INTEGER PRIMARY KEY, pid INTEGER REFERENCES t(id) ON UPDATE CASCADE);
+    INSERT INTO t VALUES(1, NULL),(2, 1),(3, 1);
+    UPDATE t SET id = 100 WHERE id = 1;
+    SELECT * FROM t ORDER BY id;
+}
+expect {
+    2|100
+    3|100
+    100|
+}
+
+# Updating a non-referenced column on a self-FK table must not emit any
+# cascade and must not trip the compile-time recursion either. Children
+# retain their pid values since the referenced parent key didn't change.
+@cross-check-integrity
+test fk-self-referential-update-non-referenced-column {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE t(id INTEGER PRIMARY KEY, pid INTEGER REFERENCES t(id) ON UPDATE CASCADE, extra TEXT);
+    INSERT INTO t VALUES(1, NULL, 'a'),(2, 1, 'b'),(3, 1, 'c');
+    UPDATE t SET extra = 'zzz' WHERE id = 1;
+    SELECT * FROM t ORDER BY id;
+}
+expect {
+    1||zzz
+    2|1|b
+    3|1|c
+}

@@ -2297,6 +2297,7 @@ fn emit_update_insns<'a>(
                     new_rowid_reg,
                     connection,
                     update_database_id,
+                    &updated_column_indices,
                 )?;
             }
 
