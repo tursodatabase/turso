@@ -339,7 +339,7 @@ fn build_covered_columns_mapping(
 /// Sort parameters by key and extract just the expressions as a Vec.
 fn sorted_arguments_from_parameters(parameters: &HashMap<i32, ast::Expr>) -> Vec<ast::Expr> {
     let mut arguments: Vec<_> = parameters.iter().collect();
-    arguments.sort_by_key(|(&i, _)| i);
+    arguments.sort_unstable_by_key(|(&i, _)| i);
     arguments.iter().map(|(_, e)| (*e).clone()).collect()
 }
 
@@ -2067,7 +2067,7 @@ fn optimize_table_access(
                         })
                         .collect();
 
-                    temp_constraint_refs.sort_by_key(|x| x.index_col_pos);
+                    temp_constraint_refs.sort_unstable_by_key(|x| x.index_col_pos);
                     let usable_constraint_refs = usable_constraints_for_join_order(
                         &table_constraints.constraints,
                         &temp_constraint_refs,

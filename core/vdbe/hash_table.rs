@@ -1708,7 +1708,7 @@ impl HashTable {
             .filter(|(_, p)| !p.is_empty())
             .map(|(idx, p)| (idx, p.mem_used))
             .collect();
-        candidates.sort_by(|a, b| b.1.cmp(&a.1)); // Sort descending by mem_used
+        candidates.sort_unstable_by(|a, b| b.1.cmp(&a.1)); // Sort descending by mem_used
 
         for (partition_idx, mem_used) in candidates {
             if projected_mem_used + entry_size <= self.mem_budget {
