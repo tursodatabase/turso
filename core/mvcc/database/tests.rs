@@ -8103,6 +8103,27 @@ fn test_committed_update_version_conflict() {
     );
 }
 
+#[test]
+fn test_read_lock_leak_deferred_then_concurrent() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let conn0 = db.connect();
+    conn0
+        .execute("CREATE TABLE t1(id INTEGER PRIMARY KEY, val TEXT)")
+        .unwrap();
+    conn0.execute("INSERT INTO t1 VALUES(1, 'v1')").unwrap();
+    conn0.close().unwrap();
+
+    let conn1 = db.connect();
+    conn1.execute("BEGIN DEFERRED").unwrap();
+    // BEGIN CONCURRENT after BEGIN DEFERRED should error but not leak state
+    let result = conn1.execute("BEGIN CONCURRENT");
+    assert!(result.is_err());
+
+    // After the error, SELECT should work without panicking
+    let rows = get_rows(&conn1, "SELECT * FROM t1");
+    assert_eq!(rows.len(), 1);
+  }
+
 /// Encrypted MVCC: write rows, restart with same key, verify recovery replays them.
 /// Then swap to a wrong key and verify that restart fails.
 #[test]
