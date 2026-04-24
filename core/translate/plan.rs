@@ -860,7 +860,8 @@ pub struct UpdatePlan {
 impl UpdatePlan {
     /// Combine the UPDATE target (always first) and the `FROM`-clause tables
     /// into one `TableReferences` — the read-side scope used for planning
-    /// outer-`WHERE` subqueries, `EXPLAIN QUERY PLAN`, and SQL serialization.
+    /// outer-`WHERE` subqueries, `EXPLAIN QUERY PLAN`, and rendering the plan
+    /// back to SQL text via `ToTokens`.
     /// The plan stores the two separately because the write-side emitter
     /// treats the target table specially; this helper rejoins them for readers.
     pub fn build_read_scope_tables(&self) -> TableReferences {
