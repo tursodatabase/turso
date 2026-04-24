@@ -34,6 +34,7 @@
   },
   "scripts": {
     "build": "tsup",
+    "clean": "rm -rf dist",
     "dev": "tsup --watch",
     "test": "ava integration-tests/*.test.mjs"
   },
