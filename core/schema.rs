@@ -1070,6 +1070,9 @@ impl Schema {
         // Triggers have their own namespace and duplicate trigger names
         // are checked in `translate_create_trigger`
         let table_name = normalize_ident(table_name);
+        if self.get_table(&table_name).is_none() {
+            bail_parse_error!("no such table: {}", table_name);
+        }
 
         // See [Schema::add_index] for why we push to the front of the deque.
         self.triggers
@@ -5320,6 +5323,32 @@ mod tests {
         let expected = r#"CREATE TABLE sqlite_schema (type TEXT, name TEXT, tbl_name TEXT, rootpage INT, sql TEXT)"#;
         let actual = sqlite_schema_table().to_sql();
         assert_eq!(expected, actual);
+    }
+
+    #[test]
+    fn test_add_trigger_requires_existing_table() {
+        let mut schema = Schema::new();
+        let err = schema
+            .add_trigger(
+                Trigger::new(
+                    "missing_trigger".to_string(),
+                    "CREATE TRIGGER missing_trigger AFTER INSERT ON missing BEGIN SELECT 1; END"
+                        .to_string(),
+                    "missing".to_string(),
+                    Some(turso_parser::ast::TriggerTime::After),
+                    turso_parser::ast::TriggerEvent::Insert,
+                    false,
+                    None,
+                    Vec::new(),
+                    false,
+                ),
+                "missing",
+            )
+            .unwrap_err();
+        assert!(
+            matches!(err, LimboError::ParseError(msg) if msg == "no such table: missing"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]

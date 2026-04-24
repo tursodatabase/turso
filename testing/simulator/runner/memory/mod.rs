@@ -5,3 +5,5 @@ pub mod io;
 mod mvcc_recovery;
 #[cfg(test)]
 mod statement_abandon;
+#[cfg(test)]
+mod view_trigger_parse_schema;
