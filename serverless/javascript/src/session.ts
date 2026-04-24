@@ -219,8 +219,10 @@ export class Session {
           if (entry.affected_row_count !== undefined) {
             rowsAffected = entry.affected_row_count;
           }
-          if (entry.last_insert_rowid) {
-            lastInsertRowid = parseInt(entry.last_insert_rowid, 10);
+          if (entry.last_insert_rowid !== undefined && entry.last_insert_rowid !== null) {
+            lastInsertRowid = typeof entry.last_insert_rowid === 'number'
+              ? entry.last_insert_rowid
+              : parseInt(entry.last_insert_rowid, 10);
           }
           break;
         case 'step_error':
@@ -301,8 +303,10 @@ export class Session {
           if (entry.affected_row_count !== undefined) {
             totalRowsAffected += entry.affected_row_count;
           }
-          if (entry.last_insert_rowid) {
-            lastInsertRowid = parseInt(entry.last_insert_rowid, 10);
+          if (entry.last_insert_rowid !== undefined && entry.last_insert_rowid !== null) {
+            lastInsertRowid = typeof entry.last_insert_rowid === 'number'
+              ? entry.last_insert_rowid
+              : parseInt(entry.last_insert_rowid, 10);
           }
           break;
         case 'step_error':
