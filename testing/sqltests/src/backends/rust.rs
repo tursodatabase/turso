@@ -9,6 +9,30 @@ use std::sync::Arc;
 use tempfile::NamedTempFile;
 use turso::{Builder, Connection, Database, Value};
 
+const TURSO_RUST_EXPERIMENTAL_FEATURES: &[&str] = &[
+    "attach",
+    "index_method",
+    "views",
+    "custom_types",
+    "generated_columns",
+    "vacuum",
+];
+
+fn apply_turso_experimental_features(mut builder: Builder) -> Builder {
+    for feature in TURSO_RUST_EXPERIMENTAL_FEATURES {
+        builder = match *feature {
+            "attach" => builder.experimental_attach(true),
+            "index_method" => builder.experimental_index_method(true),
+            "views" => builder.experimental_materialized_views(true),
+            "custom_types" => builder.experimental_custom_types(true),
+            "generated_columns" => builder.experimental_generated_columns(true),
+            "vacuum" => builder.experimental_vacuum(true),
+            _ => unreachable!("unexpected sqltests Rust backend experimental feature"),
+        };
+    }
+    builder
+}
+
 /// Native Rust backend using Turso bindings directly
 pub struct RustBackend {
     /// Resolver for default database paths
@@ -95,12 +119,7 @@ impl SqlBackend for RustBackend {
         };
 
         // Create the database using the Turso builder
-        let db = Builder::new_local(&db_path)
-            .experimental_attach(true)
-            .experimental_index_method(true)
-            .experimental_materialized_views(true)
-            .experimental_custom_types(true)
-            .experimental_generated_columns(true)
+        let db = apply_turso_experimental_features(Builder::new_local(&db_path))
             .build()
             .await
             .map_err(|e| BackendError::CreateDatabase(e.to_string()))?;

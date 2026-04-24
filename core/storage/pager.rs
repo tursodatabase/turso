@@ -1018,6 +1018,16 @@ struct CheckpointState {
     result: Option<CheckpointResult>,
     /// The checkpoint mode, used to determine if WAL truncation is needed
     mode: Option<CheckpointMode>,
+    /// Whether this checkpoint should acquire checkpoint_lock itself or consume
+    /// a checkpoint_lock already held by the caller.
+    lock_source: CheckpointLockSource,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum CheckpointLockSource {
+    #[default]
+    Acquire,
+    HeldByCaller,
 }
 
 #[derive(Clone, Debug)]
@@ -1150,6 +1160,14 @@ impl From<u8> for AutoVacuumMode {
             2 => AutoVacuumMode::Incremental,
             _ => unreachable!("Invalid AutoVacuumMode value: {}", value),
         }
+    }
+}
+
+const fn auto_vacuum_header_fields(mode: AutoVacuumMode) -> (u32, u32) {
+    match mode {
+        AutoVacuumMode::None => (0, 0),
+        AutoVacuumMode::Full => (1, 0),
+        AutoVacuumMode::Incremental => (1, 1),
     }
 }
 
@@ -2083,6 +2101,37 @@ impl Pager {
         self.auto_vacuum_mode.store(mode.into(), Ordering::SeqCst);
     }
 
+    /// Persist the auto-vacuum mode to page 1 and keep the pager cache in sync.
+    ///
+    /// Fresh databases still backed by `init_page_1` must not retain dirty pages
+    /// after this setup. Initialized databases use the normal live-header path.
+    pub(crate) fn persist_auto_vacuum_mode(&self, mode: AutoVacuumMode) -> Result<()> {
+        let (largest_root_page, incremental_vacuum_enabled) = auto_vacuum_header_fields(mode);
+
+        if !self.db_initialized() {
+            let IOResult::Done(_) = self.with_header_mut(|header| {
+                header.vacuum_mode_largest_root_page = largest_root_page.into();
+                header.incremental_vacuum_enabled = incremental_vacuum_enabled.into();
+            })?
+            else {
+                panic!("fresh database auto-vacuum setup should not do any IO");
+            };
+            // with_header_mut marks page 1 dirty as a side effect, but fresh-db
+            // bootstrap is not a real transaction.
+            self.dirty_pages.write().clear();
+        } else {
+            self.io.block(|| {
+                self.with_header_mut(|header| {
+                    header.vacuum_mode_largest_root_page = largest_root_page.into();
+                    header.incremental_vacuum_enabled = incremental_vacuum_enabled.into();
+                })
+            })?;
+        }
+
+        self.set_auto_vacuum_mode(mode);
+        Ok(())
+    }
+
     /// Retrieves the pointer map entry for a given database page.
     /// `target_page_num` (1-indexed) is the page whose entry is sought.
     /// Returns `Ok(None)` if the page is not supposed to have a ptrmap entry (e.g. header, or a ptrmap page itself).
@@ -2637,6 +2686,37 @@ impl Pager {
             return Ok(IOResult::Done(()));
         };
         Ok(IOResult::Done(wal.begin_write_tx()?))
+    }
+
+    /// Acquire exclusive WAL access (used by VACUUM).
+    ///
+    /// This replaces the normal `begin_read_tx` source snapshot acquisition for
+    /// VACUUM. VACUUM first reserves the checkpoint lock so no checkpointer can
+    /// race the source snapshot. This method then takes the VACUUM lock
+    /// exclusively to keep new readers out, takes the WAL write lock, and
+    /// installs the source snapshot that VACUUM will copy from. It does not
+    /// take a read-mark lock.
+    ///
+    /// The final TRUNCATE checkpoint takes read0 and write_lock inside the
+    /// checkpoint path after this source transaction has ended.
+    ///
+    /// VACUUM runs on an existing database, so page 1 must already be allocated
+    /// and a WAL must be present.
+    pub fn begin_exclusive_tx(&self) -> Result<IOResult<()>> {
+        if !self.db_initialized() {
+            return Err(LimboError::InternalError(
+                "begin_exclusive_tx can be done on an initialized database (page 1 must already be allocated)".into(),
+            ));
+        }
+        let wal = self.wal.as_ref().ok_or_else(|| {
+            LimboError::InternalError("begin_exclusive_tx requires WAL mode".into())
+        })?;
+        wal.begin_exclusive_tx()?;
+        // let's be conservative and clear all cache for vacuum
+        // todo: clear cache only if we detect that new writes have occurred like `begin_read_tx`
+        self.clear_page_cache(false);
+        self.set_schema_cookie(None);
+        Ok(IOResult::Done(()))
     }
 
     /// commit dirty pages from current transaction in WAL mode if this is not nested statement (for nested statements, parent will do the commit)
@@ -3949,11 +4029,16 @@ impl Pager {
         state.phase = CheckpointPhase::NotCheckpointing;
         state.result = None;
         state.mode = None;
+        state.lock_source = CheckpointLockSource::Acquire;
     }
 
     /// Clean up after a auto-checkpoint failure.
     /// Auto-checkpoint executed outside of the main transaction - so WAL transaction was already finalized
     pub fn cleanup_after_auto_checkpoint_failure(&self) {
+        self.cleanup_after_checkpoint_failure();
+    }
+
+    pub fn cleanup_after_checkpoint_failure(&self) {
         self.reset_checkpoint_state();
         if let Some(wal) = self.wal.as_ref() {
             wal.abort_checkpoint();
@@ -3999,6 +4084,35 @@ impl Pager {
         sync_mode: crate::SyncMode,
         clear_page_cache: bool,
     ) -> Result<IOResult<CheckpointResult>> {
+        self.checkpoint_inner(
+            mode,
+            sync_mode,
+            clear_page_cache,
+            CheckpointLockSource::Acquire,
+        )
+    }
+
+    pub fn checkpoint_with_held_checkpoint_lock(
+        &self,
+        mode: CheckpointMode,
+        sync_mode: crate::SyncMode,
+        clear_page_cache: bool,
+    ) -> Result<IOResult<CheckpointResult>> {
+        self.checkpoint_inner(
+            mode,
+            sync_mode,
+            clear_page_cache,
+            CheckpointLockSource::HeldByCaller,
+        )
+    }
+
+    fn checkpoint_inner(
+        &self,
+        mode: CheckpointMode,
+        sync_mode: crate::SyncMode,
+        clear_page_cache: bool,
+        lock_source: CheckpointLockSource,
+    ) -> Result<IOResult<CheckpointResult>> {
         let Some(wal) = self.wal.as_ref() else {
             turso_soft_unreachable!("checkpoint() called on database without WAL");
             return Err(LimboError::InternalError(
@@ -4019,13 +4133,20 @@ impl Pager {
                         clear_page_cache,
                     };
                     state.mode = Some(mode);
+                    state.lock_source = lock_source;
                 }
                 CheckpointPhase::Checkpoint {
                     mode,
                     sync_mode,
                     clear_page_cache,
                 } => {
-                    let res = return_if_io!(wal.checkpoint(self, mode));
+                    let checkpoint_lock_source = self.checkpoint_state.read().lock_source;
+                    let res = return_if_io!(match checkpoint_lock_source {
+                        CheckpointLockSource::Acquire => wal.checkpoint(self, mode),
+                        CheckpointLockSource::HeldByCaller => {
+                            wal.checkpoint_with_held_checkpoint_lock(self, mode)
+                        }
+                    });
                     let mut state = self.checkpoint_state.write();
                     if matches!(mode, CheckpointMode::Truncate { .. })
                         // `should_truncate` will be true for successful truncate checkpoint
@@ -4271,6 +4392,7 @@ impl Pager {
                     let mut res = state.result.take().expect("result should be set");
                     state.phase = CheckpointPhase::NotCheckpointing;
                     state.mode = None;
+                    state.lock_source = CheckpointLockSource::Acquire;
 
                     // Clear page cache only if requested (explicit checkpoints do this, auto-checkpoint does not)
                     if clear_page_cache {
@@ -5364,12 +5486,8 @@ mod ptrmap_tests {
             );
         }
         pager
-            .io
-            .block(|| {
-                pager.with_header_mut(|header| header.vacuum_mode_largest_root_page = 1.into())
-            })
+            .persist_auto_vacuum_mode(AutoVacuumMode::Full)
             .unwrap();
-        pager.set_auto_vacuum_mode(AutoVacuumMode::Full);
 
         //  Allocate all the pages as btree root pages
         const EXPECTED_FIRST_ROOT_PAGE_ID: u32 = 3; // page1 = 1,  first ptrmap page = 2, root page = 3
@@ -5398,6 +5516,109 @@ mod ptrmap_tests {
         }
 
         pager
+    }
+
+    #[test]
+    fn persist_auto_vacuum_mode_updates_fresh_header_without_dirty_pages() {
+        let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+        let db_file: Arc<dyn DatabaseStorage> = Arc::new(DatabaseFile::new(
+            io.open_file("fresh-auto-vacuum.db", OpenFlags::Create, true)
+                .unwrap(),
+        ));
+        let buffer_pool = BufferPool::begin_init(&io, 65536);
+        let pager = Pager::new(
+            db_file,
+            None,
+            io,
+            PageCache::new(4),
+            buffer_pool,
+            Arc::new(Mutex::new(())),
+            Arc::new(ArcSwapOption::new(Some(default_page1(None)))),
+        )
+        .unwrap();
+
+        pager
+            .persist_auto_vacuum_mode(AutoVacuumMode::Incremental)
+            .unwrap();
+
+        let IOResult::Done((largest_root_page, incremental_vacuum_enabled)) = pager
+            .with_header(|header| {
+                (
+                    header.vacuum_mode_largest_root_page.get(),
+                    header.incremental_vacuum_enabled.get(),
+                )
+            })
+            .unwrap()
+        else {
+            panic!("fresh database header reads should not do any IO");
+        };
+
+        assert_eq!(largest_root_page, 1);
+        assert_eq!(incremental_vacuum_enabled, 1);
+        assert_eq!(pager.get_auto_vacuum_mode(), AutoVacuumMode::Incremental);
+        assert!(
+            pager.dirty_pages.read().is_empty(),
+            "fresh-db auto-vacuum setup must not leave dirty pages behind"
+        );
+    }
+
+    #[test]
+    fn persist_auto_vacuum_mode_updates_initialized_header_and_leaves_page_one_dirty() {
+        let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+        let db_file: Arc<dyn DatabaseStorage> = Arc::new(DatabaseFile::new(
+            io.open_file("initialized-auto-vacuum.db", OpenFlags::Create, true)
+                .unwrap(),
+        ));
+        let buffer_pool = BufferPool::begin_init(&io, 65536);
+        let pager = Pager::new(
+            db_file,
+            None,
+            io,
+            PageCache::new(4),
+            buffer_pool,
+            Arc::new(Mutex::new(())),
+            Arc::new(ArcSwapOption::new(Some(default_page1(None)))),
+        )
+        .unwrap();
+
+        run_until_done(|| pager.allocate_page1(), &pager).unwrap();
+        pager.dirty_pages.write().clear();
+        assert!(pager.db_initialized());
+        assert!(
+            pager.dirty_pages.read().is_empty(),
+            "initialized-db test setup should start with no dirty pages"
+        );
+
+        pager
+            .persist_auto_vacuum_mode(AutoVacuumMode::Full)
+            .unwrap();
+
+        let (largest_root_page, incremental_vacuum_enabled) = run_until_done(
+            || {
+                pager.with_header(|header| {
+                    (
+                        header.vacuum_mode_largest_root_page.get(),
+                        header.incremental_vacuum_enabled.get(),
+                    )
+                })
+            },
+            &pager,
+        )
+        .unwrap();
+
+        assert_eq!(largest_root_page, 1);
+        assert_eq!(incremental_vacuum_enabled, 0);
+        assert_eq!(pager.get_auto_vacuum_mode(), AutoVacuumMode::Full);
+        let dirty_pages = pager.dirty_pages.read();
+        assert!(
+            dirty_pages.contains(1),
+            "initialized-db auto-vacuum setup should dirty page 1"
+        );
+        assert_eq!(
+            dirty_pages.len(),
+            1,
+            "initialized-db auto-vacuum setup should only dirty page 1 in this test"
+        );
     }
 
     #[test]

@@ -19,6 +19,24 @@ expect error {
 }
 
 @backend rust
+test vacuum-into-rejected-in-savepoint {
+    CREATE TABLE t(a TEXT);
+    SAVEPOINT sp1;
+    VACUUM INTO 'limbo_vacuum_into_savepoint_should_fail.db';
+}
+expect error {
+    cannot VACUUM INTO from within a transaction
+}
+
+@backend rust
+test vacuum-into-invalid-path-expression {
+    VACUUM INTO 1 + 2;
+}
+expect error {
+    VACUUM INTO requires a string literal path
+}
+
+@backend rust
 test vacuum-into-nonexistent-schema {
     VACUUM bogus INTO 'limbo_vacuum_bogus_schema.db';
 }

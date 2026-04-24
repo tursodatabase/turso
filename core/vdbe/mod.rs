@@ -51,10 +51,11 @@ use crate::{
             OpColumnState, OpDeleteState, OpDeleteSubState, OpDestroyState, OpIdxInsertState,
             OpInsertState, OpInsertSubState, OpJournalModeState, OpNewRowidState,
             OpNoConflictState, OpParseSchemaState, OpProgramState, OpRowIdState, OpSeekState,
-            OpTransactionState, OpVacuumIntoState,
+            OpTransactionState, VacuumIntoOpContext,
         },
         hash_table::HashTable,
         metrics::StatementMetrics,
+        vacuum::VacuumInPlaceOpContext,
     },
     ValueRef,
 };
@@ -435,7 +436,6 @@ enum ActiveOpState {
     RowId(OpRowIdState),
     Transaction(OpTransactionState),
     JournalMode(OpJournalModeState),
-    VacuumInto(Option<OpVacuumIntoState>),
     ParseSchema(OpParseSchemaState),
     HashBuild(Option<OpHashBuildState>),
     HashProbe(Option<OpHashProbeState>),
@@ -540,7 +540,6 @@ impl ActiveOpStateSlot {
         OpJournalModeState,
         OpJournalModeState::default()
     );
-    active_state_accessor!(vacuum_into, VacuumInto, Option<OpVacuumIntoState>, None);
     active_state_accessor!(parse_schema, ParseSchema, OpParseSchemaState, None);
     active_state_accessor!(hash_build, HashBuild, Option<OpHashBuildState>, None);
     active_state_accessor!(hash_probe, HashProbe, Option<OpHashProbeState>, None);
@@ -556,12 +555,6 @@ impl ActiveOpStateSlot {
         match &mut self.state {
             ActiveOpState::Program(state) => Some(state),
             _ => None,
-        }
-    }
-
-    fn reset_vacuum_into(&mut self) {
-        if matches!(self.state, ActiveOpState::VacuumInto(_)) {
-            self.clear();
         }
     }
 }
@@ -601,6 +594,8 @@ pub struct ProgramState {
     pub metrics: StatementMetrics,
     /// Current collation sequence set by OP_CollSeq instruction
     current_collation: Option<CollationSeq>,
+    op_vacuum_into: Option<Box<VacuumIntoOpContext>>,
+    op_vacuum_in_place: Option<Box<VacuumInPlaceOpContext>>,
     /// State machine for committing view deltas with I/O handling
     view_delta_state: ViewDeltaCommitState,
     /// Marker which tells about auto transaction cleanup necessary for that connection in case of reset
@@ -691,6 +686,8 @@ impl ProgramState {
             metrics: StatementMetrics::new(),
             distinct_key_values: Vec::new(),
             current_collation: None,
+            op_vacuum_into: None,
+            op_vacuum_in_place: None,
             view_delta_state: ViewDeltaCommitState::NotStarted,
             auto_txn_cleanup: TxnCleanup::None,
             fk_deferred_violations_when_stmt_started: AtomicIsize::new(0),
@@ -806,6 +803,8 @@ impl ProgramState {
         self.seek_state = OpSeekState::Start;
         self.current_collation = None;
         self.commit_state = CommitState::Ready;
+        self.op_vacuum_into = None;
+        self.op_vacuum_in_place = None;
         self.view_delta_state = ViewDeltaCommitState::NotStarted;
         self.auto_txn_cleanup = TxnCleanup::None;
         self.fk_immediate_violations_during_stmt
@@ -2153,10 +2152,16 @@ impl Program {
 
         let mut abort_error: Option<LimboError> = None;
 
-        // VACUUM INTO state can own internal helper statements whose drop path
-        // releases nested guards. Drop them before checking whether this program
+        // VACUUM (and VACUUM INTO) state can own internal helper statements whose drop path
+        // releases nested guards. Clean it before checking whether this program
         // is itself nested; otherwise abort could skip top-level cleanup.
-        state.active_op_state.reset_vacuum_into();
+        if let Err(err) = execute::cleanup_vacuum_state(&self.connection, state) {
+            capture_abort_error(
+                &mut abort_error,
+                err,
+                "Failed to clean up VACUUM state during abort",
+            );
+        }
 
         // Only end trigger execution if the subprogram was actually running.
         // Cached (pooled) statements may be dropped after their trigger execution
@@ -2722,8 +2727,6 @@ mod tests {
             OpColumnState::Start
         ));
         state.active_op_state.clear();
-        assert!(state.active_op_state.vacuum_into().is_none());
-        state.active_op_state.clear();
         assert!(state.active_op_state.parse_schema().is_none());
     }
 
@@ -2733,7 +2736,7 @@ mod tests {
         *state.active_op_state.column() = OpColumnState::GetColumn;
 
         let panic = catch_unwind(AssertUnwindSafe(|| {
-            let _ = state.active_op_state.vacuum_into();
+            let _ = state.active_op_state.parse_schema();
         }));
         assert!(panic.is_err(), "mismatched opcode resume should panic");
     }
@@ -2754,6 +2757,21 @@ mod tests {
             OpInsertSubState::Seek
         ));
         assert!(matches!(state.seek_state, OpSeekState::MoveLast));
+    }
+
+    #[test]
+    fn program_state_reset_clears_in_place_vacuum_state() {
+        let mut state = ProgramState::new(0, 0);
+        state.op_vacuum_in_place = Some(Box::new(
+            crate::vdbe::vacuum::VacuumInPlaceOpContext::new(crate::MAIN_DB_ID),
+        ));
+
+        state.reset(None, None);
+
+        assert!(
+            state.op_vacuum_in_place.is_none(),
+            "ProgramState::reset must clear in-place VACUUM state"
+        );
     }
 }
 

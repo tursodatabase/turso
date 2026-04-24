@@ -14,6 +14,15 @@ use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
 use tokio::time::timeout;
 
+const TURSO_CLI_EXPERIMENTAL_FLAGS: &[&str] = &[
+    "--experimental-views",
+    "--experimental-custom-types",
+    "--experimental-attach",
+    "--experimental-index-method",
+    "--experimental-generated-columns",
+    "--experimental-vacuum",
+];
+
 /// CLI backend that executes SQL via the tursodb CLI tool
 pub struct CliBackend {
     /// Path to the tursodb binary
@@ -262,11 +271,9 @@ impl CliDatabaseInstance {
             cmd.arg(&self.db_path);
             cmd.arg("-q"); // Quiet mode - suppress banner
             cmd.arg("-m").arg("list"); // List mode for pipe-separated output
-            cmd.arg("--experimental-views");
-            cmd.arg("--experimental-custom-types");
-            cmd.arg("--experimental-attach");
-            cmd.arg("--experimental-index-method");
-            cmd.arg("--experimental-generated-columns");
+            for flag in TURSO_CLI_EXPERIMENTAL_FLAGS {
+                cmd.arg(flag);
+            }
         }
 
         if self.readonly {

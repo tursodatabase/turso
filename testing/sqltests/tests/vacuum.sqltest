@@ -1,0 +1,93 @@
+@database :temp:
+
+@backend rust
+test vacuum-uninitialized-file-backed-db-rejected {
+    VACUUM;
+}
+expect error {
+    initialized
+}
+
+@backend rust
+test vacuum-basic-success {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT);
+    INSERT INTO t VALUES (1, 'one'), (2, 'two'), (3, 'three');
+    DELETE FROM t WHERE id = 2;
+    VACUUM;
+    SELECT id, v FROM t ORDER BY id;
+    PRAGMA integrity_check;
+}
+expect {
+    1|one
+    3|three
+    ok
+}
+
+@backend rust
+test vacuum-generated-columns {
+    CREATE TABLE t1(a INTEGER, b AS (a * 2));
+    INSERT INTO t1(a) VALUES(1), (2), (3), (4), (5);
+    DELETE FROM t1 WHERE a IN (2, 4);
+    VACUUM;
+    SELECT a, b FROM t1;
+}
+expect {
+    1|2
+    3|6
+    5|10
+}
+
+@backend rust
+@skip-if mvcc "Expression indexes are not supported with MVCC"
+test vacuum-generated-columns-with-index {
+    CREATE TABLE t1(a INTEGER, b AS (a * 2));
+    CREATE INDEX idx1 ON t1(b);
+    INSERT INTO t1(a) VALUES(1), (2), (3), (4), (5);
+    DELETE FROM t1 WHERE a IN (2, 4);
+    VACUUM;
+    SELECT a, b FROM t1;
+    PRAGMA integrity_check;
+}
+expect {
+    1|2
+    3|6
+    5|10
+    ok
+}
+
+@backend rust
+test vacuum-schema-qualified-rejected {
+    VACUUM temp;
+}
+expect error {
+    VACUUM is only supported for the main database; schema 'temp' is not supported yet
+}
+
+@backend rust
+test vacuum-rejected-in-begin {
+    CREATE TABLE tx_t(x);
+    BEGIN;
+    VACUUM;
+}
+expect error {
+    cannot VACUUM from within a transaction
+}
+
+@backend rust
+test vacuum-rejected-in-savepoint {
+    CREATE TABLE sp_t(x);
+    SAVEPOINT sp1;
+    VACUUM;
+}
+expect error {
+    cannot VACUUM from within a transaction
+}
+
+test vacuum-rejected-in-query-only {
+    CREATE TABLE qo_t(x);
+    PRAGMA query_only = 1;
+    VACUUM;
+}
+expect error {
+    Cannot execute VACUUM in query_only mode
+}

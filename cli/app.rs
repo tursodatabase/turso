@@ -89,6 +89,8 @@ pub struct Opts {
     pub experimental_index_method: bool,
     #[clap(long, help = "Enable experimental autovacuum feature")]
     pub experimental_autovacuum: bool,
+    #[clap(long, help = "Enable experimental vacuum feature")]
+    pub experimental_vacuum: bool,
     #[clap(long, help = "Enable experimental attach feature")]
     pub experimental_attach: bool,
     #[clap(long, help = "Enable experimental generated columns feature")]
@@ -236,6 +238,7 @@ impl Limbo {
             .with_encryption(opts.experimental_encryption)
             .with_index_method(opts.experimental_index_method)
             .with_autovacuum(opts.experimental_autovacuum)
+            .with_vacuum(opts.experimental_vacuum)
             .with_attach(opts.experimental_attach)
             .with_generated_columns(opts.experimental_generated_columns)
             .with_multiprocess_wal(opts.experimental_multiprocess_wal)
@@ -2365,6 +2368,12 @@ fn normalize_db_path(db_file: String) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_opts_parses_experimental_vacuum_flag() {
+        let opts = Opts::parse_from(["turso", "--experimental-vacuum"]);
+        assert!(opts.experimental_vacuum);
+    }
 
     #[test]
     fn test_normalize_db_path_adds_file_prefix_for_query_params() {
