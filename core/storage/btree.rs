@@ -11193,7 +11193,7 @@ mod tests {
                 cur = next_usize;
             }
 
-            intervals.sort_by_key(|(start, _, _)| *start);
+            intervals.sort_unstable_by_key(|(start, _, _)| *start);
             for pair in intervals.windows(2) {
                 let (a_start, a_end, a_kind) = pair[0];
                 let (b_start, _b_end, b_kind) = pair[1];

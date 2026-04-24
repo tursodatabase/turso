@@ -544,7 +544,7 @@ impl PageCache {
                 break;
             }
         }
-        spillable.sort_by_key(|pg| pg.get().id);
+        spillable.sort_unstable_by_key(|pg| pg.get().id);
         spillable
     }
 
