@@ -1,0 +1,175 @@
+name: Stack Sizes
+
+on:
+  workflow_dispatch:
+    inputs:
+      top:
+        description: Top N stack frames to print
+        required: false
+        default: "50"
+      filter:
+        description: Optional custom demangled-function regex
+        required: false
+        default: ""
+      all_functions:
+        description: Disable filtering and report every function
+        required: false
+        default: false
+        type: boolean
+  pull_request:
+    branches: ["main"]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_INCREMENTAL: "0"
+  CARGO_NET_RETRY: 10
+  CARGO_TERM_COLOR: always
+  STACK_BINARY: target/release/tursodb
+  STACK_OUT_DIR: target/stack-sizes
+  DEFAULT_STACK_FILTER: 'turso_core::|turso::sqlite::|turso::http::client::|^aws_sigv4|^aws_smithy|^aws_credential_types|^httparse::'
+
+jobs:
+  report:
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    timeout-minutes: 45
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@nightly
+
+      - name: Setup mold linker
+        uses: "./.github/shared/setup-mold"
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: "v1-stack-sizes"
+          cache-on-failure: true
+
+      - name: Install cargo-binstall
+        uses: cargo-bins/cargo-binstall@main
+
+      - name: Install report dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y llvm gawk
+          cargo binstall --no-confirm --force rustfilt
+          rustfilt --help >/dev/null
+
+      - name: Resolve report parameters
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$STACK_OUT_DIR"
+
+          TOP="${{ github.event.inputs.top || '50' }}"
+          FILTER_INPUT="${{ github.event.inputs.filter }}"
+          ALL_FUNCTIONS="${{ github.event.inputs.all_functions }}"
+
+          if [[ "$ALL_FUNCTIONS" == "true" ]]; then
+            FILTER='.'
+            FILTER_LABEL='all (no filter)'
+          elif [[ -n "$FILTER_INPUT" ]]; then
+            FILTER="$FILTER_INPUT"
+            FILTER_LABEL="custom: $FILTER_INPUT"
+          else
+            FILTER="$DEFAULT_STACK_FILTER"
+            FILTER_LABEL='coroutine-reachable (default)'
+          fi
+
+          {
+            echo "TOP=$TOP"
+            echo "FILTER=$FILTER"
+            echo "FILTER_LABEL=$FILTER_LABEL"
+            echo "RAW=$STACK_OUT_DIR/tursodb.stack-sizes.txt"
+            echo "FULL=$STACK_OUT_DIR/tursodb.stack-sizes.full.txt"
+            echo "REPORT=$STACK_OUT_DIR/tursodb.stack-sizes.report.txt"
+          } >> "$GITHUB_ENV"
+
+      - name: Build tursodb with stack size emission
+        shell: bash
+        run: |
+          set -euo pipefail
+          RUSTFLAGS="-Zemit-stack-sizes -Cforce-frame-pointers=yes" \
+            cargo +nightly build \
+            --release \
+            --locked \
+            -p turso_cli \
+            --bin tursodb
+
+          test -f "$STACK_BINARY"
+
+      - name: Dump .stack_sizes section
+        shell: bash
+        run: |
+          set -euo pipefail
+          llvm-readobj --stack-sizes "$STACK_BINARY" > "$RAW"
+
+      - name: Generate filtered report
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          awk '
+              /^ *Functions:/ {
+                  line = $0
+                  lb = index(line, "[")
+                  rb = index(line, "]")
+                  if (lb > 0 && rb > lb) {
+                      fn = substr(line, lb + 1, rb - lb - 1)
+                      gsub(/, */, "|", fn)
+                  } else {
+                      fn = ""
+                  }
+              }
+              /^ *Size:/ {
+                  size = $2
+                  if (fn != "" && size != "") {
+                      n = (size ~ /^0x/) ? strtonum(size) : size + 0
+                      print n " " fn
+                      fn = ""
+                  }
+              }
+          ' "$RAW" \
+            | rustfilt \
+            | grep -E "$FILTER" \
+            | sort -rn -k1,1 \
+            | awk '{ printf "%8d B   %s\n", $1, substr($0, index($0, $2)) }' \
+            > "$FULL"
+
+          head -n "$TOP" "$FULL" > "$REPORT"
+
+          echo "===== Top $TOP frames - $FILTER_LABEL ====="
+          cat "$REPORT"
+
+          {
+            echo "## Stack Size Report"
+            echo
+            echo "- Binary: \`$STACK_BINARY\`"
+            echo "- Filter: \`$FILTER_LABEL\`"
+            echo "- Raw dump: \`$RAW\`"
+            echo "- Full sorted report: \`$FULL\`"
+            echo "- Top-$TOP report: \`$REPORT\`"
+            echo
+            echo '```text'
+            cat "$REPORT"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload stack size artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: stack-sizes
+          path: |
+            ${{ env.STACK_OUT_DIR }}/tursodb.stack-sizes.txt
+            ${{ env.STACK_OUT_DIR }}/tursodb.stack-sizes.full.txt
+            ${{ env.STACK_OUT_DIR }}/tursodb.stack-sizes.report.txt
+          retention-days: 14
