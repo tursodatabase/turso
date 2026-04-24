@@ -84,6 +84,74 @@ test('processCursorEntries handles string lastInsertRowid', async t => {
   t.is(result.lastInsertRowid, 42);
 });
 
+// --- Connection.prepare() baton continuity (issue #6562) ---
+
+test('prepare() sends describe with the current transaction baton', async t => {
+  const { connect } = await import('../dist/index.js');
+
+  const requests = [];
+  const originalFetch = globalThis.fetch;
+
+  globalThis.fetch = async (url, opts) => {
+    const body = JSON.parse(opts.body);
+    requests.push(body);
+
+    // Every pipeline response hands back the same baton so the
+    // session stays on one server-side connection.
+    const baton = 'txn-baton-abc';
+
+    // Determine what kind of request this is to return the right shape.
+    const reqType = body.requests?.[0]?.type;
+
+    if (reqType === 'sequence') {
+      // exec('BEGIN') / exec('CREATE TABLE …')
+      return new Response(JSON.stringify({
+        baton,
+        base_url: null,
+        results: [{ type: 'ok', response: { type: 'sequence' } }],
+      }), { status: 200, headers: { 'Content-Type': 'application/json' } });
+    }
+
+    if (reqType === 'describe') {
+      return new Response(JSON.stringify({
+        baton,
+        base_url: null,
+        results: [{ type: 'ok', response: {
+          type: 'describe',
+          result: {
+            params: [],
+            cols: [{ name: 'id', decltype: 'INTEGER' }],
+            is_explain: false,
+            is_readonly: false,
+          },
+        }}],
+      }), { status: 200, headers: { 'Content-Type': 'application/json' } });
+    }
+
+    // close or anything else
+    return new Response(JSON.stringify({
+      baton: null,
+      base_url: null,
+      results: [{ type: 'ok', response: { type: 'close' } }],
+    }), { status: 200, headers: { 'Content-Type': 'application/json' } });
+  };
+
+  t.teardown(() => { globalThis.fetch = originalFetch; });
+
+  const conn = connect({ url: 'http://fake-host' });
+  await conn.exec('BEGIN');
+  await conn.exec('CREATE TABLE t (id INTEGER)');
+  await conn.prepare('INSERT INTO t VALUES (1)');
+
+  // requests[0] = exec('BEGIN')        → baton: null  (first call)
+  // requests[1] = exec('CREATE TABLE') → baton: 'txn-baton-abc'
+  // requests[2] = describe             → must also carry 'txn-baton-abc'
+  const describeReq = requests[2];
+  t.is(describeReq.requests[0].type, 'describe', 'third request should be describe');
+  t.is(describeReq.baton, 'txn-baton-abc',
+    'describe must carry the transaction baton, not null');
+});
+
 // --- Session baton reset on error ---
 
 test('Session resets baton after HTTP error', async t => {
