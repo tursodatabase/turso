@@ -81,7 +81,13 @@ export class Session {
       } as DescribeRequest]
     };
 
-    const response = await executePipeline(this.baseUrl, this.config.authToken, request, this.config.remoteEncryptionKey, this.createAbortSignal(queryOptions));
+    let response;
+    try {
+      response = await executePipeline(this.baseUrl, this.config.authToken, request, this.config.remoteEncryptionKey, this.createAbortSignal(queryOptions));
+    } catch (e) {
+      this.baton = null;
+      throw e;
+    }
 
     this.baton = response.baton;
     if (response.base_url) {
@@ -177,8 +183,15 @@ export class Session {
       }
     };
 
-    const { response, entries } = await executeCursor(this.baseUrl, this.config.authToken, request, this.config.remoteEncryptionKey, this.createAbortSignal(queryOptions));
+    let result;
+    try {
+      result = await executeCursor(this.baseUrl, this.config.authToken, request, this.config.remoteEncryptionKey, this.createAbortSignal(queryOptions));
+    } catch (e) {
+      this.baton = null;
+      throw e;
+    }
 
+    const { response, entries } = result;
     this.baton = response.baton;
     if (response.base_url) {
       this.baseUrl = response.base_url;
@@ -287,8 +300,15 @@ export class Session {
       }
     };
 
-    const { response, entries } = await executeCursor(this.baseUrl, this.config.authToken, request, this.config.remoteEncryptionKey, this.createAbortSignal(queryOptions));
+    let batchResult;
+    try {
+      batchResult = await executeCursor(this.baseUrl, this.config.authToken, request, this.config.remoteEncryptionKey, this.createAbortSignal(queryOptions));
+    } catch (e) {
+      this.baton = null;
+      throw e;
+    }
 
+    const { response, entries } = batchResult;
     this.baton = response.baton;
     if (response.base_url) {
       this.baseUrl = response.base_url;
@@ -336,16 +356,22 @@ export class Session {
       } as SequenceRequest]
     };
 
-    const response = await executePipeline(this.baseUrl, this.config.authToken, request, this.config.remoteEncryptionKey, this.createAbortSignal(queryOptions));
+    let seqResponse;
+    try {
+      seqResponse = await executePipeline(this.baseUrl, this.config.authToken, request, this.config.remoteEncryptionKey, this.createAbortSignal(queryOptions));
+    } catch (e) {
+      this.baton = null;
+      throw e;
+    }
 
-    this.baton = response.baton;
-    if (response.base_url) {
-      this.baseUrl = response.base_url;
+    this.baton = seqResponse.baton;
+    if (seqResponse.base_url) {
+      this.baseUrl = seqResponse.base_url;
     }
 
     // Check for errors in the response
-    if (response.results && response.results[0]) {
-      const result = response.results[0];
+    if (seqResponse.results && seqResponse.results[0]) {
+      const result = seqResponse.results[0];
       if (result.type === "error") {
         throw new DatabaseError(result.error?.message || 'Sequence execution failed', result.error?.code);
       }

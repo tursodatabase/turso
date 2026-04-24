@@ -1016,6 +1016,38 @@ test.serial("Per-query queryTimeout on Statement.get()", async (t) => {
   await db.close();
 });
 
+test.serial("Session recovers after HTTP error (baton reset)", async (t) => {
+  if (process.env.PROVIDER !== "serverless") {
+    t.pass("Skipping serverless-only test");
+    return;
+  }
+  const { Session } = await import("@tursodatabase/serverless");
+  const session = new Session({
+    url: process.env.TURSO_DATABASE_URL,
+    authToken: process.env.TURSO_AUTH_TOKEN,
+  });
+
+  // Execute a valid statement to establish a baton
+  await session.execute("SELECT 1");
+
+  // Corrupt the baton to simulate a stale baton after an HTTP error
+  // (In production this happens when executeCursor throws before updating the baton)
+  session['baton'] = 'intentionally-stale-baton';
+
+  // This will fail because the server rejects the stale baton
+  await t.throwsAsync(async () => {
+    await session.execute("SELECT 1");
+  }, { any: true });
+
+  // After the error, the session should have reset its baton.
+  // The next request should succeed by starting a fresh stream.
+  await t.notThrowsAsync(async () => {
+    await session.execute("SELECT 1");
+  });
+
+  await session.close();
+});
+
 const connect = async (path, options = {}) => {
   if (!path) {
     path = genDatabaseFilename();
