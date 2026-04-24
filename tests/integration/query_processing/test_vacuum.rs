@@ -6,6 +6,7 @@ use crate::common::{
 use rusqlite::Connection as SqliteConnection;
 use std::{
     collections::VecDeque,
+    path::Path,
     sync::{Arc, Mutex},
 };
 use tempfile::TempDir;
@@ -44,6 +45,16 @@ fn scalar_i64(conn: &Arc<Connection>, sql: &str) -> i64 {
     let rows: Vec<(i64,)> = conn.exec_rows(sql);
     assert_eq!(rows.len(), 1, "expected one row for {sql}");
     rows[0].0
+}
+
+fn header_i32_be(db_path: &Path, offset: usize) -> anyhow::Result<i32> {
+    let bytes = std::fs::read(db_path)?;
+    Ok(i32::from_be_bytes(bytes[offset..offset + 4].try_into()?))
+}
+
+fn header_u32_be(db_path: &Path, offset: usize) -> anyhow::Result<u32> {
+    let bytes = std::fs::read(db_path)?;
+    Ok(u32::from_be_bytes(bytes[offset..offset + 4].try_into()?))
 }
 
 fn explain_opcodes(conn: &Arc<Connection>, sql: &str) -> Vec<String> {
@@ -218,6 +229,78 @@ fn populate_until_page_count(
             "could not reach page_count {target_pages}"
         );
     }
+}
+
+fn populate_collation_vacuum_workload(conn: &Arc<Connection>) -> anyhow::Result<()> {
+    conn.execute("PRAGMA page_size = 1024")?;
+    conn.execute(
+        "CREATE TABLE people(
+            id INTEGER PRIMARY KEY,
+            name TEXT COLLATE NOCASE NOT NULL,
+            team TEXT COLLATE RTRIM NOT NULL,
+            score INTEGER NOT NULL
+        )",
+    )?;
+    conn.execute("CREATE UNIQUE INDEX idx_people_name_nc ON people(name COLLATE NOCASE)")?;
+    conn.execute("CREATE INDEX idx_people_team_score ON people(team COLLATE RTRIM, score DESC)")?;
+
+    for id in 0..120 {
+        let team = match id % 3 {
+            0 => "red   ",
+            1 => "blue  ",
+            _ => "green ",
+        };
+        conn.execute(format!(
+            "INSERT INTO people VALUES({id}, 'Name{id:03}', '{team}', {})",
+            (id * 37) % 100
+        ))?;
+    }
+    conn.execute("DELETE FROM people WHERE id % 7 = 0")?;
+    Ok(())
+}
+
+fn assert_collation_vacuum_workload(conn: &Arc<Connection>) -> anyhow::Result<()> {
+    let name_rows: Vec<(i64,)> =
+        conn.exec_rows("SELECT id FROM people WHERE name = 'name001' COLLATE NOCASE");
+    assert_eq!(name_rows, vec![(1,)]);
+
+    let err = conn
+        .execute("INSERT INTO people VALUES(1000, 'NAME001', 'blue', 1)")
+        .expect_err("NOCASE unique index should reject a case-insensitive duplicate");
+    assert!(
+        err.to_string().contains("UNIQUE") || err.to_string().contains("constraint"),
+        "unexpected NOCASE uniqueness error: {err}"
+    );
+
+    let eqp_name: Vec<(i64, i64, i64, String)> = conn.exec_rows(
+        "EXPLAIN QUERY PLAN SELECT id FROM people WHERE name = 'NAME001' COLLATE NOCASE",
+    );
+    assert!(
+        eqp_name
+            .iter()
+            .any(|(_, _, _, detail)| detail.contains("idx_people_name_nc")),
+        "NOCASE lookup should use preserved collation index, got {eqp_name:?}"
+    );
+
+    let rtrim_indexed: Vec<(i64,)> = conn.exec_rows(
+        "SELECT id FROM people
+         WHERE team = 'blue' COLLATE RTRIM
+         ORDER BY score DESC, id
+         LIMIT 8",
+    );
+    let rtrim_scanned: Vec<(i64,)> = conn.exec_rows(
+        "SELECT id FROM people NOT INDEXED
+         WHERE team = 'blue' COLLATE RTRIM
+         ORDER BY score DESC, id
+         LIMIT 8",
+    );
+    assert_eq!(
+        rtrim_indexed, rtrim_scanned,
+        "RTRIM index scan should match a table scan"
+    );
+    assert!(!rtrim_indexed.is_empty());
+    assert_eq!(run_integrity_check(conn), "ok");
+    Ok(())
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1307,6 +1390,55 @@ fn test_vacuum_into_preserves_meta_values(tmp_db: TempDatabase) -> anyhow::Resul
         "Max application_id should be preserved"
     );
 
+    Ok(())
+}
+
+/// VACUUM target finalization must preserve header fields that do not have a
+/// convenient SQL-level assertion in Turso yet.
+#[cfg_attr(feature = "checksum", ignore)]
+#[test]
+fn test_vacuum_preserves_header_cache_size_and_text_encoding() -> anyhow::Result<()> {
+    const DEFAULT_CACHE_SIZE_OFFSET: usize = 48;
+    const TEXT_ENCODING_OFFSET: usize = 56;
+
+    let temp_dir = TempDir::new()?;
+    let source_path = temp_dir.path().join("header-source.db");
+    let sqlite = SqliteConnection::open(&source_path)?;
+    sqlite.execute_batch(
+        "PRAGMA page_size = 1024;
+         PRAGMA default_cache_size = 73;
+         CREATE TABLE t(id INTEGER PRIMARY KEY, payload TEXT);
+         CREATE INDEX idx_t_payload ON t(payload);",
+    )?;
+    for id in 0..100 {
+        sqlite.execute(
+            "INSERT INTO t VALUES(?1, ?2)",
+            rusqlite::params![id, "header-payload-".repeat(20)],
+        )?;
+    }
+    sqlite.execute("DELETE FROM t WHERE id % 5 = 0", ())?;
+    drop(sqlite);
+
+    assert_eq!(header_i32_be(&source_path, DEFAULT_CACHE_SIZE_OFFSET)?, 73);
+    assert_eq!(header_u32_be(&source_path, TEXT_ENCODING_OFFSET)?, 1);
+
+    let tmp_db = TempDatabase::new_with_existent(&source_path);
+    let conn = tmp_db.connect_limbo();
+    let dest_path = temp_dir.path().join("header-vacuum-into.db");
+    conn.execute(format!("VACUUM INTO '{}'", dest_path.to_str().unwrap()))?;
+
+    assert_eq!(header_i32_be(&dest_path, DEFAULT_CACHE_SIZE_OFFSET)?, 73);
+    assert_eq!(header_u32_be(&dest_path, TEXT_ENCODING_OFFSET)?, 1);
+    let dest_db = TempDatabase::new_with_existent(&dest_path);
+    let dest_conn = dest_db.connect_limbo();
+    assert_eq!(scalar_i64(&dest_conn, "SELECT COUNT(*) FROM t"), 80);
+    assert_eq!(run_integrity_check(&dest_conn), "ok");
+
+    assert_plain_vacuum_preserves_content_hash(&tmp_db, &conn)?;
+    assert_eq!(header_i32_be(&tmp_db.path, DEFAULT_CACHE_SIZE_OFFSET)?, 73);
+    assert_eq!(header_u32_be(&tmp_db.path, TEXT_ENCODING_OFFSET)?, 1);
+    assert_eq!(scalar_i64(&conn, "SELECT COUNT(*) FROM t"), 80);
+    assert_plain_vacuum_folded_into_db_file(&tmp_db, &conn);
     Ok(())
 }
 
@@ -3833,6 +3965,44 @@ fn test_plain_vacuum_keeps_temp_schema_on_same_connection(
     Ok(())
 }
 
+#[cfg_attr(feature = "checksum", ignore)]
+#[test]
+fn test_plain_vacuum_keeps_temp_trigger_and_main_view_referencing_main() -> anyhow::Result<()> {
+    let tmp_db = TempDatabase::builder().with_views(true).build();
+    let conn = tmp_db.connect_limbo();
+
+    conn.execute("CREATE TABLE main_t(id INTEGER PRIMARY KEY, payload TEXT)")?;
+    conn.execute("CREATE TEMP TABLE audit(id INTEGER, payload TEXT)")?;
+    conn.execute(
+        "CREATE TEMP TRIGGER temp_log_main_ai AFTER INSERT ON main.main_t BEGIN
+            INSERT INTO audit VALUES(NEW.id, NEW.payload);
+         END",
+    )?;
+    conn.execute("CREATE VIEW live_main AS SELECT id, payload FROM main_t WHERE id >= 10")?;
+
+    for id in 0..60 {
+        conn.execute(format!(
+            "INSERT INTO main_t VALUES({id}, '{}')",
+            "t".repeat(160)
+        ))?;
+    }
+    conn.execute("DELETE FROM main_t WHERE id >= 20")?;
+    assert_eq!(scalar_i64(&conn, "SELECT COUNT(*) FROM temp.audit"), 60);
+    assert_eq!(scalar_i64(&conn, "SELECT COUNT(*) FROM live_main"), 10);
+
+    assert_plain_vacuum_preserves_content_hash(&tmp_db, &conn)?;
+    assert_plain_vacuum_folded_into_db_file(&tmp_db, &conn);
+
+    assert_eq!(scalar_i64(&conn, "SELECT COUNT(*) FROM live_main"), 10);
+    conn.execute("INSERT INTO main_t VALUES(1000, 'after-vacuum')")?;
+    let audit_after: Vec<(i64, String)> =
+        conn.exec_rows("SELECT id, payload FROM temp.audit WHERE id = 1000");
+    assert_eq!(audit_after, vec![(1000, "after-vacuum".to_string())]);
+    assert_eq!(scalar_i64(&conn, "SELECT COUNT(*) FROM live_main"), 11);
+    assert_eq!(run_integrity_check(&conn), "ok");
+    Ok(())
+}
+
 /// A zero-length WAL forces in-place VACUUM down the source WAL header
 /// initialization path before the first copy-back batch.
 #[cfg_attr(feature = "checksum", ignore)]
@@ -4542,6 +4712,26 @@ fn test_plain_vacuum_readonly_db_returns_readonly() -> anyhow::Result<()> {
     Ok(())
 }
 
+#[test]
+fn test_plain_vacuum_rejects_memory_database() -> anyhow::Result<()> {
+    let io: Arc<dyn IO> = Arc::new(turso_core::MemoryIO::new());
+    let db = Database::open_file(io, ":memory:")?;
+    let conn = db.connect()?;
+
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, payload TEXT)")?;
+    conn.execute("INSERT INTO t VALUES (1, 'one'), (2, 'two')")?;
+
+    let err = conn
+        .execute("VACUUM")
+        .expect_err("plain VACUUM should reject in-memory databases");
+    assert!(
+        err.to_string().contains("in-memory database"),
+        "unexpected in-memory VACUUM error: {err}"
+    );
+    assert_eq!(scalar_i64(&conn, "SELECT COUNT(*) FROM t"), 2);
+    Ok(())
+}
+
 /// Plain VACUUM works on empty databases.
 #[cfg_attr(feature = "checksum", ignore)]
 #[turso_macros::test(init_sql = "CREATE TABLE t(a INTEGER);")]
@@ -4725,6 +4915,87 @@ fn test_plain_vacuum_leaves_attached_database_untouched() -> anyhow::Result<()> 
     Ok(())
 }
 
+#[cfg_attr(feature = "checksum", ignore)]
+#[test]
+fn test_plain_vacuum_main_schema_qualified_succeeds() -> anyhow::Result<()> {
+    let tmp_db = TempDatabase::new_empty();
+    let conn = tmp_db.connect_limbo();
+
+    conn.execute("PRAGMA page_size = 1024")?;
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, payload TEXT)")?;
+    for id in 0..160 {
+        conn.execute(format!("INSERT INTO t VALUES({id}, '{}')", "m".repeat(240)))?;
+    }
+    conn.execute("DELETE FROM t WHERE id >= 20")?;
+
+    let pre_pages = scalar_i64(&conn, "PRAGMA page_count");
+    assert_plain_vacuum_preserves_content_hash_with(&tmp_db, &conn, || {
+        conn.execute("VACUUM main")?;
+        Ok(())
+    })?;
+
+    assert!(
+        scalar_i64(&conn, "PRAGMA page_count") < pre_pages,
+        "VACUUM main should compact the main database"
+    );
+    assert_eq!(scalar_i64(&conn, "SELECT COUNT(*) FROM t"), 20);
+    assert_plain_vacuum_folded_into_db_file(&tmp_db, &conn);
+    Ok(())
+}
+
+#[cfg_attr(feature = "checksum", ignore)]
+#[test]
+fn test_plain_vacuum_attached_schema_rejected_without_changes() -> anyhow::Result<()> {
+    let opts = DatabaseOpts::new().with_attach(true);
+    let tmp_db = TempDatabase::builder().with_opts(opts).build();
+    let conn = tmp_db.connect_limbo();
+
+    conn.execute("CREATE TABLE main_t(id INTEGER PRIMARY KEY, payload TEXT)")?;
+    conn.execute("INSERT INTO main_t VALUES (1, 'main-a'), (2, 'main-b')")?;
+    let attached_path = tmp_db
+        .path
+        .with_file_name("plain_vacuum_attached_reject.db");
+    conn.execute(format!(
+        "ATTACH DATABASE '{}' AS att",
+        attached_path.display()
+    ))?;
+    conn.execute("CREATE TABLE att.att_t(id INTEGER PRIMARY KEY, payload TEXT)")?;
+    conn.execute("INSERT INTO att.att_t VALUES (1, 'att-a'), (2, 'att-b')")?;
+
+    let main_count_before = scalar_i64(&conn, "SELECT COUNT(*) FROM main_t");
+    let att_count_before = scalar_i64(&conn, "SELECT COUNT(*) FROM att.att_t");
+    let main_pages_before = scalar_i64(&conn, "PRAGMA main.page_count");
+    let att_pages_before = scalar_i64(&conn, "PRAGMA att.page_count");
+
+    let err = conn
+        .execute("VACUUM att")
+        .expect_err("plain VACUUM should reject non-main schema names");
+    assert!(
+        err.to_string().contains("main database") || err.to_string().contains("att"),
+        "unexpected attached VACUUM error: {err}"
+    );
+
+    assert_eq!(
+        scalar_i64(&conn, "SELECT COUNT(*) FROM main_t"),
+        main_count_before
+    );
+    assert_eq!(
+        scalar_i64(&conn, "SELECT COUNT(*) FROM att.att_t"),
+        att_count_before
+    );
+    assert_eq!(
+        scalar_i64(&conn, "PRAGMA main.page_count"),
+        main_pages_before
+    );
+    assert_eq!(scalar_i64(&conn, "PRAGMA att.page_count"), att_pages_before);
+    conn.execute("INSERT INTO main_t VALUES (3, 'main-c')")?;
+    conn.execute("INSERT INTO att.att_t VALUES (3, 'att-c')")?;
+    assert_eq!(scalar_i64(&conn, "SELECT COUNT(*) FROM main_t"), 3);
+    assert_eq!(scalar_i64(&conn, "SELECT COUNT(*) FROM att.att_t"), 3);
+    assert_eq!(run_integrity_check(&conn), "ok");
+    Ok(())
+}
+
 /// Plain VACUUM rejects query_only mode.
 #[cfg_attr(feature = "checksum", ignore)]
 #[turso_macros::test(init_sql = "CREATE TABLE t(a INTEGER);")]
@@ -4856,6 +5127,35 @@ fn test_plain_vacuum_reprepares_stale_prepared_statement_on_other_connection(
     Ok(())
 }
 
+/// An idle prepared statement on the same connection should not block VACUUM,
+/// but it must still observe the bumped schema cookie before it runs again.
+#[cfg_attr(feature = "checksum", ignore)]
+#[turso_macros::test(init_sql = "CREATE TABLE t(a INTEGER PRIMARY KEY, b TEXT);")]
+fn test_plain_vacuum_reprepares_idle_prepared_statement_on_same_connection(
+    tmp_db: TempDatabase,
+) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+
+    conn.execute("INSERT INTO t VALUES(1, 'one'), (2, 'two'), (3, 'three')")?;
+    let mut stmt = conn.prepare("SELECT a, b FROM t WHERE a >= 2 ORDER BY a")?;
+    assert_eq!(stmt.stmt_status(StatementStatusCounter::Reprepare), 0);
+
+    assert_plain_vacuum_preserves_content_hash(&tmp_db, &conn)?;
+
+    let mut rows = Vec::new();
+    stmt.run_with_row_callback(|row| {
+        rows.push((row.get::<i64>(0)?, row.get::<String>(1)?));
+        Ok(())
+    })?;
+
+    assert_eq!(rows, vec![(2, "two".to_string()), (3, "three".to_string())]);
+    assert!(
+        stmt.stmt_status(StatementStatusCounter::Reprepare) >= 1,
+        "same-connection statement should reprepare after VACUUM bumps the schema cookie"
+    );
+    Ok(())
+}
+
 /// Plain VACUUM must reject active write statements too, not only active
 /// readers.
 #[cfg_attr(feature = "checksum", ignore)]
@@ -4944,6 +5244,42 @@ fn test_plain_vacuum_reduces_page_count(tmp_db: TempDatabase) -> anyhow::Result<
     let rows: Vec<(i64,)> = conn.exec_rows("SELECT COUNT(*) FROM t");
     assert_eq!(rows[0].0, 10);
     assert_eq!(run_integrity_check(&conn), "ok");
+    Ok(())
+}
+
+#[cfg_attr(feature = "checksum", ignore)]
+#[test]
+fn test_vacuum_clears_freelist_for_plain_and_into() -> anyhow::Result<()> {
+    let tmp_db = TempDatabase::new_empty();
+    let conn = tmp_db.connect_limbo();
+
+    conn.execute("PRAGMA page_size = 1024")?;
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, payload BLOB)")?;
+    conn.execute("CREATE INDEX idx_t_id_payload ON t(id, length(payload))")?;
+    for id in 0..220 {
+        conn.execute(format!("INSERT INTO t VALUES({id}, zeroblob(2400))"))?;
+    }
+    conn.execute("DELETE FROM t WHERE id >= 20")?;
+
+    let freelist_after_delete = scalar_i64(&conn, "PRAGMA freelist_count");
+    assert!(
+        freelist_after_delete > 0,
+        "delete workload should create free pages before VACUUM"
+    );
+
+    let dest_dir = TempDir::new()?;
+    let dest_path = dest_dir.path().join("freelist-vacuum-into.db");
+    conn.execute(format!("VACUUM INTO '{}'", dest_path.to_str().unwrap()))?;
+    let dest_db = TempDatabase::new_with_existent(&dest_path);
+    let dest_conn = dest_db.connect_limbo();
+    assert_eq!(scalar_i64(&dest_conn, "PRAGMA freelist_count"), 0);
+    assert_eq!(scalar_i64(&dest_conn, "SELECT COUNT(*) FROM t"), 20);
+    assert_eq!(run_integrity_check(&dest_conn), "ok");
+
+    assert_plain_vacuum_preserves_content_hash(&tmp_db, &conn)?;
+    assert_eq!(scalar_i64(&conn, "PRAGMA freelist_count"), 0);
+    assert_eq!(scalar_i64(&conn, "SELECT COUNT(*) FROM t"), 20);
+    assert_plain_vacuum_folded_into_db_file(&tmp_db, &conn);
     Ok(())
 }
 
@@ -5056,6 +5392,87 @@ fn test_plain_vacuum_matches_sqlite_reference_for_compacted_output() -> anyhow::
 
     let sqlite_page_count: i64 = sqlite.pragma_query_value(None, "page_count", |row| row.get(0))?;
     assert_eq!(scalar_i64(&conn, "PRAGMA page_count"), sqlite_page_count);
+    let sqlite_size = std::fs::metadata(&sqlite_path)?.len();
+    let turso_size = std::fs::metadata(&tmp_db.path)?.len();
+    assert_eq!(
+        turso_size, sqlite_size,
+        "plain VACUUM compacted file size should match SQLite"
+    );
+    Ok(())
+}
+
+#[cfg_attr(feature = "checksum", ignore)]
+#[test]
+fn test_vacuum_into_matches_sqlite_reference_page_count_and_file_size() -> anyhow::Result<()> {
+    let temp_dir = TempDir::new()?;
+    let sqlite_source_path = temp_dir.path().join("vacuum-into-source-sqlite.db");
+    let sqlite_dest_path = temp_dir.path().join("vacuum-into-dest-sqlite.db");
+    let turso_source_path = temp_dir.path().join("vacuum-into-source-turso.db");
+    let turso_dest_path = temp_dir.path().join("vacuum-into-dest-turso.db");
+
+    let sql = [
+        "PRAGMA page_size = 1024",
+        "CREATE TABLE docs(id INTEGER PRIMARY KEY, category TEXT, payload TEXT, score INTEGER)",
+        "CREATE INDEX idx_docs_category_score ON docs(category, score)",
+        "CREATE INDEX idx_docs_payload_partial ON docs(payload) WHERE score >= 50",
+        "INSERT INTO docs VALUES (1, 'a', 'alpha', 10)",
+        "INSERT INTO docs VALUES (2, 'a', 'beta', 80)",
+        "INSERT INTO docs VALUES (3, 'b', 'gamma', 75)",
+        "INSERT INTO docs VALUES (4, 'b', 'delta', 20)",
+        "INSERT INTO docs VALUES (5, 'c', 'epsilon', 95)",
+        "DELETE FROM docs WHERE id IN (1, 4)",
+        "CREATE TABLE notes(id INTEGER PRIMARY KEY, body TEXT)",
+        "INSERT INTO notes VALUES (1, 'n1'), (2, 'n2'), (3, 'n3')",
+        "DELETE FROM notes WHERE id = 2",
+    ];
+
+    let sqlite = SqliteConnection::open(&sqlite_source_path)?;
+    for stmt in sql {
+        sqlite.execute(stmt, ())?;
+    }
+    sqlite.execute(
+        &format!(
+            "VACUUM INTO '{}'",
+            escape_sqlite_string_literal(sqlite_dest_path.to_str().unwrap())
+        ),
+        (),
+    )?;
+
+    let tmp_db = TempDatabase::builder()
+        .with_db_path(&turso_source_path)
+        .build();
+    let conn = tmp_db.connect_limbo();
+    for stmt in sql {
+        conn.execute(stmt)?;
+    }
+    conn.execute(format!(
+        "VACUUM INTO '{}'",
+        escape_sqlite_string_literal(turso_dest_path.to_str().unwrap())
+    ))?;
+
+    let sqlite_dest = SqliteConnection::open(&sqlite_dest_path)?;
+    let sqlite_page_count: i64 =
+        sqlite_dest.pragma_query_value(None, "page_count", |row| row.get(0))?;
+    let sqlite_size = std::fs::metadata(&sqlite_dest_path)?.len();
+
+    let turso_dest_db = TempDatabase::new_with_existent(&turso_dest_path);
+    let turso_dest_conn = turso_dest_db.connect_limbo();
+    assert_eq!(run_integrity_check(&turso_dest_conn), "ok");
+    assert_eq!(
+        scalar_i64(&turso_dest_conn, "PRAGMA page_count"),
+        sqlite_page_count,
+        "VACUUM INTO destination page_count should match SQLite"
+    );
+    let turso_size = std::fs::metadata(&turso_dest_path)?.len();
+    assert_eq!(
+        turso_size, sqlite_size,
+        "VACUUM INTO destination file size should match SQLite"
+    );
+    assert_eq!(scalar_i64(&turso_dest_conn, "SELECT COUNT(*) FROM docs"), 3);
+    assert_eq!(
+        scalar_i64(&turso_dest_conn, "SELECT COUNT(*) FROM notes"),
+        2
+    );
     Ok(())
 }
 
@@ -5258,6 +5675,36 @@ fn test_plain_vacuum_page_size_variants_fold_and_integrity() -> anyhow::Result<(
 
 #[cfg_attr(feature = "checksum", ignore)]
 #[test]
+fn test_plain_vacuum_with_relaxed_synchronous_modes() -> anyhow::Result<()> {
+    for sync_mode in [SyncMode::Normal, SyncMode::Off] {
+        let tmp_db = TempDatabase::new_empty();
+        let conn = tmp_db.connect_limbo();
+        conn.set_sync_mode(sync_mode);
+
+        conn.execute("PRAGMA page_size = 1024")?;
+        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, payload TEXT)")?;
+        for id in 0..140 {
+            conn.execute(format!("INSERT INTO t VALUES({id}, '{}')", "s".repeat(220)))?;
+        }
+        conn.execute("DELETE FROM t WHERE id >= 30")?;
+
+        let pre_pages = scalar_i64(&conn, "PRAGMA page_count");
+        assert_plain_vacuum_preserves_content_hash(&tmp_db, &conn)?;
+
+        assert!(
+            scalar_i64(&conn, "PRAGMA page_count") < pre_pages,
+            "VACUUM should compact with synchronous={sync_mode:?}"
+        );
+        assert_eq!(scalar_i64(&conn, "SELECT COUNT(*) FROM t"), 30);
+        assert_eq!(run_integrity_check(&conn), "ok");
+        assert_plain_vacuum_folded_into_db_file(&tmp_db, &conn);
+    }
+
+    Ok(())
+}
+
+#[cfg_attr(feature = "checksum", ignore)]
+#[test]
 fn test_plain_vacuum_documented_page_size_pragma_behavior() -> anyhow::Result<()> {
     let tmp_db = TempDatabase::new_empty();
     let conn = tmp_db.connect_limbo();
@@ -5445,6 +5892,29 @@ fn test_plain_vacuum_preserves_partial_and_expression_indexes() -> anyhow::Resul
     Ok(())
 }
 
+#[cfg_attr(feature = "checksum", ignore)]
+#[test]
+fn test_vacuum_preserves_collation_sensitive_indexes() -> anyhow::Result<()> {
+    let source_db = TempDatabase::new_empty();
+    let conn = source_db.connect_limbo();
+    populate_collation_vacuum_workload(&conn)?;
+    do_flush(&conn, &source_db)?;
+    let source_hash = compute_dbhash(&source_db);
+
+    let dest_dir = TempDir::new()?;
+    let dest_path = dest_dir.path().join("collation-vacuum-into.db");
+    conn.execute(format!("VACUUM INTO '{}'", dest_path.to_str().unwrap()))?;
+    let dest_db = TempDatabase::new_with_existent(&dest_path);
+    let dest_conn = dest_db.connect_limbo();
+    assert_eq!(compute_dbhash(&dest_db).hash, source_hash.hash);
+    assert_collation_vacuum_workload(&dest_conn)?;
+
+    assert_plain_vacuum_preserves_content_hash(&source_db, &conn)?;
+    assert_collation_vacuum_workload(&conn)?;
+    assert_plain_vacuum_folded_into_db_file(&source_db, &conn);
+    Ok(())
+}
+
 /// Plain VACUUM on an encrypted source database. Exercises the per-frame
 /// decrypt branch inside `Wal::read_frames_batch`: encryption is
 /// propagated to the temp pager (see `vacuum_temp_db_encryption`), so the
@@ -5541,6 +6011,47 @@ fn test_plain_vacuum_preserves_full_autovacuum() -> anyhow::Result<()> {
 }
 
 #[test]
+fn test_vacuum_into_preserves_full_autovacuum() -> anyhow::Result<()> {
+    let opts = DatabaseOpts::new()
+        .with_encryption(true)
+        .with_autovacuum(true);
+    let (_temp_dir, tmp_db) = open_sqlite_autovacuum_db("full", opts)?;
+    let conn = tmp_db.connect_limbo();
+    let hash_opts = turso_dbhash::DbHashOptions {
+        without_schema: true,
+        ..Default::default()
+    };
+    let source_hash = compute_dbhash_with_options_and_database_opts(&tmp_db, &hash_opts, opts);
+    let dest_dir = TempDir::new()?;
+    let dest_path = dest_dir.path().join("full-autovacuum-vacuum-into.db");
+
+    assert_eq!(scalar_i64(&conn, "PRAGMA auto_vacuum"), 1);
+    conn.execute(format!("VACUUM INTO '{}'", dest_path.to_str().unwrap()))?;
+
+    let dest_db = TempDatabase::new_with_existent_with_opts(&dest_path, opts);
+    let dest_conn = dest_db.connect_limbo();
+    assert_eq!(
+        compute_dbhash_with_options_and_database_opts(&dest_db, &hash_opts, opts).hash,
+        source_hash.hash
+    );
+    assert_eq!(scalar_i64(&dest_conn, "PRAGMA auto_vacuum"), 1);
+    assert_eq!(scalar_i64(&dest_conn, "SELECT COUNT(*) FROM t"), 120);
+    assert_eq!(run_integrity_check(&dest_conn), "ok");
+
+    dest_conn.execute("CREATE TABLE extra(id INTEGER PRIMARY KEY, payload TEXT)")?;
+    for id in 0..40 {
+        dest_conn.execute(format!(
+            "INSERT INTO extra VALUES({id}, '{}')",
+            "x".repeat(80)
+        ))?;
+    }
+    dest_conn.execute("DROP TABLE extra")?;
+    assert_eq!(scalar_i64(&dest_conn, "PRAGMA auto_vacuum"), 1);
+    assert_eq!(run_integrity_check(&dest_conn), "ok");
+    Ok(())
+}
+
+#[test]
 fn test_plain_vacuum_preserves_no_autovacuum() -> anyhow::Result<()> {
     assert_plain_vacuum_preserves_autovacuum_mode("none", 0)
 }
@@ -5633,6 +6144,45 @@ fn test_plain_vacuum_checksum_multi_batch() -> anyhow::Result<()> {
 
 /// Active readers must make VACUUM fail before publishing a new WAL image. The
 /// same operation must succeed after the reader releases its snapshot.
+#[cfg_attr(feature = "checksum", ignore)]
+#[test]
+fn test_plain_vacuum_implicit_active_reader_returns_busy() -> anyhow::Result<()> {
+    let tmp_db = TempDatabase::new_empty();
+    let writer = tmp_db.connect_limbo();
+    let reader = tmp_db.connect_limbo();
+
+    writer.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, payload TEXT)")?;
+    for id in 0..120 {
+        writer.execute(format!("INSERT INTO t VALUES({id}, '{}')", "r".repeat(220)))?;
+    }
+    writer.execute("DELETE FROM t WHERE id >= 20")?;
+
+    let mut stmt = reader.prepare("SELECT id FROM t ORDER BY id")?;
+    loop {
+        match stmt.step()? {
+            StepResult::IO => stmt.get_pager().io.step()?,
+            StepResult::Row => break,
+            other => panic!("expected active reader row before VACUUM, got {other:?}"),
+        }
+    }
+    assert_eq!(
+        stmt.row().unwrap().get_values().next(),
+        Some(&Value::from_i64(0))
+    );
+
+    let result = writer.execute("VACUUM");
+    assert!(
+        matches!(result, Err(LimboError::Busy)),
+        "implicit active reader should make VACUUM return Busy, got {result:?}"
+    );
+
+    stmt.reset()?;
+    assert_plain_vacuum_preserves_content_hash(&tmp_db, &writer)?;
+    assert_eq!(scalar_i64(&writer, "SELECT COUNT(*) FROM t"), 20);
+    assert_plain_vacuum_folded_into_db_file(&tmp_db, &writer);
+    Ok(())
+}
+
 #[cfg_attr(feature = "checksum", ignore)]
 #[test]
 fn test_plain_vacuum_active_reader_blocks_fold_contract() -> anyhow::Result<()> {

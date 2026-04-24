@@ -222,6 +222,7 @@ async fn test_plain_vacuum_file_backed_smoke() {
     let dir = tempfile::tempdir().unwrap();
     let db_path = dir.path().join("vacuum-smoke.db");
     let db = Builder::new_local(db_path.to_str().unwrap())
+        .experimental_vacuum(true)
         .build()
         .await
         .unwrap();
