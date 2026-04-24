@@ -1882,6 +1882,7 @@ pub fn fire_fk_update_actions(
     new_rowid_reg: usize,
     connection: &Arc<Connection>,
     database_id: usize,
+    updated_positions: &ColumnMask,
 ) -> Result<()> {
     let parent_bt = resolver
         .with_schema(database_id, |s| s.get_btree_table(parent_table_name))
@@ -1890,6 +1891,16 @@ pub fn fire_fk_update_actions(
     for fk_ref in resolver.with_schema(database_id, |s| {
         s.resolved_fks_referencing(parent_table_name)
     })? {
+        // Skip FKs whose referenced parent-key column isn't in this UPDATE's
+        // SET list. Without this filter a self-referential ON UPDATE CASCADE
+        // recurses at translate-time: the cascade UPDATE on the child (same
+        // table) re-enters this function for its own FKs and emits another
+        // cascade subprogram, until the host stack overflows. Runtime skips
+        // via `emit_key_change_check` don't help because the recursion is
+        // during subprogram code generation.
+        if !fk_ref.parent_key_may_change(updated_positions, &parent_bt)? {
+            continue;
+        }
         let parent_cols: &[String] = &fk_ref.parent_cols;
         let ncols = parent_cols.len();
 
