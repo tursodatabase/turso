@@ -58,43 +58,28 @@ impl InteractionPlan {
             return Some(interactions);
         }
 
-        let num_interactions = env.opts.max_interactions as usize;
-        // If last interaction needs to check all db tables, generate the Property to do so.
-        // But only generate the interaction if we actually have any tables to check
-        // This can happen if we created a table, and then deleted the table, and there are no more tables to check
-        if let Some(i) = self.last_interactions()
-            && i.check_tables()
-            && !env
-                .connection_context(i.connection_index)
-                .tables()
-                .is_empty()
-        {
-            let interactions = if let InteractionsType::Query(query) = &i.interactions {
-                assert!(query.is_dml());
-                let mut table = query.uses();
-                assert!(table.len() == 1);
-                let table = table.pop().unwrap();
-
-                Interactions::new(
-                    i.connection_index,
-                    InteractionsType::Property(Property::TableHasExpectedContent { table }),
-                )
-            } else {
-                Interactions::new(
-                    i.connection_index,
-                    InteractionsType::Property(Property::AllTableHaveExpectedContent {
-                        tables: env
-                            .connection_context(i.connection_index)
-                            .tables()
-                            .iter()
-                            .map(|t| t.name.clone())
-                            .collect(),
-                    }),
-                )
-            };
-
-            return Some(interactions);
+        if env.profile.io.fault.enable {
+            if self.plan.len() == 1 {
+                let conn_index = env.choose_conn(rng);
+                let conn_ctx = &env.connection_context(conn_index);
+                let insert = sql_generation::model::query::Insert::arbitrary(rng, conn_ctx);
+                return Some(Interactions::new(
+                    conn_index,
+                    InteractionsType::Query(Query::Insert(insert)),
+                ));
+            }
+            if self.plan.len() == 2 {
+                return Some(Interactions::new(
+                    0,
+                    InteractionsType::Fault(Fault::CheckpointAsyncFault),
+                ));
+            }
+            if self.plan.len() == 3 {
+                return Some(Interactions::new(0, InteractionsType::Checkpoint));
+            }
         }
+
+        let num_interactions = env.opts.max_interactions as usize;
 
         if self.len_properties() < num_interactions {
             let conn_index = env.choose_conn(rng);
@@ -324,6 +309,12 @@ impl Interactions {
             InteractionsType::Fault(fault) => {
                 let mut builder =
                     InteractionBuilder::with_interaction(InteractionType::Fault(*fault));
+                builder.connection_index(self.connection_index).id(id);
+                let interaction = builder.build().unwrap();
+                vec![interaction]
+            }
+            InteractionsType::Checkpoint => {
+                let mut builder = InteractionBuilder::with_interaction(InteractionType::Checkpoint);
                 builder.connection_index(self.connection_index).id(id);
                 let interaction = builder.build().unwrap();
                 vec![interaction]
