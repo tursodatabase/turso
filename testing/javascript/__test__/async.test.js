@@ -322,6 +322,51 @@ test.serial("Statement.get() [blob]", async (t) => {
   t.deepEqual(result.data, binaryData, "Blob data should match original");
 });
 
+test.serial("Statement.get() [empty blob]", async (t) => {
+  const db = t.context.db;
+
+  await db.exec("CREATE TABLE IF NOT EXISTS blobs (id INTEGER PRIMARY KEY, data BLOB)");
+
+  // Insert an empty blob (zeroblob(0))
+  const insertStmt = await db.prepare("INSERT INTO blobs (data) VALUES (zeroblob(0))");
+  await insertStmt.run();
+
+  const selectStmt = await db.prepare("SELECT data FROM blobs WHERE id = 1");
+  const result = await selectStmt.get();
+
+  t.truthy(result, "Should return a result");
+  t.truthy(result.data, "Empty blob should not decode to null");
+  t.true(Buffer.isBuffer(result.data), "Should return Buffer for empty blob data");
+  t.is(result.data.length, 0, "Empty blob should have length 0");
+});
+
+test.serial("Statement.run() lastInsertRowid is 0 on fresh connection", async (t) => {
+  // On a fresh connection with no prior inserts, lastInsertRowid is 0.
+  // The serverless driver must not drop this as falsy.
+  const [freshDb, freshPath] = await connect();
+  try {
+    await freshDb.exec("CREATE TABLE rowid_test (id INTEGER PRIMARY KEY)");
+    const stmt = await freshDb.prepare("CREATE TABLE rowid_test2 (id INTEGER PRIMARY KEY)");
+    const info = await stmt.run();
+    t.is(info.lastInsertRowid, 0,
+      "lastInsertRowid should be 0, not undefined");
+  } finally {
+    await freshDb.close();
+  }
+});
+
+test.serial("Integer parameter stored in TEXT column preserves integer format", async (t) => {
+  const db = t.context.db;
+
+  await db.exec("CREATE TABLE int_text_test (a TEXT)");
+  const stmt = await db.prepare("INSERT INTO int_text_test VALUES (?)");
+  await stmt.run([42]);
+
+  const select = await db.prepare("SELECT a FROM int_text_test");
+  const row = await select.get();
+  t.is(row.a, "42", "Integer 42 in TEXT column should be '42', not '42.0'");
+});
+
 // ==========================================================================
 // Statement.iterate()
 // ==========================================================================
