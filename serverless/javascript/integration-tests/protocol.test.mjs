@@ -33,6 +33,13 @@ test('decodeValue decodes empty base64 blob as empty Buffer', t => {
   t.is(result.length, 0);
 });
 
+test('decodeValue decodes blob without base64 key as empty Buffer', t => {
+  const result = decodeValue({ type: 'blob' });
+  t.truthy(result, 'blob without base64 key should not decode to null');
+  t.true(Buffer.isBuffer(result), 'should be a Buffer');
+  t.is(result.length, 0);
+});
+
 test('decodeValue decodes unpadded base64 blob', t => {
   // 'aGVsbG8' is 'hello' without trailing '=' padding
   const result = decodeValue({ type: 'blob', base64: 'aGVsbG8' });
