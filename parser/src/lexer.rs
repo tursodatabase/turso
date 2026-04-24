@@ -838,9 +838,8 @@ impl<'a> Lexer<'a> {
             b'?' => {
                 self.eat_while(|b| b.is_ascii_digit());
 
-                // do not include '? in the value
                 Ok(Token::new(
-                    &self.input[start + 1..self.offset],
+                    &self.input[start..self.offset],
                     TokenType::TK_VARIABLE,
                 ))
             }
@@ -1049,8 +1048,9 @@ mod tests {
             (b"]".as_slice(), Token::new(b"]", TokenType::TK_RBRACKET)),
             (
                 b"?123".as_slice(),
-                Token::new(b"123", TokenType::TK_VARIABLE), // '?' omitted from value
+                Token::new(b"?123", TokenType::TK_VARIABLE),
             ),
+            (b"?".as_slice(), Token::new(b"?", TokenType::TK_VARIABLE)),
             (
                 b"$var_name".as_slice(),
                 Token::new(b"$var_name", TokenType::TK_VARIABLE),
