@@ -2761,3 +2761,342 @@ expect {
     1|hello
     2|world
 }
+
+# === Adversarial bughunt regressions (hunt summary: 435+ scenarios, no bugs). ===
+# These verify invariants that are specifically load-bearing for UPDATE…FROM.
+
+# Multi-match with an accumulating SET expression: the SET RHS is evaluated
+# from the pre-update (snapshot) row image, so multiple matches do NOT each
+# re-increment. All matches write the same pre-image calculation.
+@cross-check-integrity
+test update-from-snapshot-accumulate-stays-one {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, cnt INTEGER);
+    CREATE TABLE s(id INTEGER);
+    INSERT INTO t VALUES(1,0),(2,0);
+    INSERT INTO s VALUES(1),(1),(1),(2);
+    UPDATE t SET cnt = cnt + 1 FROM s WHERE t.id = s.id;
+    SELECT * FROM t ORDER BY id;
+}
+expect {
+    1|1
+    2|1
+}
+
+# BEFORE UPDATE trigger that RAISE(IGNORE)s based on NEW values skips
+# individual rows; other matched rows still update normally.
+@cross-check-integrity
+test update-from-before-trigger-raise-ignore-conditional {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, v INTEGER);
+    CREATE TABLE s(id INTEGER, v INTEGER);
+    INSERT INTO t VALUES(1,0),(2,0),(3,0);
+    INSERT INTO s VALUES(1,100),(2,200),(3,300);
+    CREATE TRIGGER trg BEFORE UPDATE ON t FOR EACH ROW WHEN NEW.v > 150 AND NEW.v < 250 BEGIN
+      SELECT RAISE(IGNORE);
+    END;
+    UPDATE t SET v = s.v FROM s WHERE t.id = s.id;
+    SELECT * FROM t ORDER BY id;
+}
+expect {
+    1|100
+    2|0
+    3|300
+}
+
+# A trigger that deletes rows from the source mid-update must not affect the
+# already-materialized write set: both target rows still update.
+@cross-check-integrity
+test update-from-trigger-deletes-source-mid-flight {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, v INTEGER);
+    CREATE TABLE s(id INTEGER, v INTEGER);
+    INSERT INTO t VALUES(1,10),(2,20);
+    INSERT INTO s VALUES(1,100),(2,200);
+    CREATE TRIGGER trg BEFORE UPDATE ON t FOR EACH ROW BEGIN
+      DELETE FROM s;
+    END;
+    UPDATE t SET v = s.v FROM s WHERE t.id = s.id;
+    SELECT 't'; SELECT * FROM t ORDER BY id;
+    SELECT 's'; SELECT count(*) FROM s;
+}
+expect {
+    t
+    1|100
+    2|200
+    s
+    0
+}
+
+# A trigger that inserts new target rows during the write phase does NOT
+# observe those inserts as new join matches: the write set is frozen.
+@cross-check-integrity
+test update-from-trigger-inserts-target-not-matched {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, v INTEGER);
+    CREATE TABLE s(id INTEGER, v INTEGER);
+    INSERT INTO t VALUES(1,10);
+    INSERT INTO s VALUES(1,100),(2,200);
+    CREATE TRIGGER trg AFTER UPDATE ON t FOR EACH ROW BEGIN
+      INSERT INTO t(id, v) VALUES(2, 0);
+    END;
+    UPDATE t SET v = s.v FROM s WHERE t.id = s.id;
+    SELECT * FROM t ORDER BY id;
+}
+expect {
+    1|100
+    2|0
+}
+
+# GLOB pattern as the join predicate.
+@cross-check-integrity
+test update-from-glob-pattern-join {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT);
+    CREATE TABLE s(pat TEXT, newv TEXT);
+    INSERT INTO t VALUES(1,'foo1'),(2,'bar2'),(3,'foo3');
+    INSERT INTO s VALUES('foo*','F'),('bar*','B');
+    UPDATE t SET v = s.newv FROM s WHERE t.v GLOB s.pat;
+    SELECT * FROM t ORDER BY id;
+}
+expect {
+    1|F
+    2|B
+    3|F
+}
+
+# LIKE … ESCAPE with the source supplying the pattern.
+@cross-check-integrity
+test update-from-like-escape-join {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT);
+    CREATE TABLE s(p TEXT, newv TEXT);
+    INSERT INTO t VALUES(1,'x%y'),(2,'x_y'),(3,'xAy');
+    INSERT INTO s VALUES('x\%y','escaped-percent');
+    UPDATE t SET v = s.newv FROM s WHERE t.v LIKE s.p ESCAPE '\';
+    SELECT * FROM t ORDER BY id;
+}
+expect {
+    1|escaped-percent
+    2|x_y
+    3|xAy
+}
+
+# Row-value equality as the join predicate: (t.a, t.b) = (s.a, s.b).
+@cross-check-integrity
+test update-from-row-value-equality-join {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, a INTEGER, b INTEGER, v INTEGER);
+    CREATE TABLE s(a INTEGER, b INTEGER, newv INTEGER);
+    INSERT INTO t VALUES(1,1,2,10),(2,3,4,20),(3,5,6,30);
+    INSERT INTO s VALUES(1,2,100),(3,4,200);
+    UPDATE t SET v = s.newv FROM s WHERE (t.a, t.b) = (s.a, s.b);
+    SELECT * FROM t ORDER BY id;
+}
+expect {
+    1|1|2|100
+    2|3|4|200
+    3|5|6|30
+}
+
+# IS NOT DISTINCT FROM is NULL-safe: NULL=NULL matches in the join.
+@cross-check-integrity
+test update-from-is-not-distinct-from-join {
+    CREATE TABLE t(id INTEGER, v INTEGER);
+    CREATE TABLE s(id INTEGER, v INTEGER);
+    INSERT INTO t VALUES(1,10),(NULL,20),(2,30);
+    INSERT INTO s VALUES(1,100),(NULL,999),(2,200);
+    UPDATE t SET v = s.v FROM s WHERE t.id IS NOT DISTINCT FROM s.id;
+    SELECT coalesce(id,-1), v FROM t ORDER BY coalesce(id,-1);
+}
+expect {
+    -1|999
+    1|100
+    2|200
+}
+
+# A table-valued function (pragma_table_info) can serve as the FROM source.
+@cross-check-integrity
+test update-from-pragma-table-info-source {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, colname TEXT);
+    INSERT INTO t VALUES(0,''),(1,'');
+    UPDATE t SET colname = pi.name FROM pragma_table_info('t') AS pi WHERE t.id = pi.cid;
+    SELECT * FROM t ORDER BY id;
+}
+expect {
+    0|id
+    1|colname
+}
+
+# Source rowid in the SET RHS expression.
+@cross-check-integrity
+test update-from-source-rowid-in-set-expr {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, v INTEGER);
+    CREATE TABLE s(v INTEGER);
+    INSERT INTO t VALUES(1,10),(2,20),(3,30);
+    INSERT INTO s VALUES(100),(200),(300);
+    UPDATE t SET v = s.v + s.rowid * 1000 FROM s WHERE t.id = s.rowid;
+    SELECT * FROM t ORDER BY id;
+}
+expect {
+    1|1100
+    2|2200
+    3|3300
+}
+
+# Explicit CROSS JOIN syntax in the FROM clause.
+@cross-check-integrity
+test update-from-explicit-cross-join {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, v INTEGER);
+    CREATE TABLE a(id INTEGER, x INTEGER);
+    CREATE TABLE b(id INTEGER, y INTEGER);
+    INSERT INTO t VALUES(1,10),(2,20);
+    INSERT INTO a VALUES(1,1),(2,2);
+    INSERT INTO b VALUES(1,10),(2,20);
+    UPDATE t SET v = a.x + b.y FROM a CROSS JOIN b WHERE a.id = t.id AND b.id = t.id;
+    SELECT * FROM t ORDER BY id;
+}
+expect {
+    1|11
+    2|22
+}
+
+# BETWEEN with source-side bounds as the join predicate.
+@cross-check-integrity
+test update-from-between-source-bounds {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, v INTEGER);
+    CREATE TABLE s(lo INTEGER, hi INTEGER, delta INTEGER);
+    INSERT INTO t VALUES(5,0),(10,0),(15,0),(20,0);
+    INSERT INTO s VALUES(0,9,1),(10,19,5),(20,29,10);
+    UPDATE t SET v = v + s.delta FROM s WHERE t.id BETWEEN s.lo AND s.hi;
+    SELECT * FROM t ORDER BY id;
+}
+expect {
+    5|1
+    10|5
+    15|5
+    20|10
+}
+
+# Chain rowid remap (5→8, 6→5, 7→6) — each update observes the pre-update
+# target rowid image; no intermediate collision.
+@cross-check-integrity
+test update-from-chain-rowid-remap {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, v INTEGER);
+    CREATE TABLE s(old INTEGER, newk INTEGER);
+    INSERT INTO t VALUES(5,5),(6,6),(7,7);
+    INSERT INTO s VALUES(5,8),(6,5),(7,6);
+    UPDATE t SET id = s.newk FROM s WHERE t.id = s.old;
+    SELECT * FROM t ORDER BY id;
+}
+expect {
+    5|6
+    6|7
+    8|5
+}
+
+# Setting the rowid alias AND another column together in one UPDATE FROM.
+@cross-check-integrity
+test update-from-rowid-alias-plus-column {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, v INTEGER);
+    CREATE TABLE s(old INTEGER, newk INTEGER, newv INTEGER);
+    INSERT INTO t VALUES(1,10),(2,20);
+    INSERT INTO s VALUES(1,100,1000);
+    UPDATE t SET id = s.newk, v = s.newv FROM s WHERE t.id = s.old;
+    SELECT * FROM t ORDER BY id;
+}
+expect {
+    2|20
+    100|1000
+}
+
+# OR IGNORE with multi-match where each target's intended value conflicts
+# with another target's current (pre-update) unique value: SQLite leaves
+# all rows untouched because per-row IGNORE is a no-op at the statement
+# level when none of the applied SETs ever commits successfully under
+# write-set semantics.
+@cross-check-integrity
+test update-from-or-ignore-mutual-unique-conflict {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, u INTEGER UNIQUE);
+    CREATE TABLE s(id INTEGER, u INTEGER);
+    INSERT INTO t VALUES(1,10),(2,20),(3,30);
+    INSERT INTO s VALUES(1,20),(2,10);
+    UPDATE OR IGNORE t SET u = s.u FROM s WHERE t.id = s.id;
+    SELECT * FROM t ORDER BY id;
+}
+expect {
+    1|10
+    2|20
+    3|30
+}
+
+# BEFORE UPDATE trigger observes NEW.<col> as the source-provided value.
+@cross-check-integrity
+test update-from-before-trigger-new-is-source-value {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, v INTEGER);
+    CREATE TABLE s(id INTEGER, v INTEGER);
+    CREATE TABLE log(id INTEGER, oldv INTEGER, newv INTEGER);
+    INSERT INTO t VALUES(1,10),(2,20);
+    INSERT INTO s VALUES(1,100),(2,200);
+    CREATE TRIGGER trg BEFORE UPDATE ON t FOR EACH ROW BEGIN
+      INSERT INTO log VALUES(OLD.id, OLD.v, NEW.v);
+    END;
+    UPDATE t SET v = s.v FROM s WHERE t.id = s.id;
+    SELECT * FROM log ORDER BY id;
+}
+expect {
+    1|10|100
+    2|20|200
+}
+
+# LEFT JOIN in the source where the right side is absent: SET expression
+# sees NULL on the FROM side and coalesces to a target-derived default.
+@cross-check-integrity
+test update-from-left-join-null-in-set {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, v INTEGER);
+    CREATE TABLE a(id INTEGER);
+    CREATE TABLE b(id INTEGER, v INTEGER);
+    INSERT INTO t VALUES(1,10),(2,20);
+    INSERT INTO a VALUES(1),(2);
+    INSERT INTO b VALUES(1,100);
+    UPDATE t SET v = coalesce(b.v, -1) FROM a LEFT JOIN b ON a.id = b.id WHERE t.id = a.id;
+    SELECT * FROM t ORDER BY id;
+}
+expect {
+    1|100
+    2|-1
+}
+
+# Cascade of AFTER-UPDATE triggers: UPDATE FROM on t fires trg_t which
+# updates u, which fires trg_u which updates w.
+@cross-check-integrity
+test update-from-cascade-afters-through-three-tables {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, v INTEGER);
+    CREATE TABLE u(id INTEGER PRIMARY KEY, v INTEGER);
+    CREATE TABLE w(id INTEGER PRIMARY KEY, v INTEGER);
+    CREATE TABLE s(id INTEGER, v INTEGER);
+    INSERT INTO t VALUES(1,0);
+    INSERT INTO u VALUES(1,0);
+    INSERT INTO w VALUES(1,0);
+    INSERT INTO s VALUES(1,100);
+    CREATE TRIGGER trg_t AFTER UPDATE ON t BEGIN UPDATE u SET v = NEW.v + 1 WHERE id = NEW.id; END;
+    CREATE TRIGGER trg_u AFTER UPDATE ON u BEGIN UPDATE w SET v = NEW.v + 1 WHERE id = NEW.id; END;
+    UPDATE t SET v = s.v FROM s WHERE t.id = s.id;
+    SELECT 't'; SELECT * FROM t;
+    SELECT 'u'; SELECT * FROM u;
+    SELECT 'w'; SELECT * FROM w;
+}
+expect {
+    t
+    1|100
+    u
+    1|101
+    w
+    1|102
+}
+
+# A CTE that shadows the base source table with a self-reference is a
+# circular CTE and must be rejected at planning time.
+test update-from-cte-shadows-source-is-circular {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, v INTEGER);
+    CREATE TABLE s(id INTEGER, v INTEGER);
+    INSERT INTO t VALUES(1,10);
+    INSERT INTO s VALUES(1,100);
+    WITH s(id, v) AS (SELECT id, v*10 FROM s)
+    UPDATE t SET v = s.v FROM s WHERE t.id = s.id;
+}
+expect error {
+}
