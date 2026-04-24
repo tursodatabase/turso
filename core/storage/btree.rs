@@ -7636,7 +7636,7 @@ fn defragment_page(page: &PageContent, usable_space: usize, max_frag_bytes: isiz
     // Use stack allocation for the common case (most pages have <256 cells).
     // This avoids heap allocation in the hot path.
     // MAX_STACK_CELLS * 16 bytes = 4KB of stack space.
-    const MAX_STACK_CELLS: usize = 256;
+    const MAX_STACK_CELLS: usize = 256 / 16;
 
     // Helper function to process cells and defragment the page.
     // This is generic over the slice type to work with both stack and heap storage.
