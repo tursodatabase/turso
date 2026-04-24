@@ -1327,3 +1327,61 @@ test agg_collate_no_leak_with_count {
 expect {
     a|a|2
 }
+
+# SQLite rule 2 for binary-comparison collation: "If either operand is a
+# column, then the collating function of that column is used with precedence
+# to the left operand." A column always has a collation — BINARY by default.
+# A defaulted-BINARY LHS column must therefore beat a NOCASE RHS column,
+# not silently inherit the RHS collation.
+test collate_lhs_default_binary_beats_rhs_nocase_column {
+    CREATE TABLE coll_t(v TEXT);
+    CREATE TABLE coll_s(name TEXT COLLATE NOCASE);
+    INSERT INTO coll_t VALUES('a'),('A');
+    INSERT INTO coll_s VALUES('A');
+    SELECT coll_t.v FROM coll_t, coll_s WHERE coll_t.v = coll_s.name;
+}
+expect {
+    A
+}
+
+# Swapped operands: the same rule with LHS precedence means the NOCASE
+# column now drives the comparison, so both rows match.
+test collate_lhs_nocase_column_beats_rhs_default_binary {
+    CREATE TABLE coll_t2(v TEXT);
+    CREATE TABLE coll_s2(name TEXT COLLATE NOCASE);
+    INSERT INTO coll_t2 VALUES('a'),('A');
+    INSERT INTO coll_s2 VALUES('A');
+    SELECT coll_t2.v FROM coll_t2, coll_s2 WHERE coll_s2.name = coll_t2.v ORDER BY coll_t2.v;
+}
+expect {
+    A
+    a
+}
+
+# Same LHS-precedence rule applies to IN against a subquery: the LHS
+# operand's column collation drives comparison with the subquery result
+# (previously a latent bug: NOCASE from the RHS subquery column leaked in).
+test collate_in_subquery_uses_lhs_column_collation {
+    CREATE TABLE coll_t3(v TEXT);
+    CREATE TABLE coll_s3(name TEXT COLLATE NOCASE);
+    INSERT INTO coll_t3 VALUES('a'),('A'),('B');
+    INSERT INTO coll_s3 VALUES('A');
+    SELECT coll_t3.v FROM coll_t3 WHERE coll_t3.v IN (SELECT name FROM coll_s3);
+}
+expect {
+    A
+}
+
+# Sanity check: explicit COLLATE on either side still wins over column
+# collations, regardless of LHS/RHS position.
+test collate_explicit_on_rhs_beats_lhs_column {
+    CREATE TABLE coll_t4(v TEXT);
+    CREATE TABLE coll_s4(name TEXT COLLATE NOCASE);
+    INSERT INTO coll_t4 VALUES('a'),('A');
+    INSERT INTO coll_s4 VALUES('A');
+    SELECT coll_t4.v FROM coll_t4, coll_s4 WHERE coll_t4.v = coll_s4.name COLLATE NOCASE ORDER BY coll_t4.v;
+}
+expect {
+    A
+    a
+}

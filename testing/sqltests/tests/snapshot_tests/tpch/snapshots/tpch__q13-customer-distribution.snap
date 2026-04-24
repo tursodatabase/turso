@@ -138,7 +138,7 @@ addr  opcode                                p1   p2   p3  p4                    
   94            Integer                      0    5    0                                               0  r[5]=0
   95          Return                        13    0    0                                               0
   96          EndCoroutine                   1    0    0                                               0
-  97          SorterOpen                     5    3    0  k(3,-B,-B,Binary)                            0  cursor=5
+  97          SorterOpen                     5    3    0  k(3,-B,-B,B)                                 0  cursor=5
   98          Null                           0   36    0                                               0  r[36]=NULL
   99          SorterOpen                     6    1    0  k(1,-B)                                      0  cursor=6
  100          Integer                        0   33    0                                               0  r[33]=0; clear group by abort flag

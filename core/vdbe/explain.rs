@@ -1,3 +1,4 @@
+use crate::translate::collate::CollationSeq;
 use crate::vdbe::{builder::CursorType, insn::RegisterOrLiteral};
 use crate::HashSet;
 use turso_parser::ast::{ResolveType, SortOrder};
@@ -1250,10 +1251,13 @@ pub fn insn_to_row(
                             SortOrder::Asc => "",
                             SortOrder::Desc => "-",
                         };
-                        let coll_str = if let Some(coll) = collation {
-                            format!("{sign}{coll}")
-                        } else {
-                            format!("{sign}B")
+                        // Match SQLite: print `B` as the shorthand for
+                        // BINARY, whether it came from an explicit
+                        // `COLLATE BINARY` clause or was the default for a
+                        // column without a COLLATE clause.
+                        let coll_str = match collation {
+                            Some(CollationSeq::Binary) | None => format!("{sign}B"),
+                            Some(coll) => format!("{sign}{coll}"),
                         };
                         match nulls {
                             Some(turso_parser::ast::NullsOrder::First) => format!("{coll_str} NF"),
