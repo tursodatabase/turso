@@ -200,8 +200,14 @@ fn get_collseq_parts_from_expr(
                 let column = table_ref
                     .get_column_at(*column)
                     .ok_or_else(|| crate::LimboError::ParseError("column not found".to_string()))?;
+                // Per SQLite rule 2, "if either operand is a column, then
+                // the collating function of that column is used", so a
+                // defaulted (BINARY) column must still register a column
+                // collation — otherwise a defaulted LHS column would
+                // incorrectly yield to a NOCASE RHS column in
+                // `resolve_comparison_collseq`.
                 if maybe_column_collseq.is_none() {
-                    maybe_column_collseq = column.collation_opt();
+                    maybe_column_collseq = Some(column.collation());
                 }
                 return Ok(WalkControl::Continue);
             }
@@ -212,7 +218,7 @@ fn get_collseq_parts_from_expr(
                 if let Some(btree) = table_ref.btree() {
                     if let Some((_, rowid_alias_col)) = btree.get_rowid_alias_column() {
                         if maybe_column_collseq.is_none() {
-                            maybe_column_collseq = rowid_alias_col.collation_opt();
+                            maybe_column_collseq = Some(rowid_alias_col.collation());
                         }
                     }
                 }
@@ -241,15 +247,19 @@ mod tests {
 
     #[test]
     fn test_get_collseq_from_expr_single_table_single_column() {
-        // plain column
-        for collation in [
-            None,
-            Some(CollationSeq::Binary),
-            Some(CollationSeq::NoCase),
-            Some(CollationSeq::Rtrim),
+        // Plain column. A column without an explicit COLLATE clause still
+        // has the default BINARY collation per SQLite semantics — rule 2 of
+        // comparison collation says "if either operand is a column, the
+        // collating function of that column is used", so we must report the
+        // defaulted BINARY rather than None.
+        for (input, expected) in [
+            (None, Some(CollationSeq::Binary)),
+            (Some(CollationSeq::Binary), Some(CollationSeq::Binary)),
+            (Some(CollationSeq::NoCase), Some(CollationSeq::NoCase)),
+            (Some(CollationSeq::Rtrim), Some(CollationSeq::Rtrim)),
         ] {
             let table_references =
-                get_table_references_single_table_single_column_with_collation(collation);
+                get_table_references_single_table_single_column_with_collation(input);
             let expr = Expr::Column {
                 database: None,
                 table: TableInternalId::from(1),
@@ -257,7 +267,7 @@ mod tests {
                 is_rowid_alias: false,
             };
             let collseq = get_collseq_from_expr(&expr, &table_references).unwrap();
-            assert_eq!(collseq, collation);
+            assert_eq!(collseq, expected);
         }
     }
 
@@ -429,7 +439,9 @@ mod tests {
 
     #[test]
     fn test_resolve_comparison_collseq_nocase_column_vs_binary_default() {
-        // LHS has NOCASE column, RHS has no collation → NOCASE
+        // Both sides are columns, so per SQLite rule 2 the LHS column's
+        // collation wins regardless of whether it was declared explicitly
+        // or defaults to BINARY.
         let table_refs = get_table_references_two_tables_single_column_with_collations(
             Some(CollationSeq::NoCase),
             None,
@@ -446,14 +458,15 @@ mod tests {
             column: 0,
             is_rowid_alias: false,
         };
+        // LHS is NOCASE column → NOCASE.
         assert_eq!(
             resolve_comparison_collseq(&lhs, &rhs, &table_refs).unwrap(),
             CollationSeq::NoCase
         );
-        // Swapped: RHS has NOCASE, LHS has no collation → still NOCASE
+        // Swapped: LHS is a BINARY (default) column → BINARY (not NOCASE).
         assert_eq!(
             resolve_comparison_collseq(&rhs, &lhs, &table_refs).unwrap(),
-            CollationSeq::NoCase
+            CollationSeq::Binary
         );
     }
 
