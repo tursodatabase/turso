@@ -1354,7 +1354,7 @@ fn emit_commit_phase(
         });
 
         if let Some(lbl) = commit_skip_label {
-            program.resolve_label(lbl, program.offset());
+            program.preassign_label_to_next_insn(lbl);
         }
     }
     Ok(())
@@ -2884,7 +2884,7 @@ fn emit_index_uniqueness_check(
 
     // Close the partial-index skip (preflight)
     if let Some(lbl) = maybe_skip_probe_label {
-        program.resolve_label(lbl, program.offset());
+        program.preassign_label_to_next_insn(lbl);
     }
     Ok(())
 }
