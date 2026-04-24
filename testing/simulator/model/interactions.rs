@@ -301,7 +301,14 @@ impl Interactions {
         match &self.interactions {
             InteractionsType::Property(property) => property.check_tables(),
             InteractionsType::Query(query) => query.is_dml(),
-            InteractionsType::Fault(..) => false,
+            // REOPEN_DATABASE tears down all connections and re-opens the
+            // database, which exercises the on-disk recovery path (WAL replay,
+            // header re-read, schema reload). Any committed row must still be
+            // visible afterwards, so we verify it using the shared
+            // `AllTableHaveExpectedContent` check. DISCONNECT only affects a
+            // single in-memory connection and doesn't touch persistence, so
+            // we don't follow it with a check.
+            InteractionsType::Fault(fault) => matches!(fault, Fault::ReopenDatabase),
         }
     }
 
