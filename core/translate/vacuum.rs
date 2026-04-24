@@ -43,6 +43,11 @@ pub fn translate_vacuum(
                         .to_string(),
                 ));
             }
+            if connection.experimental_custom_types_enabled() {
+                return Err(LimboError::ParseError(
+                    "VACUUM is incompatible with custom types".to_string(),
+                ));
+            }
             if connection.experimental_multiprocess_wal_enabled() {
                 return Err(LimboError::ParseError(
                     "VACUUM is incompatible with experimental multiprocess WAL".to_string(),
