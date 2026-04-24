@@ -9128,8 +9128,8 @@ pub fn op_insert(
                     let cursor = state.get_cursor(*cursor_id);
                     let cursor = cursor.as_btree_mut();
                     if !cursor.has_rowid() {
-                        state.op_insert_state.old_record = None;
-                        state.op_insert_state.sub_state = OpInsertSubState::NoopCheck;
+                        state.active_op_state.insert().old_record = None;
+                        state.active_op_state.insert().sub_state = OpInsertSubState::NoopCheck;
                         continue;
                     }
                 }
