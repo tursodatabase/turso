@@ -156,7 +156,7 @@ export function decodeValue(value: Value, safeIntegers: boolean = false): any {
         }
         return Buffer.from(bytes);
       }
-      return null;
+      return Buffer.alloc(0);
     default:
       return null;
   }
