@@ -58,6 +58,7 @@ use alter::translate_alter_table;
 use analyze::translate_analyze;
 use index::{translate_create_index, translate_drop_index, translate_optimize};
 use insert::translate_insert;
+use recursive::recursive;
 use rollback::{translate_release, translate_rollback, translate_savepoint};
 use schema::{translate_create_table, translate_create_virtual_table, translate_drop_table};
 use select::translate_select;
@@ -65,6 +66,8 @@ use tracing::{instrument, Level};
 use transaction::{translate_tx_begin, translate_tx_commit};
 use turso_parser::ast;
 use update::translate_update;
+
+const RECURSIVE_MINIMUM_STACK_SIZE: usize = 48 * 1024;
 
 #[instrument(skip_all, level = Level::DEBUG)]
 #[allow(clippy::too_many_arguments)]
@@ -77,6 +80,7 @@ pub fn translate(
     query_mode: QueryMode,
     input: &str,
 ) -> Result<Program> {
+    recursive::set_minimum_stack_size(RECURSIVE_MINIMUM_STACK_SIZE);
     tracing::trace!("querying {}", input);
     let change_cnt_on = matches!(
         stmt,
@@ -128,6 +132,7 @@ pub fn translate(
 // TODO: for now leaving the return value as a Program. But ideally to support nested parsing of arbitraty
 // statements, we would have to return a program builder instead
 /// Translate SQL statement into bytecode program.
+#[recursive]
 pub fn translate_inner(
     stmt: ast::Stmt,
     resolver: &mut Resolver,
