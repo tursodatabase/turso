@@ -3518,16 +3518,16 @@ impl<Clock: LogicalClock> MvStore<Clock> {
         &self,
         tx_id: TxID,
         connection: &Arc<Connection>,
-    ) -> Result<StateMachine<CommitStateMachine<Clock>>> {
-        let state_machine: StateMachine<CommitStateMachine<Clock>> =
-            StateMachine::<CommitStateMachine<Clock>>::new(CommitStateMachine::new(
-                CommitState::Initial,
-                tx_id,
-                connection.clone(),
-                self.commit_coordinator.clone(),
-                self.global_header.clone(),
-                connection.get_sync_mode(),
-            ));
+    ) -> Result<StateMachine<Box<CommitStateMachine<Clock>>>> {
+        let state = Box::new(CommitStateMachine::new(
+            CommitState::Initial,
+            tx_id,
+            connection.clone(),
+            self.commit_coordinator.clone(),
+            self.global_header.clone(),
+            connection.get_sync_mode(),
+        ));
+        let state_machine = StateMachine::new(state);
         Ok(state_machine)
     }
 

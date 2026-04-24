@@ -1672,15 +1672,15 @@ pub fn op_column(
         insn
     );
     'outer: loop {
-        match state.op_column_state {
+        match *state.active_op_state.column() {
             OpColumnState::Start => {
                 if let Some(deferred) = state.deferred_seeks[*cursor_id].take() {
-                    state.op_column_state = OpColumnState::Rowid {
+                    *state.active_op_state.column() = OpColumnState::Rowid {
                         index_cursor_id: deferred.index_cursor_id,
                         table_cursor_id: deferred.table_cursor_id,
                     };
                 } else {
-                    state.op_column_state = OpColumnState::GetColumn;
+                    *state.active_op_state.column() = OpColumnState::GetColumn;
                 }
             }
             OpColumnState::Rowid {
@@ -1698,7 +1698,7 @@ pub fn op_column(
                     state.registers[*dest].set_null();
                     break 'outer;
                 };
-                state.op_column_state = OpColumnState::Seek {
+                *state.active_op_state.column() = OpColumnState::Seek {
                     rowid,
                     table_cursor_id,
                 };
@@ -1727,7 +1727,7 @@ pub fn op_column(
                 }
                 state.metrics.btree_seeks = state.metrics.btree_seeks.saturating_add(1);
                 state.metrics.search_count = state.metrics.search_count.saturating_add(1);
-                state.op_column_state = OpColumnState::GetColumn;
+                *state.active_op_state.column() = OpColumnState::GetColumn;
             }
             OpColumnState::GetColumn => {
                 let (active_cursor_id, active_column) = (*cursor_id, *column);
@@ -1862,7 +1862,7 @@ pub fn op_column(
         }
     }
 
-    state.op_column_state = OpColumnState::Start;
+    state.active_op_state.clear();
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
 }
@@ -3142,13 +3142,13 @@ pub fn op_transaction(
     let result = op_transaction_inner(program, state, insn, pager);
     tracing::debug!(
         "op_transaction: end: state={:?}, tx_state={:?}",
-        state.op_transaction_state,
+        *state.active_op_state.transaction(),
         program.connection.get_tx_state()
     );
     match result {
         Ok(result) => Ok(result),
         Err(err) => {
-            state.op_transaction_state = OpTransactionState::Start;
+            state.active_op_state.clear();
             Err(err)
         }
     }
@@ -3333,7 +3333,7 @@ pub fn op_transaction_inner(
     // Get the MvStore for the specific database (main or attached).
     let mv_store = program.connection.mv_store_for_db(*db);
     loop {
-        match state.op_transaction_state {
+        match *state.active_op_state.transaction() {
             OpTransactionState::Start => {
                 let conn = program.connection.clone();
                 let write = matches!(tx_mode, TransactionMode::Write);
@@ -3547,11 +3547,12 @@ pub fn op_transaction_inner(
                             if matches!(tx_mode, TransactionMode::Write)
                                 && !pager.holds_write_lock()
                             {
-                                state.op_transaction_state =
+                                *state.active_op_state.transaction() =
                                     OpTransactionState::AttachedBeginWriteTx;
                                 continue;
                             }
-                            state.op_transaction_state = OpTransactionState::CheckSchemaCookie;
+                            *state.active_op_state.transaction() =
+                                OpTransactionState::CheckSchemaCookie;
                             continue;
                         }
                         pager.begin_read_tx()?;
@@ -3561,10 +3562,10 @@ pub fn op_transaction_inner(
                             // separately, so if it returns IO we don't re-call begin_read_tx
                             // on re-entry.
                             if conn.with_named_savepoints(|savepoints| savepoints.is_empty()) {
-                                state.op_transaction_state =
+                                *state.active_op_state.transaction() =
                                     OpTransactionState::AttachedBeginWriteTx;
                             } else {
-                                state.op_transaction_state =
+                                *state.active_op_state.transaction() =
                                     OpTransactionState::BeginNamedSavepoints;
                             }
                             continue;
@@ -3632,10 +3633,10 @@ pub fn op_transaction_inner(
                     && started_secondary_tx
                     && !conn.with_named_savepoints(|s| s.is_empty())
                 {
-                    state.op_transaction_state = OpTransactionState::BeginNamedSavepoints;
+                    *state.active_op_state.transaction() = OpTransactionState::BeginNamedSavepoints;
                     continue;
                 }
-                state.op_transaction_state = OpTransactionState::CheckSchemaCookie;
+                *state.active_op_state.transaction() = OpTransactionState::CheckSchemaCookie;
                 continue;
             }
             // 3b. For attached databases, begin the write transaction after
@@ -3645,7 +3646,7 @@ pub fn op_transaction_inner(
                 if let IOResult::IO(io) = res {
                     return Ok(InsnFunctionStepResult::IO(io));
                 }
-                state.op_transaction_state = OpTransactionState::CheckSchemaCookie;
+                *state.active_op_state.transaction() = OpTransactionState::CheckSchemaCookie;
                 continue;
             }
             OpTransactionState::BeginNamedSavepoints => {
@@ -3656,9 +3657,11 @@ pub fn op_transaction_inner(
                             && matches!(tx_mode, TransactionMode::Write)
                             && !pager.holds_write_lock()
                         {
-                            state.op_transaction_state = OpTransactionState::AttachedBeginWriteTx;
+                            *state.active_op_state.transaction() =
+                                OpTransactionState::AttachedBeginWriteTx;
                         } else {
-                            state.op_transaction_state = OpTransactionState::CheckSchemaCookie;
+                            *state.active_op_state.transaction() =
+                                OpTransactionState::CheckSchemaCookie;
                         }
                         continue;
                     }
@@ -3689,7 +3692,7 @@ pub fn op_transaction_inner(
                     }
                 }
 
-                state.op_transaction_state = OpTransactionState::BeginStatement;
+                *state.active_op_state.transaction() = OpTransactionState::BeginStatement;
             }
             OpTransactionState::BeginStatement => {
                 let needs_stmt_journal = program.needs_stmt_subtransactions.load(Ordering::Relaxed);
@@ -3751,7 +3754,7 @@ pub fn op_transaction_inner(
                     state.is_active_write = true;
                 }
                 state.pc += 1;
-                state.op_transaction_state = OpTransactionState::Start;
+                state.active_op_state.clear();
                 return Ok(InsnFunctionStepResult::Step);
             }
         }
@@ -4263,6 +4266,12 @@ pub enum OpProgramState {
     },
 }
 
+impl Default for OpProgramState {
+    fn default() -> Self {
+        Self::Start
+    }
+}
+
 fn finish_subprogram(
     program: &Program,
     statement: &Statement,
@@ -4327,7 +4336,7 @@ pub fn op_program(
         insn
     );
     loop {
-        match std::mem::replace(&mut state.op_program_state, OpProgramState::Start) {
+        match std::mem::take(state.active_op_state.program()) {
             OpProgramState::Start => {
                 // Try to reuse a cached statement for this PC, otherwise create a new one.
                 // When we have triggers or fk-actions with multi-row inserts, we can re-use
@@ -4370,7 +4379,7 @@ pub fn op_program(
                     statement.bind_at(param_index, value);
                 }
 
-                state.op_program_state = OpProgramState::Step {
+                *state.active_op_state.program() = OpProgramState::Step {
                     is_trigger,
                     statement,
                     saved_last_insert_rowid,
@@ -4397,7 +4406,7 @@ pub fn op_program(
                                 let io = statement.take_io_completions().unwrap_or_else(|| {
                                     IOCompletions::Single(Completion::new_yield())
                                 });
-                                state.op_program_state = OpProgramState::Step {
+                                *state.active_op_state.program() = OpProgramState::Step {
                                     is_trigger,
                                     statement,
                                     saved_last_insert_rowid,
@@ -4407,7 +4416,7 @@ pub fn op_program(
                             }
                             StepResult::Row => continue,
                             StepResult::Interrupt | StepResult::Busy => {
-                                state.op_program_state = OpProgramState::Step {
+                                *state.active_op_state.program() = OpProgramState::Step {
                                     is_trigger,
                                     statement,
                                     saved_last_insert_rowid,
@@ -4474,6 +4483,7 @@ pub fn op_program(
                 } else {
                     state.pc += 1;
                 }
+                state.active_op_state.clear();
                 return Ok(InsnFunctionStepResult::Step);
             }
         }
@@ -4584,15 +4594,15 @@ pub fn op_row_id(
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(RowId { cursor_id, dest }, insn);
     loop {
-        match state.op_row_id_state {
+        match *state.active_op_state.row_id() {
             OpRowIdState::Start => {
                 if let Some(deferred) = state.deferred_seeks[*cursor_id].take() {
-                    state.op_row_id_state = OpRowIdState::Record {
+                    *state.active_op_state.row_id() = OpRowIdState::Record {
                         index_cursor_id: deferred.index_cursor_id,
                         table_cursor_id: deferred.table_cursor_id,
                     };
                 } else {
-                    state.op_row_id_state = OpRowIdState::GetRowid;
+                    *state.active_op_state.row_id() = OpRowIdState::GetRowid;
                 }
             }
             OpRowIdState::Record {
@@ -4621,7 +4631,7 @@ pub fn op_row_id(
                         _ => panic!("unexpected cursor type"),
                     }
                 };
-                state.op_row_id_state = OpRowIdState::Seek {
+                *state.active_op_state.row_id() = OpRowIdState::Seek {
                     rowid,
                     table_cursor_id,
                 }
@@ -4637,7 +4647,7 @@ pub fn op_row_id(
                         table_cursor.seek(SeekKey::TableRowId(rowid), SeekOp::GE { eq_only: true })
                     );
                 }
-                state.op_row_id_state = OpRowIdState::GetRowid;
+                *state.active_op_state.row_id() = OpRowIdState::GetRowid;
             }
             OpRowIdState::GetRowid => {
                 let cursors = &mut state.cursors;
@@ -4694,7 +4704,7 @@ pub fn op_row_id(
         }
     }
 
-    state.op_row_id_state = OpRowIdState::Start;
+    state.active_op_state.clear();
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
 }
@@ -8989,7 +8999,7 @@ pub struct OpInsertState {
     pub is_noop_update: bool,
 }
 
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, Clone, Copy)]
 pub enum OpInsertSubState {
     /// If this insert overwrites a record, capture the old record for incremental view maintenance.
     /// If cursor is already positioned (no REQUIRE_SEEK), capture directly.
@@ -9035,7 +9045,7 @@ pub fn op_insert(
     );
 
     loop {
-        match &state.op_insert_state.sub_state {
+        match state.active_op_state.insert().sub_state {
             OpInsertSubState::MaybeCaptureRecord => {
                 let has_dependent_views = {
                     let schema = program.connection.schema.read();
@@ -9051,11 +9061,11 @@ pub fn op_insert(
                     has_dependent_views && !flag.has(InsertFlags::UPDATE_ROWID_CHANGE);
 
                 if flag.has(InsertFlags::REQUIRE_SEEK) {
-                    state.op_insert_state.sub_state = OpInsertSubState::Seek;
+                    state.active_op_state.insert().sub_state = OpInsertSubState::Seek;
                 } else if needs_capture {
-                    state.op_insert_state.sub_state = OpInsertSubState::CaptureRecord;
+                    state.active_op_state.insert().sub_state = OpInsertSubState::CaptureRecord;
                 } else {
-                    state.op_insert_state.sub_state = OpInsertSubState::NoopCheck;
+                    state.active_op_state.insert().sub_state = OpInsertSubState::NoopCheck;
                 }
                 continue;
             }
@@ -9083,9 +9093,9 @@ pub fn op_insert(
                 let needs_capture =
                     has_dependent_views && !flag.has(InsertFlags::UPDATE_ROWID_CHANGE);
                 if needs_capture {
-                    state.op_insert_state.sub_state = OpInsertSubState::CaptureRecord;
+                    state.active_op_state.insert().sub_state = OpInsertSubState::CaptureRecord;
                 } else {
-                    state.op_insert_state.sub_state = OpInsertSubState::NoopCheck;
+                    state.active_op_state.insert().sub_state = OpInsertSubState::NoopCheck;
                 }
                 continue;
             }
@@ -9121,8 +9131,8 @@ pub fn op_insert(
                 } else {
                     None
                 };
-                state.op_insert_state.old_record = old_record;
-                state.op_insert_state.sub_state = OpInsertSubState::NoopCheck;
+                state.active_op_state.insert().old_record = old_record;
+                state.active_op_state.insert().sub_state = OpInsertSubState::NoopCheck;
                 continue;
             }
             // TODO: add some InsertFlags that allows us to skip this check when we know for
@@ -9138,7 +9148,7 @@ pub fn op_insert(
                 // still appear physically intact, MVCC-store rows become invisible).
                 // The noop check is fundamentally incompatible with the MVCC
                 // Delete+Insert update pattern.
-                state.op_insert_state.is_noop_update = false;
+                state.active_op_state.insert().is_noop_update = false;
                 let is_mvcc = {
                     let cursor_ref = get_cursor!(state, *cursor_id);
                     cursor_ref.as_btree_mut().is_mvcc()
@@ -9168,15 +9178,15 @@ pub fn op_insert(
                         };
                         let existing_record = return_if_io!(cursor.record());
                         if existing_record.is_some_and(|r| r == record.as_ref()) {
-                            state.op_insert_state.is_noop_update = true;
+                            state.active_op_state.insert().is_noop_update = true;
                         }
                     }
                 }
-                state.op_insert_state.sub_state = OpInsertSubState::Insert;
+                state.active_op_state.insert().sub_state = OpInsertSubState::Insert;
                 continue;
             }
             OpInsertSubState::Insert => {
-                if !state.op_insert_state.is_noop_update {
+                if !state.active_op_state.insert().is_noop_update {
                     let key = match &state.registers[*key_reg].get_value() {
                         Value::Numeric(Numeric::Integer(i)) => *i,
                         _ => unreachable!("expected integer key"),
@@ -9207,7 +9217,7 @@ pub fn op_insert(
                     && table_name != SQLITE_SEQUENCE_TABLE_NAME
                     && !flag.has(InsertFlags::EPHEMERAL_TABLE_INSERT)
                 {
-                    state.op_insert_state.sub_state = OpInsertSubState::UpdateLastRowid;
+                    state.active_op_state.insert().sub_state = OpInsertSubState::UpdateLastRowid;
                 } else {
                     // Schema table writes (sqlite_master, sqlite_sequence, ephemeral)
                     // must not produce view deltas. The p4 table_name on these inserts
@@ -9215,7 +9225,7 @@ pub fn op_insert(
                     // actually being written to. Tracking deltas here would feed the
                     // sqlite_master record into the DBSP circuit as if it were data
                     // from the named table, corrupting the materialized view.
-                    state.op_insert_state.old_record = None;
+                    state.active_op_state.insert().old_record = None;
                     break;
                 }
             }
@@ -9236,7 +9246,7 @@ pub fn op_insert(
                 let schema = program.connection.schema.read();
                 let dependent_views = schema.get_dependent_materialized_views(table_name);
                 if !dependent_views.is_empty() {
-                    state.op_insert_state.sub_state = OpInsertSubState::ApplyViewChange;
+                    state.active_op_state.insert().sub_state = OpInsertSubState::ApplyViewChange;
                     continue;
                 }
                 break;
@@ -9280,7 +9290,7 @@ pub fn op_insert(
                     (key, new_values)
                 };
 
-                if let Some((key, values)) = state.op_insert_state.old_record.take() {
+                if let Some((key, values)) = state.active_op_state.insert().old_record.take() {
                     for view_name in dependent_views.iter() {
                         let tx_state = program
                             .connection
@@ -9303,8 +9313,7 @@ pub fn op_insert(
         }
     }
 
-    state.op_insert_state.sub_state = OpInsertSubState::MaybeCaptureRecord;
-    state.op_insert_state.is_noop_update = false;
+    state.active_op_state.clear();
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
 }
@@ -9334,6 +9343,7 @@ pub struct OpDeleteState {
     pub deleted_record: Option<(i64, Vec<Value>)>,
 }
 
+#[derive(Clone, Copy)]
 pub enum OpDeleteSubState {
     /// Capture the record before deletion, if the are dependent views.
     MaybeCaptureRecord,
@@ -9359,12 +9369,12 @@ pub fn op_delete(
     );
 
     loop {
-        match &state.op_delete_state.sub_state {
+        match state.active_op_state.delete().sub_state {
             OpDeleteSubState::MaybeCaptureRecord => {
                 let schema = program.connection.schema.read();
                 let dependent_views = schema.get_dependent_materialized_views(table_name);
                 if dependent_views.is_empty() {
-                    state.op_delete_state.sub_state = OpDeleteSubState::Delete;
+                    state.active_op_state.delete().sub_state = OpDeleteSubState::Delete;
                     continue;
                 }
 
@@ -9394,8 +9404,8 @@ pub fn op_delete(
                         None
                     }
                 };
-                state.op_delete_state.deleted_record = deleted_record;
-                state.op_delete_state.sub_state = OpDeleteSubState::Delete;
+                state.active_op_state.delete().deleted_record = deleted_record;
+                state.active_op_state.delete().sub_state = OpDeleteSubState::Delete;
                 continue;
             }
             OpDeleteSubState::Delete => {
@@ -9411,14 +9421,14 @@ pub fn op_delete(
                 if dependent_views.is_empty() {
                     break;
                 }
-                state.op_delete_state.sub_state = OpDeleteSubState::ApplyViewChange;
+                state.active_op_state.delete().sub_state = OpDeleteSubState::ApplyViewChange;
                 continue;
             }
             OpDeleteSubState::ApplyViewChange => {
                 let schema = program.connection.schema.read();
                 let dependent_views = schema.get_dependent_materialized_views(table_name);
                 assert!(!dependent_views.is_empty());
-                let maybe_deleted_record = state.op_delete_state.deleted_record.take();
+                let maybe_deleted_record = state.active_op_state.delete().deleted_record.take();
                 if let Some((key, values)) = maybe_deleted_record {
                     for view_name in dependent_views {
                         let tx_state = program
@@ -9433,7 +9443,7 @@ pub fn op_delete(
         }
     }
 
-    state.op_delete_state.sub_state = OpDeleteSubState::MaybeCaptureRecord;
+    state.active_op_state.clear();
     if !is_part_of_update {
         // DELETEs do not count towards the total changes if they are part of an UPDATE statement,
         // i.e. the DELETE and subsequent INSERT of a row are the same "change".
@@ -9482,9 +9492,9 @@ pub fn op_idx_delete(
             start_reg,
             num_regs,
             state.get_cursor(*cursor_id).as_btree_mut().root_page(),
-            state.op_idx_delete_state
+            state.active_op_state.idx_delete()
         );
-        match &state.op_idx_delete_state {
+        match state.active_op_state.idx_delete() {
             Some(OpIdxDeleteState::Seeking) => {
                 let found = match seek_internal(
                     program,
@@ -9516,10 +9526,10 @@ pub fn op_idx_delete(
                         )));
                     }
                     state.pc += 1;
-                    state.op_idx_delete_state = None;
+                    state.active_op_state.clear();
                     return Ok(InsnFunctionStepResult::Step);
                 }
-                state.op_idx_delete_state = Some(OpIdxDeleteState::Verifying);
+                *state.active_op_state.idx_delete() = Some(OpIdxDeleteState::Verifying);
             }
             Some(OpIdxDeleteState::Verifying) => {
                 let rowid = {
@@ -9536,7 +9546,7 @@ pub fn op_idx_delete(
                         "IdxDelete: no matching index entry found for key while verifying: {reg_values:?}"
                     )));
                 }
-                state.op_idx_delete_state = Some(OpIdxDeleteState::Deleting);
+                *state.active_op_state.idx_delete() = Some(OpIdxDeleteState::Deleting);
             }
             Some(OpIdxDeleteState::Deleting) => {
                 {
@@ -9547,11 +9557,11 @@ pub fn op_idx_delete(
                 // Increment metrics for index write (delete is a write operation)
                 state.record_rows_written(1);
                 state.pc += 1;
-                state.op_idx_delete_state = None;
+                state.active_op_state.clear();
                 return Ok(InsnFunctionStepResult::Step);
             }
             None => {
-                state.op_idx_delete_state = Some(OpIdxDeleteState::Seeking);
+                *state.active_op_state.idx_delete() = Some(OpIdxDeleteState::Seeking);
             }
         }
     }
@@ -9611,7 +9621,7 @@ pub fn op_idx_insert(
         }
     };
 
-    match state.op_idx_insert_state {
+    match *state.active_op_state.idx_insert() {
         OpIdxInsertState::MaybeSeek => {
             let (_, cursor_type) = program
                 .cursor_ref
@@ -9628,7 +9638,7 @@ pub fn op_idx_insert(
             // HOWEVER: If the record contains NULLs, NoConflict skips the seek entirely
             // (since NULLs can't conflict), so we must fall back to seeking here.
             if flags.has(IdxInsertFlags::USE_SEEK) && !record_to_insert.contains_null()? {
-                state.op_idx_insert_state = OpIdxInsertState::Insert;
+                *state.active_op_state.idx_insert() = OpIdxInsertState::Insert;
                 return Ok(InsnFunctionStepResult::Step);
                 // Fall through to do the seek since NoConflict skipped it due to NULLs
             }
@@ -9643,7 +9653,7 @@ pub fn op_idx_insert(
                 SeekOp::GE { eq_only: true },
             )? {
                 SeekInternalResult::Found => {
-                    state.op_idx_insert_state = if index_meta.unique {
+                    *state.active_op_state.idx_insert() = if index_meta.unique {
                         OpIdxInsertState::UniqueConstraintCheck
                     } else {
                         OpIdxInsertState::Insert
@@ -9651,7 +9661,7 @@ pub fn op_idx_insert(
                     Ok(InsnFunctionStepResult::Step)
                 }
                 SeekInternalResult::NotFound => {
-                    state.op_idx_insert_state = OpIdxInsertState::Insert;
+                    *state.active_op_state.idx_insert() = OpIdxInsertState::Insert;
                     Ok(InsnFunctionStepResult::Step)
                 }
                 SeekInternalResult::IO(io) => Ok(InsnFunctionStepResult::IO(io)),
@@ -9695,13 +9705,14 @@ pub fn op_idx_insert(
 
                 false
             };
-            state.op_idx_insert_state = if ignore_conflict {
+            if ignore_conflict {
                 state.pc += 1;
-                OpIdxInsertState::MaybeSeek
+                state.active_op_state.clear();
+                Ok(InsnFunctionStepResult::Step)
             } else {
-                OpIdxInsertState::Insert
-            };
-            Ok(InsnFunctionStepResult::Step)
+                *state.active_op_state.idx_insert() = OpIdxInsertState::Insert;
+                Ok(InsnFunctionStepResult::Step)
+            }
         }
         OpIdxInsertState::Insert => {
             {
@@ -9712,7 +9723,7 @@ pub fn op_idx_insert(
             if flags.has(IdxInsertFlags::NCHANGE) {
                 state.record_rows_written(1);
             }
-            state.op_idx_insert_state = OpIdxInsertState::MaybeSeek;
+            state.active_op_state.clear();
             state.pc += 1;
             Ok(InsnFunctionStepResult::Step)
         }
@@ -9785,7 +9796,7 @@ fn new_rowid_inner(
     const MAX_ATTEMPTS: u32 = 100;
     let mv_store = program.connection.mv_store();
     loop {
-        match state.op_new_rowid_state {
+        match *state.active_op_state.new_rowid() {
             OpNewRowidState::Start => {
                 if mv_store.is_some() {
                     let cursor = state.get_cursor(*cursor);
@@ -9793,9 +9804,10 @@ fn new_rowid_inner(
                     if let Some(mvcc_cursor) = cursor.downcast_mut::<MvCursor>() {
                         match return_if_io!(mvcc_cursor.start_new_rowid()) {
                             NextRowidResult::Uninitialized => {
-                                state.op_new_rowid_state = OpNewRowidState::SeekingToLast {
-                                    mvcc_already_initialized: false,
-                                };
+                                *state.active_op_state.new_rowid() =
+                                    OpNewRowidState::SeekingToLast {
+                                        mvcc_already_initialized: false,
+                                    };
                             }
                             NextRowidResult::Next {
                                 new_rowid,
@@ -9808,13 +9820,14 @@ fn new_rowid_inner(
                                     state.registers[*prev_largest_reg]
                                         .set_int(prev_rowid.unwrap_or(0));
                                 }
-                                state.op_new_rowid_state = OpNewRowidState::SeekingToLast {
-                                    mvcc_already_initialized: true,
-                                };
+                                *state.active_op_state.new_rowid() =
+                                    OpNewRowidState::SeekingToLast {
+                                        mvcc_already_initialized: true,
+                                    };
                             }
                             NextRowidResult::FindRandom => {
                                 mvcc_cursor.end_new_rowid();
-                                state.op_new_rowid_state =
+                                *state.active_op_state.new_rowid() =
                                     OpNewRowidState::GeneratingRandom { attempts: 0 };
                             }
                         }
@@ -9826,12 +9839,12 @@ fn new_rowid_inner(
                             cursor.downcast_ref::<BTreeCursor>().is_some(),
                             "Expected MvCursor or BTreeCursor in op_new_rowid"
                         );
-                        state.op_new_rowid_state = OpNewRowidState::SeekingToLast {
+                        *state.active_op_state.new_rowid() = OpNewRowidState::SeekingToLast {
                             mvcc_already_initialized: false,
                         };
                     }
                 } else {
-                    state.op_new_rowid_state = OpNewRowidState::SeekingToLast {
+                    *state.active_op_state.new_rowid() = OpNewRowidState::SeekingToLast {
                         mvcc_already_initialized: false,
                     };
                 }
@@ -9850,9 +9863,9 @@ fn new_rowid_inner(
                     return_if_io!(cursor.seek_to_last(always_seek));
                 }
                 if mvcc_already_initialized {
-                    state.op_new_rowid_state = OpNewRowidState::GoNext;
+                    *state.active_op_state.new_rowid() = OpNewRowidState::GoNext;
                 } else {
-                    state.op_new_rowid_state = OpNewRowidState::ReadingMaxRowid;
+                    *state.active_op_state.new_rowid() = OpNewRowidState::ReadingMaxRowid;
                 }
             }
 
@@ -9880,12 +9893,12 @@ fn new_rowid_inner(
                                         .set_int(prev_rowid.unwrap_or(0));
                                 }
                                 tracing::trace!("new_rowid={}", new_rowid);
-                                state.op_new_rowid_state = OpNewRowidState::GoNext;
+                                *state.active_op_state.new_rowid() = OpNewRowidState::GoNext;
                                 continue;
                             }
                             None => {
                                 // At i64::MAX — fall back to random
-                                state.op_new_rowid_state =
+                                *state.active_op_state.new_rowid() =
                                     OpNewRowidState::GeneratingRandom { attempts: 0 };
                                 continue;
                             }
@@ -9901,17 +9914,17 @@ fn new_rowid_inner(
                     Some(rowid) if rowid < MAX_ROWID => {
                         state.registers[*rowid_reg].set_int(rowid + 1);
                         tracing::trace!("new_rowid={}", rowid + 1);
-                        state.op_new_rowid_state = OpNewRowidState::GoNext;
+                        *state.active_op_state.new_rowid() = OpNewRowidState::GoNext;
                         continue;
                     }
                     Some(_) => {
-                        state.op_new_rowid_state =
+                        *state.active_op_state.new_rowid() =
                             OpNewRowidState::GeneratingRandom { attempts: 0 };
                     }
                     None => {
                         tracing::trace!("new_rowid=1");
                         state.registers[*rowid_reg].set_int(1);
-                        state.op_new_rowid_state = OpNewRowidState::GoNext;
+                        *state.active_op_state.new_rowid() = OpNewRowidState::GoNext;
                         continue;
                     }
                 }
@@ -9929,7 +9942,7 @@ fn new_rowid_inner(
                 random_rowid &= MAX_ROWID >> 1; // Mask to keep value in range [0, MAX_ROWID/2]
                 random_rowid += 1; // Ensure positive
 
-                state.op_new_rowid_state = OpNewRowidState::VerifyingCandidate {
+                *state.active_op_state.new_rowid() = OpNewRowidState::VerifyingCandidate {
                     attempts,
                     candidate: random_rowid,
                 };
@@ -9951,7 +9964,7 @@ fn new_rowid_inner(
                 if !exists {
                     // Found unused rowid!
                     state.registers[*rowid_reg].set_int(candidate);
-                    state.op_new_rowid_state = OpNewRowidState::Start;
+                    state.active_op_state.clear();
                     state.pc += 1;
 
                     if mv_store.is_some() {
@@ -9965,7 +9978,7 @@ fn new_rowid_inner(
                     return Ok(InsnFunctionStepResult::Step);
                 } else {
                     // Collision, try again
-                    state.op_new_rowid_state = OpNewRowidState::GeneratingRandom {
+                    *state.active_op_state.new_rowid() = OpNewRowidState::GeneratingRandom {
                         attempts: attempts + 1,
                     };
                 }
@@ -9976,7 +9989,7 @@ fn new_rowid_inner(
                     let cursor = cursor.as_btree_mut();
                     return_if_io!(cursor.next());
                 }
-                state.op_new_rowid_state = OpNewRowidState::Start;
+                state.active_op_state.clear();
                 state.pc += 1;
 
                 if mv_store.is_some() {
@@ -10059,7 +10072,7 @@ pub fn op_no_conflict(
     );
 
     loop {
-        match state.op_no_conflict_state {
+        match *state.active_op_state.no_conflict() {
             OpNoConflictState::Start => {
                 let record_source = if *num_regs == 0 {
                     RecordSource::Packed {
@@ -10095,10 +10108,11 @@ pub fn op_no_conflict(
 
                 if contains_nulls {
                     state.pc = target_pc.as_offset_int();
-                    state.op_no_conflict_state = OpNoConflictState::Start;
+                    state.active_op_state.clear();
                     return Ok(InsnFunctionStepResult::Step);
                 } else {
-                    state.op_no_conflict_state = OpNoConflictState::Seeking(record_source);
+                    *state.active_op_state.no_conflict() =
+                        OpNoConflictState::Seeking(record_source);
                 }
             }
             OpNoConflictState::Seeking(record_source) => {
@@ -10113,12 +10127,12 @@ pub fn op_no_conflict(
                 )? {
                     SeekInternalResult::Found => {
                         state.pc += 1;
-                        state.op_no_conflict_state = OpNoConflictState::Start;
+                        state.active_op_state.clear();
                         Ok(InsnFunctionStepResult::Step)
                     }
                     SeekInternalResult::NotFound => {
                         state.pc = target_pc.as_offset_int();
-                        state.op_no_conflict_state = OpNoConflictState::Start;
+                        state.active_op_state.clear();
                         Ok(InsnFunctionStepResult::Step)
                     }
                     SeekInternalResult::IO(io) => Ok(InsnFunctionStepResult::IO(io)),
@@ -10552,19 +10566,19 @@ pub fn op_destroy(
     };
 
     loop {
-        match state.op_destroy_state {
+        match state.active_op_state.destroy() {
             OpDestroyState::CreateCursor => {
                 // Destroy doesn't do anything meaningful with the table/index distinction so we can just use a
                 // table btree cursor for both.
                 let cursor = BTreeCursor::new(destroy_pager.clone(), *root, 0);
-                state.op_destroy_state =
+                *state.active_op_state.destroy() =
                     OpDestroyState::DestroyBtree(Arc::new(RwLock::new(cursor)));
             }
             OpDestroyState::DestroyBtree(ref mut cursor) => {
                 let maybe_former_root_page = return_if_io!(cursor.write().btree_destroy());
                 state.registers[*former_root_reg]
                     .set_int(maybe_former_root_page.unwrap_or(0) as i64);
-                state.op_destroy_state = OpDestroyState::CreateCursor;
+                state.active_op_state.clear();
                 state.pc += 1;
                 return Ok(InsnFunctionStepResult::Step);
             }
@@ -10821,7 +10835,7 @@ pub fn op_page_count(
 }
 
 /// State for the async ParseSchema instruction state machine.
-/// Stored in `ProgramState::op_parse_schema_state` so that when the inner
+/// Stored in the active opcode state slot so that when the inner
 /// schema query yields IO, we can return control to the outer caller and
 /// resume later without losing intermediate parsing state.
 pub struct OpParseSchemaInner {
@@ -10849,7 +10863,7 @@ pub fn op_parse_schema(
     let conn = program.connection.clone();
 
     // If we have in-progress state, resume stepping through schema rows.
-    if state.op_parse_schema_state.is_some() {
+    if state.active_op_state.parse_schema().is_some() {
         return op_parse_schema_step(state, &conn);
     }
 
@@ -10920,7 +10934,7 @@ pub fn op_parse_schema(
     stmt.set_mv_tx(mv_tx);
 
     // Store state for resumption across IO boundaries
-    state.op_parse_schema_state = Some(Box::new(OpParseSchemaInner {
+    *state.active_op_state.parse_schema() = Some(Box::new(OpParseSchemaInner {
         stmt,
         schema_arc,
         from_sql_indexes: Vec::with_capacity(10),
@@ -10944,7 +10958,7 @@ fn op_parse_schema_step(
     conn: &Arc<Connection>,
 ) -> Result<InsnFunctionStepResult> {
     loop {
-        let inner = state.op_parse_schema_state.as_mut().unwrap();
+        let inner = state.active_op_state.parse_schema().as_mut().unwrap();
         match inner.stmt.step()? {
             StepResult::IO => {
                 let io = inner
@@ -10955,7 +10969,8 @@ fn op_parse_schema_step(
             }
             StepResult::Row => {
                 let inner = state
-                    .op_parse_schema_state
+                    .active_op_state
+                    .parse_schema()
                     .as_mut()
                     .expect("parse schema state should exist");
                 let row = inner.stmt.row().expect("row should be present");
@@ -11001,7 +11016,8 @@ fn op_parse_schema_step(
                     db,
                     previous_auto_commit,
                 } = *state
-                    .op_parse_schema_state
+                    .active_op_state
+                    .parse_schema()
                     .take()
                     .expect("parse schema state should exist");
                 let schema = Arc::make_mut(&mut schema_arc);
@@ -11049,6 +11065,7 @@ fn op_parse_schema_step(
                 let _ = (res1?, res2?);
 
                 state.pc += 1;
+                state.active_op_state.clear();
                 return Ok(InsnFunctionStepResult::Step);
             }
             StepResult::Interrupt => {
@@ -11057,7 +11074,8 @@ fn op_parse_schema_step(
                     previous_auto_commit,
                     ..
                 } = *state
-                    .op_parse_schema_state
+                    .active_op_state
+                    .parse_schema()
                     .take()
                     .expect("parse schema state should exist");
                 drop(stmt);
@@ -11071,7 +11089,8 @@ fn op_parse_schema_step(
                     previous_auto_commit,
                     ..
                 } = *state
-                    .op_parse_schema_state
+                    .active_op_state
+                    .parse_schema()
                     .take()
                     .expect("parse schema state should exist");
                 drop(stmt);
@@ -11675,14 +11694,14 @@ pub fn op_open_ephemeral(
         _ => unreachable!("unexpected Insn {:?}", insn),
     };
     let mv_store = program.connection.mv_store();
-    match &mut state.op_open_ephemeral_state {
+    match state.active_op_state.open_ephemeral() {
         OpOpenEphemeralState::Start => {
             tracing::trace!("Start");
             // Fast path: if cursor already has an ephemeral btree, just clear it instead of
             // recreating the entire pager/file/btree. This is important for performance when
             // OpenEphemeral is called repeatedly during statement execution.
             if state.cursors[cursor_id].is_some() {
-                state.op_open_ephemeral_state = OpOpenEphemeralState::ClearExisting;
+                *state.active_op_state.open_ephemeral() = OpOpenEphemeralState::ClearExisting;
                 return Ok(InsnFunctionStepResult::Step);
             }
             // Ephemeral tables always use the main DB's page size (db index 0)
@@ -11720,7 +11739,7 @@ pub fn op_open_ephemeral(
 
             pager.set_page_size(page_size);
 
-            state.op_open_ephemeral_state = OpOpenEphemeralState::StartingTxn {
+            *state.active_op_state.open_ephemeral() = OpOpenEphemeralState::StartingTxn {
                 pager,
                 temp_file: Some(temp_file),
             };
@@ -11742,7 +11761,7 @@ pub fn op_open_ephemeral(
                     }
                 }
             }
-            state.op_open_ephemeral_state = OpOpenEphemeralState::RewindExisting;
+            *state.active_op_state.open_ephemeral() = OpOpenEphemeralState::RewindExisting;
         }
         OpOpenEphemeralState::RewindExisting => {
             tracing::trace!("RewindExisting");
@@ -11752,7 +11771,7 @@ pub fn op_open_ephemeral(
             let btree_cursor = cursor.as_btree_mut();
             return_if_io!(btree_cursor.rewind());
             state.pc += 1;
-            state.op_open_ephemeral_state = OpOpenEphemeralState::Start;
+            state.active_op_state.clear();
         }
         OpOpenEphemeralState::StartingTxn { pager, temp_file } => {
             tracing::trace!("StartingTxn");
@@ -11760,7 +11779,7 @@ pub fn op_open_ephemeral(
                 .begin_read_tx() // we have to begin a read tx before beginning a write
                 .expect("Failed to start read transaction");
             return_if_io!(pager.begin_write_tx());
-            state.op_open_ephemeral_state = OpOpenEphemeralState::CreateBtree {
+            *state.active_op_state.open_ephemeral() = OpOpenEphemeralState::CreateBtree {
                 pager: pager.clone(),
                 temp_file: temp_file.take(),
             };
@@ -11791,7 +11810,7 @@ pub fn op_open_ephemeral(
             } else {
                 BTreeCursor::new_table(pager.clone(), root_page, num_columns)
             };
-            state.op_open_ephemeral_state = OpOpenEphemeralState::Rewind {
+            *state.active_op_state.open_ephemeral() = OpOpenEphemeralState::Rewind {
                 cursor: Box::new(cursor),
                 temp_file: temp_file.take(),
             };
@@ -11810,7 +11829,7 @@ pub fn op_open_ephemeral(
                 .expect("cursor_id should exist in cursor_ref");
 
             let OpOpenEphemeralState::Rewind { cursor, temp_file } =
-                std::mem::take(&mut state.op_open_ephemeral_state)
+                std::mem::take(state.active_op_state.open_ephemeral())
             else {
                 unreachable!()
             };
@@ -11850,7 +11869,7 @@ pub fn op_open_ephemeral(
             }
 
             state.pc += 1;
-            state.op_open_ephemeral_state = OpOpenEphemeralState::Start;
+            state.active_op_state.clear();
         }
     }
 
@@ -12154,7 +12173,7 @@ pub fn op_integrity_check(
     } else {
         program.get_pager_from_database_index(db)?
     };
-    match &mut state.op_integrity_check_state {
+    match state.active_op_state.integrity_check() {
         OpIntegrityCheckState::Start => {
             let (freelist_trunk_page, db_size) = return_if_io!(with_header(
                 &target_pager,
@@ -12186,11 +12205,12 @@ pub fn op_integrity_check(
                 current_root_idx += 1;
             }
 
-            state.op_integrity_check_state = OpIntegrityCheckState::CheckingBTreeStructure {
-                errors,
-                state: integrity_check_state,
-                current_root_idx,
-            };
+            *state.active_op_state.integrity_check() =
+                OpIntegrityCheckState::CheckingBTreeStructure {
+                    errors,
+                    state: integrity_check_state,
+                    current_root_idx,
+                };
         }
         OpIntegrityCheckState::CheckingBTreeStructure {
             errors,
@@ -12211,7 +12231,7 @@ pub fn op_integrity_check(
                     Some(msg) => state.registers[*message_register].set_text(Text::new(msg)),
                     None => state.registers[*message_register].set_null(),
                 };
-                state.op_integrity_check_state = OpIntegrityCheckState::Start;
+                state.active_op_state.clear();
                 state.pc += 1;
                 return Ok(InsnFunctionStepResult::Step);
             }
@@ -12269,7 +12289,7 @@ pub fn op_integrity_check(
                 Some(msg) => state.registers[*message_register].set_text(Text::new(msg)),
                 None => state.registers[*message_register].set_null(),
             };
-            state.op_integrity_check_state = OpIntegrityCheckState::Start;
+            state.active_op_state.clear();
             state.pc += 1;
         }
     }
@@ -13137,7 +13157,8 @@ pub fn op_hash_build(
     load_insn!(HashBuild { data }, insn);
 
     let mut op_state = state
-        .op_hash_build_state
+        .active_op_state
+        .hash_build()
         .take()
         .filter(|s| {
             s.hash_table_id == data.hash_table_id
@@ -13210,11 +13231,11 @@ pub fn op_hash_build(
                 let rowid_opt = match btree_cursor.rowid() {
                     Ok(IOResult::Done(v)) => v,
                     Ok(IOResult::IO(io)) => {
-                        state.op_hash_build_state = Some(op_state);
+                        *state.active_op_state.hash_build() = Some(op_state);
                         return Ok(InsnFunctionStepResult::IO(io));
                     }
                     Err(e) => {
-                        state.op_hash_build_state = Some(op_state);
+                        *state.active_op_state.hash_build() = Some(op_state);
                         return Err(e);
                     }
                 };
@@ -13244,13 +13265,13 @@ pub fn op_hash_build(
             HashInsertResult::IO { io, pending } => {
                 op_state.key_values = pending.key_values;
                 op_state.payload_values = pending.payload_values;
-                state.op_hash_build_state = Some(op_state);
+                *state.active_op_state.hash_build() = Some(op_state);
                 return Ok(InsnFunctionStepResult::IO(io));
             }
         }
     }
 
-    state.op_hash_build_state = None;
+    state.active_op_state.clear();
     state.record_rows_read(1);
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
@@ -13371,7 +13392,7 @@ pub fn op_hash_probe(
     let num_payload = *num_payload as usize;
     let probe_rowid_reg = probe_rowid_reg.map(|r| r as usize);
     let (probe_keys, partition_idx, probe_buffered) =
-        if let Some(op_state) = state.op_hash_probe_state.take() {
+        if let Some(op_state) = state.active_op_state.hash_probe().take() {
             if op_state.hash_table_id == hash_table_id {
                 (
                     op_state.probe_keys,
@@ -13399,7 +13420,7 @@ pub fn op_hash_probe(
 
     let Some(hash_table) = state.hash_tables.get_mut(&hash_table_id) else {
         // Empty build side: treat as no match and jump to target.
-        state.op_hash_probe_state = None;
+        state.active_op_state.clear();
         state.pc = target_pc.as_offset_int();
         return Ok(InsnFunctionStepResult::Step);
     };
@@ -13414,6 +13435,7 @@ pub fn op_hash_probe(
         if let Some(rowid_reg) = probe_rowid_reg {
             if probe_buffered {
                 state.pc = target_pc.as_offset_int();
+                state.active_op_state.clear();
                 return Ok(InsnFunctionStepResult::Step);
             }
             if !hash_table.is_partition_loaded(partition_idx) {
@@ -13429,7 +13451,7 @@ pub fn op_hash_probe(
                 )? {
                     IOResult::Done(()) => {}
                     IOResult::IO(io) => {
-                        state.op_hash_probe_state = Some(OpHashProbeState {
+                        *state.active_op_state.hash_probe() = Some(OpHashProbeState {
                             probe_keys: Vec::new(), // keys consumed
                             hash_table_id,
                             partition_idx,
@@ -13440,6 +13462,7 @@ pub fn op_hash_probe(
                 }
                 // Jump to target_pc: this row is deferred to grace processing.
                 state.pc = target_pc.as_offset_int();
+                state.active_op_state.clear();
                 return Ok(InsnFunctionStepResult::Step);
             }
             // Partition is in memory: probe immediately (fast path)
@@ -13468,10 +13491,12 @@ pub fn op_hash_probe(
                     payload_dest_reg,
                     num_payload,
                 );
+                state.active_op_state.clear();
                 state.pc += 1;
                 Ok(InsnFunctionStepResult::Step)
             }
             None => {
+                state.active_op_state.clear();
                 state.pc = target_pc.as_offset_int();
                 Ok(InsnFunctionStepResult::Step)
             }
@@ -13487,10 +13512,12 @@ pub fn op_hash_probe(
                     payload_dest_reg,
                     num_payload,
                 );
+                state.active_op_state.clear();
                 state.pc += 1;
                 Ok(InsnFunctionStepResult::Step)
             }
             None => {
+                state.active_op_state.clear();
                 state.pc = target_pc.as_offset_int();
                 Ok(InsnFunctionStepResult::Step)
             }
@@ -14115,7 +14142,7 @@ pub struct OpJournalModeState {
     /// The new journal mode we're changing to
     pub new_mode: Option<journal_mode::JournalMode>,
     /// Checkpoint state machine for MVCC mode
-    pub checkpoint_sm: Option<StateMachine<CheckpointStateMachine<MvccClock>>>,
+    pub checkpoint_sm: Option<StateMachine<Box<CheckpointStateMachine<MvccClock>>>>,
     /// Page reference for writing header
     pub page_ref: Option<PageRef>,
 }
@@ -14130,13 +14157,13 @@ pub fn op_journal_mode(
         Ok(result) => {
             if !matches!(result, InsnFunctionStepResult::IO(_)) {
                 // Reset state if we are done with this instruction
-                state.op_journal_mode_state = Default::default();
+                state.active_op_state.clear();
             }
             Ok(result)
         }
         Err(err) => {
             // Reset state on error
-            state.op_journal_mode_state = Default::default();
+            state.active_op_state.clear();
             Err(err)
         }
     }
@@ -14155,7 +14182,7 @@ fn op_journal_mode_inner(
     let pager = &pager;
 
     loop {
-        match state.op_journal_mode_state.sub_state {
+        match state.active_op_state.journal_mode().sub_state {
             OpJournalModeSubState::Start => {
                 // Read header to get current mode
                 let mv_store = program.connection.mv_store_for_db(*db);
@@ -14170,7 +14197,7 @@ fn op_journal_mode_inner(
                     .map_err(|val| LimboError::Corrupt(format!("Invalid read_version: {val}")))?;
 
                 let prev_mode = journal_mode::JournalMode::from(prev_mode_version);
-                state.op_journal_mode_state.prev_mode = Some(prev_mode);
+                state.active_op_state.journal_mode().prev_mode = Some(prev_mode);
 
                 // If no new mode specified, just return current mode
                 let Some(mode_str) = new_mode else {
@@ -14212,8 +14239,8 @@ fn op_journal_mode_inner(
                     return Err(LimboError::ReadOnly);
                 }
 
-                state.op_journal_mode_state.new_mode = Some(new_mode);
-                state.op_journal_mode_state.sub_state = OpJournalModeSubState::Checkpoint;
+                state.active_op_state.journal_mode().new_mode = Some(new_mode);
+                state.active_op_state.journal_mode().sub_state = OpJournalModeSubState::Checkpoint;
             }
 
             OpJournalModeSubState::Checkpoint => {
@@ -14221,21 +14248,27 @@ fn op_journal_mode_inner(
                 let mv_store = program.connection.mv_store_for_db(*db);
                 if let Some(mv_store) = mv_store.as_ref() {
                     // MVCC checkpoint using state machine
-                    if state.op_journal_mode_state.checkpoint_sm.is_none() {
-                        state.op_journal_mode_state.checkpoint_sm =
-                            Some(StateMachine::new(CheckpointStateMachine::new(
+                    if state.active_op_state.journal_mode().checkpoint_sm.is_none() {
+                        state.active_op_state.journal_mode().checkpoint_sm =
+                            Some(StateMachine::new(Box::new(CheckpointStateMachine::new(
                                 pager.clone(),
                                 mv_store.clone(),
                                 program.connection.clone(),
                                 true,
                                 program.connection.get_sync_mode(),
-                            )));
+                            ))));
                     }
 
-                    let ckpt_sm = state.op_journal_mode_state.checkpoint_sm.as_mut().unwrap();
+                    let ckpt_sm = state
+                        .active_op_state
+                        .journal_mode()
+                        .checkpoint_sm
+                        .as_mut()
+                        .unwrap();
                     return_if_io!(ckpt_sm.step(&()));
-                    state.op_journal_mode_state.checkpoint_sm = None;
-                    state.op_journal_mode_state.sub_state = OpJournalModeSubState::UpdateHeader;
+                    state.active_op_state.journal_mode().checkpoint_sm = None;
+                    state.active_op_state.journal_mode().sub_state =
+                        OpJournalModeSubState::UpdateHeader;
                 } else {
                     // WAL checkpoint
                     let checkpoint_result = pager.checkpoint(
@@ -14246,13 +14279,15 @@ fn op_journal_mode_inner(
                         false, // Don't clear cache yet, we'll do it in Finalize
                     );
                     return_if_io!(checkpoint_result);
-                    state.op_journal_mode_state.sub_state = OpJournalModeSubState::UpdateHeader;
+                    state.active_op_state.journal_mode().sub_state =
+                        OpJournalModeSubState::UpdateHeader;
                 }
             }
 
             OpJournalModeSubState::UpdateHeader => {
                 let new_mode = state
-                    .op_journal_mode_state
+                    .active_op_state
+                    .journal_mode()
                     .new_mode
                     .expect("new_mode should be set");
                 let new_version = new_mode
@@ -14273,20 +14308,21 @@ fn op_journal_mode_inner(
                 }
 
                 // Save the page reference for writing
-                state.op_journal_mode_state.page_ref = Some(header_ref.page().clone());
+                state.active_op_state.journal_mode().page_ref = Some(header_ref.page().clone());
                 // Skip ReadPage and go directly to WritePage
-                state.op_journal_mode_state.sub_state = OpJournalModeSubState::WritePage;
+                state.active_op_state.journal_mode().sub_state = OpJournalModeSubState::WritePage;
             }
 
             OpJournalModeSubState::WritePage => {
                 // Write page 1 to disk to flush the header
                 let page = state
-                    .op_journal_mode_state
+                    .active_op_state
+                    .journal_mode()
                     .page_ref
                     .as_ref()
                     .expect("page_ref should be set");
                 let completion = begin_write_btree_page(pager, page)?;
-                state.op_journal_mode_state.sub_state = OpJournalModeSubState::Finalize;
+                state.active_op_state.journal_mode().sub_state = OpJournalModeSubState::Finalize;
                 return Ok(InsnFunctionStepResult::IO(IOCompletions::Single(
                     completion,
                 )));
@@ -14294,7 +14330,8 @@ fn op_journal_mode_inner(
 
             OpJournalModeSubState::Finalize => {
                 let new_mode = state
-                    .op_journal_mode_state
+                    .active_op_state
+                    .journal_mode()
                     .new_mode
                     .expect("new_mode should be set");
 
@@ -14483,7 +14520,7 @@ pub fn op_vacuum_into(
     match op_vacuum_into_inner(program, state, insn) {
         Ok(InsnFunctionStepResult::Step) => {
             // Instruction complete, reset state
-            state.op_vacuum_into_state = None;
+            state.active_op_state.clear();
             Ok(InsnFunctionStepResult::Step)
         }
         Ok(InsnFunctionStepResult::IO(io)) => {
@@ -14495,7 +14532,7 @@ pub fn op_vacuum_into(
         }
         Err(err) => {
             // Reset state on error
-            state.op_vacuum_into_state = None;
+            state.active_op_state.clear();
             Err(err)
         }
     }
@@ -14516,7 +14553,7 @@ fn op_vacuum_into_inner(
         insn
     );
 
-    if state.op_vacuum_into_state.is_none() {
+    if state.active_op_state.vacuum_into().is_none() {
         let database_id = program.connection.get_database_id_by_name(schema_name)?;
 
         // Matches sqlite that treats VACUUM temp INTO as a no-op (no file created)
@@ -14525,14 +14562,14 @@ fn op_vacuum_into_inner(
             return Ok(InsnFunctionStepResult::Step);
         }
 
-        state.op_vacuum_into_state = Some(OpVacuumIntoState {
+        *state.active_op_state.vacuum_into() = Some(OpVacuumIntoState {
             escaped_schema_name: schema_name.replace('"', "\"\""),
             database_id,
             ..Default::default()
         });
     }
 
-    let vacuum_state = state.op_vacuum_into_state.as_mut().unwrap();
+    let vacuum_state = state.active_op_state.vacuum_into().as_mut().unwrap();
     let escaped_schema_name = &vacuum_state.escaped_schema_name;
     let database_id = vacuum_state.database_id;
 
@@ -14856,7 +14893,7 @@ mod tests {
         );
         assert_eq!(state.pc, 0, "pc should not advance on invariant violation");
         assert!(
-            state.op_hash_probe_state.is_none(),
+            matches!(state.active_op_state.hash_probe(), None),
             "HashProbe should not stash resumable state for the removed fallback path"
         );
     }
