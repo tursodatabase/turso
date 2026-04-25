@@ -2,19 +2,21 @@ use std::sync::{atomic::Ordering, Arc};
 
 use crate::error::LimboError;
 use crate::io::{Buffer, Completion, CompletionGroup, WriteBatch as IOWriteBatch};
-use crate::schema::{BTreeTable, Schema, TypeDef};
+use crate::schema::{BTreeTable, Index, Schema, TypeDef};
+use crate::storage::btree::{BTreeCursor, CursorTrait};
 use crate::storage::pager::{AutoVacuumMode, Page, PageRef, Pager};
 use crate::storage::sqlite3_ondisk::{
     CacheSize, DatabaseHeader, PageSize, TextEncoding, WAL_FRAME_HEADER_SIZE,
 };
 use crate::types::IOCompletions;
-use crate::util::IOExt;
+use crate::util::{exprs_are_equivalent, IOExt};
 use crate::vdbe::{execute::InsnFunctionStepResult, Row};
 use crate::Result;
 use crate::{
     Connection, Database, DatabaseOpts, EncryptionKey, EncryptionOpts, MvStore, OpenFlags, SyncMode,
 };
 use turso_macros::{turso_assert, turso_assert_eq};
+use turso_parser::ast::Expr;
 
 /// A representation of a row from `sqlite_schema`.
 ///
@@ -394,8 +396,16 @@ pub(crate) struct VacuumTargetBuildContext {
     tables_to_copy: Vec<usize>,
     /// User-defined secondary indexes to CREATE
     indexes_to_create: Vec<usize>,
+    /// Indexes created before fast table copy so their b-trees can be copied
+    /// directly instead of rebuilt from table rows.
+    fast_created_indexes: Vec<usize>,
     /// Triggers, views, and rootpage = 0 objects
     post_data_entries: Vec<usize>,
+}
+
+pub(crate) struct VacuumFastIndexCopy {
+    source: Arc<Index>,
+    target: Arc<Index>,
 }
 
 impl VacuumTargetBuildContext {
@@ -407,6 +417,7 @@ impl VacuumTargetBuildContext {
             tables_to_create: Vec::new(),
             tables_to_copy: Vec::new(),
             indexes_to_create: Vec::new(),
+            fast_created_indexes: Vec::new(),
             post_data_entries: Vec::new(),
         }
     }
@@ -441,6 +452,17 @@ pub(crate) enum VacuumTargetBuildPhase {
     },
     /// Start copying a table's data
     StartCopyTable { table_idx: usize },
+    PrepareFastCopyIndexCreate {
+        table_idx: usize,
+        index_ordinals: Vec<usize>,
+        index_pos: usize,
+    },
+    StepFastCopyIndexCreate {
+        target_schema_stmt: Box<crate::Statement>,
+        table_idx: usize,
+        index_ordinals: Vec<usize>,
+        index_pos: usize,
+    },
     /// Select rows from source table and insert into the target.
     CopyRows {
         select_stmt: Box<crate::Statement>,
@@ -452,6 +474,77 @@ pub(crate) enum VacuumTargetBuildPhase {
         select_stmt: Box<crate::Statement>,
         target_insert_stmt: Box<crate::Statement>,
         table_idx: usize,
+    },
+    RewindFastTableCopy {
+        source_cursor: Box<BTreeCursor>,
+        target_cursor: Box<BTreeCursor>,
+        table_idx: usize,
+        index_pairs: Vec<VacuumFastIndexCopy>,
+    },
+    SeekEndFastTableCopy {
+        source_cursor: Box<BTreeCursor>,
+        target_cursor: Box<BTreeCursor>,
+        table_idx: usize,
+        index_pairs: Vec<VacuumFastIndexCopy>,
+    },
+    CopyFastTableRows {
+        source_cursor: Box<BTreeCursor>,
+        target_cursor: Box<BTreeCursor>,
+        table_idx: usize,
+        index_pairs: Vec<VacuumFastIndexCopy>,
+    },
+    InsertFastTableRow {
+        source_cursor: Box<BTreeCursor>,
+        target_cursor: Box<BTreeCursor>,
+        table_idx: usize,
+        index_pairs: Vec<VacuumFastIndexCopy>,
+        rowid: i64,
+    },
+    AdvanceFastTableSource {
+        source_cursor: Box<BTreeCursor>,
+        target_cursor: Box<BTreeCursor>,
+        table_idx: usize,
+        index_pairs: Vec<VacuumFastIndexCopy>,
+    },
+    StartFastIndexCopy {
+        table_idx: usize,
+        index_idx: usize,
+        index_pairs: Vec<VacuumFastIndexCopy>,
+    },
+    RewindFastIndexCopy {
+        source_cursor: Box<BTreeCursor>,
+        target_cursor: Box<BTreeCursor>,
+        table_idx: usize,
+        index_idx: usize,
+        index_pairs: Vec<VacuumFastIndexCopy>,
+    },
+    SeekEndFastIndexCopy {
+        source_cursor: Box<BTreeCursor>,
+        target_cursor: Box<BTreeCursor>,
+        table_idx: usize,
+        index_idx: usize,
+        index_pairs: Vec<VacuumFastIndexCopy>,
+    },
+    CopyFastIndexRows {
+        source_cursor: Box<BTreeCursor>,
+        target_cursor: Box<BTreeCursor>,
+        table_idx: usize,
+        index_idx: usize,
+        index_pairs: Vec<VacuumFastIndexCopy>,
+    },
+    InsertFastIndexRow {
+        source_cursor: Box<BTreeCursor>,
+        target_cursor: Box<BTreeCursor>,
+        table_idx: usize,
+        index_idx: usize,
+        index_pairs: Vec<VacuumFastIndexCopy>,
+    },
+    AdvanceFastIndexSource {
+        source_cursor: Box<BTreeCursor>,
+        target_cursor: Box<BTreeCursor>,
+        table_idx: usize,
+        index_idx: usize,
+        index_pairs: Vec<VacuumFastIndexCopy>,
     },
     /// Prepare CREATE INDEX statement on the target (idx into indexes_to_create)
     PrepareCreateIndex { idx: usize },
@@ -727,6 +820,34 @@ pub(crate) fn vacuum_target_build_step(
                         schema.get_btree_table(table_name)
                     });
 
+                if let Some(source_btree_table) = source_btree_table.as_deref() {
+                    if should_attempt_fast_table_copy(config, state, table_name, source_btree_table)
+                    {
+                        let index_ordinals =
+                            fast_copy_index_create_ordinals(state, table_name.as_str());
+                        if !index_ordinals.is_empty() {
+                            state.phase = VacuumTargetBuildPhase::PrepareFastCopyIndexCreate {
+                                table_idx,
+                                index_ordinals,
+                                index_pos: 0,
+                            };
+                            continue;
+                        }
+                    }
+
+                    if let Some((source_cursor, target_cursor, index_pairs)) =
+                        try_prepare_fast_table_copy(config, state, table_name, source_btree_table)?
+                    {
+                        state.phase = VacuumTargetBuildPhase::RewindFastTableCopy {
+                            source_cursor,
+                            target_cursor,
+                            table_idx,
+                            index_pairs,
+                        };
+                        continue;
+                    }
+                }
+
                 // sqlite_sequence may already have rows from the AUTOINCREMENT
                 // tracking that ran during the table data copy. Use INSERT OR
                 // REPLACE so the source counter values overwrite any stale
@@ -763,6 +884,63 @@ pub(crate) fn vacuum_target_build_step(
                 };
                 continue;
             }
+
+            VacuumTargetBuildPhase::PrepareFastCopyIndexCreate {
+                table_idx,
+                index_ordinals,
+                index_pos,
+            } => {
+                if index_pos >= index_ordinals.len() {
+                    state.phase = VacuumTargetBuildPhase::StartCopyTable { table_idx };
+                    continue;
+                }
+
+                let entry_ordinal = index_ordinals[index_pos];
+                let entry = &state.schema_entries[entry_ordinal];
+                let target_stmt = state.target_conn.prepare(&entry.sql)?;
+                state.phase = VacuumTargetBuildPhase::StepFastCopyIndexCreate {
+                    target_schema_stmt: Box::new(target_stmt),
+                    table_idx,
+                    index_ordinals,
+                    index_pos,
+                };
+                continue;
+            }
+
+            VacuumTargetBuildPhase::StepFastCopyIndexCreate {
+                mut target_schema_stmt,
+                table_idx,
+                index_ordinals,
+                index_pos,
+            } => match target_schema_stmt.step()? {
+                crate::StepResult::Row => {
+                    unreachable!("CREATE INDEX statement unexpectedly returned a row");
+                }
+                crate::StepResult::Done => {
+                    state.fast_created_indexes.push(index_ordinals[index_pos]);
+                    state.phase = VacuumTargetBuildPhase::PrepareFastCopyIndexCreate {
+                        table_idx,
+                        index_ordinals,
+                        index_pos: index_pos + 1,
+                    };
+                    continue;
+                }
+                crate::StepResult::IO => {
+                    let io = target_schema_stmt
+                        .take_io_completions()
+                        .expect("StepResult::IO returned but no completions available");
+                    state.phase = VacuumTargetBuildPhase::StepFastCopyIndexCreate {
+                        target_schema_stmt,
+                        table_idx,
+                        index_ordinals,
+                        index_pos,
+                    };
+                    return Ok(crate::IOResult::IO(io));
+                }
+                crate::StepResult::Busy | crate::StepResult::Interrupt => {
+                    return Err(LimboError::Busy);
+                }
+            },
 
             VacuumTargetBuildPhase::CopyRows {
                 mut select_stmt,
@@ -845,6 +1023,337 @@ pub(crate) fn vacuum_target_build_step(
                 }
             },
 
+            VacuumTargetBuildPhase::RewindFastTableCopy {
+                mut source_cursor,
+                target_cursor,
+                table_idx,
+                index_pairs,
+            } => match source_cursor.rewind()? {
+                crate::IOResult::Done(()) => {
+                    state.phase = VacuumTargetBuildPhase::SeekEndFastTableCopy {
+                        source_cursor,
+                        target_cursor,
+                        table_idx,
+                        index_pairs,
+                    };
+                    continue;
+                }
+                crate::IOResult::IO(io) => {
+                    state.phase = VacuumTargetBuildPhase::RewindFastTableCopy {
+                        source_cursor,
+                        target_cursor,
+                        table_idx,
+                        index_pairs,
+                    };
+                    return Ok(crate::IOResult::IO(io));
+                }
+            },
+
+            VacuumTargetBuildPhase::SeekEndFastTableCopy {
+                source_cursor,
+                mut target_cursor,
+                table_idx,
+                index_pairs,
+            } => match target_cursor.seek_end()? {
+                crate::IOResult::Done(()) => {
+                    state.phase = VacuumTargetBuildPhase::CopyFastTableRows {
+                        source_cursor,
+                        target_cursor,
+                        table_idx,
+                        index_pairs,
+                    };
+                    continue;
+                }
+                crate::IOResult::IO(io) => {
+                    state.phase = VacuumTargetBuildPhase::SeekEndFastTableCopy {
+                        source_cursor,
+                        target_cursor,
+                        table_idx,
+                        index_pairs,
+                    };
+                    return Ok(crate::IOResult::IO(io));
+                }
+            },
+
+            VacuumTargetBuildPhase::CopyFastTableRows {
+                mut source_cursor,
+                target_cursor,
+                table_idx,
+                index_pairs,
+            } => {
+                if !source_cursor.has_record() {
+                    state.phase = VacuumTargetBuildPhase::StartFastIndexCopy {
+                        table_idx,
+                        index_idx: 0,
+                        index_pairs,
+                    };
+                    continue;
+                }
+
+                let rowid = match source_cursor.rowid()? {
+                    crate::IOResult::Done(Some(rowid)) => rowid,
+                    crate::IOResult::Done(None) => {
+                        return Err(LimboError::Corrupt(
+                            "VACUUM fast table copy found table record without rowid".to_string(),
+                        ));
+                    }
+                    crate::IOResult::IO(io) => {
+                        state.phase = VacuumTargetBuildPhase::CopyFastTableRows {
+                            source_cursor,
+                            target_cursor,
+                            table_idx,
+                            index_pairs,
+                        };
+                        return Ok(crate::IOResult::IO(io));
+                    }
+                };
+
+                state.phase = VacuumTargetBuildPhase::InsertFastTableRow {
+                    source_cursor,
+                    target_cursor,
+                    table_idx,
+                    index_pairs,
+                    rowid,
+                };
+                continue;
+            }
+
+            VacuumTargetBuildPhase::InsertFastTableRow {
+                mut source_cursor,
+                mut target_cursor,
+                table_idx,
+                index_pairs,
+                rowid,
+            } => match target_cursor.transfer_current_table_row_from(&mut source_cursor, rowid)? {
+                crate::IOResult::Done(()) => {
+                    state.phase = VacuumTargetBuildPhase::AdvanceFastTableSource {
+                        source_cursor,
+                        target_cursor,
+                        table_idx,
+                        index_pairs,
+                    };
+                    continue;
+                }
+                crate::IOResult::IO(io) => {
+                    state.phase = VacuumTargetBuildPhase::InsertFastTableRow {
+                        source_cursor,
+                        target_cursor,
+                        table_idx,
+                        index_pairs,
+                        rowid,
+                    };
+                    return Ok(crate::IOResult::IO(io));
+                }
+            },
+
+            VacuumTargetBuildPhase::AdvanceFastTableSource {
+                mut source_cursor,
+                target_cursor,
+                table_idx,
+                index_pairs,
+            } => match source_cursor.next()? {
+                crate::IOResult::Done(()) => {
+                    state.phase = VacuumTargetBuildPhase::CopyFastTableRows {
+                        source_cursor,
+                        target_cursor,
+                        table_idx,
+                        index_pairs,
+                    };
+                    continue;
+                }
+                crate::IOResult::IO(io) => {
+                    state.phase = VacuumTargetBuildPhase::AdvanceFastTableSource {
+                        source_cursor,
+                        target_cursor,
+                        table_idx,
+                        index_pairs,
+                    };
+                    return Ok(crate::IOResult::IO(io));
+                }
+            },
+
+            VacuumTargetBuildPhase::StartFastIndexCopy {
+                table_idx,
+                index_idx,
+                index_pairs,
+            } => {
+                if index_idx >= index_pairs.len() {
+                    state.phase = VacuumTargetBuildPhase::StartCopyTable {
+                        table_idx: table_idx + 1,
+                    };
+                    continue;
+                }
+
+                let pair = &index_pairs[index_idx];
+                let source_pager = config
+                    .source_conn
+                    .get_pager_from_database_index(&config.source_db_id)?;
+                let target_pager = state.target_conn.get_pager();
+                let source_cursor = Box::new(BTreeCursor::new_index(
+                    source_pager,
+                    pair.source.root_page,
+                    &pair.source,
+                    pair.source.columns.len(),
+                ));
+                let target_cursor = Box::new(BTreeCursor::new_index(
+                    target_pager,
+                    pair.target.root_page,
+                    &pair.target,
+                    pair.target.columns.len(),
+                ));
+
+                state.phase = VacuumTargetBuildPhase::RewindFastIndexCopy {
+                    source_cursor,
+                    target_cursor,
+                    table_idx,
+                    index_idx,
+                    index_pairs,
+                };
+                continue;
+            }
+
+            VacuumTargetBuildPhase::RewindFastIndexCopy {
+                mut source_cursor,
+                target_cursor,
+                table_idx,
+                index_idx,
+                index_pairs,
+            } => match source_cursor.rewind()? {
+                crate::IOResult::Done(()) => {
+                    state.phase = VacuumTargetBuildPhase::SeekEndFastIndexCopy {
+                        source_cursor,
+                        target_cursor,
+                        table_idx,
+                        index_idx,
+                        index_pairs,
+                    };
+                    continue;
+                }
+                crate::IOResult::IO(io) => {
+                    state.phase = VacuumTargetBuildPhase::RewindFastIndexCopy {
+                        source_cursor,
+                        target_cursor,
+                        table_idx,
+                        index_idx,
+                        index_pairs,
+                    };
+                    return Ok(crate::IOResult::IO(io));
+                }
+            },
+
+            VacuumTargetBuildPhase::SeekEndFastIndexCopy {
+                source_cursor,
+                mut target_cursor,
+                table_idx,
+                index_idx,
+                index_pairs,
+            } => match target_cursor.seek_end()? {
+                crate::IOResult::Done(()) => {
+                    state.phase = VacuumTargetBuildPhase::CopyFastIndexRows {
+                        source_cursor,
+                        target_cursor,
+                        table_idx,
+                        index_idx,
+                        index_pairs,
+                    };
+                    continue;
+                }
+                crate::IOResult::IO(io) => {
+                    state.phase = VacuumTargetBuildPhase::SeekEndFastIndexCopy {
+                        source_cursor,
+                        target_cursor,
+                        table_idx,
+                        index_idx,
+                        index_pairs,
+                    };
+                    return Ok(crate::IOResult::IO(io));
+                }
+            },
+
+            VacuumTargetBuildPhase::CopyFastIndexRows {
+                source_cursor,
+                target_cursor,
+                table_idx,
+                index_idx,
+                index_pairs,
+            } => {
+                if !source_cursor.has_record() {
+                    state.phase = VacuumTargetBuildPhase::StartFastIndexCopy {
+                        table_idx,
+                        index_idx: index_idx + 1,
+                        index_pairs,
+                    };
+                    continue;
+                }
+
+                state.phase = VacuumTargetBuildPhase::InsertFastIndexRow {
+                    source_cursor,
+                    target_cursor,
+                    table_idx,
+                    index_idx,
+                    index_pairs,
+                };
+                continue;
+            }
+
+            VacuumTargetBuildPhase::InsertFastIndexRow {
+                mut source_cursor,
+                mut target_cursor,
+                table_idx,
+                index_idx,
+                index_pairs,
+            } => match target_cursor.transfer_current_index_record_from(&mut source_cursor)? {
+                crate::IOResult::Done(()) => {
+                    state.phase = VacuumTargetBuildPhase::AdvanceFastIndexSource {
+                        source_cursor,
+                        target_cursor,
+                        table_idx,
+                        index_idx,
+                        index_pairs,
+                    };
+                    continue;
+                }
+                crate::IOResult::IO(io) => {
+                    state.phase = VacuumTargetBuildPhase::InsertFastIndexRow {
+                        source_cursor,
+                        target_cursor,
+                        table_idx,
+                        index_idx,
+                        index_pairs,
+                    };
+                    return Ok(crate::IOResult::IO(io));
+                }
+            },
+
+            VacuumTargetBuildPhase::AdvanceFastIndexSource {
+                mut source_cursor,
+                target_cursor,
+                table_idx,
+                index_idx,
+                index_pairs,
+            } => match source_cursor.next()? {
+                crate::IOResult::Done(()) => {
+                    state.phase = VacuumTargetBuildPhase::CopyFastIndexRows {
+                        source_cursor,
+                        target_cursor,
+                        table_idx,
+                        index_idx,
+                        index_pairs,
+                    };
+                    continue;
+                }
+                crate::IOResult::IO(io) => {
+                    state.phase = VacuumTargetBuildPhase::AdvanceFastIndexSource {
+                        source_cursor,
+                        target_cursor,
+                        table_idx,
+                        index_idx,
+                        index_pairs,
+                    };
+                    return Ok(crate::IOResult::IO(io));
+                }
+            },
+
             // Phase 3: Create user-defined secondary indexes.
             VacuumTargetBuildPhase::PrepareCreateIndex { idx } => {
                 let entries_len = state.indexes_to_create.len();
@@ -855,6 +1364,10 @@ pub(crate) fn vacuum_target_build_step(
                 }
 
                 let entry_ordinal = state.indexes_to_create[idx];
+                if state.fast_created_indexes.contains(&entry_ordinal) {
+                    state.phase = VacuumTargetBuildPhase::PrepareCreateIndex { idx: idx + 1 };
+                    continue;
+                }
                 let entry = &state.schema_entries[entry_ordinal];
                 // Backing-btree indexes for custom index methods were filtered
                 // out when indexes_to_create was built. The remaining CREATE
@@ -956,6 +1469,158 @@ pub(crate) fn vacuum_target_build_step(
                 return Ok(crate::IOResult::Done(()));
             }
         }
+    }
+}
+
+type FastTableCopy = (Box<BTreeCursor>, Box<BTreeCursor>, Vec<VacuumFastIndexCopy>);
+
+fn should_attempt_fast_table_copy(
+    config: &VacuumTargetBuildConfig,
+    state: &VacuumTargetBuildContext,
+    table_name: &str,
+    source_table: &BTreeTable,
+) -> bool {
+    if config
+        .source_conn
+        .mv_store_for_db(config.source_db_id)
+        .is_some()
+        || state
+            .target_conn
+            .mv_store_for_db(crate::MAIN_DB_ID)
+            .is_some()
+        || !source_table.has_rowid
+        || table_name == crate::schema::SQLITE_SEQUENCE_TABLE_NAME
+    {
+        return false;
+    }
+
+    state.target_conn.with_schema(crate::MAIN_DB_ID, |schema| {
+        schema.get_btree_table(table_name).is_some_and(|target| {
+            target.has_rowid && target.columns().len() == source_table.columns().len()
+        })
+    })
+}
+
+fn fast_copy_index_create_ordinals(
+    state: &VacuumTargetBuildContext,
+    table_name: &str,
+) -> Vec<usize> {
+    state
+        .indexes_to_create
+        .iter()
+        .copied()
+        .filter(|entry_ordinal| {
+            let entry = &state.schema_entries[*entry_ordinal];
+            entry.tbl_name == table_name && !state.fast_created_indexes.contains(entry_ordinal)
+        })
+        .collect()
+}
+
+// VACUUM-only transfer path: copy table records directly, then copy any
+// autoindexes that already exist on the target after CREATE TABLE.
+fn try_prepare_fast_table_copy(
+    config: &VacuumTargetBuildConfig,
+    state: &VacuumTargetBuildContext,
+    table_name: &str,
+    source_table: &BTreeTable,
+) -> Result<Option<FastTableCopy>> {
+    if config
+        .source_conn
+        .mv_store_for_db(config.source_db_id)
+        .is_some()
+        || state
+            .target_conn
+            .mv_store_for_db(crate::MAIN_DB_ID)
+            .is_some()
+    {
+        return Ok(None);
+    }
+
+    if !source_table.has_rowid || table_name == crate::schema::SQLITE_SEQUENCE_TABLE_NAME {
+        return Ok(None);
+    }
+
+    let Some(target_table) = state.target_conn.with_schema(crate::MAIN_DB_ID, |schema| {
+        schema.get_btree_table(table_name)
+    }) else {
+        return Ok(None);
+    };
+
+    if !target_table.has_rowid || source_table.columns().len() != target_table.columns().len() {
+        return Ok(None);
+    }
+
+    let target_indexes: Vec<Arc<Index>> =
+        state.target_conn.with_schema(crate::MAIN_DB_ID, |schema| {
+            schema.get_indices(table_name).cloned().collect()
+        });
+    let mut index_pairs = Vec::with_capacity(target_indexes.len());
+    for target in target_indexes {
+        let Some(source) = config
+            .source_conn
+            .with_schema(config.source_db_id, |schema| {
+                schema.get_index(table_name, &target.name).cloned()
+            })
+        else {
+            return Ok(None);
+        };
+        if !fast_index_copy_compatible(&source, &target) {
+            return Ok(None);
+        }
+        index_pairs.push(VacuumFastIndexCopy { source, target });
+    }
+
+    let source_pager = config
+        .source_conn
+        .get_pager_from_database_index(&config.source_db_id)?;
+    let target_pager = state.target_conn.get_pager();
+
+    Ok(Some((
+        Box::new(BTreeCursor::new_table(
+            source_pager,
+            source_table.root_page,
+            source_table.columns().len(),
+        )),
+        Box::new(BTreeCursor::new_table(
+            target_pager,
+            target_table.root_page,
+            target_table.columns().len(),
+        )),
+        index_pairs,
+    )))
+}
+
+fn fast_index_copy_compatible(source: &Index, target: &Index) -> bool {
+    if source.root_page == 0
+        || target.root_page == 0
+        || source.unique != target.unique
+        || source.on_conflict != target.on_conflict
+        || source.has_rowid != target.has_rowid
+        || source.index_method.is_some()
+        || target.index_method.is_some()
+        || source.columns.len() != target.columns.len()
+    {
+        return false;
+    }
+
+    if !optional_exprs_are_equivalent(&source.where_clause, &target.where_clause) {
+        return false;
+    }
+
+    source.columns.iter().zip(&target.columns).all(|(l, r)| {
+        l.name == r.name
+            && l.order == r.order
+            && l.pos_in_table == r.pos_in_table
+            && l.collation == r.collation
+            && optional_exprs_are_equivalent(&l.expr, &r.expr)
+    })
+}
+
+fn optional_exprs_are_equivalent(left: &Option<Box<Expr>>, right: &Option<Box<Expr>>) -> bool {
+    match (left, right) {
+        (None, None) => true,
+        (Some(left), Some(right)) => exprs_are_equivalent(left, right),
+        _ => false,
     }
 }
 
@@ -2339,7 +3004,7 @@ mod tests {
     use crate::schema::Schema;
     use crate::storage::encryption::{CipherMode, EncryptionKey};
     use crate::storage::pager::Page;
-    use crate::util::IOExt;
+    use crate::util::{exprs_are_equivalent, IOExt};
     use crate::{
         Buffer, Clock, Completion, DatabaseOpts, File, MemoryIO, MonotonicInstant, OpenFlags,
         WallClockInstant, IO,

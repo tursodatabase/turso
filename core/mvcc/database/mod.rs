@@ -2459,6 +2459,24 @@ impl<Clock: LogicalClock> MvStore<Clock> {
             self.finalized_tx_states.is_empty(),
             "MVCC VACUUM reset requires finalized transaction cache to be cleared"
         );
+        // Empty buckets can still carry stale index metadata for a rootpage
+        // that VACUUM reuses. Drop them before installing the new root map.
+        let row_keys = self
+            .rows
+            .iter()
+            .map(|entry| entry.key().clone())
+            .collect::<Vec<_>>();
+        for key in row_keys {
+            self.rows.remove(&key);
+        }
+        let index_keys = self
+            .index_rows
+            .iter()
+            .map(|entry| *entry.key())
+            .collect::<Vec<_>>();
+        for key in index_keys {
+            self.index_rows.remove(&key);
+        }
         let root_pages = schema
             .tables
             .values()

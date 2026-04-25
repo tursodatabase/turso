@@ -6,7 +6,8 @@ use crate::queued_io::{QueuedIo, QueuedIoEvent, QueuedIoOpKind};
 use rusqlite::Connection as SqliteConnection;
 use std::{path::Path, sync::Arc};
 use tempfile::TempDir;
-use turso_core::{Connection, Database, DatabaseOpts, LimboError, StepResult, Value, IO};
+use turso_core::storage::database::DatabaseFile;
+use turso_core::{Connection, Database, DatabaseOpts, LimboError, OpenFlags, StepResult, Value, IO};
 use turso_parser::{ast::Cmd, parser::Parser};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
