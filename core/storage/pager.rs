@@ -1410,8 +1410,21 @@ enum AllocatePage1State {
 #[derive(Debug, Clone)]
 enum FreePageState {
     Start,
-    AddToTrunk { page: Arc<Page> },
-    NewTrunk { page: Arc<Page> },
+    AddToTrunk {
+        page: Arc<Page>,
+    },
+    NewTrunk {
+        page: Arc<Page>,
+    },
+    /// After the page is added to the freelist, update its ptrmap entry to
+    /// FreePage so that autovacuum knows the page is no longer in use.
+    /// SQLite equivalent: ptrmapPut(pBt, iPage, PTRMAP_FREEPAGE, 0) in freePage2().
+    /// This is a separate state so that if ptrmap_put yields IO, re-entry
+    /// lands here rather than repeating the freelist bookkeeping above.
+    #[cfg(not(feature = "omit_autovacuum"))]
+    PtrMapFreePage {
+        page_id: u32,
+    },
 }
 
 /// State machine for async cache spilling.
@@ -4498,6 +4511,16 @@ impl Pager {
 
                         // Unpin page before finishing - it's added to freelist
                         page.unpin();
+                        // On autovacuum databases, mark this page as free in the
+                        // ptrmap so that future ptrmap reads see the correct state.
+                        // Mirrors SQLite's freePage2() → ptrmapPut(PTRMAP_FREEPAGE, 0).
+                        #[cfg(not(feature = "omit_autovacuum"))]
+                        if self.get_auto_vacuum_mode() != AutoVacuumMode::None {
+                            *state = FreePageState::PtrMapFreePage {
+                                page_id: page_id as u32,
+                            };
+                            continue;
+                        }
                         break;
                     }
                     // page remains pinned as it transitions to NewTrunk state
@@ -4521,6 +4544,21 @@ impl Pager {
                     header.freelist_trunk_page = (page_id as u32).into();
                     // Unpin page before finishing - it's now a trunk page
                     page.unpin();
+                    // On autovacuum databases, mark this page as free in the ptrmap.
+                    // Mirrors SQLite's freePage2() → ptrmapPut(PTRMAP_FREEPAGE, 0).
+                    #[cfg(not(feature = "omit_autovacuum"))]
+                    if self.get_auto_vacuum_mode() != AutoVacuumMode::None {
+                        *state = FreePageState::PtrMapFreePage {
+                            page_id: page_id as u32,
+                        };
+                        continue;
+                    }
+                    break;
+                }
+                #[cfg(not(feature = "omit_autovacuum"))]
+                FreePageState::PtrMapFreePage { page_id } => {
+                    let page_id = *page_id;
+                    return_if_io!(self.ptrmap_put(page_id, PtrmapType::FreePage, 0));
                     break;
                 }
             }
