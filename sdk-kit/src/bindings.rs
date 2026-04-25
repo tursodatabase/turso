@@ -302,6 +302,13 @@ unsafe extern "C" {
     pub fn turso_statement_parameters_count(self_: *const turso_statement_t) -> i64;
 }
 unsafe extern "C" {
+    #[doc = " Return the name of the parameter at 1-based index, including the SQL prefix.\nReturns NULL for positional-only parameters or out-of-range indices.\nThe caller must free the returned string with turso_str_deinit."]
+    pub fn turso_statement_parameter_name(
+        self_: *const turso_statement_t,
+        index: i64,
+    ) -> *const ::std::os::raw::c_char;
+}
+unsafe extern "C" {
     #[doc = " Bind a positional argument to a statement"]
     pub fn turso_statement_bind_positional_null(
         self_: *const turso_statement_t,
