@@ -1930,7 +1930,7 @@ fn emit_update_insns<'a>(
                     program.emit_insn(Insn::Delete {
                         cursor_id: target_table_cursor_id,
                         table_name: table_name.to_string(),
-                        is_part_of_update: false,
+                        is_part_of_update: true,
                     });
 
                     // Phase 2: After Delete - fire CASCADE/SetNull/SetDefault FK actions.
