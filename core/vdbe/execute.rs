@@ -59,9 +59,9 @@ use crate::{
         builder::CursorType,
         insn::{IdxInsertFlags, Insn, SavepointOp},
     },
-    CaptureDataChangesInfo, CdcVersion, CheckpointMode, Completion, Connection, DatabaseStorage,
-    IOExt, MvCursor, NonNan, OpenFlags, QueryMode, Statement, TransactionState, ValueRef,
-    MAIN_DB_ID, TEMP_DB_ID,
+    CaptureDataChangesInfo, CdcVersion, CheckpointMode, CipherMode, Completion, Connection,
+    DatabaseStorage, EncryptionOpts, IOExt, MvCursor, NonNan, OpenFlags, QueryMode, Statement,
+    TransactionState, ValueRef, MAIN_DB_ID, TEMP_DB_ID,
 };
 use crate::{
     error::{
@@ -14548,7 +14548,8 @@ fn op_vacuum_into_inner(
     load_insn!(
         VacuumInto {
             schema_name,
-            dest_path
+            dest_path,
+            encryption_opts
         },
         insn
     );
@@ -14606,10 +14607,6 @@ fn op_vacuum_into_inner(
                     )));
                 }
 
-                // Pin source metadata before building the destination. The
-                // BEGIN and pragma helpers here are blocking convenience wrappers;
-                // async work starts with the schema scan in vacuum_into_step.
-                let source_db = program.connection.get_source_database(database_id);
                 program.connection.execute("BEGIN")?;
                 state.auto_txn_cleanup = TxnCleanup::RollbackTxn;
                 let user_version: i32 = extract_pragma_int(
@@ -14658,7 +14655,8 @@ fn op_vacuum_into_inner(
                     .with_views(source_db.experimental_views_enabled())
                     .with_index_method(source_db.experimental_index_method_enabled())
                     .with_custom_types(source_db.experimental_custom_types_enabled())
-                    .with_generated_columns(source_db.experimental_generated_columns_enabled());
+                    .with_generated_columns(source_db.experimental_generated_columns_enabled())
+                    .with_encryption(encryption_opts.is_some());
 
                 // Always use PlatformIO for the destination file, even if source
                 // is in-memory. This ensures VACUUM INTO writes to disk.
@@ -14668,14 +14666,24 @@ fn op_vacuum_into_inner(
                     dest_path,
                     OpenFlags::Create,
                     dest_opts,
-                    None,
+                    encryption_opts.clone(),
                 )?;
+
                 let dest_conn = dest_db.connect()?;
+
                 dest_conn.reset_page_size(page_size)?;
-                // set reserved_space on destination to match source
-                // this is important for databases using encryption or checksums
-                // must be set before page 1 is allocated (before any schema operations)
-                dest_conn.set_reserved_bytes(reserved_space)?;
+
+                // set reserved_space on destination to match source or use encryption parameters,
+                // if specified. This is important for databases using encryption or checksums.
+                // Must be set before page 1 is allocated (before any schema operations)
+                if let Some(EncryptionOpts { cipher, hexkey }) = encryption_opts {
+                    let cipher_mode = CipherMode::try_from(cipher.as_str())?;
+                    dest_conn.execute(format!("PRAGMA cipher = '{cipher}'"))?;
+                    dest_conn.execute(format!("PRAGMA hexkey = '{hexkey}'"))?;
+                    dest_conn.set_reserved_bytes(cipher_mode.metadata_size() as u8)?;
+                } else {
+                    dest_conn.set_reserved_bytes(reserved_space)?;
+                }
 
                 // Capture source custom type definitions so that STRICT tables with
                 // custom type columns can resolve those types during CREATE TABLE
