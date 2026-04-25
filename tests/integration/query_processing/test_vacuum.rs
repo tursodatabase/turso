@@ -1,6 +1,6 @@
 use crate::common::{
     compute_dbhash, compute_dbhash_with_database_opts, compute_dbhash_with_options,
-    compute_dbhash_with_options_and_database_opts, ExecRows, TempDatabase,
+    compute_dbhash_with_options_and_database_opts, run_query_on_row, ExecRows, TempDatabase,
 };
 use rusqlite::Connection as SqliteConnection;
 use std::sync::Arc;
@@ -3257,6 +3257,107 @@ fn test_vacuum_into_preserves_vector_blobs(tmp_db: TempDatabase) -> anyhow::Resu
         )",
     );
     assert_eq!(source_dist, dest_dist);
+
+    Ok(())
+}
+
+const VACUUM_ENC_CIPHER: &str = "aegis256";
+const VACUUM_ENC_HEXKEY: &str = "b1bbfda4f589dc9daaf004fe21111e00dc00c98237102f5c7002a5669fc76327";
+
+/// VACUUM INTO with cipher+hexkey produces an encrypted destination: the rows
+/// can be read back with the matching key, and the on-disk bytes do not contain
+/// the plaintext sentinel string.
+#[turso_macros::test]
+fn test_vacuum_into_encrypts_destination(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let _ = env_logger::try_init();
+    let conn = tmp_db.connect_limbo();
+
+    // unique sentinel that should never appear in ciphertext
+    let sentinel = "PLAINTEXT_SENTINEL_QWERTY_12345";
+    conn.execute("CREATE TABLE secrets (id INTEGER PRIMARY KEY, value TEXT)")?;
+    conn.execute(format!("INSERT INTO secrets (value) VALUES ('{sentinel}')"))?;
+    conn.execute("INSERT INTO secrets (value) VALUES ('another secret')")?;
+
+    let dest_dir = TempDir::new()?;
+    let dest_path = dest_dir.path().join("encrypted_vacuumed.db");
+    let dest_path_str = dest_path.to_str().unwrap();
+
+    conn.execute(format!(
+        "VACUUM INTO 'file:{dest_path_str}?cipher={VACUUM_ENC_CIPHER}&hexkey={VACUUM_ENC_HEXKEY}'"
+    ))?;
+    assert!(dest_path.exists(), "destination file should exist");
+
+    // open destination with matching encryption params and verify rows
+    let uri = format!("file:{dest_path_str}?cipher={VACUUM_ENC_CIPHER}&hexkey={VACUUM_ENC_HEXKEY}");
+    let (_io, dest_conn) =
+        Connection::from_uri(&uri, turso_core::DatabaseOpts::new().with_encryption(true))?;
+    let rows: Vec<(i64, String)> = dest_conn.exec_rows("SELECT id, value FROM secrets ORDER BY id");
+    assert_eq!(
+        rows,
+        vec![(1, sentinel.to_string()), (2, "another secret".to_string()),]
+    );
+
+    // the raw on-disk bytes must not contain the plaintext sentinel
+    let bytes = std::fs::read(&dest_path)?;
+    let needle = sentinel.as_bytes();
+    let leaked = bytes.windows(needle.len()).any(|w| w == needle);
+    assert!(
+        !leaked,
+        "encrypted VACUUM INTO destination leaked plaintext sentinel"
+    );
+
+    Ok(())
+}
+
+/// VACUUM INTO destination encrypted with a given key cannot be decrypted with
+/// a different key, and cannot be read at all without the cipher/hexkey params.
+#[turso_macros::test]
+fn test_vacuum_into_encrypted_destination_rejects_wrong_key(
+    tmp_db: TempDatabase,
+) -> anyhow::Result<()> {
+    let _ = env_logger::try_init();
+    let conn = tmp_db.connect_limbo();
+    conn.execute("CREATE TABLE secrets (id INTEGER PRIMARY KEY, value TEXT)")?;
+    conn.execute("INSERT INTO secrets (value) VALUES ('hidden')")?;
+
+    let dest_dir = TempDir::new()?;
+    let dest_path = dest_dir.path().join("encrypted_vacuumed.db");
+    let dest_path_str = dest_path.to_str().unwrap();
+
+    conn.execute(format!(
+        "VACUUM INTO 'file:{dest_path_str}?cipher={VACUUM_ENC_CIPHER}&hexkey={VACUUM_ENC_HEXKEY}'"
+    ))?;
+
+    // try_open returns Err either when from_uri itself rejects the file, or when
+    // a subsequent query fails to decrypt page 1.
+    let try_open = |uri: &str| -> Result<(), ()> {
+        match Connection::from_uri(uri, turso_core::DatabaseOpts::new().with_encryption(true)) {
+            Err(_) => Err(()),
+            Ok((_io, c)) => run_query_on_row(
+                &tmp_db,
+                &c,
+                "SELECT id, value FROM secrets",
+                |_row: &turso_core::Row| {},
+            )
+            .map_err(|_| ()),
+        }
+    };
+
+    // wrong hexkey (last two hex digits flipped from `27` to `77`)
+    let wrong_hexkey = "b1bbfda4f589dc9daaf004fe21111e00dc00c98237102f5c7002a5669fc76377";
+    let wrong_uri =
+        format!("file:{dest_path_str}?cipher={VACUUM_ENC_CIPHER}&hexkey={wrong_hexkey}");
+    assert!(
+        try_open(&wrong_uri).is_err(),
+        "encrypted destination must not be readable with wrong hexkey"
+    );
+
+    // no encryption params at all
+    let bare_uri = format!("file:{dest_path_str}");
+    assert!(
+        try_open(&bare_uri).is_err(),
+        "encrypted destination must not be readable without encryption params"
+    );
 
     Ok(())
 }

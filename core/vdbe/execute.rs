@@ -14607,6 +14607,10 @@ fn op_vacuum_into_inner(
                     )));
                 }
 
+                // Pin source metadata before building the destination. The
+                // BEGIN and pragma helpers here are blocking convenience wrappers;
+                // async work starts with the schema scan in vacuum_into_step.
+                let source_db = program.connection.get_source_database(database_id);
                 program.connection.execute("BEGIN")?;
                 state.auto_txn_cleanup = TxnCleanup::RollbackTxn;
                 let user_version: i32 = extract_pragma_int(
