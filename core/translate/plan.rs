@@ -326,13 +326,22 @@ pub enum Plan {
         right_most: Box<SelectPlan>,
         limit: Option<Box<Expr>>,
         offset: Option<Box<Expr>>,
-        /// ORDER BY for compound selects. Each entry is (result_column_index, sort_order, nulls_order).
+        /// ORDER BY for compound selects.
+        /// Each entry is
+        /// (result_column_index, sort_order, nulls_order, explicit_collation_override).
         /// The column index is 0-based into the result set.
-        order_by: Option<Vec<(usize, SortOrder, Option<ast::NullsOrder>)>>,
+        order_by: Option<Vec<CompoundSelectOrderByTerm>>,
     },
     Delete(Box<DeletePlan>),
     Update(Box<UpdatePlan>),
 }
+
+pub type CompoundSelectOrderByTerm = (
+    usize,
+    SortOrder,
+    Option<ast::NullsOrder>,
+    Option<CollationSeq>,
+);
 
 impl Plan {
     /// Returns true if this SELECT plan contains a reference to the given table.

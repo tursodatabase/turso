@@ -25,17 +25,22 @@ fn fmt_order_by_item(
     expr: &impl fmt::Display,
     dir: SortOrder,
     nulls: Option<turso_parser::ast::NullsOrder>,
+    collation: Option<crate::translate::collate::CollationSeq>,
 ) -> fmt::Result {
     let dir_str = match dir {
         SortOrder::Asc => "ASC",
         SortOrder::Desc => "DESC",
     };
+    let collation = collation.map(|collation| format!(" COLLATE {collation}"));
+    let collation = collation.as_deref().unwrap_or("");
     match nulls {
         Some(turso_parser::ast::NullsOrder::First) => {
-            writeln!(f, "  - {expr} {dir_str} NULLS FIRST")
+            writeln!(f, "  - {expr}{collation} {dir_str} NULLS FIRST")
         }
-        Some(turso_parser::ast::NullsOrder::Last) => writeln!(f, "  - {expr} {dir_str} NULLS LAST"),
-        None => writeln!(f, "  - {expr} {dir_str}"),
+        Some(turso_parser::ast::NullsOrder::Last) => {
+            writeln!(f, "  - {expr}{collation} {dir_str} NULLS LAST")
+        }
+        None => writeln!(f, "  - {expr}{collation} {dir_str}"),
     }
 }
 
@@ -222,8 +227,8 @@ impl Display for Plan {
                 }
                 if let Some(order_by) = order_by {
                     writeln!(f, "ORDER BY:")?;
-                    for (expr, dir, nulls) in order_by {
-                        fmt_order_by_item(f, expr, *dir, *nulls)?;
+                    for (expr, dir, nulls, collation) in order_by {
+                        fmt_order_by_item(f, expr, *dir, *nulls, *collation)?;
                     }
                 }
                 Ok(())
@@ -590,7 +595,7 @@ impl fmt::Display for UpdatePlan {
         if !self.order_by.is_empty() {
             writeln!(f, "ORDER BY:")?;
             for (expr, dir, nulls) in &self.order_by {
-                fmt_order_by_item(f, expr, *dir, *nulls)?;
+                fmt_order_by_item(f, expr, *dir, *nulls, None)?;
             }
         }
         if let Some(limit) = self.limit.as_ref() {
@@ -673,15 +678,24 @@ impl ToTokens for Plan {
                     s.append(TokenType::TK_BY, None)?;
 
                     s.comma(
-                        order_by
-                            .iter()
-                            .map(|(col_idx, order, nulls)| ast::SortedColumn {
-                                expr: Box::new(ast::Expr::Literal(ast::Literal::Numeric(
-                                    (col_idx + 1).to_string(),
-                                ))),
+                        order_by.iter().map(|(col_idx, order, nulls, collation)| {
+                            let expr = ast::Expr::Literal(ast::Literal::Numeric(
+                                (col_idx + 1).to_string(),
+                            ));
+                            let expr = if let Some(collation) = collation {
+                                ast::Expr::collate(
+                                    expr,
+                                    ast::Name::from_string(collation.to_string()),
+                                )
+                            } else {
+                                expr
+                            };
+                            ast::SortedColumn {
+                                expr: Box::new(expr),
                                 order: Some(*order),
                                 nulls: *nulls,
-                            }),
+                            }
+                        }),
                         context,
                     )?;
                 }
