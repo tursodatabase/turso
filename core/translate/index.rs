@@ -142,6 +142,9 @@ pub fn translate_create_index(
     let Some(tbl) = table.btree() else {
         crate::bail_parse_error!("Error: table '{tbl_name}' is not a b-tree table.");
     };
+    if !tbl.has_rowid {
+        bail_parse_error!("CREATE INDEX on WITHOUT ROWID tables is not supported");
+    }
     let columns = resolve_sorted_columns(&tbl, &columns)?;
 
     // Block CREATE INDEX on non-orderable custom type columns and STRUCT/UNION columns

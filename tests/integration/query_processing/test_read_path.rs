@@ -1,4 +1,6 @@
-use crate::common::{ExecRows, TempDatabase};
+use crate::common::{limbo_exec_rows, sqlite_exec_rows, ExecRows, TempDatabase};
+use rusqlite::Connection as SqliteConnection;
+use tempfile::TempDir;
 use turso_core::{LimboError, Numeric, StepResult, Value};
 
 #[turso_macros::test(mvcc, init_sql = "create table test (i integer);")]
@@ -73,6 +75,47 @@ fn test_statement_bind(tmp_db: TempDatabase) -> anyhow::Result<()> {
         Ok(())
     })
     .unwrap();
+
+    Ok(())
+}
+
+#[turso_macros::test]
+fn test_open_existing_without_rowid_database(_tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let temp_dir = TempDir::new()?;
+    let db_path = temp_dir.path().join("without_rowid.db");
+    let query = "SELECT key, value FROM config ORDER BY key";
+    let schema_query = "SELECT sql FROM sqlite_schema WHERE name = 'config'";
+
+    let (sqlite_rows, sqlite_schema) = {
+        let sqlite = SqliteConnection::open(&db_path)?;
+        sqlite.pragma_update(None, "journal_mode", "wal")?;
+        sqlite.execute_batch(
+            "CREATE TABLE config (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            ) WITHOUT ROWID;
+            INSERT INTO config VALUES ('language', 'en');
+            INSERT INTO config VALUES ('theme', 'dark');
+            PRAGMA wal_checkpoint(TRUNCATE);",
+        )?;
+
+        (
+            sqlite_exec_rows(&sqlite, query),
+            sqlite_exec_rows(&sqlite, schema_query),
+        )
+    };
+
+    let db = TempDatabase::new_with_existent(&db_path);
+    let conn = db.connect_limbo();
+
+    assert_eq!(limbo_exec_rows(&conn, query), sqlite_rows);
+    assert_eq!(limbo_exec_rows(&conn, schema_query), sqlite_schema);
+
+    let err = conn.prepare("SELECT rowid FROM config").unwrap_err();
+    assert!(
+        err.to_string().contains("no such column: rowid"),
+        "expected rowid access to be rejected for WITHOUT ROWID table, got {err}"
+    );
 
     Ok(())
 }

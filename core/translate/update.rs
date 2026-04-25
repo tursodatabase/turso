@@ -215,6 +215,9 @@ pub fn prepare_update_plan(
             body.tbl_name.name.as_str()
         );
     }
+    if table.btree().is_some_and(|bt| !bt.has_rowid) {
+        bail_parse_error!("UPDATE of WITHOUT ROWID tables is not supported");
+    }
     let schema_cookie = resolver.with_schema(database_id, |s| s.schema_version);
     program.begin_write_on_database(database_id, schema_cookie);
     validate_update(

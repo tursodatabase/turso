@@ -14,7 +14,7 @@ use super::{
 use crate::{
     io::CompletionGroup,
     io_yield_one,
-    schema::Index,
+    schema::{BTreeTable, Index},
     storage::{
         pager::{BtreePageAllocMode, Pager},
         sqlite3_ondisk::{
@@ -767,6 +767,36 @@ impl BTreeCursor {
 
     pub fn new_table(pager: Arc<Pager>, root_page: i64, num_columns: usize) -> Self {
         Self::new(pager, root_page, num_columns)
+    }
+
+    pub fn new_without_rowid_table(
+        pager: Arc<Pager>,
+        root_page: i64,
+        table: &BTreeTable,
+        num_columns: usize,
+    ) -> Self {
+        let mut cursor = Self::new(pager, root_page, num_columns);
+        let key_info = table
+            .primary_key_columns
+            .iter()
+            .map(|(col_name, order)| {
+                let (_, column) = table
+                    .get_column(col_name)
+                    .expect("WITHOUT ROWID primary key column should exist");
+                crate::types::KeyInfo {
+                    sort_order: *order,
+                    collation: column.collation_opt().unwrap_or_default(),
+                    nulls_order: None,
+                }
+            })
+            .collect::<Vec<_>>();
+        cursor.index_info = Some(Arc::new(IndexInfo {
+            key_info,
+            has_rowid: false,
+            num_cols: table.primary_key_columns.len(),
+            is_unique: true,
+        }));
+        cursor
     }
 
     pub fn new_index(pager: Arc<Pager>, root_page: i64, index: &Index, num_columns: usize) -> Self {
@@ -5695,7 +5725,7 @@ impl CursorTrait for BTreeCursor {
     fn has_rowid(&self) -> bool {
         match &self.index_info {
             Some(index_key_info) => index_key_info.has_rowid,
-            None => true, // currently we don't support WITHOUT ROWID tables
+            None => true,
         }
     }
 

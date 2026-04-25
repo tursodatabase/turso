@@ -103,6 +103,36 @@ fn test_sequential_overflow_page(tmp_db: TempDatabase) -> anyhow::Result<()> {
     Ok(())
 }
 
+#[turso_macros::test]
+fn test_insert_without_rowid_table(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let _ = env_logger::try_init();
+    let conn = tmp_db.connect_limbo();
+
+    conn.execute(
+        "CREATE TABLE config (value TEXT NOT NULL, key TEXT PRIMARY KEY, scope TEXT) WITHOUT ROWID",
+    )?;
+    conn.execute("INSERT INTO config (scope, key, value) VALUES ('user', 'theme', 'dark')")?;
+    conn.execute("INSERT INTO config (key, value, scope) VALUES ('language', 'en', 'global')")?;
+
+    let rows: Vec<(String, String, String)> =
+        conn.exec_rows("SELECT key, value, scope FROM config ORDER BY key");
+    assert_eq!(
+        rows,
+        vec![
+            (
+                "language".to_string(),
+                "en".to_string(),
+                "global".to_string()
+            ),
+            ("theme".to_string(), "dark".to_string(), "user".to_string()),
+        ]
+    );
+
+    do_flush(&conn, &tmp_db)?;
+    rusqlite_integrity_check(tmp_db.path.as_path())?;
+    Ok(())
+}
+
 #[turso_macros::test(init_sql = "CREATE TABLE test (x INTEGER PRIMARY KEY);")]
 #[ignore = "this takes too long :)"]
 fn test_sequential_write(tmp_db: TempDatabase) -> anyhow::Result<()> {
