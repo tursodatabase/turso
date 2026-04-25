@@ -2069,6 +2069,13 @@ fn test_vacuum_into_preserves_mvcc(tmp_db: TempDatabase) -> anyhow::Result<()> {
     conn.execute("INSERT INTO t VALUES (1, 'hello')")?;
     conn.execute("INSERT INTO t VALUES (2, 'world')")?;
 
+    let db_log = tmp_db.path.with_extension("db-log");
+    let db_log_size = std::fs::metadata(&db_log).unwrap().len();
+    assert!(
+        db_log_size > 0,
+        "MVCC log file should be non-empty at {db_log:?} before VACUUM INTO (size={db_log_size})"
+    );
+
     let dest_dir = TempDir::new()?;
     let dest_path = dest_dir.path().join("vacuumed_mvcc.db");
     let dest_path_str = dest_path.to_str().unwrap();
