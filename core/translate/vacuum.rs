@@ -1,8 +1,9 @@
 //! Translation of VACUUM statements to VDBE bytecode.
 
+use crate::util::OpenOptions;
 use crate::vdbe::builder::ProgramBuilder;
 use crate::vdbe::insn::Insn;
-use crate::{bail_parse_error, Connection, Result};
+use crate::{bail_parse_error, Connection, EncryptionOpts, Result};
 use crate::{sync::Arc, LimboError};
 use turso_parser::ast::{Expr, Literal, Name};
 
@@ -28,11 +29,24 @@ pub fn translate_vacuum(
     match into {
         Some(dest_expr) => {
             // VACUUM INTO 'path' - create compacted copy at destination
-            let dest_path = extract_path_from_expr(dest_expr)?;
-            program.emit_insn(Insn::VacuumInto {
-                schema_name,
-                dest_path,
-            });
+            let dest = extract_path_from_expr(dest_expr)?;
+            let opts = OpenOptions::parse(dest.as_str())?;
+            // Do we need to throw error if nonsense options like mode=ro are passed?
+            match (opts.cipher, opts.hexkey) {
+                (Some(cipher), Some(hexkey)) => program.emit_insn(Insn::VacuumInto {
+                    schema_name,
+                    dest_path: opts.path,
+                    encryption_opts: Some(EncryptionOpts { cipher, hexkey }),
+                }),
+                (Some(_), None) => bail_parse_error!("hexkey is required when cipher is provided"),
+                (None, Some(_)) => bail_parse_error!("cipher is required when hexkey is provided"),
+                (None, None) => program.emit_insn(Insn::VacuumInto {
+                    schema_name,
+                    dest_path: opts.path,
+                    encryption_opts: None,
+                }),
+            }
+
             Ok(())
         }
         None => {

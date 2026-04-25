@@ -16,7 +16,7 @@ use crate::{
     translate::{collate::CollationSeq, emitter::TransactionMode},
     types::KeyInfo,
     vdbe::affinity::Affinity,
-    PreparedProgram, Value,
+    EncryptionOpts, PreparedProgram, Value,
 };
 use strum::EnumCount;
 use strum_macros::{EnumDiscriminants, FromRepr, VariantArray};
@@ -1924,6 +1924,7 @@ pub enum Insn {
         schema_name: String,
         /// Destination file path for the vacuumed database
         dest_path: String,
+        encryption_opts: Option<EncryptionOpts>,
     },
 
     /// In-place VACUUM - compact the database (by writing to a temporary location and then copying
