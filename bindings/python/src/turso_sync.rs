@@ -194,6 +194,8 @@ pub fn py_turso_sync_new(
             None => None,
         },
         remote_encryption_key: sync_config.remote_encryption_key.clone(),
+        push_operations_threshold: None,
+        pull_bytes_threshold: None,
     };
     let database =
         TursoDatabaseSync::<Vec<u8>>::new(db_config, sync_config).map_err(turso_error_to_py_err)?;

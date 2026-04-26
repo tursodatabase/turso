@@ -97,7 +97,9 @@ class Database extends DatabasePromise {
             tracing: opts.tracing,
             bootstrapIfEmpty: typeof opts.url != "function" || opts.url() != null,
             remoteEncryption: opts.remoteEncryption?.cipher,
-            partialSyncOpts: partialSyncOpts
+            partialSyncOpts: partialSyncOpts,
+            pushOperationsThreshold: opts.pushOperationsThreshold,
+            pullBytesThreshold: opts.pullBytesThreshold,
         });
 
         let headers: { [K: string]: string } | (() => Promise<{ [K: string]: string }>);
@@ -125,6 +127,7 @@ class Database extends DatabasePromise {
             headers: headers,
             preemptionMs: 1,
             transform: opts.transform,
+            fetch: opts.fetch,
         };
         const db = engine.db() as unknown as any;
         const memory = db.memory;
@@ -344,4 +347,6 @@ async function connect(opts: DatabaseOpts): Promise<Database> {
 }
 
 export { connect, Database }
+export { retryFetch } from "@tursodatabase/sync-common"
 export type { DatabaseOpts, EncryptionOpts, DatabaseRowMutation, DatabaseRowStatement, DatabaseRowTransformResult }
+export type { RetryFetchOpts } from "@tursodatabase/sync-common"

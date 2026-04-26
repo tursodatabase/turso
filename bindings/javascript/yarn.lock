@@ -1852,6 +1852,7 @@ __metadata:
   dependencies:
     "@tursodatabase/database-common": "npm:^0.6.0-pre.22"
     "@tursodatabase/serverless": "npm:^0.2.2"
+    "@types/node": "npm:^24.12.2"
     typescript: "npm:^5.9.2"
   languageName: unknown
   linkType: soft
@@ -1879,7 +1880,7 @@ __metadata:
     "@napi-rs/cli": "npm:^3.1.5"
     "@tursodatabase/database-common": "npm:^0.6.0-pre.22"
     "@tursodatabase/sync-common": "npm:^0.6.0-pre.22"
-    "@types/node": "npm:^24.3.1"
+    "@types/node": "npm:^24.12.2"
     typescript: "npm:^5.9.2"
     vitest: "npm:^3.2.4"
   languageName: unknown
@@ -1925,7 +1926,7 @@ __metadata:
   languageName: node
   linkType: hard
 
-"@types/node@npm:^24.3.1":
+"@types/node@npm:^24.12.2, @types/node@npm:^24.3.1":
   version: 24.12.2
   resolution: "@types/node@npm:24.12.2"
   dependencies:

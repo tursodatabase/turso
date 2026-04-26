@@ -3142,7 +3142,7 @@ pub fn op_transaction(
     let result = op_transaction_inner(program, state, insn, pager);
     tracing::debug!(
         "op_transaction: end: state={:?}, tx_state={:?}",
-        *state.active_op_state.transaction(),
+        state.active_op_state,
         program.connection.get_tx_state()
     );
     match result {
@@ -11102,6 +11102,43 @@ fn op_parse_schema_step(
     }
 }
 
+/// Phases of the multi-statement state machine driven by [`op_init_cdc_version`].
+/// Each phase owns a single sub-statement that is stepped to completion before
+/// transitioning to the next phase, yielding `IO` to the outer VDBE loop instead
+/// of blocking the executor thread on `pager.io.step()`.
+#[derive(Debug)]
+pub enum OpInitCdcVersionPhase {
+    /// `SELECT 1 FROM sqlite_schema WHERE ... AND name=cdc_table` — used to detect
+    /// a legacy v1 CDC table (one that pre-dates version tracking).
+    CheckTable,
+    /// `CREATE TABLE IF NOT EXISTS <cdc_table> (...)`.
+    CreateCdcTable,
+    /// `CREATE TABLE IF NOT EXISTS <version_table> (...)`.
+    CreateVersionTable,
+    /// `INSERT OR IGNORE INTO <version_table> VALUES (...)`.
+    InsertVersion,
+    /// `SELECT version FROM <version_table> WHERE table_name=...`.
+    ReadVersion,
+}
+
+pub struct OpInitCdcVersionInner {
+    phase: OpInitCdcVersionPhase,
+    stmt: crate::Statement,
+    cdc_table_exists: bool,
+    actual_version: Option<CdcVersion>,
+}
+
+pub type OpInitCdcVersionState = Option<Box<OpInitCdcVersionInner>>;
+
+fn prepare_cdc_internal(conn: &Arc<Connection>, sql: String) -> Result<crate::Statement> {
+    let stmt = conn.prepare_internal(sql)?;
+    stmt.program
+        .prepared
+        .needs_stmt_subtransactions
+        .store(false, Ordering::Relaxed);
+    Ok(stmt)
+}
+
 pub fn op_init_cdc_version(
     program: &Program,
     state: &mut ProgramState,
@@ -11120,114 +11157,159 @@ pub fn op_init_cdc_version(
     let conn = program.connection.clone();
     let escaped_cdc_table_name = escape_sql_string_literal(cdc_table_name);
 
-    // "off" — disable CDC (table and version entry are preserved)
-    if CaptureDataChangesInfo::parse(cdc_mode, None)?.is_none() {
-        state.pending_cdc_info = Some(None);
-        state.pc += 1;
-        return Ok(InsnFunctionStepResult::Step);
-    }
+    // First entry — handle no-op cases without spinning up the state machine,
+    // and otherwise prime the first sub-statement (Phase 1: existence check).
+    if state.active_op_state.init_cdc_version().is_none() {
+        // "off" — disable CDC (table and version entry are preserved).
+        if CaptureDataChangesInfo::parse(cdc_mode, None)?.is_none() {
+            state.pending_cdc_info = Some(None);
+            state.pc += 1;
+            return Ok(InsnFunctionStepResult::Step);
+        }
 
-    // If CDC is already enabled, re-parse with current version and exit early.
-    // This makes the operation idempotent and avoids CDC capturing its own
-    // table creation when the pragma is called multiple times.
-    {
-        let current = conn.get_capture_data_changes_info();
-        if let Some(info) = current.as_ref() {
+        // If CDC is already enabled, re-parse with current version and exit
+        // early. Idempotent; avoids CDC capturing its own table creation when
+        // the pragma is called multiple times.
+        if let Some(info) = conn.get_capture_data_changes_info().as_ref() {
             let opts = CaptureDataChangesInfo::parse(cdc_mode, info.version)?;
             state.pending_cdc_info = Some(opts);
             state.pc += 1;
             return Ok(InsnFunctionStepResult::Step);
         }
-    }
 
-    // Step 0: Check if the CDC table already exists but has no version row.
-    // If so, it's a legacy v1 table that pre-dates version tracking.
-    let cdc_table_exists = {
-        let mut stmt = conn.prepare_internal(format!(
-            "SELECT 1 FROM sqlite_schema WHERE type='table' AND name='{escaped_cdc_table_name}'",
-        ))?;
-        stmt.program
-            .prepared
-            .needs_stmt_subtransactions
-            .store(false, Ordering::Relaxed);
-        let rows = stmt.run_collect_rows();
-        !rows?.is_empty()
-    };
-
-    // Step 1: Create CDC table if needed
-    {
-        let create_sql = match version {
-            CdcVersion::V1 => format!(
-                "CREATE TABLE IF NOT EXISTS {cdc_table_name} (change_id INTEGER PRIMARY KEY AUTOINCREMENT, change_time INTEGER, change_type INTEGER, table_name TEXT, id, before BLOB, after BLOB, updates BLOB)",
+        let stmt = prepare_cdc_internal(
+            &conn,
+            format!(
+                "SELECT 1 FROM sqlite_schema WHERE type='table' AND name='{escaped_cdc_table_name}'",
             ),
-            CdcVersion::V2 => format!(
-                "CREATE TABLE IF NOT EXISTS {cdc_table_name} (change_id INTEGER PRIMARY KEY AUTOINCREMENT, change_time INTEGER, change_txn_id INTEGER, change_type INTEGER, table_name TEXT, id, before BLOB, after BLOB, updates BLOB)",
-            ),
-        };
-        let mut stmt = conn.prepare_internal(create_sql)?;
-        stmt.program
-            .prepared
-            .needs_stmt_subtransactions
-            .store(false, Ordering::Relaxed);
-        stmt.run_ignore_rows()?;
+        )?;
+        *state.active_op_state.init_cdc_version() = Some(Box::new(OpInitCdcVersionInner {
+            phase: OpInitCdcVersionPhase::CheckTable,
+            stmt,
+            cdc_table_exists: false,
+            actual_version: None,
+        }));
     }
 
-    // Step 2: Create version table if needed
-    {
-        let mut stmt = conn.prepare_internal(format!(
-            "CREATE TABLE IF NOT EXISTS {TURSO_CDC_VERSION_TABLE_NAME} (table_name TEXT PRIMARY KEY, version TEXT NOT NULL)",
-        ))?;
-        stmt.program
-            .prepared
-            .needs_stmt_subtransactions
-            .store(false, Ordering::Relaxed);
-        stmt.run_ignore_rows()?;
+    let res = drive_init_cdc_version(
+        state,
+        &conn,
+        version,
+        cdc_mode,
+        cdc_table_name,
+        &escaped_cdc_table_name,
+    );
+    // Any error tears down the parked state machine so a subsequent step on the
+    // same ProgramState (without an explicit reset) starts fresh instead of
+    // resuming from a dangling sub-statement.
+    if res.is_err() {
+        state.active_op_state.clear();
     }
+    res
+}
 
-    // Step 3: Insert version row only if one doesn't already exist.
-    // If the CDC table pre-existed without a version row, it's a legacy v1 table.
-    let version_to_insert = if cdc_table_exists {
-        CdcVersion::V1
-    } else {
-        *version
-    };
-    {
-        let mut stmt = conn.prepare_internal(format!(
-            "INSERT OR IGNORE INTO {TURSO_CDC_VERSION_TABLE_NAME} (table_name, version) VALUES ('{escaped_cdc_table_name}', '{version_to_insert}')",
-        ))?;
-        stmt.program
-            .prepared
-            .needs_stmt_subtransactions
-            .store(false, Ordering::Relaxed);
-        stmt.run_ignore_rows()?;
-    }
-
-    // Step 4: Read back the actual version from the table (may differ from
-    // `version` if the row already existed with an older version).
-    let actual_version = {
-        let mut stmt = conn.prepare_internal(format!(
-            "SELECT version FROM {TURSO_CDC_VERSION_TABLE_NAME} WHERE table_name = '{escaped_cdc_table_name}'",
-        ))?;
-        stmt.program
-            .prepared
-            .needs_stmt_subtransactions
-            .store(false, Ordering::Relaxed);
-        let rows = stmt.run_collect_rows();
-        let rows = rows?;
-        match rows.first().and_then(|r| r.first()) {
-            Some(crate::Value::Text(text)) => text.to_string().parse::<CdcVersion>()?,
-            _ => *version,
+fn drive_init_cdc_version(
+    state: &mut ProgramState,
+    conn: &Arc<Connection>,
+    version: &CdcVersion,
+    cdc_mode: &str,
+    cdc_table_name: &str,
+    escaped_cdc_table_name: &str,
+) -> Result<InsnFunctionStepResult> {
+    loop {
+        let inner = state.active_op_state.init_cdc_version().as_mut().unwrap();
+        match inner.stmt.step()? {
+            StepResult::IO => {
+                let io = inner
+                    .stmt
+                    .take_io_completions()
+                    .expect("IO returned but no completions");
+                return Ok(InsnFunctionStepResult::IO(io));
+            }
+            StepResult::Row => match &inner.phase {
+                OpInitCdcVersionPhase::CheckTable => {
+                    // Any row means the table exists; keep stepping until Done.
+                    inner.cdc_table_exists = true;
+                }
+                OpInitCdcVersionPhase::ReadVersion => {
+                    let row = inner.stmt.row().expect("row should be present");
+                    if let crate::Value::Text(text) = row.get::<&crate::Value>(0)? {
+                        inner.actual_version = Some(text.to_string().parse::<CdcVersion>()?);
+                    }
+                }
+                phase => unreachable!(
+                    "op_init_cdc_version: unexpected Row from non-SELECT phase {:?}",
+                    phase
+                ),
+            },
+            StepResult::Done => match inner.phase {
+                OpInitCdcVersionPhase::CheckTable => {
+                    let create_sql = match version {
+                        CdcVersion::V1 => format!(
+                            "CREATE TABLE IF NOT EXISTS {cdc_table_name} (change_id INTEGER PRIMARY KEY AUTOINCREMENT, change_time INTEGER, change_type INTEGER, table_name TEXT, id, before BLOB, after BLOB, updates BLOB)",
+                        ),
+                        CdcVersion::V2 => format!(
+                            "CREATE TABLE IF NOT EXISTS {cdc_table_name} (change_id INTEGER PRIMARY KEY AUTOINCREMENT, change_time INTEGER, change_txn_id INTEGER, change_type INTEGER, table_name TEXT, id, before BLOB, after BLOB, updates BLOB)",
+                        ),
+                    };
+                    inner.stmt = prepare_cdc_internal(&conn, create_sql)?;
+                    inner.phase = OpInitCdcVersionPhase::CreateCdcTable;
+                }
+                OpInitCdcVersionPhase::CreateCdcTable => {
+                    inner.stmt = prepare_cdc_internal(
+                        &conn,
+                        format!(
+                            "CREATE TABLE IF NOT EXISTS {TURSO_CDC_VERSION_TABLE_NAME} (table_name TEXT PRIMARY KEY, version TEXT NOT NULL)",
+                        ),
+                    )?;
+                    inner.phase = OpInitCdcVersionPhase::CreateVersionTable;
+                }
+                OpInitCdcVersionPhase::CreateVersionTable => {
+                    // If the CDC table pre-existed without a version row, it's
+                    // a legacy v1 table — pin to V1 regardless of the requested
+                    // version.
+                    let version_to_insert = if inner.cdc_table_exists {
+                        CdcVersion::V1
+                    } else {
+                        *version
+                    };
+                    inner.stmt = prepare_cdc_internal(
+                        &conn,
+                        format!(
+                            "INSERT OR IGNORE INTO {TURSO_CDC_VERSION_TABLE_NAME} (table_name, version) VALUES ('{escaped_cdc_table_name}', '{version_to_insert}')",
+                        ),
+                    )?;
+                    inner.phase = OpInitCdcVersionPhase::InsertVersion;
+                }
+                OpInitCdcVersionPhase::InsertVersion => {
+                    inner.stmt = prepare_cdc_internal(
+                        &conn,
+                        format!(
+                            "SELECT version FROM {TURSO_CDC_VERSION_TABLE_NAME} WHERE table_name = '{escaped_cdc_table_name}'",
+                        ),
+                    )?;
+                    inner.phase = OpInitCdcVersionPhase::ReadVersion;
+                }
+                OpInitCdcVersionPhase::ReadVersion => {
+                    // Read back the actual version (may differ from `version`
+                    // if the row already existed with an older version).
+                    let actual_version = inner.actual_version.unwrap_or(*version);
+                    let opts = CaptureDataChangesInfo::parse(cdc_mode, Some(actual_version))?;
+                    // Defer enabling CDC until the program completes
+                    // successfully (Halt). Ensures rollback leaves the
+                    // connection's CDC state unchanged.
+                    state.pending_cdc_info = Some(opts);
+                    state.active_op_state.clear();
+                    state.pc += 1;
+                    return Ok(InsnFunctionStepResult::Step);
+                }
+            },
+            // Interrupt/Busy fall through to the caller, which clears the
+            // parked state machine on error.
+            StepResult::Interrupt => return Err(LimboError::Interrupt),
+            StepResult::Busy => return Err(LimboError::Busy),
         }
-    };
-
-    // Defer enabling CDC until the program completes successfully (Halt).
-    // This ensures that if the transaction rolls back, the connection's
-    // CDC state remains unchanged.
-    let opts = CaptureDataChangesInfo::parse(cdc_mode, Some(actual_version))?;
-    state.pending_cdc_info = Some(opts);
-
-    state.pc += 1;
-    Ok(InsnFunctionStepResult::Step)
+    }
 }
 
 pub fn op_populate_materialized_views(

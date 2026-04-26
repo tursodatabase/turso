@@ -113,7 +113,12 @@ fn test_concurrent_commit_no_yield_spin() {
         match stmt.step().expect("step") {
             turso_core::StepResult::Row => {
                 if let Some(row) = stmt.row() {
-                    count = row.get_values().next().expect("count value").as_int().expect("count int");
+                    count = row
+                        .get_values()
+                        .next()
+                        .expect("count value")
+                        .as_int()
+                        .expect("count int");
                 }
             }
             turso_core::StepResult::Done => break,

@@ -118,6 +118,31 @@ export interface DatabaseOpts {
      */
     remoteWritesExperimental?: boolean;
     /**
+     * optional cap on the number of CDC operations packed into a single push HTTP batch.
+     * when set, push splits on transaction boundaries once the current batch has
+     * accumulated at least this many operations. a single user transaction is never
+     * split across batches. unset (default) sends the entire change set in one batch.
+     */
+    pushOperationsThreshold?: number,
+    /**
+     * optional hint, in bytes, that splits the bootstrap download into multiple
+     * `/pull-updates` HTTP requests of >= this many bytes each (using the
+     * `server_pages_selector` bitmap). unset (default) bootstraps in a single
+     * round-trip. currently affects only the bootstrap phase — incremental
+     * pulls are unaffected. no-op when partial sync uses the `query` strategy.
+     */
+    pullBytesThreshold?: number,
+    /**
+     * optional fetch override used for every HTTP request made by the sync engine
+     * (push, pull, wait-for-changes). drop-in replacement for `globalThis.fetch`.
+     * use cases:
+     *   - retries / backoff (see {@link retryFetch})
+     *   - custom timeouts via AbortSignal
+     *   - request logging / instrumentation
+     *   - testing / mocking
+     */
+    fetch?: typeof fetch,
+    /**
      * optional parameter to enable partial sync for the database
      * WARNING: This feature is EXPERIMENTAL
      */
@@ -178,6 +203,7 @@ export interface RunOpts {
     url: string | (() => string | null),
     headers: { [K: string]: string } | (() => Promise<{ [K: string]: string }>)
     transform?: Transform,
+    fetch?: typeof fetch,
 }
 
 export interface ProtocolIo {

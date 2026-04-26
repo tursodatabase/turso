@@ -316,6 +316,22 @@ export interface DatabaseOpts {
   bootstrapIfEmpty?: boolean;
 
   /**
+   * Optional cap on the number of CDC operations packed into a single push HTTP batch.
+   * When set, push splits on transaction boundaries once the current batch has
+   * accumulated at least this many operations. A single user transaction is never
+   * split across batches. Unset (default) sends the entire change set in one batch.
+   */
+  pushOperationsThreshold?: number;
+
+  /**
+   * Optional hint, in bytes, that splits the bootstrap download into multiple
+   * `/pull-updates` HTTP requests of >= this many bytes each. Unset (default)
+   * bootstraps in a single round-trip. Currently affects only the bootstrap
+   * phase. No-op when partial sync uses the `query` bootstrap strategy.
+   */
+  pullBytesThreshold?: number;
+
+  /**
    * Optional parameter to enable partial sync for the database
    * WARNING: This feature is EXPERIMENTAL
    */

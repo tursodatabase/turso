@@ -122,6 +122,8 @@ pub struct turso_sync_database_config_t {
     pub partial_bootstrap_prefetch: bool,
     pub remote_encryption_key: *const ::std::os::raw::c_char,
     pub remote_encryption_cipher: *const ::std::os::raw::c_char,
+    pub push_operations_threshold: usize,
+    pub pull_bytes_threshold: usize,
 }
 impl Default for turso_sync_database_config_t {
     fn default() -> Self {

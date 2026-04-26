@@ -7,18 +7,22 @@
     "target": "esnext",
     "outDir": "dist/",
     "lib": [
-      "es2020"
+      "es2020",
     ],
     "paths": {
       "#index": [
         "./index.d.ts"
       ]
-    }
+    },
+    "types": [
+      "node"
+    ]
   },
   "include": [
     "*"
   ],
   "exclude": [
-    "*.test.ts"
+    "*.test.ts",
+    "turso-server.ts"
   ]
 }
