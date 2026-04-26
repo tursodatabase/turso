@@ -574,7 +574,12 @@ impl ActiveOpStateSlot {
     active_state_accessor!(parse_schema, ParseSchema, OpParseSchemaState, None);
     active_state_accessor!(hash_build, HashBuild, Option<OpHashBuildState>, None);
     active_state_accessor!(hash_probe, HashProbe, Option<OpHashProbeState>, None);
-    active_state_accessor!(init_cdc_version, InitCdcVersion, OpInitCdcVersionState, None);
+    active_state_accessor!(
+        init_cdc_version,
+        InitCdcVersion,
+        OpInitCdcVersionState,
+        None
+    );
 
     fn program_ref(&self) -> Option<&OpProgramState> {
         match &self.state {

@@ -11130,10 +11130,7 @@ pub struct OpInitCdcVersionInner {
 
 pub type OpInitCdcVersionState = Option<Box<OpInitCdcVersionInner>>;
 
-fn prepare_cdc_internal(
-    conn: &Arc<Connection>,
-    sql: String,
-) -> Result<crate::Statement> {
+fn prepare_cdc_internal(conn: &Arc<Connection>, sql: String) -> Result<crate::Statement> {
     let stmt = conn.prepare_internal(sql)?;
     stmt.program
         .prepared
@@ -11194,7 +11191,14 @@ pub fn op_init_cdc_version(
         }));
     }
 
-    let res = drive_init_cdc_version(state, &conn, version, cdc_mode, cdc_table_name, &escaped_cdc_table_name);
+    let res = drive_init_cdc_version(
+        state,
+        &conn,
+        version,
+        cdc_mode,
+        cdc_table_name,
+        &escaped_cdc_table_name,
+    );
     // Any error tears down the parked state machine so a subsequent step on the
     // same ProgramState (without an explicit reset) starts fresh instead of
     // resuming from a dangling sub-statement.
