@@ -298,6 +298,13 @@ export interface SyncEngineOpts {
    */
   remoteEncryptionKey?: string
   partialSyncOpts?: JsPartialSyncOpts
+  /**
+   * Optional cap on the number of CDC operations packed into a single push
+   * batch. When set, push splits on transaction boundaries once the batch
+   * has accumulated at least this many operations. `None` (default) sends
+   * the entire change set in one batch.
+   */
+  pushOperationsThreshold?: number
 }
 
 export declare const enum SyncEngineProtocolVersion {

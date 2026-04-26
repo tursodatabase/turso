@@ -128,6 +128,11 @@ typedef struct
     const char *remote_encryption_key;
     // optional encryption cipher name (e.g. "aes256gcm", "chacha20poly1305")
     const char *remote_encryption_cipher;
+    // optional cap on the number of CDC operations packed into a single push HTTP batch.
+    // when > 0, push splits on transaction boundaries once the current batch has accumulated
+    // at least this many operations. a single user transaction is never split across batches.
+    // 0 (default) sends the entire change set in one batch.
+    size_t push_operations_threshold;
 } turso_sync_database_config_t;
 
 /// opaque pointer to the TursoDatabaseSync instance

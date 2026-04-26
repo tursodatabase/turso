@@ -936,6 +936,81 @@ pub async fn push_logical_changes<IO: SyncEngineIo, Ctx>(
         ignore_schema_changes: false,
         ..Default::default()
     };
+
+    let threshold = opts.push_operations_threshold.filter(|t| *t > 0);
+    let mut changes = source.iterate_changes(iterate_opts)?;
+    let mut batch: Vec<DatabaseTapeRowChange> = Vec::new();
+    let mut total_rows_changed: i64 = 0;
+
+    let mut next_operation = changes.next(ctx.coro).await?;
+    while let Some(operation) = next_operation.take() {
+        next_operation = changes.next(ctx.coro).await?;
+        match operation {
+            DatabaseTapeOperation::StmtReplay(_) => {
+                panic!("changes iterator must not use StmtReplay option")
+            }
+            DatabaseTapeOperation::RowChange(change) => {
+                if change.table_name == TURSO_SYNC_TABLE_NAME {
+                    continue;
+                }
+                if opts.tables_ignore.iter().any(|x| &change.table_name == x) {
+                    continue;
+                }
+                batch.push(change);
+            }
+            DatabaseTapeOperation::Commit => {
+                // push batch if we reach threshold OR if this is last operation
+                let must_push =
+                    threshold.is_some_and(|t| batch.len() >= t) || next_operation.is_none();
+                if !must_push {
+                    continue;
+                }
+                total_rows_changed += send_push_batch(
+                    ctx,
+                    &generator,
+                    opts,
+                    &batch,
+                    client_id,
+                    source_pull_gen,
+                    &mut last_change_id,
+                )
+                .await?;
+                batch.clear();
+            }
+        }
+    }
+
+    assert!(batch.is_empty(), "last operation must be COMMIT");
+
+    tracing::info!(
+        "push_logical_changes: rows_changed={total_rows_changed}, last_change_id={:?}",
+        last_change_id
+    );
+    Ok((source_pull_gen, last_change_id.unwrap_or(0)))
+}
+
+/// Build and send a single push batch over HTTP. The caller owns the
+/// per-batch slice of changes; transformations (if enabled) run lazily here so
+/// the user-defined transform sees one batch's worth of rows at a time —
+/// matching the streaming semantics of the outer loop.
+///
+/// Returns the count of rows that actually produced SQL steps
+/// (post-transformation, excluding `Skip`).
+async fn send_push_batch<IO: SyncEngineIo, Ctx>(
+    ctx: &SyncOperationCtx<'_, IO, Ctx>,
+    generator: &DatabaseReplayGenerator,
+    opts: &DatabaseSyncEngineOpts,
+    batch_changes: &[DatabaseTapeRowChange],
+    client_id: &str,
+    source_pull_gen: i64,
+    last_change_id: &mut Option<i64>,
+) -> Result<i64> {
+    let mut transformed = if opts.use_transform {
+        Some(apply_transformation(ctx, batch_changes, generator).await?)
+    } else {
+        None
+    };
+
     let step = |query, args| BatchStep {
         stmt: Stmt {
             sql: Some(query),
@@ -949,6 +1024,7 @@ pub async fn push_logical_changes<IO: SyncEngineIo, Ctx>(
             cond: Box::new(BatchCond::IsAutocommit {}),
         }),
     };
+
     let mut add_column_step_indices = std::collections::HashSet::new();
     let mut sql_over_http_requests = vec![
         BatchStep {
@@ -964,49 +1040,18 @@ pub async fn push_logical_changes<IO: SyncEngineIo, Ctx>(
         },
         step(TURSO_SYNC_CREATE_TABLE.to_string(), Vec::new()),
     ];
-    let mut rows_changed = 0;
-    let mut changes = source.iterate_changes(iterate_opts)?;
-    let mut local_changes = Vec::new();
-    while let Some(operation) = changes.next(ctx.coro).await? {
-        match operation {
-            DatabaseTapeOperation::StmtReplay(_) => {
-                panic!("changes iterator must not use StmtReplay option")
-            }
-            DatabaseTapeOperation::RowChange(change) => {
-                if change.table_name == TURSO_SYNC_TABLE_NAME {
-                    continue;
-                }
-                let ignore = &opts.tables_ignore;
-                if ignore.iter().any(|x| &change.table_name == x) {
-                    continue;
-                }
-                local_changes.push(change);
-            }
-            DatabaseTapeOperation::Commit => continue,
-        }
-    }
 
-    let mut transformed = if opts.use_transform {
-        Some(apply_transformation(ctx, &local_changes, &generator).await?)
-    } else {
-        None
-    };
-
-    tracing::debug!("local_changes: {:?}", local_changes);
-
-    for (i, change) in local_changes.into_iter().enumerate() {
+    let mut rows_changed: i64 = 0;
+    for (i, change) in batch_changes.iter().enumerate() {
         let change_id = change.change_id;
-        let operation = if let Some(transformed) = &mut transformed {
-            match std::mem::replace(&mut transformed[i], DatabaseRowTransformResult::Skip) {
-                DatabaseRowTransformResult::Keep => DatabaseTapeOperation::RowChange(change),
-                DatabaseRowTransformResult::Skip => continue,
-                DatabaseRowTransformResult::Rewrite(replay) => {
-                    DatabaseTapeOperation::StmtReplay(replay)
-                }
-            }
+        let transform_result = if let Some(transformed) = transformed.as_mut() {
+            std::mem::replace(&mut transformed[i], DatabaseRowTransformResult::Skip)
         } else {
-            DatabaseTapeOperation::RowChange(change)
+            DatabaseRowTransformResult::Keep
         };
+        if let DatabaseRowTransformResult::Skip = transform_result {
+            continue;
+        }
         tracing::debug!(
             "change_id: {}, last_change_id: {:?}",
             change_id,
@@ -1025,27 +1070,22 @@ pub async fn push_logical_changes<IO: SyncEngineIo, Ctx>(
                 change_id
             );
         }
-        last_change_id = Some(change_id);
-        match operation {
-            DatabaseTapeOperation::Commit => {
-                panic!("Commit operation must not be emited at this stage")
-            }
-            DatabaseTapeOperation::StmtReplay(replay) => {
-                sql_over_http_requests.push(step(replay.sql, convert_to_args(replay.values)))
-            }
-            DatabaseTapeOperation::RowChange(change) => {
+        *last_change_id = Some(change_id);
+        match transform_result {
+            DatabaseRowTransformResult::Skip => panic!("Skip must be handled earlier"),
+            DatabaseRowTransformResult::Keep => {
                 let replay_info = generator.replay_info(ctx.coro, &change).await?;
                 // for now we try to support DDL statements which "extends" the schema (CREATE INDEX, CREATE TABLE, ALTER TABLE ADD COLUMN) and they have `IF NOT EXISTS` semantic
                 // as ALTER TABLE has no such syntax - we ignore error for such statements from remote for now
                 let is_alter_add_column =
                     replay_info.is_ddl_replay && is_alter_table_add_column(&replay_info.query);
-                match change.change {
+                match &change.change {
                     DatabaseTapeRowChangeType::Delete { before } => {
                         let values = generator.replay_values(
                             &replay_info,
                             replay_info.change_type,
                             change.id,
-                            before,
+                            before.clone(),
                             None,
                         );
                         sql_over_http_requests
@@ -1056,7 +1096,7 @@ pub async fn push_logical_changes<IO: SyncEngineIo, Ctx>(
                             &replay_info,
                             replay_info.change_type,
                             change.id,
-                            after,
+                            after.clone(),
                             None,
                         );
                         sql_over_http_requests
@@ -1071,8 +1111,8 @@ pub async fn push_logical_changes<IO: SyncEngineIo, Ctx>(
                             &replay_info,
                             replay_info.change_type,
                             change.id,
-                            after,
-                            Some(updates),
+                            after.clone(),
+                            Some(updates.clone()),
                         );
                         sql_over_http_requests
                             .push(step(replay_info.query.clone(), convert_to_args(values)));
@@ -1086,7 +1126,7 @@ pub async fn push_logical_changes<IO: SyncEngineIo, Ctx>(
                             &replay_info,
                             replay_info.change_type,
                             change.id,
-                            after,
+                            after.clone(),
                             None,
                         );
                         sql_over_http_requests
@@ -1096,6 +1136,9 @@ pub async fn push_logical_changes<IO: SyncEngineIo, Ctx>(
                 if is_alter_add_column {
                     add_column_step_indices.insert(sql_over_http_requests.len() - 1);
                 }
+            }
+            DatabaseRowTransformResult::Rewrite(replay) => {
+                sql_over_http_requests.push(step(replay.sql, convert_to_args(replay.values)))
             }
         }
     }
@@ -1135,13 +1178,12 @@ pub async fn push_logical_changes<IO: SyncEngineIo, Ctx>(
     };
 
     let _ = sql_execute_http(ctx, replay_hrana_request, &add_column_step_indices).await?;
-    tracing::info!("push_logical_changes: rows_changed={:?}", rows_changed);
-    Ok((source_pull_gen, last_change_id.unwrap_or(0)))
+    Ok(rows_changed)
 }
 
 pub async fn apply_transformation<IO: SyncEngineIo, Ctx>(
     ctx: &SyncOperationCtx<'_, IO, Ctx>,
-    changes: &Vec<DatabaseTapeRowChange>,
+    changes: &[DatabaseTapeRowChange],
     generator: &DatabaseReplayGenerator,
 ) -> Result<Vec<DatabaseRowTransformResult>> {
     let mut mutations = Vec::new();

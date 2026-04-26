@@ -458,6 +458,24 @@ namespace turso
                     sync_config.remote_encryption_cipher = nullptr;
                 }
 
+                // pushOperationsThreshold (0 disables batching, see C ABI docs)
+                if (syncConfigObj.hasProperty(rt, "pushOperationsThreshold"))
+                {
+                    jsi::Value thresholdVal = syncConfigObj.getProperty(rt, "pushOperationsThreshold");
+                    if (!thresholdVal.isNull() && !thresholdVal.isUndefined())
+                    {
+                        sync_config.push_operations_threshold = static_cast<size_t>(thresholdVal.asNumber());
+                    }
+                    else
+                    {
+                        sync_config.push_operations_threshold = 0;
+                    }
+                }
+                else
+                {
+                    sync_config.push_operations_threshold = 0;
+                }
+
                 // Create sync database instance
                 const turso_sync_database_t* database = nullptr;
                 const char* error = nullptr;

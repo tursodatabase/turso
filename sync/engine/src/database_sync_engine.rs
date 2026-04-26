@@ -50,6 +50,13 @@ pub struct DatabaseSyncEngineOpts {
     pub partial_sync_opts: Option<PartialSyncOpts>,
     /// Base64-encoded encryption key for the Turso Cloud database
     pub remote_encryption_key: Option<String>,
+    /// When set, [`push_changes_to_remote`] sends the local change set to the
+    /// remote in multiple HTTP batches, sealing the current batch as soon as it
+    /// has accumulated >= `push_operations_threshold` operations *and* the
+    /// next batch boundary lines up with a transaction boundary in the local
+    /// CDC log. Splits never happen mid-transaction. `None` preserves the
+    /// previous behaviour of pushing the whole change set in one batch.
+    pub push_operations_threshold: Option<usize>,
 }
 
 pub struct DataStats {

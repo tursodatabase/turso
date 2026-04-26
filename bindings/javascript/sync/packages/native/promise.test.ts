@@ -903,3 +903,47 @@ test('transform-many', async ({ server }) => {
     expect(rows1).toEqual([{ key: '1', value: 1001 + 1002 }]);
     expect(rows2).toEqual([{ key: '1', value: 1001 + 1002 }]);
 })
+
+test('push operations threshold splits batches', async ({ server }) => {
+    // Seed schema on the remote.
+    {
+        const db = await connect({ path: ':memory:', url: server.dbUrl() });
+        await db.exec("CREATE TABLE IF NOT EXISTS q(x INTEGER PRIMARY KEY, y TEXT)");
+        await db.exec("DELETE FROM q");
+        await db.push();
+        await db.close();
+    }
+
+    // total intentionally chosen so total % threshold != 0 — exercises the
+    // trailing-batch flush as well as the threshold-triggered seals.
+    const threshold = 13;
+    const total = 1003;
+
+    const db1 = await connect({
+        path: ':memory:',
+        url: server.dbUrl(),
+        pushOperationsThreshold: threshold,
+    });
+    for (let i = 0; i < total; i++) {
+        await db1.exec(`INSERT INTO q VALUES (${i}, 'v${i}')`);
+    }
+    // A multi-row transaction larger than the threshold; must not be split
+    // across HTTP batches.
+    await db1.exec("BEGIN");
+    for (let i = total; i < total + threshold * 2 + 5; i++) {
+        await db1.exec(`INSERT INTO q VALUES (${i}, 'v${i}')`);
+    }
+    await db1.exec("COMMIT");
+
+    await db1.push();
+
+    const expectedTotal = total + threshold * 2 + 5;
+
+    // Fresh client bootstraps from the remote — every row pushed in batches
+    // must be visible.
+    const db2 = await connect({ path: ':memory:', url: server.dbUrl() });
+    const cnt = await db2.prepare('SELECT COUNT(*) as c FROM q').all();
+    expect(cnt).toEqual([{ c: expectedTotal }]);
+    const last = await db2.prepare('SELECT MAX(x) as m FROM q').all();
+    expect(last).toEqual([{ m: expectedTotal - 1 }]);
+})

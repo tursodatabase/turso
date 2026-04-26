@@ -118,6 +118,13 @@ export interface DatabaseOpts {
      */
     remoteWritesExperimental?: boolean;
     /**
+     * optional cap on the number of CDC operations packed into a single push HTTP batch.
+     * when set, push splits on transaction boundaries once the current batch has
+     * accumulated at least this many operations. a single user transaction is never
+     * split across batches. unset (default) sends the entire change set in one batch.
+     */
+    pushOperationsThreshold?: number,
+    /**
      * optional parameter to enable partial sync for the database
      * WARNING: This feature is EXPERIMENTAL
      */
