@@ -1065,171 +1065,128 @@ fn rewrite_select_expressions<F>(select: &mut ast::Select, rewrite_expr: &mut F)
 where
     F: FnMut(&mut ast::Expr) -> Result<()>,
 {
-    // Rewrite WITH clause (CTEs)
-    if let Some(with_clause) = &mut select.with {
-        for cte in &mut with_clause.ctes {
-            rewrite_select_expressions(&mut cte.select, rewrite_expr)?;
-        }
+    enum RewriteItem<'a> {
+        Select(&'a mut ast::Select),
+        OneSelect(&'a mut ast::OneSelect),
+        FromClause(&'a mut ast::FromClause),
+        SelectTable(&'a mut ast::SelectTable),
+        Window(&'a mut ast::Window),
+        FrameBound(&'a mut ast::FrameBound),
+        Expr(&'a mut ast::Expr),
     }
 
-    rewrite_one_select_expressions(&mut select.body.select, rewrite_expr)?;
-
-    // Rewrite compound SELECT arms (UNION/EXCEPT/INTERSECT)
-    for compound in &mut select.body.compounds {
-        rewrite_one_select_expressions(&mut compound.select, rewrite_expr)?;
-    }
-
-    // Rewrite top-level ORDER BY
-    for sorted_col in &mut select.order_by {
-        rewrite_expression_tree(&mut sorted_col.expr, rewrite_expr)?;
-    }
-
-    // Rewrite top-level LIMIT/OFFSET
-    if let Some(limit) = &mut select.limit {
-        rewrite_expression_tree(&mut limit.expr, rewrite_expr)?;
-        if let Some(offset) = &mut limit.offset {
-            rewrite_expression_tree(offset, rewrite_expr)?;
-        }
-    }
-
-    Ok(())
-}
-
-fn rewrite_one_select_expressions<F>(
-    one_select: &mut ast::OneSelect,
-    rewrite_expr: &mut F,
-) -> Result<()>
-where
-    F: FnMut(&mut ast::Expr) -> Result<()>,
-{
-    match one_select {
-        ast::OneSelect::Select {
-            columns,
-            from,
-            where_clause,
-            group_by,
-            window_clause,
-            ..
-        } => {
-            for col in columns {
-                if let ast::ResultColumn::Expr(expr, _) = col {
-                    rewrite_expression_tree(expr, rewrite_expr)?;
+    let mut stack = vec![RewriteItem::Select(select)];
+    while let Some(item) = stack.pop() {
+        match item {
+            RewriteItem::Select(select) => {
+                if let Some(limit) = &mut select.limit {
+                    if let Some(offset) = &mut limit.offset {
+                        stack.push(RewriteItem::Expr(offset));
+                    }
+                    stack.push(RewriteItem::Expr(&mut limit.expr));
+                }
+                for sorted_col in select.order_by.iter_mut().rev() {
+                    stack.push(RewriteItem::Expr(&mut sorted_col.expr));
+                }
+                for compound in select.body.compounds.iter_mut().rev() {
+                    stack.push(RewriteItem::OneSelect(&mut compound.select));
+                }
+                stack.push(RewriteItem::OneSelect(&mut select.body.select));
+                if let Some(with_clause) = &mut select.with {
+                    for cte in with_clause.ctes.iter_mut().rev() {
+                        stack.push(RewriteItem::Select(&mut cte.select));
+                    }
                 }
             }
-
-            if let Some(from_clause) = from {
-                rewrite_from_clause_expressions(from_clause, rewrite_expr)?;
-            }
-
-            if let Some(where_expr) = where_clause {
-                rewrite_expression_tree(where_expr, rewrite_expr)?;
-            }
-
-            if let Some(group_by) = group_by {
-                for expr in &mut group_by.exprs {
-                    rewrite_expression_tree(expr, rewrite_expr)?;
+            RewriteItem::OneSelect(one_select) => match one_select {
+                ast::OneSelect::Select {
+                    columns,
+                    from,
+                    where_clause,
+                    group_by,
+                    window_clause,
+                    ..
+                } => {
+                    for window_def in window_clause.iter_mut().rev() {
+                        stack.push(RewriteItem::Window(&mut window_def.window));
+                    }
+                    if let Some(group_by) = group_by {
+                        if let Some(having_expr) = &mut group_by.having {
+                            stack.push(RewriteItem::Expr(having_expr));
+                        }
+                        for expr in group_by.exprs.iter_mut().rev() {
+                            stack.push(RewriteItem::Expr(expr));
+                        }
+                    }
+                    if let Some(where_expr) = where_clause {
+                        stack.push(RewriteItem::Expr(where_expr));
+                    }
+                    if let Some(from_clause) = from {
+                        stack.push(RewriteItem::FromClause(from_clause));
+                    }
+                    for col in columns.iter_mut().rev() {
+                        if let ast::ResultColumn::Expr(expr, _) = col {
+                            stack.push(RewriteItem::Expr(expr));
+                        }
+                    }
                 }
-                if let Some(having_expr) = &mut group_by.having {
-                    rewrite_expression_tree(having_expr, rewrite_expr)?;
+                ast::OneSelect::Values(values) => {
+                    for row in values.iter_mut().rev() {
+                        for expr in row.iter_mut().rev() {
+                            stack.push(RewriteItem::Expr(expr));
+                        }
+                    }
+                }
+            },
+            RewriteItem::FromClause(from_clause) => {
+                for join in from_clause.joins.iter_mut().rev() {
+                    if let Some(ast::JoinConstraint::On(expr)) = &mut join.constraint {
+                        stack.push(RewriteItem::Expr(expr));
+                    }
+                    stack.push(RewriteItem::SelectTable(&mut join.table));
+                }
+                stack.push(RewriteItem::SelectTable(&mut from_clause.select));
+            }
+            RewriteItem::SelectTable(select_table) => match select_table {
+                ast::SelectTable::Table(..) => {}
+                ast::SelectTable::TableCall(_, args, _) => {
+                    for arg in args.iter_mut().rev() {
+                        stack.push(RewriteItem::Expr(arg));
+                    }
+                }
+                ast::SelectTable::Select(select, _) => {
+                    stack.push(RewriteItem::Select(select));
+                }
+                ast::SelectTable::Sub(from_clause, _) => {
+                    stack.push(RewriteItem::FromClause(from_clause));
+                }
+            },
+            RewriteItem::Window(window) => {
+                if let Some(frame_clause) = &mut window.frame_clause {
+                    if let Some(end) = &mut frame_clause.end {
+                        stack.push(RewriteItem::FrameBound(end));
+                    }
+                    stack.push(RewriteItem::FrameBound(&mut frame_clause.start));
+                }
+                for sorted_col in window.order_by.iter_mut().rev() {
+                    stack.push(RewriteItem::Expr(&mut sorted_col.expr));
+                }
+                for expr in window.partition_by.iter_mut().rev() {
+                    stack.push(RewriteItem::Expr(expr));
                 }
             }
-
-            for window_def in window_clause {
-                rewrite_window_expressions(&mut window_def.window, rewrite_expr)?;
-            }
-        }
-        ast::OneSelect::Values(values) => {
-            for row in values {
-                for expr in row {
-                    rewrite_expression_tree(expr, rewrite_expr)?;
+            RewriteItem::FrameBound(frame_bound) => match frame_bound {
+                ast::FrameBound::Following(expr) | ast::FrameBound::Preceding(expr) => {
+                    stack.push(RewriteItem::Expr(expr));
                 }
-            }
+                ast::FrameBound::CurrentRow
+                | ast::FrameBound::UnboundedFollowing
+                | ast::FrameBound::UnboundedPreceding => {}
+            },
+            RewriteItem::Expr(expr) => rewrite_expression_tree(expr, rewrite_expr)?,
         }
     }
 
-    Ok(())
-}
-
-fn rewrite_from_clause_expressions<F>(
-    from_clause: &mut ast::FromClause,
-    rewrite_expr: &mut F,
-) -> Result<()>
-where
-    F: FnMut(&mut ast::Expr) -> Result<()>,
-{
-    rewrite_select_table_expressions(&mut from_clause.select, rewrite_expr)?;
-
-    for join in &mut from_clause.joins {
-        rewrite_select_table_expressions(&mut join.table, rewrite_expr)?;
-        if let Some(ast::JoinConstraint::On(expr)) = &mut join.constraint {
-            rewrite_expression_tree(expr, rewrite_expr)?;
-        }
-    }
-
-    Ok(())
-}
-
-fn rewrite_select_table_expressions<F>(
-    select_table: &mut ast::SelectTable,
-    rewrite_expr: &mut F,
-) -> Result<()>
-where
-    F: FnMut(&mut ast::Expr) -> Result<()>,
-{
-    match select_table {
-        ast::SelectTable::Table(..) => {}
-        ast::SelectTable::TableCall(_, args, _) => {
-            for arg in args {
-                rewrite_expression_tree(arg, rewrite_expr)?;
-            }
-        }
-        ast::SelectTable::Select(select, _) => {
-            rewrite_select_expressions(select, rewrite_expr)?;
-        }
-        ast::SelectTable::Sub(from_clause, _) => {
-            rewrite_from_clause_expressions(from_clause, rewrite_expr)?;
-        }
-    }
-    Ok(())
-}
-
-fn rewrite_window_expressions<F>(window: &mut ast::Window, rewrite_expr: &mut F) -> Result<()>
-where
-    F: FnMut(&mut ast::Expr) -> Result<()>,
-{
-    for expr in &mut window.partition_by {
-        rewrite_expression_tree(expr, rewrite_expr)?;
-    }
-
-    for sorted_col in &mut window.order_by {
-        rewrite_expression_tree(&mut sorted_col.expr, rewrite_expr)?;
-    }
-
-    if let Some(frame_clause) = &mut window.frame_clause {
-        rewrite_frame_bound_expressions(&mut frame_clause.start, rewrite_expr)?;
-        if let Some(end) = &mut frame_clause.end {
-            rewrite_frame_bound_expressions(end, rewrite_expr)?;
-        }
-    }
-
-    Ok(())
-}
-
-fn rewrite_frame_bound_expressions<F>(
-    frame_bound: &mut ast::FrameBound,
-    rewrite_expr: &mut F,
-) -> Result<()>
-where
-    F: FnMut(&mut ast::Expr) -> Result<()>,
-{
-    match frame_bound {
-        ast::FrameBound::Following(expr) | ast::FrameBound::Preceding(expr) => {
-            rewrite_expression_tree(expr, rewrite_expr)?;
-        }
-        ast::FrameBound::CurrentRow
-        | ast::FrameBound::UnboundedFollowing
-        | ast::FrameBound::UnboundedPreceding => {}
-    }
     Ok(())
 }
 
