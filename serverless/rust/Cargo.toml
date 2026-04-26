@@ -1,0 +1,25 @@
+# Copyright 2025 the Turso authors. All rights reserved. MIT license.
+
+[package]
+name = "turso_serverless"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Serverless Turso client over hrana v3 HTTP protocol"
+
+[lints]
+workspace = true
+
+[dependencies]
+reqwest = { version = "0.12", features = ["json", "stream"] }
+tokio = { workspace = true, features = ["sync", "macros", "rt"] }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+base64 = "0.22"
+thiserror = { workspace = true }
+futures = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["full"] }
