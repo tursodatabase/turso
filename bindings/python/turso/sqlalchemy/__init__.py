@@ -30,11 +30,12 @@ Usage:
         sync.push()  # Push local changes
 """
 
-from .dialect import AioTursoDialect, TursoDialect, TursoSyncDialect, get_sync_connection
+from .dialect import AioTursoDialect, TursoDialect, TursoServerlessDialect, TursoSyncDialect, get_sync_connection
 
 __all__ = [
     "AioTursoDialect",
     "TursoDialect",
+    "TursoServerlessDialect",
     "TursoSyncDialect",
     "get_sync_connection",
 ]

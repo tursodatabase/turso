@@ -1,6 +1,5 @@
 import test from 'ava';
-import { decodeValue, encodeValue } from '../dist/protocol.js';
-import { Session } from '../dist/session.js';
+import { decodeValue, encodeValue, Session } from '../dist/index.js';
 
 // Unit tests for serverless protocol encoding/decoding.
 // These test the serverless driver directly — no server needed.
@@ -150,6 +149,63 @@ test('prepare() sends describe with the current transaction baton', async t => {
   t.is(describeReq.requests[0].type, 'describe', 'third request should be describe');
   t.is(describeReq.baton, 'txn-baton-abc',
     'describe must carry the transaction baton, not null');
+});
+
+// --- normalizeUrl (via Session constructor) ---
+
+test('normalizeUrl rewrites libsql:// to https://', t => {
+  const s = new Session({ url: 'libsql://my-db.turso.io' });
+  t.is(s['baseUrl'], 'https://my-db.turso.io');
+});
+
+test('normalizeUrl rewrites turso:// to https://', t => {
+  const s = new Session({ url: 'turso://my-db.turso.io' });
+  t.is(s['baseUrl'], 'https://my-db.turso.io');
+});
+
+test('normalizeUrl passes through https://', t => {
+  const s = new Session({ url: 'https://my-db.turso.io' });
+  t.is(s['baseUrl'], 'https://my-db.turso.io');
+});
+
+test('normalizeUrl passes through http://', t => {
+  const s = new Session({ url: 'http://localhost:8080' });
+  t.is(s['baseUrl'], 'http://localhost:8080');
+});
+
+test('normalizeUrl turso:// with port', t => {
+  const s = new Session({ url: 'turso://my-db.turso.io:443' });
+  t.is(s['baseUrl'], 'https://my-db.turso.io:443');
+});
+
+test('normalizeUrl libsql:// with port', t => {
+  const s = new Session({ url: 'libsql://my-db.turso.io:8080' });
+  t.is(s['baseUrl'], 'https://my-db.turso.io:8080');
+});
+
+test('normalizeUrl with path', t => {
+  const s = new Session({ url: 'turso://my-db.turso.io/v1/db' });
+  t.is(s['baseUrl'], 'https://my-db.turso.io/v1/db');
+});
+
+test('normalizeUrl with query params', t => {
+  const s = new Session({ url: 'libsql://my-db.turso.io?foo=bar' });
+  t.is(s['baseUrl'], 'https://my-db.turso.io?foo=bar');
+});
+
+test('normalizeUrl passes through ws://', t => {
+  const s = new Session({ url: 'ws://localhost:8080' });
+  t.is(s['baseUrl'], 'ws://localhost:8080');
+});
+
+test('normalizeUrl passes through wss://', t => {
+  const s = new Session({ url: 'wss://my-db.turso.io' });
+  t.is(s['baseUrl'], 'wss://my-db.turso.io');
+});
+
+test('normalizeUrl libsql:// with path and query', t => {
+  const s = new Session({ url: 'libsql://my-db.turso.io/db?timeout=30' });
+  t.is(s['baseUrl'], 'https://my-db.turso.io/db?timeout=30');
 });
 
 // --- Session baton reset on error ---

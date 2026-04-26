@@ -9,3 +9,4 @@ cargo publish -p turso_sdk_kit
 cargo publish -p turso_sync_engine
 cargo publish -p turso_sync_sdk_kit
 cargo publish -p turso
+cargo publish -p turso_serverless
