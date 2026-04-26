@@ -945,6 +945,14 @@ pub async fn push_logical_changes<IO: SyncEngineIo, Ctx>(
     let mut next_operation = changes.next(ctx.coro).await?;
     while let Some(operation) = next_operation.take() {
         next_operation = changes.next(ctx.coro).await?;
+
+        if next_operation.is_none() {
+            assert!(
+                matches!(operation, DatabaseTapeOperation::Commit),
+                "last operation in the changes stream must be COMMIT"
+            );
+        }
+
         match operation {
             DatabaseTapeOperation::StmtReplay(_) => {
                 panic!("changes iterator must not use StmtReplay option")
@@ -965,22 +973,27 @@ pub async fn push_logical_changes<IO: SyncEngineIo, Ctx>(
                 if !must_push {
                     continue;
                 }
-                total_rows_changed += send_push_batch(
+                let (rows_changed, next_change_id) = send_push_batch(
                     ctx,
                     &generator,
                     opts,
                     &batch,
                     client_id,
                     source_pull_gen,
-                    &mut last_change_id,
+                    last_change_id,
                 )
                 .await?;
+                total_rows_changed += rows_changed;
+                last_change_id = Some(next_change_id);
                 batch.clear();
             }
         }
     }
 
-    assert!(batch.is_empty(), "last operation must be COMMIT");
+    assert!(
+        batch.is_empty(),
+        "batch must be empty in the end so all operations are send to remote"
+    );
 
     tracing::info!(
         "push_logical_changes: rows_changed={total_rows_changed}, last_change_id={:?}",
@@ -1003,8 +1016,8 @@ async fn send_push_batch<IO: SyncEngineIo, Ctx>(
     batch_changes: &[DatabaseTapeRowChange],
     client_id: &str,
     source_pull_gen: i64,
-    last_change_id: &mut Option<i64>,
-) -> Result<i64> {
+    mut last_change_id: Option<i64>,
+) -> Result<(i64, i64)> {
     let mut transformed = if opts.use_transform {
         Some(apply_transformation(ctx, batch_changes, generator).await?)
     } else {
@@ -1070,9 +1083,12 @@ async fn send_push_batch<IO: SyncEngineIo, Ctx>(
                 change_id
             );
         }
-        *last_change_id = Some(change_id);
+        last_change_id = Some(change_id);
         match transform_result {
             DatabaseRowTransformResult::Skip => panic!("Skip must be handled earlier"),
+            DatabaseRowTransformResult::Rewrite(replay) => {
+                sql_over_http_requests.push(step(replay.sql, convert_to_args(replay.values)))
+            }
             DatabaseRowTransformResult::Keep => {
                 let replay_info = generator.replay_info(ctx.coro, &change).await?;
                 // for now we try to support DDL statements which "extends" the schema (CREATE INDEX, CREATE TABLE, ALTER TABLE ADD COLUMN) and they have `IF NOT EXISTS` semantic
@@ -1137,9 +1153,6 @@ async fn send_push_batch<IO: SyncEngineIo, Ctx>(
                     add_column_step_indices.insert(sql_over_http_requests.len() - 1);
                 }
             }
-            DatabaseRowTransformResult::Rewrite(replay) => {
-                sql_over_http_requests.push(step(replay.sql, convert_to_args(replay.values)))
-            }
         }
     }
 
@@ -1178,7 +1191,7 @@ async fn send_push_batch<IO: SyncEngineIo, Ctx>(
     };
 
     let _ = sql_execute_http(ctx, replay_hrana_request, &add_column_step_indices).await?;
-    Ok(rows_changed)
+    Ok((rows_changed, last_change_id.unwrap_or(0)))
 }
 
 pub async fn apply_transformation<IO: SyncEngineIo, Ctx>(
