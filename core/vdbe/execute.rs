@@ -38,6 +38,7 @@ use crate::vdbe::hash_table::{
 };
 use crate::vdbe::insn::InsertFlags;
 use crate::vdbe::metrics::HashJoinMetrics;
+use crate::vdbe::vacuum::VacuumInPlaceOpContext;
 use crate::vdbe::value::ComparisonOp;
 use crate::vdbe::ValueIteratorExt;
 use crate::vdbe::{
@@ -59,9 +60,9 @@ use crate::{
         builder::CursorType,
         insn::{IdxInsertFlags, Insn, SavepointOp},
     },
-    CaptureDataChangesInfo, CdcVersion, CheckpointMode, Completion, Connection, DatabaseStorage,
-    IOExt, MvCursor, NonNan, OpenFlags, QueryMode, Statement, TransactionState, ValueRef,
-    MAIN_DB_ID, TEMP_DB_ID,
+    CaptureDataChangesInfo, CdcVersion, CheckpointMode, Completion, Connection, Database,
+    DatabaseStorage, IOExt, MvCursor, NonNan, OpenFlags, QueryMode, Statement, TransactionState,
+    ValueRef, MAIN_DB_ID, TEMP_DB_ID,
 };
 use crate::{
     error::{
@@ -112,6 +113,11 @@ use turso_parser::ast::{self, ForeignKeyClause, Name, QualifiedName, ResolveType
 use turso_parser::parser::Parser;
 
 use super::sorter::Sorter;
+use crate::vdbe::vacuum::{
+    capture_custom_types, mirror_symbols, reject_unsupported_vacuum_auto_vacuum_mode,
+    vacuum_target_build_step, vacuum_target_opts_from_source, VacuumDbHeaderMeta,
+    VacuumTargetBuildConfig, VacuumTargetBuildContext,
+};
 
 #[cfg(feature = "json")]
 use crate::{
@@ -14472,42 +14478,50 @@ where
         })
 }
 
-/// Sub-states for the VACUUM INTO operation state machine.
+/// Phases for the VACUUM INTO opcode wrapper.
 #[derive(Default)]
-pub(crate) enum OpVacuumIntoSubState {
-    /// Initial state - validate preconditions and create destination database
+pub(crate) enum VacuumIntoOpPhase {
+    /// Initial state - validate preconditions and create output database.
     #[default]
     Init,
-    /// Build compacted destination database
-    Build(Box<crate::vdbe::vacuum::VacuumInto>),
-    /// Operation complete
+    /// Build compacted output database.
+    Build,
+    /// Force the committed output into a durable self-contained database file.
+    FinalizeOutput,
+    /// Operation complete.
     Done,
 }
 
-/// Holds the state for the VACUUM INTO operation.
+/// Holds the state for the VACUUM INTO opcode operation.
 #[derive(Default)]
-pub(crate) struct OpVacuumIntoState {
-    sub_state: OpVacuumIntoSubState,
-    /// Database index for the target schema
-    database_id: usize,
-    /// Escaped schema name for safe SQL interpolation
+pub(crate) struct VacuumIntoOpContext {
+    phase: VacuumIntoOpPhase,
+    /// Database index for the source schema.
+    source_db_id: usize,
+    /// Escaped schema name for safe SQL interpolation.
     escaped_schema_name: String,
+    /// Keep output database alive while vacuum is in progress.
+    _output_db: Option<Arc<Database>>,
+    /// Configuration for the shared vacuum target build state machine.
+    target_build_config: Option<VacuumTargetBuildConfig>,
+    /// Context for the shared vacuum target build state machine.
+    target_build_context: Option<VacuumTargetBuildContext>,
 }
 
 /// VACUUM INTO - create a compacted copy of the database at the specified path.
 ///
 /// This is an async state machine implementation that yields on I/O operations.
 /// It:
-/// 1. Creates a new database at the destination path with matching page_size and
+/// 1. Creates a new output database with matching page_size and
 ///    source feature flags and schema-replay symbols
 /// 2. Queries sqlite_schema for all schema objects including rootpage, ordered by rowid
-/// 3. Creates storage-backed tables (rootpage != 0) in destination, excluding
+/// 3. Creates storage-backed tables (rootpage != 0) in the output, excluding
 ///    sqlite_sequence (auto-created when AUTOINCREMENT tables are created)
 /// 4. Copies data for all storage-backed tables, including sqlite_stat1 and other
 ///    internal storage-backed tables
 /// 5. Creates user-defined secondary indexes after data copy for performance
 ///    (backing-btree indexes for custom index methods are excluded here)
-/// 6. Copies meta values (user_version, application_id) from source to destination
+/// 6. Finalizes output database header metadata
 /// 7. Creates triggers, views, and rootpage = 0 objects last (after data copy).
 ///    Custom index methods (FTS, vector) recreate and backfill their backing
 ///    indexes from the copied table data in this phase.
@@ -14520,7 +14534,7 @@ pub fn op_vacuum_into(
     match op_vacuum_into_inner(program, state, insn) {
         Ok(InsnFunctionStepResult::Step) => {
             // Instruction complete, reset state
-            state.active_op_state.clear();
+            state.op_vacuum_into = None;
             Ok(InsnFunctionStepResult::Step)
         }
         Ok(InsnFunctionStepResult::IO(io)) => {
@@ -14531,11 +14545,52 @@ pub fn op_vacuum_into(
             unreachable!("op_vacuum_into_inner only returns Step or IO")
         }
         Err(err) => {
-            // Reset state on error
-            state.active_op_state.clear();
+            if let Err(cleanup_err) = cleanup_op_vacuum_into(&program.connection, state) {
+                tracing::error!("VACUUM INTO cleanup failed after error: {cleanup_err}");
+            }
             Err(err)
         }
     }
+}
+
+/// Clean up any VACUUM or VACUUM INTO state on error or abort.
+/// Only one of the two can be active at a time; this handles whichever is set.
+pub(crate) fn cleanup_vacuum_state(
+    connection: &Arc<Connection>,
+    state: &mut ProgramState,
+) -> Result<()> {
+    turso_assert!(
+        !(state.op_vacuum_into.is_some() && state.op_vacuum_in_place.is_some()),
+        "VACUUM INTO and in-place VACUUM state cannot both be active"
+    );
+
+    if state.op_vacuum_into.is_some() {
+        cleanup_op_vacuum_into(connection, state)
+    } else if state.op_vacuum_in_place.is_some() {
+        cleanup_op_vacuum_in_place(connection, state)
+    } else {
+        Ok(())
+    }
+}
+
+fn cleanup_op_vacuum_into(connection: &Arc<Connection>, state: &mut ProgramState) -> Result<()> {
+    let Some(mut vacuum_state) = state.op_vacuum_into.take() else {
+        return Ok(());
+    };
+
+    if let Some(target_build_context) = vacuum_state.target_build_context.as_mut() {
+        target_build_context.cleanup_after_error()?;
+    }
+
+    vacuum_state.target_build_context = None;
+    vacuum_state._output_db = None;
+
+    if state.auto_txn_cleanup == TxnCleanup::RollbackTxn {
+        let pager = connection.pager.load();
+        connection.rollback_manual_txn_cleanup(&pager, true);
+        state.auto_txn_cleanup = TxnCleanup::None;
+    }
+    Ok(())
 }
 
 fn op_vacuum_into_inner(
@@ -14543,8 +14598,6 @@ fn op_vacuum_into_inner(
     state: &mut ProgramState,
     insn: &Insn,
 ) -> Result<InsnFunctionStepResult> {
-    use crate::vdbe::vacuum::{VacuumInto, VacuumIntoConfig};
-
     load_insn!(
         VacuumInto {
             schema_name,
@@ -14553,31 +14606,31 @@ fn op_vacuum_into_inner(
         insn
     );
 
-    if state.active_op_state.vacuum_into().is_none() {
-        let database_id = program.connection.get_database_id_by_name(schema_name)?;
+    if state.op_vacuum_into.is_none() {
+        let source_db_id = program.connection.get_database_id_by_name(schema_name)?;
 
         // Matches sqlite that treats VACUUM temp INTO as a no-op (no file created)
-        if database_id == TEMP_DB_ID {
+        if source_db_id == TEMP_DB_ID {
             state.pc += 1;
             return Ok(InsnFunctionStepResult::Step);
         }
 
-        *state.active_op_state.vacuum_into() = Some(OpVacuumIntoState {
+        state.op_vacuum_into = Some(Box::new(VacuumIntoOpContext {
             escaped_schema_name: schema_name.replace('"', "\"\""),
-            database_id,
+            source_db_id,
             ..Default::default()
-        });
+        }));
     }
 
-    let vacuum_state = state.active_op_state.vacuum_into().as_mut().unwrap();
+    let vacuum_state = state.op_vacuum_into.as_mut().unwrap();
     let escaped_schema_name = &vacuum_state.escaped_schema_name;
-    let database_id = vacuum_state.database_id;
+    let source_db_id = vacuum_state.source_db_id;
 
     loop {
-        let current_sub_state = std::mem::take(&mut vacuum_state.sub_state);
+        let current_phase = std::mem::take(&mut vacuum_state.phase);
 
-        match current_sub_state {
-            OpVacuumIntoSubState::Init => {
+        match current_phase {
+            VacuumIntoOpPhase::Init => {
                 // Check if we're in a transaction
                 // as vacuum cannot be run inside a transaction
                 if !program.connection.auto_commit.load(Ordering::SeqCst) {
@@ -14606,32 +14659,35 @@ fn op_vacuum_into_inner(
                     )));
                 }
 
-                // Pin source metadata before building the destination. The
+                // Pin source metadata before building the output database. The
                 // BEGIN and pragma helpers here are blocking convenience wrappers;
-                // async work starts with the schema scan in vacuum_into_step.
-                let source_db = program.connection.get_source_database(database_id);
+                // async work starts with the schema scan in vacuum_target_build_step.
+                let source_db = program.connection.get_source_database(source_db_id);
                 program.connection.execute("BEGIN")?;
                 state.auto_txn_cleanup = TxnCleanup::RollbackTxn;
-                let user_version: i32 = extract_pragma_int(
-                    &program
-                        .connection
-                        .pragma_query(&format!("\"{escaped_schema_name}\".user_version"))?,
-                    "user_version",
-                )?;
-                let application_id: i32 = extract_pragma_int(
-                    &program
-                        .connection
-                        .pragma_query(&format!("\"{escaped_schema_name}\".application_id"))?,
-                    "application_id",
-                )?;
                 let page_size: u32 = extract_pragma_int(
                     &program
                         .connection
                         .pragma_query(&format!("\"{escaped_schema_name}\".page_size"))?,
                     "page_size",
                 )?;
+                let source_pager = program
+                    .connection
+                    .get_pager_from_database_index(&source_db_id)?;
+                let source_auto_vacuum_mode = source_pager.get_auto_vacuum_mode();
+                reject_unsupported_vacuum_auto_vacuum_mode(source_auto_vacuum_mode)?;
+                let header_meta = if let Some(mv_store) =
+                    program.connection.mv_store_for_db(source_db_id)
+                {
+                    let tx_id = program.connection.get_mv_tx_id_for_db(source_db_id);
+                    mv_store.with_header(VacuumDbHeaderMeta::from_source_header, tx_id.as_ref())?
+                } else {
+                    source_pager.io.block(|| {
+                        source_pager.with_header(VacuumDbHeaderMeta::from_source_header)
+                    })?
+                };
 
-                let reserved_space: u8 = if !is_attached_db(database_id) {
+                let reserved_space: u8 = if !is_attached_db(source_db_id) {
                     // For main or temp db prefer cached value to avoid blocking I/O
                     match program.connection.get_reserved_bytes() {
                         Some(val) => val,
@@ -14646,79 +14702,88 @@ fn op_vacuum_into_inner(
                     // For attached db read from its own pager
                     let pager = program
                         .connection
-                        .get_pager_from_database_index(&database_id)?;
+                        .get_pager_from_database_index(&source_db_id)?;
                     pager
                         .io
                         .block(|| pager.with_header(|header| header.reserved_space))?
                 };
 
-                // Mirror source feature flags to the destination so schema replay
+                // Mirror source feature flags to the output so schema replay
                 // can resolve custom types, generated columns, vtab modules, etc.
-                let dest_opts = crate::DatabaseOpts::new()
-                    .with_views(source_db.experimental_views_enabled())
-                    .with_index_method(source_db.experimental_index_method_enabled())
-                    .with_custom_types(source_db.experimental_custom_types_enabled())
-                    .with_generated_columns(source_db.experimental_generated_columns_enabled());
+                let output_opts = vacuum_target_opts_from_source(&source_db);
 
-                // Always use PlatformIO for the destination file, even if source
+                // Always use PlatformIO for the output file, even if source
                 // is in-memory. This ensures VACUUM INTO writes to disk.
                 let io: Arc<dyn crate::IO> = Arc::new(crate::io::PlatformIO::new()?);
-                let dest_db = crate::Database::open_file_with_flags(
+                let output_db = crate::Database::open_file_with_flags(
                     io,
                     dest_path,
                     OpenFlags::Create,
-                    dest_opts,
+                    output_opts,
                     None,
                 )?;
-                let dest_conn = dest_db.connect()?;
-                dest_conn.reset_page_size(page_size)?;
-                // set reserved_space on destination to match source
+                let output_conn = output_db.connect()?;
+                output_conn.reset_page_size(page_size)?;
+                // set reserved_space on output to match source
                 // this is important for databases using encryption or checksums
                 // must be set before page 1 is allocated (before any schema operations)
-                dest_conn.set_reserved_bytes(reserved_space)?;
+                output_conn.set_reserved_bytes(reserved_space)?;
 
-                // Capture source custom type definitions so that STRICT tables with
-                // custom type columns can resolve those types during CREATE TABLE
-                // replay on the destination.
-                let source_custom_types: Vec<(String, Arc<crate::schema::TypeDef>)> = program
-                    .connection
-                    .with_schema(database_id, |source_schema| {
-                        source_schema
-                            .type_registry
-                            .iter()
-                            .filter(|(_, td)| !td.is_builtin)
-                            .map(|(name, td)| (name.clone(), td.clone()))
-                            .collect()
-                    });
+                mirror_symbols(&program.connection, &output_conn);
+                let source_custom_types = capture_custom_types(&program.connection, source_db_id);
 
-                let config = VacuumIntoConfig {
+                let config = VacuumTargetBuildConfig {
                     source_conn: program.connection.clone(),
                     escaped_schema_name: escaped_schema_name.clone(),
-                    database_id,
-                    source_user_version: user_version,
-                    source_application_id: application_id,
+                    source_db_id,
+                    header_meta,
                     source_custom_types,
-                    source_mvcc_enabled: source_db.mvcc_enabled(),
+                    target_mvcc_enabled: source_db.mvcc_enabled(),
+                    target_auto_vacuum_mode: source_auto_vacuum_mode,
+                    copy_mvcc_metadata_table: false,
                 };
 
-                vacuum_state.sub_state = OpVacuumIntoSubState::Build(Box::new(VacuumInto::new(
-                    config, dest_db, dest_conn,
-                )));
+                vacuum_state._output_db = Some(output_db);
+                vacuum_state.target_build_config = Some(config);
+                vacuum_state.target_build_context =
+                    Some(VacuumTargetBuildContext::new(output_conn));
+                vacuum_state.phase = VacuumIntoOpPhase::Build;
                 continue;
             }
 
-            OpVacuumIntoSubState::Build(mut vacuum_into) => match vacuum_into.step()? {
-                IOResult::Done(()) => {
-                    vacuum_state.sub_state = OpVacuumIntoSubState::Done;
-                    continue;
-                }
-                IOResult::IO(io) => {
-                    vacuum_state.sub_state = OpVacuumIntoSubState::Build(vacuum_into);
-                    return Ok(InsnFunctionStepResult::IO(io));
-                }
-            },
+            VacuumIntoOpPhase::Build => {
+                let config = vacuum_state
+                    .target_build_config
+                    .as_ref()
+                    .expect("VacuumTargetBuildConfig must be set in Build state");
+                let target_build_context = vacuum_state
+                    .target_build_context
+                    .as_mut()
+                    .expect("VacuumTargetBuildContext must be set in Build state");
 
-            OpVacuumIntoSubState::Done => {
+                match vacuum_target_build_step(config, target_build_context)? {
+                    crate::IOResult::Done(()) => {
+                        vacuum_state.phase = VacuumIntoOpPhase::FinalizeOutput;
+                        continue;
+                    }
+                    crate::IOResult::IO(io) => {
+                        vacuum_state.phase = VacuumIntoOpPhase::Build;
+                        return Ok(InsnFunctionStepResult::IO(io));
+                    }
+                }
+            }
+
+            VacuumIntoOpPhase::FinalizeOutput => {
+                let target_build_context = vacuum_state
+                    .target_build_context
+                    .as_ref()
+                    .expect("VacuumTargetBuildContext must be set in FinalizeOutput state");
+                crate::vdbe::vacuum::finalize_vacuum_into_output(target_build_context)?;
+                vacuum_state.phase = VacuumIntoOpPhase::Done;
+                continue;
+            }
+
+            VacuumIntoOpPhase::Done => {
                 // Commit the source transaction started in Init.
                 program.connection.execute("COMMIT")?;
                 state.auto_txn_cleanup = TxnCleanup::None;
@@ -14728,6 +14793,54 @@ fn op_vacuum_into_inner(
             }
         }
     }
+}
+
+/// In-place VACUUM - compact the database via target build + direct-WAL
+/// copy-back. The opcode owns the source transaction lifecycle.
+pub fn op_vacuum(
+    program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+    _pager: &Arc<Pager>,
+) -> Result<InsnFunctionStepResult> {
+    load_insn!(Vacuum { db }, insn);
+
+    if state.op_vacuum_in_place.is_none() {
+        state.op_vacuum_in_place = Some(Box::new(VacuumInPlaceOpContext::new(*db)));
+    }
+
+    let vacuum_state = state.op_vacuum_in_place.as_mut().unwrap();
+
+    match vacuum_state.step(&program.connection) {
+        Ok(InsnFunctionStepResult::Step) => {
+            state.op_vacuum_in_place = None;
+            state.pc += 1;
+            Ok(InsnFunctionStepResult::Step)
+        }
+        Ok(InsnFunctionStepResult::IO(io)) => Ok(InsnFunctionStepResult::IO(io)),
+        Ok(InsnFunctionStepResult::Done | InsnFunctionStepResult::Row) => {
+            unreachable!("in-place VACUUM only returns Step or IO")
+        }
+        Err(err) => {
+            if let Err(cleanup_err) = cleanup_op_vacuum_in_place(&program.connection, state) {
+                tracing::error!("VACUUM cleanup failed after error: {cleanup_err}");
+            }
+            Err(err)
+        }
+    }
+}
+
+/// Clean up in-place VACUUM state on error or abort. Rolls back the source
+/// transaction if it was acquired, restores connection state, and drops
+/// temp resources.
+fn cleanup_op_vacuum_in_place(
+    connection: &Arc<Connection>,
+    state: &mut ProgramState,
+) -> Result<()> {
+    let Some(vacuum_state) = state.op_vacuum_in_place.take() else {
+        return Ok(());
+    };
+    vacuum_state.cleanup(connection)
 }
 
 fn with_header<T, F>(
@@ -14858,6 +14971,231 @@ mod tests {
         let partition_idx = ht.partition_for_keys(&probe_key);
 
         (ht, probe_key, partition_idx)
+    }
+
+    /// test to check that vacuum into connection state is reset if it is
+    /// interrupted mid way
+    #[test]
+    fn test_vacuum_into_busy_after_source_begin_rolls_back_source_txn() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+        let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+        let db = Database::open_file_with_flags(
+            io,
+            ":memory:",
+            OpenFlags::Create,
+            DatabaseOpts::new(),
+            None,
+        )
+        .unwrap();
+        let conn = db.connect().unwrap();
+        conn.execute("CREATE TABLE t(x)").unwrap();
+        conn.execute("INSERT INTO t VALUES (1)").unwrap();
+
+        let source_txn_progress_calls = Arc::new(AtomicUsize::new(0));
+        let did_interrupt = Arc::new(AtomicBool::new(false));
+        let conn_for_progress = conn.clone();
+        let source_txn_progress_calls_for_handler = source_txn_progress_calls.clone();
+        let did_interrupt_for_handler = did_interrupt.clone();
+        conn.set_progress_handler(
+            1,
+            Some(Box::new(move || {
+                if !conn_for_progress.get_auto_commit() {
+                    let calls =
+                        source_txn_progress_calls_for_handler.fetch_add(1, Ordering::SeqCst);
+                    calls >= 10 && !did_interrupt_for_handler.swap(true, Ordering::SeqCst)
+                } else {
+                    false
+                }
+            })),
+        );
+
+        let dest_dir = tempfile::TempDir::new().unwrap();
+        let dest_path = dest_dir.path().join("busy_vacuum.db");
+        let dest_path = dest_path.to_str().expect("temp path should be UTF-8");
+        let mut stmt = conn.prepare(format!("VACUUM INTO '{dest_path}'")).unwrap();
+        let step = stmt.step().unwrap();
+        conn.set_progress_handler(0, None);
+
+        assert!(
+            matches!(step, StepResult::Busy),
+            "progress interruption inside VACUUM INTO should surface as Busy, got {step:?}"
+        );
+        assert!(
+            source_txn_progress_calls.load(Ordering::SeqCst) > 10,
+            "test should interrupt after VACUUM INTO opens the source transaction"
+        );
+        assert!(
+            did_interrupt.load(Ordering::SeqCst),
+            "progress handler should have interrupted VACUUM INTO exactly once"
+        );
+        assert!(
+            conn.get_auto_commit(),
+            "Busy cleanup should roll back the source transaction before returning"
+        );
+    }
+
+    /// same like `test_vacuum_into_busy_after_source_begin_rolls_back_source_txn`
+    /// but for attached dbs
+    #[test]
+    fn test_cleanup_vacuum_into_rolls_back_attached_only_source_txn() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let main_path = dir.path().join("vacuum-into-cleanup-main.db");
+        let attached_path = dir.path().join("vacuum-into-cleanup-attached.db");
+
+        let io: Arc<dyn IO> = Arc::new(crate::io::PlatformIO::new().unwrap());
+        let db = Database::open_file_with_flags(
+            io,
+            main_path.to_str().unwrap(),
+            OpenFlags::Create,
+            DatabaseOpts::new().with_attach(true),
+            None,
+        )
+        .unwrap();
+        let conn = db.connect().unwrap();
+
+        conn.execute(format!(
+            "ATTACH DATABASE '{}' AS att",
+            attached_path.display()
+        ))
+        .unwrap();
+        conn.execute("CREATE TABLE att.t(x)").unwrap();
+        conn.execute("INSERT INTO att.t VALUES (1)").unwrap();
+
+        conn.execute("BEGIN").unwrap();
+        let attached_db_id = conn.get_database_id_by_name("att").unwrap();
+        let attached_pager = conn.get_pager_from_database_index(&attached_db_id).unwrap();
+        attached_pager.begin_read_tx().unwrap();
+
+        assert!(
+            !conn.pager.load().holds_read_lock(),
+            "attached-only cleanup regression requires the main pager to stay lock-free"
+        );
+        assert!(
+            attached_pager.holds_read_lock(),
+            "attached source pager should hold the pinned read snapshot"
+        );
+
+        let mut state = ProgramState::new(0, 0);
+        state.op_vacuum_into = Some(Box::default());
+        state.auto_txn_cleanup = TxnCleanup::RollbackTxn;
+
+        cleanup_op_vacuum_into(&conn, &mut state).unwrap();
+
+        assert!(
+            conn.get_auto_commit(),
+            "cleanup should restore auto-commit without going through SQL ROLLBACK"
+        );
+        assert_eq!(state.auto_txn_cleanup, TxnCleanup::None);
+        assert!(
+            !attached_pager.holds_read_lock(),
+            "cleanup should release the attached source read snapshot"
+        );
+
+        conn.execute("INSERT INTO att.t VALUES (2)").unwrap();
+        let mut stmt = conn.prepare("SELECT COUNT(*) FROM att.t").unwrap();
+        let mut count = 0_i64;
+        stmt.run_with_row_callback(|row| {
+            count = row.get(0)?;
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(count, 2);
+    }
+
+    #[test]
+    fn test_in_place_vacuum_succeeds_and_releases_source_locks() {
+        let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+        let db = Database::open_file_with_flags(
+            io,
+            "in-place-vacuum-design-b.db",
+            OpenFlags::Create,
+            DatabaseOpts::new(),
+            None,
+        )
+        .unwrap();
+        let conn = db.connect().unwrap();
+        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, value TEXT)")
+            .unwrap();
+        for i in 0..128 {
+            conn.execute(format!("INSERT INTO t VALUES ({i}, 'value-{i}')"))
+                .unwrap();
+        }
+        conn.execute("DELETE FROM t WHERE id % 2 = 0").unwrap();
+
+        conn.execute("VACUUM").unwrap();
+
+        let mut stmt = conn
+            .prepare("SELECT count(*), coalesce(sum(id), 0) FROM t")
+            .unwrap();
+        let mut count = 0_i64;
+        let mut sum = 0_i64;
+        stmt.run_with_row_callback(|row| {
+            count = row.get(0)?;
+            sum = row.get(1)?;
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(count, 64);
+        assert_eq!(sum, (1..128).step_by(2).sum::<i64>());
+        assert!(conn.get_auto_commit());
+
+        let pager = conn.pager.load();
+        assert!(!pager.holds_read_lock());
+        assert!(!pager.holds_write_lock());
+    }
+
+    #[test]
+    fn test_in_place_vacuum_busy_before_copyback_restores_source_txn() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+        let db = Database::open_file_with_flags(
+            io,
+            "in-place-vacuum-busy-before-copyback.db",
+            OpenFlags::Create,
+            DatabaseOpts::new(),
+            None,
+        )
+        .unwrap();
+        let conn = db.connect().unwrap();
+        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, value TEXT)")
+            .unwrap();
+        for i in 0..32 {
+            conn.execute(format!("INSERT INTO t VALUES ({i}, 'value-{i}')"))
+                .unwrap();
+        }
+
+        let did_interrupt = Arc::new(AtomicBool::new(false));
+        let conn_for_progress = conn.clone();
+        let did_interrupt_for_handler = did_interrupt.clone();
+        conn.set_progress_handler(
+            1,
+            Some(Box::new(move || {
+                !conn_for_progress.get_auto_commit()
+                    && !did_interrupt_for_handler.swap(true, Ordering::SeqCst)
+            })),
+        );
+
+        let mut stmt = conn.prepare("VACUUM").unwrap();
+        let step = stmt.step().unwrap();
+        conn.set_progress_handler(0, None);
+
+        assert!(
+            matches!(step, StepResult::Busy),
+            "progress interruption inside in-place VACUUM should surface as Busy, got {step:?}"
+        );
+        assert!(
+            did_interrupt.load(Ordering::SeqCst),
+            "test should interrupt after in-place VACUUM opens the source snapshot"
+        );
+        assert!(
+            conn.get_auto_commit(),
+            "Busy cleanup should restore auto-commit before returning"
+        );
+        let pager = conn.pager.load();
+        assert!(!pager.holds_read_lock());
+        assert!(!pager.holds_write_lock());
     }
 
     #[test]
