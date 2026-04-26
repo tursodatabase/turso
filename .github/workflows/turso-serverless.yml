@@ -4,38 +4,158 @@ on:
   workflow_dispatch:
   push:
     branches: [ main ]
-    paths:
-      - 'serverless/javascript/**'
-      - '.github/workflows/turso-serverless.yml'
   pull_request:
     branches: [ main ]
-    paths:
-      - 'serverless/javascript/**'
-      - '.github/workflows/turso-serverless.yml'
 
-env:
-  working-directory: serverless/javascript
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
 
 jobs:
-  build:
+  check:
     runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 20
-    defaults:
-      run:
-        working-directory: ${{ env.working-directory }}
-    
+
     steps:
     - uses: actions/checkout@v4
-    
+
+    - name: Install Rust
+      uses: dtolnay/rust-toolchain@stable
+
+    - name: Rust cache
+      uses: Swatinem/rust-cache@v2
+      with:
+        prefix-key: "v1-rust"
+        cache-on-failure: true
+
+    - name: Build
+      run: cargo build -p turso_serverless
+
+    - name: Clippy
+      run: cargo clippy -p turso_serverless -- --deny=warnings
+
+    - name: Unit tests
+      run: cargo test -p turso_serverless --lib
+
+  test:
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    timeout-minutes: 30
+
+    services:
+      libsql:
+        image: ghcr.io/tursodatabase/libsql-server:latest
+        ports:
+          - 8080:8080
+        env:
+          SQLD_MAX_CONCURRENT_REQUESTS: 1024
+          SQLD_MAX_CONCURRENT_CONNECTIONS: 1024
+          SQLD_DISABLE_INTELLIGENT_THROTTLING: true
+
+    env:
+      TURSO_DATABASE_URL: http://localhost:8080
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Install Rust
+      uses: dtolnay/rust-toolchain@stable
+
+    - name: Rust cache
+      uses: Swatinem/rust-cache@v2
+      with:
+        prefix-key: "v1-rust"
+        cache-on-failure: true
+
+    - uses: actions/setup-go@v5
+      with:
+        go-version: '1.24.10'
+
+    - uses: useblacksmith/setup-python@v6
+      with:
+        python-version: '3.10'
+
     - name: Setup Node.js
       uses: useblacksmith/setup-node@v5
       with:
         node-version: '20'
         cache: 'npm'
-        cache-dependency-path: ${{ env.working-directory }}/package-lock.json
-    
-    - name: Install dependencies
+        cache-dependency-path: serverless/javascript/package-lock.json
+
+    - name: Install Python deps
+      run: |
+        pip install -e "bindings/python/[sqlalchemy,dev]" hypothesis
+        pip install -e serverless/python/
+
+    # Build the native shared library needed by the local Go driver
+    - name: Build Rust (for Go native driver)
+      run: cargo build -p turso_sync_sdk_kit
+
+    # --- Rust integration tests ---
+    - name: Rust integration tests
+      run: cargo test -p turso_serverless --test integration
+
+    - name: Rust shared tests
+      run: cargo test -p turso_shared_tests
+
+    - name: Rust parity tests
+      run: cargo test -p turso_hegel_parity --test parity
+
+    # --- Go tests ---
+    - name: Go serverless integration tests
+      working-directory: serverless/go
+      run: go test -v -count=1 ./...
+
+    - name: Go shared tests
+      working-directory: testing/go-drivers
+      run: go test -v -count=1 ./...
+      env:
+        LD_LIBRARY_PATH: ${{ github.workspace }}/target/debug
+
+    - name: Go parity tests
+      working-directory: testing/hegel/go
+      run: go test -v -count=1 ./...
+      env:
+        LD_LIBRARY_PATH: ${{ github.workspace }}/target/debug
+
+    # --- Python tests ---
+    - name: Python integration tests
+      working-directory: serverless/python
+      run: pytest tests/test_serverless.py tests/test_sqlalchemy_serverless.py -v
+
+    - name: Python shared tests
+      working-directory: testing/python-drivers
+      run: pytest test_shared_dbapi.py -v
+
+    - name: Python parity tests
+      working-directory: testing/hegel/python
+      run: python -m pytest test_parity.py -v
+
+    # --- JS serverless tests ---
+    - name: Install serverless dependencies
+      working-directory: serverless/javascript
       run: npm ci
-    
-    - name: Build
+
+    - name: Build serverless
+      working-directory: serverless/javascript
       run: npm run build
+
+    - name: Serverless tests
+      working-directory: serverless/javascript
+      run: npm test
+
+    # --- JS parity tests ---
+    - name: Install JS native dependencies
+      working-directory: bindings/javascript
+      run: yarn install
+
+    - name: Build JS native module
+      working-directory: bindings/javascript
+      run: yarn build:native
+
+    - name: Install JS parity test dependencies
+      working-directory: testing/hegel/js
+      run: npm install
+
+    - name: JS parity tests
+      working-directory: testing/hegel/js
+      run: npm test

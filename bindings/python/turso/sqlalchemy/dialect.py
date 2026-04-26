@@ -666,6 +666,89 @@ class TursoSyncDialect(_TursoDialectMixin, SQLiteDialect_pysqlite):
         return pool.QueuePool
 
 
+class TursoServerlessDialect(_TursoDialectMixin, SQLiteDialect_pysqlite):
+    """
+    SQLAlchemy dialect for pure Python serverless Turso connections.
+
+    This dialect uses turso_serverless.connect() which connects to a remote
+    Turso database over HTTP using the hrana v3 protocol. No Rust FFI needed.
+
+    Usage:
+        from sqlalchemy import create_engine
+
+        engine = create_engine(
+            "sqlite+turso_serverless:///turso://my-db.turso.io"
+            "?auth_token=your-token"
+        )
+
+        # Or with connect_args:
+        engine = create_engine(
+            "sqlite+turso_serverless:///http://localhost:8080",
+            connect_args={"auth_token": "your-token"}
+        )
+    """
+
+    name = "sqlite"
+    driver = "turso_serverless"
+
+    supports_statement_cache = True
+    supports_native_datetime = False
+
+    @classmethod
+    def import_dbapi(cls):
+        """Import the turso_serverless module as DBAPI."""
+        import turso_serverless
+
+        return turso_serverless
+
+    def on_connect(self):
+        return None
+
+    def get_isolation_level(self, dbapi_connection):
+        return "SERIALIZABLE"
+
+    def set_isolation_level(self, dbapi_connection, level):
+        pass
+
+    def create_connect_args(self, url: URL) -> ConnectArgsType:
+        """
+        Create connection arguments from SQLAlchemy URL.
+
+        The URL format is:
+            sqlite+turso_serverless:///turso://my-db.turso.io?auth_token=...
+
+        The database component is the full remote URL.
+        Query parameters:
+            - auth_token: Authentication token
+            - isolation_level: Transaction isolation level
+        """
+        opts = url.translate_connect_args()
+        database = opts.pop("database", "")
+        opts.pop("username", None)
+        opts.pop("password", None)
+        opts.pop("host", None)
+        opts.pop("port", None)
+
+        query_params = dict(url.query)
+        kwargs: Dict[str, Any] = {}
+
+        auth_token = query_params.pop("auth_token", None)
+        if auth_token:
+            kwargs["auth_token"] = auth_token
+
+        isolation_level = query_params.pop("isolation_level", None)
+        if isolation_level:
+            if isolation_level.upper() == "AUTOCOMMIT":
+                kwargs["isolation_level"] = None
+            else:
+                kwargs["isolation_level"] = isolation_level
+
+        return ([database], kwargs)
+
+    def get_pool_class(self, url: URL) -> type[Pool]:
+        return pool.QueuePool
+
+
 def get_sync_connection(connection):
     """
     Get the underlying turso.sync.ConnectionSync from a SQLAlchemy connection.
