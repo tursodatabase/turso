@@ -13,6 +13,7 @@ use sql_gen::{Full, Policy, SqlGen, StmtKind};
 pub struct GeneratedStatement {
     pub sql: String,
     pub is_ddl: bool,
+    pub mutates_data: bool,
     pub has_unordered_limit: bool,
     pub unordered_limit_reason: Option<String>,
 }
@@ -55,19 +56,28 @@ impl SqlGenBackend {
         let ctx = sql_gen::Context::new_with_seed(seed);
         let mut policy = Policy::default()
             .with_stmt_weights(sql_gen::StmtWeights {
+                update: 30,
                 ..sql_gen::StmtWeights::default()
             })
             .with_function_config(
                 sql_gen::FunctionConfig::deterministic().disable(&["LIKELY", "UNLIKELY"]),
             );
         policy.select_config.require_order_by_with_limit = true;
-        // Disable expression values and conflict clauses for now
+        // Disable expression values for inserts, enable conflict clauses for updates
         policy.insert_config.expression_value_probability = 0.0;
         policy.insert_config.or_replace_probability = 0.0;
         policy.insert_config.or_ignore_probability = 0.0;
         policy.update_config.expression_value_probability = 0.0;
-        policy.update_config.or_replace_probability = 0.0;
-        policy.update_config.or_ignore_probability = 0.0;
+        policy.update_config.or_replace_probability = 0.1;
+        policy.update_config.or_ignore_probability = 0.1;
+        // Boost UPDATE FROM coverage
+        policy.update_config.from_probability = 0.4;
+        policy.update_config.returning_probability = 0.2;
+        policy.update_config.self_join_probability = 0.3;
+        policy.update_config.join_in_from_probability = 0.3;
+        policy.update_config.subquery_from_probability = 0.15;
+        policy.update_config.target_alias_probability = 0.2;
+        policy.update_config.from_set_reference_probability = 0.5;
         Self { ctx, policy }
     }
 }
@@ -79,7 +89,12 @@ impl SqlGenerator for SqlGenBackend {
             .statement(&mut self.ctx)
             .map_err(|e| anyhow::anyhow!("Failed to generate statement: {e}"))?;
         let sql = stmt.to_string();
-        let is_ddl = StmtKind::from(&stmt).is_ddl();
+        let stmt_kind = StmtKind::from(&stmt);
+        let is_ddl = stmt_kind.is_ddl();
+        let mutates_data = matches!(
+            stmt_kind,
+            StmtKind::Insert | StmtKind::Update | StmtKind::Delete
+        );
         let has_unordered_limit =
             stmt.has_unordered_limit() || stmt.non_unique_order_by_reason(schema).is_some();
         let unordered_limit_reason = stmt
@@ -89,6 +104,7 @@ impl SqlGenerator for SqlGenBackend {
         Ok(GeneratedStatement {
             sql,
             is_ddl,
+            mutates_data,
             has_unordered_limit,
             unordered_limit_reason,
         })
@@ -136,11 +152,19 @@ impl SqlGenerator for PropTestBackend {
             .map_err(|e| anyhow::anyhow!("Failed to generate statement: {e}"))?;
         let stmt = value_tree.current();
         let sql = stmt.to_string();
-        let is_ddl = sql_gen_prop::StatementKind::from(&stmt).is_ddl();
+        let stmt_kind = sql_gen_prop::StatementKind::from(&stmt);
+        let is_ddl = stmt_kind.is_ddl();
+        let mutates_data = matches!(
+            stmt_kind,
+            sql_gen_prop::StatementKind::Insert
+                | sql_gen_prop::StatementKind::Update
+                | sql_gen_prop::StatementKind::Delete
+        );
         let has_unordered_limit = stmt.has_unordered_limit();
         Ok(GeneratedStatement {
             sql,
             is_ddl,
+            mutates_data,
             has_unordered_limit,
             unordered_limit_reason: None,
         })

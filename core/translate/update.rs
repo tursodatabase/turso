@@ -5,7 +5,7 @@ use crate::schema::{EXPR_INDEX_SENTINEL, ROWID_SENTINEL};
 use crate::translate::emitter::Resolver;
 use crate::translate::expr::{bind_and_rewrite_expr, BindingBehavior};
 use crate::translate::expression_index::expression_index_column_usage;
-use crate::translate::plan::{ColumnMask, Operation, Scan};
+use crate::translate::plan::{ColumnMask, Operation};
 use crate::translate::planner::{parse_limit, ROWID_STRS};
 use crate::{
     bail_parse_error,
@@ -14,18 +14,18 @@ use crate::{
     vdbe::builder::{ProgramBuilder, ProgramBuilderOpts},
     CaptureDataChangesExt, Connection,
 };
-use turso_parser::ast::{self, Expr, SortOrder};
+use turso_parser::ast::{self, Expr};
 
 use super::emitter::emit_program;
 use super::expr::process_returning_clause;
 use super::optimizer::optimize_plan;
 use super::plan::{
-    ColumnUsedMask, DmlSafety, IterationDirection, JoinedTable, Plan, TableReferences, UpdatePlan,
+    ColumnUsedMask, DmlSafety, JoinedTable, Plan, TableReferences, UpdatePlan, UpdateSetClause,
 };
-use super::planner::{parse_where, plan_ctes_as_outer_refs};
+use super::planner::{append_vtab_predicates_to_where_clause, parse_from, parse_where};
 use super::subquery::{
-    plan_subqueries_from_returning, plan_subqueries_from_select_plan,
-    plan_subqueries_from_set_clauses, plan_subqueries_from_where_clause,
+    mark_shared_cte_materialization_requirements, plan_subqueries_from_returning,
+    plan_subqueries_from_update_sets, plan_subqueries_from_where_clause,
 };
 /*
 * Update is simple. By default we scan the table, and for each row, we check the WHERE
@@ -62,50 +62,78 @@ pub fn translate_update(
     program: &mut ProgramBuilder,
     connection: &Arc<crate::Connection>,
 ) -> crate::Result<()> {
-    let mut plan = prepare_update_plan(program, resolver, body, connection, false)?;
-
-    // Plan subqueries in the WHERE clause and SET clause
-    if let Plan::Update(ref mut update_plan) = plan {
-        if let Some(ref mut ephemeral_plan) = update_plan.ephemeral_plan {
-            // When using ephemeral plan (key columns are being updated), subqueries are in the ephemeral_plan's WHERE
-            plan_subqueries_from_select_plan(program, ephemeral_plan, resolver, connection)?;
-        } else {
-            // Normal path: subqueries are in the UPDATE plan's WHERE
-            plan_subqueries_from_where_clause(
-                program,
-                &mut update_plan.non_from_clause_subqueries,
-                &mut update_plan.table_references,
-                &mut update_plan.where_clause,
-                resolver,
-                connection,
-            )?;
-        }
-        // Plan subqueries in the SET clause (e.g. UPDATE t SET col = (SELECT ...))
-        plan_subqueries_from_set_clauses(
-            program,
-            &mut update_plan.non_from_clause_subqueries,
-            &mut update_plan.table_references,
-            &mut update_plan.set_clauses,
-            resolver,
-            connection,
-        )?;
-    }
-
-    optimize_plan(program, &mut plan, resolver)?;
-
-    if let Plan::Update(ref update_plan) = plan {
-        super::stmt_journal::set_update_stmt_journal_flags(
-            program,
-            update_plan,
-            resolver,
-            connection,
-        )?;
-    }
+    let plan = prepare_and_optimize_update_plan(program, resolver, body, connection, false, None)?;
+    let Plan::Update(ref update_plan) = plan else {
+        unreachable!("prepare_and_optimize_update_plan must return Plan::Update");
+    };
+    super::stmt_journal::set_update_stmt_journal_flags(program, update_plan, resolver, connection)?;
 
     let opts = ProgramBuilderOpts::new(1, 20, 4);
     program.extend(&opts);
     emit_program(connection, resolver, program, plan, |_| {})?;
     Ok(())
+}
+
+/// Normalize a planned UPDATE RHS into the per-column expressions consumed by SET.
+///
+/// Example:
+/// UPDATE t SET (a, b) = (SELECT x, y FROM s)
+/// After planning, the right-hand side (SELECT x, y FROM s) becomes a
+/// SubqueryResult with 2 columns, and this is split into 2 1-column SubqueryResult expressions
+/// i.e. one per each SET assignment.
+fn split_update_set_values(mut expr: Expr, target_count: usize) -> crate::Result<Vec<Expr>> {
+    while let Expr::Parenthesized(mut exprs) = expr {
+        match exprs.len() {
+            1 => expr = *exprs.pop().expect("single parenthesized expr"),
+            _ => {
+                expr = Expr::Parenthesized(exprs);
+                break;
+            }
+        }
+    }
+
+    match expr {
+        Expr::Parenthesized(vals) => {
+            if vals.len() != target_count {
+                bail_parse_error!("{} columns assigned {} values", target_count, vals.len());
+            }
+            Ok(vals.into_iter().map(|expr| *expr).collect())
+        }
+        Expr::SubqueryResult {
+            subquery_id,
+            lhs,
+            not_in,
+            query_type:
+                ast::SubqueryType::RowValue {
+                    result_reg_start,
+                    num_regs,
+                },
+        } => {
+            if num_regs != target_count {
+                bail_parse_error!("{} columns assigned {} values", target_count, num_regs);
+            }
+            Ok((0..num_regs)
+                .map(|offset| Expr::SubqueryResult {
+                    subquery_id,
+                    lhs: lhs.clone(),
+                    not_in,
+                    query_type: ast::SubqueryType::RowValue {
+                        result_reg_start: result_reg_start + offset,
+                        num_regs: 1,
+                    },
+                })
+                .collect())
+        }
+        Expr::Subquery(_) => Err(crate::LimboError::InternalError(
+            "UPDATE set clause subquery should be planned before normalization".to_string(),
+        )),
+        expr => {
+            if target_count != 1 {
+                bail_parse_error!("{} columns assigned 1 values", target_count);
+            }
+            Ok(vec![expr])
+        }
+    }
 }
 
 pub fn translate_update_for_schema_change(
@@ -116,42 +144,60 @@ pub fn translate_update_for_schema_change(
     ddl_query: &str,
     after: impl FnOnce(&mut ProgramBuilder),
 ) -> crate::Result<()> {
-    let mut plan = prepare_update_plan(program, resolver, body, connection, true)?;
-
-    if let Plan::Update(update_plan) = &mut plan {
-        if program.capture_data_changes_info().has_updates() {
-            update_plan.cdc_update_alter_statement = Some(ddl_query.to_string());
-        }
-
-        // Plan subqueries in the WHERE clause
-        if let Some(ref mut ephemeral_plan) = update_plan.ephemeral_plan {
-            plan_subqueries_from_select_plan(program, ephemeral_plan, resolver, connection)?;
-        } else {
-            plan_subqueries_from_where_clause(
-                program,
-                &mut update_plan.non_from_clause_subqueries,
-                &mut update_plan.table_references,
-                &mut update_plan.where_clause,
-                resolver,
-                connection,
-            )?;
-        }
-        // Plan subqueries in the SET clause (e.g. UPDATE t SET col = (SELECT ...))
-        plan_subqueries_from_set_clauses(
-            program,
-            &mut update_plan.non_from_clause_subqueries,
-            &mut update_plan.table_references,
-            &mut update_plan.set_clauses,
-            resolver,
-            connection,
-        )?;
-    }
-
-    optimize_plan(program, &mut plan, resolver)?;
+    let plan = prepare_and_optimize_update_plan(
+        program,
+        resolver,
+        body,
+        connection,
+        true,
+        Some(ddl_query),
+    )?;
     let opts = ProgramBuilderOpts::new(1, 20, 4);
     program.extend(&opts);
     emit_program(connection, resolver, program, plan, after)?;
     Ok(())
+}
+
+fn prepare_and_optimize_update_plan(
+    program: &mut ProgramBuilder,
+    resolver: &Resolver,
+    body: ast::Update,
+    connection: &Arc<crate::Connection>,
+    is_internal_schema_change: bool,
+    ddl_query_for_cdc_update: Option<&str>,
+) -> crate::Result<Plan> {
+    let mut update_plan = prepare_update_plan(
+        program,
+        resolver,
+        body,
+        connection,
+        is_internal_schema_change,
+    )?;
+
+    if let Some(ddl_query_for_cdc_update) = ddl_query_for_cdc_update {
+        if program.capture_data_changes_info().has_updates() {
+            update_plan.cdc_update_alter_statement = Some(ddl_query_for_cdc_update.to_string());
+        }
+    }
+    let mut read_scope_tables = update_plan.build_read_scope_tables();
+    plan_subqueries_from_where_clause(
+        program,
+        &mut update_plan.non_from_clause_subqueries,
+        &mut read_scope_tables,
+        &mut update_plan.where_clause,
+        resolver,
+        connection,
+    )?;
+    mark_shared_cte_materialization_requirements(
+        &mut read_scope_tables,
+        &mut update_plan.non_from_clause_subqueries,
+    );
+    update_plan.target_table = read_scope_tables.joined_tables_mut().remove(0);
+    update_plan.from_tables = read_scope_tables;
+
+    let mut plan = Plan::Update(Box::new(update_plan));
+    optimize_plan(program, &mut plan, resolver)?;
+    Ok(plan)
 }
 
 fn validate_update(
@@ -169,9 +215,6 @@ fn validate_update(
     {
         crate::bail_parse_error!("table {} may not be modified", table_name);
     }
-    if body.from.is_some() {
-        bail_parse_error!("FROM clause is not supported in UPDATE");
-    }
     if !body.order_by.is_empty() {
         bail_parse_error!("ORDER BY is not supported in UPDATE");
     }
@@ -185,29 +228,29 @@ fn validate_update(
     if !views.is_empty() {
         use crate::incremental::compiler::DBSP_CIRCUIT_VERSION;
         crate::bail_parse_error!(
-            "Cannot DELETE from table '{table_name}' because it has incompatible dependent materialized view(s): {}. \n\
+            "Cannot UPDATE table '{table_name}' because it has incompatible dependent materialized view(s): {}. \n\
              These views were created with a different DBSP version than the current version ({DBSP_CIRCUIT_VERSION}). \n\
              Please DROP and recreate the view(s) before modifying this table.",
-            views.iter().fold(String::new(), |_, s| s.to_string() + ", "),
+            views.iter().map(|view| view.as_str()).collect::<Vec<_>>().join(", "),
         );
     }
     Ok(())
     })
 }
 
-pub fn prepare_update_plan(
+fn prepare_update_plan(
     program: &mut ProgramBuilder,
     resolver: &Resolver,
     mut body: ast::Update,
     connection: &Arc<crate::Connection>,
     is_internal_schema_change: bool,
-) -> crate::Result<Plan> {
+) -> crate::Result<UpdatePlan> {
     let database_id = resolver.resolve_existing_table_database_id_qualified(&body.tbl_name)?;
     let schema = resolver.schema();
-    let table_name = &body.tbl_name.name;
-    let table = match resolver.with_schema(database_id, |s| s.get_table(table_name.as_str())) {
+    let target_name = &body.tbl_name.name;
+    let table = match resolver.with_schema(database_id, |s| s.get_table(target_name.as_str())) {
         Some(table) => table,
-        None => bail_parse_error!("Parse error: no such table: {}", table_name),
+        None => bail_parse_error!("Parse error: no such table: {}", target_name),
     };
     if program.trigger.is_some() && table.virtual_table().is_some() {
         bail_parse_error!(
@@ -220,7 +263,7 @@ pub fn prepare_update_plan(
     validate_update(
         schema,
         &body,
-        table_name.as_str(),
+        target_name.as_str(),
         is_internal_schema_change,
         connection,
     )?;
@@ -231,220 +274,291 @@ pub fn prepare_update_plan(
     let indexed = body.indexed.take();
 
     let table_name = table.get_name();
-    let iter_dir = body
-        .order_by
-        .first()
-        .and_then(|ob| {
-            ob.order.map(|o| match o {
-                SortOrder::Asc => IterationDirection::Forwards,
-                SortOrder::Desc => IterationDirection::Backwards,
-            })
-        })
-        .unwrap_or(IterationDirection::Forwards);
 
-    let joined_tables = vec![JoinedTable {
-        table: match table.as_ref() {
-            Table::Virtual(vtab) => Table::Virtual(vtab.clone()),
-            Table::BTree(btree_table) => Table::BTree(btree_table.clone()),
-            _ => unreachable!(),
-        },
+    let target_table = JoinedTable {
+        table: table.as_ref().clone(),
         identifier: body.tbl_name.identifier(),
         internal_id: program.table_reference_counter.next(),
-        op: build_scan_op(&table, iter_dir),
+        op: Operation::default_scan_for(&table),
         join_info: None,
         col_used_mask: ColumnUsedMask::default(),
         column_use_counts: Vec::new(),
         expression_index_usages: Vec::new(),
         database_id,
         indexed,
-    }];
-    let mut table_references = TableReferences::new(joined_tables, vec![]);
+    };
+    let mut from_tables = TableReferences::new_empty();
+    let mut where_clause = vec![];
+    let mut vtab_predicates = vec![];
+    parse_from(
+        body.from.take(),
+        resolver,
+        program,
+        with,
+        true,
+        &mut where_clause,
+        &mut vtab_predicates,
+        &mut from_tables,
+        connection,
+    )?;
 
-    // Plan CTEs and add them as outer query references for subquery resolution
-    plan_ctes_as_outer_refs(with, resolver, program, &mut table_references, connection)?;
+    // SQLite rejects UPDATE FROM when a NATURAL JOIN (or explicit USING) introduces
+    // a column name that already appears in another FROM-side table without being
+    // deduplicated. This proactive check mirrors what SQLite does even when no
+    // unqualified column reference appears in the query.
+    if !from_tables.joined_tables().is_empty() {
+        check_update_from_column_ambiguity(from_tables.joined_tables(), connection.as_ref())?;
+    }
 
+    let target_identifier = body.tbl_name.alias.as_ref().map_or_else(
+        || normalize_ident(body.tbl_name.name.as_str()),
+        |alias| normalize_ident(alias.as_str()),
+    );
+    let target_table_name = normalize_ident(body.tbl_name.name.as_str());
+    let mut non_from_clause_subqueries = vec![];
+    // Reject fairly specific cases like UPDATE t SET x=5 FROM t.
+    let illegal_target_reference = from_tables.joined_tables().iter().any(|joined| {
+        joined.database_id == database_id
+            && normalize_ident(joined.identifier.as_str()) == target_identifier
+            && normalize_ident(joined.table.get_name()) == target_table_name
+    });
+    if illegal_target_reference {
+        bail_parse_error!(
+            "target object/alias may not appear in FROM clause: {}",
+            body.tbl_name
+                .alias
+                .as_ref()
+                .map_or(body.tbl_name.name.as_str(), |alias| alias.as_str())
+        );
+    }
+
+    // At this point where_clause only contains items collected from the FROM clause's JOIN ON conditions.
+    // Subqueries within those conditions are not allowed to reference the UPDATE target table, so we do a subquery
+    // planning pass here before extending the table scope with the target table.
+    plan_subqueries_from_where_clause(
+        program,
+        &mut non_from_clause_subqueries,
+        &mut from_tables,
+        &mut where_clause,
+        resolver,
+        connection,
+    )?;
+
+    let mut read_scope_tables = TableReferences::new(vec![target_table], vec![]);
+    if from_tables.right_join_swapped() {
+        read_scope_tables.set_right_join_swapped();
+    }
+    read_scope_tables.extend(from_tables);
+
+    for set in &mut body.sets {
+        bind_and_rewrite_expr(
+            &mut set.expr,
+            Some(&mut read_scope_tables),
+            None,
+            resolver,
+            BindingBehavior::ResultColumnsNotAllowed,
+        )?;
+    }
+
+    plan_subqueries_from_update_sets(
+        program,
+        &mut non_from_clause_subqueries,
+        &mut read_scope_tables,
+        &mut body.sets,
+        resolver,
+        connection,
+    )?;
+
+    let set_clauses = collect_update_set_clauses(&mut body.sets, &table, table_name)?;
+
+    let result_columns = if !body.returning.is_empty() {
+        // Plan subqueries in RETURNING expressions before processing
+        // (so SubqueryResult nodes are cloned into result_columns)
+        let mut returning_target = read_scope_tables.joined_tables()[0].clone();
+        // SQLite resolves RETURNING columns for an aliased UPDATE target through the
+        // base table name, not the UPDATE alias. Keep the target table in scope, but
+        // under its schema name so `RETURNING t.col` works while `RETURNING alias.col`
+        // still fails.
+        returning_target.identifier = table_name.to_string();
+        let mut returning_table_references = TableReferences::new(
+            vec![returning_target],
+            read_scope_tables.outer_query_refs().to_vec(),
+        );
+        plan_subqueries_from_returning(
+            program,
+            &mut non_from_clause_subqueries,
+            &mut returning_table_references,
+            &mut body.returning,
+            resolver,
+            connection,
+        )?;
+
+        process_returning_clause(
+            &mut body.returning,
+            &mut returning_table_references,
+            resolver,
+        )?
+    } else {
+        vec![]
+    };
+
+    let columns = table.columns();
+    append_vtab_predicates_to_where_clause(
+        &mut vtab_predicates,
+        &mut read_scope_tables,
+        &result_columns,
+        &mut where_clause,
+        resolver,
+    )?;
+    parse_where(
+        body.where_clause.as_deref(),
+        &mut read_scope_tables,
+        Some(&result_columns),
+        &mut where_clause,
+        resolver,
+    )?;
+
+    let (limit, offset) = body
+        .limit
+        .map_or(Ok((None, None)), |l| parse_limit(l, resolver))?;
+
+    let indexes_to_update = collect_indexes_to_update(
+        &table,
+        table_name,
+        database_id,
+        columns,
+        &set_clauses,
+        &mut read_scope_tables,
+        resolver,
+    )?;
+
+    // read_scope_tables was only used for visibility in SET clause expressions, so reconstruct
+    // target_table and from_tables here.
+    let target_table = read_scope_tables.joined_tables_mut().remove(0);
+    let from_tables = read_scope_tables;
+
+    Ok(UpdatePlan {
+        target_table,
+        from_tables,
+        or_conflict,
+        set_clauses,
+        where_clause,
+        returning: (!result_columns.is_empty()).then_some(result_columns),
+        limit,
+        offset,
+        contains_constant_false_condition: false,
+        indexes_to_update,
+        write_set_plan: None,
+        cdc_update_alter_statement: None,
+        non_from_clause_subqueries,
+        safety: DmlSafety::default(),
+    })
+}
+
+fn collect_update_set_clauses(
+    sets: &mut [ast::Set],
+    table: &Table,
+    table_name: &str,
+) -> crate::Result<Vec<UpdateSetClause>> {
     let column_lookup: HashMap<String, usize> = table
         .columns()
         .iter()
         .enumerate()
         .filter_map(|(i, col)| col.name.as_ref().map(|name| (name.to_lowercase(), i)))
         .collect();
+    let mut set_clauses: Vec<UpdateSetClause> = Vec::with_capacity(sets.len());
 
-    let mut set_clauses: Vec<(usize, Box<Expr>)> = Vec::with_capacity(body.sets.len());
+    for set in sets {
+        let expr = std::mem::replace(&mut set.expr, Box::new(Expr::Literal(ast::Literal::Null)));
+        let values = split_update_set_values(*expr, set.col_names.len())?;
 
-    // Process each SET assignment and map column names to expressions
-    // e.g the statement `SET x = 1, y = 2, z = 3` has 3 set assigments
-    for set in &mut body.sets {
-        bind_and_rewrite_expr(
-            &mut set.expr,
-            Some(&mut table_references),
-            None,
-            resolver,
-            BindingBehavior::ResultColumnsNotAllowed,
-        )?;
-
-        let values = match set.expr.as_ref() {
-            Expr::Parenthesized(vals) => vals.clone(),
-            expr => vec![expr.clone().into()],
-        };
-
-        if set.col_names.len() != values.len() {
-            bail_parse_error!(
-                "{} columns assigned {} values",
-                set.col_names.len(),
-                values.len()
-            );
-        }
-
-        for (col_name, expr) in set.col_names.iter().zip(values.iter()) {
+        for (col_name, expr) in set.col_names.iter().zip(values.into_iter()) {
+            let expr = Box::new(expr);
             let ident = normalize_ident(col_name.as_str());
 
             let col_index = match column_lookup.get(&ident) {
                 Some(idx) => {
-                    // cannot update generated columns directly
                     table.columns()[*idx].ensure_not_generated("UPDATE", col_name.as_str())?;
                     *idx
                 }
-                None => {
-                    // Check if this is the 'rowid' keyword
-                    if ROWID_STRS.iter().any(|s| s.eq_ignore_ascii_case(&ident)) {
-                        // Find the rowid alias column if it exists
-                        if let Some((idx, _col)) = table
-                            .columns()
-                            .iter()
-                            .enumerate()
-                            .find(|(_i, c)| c.is_rowid_alias())
-                        {
-                            // Use the rowid alias column index
-                            match set_clauses.iter_mut().find(|(i, _)| i == &idx) {
-                                Some((_, existing_expr)) => existing_expr.clone_from(expr),
-                                None => set_clauses.push((idx, expr.clone())),
-                            }
-                            idx
-                        } else {
-                            // No rowid alias, use sentinel value for actual rowid
-                            match set_clauses.iter_mut().find(|(i, _)| *i == ROWID_SENTINEL) {
-                                Some((_, existing_expr)) => existing_expr.clone_from(expr),
-                                None => set_clauses.push((ROWID_SENTINEL, expr.clone())),
-                            }
-                            ROWID_SENTINEL
-                        }
-                    } else {
-                        crate::bail_parse_error!("no such column: {}.{}", table_name, col_name);
-                    }
-                }
+                None if ROWID_STRS.iter().any(|s| s.eq_ignore_ascii_case(&ident)) => table
+                    .columns()
+                    .iter()
+                    .enumerate()
+                    .find(|(_i, c)| c.is_rowid_alias())
+                    .map_or(ROWID_SENTINEL, |(idx, _col)| idx),
+                None => crate::bail_parse_error!("no such column: {}.{}", table_name, col_name),
             };
-            match set_clauses.iter_mut().find(|(idx, _)| *idx == col_index) {
-                Some((_, existing_expr)) => {
-                    // When multiple SET col[n] = val for the same column are desugared,
-                    // compose them: replace the column reference in the new expression
-                    // with the existing expression, so
-                    //   col = array_set_element(col, 0, 'X')  then  col = array_set_element(col, 2, 'Z')
-                    // becomes col = array_set_element(array_set_element(col, 0, 'X'), 2, 'Z')
-                    if let Expr::FunctionCall {
-                        name,
-                        args: new_args,
-                        ..
-                    } = expr.as_ref()
-                    {
-                        if name.as_str().eq_ignore_ascii_case("array_set_element")
-                            && new_args.len() == 3
-                        {
-                            let mut composed_args = new_args.clone();
-                            composed_args[0].clone_from(existing_expr);
-                            *existing_expr = Box::new(Expr::FunctionCall {
-                                name: name.clone(),
-                                distinctness: None,
-                                args: composed_args,
-                                order_by: vec![],
-                                filter_over: turso_parser::ast::FunctionTail {
-                                    filter_clause: None,
-                                    over_clause: None,
-                                },
-                            });
-                        } else {
-                            existing_expr.clone_from(expr);
-                        }
-                    } else {
-                        existing_expr.clone_from(expr);
-                    }
-                }
-                None => set_clauses.push((col_index, expr.clone())),
+
+            match set_clauses
+                .iter_mut()
+                .find(|set| set.column_index == col_index)
+            {
+                Some(existing) => compose_update_set_clause(existing, expr),
+                None => set_clauses.push(UpdateSetClause::new(col_index, expr)),
             }
         }
     }
 
-    // Plan subqueries in RETURNING expressions before processing
-    // (so SubqueryResult nodes are cloned into result_columns)
-    let mut non_from_clause_subqueries = vec![];
-    plan_subqueries_from_returning(
-        program,
-        &mut non_from_clause_subqueries,
-        &mut table_references,
-        &mut body.returning,
-        resolver,
-        connection,
-    )?;
+    Ok(set_clauses)
+}
 
-    let result_columns =
-        process_returning_clause(&mut body.returning, &mut table_references, resolver)?;
+fn compose_update_set_clause(existing: &mut UpdateSetClause, expr: Box<Expr>) {
+    if let Expr::FunctionCall {
+        name,
+        args: new_args,
+        ..
+    } = expr.as_ref()
+    {
+        if name.as_str().eq_ignore_ascii_case("array_set_element") && new_args.len() == 3 {
+            let mut composed_args = new_args.clone();
+            composed_args[0].clone_from(&existing.expr);
+            existing.expr = Box::new(Expr::FunctionCall {
+                name: name.clone(),
+                distinctness: None,
+                args: composed_args,
+                order_by: vec![],
+                filter_over: turso_parser::ast::FunctionTail {
+                    filter_clause: None,
+                    over_clause: None,
+                },
+            });
+            return;
+        }
+    }
 
-    let order_by = body
-        .order_by
-        .iter_mut()
-        .map(|o| {
-            let _ = bind_and_rewrite_expr(
-                &mut o.expr,
-                Some(&mut table_references),
-                Some(&result_columns),
-                resolver,
-                BindingBehavior::ResultColumnsNotAllowed,
-            );
-            (o.expr.clone(), o.order.unwrap_or(SortOrder::Asc), o.nulls)
-        })
-        .collect();
+    existing.expr = expr;
+}
 
-    // Sqlite determines we should create an ephemeral table if we do not have a FROM clause
-    // Difficult to say what items from the plan can be checked for this so currently just checking if a RowId Alias is referenced
-    // https://github.com/sqlite/sqlite/blob/master/src/update.c#L395
-    // https://github.com/sqlite/sqlite/blob/master/src/update.c#L670
-    let columns = table.columns();
-    let mut where_clause = vec![];
-    // Parse the WHERE clause
-    parse_where(
-        body.where_clause.as_deref(),
-        &mut table_references,
-        Some(&result_columns),
-        &mut where_clause,
-        resolver,
-    )?;
-
-    // Parse the LIMIT/OFFSET clause
-    let (limit, offset) = body
-        .limit
-        .map_or(Ok((None, None)), |l| parse_limit(l, resolver))?;
-
-    // Determine which indexes need updating
+fn collect_indexes_to_update(
+    table: &Table,
+    table_name: &str,
+    database_id: usize,
+    columns: &[crate::schema::Column],
+    set_clauses: &[UpdateSetClause],
+    read_scope_tables: &mut TableReferences,
+    resolver: &Resolver,
+) -> crate::Result<Vec<Arc<crate::schema::Index>>> {
     let indexes: Vec<_> = resolver.with_schema(database_id, |s| {
         s.get_indices(table_name).cloned().collect()
     });
-    let target_table_ref = table_references
+    let target_table_ref = read_scope_tables
         .joined_tables()
         .first()
         .expect("UPDATE must have a target table reference");
     let target_table_internal_id = target_table_ref.internal_id;
-    let target_table_ref = target_table_ref.clone();
-    let rowid_alias_used = set_clauses
-        .iter()
-        .any(|(idx, _)| *idx == ROWID_SENTINEL || columns[*idx].is_rowid_alias());
+    let rowid_alias_used = set_clauses.iter().any(|set| {
+        set.column_index == ROWID_SENTINEL || columns[set.column_index].is_rowid_alias()
+    });
     let updated_cols: Option<ColumnMask> =
-        (!rowid_alias_used).then(|| set_clauses.iter().map(|(i, _)| *i).collect());
+        (!rowid_alias_used).then(|| set_clauses.iter().map(|set| set.column_index).collect());
     let affected_cols = match (table.btree(), updated_cols.as_ref()) {
         (Some(bt), Some(updated)) => Some(bt.columns_affected_by_update(updated)?),
         (None, Some(updated)) => Some(updated.clone()),
         _ => None,
     };
     let mut indexes_to_update = Vec::new();
+    let mut columns_to_mark_used = Vec::new();
 
     for idx in indexes {
         let mut must_update = rowid_alias_used;
@@ -453,9 +567,7 @@ pub fn prepare_update_plan(
         for col in idx.columns.iter() {
             if let Some(expr) = col.expr.as_ref() {
                 let cols_used =
-                    expression_index_column_usage(expr.as_ref(), &target_table_ref, resolver)?;
-                // if it turns out that we need to update the index, we'll need to use all columns
-                // that are used by indexed expressions
+                    expression_index_column_usage(expr.as_ref(), target_table_ref, resolver)?;
                 expression_cols_used |= &cols_used;
 
                 if !must_update
@@ -463,7 +575,6 @@ pub fn prepare_update_plan(
                         cols_used.iter().any(|cidx| affected_cols.get(cidx))
                     })
                 {
-                    // an index must be updated if any of the affected columns is used in an indexed expression
                     must_update = true;
                 }
             } else if !must_update
@@ -471,19 +582,14 @@ pub fn prepare_update_plan(
                     .as_ref()
                     .is_some_and(|affected_cols| affected_cols.get(col.pos_in_table))
             {
-                // an index must be updated if any of its columns is affected by the update
                 must_update = true;
             }
         }
 
         if !must_update {
             if let Some(where_expr) = &idx.where_clause {
-                let cols_used = expression_index_column_usage(
-                    where_expr.as_ref(),
-                    &target_table_ref,
-                    resolver,
-                )?;
-                // a partial index must be updated if any column of its WHERE clause is affected
+                let cols_used =
+                    expression_index_column_usage(where_expr.as_ref(), target_table_ref, resolver)?;
                 must_update = affected_cols.as_ref().is_some_and(|affected_cols| {
                     cols_used.iter().any(|cidx| affected_cols.get(cidx))
                 });
@@ -491,10 +597,7 @@ pub fn prepare_update_plan(
         }
 
         if must_update {
-            // mark as used dependencies of expression indexes
-            for col_idx in expression_cols_used.iter() {
-                table_references.mark_column_used(target_table_internal_id, col_idx);
-            }
+            columns_to_mark_used.extend(expression_cols_used.iter());
             // mark as used dependencies of virtual columns
             if let Some(btree) = target_table_ref.table.btree() {
                 let virtual_cols_in_index = idx
@@ -504,43 +607,91 @@ pub fn prepare_update_plan(
                     .map(|c| c.pos_in_table)
                     .filter(|&pos| btree.columns()[pos].is_virtual_generated());
                 let deps = btree.dependencies_of_columns(virtual_cols_in_index)?;
-                for dep_idx in deps.iter() {
-                    table_references.mark_column_used(target_table_internal_id, dep_idx);
-                }
+                columns_to_mark_used.extend(deps.iter());
             }
             indexes_to_update.push(idx);
         }
     }
 
-    Ok(Plan::Update(Box::new(UpdatePlan {
-        table_references,
-        or_conflict,
-        set_clauses,
-        where_clause,
-        returning: if result_columns.is_empty() {
-            None
-        } else {
-            Some(result_columns)
-        },
-        order_by,
-        limit,
-        offset,
-        contains_constant_false_condition: false,
-        indexes_to_update,
-        ephemeral_plan: None,
-        cdc_update_alter_statement: None,
-        non_from_clause_subqueries,
-        safety: DmlSafety::default(),
-    })))
+    for col_idx in columns_to_mark_used {
+        read_scope_tables.mark_column_used(target_table_internal_id, col_idx);
+    }
+
+    Ok(indexes_to_update)
 }
 
-fn build_scan_op(table: &Table, iter_dir: IterationDirection) -> Operation {
-    match table {
-        Table::BTree(_) => Operation::Scan(Scan::BTreeTable {
-            iter_dir,
-            index: None,
-        }),
-        Table::Virtual(_) => Operation::default_scan_for(table),
-        _ => unreachable!(),
+/// Proactive column-ambiguity check for UPDATE FROM.
+///
+/// SQLite rejects UPDATE FROM when:
+/// 1. The same table identifier appears more than once in the FROM clause
+///    (duplicate unaliased tables or duplicate aliases).
+/// 2. A NATURAL JOIN or USING deduplicates a column, but another table in
+///    the FROM graph also exposes that column without deduplication.
+///
+/// In a regular SELECT these are only caught when an unqualified reference
+/// is resolved, but UPDATE FROM checks eagerly regardless of whether the
+/// column is actually referenced.
+fn check_update_from_column_ambiguity(
+    joined_tables: &[JoinedTable],
+    connection: &Connection,
+) -> crate::Result<()> {
+    // Check 1: reject duplicate table identifiers (e.g. FROM t2, t2).
+    for (i, table) in joined_tables.iter().enumerate() {
+        if joined_tables[..i]
+            .iter()
+            .any(|preceding| preceding.identifier == table.identifier)
+        {
+            let db_name = connection
+                .get_database_name_by_index(table.database_id)
+                .unwrap_or_else(|| "main".to_string());
+            bail_parse_error!(
+                "ambiguous column name: {db_name}.{}._ROWID_",
+                table.identifier
+            );
+        }
     }
+
+    // Check 2: for each USING/NATURAL-deduplicated column, verify that no
+    // other table in the FROM graph (preceding or following) exposes the
+    // same column without its own deduplication.
+    for (i, table) in joined_tables.iter().enumerate() {
+        let using = match &table.join_info {
+            Some(info) if !info.using.is_empty() => &info.using,
+            _ => continue,
+        };
+        for using_col in using {
+            let col_name = normalize_ident(using_col.as_str());
+
+            // Count how many *other* tables expose this column without it
+            // being covered by their own USING clause.
+            let mut found_count = 0usize;
+            for (j, other) in joined_tables.iter().enumerate() {
+                if j == i {
+                    continue;
+                }
+                let has_col = other.columns().iter().any(|c| {
+                    c.name
+                        .as_ref()
+                        .is_some_and(|n| n.eq_ignore_ascii_case(&col_name))
+                });
+                if !has_col {
+                    continue;
+                }
+                // If this table's own USING already covers the column,
+                // it was deduplicated by its own NATURAL/USING JOIN — skip.
+                let already_deduped = other.join_info.as_ref().is_some_and(|info| {
+                    info.using
+                        .iter()
+                        .any(|u| u.as_str().eq_ignore_ascii_case(&col_name))
+                });
+                if !already_deduped {
+                    found_count += 1;
+                }
+            }
+            if found_count > 1 {
+                bail_parse_error!("ambiguous column name: {}", using_col.as_str());
+            }
+        }
+    }
+    Ok(())
 }

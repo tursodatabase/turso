@@ -1024,6 +1024,12 @@ pub fn try_hash_join_access_method(
     if build_root_page == probe_root_page {
         return None;
     }
+    // Explicit INDEXED BY / NOT INDEXED directives must be honored. A hash join
+    // bypasses the normal access-path selection for the build/probe pair, so it
+    // would ignore the user's requested scan shape.
+    if build_table.indexed.is_some() || probe_table.indexed.is_some() {
+        return None;
+    }
     // No hash join for semi/anti-joins (nested loop with index seek is preferred).
     if probe_table
         .join_info
