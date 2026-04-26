@@ -6573,6 +6573,7 @@ dependencies = [
  "simsimd",
  "smallvec",
  "sorted-vec",
+ "stacker",
  "strum",
  "strum_macros",
  "tantivy",
