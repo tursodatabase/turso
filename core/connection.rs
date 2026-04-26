@@ -661,6 +661,7 @@ impl Connection {
         cmd: Cmd,
         input: &str,
     ) -> Result<(Program, Arc<Pager>, QueryMode)> {
+        let _stack = crate::stack::trace_scope("compile_cmd");
         self.maybe_update_schema();
         let syms = self.syms.read();
         let pager = self.pager.load().clone();
@@ -682,9 +683,13 @@ impl Connection {
                 // than cloning the original AST, which can overflow the stack
                 // on deeply nested expression trees.
                 drop(syms);
-                let mut parser = Parser::new(input.as_bytes());
-                let Some(cmd) = parser.next_cmd()? else {
-                    return Err(err);
+                let cmd = {
+                    let _stack = crate::stack::trace_scope("compile_cmd:schema_retry_parse");
+                    let mut parser = Parser::new(input.as_bytes());
+                    let Some(cmd) = parser.next_cmd()? else {
+                        return Err(err);
+                    };
+                    cmd
                 };
                 self.maybe_update_schema();
                 let syms = self.syms.read();
@@ -744,20 +749,26 @@ impl Connection {
         let result = (|| {
             let sql = sql.as_ref();
             tracing::debug!("Preparing: {}", sql);
-            let mut parser = Parser::new(sql.as_bytes());
-            let cmd = match parser.next_cmd()? {
-                Some(cmd) => cmd,
-                None => {
-                    return Err(LimboError::InvalidArgument(
-                        "The supplied SQL string contains no statements".to_string(),
-                    ));
-                }
+            let (cmd, byte_offset_end) = {
+                let _stack = crate::stack::trace_scope("prepare:parse");
+                let mut parser = Parser::new(sql.as_bytes());
+                let cmd = match parser.next_cmd()? {
+                    Some(cmd) => cmd,
+                    None => {
+                        return Err(LimboError::InvalidArgument(
+                            "The supplied SQL string contains no statements".to_string(),
+                        ));
+                    }
+                };
+                (cmd, parser.offset())
             };
-            let byte_offset_end = parser.offset();
             let input = str::from_utf8(&sql.as_bytes()[..byte_offset_end])
                 .unwrap()
                 .trim();
-            let (program, pager, mode) = self.compile_cmd(cmd, input)?;
+            let (program, pager, mode) = {
+                let _stack = crate::stack::trace_scope("prepare:compile");
+                self.compile_cmd(cmd, input)?
+            };
             Ok(Statement::new_with_origin(
                 program,
                 pager,
@@ -797,15 +808,18 @@ impl Connection {
             let pager = self.pager.load().clone();
             let mode = QueryMode::Normal;
             let schema = self.schema.read().clone();
-            let program = translate::translate(
-                &schema,
-                stmt,
-                pager.clone(),
-                self.clone(),
-                &syms,
-                mode,
-                "<ast>", // No SQL input string available
-            )?;
+            let program = {
+                let _stack = crate::stack::trace_scope("prepare_stmt:translate");
+                translate::translate(
+                    &schema,
+                    stmt,
+                    pager.clone(),
+                    self.clone(),
+                    &syms,
+                    mode,
+                    "<ast>", // No SQL input string available
+                )?
+            };
             Ok(Statement::new_with_origin(
                 program,
                 pager,
@@ -1127,8 +1141,14 @@ impl Connection {
             let input = str::from_utf8(&sql.as_bytes()[..byte_offset_end])
                 .unwrap()
                 .trim();
-            let (program, pager, mode) = self.compile_cmd(cmd, input)?;
-            Statement::new(program, pager.clone(), mode, 0).run_ignore_rows()?;
+            let (program, pager, mode) = {
+                let _stack = crate::stack::trace_scope("execute:compile");
+                self.compile_cmd(cmd, input)?
+            };
+            {
+                let _stack = crate::stack::trace_scope("execute:run");
+                Statement::new(program, pager.clone(), mode, 0).run_ignore_rows()?;
+            }
         }
         Ok(())
     }

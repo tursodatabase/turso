@@ -51,6 +51,7 @@ mod pseudo;
 mod regexp;
 #[cfg(feature = "series")]
 mod series;
+mod stack;
 mod statement;
 mod stats;
 #[allow(dead_code)]

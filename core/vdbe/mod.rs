@@ -1317,6 +1317,7 @@ impl Program {
         query_mode: QueryMode,
         waker: Option<&Waker>,
     ) -> Result<StepResult> {
+        let _stack = crate::stack::trace_scope("program_step");
         state.execution_state = ProgramExecutionState::Running;
         let result = match query_mode {
             QueryMode::Normal => self.normal_step(state, pager, waker),
@@ -1536,6 +1537,7 @@ impl Program {
             let insn_function = insn.to_function();
             if enable_tracing {
                 trace_insn(self, state.pc as InsnReference, insn);
+                crate::stack::trace_remaining("program_step:opcode");
             }
             // Always increment VM steps for every loop iteration
             state.metrics.vm_steps = state.metrics.vm_steps.saturating_add(1);

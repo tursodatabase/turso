@@ -77,6 +77,7 @@ pub fn translate(
     query_mode: QueryMode,
     input: &str,
 ) -> Result<Program> {
+    let _stack = crate::stack::trace_scope("translate");
     tracing::trace!("querying {}", input);
     let change_cnt_on = matches!(
         stmt,
@@ -120,9 +121,15 @@ pub fn translate(
         stmt => translate_inner(stmt, &mut resolver, &mut program, &connection, input)?,
     };
 
-    program.epilogue(schema);
+    {
+        let _stack = crate::stack::trace_scope("translate:epilogue");
+        program.epilogue(schema);
+    }
 
-    program.build(connection, change_cnt_on, input)
+    {
+        let _stack = crate::stack::trace_scope("translate:build");
+        program.build(connection, change_cnt_on, input)
+    }
 }
 
 // TODO: for now leaving the return value as a Program. But ideally to support nested parsing of arbitraty
@@ -135,6 +142,7 @@ pub fn translate_inner(
     connection: &Arc<Connection>,
     input: &str,
 ) -> Result<()> {
+    let _stack = crate::stack::trace_scope_with_detail("translate_inner", stmt_kind(&stmt));
     let is_write = matches!(
         stmt,
         ast::Stmt::AlterTable { .. }
@@ -415,6 +423,42 @@ pub fn translate_inner(
     }
 
     Ok(())
+}
+
+fn stmt_kind(stmt: &ast::Stmt) -> &'static str {
+    match stmt {
+        ast::Stmt::AlterTable(_) => "alter_table",
+        ast::Stmt::Analyze { .. } => "analyze",
+        ast::Stmt::Attach { .. } => "attach",
+        ast::Stmt::Begin { .. } => "begin",
+        ast::Stmt::Commit { .. } => "commit",
+        ast::Stmt::CreateIndex { .. } => "create_index",
+        ast::Stmt::CreateTable { .. } => "create_table",
+        ast::Stmt::CreateTrigger { .. } => "create_trigger",
+        ast::Stmt::CreateView { .. } => "create_view",
+        ast::Stmt::CreateMaterializedView { .. } => "create_materialized_view",
+        ast::Stmt::CreateVirtualTable(_) => "create_virtual_table",
+        ast::Stmt::CreateType { .. } => "create_type",
+        ast::Stmt::CreateDomain { .. } => "create_domain",
+        ast::Stmt::Delete { .. } => "delete",
+        ast::Stmt::Detach { .. } => "detach",
+        ast::Stmt::DropIndex { .. } => "drop_index",
+        ast::Stmt::DropTable { .. } => "drop_table",
+        ast::Stmt::DropType { .. } => "drop_type",
+        ast::Stmt::DropDomain { .. } => "drop_domain",
+        ast::Stmt::DropTrigger { .. } => "drop_trigger",
+        ast::Stmt::DropView { .. } => "drop_view",
+        ast::Stmt::Insert { .. } => "insert",
+        ast::Stmt::Pragma { .. } => "pragma",
+        ast::Stmt::Reindex { .. } => "reindex",
+        ast::Stmt::Release { .. } => "release",
+        ast::Stmt::Rollback { .. } => "rollback",
+        ast::Stmt::Savepoint { .. } => "savepoint",
+        ast::Stmt::Select { .. } => "select",
+        ast::Stmt::Update { .. } => "update",
+        ast::Stmt::Vacuum { .. } => "vacuum",
+        ast::Stmt::Optimize { .. } => "optimize",
+    }
 }
 
 #[cfg(test)]
