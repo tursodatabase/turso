@@ -274,7 +274,7 @@ fn emit_compound_select(
                 }
                 let compound_select = Plan::CompoundSelect {
                     left,
-                    right_most: Box::new(plan),
+                    right_most: plan,
                     limit: limit.clone(),
                     offset: offset.clone(),
                     order_by,
@@ -328,7 +328,7 @@ fn emit_compound_select(
                 };
                 let compound_select = Plan::CompoundSelect {
                     left,
-                    right_most: Box::new(plan),
+                    right_most: plan,
                     limit,
                     offset,
                     order_by,
@@ -391,7 +391,7 @@ fn emit_compound_select(
                 };
                 let compound_select = Plan::CompoundSelect {
                     left,
-                    right_most: Box::new(plan),
+                    right_most: plan,
                     limit,
                     offset,
                     order_by,
@@ -439,7 +439,7 @@ fn emit_compound_select(
                 };
                 let compound_select = Plan::CompoundSelect {
                     left,
-                    right_most: Box::new(plan),
+                    right_most: plan,
                     limit,
                     offset,
                     order_by,

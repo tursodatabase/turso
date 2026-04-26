@@ -322,7 +322,7 @@ impl SubqueryOrigin {
 pub enum Plan {
     Select(Box<SelectPlan>),
     CompoundSelect {
-        left: Vec<(SelectPlan, ast::CompoundOperator)>,
+        left: Vec<(Box<SelectPlan>, ast::CompoundOperator)>,
         right_most: Box<SelectPlan>,
         limit: Option<Box<Expr>>,
         offset: Option<Box<Expr>>,
