@@ -64,6 +64,8 @@ test.skipIf(process.env.LOCAL_SYNC_SERVER)('partial sync (prefix bootstrap strat
         });
         await db.exec("CREATE TABLE IF NOT EXISTS partial(value BLOB)");
         await db.exec("DELETE FROM partial");
+        await db.exec("INSERT INTO partial SELECT randomblob(1024) FROM generate_series(1, 5000)");
+        await db.exec("DELETE FROM partial");
         await db.exec("INSERT INTO partial SELECT randomblob(1024) FROM generate_series(1, 2000)");
         await db.push();
         await db.close();
@@ -73,6 +75,7 @@ test.skipIf(process.env.LOCAL_SYNC_SERVER)('partial sync (prefix bootstrap strat
         path: ':memory:',
         url: server.dbUrl(),
         longPollTimeoutMs: 100,
+        tracing: 'info',
         partialSyncExperimental: {
             bootstrapStrategy: { kind: 'prefix', length: 128 * 1024 },
             segmentSize: 4096,
@@ -90,7 +93,7 @@ test.skipIf(process.env.LOCAL_SYNC_SERVER)('partial sync (prefix bootstrap strat
 
     expect(await db.prepare("SELECT COUNT(*) as cnt FROM partial").all()).toEqual([{ cnt: 2001 }]);
     expect((await db.stats()).networkReceivedBytes).toBeGreaterThanOrEqual(2000 * 1024);
-})
+}, { timeout: 300_000 })
 
 test.skipIf(process.env.LOCAL_SYNC_SERVER)('partial sync (prefix bootstrap strategy; large segment size)', async ({ server }) => {
     {

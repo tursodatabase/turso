@@ -67,7 +67,7 @@ const isMuslFromChildProcess = () => {
 function requireNative() {
   if (process.env.NAPI_RS_NATIVE_LIBRARY_PATH) {
     try {
-      return require(process.env.NAPI_RS_NATIVE_LIBRARY_PATH);
+      nativeBinding = require(process.env.NAPI_RS_NATIVE_LIBRARY_PATH);
     } catch (err) {
       loadErrors.push(err)
     }
@@ -109,24 +109,7 @@ function requireNative() {
     }
   } else if (process.platform === 'win32') {
     if (process.arch === 'x64') {
-      if (process.config?.variables?.shlib_suffix === 'dll.a' || process.config?.variables?.node_target_type === 'shared_library') {
-        try {
-        return require('./sync.win32-x64-gnu.node')
-      } catch (e) {
-        loadErrors.push(e)
-      }
       try {
-        const binding = require('@tursodatabase/sync-win32-x64-gnu')
-        const bindingPackageVersion = require('@tursodatabase/sync-win32-x64-gnu/package.json').version
-        if (bindingPackageVersion !== '0.6.0-pre.22' && process.env.NAPI_RS_ENFORCE_VERSION_CHECK && process.env.NAPI_RS_ENFORCE_VERSION_CHECK !== '0') {
-          throw new Error(`Native binding package version mismatch, expected 0.6.0-pre.22 but got ${bindingPackageVersion}. You can reinstall dependencies to fix this issue.`)
-        }
-        return binding
-      } catch (e) {
-        loadErrors.push(e)
-      }
-      } else {
-        try {
         return require('./sync.win32-x64-msvc.node')
       } catch (e) {
         loadErrors.push(e)
@@ -140,7 +123,6 @@ function requireNative() {
         return binding
       } catch (e) {
         loadErrors.push(e)
-      }
       }
     } else if (process.arch === 'ia32') {
       try {
@@ -367,40 +349,6 @@ function requireNative() {
           loadErrors.push(e)
         }
       }
-    } else if (process.arch === 'loong64') {
-      if (isMusl()) {
-        try {
-          return require('./sync.linux-loong64-musl.node')
-        } catch (e) {
-          loadErrors.push(e)
-        }
-        try {
-          const binding = require('@tursodatabase/sync-linux-loong64-musl')
-          const bindingPackageVersion = require('@tursodatabase/sync-linux-loong64-musl/package.json').version
-          if (bindingPackageVersion !== '0.6.0-pre.22' && process.env.NAPI_RS_ENFORCE_VERSION_CHECK && process.env.NAPI_RS_ENFORCE_VERSION_CHECK !== '0') {
-            throw new Error(`Native binding package version mismatch, expected 0.6.0-pre.22 but got ${bindingPackageVersion}. You can reinstall dependencies to fix this issue.`)
-          }
-          return binding
-        } catch (e) {
-          loadErrors.push(e)
-        }
-      } else {
-        try {
-          return require('./sync.linux-loong64-gnu.node')
-        } catch (e) {
-          loadErrors.push(e)
-        }
-        try {
-          const binding = require('@tursodatabase/sync-linux-loong64-gnu')
-          const bindingPackageVersion = require('@tursodatabase/sync-linux-loong64-gnu/package.json').version
-          if (bindingPackageVersion !== '0.6.0-pre.22' && process.env.NAPI_RS_ENFORCE_VERSION_CHECK && process.env.NAPI_RS_ENFORCE_VERSION_CHECK !== '0') {
-            throw new Error(`Native binding package version mismatch, expected 0.6.0-pre.22 but got ${bindingPackageVersion}. You can reinstall dependencies to fix this issue.`)
-          }
-          return binding
-        } catch (e) {
-          loadErrors.push(e)
-        }
-      }
     } else if (process.arch === 'riscv64') {
       if (isMusl()) {
         try {
@@ -530,35 +478,21 @@ function requireNative() {
 nativeBinding = requireNative()
 
 if (!nativeBinding || process.env.NAPI_RS_FORCE_WASI) {
-  let wasiBinding = null
-  let wasiBindingError = null
   try {
-    wasiBinding = require('./sync.wasi.cjs')
-    nativeBinding = wasiBinding
+    nativeBinding = require('./sync.wasi.cjs')
   } catch (err) {
     if (process.env.NAPI_RS_FORCE_WASI) {
-      wasiBindingError = err
+      loadErrors.push(err)
     }
   }
-  if (!nativeBinding || process.env.NAPI_RS_FORCE_WASI) {
+  if (!nativeBinding) {
     try {
-      wasiBinding = require('@tursodatabase/sync-wasm32-wasi')
-      nativeBinding = wasiBinding
+      nativeBinding = require('@tursodatabase/sync-wasm32-wasi')
     } catch (err) {
       if (process.env.NAPI_RS_FORCE_WASI) {
-        if (!wasiBindingError) {
-          wasiBindingError = err
-        } else {
-          wasiBindingError.cause = err
-        }
         loadErrors.push(err)
       }
     }
-  }
-  if (process.env.NAPI_RS_FORCE_WASI === 'error' && !wasiBinding) {
-    const error = new Error('WASI binding not found and NAPI_RS_FORCE_WASI is set to error')
-    error.cause = wasiBindingError
-    throw error
   }
 }
 
@@ -568,12 +502,7 @@ if (!nativeBinding) {
       `Cannot find native binding. ` +
         `npm has a bug related to optional dependencies (https://github.com/npm/cli/issues/4828). ` +
         'Please try `npm i` again after removing both package-lock.json and node_modules directory.',
-      {
-        cause: loadErrors.reduce((err, cur) => {
-          cur.cause = err
-          return cur
-        }),
-      },
+      { cause: loadErrors }
     )
   }
   throw new Error(`Failed to load native binding`)
