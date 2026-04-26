@@ -1452,39 +1452,67 @@ where
     walk_select_expressions_inner(select, func)
 }
 
+enum SelectWalkItem<'a> {
+    Select(&'a ast::Select),
+    OneSelect(&'a ast::OneSelect),
+    FromClause(&'a ast::FromClause),
+    SelectTable(&'a ast::SelectTable),
+    Expr(&'a ast::Expr),
+}
+
 fn walk_select_expressions_inner<F>(select: &ast::Select, func: &mut F) -> Result<()>
 where
     F: FnMut(&ast::Expr) -> Result<WalkControl>,
 {
-    if let Some(with_clause) = &select.with {
-        for cte in &with_clause.ctes {
-            walk_select_expressions_inner(&cte.select, func)?;
-        }
-    }
+    let mut stack = vec![SelectWalkItem::Select(select)];
 
-    walk_one_select_expressions(&select.body.select, func)?;
-    for compound in &select.body.compounds {
-        walk_one_select_expressions(&compound.select, func)?;
-    }
+    while let Some(item) = stack.pop() {
+        match item {
+            SelectWalkItem::Select(select) => {
+                if let Some(limit) = &select.limit {
+                    if let Some(offset) = &limit.offset {
+                        stack.push(SelectWalkItem::Expr(offset));
+                    }
+                    stack.push(SelectWalkItem::Expr(&limit.expr));
+                }
 
-    for sorted_col in &select.order_by {
-        walk_expr_with_subqueries(&sorted_col.expr, func)?;
-    }
+                for sorted_col in select.order_by.iter().rev() {
+                    stack.push(SelectWalkItem::Expr(&sorted_col.expr));
+                }
 
-    if let Some(limit) = &select.limit {
-        walk_expr_with_subqueries(&limit.expr, func)?;
-        if let Some(offset) = &limit.offset {
-            walk_expr_with_subqueries(offset, func)?;
+                for compound in select.body.compounds.iter().rev() {
+                    stack.push(SelectWalkItem::OneSelect(&compound.select));
+                }
+                stack.push(SelectWalkItem::OneSelect(&select.body.select));
+
+                if let Some(with_clause) = &select.with {
+                    for cte in with_clause.ctes.iter().rev() {
+                        stack.push(SelectWalkItem::Select(&cte.select));
+                    }
+                }
+            }
+            SelectWalkItem::OneSelect(one_select) => {
+                walk_one_select_expressions_inner(one_select, &mut stack);
+            }
+            SelectWalkItem::FromClause(from_clause) => {
+                walk_from_clause_expressions(from_clause, &mut stack);
+            }
+            SelectWalkItem::SelectTable(select_table) => {
+                walk_select_table_expressions(select_table, &mut stack);
+            }
+            SelectWalkItem::Expr(expr) => {
+                walk_expr_with_subqueries_into(expr, func, &mut stack)?;
+            }
         }
     }
 
     Ok(())
 }
 
-fn walk_one_select_expressions<F>(one_select: &ast::OneSelect, func: &mut F) -> Result<()>
-where
-    F: FnMut(&ast::Expr) -> Result<WalkControl>,
-{
+fn walk_one_select_expressions_inner<'a>(
+    one_select: &'a ast::OneSelect,
+    stack: &mut Vec<SelectWalkItem<'a>>,
+) {
     match one_select {
         ast::OneSelect::Select {
             columns,
@@ -1494,116 +1522,110 @@ where
             window_clause,
             ..
         } => {
-            for col in columns {
-                if let ast::ResultColumn::Expr(expr, _) = col {
-                    walk_expr_with_subqueries(expr, func)?;
-                }
-            }
-
-            if let Some(from_clause) = from {
-                walk_from_clause_expressions(from_clause, func)?;
-            }
-
-            if let Some(where_expr) = where_clause {
-                walk_expr_with_subqueries(where_expr, func)?;
+            for window_def in window_clause.iter().rev() {
+                push_window_expression_items(&window_def.window, stack);
             }
 
             if let Some(group_by) = group_by {
-                for expr in &group_by.exprs {
-                    walk_expr_with_subqueries(expr, func)?;
-                }
                 if let Some(having_expr) = &group_by.having {
-                    walk_expr_with_subqueries(having_expr, func)?;
+                    stack.push(SelectWalkItem::Expr(having_expr));
+                }
+                for expr in group_by.exprs.iter().rev() {
+                    stack.push(SelectWalkItem::Expr(expr));
                 }
             }
 
-            for window_def in window_clause {
-                walk_window_expressions(&window_def.window, func)?;
+            if let Some(where_expr) = where_clause {
+                stack.push(SelectWalkItem::Expr(where_expr));
+            }
+
+            if let Some(from_clause) = from {
+                stack.push(SelectWalkItem::FromClause(from_clause));
+            }
+
+            for col in columns.iter().rev() {
+                if let ast::ResultColumn::Expr(expr, _) = col {
+                    stack.push(SelectWalkItem::Expr(expr));
+                }
             }
         }
         ast::OneSelect::Values(values) => {
-            for row in values {
-                for expr in row {
-                    walk_expr_with_subqueries(expr, func)?;
+            for row in values.iter().rev() {
+                for expr in row.iter().rev() {
+                    stack.push(SelectWalkItem::Expr(expr));
                 }
             }
         }
     }
-
-    Ok(())
 }
 
-fn walk_from_clause_expressions<F>(from_clause: &ast::FromClause, func: &mut F) -> Result<()>
-where
-    F: FnMut(&ast::Expr) -> Result<WalkControl>,
-{
-    walk_select_table_expressions(&from_clause.select, func)?;
-
-    for join in &from_clause.joins {
-        walk_select_table_expressions(&join.table, func)?;
-
+fn walk_from_clause_expressions<'a>(
+    from_clause: &'a ast::FromClause,
+    stack: &mut Vec<SelectWalkItem<'a>>,
+) {
+    for join in from_clause.joins.iter().rev() {
         if let Some(ast::JoinConstraint::On(expr)) = &join.constraint {
-            walk_expr_with_subqueries(expr, func)?;
+            stack.push(SelectWalkItem::Expr(expr));
         }
+        stack.push(SelectWalkItem::SelectTable(&join.table));
     }
-
-    Ok(())
+    stack.push(SelectWalkItem::SelectTable(&from_clause.select));
 }
 
-fn walk_select_table_expressions<F>(select_table: &ast::SelectTable, func: &mut F) -> Result<()>
-where
-    F: FnMut(&ast::Expr) -> Result<WalkControl>,
-{
+fn walk_select_table_expressions<'a>(
+    select_table: &'a ast::SelectTable,
+    stack: &mut Vec<SelectWalkItem<'a>>,
+) {
     match select_table {
-        ast::SelectTable::Select(select, _) => walk_select_expressions_inner(select, func),
-        ast::SelectTable::Sub(from_clause, _) => walk_from_clause_expressions(from_clause, func),
+        ast::SelectTable::Select(select, _) => stack.push(SelectWalkItem::Select(select)),
+        ast::SelectTable::Sub(from_clause, _) => {
+            stack.push(SelectWalkItem::FromClause(from_clause))
+        }
         ast::SelectTable::TableCall(_, args, _) => {
-            for arg in args {
-                walk_expr_with_subqueries(arg, func)?;
+            for arg in args.iter().rev() {
+                stack.push(SelectWalkItem::Expr(arg));
             }
-            Ok(())
         }
-        ast::SelectTable::Table(_, _, _) => Ok(()),
+        ast::SelectTable::Table(_, _, _) => {}
     }
 }
 
-fn walk_window_expressions<F>(window: &ast::Window, func: &mut F) -> Result<()>
-where
-    F: FnMut(&ast::Expr) -> Result<WalkControl>,
-{
-    for expr in &window.partition_by {
-        walk_expr_with_subqueries(expr, func)?;
-    }
-
-    for sorted_col in &window.order_by {
-        walk_expr_with_subqueries(&sorted_col.expr, func)?;
-    }
-
+fn push_window_expression_items<'a>(window: &'a ast::Window, stack: &mut Vec<SelectWalkItem<'a>>) {
     if let Some(frame_clause) = &window.frame_clause {
-        walk_frame_bound_expressions(&frame_clause.start, func)?;
         if let Some(end_bound) = &frame_clause.end {
-            walk_frame_bound_expressions(end_bound, func)?;
+            push_frame_bound_expression_item(end_bound, stack);
         }
+        push_frame_bound_expression_item(&frame_clause.start, stack);
     }
 
-    Ok(())
+    for sorted_col in window.order_by.iter().rev() {
+        stack.push(SelectWalkItem::Expr(&sorted_col.expr));
+    }
+
+    for expr in window.partition_by.iter().rev() {
+        stack.push(SelectWalkItem::Expr(expr));
+    }
 }
 
-fn walk_frame_bound_expressions<F>(bound: &ast::FrameBound, func: &mut F) -> Result<()>
-where
-    F: FnMut(&ast::Expr) -> Result<WalkControl>,
-{
+fn push_frame_bound_expression_item<'a>(
+    bound: &'a ast::FrameBound,
+    stack: &mut Vec<SelectWalkItem<'a>>,
+) {
     match bound {
         ast::FrameBound::Following(expr) | ast::FrameBound::Preceding(expr) => {
-            walk_expr_with_subqueries(expr, func)
+            stack.push(SelectWalkItem::Expr(expr));
         }
         ast::FrameBound::CurrentRow
         | ast::FrameBound::UnboundedFollowing
-        | ast::FrameBound::UnboundedPreceding => Ok(()),
+        | ast::FrameBound::UnboundedPreceding => {}
     }
 }
 
-pub fn walk_expr_with_subqueries<F>(expr: &ast::Expr, func: &mut F) -> Result<()>
+fn walk_expr_with_subqueries_into<'a, F>(
+    expr: &'a ast::Expr,
+    func: &mut F,
+    stack: &mut Vec<SelectWalkItem<'a>>,
+) -> Result<()>
 where
     F: FnMut(&ast::Expr) -> Result<WalkControl>,
 {
@@ -1612,10 +1634,10 @@ where
         if matches!(control, WalkControl::Continue) {
             match e {
                 ast::Expr::Subquery(select) | ast::Expr::Exists(select) => {
-                    walk_select_expressions_inner(select, func)?;
+                    stack.push(SelectWalkItem::Select(select));
                 }
                 ast::Expr::InSelect { rhs, .. } => {
-                    walk_select_expressions_inner(rhs, func)?;
+                    stack.push(SelectWalkItem::Select(rhs));
                 }
                 _ => {}
             }
