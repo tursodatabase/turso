@@ -532,6 +532,10 @@ fn execute_trigger_commands(
     database_id: usize,
     ignore_jump_target: BranchOffset,
 ) -> Result<bool> {
+    let _stack = crate::stack::trace_scope_with_detail(
+        "trigger:execute_commands",
+        trigger_event_kind(&trigger.event),
+    );
     struct TriggerCompilationGuard {
         connection: Arc<crate::Connection>,
     }
@@ -598,15 +602,27 @@ fn execute_trigger_commands(
     resolver.set_trigger_context(trigger_database_id, trigger.name.clone());
     let compile_result = (|| -> Result<()> {
         for command in trigger.commands.iter() {
-            let stmt = trigger_cmd_to_stmt_for_subprogram(command, &subprogram_ctx)?;
+            let stmt = {
+                let _stack = crate::stack::trace_scope_with_detail(
+                    "trigger:rewrite_command",
+                    trigger_command_kind(command),
+                );
+                trigger_cmd_to_stmt_for_subprogram(command, &subprogram_ctx)?
+            };
             subprogram_builder.prologue();
-            translate_inner(
-                stmt,
-                resolver,
-                &mut subprogram_builder,
-                connection,
-                "trigger subprogram",
-            )?;
+            {
+                let _stack = crate::stack::trace_scope_with_detail(
+                    "trigger:translate_command",
+                    trigger_command_kind(command),
+                );
+                translate_inner(
+                    stmt,
+                    resolver,
+                    &mut subprogram_builder,
+                    connection,
+                    "trigger subprogram",
+                )?;
+            }
             if matches!(
                 command,
                 ast::TriggerCmd::Insert { .. }
@@ -621,9 +637,14 @@ fn execute_trigger_commands(
     // Restore previous trigger context (supports nested triggers).
     resolver.trigger_context = prev_trigger_context;
     compile_result?;
-    subprogram_builder.epilogue(resolver.schema());
-    let built_subprogram =
-        subprogram_builder.build(connection.clone(), true, "trigger subprogram")?;
+    {
+        let _stack = crate::stack::trace_scope("trigger:subprogram_epilogue");
+        subprogram_builder.epilogue(resolver.schema());
+    }
+    let built_subprogram = {
+        let _stack = crate::stack::trace_scope("trigger:subprogram_build");
+        subprogram_builder.build(connection.clone(), true, "trigger subprogram")?
+    };
     let subprogram_prepared = built_subprogram.prepared();
 
     // Trigger subprograms do not emit Transaction opcodes, so the parent statement
@@ -864,6 +885,8 @@ pub fn fire_trigger(
     database_id: usize,
     ignore_jump_target: BranchOffset,
 ) -> Result<()> {
+    let _stack =
+        crate::stack::trace_scope_with_detail("trigger:fire", trigger_event_kind(&trigger.event));
     // Decode custom type registers so trigger bodies see user-facing values,
     // not raw encoded blobs from disk.
     // - OLD registers always come from cursor reads → always encoded → always decode
@@ -880,19 +903,26 @@ pub fn fire_trigger(
     let result = (|| -> Result<()> {
         // Evaluate WHEN clause if present
         if let Some(mut when_expr) = trigger.when_clause.clone() {
+            let _stack = crate::stack::trace_scope("trigger:when_clause");
             // Rewrite NEW/OLD references in WHEN clause to use registers
-            rewrite_trigger_expr_for_when_clause(&mut when_expr, &ctx.table, ctx)?;
+            {
+                let _stack = crate::stack::trace_scope("trigger:rewrite_when");
+                rewrite_trigger_expr_for_when_clause(&mut when_expr, &ctx.table, ctx)?;
+            }
 
             // Plan and emit any subqueries in the WHEN clause (e.g. IN (SELECT ...), EXISTS, scalar subqueries).
             // This transforms InSelect/Exists/Subquery nodes into SubqueryResult nodes that translate_expr can handle.
             let mut subqueries = Vec::new();
-            plan_subqueries_from_trigger_when_clause(
-                program,
-                &mut subqueries,
-                &mut when_expr,
-                resolver,
-                connection,
-            )?;
+            {
+                let _stack = crate::stack::trace_scope("trigger:plan_when_subqueries");
+                plan_subqueries_from_trigger_when_clause(
+                    program,
+                    &mut subqueries,
+                    &mut when_expr,
+                    resolver,
+                    connection,
+                )?;
+            }
             // Emit the planned subqueries so their results are available when we evaluate the WHEN expression.
             // Always treat these as correlated (no `Once` caching) because the WHEN clause is evaluated
             // per-row, and trigger bodies may modify the tables referenced by the subquery between evaluations.
@@ -909,7 +939,10 @@ pub fn fire_trigger(
             }
 
             let when_reg = program.alloc_register();
-            translate_expr(program, None, &when_expr, when_reg, resolver)?;
+            {
+                let _stack = crate::stack::trace_scope("trigger:translate_when_expr");
+                translate_expr(program, None, &when_expr, when_reg, resolver)?;
+            }
 
             let skip_label = program.allocate_label();
             program.emit_insn(Insn::IfNot {
@@ -919,34 +952,58 @@ pub fn fire_trigger(
             });
 
             // Execute trigger commands if WHEN clause is true
-            execute_trigger_commands(
-                program,
-                resolver,
-                &trigger,
-                ctx,
-                connection,
-                database_id,
-                ignore_jump_target,
-            )?;
+            {
+                let _stack = crate::stack::trace_scope("trigger:execute_when_body");
+                execute_trigger_commands(
+                    program,
+                    resolver,
+                    &trigger,
+                    ctx,
+                    connection,
+                    database_id,
+                    ignore_jump_target,
+                )?;
+            }
 
             program.preassign_label_to_next_insn(skip_label);
         } else {
             // No WHEN clause - always execute
-            execute_trigger_commands(
-                program,
-                resolver,
-                &trigger,
-                ctx,
-                connection,
-                database_id,
-                ignore_jump_target,
-            )?;
+            {
+                let _stack = crate::stack::trace_scope("trigger:execute_body");
+                execute_trigger_commands(
+                    program,
+                    resolver,
+                    &trigger,
+                    ctx,
+                    connection,
+                    database_id,
+                    ignore_jump_target,
+                )?;
+            }
         }
 
         Ok(())
     })();
     resolver.register_affinities = saved_register_affinities;
     result
+}
+
+fn trigger_event_kind(event: &TriggerEvent) -> &'static str {
+    match event {
+        TriggerEvent::Delete => "delete",
+        TriggerEvent::Insert => "insert",
+        TriggerEvent::Update => "update",
+        TriggerEvent::UpdateOf(_) => "update_of",
+    }
+}
+
+fn trigger_command_kind(command: &ast::TriggerCmd) -> &'static str {
+    match command {
+        ast::TriggerCmd::Insert { .. } => "insert",
+        ast::TriggerCmd::Update { .. } => "update",
+        ast::TriggerCmd::Delete { .. } => "delete",
+        ast::TriggerCmd::Select(_) => "select",
+    }
 }
 
 /// Decode encoded custom type registers in a TriggerContext.

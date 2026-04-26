@@ -5882,6 +5882,7 @@ pub fn bind_and_rewrite_expr<'a>(
     resolver: &Resolver<'_>,
     binding_behavior: BindingBehavior,
 ) -> Result<()> {
+    let _stack = crate::stack::trace_scope("expr:bind_and_rewrite");
     walk_expr_mut(
         top_level_expr,
         &mut |expr: &mut ast::Expr| -> Result<WalkControl> {

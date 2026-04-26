@@ -225,6 +225,7 @@ pub fn plan_subqueries_from_select_plan(
     resolver: &Resolver,
     connection: &Arc<Connection>,
 ) -> Result<()> {
+    let _stack = crate::stack::trace_scope("subquery:plan_from_select_plan");
     // WHERE
     plan_subqueries_with_outer_query_access(
         program,
