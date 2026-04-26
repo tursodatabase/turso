@@ -32,6 +32,11 @@ pub struct TursoDatabaseSyncConfig {
     /// is split on transaction boundaries once the batch has accumulated at
     /// least this many operations.
     pub push_operations_threshold: Option<usize>,
+    /// Optional hint, in bytes, that splits the bootstrap download into
+    /// multiple `/pull-updates` HTTP requests of >= this many bytes each.
+    /// `None` => single-request bootstrap. No-op when partial-sync uses the
+    /// query bootstrap strategy.
+    pub pull_bytes_threshold: Option<usize>,
 }
 
 pub type PartialSyncOpts = turso_sync_engine::types::PartialSyncOpts;
@@ -107,6 +112,11 @@ impl TursoDatabaseSyncConfig {
                 None
             } else {
                 Some(config.push_operations_threshold)
+            },
+            pull_bytes_threshold: if config.pull_bytes_threshold == 0 {
+                None
+            } else {
+                Some(config.pull_bytes_threshold)
             },
         })
     }
@@ -235,6 +245,7 @@ impl<TBytes: AsRef<[u8]> + Send + Sync + 'static> TursoDatabaseSync<TBytes> {
             partial_sync_opts: sync_config.partial_sync_opts.clone(),
             remote_encryption_key: sync_config.remote_encryption_key.clone(),
             push_operations_threshold: sync_config.push_operations_threshold,
+            pull_bytes_threshold: sync_config.pull_bytes_threshold,
         };
         let is_memory = db_config.path == ":memory:";
         let db_io: Option<Arc<dyn IO>> = if is_memory {

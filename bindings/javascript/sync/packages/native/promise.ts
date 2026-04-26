@@ -98,6 +98,7 @@ class Database extends DatabasePromise {
             remoteEncryptionKey: opts.remoteEncryption?.key,
             partialSyncOpts: partialSyncOpts as any,
             pushOperationsThreshold: opts.pushOperationsThreshold,
+            pullBytesThreshold: opts.pullBytesThreshold,
         });
 
         let headers: { [K: string]: string } | (() => Promise<{ [K: string]: string }>);

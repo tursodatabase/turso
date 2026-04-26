@@ -125,6 +125,14 @@ export interface DatabaseOpts {
      */
     pushOperationsThreshold?: number,
     /**
+     * optional hint, in bytes, that splits the bootstrap download into multiple
+     * `/pull-updates` HTTP requests of >= this many bytes each (using the
+     * `server_pages_selector` bitmap). unset (default) bootstraps in a single
+     * round-trip. currently affects only the bootstrap phase — incremental
+     * pulls are unaffected. no-op when partial sync uses the `query` strategy.
+     */
+    pullBytesThreshold?: number,
+    /**
      * optional fetch override used for every HTTP request made by the sync engine
      * (push, pull, wait-for-changes). drop-in replacement for `globalThis.fetch`.
      * use cases:

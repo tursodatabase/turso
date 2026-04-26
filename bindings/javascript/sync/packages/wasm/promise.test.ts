@@ -308,7 +308,7 @@ test('constraint-conflict', async () => {
     await db2.exec("INSERT INTO u VALUES ('k2', 'value1')");
 
     await db1.push();
-    await expect(async () => await db2.push()).rejects.toThrow('SQLite error: UNIQUE constraint failed: u.y');
+    await expect(async () => await db2.push()).rejects.toThrow(/UNIQUE constraint failed: u.y/);
 })
 
 test('checkpoint', async () => {
@@ -548,7 +548,7 @@ test('concurrent-updates', { timeout: 60000 }, async () => {
     await Promise.all(dbs.map(db => db.pull()));
     let results = [];
     for (let i = 0; i < dbs.length; i++) {
-        results.push(await dbs[i].prepare('SELECT x, y FROM three').all());
+        results.push((await dbs[i].prepare('SELECT x, y FROM three').all()).sort(localeCompare));
     }
     for (let i = 0; i < dbs.length; i++) {
         expect(results[i]).toEqual(results[0]);

@@ -324,6 +324,14 @@ export interface DatabaseOpts {
   pushOperationsThreshold?: number;
 
   /**
+   * Optional hint, in bytes, that splits the bootstrap download into multiple
+   * `/pull-updates` HTTP requests of >= this many bytes each. Unset (default)
+   * bootstraps in a single round-trip. Currently affects only the bootstrap
+   * phase. No-op when partial sync uses the `query` bootstrap strategy.
+   */
+  pullBytesThreshold?: number;
+
+  /**
    * Optional parameter to enable partial sync for the database
    * WARNING: This feature is EXPERIMENTAL
    */

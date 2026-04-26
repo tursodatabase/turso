@@ -1257,6 +1257,7 @@ pub async fn bootstrap_db_file<IO: SyncEngineIo, Ctx>(
     main_db_path: &str,
     protocol: DatabaseSyncEngineProtocolVersion,
     partial_sync: Option<PartialSyncOpts>,
+    pull_bytes_threshold: Option<usize>,
 ) -> Result<DatabasePullRevision> {
     match protocol {
         DatabaseSyncEngineProtocolVersion::Legacy => {
@@ -1268,54 +1269,42 @@ pub async fn bootstrap_db_file<IO: SyncEngineIo, Ctx>(
             bootstrap_db_file_legacy(ctx, io, main_db_path).await
         }
         DatabaseSyncEngineProtocolVersion::V1 => {
-            bootstrap_db_file_v1(ctx, io, main_db_path, partial_sync).await
+            bootstrap_db_file_v1(ctx, io, main_db_path, partial_sync, pull_bytes_threshold).await
         }
     }
 }
 
-pub async fn bootstrap_db_file_v1<IO: SyncEngineIo, Ctx>(
-    ctx: &SyncOperationCtx<'_, IO, Ctx>,
-    io: &Arc<dyn turso_core::IO>,
-    main_db_path: &str,
-    partial_sync: Option<PartialSyncOpts>,
-) -> Result<DatabasePullRevision> {
-    if let Some(PartialSyncOpts {
-        bootstrap_strategy: None,
-        ..
-    }) = partial_sync
-    {
-        return Err(Error::DatabaseSyncEngineError(
-            "partial sync bootstrap strategy must be set for initialization".to_string(),
-        ));
+/// Serialise a contiguous `[start, end)` page-id range into a RoaringBitmap
+/// blob suitable for `PullUpdatesReqProtoBody::server_pages_selector`.
+fn page_range_bitmap(start_inclusive: u32, end_exclusive: u32) -> Result<Vec<u8>> {
+    let mut bitmap = RoaringBitmap::new();
+    if start_inclusive < end_exclusive {
+        bitmap.insert_range(start_inclusive..end_exclusive);
     }
-    let server_pages_selector = if let Some(PartialSyncOpts {
-        bootstrap_strategy: Some(PartialBootstrapStrategy::Prefix { length }),
-        ..
-    }) = &partial_sync
-    {
-        let mut bitmap = RoaringBitmap::new();
-        bitmap.insert_range(0..(*length / PAGE_SIZE) as u32);
-        let mut bitmap_bytes = Vec::with_capacity(bitmap.serialized_size());
-        bitmap.serialize_into(&mut bitmap_bytes).map_err(|e| {
-            Error::DatabaseSyncEngineError(format!("unable to serialize bootstrap request: {e}"))
-        })?;
-        bitmap_bytes
-    } else {
-        Vec::new()
-    };
-    let server_query_selector = if let Some(PartialSyncOpts {
-        bootstrap_strategy: Some(PartialBootstrapStrategy::Query { query }),
-        ..
-    }) = partial_sync
-    {
-        query
-    } else {
-        String::new()
-    };
+    let mut bytes = Vec::with_capacity(bitmap.serialized_size());
+    bitmap.serialize_into(&mut bytes).map_err(|e| {
+        Error::DatabaseSyncEngineError(format!("unable to serialize bootstrap request: {e}"))
+    })?;
+    Ok(bytes)
+}
 
+/// Send a single `/pull-updates` request and stream every returned page into
+/// `file`. Returns the response header for the caller to inspect (db_size,
+/// server_revision). When `truncate_on_first_response` is set, the file is
+/// resized to `header.db_size * PAGE_SIZE` between reading the header and the
+/// first page — used by the first chunk of a chunked bootstrap.
+#[allow(clippy::too_many_arguments)]
+async fn pull_chunk_into_file<IO: SyncEngineIo, Ctx>(
+    ctx: &SyncOperationCtx<'_, IO, Ctx>,
+    file: &Arc<dyn turso_core::File>,
+    server_revision: &str,
+    server_pages_selector: Vec<u8>,
+    server_query_selector: String,
+    truncate_on_first_response: bool,
+) -> Result<PullUpdatesRespProtoBody> {
     let request = PullUpdatesReqProtoBody {
         encoding: PageUpdatesEncodingReq::Raw as i32,
-        server_revision: String::new(),
+        server_revision: server_revision.to_string(),
         client_revision: String::new(),
         long_poll_timeout_ms: 0,
         server_pages_selector: server_pages_selector.into(),
@@ -1346,23 +1335,19 @@ pub async fn bootstrap_db_file_v1<IO: SyncEngineIo, Ctx>(
             "no header returned in the pull-updates protobuf call".to_string(),
         ));
     };
-    tracing::info!(
-        "bootstrap_db_file(path={}): got header={:?}",
-        main_db_path,
-        header
-    );
-    let file = io.open_file(main_db_path, OpenFlags::Create, false)?;
-    let c = Completion::new_trunc(move |result| {
-        let Ok(rc) = result else {
-            return;
-        };
-        assert!(rc as usize == 0);
-    });
-    let c = file.truncate(header.db_size * PAGE_SIZE as u64, c)?;
-    while !c.succeeded() {
-        ctx.coro.yield_(SyncEngineIoResult::IO).await?;
+    tracing::info!("bootstrap_db_file: got header={:?}", header);
+    if truncate_on_first_response {
+        let c = Completion::new_trunc(move |result| {
+            let Ok(rc) = result else {
+                return;
+            };
+            assert!(rc as usize == 0);
+        });
+        let c = file.truncate(header.db_size * PAGE_SIZE as u64, c)?;
+        while !c.succeeded() {
+            ctx.coro.yield_(SyncEngineIoResult::IO).await?;
+        }
     }
-
     #[allow(clippy::arc_with_non_send_sync)]
     let buffer = Arc::new(Buffer::new_temporary(PAGE_SIZE));
     while let Some(page_data) = wait_proto_message::<Ctx, PageData>(
@@ -1399,6 +1384,99 @@ pub async fn bootstrap_db_file_v1<IO: SyncEngineIo, Ctx>(
             ctx.coro.yield_(SyncEngineIoResult::IO).await?;
         }
     }
+    Ok(header)
+}
+
+pub async fn bootstrap_db_file_v1<IO: SyncEngineIo, Ctx>(
+    ctx: &SyncOperationCtx<'_, IO, Ctx>,
+    io: &Arc<dyn turso_core::IO>,
+    main_db_path: &str,
+    partial_sync: Option<PartialSyncOpts>,
+    pull_bytes_threshold: Option<usize>,
+) -> Result<DatabasePullRevision> {
+    if let Some(PartialSyncOpts {
+        bootstrap_strategy: None,
+        ..
+    }) = partial_sync
+    {
+        return Err(Error::DatabaseSyncEngineError(
+            "partial sync bootstrap strategy must be set for initialization".to_string(),
+        ));
+    }
+    // Predetermined last page id from the partial-sync prefix strategy (if any).
+    let prefix_bootstrap_last_page_id: Option<u32> = if let Some(PartialSyncOpts {
+        bootstrap_strategy: Some(PartialBootstrapStrategy::Prefix { length }),
+        ..
+    }) = &partial_sync
+    {
+        Some((*length / PAGE_SIZE) as u32)
+    } else {
+        None
+    };
+    // Server-side query selector (can't be chunked locally — server picks pages).
+    let server_query_selector: String = if let Some(PartialSyncOpts {
+        bootstrap_strategy: Some(PartialBootstrapStrategy::Query { query }),
+        ..
+    }) = &partial_sync
+    {
+        query.clone()
+    } else {
+        String::new()
+    };
+    let has_query = !server_query_selector.is_empty();
+
+    // Convert the byte threshold into a page-count chunk size. Chunking only
+    // applies when the page set is statically known on the client (i.e. no
+    // query selector).
+    let chunk_pages: Option<u32> = if has_query {
+        None
+    } else {
+        pull_bytes_threshold
+            .filter(|t| *t > 0)
+            .map(|t| (t.div_ceil(PAGE_SIZE)).max(1) as u32)
+    };
+
+    let file = io.open_file(main_db_path, OpenFlags::Create, false)?;
+
+    // First request: covers either [0..min(N, prefix)) when chunking, [0..L)
+    // for a non-chunked prefix bootstrap, or an empty bitmap (server returns
+    // the full DB) for the bare full bootstrap.
+    let first_selector = if let Some(n) = chunk_pages {
+        let upper = prefix_bootstrap_last_page_id.unwrap_or(u32::MAX);
+        page_range_bitmap(0, std::cmp::min(n, upper))?
+    } else if let Some(l) = prefix_bootstrap_last_page_id {
+        page_range_bitmap(0, l)?
+    } else {
+        Vec::new()
+    };
+    let header =
+        pull_chunk_into_file(ctx, &file, "", first_selector, server_query_selector, true).await?;
+
+    // Subsequent chunks (if any). Pin every chunk to the same `server_revision`
+    // so the page set stays consistent across HTTP round-trips, and never go
+    // past the predetermined upper bound (prefix length or db_size).
+    if let Some(n) = chunk_pages {
+        let last_page_id: u64 = match prefix_bootstrap_last_page_id {
+            Some(l) => std::cmp::min(l as u64, header.db_size),
+            None => header.db_size,
+        };
+        let mut start = n as u64;
+        while start < last_page_id {
+            let end = std::cmp::min(start + n as u64, last_page_id);
+            let selector = page_range_bitmap(start as u32, end as u32)?;
+            pull_chunk_into_file(
+                ctx,
+                &file,
+                &header.server_revision,
+                selector,
+                String::new(),
+                false,
+            )
+            .await?;
+            start = end;
+        }
+    }
+
     Ok(DatabasePullRevision::V1 {
         revision: header.server_revision,
     })

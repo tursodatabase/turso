@@ -999,6 +999,54 @@ test('retryFetch propagates persistent errors', async () => {
     await expect(wrapped(new URL('http://localhost/'), {} as RequestInit)).rejects.toThrow(/persistent failure/);
 })
 
+test('pullBytesThreshold splits bootstrap into multiple chunks', async ({ server }) => {
+    const PAGE_SIZE = 4096;
+    const THRESHOLD = 8192;
+    const PAGES_PER_CHUNK = Math.ceil(THRESHOLD / PAGE_SIZE); // 2
+
+    // Seed a remote with enough data to span multiple 4KB pages.
+    {
+        const seed = await connect({ path: ':memory:', url: server.dbUrl() });
+        await seed.exec("CREATE TABLE big(x INTEGER PRIMARY KEY, y BLOB)");
+        await seed.exec("INSERT INTO big SELECT value, randomblob(1024) FROM generate_series(1, 50)");
+        await seed.push();
+        await seed.close();
+    }
+    // Ask the server itself for its db_size (= page count) — the chunk count
+    // is a deterministic function of this number, so the test can assert it
+    // exactly. Reading the local file's PRAGMA page_count after a probe
+    // bootstrap is unreliable: connect() augments the local DB with sync
+    // bookkeeping after the engine truncates it, inflating page_count past
+    // what the server actually returned.
+    const pageCountRows = await server.dbSql('PRAGMA page_count');
+    const serverPages = Number(pageCountRows[0][0]);
+
+    let pullUpdatesCalls = 0;
+    const trackedFetch: typeof fetch = async (input, init) => {
+        if (init?.method === 'POST' && input.toString().endsWith('/pull-updates')) {
+            pullUpdatesCalls += 1;
+        }
+        return fetch(input, init);
+    };
+
+    const db = await connect({
+        path: ':memory:',
+        url: server.dbUrl(),
+        pullBytesThreshold: THRESHOLD,
+        fetch: trackedFetch,
+    });
+
+    const expectedChunks = Math.ceil(serverPages / PAGES_PER_CHUNK);
+    expect(serverPages).toBeGreaterThan(PAGES_PER_CHUNK); // sanity: would split
+    expect(pullUpdatesCalls).toBe(expectedChunks);
+
+    // Bootstrapped data must be intact regardless of the chunked fetch.
+    const cnt = await db.prepare("SELECT COUNT(*) as c FROM big").all();
+    expect(cnt).toEqual([{ c: 50 }]);
+    const sizes = await db.prepare("SELECT length(y) as len FROM big LIMIT 1").all();
+    expect(sizes).toEqual([{ len: 1024 }]);
+})
+
 test('push failure leaves server state on transaction boundary', async ({ server }) => {
     // Seed: empty schema on the remote.
     {

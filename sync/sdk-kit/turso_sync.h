@@ -133,6 +133,11 @@ typedef struct
     // at least this many operations. a single user transaction is never split across batches.
     // 0 (default) sends the entire change set in one batch.
     size_t push_operations_threshold;
+    // optional hint, in bytes, that splits the bootstrap download into multiple
+    // /pull-updates HTTP requests of >= this many bytes each. when > 0, the bootstrap
+    // is fetched in chunks via the server_pages_selector bitmap. 0 (default) bootstraps
+    // in a single round-trip. no-op when partial-sync uses the query bootstrap strategy.
+    size_t pull_bytes_threshold;
 } turso_sync_database_config_t;
 
 /// opaque pointer to the TursoDatabaseSync instance
