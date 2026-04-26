@@ -5545,34 +5545,35 @@ pub fn as_binary_components(
     }
 }
 
-/// Recursively unwrap parentheses from an expression
+/// Unwrap parentheses from an expression
 /// e.g. (((t.x > 5))) -> t.x > 5
 pub fn unwrap_parens(expr: &ast::Expr) -> Result<&ast::Expr> {
-    match expr {
-        ast::Expr::Column { .. } => Ok(expr),
-        ast::Expr::Parenthesized(exprs) => match exprs.len() {
-            1 => unwrap_parens(exprs.first().unwrap()),
-            _ => Ok(expr), // If the expression is e.g. (x, y), as used in e.g. (x, y) IN (SELECT ...), return as is.
-        },
-        _ => Ok(expr),
+    let mut current = expr;
+    loop {
+        match current {
+            ast::Expr::Parenthesized(exprs) if exprs.len() == 1 => {
+                current = exprs.first().unwrap();
+            }
+            _ => return Ok(current),
+        }
     }
 }
 
-/// Recursively unwrap parentheses from an owned Expr.
+/// Unwrap parentheses from an owned Expr.
 /// Returns how many pairs of parentheses were removed.
-pub fn unwrap_parens_owned(expr: ast::Expr) -> Result<(ast::Expr, usize)> {
+pub fn unwrap_parens_owned(mut expr: ast::Expr) -> Result<(ast::Expr, usize)> {
     let mut paren_count = 0;
-    match expr {
-        ast::Expr::Parenthesized(mut exprs) => match exprs.len() {
-            1 => {
-                paren_count += 1;
-                let (expr, count) = unwrap_parens_owned(*exprs.pop().unwrap())?;
-                paren_count += count;
-                Ok((expr, paren_count))
-            }
-            _ => crate::bail_parse_error!("expected single expression in parentheses"),
-        },
-        _ => Ok((expr, paren_count)),
+    loop {
+        match expr {
+            ast::Expr::Parenthesized(mut exprs) => match exprs.len() {
+                1 => {
+                    paren_count += 1;
+                    expr = *exprs.pop().unwrap();
+                }
+                _ => crate::bail_parse_error!("expected single expression in parentheses"),
+            },
+            _ => return Ok((expr, paren_count)),
+        }
     }
 }
 
