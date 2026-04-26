@@ -125,6 +125,16 @@ export interface DatabaseOpts {
      */
     pushOperationsThreshold?: number,
     /**
+     * optional fetch override used for every HTTP request made by the sync engine
+     * (push, pull, wait-for-changes). drop-in replacement for `globalThis.fetch`.
+     * use cases:
+     *   - retries / backoff (see {@link retryFetch})
+     *   - custom timeouts via AbortSignal
+     *   - request logging / instrumentation
+     *   - testing / mocking
+     */
+    fetch?: typeof fetch,
+    /**
      * optional parameter to enable partial sync for the database
      * WARNING: This feature is EXPERIMENTAL
      */
@@ -185,6 +195,7 @@ export interface RunOpts {
     url: string | (() => string | null),
     headers: { [K: string]: string } | (() => Promise<{ [K: string]: string }>)
     transform?: Transform,
+    fetch?: typeof fetch,
 }
 
 export interface ProtocolIo {

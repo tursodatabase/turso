@@ -125,6 +125,7 @@ class Database extends DatabasePromise {
             headers: headers,
             preemptionMs: 1,
             transform: opts.transform,
+            fetch: opts.fetch,
         };
         const db = engine.db() as unknown as any;
         const memory = db.memory;
@@ -317,4 +318,6 @@ async function connect(opts: DatabaseOpts): Promise<Database> {
 }
 
 export { connect, Database }
+export { retryFetch } from "@tursodatabase/sync-common"
 export type { DatabaseOpts, EncryptionOpts, DatabaseRowMutation, DatabaseRowStatement, DatabaseRowTransformResult }
+export type { RetryFetchOpts } from "@tursodatabase/sync-common"

@@ -1,6 +1,6 @@
 import { unlinkSync } from "node:fs";
 import { test as baseTest, expect } from 'vitest'
-import { connect, Database, DatabaseRowMutation, DatabaseRowTransformResult } from './promise.js'
+import { connect, Database, DatabaseRowMutation, DatabaseRowTransformResult, retryFetch } from './promise.js'
 import { TursoServer } from './turso-server.js'
 
 const localeCompare = (a: { x: string }, b: { x: string }) => a.x.localeCompare(b.x);
@@ -946,4 +946,106 @@ test('push operations threshold splits batches', async ({ server }) => {
     expect(cnt).toEqual([{ c: expectedTotal }]);
     const last = await db2.prepare('SELECT MAX(x) as m FROM q').all();
     expect(last).toEqual([{ m: expectedTotal - 1 }]);
+})
+
+test('custom fetch override is invoked', async ({ server }) => {
+    let calls = 0;
+    const trackingFetch: typeof fetch = (input, init) => {
+        calls += 1;
+        return fetch(input, init);
+    };
+    const db = await connect({ path: ':memory:', url: server.dbUrl(), fetch: trackingFetch });
+    await db.exec("CREATE TABLE t(x)");
+    await db.exec("INSERT INTO t VALUES (1), (2), (3)");
+    await db.push();
+    expect(calls).toBeGreaterThan(0);
+    const rows = await db.prepare('SELECT x FROM t ORDER BY x').all();
+    expect(rows).toEqual([{ x: 1 }, { x: 2 }, { x: 3 }]);
+})
+
+test('retryFetch retries transient network failures', async ({ server }) => {
+    let attemptsObserved = 0;
+    // Drop the first 2 push attempts (status 503), then forward.
+    let dropsRemaining = 2;
+    const flakyFetch: typeof fetch = async (input, init) => {
+        attemptsObserved += 1;
+        if (init?.method === 'POST' && dropsRemaining > 0) {
+            dropsRemaining -= 1;
+            return new Response('flaky', { status: 503 });
+        }
+        return fetch(input, init);
+    };
+    const wrapped = retryFetch({ fetch: flakyFetch, attempts: 5, delayMs: 10, backoff: 2 });
+    const db = await connect({ path: ':memory:', url: server.dbUrl(), fetch: wrapped });
+    await db.exec("CREATE TABLE t(x)");
+    await db.exec("INSERT INTO t VALUES (1), (2), (3)");
+    await db.push();
+    // Both POST drops should have been retried — attemptsObserved counts every
+    // call (including dropped ones), so we expect at least the retries plus the
+    // eventual successful POSTs.
+    expect(attemptsObserved).toBeGreaterThanOrEqual(2);
+    expect(dropsRemaining).toBe(0);
+    const db2 = await connect({ path: ':memory:', url: server.dbUrl() });
+    const rows = await db2.prepare('SELECT x FROM t ORDER BY x').all();
+    expect(rows).toEqual([{ x: 1 }, { x: 2 }, { x: 3 }]);
+})
+
+test('retryFetch propagates persistent errors', async () => {
+    const wrapped = retryFetch({
+        fetch: async () => { throw new TypeError('persistent failure'); },
+        attempts: 3,
+        delayMs: 5,
+    });
+    await expect(wrapped(new URL('http://localhost/'), {} as RequestInit)).rejects.toThrow(/persistent failure/);
+})
+
+test('push failure leaves server state on transaction boundary', async ({ server }) => {
+    // Seed: empty schema on the remote.
+    {
+        const db = await connect({ path: ':memory:', url: server.dbUrl() });
+        await db.exec("CREATE TABLE q(x INTEGER PRIMARY KEY)");
+        await db.push();
+        await db.close();
+    }
+
+    // /v2/pipeline POST traffic from a single push() is:
+    //   1) fetch_last_change_id  (SELECT)
+    //   2) push batch #1         (BEGIN ... COMMIT for txn 1)
+    //   3) push batch #2         (BEGIN ... COMMIT for txn 2)
+    // Drop the 3rd /v2/pipeline POST so only batch #1 lands on the remote.
+    let pipelinePosts = 0;
+    const flaky: typeof fetch = async (input, init) => {
+        if (init?.method === 'POST' && input.toString().endsWith('/v2/pipeline')) {
+            pipelinePosts += 1;
+            if (pipelinePosts === 3) {
+                return new Response('drop', { status: 503 });
+            }
+        }
+        return fetch(input, init);
+    };
+
+    const db = await connect({
+        path: ':memory:',
+        url: server.dbUrl(),
+        pushOperationsThreshold: 5,
+        fetch: flaky,
+    });
+
+    // Two distinct transactions, each exactly threshold-sized → one batch each.
+    await db.exec("BEGIN");
+    for (let i = 0; i < 5; i++) await db.exec(`INSERT INTO q VALUES (${i})`);
+    await db.exec("COMMIT");
+    await db.exec("BEGIN");
+    for (let i = 5; i < 10; i++) await db.exec(`INSERT INTO q VALUES (${i})`);
+    await db.exec("COMMIT");
+
+    // Second batch fails — push must reject.
+    await expect(db.push()).rejects.toThrow();
+
+    // Read the remote via a clean client. The first transaction must be fully
+    // present (rows 0..4); the second must not have leaked any rows
+    // (transaction-boundary respected, not split mid-flight).
+    const db2 = await connect({ path: ':memory:', url: server.dbUrl() });
+    const rows = await db2.prepare('SELECT x FROM q ORDER BY x').all();
+    expect(rows).toEqual([{ x: 0 }, { x: 1 }, { x: 2 }, { x: 3 }, { x: 4 }]);
 })
