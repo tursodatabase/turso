@@ -1,0 +1,234 @@
+{
+  "constants": {
+    "num_tables": 6,
+    "col_types": ["INTEGER", "TEXT", "REAL", "BLOB", "NUMERIC"],
+    "max_ops_per_case": 20,
+    "max_dynamic_cols": 5,
+    "error_sqls": [
+      "SELECT * FROM nonexistent_table_xyz",
+      "INSERT INTO t_{prefix}_0 VALUES (1, 2, 3)",
+      "SELECT * FROM nonexistent_table_abc",
+      "SELECT * FROM nonexistent_table_zzz"
+    ]
+  },
+  "values": [
+    { "id": "null" },
+    { "id": "integer", "random": { "min": -10000, "max": 10000 } },
+    { "id": "float", "random_scaled": { "min": -1000, "max": 1000, "divisor": 10 } },
+    { "id": "ascii", "random_string": { "min_len": 0, "max_len": 50 } },
+    { "id": "blob", "random_bytes": { "min_len": 0, "max_len": 32 } },
+    { "id": "int_extreme", "oneof": [9223372036854775807, -9223372036854775808, 0] },
+    { "id": "float_extreme", "oneof_float": [1.7976931348623157e+308, -1.7976931348623157e+308, 0.0] },
+    { "id": "empty_string", "literal": "" },
+    { "id": "empty_blob", "literal_bytes": "" },
+    { "id": "large_or_unicode", "desc": "256-byte 0xAB blob or emoji/CJK/RTL string" },
+    { "id": "null_bytes_string", "literal": "hello\u0000world" },
+    { "id": "sql_chars_string", "literal": "it's a \"test\"; DROP TABLE--" },
+    { "id": "backslash_string", "literal": "path\\to\\file" },
+    { "id": "whitespace_string", "literal": "\t\n\r" },
+    { "id": "negative_zero", "literal_float": -0.0 },
+    { "id": "zero_blob", "fill_bytes": { "byte": 0, "len": 32 } },
+    { "id": "high_bit_blob", "fill_bytes": { "byte": 255, "len": 32 } },
+    { "id": "large_string", "repeat_char": { "char": "a", "len": 4096 } },
+    { "id": "large_blob", "fill_bytes": { "byte": 171, "len": 4096 } },
+    { "id": "bom_string", "literal": "\uFEFFBOM text" }
+  ],
+  "unicode_options": [
+    "\ud83d\ude00\ud83d\udca9\ud83d\ude80",
+    "\u4e16\u754c\u4f60\u597d",
+    "\u0627\u0644\u0633\u0644\u0627\u0645"
+  ],
+  "ops": [
+    {
+      "id": "create",
+      "variant": 0,
+      "sql": "CREATE TABLE IF NOT EXISTS {table} (a INTEGER, b TEXT)",
+      "fields": { "table": "table_name" },
+      "tracks_cols": 2,
+      "result": "exec"
+    },
+    {
+      "id": "insert",
+      "variant": 1,
+      "sql": "INSERT INTO {table} VALUES ({placeholders})",
+      "fields": { "table": "table_name", "values": "table_values" },
+      "result": "exec_rows"
+    },
+    {
+      "id": "select",
+      "variant": 2,
+      "sql": "SELECT * FROM {table}",
+      "fields": { "table": "table_name" },
+      "result": "query"
+    },
+    {
+      "id": "select_value",
+      "variant": 3,
+      "sql": "SELECT {expr}",
+      "fields": { "expr": "random_int_str" },
+      "result": "query"
+    },
+    {
+      "id": "begin",
+      "variant": 4,
+      "sql": "BEGIN",
+      "fields": {},
+      "result": "exec"
+    },
+    {
+      "id": "commit",
+      "variant": 5,
+      "sql": "COMMIT",
+      "fields": {},
+      "result": "exec"
+    },
+    {
+      "id": "rollback",
+      "variant": 6,
+      "sql": "ROLLBACK",
+      "fields": {},
+      "result": "exec"
+    },
+    {
+      "id": "invalid",
+      "variant": 7,
+      "sql": "SELECT foobar_nonexistent",
+      "fields": {},
+      "result": "query"
+    },
+    {
+      "id": "param",
+      "variant": 8,
+      "sql": "SELECT ?, ?",
+      "fields": { "params": "two_values" },
+      "result": "query"
+    },
+    {
+      "id": "create_dynamic",
+      "variant": 9,
+      "sql": "CREATE TABLE IF NOT EXISTS {table} ({col_defs})",
+      "fields": { "table": "table_name", "cols": "dynamic_cols" },
+      "tracks_cols": "dynamic",
+      "result": "exec"
+    },
+    {
+      "id": "insert_returning",
+      "variant": 10,
+      "sql": "INSERT INTO {table} VALUES ({placeholders}) RETURNING *",
+      "fields": { "table": "table_name", "values": "table_values" },
+      "result": "query"
+    },
+    {
+      "id": "delete_returning",
+      "variant": 11,
+      "sql": "DELETE FROM {table} RETURNING *",
+      "fields": { "table": "table_name" },
+      "result": "query"
+    },
+    {
+      "id": "update_returning",
+      "variant": 12,
+      "sql": "UPDATE {table} SET a = ? RETURNING *",
+      "fields": { "table": "table_name", "value": "one_value" },
+      "result": "query"
+    },
+    {
+      "id": "named_param",
+      "variant": 13,
+      "sql": "SELECT {named_cols}",
+      "fields": { "named": "named_values" },
+      "result": "query",
+      "named_params": ["foo", "bar"]
+    },
+    {
+      "id": "numbered_param",
+      "variant": 14,
+      "sql": "SELECT {numbered_cols}",
+      "fields": { "params": "two_values" },
+      "result": "query"
+    },
+    {
+      "id": "insert_affected",
+      "variant": 15,
+      "sql": "INSERT INTO {table} VALUES ({placeholders})",
+      "fields": { "table": "table_name", "values": "table_values" },
+      "result": "affected"
+    },
+    {
+      "id": "delete_affected",
+      "variant": 16,
+      "sql": "DELETE FROM {table}",
+      "fields": { "table": "table_name" },
+      "result": "affected"
+    },
+    {
+      "id": "update_affected",
+      "variant": 17,
+      "sql": "UPDATE {table} SET a = ?",
+      "fields": { "table": "table_name", "value": "one_value" },
+      "result": "affected"
+    },
+    {
+      "id": "insert_rowid",
+      "variant": 18,
+      "sql": "INSERT INTO {table} VALUES ({placeholders})",
+      "fields": { "table": "table_name", "values": "table_values" },
+      "result": "rowid"
+    },
+    {
+      "id": "batch",
+      "variant": 19,
+      "sql": "CREATE TABLE IF NOT EXISTS t_{prefix}_{tbl} (a INTEGER, b TEXT); INSERT INTO t_{prefix}_{tbl} VALUES ({a}, 'batch')",
+      "fields": { "sql": "batch_sql" },
+      "result": "exec"
+    },
+    {
+      "id": "select_limit",
+      "variant": 20,
+      "sql": "SELECT * FROM {table} LIMIT 1",
+      "fields": { "table": "table_name" },
+      "result": "query"
+    },
+    {
+      "id": "select_count",
+      "variant": 21,
+      "sql": "SELECT COUNT(*), SUM(a) FROM {table}",
+      "fields": { "table": "table_name" },
+      "result": "query"
+    },
+    {
+      "id": "select_expr",
+      "variant": 22,
+      "sql": "SELECT 1+1, 'hello'||'world', NULL, CAST(3.14 AS INTEGER), typeof(?)",
+      "fields": { "value": "one_value" },
+      "result": "query"
+    },
+    {
+      "id": "error_check",
+      "variant": 23,
+      "sql": "{error_sql}",
+      "fields": { "sql": "error_sql" },
+      "result": "error_check"
+    },
+    {
+      "id": "prepared_reuse",
+      "variant": 24,
+      "sql": "SELECT ?, ?",
+      "fields": { "params_sets": "three_param_pairs" },
+      "result": "prepared_reuse"
+    },
+    {
+      "id": "create_trigger",
+      "variant": 25,
+      "sql": "CREATE TRIGGER IF NOT EXISTS tr_{table}_ins AFTER INSERT ON {table} BEGIN INSERT INTO {audit} VALUES ('{table}', NEW.a); INSERT INTO {audit} VALUES ('{table}', NEW.a * 2); END",
+      "fields": { "table": "table_name" },
+      "result": "trigger"
+    }
+  ],
+  "tests": {
+    "api_parity": { "prefix_range": [0, 65535], "num_examples": 100 },
+    "error_recovery": { "prefix_range": [300000, 365535], "num_examples": 50 },
+    "ddl_in_transaction": { "prefix_range": [100000, 165535], "num_examples": 50 },
+    "ddl_prepare_in_transaction": { "prefix_range": [200000, 265535], "num_examples": 50 }
+  }
+}

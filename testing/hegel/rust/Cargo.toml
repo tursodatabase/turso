@@ -1,0 +1,21 @@
+# Copyright 2025 the Turso authors. All rights reserved. MIT license.
+
+[package]
+name = "turso_hegel_parity"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Hegel property-based parity tests for turso and turso_serverless drivers"
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+turso = { workspace = true }
+turso_serverless = { workspace = true }
+tokio = { workspace = true, features = ["full"] }
+hegeltest = "0.8"
+serde_json = { workspace = true }
