@@ -6718,7 +6718,10 @@ where
     Ok(WalkControl::Continue)
 }
 
-fn push_expr_children_mut(expr: &mut ast::Expr, stack: &mut SmallVec<[*mut ast::Expr; 16]>) {
+pub(crate) fn push_expr_children_mut(
+    expr: &mut ast::Expr,
+    stack: &mut SmallVec<[*mut ast::Expr; 16]>,
+) {
     match expr {
         ast::Expr::SubqueryResult { lhs, .. } => {
             if let Some(lhs) = lhs {
