@@ -1047,6 +1047,84 @@ test('pullBytesThreshold splits bootstrap into multiple chunks', async ({ server
     expect(sizes).toEqual([{ len: 1024 }]);
 })
 
+test('unreliable fetch eventually drains all push batches', async ({ server }) => {
+    // Seed empty schema.
+    {
+        const db = await connect({ path: ':memory:', url: server.dbUrl() });
+        await db.exec("CREATE TABLE q(x INTEGER PRIMARY KEY)");
+        await db.push();
+        await db.close();
+    }
+
+    const THRESHOLD = 5;
+    const TXNS = 4;
+    const ROWS_PER_TXN = THRESHOLD;
+    const TOTAL_ROWS = TXNS * ROWS_PER_TXN;
+
+    // Unreliable fetch: lets the first push batch of each push() through and
+    // fails every subsequent batch in the same push() with 503. fetch_last_change_id
+    // resets the per-push counter (it's the first /v2/pipeline POST of every
+    // push and uses SELECT, not BEGIN IMMEDIATE).
+    let batchesThisPush = 0;
+    const unreliableFetch: typeof fetch = async (input, init) => {
+        if (init?.method === 'POST' && input.toString().endsWith('/v2/pipeline')) {
+            const body = init.body ? new TextDecoder().decode(init.body as Uint8Array) : '';
+            if (body.includes('BEGIN IMMEDIATE')) {
+                batchesThisPush += 1;
+                if (batchesThisPush > 1) {
+                    return new Response('flaky', { status: 503 });
+                }
+            } else {
+                // fetch_last_change_id: start of a new push attempt.
+                batchesThisPush = 0;
+            }
+        }
+        return fetch(input, init);
+    };
+
+    const db = await connect({
+        path: ':memory:',
+        url: server.dbUrl(),
+        pushOperationsThreshold: THRESHOLD,
+        fetch: unreliableFetch,
+    });
+
+    // Generate TXNS distinct transactions, each exactly threshold-sized.
+    for (let txn = 0; txn < TXNS; txn++) {
+        await db.exec("BEGIN");
+        for (let i = 0; i < ROWS_PER_TXN; i++) {
+            await db.exec(`INSERT INTO q VALUES (${txn * ROWS_PER_TXN + i})`);
+        }
+        await db.exec("COMMIT");
+    }
+
+    // Each push() lands exactly one batch and then errors on the next. With
+    // TXNS batches outstanding, the first (TXNS-1) push() calls reject; the
+    // last one (a single remaining batch) completes cleanly.
+    let attempts = 0;
+    while (attempts < TXNS) {
+        attempts += 1;
+        try {
+            await db.push();
+            break;
+        } catch (e) {
+            // expected for the first TXNS - 1 attempts
+            if (attempts >= TXNS) {
+                throw e;
+            }
+        }
+    }
+    expect(attempts).toBe(TXNS);
+
+    // Every row pushed across the multiple attempts must be visible to a
+    // fresh client, in the exact order they were inserted (no gaps, no
+    // duplicates, no reordering across batch boundaries).
+    const db2 = await connect({ path: ':memory:', url: server.dbUrl() });
+    const rows = await db2.prepare('SELECT x FROM q ORDER BY x').all();
+    const expected = Array.from({ length: TOTAL_ROWS }, (_, i) => ({ x: i }));
+    expect(rows).toEqual(expected);
+})
+
 test('push failure leaves server state on transaction boundary', async ({ server }) => {
     // Seed: empty schema on the remote.
     {
