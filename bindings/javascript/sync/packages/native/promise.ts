@@ -4,10 +4,11 @@ import { SyncEngine, SyncEngineProtocolVersion, Database as NativeDatabase } fro
 import { promises } from "node:fs";
 
 let NodeIO: ProtocolIo = {
+
     async read(path: string): Promise<Buffer | Uint8Array | null> {
         try {
             return await promises.readFile(path);
-        } catch (error) {
+        } catch (error: any) {
             if (error.code === 'ENOENT') {
                 return null;
             }
@@ -53,8 +54,8 @@ function resolveUrl(url: string | (() => string | null)): string {
 
 class Database extends DatabasePromise {
     #engine: any;
-    #guards: SyncEngineGuards;
-    #runner: Runner;
+    #guards: SyncEngineGuards | null = null;
+    #runner: Runner | null = null;
     #remoteWriter: RemoteWriter | null = null;
     #db: any;
     constructor(opts: DatabaseOpts) {
@@ -95,7 +96,7 @@ class Database extends DatabasePromise {
             bootstrapIfEmpty: typeof opts.url != "function" || opts.url() != null,
             remoteEncryptionCipher: opts.remoteEncryption?.cipher,
             remoteEncryptionKey: opts.remoteEncryption?.key,
-            partialSyncOpts: partialSyncOpts
+            partialSyncOpts: partialSyncOpts as any
         });
 
         let headers: { [K: string]: string } | (() => Promise<{ [K: string]: string }>);
@@ -155,7 +156,7 @@ class Database extends DatabasePromise {
         } else if (this.#engine == null) {
             await super.connect();
         } else {
-            await run(this.#runner, this.#engine.connect());
+            await run(this.#runner!, this.#engine.connect());
         }
         this.connected = true;
     }
@@ -168,11 +169,11 @@ class Database extends DatabasePromise {
         if (this.#engine == null) {
             throw new Error("sync is disabled as database was opened without sync support")
         }
-        const changes = await this.#guards.wait(async () => await run(this.#runner, this.#engine.wait()));
+        const changes = await this.#guards!.wait(async () => await run(this.#runner!, this.#engine.wait()));
         if (changes.empty()) {
             return false;
         }
-        await this.#guards.apply(async () => await run(this.#runner, this.#engine.apply(changes)));
+        await this.#guards!.apply(async () => await run(this.#runner!, this.#engine.apply(changes)));
         return true;
     }
     /**
@@ -183,7 +184,7 @@ class Database extends DatabasePromise {
         if (this.#engine == null) {
             throw new Error("sync is disabled as database was opened without sync support")
         }
-        await this.#guards.push(async () => await run(this.#runner, this.#engine.push()));
+        await this.#guards!.push(async () => await run(this.#runner!, this.#engine.push()));
     }
     /**
      * checkpoint WAL for local database
@@ -192,7 +193,7 @@ class Database extends DatabasePromise {
         if (this.#engine == null) {
             throw new Error("sync is disabled as database was opened without sync support")
         }
-        await this.#guards.checkpoint(async () => await run(this.#runner, this.#engine.checkpoint()));
+        await this.#guards!.checkpoint(async () => await run(this.#runner!, this.#engine.checkpoint()));
     }
     /**
      * @returns statistic of current local database
@@ -201,7 +202,7 @@ class Database extends DatabasePromise {
         if (this.#engine == null) {
             throw new Error("sync is disabled as database was opened without sync support")
         }
-        return (await run(this.#runner, this.#engine.stats()));
+        return (await run(this.#runner!, this.#engine.stats()));
     }
 
     /**
@@ -250,7 +251,7 @@ class Database extends DatabasePromise {
      * Returns a function that executes the given function in a transaction.
      * When remoteWrites is enabled, the entire transaction goes to remote.
      */
-    override transaction(fn: (...any) => Promise<any>) {
+    override transaction(fn: (...any: any) => Promise<any>) {
         if (typeof fn !== "function")
             throw new TypeError("Expected first argument to be a function");
 

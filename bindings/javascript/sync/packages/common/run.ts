@@ -9,7 +9,7 @@ interface TrackPromise<T> {
 }
 
 function trackPromise<T>(p: Promise<T>): TrackPromise<T> {
-    let status = { promise: null, finished: false };
+    let status: any = { promise: null, finished: false };
     status.promise = p.finally(() => status.finished = true);
     return status;
 }
@@ -51,7 +51,10 @@ async function process(opts: RunOpts, io: ProtocolIo, request: any) {
                 body: requestType.body != null ? new Uint8Array(requestType.body) : null,
             });
             completion.status(response.status);
-            const reader = response.body.getReader();
+            const reader = response.body?.getReader();
+            if (reader == null) {
+                throw new Error("reader is null");
+            }
             while (true) {
                 const { done, value } = await reader.read();
                 if (done) {
@@ -121,7 +124,7 @@ export interface Runner {
 }
 
 export function runner(opts: RunOpts, io: ProtocolIo, engine: any): Runner {
-    let tasks = [];
+    let tasks: TrackPromise<any>[] = [];
     return {
         async wait() {
             for (let request = engine.protocolIo(); request != null; request = engine.protocolIo()) {

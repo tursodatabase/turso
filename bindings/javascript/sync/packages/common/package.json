@@ -15,6 +15,7 @@
     "README.md"
   ],
   "devDependencies": {
+    "@types/node": "^24.12.2",
     "typescript": "^5.9.2"
   },
   "scripts": {
