@@ -9133,3 +9133,323 @@ fn test_integrity_check_ignores_dropped_root_that_is_live_after_recovery() {
     assert_eq!(rows.len(), 1);
     assert_eq!(&rows[0][0].to_string(), "ok");
 }
+/// Snapshot stability under all of: nested-savepoint rollbacks, checkpoints,
+/// CREATE/DROP INDEX, and concurrent committed writers.
+///
+/// One reader holds a long BEGIN CONCURRENT and repeatedly samples
+/// `SELECT count(*) FROM t`; *every sample within the tx must be equal*.
+/// If any pair differs, MVCC snapshot isolation is violated — the case the
+/// original analysis points at (`gc_version_chain` Rule 3 reaping `V_old`
+/// after a savepoint-thread's rollback restores `end=None`, while the
+/// reader's snapshot still depends on it).
+///
+/// Disruptor threads (each toggleable via env):
+///   REPRO_SP=1     — runs the nested-savepoint driver (BEGIN CONCURRENT;
+///                    SAVEPOINT × depth with INSERTs and DELETEs of
+///                    pre-existing rows; ROLLBACK TO sp_<rb>; RELEASE; COMMIT)
+///   REPRO_CKPT=1   — cycles PRAGMA wal_checkpoint(PASSIVE/FULL/RESTART/TRUNCATE)
+///   REPRO_DDL=1    — CREATE/DROP INDEX cycle
+///   REPRO_WRITER=1 — committed INSERT/DELETE in BEGIN CONCURRENT/COMMIT
+///   (defaults: SP, CKPT, WRITER on; DDL off because it currently hangs.)
+///
+/// Other knobs:
+///   REPRO_DURATION_SECS=N  total wall-clock cap (default 30)
+///   REPRO_READER_OPS=N     count samples per reader transaction (default 8)
+#[test]
+#[ignore = "concurrency soak — run with `cargo test -p turso_core test_snapshot_stability_full -- --ignored --nocapture`"]
+fn test_snapshot_stability_full() {
+    use crate::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
+    use std::time::{Duration, Instant};
+
+    // Honor RUST_LOG when set; ignored if a subscriber is already installed.
+    // NOTE: deliberately NOT using `with_test_writer()` — that routes through
+    // libtest's stdout capture, which serializes events behind a mutex and is
+    // slow enough under heavy concurrency to suppress the very race we're
+    // trying to log.
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .with_writer(std::io::stderr)
+        .try_init();
+
+    let db = MvccTestDbNoConn::new_with_random_db();
+    {
+        let conn = db.connect();
+        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT, b BLOB)")
+            .unwrap();
+        conn.execute("CREATE INDEX idx_v ON t(v)").unwrap();
+        // Pre-existing rows so V_old candidates exist before any tx starts.
+        for i in 0..500 {
+            conn.execute(&format!("INSERT INTO t VALUES ({i}, 'v_{i}', NULL)"))
+                .unwrap();
+        }
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+        conn.close().unwrap();
+    }
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let mismatch = Arc::new(AtomicBool::new(false));
+    let reader_iters = Arc::new(AtomicU64::new(0));
+    let reader_samples = Arc::new(AtomicU64::new(0));
+    let sp_iters = Arc::new(AtomicU64::new(0));
+    let writer_iters = Arc::new(AtomicU64::new(0));
+    let ckpt_iters = Arc::new(AtomicU64::new(0));
+    let ddl_iters = Arc::new(AtomicU64::new(0));
+    let next_id = Arc::new(AtomicU64::new(10_000_000));
+
+    let mismatch_first = Arc::new(AtomicI64::new(0));
+    let mismatch_second = Arc::new(AtomicI64::new(0));
+    let mismatch_idx_a = Arc::new(AtomicU64::new(0));
+    let mismatch_idx_b = Arc::new(AtomicU64::new(0));
+
+    let duration = Duration::from_secs(
+        std::env::var("REPRO_DURATION_SECS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(30),
+    );
+    let reader_ops: usize = std::env::var("REPRO_READER_OPS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(8);
+
+    let enable_sp = std::env::var("REPRO_SP")
+        .map(|s| s != "0")
+        .unwrap_or(true);
+    let enable_writer = std::env::var("REPRO_WRITER")
+        .map(|s| s != "0")
+        .unwrap_or(true);
+    let enable_ckpt = std::env::var("REPRO_CKPT")
+        .map(|s| s != "0")
+        .unwrap_or(true);
+    let enable_ddl = std::env::var("REPRO_DDL")
+        .map(|s| s != "0")
+        .unwrap_or(false);
+
+    // --- Reader: snapshot-stability assertion ---
+    let reader = {
+        let db_arc = db.get_db();
+        let stop = stop.clone();
+        let mismatch = mismatch.clone();
+        let reader_iters = reader_iters.clone();
+        let reader_samples = reader_samples.clone();
+        let mismatch_first = mismatch_first.clone();
+        let mismatch_second = mismatch_second.clone();
+        let mismatch_idx_a = mismatch_idx_a.clone();
+        let mismatch_idx_b = mismatch_idx_b.clone();
+        std::thread::spawn(move || {
+            let conn = db_arc.connect().unwrap();
+            while !stop.load(Ordering::Relaxed) && !mismatch.load(Ordering::Relaxed) {
+                if conn.execute("BEGIN CONCURRENT").is_err() {
+                    std::thread::yield_now();
+                    continue;
+                }
+                let mut samples: Vec<i64> = Vec::with_capacity(reader_ops);
+                for _ in 0..reader_ops {
+                    let mut stmt = conn.prepare("SELECT count(*) FROM t").unwrap();
+                    let rows = stmt.run_collect_rows().unwrap();
+                    let c = rows[0][0].as_int().unwrap();
+                    samples.push(c);
+                    reader_samples.fetch_add(1, Ordering::Relaxed);
+                }
+                // All samples within one snapshot must be equal.
+                if let Some((i, &c)) = samples
+                    .iter()
+                    .enumerate()
+                    .find(|(_, &c)| c != samples[0])
+                {
+                    mismatch_first.store(samples[0], Ordering::Relaxed);
+                    mismatch_second.store(c, Ordering::Relaxed);
+                    mismatch_idx_a.store(0, Ordering::Relaxed);
+                    mismatch_idx_b.store(i as u64, Ordering::Relaxed);
+                    mismatch.store(true, Ordering::Relaxed);
+                    let _ = conn.execute("ROLLBACK");
+                    return;
+                }
+                let _ = conn.execute("COMMIT");
+                reader_iters.fetch_add(1, Ordering::Relaxed);
+            }
+        })
+    };
+
+    // --- Savepoint-rollback driver: tombstones pre-existing rows inside a
+    //     savepoint, then rolls back, restoring V_old.end = None. ---
+    let sp_thread = enable_sp.then(|| {
+        let db_arc = db.get_db();
+        let stop = stop.clone();
+        let mismatch = mismatch.clone();
+        let sp_iters = sp_iters.clone();
+        let next_id = next_id.clone();
+        std::thread::spawn(move || {
+            let conn = db_arc.connect().unwrap();
+            let mut rng = ChaCha8Rng::seed_from_u64(0xCAFEF00D);
+            while !stop.load(Ordering::Relaxed) && !mismatch.load(Ordering::Relaxed) {
+                if conn.execute("BEGIN CONCURRENT").is_err() {
+                    std::thread::yield_now();
+                    continue;
+                }
+                let depth = 2 + (rng.random::<u8>() % 3) as usize;
+                let mut sps = Vec::with_capacity(depth);
+                let mut aborted = false;
+                'sp: for i in 0..depth {
+                    let name = format!("sp_{i}_{}", rng.random::<u32>() % 100_000);
+                    if conn.execute(&format!("SAVEPOINT {name}")).is_err() {
+                        aborted = true;
+                        break 'sp;
+                    }
+                    sps.push(name);
+                    let muts = 1 + (rng.random::<u8>() % 4) as u64;
+                    for _ in 0..muts {
+                        let op = rng.random::<u8>() % 3;
+                        let sql = if op == 0 {
+                            // Tombstone a pre-existing baseline row inside SP.
+                            let target = (rng.random::<u32>() % 500) as i64;
+                            format!("DELETE FROM t WHERE id = {target}")
+                        } else {
+                            let id =
+                                next_id.fetch_add(1, Ordering::Relaxed) as i64;
+                            format!("INSERT INTO t VALUES ({id}, 'sp_{id}', NULL)")
+                        };
+                        match conn.execute(&sql) {
+                            Ok(_) => {}
+                            Err(LimboError::Constraint(_)) => {}
+                            Err(LimboError::WriteWriteConflict)
+                            | Err(LimboError::Busy)
+                            | Err(LimboError::TxTerminated) => {
+                                aborted = true;
+                                break 'sp;
+                            }
+                            Err(e) => panic!("sp mutation failed: {e:?}"),
+                        }
+                    }
+                }
+                if aborted {
+                    let _ = conn.execute("ROLLBACK");
+                    continue;
+                }
+                let rb = (rng.random::<u8>() as usize) % depth;
+                let target = sps[rb].clone();
+                let _ = conn.execute(&format!("ROLLBACK TO {target}"));
+                let _ = conn.execute(&format!("RELEASE {target}"));
+                let _ = conn.execute("COMMIT");
+                sp_iters.fetch_add(1, Ordering::Relaxed);
+            }
+        })
+    });
+
+    // --- Independent committed writer: drives ckpt_max + GC. ---
+    let writer_thread = enable_writer.then(|| {
+        let db_arc = db.get_db();
+        let stop = stop.clone();
+        let mismatch = mismatch.clone();
+        let writer_iters = writer_iters.clone();
+        let next_id = next_id.clone();
+        std::thread::spawn(move || {
+            let conn = db_arc.connect().unwrap();
+            let mut rng = ChaCha8Rng::seed_from_u64(0xDEADBEEF);
+            while !stop.load(Ordering::Relaxed) && !mismatch.load(Ordering::Relaxed) {
+                if conn.execute("BEGIN CONCURRENT").is_err() {
+                    std::thread::yield_now();
+                    continue;
+                }
+                let id = next_id.fetch_add(1, Ordering::Relaxed) as i64;
+                let sql = if rng.random::<u8>() & 3 == 0 {
+                    let target = (rng.random::<u32>() % 500) as i64;
+                    format!("DELETE FROM t WHERE id = {target}")
+                } else {
+                    format!("INSERT INTO t VALUES ({id}, 'w_{id}', NULL)")
+                };
+                if conn.execute(&sql).is_err() {
+                    let _ = conn.execute("ROLLBACK");
+                    continue;
+                }
+                if conn.execute("COMMIT").is_ok() {
+                    writer_iters.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+        })
+    });
+
+    // --- Checkpoint thread: drives drop_unused_row_versions. ---
+    let ckpt_thread = enable_ckpt.then(|| {
+        let db_arc = db.get_db();
+        let stop = stop.clone();
+        let mismatch = mismatch.clone();
+        let ckpt_iters = ckpt_iters.clone();
+        std::thread::spawn(move || {
+            let conn = db_arc.connect().unwrap();
+            let modes = ["PASSIVE", "FULL", "RESTART", "TRUNCATE"];
+            let mut idx = 0usize;
+            while !stop.load(Ordering::Relaxed) && !mismatch.load(Ordering::Relaxed) {
+                let _ = conn.execute(&format!(
+                    "PRAGMA wal_checkpoint({})",
+                    modes[idx % modes.len()]
+                ));
+                idx = idx.wrapping_add(1);
+                ckpt_iters.fetch_add(1, Ordering::Relaxed);
+            }
+        })
+    });
+
+    // --- DDL thread: CREATE INDEX / DROP INDEX cycle (default OFF). ---
+    let ddl_thread = enable_ddl.then(|| {
+        let db_arc = db.get_db();
+        let stop = stop.clone();
+        let mismatch = mismatch.clone();
+        let ddl_iters = ddl_iters.clone();
+        std::thread::spawn(move || {
+            let conn = db_arc.connect().unwrap();
+            let mut i = 0u32;
+            while !stop.load(Ordering::Relaxed) && !mismatch.load(Ordering::Relaxed) {
+                let name = format!("idx_dyn_{}", i % 4);
+                let _ = conn.execute(&format!("CREATE INDEX {name} ON t(v)"));
+                let _ = conn.execute(&format!("DROP INDEX {name}"));
+                i = i.wrapping_add(1);
+                ddl_iters.fetch_add(1, Ordering::Relaxed);
+            }
+        })
+    });
+
+    let started = Instant::now();
+    while started.elapsed() < duration && !mismatch.load(Ordering::Relaxed) {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    stop.store(true, Ordering::Relaxed);
+
+    reader.join().unwrap();
+    if let Some(h) = sp_thread {
+        h.join().unwrap();
+    }
+    if let Some(h) = writer_thread {
+        h.join().unwrap();
+    }
+    if let Some(h) = ckpt_thread {
+        h.join().unwrap();
+    }
+    if let Some(h) = ddl_thread {
+        h.join().unwrap();
+    }
+
+    let r = reader_iters.load(Ordering::Relaxed);
+    let rs = reader_samples.load(Ordering::Relaxed);
+    let s = sp_iters.load(Ordering::Relaxed);
+    let w = writer_iters.load(Ordering::Relaxed);
+    let c = ckpt_iters.load(Ordering::Relaxed);
+    let d = ddl_iters.load(Ordering::Relaxed);
+    eprintln!(
+        "reader_iters={r} reader_samples={rs} sp_iters={s} writer_iters={w} ckpt_iters={c} ddl_iters={d} elapsed={:?}",
+        started.elapsed()
+    );
+
+    if mismatch.load(Ordering::Relaxed) {
+        let a = mismatch_first.load(Ordering::Relaxed);
+        let b = mismatch_second.load(Ordering::Relaxed);
+        let ia = mismatch_idx_a.load(Ordering::Relaxed);
+        let ib = mismatch_idx_b.load(Ordering::Relaxed);
+        panic!(
+            "snapshot count drifted within a single BEGIN CONCURRENT: \
+             samples[{ia}]={a} samples[{ib}]={b} \
+             (reader_iters={r}, sp_iters={s}, writer_iters={w}, ckpt_iters={c}, ddl_iters={d})"
+        );
+    }
+    assert!(rs > 0, "reader made no progress");
+}
