@@ -3338,13 +3338,14 @@ impl Pager {
 
                             let wal_pages: Vec<PageRef> = pages
                                 .iter()
-                                .map(|p| {
+                                .map(|p| -> Result<PageRef> {
+                                    self.subjournal_page_if_required(p)?;
                                     // Set write_pending on all pages before WAL write so callback can
                                     // detect mid-write modifications.
                                     p.set_write_pending();
-                                    p.to_page()
+                                    Ok(p.to_page())
                                 })
-                                .collect();
+                                .collect::<Result<Vec<_>>>()?;
                             let c = wal.append_frames_vectored(wal_pages, page_sz)?;
 
                             if c.succeeded() {
