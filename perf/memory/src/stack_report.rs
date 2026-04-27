@@ -1,5 +1,4 @@
 use std::{
-    collections::BTreeMap,
     fs,
     path::PathBuf,
     sync::{Arc, Mutex},
@@ -31,7 +30,7 @@ struct Args {
     #[arg(long = "sql", short = 's')]
     sql: PathBuf,
 
-    /// Maximum number of lowest-stack labels to print in human output.
+    /// Maximum number of heaviest span samples to print per statement in human output.
     #[arg(long = "top", default_value = "40")]
     top: usize,
 
@@ -45,6 +44,19 @@ struct StackCollector {
     samples: Mutex<Vec<StackSample>>,
 }
 
+impl StackCollector {
+    fn sample_count(&self) -> usize {
+        self.samples
+            .lock()
+            .expect("stack collector mutex poisoned")
+            .len()
+    }
+
+    fn samples_from(&self, start: usize) -> Vec<StackSample> {
+        self.samples.lock().expect("stack collector mutex poisoned")[start..].to_vec()
+    }
+}
+
 #[derive(Debug, Clone, Serialize)]
 struct StackSample {
     label: String,
@@ -53,13 +65,23 @@ struct StackSample {
 }
 
 #[derive(Debug, Clone, Serialize)]
-struct StackSummary {
+struct StatementReport {
+    index: usize,
+    sql: String,
+    baseline_remaining_stack: usize,
+    min_remaining_stack: usize,
+    stack_used: usize,
+    samples: usize,
+    spans: Vec<SpanReport>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct SpanReport {
+    trace_sequence: usize,
     label: String,
     detail: Option<String>,
-    count: usize,
-    min_remaining_stack: usize,
-    max_remaining_stack: usize,
-    avg_remaining_stack: usize,
+    remaining_stack: usize,
+    stack_used: usize,
 }
 
 #[derive(Debug, Serialize)]
@@ -67,7 +89,7 @@ struct StackReport {
     sql: String,
     db: String,
     samples: usize,
-    summaries: Vec<StackSummary>,
+    statements: Vec<StatementReport>,
 }
 
 #[derive(Clone)]
@@ -174,25 +196,25 @@ async fn main() -> Result<()> {
 
     let sql = read_sql(&args.sql)?;
 
-    let db = turso::Builder::new_local(":memory")
+    let db = turso::Builder::new_local(":memory:")
         .experimental_generated_columns(true)
         .experimental_custom_types(true)
         .experimental_materialized_views(true)
         .build()
         .await?;
     let conn = db.connect()?;
-    execute_sql_payload(&conn, &sql).await?;
-
-    let samples = collector
-        .samples
-        .lock()
-        .expect("stack collector mutex poisoned")
-        .clone();
+    let mut statements = execute_sql_payload(&conn, &sql, Arc::clone(&collector)).await?;
+    statements.sort_by(|a, b| {
+        b.stack_used
+            .cmp(&a.stack_used)
+            .then_with(|| a.index.cmp(&b.index))
+    });
+    let samples = statements.iter().map(|statement| statement.samples).sum();
     let report = StackReport {
         sql: args.sql.display().to_string(),
-        db: "memory".to_string(),
-        samples: samples.len(),
-        summaries: summarize(samples),
+        db: ":memory:".to_string(),
+        samples,
+        statements,
     };
 
     match args.format {
@@ -212,13 +234,22 @@ fn read_sql(path: &PathBuf) -> Result<String> {
     }
 }
 
-async fn execute_sql_payload(conn: &turso::Connection, sql: &str) -> Result<()> {
-    for statement in split_sql_statements(sql)? {
+async fn execute_sql_payload(
+    conn: &turso::Connection,
+    sql: &str,
+    collector: Arc<StackCollector>,
+) -> Result<Vec<StatementReport>> {
+    let mut reports = Vec::new();
+
+    for (index, statement) in split_sql_statements(sql)?.into_iter().enumerate() {
         let statement = statement.trim();
         if statement.is_empty() {
             continue;
         }
 
+        let start_sample = collector.sample_count();
+        let baseline_remaining_stack =
+            stacker::remaining_stack().context("failed to read baseline remaining stack")?;
         let mut stmt = conn
             .prepare(statement)
             .await
@@ -239,8 +270,16 @@ async fn execute_sql_payload(conn: &turso::Connection, sql: &str) -> Result<()> 
                 .is_some()
             {}
         }
+
+        let samples = collector.samples_from(start_sample);
+        reports.push(build_statement_report(
+            index + 1,
+            statement,
+            baseline_remaining_stack,
+            samples,
+        ));
     }
-    Ok(())
+    Ok(reports)
 }
 
 fn split_sql_statements(sql: &str) -> Result<Vec<&str>> {
@@ -258,37 +297,43 @@ fn split_sql_statements(sql: &str) -> Result<Vec<&str>> {
     Ok(statements)
 }
 
-fn summarize(samples: Vec<StackSample>) -> Vec<StackSummary> {
-    let mut grouped: BTreeMap<(String, Option<String>), (usize, usize, usize, usize)> =
-        BTreeMap::new();
-
-    for sample in samples {
-        let key = (sample.label, sample.detail);
-        let entry = grouped.entry(key).or_insert((0, usize::MAX, 0, 0));
-        entry.0 += 1;
-        entry.1 = entry.1.min(sample.remaining_stack);
-        entry.2 = entry.2.max(sample.remaining_stack);
-        entry.3 += sample.remaining_stack;
-    }
-
-    let mut summaries = grouped
-        .into_iter()
-        .map(|((label, detail), (count, min, max, sum))| StackSummary {
-            label,
-            detail,
-            count,
-            min_remaining_stack: min,
-            max_remaining_stack: max,
-            avg_remaining_stack: sum / count,
+fn build_statement_report(
+    index: usize,
+    sql: &str,
+    baseline_remaining_stack: usize,
+    samples: Vec<StackSample>,
+) -> StatementReport {
+    let min_remaining_stack = samples
+        .iter()
+        .map(|sample| sample.remaining_stack)
+        .min()
+        .unwrap_or(baseline_remaining_stack);
+    let mut spans = samples
+        .iter()
+        .enumerate()
+        .map(|(trace_sequence, sample)| SpanReport {
+            trace_sequence: trace_sequence + 1,
+            label: sample.label.clone(),
+            detail: sample.detail.clone(),
+            remaining_stack: sample.remaining_stack,
+            stack_used: baseline_remaining_stack.saturating_sub(sample.remaining_stack),
         })
         .collect::<Vec<_>>();
-    summaries.sort_by(|a, b| {
-        a.min_remaining_stack
-            .cmp(&b.min_remaining_stack)
-            .then_with(|| a.label.cmp(&b.label))
-            .then_with(|| a.detail.cmp(&b.detail))
+    spans.sort_by(|a, b| {
+        b.stack_used
+            .cmp(&a.stack_used)
+            .then_with(|| a.trace_sequence.cmp(&b.trace_sequence))
     });
-    summaries
+
+    StatementReport {
+        index,
+        sql: single_line_sql(sql),
+        baseline_remaining_stack,
+        min_remaining_stack,
+        stack_used: baseline_remaining_stack.saturating_sub(min_remaining_stack),
+        samples: spans.len(),
+        spans,
+    }
 }
 
 fn print_human(report: &StackReport, top: usize) {
@@ -297,39 +342,80 @@ fn print_human(report: &StackReport, top: usize) {
     println!("DB:      {}", report.db);
     println!("Samples: {}", report.samples);
     println!();
-    println!(
-        "{:>8} {:>12} {:>12} {:>12}  label",
-        "count", "min", "max", "avg"
-    );
-    for summary in report.summaries.iter().take(top) {
-        let label = match &summary.detail {
-            Some(detail) => format!("{} detail={detail}", summary.label),
-            None => summary.label.clone(),
-        };
+
+    for statement in &report.statements {
         println!(
-            "{:>8} {:>12} {:>12} {:>12}  {}",
-            summary.count,
-            summary.min_remaining_stack,
-            summary.max_remaining_stack,
-            summary.avg_remaining_stack,
-            label
+            "statement #{:<4} stack_used={:<8} baseline={:<10} min_remaining={:<10} samples={:<6} {}",
+            statement.index,
+            statement.stack_used,
+            statement.baseline_remaining_stack,
+            statement.min_remaining_stack,
+            statement.samples,
+            statement.sql
         );
+        if statement.spans.is_empty() {
+            println!("  no stack samples");
+            continue;
+        }
+        println!(
+            "  {:>5} {:>12} {:>12}  span",
+            "seq", "stack_used", "remaining"
+        );
+        for span in statement.spans.iter().take(top) {
+            let label = match &span.detail {
+                Some(detail) => format!("{} detail={detail}", span.label),
+                None => span.label.clone(),
+            };
+            println!(
+                "  {:>5} {:>12} {:>12}  {}",
+                span.trace_sequence, span.stack_used, span.remaining_stack, label
+            );
+        }
+        if statement.spans.len() > top {
+            println!("  ... {} more spans", statement.spans.len() - top);
+        }
+        println!();
     }
 }
 
 fn print_csv(report: &StackReport) {
-    println!("label,detail,count,min_remaining_stack,max_remaining_stack,avg_remaining_stack");
-    for summary in &report.summaries {
-        println!(
-            "{},{},{},{},{},{}",
-            csv_escape(&summary.label),
-            csv_escape(summary.detail.as_deref().unwrap_or("")),
-            summary.count,
-            summary.min_remaining_stack,
-            summary.max_remaining_stack,
-            summary.avg_remaining_stack
-        );
+    println!(
+        "statement_index,statement_sql,statement_stack_used,statement_baseline_remaining_stack,statement_min_remaining_stack,statement_samples,span_trace_sequence,span_label,span_detail,span_stack_used,span_remaining_stack"
+    );
+    for statement in &report.statements {
+        if statement.spans.is_empty() {
+            println!(
+                "{},{},{},{},{},{},,,,,",
+                statement.index,
+                csv_escape(&statement.sql),
+                statement.stack_used,
+                statement.baseline_remaining_stack,
+                statement.min_remaining_stack,
+                statement.samples
+            );
+            continue;
+        }
+        for span in &statement.spans {
+            println!(
+                "{},{},{},{},{},{},{},{},{},{},{}",
+                statement.index,
+                csv_escape(&statement.sql),
+                statement.stack_used,
+                statement.baseline_remaining_stack,
+                statement.min_remaining_stack,
+                statement.samples,
+                span.trace_sequence,
+                csv_escape(&span.label),
+                csv_escape(span.detail.as_deref().unwrap_or("")),
+                span.stack_used,
+                span.remaining_stack
+            );
+        }
     }
+}
+
+fn single_line_sql(sql: &str) -> String {
+    sql.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 fn unquote_debug_string(value: &str) -> String {
