@@ -7,11 +7,51 @@ description: How to benchmark and analyze memory usage in Turso using the memory
 
 The `perf/memory` crate benchmarks memory usage of SQL workloads under WAL and MVCC journal modes. It uses `dhat` as the global allocator to track every heap allocation, and `memory-stats` for process-level RSS snapshots.
 
+It also contains a `stack-report` helper binary for stack-usage investigations.
+That binary runs a SQL payload with the `stacker` feature enabled and captures
+`turso_stack` tracing events in-process, aggregating structured tracing fields
+instead of parsing stderr log text.
+
 ## Location
 
 - Benchmark crate: `perf/memory/`
 - Analysis script: `perf/memory/analyze-dhat.py`
 - dhat output: `dhat-heap.json` (written to CWD after each run)
+
+## Running Stack Reports
+
+Use this when investigating stack usage from SQL translation/execution probes.
+Run stack reports in release mode with `--features stacker` when comparing
+against server logs or CI stack-size output. Debug builds can materially
+overstate stack deltas and should only be used for quick local iteration.
+
+```bash
+cargo run --release -q -p memory-benchmark --features stacker --bin stack-report -- \
+  --sql path/to/payload.sql \
+  --top 40
+```
+
+Useful options:
+
+```bash
+--sql FILE|-             # SQL payload, or stdin with -
+--format human|json|csv  # output format
+--top N                  # human output row limit
+```
+
+The report is sorted by lowest `remaining_stack`, so the first rows are the
+deepest observed stack points. JSON and CSV formats are deterministic and
+intended for comparing runs.
+
+`stack-report` splits payloads with `turso_parser::parser::Parser::next_cmd()`.
+It then executes statements with no result columns, and queries and drains
+row-producing statements. Do not change binding `execute_batch` semantics for
+stack reports.
+
+The runner currently uses a fixed in-memory database and enables generated
+columns, custom types, and materialized views internally. There are no stack
+report CLI flags for selecting the database path or toggling those experimental
+features.
 
 ## Running Benchmarks
 
