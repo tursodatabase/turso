@@ -5888,6 +5888,7 @@ pub fn bind_and_rewrite_expr<'a>(
         &mut |expr: &mut ast::Expr| -> Result<WalkControl> {
             match expr {
                 Expr::Id(id) => {
+                    let _stack = crate::stack::trace_scope("expr:bind_id");
                     let Some(referenced_tables) = &mut referenced_tables else {
                         if binding_behavior == BindingBehavior::AllowUnboundIdentifiers {
                             return Ok(WalkControl::Continue);
@@ -6046,6 +6047,7 @@ pub fn bind_and_rewrite_expr<'a>(
                     }
                 }
                 Expr::Qualified(tbl, id) => {
+                    let _stack = crate::stack::trace_scope("expr:bind_qualified");
                     // Resolve a `<tbl>.<id>` reference.
                     //
                     // Two-stage lookup with shadowing:
@@ -6271,6 +6273,7 @@ pub fn bind_and_rewrite_expr<'a>(
                     return Ok(WalkControl::Continue);
                 }
                 Expr::DoublyQualified(db_name, tbl_name, col_name) => {
+                    let _stack = crate::stack::trace_scope("expr:bind_doubly_qualified");
                     // Clone the names upfront so we can reassign *expr later
                     // without lifetime conflicts.
                     let db_name_str = db_name.as_str().to_string();
