@@ -172,6 +172,8 @@ export class Database {
       // Remote encryption options (key is passed to sync engine for HTTP headers)
       remoteEncryptionKey: this._opts.remoteEncryption?.key,
       remoteEncryptionCipher: this._opts.remoteEncryption?.cipher,
+      pushOperationsThreshold: this._opts.pushOperationsThreshold,
+      pullBytesThreshold: this._opts.pullBytesThreshold,
     };
 
     // Add partial sync options if present

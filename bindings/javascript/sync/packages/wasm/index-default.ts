@@ -1,6 +1,6 @@
 import { isWebWorker, setupWebWorker, setupMainThread } from "@tursodatabase/database-wasm-common";
 
-export let MainWorker = null;
+export let MainWorker: any = null;
 
 const __wasmUrl = new URL('./sync.wasm32-wasi.wasm', import.meta.url).href;
 const __wasmFile = await fetch(__wasmUrl).then((res) => res.arrayBuffer())

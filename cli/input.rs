@@ -194,7 +194,7 @@ pub fn get_io(db_location: DbLocation, io_choice: &str) -> anyhow::Result<Arc<dy
 
 #[cfg(all(test, target_os = "windows", feature = "experimental_win_iocp"))]
 mod tests {
-    use super::{DbLocation, get_io};
+    use super::{get_io, DbLocation};
 
     #[test]
     fn experimental_win_iocp_backend_is_available_for_path_databases() {

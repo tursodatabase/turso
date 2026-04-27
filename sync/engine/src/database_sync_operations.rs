@@ -936,6 +936,94 @@ pub async fn push_logical_changes<IO: SyncEngineIo, Ctx>(
         ignore_schema_changes: false,
         ..Default::default()
     };
+
+    let threshold = opts.push_operations_threshold.filter(|t| *t > 0);
+    let mut changes = source.iterate_changes(iterate_opts)?;
+    let mut batch: Vec<DatabaseTapeRowChange> = Vec::new();
+    let mut total_rows_changed: i64 = 0;
+
+    let mut next_operation = changes.next(ctx.coro).await?;
+    while let Some(operation) = next_operation.take() {
+        next_operation = changes.next(ctx.coro).await?;
+
+        if next_operation.is_none() {
+            assert!(
+                matches!(operation, DatabaseTapeOperation::Commit),
+                "last operation in the changes stream must be COMMIT"
+            );
+        }
+
+        match operation {
+            DatabaseTapeOperation::StmtReplay(_) => {
+                panic!("changes iterator must not use StmtReplay option")
+            }
+            DatabaseTapeOperation::RowChange(change) => {
+                if change.table_name == TURSO_SYNC_TABLE_NAME {
+                    continue;
+                }
+                if opts.tables_ignore.iter().any(|x| &change.table_name == x) {
+                    continue;
+                }
+                batch.push(change);
+            }
+            DatabaseTapeOperation::Commit => {
+                // push batch if we reach threshold OR if this is last operation
+                let must_push =
+                    threshold.is_some_and(|t| batch.len() >= t) || next_operation.is_none();
+                if !must_push {
+                    continue;
+                }
+                let (rows_changed, next_change_id) = send_push_batch(
+                    ctx,
+                    &generator,
+                    opts,
+                    &batch,
+                    client_id,
+                    source_pull_gen,
+                    last_change_id,
+                )
+                .await?;
+                total_rows_changed += rows_changed;
+                last_change_id = Some(next_change_id);
+                batch.clear();
+            }
+        }
+    }
+
+    assert!(
+        batch.is_empty(),
+        "batch must be empty in the end so all operations are send to remote"
+    );
+
+    tracing::info!(
+        "push_logical_changes: rows_changed={total_rows_changed}, last_change_id={:?}",
+        last_change_id
+    );
+    Ok((source_pull_gen, last_change_id.unwrap_or(0)))
+}
+
+/// Build and send a single push batch over HTTP. The caller owns the
+/// per-batch slice of changes; transformations (if enabled) run lazily here so
+/// the user-defined transform sees one batch's worth of rows at a time —
+/// matching the streaming semantics of the outer loop.
+///
+/// Returns the count of rows that actually produced SQL steps
+/// (post-transformation, excluding `Skip`).
+async fn send_push_batch<IO: SyncEngineIo, Ctx>(
+    ctx: &SyncOperationCtx<'_, IO, Ctx>,
+    generator: &DatabaseReplayGenerator,
+    opts: &DatabaseSyncEngineOpts,
+    batch_changes: &[DatabaseTapeRowChange],
+    client_id: &str,
+    source_pull_gen: i64,
+    mut last_change_id: Option<i64>,
+) -> Result<(i64, i64)> {
+    let mut transformed = if opts.use_transform {
+        Some(apply_transformation(ctx, batch_changes, generator).await?)
+    } else {
+        None
+    };
+
     let step = |query, args| BatchStep {
         stmt: Stmt {
             sql: Some(query),
@@ -949,6 +1037,7 @@ pub async fn push_logical_changes<IO: SyncEngineIo, Ctx>(
             cond: Box::new(BatchCond::IsAutocommit {}),
         }),
     };
+
     let mut add_column_step_indices = std::collections::HashSet::new();
     let mut sql_over_http_requests = vec![
         BatchStep {
@@ -964,49 +1053,18 @@ pub async fn push_logical_changes<IO: SyncEngineIo, Ctx>(
         },
         step(TURSO_SYNC_CREATE_TABLE.to_string(), Vec::new()),
     ];
-    let mut rows_changed = 0;
-    let mut changes = source.iterate_changes(iterate_opts)?;
-    let mut local_changes = Vec::new();
-    while let Some(operation) = changes.next(ctx.coro).await? {
-        match operation {
-            DatabaseTapeOperation::StmtReplay(_) => {
-                panic!("changes iterator must not use StmtReplay option")
-            }
-            DatabaseTapeOperation::RowChange(change) => {
-                if change.table_name == TURSO_SYNC_TABLE_NAME {
-                    continue;
-                }
-                let ignore = &opts.tables_ignore;
-                if ignore.iter().any(|x| &change.table_name == x) {
-                    continue;
-                }
-                local_changes.push(change);
-            }
-            DatabaseTapeOperation::Commit => continue,
-        }
-    }
 
-    let mut transformed = if opts.use_transform {
-        Some(apply_transformation(ctx, &local_changes, &generator).await?)
-    } else {
-        None
-    };
-
-    tracing::debug!("local_changes: {:?}", local_changes);
-
-    for (i, change) in local_changes.into_iter().enumerate() {
+    let mut rows_changed: i64 = 0;
+    for (i, change) in batch_changes.iter().enumerate() {
         let change_id = change.change_id;
-        let operation = if let Some(transformed) = &mut transformed {
-            match std::mem::replace(&mut transformed[i], DatabaseRowTransformResult::Skip) {
-                DatabaseRowTransformResult::Keep => DatabaseTapeOperation::RowChange(change),
-                DatabaseRowTransformResult::Skip => continue,
-                DatabaseRowTransformResult::Rewrite(replay) => {
-                    DatabaseTapeOperation::StmtReplay(replay)
-                }
-            }
+        let transform_result = if let Some(transformed) = transformed.as_mut() {
+            std::mem::replace(&mut transformed[i], DatabaseRowTransformResult::Skip)
         } else {
-            DatabaseTapeOperation::RowChange(change)
+            DatabaseRowTransformResult::Keep
         };
+        if let DatabaseRowTransformResult::Skip = transform_result {
+            continue;
+        }
         tracing::debug!(
             "change_id: {}, last_change_id: {:?}",
             change_id,
@@ -1026,26 +1084,24 @@ pub async fn push_logical_changes<IO: SyncEngineIo, Ctx>(
             );
         }
         last_change_id = Some(change_id);
-        match operation {
-            DatabaseTapeOperation::Commit => {
-                panic!("Commit operation must not be emited at this stage")
-            }
-            DatabaseTapeOperation::StmtReplay(replay) => {
+        match transform_result {
+            DatabaseRowTransformResult::Skip => panic!("Skip must be handled earlier"),
+            DatabaseRowTransformResult::Rewrite(replay) => {
                 sql_over_http_requests.push(step(replay.sql, convert_to_args(replay.values)))
             }
-            DatabaseTapeOperation::RowChange(change) => {
+            DatabaseRowTransformResult::Keep => {
                 let replay_info = generator.replay_info(ctx.coro, &change).await?;
                 // for now we try to support DDL statements which "extends" the schema (CREATE INDEX, CREATE TABLE, ALTER TABLE ADD COLUMN) and they have `IF NOT EXISTS` semantic
                 // as ALTER TABLE has no such syntax - we ignore error for such statements from remote for now
                 let is_alter_add_column =
                     replay_info.is_ddl_replay && is_alter_table_add_column(&replay_info.query);
-                match change.change {
+                match &change.change {
                     DatabaseTapeRowChangeType::Delete { before } => {
                         let values = generator.replay_values(
                             &replay_info,
                             replay_info.change_type,
                             change.id,
-                            before,
+                            before.clone(),
                             None,
                         );
                         sql_over_http_requests
@@ -1056,7 +1112,7 @@ pub async fn push_logical_changes<IO: SyncEngineIo, Ctx>(
                             &replay_info,
                             replay_info.change_type,
                             change.id,
-                            after,
+                            after.clone(),
                             None,
                         );
                         sql_over_http_requests
@@ -1071,8 +1127,8 @@ pub async fn push_logical_changes<IO: SyncEngineIo, Ctx>(
                             &replay_info,
                             replay_info.change_type,
                             change.id,
-                            after,
-                            Some(updates),
+                            after.clone(),
+                            Some(updates.clone()),
                         );
                         sql_over_http_requests
                             .push(step(replay_info.query.clone(), convert_to_args(values)));
@@ -1086,7 +1142,7 @@ pub async fn push_logical_changes<IO: SyncEngineIo, Ctx>(
                             &replay_info,
                             replay_info.change_type,
                             change.id,
-                            after,
+                            after.clone(),
                             None,
                         );
                         sql_over_http_requests
@@ -1135,13 +1191,12 @@ pub async fn push_logical_changes<IO: SyncEngineIo, Ctx>(
     };
 
     let _ = sql_execute_http(ctx, replay_hrana_request, &add_column_step_indices).await?;
-    tracing::info!("push_logical_changes: rows_changed={:?}", rows_changed);
-    Ok((source_pull_gen, last_change_id.unwrap_or(0)))
+    Ok((rows_changed, last_change_id.unwrap_or(0)))
 }
 
 pub async fn apply_transformation<IO: SyncEngineIo, Ctx>(
     ctx: &SyncOperationCtx<'_, IO, Ctx>,
-    changes: &Vec<DatabaseTapeRowChange>,
+    changes: &[DatabaseTapeRowChange],
     generator: &DatabaseReplayGenerator,
 ) -> Result<Vec<DatabaseRowTransformResult>> {
     let mut mutations = Vec::new();
@@ -1215,6 +1270,7 @@ pub async fn bootstrap_db_file<IO: SyncEngineIo, Ctx>(
     main_db_path: &str,
     protocol: DatabaseSyncEngineProtocolVersion,
     partial_sync: Option<PartialSyncOpts>,
+    pull_bytes_threshold: Option<usize>,
 ) -> Result<DatabasePullRevision> {
     match protocol {
         DatabaseSyncEngineProtocolVersion::Legacy => {
@@ -1226,54 +1282,42 @@ pub async fn bootstrap_db_file<IO: SyncEngineIo, Ctx>(
             bootstrap_db_file_legacy(ctx, io, main_db_path).await
         }
         DatabaseSyncEngineProtocolVersion::V1 => {
-            bootstrap_db_file_v1(ctx, io, main_db_path, partial_sync).await
+            bootstrap_db_file_v1(ctx, io, main_db_path, partial_sync, pull_bytes_threshold).await
         }
     }
 }
 
-pub async fn bootstrap_db_file_v1<IO: SyncEngineIo, Ctx>(
-    ctx: &SyncOperationCtx<'_, IO, Ctx>,
-    io: &Arc<dyn turso_core::IO>,
-    main_db_path: &str,
-    partial_sync: Option<PartialSyncOpts>,
-) -> Result<DatabasePullRevision> {
-    if let Some(PartialSyncOpts {
-        bootstrap_strategy: None,
-        ..
-    }) = partial_sync
-    {
-        return Err(Error::DatabaseSyncEngineError(
-            "partial sync bootstrap strategy must be set for initialization".to_string(),
-        ));
+/// Serialise a contiguous `[start, end)` page-id range into a RoaringBitmap
+/// blob suitable for `PullUpdatesReqProtoBody::server_pages_selector`.
+fn page_range_bitmap(start_inclusive: u32, end_exclusive: u32) -> Result<Vec<u8>> {
+    let mut bitmap = RoaringBitmap::new();
+    if start_inclusive < end_exclusive {
+        bitmap.insert_range(start_inclusive..end_exclusive);
     }
-    let server_pages_selector = if let Some(PartialSyncOpts {
-        bootstrap_strategy: Some(PartialBootstrapStrategy::Prefix { length }),
-        ..
-    }) = &partial_sync
-    {
-        let mut bitmap = RoaringBitmap::new();
-        bitmap.insert_range(0..(*length / PAGE_SIZE) as u32);
-        let mut bitmap_bytes = Vec::with_capacity(bitmap.serialized_size());
-        bitmap.serialize_into(&mut bitmap_bytes).map_err(|e| {
-            Error::DatabaseSyncEngineError(format!("unable to serialize bootstrap request: {e}"))
-        })?;
-        bitmap_bytes
-    } else {
-        Vec::new()
-    };
-    let server_query_selector = if let Some(PartialSyncOpts {
-        bootstrap_strategy: Some(PartialBootstrapStrategy::Query { query }),
-        ..
-    }) = partial_sync
-    {
-        query
-    } else {
-        String::new()
-    };
+    let mut bytes = Vec::with_capacity(bitmap.serialized_size());
+    bitmap.serialize_into(&mut bytes).map_err(|e| {
+        Error::DatabaseSyncEngineError(format!("unable to serialize bootstrap request: {e}"))
+    })?;
+    Ok(bytes)
+}
 
+/// Send a single `/pull-updates` request and stream every returned page into
+/// `file`. Returns the response header for the caller to inspect (db_size,
+/// server_revision). When `truncate_on_first_response` is set, the file is
+/// resized to `header.db_size * PAGE_SIZE` between reading the header and the
+/// first page — used by the first chunk of a chunked bootstrap.
+#[allow(clippy::too_many_arguments)]
+async fn pull_chunk_into_file<IO: SyncEngineIo, Ctx>(
+    ctx: &SyncOperationCtx<'_, IO, Ctx>,
+    file: &Arc<dyn turso_core::File>,
+    server_revision: &str,
+    server_pages_selector: Vec<u8>,
+    server_query_selector: String,
+    truncate_on_first_response: bool,
+) -> Result<PullUpdatesRespProtoBody> {
     let request = PullUpdatesReqProtoBody {
         encoding: PageUpdatesEncodingReq::Raw as i32,
-        server_revision: String::new(),
+        server_revision: server_revision.to_string(),
         client_revision: String::new(),
         long_poll_timeout_ms: 0,
         server_pages_selector: server_pages_selector.into(),
@@ -1304,23 +1348,19 @@ pub async fn bootstrap_db_file_v1<IO: SyncEngineIo, Ctx>(
             "no header returned in the pull-updates protobuf call".to_string(),
         ));
     };
-    tracing::info!(
-        "bootstrap_db_file(path={}): got header={:?}",
-        main_db_path,
-        header
-    );
-    let file = io.open_file(main_db_path, OpenFlags::Create, false)?;
-    let c = Completion::new_trunc(move |result| {
-        let Ok(rc) = result else {
-            return;
-        };
-        assert!(rc as usize == 0);
-    });
-    let c = file.truncate(header.db_size * PAGE_SIZE as u64, c)?;
-    while !c.succeeded() {
-        ctx.coro.yield_(SyncEngineIoResult::IO).await?;
+    tracing::info!("bootstrap_db_file: got header={:?}", header);
+    if truncate_on_first_response {
+        let c = Completion::new_trunc(move |result| {
+            let Ok(rc) = result else {
+                return;
+            };
+            assert!(rc as usize == 0);
+        });
+        let c = file.truncate(header.db_size * PAGE_SIZE as u64, c)?;
+        while !c.succeeded() {
+            ctx.coro.yield_(SyncEngineIoResult::IO).await?;
+        }
     }
-
     #[allow(clippy::arc_with_non_send_sync)]
     let buffer = Arc::new(Buffer::new_temporary(PAGE_SIZE));
     while let Some(page_data) = wait_proto_message::<Ctx, PageData>(
@@ -1357,6 +1397,99 @@ pub async fn bootstrap_db_file_v1<IO: SyncEngineIo, Ctx>(
             ctx.coro.yield_(SyncEngineIoResult::IO).await?;
         }
     }
+    Ok(header)
+}
+
+pub async fn bootstrap_db_file_v1<IO: SyncEngineIo, Ctx>(
+    ctx: &SyncOperationCtx<'_, IO, Ctx>,
+    io: &Arc<dyn turso_core::IO>,
+    main_db_path: &str,
+    partial_sync: Option<PartialSyncOpts>,
+    pull_bytes_threshold: Option<usize>,
+) -> Result<DatabasePullRevision> {
+    if let Some(PartialSyncOpts {
+        bootstrap_strategy: None,
+        ..
+    }) = partial_sync
+    {
+        return Err(Error::DatabaseSyncEngineError(
+            "partial sync bootstrap strategy must be set for initialization".to_string(),
+        ));
+    }
+    // Predetermined last page id from the partial-sync prefix strategy (if any).
+    let prefix_bootstrap_last_page_id: Option<u32> = if let Some(PartialSyncOpts {
+        bootstrap_strategy: Some(PartialBootstrapStrategy::Prefix { length }),
+        ..
+    }) = &partial_sync
+    {
+        Some((*length / PAGE_SIZE) as u32)
+    } else {
+        None
+    };
+    // Server-side query selector (can't be chunked locally — server picks pages).
+    let server_query_selector: String = if let Some(PartialSyncOpts {
+        bootstrap_strategy: Some(PartialBootstrapStrategy::Query { query }),
+        ..
+    }) = &partial_sync
+    {
+        query.clone()
+    } else {
+        String::new()
+    };
+    let has_query = !server_query_selector.is_empty();
+
+    // Convert the byte threshold into a page-count chunk size. Chunking only
+    // applies when the page set is statically known on the client (i.e. no
+    // query selector).
+    let chunk_pages: Option<u32> = if has_query {
+        None
+    } else {
+        pull_bytes_threshold
+            .filter(|t| *t > 0)
+            .map(|t| (t.div_ceil(PAGE_SIZE)).max(1) as u32)
+    };
+
+    let file = io.open_file(main_db_path, OpenFlags::Create, false)?;
+
+    // First request: covers either [0..min(N, prefix)) when chunking, [0..L)
+    // for a non-chunked prefix bootstrap, or an empty bitmap (server returns
+    // the full DB) for the bare full bootstrap.
+    let first_selector = if let Some(n) = chunk_pages {
+        let upper = prefix_bootstrap_last_page_id.unwrap_or(u32::MAX);
+        page_range_bitmap(0, std::cmp::min(n, upper))?
+    } else if let Some(l) = prefix_bootstrap_last_page_id {
+        page_range_bitmap(0, l)?
+    } else {
+        Vec::new()
+    };
+    let header =
+        pull_chunk_into_file(ctx, &file, "", first_selector, server_query_selector, true).await?;
+
+    // Subsequent chunks (if any). Pin every chunk to the same `server_revision`
+    // so the page set stays consistent across HTTP round-trips, and never go
+    // past the predetermined upper bound (prefix length or db_size).
+    if let Some(n) = chunk_pages {
+        let last_page_id: u64 = match prefix_bootstrap_last_page_id {
+            Some(l) => std::cmp::min(l as u64, header.db_size),
+            None => header.db_size,
+        };
+        let mut start = n as u64;
+        while start < last_page_id {
+            let end = std::cmp::min(start + n as u64, last_page_id);
+            let selector = page_range_bitmap(start as u32, end as u32)?;
+            pull_chunk_into_file(
+                ctx,
+                &file,
+                &header.server_revision,
+                selector,
+                String::new(),
+                false,
+            )
+            .await?;
+            start = end;
+        }
+    }
+
     Ok(DatabasePullRevision::V1 {
         revision: header.server_revision,
     })

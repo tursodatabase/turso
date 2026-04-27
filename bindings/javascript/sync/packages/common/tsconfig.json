@@ -11,6 +11,9 @@
       "es2020",
       "dom"
     ],
+    "types": [
+      "node"
+    ]
   },
   "include": [
     "*"

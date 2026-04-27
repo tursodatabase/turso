@@ -41,10 +41,10 @@ export declare class Database {
    *
    * # Returns
    *
-   * A `Statement` instance.
+   * A promise resolving to a `Statement` instance.
    */
-  prepare(sql: string): Statement
-  executor(sql: string): BatchExecutor
+  prepare(sql: string): Promise<Statement>
+  executor(sql: string, queryOptions?: QueryOptions | undefined | null): BatchExecutor
   /**
    * Returns the rowid of the last row inserted.
    *
@@ -96,6 +96,7 @@ export declare class Database {
 /** A prepared statement. */
 export declare class Statement {
   reset(): void
+  setQueryTimeout(queryOptions?: QueryOptions | undefined | null): void
   /** Returns the number of parameters in the statement. */
   parameterCount(): number
   /**
@@ -136,7 +137,7 @@ export declare class Statement {
    */
   safeIntegers(toggle?: boolean | undefined | null): void
   /** Get column information for the statement */
-  columns(): Promise<any>
+  columns(): Promise<TableColumn[]>
   /** Finalizes the statement. */
   finalize(): void
 }
@@ -148,6 +149,7 @@ export declare class Statement {
 export interface DatabaseOpts {
   readonly?: boolean
   timeout?: number
+  defaultQueryTimeout?: number
   fileMustExist?: boolean
   tracing?: string
   /** Experimental features to enable */
@@ -173,6 +175,18 @@ export interface EncryptionOpts {
   cipher: EncryptionCipher
   /** The hex-encoded encryption key */
   hexkey: string
+}
+
+export interface QueryOptions {
+  queryTimeout?: number
+}
+
+export interface TableColumn {
+  name: string
+  type?: string | null
+  column?: undefined
+  table?: undefined
+  database?: undefined
 }
 export declare class GeneratorHolder {
   resumeSync(error?: string | undefined | null): GeneratorResponse
@@ -284,6 +298,20 @@ export interface SyncEngineOpts {
    */
   remoteEncryptionKey?: string
   partialSyncOpts?: JsPartialSyncOpts
+  /**
+   * Optional cap on the number of CDC operations packed into a single push
+   * batch. When set, push splits on transaction boundaries once the batch
+   * has accumulated at least this many operations. `None` (default) sends
+   * the entire change set in one batch.
+   */
+  pushOperationsThreshold?: number
+  /**
+   * Optional hint, in bytes, that splits the bootstrap download into
+   * multiple `/pull-updates` HTTP requests of >= this many bytes each.
+   * `None` (default) bootstraps in a single round-trip. No-op when
+   * partial-sync uses the query bootstrap strategy.
+   */
+  pullBytesThreshold?: number
 }
 
 export declare const enum SyncEngineProtocolVersion {

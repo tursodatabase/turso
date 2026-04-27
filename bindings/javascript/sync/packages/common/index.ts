@@ -1,4 +1,4 @@
-import { run, memoryIO, runner, SyncEngineGuards, Runner } from "./run.js"
+import { run, memoryIO, runner, retryFetch, SyncEngineGuards, Runner, RetryFetchOpts } from "./run.js"
 import {
     DatabaseOpts,
     ProtocolIo,
@@ -13,7 +13,7 @@ import {
 import { RemoteWriter, RemoteWriterConfig } from "./remote-writer.js"
 import { RemoteWriteStatement } from "./remote-write-statement.js"
 
-export { run, memoryIO, runner, SyncEngineGuards, Runner }
+export { run, memoryIO, runner, retryFetch, SyncEngineGuards, Runner }
 export { RemoteWriter, RemoteWriteStatement }
 export type {
     DatabaseStats,
@@ -24,6 +24,7 @@ export type {
     DatabaseRowTransformResult,
     EncryptionOpts,
     RemoteWriterConfig,
+    RetryFetchOpts,
 
     ProtocolIo,
     RunOpts,

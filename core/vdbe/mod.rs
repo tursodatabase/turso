@@ -49,9 +49,9 @@ use crate::{
     vdbe::{
         execute::{
             OpColumnState, OpDeleteState, OpDeleteSubState, OpDestroyState, OpIdxInsertState,
-            OpInsertState, OpInsertSubState, OpJournalModeState, OpNewRowidState,
-            OpNoConflictState, OpParseSchemaState, OpProgramState, OpRowIdState, OpSeekState,
-            OpTransactionState, OpVacuumIntoState,
+            OpInitCdcVersionState, OpInsertState, OpInsertSubState, OpJournalModeState,
+            OpNewRowidState, OpNoConflictState, OpParseSchemaState, OpProgramState, OpRowIdState,
+            OpSeekState, OpTransactionState, OpVacuumIntoState,
         },
         hash_table::HashTable,
         metrics::StatementMetrics,
@@ -401,9 +401,38 @@ enum ActiveOpState {
     ParseSchema(OpParseSchemaState),
     HashBuild(Option<OpHashBuildState>),
     HashProbe(Option<OpHashProbeState>),
+    InitCdcVersion(OpInitCdcVersionState),
 }
 
-#[derive(Default)]
+impl std::fmt::Debug for ActiveOpState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let name = match self {
+            ActiveOpState::None => "None",
+            ActiveOpState::Delete(_) => "Delete",
+            ActiveOpState::Destroy(_) => "Destroy",
+            ActiveOpState::IdxDelete(_) => "IdxDelete",
+            ActiveOpState::IntegrityCheck(_) => "IntegrityCheck",
+            ActiveOpState::OpenEphemeral(_) => "OpenEphemeral",
+            ActiveOpState::Program(_) => "Program",
+            ActiveOpState::NewRowid(_) => "NewRowid",
+            ActiveOpState::IdxInsert(_) => "IdxInsert",
+            ActiveOpState::Insert(_) => "Insert",
+            ActiveOpState::NoConflict(_) => "NoConflict",
+            ActiveOpState::Column(_) => "Column",
+            ActiveOpState::RowId(_) => "RowId",
+            ActiveOpState::Transaction(_) => "Transaction",
+            ActiveOpState::JournalMode(_) => "JournalMode",
+            ActiveOpState::VacuumInto(_) => "VacuumInto",
+            ActiveOpState::ParseSchema(_) => "ParseSchema",
+            ActiveOpState::HashBuild(_) => "HashBuild",
+            ActiveOpState::HashProbe(_) => "HashProbe",
+            ActiveOpState::InitCdcVersion(_) => "InitCdcVersion",
+        };
+        f.write_str(name)
+    }
+}
+
+#[derive(Debug, Default)]
 struct ActiveOpStateSlot {
     state: ActiveOpState,
 }
@@ -416,9 +445,10 @@ macro_rules! active_state_accessor {
             }
             match &mut self.state {
                 ActiveOpState::$variant(state) => state,
-                _ => unreachable!(
-                    "active opcode state mismatch: expected {}",
-                    stringify!($variant)
+                state => unreachable!(
+                    "active opcode state mismatch: expected {}, got {:?}",
+                    stringify!($variant),
+                    state
                 ),
             }
         }
@@ -506,6 +536,12 @@ impl ActiveOpStateSlot {
     active_state_accessor!(parse_schema, ParseSchema, OpParseSchemaState, None);
     active_state_accessor!(hash_build, HashBuild, Option<OpHashBuildState>, None);
     active_state_accessor!(hash_probe, HashProbe, Option<OpHashProbeState>, None);
+    active_state_accessor!(
+        init_cdc_version,
+        InitCdcVersion,
+        OpInitCdcVersionState,
+        None
+    );
 
     fn program_ref(&self) -> Option<&OpProgramState> {
         match &self.state {
