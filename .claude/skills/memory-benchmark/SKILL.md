@@ -36,17 +36,30 @@ Useful options:
 ```bash
 --sql FILE|-             # SQL payload, or stdin with -
 --format human|json|csv  # output format
---top N                  # heaviest span rows per statement in human output
+--top N                  # aggregate/span rows per statement in human output
 ```
 
 The report is statement-oriented. For each SQL statement, it records the
 remaining stack before execution, the minimum remaining stack sampled while that
 statement ran, and `stack_used = baseline_remaining_stack - min_remaining_stack`.
 Statements are sorted by `stack_used` descending so the worst SQL statements are
-first. Within each statement, span rows are sorted by `stack_used` descending,
-with the original tracing emission sequence kept in the `trace_sequence` field
-(`seq` in human output). JSON and CSV formats are deterministic and intended for
-comparing runs.
+first. The human report also prints global and per-statement span aggregates
+sorted by `total_inclusive_stack_used` descending. These aggregate rows group by
+`label` plus `detail` and include call count, total/max self stack, total/max
+inclusive stack, max cumulative stack at span entry, and `peak_path_hits` for
+spans that were active at the statement's minimum remaining-stack sample.
+
+Within each statement, raw span rows are still sorted by `stack_used`
+descending, with the original tracing emission sequence kept in the
+`trace_sequence` field (`seq` in human output). Raw span rows include
+`inclusive_stack_used`, which is measured from the span's parent stack level down
+to the deepest sampled remaining stack while the span was active. This is an
+inclusive profiler-style metric, so nested spans intentionally overlap; use it
+for ranking likely contributors, not for summing to statement total stack.
+
+JSON and CSV formats are deterministic and intended for comparing runs. CSV
+uses a `row_type` column with `global_aggregate`, `statement_aggregate`, `span`,
+and `statement` rows.
 
 `stack-report` splits payloads with `turso_parser::parser::Parser::next_cmd()`.
 It then executes statements with no result columns, and queries and drains
