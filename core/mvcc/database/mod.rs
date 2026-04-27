@@ -5247,8 +5247,7 @@ impl RowVersion {
                         speculatively_invalidated
                     }
                     Some(TransactionState::Active) => false,
-                    Some(TransactionState::Aborted)
-                    | Some(TransactionState::Terminated) => false,
+                    Some(TransactionState::Aborted) | Some(TransactionState::Terminated) => false,
                     None => false,
                 }
             }
