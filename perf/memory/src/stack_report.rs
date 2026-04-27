@@ -38,6 +38,14 @@ struct Args {
     /// Output format.
     #[arg(long = "format", default_value = "human")]
     format: OutputFormat,
+
+    /// Only include reports for these 1-based statement indexes. Can be repeated or comma-separated.
+    #[arg(long = "statement", value_delimiter = ',')]
+    statements: Vec<usize>,
+
+    /// Only include reports for statements whose SQL contains this substring. Can be repeated.
+    #[arg(long = "sql-contains")]
+    sql_contains: Vec<String>,
 }
 
 #[derive(Debug, Default)]
@@ -235,7 +243,7 @@ async fn main() -> Result<()> {
         .build()
         .await?;
     let conn = db.connect()?;
-    let mut statements = execute_sql_payload(&conn, &sql, Arc::clone(&collector)).await?;
+    let mut statements = execute_sql_payload(&conn, &sql, Arc::clone(&collector), &args).await?;
     statements.sort_by(|a, b| {
         b.stack_used
             .cmp(&a.stack_used)
@@ -272,6 +280,7 @@ async fn execute_sql_payload(
     conn: &turso::Connection,
     sql: &str,
     collector: Arc<StackCollector>,
+    args: &Args,
 ) -> Result<Vec<StatementReport>> {
     let mut reports = Vec::new();
 
@@ -305,15 +314,40 @@ async fn execute_sql_payload(
             {}
         }
 
-        let samples = collector.samples_from(start_sample);
-        reports.push(build_statement_report(
-            index + 1,
-            statement,
-            baseline_remaining_stack,
-            samples,
-        ));
+        let statement_index = index + 1;
+        if statement_matches_report_filters(statement_index, statement, args) {
+            let samples = collector.samples_from(start_sample);
+            reports.push(build_statement_report(
+                statement_index,
+                statement,
+                baseline_remaining_stack,
+                samples,
+            ));
+        }
     }
     Ok(reports)
+}
+
+fn statement_matches_report_filters(index: usize, sql: &str, args: &Args) -> bool {
+    if !args.statements.is_empty() && !args.statements.contains(&index) {
+        return false;
+    }
+    if !args.sql_contains.is_empty()
+        && !args
+            .sql_contains
+            .iter()
+            .any(|needle| contains_ignore_ascii_case(sql, needle))
+    {
+        return false;
+    }
+    true
+}
+
+fn contains_ignore_ascii_case(value: &str, needle: &str) -> bool {
+    value
+        .as_bytes()
+        .windows(needle.len())
+        .any(|candidate| candidate.eq_ignore_ascii_case(needle.as_bytes()))
 }
 
 fn split_sql_statements(sql: &str) -> Result<Vec<&str>> {
@@ -800,6 +834,54 @@ mod tests {
     use super::*;
 
     #[test]
+    fn statement_filter_matches_one_based_indexes() {
+        let args = args_with_filters(vec![2, 4], Vec::new());
+
+        assert!(!statement_matches_report_filters(1, "SELECT 1", &args));
+        assert!(statement_matches_report_filters(2, "SELECT 2", &args));
+        assert!(!statement_matches_report_filters(3, "SELECT 3", &args));
+        assert!(statement_matches_report_filters(4, "SELECT 4", &args));
+    }
+
+    #[test]
+    fn sql_contains_filter_matches_any_substring() {
+        let args = args_with_filters(Vec::new(), vec!["trigger", "GENERATED"]);
+
+        assert!(statement_matches_report_filters(
+            1,
+            "CREATE TRIGGER cleanup AFTER INSERT ON t BEGIN SELECT 1; END",
+            &args
+        ));
+        assert!(statement_matches_report_filters(
+            2,
+            "CREATE TABLE t(x INT GENERATED ALWAYS AS (1))",
+            &args
+        ));
+        assert!(!statement_matches_report_filters(
+            3,
+            "CREATE TABLE t(x)",
+            &args
+        ));
+    }
+
+    #[test]
+    fn combined_filters_require_index_and_sql_match() {
+        let args = args_with_filters(vec![3], vec!["trigger"]);
+
+        assert!(!statement_matches_report_filters(
+            2,
+            "CREATE TRIGGER cleanup AFTER INSERT ON t BEGIN SELECT 1; END",
+            &args
+        ));
+        assert!(!statement_matches_report_filters(3, "SELECT 1", &args));
+        assert!(statement_matches_report_filters(
+            3,
+            "CREATE TRIGGER cleanup AFTER INSERT ON t BEGIN SELECT 1; END",
+            &args
+        ));
+    }
+
+    #[test]
     fn statement_stack_used_is_peak_delta_not_sum() {
         let report = build_statement_report(
             1,
@@ -974,5 +1056,15 @@ mod tests {
         let buffer = [0_u8; 16 * 1024];
         std::hint::black_box(&buffer);
         stacker::remaining_stack().expect("remaining stack should be available")
+    }
+
+    fn args_with_filters(statements: Vec<usize>, sql_contains: Vec<&str>) -> Args {
+        Args {
+            sql: PathBuf::from("-"),
+            top: 40,
+            format: OutputFormat::Human,
+            statements,
+            sql_contains: sql_contains.into_iter().map(str::to_string).collect(),
+        }
     }
 }

@@ -37,6 +37,8 @@ Useful options:
 --sql FILE|-             # SQL payload, or stdin with -
 --format human|json|csv  # output format
 --top N                  # aggregate/span rows per statement in human output
+--statement N[,N...]     # only include reports for 1-based statement indexes
+--sql-contains TEXT      # only include reports for statements containing TEXT, ASCII case-insensitive
 ```
 
 The report is statement-oriented. For each SQL statement, it records the
@@ -60,6 +62,11 @@ for ranking likely contributors, not for summing to statement total stack.
 JSON and CSV formats are deterministic and intended for comparing runs. CSV
 uses a `row_type` column with `global_aggregate`, `statement_aggregate`, `span`,
 and `statement` rows.
+
+Statement filters affect reporting only. The runner still executes the full SQL
+payload in order so schema/data setup and earlier statements remain visible to
+later selected statements. Multiple `--statement` and `--sql-contains` filters
+are allowed; when both are present, a statement must match both kinds.
 
 `stack-report` splits payloads with `turso_parser::parser::Parser::next_cmd()`.
 It then executes statements with no result columns, and queries and drains
