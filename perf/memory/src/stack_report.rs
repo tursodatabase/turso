@@ -90,6 +90,7 @@ struct SpanReport {
     label: String,
     detail: Option<String>,
     remaining_stack: usize,
+    cumulative_stack_used: usize,
     stack_used: usize,
 }
 
@@ -321,18 +322,7 @@ fn build_statement_report(
         .map(|sample| sample.remaining_stack)
         .min()
         .unwrap_or(baseline_remaining_stack);
-    let mut spans = samples
-        .iter()
-        .enumerate()
-        .filter(|(_, sample)| matches!(sample.phase, StackPhase::Enter | StackPhase::Sample))
-        .map(|(trace_sequence, sample)| SpanReport {
-            trace_sequence: trace_sequence + 1,
-            label: sample.label.clone(),
-            detail: sample.detail.clone(),
-            remaining_stack: sample.remaining_stack,
-            stack_used: baseline_remaining_stack.saturating_sub(sample.remaining_stack),
-        })
-        .collect::<Vec<_>>();
+    let mut spans = build_span_reports(baseline_remaining_stack, &samples);
     spans.sort_by(|a, b| {
         b.stack_used
             .cmp(&a.stack_used)
@@ -348,6 +338,54 @@ fn build_statement_report(
         samples: spans.len(),
         spans,
     }
+}
+
+fn build_span_reports(baseline_remaining_stack: usize, samples: &[StackSample]) -> Vec<SpanReport> {
+    let mut active_stack = vec![baseline_remaining_stack];
+    let mut spans = Vec::new();
+
+    for (trace_sequence, sample) in samples.iter().enumerate() {
+        match sample.phase {
+            StackPhase::Enter => {
+                let parent_remaining = active_stack
+                    .last()
+                    .copied()
+                    .unwrap_or(baseline_remaining_stack);
+                spans.push(SpanReport {
+                    trace_sequence: trace_sequence + 1,
+                    label: sample.label.clone(),
+                    detail: sample.detail.clone(),
+                    remaining_stack: sample.remaining_stack,
+                    cumulative_stack_used: baseline_remaining_stack
+                        .saturating_sub(sample.remaining_stack),
+                    stack_used: parent_remaining.saturating_sub(sample.remaining_stack),
+                });
+                active_stack.push(sample.remaining_stack);
+            }
+            StackPhase::Exit => {
+                let _ = active_stack.pop();
+                if active_stack.is_empty() {
+                    active_stack.push(baseline_remaining_stack);
+                }
+            }
+            StackPhase::Sample => {
+                let parent_remaining = active_stack
+                    .last()
+                    .copied()
+                    .unwrap_or(baseline_remaining_stack);
+                spans.push(SpanReport {
+                    trace_sequence: trace_sequence + 1,
+                    label: sample.label.clone(),
+                    detail: sample.detail.clone(),
+                    remaining_stack: sample.remaining_stack,
+                    cumulative_stack_used: baseline_remaining_stack
+                        .saturating_sub(sample.remaining_stack),
+                    stack_used: parent_remaining.saturating_sub(sample.remaining_stack),
+                });
+            }
+        }
+    }
+    spans
 }
 
 fn print_human(report: &StackReport, top: usize) {
@@ -372,8 +410,8 @@ fn print_human(report: &StackReport, top: usize) {
             continue;
         }
         println!(
-            "  {:>5} {:>12} {:>12}  span",
-            "seq", "stack_used", "remaining"
+            "  {:>5} {:>12} {:>12} {:>12}  span",
+            "seq", "self_used", "cum_used", "remaining"
         );
         for span in statement.spans.iter().take(top) {
             let label = match &span.detail {
@@ -381,8 +419,12 @@ fn print_human(report: &StackReport, top: usize) {
                 None => span.label.clone(),
             };
             println!(
-                "  {:>5} {:>12} {:>12}  {}",
-                span.trace_sequence, span.stack_used, span.remaining_stack, label
+                "  {:>5} {:>12} {:>12} {:>12}  {}",
+                span.trace_sequence,
+                span.stack_used,
+                span.cumulative_stack_used,
+                span.remaining_stack,
+                label
             );
         }
         if statement.spans.len() > top {
@@ -394,7 +436,7 @@ fn print_human(report: &StackReport, top: usize) {
 
 fn print_csv(report: &StackReport) {
     println!(
-        "statement_index,statement_sql,statement_stack_used,statement_baseline_remaining_stack,statement_min_remaining_stack,statement_samples,span_trace_sequence,span_label,span_detail,span_stack_used,span_remaining_stack"
+        "statement_index,statement_sql,statement_stack_used,statement_baseline_remaining_stack,statement_min_remaining_stack,statement_samples,span_trace_sequence,span_label,span_detail,span_self_stack_used,span_cumulative_stack_used,span_remaining_stack"
     );
     for statement in &report.statements {
         if statement.spans.is_empty() {
@@ -411,7 +453,7 @@ fn print_csv(report: &StackReport) {
         }
         for span in &statement.spans {
             println!(
-                "{},{},{},{},{},{},{},{},{},{},{}",
+                "{},{},{},{},{},{},{},{},{},{},{},{}",
                 statement.index,
                 csv_escape(&statement.sql),
                 statement.stack_used,
@@ -422,6 +464,7 @@ fn print_csv(report: &StackReport) {
                 csv_escape(&span.label),
                 csv_escape(span.detail.as_deref().unwrap_or("")),
                 span.stack_used,
+                span.cumulative_stack_used,
                 span.remaining_stack
             );
         }
@@ -492,6 +535,12 @@ mod tests {
                     remaining_stack: 7_500,
                 },
                 StackSample {
+                    label: "inner:end".to_string(),
+                    detail: None,
+                    phase: StackPhase::Exit,
+                    remaining_stack: 9_000,
+                },
+                StackSample {
                     label: "outer:end".to_string(),
                     detail: None,
                     phase: StackPhase::Exit,
@@ -503,14 +552,15 @@ mod tests {
         assert_eq!(report.stack_used, 2_500);
         assert_eq!(report.min_remaining_stack, 7_500);
         assert_eq!(report.spans[0].label, "inner");
-        assert_eq!(report.spans[0].stack_used, 2_500);
+        assert_eq!(report.spans[0].stack_used, 1_500);
+        assert_eq!(report.spans[0].cumulative_stack_used, 2_500);
         assert_eq!(
             report
                 .spans
                 .iter()
                 .map(|span| span.stack_used)
                 .sum::<usize>(),
-            3_500
+            2_500
         );
     }
 

@@ -6069,8 +6069,14 @@ pub fn bind_and_rewrite_expr<'a>(
                             id.as_str()
                         );
                     };
-                    let normalized_table_name = normalize_ident(tbl.as_str());
-                    let normalized_id = normalize_ident(id.as_str());
+                    let normalized_table_name = {
+                        let _stack = crate::stack::trace_scope("expr:qualified:normalize_table");
+                        normalize_ident(tbl.as_str())
+                    };
+                    let normalized_id = {
+                        let _stack = crate::stack::trace_scope("expr:qualified:normalize_column");
+                        normalize_ident(id.as_str())
+                    };
 
                     // `resolved` holds the accepted binding (at most one).
                     // `identifier_matched` is true once *any* scope produced a table whose
@@ -6088,20 +6094,22 @@ pub fn bind_and_rewrite_expr<'a>(
                     };
 
                     // --- Stage 1: search the current scope's FROM tables. ---
-                    for joined_table in referenced_tables
-                        .joined_tables()
-                        .iter()
-                        .filter(|t| t.identifier == normalized_table_name)
                     {
-                        identifier_matched = true;
-                        let Some(candidate) = resolve_qualified_on_ref(
-                            &joined_table.table,
-                            joined_table.internal_id,
-                            &normalized_id,
-                        )?
-                        else {
-                            continue;
-                        };
+                        let _stack = crate::stack::trace_scope("expr:qualified:find_table");
+                        for joined_table in referenced_tables
+                            .joined_tables()
+                            .iter()
+                            .filter(|t| t.identifier == normalized_table_name)
+                        {
+                            identifier_matched = true;
+                            let Some(candidate) = resolve_qualified_on_ref(
+                                &joined_table.table,
+                                joined_table.internal_id,
+                                &normalized_id,
+                            )?
+                            else {
+                                continue;
+                            };
 
                         // Multiple FROM tables share this identifier and both contain `id`.
                         // For column matches, a USING/NATURAL join on `id` lets the first
@@ -6120,7 +6128,6 @@ pub fn bind_and_rewrite_expr<'a>(
                             }
                             continue;
                         }
-                        resolved = Some((joined_table.internal_id, candidate));
                     }
                     // --- Stage 2: fall back to enclosing scopes ---
                     // Only attempted if no inner-scope table matched the identifier — an
@@ -6136,6 +6143,7 @@ pub fn bind_and_rewrite_expr<'a>(
                     // CTE is consumed into a FROM, column resolution must go through the
                     // corresponding `joined_table`, not the definition-only ref.
                     if !identifier_matched {
+                        let _stack = crate::stack::trace_scope("expr:qualified:find_outer_ref");
                         let nearest_outer_scope = referenced_tables
                             .outer_query_refs()
                             .iter()
@@ -6195,14 +6203,18 @@ pub fn bind_and_rewrite_expr<'a>(
                         // The `cte_id`/`cte_select` check restricts this to real CTE
                         // definition refs so any other future use of `cte_definition_only`
                         // still falls through to "no such table".
-                        if referenced_tables
-                            .find_outer_query_ref_by_identifier(&normalized_table_name)
-                            .is_some_and(|outer_ref| {
-                                outer_ref.cte_definition_only
-                                    && (outer_ref.cte_id.is_some()
-                                        || outer_ref.cte_select.is_some())
-                            })
-                        {
+                        let is_definition_only_cte = {
+                            let _stack =
+                                crate::stack::trace_scope("expr:qualified:outer_ref_check");
+                            referenced_tables
+                                .find_outer_query_ref_by_identifier(&normalized_table_name)
+                                .is_some_and(|outer_ref| {
+                                    outer_ref.cte_definition_only
+                                        && (outer_ref.cte_id.is_some()
+                                            || outer_ref.cte_select.is_some())
+                                })
+                        };
+                        if is_definition_only_cte {
                             crate::bail_parse_error!(
                                 "no such column: {}.{}",
                                 tbl.as_str(),
@@ -6223,20 +6235,36 @@ pub fn bind_and_rewrite_expr<'a>(
                         // We do NOT reject ambiguous schemas at CREATE TABLE time because
                         // the combinatorial explosion (CREATE TYPE, CREATE TABLE, ALTER TABLE)
                         // makes that impractical. Deterministic precedence is sufficient.
-                        let field_name = normalize_ident(id.as_str());
-                        if let Some(m) = find_custom_type_column(
-                            referenced_tables,
-                            &normalized_table_name,
-                            resolver,
-                        )? {
-                            *expr = make_field_access_expr(
-                                m.table_id,
-                                m.col_idx,
-                                m.is_rowid_alias,
-                                &field_name,
-                                m.type_def,
-                            );
-                            referenced_tables.mark_column_used(m.table_id, m.col_idx);
+                        let field_name = {
+                            let _stack =
+                                crate::stack::trace_scope("expr:qualified:normalize_field");
+                            normalize_ident(id.as_str())
+                        };
+                        if let Some(m) = {
+                            let _stack =
+                                crate::stack::trace_scope("expr:qualified:find_custom_type_column");
+                            find_custom_type_column(
+                                referenced_tables,
+                                &normalized_table_name,
+                                resolver,
+                            )?
+                        } {
+                            {
+                                let _stack =
+                                    crate::stack::trace_scope("expr:qualified:make_field_access");
+                                *expr = make_field_access_expr(
+                                    m.table_id,
+                                    m.col_idx,
+                                    m.is_rowid_alias,
+                                    &field_name,
+                                    m.type_def,
+                                );
+                            }
+                            {
+                                let _stack =
+                                    crate::stack::trace_scope("expr:qualified:mark_column_used");
+                                referenced_tables.mark_column_used(m.table_id, m.col_idx);
+                            }
                             return Ok(WalkControl::Continue);
                         }
                         crate::bail_parse_error!("no such table: {}", normalized_table_name);
@@ -6252,22 +6280,38 @@ pub fn bind_and_rewrite_expr<'a>(
                             col_idx,
                             is_rowid_alias,
                         } => {
-                            *expr = Expr::Column {
-                                database: None, // TODO: support different databases
-                                table: tbl_id,
-                                column: col_idx,
-                                is_rowid_alias,
-                            };
+                            {
+                                let _stack =
+                                    crate::stack::trace_scope("expr:qualified:rewrite_column");
+                                *expr = Expr::Column {
+                                    database: None, // TODO: support different databases
+                                    table: tbl_id,
+                                    column: col_idx,
+                                    is_rowid_alias,
+                                };
+                            }
                             tracing::debug!("rewritten to column");
-                            referenced_tables.mark_column_used(tbl_id, col_idx);
+                            {
+                                let _stack =
+                                    crate::stack::trace_scope("expr:qualified:mark_column_used");
+                                referenced_tables.mark_column_used(tbl_id, col_idx);
+                            }
                         }
                         QualifiedMatch::RowId => {
-                            *expr = Expr::RowId {
-                                database: None, // TODO: support different databases
-                                table: tbl_id,
-                            };
+                            {
+                                let _stack =
+                                    crate::stack::trace_scope("expr:qualified:rewrite_rowid");
+                                *expr = Expr::RowId {
+                                    database: None, // TODO: support different databases
+                                    table: tbl_id,
+                                };
+                            }
                             tracing::debug!("rewritten to rowid");
-                            referenced_tables.mark_rowid_referenced(tbl_id);
+                            {
+                                let _stack =
+                                    crate::stack::trace_scope("expr:qualified:mark_rowid_used");
+                                referenced_tables.mark_rowid_referenced(tbl_id);
+                            }
                         }
                     }
                     return Ok(WalkControl::Continue);
