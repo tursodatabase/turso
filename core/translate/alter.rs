@@ -1618,8 +1618,18 @@ pub fn translate_alter_table(
                 true => (false, None),
                 false => {
                     let replacement_column = Column::try_from(&definition)?;
-                    let rewrites_physical_layout = !btree.columns()[column_index].is_generated()
-                        && replacement_column.is_generated();
+                    let old_column = &btree.columns()[column_index];
+                    let becomes_generated =
+                        !old_column.is_generated() && replacement_column.is_generated();
+                    // A change of declared type can change the column's affinity, in
+                    // which case existing on-disk values must be coerced to match the
+                    // new affinity. Without this, the row payload retains the old
+                    // serial type and SQLite's `PRAGMA integrity_check` reports the
+                    // file as corrupt (e.g. "NUMERIC value in <table>.<col>" when
+                    // changing NUMERIC -> TEXT). See issue #3706.
+                    let affinity_changed = old_column.affinity_with_strict(btree.is_strict)
+                        != replacement_column.affinity_with_strict(btree.is_strict);
+                    let rewrites_physical_layout = becomes_generated || affinity_changed;
                     (rewrites_physical_layout, Some(replacement_column))
                 }
             };

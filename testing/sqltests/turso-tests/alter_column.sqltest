@@ -596,3 +596,39 @@ test alter-table-add-parens-default {
 expect {
     1|123|-456
 }
+
+# Existing rows must be rewritten when ALTER COLUMN changes affinity, so the
+# stored serial type matches the new declared type (issue #3706).
+test alter-column-numeric-to-text-coerces-existing-rows {
+    CREATE TABLE t (x NUMERIC);
+    INSERT INTO t VALUES (1), (2.5), ('abc');
+    ALTER TABLE t ALTER COLUMN x TO y TEXT;
+    SELECT typeof(y), y FROM t ORDER BY rowid;
+}
+expect {
+    text|1
+    text|2.5
+    text|abc
+}
+
+test alter-column-text-to-integer-coerces-existing-rows {
+    CREATE TABLE t (x TEXT);
+    INSERT INTO t VALUES ('42'), ('abc');
+    ALTER TABLE t ALTER COLUMN x TO y INTEGER;
+    SELECT typeof(y), y FROM t ORDER BY rowid;
+}
+expect {
+    integer|42
+    text|abc
+}
+
+test alter-column-same-affinity-keeps-existing-rows {
+    CREATE TABLE t (x INTEGER);
+    INSERT INTO t VALUES (1), (2);
+    ALTER TABLE t ALTER COLUMN x TO y INTEGER;
+    SELECT typeof(y), y FROM t ORDER BY rowid;
+}
+expect {
+    integer|1
+    integer|2
+}
