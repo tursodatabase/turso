@@ -6,10 +6,15 @@ use crate::translate::subquery::{
     emit_non_from_clause_subquery, plan_subqueries_from_trigger_when_clause,
 };
 use crate::translate::{
+    delete::translate_delete,
     emitter::Resolver,
     expr::{self, translate_expr, walk_expr_mut},
+    insert::translate_insert,
+    plan::QueryDestination,
     planner::ROWID_STRS,
-    translate_inner, ProgramBuilder, ProgramBuilderOpts,
+    select::translate_select,
+    update::translate_update,
+    ProgramBuilder, ProgramBuilderOpts,
 };
 use crate::util::normalize_ident;
 use crate::vdbe::affinity::Affinity;
@@ -279,11 +284,14 @@ fn rewrite_upsert_exprs_for_subprogram(
     Ok(())
 }
 
-/// Convert TriggerCmd to Stmt, rewriting NEW/OLD to Variable expressions (for subprogram compilation)
-fn trigger_cmd_to_stmt_for_subprogram(
+/// Rewrite and translate one trigger command into the trigger subprogram.
+fn translate_trigger_cmd_for_subprogram(
     cmd: &ast::TriggerCmd,
     subprogram_ctx: &TriggerSubprogramContext,
-) -> Result<ast::Stmt> {
+    resolver: &mut Resolver,
+    program: &mut ProgramBuilder,
+    connection: &Arc<crate::Connection>,
+) -> Result<()> {
     use ast::{InsertBody, QualifiedName};
 
     match cmd {
@@ -307,18 +315,23 @@ fn trigger_cmd_to_stmt_for_subprogram(
             // If override_conflict is set (e.g., in UPSERT DO UPDATE context),
             // use it instead of the command's or_conflict to ensure errors propagate.
             let effective_or_conflict = subprogram_ctx.override_conflict.or(*or_conflict);
-            Ok(ast::Stmt::Insert {
-                with: None,
-                or_conflict: effective_or_conflict,
-                tbl_name: QualifiedName {
+            translate_insert(
+                resolver,
+                effective_or_conflict,
+                QualifiedName {
                     db_name: subprogram_ctx.db_name.clone(),
                     name: tbl_name.clone(),
                     alias: None,
                 },
-                columns: col_names.clone(),
+                col_names.clone(),
                 body,
-                returning: returning.clone(),
-            })
+                returning.clone(),
+                None,
+                program,
+                connection,
+            )?;
+            program.begin_write_operation();
+            Ok(())
         }
         ast::TriggerCmd::Update {
             or_conflict,
@@ -349,7 +362,7 @@ fn trigger_cmd_to_stmt_for_subprogram(
             // If override_conflict is set (e.g., in UPSERT DO UPDATE context),
             // use it instead of the command's or_conflict to ensure errors propagate.
             let effective_or_conflict = subprogram_ctx.override_conflict.or(*or_conflict);
-            Ok(ast::Stmt::Update(ast::Update {
+            let update = ast::Update {
                 with: None,
                 or_conflict: effective_or_conflict,
                 tbl_name: QualifiedName {
@@ -364,7 +377,15 @@ fn trigger_cmd_to_stmt_for_subprogram(
                 returning: vec![],
                 order_by: vec![],
                 limit: None,
-            }))
+            };
+            if update.where_clause.is_none() && connection.get_dml_require_where() {
+                bail_parse_error!(
+                    "UPDATE without a WHERE clause is not allowed when require_where (or i_am_a_dummy) is enabled"
+                );
+            }
+            translate_update(update, resolver, program, connection)?;
+            program.begin_write_operation();
+            Ok(())
         }
         ast::TriggerCmd::Delete {
             tbl_name,
@@ -376,25 +397,44 @@ fn trigger_cmd_to_stmt_for_subprogram(
                 rewrite_trigger_expr_for_subprogram(where_expr, subprogram_ctx)?;
             }
 
-            Ok(ast::Stmt::Delete {
-                tbl_name: QualifiedName {
+            if where_clause_clone.is_none() && connection.get_dml_require_where() {
+                bail_parse_error!(
+                    "DELETE without a WHERE clause is not allowed when require_where (or i_am_a_dummy) is enabled"
+                );
+            }
+            translate_delete(
+                &QualifiedName {
                     db_name: subprogram_ctx.db_name.clone(),
                     name: tbl_name.clone(),
                     alias: None,
                 },
-                where_clause: where_clause_clone,
-                limit: None,
-                returning: vec![],
-                indexed: None,
-                order_by: vec![],
-                with: None,
-            })
+                resolver,
+                where_clause_clone,
+                None,
+                vec![],
+                None,
+                None,
+                program,
+                connection,
+            )?;
+            program.begin_write_operation();
+            Ok(())
         }
         ast::TriggerCmd::Select(select) => {
             // Rewrite NEW/OLD references in the SELECT
             let mut select_clone = select.clone();
             rewrite_expressions_in_select_for_subprogram(&mut select_clone, subprogram_ctx)?;
-            Ok(ast::Stmt::Select(select_clone))
+            translate_select(
+                select_clone,
+                resolver,
+                program,
+                QueryDestination::ResultRows,
+                connection,
+            )?;
+            if !program.table_references.is_empty() {
+                program.begin_read_operation();
+            }
+            Ok(())
         }
     }
 }
@@ -647,25 +687,18 @@ fn compile_deferred_trigger_program(
                 "trigger:compile_command",
                 trigger_command_kind(command),
             );
-            let stmt = {
-                let _stack = crate::stack::trace_scope_with_detail(
-                    "trigger:rewrite_command",
-                    trigger_command_kind(command),
-                );
-                trigger_cmd_to_stmt_for_subprogram(command, &subprogram_ctx)?
-            };
             subprogram_builder.prologue();
             {
                 let _stack = crate::stack::trace_scope_with_detail(
                     "trigger:translate_command",
                     trigger_command_kind(command),
                 );
-                translate_inner(
-                    stmt,
+                translate_trigger_cmd_for_subprogram(
+                    command,
+                    &subprogram_ctx,
                     resolver,
                     &mut subprogram_builder,
                     connection,
-                    "trigger subprogram",
                 )?;
             }
             if matches!(
