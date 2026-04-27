@@ -512,10 +512,10 @@ fn add_aggregate_if_not_exists(
 /// yield registers and so on.
 ///
 #[allow(clippy::too_many_arguments)]
-fn plan_cte(
+fn plan_single_cte(
     cte_idx: usize,
     cte_definitions: &[CteDefinition],
-    base_outer_query_refs: &[OuterQueryReference],
+    outer_query_refs: &[OuterQueryReference],
     resolver: &Resolver,
     program: &mut ProgramBuilder,
     connection: &Arc<crate::Connection>,
@@ -534,52 +534,6 @@ fn plan_cte(
         )
     });
 
-    // Build outer_query_refs including only the CTEs this one directly references.
-    // By tracking direct dependencies instead of all preceding CTEs, we avoid
-    // exponential re-planning when CTEs have transitive dependencies.
-    let mut outer_query_refs = base_outer_query_refs.to_vec();
-    for &ref_idx in &cte_def.referenced_cte_indices {
-        let ref_cte_name = &cte_definitions[ref_idx].name;
-        let _stack =
-            crate::stack::trace_scope_with_dynamic_detail("planner:plan_cte_dependency", || {
-                format!("from={},to={ref_cte_name}", cte_def.name)
-            });
-        // Check if this CTE has already been planned and is in outer_query_refs.
-        // This avoids exponential re-planning when CTEs have transitive dependencies.
-        if outer_query_refs
-            .iter()
-            .any(|r| &r.identifier == ref_cte_name)
-        {
-            continue;
-        }
-        // Recursively plan the referenced CTE so it's visible within this CTE's body.
-        // Example: WITH a AS (...), b AS (SELECT * FROM a) - when planning b, we need
-        // a to be in scope. This visibility-only copy is not itself a read that can
-        // share a materialized result, so it must not be treated as one here.
-        let referenced_table = plan_cte(
-            ref_idx,
-            cte_definitions,
-            base_outer_query_refs,
-            resolver,
-            program,
-            connection,
-            false,
-        )?;
-        outer_query_refs.push(OuterQueryReference {
-            identifier: referenced_table.identifier.clone(),
-            internal_id: referenced_table.internal_id,
-            table: referenced_table.table.clone(),
-            using_dedup_hidden_cols: referenced_table.using_dedup_hidden_cols(),
-            col_used_mask: ColumnUsedMask::default(),
-            cte_select: None,
-            cte_explicit_columns: vec![],
-            cte_id: Some(cte_definitions[ref_idx].cte_id),
-            cte_definition_only: false,
-            rowid_referenced: false,
-            scope_depth: 0,
-        });
-    }
-
     // Block the CTE's own name from resolving to a schema object during
     // planning of its body. Without this, a same-named view would be expanded
     // recursively (stack overflow) and a same-named table would give wrong
@@ -596,7 +550,7 @@ fn plan_cte(
             simplify_transparent_cte_select(cte_def.select.clone()),
             resolver,
             program,
-            &outer_query_refs,
+            outer_query_refs,
             QueryDestination::placeholder_for_subquery(),
             connection,
         )
@@ -641,6 +595,125 @@ fn plan_cte(
             crate::bail_parse_error!("DELETE/UPDATE queries are not supported in CTEs")
         }
     }
+}
+
+fn cte_dependency_order(root_idx: usize, cte_definitions: &[CteDefinition]) -> Vec<usize> {
+    let mut order = Vec::new();
+    let mut seen = vec![false; cte_definitions.len()];
+    let mut stack: Vec<(usize, bool)> = cte_definitions[root_idx]
+        .referenced_cte_indices
+        .iter()
+        .rev()
+        .map(|&idx| (idx, false))
+        .collect();
+
+    while let Some((idx, expanded)) = stack.pop() {
+        if expanded {
+            order.push(idx);
+            continue;
+        }
+        if seen[idx] {
+            continue;
+        }
+        seen[idx] = true;
+        stack.push((idx, true));
+        for &dependency_idx in cte_definitions[idx].referenced_cte_indices.iter().rev() {
+            if !seen[dependency_idx] {
+                stack.push((dependency_idx, false));
+            }
+        }
+    }
+
+    order
+}
+
+fn add_planned_cte_outer_ref(
+    outer_query_refs: &mut Vec<OuterQueryReference>,
+    cte_definitions: &[CteDefinition],
+    cte_idx: usize,
+    joined_table: JoinedTable,
+) {
+    outer_query_refs.push(OuterQueryReference {
+        identifier: joined_table.identifier.clone(),
+        internal_id: joined_table.internal_id,
+        table: joined_table.table.clone(),
+        using_dedup_hidden_cols: joined_table.using_dedup_hidden_cols(),
+        col_used_mask: ColumnUsedMask::default(),
+        cte_select: None,
+        cte_explicit_columns: vec![],
+        cte_id: Some(cte_definitions[cte_idx].cte_id),
+        cte_definition_only: false,
+        rowid_referenced: false,
+        scope_depth: 0,
+    });
+}
+
+/// Plan a CTE when it's referenced in a query.
+/// Dependencies are planned in topological order before the referenced CTE, so
+/// each SELECT prepare completes before the next one starts. This keeps CTE
+/// dependency planning from stacking recursive prepare frames.
+#[allow(clippy::too_many_arguments)]
+fn plan_cte(
+    cte_idx: usize,
+    cte_definitions: &[CteDefinition],
+    base_outer_query_refs: &[OuterQueryReference],
+    resolver: &Resolver,
+    program: &mut ProgramBuilder,
+    connection: &Arc<crate::Connection>,
+    actual_reference: bool,
+) -> Result<JoinedTable> {
+    let mut outer_query_refs = base_outer_query_refs.to_vec();
+    let dependency_order = cte_dependency_order(cte_idx, cte_definitions);
+    {
+        let _stack = crate::stack::trace_scope_with_dynamic_detail(
+            "planner:plan_cte_dependency_order",
+            || {
+                format!(
+                    "name={},dependencies={}",
+                    cte_definitions[cte_idx].name,
+                    dependency_order.len()
+                )
+            },
+        );
+        for ref_idx in dependency_order {
+            let ref_cte_name = &cte_definitions[ref_idx].name;
+            let _stack = crate::stack::trace_scope_with_dynamic_detail(
+                "planner:plan_cte_dependency",
+                || format!("from={},to={ref_cte_name}", cte_definitions[cte_idx].name),
+            );
+            if outer_query_refs
+                .iter()
+                .any(|r| &r.identifier == ref_cte_name)
+            {
+                continue;
+            }
+            let referenced_table = plan_single_cte(
+                ref_idx,
+                cte_definitions,
+                &outer_query_refs,
+                resolver,
+                program,
+                connection,
+                false,
+            )?;
+            add_planned_cte_outer_ref(
+                &mut outer_query_refs,
+                cte_definitions,
+                ref_idx,
+                referenced_table,
+            );
+        }
+    }
+
+    plan_single_cte(
+        cte_idx,
+        cte_definitions,
+        &outer_query_refs,
+        resolver,
+        program,
+        connection,
+        actual_reference,
+    )
 }
 
 /// Plan CTEs from a WITH clause and add them as outer query references.

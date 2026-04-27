@@ -41,7 +41,7 @@ nanosecond-bench = ["bench"]
 fts = ["dep:tantivy"]
 codspeed = ["bench"]
 optimizer_params = ["serde", "dep:serde_json"]
-stacker = ["dep:stacker"]
+stacker = ["dep:stacker", "turso_parser/stacker"]
 
 [target.'cfg(target_os = "windows")'.dependencies]
 windows-sys = { version = "0.61.2", features = [

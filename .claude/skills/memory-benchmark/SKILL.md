@@ -40,6 +40,7 @@ Useful options:
 --top N                  # aggregate/span rows per statement in human output
 --statement N[,N...]     # only include reports for 1-based statement indexes
 --sql-contains TEXT      # only include reports for statements containing TEXT, ASCII case-insensitive
+--trace-parser           # include prepare-time parser stack spans as parser:* labels
 ```
 
 Built-in stack profiles:
@@ -89,6 +90,12 @@ are allowed; when both are present, a statement must match both kinds.
 It then executes statements with no result columns, and queries and drains
 row-producing statements. Do not change binding `execute_batch` semantics for
 stack reports.
+
+When run with `--features stacker -- --trace-parser`, parser instrumentation is
+also enabled. Parser spans use the same `turso_stack` tracing target and show up
+in per-statement reports for prepare-time parsing as `parser:*` labels. Parser
+events emitted while `stack-report` initially splits the full payload are not
+assigned to statements; use the per-statement prepare spans for comparisons.
 
 The runner currently uses a fixed in-memory database and enables generated
 columns, custom types, and materialized views internally. There are no stack
