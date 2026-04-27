@@ -5,7 +5,7 @@ use crate::mvcc::cursor::{MvccCursorType, NextRowidResult};
 use crate::mvcc::database::CheckpointStateMachine;
 use crate::mvcc::MvccClock;
 use crate::numeric::Numeric;
-use crate::schema::{Schema, Table, SCHEMA_TABLE_NAME, SQLITE_SEQUENCE_TABLE_NAME};
+use crate::schema::{Schema, Table, SQLITE_SEQUENCE_TABLE_NAME};
 use crate::state_machine::StateMachine;
 use crate::storage::btree::{
     integrity_check, CursorTrait, IntegrityCheckError, IntegrityCheckState, PageCategory,
@@ -10931,21 +10931,29 @@ pub fn op_page_count(
 
 /// State for the async ParseSchema instruction state machine.
 /// Stored in the active opcode state slot so that when the inner
-/// schema query yields IO, we can return control to the outer caller and
+/// schema cursor yields IO, we can return control to the outer caller and
 /// resume later without losing intermediate parsing state.
 pub struct OpParseSchemaInner {
-    stmt: crate::Statement,
+    cursor: Box<dyn CursorTrait>,
     schema_arc: Arc<Schema>,
     from_sql_indexes: Vec<crate::util::UnparsedFromSqlIndex>,
     automatic_indices: crate::HashMap<String, Vec<(String, i64)>>,
     dbsp_state_roots: crate::HashMap<String, i64>,
     dbsp_state_index_roots: crate::HashMap<String, i64>,
     materialized_view_info: crate::HashMap<String, (String, i64)>,
+    filter: crate::vdbe::insn::ParseSchemaFilter,
     db: usize,
-    previous_auto_commit: bool,
+    phase: OpParseSchemaPhase,
 }
 
 pub type OpParseSchemaState = Option<Box<OpParseSchemaInner>>;
+
+#[derive(Debug)]
+enum OpParseSchemaPhase {
+    Rewinding,
+    FetchingRecord,
+    Advancing,
+}
 
 pub fn op_parse_schema(
     program: &Program,
@@ -10953,7 +10961,7 @@ pub fn op_parse_schema(
     insn: &Insn,
     _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
-    load_insn!(ParseSchema { db, where_clause }, insn);
+    load_insn!(ParseSchema { db, filter }, insn);
 
     let conn = program.connection.clone();
 
@@ -10962,40 +10970,11 @@ pub fn op_parse_schema(
         return op_parse_schema_step(state, &conn);
     }
 
-    // set auto commit to false in order for parse schema to not commit changes as transaction state is stored in connection,
-    // and we use the same connection for nested query.
-    let previous_auto_commit = conn.auto_commit.load(Ordering::SeqCst);
-    conn.auto_commit.store(false, Ordering::SeqCst);
-
-    // For attached databases, qualify the sqlite_schema table with the database name
-    let schema_table = if *db != crate::MAIN_DB_ID {
-        let db_name = conn
-            .get_database_name_by_index(*db)
-            .unwrap_or_else(|| "main".to_string());
-        format!("{db_name}.sqlite_schema")
-    } else {
-        SCHEMA_TABLE_NAME.to_string()
-    };
-    let sql = if let Some(where_clause) = where_clause {
-        format!("SELECT * FROM {schema_table} WHERE {where_clause}")
-    } else {
-        format!("SELECT * FROM {schema_table}")
-    };
-    let mut stmt = conn.prepare_internal(sql)?;
-    // ParseSchema runs as a nested helper statement inside the parent schema
-    // mutation. It only reads sqlite_schema, so a statement subtransaction is
-    // unnecessary and can contend with the parent's subjournal on temp/attached
-    // pagers, surfacing as SQLITE_BUSY during temp DDL.
-    stmt.program
-        .prepared
-        .needs_stmt_subtransactions
-        .store(false, Ordering::Relaxed);
+    let cursor = parse_schema_cursor(&conn, *db)?;
 
     // Get a mutable schema clone *without* holding the schema lock during
-    // nested statement execution.  The nested Statement may call reprepare()
-    // which also acquires the schema / database_schemas write lock, so holding
-    // it here would deadlock on the same thread (parking_lot RwLock is not
-    // re-entrant).
+    // schema table scanning.  Schema row handling reparses SQL and may need
+    // connection-scoped metadata, so avoid holding schema locks across the scan.
     let schema_arc = if *db == crate::TEMP_DB_ID {
         // TEMP: single source of truth is `temp_db.db.schema`. Skip
         // `database_schemas` staging entirely — it would only go stale.
@@ -11009,8 +10988,6 @@ pub fn op_parse_schema(
         let fallback_schema = {
             let attached_dbs = conn.attached_databases.read();
             let Some((db_inst, _pager)) = attached_dbs.index_to_data.get(db) else {
-                conn.auto_commit
-                    .store(previous_auto_commit, Ordering::SeqCst);
                 return Err(LimboError::InternalError(format!(
                     "stale reference to detached database (index {db})"
                 )));
@@ -11024,29 +11001,53 @@ pub fn op_parse_schema(
         conn.schema.read().clone()
     };
 
-    // Set up MVCC transaction for the nested statement
-    let mv_tx = program.connection.get_mv_tx();
-    stmt.set_mv_tx(mv_tx);
-
     // Store state for resumption across IO boundaries
     *state.active_op_state.parse_schema() = Some(Box::new(OpParseSchemaInner {
-        stmt,
+        cursor,
         schema_arc,
         from_sql_indexes: Vec::with_capacity(10),
         automatic_indices: Default::default(),
         dbsp_state_roots: Default::default(),
         dbsp_state_index_roots: Default::default(),
         materialized_view_info: Default::default(),
+        filter: filter.clone(),
         db: *db,
-        previous_auto_commit,
+        phase: OpParseSchemaPhase::Rewinding,
     }));
 
     // Now begin stepping through the schema rows
     op_parse_schema_step(state, &conn)
 }
 
-/// Drive the inner schema statement one step at a time.
-/// Returns IO to the outer VDBE loop when the inner statement needs it,
+fn parse_schema_cursor(conn: &Arc<Connection>, db: usize) -> Result<Box<dyn CursorTrait>> {
+    let pager = conn.get_pager_from_database_index(&db)?;
+    let mv_store = conn.mv_store_for_db(db);
+    let btree_cursor: Box<dyn CursorTrait> = Box::new(BTreeCursor::new_table(
+        pager,
+        maybe_transform_root_page_to_positive(mv_store.as_ref(), 1),
+        5,
+    ));
+
+    if let Some(tx_id) = conn.get_mv_tx_id_for_db(db) {
+        let mv_store = mv_store
+            .as_ref()
+            .expect("mv_store should be Some when MVCC transaction is active")
+            .clone();
+        Ok(Box::new(MvCursor::new(
+            mv_store,
+            conn,
+            tx_id,
+            1,
+            MvccCursorType::Table,
+            btree_cursor,
+        )?))
+    } else {
+        Ok(btree_cursor)
+    }
+}
+
+/// Drive the schema table cursor one step at a time.
+/// Returns IO to the outer VDBE loop when the schema cursor needs it,
 /// preserving all intermediate parsing state for resumption.
 fn op_parse_schema_step(
     state: &mut ProgramState,
@@ -11054,147 +11055,150 @@ fn op_parse_schema_step(
 ) -> Result<InsnFunctionStepResult> {
     loop {
         let inner = state.active_op_state.parse_schema().as_mut().unwrap();
-        match inner.stmt.step()? {
-            StepResult::IO => {
-                let io = inner
-                    .stmt
-                    .take_io_completions()
-                    .expect("IO returned but no completions");
-                return Ok(InsnFunctionStepResult::IO(io));
+        match inner.phase {
+            OpParseSchemaPhase::Rewinding => {
+                return_if_io!(inner.cursor.rewind());
+                inner.phase = OpParseSchemaPhase::FetchingRecord;
             }
-            StepResult::Row => {
-                let inner = state
-                    .active_op_state
-                    .parse_schema()
-                    .as_mut()
-                    .expect("parse schema state should exist");
-                let row = inner.stmt.row().expect("row should be present");
-                let ty = row.get::<&str>(0)?;
-                let name = row.get::<&str>(1)?;
-                let table_name = row.get::<&str>(2)?;
-                let root_page = row.get::<i64>(3)?;
-                let sql = row.get::<&str>(4).ok();
-                let schema = Arc::make_mut(&mut inner.schema_arc);
-                let syms = conn.syms.read();
-                let attached_resolver = |alias: &str| -> Option<usize> {
-                    conn.attached_databases()
-                        .read()
-                        .get_database_by_name(&crate::util::normalize_ident(alias))
-                        .map(|(idx, _)| idx)
+            OpParseSchemaPhase::FetchingRecord => {
+                let row = return_if_io!(inner.cursor.record());
+                let Some(row) = row else {
+                    return finish_parse_schema(state, conn);
                 };
-                schema.handle_schema_row(
-                    ty,
-                    name,
-                    table_name,
-                    root_page,
-                    sql,
-                    &syms,
-                    &mut inner.from_sql_indexes,
-                    &mut inner.automatic_indices,
-                    &mut inner.dbsp_state_roots,
-                    &mut inner.dbsp_state_index_roots,
-                    &mut inner.materialized_view_info,
-                    &attached_resolver,
-                )?;
-                continue;
-            }
-            StepResult::Done => {
-                // Take the state to finalize
-                let OpParseSchemaInner {
-                    stmt,
-                    mut schema_arc,
-                    from_sql_indexes,
-                    automatic_indices,
-                    dbsp_state_roots,
-                    dbsp_state_index_roots,
-                    materialized_view_info,
-                    db,
-                    previous_auto_commit,
-                } = *state
-                    .active_op_state
-                    .parse_schema()
-                    .take()
-                    .expect("parse schema state should exist");
-                let schema = Arc::make_mut(&mut schema_arc);
-                let mv_store = stmt.mv_store();
-                let syms = conn.syms.read();
 
-                let res1 = schema.populate_indices(
-                    &syms,
-                    from_sql_indexes,
-                    automatic_indices,
-                    mv_store.is_some(),
-                );
-                let res2 = schema.populate_materialized_views(
-                    materialized_view_info,
-                    dbsp_state_roots,
-                    dbsp_state_index_roots,
-                );
+                let ty = schema_text_column(row, 0, "type")?.to_string();
+                let name = schema_text_column(row, 1, "name")?.to_string();
+                let table_name = schema_text_column(row, 2, "tbl_name")?.to_string();
+                let root_page = schema_integer_column(row, 3, "rootpage")?;
+                let sql = match row.get_value(4)? {
+                    ValueRef::Text(sql) => Some(sql.as_str().to_string()),
+                    _ => None,
+                };
 
-                // Store the modified schema back
-                if db == crate::TEMP_DB_ID {
-                    // TEMP: write directly to `temp_db.db.schema` — the single
-                    // source of truth; never stage in `database_schemas`.
-                    //
-                    // Refresh schema_version from the pager header first. At
-                    // this point SetCookie has already run for the current
-                    // DDL, so the header cookie is authoritative; without this
-                    // the cached version can drift on subsequent temp DDLs in
-                    // the same transaction and trigger a spurious
-                    // SchemaUpdated -> reprepare -> rollback_attached() loop
-                    // that wipes in-flight dirty pages.
-                    if let Some(temp_db) = conn.temp.database.read().as_ref() {
-                        if let Some(cookie) = temp_db.pager.get_schema_cookie_cached() {
-                            schema.schema_version = cookie;
-                        }
-                        *temp_db.db.schema.lock() = schema_arc;
-                    }
-                } else if db != crate::MAIN_DB_ID {
-                    conn.database_schemas().write().insert(db, schema_arc);
-                } else {
-                    *conn.schema.write() = schema_arc;
+                if inner.filter.matches(&ty, &name, &table_name) {
+                    let schema = Arc::make_mut(&mut inner.schema_arc);
+                    let syms = conn.syms.read();
+                    let attached_resolver = |alias: &str| -> Option<usize> {
+                        conn.attached_databases()
+                            .read()
+                            .get_database_by_name(&crate::util::normalize_ident(alias))
+                            .map(|(idx, _)| idx)
+                    };
+                    schema.handle_schema_row(
+                        &ty,
+                        &name,
+                        &table_name,
+                        root_page,
+                        sql.as_deref(),
+                        &syms,
+                        &mut inner.from_sql_indexes,
+                        &mut inner.automatic_indices,
+                        &mut inner.dbsp_state_roots,
+                        &mut inner.dbsp_state_index_roots,
+                        &mut inner.materialized_view_info,
+                        &attached_resolver,
+                    )?;
                 }
-                drop(stmt);
-                conn.auto_commit
-                    .store(previous_auto_commit, Ordering::SeqCst);
-                let _ = (res1?, res2?);
 
-                state.pc += 1;
-                state.active_op_state.clear();
-                return Ok(InsnFunctionStepResult::Step);
+                inner.phase = OpParseSchemaPhase::Advancing;
             }
-            StepResult::Interrupt => {
-                let OpParseSchemaInner {
-                    stmt,
-                    previous_auto_commit,
-                    ..
-                } = *state
-                    .active_op_state
-                    .parse_schema()
-                    .take()
-                    .expect("parse schema state should exist");
-                drop(stmt);
-                conn.auto_commit
-                    .store(previous_auto_commit, Ordering::SeqCst);
-                return Err(LimboError::Interrupt);
-            }
-            StepResult::Busy => {
-                let OpParseSchemaInner {
-                    stmt,
-                    previous_auto_commit,
-                    ..
-                } = *state
-                    .active_op_state
-                    .parse_schema()
-                    .take()
-                    .expect("parse schema state should exist");
-                drop(stmt);
-                conn.auto_commit
-                    .store(previous_auto_commit, Ordering::SeqCst);
-                return Err(LimboError::Busy);
+            OpParseSchemaPhase::Advancing => {
+                return_if_io!(inner.cursor.next());
+                if inner.cursor.has_record() {
+                    inner.phase = OpParseSchemaPhase::FetchingRecord;
+                    continue;
+                }
+                return finish_parse_schema(state, conn);
             }
         }
     }
+}
+
+fn finish_parse_schema(
+    state: &mut ProgramState,
+    conn: &Arc<Connection>,
+) -> Result<InsnFunctionStepResult> {
+    let OpParseSchemaInner {
+        mut schema_arc,
+        from_sql_indexes,
+        automatic_indices,
+        dbsp_state_roots,
+        dbsp_state_index_roots,
+        materialized_view_info,
+        db,
+        ..
+    } = *state
+        .active_op_state
+        .parse_schema()
+        .take()
+        .expect("parse schema state should exist");
+    let schema = Arc::make_mut(&mut schema_arc);
+    let mv_store = conn.mv_store_for_db(db);
+    let syms = conn.syms.read();
+
+    let res1 = schema.populate_indices(
+        &syms,
+        from_sql_indexes,
+        automatic_indices,
+        mv_store.is_some(),
+    );
+    let res2 = schema.populate_materialized_views(
+        materialized_view_info,
+        dbsp_state_roots,
+        dbsp_state_index_roots,
+    );
+
+    // Store the modified schema back
+    if db == crate::TEMP_DB_ID {
+        // TEMP: write directly to `temp_db.db.schema` — the single
+        // source of truth; never stage in `database_schemas`.
+        //
+        // Refresh schema_version from the pager header first. At
+        // this point SetCookie has already run for the current
+        // DDL, so the header cookie is authoritative; without this
+        // the cached version can drift on subsequent temp DDLs in
+        // the same transaction and trigger a spurious
+        // SchemaUpdated -> reprepare -> rollback_attached() loop
+        // that wipes in-flight dirty pages.
+        if let Some(temp_db) = conn.temp.database.read().as_ref() {
+            if let Some(cookie) = temp_db.pager.get_schema_cookie_cached() {
+                schema.schema_version = cookie;
+            }
+            *temp_db.db.schema.lock() = schema_arc;
+        }
+    } else if db != crate::MAIN_DB_ID {
+        conn.database_schemas().write().insert(db, schema_arc);
+    } else {
+        *conn.schema.write() = schema_arc;
+    }
+    conn.bump_prepare_context_generation();
+    let _ = (res1?, res2?);
+
+    state.pc += 1;
+    state.active_op_state.clear();
+    Ok(InsnFunctionStepResult::Step)
+}
+
+fn schema_text_column<'a>(
+    row: &'a ImmutableRecord,
+    column: usize,
+    column_name: &str,
+) -> Result<&'a str> {
+    let ValueRef::Text(value) = row.get_value(column)? else {
+        return Err(LimboError::ConversionError(format!(
+            "Expected text value for sqlite_schema.{column_name}"
+        )));
+    };
+    Ok(value.as_str())
+}
+
+fn schema_integer_column(row: &ImmutableRecord, column: usize, column_name: &str) -> Result<i64> {
+    let ValueRef::Numeric(Numeric::Integer(value)) = row.get_value(column)? else {
+        return Err(LimboError::ConversionError(format!(
+            "Expected integer value for sqlite_schema.{column_name}"
+        )));
+    };
+    Ok(value)
 }
 
 /// Phases of the multi-statement state machine driven by [`op_init_cdc_version`].

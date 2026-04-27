@@ -1748,14 +1748,14 @@ pub fn insn_to_row(
                 0,
                 format!("if (r[{}]==NULL) goto {}", reg, target_pc.as_debug_int()),
             ),
-            Insn::ParseSchema { db, where_clause } => (
+            Insn::ParseSchema { db, filter } => (
                 "ParseSchema",
                 *db as i64,
                 0,
                 0,
-                Value::build_text(where_clause.clone().unwrap_or_else(|| "NULL".to_string())),
+                Value::build_text(filter.explain()),
                 0,
-                where_clause.clone().unwrap_or_else(|| "NULL".to_string()),
+                filter.explain(),
             ),
             Insn::PopulateMaterializedViews { cursors } => (
                 "PopulateMaterializedViews",
