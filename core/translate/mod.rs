@@ -137,6 +137,11 @@ pub fn translate(
     };
 
     {
+        let _stack = crate::stack::trace_scope("translate:compile_deferred_triggers");
+        trigger_exec::compile_deferred_trigger_programs(&mut program, &mut resolver, &connection)?;
+    }
+
+    {
         let _stack = crate::stack::trace_scope("translate:epilogue");
         program.epilogue(schema);
     }

@@ -220,6 +220,7 @@ pub struct ProgramBuilder {
     ctes_being_defined: Vec<String>,
     /// If this ProgramBuilder is building trigger subprogram, a ref to the trigger is stored here.
     pub trigger: Option<Arc<Trigger>>,
+    pub deferred_trigger_programs: Vec<DeferredTriggerProgram>,
     pub table_reference_counter: TableRefIdCounter,
     /// Curr collation sequence. Bool indicates whether it was set by a COLLATE expr
     collation: Option<(CollationSeq, bool)>,
@@ -289,6 +290,18 @@ pub struct ProgramBuilder {
     /// `UnionValueFunc` handler in expr.rs saves/restores this to the inner union
     /// type before translating the value argument.
     pub(crate) target_union_type: Option<Arc<crate::schema::TypeDef>>,
+}
+
+#[derive(Debug, Clone)]
+pub struct DeferredTriggerProgram {
+    pub insn_index: usize,
+    pub trigger: Arc<Trigger>,
+    pub table: Arc<BTreeTable>,
+    pub new_registers: Option<Vec<usize>>,
+    pub old_registers: Option<Vec<usize>>,
+    pub override_conflict: Option<ResolveType>,
+    pub database_id: usize,
+    pub ignore_jump_target: BranchOffset,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -677,6 +690,7 @@ impl ProgramBuilder {
             reg_result_cols_start: None,
             flags: ProgramBuilderFlags::new(is_subprogram),
             trigger,
+            deferred_trigger_programs: Vec::new(),
             resolve_type: ResolveType::Abort,
             trigger_conflict_override: None,
             cursor_overrides: HashMap::default(),
@@ -1006,6 +1020,12 @@ impl ProgramBuilder {
         self.flags
             .set_readonly(self.flags.readonly() & insn.is_readonly());
         self.insns.push((insn, self.insns.len()));
+    }
+
+    pub fn replace_insn(&mut self, index: usize, insn: Insn) {
+        self.flags
+            .set_readonly(self.flags.readonly() & insn.is_readonly());
+        self.insns[index].0 = insn;
     }
 
     /// Emit an instruction that should not start or extend a constant span on its own.
