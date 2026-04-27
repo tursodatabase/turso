@@ -596,11 +596,11 @@ pub struct ProgramState {
     pub parameters: Vec<Value>,
     commit_state: CommitState,
     #[cfg(feature = "json")]
-    json_cache: JsonCacheCell,
+    json_cache: Box<JsonCacheCell>,
     active_op_state: ActiveOpStateSlot,
     seek_state: OpSeekState,
     /// Metrics collected for the lifetime of this prepared statement.
-    pub metrics: StatementMetrics,
+    pub metrics: Box<StatementMetrics>,
     /// Current collation sequence set by OP_CollSeq instruction
     current_collation: Option<CollationSeq>,
     op_vacuum_state: VacuumOpState,
@@ -688,10 +688,10 @@ impl ProgramState {
             parameters: Vec::new(),
             commit_state: CommitState::Ready,
             #[cfg(feature = "json")]
-            json_cache: JsonCacheCell::new(),
+            json_cache: Box::new(JsonCacheCell::new()),
             active_op_state: ActiveOpStateSlot::default(),
             seek_state: OpSeekState::Start,
-            metrics: StatementMetrics::new(),
+            metrics: Box::new(StatementMetrics::new()),
             distinct_key_values: Vec::new(),
             current_collation: None,
             op_vacuum_state: VacuumOpState::None,
@@ -844,7 +844,7 @@ impl ProgramState {
     }
 
     pub(crate) fn metrics(&self) -> StatementMetrics {
-        let mut metrics = self.metrics.clone();
+        let mut metrics = self.metrics.as_ref().clone();
         if let Some(OpProgramState::Step { statement, .. }) = self.active_op_state.program_ref() {
             metrics.merge(&statement.metrics());
         }
