@@ -4405,6 +4405,12 @@ fn test_plain_vacuum_preserves_fts_index(tmp_db: TempDatabase) -> anyhow::Result
             .any(|(_, _, _, detail)| detail.contains("INDEX METHOD")),
         "FTS query should use an index method after plain VACUUM, got plan: {eqp:?}",
     );
+    conn.execute(
+        "INSERT INTO articles VALUES (5, 'Vacuum Export', 'Full text search stays usable after vacuum')",
+    )?;
+    let vacuum_matches: Vec<(i64,)> = conn
+        .exec_rows("SELECT id FROM articles WHERE fts_match(title, body, 'vacuum') ORDER BY id");
+    assert_eq!(vacuum_matches, vec![(5,)]);
     assert_plain_vacuum_folded_into_db_file(&tmp_db, &conn);
 
     Ok(())
@@ -5270,170 +5276,6 @@ fn test_plain_vacuum_preserves_indexes(tmp_db: TempDatabase) -> anyhow::Result<(
     let rows: Vec<(i64, String)> =
         conn.exec_rows("SELECT a, b FROM t1 INDEXED BY idx_t1_b WHERE b = 'gamma'");
     assert_eq!(rows, vec![(3, "gamma".to_string())]);
-
-    Ok(())
-}
-
-/// Plain VACUUM must preserve `sqlite_stat1` rows produced by ANALYZE.
-#[turso_macros::test(mvcc)]
-fn test_plain_vacuum_preserves_sqlite_stat1(tmp_db: TempDatabase) -> anyhow::Result<()> {
-    let conn = tmp_db.connect_limbo();
-
-    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, category TEXT, value INTEGER)")?;
-    conn.execute("CREATE INDEX idx_t_category_value ON t(category, value)")?;
-    for i in 0..50 {
-        let category = if i % 2 == 0 { "even" } else { "odd" };
-        conn.execute(format!(
-            "INSERT INTO t VALUES ({i}, '{category}', {})",
-            i * 10
-        ))?;
-    }
-    conn.execute("ANALYZE")?;
-
-    let source_stats: Vec<(String, String, String)> =
-        conn.exec_rows("SELECT tbl, COALESCE(idx, ''), stat FROM sqlite_stat1 ORDER BY tbl, idx");
-    assert!(
-        !source_stats.is_empty(),
-        "ANALYZE should populate sqlite_stat1"
-    );
-
-    run_plain_vacuum_and_assert_round_trip(&tmp_db, &conn)?;
-
-    let dest_stats: Vec<(String, String, String)> =
-        conn.exec_rows("SELECT tbl, COALESCE(idx, ''), stat FROM sqlite_stat1 ORDER BY tbl, idx");
-    assert_eq!(dest_stats, source_stats);
-
-    let count: Vec<(i64,)> = conn.exec_rows("SELECT COUNT(*) FROM t WHERE category = 'even'");
-    assert_eq!(count, vec![(25,)]);
-
-    Ok(())
-}
-
-/// Plain VACUUM must preserve custom index-method indexes on the source
-/// connection after schema reload.
-#[turso_macros::test]
-fn test_plain_vacuum_preserves_custom_index_method(tmp_db: TempDatabase) -> anyhow::Result<()> {
-    let conn = tmp_db.connect_limbo();
-
-    conn.execute("CREATE TABLE vectors (id INTEGER PRIMARY KEY, label TEXT, embedding BLOB)")?;
-    conn.execute("CREATE INDEX vec_idx ON vectors USING toy_vector_sparse_ivf (embedding)")?;
-    conn.execute("INSERT INTO vectors VALUES (1, 'cat', vector32_sparse('[1, 0, 0, 0]'))")?;
-    conn.execute("INSERT INTO vectors VALUES (2, 'dog', vector32_sparse('[0, 1, 0, 0]'))")?;
-    conn.execute("INSERT INTO vectors VALUES (3, 'fish', vector32_sparse('[0, 0, 1, 0]'))")?;
-    let before_nearest: Vec<(i64, String, f64)> = conn.exec_rows(
-        "SELECT id, label, vector_distance_jaccard(embedding, vector32_sparse('[1, 0, 0, 0]')) AS distance \
-         FROM vectors ORDER BY distance LIMIT 1",
-    );
-
-    assert_plain_vacuum_preserves_content_hash(&tmp_db, &conn)?;
-
-    let indexes: Vec<(String,)> = conn.exec_rows(
-        "SELECT name FROM sqlite_schema WHERE type = 'index' AND tbl_name = 'vectors' ORDER BY name",
-    );
-    assert_eq!(
-        indexes,
-        vec![
-            ("vec_idx".to_string(),),
-            ("vec_idx_inverted_index".to_string(),),
-            ("vec_idx_stats".to_string(),),
-        ],
-    );
-
-    let eqp: Vec<(i64, i64, i64, String)> = conn.exec_rows(
-        "EXPLAIN QUERY PLAN \
-         SELECT id, label, vector_distance_jaccard(embedding, vector32_sparse('[1, 0, 0, 0]')) AS distance \
-         FROM vectors ORDER BY distance LIMIT 1",
-    );
-    assert!(
-        eqp.iter()
-            .any(|(_, _, _, detail)| detail.contains("INDEX METHOD")),
-        "nearest-neighbor query should use custom index method after plain VACUUM, got plan: {eqp:?}",
-    );
-
-    let nearest: Vec<(i64, String, f64)> = conn.exec_rows(
-        "SELECT id, label, vector_distance_jaccard(embedding, vector32_sparse('[1, 0, 0, 0]')) AS distance \
-         FROM vectors ORDER BY distance LIMIT 1",
-    );
-    assert_eq!(nearest, before_nearest);
-    assert_plain_vacuum_folded_into_db_file(&tmp_db, &conn);
-
-    Ok(())
-}
-
-#[cfg(all(feature = "fts", not(target_family = "wasm")))]
-#[turso_macros::test]
-fn test_plain_vacuum_preserves_fts_index(tmp_db: TempDatabase) -> anyhow::Result<()> {
-    let conn = tmp_db.connect_limbo();
-
-    conn.execute("CREATE TABLE articles(id INTEGER PRIMARY KEY, title TEXT, body TEXT)")?;
-    conn.execute("CREATE INDEX fts_articles ON articles USING fts (title, body)")?;
-    conn.execute("INSERT INTO articles VALUES (1, 'Database Performance', 'Optimizing database queries is important for performance')")?;
-    conn.execute("INSERT INTO articles VALUES (2, 'Web Development', 'Modern web applications use JavaScript and APIs')")?;
-    conn.execute("INSERT INTO articles VALUES (3, 'Database Design', 'Good database design leads to better performance')")?;
-    conn.execute("INSERT INTO articles VALUES (4, 'API Development', 'RESTful APIs are common in web services')")?;
-
-    let before_database_matches: Vec<(i64,)> = conn
-        .exec_rows("SELECT id FROM articles WHERE fts_match(title, body, 'database') ORDER BY id");
-
-    assert_plain_vacuum_preserves_content_hash(&tmp_db, &conn)?;
-
-    let after_database_matches: Vec<(i64,)> = conn
-        .exec_rows("SELECT id FROM articles WHERE fts_match(title, body, 'database') ORDER BY id");
-    assert_eq!(after_database_matches, before_database_matches);
-
-    let web_matches: Vec<(i64,)> =
-        conn.exec_rows("SELECT id FROM articles WHERE fts_match(title, body, 'web') ORDER BY id");
-    assert_eq!(web_matches, vec![(2,), (4,)]);
-
-    let eqp: Vec<(i64, i64, i64, String)> = conn.exec_rows(
-        "EXPLAIN QUERY PLAN \
-         SELECT id FROM articles WHERE fts_match(title, body, 'database')",
-    );
-    assert!(
-        eqp.iter()
-            .any(|(_, _, _, detail)| detail.contains("INDEX METHOD")),
-        "FTS query should use an index method after plain VACUUM, got plan: {eqp:?}",
-    );
-
-    conn.execute(
-        "INSERT INTO articles VALUES (5, 'Vacuum Export', 'Full text search stays usable after vacuum')",
-    )?;
-    let vacuum_matches: Vec<(i64,)> = conn
-        .exec_rows("SELECT id FROM articles WHERE fts_match(title, body, 'vacuum') ORDER BY id");
-    assert_eq!(vacuum_matches, vec![(5,)]);
-
-    Ok(())
-}
-
-/// Plain VACUUM must preserve vector blobs stored as ordinary BLOB data.
-#[turso_macros::test]
-fn test_plain_vacuum_preserves_vector_blobs(tmp_db: TempDatabase) -> anyhow::Result<()> {
-    let conn = tmp_db.connect_limbo();
-
-    conn.execute("CREATE TABLE vectors (id INTEGER PRIMARY KEY, label TEXT, embedding BLOB)")?;
-    conn.execute("INSERT INTO vectors VALUES (1, 'cat', vector32('[1.0, 0.0, 0.0, 0.0]'))")?;
-    conn.execute("INSERT INTO vectors VALUES (2, 'dog', vector32('[0.0, 1.0, 0.0, 0.0]'))")?;
-    conn.execute("INSERT INTO vectors VALUES (3, 'fish', vector32('[0.0, 0.0, 1.0, 0.0]'))")?;
-
-    let before_dist: Vec<(f64,)> = conn.exec_rows(
-        "SELECT vector_distance_cos(
-            (SELECT embedding FROM vectors WHERE id = 1),
-            (SELECT embedding FROM vectors WHERE id = 2)
-        )",
-    );
-
-    assert_plain_vacuum_preserves_content_hash(&tmp_db, &conn)?;
-
-    let count: Vec<(i64,)> = conn.exec_rows("SELECT COUNT(*) FROM vectors");
-    assert_eq!(count[0].0, 3);
-
-    let after_dist: Vec<(f64,)> = conn.exec_rows(
-        "SELECT vector_distance_cos(
-            (SELECT embedding FROM vectors WHERE id = 1),
-            (SELECT embedding FROM vectors WHERE id = 2)
-        )",
-    );
-    assert_eq!(after_dist, before_dist);
 
     Ok(())
 }
