@@ -521,23 +521,29 @@ fn plan_cte(
     connection: &Arc<crate::Connection>,
     actual_reference: bool,
 ) -> Result<JoinedTable> {
-    let _stack = crate::stack::trace_scope_with_detail(
-        "planner:plan_cte",
-        if actual_reference {
-            "actual_reference"
-        } else {
-            "visibility"
-        },
-    );
     let cte_def = &cte_definitions[cte_idx];
+    let _stack = crate::stack::trace_scope_with_dynamic_detail("planner:plan_cte", || {
+        format!(
+            "name={},mode={}",
+            cte_def.name,
+            if actual_reference {
+                "actual_reference"
+            } else {
+                "visibility"
+            }
+        )
+    });
 
     // Build outer_query_refs including only the CTEs this one directly references.
     // By tracking direct dependencies instead of all preceding CTEs, we avoid
     // exponential re-planning when CTEs have transitive dependencies.
     let mut outer_query_refs = base_outer_query_refs.to_vec();
     for &ref_idx in &cte_def.referenced_cte_indices {
-        let _stack = crate::stack::trace_scope("planner:plan_cte_dependency");
         let ref_cte_name = &cte_definitions[ref_idx].name;
+        let _stack =
+            crate::stack::trace_scope_with_dynamic_detail("planner:plan_cte_dependency", || {
+                format!("from={},to={ref_cte_name}", cte_def.name)
+            });
         // Check if this CTE has already been planned and is in outer_query_refs.
         // This avoids exponential re-planning when CTEs have transitive dependencies.
         if outer_query_refs
@@ -582,7 +588,10 @@ fn plan_cte(
 
     // Plan this CTE with fresh IDs
     let cte_plan = {
-        let _stack = crate::stack::trace_scope("planner:plan_cte_prepare_select");
+        let _stack = crate::stack::trace_scope_with_dynamic_detail(
+            "planner:plan_cte_prepare_select",
+            || cte_def.name.clone(),
+        );
         prepare_select_plan(
             simplify_transparent_cte_select(cte_def.select.clone()),
             resolver,
@@ -735,6 +744,45 @@ pub fn plan_ctes_as_outer_refs(
     Ok(())
 }
 
+fn select_table_stack_detail(table: &ast::SelectTable) -> String {
+    match table {
+        ast::SelectTable::Table(qualified_name, maybe_alias, _) => {
+            format!(
+                "table={}",
+                table_reference_stack_detail(
+                    &normalize_ident(qualified_name.name.as_str()),
+                    maybe_alias.as_ref(),
+                )
+            )
+        }
+        ast::SelectTable::TableCall(qualified_name, _, maybe_alias) => {
+            format!(
+                "table_call={}",
+                table_reference_stack_detail(
+                    &normalize_ident(qualified_name.name.as_str()),
+                    maybe_alias.as_ref(),
+                )
+            )
+        }
+        ast::SelectTable::Select(_, maybe_alias) => maybe_alias
+            .as_ref()
+            .map(|alias| format!("subselect={}", normalize_ident(alias.name().as_str())))
+            .unwrap_or_else(|| "subselect=(anonymous)".to_string()),
+        ast::SelectTable::Sub(_, maybe_alias) => maybe_alias
+            .as_ref()
+            .map(|alias| format!("sub={}", normalize_ident(alias.name().as_str())))
+            .unwrap_or_else(|| "sub=(anonymous)".to_string()),
+    }
+}
+
+fn table_reference_stack_detail(table_name: &str, maybe_alias: Option<&As>) -> String {
+    if let Some(alias) = maybe_alias {
+        format!("{table_name} as {}", normalize_ident(alias.name().as_str()))
+    } else {
+        table_name.to_string()
+    }
+}
+
 fn parse_from_clause_table(
     table: ast::SelectTable,
     resolver: &Resolver,
@@ -744,6 +792,9 @@ fn parse_from_clause_table(
     cte_definitions: &[CteDefinition],
     connection: &Arc<crate::Connection>,
 ) -> Result<()> {
+    let _stack = crate::stack::trace_scope_with_dynamic_detail("planner:parse_from_table", || {
+        select_table_stack_detail(&table)
+    });
     match table {
         ast::SelectTable::Table(qualified_name, maybe_alias, indexed) => parse_table(
             table_references,
@@ -875,7 +926,10 @@ fn parse_table(
         .iter()
         .position(|cte| cte.name == normalized_qualified_name)
     {
-        let _stack = crate::stack::trace_scope("planner:parse_table_current_cte");
+        let _stack = crate::stack::trace_scope_with_dynamic_detail(
+            "planner:parse_table_current_cte",
+            || table_reference_stack_detail(&normalized_qualified_name, maybe_alias),
+        );
         let planning_outer_query_refs =
             base_outer_refs_for_cte_planning(table_references.outer_query_refs(), cte_definitions);
         // This is an actual CTE reference in the FROM/JOIN clause - count it
@@ -929,7 +983,10 @@ fn parse_table(
         };
 
         if let Some(cte_ast) = cte_select {
-            let _stack = crate::stack::trace_scope("planner:parse_table_outer_cte_replan");
+            let _stack = crate::stack::trace_scope_with_dynamic_detail(
+                "planner:parse_table_outer_cte_replan",
+                || table_reference_stack_detail(&normalized_qualified_name, maybe_alias),
+            );
             // Re-plan the CTE from its original AST to get fresh internal_ids.
             // This prevents cursor key collisions when the same CTE is
             // referenced multiple times in the same scope.
@@ -1257,7 +1314,14 @@ pub fn parse_from(
     table_references: &mut TableReferences,
     connection: &Arc<crate::Connection>,
 ) -> Result<()> {
-    let _stack = crate::stack::trace_scope("planner:parse_from");
+    let cte_count = with.as_ref().map_or(0, |with| with.ctes.len());
+    let from_table_count = from.as_ref().map_or(0, |from| 1 + from.joins.len());
+    let _stack = crate::stack::trace_scope_with_dynamic_detail("planner:parse_from", || {
+        format!(
+            "ctes={cte_count},from_tables={from_table_count},preplan_ctes_for_non_from_subqueries={preplan_ctes_for_non_from_subqueries},outer_refs={}",
+            table_references.outer_query_refs().len()
+        )
+    });
     // Collect CTE definitions instead of planning them immediately.
     // Each CTE reference will be planned fresh when encountered, ensuring unique internal_ids.
     let mut cte_definitions: Vec<CteDefinition> = vec![];
@@ -1314,8 +1378,10 @@ pub fn parse_from(
                 &cte_definitions,
             );
             {
-                let _stack =
-                    crate::stack::trace_scope("planner:preplan_ctes_for_non_from_subqueries");
+                let _stack = crate::stack::trace_scope_with_dynamic_detail(
+                    "planner:preplan_ctes_for_non_from_subqueries",
+                    || format!("ctes={}", cte_definitions.len()),
+                );
                 for (idx, cte_def) in cte_definitions.iter().enumerate() {
                     let cte_table = plan_cte(
                         idx,

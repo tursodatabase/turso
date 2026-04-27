@@ -5869,7 +5869,10 @@ pub fn bind_and_rewrite_expr<'a>(
         &mut |expr: &mut ast::Expr| -> Result<WalkControl> {
             match expr {
                 Expr::Id(id) => {
-                    let _stack = crate::stack::trace_scope("expr:bind_id");
+                    let _stack =
+                        crate::stack::trace_scope_with_dynamic_detail("expr:bind_id", || {
+                            id.as_str().to_string()
+                        });
                     let Some(referenced_tables) = &mut referenced_tables else {
                         if binding_behavior == BindingBehavior::AllowUnboundIdentifiers {
                             return Ok(WalkControl::Continue);

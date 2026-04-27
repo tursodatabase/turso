@@ -165,7 +165,10 @@ pub fn prepare_select_plan(
     query_destination: QueryDestination,
     connection: &Arc<crate::Connection>,
 ) -> Result<Plan> {
-    let _stack = crate::stack::trace_scope("select:prepare_select_plan");
+    let _stack =
+        crate::stack::trace_scope_with_dynamic_detail("select:prepare_select_plan", || {
+            select_stack_detail(&select)
+        });
     let compounds = select.body.compounds;
     match compounds.is_empty() {
         true => Ok(Plan::Select(Box::new(prepare_one_select_plan(
@@ -261,6 +264,58 @@ pub fn prepare_select_plan(
     }
 }
 
+fn select_stack_detail(select: &ast::Select) -> String {
+    format!(
+        "with_ctes={},compounds={},order_by={},limit={}",
+        select.with.as_ref().map_or(0, |with| with.ctes.len()),
+        select.body.compounds.len(),
+        select.order_by.len(),
+        select.limit.is_some()
+    )
+}
+
+fn one_select_stack_detail(
+    select: &ast::OneSelect,
+    limit: Option<&ast::Limit>,
+    order_by: &[ast::SortedColumn],
+    with: Option<&ast::With>,
+    outer_query_refs: &[OuterQueryReference],
+) -> String {
+    match select {
+        ast::OneSelect::Select {
+            columns,
+            from,
+            where_clause,
+            group_by,
+            window_clause,
+            ..
+        } => {
+            let from_tables = from.as_ref().map_or(0, |from| 1 + from.joins.len());
+            format!(
+                "kind=select,columns={},from_tables={from_tables},where={},group_by={},windows={},order_by={},limit={},with_ctes={},outer_refs={}",
+                columns.len(),
+                where_clause.is_some(),
+                group_by.is_some(),
+                window_clause.len(),
+                order_by.len(),
+                limit.is_some(),
+                with.map_or(0, |with| with.ctes.len()),
+                outer_query_refs.len()
+            )
+        }
+        ast::OneSelect::Values(rows) => {
+            format!(
+                "kind=values,rows={},order_by={},limit={},with_ctes={},outer_refs={}",
+                rows.len(),
+                order_by.len(),
+                limit.is_some(),
+                with.map_or(0, |with| with.ctes.len()),
+                outer_query_refs.len()
+            )
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn prepare_one_select_plan(
     select: ast::OneSelect,
@@ -273,7 +328,16 @@ fn prepare_one_select_plan(
     query_destination: QueryDestination,
     connection: &Arc<crate::Connection>,
 ) -> Result<SelectPlan> {
-    let _stack = crate::stack::trace_scope("select:prepare_one_select_plan");
+    let _stack =
+        crate::stack::trace_scope_with_dynamic_detail("select:prepare_one_select_plan", || {
+            one_select_stack_detail(
+                &select,
+                limit.as_ref(),
+                &order_by,
+                with.as_ref(),
+                outer_query_refs,
+            )
+        });
     match select {
         ast::OneSelect::Select {
             columns,
@@ -414,7 +478,17 @@ fn prepare_one_select_plan(
                 connection.get_full_column_names() && !connection.get_short_column_names();
             let mut aggregate_expressions = Vec::new();
             {
-                let _stack = crate::stack::trace_scope("select:bind_result_columns");
+                let _stack = crate::stack::trace_scope_with_dynamic_detail(
+                    "select:bind_result_columns",
+                    || {
+                        format!(
+                            "columns={},tables={},outer_refs={}",
+                            columns.len(),
+                            plan.table_references.joined_tables().len(),
+                            plan.table_references.outer_query_refs().len()
+                        )
+                    },
+                );
                 for column in columns.into_iter() {
                     match column {
                         ResultColumn::Star => {

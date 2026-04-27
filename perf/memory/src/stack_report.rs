@@ -23,13 +23,27 @@ enum OutputFormat {
     Csv,
 }
 
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum StackProfile {
+    /// Reduced variants of a multi-CTE read query with JSON aggregation.
+    ComplexCteMatrix,
+    /// Generated-column ALTER TABLE and expression-bearing CREATE INDEX statements.
+    GeneratedIndexDdl,
+    /// INSERT statements that fire validation triggers with subqueries.
+    TriggerInsert,
+}
+
 #[derive(Parser, Debug)]
 #[command(name = "stack-report")]
 #[command(about = "Run a SQL payload and summarize turso stacker tracing samples")]
 struct Args {
     /// SQL file to execute. Use '-' to read from stdin.
-    #[arg(long = "sql", short = 's')]
-    sql: PathBuf,
+    #[arg(long = "sql", short = 's', required_unless_present = "profile")]
+    sql: Option<PathBuf>,
+
+    /// Built-in SQL profile to execute instead of a SQL file.
+    #[arg(long = "profile", value_enum, conflicts_with = "sql")]
+    profile: Option<StackProfile>,
 
     /// Maximum number of heaviest span samples to print per statement in human output.
     #[arg(long = "top", default_value = "40")]
@@ -234,7 +248,7 @@ async fn main() -> Result<()> {
     tracing::subscriber::set_global_default(subscriber)
         .context("failed to install stack tracing subscriber")?;
 
-    let sql = read_sql(&args.sql)?;
+    let input = load_sql_input(&args)?;
 
     let db = turso::Builder::new_local(":memory:")
         .experimental_generated_columns(true)
@@ -243,7 +257,8 @@ async fn main() -> Result<()> {
         .build()
         .await?;
     let conn = db.connect()?;
-    let mut statements = execute_sql_payload(&conn, &sql, Arc::clone(&collector), &args).await?;
+    let mut statements =
+        execute_sql_payload(&conn, &input.sql, Arc::clone(&collector), &args).await?;
     statements.sort_by(|a, b| {
         b.stack_used
             .cmp(&a.stack_used)
@@ -252,8 +267,8 @@ async fn main() -> Result<()> {
     let samples = statements.iter().map(|statement| statement.samples).sum();
     let span_aggregates = build_global_span_aggregates(&statements);
     let report = StackReport {
-        sql: args.sql.display().to_string(),
-        db: ":memory:".to_string(),
+        sql: input.name,
+        db: ":memory: generated_columns=true custom_types=true materialized_views=true".to_string(),
         samples,
         span_aggregates,
         statements,
@@ -268,12 +283,318 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
+struct SqlInput {
+    name: String,
+    sql: String,
+}
+
+fn load_sql_input(args: &Args) -> Result<SqlInput> {
+    if let Some(profile) = args.profile {
+        return Ok(profile_sql(profile));
+    }
+
+    let path = args.sql.as_ref().context("--sql is required")?;
+    let sql = read_sql(path)?;
+    Ok(SqlInput {
+        name: path.display().to_string(),
+        sql,
+    })
+}
+
 fn read_sql(path: &PathBuf) -> Result<String> {
     if path.as_os_str() == "-" {
         std::io::read_to_string(std::io::stdin()).context("failed to read SQL from stdin")
     } else {
         fs::read_to_string(path).with_context(|| format!("failed to read {}", path.display()))
     }
+}
+
+fn profile_sql(profile: StackProfile) -> SqlInput {
+    match profile {
+        StackProfile::ComplexCteMatrix => SqlInput {
+            name: "profile:complex-cte-matrix".to_string(),
+            sql: complex_cte_matrix_sql().to_string(),
+        },
+        StackProfile::GeneratedIndexDdl => SqlInput {
+            name: "profile:generated-index-ddl".to_string(),
+            sql: generated_index_ddl_sql().to_string(),
+        },
+        StackProfile::TriggerInsert => SqlInput {
+            name: "profile:trigger-insert".to_string(),
+            sql: trigger_insert_sql().to_string(),
+        },
+    }
+}
+
+fn complex_cte_matrix_sql() -> &'static str {
+    r#"
+CREATE TABLE items (
+  id TEXT PRIMARY KEY,
+  deleted_at TEXT,
+  created_at TEXT,
+  owner_id INTEGER,
+  updated_at TEXT,
+  updater_id INTEGER,
+  archived_by_id INTEGER,
+  restored_by_id INTEGER,
+  search_text TEXT,
+  item_number INTEGER,
+  sort_key TEXT,
+  value_text TEXT,
+  secondary_value TEXT
+);
+
+CREATE TABLE notes (
+  id TEXT PRIMARY KEY,
+  thread_id TEXT NOT NULL,
+  body TEXT NOT NULL,
+  reactions TEXT NOT NULL,
+  author_id INTEGER NOT NULL,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  updater_id INTEGER NOT NULL,
+  deleted_at TEXT,
+  archived_by_id INTEGER,
+  restored_by_user_id INTEGER
+);
+
+CREATE TABLE note_threads (
+  id TEXT PRIMARY KEY,
+  item_id TEXT NOT NULL,
+  state INTEGER NOT NULL,
+  author_id INTEGER NOT NULL,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  updater_id INTEGER NOT NULL,
+  deleted_at TEXT,
+  archived_by_id INTEGER,
+  restored_by_user_id INTEGER
+);
+
+INSERT INTO items (
+  id, deleted_at, created_at, owner_id, updated_at, updater_id, archived_by_id,
+  restored_by_id, search_text, item_number, sort_key, value_text, secondary_value
+) VALUES (
+  'row-example-id', NULL, '2024-01-01 00:00:00.000', 1, '2024-01-01 00:00:00.000',
+  1, NULL, NULL, 'hello', 1, 'a0', '{"v":"hello"}', NULL
+);
+
+INSERT INTO note_threads (
+  id, item_id, state, author_id, created_at, updated_at, updater_id, deleted_at,
+  archived_by_id, restored_by_user_id
+) VALUES (
+  'thread-example-id', 'row-example-id', 0, 1, '2024-01-01 00:00:00.000',
+  '2024-01-01 00:00:00.000', 1, NULL, NULL, NULL
+);
+
+INSERT INTO notes (
+  id, thread_id, body, reactions, author_id, created_at, updated_at, updater_id, deleted_at, archived_by_id,
+  restored_by_user_id
+) VALUES (
+  'comment-example-id', 'thread-example-id', '{"text":"hello"}', '[]', 1,
+  '2024-01-01 00:00:00.000', '2024-01-01 00:00:00.000', 1, NULL, NULL, NULL
+);
+
+SELECT /* profile:complex-cte:inner-select */
+       id, deleted_at, created_at, owner_id, updated_at, updater_id, archived_by_id,
+       restored_by_id, search_text, item_number, sort_key, value_text, secondary_value, sort_key
+FROM items WHERE deleted_at IS NULL ORDER BY sort_key ASC LIMIT 100;
+
+SELECT /* profile:complex-cte:inline-derived */
+       selected_items.*
+FROM (
+  SELECT id, deleted_at, created_at, owner_id, updated_at, updater_id, archived_by_id,
+         restored_by_id, search_text, item_number, sort_key, value_text, secondary_value, sort_key
+  FROM items WHERE deleted_at IS NULL ORDER BY sort_key ASC LIMIT 100
+) AS selected_items
+ORDER BY selected_items.sort_key ASC;
+
+WITH /* profile:complex-cte:cte-direct */
+selected_items AS (
+  SELECT id, deleted_at, created_at, owner_id, updated_at, updater_id, archived_by_id,
+         restored_by_id, search_text, item_number, sort_key, value_text, secondary_value, sort_key
+  FROM items WHERE deleted_at IS NULL ORDER BY sort_key ASC LIMIT 100
+)
+SELECT selected_items.*
+FROM selected_items
+ORDER BY selected_items.sort_key ASC;
+
+WITH /* profile:complex-cte:cte-transparent-wrapper */
+selected_items AS (
+  SELECT * FROM (
+    SELECT id, deleted_at, created_at, owner_id, updated_at, updater_id, archived_by_id,
+           restored_by_id, search_text, item_number, sort_key, value_text, secondary_value, sort_key
+    FROM items WHERE deleted_at IS NULL ORDER BY sort_key ASC LIMIT 100
+  )
+)
+SELECT selected_items.*
+FROM selected_items
+ORDER BY selected_items.sort_key ASC;
+
+WITH /* profile:complex-cte:cte-with-dependent-in-subquery */
+selected_items AS (
+  SELECT * FROM (
+    SELECT id, deleted_at, created_at, owner_id, updated_at, updater_id, archived_by_id,
+           restored_by_id, search_text, item_number, sort_key, value_text, secondary_value, sort_key
+    FROM items WHERE deleted_at IS NULL ORDER BY sort_key ASC LIMIT 100
+  )
+),
+item_threads AS (
+  SELECT item_id, json_group_array(json_object('id', id, 'itemId', item_id)) as threads
+  FROM note_threads
+  WHERE deleted_at IS NULL AND item_id IN (SELECT id FROM selected_items)
+  GROUP BY item_id
+)
+SELECT selected_items.*, COALESCE(item_threads.threads, json_array()) as note_threads
+FROM selected_items
+LEFT JOIN item_threads ON selected_items.id = item_threads.item_id
+ORDER BY selected_items.sort_key ASC;
+
+WITH /* profile:complex-cte:full-query */
+selected_items AS (
+  SELECT * FROM (
+    SELECT id, deleted_at, created_at, owner_id, updated_at, updater_id, archived_by_id,
+           restored_by_id, search_text, item_number, sort_key, value_text, secondary_value, sort_key
+    FROM items WHERE deleted_at IS NULL ORDER BY sort_key ASC LIMIT 100
+  )
+),
+thread_notes AS (
+  SELECT thread_id,
+    json_group_array(json_object(
+      'id', id, 'threadId', thread_id, 'body', json(body), 'reactions', json(reactions),
+      'authorId', author_id, 'createdAt', created_at,
+      'updatedAt', updated_at, 'updaterId', updater_id,
+      'deletedAt', deleted_at, 'archivedById', archived_by_id,
+      'restoredByUserId', restored_by_user_id
+    )) as notes
+  FROM notes WHERE deleted_at IS NULL GROUP BY thread_id ORDER BY created_at
+),
+item_threads AS (
+  SELECT item_id,
+    COALESCE(
+      json_group_array(json_object(
+        'id', id, 'itemId', item_id, 'state', state,
+        'authorId', author_id, 'createdAt', created_at,
+        'updatedAt', updated_at, 'updaterId', updater_id,
+        'deletedAt', deleted_at, 'archivedById', archived_by_id,
+        'restoredByUserId', restored_by_user_id,
+        'notes', COALESCE(json(thread_notes.notes), json_array())
+      )),
+      json_array()
+    ) as threads
+  FROM note_threads
+  LEFT JOIN thread_notes ON note_threads.id = thread_notes.thread_id
+  WHERE deleted_at IS NULL AND item_id IN (SELECT id FROM selected_items)
+  GROUP BY item_id
+)
+SELECT selected_items.*, COALESCE(item_threads.threads, json_array()) as note_threads
+FROM selected_items
+LEFT JOIN item_threads ON selected_items.id = item_threads.item_id
+ORDER BY selected_items.sort_key ASC;
+"#
+}
+
+fn generated_index_ddl_sql() -> &'static str {
+    r#"
+CREATE TABLE items (
+  id TEXT PRIMARY KEY,
+  deleted_at TEXT,
+  sort_key TEXT
+);
+
+INSERT INTO items (id, deleted_at, sort_key) VALUES ('item-a', NULL, 'a0');
+
+ALTER /* profile:generated-index-ddl:add-plain-column */
+TABLE items ADD COLUMN payload TEXT;
+
+ALTER /* profile:generated-index-ddl:add-generated-filter-column */
+TABLE items ADD COLUMN filter_value blob GENERATED ALWAYS AS (
+  CASE
+    WHEN json_type(payload, '$.filter') IS NOT NULL THEN json_extract(payload, '$.filter')
+    ELSE json_extract(payload, '$.value')
+  END
+) VIRTUAL;
+
+ALTER /* profile:generated-index-ddl:add-generated-sort-column */
+TABLE items ADD COLUMN sort_value blob GENERATED ALWAYS AS (
+  CASE
+    WHEN json_type(payload, '$.sort') IS NOT NULL THEN json_extract(payload, '$.sort')
+    WHEN json_type(payload, '$.filter') IS NOT NULL THEN json_extract(payload, '$.filter')
+    ELSE json_extract(payload, '$.value')
+  END
+) VIRTUAL;
+
+ALTER /* profile:generated-index-ddl:add-search-representation */
+TABLE items ADD COLUMN search_text TEXT GENERATED ALWAYS AS (
+  CAST(sort_value AS TEXT)
+) VIRTUAL;
+
+CREATE /* profile:generated-index-ddl:create-search-index */
+INDEX IF NOT EXISTS items_search_index
+ON items (search_text, sort_key, deleted_at IS NOT NULL);
+"#
+}
+
+fn trigger_insert_sql() -> &'static str {
+    r#"
+CREATE TABLE trigger_gate (
+  scenario TEXT NOT NULL,
+  metadata TEXT
+);
+
+CREATE TABLE entity_config (
+  entity_id TEXT PRIMARY KEY,
+  config TEXT,
+  deleted_at TEXT
+);
+
+CREATE TABLE version_metadata (
+  latest_version INTEGER NOT NULL
+);
+
+CREATE TABLE audit_log (
+  version INTEGER NOT NULL
+);
+
+INSERT INTO entity_config (entity_id, config, deleted_at) VALUES ('entity-a', 'none', NULL);
+INSERT INTO version_metadata (latest_version) VALUES (1);
+INSERT INTO audit_log (version) VALUES (1);
+
+CREATE TRIGGER IF NOT EXISTS validate_entity_config
+BEFORE INSERT ON trigger_gate
+WHEN NEW.scenario = 'CONFIG_CHECK'
+BEGIN
+  SELECT CASE
+    WHEN COALESCE(
+      (SELECT entity_config.config
+       FROM entity_config
+       WHERE entity_config.entity_id = json_extract(NEW.metadata, '$.entityId')
+         AND entity_config.deleted_at IS NULL),
+      'none'
+    ) != json_extract(NEW.metadata, '$.expectedConfig')
+    THEN RAISE(ROLLBACK, 'entity config mismatch')
+  END;
+END;
+
+CREATE TRIGGER IF NOT EXISTS validate_audit_version
+BEFORE INSERT ON trigger_gate
+WHEN NEW.scenario = 'VERSION_CHECK'
+BEGIN
+  SELECT CASE
+    WHEN (SELECT IFNULL(MAX(audit_log.version), 0) FROM audit_log)
+      <> (SELECT version_metadata.latest_version FROM version_metadata LIMIT 1)
+    THEN RAISE(ROLLBACK, 'version mismatch')
+  END;
+END;
+
+INSERT /* profile:trigger-insert:config-check */
+INTO trigger_gate (scenario, metadata)
+VALUES ('CONFIG_CHECK', '{"entityId":"entity-a","expectedConfig":"none"}');
+
+INSERT /* profile:trigger-insert:version-check */
+INTO trigger_gate (scenario, metadata)
+VALUES ('VERSION_CHECK', NULL);
+"#
 }
 
 async fn execute_sql_payload(
@@ -1060,7 +1381,8 @@ mod tests {
 
     fn args_with_filters(statements: Vec<usize>, sql_contains: Vec<&str>) -> Args {
         Args {
-            sql: PathBuf::from("-"),
+            sql: Some(PathBuf::from("-")),
+            profile: None,
             top: 40,
             format: OutputFormat::Human,
             statements,
