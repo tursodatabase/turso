@@ -479,6 +479,14 @@ fn plan_cte(
     connection: &Arc<crate::Connection>,
     actual_reference: bool,
 ) -> Result<JoinedTable> {
+    let _stack = crate::stack::trace_scope_with_detail(
+        "planner:plan_cte",
+        if actual_reference {
+            "actual_reference"
+        } else {
+            "visibility"
+        },
+    );
     let cte_def = &cte_definitions[cte_idx];
 
     // Build outer_query_refs including only the CTEs this one directly references.
@@ -486,6 +494,7 @@ fn plan_cte(
     // exponential re-planning when CTEs have transitive dependencies.
     let mut outer_query_refs = base_outer_query_refs.to_vec();
     for &ref_idx in &cte_def.referenced_cte_indices {
+        let _stack = crate::stack::trace_scope("planner:plan_cte_dependency");
         let ref_cte_name = &cte_definitions[ref_idx].name;
         // Check if this CTE has already been planned and is in outer_query_refs.
         // This avoids exponential re-planning when CTEs have transitive dependencies.
@@ -530,14 +539,17 @@ fn plan_cte(
     program.push_cte_being_defined(cte_def.name.clone());
 
     // Plan this CTE with fresh IDs
-    let cte_plan = prepare_select_plan(
-        cte_def.select.clone(),
-        resolver,
-        program,
-        &outer_query_refs,
-        QueryDestination::placeholder_for_subquery(),
-        connection,
-    );
+    let cte_plan = {
+        let _stack = crate::stack::trace_scope("planner:plan_cte_prepare_select");
+        prepare_select_plan(
+            cte_def.select.clone(),
+            resolver,
+            program,
+            &outer_query_refs,
+            QueryDestination::placeholder_for_subquery(),
+            connection,
+        )
+    };
     program.pop_cte_being_defined();
     let cte_plan = cte_plan?;
 
@@ -821,6 +833,7 @@ fn parse_table(
         .iter()
         .position(|cte| cte.name == normalized_qualified_name)
     {
+        let _stack = crate::stack::trace_scope("planner:parse_table_current_cte");
         let planning_outer_query_refs =
             base_outer_refs_for_cte_planning(table_references.outer_query_refs(), cte_definitions);
         // This is an actual CTE reference in the FROM/JOIN clause - count it
@@ -874,6 +887,7 @@ fn parse_table(
         };
 
         if let Some(cte_ast) = cte_select {
+            let _stack = crate::stack::trace_scope("planner:parse_table_outer_cte_replan");
             // Re-plan the CTE from its original AST to get fresh internal_ids.
             // This prevents cursor key collisions when the same CTE is
             // referenced multiple times in the same scope.
@@ -1257,32 +1271,36 @@ pub fn parse_from(
                 table_references.outer_query_refs(),
                 &cte_definitions,
             );
-            for (idx, cte_def) in cte_definitions.iter().enumerate() {
-                let cte_table = plan_cte(
-                    idx,
-                    &cte_definitions,
-                    &base_outer_query_refs,
-                    resolver,
-                    program,
-                    connection,
-                    false,
-                )?;
-                table_references.add_outer_query_reference(OuterQueryReference {
-                    identifier: cte_def.name.clone(),
-                    internal_id: cte_table.internal_id,
-                    table: cte_table.table,
-                    using_dedup_hidden_cols: ColumnMask::default(),
-                    col_used_mask: ColumnUsedMask::default(),
-                    cte_select: Some(cte_def.select.clone()),
-                    cte_explicit_columns: cte_def.explicit_columns.clone(),
-                    cte_id: Some(cte_def.cte_id),
-                    // Preplanned CTE refs are for subquery FROM lookup only. They are not
-                    // visible as column sources unless the CTE is explicitly referenced in
-                    // this scope's FROM/JOIN clause.
-                    cte_definition_only: true,
-                    rowid_referenced: false,
-                    scope_depth: 0,
-                });
+            {
+                let _stack =
+                    crate::stack::trace_scope("planner:preplan_ctes_for_non_from_subqueries");
+                for (idx, cte_def) in cte_definitions.iter().enumerate() {
+                    let cte_table = plan_cte(
+                        idx,
+                        &cte_definitions,
+                        &base_outer_query_refs,
+                        resolver,
+                        program,
+                        connection,
+                        false,
+                    )?;
+                    table_references.add_outer_query_reference(OuterQueryReference {
+                        identifier: cte_def.name.clone(),
+                        internal_id: cte_table.internal_id,
+                        table: cte_table.table,
+                        using_dedup_hidden_cols: ColumnMask::default(),
+                        col_used_mask: ColumnUsedMask::default(),
+                        cte_select: Some(cte_def.select.clone()),
+                        cte_explicit_columns: cte_def.explicit_columns.clone(),
+                        cte_id: Some(cte_def.cte_id),
+                        // Preplanned CTE refs are for subquery FROM lookup only. They are not
+                        // visible as column sources unless the CTE is explicitly referenced in
+                        // this scope's FROM/JOIN clause.
+                        cte_definition_only: true,
+                        rowid_referenced: false,
+                        scope_depth: 0,
+                    });
+                }
             }
         }
     }
