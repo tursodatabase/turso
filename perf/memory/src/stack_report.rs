@@ -1,4 +1,5 @@
 use std::{
+    collections::BTreeMap,
     fs,
     path::PathBuf,
     sync::{Arc, Mutex},
@@ -81,6 +82,7 @@ struct StatementReport {
     min_remaining_stack: usize,
     stack_used: usize,
     samples: usize,
+    span_aggregates: Vec<SpanAggregateReport>,
     spans: Vec<SpanReport>,
 }
 
@@ -92,6 +94,21 @@ struct SpanReport {
     remaining_stack: usize,
     cumulative_stack_used: usize,
     stack_used: usize,
+    inclusive_stack_used: usize,
+    peak_path_hits: usize,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct SpanAggregateReport {
+    label: String,
+    detail: Option<String>,
+    calls: usize,
+    total_self_stack_used: usize,
+    max_self_stack_used: usize,
+    total_inclusive_stack_used: usize,
+    max_inclusive_stack_used: usize,
+    max_cumulative_stack_used: usize,
+    peak_path_hits: usize,
 }
 
 #[derive(Debug, Serialize)]
@@ -99,6 +116,7 @@ struct StackReport {
     sql: String,
     db: String,
     samples: usize,
+    span_aggregates: Vec<SpanAggregateReport>,
     statements: Vec<StatementReport>,
 }
 
@@ -224,10 +242,12 @@ async fn main() -> Result<()> {
             .then_with(|| a.index.cmp(&b.index))
     });
     let samples = statements.iter().map(|statement| statement.samples).sum();
+    let span_aggregates = build_global_span_aggregates(&statements);
     let report = StackReport {
         sql: args.sql.display().to_string(),
         db: ":memory:".to_string(),
         samples,
+        span_aggregates,
         statements,
     };
 
@@ -322,7 +342,8 @@ fn build_statement_report(
         .map(|sample| sample.remaining_stack)
         .min()
         .unwrap_or(baseline_remaining_stack);
-    let mut spans = build_span_reports(baseline_remaining_stack, &samples);
+    let mut spans = build_span_reports(baseline_remaining_stack, min_remaining_stack, &samples);
+    let span_aggregates = aggregate_span_reports(&spans);
     spans.sort_by(|a, b| {
         b.stack_used
             .cmp(&a.stack_used)
@@ -336,21 +357,36 @@ fn build_statement_report(
         min_remaining_stack,
         stack_used: baseline_remaining_stack.saturating_sub(min_remaining_stack),
         samples: spans.len(),
+        span_aggregates,
         spans,
     }
 }
 
-fn build_span_reports(baseline_remaining_stack: usize, samples: &[StackSample]) -> Vec<SpanReport> {
-    let mut active_stack = vec![baseline_remaining_stack];
+#[derive(Debug)]
+struct ActiveSpan {
+    span_index: usize,
+    parent_remaining_stack: usize,
+    entry_remaining_stack: usize,
+    min_remaining_stack: usize,
+}
+
+fn build_span_reports(
+    baseline_remaining_stack: usize,
+    statement_min_remaining_stack: usize,
+    samples: &[StackSample],
+) -> Vec<SpanReport> {
+    let mut active_spans = Vec::<ActiveSpan>::new();
     let mut spans = Vec::new();
 
     for (trace_sequence, sample) in samples.iter().enumerate() {
         match sample.phase {
             StackPhase::Enter => {
-                let parent_remaining = active_stack
+                update_active_span_min(&mut active_spans, sample.remaining_stack);
+                let parent_remaining = active_spans
                     .last()
-                    .copied()
+                    .map(|span| span.entry_remaining_stack)
                     .unwrap_or(baseline_remaining_stack);
+                let span_index = spans.len();
                 spans.push(SpanReport {
                     trace_sequence: trace_sequence + 1,
                     label: sample.label.clone(),
@@ -359,20 +395,38 @@ fn build_span_reports(baseline_remaining_stack: usize, samples: &[StackSample]) 
                     cumulative_stack_used: baseline_remaining_stack
                         .saturating_sub(sample.remaining_stack),
                     stack_used: parent_remaining.saturating_sub(sample.remaining_stack),
+                    inclusive_stack_used: 0,
+                    peak_path_hits: 0,
                 });
-                active_stack.push(sample.remaining_stack);
+                active_spans.push(ActiveSpan {
+                    span_index,
+                    parent_remaining_stack: parent_remaining,
+                    entry_remaining_stack: sample.remaining_stack,
+                    min_remaining_stack: sample.remaining_stack,
+                });
+                if sample.remaining_stack == statement_min_remaining_stack {
+                    mark_peak_path(&active_spans, &mut spans);
+                }
             }
             StackPhase::Exit => {
-                let _ = active_stack.pop();
-                if active_stack.is_empty() {
-                    active_stack.push(baseline_remaining_stack);
+                update_active_span_min(&mut active_spans, sample.remaining_stack);
+                if sample.remaining_stack == statement_min_remaining_stack {
+                    mark_peak_path(&active_spans, &mut spans);
+                }
+                if let Some(active_span) = active_spans.pop() {
+                    finalize_active_span(active_span, &mut spans);
                 }
             }
             StackPhase::Sample => {
-                let parent_remaining = active_stack
+                update_active_span_min(&mut active_spans, sample.remaining_stack);
+                if sample.remaining_stack == statement_min_remaining_stack {
+                    mark_peak_path(&active_spans, &mut spans);
+                }
+                let parent_remaining = active_spans
                     .last()
-                    .copied()
+                    .map(|span| span.entry_remaining_stack)
                     .unwrap_or(baseline_remaining_stack);
+                let stack_used = parent_remaining.saturating_sub(sample.remaining_stack);
                 spans.push(SpanReport {
                     trace_sequence: trace_sequence + 1,
                     label: sample.label.clone(),
@@ -380,12 +434,95 @@ fn build_span_reports(baseline_remaining_stack: usize, samples: &[StackSample]) 
                     remaining_stack: sample.remaining_stack,
                     cumulative_stack_used: baseline_remaining_stack
                         .saturating_sub(sample.remaining_stack),
-                    stack_used: parent_remaining.saturating_sub(sample.remaining_stack),
+                    stack_used,
+                    inclusive_stack_used: stack_used,
+                    peak_path_hits: usize::from(
+                        sample.remaining_stack == statement_min_remaining_stack,
+                    ),
                 });
             }
         }
     }
+    while let Some(active_span) = active_spans.pop() {
+        finalize_active_span(active_span, &mut spans);
+    }
     spans
+}
+
+fn update_active_span_min(active_spans: &mut [ActiveSpan], remaining_stack: usize) {
+    for active_span in active_spans {
+        active_span.min_remaining_stack = active_span.min_remaining_stack.min(remaining_stack);
+    }
+}
+
+fn mark_peak_path(active_spans: &[ActiveSpan], spans: &mut [SpanReport]) {
+    for active_span in active_spans {
+        spans[active_span.span_index].peak_path_hits += 1;
+    }
+}
+
+fn finalize_active_span(active_span: ActiveSpan, spans: &mut [SpanReport]) {
+    spans[active_span.span_index].inclusive_stack_used = active_span
+        .parent_remaining_stack
+        .saturating_sub(active_span.min_remaining_stack);
+}
+
+fn build_global_span_aggregates(statements: &[StatementReport]) -> Vec<SpanAggregateReport> {
+    aggregate_span_reports(
+        statements
+            .iter()
+            .flat_map(|statement| statement.spans.iter()),
+    )
+}
+
+fn aggregate_span_reports<'a, I>(spans: I) -> Vec<SpanAggregateReport>
+where
+    I: IntoIterator<Item = &'a SpanReport>,
+{
+    let mut aggregates = BTreeMap::<(String, Option<String>), SpanAggregateReport>::new();
+    for span in spans {
+        let entry = aggregates
+            .entry((span.label.clone(), span.detail.clone()))
+            .or_insert_with(|| SpanAggregateReport {
+                label: span.label.clone(),
+                detail: span.detail.clone(),
+                calls: 0,
+                total_self_stack_used: 0,
+                max_self_stack_used: 0,
+                total_inclusive_stack_used: 0,
+                max_inclusive_stack_used: 0,
+                max_cumulative_stack_used: 0,
+                peak_path_hits: 0,
+            });
+        entry.calls += 1;
+        entry.total_self_stack_used += span.stack_used;
+        entry.max_self_stack_used = entry.max_self_stack_used.max(span.stack_used);
+        entry.total_inclusive_stack_used += span.inclusive_stack_used;
+        entry.max_inclusive_stack_used = entry
+            .max_inclusive_stack_used
+            .max(span.inclusive_stack_used);
+        entry.max_cumulative_stack_used = entry
+            .max_cumulative_stack_used
+            .max(span.cumulative_stack_used);
+        entry.peak_path_hits += span.peak_path_hits;
+    }
+
+    let mut aggregates = aggregates.into_values().collect::<Vec<_>>();
+    sort_span_aggregates(&mut aggregates);
+    aggregates
+}
+
+fn sort_span_aggregates(aggregates: &mut [SpanAggregateReport]) {
+    aggregates.sort_by(|a, b| {
+        b.total_inclusive_stack_used
+            .cmp(&a.total_inclusive_stack_used)
+            .then_with(|| b.max_inclusive_stack_used.cmp(&a.max_inclusive_stack_used))
+            .then_with(|| b.peak_path_hits.cmp(&a.peak_path_hits))
+            .then_with(|| b.calls.cmp(&a.calls))
+            .then_with(|| b.total_self_stack_used.cmp(&a.total_self_stack_used))
+            .then_with(|| a.label.cmp(&b.label))
+            .then_with(|| a.detail.cmp(&b.detail))
+    });
 }
 
 fn print_human(report: &StackReport, top: usize) {
@@ -394,6 +531,12 @@ fn print_human(report: &StackReport, top: usize) {
     println!("DB:      {}", report.db);
     println!("Samples: {}", report.samples);
     println!();
+
+    if !report.span_aggregates.is_empty() {
+        println!("global span aggregates:");
+        print_span_aggregate_rows(&report.span_aggregates, top, "  ");
+        println!();
+    }
 
     for statement in &report.statements {
         println!(
@@ -409,65 +552,206 @@ fn print_human(report: &StackReport, top: usize) {
             println!("  no stack samples");
             continue;
         }
+        println!("  aggregate spans:");
+        print_span_aggregate_rows(&statement.span_aggregates, top, "    ");
+        if statement.span_aggregates.len() > top {
+            println!(
+                "    ... {} more aggregate spans",
+                statement.span_aggregates.len() - top
+            );
+        }
+        println!("  span samples:");
         println!(
-            "  {:>5} {:>12} {:>12} {:>12}  span",
-            "seq", "self_used", "cum_used", "remaining"
+            "    {:>5} {:>12} {:>12} {:>12} {:>10} {:>12}  span",
+            "seq", "self_used", "incl_used", "cum_used", "peak_hits", "remaining"
         );
         for span in statement.spans.iter().take(top) {
-            let label = match &span.detail {
-                Some(detail) => format!("{} detail={detail}", span.label),
-                None => span.label.clone(),
-            };
+            let label = span_label(&span.label, span.detail.as_deref());
             println!(
-                "  {:>5} {:>12} {:>12} {:>12}  {}",
+                "    {:>5} {:>12} {:>12} {:>12} {:>10} {:>12}  {}",
                 span.trace_sequence,
                 span.stack_used,
+                span.inclusive_stack_used,
                 span.cumulative_stack_used,
+                span.peak_path_hits,
                 span.remaining_stack,
                 label
             );
         }
         if statement.spans.len() > top {
-            println!("  ... {} more spans", statement.spans.len() - top);
+            println!("    ... {} more spans", statement.spans.len() - top);
         }
         println!();
     }
 }
 
+fn print_span_aggregate_rows(aggregates: &[SpanAggregateReport], top: usize, indent: &str) {
+    println!(
+        "{indent}{:>7} {:>12} {:>12} {:>12} {:>12} {:>12} {:>10}  span",
+        "calls", "total_self", "max_self", "total_incl", "max_incl", "max_cum", "peak_hits"
+    );
+    for aggregate in aggregates.iter().take(top) {
+        let label = span_label(&aggregate.label, aggregate.detail.as_deref());
+        println!(
+            "{indent}{:>7} {:>12} {:>12} {:>12} {:>12} {:>12} {:>10}  {}",
+            aggregate.calls,
+            aggregate.total_self_stack_used,
+            aggregate.max_self_stack_used,
+            aggregate.total_inclusive_stack_used,
+            aggregate.max_inclusive_stack_used,
+            aggregate.max_cumulative_stack_used,
+            aggregate.peak_path_hits,
+            label
+        );
+    }
+}
+
 fn print_csv(report: &StackReport) {
     println!(
-        "statement_index,statement_sql,statement_stack_used,statement_baseline_remaining_stack,statement_min_remaining_stack,statement_samples,span_trace_sequence,span_label,span_detail,span_self_stack_used,span_cumulative_stack_used,span_remaining_stack"
+        "row_type,statement_index,statement_sql,statement_stack_used,statement_baseline_remaining_stack,statement_min_remaining_stack,statement_samples,span_trace_sequence,span_label,span_detail,span_self_stack_used,span_inclusive_stack_used,span_cumulative_stack_used,span_peak_path_hits,span_remaining_stack,aggregate_label,aggregate_detail,aggregate_calls,aggregate_total_self_stack_used,aggregate_max_self_stack_used,aggregate_total_inclusive_stack_used,aggregate_max_inclusive_stack_used,aggregate_max_cumulative_stack_used,aggregate_peak_path_hits"
     );
+    for aggregate in &report.span_aggregates {
+        print_csv_aggregate_row("global_aggregate", None, aggregate);
+    }
     for statement in &report.statements {
         if statement.spans.is_empty() {
-            println!(
-                "{},{},{},{},{},{},,,,,",
-                statement.index,
-                csv_escape(&statement.sql),
-                statement.stack_used,
-                statement.baseline_remaining_stack,
-                statement.min_remaining_stack,
-                statement.samples
-            );
+            print_csv_statement_row(statement);
             continue;
         }
-        for span in &statement.spans {
-            println!(
-                "{},{},{},{},{},{},{},{},{},{},{},{}",
-                statement.index,
-                csv_escape(&statement.sql),
-                statement.stack_used,
-                statement.baseline_remaining_stack,
-                statement.min_remaining_stack,
-                statement.samples,
-                span.trace_sequence,
-                csv_escape(&span.label),
-                csv_escape(span.detail.as_deref().unwrap_or("")),
-                span.stack_used,
-                span.cumulative_stack_used,
-                span.remaining_stack
-            );
+        for aggregate in &statement.span_aggregates {
+            print_csv_aggregate_row("statement_aggregate", Some(statement), aggregate);
         }
+        for span in &statement.spans {
+            print_csv_span_row(statement, span);
+        }
+    }
+}
+
+fn print_csv_statement_row(statement: &StatementReport) {
+    print_csv_row(vec![
+        "statement".to_string(),
+        statement.index.to_string(),
+        csv_escape(&statement.sql),
+        statement.stack_used.to_string(),
+        statement.baseline_remaining_stack.to_string(),
+        statement.min_remaining_stack.to_string(),
+        statement.samples.to_string(),
+        String::new(),
+        String::new(),
+        String::new(),
+        String::new(),
+        String::new(),
+        String::new(),
+        String::new(),
+        String::new(),
+        String::new(),
+        String::new(),
+        String::new(),
+        String::new(),
+        String::new(),
+        String::new(),
+        String::new(),
+        String::new(),
+        String::new(),
+    ]);
+}
+
+fn print_csv_span_row(statement: &StatementReport, span: &SpanReport) {
+    print_csv_row(vec![
+        "span".to_string(),
+        statement.index.to_string(),
+        csv_escape(&statement.sql),
+        statement.stack_used.to_string(),
+        statement.baseline_remaining_stack.to_string(),
+        statement.min_remaining_stack.to_string(),
+        statement.samples.to_string(),
+        span.trace_sequence.to_string(),
+        csv_escape(&span.label),
+        csv_escape(span.detail.as_deref().unwrap_or("")),
+        span.stack_used.to_string(),
+        span.inclusive_stack_used.to_string(),
+        span.cumulative_stack_used.to_string(),
+        span.peak_path_hits.to_string(),
+        span.remaining_stack.to_string(),
+        String::new(),
+        String::new(),
+        String::new(),
+        String::new(),
+        String::new(),
+        String::new(),
+        String::new(),
+        String::new(),
+        String::new(),
+    ]);
+}
+
+fn print_csv_aggregate_row(
+    row_type: &str,
+    statement: Option<&StatementReport>,
+    aggregate: &SpanAggregateReport,
+) {
+    let (
+        statement_index,
+        statement_sql,
+        statement_stack_used,
+        statement_baseline_remaining_stack,
+        statement_min_remaining_stack,
+        statement_samples,
+    ) = match statement {
+        Some(statement) => (
+            statement.index.to_string(),
+            csv_escape(&statement.sql),
+            statement.stack_used.to_string(),
+            statement.baseline_remaining_stack.to_string(),
+            statement.min_remaining_stack.to_string(),
+            statement.samples.to_string(),
+        ),
+        None => (
+            String::new(),
+            String::new(),
+            String::new(),
+            String::new(),
+            String::new(),
+            String::new(),
+        ),
+    };
+
+    print_csv_row(vec![
+        row_type.to_string(),
+        statement_index,
+        statement_sql,
+        statement_stack_used,
+        statement_baseline_remaining_stack,
+        statement_min_remaining_stack,
+        statement_samples,
+        String::new(),
+        String::new(),
+        String::new(),
+        String::new(),
+        String::new(),
+        String::new(),
+        String::new(),
+        String::new(),
+        csv_escape(&aggregate.label),
+        csv_escape(aggregate.detail.as_deref().unwrap_or("")),
+        aggregate.calls.to_string(),
+        aggregate.total_self_stack_used.to_string(),
+        aggregate.max_self_stack_used.to_string(),
+        aggregate.total_inclusive_stack_used.to_string(),
+        aggregate.max_inclusive_stack_used.to_string(),
+        aggregate.max_cumulative_stack_used.to_string(),
+        aggregate.peak_path_hits.to_string(),
+    ]);
+}
+
+fn print_csv_row(fields: Vec<String>) {
+    println!("{}", fields.join(","));
+}
+
+fn span_label(label: &str, detail: Option<&str>) -> String {
+    match detail {
+        Some(detail) => format!("{label} detail={detail}"),
+        None => label.to_string(),
     }
 }
 
@@ -553,7 +837,24 @@ mod tests {
         assert_eq!(report.min_remaining_stack, 7_500);
         assert_eq!(report.spans[0].label, "inner");
         assert_eq!(report.spans[0].stack_used, 1_500);
+        assert_eq!(report.spans[0].inclusive_stack_used, 1_500);
         assert_eq!(report.spans[0].cumulative_stack_used, 2_500);
+        let outer = report
+            .span_aggregates
+            .iter()
+            .find(|aggregate| aggregate.label == "outer")
+            .expect("outer aggregate should exist");
+        assert_eq!(outer.total_self_stack_used, 1_000);
+        assert_eq!(outer.total_inclusive_stack_used, 2_500);
+        assert_eq!(outer.peak_path_hits, 1);
+        let inner = report
+            .span_aggregates
+            .iter()
+            .find(|aggregate| aggregate.label == "inner")
+            .expect("inner aggregate should exist");
+        assert_eq!(inner.total_self_stack_used, 1_500);
+        assert_eq!(inner.total_inclusive_stack_used, 1_500);
+        assert_eq!(inner.peak_path_hits, 1);
         assert_eq!(
             report
                 .spans
@@ -574,13 +875,13 @@ mod tests {
                 StackSample {
                     label: "first".to_string(),
                     detail: None,
-                    phase: StackPhase::Enter,
+                    phase: StackPhase::Sample,
                     remaining_stack: 8_000,
                 },
                 StackSample {
                     label: "second".to_string(),
                     detail: None,
-                    phase: StackPhase::Enter,
+                    phase: StackPhase::Sample,
                     remaining_stack: 8_000,
                 },
             ],
@@ -588,6 +889,69 @@ mod tests {
 
         assert_eq!(report.spans[0].trace_sequence, 1);
         assert_eq!(report.spans[1].trace_sequence, 2);
+    }
+
+    #[test]
+    fn aggregate_spans_count_repeated_calls() {
+        let report = build_statement_report(
+            1,
+            "SELECT 1",
+            10_000,
+            vec![
+                StackSample {
+                    label: "leaf".to_string(),
+                    detail: Some("expr".to_string()),
+                    phase: StackPhase::Sample,
+                    remaining_stack: 9_000,
+                },
+                StackSample {
+                    label: "leaf".to_string(),
+                    detail: Some("expr".to_string()),
+                    phase: StackPhase::Sample,
+                    remaining_stack: 8_500,
+                },
+            ],
+        );
+
+        assert_eq!(report.span_aggregates.len(), 1);
+        let aggregate = &report.span_aggregates[0];
+        assert_eq!(aggregate.label, "leaf");
+        assert_eq!(aggregate.detail.as_deref(), Some("expr"));
+        assert_eq!(aggregate.calls, 2);
+        assert_eq!(aggregate.total_self_stack_used, 2_500);
+        assert_eq!(aggregate.max_self_stack_used, 1_500);
+        assert_eq!(aggregate.total_inclusive_stack_used, 2_500);
+        assert_eq!(aggregate.max_inclusive_stack_used, 1_500);
+        assert_eq!(aggregate.peak_path_hits, 1);
+    }
+
+    #[test]
+    fn exit_samples_contribute_to_active_span_inclusive_usage() {
+        let report = build_statement_report(
+            1,
+            "SELECT 1",
+            10_000,
+            vec![
+                StackSample {
+                    label: "scope".to_string(),
+                    detail: None,
+                    phase: StackPhase::Enter,
+                    remaining_stack: 9_500,
+                },
+                StackSample {
+                    label: "scope:end".to_string(),
+                    detail: None,
+                    phase: StackPhase::Exit,
+                    remaining_stack: 9_000,
+                },
+            ],
+        );
+
+        assert_eq!(report.stack_used, 1_000);
+        assert_eq!(report.spans.len(), 1);
+        assert_eq!(report.spans[0].stack_used, 500);
+        assert_eq!(report.spans[0].inclusive_stack_used, 1_000);
+        assert_eq!(report.spans[0].peak_path_hits, 1);
     }
 
     #[test]
