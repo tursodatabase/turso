@@ -13,6 +13,7 @@ use crate::translate::{
 };
 use crate::util::normalize_ident;
 use crate::vdbe::affinity::Affinity;
+use crate::vdbe::builder::DeferredTriggerProgram;
 use crate::vdbe::insn::Insn;
 use crate::vdbe::BranchOffset;
 use crate::{bail_parse_error, QueryMode, Result};
@@ -21,7 +22,7 @@ use std::num::NonZero;
 use turso_parser::ast::{self, Expr, TriggerEvent, TriggerTime};
 
 /// Context for trigger execution
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct TriggerContext {
     /// Table the trigger is attached to
     pub table: Arc<BTreeTable>,
@@ -525,10 +526,10 @@ fn rewrite_trigger_expr_single_for_subprogram(
 /// Returns true if there are triggers that will fire.
 fn execute_trigger_commands(
     program: &mut ProgramBuilder,
-    resolver: &mut Resolver,
+    _resolver: &mut Resolver,
     trigger: &Arc<Trigger>,
     ctx: &TriggerContext,
-    connection: &Arc<crate::Connection>,
+    _connection: &Arc<crate::Connection>,
     database_id: usize,
     ignore_jump_target: BranchOffset,
 ) -> Result<bool> {
@@ -536,6 +537,41 @@ fn execute_trigger_commands(
         "trigger:execute_commands",
         trigger_event_kind(&trigger.event),
     );
+    let insn_index = program.insns.len();
+    program.emit_insn(Insn::Noop);
+    program
+        .deferred_trigger_programs
+        .push(DeferredTriggerProgram {
+            insn_index,
+            trigger: trigger.clone(),
+            table: ctx.table.clone(),
+            new_registers: ctx.new_registers.clone(),
+            old_registers: ctx.old_registers.clone(),
+            override_conflict: ctx.override_conflict,
+            database_id,
+            ignore_jump_target,
+        });
+
+    Ok(true)
+}
+
+pub(crate) fn compile_deferred_trigger_programs(
+    program: &mut ProgramBuilder,
+    resolver: &mut Resolver,
+    connection: &Arc<crate::Connection>,
+) -> Result<()> {
+    while let Some(deferred) = program.deferred_trigger_programs.pop() {
+        compile_deferred_trigger_program(program, resolver, connection, deferred)?;
+    }
+    Ok(())
+}
+
+fn compile_deferred_trigger_program(
+    program: &mut ProgramBuilder,
+    resolver: &mut Resolver,
+    connection: &Arc<crate::Connection>,
+    deferred: DeferredTriggerProgram,
+) -> Result<()> {
     struct TriggerCompilationGuard {
         connection: Arc<crate::Connection>,
     }
@@ -546,29 +582,30 @@ fn execute_trigger_commands(
         }
     }
 
+    let trigger = &deferred.trigger;
     if connection.trigger_is_compiling(trigger) {
-        // Do not recursively compile the same trigger
-        return Ok(false);
+        return Ok(());
     }
     connection.start_trigger_compilation(trigger.clone());
     let _trigger_compilation_guard = TriggerCompilationGuard {
         connection: connection.clone(),
     };
 
-    let has_new = ctx.new_registers.is_some();
-    let has_old = ctx.old_registers.is_some();
-    let num_cols = ctx.table.columns().len();
+    let has_new = deferred.new_registers.is_some();
+    let has_old = deferred.old_registers.is_some();
+    let num_cols = deferred.table.columns().len();
 
     // Ordinary non-main triggers need unqualified DML targets rewritten into the
     // trigger's schema. Temp-backed triggers intentionally keep unqualified names
     // unresolved so they can follow SQLite's normal temp/main lookup rules.
-    let db_name = if database_id == crate::MAIN_DB_ID || database_id == crate::TEMP_DB_ID {
-        None
-    } else {
-        resolver
-            .get_database_name_by_index(database_id)
-            .map(ast::Name::exact)
-    };
+    let db_name =
+        if deferred.database_id == crate::MAIN_DB_ID || deferred.database_id == crate::TEMP_DB_ID {
+            None
+        } else {
+            resolver
+                .get_database_name_by_index(deferred.database_id)
+                .map(ast::Name::exact)
+        };
     // Parameter indices are allocated on demand during the AST rewrite.
     // Only columns actually referenced in the trigger body get a parameter,
     // reducing bind_at calls from N (all columns) to K (referenced columns).
@@ -576,8 +613,8 @@ fn execute_trigger_commands(
         param_alloc: RefCell::new(ParamAllocator::new(num_cols, has_new, has_old)),
         has_new,
         has_old,
-        table: ctx.table.clone(),
-        override_conflict: ctx.override_conflict,
+        table: deferred.table.clone(),
+        override_conflict: deferred.override_conflict,
         db_name,
     };
     let mut subprogram_builder = ProgramBuilder::new_for_trigger(
@@ -588,7 +625,7 @@ fn execute_trigger_commands(
     );
     // If we have an override_conflict (e.g. from UPSERT DO UPDATE context),
     // propagate it to the subprogram so that nested trigger firing will also use it.
-    if let Some(override_conflict) = ctx.override_conflict {
+    if let Some(override_conflict) = deferred.override_conflict {
         subprogram_builder.set_trigger_conflict_override(override_conflict);
     }
     // Restrict table resolution to the trigger's database during subprogram compilation.
@@ -596,7 +633,7 @@ fn execute_trigger_commands(
     let trigger_database_id = if trigger.temporary {
         crate::TEMP_DB_ID
     } else {
-        database_id
+        deferred.database_id
     };
     let prev_trigger_context = resolver.trigger_context.clone();
     resolver.set_trigger_context(trigger_database_id, trigger.name.clone());
@@ -637,6 +674,7 @@ fn execute_trigger_commands(
     // Restore previous trigger context (supports nested triggers).
     resolver.trigger_context = prev_trigger_context;
     compile_result?;
+    compile_deferred_trigger_programs(&mut subprogram_builder, resolver, connection)?;
     {
         let _stack = crate::stack::trace_scope("trigger:subprogram_epilogue");
         subprogram_builder.epilogue(resolver.schema());
@@ -676,7 +714,7 @@ fn execute_trigger_commands(
     let total_params = alloc.num_params();
     let mut param_registers = vec![0usize; total_params];
 
-    if let Some(new_regs) = &ctx.new_registers {
+    if let Some(new_regs) = &deferred.new_registers {
         for (col_idx, opt_param) in alloc.new_entries.iter().enumerate() {
             if let Some(param_idx) = opt_param {
                 param_registers[param_idx.get() - 1] = new_regs[col_idx];
@@ -686,7 +724,7 @@ fn execute_trigger_commands(
             param_registers[param_idx.get() - 1] = *new_regs.last().unwrap();
         }
     }
-    if let Some(old_regs) = &ctx.old_registers {
+    if let Some(old_regs) = &deferred.old_registers {
         for (col_idx, opt_param) in alloc.old_entries.iter().enumerate() {
             if let Some(param_idx) = opt_param {
                 param_registers[param_idx.get() - 1] = old_regs[col_idx];
@@ -698,13 +736,16 @@ fn execute_trigger_commands(
     }
     drop(alloc);
 
-    program.emit_insn(Insn::Program {
-        param_registers,
-        program: built_subprogram.prepared().clone(),
-        ignore_jump_target,
-    });
+    program.replace_insn(
+        deferred.insn_index,
+        Insn::Program {
+            param_registers,
+            program: built_subprogram.prepared().clone(),
+            ignore_jump_target: deferred.ignore_jump_target,
+        },
+    );
 
-    Ok(true)
+    Ok(())
 }
 
 /// Check if there are any triggers for a given event (regardless of time).

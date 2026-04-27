@@ -1353,6 +1353,11 @@ fn emit_fk_action_subprogram(
         connection,
         description,
     )?;
+    super::trigger_exec::compile_deferred_trigger_programs(
+        &mut subprogram_builder,
+        resolver,
+        connection,
+    )?;
     subprogram_builder.epilogue(resolver.schema());
     let built_subprogram = subprogram_builder.build(connection.clone(), true, description)?;
 
