@@ -9156,7 +9156,6 @@ fn test_integrity_check_ignores_dropped_root_that_is_live_after_recovery() {
 ///   REPRO_DURATION_SECS=N  total wall-clock cap (default 30)
 ///   REPRO_READER_OPS=N     count samples per reader transaction (default 8)
 #[test]
-#[ignore = "concurrency soak — run with `cargo test -p turso_core test_snapshot_stability_full -- --ignored --nocapture`"]
 fn test_snapshot_stability_full() {
     use crate::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
     use std::time::{Duration, Instant};
@@ -9205,16 +9204,14 @@ fn test_snapshot_stability_full() {
         std::env::var("REPRO_DURATION_SECS")
             .ok()
             .and_then(|s| s.parse().ok())
-            .unwrap_or(30),
+            .unwrap_or(5),
     );
     let reader_ops: usize = std::env::var("REPRO_READER_OPS")
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(8);
 
-    let enable_sp = std::env::var("REPRO_SP")
-        .map(|s| s != "0")
-        .unwrap_or(true);
+    let enable_sp = std::env::var("REPRO_SP").map(|s| s != "0").unwrap_or(true);
     let enable_writer = std::env::var("REPRO_WRITER")
         .map(|s| s != "0")
         .unwrap_or(true);
@@ -9252,11 +9249,7 @@ fn test_snapshot_stability_full() {
                     reader_samples.fetch_add(1, Ordering::Relaxed);
                 }
                 // All samples within one snapshot must be equal.
-                if let Some((i, &c)) = samples
-                    .iter()
-                    .enumerate()
-                    .find(|(_, &c)| c != samples[0])
-                {
+                if let Some((i, &c)) = samples.iter().enumerate().find(|(_, &c)| c != samples[0]) {
                     mismatch_first.store(samples[0], Ordering::Relaxed);
                     mismatch_second.store(c, Ordering::Relaxed);
                     mismatch_idx_a.store(0, Ordering::Relaxed);
@@ -9305,8 +9298,7 @@ fn test_snapshot_stability_full() {
                             let target = (rng.random::<u32>() % 500) as i64;
                             format!("DELETE FROM t WHERE id = {target}")
                         } else {
-                            let id =
-                                next_id.fetch_add(1, Ordering::Relaxed) as i64;
+                            let id = next_id.fetch_add(1, Ordering::Relaxed) as i64;
                             format!("INSERT INTO t VALUES ({id}, 'sp_{id}', NULL)")
                         };
                         match conn.execute(&sql) {
