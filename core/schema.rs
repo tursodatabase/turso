@@ -1687,6 +1687,14 @@ impl Schema {
         // so the trigger never fires against a real db.
         resolve_attached_db: &dyn Fn(&str) -> Option<usize>,
     ) -> Result<()> {
+        let detail = match ty {
+            "table" => "table",
+            "index" => "index",
+            "view" => "view",
+            "trigger" => "trigger",
+            _ => "other",
+        };
+        let _stack = crate::stack::trace_scope_with_detail("schema:handle_schema_row", detail);
         match ty {
             "table" => {
                 let sql = maybe_sql.expect("sql should be present for table");
@@ -1860,22 +1868,34 @@ impl Schema {
                 let sql = maybe_sql.expect("sql should be present for trigger");
                 let trigger_name = name.to_string();
 
-                let mut parser = Parser::new(sql.as_bytes());
-                let Ok(Some(Cmd::Stmt(Stmt::CreateTrigger {
-                    temporary,
-                    if_not_exists: _,
-                    trigger_name: _,
-                    time,
-                    event,
-                    tbl_name,
-                    for_each_row,
-                    when_clause,
-                    commands,
-                }))) = parser.next_cmd()
-                else {
-                    return Err(crate::LimboError::ParseError(format!(
-                        "invalid trigger sql: {sql}"
-                    )));
+                let (temporary, time, event, tbl_name, for_each_row, when_clause, commands) = {
+                    let _stack = crate::stack::trace_scope("schema:parse_trigger_sql");
+                    let mut parser = Parser::new(sql.as_bytes());
+                    let Ok(Some(Cmd::Stmt(Stmt::CreateTrigger {
+                        temporary,
+                        if_not_exists: _,
+                        trigger_name: _,
+                        time,
+                        event,
+                        tbl_name,
+                        for_each_row,
+                        when_clause,
+                        commands,
+                    }))) = parser.next_cmd()
+                    else {
+                        return Err(crate::LimboError::ParseError(format!(
+                            "invalid trigger sql: {sql}"
+                        )));
+                    };
+                    (
+                        temporary,
+                        time,
+                        event,
+                        tbl_name,
+                        for_each_row,
+                        when_clause,
+                        commands,
+                    )
                 };
                 // Resolve the target database from the SQL qualifier:
                 // CREATE TEMP TRIGGER ... ON main.tbl → target is MAIN_DB_ID
@@ -1897,6 +1917,7 @@ impl Schema {
                         resolve_attached_db(db).unwrap_or(crate::INVALID_DB_ID)
                     }
                 });
+                let _stack = crate::stack::trace_scope("schema:add_trigger");
                 self.add_trigger(
                     Trigger::new(
                         trigger_name,

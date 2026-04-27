@@ -257,17 +257,20 @@ pub fn translate_inner(
                 commands,
             } => {
                 // Reconstruct SQL for storage
-                let sql = trigger::create_trigger_to_sql(
-                    temporary,
-                    if_not_exists,
-                    &trigger_name,
-                    time,
-                    &event,
-                    &tbl_name,
-                    for_each_row,
-                    when_clause.as_deref(),
-                    &commands,
-                );
+                let sql = {
+                    let _stack = crate::stack::trace_scope("trigger:create_to_sql");
+                    trigger::create_trigger_to_sql(
+                        temporary,
+                        if_not_exists,
+                        &trigger_name,
+                        time,
+                        &event,
+                        &tbl_name,
+                        for_each_row,
+                        when_clause.as_deref(),
+                        &commands,
+                    )
+                };
                 trigger::translate_create_trigger(
                     trigger_name,
                     resolver,
