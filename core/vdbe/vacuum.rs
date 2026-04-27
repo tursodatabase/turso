@@ -1317,7 +1317,7 @@ impl VacuumInPlaceOpContext {
 }
 
 /// The batch size for copy-back: how many temp pages to read per batch.
-const VACUUM_COPY_BATCH_SIZE: u32 = 64;
+const VACUUM_COPY_BATCH_SIZE: u32 = 1024;
 
 /// Returns the first page number of the batch after the one that starts at `start_page`.
 /// The current batch covers the half-open range `[start_page, next_start)`,

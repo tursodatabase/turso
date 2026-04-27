@@ -1,0 +1,18 @@
+[package]
+name = "vacuum-benchmark"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "vacuum-benchmark"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = { workspace = true }
+clap = { workspace = true, features = ["derive"] }
+rand = { workspace = true, features = ["small_rng"] }
+rusqlite = { workspace = true }
+libc = "0.2.172"
+tokio = { workspace = true, default-features = true, features = ["full"] }
+turso = { workspace = true }
+tracing-subscriber = { workspace = true }
