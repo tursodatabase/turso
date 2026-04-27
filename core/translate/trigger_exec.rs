@@ -572,6 +572,7 @@ fn compile_deferred_trigger_program(
     connection: &Arc<crate::Connection>,
     deferred: DeferredTriggerProgram,
 ) -> Result<()> {
+    let _stack = crate::stack::trace_scope("trigger:compile_deferred_program");
     struct TriggerCompilationGuard {
         connection: Arc<crate::Connection>,
     }
@@ -617,12 +618,15 @@ fn compile_deferred_trigger_program(
         override_conflict: deferred.override_conflict,
         db_name,
     };
-    let mut subprogram_builder = ProgramBuilder::new_for_trigger(
-        QueryMode::Normal,
-        program.capture_data_changes_info().clone(),
-        ProgramBuilderOpts::new(1, 32, 2),
-        trigger.clone(),
-    );
+    let mut subprogram_builder = {
+        let _stack = crate::stack::trace_scope("trigger:subprogram_builder_new");
+        ProgramBuilder::new_for_trigger(
+            QueryMode::Normal,
+            program.capture_data_changes_info().clone(),
+            ProgramBuilderOpts::new(1, 32, 2),
+            trigger.clone(),
+        )
+    };
     // If we have an override_conflict (e.g. from UPSERT DO UPDATE context),
     // propagate it to the subprogram so that nested trigger firing will also use it.
     if let Some(override_conflict) = deferred.override_conflict {
@@ -639,6 +643,10 @@ fn compile_deferred_trigger_program(
     resolver.set_trigger_context(trigger_database_id, trigger.name.clone());
     let compile_result = (|| -> Result<()> {
         for command in trigger.commands.iter() {
+            let _stack = crate::stack::trace_scope_with_detail(
+                "trigger:compile_command",
+                trigger_command_kind(command),
+            );
             let stmt = {
                 let _stack = crate::stack::trace_scope_with_detail(
                     "trigger:rewrite_command",
@@ -674,7 +682,10 @@ fn compile_deferred_trigger_program(
     // Restore previous trigger context (supports nested triggers).
     resolver.trigger_context = prev_trigger_context;
     compile_result?;
-    compile_deferred_trigger_programs(&mut subprogram_builder, resolver, connection)?;
+    {
+        let _stack = crate::stack::trace_scope("trigger:compile_nested_deferred_programs");
+        compile_deferred_trigger_programs(&mut subprogram_builder, resolver, connection)?;
+    }
     {
         let _stack = crate::stack::trace_scope("trigger:subprogram_epilogue");
         subprogram_builder.epilogue(resolver.schema());
