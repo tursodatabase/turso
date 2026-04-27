@@ -10961,6 +10961,7 @@ pub fn op_parse_schema(
     insn: &Insn,
     _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
+    let _stack = crate::stack::trace_scope("vdbe:op_parse_schema");
     load_insn!(ParseSchema { db, filter }, insn);
 
     let conn = program.connection.clone();
@@ -11053,14 +11054,17 @@ fn op_parse_schema_step(
     state: &mut ProgramState,
     conn: &Arc<Connection>,
 ) -> Result<InsnFunctionStepResult> {
+    let _stack = crate::stack::trace_scope("vdbe:op_parse_schema_step");
     loop {
         let inner = state.active_op_state.parse_schema().as_mut().unwrap();
         match inner.phase {
             OpParseSchemaPhase::Rewinding => {
+                let _stack = crate::stack::trace_scope("vdbe:parse_schema_rewind");
                 return_if_io!(inner.cursor.rewind());
                 inner.phase = OpParseSchemaPhase::FetchingRecord;
             }
             OpParseSchemaPhase::FetchingRecord => {
+                let _stack = crate::stack::trace_scope("vdbe:parse_schema_fetch_record");
                 let row = return_if_io!(inner.cursor.record());
                 let Some(row) = row else {
                     return finish_parse_schema(state, conn);
@@ -11076,6 +11080,17 @@ fn op_parse_schema_step(
                 };
 
                 if inner.filter.matches(&ty, &name, &table_name) {
+                    let detail = match ty.as_str() {
+                        "table" => "table",
+                        "index" => "index",
+                        "view" => "view",
+                        "trigger" => "trigger",
+                        _ => "other",
+                    };
+                    let _stack = crate::stack::trace_scope_with_detail(
+                        "vdbe:parse_schema_handle_row",
+                        detail,
+                    );
                     let schema = Arc::make_mut(&mut inner.schema_arc);
                     let syms = conn.syms.read();
                     let attached_resolver = |alias: &str| -> Option<usize> {
@@ -11103,6 +11118,7 @@ fn op_parse_schema_step(
                 inner.phase = OpParseSchemaPhase::Advancing;
             }
             OpParseSchemaPhase::Advancing => {
+                let _stack = crate::stack::trace_scope("vdbe:parse_schema_advance");
                 return_if_io!(inner.cursor.next());
                 if inner.cursor.has_record() {
                     inner.phase = OpParseSchemaPhase::FetchingRecord;
@@ -11118,6 +11134,7 @@ fn finish_parse_schema(
     state: &mut ProgramState,
     conn: &Arc<Connection>,
 ) -> Result<InsnFunctionStepResult> {
+    let _stack = crate::stack::trace_scope("vdbe:finish_parse_schema");
     let OpParseSchemaInner {
         mut schema_arc,
         from_sql_indexes,
