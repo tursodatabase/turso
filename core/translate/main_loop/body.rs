@@ -399,7 +399,7 @@ fn emit_loop_source<'a>(
             }
 
             if let Some(label) = label_emit_nonagg_only_once {
-                program.resolve_label(label, program.offset());
+                program.preassign_label_to_next_insn(label);
                 let flag = t_ctx.reg_nonagg_emit_once_flag.unwrap();
                 program.emit_int(1, flag);
             }

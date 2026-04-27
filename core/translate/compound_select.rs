@@ -1066,7 +1066,7 @@ fn emit_compound_order_by(
         });
     }
 
-    program.resolve_label(sort_loop_next, program.offset());
+    program.preassign_label_to_next_insn(sort_loop_next);
     program.emit_insn(Insn::SorterNext {
         cursor_id: sort_cursor,
         pc_if_next: sort_loop_start,

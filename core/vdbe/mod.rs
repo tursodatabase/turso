@@ -108,34 +108,14 @@ pub enum ViewDeltaCommitState {
     Done,
 }
 
-/// We use labels to indicate that we want to jump to whatever the instruction offset
-/// will be at runtime, because the offset cannot always be determined when the jump
-/// instruction is created.
-///
-/// In some cases, we want to jump to EXACTLY a specific instruction.
-/// - Example: a condition is not met, so we want to jump to wherever Halt is.
-///
-/// In other cases, we don't care what the exact instruction is, but we know that we
-/// want to jump to whatever comes AFTER a certain instruction.
-/// - Example: a Next instruction will want to jump to "whatever the start of the loop is",
-///   but it doesn't care what instruction that is.
-///
-/// The reason this distinction is important is that we might reorder instructions that are
-/// constant at compile time, and when we do that, we need to change the offsets of any impacted
-/// jump instructions, so the instruction that comes immediately after "next Insn" might have changed during the reordering.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum JumpTarget {
-    ExactlyThisInsn,
-    AfterThisInsn,
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 /// Represents a target for a jump instruction.
 /// Stores 32-bit ints to keep the enum word-sized.
 pub enum BranchOffset {
     /// A label is a named location in the program.
     /// If there are references to it, it must always be resolved to an Offset
-    /// via program.resolve_label().
+    /// via `ProgramBuilder::preassign_label_to_next_insn` or
+    /// `ProgramBuilder::link_label_to_other_label`.
     Label(u32),
     /// An offset is a direct index into the instruction list.
     Offset(InsnReference),
@@ -145,11 +125,6 @@ pub enum BranchOffset {
 }
 
 impl BranchOffset {
-    /// Returns true if the branch offset is a label.
-    pub fn is_label(&self) -> bool {
-        matches!(self, BranchOffset::Label(_))
-    }
-
     /// Returns true if the branch offset is an offset.
     pub fn is_offset(&self) -> bool {
         matches!(self, BranchOffset::Offset(_))
@@ -173,19 +148,6 @@ impl BranchOffset {
             BranchOffset::Offset(v) => *v as i32,
             BranchOffset::Placeholder => i32::MAX,
         }
-    }
-
-    /// Adds an integer value to the branch offset.
-    /// Returns a new branch offset.
-    /// Panics if the branch offset is a label or placeholder.
-    #[allow(clippy::should_implement_trait)]
-    pub fn add<N: Into<u32>>(self, n: N) -> BranchOffset {
-        BranchOffset::Offset(self.as_offset_int() + n.into())
-    }
-
-    #[allow(clippy::should_implement_trait)]
-    pub fn sub<N: Into<u32>>(self, n: N) -> BranchOffset {
-        BranchOffset::Offset(self.as_offset_int() - n.into())
     }
 }
 

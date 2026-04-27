@@ -791,7 +791,7 @@ fn emit_flush_buffer_if_new_partition(
             target_pc_gt: new_partition_label,
         });
 
-        program.resolve_label(new_partition_label, program.offset());
+        program.preassign_label_to_next_insn(new_partition_label);
         program.add_comment(program.offset(), "detected new partition");
         program.emit_insn(Insn::Gosub {
             target_pc: labels.flush_buffer,
@@ -808,7 +808,7 @@ fn emit_flush_buffer_if_new_partition(
             extra_amount: partition_by_len - 1,
         });
 
-        program.resolve_label(same_partition_label, program.offset());
+        program.preassign_label_to_next_insn(same_partition_label);
     }
 
     Ok(())
@@ -901,7 +901,7 @@ fn emit_flush_buffer_if_not_peer(
             target_pc_gt: label_not_peer,
         });
 
-        program.resolve_label(label_not_peer, program.offset());
+        program.preassign_label_to_next_insn(label_not_peer);
         program.add_comment(program.offset(), "detected non-peer row");
         program.emit_insn(Insn::Gosub {
             target_pc: labels.flush_buffer,
@@ -913,7 +913,7 @@ fn emit_flush_buffer_if_not_peer(
             extra_amount: order_by_len - 1,
         });
 
-        program.resolve_label(label_peer, program.offset());
+        program.preassign_label_to_next_insn(label_peer);
     }
 
     Ok(())
@@ -1055,7 +1055,7 @@ pub fn emit_window_results(
 
     emit_return_buffered_rows(program, window, t_ctx, plan)?;
 
-    program.resolve_label(label_empty, program.offset());
+    program.preassign_label_to_next_insn(label_empty);
 
     program.emit_insn(Insn::ResetSorter {
         cursor_id: cursor_buffer_read,
@@ -1146,7 +1146,7 @@ fn emit_return_buffered_rows(
         }
     }
 
-    program.resolve_label(label_skip_returning_row, program.offset());
+    program.preassign_label_to_next_insn(label_skip_returning_row);
 
     if let Distinctness::Distinct { ctx } = &plan.distinctness {
         let distinct_ctx = ctx.as_ref().expect("distinct context must exist");

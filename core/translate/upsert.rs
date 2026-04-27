@@ -924,7 +924,7 @@ pub fn emit_upsert(
                 raise_error_if_no_matching_entry: false,
             });
             if let Some(label) = maybe_skip_del {
-                program.resolve_label(label, program.offset());
+                program.preassign_label_to_next_insn(label);
             }
 
             // Skip insert if NEW predicate false/NULL
@@ -1041,7 +1041,7 @@ pub fn emit_upsert(
             });
 
             if let Some(lbl) = maybe_skip_ins {
-                program.resolve_label(lbl, program.offset());
+                program.preassign_label_to_next_insn(lbl);
             }
         }
     }

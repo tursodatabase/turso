@@ -669,7 +669,7 @@ pub fn group_by_process_single_group(
         program.offset(),
         "check if ended group had data, and output if so",
     );
-    program.resolve_label(label_jump_after_comparison, program.offset());
+    program.preassign_label_to_next_insn(label_jump_after_comparison);
     program.emit_insn(Insn::Gosub {
         target_pc: labels.label_subrtn_acc_output,
         return_reg: registers.reg_subrtn_acc_output_return_offset,
@@ -891,7 +891,7 @@ pub fn group_by_process_single_group(
     }
 
     // Mark that we've stored data for this group
-    program.resolve_label(labels.label_acc_indicator_set_flag_true, program.offset());
+    program.preassign_label_to_next_insn(labels.label_acc_indicator_set_flag_true);
     program.add_comment(program.offset(), "indicate data in accumulator");
     program.emit_insn(Insn::Integer {
         value: 1,
@@ -972,7 +972,7 @@ pub fn group_by_emit_row_phase<'a>(
         can_fallthrough: false,
     });
 
-    program.resolve_label(labels.label_subrtn_acc_output, program.offset());
+    program.preassign_label_to_next_insn(labels.label_subrtn_acc_output);
 
     // Only output a row if there's data in the accumulator
     program.add_comment(program.offset(), "output group by row subroutine start");
@@ -983,14 +983,11 @@ pub fn group_by_emit_row_phase<'a>(
     });
 
     // If no data, return without outputting a row
-    program.resolve_label(
-        labels.label_group_by_end_without_emitting_row,
-        program.offset(),
-    );
+    program.preassign_label_to_next_insn(labels.label_group_by_end_without_emitting_row);
     // SELECT DISTINCT also jumps here if there is a duplicate.
     if let Distinctness::Distinct { ctx } = &plan.distinctness {
         let distinct_ctx = ctx.as_ref().expect("distinct context must exist");
-        program.resolve_label(distinct_ctx.label_on_conflict, program.offset());
+        program.preassign_label_to_next_insn(distinct_ctx.label_on_conflict);
     }
     program.emit_insn(Insn::Return {
         return_reg: registers.reg_subrtn_acc_output_return_offset,
@@ -998,7 +995,7 @@ pub fn group_by_emit_row_phase<'a>(
     });
 
     // Resolve the label for the start of the group by output row subroutine
-    program.resolve_label(labels.label_agg_final, program.offset());
+    program.preassign_label_to_next_insn(labels.label_agg_final);
     // Finalize aggregate values for output
     for (i, agg) in plan.aggregates.iter().enumerate() {
         let agg_start_reg = t_ctx
@@ -1091,7 +1088,7 @@ pub fn group_by_emit_row_phase<'a>(
 
     // Subroutine to clear accumulators for a new group
     program.add_comment(program.offset(), "clear accumulator subroutine start");
-    program.resolve_label(labels.label_subrtn_acc_clear, program.offset());
+    program.preassign_label_to_next_insn(labels.label_subrtn_acc_clear);
     let start_reg = registers.reg_non_aggregate_exprs_acc;
 
     // Reset all accumulator registers to NULL

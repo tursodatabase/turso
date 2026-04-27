@@ -1213,7 +1213,7 @@ fn emit_epilogue(
 ) -> Result<()> {
     if inserting_multiple_rows {
         if let Some(temp_table_ctx) = &ctx.temp_table_ctx {
-            program.resolve_label(ctx.loop_labels.row_done, program.offset());
+            program.preassign_label_to_next_insn(ctx.loop_labels.row_done);
 
             program.emit_insn(Insn::Next {
                 cursor_id: temp_table_ctx.cursor_id,
@@ -1229,7 +1229,7 @@ fn emit_epilogue(
             });
         } else {
             // For multiple rows which not require a temp table, loop back
-            program.resolve_label(ctx.loop_labels.row_done, program.offset());
+            program.preassign_label_to_next_insn(ctx.loop_labels.row_done);
             program.emit_insn(Insn::Goto {
                 target_pc: ctx.loop_labels.loop_start,
             });
@@ -1241,7 +1241,7 @@ fn emit_epilogue(
             }
         }
     } else {
-        program.resolve_label(ctx.loop_labels.row_done, program.offset());
+        program.preassign_label_to_next_insn(ctx.loop_labels.row_done);
         // single-row falls through to epilogue
         program.emit_insn(Insn::Goto {
             target_pc: ctx.loop_labels.stmt_epilogue,
@@ -1259,7 +1259,7 @@ fn emit_epilogue(
         program.emit_insn(Insn::FkCheck { deferred: false });
         emit_returning_scan_back(program, buf);
     }
-    program.resolve_label(ctx.halt_label, program.offset());
+    program.preassign_label_to_next_insn(ctx.halt_label);
     Ok(())
 }
 
@@ -3288,7 +3288,7 @@ fn translate_virtual_table_insert(
     program.emit_insn(Insn::Close { cursor_id });
 
     let halt_label = program.allocate_label();
-    program.resolve_label(halt_label, program.offset());
+    program.preassign_label_to_next_insn(halt_label);
 
     Ok(())
 }
@@ -3797,7 +3797,7 @@ fn emit_replace_delete_conflicting_row(
         });
 
         if let Some(label) = skip_delete_label {
-            program.resolve_label(label, program.offset());
+            program.preassign_label_to_next_insn(label);
         }
     }
 
@@ -4180,10 +4180,10 @@ pub fn emit_parent_side_fk_decrement_on_insert(
             program.emit_insn(Insn::Goto { target_pc: skip });
 
             // Found: guarded counter decrement
-            program.resolve_label(found, program.offset());
+            program.preassign_label_to_next_insn(found);
             program.emit_insn(Insn::Close { cursor_id: icur });
             emit_guarded_fk_decrement(program, skip, pref.fk.deferred);
-            program.resolve_label(skip, program.offset());
+            program.preassign_label_to_next_insn(skip);
         } else {
             // fallback scan :(
             let ccur = open_read_table(program, child_tbl, database_id);
@@ -4194,7 +4194,7 @@ pub fn emit_parent_side_fk_decrement_on_insert(
             });
             let loop_top = program.allocate_label();
             let next_row = program.allocate_label();
-            program.resolve_label(loop_top, program.offset());
+            program.preassign_label_to_next_insn(loop_top);
 
             for (i, child_name) in child_cols.iter().enumerate() {
                 let (pos, _) = child_tbl.get_column(child_name).ok_or_else(|| {
@@ -4224,16 +4224,16 @@ pub fn emit_parent_side_fk_decrement_on_insert(
                 program.emit_insn(Insn::Goto {
                     target_pc: next_row,
                 });
-                program.resolve_label(cont, program.offset());
+                program.preassign_label_to_next_insn(cont);
             }
             // Matched one child row: guarded decrement of counter
             emit_guarded_fk_decrement(program, next_row, pref.fk.deferred);
-            program.resolve_label(next_row, program.offset());
+            program.preassign_label_to_next_insn(next_row);
             program.emit_insn(Insn::Next {
                 cursor_id: ccur,
                 pc_if_next: loop_top,
             });
-            program.resolve_label(done, program.offset());
+            program.preassign_label_to_next_insn(done);
             program.emit_insn(Insn::Close { cursor_id: ccur });
         }
     }

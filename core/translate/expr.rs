@@ -831,13 +831,13 @@ pub fn translate_condition_expr(
 
             if *not {
                 // When IN is TRUE (match found), NOT IN should be FALSE
-                program.resolve_label(not_true_label.unwrap(), program.offset());
+                program.preassign_label_to_next_insn(not_true_label.unwrap());
                 program.emit_insn(Insn::Goto {
                     target_pc: jump_target_when_false,
                 });
 
                 // When IN is FALSE (no match), NOT IN should be TRUE
-                program.resolve_label(not_false_label.unwrap(), program.offset());
+                program.preassign_label_to_next_insn(not_false_label.unwrap());
                 program.emit_insn(Insn::Goto {
                     target_pc: jump_target_when_true,
                 });
@@ -2052,7 +2052,7 @@ pub fn translate_expr(
                                 resolver,
                                 NoConstantOptReason::RegisterReuse,
                             )?;
-                            program.resolve_label(before_copy_label, program.offset());
+                            program.preassign_label_to_next_insn(before_copy_label);
                             program.emit_insn(Insn::Copy {
                                 src_reg: temp_reg,
                                 dst_reg: target_register,
@@ -3663,7 +3663,7 @@ pub fn translate_expr(
             });
 
             // False path: set result to 0
-            program.resolve_label(dest_if_false, program.offset());
+            program.preassign_label_to_next_insn(dest_if_false);
 
             // Force integer conversion with AddImm 0
             program.emit_insn(Insn::AddImm {
@@ -3677,7 +3677,7 @@ pub fn translate_expr(
                     dest: tmp,
                 });
             }
-            program.resolve_label(dest_if_null, program.offset());
+            program.preassign_label_to_next_insn(dest_if_null);
             program.emit_insn(Insn::Copy {
                 src_reg: tmp,
                 dst_reg: result_reg,

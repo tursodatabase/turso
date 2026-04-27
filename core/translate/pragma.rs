@@ -564,7 +564,7 @@ fn update_pragma(
                 on_error: None,
                 description_reg: None,
             });
-            program.resolve_label(set_cookie_label, program.offset());
+            program.preassign_label_to_next_insn(set_cookie_label);
             program.emit_insn(Insn::SetCookie {
                 db: database_id,
                 cookie: Cookie::IncrementalVacuum,
