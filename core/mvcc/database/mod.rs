@@ -5220,9 +5220,37 @@ impl RowVersion {
                 tx.begin_ts > end_ts
             }
             Some(TxTimestampOrID::TxID(end_tx_id)) => {
-                // Row is being deleted/updated by another transaction
-                // If it's OUR transaction, the B-tree row is invalid (we deleted/updated it)
-                end_tx_id == tx.tx_id
+                // Row is being deleted/updated by another transaction.
+                // Consult the deleting tx's state so we don't race with the
+                // post-commit rewrite that turns TxID(W) into Timestamp(W.end_ts).
+                if end_tx_id == tx.tx_id {
+                    return true;
+                }
+                match lookup_tx_state(txs, finalized_tx_states, end_tx_id) {
+                    Some(TransactionState::Committed(committed_ts)) => {
+                        // Same predicate as the Timestamp arm above.
+                        tx.begin_ts > committed_ts
+                    }
+                    Some(TransactionState::Preparing(end_ts)) => {
+                        // Hekaton speculative read: treat as if W will commit at
+                        // its prepared end_ts. When we speculatively invalidate
+                        // the B-tree row, register a commit dependency on W —
+                        // for tombstones (begin=None) we are the only place that
+                        // decides this, since `is_visible_to` short-circuits at
+                        // `is_begin_visible` and never calls `is_end_visible`.
+                        // If W aborts, we must cascade-abort to avoid letting
+                        // the reader observe the row reappear.
+                        let speculatively_invalidated = tx.begin_ts > end_ts;
+                        if speculatively_invalidated {
+                            register_commit_dependency(txs, tx, end_tx_id);
+                        }
+                        speculatively_invalidated
+                    }
+                    Some(TransactionState::Active) => false,
+                    Some(TransactionState::Aborted)
+                    | Some(TransactionState::Terminated) => false,
+                    None => false,
+                }
             }
             None => false,
         }
