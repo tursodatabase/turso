@@ -240,6 +240,7 @@ impl<'a> Parser<'a> {
 
     // entrypoint of parsing
     pub fn next_cmd(&mut self) -> Result<Option<Cmd>> {
+        let _stack = crate::stack::trace_scope("parser:next_cmd");
         self.last_variable_id = 0;
         self.named_variables.clear();
 
@@ -649,6 +650,10 @@ impl<'a> Parser<'a> {
             TK_REINDEX,
             TK_OPTIMIZE
         );
+        let stmt_token = tok.token_type;
+        let _stack = crate::stack::trace_scope_with_dynamic_detail("parser:parse_stmt", || {
+            format!("token={stmt_token:?}")
+        });
 
         match tok.token_type {
             TK_BEGIN => self.parse_begin(),
@@ -936,6 +941,7 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_create_stmt(&mut self) -> Result<Stmt> {
+        let _stack = crate::stack::trace_scope("parser:parse_create_stmt");
         eat_assert!(self, TK_CREATE);
         let mut first_tok = peek_expect!(
             self,
@@ -976,6 +982,7 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_with_stmt(&mut self) -> Result<Stmt> {
+        let _stack = crate::stack::trace_scope("parser:parse_with_stmt");
         let with = self.parse_with()?;
         debug_assert!(with.is_some());
         let first_tok =
@@ -1448,6 +1455,7 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_expr_operand(&mut self) -> Result<Box<Expr>> {
+        let _stack = crate::stack::trace_scope("parser:parse_expr_operand");
         let tok = peek_expect!(
             self,
             TK_LP,
@@ -1790,6 +1798,9 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_expr(&mut self, precedence: u8) -> Result<Box<Expr>> {
+        let _stack = crate::stack::trace_scope_with_dynamic_detail("parser:parse_expr", || {
+            format!("precedence={precedence}")
+        });
         let mut result = self.parse_expr_operand()?;
 
         loop {
@@ -2258,6 +2269,7 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_common_table_expr(&mut self) -> Result<CommonTableExpr> {
+        let _stack = crate::stack::trace_scope("parser:parse_common_table_expr");
         let nm = self.parse_nm()?;
         let eid_list = self.parse_eid_list(false)?;
         eat_expect!(self, TK_AS);
@@ -2285,6 +2297,7 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_with(&mut self) -> Result<Option<With>> {
+        let _stack = crate::stack::trace_scope("parser:parse_with");
         if let Some(tok) = self.peek()? {
             if tok.token_type == TK_WITH {
                 eat_assert!(self, TK_WITH);
@@ -2496,6 +2509,7 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_joined_tables(&mut self) -> Result<Vec<JoinedSelectTable>> {
+        let _stack = crate::stack::trace_scope("parser:parse_joined_tables");
         let mut result = vec![];
         while let Some(tok) = self.peek()? {
             let op = match tok.token_type {
@@ -2627,6 +2641,7 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_from_clause(&mut self) -> Result<FromClause> {
+        let _stack = crate::stack::trace_scope("parser:parse_from_clause");
         let tok = peek_expect!(
             self,
             TK_ID,
@@ -2786,6 +2801,7 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_one_select(&mut self) -> Result<OneSelect> {
+        let _stack = crate::stack::trace_scope("parser:parse_one_select");
         let tok = eat_expect!(self, TK_SELECT, TK_VALUES);
         match tok.token_type {
             TK_SELECT => {
@@ -2834,6 +2850,7 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_select_body(&mut self) -> Result<SelectBody> {
+        let _stack = crate::stack::trace_scope("parser:parse_select_body");
         let select = self.parse_one_select()?;
         let mut compounds = vec![];
         while let Some(tok) = self.peek()? {
@@ -2959,6 +2976,7 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_select_without_cte(&mut self, with: Option<With>) -> Result<Select> {
+        let _stack = crate::stack::trace_scope("parser:parse_select_without_cte");
         let body = self.parse_select_body()?;
         let order_by = self.parse_order_by()?;
         let limit = self.parse_limit()?;
@@ -2971,6 +2989,7 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_select(&mut self) -> Result<Select> {
+        let _stack = crate::stack::trace_scope("parser:parse_select");
         let with = self.parse_with()?;
         self.parse_select_without_cte(with)
     }
@@ -3233,6 +3252,7 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_create_table(&mut self, temporary: bool) -> Result<Stmt> {
+        let _stack = crate::stack::trace_scope("parser:parse_create_table");
         eat_assert!(self, TK_TABLE);
         let if_not_exists = self.parse_if_not_exists()?;
         let tbl_name = self.parse_fullname(false)?;
@@ -3839,6 +3859,7 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_alter(&mut self) -> Result<Stmt> {
+        let _stack = crate::stack::trace_scope("parser:parse_alter");
         eat_assert!(self, TK_ALTER);
         eat_expect!(self, TK_TABLE);
         let tbl_name = self.parse_fullname(false)?;
@@ -3962,6 +3983,7 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_create_index(&mut self) -> Result<Stmt> {
+        let _stack = crate::stack::trace_scope("parser:parse_create_index");
         let tok = eat_assert!(self, TK_INDEX, TK_UNIQUE);
         let has_unique = tok.token_type == TK_UNIQUE;
         if has_unique {
@@ -4209,6 +4231,7 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_trigger_cmd(&mut self) -> Result<TriggerCmd> {
+        let _stack = crate::stack::trace_scope("parser:parse_trigger_cmd");
         let tok = peek_expect!(
             self, TK_INSERT, TK_REPLACE, TK_UPDATE, TK_DELETE, TK_WITH, TK_SELECT, TK_VALUES,
         );
@@ -4226,6 +4249,7 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_create_trigger(&mut self, temporary: bool) -> Result<Stmt> {
+        let _stack = crate::stack::trace_scope("parser:parse_create_trigger");
         eat_assert!(self, TK_TRIGGER);
 
         let if_not_exists = self.parse_if_not_exists()?;
@@ -4754,6 +4778,7 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_insert_without_cte(&mut self, with: Option<With>) -> Result<Stmt> {
+        let _stack = crate::stack::trace_scope("parser:parse_insert_without_cte");
         let tok = eat_assert!(self, TK_INSERT, TK_REPLACE);
         let resolve_type = match tok.token_type {
             TK_INSERT => self.parse_or_conflict()?,
@@ -4807,11 +4832,13 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_insert(&mut self) -> Result<Stmt> {
+        let _stack = crate::stack::trace_scope("parser:parse_insert");
         let with = self.parse_with()?;
         self.parse_insert_without_cte(with)
     }
 
     fn parse_update_without_cte(&mut self, with: Option<With>) -> Result<Stmt> {
+        let _stack = crate::stack::trace_scope("parser:parse_update_without_cte");
         eat_assert!(self, TK_UPDATE);
         let resolve_type = self.parse_or_conflict()?;
         let tbl_name = self.parse_fullname(true)?;
@@ -4841,6 +4868,7 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_update(&mut self) -> Result<Stmt> {
+        let _stack = crate::stack::trace_scope("parser:parse_update");
         let with = self.parse_with()?;
         self.parse_update_without_cte(with)
     }

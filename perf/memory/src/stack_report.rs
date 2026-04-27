@@ -60,6 +60,10 @@ struct Args {
     /// Only include reports for statements whose SQL contains this substring. Can be repeated.
     #[arg(long = "sql-contains")]
     sql_contains: Vec<String>,
+
+    /// Include parser stack spans in per-statement prepare reports.
+    #[arg(long = "trace-parser")]
+    trace_parser: bool,
 }
 
 #[derive(Debug, Default)]
@@ -239,6 +243,9 @@ async fn main() -> Result<()> {
     // objects, so stack guards consistently emit tracing events.
     unsafe {
         std::env::set_var("TURSO_TRACE_STACK", "1");
+        if args.trace_parser {
+            std::env::set_var("TURSO_TRACE_PARSER_STACK", "1");
+        }
     }
 
     let collector = Arc::new(StackCollector::default());

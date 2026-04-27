@@ -13,7 +13,7 @@ name = "stack-report"
 path = "src/stack_report.rs"
 
 [features]
-stacker = ["turso/stacker"]
+stacker = ["turso/stacker", "turso_parser/stacker"]
 
 [dependencies]
 turso = { path = "../../bindings/rust", default-features = false }

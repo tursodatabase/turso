@@ -6683,9 +6683,11 @@ dependencies = [
  "miette",
  "pprof",
  "serde",
+ "stacker",
  "strum",
  "strum_macros",
  "thiserror 2.0.16",
+ "tracing",
  "turso_macros",
 ]
 
