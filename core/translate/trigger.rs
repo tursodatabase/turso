@@ -2,7 +2,7 @@ use crate::translate::emitter::Resolver;
 use crate::translate::schema::{emit_schema_entry, SchemaEntryType, SQLITE_TABLEID};
 use crate::translate::ProgramBuilder;
 use crate::translate::ProgramBuilderOpts;
-use crate::util::{escape_sql_string_literal, normalize_ident};
+use crate::util::normalize_ident;
 use crate::vdbe::builder::CursorType;
 use crate::vdbe::insn::{Cookie, Insn};
 use crate::{bail_parse_error, Result, MAIN_DB_ID};
@@ -209,12 +209,12 @@ pub fn translate_create_trigger(
     });
 
     // Parse schema to load the new trigger
-    let escaped_trigger_name = escape_sql_string_literal(&normalized_trigger_name);
     program.emit_insn(Insn::ParseSchema {
         db: database_id,
-        where_clause: Some(format!(
-            "name = '{escaped_trigger_name}' AND type = 'trigger'"
-        )),
+        filter: crate::vdbe::insn::ParseSchemaFilter::NameAndType {
+            name: normalized_trigger_name,
+            ty: "trigger".to_string(),
+        },
     });
 
     Ok(())
