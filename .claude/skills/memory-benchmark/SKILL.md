@@ -36,12 +36,17 @@ Useful options:
 ```bash
 --sql FILE|-             # SQL payload, or stdin with -
 --format human|json|csv  # output format
---top N                  # human output row limit
+--top N                  # heaviest span rows per statement in human output
 ```
 
-The report is sorted by lowest `remaining_stack`, so the first rows are the
-deepest observed stack points. JSON and CSV formats are deterministic and
-intended for comparing runs.
+The report is statement-oriented. For each SQL statement, it records the
+remaining stack before execution, the minimum remaining stack sampled while that
+statement ran, and `stack_used = baseline_remaining_stack - min_remaining_stack`.
+Statements are sorted by `stack_used` descending so the worst SQL statements are
+first. Within each statement, span rows are sorted by `stack_used` descending,
+with the original tracing emission sequence kept in the `trace_sequence` field
+(`seq` in human output). JSON and CSV formats are deterministic and intended for
+comparing runs.
 
 `stack-report` splits payloads with `turso_parser::parser::Parser::next_cmd()`.
 It then executes statements with no result columns, and queries and drains

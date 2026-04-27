@@ -3393,6 +3393,7 @@ dependencies = [
  "rand 0.9.4",
  "serde",
  "serde_json",
+ "stacker",
  "tokio",
  "tracing",
  "tracing-subscriber",

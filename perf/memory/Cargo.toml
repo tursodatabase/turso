@@ -22,6 +22,7 @@ clap = { workspace = true, features = ["derive"] }
 tokio = { workspace = true, default-features = true, features = ["full"] }
 tracing-subscriber = { workspace = true }
 tracing = { workspace = true }
+stacker = "0.1"
 memory-stats = "1.2.0"
 dhat = "0.3"
 serde = { workspace = true, features = ["derive"] }
