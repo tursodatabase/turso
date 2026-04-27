@@ -35,10 +35,27 @@ Useful options:
 
 ```bash
 --sql FILE|-             # SQL payload, or stdin with -
+--profile NAME           # built-in SQL profile instead of --sql
 --format human|json|csv  # output format
 --top N                  # aggregate/span rows per statement in human output
 --statement N[,N...]     # only include reports for 1-based statement indexes
 --sql-contains TEXT      # only include reports for statements containing TEXT, ASCII case-insensitive
+```
+
+Built-in stack profiles:
+
+```bash
+complex-cte-matrix  # reduced multi-CTE read variants with JSON aggregation
+generated-index-ddl # generated-column ALTER TABLE and CREATE INDEX variants
+trigger-insert      # INSERT statements that fire validation triggers with subqueries
+```
+
+For example:
+
+```bash
+cargo run --release -q -p memory-benchmark --features stacker --bin stack-report -- \
+  --profile complex-cte-matrix \
+  --top 30
 ```
 
 The report is statement-oriented. For each SQL statement, it records the
