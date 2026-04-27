@@ -127,41 +127,91 @@ fn test_allow_drop_unreferenced_columns(tmp_db: TempDatabase) -> anyhow::Result<
     Ok(())
 }
 
-/// WITHOUT ROWID tables are not supported
 #[turso_macros::test]
-fn test_create_table_without_rowid_not_supported(tmp_db: TempDatabase) -> anyhow::Result<()> {
+fn test_create_table_without_rowid_supported(tmp_db: TempDatabase) -> anyhow::Result<()> {
     let _ = env_logger::try_init();
     let conn = tmp_db.connect_limbo();
 
-    let res = conn.execute("CREATE TABLE t(a INTEGER PRIMARY KEY, b TEXT) WITHOUT ROWID");
-    assert!(
-        res.is_err(),
-        "Expected error when creating WITHOUT ROWID table"
-    );
-    assert!(
-        res.unwrap_err()
-            .to_string()
-            .contains("WITHOUT ROWID tables are not supported"),
-        "Expected error message about WITHOUT ROWID not being supported"
+    conn.execute("CREATE TABLE t(b INTEGER, a TEXT PRIMARY KEY, c TEXT) WITHOUT ROWID")?;
+
+    let sql: Vec<(String,)> =
+        conn.exec_rows("SELECT sql FROM sqlite_schema WHERE type = 'table' AND name = 't'");
+    assert_eq!(
+        sql,
+        vec![("CREATE TABLE t (b INTEGER, a TEXT PRIMARY KEY, c TEXT) WITHOUT ROWID".to_string(),)]
     );
     Ok(())
 }
 
 #[turso_macros::test]
-fn test_create_table_without_rowid_composite_pk(tmp_db: TempDatabase) -> anyhow::Result<()> {
+fn test_create_table_without_rowid_composite_pk_supported(
+    tmp_db: TempDatabase,
+) -> anyhow::Result<()> {
     let _ = env_logger::try_init();
     let conn = tmp_db.connect_limbo();
 
-    let res = conn.execute("CREATE TABLE t(a TEXT, b INT, PRIMARY KEY(a, b)) WITHOUT ROWID");
+    conn.execute("CREATE TABLE t(a TEXT, b INT, PRIMARY KEY(a, b)) WITHOUT ROWID")?;
+    Ok(())
+}
+
+#[turso_macros::test]
+fn test_create_table_without_rowid_requires_primary_key(
+    tmp_db: TempDatabase,
+) -> anyhow::Result<()> {
+    let _ = env_logger::try_init();
+    let conn = tmp_db.connect_limbo();
+
+    let res = conn.execute("CREATE TABLE t(a TEXT, b INT) WITHOUT ROWID");
     assert!(
         res.is_err(),
-        "Expected error when creating WITHOUT ROWID table with composite primary key"
+        "Expected error when creating WITHOUT ROWID table without a primary key"
+    );
+    assert!(
+        res.unwrap_err().to_string().contains("PRIMARY KEY"),
+        "Expected error message about a required primary key"
+    );
+    Ok(())
+}
+
+#[turso_macros::test]
+fn test_create_table_without_rowid_rejects_secondary_unique(
+    tmp_db: TempDatabase,
+) -> anyhow::Result<()> {
+    let _ = env_logger::try_init();
+    let conn = tmp_db.connect_limbo();
+
+    let res =
+        conn.execute("CREATE TABLE t(a TEXT PRIMARY KEY, b INT UNIQUE, c TEXT) WITHOUT ROWID");
+    assert!(
+        res.is_err(),
+        "Expected error when creating WITHOUT ROWID table with secondary UNIQUE"
     );
     assert!(
         res.unwrap_err()
             .to_string()
-            .contains("WITHOUT ROWID tables are not supported"),
-        "Expected error message about WITHOUT ROWID not being supported"
+            .contains("secondary UNIQUE constraints on WITHOUT ROWID tables are not supported"),
+        "Expected error message about secondary UNIQUE constraints"
+    );
+    Ok(())
+}
+
+#[turso_macros::test]
+fn test_create_table_without_rowid_rejects_autoincrement(
+    tmp_db: TempDatabase,
+) -> anyhow::Result<()> {
+    let _ = env_logger::try_init();
+    let conn = tmp_db.connect_limbo();
+
+    let res = conn.execute("CREATE TABLE t(a INTEGER PRIMARY KEY AUTOINCREMENT) WITHOUT ROWID");
+    assert!(
+        res.is_err(),
+        "Expected error when creating WITHOUT ROWID table with AUTOINCREMENT"
+    );
+    assert!(
+        res.unwrap_err()
+            .to_string()
+            .contains("AUTOINCREMENT is not allowed on WITHOUT ROWID tables"),
+        "Expected error message about AUTOINCREMENT"
     );
     Ok(())
 }

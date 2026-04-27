@@ -1167,13 +1167,27 @@ pub fn op_open_read(
                 .expect("cursor_id should be valid")
                 .replace(Cursor::new_materialized_view(mv_cursor));
         }
-        CursorType::BTreeTable(_) => {
+        CursorType::BTreeTable(table) => {
             // Regular table
-            let btree_cursor = Box::new(BTreeCursor::new_table(
-                pager,
-                maybe_transform_root_page_to_positive(mv_store.as_ref(), *root_page),
-                num_columns,
-            ));
+            if !table.has_rowid && program.connection.get_mv_tx_id_for_db(*db).is_some() {
+                return Err(LimboError::ParseError(
+                    "WITHOUT ROWID tables are not supported in MVCC mode".to_string(),
+                ));
+            }
+            let btree_cursor: Box<dyn CursorTrait> = if table.has_rowid {
+                Box::new(BTreeCursor::new_table(
+                    pager,
+                    maybe_transform_root_page_to_positive(mv_store.as_ref(), *root_page),
+                    num_columns,
+                ))
+            } else {
+                Box::new(BTreeCursor::new_without_rowid_table(
+                    pager,
+                    maybe_transform_root_page_to_positive(mv_store.as_ref(), *root_page),
+                    table.as_ref(),
+                    num_columns,
+                ))
+            };
             let cursor = maybe_promote_to_mvcc_cursor(btree_cursor, MvccCursorType::Table)?;
             cursors
                 .get_mut(*cursor_id)
@@ -9070,16 +9084,26 @@ pub fn op_insert(
                 continue;
             }
             OpInsertSubState::Seek => {
+                let is_without_rowid = {
+                    let cursor = get_cursor!(state, *cursor_id);
+                    !cursor.as_btree_mut().has_rowid()
+                };
                 if let SeekInternalResult::IO(io) = seek_internal(
                     program,
                     state,
                     pager,
-                    RecordSource::Unpacked {
-                        start_reg: *key_reg,
-                        num_regs: 1,
+                    if is_without_rowid {
+                        RecordSource::Packed {
+                            record_reg: *record_reg,
+                        }
+                    } else {
+                        RecordSource::Unpacked {
+                            start_reg: *key_reg,
+                            num_regs: 1,
+                        }
                     },
                     *cursor_id,
-                    false,
+                    is_without_rowid,
                     SeekOp::GE { eq_only: true },
                 )? {
                     return Ok(InsnFunctionStepResult::IO(io));
@@ -9100,6 +9124,15 @@ pub fn op_insert(
                 continue;
             }
             OpInsertSubState::CaptureRecord => {
+                {
+                    let cursor = state.get_cursor(*cursor_id);
+                    let cursor = cursor.as_btree_mut();
+                    if !cursor.has_rowid() {
+                        state.active_op_state.insert().old_record = None;
+                        state.active_op_state.insert().sub_state = OpInsertSubState::NoopCheck;
+                        continue;
+                    }
+                }
                 let insert_key = match &state.registers[*key_reg].get_value() {
                     Value::Numeric(Numeric::Integer(i)) => *i,
                     _ => unreachable!("expected integer key in insert"),
@@ -9153,7 +9186,12 @@ pub fn op_insert(
                     let cursor_ref = get_cursor!(state, *cursor_id);
                     cursor_ref.as_btree_mut().is_mvcc()
                 };
+                let has_rowid = {
+                    let cursor = get_cursor!(state, *cursor_id);
+                    cursor.as_btree_mut().has_rowid()
+                };
                 if !is_mvcc
+                    && has_rowid
                     && flag.has(InsertFlags::SKIP_LAST_ROWID)
                     && !flag.has(InsertFlags::UPDATE_ROWID_CHANGE)
                 {
@@ -9187,10 +9225,6 @@ pub fn op_insert(
             }
             OpInsertSubState::Insert => {
                 if !state.active_op_state.insert().is_noop_update {
-                    let key = match &state.registers[*key_reg].get_value() {
-                        Value::Numeric(Numeric::Integer(i)) => *i,
-                        _ => unreachable!("expected integer key"),
-                    };
                     let record = match &state.registers[*record_reg] {
                         Register::Record(r) => std::borrow::Cow::Borrowed(r),
                         Register::Value(value) => {
@@ -9204,7 +9238,15 @@ pub fn op_insert(
                     };
                     let cursor = get_cursor!(state, *cursor_id);
                     let cursor = cursor.as_btree_mut();
-                    return_if_io!(cursor.insert(&BTreeKey::new_table_rowid(key, Some(&record))));
+                    if cursor.has_rowid() {
+                        let key = match &state.registers[*key_reg].get_value() {
+                            Value::Numeric(Numeric::Integer(i)) => *i,
+                            _ => unreachable!("expected integer key"),
+                        };
+                        return_if_io!(cursor.insert(&BTreeKey::new_table_rowid(key, Some(&record))));
+                    } else {
+                        return_if_io!(cursor.insert(&BTreeKey::new_index_key(&record)));
+                    }
                     state.record_rows_written(1);
                 }
                 // Only update last_insert_rowid for regular table inserts, not schema modifications
@@ -9230,15 +9272,26 @@ pub fn op_insert(
                 }
             }
             OpInsertSubState::UpdateLastRowid => {
-                let maybe_rowid = {
+                let has_rowid = {
                     let cursor = state.get_cursor(*cursor_id);
                     let cursor = cursor.as_btree_mut();
-                    return_if_io!(cursor.rowid())
+                    cursor.has_rowid()
                 };
-                if let Some(rowid) = maybe_rowid {
-                    if !flag.has(InsertFlags::SKIP_LAST_ROWID) {
-                        program.connection.update_last_rowid(rowid);
+                if has_rowid {
+                    let maybe_rowid = {
+                        let cursor = state.get_cursor(*cursor_id);
+                        let cursor = cursor.as_btree_mut();
+                        return_if_io!(cursor.rowid())
+                    };
+                    if let Some(rowid) = maybe_rowid {
+                        if !flag.has(InsertFlags::SKIP_LAST_ROWID) {
+                            program.connection.update_last_rowid(rowid);
+                        }
+                        state
+                            .n_change
+                            .fetch_add(1, crate::sync::atomic::Ordering::SeqCst);
                     }
+                } else {
                     state
                         .n_change
                         .fetch_add(1, crate::sync::atomic::Ordering::SeqCst);
@@ -9246,6 +9299,12 @@ pub fn op_insert(
                 let schema = program.connection.schema.read();
                 let dependent_views = schema.get_dependent_materialized_views(table_name);
                 if !dependent_views.is_empty() {
+                    if !has_rowid {
+                        return Err(LimboError::ParseError(
+                            "WITHOUT ROWID tables with dependent materialized views are not supported"
+                                .to_string(),
+                        ));
+                    }
                     state.active_op_state.insert().sub_state = OpInsertSubState::ApplyViewChange;
                     continue;
                 }
@@ -10333,6 +10392,13 @@ pub fn op_open_write(
                 .expect("cursor_id should be valid")
                 .replace(Cursor::new_btree(cursor));
         } else {
+            if matches!(cursor_type, CursorType::BTreeTable(table_rc) if !table_rc.has_rowid)
+                && program.connection.get_mv_tx_id_for_db(*db).is_some()
+            {
+                return Err(LimboError::ParseError(
+                    "WITHOUT ROWID tables are not supported in MVCC mode".to_string(),
+                ));
+            }
             let num_columns = match cursor_type {
                 CursorType::BTreeTable(table_rc) => table_rc.columns().len(),
                 CursorType::MaterializedView(table_rc, _) => table_rc.columns().len(),
@@ -10341,11 +10407,21 @@ pub fn op_open_write(
                 ),
             };
 
-            let btree_cursor = Box::new(BTreeCursor::new_table(
-                pager,
-                maybe_transform_root_page_to_positive(mv_store.as_ref(), root_page),
-                num_columns,
-            ));
+            let btree_cursor: Box<dyn CursorTrait> = match cursor_type {
+                CursorType::BTreeTable(table_rc) if !table_rc.has_rowid => {
+                    Box::new(BTreeCursor::new_without_rowid_table(
+                        pager,
+                        maybe_transform_root_page_to_positive(mv_store.as_ref(), root_page),
+                        table_rc.as_ref(),
+                        num_columns,
+                    ))
+                }
+                _ => Box::new(BTreeCursor::new_table(
+                    pager,
+                    maybe_transform_root_page_to_positive(mv_store.as_ref(), root_page),
+                    num_columns,
+                )),
+            };
             let cursor = maybe_promote_to_mvcc_cursor(btree_cursor, MvccCursorType::Table)?;
             cursors
                 .get_mut(*cursor_id)
@@ -11911,11 +11987,25 @@ pub fn op_open_dup(
         .expect("cursor_id should exist in cursor_ref");
     match cursor_type {
         CursorType::BTreeTable(table) => {
-            let cursor = Box::new(BTreeCursor::new_table(
-                pager,
-                maybe_transform_root_page_to_positive(mv_store.as_ref(), root_page),
-                table.columns().len(),
-            ));
+            if !table.has_rowid && program.connection.get_mv_tx_id().is_some() {
+                return Err(LimboError::ParseError(
+                    "WITHOUT ROWID tables are not supported in MVCC mode".to_string(),
+                ));
+            }
+            let cursor: Box<dyn CursorTrait> = if table.has_rowid {
+                Box::new(BTreeCursor::new_table(
+                    pager,
+                    maybe_transform_root_page_to_positive(mv_store.as_ref(), root_page),
+                    table.columns().len(),
+                ))
+            } else {
+                Box::new(BTreeCursor::new_without_rowid_table(
+                    pager,
+                    maybe_transform_root_page_to_positive(mv_store.as_ref(), root_page),
+                    table.as_ref(),
+                    table.columns().len(),
+                ))
+            };
             let cursor: Box<dyn CursorTrait> = if !is_ephemeral {
                 if let Some(tx_id) = program.connection.get_mv_tx_id() {
                     let mv_store = mv_store

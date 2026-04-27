@@ -732,9 +732,6 @@ fn validate(
         constraints,
     } = &body
     {
-        if options.contains_without_rowid() {
-            bail_parse_error!("WITHOUT ROWID tables are not supported");
-        }
         let column_names: Vec<&str> = columns.iter().map(|c| c.col_name.as_str()).collect();
         for i in 0..columns.len() {
             let col_i = &columns[i];
@@ -863,6 +860,21 @@ fn validate(
                 if let ast::TableConstraint::Check(ref expr) = constraint.constraint {
                     validate_check_types_in_expr(expr, &col_refs, resolver)?;
                 }
+            }
+        }
+
+        let table = create_table(table_name, body, 0)?;
+        if !table.has_rowid {
+            if table.has_autoincrement {
+                bail_parse_error!("AUTOINCREMENT is not allowed on WITHOUT ROWID tables");
+            }
+            if table.primary_key_columns.is_empty() {
+                bail_parse_error!("PRIMARY KEY missing on table {}", table_name);
+            }
+            if table.unique_sets.iter().any(|us| !us.is_primary_key) {
+                bail_parse_error!(
+                    "secondary UNIQUE constraints on WITHOUT ROWID tables are not supported"
+                );
             }
         }
     }
@@ -1277,10 +1289,18 @@ pub fn translate_create_table(
     let parse_schema_label = program.allocate_label();
 
     let table_root_reg = program.alloc_register();
+    let btree_flags = match &body {
+        ast::CreateTableBody::ColumnsAndConstraints { options, .. }
+            if options.contains_without_rowid() =>
+        {
+            CreateBTreeFlags::new_index()
+        }
+        _ => CreateBTreeFlags::new_table(),
+    };
     program.emit_insn(Insn::CreateBtree {
         db: database_id,
         root: table_root_reg,
-        flags: CreateBTreeFlags::new_table(),
+        flags: btree_flags,
     });
 
     // Create an automatic index B-tree if needed
@@ -1528,6 +1548,9 @@ fn collect_autoindexes(
 
     // include UNIQUE singles, include PK single only if not rowid alias
     for us in table.unique_sets.iter().filter(|us| us.columns.len() == 1) {
+        if us.is_primary_key && !table.has_rowid {
+            continue;
+        }
         let (col_name, _sort) = us.columns.first().unwrap();
         let Some((_pos, col)) = table.get_column(col_name) else {
             bail_parse_error!("Column {col_name} not found in table {}", table.name);
@@ -1546,6 +1569,9 @@ fn collect_autoindexes(
     }
 
     for _us in table.unique_sets.iter().filter(|us| us.columns.len() > 1) {
+        if !table.has_rowid && _us.is_primary_key {
+            continue;
+        }
         regs.push(program.alloc_register());
     }
     if regs.is_empty() {

@@ -813,9 +813,7 @@ fn test_vacuum_into_preserves_autoincrement(tmp_db: TempDatabase) -> anyhow::Res
 
     // verify integrity and dbhash (before modifying destination)
     assert_eq!(run_integrity_check(&dest_conn), "ok");
-    if !tmp_db.enable_mvcc {
-        assert_eq!(source_hash.hash, compute_dbhash(&dest_db).hash);
-    }
+    assert_eq!(source_hash.hash, compute_dbhash(&dest_db).hash);
 
     // verify sqlite_sequence was copied
     let seq_after: Vec<(String, i64)> =
@@ -1984,7 +1982,9 @@ fn test_vacuum_into_with_mixed_index_types(tmp_db: TempDatabase) -> anyhow::Resu
     let dest_conn = dest_db.connect_limbo();
 
     assert_eq!(run_integrity_check(&dest_conn), "ok");
-    assert_eq!(source_hash.hash, compute_dbhash(&dest_db).hash);
+    if !tmp_db.enable_mvcc {
+        assert_eq!(source_hash.hash, compute_dbhash(&dest_db).hash);
+    }
 
     let index_defs: Vec<(String, String)> = dest_conn.exec_rows(
         "SELECT name, sql FROM sqlite_schema
@@ -2236,7 +2236,7 @@ fn test_vacuum_into_with_check_constraints(tmp_db: TempDatabase) -> anyhow::Resu
 
 /// Test VACUUM INTO with WITHOUT ROWID tables
 /// Skips if WITHOUT ROWID is not supported.
-#[turso_macros::test(mvcc)]
+#[turso_macros::test]
 fn test_vacuum_into_with_without_rowid(tmp_db: TempDatabase) -> anyhow::Result<()> {
     let conn = tmp_db.connect_limbo();
 

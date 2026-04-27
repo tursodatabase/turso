@@ -1632,7 +1632,8 @@ impl Schema {
 
             // Create a BTreeTable for the materialized view
             let cols = incremental_view.column_schema.flat_columns();
-            let logical_to_physical_map = BTreeTable::build_logical_to_physical_map(&cols);
+            let logical_to_physical_map =
+                BTreeTable::build_logical_to_physical_map(&cols, &[], true);
             let table = Arc::new(Table::BTree(Arc::new(BTreeTable {
                 name: view_name.clone(),
                 root_page: main_root,
@@ -2232,7 +2233,7 @@ pub enum ColumnLayout {
 impl ColumnLayout {
     pub fn from_table(table: &Table) -> Self {
         match table {
-            Table::BTree(btree) => Self::from_columns(&btree.columns),
+            Table::BTree(btree) => Self::from_btree(btree),
             Table::Virtual(vtable) => Self::Identity {
                 column_count: vtable.as_ref().columns.len(),
             },
@@ -2243,7 +2244,24 @@ impl ColumnLayout {
     }
 
     pub fn from_btree(btree: &BTreeTable) -> Self {
-        Self::from_columns(&btree.columns)
+        let total = btree.columns.len();
+        let non_virtual_col_count = btree
+            .columns
+            .iter()
+            .filter(|c| !c.is_virtual_generated())
+            .count();
+        let offsets = btree.logical_to_physical_map.clone();
+        let is_identity = non_virtual_col_count == total && offsets.iter().copied().eq(0..total);
+        if is_identity {
+            Self::Identity {
+                column_count: total,
+            }
+        } else {
+            Self::Mapped {
+                offsets,
+                non_virtual_col_count,
+            }
+        }
     }
 
     pub fn from_columns(columns: &[Column]) -> Self {
@@ -2631,8 +2649,11 @@ impl Drop for ColumnsMut<'_> {
         self.table.column_dependencies.0 = OnceLock::new();
         self.table.has_virtual_columns =
             self.table.columns.iter().any(|c| c.is_virtual_generated());
-        self.table.logical_to_physical_map =
-            BTreeTable::build_logical_to_physical_map(&self.table.columns);
+        self.table.logical_to_physical_map = BTreeTable::build_logical_to_physical_map(
+            &self.table.columns,
+            &self.table.primary_key_columns,
+            self.table.has_rowid,
+        );
     }
 }
 
@@ -2650,13 +2671,15 @@ impl BTreeTable {
         rowid_alias_conflict_clause: Option<ResolveType>,
     ) -> Self {
         let has_virtual_columns = columns.iter().any(|c| c.is_virtual_generated());
-        let logical_to_physical_map = Self::build_logical_to_physical_map(&columns);
+        let has_rowid = characteristics.contains(BTreeCharacteristics::HAS_ROWID);
+        let logical_to_physical_map =
+            Self::build_logical_to_physical_map(&columns, &primary_key_columns, has_rowid);
         Self {
             root_page,
             name,
             primary_key_columns,
             columns,
-            has_rowid: characteristics.contains(BTreeCharacteristics::HAS_ROWID),
+            has_rowid,
             is_strict: characteristics.contains(BTreeCharacteristics::STRICT),
             has_autoincrement: characteristics.contains(BTreeCharacteristics::HAS_AUTOINCREMENT),
             unique_sets,
@@ -2897,7 +2920,9 @@ impl BTreeTable {
                     sql.push_str("[]");
                 }
             }
-            if column.notnull() {
+            if column.notnull()
+                && (column.explicit_notnull() || !self.is_without_rowid_inline_pk(column))
+            {
                 sql.push_str(" NOT NULL");
             }
 
@@ -3036,8 +3061,19 @@ impl BTreeTable {
         if self.is_strict {
             sql.push_str(" STRICT");
         }
+        if !self.has_rowid {
+            if self.is_strict {
+                sql.push_str(", WITHOUT ROWID");
+            } else {
+                sql.push_str(" WITHOUT ROWID");
+            }
+        }
 
         sql
+    }
+
+    fn is_without_rowid_inline_pk(&self, column: &Column) -> bool {
+        !self.has_rowid && self.primary_key_columns.len() == 1 && column.primary_key()
     }
 
     pub fn column_collations(&self) -> Vec<CollationSeq> {
@@ -3052,12 +3088,42 @@ impl BTreeTable {
         self.logical_to_physical_map[logical]
     }
 
-    pub fn build_logical_to_physical_map(columns: &[Column]) -> Vec<usize> {
-        let mut map = Vec::with_capacity(columns.len());
+    pub fn build_logical_to_physical_map(
+        columns: &[Column],
+        primary_key_columns: &[(String, SortOrder)],
+        has_rowid: bool,
+    ) -> Vec<usize> {
+        let mut map = vec![usize::MAX; columns.len()];
         let mut physical = 0;
-        for col in columns {
-            map.push(physical);
-            if !col.is_generated() {
+
+        if !has_rowid {
+            for (pk_name, _) in primary_key_columns {
+                let Some((pk_idx, col)) = columns.iter().enumerate().find(|(_, col)| {
+                    col.name
+                        .as_ref()
+                        .is_some_and(|name| name.eq_ignore_ascii_case(pk_name))
+                }) else {
+                    continue;
+                };
+                if col.is_virtual_generated() || map[pk_idx] != usize::MAX {
+                    continue;
+                }
+                map[pk_idx] = physical;
+                physical += 1;
+            }
+        }
+
+        for (idx, col) in columns.iter().enumerate() {
+            if col.is_virtual_generated() || map[idx] != usize::MAX {
+                continue;
+            }
+            map[idx] = physical;
+            physical += 1;
+        }
+
+        for offset in &mut map {
+            if *offset == usize::MAX {
+                *offset = physical;
                 physical += 1;
             }
         }
@@ -3515,7 +3581,7 @@ pub(crate) fn validate_generated_expr(expr: &Expr) -> Result<()> {
 pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> Result<BTreeTable> {
     let table_name = normalize_ident(tbl_name);
     trace!("Creating table {}", table_name);
-    let has_rowid = true;
+    let has_rowid;
     let mut has_autoincrement = false;
     let mut primary_key_columns = vec![];
     let mut foreign_keys = vec![];
@@ -3530,6 +3596,7 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
             constraints,
             options,
         } => {
+            has_rowid = !options.contains_without_rowid();
             is_strict = options.contains_strict();
 
             // we need to preserve order of unique sets definition
@@ -3722,6 +3789,7 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
                 let mut generated: Option<Box<Expr>> = None;
                 let mut primary_key = false;
                 let mut notnull = false;
+                let mut explicit_notnull = false;
                 let mut notnull_conflict_clause = None;
                 let mut order = SortOrder::Asc;
                 let mut unique = false;
@@ -3776,6 +3844,7 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
                             ..
                         } => {
                             notnull = !nullable;
+                            explicit_notnull = !nullable;
                             notnull_conflict_clause = *conflict_clause;
                         }
                         ast::ColumnConstraint::Default(ref expr) => {
@@ -3906,6 +3975,7 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
                             && primary_key
                             && !primary_key_desc_columns_constraint,
                         notnull,
+                        explicit_notnull,
                         unique,
                         hidden: false,
                         notnull_conflict_clause,
@@ -3918,10 +3988,6 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
                     }
                 }
                 cols.push(col);
-            }
-
-            if options.contains_without_rowid() {
-                crate::bail_parse_error!("WITHOUT ROWID tables are not supported");
             }
         }
         CreateTableBody::AsSelect(_) => {
@@ -4044,7 +4110,30 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
         column_dependencies: Default::default(),
     };
     table.prepare_generated_columns()?;
-    table.logical_to_physical_map = BTreeTable::build_logical_to_physical_map(&table.columns);
+    if !table.has_rowid {
+        if table.primary_key_columns.is_empty() {
+            crate::bail_parse_error!("PRIMARY KEY missing on table {}", table.name);
+        }
+        for (pk_name, _) in &table.primary_key_columns {
+            let Some((_, col)) = table.get_column(pk_name) else {
+                crate::bail_parse_error!(
+                    "PRIMARY KEY column {pk_name} not found in table {}",
+                    table.name
+                );
+            };
+            if !col.notnull() {
+                let Some(idx) = table.get_column(pk_name).map(|(idx, _)| idx) else {
+                    unreachable!("PRIMARY KEY column should exist");
+                };
+                table.columns[idx].set_notnull(true);
+            }
+        }
+    }
+    table.logical_to_physical_map = BTreeTable::build_logical_to_physical_map(
+        &table.columns,
+        &table.primary_key_columns,
+        table.has_rowid,
+    );
     Ok(table)
 }
 
@@ -4193,6 +4282,7 @@ pub struct Column {
     pub default: Option<Box<Expr>>,
     generated_type: GeneratedType,
     raw: u16,
+    explicit_notnull: bool,
     /// ON CONFLICT clause for NOT NULL constraint on this column.
     pub notnull_conflict_clause: Option<ResolveType>,
 }
@@ -4202,6 +4292,7 @@ pub struct ColDef {
     pub primary_key: bool,
     pub rowid_alias: bool,
     pub notnull: bool,
+    pub explicit_notnull: bool,
     pub unique: bool,
     pub hidden: bool,
     pub notnull_conflict_clause: Option<ResolveType>,
@@ -4353,6 +4444,7 @@ impl Column {
             default,
             generated_type,
             raw,
+            explicit_notnull: coldef.explicit_notnull,
             notnull_conflict_clause: coldef.notnull_conflict_clause,
         }
     }
@@ -4406,6 +4498,10 @@ impl Column {
     #[inline]
     pub const fn notnull(&self) -> bool {
         self.raw & F_NOTNULL != 0
+    }
+    #[inline]
+    pub const fn explicit_notnull(&self) -> bool {
+        self.explicit_notnull
     }
     #[inline]
     pub const fn unique(&self) -> bool {
@@ -4580,6 +4676,7 @@ impl TryFrom<&ColumnDefinition> for Column {
                 primary_key,
                 rowid_alias: primary_key && matches!(ty, Type::Integer),
                 notnull,
+                explicit_notnull: notnull,
                 unique,
                 hidden,
                 notnull_conflict_clause,
@@ -4643,7 +4740,7 @@ pub fn sqlite_schema_table() -> BTreeTable {
         Column::new_default_integer(Some("rootpage".to_string()), "INT".to_string(), None),
         Column::new_default_text(Some("sql".to_string()), "TEXT".to_string(), None),
     ];
-    let logical_to_physical_map = BTreeTable::build_logical_to_physical_map(&columns);
+    let logical_to_physical_map = BTreeTable::build_logical_to_physical_map(&columns, &[], true);
     BTreeTable {
         root_page: 1,
         name: "sqlite_schema".to_string(),
@@ -4674,8 +4771,8 @@ pub struct Index {
     /// Does the index have a rowid as the last column?
     /// This is the case for btree indexes (persistent or ephemeral) that
     /// have been created based on a table with a rowid.
-    /// For example, WITHOUT ROWID tables (not supported in Limbo yet),
-    /// and  SELECT DISTINCT ephemeral indexes will not have a rowid.
+    /// For example, WITHOUT ROWID tables and SELECT DISTINCT ephemeral indexes
+    /// will not have a rowid.
     pub has_rowid: bool,
     pub where_clause: Option<Box<Expr>>,
     pub index_method: Option<Arc<dyn IndexMethodAttachment>>,
@@ -5016,7 +5113,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "WITHOUT ROWID not supported"]
     pub fn test_has_rowid_false() -> Result<()> {
         let sql = r#"CREATE TABLE t1 (a INTEGER PRIMARY KEY, b TEXT) WITHOUT ROWID;"#;
         let table = BTreeTable::from_sql(sql, 0)?;
@@ -5062,7 +5158,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "WITHOUT ROWID not supported"]
     pub fn test_column_is_rowid_alias_single_integer_separate_primary_key_definition_without_rowid(
     ) -> Result<()> {
         let sql = r#"CREATE TABLE t1 (a INTEGER, b TEXT, PRIMARY KEY(a)) WITHOUT ROWID;"#;
@@ -5076,7 +5171,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "WITHOUT ROWID not supported"]
     pub fn test_column_is_rowid_alias_single_integer_without_rowid() -> Result<()> {
         let sql = r#"CREATE TABLE t1 (a INTEGER PRIMARY KEY, b TEXT) WITHOUT ROWID;"#;
         let table = BTreeTable::from_sql(sql, 0)?;
@@ -5426,7 +5520,8 @@ mod tests {
             "INT".to_string(),
             None,
         )];
-        let logical_to_physical_map = BTreeTable::build_logical_to_physical_map(&columns);
+        let logical_to_physical_map =
+            BTreeTable::build_logical_to_physical_map(&columns, &[], true);
         let table = BTreeTable {
             root_page: 0,
             name: "t1".to_string(),
@@ -5683,13 +5778,27 @@ mod tests {
     }
 
     #[test]
-    fn test_without_rowid_rejected() {
+    fn test_without_rowid_preserved_in_sql() -> Result<()> {
         let sql = r#"CREATE TABLE t(code TEXT PRIMARY KEY, val TEXT) WITHOUT ROWID"#;
-        let result = BTreeTable::from_sql(sql, 0);
+        let table = BTreeTable::from_sql(sql, 0)?;
+        assert!(table.get_column("code").unwrap().1.notnull());
         assert_eq!(
-            "Parse error: WITHOUT ROWID tables are not supported",
-            format!("{}", result.unwrap_err())
+            table.to_sql(),
+            "CREATE TABLE t (code TEXT PRIMARY KEY, val TEXT) WITHOUT ROWID"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn test_strict_without_rowid_preserved_in_sql() -> Result<()> {
+        let sql = r#"CREATE TABLE t(code TEXT PRIMARY KEY, val TEXT) STRICT, WITHOUT ROWID"#;
+        let table = BTreeTable::from_sql(sql, 0)?;
+        assert!(table.get_column("code").unwrap().1.notnull());
+        assert_eq!(
+            table.to_sql(),
+            "CREATE TABLE t (code TEXT PRIMARY KEY, val TEXT) STRICT, WITHOUT ROWID"
+        );
+        Ok(())
     }
 
     #[test]

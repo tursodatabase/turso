@@ -42,6 +42,9 @@ fn validate_delete(
     if program.trigger.is_some() && table.virtual_table().is_some() {
         crate::bail_parse_error!("unsafe use of virtual table \"{}\"", tbl_name);
     }
+    if table.btree().is_some_and(|bt| !bt.has_rowid) {
+        crate::bail_parse_error!("DELETE from WITHOUT ROWID tables is not supported");
+    }
 
     // Check if this is a materialized view
     if resolver.schema().is_materialized_view(tbl_name) {
