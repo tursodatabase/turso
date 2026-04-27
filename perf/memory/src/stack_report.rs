@@ -61,7 +61,16 @@ impl StackCollector {
 struct StackSample {
     label: String,
     detail: Option<String>,
+    phase: StackPhase,
     remaining_stack: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum StackPhase {
+    Enter,
+    Exit,
+    Sample,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -127,6 +136,7 @@ where
             .push(StackSample {
                 label,
                 detail: visitor.detail,
+                phase: visitor.phase.unwrap_or(StackPhase::Sample),
                 remaining_stack,
             });
     }
@@ -136,6 +146,7 @@ where
 struct StackEventVisitor {
     label: Option<String>,
     detail: Option<String>,
+    phase: Option<StackPhase>,
     remaining_stack: Option<usize>,
 }
 
@@ -150,6 +161,7 @@ impl Visit for StackEventVisitor {
                     self.detail = detail;
                 }
             }
+            "phase" => self.phase = parse_stack_phase(&unquote_debug_string(&rendered)),
             "remaining_stack" => {
                 self.remaining_stack = rendered.parse().ok();
             }
@@ -161,6 +173,7 @@ impl Visit for StackEventVisitor {
         match field.name() {
             "label" => self.label = Some(value.to_string()),
             "detail" if !value.is_empty() => self.detail = Some(value.to_string()),
+            "phase" => self.phase = parse_stack_phase(value),
             _ => {}
         }
     }
@@ -311,6 +324,7 @@ fn build_statement_report(
     let mut spans = samples
         .iter()
         .enumerate()
+        .filter(|(_, sample)| matches!(sample.phase, StackPhase::Enter | StackPhase::Sample))
         .map(|(trace_sequence, sample)| SpanReport {
             trace_sequence: trace_sequence + 1,
             label: sample.label.clone(),
@@ -437,10 +451,114 @@ fn parse_debug_option_string(value: &str) -> Option<String> {
         .or_else(|| Some(unquote_debug_string(value)))
 }
 
+fn parse_stack_phase(value: &str) -> Option<StackPhase> {
+    match value {
+        "enter" => Some(StackPhase::Enter),
+        "exit" => Some(StackPhase::Exit),
+        "sample" => Some(StackPhase::Sample),
+        _ => None,
+    }
+}
+
 fn csv_escape(value: &str) -> String {
     if value.contains(',') || value.contains('"') || value.contains('\n') {
         format!("\"{}\"", value.replace('"', "\"\""))
     } else {
         value.to_string()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn statement_stack_used_is_peak_delta_not_sum() {
+        let report = build_statement_report(
+            1,
+            "SELECT 1",
+            10_000,
+            vec![
+                StackSample {
+                    label: "outer".to_string(),
+                    detail: None,
+                    phase: StackPhase::Enter,
+                    remaining_stack: 9_000,
+                },
+                StackSample {
+                    label: "inner".to_string(),
+                    detail: None,
+                    phase: StackPhase::Enter,
+                    remaining_stack: 7_500,
+                },
+                StackSample {
+                    label: "outer:end".to_string(),
+                    detail: None,
+                    phase: StackPhase::Exit,
+                    remaining_stack: 9_100,
+                },
+            ],
+        );
+
+        assert_eq!(report.stack_used, 2_500);
+        assert_eq!(report.min_remaining_stack, 7_500);
+        assert_eq!(report.spans[0].label, "inner");
+        assert_eq!(report.spans[0].stack_used, 2_500);
+        assert_eq!(
+            report
+                .spans
+                .iter()
+                .map(|span| span.stack_used)
+                .sum::<usize>(),
+            3_500
+        );
+    }
+
+    #[test]
+    fn span_sort_keeps_trace_sequence_for_ties() {
+        let report = build_statement_report(
+            1,
+            "SELECT 1",
+            10_000,
+            vec![
+                StackSample {
+                    label: "first".to_string(),
+                    detail: None,
+                    phase: StackPhase::Enter,
+                    remaining_stack: 8_000,
+                },
+                StackSample {
+                    label: "second".to_string(),
+                    detail: None,
+                    phase: StackPhase::Enter,
+                    remaining_stack: 8_000,
+                },
+            ],
+        );
+
+        assert_eq!(report.spans[0].trace_sequence, 1);
+        assert_eq!(report.spans[1].trace_sequence, 2);
+    }
+
+    #[test]
+    fn stacker_remaining_stack_tracks_real_stack_growth() {
+        let before = stacker::remaining_stack().expect("remaining stack should be available");
+        let inside = consume_stack_frame();
+        assert!(
+            before > inside,
+            "remaining stack should shrink inside a stack-consuming frame: before={before}, inside={inside}"
+        );
+        assert!(
+            before - inside >= 8 * 1024,
+            "expected at least an 8KiB observed stack delta, got {} bytes",
+            before - inside
+        );
+    }
+
+    #[inline(never)]
+    fn consume_stack_frame() -> usize {
+        let buffer = [0_u8; 16 * 1024];
+        std::hint::black_box(&buffer);
+        stacker::remaining_stack().expect("remaining stack should be available")
     }
 }
