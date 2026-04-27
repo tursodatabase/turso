@@ -127,6 +127,27 @@ impl Predicate {
                         })
                     }),
                 ),
+                (
+                    1,
+                    Box::new(|rng| {
+                        // column BETWEEN lt AND gt — always true since lt < column ≤ gt.
+                        // Skip when the column value is NULL: BETWEEN with a NULL operand
+                        // evaluates to NULL, which is not truthy.
+                        if value.is_null() {
+                            return None;
+                        }
+                        let lt_value =
+                            LTValue::arbitrary_from(rng, context, (value, column.column_type)).0;
+                        let gt_value =
+                            GTValue::arbitrary_from(rng, context, (value, column.column_type)).0;
+                        Some(Expr::Between {
+                            lhs: Box::new(qualified_column_expr(&table_name, &column.name)),
+                            not: false,
+                            start: Box::new(Expr::Literal(lt_value.into())),
+                            end: Box::new(Expr::Literal(gt_value.into())),
+                        })
+                    }),
+                ),
             ],
             rng,
         );
@@ -204,6 +225,33 @@ impl Predicate {
             ],
             rng,
         );
+        // Inject BETWEEN-based false predicates 30% of the time. Two flavours, both
+        // historically bug-prone in BETWEEN implementations:
+        //   * NOT BETWEEN [lt, gt] — column sits inside, NOT inverts to false.
+        //   * BETWEEN [gt, lt]     — reversed bounds (start > end); always false per SQL semantics.
+        let expr = if !value.is_null() && rng.random_bool(0.3) {
+            let lt_value = LTValue::arbitrary_from(rng, context, (value, column.column_type)).0;
+            let gt_value = GTValue::arbitrary_from(rng, context, (value, column.column_type)).0;
+            if rng.random_bool(0.5) {
+                // NOT BETWEEN around the value.
+                Expr::Between {
+                    lhs: Box::new(qualified_column_expr(&table_name, &column.name)),
+                    not: true,
+                    start: Box::new(Expr::Literal(lt_value.into())),
+                    end: Box::new(Expr::Literal(gt_value.into())),
+                }
+            } else {
+                // Reversed bounds — start > end, always false in SQL.
+                Expr::Between {
+                    lhs: Box::new(qualified_column_expr(&table_name, &column.name)),
+                    not: false,
+                    start: Box::new(Expr::Literal(gt_value.into())),
+                    end: Box::new(Expr::Literal(lt_value.into())),
+                }
+            }
+        } else {
+            expr
+        };
         Predicate(expr)
     }
 }
@@ -265,6 +313,22 @@ impl SimplePredicate {
             ],
             rng,
         );
+        // 20% chance to wrap in BETWEEN: column BETWEEN lt AND gt — true since lt < column ≤ gt.
+        // Skip when column_value is NULL (BETWEEN evaluates to NULL).
+        let expr = if !column_value.is_null() && rng.random_bool(0.2) {
+            let lt_value =
+                LTValue::arbitrary_from(rng, context, (column_value, column.column.column_type)).0;
+            let gt_value =
+                GTValue::arbitrary_from(rng, context, (column_value, column.column.column_type)).0;
+            Expr::Between {
+                lhs: Box::new(qualified_column_expr(table_name, &column.column.name)),
+                not: false,
+                start: Box::new(Expr::Literal(lt_value.into())),
+                end: Box::new(Expr::Literal(gt_value.into())),
+            }
+        } else {
+            expr
+        };
         SimplePredicate(Predicate(expr))
     }
 
@@ -324,6 +388,22 @@ impl SimplePredicate {
             ],
             rng,
         );
+        // 20% chance to use NOT BETWEEN: false because column always sits in [lt, gt].
+        // Skip on NULL columns where the result is NULL, not falsy.
+        let expr = if !column_value.is_null() && rng.random_bool(0.2) {
+            let lt_value =
+                LTValue::arbitrary_from(rng, context, (column_value, column.column.column_type)).0;
+            let gt_value =
+                GTValue::arbitrary_from(rng, context, (column_value, column.column.column_type)).0;
+            Expr::Between {
+                lhs: Box::new(qualified_column_expr(table_name, &column.column.name)),
+                not: true,
+                start: Box::new(Expr::Literal(lt_value.into())),
+                end: Box::new(Expr::Literal(gt_value.into())),
+            }
+        } else {
+            expr
+        };
         SimplePredicate(Predicate(expr))
     }
 }

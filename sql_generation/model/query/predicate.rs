@@ -148,6 +148,27 @@ pub fn expr_to_value<T: TableContext>(
             assert_eq!(exprs.len(), 1);
             expr_to_value(&exprs[0], row, table)
         }
+        ast::Expr::Between {
+            lhs,
+            not,
+            start,
+            end,
+        } => {
+            // x BETWEEN a AND b is exactly x >= a AND x <= b. NULL semantics propagate
+            // through the underlying binary comparisons (Greater/Less/And), so we can
+            // delegate without special-casing NULL here.
+            let lhs_v = expr_to_value(lhs, row, table)?;
+            let start_v = expr_to_value(start, row, table)?;
+            let end_v = expr_to_value(end, row, table)?;
+            let ge = lhs_v.binary_compare(&start_v, ast::Operator::GreaterEquals);
+            let le = lhs_v.binary_compare(&end_v, ast::Operator::LessEquals);
+            let in_range = ge.binary_compare(&le, ast::Operator::And);
+            Some(if *not {
+                in_range.unary_exec(ast::UnaryOperator::Not)
+            } else {
+                in_range
+            })
+        }
         _ => unreachable!("{:?}", expr),
     }
 }

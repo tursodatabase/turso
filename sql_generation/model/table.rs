@@ -219,7 +219,7 @@ impl SimValue {
     }
 
     #[inline]
-    fn is_null(&self) -> bool {
+    pub fn is_null(&self) -> bool {
         matches!(self.0, types::Value::Null)
     }
 
