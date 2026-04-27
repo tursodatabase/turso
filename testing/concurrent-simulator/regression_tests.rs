@@ -2,7 +2,7 @@
 
 use std::path::Path;
 use std::sync::Arc;
-use turso_core::{Connection, Database, DatabaseOpts, LimboError, OpenFlags, IO};
+use turso_core::{Connection, Database, DatabaseOpts, IO, LimboError, OpenFlags};
 use turso_whopper::multiprocess::{MultiprocessOpts, MultiprocessWhopper};
 use turso_whopper::{
     multiprocess_platform_io,
@@ -1221,8 +1221,8 @@ fn multiprocess_restart_rebuilds_from_disk_after_partial_checkpoint_proof_is_cle
 
 #[cfg(all(any(unix, target_os = "windows"), target_pointer_width = "64"))]
 #[test]
-fn multiprocess_restart_rebuilds_from_disk_after_db_header_mismatch_invalidates_partial_checkpoint_proof(
-) {
+fn multiprocess_restart_rebuilds_from_disk_after_db_header_mismatch_invalidates_partial_checkpoint_proof()
+ {
     let mut whopper = create_multiprocess_whopper(1);
     create_partial_checkpoint_state(&mut whopper);
 
