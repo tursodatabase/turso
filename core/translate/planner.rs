@@ -60,6 +60,48 @@ struct CteDefinition {
     materialize_hint: bool,
 }
 
+fn simplify_transparent_cte_select(mut select: Select) -> Select {
+    while let Some(inner) = transparent_star_subselect(&select) {
+        select = inner;
+    }
+    select
+}
+
+fn transparent_star_subselect(select: &Select) -> Option<Select> {
+    if select.with.is_some()
+        || !select.body.compounds.is_empty()
+        || !select.order_by.is_empty()
+        || select.limit.is_some()
+    {
+        return None;
+    }
+
+    let ast::OneSelect::Select {
+        distinctness,
+        columns,
+        from: Some(from),
+        where_clause: None,
+        group_by: None,
+        window_clause,
+    } = &select.body.select
+    else {
+        return None;
+    };
+
+    if distinctness.is_some_and(|d| d != ast::Distinctness::All)
+        || !matches!(columns.as_slice(), [ast::ResultColumn::Star])
+        || !window_clause.is_empty()
+        || !from.joins.is_empty()
+    {
+        return None;
+    }
+
+    match from.select.as_ref() {
+        ast::SelectTable::Select(inner, None) => Some(inner.clone()),
+        _ => None,
+    }
+}
+
 /// Collect all table names referenced in a SELECT's FROM clause.
 /// Used to determine which earlier CTEs a CTE directly depends on.
 fn collect_from_clause_table_refs(select: &Select, out: &mut Vec<String>) {
@@ -542,7 +584,7 @@ fn plan_cte(
     let cte_plan = {
         let _stack = crate::stack::trace_scope("planner:plan_cte_prepare_select");
         prepare_select_plan(
-            cte_def.select.clone(),
+            simplify_transparent_cte_select(cte_def.select.clone()),
             resolver,
             program,
             &outer_query_refs,
