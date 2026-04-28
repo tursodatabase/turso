@@ -65,7 +65,7 @@ bytes = "1.11.1"
 itertools.workspace = true
 
 [features]
-default = ["io_uring", "mimalloc"]
+default = ["io_uring", "mimalloc", "experimental_win_iocp"]
 io_uring = ["turso_core/io_uring"]
 experimental_win_iocp = ["turso_core/experimental_win_iocp"]
 tracing_release = ["turso_core/tracing_release"]

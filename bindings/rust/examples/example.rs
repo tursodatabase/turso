@@ -3,6 +3,7 @@ use turso::{Builder, Error};
 #[tokio::main]
 async fn main() -> Result<(), Error> {
     let db = Builder::new_local(":memory:")
+        .experimental_index_method(true)
         .build()
         .await
         .expect("Turso Failed to Build memory db");
@@ -13,6 +14,12 @@ async fn main() -> Result<(), Error> {
 
     conn.execute(
         "CREATE TABLE IF NOT EXISTS users (email TEXT, age INTEGER)",
+        (),
+    )
+    .await?;
+
+    conn.execute(
+        "CREATE INDEX fts_users_email ON users USING fts (email)",
         (),
     )
     .await?;
@@ -29,7 +36,9 @@ async fn main() -> Result<(), Error> {
 
     stmt.execute(["foo@example.com", &21.to_string()]).await?;
 
-    let mut stmt = conn.prepare("SELECT * FROM users WHERE email = ?1").await?;
+    let mut stmt = conn
+        .prepare("SELECT * FROM users WHERE email MATCH ?1")
+        .await?;
 
     let mut rows = stmt.query(["foo@example.com"]).await?;
 

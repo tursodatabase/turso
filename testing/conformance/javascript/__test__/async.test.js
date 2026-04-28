@@ -559,7 +559,7 @@ test.serial("Query timeout option interrupts long-running query", async (t) => {
 
   const error = await t.throwsAsync(async () => {
     await stmt.get();
-  });
+  }, { any: true });
   t.truthy(error);
   t.true(error.message.toLowerCase().includes("interrupt"));
 
@@ -620,7 +620,7 @@ test.serial("Per-query timeout option interrupts long-running Statement.get()", 
 
   const error = await t.throwsAsync(async () => {
     await stmt.get(undefined, { queryTimeout: 50 });
-  });
+  }, { any: true });
   t.truthy(error);
   t.true(error.message.toLowerCase().includes("interrupt"));
 

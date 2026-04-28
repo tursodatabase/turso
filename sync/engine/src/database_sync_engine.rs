@@ -50,6 +50,22 @@ pub struct DatabaseSyncEngineOpts {
     pub partial_sync_opts: Option<PartialSyncOpts>,
     /// Base64-encoded encryption key for the Turso Cloud database
     pub remote_encryption_key: Option<String>,
+    /// When set, [`push_changes_to_remote`] sends the local change set to the
+    /// remote in multiple HTTP batches, sealing the current batch as soon as it
+    /// has accumulated >= `push_operations_threshold` operations *and* the
+    /// next batch boundary lines up with a transaction boundary in the local
+    /// CDC log. Splits never happen mid-transaction. `None` preserves the
+    /// previous behaviour of pushing the whole change set in one batch.
+    pub push_operations_threshold: Option<usize>,
+    /// Optional hint, in bytes, to chunk the initial bootstrap download into
+    /// multiple `/pull-updates` HTTP requests using the `server_pages_selector`
+    /// bitmap. Each chunk covers the smallest contiguous range of pages whose
+    /// total size is >= `pull_bytes_threshold`. `None` (default) bootstraps in
+    /// a single HTTP round-trip. Currently applied only to the bootstrap phase
+    /// — incremental pulls are unaffected. **No-op when partial-sync uses the
+    /// `Query` bootstrap strategy** — the server picks the page set, so the
+    /// client can't chunk it locally.
+    pub pull_bytes_threshold: Option<usize>,
 }
 
 pub struct DataStats {
@@ -257,6 +273,7 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
                     main_db_path,
                     opts.protocol_version_hint,
                     partial_sync_opts,
+                    opts.pull_bytes_threshold,
                 )
                 .await?;
                 let meta = DatabaseMetadata {

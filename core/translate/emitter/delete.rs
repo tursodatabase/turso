@@ -751,7 +751,7 @@ fn emit_delete_row_common(
                 raise_error_if_no_matching_entry: index.where_clause.is_none(),
             });
             if let Some(label) = skip_delete_label {
-                program.resolve_label(label, program.offset());
+                program.preassign_label_to_next_insn(label);
             }
         }
 

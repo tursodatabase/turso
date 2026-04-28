@@ -15,7 +15,7 @@ export interface ExecuteResult {
   cols: Column[];
   rows: Value[][];
   affected_row_count: number;
-  last_insert_rowid?: string;
+  last_insert_rowid?: string | number;
 }
 
 export interface NamedArg {
@@ -104,6 +104,9 @@ export function encodeValue(value: any): Value {
     if (!Number.isFinite(value)) {
       throw new Error("Only finite numbers (not Infinity or NaN) can be passed as arguments");
     }
+    if (Number.isSafeInteger(value)) {
+      return { type: 'integer', value: value.toString() };
+    }
     return { type: 'float', value };
   }
   
@@ -141,15 +144,19 @@ export function decodeValue(value: Value, safeIntegers: boolean = false): any {
     case 'text':
       return value.value as string;
     case 'blob':
-      if (value.base64) {
-        const binaryString = atob(value.base64);
+      if (value.base64 !== undefined && value.base64 !== null) {
+        let b64 = value.base64;
+        while (b64.length % 4 !== 0) {
+          b64 += '=';
+        }
+        const binaryString = atob(b64);
         const bytes = new Uint8Array(binaryString.length);
         for (let i = 0; i < binaryString.length; i++) {
           bytes[i] = binaryString.charCodeAt(i);
         }
         return Buffer.from(bytes);
       }
-      return null;
+      return Buffer.alloc(0);
     default:
       return null;
   }
@@ -173,7 +180,7 @@ export interface CursorEntry {
   cols?: Column[];
   row?: Value[];
   affected_row_count?: number;
-  last_insert_rowid?: string;
+  last_insert_rowid?: string | number;
   error?: {
     message: string;
     code: string;

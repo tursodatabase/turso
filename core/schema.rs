@@ -181,7 +181,7 @@ pub const TURSO_INTERNAL_PREFIX: &str = "__turso_internal_";
 use crate::util::quote_identifier as quote_ident;
 
 /// Recursively rewrite `Expr::Id("value")` (case-insensitive) to `Expr::Id(col_name)`.
-fn rewrite_value_to_column(expr: &ast::Expr, col_name: &str) -> Box<ast::Expr> {
+pub fn rewrite_value_to_column(expr: &ast::Expr, col_name: &str) -> Box<ast::Expr> {
     let mut cloned = expr.clone();
     let _ = walk_expr_mut(&mut cloned, &mut |e| {
         if let ast::Expr::Id(name) = e {
@@ -192,6 +192,53 @@ fn rewrite_value_to_column(expr: &ast::Expr, col_name: &str) -> Box<ast::Expr> {
         Ok(WalkControl::Continue)
     });
     Box::new(cloned)
+}
+
+/// Field definition within a StructDef.
+#[derive(Debug, Clone)]
+pub struct StructFieldDef {
+    pub name: String,
+    pub base_affinity: Affinity,
+    pub type_name: String,
+}
+
+/// Definition for a STRUCT composite type.
+#[derive(Debug, Clone)]
+pub struct StructDef {
+    pub fields: Vec<StructFieldDef>,
+}
+
+/// Variant definition within a UnionDef.
+#[derive(Debug, Clone)]
+pub struct UnionVariantDef {
+    pub tag_name: String,
+    pub tag_index: u8,
+    pub base_affinity: Affinity,
+    pub type_name: String,
+}
+
+/// Definition for a UNION discriminated union type.
+#[derive(Debug, Clone)]
+pub struct UnionDef {
+    pub variants: Vec<UnionVariantDef>,
+    /// Cached variant tag names for `UnionTag` instructions.
+    /// Built once at type registration time so we don't rebuild per-instruction.
+    pub tag_names: Arc<[String]>,
+}
+
+/// The kind-specific payload of a custom type.
+#[derive(Debug, Clone)]
+pub enum TypeDefKind {
+    Custom {
+        params: Vec<ast::TypeParam>,
+        base: String,
+        encode: Option<Box<ast::Expr>>,
+        decode: Option<Box<ast::Expr>>,
+        operators: Vec<TypeOperator>,
+        default: Option<Box<ast::Expr>>,
+    },
+    Struct(StructDef),
+    Union(UnionDef),
 }
 
 /// Custom type definition, loaded from sqlite_turso_types
@@ -220,19 +267,13 @@ impl ResolvedType {
     /// Matches PostgreSQL: a child domain inherits the parent's DEFAULT when it
     /// doesn't declare its own.
     pub fn default_expr(&self) -> Option<&ast::Expr> {
-        self.chain.iter().find_map(|td| td.default.as_deref())
+        self.chain.iter().find_map(|td| td.default_expr())
     }
 }
 
 #[derive(Debug, Clone)]
 pub struct TypeDef {
     pub name: String,
-    pub params: Vec<ast::TypeParam>,
-    pub base: String,
-    pub encode: Option<Box<ast::Expr>>,
-    pub decode: Option<Box<ast::Expr>>,
-    pub operators: Vec<TypeOperator>,
-    pub default: Option<Box<ast::Expr>>,
     pub is_builtin: bool,
     pub not_null: bool,
     /// Whether this is a domain (CREATE DOMAIN) vs a custom type (CREATE TYPE).
@@ -242,30 +283,197 @@ pub struct TypeDef {
     /// CHECK constraints from CREATE DOMAIN, stored as first-class data.
     /// Empty for regular CREATE TYPE definitions.
     pub domain_checks: Vec<ast::DomainConstraint>,
+    pub kind: TypeDefKind,
 }
 
 impl TypeDef {
+    /// Returns true if this is a STRUCT type.
+    pub fn is_struct(&self) -> bool {
+        matches!(self.kind, TypeDefKind::Struct(_))
+    }
+
+    /// Returns true if this is a UNION type.
+    pub fn is_union(&self) -> bool {
+        matches!(self.kind, TypeDefKind::Union(_))
+    }
+
+    /// Returns the StructDef if this is a STRUCT type.
+    pub fn struct_def(&self) -> Option<&StructDef> {
+        match &self.kind {
+            TypeDefKind::Struct(sd) => Some(sd),
+            _ => None,
+        }
+    }
+
+    /// Returns the UnionDef if this is a UNION type.
+    pub fn union_def(&self) -> Option<&UnionDef> {
+        match &self.kind {
+            TypeDefKind::Union(ud) => Some(ud),
+            _ => None,
+        }
+    }
+
+    /// Returns the encode expression (Custom types only).
+    pub fn encode(&self) -> Option<&ast::Expr> {
+        match &self.kind {
+            TypeDefKind::Custom { encode, .. } => encode.as_deref(),
+            _ => None,
+        }
+    }
+
+    /// Returns the decode expression (Custom types only).
+    pub fn decode(&self) -> Option<&ast::Expr> {
+        match &self.kind {
+            TypeDefKind::Custom { decode, .. } => decode.as_deref(),
+            _ => None,
+        }
+    }
+
+    /// Returns the base type name.
+    pub fn base(&self) -> &str {
+        match &self.kind {
+            TypeDefKind::Custom { base, .. } => base,
+            TypeDefKind::Struct(_) | TypeDefKind::Union(_) => "blob",
+        }
+    }
+
+    /// Returns the params (Custom types only, empty for Struct/Union).
+    pub fn params(&self) -> &[ast::TypeParam] {
+        match &self.kind {
+            TypeDefKind::Custom { params, .. } => params,
+            _ => &[],
+        }
+    }
+
+    /// Returns the operators (Custom types only, empty for Struct/Union).
+    pub fn operators(&self) -> &[TypeOperator] {
+        match &self.kind {
+            TypeDefKind::Custom { operators, .. } => operators,
+            _ => &[],
+        }
+    }
+
+    /// Returns the default expression (Custom types only).
+    pub fn default_expr(&self) -> Option<&ast::Expr> {
+        match &self.kind {
+            TypeDefKind::Custom { default, .. } => default.as_deref(),
+            _ => None,
+        }
+    }
+
+    /// Find a struct field by name. Returns (field_index, &StructFieldDef).
+    pub fn find_struct_field(&self, name: &str) -> Option<(usize, &StructFieldDef)> {
+        self.struct_def().and_then(|sd| {
+            sd.fields
+                .iter()
+                .enumerate()
+                .find(|(_, f)| f.name.eq_ignore_ascii_case(name))
+        })
+    }
+
+    /// Resolve a tag name to its numeric index within this union type.
+    /// Returns None if this is not a union or the variant doesn't exist.
+    pub fn resolve_union_tag_index(&self, tag_name: &str) -> Option<u8> {
+        self.find_union_variant(tag_name).map(|(idx, _)| idx)
+    }
+
+    /// Find a union variant by tag name. Returns (tag_index, &UnionVariantDef).
+    pub fn find_union_variant(&self, name: &str) -> Option<(u8, &UnionVariantDef)> {
+        self.union_def().and_then(|ud| {
+            ud.variants
+                .iter()
+                .find(|v| v.tag_name.eq_ignore_ascii_case(name))
+                .map(|v| (v.tag_index, v))
+        })
+    }
+
     /// Construct a TypeDef from a parsed CREATE TYPE statement.
     pub fn from_create_type(
         type_name: &str,
         body: &ast::CreateTypeBody,
         is_builtin: bool,
         sql: String,
-    ) -> Self {
-        Self {
-            name: type_name.to_string(),
-            params: body.params.clone(),
-            base: body.base.clone(),
-            encode: body.encode.clone(),
-            decode: body.decode.clone(),
-            operators: body.operators.clone(),
-            default: body.default.clone(),
-            is_builtin,
-            not_null: false,
-            is_domain: false,
-            sql,
-            domain_checks: Vec::new(),
-        }
+    ) -> crate::Result<Self> {
+        Ok(match body {
+            ast::CreateTypeBody::CustomType {
+                params,
+                base,
+                encode,
+                decode,
+                operators,
+                default,
+            } => Self {
+                name: type_name.to_string(),
+                is_builtin,
+                not_null: false,
+                is_domain: false,
+                sql,
+                domain_checks: Vec::new(),
+                kind: TypeDefKind::Custom {
+                    params: params.clone(),
+                    base: base.clone(),
+                    encode: encode.clone(),
+                    decode: decode.clone(),
+                    operators: operators.clone(),
+                    default: default.clone(),
+                },
+            },
+            ast::CreateTypeBody::Struct(fields) => {
+                let struct_fields: Vec<StructFieldDef> = fields
+                    .iter()
+                    .map(|f| StructFieldDef {
+                        name: f.name.to_string(),
+                        base_affinity: Affinity::affinity(&f.field_type.name),
+                        type_name: f.field_type.name.clone(),
+                    })
+                    .collect();
+                Self {
+                    name: type_name.to_string(),
+                    is_builtin,
+                    not_null: false,
+                    is_domain: false,
+                    sql,
+                    domain_checks: Vec::new(),
+                    kind: TypeDefKind::Struct(StructDef {
+                        fields: struct_fields,
+                    }),
+                }
+            }
+            ast::CreateTypeBody::Union(fields) => {
+                if fields.len() > 256 {
+                    return Err(crate::LimboError::ParseError(format!(
+                        "UNION type cannot have more than 256 variants (got {})",
+                        fields.len()
+                    )));
+                }
+                let variants: Vec<UnionVariantDef> = fields
+                    .iter()
+                    .enumerate()
+                    .map(|(i, f)| UnionVariantDef {
+                        tag_name: f.name.to_string(),
+                        tag_index: i as u8,
+                        base_affinity: Affinity::affinity(&f.field_type.name),
+                        type_name: f.field_type.name.clone(),
+                    })
+                    .collect();
+                Self {
+                    name: type_name.to_string(),
+                    is_builtin,
+                    not_null: false,
+                    is_domain: false,
+                    sql,
+                    domain_checks: Vec::new(),
+                    kind: TypeDefKind::Union(UnionDef {
+                        tag_names: variants
+                            .iter()
+                            .map(|v| v.tag_name.clone())
+                            .collect::<Vec<_>>()
+                            .into(),
+                        variants,
+                    }),
+                }
+            }
+        })
     }
 
     /// Construct a TypeDef from a parsed CREATE DOMAIN statement.
@@ -280,35 +488,37 @@ impl TypeDef {
     ) -> Self {
         Self {
             name: domain_name.to_string(),
-            params: Vec::new(),
-            base: base_type.to_string(),
-            encode: None,
-            decode: None,
-            operators: Vec::new(),
-            default,
             is_builtin: false,
             not_null,
             is_domain: true,
             sql,
             domain_checks: constraints.to_vec(),
+            kind: TypeDefKind::Custom {
+                params: Vec::new(),
+                base: base_type.to_string(),
+                encode: None,
+                decode: None,
+                operators: Vec::new(),
+                default,
+            },
         }
     }
 
     /// The expected input type for `value` in this custom type.
     /// Looks for a `value` parameter with a type annotation.
-    /// Falls back to `self.base` if `value` is not declared.
+    /// Falls back to base type if `value` is not declared.
     pub fn value_input_type(&self) -> &str {
-        for p in &self.params {
+        for p in self.params() {
             if p.name.eq_ignore_ascii_case("value") {
-                return p.ty.as_deref().unwrap_or(&self.base);
+                return p.ty.as_deref().unwrap_or_else(|| self.base());
             }
         }
-        &self.base
+        self.base()
     }
 
     /// The non-value params (user-provided at column declaration time).
     pub fn user_params(&self) -> impl Iterator<Item = &turso_parser::ast::TypeParam> {
-        self.params
+        self.params()
             .iter()
             .filter(|p| !p.name.eq_ignore_ascii_case("value"))
     }
@@ -453,7 +663,7 @@ impl Default for Schema {
     }
 }
 
-fn bootstrap_builtin_types(registry: &mut HashMap<String, Arc<TypeDef>>) {
+fn bootstrap_builtin_types(registry: &mut HashMap<String, Arc<TypeDef>>) -> crate::Result<()> {
     use turso_parser::ast::{Cmd, Stmt};
     use turso_parser::parser::Parser;
 
@@ -482,10 +692,12 @@ fn bootstrap_builtin_types(registry: &mut HashMap<String, Arc<TypeDef>>) {
             type_name, body, ..
         }))) = parser.next_cmd()
         else {
-            panic!("Failed to parse built-in type SQL: {sql}");
+            return Err(crate::LimboError::InternalError(format!(
+                "failed to parse built-in type SQL: {sql}"
+            )));
         };
 
-        let type_def = TypeDef::from_create_type(&type_name, &body, true, sql.to_string());
+        let type_def = TypeDef::from_create_type(&type_name, &body, true, sql.to_string())?;
         registry.insert(type_name.to_lowercase(), Arc::new(type_def));
     }
 
@@ -500,6 +712,7 @@ fn bootstrap_builtin_types(registry: &mut HashMap<String, Arc<TypeDef>>) {
             registry.insert(alias.to_string(), type_def);
         }
     }
+    Ok(())
 }
 
 impl Schema {
@@ -515,11 +728,16 @@ impl Schema {
         }
     }
 
+    /// Create a schema with custom types enabled.
+    ///
+    /// Panics if a hardcoded built-in type definition is malformed (programmer
+    /// bug). Production code that opens user databases should prefer
+    /// [`Schema::with_options`] which returns `Result`.
     pub fn new() -> Self {
-        Self::with_options(true)
+        Self::with_options(true).expect("built-in type definitions are malformed")
     }
 
-    pub fn with_options(enable_custom_types: bool) -> Self {
+    pub fn with_options(enable_custom_types: bool) -> crate::Result<Self> {
         let mut tables: HashMap<String, Arc<Table>> = HashMap::default();
         let has_indexes = HashSet::default();
         let indexes: HashMap<String, VecDeque<Arc<Index>>> = HashMap::default();
@@ -541,7 +759,11 @@ impl Schema {
         let triggers = HashMap::default();
         let table_to_materialized_views: HashMap<String, Vec<String>> = HashMap::default();
         let incompatible_views = HashSet::default();
-        Self {
+        let mut type_registry = HashMap::default();
+        if enable_custom_types {
+            bootstrap_builtin_types(&mut type_registry)?;
+        }
+        Ok(Self {
             tables,
             materialized_view_names,
             materialized_view_sql,
@@ -555,15 +777,9 @@ impl Schema {
             table_to_materialized_views,
             incompatible_views,
             dropped_root_pages: HashSet::default(),
-            type_registry: {
-                let mut registry = HashMap::default();
-                if enable_custom_types {
-                    bootstrap_builtin_types(&mut registry);
-                }
-                registry
-            },
+            type_registry,
             generated_columns_enabled: false,
-        }
+        })
     }
 
     /// Look up a custom type definition by name.
@@ -633,7 +849,7 @@ impl Schema {
             match self.type_registry.get(&current) {
                 Some(td) => {
                     chain.push(Arc::clone(td));
-                    current = td.base.to_lowercase();
+                    current = td.base().to_lowercase();
                 }
                 None => {
                     // current is not in the registry — it's a primitive
@@ -654,7 +870,8 @@ impl Schema {
             Ok(Some(Cmd::Stmt(Stmt::CreateType {
                 type_name, body, ..
             }))) => {
-                let type_def = TypeDef::from_create_type(&type_name, &body, false, sql.to_string());
+                let type_def =
+                    TypeDef::from_create_type(&type_name, &body, false, sql.to_string())?;
                 self.type_registry
                     .insert(type_name.to_lowercase(), Arc::new(type_def));
             }
@@ -1415,7 +1632,8 @@ impl Schema {
 
             // Create a BTreeTable for the materialized view
             let cols = incremental_view.column_schema.flat_columns();
-            let logical_to_physical_map = BTreeTable::build_logical_to_physical_map(&cols);
+            let logical_to_physical_map =
+                BTreeTable::build_logical_to_physical_map(&cols, &[], true);
             let table = Arc::new(Table::BTree(Arc::new(BTreeTable {
                 name: view_name.clone(),
                 root_page: main_root,
@@ -2015,7 +2233,7 @@ pub enum ColumnLayout {
 impl ColumnLayout {
     pub fn from_table(table: &Table) -> Self {
         match table {
-            Table::BTree(btree) => Self::from_columns(&btree.columns),
+            Table::BTree(btree) => Self::from_btree(btree),
             Table::Virtual(vtable) => Self::Identity {
                 column_count: vtable.as_ref().columns.len(),
             },
@@ -2026,7 +2244,24 @@ impl ColumnLayout {
     }
 
     pub fn from_btree(btree: &BTreeTable) -> Self {
-        Self::from_columns(&btree.columns)
+        let total = btree.columns.len();
+        let non_virtual_col_count = btree
+            .columns
+            .iter()
+            .filter(|c| !c.is_virtual_generated())
+            .count();
+        let offsets = btree.logical_to_physical_map.clone();
+        let is_identity = non_virtual_col_count == total && offsets.iter().copied().eq(0..total);
+        if is_identity {
+            Self::Identity {
+                column_count: total,
+            }
+        } else {
+            Self::Mapped {
+                offsets,
+                non_virtual_col_count,
+            }
+        }
     }
 
     pub fn from_columns(columns: &[Column]) -> Self {
@@ -2188,6 +2423,15 @@ impl Table {
             Self::Virtual(_) => None,
             Self::FromClauseSubquery(_) => None,
         }
+    }
+
+    /// Like `btree()` but returns an error instead of None.
+    pub fn require_btree(&self) -> crate::Result<Arc<BTreeTable>> {
+        self.btree().ok_or_else(|| {
+            crate::LimboError::InternalError(
+                "operation requires a btree table, not a virtual table".into(),
+            )
+        })
     }
 
     pub fn btree_mut(&mut self) -> Option<&mut Arc<BTreeTable>> {
@@ -2405,8 +2649,11 @@ impl Drop for ColumnsMut<'_> {
         self.table.column_dependencies.0 = OnceLock::new();
         self.table.has_virtual_columns =
             self.table.columns.iter().any(|c| c.is_virtual_generated());
-        self.table.logical_to_physical_map =
-            BTreeTable::build_logical_to_physical_map(&self.table.columns);
+        self.table.logical_to_physical_map = BTreeTable::build_logical_to_physical_map(
+            &self.table.columns,
+            &self.table.primary_key_columns,
+            self.table.has_rowid,
+        );
     }
 }
 
@@ -2424,13 +2671,15 @@ impl BTreeTable {
         rowid_alias_conflict_clause: Option<ResolveType>,
     ) -> Self {
         let has_virtual_columns = columns.iter().any(|c| c.is_virtual_generated());
-        let logical_to_physical_map = Self::build_logical_to_physical_map(&columns);
+        let has_rowid = characteristics.contains(BTreeCharacteristics::HAS_ROWID);
+        let logical_to_physical_map =
+            Self::build_logical_to_physical_map(&columns, &primary_key_columns, has_rowid);
         Self {
             root_page,
             name,
             primary_key_columns,
             columns,
-            has_rowid: characteristics.contains(BTreeCharacteristics::HAS_ROWID),
+            has_rowid,
             is_strict: characteristics.contains(BTreeCharacteristics::STRICT),
             has_autoincrement: characteristics.contains(BTreeCharacteristics::HAS_AUTOINCREMENT),
             unique_sets,
@@ -2671,7 +2920,9 @@ impl BTreeTable {
                     sql.push_str("[]");
                 }
             }
-            if column.notnull() {
+            if column.notnull()
+                && (column.explicit_notnull() || !self.is_without_rowid_inline_pk(column))
+            {
                 sql.push_str(" NOT NULL");
             }
 
@@ -2810,8 +3061,19 @@ impl BTreeTable {
         if self.is_strict {
             sql.push_str(" STRICT");
         }
+        if !self.has_rowid {
+            if self.is_strict {
+                sql.push_str(", WITHOUT ROWID");
+            } else {
+                sql.push_str(" WITHOUT ROWID");
+            }
+        }
 
         sql
+    }
+
+    fn is_without_rowid_inline_pk(&self, column: &Column) -> bool {
+        !self.has_rowid && self.primary_key_columns.len() == 1 && column.primary_key()
     }
 
     pub fn column_collations(&self) -> Vec<CollationSeq> {
@@ -2826,12 +3088,42 @@ impl BTreeTable {
         self.logical_to_physical_map[logical]
     }
 
-    pub fn build_logical_to_physical_map(columns: &[Column]) -> Vec<usize> {
-        let mut map = Vec::with_capacity(columns.len());
+    pub fn build_logical_to_physical_map(
+        columns: &[Column],
+        primary_key_columns: &[(String, SortOrder)],
+        has_rowid: bool,
+    ) -> Vec<usize> {
+        let mut map = vec![usize::MAX; columns.len()];
         let mut physical = 0;
-        for col in columns {
-            map.push(physical);
-            if !col.is_generated() {
+
+        if !has_rowid {
+            for (pk_name, _) in primary_key_columns {
+                let Some((pk_idx, col)) = columns.iter().enumerate().find(|(_, col)| {
+                    col.name
+                        .as_ref()
+                        .is_some_and(|name| name.eq_ignore_ascii_case(pk_name))
+                }) else {
+                    continue;
+                };
+                if col.is_virtual_generated() || map[pk_idx] != usize::MAX {
+                    continue;
+                }
+                map[pk_idx] = physical;
+                physical += 1;
+            }
+        }
+
+        for (idx, col) in columns.iter().enumerate() {
+            if col.is_virtual_generated() || map[idx] != usize::MAX {
+                continue;
+            }
+            map[idx] = physical;
+            physical += 1;
+        }
+
+        for offset in &mut map {
+            if *offset == usize::MAX {
+                *offset = physical;
                 physical += 1;
             }
         }
@@ -3129,11 +3421,11 @@ fn find_column_index_by_name(columns: &[Column], col_name: &str) -> Option<usize
     })
 }
 
-/// Resolve [Expr::Id] / [Expr::Qualified] in a generated column expression to
-/// `Expr::Column { table: SELF_TABLE, column: idx }`.
+/// Resolve [Expr::Id] / [Expr::Qualified] / [Expr::DoublyQualified] in a generated column
+/// or partial-index expression to `Expr::Column { table: SELF_TABLE, column: idx }`.
 pub fn resolve_gencol_expr_columns(gencol_expr: &mut Expr, columns: &[Column]) -> Result<()> {
     walk_expr_mut(gencol_expr, &mut |e| match e {
-        Expr::Id(name) | Expr::Qualified(_, name) => {
+        Expr::Id(name) | Expr::Qualified(_, name) | Expr::DoublyQualified(_, _, name) => {
             let col_name = normalize_ident(name.as_str());
             let (idx, col) = columns
                 .iter()
@@ -3289,7 +3581,7 @@ pub(crate) fn validate_generated_expr(expr: &Expr) -> Result<()> {
 pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> Result<BTreeTable> {
     let table_name = normalize_ident(tbl_name);
     trace!("Creating table {}", table_name);
-    let has_rowid = true;
+    let has_rowid;
     let mut has_autoincrement = false;
     let mut primary_key_columns = vec![];
     let mut foreign_keys = vec![];
@@ -3304,6 +3596,7 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
             constraints,
             options,
         } => {
+            has_rowid = !options.contains_without_rowid();
             is_strict = options.contains_strict();
 
             // we need to preserve order of unique sets definition
@@ -3496,6 +3789,7 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
                 let mut generated: Option<Box<Expr>> = None;
                 let mut primary_key = false;
                 let mut notnull = false;
+                let mut explicit_notnull = false;
                 let mut notnull_conflict_clause = None;
                 let mut order = SortOrder::Asc;
                 let mut unique = false;
@@ -3550,6 +3844,7 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
                             ..
                         } => {
                             notnull = !nullable;
+                            explicit_notnull = !nullable;
                             notnull_conflict_clause = *conflict_clause;
                         }
                         ast::ColumnConstraint::Default(ref expr) => {
@@ -3680,6 +3975,7 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
                             && primary_key
                             && !primary_key_desc_columns_constraint,
                         notnull,
+                        explicit_notnull,
                         unique,
                         hidden: false,
                         notnull_conflict_clause,
@@ -3692,10 +3988,6 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
                     }
                 }
                 cols.push(col);
-            }
-
-            if options.contains_without_rowid() {
-                crate::bail_parse_error!("WITHOUT ROWID tables are not supported");
             }
         }
         CreateTableBody::AsSelect(_) => {
@@ -3818,7 +4110,30 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
         column_dependencies: Default::default(),
     };
     table.prepare_generated_columns()?;
-    table.logical_to_physical_map = BTreeTable::build_logical_to_physical_map(&table.columns);
+    if !table.has_rowid {
+        if table.primary_key_columns.is_empty() {
+            crate::bail_parse_error!("PRIMARY KEY missing on table {}", table.name);
+        }
+        for (pk_name, _) in &table.primary_key_columns {
+            let Some((_, col)) = table.get_column(pk_name) else {
+                crate::bail_parse_error!(
+                    "PRIMARY KEY column {pk_name} not found in table {}",
+                    table.name
+                );
+            };
+            if !col.notnull() {
+                let Some(idx) = table.get_column(pk_name).map(|(idx, _)| idx) else {
+                    unreachable!("PRIMARY KEY column should exist");
+                };
+                table.columns[idx].set_notnull(true);
+            }
+        }
+    }
+    table.logical_to_physical_map = BTreeTable::build_logical_to_physical_map(
+        &table.columns,
+        &table.primary_key_columns,
+        table.has_rowid,
+    );
     Ok(table)
 }
 
@@ -3967,6 +4282,7 @@ pub struct Column {
     pub default: Option<Box<Expr>>,
     generated_type: GeneratedType,
     raw: u16,
+    explicit_notnull: bool,
     /// ON CONFLICT clause for NOT NULL constraint on this column.
     pub notnull_conflict_clause: Option<ResolveType>,
 }
@@ -3976,6 +4292,7 @@ pub struct ColDef {
     pub primary_key: bool,
     pub rowid_alias: bool,
     pub notnull: bool,
+    pub explicit_notnull: bool,
     pub unique: bool,
     pub hidden: bool,
     pub notnull_conflict_clause: Option<ResolveType>,
@@ -4127,6 +4444,7 @@ impl Column {
             default,
             generated_type,
             raw,
+            explicit_notnull: coldef.explicit_notnull,
             notnull_conflict_clause: coldef.notnull_conflict_clause,
         }
     }
@@ -4180,6 +4498,10 @@ impl Column {
     #[inline]
     pub const fn notnull(&self) -> bool {
         self.raw & F_NOTNULL != 0
+    }
+    #[inline]
+    pub const fn explicit_notnull(&self) -> bool {
+        self.explicit_notnull
     }
     #[inline]
     pub const fn unique(&self) -> bool {
@@ -4354,6 +4676,7 @@ impl TryFrom<&ColumnDefinition> for Column {
                 primary_key,
                 rowid_alias: primary_key && matches!(ty, Type::Integer),
                 notnull,
+                explicit_notnull: notnull,
                 unique,
                 hidden,
                 notnull_conflict_clause,
@@ -4417,7 +4740,7 @@ pub fn sqlite_schema_table() -> BTreeTable {
         Column::new_default_integer(Some("rootpage".to_string()), "INT".to_string(), None),
         Column::new_default_text(Some("sql".to_string()), "TEXT".to_string(), None),
     ];
-    let logical_to_physical_map = BTreeTable::build_logical_to_physical_map(&columns);
+    let logical_to_physical_map = BTreeTable::build_logical_to_physical_map(&columns, &[], true);
     BTreeTable {
         root_page: 1,
         name: "sqlite_schema".to_string(),
@@ -4448,8 +4771,8 @@ pub struct Index {
     /// Does the index have a rowid as the last column?
     /// This is the case for btree indexes (persistent or ephemeral) that
     /// have been created based on a table with a rowid.
-    /// For example, WITHOUT ROWID tables (not supported in Limbo yet),
-    /// and  SELECT DISTINCT ephemeral indexes will not have a rowid.
+    /// For example, WITHOUT ROWID tables and SELECT DISTINCT ephemeral indexes
+    /// will not have a rowid.
     pub has_rowid: bool,
     pub where_clause: Option<Box<Expr>>,
     pub index_method: Option<Arc<dyn IndexMethodAttachment>>,
@@ -4790,7 +5113,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "WITHOUT ROWID not supported"]
     pub fn test_has_rowid_false() -> Result<()> {
         let sql = r#"CREATE TABLE t1 (a INTEGER PRIMARY KEY, b TEXT) WITHOUT ROWID;"#;
         let table = BTreeTable::from_sql(sql, 0)?;
@@ -4836,7 +5158,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "WITHOUT ROWID not supported"]
     pub fn test_column_is_rowid_alias_single_integer_separate_primary_key_definition_without_rowid(
     ) -> Result<()> {
         let sql = r#"CREATE TABLE t1 (a INTEGER, b TEXT, PRIMARY KEY(a)) WITHOUT ROWID;"#;
@@ -4850,7 +5171,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "WITHOUT ROWID not supported"]
     pub fn test_column_is_rowid_alias_single_integer_without_rowid() -> Result<()> {
         let sql = r#"CREATE TABLE t1 (a INTEGER PRIMARY KEY, b TEXT) WITHOUT ROWID;"#;
         let table = BTreeTable::from_sql(sql, 0)?;
@@ -5200,7 +5520,8 @@ mod tests {
             "INT".to_string(),
             None,
         )];
-        let logical_to_physical_map = BTreeTable::build_logical_to_physical_map(&columns);
+        let logical_to_physical_map =
+            BTreeTable::build_logical_to_physical_map(&columns, &[], true);
         let table = BTreeTable {
             root_page: 0,
             name: "t1".to_string(),
@@ -5457,13 +5778,27 @@ mod tests {
     }
 
     #[test]
-    fn test_without_rowid_rejected() {
+    fn test_without_rowid_preserved_in_sql() -> Result<()> {
         let sql = r#"CREATE TABLE t(code TEXT PRIMARY KEY, val TEXT) WITHOUT ROWID"#;
-        let result = BTreeTable::from_sql(sql, 0);
+        let table = BTreeTable::from_sql(sql, 0)?;
+        assert!(table.get_column("code").unwrap().1.notnull());
         assert_eq!(
-            "Parse error: WITHOUT ROWID tables are not supported",
-            format!("{}", result.unwrap_err())
+            table.to_sql(),
+            "CREATE TABLE t (code TEXT PRIMARY KEY, val TEXT) WITHOUT ROWID"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn test_strict_without_rowid_preserved_in_sql() -> Result<()> {
+        let sql = r#"CREATE TABLE t(code TEXT PRIMARY KEY, val TEXT) STRICT, WITHOUT ROWID"#;
+        let table = BTreeTable::from_sql(sql, 0)?;
+        assert!(table.get_column("code").unwrap().1.notnull());
+        assert_eq!(
+            table.to_sql(),
+            "CREATE TABLE t (code TEXT PRIMARY KEY, val TEXT) STRICT, WITHOUT ROWID"
+        );
+        Ok(())
     }
 
     #[test]

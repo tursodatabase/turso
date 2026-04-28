@@ -14,6 +14,7 @@ import (
 	"testing"
 	"time"
 
+	_ "github.com/mattn/go-sqlite3"
 	"github.com/stretchr/testify/require"
 	turso_libs "github.com/tursodatabase/turso-go-platform-libs"
 )
@@ -742,6 +743,78 @@ func TestParameterOrdering(t *testing.T) {
 			if result[i] != expectedValues[i] {
 				t.Fatalf("Expected %d, got %d", expectedValues[i], result[i])
 			}
+		}
+	}
+}
+
+// TestParametersNamed tests named parameter binding through Go's database/sql
+// API against both turso and go-sqlite3 to ensure compatible behavior.
+//
+// Go's database/sql strips SQL prefixes: sql.Named("a", v) → Name="a".
+// The driver must resolve bare names against :param, @param, and $param
+// placeholders. The "colon" variant was the original bug; the "@" and "$"
+// variants are for coverage to match go-sqlite3 behavior.
+func TestParametersNamed(t *testing.T) {
+	openSqlite3 := func(t *testing.T) *sql.DB {
+		t.Helper()
+		db, err := sql.Open("sqlite3", ":memory:")
+		require.NoError(t, err)
+		t.Cleanup(func() { db.Close() })
+		return db
+	}
+
+	drivers := []struct {
+		name string
+		open func(t *testing.T) *sql.DB
+	}{
+		{"turso", openMem},
+		{"sqlite3", openSqlite3},
+	}
+
+	// Each SQL prefix variant with bare Go names (the standard pattern).
+	prefixes := []struct {
+		tag    string
+		prefix string
+	}{
+		{"colon", ":"},
+		{"at", "@"},
+		{"dollar", "$"},
+	}
+
+	for _, drv := range drivers {
+		for _, pfx := range prefixes {
+			t.Run(drv.name+"/"+pfx.tag, func(t *testing.T) {
+				db := drv.open(t)
+				_, err := db.Exec("CREATE TABLE np (a TEXT, b TEXT, c INTEGER)")
+				require.NoError(t, err)
+
+				insertSQL := fmt.Sprintf(
+					"INSERT INTO np (a, b, c) VALUES (%[1]sa, %[1]sb, %[1]sc)", pfx.prefix)
+				_, err = db.Exec(insertSQL,
+					sql.Named("a", "one"),
+					sql.Named("b", "two"),
+					sql.Named("c", 3))
+				require.NoError(t, err)
+
+				var a, b string
+				var c int
+				err = db.QueryRow("SELECT a, b, c FROM np").Scan(&a, &b, &c)
+				require.NoError(t, err)
+				require.Equal(t, "one", a)
+				require.Equal(t, "two", b)
+				require.Equal(t, 3, c)
+
+				// Also test named params in a WHERE clause.
+				whereSQL := fmt.Sprintf(
+					"SELECT a, b, c FROM np WHERE a = %[1]sx AND c = %[1]sy", pfx.prefix)
+				err = db.QueryRow(whereSQL,
+					sql.Named("x", "one"),
+					sql.Named("y", 3)).Scan(&a, &b, &c)
+				require.NoError(t, err)
+				require.Equal(t, "one", a)
+				require.Equal(t, "two", b)
+				require.Equal(t, 3, c)
+			})
 		}
 	}
 }

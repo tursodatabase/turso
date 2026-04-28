@@ -493,6 +493,29 @@ pub extern "C" fn turso_statement_parameters_count(statement: *const c::turso_st
     statement.parameters_count() as i64
 }
 
+/// Return the name of the parameter at 1-based `index`, including the SQL
+/// prefix (e.g. `:name`, `@name`, `$name`). Returns NULL for positional-only
+/// parameters or out-of-range indices. The caller must free the returned
+/// string with `turso_str_deinit`.
+#[no_mangle]
+#[signature(c)]
+pub extern "C" fn turso_statement_parameter_name(
+    statement: *const c::turso_statement_t,
+    index: i64,
+) -> *const std::ffi::c_char {
+    if index <= 0 {
+        return std::ptr::null();
+    }
+    let statement = match unsafe { TursoStatement::ref_from_capi(statement) } {
+        Ok(statement) => statement,
+        Err(_) => return std::ptr::null(),
+    };
+    match statement.parameter_name(index as usize) {
+        Some(name) => str_to_c_string(&name),
+        None => std::ptr::null(),
+    }
+}
+
 #[no_mangle]
 #[signature(c)]
 pub extern "C" fn turso_statement_bind_positional_null(

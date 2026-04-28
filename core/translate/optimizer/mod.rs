@@ -2,12 +2,13 @@ use super::{
     collate::get_collseq_from_expr,
     emitter::Resolver,
     plan::{
-        DeletePlan, GroupBy, InSeekSource, IterationDirection, JoinOrderMember, JoinType,
+        DeletePlan, GroupBy, InSeekSource, IterationDirection, JoinInfo, JoinOrderMember, JoinType,
         JoinedTable, MinMaxDef, MultiIndexBranch, MultiIndexScanOp, Operation, Plan, Search,
         SeekDef, SeekKey, SelectPlan, SetOperation, SimpleAggregate, TableReferences, UpdatePlan,
         WhereTerm,
     },
 };
+use crate::schema::GeneratedType;
 use crate::translate::expression_index::expression_index_column_usage;
 use crate::translate::plan::{BitSet, ColumnMask, MultiIndexBranchAccess};
 use crate::translate::planner::TableMask;
@@ -15,7 +16,10 @@ use crate::{
     function::{AggFunc, Deterministic},
     index_method::IndexMethodCostEstimate,
     numeric::Numeric,
-    schema::{BTreeCharacteristics, BTreeTable, Index, IndexColumn, Schema, Table, ROWID_SENTINEL},
+    schema::{
+        BTreeCharacteristics, BTreeTable, ColDef, Column, Index, IndexColumn, Schema, Table, Type,
+        ROWID_SENTINEL,
+    },
     translate::{
         insert::ROWID_COLUMN,
         optimizer::{
@@ -28,9 +32,9 @@ use crate::{
             order::{ColumnTarget, OrderTarget},
         },
         plan::{
-            ColumnUsedMask, DmlSafetyReason, EphemeralRowidMode, HashJoinOp, IndexMethodQuery,
-            NonFromClauseSubquery, OuterQueryReference, QueryDestination, ResultSetColumn, Scan,
-            SeekKeyComponent, SubqueryState,
+            DmlSafetyReason, EphemeralRowidMode, HashJoinOp, IndexMethodQuery,
+            NonFromClauseSubquery, QueryDestination, ResultSetColumn, Scan, SeekKeyComponent,
+            SubqueryEvalPhase, SubqueryOrigin, SubqueryState, UpdateSetClause, WriteSetPlan,
         },
         trigger_exec::has_triggers_including_temp,
     },
@@ -45,7 +49,6 @@ use crate::{
     },
     LimboError, Result,
 };
-use crate::{schema::GeneratedType, MAIN_DB_ID};
 use crate::{turso_assert, turso_assert_eq, turso_debug_assert, turso_soft_unreachable};
 use constraints::{
     constraints_from_where_clause, usable_constraints_for_join_order, Constraint,
@@ -58,7 +61,7 @@ use order::{
     compute_order_target, plan_satisfies_order_target, simple_aggregate_order_target,
     EliminatesSortBy, OrderTargetPurpose,
 };
-use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
+use rustc_hash::FxHashMap as HashMap;
 use std::{cmp::Ordering, collections::VecDeque, sync::Arc};
 use turso_ext::{ConstraintInfo, ConstraintUsage};
 use turso_parser::ast::{self, Expr, SortOrder, SubqueryType, TriggerEvent};
@@ -769,22 +772,49 @@ fn optimize_update_plan(
     resolver: &Resolver,
 ) -> Result<()> {
     let schema = resolver.schema();
+    let is_update_from = !plan.from_tables.joined_tables().is_empty();
+    if is_update_from {
+        plan.safety.require(DmlSafetyReason::UpdateFrom);
+    }
+    let mut target_tables = TableReferences::new(
+        vec![plan.target_table.clone()],
+        plan.from_tables.outer_query_refs().to_vec(),
+    );
     #[cfg(all(feature = "fts", not(target_family = "wasm")))]
-    transform_match_to_fts_match(&mut plan.where_clause, schema, &plan.table_references)?;
+    transform_match_to_fts_match(&mut plan.where_clause, schema, &target_tables)?;
     lift_common_subexpressions_from_binary_or_terms(&mut plan.where_clause)?;
     if let ConstantConditionEliminationResult::ImpossibleCondition =
         eliminate_constant_conditions(&mut plan.where_clause)?
     {
         plan.contains_constant_false_condition = true;
+        if is_update_from {
+            let update_from_set_result_columns = update_from_set_result_columns(&plan.set_clauses);
+            build_update_write_set_plan(program, plan, update_from_set_result_columns)?;
+        }
         return Ok(());
     }
-    let _ = optimize_table_access(
+    if is_update_from {
+        let update_from_set_result_columns = update_from_set_result_columns(&plan.set_clauses);
+        build_update_write_set_plan(program, plan, update_from_set_result_columns)?;
+        optimize_select_plan(
+            &mut plan
+                .write_set_plan
+                .as_mut()
+                .expect("UPDATE ... FROM must build its write-set SELECT before optimization")
+                .select,
+            schema,
+        )?;
+        return Ok(());
+    }
+
+    let mut order_by = vec![];
+    let optimize_result = optimize_table_access(
         schema,
         &mut [],
-        &mut plan.table_references,
+        &mut target_tables,
         &schema.indexes,
         &mut plan.where_clause,
-        &mut plan.order_by,
+        &mut order_by,
         &mut None,
         None,
         &plan.non_from_clause_subqueries,
@@ -792,8 +822,13 @@ fn optimize_update_plan(
         &mut plan.offset,
         1.0,
     )?;
+    plan.target_table = target_tables
+        .joined_tables()
+        .first()
+        .expect("UPDATE must optimize exactly one target table")
+        .clone();
 
-    if let Some(reason) = first_update_safety_reason(plan, resolver)? {
+    if let Some(reason) = update_write_set_reason(plan, resolver)? {
         plan.safety.require(reason);
     }
 
@@ -801,14 +836,24 @@ fn optimize_update_plan(
         return Ok(());
     }
 
-    add_ephemeral_table_to_update_plan(program, plan)
+    let join_order = optimize_result
+        .map(|result| result.join_order)
+        .unwrap_or_else(|| default_join_order(&target_tables));
+
+    build_update_write_set_plan(program, plan, Vec::new())?;
+    plan.write_set_plan
+        .as_mut()
+        .expect("stable-write-set UPDATE must build a write-set SELECT")
+        .select
+        .join_order = join_order;
+    Ok(())
 }
 
-fn first_update_safety_reason(
+fn update_write_set_reason(
     plan: &UpdatePlan,
     resolver: &Resolver,
 ) -> Result<Option<DmlSafetyReason>> {
-    let table_ref = &plan.table_references.joined_tables()[0];
+    let table_ref = &plan.target_table;
     let reason = 'requires: {
         let Some(btree_table_arc) = table_ref.table.btree() else {
             break 'requires None;
@@ -835,7 +880,11 @@ fn first_update_safety_reason(
         }
 
         // Check if there are UPDATE triggers
-        let updated_cols: ColumnMask = plan.set_clauses.iter().map(|(i, _)| *i).collect();
+        let updated_cols: ColumnMask = plan
+            .set_clauses
+            .iter()
+            .map(|set_clause| set_clause.column_index)
+            .collect();
         let database_id = table_ref.database_id;
         if has_triggers_including_temp(
             resolver,
@@ -857,8 +906,9 @@ fn first_update_safety_reason(
         }
 
         let Some(index) = table_ref.op.index() else {
-            let rowid_alias_used = plan.set_clauses.iter().fold(false, |accum, (idx, _)| {
-                accum || (*idx != ROWID_SENTINEL && btree_table.columns()[*idx].is_rowid_alias())
+            let rowid_alias_used = plan.set_clauses.iter().any(|set_clause| {
+                set_clause.column_index != ROWID_SENTINEL
+                    && btree_table.columns()[set_clause.column_index].is_rowid_alias()
             });
             if rowid_alias_used {
                 break 'requires Some(DmlSafetyReason::KeyMutation);
@@ -866,19 +916,19 @@ fn first_update_safety_reason(
             let direct_rowid_update = plan
                 .set_clauses
                 .iter()
-                .any(|(idx, _)| *idx == ROWID_SENTINEL);
+                .any(|set_clause| set_clause.column_index == ROWID_SENTINEL);
             if direct_rowid_update {
                 break 'requires Some(DmlSafetyReason::KeyMutation);
             }
             break 'requires None;
         };
 
-        for (set_clause_col_idx, _) in plan.set_clauses.iter() {
+        for set_clause in plan.set_clauses.iter() {
             for c in index.columns.iter() {
                 if let Some(ref expr) = c.expr {
                     let expr_idx_cols_mask =
                         expression_index_column_usage(expr.as_ref(), table_ref, resolver)?;
-                    if expr_idx_cols_mask.get(*set_clause_col_idx) {
+                    if expr_idx_cols_mask.get(set_clause.column_index) {
                         break 'requires Some(DmlSafetyReason::KeyMutation);
                     }
                 }
@@ -899,52 +949,84 @@ fn first_update_safety_reason(
     Ok(reason)
 }
 
+fn collect_subquery_ids_from_exprs<'a>(
+    exprs: impl IntoIterator<Item = &'a ast::Expr>,
+) -> Result<BitSet<turso_parser::ast::TableInternalId>> {
+    use crate::translate::expr::walk_expr;
+    use crate::translate::expr::WalkControl;
+
+    let mut ids = BitSet::<turso_parser::ast::TableInternalId>::default();
+    let mut collector = |e: &ast::Expr| -> Result<WalkControl> {
+        if let ast::Expr::SubqueryResult { subquery_id, .. } = e {
+            ids.set(*subquery_id);
+        }
+        Ok(WalkControl::Continue)
+    };
+    for expr in exprs {
+        walk_expr(expr, &mut collector)?;
+    }
+    Ok(ids)
+}
+
 /// Collect SubqueryResult IDs referenced in SET clause and RETURNING expressions.
 /// These subqueries must stay in the main update plan (evaluated during the update phase),
 /// not be moved to the ephemeral plan (which only collects rowids).
 fn collect_update_phase_subquery_ids(
     plan: &UpdatePlan,
-) -> HashSet<turso_parser::ast::TableInternalId> {
-    use crate::translate::expr::walk_expr;
-    use crate::translate::expr::WalkControl;
-
-    let mut ids = HashSet::default();
-    let mut collector = |e: &ast::Expr| -> Result<WalkControl> {
-        if let ast::Expr::SubqueryResult { subquery_id, .. } = e {
-            ids.insert(*subquery_id);
-        }
-        Ok(WalkControl::Continue)
-    };
-    for (_, expr) in plan.set_clauses.iter() {
-        let _ = walk_expr(expr, &mut collector);
-    }
-    if let Some(returning) = &plan.returning {
-        for rc in returning {
-            let _ = walk_expr(&rc.expr, &mut collector);
-        }
-    }
-    ids
+) -> Result<BitSet<turso_parser::ast::TableInternalId>> {
+    let mut ids = collect_subquery_ids_from_exprs(
+        plan.set_clauses
+            .iter()
+            .map(|set_clause| set_clause.expr.as_ref()),
+    )?;
+    ids.union_with(&collect_subquery_ids_from_exprs(
+        plan.returning
+            .iter()
+            .flat_map(|returning| returning.iter().map(|column| &column.expr)),
+    )?);
+    Ok(ids)
 }
 
-/// An ephemeral table is required if:
-/// 1. The UPDATE modifies any column that is present in the key of the btree used to iterate over the table.
-///    For regular table scans or seeks, the key is the rowid or the rowid alias column (INTEGER PRIMARY KEY).
-///    For index scans and seeks, the key is any column in the index used.
-/// 2. There are UPDATE triggers on the table (SQLite always uses ephemeral tables when triggers exist).
+fn update_from_scratch_col_name(idx: usize) -> String {
+    format!("__update_from_{idx}")
+}
+
+fn update_from_scratch_columns(set_clause_count: usize) -> Vec<Column> {
+    (0..set_clause_count)
+        .map(|idx| {
+            // Keep scratch-table columns at BLOB affinity so materializing SET payloads
+            // does not coerce values before the real target-column affinity is applied.
+            Column::new(
+                Some(update_from_scratch_col_name(idx)),
+                "BLOB".to_string(),
+                None,
+                None,
+                Type::Blob,
+                None,
+                ColDef::default(),
+            )
+        })
+        .collect()
+}
+
+/// Build the SELECT that gathers the stable write set for an UPDATE before the
+/// mutating write loop runs.
 ///
-/// The ephemeral table will accumulate all the rowids of the rows that are affected by the UPDATE,
-/// and then the temp table will be iterated over and the actual row updates performed.
-///
-/// This is necessary because an UPDATE is implemented as a DELETE-then-INSERT operation, which could
-/// mess up the iteration order of the rows by changing the keys in the table/index that the iteration
-/// is performed over. The ephemeral table ensures stable iteration because it is not modified during
-/// the UPDATE loop.
-fn add_ephemeral_table_to_update_plan(
+/// Plain UPDATE materializes only target rowids. `UPDATE ... FROM` materializes
+/// both the chosen SET payloads and the target rowid, using the FROM-side graph
+/// plus the target table as the read-side SELECT source.
+fn build_update_write_set_plan(
     program: &mut ProgramBuilder,
     plan: &mut UpdatePlan,
+    update_from_set_result_columns: Vec<ResultSetColumn>,
 ) -> Result<()> {
-    let internal_id = program.table_reference_counter.next();
-    let columns = vec![(*ROWID_COLUMN).clone()];
+    let scratch_table_id = program.table_reference_counter.next();
+    let is_update_from = !plan.from_tables.joined_tables().is_empty();
+    let columns = if is_update_from {
+        update_from_scratch_columns(plan.set_clauses.len())
+    } else {
+        vec![(*ROWID_COLUMN).clone()]
+    };
     let ephemeral_table = Arc::new(BTreeTable::new(
         0, // root_page, not relevant for ephemeral table definition
         "ephemeral_scratch".to_string(),
@@ -958,90 +1040,44 @@ fn add_ephemeral_table_to_update_plan(
     ));
 
     let temp_cursor_id = program.alloc_cursor_id_keyed(
-        CursorKey::table(internal_id),
+        CursorKey::table(scratch_table_id),
         CursorType::BTreeTable(ephemeral_table.clone()),
     );
 
-    // The actual update loop will use the ephemeral table as the single [JoinedTable] which it then loops over.
-    let table_references_update = TableReferences::new(
-        vec![JoinedTable {
-            table: Table::BTree(ephemeral_table.clone()),
-            identifier: "ephemeral_scratch".to_string(),
-            internal_id,
-            op: Operation::Scan(Scan::BTreeTable {
-                iter_dir: IterationDirection::Forwards,
-                index: None,
-            }),
-            join_info: None,
-            col_used_mask: ColumnUsedMask::default(),
-            column_use_counts: Vec::new(),
-            expression_index_usages: Vec::new(),
-            database_id: MAIN_DB_ID,
-            indexed: None,
-        }],
-        vec![],
-    );
+    let write_set_tables = if is_update_from {
+        let mut from_tables = plan.from_tables.clone();
+        let mut target_table = plan.target_table.clone();
+        target_table.join_info = Some(JoinInfo {
+            join_type: JoinType::Inner,
+            using: vec![],
+            no_reorder: false,
+        });
+        from_tables.add_joined_table(target_table);
+        from_tables
+    } else {
+        TableReferences::new(
+            vec![plan.target_table.clone()],
+            plan.from_tables.outer_query_refs().to_vec(),
+        )
+    };
+    let rowid_internal_id = plan.target_table.internal_id;
 
-    // Building the ephemeral table will use the TableReferences from the original plan -- i.e. if we chose an index scan originally,
-    // we will build the ephemeral table by using the same index scan and using the same WHERE filters.
-    let table_references_ephemeral_select =
-        std::mem::replace(&mut plan.table_references, table_references_update);
+    let mut result_columns = update_from_set_result_columns;
+    result_columns.push(ResultSetColumn {
+        expr: Expr::RowId {
+            database: None,
+            table: rowid_internal_id,
+        },
+        alias: None,
+        implicit_column_name: None,
+        contains_aggregates: false,
+    });
 
-    for table in table_references_ephemeral_select.joined_tables() {
-        // The update loop needs to reference columns from the original source table, so we add it as an outer query reference.
-        plan.table_references
-            .add_outer_query_reference(OuterQueryReference {
-                identifier: table.identifier.clone(),
-                internal_id: table.internal_id,
-                table: table.table.clone(),
-                using_dedup_hidden_cols: ColumnMask::default(),
-                col_used_mask: table.col_used_mask.clone(),
-                cte_select: None,
-                cte_explicit_columns: vec![],
-                cte_id: None,
-                cte_definition_only: false,
-                rowid_referenced: false,
-                scope_depth: 0,
-            });
-    }
-
-    // Preserve outer query references (e.g. CTEs) from the original plan.
-    for outer_ref in table_references_ephemeral_select.outer_query_refs() {
-        plan.table_references
-            .add_outer_query_reference(outer_ref.clone());
-    }
-
-    let join_order = table_references_ephemeral_select
-        .joined_tables()
-        .iter()
-        .enumerate()
-        .map(|(i, t)| JoinOrderMember {
-            table_id: t.internal_id,
-            original_idx: i,
-            is_outer: t
-                .join_info
-                .as_ref()
-                .is_some_and(|join_info| join_info.is_outer()),
-        })
-        .collect();
-    let rowid_internal_id = table_references_ephemeral_select
-        .joined_tables()
-        .first()
-        .unwrap()
-        .internal_id;
-
-    let ephemeral_plan = SelectPlan {
-        table_references: table_references_ephemeral_select,
-        result_columns: vec![ResultSetColumn {
-            expr: Expr::RowId {
-                database: None,
-                table: rowid_internal_id,
-            },
-            alias: None,
-            implicit_column_name: None,
-            contains_aggregates: false,
-        }],
-        where_clause: plan.where_clause.drain(..).collect(),
+    let join_order = default_join_order(&write_set_tables);
+    let write_set_select = SelectPlan {
+        table_references: write_set_tables,
+        result_columns,
+        where_clause: std::mem::take(&mut plan.where_clause),
         group_by: None,     // N/A
         order_by: vec![],   // N/A
         aggregates: vec![], // N/A
@@ -1059,19 +1095,29 @@ fn add_ephemeral_table_to_update_plan(
         window: None,
         input_cardinality_hint: None,
         estimated_output_rows: None,
-        // Only move WHERE clause subqueries to the ephemeral plan.
-        // SET clause and RETURNING clause subqueries must remain in the main update plan
-        // because they compute new column values during the update phase (second pass),
-        // not during row collection (first pass). Moving them here would cause correlated
-        // subqueries in SET to evaluate with wrong cursor positions.
+        // For regular UPDATEs, only WHERE-clause subqueries move into the ephemeral plan.
+        // For UPDATE ... FROM, SET expressions become part of the ephemeral SELECT payload,
+        // so their subqueries move too.
+        // RETURNING subqueries always remain in the main update plan.
         non_from_clause_subqueries: {
-            let update_phase_ids = collect_update_phase_subquery_ids(plan);
+            let ids_to_keep_in_main_plan = if is_update_from {
+                collect_subquery_ids_from_exprs(
+                    plan.returning
+                        .iter()
+                        .flat_map(|returning| returning.iter().map(|column| &column.expr)),
+                )?
+            } else {
+                collect_update_phase_subquery_ids(plan)?
+            };
             let mut ephemeral_subs = Vec::new();
             let mut remaining = Vec::new();
-            for sq in plan.non_from_clause_subqueries.drain(..) {
-                if update_phase_ids.contains(&sq.internal_id) {
+            for mut sq in plan.non_from_clause_subqueries.drain(..) {
+                if ids_to_keep_in_main_plan.get(sq.internal_id) {
                     remaining.push(sq);
                 } else {
+                    if is_update_from && sq.origin == SubqueryOrigin::DmlSet {
+                        sq.eval_phase = SubqueryEvalPhase::BeforeLoop;
+                    }
                     ephemeral_subs.push(sq);
                 }
             }
@@ -1082,9 +1128,54 @@ fn add_ephemeral_table_to_update_plan(
         phantom_params: vec![],
     };
 
-    plan.ephemeral_plan = Some(ephemeral_plan);
+    plan.write_set_plan = Some(WriteSetPlan {
+        select: write_set_select,
+        scratch_table_id,
+    });
+
+    if is_update_from {
+        // For UPDATE ... FROM, the SET expression payloads are materialized, so they are direct
+        // column references to the scratch table.
+        for (idx, set_clause) in plan.set_clauses.iter_mut().enumerate() {
+            set_clause.update_from_result = Some(Box::new(Expr::Column {
+                database: None,
+                table: scratch_table_id,
+                column: idx,
+                is_rowid_alias: false,
+            }));
+        }
+    }
 
     Ok(())
+}
+
+fn default_join_order(table_references: &TableReferences) -> Vec<JoinOrderMember> {
+    table_references
+        .joined_tables()
+        .iter()
+        .enumerate()
+        .map(|(i, t)| JoinOrderMember {
+            table_id: t.internal_id,
+            original_idx: i,
+            is_outer: t
+                .join_info
+                .as_ref()
+                .is_some_and(|join_info| join_info.is_outer()),
+        })
+        .collect()
+}
+
+fn update_from_set_result_columns(set_clauses: &[UpdateSetClause]) -> Vec<ResultSetColumn> {
+    set_clauses
+        .iter()
+        .enumerate()
+        .map(|(idx, set_clause)| ResultSetColumn {
+            expr: set_clause.expr.as_ref().clone(),
+            alias: Some(update_from_scratch_col_name(idx)),
+            implicit_column_name: None,
+            contains_aggregates: false,
+        })
+        .collect()
 }
 
 fn optimize_subqueries(plan: &mut SelectPlan, schema: &Schema) -> Result<()> {
@@ -2713,6 +2804,7 @@ impl Optimizable for ast::Expr {
             Expr::Qualified(..) => {
                 panic!("Do not call is_nonnull before Qualified has been rewritten as Column")
             }
+            Expr::FieldAccess { .. } => false, // struct/union field extraction can return NULL
             Expr::Raise(..) => false,
             Expr::Subquery(..) => false,
             Expr::Unary(_, expr) => expr.is_nonnull(tables),
@@ -2805,7 +2897,7 @@ impl Optimizable for ast::Expr {
             // Not constant. Normally rewritten to Expr::Column by the optimizer,
             // but CHECK constraints bypass the rewrite pass and legitimately
             // contain Qualified nodes.
-            Expr::Qualified(_, _) => false,
+            Expr::Qualified(_, _) | Expr::FieldAccess { .. } => false,
             Expr::Raise(_, expr) => expr.as_ref().is_none_or(|expr| expr.is_constant(resolver)),
             Expr::Subquery(_) => false,
             Expr::Unary(_, expr) => expr.is_constant(resolver),

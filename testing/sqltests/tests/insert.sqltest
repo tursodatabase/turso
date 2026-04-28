@@ -2202,3 +2202,22 @@ test insert-column-count-mismatch-select {
 expect error {
     table t1 has 1 columns but 7 values were supplied
 }
+
+# Regression: used to infinite-loop on INSERT when two partial UNIQUE
+# indexes coexist and one of them has an expression key. The skip-this-
+# index label was resolved via `resolve_label` instead of
+# `preassign_label_to_next_insn`, so when a compile-time constant emitted
+# later got hoisted, the label followed it and the skip jumped somewhere
+# that looped back to the start of the program. Discovered by fuzz test
+# `partial_index_mutation_and_upsert_fuzz`.
+@cross-check-integrity
+test insert-two-partial-unique-indexes-expr-key-no-hang {
+    CREATE TABLE t (id INTEGER PRIMARY KEY, k TEXT, c0 INT);
+    CREATE UNIQUE INDEX idx_a ON t(k, c0) WHERE 1;
+    CREATE UNIQUE INDEX idx_b ON t(upper(c0)) WHERE c0 BETWEEN -6 AND -6;
+    INSERT INTO t VALUES (NULL, 'B', NULL);
+    SELECT id, k, c0 FROM t;
+}
+expect {
+    1|B|
+}

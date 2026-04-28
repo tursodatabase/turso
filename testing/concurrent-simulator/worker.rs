@@ -1,8 +1,9 @@
 //! Worker process for multiprocess mode.
 //!
-//! Each worker opens the database with real filesystem I/O (UnixIO) and
-//! executes SQL commands received from the coordinator over stdin, returning
-//! results over stdout using the JSON-line protocol.
+//! Each worker opens the database with the host's real multiprocess-capable
+//! filesystem I/O backend and executes SQL commands received from the
+//! coordinator over stdin, returning results over stdout using the JSON-line
+//! protocol.
 
 use std::io::{BufRead, BufReader, Write};
 use std::sync::Arc;
@@ -10,9 +11,10 @@ use std::time::{Duration, Instant};
 
 use turso_core::{
     CheckpointMode, Connection, Database, DatabaseOpts, LimboError, OpenFlags,
-    SharedWalCoordinationOpenTelemetryMode, SharedWalTestingSnapshot, StepResult, UnixIO, Value,
+    SharedWalCoordinationOpenTelemetryMode, SharedWalTestingSnapshot, StepResult, Value,
 };
 
+use crate::multiprocess_platform_io;
 use crate::protocol::{
     self, WorkerCommand, WorkerCoordinationOpenMode, WorkerResponse, WorkerSharedWalSnapshot,
     WorkerStartupTelemetry,
@@ -49,7 +51,7 @@ pub fn run_worker(
         .with(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("warn")))
         .try_init();
 
-    let io = Arc::new(UnixIO::new()?);
+    let io = multiprocess_platform_io()?;
     let db_opts = DatabaseOpts::new().with_multiprocess_wal(true);
     let db = Database::open_file_with_flags(
         io,
@@ -362,7 +364,10 @@ fn execute_sql_inner(conn: &Arc<Connection>, sql: &str) -> WorkerResponse {
                 }
                 Ok(StepResult::IO) => {
                     io_count += 1;
-                    // Real I/O: the operation needs more I/O, keep stepping
+                    stmt.get_pager()
+                        .io
+                        .step()
+                        .expect("worker should advance statement IO");
                     continue;
                 }
                 Err(turso_core::LimboError::SchemaUpdated) => {

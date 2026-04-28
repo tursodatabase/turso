@@ -39,7 +39,7 @@ impl TableRefIdCounter {
 }
 
 use super::{
-    affinity::Affinity, BranchOffset, CursorID, Insn, InsnReference, JumpTarget, PrepareContext,
+    affinity::Affinity, BranchOffset, CursorID, Insn, InsnReference, PrepareContext,
     PreparedProgram, Program,
 };
 use crate::translate::plan::BitSet;
@@ -112,7 +112,10 @@ pub enum SelfTableContext {
         table_ref_id: TableInternalId,
         referenced_tables: TableReferences,
     },
-    ForDML(DmlColumnContext),
+    ForDML {
+        dml_ctx: DmlColumnContext,
+        table: Arc<BTreeTable>,
+    },
 }
 
 #[derive(Clone)]
@@ -197,7 +200,11 @@ pub struct ProgramBuilder {
     /// again. Hence, the key is optional.
     pub cursor_ref: Vec<(Option<CursorKey>, CursorType)>,
     /// A vector where index=label number, value=resolved offset. Resolved in build().
-    label_to_resolved_offset: Vec<Option<(InsnReference, JumpTarget)>>,
+    /// For each allocated label, the offset of the instruction emitted *just
+    /// before* the label's logical "next-insn" anchor. The label resolves to
+    /// `anchor_offset + 1` so it tracks whichever instruction ends up at that
+    /// position, even after `emit_constant_insns` reorders the program.
+    label_to_resolved_offset: Vec<Option<InsnReference>>,
     // map of instruction index to manual comment (used in EXPLAIN only)
     comments: Vec<(InsnReference, &'static str)>,
     pub parameters: Parameters,
@@ -267,6 +274,21 @@ pub struct ProgramBuilder {
     next_cte_id: usize,
     /// Counter for subquery numbering in EXPLAIN QUERY PLAN output.
     next_subquery_eqp_id: usize,
+    /// Write-context for union-typed columns: tells `union_value('tag', val)`
+    /// which union TypeDef to resolve the tag against.
+    ///
+    /// Unlike read-path functions (`union_tag(col)`, `union_extract(col, 'tag')`)
+    /// which resolve the union type from the column expression they operate on,
+    /// `union_value()` constructs a *new* value — the SQL syntax doesn't reference
+    /// the target column, so the type must come from the INSERT/UPDATE/UPSERT context.
+    ///
+    /// This follows the same save/restore pattern as `id_register_overrides`
+    /// (ENCODE/DECODE context) and `self_table_context` (DML column resolution).
+    /// Callers must save with `.take()`, set the new value, translate the expression,
+    /// then restore the saved value. For nested unions (union-in-union), the
+    /// `UnionValueFunc` handler in expr.rs saves/restores this to the inner union
+    /// type before translating the value argument.
+    pub(crate) target_union_type: Option<Arc<crate::schema::TypeDef>>,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -667,6 +689,7 @@ impl ProgramBuilder {
             materialized_ctes: HashMap::default(),
             ctes_being_defined: Vec::new(),
             next_subquery_eqp_id: 1,
+            target_union_type: None,
         }
     }
 
@@ -1146,8 +1169,8 @@ impl ProgramBuilder {
         }
 
         for resolved_offset in self.label_to_resolved_offset.iter_mut() {
-            if let Some((old_offset, target)) = resolved_offset {
-                *resolved_offset = Some((old_to_new[*old_offset as usize] as u32, *target));
+            if let Some(old_offset) = resolved_offset {
+                *resolved_offset = Some(old_to_new[*old_offset as usize] as u32);
             }
         }
 
@@ -1199,29 +1222,35 @@ impl ProgramBuilder {
     /// reordering the emitted instructions.
     #[inline]
     pub fn preassign_label_to_next_insn(&mut self, label: BranchOffset) {
-        turso_assert!(label.is_label(), "BranchOffset should be a label", { "label": label });
-        self._resolve_label(label, self.offset().sub(1u32), JumpTarget::AfterThisInsn);
-    }
-
-    /// Resolve a label to exactly the instruction that was last emitted.
-    ///
-    /// Use this when your use case is: "the program should jump to the exact instruction
-    /// that was last emitted", and you don't care WHERE exactly that ends up being
-    /// once the order of the bytecode of the program is finalized. Examples include
-    /// "jump to the Halt instruction", or "jump to the Next instruction of a loop".
-    #[inline]
-    pub fn resolve_label(&mut self, label: BranchOffset, to_offset: BranchOffset) {
-        self._resolve_label(label, to_offset, JumpTarget::ExactlyThisInsn);
-    }
-
-    fn _resolve_label(&mut self, label: BranchOffset, to_offset: BranchOffset, target: JumpTarget) {
-        turso_assert!(matches!(label, BranchOffset::Label(_)));
-        turso_assert!(matches!(to_offset, BranchOffset::Offset(_)));
         let BranchOffset::Label(label_number) = label else {
-            unreachable!("Label is not a label");
+            unreachable!("preassign_label_to_next_insn requires a Label, got {label:?}");
         };
-        self.label_to_resolved_offset[label_number as usize] =
-            Some((to_offset.as_offset_int(), target));
+        let anchor = self.offset().as_offset_int().saturating_sub(1);
+        self.label_to_resolved_offset[label_number as usize] = Some(anchor);
+    }
+
+    /// Resolve `dest` so that it ends up pointing at the same final offset as
+    /// `anchor`. `anchor` must already be preassigned. Use when several labels
+    /// have to target the same logical program point but the point was
+    /// anchored earlier (or in a different function) and
+    /// `preassign_label_to_next_insn` cannot be called again at that moment.
+    ///
+    /// Using this helper (instead of capturing a raw `BranchOffset::Offset`
+    /// from `program.offset()` and passing it to multiple resolutions) keeps
+    /// all the linked labels correctly remapped when `emit_constant_insns`
+    /// hoists compile-time constants — raw offsets don't get remapped, but
+    /// label resolutions do.
+    #[inline]
+    pub fn link_label_to_other_label(&mut self, dest: BranchOffset, anchor: BranchOffset) {
+        let BranchOffset::Label(dest_n) = dest else {
+            unreachable!("link_label_to_other_label dest must be a Label, got {dest:?}");
+        };
+        let BranchOffset::Label(anchor_n) = anchor else {
+            unreachable!("link_label_to_other_label anchor must be a Label, got {anchor:?}");
+        };
+        let resolution = self.label_to_resolved_offset[anchor_n as usize]
+            .expect("anchor label must already be preassigned/resolved");
+        self.label_to_resolved_offset[dest_n as usize] = Some(resolution);
     }
 
     /// Resolve unresolved labels to a specific offset in the instruction list.
@@ -1232,21 +1261,12 @@ impl ProgramBuilder {
     pub fn resolve_labels(&mut self) -> crate::Result<()> {
         let resolve = |pc: &mut BranchOffset, insn_name: &str| -> crate::Result<()> {
             if let BranchOffset::Label(label) = pc {
-                let Some(Some((to_offset, target))) =
-                    self.label_to_resolved_offset.get(*label as usize)
-                else {
+                let Some(Some(anchor)) = self.label_to_resolved_offset.get(*label as usize) else {
                     crate::bail_corrupt_error!(
                         "Reference to undefined or unresolved label in {insn_name}: {label}"
                     );
                 };
-                *pc = BranchOffset::Offset(
-                    to_offset
-                        + if *target == JumpTarget::ExactlyThisInsn {
-                            0
-                        } else {
-                            1
-                        },
-                );
+                *pc = BranchOffset::Offset(anchor + 1);
             }
             Ok(())
         };
@@ -1352,6 +1372,9 @@ impl ProgramBuilder {
                     target_pc,
                 } => {
                     resolve(target_pc, "NotNull")?;
+                }
+                Insn::ColumnHasField { target_pc, .. } => {
+                    resolve(target_pc, "ColumnHasField")?;
                 }
                 Insn::IfPos { target_pc, .. } => {
                     resolve(target_pc, "IfPos")?;
@@ -1787,6 +1810,27 @@ impl ProgramBuilder {
         }
     }
 
+    /// Emit a ColumnHasField instruction that jumps to `target_pc` if the
+    /// cursor's record has a field at the given logical column index.
+    /// Falls through if the record is short (ALTER TABLE ADD COLUMN).
+    pub fn emit_column_has_field(
+        &mut self,
+        cursor_id: CursorID,
+        column: usize,
+        target_pc: BranchOffset,
+    ) {
+        let (_, cursor_type) = self.cursor_ref.get(cursor_id).expect("cursor_id is valid");
+        let physical_column = match cursor_type {
+            CursorType::BTreeTable(btree) => btree.logical_to_physical_column(column),
+            _ => column,
+        };
+        self.emit_insn(Insn::ColumnHasField {
+            cursor_id,
+            column: physical_column,
+            target_pc,
+        });
+    }
+
     /// Emit an Affinity instruction for a single register with the given column affinity.
     pub fn emit_column_affinity(&mut self, register: usize, affinity: Affinity) {
         self.emit_insn(Insn::Affinity {
@@ -1958,7 +2002,7 @@ impl ProgramBuilder {
         result
     }
 
-    pub const fn self_table_context(&self) -> &Option<SelfTableContext> {
-        &self.self_table_context
+    pub fn current_self_table_context(&self) -> Option<&SelfTableContext> {
+        self.self_table_context.as_ref()
     }
 }

@@ -142,9 +142,12 @@ pub fn translate_create_index(
     let Some(tbl) = table.btree() else {
         crate::bail_parse_error!("Error: table '{tbl_name}' is not a b-tree table.");
     };
+    if !tbl.has_rowid {
+        bail_parse_error!("CREATE INDEX on WITHOUT ROWID tables is not supported");
+    }
     let columns = resolve_sorted_columns(&tbl, &columns)?;
 
-    // Block CREATE INDEX on non-orderable custom type columns
+    // Block CREATE INDEX on non-orderable custom type columns and STRUCT/UNION columns
     for col in &columns {
         if col.expr.is_none() {
             // Simple column reference (not expression index)
@@ -153,8 +156,14 @@ pub fn translate_create_index(
                     .schema()
                     .get_type_def(&column.ty_str, tbl.is_strict)
                 {
-                    if type_def.decode.is_some()
-                        && !type_def.operators.iter().any(|op| op.op == "<")
+                    if type_def.is_struct() || type_def.is_union() {
+                        bail_parse_error!(
+                            "cannot create index on STRUCT/UNION column '{}'",
+                            col.name
+                        );
+                    }
+                    if type_def.decode().is_some()
+                        && !type_def.operators().iter().any(|op| op.op == "<")
                     {
                         bail_parse_error!(
                             "cannot create index on column '{}' of type '{}': type does not declare OPERATOR '<'",
@@ -380,7 +389,7 @@ pub fn translate_create_index(
         });
 
         if let Some(skip_row_label) = skip_row_label {
-            program.resolve_label(skip_row_label, program.offset());
+            program.preassign_label_to_next_insn(skip_row_label);
         }
         program.emit_insn(Insn::Next {
             cursor_id: table_cursor_id,
@@ -478,7 +487,7 @@ pub fn translate_create_index(
         });
 
         if let Some(skip_row_label) = skip_row_label {
-            program.resolve_label(skip_row_label, program.offset());
+            program.preassign_label_to_next_insn(skip_row_label);
         }
         program.emit_insn(Insn::Next {
             cursor_id: table_cursor_id,
@@ -510,7 +519,7 @@ pub fn translate_create_index(
             // we fall through to Halt with a unique constraint violation error.
             let goto_label = program.allocate_label();
             let label_after_sorter_compare = program.allocate_label();
-            program.resolve_label(goto_label, program.offset());
+            program.preassign_label_to_next_insn(goto_label);
             program.emit_insn(Insn::Goto {
                 target_pc: label_after_sorter_compare,
             });
@@ -994,7 +1003,7 @@ pub fn translate_drop_index(
         cursor_id: sqlite_schema_cursor_id,
         pc_if_empty: loop_end_label,
     });
-    program.resolve_label(loop_start_label, program.offset());
+    program.preassign_label_to_next_insn(loop_start_label);
 
     // Read sqlite_schema.name into dest_reg
     let dest_reg = program.alloc_register();
@@ -1032,7 +1041,7 @@ pub fn translate_drop_index(
     program.emit_insn(Insn::Once {
         target_pc_when_reentered: label_once_end,
     });
-    program.resolve_label(label_once_end, program.offset());
+    program.preassign_label_to_next_insn(label_once_end);
 
     if let Some((cdc_cursor_id, _)) = cdc_table {
         let before_record_reg = if program.capture_data_changes_info().has_before() {
@@ -1065,13 +1074,13 @@ pub fn translate_drop_index(
         is_part_of_update: false,
     });
 
-    program.resolve_label(next_label, program.offset());
+    program.preassign_label_to_next_insn(next_label);
     program.emit_insn(Insn::Next {
         cursor_id: sqlite_schema_cursor_id,
         pc_if_next: loop_start_label,
     });
 
-    program.resolve_label(loop_end_label, program.offset());
+    program.preassign_label_to_next_insn(loop_end_label);
     if let Some((cdc_cursor_id, _)) = cdc_table {
         emit_cdc_autocommit_commit(program, resolver, cdc_cursor_id)?;
     }

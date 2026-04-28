@@ -317,7 +317,9 @@ impl Drop for Connection {
 
 impl Connection {
     pub(crate) fn empty_temp_schema(&self) -> Arc<Schema> {
-        let mut schema = Schema::with_options(self.db.experimental_custom_types_enabled());
+        // with_options only fails if built-in type SQL is malformed (programmer bug).
+        let mut schema = Schema::with_options(self.db.experimental_custom_types_enabled())
+            .expect("built-in type definitions are malformed");
         schema.generated_columns_enabled = self.db.experimental_generated_columns_enabled();
         Arc::new(schema)
     }
@@ -902,7 +904,7 @@ impl Connection {
 
     pub(crate) fn reparse_schema_with_cookie(self: &Arc<Connection>, cookie: u32) -> Result<()> {
         // create fresh schema as some objects can be deleted
-        let mut fresh = Schema::with_options(self.experimental_custom_types_enabled());
+        let mut fresh = Schema::with_options(self.experimental_custom_types_enabled())?;
         fresh.generated_columns_enabled = self.db.experimental_generated_columns_enabled();
         fresh.schema_version = cookie;
 
@@ -1596,7 +1598,7 @@ impl Connection {
             .block(|| pager.checkpoint(mode, SyncMode::Full, true))
     }
 
-    #[cfg(all(feature = "simulator", target_pointer_width = "64", unix))]
+    #[cfg(all(feature = "simulator", target_pointer_width = "64", host_shared_wal))]
     pub fn install_unpublished_backfill_proof_for_testing(
         &self,
         upper_bound_inclusive: u64,

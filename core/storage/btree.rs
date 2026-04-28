@@ -14,7 +14,7 @@ use super::{
 use crate::{
     io::CompletionGroup,
     io_yield_one,
-    schema::Index,
+    schema::{BTreeTable, Index},
     storage::{
         pager::{BtreePageAllocMode, Pager},
         sqlite3_ondisk::{
@@ -769,6 +769,36 @@ impl BTreeCursor {
         Self::new(pager, root_page, num_columns)
     }
 
+    pub fn new_without_rowid_table(
+        pager: Arc<Pager>,
+        root_page: i64,
+        table: &BTreeTable,
+        num_columns: usize,
+    ) -> Self {
+        let mut cursor = Self::new(pager, root_page, num_columns);
+        let key_info = table
+            .primary_key_columns
+            .iter()
+            .map(|(col_name, order)| {
+                let (_, column) = table
+                    .get_column(col_name)
+                    .expect("WITHOUT ROWID primary key column should exist");
+                crate::types::KeyInfo {
+                    sort_order: *order,
+                    collation: column.collation_opt().unwrap_or_default(),
+                    nulls_order: None,
+                }
+            })
+            .collect::<Vec<_>>();
+        cursor.index_info = Some(Arc::new(IndexInfo {
+            key_info,
+            has_rowid: false,
+            num_cols: table.primary_key_columns.len(),
+            is_unique: true,
+        }));
+        cursor
+    }
+
     pub fn new_index(pager: Arc<Pager>, root_page: i64, index: &Index, num_columns: usize) -> Self {
         let mut cursor = Self::new(pager, root_page, num_columns);
         cursor.index_info = Some(Arc::new(IndexInfo::new_from_index(index)));
@@ -942,11 +972,19 @@ impl BTreeCursor {
     ) -> Result<IOResult<()>> {
         loop {
             if self.read_overflow_state.is_none() {
+                let remaining_to_read =
+                    payload_size
+                        .checked_sub(payload.len() as u64)
+                        .ok_or_else(|| {
+                            LimboError::Corrupt(
+                                "payload size is smaller than local payload bytes".to_string(),
+                            )
+                        })? as usize;
                 let (page, c) = self.read_page(start_next_page as i64)?;
                 self.read_overflow_state.replace(ReadPayloadOverflow {
                     payload: payload.to_vec(),
                     next_page: start_next_page,
-                    remaining_to_read: payload_size as usize - payload.len(),
+                    remaining_to_read,
                     page,
                 });
                 if let Some(c) = c {
@@ -985,10 +1023,20 @@ impl BTreeCursor {
                 }
                 continue;
             }
-            turso_assert!(
-                *remaining_to_read == 0 && next == 0,
-                "we can't have more pages to read while also have read everything"
-            );
+            if *remaining_to_read != 0 || next != 0 {
+                let chain_page = *next_page;
+                let remaining = *remaining_to_read;
+                self.read_overflow_state.take();
+                tracing::warn!(
+                    chain_page,
+                    next,
+                    remaining,
+                    "inconsistent overflow chain observed during payload read"
+                );
+                return Err(LimboError::Corrupt(
+                    "inconsistent overflow chain observed during payload read".to_string(),
+                ));
+            }
             let payload_swap = std::mem::take(payload);
 
             let mut reuse_immutable = self.get_immutable_record_or_create();
@@ -999,7 +1047,7 @@ impl BTreeCursor {
                 .unwrap()
                 .start_serialization(&payload_swap);
 
-            let _ = self.read_overflow_state.take();
+            self.read_overflow_state.take();
             break Ok(IOResult::Done(()));
         }
     }
@@ -5062,6 +5110,7 @@ impl CursorTrait for BTreeCursor {
         // Reset seek state
         self.seek_state = CursorSeekState::Start;
         self.valid_state = CursorValidState::Valid;
+        self.read_overflow_state = None;
         Ok(IOResult::Done(seek_result))
     }
 
@@ -5695,7 +5744,7 @@ impl CursorTrait for BTreeCursor {
     fn has_rowid(&self) -> bool {
         match &self.index_info {
             Some(index_key_info) => index_key_info.has_rowid,
-            None => true, // currently we don't support WITHOUT ROWID tables
+            None => true,
         }
     }
 
@@ -5781,6 +5830,7 @@ impl CursorTrait for BTreeCursor {
                     let has_record = return_if_io!(self.move_to_rightmost(always_seek));
                     self.invalidate_record();
                     self.set_has_record(has_record);
+                    self.read_overflow_state = None;
                     if !has_record {
                         self.seek_to_last_state = SeekToLastState::IsEmpty;
                         continue;
@@ -9716,6 +9766,37 @@ mod tests {
             }
         }
 
+        Ok(())
+    }
+
+    #[test]
+    fn test_process_overflow_read_inconsistent_chain_returns_corrupt() -> Result<()> {
+        let pager = setup_test_env(3);
+        let mut cursor = BTreeCursor::new_table(pager.clone(), 1, 5);
+
+        let (overflow_page, c) = cursor.read_page(2)?;
+        if let Some(c) = c {
+            pager.io.wait_for_completion(c)?;
+        }
+        while overflow_page.is_locked() {
+            pager.io.step()?;
+        }
+
+        let overflow_contents = overflow_page.get_contents();
+        overflow_contents.write_u32_no_offset(0, 0);
+        overflow_contents.as_ptr()[4..].fill(b'Z');
+
+        let local_payload: &'static [u8] = Box::leak(vec![b'Y'; 32].into_boxed_slice());
+        let payload_size = local_payload.len() as u64 + ((cursor.usable_space() - 4) as u64 * 2);
+        let cursor_pager = cursor.pager.clone();
+
+        let err = run_until_done(
+            || cursor.process_overflow_read(local_payload, 2, payload_size),
+            &cursor_pager,
+        )
+        .expect_err("inconsistent overflow chain should fail with Corrupt");
+        assert!(matches!(err, LimboError::Corrupt(_)));
+        assert!(cursor.read_overflow_state.is_none());
         Ok(())
     }
 

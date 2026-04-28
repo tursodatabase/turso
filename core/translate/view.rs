@@ -536,7 +536,7 @@ pub fn translate_drop_view(
         is_part_of_update: false,
     });
 
-    program.resolve_label(skip_delete_label, program.offset());
+    program.preassign_label_to_next_insn(skip_delete_label);
 
     // Move to next row
     program.emit_insn(Insn::Next {
@@ -651,7 +651,7 @@ pub fn translate_drop_view(
             is_part_of_update: false,
         });
 
-        program.resolve_label(dbsp_skip_delete_label, program.offset());
+        program.preassign_label_to_next_insn(dbsp_skip_delete_label);
 
         // Move to next row
         program.emit_insn(Insn::Next {

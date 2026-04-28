@@ -1057,6 +1057,15 @@ impl TursoStatement {
             None => 0,
         }
     }
+    /// Returns the name of the parameter at the given 1-based index,
+    /// including its SQL prefix (e.g. `:name`, `@name`, `$name`).
+    /// Returns None for positional-only (`?`) parameters or out-of-range indices.
+    pub fn parameter_name(&self, index: usize) -> Option<String> {
+        let handle = self.handle.lock().unwrap();
+        let stmt = handle.as_ref()?;
+        let index = index.try_into().ok()?;
+        stmt.parameters().name(index)
+    }
     /// binds positional parameter at the corresponding index (1-based)
     pub fn bind_positional(
         &mut self,

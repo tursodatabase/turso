@@ -1,6 +1,10 @@
 use super::*;
-use std::os::unix::process::ExitStatusExt;
 use std::process::Command;
+
+#[cfg(all(target_os = "windows", feature = "experimental_win_iocp"))]
+use crate::WindowsIOCP;
+#[cfg(unix)]
+use std::os::unix::process::ExitStatusExt;
 
 const MULTIPROCESS_SHM_INSERT_CHILD_TEST: &str =
     "multiprocess_tests::multiprocess_shm_insert_child_process";
@@ -15,6 +19,18 @@ const MULTIPROCESS_SHM_INSERT_AND_CLOSE_CHILD_TEST: &str =
 const MULTIPROCESS_SHM_EXPECT_OPEN_FAILURE_CHILD_TEST: &str =
     "multiprocess_tests::multiprocess_shm_expect_open_failure_child_process";
 const DEFAULT_LOCKED_DB_CHILD_TEST: &str = "multiprocess_tests::default_locked_db_child_process";
+
+fn multiprocess_test_io() -> Arc<dyn IO> {
+    #[cfg(all(target_os = "windows", feature = "experimental_win_iocp"))]
+    {
+        Arc::new(WindowsIOCP::new().unwrap())
+    }
+
+    #[cfg(not(all(target_os = "windows", feature = "experimental_win_iocp")))]
+    {
+        Arc::new(PlatformIO::new().unwrap())
+    }
+}
 
 fn count_test_rows(conn: &Arc<Connection>) -> i64 {
     let mut stmt = conn.prepare("select count(*) from test").unwrap();
@@ -185,7 +201,7 @@ fn shared_wal_coordination_rejects_remote_filesystem_magic_values() {
 }
 
 #[test]
-#[cfg(all(unix, target_pointer_width = "64"))]
+#[cfg(host_shared_wal)]
 fn shared_wal_coordination_path_probe_accepts_nonexistent_relative_paths() {
     let result = Database::path_allows_shared_wal_coordination(std::path::Path::new(
         "nonexistent-relative-multiprocess-wal.db",
@@ -201,7 +217,7 @@ fn database_open_without_experimental_multiprocess_wal_uses_in_process_backend()
     let dir = tempfile::tempdir().unwrap();
     let db_path = dir.path().join("coordination-default-off.db");
     let db_path_str = db_path.to_str().unwrap();
-    let io: Arc<dyn IO> = Arc::new(PlatformIO::new().unwrap());
+    let io: Arc<dyn IO> = multiprocess_test_io();
     let db = Database::open_file(io, db_path_str).unwrap();
 
     let last_checksum_and_max_frame = db.shared_wal.read().last_checksum_and_max_frame();
@@ -221,7 +237,7 @@ fn database_open_without_experimental_multiprocess_wal_rejects_second_process() 
     let dir = tempfile::tempdir().unwrap();
     let db_path = dir.path().join("coordination-default-locked.db");
     let db_path_str = db_path.to_str().unwrap();
-    let io: Arc<dyn IO> = Arc::new(PlatformIO::new().unwrap());
+    let io: Arc<dyn IO> = multiprocess_test_io();
     let _db = Database::open_file(io, db_path_str).unwrap();
 
     let current_exe = std::env::current_exe().unwrap();
@@ -262,7 +278,7 @@ fn readonly_open_with_experimental_multiprocess_wal_allows_missing_coordination_
     let dir = tempfile::tempdir().unwrap();
     let db_path = dir.path().join("readonly-multiprocess-no-tshm.db");
     let db_path_str = db_path.to_str().unwrap();
-    let io: Arc<dyn IO> = Arc::new(PlatformIO::new().unwrap());
+    let io: Arc<dyn IO> = multiprocess_test_io();
 
     {
         let db = Database::open_file(io.clone(), db_path_str).unwrap();
@@ -283,7 +299,7 @@ fn database_open_with_experimental_multiprocess_wal_rejects_second_default_proce
         .path()
         .join("coordination-multiprocess-parent-default-child.db");
     let db_path_str = db_path.to_str().unwrap();
-    let io: Arc<dyn IO> = Arc::new(PlatformIO::new().unwrap());
+    let io: Arc<dyn IO> = multiprocess_test_io();
     let _db = open_multiprocess_db(io, db_path_str).unwrap();
 
     let current_exe = std::env::current_exe().unwrap();
@@ -309,7 +325,7 @@ fn database_open_without_experimental_multiprocess_wal_rejects_second_multiproce
         .path()
         .join("coordination-default-parent-multiprocess-child.db");
     let db_path_str = db_path.to_str().unwrap();
-    let io: Arc<dyn IO> = Arc::new(PlatformIO::new().unwrap());
+    let io: Arc<dyn IO> = multiprocess_test_io();
     let _db = Database::open_file(io, db_path_str).unwrap();
 
     let current_exe = std::env::current_exe().unwrap();
@@ -333,7 +349,7 @@ fn database_open_selects_shm_wal_backend() {
     let dir = tempfile::tempdir().unwrap();
     let db_path = dir.path().join("coordination.db");
     let db_path_str = db_path.to_str().unwrap();
-    let io: Arc<dyn IO> = Arc::new(PlatformIO::new().unwrap());
+    let io: Arc<dyn IO> = multiprocess_test_io();
     let db = open_multiprocess_db(io, db_path_str).unwrap();
 
     let last_checksum_and_max_frame = db.shared_wal.read().last_checksum_and_max_frame();
@@ -352,7 +368,7 @@ fn database_open_rebuilds_from_disk_scan_when_exclusive_shm_snapshot_is_stale() 
     let dir = tempfile::tempdir().unwrap();
     let db_path = dir.path().join("coordination-stale-reopen.db");
     let db_path_str = db_path.to_str().unwrap();
-    let io: Arc<dyn IO> = Arc::new(PlatformIO::new().unwrap());
+    let io: Arc<dyn IO> = multiprocess_test_io();
 
     let db_a = open_multiprocess_db(io.clone(), db_path_str).unwrap();
     let conn_a = db_a.connect().unwrap();
@@ -402,7 +418,7 @@ fn database_open_reuses_trusted_tshm_snapshot_without_disk_scan_when_no_backfill
     let dir = tempfile::tempdir().unwrap();
     let db_path = dir.path().join("coordination-trusted-tail-reopen.db");
     let db_path_str = db_path.to_str().unwrap();
-    let io: Arc<dyn IO> = Arc::new(PlatformIO::new().unwrap());
+    let io: Arc<dyn IO> = multiprocess_test_io();
 
     let db = open_multiprocess_db(io.clone(), db_path_str).unwrap();
     let conn = db.connect().unwrap();
@@ -469,7 +485,7 @@ fn database_open_rebuilds_from_disk_scan_after_partial_checkpoint_without_backfi
         .path()
         .join("coordination-partial-checkpoint-reopen-no-proof.db");
     let db_path_str = db_path.to_str().unwrap();
-    let io: Arc<dyn IO> = Arc::new(PlatformIO::new().unwrap());
+    let io: Arc<dyn IO> = multiprocess_test_io();
 
     let db = open_multiprocess_db(io.clone(), db_path_str).unwrap();
     let conn = db.connect().unwrap();
@@ -547,7 +563,7 @@ fn database_open_rebuilds_from_disk_scan_after_wal_append_invalidates_backfill_p
         .path()
         .join("coordination-partial-checkpoint-reopen-stale-proof.db");
     let db_path_str = db_path.to_str().unwrap();
-    let io: Arc<dyn IO> = Arc::new(PlatformIO::new().unwrap());
+    let io: Arc<dyn IO> = multiprocess_test_io();
 
     let db = open_multiprocess_db(io.clone(), db_path_str).unwrap();
     let conn = db.connect().unwrap();
@@ -619,7 +635,7 @@ fn database_open_rebuilds_from_disk_scan_after_db_header_mismatch_invalidates_ba
         .path()
         .join("coordination-partial-checkpoint-reopen-db-header-mismatch.db");
     let db_path_str = db_path.to_str().unwrap();
-    let io: Arc<dyn IO> = Arc::new(PlatformIO::new().unwrap());
+    let io: Arc<dyn IO> = multiprocess_test_io();
 
     let db = open_multiprocess_db(io.clone(), db_path_str).unwrap();
     let conn = db.connect().unwrap();
@@ -692,7 +708,7 @@ fn default_locked_db_child_process() {
         return;
     };
 
-    let io: Arc<dyn IO> = Arc::new(PlatformIO::new().unwrap());
+    let io: Arc<dyn IO> = multiprocess_test_io();
     let err = Database::open_file(io, db_path.to_str().unwrap())
         .expect_err("default non-multiprocess open should stay DB-file locked across processes");
     assert!(
@@ -707,7 +723,7 @@ fn multiprocess_shm_expect_open_failure_child_process() {
         return;
     };
 
-    let io: Arc<dyn IO> = Arc::new(PlatformIO::new().unwrap());
+    let io: Arc<dyn IO> = multiprocess_test_io();
     let err = open_multiprocess_db(io, db_path.to_str().unwrap())
         .expect_err("multiprocess open should fail when a legacy opener already owns the DB");
     assert!(
@@ -722,7 +738,7 @@ fn multiprocess_shm_insert_child_process() {
         return;
     };
 
-    let io: Arc<dyn IO> = Arc::new(PlatformIO::new().unwrap());
+    let io: Arc<dyn IO> = multiprocess_test_io();
     let db = open_multiprocess_db(io, db_path.to_str().unwrap()).unwrap();
     let last_checksum_and_max_frame = db.shared_wal.read().last_checksum_and_max_frame();
     let wal = db
@@ -743,7 +759,7 @@ fn multiprocess_shm_insert_and_close_child_process() {
         return;
     };
 
-    let io: Arc<dyn IO> = Arc::new(PlatformIO::new().unwrap());
+    let io: Arc<dyn IO> = multiprocess_test_io();
     let db = open_multiprocess_db(io, db_path.to_str().unwrap()).unwrap();
     let last_checksum_and_max_frame = db.shared_wal.read().last_checksum_and_max_frame();
     let wal = db
@@ -769,7 +785,7 @@ fn multiprocess_shm_count_child_process() {
         .parse::<i64>()
         .unwrap();
 
-    let io: Arc<dyn IO> = Arc::new(PlatformIO::new().unwrap());
+    let io: Arc<dyn IO> = multiprocess_test_io();
     let db = open_multiprocess_db(io, db_path.to_str().unwrap()).unwrap();
     let last_checksum_and_max_frame = db.shared_wal.read().last_checksum_and_max_frame();
     let wal = db
@@ -797,7 +813,7 @@ fn multiprocess_shm_hold_read_tx_child_process() {
     let readonly = std::env::var_os("TURSO_MULTIPROCESS_READONLY").is_some();
     let expect_disk_scan = std::env::var_os("TURSO_MULTIPROCESS_EXPECT_DISK_SCAN").is_some();
 
-    let io: Arc<dyn IO> = Arc::new(PlatformIO::new().unwrap());
+    let io: Arc<dyn IO> = multiprocess_test_io();
     let db = if readonly {
         open_multiprocess_db_with_flags(io, db_path.to_str().unwrap(), OpenFlags::ReadOnly).unwrap()
     } else {
@@ -835,7 +851,7 @@ fn multiprocess_shm_schema_child_process() {
         return;
     };
 
-    let io: Arc<dyn IO> = Arc::new(PlatformIO::new().unwrap());
+    let io: Arc<dyn IO> = multiprocess_test_io();
     let db = open_multiprocess_db(io, db_path.to_str().unwrap()).unwrap();
     let last_checksum_and_max_frame = db.shared_wal.read().last_checksum_and_max_frame();
     let wal = db
@@ -857,7 +873,7 @@ fn subprocess_database_open_selects_multiprocess_shm_backend() {
     let dir = tempfile::tempdir().unwrap();
     let db_path = dir.path().join("coordination-subprocess.db");
     let db_path_str = db_path.to_str().unwrap();
-    let io: Arc<dyn IO> = Arc::new(PlatformIO::new().unwrap());
+    let io: Arc<dyn IO> = multiprocess_test_io();
     let db = open_multiprocess_db(io, db_path_str).unwrap();
     let last_checksum_and_max_frame = db.shared_wal.read().last_checksum_and_max_frame();
     let wal = db
@@ -909,7 +925,7 @@ fn subprocess_child_close_skips_shutdown_checkpoint_in_multiprocess_wal_mode() {
     let dir = tempfile::tempdir().unwrap();
     let db_path = dir.path().join("close-skip-shutdown-checkpoint.db");
     let db_path_str = db_path.to_str().unwrap();
-    let io: Arc<dyn IO> = Arc::new(PlatformIO::new().unwrap());
+    let io: Arc<dyn IO> = multiprocess_test_io();
     let db = open_multiprocess_db(io, db_path_str).unwrap();
     let conn = db.connect().unwrap();
 
@@ -958,7 +974,7 @@ fn subprocess_database_open_survives_truncate_rewrite_cycles() {
     let dir = tempfile::tempdir().unwrap();
     let db_path = dir.path().join("coordination-truncate-rewrite.db");
     let db_path_str = db_path.to_str().unwrap();
-    let io: Arc<dyn IO> = Arc::new(PlatformIO::new().unwrap());
+    let io: Arc<dyn IO> = multiprocess_test_io();
     let db = open_multiprocess_db(io, db_path_str).unwrap();
     let conn = db.connect().unwrap();
     conn.execute("create table test(id integer primary key, value text)")
@@ -1021,7 +1037,7 @@ fn subprocess_database_open_peer_refreshes_remote_schema_without_reopen() {
     let dir = tempfile::tempdir().unwrap();
     let db_path = dir.path().join("coordination-peer-schema-refresh.db");
     let db_path_str = db_path.to_str().unwrap();
-    let io: Arc<dyn IO> = Arc::new(PlatformIO::new().unwrap());
+    let io: Arc<dyn IO> = multiprocess_test_io();
     let db = open_multiprocess_db(io, db_path_str).unwrap();
     let conn = db.connect().unwrap();
     conn.execute("create table t(value integer, next_value integer)")
@@ -1084,7 +1100,7 @@ fn subprocess_database_open_parent_directly_uses_child_created_table() {
     let dir = tempfile::tempdir().unwrap();
     let db_path = dir.path().join("coordination-direct-child-table-use.db");
     let db_path_str = db_path.to_str().unwrap();
-    let io: Arc<dyn IO> = Arc::new(PlatformIO::new().unwrap());
+    let io: Arc<dyn IO> = multiprocess_test_io();
     let db = open_multiprocess_db(io, db_path_str).unwrap();
     let conn = db.connect().unwrap();
     conn.execute("create table t(value integer)").unwrap();
@@ -1121,7 +1137,7 @@ fn subprocess_database_open_parent_execute_uses_child_created_table() {
     let dir = tempfile::tempdir().unwrap();
     let db_path = dir.path().join("coordination-execute-child-table-use.db");
     let db_path_str = db_path.to_str().unwrap();
-    let io: Arc<dyn IO> = Arc::new(PlatformIO::new().unwrap());
+    let io: Arc<dyn IO> = multiprocess_test_io();
     let db = open_multiprocess_db(io, db_path_str).unwrap();
     let conn = db.connect().unwrap();
     conn.execute("create table t(value integer)").unwrap();
@@ -1160,7 +1176,7 @@ fn subprocess_readonly_child_reader_blocks_restart_and_truncate_checkpoints() {
     let ready_file = dir.path().join("child-ready");
     let release_file = dir.path().join("child-release");
     let db_path_str = db_path.to_str().unwrap();
-    let io: Arc<dyn IO> = Arc::new(PlatformIO::new().unwrap());
+    let io: Arc<dyn IO> = multiprocess_test_io();
 
     let db = open_multiprocess_db(io, db_path_str).unwrap();
     let conn = db.connect().unwrap();
@@ -1254,7 +1270,7 @@ fn subprocess_readonly_disk_scan_child_reader_stays_in_shared_coordination() {
     let ready_file = dir.path().join("child-ready");
     let release_file = dir.path().join("child-release");
     let db_path_str = db_path.to_str().unwrap();
-    let io: Arc<dyn IO> = Arc::new(PlatformIO::new().unwrap());
+    let io: Arc<dyn IO> = multiprocess_test_io();
 
     let db = open_multiprocess_db(io.clone(), db_path_str).unwrap();
     let conn = db.connect().unwrap();
@@ -1361,7 +1377,7 @@ fn subprocess_readonly_disk_scan_child_reader_stays_in_shared_coordination() {
         "disk-scan read-only child should exit cleanly after releasing its read transaction: {child_status:?}"
     );
 
-    let reopened = open_multiprocess_db(Arc::new(PlatformIO::new().unwrap()), db_path_str).unwrap();
+    let reopened = open_multiprocess_db(multiprocess_test_io(), db_path_str).unwrap();
     let reopened_conn = reopened.connect().unwrap();
     let checkpoint = reopened_conn
         .checkpoint(CheckpointMode::Truncate {
@@ -1386,7 +1402,7 @@ fn subprocess_database_truncate_checkpoint_reclaims_dead_child_reader_slot() {
     let ready_file = dir.path().join("child-ready");
     let release_file = dir.path().join("child-release");
     let db_path_str = db_path.to_str().unwrap();
-    let io: Arc<dyn IO> = Arc::new(PlatformIO::new().unwrap());
+    let io: Arc<dyn IO> = multiprocess_test_io();
     let db = open_multiprocess_db(io, db_path_str).unwrap();
     let conn = db.connect().unwrap();
     conn.execute("create table test(id integer primary key, value text)")
@@ -1436,10 +1452,16 @@ fn subprocess_database_truncate_checkpoint_reclaims_dead_child_reader_slot() {
 
     child.kill().unwrap();
     let child_status = child.wait().unwrap();
+    #[cfg(unix)]
     assert_eq!(
         child_status.signal(),
         Some(libc::SIGKILL),
         "expected killed child process to exit via SIGKILL, got {child_status:?}"
+    );
+    #[cfg(windows)]
+    assert!(
+        !child_status.success(),
+        "expected killed child process to exit unsuccessfully on Windows, got {child_status:?}"
     );
 
     let checkpoint = conn
@@ -1468,7 +1490,7 @@ fn subprocess_database_truncate_checkpoint_reclaims_dead_child_reader_slot() {
     manager.clear();
     drop(manager);
 
-    let io: Arc<dyn IO> = Arc::new(PlatformIO::new().unwrap());
+    let io: Arc<dyn IO> = multiprocess_test_io();
     let reopened = open_multiprocess_db(io, db_path_str).unwrap();
     let reopened_conn = reopened.connect().unwrap();
     assert_eq!(
@@ -1485,7 +1507,7 @@ fn database_open_reopen_with_live_child_reader_does_not_clobber_authority() {
     let ready_file = dir.path().join("child-ready");
     let release_file = dir.path().join("child-release");
     let db_path_str = db_path.to_str().unwrap();
-    let io: Arc<dyn IO> = Arc::new(PlatformIO::new().unwrap());
+    let io: Arc<dyn IO> = multiprocess_test_io();
 
     let db = open_multiprocess_db(io.clone(), db_path_str).unwrap();
     let conn = db.connect().unwrap();
@@ -1584,7 +1606,7 @@ fn database_open_rebuilds_from_disk_scan_when_shared_frame_index_overflowed() {
         .path()
         .join("coordination-overflowed-frame-index-reopen.db");
     let db_path_str = db_path.to_str().unwrap();
-    let io: Arc<dyn IO> = Arc::new(PlatformIO::new().unwrap());
+    let io: Arc<dyn IO> = multiprocess_test_io();
 
     let db_a = open_multiprocess_db(io.clone(), db_path_str).unwrap();
     let conn_a = db_a.connect().unwrap();

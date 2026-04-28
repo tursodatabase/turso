@@ -1,0 +1,95 @@
+@database :memory:
+@skip-file-if mvcc "WITHOUT ROWID writes are not supported in MVCC mode"
+@skip-file-if sqlite "SQLite supports WITHOUT ROWID operations that Turso does not yet implement"
+
+test without-rowid-hidden-rowid {
+    CREATE TABLE t(a INTEGER PRIMARY KEY, b TEXT) WITHOUT ROWID;
+    SELECT rowid FROM t;
+}
+expect error {
+    no such column: rowid
+}
+
+test without-rowid-primary-key-uniqueness {
+    CREATE TABLE t(a TEXT PRIMARY KEY, b INTEGER) WITHOUT ROWID;
+    INSERT INTO t VALUES ('k', 1);
+    INSERT INTO t VALUES ('k', 2);
+}
+expect error {
+    UNIQUE constraint failed
+}
+
+test without-rowid-missing-primary-key-rejected {
+    CREATE TABLE t(a INTEGER, b TEXT) WITHOUT ROWID;
+}
+expect error {
+    PRIMARY KEY missing on table t
+}
+
+test without-rowid-secondary-unique-rejected {
+    CREATE TABLE t(a TEXT PRIMARY KEY, b INTEGER UNIQUE, c TEXT) WITHOUT ROWID;
+}
+expect error {
+    secondary UNIQUE constraints on WITHOUT ROWID tables are not supported
+}
+
+test without-rowid-autoincrement-rejected {
+    CREATE TABLE t(a INTEGER PRIMARY KEY AUTOINCREMENT) WITHOUT ROWID;
+}
+expect error {
+    AUTOINCREMENT is not allowed on WITHOUT ROWID tables
+}
+
+test without-rowid-create-index-rejected {
+    CREATE TABLE t(a TEXT PRIMARY KEY, b INTEGER) WITHOUT ROWID;
+    CREATE INDEX idx_t_b ON t(b);
+}
+expect error {
+    CREATE INDEX on WITHOUT ROWID tables is not supported
+}
+
+test without-rowid-update-rejected {
+    CREATE TABLE t(a TEXT PRIMARY KEY, b INTEGER) WITHOUT ROWID;
+    INSERT INTO t VALUES ('k', 1);
+    UPDATE t SET b = 2 WHERE a = 'k';
+}
+expect error {
+    UPDATE of WITHOUT ROWID tables is not supported
+}
+
+test without-rowid-delete-rejected {
+    CREATE TABLE t(a TEXT PRIMARY KEY, b INTEGER) WITHOUT ROWID;
+    INSERT INTO t VALUES ('k', 1);
+    DELETE FROM t WHERE a = 'k';
+}
+expect error {
+    DELETE from WITHOUT ROWID tables is not supported
+}
+
+test without-rowid-insert-or-replace-rejected {
+    CREATE TABLE t(a TEXT PRIMARY KEY, b INTEGER) WITHOUT ROWID;
+    INSERT OR REPLACE INTO t VALUES ('k', 1);
+}
+expect error {
+    UPSERT and REPLACE on WITHOUT ROWID tables are not supported
+}
+
+test without-rowid-upsert-rejected {
+    CREATE TABLE t(a TEXT PRIMARY KEY, b INTEGER) WITHOUT ROWID;
+    INSERT INTO t VALUES ('k', 1);
+    INSERT INTO t VALUES ('k', 2) ON CONFLICT DO UPDATE SET b = excluded.b;
+}
+expect error {
+    UPSERT and REPLACE on WITHOUT ROWID tables are not supported
+}
+
+test without-rowid-foreign-keys-rejected {
+    PRAGMA foreign_keys = ON;
+    CREATE TABLE parent(id INTEGER PRIMARY KEY);
+    INSERT INTO parent VALUES (1);
+    CREATE TABLE child(id INTEGER PRIMARY KEY, parent_id INTEGER REFERENCES parent(id)) WITHOUT ROWID;
+    INSERT INTO child VALUES (10, 1);
+}
+expect error {
+    foreign keys on WITHOUT ROWID tables are not supported
+}

@@ -15,10 +15,10 @@
     "ava": "^6.4.1"
   },
   "dependencies": {
-    "@tursodatabase/serverless": "../../serverless/javascript",
-    "@tursodatabase/database": "../../bindings/javascript/packages/native",
+    "@tursodatabase/serverless": "../../../serverless/javascript",
+    "@tursodatabase/database": "../../../bindings/javascript/packages/native",
     "better-sqlite3": "^12.9.0",
-    "libsql": "^0.6.0-pre.33",
+    "libsql": "^0.6.0-pre.34",
     "@libsql/client": "^0.15.15"
   }
 }

@@ -568,7 +568,7 @@ queryTimeoutInterruptsLongRunningQueryTest("Query timeout option interrupts long
 
   const error = t.throws(() => {
     stmt.get();
-  });
+  }, { any: true });
   t.truthy(error);
   t.true(error.message.toLowerCase().includes("interrupt"));
 

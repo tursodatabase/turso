@@ -102,10 +102,15 @@ export class Connection {
       throw new TypeError("The database connection is not open");
     }
     
-    // Create a session to get column metadata via describe
-    const session = new Session(this.config);
-    const description = await session.describe(sql);
-    await session.close();
+    // Describe on the existing session so it sees uncommitted DDL
+    // (e.g. CREATE TABLE in the same transaction).
+    await this.execLock.acquire();
+    let description;
+    try {
+      description = await this.session.describe(sql);
+    } finally {
+      this.execLock.release();
+    }
     
     const stmt = Statement.fromSession(this.session, sql, description.cols, this.execLock);
     if (this.defaultSafeIntegerMode) {

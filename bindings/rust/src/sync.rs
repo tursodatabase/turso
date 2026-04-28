@@ -220,6 +220,8 @@ impl Builder {
             reserved_bytes,
             partial_sync_opts: self.partial_sync_config_experimental.clone(),
             remote_encryption_key: self.remote_encryption_key.clone(),
+            push_operations_threshold: None,
+            pull_bytes_threshold: None,
         };
 
         // Create sync wrapper.

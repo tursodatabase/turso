@@ -189,6 +189,8 @@ pub(crate) fn unix_shared_wal_lock_byte(
         l_start: offset as libc::off_t,
         l_len: 1,
         l_pid: 0,
+        #[cfg(target_os = "freebsd")]
+        l_sysid: 0,
     };
     let cmd = match (kind, blocking) {
         #[cfg(target_os = "linux")]
@@ -238,6 +240,8 @@ pub(crate) fn unix_shared_wal_unlock_byte(
         l_start: offset as libc::off_t,
         l_len: 1,
         l_pid: 0,
+        #[cfg(target_os = "freebsd")]
+        l_sysid: 0,
     };
     let cmd = match kind {
         #[cfg(target_os = "linux")]

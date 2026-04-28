@@ -48,6 +48,7 @@ Source = "https://github.com/tursodatabase/turso"
 
 [project.entry-points."sqlalchemy.dialects"]
 "sqlite.turso" = "turso.sqlalchemy:TursoDialect"
+"sqlite.aioturso" = "turso.sqlalchemy:AioTursoDialect"
 "sqlite.turso_sync" = "turso.sqlalchemy:TursoSyncDialect"
 
 [tool.maturin]

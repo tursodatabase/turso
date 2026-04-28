@@ -1,7 +1,8 @@
 """SQLAlchemy dialects for pyturso.
 
-This module provides two SQLAlchemy dialects:
+This module provides SQLAlchemy dialects:
 - TursoDialect: Basic local database connections (sqlite+turso://)
+- AioTursoDialect: Basic local asyncio connections (sqlite+aioturso://)
 - TursoSyncDialect: Sync-enabled connections with remote support (sqlite+turso_sync://)
 """
 
@@ -11,9 +12,15 @@ import logging
 from typing import TYPE_CHECKING, Any, Dict, List
 
 from sqlalchemy import pool
+from sqlalchemy.connectors.asyncio import (
+    AsyncAdapt_dbapi_connection,
+    AsyncAdapt_dbapi_module,
+)
+from sqlalchemy.dialects.sqlite.aiosqlite import SQLiteDialect_aiosqlite
 from sqlalchemy.dialects.sqlite.pysqlite import SQLiteDialect_pysqlite
 from sqlalchemy.engine import URL
 from sqlalchemy.engine.reflection import ObjectKind
+from sqlalchemy.util.concurrency import await_only
 
 if TYPE_CHECKING:
     from sqlalchemy.engine.interfaces import ConnectArgsType, ReflectedForeignKeyConstraint, ReflectedIndex
@@ -290,6 +297,177 @@ class TursoDialect(_TursoDialectMixin, SQLiteDialect_pysqlite):
         if url.database == ":memory:":
             return pool.SingletonThreadPool
         return pool.QueuePool
+
+
+class AsyncAdapt_turso_dbapi(AsyncAdapt_dbapi_module):
+    """Bridge turso.aio (coroutine API) to SQLAlchemy's DBAPI-shaped async adapter contract.
+
+    SQLAlchemy's async engine still drives execution through DBAPI-style
+    connection/cursor semantics internally. turso.aio exposes awaitable
+    operations, so we provide this adapter layer to map turso.aio connections
+    into SQLAlchemy's AsyncAdapt_dbapi_connection while exposing DBAPI module
+    attributes/exceptions (paramstyle, Error hierarchy, sqlite version info).
+    """
+
+    def __init__(self, turso_aio_module, turso_module):
+        # Match SQLAlchemy 2.0.x adapter style (same approach as aiosqlite).
+        self.turso_aio = turso_aio_module
+        self.turso = turso_module
+        self.paramstyle = "qmark"
+        self._init_dbapi_attributes()
+
+    def _init_dbapi_attributes(self) -> None:
+        """Populate DBAPI-shaped module attributes expected by SQLAlchemy.
+
+        turso.aio focuses on coroutine connection APIs and does not expose the
+        full DBAPI module surface directly. We mirror DBAPI exceptions/metadata
+        from turso (sync module) here so SQLAlchemy sees the expected interface.
+
+        Current support shape:
+        - turso.aio exposes async connection/cursor APIs (e.g. connect()).
+        - turso.aio does not expose DBAPI module attributes/exceptions like
+          apilevel/paramstyle/sqlite_version/Error hierarchy.
+        - turso (sync module) exposes that DBAPI metadata and exceptions.
+        """
+        for name in (
+            "Error",
+            "InterfaceError",
+            "DatabaseError",
+            "DataError",
+            "OperationalError",
+            "IntegrityError",
+            "InternalError",
+            "ProgrammingError",
+            "Warning",
+            "NotSupportedError",
+            "apilevel",
+            "threadsafety",
+            "sqlite_version",
+            "sqlite_version_info",
+        ):
+            setattr(self, name, getattr(self.turso, name))
+
+        # Preserve sqlite constants/types expected by SQLite dialect helpers.
+        import sqlite3
+
+        for name in ("PARSE_COLNAMES", "PARSE_DECLTYPES", "Binary"):
+            setattr(self, name, getattr(sqlite3, name))
+
+    def connect(self, *arg: Any, **kw: Any) -> AsyncAdapt_dbapi_connection:
+        creator_fn = kw.pop("async_creator_fn", None)
+
+        if creator_fn:
+            connection = creator_fn(*arg, **kw)
+        else:
+            connection = self.turso_aio.connect(*arg, **kw)
+
+        return AsyncAdapt_dbapi_connection(self, await_only(connection))
+
+
+class AioTursoDialect(_TursoDialectMixin, SQLiteDialect_aiosqlite):
+    """
+    SQLAlchemy asyncio dialect for pyturso local database connections.
+
+    Naming:
+        SQLAlchemy URLs use dialect+driver://. The driver is named
+        "aioturso" to mirror SQLAlchemy's built-in "sqlite+aiosqlite://"
+        naming. The "aio" prefix identifies the asyncio driver; "turso_sync"
+        remains reserved for Turso remote sync support.
+
+    Async model:
+        Like aiosqlite, turso.aio exposes an asyncio interface by running the
+        underlying blocking local connection on a worker thread. This integrates
+        with event loops and avoids blocking application code, but it is not
+        engine-level async I/O and should not be treated as a query performance
+        optimization.
+
+    References:
+        SQLAlchemy aiosqlite dialect:
+        https://github.com/sqlalchemy/sqlalchemy/blob/main/lib/sqlalchemy/dialects/sqlite/aiosqlite.py
+        aioturso worker-thread implementation:
+        turso/lib_aio.py and turso/worker.py.
+
+    Usage:
+        from sqlalchemy.ext.asyncio import create_async_engine
+        engine = create_async_engine("sqlite+aioturso:///:memory:")
+    """
+
+    name = "sqlite"
+    driver = "aioturso"
+
+    # Enable statement caching for better performance
+    supports_statement_cache = True
+    # Disable native_datetime since turso handles datetime differently
+    supports_native_datetime = False
+
+    @classmethod
+    def import_dbapi(cls):
+        """Import turso.aio as async DBAPI with SQLAlchemy adapter."""
+        import turso
+        import turso.aio
+
+        return AsyncAdapt_turso_dbapi(turso.aio, turso)
+
+    def on_connect(self):
+        """Skip pysqlite REGEXP function setup (unsupported by turso)."""
+        return None
+
+    def get_isolation_level(self, dbapi_connection):
+        """Turso does not use PRAGMA read_uncommitted; always SERIALIZABLE."""
+        return "SERIALIZABLE"
+
+    def set_isolation_level(self, dbapi_connection, level):
+        """No-op: isolation level is set at connect time."""
+        pass
+
+    def create_connect_args(self, url: URL) -> ConnectArgsType:
+        """
+        Create connection arguments from SQLAlchemy URL.
+
+        The URL format is:
+            sqlite+aioturso:///path/to/database.db
+
+        Query parameters supported:
+            - isolation_level: Transaction isolation level
+            - experimental_features: Comma-separated feature flags
+        """
+        opts = url.translate_connect_args()
+
+        # 'database' key becomes the positional argument
+        database = opts.pop("database", ":memory:")
+
+        # Remove unsupported URL components
+        opts.pop("username", None)
+        opts.pop("password", None)
+        opts.pop("host", None)
+        opts.pop("port", None)
+
+        # Extract query parameters
+        query_params = dict(url.query)
+
+        kwargs: Dict[str, Any] = {}
+
+        # Handle isolation_level
+        isolation_level = query_params.pop("isolation_level", None)
+        if isolation_level:
+            if isolation_level.upper() == "AUTOCOMMIT":
+                kwargs["isolation_level"] = None
+            else:
+                kwargs["isolation_level"] = isolation_level
+
+        # Handle experimental_features
+        experimental_features = query_params.pop("experimental_features", None)
+        if experimental_features:
+            kwargs["experimental_features"] = experimental_features
+
+        return ([database], kwargs)
+
+    @classmethod
+    def get_pool_class(cls, url: URL) -> type[pool.Pool]:
+        """Match SQLAlchemy async SQLite pool behavior."""
+        if cls._is_url_file_db(url):
+            return pool.AsyncAdaptedQueuePool
+        return pool.StaticPool
 
 
 class TursoSyncDialect(_TursoDialectMixin, SQLiteDialect_pysqlite):

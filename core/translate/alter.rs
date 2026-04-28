@@ -240,7 +240,7 @@ fn emit_rename_sqlite_sequence_entry(
             table_name: crate::schema::SQLITE_SEQUENCE_TABLE_NAME.to_string(),
         });
 
-        program.resolve_label(continue_loop_label, program.offset());
+        program.preassign_label_to_next_insn(continue_loop_label);
     });
 }
 
@@ -376,7 +376,7 @@ fn emit_add_column_default_type_validation(
         description_reg: None,
     });
 
-    program.resolve_label(skip_check_label, program.offset());
+    program.preassign_label_to_next_insn(skip_check_label);
     Ok(())
 }
 
@@ -467,11 +467,13 @@ fn emit_add_virtual_column_validation(
 
     let dml_ctx =
         DmlColumnContext::layout(resolved_table.columns(), base_dest_reg, rowid_reg, layout);
+    let resolved_table_arc = Arc::new(resolved_table.clone());
     compute_virtual_columns(
         program,
         &resolved_table.columns_topo_sort()?,
         &dml_ctx,
         resolver,
+        &resolved_table_arc,
     )?;
     let result_reg = dml_ctx.to_column_reg(new_column_idx);
 
@@ -512,7 +514,7 @@ fn emit_add_virtual_column_validation(
             on_error: None,
             description_reg: None,
         });
-        program.resolve_label(notnull_passed, program.offset());
+        program.preassign_label_to_next_insn(notnull_passed);
     }
 
     program.emit_insn(Insn::Next {
@@ -520,7 +522,7 @@ fn emit_add_virtual_column_validation(
         pc_if_next: loop_start,
     });
 
-    program.resolve_label(skip_label, program.offset());
+    program.preassign_label_to_next_insn(skip_label);
     Ok(())
 }
 
@@ -550,19 +552,38 @@ fn emit_add_column_check_validation(
         _ => return Ok(()),
     };
 
-    // Collect CHECK constraints from the column constraints being added.
-    let check_exprs: Vec<(&Option<ast::Name>, &Box<ast::Expr>)> = constraints
+    // Collect CHECK constraints from column-level constraints + domain CHECKs.
+    // Domain CHECKs use `value` as placeholder which must be rewritten to the column name.
+    let mut all_checks: Vec<(Option<String>, Box<ast::Expr>)> = constraints
         .iter()
         .filter_map(|c| {
             if let ast::ColumnConstraint::Check(expr) = &c.constraint {
-                Some((&c.name, expr))
+                Some((
+                    c.name.as_ref().map(|n| n.as_str().to_string()),
+                    expr.clone(),
+                ))
             } else {
                 None
             }
         })
         .collect();
 
-    if check_exprs.is_empty() {
+    if let Ok(Some(resolved)) = resolver
+        .schema()
+        .resolve_type(&column.ty_str, btree.is_strict)
+    {
+        if resolved.is_domain() {
+            for td in &resolved.chain {
+                for dc in &td.domain_checks {
+                    let rewritten =
+                        crate::schema::rewrite_value_to_column(&dc.check, new_column_name);
+                    all_checks.push((dc.name.clone(), rewritten));
+                }
+            }
+        }
+    }
+
+    if all_checks.is_empty() {
         return Ok(());
     }
 
@@ -584,8 +605,8 @@ fn emit_add_column_check_validation(
     });
 
     // Table has rows -- evaluate each CHECK constraint with the default value substituted.
-    for (constraint_name, check_expr) in &check_exprs {
-        let mut substituted = (*check_expr).clone();
+    for (constraint_name, check_expr) in &all_checks {
+        let mut substituted = *check_expr.clone();
 
         // Replace references to the new column with the default value expression.
         let _ = walk_expr_mut(
@@ -627,7 +648,7 @@ fn emit_add_column_check_validation(
 
         // CHECK failed -- halt with constraint error.
         let name = match constraint_name {
-            Some(name) => name.as_str().to_string(),
+            Some(name) => name.clone(),
             None => format!("{check_expr}"),
         };
         program.emit_insn(Insn::Halt {
@@ -640,7 +661,7 @@ fn emit_add_column_check_validation(
         program.preassign_label_to_next_insn(check_passed_label);
     }
 
-    program.resolve_label(skip_check_label, program.offset());
+    program.preassign_label_to_next_insn(skip_check_label);
     Ok(())
 }
 
@@ -1291,7 +1312,7 @@ pub fn translate_alter_table(
                         description_reg: None,
                     });
 
-                    program.resolve_label(skip_error_label, program.offset());
+                    program.preassign_label_to_next_insn(skip_error_label);
                 }
 
                 if default_type_mismatch {
@@ -1597,8 +1618,18 @@ pub fn translate_alter_table(
                 true => (false, None),
                 false => {
                     let replacement_column = Column::try_from(&definition)?;
-                    let rewrites_physical_layout = !btree.columns()[column_index].is_generated()
-                        && replacement_column.is_generated();
+                    let old_column = &btree.columns()[column_index];
+                    let becomes_generated =
+                        !old_column.is_generated() && replacement_column.is_generated();
+                    // A change of declared type can change the column's affinity, in
+                    // which case existing on-disk values must be coerced to match the
+                    // new affinity. Without this, the row payload retains the old
+                    // serial type and SQLite's `PRAGMA integrity_check` reports the
+                    // file as corrupt (e.g. "NUMERIC value in <table>.<col>" when
+                    // changing NUMERIC -> TEXT). See issue #3706.
+                    let affinity_changed = old_column.affinity_with_strict(btree.is_strict)
+                        != replacement_column.affinity_with_strict(btree.is_strict);
+                    let rewrites_physical_layout = becomes_generated || affinity_changed;
                     (rewrites_physical_layout, Some(replacement_column))
                 }
             };

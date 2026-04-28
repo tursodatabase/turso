@@ -337,7 +337,7 @@ pub fn plan_subqueries_from_select_plan(
     update_column_used_masks(
         &mut plan.table_references,
         &mut plan.non_from_clause_subqueries,
-    );
+    )?;
     Ok(())
 }
 
@@ -358,14 +358,14 @@ pub fn plan_subqueries_from_where_clause(
         non_from_clause_subqueries,
         table_references,
         resolver,
-        where_clause.iter_mut().map(|t| &mut t.expr),
+        where_clause.iter_mut().map(|term| &mut term.expr),
         connection,
         SubqueryPosition::Where,
         SubqueryOrigin::DmlWhere,
         SubqueryPosition::Where.allow_correlated(),
     )?;
 
-    update_column_used_masks(table_references, non_from_clause_subqueries);
+    update_column_used_masks(table_references, non_from_clause_subqueries)?;
     Ok(())
 }
 
@@ -393,18 +393,18 @@ pub fn plan_subqueries_from_values(
         SubqueryPosition::ResultColumn.allow_correlated(),
     )?;
 
-    update_column_used_masks(table_references, non_from_clause_subqueries);
+    update_column_used_masks(table_references, non_from_clause_subqueries)?;
     Ok(())
 }
 
 /// Compute query plans for subqueries in UPDATE SET clause expressions.
 /// This is used by UPDATE statements where SET clause values contain scalar subqueries.
 /// e.g. `UPDATE t SET col = (SELECT max(id) FROM t2)`
-pub fn plan_subqueries_from_set_clauses(
+pub fn plan_subqueries_from_update_sets(
     program: &mut ProgramBuilder,
     non_from_clause_subqueries: &mut Vec<NonFromClauseSubquery>,
     table_references: &mut TableReferences,
-    set_clauses: &mut [(usize, Box<ast::Expr>)],
+    sets: &mut [ast::Set],
     resolver: &Resolver,
     connection: &Arc<Connection>,
 ) -> Result<()> {
@@ -413,14 +413,14 @@ pub fn plan_subqueries_from_set_clauses(
         non_from_clause_subqueries,
         table_references,
         resolver,
-        set_clauses.iter_mut().map(|(_, expr)| expr.as_mut()),
+        sets.iter_mut().map(|set| set.expr.as_mut()),
         connection,
-        SubqueryPosition::ResultColumn, // SET clause subqueries are similar to result columns
+        SubqueryPosition::ResultColumn,
         SubqueryOrigin::DmlSet,
         SubqueryPosition::ResultColumn.allow_correlated(),
     )?;
 
-    update_column_used_masks(table_references, non_from_clause_subqueries);
+    update_column_used_masks(table_references, non_from_clause_subqueries)?;
     Ok(())
 }
 
@@ -453,7 +453,7 @@ pub fn plan_subqueries_from_returning(
         SubqueryPosition::ResultColumn.allow_correlated(),
     )?;
 
-    update_column_used_masks(table_references, non_from_clause_subqueries);
+    update_column_used_masks(table_references, non_from_clause_subqueries)?;
     Ok(())
 }
 
@@ -568,7 +568,7 @@ fn get_subquery_parser<'a>(
     referenced_tables: &'a mut TableReferences,
     resolver: &'a Resolver,
     connection: &'a Arc<Connection>,
-    get_outer_query_refs: fn(&TableReferences) -> Vec<OuterQueryReference>,
+    get_outer_query_refs: impl Fn(&TableReferences) -> Vec<OuterQueryReference> + 'a,
     position: SubqueryPosition,
     origin: SubqueryOrigin,
     allow_correlated: bool,
@@ -934,8 +934,11 @@ fn recollect_aggregates(plan: &mut SelectPlan, resolver: &Resolver) -> Result<()
 fn update_column_used_masks(
     table_refs: &mut TableReferences,
     subqueries: &mut [NonFromClauseSubquery],
-) {
-    fn propagate_outer_refs_from_select_plan(table_refs: &mut TableReferences, plan: &SelectPlan) {
+) -> Result<()> {
+    fn propagate_outer_refs_from_select_plan(
+        table_refs: &mut TableReferences,
+        plan: &SelectPlan,
+    ) -> Result<()> {
         for child_outer_query_ref in plan
             .table_references
             .outer_query_refs()
@@ -967,37 +970,47 @@ fn update_column_used_masks(
 
         for joined_table in plan.table_references.joined_tables().iter() {
             if let Table::FromClauseSubquery(from_clause_subquery) = &joined_table.table {
-                propagate_outer_refs_from_plan(table_refs, from_clause_subquery.plan.as_ref());
+                propagate_outer_refs_from_plan(table_refs, from_clause_subquery.plan.as_ref())?;
             }
         }
+        Ok(())
     }
 
-    fn propagate_outer_refs_from_plan(table_refs: &mut TableReferences, plan: &Plan) {
+    fn propagate_outer_refs_from_plan(table_refs: &mut TableReferences, plan: &Plan) -> Result<()> {
         match plan {
             Plan::Select(select_plan) => {
-                propagate_outer_refs_from_select_plan(table_refs, select_plan);
+                propagate_outer_refs_from_select_plan(table_refs, select_plan)?;
             }
             Plan::CompoundSelect {
                 left, right_most, ..
             } => {
                 for (select_plan, _) in left.iter() {
-                    propagate_outer_refs_from_select_plan(table_refs, select_plan);
+                    propagate_outer_refs_from_select_plan(table_refs, select_plan)?;
                 }
-                propagate_outer_refs_from_select_plan(table_refs, right_most);
+                propagate_outer_refs_from_select_plan(table_refs, right_most)?;
             }
-            Plan::Delete(_) | Plan::Update(_) => {}
+            Plan::Delete(_) | Plan::Update(_) => {
+                return Err(crate::LimboError::InternalError(
+                    "DELETE/UPDATE plans should not appear in FROM clause subqueries".into(),
+                ));
+            }
         }
+        Ok(())
     }
 
     for subquery in subqueries.iter_mut() {
         let SubqueryState::Unevaluated { plan } = &mut subquery.state else {
-            panic!("subquery has already been evaluated");
+            return Err(crate::LimboError::InternalError(
+                "subquery has already been evaluated".into(),
+            ));
         };
         let Some(child_plan) = plan.as_mut() else {
-            panic!("subquery has no plan");
+            return Err(crate::LimboError::InternalError(
+                "subquery has no plan".into(),
+            ));
         };
 
-        propagate_outer_refs_from_plan(table_refs, child_plan);
+        propagate_outer_refs_from_plan(table_refs, child_plan)?;
     }
 
     // Collect raw plan pointers to avoid cloning while sidestepping borrow rules.
@@ -1014,8 +1027,9 @@ fn update_column_used_masks(
     for plan in from_clause_plans {
         // SAFETY: plans live within table_refs for the duration of this function.
         let plan = unsafe { &*plan };
-        propagate_outer_refs_from_plan(table_refs, plan);
+        propagate_outer_refs_from_plan(table_refs, plan)?;
     }
+    Ok(())
 }
 
 /// Recursively pre-materialize all multi-ref CTEs in a plan tree.

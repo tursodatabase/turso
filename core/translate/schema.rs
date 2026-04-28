@@ -732,9 +732,6 @@ fn validate(
         constraints,
     } = &body
     {
-        if options.contains_without_rowid() {
-            bail_parse_error!("WITHOUT ROWID tables are not supported");
-        }
         let column_names: Vec<&str> = columns.iter().map(|c| c.col_name.as_str()).collect();
         for i in 0..columns.len() {
             let col_i = &columns[i];
@@ -863,6 +860,21 @@ fn validate(
                 if let ast::TableConstraint::Check(ref expr) = constraint.constraint {
                     validate_check_types_in_expr(expr, &col_refs, resolver)?;
                 }
+            }
+        }
+
+        let table = create_table(table_name, body, 0)?;
+        if !table.has_rowid {
+            if table.has_autoincrement {
+                bail_parse_error!("AUTOINCREMENT is not allowed on WITHOUT ROWID tables");
+            }
+            if table.primary_key_columns.is_empty() {
+                bail_parse_error!("PRIMARY KEY missing on table {}", table_name);
+            }
+            if table.unique_sets.iter().any(|us| !us.is_primary_key) {
+                bail_parse_error!(
+                    "secondary UNIQUE constraints on WITHOUT ROWID tables are not supported"
+                );
             }
         }
     }
@@ -1229,7 +1241,7 @@ pub fn translate_create_table(
         value: 1,
         p5: 0,
     });
-    program.resolve_label(create_btree_label, program.offset());
+    program.preassign_label_to_next_insn(create_btree_label);
 
     let created_sequence_table = if has_autoincrement
         && resolver.with_schema(database_id, |s| {
@@ -1277,10 +1289,18 @@ pub fn translate_create_table(
     let parse_schema_label = program.allocate_label();
 
     let table_root_reg = program.alloc_register();
+    let btree_flags = match &body {
+        ast::CreateTableBody::ColumnsAndConstraints { options, .. }
+            if options.contains_without_rowid() =>
+        {
+            CreateBTreeFlags::new_index()
+        }
+        _ => CreateBTreeFlags::new_table(),
+    };
     program.emit_insn(Insn::CreateBtree {
         db: database_id,
         root: table_root_reg,
-        flags: CreateBTreeFlags::new_table(),
+        flags: btree_flags,
     });
 
     // Create an automatic index B-tree if needed
@@ -1361,7 +1381,7 @@ pub fn translate_create_table(
         }
     }
 
-    program.resolve_label(parse_schema_label, program.offset());
+    program.preassign_label_to_next_insn(parse_schema_label);
     let schema_version = resolver.with_schema(database_id, |s| s.schema_version);
     program.emit_insn(Insn::SetCookie {
         db: database_id,
@@ -1528,6 +1548,9 @@ fn collect_autoindexes(
 
     // include UNIQUE singles, include PK single only if not rowid alias
     for us in table.unique_sets.iter().filter(|us| us.columns.len() == 1) {
+        if us.is_primary_key && !table.has_rowid {
+            continue;
+        }
         let (col_name, _sort) = us.columns.first().unwrap();
         let Some((_pos, col)) = table.get_column(col_name) else {
             bail_parse_error!("Column {col_name} not found in table {}", table.name);
@@ -1546,6 +1569,9 @@ fn collect_autoindexes(
     }
 
     for _us in table.unique_sets.iter().filter(|us| us.columns.len() > 1) {
+        if !table.has_rowid && _us.is_primary_key {
+            continue;
+        }
         regs.push(program.alloc_register());
     }
     if regs.is_empty() {
@@ -1857,7 +1883,7 @@ pub fn translate_drop_table(
             None,
             SQLITE_TABLEID,
         )?;
-        program.resolve_label(skip_cdc_label, program.offset());
+        program.preassign_label_to_next_insn(skip_cdc_label);
     }
     program.emit_insn(Insn::Delete {
         cursor_id: sqlite_schema_cursor_id_0,
@@ -1865,7 +1891,7 @@ pub fn translate_drop_table(
         is_part_of_update: false,
     });
 
-    program.resolve_label(next_label, program.offset());
+    program.preassign_label_to_next_insn(next_label);
     program.emit_insn(Insn::Next {
         cursor_id: sqlite_schema_cursor_id_0,
         pc_if_next: metadata_loop,
@@ -1968,13 +1994,13 @@ pub fn translate_drop_table(
                 program.emit_insn(Insn::Goto {
                     target_pc: temp_next_label,
                 });
-                program.resolve_label(temp_delete_label, program.offset());
+                program.preassign_label_to_next_insn(temp_delete_label);
                 program.emit_insn(Insn::Delete {
                     cursor_id: temp_cursor,
                     table_name: SQLITE_TABLEID.to_string(),
                     is_part_of_update: false,
                 });
-                program.resolve_label(temp_next_label, program.offset());
+                program.preassign_label_to_next_insn(temp_next_label);
                 program.emit_insn(Insn::Next {
                     cursor_id: temp_cursor,
                     pc_if_next: temp_loop_label,
@@ -2127,7 +2153,7 @@ pub fn translate_drop_table(
             table_name: "scratch_table".to_string(),
         });
 
-        program.resolve_label(next_label, program.offset());
+        program.preassign_label_to_next_insn(next_label);
         program.emit_insn(Insn::Next {
             cursor_id: sqlite_schema_cursor_id_1,
             pc_if_next: copy_schema_to_temp_table_loop,
@@ -2135,7 +2161,7 @@ pub fn translate_drop_table(
         program.preassign_label_to_next_insn(copy_schema_to_temp_table_loop_end_label);
         // End loop to copy over row id's from the schema table for rows that have the same root page as the one that was moved
 
-        program.resolve_label(if_not_label, program.offset());
+        program.preassign_label_to_next_insn(if_not_label);
 
         // 5. Open a write cursor to the schema table and re-insert the records placed in the ephemeral table but insert the correct root page now
         program.emit_insn(Insn::OpenWrite {
@@ -2193,7 +2219,7 @@ pub fn translate_drop_table(
             table_name: SQLITE_TABLEID.to_string(),
         });
 
-        program.resolve_label(next_label, program.offset());
+        program.preassign_label_to_next_insn(next_label);
         program.emit_insn(Insn::Next {
             cursor_id: ephemeral_cursor_id,
             pc_if_next: copy_temp_table_to_schema_loop,
@@ -2247,7 +2273,7 @@ pub fn translate_drop_table(
             is_part_of_update: false,
         });
 
-        program.resolve_label(continue_loop_label, program.offset());
+        program.preassign_label_to_next_insn(continue_loop_label);
         program.emit_insn(Insn::Next {
             cursor_id: seq_cursor_id,
             pc_if_next: loop_start_label,
@@ -2301,7 +2327,7 @@ pub fn translate_drop_table(
             is_part_of_update: false,
         });
 
-        program.resolve_label(continue_ver_label, program.offset());
+        program.preassign_label_to_next_insn(continue_ver_label);
         program.emit_insn(Insn::Next {
             cursor_id: ver_cursor_id,
             pc_if_next: ver_loop_start_label,
@@ -2514,12 +2540,19 @@ pub fn translate_create_type(
         bail_parse_error!("type {normalized_name} already exists");
     }
 
-    // Validate encode/decode expressions for safety
-    if let Some(ref encode) = body.encode {
-        validate_type_expr(encode, "ENCODE", resolver)?;
-    }
-    if let Some(ref decode) = body.decode {
-        validate_type_expr(decode, "DECODE", resolver)?;
+    // Validate encode/decode expressions for safety (only for custom types)
+    if let ast::CreateTypeBody::CustomType {
+        ref encode,
+        ref decode,
+        ..
+    } = body
+    {
+        if let Some(ref encode) = encode {
+            validate_type_expr(encode, "ENCODE", resolver)?;
+        }
+        if let Some(ref decode) = decode {
+            validate_type_expr(decode, "DECODE", resolver)?;
+        }
     }
 
     // Build canonical SQL (without IF NOT EXISTS) for persistence
@@ -2535,48 +2568,92 @@ fn build_create_type_sql(name: &str, body: &ast::CreateTypeBody) -> String {
         s.replace('\'', "''")
     }
 
-    let mut sql = if body.params.is_empty() {
-        format!(
-            "CREATE TYPE {} BASE {}",
-            quote_ident(name),
-            quote_ident(&body.base)
-        )
-    } else {
-        let params: Vec<String> = body
-            .params
-            .iter()
-            .map(|p| match &p.ty {
-                Some(ty) => format!("{} {}", quote_ident(&p.name), ty),
-                None => quote_ident(&p.name),
-            })
-            .collect();
-        format!(
-            "CREATE TYPE {}({}) BASE {}",
-            quote_ident(name),
-            params.join(", "),
-            quote_ident(&body.base)
-        )
-    };
-    if let Some(ref encode) = body.encode {
-        sql.push_str(&format!(" ENCODE {encode}"));
-    }
-    if let Some(ref decode) = body.decode {
-        sql.push_str(&format!(" DECODE {decode}"));
-    }
-    if let Some(ref default) = body.default {
-        sql.push_str(&format!(" DEFAULT {default}"));
-    }
-    for op in &body.operators {
-        match &op.func_name {
-            Some(func_name) => sql.push_str(&format!(
-                " OPERATOR '{}' {}",
-                quote_string_literal(&op.op),
-                quote_ident(func_name)
-            )),
-            None => sql.push_str(&format!(" OPERATOR '{}'", quote_string_literal(&op.op),)),
+    match body {
+        ast::CreateTypeBody::CustomType {
+            params,
+            base,
+            encode,
+            decode,
+            default,
+            operators,
+        } => {
+            let mut sql = if params.is_empty() {
+                format!(
+                    "CREATE TYPE {} BASE {}",
+                    quote_ident(name),
+                    quote_ident(base)
+                )
+            } else {
+                let param_strs: Vec<String> = params
+                    .iter()
+                    .map(|p| match &p.ty {
+                        Some(ty) => format!("{} {}", quote_ident(&p.name), ty),
+                        None => quote_ident(&p.name),
+                    })
+                    .collect();
+                format!(
+                    "CREATE TYPE {}({}) BASE {}",
+                    quote_ident(name),
+                    param_strs.join(", "),
+                    quote_ident(base)
+                )
+            };
+            if let Some(ref encode) = encode {
+                sql.push_str(&format!(" ENCODE {encode}"));
+            }
+            if let Some(ref decode) = decode {
+                sql.push_str(&format!(" DECODE {decode}"));
+            }
+            if let Some(ref default) = default {
+                sql.push_str(&format!(" DEFAULT {default}"));
+            }
+            for op in operators {
+                match &op.func_name {
+                    Some(func_name) => sql.push_str(&format!(
+                        " OPERATOR '{}' {}",
+                        quote_string_literal(&op.op),
+                        quote_ident(func_name)
+                    )),
+                    None => sql.push_str(&format!(" OPERATOR '{}'", quote_string_literal(&op.op))),
+                }
+            }
+            sql
+        }
+        ast::CreateTypeBody::Struct(fields) => {
+            let field_strs: Vec<String> = fields
+                .iter()
+                .map(|f| {
+                    format!(
+                        "{} {}",
+                        quote_ident(f.name.as_str()),
+                        quote_ident(&f.field_type.name)
+                    )
+                })
+                .collect();
+            format!(
+                "CREATE TYPE {} AS STRUCT({})",
+                quote_ident(name),
+                field_strs.join(", ")
+            )
+        }
+        ast::CreateTypeBody::Union(fields) => {
+            let variant_strs: Vec<String> = fields
+                .iter()
+                .map(|f| {
+                    format!(
+                        "{} {}",
+                        quote_ident(f.name.as_str()),
+                        quote_ident(&f.field_type.name)
+                    )
+                })
+                .collect();
+            format!(
+                "CREATE TYPE {} AS UNION({})",
+                quote_ident(name),
+                variant_strs.join(", ")
+            )
         }
     }
-    sql
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2714,7 +2791,7 @@ pub fn translate_drop_type(
 
     // Check if any other type/domain depends on this type
     for (name, td) in resolver.schema().type_registry.iter() {
-        if normalize_ident(&td.base) == normalized_name {
+        if normalize_ident(td.base()) == normalized_name {
             bail_parse_error!(
                 "cannot drop type {}: type {} depends on it",
                 normalized_name,
@@ -2773,7 +2850,7 @@ pub fn translate_drop_type(
         is_part_of_update: false,
     });
 
-    program.resolve_label(skip_delete_label, program.offset());
+    program.preassign_label_to_next_insn(skip_delete_label);
 
     program.emit_insn(Insn::Next {
         cursor_id: types_cursor_id,

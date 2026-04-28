@@ -735,7 +735,7 @@ func (c *tursoDbConnection) executeFully(ctx context.Context, stmt TursoStatemen
 }
 
 // bindArgs binds ordered and named values to a statement.
-// Named values are resolved via turso_statement_named_position, otherwise ordinal positions are used (1-based).
+// Named values are resolved via turso_statement_parameter_name, otherwise ordinal positions are used (1-based).
 func bindArgs(stmt TursoStatement, args []driver.NamedValue) error {
 	// Validate number of inputs if no named args present
 	if len(args) > 0 {
@@ -753,14 +753,36 @@ func bindArgs(stmt TursoStatement, args []driver.NamedValue) error {
 			}
 		}
 	}
+
+	// Build bare-name → position map from statement metadata.
+	// Go's database/sql strips the SQL prefix from named parameters:
+	// sql.Named("a", v) arrives as Name="a", but the statement knows
+	// the full name (e.g. ":a", "@a", "$a"). We strip the prefix from
+	// the statement's parameter names to build the lookup table.
+	var nameMap map[string]int
+	paramCount := int(turso_statement_parameters_count(stmt))
+	if paramCount > 0 {
+		nameMap = make(map[string]int, paramCount)
+		for i := 1; i <= paramCount; i++ {
+			pname := turso_statement_parameter_name(stmt, i)
+			if pname == "" {
+				continue
+			}
+			bare := strings.TrimLeft(pname, ":@$")
+			if bare != "" {
+				nameMap[bare] = i
+			}
+		}
+	}
+
 	for idx, nv := range args {
 		pos := idx + 1
 		if nv.Name != "" {
-			np := int(turso_statement_named_position(stmt, nv.Name))
-			if np <= 0 {
+			p, ok := nameMap[nv.Name]
+			if !ok {
 				return fmt.Errorf("turso: unknown named parameter %q", nv.Name)
 			}
-			pos = np
+			pos = p
 		} else if nv.Ordinal > 0 {
 			pos = nv.Ordinal
 		}

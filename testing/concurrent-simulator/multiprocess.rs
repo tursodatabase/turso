@@ -3,14 +3,14 @@
 //! Spawns N worker processes, each opening the same on-disk database with real
 //! filesystem I/O. Reuses the existing workload generation and property
 //! validation infrastructure while exercising the full multiprocess coordination
-//! stack (OFD locks, .tshm shared memory, WAL reader slots, MVCC tx slots).
+//! stack (shared byte-range locks, .tshm shared memory, WAL reader slots, MVCC
+//! tx slots).
 
 use serde::Serialize;
 use std::fs::{File, create_dir_all};
 use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -19,7 +19,7 @@ use rand::{Rng, RngCore, SeedableRng};
 use rand_chacha::ChaCha8Rng;
 use sql_generation::generation::Opts;
 use tracing::{debug, error, info};
-use turso_core::{Database, DatabaseOpts, LimboError, OpenFlags, UnixIO};
+use turso_core::{Database, DatabaseOpts, LimboError, OpenFlags};
 
 use crate::chaotic_elle::{ChaoticWorkload, ChaoticWorkloadProfile};
 use crate::operations::{FiberState, OpResult, Operation, TxMode};
@@ -28,7 +28,10 @@ use crate::protocol::{
     WorkerCommand, WorkerResponse, WorkerSharedWalSnapshot, WorkerStartupTelemetry,
 };
 use crate::workloads::{Workload, WorkloadContext};
-use crate::{SimulatorState, Stats, StepResult, create_initial_indexes, create_initial_schema};
+use crate::{
+    SimulatorState, Stats, StepResult, create_initial_indexes, create_initial_schema,
+    multiprocess_platform_io,
+};
 
 /// Configuration for the multiprocess simulator.
 pub struct MultiprocessOpts {
@@ -249,8 +252,8 @@ impl MultiprocessWhopper {
             .expect("system clock is before UNIX_EPOCH")
             .as_nanos();
         let counter = PATH_COUNTER.fetch_add(1, AtomicOrdering::Relaxed);
-        let db_path = PathBuf::from(format!(
-            "/tmp/whopper-mp-{}-{}-{}-{}.db",
+        let db_path = std::env::temp_dir().join(format!(
+            "whopper-mp-{}-{}-{}-{}.db",
             seed,
             std::process::id(),
             unique_suffix,
@@ -260,7 +263,7 @@ impl MultiprocessWhopper {
 
         // Bootstrap schema using real I/O
         {
-            let io = Arc::new(UnixIO::new()?);
+            let io = multiprocess_platform_io()?;
             let db = Database::open_file_with_flags(
                 io,
                 db_path.to_str().unwrap(),
@@ -1255,7 +1258,19 @@ fn send_command(process: &mut WorkerProcessHandle, cmd: &WorkerCommand) -> anyho
 
 /// Receive a response from a worker.
 fn recv_response(process: &mut WorkerProcessHandle) -> anyhow::Result<WorkerResponse> {
-    recv_response_timeout(process, Duration::from_secs(10))
+    recv_response_timeout(process, worker_response_timeout())
+}
+
+fn worker_response_timeout() -> Duration {
+    #[cfg(target_os = "windows")]
+    {
+        Duration::from_secs(30)
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        Duration::from_secs(10)
+    }
 }
 
 fn recv_response_timeout(
@@ -1342,6 +1357,22 @@ mod tests {
 
     use super::WorkerProcessHandle;
 
+    fn placeholder_child_command() -> Command {
+        #[cfg(windows)]
+        {
+            let mut cmd = Command::new("cmd");
+            cmd.args(["/C", "timeout", "/T", "60", "/NOBREAK"]);
+            cmd
+        }
+
+        #[cfg(not(windows))]
+        {
+            let mut cmd = Command::new("sleep");
+            cmd.arg("60");
+            cmd
+        }
+    }
+
     fn history_output_path(label: &str) -> std::path::PathBuf {
         std::env::temp_dir().join(format!(
             "turso-whopper-history-{label}-{}-{}.jsonl",
@@ -1360,8 +1391,7 @@ mod tests {
     #[test]
     fn recv_response_times_out_when_worker_stops_responding() {
         let (_tx, rx) = mpsc::channel();
-        let mut child = Command::new("sleep")
-            .arg("60")
+        let mut child = placeholder_child_command()
             .stdin(Stdio::piped())
             .spawn()
             .expect("failed to spawn placeholder child");

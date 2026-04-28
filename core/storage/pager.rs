@@ -3338,13 +3338,14 @@ impl Pager {
 
                             let wal_pages: Vec<PageRef> = pages
                                 .iter()
-                                .map(|p| {
+                                .map(|p| -> Result<PageRef> {
+                                    self.subjournal_page_if_required(p)?;
                                     // Set write_pending on all pages before WAL write so callback can
                                     // detect mid-write modifications.
                                     p.set_write_pending();
-                                    p.to_page()
+                                    Ok(p.to_page())
                                 })
-                                .collect();
+                                .collect::<Result<Vec<_>>>()?;
                             let c = wal.append_frames_vectored(wal_pages, page_sz)?;
 
                             if c.succeeded() {
@@ -5504,7 +5505,7 @@ mod ptrmap_tests {
     }
 }
 
-#[cfg(all(test, feature = "fs", unix, target_pointer_width = "64"))]
+#[cfg(all(test, feature = "fs", host_shared_wal))]
 mod checkpoint_phase_tests {
     use super::*;
     use crate::io::{PlatformIO, IO};
