@@ -584,8 +584,8 @@ pub fn insn_to_row(
                         name
                     }
                     CursorType::BTreeIndex(index) => {
-                        let name = &index.columns.get(*column).expect("column index out of bounds").name;
-                        Some(name)
+                        let name = index.columns.get(*column).map(|c| &c.name);
+                        name
                     }
                     CursorType::MaterializedView(table, _) => {
                         let name = table.columns().get(*column).and_then(|v| v.name.as_ref());
@@ -594,7 +594,10 @@ pub fn insn_to_row(
                     CursorType::Pseudo(_) => None,
                     CursorType::Sorter => None,
                     CursorType::IndexMethod(..) => None,
-                    CursorType::VirtualTable(v) => v.columns.get(*column).expect("column index out of bounds").name.as_ref(),
+                    CursorType::VirtualTable(v) => {
+                        let name = v.columns.get(*column).and_then(|c| c.name.as_ref());
+                        name
+}
                 };
                 (
                     "Column",
