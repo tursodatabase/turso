@@ -1,4 +1,8 @@
-use std::sync::{atomic::Ordering, Arc};
+use std::{
+    cell::RefCell,
+    sync::{atomic::Ordering, Arc},
+    time::{Duration, Instant},
+};
 
 use crate::error::LimboError;
 use crate::io::{Buffer, Completion, CompletionGroup, WriteBatch as IOWriteBatch};
@@ -401,6 +405,7 @@ pub(crate) struct VacuumTargetBuildContext {
     fast_created_indexes: Vec<usize>,
     /// Triggers, views, and rootpage = 0 objects
     post_data_entries: Vec<usize>,
+    timing: VacuumTargetTimingState,
 }
 
 pub(crate) struct VacuumFastIndexCopy {
@@ -419,6 +424,7 @@ impl VacuumTargetBuildContext {
             indexes_to_create: Vec::new(),
             fast_created_indexes: Vec::new(),
             post_data_entries: Vec::new(),
+            timing: VacuumTargetTimingState::new(VacuumTargetTimingPhase::Init),
         }
     }
 
@@ -566,6 +572,44 @@ pub(crate) enum VacuumTargetBuildPhase {
     Done,
 }
 
+impl VacuumTargetBuildPhase {
+    fn timing_phase(&self) -> VacuumTargetTimingPhase {
+        match self {
+            Self::Init => VacuumTargetTimingPhase::Init,
+            Self::CollectSchemaRows { .. } => VacuumTargetTimingPhase::CollectSchema,
+            Self::PrepareCreateTable { .. } | Self::StepCreateTable { .. } => {
+                VacuumTargetTimingPhase::CreateTables
+            }
+            Self::PrepareFastCopyIndexCreate { .. } | Self::StepFastCopyIndexCreate { .. } => {
+                VacuumTargetTimingPhase::CreateFastIndexes
+            }
+            Self::CopyRows { .. } | Self::StepTargetInsert { .. } => {
+                VacuumTargetTimingPhase::CopyRowsSql
+            }
+            Self::StartCopyTable { .. }
+            | Self::RewindFastTableCopy { .. }
+            | Self::SeekEndFastTableCopy { .. }
+            | Self::CopyFastTableRows { .. }
+            | Self::InsertFastTableRow { .. }
+            | Self::AdvanceFastTableSource { .. } => VacuumTargetTimingPhase::CopyTableFast,
+            Self::StartFastIndexCopy { .. }
+            | Self::RewindFastIndexCopy { .. }
+            | Self::SeekEndFastIndexCopy { .. }
+            | Self::CopyFastIndexRows { .. }
+            | Self::InsertFastIndexRow { .. }
+            | Self::AdvanceFastIndexSource { .. } => VacuumTargetTimingPhase::CopyIndexFast,
+            Self::PrepareCreateIndex { .. } | Self::StepCreateIndex { .. } => {
+                VacuumTargetTimingPhase::CreateIndexesSql
+            }
+            Self::PreparePostData { .. } | Self::StepPostData { .. } => {
+                VacuumTargetTimingPhase::PostData
+            }
+            Self::FinalizeTargetHeader => VacuumTargetTimingPhase::FinalizeHeader,
+            Self::Done => VacuumTargetTimingPhase::Commit,
+        }
+    }
+}
+
 /// Build a compacted vacuum target database.
 ///
 /// This is an async state machine implementation that yields on I/O operations.
@@ -591,6 +635,7 @@ pub(crate) fn vacuum_target_build_step(
 ) -> Result<crate::IOResult<()>> {
     loop {
         let current_phase = std::mem::take(&mut state.phase);
+        state.timing.observe_phase(current_phase.timing_phase());
 
         match current_phase {
             VacuumTargetBuildPhase::Init => {
@@ -1466,6 +1511,9 @@ pub(crate) fn vacuum_target_build_step(
             VacuumTargetBuildPhase::Done => {
                 // Commit the target transaction started in Init phase.
                 state.target_conn.execute("COMMIT")?;
+                store_last_vacuum_target_timing(
+                    state.timing.finish(VacuumTargetTimingPhase::Commit),
+                );
                 return Ok(crate::IOResult::Done(()));
             }
         }
@@ -1847,6 +1895,255 @@ struct VacuumInPlaceCleanupState {
     vacuum_lock_held: bool,
 }
 
+const VACUUM_TIMING_PHASE_COUNT: usize = 14;
+
+#[derive(Debug, Clone)]
+pub struct VacuumTimingReport {
+    pub entries: Vec<VacuumTimingEntry>,
+    pub total: Duration,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct VacuumTimingEntry {
+    pub phase: &'static str,
+    pub duration: Duration,
+}
+
+thread_local! {
+    static LAST_VACUUM_TIMING: RefCell<Option<VacuumTimingReport>> = const { RefCell::new(None) };
+    static LAST_VACUUM_TARGET_TIMING: RefCell<Option<VacuumTimingReport>> = const { RefCell::new(None) };
+}
+
+pub fn take_last_vacuum_timing() -> Option<VacuumTimingReport> {
+    LAST_VACUUM_TIMING.with(|timing| timing.borrow_mut().take())
+}
+
+pub fn take_last_vacuum_target_timing() -> Option<VacuumTimingReport> {
+    LAST_VACUUM_TARGET_TIMING.with(|timing| timing.borrow_mut().take())
+}
+
+pub(crate) fn store_last_vacuum_timing(report: VacuumTimingReport) {
+    LAST_VACUUM_TIMING.with(|timing| {
+        *timing.borrow_mut() = Some(report);
+    });
+}
+
+fn store_last_vacuum_target_timing(report: VacuumTimingReport) {
+    LAST_VACUUM_TARGET_TIMING.with(|timing| {
+        *timing.borrow_mut() = Some(report);
+    });
+}
+
+#[repr(usize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VacuumTimingPhase {
+    Preflight = 0,
+    BeginSourceTx = 1,
+    ReadSourceMetadata = 2,
+    TargetBuild = 3,
+    CaptureTargetMetadata = 4,
+    BeginTempReadTx = 5,
+    InitSourceWalHeader = 6,
+    ReadTempBatch = 7,
+    WriteWalBatch = 8,
+    SyncSourceWal = 9,
+    PublishWalCommit = 10,
+    Checkpoint = 11,
+    InstallCommittedImage = 12,
+    Done = 13,
+}
+
+impl VacuumTimingPhase {
+    const REPORT_PHASES: [Self; VACUUM_TIMING_PHASE_COUNT - 1] = [
+        Self::Preflight,
+        Self::BeginSourceTx,
+        Self::ReadSourceMetadata,
+        Self::TargetBuild,
+        Self::CaptureTargetMetadata,
+        Self::BeginTempReadTx,
+        Self::InitSourceWalHeader,
+        Self::ReadTempBatch,
+        Self::WriteWalBatch,
+        Self::SyncSourceWal,
+        Self::PublishWalCommit,
+        Self::Checkpoint,
+        Self::InstallCommittedImage,
+    ];
+
+    fn index(self) -> usize {
+        self as usize
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            Self::Preflight => "preflight",
+            Self::BeginSourceTx => "begin_source_tx",
+            Self::ReadSourceMetadata => "read_source_metadata",
+            Self::TargetBuild => "target_build",
+            Self::CaptureTargetMetadata => "capture_target_metadata",
+            Self::BeginTempReadTx => "begin_temp_read_tx",
+            Self::InitSourceWalHeader => "init_source_wal_header",
+            Self::ReadTempBatch => "read_temp_batch",
+            Self::WriteWalBatch => "write_wal_batch",
+            Self::SyncSourceWal => "sync_source_wal",
+            Self::PublishWalCommit => "publish_wal_commit",
+            Self::Checkpoint => "checkpoint",
+            Self::InstallCommittedImage => "install_committed_image",
+            Self::Done => "done",
+        }
+    }
+}
+
+struct VacuumTimingState {
+    active_phase: VacuumTimingPhase,
+    active_since: Instant,
+    durations: [Duration; VACUUM_TIMING_PHASE_COUNT],
+}
+
+impl VacuumTimingState {
+    fn new(active_phase: VacuumTimingPhase) -> Self {
+        Self {
+            active_phase,
+            active_since: Instant::now(),
+            durations: [Duration::ZERO; VACUUM_TIMING_PHASE_COUNT],
+        }
+    }
+
+    fn observe_phase(&mut self, phase: VacuumTimingPhase) {
+        if phase == self.active_phase {
+            return;
+        }
+
+        let now = Instant::now();
+        self.durations[self.active_phase.index()] += now.duration_since(self.active_since);
+        self.active_phase = phase;
+        self.active_since = now;
+    }
+
+    fn finish(&mut self, phase: VacuumTimingPhase) -> VacuumTimingReport {
+        self.observe_phase(phase);
+        if self.active_phase != VacuumTimingPhase::Done {
+            let now = Instant::now();
+            self.durations[self.active_phase.index()] += now.duration_since(self.active_since);
+            self.active_since = now;
+        }
+
+        let entries: Vec<_> = VacuumTimingPhase::REPORT_PHASES
+            .into_iter()
+            .map(|phase| VacuumTimingEntry {
+                phase: phase.name(),
+                duration: self.durations[phase.index()],
+            })
+            .filter(|entry| !entry.duration.is_zero())
+            .collect();
+        let total = entries
+            .iter()
+            .fold(Duration::ZERO, |acc, entry| acc + entry.duration);
+        VacuumTimingReport { entries, total }
+    }
+}
+
+const VACUUM_TARGET_TIMING_PHASE_COUNT: usize = 11;
+
+#[repr(usize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VacuumTargetTimingPhase {
+    Init = 0,
+    CollectSchema = 1,
+    CreateTables = 2,
+    CreateFastIndexes = 3,
+    CopyRowsSql = 4,
+    CopyTableFast = 5,
+    CopyIndexFast = 6,
+    CreateIndexesSql = 7,
+    PostData = 8,
+    FinalizeHeader = 9,
+    Commit = 10,
+}
+
+impl VacuumTargetTimingPhase {
+    const REPORT_PHASES: [Self; VACUUM_TARGET_TIMING_PHASE_COUNT] = [
+        Self::Init,
+        Self::CollectSchema,
+        Self::CreateTables,
+        Self::CreateFastIndexes,
+        Self::CopyRowsSql,
+        Self::CopyTableFast,
+        Self::CopyIndexFast,
+        Self::CreateIndexesSql,
+        Self::PostData,
+        Self::FinalizeHeader,
+        Self::Commit,
+    ];
+
+    fn index(self) -> usize {
+        self as usize
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            Self::Init => "target.init",
+            Self::CollectSchema => "target.collect_schema",
+            Self::CreateTables => "target.create_tables",
+            Self::CreateFastIndexes => "target.create_fast_indexes",
+            Self::CopyRowsSql => "target.copy_rows_sql",
+            Self::CopyTableFast => "target.copy_table_fast",
+            Self::CopyIndexFast => "target.copy_index_fast",
+            Self::CreateIndexesSql => "target.create_indexes_sql",
+            Self::PostData => "target.post_data",
+            Self::FinalizeHeader => "target.finalize_header",
+            Self::Commit => "target.commit",
+        }
+    }
+}
+
+struct VacuumTargetTimingState {
+    active_phase: VacuumTargetTimingPhase,
+    active_since: Instant,
+    durations: [Duration; VACUUM_TARGET_TIMING_PHASE_COUNT],
+}
+
+impl VacuumTargetTimingState {
+    fn new(active_phase: VacuumTargetTimingPhase) -> Self {
+        Self {
+            active_phase,
+            active_since: Instant::now(),
+            durations: [Duration::ZERO; VACUUM_TARGET_TIMING_PHASE_COUNT],
+        }
+    }
+
+    fn observe_phase(&mut self, phase: VacuumTargetTimingPhase) {
+        if phase == self.active_phase {
+            return;
+        }
+
+        let now = Instant::now();
+        self.durations[self.active_phase.index()] += now.duration_since(self.active_since);
+        self.active_phase = phase;
+        self.active_since = now;
+    }
+
+    fn finish(&mut self, phase: VacuumTargetTimingPhase) -> VacuumTimingReport {
+        self.observe_phase(phase);
+        let now = Instant::now();
+        self.durations[self.active_phase.index()] += now.duration_since(self.active_since);
+        self.active_since = now;
+
+        let entries: Vec<_> = VacuumTargetTimingPhase::REPORT_PHASES
+            .into_iter()
+            .map(|phase| VacuumTimingEntry {
+                phase: phase.name(),
+                duration: self.durations[phase.index()],
+            })
+            .filter(|entry| !entry.duration.is_zero())
+            .collect();
+        let total = entries
+            .iter()
+            .fold(Duration::ZERO, |acc, entry| acc + entry.duration);
+        VacuumTimingReport { entries, total }
+    }
+}
+
 /// Phases for the in-place VACUUM state machine.
 enum VacuumInPlacePhase {
     /// Validate preconditions (auto_commit, active statements, readonly, memory,
@@ -1936,6 +2233,27 @@ impl Default for VacuumInPlacePhase {
     }
 }
 
+impl VacuumInPlacePhase {
+    fn timing_phase(&self) -> VacuumTimingPhase {
+        match self {
+            Self::Preflight => VacuumTimingPhase::Preflight,
+            Self::BeginSourceTx => VacuumTimingPhase::BeginSourceTx,
+            Self::ReadSourceMetadata => VacuumTimingPhase::ReadSourceMetadata,
+            Self::TargetBuild { .. } => VacuumTimingPhase::TargetBuild,
+            Self::CaptureTargetMetadata { .. } => VacuumTimingPhase::CaptureTargetMetadata,
+            Self::BeginTempReadTx { .. } => VacuumTimingPhase::BeginTempReadTx,
+            Self::InitSourceWalHeader { .. } => VacuumTimingPhase::InitSourceWalHeader,
+            Self::ReadTempBatch { .. } => VacuumTimingPhase::ReadTempBatch,
+            Self::WriteWalBatch { .. } => VacuumTimingPhase::WriteWalBatch,
+            Self::SyncSourceWal { .. } => VacuumTimingPhase::SyncSourceWal,
+            Self::PublishWalCommit { .. } => VacuumTimingPhase::PublishWalCommit,
+            Self::Checkpoint => VacuumTimingPhase::Checkpoint,
+            Self::InstallCommittedImage => VacuumTimingPhase::InstallCommittedImage,
+            Self::Done => VacuumTimingPhase::Done,
+        }
+    }
+}
+
 /// Holds the context for the in-place VACUUM operation across async yields.
 pub(crate) struct VacuumInPlaceOpContext {
     /// Database index being vacuumed.
@@ -1948,6 +2266,8 @@ pub(crate) struct VacuumInPlaceOpContext {
     committed_image: Option<VacuumCommittedImageMeta>,
     /// Independent cleanup flags that survive `std::mem::take` on `phase`.
     cleanup_state: VacuumInPlaceCleanupState,
+    /// Wall-clock phase timing used by the benchmark harness.
+    timing: VacuumTimingState,
 }
 
 impl VacuumInPlaceOpContext {
@@ -1957,6 +2277,7 @@ impl VacuumInPlaceOpContext {
             phase: VacuumInPlacePhase::Preflight,
             committed_image: None,
             cleanup_state: VacuumInPlaceCleanupState::default(),
+            timing: VacuumTimingState::new(VacuumTimingPhase::Preflight),
         }
     }
 
@@ -1967,7 +2288,12 @@ impl VacuumInPlaceOpContext {
             &mut self.phase,
             &mut self.committed_image,
             &mut self.cleanup_state,
+            &mut self.timing,
         )
+    }
+
+    pub(crate) fn finish_timing(&mut self) -> VacuumTimingReport {
+        self.timing.finish(self.phase.timing_phase())
     }
 
     pub(crate) fn cleanup(self, connection: &Arc<Connection>) -> Result<()> {
@@ -1976,6 +2302,7 @@ impl VacuumInPlaceOpContext {
             phase,
             committed_image: _,
             cleanup_state,
+            timing: _,
         } = self;
         vacuum_in_place_cleanup(connection, db, phase, cleanup_state)
     }
@@ -2265,11 +2592,13 @@ fn vacuum_in_place_step(
     phase: &mut VacuumInPlacePhase,
     committed_image: &mut Option<VacuumCommittedImageMeta>,
     cleanup_state: &mut VacuumInPlaceCleanupState,
+    timing: &mut VacuumTimingState,
 ) -> Result<InsnFunctionStepResult> {
     let source_pager = connection.get_pager_from_database_index(&db)?;
 
     loop {
         let current_phase = std::mem::take(phase);
+        timing.observe_phase(current_phase.timing_phase());
         match current_phase {
             VacuumInPlacePhase::Preflight => {
                 // 1. Must be in auto-commit mode (no explicit transaction).
@@ -3004,7 +3333,7 @@ mod tests {
     use crate::schema::Schema;
     use crate::storage::encryption::{CipherMode, EncryptionKey};
     use crate::storage::pager::Page;
-    use crate::util::{exprs_are_equivalent, IOExt};
+    use crate::util::IOExt;
     use crate::{
         Buffer, Clock, Completion, DatabaseOpts, File, MemoryIO, MonotonicInstant, OpenFlags,
         WallClockInstant, IO,

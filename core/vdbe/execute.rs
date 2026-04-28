@@ -38,7 +38,7 @@ use crate::vdbe::hash_table::{
 };
 use crate::vdbe::insn::InsertFlags;
 use crate::vdbe::metrics::HashJoinMetrics;
-use crate::vdbe::vacuum::VacuumInPlaceOpContext;
+use crate::vdbe::vacuum::{store_last_vacuum_timing, VacuumInPlaceOpContext};
 use crate::vdbe::value::ComparisonOp;
 use crate::vdbe::ValueIteratorExt;
 use crate::vdbe::{
@@ -4592,6 +4592,145 @@ pub fn op_row_data(
 
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
+}
+
+fn cursor_pair_mut(
+    cursors: &mut [Option<Cursor>],
+    dest_cursor_id: usize,
+    source_cursor_id: usize,
+) -> Result<(&mut Cursor, &mut Cursor)> {
+    if dest_cursor_id == source_cursor_id {
+        return Err(LimboError::InternalError(
+            "RowCell requires distinct source and destination cursors".to_string(),
+        ));
+    }
+
+    let cursor_count = cursors.len();
+    if dest_cursor_id >= cursor_count || source_cursor_id >= cursor_count {
+        return Err(LimboError::InternalError(format!(
+            "RowCell cursor out of range: dest={dest_cursor_id}, source={source_cursor_id}, cursor_count={cursor_count}"
+        )));
+    }
+
+    if dest_cursor_id < source_cursor_id {
+        let (left, right) = cursors.split_at_mut(source_cursor_id);
+        let dest = left[dest_cursor_id].as_mut().ok_or_else(|| {
+            LimboError::InternalError(format!(
+                "RowCell destination cursor {dest_cursor_id} is not open"
+            ))
+        })?;
+        let source = right[0].as_mut().ok_or_else(|| {
+            LimboError::InternalError(format!(
+                "RowCell source cursor {source_cursor_id} is not open"
+            ))
+        })?;
+        Ok((dest, source))
+    } else {
+        let (left, right) = cursors.split_at_mut(dest_cursor_id);
+        let source = left[source_cursor_id].as_mut().ok_or_else(|| {
+            LimboError::InternalError(format!(
+                "RowCell source cursor {source_cursor_id} is not open"
+            ))
+        })?;
+        let dest = right[0].as_mut().ok_or_else(|| {
+            LimboError::InternalError(format!(
+                "RowCell destination cursor {dest_cursor_id} is not open"
+            ))
+        })?;
+        Ok((dest, source))
+    }
+}
+
+fn concrete_btree_cursor_mut(cursor: &mut Cursor, cursor_id: usize) -> Result<&mut BTreeCursor> {
+    let Cursor::BTree(cursor) = cursor else {
+        return Err(LimboError::InternalError(format!(
+            "RowCell cursor {cursor_id} is not a b-tree cursor"
+        )));
+    };
+
+    let cursor = cursor.as_mut() as &mut dyn Any;
+    cursor.downcast_mut::<BTreeCursor>().ok_or_else(|| {
+        LimboError::InternalError(format!(
+            "RowCell cursor {cursor_id} is not a plain BTreeCursor"
+        ))
+    })
+}
+
+pub fn op_row_cell(
+    program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+    _pager: &Arc<Pager>,
+) -> Result<InsnFunctionStepResult> {
+    load_insn!(
+        RowCell {
+            dest_cursor_id,
+            source_cursor_id,
+            rowid_reg,
+        },
+        insn
+    );
+
+    let (_, dest_cursor_type) = program.cursor_ref.get(*dest_cursor_id).ok_or_else(|| {
+        LimboError::InternalError(format!(
+            "RowCell destination cursor {dest_cursor_id} has no metadata"
+        ))
+    })?;
+    let (_, source_cursor_type) = program.cursor_ref.get(*source_cursor_id).ok_or_else(|| {
+        LimboError::InternalError(format!(
+            "RowCell source cursor {source_cursor_id} has no metadata"
+        ))
+    })?;
+
+    let rowid = rowid_reg
+        .map(|reg| match state.registers[reg].get_value() {
+            Value::Numeric(Numeric::Integer(rowid)) => Ok(*rowid),
+            value => Err(LimboError::InternalError(format!(
+                "RowCell rowid register {reg} must contain an integer, got {value:?}"
+            ))),
+        })
+        .transpose()?;
+
+    let transfer_result = match (dest_cursor_type, source_cursor_type, rowid) {
+        (CursorType::BTreeTable(_), CursorType::BTreeTable(_), Some(rowid)) => {
+            let (dest_cursor, source_cursor) =
+                cursor_pair_mut(&mut state.cursors, *dest_cursor_id, *source_cursor_id)?;
+            let dest_cursor = concrete_btree_cursor_mut(dest_cursor, *dest_cursor_id)?;
+            let source_cursor = concrete_btree_cursor_mut(source_cursor, *source_cursor_id)?;
+            dest_cursor.transfer_current_table_row_from(source_cursor, rowid)?
+        }
+        (CursorType::BTreeIndex(_), CursorType::BTreeIndex(_), None) => {
+            let (dest_cursor, source_cursor) =
+                cursor_pair_mut(&mut state.cursors, *dest_cursor_id, *source_cursor_id)?;
+            let dest_cursor = concrete_btree_cursor_mut(dest_cursor, *dest_cursor_id)?;
+            let source_cursor = concrete_btree_cursor_mut(source_cursor, *source_cursor_id)?;
+            dest_cursor.transfer_current_index_record_from(source_cursor)?
+        }
+        (CursorType::BTreeTable(_), CursorType::BTreeTable(_), None) => {
+            return Err(LimboError::InternalError(
+                "RowCell table transfer requires rowid_reg".to_string(),
+            ));
+        }
+        (CursorType::BTreeIndex(_), CursorType::BTreeIndex(_), Some(_)) => {
+            return Err(LimboError::InternalError(
+                "RowCell index transfer must not specify rowid_reg".to_string(),
+            ));
+        }
+        _ => {
+            return Err(LimboError::InternalError(format!(
+                "RowCell requires matching table/table or index/index cursors, got dest={dest_cursor_type:?}, source={source_cursor_type:?}"
+            )));
+        }
+    };
+
+    match transfer_result {
+        IOResult::Done(()) => {
+            state.record_rows_written(1);
+            state.pc += 1;
+            Ok(InsnFunctionStepResult::Step)
+        }
+        IOResult::IO(io) => Ok(InsnFunctionStepResult::IO(io)),
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -14996,6 +15135,7 @@ pub fn op_vacuum(
 
     match vacuum_state.step(&program.connection) {
         Ok(InsnFunctionStepResult::Step) => {
+            store_last_vacuum_timing(vacuum_state.finish_timing());
             state.op_vacuum_in_place = None;
             state.pc += 1;
             Ok(InsnFunctionStepResult::Step)

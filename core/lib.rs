@@ -1,4 +1,12 @@
 pub mod busy;
+pub mod diagnostics {
+    pub mod vacuum {
+        pub use crate::vdbe::vacuum::{
+            take_last_vacuum_target_timing, take_last_vacuum_timing, VacuumTimingEntry,
+            VacuumTimingReport,
+        };
+    }
+}
 #[cfg(feature = "cli_only")]
 pub mod dbpage;
 #[cfg(any(feature = "fuzz", feature = "bench"))]

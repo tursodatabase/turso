@@ -1077,6 +1077,31 @@ pub fn insn_to_row(
                     target_pc.as_debug_int()
                 ),
             ),
+            Insn::RowCell {
+                dest_cursor_id,
+                source_cursor_id,
+                rowid_reg,
+            } => (
+                "RowCell",
+                *dest_cursor_id as i64,
+                *source_cursor_id as i64,
+                rowid_reg.unwrap_or(0) as i64,
+                Value::build_text(""),
+                0,
+                match rowid_reg {
+                    Some(rowid_reg) => format!(
+                        "{} <- {} rowid=r[{}]",
+                        get_table_or_index_name(*dest_cursor_id),
+                        get_table_or_index_name(*source_cursor_id),
+                        rowid_reg
+                    ),
+                    None => format!(
+                        "{} <- {}",
+                        get_table_or_index_name(*dest_cursor_id),
+                        get_table_or_index_name(*source_cursor_id)
+                    ),
+                },
+            ),
             Insn::DeferredSeek {
                 index_cursor_id,
                 table_cursor_id,

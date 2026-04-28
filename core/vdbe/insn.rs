@@ -855,6 +855,17 @@ pub enum Insn {
         cursor_id: CursorID,
         dest: usize,
     },
+    /// Copy the current cell from source_cursor_id into dest_cursor_id.
+    ///
+    /// For table b-trees, rowid_reg must contain the destination rowid. For
+    /// index b-trees, rowid_reg must be None. Unlike SQLite's OP_RowCell, this
+    /// instruction completes the insert directly instead of preparing a cell
+    /// for a following Insert/IdxInsert.
+    RowCell {
+        dest_cursor_id: CursorID,
+        source_cursor_id: CursorID,
+        rowid_reg: Option<usize>,
+    },
 
     /// Read the rowid of the current row.
     RowId {
@@ -1885,6 +1896,7 @@ impl InsnVariants {
             InsnVariants::String8 => execute::op_string8,
             InsnVariants::Blob => execute::op_blob,
             InsnVariants::RowData => execute::op_row_data,
+            InsnVariants::RowCell => execute::op_row_cell,
             InsnVariants::RowId => execute::op_row_id,
             InsnVariants::IdxRowId => execute::op_idx_row_id,
             InsnVariants::SeekRowid => execute::op_seek_rowid,
@@ -2037,6 +2049,7 @@ impl Insn {
             }
             | Self::Insert { .. }
             | Self::Delete { .. }
+            | Self::RowCell { .. }
             | Self::IdxDelete { .. }
             | Self::OpenWrite { .. }
             | Self::CreateBtree { .. }

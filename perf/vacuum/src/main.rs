@@ -1,4 +1,4 @@
-use anyhow::{Context, Result, bail};
+use anyhow::{bail, Context, Result};
 use clap::Parser;
 use rand::rngs::SmallRng;
 use rand::{Rng, SeedableRng};
@@ -6,6 +6,9 @@ use rusqlite::Connection as SqliteConnection;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
+use turso::core::diagnostics::vacuum::{
+    take_last_vacuum_target_timing, take_last_vacuum_timing, VacuumTimingReport,
+};
 use turso::{Builder, Connection as TursoConnection, Value};
 
 const DEFAULT_SIZES_MB: &[u64] = &[5, 50, 500, 2_048, 5_120];
@@ -158,6 +161,8 @@ struct BackendStats {
     post_page_count: i64,
     page_size: i64,
     vacuum_duration: Duration,
+    vacuum_timing: Option<VacuumTimingReport>,
+    vacuum_target_timing: Option<VacuumTimingReport>,
 }
 
 #[derive(Debug)]
@@ -199,10 +204,11 @@ async fn main() -> Result<()> {
     }
 
     println!(
-        "workload mix: {}% inserts / {}% updates / {}% deletes",
-        INSERT_PERCENT, UPDATE_PERCENT, DELETE_PERCENT
+        "workload mix: {INSERT_PERCENT}% inserts / {UPDATE_PERCENT}% updates / {DELETE_PERCENT}% deletes"
     );
     print_report(&rows);
+    print_turso_vacuum_timing(&rows);
+    print_turso_target_timing(&rows);
     Ok(())
 }
 
@@ -252,12 +258,16 @@ async fn run_case(
             post_page_count: sqlite_post_pages,
             page_size: sqlite.page_size()?,
             vacuum_duration: sqlite_vacuum,
+            vacuum_timing: None,
+            vacuum_target_timing: None,
         },
         turso: BackendStats {
             pre_page_count: turso_pre_pages,
             post_page_count: turso_post_pages,
             page_size: turso.page_size().await?,
-            vacuum_duration: turso_vacuum,
+            vacuum_duration: turso_vacuum.duration,
+            vacuum_timing: turso_vacuum.timing,
+            vacuum_target_timing: turso_vacuum.target_timing,
         },
     })
 }
@@ -334,8 +344,8 @@ impl SqliteBackend {
     fn apply_batch(&self, ops: &[WorkloadOp]) -> Result<()> {
         let tx = self.conn.unchecked_transaction()?;
         {
-            let mut insert_stmt = tx
-                .prepare("INSERT INTO workload(id, hot, payload, note) VALUES(?1, ?2, ?3, ?4)")?;
+            let mut insert_stmt =
+                tx.prepare("INSERT INTO workload(id, hot, payload, note) VALUES(?1, ?2, ?3, ?4)")?;
             let mut update_stmt =
                 tx.prepare("UPDATE workload SET hot = ?2, payload = ?3, note = ?4 WHERE id = ?1")?;
             let mut delete_stmt = tx.prepare("DELETE FROM workload WHERE id = ?1")?;
@@ -401,6 +411,12 @@ struct TursoBackend {
     conn: TursoConnection,
 }
 
+struct TursoVacuumStats {
+    duration: Duration,
+    timing: Option<VacuumTimingReport>,
+    target_timing: Option<VacuumTimingReport>,
+}
+
 impl TursoBackend {
     async fn open(path: &Path) -> Result<Self> {
         let db = Builder::new_local(path.to_str().context("non-utf8 turso path")?)
@@ -451,12 +467,7 @@ impl TursoBackend {
                     payload,
                 } => {
                     insert_stmt
-                        .execute((
-                            *id,
-                            *hot,
-                            Value::Blob(payload.clone()),
-                            note.clone(),
-                        ))
+                        .execute((*id, *hot, Value::Blob(payload.clone()), note.clone()))
                         .await?;
                 }
                 WorkloadOp::Update {
@@ -466,12 +477,7 @@ impl TursoBackend {
                     payload,
                 } => {
                     update_stmt
-                        .execute((
-                            *id,
-                            *hot,
-                            Value::Blob(payload.clone()),
-                            note.clone(),
-                        ))
+                        .execute((*id, *hot, Value::Blob(payload.clone()), note.clone()))
                         .await?;
                 }
                 WorkloadOp::Delete { id } => {
@@ -485,15 +491,22 @@ impl TursoBackend {
     }
 
     async fn prepare_for_vacuum(&self) -> Result<()> {
-        self.run_pragma_row("PRAGMA wal_checkpoint(TRUNCATE)").await?;
+        self.run_pragma_row("PRAGMA wal_checkpoint(TRUNCATE)")
+            .await?;
         self.conn.pragma_update("synchronous", "'FULL'").await?;
         Ok(())
     }
 
-    async fn vacuum(&self) -> Result<Duration> {
+    async fn vacuum(&self) -> Result<TursoVacuumStats> {
+        let _ = take_last_vacuum_timing();
+        let _ = take_last_vacuum_target_timing();
         let start = Instant::now();
         self.conn.execute("VACUUM", ()).await?;
-        Ok(start.elapsed())
+        Ok(TursoVacuumStats {
+            duration: start.elapsed(),
+            timing: take_last_vacuum_timing(),
+            target_timing: take_last_vacuum_target_timing(),
+        })
     }
 
     async fn page_count(&self) -> Result<i64> {
@@ -525,13 +538,7 @@ fn print_report(rows: &[BenchmarkRow]) {
     println!();
     println!(
         "{:<10} {:<8} {:>14} {:>14} {:>14} {:>14} {:>14}",
-        "target",
-        "backend",
-        "pre_pages",
-        "post_pages",
-        "pre_size_mb",
-        "post_size_mb",
-        "vacuum_ms"
+        "target", "backend", "pre_pages", "post_pages", "pre_size_mb", "post_size_mb", "vacuum_ms"
     );
     println!("{}", "-".repeat(98));
     for row in rows {
@@ -556,4 +563,93 @@ fn print_backend_row(target_size_mb: u64, backend: &str, stats: &BackendStats) {
         post_size_mb,
         stats.vacuum_duration.as_secs_f64() * 1000.0,
     );
+}
+
+fn print_turso_vacuum_timing(rows: &[BenchmarkRow]) {
+    if !rows.iter().any(|row| row.turso.vacuum_timing.is_some()) {
+        return;
+    }
+
+    println!();
+    println!("turso vacuum phase timings:");
+    println!(
+        "{:<10} {:<28} {:>14} {:>10}",
+        "target", "phase", "phase_ms", "profile_%"
+    );
+    println!("{}", "-".repeat(68));
+    for row in rows {
+        let Some(timing) = &row.turso.vacuum_timing else {
+            continue;
+        };
+        let total_ms = timing.total.as_secs_f64() * 1000.0;
+        for entry in &timing.entries {
+            let phase_ms = entry.duration.as_secs_f64() * 1000.0;
+            let pct = if total_ms > 0.0 {
+                (phase_ms / total_ms) * 100.0
+            } else {
+                0.0
+            };
+            println!(
+                "{:<10} {:<28} {:>14.2} {:>9.1}%",
+                format!("{}MB", row.target_size_mb),
+                entry.phase,
+                phase_ms,
+                pct,
+            );
+        }
+        println!(
+            "{:<10} {:<28} {:>14.2} {:>9.1}%",
+            format!("{}MB", row.target_size_mb),
+            "profile_total",
+            total_ms,
+            100.0,
+        );
+        println!();
+    }
+}
+
+fn print_turso_target_timing(rows: &[BenchmarkRow]) {
+    if !rows
+        .iter()
+        .any(|row| row.turso.vacuum_target_timing.is_some())
+    {
+        return;
+    }
+
+    println!();
+    println!("turso target-build phase timings:");
+    println!(
+        "{:<10} {:<32} {:>14} {:>10}",
+        "target", "phase", "phase_ms", "target_%"
+    );
+    println!("{}", "-".repeat(72));
+    for row in rows {
+        let Some(timing) = &row.turso.vacuum_target_timing else {
+            continue;
+        };
+        let total_ms = timing.total.as_secs_f64() * 1000.0;
+        for entry in &timing.entries {
+            let phase_ms = entry.duration.as_secs_f64() * 1000.0;
+            let pct = if total_ms > 0.0 {
+                (phase_ms / total_ms) * 100.0
+            } else {
+                0.0
+            };
+            println!(
+                "{:<10} {:<32} {:>14.2} {:>9.1}%",
+                format!("{}MB", row.target_size_mb),
+                entry.phase,
+                phase_ms,
+                pct,
+            );
+        }
+        println!(
+            "{:<10} {:<32} {:>14.2} {:>9.1}%",
+            format!("{}MB", row.target_size_mb),
+            "target_total",
+            total_ms,
+            100.0,
+        );
+        println!();
+    }
 }
