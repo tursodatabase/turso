@@ -597,7 +597,7 @@ pub fn insn_to_row(
                     CursorType::VirtualTable(v) => {
                         let name = v.columns.get(*column).and_then(|c| c.name.as_ref());
                         name
-}
+                    }
                 };
                 (
                     "Column",
