@@ -6106,7 +6106,13 @@ fn test_mvcc_plain_vacuum_active_tx_returns_busy() -> anyhow::Result<()> {
 }
 
 fn open_queued_db(io: Arc<QueuedIo>, path: &str) -> anyhow::Result<Arc<Database>> {
-    Ok(Database::open_file(io, path)?)
+    Ok(Database::open_file_with_flags(
+        io,
+        path,
+        Default::default(),
+        DatabaseOpts::new().with_vacuum(true),
+        None,
+    )?)
 }
 
 fn populate_queued_multibatch(conn: &Arc<Connection>) -> anyhow::Result<()> {

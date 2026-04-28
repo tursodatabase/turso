@@ -8,9 +8,8 @@ use turso_parser::ast::{Expr, Literal, Name};
 
 /// Translate a VACUUM statement into VDBE bytecode.
 ///
-/// We have `VACUUM INTO`. The in-place `VACUUM` is experimental:
-/// it is enabled by default in debug/test builds and gated behind the
-/// experimental vacuum feature flag in release builds.
+/// We have `VACUUM INTO`. The in-place `VACUUM` is experimental and gated
+/// behind the experimental vacuum feature flag.
 ///
 /// # Arguments
 /// * `program` - The program builder to emit instructions to
@@ -37,7 +36,7 @@ pub fn translate_vacuum(
             Ok(())
         }
         None => {
-            if !cfg!(debug_assertions) && !connection.experimental_vacuum_enabled() {
+            if !connection.experimental_vacuum_enabled() {
                 return Err(LimboError::ParseError(
                     "VACUUM is an experimental feature. Enable with --experimental-vacuum flag"
                         .to_string(),
