@@ -157,6 +157,66 @@ class Database {
     return properties.default.value;
   }
 
+  /**
+   * Prepares the SQL and executes it as `Statement.run`, returning the run info.
+   *
+   * @param {string} sql - The SQL statement string.
+   * @param {...any} bindParameters - Bind parameters, optionally followed by a query options object.
+   */
+  async run(sql, ...bindParameters) {
+    const stmt = this.prepare(sql);
+    try {
+      return await stmt.run(...bindParameters);
+    } finally {
+      await stmt.close();
+    }
+  }
+
+  /**
+   * Prepares the SQL and executes it as `Statement.get`, returning the first row.
+   *
+   * @param {string} sql - The SQL statement string.
+   * @param {...any} bindParameters - Bind parameters, optionally followed by a query options object.
+   */
+  async get(sql, ...bindParameters) {
+    const stmt = this.prepare(sql);
+    try {
+      return await stmt.get(...bindParameters);
+    } finally {
+      await stmt.close();
+    }
+  }
+
+  /**
+   * Prepares the SQL and executes it as `Statement.all`, returning all rows.
+   *
+   * @param {string} sql - The SQL statement string.
+   * @param {...any} bindParameters - Bind parameters, optionally followed by a query options object.
+   */
+  async all(sql, ...bindParameters) {
+    const stmt = this.prepare(sql);
+    try {
+      return await stmt.all(...bindParameters);
+    } finally {
+      await stmt.close();
+    }
+  }
+
+  /**
+   * Prepares the SQL and executes it as `Statement.iterate`, yielding each row.
+   *
+   * @param {string} sql - The SQL statement string.
+   * @param {...any} bindParameters - Bind parameters, optionally followed by a query options object.
+   */
+  async *iterate(sql, ...bindParameters) {
+    const stmt = this.prepare(sql);
+    try {
+      yield* stmt.iterate(...bindParameters);
+    } finally {
+      await stmt.close();
+    }
+  }
+
   async pragma(source, options) {
     if (options == null) options = {};
 
