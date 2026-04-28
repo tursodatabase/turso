@@ -79,6 +79,11 @@ export interface PipelineRequest {
   requests: (ExecuteRequest | BatchRequest | SequenceRequest | CloseRequest | DescribeRequest)[];
 }
 
+export interface BatchResult {
+  step_results: Array<ExecuteResult | null>;
+  step_errors: Array<{ message: string; code: string } | null>;
+}
+
 export interface PipelineResponse {
   baton: string | null;
   base_url: string | null;
@@ -86,7 +91,7 @@ export interface PipelineResponse {
     type: 'ok' | 'error';
     response?: {
       type: 'execute' | 'batch' | 'sequence' | 'close' | 'describe';
-      result?: ExecuteResult | DescribeResult;
+      result?: ExecuteResult | DescribeResult | BatchResult;
     };
     error?: {
       message: string;
@@ -361,7 +366,17 @@ export async function executePipeline(
   }
 
   if (!response.ok) {
-    throw new DatabaseError(`HTTP error! status: ${response.status}`);
+    let errorMessage = `HTTP error! status: ${response.status}`;
+    try {
+      const errorBody = await response.text();
+      const errorData = JSON.parse(errorBody);
+      if (errorData.message) {
+        errorMessage = errorData.message;
+      }
+    } catch {
+      // If we can't parse the error body, use the default HTTP error message
+    }
+    throw new DatabaseError(errorMessage);
   }
 
   return response.json();
