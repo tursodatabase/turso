@@ -629,12 +629,28 @@ impl Connection {
         cmd: Cmd,
         input: &str,
     ) -> Result<(Program, Arc<Pager>, QueryMode)> {
-        self.maybe_update_schema();
-        let syms = self.syms.read();
-        let pager = self.pager.load().clone();
-        let mode = QueryMode::new(&cmd);
+        let _stack = crate::stack::trace_scope("compile_cmd");
+        {
+            let _stack = crate::stack::trace_scope("compile_cmd:update_schema");
+            self.maybe_update_schema();
+        }
+        let syms = {
+            let _stack = crate::stack::trace_scope("compile_cmd:read_symbols");
+            self.syms.read()
+        };
+        let pager = {
+            let _stack = crate::stack::trace_scope("compile_cmd:load_pager");
+            self.pager.load().clone()
+        };
+        let mode = {
+            let _stack = crate::stack::trace_scope("compile_cmd:query_mode");
+            QueryMode::new(&cmd)
+        };
         let (Cmd::Stmt(stmt) | Cmd::Explain(stmt) | Cmd::ExplainQueryPlan(stmt)) = cmd;
-        let schema = self.schema.read().clone();
+        let schema = {
+            let _stack = crate::stack::trace_scope("compile_cmd:clone_schema");
+            self.schema.read().clone()
+        };
         match translate::translate(
             &schema,
             stmt,
@@ -650,16 +666,35 @@ impl Connection {
                 // than cloning the original AST, which can overflow the stack
                 // on deeply nested expression trees.
                 drop(syms);
-                let mut parser = Parser::new(input.as_bytes());
-                let Some(cmd) = parser.next_cmd()? else {
-                    return Err(err);
+                let cmd = {
+                    let _stack = crate::stack::trace_scope("compile_cmd:schema_retry_parse");
+                    let mut parser = Parser::new(input.as_bytes());
+                    let Some(cmd) = parser.next_cmd()? else {
+                        return Err(err);
+                    };
+                    cmd
                 };
-                self.maybe_update_schema();
-                let syms = self.syms.read();
-                let pager = self.pager.load().clone();
-                let mode = QueryMode::new(&cmd);
+                {
+                    let _stack = crate::stack::trace_scope("compile_cmd:retry_update_schema");
+                    self.maybe_update_schema();
+                }
+                let syms = {
+                    let _stack = crate::stack::trace_scope("compile_cmd:retry_read_symbols");
+                    self.syms.read()
+                };
+                let pager = {
+                    let _stack = crate::stack::trace_scope("compile_cmd:retry_load_pager");
+                    self.pager.load().clone()
+                };
+                let mode = {
+                    let _stack = crate::stack::trace_scope("compile_cmd:retry_query_mode");
+                    QueryMode::new(&cmd)
+                };
                 let (Cmd::Stmt(stmt) | Cmd::Explain(stmt) | Cmd::ExplainQueryPlan(stmt)) = cmd;
-                let schema = self.schema.read().clone();
+                let schema = {
+                    let _stack = crate::stack::trace_scope("compile_cmd:retry_clone_schema");
+                    self.schema.read().clone()
+                };
                 translate::translate(
                     &schema,
                     stmt,
@@ -707,35 +742,46 @@ impl Connection {
 
         let needs_nested_guard = origin.needs_nested_guard();
         if needs_nested_guard {
+            let _stack = crate::stack::trace_scope("prepare:start_nested");
             self.start_nested();
         }
         let result = (|| {
             let sql = sql.as_ref();
             tracing::debug!("Preparing: {}", sql);
-            let mut parser = Parser::new(sql.as_bytes());
-            let cmd = match parser.next_cmd()? {
-                Some(cmd) => cmd,
-                None => {
-                    return Err(LimboError::InvalidArgument(
-                        "The supplied SQL string contains no statements".to_string(),
-                    ));
-                }
+            let (cmd, byte_offset_end) = {
+                let _stack = crate::stack::trace_scope("prepare:parse");
+                let mut parser = Parser::new(sql.as_bytes());
+                let cmd = match parser.next_cmd()? {
+                    Some(cmd) => cmd,
+                    None => {
+                        return Err(LimboError::InvalidArgument(
+                            "The supplied SQL string contains no statements".to_string(),
+                        ));
+                    }
+                };
+                (cmd, parser.offset())
             };
-            let byte_offset_end = parser.offset();
             let input = str::from_utf8(&sql.as_bytes()[..byte_offset_end])
                 .unwrap()
                 .trim();
-            let (program, pager, mode) = self.compile_cmd(cmd, input)?;
-            Ok(Statement::new_with_origin(
-                program,
-                pager,
-                mode,
-                byte_offset_end,
-                origin,
-                needs_nested_guard,
-            ))
+            let (program, pager, mode) = {
+                let _stack = crate::stack::trace_scope("prepare:compile");
+                self.compile_cmd(cmd, input)?
+            };
+            {
+                let _stack = crate::stack::trace_scope("prepare:statement_new");
+                Ok(Statement::new_with_origin(
+                    program,
+                    pager,
+                    mode,
+                    byte_offset_end,
+                    origin,
+                    needs_nested_guard,
+                ))
+            }
         })();
         if result.is_err() && needs_nested_guard {
+            let _stack = crate::stack::trace_scope("prepare:end_nested_on_error");
             self.end_nested();
         }
         result
@@ -757,33 +803,56 @@ impl Connection {
         }
         let needs_nested_guard = origin.needs_nested_guard();
         if needs_nested_guard {
+            let _stack = crate::stack::trace_scope("prepare_stmt:start_nested");
             self.start_nested();
         }
         let result = (|| {
-            self.maybe_update_schema();
-            let syms = self.syms.read();
-            let pager = self.pager.load().clone();
-            let mode = QueryMode::Normal;
-            let schema = self.schema.read().clone();
-            let program = translate::translate(
-                &schema,
-                stmt,
-                pager.clone(),
-                self.clone(),
-                &syms,
-                mode,
-                "<ast>", // No SQL input string available
-            )?;
-            Ok(Statement::new_with_origin(
-                program,
-                pager,
-                mode,
-                0,
-                origin,
-                needs_nested_guard,
-            ))
+            {
+                let _stack = crate::stack::trace_scope("prepare_stmt:update_schema");
+                self.maybe_update_schema();
+            }
+            let syms = {
+                let _stack = crate::stack::trace_scope("prepare_stmt:read_symbols");
+                self.syms.read()
+            };
+            let pager = {
+                let _stack = crate::stack::trace_scope("prepare_stmt:load_pager");
+                self.pager.load().clone()
+            };
+            let mode = {
+                let _stack = crate::stack::trace_scope("prepare_stmt:query_mode");
+                QueryMode::Normal
+            };
+            let schema = {
+                let _stack = crate::stack::trace_scope("prepare_stmt:clone_schema");
+                self.schema.read().clone()
+            };
+            let program = {
+                let _stack = crate::stack::trace_scope("prepare_stmt:translate");
+                translate::translate(
+                    &schema,
+                    stmt,
+                    pager.clone(),
+                    self.clone(),
+                    &syms,
+                    mode,
+                    "<ast>", // No SQL input string available
+                )?
+            };
+            {
+                let _stack = crate::stack::trace_scope("prepare_stmt:statement_new");
+                Ok(Statement::new_with_origin(
+                    program,
+                    pager,
+                    mode,
+                    0,
+                    origin,
+                    needs_nested_guard,
+                ))
+            }
         })();
         if result.is_err() && needs_nested_guard {
+            let _stack = crate::stack::trace_scope("prepare_stmt:end_nested_on_error");
             self.end_nested();
         }
         result
@@ -1093,8 +1162,14 @@ impl Connection {
             let input = str::from_utf8(&sql.as_bytes()[..byte_offset_end])
                 .unwrap()
                 .trim();
-            let (program, pager, mode) = self.compile_cmd(cmd, input)?;
-            Statement::new(program, pager.clone(), mode, 0).run_ignore_rows()?;
+            let (program, pager, mode) = {
+                let _stack = crate::stack::trace_scope("execute:compile");
+                self.compile_cmd(cmd, input)?
+            };
+            {
+                let _stack = crate::stack::trace_scope("execute:run");
+                Statement::new(program, pager.clone(), mode, 0).run_ignore_rows()?;
+            }
         }
         Ok(())
     }

@@ -2,7 +2,7 @@ use crate::translate::emitter::Resolver;
 use crate::translate::schema::{emit_schema_entry, SchemaEntryType, SQLITE_TABLEID};
 use crate::translate::ProgramBuilder;
 use crate::translate::ProgramBuilderOpts;
-use crate::util::{escape_sql_string_literal, normalize_ident};
+use crate::util::normalize_ident;
 use crate::vdbe::builder::CursorType;
 use crate::vdbe::insn::{Cookie, Insn};
 use crate::{bail_parse_error, Result, MAIN_DB_ID};
@@ -97,10 +97,13 @@ pub fn translate_create_trigger(
     commands: &[ast::TriggerCmd],
     when_clause: Option<&ast::Expr>,
 ) -> Result<()> {
+    let _stack = crate::stack::trace_scope("trigger:translate_create");
     let normalized_trigger_name = normalize_ident(trigger_name.name.as_str());
     let normalized_table_name = normalize_ident(tbl_name.name.as_str());
-    let database_id =
-        resolve_create_trigger_database_id(resolver, &trigger_name, &tbl_name, temporary)?;
+    let database_id = {
+        let _stack = crate::stack::trace_scope("trigger:resolve_database");
+        resolve_create_trigger_database_id(resolver, &trigger_name, &tbl_name, temporary)?
+    };
     let target_table_database_id = if temporary {
         // A temp trigger's target table can be in any schema.
         resolver.resolve_existing_table_database_id_qualified(&tbl_name)?
@@ -131,6 +134,7 @@ pub fn translate_create_trigger(
     // Temp-backed triggers follow SQLite's looser name-resolution rules and may
     // access objects across schemas. Ordinary triggers stay schema-local.
     if database_id != crate::TEMP_DB_ID {
+        let _stack = crate::stack::trace_scope("trigger:validate_cross_db_refs");
         validate_trigger_no_cross_db_refs(
             resolver,
             database_id,
@@ -144,25 +148,30 @@ pub fn translate_create_trigger(
         bail_parse_error!("cannot create trigger on system table");
     }
 
-    // Check if trigger already exists
-    if resolver.with_schema(database_id, |s| {
-        s.get_trigger(&normalized_trigger_name).is_some()
-    }) {
-        if if_not_exists {
-            return Ok(());
+    {
+        let _stack = crate::stack::trace_scope("trigger:check_existing");
+        if resolver.with_schema(database_id, |s| {
+            s.get_trigger(&normalized_trigger_name).is_some()
+        }) {
+            if if_not_exists {
+                return Ok(());
+            }
+            bail_parse_error!("Trigger {} already exists", normalized_trigger_name);
         }
-        bail_parse_error!("Trigger {} already exists", normalized_trigger_name);
     }
 
     // Verify the table exists (use the table's database, not the trigger's).
-    let table = resolver.with_schema(target_table_database_id, |s| {
-        s.get_table(&normalized_table_name)
-    });
-    let Some(table) = table else {
-        bail_parse_error!("no such table: {}", normalized_table_name);
-    };
-    if table.virtual_table().is_some() {
-        bail_parse_error!("cannot create triggers on virtual tables");
+    {
+        let _stack = crate::stack::trace_scope("trigger:check_target_table");
+        let table = resolver.with_schema(target_table_database_id, |s| {
+            s.get_table(&normalized_table_name)
+        });
+        let Some(table) = table else {
+            bail_parse_error!("no such table: {}", normalized_table_name);
+        };
+        if table.virtual_table().is_some() {
+            bail_parse_error!("cannot create triggers on virtual tables");
+        }
     }
 
     if time
@@ -187,17 +196,20 @@ pub fn translate_create_trigger(
     });
 
     // Add the trigger entry to sqlite_schema
-    emit_schema_entry(
-        program,
-        resolver,
-        sqlite_schema_cursor_id,
-        None, // cdc_table_cursor_id, no cdc for triggers
-        SchemaEntryType::Trigger,
-        &normalized_trigger_name,
-        &normalized_table_name,
-        0, // triggers don't have a root page
-        Some(sql),
-    )?;
+    {
+        let _stack = crate::stack::trace_scope("trigger:emit_schema_entry");
+        emit_schema_entry(
+            program,
+            resolver,
+            sqlite_schema_cursor_id,
+            None, // cdc_table_cursor_id, no cdc for triggers
+            SchemaEntryType::Trigger,
+            &normalized_trigger_name,
+            &normalized_table_name,
+            0, // triggers don't have a root page
+            Some(sql),
+        )?;
+    }
 
     // Update schema version
     let schema_version = resolver.with_schema(database_id, |s| s.schema_version);
@@ -209,13 +221,16 @@ pub fn translate_create_trigger(
     });
 
     // Parse schema to load the new trigger
-    let escaped_trigger_name = escape_sql_string_literal(&normalized_trigger_name);
-    program.emit_insn(Insn::ParseSchema {
-        db: database_id,
-        where_clause: Some(format!(
-            "name = '{escaped_trigger_name}' AND type = 'trigger'"
-        )),
-    });
+    {
+        let _stack = crate::stack::trace_scope("trigger:emit_parse_schema");
+        program.emit_insn(Insn::ParseSchema {
+            db: database_id,
+            filter: crate::vdbe::insn::ParseSchemaFilter::NameAndType {
+                name: normalized_trigger_name,
+                ty: "trigger".to_string(),
+            },
+        });
+    }
 
     Ok(())
 }
@@ -252,6 +267,7 @@ fn validate_trigger_no_cross_db_refs(
     commands: &[ast::TriggerCmd],
     when_clause: Option<&ast::Expr>,
 ) -> Result<()> {
+    let _stack = crate::stack::trace_scope("trigger:validate_no_cross_db_refs");
     let ctx = CrossDbCheckCtx {
         resolver,
         trigger_db_id,
@@ -259,12 +275,15 @@ fn validate_trigger_no_cross_db_refs(
     };
 
     if let Some(when) = when_clause {
+        let _stack = crate::stack::trace_scope("trigger:validate_when");
         ctx.check_expr(when)?;
     }
 
     for cmd in commands {
         match cmd {
             ast::TriggerCmd::Insert { select, .. } => {
+                let _stack =
+                    crate::stack::trace_scope_with_detail("trigger:validate_cmd", "insert");
                 ctx.check_select(select)?;
             }
             ast::TriggerCmd::Update {
@@ -273,6 +292,8 @@ fn validate_trigger_no_cross_db_refs(
                 where_clause,
                 ..
             } => {
+                let _stack =
+                    crate::stack::trace_scope_with_detail("trigger:validate_cmd", "update");
                 for set in sets {
                     ctx.check_expr(&set.expr)?;
                 }
@@ -284,11 +305,15 @@ fn validate_trigger_no_cross_db_refs(
                 }
             }
             ast::TriggerCmd::Delete { where_clause, .. } => {
+                let _stack =
+                    crate::stack::trace_scope_with_detail("trigger:validate_cmd", "delete");
                 if let Some(wc) = where_clause {
                     ctx.check_expr(wc)?;
                 }
             }
             ast::TriggerCmd::Select(select) => {
+                let _stack =
+                    crate::stack::trace_scope_with_detail("trigger:validate_cmd", "select");
                 ctx.check_select(select)?;
             }
         }
@@ -324,6 +349,7 @@ impl CrossDbCheckCtx<'_> {
     /// here — they are column references, not table references. SQLite allows them
     /// at CREATE TRIGGER time and only rejects them at runtime as "no such column".
     fn check_expr(&self, expr: &ast::Expr) -> Result<()> {
+        let _stack = crate::stack::trace_scope("trigger:validate_expr");
         use crate::translate::expr::WalkControl;
         crate::translate::expr::walk_expr(expr, &mut |e| -> Result<WalkControl> {
             match e {
@@ -342,6 +368,7 @@ impl CrossDbCheckCtx<'_> {
     }
 
     fn check_select(&self, select: &ast::Select) -> Result<()> {
+        let _stack = crate::stack::trace_scope("trigger:validate_select");
         check_select_table_refs(select, &|qn| self.check_qname(qn), &|e| self.check_expr(e))
     }
 

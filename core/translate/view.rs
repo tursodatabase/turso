@@ -8,9 +8,7 @@ use crate::translate::{
     emitter::Resolver,
     schema::{emit_schema_entry, SchemaEntryType, SQLITE_TABLEID},
 };
-use crate::util::{
-    escape_sql_string_literal, normalize_ident, PRIMARY_KEY_AUTOMATIC_INDEX_NAME_PREFIX,
-};
+use crate::util::{normalize_ident, PRIMARY_KEY_AUTOMATIC_INDEX_NAME_PREFIX};
 use crate::vdbe::builder::{CursorType, ProgramBuilder};
 use crate::vdbe::insn::{CmpInsFlags, Cookie, Insn, RegisterOrLiteral};
 use crate::{bail_parse_error, Connection, Result, MAIN_DB_ID};
@@ -234,14 +232,15 @@ pub fn translate_create_materialized_view(
     )?;
 
     // Parse schema to load the new view and DBSP state table
-    let escaped_view_name = escape_sql_string_literal(&normalized_view_name);
-    let escaped_dbsp_table_name = escape_sql_string_literal(dbsp_table_name.as_str());
-    let escaped_dbsp_index_name = escape_sql_string_literal(&dbsp_index_name);
     program.emit_insn(Insn::ParseSchema {
         db: database_id,
-        where_clause: Some(format!(
-            "name = '{escaped_view_name}' OR name = '{escaped_dbsp_table_name}' OR name = '{escaped_dbsp_index_name}'"
-        )),
+        filter: crate::vdbe::insn::ParseSchemaFilter::Name {
+            names: vec![
+                normalized_view_name.clone(),
+                dbsp_table_name.as_str().to_string(),
+                dbsp_index_name,
+            ],
+        },
     });
 
     let schema_version = resolver.with_schema(database_id, |s| s.schema_version);
@@ -344,10 +343,11 @@ pub fn translate_create_view(
     )?;
 
     // Parse schema to load the new view
-    let escaped_view_name = escape_sql_string_literal(&normalized_view_name);
     program.emit_insn(Insn::ParseSchema {
         db: database_id,
-        where_clause: Some(format!("name = '{escaped_view_name}'")),
+        filter: crate::vdbe::insn::ParseSchemaFilter::Name {
+            names: vec![normalized_view_name],
+        },
     });
 
     let schema_version = resolver.with_schema(database_id, |s| s.schema_version);

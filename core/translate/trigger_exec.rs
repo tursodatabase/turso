@@ -6,13 +6,19 @@ use crate::translate::subquery::{
     emit_non_from_clause_subquery, plan_subqueries_from_trigger_when_clause,
 };
 use crate::translate::{
+    delete::translate_delete,
     emitter::Resolver,
     expr::{self, translate_expr, walk_expr_mut},
+    insert::translate_insert,
+    plan::QueryDestination,
     planner::ROWID_STRS,
-    translate_inner, ProgramBuilder, ProgramBuilderOpts,
+    select::translate_select,
+    update::translate_update,
+    ProgramBuilder, ProgramBuilderOpts,
 };
 use crate::util::normalize_ident;
 use crate::vdbe::affinity::Affinity;
+use crate::vdbe::builder::DeferredTriggerProgram;
 use crate::vdbe::insn::Insn;
 use crate::vdbe::BranchOffset;
 use crate::{bail_parse_error, QueryMode, Result};
@@ -21,7 +27,7 @@ use std::num::NonZero;
 use turso_parser::ast::{self, Expr, TriggerEvent, TriggerTime};
 
 /// Context for trigger execution
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct TriggerContext {
     /// Table the trigger is attached to
     pub table: Arc<BTreeTable>,
@@ -278,11 +284,14 @@ fn rewrite_upsert_exprs_for_subprogram(
     Ok(())
 }
 
-/// Convert TriggerCmd to Stmt, rewriting NEW/OLD to Variable expressions (for subprogram compilation)
-fn trigger_cmd_to_stmt_for_subprogram(
+/// Rewrite and translate one trigger command into the trigger subprogram.
+fn translate_trigger_cmd_for_subprogram(
     cmd: &ast::TriggerCmd,
     subprogram_ctx: &TriggerSubprogramContext,
-) -> Result<ast::Stmt> {
+    resolver: &mut Resolver,
+    program: &mut ProgramBuilder,
+    connection: &Arc<crate::Connection>,
+) -> Result<()> {
     use ast::{InsertBody, QualifiedName};
 
     match cmd {
@@ -306,18 +315,23 @@ fn trigger_cmd_to_stmt_for_subprogram(
             // If override_conflict is set (e.g., in UPSERT DO UPDATE context),
             // use it instead of the command's or_conflict to ensure errors propagate.
             let effective_or_conflict = subprogram_ctx.override_conflict.or(*or_conflict);
-            Ok(ast::Stmt::Insert {
-                with: None,
-                or_conflict: effective_or_conflict,
-                tbl_name: QualifiedName {
+            translate_insert(
+                resolver,
+                effective_or_conflict,
+                QualifiedName {
                     db_name: subprogram_ctx.db_name.clone(),
                     name: tbl_name.clone(),
                     alias: None,
                 },
-                columns: col_names.clone(),
+                col_names.clone(),
                 body,
-                returning: returning.clone(),
-            })
+                returning.clone(),
+                None,
+                program,
+                connection,
+            )?;
+            program.begin_write_operation();
+            Ok(())
         }
         ast::TriggerCmd::Update {
             or_conflict,
@@ -348,7 +362,7 @@ fn trigger_cmd_to_stmt_for_subprogram(
             // If override_conflict is set (e.g., in UPSERT DO UPDATE context),
             // use it instead of the command's or_conflict to ensure errors propagate.
             let effective_or_conflict = subprogram_ctx.override_conflict.or(*or_conflict);
-            Ok(ast::Stmt::Update(ast::Update {
+            let update = ast::Update {
                 with: None,
                 or_conflict: effective_or_conflict,
                 tbl_name: QualifiedName {
@@ -363,7 +377,15 @@ fn trigger_cmd_to_stmt_for_subprogram(
                 returning: vec![],
                 order_by: vec![],
                 limit: None,
-            }))
+            };
+            if update.where_clause.is_none() && connection.get_dml_require_where() {
+                bail_parse_error!(
+                    "UPDATE without a WHERE clause is not allowed when require_where (or i_am_a_dummy) is enabled"
+                );
+            }
+            translate_update(update, resolver, program, connection)?;
+            program.begin_write_operation();
+            Ok(())
         }
         ast::TriggerCmd::Delete {
             tbl_name,
@@ -375,25 +397,44 @@ fn trigger_cmd_to_stmt_for_subprogram(
                 rewrite_trigger_expr_for_subprogram(where_expr, subprogram_ctx)?;
             }
 
-            Ok(ast::Stmt::Delete {
-                tbl_name: QualifiedName {
+            if where_clause_clone.is_none() && connection.get_dml_require_where() {
+                bail_parse_error!(
+                    "DELETE without a WHERE clause is not allowed when require_where (or i_am_a_dummy) is enabled"
+                );
+            }
+            translate_delete(
+                &QualifiedName {
                     db_name: subprogram_ctx.db_name.clone(),
                     name: tbl_name.clone(),
                     alias: None,
                 },
-                where_clause: where_clause_clone,
-                limit: None,
-                returning: vec![],
-                indexed: None,
-                order_by: vec![],
-                with: None,
-            })
+                resolver,
+                where_clause_clone,
+                None,
+                vec![],
+                None,
+                None,
+                program,
+                connection,
+            )?;
+            program.begin_write_operation();
+            Ok(())
         }
         ast::TriggerCmd::Select(select) => {
             // Rewrite NEW/OLD references in the SELECT
             let mut select_clone = select.clone();
             rewrite_expressions_in_select_for_subprogram(&mut select_clone, subprogram_ctx)?;
-            Ok(ast::Stmt::Select(select_clone))
+            translate_select(
+                select_clone,
+                resolver,
+                program,
+                QueryDestination::ResultRows,
+                connection,
+            )?;
+            if !program.table_references.is_empty() {
+                program.begin_read_operation();
+            }
+            Ok(())
         }
     }
 }
@@ -525,13 +566,53 @@ fn rewrite_trigger_expr_single_for_subprogram(
 /// Returns true if there are triggers that will fire.
 fn execute_trigger_commands(
     program: &mut ProgramBuilder,
-    resolver: &mut Resolver,
+    _resolver: &mut Resolver,
     trigger: &Arc<Trigger>,
     ctx: &TriggerContext,
-    connection: &Arc<crate::Connection>,
+    _connection: &Arc<crate::Connection>,
     database_id: usize,
     ignore_jump_target: BranchOffset,
 ) -> Result<bool> {
+    let _stack = crate::stack::trace_scope_with_detail(
+        "trigger:execute_commands",
+        trigger_event_kind(&trigger.event),
+    );
+    let insn_index = program.insns.len();
+    program.emit_insn(Insn::Noop);
+    program
+        .deferred_trigger_programs
+        .push(DeferredTriggerProgram {
+            insn_index,
+            trigger: trigger.clone(),
+            table: ctx.table.clone(),
+            new_registers: ctx.new_registers.clone(),
+            old_registers: ctx.old_registers.clone(),
+            override_conflict: ctx.override_conflict,
+            database_id,
+            ignore_jump_target,
+        });
+
+    Ok(true)
+}
+
+pub(crate) fn compile_deferred_trigger_programs(
+    program: &mut ProgramBuilder,
+    resolver: &mut Resolver,
+    connection: &Arc<crate::Connection>,
+) -> Result<()> {
+    while let Some(deferred) = program.deferred_trigger_programs.pop() {
+        compile_deferred_trigger_program(program, resolver, connection, deferred)?;
+    }
+    Ok(())
+}
+
+fn compile_deferred_trigger_program(
+    program: &mut ProgramBuilder,
+    resolver: &mut Resolver,
+    connection: &Arc<crate::Connection>,
+    deferred: DeferredTriggerProgram,
+) -> Result<()> {
+    let _stack = crate::stack::trace_scope("trigger:compile_deferred_program");
     struct TriggerCompilationGuard {
         connection: Arc<crate::Connection>,
     }
@@ -542,29 +623,30 @@ fn execute_trigger_commands(
         }
     }
 
+    let trigger = &deferred.trigger;
     if connection.trigger_is_compiling(trigger) {
-        // Do not recursively compile the same trigger
-        return Ok(false);
+        return Ok(());
     }
     connection.start_trigger_compilation(trigger.clone());
     let _trigger_compilation_guard = TriggerCompilationGuard {
         connection: connection.clone(),
     };
 
-    let has_new = ctx.new_registers.is_some();
-    let has_old = ctx.old_registers.is_some();
-    let num_cols = ctx.table.columns().len();
+    let has_new = deferred.new_registers.is_some();
+    let has_old = deferred.old_registers.is_some();
+    let num_cols = deferred.table.columns().len();
 
     // Ordinary non-main triggers need unqualified DML targets rewritten into the
     // trigger's schema. Temp-backed triggers intentionally keep unqualified names
     // unresolved so they can follow SQLite's normal temp/main lookup rules.
-    let db_name = if database_id == crate::MAIN_DB_ID || database_id == crate::TEMP_DB_ID {
-        None
-    } else {
-        resolver
-            .get_database_name_by_index(database_id)
-            .map(ast::Name::exact)
-    };
+    let db_name =
+        if deferred.database_id == crate::MAIN_DB_ID || deferred.database_id == crate::TEMP_DB_ID {
+            None
+        } else {
+            resolver
+                .get_database_name_by_index(deferred.database_id)
+                .map(ast::Name::exact)
+        };
     // Parameter indices are allocated on demand during the AST rewrite.
     // Only columns actually referenced in the trigger body get a parameter,
     // reducing bind_at calls from N (all columns) to K (referenced columns).
@@ -572,19 +654,22 @@ fn execute_trigger_commands(
         param_alloc: RefCell::new(ParamAllocator::new(num_cols, has_new, has_old)),
         has_new,
         has_old,
-        table: ctx.table.clone(),
-        override_conflict: ctx.override_conflict,
+        table: deferred.table.clone(),
+        override_conflict: deferred.override_conflict,
         db_name,
     };
-    let mut subprogram_builder = ProgramBuilder::new_for_trigger(
-        QueryMode::Normal,
-        program.capture_data_changes_info().clone(),
-        ProgramBuilderOpts::new(1, 32, 2),
-        trigger.clone(),
-    );
+    let mut subprogram_builder = {
+        let _stack = crate::stack::trace_scope("trigger:subprogram_builder_new");
+        ProgramBuilder::new_for_trigger(
+            QueryMode::Normal,
+            program.capture_data_changes_info().clone(),
+            ProgramBuilderOpts::new(1, 32, 2),
+            trigger.clone(),
+        )
+    };
     // If we have an override_conflict (e.g. from UPSERT DO UPDATE context),
     // propagate it to the subprogram so that nested trigger firing will also use it.
-    if let Some(override_conflict) = ctx.override_conflict {
+    if let Some(override_conflict) = deferred.override_conflict {
         subprogram_builder.set_trigger_conflict_override(override_conflict);
     }
     // Restrict table resolution to the trigger's database during subprogram compilation.
@@ -592,21 +677,30 @@ fn execute_trigger_commands(
     let trigger_database_id = if trigger.temporary {
         crate::TEMP_DB_ID
     } else {
-        database_id
+        deferred.database_id
     };
     let prev_trigger_context = resolver.trigger_context.clone();
     resolver.set_trigger_context(trigger_database_id, trigger.name.clone());
     let compile_result = (|| -> Result<()> {
         for command in trigger.commands.iter() {
-            let stmt = trigger_cmd_to_stmt_for_subprogram(command, &subprogram_ctx)?;
+            let _stack = crate::stack::trace_scope_with_detail(
+                "trigger:compile_command",
+                trigger_command_kind(command),
+            );
             subprogram_builder.prologue();
-            translate_inner(
-                stmt,
-                resolver,
-                &mut subprogram_builder,
-                connection,
-                "trigger subprogram",
-            )?;
+            {
+                let _stack = crate::stack::trace_scope_with_detail(
+                    "trigger:translate_command",
+                    trigger_command_kind(command),
+                );
+                translate_trigger_cmd_for_subprogram(
+                    command,
+                    &subprogram_ctx,
+                    resolver,
+                    &mut subprogram_builder,
+                    connection,
+                )?;
+            }
             if matches!(
                 command,
                 ast::TriggerCmd::Insert { .. }
@@ -621,9 +715,18 @@ fn execute_trigger_commands(
     // Restore previous trigger context (supports nested triggers).
     resolver.trigger_context = prev_trigger_context;
     compile_result?;
-    subprogram_builder.epilogue(resolver.schema());
-    let built_subprogram =
-        subprogram_builder.build(connection.clone(), true, "trigger subprogram")?;
+    {
+        let _stack = crate::stack::trace_scope("trigger:compile_nested_deferred_programs");
+        compile_deferred_trigger_programs(&mut subprogram_builder, resolver, connection)?;
+    }
+    {
+        let _stack = crate::stack::trace_scope("trigger:subprogram_epilogue");
+        subprogram_builder.epilogue(resolver.schema());
+    }
+    let built_subprogram = {
+        let _stack = crate::stack::trace_scope("trigger:subprogram_build");
+        subprogram_builder.build(connection.clone(), true, "trigger subprogram")?
+    };
     let subprogram_prepared = built_subprogram.prepared();
 
     // Trigger subprograms do not emit Transaction opcodes, so the parent statement
@@ -655,7 +758,7 @@ fn execute_trigger_commands(
     let total_params = alloc.num_params();
     let mut param_registers = vec![0usize; total_params];
 
-    if let Some(new_regs) = &ctx.new_registers {
+    if let Some(new_regs) = &deferred.new_registers {
         for (col_idx, opt_param) in alloc.new_entries.iter().enumerate() {
             if let Some(param_idx) = opt_param {
                 param_registers[param_idx.get() - 1] = new_regs[col_idx];
@@ -665,7 +768,7 @@ fn execute_trigger_commands(
             param_registers[param_idx.get() - 1] = *new_regs.last().unwrap();
         }
     }
-    if let Some(old_regs) = &ctx.old_registers {
+    if let Some(old_regs) = &deferred.old_registers {
         for (col_idx, opt_param) in alloc.old_entries.iter().enumerate() {
             if let Some(param_idx) = opt_param {
                 param_registers[param_idx.get() - 1] = old_regs[col_idx];
@@ -677,13 +780,16 @@ fn execute_trigger_commands(
     }
     drop(alloc);
 
-    program.emit_insn(Insn::Program {
-        param_registers,
-        program: built_subprogram.prepared().clone(),
-        ignore_jump_target,
-    });
+    program.replace_insn(
+        deferred.insn_index,
+        Insn::Program {
+            param_registers,
+            program: built_subprogram.prepared().clone(),
+            ignore_jump_target: deferred.ignore_jump_target,
+        },
+    );
 
-    Ok(true)
+    Ok(())
 }
 
 /// Check if there are any triggers for a given event (regardless of time).
@@ -864,6 +970,8 @@ pub fn fire_trigger(
     database_id: usize,
     ignore_jump_target: BranchOffset,
 ) -> Result<()> {
+    let _stack =
+        crate::stack::trace_scope_with_detail("trigger:fire", trigger_event_kind(&trigger.event));
     // Decode custom type registers so trigger bodies see user-facing values,
     // not raw encoded blobs from disk.
     // - OLD registers always come from cursor reads → always encoded → always decode
@@ -880,19 +988,26 @@ pub fn fire_trigger(
     let result = (|| -> Result<()> {
         // Evaluate WHEN clause if present
         if let Some(mut when_expr) = trigger.when_clause.clone() {
+            let _stack = crate::stack::trace_scope("trigger:when_clause");
             // Rewrite NEW/OLD references in WHEN clause to use registers
-            rewrite_trigger_expr_for_when_clause(&mut when_expr, &ctx.table, ctx)?;
+            {
+                let _stack = crate::stack::trace_scope("trigger:rewrite_when");
+                rewrite_trigger_expr_for_when_clause(&mut when_expr, &ctx.table, ctx)?;
+            }
 
             // Plan and emit any subqueries in the WHEN clause (e.g. IN (SELECT ...), EXISTS, scalar subqueries).
             // This transforms InSelect/Exists/Subquery nodes into SubqueryResult nodes that translate_expr can handle.
             let mut subqueries = Vec::new();
-            plan_subqueries_from_trigger_when_clause(
-                program,
-                &mut subqueries,
-                &mut when_expr,
-                resolver,
-                connection,
-            )?;
+            {
+                let _stack = crate::stack::trace_scope("trigger:plan_when_subqueries");
+                plan_subqueries_from_trigger_when_clause(
+                    program,
+                    &mut subqueries,
+                    &mut when_expr,
+                    resolver,
+                    connection,
+                )?;
+            }
             // Emit the planned subqueries so their results are available when we evaluate the WHEN expression.
             // Always treat these as correlated (no `Once` caching) because the WHEN clause is evaluated
             // per-row, and trigger bodies may modify the tables referenced by the subquery between evaluations.
@@ -909,7 +1024,10 @@ pub fn fire_trigger(
             }
 
             let when_reg = program.alloc_register();
-            translate_expr(program, None, &when_expr, when_reg, resolver)?;
+            {
+                let _stack = crate::stack::trace_scope("trigger:translate_when_expr");
+                translate_expr(program, None, &when_expr, when_reg, resolver)?;
+            }
 
             let skip_label = program.allocate_label();
             program.emit_insn(Insn::IfNot {
@@ -919,34 +1037,58 @@ pub fn fire_trigger(
             });
 
             // Execute trigger commands if WHEN clause is true
-            execute_trigger_commands(
-                program,
-                resolver,
-                &trigger,
-                ctx,
-                connection,
-                database_id,
-                ignore_jump_target,
-            )?;
+            {
+                let _stack = crate::stack::trace_scope("trigger:execute_when_body");
+                execute_trigger_commands(
+                    program,
+                    resolver,
+                    &trigger,
+                    ctx,
+                    connection,
+                    database_id,
+                    ignore_jump_target,
+                )?;
+            }
 
             program.preassign_label_to_next_insn(skip_label);
         } else {
             // No WHEN clause - always execute
-            execute_trigger_commands(
-                program,
-                resolver,
-                &trigger,
-                ctx,
-                connection,
-                database_id,
-                ignore_jump_target,
-            )?;
+            {
+                let _stack = crate::stack::trace_scope("trigger:execute_body");
+                execute_trigger_commands(
+                    program,
+                    resolver,
+                    &trigger,
+                    ctx,
+                    connection,
+                    database_id,
+                    ignore_jump_target,
+                )?;
+            }
         }
 
         Ok(())
     })();
     resolver.register_affinities = saved_register_affinities;
     result
+}
+
+fn trigger_event_kind(event: &TriggerEvent) -> &'static str {
+    match event {
+        TriggerEvent::Delete => "delete",
+        TriggerEvent::Insert => "insert",
+        TriggerEvent::Update => "update",
+        TriggerEvent::UpdateOf(_) => "update_of",
+    }
+}
+
+fn trigger_command_kind(command: &ast::TriggerCmd) -> &'static str {
+    match command {
+        ast::TriggerCmd::Insert { .. } => "insert",
+        ast::TriggerCmd::Update { .. } => "update",
+        ast::TriggerCmd::Delete { .. } => "delete",
+        ast::TriggerCmd::Select(_) => "select",
+    }
 }
 
 /// Decode encoded custom type registers in a TriggerContext.

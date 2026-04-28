@@ -32,6 +32,7 @@ use crate::vdbe::{
     BranchOffset, CursorID,
 };
 use crate::{LimboError, Numeric, Result, Value};
+use smallvec::SmallVec;
 
 #[derive(Debug, Clone, Copy)]
 pub struct ConditionMetadata {
@@ -5580,180 +5581,176 @@ pub enum WalkControl {
     SkipChildren, // Skip children but continue walking siblings
 }
 
-/// Recursively walks an immutable expression, applying a function to each sub-expression.
+/// Walks an immutable expression in pre-order, applying a function to each sub-expression.
 pub fn walk_expr<'a, F>(expr: &'a ast::Expr, func: &mut F) -> Result<WalkControl>
 where
     F: FnMut(&'a ast::Expr) -> Result<WalkControl>,
 {
-    match func(expr)? {
-        WalkControl::Continue => {
-            match expr {
-                ast::Expr::SubqueryResult { lhs, .. } => {
-                    if let Some(lhs) = lhs {
-                        walk_expr(lhs, func)?;
-                    }
-                }
-                ast::Expr::Between {
-                    lhs, start, end, ..
-                } => {
-                    walk_expr(lhs, func)?;
-                    walk_expr(start, func)?;
-                    walk_expr(end, func)?;
-                }
-                ast::Expr::Binary(lhs, _, rhs) => {
-                    walk_expr(lhs, func)?;
-                    walk_expr(rhs, func)?;
-                }
-                ast::Expr::Case {
-                    base,
-                    when_then_pairs,
-                    else_expr,
-                } => {
-                    if let Some(base_expr) = base {
-                        walk_expr(base_expr, func)?;
-                    }
-                    for (when_expr, then_expr) in when_then_pairs {
-                        walk_expr(when_expr, func)?;
-                        walk_expr(then_expr, func)?;
-                    }
-                    if let Some(else_expr) = else_expr {
-                        walk_expr(else_expr, func)?;
-                    }
-                }
-                ast::Expr::Cast { expr, .. } => {
-                    walk_expr(expr, func)?;
-                }
-                ast::Expr::Collate(expr, _) => {
-                    walk_expr(expr, func)?;
-                }
-                ast::Expr::Exists(_select) | ast::Expr::Subquery(_select) => {
-                    // TODO: Walk through select statements if needed
-                }
-                ast::Expr::FunctionCall {
-                    args,
-                    order_by,
-                    filter_over,
-                    ..
-                } => {
-                    for arg in args {
-                        walk_expr(arg, func)?;
-                    }
-                    for sort_col in order_by {
-                        walk_expr(&sort_col.expr, func)?;
-                    }
-                    if let Some(filter_clause) = &filter_over.filter_clause {
-                        walk_expr(filter_clause, func)?;
-                    }
-                    if let Some(over_clause) = &filter_over.over_clause {
-                        match over_clause {
-                            ast::Over::Window(window) => {
-                                for part_expr in &window.partition_by {
-                                    walk_expr(part_expr, func)?;
-                                }
-                                for sort_col in &window.order_by {
-                                    walk_expr(&sort_col.expr, func)?;
-                                }
-                                if let Some(frame_clause) = &window.frame_clause {
-                                    walk_expr_frame_bound(&frame_clause.start, func)?;
-                                    if let Some(end_bound) = &frame_clause.end {
-                                        walk_expr_frame_bound(end_bound, func)?;
-                                    }
-                                }
-                            }
-                            ast::Over::Name(_) => {}
-                        }
-                    }
-                }
-                ast::Expr::FunctionCallStar { filter_over, .. } => {
-                    if let Some(filter_clause) = &filter_over.filter_clause {
-                        walk_expr(filter_clause, func)?;
-                    }
-                    if let Some(over_clause) = &filter_over.over_clause {
-                        match over_clause {
-                            ast::Over::Window(window) => {
-                                for part_expr in &window.partition_by {
-                                    walk_expr(part_expr, func)?;
-                                }
-                                for sort_col in &window.order_by {
-                                    walk_expr(&sort_col.expr, func)?;
-                                }
-                                if let Some(frame_clause) = &window.frame_clause {
-                                    walk_expr_frame_bound(&frame_clause.start, func)?;
-                                    if let Some(end_bound) = &frame_clause.end {
-                                        walk_expr_frame_bound(end_bound, func)?;
-                                    }
-                                }
-                            }
-                            ast::Over::Name(_) => {}
-                        }
-                    }
-                }
-                ast::Expr::InList { lhs, rhs, .. } => {
-                    walk_expr(lhs, func)?;
-                    for expr in rhs {
-                        walk_expr(expr, func)?;
-                    }
-                }
-                ast::Expr::InSelect { lhs, rhs: _, .. } => {
-                    walk_expr(lhs, func)?;
-                    // TODO: Walk through select statements if needed
-                }
-                ast::Expr::InTable { lhs, args, .. } => {
-                    walk_expr(lhs, func)?;
-                    for expr in args {
-                        walk_expr(expr, func)?;
-                    }
-                }
-                ast::Expr::IsNull(expr) | ast::Expr::NotNull(expr) => {
-                    walk_expr(expr, func)?;
-                }
-                ast::Expr::Like {
-                    lhs, rhs, escape, ..
-                } => {
-                    walk_expr(lhs, func)?;
-                    walk_expr(rhs, func)?;
-                    if let Some(esc_expr) = escape {
-                        walk_expr(esc_expr, func)?;
-                    }
-                }
-                ast::Expr::Parenthesized(exprs) => {
-                    for expr in exprs {
-                        walk_expr(expr, func)?;
-                    }
-                }
-                ast::Expr::Raise(_, expr) => {
-                    if let Some(raise_expr) = expr {
-                        walk_expr(raise_expr, func)?;
-                    }
-                }
-                ast::Expr::Unary(_, expr) => {
-                    walk_expr(expr, func)?;
-                }
-                ast::Expr::Array { .. } | ast::Expr::Subscript { .. } => {
-                    unreachable!(
-                        "Array and Subscript are desugared into function calls by the parser"
-                    )
-                }
-                ast::Expr::Id(_)
-                | ast::Expr::Column { .. }
-                | ast::Expr::RowId { .. }
-                | ast::Expr::Literal(_)
-                | ast::Expr::DoublyQualified(..)
-                | ast::Expr::Name(_)
-                | ast::Expr::Qualified(..)
-                | ast::Expr::Variable(_)
-                | ast::Expr::Register(_)
-                | ast::Expr::Default => {
-                    // No nested expressions
-                }
-                ast::Expr::FieldAccess { base, .. } => {
-                    walk_expr(base, func)?;
-                }
+    let mut stack = SmallVec::<[&'a ast::Expr; 16]>::new();
+    stack.push(expr);
+
+    while let Some(expr) = stack.pop() {
+        if matches!(func(expr)?, WalkControl::Continue) {
+            push_expr_children(expr, &mut stack);
+        }
+    }
+
+    Ok(WalkControl::Continue)
+}
+
+fn push_expr_children<'a>(expr: &'a ast::Expr, stack: &mut SmallVec<[&'a ast::Expr; 16]>) {
+    match expr {
+        ast::Expr::SubqueryResult { lhs, .. } => {
+            if let Some(lhs) = lhs {
+                stack.push(lhs);
             }
         }
-        WalkControl::SkipChildren => return Ok(WalkControl::Continue),
-    };
-    Ok(WalkControl::Continue)
+        ast::Expr::Between {
+            lhs, start, end, ..
+        } => {
+            stack.push(end);
+            stack.push(start);
+            stack.push(lhs);
+        }
+        ast::Expr::Binary(lhs, _, rhs) => {
+            stack.push(rhs);
+            stack.push(lhs);
+        }
+        ast::Expr::Case {
+            base,
+            when_then_pairs,
+            else_expr,
+        } => {
+            if let Some(else_expr) = else_expr {
+                stack.push(else_expr);
+            }
+            for (when_expr, then_expr) in when_then_pairs.iter().rev() {
+                stack.push(then_expr);
+                stack.push(when_expr);
+            }
+            if let Some(base_expr) = base {
+                stack.push(base_expr);
+            }
+        }
+        ast::Expr::Cast { expr, .. }
+        | ast::Expr::Collate(expr, _)
+        | ast::Expr::IsNull(expr)
+        | ast::Expr::NotNull(expr)
+        | ast::Expr::Unary(_, expr)
+        | ast::Expr::FieldAccess { base: expr, .. } => {
+            stack.push(expr);
+        }
+        ast::Expr::Exists(_select) | ast::Expr::Subquery(_select) => {
+            // TODO: Walk through select statements if needed
+        }
+        ast::Expr::FunctionCall {
+            args,
+            order_by,
+            filter_over,
+            ..
+        } => {
+            push_over_clause_exprs(filter_over.over_clause.as_ref(), stack);
+            if let Some(filter_clause) = &filter_over.filter_clause {
+                stack.push(filter_clause);
+            }
+            for sort_col in order_by.iter().rev() {
+                stack.push(&sort_col.expr);
+            }
+            for arg in args.iter().rev() {
+                stack.push(arg);
+            }
+        }
+        ast::Expr::FunctionCallStar { filter_over, .. } => {
+            push_over_clause_exprs(filter_over.over_clause.as_ref(), stack);
+            if let Some(filter_clause) = &filter_over.filter_clause {
+                stack.push(filter_clause);
+            }
+        }
+        ast::Expr::InList { lhs, rhs, .. } => {
+            for expr in rhs.iter().rev() {
+                stack.push(expr);
+            }
+            stack.push(lhs);
+        }
+        ast::Expr::InSelect { lhs, rhs: _, .. } => {
+            // TODO: Walk through select statements if needed
+            stack.push(lhs);
+        }
+        ast::Expr::InTable { lhs, args, .. } => {
+            for expr in args.iter().rev() {
+                stack.push(expr);
+            }
+            stack.push(lhs);
+        }
+        ast::Expr::Like {
+            lhs, rhs, escape, ..
+        } => {
+            if let Some(esc_expr) = escape {
+                stack.push(esc_expr);
+            }
+            stack.push(rhs);
+            stack.push(lhs);
+        }
+        ast::Expr::Parenthesized(exprs) => {
+            for expr in exprs.iter().rev() {
+                stack.push(expr);
+            }
+        }
+        ast::Expr::Raise(_, expr) => {
+            if let Some(raise_expr) = expr {
+                stack.push(raise_expr);
+            }
+        }
+        ast::Expr::Array { .. } | ast::Expr::Subscript { .. } => {
+            unreachable!("Array and Subscript are desugared into function calls by the parser")
+        }
+        ast::Expr::Id(_)
+        | ast::Expr::Column { .. }
+        | ast::Expr::RowId { .. }
+        | ast::Expr::Literal(_)
+        | ast::Expr::DoublyQualified(..)
+        | ast::Expr::Name(_)
+        | ast::Expr::Qualified(..)
+        | ast::Expr::Variable(_)
+        | ast::Expr::Register(_)
+        | ast::Expr::Default => {
+            // No nested expressions
+        }
+    }
+}
+
+fn push_over_clause_exprs<'a>(
+    over_clause: Option<&'a ast::Over>,
+    stack: &mut SmallVec<[&'a ast::Expr; 16]>,
+) {
+    if let Some(ast::Over::Window(window)) = over_clause {
+        if let Some(frame_clause) = &window.frame_clause {
+            if let Some(end_bound) = &frame_clause.end {
+                push_frame_bound_expr(end_bound, stack);
+            }
+            push_frame_bound_expr(&frame_clause.start, stack);
+        }
+        for sort_col in window.order_by.iter().rev() {
+            stack.push(&sort_col.expr);
+        }
+        for part_expr in window.partition_by.iter().rev() {
+            stack.push(part_expr);
+        }
+    }
+}
+
+fn push_frame_bound_expr<'a>(
+    bound: &'a ast::FrameBound,
+    stack: &mut SmallVec<[&'a ast::Expr; 16]>,
+) {
+    match bound {
+        ast::FrameBound::Following(expr) | ast::FrameBound::Preceding(expr) => {
+            stack.push(expr);
+        }
+        ast::FrameBound::CurrentRow
+        | ast::FrameBound::UnboundedFollowing
+        | ast::FrameBound::UnboundedPreceding => {}
+    }
 }
 
 pub fn expr_references_subquery_id(expr: &ast::Expr, subquery_id: TableInternalId) -> bool {
@@ -5783,22 +5780,6 @@ pub fn expr_references_any_subquery(expr: &ast::Expr) -> bool {
         Ok(WalkControl::Continue)
     });
     found
-}
-
-fn walk_expr_frame_bound<'a, F>(bound: &'a ast::FrameBound, func: &mut F) -> Result<WalkControl>
-where
-    F: FnMut(&'a ast::Expr) -> Result<WalkControl>,
-{
-    match bound {
-        ast::FrameBound::Following(expr) | ast::FrameBound::Preceding(expr) => {
-            walk_expr(expr, func)?;
-        }
-        ast::FrameBound::CurrentRow
-        | ast::FrameBound::UnboundedFollowing
-        | ast::FrameBound::UnboundedPreceding => {}
-    }
-
-    Ok(WalkControl::Continue)
 }
 
 /// The precedence of binding identifiers to columns.
@@ -5882,11 +5863,16 @@ pub fn bind_and_rewrite_expr<'a>(
     resolver: &Resolver<'_>,
     binding_behavior: BindingBehavior,
 ) -> Result<()> {
+    let _stack = crate::stack::trace_scope("expr:bind_and_rewrite");
     walk_expr_mut(
         top_level_expr,
         &mut |expr: &mut ast::Expr| -> Result<WalkControl> {
             match expr {
                 Expr::Id(id) => {
+                    let _stack =
+                        crate::stack::trace_scope_with_dynamic_detail("expr:bind_id", || {
+                            id.as_str().to_string()
+                        });
                     let Some(referenced_tables) = &mut referenced_tables else {
                         if binding_behavior == BindingBehavior::AllowUnboundIdentifiers {
                             return Ok(WalkControl::Continue);
@@ -6045,6 +6031,7 @@ pub fn bind_and_rewrite_expr<'a>(
                     }
                 }
                 Expr::Qualified(tbl, id) => {
+                    let _stack = crate::stack::trace_scope("expr:bind_qualified");
                     // Resolve a `<tbl>.<id>` reference.
                     //
                     // Two-stage lookup with shadowing:
@@ -6066,8 +6053,14 @@ pub fn bind_and_rewrite_expr<'a>(
                             id.as_str()
                         );
                     };
-                    let normalized_table_name = normalize_ident(tbl.as_str());
-                    let normalized_id = normalize_ident(id.as_str());
+                    let normalized_table_name = {
+                        let _stack = crate::stack::trace_scope("expr:qualified:normalize_table");
+                        normalize_ident(tbl.as_str())
+                    };
+                    let normalized_id = {
+                        let _stack = crate::stack::trace_scope("expr:qualified:normalize_column");
+                        normalize_ident(id.as_str())
+                    };
 
                     // `resolved` holds the accepted binding (at most one).
                     // `identifier_matched` is true once *any* scope produced a table whose
@@ -6085,39 +6078,42 @@ pub fn bind_and_rewrite_expr<'a>(
                     };
 
                     // --- Stage 1: search the current scope's FROM tables. ---
-                    for joined_table in referenced_tables
-                        .joined_tables()
-                        .iter()
-                        .filter(|t| t.identifier == normalized_table_name)
                     {
-                        identifier_matched = true;
-                        let Some(candidate) = resolve_qualified_on_ref(
-                            &joined_table.table,
-                            joined_table.internal_id,
-                            &normalized_id,
-                        )?
-                        else {
-                            continue;
-                        };
+                        let _stack = crate::stack::trace_scope("expr:qualified:find_table");
+                        for joined_table in referenced_tables
+                            .joined_tables()
+                            .iter()
+                            .filter(|t| t.identifier == normalized_table_name)
+                        {
+                            identifier_matched = true;
+                            let Some(candidate) = resolve_qualified_on_ref(
+                                &joined_table.table,
+                                joined_table.internal_id,
+                                &normalized_id,
+                            )?
+                            else {
+                                continue;
+                            };
 
-                        // Multiple FROM tables share this identifier and both contain `id`.
-                        // For column matches, a USING/NATURAL join on `id` lets the first
-                        // match stand (the duplicate side is implicitly merged). Rowid
-                        // matches never get this exception (rowid isn't a USING column).
-                        if resolved.is_some() {
-                            let allowed_by_using =
-                                matches!(candidate, QualifiedMatch::Column { .. })
-                                    && joined_table.join_info.as_ref().is_some_and(|ji| {
-                                        ji.using.iter().any(|u| {
-                                            u.as_str().eq_ignore_ascii_case(&normalized_id)
-                                        })
-                                    });
-                            if !allowed_by_using {
-                                return Err(ambiguous());
+                            // Multiple FROM tables share this identifier and both contain `id`.
+                            // For column matches, a USING/NATURAL join on `id` lets the first
+                            // match stand (the duplicate side is implicitly merged). Rowid
+                            // matches never get this exception (rowid isn't a USING column).
+                            if resolved.is_some() {
+                                let allowed_by_using =
+                                    matches!(candidate, QualifiedMatch::Column { .. })
+                                        && joined_table.join_info.as_ref().is_some_and(|ji| {
+                                            ji.using.iter().any(|u| {
+                                                u.as_str().eq_ignore_ascii_case(&normalized_id)
+                                            })
+                                        });
+                                if !allowed_by_using {
+                                    return Err(ambiguous());
+                                }
+                                continue;
                             }
-                            continue;
+                            resolved = Some((joined_table.internal_id, candidate));
                         }
-                        resolved = Some((joined_table.internal_id, candidate));
                     }
                     // --- Stage 2: fall back to enclosing scopes ---
                     // Only attempted if no inner-scope table matched the identifier — an
@@ -6133,6 +6129,7 @@ pub fn bind_and_rewrite_expr<'a>(
                     // CTE is consumed into a FROM, column resolution must go through the
                     // corresponding `joined_table`, not the definition-only ref.
                     if !identifier_matched {
+                        let _stack = crate::stack::trace_scope("expr:qualified:find_outer_ref");
                         let nearest_outer_scope = referenced_tables
                             .outer_query_refs()
                             .iter()
@@ -6192,14 +6189,18 @@ pub fn bind_and_rewrite_expr<'a>(
                         // The `cte_id`/`cte_select` check restricts this to real CTE
                         // definition refs so any other future use of `cte_definition_only`
                         // still falls through to "no such table".
-                        if referenced_tables
-                            .find_outer_query_ref_by_identifier(&normalized_table_name)
-                            .is_some_and(|outer_ref| {
-                                outer_ref.cte_definition_only
-                                    && (outer_ref.cte_id.is_some()
-                                        || outer_ref.cte_select.is_some())
-                            })
-                        {
+                        let is_definition_only_cte = {
+                            let _stack =
+                                crate::stack::trace_scope("expr:qualified:outer_ref_check");
+                            referenced_tables
+                                .find_outer_query_ref_by_identifier(&normalized_table_name)
+                                .is_some_and(|outer_ref| {
+                                    outer_ref.cte_definition_only
+                                        && (outer_ref.cte_id.is_some()
+                                            || outer_ref.cte_select.is_some())
+                                })
+                        };
+                        if is_definition_only_cte {
                             crate::bail_parse_error!(
                                 "no such column: {}.{}",
                                 tbl.as_str(),
@@ -6220,20 +6221,36 @@ pub fn bind_and_rewrite_expr<'a>(
                         // We do NOT reject ambiguous schemas at CREATE TABLE time because
                         // the combinatorial explosion (CREATE TYPE, CREATE TABLE, ALTER TABLE)
                         // makes that impractical. Deterministic precedence is sufficient.
-                        let field_name = normalize_ident(id.as_str());
-                        if let Some(m) = find_custom_type_column(
-                            referenced_tables,
-                            &normalized_table_name,
-                            resolver,
-                        )? {
-                            *expr = make_field_access_expr(
-                                m.table_id,
-                                m.col_idx,
-                                m.is_rowid_alias,
-                                &field_name,
-                                m.type_def,
-                            );
-                            referenced_tables.mark_column_used(m.table_id, m.col_idx);
+                        let field_name = {
+                            let _stack =
+                                crate::stack::trace_scope("expr:qualified:normalize_field");
+                            normalize_ident(id.as_str())
+                        };
+                        if let Some(m) = {
+                            let _stack =
+                                crate::stack::trace_scope("expr:qualified:find_custom_type_column");
+                            find_custom_type_column(
+                                referenced_tables,
+                                &normalized_table_name,
+                                resolver,
+                            )?
+                        } {
+                            {
+                                let _stack =
+                                    crate::stack::trace_scope("expr:qualified:make_field_access");
+                                *expr = make_field_access_expr(
+                                    m.table_id,
+                                    m.col_idx,
+                                    m.is_rowid_alias,
+                                    &field_name,
+                                    m.type_def,
+                                );
+                            }
+                            {
+                                let _stack =
+                                    crate::stack::trace_scope("expr:qualified:mark_column_used");
+                                referenced_tables.mark_column_used(m.table_id, m.col_idx);
+                            }
                             return Ok(WalkControl::Continue);
                         }
                         crate::bail_parse_error!("no such table: {}", normalized_table_name);
@@ -6249,27 +6266,44 @@ pub fn bind_and_rewrite_expr<'a>(
                             col_idx,
                             is_rowid_alias,
                         } => {
-                            *expr = Expr::Column {
-                                database: None, // TODO: support different databases
-                                table: tbl_id,
-                                column: col_idx,
-                                is_rowid_alias,
-                            };
+                            {
+                                let _stack =
+                                    crate::stack::trace_scope("expr:qualified:rewrite_column");
+                                *expr = Expr::Column {
+                                    database: None, // TODO: support different databases
+                                    table: tbl_id,
+                                    column: col_idx,
+                                    is_rowid_alias,
+                                };
+                            }
                             tracing::debug!("rewritten to column");
-                            referenced_tables.mark_column_used(tbl_id, col_idx);
+                            {
+                                let _stack =
+                                    crate::stack::trace_scope("expr:qualified:mark_column_used");
+                                referenced_tables.mark_column_used(tbl_id, col_idx);
+                            }
                         }
                         QualifiedMatch::RowId => {
-                            *expr = Expr::RowId {
-                                database: None, // TODO: support different databases
-                                table: tbl_id,
-                            };
+                            {
+                                let _stack =
+                                    crate::stack::trace_scope("expr:qualified:rewrite_rowid");
+                                *expr = Expr::RowId {
+                                    database: None, // TODO: support different databases
+                                    table: tbl_id,
+                                };
+                            }
                             tracing::debug!("rewritten to rowid");
-                            referenced_tables.mark_rowid_referenced(tbl_id);
+                            {
+                                let _stack =
+                                    crate::stack::trace_scope("expr:qualified:mark_rowid_used");
+                                referenced_tables.mark_rowid_referenced(tbl_id);
+                            }
                         }
                     }
                     return Ok(WalkControl::Continue);
                 }
                 Expr::DoublyQualified(db_name, tbl_name, col_name) => {
+                    let _stack = crate::stack::trace_scope("expr:bind_doubly_qualified");
                     // Clone the names upfront so we can reassign *expr later
                     // without lifetime conflicts.
                     let db_name_str = db_name.as_str().to_string();
@@ -6879,196 +6913,240 @@ fn validate_custom_type_function_call(
     Ok(())
 }
 
-/// Recursively walks a mutable expression, applying a function to each sub-expression.
+/// Walks a mutable expression in pre-order, applying a function to each sub-expression.
 pub fn walk_expr_mut<F>(expr: &mut ast::Expr, func: &mut F) -> Result<WalkControl>
 where
     F: FnMut(&mut ast::Expr) -> Result<WalkControl>,
 {
-    match func(expr)? {
-        WalkControl::Continue => {
-            match expr {
-                ast::Expr::SubqueryResult { lhs, .. } => {
-                    if let Some(lhs) = lhs {
-                        walk_expr_mut(lhs, func)?;
-                    }
-                }
-                ast::Expr::Between {
-                    lhs, start, end, ..
-                } => {
-                    walk_expr_mut(lhs, func)?;
-                    walk_expr_mut(start, func)?;
-                    walk_expr_mut(end, func)?;
-                }
-                ast::Expr::Binary(lhs, _, rhs) => {
-                    walk_expr_mut(lhs, func)?;
-                    walk_expr_mut(rhs, func)?;
-                }
-                ast::Expr::Case {
-                    base,
-                    when_then_pairs,
-                    else_expr,
-                } => {
-                    if let Some(base_expr) = base {
-                        walk_expr_mut(base_expr, func)?;
-                    }
-                    for (when_expr, then_expr) in when_then_pairs {
-                        walk_expr_mut(when_expr, func)?;
-                        walk_expr_mut(then_expr, func)?;
-                    }
-                    if let Some(else_expr) = else_expr {
-                        walk_expr_mut(else_expr, func)?;
-                    }
-                }
-                ast::Expr::Cast { expr, .. } => {
-                    walk_expr_mut(expr, func)?;
-                }
-                ast::Expr::Collate(expr, _) => {
-                    walk_expr_mut(expr, func)?;
-                }
-                ast::Expr::Exists(_) | ast::Expr::Subquery(_) => {
-                    // TODO: Walk through select statements if needed
-                }
-                ast::Expr::FunctionCall {
-                    args,
-                    order_by,
-                    filter_over,
-                    ..
-                } => {
-                    for arg in args {
-                        walk_expr_mut(arg, func)?;
-                    }
-                    for sort_col in order_by {
-                        walk_expr_mut(&mut sort_col.expr, func)?;
-                    }
-                    if let Some(filter_clause) = &mut filter_over.filter_clause {
-                        walk_expr_mut(filter_clause, func)?;
-                    }
-                    if let Some(over_clause) = &mut filter_over.over_clause {
-                        match over_clause {
-                            ast::Over::Window(window) => {
-                                for part_expr in &mut window.partition_by {
-                                    walk_expr_mut(part_expr, func)?;
-                                }
-                                for sort_col in &mut window.order_by {
-                                    walk_expr_mut(&mut sort_col.expr, func)?;
-                                }
-                                if let Some(frame_clause) = &mut window.frame_clause {
-                                    walk_expr_mut_frame_bound(&mut frame_clause.start, func)?;
-                                    if let Some(end_bound) = &mut frame_clause.end {
-                                        walk_expr_mut_frame_bound(end_bound, func)?;
-                                    }
-                                }
-                            }
-                            ast::Over::Name(_) => {}
-                        }
-                    }
-                }
-                ast::Expr::FunctionCallStar { filter_over, .. } => {
-                    if let Some(ref mut filter_clause) = filter_over.filter_clause {
-                        walk_expr_mut(filter_clause, func)?;
-                    }
-                    if let Some(ref mut over_clause) = filter_over.over_clause {
-                        match over_clause {
-                            ast::Over::Window(window) => {
-                                for part_expr in &mut window.partition_by {
-                                    walk_expr_mut(part_expr, func)?;
-                                }
-                                for sort_col in &mut window.order_by {
-                                    walk_expr_mut(&mut sort_col.expr, func)?;
-                                }
-                                if let Some(frame_clause) = &mut window.frame_clause {
-                                    walk_expr_mut_frame_bound(&mut frame_clause.start, func)?;
-                                    if let Some(end_bound) = &mut frame_clause.end {
-                                        walk_expr_mut_frame_bound(end_bound, func)?;
-                                    }
-                                }
-                            }
-                            ast::Over::Name(_) => {}
-                        }
-                    }
-                }
-                ast::Expr::InList { lhs, rhs, .. } => {
-                    walk_expr_mut(lhs, func)?;
-                    for expr in rhs {
-                        walk_expr_mut(expr, func)?;
-                    }
-                }
-                ast::Expr::InSelect { lhs, rhs: _, .. } => {
-                    walk_expr_mut(lhs, func)?;
-                    // TODO: Walk through select statements if needed
-                }
-                ast::Expr::InTable { lhs, args, .. } => {
-                    walk_expr_mut(lhs, func)?;
-                    for expr in args {
-                        walk_expr_mut(expr, func)?;
-                    }
-                }
-                ast::Expr::IsNull(expr) | ast::Expr::NotNull(expr) => {
-                    walk_expr_mut(expr, func)?;
-                }
-                ast::Expr::Like {
-                    lhs, rhs, escape, ..
-                } => {
-                    walk_expr_mut(lhs, func)?;
-                    walk_expr_mut(rhs, func)?;
-                    if let Some(esc_expr) = escape {
-                        walk_expr_mut(esc_expr, func)?;
-                    }
-                }
-                ast::Expr::Parenthesized(exprs) => {
-                    for expr in exprs {
-                        walk_expr_mut(expr, func)?;
-                    }
-                }
-                ast::Expr::Raise(_, expr) => {
-                    if let Some(raise_expr) = expr {
-                        walk_expr_mut(raise_expr, func)?;
-                    }
-                }
-                ast::Expr::Unary(_, expr) => {
-                    walk_expr_mut(expr, func)?;
-                }
-                ast::Expr::Array { .. } | ast::Expr::Subscript { .. } => {
-                    unreachable!(
-                        "Array and Subscript are desugared into function calls by the parser"
-                    )
-                }
-                ast::Expr::Id(_)
-                | ast::Expr::Column { .. }
-                | ast::Expr::RowId { .. }
-                | ast::Expr::Literal(_)
-                | ast::Expr::DoublyQualified(..)
-                | ast::Expr::Name(_)
-                | ast::Expr::Qualified(..)
-                | ast::Expr::Variable(_)
-                | ast::Expr::Register(_)
-                | ast::Expr::Default => {
-                    // No nested expressions
-                }
-                ast::Expr::FieldAccess { base, .. } => {
-                    walk_expr_mut(base, func)?;
-                }
-            }
+    let mut stack = SmallVec::<[*mut ast::Expr; 16]>::new();
+    stack.push(expr);
+
+    while let Some(expr_ptr) = stack.pop() {
+        // SAFETY: Pointers pushed onto the stack are derived from the unique
+        // mutable borrow of the root expression. The walker visits each node at
+        // most once and never mutates ancestor containers after child pointers
+        // have been pushed.
+        let expr = unsafe { &mut *expr_ptr };
+        if matches!(func(expr)?, WalkControl::Continue) {
+            push_expr_children_mut(expr, &mut stack);
         }
-        WalkControl::SkipChildren => return Ok(WalkControl::Continue),
-    };
+    }
+
     Ok(WalkControl::Continue)
 }
 
-fn walk_expr_mut_frame_bound<F>(bound: &mut ast::FrameBound, func: &mut F) -> Result<WalkControl>
-where
-    F: FnMut(&mut ast::Expr) -> Result<WalkControl>,
-{
+fn push_expr_children_mut(expr: &mut ast::Expr, stack: &mut SmallVec<[*mut ast::Expr; 16]>) {
+    match expr {
+        ast::Expr::SubqueryResult { lhs, .. } => {
+            if let Some(lhs) = lhs {
+                stack.push(&mut **lhs);
+            }
+        }
+        ast::Expr::Between {
+            lhs, start, end, ..
+        } => {
+            stack.push(&mut **end);
+            stack.push(&mut **start);
+            stack.push(&mut **lhs);
+        }
+        ast::Expr::Binary(lhs, _, rhs) => {
+            stack.push(&mut **rhs);
+            stack.push(&mut **lhs);
+        }
+        ast::Expr::Case {
+            base,
+            when_then_pairs,
+            else_expr,
+        } => {
+            if let Some(else_expr) = else_expr {
+                stack.push(&mut **else_expr);
+            }
+            for (when_expr, then_expr) in when_then_pairs.iter_mut().rev() {
+                stack.push(&mut **then_expr);
+                stack.push(&mut **when_expr);
+            }
+            if let Some(base_expr) = base {
+                stack.push(&mut **base_expr);
+            }
+        }
+        ast::Expr::Cast { expr, .. }
+        | ast::Expr::Collate(expr, _)
+        | ast::Expr::IsNull(expr)
+        | ast::Expr::NotNull(expr)
+        | ast::Expr::Unary(_, expr)
+        | ast::Expr::FieldAccess { base: expr, .. } => {
+            stack.push(&mut **expr);
+        }
+        ast::Expr::Exists(_) | ast::Expr::Subquery(_) => {
+            // TODO: Walk through select statements if needed
+        }
+        ast::Expr::FunctionCall {
+            args,
+            order_by,
+            filter_over,
+            ..
+        } => {
+            push_over_clause_exprs_mut(filter_over.over_clause.as_mut(), stack);
+            if let Some(filter_clause) = &mut filter_over.filter_clause {
+                stack.push(&mut **filter_clause);
+            }
+            for sort_col in order_by.iter_mut().rev() {
+                stack.push(&mut *sort_col.expr);
+            }
+            for arg in args.iter_mut().rev() {
+                stack.push(&mut **arg);
+            }
+        }
+        ast::Expr::FunctionCallStar { filter_over, .. } => {
+            push_over_clause_exprs_mut(filter_over.over_clause.as_mut(), stack);
+            if let Some(filter_clause) = &mut filter_over.filter_clause {
+                stack.push(&mut **filter_clause);
+            }
+        }
+        ast::Expr::InList { lhs, rhs, .. } => {
+            for expr in rhs.iter_mut().rev() {
+                stack.push(&mut **expr);
+            }
+            stack.push(&mut **lhs);
+        }
+        ast::Expr::InSelect { lhs, rhs: _, .. } => {
+            // TODO: Walk through select statements if needed
+            stack.push(&mut **lhs);
+        }
+        ast::Expr::InTable { lhs, args, .. } => {
+            for expr in args.iter_mut().rev() {
+                stack.push(&mut **expr);
+            }
+            stack.push(&mut **lhs);
+        }
+        ast::Expr::Like {
+            lhs, rhs, escape, ..
+        } => {
+            if let Some(esc_expr) = escape {
+                stack.push(&mut **esc_expr);
+            }
+            stack.push(&mut **rhs);
+            stack.push(&mut **lhs);
+        }
+        ast::Expr::Parenthesized(exprs) => {
+            for expr in exprs.iter_mut().rev() {
+                stack.push(&mut **expr);
+            }
+        }
+        ast::Expr::Raise(_, expr) => {
+            if let Some(raise_expr) = expr {
+                stack.push(&mut **raise_expr);
+            }
+        }
+        ast::Expr::Array { .. } | ast::Expr::Subscript { .. } => {
+            unreachable!("Array and Subscript are desugared into function calls by the parser")
+        }
+        ast::Expr::Id(_)
+        | ast::Expr::Column { .. }
+        | ast::Expr::RowId { .. }
+        | ast::Expr::Literal(_)
+        | ast::Expr::DoublyQualified(..)
+        | ast::Expr::Name(_)
+        | ast::Expr::Qualified(..)
+        | ast::Expr::Variable(_)
+        | ast::Expr::Register(_)
+        | ast::Expr::Default => {
+            // No nested expressions
+        }
+    }
+}
+
+fn push_over_clause_exprs_mut(
+    over_clause: Option<&mut ast::Over>,
+    stack: &mut SmallVec<[*mut ast::Expr; 16]>,
+) {
+    if let Some(ast::Over::Window(window)) = over_clause {
+        if let Some(frame_clause) = &mut window.frame_clause {
+            if let Some(end_bound) = &mut frame_clause.end {
+                push_frame_bound_expr_mut(end_bound, stack);
+            }
+            push_frame_bound_expr_mut(&mut frame_clause.start, stack);
+        }
+        for sort_col in window.order_by.iter_mut().rev() {
+            stack.push(&mut *sort_col.expr);
+        }
+        for part_expr in window.partition_by.iter_mut().rev() {
+            stack.push(&mut **part_expr);
+        }
+    }
+}
+
+fn push_frame_bound_expr_mut(
+    bound: &mut ast::FrameBound,
+    stack: &mut SmallVec<[*mut ast::Expr; 16]>,
+) {
     match bound {
         ast::FrameBound::Following(expr) | ast::FrameBound::Preceding(expr) => {
-            walk_expr_mut(expr, func)?;
+            stack.push(&mut **expr);
         }
         ast::FrameBound::CurrentRow
         | ast::FrameBound::UnboundedFollowing
         | ast::FrameBound::UnboundedPreceding => {}
     }
+}
 
-    Ok(WalkControl::Continue)
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use turso_parser::ast::{Literal, Operator};
+
+    fn numeric(value: &str) -> ast::Expr {
+        ast::Expr::Literal(Literal::Numeric(value.to_string()))
+    }
+
+    fn describe_expr(expr: &ast::Expr) -> String {
+        match expr {
+            ast::Expr::Between { .. } => "between".to_string(),
+            ast::Expr::Binary(_, op, _) => format!("binary:{op:?}"),
+            ast::Expr::Id(name) => format!("id:{}", name.as_str()),
+            ast::Expr::Literal(Literal::Numeric(value)) => format!("num:{value}"),
+            other => format!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn walk_expr_visits_nodes_in_preorder() {
+        let expr = ast::Expr::between(
+            ast::Expr::binary(numeric("1"), Operator::Add, numeric("2")),
+            false,
+            numeric("3"),
+            numeric("4"),
+        );
+        let mut visited = Vec::new();
+
+        walk_expr(&expr, &mut |expr| {
+            visited.push(describe_expr(expr));
+            Ok(WalkControl::Continue)
+        })
+        .unwrap();
+
+        assert_eq!(
+            visited,
+            ["between", "binary:Add", "num:1", "num:2", "num:3", "num:4"]
+        );
+    }
+
+    #[test]
+    fn walk_expr_mut_visits_children_added_by_callback() {
+        let mut expr = ast::Expr::Id(ast::Name::from_bytes(b"root"));
+        let mut visited = Vec::new();
+
+        walk_expr_mut(&mut expr, &mut |expr| {
+            visited.push(describe_expr(expr));
+            if matches!(expr, ast::Expr::Id(_)) {
+                *expr = ast::Expr::binary(numeric("1"), Operator::Add, numeric("2"));
+            }
+            Ok(WalkControl::Continue)
+        })
+        .unwrap();
+
+        assert_eq!(visited, ["id:root", "num:1", "num:2"]);
+    }
 }
 
 #[derive(Debug, Clone, Copy)]

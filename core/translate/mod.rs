@@ -77,52 +77,79 @@ pub fn translate(
     query_mode: QueryMode,
     input: &str,
 ) -> Result<Program> {
+    let _stack = crate::stack::trace_scope("translate");
     tracing::trace!("querying {}", input);
-    let change_cnt_on = matches!(
-        stmt,
-        ast::Stmt::CreateIndex { .. }
-            | ast::Stmt::Delete { .. }
-            | ast::Stmt::Insert { .. }
-            | ast::Stmt::Update { .. }
-    );
-
-    // Boxed so the ~800 B builder sits on the heap instead of the prepare frame.
-    let mut program = Box::new(ProgramBuilder::new(
-        query_mode,
-        connection.get_capture_data_changes_info().clone(),
-        // These options will be extended whithin each translate program
-        ProgramBuilderOpts::new(1, 32, 2),
-    ));
-
-    program.prologue();
-    let mut resolver = Resolver::new(
-        schema,
-        connection.database_schemas(),
-        &connection.temp.database,
-        connection.attached_databases(),
-        syms,
-        connection.experimental_custom_types_enabled(),
-        connection.get_dqs_dml().into(),
-    );
-
-    match stmt {
-        // There can be no nesting with pragma, so lift it up here
-        ast::Stmt::Pragma { name, body } => {
-            pragma::translate_pragma(
-                &resolver,
-                &name,
-                body,
-                pager,
-                connection.clone(),
-                &mut program,
-            )?;
-        }
-        stmt => translate_inner(stmt, &mut resolver, &mut program, &connection, input)?,
+    let change_cnt_on = {
+        let _stack = crate::stack::trace_scope("translate:change_count");
+        matches!(
+            stmt,
+            ast::Stmt::CreateIndex { .. }
+                | ast::Stmt::Delete { .. }
+                | ast::Stmt::Insert { .. }
+                | ast::Stmt::Update { .. }
+        )
     };
 
-    program.epilogue(schema);
+    // Boxed so the ~800 B builder sits on the heap instead of the prepare frame.
+    let mut program = {
+        let _stack = crate::stack::trace_scope("translate:program_builder_new");
+        Box::new(ProgramBuilder::new(
+            query_mode,
+            connection.get_capture_data_changes_info().clone(),
+            // These options will be extended whithin each translate program
+            ProgramBuilderOpts::new(1, 32, 2),
+        ))
+    };
 
-    program.build(connection, change_cnt_on, input)
+    {
+        let _stack = crate::stack::trace_scope("translate:prologue");
+        program.prologue();
+    }
+    let mut resolver = {
+        let _stack = crate::stack::trace_scope("translate:resolver_new");
+        Resolver::new(
+            schema,
+            connection.database_schemas(),
+            &connection.temp.database,
+            connection.attached_databases(),
+            syms,
+            connection.experimental_custom_types_enabled(),
+            connection.get_dqs_dml().into(),
+        )
+    };
+
+    {
+        let _stack = crate::stack::trace_scope("translate:dispatch");
+        match stmt {
+            // There can be no nesting with pragma, so lift it up here
+            ast::Stmt::Pragma { name, body } => {
+                pragma::translate_pragma(
+                    &resolver,
+                    &name,
+                    body,
+                    pager,
+                    connection.clone(),
+                    &mut program,
+                )?;
+            }
+            stmt => translate_inner(stmt, &mut resolver, &mut program, &connection, input)?,
+        }
+    };
+
+    {
+        let _stack = crate::stack::trace_scope("translate:compile_deferred_triggers");
+        trigger_exec::compile_deferred_trigger_programs(&mut program, &mut resolver, &connection)?;
+    }
+
+    {
+        let _stack = crate::stack::trace_scope("translate:epilogue");
+        program.epilogue(schema);
+    }
+
+    {
+        let _stack = crate::stack::trace_scope("translate:build");
+        program.build(connection, change_cnt_on, input)
+    }
 }
 
 // TODO: for now leaving the return value as a Program. But ideally to support nested parsing of arbitraty
@@ -135,30 +162,37 @@ pub fn translate_inner(
     connection: &Arc<Connection>,
     input: &str,
 ) -> Result<()> {
-    let is_write = matches!(
-        stmt,
-        ast::Stmt::AlterTable { .. }
-            | ast::Stmt::Analyze { .. }
-            | ast::Stmt::CreateIndex { .. }
-            | ast::Stmt::CreateTable { .. }
-            | ast::Stmt::CreateTrigger { .. }
-            | ast::Stmt::CreateView { .. }
-            | ast::Stmt::CreateMaterializedView { .. }
-            | ast::Stmt::CreateVirtualTable(..)
-            | ast::Stmt::CreateType { .. }
-            | ast::Stmt::CreateDomain { .. }
-            | ast::Stmt::Delete { .. }
-            | ast::Stmt::DropIndex { .. }
-            | ast::Stmt::DropTable { .. }
-            | ast::Stmt::DropType { .. }
-            | ast::Stmt::DropDomain { .. }
-            | ast::Stmt::DropView { .. }
-            | ast::Stmt::Reindex { .. }
-            | ast::Stmt::Optimize { .. }
-            | ast::Stmt::Update { .. }
-            | ast::Stmt::Insert { .. }
-    );
-    let is_vacuum = matches!(stmt, ast::Stmt::Vacuum { .. });
+    let _stack = crate::stack::trace_scope_with_detail("translate_inner", stmt_kind(&stmt));
+    let is_write = {
+        let _stack = crate::stack::trace_scope("translate_inner:classify_write");
+        matches!(
+            stmt,
+            ast::Stmt::AlterTable { .. }
+                | ast::Stmt::Analyze { .. }
+                | ast::Stmt::CreateIndex { .. }
+                | ast::Stmt::CreateTable { .. }
+                | ast::Stmt::CreateTrigger { .. }
+                | ast::Stmt::CreateView { .. }
+                | ast::Stmt::CreateMaterializedView { .. }
+                | ast::Stmt::CreateVirtualTable(..)
+                | ast::Stmt::CreateType { .. }
+                | ast::Stmt::CreateDomain { .. }
+                | ast::Stmt::Delete { .. }
+                | ast::Stmt::DropIndex { .. }
+                | ast::Stmt::DropTable { .. }
+                | ast::Stmt::DropType { .. }
+                | ast::Stmt::DropDomain { .. }
+                | ast::Stmt::DropView { .. }
+                | ast::Stmt::Reindex { .. }
+                | ast::Stmt::Optimize { .. }
+                | ast::Stmt::Update { .. }
+                | ast::Stmt::Insert { .. }
+        )
+    };
+    let is_vacuum = {
+        let _stack = crate::stack::trace_scope("translate_inner:classify_vacuum");
+        matches!(stmt, ast::Stmt::Vacuum { .. })
+    };
 
     if is_vacuum && connection.get_query_only() {
         bail_parse_error!("Cannot execute VACUUM in query_only mode")
@@ -168,253 +202,307 @@ pub fn translate_inner(
         bail_parse_error!("Cannot execute write statement in query_only mode")
     }
 
-    let is_select = matches!(stmt, ast::Stmt::Select { .. });
+    let is_select = {
+        let _stack = crate::stack::trace_scope("translate_inner:classify_select");
+        matches!(stmt, ast::Stmt::Select { .. })
+    };
 
-    match stmt {
-        ast::Stmt::AlterTable(alter) => {
-            translate_alter_table(alter, resolver, program, connection, input)?;
-        }
-        ast::Stmt::Analyze { name } => translate_analyze(name, resolver, program)?,
-        ast::Stmt::Attach { expr, db_name, key } => {
-            attach::translate_attach(&expr, resolver, &db_name, &key, program, connection.clone())?;
-        }
-        ast::Stmt::Begin { typ, name } => translate_tx_begin(typ, name, resolver, program)?,
-        ast::Stmt::Commit { name } => {
-            translate_tx_commit(name, resolver.schema(), resolver, program)?
-        }
-        ast::Stmt::CreateIndex { .. } => {
-            translate_create_index(program, connection, resolver, stmt)?;
-        }
-        ast::Stmt::CreateTable {
-            temporary,
-            if_not_exists,
-            tbl_name,
-            body,
-        } => translate_create_table(
-            tbl_name,
-            resolver,
-            temporary,
-            if_not_exists,
-            body,
-            program,
-            connection,
-        )?,
-        ast::Stmt::CreateTrigger {
-            temporary,
-            if_not_exists,
-            trigger_name,
-            time,
-            event,
-            tbl_name,
-            for_each_row,
-            when_clause,
-            commands,
-        } => {
-            // Reconstruct SQL for storage
-            let sql = trigger::create_trigger_to_sql(
+    {
+        let _stack = crate::stack::trace_scope("translate_inner:dispatch");
+        match stmt {
+            ast::Stmt::AlterTable(alter) => {
+                translate_alter_table(alter, resolver, program, connection, input)?;
+            }
+            ast::Stmt::Analyze { name } => translate_analyze(name, resolver, program)?,
+            ast::Stmt::Attach { expr, db_name, key } => {
+                attach::translate_attach(
+                    &expr,
+                    resolver,
+                    &db_name,
+                    &key,
+                    program,
+                    connection.clone(),
+                )?;
+            }
+            ast::Stmt::Begin { typ, name } => translate_tx_begin(typ, name, resolver, program)?,
+            ast::Stmt::Commit { name } => {
+                translate_tx_commit(name, resolver.schema(), resolver, program)?
+            }
+            ast::Stmt::CreateIndex { .. } => {
+                translate_create_index(program, connection, resolver, stmt)?;
+            }
+            ast::Stmt::CreateTable {
                 temporary,
                 if_not_exists,
-                &trigger_name,
-                time,
-                &event,
-                &tbl_name,
-                for_each_row,
-                when_clause.as_deref(),
-                &commands,
-            );
-            trigger::translate_create_trigger(
-                trigger_name,
-                resolver,
-                temporary,
-                if_not_exists,
-                time,
                 tbl_name,
-                program,
-                sql,
-                &commands,
-                when_clause.as_deref(),
-            )?
-        }
-        ast::Stmt::CreateView {
-            view_name,
-            select,
-            columns,
-            ..
-        } => view::translate_create_view(&view_name, resolver, &select, &columns, program)?,
-        ast::Stmt::CreateMaterializedView {
-            view_name, select, ..
-        } => view::translate_create_materialized_view(
-            &view_name,
-            resolver,
-            &select,
-            connection.clone(),
-            program,
-        )?,
-        ast::Stmt::CreateVirtualTable(vtab) => {
-            translate_create_virtual_table(vtab, resolver, program, connection)?
-        }
-        ast::Stmt::Delete {
-            tbl_name,
-            where_clause,
-            limit,
-            returning,
-            indexed,
-            order_by,
-            with,
-        } => {
-            if !order_by.is_empty() {
-                bail_parse_error!("ORDER BY clause is not supported in DELETE");
-            }
-            if where_clause.is_none() && connection.get_dml_require_where() {
-                bail_parse_error!(
-                    "DELETE without a WHERE clause is not allowed when require_where (or i_am_a_dummy) is enabled"
-                );
-            }
-            translate_delete(
-                &tbl_name,
+                body,
+            } => translate_create_table(
+                tbl_name,
                 resolver,
+                temporary,
+                if_not_exists,
+                body,
+                program,
+                connection,
+            )?,
+            ast::Stmt::CreateTrigger {
+                temporary,
+                if_not_exists,
+                trigger_name,
+                time,
+                event,
+                tbl_name,
+                for_each_row,
+                when_clause,
+                commands,
+            } => {
+                // Reconstruct SQL for storage
+                let sql = {
+                    let _stack = crate::stack::trace_scope("trigger:create_to_sql");
+                    trigger::create_trigger_to_sql(
+                        temporary,
+                        if_not_exists,
+                        &trigger_name,
+                        time,
+                        &event,
+                        &tbl_name,
+                        for_each_row,
+                        when_clause.as_deref(),
+                        &commands,
+                    )
+                };
+                trigger::translate_create_trigger(
+                    trigger_name,
+                    resolver,
+                    temporary,
+                    if_not_exists,
+                    time,
+                    tbl_name,
+                    program,
+                    sql,
+                    &commands,
+                    when_clause.as_deref(),
+                )?
+            }
+            ast::Stmt::CreateView {
+                view_name,
+                select,
+                columns,
+                ..
+            } => view::translate_create_view(&view_name, resolver, &select, &columns, program)?,
+            ast::Stmt::CreateMaterializedView {
+                view_name, select, ..
+            } => view::translate_create_materialized_view(
+                &view_name,
+                resolver,
+                &select,
+                connection.clone(),
+                program,
+            )?,
+            ast::Stmt::CreateVirtualTable(vtab) => {
+                translate_create_virtual_table(vtab, resolver, program, connection)?
+            }
+            ast::Stmt::Delete {
+                tbl_name,
                 where_clause,
                 limit,
                 returning,
                 indexed,
+                order_by,
+                with,
+            } => {
+                if !order_by.is_empty() {
+                    bail_parse_error!("ORDER BY clause is not supported in DELETE");
+                }
+                if where_clause.is_none() && connection.get_dml_require_where() {
+                    bail_parse_error!(
+                    "DELETE without a WHERE clause is not allowed when require_where (or i_am_a_dummy) is enabled"
+                );
+                }
+                translate_delete(
+                    &tbl_name,
+                    resolver,
+                    where_clause,
+                    limit,
+                    returning,
+                    indexed,
+                    with,
+                    program,
+                    connection,
+                )?
+            }
+            ast::Stmt::Detach { name } => {
+                attach::translate_detach(&name, resolver, program, connection.clone())?
+            }
+            ast::Stmt::DropIndex {
+                if_exists,
+                idx_name,
+            } => translate_drop_index(&idx_name, resolver, if_exists, program)?,
+            ast::Stmt::DropTable {
+                if_exists,
+                tbl_name,
+            } => translate_drop_table(tbl_name, resolver, if_exists, program, connection)?,
+            ast::Stmt::DropTrigger {
+                if_exists,
+                trigger_name,
+            } => trigger::translate_drop_trigger(resolver, &trigger_name, if_exists, program)?,
+            ast::Stmt::DropView {
+                if_exists,
+                view_name,
+            } => view::translate_drop_view(resolver, &view_name, if_exists, program)?,
+            ast::Stmt::CreateType {
+                if_not_exists,
+                type_name,
+                body,
+            } => {
+                if !connection.experimental_custom_types_enabled() {
+                    bail_parse_error!("Custom types require --experimental-custom-types flag");
+                }
+                schema::translate_create_type(&type_name, &body, if_not_exists, resolver, program)?
+            }
+            ast::Stmt::CreateDomain {
+                if_not_exists,
+                domain_name,
+                base_type,
+                default,
+                not_null,
+                constraints,
+            } => {
+                if !connection.experimental_custom_types_enabled() {
+                    bail_parse_error!("Custom types require --experimental-custom-types flag");
+                }
+                schema::translate_create_domain(
+                    &domain_name,
+                    &base_type,
+                    not_null,
+                    &constraints,
+                    default,
+                    if_not_exists,
+                    resolver,
+                    program,
+                )?
+            }
+            ast::Stmt::DropType {
+                if_exists,
+                type_name,
+            } => {
+                if !connection.experimental_custom_types_enabled() {
+                    bail_parse_error!("Custom types require --experimental-custom-types flag");
+                }
+                schema::translate_drop_type(&type_name, if_exists, false, resolver, program)?
+            }
+            ast::Stmt::DropDomain {
+                if_exists,
+                domain_name,
+            } => {
+                if !connection.experimental_custom_types_enabled() {
+                    bail_parse_error!("Custom types require --experimental-custom-types flag");
+                }
+                schema::translate_drop_type(&domain_name, if_exists, true, resolver, program)?
+            }
+            ast::Stmt::Pragma { .. } => {
+                bail_parse_error!("PRAGMA statement cannot be evaluated in a nested context")
+            }
+            ast::Stmt::Reindex { .. } => bail_parse_error!("REINDEX not supported yet"),
+            ast::Stmt::Optimize { idx_name } => {
+                translate_optimize(idx_name, resolver, program, connection)?
+            }
+            ast::Stmt::Release { name } => translate_release(program, name)?,
+            ast::Stmt::Rollback {
+                tx_name,
+                savepoint_name,
+            } => translate_rollback(program, tx_name, savepoint_name)?,
+            ast::Stmt::Savepoint { name } => translate_savepoint(program, name)?,
+            ast::Stmt::Select(select) => {
+                translate_select(
+                    select,
+                    resolver,
+                    program,
+                    plan::QueryDestination::ResultRows,
+                    connection,
+                )?;
+            }
+            ast::Stmt::Update(update) => {
+                if update.where_clause.is_none() && connection.get_dml_require_where() {
+                    bail_parse_error!(
+                    "UPDATE without a WHERE clause is not allowed when require_where (or i_am_a_dummy) is enabled"
+                );
+                }
+                translate_update(update, resolver, program, connection)?
+            }
+            ast::Stmt::Vacuum { name, into } => {
+                vacuum::translate_vacuum(program, name.as_ref(), into.as_deref())?
+            }
+            ast::Stmt::Insert {
+                with,
+                or_conflict,
+                tbl_name,
+                columns,
+                body,
+                returning,
+            } => translate_insert(
+                resolver,
+                or_conflict,
+                tbl_name,
+                columns,
+                body,
+                returning,
                 with,
                 program,
                 connection,
-            )?
-        }
-        ast::Stmt::Detach { name } => {
-            attach::translate_detach(&name, resolver, program, connection.clone())?
-        }
-        ast::Stmt::DropIndex {
-            if_exists,
-            idx_name,
-        } => translate_drop_index(&idx_name, resolver, if_exists, program)?,
-        ast::Stmt::DropTable {
-            if_exists,
-            tbl_name,
-        } => translate_drop_table(tbl_name, resolver, if_exists, program, connection)?,
-        ast::Stmt::DropTrigger {
-            if_exists,
-            trigger_name,
-        } => trigger::translate_drop_trigger(resolver, &trigger_name, if_exists, program)?,
-        ast::Stmt::DropView {
-            if_exists,
-            view_name,
-        } => view::translate_drop_view(resolver, &view_name, if_exists, program)?,
-        ast::Stmt::CreateType {
-            if_not_exists,
-            type_name,
-            body,
-        } => {
-            if !connection.experimental_custom_types_enabled() {
-                bail_parse_error!("Custom types require --experimental-custom-types flag");
-            }
-            schema::translate_create_type(&type_name, &body, if_not_exists, resolver, program)?
-        }
-        ast::Stmt::CreateDomain {
-            if_not_exists,
-            domain_name,
-            base_type,
-            default,
-            not_null,
-            constraints,
-        } => {
-            if !connection.experimental_custom_types_enabled() {
-                bail_parse_error!("Custom types require --experimental-custom-types flag");
-            }
-            schema::translate_create_domain(
-                &domain_name,
-                &base_type,
-                not_null,
-                &constraints,
-                default,
-                if_not_exists,
-                resolver,
-                program,
-            )?
-        }
-        ast::Stmt::DropType {
-            if_exists,
-            type_name,
-        } => {
-            if !connection.experimental_custom_types_enabled() {
-                bail_parse_error!("Custom types require --experimental-custom-types flag");
-            }
-            schema::translate_drop_type(&type_name, if_exists, false, resolver, program)?
-        }
-        ast::Stmt::DropDomain {
-            if_exists,
-            domain_name,
-        } => {
-            if !connection.experimental_custom_types_enabled() {
-                bail_parse_error!("Custom types require --experimental-custom-types flag");
-            }
-            schema::translate_drop_type(&domain_name, if_exists, true, resolver, program)?
-        }
-        ast::Stmt::Pragma { .. } => {
-            bail_parse_error!("PRAGMA statement cannot be evaluated in a nested context")
-        }
-        ast::Stmt::Reindex { .. } => bail_parse_error!("REINDEX not supported yet"),
-        ast::Stmt::Optimize { idx_name } => {
-            translate_optimize(idx_name, resolver, program, connection)?
-        }
-        ast::Stmt::Release { name } => translate_release(program, name)?,
-        ast::Stmt::Rollback {
-            tx_name,
-            savepoint_name,
-        } => translate_rollback(program, tx_name, savepoint_name)?,
-        ast::Stmt::Savepoint { name } => translate_savepoint(program, name)?,
-        ast::Stmt::Select(select) => {
-            translate_select(
-                select,
-                resolver,
-                program,
-                plan::QueryDestination::ResultRows,
-                connection,
-            )?;
-        }
-        ast::Stmt::Update(update) => {
-            if update.where_clause.is_none() && connection.get_dml_require_where() {
-                bail_parse_error!(
-                    "UPDATE without a WHERE clause is not allowed when require_where (or i_am_a_dummy) is enabled"
-                );
-            }
-            translate_update(update, resolver, program, connection)?
-        }
-        ast::Stmt::Vacuum { name, into } => {
-            vacuum::translate_vacuum(program, name.as_ref(), into.as_deref())?
-        }
-        ast::Stmt::Insert {
-            with,
-            or_conflict,
-            tbl_name,
-            columns,
-            body,
-            returning,
-        } => translate_insert(
-            resolver,
-            or_conflict,
-            tbl_name,
-            columns,
-            body,
-            returning,
-            with,
-            program,
-            connection,
-        )?,
-    };
+            )?,
+        };
+    }
 
     // Indicate write operations so that in the epilogue we can emit the correct type of transaction
     if is_write {
+        let _stack = crate::stack::trace_scope("translate_inner:begin_write_operation");
         program.begin_write_operation();
     }
 
     // Indicate read operations so that in the epilogue we can emit the correct type of transaction
     if is_select && !program.table_references.is_empty() {
+        let _stack = crate::stack::trace_scope("translate_inner:begin_read_operation");
         program.begin_read_operation();
     }
 
     Ok(())
+}
+
+fn stmt_kind(stmt: &ast::Stmt) -> &'static str {
+    match stmt {
+        ast::Stmt::AlterTable(_) => "alter_table",
+        ast::Stmt::Analyze { .. } => "analyze",
+        ast::Stmt::Attach { .. } => "attach",
+        ast::Stmt::Begin { .. } => "begin",
+        ast::Stmt::Commit { .. } => "commit",
+        ast::Stmt::CreateIndex { .. } => "create_index",
+        ast::Stmt::CreateTable { .. } => "create_table",
+        ast::Stmt::CreateTrigger { .. } => "create_trigger",
+        ast::Stmt::CreateView { .. } => "create_view",
+        ast::Stmt::CreateMaterializedView { .. } => "create_materialized_view",
+        ast::Stmt::CreateVirtualTable(_) => "create_virtual_table",
+        ast::Stmt::CreateType { .. } => "create_type",
+        ast::Stmt::CreateDomain { .. } => "create_domain",
+        ast::Stmt::Delete { .. } => "delete",
+        ast::Stmt::Detach { .. } => "detach",
+        ast::Stmt::DropIndex { .. } => "drop_index",
+        ast::Stmt::DropTable { .. } => "drop_table",
+        ast::Stmt::DropType { .. } => "drop_type",
+        ast::Stmt::DropDomain { .. } => "drop_domain",
+        ast::Stmt::DropTrigger { .. } => "drop_trigger",
+        ast::Stmt::DropView { .. } => "drop_view",
+        ast::Stmt::Insert { .. } => "insert",
+        ast::Stmt::Pragma { .. } => "pragma",
+        ast::Stmt::Reindex { .. } => "reindex",
+        ast::Stmt::Release { .. } => "release",
+        ast::Stmt::Rollback { .. } => "rollback",
+        ast::Stmt::Savepoint { .. } => "savepoint",
+        ast::Stmt::Select { .. } => "select",
+        ast::Stmt::Update { .. } => "update",
+        ast::Stmt::Vacuum { .. } => "vacuum",
+        ast::Stmt::Optimize { .. } => "optimize",
+    }
 }
 
 #[cfg(test)]

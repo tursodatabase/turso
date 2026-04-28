@@ -79,6 +79,7 @@ pub fn translate_delete(
     program: &mut ProgramBuilder,
     connection: &Arc<crate::Connection>,
 ) -> Result<()> {
+    let _stack = crate::stack::trace_scope("delete:translate");
     let database_id = resolver.resolve_existing_table_database_id_qualified(tbl_name)?;
     let normalized_table_name = normalize_ident(tbl_name.name.as_str());
     let table = validate_delete(
@@ -92,27 +93,32 @@ pub fn translate_delete(
     let schema_cookie = resolver.with_schema(database_id, |s| s.schema_version);
     program.begin_write_on_database(database_id, schema_cookie);
 
-    let mut delete_plan = prepare_delete_plan(
-        program,
-        resolver,
-        tbl_name,
-        table,
-        where_clause,
-        limit,
-        returning,
-        indexed,
-        with,
-        connection,
-        database_id,
-    )?;
+    let mut delete_plan = {
+        let _stack = crate::stack::trace_scope("delete:prepare_plan");
+        prepare_delete_plan(
+            program,
+            resolver,
+            tbl_name,
+            table,
+            where_clause,
+            limit,
+            returning,
+            indexed,
+            with,
+            connection,
+            database_id,
+        )?
+    };
 
     // Plan subqueries in the WHERE clause
     if let Plan::Delete(ref mut delete_plan_inner) = delete_plan {
         if let Some(ref mut rowset_plan) = delete_plan_inner.rowset_plan {
             // When using rowset (triggers or subqueries present), subqueries are in the rowset_plan's WHERE
+            let _stack = crate::stack::trace_scope("delete:plan_rowset_subqueries");
             plan_subqueries_from_select_plan(program, rowset_plan, resolver, connection)?;
         } else {
             // Normal path: subqueries are in the DELETE plan's WHERE
+            let _stack = crate::stack::trace_scope("delete:plan_where_subqueries");
             plan_subqueries_from_where_clause(
                 program,
                 &mut delete_plan_inner.non_from_clause_subqueries,
@@ -124,7 +130,10 @@ pub fn translate_delete(
         }
     }
 
-    optimize_plan(program, &mut delete_plan, resolver)?;
+    {
+        let _stack = crate::stack::trace_scope("delete:optimize_plan");
+        optimize_plan(program, &mut delete_plan, resolver)?;
+    }
     if let Plan::Delete(delete_plan_inner) = &mut delete_plan {
         // Re-check after optimization: chosen access paths can make "delete while scanning"
         // unsafe, so we may need to collect rowids first.
@@ -170,7 +179,10 @@ pub fn translate_delete(
     )?;
     let opts = ProgramBuilderOpts::new(1, estimate_num_instructions(delete), 0);
     program.extend(&opts);
-    emit_program(connection, resolver, program, delete_plan, |_| {})?;
+    {
+        let _stack = crate::stack::trace_scope("delete:emit_program");
+        emit_program(connection, resolver, program, delete_plan, |_| {})?;
+    }
     Ok(())
 }
 

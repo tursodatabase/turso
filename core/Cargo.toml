@@ -41,6 +41,7 @@ nanosecond-bench = ["bench"]
 fts = ["dep:tantivy"]
 codspeed = ["bench"]
 optimizer_params = ["serde", "dep:serde_json"]
+stacker = ["dep:stacker", "turso_parser/stacker"]
 
 [target.'cfg(target_os = "windows")'.dependencies]
 windows-sys = { version = "0.61.2", features = [
@@ -115,6 +116,7 @@ crc32c = "0.6.8"
 bigdecimal = "0.4"
 num-bigint = "0.4"
 num-traits = "0.2"
+stacker = { version = "0.1", optional = true }
 
 [target.'cfg(not(any(target_family = "wasm", all(target_os = "windows", target_arch = "aarch64"))))'.dependencies]
 simsimd = "6.5.3"
