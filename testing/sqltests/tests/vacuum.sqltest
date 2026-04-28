@@ -125,6 +125,172 @@ expect {
     ok
 }
 
+# Adapted from SQLite vacuum.test vacuum-1.4: VACUUM must preserve schema
+# objects that are reloaded after the source image is rebuilt.
+test vacuum-preserves-view-and-trigger {
+    CREATE TABLE t1(a INTEGER PRIMARY KEY, b TEXT, c TEXT);
+    CREATE TABLE vacuum_trigger_log(a INTEGER, b TEXT);
+    CREATE VIEW vacuum_view AS SELECT b, c FROM t1 WHERE a > 1;
+    CREATE TRIGGER vacuum_t1_ad AFTER DELETE ON t1 BEGIN
+        INSERT INTO vacuum_trigger_log VALUES(old.a, old.b);
+    END;
+    INSERT INTO t1 VALUES(1, 'one', 'alpha'), (2, 'two', 'beta'), (3, 'three', 'gamma');
+    DELETE FROM t1 WHERE a = 1;
+    VACUUM;
+    SELECT b, c FROM vacuum_view ORDER BY b;
+    DELETE FROM t1 WHERE a = 2;
+    SELECT a, b FROM vacuum_trigger_log ORDER BY a;
+    PRAGMA integrity_check;
+}
+expect {
+    three|gamma
+    two|beta
+    1|one
+    2|two
+    ok
+}
+
+# Adapted from SQLite vacuum.test ticket #515: VACUUM works after a table
+# referenced by a view is dropped and recreated with a compatible shape.
+test vacuum-after-recreate-view-table {
+    CREATE TABLE vacuum_recreate_test(id INTEGER PRIMARY KEY, value TEXT);
+    INSERT INTO vacuum_recreate_test VALUES(1, 'before');
+    CREATE VIEW vacuum_recreate_view AS SELECT id, value FROM vacuum_recreate_test;
+    CREATE TABLE vacuum_recreate_temp(id INTEGER PRIMARY KEY, value TEXT);
+    INSERT INTO vacuum_recreate_temp SELECT id, value FROM vacuum_recreate_test;
+    DROP TABLE vacuum_recreate_test;
+    CREATE TABLE vacuum_recreate_test(id INTEGER PRIMARY KEY, value TEXT);
+    INSERT INTO vacuum_recreate_test SELECT id, value FROM vacuum_recreate_temp;
+    DROP TABLE vacuum_recreate_temp;
+    VACUUM;
+    SELECT id, value FROM vacuum_recreate_view;
+    PRAGMA integrity_check;
+}
+expect {
+    1|before
+    ok
+}
+
+# Adapted from SQLite vacuum.test vacuum-6.*: quoted identifiers and BLOB
+# literals survive VACUUM.
+test vacuum-quoted-table-name-and-blob {
+    CREATE TABLE "abc abc"(a, b, c);
+    INSERT INTO "abc abc" VALUES(1, 2, 3);
+    VACUUM;
+    SELECT * FROM "abc abc";
+    DELETE FROM "abc abc";
+    INSERT INTO "abc abc" VALUES(X'00112233', NULL, NULL);
+    VACUUM;
+    SELECT count(*) FROM "abc abc" WHERE a = X'00112233';
+    PRAGMA integrity_check;
+}
+expect {
+    1|2|3
+    1
+    ok
+}
+
+# Adapted from SQLite vacuum.test vacuum-9.*: sqlite_sequence and
+# AUTOINCREMENT state survive VACUUM.
+@skip-if mvcc "AUTOINCREMENT is not supported in MVCC mode"
+test vacuum-preserves-autoincrement-sequence {
+    CREATE TABLE vacuum_autoinc(id INTEGER PRIMARY KEY AUTOINCREMENT, value TEXT);
+    INSERT INTO vacuum_autoinc(value) VALUES('hi'), ('there');
+    DELETE FROM vacuum_autoinc;
+    VACUUM;
+    INSERT INTO vacuum_autoinc(value) VALUES('one'), ('two');
+    VACUUM;
+    SELECT id, value FROM vacuum_autoinc ORDER BY id;
+    SELECT name, seq FROM sqlite_sequence WHERE name = 'vacuum_autoinc';
+    PRAGMA integrity_check;
+}
+expect {
+    3|one
+    4|two
+    vacuum_autoinc|4
+    ok
+}
+
+# Adapted from SQLite vacuum2.test ticket #1121: VACUUM works after all
+# AUTOINCREMENT tables have been dropped.
+@skip-if mvcc "AUTOINCREMENT is not supported in MVCC mode"
+test vacuum-after-dropping-all-autoincrement-tables {
+    CREATE TABLE vacuum_drop_autoinc(id INTEGER PRIMARY KEY AUTOINCREMENT, value TEXT);
+    DROP TABLE vacuum_drop_autoinc;
+    VACUUM;
+    PRAGMA integrity_check;
+    SELECT count(*) FROM sqlite_schema WHERE name = 'vacuum_drop_autoinc';
+}
+expect {
+    ok
+    0
+}
+
+# Adapted from SQLite vacuum.test vacuum-10.*: count_changes must not make
+# VACUUM return rows or corrupt subsequent execution.
+@skip "missing feature: PRAGMA count_changes is not supported; see missing_feature.txt"
+test vacuum-with-count-changes {
+    CREATE TABLE vacuum_count_changes(a, b);
+    INSERT INTO vacuum_count_changes VALUES('a', 'b'), ('c', 'd');
+    PRAGMA count_changes = 1;
+    VACUUM;
+    SELECT count(*) FROM vacuum_count_changes;
+    PRAGMA integrity_check;
+}
+expect {
+    2
+    ok
+}
+
+# Adapted from SQLite vacuum4.test: a database with auto_vacuum enabled and a
+# large schema can be vacuumed without corrupting sqlite_schema.
+@skip "missing feature: sqltests do not enable experimental auto-vacuum; see missing_feature.txt"
+test vacuum-large-schema-autovacuum {
+    PRAGMA auto_vacuum = FULL;
+    CREATE TABLE vacuum_large_schema_1(
+        c000, c001, c002, c003, c004, c005, c006, c007, c008, c009,
+        c010, c011, c012, c013, c014, c015, c016, c017, c018, c019,
+        c020, c021, c022, c023, c024, c025, c026, c027, c028, c029,
+        c030, c031, c032, c033, c034, c035, c036, c037, c038, c039,
+        c040, c041, c042, c043, c044, c045, c046, c047, c048, c049
+    );
+    CREATE TABLE vacuum_large_schema_2(
+        c000, c001, c002, c003, c004, c005, c006, c007, c008, c009,
+        c010, c011, c012, c013, c014, c015, c016, c017, c018, c019,
+        c020, c021, c022, c023, c024, c025, c026, c027, c028, c029,
+        c030, c031, c032, c033, c034, c035, c036, c037, c038, c039,
+        c040, c041, c042, c043, c044, c045, c046, c047, c048, c049
+    );
+    VACUUM;
+    SELECT count(*) FROM sqlite_schema WHERE name LIKE 'vacuum_large_schema_%';
+    PRAGMA integrity_check;
+}
+expect {
+    2
+    ok
+}
+
+# Adapted from SQLite vacuum6.test: VACUUM preserves larger indexed records.
+test vacuum-large-indexed-records {
+    CREATE TABLE vacuum_big_records(a INTEGER PRIMARY KEY, b);
+    CREATE INDEX vacuum_big_records_b ON vacuum_big_records(b);
+    INSERT INTO vacuum_big_records VALUES(1, randomblob(1200));
+    INSERT INTO vacuum_big_records SELECT a + 1, randomblob(1200) FROM vacuum_big_records;
+    INSERT INTO vacuum_big_records SELECT a + 2, randomblob(1200) FROM vacuum_big_records;
+    INSERT INTO vacuum_big_records SELECT a + 4, randomblob(1200) FROM vacuum_big_records;
+    INSERT INTO vacuum_big_records SELECT a + 8, randomblob(1200) FROM vacuum_big_records;
+    INSERT INTO vacuum_big_records SELECT a + 16, randomblob(1200) FROM vacuum_big_records;
+    INSERT INTO vacuum_big_records SELECT a + 32, randomblob(1200) FROM vacuum_big_records;
+    INSERT INTO vacuum_big_records SELECT a + 64, randomblob(1200) FROM vacuum_big_records;
+    VACUUM;
+    SELECT count(*), sum(length(b)) FROM vacuum_big_records;
+    PRAGMA integrity_check;
+}
+expect {
+    128|153600
+    ok
+}
+
 # Adapted from SQLite vacuum.test ticket #873: a database filename containing
 # an apostrophe can be vacuumed.
 @backend cli

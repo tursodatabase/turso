@@ -13,6 +13,7 @@ pub mod subjournal;
 pub mod subquery;
 pub mod temp_tables;
 pub mod test_join_optimizer;
+pub mod vacuum;
 
 #[cfg(test)]
 mod fuzz_tests {

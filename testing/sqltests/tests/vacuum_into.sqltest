@@ -132,6 +132,24 @@ expect error {
 
 @skip "missing feature: VACUUM INTO does not support arbitrary target expressions; see missing_feature.txt"
 @backend cli
+test vacuum-into-qualified-identifier-target-error-from-sqlite {
+    VACUUM INTO t1.nosuchcol;
+}
+expect error {
+    no such column: t1.nosuchcol
+}
+
+@skip "missing feature: VACUUM INTO does not support arbitrary target expressions; see missing_feature.txt"
+@backend cli
+test vacuum-into-main-qualified-identifier-target-error-from-sqlite {
+    VACUUM INTO main.t1.nosuchcol;
+}
+expect error {
+    no such column: main.t1.nosuchcol
+}
+
+@skip "missing feature: VACUUM INTO does not support arbitrary target expressions; see missing_feature.txt"
+@backend cli
 test vacuum-into-null-target-error-from-sqlite {
     VACUUM INTO null;
 }
@@ -145,6 +163,15 @@ test vacuum-into-function-target-from-sqlite {
     VACUUM INTO target();
 }
 expect {
+}
+
+@skip "missing feature: VACUUM INTO does not support arbitrary target expressions; see missing_feature.txt"
+@backend cli
+test vacuum-into-missing-function-target-error-from-sqlite {
+    VACUUM INTO target2();
+}
+expect error {
+    no such function: target2
 }
 
 # Adapted from SQLite vacuum-into.test: changing page-size for the output works

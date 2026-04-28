@@ -9,7 +9,7 @@ use turso_core::{
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum QueuedIoOpKind {
+pub enum QueuedIoOpKind {
     Pread,
     Pwrite,
     Pwritev,
@@ -18,9 +18,9 @@ pub(crate) enum QueuedIoOpKind {
 }
 
 #[derive(Clone, Debug)]
-pub(crate) struct QueuedIoEvent {
-    pub(crate) path: String,
-    pub(crate) kind: QueuedIoOpKind,
+pub struct QueuedIoEvent {
+    pub path: String,
+    pub kind: QueuedIoOpKind,
 }
 
 struct QueuedIoOp {
@@ -30,8 +30,8 @@ struct QueuedIoOp {
 
 #[derive(Debug)]
 struct QueuedIoFault {
-    path_suffix: String,
-    kind: QueuedIoOpKind,
+    path_suffix: Option<String>,
+    kind: Option<QueuedIoOpKind>,
     allowed_successes: usize,
     seen: usize,
 }
@@ -52,38 +52,47 @@ impl QueuedIoState {
     }
 }
 
-pub(crate) struct QueuedIo {
+pub struct QueuedIo {
     inner: Arc<dyn IO>,
     state: Arc<QueuedIoState>,
 }
 
 impl QueuedIo {
-    pub(crate) fn new() -> Self {
+    pub fn new() -> Self {
         Self {
             inner: Arc::new(turso_core::MemoryIO::new()),
             state: Arc::new(QueuedIoState::new()),
         }
     }
 
-    pub(crate) fn fail_after_successes(
+    pub fn fail_after_successes(
         &self,
         path_suffix: &str,
         kind: QueuedIoOpKind,
         allowed_successes: usize,
     ) {
         *self.state.fault.lock().unwrap() = Some(QueuedIoFault {
-            path_suffix: path_suffix.to_string(),
-            kind,
+            path_suffix: Some(path_suffix.to_string()),
+            kind: Some(kind),
             allowed_successes,
             seen: 0,
         });
     }
 
-    pub(crate) fn clear_fault(&self) {
+    pub fn fail_any_after_successes(&self, allowed_successes: usize) {
+        *self.state.fault.lock().unwrap() = Some(QueuedIoFault {
+            path_suffix: None,
+            kind: None,
+            allowed_successes,
+            seen: 0,
+        });
+    }
+
+    pub fn clear_fault(&self) {
         *self.state.fault.lock().unwrap() = None;
     }
 
-    pub(crate) fn count_events(&self, path_suffix: &str, kind: QueuedIoOpKind) -> usize {
+    pub fn count_events(&self, path_suffix: &str, kind: QueuedIoOpKind) -> usize {
         self.state
             .history
             .lock()
@@ -93,15 +102,15 @@ impl QueuedIo {
             .count()
     }
 
-    pub(crate) fn history_len(&self) -> usize {
+    pub fn history_len(&self) -> usize {
         self.state.history.lock().unwrap().len()
     }
 
-    pub(crate) fn history_since(&self, start: usize) -> Vec<QueuedIoEvent> {
+    pub fn history_since(&self, start: usize) -> Vec<QueuedIoEvent> {
         self.state.history.lock().unwrap()[start..].to_vec()
     }
 
-    pub(crate) fn pending_events(&self) -> Vec<QueuedIoEvent> {
+    pub fn pending_events(&self) -> Vec<QueuedIoEvent> {
         self.state
             .pending
             .lock()
@@ -111,7 +120,7 @@ impl QueuedIo {
             .collect()
     }
 
-    pub(crate) fn step_one(&self) -> turso_core::Result<Option<QueuedIoEvent>> {
+    pub fn step_one(&self) -> turso_core::Result<Option<QueuedIoEvent>> {
         let Some(op) = self.state.pending.lock().unwrap().pop_front() else {
             return Ok(None);
         };
@@ -121,10 +130,7 @@ impl QueuedIo {
         Ok(Some(event))
     }
 
-    pub(crate) fn step_last_matching<F>(
-        &self,
-        predicate: F,
-    ) -> turso_core::Result<Option<QueuedIoEvent>>
+    pub fn step_last_matching<F>(&self, predicate: F) -> turso_core::Result<Option<QueuedIoEvent>>
     where
         F: Fn(&QueuedIoEvent) -> bool,
     {
@@ -139,6 +145,12 @@ impl QueuedIo {
         (op.action)()?;
         self.state.history.lock().unwrap().push(event.clone());
         Ok(Some(event))
+    }
+}
+
+impl Default for QueuedIo {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -220,7 +232,15 @@ impl QueuedFile {
         let fault_this_op = {
             let mut fault = self.state.fault.lock().unwrap();
             if let Some(fault) = fault.as_mut() {
-                if self.path.ends_with(&fault.path_suffix) && kind == fault.kind {
+                let path_matches = match &fault.path_suffix {
+                    Some(path_suffix) => self.path.ends_with(path_suffix),
+                    None => true,
+                };
+                let kind_matches = match fault.kind {
+                    Some(fault_kind) => kind == fault_kind,
+                    None => true,
+                };
+                if path_matches && kind_matches {
                     fault.seen += 1;
                     fault.seen > fault.allowed_successes
                 } else {
