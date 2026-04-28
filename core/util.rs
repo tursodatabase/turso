@@ -1,7 +1,5 @@
 use crate::numeric::StrToF64;
 use crate::schema::ColDef;
-use crate::schema_parser::{SchemaTableParser, SchemaTableRow, SchemaTableType};
-use crate::translate::emitter::TransactionMode;
 use crate::translate::expr::{walk_expr, walk_expr_mut, WalkControl};
 use crate::translate::plan::{BitSet, JoinedTable, TableReferences};
 use crate::translate::planner::{parse_row_id, TableMask};
@@ -10,12 +8,11 @@ use crate::IO;
 use crate::{
     schema::{Column, Schema, Table, Type},
     types::{Value, ValueType},
-    LimboError, OpenFlags, Result, Statement, SymbolTable,
+    LimboError, OpenFlags, Result,
 };
 use either::Either;
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use std::future::Future;
-use tracing::{instrument, Level};
 use turso_macros::match_ignore_ascii_case;
 use turso_parser::ast::{self, CreateTableBody, Expr, Literal, UnaryOperator};
 use turso_parser::parser::Parser;
@@ -154,47 +151,6 @@ pub struct UnparsedFromSqlIndex {
     pub table_name: String,
     pub root_page: i64,
     pub sql: String,
-}
-
-#[instrument(skip_all, level = Level::INFO)]
-pub fn parse_schema_rows(
-    mut rows: Statement,
-    schema: &mut Schema,
-    syms: &SymbolTable,
-    mv_tx: Option<(u64, TransactionMode)>,
-    resolve_attached_db: &dyn Fn(&str) -> Option<usize>,
-) -> Result<()> {
-    rows.set_mv_tx(mv_tx);
-    let mvcc_enabled = rows.mv_store().is_some();
-    let mut parser = SchemaTableParser::default();
-
-    // TODO: How do we ensure that the I/O we submitted to
-    // read the schema is actually complete?
-    rows.run_with_row_callback(|row| {
-        let ty = row.get::<&str>(0)?;
-        let name = row.get::<&str>(1)?;
-        let table_name = row.get::<&str>(2)?;
-        let root_page = row.get::<i64>(3)?;
-        let sql = row.get::<&str>(4).ok();
-        parser.parse_row(
-            schema,
-            &SchemaTableRow {
-                ty: ty.parse::<SchemaTableType>().map_err(|_| {
-                    LimboError::ConversionError(format!("Invalid sqlite_schema.type value: {ty}"))
-                })?,
-                name: name.to_string(),
-                table_name: table_name.to_string(),
-                root_page,
-                sql: sql.map(ToString::to_string),
-            },
-            syms,
-            resolve_attached_db,
-        )
-    })?;
-
-    parser.finish(schema, syms, mvcc_enabled)?;
-
-    Ok(())
 }
 
 fn cmp_numeric_strings(num_str: &str, other: &str) -> bool {
