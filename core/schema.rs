@@ -140,7 +140,9 @@ impl Trigger {
     }
 }
 
-use crate::schema_parser::{SchemaTableCursor, SchemaTableDecodeErrorKind, SchemaTableParser};
+use crate::schema_parser::{
+    SchemaTableCursor, SchemaTableDecodeErrorKind, SchemaTableParser, SchemaTableType,
+};
 use crate::storage::btree::BTreeCursor;
 use crate::sync::Arc;
 use crate::sync::Mutex;
@@ -1582,7 +1584,7 @@ impl Schema {
     #[allow(clippy::too_many_arguments)]
     pub fn handle_schema_row(
         &mut self,
-        ty: &str,
+        ty: SchemaTableType,
         name: &str,
         table_name: &str,
         root_page: i64,
@@ -1603,7 +1605,7 @@ impl Schema {
         resolve_attached_db: &dyn Fn(&str) -> Option<usize>,
     ) -> Result<()> {
         match ty {
-            "table" => {
+            SchemaTableType::Table => {
                 let sql = maybe_sql.expect("sql should be present for table");
                 let sql_bytes = sql.as_bytes();
                 if root_page == 0 && contains_ignore_ascii_case!(sql_bytes, b"create virtual") {
@@ -1667,7 +1669,7 @@ impl Schema {
                     self.add_btree_table(Arc::new(table))?;
                 }
             }
-            "index" => {
+            SchemaTableType::Index => {
                 match maybe_sql {
                     Some(sql) => {
                         from_sql_indexes.push(UnparsedFromSqlIndex {
@@ -1714,7 +1716,7 @@ impl Schema {
                     }
                 }
             }
-            "view" => {
+            SchemaTableType::View => {
                 use crate::schema::View;
                 use turso_parser::ast::{Cmd, Stmt};
                 use turso_parser::parser::Parser;
@@ -1768,7 +1770,7 @@ impl Schema {
                     }
                 }
             }
-            "trigger" => {
+            SchemaTableType::Trigger => {
                 use turso_parser::ast::{Cmd, Stmt};
                 use turso_parser::parser::Parser;
 
@@ -1828,8 +1830,6 @@ impl Schema {
                     tbl_name.name.as_str(),
                 )?;
             }
-            // Types are stored in sqlite_turso_types, not sqlite_schema
-            _ => {}
         };
 
         Ok(())
@@ -5763,7 +5763,7 @@ mod tests {
         schema.generated_columns_enabled = false;
 
         let result = schema.handle_schema_row(
-            "table",
+            SchemaTableType::Table,
             "t1",
             "t1",
             2,

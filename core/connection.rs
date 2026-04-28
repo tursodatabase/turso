@@ -1,6 +1,7 @@
 use crate::error::io_error;
 #[cfg(any(test, injected_yields))]
 use crate::mvcc::yield_points::YieldInjector;
+use crate::schema_parser::SchemaTableType;
 use crate::statement::StatementOrigin;
 use crate::storage::{journal_mode, pager::SavepointResult};
 use crate::sync::{
@@ -1824,13 +1825,18 @@ impl Connection {
         // before taking the schema write lock. This prevents a deadlock in MVCC
         // mode where Statement::drop -> abort -> rollback_tx -> schema.read()
         // would deadlock against the schema write lock.
-        let mut rows_data: Vec<(String, String, String, i64, Option<String>)> = Vec::new();
+        let mut rows_data: Vec<(SchemaTableType, String, String, i64, Option<String>)> = Vec::new();
         {
             let mut rows = self
                 .query("SELECT * FROM sqlite_schema")?
                 .expect("query must be parsed to statement");
             rows.run_with_row_callback(|row| {
-                let ty = row.get::<&str>(0)?.to_string();
+                let ty_text = row.get::<&str>(0)?;
+                let ty = ty_text.parse::<SchemaTableType>().map_err(|_| {
+                    LimboError::ConversionError(format!(
+                        "Invalid sqlite_schema.type value: {ty_text}"
+                    ))
+                })?;
                 let name = row.get::<&str>(1)?.to_string();
                 let table_name = row.get::<&str>(2)?.to_string();
                 let root_page = row.get::<i64>(3)?;
@@ -1860,7 +1866,7 @@ impl Connection {
             };
             for (ty, name, table_name, root_page, sql) in &rows_data {
                 match schema.handle_schema_row(
-                    ty,
+                    *ty,
                     name,
                     table_name,
                     *root_page,

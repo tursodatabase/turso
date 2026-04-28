@@ -583,7 +583,7 @@ pub fn translate_create_index(
         db: database_id,
         filter: crate::vdbe::insn::ParseSchemaFilter::NameAndType {
             name: idx_name.clone(),
-            ty: "index".to_string(),
+            ty: crate::schema_parser::SchemaTableType::Index,
         },
     });
     // Close the final sqlite_schema cursor

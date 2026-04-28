@@ -6,32 +6,52 @@ use crate::types::ImmutableRecord;
 use crate::util::UnparsedFromSqlIndex;
 use crate::{LimboError, Result, SymbolTable, ValueRef};
 use rustc_hash::{FxBuildHasher, FxHashMap as HashMap};
+use std::str::FromStr;
+
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    strum_macros::Display,
+    strum_macros::EnumString,
+    strum_macros::IntoStaticStr,
+)]
+#[strum(ascii_case_insensitive, serialize_all = "snake_case")]
+pub enum SchemaTableType {
+    Table,
+    Index,
+    View,
+    Trigger,
+}
 
 #[derive(Debug, Clone)]
 pub enum ParseSchemaFilter {
     All,
     TableNameNotTrigger { table_names: Vec<String> },
     Name { names: Vec<String> },
-    NameAndType { name: String, ty: String },
+    NameAndType { name: String, ty: SchemaTableType },
 }
 
 impl ParseSchemaFilter {
-    pub fn matches(&self, ty: &str, name: &str, table_name: &str) -> bool {
+    pub(crate) fn matches(&self, ty: SchemaTableType, name: &str, table_name: &str) -> bool {
         match self {
             Self::All => true,
             Self::TableNameNotTrigger { table_names } => {
-                ty != "trigger" && table_names.iter().any(|candidate| candidate == table_name)
+                ty != SchemaTableType::Trigger
+                    && table_names.iter().any(|candidate| candidate == table_name)
             }
             Self::Name { names } => names.iter().any(|candidate| candidate == name),
             Self::NameAndType {
                 name: candidate,
                 ty: candidate_ty,
-            } => candidate == name && candidate_ty == ty,
+            } => candidate == name && *candidate_ty == ty,
         }
     }
 
     pub(crate) fn matches_row(&self, row: &SchemaTableRow) -> bool {
-        self.matches(&row.ty, &row.name, &row.table_name)
+        self.matches(row.ty, &row.name, &row.table_name)
     }
 
     pub fn explain(&self) -> String {
@@ -55,7 +75,7 @@ impl ParseSchemaFilter {
             Self::NameAndType { name, ty } => format!(
                 "name = {} AND type = {}",
                 quote_schema_value(name),
-                quote_schema_value(ty)
+                quote_schema_value((*ty).into())
             ),
         }
     }
@@ -72,7 +92,7 @@ pub(crate) enum SchemaTableDecodeErrorKind {
 }
 
 pub(crate) struct SchemaTableRow {
-    pub ty: String,
+    pub ty: SchemaTableType,
     pub name: String,
     pub table_name: String,
     pub root_page: i64,
@@ -95,7 +115,7 @@ impl SchemaTableRow {
             ));
         }
 
-        let ty = text_column(record, 0, "type", error_kind)?;
+        let ty = schema_type_column(record, error_kind)?;
         let name = text_column(record, 1, "name", error_kind)?;
         let table_name = text_column(record, 2, "tbl_name", error_kind)?;
         let root_page = integer_column(record, 3, "rootpage", error_kind)?;
@@ -105,7 +125,7 @@ impl SchemaTableRow {
         };
 
         Ok(Self {
-            ty: ty.to_string(),
+            ty,
             name: name.to_string(),
             table_name: table_name.to_string(),
             root_page,
@@ -114,10 +134,10 @@ impl SchemaTableRow {
     }
 
     pub(crate) fn has_btree(&self) -> bool {
-        match self.ty.as_str() {
-            "index" => true,
-            "table" => !self.is_virtual_table(),
-            _ => false,
+        match self.ty {
+            SchemaTableType::Index => true,
+            SchemaTableType::Table => !self.is_virtual_table(),
+            SchemaTableType::View | SchemaTableType::Trigger => false,
         }
     }
 
@@ -132,6 +152,20 @@ fn contains_ignore_ascii_case(haystack: &[u8], needle: &[u8]) -> bool {
     haystack
         .windows(needle.len())
         .any(|window| window.eq_ignore_ascii_case(needle))
+}
+
+fn schema_type_column(
+    record: &ImmutableRecord,
+    error_kind: SchemaTableDecodeErrorKind,
+) -> Result<SchemaTableType> {
+    let value = text_column(record, 0, "type", error_kind)?;
+    SchemaTableType::from_str(value).map_err(|_| {
+        schema_table_error(
+            error_kind,
+            format!("sqlite_schema type is invalid: {value}"),
+            format!("Invalid sqlite_schema.type value: {value}"),
+        )
+    })
 }
 
 #[derive(Debug)]
@@ -269,7 +303,7 @@ impl SchemaTableParser {
         resolve_attached_db: &dyn Fn(&str) -> Option<usize>,
     ) -> Result<()> {
         schema.handle_schema_row(
-            &row.ty,
+            row.ty,
             &row.name,
             &row.table_name,
             row.root_page,

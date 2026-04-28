@@ -1,6 +1,6 @@
 use crate::numeric::StrToF64;
 use crate::schema::ColDef;
-use crate::schema_parser::{SchemaTableParser, SchemaTableRow};
+use crate::schema_parser::{SchemaTableParser, SchemaTableRow, SchemaTableType};
 use crate::translate::emitter::TransactionMode;
 use crate::translate::expr::{walk_expr, walk_expr_mut, WalkControl};
 use crate::translate::plan::{BitSet, JoinedTable, TableReferences};
@@ -179,7 +179,9 @@ pub fn parse_schema_rows(
         parser.parse_row(
             schema,
             &SchemaTableRow {
-                ty: ty.to_string(),
+                ty: ty.parse::<SchemaTableType>().map_err(|_| {
+                    LimboError::ConversionError(format!("Invalid sqlite_schema.type value: {ty}"))
+                })?,
                 name: name.to_string(),
                 table_name: table_name.to_string(),
                 root_page,

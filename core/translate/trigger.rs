@@ -213,7 +213,7 @@ pub fn translate_create_trigger(
         db: database_id,
         filter: crate::vdbe::insn::ParseSchemaFilter::NameAndType {
             name: normalized_trigger_name,
-            ty: "trigger".to_string(),
+            ty: crate::schema_parser::SchemaTableType::Trigger,
         },
     });
 
