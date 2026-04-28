@@ -15008,15 +15008,12 @@ pub fn op_vacuum(
     };
 
     match vacuum_state.step(&program.connection) {
-        Ok(InsnFunctionStepResult::Step) => {
+        Ok(IOResult::Done(())) => {
             state.op_vacuum_state = VacuumOpState::None;
             state.pc += 1;
             Ok(InsnFunctionStepResult::Step)
         }
-        Ok(InsnFunctionStepResult::IO(io)) => Ok(InsnFunctionStepResult::IO(io)),
-        Ok(InsnFunctionStepResult::Done | InsnFunctionStepResult::Row) => {
-            unreachable!("in-place VACUUM only returns Step or IO")
-        }
+        Ok(IOResult::IO(io)) => Ok(InsnFunctionStepResult::IO(io)),
         Err(err) => {
             if matches!(state.op_vacuum_state, VacuumOpState::InPlace(_)) {
                 let VacuumOpState::InPlace(vacuum_state) =

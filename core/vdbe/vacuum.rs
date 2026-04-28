@@ -7,9 +7,9 @@ use crate::storage::pager::{AutoVacuumMode, Page, PageRef, Pager};
 use crate::storage::sqlite3_ondisk::{
     CacheSize, DatabaseHeader, PageSize, RawVersion, TextEncoding, WAL_FRAME_HEADER_SIZE,
 };
-use crate::types::IOCompletions;
+use crate::types::{IOCompletions, IOResult};
 use crate::util::IOExt;
-use crate::vdbe::{execute::InsnFunctionStepResult, Row};
+use crate::vdbe::Row;
 use crate::Result;
 use crate::{
     Connection, Database, DatabaseOpts, EncryptionKey, EncryptionOpts, MvStore, OpenFlags, SyncMode,
@@ -1305,7 +1305,7 @@ impl VacuumInPlaceOpContext {
         }
     }
 
-    pub(crate) fn step(&mut self, connection: &Arc<Connection>) -> Result<InsnFunctionStepResult> {
+    pub(crate) fn step(&mut self, connection: &Arc<Connection>) -> Result<IOResult<()>> {
         vacuum_in_place_step(
             connection,
             self.db,
@@ -1599,8 +1599,8 @@ fn reload_physical_schema_for_mvcc_vacuum(
     reparse_result
 }
 
-/// Step the in-place VACUUM state machine once. Returns `IO` to yield or `Step`
-/// when the entire operation is complete.
+/// Step the in-place VACUUM state machine once. Returns `IO` to yield or
+/// `Done(())` when the entire operation is complete.
 ///
 /// `cleanup_state` independently tracks which resources the opcode has acquired so
 /// that cleanup can roll back correctly
@@ -1610,7 +1610,7 @@ fn vacuum_in_place_step(
     phase: &mut VacuumInPlacePhase,
     committed_image: &mut Option<VacuumCommittedImageMeta>,
     cleanup_state: &mut VacuumInPlaceCleanupState,
-) -> Result<InsnFunctionStepResult> {
+) -> Result<IOResult<()>> {
     let source_pager = connection.get_pager_from_database_index(&db)?;
 
     loop {
@@ -1717,7 +1717,7 @@ fn vacuum_in_place_step(
                     }
                     crate::IOResult::IO(io) => {
                         *phase = VacuumInPlacePhase::BeginSourceTx;
-                        return Ok(InsnFunctionStepResult::IO(io));
+                        return Ok(IOResult::IO(io));
                     }
                 }
             }
@@ -1793,7 +1793,7 @@ fn vacuum_in_place_step(
                             temp_db,
                             context,
                         };
-                        return Ok(InsnFunctionStepResult::IO(io));
+                        return Ok(IOResult::IO(io));
                     }
                 }
             }
@@ -1890,9 +1890,7 @@ fn vacuum_in_place_step(
                         completion: completion.clone(),
                         fsync_phase,
                     };
-                    return Ok(InsnFunctionStepResult::IO(IOCompletions::Single(
-                        completion,
-                    )));
+                    return Ok(IOResult::IO(IOCompletions::Single(completion)));
                 }
                 if !completion.succeeded() {
                     return Err(vacuum_completion_error(&completion, "WAL header init"));
@@ -1971,9 +1969,7 @@ fn vacuum_in_place_step(
                         batch_pages,
                         read_completion: read_completion.clone(),
                     };
-                    return Ok(InsnFunctionStepResult::IO(IOCompletions::Single(
-                        read_completion,
-                    )));
+                    return Ok(IOResult::IO(IOCompletions::Single(read_completion)));
                 }
                 if !read_completion.succeeded() {
                     return Err(vacuum_completion_error(&read_completion, "temp batch read"));
@@ -2059,7 +2055,7 @@ fn vacuum_in_place_step(
                         read_scratch_buf,
                         completions,
                     };
-                    return Ok(InsnFunctionStepResult::IO(IOCompletions::Single(pending)));
+                    return Ok(IOResult::IO(IOCompletions::Single(pending)));
                 }
 
                 // Check for write errors.
@@ -2136,9 +2132,7 @@ fn vacuum_in_place_step(
                         temp_db,
                         sync_completion: sync_completion.clone(),
                     };
-                    return Ok(InsnFunctionStepResult::IO(IOCompletions::Single(
-                        sync_completion,
-                    )));
+                    return Ok(IOResult::IO(IOCompletions::Single(sync_completion)));
                 }
                 if !sync_completion.succeeded() {
                     return Err(vacuum_completion_error(&sync_completion, "WAL fsync"));
@@ -2228,7 +2222,7 @@ fn vacuum_in_place_step(
                     }
                     Ok(crate::IOResult::IO(io)) => {
                         *phase = VacuumInPlacePhase::Checkpoint;
-                        return Ok(InsnFunctionStepResult::IO(io));
+                        return Ok(IOResult::IO(io));
                     }
                     Err(err) => {
                         tracing::error!("VACUUM post-commit checkpoint failed: {err}");
@@ -2257,11 +2251,11 @@ fn vacuum_in_place_step(
                 drop(cleanup_state.mvcc_guard.take());
 
                 *phase = VacuumInPlacePhase::Done;
-                return Ok(InsnFunctionStepResult::Step);
+                return Ok(IOResult::Done(()));
             }
 
             VacuumInPlacePhase::Done => {
-                return Ok(InsnFunctionStepResult::Step);
+                return Ok(IOResult::Done(()));
             }
         }
     }
