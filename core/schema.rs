@@ -140,7 +140,8 @@ impl Trigger {
     }
 }
 
-use crate::storage::btree::{BTreeCursor, CursorTrait};
+use crate::schema_parser::{SchemaTableCursor, SchemaTableDecodeErrorKind, SchemaTableParser};
+use crate::storage::btree::BTreeCursor;
 use crate::sync::Arc;
 use crate::sync::Mutex;
 use crate::translate::collate::CollationSeq;
@@ -151,11 +152,11 @@ use crate::util::{
 use crate::Result;
 use crate::{
     bail_parse_error, contains_ignore_ascii_case, eq_ignore_ascii_case, match_ignore_ascii_case,
-    LimboError, MvCursor, Pager, SymbolTable, ValueRef, VirtualTable,
+    LimboError, MvCursor, Pager, SymbolTable, VirtualTable,
 };
 use bitflags::bitflags;
 use core::fmt;
-use rustc_hash::{FxBuildHasher, FxHashMap as HashMap, FxHashSet as HashSet};
+use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use std::collections::VecDeque;
 use std::ops::Deref;
 use std::sync::OnceLock;
@@ -529,34 +530,20 @@ impl TypeDef {
     }
 }
 
-/// Accumulators for schema loading - kept separate to avoid moving through state variants
-struct MakeFromBtreeAccumulators {
-    from_sql_indexes: Vec<UnparsedFromSqlIndex>,
-    automatic_indices: HashMap<String, Vec<(String, i64)>>,
-    /// Store DBSP state table root pages: view_name -> dbsp_state_root_page
-    dbsp_state_roots: HashMap<String, i64>,
-    /// Store DBSP state table index root pages: view_name -> dbsp_state_index_root_page
-    dbsp_state_index_roots: HashMap<String, i64>,
-    /// Store materialized view info (SQL and root page) for later creation
-    materialized_view_info: HashMap<String, (String, i64)>,
-}
-
 /// Phase tracking for async schema loading
 #[derive(Default, Debug)]
 pub enum MakeFromBtreePhase {
     #[default]
     Init,
-    Rewinding,
-    FetchingRecord,
-    Advancing,
+    Scanning,
     Done,
 }
 
 /// State machine for async schema loading - passed by caller, not stored on Schema
 pub struct MakeFromBtreeState {
     phase: MakeFromBtreePhase,
-    cursor: Option<BTreeCursor>,
-    accumulators: Option<MakeFromBtreeAccumulators>,
+    cursor: Option<SchemaTableCursor>,
+    parser: Option<SchemaTableParser>,
     read_tx_active: bool,
 }
 
@@ -571,7 +558,7 @@ impl MakeFromBtreeState {
         Self {
             phase: MakeFromBtreePhase::Init,
             cursor: None,
-            accumulators: None,
+            parser: None,
             read_tx_active: false,
         }
     }
@@ -583,7 +570,7 @@ impl MakeFromBtreeState {
             self.read_tx_active = false;
         }
         self.cursor = None;
-        self.accumulators = None;
+        self.parser = None;
     }
 }
 
@@ -1331,123 +1318,51 @@ impl Schema {
                         ));
                     }
 
-                    state.cursor = Some(BTreeCursor::new_table(Arc::clone(pager), 1, 10));
+                    state.cursor = Some(SchemaTableCursor::new(
+                        Box::new(BTreeCursor::new_table(Arc::clone(pager), 1, 10)),
+                        SchemaTableDecodeErrorKind::Conversion,
+                    ));
                     pager.begin_read_tx()?;
                     state.read_tx_active = true;
 
-                    state.accumulators = Some(MakeFromBtreeAccumulators {
-                        from_sql_indexes: Vec::with_capacity(10),
-                        automatic_indices: HashMap::with_capacity_and_hasher(10, FxBuildHasher),
-                        dbsp_state_roots: HashMap::default(),
-                        dbsp_state_index_roots: HashMap::default(),
-                        materialized_view_info: HashMap::default(),
-                    });
+                    state.parser = Some(SchemaTableParser::default());
 
-                    state.phase = MakeFromBtreePhase::Rewinding;
+                    state.phase = MakeFromBtreePhase::Scanning;
                 }
 
-                MakeFromBtreePhase::Rewinding => {
+                MakeFromBtreePhase::Scanning => {
                     let cursor = state
                         .cursor
                         .as_mut()
                         .expect("cursor must be initialized in Init phase");
-                    return_if_io!(cursor.rewind());
-                    state.phase = MakeFromBtreePhase::FetchingRecord;
-                }
-
-                MakeFromBtreePhase::FetchingRecord => {
-                    let cursor = state
-                        .cursor
-                        .as_mut()
-                        .expect("cursor must be initialized in Init phase");
-                    let row = return_if_io!(cursor.record());
+                    let row = return_if_io!(cursor.next_row());
 
                     let Some(row) = row else {
                         // EOF - finalize
                         pager.end_read_tx();
                         state.read_tx_active = false;
 
-                        let acc = state
-                            .accumulators
+                        let parser = state
+                            .parser
                             .take()
-                            .expect("accumulators must be initialized in Init phase");
-                        self.populate_indices(
-                            syms,
-                            acc.from_sql_indexes,
-                            acc.automatic_indices,
-                            mv_cursor.is_some(),
-                        )?;
-                        self.populate_materialized_views(
-                            acc.materialized_view_info,
-                            acc.dbsp_state_roots,
-                            acc.dbsp_state_index_roots,
-                        )?;
+                            .expect("schema parser must be initialized in Init phase");
+                        parser.finish(self, syms, mv_cursor.is_some())?;
 
                         state.cursor = None;
                         state.phase = MakeFromBtreePhase::Done;
                         return Ok(IOResult::Done(()));
                     };
 
-                    // Process the row (no IO - CPU only)
-                    // sqlite schema table has 5 columns: type, name, tbl_name, rootpage, sql
-                    let ty_value = row.get_value(0)?;
-                    let ValueRef::Text(ty) = ty_value else {
-                        return Err(LimboError::ConversionError("Expected text value".into()));
-                    };
-                    let ValueRef::Text(name) = row.get_value(1)? else {
-                        return Err(LimboError::ConversionError("Expected text value".into()));
-                    };
-                    let table_name_value = row.get_value(2)?;
-                    let ValueRef::Text(table_name) = table_name_value else {
-                        return Err(LimboError::ConversionError("Expected text value".into()));
-                    };
-                    let root_page_value = row.get_value(3)?;
-                    let ValueRef::Numeric(crate::numeric::Numeric::Integer(root_page)) =
-                        root_page_value
-                    else {
-                        return Err(LimboError::ConversionError("Expected integer value".into()));
-                    };
-                    let sql_value = row.get_value(4)?;
-                    let sql_textref = match sql_value {
-                        ValueRef::Text(sql) => Some(sql),
-                        _ => None,
-                    };
-                    let sql = sql_textref.map(|s| s.as_str());
-
-                    let acc = state
-                        .accumulators
+                    let parser = state
+                        .parser
                         .as_mut()
-                        .expect("accumulators must be initialized in Init phase");
+                        .expect("schema parser must be initialized in Init phase");
                     // `make_from_btree` is called during database open before
                     // any connection exists, so there is no attached catalog
                     // to consult. Any `CREATE TEMP TRIGGER ... ON aux.x` row
                     // maps to `Some(INVALID_DB_ID)` until a connection-scoped
                     // reparse runs with a real resolver.
-                    self.handle_schema_row(
-                        &ty,
-                        &name,
-                        &table_name,
-                        root_page,
-                        sql,
-                        syms,
-                        &mut acc.from_sql_indexes,
-                        &mut acc.automatic_indices,
-                        &mut acc.dbsp_state_roots,
-                        &mut acc.dbsp_state_index_roots,
-                        &mut acc.materialized_view_info,
-                        &|_| None,
-                    )?;
-
-                    state.phase = MakeFromBtreePhase::Advancing;
-                }
-
-                MakeFromBtreePhase::Advancing => {
-                    let cursor = state
-                        .cursor
-                        .as_mut()
-                        .expect("cursor must be initialized in Init phase");
-                    return_if_io!(cursor.next());
-                    state.phase = MakeFromBtreePhase::FetchingRecord;
+                    parser.parse_row(self, &row, syms, &|_| None)?;
                 }
 
                 MakeFromBtreePhase::Done => {

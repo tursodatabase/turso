@@ -18,6 +18,7 @@ pub mod mvcc;
 #[cfg(any(feature = "fuzz", feature = "bench"))]
 pub mod numeric;
 pub mod schema;
+mod schema_parser;
 pub mod state_machine;
 pub mod storage;
 pub mod types;

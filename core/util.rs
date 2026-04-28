@@ -1,5 +1,6 @@
 use crate::numeric::StrToF64;
 use crate::schema::ColDef;
+use crate::schema_parser::{SchemaTableParser, SchemaTableRow};
 use crate::translate::emitter::TransactionMode;
 use crate::translate::expr::{walk_expr, walk_expr_mut, WalkControl};
 use crate::translate::plan::{BitSet, JoinedTable, TableReferences};
@@ -164,18 +165,8 @@ pub fn parse_schema_rows(
     resolve_attached_db: &dyn Fn(&str) -> Option<usize>,
 ) -> Result<()> {
     rows.set_mv_tx(mv_tx);
-    let mv_store = rows.mv_store().clone();
-    // TODO: if we IO, this unparsed indexes is lost. Will probably need some state between
-    // IO runs
-    let mut from_sql_indexes = Vec::with_capacity(10);
-    let mut automatic_indices = HashMap::with_capacity_and_hasher(10, Default::default());
-
-    // Store DBSP state table root pages: view_name -> dbsp_state_root_page
-    let mut dbsp_state_roots: HashMap<String, i64> = HashMap::default();
-    // Store DBSP state table index root pages: view_name -> dbsp_state_index_root_page
-    let mut dbsp_state_index_roots: HashMap<String, i64> = HashMap::default();
-    // Store materialized view info (SQL and root page) for later creation
-    let mut materialized_view_info: HashMap<String, (String, i64)> = HashMap::default();
+    let mvcc_enabled = rows.mv_store().is_some();
+    let mut parser = SchemaTableParser::default();
 
     // TODO: How do we ensure that the I/O we submitted to
     // read the schema is actually complete?
@@ -185,33 +176,21 @@ pub fn parse_schema_rows(
         let table_name = row.get::<&str>(2)?;
         let root_page = row.get::<i64>(3)?;
         let sql = row.get::<&str>(4).ok();
-        schema.handle_schema_row(
-            ty,
-            name,
-            table_name,
-            root_page,
-            sql,
+        parser.parse_row(
+            schema,
+            &SchemaTableRow {
+                ty: ty.to_string(),
+                name: name.to_string(),
+                table_name: table_name.to_string(),
+                root_page,
+                sql: sql.map(ToString::to_string),
+            },
             syms,
-            &mut from_sql_indexes,
-            &mut automatic_indices,
-            &mut dbsp_state_roots,
-            &mut dbsp_state_index_roots,
-            &mut materialized_view_info,
             resolve_attached_db,
         )
     })?;
 
-    schema.populate_indices(
-        syms,
-        from_sql_indexes,
-        automatic_indices,
-        mv_store.is_some(),
-    )?;
-    schema.populate_materialized_views(
-        materialized_view_info,
-        dbsp_state_roots,
-        dbsp_state_index_roots,
-    )?;
+    parser.finish(schema, syms, mvcc_enabled)?;
 
     Ok(())
 }

@@ -24,6 +24,8 @@ use strum_macros::{EnumDiscriminants, FromRepr, VariantArray};
 use turso_macros::Description;
 use turso_parser::ast::{ResolveType, SortOrder};
 
+pub use crate::schema_parser::ParseSchemaFilter;
+
 /// Known custom type comparator functions for sorting and MIN/MAX aggregates.
 /// These replace heap-allocated String names with a compact enum.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -32,60 +34,6 @@ pub enum SortComparatorType {
     StringReverse,
     TestUintLt,
     ArrayLt,
-}
-
-#[derive(Debug, Clone)]
-pub enum ParseSchemaFilter {
-    All,
-    TableNameNotTrigger { table_names: Vec<String> },
-    Name { names: Vec<String> },
-    NameAndType { name: String, ty: String },
-}
-
-impl ParseSchemaFilter {
-    pub fn matches(&self, ty: &str, name: &str, table_name: &str) -> bool {
-        match self {
-            Self::All => true,
-            Self::TableNameNotTrigger { table_names } => {
-                ty != "trigger" && table_names.iter().any(|candidate| candidate == table_name)
-            }
-            Self::Name { names } => names.iter().any(|candidate| candidate == name),
-            Self::NameAndType {
-                name: candidate,
-                ty: candidate_ty,
-            } => candidate == name && candidate_ty == ty,
-        }
-    }
-
-    pub fn explain(&self) -> String {
-        match self {
-            Self::All => "ALL".to_string(),
-            Self::TableNameNotTrigger { table_names } => table_names
-                .iter()
-                .map(|table_name| {
-                    format!(
-                        "tbl_name = {} AND type != 'trigger'",
-                        quote_schema_value(table_name)
-                    )
-                })
-                .collect::<Vec<_>>()
-                .join(" OR "),
-            Self::Name { names } => names
-                .iter()
-                .map(|name| format!("name = {}", quote_schema_value(name)))
-                .collect::<Vec<_>>()
-                .join(" OR "),
-            Self::NameAndType { name, ty } => format!(
-                "name = {} AND type = {}",
-                quote_schema_value(name),
-                quote_schema_value(ty)
-            ),
-        }
-    }
-}
-
-fn quote_schema_value(value: &str) -> String {
-    format!("'{}'", value.replace('\'', "''"))
 }
 
 /// Flags provided to comparison instructions (e.g. Eq, Ne) which determine behavior related to NULL values.

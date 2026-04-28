@@ -4,6 +4,7 @@ use crate::mvcc::cursor::{static_iterator_hack, MvccIterator};
 use crate::mvcc::yield_hooks::{ProvidesYieldContext, YieldContext, YieldPointMarker};
 use crate::mvcc::yield_points::inject_transition_yield;
 use crate::schema::{Schema, Table};
+use crate::schema_parser::{SchemaTableDecodeErrorKind, SchemaTableParser, SchemaTableRow};
 use crate::state_machine::StateMachine;
 use crate::state_machine::StateTransition;
 use crate::state_machine::TransitionResult;
@@ -25,17 +26,15 @@ use crate::types::IOResult;
 use crate::types::ImmutableRecord;
 use crate::types::IndexInfo;
 use crate::types::SeekResult;
+use crate::Completion;
 use crate::File;
 use crate::IOExt;
 use crate::LimboError;
+#[cfg(test)]
+use crate::Numeric;
 use crate::Result;
 use crate::ValueRef;
-use crate::{
-    contains_ignore_ascii_case, eq_ignore_ascii_case, match_ignore_ascii_case, Completion,
-};
-use crate::{
-    turso_assert, turso_assert_eq, turso_assert_less_than, turso_assert_reachable, Numeric,
-};
+use crate::{turso_assert, turso_assert_eq, turso_assert_less_than, turso_assert_reachable};
 use crate::{Connection, Pager, SyncMode};
 use crossbeam_skiplist::map::Entry;
 use crossbeam_skiplist::{SkipMap, SkipSet};
@@ -4639,112 +4638,48 @@ impl<Clock: LogicalClock> MvStore<Clock> {
         // Cell is used so the get_index_info closure can flush the pending rebuild.
         let needs_schema_rebuild = std::cell::Cell::new(false);
 
-        let rebuild_schema =
-            |connection: &Arc<Connection>, schema_rows: &HashMap<i64, ImmutableRecord>| {
-                let pager = connection.pager.load().clone();
-                let cookie = self
-                    .global_header
-                    .read()
-                    .as_ref()
-                    .map(|header| header.schema_cookie.get())
-                    .unwrap_or(
-                        pager
-                            .io
-                            .block(|| pager.with_header(|header| header.schema_cookie))?
-                            .get(),
-                    );
-                let mut fresh = Schema::new();
-                fresh.generated_columns_enabled =
-                    connection.db.experimental_generated_columns_enabled();
-                fresh.schema_version = cookie;
-                let mut from_sql_indexes = Vec::with_capacity(10);
-                let mut automatic_indices: HashMap<String, Vec<(String, i64)>> = HashMap::default();
-                let mut dbsp_state_roots: HashMap<String, i64> = HashMap::default();
-                let mut dbsp_state_index_roots: HashMap<String, i64> = HashMap::default();
-                let mut materialized_view_info: HashMap<String, (String, i64)> = HashMap::default();
-                let syms = connection.syms.read();
-                let mv_store = connection.db.get_mv_store().clone();
-
-                for record in schema_rows.values() {
-                    let ty = match record.get_value_opt(0) {
-                        Some(ValueRef::Text(v)) => v.as_str(),
-                        _ => {
-                            return Err(LimboError::Corrupt(
-                                "sqlite_schema type must be text".to_string(),
-                            ))
-                        }
-                    };
-                    let name = match record.get_value_opt(1) {
-                        Some(ValueRef::Text(v)) => v.as_str(),
-                        _ => {
-                            return Err(LimboError::Corrupt(
-                                "sqlite_schema name must be text".to_string(),
-                            ))
-                        }
-                    };
-                    let table_name = match record.get_value_opt(2) {
-                        Some(ValueRef::Text(v)) => v.as_str(),
-                        _ => {
-                            return Err(LimboError::Corrupt(
-                                "sqlite_schema tbl_name must be text".to_string(),
-                            ))
-                        }
-                    };
-                    let root_page = match record.get_value_opt(3) {
-                        Some(ValueRef::Numeric(Numeric::Integer(v))) => v,
-                        _ => {
-                            return Err(LimboError::Corrupt(
-                                "sqlite_schema root_page must be integer".to_string(),
-                            ))
-                        }
-                    };
-                    let sql = match record.get_value_opt(4) {
-                        Some(ValueRef::Text(v)) => Some(v.as_str()),
-                        _ => None,
-                    };
-                    let attached_resolver = |alias: &str| -> Option<usize> {
-                        connection
-                            .attached_databases()
-                            .read()
-                            .get_database_by_name(&crate::util::normalize_ident(alias))
-                            .map(|(idx, _)| idx)
-                    };
-                    fresh.handle_schema_row(
-                        ty,
-                        name,
-                        table_name,
-                        root_page,
-                        sql,
-                        &syms,
-                        &mut from_sql_indexes,
-                        &mut automatic_indices,
-                        &mut dbsp_state_roots,
-                        &mut dbsp_state_index_roots,
-                        &mut materialized_view_info,
-                        &attached_resolver,
-                    )?;
-                }
-                fresh.populate_indices(
-                    &syms,
-                    from_sql_indexes,
-                    automatic_indices,
-                    mv_store.is_some(),
-                )?;
-                fresh.populate_materialized_views(
-                    materialized_view_info,
-                    dbsp_state_roots,
-                    dbsp_state_index_roots,
-                )?;
-                Self::rehydrate_table_valued_functions(
-                    &mut fresh,
-                    &preserved_table_valued_functions,
+        let rebuild_schema = |connection: &Arc<Connection>,
+                              schema_rows: &HashMap<i64, ImmutableRecord>|
+         -> Result<()> {
+            let pager = connection.pager.load().clone();
+            let cookie = self
+                .global_header
+                .read()
+                .as_ref()
+                .map(|header| header.schema_cookie.get())
+                .unwrap_or(
+                    pager
+                        .io
+                        .block(|| pager.with_header(|header| header.schema_cookie))?
+                        .get(),
                 );
+            let mut fresh = Schema::new();
+            fresh.generated_columns_enabled =
+                connection.db.experimental_generated_columns_enabled();
+            fresh.schema_version = cookie;
+            let mut parser = SchemaTableParser::default();
+            let syms = connection.syms.read();
+            let mv_store = connection.db.get_mv_store().clone();
 
-                let fresh = Arc::new(fresh);
-                *connection.schema.write() = fresh.clone();
-                *connection.db.schema.lock() = fresh;
-                Ok(())
-            };
+            for record in schema_rows.values() {
+                let row = SchemaTableRow::from_record(record, SchemaTableDecodeErrorKind::Corrupt)?;
+                let attached_resolver = |alias: &str| -> Option<usize> {
+                    connection
+                        .attached_databases()
+                        .read()
+                        .get_database_by_name(&crate::util::normalize_ident(alias))
+                        .map(|(idx, _)| idx)
+                };
+                parser.parse_row(&mut fresh, &row, &syms, &attached_resolver)?;
+            }
+            parser.finish(&mut fresh, &syms, mv_store.is_some())?;
+            Self::rehydrate_table_valued_functions(&mut fresh, &preserved_table_valued_functions);
+
+            let fresh = Arc::new(fresh);
+            *connection.schema.write() = fresh.clone();
+            *connection.db.schema.lock() = fresh;
+            Ok(())
+        };
 
         loop {
             let mut get_index_info = |index_id: MVTableId| -> Result<Arc<IndexInfo>> {
@@ -4799,72 +4734,46 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                     if is_schema_row {
                         let row_data = row.payload().to_vec();
                         let record = ImmutableRecord::from_bin_record(row_data);
-                        if record.column_count() < 5 {
-                            return Err(LimboError::Corrupt(format!(
-                                "sqlite_schema row must have at least 5 columns, got {}",
-                                record.column_count()
-                            )));
-                        }
-                        let Some(ValueRef::Text(row_type)) = record.get_value_opt(0) else {
-                            return Err(LimboError::Corrupt(
-                                "sqlite_schema type must be text".to_string(),
-                            ));
-                        };
-                        let row_type = row_type.as_str();
-                        let val = match record.get_value_opt(3) {
-                            Some(v) => v,
-                            None => {
-                                return Err(LimboError::InternalError(
-                                    "Expected at least 5 columns in sqlite_schema".to_string(),
-                                ));
-                            }
-                        };
-                        let ValueRef::Numeric(crate::numeric::Numeric::Integer(root_page)) = val
-                        else {
-                            panic!("Expected integer value for root page, got {val:?}");
-                        };
-                        let sql = match record.get_value_opt(4) {
-                            Some(ValueRef::Text(v)) => Some(v.as_str()),
-                            _ => None,
-                        };
-                        let is_virtual_table = row_type == "table"
-                            && sql.is_some_and(|sql| {
-                                contains_ignore_ascii_case!(sql.as_bytes(), b"create virtual")
-                            });
-                        let has_btree = match row_type {
-                            "index" => true,
-                            "table" => !is_virtual_table,
-                            _ => false,
-                        };
-                        if has_btree {
-                            if root_page == 0 {
+                        {
+                            let schema_row = SchemaTableRow::from_record(
+                                &record,
+                                SchemaTableDecodeErrorKind::Corrupt,
+                            )?;
+                            if schema_row.has_btree() {
+                                if schema_row.root_page == 0 {
+                                    return Err(LimboError::Corrupt(format!(
+                                        "sqlite_schema root_page=0 for btree {}",
+                                        schema_row.ty
+                                    )));
+                                }
+                                if schema_row.root_page < 0 {
+                                    let table_id =
+                                        self.get_table_id_from_root_page(schema_row.root_page);
+                                    if let Some(entry) = self.table_id_to_rootpage.get(&table_id) {
+                                        if let Some(value) = *entry.value() {
+                                            panic!("Logical log contains an insertion of a sqlite_schema record that has both a negative root page and a positive root page: {} & {value}", schema_row.root_page);
+                                        }
+                                    }
+                                    self.insert_table_id_to_rootpage(table_id, None);
+                                } else {
+                                    dropped_root_pages.remove(&schema_row.root_page);
+                                    let table_id =
+                                        self.get_table_id_from_root_page(schema_row.root_page);
+                                    let Some(entry) = self.table_id_to_rootpage.get(&table_id)
+                                    else {
+                                        panic!("Logical log contains root page reference {} that does not exist in the table_id_to_rootpage map", schema_row.root_page);
+                                    };
+                                    let Some(value) = *entry.value() else {
+                                        panic!("Logical log contains root page reference {} that does not have a root page in the table_id_to_rootpage map", schema_row.root_page);
+                                    };
+                                    turso_assert_eq!(value, schema_row.root_page as u64, "logical log root page does not match table_id_to_rootpage map", { "root_page": schema_row.root_page, "map_value": value });
+                                }
+                            } else if schema_row.root_page != 0 {
                                 return Err(LimboError::Corrupt(format!(
-                                    "sqlite_schema root_page=0 for btree {row_type}"
+                                    "sqlite_schema root_page must be 0 for {}, got {}",
+                                    schema_row.ty, schema_row.root_page
                                 )));
                             }
-                            if root_page < 0 {
-                                let table_id = self.get_table_id_from_root_page(root_page);
-                                if let Some(entry) = self.table_id_to_rootpage.get(&table_id) {
-                                    if let Some(value) = *entry.value() {
-                                        panic!("Logical log contains an insertion of a sqlite_schema record that has both a negative root page and a positive root page: {root_page} & {value}");
-                                    }
-                                }
-                                self.insert_table_id_to_rootpage(table_id, None);
-                            } else {
-                                dropped_root_pages.remove(&root_page);
-                                let table_id = self.get_table_id_from_root_page(root_page);
-                                let Some(entry) = self.table_id_to_rootpage.get(&table_id) else {
-                                    panic!("Logical log contains root page reference {root_page} that does not exist in the table_id_to_rootpage map");
-                                };
-                                let Some(value) = *entry.value() else {
-                                    panic!("Logical log contains root page reference {root_page} that does not have a root page in the table_id_to_rootpage map");
-                                };
-                                turso_assert_eq!(value, root_page as u64, "logical log root page does not match table_id_to_rootpage map", { "root_page": root_page, "map_value": value });
-                            }
-                        } else if root_page != 0 {
-                            return Err(LimboError::Corrupt(format!(
-                                "sqlite_schema root_page must be 0 for {row_type}, got {root_page}"
-                            )));
                         }
                         let rowid_int = rowid.row_id.to_int_or_panic();
                         schema_rows.insert(rowid_int, record);
@@ -4971,27 +4880,12 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                             // deleted in the same transaction (ex: a CREATE TABLE followed by a DROP TABLE)
                             continue;
                         };
-                        if record.column_count() < 5 {
-                            return Err(LimboError::Corrupt(format!(
-                                "sqlite_schema row must have at least 5 columns, got {}",
-                                record.column_count()
-                            )));
-                        }
-                        let Some(ValueRef::Text(row_type)) = record.get_value_opt(0) else {
-                            return Err(LimboError::Corrupt(
-                                "sqlite_schema type must be text".to_string(),
-                            ));
-                        };
-                        let row_type = row_type.as_str();
-                        let Some(ValueRef::Numeric(Numeric::Integer(root_page))) =
-                            record.get_value_opt(3)
-                        else {
-                            return Err(LimboError::Corrupt(
-                                "sqlite_schema root_page must be integer".to_string(),
-                            ));
-                        };
-                        if (row_type == "table" || row_type == "index") && root_page > 0 {
-                            dropped_root_pages.insert(root_page);
+                        let schema_row = SchemaTableRow::from_record(
+                            record,
+                            SchemaTableDecodeErrorKind::Corrupt,
+                        )?;
+                        if schema_row.has_btree() && schema_row.root_page > 0 {
+                            dropped_root_pages.insert(schema_row.root_page);
                         }
                         schema_rows.remove(&rowid_int);
                         needs_schema_rebuild.set(true);

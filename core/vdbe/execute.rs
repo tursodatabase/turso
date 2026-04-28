@@ -6,6 +6,7 @@ use crate::mvcc::database::CheckpointStateMachine;
 use crate::mvcc::MvccClock;
 use crate::numeric::Numeric;
 use crate::schema::{Schema, Table, SQLITE_SEQUENCE_TABLE_NAME};
+use crate::schema_parser::{SchemaTableCursor, SchemaTableDecodeErrorKind, SchemaTableParser};
 use crate::state_machine::StateMachine;
 use crate::storage::btree::{
     integrity_check, CursorTrait, IntegrityCheckError, IntegrityCheckState, PageCategory,
@@ -10943,26 +10944,14 @@ pub fn op_page_count(
 /// schema cursor yields IO, we can return control to the outer caller and
 /// resume later without losing intermediate parsing state.
 pub struct OpParseSchemaInner {
-    cursor: Box<dyn CursorTrait>,
+    cursor: SchemaTableCursor,
     schema_arc: Arc<Schema>,
-    from_sql_indexes: Vec<crate::util::UnparsedFromSqlIndex>,
-    automatic_indices: crate::HashMap<String, Vec<(String, i64)>>,
-    dbsp_state_roots: crate::HashMap<String, i64>,
-    dbsp_state_index_roots: crate::HashMap<String, i64>,
-    materialized_view_info: crate::HashMap<String, (String, i64)>,
+    parser: SchemaTableParser,
     filter: crate::vdbe::insn::ParseSchemaFilter,
     db: usize,
-    phase: OpParseSchemaPhase,
 }
 
 pub type OpParseSchemaState = Option<Box<OpParseSchemaInner>>;
-
-#[derive(Debug)]
-enum OpParseSchemaPhase {
-    Rewinding,
-    FetchingRecord,
-    Advancing,
-}
 
 pub fn op_parse_schema(
     program: &Program,
@@ -11012,16 +11001,11 @@ pub fn op_parse_schema(
 
     // Store state for resumption across IO boundaries
     *state.active_op_state.parse_schema() = Some(Box::new(OpParseSchemaInner {
-        cursor,
+        cursor: SchemaTableCursor::new(cursor, SchemaTableDecodeErrorKind::Conversion),
         schema_arc,
-        from_sql_indexes: Vec::with_capacity(10),
-        automatic_indices: Default::default(),
-        dbsp_state_roots: Default::default(),
-        dbsp_state_index_roots: Default::default(),
-        materialized_view_info: Default::default(),
+        parser: SchemaTableParser::default(),
         filter: filter.clone(),
         db: *db,
-        phase: OpParseSchemaPhase::Rewinding,
     }));
 
     // Now begin stepping through the schema rows
@@ -11064,61 +11048,23 @@ fn op_parse_schema_step(
 ) -> Result<InsnFunctionStepResult> {
     loop {
         let inner = state.active_op_state.parse_schema().as_mut().unwrap();
-        match inner.phase {
-            OpParseSchemaPhase::Rewinding => {
-                return_if_io!(inner.cursor.rewind());
-                inner.phase = OpParseSchemaPhase::FetchingRecord;
-            }
-            OpParseSchemaPhase::FetchingRecord => {
-                let row = return_if_io!(inner.cursor.record());
-                let Some(row) = row else {
-                    return finish_parse_schema(state, conn);
-                };
+        let row = return_if_io!(inner.cursor.next_row());
+        let Some(row) = row else {
+            return finish_parse_schema(state, conn);
+        };
 
-                let ty = schema_text_column(row, 0, "type")?.to_string();
-                let name = schema_text_column(row, 1, "name")?.to_string();
-                let table_name = schema_text_column(row, 2, "tbl_name")?.to_string();
-                let root_page = schema_integer_column(row, 3, "rootpage")?;
-                let sql = match row.get_value(4)? {
-                    ValueRef::Text(sql) => Some(sql.as_str().to_string()),
-                    _ => None,
-                };
-
-                if inner.filter.matches(&ty, &name, &table_name) {
-                    let schema = Arc::make_mut(&mut inner.schema_arc);
-                    let syms = conn.syms.read();
-                    let attached_resolver = |alias: &str| -> Option<usize> {
-                        conn.attached_databases()
-                            .read()
-                            .get_database_by_name(&crate::util::normalize_ident(alias))
-                            .map(|(idx, _)| idx)
-                    };
-                    schema.handle_schema_row(
-                        &ty,
-                        &name,
-                        &table_name,
-                        root_page,
-                        sql.as_deref(),
-                        &syms,
-                        &mut inner.from_sql_indexes,
-                        &mut inner.automatic_indices,
-                        &mut inner.dbsp_state_roots,
-                        &mut inner.dbsp_state_index_roots,
-                        &mut inner.materialized_view_info,
-                        &attached_resolver,
-                    )?;
-                }
-
-                inner.phase = OpParseSchemaPhase::Advancing;
-            }
-            OpParseSchemaPhase::Advancing => {
-                return_if_io!(inner.cursor.next());
-                if inner.cursor.has_record() {
-                    inner.phase = OpParseSchemaPhase::FetchingRecord;
-                    continue;
-                }
-                return finish_parse_schema(state, conn);
-            }
+        if inner.filter.matches_row(&row) {
+            let schema = Arc::make_mut(&mut inner.schema_arc);
+            let syms = conn.syms.read();
+            let attached_resolver = |alias: &str| -> Option<usize> {
+                conn.attached_databases()
+                    .read()
+                    .get_database_by_name(&crate::util::normalize_ident(alias))
+                    .map(|(idx, _)| idx)
+            };
+            inner
+                .parser
+                .parse_row(schema, &row, &syms, &attached_resolver)?;
         }
     }
 }
@@ -11129,11 +11075,7 @@ fn finish_parse_schema(
 ) -> Result<InsnFunctionStepResult> {
     let OpParseSchemaInner {
         mut schema_arc,
-        from_sql_indexes,
-        automatic_indices,
-        dbsp_state_roots,
-        dbsp_state_index_roots,
-        materialized_view_info,
+        parser,
         db,
         ..
     } = *state
@@ -11145,17 +11087,7 @@ fn finish_parse_schema(
     let mv_store = conn.mv_store_for_db(db);
     let syms = conn.syms.read();
 
-    let res1 = schema.populate_indices(
-        &syms,
-        from_sql_indexes,
-        automatic_indices,
-        mv_store.is_some(),
-    );
-    let res2 = schema.populate_materialized_views(
-        materialized_view_info,
-        dbsp_state_roots,
-        dbsp_state_index_roots,
-    );
+    let res = parser.finish(schema, &syms, mv_store.is_some());
 
     // Store the modified schema back
     if db == crate::TEMP_DB_ID {
@@ -11181,33 +11113,11 @@ fn finish_parse_schema(
         *conn.schema.write() = schema_arc;
     }
     conn.bump_prepare_context_generation();
-    let _ = (res1?, res2?);
+    res?;
 
     state.pc += 1;
     state.active_op_state.clear();
     Ok(InsnFunctionStepResult::Step)
-}
-
-fn schema_text_column<'a>(
-    row: &'a ImmutableRecord,
-    column: usize,
-    column_name: &str,
-) -> Result<&'a str> {
-    let ValueRef::Text(value) = row.get_value(column)? else {
-        return Err(LimboError::ConversionError(format!(
-            "Expected text value for sqlite_schema.{column_name}"
-        )));
-    };
-    Ok(value.as_str())
-}
-
-fn schema_integer_column(row: &ImmutableRecord, column: usize, column_name: &str) -> Result<i64> {
-    let ValueRef::Numeric(Numeric::Integer(value)) = row.get_value(column)? else {
-        return Err(LimboError::ConversionError(format!(
-            "Expected integer value for sqlite_schema.{column_name}"
-        )));
-    };
-    Ok(value)
 }
 
 /// Phases of the multi-statement state machine driven by [`op_init_cdc_version`].
