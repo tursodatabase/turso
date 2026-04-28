@@ -2807,8 +2807,12 @@ enum CheckpointLocks {
     },
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum CheckpointLockSource {
+/// CheckpointLockSource says whether the checkpoint state machine should acquire checkpoint_lock
+/// itself or consume checkpoint_lock already held by the caller.
+/// Most of the time, the default `Acquire` is used, except for VACUUM.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum CheckpointLockSource {
+    #[default]
     Acquire,
     HeldByCaller,
 }

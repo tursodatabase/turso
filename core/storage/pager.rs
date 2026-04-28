@@ -5,7 +5,7 @@ use crate::io::FileSyncType;
 use crate::io::WriteBatch;
 use crate::storage::btree::PinGuard;
 use crate::storage::subjournal::Subjournal;
-use crate::storage::wal::PreparedFrames;
+use crate::storage::wal::{CheckpointLockSource, PreparedFrames};
 use crate::storage::{
     buffer_pool::BufferPool,
     database::DatabaseStorage,
@@ -1020,16 +1020,6 @@ struct CheckpointState {
     mode: Option<CheckpointMode>,
     /// The checkpoint state machine should acquire the lock or use the one by caller
     lock_source: CheckpointLockSource,
-}
-
-/// CheckpointLockSource says whether the checkpoint state machine should acquire checkpoint_lock
-/// itself or consume checkpoint_lock already held by the caller.
-/// Most of the time, the default `Acquire` is used, except for VACUUM.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-enum CheckpointLockSource {
-    #[default]
-    Acquire,
-    HeldByCaller,
 }
 
 #[derive(Clone, Debug)]
