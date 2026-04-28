@@ -1901,62 +1901,17 @@ impl Connection {
 
         let syms = self.syms.read();
         self.with_schema_mut(|schema| -> Result<()> {
-            // Incremental re-parse after extension loading. The schema already has
-            // tables/indices/views from initial parse. We only need to pick up
-            // entries that previously failed (e.g. virtual tables whose module
-            // wasn't loaded yet). "Already exists" errors are expected and skipped.
-            let mut from_sql_indexes = Vec::new();
-            let mut automatic_indices = HashMap::default();
-            let mut dbsp_state_roots = HashMap::default();
-            let mut dbsp_state_index_roots = HashMap::default();
-            let mut materialized_view_info = HashMap::default();
-
             let attached_resolver = |name: &str| -> Option<usize> {
                 self.attached_databases
                     .read()
                     .get_database_by_name(&crate::util::normalize_ident(name))
                     .map(|(idx, _)| idx)
             };
+            let mut parser = SchemaTableParser::default();
             for row in &rows_data {
-                match schema.handle_schema_row(
-                    row.ty,
-                    &row.name,
-                    &row.table_name,
-                    row.root_page,
-                    row.sql.as_deref(),
-                    &syms,
-                    &mut from_sql_indexes,
-                    &mut automatic_indices,
-                    &mut dbsp_state_roots,
-                    &mut dbsp_state_index_roots,
-                    &mut materialized_view_info,
-                    &attached_resolver,
-                ) {
-                    Ok(()) => {}
-                    Err(LimboError::ParseError(msg)) if msg.contains("already exists") => {}
-                    Err(LimboError::ExtensionError(msg)) => {
-                        eprintln!("Warning: {msg}");
-                    }
-                    Err(e) => return Err(e),
-                }
+                parser.parse_extension_load_row(schema, row, &syms, &attached_resolver)?;
             }
-
-            match schema.populate_indices(&syms, from_sql_indexes, automatic_indices, false) {
-                Ok(()) => {}
-                Err(LimboError::ParseError(msg)) if msg.contains("already exists") => {}
-                Err(LimboError::ExtensionError(msg)) => eprintln!("Warning: {msg}"),
-                Err(e) => return Err(e),
-            }
-            match schema.populate_materialized_views(
-                materialized_view_info,
-                dbsp_state_roots,
-                dbsp_state_index_roots,
-            ) {
-                Ok(()) => {}
-                Err(LimboError::ExtensionError(msg)) => eprintln!("Warning: {msg}"),
-                Err(e) => return Err(e),
-            }
-            Ok(())
+            parser.finish_extension_load(schema, &syms)
         })
     }
 

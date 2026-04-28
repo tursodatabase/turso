@@ -318,6 +318,25 @@ impl SchemaTableParser {
         )
     }
 
+    pub(crate) fn parse_extension_load_row(
+        &mut self,
+        schema: &mut Schema,
+        row: &SchemaTableRow,
+        syms: &SymbolTable,
+        resolve_attached_db: &dyn Fn(&str) -> Option<usize>,
+    ) -> Result<()> {
+        // Incremental re-parse after extension loading. The schema already has
+        // tables/indices/views from initial parse. We only need to pick up
+        // entries that previously failed (e.g. virtual tables whose module
+        // wasn't loaded yet). "Already exists" errors are expected and skipped.
+        Self::ignore_expected_extension_load_error(self.parse_row(
+            schema,
+            row,
+            syms,
+            resolve_attached_db,
+        ))
+    }
+
     pub(crate) fn finish(
         self,
         schema: &mut Schema,
@@ -335,5 +354,35 @@ impl SchemaTableParser {
             self.dbsp_state_roots,
             self.dbsp_state_index_roots,
         )
+    }
+
+    pub(crate) fn finish_extension_load(
+        self,
+        schema: &mut Schema,
+        syms: &SymbolTable,
+    ) -> Result<()> {
+        Self::ignore_expected_extension_load_error(schema.populate_indices(
+            syms,
+            self.from_sql_indexes,
+            self.automatic_indices,
+            false,
+        ))?;
+        Self::ignore_expected_extension_load_error(schema.populate_materialized_views(
+            self.materialized_view_info,
+            self.dbsp_state_roots,
+            self.dbsp_state_index_roots,
+        ))
+    }
+
+    fn ignore_expected_extension_load_error(result: Result<()>) -> Result<()> {
+        match result {
+            Ok(()) => Ok(()),
+            Err(LimboError::ParseError(msg)) if msg.contains("already exists") => Ok(()),
+            Err(LimboError::ExtensionError(msg)) => {
+                eprintln!("Warning: {msg}");
+                Ok(())
+            }
+            Err(e) => Err(e),
+        }
     }
 }
