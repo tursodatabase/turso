@@ -30,6 +30,7 @@ import (
 	"sort"
 	"strings"
 	"testing"
+	"time"
 
 	turso_libs "github.com/tursodatabase/turso-go-platform-libs"
 	turso "turso.tech/database/tursogo"
@@ -130,6 +131,11 @@ type Op struct {
 		Name  string
 		Value any
 	}
+	InnerOps    []Op   // for transaction_workflow
+	Commit      bool   // for transaction_workflow
+	GoodOp      *Op    // for error_in_transaction
+	BadSQL      string // for error_in_transaction
+	RecoveryOp  *Op    // for error_in_transaction
 }
 
 type ColDef struct {
@@ -492,8 +498,88 @@ func genOp(ht *hegel.T, tableCols map[string]int, prefix int) Op {
 			Kind:  "create_trigger",
 			Table: genTableName(ht, prefix),
 		}
+	case "transaction_workflow":
+		return genTransactionWorkflow(ht, tableCols, prefix)
+	case "error_in_transaction":
+		return genErrorInTransaction(ht, tableCols, prefix)
 	default:
 		panic(fmt.Sprintf("unknown op id in ops.json: %s", opSpec.ID))
+	}
+}
+
+// dmlOpIDs are ops safe to use inside a transaction (no BEGIN/COMMIT/ROLLBACK).
+var dmlOpIDs = []string{
+	"create", "insert", "select", "select_value",
+	"insert_returning", "delete_returning", "update_returning",
+	"select_limit", "select_count", "select_expr",
+	"insert_affected", "delete_affected", "update_affected",
+}
+
+func genInnerOp(ht *hegel.T, tableCols map[string]int, prefix int) Op {
+	pick := hegel.Draw(ht, hegel.Integers(0, len(dmlOpIDs)-1))
+	id := dmlOpIDs[pick]
+
+	switch id {
+	case "create":
+		table := genTableName(ht, prefix)
+		tableCols[table] = 2
+		return Op{Kind: "create", Table: table}
+	case "insert":
+		table := genTableName(ht, prefix)
+		return Op{Kind: "insert", Table: table, Values: genValuesForTable(ht, table, tableCols)}
+	case "select":
+		return Op{Kind: "select", Table: genTableName(ht, prefix)}
+	case "select_value":
+		v := hegel.Draw(ht, hegel.Integers(-1000, 1000))
+		return Op{Kind: "select_value", Expr: fmt.Sprintf("%d", v)}
+	case "insert_returning":
+		table := genTableName(ht, prefix)
+		return Op{Kind: "insert_returning", Table: table, Values: genValuesForTable(ht, table, tableCols)}
+	case "delete_returning":
+		return Op{Kind: "delete_returning", Table: genTableName(ht, prefix)}
+	case "update_returning":
+		return Op{Kind: "update_returning", Table: genTableName(ht, prefix), Value: genValue(ht)}
+	case "select_limit":
+		return Op{Kind: "select_limit", Table: genTableName(ht, prefix)}
+	case "select_count":
+		return Op{Kind: "select_count", Table: genTableName(ht, prefix)}
+	case "select_expr":
+		return Op{Kind: "select_expr", Value: genValue(ht)}
+	case "insert_affected":
+		table := genTableName(ht, prefix)
+		return Op{Kind: "insert_affected", Table: table, Values: genValuesForTable(ht, table, tableCols)}
+	case "delete_affected":
+		return Op{Kind: "delete_affected", Table: genTableName(ht, prefix)}
+	case "update_affected":
+		return Op{Kind: "update_affected", Table: genTableName(ht, prefix), Value: genValue(ht)}
+	default:
+		panic("unreachable")
+	}
+}
+
+func genTransactionWorkflow(ht *hegel.T, tableCols map[string]int, prefix int) Op {
+	count := hegel.Draw(ht, hegel.Integers(1, 5))
+	innerOps := make([]Op, count)
+	for i := range innerOps {
+		innerOps[i] = genInnerOp(ht, tableCols, prefix)
+	}
+	commitByte := hegel.Draw(ht, hegel.Integers(0, 255))
+	return Op{
+		Kind:     "transaction_workflow",
+		InnerOps: innerOps,
+		Commit:   commitByte%2 == 0,
+	}
+}
+
+func genErrorInTransaction(ht *hegel.T, tableCols map[string]int, prefix int) Op {
+	goodOp := genInnerOp(ht, tableCols, prefix)
+	badSQL := genErrorSQL(ht, prefix)
+	recoveryOp := genInnerOp(ht, tableCols, prefix)
+	return Op{
+		Kind:       "error_in_transaction",
+		GoodOp:     &goodOp,
+		BadSQL:     badSQL,
+		RecoveryOp: &recoveryOp,
 	}
 }
 
@@ -724,8 +810,76 @@ func executeOp(db *sql.DB, op Op) OpResult {
 		db.Exec(fmt.Sprintf("INSERT INTO %s VALUES (42, 'trigger_test')", op.Table))
 		return queryResult(db, fmt.Sprintf("SELECT * FROM %s ORDER BY rowid", audit))
 
+	case "transaction_workflow":
+		tx, err := db.BeginTx(context.Background(), nil)
+		if err != nil {
+			return OpResult{Success: false}
+		}
+		for i := range op.InnerOps {
+			executeOpTx(tx, &op.InnerOps[i])
+		}
+		if op.Commit {
+			err = tx.Commit()
+		} else {
+			err = tx.Rollback()
+		}
+		if err != nil {
+			return OpResult{Success: false}
+		}
+		return OpResult{Success: true, RowCount: 0}
+
+	case "error_in_transaction":
+		tx, err := db.BeginTx(context.Background(), nil)
+		if err != nil {
+			return OpResult{Success: false}
+		}
+		executeOpTx(tx, op.GoodOp)
+		tx.Exec(op.BadSQL)
+		executeOpTx(tx, op.RecoveryOp)
+		err = tx.Rollback()
+		if err != nil {
+			return OpResult{Success: false}
+		}
+		return OpResult{Success: true, RowCount: 0}
+
 	default:
 		return OpResult{Success: false}
+	}
+}
+
+// executeOpTx runs a DML/query op inside a transaction, ignoring errors.
+func executeOpTx(tx *sql.Tx, op *Op) {
+	switch op.Kind {
+	case "create":
+		tx.Exec(fmt.Sprintf("CREATE TABLE IF NOT EXISTS %s (a INTEGER, b TEXT)", op.Table))
+	case "create_dynamic":
+		var colDefs []string
+		for _, c := range op.Cols {
+			colDefs = append(colDefs, fmt.Sprintf("%s %s", c.Name, c.Type))
+		}
+		tx.Exec(fmt.Sprintf("CREATE TABLE IF NOT EXISTS %s (%s)", op.Table, strings.Join(colDefs, ", ")))
+	case "insert", "insert_affected", "insert_rowid":
+		tx.Exec(fmt.Sprintf("INSERT INTO %s VALUES (%s)", op.Table, placeholders(len(op.Values))), op.Values...)
+	case "insert_returning":
+		tx.Query(fmt.Sprintf("INSERT INTO %s VALUES (%s) RETURNING *", op.Table, placeholders(len(op.Values))), op.Values...)
+	case "delete_returning":
+		tx.Query(fmt.Sprintf("DELETE FROM %s RETURNING *", op.Table))
+	case "delete_affected":
+		tx.Exec(fmt.Sprintf("DELETE FROM %s", op.Table))
+	case "update_returning":
+		tx.Query(fmt.Sprintf("UPDATE %s SET a = ? RETURNING *", op.Table), op.Value)
+	case "update_affected":
+		tx.Exec(fmt.Sprintf("UPDATE %s SET a = ?", op.Table), op.Value)
+	case "select":
+		tx.Query(fmt.Sprintf("SELECT * FROM %s", op.Table))
+	case "select_value":
+		tx.Query(fmt.Sprintf("SELECT %s", op.Expr))
+	case "select_limit":
+		tx.Query(fmt.Sprintf("SELECT * FROM %s LIMIT 1", op.Table))
+	case "select_count":
+		tx.Query(fmt.Sprintf("SELECT COUNT(*), SUM(a) FROM %s", op.Table))
+	case "select_expr":
+		tx.Query("SELECT 1+1, 'hello'||'world', NULL, CAST(3.14 AS INTEGER), typeof(?)", op.Value)
 	}
 }
 
@@ -745,13 +899,25 @@ func queryResult(db *sql.DB, query string) OpResult {
 	return queryResultWithParams(db, query, nil)
 }
 
+func queryResultTx(tx *sql.Tx, query string) OpResult {
+	rows, err := tx.Query(query)
+	if err != nil {
+		return OpResult{Success: false}
+	}
+	defer rows.Close()
+	return scanRows(rows)
+}
+
 func queryResultWithParams(db *sql.DB, query string, params []any) OpResult {
 	rows, err := db.Query(query, params...)
 	if err != nil {
 		return OpResult{Success: false}
 	}
 	defer rows.Close()
+	return scanRows(rows)
+}
 
+func scanRows(rows *sql.Rows) OpResult {
 	cols, err := rows.Columns()
 	if err != nil {
 		return OpResult{Success: false}
@@ -843,11 +1009,17 @@ func openDB(t *testing.T, driver string) *sql.DB {
 		if err != nil {
 			t.Fatalf("remote driver not available: %v", err)
 		}
-		if err := db.Ping(); err != nil {
-			db.Close()
-			t.Fatalf("server not reachable at %s: %v", url, err)
+		// Retry Ping with backoff — the shared libsql-server can
+		// temporarily return 429 when prior test suites left it busy.
+		for attempt := 0; attempt < 5; attempt++ {
+			if err = db.Ping(); err == nil {
+				return db
+			}
+			time.Sleep(time.Duration(attempt+1) * 500 * time.Millisecond)
 		}
-		return db
+		db.Close()
+		t.Fatalf("server not reachable at %s after retries: %v", url, err)
+		return nil
 	default:
 		t.Fatalf("unknown driver %q", driver)
 		return nil
@@ -970,30 +1142,34 @@ func TestAPIParity(t *testing.T) {
 			{"local", localDB},
 			{"remote", remoteDB},
 		} {
-			_, err := tc.db.Exec("BEGIN")
+			tx, err := tc.db.BeginTx(context.Background(), nil)
 			if err != nil {
 				ht.Fatalf("%s: BEGIN failed: %v", tc.label, err)
 			}
 
-			_, err = tc.db.Exec(fmt.Sprintf("CREATE TABLE IF NOT EXISTS %s (a INTEGER, b TEXT)", table))
+			_, err = tx.Exec(fmt.Sprintf("CREATE TABLE IF NOT EXISTS %s (a INTEGER, b TEXT)", table))
 			if err != nil {
+				tx.Rollback()
 				ht.Fatalf("%s: CREATE TABLE failed: %v", tc.label, err)
 			}
 
-			_, err = tc.db.Exec(fmt.Sprintf("INSERT INTO %s VALUES (?, 'txn_ddl')", table), val)
+			_, err = tx.Exec(fmt.Sprintf("INSERT INTO %s VALUES (?, 'txn_ddl')", table), val)
 			if err != nil {
+				tx.Rollback()
 				ht.Fatalf("%s: INSERT failed: %v", tc.label, err)
 			}
 
-			result := queryResult(tc.db, fmt.Sprintf("SELECT a FROM %s", table))
+			result := queryResultTx(tx, fmt.Sprintf("SELECT a FROM %s", table))
 			if !result.Success {
+				tx.Rollback()
 				ht.Fatalf("%s: SELECT inside txn failed after CREATE+INSERT", tc.label)
 			}
 			if result.RowCount != 1 {
+				tx.Rollback()
 				ht.Fatalf("%s: expected 1 row, got %d", tc.label, result.RowCount)
 			}
 
-			_, err = tc.db.Exec("COMMIT")
+			err = tx.Commit()
 			if err != nil {
 				ht.Fatalf("%s: COMMIT failed: %v", tc.label, err)
 			}
@@ -1023,37 +1199,42 @@ func TestAPIParity(t *testing.T) {
 			{"local", localDB},
 			{"remote", remoteDB},
 		} {
-			_, err := tc.db.Exec("BEGIN")
+			tx, err := tc.db.BeginTx(context.Background(), nil)
 			if err != nil {
 				ht.Fatalf("%s: BEGIN failed: %v", tc.label, err)
 			}
 
-			_, err = tc.db.Exec(fmt.Sprintf("CREATE TABLE IF NOT EXISTS %s (a INTEGER, b TEXT)", table))
+			_, err = tx.Exec(fmt.Sprintf("CREATE TABLE IF NOT EXISTS %s (a INTEGER, b TEXT)", table))
 			if err != nil {
+				tx.Rollback()
 				ht.Fatalf("%s: CREATE TABLE failed: %v", tc.label, err)
 			}
 
-			// Use Prepare() instead of Exec() — this exercises the describe
+			// Use Prepare() on the tx — this exercises the describe
 			// path which must see DDL from the current transaction.
-			stmt, err := tc.db.Prepare(fmt.Sprintf("INSERT INTO %s VALUES (?, 'txn_ddl')", table))
+			stmt, err := tx.Prepare(fmt.Sprintf("INSERT INTO %s VALUES (?, 'txn_ddl')", table))
 			if err != nil {
+				tx.Rollback()
 				ht.Fatalf("%s: Prepare(INSERT) failed after CREATE in same txn: %v", tc.label, err)
 			}
 			_, err = stmt.Exec(val)
 			stmt.Close()
 			if err != nil {
+				tx.Rollback()
 				ht.Fatalf("%s: prepared INSERT Exec failed: %v", tc.label, err)
 			}
 
-			result := queryResult(tc.db, fmt.Sprintf("SELECT a FROM %s", table))
+			result := queryResultTx(tx, fmt.Sprintf("SELECT a FROM %s", table))
 			if !result.Success {
+				tx.Rollback()
 				ht.Fatalf("%s: SELECT inside txn failed after CREATE+Prepare(INSERT)", tc.label)
 			}
 			if result.RowCount != 1 {
+				tx.Rollback()
 				ht.Fatalf("%s: expected 1 row, got %d", tc.label, result.RowCount)
 			}
 
-			_, err = tc.db.Exec("COMMIT")
+			err = tx.Commit()
 			if err != nil {
 				ht.Fatalf("%s: COMMIT failed: %v", tc.label, err)
 			}

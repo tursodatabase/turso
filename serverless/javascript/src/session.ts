@@ -167,6 +167,9 @@ export class Session {
 
   /**
    * Describe a SQL statement to get its column metadata.
+   *
+   * @param sql - The SQL statement to describe
+   * @returns Promise resolving to the statement description
    */
   async describe(sql: string, queryOptions?: QueryOptions): Promise<DescribeResult> {
     const response = await this.sendPipeline(
@@ -190,6 +193,11 @@ export class Session {
   /**
    * Execute a SQL statement and return all results.
    * Uses pipeline (not cursor) so the stream is properly closed.
+   *
+   * @param sql - The SQL statement to execute
+   * @param args - Optional array of parameter values or object with named parameters
+   * @param safeIntegers - Whether to return integers as BigInt
+   * @returns Promise resolving to the complete result set
    */
   async execute(sql: string, args: any[] | Record<string, any> = [], safeIntegers: boolean = false, queryOptions?: QueryOptions): Promise<any> {
     const { positionalArgs, namedArgs } = this.encodeArgs(args);
@@ -223,6 +231,10 @@ export class Session {
   /**
    * Execute a SQL statement and return the raw response and entries.
    * Uses cursor for streaming support.
+   *
+   * @param sql - The SQL statement to execute
+   * @param args - Optional array of parameter values or object with named parameters
+   * @returns Promise resolving to the raw response and cursor entries
    */
   async executeRaw(sql: string, args: any[] | Record<string, any> = [], queryOptions?: QueryOptions): Promise<{ response: CursorResponse; entries: AsyncGenerator<CursorEntry> }> {
     const { positionalArgs, namedArgs } = this.encodeArgs(args);
@@ -307,6 +319,9 @@ export class Session {
 
   /**
    * Process cursor entries into a structured result.
+   *
+   * @param entries - Async generator of cursor entries
+   * @returns Promise resolving to the processed result
    */
   async processCursorEntries(entries: AsyncGenerator<CursorEntry>, safeIntegers: boolean = false): Promise<any> {
     let columns: string[] = [];
@@ -357,6 +372,10 @@ export class Session {
 
   /**
    * Create a row object with both array and named property access.
+   *
+   * @param values - Array of column values
+   * @param columns - Array of column names
+   * @returns Row object with dual access patterns
    */
   createRowObject(values: any[], columns: string[]): any {
     const row = [...values];
@@ -378,6 +397,9 @@ export class Session {
   /**
    * Execute multiple SQL statements in a batch.
    * Uses pipeline (not cursor) so the stream is properly closed.
+   *
+   * @param statements - Array of SQL statements to execute
+   * @returns Promise resolving to batch execution results
    */
   async batch(statements: string[], queryOptions?: QueryOptions): Promise<any> {
     const batchReq: BatchRequest = {
@@ -441,6 +463,9 @@ export class Session {
 
   /**
    * Execute a sequence of SQL statements separated by semicolons.
+   *
+   * @param sql - SQL string containing multiple statements separated by semicolons
+   * @returns Promise resolving when all statements are executed
    */
   async sequence(sql: string, queryOptions?: QueryOptions): Promise<void> {
     const response = await this.sendPipeline(
@@ -458,6 +483,9 @@ export class Session {
 
   /**
    * Close the session.
+   *
+   * Sends a close request to the server to properly clean up the stream
+   * before resetting the local state.
    */
   async close(): Promise<void> {
     if (this.baton) {
@@ -468,10 +496,12 @@ export class Session {
         };
         await executePipeline(this.baseUrl, this.config.authToken, request, this.config.remoteEncryptionKey);
       } catch {
-        // Ignore errors during close
+        // Ignore errors during close — the connection might already be closed
+        // or the baton may be stale after a timeout.
       }
     }
 
+    // Reset local state
     this.baton = null;
     this.baseUrl = '';
   }
