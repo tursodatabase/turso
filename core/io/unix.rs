@@ -3,7 +3,6 @@ use crate::error::{io_error, CompletionError, LimboError};
 use crate::io::clock::{Clock, DefaultClock, MonotonicInstant, WallClockInstant};
 use crate::io::common;
 use crate::io::FileSyncType;
-use crate::sync::Mutex;
 use crate::Result;
 use rustix::{
     fd::{AsFd, AsRawFd},
@@ -111,7 +110,7 @@ impl IO for UnixIO {
 
         #[allow(clippy::arc_with_non_send_sync)]
         let unix_file = Arc::new(UnixFile {
-            file: Arc::new(Mutex::new(file)),
+            file,
             path: path.to_string(),
         });
         if std::env::var(common::ENV_DISABLE_FILE_LOCK).is_err()
@@ -134,7 +133,7 @@ impl IO for UnixIO {
 }
 
 pub struct UnixFile {
-    file: Arc<Mutex<std::fs::File>>,
+    file: std::fs::File,
     path: String,
 }
 
@@ -326,8 +325,7 @@ pub(crate) fn unix_shared_wal_map(
 
 impl File for UnixFile {
     fn lock_file(&self, exclusive: bool) -> Result<()> {
-        let fd = self.file.lock();
-        let fd = fd.as_fd();
+        let fd = self.file.as_fd();
         // F_SETLK is a non-blocking lock. The lock will be released when the file is closed
         // or the process exits or after an explicit unlock.
         fs::fcntl_lock(
@@ -354,8 +352,7 @@ impl File for UnixFile {
     }
 
     fn unlock_file(&self) -> Result<()> {
-        let fd = self.file.lock();
-        let fd = fd.as_fd();
+        let fd = self.file.as_fd();
         fs::fcntl_lock(fd, FlockOperation::NonBlockingUnlock).map_err(|e| {
             LimboError::LockingError(format!(
                 "Failed to release file lock: {}",
@@ -367,13 +364,12 @@ impl File for UnixFile {
 
     #[instrument(err, skip_all, level = Level::TRACE)]
     fn pread(&self, pos: u64, c: Completion) -> Result<Completion> {
-        let file = self.file.lock();
         let result = unsafe {
             let r = c.as_read();
             let buf = r.buf();
             let slice = buf.as_mut_slice();
             libc::pread(
-                file.as_raw_fd(),
+                self.file.as_raw_fd(),
                 slice.as_mut_ptr() as *mut libc::c_void,
                 slice.len(),
                 pos as libc::off_t,
@@ -392,7 +388,6 @@ impl File for UnixFile {
 
     #[instrument(err, skip_all, level = Level::TRACE)]
     fn pwrite(&self, pos: u64, buffer: Arc<crate::Buffer>, c: Completion) -> Result<Completion> {
-        let file = self.file.lock();
         let buf_slice = buffer.as_slice();
         let total_size = buf_slice.len();
 
@@ -403,7 +398,7 @@ impl File for UnixFile {
             let remaining_slice = &buf_slice[total_written..];
             let result = unsafe {
                 libc::pwrite(
-                    file.as_raw_fd(),
+                    self.file.as_raw_fd(),
                     remaining_slice.as_ptr() as *const libc::c_void,
                     remaining_slice.len(),
                     current_pos as libc::off_t,
@@ -447,7 +442,6 @@ impl File for UnixFile {
             return self.pwrite(pos, buffers[0].clone(), c);
         }
 
-        let file = self.file.lock();
         let mut total_written = 0usize;
         let mut current_pos = pos;
         let mut buf_idx = 0;
@@ -455,7 +449,13 @@ impl File for UnixFile {
 
         let total_size: usize = buffers.iter().map(|b| b.len()).sum();
         while total_written < total_size {
-            match try_pwritev_raw(file.as_raw_fd(), current_pos, &buffers, buf_idx, buf_offset) {
+            match try_pwritev_raw(
+                self.file.as_raw_fd(),
+                current_pos,
+                &buffers,
+                buf_idx,
+                buf_offset,
+            ) {
                 Ok(written) => {
                     if written == 0 {
                         // Unexpected EOF
@@ -503,21 +503,21 @@ impl File for UnixFile {
 
     #[instrument(err, skip_all, level = Level::TRACE)]
     fn sync(&self, c: Completion, sync_type: FileSyncType) -> Result<Completion> {
-        let file = self.file.lock();
-
         let result = unsafe {
             #[cfg(target_vendor = "apple")]
             {
                 match sync_type {
-                    FileSyncType::Fsync => libc::fsync(file.as_raw_fd()),
-                    FileSyncType::FullFsync => libc::fcntl(file.as_raw_fd(), libc::F_FULLFSYNC),
+                    FileSyncType::Fsync => libc::fsync(self.file.as_raw_fd()),
+                    FileSyncType::FullFsync => {
+                        libc::fcntl(self.file.as_raw_fd(), libc::F_FULLFSYNC)
+                    }
                 }
             }
             #[cfg(not(target_vendor = "apple"))]
             {
                 // FullFsync has no effect on non-Apple platforms
                 let _ = sync_type;
-                libc::fsync(file.as_raw_fd())
+                libc::fsync(self.file.as_raw_fd())
             }
         };
 
@@ -540,14 +540,16 @@ impl File for UnixFile {
 
     #[instrument(err, skip_all, level = Level::TRACE)]
     fn size(&self) -> Result<u64> {
-        let file = self.file.lock();
-        Ok(file.metadata().map_err(|e| io_error(e, "metadata"))?.len())
+        Ok(self
+            .file
+            .metadata()
+            .map_err(|e| io_error(e, "metadata"))?
+            .len())
     }
 
     #[instrument(err, skip_all, level = Level::INFO)]
     fn truncate(&self, len: u64, c: Completion) -> Result<Completion> {
-        let file = self.file.lock();
-        let result = file.set_len(len);
+        let result = self.file.set_len(len);
         match result {
             Ok(()) => {
                 trace!("file truncated to len=({})", len);
@@ -564,8 +566,7 @@ impl File for UnixFile {
         exclusive: bool,
         kind: SharedWalLockKind,
     ) -> Result<()> {
-        let file = self.file.lock();
-        unix_shared_wal_lock_byte(file.as_raw_fd(), offset, exclusive, true, kind).map(|_| ())
+        unix_shared_wal_lock_byte(self.file.as_raw_fd(), offset, exclusive, true, kind).map(|_| ())
     }
 
     fn shared_wal_try_lock_byte(
@@ -574,24 +575,21 @@ impl File for UnixFile {
         exclusive: bool,
         kind: SharedWalLockKind,
     ) -> Result<bool> {
-        let file = self.file.lock();
-        unix_shared_wal_lock_byte(file.as_raw_fd(), offset, exclusive, false, kind)
+        unix_shared_wal_lock_byte(self.file.as_raw_fd(), offset, exclusive, false, kind)
     }
 
     fn shared_wal_unlock_byte(&self, offset: u64, kind: SharedWalLockKind) -> Result<()> {
-        let file = self.file.lock();
-        unix_shared_wal_unlock_byte(file.as_raw_fd(), offset, kind)
+        unix_shared_wal_unlock_byte(self.file.as_raw_fd(), offset, kind)
     }
 
     fn shared_wal_set_len(&self, len: u64) -> Result<()> {
-        let file = self.file.lock();
-        file.set_len(len)
+        self.file
+            .set_len(len)
             .map_err(|err| io_error(err, "resize shared WAL coordination file"))
     }
 
     fn shared_wal_map(&self, offset: u64, len: usize) -> Result<Box<dyn SharedWalMappedRegion>> {
-        let file = self.file.lock();
-        unix_shared_wal_map(offset, len, file.as_raw_fd())
+        unix_shared_wal_map(offset, len, self.file.as_raw_fd())
     }
 }
 
