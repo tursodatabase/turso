@@ -27,6 +27,16 @@ expect {
     ok
 }
 
+test update-or-replace-conflict-delete-changes-count {
+    CREATE TABLE t(a INTEGER PRIMARY KEY, b INT UNIQUE);
+    INSERT INTO t VALUES(1,10),(2,20),(3,30);
+    UPDATE OR REPLACE t SET b = 10 WHERE a = 3;
+    SELECT changes();
+}
+expect {
+    1
+}
+
 test update-or-replace-rowid-no-conflict-preserves-secondary-index {
     CREATE TABLE t(id INTEGER PRIMARY KEY, c TEXT, payload TEXT);
     CREATE INDEX idx_c ON t(c);
