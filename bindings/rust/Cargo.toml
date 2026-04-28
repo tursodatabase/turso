@@ -16,7 +16,9 @@ workspace = true
 default = ["mimalloc"]
 mimalloc = ["dep:mimalloc"]
 pure-rust-crypto = ["turso_sdk_kit/pure-rust-crypto", "turso_sync_sdk_kit/pure-rust-crypto"]
-sync = [
+# Keep `sync` as the compatibility alias for the OpenSSL-backed transport.
+sync = ["sync-openssl"]
+sync-openssl = [
     "dep:hyper",
     "dep:tokio",
     "dep:hyper-tls",

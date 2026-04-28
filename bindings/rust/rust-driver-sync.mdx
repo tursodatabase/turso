@@ -105,7 +105,10 @@ Use following example to get up-to date understanding of Hyper API:
 
 <Link url="https://raw.githubusercontent.com/hyperium/hyper/refs/heads/master/examples/client.rs" />
 
-For HTTPS project already installed `hyper_tls` dep. You can inspect example here:
+The `sync` feature enables the `sync-openssl` by default. The `sync-rustls` feature enables the Rustls backend instead;
+when both sync TLS backends are enabled, the OpenSSL-backed transport is used.
+
+For the OpenSSL-backed HTTPS path, inspect the `hyper_tls` example here:
 
 <Link url="https://raw.githubusercontent.com/hyperium/hyper-tls/refs/heads/master/examples/client.rs" />
 

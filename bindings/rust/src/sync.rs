@@ -10,10 +10,10 @@ use std::{
 use bytes::Bytes;
 use http_body_util::{BodyExt, Full};
 use hyper::{header::AUTHORIZATION, Request};
-#[cfg(feature = "sync-rustls")]
-use hyper_rustls::{HttpsConnector, HttpsConnectorBuilder};
-#[cfg(feature = "sync")]
-use hyper_tls::HttpsConnector;
+#[cfg(all(feature = "sync-rustls", not(feature = "sync-openssl")))]
+use hyper_rustls::{HttpsConnector as RustlsHttpsConnector, HttpsConnectorBuilder};
+#[cfg(feature = "sync-openssl")]
+use hyper_tls::HttpsConnector as OpenSslHttpsConnector;
 use hyper_util::{
     client::legacy::{connect::HttpConnector, Client},
     rt::TokioExecutor,
@@ -22,10 +22,10 @@ use tokio::sync::mpsc;
 
 use crate::{connection::Connection, Error, Result};
 
-#[cfg(all(feature = "sync", feature = "sync-rustls"))]
-compile_error!("features `sync` and `sync-rustls` are mutually exclusive");
-
-type SyncHttpConnector = HttpsConnector<HttpConnector>;
+#[cfg(feature = "sync-openssl")]
+type SyncHttpConnector = OpenSslHttpsConnector<HttpConnector>;
+#[cfg(all(feature = "sync-rustls", not(feature = "sync-openssl")))]
+type SyncHttpConnector = RustlsHttpsConnector<HttpConnector>;
 type SyncHttpClient = Client<SyncHttpConnector, Full<Bytes>>;
 
 // Public re-exports of sync types for users of this crate.
@@ -440,13 +440,13 @@ struct IoWorker {
 }
 
 impl IoWorker {
-    #[cfg(feature = "sync")]
+    #[cfg(feature = "sync-openssl")]
     fn build_http_client() -> SyncHttpClient {
-        let https = HttpsConnector::new();
+        let https = OpenSslHttpsConnector::new();
         Client::builder(TokioExecutor::new()).build::<_, Full<Bytes>>(https)
     }
 
-    #[cfg(feature = "sync-rustls")]
+    #[cfg(all(feature = "sync-rustls", not(feature = "sync-openssl")))]
     fn build_http_client() -> SyncHttpClient {
         let https = HttpsConnectorBuilder::new()
             .with_provider_and_webpki_roots(rustls::crypto::aws_lc_rs::default_provider())
@@ -751,13 +751,13 @@ mod tests {
     const ADMIN_URL: &str = "http://localhost:8081";
     const USER_URL: &str = "http://localhost:8080";
 
-    #[cfg(feature = "sync")]
+    #[cfg(feature = "sync-openssl")]
     #[test]
-    fn sync_http_client_builds_with_native_tls() {
+    fn sync_http_client_builds_with_openssl() {
         let _client = super::IoWorker::build_http_client();
     }
 
-    #[cfg(feature = "sync-rustls")]
+    #[cfg(all(feature = "sync-rustls", not(feature = "sync-openssl")))]
     #[test]
     fn sync_http_client_builds_with_rustls() {
         let _client = super::IoWorker::build_http_client();
