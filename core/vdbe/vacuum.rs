@@ -1206,18 +1206,16 @@ enum VacuumInPlacePhase {
     /// Create temp DB and run the shared target-build engine.
     TargetBuild {
         config: Box<VacuumTargetBuildConfig>,
-        temp_db: Box<VacuumTempDb>,
         context: Box<VacuumTargetBuildContext>,
     },
     /// Capture the finalized target schema/header before publishing the
     /// replacement image into the source WAL.
-    CaptureTargetMetadata { temp_db: Box<VacuumTempDb> },
+    CaptureTargetMetadata,
     /// Open a read transaction on the committed temp pager so that we can read the pages back
-    BeginTempReadTx { temp_db: Box<VacuumTempDb> },
+    BeginTempReadTx,
     /// Initialize the source WAL header if needed (one-time before first batch).
     /// Two IO steps: write the header, then fsync to set `initialized = true`.
     InitSourceWalHeader {
-        temp_db: Box<VacuumTempDb>,
         total_pages: u32,
         /// The completion to wait on: first the header write, then the fsync.
         completion: crate::io::Completion,
@@ -1230,7 +1228,6 @@ enum VacuumInPlacePhase {
     /// The state waits on a single `CompletionGroup` completion that
     /// covers every run in the batch.
     ReadTempBatch {
-        temp_db: Box<VacuumTempDb>,
         total_pages: u32,
         /// First page id NOT included in this batch (i.e., the page id
         /// where the next batch will start, 1-based).
@@ -1247,7 +1244,6 @@ enum VacuumInPlacePhase {
     },
     /// Write a prepared batch to the WAL file.
     WriteWalBatch {
-        temp_db: Box<VacuumTempDb>,
         total_pages: u32,
         next_page: u32,
         prev_prepared: Option<Box<crate::storage::wal::PreparedFrames>>,
@@ -1256,13 +1252,12 @@ enum VacuumInPlacePhase {
     },
     /// Fsync the WAL if sync mode requires it.
     SyncSourceWal {
-        temp_db: Box<VacuumTempDb>,
         sync_completion: crate::io::Completion,
     },
     /// Publish: commit_prepared_frames + finish_append_frames_commit, release
     /// source WAL write/source snapshot state, keep the VACUUM lock, and drop
     /// temp resources.
-    PublishWalCommit { temp_db: Box<VacuumTempDb> },
+    PublishWalCommit,
     /// TRUNCATE checkpoint: copy WAL frames back into the DB file and truncate
     /// the WAL to zero. The pager's internal state machine handles the multi-step
     /// IO (backfill → sync DB → truncate WAL). Plain VACUUM requires this fold
@@ -1287,11 +1282,14 @@ pub(crate) struct VacuumInPlaceOpContext {
     db: usize,
     /// Current phase for the in-place VACUUM operation.
     phase: VacuumInPlacePhase,
+    /// File-backed compacted target image used until the replacement WAL frames
+    /// are published into the source database.
+    temp_db: Option<Box<VacuumTempDb>>,
     /// Normalized schema/header snapshot for the new image that will
     /// be published to the source DB. We capture it before source WAL publish so that
     /// post-commit we can install it without reading from disk.
     committed_image: Option<VacuumCommittedImageMeta>,
-    /// Independent cleanup flags that survive `std::mem::take` on `phase`.
+    /// Independent cleanup flags for resources that are not owned by `phase`.
     cleanup_state: VacuumInPlaceCleanupState,
 }
 
@@ -1300,6 +1298,7 @@ impl VacuumInPlaceOpContext {
         Self {
             db,
             phase: VacuumInPlacePhase::Preflight,
+            temp_db: None,
             committed_image: None,
             cleanup_state: VacuumInPlaceCleanupState::default(),
         }
@@ -1310,6 +1309,7 @@ impl VacuumInPlaceOpContext {
             connection,
             self.db,
             &mut self.phase,
+            &mut self.temp_db,
             &mut self.committed_image,
             &mut self.cleanup_state,
         )
@@ -1319,10 +1319,18 @@ impl VacuumInPlaceOpContext {
         let Self {
             db,
             phase,
+            temp_db,
             committed_image,
             cleanup_state,
         } = self;
-        vacuum_in_place_cleanup(connection, db, phase, committed_image, cleanup_state)
+        vacuum_in_place_cleanup(
+            connection,
+            db,
+            phase,
+            temp_db,
+            committed_image,
+            cleanup_state,
+        )
     }
 }
 
@@ -1608,14 +1616,14 @@ fn vacuum_in_place_step(
     connection: &Arc<Connection>,
     db: usize,
     phase: &mut VacuumInPlacePhase,
+    temp_db: &mut Option<Box<VacuumTempDb>>,
     committed_image: &mut Option<VacuumCommittedImageMeta>,
     cleanup_state: &mut VacuumInPlaceCleanupState,
 ) -> Result<IOResult<()>> {
     let source_pager = connection.get_pager_from_database_index(&db)?;
 
     loop {
-        let current_phase = std::mem::take(phase);
-        match current_phase {
+        match phase {
             VacuumInPlacePhase::Preflight => {
                 // 1. Must be in auto-commit mode (no explicit transaction).
                 if !connection.auto_commit.load(Ordering::SeqCst) {
@@ -1748,10 +1756,10 @@ fn vacuum_in_place_step(
                     })
                 })?;
                 // Create temp database.
-                let temp_db =
+                let new_temp_db =
                     open_vacuum_temp_db(connection, &source_db, page_size, reserved_space)?;
 
-                mirror_symbols(connection, &temp_db.conn);
+                mirror_symbols(connection, &new_temp_db.conn);
                 let source_custom_types = capture_custom_types(connection, db);
 
                 let config = VacuumTargetBuildConfig {
@@ -1765,50 +1773,51 @@ fn vacuum_in_place_step(
                     copy_mvcc_metadata_table: source_db.mvcc_enabled(),
                 };
 
-                let target_build_context = VacuumTargetBuildContext::new(temp_db.conn.clone());
+                let target_build_context = VacuumTargetBuildContext::new(new_temp_db.conn.clone());
+                turso_assert!(
+                    temp_db.is_none(),
+                    "VACUUM temp database must not already be installed"
+                );
+                *temp_db = Some(Box::new(new_temp_db));
 
                 *phase = VacuumInPlacePhase::TargetBuild {
                     config: Box::new(config),
-                    temp_db: Box::new(temp_db),
                     context: Box::new(target_build_context),
                 };
                 continue;
             }
 
-            VacuumInPlacePhase::TargetBuild {
-                config,
-                temp_db,
-                mut context,
-            } => {
-                match vacuum_target_build_step(&config, &mut context)? {
+            VacuumInPlacePhase::TargetBuild { config, context } => {
+                match vacuum_target_build_step(config.as_ref(), context.as_mut())? {
                     crate::IOResult::Done(()) => {
                         // Temp build complete. Capture the finalized metadata
                         // snapshot now, before we copy back the pages to main db
-                        *phase = VacuumInPlacePhase::CaptureTargetMetadata { temp_db };
+                        *phase = VacuumInPlacePhase::CaptureTargetMetadata;
                         continue;
                     }
                     crate::IOResult::IO(io) => {
-                        *phase = VacuumInPlacePhase::TargetBuild {
-                            config,
-                            temp_db,
-                            context,
-                        };
                         return Ok(IOResult::IO(io));
                     }
                 }
             }
 
-            VacuumInPlacePhase::CaptureTargetMetadata { temp_db } => {
-                *committed_image = Some(capture_target_metadata(&temp_db)?);
-                *phase = VacuumInPlacePhase::BeginTempReadTx { temp_db };
+            VacuumInPlacePhase::CaptureTargetMetadata => {
+                let temp_db_ref = temp_db
+                    .as_ref()
+                    .expect("VACUUM CaptureTargetMetadata phase requires temp db");
+                *committed_image = Some(capture_target_metadata(temp_db_ref)?);
+                *phase = VacuumInPlacePhase::BeginTempReadTx;
                 continue;
             }
 
-            VacuumInPlacePhase::BeginTempReadTx { temp_db } => {
+            VacuumInPlacePhase::BeginTempReadTx => {
+                let temp_db_ref = temp_db
+                    .as_ref()
+                    .expect("VACUUM BeginTempReadTx phase requires temp db");
                 // The temp db build is now completed and it must have released its WAL read
                 // mark. So we start a fresh read snapshot on the committed temp image.
                 // so `Wal::find_frame` uses the committed temp-WAL frame set for copy-back.
-                let temp_pager = temp_db.conn.get_pager();
+                let temp_pager = temp_db_ref.conn.get_pager();
                 turso_assert!(
                     !temp_pager.holds_read_lock(),
                     "VACUUM temp COMMIT should release the temp WAL read lock"
@@ -1850,7 +1859,6 @@ fn vacuum_in_place_step(
                 if let Some(header_write_c) = wal.prepare_wal_start(page_sz)? {
                     // WAL not yet initialized — yield on the header write.
                     *phase = VacuumInPlacePhase::InitSourceWalHeader {
-                        temp_db,
                         total_pages,
                         completion: header_write_c,
                         fsync_phase: false,
@@ -1859,14 +1867,12 @@ fn vacuum_in_place_step(
                 }
 
                 // WAL already initialized — kick off the first read batch.
-                let temp_pager = temp_db.conn.get_pager();
                 let batch_end = next_vacuum_copy_batch_start(1, total_pages);
                 let read_scratch_buf = new_vacuum_read_scratch_buf(&temp_pager);
                 let (batch_pages, read_completion) =
                     start_temp_batch_reads(&temp_pager, 1, batch_end, &read_scratch_buf)?;
 
                 *phase = VacuumInPlacePhase::ReadTempBatch {
-                    temp_db,
                     total_pages,
                     next_page: batch_end,
                     prev_prepared: None,
@@ -1878,48 +1884,39 @@ fn vacuum_in_place_step(
             }
 
             VacuumInPlacePhase::InitSourceWalHeader {
-                temp_db,
                 total_pages,
                 completion,
                 fsync_phase,
             } => {
                 if !completion.finished() {
-                    *phase = VacuumInPlacePhase::InitSourceWalHeader {
-                        temp_db,
-                        total_pages,
-                        completion: completion.clone(),
-                        fsync_phase,
-                    };
-                    return Ok(IOResult::IO(IOCompletions::Single(completion)));
+                    return Ok(IOResult::IO(IOCompletions::Single(completion.clone())));
                 }
                 if !completion.succeeded() {
                     return Err(vacuum_completion_error(&completion, "WAL header init"));
                 }
 
-                if !fsync_phase {
+                if !*fsync_phase {
                     // Header write done — issue the fsync via prepare_wal_finish
                     // to set WAL `initialized = true`.
                     let wal = source_pager.wal.as_ref().unwrap();
                     let sync_c = wal.prepare_wal_finish(source_pager.get_sync_type())?;
-                    *phase = VacuumInPlacePhase::InitSourceWalHeader {
-                        temp_db,
-                        total_pages,
-                        completion: sync_c,
-                        fsync_phase: true,
-                    };
+                    *completion = sync_c;
+                    *fsync_phase = true;
                     continue;
                 }
 
                 // WAL header fully initialized. Kick off the first read batch.
-                let temp_pager = temp_db.conn.get_pager();
-                let batch_end = next_vacuum_copy_batch_start(1, total_pages);
+                let temp_db_ref = temp_db
+                    .as_ref()
+                    .expect("VACUUM InitSourceWalHeader phase requires temp db");
+                let temp_pager = temp_db_ref.conn.get_pager();
+                let batch_end = next_vacuum_copy_batch_start(1, *total_pages);
                 let read_scratch_buf = new_vacuum_read_scratch_buf(&temp_pager);
                 let (batch_pages, read_completion) =
                     start_temp_batch_reads(&temp_pager, 1, batch_end, &read_scratch_buf)?;
 
                 *phase = VacuumInPlacePhase::ReadTempBatch {
-                    temp_db,
-                    total_pages,
+                    total_pages: *total_pages,
                     next_page: batch_end,
                     prev_prepared: None,
                     read_scratch_buf,
@@ -1930,7 +1927,6 @@ fn vacuum_in_place_step(
             }
 
             VacuumInPlacePhase::ReadTempBatch {
-                temp_db,
                 total_pages,
                 next_page,
                 prev_prepared,
@@ -1939,11 +1935,11 @@ fn vacuum_in_place_step(
                 read_completion,
             } => {
                 turso_assert!(
-                    total_pages < u32::MAX,
+                    *total_pages < u32::MAX,
                     "VACUUM read batch requires a representable exclusive end page",
-                    { "total_pages": total_pages }
+                    { "total_pages": *total_pages }
                 );
-                let database_end = total_pages + 1;
+                let database_end = *total_pages + 1;
                 turso_assert!(
                     !batch_pages.is_empty(),
                     "VACUUM read batch must contain pages"
@@ -1954,29 +1950,20 @@ fn vacuum_in_place_step(
                     { "batch_pages": batch_pages.len(), "batch_size": VACUUM_COPY_BATCH_SIZE }
                 );
                 turso_assert!(
-                    next_page > 1 && next_page <= database_end,
+                    *next_page > 1 && *next_page <= database_end,
                     "VACUUM read batch next page is outside database image",
-                    { "next_page": next_page, "total_pages": total_pages }
+                    { "next_page": *next_page, "total_pages": *total_pages }
                 );
                 // Wait for every run in this batch to finish.
                 if !read_completion.finished() {
-                    *phase = VacuumInPlacePhase::ReadTempBatch {
-                        temp_db,
-                        total_pages,
-                        next_page,
-                        prev_prepared,
-                        read_scratch_buf,
-                        batch_pages,
-                        read_completion: read_completion.clone(),
-                    };
-                    return Ok(IOResult::IO(IOCompletions::Single(read_completion)));
+                    return Ok(IOResult::IO(IOCompletions::Single(read_completion.clone())));
                 }
                 if !read_completion.succeeded() {
                     return Err(vacuum_completion_error(&read_completion, "temp batch read"));
                 }
 
                 // All pages in this batch are loaded. Prepare WAL frames.
-                for page in &batch_pages {
+                for page in batch_pages.iter() {
                     turso_assert!(
                         page.is_loaded(),
                         "VACUUM read batch page must be loaded before WAL prepare",
@@ -1988,14 +1975,14 @@ fn vacuum_in_place_step(
                         { "page_id": page.get().id }
                     );
                 }
-                let all_read = next_page > total_pages;
+                let all_read = *next_page > *total_pages;
                 let wal = source_pager
                     .wal
                     .as_ref()
                     .ok_or_else(|| LimboError::InternalError("VACUUM requires WAL".into()))?;
                 let page_sz = source_pager.get_page_size_unchecked();
 
-                let db_size_on_commit = if all_read { Some(total_pages) } else { None };
+                let db_size_on_commit = if all_read { Some(*total_pages) } else { None };
 
                 let prepared = wal.prepare_frames(
                     &batch_pages,
@@ -2011,25 +1998,23 @@ fn vacuum_in_place_step(
                 let completions = batch.submit()?;
 
                 *phase = VacuumInPlacePhase::WriteWalBatch {
-                    temp_db,
-                    total_pages,
-                    next_page,
+                    total_pages: *total_pages,
+                    next_page: *next_page,
                     prev_prepared: Some(Box::new(prepared)),
-                    read_scratch_buf,
+                    read_scratch_buf: Arc::clone(read_scratch_buf),
                     completions,
                 };
                 continue;
             }
 
             VacuumInPlacePhase::WriteWalBatch {
-                temp_db,
                 total_pages,
                 next_page,
                 prev_prepared,
                 read_scratch_buf,
                 completions,
             } => {
-                let database_end = total_pages + 1;
+                let database_end = *total_pages + 1;
                 turso_assert!(
                     prev_prepared.is_some(),
                     "VACUUM WAL write batch requires prepared frames"
@@ -2039,27 +2024,19 @@ fn vacuum_in_place_step(
                     "VACUUM WAL write batch requires write completions"
                 );
                 turso_assert!(
-                    next_page > 1 && next_page <= database_end,
+                    *next_page > 1 && *next_page <= database_end,
                     "VACUUM WAL write batch next page is outside database image",
-                    { "next_page": next_page, "total_pages": total_pages }
+                    { "next_page": *next_page, "total_pages": *total_pages }
                 );
                 // Wait for all writes in this batch. We yield on the first
                 // unfinished completion; re-entry will re-check them all.
                 let pending = completions.iter().find(|c| !c.finished()).cloned();
                 if let Some(pending) = pending {
-                    *phase = VacuumInPlacePhase::WriteWalBatch {
-                        temp_db,
-                        total_pages,
-                        next_page,
-                        prev_prepared,
-                        read_scratch_buf,
-                        completions,
-                    };
                     return Ok(IOResult::IO(IOCompletions::Single(pending)));
                 }
 
                 // Check for write errors.
-                for c in &completions {
+                for c in completions.iter() {
                     if !c.succeeded() {
                         return Err(vacuum_completion_error(c, "WAL write"));
                     }
@@ -2077,27 +2054,34 @@ fn vacuum_in_place_step(
                 // source-cache dirty state or WAL tags to update, and the
                 // source page cache is invalidated wholesale in Publish.
                 let wal = source_pager.wal.as_ref().unwrap();
-                let prepared = prev_prepared.as_ref().unwrap();
+                let prepared = prev_prepared
+                    .as_ref()
+                    .expect("VACUUM WriteWalBatch phase requires prepared frames");
                 wal.commit_prepared_frames(std::slice::from_ref(prepared.as_ref()));
 
                 // More pages to copy?
-                if next_page <= total_pages {
+                if *next_page <= *total_pages {
                     // Kick off the next read batch in parallel.
-                    let temp_pager = temp_db.conn.get_pager();
-                    let batch_end = next_vacuum_copy_batch_start(next_page, total_pages);
+                    let temp_db_ref = temp_db
+                        .as_ref()
+                        .expect("VACUUM WriteWalBatch phase requires temp db");
+                    let temp_pager = temp_db_ref.conn.get_pager();
+                    let batch_end = next_vacuum_copy_batch_start(*next_page, *total_pages);
                     let (batch_pages, read_completion) = start_temp_batch_reads(
                         &temp_pager,
-                        next_page,
+                        *next_page,
                         batch_end,
-                        &read_scratch_buf,
+                        read_scratch_buf,
                     )?;
+                    let prev_prepared = prev_prepared
+                        .take()
+                        .expect("VACUUM WriteWalBatch phase requires prepared frames");
 
                     *phase = VacuumInPlacePhase::ReadTempBatch {
-                        temp_db,
-                        total_pages,
+                        total_pages: *total_pages,
                         next_page: batch_end,
-                        prev_prepared,
-                        read_scratch_buf,
+                        prev_prepared: Some(prev_prepared),
+                        read_scratch_buf: Arc::clone(read_scratch_buf),
                         batch_pages,
                         read_completion,
                     };
@@ -2112,36 +2096,28 @@ fn vacuum_in_place_step(
                 if sync_mode == SyncMode::Full {
                     let sync_c = wal.sync(source_pager.get_sync_type())?;
                     *phase = VacuumInPlacePhase::SyncSourceWal {
-                        temp_db,
                         sync_completion: sync_c,
                     };
                     continue;
                 }
 
                 // No sync needed — proceed directly to publish.
-                *phase = VacuumInPlacePhase::PublishWalCommit { temp_db };
+                *phase = VacuumInPlacePhase::PublishWalCommit;
                 continue;
             }
 
-            VacuumInPlacePhase::SyncSourceWal {
-                temp_db,
-                sync_completion,
-            } => {
+            VacuumInPlacePhase::SyncSourceWal { sync_completion } => {
                 if !sync_completion.finished() {
-                    *phase = VacuumInPlacePhase::SyncSourceWal {
-                        temp_db,
-                        sync_completion: sync_completion.clone(),
-                    };
-                    return Ok(IOResult::IO(IOCompletions::Single(sync_completion)));
+                    return Ok(IOResult::IO(IOCompletions::Single(sync_completion.clone())));
                 }
                 if !sync_completion.succeeded() {
                     return Err(vacuum_completion_error(&sync_completion, "WAL fsync"));
                 }
-                *phase = VacuumInPlacePhase::PublishWalCommit { temp_db };
+                *phase = VacuumInPlacePhase::PublishWalCommit;
                 continue;
             }
 
-            VacuumInPlacePhase::PublishWalCommit { temp_db } => {
+            VacuumInPlacePhase::PublishWalCommit => {
                 turso_assert!(
                     cleanup_state.checkpoint_cleanup == CheckpointLockCleanup::ReleaseRaw,
                     "VACUUM publish phase requires held checkpoint lock"
@@ -2178,6 +2154,9 @@ fn vacuum_in_place_step(
                 source_pager.set_schema_cookie(None);
 
                 // Drop temp resources before checkpoint.
+                let temp_db = temp_db
+                    .take()
+                    .expect("VACUUM PublishWalCommit phase requires temp db");
                 drop(temp_db);
 
                 *phase = VacuumInPlacePhase::Checkpoint;
@@ -2257,7 +2236,7 @@ fn vacuum_in_place_step(
 
 /// Roll back the source transaction and restore connection state after an
 /// in-place VACUUM failure. Uses `cleanup_state` to decide what to undo; this
-/// state is independent of the phase enum and survives `std::mem::take`.
+/// state tracks resources that are not owned by the phase enum.
 ///
 /// `phase` is taken by value so helper statements inside `TargetBuild` are
 /// dropped before we attempt `rollback_tx`. This
@@ -2267,6 +2246,7 @@ fn vacuum_in_place_cleanup(
     connection: &Arc<Connection>,
     db: usize,
     mut phase: VacuumInPlacePhase,
+    temp_db: Option<Box<VacuumTempDb>>,
     committed_image: Option<VacuumCommittedImageMeta>,
     mut cleanup_state: VacuumInPlaceCleanupState,
 ) -> Result<()> {
@@ -2306,6 +2286,7 @@ fn vacuum_in_place_cleanup(
             }
         }
         drop(cleanup_state.mvcc_guard.take());
+        drop(temp_db);
         return Ok(());
     }
 
@@ -2313,6 +2294,7 @@ fn vacuum_in_place_cleanup(
     // Their Drop impls decrement Connection::nestedness, which must happen
     // before rollback_tx (which is a no-op while nested).
     drop(phase);
+    drop(temp_db);
 
     // Write transaction open but not yet committed — roll back.
     let pager = connection
@@ -2718,6 +2700,7 @@ mod tests {
             &conn,
             crate::MAIN_DB_ID,
             VacuumInPlacePhase::Checkpoint,
+            None,
             Some(committed),
             VacuumInPlaceCleanupState::default(),
         )?;
