@@ -49,10 +49,10 @@ jobs:
         working-directory: bindings/javascript
         run: yarn build:native
       - name: Install test dependencies
-        working-directory: testing/javascript
+        working-directory: testing/conformance/javascript
         run: npm install
       - name: Run conformance tests
-        working-directory: testing/javascript
+        working-directory: testing/conformance/javascript
         run: npm run test:turso
 
   sqlite-tcl:
