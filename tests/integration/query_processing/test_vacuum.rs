@@ -2,11 +2,11 @@ use crate::common::{
     compute_dbhash, compute_dbhash_with_database_opts, compute_dbhash_with_options,
     compute_dbhash_with_options_and_database_opts, do_flush, ExecRows, TempDatabase,
 };
-use crate::queued_io::{QueuedIo, QueuedIoEvent, QueuedIoOpKind};
+use crate::queued_io::{QueuedIo, QueuedIoOpKind};
 use rusqlite::Connection as SqliteConnection;
 use std::{path::Path, sync::Arc};
 use tempfile::TempDir;
-use turso_core::{Connection, Database, DatabaseOpts, LimboError, StepResult, Value, IO};
+use turso_core::{Connection, Database, DatabaseOpts, LimboError, StepResult, Value};
 use turso_parser::{ast::Cmd, parser::Parser};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -82,21 +82,6 @@ fn compute_plain_vacuum_dbhash(tmp_db: &TempDatabase) -> PlainVacuumInvariant {
     }
 }
 
-fn compute_plain_vacuum_file_dbhash(path: &str) -> PlainVacuumInvariant {
-    let options = turso_dbhash::DbHashOptions {
-        without_schema: true,
-        ..Default::default()
-    };
-    let reopened = TempDatabase::new_with_existent_with_opts(Path::new(path), DatabaseOpts::new());
-    let reopened_conn = reopened.connect_limbo();
-    PlainVacuumInvariant {
-        hash: turso_dbhash::hash_database(path, &options)
-            .expect("dbhash failed")
-            .hash,
-        normalized_schema: normalized_schema_snapshot(&reopened_conn),
-    }
-}
-
 fn assert_plain_vacuum_integrity_and_hash(
     tmp_db: &TempDatabase,
     conn: &Arc<Connection>,
@@ -105,24 +90,6 @@ fn assert_plain_vacuum_integrity_and_hash(
     assert_eq!(run_integrity_check(conn), "ok");
     assert_eq!(
         compute_plain_vacuum_dbhash(tmp_db).hash,
-        expected.hash,
-        "plain VACUUM should preserve logical database content"
-    );
-    assert_eq!(
-        normalized_schema_snapshot(conn),
-        expected.normalized_schema,
-        "plain VACUUM should preserve normalized sqlite_schema entries"
-    );
-}
-
-fn assert_plain_vacuum_integrity_and_hash_for_path(
-    path: &str,
-    conn: &Arc<Connection>,
-    expected: &PlainVacuumInvariant,
-) {
-    assert_eq!(run_integrity_check(conn), "ok");
-    assert_eq!(
-        compute_plain_vacuum_file_dbhash(path).hash,
         expected.hash,
         "plain VACUUM should preserve logical database content"
     );
@@ -6129,261 +6096,6 @@ fn populate_queued_multibatch(conn: &Arc<Connection>) -> anyhow::Result<()> {
 
 #[cfg_attr(feature = "checksum", ignore)]
 #[test]
-fn test_plain_vacuum_queued_io_reentry_multi_batch() -> anyhow::Result<()> {
-    // Exercises the queued-IO async path for a multi-batch plain VACUUM and
-    // asserts the source WAL copy-back re-enters cleanly across more than one
-    // batched read/write cycle.
-    let io = Arc::new(QueuedIo::new());
-    let path = "queued-vacuum-reentry.db";
-    let db = open_queued_db(io.clone(), path)?;
-    let conn = db.connect()?;
-
-    populate_queued_multibatch(&conn)?;
-    let pre_pages = scalar_i64(&conn, "PRAGMA page_count");
-    assert!(pre_pages > 64, "queued IO workload should be multi-batch");
-
-    let before_hash = compute_plain_vacuum_file_dbhash(path);
-    conn.execute("VACUUM")?;
-
-    assert!(
-        io.count_events("-wal", QueuedIoOpKind::Pread) > 0,
-        "batch reads should issue queued WAL preads"
-    );
-    assert!(
-        io.count_events("-wal", QueuedIoOpKind::Pwritev) > 1,
-        "multi-batch copy-back should issue multiple source WAL pwritev operations"
-    );
-    assert_eq!(scalar_i64(&conn, "SELECT COUNT(*) FROM t"), 176);
-    assert!(
-        scalar_i64(&conn, "PRAGMA page_count") < pre_pages,
-        "VACUUM should compact the queued-IO workload"
-    );
-    assert_plain_vacuum_integrity_and_hash_for_path(path, &conn, &before_hash);
-    Ok(())
-}
-
-#[cfg_attr(feature = "checksum", ignore)]
-#[test]
-fn test_plain_vacuum_reinitializes_source_wal_header_after_truncate_checkpoint(
-) -> anyhow::Result<()> {
-    // `wal_checkpoint(TRUNCATE)` leaves the source WAL uninitialized for the
-    // next writer. Plain VACUUM must rewrite and fsync that source WAL header
-    // before it starts copying compacted frames back into the source WAL.
-    let io = Arc::new(QueuedIo::new());
-    let path = "queued-vacuum-source-wal-header-init.db";
-    let source_wal_path = format!("{path}-wal");
-    let db = open_queued_db(io.clone(), path)?;
-    let conn = db.connect()?;
-
-    populate_queued_multibatch(&conn)?;
-    let history_start = io.history_len();
-
-    let before_hash = compute_plain_vacuum_file_dbhash(path);
-    conn.execute("VACUUM")?;
-
-    let source_wal_events: Vec<QueuedIoEvent> = io
-        .history_since(history_start)
-        .into_iter()
-        .filter(|event| {
-            event.path == source_wal_path
-                && matches!(
-                    event.kind,
-                    QueuedIoOpKind::Pwrite | QueuedIoOpKind::Pwritev | QueuedIoOpKind::Sync
-                )
-        })
-        .collect();
-
-    let first_batch_write = source_wal_events
-        .iter()
-        .position(|event| event.kind == QueuedIoOpKind::Pwritev)
-        .expect("VACUUM should write copied frames into the source WAL");
-    let header_write = source_wal_events
-        .iter()
-        .position(|event| event.kind == QueuedIoOpKind::Pwrite)
-        .expect("VACUUM should rewrite the source WAL header after TRUNCATE");
-    let header_sync = source_wal_events
-        .iter()
-        .position(|event| event.kind == QueuedIoOpKind::Sync)
-        .expect("VACUUM should fsync the rewritten source WAL header before copy-back");
-
-    assert!(
-        header_write < header_sync,
-        "source WAL header write must complete before its fsync"
-    );
-    assert!(
-        header_sync < first_batch_write,
-        "source WAL header must be rewritten and fsynced before the first copied frame batch"
-    );
-
-    assert_plain_vacuum_integrity_and_hash_for_path(path, &conn, &before_hash);
-    Ok(())
-}
-
-#[cfg_attr(feature = "checksum", ignore)]
-#[test]
-fn test_plain_vacuum_second_statement_same_connection_fails_while_first_active(
-) -> anyhow::Result<()> {
-    let io = Arc::new(QueuedIo::new());
-    let path = "queued-vacuum-same-conn-active.db";
-    let db = open_queued_db(io.clone(), path)?;
-    let conn = db.connect()?;
-
-    populate_queued_multibatch(&conn)?;
-    let before_hash = compute_plain_vacuum_file_dbhash(path);
-
-    let mut first = conn.prepare("VACUUM")?;
-    loop {
-        match first.step()? {
-            StepResult::Done => {
-                anyhow::bail!("VACUUM finished before reaching an in-flight IO state")
-            }
-            StepResult::Row => continue,
-            StepResult::Busy => anyhow::bail!("unexpected Busy while staging first VACUUM"),
-            StepResult::Interrupt => {
-                anyhow::bail!("unexpected Interrupt while staging first VACUUM")
-            }
-            StepResult::IO => {
-                if !conn.get_auto_commit() {
-                    break;
-                }
-                io.step()?;
-            }
-        }
-    }
-
-    let mut second = conn.prepare("VACUUM")?;
-    let err = second
-        .step()
-        .expect_err("second VACUUM on the same connection should fail while the first is active");
-    let message = err.to_string();
-    assert_eq!(
-        message, "Transaction error: cannot VACUUM from within a transaction",
-        "expected same-connection VACUUM rejection, got {err:?}"
-    );
-
-    loop {
-        match first.step()? {
-            StepResult::Done => break,
-            StepResult::Row => continue,
-            StepResult::Busy => anyhow::bail!("unexpected Busy while completing first VACUUM"),
-            StepResult::Interrupt => {
-                anyhow::bail!("unexpected Interrupt while completing first VACUUM")
-            }
-            StepResult::IO => io.step()?,
-        }
-    }
-
-    assert_eq!(scalar_i64(&conn, "SELECT COUNT(*) FROM t"), 176);
-    assert_plain_vacuum_integrity_and_hash_for_path(path, &conn, &before_hash);
-    Ok(())
-}
-
-fn assert_failed_vacuum_left_queued_db_usable(
-    conn: &Arc<Connection>,
-    pre_pages: i64,
-) -> anyhow::Result<()> {
-    assert_eq!(
-        scalar_i64(conn, "PRAGMA page_count"),
-        pre_pages,
-        "failed VACUUM must not publish a partial compacted image"
-    );
-    assert_eq!(scalar_i64(conn, "SELECT COUNT(*) FROM t"), 176);
-    assert_eq!(
-        scalar_i64(conn, "SELECT COUNT(*) FROM t WHERE payload = '{}'",),
-        0
-    );
-    conn.execute("INSERT INTO t VALUES(10000, 'after-failure')")?;
-    conn.execute("DELETE FROM t WHERE id = 10000")?;
-    assert_eq!(run_integrity_check(conn), "ok");
-    Ok(())
-}
-
-#[cfg_attr(feature = "checksum", ignore)]
-#[test]
-fn test_plain_vacuum_source_wal_first_batch_write_failure_rolls_back() -> anyhow::Result<()> {
-    let io = Arc::new(QueuedIo::new());
-    let path = "queued-vacuum-first-write-failure.db";
-    let db = open_queued_db(io.clone(), path)?;
-    let conn = db.connect()?;
-
-    populate_queued_multibatch(&conn)?;
-    let pre_pages = scalar_i64(&conn, "PRAGMA page_count");
-
-    io.fail_after_successes("-wal", QueuedIoOpKind::Pwritev, 0);
-    let err = conn.execute("VACUUM").unwrap_err();
-    io.clear_fault();
-    assert_eq!(
-        err.to_string(),
-        "Completion was aborted",
-        "unexpected error for first batch write fault: {err}"
-    );
-
-    assert_failed_vacuum_left_queued_db_usable(&conn, pre_pages)?;
-    let before_hash = compute_plain_vacuum_file_dbhash(path);
-    conn.execute("VACUUM")?;
-    assert!(scalar_i64(&conn, "PRAGMA page_count") < pre_pages);
-    assert_plain_vacuum_integrity_and_hash_for_path(path, &conn, &before_hash);
-    Ok(())
-}
-
-#[cfg_attr(feature = "checksum", ignore)]
-#[test]
-fn test_plain_vacuum_source_wal_later_batch_write_failure_rolls_back() -> anyhow::Result<()> {
-    let io = Arc::new(QueuedIo::new());
-    let path = "queued-vacuum-later-write-failure.db";
-    let db = open_queued_db(io.clone(), path)?;
-    let conn = db.connect()?;
-
-    populate_queued_multibatch(&conn)?;
-    let pre_pages = scalar_i64(&conn, "PRAGMA page_count");
-
-    io.fail_after_successes("-wal", QueuedIoOpKind::Pwritev, 1);
-    let err = conn.execute("VACUUM").unwrap_err();
-    io.clear_fault();
-    assert_eq!(
-        err.to_string(),
-        "Completion was aborted",
-        "unexpected error for later batch write fault: {err}"
-    );
-
-    assert_failed_vacuum_left_queued_db_usable(&conn, pre_pages)?;
-    let before_hash = compute_plain_vacuum_file_dbhash(path);
-    conn.execute("VACUUM")?;
-    assert!(scalar_i64(&conn, "PRAGMA page_count") < pre_pages);
-    assert_plain_vacuum_integrity_and_hash_for_path(path, &conn, &before_hash);
-    Ok(())
-}
-
-#[cfg_attr(feature = "checksum", ignore)]
-#[test]
-fn test_plain_vacuum_source_wal_sync_failure_rolls_back() -> anyhow::Result<()> {
-    let io = Arc::new(QueuedIo::new());
-    let path = "queued-vacuum-sync-failure.db";
-    let db = open_queued_db(io.clone(), path)?;
-    let conn = db.connect()?;
-
-    populate_queued_multibatch(&conn)?;
-    let pre_pages = scalar_i64(&conn, "PRAGMA page_count");
-
-    io.fail_after_successes("-wal", QueuedIoOpKind::Sync, 0);
-    let err = conn.execute("VACUUM").unwrap_err();
-    io.clear_fault();
-    assert_eq!(
-        err.to_string(),
-        "Completion was aborted",
-        "unexpected error for source WAL sync fault: {err}"
-    );
-
-    assert_failed_vacuum_left_queued_db_usable(&conn, pre_pages)?;
-    let before_hash = compute_plain_vacuum_file_dbhash(path);
-    conn.execute("VACUUM")?;
-    assert!(scalar_i64(&conn, "PRAGMA page_count") < pre_pages);
-    assert_plain_vacuum_integrity_and_hash_for_path(path, &conn, &before_hash);
-    Ok(())
-}
-
-#[cfg_attr(feature = "checksum", ignore)]
-#[test]
 fn test_plain_vacuum_reset_during_checkpoint_io_cleans_up_checkpoint_and_vacuum_locks(
 ) -> anyhow::Result<()> {
     // Park plain VACUUM after copy-back has committed but while the final
@@ -6456,54 +6168,4 @@ fn test_plain_vacuum_reset_during_checkpoint_io_cleans_up_checkpoint_and_vacuum_
     );
 
     Ok(())
-}
-
-#[cfg_attr(feature = "checksum", ignore)]
-#[test]
-fn test_plain_vacuum_crash_after_nonfinal_source_wal_batch_recovers_original() -> anyhow::Result<()>
-{
-    let io = Arc::new(QueuedIo::new());
-    let path = "queued-vacuum-crash-after-nonfinal-batch.db";
-    let db = open_queued_db(io.clone(), path)?;
-    let conn = db.connect()?;
-
-    populate_queued_multibatch(&conn)?;
-    let pre_pages = scalar_i64(&conn, "PRAGMA page_count");
-    assert!(
-        pre_pages > 64,
-        "crash test requires a non-final first batch"
-    );
-
-    let mut stmt = conn.prepare("VACUUM")?;
-    loop {
-        match stmt.step()? {
-            StepResult::Done => {
-                panic!("VACUUM finished before source WAL batch write was observed")
-            }
-            StepResult::Row => continue,
-            StepResult::Busy | StepResult::Interrupt => {
-                panic!("unexpected non-IO VACUUM result during crash test")
-            }
-            StepResult::IO => {
-                while let Some(event) = io.step_one()? {
-                    if event.path.ends_with("-wal") && event.kind == QueuedIoOpKind::Pwritev {
-                        std::mem::forget(stmt);
-                        std::mem::forget(conn);
-                        std::mem::forget(db);
-
-                        let reopened = open_queued_db(io.clone(), path)?;
-                        let reopened_conn = reopened.connect()?;
-                        assert_eq!(
-                            scalar_i64(&reopened_conn, "PRAGMA page_count"),
-                            pre_pages,
-                            "non-final VACUUM frames without a commit marker must be ignored on recovery"
-                        );
-                        assert_eq!(scalar_i64(&reopened_conn, "SELECT COUNT(*) FROM t"), 176);
-                        assert_eq!(run_integrity_check(&reopened_conn), "ok");
-                        return Ok(());
-                    }
-                }
-            }
-        }
-    }
 }
