@@ -150,7 +150,10 @@ async fn execute_insert_returning() {
 #[tokio::test]
 async fn value_roundtrip_string() {
     let conn = connect().await;
-    let mut rows = conn.query("SELECT ?", vec![Value::from("boomerang")]).await.unwrap();
+    let mut rows = conn
+        .query("SELECT ?", vec![Value::from("boomerang")])
+        .await
+        .unwrap();
     let row = rows.next().await.unwrap().unwrap();
     assert_eq!(
         row.get_value(0).unwrap(),
@@ -162,7 +165,10 @@ async fn value_roundtrip_string() {
 async fn value_roundtrip_unicode() {
     let conn = connect().await;
     let unicode = "žluťoučký kůň úpěl ďábelské ódy";
-    let mut rows = conn.query("SELECT ?", vec![Value::from(unicode)]).await.unwrap();
+    let mut rows = conn
+        .query("SELECT ?", vec![Value::from(unicode)])
+        .await
+        .unwrap();
     let row = rows.next().await.unwrap().unwrap();
     assert_eq!(row.get_value(0).unwrap(), Value::Text(unicode.to_string()));
 }
@@ -170,7 +176,10 @@ async fn value_roundtrip_unicode() {
 #[tokio::test]
 async fn value_roundtrip_integer() {
     let conn = connect().await;
-    let mut rows = conn.query("SELECT ?", vec![Value::Integer(-2023)]).await.unwrap();
+    let mut rows = conn
+        .query("SELECT ?", vec![Value::Integer(-2023)])
+        .await
+        .unwrap();
     let row = rows.next().await.unwrap().unwrap();
     assert_eq!(row.get_value(0).unwrap(), Value::Integer(-2023));
 }
@@ -178,7 +187,10 @@ async fn value_roundtrip_integer() {
 #[tokio::test]
 async fn value_roundtrip_float() {
     let conn = connect().await;
-    let mut rows = conn.query("SELECT ?", vec![Value::Real(12.345)]).await.unwrap();
+    let mut rows = conn
+        .query("SELECT ?", vec![Value::Real(12.345)])
+        .await
+        .unwrap();
     let row = rows.next().await.unwrap().unwrap();
     assert_eq!(row.get_value(0).unwrap(), Value::Real(12.345));
 }
@@ -194,7 +206,10 @@ async fn value_roundtrip_null() {
 #[tokio::test]
 async fn value_roundtrip_bool_true() {
     let conn = connect().await;
-    let mut rows = conn.query("SELECT ?", vec![Value::from(true)]).await.unwrap();
+    let mut rows = conn
+        .query("SELECT ?", vec![Value::from(true)])
+        .await
+        .unwrap();
     let row = rows.next().await.unwrap().unwrap();
     assert_eq!(row.get_value(0).unwrap(), Value::Integer(1));
 }
@@ -202,7 +217,10 @@ async fn value_roundtrip_bool_true() {
 #[tokio::test]
 async fn value_roundtrip_bool_false() {
     let conn = connect().await;
-    let mut rows = conn.query("SELECT ?", vec![Value::from(false)]).await.unwrap();
+    let mut rows = conn
+        .query("SELECT ?", vec![Value::from(false)])
+        .await
+        .unwrap();
     let row = rows.next().await.unwrap().unwrap();
     assert_eq!(row.get_value(0).unwrap(), Value::Integer(0));
 }
@@ -222,7 +240,10 @@ async fn value_roundtrip_blob() {
 #[tokio::test]
 async fn value_roundtrip_large_integer() {
     let conn = connect().await;
-    let mut rows = conn.query("SELECT ?||''", vec![Value::Integer(i64::MAX)]).await.unwrap();
+    let mut rows = conn
+        .query("SELECT ?||''", vec![Value::Integer(i64::MAX)])
+        .await
+        .unwrap();
     let row = rows.next().await.unwrap().unwrap();
     assert_eq!(row.get_value(0).unwrap(), Value::Text(i64::MAX.to_string()));
 }
@@ -234,7 +255,10 @@ async fn value_roundtrip_large_integer() {
 #[tokio::test]
 async fn args_positional() {
     let conn = connect().await;
-    let mut rows = conn.query("SELECT ?, ?", vec![Value::from("one"), Value::from("two")]).await.unwrap();
+    let mut rows = conn
+        .query("SELECT ?, ?", vec![Value::from("one"), Value::from("two")])
+        .await
+        .unwrap();
     let row = rows.next().await.unwrap().unwrap();
     assert_eq!(row.get_value(0).unwrap(), Value::Text("one".to_string()));
     assert_eq!(row.get_value(1).unwrap(), Value::Text("two".to_string()));

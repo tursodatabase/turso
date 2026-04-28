@@ -1,11 +1,11 @@
 use std::sync::Arc;
 
-use tokio::sync::Mutex;
 use crate::{Column, Error, Params, Result};
+use tokio::sync::Mutex;
 
 use crate::protocol::{
-    decode_value, encode_value, BatchStep, CursorBatch, CursorEntry, NamedArg,
-    PipelineRequestEntry, StmtBody,
+    decode_value, encode_value, ExecuteStreamReq, NamedArg, SequenceStreamReq, StmtBody,
+    StreamRequest, StreamResponse, StreamResult,
 };
 use crate::rows::{Row, Rows};
 use crate::session::Session;
@@ -50,18 +50,14 @@ impl Connection {
     pub async fn execute_batch(&self, sql: impl AsRef<str>) -> Result<()> {
         let mut session = self.session.lock().await;
         let response = session
-            .execute_pipeline(vec![PipelineRequestEntry::Sequence {
-                sql: sql.as_ref().to_string(),
-            }])
+            .execute_pipeline(vec![StreamRequest::Sequence(SequenceStreamReq {
+                sql: Some(sql.as_ref().to_string()),
+                sql_id: None,
+            })])
             .await?;
 
-        if let Some(result) = response.results.first() {
-            if result.typ == "error" {
-                if let Some(err) = &result.error {
-                    return Err(Error::Error(err.message.clone()));
-                }
-                return Err(Error::Error("Sequence execution failed".to_string()));
-            }
+        if let Some(StreamResult::Error { error }) = response.results.first() {
+            return Err(Error::Error(error.message.clone()));
         }
 
         Ok(())
@@ -72,40 +68,38 @@ impl Connection {
         // For remote, describe the statement to get column metadata
         let mut session = self.session.lock().await;
         let response = session
-            .execute_pipeline(vec![PipelineRequestEntry::Describe {
-                sql: sql.as_ref().to_string(),
-            }])
+            .execute_pipeline(vec![StreamRequest::Describe(
+                turso_remote_protocol::DescribeStreamReq {
+                    sql: Some(sql.as_ref().to_string()),
+                    sql_id: None,
+                },
+            )])
             .await?;
 
         if let Some(result) = response.results.first() {
-            if result.typ == "error" {
-                if let Some(err) = &result.error {
-                    return Err(Error::Error(err.message.clone()));
+            match result {
+                StreamResult::Error { error } => {
+                    return Err(Error::Error(error.message.clone()));
                 }
-                return Err(Error::Error("Describe failed".to_string()));
-            }
+                StreamResult::Ok {
+                    response: StreamResponse::Describe(desc_resp),
+                } => {
+                    let columns: Vec<Column> = desc_resp
+                        .result
+                        .cols
+                        .iter()
+                        .map(|c| {
+                            Column::new(c.name.clone().unwrap_or_default(), c.decltype.clone())
+                        })
+                        .collect();
 
-            if let Some(resp) = &result.response {
-                if resp.typ == "describe" {
-                    if let Some(desc_val) = &resp.result {
-                        let desc: crate::protocol::DescribeResult =
-                            serde_json::from_value(desc_val.clone()).map_err(|e| {
-                                Error::Error(format!("Failed to parse describe result: {e}"))
-                            })?;
-
-                        let columns: Vec<Column> = desc
-                            .cols
-                            .iter()
-                            .map(|c| Column::new(c.name.clone(), c.decltype.clone()))
-                            .collect();
-
-                        return Ok(Statement::new(
-                            self.clone(),
-                            sql.as_ref().to_string(),
-                            columns,
-                        ));
-                    }
+                    return Ok(Statement::new(
+                        self.clone(),
+                        sql.as_ref().to_string(),
+                        columns,
+                    ));
                 }
+                _ => {}
             }
         }
 
@@ -123,7 +117,10 @@ impl Connection {
     }
 
     /// Begin a new transaction with the specified behavior.
-    pub async fn transaction_with_behavior(&mut self, behavior: TransactionBehavior) -> Result<Transaction<'_>> {
+    pub async fn transaction_with_behavior(
+        &mut self,
+        behavior: TransactionBehavior,
+    ) -> Result<Transaction<'_>> {
         Transaction::new(self, behavior).await
     }
 
@@ -162,7 +159,11 @@ impl Connection {
     }
 
     /// Set a PRAGMA value and return the result rows.
-    pub async fn pragma_update<V: std::fmt::Display>(&self, pragma_name: &str, pragma_value: V) -> Result<Vec<Row>> {
+    pub async fn pragma_update<V: std::fmt::Display>(
+        &self,
+        pragma_name: &str,
+        pragma_value: V,
+    ) -> Result<Vec<Row>> {
         let sql = format!("PRAGMA {pragma_name} = {pragma_value}");
         let mut rows = self.query(&sql, ()).await?;
         let mut result = Vec::new();
@@ -192,6 +193,14 @@ impl Connection {
         params: impl Into<Params>,
         want_rows: bool,
     ) -> Result<ExecuteResult> {
+        // Detect transaction boundaries and toggle keep_alive.
+        let sql_upper = sql.trim().to_uppercase();
+        let is_begin = sql_upper.starts_with("BEGIN") || sql_upper.starts_with("SAVEPOINT");
+        let is_end = sql_upper.starts_with("COMMIT")
+            || sql_upper.starts_with("ROLLBACK")
+            || sql_upper.starts_with("END")
+            || sql_upper.starts_with("RELEASE");
+
         let params: Params = params.into();
 
         let (args, named_args) = match params {
@@ -212,72 +221,84 @@ impl Connection {
             }
         };
 
-        let step = BatchStep {
-            stmt: StmtBody {
-                sql: sql.to_string(),
-                args,
-                named_args,
-                want_rows,
-            },
-            condition: None,
+        let stmt = StmtBody {
+            sql: Some(sql.to_string()),
+            sql_id: None,
+            args,
+            named_args,
+            want_rows: Some(want_rows),
+            replication_index: None,
         };
 
         let mut session = self.session.lock().await;
-        let entries = session
-            .execute_cursor(CursorBatch { steps: vec![step] })
-            .await?;
 
-        let mut columns = Vec::new();
-        let mut rows = Vec::new();
-        let mut rows_affected = 0u64;
-        let mut last_insert_rowid = None;
-
-        for entry in &entries {
-            match entry {
-                CursorEntry::StepBegin { cols, .. } => {
-                    if let Some(cols) = cols {
-                        columns = cols
-                            .iter()
-                            .map(|c| Column::new(c.name.clone(), c.decltype.clone()))
-                            .collect();
-                    }
-                }
-                CursorEntry::Row { row, .. } => {
-                    if let Some(values) = row {
-                        let decoded: Vec<crate::Value> =
-                            values.iter().map(decode_value).collect();
-                        rows.push(Row::new(decoded));
-                    }
-                }
-                CursorEntry::StepEnd {
-                    affected_row_count,
-                    last_insert_rowid: rowid,
-                    ..
-                } => {
-                    if let Some(count) = affected_row_count {
-                        rows_affected = *count;
-                    }
-                    if let Some(rowid_str) = rowid {
-                        last_insert_rowid = rowid_str.parse::<i64>().ok();
-                    }
-                }
-                CursorEntry::StepError { error, .. } | CursorEntry::Error { error } => {
-                    let msg = error
-                        .as_ref()
-                        .map(|e| e.message.clone())
-                        .unwrap_or_else(|| "SQL execution failed".to_string());
-                    return Err(Error::Error(msg));
-                }
-                CursorEntry::ReplicationIndex { .. } => {}
-            }
+        if is_begin {
+            session.set_keep_alive(true);
         }
 
-        Ok(ExecuteResult {
-            columns,
-            rows,
-            rows_affected,
-            last_insert_rowid,
-        })
+        let response = session
+            .execute_pipeline(vec![StreamRequest::Execute(ExecuteStreamReq { stmt })])
+            .await;
+
+        // On error during end-of-transaction, reset keep_alive.
+        if response.is_err() && is_end {
+            session.set_keep_alive(false);
+        }
+
+        let response = response?;
+
+        // Find the execute result (skip the close result at the end).
+        let result = response
+            .results
+            .first()
+            .ok_or_else(|| Error::Error("No result in pipeline response".to_string()))?;
+
+        match result {
+            StreamResult::Error { error } => {
+                let msg = error.message.clone();
+                if is_end {
+                    session.set_keep_alive(false);
+                }
+                Err(Error::Error(msg))
+            }
+            StreamResult::Ok {
+                response: StreamResponse::Execute(exec_resp),
+            } => {
+                let exec_result = &exec_resp.result;
+
+                let columns: Vec<Column> = exec_result
+                    .cols
+                    .iter()
+                    .map(|c| Column::new(c.name.clone().unwrap_or_default(), c.decltype.clone()))
+                    .collect();
+
+                let rows: Vec<Row> = exec_result
+                    .rows
+                    .iter()
+                    .map(|row| {
+                        let decoded: Vec<crate::Value> =
+                            row.values.iter().map(decode_value).collect();
+                        Row::new(decoded)
+                    })
+                    .collect();
+
+                let last_insert_rowid = exec_result.last_insert_rowid;
+
+                if is_end {
+                    session.set_keep_alive(false);
+                }
+
+                Ok(ExecuteResult {
+                    columns,
+                    rows,
+                    rows_affected: exec_result.affected_row_count,
+                    last_insert_rowid,
+                })
+            }
+            _ => Err(Error::Error(
+                "Unexpected result in pipeline response".to_string(),
+            )),
+        }
     }
 }
 

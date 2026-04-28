@@ -68,7 +68,7 @@ impl<const N: usize> From<[(&'static str, Value); N]> for Params {
 ///
 /// ```ignore
 /// use turso_serverless::params;
-/// conn.execute("SELECT ?, ?, ?", params![1, "hello", 3.14]).await?;
+/// conn.execute("SELECT ?, ?, ?", params![1, "hello", 3.15]).await?;
 /// ```
 #[macro_export]
 macro_rules! params {
@@ -106,13 +106,13 @@ mod tests {
 
     #[test]
     fn test_params_macro_positional() {
-        let p = params![1, "hello", 3.14];
+        let p = params![1, "hello", 3.15];
         match p {
             crate::Params::Positional(v) => {
                 assert_eq!(v.len(), 3);
                 assert_eq!(v[0], Value::Integer(1));
                 assert_eq!(v[1], Value::Text("hello".to_string()));
-                assert_eq!(v[2], Value::Real(3.14));
+                assert_eq!(v[2], Value::Real(3.15));
             }
             _ => panic!("expected Positional"),
         }

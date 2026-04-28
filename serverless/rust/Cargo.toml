@@ -18,6 +18,8 @@ tokio = { workspace = true, features = ["sync", "macros", "rt"] }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 base64 = "0.22"
+bytes = "1"
+turso_remote_protocol = { workspace = true }
 thiserror = { workspace = true }
 futures = { workspace = true }
 

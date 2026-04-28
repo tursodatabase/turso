@@ -28,14 +28,20 @@ pub struct Transaction<'conn> {
 
 impl<'conn> Transaction<'conn> {
     /// Begin a new transaction with the given behavior.
-    pub async fn new(conn: &'conn mut Connection, behavior: TransactionBehavior) -> Result<Transaction<'conn>> {
+    pub async fn new(
+        conn: &'conn mut Connection,
+        behavior: TransactionBehavior,
+    ) -> Result<Transaction<'conn>> {
         Self::new_unchecked(conn, behavior).await
     }
 
     /// Begin a new transaction without requiring `&mut`.
     ///
     /// This allows starting a transaction without compile-time nesting prevention.
-    pub async fn new_unchecked(conn: &'conn Connection, behavior: TransactionBehavior) -> Result<Transaction<'conn>> {
+    pub async fn new_unchecked(
+        conn: &'conn Connection,
+        behavior: TransactionBehavior,
+    ) -> Result<Transaction<'conn>> {
         let sql = match behavior {
             TransactionBehavior::Deferred => "BEGIN DEFERRED",
             TransactionBehavior::Immediate => "BEGIN IMMEDIATE",

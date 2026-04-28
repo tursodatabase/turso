@@ -14,7 +14,12 @@ pub struct Statement {
 
 impl Statement {
     pub(crate) fn new(conn: Connection, sql: String, columns: Vec<Column>) -> Self {
-        Self { conn, sql, columns, last_n_change: 0 }
+        Self {
+            conn,
+            sql,
+            columns,
+            last_n_change: 0,
+        }
     }
 
     /// Execute the statement with the given parameters, returning the number of affected rows.

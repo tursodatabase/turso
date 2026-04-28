@@ -10,12 +10,18 @@ repository.workspace = true
 description = "Hegel property-based parity tests for turso and turso_serverless drivers"
 publish = false
 
+[lib]
+name = "turso_hegel_parity"
+path = "src/lib.rs"
+
 [lints]
 workspace = true
 
 [dependencies]
+hegeltest = "0.8"
+serde_json = { workspace = true }
+
+[dev-dependencies]
 turso = { workspace = true }
 turso_serverless = { workspace = true }
 tokio = { workspace = true, features = ["full"] }
-hegeltest = "0.8"
-serde_json = { workspace = true }

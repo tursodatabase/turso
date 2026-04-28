@@ -143,11 +143,14 @@ func (c *remoteConn) BeginTx(ctx context.Context, opts driver.TxOptions) (driver
 			WantRows:  false,
 		},
 	}
+	c.sess.keepAlive = true
 	entries, err := c.sess.executeCursorCtx(ctx, []batchStep{step})
 	if err != nil {
+		c.sess.keepAlive = false
 		return nil, err
 	}
 	if stepErr := extractStepError(entries); stepErr != nil {
+		c.sess.keepAlive = false
 		return nil, stepErr
 	}
 	return &remoteTx{conn: c}, nil
@@ -386,6 +389,7 @@ func (tx *remoteTx) Commit() error {
 		},
 	}
 	entries, err := tx.conn.sess.executeCursor([]batchStep{step})
+	tx.conn.sess.keepAlive = false
 	if err != nil {
 		return err
 	}
@@ -416,6 +420,7 @@ func (tx *remoteTx) Rollback() error {
 		},
 	}
 	entries, err := tx.conn.sess.executeCursor([]batchStep{step})
+	tx.conn.sess.keepAlive = false
 	if err != nil {
 		return err
 	}

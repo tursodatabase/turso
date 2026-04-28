@@ -857,13 +857,11 @@ pub async fn fetch_last_change_id<IO: SyncEngineIo, Ctx>(
                             replication_index: None,
                         },
                         condition: None,
-                    }]
-                    .into(),
+                    }],
                     replication_index: None,
                 },
             }),
-        ]
-        .into(),
+        ],
     };
 
     let no_ignored_steps = std::collections::HashSet::new();
@@ -1184,11 +1182,10 @@ async fn send_push_batch<IO: SyncEngineIo, Ctx>(
         baton: None,
         requests: vec![StreamRequest::Batch(BatchStreamReq {
             batch: Batch {
-                steps: sql_over_http_requests.into(),
+                steps: sql_over_http_requests,
                 replication_index: None,
             },
-        })]
-        .into(),
+        })],
     };
 
     let _ = sql_execute_http(ctx, replay_hrana_request, &add_column_step_indices).await?;
@@ -1626,6 +1623,11 @@ async fn sql_execute_http<IO: SyncEngineIo, Ctx>(
                     for result in batch.result.step_results.into_iter().flatten() {
                         results.push(result);
                     }
+                }
+                other => {
+                    return Err(Error::DatabaseSyncEngineError(format!(
+                        "unexpected stream response type: {other:?}"
+                    )));
                 }
             },
         }

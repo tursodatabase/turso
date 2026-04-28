@@ -29,6 +29,7 @@ class Session:
         self._auth_token = auth_token
         self._baton: Optional[str] = None
         self._base_url = normalize_url(url)
+        self.keep_alive: bool = False
 
     def _headers(self) -> dict[str, str]:
         headers = {"Content-Type": "application/json"}
@@ -59,7 +60,8 @@ class Session:
 
         Returns a list of CursorEntry dicts.
         """
-        request = build_cursor_request(self._baton, steps)
+        baton = self._baton if self.keep_alive else None
+        request = build_cursor_request(baton, steps)
         self._baton = None  # consumed
 
         raw = self._post("/v3/cursor", request)
@@ -71,7 +73,10 @@ class Session:
 
         # First line: CursorResponse (baton + optional base_url)
         cursor_resp = json.loads(lines[0])
-        self._baton = cursor_resp.get("baton")
+        if self.keep_alive:
+            self._baton = cursor_resp.get("baton")
+        else:
+            self._baton = None
         if cursor_resp.get("base_url"):
             self._base_url = cursor_resp["base_url"]
 
@@ -86,13 +91,22 @@ class Session:
 
         Returns the PipelineResponse dict.
         """
-        request = build_pipeline_request(self._baton, requests)
+        reqs = list(requests)
+        if not self.keep_alive:
+            # Append close unless the requests already include one.
+            if not any(r.get("type") == "close" for r in requests):
+                reqs.append({"type": "close"})
+        baton = self._baton if self.keep_alive else None
+        request = build_pipeline_request(baton, reqs)
         self._baton = None  # consumed
 
         raw = self._post("/v3/pipeline", request)
         resp: dict[str, Any] = json.loads(raw)
 
-        self._baton = resp.get("baton")
+        if self.keep_alive:
+            self._baton = resp.get("baton")
+        else:
+            self._baton = None
         if resp.get("base_url"):
             self._base_url = resp["base_url"]
 
