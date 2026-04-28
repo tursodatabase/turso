@@ -3117,7 +3117,7 @@ pub fn translate_expr(
         } if table_ref_id.is_self_table() => {
             // the table is a SELF_TABLE placeholder (used for generated columns), so we now have
             // to resolve it to the actual reference id using the SelfTableContext.
-            return program.with_existing_self_table_context(|program, self_table_context| {
+            return resolver.with_existing_self_table_context(|self_table_context| {
                 match self_table_context {
                     Some(SelfTableContext::ForSelect {
                         table_ref_id: real_id,
@@ -3147,7 +3147,7 @@ pub fn translate_expr(
                         Ok(target_register)
                     }
                     None => {
-                        // This error means that a program.with_self_table_context() was missing
+                        // This error means that a resolver.with_self_table_context() scope was missing
                         // somewhere in the call stack.
                         crate::bail_parse_error!(
                             "SELF_TABLE column reference outside of generated column context"
@@ -3322,11 +3322,13 @@ pub fn translate_expr(
                             // if we're reading from an index that contains this virtual column,
                             // the index already has the computed value, so read it from the index
                             GeneratedType::Virtual { expr, .. } if !read_from_index => {
-                                program.with_self_table_context(
-                                    Some(&SelfTableContext::ForSelect {
-                                        table_ref_id: *table_ref_id,
-                                        referenced_tables: referenced_tables.unwrap().clone(),
-                                    }),
+                                let self_ctx = SelfTableContext::ForSelect {
+                                    table_ref_id: *table_ref_id,
+                                    referenced_tables: referenced_tables.unwrap().clone(),
+                                };
+                                resolver.with_self_table_context(
+                                    program,
+                                    Some(&self_ctx),
                                     |program, _| {
                                         translate_expr(
                                             program,
@@ -5475,7 +5477,7 @@ fn do_emit_table_column(
 ) -> Result<()> {
     match column.generated_type() {
         GeneratedType::Virtual { expr, .. } => {
-            program.with_self_table_context(Some(self_table_context), |program, _| {
+            resolver.with_self_table_context(program, Some(self_table_context), |program, _| {
                 translate_expr(program, referenced_tables, expr, target_register, resolver)?;
                 Ok(())
             })?;
@@ -6504,7 +6506,7 @@ fn extract_string_literal(expr: &ast::Expr) -> crate::Result<String> {
 ///
 /// In the DML index-maintenance path (INSERT with expression indexes),
 /// `referenced_tables` is `None` and columns use `SELF_TABLE`. We fall back
-/// to the ProgramBuilder's `SelfTableContext::ForDML` to obtain column metadata.
+/// to the Resolver's `SelfTableContext::ForDML` to obtain column metadata.
 /// Resolve the TypeDef for a column expression (Column or DML self-table column).
 fn resolve_typedef_from_column(
     expr: &ast::Expr,
@@ -6594,8 +6596,8 @@ fn resolve_column_type_str(
     table: ast::TableInternalId,
     column: usize,
     referenced_tables: Option<&TableReferences>,
-    _resolver: &Resolver,
-    program: &ProgramBuilder,
+    resolver: &Resolver,
+    _program: &ProgramBuilder,
 ) -> Option<String> {
     if let Some(rt) = referenced_tables {
         if let Some((_, tbl)) = rt.find_table_by_internal_id(table) {
@@ -6603,7 +6605,8 @@ fn resolve_column_type_str(
         }
     }
     if table.is_self_table() {
-        if let Some(SelfTableContext::ForDML { table, .. }) = program.current_self_table_context() {
+        if let Some(SelfTableContext::ForDML { table, .. }) = resolver.self_table_context()
+        {
             return Some(table.columns().get(column)?.ty_str.clone());
         }
     }
@@ -7100,6 +7103,13 @@ pub(crate) fn get_expr_affinity_info(
 ) -> ExprAffinityInfo {
     match expr {
         ast::Expr::Column { table, column, .. } => {
+            if table.is_self_table() {
+                if let Some(resolver) = resolver {
+                    if let Some(aff) = resolver.self_table_affinity(*column) {
+                        return ExprAffinityInfo::with_affinity(aff);
+                    }
+                }
+            }
             if let Some(tables) = referenced_tables {
                 if let Some((_, table_ref)) = tables.find_table_by_internal_id(*table) {
                     if let Some(col) = table_ref.get_column_at(*column) {
@@ -7109,16 +7119,6 @@ pub(crate) fn get_expr_affinity_info(
                             );
                         }
                         return ExprAffinityInfo::with_affinity(col.affinity());
-                    }
-                }
-            }
-            // SELF_TABLE fallback: during DML expression index evaluation,
-            // referenced_tables is None but column affinities are available
-            // via the resolver's self_table_column_affinities.
-            if table.is_self_table() {
-                if let Some(resolver) = resolver {
-                    if let Some(aff) = resolver.self_table_column_affinities.get(*column) {
-                        return ExprAffinityInfo::with_affinity(*aff);
                     }
                 }
             }
@@ -8174,7 +8174,7 @@ pub(crate) fn emit_dml_expr_index_value(
         dml_ctx: DmlColumnContext::from_column_reg_mapping(pairs),
         table: Arc::clone(table),
     };
-    program.with_self_table_context(Some(&ctx), |program, _| {
+    resolver.with_self_table_context(program, Some(&ctx), |program, _| {
         translate_expr(program, None, &expr, dest_reg, resolver)?;
         Ok(())
     })?;

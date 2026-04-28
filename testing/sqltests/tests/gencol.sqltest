@@ -145,7 +145,6 @@ expect {
 }
 
 # TEXT column uses text comparison: '10' > '5' is false (lexicographic)
-@skip "TODO needs virtual column affinity handling"
 test gencol_comparison_affinity_text_integer {
     CREATE TABLE t1(a TEXT, b INTEGER AS (a > 5));
     INSERT INTO t1(a) VALUES('10'), ('3'), ('7');
@@ -157,7 +156,6 @@ expect {
     7|1
 }
 
-@skip "TODO needs virtual column affinity handling"
 test gencol_comparison_affinity_equals {
     CREATE TABLE t1(a TEXT, b INTEGER AS (a = 10));
     INSERT INTO t1(a) VALUES('10'), ('5');
@@ -168,7 +166,6 @@ expect {
     5|0
 }
 
-@skip "TODO needs virtual column affinity handling"
 test gencol_comparison_affinity_null {
     CREATE TABLE t1(a TEXT, b INTEGER AS (a > 5));
     INSERT INTO t1(a) VALUES(NULL), ('10');
@@ -179,7 +176,6 @@ expect {
     10|0
 }
 
-@skip "TODO needs virtual column affinity handling"
 test gencol_comparison_affinity_negative {
     CREATE TABLE t1(a TEXT, b INTEGER AS (a > -5));
     INSERT INTO t1(a) VALUES('-3'), ('-7'), ('0');
@@ -191,7 +187,6 @@ expect {
     0|1
 }
 
-@skip "TODO needs virtual column affinity handling"
 test gencol_comparison_affinity_real {
     CREATE TABLE t1(a TEXT, b INTEGER AS (a > 5.5));
     INSERT INTO t1(a) VALUES('6'), ('5'), ('5.5');
@@ -201,6 +196,156 @@ expect {
     6|1
     5|0
     5.5|0
+}
+
+test gencol_self_table_affinity_update_not_null {
+    CREATE TABLE t(a TEXT, g AS (CASE WHEN a=10 THEN NULL ELSE 1 END) NOT NULL);
+    INSERT INTO t(a) VALUES('x');
+    UPDATE t SET a='10';
+}
+expect error {
+    NOT NULL constraint failed: t.g
+}
+
+test gencol_self_table_affinity_create_index_population {
+    CREATE TABLE t(a TEXT, g INT GENERATED ALWAYS AS (a >= 10) VIRTUAL);
+    INSERT INTO t(a) VALUES('0');
+    CREATE INDEX idx_g ON t(g);
+    SELECT 'g1', a, g FROM t INDEXED BY idx_g WHERE g=1;
+    SELECT 'g0', a, g FROM t INDEXED BY idx_g WHERE g=0;
+}
+expect {
+    g0|0|0
+}
+
+test gencol_self_table_affinity_delete_index_maintenance {
+    CREATE TABLE t(a TEXT, v AS (a = 10) VIRTUAL);
+    CREATE INDEX i ON t(v);
+    INSERT INTO t(a) VALUES('10');
+    DELETE FROM t;
+    SELECT count(*) FROM t;
+    PRAGMA integrity_check;
+}
+expect {
+    0
+    ok
+}
+
+test gencol_self_table_affinity_hash_join_payload {
+    CREATE TABLE b(k INT, a TEXT, g INT GENERATED ALWAYS AS (a = 5) VIRTUAL);
+    CREATE TABLE p(k INT);
+    INSERT INTO b VALUES(1, '5');
+    INSERT INTO p VALUES(1);
+    SELECT 'plain', g FROM b;
+    SELECT 'hash', b.g FROM b FULL OUTER JOIN p ON b.k = p.k;
+}
+expect {
+    plain|1
+    hash|1
+}
+
+test gencol_self_table_affinity_integrity_check_not_null {
+    CREATE TABLE t(
+        a TEXT,
+        b INT GENERATED ALWAYS AS (CASE WHEN a < 40 THEN 1 END) VIRTUAL NOT NULL
+    );
+    INSERT INTO t(a) VALUES('10');
+    SELECT a, b, typeof(b), a < 40 FROM t;
+    PRAGMA integrity_check;
+}
+expect {
+    10|1|integer|1
+    ok
+}
+
+test gencol_self_table_affinity_integrity_check_index {
+    CREATE TABLE t(a TEXT, g INT GENERATED ALWAYS AS (a < 2) VIRTUAL);
+    CREATE INDEX i ON t(g);
+    INSERT INTO t(a) VALUES('10');
+    SELECT a, g, typeof(g) FROM t;
+    PRAGMA integrity_check;
+}
+expect {
+    10|1|integer
+    ok
+}
+
+test gencol_self_table_affinity_update_returning_not_null {
+    CREATE TABLE t(a TEXT, g INT AS (CASE WHEN a=10 THEN 1 END) VIRTUAL NOT NULL);
+    INSERT INTO t(a) VALUES('10');
+    UPDATE t SET a='10' RETURNING a, g, typeof(g);
+}
+expect {
+    10|1|integer
+}
+
+test gencol_self_table_affinity_indexed_update_returning {
+    CREATE TABLE t(a TEXT, g INT AS (a = 10) VIRTUAL);
+    INSERT INTO t(a) VALUES('10'), ('5');
+    CREATE INDEX idx_g ON t(g);
+    UPDATE t INDEXED BY idx_g SET a='11' WHERE g=1 RETURNING a, g, typeof(g);
+    SELECT 'all', a, g FROM t ORDER BY a;
+    PRAGMA integrity_check;
+}
+expect {
+    11|0|integer
+    all|11|0
+    all|5|0
+    ok
+}
+
+test gencol_self_table_affinity_indexed_delete_returning {
+    CREATE TABLE t(a TEXT, g INT AS (a = 10) VIRTUAL);
+    INSERT INTO t(a) VALUES('10'), ('5');
+    CREATE INDEX idx_g ON t(g);
+    DELETE FROM t INDEXED BY idx_g WHERE g=0 RETURNING a, g, typeof(g);
+    SELECT 'left', a, g FROM t;
+    PRAGMA integrity_check;
+}
+expect {
+    5|0|integer
+    left|10|1
+    ok
+}
+
+test gencol_self_table_affinity_insert_returning_index_integrity {
+    CREATE TABLE t(a TEXT, g INT AS (a = 10) VIRTUAL);
+    CREATE INDEX idx_g ON t(g);
+    INSERT INTO t(a) VALUES('10'), ('5') RETURNING a, g, typeof(g);
+    SELECT 'idx1', a, g FROM t INDEXED BY idx_g WHERE g=1;
+    SELECT 'idx0', a, g FROM t INDEXED BY idx_g WHERE g=0;
+    PRAGMA integrity_check;
+}
+expect {
+    10|1|integer
+    5|0|integer
+    idx1|10|1
+    idx0|5|0
+    ok
+}
+
+test gencol_trigger_when_generated_text_affinity {
+    CREATE TABLE t(a TEXT, g TEXT AS (a > 5) VIRTUAL);
+    CREATE TABLE log(ev TEXT, val TEXT);
+
+    CREATE TRIGGER bi BEFORE INSERT ON t WHEN NEW.g = 0 BEGIN INSERT INTO log VALUES('BI:new', NEW.g || ':' || typeof(NEW.g)); END;
+    CREATE TRIGGER ai AFTER INSERT ON t WHEN NEW.g = 0 BEGIN INSERT INTO log VALUES('AI:new', NEW.g || ':' || typeof(NEW.g)); END;
+    INSERT INTO t(a) VALUES('10');
+
+    CREATE TRIGGER bu_old BEFORE UPDATE ON t WHEN OLD.g = 0 BEGIN INSERT INTO log VALUES('BU:old', OLD.g || ':' || typeof(OLD.g)); END;
+    CREATE TRIGGER bu_new BEFORE UPDATE ON t WHEN NEW.g = 0 BEGIN INSERT INTO log VALUES('BU:new', NEW.g || ':' || typeof(NEW.g)); END;
+    CREATE TRIGGER au_old AFTER UPDATE ON t WHEN OLD.g = 0 BEGIN INSERT INTO log VALUES('AU:old', OLD.g || ':' || typeof(OLD.g)); END;
+    CREATE TRIGGER au_new AFTER UPDATE ON t WHEN NEW.g = 0 BEGIN INSERT INTO log VALUES('AU:new', NEW.g || ':' || typeof(NEW.g)); END;
+    UPDATE t SET a='10';
+
+    CREATE TRIGGER bd BEFORE DELETE ON t WHEN OLD.g = 0 BEGIN INSERT INTO log VALUES('BD:old', OLD.g || ':' || typeof(OLD.g)); END;
+    CREATE TRIGGER ad AFTER DELETE ON t WHEN OLD.g = 0 BEGIN INSERT INTO log VALUES('AD:old', OLD.g || ':' || typeof(OLD.g)); END;
+    DELETE FROM t;
+
+    SELECT COALESCE(group_concat(ev || '=' || val, ','), 'EMPTY') FROM log;
+}
+expect {
+    EMPTY
 }
 
 # --- Unary operators ---

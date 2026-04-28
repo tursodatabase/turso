@@ -347,7 +347,8 @@ fn translate_integrity_check_impl(
                             referenced_tables: table_references.clone(),
                         }
                     });
-                    program.with_self_table_context(
+                    resolver.with_self_table_context(
+                        program,
                         self_table_context.as_ref(),
                         |program, _| {
                             translate_expr_no_constant_opt(
@@ -460,7 +461,8 @@ fn translate_integrity_check_impl(
                                 }
                             });
 
-                        program.with_self_table_context(
+                        resolver.with_self_table_context(
+                            program,
                             self_table_context.as_ref(),
                             |program, _| {
                                 translate_expr_no_constant_opt(
