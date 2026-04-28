@@ -176,7 +176,7 @@ impl TursoSyncServer {
             let result = match request {
                 StreamRequest::Execute(exec_req) => self.execute_statement(&conn, &exec_req),
                 StreamRequest::Batch(batch_req) => self.execute_batch(&conn, &batch_req),
-                StreamRequest::None => StreamResult::Error {
+                _ => StreamResult::Error {
                     error: Error {
                         message: "Unknown request type".to_string(),
                         code: "UNKNOWN".to_string(),

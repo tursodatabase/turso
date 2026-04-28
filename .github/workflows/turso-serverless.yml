@@ -143,6 +143,49 @@ jobs:
       working-directory: serverless/javascript
       run: npm test
 
+    # --- Protocol validation through hrana-proxy ---
+    - name: Build hrana-proxy
+      run: cargo build -p hrana-proxy
+
+    - name: Start hrana-proxy
+      run: |
+        target/debug/hrana-proxy --upstream http://localhost:8080 --listen 0.0.0.0:9090 &
+        sleep 2
+        curl -sf http://localhost:9090/health
+
+    - name: JS serverless tests (through proxy)
+      working-directory: serverless/javascript
+      run: npm test
+      env:
+        TURSO_DATABASE_URL: http://localhost:9090
+
+    - name: Rust integration tests (through proxy)
+      run: cargo test -p turso_serverless --test integration
+      env:
+        TURSO_DATABASE_URL: http://localhost:9090
+
+    - name: Go serverless tests (through proxy)
+      working-directory: serverless/go
+      run: go test -v -count=1 ./...
+      env:
+        TURSO_DATABASE_URL: http://localhost:9090
+
+    - name: Python serverless tests (through proxy)
+      working-directory: serverless/python
+      run: pytest tests/test_serverless.py -v
+      env:
+        TURSO_DATABASE_URL: http://localhost:9090
+
+    - name: Rust protocol property tests (through proxy)
+      run: cargo test -p turso_hegel_parity --test protocol -- --nocapture --test-threads=1
+      env:
+        TURSO_DATABASE_URL: http://localhost:9090
+
+    - name: Rust parity tests (through proxy)
+      run: cargo test -p turso_hegel_parity --test parity -- --test-threads=1
+      env:
+        TURSO_DATABASE_URL: http://localhost:9090
+
     # --- JS parity tests ---
     - name: Install JS native dependencies
       working-directory: bindings/javascript

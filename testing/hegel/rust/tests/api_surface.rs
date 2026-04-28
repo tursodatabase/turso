@@ -108,10 +108,7 @@ fn parse_methods(json_path: &std::path::Path) -> BTreeMap<String, BTreeSet<Strin
             None => continue,
         };
         // Skip trait impls (inherent impls have "trait": null)
-        if impl_data
-            .get("trait")
-            .is_some_and(|v| !v.is_null())
-        {
+        if impl_data.get("trait").is_some_and(|v| !v.is_null()) {
             continue;
         }
         // inherent impl (not trait impl)
@@ -193,18 +190,14 @@ fn api_surface_parity() {
         // Methods in local but not remote
         for m in &local_methods {
             if !remote_methods.contains(m) && !local_only_set.contains(&(type_name, m.as_str())) {
-                errors.push(format!(
-                    "  {type_name}::{m} — in local but not remote"
-                ));
+                errors.push(format!("  {type_name}::{m} — in local but not remote"));
             }
         }
 
         // Methods in remote but not local
         for m in &remote_methods {
             if !local_methods.contains(m) && !remote_only_set.contains(&(type_name, m.as_str())) {
-                errors.push(format!(
-                    "  {type_name}::{m} — in remote but not local"
-                ));
+                errors.push(format!("  {type_name}::{m} — in remote but not local"));
             }
         }
     }

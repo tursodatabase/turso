@@ -223,12 +223,29 @@
       "sql": "CREATE TRIGGER IF NOT EXISTS tr_{table}_ins AFTER INSERT ON {table} BEGIN INSERT INTO {audit} VALUES ('{table}', NEW.a); INSERT INTO {audit} VALUES ('{table}', NEW.a * 2); END",
       "fields": { "table": "table_name" },
       "result": "trigger"
+    },
+    {
+      "id": "transaction_workflow",
+      "variant": 26,
+      "sql": "BEGIN; ... inner ops ...; COMMIT/ROLLBACK",
+      "fields": { "inner_ops": "dml_ops", "commit": "bool" },
+      "result": "exec",
+      "desc": "Structured transaction: BEGIN -> 1-5 DML/query ops -> COMMIT or ROLLBACK"
+    },
+    {
+      "id": "error_in_transaction",
+      "variant": 27,
+      "sql": "BEGIN; good_op; bad_sql; recovery_op; ROLLBACK",
+      "fields": { "good_op": "dml_op", "bad_sql": "error_sql", "recovery_op": "dml_op" },
+      "result": "exec",
+      "desc": "Error recovery in transaction: BEGIN -> good op -> error SQL -> recovery op -> ROLLBACK"
     }
   ],
   "tests": {
     "api_parity": { "prefix_range": [0, 65535], "num_examples": 100 },
     "error_recovery": { "prefix_range": [300000, 365535], "num_examples": 50 },
     "ddl_in_transaction": { "prefix_range": [100000, 165535], "num_examples": 50 },
-    "ddl_prepare_in_transaction": { "prefix_range": [200000, 265535], "num_examples": 50 }
+    "ddl_prepare_in_transaction": { "prefix_range": [200000, 265535], "num_examples": 50 },
+    "protocol_properties": { "prefix_range": [400000, 465535], "num_examples": 100 }
   }
 }

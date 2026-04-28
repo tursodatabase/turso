@@ -1,6 +1,6 @@
+use crate::{Error, Result};
 use futures::StreamExt;
 use reqwest::Client;
-use crate::{Error, Result};
 
 use crate::protocol::{
     CursorBatch, CursorEntry, CursorRequest, CursorResponse, PipelineRequest, PipelineResponse,
@@ -23,16 +23,23 @@ pub struct Session {
     auth_token: Option<String>,
     baton: Option<String>,
     base_url: String,
+    keep_alive: bool,
 }
 
 impl Session {
     pub fn new(url: String, auth_token: Option<String>) -> Self {
+        let client = Client::new();
         Self {
-            client: Client::new(),
+            client,
             auth_token,
             baton: None,
             base_url: normalize_url(&url),
+            keep_alive: false,
         }
+    }
+
+    pub fn set_keep_alive(&mut self, val: bool) {
+        self.keep_alive = val;
     }
 
     fn auth_header(&self) -> Option<String> {
@@ -40,11 +47,14 @@ impl Session {
     }
 
     /// Execute a cursor request (streaming NDJSON for queries with rows).
+    #[allow(dead_code)]
     pub async fn execute_cursor(&mut self, batch: CursorBatch) -> Result<Vec<CursorEntry>> {
-        let request = CursorRequest {
-            baton: self.baton.take(),
-            batch,
+        let baton = if self.keep_alive {
+            self.baton.take()
+        } else {
+            None
         };
+        let request = CursorRequest { baton, batch };
 
         let url = format!("{}/v3/cursor", self.base_url);
         let mut req = self
@@ -99,7 +109,9 @@ impl Session {
         let cursor_response: CursorResponse = serde_json::from_str(first_line)
             .map_err(|e| Error::Error(format!("Failed to parse cursor response: {e}")))?;
 
-        self.baton = cursor_response.baton;
+        if self.keep_alive {
+            self.baton = cursor_response.baton;
+        }
         if let Some(base_url) = cursor_response.base_url {
             self.base_url = base_url;
         }
@@ -118,12 +130,16 @@ impl Session {
     /// Execute a pipeline request (JSON request/response for describe, sequence, close).
     pub async fn execute_pipeline(
         &mut self,
-        requests: Vec<crate::protocol::PipelineRequestEntry>,
+        mut requests: Vec<crate::protocol::StreamRequest>,
     ) -> Result<PipelineResponse> {
-        let request = PipelineRequest {
-            baton: self.baton.take(),
-            requests,
+        let baton = if self.keep_alive {
+            self.baton.take()
+        } else {
+            // When not keeping alive, append Close so the server releases the stream.
+            requests.push(crate::protocol::StreamRequest::Close);
+            None
         };
+        let request = PipelineRequest { baton, requests };
 
         let url = format!("{}/v3/pipeline", self.base_url);
         let mut req = self
@@ -154,9 +170,25 @@ impl Session {
             .await
             .map_err(|e| Error::Error(format!("Failed to parse pipeline response: {e}")))?;
 
-        self.baton.clone_from(&pipeline_response.baton);
+        if self.keep_alive {
+            self.baton.clone_from(&pipeline_response.baton);
+        }
         if let Some(base_url) = &pipeline_response.base_url {
             self.base_url.clone_from(base_url);
+        }
+
+        // On error outside a transaction, reset baton so we don't leak
+        // a stale stream.  Inside a transaction (keep_alive=true) the
+        // server keeps the stream alive for SQL-level errors so the
+        // client can still ROLLBACK — trust the baton in the response.
+        if !self.keep_alive {
+            let has_error = pipeline_response
+                .results
+                .iter()
+                .any(|r| matches!(r, crate::protocol::StreamResult::Error { .. }));
+            if has_error {
+                self.baton = None;
+            }
         }
 
         Ok(pipeline_response)
@@ -166,7 +198,7 @@ impl Session {
     pub async fn close(&mut self) -> Result<()> {
         if self.baton.is_some() {
             let _ = self
-                .execute_pipeline(vec![crate::protocol::PipelineRequestEntry::Close])
+                .execute_pipeline(vec![crate::protocol::StreamRequest::Close])
                 .await;
         }
         self.baton = None;

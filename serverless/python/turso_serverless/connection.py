@@ -82,9 +82,16 @@ class Connection:
         self._ensure_open()
         step = build_batch_step(sql, args=params, named_args=named_params, want_rows=want_rows)
 
+        # Enable keep_alive before BEGIN so the baton is preserved
+        kw = _first_keyword(sql)
+        if kw == "BEGIN":
+            self._session.keep_alive = True
+
         try:
             entries = self._session.execute_cursor([step])
         except RuntimeError as e:
+            if kw == "BEGIN":
+                self._session.keep_alive = False
             raise _classify_error(str(e))
 
         columns: list[str] = []
@@ -121,14 +128,18 @@ class Connection:
                     raise _classify_error(err.get("message", "Unknown error"))
                 raise OperationalError("Unknown error")
 
-        # Track transaction state
+        # Track transaction state — keep_alive must be set to True before
+        # BEGIN so the baton is preserved, but set to False after
+        # COMMIT/ROLLBACK so the baton is still sent with the final request.
         kw = _first_keyword(sql)
         if kw == "BEGIN":
             self._in_transaction = True
         elif kw in ("COMMIT", "END"):
             self._in_transaction = False
+            self._session.keep_alive = False
         elif kw == "ROLLBACK":
             self._in_transaction = False
+            self._session.keep_alive = False
 
         return columns, rows, affected_rows, last_rowid
 

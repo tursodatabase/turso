@@ -28,6 +28,10 @@ type session struct {
 	authToken string
 	baton     *string
 	baseURL   string
+	// keepAlive controls stream lifecycle. When false (default), each
+	// pipeline request appends a close and sends baton: nil. When true
+	// (inside a transaction), the baton is preserved across requests.
+	keepAlive bool
 }
 
 func newSession(url, authToken string) *session {
@@ -52,8 +56,12 @@ func (s *session) executeCursor(steps []batchStep) ([]cursorEntry, error) {
 
 // executeCursorCtx sends a cursor request (streaming NDJSON) and returns parsed entries.
 func (s *session) executeCursorCtx(ctx context.Context, steps []batchStep) ([]cursorEntry, error) {
+	var baton *string
+	if s.keepAlive {
+		baton = s.baton
+	}
 	req := cursorRequest{
-		Baton: s.baton,
+		Baton: baton,
 		Batch: cursorBatch{Steps: steps},
 	}
 	s.baton = nil
@@ -96,7 +104,11 @@ func (s *session) executeCursorCtx(ctx context.Context, steps []batchStep) ([]cu
 	if err := json.Unmarshal(scanner.Bytes(), &cr); err != nil {
 		return nil, fmt.Errorf("turso: failed to parse cursor response: %w", err)
 	}
-	s.baton = cr.Baton
+	if s.keepAlive {
+		s.baton = cr.Baton
+	} else {
+		s.baton = nil
+	}
 	if cr.BaseURL != nil {
 		s.baseURL = *cr.BaseURL
 	}
@@ -128,9 +140,26 @@ func (s *session) executePipeline(requests []pipelineRequestEntry) (*pipelineRes
 
 // executePipelineCtx sends a pipeline request and returns the response.
 func (s *session) executePipelineCtx(ctx context.Context, requests []pipelineRequestEntry) (*pipelineResponse, error) {
+	reqs := requests
+	var baton *string
+	if s.keepAlive {
+		baton = s.baton
+	} else {
+		// Append close unless the requests already include one.
+		hasClose := false
+		for _, r := range requests {
+			if r.Type == "close" {
+				hasClose = true
+				break
+			}
+		}
+		if !hasClose {
+			reqs = append(append([]pipelineRequestEntry{}, requests...), pipelineRequestEntry{Type: "close"})
+		}
+	}
 	req := pipelineRequest{
-		Baton:    s.baton,
-		Requests: requests,
+		Baton:    baton,
+		Requests: reqs,
 	}
 	s.baton = nil
 
@@ -164,7 +193,11 @@ func (s *session) executePipelineCtx(ctx context.Context, requests []pipelineReq
 		return nil, fmt.Errorf("turso: failed to parse pipeline response: %w", err)
 	}
 
-	s.baton = pr.Baton
+	if s.keepAlive {
+		s.baton = pr.Baton
+	} else {
+		s.baton = nil
+	}
 	if pr.BaseURL != nil {
 		s.baseURL = *pr.BaseURL
 	}
