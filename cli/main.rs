@@ -37,7 +37,7 @@ fn rustyline_config() -> Config {
 pub static HOME_DIR: LazyLock<PathBuf> =
     LazyLock::new(|| dirs::home_dir().expect("Could not determine home directory"));
 
-pub static HISTORY_FILE: LazyLock<PathBuf> = LazyLock::new(|| HOME_DIR.join(".limbo_history"));
+pub static HISTORY_FILE: LazyLock<PathBuf> = LazyLock::new(|| HOME_DIR.join(".tursodb_history"));
 
 fn run_mcp_server(app: app::Limbo) -> anyhow::Result<()> {
     let conn = app.get_connection();
