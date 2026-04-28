@@ -2,11 +2,13 @@ import { AsyncLock } from './async-lock.js';
 import { Session, type SessionConfig } from './session.js';
 import { Statement } from './statement.js';
 import { type QueryOptions } from './protocol.js';
+import { normalizeArgs, splitBindParameters } from './args.js';
 
 /**
  * Configuration options for connecting to a Turso database.
  */
 export interface Config extends SessionConfig {}
+
 
 /**
  * A connection to a Turso database.
@@ -121,12 +123,75 @@ export class Connection {
 
 
   /**
+   * Like `prepare(sql).run(args)` but in a single round trip — skips `describe`
+   * since run() does not need column metadata.
+   */
+  async run(sql: string, ...bindParameters: any[]): Promise<any> {
+    if (!this.isOpen) throw new TypeError("The database connection is not open");
+    const { params, queryOptions } = splitBindParameters(bindParameters);
+    await this.execLock.acquire();
+    try {
+      const result = await this.session.execute(sql, normalizeArgs(params), this.defaultSafeIntegerMode, queryOptions);
+      return { changes: result.rowsAffected, lastInsertRowid: result.lastInsertRowid };
+    } finally {
+      this.execLock.release();
+    }
+  }
+
+  /**
+   * Like `prepare(sql).get(args)` but in a single round trip.
+   */
+  async get(sql: string, ...bindParameters: any[]): Promise<any> {
+    if (!this.isOpen) throw new TypeError("The database connection is not open");
+    const { params, queryOptions } = splitBindParameters(bindParameters);
+    await this.execLock.acquire();
+    try {
+      const result = await this.session.execute(sql, normalizeArgs(params), this.defaultSafeIntegerMode, queryOptions);
+      const row = result.rows[0];
+      if (!row) return undefined;
+      const obj: any = {};
+      result.columns.forEach((col: string, i: number) => { obj[col] = row[i]; });
+      return obj;
+    } finally {
+      this.execLock.release();
+    }
+  }
+
+  /**
+   * Like `prepare(sql).all(args)` but in a single round trip.
+   */
+  async all(sql: string, ...bindParameters: any[]): Promise<any[]> {
+    if (!this.isOpen) throw new TypeError("The database connection is not open");
+    const { params, queryOptions } = splitBindParameters(bindParameters);
+    await this.execLock.acquire();
+    try {
+      const result = await this.session.execute(sql, normalizeArgs(params), this.defaultSafeIntegerMode, queryOptions);
+      return result.rows.map((row: any) => {
+        const obj: any = {};
+        result.columns.forEach((col: string, i: number) => { obj[col] = row[i]; });
+        return obj;
+      });
+    } finally {
+      this.execLock.release();
+    }
+  }
+
+  /**
+   * Like `prepare(sql).iterate(args)` but in a single round trip. Buffers the
+   * result set — the connection lock cannot be held across `yield` points
+   * without risking deadlock on nested calls.
+   */
+  async *iterate(sql: string, ...bindParameters: any[]): AsyncGenerator<any> {
+    for (const row of await this.all(sql, ...bindParameters)) yield row;
+  }
+
+  /**
    * Execute a SQL statement and return all results.
-   * 
+   *
    * @param sql - The SQL statement to execute
    * @param args - Optional array of parameter values
    * @returns Promise resolving to the complete result set
-   * 
+   *
    * @example
    * ```typescript
    * const result = await client.execute("SELECT * FROM users WHERE id = ?", [123]);
