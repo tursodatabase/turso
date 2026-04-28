@@ -896,20 +896,28 @@ impl Statement {
             let mut js_obj = Object::new(env)?;
             let column_name = stmt.get_column_name(i);
             let column_type = stmt.get_column_type_name(i);
+            let column_origin = stmt.get_column_origin_name(i);
+            let column_table = stmt.get_column_table_name(i);
+            let column_db = stmt.get_column_database_name(i);
 
-            // Set the name property
             js_obj.set("name", column_name.as_ref())?;
 
-            // Set type property if available
             match column_type {
                 Some(type_str) => js_obj.set("type", type_str.as_str())?,
                 None => js_obj.set("type", ToNapiValue::into_unknown(Null, env)?)?,
             }
-
-            // For now, set other properties to null since turso_core doesn't provide this metadata
-            js_obj.set("column", ToNapiValue::into_unknown(Null, env)?)?;
-            js_obj.set("table", ToNapiValue::into_unknown(Null, env)?)?;
-            js_obj.set("database", ToNapiValue::into_unknown(Null, env)?)?;
+            match column_origin {
+                Some(s) => js_obj.set("column", s.as_ref())?,
+                None => js_obj.set("column", ToNapiValue::into_unknown(Null, env)?)?,
+            }
+            match column_table {
+                Some(s) => js_obj.set("table", s.as_ref())?,
+                None => js_obj.set("table", ToNapiValue::into_unknown(Null, env)?)?,
+            }
+            match column_db {
+                Some(s) => js_obj.set("database", s)?,
+                None => js_obj.set("database", ToNapiValue::into_unknown(Null, env)?)?,
+            }
 
             js_array.set(i as u32, js_obj)?;
         }

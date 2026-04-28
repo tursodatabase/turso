@@ -710,6 +710,51 @@ impl Statement {
         }
     }
 
+    /// Returns the origin column name in the source table for a result column.
+    ///
+    /// Behaves like SQLite's `sqlite3_column_origin_name()`: when the result
+    /// column is a direct reference to a column of a table, returns the
+    /// underlying column name (independent of any AS alias). For expressions
+    /// or subqueries, returns None.
+    pub fn get_column_origin_name(&self, idx: usize) -> Option<Cow<'_, str>> {
+        if self.query_mode == QueryMode::Explain || self.query_mode == QueryMode::ExplainQueryPlan {
+            return None;
+        }
+        let column = &self.program.result_columns.get(idx).expect("No column");
+        match &column.expr {
+            turso_parser::ast::Expr::Column {
+                table,
+                column: column_idx,
+                ..
+            } => {
+                let (_, table_ref) = self
+                    .program
+                    .table_references
+                    .find_table_by_internal_id(*table)?;
+                let table_column = table_ref.get_column_at(*column_idx)?;
+                table_column.name.as_deref().map(Cow::Borrowed)
+            }
+            _ => None,
+        }
+    }
+
+    /// Returns the database name for a result column.
+    ///
+    /// Behaves like SQLite's `sqlite3_column_database_name()`. Returns "main"
+    /// for column references (ATTACH-qualified database names are not yet
+    /// surfaced through table references). Returns None for expressions or
+    /// subqueries.
+    pub fn get_column_database_name(&self, idx: usize) -> Option<&'static str> {
+        if self.query_mode == QueryMode::Explain || self.query_mode == QueryMode::ExplainQueryPlan {
+            return None;
+        }
+        let column = &self.program.result_columns.get(idx).expect("No column");
+        match &column.expr {
+            turso_parser::ast::Expr::Column { .. } => Some("main"),
+            _ => None,
+        }
+    }
+
     /// Returns the declared type of a result column.
     ///
     /// This behaves similarly to SQLite's `sqlite3_column_decltype()`:
