@@ -95,6 +95,11 @@ pub struct Builder {
     remote_encryption_key: Option<String>,
     // Encryption cipher for the Turso Cloud database
     remote_encryption_cipher: Option<RemoteEncryptionCipher>,
+    // Whether to enable the experimental `index_method` engine feature
+    // (e.g. `CREATE INDEX … USING fts (...)`). Mirrors the local Builder's
+    // `experimental_index_method` flag so synced databases can use the
+    // same SQL surface as their local-only counterparts.
+    experimental_index_method: bool,
 }
 
 impl Builder {
@@ -110,7 +115,18 @@ impl Builder {
             partial_sync_config_experimental: None,
             remote_encryption_key: None,
             remote_encryption_cipher: None,
+            experimental_index_method: false,
         }
+    }
+
+    /// Enable the experimental `index_method` engine feature for the synced
+    /// database. When enabled, SQL statements like
+    /// `CREATE INDEX idx ON t USING fts (...)` are accepted by the local
+    /// engine. Mirrors the local [`crate::Builder::experimental_index_method`]
+    /// method so callers can use the same SQL surface in synced mode.
+    pub fn experimental_index_method(mut self, enable: bool) -> Self {
+        self.experimental_index_method = enable;
+        self
     }
 
     // Set remote_url for HTTP requests.
@@ -173,10 +189,25 @@ impl Builder {
 
     // Build the synced database object, initialize and open it.
     pub async fn build(self) -> Result<Database> {
+        // Compose the experimental_features comma-separated string from the
+        // boolean flags exposed on this Builder. Today only `index_method`
+        // is wired; future synced-compatible flags can be added here.
+        let experimental_features = {
+            let mut features: Vec<&str> = Vec::new();
+            if self.experimental_index_method {
+                features.push("index_method");
+            }
+            if features.is_empty() {
+                None
+            } else {
+                Some(features.join(","))
+            }
+        };
+
         // Build core database config for the embedded engine.
         let db_config = turso_sdk_kit::rsapi::TursoDatabaseConfig {
             path: self.path.clone(),
-            experimental_features: None,
+            experimental_features,
             // IMPORTANT: async IO must be turned on to delegate IO to this layer.
             async_io: true,
             encryption: None,
