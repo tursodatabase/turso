@@ -43,7 +43,7 @@ use crate::vdbe::value::ComparisonOp;
 use crate::vdbe::ValueIteratorExt;
 use crate::vdbe::{
     registers_to_ref_values, DeferredSeekState, EndStatement, OpHashBuildState, OpHashProbeState,
-    StepResult, TxnCleanup,
+    StepResult, TxnCleanup, VacuumOpState,
 };
 use crate::vector::{
     vector1bit, vector32, vector32_sparse, vector64, vector8, vector_concat, vector_distance_cos,
@@ -14717,7 +14717,7 @@ pub fn op_vacuum_into(
     match op_vacuum_into_inner(program, state, insn) {
         Ok(InsnFunctionStepResult::Step) => {
             // Instruction complete, reset state
-            state.op_vacuum_into = None;
+            state.op_vacuum_state = VacuumOpState::None;
             Ok(InsnFunctionStepResult::Step)
         }
         Ok(InsnFunctionStepResult::IO(io)) => {
@@ -14728,8 +14728,17 @@ pub fn op_vacuum_into(
             unreachable!("op_vacuum_into_inner only returns Step or IO")
         }
         Err(err) => {
-            if let Err(cleanup_err) = cleanup_op_vacuum_into(&program.connection, state) {
-                tracing::error!("VACUUM INTO cleanup failed after error: {cleanup_err}");
+            if matches!(state.op_vacuum_state, VacuumOpState::IntoFile(_)) {
+                let VacuumOpState::IntoFile(vacuum_state) =
+                    std::mem::take(&mut state.op_vacuum_state)
+                else {
+                    unreachable!("invalid state, we are inside vacuum into op");
+                };
+                if let Err(cleanup_err) =
+                    cleanup_op_vacuum_into(&program.connection, state, vacuum_state)
+                {
+                    tracing::error!("VACUUM INTO cleanup failed after error: {cleanup_err}");
+                }
             }
             Err(err)
         }
@@ -14737,30 +14746,26 @@ pub fn op_vacuum_into(
 }
 
 /// Clean up any VACUUM or VACUUM INTO state on error or abort.
-/// Only one of the two can be active at a time; this handles whichever is set.
 pub(crate) fn cleanup_vacuum_state(
     connection: &Arc<Connection>,
     state: &mut ProgramState,
 ) -> Result<()> {
-    turso_assert!(
-        !(state.op_vacuum_into.is_some() && state.op_vacuum_in_place.is_some()),
-        "VACUUM INTO and in-place VACUUM state cannot both be active"
-    );
-
-    if state.op_vacuum_into.is_some() {
-        cleanup_op_vacuum_into(connection, state)
-    } else if state.op_vacuum_in_place.is_some() {
-        cleanup_op_vacuum_in_place(connection, state)
-    } else {
-        Ok(())
+    match std::mem::take(&mut state.op_vacuum_state) {
+        VacuumOpState::None => Ok(()),
+        VacuumOpState::IntoFile(vacuum_state) => {
+            cleanup_op_vacuum_into(connection, state, vacuum_state)
+        }
+        VacuumOpState::InPlace(vacuum_state) => {
+            cleanup_op_vacuum_in_place(connection, vacuum_state)
+        }
     }
 }
 
-fn cleanup_op_vacuum_into(connection: &Arc<Connection>, state: &mut ProgramState) -> Result<()> {
-    let Some(mut vacuum_state) = state.op_vacuum_into.take() else {
-        return Ok(());
-    };
-
+fn cleanup_op_vacuum_into(
+    connection: &Arc<Connection>,
+    state: &mut ProgramState,
+    mut vacuum_state: Box<VacuumIntoOpContext>,
+) -> Result<()> {
     if let Some(target_build_context) = vacuum_state.target_build_context.as_mut() {
         target_build_context.cleanup_after_error()?;
     }
@@ -14789,7 +14794,7 @@ fn op_vacuum_into_inner(
         insn
     );
 
-    if state.op_vacuum_into.is_none() {
+    if matches!(state.op_vacuum_state, VacuumOpState::None) {
         let source_db_id = program.connection.get_database_id_by_name(schema_name)?;
 
         // Matches sqlite that treats VACUUM temp INTO as a no-op (no file created)
@@ -14798,14 +14803,18 @@ fn op_vacuum_into_inner(
             return Ok(InsnFunctionStepResult::Step);
         }
 
-        state.op_vacuum_into = Some(Box::new(VacuumIntoOpContext {
+        state.op_vacuum_state = VacuumOpState::IntoFile(Box::new(VacuumIntoOpContext {
             escaped_schema_name: schema_name.replace('"', "\"\""),
             source_db_id,
             ..Default::default()
         }));
     }
 
-    let vacuum_state = state.op_vacuum_into.as_mut().unwrap();
+    let VacuumOpState::IntoFile(vacuum_state) = &mut state.op_vacuum_state else {
+        return Err(LimboError::InternalError(
+            "VACUUM INTO resumed with incompatible VACUUM state".to_string(),
+        ));
+    };
     let escaped_schema_name = &vacuum_state.escaped_schema_name;
     let source_db_id = vacuum_state.source_db_id;
 
@@ -14988,15 +14997,19 @@ pub fn op_vacuum(
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(Vacuum { db }, insn);
 
-    if state.op_vacuum_in_place.is_none() {
-        state.op_vacuum_in_place = Some(Box::new(VacuumInPlaceOpContext::new(*db)));
+    if matches!(state.op_vacuum_state, VacuumOpState::None) {
+        state.op_vacuum_state = VacuumOpState::InPlace(Box::new(VacuumInPlaceOpContext::new(*db)));
     }
 
-    let vacuum_state = state.op_vacuum_in_place.as_mut().unwrap();
+    let VacuumOpState::InPlace(vacuum_state) = &mut state.op_vacuum_state else {
+        return Err(LimboError::InternalError(
+            "VACUUM resumed with incompatible VACUUM state".to_string(),
+        ));
+    };
 
     match vacuum_state.step(&program.connection) {
         Ok(InsnFunctionStepResult::Step) => {
-            state.op_vacuum_in_place = None;
+            state.op_vacuum_state = VacuumOpState::None;
             state.pc += 1;
             Ok(InsnFunctionStepResult::Step)
         }
@@ -15005,8 +15018,17 @@ pub fn op_vacuum(
             unreachable!("in-place VACUUM only returns Step or IO")
         }
         Err(err) => {
-            if let Err(cleanup_err) = cleanup_op_vacuum_in_place(&program.connection, state) {
-                tracing::error!("VACUUM cleanup failed after error: {cleanup_err}");
+            if matches!(state.op_vacuum_state, VacuumOpState::InPlace(_)) {
+                let VacuumOpState::InPlace(vacuum_state) =
+                    std::mem::take(&mut state.op_vacuum_state)
+                else {
+                    unreachable!("invalid state, we are inside vacuum op");
+                };
+                if let Err(cleanup_err) =
+                    cleanup_op_vacuum_in_place(&program.connection, vacuum_state)
+                {
+                    tracing::error!("VACUUM cleanup failed after error: {cleanup_err}");
+                }
             }
             Err(err)
         }
@@ -15018,11 +15040,8 @@ pub fn op_vacuum(
 /// temp resources.
 fn cleanup_op_vacuum_in_place(
     connection: &Arc<Connection>,
-    state: &mut ProgramState,
+    vacuum_state: Box<VacuumInPlaceOpContext>,
 ) -> Result<()> {
-    let Some(vacuum_state) = state.op_vacuum_in_place.take() else {
-        return Ok(());
-    };
     vacuum_state.cleanup(connection)
 }
 
@@ -15260,10 +15279,9 @@ mod tests {
         );
 
         let mut state = ProgramState::new(0, 0);
-        state.op_vacuum_into = Some(Box::default());
         state.auto_txn_cleanup = TxnCleanup::RollbackTxn;
 
-        cleanup_op_vacuum_into(&conn, &mut state).unwrap();
+        cleanup_op_vacuum_into(&conn, &mut state, Box::default()).unwrap();
 
         assert!(
             conn.get_auto_commit(),

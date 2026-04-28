@@ -562,6 +562,18 @@ pub(crate) struct DeferredSeekState {
     pub table_cursor_id: CursorID,
 }
 
+pub(crate) enum VacuumOpState {
+    None,
+    IntoFile(Box<VacuumIntoOpContext>),
+    InPlace(Box<VacuumInPlaceOpContext>),
+}
+
+impl Default for VacuumOpState {
+    fn default() -> Self {
+        Self::None
+    }
+}
+
 /// The program state describes the environment in which the program executes.
 pub struct ProgramState {
     pub io_completions: Option<IOCompletions>,
@@ -591,8 +603,7 @@ pub struct ProgramState {
     pub metrics: StatementMetrics,
     /// Current collation sequence set by OP_CollSeq instruction
     current_collation: Option<CollationSeq>,
-    op_vacuum_into: Option<Box<VacuumIntoOpContext>>,
-    op_vacuum_in_place: Option<Box<VacuumInPlaceOpContext>>,
+    op_vacuum_state: VacuumOpState,
     /// State machine for committing view deltas with I/O handling
     view_delta_state: ViewDeltaCommitState,
     /// Marker which tells about auto transaction cleanup necessary for that connection in case of reset
@@ -683,8 +694,7 @@ impl ProgramState {
             metrics: StatementMetrics::new(),
             distinct_key_values: Vec::new(),
             current_collation: None,
-            op_vacuum_into: None,
-            op_vacuum_in_place: None,
+            op_vacuum_state: VacuumOpState::None,
             view_delta_state: ViewDeltaCommitState::NotStarted,
             auto_txn_cleanup: TxnCleanup::None,
             fk_deferred_violations_when_stmt_started: AtomicIsize::new(0),
@@ -800,8 +810,7 @@ impl ProgramState {
         self.seek_state = OpSeekState::Start;
         self.current_collation = None;
         self.commit_state = CommitState::Ready;
-        self.op_vacuum_into = None;
-        self.op_vacuum_in_place = None;
+        self.op_vacuum_state = VacuumOpState::None;
         self.view_delta_state = ViewDeltaCommitState::NotStarted;
         self.auto_txn_cleanup = TxnCleanup::None;
         self.fk_immediate_violations_during_stmt
