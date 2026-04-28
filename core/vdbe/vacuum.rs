@@ -1319,10 +1319,10 @@ impl VacuumInPlaceOpContext {
         let Self {
             db,
             phase,
-            committed_image: _,
+            committed_image,
             cleanup_state,
         } = self;
-        vacuum_in_place_cleanup(connection, db, phase, cleanup_state)
+        vacuum_in_place_cleanup(connection, db, phase, committed_image, cleanup_state)
     }
 }
 
@@ -2234,10 +2234,10 @@ fn vacuum_in_place_step(
                         tracing::error!("VACUUM post-commit checkpoint failed: {err}");
                         source_pager.cleanup_after_checkpoint_failure();
                         cleanup_state.checkpoint_cleanup = CheckpointLockCleanup::None;
-                        let committed_image = committed_image.as_ref().expect(
+                        let committed_image = committed_image.take().expect(
                             "VACUUM checkpoint failure after publish requires captured metadata",
                         );
-                        install_committed_vacuum_image(connection, db, committed_image);
+                        install_committed_vacuum_image(connection, db, &committed_image);
                         if cleanup_state.vacuum_lock_held {
                             if let Some(wal) = source_pager.wal.as_ref() {
                                 wal.release_vacuum_lock();
@@ -2279,6 +2279,7 @@ fn vacuum_in_place_cleanup(
     connection: &Arc<Connection>,
     db: usize,
     mut phase: VacuumInPlacePhase,
+    committed_image: Option<VacuumCommittedImageMeta>,
     mut cleanup_state: VacuumInPlaceCleanupState,
 ) -> Result<()> {
     if let VacuumInPlacePhase::TargetBuild { context, .. } = &mut phase {
@@ -2305,6 +2306,9 @@ fn vacuum_in_place_cleanup(
 
     // No source transaction to undo. Any raw locks are still released below.
     if !cleanup_state.source_tx_open {
+        if let Some(committed_image) = committed_image.as_ref() {
+            install_committed_vacuum_image(connection, db, committed_image);
+        }
         if cleanup_state.vacuum_lock_held {
             let pager = connection
                 .get_pager_from_database_index(&db)
@@ -2692,6 +2696,48 @@ mod tests {
         assert!(conn.schema.read().generated_columns_enabled);
         let shared = db.clone_schema();
         assert_eq!(shared.schema_version, 42);
+        assert!(shared.generated_columns_enabled);
+
+        Ok(())
+    }
+
+    #[test]
+    fn cleanup_after_published_vacuum_installs_committed_image() -> Result<()> {
+        let io: Arc<dyn crate::IO> = Arc::new(crate::MemoryIO::new());
+        let db = Database::open_file(io, ":memory:")?;
+        let conn = db.connect()?;
+
+        conn.with_schema_mut(|schema| {
+            schema.schema_version = 1;
+        });
+        db.with_schema_mut(|schema| {
+            schema.schema_version = 1;
+            Ok(())
+        })?;
+
+        let mut header = DatabaseHeader::default();
+        header.schema_cookie = 43.into();
+        let committed = VacuumCommittedImageMeta {
+            header,
+            schema: Arc::new(Schema {
+                generated_columns_enabled: true,
+                schema_version: 43,
+                ..Default::default()
+            }),
+        };
+
+        vacuum_in_place_cleanup(
+            &conn,
+            crate::MAIN_DB_ID,
+            VacuumInPlacePhase::Checkpoint,
+            Some(committed),
+            VacuumInPlaceCleanupState::default(),
+        )?;
+
+        assert_eq!(conn.schema.read().schema_version, 43);
+        assert!(conn.schema.read().generated_columns_enabled);
+        let shared = db.clone_schema();
+        assert_eq!(shared.schema_version, 43);
         assert!(shared.generated_columns_enabled);
 
         Ok(())

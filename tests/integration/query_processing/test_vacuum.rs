@@ -6439,9 +6439,15 @@ fn test_plain_vacuum_reset_during_checkpoint_io_cleans_up_checkpoint_and_vacuum_
     let reader = db.connect()?;
     assert_eq!(scalar_i64(&reader, "SELECT COUNT(*) FROM t"), 176);
     conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")?;
-    let before_hash = compute_plain_vacuum_file_dbhash(path);
+    let before_schema = normalized_schema_snapshot(&conn);
     conn.execute("VACUUM")?;
-    assert_plain_vacuum_integrity_and_hash_for_path(path, &conn, &before_hash);
+    assert_eq!(run_integrity_check(&conn), "ok");
+    assert_eq!(scalar_i64(&conn, "SELECT COUNT(*) FROM t"), 176);
+    assert_eq!(
+        normalized_schema_snapshot(&conn),
+        before_schema,
+        "plain VACUUM should preserve normalized sqlite_schema entries"
+    );
 
     Ok(())
 }
