@@ -4,6 +4,7 @@ use crate::io::common;
 use crate::io::FileSyncType;
 use crate::sync::{Arc, Mutex};
 use crate::{Clock, Completion, CompletionError, File, LimboError, OpenFlags, Result, IO};
+use std::cell::Cell;
 use std::collections::HashMap;
 use std::io::ErrorKind;
 use std::path::PathBuf;
@@ -13,16 +14,86 @@ use std::sync::OnceLock;
 use tracing::debug;
 use tracing::{instrument, trace, Level};
 use windows_sys::Win32::Foundation::{
-    CloseHandle, GetLastError, ERROR_HANDLE_EOF, FALSE, GENERIC_READ, GENERIC_WRITE, HANDLE,
-    INVALID_HANDLE_VALUE,
+    CloseHandle, GetLastError, ERROR_HANDLE_EOF, ERROR_IO_PENDING, FALSE, GENERIC_READ,
+    GENERIC_WRITE, HANDLE, INVALID_HANDLE_VALUE, TRUE, WAIT_OBJECT_0,
 };
 use windows_sys::Win32::Storage::FileSystem::{
     CreateFileW, FileEndOfFileInfo, FlushFileBuffers, GetFileSizeEx, LockFileEx, ReadFile,
     SetFileInformationByHandle, UnlockFileEx, WriteFile, FILE_ATTRIBUTE_NORMAL,
-    FILE_END_OF_FILE_INFO, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
-    LOCKFILE_EXCLUSIVE_LOCK, LOCKFILE_FAIL_IMMEDIATELY, OPEN_ALWAYS, OPEN_EXISTING,
+    FILE_END_OF_FILE_INFO, FILE_FLAG_OVERLAPPED, FILE_SHARE_DELETE, FILE_SHARE_READ,
+    FILE_SHARE_WRITE, LOCKFILE_EXCLUSIVE_LOCK, LOCKFILE_FAIL_IMMEDIATELY, OPEN_ALWAYS,
+    OPEN_EXISTING,
 };
-use windows_sys::Win32::System::IO::{OVERLAPPED, OVERLAPPED_0, OVERLAPPED_0_0};
+use windows_sys::Win32::System::Threading::{CreateEventW, ResetEvent, WaitForSingleObject, INFINITE};
+use windows_sys::Win32::System::IO::{GetOverlappedResult, OVERLAPPED, OVERLAPPED_0, OVERLAPPED_0_0};
+
+// Per-thread event handle used to synchronously wait for completion of an
+// overlapped ReadFile/WriteFile. Created lazily on first use and reused for
+// the lifetime of the thread (closed by the OS on thread exit). One event
+// per thread (rather than per file or per call) so concurrent I/O on the
+// same WindowsFile from different threads doesn't race on a shared event,
+// and we don't pay CreateEventW cost per page read.
+thread_local! {
+    static IO_EVENT: Cell<HANDLE> = const { Cell::new(ptr::null_mut()) };
+}
+
+/// Run `f` with a thread-local manual-reset Event, freshly reset.
+fn with_io_event<F, R>(f: F) -> Result<R>
+where
+    F: FnOnce(HANDLE) -> Result<R>,
+{
+    IO_EVENT.with(|cell| {
+        let mut event = cell.get();
+        if event.is_null() {
+            // SAFETY: passing null SECURITY_ATTRIBUTES, manual-reset, initial-non-signaled,
+            // null name. CreateEventW returns null on failure.
+            event = unsafe { CreateEventW(ptr::null(), TRUE, FALSE, ptr::null()) };
+            if event.is_null() {
+                return Err(last_os_error("CreateEventW"));
+            }
+            cell.set(event);
+        }
+        // SAFETY: event is a valid manual-reset event we own for this thread.
+        unsafe {
+            ResetEvent(event);
+        }
+        f(event)
+    })
+}
+
+/// Issue a single overlapped `WriteFile` and wait for it to complete on the
+/// thread-local event. Returns the byte count, mirroring the three completion
+/// paths described on `pread`.
+fn write_chunk(handle: HANDLE, event: HANDLE, pos: u64, data: &[u8]) -> Result<usize> {
+    let mut overlapped = overlapped_at(pos);
+    overlapped.hEvent = event;
+    let mut bytes_written: u32 = 0;
+    let issued = unsafe {
+        WriteFile(
+            handle,
+            data.as_ptr(),
+            data.len() as u32,
+            &mut bytes_written,
+            &mut overlapped,
+        )
+    };
+    if issued == FALSE {
+        let error = unsafe { GetLastError() };
+        if error != ERROR_IO_PENDING {
+            return Err(last_os_error("pwrite"));
+        }
+        let wait = unsafe { WaitForSingleObject(event, INFINITE) };
+        if wait != WAIT_OBJECT_0 {
+            return Err(last_os_error("pwrite WaitForSingleObject"));
+        }
+        let ok =
+            unsafe { GetOverlappedResult(handle, &overlapped, &mut bytes_written, FALSE) };
+        if ok == FALSE {
+            return Err(last_os_error("pwrite GetOverlappedResult"));
+        }
+    }
+    Ok(bytes_written as usize)
+}
 
 /// Creates an OVERLAPPED structure with the given file offset.
 /// Used with ReadFile/WriteFile on synchronous (non-OVERLAPPED) handles
@@ -207,6 +278,12 @@ impl IO for WindowsIO {
 
         let shared_mode = FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE;
 
+        // Open with FILE_FLAG_OVERLAPPED so concurrent ReadFile/WriteFile calls
+        // from different threads aren't serialized by the kernel's
+        // FO_SYNCHRONOUS_IO file-object lock. We still wait for each call to
+        // complete before returning (via a per-thread Event), so semantics
+        // remain synchronous from the caller's point of view, but multiple
+        // threads can have I/O in flight at the same time.
         let file_handle = unsafe {
             CreateFileW(
                 wide_path.as_ptr(),
@@ -214,7 +291,7 @@ impl IO for WindowsIO {
                 shared_mode,
                 ptr::null(),
                 creation_disposition,
-                FILE_ATTRIBUTE_NORMAL,
+                FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OVERLAPPED,
                 ptr::null_mut(),
             )
         };
@@ -327,35 +404,61 @@ impl File for WindowsFile {
 
     #[instrument(skip(self, c), level = Level::TRACE)]
     fn pread(&self, pos: u64, c: Completion) -> Result<Completion> {
-        let mut overlapped = overlapped_at(pos);
-        let mut bytes_read: u32 = 0;
+        with_io_event(|event| {
+            let mut overlapped = overlapped_at(pos);
+            overlapped.hEvent = event;
+            let mut bytes_read: u32 = 0;
 
-        let result = unsafe {
-            let r = c.as_read();
-            let buf = r.buf();
-            let slice = buf.as_mut_slice();
-            ReadFile(
-                self.handle,
-                slice.as_mut_ptr(),
-                slice.len() as u32,
-                &mut bytes_read,
-                &mut overlapped,
-            )
-        };
+            let issued = unsafe {
+                let r = c.as_read();
+                let buf = r.buf();
+                let slice = buf.as_mut_slice();
+                ReadFile(
+                    self.handle,
+                    slice.as_mut_ptr(),
+                    slice.len() as u32,
+                    &mut bytes_read,
+                    &mut overlapped,
+                )
+            };
 
-        if result == FALSE {
-            let error = unsafe { GetLastError() };
-            if error == ERROR_HANDLE_EOF {
-                // EOF - report 0 bytes read, same as Unix pread at EOF
-                c.complete(0);
-                return Ok(c);
+            // Three completion paths on an overlapped handle:
+            //  1. ReadFile returns TRUE: synchronous completion. bytes_read
+            //     already holds the count.
+            //  2. ReadFile returns FALSE / ERROR_IO_PENDING: I/O is in flight.
+            //     Wait on the event, then GetOverlappedResult to read the
+            //     final byte count.
+            //  3. ReadFile returns FALSE / ERROR_HANDLE_EOF: synchronous EOF.
+            if issued == FALSE {
+                let error = unsafe { GetLastError() };
+                if error == ERROR_HANDLE_EOF {
+                    c.complete(0);
+                    return Ok(c);
+                }
+                if error != ERROR_IO_PENDING {
+                    return Err(last_os_error("pread"));
+                }
+                let wait = unsafe { WaitForSingleObject(event, INFINITE) };
+                if wait != WAIT_OBJECT_0 {
+                    return Err(last_os_error("pread WaitForSingleObject"));
+                }
+                let ok = unsafe {
+                    GetOverlappedResult(self.handle, &overlapped, &mut bytes_read, FALSE)
+                };
+                if ok == FALSE {
+                    let err = unsafe { GetLastError() };
+                    if err == ERROR_HANDLE_EOF {
+                        c.complete(0);
+                        return Ok(c);
+                    }
+                    return Err(last_os_error("pread GetOverlappedResult"));
+                }
             }
-            return Err(last_os_error("pread"));
-        }
 
-        trace!("pread n: {}", bytes_read);
-        c.complete(bytes_read as i32);
-        Ok(c)
+            trace!("pread n: {}", bytes_read);
+            c.complete(bytes_read as i32);
+            Ok(c)
+        })
     }
 
     #[instrument(skip(self, c, buffer), level = Level::TRACE)]
@@ -367,31 +470,13 @@ impl File for WindowsFile {
 
         while total_written < total_size {
             let remaining = &buf_slice[total_written..];
-            let mut bytes_written: u32 = 0;
-            let mut overlapped = overlapped_at(current_pos);
-
-            let result = unsafe {
-                WriteFile(
-                    self.handle,
-                    remaining.as_ptr(),
-                    remaining.len() as u32,
-                    &mut bytes_written,
-                    &mut overlapped,
-                )
-            };
-
-            if result == FALSE {
-                return Err(last_os_error("pwrite"));
-            }
-
-            let written = bytes_written as usize;
+            let written = with_io_event(|event| write_chunk(self.handle, event, current_pos, remaining))?;
             if written == 0 {
                 return Err(LimboError::CompletionError(CompletionError::IOError(
                     ErrorKind::UnexpectedEof,
                     "pwrite",
                 )));
             }
-
             total_written += written;
             current_pos += written as u64;
             trace!("pwrite iteration: wrote {written}, total {total_written}/{total_size}");
@@ -427,31 +512,15 @@ impl File for WindowsFile {
 
             while buf_written < slice.len() {
                 let remaining = &slice[buf_written..];
-                let mut bytes_written: u32 = 0;
-                let mut overlapped = overlapped_at(current_pos);
-
-                let result = unsafe {
-                    WriteFile(
-                        self.handle,
-                        remaining.as_ptr(),
-                        remaining.len() as u32,
-                        &mut bytes_written,
-                        &mut overlapped,
-                    )
-                };
-
-                if result == FALSE {
-                    return Err(last_os_error("pwritev"));
-                }
-
-                let written = bytes_written as usize;
+                let written = with_io_event(|event| {
+                    write_chunk(self.handle, event, current_pos, remaining)
+                })?;
                 if written == 0 {
                     return Err(LimboError::CompletionError(CompletionError::IOError(
                         ErrorKind::UnexpectedEof,
                         "pwritev",
                     )));
                 }
-
                 buf_written += written;
                 current_pos += written as u64;
                 total_written += written;
