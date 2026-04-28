@@ -1120,7 +1120,7 @@ enum CheckpointLockCleanup {
     #[default]
     None,
     /// VACUUM owns only the raw checkpoint_lock; cleanup releases it
-    /// directly with `Wal::release_checkpoint_lock`.
+    /// directly with `Wal::release_vacuum_checkpoint_lock`.
     ReleaseRaw,
     /// The checkpoint state machine has consumed the raw checkpoint_lock and
     /// may now own read0/write too, so cleanup must abort checkpoint state.
@@ -1170,7 +1170,7 @@ impl Drop for MvccVacuumGuard {
 /// 2. `checkpoint_cleanup = ReleaseRaw` immediately after acquiring the raw
 ///    checkpoint lock in `Preflight`.
 /// 3. `source_tx_open = true` and `vacuum_lock_held = true` together after
-///    `begin_blocking_tx()` succeeds in `BeginSourceTx`.
+///    `begin_vacuum_blocking_tx()` succeeds in `BeginSourceTx`.
 /// 4. `source_tx_open` is cleared immediately after
 ///    `finish_append_frames_commit()` and `end_write_tx()` in `PublishWalCommit`.
 /// 5. `checkpoint_cleanup` transitions from `ReleaseRaw` to
@@ -1198,7 +1198,7 @@ enum VacuumInPlacePhase {
     /// MVCC, WAL-backed pager). Then acquire check_point lock
     Preflight,
     /// Acquire exclusive source access on the source WAL via
-    /// `begin_blocking_tx`: checkpoint_lock is already held from Preflight;
+    /// `begin_vacuum_blocking_tx`: checkpoint_lock is already held from Preflight;
     /// this acquires the exclusive VACUUM lock and installs the source snapshot.
     BeginSourceTx,
     /// Read source database header metadata for the target-build config.
@@ -1694,7 +1694,7 @@ fn vacuum_in_place_step(
                 // ensures a post-commit TRUNCATE checkpoint won't fail due
                 // to a concurrent checkpointer. If the lock is unavailable
                 // we fail fast before doing any expensive work.
-                wal.try_begin_checkpoint_lock()?;
+                wal.try_begin_vacuum_checkpoint_lock()?;
                 cleanup_state.checkpoint_cleanup = CheckpointLockCleanup::ReleaseRaw;
                 *phase = VacuumInPlacePhase::BeginSourceTx;
                 continue;
@@ -1704,7 +1704,7 @@ fn vacuum_in_place_step(
                 // Acquire exclusive WAL access in one shot:
                 // vacuum lock + WAL write lock + connection snapshot.
                 // Checkpoint lock was already acquired in Preflight.
-                match source_pager.begin_blocking_tx()? {
+                match source_pager.begin_vacuum_blocking_tx()? {
                     crate::IOResult::Done(()) => {
                         connection.auto_commit.store(false, Ordering::SeqCst);
                         connection.set_tx_state(crate::connection::TransactionState::Write {
@@ -2192,13 +2192,7 @@ fn vacuum_in_place_step(
                 if cleanup_state.checkpoint_cleanup == CheckpointLockCleanup::ReleaseRaw {
                     cleanup_state.checkpoint_cleanup = CheckpointLockCleanup::AbortCheckpoint;
                 }
-                match source_pager.checkpoint_with_held_checkpoint_lock(
-                    crate::storage::wal::CheckpointMode::Truncate {
-                        upper_bound_inclusive: None,
-                    },
-                    SyncMode::Full,
-                    true,
-                ) {
+                match source_pager.vacuum_checkpoint_with_held_lock(SyncMode::Full, true) {
                     Ok(crate::IOResult::Done(result)) => {
                         cleanup_state.checkpoint_cleanup = CheckpointLockCleanup::None;
                         turso_assert!(
@@ -2286,7 +2280,7 @@ fn vacuum_in_place_cleanup(
                 .get_pager_from_database_index(&db)
                 .expect("VACUUM cleanup requires source pager");
             if let Some(wal) = pager.wal.as_ref() {
-                wal.release_checkpoint_lock();
+                wal.release_vacuum_checkpoint_lock();
             }
         }
         CheckpointLockCleanup::AbortCheckpoint => {

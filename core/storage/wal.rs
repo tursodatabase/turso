@@ -496,16 +496,14 @@ trait WalCoordination: Debug + Send + Sync {
         mode: CheckpointMode,
     ) -> Result<CoordinationCheckpointGuardKind>;
 
-    /// Acquire the remaining checkpoint-related locks for `mode` when the
+    /// Acquire the remaining checkpoint-related locks for VACUUM when the
     /// caller already owns the raw process-local checkpoint lock.
     ///
     /// On error, implementations must release that held checkpoint lock before
     /// returning.
     ///
-    /// Right now used by VACUUM with mode being `TRUNCATE` always.
-    fn acquire_checkpoint_guard_from_held_lock(
+    fn acquire_vacuum_checkpoint_guard_from_held_lock(
         &self,
-        mode: CheckpointMode,
     ) -> Result<CoordinationCheckpointGuardKind>;
 
     /// Release the checkpoint-related locks previously acquired for `guard`.
@@ -715,11 +713,11 @@ pub trait Wal: Debug + Send + Sync {
     /// Try to acquire the checkpoint serialization lock. Returns `Busy` if
     /// another checkpointer or VACUUM already holds it. Used by plain VACUUM
     /// to fail fast if a concurrent checkpoint would block later.
-    fn try_begin_checkpoint_lock(&self) -> Result<()>;
+    fn try_begin_vacuum_checkpoint_lock(&self) -> Result<()>;
 
     /// Release the checkpoint serialization lock acquired by
-    /// `try_begin_checkpoint_lock`.
-    fn release_checkpoint_lock(&self);
+    /// `try_begin_vacuum_checkpoint_lock`.
+    fn release_vacuum_checkpoint_lock(&self);
 
     /// Acquire exclusive WAL access. This will block all new readers and writers. Also,
     /// this routine succeeds only if no other transactions are active. This is used by
@@ -733,19 +731,16 @@ pub trait Wal: Debug + Send + Sync {
     /// is protected by `vacuum_lock`: normal readers hold that lock shared for
     /// their read transaction, so once the exclusive lock is acquired no new
     /// normal reader or writer can enter.
-    fn begin_blocking_tx(&self) -> Result<()>;
+    fn begin_vacuum_blocking_tx(&self) -> Result<()>;
 
     /// Checkpoint using a checkpoint lock already held by the caller. The
     /// method consumes that raw checkpoint-lock ownership: on success the guard
     /// is held by the checkpoint state machine, and on early failure it is
     /// released before returning.
-    fn checkpoint_with_held_checkpoint_lock(
-        &self,
-        pager: &Pager,
-        mode: CheckpointMode,
-    ) -> Result<IOResult<CheckpointResult>>;
+    fn vacuum_checkpoint_with_held_lock(&self, pager: &Pager)
+        -> Result<IOResult<CheckpointResult>>;
 
-    /// Release the exclusive VACUUM lock acquired by `begin_blocking_tx`.
+    /// Release the exclusive VACUUM lock acquired by `begin_vacuum_blocking_tx`.
     /// VACUUM calls this once done, after which new
     /// readers and writers may proceed again.
     fn release_vacuum_lock(&self);
@@ -1022,14 +1017,9 @@ impl WalCoordination for InProcessWalCoordination {
         }
     }
 
-    fn acquire_checkpoint_guard_from_held_lock(
+    fn acquire_vacuum_checkpoint_guard_from_held_lock(
         &self,
-        mode: CheckpointMode,
     ) -> Result<CoordinationCheckpointGuardKind> {
-        turso_assert!(
-            matches!(mode, CheckpointMode::Truncate { .. }),
-            "held checkpoint-lock path currently only supports TRUNCATE checkpoints"
-        );
         if !self.try_read_mark_exclusive(0) {
             self.unlock_checkpoint_lock();
             tracing::trace!("CheckpointGuard: held VACUUM read0 lock failed, returning Busy");
@@ -2011,14 +2001,9 @@ impl WalCoordination for ShmWalCoordination {
         }
     }
 
-    fn acquire_checkpoint_guard_from_held_lock(
+    fn acquire_vacuum_checkpoint_guard_from_held_lock(
         &self,
-        mode: CheckpointMode,
     ) -> Result<CoordinationCheckpointGuardKind> {
-        turso_assert!(
-            matches!(mode, CheckpointMode::Truncate { .. }),
-            "held checkpoint-lock path currently only supports TRUNCATE checkpoints"
-        );
         if !self.authority.try_acquire_checkpoint(self.owner) {
             self.fallback.unlock_checkpoint_lock();
             return Err(LimboError::Busy);
@@ -2833,16 +2818,13 @@ impl CheckpointLocks {
         })
     }
 
-    /// Build checkpoint ownership from a checkpoint_lock that the caller
-    /// already holds. This consumes that raw lock ownership: on success the
+    /// Build checkpoint ownership from a checkpoint_lock that VACUUM already
+    /// holds. This consumes that raw lock ownership: on success the
     /// returned guard owns checkpoint/read0/write as appropriate, and on error
     /// the coordination backend releases the held checkpoint lock before
     /// returning.
-    fn from_held_checkpoint_lock(
-        coordination: Arc<dyn WalCoordination>,
-        mode: CheckpointMode,
-    ) -> Result<Self> {
-        let guard = coordination.acquire_checkpoint_guard_from_held_lock(mode)?;
+    fn from_held_vacuum_checkpoint_lock(coordination: Arc<dyn WalCoordination>) -> Result<Self> {
+        let guard = coordination.acquire_vacuum_checkpoint_guard_from_held_lock()?;
         Ok(match guard {
             CoordinationCheckpointGuardKind::Read0 => Self::Read0 { coordination },
             CoordinationCheckpointGuardKind::Writer => Self::Writer { coordination },
@@ -2934,7 +2916,7 @@ impl WalFile {
     //   upgrade of an existing read transaction, so their guard is still the
     //   read guard owned by the read transaction.
     // - In-place VACUUM installs a write guard and takes the WAL write lock in
-    //   `begin_blocking_tx`. `end_write_tx` releases the WAL write lock, and
+    //   `begin_vacuum_blocking_tx`. `end_write_tx` releases the WAL write lock, and
     //   `release_vacuum_lock` releases the write guard.
     fn install_vacuum_lock_guard(&self, guard: VacuumLockGuard) {
         let mut slot = self.vacuum_lock_guard.write();
@@ -3683,17 +3665,22 @@ impl Wal for WalFile {
             })
     }
 
-    fn checkpoint_with_held_checkpoint_lock(
+    fn vacuum_checkpoint_with_held_lock(
         &self,
         pager: &Pager,
-        mode: CheckpointMode,
     ) -> Result<IOResult<CheckpointResult>> {
-        self.checkpoint_inner(pager, mode, CheckpointLockSource::HeldByCaller)
-            .inspect_err(|e| {
-                tracing::info!("Wal Checkpoint failed: {e}");
-                let _ = self.checkpoint_guard.write().take();
-                self.ongoing_checkpoint.write().state = CheckpointState::Start;
-            })
+        self.checkpoint_inner(
+            pager,
+            CheckpointMode::Truncate {
+                upper_bound_inclusive: None,
+            },
+            CheckpointLockSource::HeldByCaller,
+        )
+        .inspect_err(|e| {
+            tracing::info!("Wal Checkpoint failed: {e}");
+            let _ = self.checkpoint_guard.write().take();
+            self.ongoing_checkpoint.write().state = CheckpointState::Start;
+        })
     }
 
     fn install_durable_backfill_proof(
@@ -3782,7 +3769,7 @@ impl Wal for WalFile {
         self.reset_internal_states();
     }
 
-    fn try_begin_checkpoint_lock(&self) -> Result<()> {
+    fn try_begin_vacuum_checkpoint_lock(&self) -> Result<()> {
         self.with_shared(|shared| {
             if !shared.runtime.checkpoint_lock.write() {
                 return Err(LimboError::Busy);
@@ -3791,20 +3778,20 @@ impl Wal for WalFile {
         })
     }
 
-    fn release_checkpoint_lock(&self) {
+    fn release_vacuum_checkpoint_lock(&self) {
         self.with_shared(|shared| {
             shared.runtime.checkpoint_lock.unlock();
         });
     }
 
-    fn begin_blocking_tx(&self) -> Result<()> {
+    fn begin_vacuum_blocking_tx(&self) -> Result<()> {
         turso_assert!(
             self.max_frame_read_lock_index.load(Ordering::Acquire) == NO_LOCK_HELD,
-            "begin_blocking_tx: must not already hold a read lock"
+            "begin_vacuum_blocking_tx: must not already hold a read lock"
         );
         turso_assert!(
             !self.holds_write_lock(),
-            "begin_blocking_tx: must not already hold the write lock"
+            "begin_vacuum_blocking_tx: must not already hold the write lock"
         );
         turso_assert!(
             self.vacuum_lock_guard.read().is_none(),
@@ -3825,7 +3812,7 @@ impl Wal for WalFile {
                 // acquire the write lock
                 turso_assert!(
                     shared.runtime.read_locks[idx].write(),
-                    "begin_blocking_tx: read lock held after VACUUM lock acquired",
+                    "begin_vacuum_blocking_tx: read lock held after VACUUM lock acquired",
                     { "read_lock_idx": idx }
                 );
                 shared.runtime.read_locks[idx].unlock();
@@ -3837,14 +3824,17 @@ impl Wal for WalFile {
         self.install_connection_state(WalConnectionState::new(snapshot, ReadGuardKind::None));
         turso_assert!(
             self.with_shared(|shared| shared.runtime.write_lock.write()),
-            "begin_blocking_tx: write lock held after VACUUM lock acquired"
+            "begin_vacuum_blocking_tx: write lock held after VACUUM lock acquired"
         );
         if self
             .write_lock_held
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
             .is_err()
         {
-            turso_assert!(false, "begin_blocking_tx: write_lock_held already set");
+            turso_assert!(
+                false,
+                "begin_vacuum_blocking_tx: write_lock_held already set"
+            );
         }
         self.install_vacuum_lock_guard(vacuum_lock_guard);
         Ok(())
@@ -4880,7 +4870,7 @@ impl WalFile {
                     CheckpointLocks::new(self.coordination.clone(), mode)?
                 }
                 CheckpointLockSource::HeldByCaller => {
-                    CheckpointLocks::from_held_checkpoint_lock(self.coordination.clone(), mode)?
+                    CheckpointLocks::from_held_vacuum_checkpoint_lock(self.coordination.clone())?
                 }
             };
             *self.checkpoint_guard.write() = Some(guard);
@@ -8329,8 +8319,8 @@ pub mod test {
         let (shared, vacuum_wal) = make_test_wal();
         let reader_wal = make_test_wal_from_shared(shared);
 
-        vacuum_wal.try_begin_checkpoint_lock().unwrap();
-        vacuum_wal.begin_blocking_tx().unwrap();
+        vacuum_wal.try_begin_vacuum_checkpoint_lock().unwrap();
+        vacuum_wal.begin_vacuum_blocking_tx().unwrap();
 
         assert!(
             matches!(reader_wal.try_begin_read_tx(), TryBeginReadResult::Busy),
@@ -8342,12 +8332,12 @@ pub mod test {
         );
         assert!(
             vacuum_wal.holds_write_lock(),
-            "begin_blocking_tx should acquire the source write lock"
+            "begin_vacuum_blocking_tx should acquire the source write lock"
         );
 
         vacuum_wal.end_write_tx();
         vacuum_wal.release_vacuum_lock();
-        vacuum_wal.release_checkpoint_lock();
+        vacuum_wal.release_vacuum_checkpoint_lock();
 
         assert!(
             matches!(reader_wal.try_begin_read_tx(), TryBeginReadResult::Ok(_)),
@@ -8365,18 +8355,18 @@ pub mod test {
             reader_wal.try_begin_read_tx(),
             TryBeginReadResult::Ok(_)
         ));
-        vacuum_wal.try_begin_checkpoint_lock().unwrap();
+        vacuum_wal.try_begin_vacuum_checkpoint_lock().unwrap();
 
         assert!(
-            matches!(vacuum_wal.begin_blocking_tx(), Err(LimboError::Busy)),
+            matches!(vacuum_wal.begin_vacuum_blocking_tx(), Err(LimboError::Busy)),
             "active reader should prevent VACUUM from acquiring its exclusive lock"
         );
 
         reader_wal.end_read_tx();
-        vacuum_wal.begin_blocking_tx().unwrap();
+        vacuum_wal.begin_vacuum_blocking_tx().unwrap();
         vacuum_wal.end_write_tx();
         vacuum_wal.release_vacuum_lock();
-        vacuum_wal.release_checkpoint_lock();
+        vacuum_wal.release_vacuum_checkpoint_lock();
     }
 
     #[test]
@@ -8423,11 +8413,11 @@ pub mod test {
             shared.read().runtime.read_locks[idx].unlock();
         }
 
-        vacuum_wal.try_begin_checkpoint_lock().unwrap();
-        vacuum_wal.begin_blocking_tx().unwrap();
+        vacuum_wal.try_begin_vacuum_checkpoint_lock().unwrap();
+        vacuum_wal.begin_vacuum_blocking_tx().unwrap();
         vacuum_wal.end_write_tx();
         vacuum_wal.release_vacuum_lock();
-        vacuum_wal.release_checkpoint_lock();
+        vacuum_wal.release_vacuum_checkpoint_lock();
     }
 
     #[test]
@@ -8435,14 +8425,14 @@ pub mod test {
         let (shared, vacuum_wal) = make_test_wal();
         let contender_wal = make_test_wal_from_shared(shared);
 
-        vacuum_wal.try_begin_checkpoint_lock().unwrap();
-        vacuum_wal.begin_blocking_tx().unwrap();
+        vacuum_wal.try_begin_vacuum_checkpoint_lock().unwrap();
+        vacuum_wal.begin_vacuum_blocking_tx().unwrap();
 
         assert!(vacuum_wal.holds_write_lock());
         assert!(!vacuum_wal.holds_read_lock());
         assert!(
             matches!(
-                contender_wal.try_begin_checkpoint_lock(),
+                contender_wal.try_begin_vacuum_checkpoint_lock(),
                 Err(LimboError::Busy)
             ),
             "held checkpoint lock should block other checkpointers"
@@ -8451,13 +8441,9 @@ pub mod test {
         vacuum_wal.end_write_tx();
         assert!(!vacuum_wal.holds_write_lock());
 
-        let guard = CheckpointLocks::from_held_checkpoint_lock(
-            vacuum_wal.coordination.clone(),
-            CheckpointMode::Truncate {
-                upper_bound_inclusive: None,
-            },
-        )
-        .unwrap();
+        let guard =
+            CheckpointLocks::from_held_vacuum_checkpoint_lock(vacuum_wal.coordination.clone())
+                .unwrap();
         assert!(
             matches!(contender_wal.try_begin_read_tx(), TryBeginReadResult::Busy),
             "VACUUM lock should continue blocking readers during final checkpoint"
@@ -8465,10 +8451,10 @@ pub mod test {
 
         drop(guard);
         assert!(
-            contender_wal.try_begin_checkpoint_lock().is_ok(),
+            contender_wal.try_begin_vacuum_checkpoint_lock().is_ok(),
             "checkpoint cleanup should release the checkpoint lock"
         );
-        contender_wal.release_checkpoint_lock();
+        contender_wal.release_vacuum_checkpoint_lock();
         assert!(
             matches!(contender_wal.try_begin_read_tx(), TryBeginReadResult::Busy),
             "checkpoint cleanup must not release the VACUUM lock"

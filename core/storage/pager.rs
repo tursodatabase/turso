@@ -2683,16 +2683,16 @@ impl Pager {
     ///
     /// VACUUM runs on an existing database, so page 1 must already be allocated
     /// and a WAL must be present.
-    pub fn begin_blocking_tx(&self) -> Result<IOResult<()>> {
+    pub fn begin_vacuum_blocking_tx(&self) -> Result<IOResult<()>> {
         if !self.db_initialized() {
             return Err(LimboError::InternalError(
-                "begin_blocking_tx can be done on an initialized database (page 1 must already be allocated)".into(),
+                "begin_vacuum_blocking_tx can be done on an initialized database (page 1 must already be allocated)".into(),
             ));
         }
         let wal = self.wal.as_ref().ok_or_else(|| {
-            LimboError::InternalError("begin_blocking_tx requires WAL mode".into())
+            LimboError::InternalError("begin_vacuum_blocking_tx requires WAL mode".into())
         })?;
-        wal.begin_blocking_tx()?;
+        wal.begin_vacuum_blocking_tx()?;
         // let's be conservative and clear all cache for vacuum
         // todo: clear cache only if we detect that new writes have occurred like `begin_read_tx`
         self.clear_page_cache(false);
@@ -4073,14 +4073,15 @@ impl Pager {
         )
     }
 
-    pub fn checkpoint_with_held_checkpoint_lock(
+    pub fn vacuum_checkpoint_with_held_lock(
         &self,
-        mode: CheckpointMode,
         sync_mode: crate::SyncMode,
         clear_page_cache: bool,
     ) -> Result<IOResult<CheckpointResult>> {
         self.checkpoint_inner(
-            mode,
+            CheckpointMode::Truncate {
+                upper_bound_inclusive: None,
+            },
             sync_mode,
             clear_page_cache,
             CheckpointLockSource::HeldByCaller,
@@ -4125,7 +4126,7 @@ impl Pager {
                     let res = return_if_io!(match checkpoint_lock_source {
                         CheckpointLockSource::Acquire => wal.checkpoint(self, mode),
                         CheckpointLockSource::HeldByCaller => {
-                            wal.checkpoint_with_held_checkpoint_lock(self, mode)
+                            wal.vacuum_checkpoint_with_held_lock(self)
                         }
                     });
                     let mut state = self.checkpoint_state.write();
