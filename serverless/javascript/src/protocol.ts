@@ -104,7 +104,7 @@ export function encodeValue(value: any): Value {
     if (!Number.isFinite(value)) {
       throw new Error("Only finite numbers (not Infinity or NaN) can be passed as arguments");
     }
-    if (Number.isInteger(value)) {
+    if (Number.isSafeInteger(value)) {
       return { type: 'integer', value: value.toString() };
     }
     return { type: 'float', value };
