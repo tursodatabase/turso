@@ -4,6 +4,8 @@
 //! protocol. It is consumed by the serverless driver, sync engine, and the
 //! validating proxy.
 
+pub mod proto;
+
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 

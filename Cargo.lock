@@ -2439,9 +2439,9 @@ checksum = "2304e00983f87ffb38b55b444b5e3b60a884b5d30c0fca7d82fe33449bbe55ea"
 
 [[package]]
 name = "hegeltest"
-version = "0.8.0"
+version = "0.8.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "77b02eb0606bfdcd2da3f24fc98d238bf25cdb1519ff5ded72cd596bb9cea3a7"
+checksum = "972b8522e95c222e1e238ec35de0788b4725c597e5b19d3fe7a7d45bcdd75609"
 dependencies = [
  "ciborium",
  "crc32fast",
@@ -2454,9 +2454,9 @@ dependencies = [
 
 [[package]]
 name = "hegeltest-macros"
-version = "0.8.0"
+version = "0.8.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cfc159840fb3c516b6fa675c74a08a1907919445b2365e9a4116abf14ca71896"
+checksum = "8006777d2a386dd2fcad66a3653e6f801f7864c6d3d1b5894e70bf96bf094c79"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -6825,7 +6825,7 @@ dependencies = [
 
 [[package]]
 name = "turso_hegel_parity"
-version = "0.6.0-pre.22"
+version = "0.6.0-pre.24"
 dependencies = [
  "hegeltest",
  "serde_json",
@@ -6877,10 +6877,11 @@ dependencies = [
 
 [[package]]
 name = "turso_remote_protocol"
-version = "0.6.0-pre.22"
+version = "0.6.0-pre.24"
 dependencies = [
  "base64 0.22.1",
  "bytes",
+ "prost 0.13.5",
  "serde",
  "serde_json",
 ]
@@ -6911,7 +6912,7 @@ dependencies = [
 
 [[package]]
 name = "turso_serverless"
-version = "0.6.0-pre.22"
+version = "0.6.0-pre.24"
 dependencies = [
  "base64 0.22.1",
  "bytes",
@@ -6926,7 +6927,7 @@ dependencies = [
 
 [[package]]
 name = "turso_shared_tests"
-version = "0.6.0-pre.22"
+version = "0.6.0-pre.24"
 dependencies = [
  "tokio",
  "turso",

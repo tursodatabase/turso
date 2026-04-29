@@ -239,6 +239,14 @@ const arbBatchSQL = fc.tuple(
   `CREATE TABLE IF NOT EXISTS t_${tbl} (a INTEGER, b TEXT); INSERT INTO t_${tbl} VALUES (${a}, 'batch')`
 );
 
+// DML ops safe to use inside a transaction (no BEGIN/COMMIT/ROLLBACK).
+const _DML_OP_IDS = new Set([
+  'create', 'insert', 'select', 'select_value',
+  'insert_returning', 'delete_returning', 'update_returning',
+  'select_limit', 'select_count', 'select_expr',
+  'insert_affected', 'delete_affected', 'update_affected',
+]);
+
 // Build op arbitraries dynamically from spec
 function _buildOpArb(opSpec) {
   const id = opSpec.id;
@@ -330,10 +338,28 @@ function _buildOpArb(opSpec) {
     );
   }
 
+  // Transaction workflow: 1-5 DML ops, then commit or rollback
+  if (fields.inner_ops === 'dml_ops' && fields.commit === 'bool') {
+    return fc.tuple(
+      fc.array(arbDmlOp, { minLength: 1, maxLength: 5 }),
+      fc.boolean()
+    ).map(([innerOps, commit]) => ({ kind: id, innerOps, commit }));
+  }
+
+  // Error in transaction: good op, bad SQL, recovery op
+  if (fields.good_op === 'dml_op' && fields.bad_sql === 'error_sql') {
+    return fc.tuple(
+      arbDmlOp,
+      fc.constantFrom(..._SPEC.constants.error_sqls),
+      arbDmlOp,
+    ).map(([goodOp, badSql, recoveryOp]) => ({ kind: id, goodOp, badSql, recoveryOp }));
+  }
+
   // Fallback: constant
   return fc.constant({ kind: id });
 }
 
+const arbDmlOp = fc.oneof(..._SPEC.ops.filter(o => _DML_OP_IDS.has(o.id)).map(_buildOpArb));
 const arbOp = fc.oneof(..._SPEC.ops.map(_buildOpArb));
 
 // ---------------------------------------------------------------------------
@@ -466,6 +492,33 @@ async function executeOpLocal(db, op) {
       return { success: false };
     }
   }
+  if (op.kind === 'transaction_workflow') {
+    try {
+      await executeLocal(db, 'BEGIN');
+      for (const inner of op.innerOps) {
+        const { sql, params } = buildSql(inner);
+        try { await executeLocal(db, sql, params); } catch {}
+      }
+      await executeLocal(db, op.commit ? 'COMMIT' : 'ROLLBACK');
+      return { success: true, columnCount: 0, rowCount: 0 };
+    } catch {
+      return { success: false };
+    }
+  }
+  if (op.kind === 'error_in_transaction') {
+    try {
+      await executeLocal(db, 'BEGIN');
+      const { sql: goodSql, params: goodParams } = buildSql(op.goodOp);
+      try { await executeLocal(db, goodSql, goodParams); } catch {}
+      try { await executeLocal(db, op.badSql); } catch {}
+      const { sql: recSql, params: recParams } = buildSql(op.recoveryOp);
+      try { await executeLocal(db, recSql, recParams); } catch {}
+      await executeLocal(db, 'ROLLBACK');
+      return { success: true, columnCount: 0, rowCount: 0 };
+    } catch {
+      return { success: false };
+    }
+  }
   const { sql, params } = buildSql(op);
   return executeLocal(db, sql, params);
 }
@@ -533,6 +586,33 @@ async function executeOpRemote(conn, op) {
       for (const s of stmts) {
         await executeRemote(conn, s);
       }
+      return { success: true, columnCount: 0, rowCount: 0 };
+    } catch {
+      return { success: false };
+    }
+  }
+  if (op.kind === 'transaction_workflow') {
+    try {
+      await executeRemote(conn, 'BEGIN');
+      for (const inner of op.innerOps) {
+        const { sql, params } = buildSql(inner);
+        try { await executeRemote(conn, sql, params); } catch {}
+      }
+      await executeRemote(conn, op.commit ? 'COMMIT' : 'ROLLBACK');
+      return { success: true, columnCount: 0, rowCount: 0 };
+    } catch {
+      return { success: false };
+    }
+  }
+  if (op.kind === 'error_in_transaction') {
+    try {
+      await executeRemote(conn, 'BEGIN');
+      const { sql: goodSql, params: goodParams } = buildSql(op.goodOp);
+      try { await executeRemote(conn, goodSql, goodParams); } catch {}
+      try { await executeRemote(conn, op.badSql); } catch {}
+      const { sql: recSql, params: recParams } = buildSql(op.recoveryOp);
+      try { await executeRemote(conn, recSql, recParams); } catch {}
+      await executeRemote(conn, 'ROLLBACK');
       return { success: true, columnCount: 0, rowCount: 0 };
     } catch {
       return { success: false };
@@ -623,6 +703,10 @@ function applyPrefix(op, prefix) {
   if (op.kind === 'batch' || op.kind === 'error_check') {
     op.sql = op.sql.replace(re, repl);
   }
+  if (op.innerOps) op.innerOps = op.innerOps.map(o => applyPrefix(o, prefix));
+  if (op.goodOp) op.goodOp = applyPrefix(op.goodOp, prefix);
+  if (op.recoveryOp) op.recoveryOp = applyPrefix(op.recoveryOp, prefix);
+  if (op.badSql) op.badSql = op.badSql.replace(re, repl);
   return op;
 }
 

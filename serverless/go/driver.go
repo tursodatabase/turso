@@ -188,6 +188,8 @@ func (c *remoteConn) ExecContext(ctx context.Context, query string, args []drive
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
+	c.detectTransactionBoundary(query)
+
 	// Check if multi-statement
 	stmts := splitStatements(query)
 	if len(stmts) <= 1 {
@@ -195,6 +197,7 @@ func (c *remoteConn) ExecContext(ctx context.Context, query string, args []drive
 		step := buildBatchStep(query, args, false)
 		entries, err := c.sess.executeCursorCtx(ctx, []batchStep{step})
 		if err != nil {
+			c.onExecError()
 			return nil, err
 		}
 		return extractResult(entries)
@@ -224,9 +227,12 @@ func (c *remoteConn) QueryContext(ctx context.Context, query string, args []driv
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
+	c.detectTransactionBoundary(query)
+
 	step := buildBatchStep(query, args, true)
 	entries, err := c.sess.executeCursorCtx(ctx, []batchStep{step})
 	if err != nil {
+		c.onExecError()
 		return nil, err
 	}
 
@@ -240,6 +246,30 @@ func (c *remoteConn) checkOpen() error {
 		return ErrTursoConnClosed
 	}
 	return nil
+}
+
+// detectTransactionBoundary toggles keepAlive based on SQL content,
+// matching the Rust driver's behavior. Must be called with c.mu held.
+func (c *remoteConn) detectTransactionBoundary(query string) {
+	upper := strings.ToUpper(strings.TrimSpace(query))
+	if strings.HasPrefix(upper, "BEGIN") || strings.HasPrefix(upper, "SAVEPOINT") {
+		c.sess.keepAlive = true
+	} else if strings.HasPrefix(upper, "COMMIT") || strings.HasPrefix(upper, "ROLLBACK") || strings.HasPrefix(upper, "END") || strings.HasPrefix(upper, "RELEASE") {
+		c.sess.keepAlive = false
+	}
+}
+
+// onExecError resets keepAlive when a statement fails outside a transaction.
+// Must be called with c.mu held.
+func (c *remoteConn) onExecError() {
+	if !c.sess.keepAlive {
+		return
+	}
+	// Inside a transaction the baton is still valid — the user can ROLLBACK.
+	// Only reset if the error was on the BEGIN itself (baton is empty).
+	if c.sess.baton == nil {
+		c.sess.keepAlive = false
+	}
 }
 
 // --- driver.Stmt ---

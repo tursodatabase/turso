@@ -47,8 +47,8 @@ jobs:
         ports:
           - 8080:8080
         env:
-          SQLD_MAX_CONCURRENT_REQUESTS: 1024
-          SQLD_MAX_CONCURRENT_CONNECTIONS: 1024
+          SQLD_MAX_CONCURRENT_REQUESTS: 4096
+          SQLD_MAX_CONCURRENT_CONNECTIONS: 4096
           SQLD_DISABLE_INTELLIGENT_THROTTLING: true
 
     env:
@@ -91,44 +91,46 @@ jobs:
       run: cargo build -p turso_sync_sdk_kit
 
     # --- Rust integration tests ---
+    # All remote-hitting Rust tests run single-threaded to avoid
+    # overwhelming the shared libsql-server with concurrent connections.
     - name: Rust integration tests
-      run: cargo test -p turso_serverless --test integration
+      run: cargo test -p turso_serverless --test integration -- --test-threads=1
 
     - name: Rust shared tests
-      run: cargo test -p turso_shared_tests
+      run: cargo test -p turso_shared_tests -- --test-threads=1
 
     - name: Rust parity tests
-      run: cargo test -p turso_hegel_parity --test parity
+      run: cargo test -p turso_hegel_parity --test parity -- --test-threads=1
 
     # --- Go tests ---
     - name: Go serverless integration tests
       working-directory: serverless/go
-      run: go test -v -count=1 ./...
+      run: go test -v -count=1 -parallel=1 ./...
 
     - name: Go shared tests
       working-directory: testing/go-drivers
-      run: go test -v -count=1 ./...
+      run: go test -v -count=1 -parallel=1 ./...
       env:
         LD_LIBRARY_PATH: ${{ github.workspace }}/target/debug
 
     - name: Go parity tests
       working-directory: testing/hegel/go
-      run: go test -v -count=1 ./...
+      run: go test -v -count=1 -parallel=1 ./...
       env:
         LD_LIBRARY_PATH: ${{ github.workspace }}/target/debug
 
     # --- Python tests ---
     - name: Python integration tests
       working-directory: serverless/python
-      run: pytest tests/test_serverless.py tests/test_sqlalchemy_serverless.py -v
+      run: pytest tests/test_serverless.py tests/test_sqlalchemy_serverless.py -v -p no:parallel
 
     - name: Python shared tests
       working-directory: testing/python-drivers
-      run: pytest test_shared_dbapi.py -v
+      run: pytest test_shared_dbapi.py -v -p no:parallel
 
     - name: Python parity tests
       working-directory: testing/hegel/python
-      run: python -m pytest test_parity.py -v
+      run: python -m pytest test_parity.py -v -p no:parallel
 
     # --- JS serverless tests ---
     - name: Install serverless dependencies
@@ -160,19 +162,19 @@ jobs:
         TURSO_DATABASE_URL: http://localhost:9090
 
     - name: Rust integration tests (through proxy)
-      run: cargo test -p turso_serverless --test integration
+      run: cargo test -p turso_serverless --test integration -- --test-threads=1
       env:
         TURSO_DATABASE_URL: http://localhost:9090
 
     - name: Go serverless tests (through proxy)
       working-directory: serverless/go
-      run: go test -v -count=1 ./...
+      run: go test -v -count=1 -parallel=1 ./...
       env:
         TURSO_DATABASE_URL: http://localhost:9090
 
     - name: Python serverless tests (through proxy)
       working-directory: serverless/python
-      run: pytest tests/test_serverless.py -v
+      run: pytest tests/test_serverless.py -v -p no:parallel
       env:
         TURSO_DATABASE_URL: http://localhost:9090
 
