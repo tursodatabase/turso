@@ -3451,131 +3451,122 @@ pub fn resolve_gencol_expr_columns(gencol_expr: &mut Expr, columns: &[Column]) -
 }
 
 pub(crate) fn validate_generated_expr(expr: &Expr) -> Result<()> {
-    crate::stack::trace_remaining("validate_generated_expr:entry");
     use ast::Expr;
-    match expr {
-        Expr::Qualified(_, _) => {
-            bail_parse_error!("the \".\" operator prohibited in generated columns");
-        }
-        Expr::DoublyQualified(_, _, _) => {
-            bail_parse_error!("the \".\" operator prohibited in generated columns");
-        }
+    let mut pending = Vec::with_capacity(8);
+    pending.push(expr);
+    while let Some(expr) = pending.pop() {
+        match expr {
+            Expr::Qualified(_, _) => {
+                bail_parse_error!("the \".\" operator prohibited in generated columns");
+            }
+            Expr::DoublyQualified(_, _, _) => {
+                bail_parse_error!("the \".\" operator prohibited in generated columns");
+            }
 
-        Expr::Variable(_) => {
-            bail_parse_error!("bind parameters prohibited in generated columns");
-        }
+            Expr::Variable(_) => {
+                bail_parse_error!("bind parameters prohibited in generated columns");
+            }
 
-        Expr::Subquery(_) | Expr::InSelect { .. } | Expr::Exists(_) | Expr::InTable { .. } => {
-            bail_parse_error!("subqueries prohibited in generated columns");
-        }
+            Expr::Subquery(_) | Expr::InSelect { .. } | Expr::Exists(_) | Expr::InTable { .. } => {
+                bail_parse_error!("subqueries prohibited in generated columns");
+            }
 
-        Expr::FunctionCall {
-            name,
-            args,
-            filter_over,
-            ..
-        } => {
-            if filter_over.over_clause.is_some() {
-                bail_parse_error!("window functions prohibited in generated columns");
+            Expr::FunctionCall {
+                name,
+                args,
+                filter_over,
+                ..
+            } => {
+                validate_generated_function(name, args.len(), filter_over)?;
+                pending.extend(args.iter().map(|arg| arg.as_ref()));
             }
-            let arg_count = args.len();
-            let Some(func) = Func::resolve_function(name.as_str(), arg_count)? else {
-                return Err(LimboError::ParseError(format!(
-                    "could not resolve function {}",
-                    name.as_str()
-                )));
-            };
-            if matches!(func, Func::Agg(_)) {
-                bail_parse_error!("aggregate functions prohibited in generated columns");
-            }
-            if !func.is_deterministic() {
-                bail_parse_error!("non-deterministic functions prohibited in generated columns");
-            }
-            for arg in args {
-                validate_generated_expr(arg)?;
-            }
-        }
 
-        Expr::FunctionCallStar { name, filter_over } => {
-            if filter_over.over_clause.is_some() {
-                bail_parse_error!("window functions prohibited in generated columns");
+            Expr::FunctionCallStar { name, filter_over } => {
+                validate_generated_function(name, 0, filter_over)?;
             }
-            let Some(func) = Func::resolve_function(name.as_str(), 0)? else {
-                return Err(LimboError::ParseError(format!(
-                    "could not resolve function {}",
-                    name.as_str()
-                )));
-            };
 
-            if matches!(func, Func::Agg(_)) {
-                bail_parse_error!("aggregate functions prohibited in generated columns");
+            Expr::Binary(lhs, _, rhs) => {
+                pending.push(lhs.as_ref());
+                pending.push(rhs.as_ref());
             }
-            if !func.is_deterministic() {
-                bail_parse_error!("non-deterministic functions prohibited in generated columns");
+            Expr::Unary(_, inner) => {
+                pending.push(inner.as_ref());
             }
+            Expr::Parenthesized(exprs) => {
+                pending.extend(exprs.iter().map(|expr| expr.as_ref()));
+            }
+            Expr::Case {
+                base,
+                when_then_pairs,
+                else_expr,
+                ..
+            } => {
+                if let Some(base) = base {
+                    pending.push(base.as_ref());
+                }
+                for (when_expr, then_expr) in when_then_pairs {
+                    pending.push(when_expr.as_ref());
+                    pending.push(then_expr.as_ref());
+                }
+                if let Some(else_expr) = else_expr {
+                    pending.push(else_expr.as_ref());
+                }
+            }
+            Expr::Cast { expr, .. } => {
+                pending.push(expr.as_ref());
+            }
+            Expr::InList { lhs, rhs, .. } => {
+                pending.push(lhs.as_ref());
+                pending.extend(rhs.iter().map(|expr| expr.as_ref()));
+            }
+            Expr::Between {
+                lhs, start, end, ..
+            } => {
+                pending.push(lhs.as_ref());
+                pending.push(start.as_ref());
+                pending.push(end.as_ref());
+            }
+            Expr::Like {
+                lhs, rhs, escape, ..
+            } => {
+                pending.push(lhs.as_ref());
+                pending.push(rhs.as_ref());
+                if let Some(escape) = escape {
+                    pending.push(escape.as_ref());
+                }
+            }
+            Expr::Collate(inner, _) => {
+                pending.push(inner.as_ref());
+            }
+            Expr::IsNull(inner) | Expr::NotNull(inner) => {
+                pending.push(inner.as_ref());
+            }
+            _ => {}
         }
+    }
+    Ok(())
+}
 
-        Expr::Binary(lhs, _, rhs) => {
-            validate_generated_expr(lhs)?;
-            validate_generated_expr(rhs)?;
-        }
-        Expr::Unary(_, inner) => {
-            validate_generated_expr(inner)?;
-        }
-        Expr::Parenthesized(exprs) => {
-            for e in exprs {
-                validate_generated_expr(e)?;
-            }
-        }
-        Expr::Case {
-            base,
-            when_then_pairs,
-            else_expr,
-            ..
-        } => {
-            if let Some(b) = base {
-                validate_generated_expr(b)?;
-            }
-            for (w, t) in when_then_pairs {
-                validate_generated_expr(w)?;
-                validate_generated_expr(t)?;
-            }
-            if let Some(e) = else_expr {
-                validate_generated_expr(e)?;
-            }
-        }
-        Expr::Cast { expr, .. } => {
-            validate_generated_expr(expr)?;
-        }
-        Expr::InList { lhs, rhs, .. } => {
-            validate_generated_expr(lhs)?;
-            for e in rhs {
-                validate_generated_expr(e)?;
-            }
-        }
-        Expr::Between {
-            lhs, start, end, ..
-        } => {
-            validate_generated_expr(lhs)?;
-            validate_generated_expr(start)?;
-            validate_generated_expr(end)?;
-        }
-        Expr::Like {
-            lhs, rhs, escape, ..
-        } => {
-            validate_generated_expr(lhs)?;
-            validate_generated_expr(rhs)?;
-            if let Some(e) = escape {
-                validate_generated_expr(e)?;
-            }
-        }
-        Expr::Collate(inner, _) => {
-            validate_generated_expr(inner)?;
-        }
-        Expr::IsNull(inner) | Expr::NotNull(inner) => {
-            validate_generated_expr(inner)?;
-        }
-        _ => {}
+#[inline(never)]
+fn validate_generated_function(
+    name: &Name,
+    arg_count: usize,
+    filter_over: &ast::FunctionTail,
+) -> Result<()> {
+    if filter_over.over_clause.is_some() {
+        bail_parse_error!("window functions prohibited in generated columns");
+    }
+    let Some(func) = Func::resolve_function(name.as_str(), arg_count)? else {
+        return Err(LimboError::ParseError(format!(
+            "could not resolve function {}",
+            name.as_str()
+        )));
+    };
+    if matches!(func, Func::Agg(_)) {
+        bail_parse_error!("aggregate functions prohibited in generated columns");
+    }
+    if !func.is_deterministic() {
+        bail_parse_error!("non-deterministic functions prohibited in generated columns");
     }
     Ok(())
 }
