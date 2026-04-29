@@ -2001,7 +2001,13 @@ impl Pager {
             turso_assert!(c.succeeded(), "memory IO should complete immediately");
             current_offset += page_size;
             rollback_bitset.insert(page_id);
-            self.upsert_page_in_cache(page_id as usize, page, false)?;
+            // The restored image is the transaction-visible state at the
+            // savepoint, not necessarily durable state. Keep it dirty so cache
+            // eviction cannot drop uncommitted changes that predate the
+            // rolled-back savepoint/statement.
+            page.set_dirty();
+            dirty_pages.insert(page_id);
+            self.upsert_page_in_cache(page_id as usize, page, true)?;
         }
 
         let truncate_completion = subjournal.truncate(journal_start_offset)?;
@@ -2031,6 +2037,14 @@ impl Pager {
                 frame: savepoint.wal_max_frame,
                 checksum: savepoint.wal_checksum,
             }));
+            self.page_cache
+                .write()
+                .delete_clean_pages_after_wal_frame(savepoint.wal_max_frame)
+                .map_err(|e| {
+                    LimboError::InternalError(format!(
+                        "failed to invalidate rolled-back WAL pages: {e:?}"
+                    ))
+                })?;
         }
 
         Ok(())
