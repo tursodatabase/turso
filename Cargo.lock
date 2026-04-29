@@ -6995,6 +6995,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "vacuum-benchmark"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "libc",
+ "rand 0.9.4",
+ "rusqlite",
+ "tokio",
+ "tracing-subscriber",
+ "turso",
+]
+
+[[package]]
 name = "validator"
 version = "0.20.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"

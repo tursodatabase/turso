@@ -144,6 +144,7 @@ pub struct Builder {
     enable_custom_types: bool,
     enable_index_method: bool,
     enable_materialized_views: bool,
+    enable_vacuum: bool,
     enable_generated_columns: bool,
     enable_multiprocess_wal: bool,
     vfs: Option<String>,
@@ -161,6 +162,7 @@ impl Builder {
             enable_custom_types: false,
             enable_index_method: false,
             enable_materialized_views: false,
+            enable_vacuum: false,
             enable_generated_columns: false,
             enable_multiprocess_wal: false,
             vfs: None,
@@ -214,6 +216,11 @@ impl Builder {
         self
     }
 
+    pub fn experimental_vacuum(mut self, enabled: bool) -> Self {
+        self.enable_vacuum = enabled;
+        self
+    }
+
     pub fn experimental_multiprocess_wal(mut self, enabled: bool) -> Self {
         self.enable_multiprocess_wal = enabled;
         self
@@ -246,6 +253,9 @@ impl Builder {
         }
         if self.enable_materialized_views {
             features.push("views");
+        }
+        if self.enable_vacuum {
+            features.push("vacuum");
         }
         if self.enable_generated_columns {
             features.push("generated_columns");

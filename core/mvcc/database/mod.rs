@@ -2395,6 +2395,126 @@ impl<Clock: LogicalClock> MvStore<Clock> {
         }
     }
 
+    /// Acquire MVCC's stop-the-world gate for VACUUM.
+    ///
+    /// This is the same lock used by MVCC checkpointing. All MVCC transactions
+    /// hold it in read mode for their whole lifetime, so acquiring it in write
+    /// mode proves there are no active MVCC transactions and prevents new ones
+    /// from starting until VACUUM releases it.
+    pub(crate) fn try_begin_vacuum_gate(&self) -> Result<()> {
+        if !self.blocking_checkpoint_lock.write() {
+            return Err(LimboError::Busy);
+        }
+        turso_assert!(
+            self.txs.is_empty(),
+            "MVCC vacuum gate acquired while transactions are still active"
+        );
+        Ok(())
+    }
+
+    /// Release the MVCC stop-the-world gate acquired by `try_begin_vacuum_gate`.
+    pub(crate) fn release_vacuum_gate(&self) {
+        self.blocking_checkpoint_lock.unlock();
+    }
+
+    /// VACUUM copies the physical DB image, so any MVCC logical-log bytes must
+    /// be checkpointed first.
+    pub(crate) fn has_uncheckpointed_log(&self) -> Result<bool> {
+        Ok(self.get_logical_log_file().size()? != 0)
+    }
+
+    /// Rebuild MVCC's physical root-page metadata after in-place VACUUM
+    /// reparses the rewritten B-tree image and stages the committed page-1
+    /// header that now owns the physical schema cookie.
+    ///
+    /// The caller must hold the MVCC vacuum gate and pass both the committed
+    /// page-1 header and the schema parsed from the post-VACUUM physical
+    /// database image.
+    pub(crate) fn reset_after_vacuum(&self, header: DatabaseHeader, schema: &Schema) {
+        turso_assert!(
+            self.txs.is_empty(),
+            "MVCC VACUUM reset requires no active transactions"
+        );
+        // see the test `test_mvcc_plain_vacuum_active_write_tx_returns_busy`
+        self.drop_unused_row_versions();
+        let has_table_versions = self
+            .rows
+            .iter()
+            .any(|entry| !entry.value().read().is_empty());
+        turso_assert!(
+            !has_table_versions,
+            "MVCC VACUUM reset requires checkpointed table versions to be cleared"
+        );
+        let has_index_versions = self.index_rows.iter().any(|index_entry| {
+            index_entry
+                .value()
+                .iter()
+                .any(|entry| !entry.value().read().is_empty())
+        });
+        turso_assert!(
+            !has_index_versions,
+            "MVCC VACUUM reset requires checkpointed index versions to be cleared"
+        );
+        turso_assert!(
+            self.finalized_tx_states.is_empty(),
+            "MVCC VACUUM reset requires finalized transaction cache to be cleared"
+        );
+        // Empty buckets can still carry stale index metadata for a rootpage
+        // that VACUUM reuses. Drop them before installing the new root map.
+        let row_keys = self
+            .rows
+            .iter()
+            .map(|entry| entry.key().clone())
+            .collect::<Vec<_>>();
+        for key in row_keys {
+            self.rows.remove(&key);
+        }
+        let index_keys = self
+            .index_rows
+            .iter()
+            .map(|entry| *entry.key())
+            .collect::<Vec<_>>();
+        for key in index_keys {
+            self.index_rows.remove(&key);
+        }
+        let root_pages = schema
+            .tables
+            .values()
+            .filter_map(|table| match table.as_ref() {
+                Table::BTree(btree) => Some(btree.root_page),
+                _ => None,
+            })
+            .chain(
+                schema
+                    .indexes
+                    .values()
+                    .flatten()
+                    .map(|index| index.root_page),
+            )
+            .collect::<Vec<_>>();
+        for &root_page in &root_pages {
+            turso_assert!(
+                root_page > 0,
+                "post-VACUUM B-tree root page must be positive"
+            );
+        }
+        let keys = self
+            .table_id_to_rootpage
+            .iter()
+            .map(|entry| *entry.key())
+            .collect::<Vec<_>>();
+        for key in keys {
+            self.table_id_to_rootpage.remove(&key);
+        }
+        self.table_id_to_last_rowid.write().clear();
+        self.insert_table_id_to_rootpage(SQLITE_SCHEMA_MVCC_TABLE_ID, Some(1));
+        for root_page in root_pages {
+            let table_id = MVTableId::from(-root_page);
+            self.insert_table_id_to_rootpage(table_id, Some(root_page as u64));
+        }
+        self.global_header.write().replace(header);
+    }
+
     /// Creates the `__turso_internal_mvcc_meta` table and seeds it with
     /// `persistent_tx_ts_max` (initialized to 0). This table stores the durable replay
     /// boundary: on recovery, only logical-log frames with `commit_ts > persistent_tx_ts_max`

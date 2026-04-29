@@ -297,6 +297,10 @@ struct BalanceState {
 #[derive(Debug)]
 enum WriteState {
     Start,
+    TransferStart {
+        source: TransferCellSource,
+        restore: TransferRestorePosition,
+    },
     /// Overwrite an existing cell.
     /// In addition to deleting the old cell and writing a new one,
     /// we may also need to clear the old cell's overflow pages
@@ -315,8 +319,42 @@ enum WriteState {
         new_payload: Vec<u8>,
         fill_cell_payload_state: FillCellPayloadState,
     },
+    TransferInsert {
+        page: PageRef,
+        cell_idx: usize,
+        new_payload: Vec<u8>,
+        fill_cell_payload_state: TransferCellPayloadState,
+        source: TransferCellSource,
+        restore: TransferRestorePosition,
+    },
     Balancing,
+    TransferBalancing {
+        restore: TransferRestorePosition,
+    },
+    TransferSeekEnd,
     Finish,
+}
+
+struct TransferCellSource {
+    payload_size: usize,
+    local_payload: Vec<u8>,
+    first_overflow_page: Option<u32>,
+    source_pager: Arc<Pager>,
+}
+
+impl std::fmt::Debug for TransferCellSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TransferCellSource")
+            .field("payload_size", &self.payload_size)
+            .field("local_payload_len", &self.local_payload.len())
+            .field("first_overflow_page", &self.first_overflow_page)
+            .finish_non_exhaustive()
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum TransferRestorePosition {
+    SeekEnd,
 }
 
 struct ReadPayloadOverflow {
@@ -803,6 +841,91 @@ impl BTreeCursor {
         let mut cursor = Self::new(pager, root_page, num_columns);
         cursor.index_info = Some(Arc::new(IndexInfo::new_from_index(index)));
         cursor
+    }
+
+    /// Copy the source cursor's current table payload into this cursor using
+    /// this b-tree's normal cell construction path. Source overflow pointers are
+    /// never reused: `record()` materializes the logical payload bytes, then
+    /// `insert()` allocates any overflow pages needed by the destination b-tree.
+    pub fn transfer_current_table_row_from(
+        &mut self,
+        source: &mut BTreeCursor,
+        rowid: i64,
+    ) -> Result<IOResult<()>> {
+        let source = source.current_table_transfer_source(rowid)?;
+        self.insert_transfer_source(source, Some(rowid))
+    }
+
+    /// Copy the source cursor's current index payload into this cursor using
+    /// this b-tree's normal cell construction path.
+    pub fn transfer_current_index_record_from(
+        &mut self,
+        source: &mut BTreeCursor,
+    ) -> Result<IOResult<()>> {
+        let source = source.current_index_transfer_source()?;
+        self.insert_transfer_source(source, None)
+    }
+
+    fn current_table_transfer_source(&self, rowid: i64) -> Result<TransferCellSource> {
+        let page = self.stack.top_ref();
+        let contents = page.get_contents();
+        let cell_idx = self.stack.current_cell_index();
+        turso_assert_greater_than_or_equal!(cell_idx, 0);
+        let cell = contents.cell_get(cell_idx as usize, self.usable_space())?;
+        let BTreeCell::TableLeafCell(TableLeafCell {
+            rowid: cell_rowid,
+            payload,
+            payload_size,
+            first_overflow_page,
+        }) = cell
+        else {
+            return Err(LimboError::Corrupt(
+                "B-tree transfer expected source table leaf cell".to_string(),
+            ));
+        };
+        if cell_rowid != rowid {
+            return Err(LimboError::Corrupt(format!(
+                "B-tree transfer rowid mismatch: expected {rowid}, found {cell_rowid}"
+            )));
+        }
+        Ok(TransferCellSource {
+            payload_size: usize::try_from(payload_size).map_err(|_| LimboError::IntegerOverflow)?,
+            local_payload: payload.to_vec(),
+            first_overflow_page,
+            source_pager: self.pager.clone(),
+        })
+    }
+
+    fn current_index_transfer_source(&self) -> Result<TransferCellSource> {
+        let page = self.stack.top_ref();
+        let contents = page.get_contents();
+        let cell_idx = self.stack.current_cell_index();
+        turso_assert_greater_than_or_equal!(cell_idx, 0);
+        let cell = contents.cell_get(cell_idx as usize, self.usable_space())?;
+        let (payload, payload_size, first_overflow_page) = match cell {
+            BTreeCell::IndexLeafCell(IndexLeafCell {
+                payload,
+                payload_size,
+                first_overflow_page,
+            })
+            | BTreeCell::IndexInteriorCell(IndexInteriorCell {
+                payload,
+                payload_size,
+                first_overflow_page,
+                ..
+            }) => (payload, payload_size, first_overflow_page),
+            _ => {
+                return Err(LimboError::Corrupt(
+                    "B-tree transfer expected source index cell".to_string(),
+                ));
+            }
+        };
+        Ok(TransferCellSource {
+            payload_size: usize::try_from(payload_size).map_err(|_| LimboError::IntegerOverflow)?,
+            local_payload: payload.to_vec(),
+            first_overflow_page,
+            source_pager: self.pager.clone(),
+        })
     }
 
     /// Resets the cached count state so the next `count()` call re-traverses the
@@ -2456,6 +2579,12 @@ impl BTreeCursor {
                 WriteState::Finish => {
                     break Ok(IOResult::Done(()));
                 }
+                WriteState::TransferStart { .. }
+                | WriteState::TransferInsert { .. }
+                | WriteState::TransferBalancing { .. }
+                | WriteState::TransferSeekEnd => {
+                    panic!("VACUUM transfer write state reached ordinary insert")
+                }
             };
         };
         if matches!(self.state, CursorState::Write(WriteState::Finish)) {
@@ -2466,6 +2595,143 @@ impl BTreeCursor {
         }
         self.state = CursorState::None;
         ret
+    }
+
+    #[cfg_attr(debug_assertions, instrument(skip_all, level = Level::DEBUG))]
+    fn insert_transfer_source(
+        &mut self,
+        source: TransferCellSource,
+        int_key: Option<i64>,
+    ) -> Result<IOResult<()>> {
+        if let CursorState::None = &self.state {
+            self.state = CursorState::Write(WriteState::TransferStart {
+                source,
+                restore: TransferRestorePosition::SeekEnd,
+            });
+        }
+
+        loop {
+            let write_state = {
+                let CursorState::Write(write_state) = &mut self.state else {
+                    panic!("expected write state");
+                };
+                std::mem::replace(write_state, WriteState::Finish)
+            };
+            match write_state {
+                WriteState::TransferStart { source, restore } => {
+                    let page = self.stack.top();
+                    self.pager.add_dirty(&page)?;
+                    let contents = page.get_contents();
+                    turso_assert!(
+                        contents.is_leaf(),
+                        "VACUUM transfer inserts must append into a leaf page"
+                    );
+                    let cell_idx = contents.cell_count() as usize;
+                    self.stack.set_cell_index(cell_idx as i32);
+
+                    let mut payload = std::mem::take(&mut self.reusable_cell_payload);
+                    payload.clear();
+                    const MAX_CELL_HEADER: usize = 22;
+                    let needed_capacity = source.local_payload.len() + MAX_CELL_HEADER;
+                    if payload.capacity() < needed_capacity {
+                        payload.reserve(needed_capacity - payload.capacity());
+                    }
+
+                    self.state = CursorState::Write(WriteState::TransferInsert {
+                        page,
+                        cell_idx,
+                        new_payload: payload,
+                        fill_cell_payload_state: TransferCellPayloadState::Start,
+                        source,
+                        restore,
+                    });
+                    continue;
+                }
+                WriteState::TransferInsert {
+                    page,
+                    cell_idx,
+                    mut new_payload,
+                    mut fill_cell_payload_state,
+                    source,
+                    restore,
+                } => {
+                    if let IOResult::IO(io) = fill_cell_payload_from_transfer_source(
+                        &PinGuard::new(page.clone()),
+                        int_key,
+                        &mut new_payload,
+                        cell_idx,
+                        &source,
+                        self.usable_space(),
+                        self.pager.clone(),
+                        &mut fill_cell_payload_state,
+                    )? {
+                        self.state = CursorState::Write(WriteState::TransferInsert {
+                            page,
+                            cell_idx,
+                            new_payload,
+                            fill_cell_payload_state,
+                            source,
+                            restore,
+                        });
+                        return Ok(IOResult::IO(io));
+                    }
+
+                    {
+                        let contents = page.get_contents();
+                        insert_into_cell(
+                            contents,
+                            new_payload.as_slice(),
+                            cell_idx,
+                            self.usable_space(),
+                        )?;
+                        self.stack.set_cell_index(contents.cell_count() as i32);
+                    }
+
+                    let overflows = !page.get_contents().overflow_cells.is_empty();
+                    self.reusable_cell_payload = std::mem::take(&mut new_payload);
+                    if overflows {
+                        self.state = CursorState::Write(WriteState::TransferBalancing { restore });
+                    } else {
+                        self.state = CursorState::Write(WriteState::Finish);
+                    }
+                    continue;
+                }
+                WriteState::TransferBalancing { restore } => {
+                    if let IOResult::IO(io) = self.balance(None)? {
+                        self.state = CursorState::Write(WriteState::TransferBalancing { restore });
+                        return Ok(IOResult::IO(io));
+                    }
+                    let CursorState::Write(write_state) = &mut self.state else {
+                        panic!("expected write state");
+                    };
+                    match restore {
+                        TransferRestorePosition::SeekEnd => {
+                            *write_state = WriteState::TransferSeekEnd;
+                        }
+                    }
+                    continue;
+                }
+                WriteState::TransferSeekEnd => {
+                    if let IOResult::IO(io) = self.seek_end()? {
+                        self.state = CursorState::Write(WriteState::TransferSeekEnd);
+                        return Ok(IOResult::IO(io));
+                    }
+                    self.state = CursorState::Write(WriteState::Finish);
+                    continue;
+                }
+                WriteState::Finish => {
+                    self.state = CursorState::None;
+                    self.invalidate_count_cache();
+                    if int_key.is_some() {
+                        self.set_has_record(true);
+                    }
+                    return Ok(IOResult::Done(()));
+                }
+                other => {
+                    panic!("unexpected write state for VACUUM transfer insert: {other:?}");
+                }
+            }
+        }
     }
 
     /// Balance a leaf page.
@@ -8073,11 +8339,34 @@ pub enum FillCellPayloadState {
     },
 }
 
+#[derive(Debug)]
+pub enum TransferCellPayloadState {
+    Start,
+    CopyData {
+        state: TransferCopyDataState,
+        remaining_to_copy: usize,
+        source_local_offset: usize,
+        source_overflow_page: Option<PageRef>,
+        source_overflow_next_page: Option<u32>,
+        source_overflow_offset: usize,
+        space_left_on_cur_page: usize,
+        dst_data_offset: usize,
+        current_overflow_page: Option<PinGuard>,
+    },
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Copy)]
 pub enum CopyDataState {
     /// Copy the next chunk of data from the record buffer to the cell payload.
     Copy,
     /// Allocate a new overflow page if we couldn't fit all data to the current page.
+    AllocateOverflowPage,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Copy)]
+pub enum TransferCopyDataState {
+    Copy,
+    ReadSourceOverflowPage,
     AllocateOverflowPage,
 }
 
@@ -8229,6 +8518,225 @@ fn fill_cell_payload(
         }
     };
     result
+}
+
+#[allow(clippy::too_many_arguments)]
+fn fill_cell_payload_from_transfer_source(
+    page: &PinGuard,
+    int_key: Option<i64>,
+    cell_payload: &mut Vec<u8>,
+    _cell_idx: usize,
+    source: &TransferCellSource,
+    usable_space: usize,
+    target_pager: Arc<Pager>,
+    fill_cell_payload_state: &mut TransferCellPayloadState,
+) -> Result<IOResult<()>> {
+    let overflow_page_pointer_size = 4;
+    let overflow_page_data_size = usable_space - overflow_page_pointer_size;
+    let source_overflow_page_data_size =
+        source.source_pager.usable_space() - overflow_page_pointer_size;
+
+    loop {
+        match fill_cell_payload_state {
+            TransferCellPayloadState::Start => {
+                let page_contents = page.get_contents();
+                let page_type = page_contents.page_type()?;
+                turso_assert!(
+                    matches!(page_type, PageType::TableLeaf | PageType::IndexLeaf),
+                    "VACUUM transfer inserts must target leaf pages",
+                    { "page_type": page_type }
+                );
+
+                if matches!(page_type, PageType::TableLeaf) {
+                    let int_key = int_key.unwrap();
+                    write_varint_to_vec(source.payload_size as u64, cell_payload);
+                    write_varint_to_vec(int_key as u64, cell_payload);
+                } else {
+                    write_varint_to_vec(source.payload_size as u64, cell_payload);
+                }
+
+                let max_local = payload_overflow_threshold_max(page_type, usable_space);
+                let min_local = payload_overflow_threshold_min(page_type, usable_space);
+                let (overflows, local_size_if_overflow) =
+                    payload_overflows(source.payload_size, max_local, min_local, usable_space);
+                let local_payload_space = if overflows {
+                    local_size_if_overflow - overflow_page_pointer_size
+                } else {
+                    source.payload_size
+                };
+
+                let cell_non_payload_elems_size = cell_payload.len();
+                cell_payload.resize(
+                    cell_non_payload_elems_size
+                        + local_payload_space
+                        + if overflows {
+                            overflow_page_pointer_size
+                        } else {
+                            0
+                        },
+                    0,
+                );
+
+                *fill_cell_payload_state = TransferCellPayloadState::CopyData {
+                    state: TransferCopyDataState::Copy,
+                    remaining_to_copy: source.payload_size,
+                    source_local_offset: 0,
+                    source_overflow_page: None,
+                    source_overflow_next_page: source.first_overflow_page,
+                    source_overflow_offset: 0,
+                    space_left_on_cur_page: local_payload_space,
+                    dst_data_offset: cell_non_payload_elems_size,
+                    current_overflow_page: None,
+                };
+                continue;
+            }
+            TransferCellPayloadState::CopyData {
+                state,
+                remaining_to_copy,
+                source_local_offset,
+                source_overflow_page,
+                source_overflow_next_page,
+                source_overflow_offset,
+                space_left_on_cur_page,
+                dst_data_offset,
+                current_overflow_page,
+            } => match state {
+                TransferCopyDataState::Copy => {
+                    if *remaining_to_copy == 0 {
+                        return Ok(IOResult::Done(()));
+                    }
+
+                    if *space_left_on_cur_page == 0 {
+                        *state = TransferCopyDataState::AllocateOverflowPage;
+                        continue;
+                    }
+
+                    let (source_chunk, source_chunk_available) =
+                        if *source_local_offset < source.local_payload.len() {
+                            let chunk = &source.local_payload[*source_local_offset..];
+                            (chunk, chunk.len())
+                        } else {
+                            if source_overflow_page.is_none() {
+                                *state = TransferCopyDataState::ReadSourceOverflowPage;
+                                continue;
+                            }
+                            let page = source_overflow_page.as_ref().unwrap();
+                            turso_assert!(page.is_loaded(), "source overflow page is not loaded");
+                            let contents = page.get_contents();
+                            let buf = contents.as_ptr();
+                            let available = source_overflow_page_data_size
+                                .saturating_sub(*source_overflow_offset)
+                                .min(*remaining_to_copy);
+                            let start = overflow_page_pointer_size + *source_overflow_offset;
+                            (&buf[start..start + available], available)
+                        };
+
+                    turso_assert!(
+                        source_chunk_available > 0,
+                        "VACUUM transfer source produced no payload bytes"
+                    );
+                    let amount_to_copy = (*space_left_on_cur_page)
+                        .min(source_chunk_available)
+                        .min(*remaining_to_copy);
+                    let source_chunk = &source_chunk[..amount_to_copy];
+
+                    if let Some(cur_page) = current_overflow_page {
+                        turso_assert!(cur_page.is_loaded(), "current overflow page is not loaded");
+                        turso_assert!(
+                            *dst_data_offset >= overflow_page_pointer_size,
+                            "overflow payload must be written after the next-page pointer"
+                        );
+                        let contents = cur_page.get_contents();
+                        let buf = &mut contents.as_ptr()
+                            [*dst_data_offset..*dst_data_offset + amount_to_copy];
+                        buf.copy_from_slice(source_chunk);
+                    } else {
+                        let buf =
+                            &mut cell_payload[*dst_data_offset..*dst_data_offset + amount_to_copy];
+                        buf.copy_from_slice(source_chunk);
+                    }
+
+                    if *source_local_offset < source.local_payload.len() {
+                        *source_local_offset += amount_to_copy;
+                    } else {
+                        *source_overflow_offset += amount_to_copy;
+                        if *source_overflow_offset == source_overflow_page_data_size
+                            && *remaining_to_copy > amount_to_copy
+                        {
+                            let contents = source_overflow_page.as_ref().unwrap().get_contents();
+                            let next = contents.read_u32_no_offset(0);
+                            turso_assert!(next != 0, "source overflow chain ended early");
+                            *source_overflow_page = None;
+                            *source_overflow_next_page = Some(next);
+                            *source_overflow_offset = 0;
+                        }
+                    }
+
+                    *dst_data_offset += amount_to_copy;
+                    *space_left_on_cur_page -= amount_to_copy;
+                    *remaining_to_copy -= amount_to_copy;
+
+                    if *remaining_to_copy == 0 {
+                        return Ok(IOResult::Done(()));
+                    }
+                    if *space_left_on_cur_page == 0 {
+                        *state = TransferCopyDataState::AllocateOverflowPage;
+                    }
+                }
+                TransferCopyDataState::ReadSourceOverflowPage => {
+                    let next_page = source_overflow_next_page.ok_or_else(|| {
+                        LimboError::Corrupt(
+                            "source overflow chain ended before payload was copied".to_string(),
+                        )
+                    })?;
+                    let (page, c) = btree_read_page(&source.source_pager, next_page as i64)?;
+                    *source_overflow_page = Some(page);
+                    *source_overflow_next_page = None;
+                    *source_overflow_offset = 0;
+                    *state = TransferCopyDataState::Copy;
+                    if let Some(c) = c {
+                        return Ok(IOResult::IO(IOCompletions::Single(c)));
+                    }
+                }
+                TransferCopyDataState::AllocateOverflowPage => {
+                    let new_overflow_page = match target_pager.allocate_overflow_page() {
+                        Ok(IOResult::Done(new_overflow_page)) => PinGuard::new(new_overflow_page),
+                        Ok(IOResult::IO(io_result)) => return Ok(IOResult::IO(io_result)),
+                        Err(e) => {
+                            mark_unlikely();
+                            return Err(e);
+                        }
+                    };
+                    turso_assert!(
+                        new_overflow_page.is_loaded(),
+                        "new overflow page is not loaded"
+                    );
+                    let new_overflow_page_id = new_overflow_page.get().id as u32;
+
+                    if let Some(prev_page) = current_overflow_page {
+                        turso_assert!(
+                            prev_page.is_loaded(),
+                            "previous overflow page is not loaded"
+                        );
+                        let contents = prev_page.get_contents();
+                        let buf = &mut contents.as_ptr()[..overflow_page_pointer_size];
+                        buf.copy_from_slice(&new_overflow_page_id.to_be_bytes());
+                    } else {
+                        let first_overflow_page_ptr_offset =
+                            cell_payload.len() - overflow_page_pointer_size;
+                        let buf = &mut cell_payload[first_overflow_page_ptr_offset
+                            ..first_overflow_page_ptr_offset + overflow_page_pointer_size];
+                        buf.copy_from_slice(&new_overflow_page_id.to_be_bytes());
+                    }
+
+                    *dst_data_offset = overflow_page_pointer_size;
+                    *space_left_on_cur_page = overflow_page_data_size;
+                    *current_overflow_page = Some(new_overflow_page);
+                    *state = TransferCopyDataState::Copy;
+                }
+            },
+        }
+    }
 }
 /// Returns the maximum payload size (X) that can be stored directly on a b-tree page without spilling to overflow pages.
 ///

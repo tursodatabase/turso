@@ -1077,6 +1077,31 @@ pub fn insn_to_row(
                     target_pc.as_debug_int()
                 ),
             ),
+            Insn::RowCell {
+                dest_cursor_id,
+                source_cursor_id,
+                rowid_reg,
+            } => (
+                "RowCell",
+                *dest_cursor_id as i64,
+                *source_cursor_id as i64,
+                rowid_reg.unwrap_or(0) as i64,
+                Value::build_text(""),
+                0,
+                match rowid_reg {
+                    Some(rowid_reg) => format!(
+                        "{} <- {} rowid=r[{}]",
+                        get_table_or_index_name(*dest_cursor_id),
+                        get_table_or_index_name(*source_cursor_id),
+                        rowid_reg
+                    ),
+                    None => format!(
+                        "{} <- {}",
+                        get_table_or_index_name(*dest_cursor_id),
+                        get_table_or_index_name(*source_cursor_id)
+                    ),
+                },
+            ),
             Insn::DeferredSeek {
                 index_cursor_id,
                 table_cursor_id,
@@ -2433,6 +2458,15 @@ pub fn insn_to_row(
             Value::build_text(dest_path.to_string()),
             0,
             format!("schema={schema_name}, dest={dest_path}"),
+        ),
+        Insn::Vacuum { db } => (
+            "Vacuum",
+            *db as i64,
+            0,
+            0,
+            Value::Null,
+            0,
+            format!("db={db}"),
         ),
         Insn::InitCdcVersion { cdc_table_name, version, cdc_mode } => (
             "InitCdcVersion",

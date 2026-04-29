@@ -855,6 +855,17 @@ pub enum Insn {
         cursor_id: CursorID,
         dest: usize,
     },
+    /// Copy the current cell from source_cursor_id into dest_cursor_id.
+    ///
+    /// For table b-trees, rowid_reg must contain the destination rowid. For
+    /// index b-trees, rowid_reg must be None. Unlike SQLite's OP_RowCell, this
+    /// instruction completes the insert directly instead of preparing a cell
+    /// for a following Insert/IdxInsert.
+    RowCell {
+        dest_cursor_id: CursorID,
+        source_cursor_id: CursorID,
+        rowid_reg: Option<usize>,
+    },
 
     /// Read the rowid of the current row.
     RowId {
@@ -1757,6 +1768,13 @@ pub enum Insn {
         dest_path: String,
     },
 
+    /// In-place VACUUM - compact the database (by writing to a temporary location and then copying
+    /// back)
+    Vacuum {
+        /// Database index to vacuum (0 = main)
+        db: usize,
+    },
+
     /// Ensure turso_cdc_version table exists and insert/replace a version row,
     /// then enable CDC on the connection. Runs nested SQL at VDBE execution time
     /// (same pattern as ParseSchema). CDC is enabled after version table operations
@@ -1878,6 +1896,7 @@ impl InsnVariants {
             InsnVariants::String8 => execute::op_string8,
             InsnVariants::Blob => execute::op_blob,
             InsnVariants::RowData => execute::op_row_data,
+            InsnVariants::RowCell => execute::op_row_cell,
             InsnVariants::RowId => execute::op_row_id,
             InsnVariants::IdxRowId => execute::op_idx_row_id,
             InsnVariants::SeekRowid => execute::op_seek_rowid,
@@ -1993,6 +2012,7 @@ impl InsnVariants {
             InsnVariants::HashGraceNextProbe => execute::op_hash_grace_next_probe,
             InsnVariants::HashGraceAdvancePartition => execute::op_hash_grace_advance_partition,
             InsnVariants::VacuumInto => execute::op_vacuum_into,
+            InsnVariants::Vacuum => execute::op_vacuum,
             InsnVariants::InitCdcVersion => execute::op_init_cdc_version,
         }
     }
@@ -2029,6 +2049,7 @@ impl Insn {
             }
             | Self::Insert { .. }
             | Self::Delete { .. }
+            | Self::RowCell { .. }
             | Self::IdxDelete { .. }
             | Self::OpenWrite { .. }
             | Self::CreateBtree { .. }
@@ -2049,7 +2070,8 @@ impl Insn {
             | Self::DropColumn { .. }
             | Self::AddColumn { .. }
             | Self::AlterColumn { .. }
-            | Self::JournalMode { .. } => false,
+            | Self::JournalMode { .. }
+            | Self::Vacuum { .. } => false,
             Self::MaxPgcnt { new_max, .. } => *new_max == 0,
             Self::Program { program, .. } => program.is_readonly(),
             _ => true,

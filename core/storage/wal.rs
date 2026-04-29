@@ -496,6 +496,18 @@ trait WalCoordination: Debug + Send + Sync {
         mode: CheckpointMode,
     ) -> Result<CoordinationCheckpointGuardKind>;
 
+    /// Acquire the remaining checkpoint-related locks for `mode` when the
+    /// caller already owns the raw process-local checkpoint lock.
+    ///
+    /// On error, implementations must release that held checkpoint lock before
+    /// returning.
+    ///
+    /// Right now used by VACUUM with mode being `TRUNCATE` always.
+    fn acquire_checkpoint_guard_from_held_lock(
+        &self,
+        mode: CheckpointMode,
+    ) -> Result<CoordinationCheckpointGuardKind>;
+
     /// Release the checkpoint-related locks previously acquired for `guard`.
     fn release_checkpoint_guard(&self, guard: CoordinationCheckpointGuardKind);
 
@@ -519,6 +531,9 @@ trait WalCoordination: Debug + Send + Sync {
 
     /// Return the WAL file used for durable reads and writes.
     fn wal_file(&self) -> Result<Arc<dyn File>>;
+
+    /// Clone the shared WAL state backing this coordination backend.
+    fn shared_wal_state(&self) -> Arc<RwLock<WalFileShared>>;
 
     /// Report whether the WAL header has already been written and synced.
     fn wal_is_initialized(&self) -> bool;
@@ -588,6 +603,23 @@ pub trait Wal: Debug + Send + Sync {
         frame_id: u64,
         page: PageRef,
         buffer_pool: Arc<BufferPool>,
+    ) -> Result<Completion>;
+
+    /// Read a contiguous run of WAL frames with a single `pread`.
+    /// For each `i`, `pages[i]` receives the decoded page body of frame
+    /// `start_frame + i`. This method is a batched version of `read_frame`.
+    ///
+    /// If `scratch_buf` is `Some`, it is used as the pread destination (must
+    /// have length exactly `(page_size + WAL_FRAME_HEADER_SIZE) * pages.len()`).
+    /// Otherwise a fresh temporary buffer is allocated. VACUUM passes a
+    /// pre-allocated buffer to amortize the ~batch-size allocation across
+    /// batches.
+    fn read_frames_batch(
+        &self,
+        start_frame: u64,
+        pages: &[PageRef],
+        buffer_pool: Arc<BufferPool>,
+        scratch_buf: Option<Arc<Buffer>>,
     ) -> Result<Completion>;
 
     /// Read a raw frame (header included) from the WAL.
@@ -679,6 +711,44 @@ pub trait Wal: Debug + Send + Sync {
         result: &mut CheckpointResult,
         sync_type: FileSyncType,
     ) -> Result<IOResult<()>>;
+
+    /// Try to acquire the checkpoint serialization lock. Returns `Busy` if
+    /// another checkpointer or VACUUM already holds it. Used by plain VACUUM
+    /// to fail fast if a concurrent checkpoint would block later.
+    fn try_begin_checkpoint_lock(&self) -> Result<()>;
+
+    /// Release the checkpoint serialization lock acquired by
+    /// `try_begin_checkpoint_lock`.
+    fn release_checkpoint_lock(&self);
+
+    /// Acquire exclusive WAL access. This will block all new readers and writers. Also,
+    /// this routine succeeds only if no other transactions are active. This is used by
+    /// VACUUM routine.
+    ///
+    ///
+    /// VACUUM: take `vacuum_lock` exclusively, take the WAL write lock, and install
+    /// the source snapshot that VACUUM will copy from.
+    ///
+    /// This does not acquire a physical read-mark lock. The exclusive snapshot
+    /// is protected by `vacuum_lock`: normal readers hold that lock shared for
+    /// their read transaction, so once the exclusive lock is acquired no new
+    /// normal reader or writer can enter.
+    fn begin_blocking_tx(&self) -> Result<()>;
+
+    /// Checkpoint using a checkpoint lock already held by the caller. The
+    /// method consumes that raw checkpoint-lock ownership: on success the guard
+    /// is held by the checkpoint state machine, and on early failure it is
+    /// released before returning.
+    fn checkpoint_with_held_checkpoint_lock(
+        &self,
+        pager: &Pager,
+        mode: CheckpointMode,
+    ) -> Result<IOResult<CheckpointResult>>;
+
+    /// Release the exclusive VACUUM lock acquired by `begin_blocking_tx`.
+    /// VACUUM calls this once done, after which new
+    /// readers and writers may proceed again.
+    fn release_vacuum_lock(&self);
 
     #[cfg(any(test, debug_assertions))]
     fn as_any(&self) -> &dyn std::any::Any;
@@ -952,6 +1022,28 @@ impl WalCoordination for InProcessWalCoordination {
         }
     }
 
+    fn acquire_checkpoint_guard_from_held_lock(
+        &self,
+        mode: CheckpointMode,
+    ) -> Result<CoordinationCheckpointGuardKind> {
+        turso_assert!(
+            matches!(mode, CheckpointMode::Truncate { .. }),
+            "held checkpoint-lock path currently only supports TRUNCATE checkpoints"
+        );
+        if !self.try_read_mark_exclusive(0) {
+            self.unlock_checkpoint_lock();
+            tracing::trace!("CheckpointGuard: held VACUUM read0 lock failed, returning Busy");
+            return Err(LimboError::Busy);
+        }
+        if !self.try_write_lock() {
+            self.unlock_read_mark(0);
+            self.unlock_checkpoint_lock();
+            tracing::trace!("CheckpointGuard: held VACUUM write lock failed, returning Busy");
+            return Err(LimboError::Busy);
+        }
+        Ok(CoordinationCheckpointGuardKind::Writer)
+    }
+
     fn release_checkpoint_guard(&self, guard: CoordinationCheckpointGuardKind) {
         match guard {
             CoordinationCheckpointGuardKind::Writer => {
@@ -1148,6 +1240,10 @@ impl WalCoordination for InProcessWalCoordination {
     #[cfg(test)]
     fn shared_ptr(&self) -> usize {
         Arc::as_ptr(&self.shared) as usize
+    }
+
+    fn shared_wal_state(&self) -> Arc<RwLock<WalFileShared>> {
+        self.shared.clone()
     }
 }
 
@@ -1915,6 +2011,39 @@ impl WalCoordination for ShmWalCoordination {
         }
     }
 
+    fn acquire_checkpoint_guard_from_held_lock(
+        &self,
+        mode: CheckpointMode,
+    ) -> Result<CoordinationCheckpointGuardKind> {
+        turso_assert!(
+            matches!(mode, CheckpointMode::Truncate { .. }),
+            "held checkpoint-lock path currently only supports TRUNCATE checkpoints"
+        );
+        if !self.authority.try_acquire_checkpoint(self.owner) {
+            self.fallback.unlock_checkpoint_lock();
+            return Err(LimboError::Busy);
+        }
+        if !self.authority.try_acquire_writer(self.owner) {
+            self.authority.release_checkpoint(self.owner);
+            self.fallback.unlock_checkpoint_lock();
+            return Err(LimboError::Busy);
+        }
+        if !self.fallback.try_read_mark_exclusive(0) {
+            self.fallback.unlock_checkpoint_lock();
+            self.authority.release_writer(self.owner);
+            self.authority.release_checkpoint(self.owner);
+            return Err(LimboError::Busy);
+        }
+        if !self.fallback.try_write_lock() {
+            self.fallback.unlock_read_mark(0);
+            self.fallback.unlock_checkpoint_lock();
+            self.authority.release_writer(self.owner);
+            self.authority.release_checkpoint(self.owner);
+            return Err(LimboError::Busy);
+        }
+        Ok(CoordinationCheckpointGuardKind::Writer)
+    }
+
     fn release_checkpoint_guard(&self, guard: CoordinationCheckpointGuardKind) {
         match guard {
             CoordinationCheckpointGuardKind::Writer => {
@@ -2025,6 +2154,10 @@ impl WalCoordination for ShmWalCoordination {
 
     fn wal_file(&self) -> Result<Arc<dyn File>> {
         self.fallback.wal_file()
+    }
+
+    fn shared_wal_state(&self) -> Arc<RwLock<WalFileShared>> {
+        self.shared.clone()
     }
 
     fn wal_is_initialized(&self) -> bool {
@@ -2401,6 +2534,10 @@ pub struct WalFile {
 
     /// Manages locks needed for checkpointing
     checkpoint_guard: RwLock<Option<CheckpointLocks>>,
+    /// Manages locks needed for VACUUM. This is very much similar to `checkpoint_guard`
+    /// This lock is to be held by all readers before they can begin. And VACUUM holds it
+    /// exclusively. See `install_vacuum_lock_guard` for its lifecycle.
+    vacuum_lock_guard: RwLock<Option<VacuumLockGuard>>,
 
     io_ctx: RwLock<IOContext>,
 
@@ -2512,6 +2649,12 @@ pub struct WalSharedRuntime {
     /// Slots 1‑4 carry a frame‑number in value and may be shared by many readers. Slot 1 is the
     /// default read lock and is to contain the max_frame in WAL.
     pub read_locks: [TursoRwLock; 5],
+    /// Lock used by in-place VACUUM to keep new read/write transactions out
+    /// while VACUUM is in progress.
+    /// Normal WAL transactions hold this shared for the lifetime of their
+    /// transaction. VACUUM holds it exclusively until its final truncate
+    /// checkpoint has completed.
+    pub vacuum_lock: TursoRwLock,
     /// There is only one write allowed in WAL mode. This lock takes care of ensuring there is only
     /// one used.
     pub write_lock: TursoRwLock,
@@ -2601,6 +2744,56 @@ impl fmt::Debug for WalFileShared {
     }
 }
 
+#[derive(Debug)]
+enum VacuumLockGuard {
+    Read { ptr: Arc<RwLock<WalFileShared>> },
+    Write { ptr: Arc<RwLock<WalFileShared>> },
+}
+
+impl VacuumLockGuard {
+    fn try_read(ptr: Arc<RwLock<WalFileShared>>) -> Option<Self> {
+        let acquired = {
+            let shared = ptr.read();
+            shared.runtime.vacuum_lock.read()
+        };
+        if acquired {
+            Some(Self::Read { ptr })
+        } else {
+            None
+        }
+    }
+
+    fn try_write(ptr: Arc<RwLock<WalFileShared>>) -> Option<Self> {
+        let acquired = {
+            let shared = ptr.read();
+            shared.runtime.vacuum_lock.write()
+        };
+        if acquired {
+            Some(Self::Write { ptr })
+        } else {
+            None
+        }
+    }
+
+    const fn is_read(&self) -> bool {
+        matches!(self, Self::Read { .. })
+    }
+
+    const fn is_write(&self) -> bool {
+        matches!(self, Self::Write { .. })
+    }
+}
+
+impl Drop for VacuumLockGuard {
+    fn drop(&mut self) {
+        match self {
+            Self::Read { ptr } | Self::Write { ptr } => {
+                ptr.read().runtime.vacuum_lock.unlock();
+            }
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 /// To manage and ensure that no locks are leaked during checkpointing in
 /// the case of errors. It is held by the WalFile while checkpoint is ongoing
@@ -2614,6 +2807,12 @@ enum CheckpointLocks {
     },
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CheckpointLockSource {
+    Acquire,
+    HeldByCaller,
+}
+
 /// Database checkpointers takes the following locks, in order:
 /// The exclusive CHECKPOINTER lock.
 /// The exclusive WRITER lock (FULL, RESTART and TRUNCATE only).
@@ -2624,6 +2823,22 @@ enum CheckpointLocks {
 impl CheckpointLocks {
     fn new(coordination: Arc<dyn WalCoordination>, mode: CheckpointMode) -> Result<Self> {
         let guard = coordination.acquire_checkpoint_guard(mode)?;
+        Ok(match guard {
+            CoordinationCheckpointGuardKind::Read0 => Self::Read0 { coordination },
+            CoordinationCheckpointGuardKind::Writer => Self::Writer { coordination },
+        })
+    }
+
+    /// Build checkpoint ownership from a checkpoint_lock that the caller
+    /// already holds. This consumes that raw lock ownership: on success the
+    /// returned guard owns checkpoint/read0/write as appropriate, and on error
+    /// the coordination backend releases the held checkpoint lock before
+    /// returning.
+    fn from_held_checkpoint_lock(
+        coordination: Arc<dyn WalCoordination>,
+        mode: CheckpointMode,
+    ) -> Result<Self> {
+        let guard = coordination.acquire_checkpoint_guard_from_held_lock(mode)?;
         Ok(match guard {
             CoordinationCheckpointGuardKind::Read0 => Self::Read0 { coordination },
             CoordinationCheckpointGuardKind::Writer => Self::Writer { coordination },
@@ -2652,6 +2867,12 @@ enum TryBeginReadResult {
     Retry,
     /// Non-retriable failure while preparing the local WAL view.
     Err(LimboError),
+    /// We could get a lock / source snapshot for readers because WAL is exclusively held by
+    /// other transaction.
+    /// This usually happens during VACUUM when it holds the vacuum lock exclusively.
+    /// Retrying will not help until VACUUM releases; caller should surface Busy
+    /// to the client rather than spin.
+    Busy,
 }
 
 impl WalFile {
@@ -2694,6 +2915,55 @@ impl WalFile {
         snapshot != local_state.snapshot
     }
 
+    fn has_vacuum_read_lock_guard(&self) -> bool {
+        self.vacuum_lock_guard
+            .read()
+            .as_ref()
+            .is_some_and(VacuumLockGuard::is_read)
+    }
+
+    // VACUUM lock guard lifecycle:
+    // - Normal readers install a read guard in `try_begin_read_tx` after the
+    //   read-mark slot is selected; `end_read_tx` releases that guard through
+    //   `release_vacuum_read_lock_guard`.
+    // - Normal writers do not install their own VACUUM guard. They are an
+    //   upgrade of an existing read transaction, so their guard is still the
+    //   read guard owned by the read transaction.
+    // - In-place VACUUM installs a write guard and takes the WAL write lock in
+    //   `begin_blocking_tx`. `end_write_tx` releases the WAL write lock, and
+    //   `release_vacuum_lock` releases the write guard.
+    fn install_vacuum_lock_guard(&self, guard: VacuumLockGuard) {
+        let mut slot = self.vacuum_lock_guard.write();
+        turso_assert!(slot.is_none(), "VACUUM lock guard is already installed");
+        *slot = Some(guard);
+    }
+
+    fn release_vacuum_read_lock_guard(&self) {
+        let guard = {
+            let mut slot = self.vacuum_lock_guard.write();
+            turso_assert!(
+                slot.as_ref().is_some_and(VacuumLockGuard::is_read),
+                "VACUUM read lock guard is not held"
+            );
+            slot.take()
+                .expect("VACUUM read lock guard should be present after kind check")
+        };
+        drop(guard);
+    }
+
+    fn release_vacuum_write_lock_guard(&self) {
+        let guard = {
+            let mut slot = self.vacuum_lock_guard.write();
+            turso_assert!(
+                slot.as_ref().is_some_and(VacuumLockGuard::is_write),
+                "VACUUM write lock guard is not held"
+            );
+            slot.take()
+                .expect("VACUUM write lock guard should be present after kind check")
+        };
+        drop(guard);
+    }
+
     /// Try to begin a read transaction. Returns Retry for transient conditions
     /// that should be retried immediately, Ok for success.
     fn try_begin_read_tx(&self) -> TryBeginReadResult {
@@ -2704,6 +2974,20 @@ impl WalFile {
             "cannot start a new read tx without ending an existing one",
             { "lock_value": self.max_frame_read_lock_index.load(Ordering::Acquire), "expected": NO_LOCK_HELD }
         );
+        turso_assert!(
+            self.vacuum_lock_guard.read().is_none(),
+            "VACUUM lock guard already held"
+        );
+
+        // Before we can start the txn, we must first take read lock on the vacuum. If we cannot,
+        // then vacuum is already in progress. Once we acquire a read lock, this would prevent
+        // vacuum to run till the lock is released.
+        let Some(vacuum_lock_guard) =
+            VacuumLockGuard::try_read(self.coordination.shared_wal_state())
+        else {
+            tracing::debug!("begin_read_tx: VACUUM holds the vacuum lock, returning Busy");
+            return TryBeginReadResult::Busy;
+        };
 
         // Snapshot the shared WAL state. We haven't taken a read lock yet, so we need
         // to validate these values later.
@@ -2745,6 +3029,7 @@ impl WalFile {
         let Some(read_guard) = self.coordination.try_begin_read_tx(shared_snapshot) else {
             return TryBeginReadResult::Retry;
         };
+        self.install_vacuum_lock_guard(vacuum_lock_guard);
         self.install_connection_state(WalConnectionState::new(shared_snapshot, read_guard));
         tracing::debug!(
             "begin_read_tx(min={}, max={}, slot={}, max_frame_in_wal={})",
@@ -2770,6 +3055,7 @@ impl Wal for WalFile {
             match self.try_begin_read_tx() {
                 TryBeginReadResult::Ok(changed) => return Ok(changed),
                 TryBeginReadResult::Err(err) => return Err(err),
+                TryBeginReadResult::Busy => return Err(LimboError::Busy),
                 TryBeginReadResult::Retry => {
                     cnt += 1;
                     if cnt > 100 {
@@ -2808,8 +3094,14 @@ impl Wal for WalFile {
                 .end_read_tx(ReadGuardKind::from_lock_index(slot));
             self.max_frame_read_lock_index
                 .store(NO_LOCK_HELD, Ordering::Release);
+            self.release_vacuum_read_lock_guard();
             tracing::debug!("end_read_tx(slot={slot})");
         } else {
+            // if NO_LOCK_HELD, then we must not have vacuum lock either.
+            turso_assert!(
+                !self.has_vacuum_read_lock_guard(),
+                "vacuum read lock guard held without setting lock slot NO_LOCK_HELD"
+            );
             tracing::debug!("end_read_tx(slot=no_lock)");
         }
     }
@@ -3041,6 +3333,157 @@ impl Wal for WalFile {
     }
 
     #[instrument(skip_all, level = Level::DEBUG)]
+    fn read_frames_batch(
+        &self,
+        start_frame: u64,
+        pages: &[PageRef],
+        buffer_pool: Arc<BufferPool>,
+        scratch_buf: Option<Arc<Buffer>>,
+    ) -> Result<Completion> {
+        turso_assert!(
+            !pages.is_empty(),
+            "read_frames_batch requires at least one page"
+        );
+        let page_size = self.page_size() as usize;
+        turso_assert!(page_size > 0, "WAL page size must be initialized");
+        let frame_size = WAL_FRAME_HEADER_SIZE + page_size;
+        let count = pages.len();
+        let total = frame_size * count;
+        let offset = self.frame_offset(start_frame);
+        if let Some(buf) = &scratch_buf {
+            turso_assert!(
+                buf.len() == total,
+                "read_frames_batch scratch_buf size must match expected pread length",
+                { "buf_len": buf.len(), "expected": total }
+            );
+        }
+
+        // Lock each target page and pre-allocate its destination buffer so the
+        // completion callback only parses headers, decrypts/verifies, and copies.
+        let mut slots: Vec<(PageRef, Arc<Buffer>)> = Vec::with_capacity(count);
+        for page in pages.iter() {
+            #[cfg(debug_assertions)]
+            {
+                turso_assert!(
+                    !page.is_locked(), "read_frames_batch target page must not already be locked",
+                    { "page_id": page.get().id }
+                );
+                turso_assert!(
+                    !page.is_loaded(), "read_frames_batch target page must be an unloaded scratch page",
+                    { "page_id": page.get().id }
+                );
+                turso_assert!(
+                    page.get().buffer.is_none(),
+                    "read_frames_batch target page must not already retain a buffer",
+                    { "page_id": page.get().id }
+                );
+            }
+            page.set_locked();
+            slots.push((page.clone(), Arc::new(buffer_pool.get_page())));
+        }
+
+        let epoch = self.coordination.checkpoint_epoch();
+        let enc_or_csum = self.io_ctx.read().encryption_or_checksum().clone();
+        let raw_buf = scratch_buf.unwrap_or_else(|| Arc::new(Buffer::new_temporary(total)));
+
+        let complete = Box::new(move |res: Result<(Arc<Buffer>, i32), CompletionError>| {
+            let clear_slots_on_err = |slots: &[(PageRef, Arc<Buffer>)]| {
+                for (page, _) in slots {
+                    page.clear_locked();
+                    page.clear_wal_tag();
+                }
+            };
+
+            let Ok((buf, bytes_read)) = res else {
+                tracing::debug!(err = ?res.unwrap_err());
+                clear_slots_on_err(&slots);
+                return None;
+            };
+            if bytes_read != total as i32 {
+                tracing::debug!(
+                    "short read on WAL batch at offset {offset}: expected {total} bytes, got {bytes_read}"
+                );
+                clear_slots_on_err(&slots);
+                return Some(CompletionError::ShortReadWalFrame {
+                    offset,
+                    expected: total,
+                    actual: bytes_read as usize,
+                });
+            }
+            let raw = buf.as_slice();
+            for (i, (page, page_buf)) in slots.iter().enumerate() {
+                let frame_start = i * frame_size;
+                let frame = &raw[frame_start..frame_start + frame_size];
+                let (header, page_body) = sqlite3_ondisk::parse_wal_frame_header(frame);
+                let expected_page_id = page.get().id;
+                if header.page_number as usize != expected_page_id {
+                    mark_unlikely();
+                    tracing::error!(
+                        frame_id = start_frame + i as u64,
+                        expected = expected_page_id,
+                        got = header.page_number,
+                        "WAL batch frame page_no mismatch"
+                    );
+                    clear_slots_on_err(&slots);
+                    return Some(CompletionError::WalFramePageMismatch {
+                        frame_id: start_frame + i as u64,
+                        expected: expected_page_id,
+                        actual: header.page_number,
+                    });
+                }
+
+                let body_slice = page_buf.as_mut_slice();
+                turso_assert!(
+                    body_slice.len() == page_size,
+                    "read_frames_batch buffer size must match WAL page size",
+                    { "buffer_len": body_slice.len(), "page_size": page_size }
+                );
+                body_slice.copy_from_slice(page_body);
+
+                match &enc_or_csum {
+                    EncryptionOrChecksum::Encryption(ctx) => {
+                        match ctx.decrypt_page(body_slice, expected_page_id) {
+                            Ok(decrypted) => body_slice.copy_from_slice(&decrypted),
+                            Err(e) => {
+                                mark_unlikely();
+                                tracing::error!(
+                                    "Failed to decrypt WAL batch frame for page_idx={expected_page_id}: {e}"
+                                );
+                                clear_slots_on_err(&slots);
+                                return Some(CompletionError::DecryptionError {
+                                    page_idx: expected_page_id,
+                                });
+                            }
+                        }
+                    }
+                    EncryptionOrChecksum::Checksum(ctx) => {
+                        if let Err(e) = ctx.verify_checksum(body_slice, expected_page_id) {
+                            mark_unlikely();
+                            tracing::error!(
+                                "Failed to verify checksum for page_id={expected_page_id}: {e}"
+                            );
+                            clear_slots_on_err(&slots);
+                            return Some(e);
+                        }
+                    }
+                    EncryptionOrChecksum::None => {}
+                }
+            }
+
+            for (i, (page, page_buf)) in slots.iter().enumerate() {
+                let page_id = page.get().id;
+                finish_read_page(page_id, page_buf.clone(), page.clone());
+                page.set_wal_tag(start_frame + i as u64, epoch);
+            }
+            None
+        });
+
+        let c = Completion::new_read(raw_buf, complete);
+        let file = self.coordination.wal_file()?;
+        file.pread(offset, c)
+    }
+
+    #[instrument(skip_all, level = Level::DEBUG)]
     // todo(sivukhin): change API to accept Buffer or some other owned type
     // this method involves IO and cross "async" boundary - so juggling with references is bad and dangerous
     fn read_frame_raw(&self, frame_id: u64, frame: &mut [u8]) -> Result<Completion> {
@@ -3228,11 +3671,25 @@ impl Wal for WalFile {
         pager: &Pager,
         mode: CheckpointMode,
     ) -> Result<IOResult<CheckpointResult>> {
-        self.checkpoint_inner(pager, mode).inspect_err(|e| {
-            tracing::info!("Wal Checkpoint failed: {e}");
-            let _ = self.checkpoint_guard.write().take();
-            self.ongoing_checkpoint.write().state = CheckpointState::Start;
-        })
+        self.checkpoint_inner(pager, mode, CheckpointLockSource::Acquire)
+            .inspect_err(|e| {
+                tracing::info!("Wal Checkpoint failed: {e}");
+                let _ = self.checkpoint_guard.write().take();
+                self.ongoing_checkpoint.write().state = CheckpointState::Start;
+            })
+    }
+
+    fn checkpoint_with_held_checkpoint_lock(
+        &self,
+        pager: &Pager,
+        mode: CheckpointMode,
+    ) -> Result<IOResult<CheckpointResult>> {
+        self.checkpoint_inner(pager, mode, CheckpointLockSource::HeldByCaller)
+            .inspect_err(|e| {
+                tracing::info!("Wal Checkpoint failed: {e}");
+                let _ = self.checkpoint_guard.write().take();
+                self.ongoing_checkpoint.write().state = CheckpointState::Start;
+            })
     }
 
     fn install_durable_backfill_proof(
@@ -3319,6 +3776,84 @@ impl Wal for WalFile {
     fn abort_checkpoint(&self) {
         let _ = self.checkpoint_guard.write().take();
         self.reset_internal_states();
+    }
+
+    fn try_begin_checkpoint_lock(&self) -> Result<()> {
+        self.with_shared(|shared| {
+            if !shared.runtime.checkpoint_lock.write() {
+                return Err(LimboError::Busy);
+            }
+            Ok(())
+        })
+    }
+
+    fn release_checkpoint_lock(&self) {
+        self.with_shared(|shared| {
+            shared.runtime.checkpoint_lock.unlock();
+        });
+    }
+
+    fn begin_blocking_tx(&self) -> Result<()> {
+        turso_assert!(
+            self.max_frame_read_lock_index.load(Ordering::Acquire) == NO_LOCK_HELD,
+            "begin_blocking_tx: must not already hold a read lock"
+        );
+        turso_assert!(
+            !self.holds_write_lock(),
+            "begin_blocking_tx: must not already hold the write lock"
+        );
+        turso_assert!(
+            self.vacuum_lock_guard.read().is_none(),
+            "VACUUM lock guard already held"
+        );
+
+        let Some(vacuum_lock_guard) =
+            VacuumLockGuard::try_write(self.coordination.shared_wal_state())
+        else {
+            return Err(LimboError::Busy);
+        };
+
+        // This block is purely an invariant check. The exclusive VACUUM lock can be held
+        // only if we don't have any other active locks.
+        self.with_shared(|shared| {
+            for idx in 0..shared.runtime.read_locks.len() {
+                // iff there are no read locks active, only then we should be able to
+                // acquire the write lock
+                turso_assert!(
+                    shared.runtime.read_locks[idx].write(),
+                    "begin_blocking_tx: read lock held after VACUUM lock acquired",
+                    { "read_lock_idx": idx }
+                );
+                shared.runtime.read_locks[idx].unlock();
+            }
+        });
+
+        // Install connection state with a fresh snapshot.
+        let snapshot = self.load_coordination_snapshot();
+        self.install_connection_state(WalConnectionState::new(snapshot, ReadGuardKind::None));
+        turso_assert!(
+            self.with_shared(|shared| shared.runtime.write_lock.write()),
+            "begin_blocking_tx: write lock held after VACUUM lock acquired"
+        );
+        if self
+            .write_lock_held
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            turso_assert!(false, "begin_blocking_tx: write_lock_held already set");
+        }
+        self.install_vacuum_lock_guard(vacuum_lock_guard);
+        Ok(())
+    }
+
+    fn release_vacuum_lock(&self) {
+        // This drops the stop-the-world gate after VACUUM is one.
+        // Only after this new readers can proceed.
+        turso_assert!(
+            !self.holds_write_lock(),
+            "release_vacuum_lock called while source write lock is still held"
+        );
+        self.release_vacuum_write_lock_guard();
     }
 
     #[instrument(skip_all, level = Level::DEBUG)]
@@ -3435,6 +3970,10 @@ impl Wal for WalFile {
         db_size_on_commit: Option<u32>,
         prev: Option<&PreparedFrames>,
     ) -> Result<PreparedFrames> {
+        turso_assert!(
+            !pages.is_empty(),
+            "prepare_frames requires at least one page"
+        );
         turso_assert!(
             pages.len() <= IOV_MAX,
             "supported up to IOV_MAX pages at once"
@@ -3784,6 +4323,7 @@ impl WalFile {
             checkpoint_seq: AtomicU32::new(0),
             syncing: Arc::new(AtomicBool::new(false)),
             write_lock_held: AtomicBool::new(false),
+            vacuum_lock_guard: RwLock::new(None),
             min_frame: AtomicU64::new(0),
             transaction_count: AtomicU64::new(0),
             max_frame_read_lock_index: AtomicUsize::new(NO_LOCK_HELD),
@@ -3807,6 +4347,15 @@ impl WalFile {
     #[cfg(test)]
     pub(crate) fn coordination_open_mode_name(&self) -> Option<&'static str> {
         self.coordination.open_mode_name()
+    }
+
+    fn with_shared<F, R>(&self, func: F) -> R
+    where
+        F: FnOnce(&WalFileShared) -> R,
+    {
+        let shared = self.coordination.shared_wal_state();
+        let guard = shared.read();
+        func(&guard)
     }
 
     fn page_size(&self) -> u32 {
@@ -3852,6 +4401,7 @@ impl WalFile {
         &self,
         pager: &Pager,
         mode: CheckpointMode,
+        lock_source: CheckpointLockSource,
     ) -> Result<IOResult<CheckpointResult>> {
         loop {
             let state = self.ongoing_checkpoint.read().state.clone();
@@ -3866,6 +4416,13 @@ impl WalFile {
                     let nbackfills = snapshot.nbackfills;
                     tracing::info!("shared_wal: max_frame={max_frame}, nbackfills={nbackfills}");
                     let needs_backfill = max_frame > nbackfills;
+                    if matches!(lock_source, CheckpointLockSource::HeldByCaller) {
+                        turso_assert!(
+                            needs_backfill,
+                            "held checkpoint-lock path requires WAL frames to backfill",
+                            { "max_frame": max_frame, "nbackfills": nbackfills }
+                        );
+                    }
                     if !needs_backfill && !mode.should_restart_log() {
                         // there are no frames to copy over and we don't need to reset
                         // the log so we can return early success.
@@ -3874,7 +4431,7 @@ impl WalFile {
                         )));
                     }
                     // acquire the appropriate exclusive locks depending on the checkpoint mode
-                    self.acquire_proper_checkpoint_guard(mode)?;
+                    self.acquire_proper_checkpoint_guard(mode, lock_source)?;
                     let mut max_frame = self.determine_max_safe_checkpoint_frame();
 
                     if let CheckpointMode::Truncate {
@@ -4291,7 +4848,11 @@ impl WalFile {
         }
     }
 
-    fn acquire_proper_checkpoint_guard(&self, mode: CheckpointMode) -> Result<()> {
+    fn acquire_proper_checkpoint_guard(
+        &self,
+        mode: CheckpointMode,
+        lock_source: CheckpointLockSource,
+    ) -> Result<()> {
         let needs_new_guard = {
             let guard = self.checkpoint_guard.read();
             !matches!(
@@ -4310,7 +4871,14 @@ impl WalFile {
             if self.checkpoint_guard.read().is_some() {
                 let _ = self.checkpoint_guard.write().take();
             }
-            let guard = CheckpointLocks::new(self.coordination.clone(), mode)?;
+            let guard = match lock_source {
+                CheckpointLockSource::Acquire => {
+                    CheckpointLocks::new(self.coordination.clone(), mode)?
+                }
+                CheckpointLockSource::HeldByCaller => {
+                    CheckpointLocks::from_held_checkpoint_lock(self.coordination.clone(), mode)?
+                }
+            };
             *self.checkpoint_guard.write() = Some(guard);
         }
         Ok(())
@@ -4743,6 +5311,7 @@ impl WalFileShared {
                 frame_cache: Arc::new(SpinLock::new(FxHashMap::default())),
                 file: Some(file),
                 read_locks,
+                vacuum_lock: TursoRwLock::new(),
                 write_lock: TursoRwLock::new(),
                 checkpoint_lock: TursoRwLock::new(),
                 epoch: AtomicU32::new(snapshot.checkpoint_epoch),
@@ -4810,6 +5379,7 @@ impl WalFileShared {
                 frame_cache: Arc::new(SpinLock::new(FxHashMap::default())),
                 file: None,
                 read_locks,
+                vacuum_lock: TursoRwLock::new(),
                 write_lock: TursoRwLock::new(),
                 checkpoint_lock: TursoRwLock::new(),
                 epoch: AtomicU32::new(0),
@@ -4850,6 +5420,7 @@ impl WalFileShared {
                 frame_cache: Arc::new(SpinLock::new(FxHashMap::default())),
                 file: Some(file),
                 read_locks,
+                vacuum_lock: TursoRwLock::new(),
                 write_lock: TursoRwLock::new(),
                 checkpoint_lock: TursoRwLock::new(),
                 epoch: AtomicU32::new(0),
@@ -4914,8 +5485,8 @@ pub mod test {
         AuthoritySnapshotValidation, ShmWalCoordination,
     };
     use super::{
-        InProcessWalCoordination, ReadGuardKind, Wal, WalCommitState, WalConnectionState,
-        WalCoordination, WalFile, WalSnapshot,
+        CheckpointLocks, InProcessWalCoordination, ReadGuardKind, TryBeginReadResult, Wal,
+        WalCommitState, WalConnectionState, WalCoordination, WalFile, WalSnapshot, NO_LOCK_HELD,
     };
     #[cfg(host_shared_wal)]
     use crate::storage::shared_wal_coordination::{
@@ -4924,16 +5495,18 @@ pub mod test {
     use crate::sync::{atomic::Ordering, Arc};
     use crate::sync::{Mutex, RwLock};
     use crate::{
+        io::FileSyncType,
         storage::{
             buffer_pool::BufferPool,
             database::{DatabaseFile, DatabaseStorage},
+            pager::{allocate_new_page, PageRef},
             sqlite3_ondisk::{self, PageSize, WAL_HEADER_SIZE},
             wal::READMARK_NOT_USED,
         },
         types::IOResult,
         util::IOExt,
-        Buffer, CheckpointMode, CheckpointResult, Completion, Connection, Database, File,
-        LimboError, PlatformIO, SyncMode, WalFileShared, IO,
+        Buffer, CheckpointMode, CheckpointResult, Completion, CompletionError, Connection,
+        Database, File, LimboError, MemoryIO, OpenFlags, PlatformIO, SyncMode, WalFileShared, IO,
     };
     use std::num::NonZeroUsize;
     #[cfg(unix)]
@@ -5218,6 +5791,262 @@ pub mod test {
             Arc::new(InProcessWalCoordination::new(shared.clone()));
         let wal = WalFile::new_with_coordination(io, coordination, ((0, 0), 0), buffer_pool);
         (shared, wal)
+    }
+
+    fn make_test_wal_from_shared(shared: Arc<RwLock<WalFileShared>>) -> WalFile {
+        let io: Arc<dyn IO> = Arc::new(PlatformIO::new().unwrap());
+        let buffer_pool = BufferPool::begin_init(&io, BufferPool::TEST_ARENA_SIZE);
+        let snapshot = shared.read().last_checksum_and_max_frame();
+        WalFile::new(io, shared, snapshot, buffer_pool)
+    }
+
+    fn make_initialized_memory_wal(page_size: u32) -> (Arc<dyn IO>, Arc<BufferPool>, WalFile) {
+        let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+        let buffer_pool = BufferPool::begin_init(&io, BufferPool::TEST_ARENA_SIZE);
+        buffer_pool
+            .finalize_with_page_size(page_size as usize)
+            .unwrap();
+        let file = io
+            .open_file("direct-batch-read.db-wal", OpenFlags::Create, false)
+            .unwrap();
+        let shared = WalFileShared::new_shared(file).unwrap();
+        let wal = WalFile::new(io.clone(), shared, ((0, 0), 0), buffer_pool.clone());
+        let page_size = PageSize::new(page_size).unwrap();
+
+        if let Some(c) = wal.prepare_wal_start(page_size).unwrap() {
+            io.wait_for_completion(c).unwrap();
+        }
+        let c = wal.prepare_wal_finish(FileSyncType::Fsync).unwrap();
+        io.wait_for_completion(c).unwrap();
+
+        (io, buffer_pool, wal)
+    }
+
+    fn page_with_pattern(page_id: i64, seed: u8, buffer_pool: &Arc<BufferPool>) -> PageRef {
+        let page = allocate_new_page(page_id, buffer_pool);
+        for (idx, byte) in page.get_contents().as_ptr().iter_mut().enumerate() {
+            *byte = seed.wrapping_add(idx as u8).wrapping_add(page_id as u8);
+        }
+        page
+    }
+
+    fn append_test_pages(
+        io: &Arc<dyn IO>,
+        wal: &WalFile,
+        page_size: u32,
+        pages: &[PageRef],
+    ) -> Vec<Vec<u8>> {
+        let prepared = wal
+            .prepare_frames(pages, PageSize::new(page_size).unwrap(), Some(99), None)
+            .unwrap();
+        let expected = pages
+            .iter()
+            .map(|page| page.get_contents().as_ptr().to_vec())
+            .collect::<Vec<_>>();
+
+        let file = wal.wal_file().unwrap();
+        let c = file
+            .pwritev(
+                prepared.offset,
+                prepared.bufs.clone(),
+                Completion::new_write(|_| {}),
+            )
+            .unwrap();
+        io.wait_for_completion(c).unwrap();
+        wal.commit_prepared_frames(&[prepared]);
+        wal.finish_append_frames_commit().unwrap();
+        expected
+    }
+
+    fn wait_for_completion_error(io: &Arc<dyn IO>, completion: Completion) -> CompletionError {
+        match io.wait_for_completion(completion) {
+            Err(LimboError::CompletionError(err)) => err,
+            other => panic!("expected completion error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn read_frames_batch_reads_contiguous_wal_frames_directly() {
+        let page_size = 512;
+        let (io, buffer_pool, wal) = make_initialized_memory_wal(page_size);
+        let source_pages = vec![
+            page_with_pattern(2, 0x10, &buffer_pool),
+            page_with_pattern(3, 0x20, &buffer_pool),
+            page_with_pattern(4, 0x30, &buffer_pool),
+            page_with_pattern(5, 0x40, &buffer_pool),
+        ];
+        let expected = append_test_pages(&io, &wal, page_size, &source_pages);
+
+        let target_pages = vec![
+            Arc::new(crate::Page::new(2)),
+            Arc::new(crate::Page::new(3)),
+            Arc::new(crate::Page::new(4)),
+            Arc::new(crate::Page::new(5)),
+        ];
+        let c = wal
+            .read_frames_batch(1, &target_pages, buffer_pool, None)
+            .unwrap();
+        io.wait_for_completion(c).unwrap();
+
+        for (idx, page) in target_pages.iter().enumerate() {
+            assert!(page.is_loaded(), "page {} should be loaded", page.get().id);
+            assert!(!page.is_locked(), "page {} lock leaked", page.get().id);
+            assert_eq!(page.wal_tag_pair(), ((idx + 1) as u64, 0));
+            assert_eq!(page.get_contents().as_ptr(), expected[idx].as_slice());
+        }
+    }
+
+    #[test]
+    fn read_frames_batch_can_start_from_middle_frame() {
+        let page_size = 512;
+        let (io, buffer_pool, wal) = make_initialized_memory_wal(page_size);
+        let source_pages = vec![
+            page_with_pattern(10, 0x01, &buffer_pool),
+            page_with_pattern(11, 0x02, &buffer_pool),
+            page_with_pattern(12, 0x03, &buffer_pool),
+            page_with_pattern(13, 0x04, &buffer_pool),
+        ];
+        let expected = append_test_pages(&io, &wal, page_size, &source_pages);
+
+        let target_pages = vec![
+            Arc::new(crate::Page::new(11)),
+            Arc::new(crate::Page::new(12)),
+            Arc::new(crate::Page::new(13)),
+        ];
+        let c = wal
+            .read_frames_batch(2, &target_pages, buffer_pool, None)
+            .unwrap();
+        io.wait_for_completion(c).unwrap();
+
+        for (idx, page) in target_pages.iter().enumerate() {
+            assert!(page.is_loaded(), "page {} should be loaded", page.get().id);
+            assert!(!page.is_locked(), "page {} lock leaked", page.get().id);
+            assert_eq!(page.wal_tag_pair(), ((idx + 2) as u64, 0));
+            assert_eq!(page.get_contents().as_ptr(), expected[idx + 1].as_slice());
+        }
+    }
+
+    #[test]
+    fn read_frames_batch_follows_physical_frame_order_not_page_id_order() {
+        let page_size = 512;
+        let (io, buffer_pool, wal) = make_initialized_memory_wal(page_size);
+        let source_pages = vec![
+            page_with_pattern(7, 0x71, &buffer_pool),
+            page_with_pattern(2, 0x22, &buffer_pool),
+            page_with_pattern(5, 0x55, &buffer_pool),
+            page_with_pattern(9, 0x99, &buffer_pool),
+        ];
+        let expected = append_test_pages(&io, &wal, page_size, &source_pages);
+
+        let target_pages = vec![
+            Arc::new(crate::Page::new(7)),
+            Arc::new(crate::Page::new(2)),
+            Arc::new(crate::Page::new(5)),
+            Arc::new(crate::Page::new(9)),
+        ];
+        let c = wal
+            .read_frames_batch(1, &target_pages, buffer_pool, None)
+            .unwrap();
+        io.wait_for_completion(c).unwrap();
+
+        for (idx, page) in target_pages.iter().enumerate() {
+            assert_eq!(
+                page.get_contents().as_ptr(),
+                expected[idx].as_slice(),
+                "frame-order read should preserve page {} contents",
+                page.get().id
+            );
+            assert_eq!(page.wal_tag_pair(), ((idx + 1) as u64, 0));
+        }
+    }
+
+    #[test]
+    fn read_frames_batch_short_read_errors_and_clears_page_locks() {
+        let page_size = 512;
+        let (io, buffer_pool, wal) = make_initialized_memory_wal(page_size);
+        let source_pages = vec![
+            page_with_pattern(20, 0x20, &buffer_pool),
+            page_with_pattern(21, 0x21, &buffer_pool),
+        ];
+        append_test_pages(&io, &wal, page_size, &source_pages);
+
+        let target_pages = vec![
+            Arc::new(crate::Page::new(20)),
+            Arc::new(crate::Page::new(21)),
+            Arc::new(crate::Page::new(22)),
+        ];
+        let c = wal
+            .read_frames_batch(1, &target_pages, buffer_pool, None)
+            .unwrap();
+        let err = wait_for_completion_error(&io, c);
+
+        assert!(
+            matches!(err, CompletionError::ShortReadWalFrame { .. }),
+            "unexpected error: {err:?}"
+        );
+        for page in &target_pages {
+            assert!(!page.is_locked(), "page {} lock leaked", page.get().id);
+            assert!(
+                !page.is_loaded(),
+                "page {} should not be loaded",
+                page.get().id
+            );
+            assert!(
+                !page.has_wal_tag(),
+                "page {} should not be tagged",
+                page.get().id
+            );
+        }
+    }
+
+    #[test]
+    fn read_frames_batch_page_number_mismatch_returns_error_not_panic() {
+        let page_size = 512;
+        let (io, buffer_pool, wal) = make_initialized_memory_wal(page_size);
+        let source_pages = vec![
+            page_with_pattern(30, 0x30, &buffer_pool),
+            page_with_pattern(31, 0x31, &buffer_pool),
+        ];
+        append_test_pages(&io, &wal, page_size, &source_pages);
+
+        let target_pages = vec![
+            Arc::new(crate::Page::new(30)),
+            Arc::new(crate::Page::new(99)),
+        ];
+        let c = wal
+            .read_frames_batch(1, &target_pages, buffer_pool, None)
+            .unwrap();
+        let err = wait_for_completion_error(&io, c);
+
+        assert!(
+            matches!(
+                err,
+                CompletionError::WalFramePageMismatch {
+                    frame_id: 2,
+                    expected: 99,
+                    actual: 31
+                }
+            ),
+            "unexpected error: {err:?}"
+        );
+        for page in &target_pages {
+            assert!(!page.is_locked(), "page {} lock leaked", page.get().id);
+            assert!(
+                !page.is_loaded(),
+                "page {} should not be loaded",
+                page.get().id
+            );
+            assert!(
+                !page.has_wal_tag(),
+                "page {} should not be tagged",
+                page.get().id
+            );
+            assert!(
+                page.get().buffer.is_none(),
+                "page {} should not retain a buffer",
+                page.get().id
+            );
+        }
     }
 
     fn set_shared_snapshot(shared: &Arc<RwLock<WalFileShared>>, snapshot: WalSnapshot) {
@@ -7489,6 +8318,164 @@ pub mod test {
         assert!(coordination
             .prepare_wal_header(io.as_ref(), PageSize::new(4096).unwrap())
             .is_none());
+    }
+
+    #[test]
+    fn test_vacuum_lock_blocks_new_read_transactions_until_release() {
+        let (shared, vacuum_wal) = make_test_wal();
+        let reader_wal = make_test_wal_from_shared(shared);
+
+        vacuum_wal.try_begin_checkpoint_lock().unwrap();
+        vacuum_wal.begin_blocking_tx().unwrap();
+
+        assert!(
+            matches!(reader_wal.try_begin_read_tx(), TryBeginReadResult::Busy),
+            "VACUUM lock should block new WAL readers before they take a read-mark slot"
+        );
+        assert!(
+            !vacuum_wal.holds_read_lock(),
+            "exclusive VACUUM snapshot must not masquerade as a read-mark lock"
+        );
+        assert!(
+            vacuum_wal.holds_write_lock(),
+            "begin_blocking_tx should acquire the source write lock"
+        );
+
+        vacuum_wal.end_write_tx();
+        vacuum_wal.release_vacuum_lock();
+        vacuum_wal.release_checkpoint_lock();
+
+        assert!(
+            matches!(reader_wal.try_begin_read_tx(), TryBeginReadResult::Ok(_)),
+            "reader should start after VACUUM releases the lock"
+        );
+        reader_wal.end_read_tx();
+    }
+
+    #[test]
+    fn test_active_reader_blocks_vacuum_exclusive_tx() {
+        let (shared, reader_wal) = make_test_wal();
+        let vacuum_wal = make_test_wal_from_shared(shared);
+
+        assert!(matches!(
+            reader_wal.try_begin_read_tx(),
+            TryBeginReadResult::Ok(_)
+        ));
+        vacuum_wal.try_begin_checkpoint_lock().unwrap();
+
+        assert!(
+            matches!(vacuum_wal.begin_blocking_tx(), Err(LimboError::Busy)),
+            "active reader should prevent VACUUM from acquiring its exclusive lock"
+        );
+
+        reader_wal.end_read_tx();
+        vacuum_wal.begin_blocking_tx().unwrap();
+        vacuum_wal.end_write_tx();
+        vacuum_wal.release_vacuum_lock();
+        vacuum_wal.release_checkpoint_lock();
+    }
+
+    #[test]
+    fn test_read_retry_does_not_leak_vacuum_guard_or_block_vacuum() {
+        let (shared, _) = make_test_wal();
+        let retry_reader = make_test_wal_from_shared(shared.clone());
+        let vacuum_wal = make_test_wal_from_shared(shared.clone());
+
+        set_shared_snapshot(
+            &shared,
+            WalSnapshot {
+                max_frame: 5,
+                nbackfills: 0,
+                last_checksum: (0, 0),
+                checkpoint_seq: 0,
+                transaction_count: 1,
+            },
+        );
+
+        for idx in 1..5 {
+            assert!(
+                shared.read().runtime.read_locks[idx].write(),
+                "expected setup to occupy read-mark slot {idx}"
+            );
+        }
+
+        assert!(
+            matches!(retry_reader.try_begin_read_tx(), TryBeginReadResult::Retry),
+            "reader should retry when all read-mark slots are transiently unavailable"
+        );
+        assert!(
+            !retry_reader.has_vacuum_read_lock_guard(),
+            "retry path must not retain a shared VACUUM lock guard"
+        );
+        assert_eq!(
+            retry_reader
+                .max_frame_read_lock_index
+                .load(Ordering::Acquire),
+            NO_LOCK_HELD,
+            "retry path must not retain a read-mark slot"
+        );
+
+        for idx in 1..5 {
+            shared.read().runtime.read_locks[idx].unlock();
+        }
+
+        vacuum_wal.try_begin_checkpoint_lock().unwrap();
+        vacuum_wal.begin_blocking_tx().unwrap();
+        vacuum_wal.end_write_tx();
+        vacuum_wal.release_vacuum_lock();
+        vacuum_wal.release_checkpoint_lock();
+    }
+
+    #[test]
+    fn test_held_vacuum_checkpoint_locks_do_not_release_vacuum_lock() {
+        let (shared, vacuum_wal) = make_test_wal();
+        let contender_wal = make_test_wal_from_shared(shared);
+
+        vacuum_wal.try_begin_checkpoint_lock().unwrap();
+        vacuum_wal.begin_blocking_tx().unwrap();
+
+        assert!(vacuum_wal.holds_write_lock());
+        assert!(!vacuum_wal.holds_read_lock());
+        assert!(
+            matches!(
+                contender_wal.try_begin_checkpoint_lock(),
+                Err(LimboError::Busy)
+            ),
+            "held checkpoint lock should block other checkpointers"
+        );
+
+        vacuum_wal.end_write_tx();
+        assert!(!vacuum_wal.holds_write_lock());
+
+        let guard = CheckpointLocks::from_held_checkpoint_lock(
+            vacuum_wal.coordination.clone(),
+            CheckpointMode::Truncate {
+                upper_bound_inclusive: None,
+            },
+        )
+        .unwrap();
+        assert!(
+            matches!(contender_wal.try_begin_read_tx(), TryBeginReadResult::Busy),
+            "VACUUM lock should continue blocking readers during final checkpoint"
+        );
+
+        drop(guard);
+        assert!(
+            contender_wal.try_begin_checkpoint_lock().is_ok(),
+            "checkpoint cleanup should release the checkpoint lock"
+        );
+        contender_wal.release_checkpoint_lock();
+        assert!(
+            matches!(contender_wal.try_begin_read_tx(), TryBeginReadResult::Busy),
+            "checkpoint cleanup must not release the VACUUM lock"
+        );
+
+        vacuum_wal.release_vacuum_lock();
+        assert!(matches!(
+            contender_wal.try_begin_read_tx(),
+            TryBeginReadResult::Ok(_)
+        ));
+        contender_wal.end_read_tx();
     }
 
     #[test]

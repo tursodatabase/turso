@@ -29,7 +29,7 @@ pub extern "C" fn turso_enable_experimental() {
 fn default_db_opts() -> DatabaseOpts {
     let mut opts = DatabaseOpts::new();
     if EXPERIMENTAL_ENABLED.load(Ordering::Acquire) {
-        opts = opts.with_generated_columns(true);
+        opts = opts.with_generated_columns(true).with_vacuum(true);
     }
     opts
 }
