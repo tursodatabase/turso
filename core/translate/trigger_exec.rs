@@ -18,6 +18,7 @@ use crate::vdbe::BranchOffset;
 use crate::{bail_parse_error, QueryMode, Result};
 use std::cell::RefCell;
 use std::num::NonZero;
+use turso_parser::ast::RefAct;
 use turso_parser::ast::{self, Expr, TriggerEvent, TriggerTime};
 
 /// Context for trigger execution
@@ -853,6 +854,50 @@ pub fn has_triggers_including_temp(
         }
     }
     false
+}
+
+/// Returns `true` if `table` has FK children with active CASCADE/SET NULL/SET DEFAULT
+/// actions for `event`, **and** those children have triggers that would fire during
+/// the cascaded DML.
+///
+/// When this is true the statement must materialise its target rowids before writing,
+/// because the cascade-fired trigger could mutate the target table mid-scan.
+pub fn has_fk_cascade_triggers(
+    resolver: &Resolver,
+    database_id: usize,
+    table: &BTreeTable,
+    event: TriggerEvent,
+    foreign_keys_enabled: bool,
+) -> bool {
+    if !foreign_keys_enabled {
+        return false;
+    }
+    let target = table.name.as_str();
+    resolver.with_schema(database_id, |s| {
+        s.tables.values().any(|t| {
+            let Some(child) = t.btree() else { return false };
+            child.foreign_keys.iter().any(|fk| {
+                if !fk.parent_table.eq_ignore_ascii_case(target) {
+                    return false;
+                }
+                let child_event = match &event {
+                    TriggerEvent::Delete => match fk.on_delete {
+                        RefAct::Cascade => TriggerEvent::Delete,
+                        RefAct::SetNull | RefAct::SetDefault => TriggerEvent::Update,
+                        _ => return false,
+                    },
+                    TriggerEvent::Update => match fk.on_update {
+                        RefAct::Cascade | RefAct::SetNull | RefAct::SetDefault => {
+                            TriggerEvent::Update
+                        }
+                        _ => return false,
+                    },
+                    _ => return false,
+                };
+                has_triggers_including_temp(resolver, database_id, child_event, None, &child)
+            })
+        })
+    })
 }
 
 pub fn fire_trigger(
