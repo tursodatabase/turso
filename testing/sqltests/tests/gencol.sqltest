@@ -2335,6 +2335,40 @@ expect {
 
 @cross-check-integrity
 @skip-if mvcc "Expression indexes are not supported with MVCC"
+test gencol_expr_index_virtual_update_returning_halloween {
+    CREATE TABLE t1(a INTEGER, g INT AS (a = 10) VIRTUAL);
+    CREATE INDEX idx_expr ON t1(g + 0);
+    INSERT INTO t1(a) VALUES(10), (5);
+    UPDATE t1 SET a = 11 WHERE g + 0 = 1 RETURNING a, g, g + 0;
+    SELECT 'all', a, g FROM t1 ORDER BY a;
+    PRAGMA integrity_check;
+}
+expect {
+    11|0|0
+    all|5|0
+    all|11|0
+    ok
+}
+
+@cross-check-integrity
+@skip-if mvcc "Expression indexes are not supported with MVCC"
+test gencol_expr_index_virtual_update_transitive_halloween {
+    CREATE TABLE t1(a INTEGER, g INT AS (a = 10) VIRTUAL, h INT AS (g + 0) VIRTUAL);
+    CREATE INDEX idx_expr ON t1(h + 0);
+    INSERT INTO t1(a) VALUES(10), (5);
+    UPDATE t1 SET a = 11 WHERE h + 0 = 1 RETURNING a, g, h, h + 0;
+    SELECT 'all', a, g, h FROM t1 ORDER BY a;
+    PRAGMA integrity_check;
+}
+expect {
+    11|0|0|0
+    all|5|0|0
+    all|11|0|0
+    ok
+}
+
+@cross-check-integrity
+@skip-if mvcc "Expression indexes are not supported with MVCC"
 test gencol_expr_index_virtual_delete {
     CREATE TABLE t1(a INTEGER, b AS (a * 2));
     CREATE INDEX idx1 ON t1(b + 10);

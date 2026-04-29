@@ -4,6 +4,29 @@
 # conflict is resolved via REPLACE.
 
 @cross-check-integrity
+test update-rowid-through-secondary-index-scan {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, a INT, payload TEXT);
+    CREATE INDEX idx_a ON t(a);
+    INSERT INTO t VALUES(1, 1, 'x'), (2, 1, 'y'), (3, 2, 'z');
+
+    UPDATE t
+       SET id = id + 10
+     WHERE a = 1
+     RETURNING id, a, payload;
+
+    SELECT id, a, payload FROM t ORDER BY id;
+    PRAGMA integrity_check;
+}
+expect {
+    11|1|x
+    12|1|y
+    3|2|z
+    11|1|x
+    12|1|y
+    ok
+}
+
+@cross-check-integrity
 test update-or-replace-rowid-conflict-preserves-secondary-index {
     CREATE TABLE t(id INTEGER PRIMARY KEY, c TEXT, payload TEXT);
     CREATE INDEX idx_c ON t(c);
