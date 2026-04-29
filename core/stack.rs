@@ -1,6 +1,6 @@
 macro_rules! trace_stack {
     () => {
-        let _stack = $crate::stack::trace_scope(concat!(module_path!(), "::", line!()));
+        let _stack = $crate::stack::trace_scope(concat!("line:", line!()));
     };
     ($label:expr $(,)?) => {
         let _stack = $crate::stack::trace_scope($label);

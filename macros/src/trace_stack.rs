@@ -95,13 +95,13 @@ fn trace_guard(args: &TraceStackArgs, function_name: &syn::Ident) -> proc_macro2
     let (span_name, guard) = match args {
         TraceStackArgs::Inferred => {
             let guard = quote! {
-                crate::stack::trace_stack!(concat!(module_path!(), "::", stringify!(#function_name)));
+                crate::stack::trace_stack!(stringify!(#function_name));
             };
             (inferred_span_name, guard)
         }
         TraceStackArgs::InferredWithDetail(detail) => {
             let guard = quote! {
-                crate::stack::trace_stack!(concat!(module_path!(), "::", stringify!(#function_name)), #detail);
+                crate::stack::trace_stack!(stringify!(#function_name), #detail);
             };
             (inferred_span_name, guard)
         }
@@ -121,7 +121,7 @@ fn trace_guard(args: &TraceStackArgs, function_name: &syn::Ident) -> proc_macro2
 
     quote! {
         #[cfg(feature = "stacker")]
-        let _stack_span = tracing::debug_span!(target: "turso_stack", #span_name).entered();
+        let _stack_span = tracing::debug_span!(target: "turso_stack", #span_name, module_path = module_path!()).entered();
         #guard
     }
 }

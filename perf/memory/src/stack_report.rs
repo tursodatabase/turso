@@ -8,7 +8,7 @@ use std::{
 use anyhow::{Context, Result};
 use clap::{Parser, ValueEnum};
 use serde::Serialize;
-use tracing::{Event, Level, Subscriber, field::Visit};
+use tracing::{Event, Id, Level, Subscriber, field::Visit, span::Attributes};
 use tracing_subscriber::{
     Layer,
     layer::{Context as LayerContext, SubscriberExt},
@@ -141,7 +141,18 @@ where
         metadata.target() == "turso_stack" && *metadata.level() <= Level::DEBUG
     }
 
-    fn on_event(&self, event: &Event<'_>, _ctx: LayerContext<'_, S>) {
+    fn on_new_span(&self, attrs: &Attributes<'_>, id: &Id, ctx: LayerContext<'_, S>) {
+        let mut visitor = StackSpanVisitor::default();
+        attrs.record(&mut visitor);
+
+        if let Some(span) = ctx.span(id) {
+            span.extensions_mut().insert(StackSpanFields {
+                module_path: visitor.module_path,
+            });
+        }
+    }
+
+    fn on_event(&self, event: &Event<'_>, ctx: LayerContext<'_, S>) {
         if event.metadata().target() != "turso_stack" {
             return;
         }
@@ -155,6 +166,7 @@ where
         let Some(remaining_stack) = visitor.remaining_stack else {
             return;
         };
+        let label = scoped_stack_label(&ctx, event, &label);
 
         self.collector
             .samples
@@ -166,6 +178,30 @@ where
                 phase: visitor.phase.unwrap_or(StackPhase::Sample),
                 remaining_stack,
             });
+    }
+}
+
+#[derive(Debug)]
+struct StackSpanFields {
+    module_path: Option<String>,
+}
+
+#[derive(Default)]
+struct StackSpanVisitor {
+    module_path: Option<String>,
+}
+
+impl Visit for StackSpanVisitor {
+    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+        if field.name() == "module_path" {
+            self.module_path = Some(unquote_debug_string(&format!("{value:?}")));
+        }
+    }
+
+    fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+        if field.name() == "module_path" {
+            self.module_path = Some(value.to_string());
+        }
     }
 }
 
@@ -215,6 +251,107 @@ impl Visit for StackEventVisitor {
         if field.name() == "remaining_stack" {
             self.remaining_stack = usize::try_from(value).ok();
         }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct StackPathSegment {
+    module_path: Option<String>,
+    name: String,
+}
+
+fn scoped_stack_label<S>(ctx: &LayerContext<'_, S>, event: &Event<'_>, label: &str) -> String
+where
+    S: Subscriber + for<'lookup> LookupSpan<'lookup>,
+{
+    let event_segment = StackPathSegment {
+        module_path: None,
+        name: label.to_string(),
+    };
+    let Some(scope) = ctx.event_scope(event) else {
+        return format_stack_path(&[], &event_segment);
+    };
+
+    let scope_segments = scope
+        .from_root()
+        .filter(|span| span.metadata().target() == "turso_stack")
+        .map(|span| {
+            let module_path = span
+                .extensions()
+                .get::<StackSpanFields>()
+                .and_then(|fields| fields.module_path.clone());
+            StackPathSegment {
+                module_path,
+                name: span.metadata().name().to_string(),
+            }
+        })
+        .collect::<Vec<_>>();
+
+    format_stack_path(&scope_segments, &event_segment)
+}
+
+fn format_stack_path(scope_segments: &[StackPathSegment], event: &StackPathSegment) -> String {
+    let mut path = String::new();
+
+    for segment in scope_segments {
+        append_stack_path_segment(&mut path, segment);
+    }
+
+    if scope_segments
+        .last()
+        .is_some_and(|segment| stack_segments_match(segment, event))
+    {
+        return path;
+    }
+
+    append_stack_path_segment(&mut path, event);
+    path
+}
+
+fn stack_segments_match(
+    scope_segment: &StackPathSegment,
+    event_segment: &StackPathSegment,
+) -> bool {
+    scope_segment.name == event_segment.name
+        || event_segment
+            .name
+            .strip_prefix(scope_segment.module_path.as_deref().unwrap_or_default())
+            .is_some_and(|suffix| suffix == format!("::{}", scope_segment.name))
+}
+
+fn append_stack_path_segment(path: &mut String, segment: &StackPathSegment) {
+    let rendered = render_stack_path_segment(
+        segment.module_path.as_deref(),
+        &segment.name,
+        path.is_empty(),
+    );
+    if !path.is_empty() && !rendered.is_empty() {
+        path.push_str("::");
+    }
+    path.push_str(&rendered);
+}
+
+fn render_stack_path_segment(module_path: Option<&str>, name: &str, is_first: bool) -> String {
+    if let Some(module_path) = module_path {
+        if let Some(local_name) = name.strip_prefix(&format!("{module_path}::")) {
+            return if is_first {
+                format!("{module_path}::{local_name}")
+            } else {
+                local_name.to_string()
+            };
+        }
+
+        if name.contains("::") {
+            return name.to_string();
+        }
+
+        if is_first {
+            format!("{module_path}::{name}")
+        } else {
+            name.to_string()
+        }
+    } else {
+        name.to_string()
     }
 }
 
@@ -879,6 +1016,69 @@ mod tests {
             "CREATE TRIGGER cleanup AFTER INSERT ON t BEGIN SELECT 1; END",
             &args
         ));
+    }
+
+    #[test]
+    fn stack_path_does_not_repeat_same_module_for_nested_spans() {
+        let scope = vec![
+            StackPathSegment {
+                module_path: Some("turso_core::connection".to_string()),
+                name: "prepare_with_origin".to_string(),
+            },
+            StackPathSegment {
+                module_path: Some("turso_core::connection".to_string()),
+                name: "compile_cmd".to_string(),
+            },
+        ];
+        let event = StackPathSegment {
+            module_path: Some("turso_core::connection".to_string()),
+            name: "compile".to_string(),
+        };
+
+        assert_eq!(
+            format_stack_path(&scope, &event),
+            "turso_core::connection::prepare_with_origin::compile_cmd::compile"
+        );
+    }
+
+    #[test]
+    fn stack_path_does_not_append_event_when_it_matches_current_span() {
+        let scope = vec![StackPathSegment {
+            module_path: Some("turso_core::connection".to_string()),
+            name: "prepare_with_origin".to_string(),
+        }];
+        let event = StackPathSegment {
+            module_path: Some("turso_core::connection".to_string()),
+            name: "prepare_with_origin".to_string(),
+        };
+
+        assert_eq!(
+            format_stack_path(&scope, &event),
+            "turso_core::connection::prepare_with_origin"
+        );
+    }
+
+    #[test]
+    fn stack_path_uses_tracing_style_names_when_scope_moves_to_another_module() {
+        let scope = vec![
+            StackPathSegment {
+                module_path: Some("turso_core::connection".to_string()),
+                name: "prepare_with_origin".to_string(),
+            },
+            StackPathSegment {
+                module_path: Some("turso_core::translate".to_string()),
+                name: "translate".to_string(),
+            },
+        ];
+        let event = StackPathSegment {
+            module_path: Some("turso_core::translate".to_string()),
+            name: "dispatch".to_string(),
+        };
+
+        assert_eq!(
+            format_stack_path(&scope, &event),
+            "turso_core::connection::prepare_with_origin::translate::dispatch"
+        );
     }
 
     #[test]
