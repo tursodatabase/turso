@@ -10,7 +10,7 @@ use turso_parser::ast::{Expr, Operator, TableInternalId};
 
 use super::{
     access_method::{find_best_access_method_for_join_order, AccessMethod},
-    constraints::TableConstraints,
+    constraints::{usable_constraints_for_lhs_mask, TableConstraints},
     cost_params::CostModelParams,
     order::OrderTarget,
     IndexMethodCandidate,
@@ -1545,33 +1545,22 @@ pub fn compute_greedy_join_order<'a>(
     }))
 }
 
-/// Select starting table for greedy join ordering.
+/// Select the best starting table for greedy join ordering by evaluating indexed-seek benefits.
 ///
-/// Prefers tables with high "hub score": tables referenced by many other tables' usable
-/// constraints. Starting with such tables enables index lookups on subsequent joins.
-/// E.g., in a star schema, the fact table is referenced by all dimension FKs, so
-/// starting there allows all dimensions to use their PK indexes.
+/// Score = base_rows * filter_selectivity * table's indexed-seek multiplier
 ///
-/// Score = (base_rows * filter_selectivity) / (1 + hub_score)
-/// Lower score wins. Outer join RHS tables are excluded (have ordering dependencies).
+/// The multiplier is lower (better) for tables that enable indexed seeks on others
+/// (e.g., a fact table in a star schema) and higher for tables that are themselves
+/// better reached via an index only after a predecessor has been joined.
+///
+/// Lower score wins. Outer join RHS tables are excluded.
 fn find_best_starting_table(
     num_tables: usize,
     constraints: &[TableConstraints],
     base_table_rows: &[RowCountEstimate],
     left_join_deps: &HashMap<usize, TableMask>,
 ) -> usize {
-    // hub_score[t] = count of usable constraints on OTHER tables that reference t.
-    // If we join t first, each such constraint becomes usable for an index lookup.
-    let mut hub_score = vec![0usize; num_tables];
-    for (t, tc) in constraints.iter().enumerate() {
-        for c in &tc.constraints {
-            if c.usable && c.table_col_pos.is_some() {
-                for other in (0..num_tables).filter(|&x| x != t && c.lhs_mask.get(x)) {
-                    hub_score[other] += 1;
-                }
-            }
-        }
-    }
+    let multipliers = compute_indexed_seek_benefits(num_tables, constraints, left_join_deps);
 
     let mut best: Option<(usize, f64)> = None;
     for t in 0..num_tables {
@@ -1596,7 +1585,7 @@ fn find_best_starting_table(
             .map(|c| c.selectivity)
             .product();
 
-        let score = base_rows * selectivity / (1.0 + hub_score[t] as f64);
+        let score = base_rows * selectivity * multipliers[t];
 
         if best.is_none_or(|(_, s)| score < s) {
             best = Some((t, score));
@@ -1605,6 +1594,168 @@ fn find_best_starting_table(
 
     // Table 0 can never be outer join RHS, so best is always Some.
     best.expect("no valid starting table").0
+}
+
+#[derive(Debug, Default, Clone, Copy)]
+struct IndexedSeekBenefit {
+    /// measures how much choosing this table first enables indexed seeks on other tables.
+    /// Higher is better for a starting table.
+    reward: f64,
+    /// measures how much this table prefers some other table to be joined first
+    /// so it can be reached through an indexed seek.
+    /// Higher indicates that it is a poor starting choice.
+    penalty: f64,
+}
+
+impl IndexedSeekBenefit {
+    fn multiplier(&self) -> f64 {
+        (1.0 + self.penalty) / (1.0 + self.reward)
+    }
+}
+
+/// Compute directed indexed-seek benefits for single-table starting choices.
+///
+/// Returns a vector of multipliers for each candidate starting table.
+/// A lower multiplier indicates a better starting choice.
+///
+/// ### Approach
+///
+/// A table enables a seek on another when its presence in the join prefix allows
+/// the second table to use an indexed seek instead of a scan. This function
+/// estimates these benefits by inspecting index candidates and their dependencies.
+///
+/// ### Algorithm
+///
+/// 1.  For each table, identify its potential index lookups.
+/// 2.  Constant Seek Benefits: Identify lookups that require no prior tables
+///     (e.g., WHERE col = 42). These benefit every starting table except the
+///     table being filtered itself.
+/// 3.  Specific Predecessors: Identify lookups that require exactly one specific
+///     table to be joined first (e.g., WHERE rhs.col = lhs.col).
+/// 4.  Aggregation: Combine these benefits. For each candidate starting
+///     table, its multiplier is derived from the sum of specific benefits it provides
+///     plus the total constant benefits provided by all other tables in the query.
+///
+/// ### Complexity
+///
+/// - Time: O(C + T), where C is the total number of constraint
+///   references across all index candidates, and T is the number of tables.
+/// - Space: O(T) to store the benefits for each candidate table.
+fn compute_indexed_seek_benefits(
+    num_tables: usize,
+    constraints: &[TableConstraints],
+    left_join_deps: &HashMap<usize, TableMask>,
+) -> Vec<f64> {
+    let mut benefits = vec![IndexedSeekBenefit::default(); num_tables];
+
+    let mut total_constant_score = 0.0;
+    let mut constant_scores = vec![0.0; num_tables];
+
+    for rhs in 0..num_tables {
+        let deps = left_join_deps.get(&rhs).cloned().unwrap_or_default();
+        // If a table requires more than one prior table to be joined (e.g., in complex
+        // join dependencies), choosing a single starting table will not enable its
+        // indexed seek. Thus, it doesn't contribute to any single table's score.
+        if deps.count() > 1 {
+            continue;
+        }
+
+        if let Some(dep_t) = deps.iter().next() {
+            let mut mask = TableMask::default();
+            mask.set(dep_t);
+            let score = get_best_seek_score(&constraints[rhs], &mask, rhs);
+            if score > 0.0 {
+                benefits[dep_t].reward += score;
+                benefits[rhs].penalty += score;
+            }
+        } else {
+            let mut potential_predecessors = TableMask::default();
+            for candidate in &constraints[rhs].candidates {
+                for cref in &candidate.refs {
+                    // Only the first index column can be enabled for an index
+                    // seek by joining a single table first.
+                    if cref.index_col_pos > 0 {
+                        break;
+                    }
+                    let c = &constraints[rhs].constraints[cref.constraint_vec_pos];
+                    if c.lhs_mask.count() == 1 {
+                        if let Some(t) = c.lhs_mask.iter().next() {
+                            potential_predecessors.set(t);
+                        }
+                    }
+                }
+            }
+
+            let constant_score = get_best_seek_score(&constraints[rhs], &TableMask::default(), rhs);
+            if constant_score > 0.0 {
+                total_constant_score += constant_score;
+                constant_scores[rhs] = constant_score;
+                benefits[rhs].penalty += constant_score * (num_tables.saturating_sub(1)) as f64;
+            }
+
+            for t in potential_predecessors.iter() {
+                if t == rhs {
+                    continue;
+                }
+                let mut mask = TableMask::default();
+                mask.set(t);
+                let specific_score = get_best_seek_score(&constraints[rhs], &mask, rhs);
+                let delta = specific_score - constant_score;
+                if delta != 0.0 {
+                    benefits[t].reward += delta;
+                    benefits[rhs].penalty += delta;
+                }
+            }
+        }
+    }
+
+    for start in 0..num_tables {
+        benefits[start].reward += total_constant_score - constant_scores[start];
+    }
+
+    benefits.into_iter().map(|b| b.multiplier()).collect()
+}
+
+/// Calculate the best "seek score" for a table given a set of already joined tables (lhs_mask).
+///
+/// A higher score indicates that joining the LHS tables enables a more efficient indexed seek
+/// for the RHS table. Priorities are:
+/// 1. Secondary index equality seek (highest)
+/// 2. RowID/PK equality seek
+/// 3. Range scan (lowest)
+fn get_best_seek_score(
+    rhs_constraints: &TableConstraints,
+    lhs_mask: &TableMask,
+    rhs: usize,
+) -> f64 {
+    const INDEX_EQ_SCORE: f64 = 2.0;
+    const ROWID_EQ_SCORE: f64 = 1.5;
+    const RANGE_SCORE: f64 = 0.5;
+
+    let mut best_score = 0.0;
+    for candidate in &rhs_constraints.candidates {
+        let usable_constraint_refs = usable_constraints_for_lhs_mask(
+            &rhs_constraints.constraints,
+            &candidate.refs,
+            lhs_mask,
+            rhs,
+        );
+        if let Some(first_ref) = usable_constraint_refs.first() {
+            let score = if first_ref.eq.is_some() {
+                if candidate.index.is_some() {
+                    INDEX_EQ_SCORE
+                } else {
+                    ROWID_EQ_SCORE
+                }
+            } else {
+                RANGE_SCORE
+            };
+            if score > best_score {
+                best_score = score;
+            }
+        }
+    }
+    best_score
 }
 
 /// Specialized version of [compute_best_join_order] that just joins tables in the order they are given
