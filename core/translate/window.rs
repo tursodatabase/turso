@@ -88,6 +88,7 @@ struct WindowSubqueryContext<'a> {
 ///     ORDER BY c, d
 /// );
 /// ```
+#[turso_macros::trace_stack]
 pub fn plan_windows(
     program: &mut ProgramBuilder,
     plan: &mut SelectPlan,

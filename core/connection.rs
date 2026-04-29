@@ -662,27 +662,13 @@ impl Connection {
         cmd: Cmd,
         input: &str,
     ) -> Result<(Program, Arc<Pager>, QueryMode)> {
-        {
-            crate::stack::trace_stack!("update_schema");
-            self.maybe_update_schema();
-        }
-        let syms = {
-            crate::stack::trace_stack!("read_symbols");
-            self.syms.read()
-        };
-        let pager = {
-            crate::stack::trace_stack!("load_pager");
-            self.pager.load().clone()
-        };
-        let mode = {
-            crate::stack::trace_stack!("query_mode");
-            QueryMode::new(&cmd)
-        };
+        self.maybe_update_schema();
+
+        let syms = self.syms.read();
+        let pager = self.pager.load().clone();
+        let mode = QueryMode::new(&cmd);
         let (Cmd::Stmt(stmt) | Cmd::Explain(stmt) | Cmd::ExplainQueryPlan(stmt)) = cmd;
-        let schema = {
-            crate::stack::trace_stack!("clone_schema");
-            self.schema.read().clone()
-        };
+        let schema = self.schema.read().clone();
         match translate::translate(
             &schema,
             stmt,
@@ -706,27 +692,12 @@ impl Connection {
                     };
                     cmd
                 };
-                {
-                    crate::stack::trace_stack!("retry_update_schema");
-                    self.maybe_update_schema();
-                }
-                let syms = {
-                    crate::stack::trace_stack!("retry_read_symbols");
-                    self.syms.read()
-                };
-                let pager = {
-                    crate::stack::trace_stack!("retry_load_pager");
-                    self.pager.load().clone()
-                };
-                let mode = {
-                    crate::stack::trace_stack!("retry_query_mode");
-                    QueryMode::new(&cmd)
-                };
+                self.maybe_update_schema();
+                let syms = self.syms.read();
+                let pager = self.pager.load().clone();
+                let mode = QueryMode::new(&cmd);
                 let (Cmd::Stmt(stmt) | Cmd::Explain(stmt) | Cmd::ExplainQueryPlan(stmt)) = cmd;
-                let schema = {
-                    crate::stack::trace_stack!("retry_clone_schema");
-                    self.schema.read().clone()
-                };
+                let schema = self.schema.read().clone();
                 translate::translate(
                     &schema,
                     stmt,
@@ -775,7 +746,6 @@ impl Connection {
 
         let needs_nested_guard = origin.needs_nested_guard();
         if needs_nested_guard {
-            crate::stack::trace_stack!("start_nested");
             self.start_nested();
         }
         let result = (|| {
@@ -797,24 +767,18 @@ impl Connection {
             let input = str::from_utf8(&sql.as_bytes()[..byte_offset_end])
                 .unwrap()
                 .trim();
-            let (program, pager, mode) = {
-                crate::stack::trace_stack!("compile");
-                self.compile_cmd(cmd, input)?
-            };
-            {
-                crate::stack::trace_stack!("statement_new");
-                Ok(Statement::new_with_origin(
-                    program,
-                    pager,
-                    mode,
-                    byte_offset_end,
-                    origin,
-                    needs_nested_guard,
-                ))
-            }
+            let (program, pager, mode) = self.compile_cmd(cmd, input)?;
+
+            Ok(Statement::new_with_origin(
+                program,
+                pager,
+                mode,
+                byte_offset_end,
+                origin,
+                needs_nested_guard,
+            ))
         })();
         if result.is_err() && needs_nested_guard {
-            crate::stack::trace_stack!("end_nested_on_error");
             self.end_nested();
         }
         result
@@ -837,56 +801,33 @@ impl Connection {
         }
         let needs_nested_guard = origin.needs_nested_guard();
         if needs_nested_guard {
-            crate::stack::trace_stack!("start_nested");
             self.start_nested();
         }
         let result = (|| {
-            {
-                crate::stack::trace_stack!("update_schema");
-                self.maybe_update_schema();
-            }
-            let syms = {
-                crate::stack::trace_stack!("read_symbols");
-                self.syms.read()
-            };
-            let pager = {
-                crate::stack::trace_stack!("load_pager");
-                self.pager.load().clone()
-            };
-            let mode = {
-                crate::stack::trace_stack!("query_mode");
-                QueryMode::Normal
-            };
-            let schema = {
-                crate::stack::trace_stack!("clone_schema");
-                self.schema.read().clone()
-            };
-            let program = {
-                crate::stack::trace_stack!("translate");
-                translate::translate(
-                    &schema,
-                    stmt,
-                    pager.clone(),
-                    self.clone(),
-                    &syms,
-                    mode,
-                    "<ast>", // No SQL input string available
-                )?
-            };
-            {
-                crate::stack::trace_stack!("statement_new");
-                Ok(Statement::new_with_origin(
-                    program,
-                    pager,
-                    mode,
-                    0,
-                    origin,
-                    needs_nested_guard,
-                ))
-            }
+            self.maybe_update_schema();
+            let syms = self.syms.read();
+            let pager = self.pager.load().clone();
+            let mode = QueryMode::Normal;
+            let schema = self.schema.read().clone();
+            let program = translate::translate(
+                &schema,
+                stmt,
+                pager.clone(),
+                self.clone(),
+                &syms,
+                mode,
+                "<ast>", // No SQL input string available
+            )?;
+            Ok(Statement::new_with_origin(
+                program,
+                pager,
+                mode,
+                0,
+                origin,
+                needs_nested_guard,
+            ))
         })();
         if result.is_err() && needs_nested_guard {
-            crate::stack::trace_stack!("end_nested_on_error");
             self.end_nested();
         }
         result
@@ -1199,10 +1140,7 @@ impl Connection {
             let input = str::from_utf8(&sql.as_bytes()[..byte_offset_end])
                 .unwrap()
                 .trim();
-            let (program, pager, mode) = {
-                crate::stack::trace_stack!("compile");
-                self.compile_cmd(cmd, input)?
-            };
+            let (program, pager, mode) = self.compile_cmd(cmd, input)?;
             {
                 crate::stack::trace_stack!("run");
                 Statement::new(program, pager.clone(), mode, 0).run_ignore_rows()?;

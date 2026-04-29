@@ -1017,6 +1017,7 @@ pub fn resolve_expr(
 }
 
 /// Translate an expression into bytecode.
+#[turso_macros::trace_stack]
 pub fn translate_expr(
     program: &mut ProgramBuilder,
     referenced_tables: Option<&TableReferences>,
@@ -6069,14 +6070,8 @@ pub fn bind_and_rewrite_expr<'a>(
                             id.as_str()
                         );
                     };
-                    let normalized_table_name = {
-                        crate::stack::trace_stack!("qualified:normalize_table");
-                        normalize_ident(tbl.as_str())
-                    };
-                    let normalized_id = {
-                        crate::stack::trace_stack!("qualified:normalize_column");
-                        normalize_ident(id.as_str())
-                    };
+                    let normalized_table_name = normalize_ident(tbl.as_str());
+                    let normalized_id = normalize_ident(id.as_str());
 
                     // `resolved` holds the accepted binding (at most one).
                     // `identifier_matched` is true once *any* scope produced a table whose
@@ -6094,22 +6089,20 @@ pub fn bind_and_rewrite_expr<'a>(
                     };
 
                     // --- Stage 1: search the current scope's FROM tables. ---
+                    for joined_table in referenced_tables
+                        .joined_tables()
+                        .iter()
+                        .filter(|t| t.identifier == normalized_table_name)
                     {
-                        crate::stack::trace_stack!("qualified:find_table");
-                        for joined_table in referenced_tables
-                            .joined_tables()
-                            .iter()
-                            .filter(|t| t.identifier == normalized_table_name)
-                        {
-                            identifier_matched = true;
-                            let Some(candidate) = resolve_qualified_on_ref(
-                                &joined_table.table,
-                                joined_table.internal_id,
-                                &normalized_id,
-                            )?
-                            else {
-                                continue;
-                            };
+                        identifier_matched = true;
+                        let Some(candidate) = resolve_qualified_on_ref(
+                            &joined_table.table,
+                            joined_table.internal_id,
+                            &normalized_id,
+                        )?
+                        else {
+                            continue;
+                        };
 
                         // Multiple FROM tables share this identifier and both contain `id`.
                         // For column matches, a USING/NATURAL join on `id` lets the first
@@ -6128,6 +6121,7 @@ pub fn bind_and_rewrite_expr<'a>(
                             }
                             continue;
                         }
+                        resolved = Some((joined_table.internal_id, candidate));
                     }
                     // --- Stage 2: fall back to enclosing scopes ---
                     // Only attempted if no inner-scope table matched the identifier — an
@@ -6202,16 +6196,13 @@ pub fn bind_and_rewrite_expr<'a>(
                         // The `cte_id`/`cte_select` check restricts this to real CTE
                         // definition refs so any other future use of `cte_definition_only`
                         // still falls through to "no such table".
-                        let is_definition_only_cte = {
-                            crate::stack::trace_stack!("qualified:outer_ref_check");
-                            referenced_tables
-                                .find_outer_query_ref_by_identifier(&normalized_table_name)
-                                .is_some_and(|outer_ref| {
-                                    outer_ref.cte_definition_only
-                                        && (outer_ref.cte_id.is_some()
-                                            || outer_ref.cte_select.is_some())
-                                })
-                        };
+                        let is_definition_only_cte = referenced_tables
+                            .find_outer_query_ref_by_identifier(&normalized_table_name)
+                            .is_some_and(|outer_ref| {
+                                outer_ref.cte_definition_only
+                                    && (outer_ref.cte_id.is_some()
+                                        || outer_ref.cte_select.is_some())
+                            });
                         if is_definition_only_cte {
                             crate::bail_parse_error!(
                                 "no such column: {}.{}",
@@ -6233,32 +6224,20 @@ pub fn bind_and_rewrite_expr<'a>(
                         // We do NOT reject ambiguous schemas at CREATE TABLE time because
                         // the combinatorial explosion (CREATE TYPE, CREATE TABLE, ALTER TABLE)
                         // makes that impractical. Deterministic precedence is sufficient.
-                        let field_name = {
-                            crate::stack::trace_stack!("qualified:normalize_field");
-                            normalize_ident(id.as_str())
-                        };
-                        if let Some(m) = {
-                            crate::stack::trace_stack!("qualified:find_custom_type_column");
-                            find_custom_type_column(
-                                referenced_tables,
-                                &normalized_table_name,
-                                resolver,
-                            )?
-                        } {
-                            {
-                                crate::stack::trace_stack!("qualified:make_field_access");
-                                *expr = make_field_access_expr(
-                                    m.table_id,
-                                    m.col_idx,
-                                    m.is_rowid_alias,
-                                    &field_name,
-                                    m.type_def,
-                                );
-                            }
-                            {
-                                crate::stack::trace_stack!("qualified:mark_column_used");
-                                referenced_tables.mark_column_used(m.table_id, m.col_idx);
-                            }
+                        let field_name = normalize_ident(id.as_str());
+                        if let Some(m) = find_custom_type_column(
+                            referenced_tables,
+                            &normalized_table_name,
+                            resolver,
+                        )? {
+                            *expr = make_field_access_expr(
+                                m.table_id,
+                                m.col_idx,
+                                m.is_rowid_alias,
+                                &field_name,
+                                m.type_def,
+                            );
+                            referenced_tables.mark_column_used(m.table_id, m.col_idx);
                             return Ok(WalkControl::Continue);
                         }
                         crate::bail_parse_error!("no such table: {}", normalized_table_name);
@@ -6274,34 +6253,22 @@ pub fn bind_and_rewrite_expr<'a>(
                             col_idx,
                             is_rowid_alias,
                         } => {
-                            {
-                                crate::stack::trace_stack!("qualified:rewrite_column");
-                                *expr = Expr::Column {
-                                    database: None, // TODO: support different databases
-                                    table: tbl_id,
-                                    column: col_idx,
-                                    is_rowid_alias,
-                                };
-                            }
+                            *expr = Expr::Column {
+                                database: None, // TODO: support different databases
+                                table: tbl_id,
+                                column: col_idx,
+                                is_rowid_alias,
+                            };
                             tracing::debug!("rewritten to column");
-                            {
-                                crate::stack::trace_stack!("qualified:mark_column_used");
-                                referenced_tables.mark_column_used(tbl_id, col_idx);
-                            }
+                            referenced_tables.mark_column_used(tbl_id, col_idx);
                         }
                         QualifiedMatch::RowId => {
-                            {
-                                crate::stack::trace_stack!("qualified:rewrite_rowid");
-                                *expr = Expr::RowId {
-                                    database: None, // TODO: support different databases
-                                    table: tbl_id,
-                                };
-                            }
+                            *expr = Expr::RowId {
+                                database: None, // TODO: support different databases
+                                table: tbl_id,
+                            };
                             tracing::debug!("rewritten to rowid");
-                            {
-                                crate::stack::trace_stack!("qualified:mark_rowid_used");
-                                referenced_tables.mark_rowid_referenced(tbl_id);
-                            }
+                            referenced_tables.mark_rowid_referenced(tbl_id);
                         }
                     }
                     return Ok(WalkControl::Continue);
@@ -6658,6 +6625,7 @@ struct CustomTypeColumnMatch<'a> {
 
 /// Search all joined tables for a column named `col_name` with a struct/union type.
 /// Errors on ambiguity (>1 match). Returns `None` if no match.
+#[turso_macros::trace_stack]
 fn find_custom_type_column<'a>(
     referenced_tables: &TableReferences,
     col_name: &str,

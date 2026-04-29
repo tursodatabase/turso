@@ -93,32 +93,27 @@ pub fn translate_delete(
     let schema_cookie = resolver.with_schema(database_id, |s| s.schema_version);
     program.begin_write_on_database(database_id, schema_cookie);
 
-    let mut delete_plan = {
-        crate::stack::trace_stack!("prepare_plan");
-        prepare_delete_plan(
-            program,
-            resolver,
-            tbl_name,
-            table,
-            where_clause,
-            limit,
-            returning,
-            indexed,
-            with,
-            connection,
-            database_id,
-        )?
-    };
+    let mut delete_plan = prepare_delete_plan(
+        program,
+        resolver,
+        tbl_name,
+        table,
+        where_clause,
+        limit,
+        returning,
+        indexed,
+        with,
+        connection,
+        database_id,
+    )?;
 
     // Plan subqueries in the WHERE clause
     if let Plan::Delete(ref mut delete_plan_inner) = delete_plan {
         if let Some(ref mut rowset_plan) = delete_plan_inner.rowset_plan {
             // When using rowset (triggers or subqueries present), subqueries are in the rowset_plan's WHERE
-            crate::stack::trace_stack!("plan_rowset_subqueries");
             plan_subqueries_from_select_plan(program, rowset_plan, resolver, connection)?;
         } else {
             // Normal path: subqueries are in the DELETE plan's WHERE
-            crate::stack::trace_stack!("plan_where_subqueries");
             plan_subqueries_from_where_clause(
                 program,
                 &mut delete_plan_inner.non_from_clause_subqueries,
@@ -130,10 +125,7 @@ pub fn translate_delete(
         }
     }
 
-    {
-        crate::stack::trace_stack!("optimize_plan");
-        optimize_plan(program, &mut delete_plan, resolver)?;
-    }
+    optimize_plan(program, &mut delete_plan, resolver)?;
     if let Plan::Delete(delete_plan_inner) = &mut delete_plan {
         // Re-check after optimization: chosen access paths can make "delete while scanning"
         // unsafe, so we may need to collect rowids first.
@@ -179,14 +171,12 @@ pub fn translate_delete(
     )?;
     let opts = ProgramBuilderOpts::new(1, estimate_num_instructions(delete), 0);
     program.extend(&opts);
-    {
-        crate::stack::trace_stack!("emit_program");
-        emit_program(connection, resolver, program, delete_plan, |_| {})?;
-    }
+    emit_program(connection, resolver, program, delete_plan, |_| {})?;
     Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
+#[turso_macros::trace_stack]
 pub fn prepare_delete_plan(
     program: &mut ProgramBuilder,
     resolver: &Resolver,

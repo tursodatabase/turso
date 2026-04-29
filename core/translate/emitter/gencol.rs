@@ -8,6 +8,7 @@ use turso_parser::ast;
 use super::{ProgramBuilder, Resolver};
 
 /// Emit bytecode to compute virtual generated columns for a row.
+#[turso_macros::trace_stack]
 pub fn compute_virtual_columns(
     program: &mut ProgramBuilder,
     columns: &ColumnsTopologicalSort<'_>,

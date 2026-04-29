@@ -40,26 +40,20 @@ pub fn translate_select(
     query_destination: QueryDestination,
     connection: &Arc<crate::Connection>,
 ) -> Result<usize> {
-    let plan = {
-        trace_stack!("prepare_plan");
-        prepare_select_plan(
-            select,
-            resolver,
-            program,
-            &[],
-            query_destination,
-            connection,
-        )?
-    };
+    let plan = prepare_select_plan(
+        select,
+        resolver,
+        program,
+        &[],
+        query_destination,
+        connection,
+    )?;
     if program.trigger.is_some() {
         if let Some(virtual_table) = plan_first_virtual_table_name(&plan) {
             crate::bail_parse_error!("unsafe use of virtual table \"{}\"", virtual_table);
         }
     }
-    {
-        trace_stack!("emit_plan");
-        emit_select_plan(plan, resolver, program, connection)
-    }
+    emit_select_plan(plan, resolver, program, connection)
 }
 
 /// Optimize and emit bytecode for an already-prepared select plan.
@@ -70,10 +64,7 @@ pub fn emit_select_plan(
     program: &mut ProgramBuilder,
     connection: &Arc<crate::Connection>,
 ) -> Result<usize> {
-    {
-        trace_stack!("optimize_plan");
-        optimize_plan(program, &mut plan, resolver)?;
-    }
+    optimize_plan(program, &mut plan, resolver)?;
     let num_result_cols;
     let opts = match &plan {
         Plan::Select(select) => {
@@ -112,10 +103,7 @@ pub fn emit_select_plan(
     };
 
     program.extend(&opts);
-    {
-        trace_stack!("emit_program");
-        emit_program(connection, resolver, program, plan, |_| {})?;
-    }
+    emit_program(connection, resolver, program, plan, |_| {})?;
     Ok(num_result_cols)
 }
 
@@ -313,7 +301,6 @@ fn prepare_one_select_plan(
                     limit.as_ref(),
                 );
             {
-                trace_stack!("parse_from");
                 parse_from(
                     from,
                     resolver,
@@ -544,13 +531,11 @@ fn prepare_one_select_plan(
             // Virtual table predicates may depend on column bindings from tables to the right in the join order,
             // so we must wait until the full set of references has been collected.
             {
-                trace_stack!("add_vtab_predicates");
                 add_vtab_predicates_to_where_clause(&mut vtab_predicates, &mut plan, resolver)?;
             }
 
             // Parse the actual WHERE clause and add its conditions to the plan WHERE clause that already contains the join conditions.
             {
-                trace_stack!("parse_where");
                 parse_where(
                     where_clause.as_deref(),
                     &mut plan.table_references,
@@ -738,20 +723,15 @@ fn prepare_one_select_plan(
 
             // Parse the LIMIT/OFFSET clause
             {
-                trace_stack!("parse_limit");
                 (plan.limit, plan.offset) =
                     limit.map_or(Ok((None, None)), |l| parse_limit(l, resolver))?;
             }
 
             if !windows.is_empty() {
-                trace_stack!("plan_windows");
                 plan_windows(program, &mut plan, resolver, connection, &mut windows)?;
             }
 
-            {
-                trace_stack!("plan_subqueries");
-                plan_subqueries_from_select_plan(program, &mut plan, resolver, connection)?;
-            }
+            plan_subqueries_from_select_plan(program, &mut plan, resolver, connection)?;
 
             {
                 trace_stack!("validate_plan");
@@ -1070,6 +1050,7 @@ fn reject_outer_scope_refs_inside_select_plan(
     Ok(())
 }
 
+#[turso_macros::trace_stack]
 fn add_vtab_predicates_to_where_clause(
     vtab_predicates: &mut Vec<Expr>,
     plan: &mut SelectPlan,

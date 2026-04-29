@@ -361,6 +361,7 @@ pub fn plan_subqueries_from_select_plan(
 /// This is used by DELETE and UPDATE statements which only have subqueries in the WHERE clause.
 /// Similar to [plan_subqueries_from_select_plan] but only handles the WHERE clause
 /// since these statements don't have GROUP BY, ORDER BY, or result column subqueries.
+#[turso_macros::trace_stack]
 pub fn plan_subqueries_from_where_clause(
     program: &mut ProgramBuilder,
     non_from_clause_subqueries: &mut Vec<NonFromClauseSubquery>,
@@ -443,6 +444,7 @@ pub fn plan_subqueries_from_update_sets(
 /// Compute query plans for subqueries in RETURNING expressions.
 /// This is used by INSERT, UPDATE, and DELETE statements with RETURNING clauses.
 /// RETURNING expressions may contain scalar subqueries that need to be planned.
+#[turso_macros::trace_stack]
 pub fn plan_subqueries_from_returning(
     program: &mut ProgramBuilder,
     non_from_clause_subqueries: &mut Vec<NonFromClauseSubquery>,
@@ -476,6 +478,7 @@ pub fn plan_subqueries_from_returning(
 /// Plan subqueries in a trigger WHEN clause expression.
 /// The WHEN clause has no FROM clause, so there are no outer query references.
 /// NEW/OLD references should already be rewritten to Expr::Register before calling this.
+#[turso_macros::trace_stack]
 pub fn plan_subqueries_from_trigger_when_clause(
     program: &mut ProgramBuilder,
     non_from_clause_subqueries: &mut Vec<NonFromClauseSubquery>,
@@ -625,26 +628,20 @@ fn get_subquery_parser<'a>(
                     unreachable!();
                 };
 
-                let plan = {
-                    crate::stack::trace_stack!("prepare_exists_plan");
-                    prepare_select_plan(
-                        subselect,
-                        resolver,
-                        program,
-                        &outer_query_refs,
-                        QueryDestination::ExistsSubqueryResult { result_reg },
-                        connection,
-                    )?
-                };
+                let plan = prepare_select_plan(
+                    subselect,
+                    resolver,
+                    program,
+                    &outer_query_refs,
+                    QueryDestination::ExistsSubqueryResult { result_reg },
+                    connection,
+                )?;
                 let Plan::Select(mut plan) = plan else {
                     crate::bail_parse_error!(
                         "compound SELECT queries not supported yet in WHERE clause subqueries"
                     );
                 };
-                {
-                    crate::stack::trace_stack!("optimize_exists_plan");
-                    optimize_select_plan(&mut plan, resolver.schema())?;
-                }
+                optimize_select_plan(&mut plan, resolver.schema())?;
                 let correlated = select_plan_has_outer_scope_dependency(&plan);
                 handle_unsupported_correlation(correlated, position, allow_correlated)?;
                 out_subqueries.push(NonFromClauseSubquery {
@@ -683,26 +680,20 @@ fn get_subquery_parser<'a>(
                 }) else {
                     unreachable!();
                 };
-                let plan = {
-                    crate::stack::trace_stack!("prepare_scalar_plan");
-                    prepare_select_plan(
-                        subselect,
-                        resolver,
-                        program,
-                        &outer_query_refs,
-                        QueryDestination::Unset,
-                        connection,
-                    )?
-                };
+                let plan = prepare_select_plan(
+                    subselect,
+                    resolver,
+                    program,
+                    &outer_query_refs,
+                    QueryDestination::Unset,
+                    connection,
+                )?;
                 let Plan::Select(mut plan) = plan else {
                     crate::bail_parse_error!(
                         "compound SELECT queries not supported yet in WHERE clause subqueries"
                     );
                 };
-                {
-                    crate::stack::trace_stack!("optimize_scalar_plan");
-                    optimize_select_plan(&mut plan, resolver.schema())?;
-                }
+                optimize_select_plan(&mut plan, resolver.schema())?;
                 let reg_count = plan.result_columns.len();
                 let reg_start = program.alloc_registers(reg_count);
 
@@ -789,20 +780,16 @@ fn get_subquery_parser<'a>(
                 }) else {
                     unreachable!();
                 };
-                let plan = {
-                    crate::stack::trace_stack!("prepare_in_select_plan");
-                    prepare_select_plan(
-                        rhs,
-                        resolver,
-                        program,
-                        &outer_query_refs,
-                        QueryDestination::Unset,
-                        connection,
-                    )?
-                };
+                let plan = prepare_select_plan(
+                    rhs,
+                    resolver,
+                    program,
+                    &outer_query_refs,
+                    QueryDestination::Unset,
+                    connection,
+                )?;
                 let mut plan = match plan {
                     Plan::Select(mut select_plan) => {
-                        crate::stack::trace_stack!("optimize_in_select_plan");
                         optimize_select_plan(&mut select_plan, resolver.schema())?;
                         Plan::Select(select_plan)
                     }
@@ -813,7 +800,6 @@ fn get_subquery_parser<'a>(
                         offset,
                         order_by,
                     } => {
-                        crate::stack::trace_stack!("optimize_in_compound_plan");
                         optimize_select_plan(&mut right_most, resolver.schema())?;
                         for (select_plan, _) in left.iter_mut() {
                             optimize_select_plan(select_plan, resolver.schema())?;

@@ -309,18 +309,15 @@ pub fn translate_insert(
         mut values,
         mut upsert_actions,
         inserting_multiple_rows,
-    } = {
-        crate::stack::trace_stack!("bind");
-        bind_insert(
-            program,
-            resolver,
-            &table,
-            &columns,
-            &mut body,
-            on_conflict.unwrap_or(ResolveType::Abort),
-            database_id,
-        )?
-    };
+    } = bind_insert(
+        program,
+        resolver,
+        &table,
+        &columns,
+        &mut body,
+        on_conflict.unwrap_or(ResolveType::Abort),
+        database_id,
+    )?;
 
     if inserting_multiple_rows && btree_table.has_autoincrement {
         ensure_sequence_initialized(program, resolver, &btree_table, database_id)?;
@@ -352,31 +349,25 @@ pub fn translate_insert(
     );
 
     // Plan CTEs and add them as outer query references for RETURNING subquery resolution
-    {
-        crate::stack::trace_stack!("plan_returning_ctes");
-        plan_ctes_as_outer_refs(
-            with_for_returning,
-            resolver,
-            program,
-            &mut table_references,
-            connection,
-        )?;
-    }
+    plan_ctes_as_outer_refs(
+        with_for_returning,
+        resolver,
+        program,
+        &mut table_references,
+        connection,
+    )?;
 
     // Plan subqueries in RETURNING expressions before processing
     // (so SubqueryResult nodes are cloned into result_columns)
     let mut returning_subqueries = vec![];
-    {
-        crate::stack::trace_stack!("plan_returning_subqueries");
-        plan_subqueries_from_returning(
-            program,
-            &mut returning_subqueries,
-            &mut table_references,
-            &mut returning,
-            resolver,
-            connection,
-        )?;
-    }
+    plan_subqueries_from_returning(
+        program,
+        &mut returning_subqueries,
+        &mut table_references,
+        &mut returning,
+        resolver,
+        connection,
+    )?;
 
     // Process RETURNING clause using shared module
     let mut result_columns =
@@ -442,21 +433,18 @@ pub fn translate_insert(
         });
     }
 
-    {
-        crate::stack::trace_stack!("init_source_emission");
-        init_source_emission(
-            program,
-            &table,
-            connection,
-            &mut ctx,
-            resolver,
-            &mut values,
-            body,
-            &columns,
-            &table_references,
-            database_id,
-        )?;
-    }
+    init_source_emission(
+        program,
+        &table,
+        connection,
+        &mut ctx,
+        resolver,
+        &mut values,
+        body,
+        &columns,
+        &table_references,
+        database_id,
+    )?;
     let has_upsert = !upsert_actions.is_empty();
 
     // Set up the program to return result columns if RETURNING is specified
@@ -465,17 +453,14 @@ pub fn translate_insert(
     }
     let insertion = build_insertion(program, &table, &columns, ctx.num_values)?;
 
-    {
-        crate::stack::trace_stack!("translate_rows_open_tables");
-        translate_rows_and_open_tables(
-            program,
-            resolver,
-            &insertion,
-            &ctx,
-            &values,
-            inserting_multiple_rows,
-        )?;
-    }
+    translate_rows_and_open_tables(
+        program,
+        resolver,
+        &insertion,
+        &ctx,
+        &values,
+        inserting_multiple_rows,
+    )?;
 
     // Emit subqueries for RETURNING clause (uncorrelated subqueries are evaluated once)
     emit_non_from_clause_subqueries_for_eval_at(
@@ -543,7 +528,6 @@ pub fn translate_insert(
 
     let has_before_triggers = !relevant_before_triggers.is_empty();
     if has_before_triggers {
-        crate::stack::trace_stack!("before_triggers");
         compute_virtual_columns(
             program,
             &ctx.table.columns_topo_sort()?,
@@ -956,7 +940,6 @@ pub fn translate_insert(
     );
     let has_after_triggers = !relevant_after_triggers.is_empty();
     if has_after_triggers {
-        crate::stack::trace_stack!("after_triggers");
         compute_virtual_columns(
             program,
             &ctx.table.columns_topo_sort()?,
@@ -1405,6 +1388,7 @@ fn emit_commit_phase(
     Ok(())
 }
 
+#[turso_macros::trace_stack]
 fn translate_rows_and_open_tables(
     program: &mut ProgramBuilder,
     resolver: &Resolver,
@@ -1898,6 +1882,7 @@ fn resolve_defaults_in_row(
     }
 }
 
+#[turso_macros::trace_stack]
 fn bind_insert(
     program: &mut ProgramBuilder,
     resolver: &Resolver,
@@ -2070,6 +2055,7 @@ fn bind_insert(
 /// default expressions registered for the columns, or NULLs, so they can be translated into
 /// registers later.
 #[allow(clippy::too_many_arguments, clippy::vec_box)]
+#[turso_macros::trace_stack]
 fn init_source_emission<'a>(
     program: &mut ProgramBuilder,
     table: &Table,
