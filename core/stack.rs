@@ -1,3 +1,16 @@
+macro_rules! trace_stack {
+    () => {
+        let _stack = $crate::stack::trace_scope(concat!(module_path!(), ":", line!()));
+    };
+    ($label:expr $(,)?) => {
+        let _stack = $crate::stack::trace_scope($label);
+    };
+    ($label:expr, $detail:expr $(,)?) => {
+        let _stack = $crate::stack::trace_scope_with_detail($label, $detail);
+    };
+}
+pub(crate) use trace_stack;
+
 #[cfg(feature = "stacker")]
 pub(crate) struct TraceGuard {
     label: &'static str,

@@ -4,6 +4,7 @@ use super::plan::{
     QueryDestination, Search, TableReferences, Window,
 };
 use crate::schema::Table;
+use crate::stack::trace_stack;
 use crate::sync::Arc;
 use crate::translate::emitter::{OperationMode, Resolver};
 use crate::translate::expr::{
@@ -31,6 +32,7 @@ use turso_parser::ast::{self, CompoundSelect, Expr};
 /// SQLite's default SQLITE_MAX_COLUMN is 2000, with a hard upper limit of 32767.
 const SQLITE_MAX_COLUMN: usize = 2000;
 
+#[turso_macros::trace_stack]
 pub fn translate_select(
     select: ast::Select,
     resolver: &Resolver,
@@ -38,9 +40,8 @@ pub fn translate_select(
     query_destination: QueryDestination,
     connection: &Arc<crate::Connection>,
 ) -> Result<usize> {
-    let _stack = crate::stack::trace_scope("select:translate");
     let plan = {
-        let _stack = crate::stack::trace_scope("select:prepare_plan");
+        trace_stack!("select:prepare_plan");
         prepare_select_plan(
             select,
             resolver,
@@ -56,21 +57,21 @@ pub fn translate_select(
         }
     }
     {
-        let _stack = crate::stack::trace_scope("select:emit_plan");
+        trace_stack!("select:emit_plan");
         emit_select_plan(plan, resolver, program, connection)
     }
 }
 
 /// Optimize and emit bytecode for an already-prepared select plan.
+#[turso_macros::trace_stack]
 pub fn emit_select_plan(
     mut plan: Plan,
     resolver: &Resolver,
     program: &mut ProgramBuilder,
     connection: &Arc<crate::Connection>,
 ) -> Result<usize> {
-    let _stack = crate::stack::trace_scope("select:emit_select_plan");
     {
-        let _stack = crate::stack::trace_scope("select:optimize_plan");
+        trace_stack!("select:optimize_plan");
         optimize_plan(program, &mut plan, resolver)?;
     }
     let num_result_cols;
@@ -112,7 +113,7 @@ pub fn emit_select_plan(
 
     program.extend(&opts);
     {
-        let _stack = crate::stack::trace_scope("select:emit_program");
+        trace_stack!("select:emit_program");
         emit_program(connection, resolver, program, plan, |_| {})?;
     }
     Ok(num_result_cols)
@@ -157,6 +158,7 @@ fn select_plan_first_virtual_table_name(select_plan: &SelectPlan) -> Option<Stri
     None
 }
 
+#[turso_macros::trace_stack]
 pub fn prepare_select_plan(
     select: ast::Select,
     resolver: &Resolver,
@@ -165,7 +167,6 @@ pub fn prepare_select_plan(
     query_destination: QueryDestination,
     connection: &Arc<crate::Connection>,
 ) -> Result<Plan> {
-    let _stack = crate::stack::trace_scope("select:prepare_select_plan");
     let compounds = select.body.compounds;
     match compounds.is_empty() {
         true => Ok(Plan::Select(Box::new(prepare_one_select_plan(
@@ -262,6 +263,7 @@ pub fn prepare_select_plan(
 }
 
 #[allow(clippy::too_many_arguments)]
+#[turso_macros::trace_stack]
 fn prepare_one_select_plan(
     select: ast::OneSelect,
     resolver: &Resolver,
@@ -273,7 +275,6 @@ fn prepare_one_select_plan(
     query_destination: QueryDestination,
     connection: &Arc<crate::Connection>,
 ) -> Result<SelectPlan> {
-    let _stack = crate::stack::trace_scope("select:prepare_one_select_plan");
     match select {
         ast::OneSelect::Select {
             columns,
@@ -312,7 +313,7 @@ fn prepare_one_select_plan(
                     limit.as_ref(),
                 );
             {
-                let _stack = crate::stack::trace_scope("select:parse_from");
+                trace_stack!("select:parse_from");
                 parse_from(
                     from,
                     resolver,
@@ -382,7 +383,7 @@ fn prepare_one_select_plan(
 
             let mut windows = Vec::with_capacity(window_clause.len());
             {
-                let _stack = crate::stack::trace_scope("select:bind_windows");
+                trace_stack!("select:bind_windows");
                 for window_def in window_clause.iter() {
                     let name = normalize_ident(window_def.name.as_str());
                     let mut window = Window::new(Some(name), &window_def.window)?;
@@ -414,7 +415,7 @@ fn prepare_one_select_plan(
                 connection.get_full_column_names() && !connection.get_short_column_names();
             let mut aggregate_expressions = Vec::new();
             {
-                let _stack = crate::stack::trace_scope("select:bind_result_columns");
+                trace_stack!("select:bind_result_columns");
                 for column in columns.into_iter() {
                     match column {
                         ResultColumn::Star => {
@@ -543,13 +544,13 @@ fn prepare_one_select_plan(
             // Virtual table predicates may depend on column bindings from tables to the right in the join order,
             // so we must wait until the full set of references has been collected.
             {
-                let _stack = crate::stack::trace_scope("select:add_vtab_predicates");
+                trace_stack!("select:add_vtab_predicates");
                 add_vtab_predicates_to_where_clause(&mut vtab_predicates, &mut plan, resolver)?;
             }
 
             // Parse the actual WHERE clause and add its conditions to the plan WHERE clause that already contains the join conditions.
             {
-                let _stack = crate::stack::trace_scope("select:parse_where");
+                trace_stack!("select:parse_where");
                 parse_where(
                     where_clause.as_deref(),
                     &mut plan.table_references,
@@ -560,7 +561,7 @@ fn prepare_one_select_plan(
             }
 
             {
-                let _stack = crate::stack::trace_scope("select:process_group_by");
+                trace_stack!("select:process_group_by");
                 if let Some(mut group_by) = group_by {
                     // Process HAVING clause if present
                     let having_predicates = if let Some(having) = group_by.having {
@@ -633,7 +634,7 @@ fn prepare_one_select_plan(
                 .is_some_and(|gb| !gb.exprs.is_empty());
 
             {
-                let _stack = crate::stack::trace_scope("select:process_order_by");
+                trace_stack!("select:process_order_by");
                 for mut o in order_by {
                     replace_column_number_with_copy_of_column_expr(
                         &mut o.expr,
@@ -737,23 +738,23 @@ fn prepare_one_select_plan(
 
             // Parse the LIMIT/OFFSET clause
             {
-                let _stack = crate::stack::trace_scope("select:parse_limit");
+                trace_stack!("select:parse_limit");
                 (plan.limit, plan.offset) =
                     limit.map_or(Ok((None, None)), |l| parse_limit(l, resolver))?;
             }
 
             if !windows.is_empty() {
-                let _stack = crate::stack::trace_scope("select:plan_windows");
+                trace_stack!("select:plan_windows");
                 plan_windows(program, &mut plan, resolver, connection, &mut windows)?;
             }
 
             {
-                let _stack = crate::stack::trace_scope("select:plan_subqueries");
+                trace_stack!("select:plan_subqueries");
                 plan_subqueries_from_select_plan(program, &mut plan, resolver, connection)?;
             }
 
             {
-                let _stack = crate::stack::trace_scope("select:validate_plan");
+                trace_stack!("select:validate_plan");
                 validate_group_by_outer_scope_refs(&plan)?;
 
                 validate_expr_correct_column_counts(&plan)?;
