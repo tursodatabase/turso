@@ -75,6 +75,209 @@ impl MvccTestDb {
     }
 }
 
+#[test]
+fn mvcc_active_read_tx_blocks_vacuum_gate() {
+    let db = MvccTestDb::new();
+    let pager = db.conn.pager.load().clone();
+    let tx_id = db.mvcc_store.begin_tx(pager).unwrap();
+
+    assert!(matches!(
+        db.mvcc_store.try_begin_vacuum_gate(),
+        Err(LimboError::Busy)
+    ));
+
+    db.mvcc_store.remove_tx(tx_id);
+    db.mvcc_store.try_begin_vacuum_gate().unwrap();
+    db.mvcc_store.release_vacuum_gate();
+}
+
+#[test]
+fn mvcc_active_write_tx_blocks_vacuum_gate() {
+    let db = MvccTestDb::new();
+    let pager = db.conn.pager.load().clone();
+    let tx_id = db
+        .mvcc_store
+        .begin_exclusive_tx(pager.clone(), None)
+        .unwrap();
+
+    assert!(matches!(
+        db.mvcc_store.try_begin_vacuum_gate(),
+        Err(LimboError::Busy)
+    ));
+
+    db.mvcc_store
+        .rollback_tx(tx_id, pager, &db.conn, crate::MAIN_DB_ID);
+    db.mvcc_store.try_begin_vacuum_gate().unwrap();
+    db.mvcc_store.release_vacuum_gate();
+}
+
+#[test]
+fn mvcc_vacuum_gate_blocks_new_read_and_write_tx() {
+    let db = MvccTestDb::new();
+    let pager = db.conn.pager.load().clone();
+
+    db.mvcc_store.try_begin_vacuum_gate().unwrap();
+
+    assert!(matches!(
+        db.mvcc_store.begin_tx(pager.clone()),
+        Err(LimboError::Busy)
+    ));
+    assert!(matches!(
+        db.mvcc_store.begin_exclusive_tx(pager, None),
+        Err(LimboError::Busy)
+    ));
+
+    db.mvcc_store.release_vacuum_gate();
+}
+
+#[test]
+fn mvcc_reset_after_vacuum_installs_header_and_rootpages() {
+    let db = MvccTestDb::new();
+    db.conn
+        .execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")
+        .unwrap();
+    db.conn.execute("CREATE INDEX idx_t_v ON t(v)").unwrap();
+    db.conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+
+    db.conn.demote_to_mvcc_connection();
+    db.conn.reparse_schema().unwrap();
+    let schema = db.conn.schema.read().clone();
+    db.conn.promote_to_regular_connection();
+    let table_root = match schema.tables.get("t").expect("table t").as_ref() {
+        Table::BTree(btree) => btree.root_page,
+        _ => panic!("expected btree table"),
+    };
+    let index_root = schema
+        .indexes
+        .get("t")
+        .and_then(|indexes| indexes.front())
+        .map(|index| index.root_page)
+        .expect("index idx_t_v");
+
+    let mut header = DatabaseHeader::default();
+    header.schema_cookie = 77.into();
+
+    db.mvcc_store
+        .global_header
+        .write()
+        .replace(DatabaseHeader::default());
+    db.mvcc_store
+        .insert_table_id_to_rootpage(MVTableId::from(-999_i64), Some(999));
+
+    db.mvcc_store.try_begin_vacuum_gate().unwrap();
+    db.mvcc_store.reset_after_vacuum(header, schema.as_ref());
+    db.mvcc_store.release_vacuum_gate();
+
+    assert_eq!(
+        db.mvcc_store
+            .with_header(|header| header.schema_cookie.get(), None)
+            .unwrap(),
+        77
+    );
+    assert_eq!(
+        *db.mvcc_store
+            .table_id_to_rootpage
+            .get(&SQLITE_SCHEMA_MVCC_TABLE_ID)
+            .expect("sqlite_schema mapping")
+            .value(),
+        Some(1)
+    );
+    assert_eq!(
+        *db.mvcc_store
+            .table_id_to_rootpage
+            .get(&MVTableId::from(-(table_root)))
+            .expect("table root mapping")
+            .value(),
+        Some(table_root as u64)
+    );
+    assert_eq!(
+        *db.mvcc_store
+            .table_id_to_rootpage
+            .get(&MVTableId::from(-(index_root)))
+            .expect("index root mapping")
+            .value(),
+        Some(index_root as u64)
+    );
+    assert!(
+        db.mvcc_store
+            .table_id_to_rootpage
+            .get(&MVTableId::from(-999_i64))
+            .is_none(),
+        "stale root-page entries must be cleared"
+    );
+}
+
+#[test]
+fn mvcc_reset_after_vacuum_clears_checkpointed_empty_version_buckets() {
+    let db = MvccTestDb::new();
+    db.conn
+        .execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")
+        .unwrap();
+    db.conn.execute("CREATE INDEX idx_t_v ON t(v)").unwrap();
+
+    db.conn
+        .execute("INSERT INTO t VALUES (1, 'a'), (2, 'b'), (3, 'c')")
+        .unwrap();
+    db.conn
+        .execute("UPDATE t SET v = 'z' WHERE id = 1")
+        .unwrap();
+    db.conn.execute("DELETE FROM t WHERE id = 2").unwrap();
+    db.conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+
+    // Normal MVCC checkpoint GC removes versions but can leave empty map
+    // buckets behind; VACUUM reset must not preserve those stale keys.
+    let checkpointed_row_ids = db
+        .mvcc_store
+        .rows
+        .iter()
+        .filter(|entry| entry.value().read().is_empty())
+        .map(|entry| entry.key().clone())
+        .collect::<Vec<_>>();
+    let checkpointed_index_ids = db
+        .mvcc_store
+        .index_rows
+        .iter()
+        .filter(|entry| {
+            entry
+                .value()
+                .iter()
+                .all(|row_entry| row_entry.value().read().is_empty())
+        })
+        .map(|entry| *entry.key())
+        .collect::<Vec<_>>();
+    assert!(
+        !checkpointed_row_ids.is_empty(),
+        "checkpoint GC should leave empty table row buckets before VACUUM reset"
+    );
+    assert!(
+        !checkpointed_index_ids.is_empty(),
+        "checkpoint GC should leave empty index buckets before VACUUM reset"
+    );
+
+    db.conn.demote_to_mvcc_connection();
+    db.conn.reparse_schema().unwrap();
+    let schema = db.conn.schema.read().clone();
+    db.conn.promote_to_regular_connection();
+
+    db.mvcc_store.try_begin_vacuum_gate().unwrap();
+    db.mvcc_store
+        .reset_after_vacuum(DatabaseHeader::default(), schema.as_ref());
+    db.mvcc_store.release_vacuum_gate();
+
+    for row_id in checkpointed_row_ids {
+        assert!(
+            db.mvcc_store.rows.get(&row_id).is_none(),
+            "checkpointed empty table row buckets must be cleared across VACUUM reset"
+        );
+    }
+    for index_id in checkpointed_index_ids {
+        assert!(
+            db.mvcc_store.index_rows.get(&index_id).is_none(),
+            "checkpointed empty index buckets must be cleared across VACUUM reset"
+        );
+    }
+}
+
 impl MvccTestDbNoConn {
     pub fn new() -> Self {
         let io = Arc::new(MemoryIO::new());

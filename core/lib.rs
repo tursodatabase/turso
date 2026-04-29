@@ -201,6 +201,7 @@ pub struct DatabaseOpts {
     pub enable_encryption: bool,
     pub enable_index_method: bool,
     pub enable_autovacuum: bool,
+    pub enable_vacuum: bool,
     pub enable_attach: bool,
     pub enable_generated_columns: bool,
     pub enable_multiprocess_wal: bool,
@@ -241,6 +242,11 @@ impl DatabaseOpts {
 
     pub fn with_autovacuum(mut self, enable: bool) -> Self {
         self.enable_autovacuum = enable;
+        self
+    }
+
+    pub fn with_vacuum(mut self, enable: bool) -> Self {
+        self.enable_vacuum = enable;
         self
     }
 
@@ -1710,6 +1716,7 @@ impl Database {
             check_constraints_pragma: AtomicBool::new(false),
             vtab_txn_states: RwLock::new(HashSet::default()),
             named_savepoints: RwLock::new(Vec::new()),
+            schema_reparse_in_progress: AtomicBool::new(false),
             prepare_context_generation: AtomicU64::new(0),
         });
         self.n_connections
@@ -2372,6 +2379,18 @@ impl Database {
 
     pub fn experimental_custom_types_enabled(&self) -> bool {
         self.opts.enable_custom_types
+    }
+
+    pub fn experimental_encryption_enabled(&self) -> bool {
+        self.opts.enable_encryption
+    }
+
+    pub fn experimental_autovacuum_enabled(&self) -> bool {
+        self.opts.enable_autovacuum
+    }
+
+    pub fn experimental_vacuum_enabled(&self) -> bool {
+        self.opts.enable_vacuum
     }
 
     pub fn experimental_attach_enabled(&self) -> bool {
