@@ -9485,6 +9485,93 @@ fn test_immediate_not_blocked_by_concurrent_speculative_write() {
 }
 
 #[test]
+fn test_tx_a_rollback_does_not_clear_tx_b_immediate_override() {
+    let db = MvccTestDb::new();
+    let mvcc_store = db.mvcc_store.clone();
+
+    // TX A starts as a BEGIN IMMEDIATE-style transaction and owns both the
+    // exclusive lock and the speculative-write override marker.
+    let tx_a_conn = db.conn.clone();
+    let tx_a_id = mvcc_store
+        .begin_exclusive_tx(tx_a_conn.pager.load().clone(), None, true)
+        .unwrap();
+
+    let tx_a_released_exclusive = Arc::new(std::sync::Barrier::new(2));
+    let tx_b_started_immediate = Arc::new(std::sync::Barrier::new(2));
+    let rollback_store = mvcc_store.clone();
+    let rollback_thread = {
+        let tx_a_released_exclusive = tx_a_released_exclusive.clone();
+        let tx_b_started_immediate = tx_b_started_immediate.clone();
+        std::thread::spawn(move || {
+            // First half of TX A rollback: it is aborted and no longer blocks
+            // another BEGIN IMMEDIATE from taking the exclusive lock.
+            {
+                let tx_a = rollback_store.txs.get(&tx_a_id).unwrap();
+                tx_a.value().state.store(TransactionState::Aborted);
+                rollback_store.unlock_commit_lock_if_held(tx_a.value());
+            }
+
+            let released_tx_id = rollback_store
+                .exclusive_tx
+                .swap(NO_EXCLUSIVE_TX, Ordering::Release);
+            assert_eq!(released_tx_id, tx_a_id);
+
+            tx_a_released_exclusive.wait();
+            tx_b_started_immediate.wait();
+
+            // Second half of TX A rollback. This must not clear the override
+            // marker if TX B acquired it while TX A was between the two steps.
+            rollback_store.clear_speculative_write_override_for_released_tx(&tx_a_id);
+            if let Some(tx_a) = rollback_store.txs.get(&tx_a_id) {
+                tx_a.value().state.store(TransactionState::Terminated);
+            }
+            rollback_store.remove_tx(tx_a_id);
+        })
+    };
+
+    tx_a_released_exclusive.wait();
+    assert_eq!(
+        mvcc_store.exclusive_tx.load(Ordering::Acquire),
+        NO_EXCLUSIVE_TX
+    );
+
+    // TX B starts while TX A rollback is paused after releasing exclusive_tx
+    // but before clearing can_override_speculative_write_lock.
+    let tx_b_conn = db.db.connect().unwrap();
+    let tx_b_result = mvcc_store.begin_exclusive_tx(tx_b_conn.pager.load().clone(), None, true);
+    let override_tx_id = mvcc_store
+        .can_override_speculative_write_lock
+        .load(Ordering::Acquire);
+    // TX A is still rolling back here: released exclusive_tx, but not removed.
+    let tx_a = mvcc_store.txs.get(&tx_a_id).unwrap();
+    assert_eq!(tx_a.value().state.load(), TransactionState::Aborted);
+
+    tx_b_started_immediate.wait();
+    let tx_b_id = tx_b_result.unwrap();
+    assert_eq!(
+        override_tx_id, tx_b_id,
+        "TX B BEGIN IMMEDIATE should set speculative-write override"
+    );
+
+    rollback_thread.join().unwrap();
+    // TX A has finished rollback after TX B began. TX B must still own the
+    // override marker, otherwise it can spuriously hit WriteWriteConflict.
+    assert_eq!(
+        mvcc_store
+            .can_override_speculative_write_lock
+            .load(Ordering::Acquire),
+        tx_b_id
+    );
+
+    mvcc_store.rollback_tx(
+        tx_b_id,
+        tx_b_conn.pager.load().clone(),
+        &tx_b_conn,
+        crate::MAIN_DB_ID,
+    );
+}
+
+#[test]
 fn test_immediate_and_concurrent_non_conflicting_updates_both_commit() {
     let db = MvccTestDbNoConn::new_with_random_db();
     let conn0 = db.connect();

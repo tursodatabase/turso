@@ -3988,9 +3988,17 @@ impl<Clock: LogicalClock> MvStore<Clock> {
     fn release_exclusive_tx(&self, tx_id: &TxID) {
         tracing::trace!("release_exclusive_tx(tx_id={})", tx_id);
         let prev = self.exclusive_tx.swap(NO_EXCLUSIVE_TX, Ordering::Release);
-        self.can_override_speculative_write_lock
-            .store(NO_EXCLUSIVE_TX, Ordering::Release);
         turso_assert_eq!(prev, *tx_id, "exclusive lock released by wrong tx", { "expected_tx_id": *tx_id, "actual_tx_id": prev });
+        self.clear_speculative_write_override_for_released_tx(tx_id);
+    }
+
+    fn clear_speculative_write_override_for_released_tx(&self, tx_id: &TxID) {
+        let _ = self.can_override_speculative_write_lock.compare_exchange(
+            *tx_id,
+            NO_EXCLUSIVE_TX,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
     }
 
     /// Generates next unique transaction id
