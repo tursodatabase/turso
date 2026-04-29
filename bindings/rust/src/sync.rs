@@ -481,6 +481,7 @@ impl IoWorker {
 
     // Called from the IO thread once progress has been made to notify all pending futures.
     fn notify_progress(wakers: &Arc<Mutex<Vec<Waker>>>) {
+        tracing::trace!("notify_progress");
         let wakers = {
             let mut guard = wakers.lock().unwrap();
             std::mem::take(&mut *guard)
@@ -579,6 +580,7 @@ impl IoWorker {
         headers: &[(String, String)],
         completion: turso_sync_sdk_kit::sync_engine_io::SyncEngineIoCompletion<Bytes>,
     ) {
+        tracing::trace!("process_http: method={}, path={}", method, path);
         // Build full URL.
         let full_url = if path.starts_with("http://") || path.starts_with("https://") {
             path.to_string()
