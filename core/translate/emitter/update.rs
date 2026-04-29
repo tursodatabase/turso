@@ -8,7 +8,7 @@ use crate::vdbe::builder::SelfTableContext;
 use crate::{
     ast, emit_explain,
     error::{SQLITE_CONSTRAINT_NOTNULL, SQLITE_CONSTRAINT_PRIMARYKEY, SQLITE_CONSTRAINT_UNIQUE},
-    schema::{BTreeTable, CheckConstraint, Index, ROWID_SENTINEL},
+    schema::{BTreeTable, CheckConstraint, Index, EXPR_INDEX_SENTINEL, ROWID_SENTINEL},
     sync::Arc,
     translate::{
         display::format_eqp_detail,
@@ -1552,12 +1552,20 @@ fn emit_update_insns<'a>(
     let has_returning = returning.as_ref().is_some_and(|r| !r.is_empty());
     if let Table::BTree(ref btree) = target_table.table {
         let has_check_constraints = !btree.check_constraints.is_empty();
+        let index_references_virtual_column = indexes_to_update
+            .iter()
+            .flat_map(|idx| idx.columns.iter())
+            .any(|col| {
+                col.pos_in_table != EXPR_INDEX_SENTINEL
+                    && btree.columns()[col.pos_in_table].is_virtual_generated()
+            });
 
         if update_affects_virtual_columns
             || has_before_triggers
             || has_after_triggers
             || has_returning
             || has_check_constraints
+            || index_references_virtual_column
         {
             let columns = target_table.table.columns();
 
