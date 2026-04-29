@@ -189,21 +189,25 @@ impl<TBytes: AsRef<[u8]>> Clone for SyncEngineIoCompletion<TBytes> {
 impl<TBytes: AsRef<[u8]>> SyncEngineIoCompletion<TBytes> {
     /// set error to the IO completion which will trigger appropriate error path on the sync-engine side
     pub fn poison(&self, err: String) {
+        tracing::debug!("completion::poison: {err}");
         let mut completion = self.inner.lock().unwrap();
         completion.err = Some(err);
     }
     /// set HTTP status code for HTTP IO request
     pub fn status(&self, value: u32) {
+        tracing::debug!("completion::status: {value}");
         let mut completion = self.inner.lock().unwrap();
         completion.status = Some(value as u16);
     }
     /// push raw data to the IO request (FullRead or HTTP)
     pub fn push_buffer(&self, value: TBytes) {
+        tracing::debug!("completion::push_buffer");
         let mut completion = self.inner.lock().unwrap();
         completion.chunks.push_back(value);
     }
     /// mark completion as done (sync-engine will stop waiting for more data to arrive)
     pub fn done(&self) {
+        tracing::debug!("completion::done");
         let mut completion = self.inner.lock().unwrap();
         completion.finished = true;
     }

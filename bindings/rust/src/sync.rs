@@ -498,9 +498,8 @@ impl IoWorker {
         // Create HTTPS-capable Hyper client.
         let mut http_connector = HttpConnector::new();
         http_connector.enforce_http(false);
-        let https: HttpsConnector<HttpConnector> = HttpsConnector::new();
-        let client: Client<HttpsConnector<HttpConnector>, Full<Bytes>> =
-            Client::builder(TokioExecutor::new()).build::<_, Full<Bytes>>(https);
+        let https = HttpsConnector::new();
+        let client = Client::builder(TokioExecutor::new()).build::<_, Full<Bytes>>(https);
 
         while rx.recv().await.is_some() {
             // Process all pending items in the sync IO queue.
