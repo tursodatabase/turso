@@ -192,7 +192,8 @@ pub struct SelectFree(pub Select);
 
 impl Arbitrary for SelectFree {
     fn arbitrary<R: Rng + ?Sized, C: GenerationContext>(rng: &mut R, env: &C) -> Self {
-        let expr = Predicate(Expr::arbitrary_sized(rng, env, 8));
+        let expr_size = env.opts().query.select.free_expr_size as usize;
+        let expr = Predicate(Expr::arbitrary_sized(rng, env, expr_size));
         let select = Select::expr(expr);
         Self(select)
     }

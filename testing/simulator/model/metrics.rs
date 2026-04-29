@@ -145,6 +145,9 @@ impl InteractionStats {
             Query::Begin(_) => self.begin_count += 1,
             Query::Commit(_) => self.commit_count += 1,
             Query::Rollback(_) => self.rollback_count += 1,
+            Query::Savepoint(_) => self.begin_count += 1,
+            Query::RollbackToSavepoint(_) => self.rollback_count += 1,
+            Query::ReleaseSavepoint(_) => self.commit_count += 1,
             Query::AlterTable(_) => self.alter_table_count += 1,
             Query::DropIndex(_) => self.drop_index_count += 1,
             Query::Placeholder => {}

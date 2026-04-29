@@ -19,7 +19,7 @@ use sql_generation::{
             transaction::{Begin, Commit, Rollback},
             update::{SetValue, Update},
         },
-        table::SimValue,
+        table::{ColumnType, SimValue, Table},
     },
 };
 use strum::IntoEnumIterator;
@@ -30,7 +30,8 @@ use crate::{
     common::print_diff,
     generation::{Shadow, WeightedDistribution, query::QueryDistribution},
     model::{
-        Query, QueryCapabilities, QueryDiscriminants, ResultSet,
+        Query, QueryCapabilities, QueryDiscriminants, ReleaseSavepoint, ResultSet,
+        RollbackToSavepoint, Savepoint,
         interactions::{
             Assertion, Interaction, InteractionBuilder, InteractionType, PropertyMetadata,
         },
@@ -225,6 +226,14 @@ impl Property {
                         }
                         _ => Some(query),
                     }
+                }
+            }
+            Property::SavepointRollback { .. } => {
+                |rng: &mut R, ctx: &G, _query_distr: &QueryDistribution, property: &Property| {
+                    let Property::SavepointRollback { write_kinds, .. } = property else {
+                        unreachable!()
+                    };
+                    random_main_table_write(rng, ctx, write_kinds)
                 }
             }
             Property::Queries { .. } => {
@@ -1197,6 +1206,33 @@ impl Property {
                 .into_iter()
                 .map(|query| InteractionBuilder::with_interaction(InteractionType::Query(query)))
                 .collect(),
+            Property::SavepointRollback {
+                queries, tables, ..
+            } => {
+                let savepoint_name = format!("sim_sp_{}", id.get());
+                let mut interactions = Vec::with_capacity(queries.len() + 4 + tables.len() * 2);
+                interactions.push(InteractionBuilder::with_interaction(
+                    InteractionType::Query(Query::Savepoint(Savepoint {
+                        name: savepoint_name.clone(),
+                    })),
+                ));
+                interactions.extend(queries.clone().into_iter().map(|query| {
+                    InteractionBuilder::with_interaction(InteractionType::Query(query))
+                }));
+                interactions.push(InteractionBuilder::with_interaction(
+                    InteractionType::Query(Query::RollbackToSavepoint(RollbackToSavepoint {
+                        name: savepoint_name.clone(),
+                    })),
+                ));
+                interactions.push(InteractionBuilder::with_interaction(
+                    InteractionType::Query(Query::ReleaseSavepoint(ReleaseSavepoint {
+                        name: savepoint_name,
+                    })),
+                ));
+                interactions.extend(assert_all_table_values(tables, connection_index));
+                interactions.push(assert_integrity_check(tables, connection_index));
+                interactions
+            }
         };
 
         assert!(!interactions.is_empty());
@@ -1211,6 +1247,230 @@ impl Property {
                 builder.build().unwrap()
             })
             .collect()
+    }
+}
+
+fn random_main_table_write<R: rand::Rng + ?Sized>(
+    rng: &mut R,
+    ctx: &impl GenerationContext,
+    write_kinds: &[QueryDiscriminants],
+) -> Option<Query> {
+    let tables = ctx
+        .tables()
+        .iter()
+        .filter(|table| !table.name.contains('.'))
+        .collect::<Vec<_>>();
+
+    if tables.is_empty() {
+        return None;
+    }
+
+    let table = *pick(&tables, rng);
+    let write_kind = pick(write_kinds, rng);
+
+    match write_kind {
+        QueryDiscriminants::Insert => Some(random_main_table_insert(rng, ctx, table)),
+        QueryDiscriminants::Update => Some(random_main_table_update(rng, ctx, table)),
+        QueryDiscriminants::Delete => Some(random_main_table_delete(rng, table)),
+        _ => None,
+    }
+}
+
+fn random_main_table_insert<R: rand::Rng + ?Sized>(
+    rng: &mut R,
+    ctx: &impl GenerationContext,
+    table: &Table,
+) -> Query {
+    const UNIQUE_BASE_OFFSET_RANGE: std::ops::Range<i64> = 3_000_000_000..4_000_000_000;
+    const UNIQUE_COL_STRIDE: i64 = 10_000_000;
+
+    let num_rows = rng.random_range(1..=5);
+    let base_offset: i64 = rng.random_range(UNIQUE_BASE_OFFSET_RANGE);
+    let values = (0..num_rows)
+        .map(|row_idx| {
+            table
+                .columns
+                .iter()
+                .enumerate()
+                .map(|(col_idx, column)| {
+                    if column.has_unique_or_pk() {
+                        let offset =
+                            base_offset + (col_idx as i64 * UNIQUE_COL_STRIDE) + row_idx as i64;
+                        SimValue::unique_for_type(&column.column_type, offset)
+                    } else {
+                        SimValue::arbitrary_from(rng, ctx, &column.column_type)
+                    }
+                })
+                .collect()
+        })
+        .collect();
+
+    Query::Insert(Insert::Values {
+        table: table.name.clone(),
+        values,
+        on_conflict: None,
+    })
+}
+
+fn random_main_table_update<R: rand::Rng + ?Sized>(
+    rng: &mut R,
+    ctx: &impl GenerationContext,
+    table: &Table,
+) -> Query {
+    let update_opts = &ctx.opts().query.update;
+    let unique_columns = table
+        .columns
+        .iter()
+        .enumerate()
+        .filter(|(_, column)| {
+            column.has_unique_or_pk() && !matches!(column.column_type, ColumnType::Blob)
+        })
+        .collect::<Vec<_>>();
+    let non_unique_columns = table
+        .columns
+        .iter()
+        .filter(|column| !column.has_unique_or_pk())
+        .collect::<Vec<_>>();
+
+    let last_row_idx = table.rows.len().saturating_sub(1);
+    let conflict_capable_columns = if table.rows.len() >= 2 {
+        unique_columns
+            .iter()
+            .filter(|(col_idx, _)| table.rows[0][*col_idx] != table.rows[last_row_idx][*col_idx])
+            .copied()
+            .collect::<Vec<_>>()
+    } else {
+        Vec::new()
+    };
+
+    if update_opts.force_late_failure
+        && !conflict_capable_columns.is_empty()
+        && !non_unique_columns.is_empty()
+    {
+        let (col_idx, unique_col) = *pick(&conflict_capable_columns, rng);
+        let marker_col = *pick(&non_unique_columns, rng);
+        let first_val = table.rows[0][col_idx].clone();
+        let last_val = table.rows[last_row_idx][col_idx].clone();
+        let marker_value = match update_opts.padding_size {
+            Some(size) if matches!(marker_col.column_type, ColumnType::Blob) => {
+                SimValue(turso_core::Value::Blob(vec![b'X'; size]))
+            }
+            Some(size) => SimValue(turso_core::Value::Text("X".repeat(size).into())),
+            None => SimValue::arbitrary_from(rng, ctx, &marker_col.column_type),
+        };
+
+        return Query::Update(Update {
+            table: table.name.clone(),
+            set_values: vec![
+                (marker_col.name.clone(), SetValue::Simple(marker_value)),
+                (
+                    unique_col.name.clone(),
+                    SetValue::CaseWhen {
+                        condition: Box::new(Predicate::eq(
+                            Predicate::column(unique_col.name.clone()),
+                            Predicate::value(last_val),
+                        )),
+                        then_value: first_val,
+                        else_column: unique_col.name.clone(),
+                    },
+                ),
+            ],
+            predicate: Predicate::true_(),
+        });
+    }
+
+    let column = if non_unique_columns.is_empty() {
+        pick(&table.columns, rng)
+    } else {
+        *pick(&non_unique_columns, rng)
+    };
+    let value = match (update_opts.padding_size, &column.column_type) {
+        (Some(size), ColumnType::Blob) => SimValue(turso_core::Value::Blob(vec![b'X'; size])),
+        (Some(size), ColumnType::Text) => {
+            SimValue(turso_core::Value::Text("X".repeat(size).into()))
+        }
+        _ => SimValue::arbitrary_from(rng, ctx, &column.column_type),
+    };
+
+    Query::Update(Update {
+        table: table.name.clone(),
+        set_values: vec![(column.name.clone(), SetValue::Simple(value))],
+        predicate: if rng.random_bool(0.8) {
+            Predicate::true_()
+        } else {
+            Predicate::false_()
+        },
+    })
+}
+
+fn random_main_table_delete<R: rand::Rng + ?Sized>(rng: &mut R, table: &Table) -> Query {
+    Query::Delete(Delete {
+        table: table.name.clone(),
+        predicate: if rng.random_bool(0.5) {
+            Predicate::true_()
+        } else {
+            Predicate::false_()
+        },
+    })
+}
+
+fn assert_integrity_check(tables: &[String], connection_index: usize) -> InteractionBuilder {
+    let tables = tables.to_vec();
+    InteractionBuilder::with_interaction(InteractionType::Assertion(Assertion::new(
+        "PRAGMA integrity_check should be ok after savepoint rollback".to_string(),
+        move |_stack: &Vec<ResultSet>, env: &mut SimulatorEnv| {
+            let result = run_integrity_check(env, connection_index)?;
+            if result == "ok" {
+                Ok(Ok(()))
+            } else {
+                Ok(Err(format!("integrity_check returned {result:?}")))
+            }
+        },
+        tables,
+    )))
+}
+
+fn run_integrity_check(
+    env: &mut SimulatorEnv,
+    connection_index: usize,
+) -> turso_core::Result<String> {
+    match &mut env.connections[connection_index] {
+        crate::runner::env::SimConnection::LimboConnection(conn) => {
+            let mut rows = conn.query("PRAGMA integrity_check")?.ok_or_else(|| {
+                LimboError::InternalError("integrity_check returned no rows".into())
+            })?;
+            let mut result = Vec::new();
+            rows.run_with_row_callback(|row| {
+                let value = row
+                    .get_value(0)
+                    .to_text()
+                    .ok_or_else(|| {
+                        LimboError::InternalError(
+                            "integrity_check returned a non-text value".to_string(),
+                        )
+                    })?
+                    .to_string();
+                result.push(value);
+                Ok(())
+            })?;
+            Ok(result.join("\n"))
+        }
+        crate::runner::env::SimConnection::SQLiteConnection(conn) => {
+            let mut stmt = conn
+                .prepare("PRAGMA integrity_check")
+                .map_err(|e| LimboError::InternalError(e.to_string()))?;
+            let rows = stmt
+                .query_map([], |row| row.get::<_, String>(0))
+                .map_err(|e| LimboError::InternalError(e.to_string()))?;
+            let mut result = Vec::new();
+            for row in rows {
+                result.push(row.map_err(|e| LimboError::InternalError(e.to_string()))?);
+            }
+            Ok(result.join("\n"))
+        }
+        crate::runner::env::SimConnection::Disconnected => Err(LimboError::InternalError(
+            "connection is disconnected during integrity_check assertion".into(),
+        )),
     }
 }
 
@@ -1382,6 +1642,39 @@ fn property_read_your_updates_back<R: rand::Rng + ?Sized>(
         update,
         select_before: select.clone(),
         select_after: select,
+    }
+}
+
+fn property_savepoint_rollback<R: rand::Rng + ?Sized>(
+    rng: &mut R,
+    query_distr: &QueryDistribution,
+    ctx: &impl GenerationContext,
+    _mvcc: bool,
+) -> Property {
+    let tables = ctx
+        .tables()
+        .iter()
+        .filter(|table| !table.name.contains('.'))
+        .map(|table| table.name.clone())
+        .collect::<Vec<_>>();
+    assert!(!tables.is_empty());
+    let write_kinds = query_distr
+        .positive_items()
+        .filter(|query| {
+            matches!(
+                query,
+                QueryDiscriminants::Insert
+                    | QueryDiscriminants::Update
+                    | QueryDiscriminants::Delete
+            )
+        })
+        .collect::<Vec<_>>();
+    assert!(!write_kinds.is_empty());
+    let amount = rng.random_range(1..=5);
+    Property::SavepointRollback {
+        queries: std::iter::repeat_n(Query::Placeholder, amount).collect(),
+        tables,
+        write_kinds,
     }
 }
 
@@ -1605,6 +1898,7 @@ impl PropertyDiscriminants {
         match self {
             PropertyDiscriminants::InsertValuesSelect => property_insert_values_select,
             PropertyDiscriminants::ReadYourUpdatesBack => property_read_your_updates_back,
+            PropertyDiscriminants::SavepointRollback => property_savepoint_rollback,
             PropertyDiscriminants::TableHasExpectedContent => property_table_has_expected_content,
             PropertyDiscriminants::AllTableHaveExpectedContent => {
                 property_all_tables_have_expected_content
@@ -1637,7 +1931,7 @@ impl PropertyDiscriminants {
                 if !env.opts.disable_insert_values_select && !ctx.tables().is_empty() {
                     let has_non_unique_table =
                         ctx.tables().iter().any(|t| !t.has_any_unique_column());
-                    if has_non_unique_table {
+                    if has_non_unique_table && remaining.select > 0 && remaining.insert > 0 {
                         u32::min(remaining.select, remaining.insert).max(1)
                     } else {
                         0 // all tables have UNIQUE columns, skip this property
@@ -1648,7 +1942,21 @@ impl PropertyDiscriminants {
             }
 
             PropertyDiscriminants::ReadYourUpdatesBack => {
-                u32::min(remaining.select, remaining.insert).max(1)
+                if remaining.select > 0 && remaining.update > 0 {
+                    u32::min(remaining.select, remaining.update).max(1)
+                } else {
+                    0
+                }
+            }
+            PropertyDiscriminants::SavepointRollback => {
+                if !env.opts.disable_savepoint_rollback
+                    && !env.profile.mvcc
+                    && ctx.tables().iter().any(|table| !table.name.contains('.'))
+                {
+                    remaining.insert + remaining.update + remaining.delete
+                } else {
+                    0
+                }
             }
             PropertyDiscriminants::TableHasExpectedContent => {
                 if !ctx.tables().is_empty() {
@@ -1750,6 +2058,7 @@ impl PropertyDiscriminants {
             PropertyDiscriminants::ReadYourUpdatesBack => {
                 QueryCapabilities::SELECT.union(QueryCapabilities::UPDATE)
             }
+            PropertyDiscriminants::SavepointRollback => QueryCapabilities::INSERT,
             PropertyDiscriminants::TableHasExpectedContent => QueryCapabilities::SELECT,
             PropertyDiscriminants::AllTableHaveExpectedContent => QueryCapabilities::SELECT,
             PropertyDiscriminants::DoubleCreateFailure => QueryCapabilities::CREATE,

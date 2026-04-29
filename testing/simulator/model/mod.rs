@@ -240,8 +240,42 @@ pub mod property;
 
 pub(crate) type ResultSet = turso_core::Result<Vec<Vec<SimValue>>>;
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Savepoint {
+    pub name: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RollbackToSavepoint {
+    pub name: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReleaseSavepoint {
+    pub name: String,
+}
+
+impl Display for Savepoint {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "SAVEPOINT {}", self.name)
+    }
+}
+
+impl Display for RollbackToSavepoint {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "ROLLBACK TO {}", self.name)
+    }
+}
+
+impl Display for ReleaseSavepoint {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "RELEASE {}", self.name)
+    }
+}
+
 // This type represents the potential queries on the database.
 #[derive(Debug, Clone, Serialize, Deserialize, strum::EnumDiscriminants)]
+#[strum_discriminants(derive(Serialize, Deserialize))]
 pub enum Query {
     Create(Create),
     Select(Select),
@@ -255,6 +289,9 @@ pub enum Query {
     Begin(Begin),
     Commit(Commit),
     Rollback(Rollback),
+    Savepoint(Savepoint),
+    RollbackToSavepoint(RollbackToSavepoint),
+    ReleaseSavepoint(ReleaseSavepoint),
     Pragma(Pragma),
     /// Placeholder query that still needs to be generated
     Placeholder,
@@ -306,6 +343,9 @@ impl Query {
             Query::Begin(_)
             | Query::Commit(_)
             | Query::Rollback(_)
+            | Query::Savepoint(_)
+            | Query::RollbackToSavepoint(_)
+            | Query::ReleaseSavepoint(_)
             | Query::Placeholder
             | Query::Pragma(_) => IndexSet::new(),
         }
@@ -331,6 +371,9 @@ impl Query {
                 table_name: table, ..
             }) => vec![table.clone()],
             Query::Begin(..) | Query::Commit(..) | Query::Rollback(..) => vec![],
+            Query::Savepoint(..) | Query::RollbackToSavepoint(..) | Query::ReleaseSavepoint(..) => {
+                vec![]
+            }
             Query::Placeholder => vec![],
             Query::Pragma(_) => vec![],
         }
@@ -340,7 +383,12 @@ impl Query {
     pub fn is_transaction(&self) -> bool {
         matches!(
             self,
-            Self::Begin(..) | Self::Commit(..) | Self::Rollback(..)
+            Self::Begin(..)
+                | Self::Commit(..)
+                | Self::Rollback(..)
+                | Self::Savepoint(..)
+                | Self::RollbackToSavepoint(..)
+                | Self::ReleaseSavepoint(..)
         )
     }
 
@@ -387,6 +435,9 @@ impl Display for Query {
             Self::Begin(begin) => write!(f, "{begin}"),
             Self::Commit(commit) => write!(f, "{commit}"),
             Self::Rollback(rollback) => write!(f, "{rollback}"),
+            Self::Savepoint(savepoint) => write!(f, "{savepoint}"),
+            Self::RollbackToSavepoint(rollback_to) => write!(f, "{rollback_to}"),
+            Self::ReleaseSavepoint(release) => write!(f, "{release}"),
             Self::Placeholder => Ok(()),
             Query::Pragma(pragma) => write!(f, "{pragma}"),
         }
@@ -413,6 +464,9 @@ impl Shadow for Query {
             Query::Begin(begin) => Ok(begin.shadow(env)),
             Query::Commit(commit) => Ok(commit.shadow(env)),
             Query::Rollback(rollback) => Ok(rollback.shadow(env)),
+            Query::Savepoint(savepoint) => Ok(savepoint.shadow(env)),
+            Query::RollbackToSavepoint(rollback_to) => rollback_to.shadow(env),
+            Query::ReleaseSavepoint(release) => release.shadow(env),
             Query::Placeholder => Ok(vec![]),
             Query::Pragma(Pragma::AutoVacuumMode(_)) => Ok(vec![]),
         }
@@ -463,7 +517,10 @@ impl From<QueryDiscriminants> for QueryCapabilities {
             QueryDiscriminants::DropIndex => Self::DROP_INDEX,
             QueryDiscriminants::Begin
             | QueryDiscriminants::Commit
-            | QueryDiscriminants::Rollback => {
+            | QueryDiscriminants::Rollback
+            | QueryDiscriminants::Savepoint
+            | QueryDiscriminants::RollbackToSavepoint
+            | QueryDiscriminants::ReleaseSavepoint => {
                 unreachable!("QueryCapabilities do not apply to transaction queries")
             }
             QueryDiscriminants::Placeholder => {
@@ -992,6 +1049,30 @@ impl Shadow for Rollback {
     fn shadow(&self, tables: &mut ShadowTablesMut) -> Self::Result {
         tables.delete_snapshot();
         vec![]
+    }
+}
+
+impl Shadow for Savepoint {
+    type Result = Vec<Vec<SimValue>>;
+    fn shadow(&self, tables: &mut ShadowTablesMut) -> Self::Result {
+        tables.savepoint(self.name.clone());
+        vec![]
+    }
+}
+
+impl Shadow for RollbackToSavepoint {
+    type Result = anyhow::Result<Vec<Vec<SimValue>>>;
+    fn shadow(&self, tables: &mut ShadowTablesMut) -> Self::Result {
+        tables.rollback_to_savepoint(&self.name)?;
+        Ok(vec![])
+    }
+}
+
+impl Shadow for ReleaseSavepoint {
+    type Result = anyhow::Result<Vec<Vec<SimValue>>>;
+    fn shadow(&self, tables: &mut ShadowTablesMut) -> Self::Result {
+        tables.release_savepoint(&self.name)?;
+        Ok(vec![])
     }
 }
 
