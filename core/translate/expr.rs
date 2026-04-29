@@ -3209,7 +3209,6 @@ pub fn translate_expr(
 
             // If we are reading a column from a table, we find the cursor that corresponds to
             // the table and read the column from the cursor.
-            // If we have a covering index, we don't have an open table cursor so we read from the index cursor.
             match &table {
                 Table::BTree(_) => {
                     let (table_cursor_id, index_cursor_id) = if is_from_outer_query_scope {
@@ -3228,8 +3227,16 @@ pub fn translate_expr(
                             )
                         }
                     } else {
-                        let table_cursor_id = if use_covering_index || use_index_method.is_some() {
+                        let table_cursor_id = if use_index_method.is_some() {
                             None
+                        } else if use_covering_index {
+                            // If we have a covering index, we don't have an open table cursor so we
+                            // read from the index cursor, but the requested column might
+                            // legitimately not be in the index if it's a dependency of a generated
+                            // column.
+                            // Example: CREATE TABLE t(c0, c1 AS (c2 + 1), c2);
+                            // CREATE INDEX i ON t(c1, c0); DELETE FROM t WHERE c0 < 'X';
+                            program.resolve_cursor_id_safe(&CursorKey::table(*table_ref_id))
                         } else {
                             Some(program.resolve_cursor_id(&CursorKey::table(*table_ref_id)))
                         };
