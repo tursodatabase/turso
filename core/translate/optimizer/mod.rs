@@ -905,43 +905,36 @@ fn update_write_set_reason(
             break 'requires Some(DmlSafetyReason::ReplaceMode);
         }
 
+        let rowid_alias_used = plan.set_clauses.iter().any(|set_clause| {
+            set_clause.column_index != ROWID_SENTINEL
+                && btree_table.columns()[set_clause.column_index].is_rowid_alias()
+        });
+        let direct_rowid_update = plan
+            .set_clauses
+            .iter()
+            .any(|set_clause| set_clause.column_index == ROWID_SENTINEL);
+        if rowid_alias_used || direct_rowid_update {
+            break 'requires Some(DmlSafetyReason::KeyMutation);
+        }
+
         let Some(index) = table_ref.op.index() else {
-            let rowid_alias_used = plan.set_clauses.iter().any(|set_clause| {
-                set_clause.column_index != ROWID_SENTINEL
-                    && btree_table.columns()[set_clause.column_index].is_rowid_alias()
-            });
-            if rowid_alias_used {
-                break 'requires Some(DmlSafetyReason::KeyMutation);
-            }
-            let direct_rowid_update = plan
-                .set_clauses
-                .iter()
-                .any(|set_clause| set_clause.column_index == ROWID_SENTINEL);
-            if direct_rowid_update {
-                break 'requires Some(DmlSafetyReason::KeyMutation);
-            }
             break 'requires None;
         };
 
-        for set_clause in plan.set_clauses.iter() {
-            for c in index.columns.iter() {
-                if let Some(ref expr) = c.expr {
-                    let expr_idx_cols_mask =
-                        expression_index_column_usage(expr.as_ref(), table_ref, resolver)?;
-                    if expr_idx_cols_mask.get(set_clause.column_index) {
-                        break 'requires Some(DmlSafetyReason::KeyMutation);
-                    }
-                }
-            }
-        }
-
         let affected_cols = btree_table.columns_affected_by_update(&updated_cols)?;
-        if index
-            .columns
-            .iter()
-            .any(|c| affected_cols.get(c.pos_in_table))
-        {
-            break 'requires Some(DmlSafetyReason::KeyMutation);
+        for c in index.columns.iter() {
+            if let Some(ref expr) = c.expr {
+                let expr_idx_cols_mask =
+                    expression_index_column_usage(expr.as_ref(), table_ref, resolver)?;
+                if expr_idx_cols_mask
+                    .iter()
+                    .any(|cidx| affected_cols.get(cidx))
+                {
+                    break 'requires Some(DmlSafetyReason::KeyMutation);
+                }
+            } else if affected_cols.get(c.pos_in_table) {
+                break 'requires Some(DmlSafetyReason::KeyMutation);
+            }
         }
         break 'requires None;
     };
