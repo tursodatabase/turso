@@ -5888,7 +5888,7 @@ pub fn bind_and_rewrite_expr<'a>(
         &mut |expr: &mut ast::Expr| -> Result<WalkControl> {
             match expr {
                 Expr::Id(id) => {
-                    let _stack = crate::stack::trace_scope("bind_id");
+                    crate::stack::trace_stack!("bind_id");
                     let Some(referenced_tables) = &mut referenced_tables else {
                         if binding_behavior == BindingBehavior::AllowUnboundIdentifiers {
                             return Ok(WalkControl::Continue);
@@ -6047,7 +6047,7 @@ pub fn bind_and_rewrite_expr<'a>(
                     }
                 }
                 Expr::Qualified(tbl, id) => {
-                    let _stack = crate::stack::trace_scope("bind_qualified");
+                    crate::stack::trace_stack!("bind_qualified");
                     // Resolve a `<tbl>.<id>` reference.
                     //
                     // Two-stage lookup with shadowing:
@@ -6070,11 +6070,11 @@ pub fn bind_and_rewrite_expr<'a>(
                         );
                     };
                     let normalized_table_name = {
-                        let _stack = crate::stack::trace_scope("qualified:normalize_table");
+                        crate::stack::trace_stack!("qualified:normalize_table");
                         normalize_ident(tbl.as_str())
                     };
                     let normalized_id = {
-                        let _stack = crate::stack::trace_scope("qualified:normalize_column");
+                        crate::stack::trace_stack!("qualified:normalize_column");
                         normalize_ident(id.as_str())
                     };
 
@@ -6095,7 +6095,7 @@ pub fn bind_and_rewrite_expr<'a>(
 
                     // --- Stage 1: search the current scope's FROM tables. ---
                     {
-                        let _stack = crate::stack::trace_scope("qualified:find_table");
+                        crate::stack::trace_stack!("qualified:find_table");
                         for joined_table in referenced_tables
                             .joined_tables()
                             .iter()
@@ -6143,7 +6143,6 @@ pub fn bind_and_rewrite_expr<'a>(
                     // CTE is consumed into a FROM, column resolution must go through the
                     // corresponding `joined_table`, not the definition-only ref.
                     if !identifier_matched {
-                        let _stack = crate::stack::trace_scope("qualified:find_outer_ref");
                         let nearest_outer_scope = referenced_tables
                             .outer_query_refs()
                             .iter()
@@ -6204,7 +6203,7 @@ pub fn bind_and_rewrite_expr<'a>(
                         // definition refs so any other future use of `cte_definition_only`
                         // still falls through to "no such table".
                         let is_definition_only_cte = {
-                            let _stack = crate::stack::trace_scope("qualified:outer_ref_check");
+                            crate::stack::trace_stack!("qualified:outer_ref_check");
                             referenced_tables
                                 .find_outer_query_ref_by_identifier(&normalized_table_name)
                                 .is_some_and(|outer_ref| {
@@ -6235,12 +6234,11 @@ pub fn bind_and_rewrite_expr<'a>(
                         // the combinatorial explosion (CREATE TYPE, CREATE TABLE, ALTER TABLE)
                         // makes that impractical. Deterministic precedence is sufficient.
                         let field_name = {
-                            let _stack = crate::stack::trace_scope("qualified:normalize_field");
+                            crate::stack::trace_stack!("qualified:normalize_field");
                             normalize_ident(id.as_str())
                         };
                         if let Some(m) = {
-                            let _stack =
-                                crate::stack::trace_scope("qualified:find_custom_type_column");
+                            crate::stack::trace_stack!("qualified:find_custom_type_column");
                             find_custom_type_column(
                                 referenced_tables,
                                 &normalized_table_name,
@@ -6248,8 +6246,7 @@ pub fn bind_and_rewrite_expr<'a>(
                             )?
                         } {
                             {
-                                let _stack =
-                                    crate::stack::trace_scope("qualified:make_field_access");
+                                crate::stack::trace_stack!("qualified:make_field_access");
                                 *expr = make_field_access_expr(
                                     m.table_id,
                                     m.col_idx,
@@ -6259,8 +6256,7 @@ pub fn bind_and_rewrite_expr<'a>(
                                 );
                             }
                             {
-                                let _stack =
-                                    crate::stack::trace_scope("qualified:mark_column_used");
+                                crate::stack::trace_stack!("qualified:mark_column_used");
                                 referenced_tables.mark_column_used(m.table_id, m.col_idx);
                             }
                             return Ok(WalkControl::Continue);
@@ -6279,7 +6275,7 @@ pub fn bind_and_rewrite_expr<'a>(
                             is_rowid_alias,
                         } => {
                             {
-                                let _stack = crate::stack::trace_scope("qualified:rewrite_column");
+                                crate::stack::trace_stack!("qualified:rewrite_column");
                                 *expr = Expr::Column {
                                     database: None, // TODO: support different databases
                                     table: tbl_id,
@@ -6289,14 +6285,13 @@ pub fn bind_and_rewrite_expr<'a>(
                             }
                             tracing::debug!("rewritten to column");
                             {
-                                let _stack =
-                                    crate::stack::trace_scope("qualified:mark_column_used");
+                                crate::stack::trace_stack!("qualified:mark_column_used");
                                 referenced_tables.mark_column_used(tbl_id, col_idx);
                             }
                         }
                         QualifiedMatch::RowId => {
                             {
-                                let _stack = crate::stack::trace_scope("qualified:rewrite_rowid");
+                                crate::stack::trace_stack!("qualified:rewrite_rowid");
                                 *expr = Expr::RowId {
                                     database: None, // TODO: support different databases
                                     table: tbl_id,
@@ -6304,7 +6299,7 @@ pub fn bind_and_rewrite_expr<'a>(
                             }
                             tracing::debug!("rewritten to rowid");
                             {
-                                let _stack = crate::stack::trace_scope("qualified:mark_rowid_used");
+                                crate::stack::trace_stack!("qualified:mark_rowid_used");
                                 referenced_tables.mark_rowid_referenced(tbl_id);
                             }
                         }
@@ -6312,7 +6307,7 @@ pub fn bind_and_rewrite_expr<'a>(
                     return Ok(WalkControl::Continue);
                 }
                 Expr::DoublyQualified(db_name, tbl_name, col_name) => {
-                    let _stack = crate::stack::trace_scope("bind_doubly_qualified");
+                    crate::stack::trace_stack!("bind_doubly_qualified");
                     // Clone the names upfront so we can reassign *expr later
                     // without lifetime conflicts.
                     let db_name_str = db_name.as_str().to_string();

@@ -80,7 +80,7 @@ pub fn translate(
 ) -> Result<Program> {
     tracing::trace!("querying {}", input);
     let change_cnt_on = {
-        let _stack = crate::stack::trace_scope("change_count");
+        crate::stack::trace_stack!("change_count");
         matches!(
             stmt,
             ast::Stmt::CreateIndex { .. }
@@ -92,7 +92,7 @@ pub fn translate(
 
     // Boxed so the ~800 B builder sits on the heap instead of the prepare frame.
     let mut program = {
-        let _stack = crate::stack::trace_scope("program_builder_new");
+        crate::stack::trace_stack!("program_builder_new");
         Box::new(ProgramBuilder::new(
             query_mode,
             connection.get_capture_data_changes_info().clone(),
@@ -102,11 +102,11 @@ pub fn translate(
     };
 
     {
-        let _stack = crate::stack::trace_scope("prologue");
+        crate::stack::trace_stack!("prologue");
         program.prologue();
     }
     let mut resolver = {
-        let _stack = crate::stack::trace_scope("resolver_new");
+        crate::stack::trace_stack!("resolver_new");
         Resolver::new(
             schema,
             connection.database_schemas(),
@@ -119,7 +119,7 @@ pub fn translate(
     };
 
     {
-        let _stack = crate::stack::trace_scope("dispatch");
+        crate::stack::trace_stack!("dispatch");
         match stmt {
             // There can be no nesting with pragma, so lift it up here
             ast::Stmt::Pragma { name, body } => {
@@ -137,12 +137,12 @@ pub fn translate(
     };
 
     {
-        let _stack = crate::stack::trace_scope("epilogue");
+        crate::stack::trace_stack!("epilogue");
         program.epilogue(schema);
     }
 
     {
-        let _stack = crate::stack::trace_scope("build");
+        crate::stack::trace_stack!("build");
         program.build(connection, change_cnt_on, input)
     }
 }
@@ -159,7 +159,7 @@ pub fn translate_inner(
     input: &str,
 ) -> Result<()> {
     let is_write = {
-        let _stack = crate::stack::trace_scope("classify_write");
+        crate::stack::trace_stack!("classify_write");
         matches!(
             stmt,
             ast::Stmt::AlterTable { .. }
@@ -185,7 +185,7 @@ pub fn translate_inner(
         )
     };
     let is_vacuum = {
-        let _stack = crate::stack::trace_scope("classify_vacuum");
+        crate::stack::trace_stack!("classify_vacuum");
         matches!(stmt, ast::Stmt::Vacuum { .. })
     };
 
@@ -198,12 +198,12 @@ pub fn translate_inner(
     }
 
     let is_select = {
-        let _stack = crate::stack::trace_scope("classify_select");
+        crate::stack::trace_stack!("classify_select");
         matches!(stmt, ast::Stmt::Select { .. })
     };
 
     {
-        let _stack = crate::stack::trace_scope("dispatch");
+        crate::stack::trace_stack!("dispatch");
         match stmt {
             ast::Stmt::AlterTable(alter) => {
                 translate_alter_table(alter, resolver, program, connection, input)?;
@@ -422,9 +422,12 @@ pub fn translate_inner(
                 }
                 translate_update(update, resolver, program, connection)?
             }
-            ast::Stmt::Vacuum { name, into } => {
-                vacuum::translate_vacuum(program, name.as_ref(), into.as_deref(), connection.clone())?
-            }
+            ast::Stmt::Vacuum { name, into } => vacuum::translate_vacuum(
+                program,
+                name.as_ref(),
+                into.as_deref(),
+                connection.clone(),
+            )?,
             ast::Stmt::Insert {
                 with,
                 or_conflict,
@@ -448,13 +451,13 @@ pub fn translate_inner(
 
     // Indicate write operations so that in the epilogue we can emit the correct type of transaction
     if is_write {
-        let _stack = crate::stack::trace_scope("begin_write_operation");
+        crate::stack::trace_stack!("begin_write_operation");
         program.begin_write_operation();
     }
 
     // Indicate read operations so that in the epilogue we can emit the correct type of transaction
     if is_select && !program.table_references.is_empty() {
-        let _stack = crate::stack::trace_scope("begin_read_operation");
+        crate::stack::trace_stack!("begin_read_operation");
         program.begin_read_operation();
     }
 

@@ -600,18 +600,12 @@ fn execute_trigger_commands(
     let compile_result = (|| -> Result<()> {
         for command in trigger.commands.iter() {
             let stmt = {
-                let _stack = crate::stack::trace_scope_with_detail(
-                    "rewrite_command",
-                    trigger_command_kind(command),
-                );
+                crate::stack::trace_stack!("rewrite_command", trigger_command_kind(command),);
                 trigger_cmd_to_stmt_for_subprogram(command, &subprogram_ctx)?
             };
             subprogram_builder.prologue();
             {
-                let _stack = crate::stack::trace_scope_with_detail(
-                    "translate_command",
-                    trigger_command_kind(command),
-                );
+                crate::stack::trace_stack!("translate_command", trigger_command_kind(command),);
                 translate_inner(
                     stmt,
                     resolver,
@@ -635,11 +629,11 @@ fn execute_trigger_commands(
     resolver.trigger_context = prev_trigger_context;
     compile_result?;
     {
-        let _stack = crate::stack::trace_scope("subprogram_epilogue");
+        crate::stack::trace_stack!("subprogram_epilogue");
         subprogram_builder.epilogue(resolver.schema());
     }
     let built_subprogram = {
-        let _stack = crate::stack::trace_scope("subprogram_build");
+        crate::stack::trace_stack!("subprogram_build");
         subprogram_builder.build(connection.clone(), true, "trigger subprogram")?
     };
     let subprogram_prepared = built_subprogram.prepared();
@@ -899,10 +893,10 @@ pub fn fire_trigger(
     let result = (|| -> Result<()> {
         // Evaluate WHEN clause if present
         if let Some(mut when_expr) = trigger.when_clause.clone() {
-            let _stack = crate::stack::trace_scope("when_clause");
+            crate::stack::trace_stack!("when_clause");
             // Rewrite NEW/OLD references in WHEN clause to use registers
             {
-                let _stack = crate::stack::trace_scope("rewrite_when");
+                crate::stack::trace_stack!("rewrite_when");
                 rewrite_trigger_expr_for_when_clause(&mut when_expr, &ctx.table, ctx)?;
             }
 
@@ -910,7 +904,7 @@ pub fn fire_trigger(
             // This transforms InSelect/Exists/Subquery nodes into SubqueryResult nodes that translate_expr can handle.
             let mut subqueries = Vec::new();
             {
-                let _stack = crate::stack::trace_scope("plan_when_subqueries");
+                crate::stack::trace_stack!("plan_when_subqueries");
                 plan_subqueries_from_trigger_when_clause(
                     program,
                     &mut subqueries,
@@ -936,7 +930,7 @@ pub fn fire_trigger(
 
             let when_reg = program.alloc_register();
             {
-                let _stack = crate::stack::trace_scope("translate_when_expr");
+                crate::stack::trace_stack!("translate_when_expr");
                 translate_expr(program, None, &when_expr, when_reg, resolver)?;
             }
 
@@ -949,7 +943,7 @@ pub fn fire_trigger(
 
             // Execute trigger commands if WHEN clause is true
             {
-                let _stack = crate::stack::trace_scope("execute_when_body");
+                crate::stack::trace_stack!("execute_when_body");
                 execute_trigger_commands(
                     program,
                     resolver,
@@ -965,7 +959,7 @@ pub fn fire_trigger(
         } else {
             // No WHEN clause - always execute
             {
-                let _stack = crate::stack::trace_scope("execute_body");
+                crate::stack::trace_stack!("execute_body");
                 execute_trigger_commands(
                     program,
                     resolver,

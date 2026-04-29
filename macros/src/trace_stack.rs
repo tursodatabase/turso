@@ -95,25 +95,25 @@ fn trace_guard(args: &TraceStackArgs, function_name: &syn::Ident) -> proc_macro2
     let (span_name, guard) = match args {
         TraceStackArgs::Inferred => {
             let guard = quote! {
-                let _stack = crate::stack::trace_scope(concat!(module_path!(), "::", stringify!(#function_name)));
+                crate::stack::trace_stack!(concat!(module_path!(), "::", stringify!(#function_name)));
             };
             (inferred_span_name, guard)
         }
         TraceStackArgs::InferredWithDetail(detail) => {
             let guard = quote! {
-                let _stack = crate::stack::trace_scope_with_detail(concat!(module_path!(), "::", stringify!(#function_name)), #detail);
+                crate::stack::trace_stack!(concat!(module_path!(), "::", stringify!(#function_name)), #detail);
             };
             (inferred_span_name, guard)
         }
         TraceStackArgs::Label(label) => {
             let guard = quote! {
-                let _stack = crate::stack::trace_scope(#label);
+                crate::stack::trace_stack!(#label);
             };
             (label.clone(), guard)
         }
         TraceStackArgs::LabelWithDetail(label, detail) => {
             let guard = quote! {
-                let _stack = crate::stack::trace_scope_with_detail(#label, #detail);
+                crate::stack::trace_stack!(#label, #detail);
             };
             (label.clone(), guard)
         }

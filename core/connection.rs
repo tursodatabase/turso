@@ -663,24 +663,24 @@ impl Connection {
         input: &str,
     ) -> Result<(Program, Arc<Pager>, QueryMode)> {
         {
-            let _stack = crate::stack::trace_scope("update_schema");
+            crate::stack::trace_stack!("update_schema");
             self.maybe_update_schema();
         }
         let syms = {
-            let _stack = crate::stack::trace_scope("read_symbols");
+            crate::stack::trace_stack!("read_symbols");
             self.syms.read()
         };
         let pager = {
-            let _stack = crate::stack::trace_scope("load_pager");
+            crate::stack::trace_stack!("load_pager");
             self.pager.load().clone()
         };
         let mode = {
-            let _stack = crate::stack::trace_scope("query_mode");
+            crate::stack::trace_stack!("query_mode");
             QueryMode::new(&cmd)
         };
         let (Cmd::Stmt(stmt) | Cmd::Explain(stmt) | Cmd::ExplainQueryPlan(stmt)) = cmd;
         let schema = {
-            let _stack = crate::stack::trace_scope("clone_schema");
+            crate::stack::trace_stack!("clone_schema");
             self.schema.read().clone()
         };
         match translate::translate(
@@ -699,7 +699,7 @@ impl Connection {
                 // on deeply nested expression trees.
                 drop(syms);
                 let cmd = {
-                    let _stack = crate::stack::trace_scope("schema_retry_parse");
+                    crate::stack::trace_stack!("schema_retry_parse");
                     let mut parser = Parser::new(input.as_bytes());
                     let Some(cmd) = parser.next_cmd()? else {
                         return Err(err);
@@ -707,24 +707,24 @@ impl Connection {
                     cmd
                 };
                 {
-                    let _stack = crate::stack::trace_scope("retry_update_schema");
+                    crate::stack::trace_stack!("retry_update_schema");
                     self.maybe_update_schema();
                 }
                 let syms = {
-                    let _stack = crate::stack::trace_scope("retry_read_symbols");
+                    crate::stack::trace_stack!("retry_read_symbols");
                     self.syms.read()
                 };
                 let pager = {
-                    let _stack = crate::stack::trace_scope("retry_load_pager");
+                    crate::stack::trace_stack!("retry_load_pager");
                     self.pager.load().clone()
                 };
                 let mode = {
-                    let _stack = crate::stack::trace_scope("retry_query_mode");
+                    crate::stack::trace_stack!("retry_query_mode");
                     QueryMode::new(&cmd)
                 };
                 let (Cmd::Stmt(stmt) | Cmd::Explain(stmt) | Cmd::ExplainQueryPlan(stmt)) = cmd;
                 let schema = {
-                    let _stack = crate::stack::trace_scope("retry_clone_schema");
+                    crate::stack::trace_stack!("retry_clone_schema");
                     self.schema.read().clone()
                 };
                 translate::translate(
@@ -758,6 +758,7 @@ impl Connection {
         self.prepare_with_origin(sql, StatementOrigin::Root)
     }
 
+    #[turso_macros::trace_stack]
     fn prepare_with_origin(
         self: &Arc<Connection>,
         sql: impl AsRef<str>,
@@ -774,14 +775,14 @@ impl Connection {
 
         let needs_nested_guard = origin.needs_nested_guard();
         if needs_nested_guard {
-            let _stack = crate::stack::trace_scope("prepare:start_nested");
+            crate::stack::trace_stack!("start_nested");
             self.start_nested();
         }
         let result = (|| {
             let sql = sql.as_ref();
             tracing::debug!("Preparing: {}", sql);
             let (cmd, byte_offset_end) = {
-                let _stack = crate::stack::trace_scope("prepare:parse");
+                crate::stack::trace_stack!("parse");
                 let mut parser = Parser::new(sql.as_bytes());
                 let cmd = match parser.next_cmd()? {
                     Some(cmd) => cmd,
@@ -797,11 +798,11 @@ impl Connection {
                 .unwrap()
                 .trim();
             let (program, pager, mode) = {
-                let _stack = crate::stack::trace_scope("prepare:compile");
+                crate::stack::trace_stack!("compile");
                 self.compile_cmd(cmd, input)?
             };
             {
-                let _stack = crate::stack::trace_scope("prepare:statement_new");
+                crate::stack::trace_stack!("statement_new");
                 Ok(Statement::new_with_origin(
                     program,
                     pager,
@@ -813,7 +814,7 @@ impl Connection {
             }
         })();
         if result.is_err() && needs_nested_guard {
-            let _stack = crate::stack::trace_scope("prepare:end_nested_on_error");
+            crate::stack::trace_stack!("end_nested_on_error");
             self.end_nested();
         }
         result
@@ -825,6 +826,7 @@ impl Connection {
         self.prepare_stmt_with_origin(stmt, StatementOrigin::Root)
     }
 
+    #[turso_macros::trace_stack]
     fn prepare_stmt_with_origin(
         self: &Arc<Connection>,
         stmt: ast::Stmt,
@@ -835,32 +837,32 @@ impl Connection {
         }
         let needs_nested_guard = origin.needs_nested_guard();
         if needs_nested_guard {
-            let _stack = crate::stack::trace_scope("prepare_stmt:start_nested");
+            crate::stack::trace_stack!("start_nested");
             self.start_nested();
         }
         let result = (|| {
             {
-                let _stack = crate::stack::trace_scope("prepare_stmt:update_schema");
+                crate::stack::trace_stack!("update_schema");
                 self.maybe_update_schema();
             }
             let syms = {
-                let _stack = crate::stack::trace_scope("prepare_stmt:read_symbols");
+                crate::stack::trace_stack!("read_symbols");
                 self.syms.read()
             };
             let pager = {
-                let _stack = crate::stack::trace_scope("prepare_stmt:load_pager");
+                crate::stack::trace_stack!("load_pager");
                 self.pager.load().clone()
             };
             let mode = {
-                let _stack = crate::stack::trace_scope("prepare_stmt:query_mode");
+                crate::stack::trace_stack!("query_mode");
                 QueryMode::Normal
             };
             let schema = {
-                let _stack = crate::stack::trace_scope("prepare_stmt:clone_schema");
+                crate::stack::trace_stack!("clone_schema");
                 self.schema.read().clone()
             };
             let program = {
-                let _stack = crate::stack::trace_scope("prepare_stmt:translate");
+                crate::stack::trace_stack!("translate");
                 translate::translate(
                     &schema,
                     stmt,
@@ -872,7 +874,7 @@ impl Connection {
                 )?
             };
             {
-                let _stack = crate::stack::trace_scope("prepare_stmt:statement_new");
+                crate::stack::trace_stack!("statement_new");
                 Ok(Statement::new_with_origin(
                     program,
                     pager,
@@ -884,7 +886,7 @@ impl Connection {
             }
         })();
         if result.is_err() && needs_nested_guard {
-            let _stack = crate::stack::trace_scope("prepare_stmt:end_nested_on_error");
+            crate::stack::trace_stack!("end_nested_on_error");
             self.end_nested();
         }
         result
@@ -1185,6 +1187,7 @@ impl Connection {
     /// Execute will run a query from start to finish taking ownership of I/O because it will run pending I/Os if it didn't finish.
     /// TODO: make this api async
     #[instrument(skip_all, level = Level::INFO)]
+    #[turso_macros::trace_stack]
     pub fn execute(self: &Arc<Connection>, sql: impl AsRef<str>) -> Result<()> {
         if self.is_closed() {
             return Err(LimboError::InternalError("Connection closed".to_string()));
@@ -1197,11 +1200,11 @@ impl Connection {
                 .unwrap()
                 .trim();
             let (program, pager, mode) = {
-                let _stack = crate::stack::trace_scope("execute:compile");
+                crate::stack::trace_stack!("compile");
                 self.compile_cmd(cmd, input)?
             };
             {
-                let _stack = crate::stack::trace_scope("execute:run");
+                crate::stack::trace_stack!("run");
                 Statement::new(program, pager.clone(), mode, 0).run_ignore_rows()?;
             }
         }
