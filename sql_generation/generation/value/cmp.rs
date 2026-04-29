@@ -15,7 +15,13 @@ impl ArbitraryFrom<(&SimValue, ColumnType)> for LTValue {
     ) -> Self {
         let new_value = match &value.0 {
             Value::Numeric(Numeric::Integer(i)) => {
-                Value::from_i64(rng.random_range(i64::MIN..*i - 1))
+                // `i64::MIN` has no i64 less than it; `i64::MIN + 1` would make the
+                // sampling range `i64::MIN..i64::MIN`, which is empty.
+                if *i <= i64::MIN + 1 {
+                    Value::from_i64(i64::MIN)
+                } else {
+                    Value::from_i64(rng.random_range(i64::MIN..*i - 1))
+                }
             }
             Value::Numeric(Numeric::Float(f)) => {
                 Value::from_f64(f64::from(*f) - rng.random_range(0.0..1e10))
@@ -33,12 +39,14 @@ impl ArbitraryFrom<(&SimValue, ColumnType)> for LTValue {
             Value::Blob(b) => {
                 // Either shorten the blob, or make at least one byte smaller and mutate the rest
                 let mut b = b.clone();
-                if rng.random_bool(0.01) {
+                if b.is_empty() {
+                    Value::Blob(b)
+                } else if rng.random_bool(0.01) {
                     b.pop();
                     Value::Blob(b)
                 } else {
                     let index = rng.random_range(0..b.len());
-                    b[index] -= 1;
+                    b[index] = b[index].saturating_sub(1);
                     // Mutate the rest of the blob
                     for val in b.iter_mut().skip(index + 1) {
                         *val = rng.random_range(0..=255);
@@ -62,9 +70,21 @@ impl ArbitraryFrom<(&SimValue, ColumnType)> for GTValue {
         (value, col_type): (&SimValue, ColumnType),
     ) -> Self {
         let new_value = match &value.0 {
-            Value::Numeric(Numeric::Integer(i)) => Value::from_i64(rng.random_range(*i..i64::MAX)),
+            Value::Numeric(Numeric::Integer(i)) => {
+                // `i64::MAX` has no i64 greater than it; `i64::MAX - 1` would make the
+                // sampling range `i64::MAX..=i64::MAX` with an empty "strictly greater" set.
+                if *i >= i64::MAX - 1 {
+                    Value::from_i64(i64::MAX)
+                } else {
+                    Value::from_i64(rng.random_range(*i + 1..=i64::MAX))
+                }
+            }
             Value::Numeric(Numeric::Float(f)) => {
-                Value::from_f64(rng.random_range(f64::from(*f)..1e10))
+                if f64::from(*f) >= 1e10 {
+                    Value::from_f64(1e10)
+                } else {
+                    Value::from_f64(rng.random_range(f64::from(*f)..1e10))
+                }
             }
             value @ Value::Text(..) => {
                 // Either lengthen the string, or make at least one character smaller and mutate the rest
@@ -81,14 +101,14 @@ impl ArbitraryFrom<(&SimValue, ColumnType)> for GTValue {
                 }
             }
             Value::Blob(b) => {
-                // Either lengthen the blob, or make at least one byte smaller and mutate the rest
+                // Either lengthen the blob, or make at least one byte larger and mutate the rest
                 let mut b = b.clone();
-                if rng.random_bool(0.01) {
+                if b.is_empty() || rng.random_bool(0.01) {
                     b.push(rng.random_range(0..=255));
                     Value::Blob(b)
                 } else {
                     let index = rng.random_range(0..b.len());
-                    b[index] += 1;
+                    b[index] = b[index].saturating_add(1);
                     // Mutate the rest of the blob
                     for val in b.iter_mut().skip(index + 1) {
                         *val = rng.random_range(0..=255);
@@ -191,8 +211,38 @@ fn mutate_string<R: rand::Rng + ?Sized>(
 #[cfg(test)]
 mod tests {
     use anarchist_readable_name_generator_lib::readable_name;
+    use rand::SeedableRng;
+    use rand_chacha::ChaCha8Rng;
+
+    use crate::generation::tests::TestContext;
 
     use super::*;
+
+    // Boundary values must not panic with "cannot sample empty range" or byte
+    // over/underflow. Covers LTValue @ i64::MIN / i64::MIN+1, GTValue @ i64::MAX /
+    // i64::MAX-1, GTValue @ float >= 1e10, and empty/saturated blobs.
+    #[test]
+    fn lt_gt_value_boundaries_do_not_panic() {
+        let mut rng = ChaCha8Rng::seed_from_u64(0);
+        let ctx = TestContext::default();
+
+        let cases: [(SimValue, ColumnType); 8] = [
+            (SimValue(Value::from_i64(i64::MIN)), ColumnType::Integer),
+            (SimValue(Value::from_i64(i64::MIN + 1)), ColumnType::Integer),
+            (SimValue(Value::from_i64(i64::MAX)), ColumnType::Integer),
+            (SimValue(Value::from_i64(i64::MAX - 1)), ColumnType::Integer),
+            (SimValue(Value::from_f64(1e10)), ColumnType::Float),
+            (SimValue(Value::from_f64(2e10)), ColumnType::Float),
+            (SimValue(Value::Blob(Vec::new())), ColumnType::Blob),
+            (SimValue(Value::Blob(vec![0, 255])), ColumnType::Blob),
+        ];
+        for (val, col_type) in &cases {
+            for _ in 0..200 {
+                let _ = LTValue::arbitrary_from(&mut rng, &ctx, (val, *col_type));
+                let _ = GTValue::arbitrary_from(&mut rng, &ctx, (val, *col_type));
+            }
+        }
+    }
 
     #[test]
     fn test_mutate_string_fuzz() {

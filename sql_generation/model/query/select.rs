@@ -366,7 +366,7 @@ impl Select {
                                     }
                                     ResultColumn::Star => ast::ResultColumn::Star,
                                     ResultColumn::Column(name) => ast::ResultColumn::Expr(
-                                        ast::Expr::Id(ast::Name::exact(name.clone())).into_boxed(),
+                                        column_qualified_expr(name).into_boxed(),
                                         None,
                                     ),
                                 })
