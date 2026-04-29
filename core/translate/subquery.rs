@@ -219,16 +219,16 @@ pub(crate) fn mark_shared_cte_materialization_requirements(
 /// The appropriate time is determined by whether the subquery is correlated or uncorrelated;
 /// if it is uncorrelated, it can be evaluated as early as possible, but if it is correlated, it must be evaluated after all of its dependencies from the
 /// outer query are 'in scope', i.e. their cursors are open and rewound.
+#[turso_macros::trace_stack]
 pub fn plan_subqueries_from_select_plan(
     program: &mut ProgramBuilder,
     plan: &mut SelectPlan,
     resolver: &Resolver,
     connection: &Arc<Connection>,
 ) -> Result<()> {
-    let _stack = crate::stack::trace_scope("subquery:plan_from_select_plan");
     // WHERE
     {
-        let _stack = crate::stack::trace_scope("subquery:select_where");
+        let _stack = crate::stack::trace_scope("select_where");
         plan_subqueries_with_outer_query_access(
             program,
             &mut plan.non_from_clause_subqueries,
@@ -245,7 +245,7 @@ pub fn plan_subqueries_from_select_plan(
     // GROUP BY
     if let Some(group_by) = &mut plan.group_by {
         {
-            let _stack = crate::stack::trace_scope("subquery:select_group_by");
+            let _stack = crate::stack::trace_scope("select_group_by");
             plan_subqueries_with_outer_query_access(
                 program,
                 &mut plan.non_from_clause_subqueries,
@@ -259,7 +259,7 @@ pub fn plan_subqueries_from_select_plan(
             )?;
         }
         if let Some(having) = group_by.having.as_mut() {
-            let _stack = crate::stack::trace_scope("subquery:select_having");
+            let _stack = crate::stack::trace_scope("select_having");
             plan_subqueries_with_outer_query_access(
                 program,
                 &mut plan.non_from_clause_subqueries,
@@ -276,7 +276,7 @@ pub fn plan_subqueries_from_select_plan(
 
     // Result columns
     {
-        let _stack = crate::stack::trace_scope("subquery:select_result_columns");
+        let _stack = crate::stack::trace_scope("select_result_columns");
         plan_subqueries_with_outer_query_access(
             program,
             &mut plan.non_from_clause_subqueries,
@@ -292,7 +292,7 @@ pub fn plan_subqueries_from_select_plan(
 
     // ORDER BY
     {
-        let _stack = crate::stack::trace_scope("subquery:select_order_by");
+        let _stack = crate::stack::trace_scope("select_order_by");
         plan_subqueries_with_outer_query_access(
             program,
             &mut plan.non_from_clause_subqueries,
@@ -322,12 +322,12 @@ pub fn plan_subqueries_from_select_plan(
         );
         // Limit
         if let Some(limit) = &mut plan.limit {
-            let _stack = crate::stack::trace_scope("subquery:select_limit");
+            let _stack = crate::stack::trace_scope("select_limit");
             walk_expr_mut(limit, &mut subquery_parser)?;
         }
         // Offset
         if let Some(offset) = &mut plan.offset {
-            let _stack = crate::stack::trace_scope("subquery:select_offset");
+            let _stack = crate::stack::trace_scope("select_offset");
             walk_expr_mut(offset, &mut subquery_parser)?;
         }
     }
@@ -499,6 +499,7 @@ pub fn plan_subqueries_from_trigger_when_clause(
 
 /// Compute query plans for subqueries in the WHERE clause and HAVING clause (both of which have access to the outer query scope)
 #[allow(clippy::too_many_arguments)]
+#[turso_macros::trace_stack]
 fn plan_subqueries_with_outer_query_access<'a>(
     program: &mut ProgramBuilder,
     out_subqueries: &mut Vec<NonFromClauseSubquery>,
@@ -510,7 +511,6 @@ fn plan_subqueries_with_outer_query_access<'a>(
     origin: SubqueryOrigin,
     allow_correlated: bool,
 ) -> Result<()> {
-    let _stack = crate::stack::trace_scope("subquery:walk_outer_query_access");
     // Most subqueries can reference columns from the outer query,
     // including nested cases where a subquery inside a subquery references columns from its parent's parent
     // and so on.
@@ -606,7 +606,7 @@ fn get_subquery_parser<'a>(
             ast::Expr::Exists(_) => {
                 let subquery_id = program.table_reference_counter.next();
                 let outer_query_refs = {
-                    let _stack = crate::stack::trace_scope("subquery:get_outer_refs");
+                    let _stack = crate::stack::trace_scope("get_outer_refs");
                     get_outer_query_refs(referenced_tables)
                 };
 
@@ -619,14 +619,14 @@ fn get_subquery_parser<'a>(
                     query_type: subquery_type.clone(),
                 };
                 let ast::Expr::Exists(subselect) = ({
-                    let _stack = crate::stack::trace_scope("subquery:replace_exists_expr");
+                    let _stack = crate::stack::trace_scope("replace_exists_expr");
                     std::mem::replace(expr, result_expr)
                 }) else {
                     unreachable!();
                 };
 
                 let plan = {
-                    let _stack = crate::stack::trace_scope("subquery:prepare_exists_plan");
+                    let _stack = crate::stack::trace_scope("prepare_exists_plan");
                     prepare_select_plan(
                         subselect,
                         resolver,
@@ -642,7 +642,7 @@ fn get_subquery_parser<'a>(
                     );
                 };
                 {
-                    let _stack = crate::stack::trace_scope("subquery:optimize_exists_plan");
+                    let _stack = crate::stack::trace_scope("optimize_exists_plan");
                     optimize_select_plan(&mut plan, resolver.schema())?;
                 }
                 let correlated = select_plan_has_outer_scope_dependency(&plan);
@@ -662,7 +662,7 @@ fn get_subquery_parser<'a>(
             ast::Expr::Subquery(_) => {
                 let subquery_id = program.table_reference_counter.next();
                 let outer_query_refs = {
-                    let _stack = crate::stack::trace_scope("subquery:get_outer_refs");
+                    let _stack = crate::stack::trace_scope("get_outer_refs");
                     get_outer_query_refs(referenced_tables)
                 };
 
@@ -678,13 +678,13 @@ fn get_subquery_parser<'a>(
                     },
                 };
                 let ast::Expr::Subquery(subselect) = ({
-                    let _stack = crate::stack::trace_scope("subquery:replace_scalar_expr");
+                    let _stack = crate::stack::trace_scope("replace_scalar_expr");
                     std::mem::replace(expr, result_expr)
                 }) else {
                     unreachable!();
                 };
                 let plan = {
-                    let _stack = crate::stack::trace_scope("subquery:prepare_scalar_plan");
+                    let _stack = crate::stack::trace_scope("prepare_scalar_plan");
                     prepare_select_plan(
                         subselect,
                         resolver,
@@ -700,7 +700,7 @@ fn get_subquery_parser<'a>(
                     );
                 };
                 {
-                    let _stack = crate::stack::trace_scope("subquery:optimize_scalar_plan");
+                    let _stack = crate::stack::trace_scope("optimize_scalar_plan");
                     optimize_select_plan(&mut plan, resolver.schema())?;
                 }
                 let reg_count = plan.result_columns.len();
@@ -779,18 +779,18 @@ fn get_subquery_parser<'a>(
             ast::Expr::InSelect { .. } => {
                 let subquery_id = program.table_reference_counter.next();
                 let outer_query_refs = {
-                    let _stack = crate::stack::trace_scope("subquery:get_outer_refs");
+                    let _stack = crate::stack::trace_scope("get_outer_refs");
                     get_outer_query_refs(referenced_tables)
                 };
 
                 let ast::Expr::InSelect { lhs, not, rhs } = ({
-                    let _stack = crate::stack::trace_scope("subquery:take_in_select_expr");
+                    let _stack = crate::stack::trace_scope("take_in_select_expr");
                     std::mem::take(expr)
                 }) else {
                     unreachable!();
                 };
                 let plan = {
-                    let _stack = crate::stack::trace_scope("subquery:prepare_in_select_plan");
+                    let _stack = crate::stack::trace_scope("prepare_in_select_plan");
                     prepare_select_plan(
                         rhs,
                         resolver,
@@ -802,7 +802,7 @@ fn get_subquery_parser<'a>(
                 };
                 let mut plan = match plan {
                     Plan::Select(mut select_plan) => {
-                        let _stack = crate::stack::trace_scope("subquery:optimize_in_select_plan");
+                        let _stack = crate::stack::trace_scope("optimize_in_select_plan");
                         optimize_select_plan(&mut select_plan, resolver.schema())?;
                         Plan::Select(select_plan)
                     }
@@ -813,8 +813,7 @@ fn get_subquery_parser<'a>(
                         offset,
                         order_by,
                     } => {
-                        let _stack =
-                            crate::stack::trace_scope("subquery:optimize_in_compound_plan");
+                        let _stack = crate::stack::trace_scope("optimize_in_compound_plan");
                         optimize_select_plan(&mut right_most, resolver.schema())?;
                         for (select_plan, _) in left.iter_mut() {
                             optimize_select_plan(select_plan, resolver.schema())?;

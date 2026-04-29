@@ -523,6 +523,7 @@ fn rewrite_trigger_expr_single_for_subprogram(
 
 /// Execute trigger commands by compiling them as a subprogram and emitting Program instruction
 /// Returns true if there are triggers that will fire.
+#[turso_macros::trace_stack(detail = trigger_event_kind(&trigger.event))]
 fn execute_trigger_commands(
     program: &mut ProgramBuilder,
     resolver: &mut Resolver,
@@ -532,10 +533,6 @@ fn execute_trigger_commands(
     database_id: usize,
     ignore_jump_target: BranchOffset,
 ) -> Result<bool> {
-    let _stack = crate::stack::trace_scope_with_detail(
-        "trigger:execute_commands",
-        trigger_event_kind(&trigger.event),
-    );
     struct TriggerCompilationGuard {
         connection: Arc<crate::Connection>,
     }
@@ -604,7 +601,7 @@ fn execute_trigger_commands(
         for command in trigger.commands.iter() {
             let stmt = {
                 let _stack = crate::stack::trace_scope_with_detail(
-                    "trigger:rewrite_command",
+                    "rewrite_command",
                     trigger_command_kind(command),
                 );
                 trigger_cmd_to_stmt_for_subprogram(command, &subprogram_ctx)?
@@ -612,7 +609,7 @@ fn execute_trigger_commands(
             subprogram_builder.prologue();
             {
                 let _stack = crate::stack::trace_scope_with_detail(
-                    "trigger:translate_command",
+                    "translate_command",
                     trigger_command_kind(command),
                 );
                 translate_inner(
@@ -638,11 +635,11 @@ fn execute_trigger_commands(
     resolver.trigger_context = prev_trigger_context;
     compile_result?;
     {
-        let _stack = crate::stack::trace_scope("trigger:subprogram_epilogue");
+        let _stack = crate::stack::trace_scope("subprogram_epilogue");
         subprogram_builder.epilogue(resolver.schema());
     }
     let built_subprogram = {
-        let _stack = crate::stack::trace_scope("trigger:subprogram_build");
+        let _stack = crate::stack::trace_scope("subprogram_build");
         subprogram_builder.build(connection.clone(), true, "trigger subprogram")?
     };
     let subprogram_prepared = built_subprogram.prepared();
@@ -876,6 +873,7 @@ pub fn has_triggers_including_temp(
     false
 }
 
+#[turso_macros::trace_stack(detail = trigger_event_kind(&trigger.event))]
 pub fn fire_trigger(
     program: &mut ProgramBuilder,
     resolver: &mut Resolver,
@@ -885,8 +883,6 @@ pub fn fire_trigger(
     database_id: usize,
     ignore_jump_target: BranchOffset,
 ) -> Result<()> {
-    let _stack =
-        crate::stack::trace_scope_with_detail("trigger:fire", trigger_event_kind(&trigger.event));
     // Decode custom type registers so trigger bodies see user-facing values,
     // not raw encoded blobs from disk.
     // - OLD registers always come from cursor reads → always encoded → always decode
@@ -903,10 +899,10 @@ pub fn fire_trigger(
     let result = (|| -> Result<()> {
         // Evaluate WHEN clause if present
         if let Some(mut when_expr) = trigger.when_clause.clone() {
-            let _stack = crate::stack::trace_scope("trigger:when_clause");
+            let _stack = crate::stack::trace_scope("when_clause");
             // Rewrite NEW/OLD references in WHEN clause to use registers
             {
-                let _stack = crate::stack::trace_scope("trigger:rewrite_when");
+                let _stack = crate::stack::trace_scope("rewrite_when");
                 rewrite_trigger_expr_for_when_clause(&mut when_expr, &ctx.table, ctx)?;
             }
 
@@ -914,7 +910,7 @@ pub fn fire_trigger(
             // This transforms InSelect/Exists/Subquery nodes into SubqueryResult nodes that translate_expr can handle.
             let mut subqueries = Vec::new();
             {
-                let _stack = crate::stack::trace_scope("trigger:plan_when_subqueries");
+                let _stack = crate::stack::trace_scope("plan_when_subqueries");
                 plan_subqueries_from_trigger_when_clause(
                     program,
                     &mut subqueries,
@@ -940,7 +936,7 @@ pub fn fire_trigger(
 
             let when_reg = program.alloc_register();
             {
-                let _stack = crate::stack::trace_scope("trigger:translate_when_expr");
+                let _stack = crate::stack::trace_scope("translate_when_expr");
                 translate_expr(program, None, &when_expr, when_reg, resolver)?;
             }
 
@@ -953,7 +949,7 @@ pub fn fire_trigger(
 
             // Execute trigger commands if WHEN clause is true
             {
-                let _stack = crate::stack::trace_scope("trigger:execute_when_body");
+                let _stack = crate::stack::trace_scope("execute_when_body");
                 execute_trigger_commands(
                     program,
                     resolver,
@@ -969,7 +965,7 @@ pub fn fire_trigger(
         } else {
             // No WHEN clause - always execute
             {
-                let _stack = crate::stack::trace_scope("trigger:execute_body");
+                let _stack = crate::stack::trace_scope("execute_body");
                 execute_trigger_commands(
                     program,
                     resolver,

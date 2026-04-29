@@ -41,7 +41,7 @@ pub fn translate_select(
     connection: &Arc<crate::Connection>,
 ) -> Result<usize> {
     let plan = {
-        trace_stack!("select:prepare_plan");
+        trace_stack!("prepare_plan");
         prepare_select_plan(
             select,
             resolver,
@@ -57,7 +57,7 @@ pub fn translate_select(
         }
     }
     {
-        trace_stack!("select:emit_plan");
+        trace_stack!("emit_plan");
         emit_select_plan(plan, resolver, program, connection)
     }
 }
@@ -71,7 +71,7 @@ pub fn emit_select_plan(
     connection: &Arc<crate::Connection>,
 ) -> Result<usize> {
     {
-        trace_stack!("select:optimize_plan");
+        trace_stack!("optimize_plan");
         optimize_plan(program, &mut plan, resolver)?;
     }
     let num_result_cols;
@@ -113,7 +113,7 @@ pub fn emit_select_plan(
 
     program.extend(&opts);
     {
-        trace_stack!("select:emit_program");
+        trace_stack!("emit_program");
         emit_program(connection, resolver, program, plan, |_| {})?;
     }
     Ok(num_result_cols)
@@ -313,7 +313,7 @@ fn prepare_one_select_plan(
                     limit.as_ref(),
                 );
             {
-                trace_stack!("select:parse_from");
+                trace_stack!("parse_from");
                 parse_from(
                     from,
                     resolver,
@@ -383,7 +383,7 @@ fn prepare_one_select_plan(
 
             let mut windows = Vec::with_capacity(window_clause.len());
             {
-                trace_stack!("select:bind_windows");
+                trace_stack!("bind_windows");
                 for window_def in window_clause.iter() {
                     let name = normalize_ident(window_def.name.as_str());
                     let mut window = Window::new(Some(name), &window_def.window)?;
@@ -415,7 +415,7 @@ fn prepare_one_select_plan(
                 connection.get_full_column_names() && !connection.get_short_column_names();
             let mut aggregate_expressions = Vec::new();
             {
-                trace_stack!("select:bind_result_columns");
+                trace_stack!("bind_result_columns");
                 for column in columns.into_iter() {
                     match column {
                         ResultColumn::Star => {
@@ -544,13 +544,13 @@ fn prepare_one_select_plan(
             // Virtual table predicates may depend on column bindings from tables to the right in the join order,
             // so we must wait until the full set of references has been collected.
             {
-                trace_stack!("select:add_vtab_predicates");
+                trace_stack!("add_vtab_predicates");
                 add_vtab_predicates_to_where_clause(&mut vtab_predicates, &mut plan, resolver)?;
             }
 
             // Parse the actual WHERE clause and add its conditions to the plan WHERE clause that already contains the join conditions.
             {
-                trace_stack!("select:parse_where");
+                trace_stack!("parse_where");
                 parse_where(
                     where_clause.as_deref(),
                     &mut plan.table_references,
@@ -561,7 +561,7 @@ fn prepare_one_select_plan(
             }
 
             {
-                trace_stack!("select:process_group_by");
+                trace_stack!("process_group_by");
                 if let Some(mut group_by) = group_by {
                     // Process HAVING clause if present
                     let having_predicates = if let Some(having) = group_by.having {
@@ -634,7 +634,7 @@ fn prepare_one_select_plan(
                 .is_some_and(|gb| !gb.exprs.is_empty());
 
             {
-                trace_stack!("select:process_order_by");
+                trace_stack!("process_order_by");
                 for mut o in order_by {
                     replace_column_number_with_copy_of_column_expr(
                         &mut o.expr,
@@ -738,23 +738,23 @@ fn prepare_one_select_plan(
 
             // Parse the LIMIT/OFFSET clause
             {
-                trace_stack!("select:parse_limit");
+                trace_stack!("parse_limit");
                 (plan.limit, plan.offset) =
                     limit.map_or(Ok((None, None)), |l| parse_limit(l, resolver))?;
             }
 
             if !windows.is_empty() {
-                trace_stack!("select:plan_windows");
+                trace_stack!("plan_windows");
                 plan_windows(program, &mut plan, resolver, connection, &mut windows)?;
             }
 
             {
-                trace_stack!("select:plan_subqueries");
+                trace_stack!("plan_subqueries");
                 plan_subqueries_from_select_plan(program, &mut plan, resolver, connection)?;
             }
 
             {
-                trace_stack!("select:validate_plan");
+                trace_stack!("validate_plan");
                 validate_group_by_outer_scope_refs(&plan)?;
 
                 validate_expr_correct_column_counts(&plan)?;

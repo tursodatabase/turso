@@ -228,6 +228,7 @@ impl<'a> InsertEmitCtx<'a> {
 }
 
 #[allow(clippy::too_many_arguments)]
+#[turso_macros::trace_stack]
 pub fn translate_insert(
     resolver: &mut Resolver,
     on_conflict: Option<ResolveType>,
@@ -239,7 +240,6 @@ pub fn translate_insert(
     program: &mut ProgramBuilder,
     connection: &Arc<crate::Connection>,
 ) -> Result<()> {
-    let _stack = crate::stack::trace_scope("insert:translate");
     let opts = ProgramBuilderOpts::new(1, 30, 5);
     program.extend(&opts);
 
@@ -310,7 +310,7 @@ pub fn translate_insert(
         mut upsert_actions,
         inserting_multiple_rows,
     } = {
-        let _stack = crate::stack::trace_scope("insert:bind");
+        let _stack = crate::stack::trace_scope("bind");
         bind_insert(
             program,
             resolver,
@@ -353,7 +353,7 @@ pub fn translate_insert(
 
     // Plan CTEs and add them as outer query references for RETURNING subquery resolution
     {
-        let _stack = crate::stack::trace_scope("insert:plan_returning_ctes");
+        let _stack = crate::stack::trace_scope("plan_returning_ctes");
         plan_ctes_as_outer_refs(
             with_for_returning,
             resolver,
@@ -367,7 +367,7 @@ pub fn translate_insert(
     // (so SubqueryResult nodes are cloned into result_columns)
     let mut returning_subqueries = vec![];
     {
-        let _stack = crate::stack::trace_scope("insert:plan_returning_subqueries");
+        let _stack = crate::stack::trace_scope("plan_returning_subqueries");
         plan_subqueries_from_returning(
             program,
             &mut returning_subqueries,
@@ -443,7 +443,7 @@ pub fn translate_insert(
     }
 
     {
-        let _stack = crate::stack::trace_scope("insert:init_source_emission");
+        let _stack = crate::stack::trace_scope("init_source_emission");
         init_source_emission(
             program,
             &table,
@@ -466,7 +466,7 @@ pub fn translate_insert(
     let insertion = build_insertion(program, &table, &columns, ctx.num_values)?;
 
     {
-        let _stack = crate::stack::trace_scope("insert:translate_rows_open_tables");
+        let _stack = crate::stack::trace_scope("translate_rows_open_tables");
         translate_rows_and_open_tables(
             program,
             resolver,
@@ -543,7 +543,7 @@ pub fn translate_insert(
 
     let has_before_triggers = !relevant_before_triggers.is_empty();
     if has_before_triggers {
-        let _stack = crate::stack::trace_scope("insert:before_triggers");
+        let _stack = crate::stack::trace_scope("before_triggers");
         compute_virtual_columns(
             program,
             &ctx.table.columns_topo_sort()?,
@@ -956,7 +956,7 @@ pub fn translate_insert(
     );
     let has_after_triggers = !relevant_after_triggers.is_empty();
     if has_after_triggers {
-        let _stack = crate::stack::trace_scope("insert:after_triggers");
+        let _stack = crate::stack::trace_scope("after_triggers");
         compute_virtual_columns(
             program,
             &ctx.table.columns_topo_sort()?,

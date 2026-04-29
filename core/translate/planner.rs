@@ -1190,6 +1190,7 @@ fn base_outer_refs_for_cte_planning(
 }
 
 #[allow(clippy::too_many_arguments)]
+#[turso_macros::trace_stack]
 pub fn parse_from(
     from: Option<FromClause>,
     resolver: &Resolver,
@@ -1201,7 +1202,6 @@ pub fn parse_from(
     table_references: &mut TableReferences,
     connection: &Arc<crate::Connection>,
 ) -> Result<()> {
-    let _stack = crate::stack::trace_scope("planner:parse_from");
     // Collect CTE definitions instead of planning them immediately.
     // Each CTE reference will be planned fresh when encountered, ensuring unique internal_ids.
     let mut cte_definitions: Vec<CteDefinition> = vec![];
@@ -1318,6 +1318,7 @@ pub fn parse_from(
     Ok(())
 }
 
+#[turso_macros::trace_stack]
 pub fn parse_where(
     where_clause: Option<&Expr>,
     table_references: &mut TableReferences,
@@ -1325,7 +1326,6 @@ pub fn parse_where(
     out_where_clause: &mut Vec<WhereTerm>,
     resolver: &Resolver,
 ) -> Result<()> {
-    let _stack = crate::stack::trace_scope("planner:parse_where");
     if let Some(where_expr) = where_clause {
         let start_idx = out_where_clause.len();
         break_predicate_at_and_boundaries(where_expr, out_where_clause);

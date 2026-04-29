@@ -68,6 +68,7 @@ use update::translate_update;
 
 #[instrument(skip_all, level = Level::DEBUG)]
 #[allow(clippy::too_many_arguments)]
+#[turso_macros::trace_stack]
 pub fn translate(
     schema: &Schema,
     stmt: ast::Stmt,
@@ -77,10 +78,9 @@ pub fn translate(
     query_mode: QueryMode,
     input: &str,
 ) -> Result<Program> {
-    let _stack = crate::stack::trace_scope("translate");
     tracing::trace!("querying {}", input);
     let change_cnt_on = {
-        let _stack = crate::stack::trace_scope("translate:change_count");
+        let _stack = crate::stack::trace_scope("change_count");
         matches!(
             stmt,
             ast::Stmt::CreateIndex { .. }
@@ -92,7 +92,7 @@ pub fn translate(
 
     // Boxed so the ~800 B builder sits on the heap instead of the prepare frame.
     let mut program = {
-        let _stack = crate::stack::trace_scope("translate:program_builder_new");
+        let _stack = crate::stack::trace_scope("program_builder_new");
         Box::new(ProgramBuilder::new(
             query_mode,
             connection.get_capture_data_changes_info().clone(),
@@ -102,11 +102,11 @@ pub fn translate(
     };
 
     {
-        let _stack = crate::stack::trace_scope("translate:prologue");
+        let _stack = crate::stack::trace_scope("prologue");
         program.prologue();
     }
     let mut resolver = {
-        let _stack = crate::stack::trace_scope("translate:resolver_new");
+        let _stack = crate::stack::trace_scope("resolver_new");
         Resolver::new(
             schema,
             connection.database_schemas(),
@@ -119,7 +119,7 @@ pub fn translate(
     };
 
     {
-        let _stack = crate::stack::trace_scope("translate:dispatch");
+        let _stack = crate::stack::trace_scope("dispatch");
         match stmt {
             // There can be no nesting with pragma, so lift it up here
             ast::Stmt::Pragma { name, body } => {
@@ -137,12 +137,12 @@ pub fn translate(
     };
 
     {
-        let _stack = crate::stack::trace_scope("translate:epilogue");
+        let _stack = crate::stack::trace_scope("epilogue");
         program.epilogue(schema);
     }
 
     {
-        let _stack = crate::stack::trace_scope("translate:build");
+        let _stack = crate::stack::trace_scope("build");
         program.build(connection, change_cnt_on, input)
     }
 }
@@ -150,6 +150,7 @@ pub fn translate(
 // TODO: for now leaving the return value as a Program. But ideally to support nested parsing of arbitraty
 // statements, we would have to return a program builder instead
 /// Translate SQL statement into bytecode program.
+#[turso_macros::trace_stack(detail = stmt_kind(&stmt))]
 pub fn translate_inner(
     stmt: ast::Stmt,
     resolver: &mut Resolver,
@@ -157,9 +158,8 @@ pub fn translate_inner(
     connection: &Arc<Connection>,
     input: &str,
 ) -> Result<()> {
-    let _stack = crate::stack::trace_scope_with_detail("translate_inner", stmt_kind(&stmt));
     let is_write = {
-        let _stack = crate::stack::trace_scope("translate_inner:classify_write");
+        let _stack = crate::stack::trace_scope("classify_write");
         matches!(
             stmt,
             ast::Stmt::AlterTable { .. }
@@ -185,7 +185,7 @@ pub fn translate_inner(
         )
     };
     let is_vacuum = {
-        let _stack = crate::stack::trace_scope("translate_inner:classify_vacuum");
+        let _stack = crate::stack::trace_scope("classify_vacuum");
         matches!(stmt, ast::Stmt::Vacuum { .. })
     };
 
@@ -198,12 +198,12 @@ pub fn translate_inner(
     }
 
     let is_select = {
-        let _stack = crate::stack::trace_scope("translate_inner:classify_select");
+        let _stack = crate::stack::trace_scope("classify_select");
         matches!(stmt, ast::Stmt::Select { .. })
     };
 
     {
-        let _stack = crate::stack::trace_scope("translate_inner:dispatch");
+        let _stack = crate::stack::trace_scope("dispatch");
         match stmt {
             ast::Stmt::AlterTable(alter) => {
                 translate_alter_table(alter, resolver, program, connection, input)?;
@@ -448,13 +448,13 @@ pub fn translate_inner(
 
     // Indicate write operations so that in the epilogue we can emit the correct type of transaction
     if is_write {
-        let _stack = crate::stack::trace_scope("translate_inner:begin_write_operation");
+        let _stack = crate::stack::trace_scope("begin_write_operation");
         program.begin_write_operation();
     }
 
     // Indicate read operations so that in the epilogue we can emit the correct type of transaction
     if is_select && !program.table_references.is_empty() {
-        let _stack = crate::stack::trace_scope("translate_inner:begin_read_operation");
+        let _stack = crate::stack::trace_scope("begin_read_operation");
         program.begin_read_operation();
     }
 

@@ -656,31 +656,31 @@ impl Connection {
         Ok(true)
     }
 
+    #[turso_macros::trace_stack]
     fn compile_cmd(
         self: &Arc<Connection>,
         cmd: Cmd,
         input: &str,
     ) -> Result<(Program, Arc<Pager>, QueryMode)> {
-        let _stack = crate::stack::trace_scope("compile_cmd");
         {
-            let _stack = crate::stack::trace_scope("compile_cmd:update_schema");
+            let _stack = crate::stack::trace_scope("update_schema");
             self.maybe_update_schema();
         }
         let syms = {
-            let _stack = crate::stack::trace_scope("compile_cmd:read_symbols");
+            let _stack = crate::stack::trace_scope("read_symbols");
             self.syms.read()
         };
         let pager = {
-            let _stack = crate::stack::trace_scope("compile_cmd:load_pager");
+            let _stack = crate::stack::trace_scope("load_pager");
             self.pager.load().clone()
         };
         let mode = {
-            let _stack = crate::stack::trace_scope("compile_cmd:query_mode");
+            let _stack = crate::stack::trace_scope("query_mode");
             QueryMode::new(&cmd)
         };
         let (Cmd::Stmt(stmt) | Cmd::Explain(stmt) | Cmd::ExplainQueryPlan(stmt)) = cmd;
         let schema = {
-            let _stack = crate::stack::trace_scope("compile_cmd:clone_schema");
+            let _stack = crate::stack::trace_scope("clone_schema");
             self.schema.read().clone()
         };
         match translate::translate(
@@ -699,7 +699,7 @@ impl Connection {
                 // on deeply nested expression trees.
                 drop(syms);
                 let cmd = {
-                    let _stack = crate::stack::trace_scope("compile_cmd:schema_retry_parse");
+                    let _stack = crate::stack::trace_scope("schema_retry_parse");
                     let mut parser = Parser::new(input.as_bytes());
                     let Some(cmd) = parser.next_cmd()? else {
                         return Err(err);
@@ -707,24 +707,24 @@ impl Connection {
                     cmd
                 };
                 {
-                    let _stack = crate::stack::trace_scope("compile_cmd:retry_update_schema");
+                    let _stack = crate::stack::trace_scope("retry_update_schema");
                     self.maybe_update_schema();
                 }
                 let syms = {
-                    let _stack = crate::stack::trace_scope("compile_cmd:retry_read_symbols");
+                    let _stack = crate::stack::trace_scope("retry_read_symbols");
                     self.syms.read()
                 };
                 let pager = {
-                    let _stack = crate::stack::trace_scope("compile_cmd:retry_load_pager");
+                    let _stack = crate::stack::trace_scope("retry_load_pager");
                     self.pager.load().clone()
                 };
                 let mode = {
-                    let _stack = crate::stack::trace_scope("compile_cmd:retry_query_mode");
+                    let _stack = crate::stack::trace_scope("retry_query_mode");
                     QueryMode::new(&cmd)
                 };
                 let (Cmd::Stmt(stmt) | Cmd::Explain(stmt) | Cmd::ExplainQueryPlan(stmt)) = cmd;
                 let schema = {
-                    let _stack = crate::stack::trace_scope("compile_cmd:retry_clone_schema");
+                    let _stack = crate::stack::trace_scope("retry_clone_schema");
                     self.schema.read().clone()
                 };
                 translate::translate(

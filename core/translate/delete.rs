@@ -68,6 +68,7 @@ fn validate_delete(
 }
 
 #[allow(clippy::too_many_arguments)]
+#[turso_macros::trace_stack]
 pub fn translate_delete(
     tbl_name: &QualifiedName,
     resolver: &Resolver,
@@ -79,7 +80,6 @@ pub fn translate_delete(
     program: &mut ProgramBuilder,
     connection: &Arc<crate::Connection>,
 ) -> Result<()> {
-    let _stack = crate::stack::trace_scope("delete:translate");
     let database_id = resolver.resolve_existing_table_database_id_qualified(tbl_name)?;
     let normalized_table_name = normalize_ident(tbl_name.name.as_str());
     let table = validate_delete(
@@ -94,7 +94,7 @@ pub fn translate_delete(
     program.begin_write_on_database(database_id, schema_cookie);
 
     let mut delete_plan = {
-        let _stack = crate::stack::trace_scope("delete:prepare_plan");
+        let _stack = crate::stack::trace_scope("prepare_plan");
         prepare_delete_plan(
             program,
             resolver,
@@ -114,11 +114,11 @@ pub fn translate_delete(
     if let Plan::Delete(ref mut delete_plan_inner) = delete_plan {
         if let Some(ref mut rowset_plan) = delete_plan_inner.rowset_plan {
             // When using rowset (triggers or subqueries present), subqueries are in the rowset_plan's WHERE
-            let _stack = crate::stack::trace_scope("delete:plan_rowset_subqueries");
+            let _stack = crate::stack::trace_scope("plan_rowset_subqueries");
             plan_subqueries_from_select_plan(program, rowset_plan, resolver, connection)?;
         } else {
             // Normal path: subqueries are in the DELETE plan's WHERE
-            let _stack = crate::stack::trace_scope("delete:plan_where_subqueries");
+            let _stack = crate::stack::trace_scope("plan_where_subqueries");
             plan_subqueries_from_where_clause(
                 program,
                 &mut delete_plan_inner.non_from_clause_subqueries,
@@ -131,7 +131,7 @@ pub fn translate_delete(
     }
 
     {
-        let _stack = crate::stack::trace_scope("delete:optimize_plan");
+        let _stack = crate::stack::trace_scope("optimize_plan");
         optimize_plan(program, &mut delete_plan, resolver)?;
     }
     if let Plan::Delete(delete_plan_inner) = &mut delete_plan {
@@ -180,7 +180,7 @@ pub fn translate_delete(
     let opts = ProgramBuilderOpts::new(1, estimate_num_instructions(delete), 0);
     program.extend(&opts);
     {
-        let _stack = crate::stack::trace_scope("delete:emit_program");
+        let _stack = crate::stack::trace_scope("emit_program");
         emit_program(connection, resolver, program, delete_plan, |_| {})?;
     }
     Ok(())

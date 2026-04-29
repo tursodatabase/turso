@@ -661,6 +661,9 @@ pub fn test(args: TokenStream, input: TokenStream) -> TokenStream {
 ///
 /// #[turso_macros::trace_stack("select:translate")]
 /// fn translate_select(...) { ... }
+///
+/// #[turso_macros::trace_stack(detail = stmt_kind(&stmt))]
+/// fn translate_inner(stmt: ast::Stmt, ...) { ... }
 /// ```
 #[proc_macro_attribute]
 pub fn trace_stack(attr: TokenStream, input: TokenStream) -> TokenStream {

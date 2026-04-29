@@ -1310,6 +1310,7 @@ impl Program {
         state.is_interrupted()
     }
 
+    #[turso_macros::trace_stack]
     pub fn step(
         &self,
         state: &mut ProgramState,
@@ -1317,7 +1318,6 @@ impl Program {
         query_mode: QueryMode,
         waker: Option<&Waker>,
     ) -> Result<StepResult> {
-        let _stack = crate::stack::trace_scope("program_step");
         state.execution_state = ProgramExecutionState::Running;
         let result = match query_mode {
             QueryMode::Normal => self.normal_step(state, pager, waker),
