@@ -2,6 +2,26 @@
 
 Deterministic concurrent simulator for Turso.
 
+## Coverage
+
+To collect line coverage from actual Whopper execution:
+
+```bash
+make whopper-coverage WHOPPER_RUNS=10
+```
+
+Pass regular Whopper CLI flags through `WHOPPER_ARGS`:
+
+```bash
+make whopper-coverage WHOPPER_RUNS=10 \
+  WHOPPER_ARGS="--mode fast --max-steps 10000 --multiprocess --processes 2 --connections-per-process 2"
+```
+
+Reports are written to:
+
+- `.coverage/whopper/report.txt`
+- `.coverage/whopper/html/index.html`
+
 ## Running Elle Locally (macOS)
 
 ### One-time setup
