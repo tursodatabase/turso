@@ -1,5 +1,6 @@
 //! Translation of VACUUM statements to VDBE bytecode.
 
+use crate::util::normalize_ident;
 use crate::vdbe::builder::ProgramBuilder;
 use crate::vdbe::insn::Insn;
 use crate::{bail_parse_error, Connection, Result};
@@ -48,8 +49,17 @@ pub fn translate_vacuum(
                 ));
             }
 
-            // Schema-qualified VACUUM is not supported yet.
-            if schema_name != "main" {
+            let normalized_schema_name = normalize_ident(&schema_name);
+            if normalized_schema_name != "main" {
+                let schema_exists = normalized_schema_name == "temp"
+                    || connection
+                        .attached_databases()
+                        .read()
+                        .get_database_by_name(&normalized_schema_name)
+                        .is_some();
+                if !schema_exists {
+                    bail_parse_error!("unknown database {}", schema_name);
+                }
                 bail_parse_error!(
                     "VACUUM is only supported for the main database; schema '{}' is not supported yet",
                     schema_name

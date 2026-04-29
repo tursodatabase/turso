@@ -23,6 +23,27 @@ expect {
     ok
 }
 
+# Adapted from SQLite e_vacuum.test: VACUUM reclaims freelist pages after
+# deleted data leaves free pages behind.
+test vacuum-reclaims-freelist-pages {
+    PRAGMA page_size = 1024;
+    CREATE TABLE vacuum_freelist_keep(x);
+    CREATE TABLE vacuum_freelist_drop(x);
+    INSERT INTO vacuum_freelist_drop VALUES(randomblob(2000));
+    INSERT INTO vacuum_freelist_drop SELECT randomblob(2000) FROM vacuum_freelist_drop;
+    INSERT INTO vacuum_freelist_drop SELECT randomblob(2000) FROM vacuum_freelist_drop;
+    DROP TABLE vacuum_freelist_drop;
+    PRAGMA freelist_count;
+    VACUUM;
+    PRAGMA freelist_count;
+    PRAGMA integrity_check;
+}
+expect {
+    9
+    0
+    ok
+}
+
 @backend rust
 test vacuum-generated-columns {
     CREATE TABLE t1(a INTEGER, b AS (a * 2));
@@ -110,6 +131,15 @@ expect error {
     VACUUM is only supported for the main database; schema 'temp' is not supported yet
 }
 
+# Adapted from SQLite vacuum5.test: unknown schema-qualified VACUUM reports
+# the missing database name.
+test vacuum-unknown-schema-rejected {
+    VACUUM olaf;
+}
+expect error {
+    unknown database olaf
+}
+
 @backend rust
 test vacuum-rejected-in-begin {
     CREATE TABLE tx_t(x);
@@ -183,6 +213,33 @@ test vacuum-preserves-user-version {
 expect {
     2
     ok
+}
+
+# Adapted from SQLite pragma.test pragma-8.2.4.2: VACUUM increments the
+# schema-version header field.
+test vacuum-increments-schema-version {
+    CREATE TABLE vacuum_schema_version(x);
+    PRAGMA schema_version;
+    VACUUM;
+    PRAGMA schema_version;
+}
+expect {
+    1
+    2
+}
+
+# Adapted from SQLite pragma.test pragma-1.9.2: VACUUM preserves
+# default_cache_size.
+@skip "missing feature: PRAGMA default_cache_size is not supported; see missing_feature.txt"
+test vacuum-preserves-default-cache-size-from-sqlite {
+    PRAGMA default_cache_size = -123;
+    VACUUM;
+    PRAGMA cache_size;
+    PRAGMA default_cache_size;
+}
+expect {
+    123
+    123
 }
 
 # Adapted from SQLite vacuum.test vacuum-1.4: VACUUM must preserve schema
@@ -344,6 +401,23 @@ expect {
     ok
 }
 
+# Adapted from SQLite without_rowid3.test: VACUUM must preserve a foreign-key
+# schema whose child table is created before the parent table.
+test vacuum-preserves-child-before-parent-foreign-key {
+    PRAGMA foreign_keys = ON;
+    CREATE TABLE vacuum_fk_child_first(a REFERENCES vacuum_fk_parent_later(c), b);
+    CREATE TABLE vacuum_fk_parent_later(c UNIQUE, b);
+    INSERT INTO vacuum_fk_parent_later VALUES(1, 2);
+    INSERT INTO vacuum_fk_child_first VALUES(1, 2);
+    VACUUM;
+    SELECT a, b FROM vacuum_fk_child_first;
+    PRAGMA integrity_check;
+}
+expect {
+    1|2
+    ok
+}
+
 # Adapted from SQLite check.test check-4.10: VACUUM must still rebuild a
 # database containing rows inserted while CHECK constraints were ignored.
 test vacuum-with-ignored-check-constraints {
@@ -426,6 +500,22 @@ expect {
     ok
 }
 
+# Adapted from SQLite tableopts.test: VACUUM preserves composite-primary-key
+# WITHOUT ROWID tables.
+@skip-if mvcc "WITHOUT ROWID tables are not supported in MVCC mode"
+test vacuum-without-rowid-composite-primary-key {
+    CREATE TABLE vacuum_wr_composite(a, b, c, PRIMARY KEY(a,b)) WITHOUT ROWID;
+    INSERT INTO vacuum_wr_composite VALUES(1,2,3),(2,3,4);
+    VACUUM;
+    SELECT c FROM vacuum_wr_composite WHERE a IN (1,2) ORDER BY b;
+    PRAGMA integrity_check;
+}
+expect {
+    3
+    4
+    ok
+}
+
 # Adapted from SQLite without_rowid1.test/index6.test/index7.test: SQLite
 # vacuums WITHOUT ROWID tables with secondary indexes and UNIQUE constraints.
 @skip "missing feature: secondary indexes and secondary UNIQUE constraints on WITHOUT ROWID tables are not supported; see missing_feature.txt"
@@ -453,6 +543,44 @@ test vacuum-with-count-changes {
 }
 expect {
     2
+    ok
+}
+
+# Adapted from SQLite misc4.test: malformed schema SQL should surface a stable
+# parse error during VACUUM.
+@skip "missing feature: PRAGMA writable_schema is not supported; see missing_feature.txt"
+test vacuum-malformed-schema-error-from-sqlite {
+    CREATE TABLE vacuum_malformed_schema(x);
+    PRAGMA writable_schema = ON;
+    UPDATE sqlite_master SET sql='CREATE TABLE [M%s%s%s%s%s%s%s%s%s%s%s%s%s'
+        WHERE name = 'vacuum_malformed_schema';
+    VACUUM;
+}
+expect error {
+    unrecognized token
+}
+
+# Adapted from SQLite tkt3762.test: incremental_vacuum after a plain VACUUM
+# must not corrupt the database.
+@skip "missing feature: PRAGMA incremental_vacuum is not supported; see missing_feature.txt"
+test vacuum-before-incremental-vacuum-from-sqlite {
+    CREATE TABLE vacuum_incremental_after_plain(x);
+    INSERT INTO vacuum_incremental_after_plain VALUES(zeroblob(900));
+    INSERT INTO vacuum_incremental_after_plain SELECT x FROM vacuum_incremental_after_plain;
+    INSERT INTO vacuum_incremental_after_plain SELECT x FROM vacuum_incremental_after_plain;
+    INSERT INTO vacuum_incremental_after_plain SELECT x FROM vacuum_incremental_after_plain;
+    DELETE FROM vacuum_incremental_after_plain WHERE rowid > 3;
+    VACUUM;
+    BEGIN;
+    DELETE FROM vacuum_incremental_after_plain WHERE rowid = 2;
+    PRAGMA incremental_vacuum(10);
+    INSERT INTO vacuum_incremental_after_plain VALUES(zeroblob(3900));
+    SELECT count(*) FROM vacuum_incremental_after_plain;
+    ROLLBACK;
+    PRAGMA integrity_check;
+}
+expect {
+    3
     ok
 }
 
@@ -585,6 +713,43 @@ test vacuum-database-name-with-quote {
     PRAGMA integrity_check;
 }
 expect {
+    ok
+}
+
+# Adapted from SQLite pagesize.test: an initial page size selected before
+# database creation is preserved by VACUUM.
+test vacuum-preserves-initial-page-size {
+    PRAGMA page_size = 1024;
+    CREATE TABLE vacuum_page_size_keep(x);
+    INSERT INTO vacuum_page_size_keep VALUES(randomblob(1500));
+    VACUUM;
+    PRAGMA page_size;
+    SELECT count(*), sum(length(x)) FROM vacuum_page_size_keep;
+    PRAGMA integrity_check;
+}
+expect {
+    1024
+    1|1500
+    ok
+}
+
+# Adapted from SQLite walbak.test/tkt-5d863f876e.test: VACUUM in WAL mode
+# preserves journal mode and indexed table content.
+test vacuum-preserves-wal-journal-mode {
+    CREATE TABLE vacuum_wal_mode(a, b);
+    CREATE INDEX vacuum_wal_mode_idx ON vacuum_wal_mode(a, b);
+    INSERT INTO vacuum_wal_mode VALUES(1, 2), (3, 4);
+    PRAGMA journal_mode = WAL;
+    VACUUM;
+    PRAGMA journal_mode;
+    SELECT * FROM vacuum_wal_mode ORDER BY a;
+    PRAGMA integrity_check;
+}
+expect {
+    wal
+    wal
+    1|2
+    3|4
     ok
 }
 

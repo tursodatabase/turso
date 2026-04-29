@@ -6,7 +6,7 @@ use core_tester::{
 };
 use rand::{Rng, RngCore, SeedableRng};
 use rand_chacha::ChaCha8Rng;
-use turso_core::{Connection, Database};
+use turso_core::{Connection, Database, DatabaseOpts, OpenFlags};
 
 use super::helpers;
 
@@ -17,7 +17,13 @@ struct VacuumSnapshot {
 }
 
 fn open_queued_db(io: Arc<QueuedIo>, path: &str) -> anyhow::Result<Arc<Database>> {
-    Ok(Database::open_file(io, path)?)
+    Ok(Database::open_file_with_flags(
+        io,
+        path,
+        OpenFlags::Create,
+        DatabaseOpts::new().with_vacuum(true),
+        None,
+    )?)
 }
 
 fn run_integrity_check(conn: &Arc<Connection>) -> String {
