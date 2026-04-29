@@ -1757,6 +1757,13 @@ pub enum Insn {
         dest_path: String,
     },
 
+    /// In-place VACUUM - compact the database (by writing to a temporary location and then copying
+    /// back)
+    Vacuum {
+        /// Database index to vacuum (0 = main)
+        db: usize,
+    },
+
     /// Ensure turso_cdc_version table exists and insert/replace a version row,
     /// then enable CDC on the connection. Runs nested SQL at VDBE execution time
     /// (same pattern as ParseSchema). CDC is enabled after version table operations
@@ -1993,6 +2000,7 @@ impl InsnVariants {
             InsnVariants::HashGraceNextProbe => execute::op_hash_grace_next_probe,
             InsnVariants::HashGraceAdvancePartition => execute::op_hash_grace_advance_partition,
             InsnVariants::VacuumInto => execute::op_vacuum_into,
+            InsnVariants::Vacuum => execute::op_vacuum,
             InsnVariants::InitCdcVersion => execute::op_init_cdc_version,
         }
     }
@@ -2049,7 +2057,8 @@ impl Insn {
             | Self::DropColumn { .. }
             | Self::AddColumn { .. }
             | Self::AlterColumn { .. }
-            | Self::JournalMode { .. } => false,
+            | Self::JournalMode { .. }
+            | Self::Vacuum { .. } => false,
             Self::MaxPgcnt { new_max, .. } => *new_max == 0,
             Self::Program { program, .. } => program.is_readonly(),
             _ => true,

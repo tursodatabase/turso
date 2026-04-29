@@ -1,4 +1,4 @@
-@database :memory:
+@database :temp:
 
 # =============================================================================
 # 1. Basics & Syntax Variants
@@ -3217,7 +3217,6 @@ expect {
 
 # --- VACUUM ---
 
-@skip "TODO: VACUUM is not supported yet"
 test gencol_vacuum_virtual {
     CREATE TABLE t1(a INTEGER, b AS (a * 2));
     INSERT INTO t1(a) VALUES(1), (2), (3), (4), (5);
@@ -3231,7 +3230,6 @@ expect {
     5|10
 }
 
-@skip "TODO: VACUUM is not supported yet"
 @skip-if mvcc "Expression indexes are not supported with MVCC"
 test gencol_vacuum_virtual_with_index {
     CREATE TABLE t1(a INTEGER, b AS (a * 2));

@@ -524,7 +524,7 @@ impl Statement {
             conn.rollback_current_txn_state(&main_pager, true);
             self.state.auto_txn_cleanup = vdbe::TxnCleanup::None;
         }
-        if conn.get_auto_commit() {
+        if conn.get_auto_commit() && !conn.schema_reparse_in_progress() {
             conn.maybe_reparse_schema()?;
         }
 

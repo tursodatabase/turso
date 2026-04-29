@@ -5,14 +5,23 @@ use crate::backends::DefaultDatabaseResolver;
 use crate::parser::ast::{Backend, Capability, DatabaseConfig, DatabaseLocation};
 use async_trait::async_trait;
 use std::collections::HashSet;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
-use tempfile::NamedTempFile;
+use tempfile::{NamedTempFile, TempDir};
 use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
 use tokio::time::timeout;
+
+const TURSO_CLI_EXPERIMENTAL_FLAGS: &[&str] = &[
+    "--experimental-views",
+    "--experimental-custom-types",
+    "--experimental-attach",
+    "--experimental-index-method",
+    "--experimental-generated-columns",
+    "--experimental-vacuum",
+];
 
 /// CLI backend that executes SQL via the tursodb CLI tool
 pub struct CliBackend {
@@ -79,6 +88,22 @@ impl CliBackend {
     }
 }
 
+fn resolve_database_path(path: &Path) -> PathBuf {
+    if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(path)
+    }
+}
+
+fn resolve_binary_path(path: &Path) -> Result<PathBuf, std::io::Error> {
+    if path.is_absolute() || path.components().count() == 1 {
+        Ok(path.to_path_buf())
+    } else {
+        Ok(std::env::current_dir()?.join(path))
+    }
+}
+
 #[async_trait]
 impl SqlBackend for CliBackend {
     fn name(&self) -> &str {
@@ -109,7 +134,11 @@ impl SqlBackend for CliBackend {
                 let path = temp.path().to_string_lossy().to_string();
                 (path, Some(temp), true)
             }
-            DatabaseLocation::Path(path) => (path.to_string_lossy().to_string(), None, false),
+            DatabaseLocation::Path(path) => (
+                resolve_database_path(path).to_string_lossy().to_string(),
+                None,
+                false,
+            ),
             DatabaseLocation::Default | DatabaseLocation::DefaultNoRowidAlias => {
                 // Resolve the path using the resolver
                 let resolved = self
@@ -124,14 +153,26 @@ impl SqlBackend for CliBackend {
                 (resolved.to_string_lossy().to_string(), None, false)
             }
         };
+        let working_temp_dir = if self.working_dir.is_none() {
+            Some(TempDir::new().map_err(|e| BackendError::CreateDatabase(e.to_string()))?)
+        } else {
+            None
+        };
+        let working_dir = self.working_dir.clone().or_else(|| {
+            working_temp_dir
+                .as_ref()
+                .map(|dir| dir.path().to_path_buf())
+        });
 
         Ok(Box::new(CliDatabaseInstance {
-            binary_path: self.binary_path.clone(),
-            working_dir: self.working_dir.clone(),
+            binary_path: resolve_binary_path(&self.binary_path)
+                .map_err(|e| BackendError::CreateDatabase(e.to_string()))?,
+            working_dir,
             db_path,
             readonly: config.readonly,
             timeout: self.timeout,
             _temp_file: temp_file,
+            _working_temp_dir: working_temp_dir,
             buffer_setups,
             setup_buffer: Vec::new(),
             mvcc: self.mvcc,
@@ -149,6 +190,8 @@ pub struct CliDatabaseInstance {
     timeout: Duration,
     /// Keep temp file alive - it's deleted when this is dropped
     _temp_file: Option<NamedTempFile>,
+    /// Keep the per-test CLI working directory alive for relative file outputs.
+    _working_temp_dir: Option<TempDir>,
     /// Whether to buffer setups and send them with the test SQL in one subprocess.
     /// True for per-test databases (memory, temp); false for shared databases (file, default).
     buffer_setups: bool,
@@ -262,11 +305,9 @@ impl CliDatabaseInstance {
             cmd.arg(&self.db_path);
             cmd.arg("-q"); // Quiet mode - suppress banner
             cmd.arg("-m").arg("list"); // List mode for pipe-separated output
-            cmd.arg("--experimental-views");
-            cmd.arg("--experimental-custom-types");
-            cmd.arg("--experimental-attach");
-            cmd.arg("--experimental-index-method");
-            cmd.arg("--experimental-generated-columns");
+            for flag in TURSO_CLI_EXPERIMENTAL_FLAGS {
+                cmd.arg(flag);
+            }
         }
 
         if self.readonly {

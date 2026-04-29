@@ -1,0 +1,22 @@
+@database :memory:
+@skip-file-if mvcc "plain VACUUM sqltests are disabled for MVCC; MVCC VACUUM coverage lives in Rust integration tests"
+
+# Adapted from SQLite vacuum.test/vacuum3.test: in-memory databases can be
+# vacuumed and VACUUM clears their freelist.
+@skip "missing feature: plain VACUUM does not support in-memory databases; see missing_feature.txt"
+test vacuum-memory-database-from-sqlite {
+    CREATE TABLE t1(t);
+    VACUUM;
+    CREATE TABLE t2(t);
+    CREATE TABLE t3(t);
+    DROP TABLE t2;
+    PRAGMA freelist_count;
+    VACUUM;
+    PRAGMA integrity_check;
+    PRAGMA freelist_count;
+}
+expect {
+    1
+    ok
+    0
+}

@@ -12,6 +12,8 @@ const MULTIPROCESS_SHM_COUNT_CHILD_TEST: &str =
     "multiprocess_tests::multiprocess_shm_count_child_process";
 const MULTIPROCESS_SHM_HOLD_READ_TX_CHILD_TEST: &str =
     "multiprocess_tests::multiprocess_shm_hold_read_tx_child_process";
+const MULTIPROCESS_SHM_HOLD_OPEN_CHILD_TEST: &str =
+    "multiprocess_tests::multiprocess_shm_hold_open_child_process";
 const MULTIPROCESS_SHM_SCHEMA_CHILD_TEST: &str =
     "multiprocess_tests::multiprocess_shm_schema_child_process";
 const MULTIPROCESS_SHM_INSERT_AND_CLOSE_CHILD_TEST: &str =
@@ -41,6 +43,18 @@ fn count_test_rows(conn: &Arc<Connection>) -> i64 {
     })
     .unwrap();
     count
+}
+
+fn is_multiprocess_vacuum_rejection(err: &LimboError) -> bool {
+    match err {
+        LimboError::ParseError(msg) => {
+            msg.contains("VACUUM is incompatible with experimental multiprocess WAL")
+        }
+        LimboError::TxError(msg) | LimboError::InternalError(msg) => {
+            msg.contains("cannot VACUUM experimental multiprocess WAL databases")
+        }
+        _ => false,
+    }
 }
 
 fn get_rows(conn: &Arc<Connection>, query: &str) -> Vec<Vec<Value>> {
@@ -846,6 +860,33 @@ fn multiprocess_shm_hold_read_tx_child_process() {
 }
 
 #[test]
+fn multiprocess_shm_hold_open_child_process() {
+    let Some(db_path) = std::env::var_os("TURSO_MULTIPROCESS_DB_PATH") else {
+        return;
+    };
+    let ready_file = std::env::var_os("TURSO_MULTIPROCESS_READY_FILE")
+        .map(std::path::PathBuf::from)
+        .unwrap();
+    let release_file = std::env::var_os("TURSO_MULTIPROCESS_RELEASE_FILE")
+        .map(std::path::PathBuf::from)
+        .unwrap();
+
+    let io: Arc<dyn IO> = Arc::new(PlatformIO::new().unwrap());
+    let db = open_multiprocess_db(io, db_path.to_str().unwrap()).unwrap();
+    let last_checksum_and_max_frame = db.shared_wal.read().last_checksum_and_max_frame();
+    let wal = db
+        .build_wal(last_checksum_and_max_frame, db.buffer_pool.clone())
+        .unwrap();
+    let wal_file = wal.as_any().downcast_ref::<WalFile>().unwrap();
+    assert_eq!(wal_file.coordination_backend_name(), "tshm");
+    assert_eq!(wal_file.coordination_open_mode_name(), Some("multiprocess"));
+
+    let _conn = db.connect().unwrap();
+    std::fs::write(&ready_file, b"ready").unwrap();
+    wait_for_file(&release_file);
+}
+
+#[test]
 fn multiprocess_shm_schema_child_process() {
     let Some(db_path) = std::env::var_os("TURSO_MULTIPROCESS_DB_PATH") else {
         return;
@@ -917,6 +958,86 @@ fn subprocess_database_open_selects_multiprocess_shm_backend() {
         "count child process failed: stdout={}; stderr={}",
         String::from_utf8_lossy(&count_output.stdout),
         String::from_utf8_lossy(&count_output.stderr)
+    );
+}
+
+#[test]
+fn plain_vacuum_rejects_multiprocess_wal_database_without_peer_process() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("vacuum-multiprocess-no-peer.db");
+    let db_path_str = db_path.to_str().unwrap();
+    let io: Arc<dyn IO> = multiprocess_test_io();
+
+    let db = open_multiprocess_db(io, db_path_str).unwrap();
+    let conn = db.connect().unwrap();
+    conn.execute("create table test(id integer primary key, value text)")
+        .unwrap();
+    conn.execute("insert into test(value) values ('parent')")
+        .unwrap();
+
+    let err = conn
+        .execute("VACUUM")
+        .expect_err("VACUUM should reject multiprocess-WAL databases");
+    assert!(
+        is_multiprocess_vacuum_rejection(&err),
+        "expected multiprocess VACUUM rejection, got {err:?}"
+    );
+    assert_eq!(
+        count_test_rows(&conn),
+        1,
+        "rejecting VACUUM on multiprocess-WAL databases must not disturb existing rows"
+    );
+}
+
+#[test]
+fn plain_vacuum_rejects_live_multiprocess_peer_process() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("vacuum-multiprocess-peer.db");
+    let db_path_str = db_path.to_str().unwrap();
+    let ready_file = dir.path().join("vacuum-peer-ready");
+    let release_file = dir.path().join("vacuum-peer-release");
+    let io: Arc<dyn IO> = multiprocess_test_io();
+
+    let db = open_multiprocess_db(io, db_path_str).unwrap();
+    let conn = db.connect().unwrap();
+    conn.execute("create table test(id integer primary key, value text)")
+        .unwrap();
+    conn.execute("insert into test(value) values ('parent')")
+        .unwrap();
+
+    let current_exe = std::env::current_exe().unwrap();
+    let mut child = Command::new(&current_exe)
+        .arg(MULTIPROCESS_SHM_HOLD_OPEN_CHILD_TEST)
+        .arg("--exact")
+        .arg("--nocapture")
+        .env("TURSO_MULTIPROCESS_DB_PATH", db_path_str)
+        .env("TURSO_MULTIPROCESS_READY_FILE", &ready_file)
+        .env("TURSO_MULTIPROCESS_RELEASE_FILE", &release_file)
+        .spawn()
+        .unwrap();
+    wait_for_file(&ready_file);
+
+    let authority = db.shared_wal_coordination().unwrap().unwrap();
+    assert!(
+        !authority.is_last_process_mapping(),
+        "live child process should make the parent authority observe another process mapping"
+    );
+
+    let err = conn
+        .execute("VACUUM")
+        .expect_err("VACUUM should reject while another multiprocess-WAL process is live");
+    assert!(
+        is_multiprocess_vacuum_rejection(&err),
+        "expected multiprocess VACUUM rejection, got {err:?}"
+    );
+
+    std::fs::write(&release_file, b"release").unwrap();
+    let status = child.wait().unwrap();
+    assert!(status.success(), "child process failed: status={status:?}");
+    assert_eq!(
+        count_test_rows(&conn),
+        1,
+        "rejecting VACUUM while a peer process is live must not disturb the existing connection"
     );
 }
 

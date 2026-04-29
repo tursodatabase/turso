@@ -139,6 +139,18 @@ pub(crate) struct RollbackFrameInfo {
     pub(crate) staged_schema_snapshot: HashMap<usize, Arc<Schema>>,
 }
 
+struct SchemaReparseGuard {
+    connection: Arc<Connection>,
+}
+
+impl Drop for SchemaReparseGuard {
+    fn drop(&mut self) {
+        self.connection
+            .schema_reparse_in_progress
+            .store(false, Ordering::SeqCst);
+    }
+}
+
 /// Database connection handle.
 ///
 /// If you add a setting that affects SQL compilation or execution, call
@@ -247,6 +259,10 @@ pub struct Connection {
     /// Connection-level named savepoint stack used to mirror savepoint state
     /// onto temp/attached databases that start participating after SAVEPOINT.
     pub(crate) named_savepoints: RwLock<Vec<NamedSavepointFrame>>,
+    /// True while this connection is rebuilding its schema from sqlite_schema.
+    /// Internal helper statements used during reload must not recursively
+    /// trigger another schema reparse on the same connection.
+    pub(crate) schema_reparse_in_progress: AtomicBool,
     /// Generation counter bumped whenever any setting that affects PrepareContext
     /// changes. Allows prepared statements to cheaply detect when they need to be
     /// reprepared (single u64 comparison instead of rebuilding the full context).
@@ -316,6 +332,21 @@ impl Drop for Connection {
 }
 
 impl Connection {
+    fn schema_reparse_guard(self: &Arc<Connection>) -> SchemaReparseGuard {
+        let was_reparsing = self.schema_reparse_in_progress.swap(true, Ordering::SeqCst);
+        turso_assert!(
+            !was_reparsing,
+            "schema reparse must not recurse on the same connection"
+        );
+        SchemaReparseGuard {
+            connection: self.clone(),
+        }
+    }
+
+    pub(crate) fn schema_reparse_in_progress(&self) -> bool {
+        self.schema_reparse_in_progress.load(Ordering::Acquire)
+    }
+
     pub(crate) fn empty_temp_schema(&self) -> Arc<Schema> {
         // with_options only fails if built-in type SQL is malformed (programmer bug).
         let mut schema = Schema::with_options(self.db.experimental_custom_types_enabled())
@@ -329,6 +360,7 @@ impl Connection {
             .with_views(self.db.experimental_views_enabled())
             .with_custom_types(self.db.experimental_custom_types_enabled())
             .with_index_method(self.db.experimental_index_method_enabled())
+            .with_vacuum(self.db.experimental_vacuum_enabled())
             .with_generated_columns(self.db.experimental_generated_columns_enabled())
     }
 
@@ -903,6 +935,8 @@ impl Connection {
     }
 
     pub(crate) fn reparse_schema_with_cookie(self: &Arc<Connection>, cookie: u32) -> Result<()> {
+        let _reparse_guard = self.schema_reparse_guard();
+        self.pager.load().set_schema_cookie(Some(cookie));
         // create fresh schema as some objects can be deleted
         let mut fresh = Schema::with_options(self.experimental_custom_types_enabled())?;
         fresh.generated_columns_enabled = self.db.experimental_generated_columns_enabled();
@@ -1251,7 +1285,7 @@ impl Connection {
         if !has_types_table {
             return Ok(Vec::new());
         }
-        let mut type_stmt = self.prepare(format!(
+        let mut type_stmt = self.prepare_internal(format!(
             "SELECT name, sql FROM {}",
             crate::schema::TURSO_TYPES_TABLE_NAME
         ))?;
@@ -1264,6 +1298,9 @@ impl Connection {
     }
 
     pub fn maybe_update_schema(&self) {
+        if self.schema_reparse_in_progress() {
+            return;
+        }
         let current_schema_version = self.schema.read().schema_version;
         let schema = self.db.schema.lock();
         if matches!(self.get_tx_state(), TransactionState::None)
@@ -1908,6 +1945,14 @@ impl Connection {
         self.db.experimental_attach_enabled()
     }
 
+    pub fn experimental_vacuum_enabled(&self) -> bool {
+        self.db.experimental_vacuum_enabled()
+    }
+
+    pub fn experimental_multiprocess_wal_enabled(&self) -> bool {
+        self.db.experimental_multiprocess_wal_enabled()
+    }
+
     pub fn experimental_generated_columns_enabled(&self) -> bool {
         self.db.experimental_generated_columns_enabled()
     }
@@ -2337,6 +2382,7 @@ impl Connection {
             .with_views(self.db.experimental_views_enabled())
             .with_custom_types(self.db.experimental_custom_types_enabled())
             .with_index_method(self.db.experimental_index_method_enabled())
+            .with_vacuum(self.db.experimental_vacuum_enabled())
             .with_generated_columns(self.db.experimental_generated_columns_enabled());
         // Select the IO layer for the attached database:
         // - :memory: databases always get a fresh MemoryIO
@@ -3095,6 +3141,39 @@ impl Connection {
         }
         self.rollback_attached_wal_txns();
         self.set_tx_state(TransactionState::None);
+    }
+
+    /// Roll back transaction state for helpers that start a manual `BEGIN`
+    /// outside the normal Transaction opcode path.
+    ///
+    /// Unlike `rollback_current_txn_state`, this tolerates the attached-only
+    /// case where the connection flipped `auto_commit` off but never opened a
+    /// main-db read transaction.
+    pub(crate) fn rollback_manual_txn_cleanup(
+        &self,
+        pager: &Arc<Pager>,
+        clear_attached_schemas: bool,
+    ) {
+        let main_has_implicit_state = self.get_tx_state() != TransactionState::None
+            || self.get_mv_tx().is_some()
+            || pager.holds_read_lock()
+            || pager.holds_write_lock();
+
+        if main_has_implicit_state {
+            self.rollback_current_txn_state(pager, clear_attached_schemas);
+        } else {
+            if self.next_attached_mv_tx().is_some() {
+                self.rollback_attached_mvcc_txs(clear_attached_schemas);
+            }
+            self.rollback_attached_wal_txns();
+            self.set_tx_state(TransactionState::None);
+            self.auto_commit.store(true, Ordering::SeqCst);
+        }
+
+        self.rollback_temp_schema();
+        self.set_cdc_transaction_id(-1);
+        self.clear_named_savepoints();
+        self.clear_deferred_foreign_key_violations();
     }
 
     /// Iterate over all attached MVCC transactions, calling `f(db_id, tx_id)` for each.
