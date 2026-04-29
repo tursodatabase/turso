@@ -358,6 +358,7 @@ impl Future for AsyncOpFuture {
         Result<Option<turso_sync_sdk_kit::turso_async_operation::TursoAsyncOperationResult>>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        tracing::trace!("poll async op future");
         let this = unsafe { self.get_unchecked_mut() };
         let Some(op) = &this.op else {
             return Poll::Ready(Err(Error::Misuse(
@@ -481,11 +482,11 @@ impl IoWorker {
 
     // Called from the IO thread once progress has been made to notify all pending futures.
     fn notify_progress(wakers: &Arc<Mutex<Vec<Waker>>>) {
-        tracing::trace!("notify_progress");
         let wakers = {
             let mut guard = wakers.lock().unwrap();
             std::mem::take(&mut *guard)
         };
+        tracing::trace!("notify_progress: wakers={}", wakers.len());
         for w in wakers {
             w.wake();
         }
