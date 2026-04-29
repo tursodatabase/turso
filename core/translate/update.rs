@@ -14,19 +14,21 @@ use crate::{
     vdbe::builder::{ProgramBuilder, ProgramBuilderOpts},
     CaptureDataChangesExt, Connection,
 };
-use turso_parser::ast::{self, Expr};
+use turso_parser::ast::{self, Expr, TriggerEvent};
 
 use super::emitter::emit_program;
 use super::expr::process_returning_clause;
 use super::optimizer::optimize_plan;
 use super::plan::{
-    ColumnUsedMask, DmlSafety, JoinedTable, Plan, TableReferences, UpdatePlan, UpdateSetClause,
+    ColumnUsedMask, DmlSafety, DmlSafetyReason, JoinedTable, Plan, TableReferences, UpdatePlan,
+    UpdateSetClause,
 };
 use super::planner::{append_vtab_predicates_to_where_clause, parse_from, parse_where};
 use super::subquery::{
     mark_shared_cte_materialization_requirements, plan_subqueries_from_returning,
     plan_subqueries_from_update_sets, plan_subqueries_from_where_clause,
 };
+use super::trigger_exec::has_fk_cascade_triggers;
 /*
 * Update is simple. By default we scan the table, and for each row, we check the WHERE
 * clause. If it evaluates to true, we build the new record with the updated value and insert.
@@ -440,6 +442,20 @@ fn prepare_update_plan(
     let target_table = read_scope_tables.joined_tables_mut().remove(0);
     let from_tables = read_scope_tables;
 
+    let mut safety = DmlSafety::default();
+    // FK cascade triggers when a child can write back to this table mid-scan.
+    if let Some(bt) = table.btree() {
+        if has_fk_cascade_triggers(
+            resolver,
+            database_id,
+            bt.as_ref(),
+            TriggerEvent::Update,
+            connection.foreign_keys_enabled(),
+        ) {
+            safety.require(DmlSafetyReason::Trigger);
+        }
+    }
+
     Ok(UpdatePlan {
         target_table,
         from_tables,
@@ -454,7 +470,7 @@ fn prepare_update_plan(
         write_set_plan: None,
         cdc_update_alter_statement: None,
         non_from_clause_subqueries,
-        safety: DmlSafety::default(),
+        safety,
     })
 }
 

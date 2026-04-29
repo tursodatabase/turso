@@ -12,7 +12,7 @@ use crate::translate::subquery::{
     plan_subqueries_from_returning, plan_subqueries_from_select_plan,
     plan_subqueries_from_where_clause,
 };
-use crate::translate::trigger_exec::has_triggers_including_temp;
+use crate::translate::trigger_exec::{has_fk_cascade_triggers, has_triggers_including_temp};
 use crate::util::normalize_ident;
 use crate::vdbe::builder::{ProgramBuilder, ProgramBuilderOpts};
 use crate::Result;
@@ -245,19 +245,24 @@ pub fn prepare_delete_plan(
     let (resolved_limit, resolved_offset) =
         limit.map_or(Ok((None, None)), |l| parse_limit(l, resolver))?;
 
-    // Check if there are DELETE triggers. If so, we need to materialize the write set into a RowSet first.
-    // This is done in SQLite for all DELETE triggers on the affected table even if the trigger would not have an impact
-    // on the target table -- presumably due to lack of static analysis capabilities to determine whether it's safe
-    // to skip the rowset materialization.
-    let has_delete_triggers = btree_table_for_triggers
+    // Check if there are DELETE triggers, or FK cascade triggers on a child that can write back mid-scan.
+    // If so, we materialize the write set into a RowSet first.
+    let needs_trigger_safety = btree_table_for_triggers
         .as_ref()
         .map(|bt| {
             has_triggers_including_temp(resolver, database_id, TriggerEvent::Delete, None, bt)
+                || has_fk_cascade_triggers(
+                    resolver,
+                    database_id,
+                    bt,
+                    TriggerEvent::Delete,
+                    connection.foreign_keys_enabled(),
+                )
         })
         .unwrap_or(false);
 
     let mut safety = DmlSafety::default();
-    if has_delete_triggers {
+    if needs_trigger_safety {
         safety.require(DmlSafetyReason::Trigger);
     }
     if where_clause_has_subquery(&where_predicates) {
