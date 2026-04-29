@@ -723,6 +723,7 @@ fn validate_check_types_in_expr(
 fn validate(
     body: &ast::CreateTableBody,
     table_name: &str,
+    table: &BTreeTable,
     resolver: &Resolver,
     conn: &Connection,
 ) -> Result<()> {
@@ -864,9 +865,6 @@ fn validate(
             }
         }
 
-        crate::stack::trace_remaining("create_table_validate:before_schema_create_table");
-        let table = create_table(table_name, body, 0)?;
-        crate::stack::trace_remaining("create_table_validate:after_schema_create_table");
         if !table.has_rowid {
             if table.has_autoincrement {
                 bail_parse_error!("AUTOINCREMENT is not allowed on WITHOUT ROWID tables");
@@ -1128,8 +1126,17 @@ pub fn translate_create_table(
     let schema_cookie = resolver.with_schema(database_id, |s| s.schema_version);
     program.begin_write_on_database(database_id, schema_cookie);
     let normalized_tbl_name = normalize_ident(tbl_name.name.as_str());
+    crate::stack::trace_remaining("translate_create_table:before_schema_create_table");
+    let created_table = Box::new(create_table(&normalized_tbl_name, &body, 0)?);
+    crate::stack::trace_remaining("translate_create_table:after_schema_create_table");
     crate::stack::trace_remaining("translate_create_table:before_validate");
-    validate(&body, &normalized_tbl_name, resolver, connection)?;
+    validate(
+        &body,
+        &normalized_tbl_name,
+        created_table.as_ref(),
+        resolver,
+        connection,
+    )?;
     crate::stack::trace_remaining("translate_create_table:after_validate");
 
     // Gate array column types behind the experimental custom types flag.
@@ -1335,7 +1342,7 @@ pub fn translate_create_table(
     // https://github.com/sqlite/sqlite/blob/95f6df5b8d55e67d1e34d2bff217305a2f21b1fb/src/build.c#L1334C5-L1336C65
 
     crate::stack::trace_remaining("translate_create_table:before_collect_autoindexes");
-    let index_regs = collect_autoindexes(&body, program, &normalized_tbl_name)?;
+    let index_regs = collect_autoindexes(created_table.as_ref(), program)?;
     crate::stack::trace_remaining("translate_create_table:after_collect_autoindexes");
     if let Some(index_regs) = index_regs.as_ref() {
         for index_reg in index_regs.iter() {
@@ -1548,13 +1555,10 @@ pub fn emit_schema_entry(
 ///
 /// Otherwise, an automatic PRIMARY KEY index is required.
 fn collect_autoindexes(
-    body: &ast::CreateTableBody,
+    table: &BTreeTable,
     program: &mut ProgramBuilder,
-    tbl_name: &str,
 ) -> Result<Option<Vec<usize>>> {
     crate::stack::trace_remaining("collect_autoindexes:entry");
-    let table = create_table(tbl_name, body, 0)?;
-    crate::stack::trace_remaining("collect_autoindexes:after_schema_create_table");
 
     let mut regs: Vec<usize> = Vec::new();
 
