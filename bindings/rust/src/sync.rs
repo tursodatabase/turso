@@ -371,6 +371,7 @@ impl Future for AsyncOpFuture {
         // Try to resume the operation.
         match op.resume() {
             Ok(turso_sdk_kit::rsapi::TursoStatusCode::Done) => {
+                tracing::trace!("async op done");
                 // Try to take the result (may be None).
                 let result = op.take_result().map(Some).or_else(|err| match err {
                     turso_sdk_kit::rsapi::TursoError::Misuse(msg)
@@ -385,6 +386,7 @@ impl Future for AsyncOpFuture {
                 Poll::Ready(Ok(result))
             }
             Ok(turso_sdk_kit::rsapi::TursoStatusCode::Io) => {
+                tracing::trace!("async op pending io");
                 // Kick IO worker to process queued IO.
                 this.io.kick();
                 // Wait until IO worker makes progress and wakes us.
