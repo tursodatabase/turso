@@ -4,7 +4,9 @@ This module provides SQLAlchemy integration for pyturso:
 - TursoDialect: Basic local database connections (sqlite+turso://)
 - AioTursoDialect: Basic local database connections for async engines (sqlite+aioturso://)
 - TursoSyncDialect: Sync-enabled connections with remote support (sqlite+turso_sync://)
+- AioTursoSyncDialect: Sync-enabled connections for async engines (sqlite+aioturso_sync://)
 - get_sync_connection: Helper to access sync methods from SQLAlchemy connections
+- get_async_sync_connection: Helper to access async sync methods from SQLAlchemy async connections
 
 Usage:
     from sqlalchemy import create_engine, text
@@ -30,11 +32,20 @@ Usage:
         sync.push()  # Push local changes
 """
 
-from .dialect import AioTursoDialect, TursoDialect, TursoSyncDialect, get_sync_connection
+from .dialect import (
+    AioTursoDialect,
+    AioTursoSyncDialect,
+    TursoDialect,
+    TursoSyncDialect,
+    get_async_sync_connection,
+    get_sync_connection,
+)
 
 __all__ = [
     "AioTursoDialect",
+    "AioTursoSyncDialect",
     "TursoDialect",
     "TursoSyncDialect",
+    "get_async_sync_connection",
     "get_sync_connection",
 ]

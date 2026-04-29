@@ -4,10 +4,11 @@ This document describes the SQLAlchemy dialect implementation for pyturso.
 
 ## Status: Implemented
 
-The SQLAlchemy dialect is fully implemented with three dialects:
+The SQLAlchemy dialect is fully implemented with four dialects:
 - `sqlite+turso://` - Basic local database connections
 - `sqlite+aioturso://` - Basic local database connections for SQLAlchemy async engines
 - `sqlite+turso_sync://` - Sync-enabled connections with remote database support
+- `sqlite+aioturso_sync://` - Sync-enabled connections with remote database support for SQLAlchemy async engines
 
 ## Installation
 
@@ -91,6 +92,34 @@ async with AsyncSession(engine) as session:
 await engine.dispose()
 ```
 
+### Async Sync-Enabled Connection (Remote Sync)
+
+```python
+from sqlalchemy import text
+from sqlalchemy.ext.asyncio import create_async_engine
+from turso.sqlalchemy import get_async_sync_connection
+
+engine = create_async_engine(
+    "sqlite+aioturso_sync:///local.db",
+    connect_args={
+        "remote_url": "https://your-db.turso.io",
+        "auth_token": "your-token",
+    },
+)
+
+async with engine.connect() as conn:
+    sync = get_async_sync_connection(conn)
+    await sync.pull()
+
+    result = await conn.execute(text("SELECT * FROM users"))
+
+    await conn.execute(text("INSERT INTO users (name) VALUES ('Bob')"))
+    await conn.commit()
+    await sync.push()
+
+await engine.dispose()
+```
+
 ### ORM Usage
 
 ```python
@@ -160,6 +189,21 @@ URL validation:
 - Host/port in URL raises `ValueError` (use `remote_url` query param instead)
 - Unrecognized query parameters emit a `UserWarning`
 
+### Async Sync Dialect (`sqlite+aioturso_sync://`)
+
+`sqlite+aioturso_sync://` accepts the same sync connection options as `sqlite+turso_sync://`.
+For async applications, prefer `connect_args` for remote configuration, especially when passing callables or structured options:
+
+```python
+engine = create_async_engine(
+    "sqlite+aioturso_sync:///local.db",
+    connect_args={
+        "remote_url": "https://db.turso.io",
+        "auth_token": get_fresh_token,
+    },
+)
+```
+
 ## Sync Operations
 
 The `get_sync_connection()` helper provides access to sync-specific methods:
@@ -206,12 +250,18 @@ _TursoDialectMixin (reflection overrides)
         │       └── pool: StaticPool (:memory:) / AsyncAdaptedQueuePool (file)
         │
         └── TursoSyncDialect (sqlite+turso_sync://)
-                ├── uses turso.sync.connect()
-                ├── pool: SingletonThreadPool (:memory:) / QueuePool (file)
-                └── get_sync_connection() → ConnectionSync (pull/push/checkpoint/stats)
+        │       ├── uses turso.sync.connect()
+        │       ├── pool: SingletonThreadPool (:memory:) / QueuePool (file)
+        │       └── get_sync_connection() → ConnectionSync (pull/push/checkpoint/stats)
+        │
+        └── AioTursoSyncDialect (sqlite+aioturso_sync://)
+                ├── uses turso.aio.sync.connect()
+                ├── adapts turso.aio.sync to SQLAlchemy's DBAPI-shaped async contract
+                ├── pool: StaticPool (:memory:) / AsyncAdaptedQueuePool (file)
+                └── get_async_sync_connection() → async ConnectionSync (pull/push/checkpoint/stats)
 ```
 
-The sync dialects use Python MRO: `_TursoDialectMixin` provides PRAGMA-related overrides, `SQLiteDialect_pysqlite` provides core SQLite dialect behavior. The async dialect uses `SQLiteDialect_aiosqlite` with the same Turso-specific mixin and an adapter that maps `turso.aio` into SQLAlchemy's async DBAPI wrapper.
+The sync dialects use Python MRO: `_TursoDialectMixin` provides PRAGMA-related overrides, `SQLiteDialect_pysqlite` provides core SQLite dialect behavior for blocking engines, and `SQLiteDialect_aiosqlite` provides core async SQLite behavior for async engines. The async dialects use an adapter that maps `turso.aio` modules into SQLAlchemy's async DBAPI wrapper.
 
 ## What Pyturso Provides
 
@@ -290,7 +340,7 @@ This doesn't affect normal usage including:
 
 ### Async Scope
 
-`sqlite+aioturso://` supports local databases through `turso.aio`. Remote sync for SQLAlchemy async engines is not implemented by this dialect; use `sqlite+turso_sync://` with synchronous SQLAlchemy engines for remote sync operations.
+`sqlite+aioturso://` supports local databases through `turso.aio`. Use `sqlite+aioturso_sync://` for SQLAlchemy async engines that need Turso remote sync.
 
 ## Entry Points
 
@@ -301,6 +351,7 @@ Dialects are registered via `pyproject.toml` entry points:
 "sqlite.turso" = "turso.sqlalchemy:TursoDialect"
 "sqlite.aioturso" = "turso.sqlalchemy:AioTursoDialect"
 "sqlite.turso_sync" = "turso.sqlalchemy:TursoSyncDialect"
+"sqlite.aioturso_sync" = "turso.sqlalchemy:AioTursoSyncDialect"
 ```
 
 ## Files

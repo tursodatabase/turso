@@ -165,6 +165,28 @@ async def main():
 asyncio.run(main())
 ```
 
+## SQLAlchemy synchronization driver (asyncio)
+
+```python
+from sqlalchemy import text
+from sqlalchemy.ext.asyncio import create_async_engine
+from turso.sqlalchemy import get_async_sync_connection
+
+engine = create_async_engine(
+    "sqlite+aioturso_sync:///local.db",
+    connect_args={"remote_url": "https://<db>.<region>.turso.io"},
+)
+
+async with engine.connect() as conn:
+    sync = get_async_sync_connection(conn)
+    await sync.pull()
+    await conn.execute(text("INSERT INTO t VALUES ('hello from sqlalchemy asyncio')"))
+    await conn.commit()
+    await sync.push()
+
+await engine.dispose()
+```
+
 ## License
 
 This project is licensed under the [MIT license](../../LICENSE.md).
