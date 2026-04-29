@@ -15015,17 +15015,13 @@ pub fn op_vacuum(
         }
         Ok(IOResult::IO(io)) => Ok(InsnFunctionStepResult::IO(io)),
         Err(err) => {
-            if matches!(state.op_vacuum_state, VacuumOpState::InPlace(_)) {
-                let VacuumOpState::InPlace(vacuum_state) =
-                    std::mem::take(&mut state.op_vacuum_state)
-                else {
-                    unreachable!("invalid state, we are inside vacuum op");
-                };
-                if let Err(cleanup_err) =
-                    cleanup_op_vacuum_in_place(&program.connection, vacuum_state)
-                {
-                    tracing::error!("VACUUM cleanup failed after error: {cleanup_err}");
-                }
+            let VacuumOpState::InPlace(vacuum_state) = std::mem::take(&mut state.op_vacuum_state)
+            else {
+                unreachable!("invalid state, we are inside vacuum op");
+            };
+            if let Err(cleanup_err) = cleanup_op_vacuum_in_place(&program.connection, vacuum_state)
+            {
+                tracing::error!("VACUUM cleanup failed after error: {cleanup_err}");
             }
             Err(err)
         }
