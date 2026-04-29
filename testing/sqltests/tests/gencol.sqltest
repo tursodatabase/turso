@@ -4695,3 +4695,20 @@ test update-virtual-column-index-via-single-column-unique-index-scan {
     UPDATE t SET b = 42 WHERE c = 'x';
 } expect {
 }
+
+@skip-if sqlite "SQLite doesn't support custom types"
+@requires custom_types "uses custom types"
+test gencol-virtual-union-tag-select-resolves-self-table-type {
+    CREATE TYPE number AS UNION(i INT, f REAL);
+    CREATE TABLE tagged(
+        id INT,
+        val number,
+        tag TEXT GENERATED ALWAYS AS (union_tag(val)) VIRTUAL
+    ) STRICT;
+    INSERT INTO tagged(id, val) VALUES (1, union_value('i', 42));
+    INSERT INTO tagged(id, val) VALUES (2, union_value('f', 3.5));
+    SELECT id, tag FROM tagged ORDER BY id;
+} expect {
+    1|i
+    2|f
+}

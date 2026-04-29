@@ -6591,7 +6591,7 @@ fn resolve_struct_from_expr(
     }
 }
 
-/// Get the type string for a column, handling both referenced_tables and DML context.
+/// Get the type string for a column, handling both referenced_tables and self-table context.
 fn resolve_column_type_str(
     table: ast::TableInternalId,
     column: usize,
@@ -6605,10 +6605,7 @@ fn resolve_column_type_str(
         }
     }
     if table.is_self_table() {
-        if let Some(SelfTableContext::ForDML { table, .. }) = resolver.self_table_context()
-        {
-            return Some(table.columns().get(column)?.ty_str.clone());
-        }
+        return resolver.self_table_column_type_str(column);
     }
     None
 }
