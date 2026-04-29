@@ -220,11 +220,11 @@ pub fn translate_analyze(
             Some(sql.to_string()),
         )?;
 
-        let parse_schema_where_clause =
-            "tbl_name = 'sqlite_stat1' AND type != 'trigger'".to_string();
         program.emit_insn(Insn::ParseSchema {
             db: database_id,
-            where_clause: Some(parse_schema_where_clause),
+            filter: crate::vdbe::insn::ParseSchemaFilter::TableNameNotTrigger {
+                table_names: vec!["sqlite_stat1".to_string()],
+            },
         });
 
         // Bump schema cookie so subsequent statements reparse schema.

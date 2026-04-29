@@ -24,6 +24,8 @@ use strum_macros::{EnumDiscriminants, FromRepr, VariantArray};
 use turso_macros::Description;
 use turso_parser::ast::{ResolveType, SortOrder};
 
+pub use crate::schema_parser::ParseSchemaFilter;
+
 /// Known custom type comparator functions for sorting and MIN/MAX aggregates.
 /// These replace heap-allocated String names with a compact enum.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1347,7 +1349,7 @@ pub enum Insn {
     },
     ParseSchema {
         db: usize,
-        where_clause: Option<String>,
+        filter: ParseSchemaFilter,
     },
 
     /// Populate all materialized views after schema parsing

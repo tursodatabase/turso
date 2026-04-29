@@ -1,7 +1,12 @@
 use crate::error::io_error;
+use crate::mvcc::cursor::MvccCursorType;
 #[cfg(any(test, injected_yields))]
 use crate::mvcc::yield_points::YieldInjector;
+use crate::schema_parser::{
+    SchemaTableCursor, SchemaTableDecodeErrorKind, SchemaTableParser, SchemaTableRow,
+};
 use crate::statement::StatementOrigin;
+use crate::storage::btree::{BTreeCursor, CursorTrait};
 use crate::storage::{journal_mode, pager::SavepointResult};
 use crate::sync::{
     atomic::{AtomicBool, AtomicI32, AtomicI64, AtomicIsize, AtomicU16, AtomicU64, Ordering},
@@ -16,16 +21,15 @@ use crate::Page;
 use crate::{
     ast, function,
     io::{MemoryIO, IO},
-    parse_schema_rows,
     progress::{ProgressHandler, ProgressHandlerCallback},
     refresh_analyze_stats, translate,
     util::IOExt,
     vdbe, AllViewsTxState, AtomicCipherMode, AtomicSyncMode, AtomicTempStore, BusyHandler,
     BusyHandlerCallback, CaptureDataChangesInfo, CheckpointMode, CheckpointResult, CipherMode, Cmd,
     Completion, ConnectionMetrics, Database, DatabaseCatalog, DatabaseOpts, Duration,
-    EncryptionKey, EncryptionOpts, IndexMethod, LimboError, MvStore, OpenFlags, PageSize, Pager,
-    Parser, Program, QueryMode, QueryRunner, Result, Schema, Statement, SyncMode, TransactionMode,
-    Trigger, Value, VirtualTable,
+    EncryptionKey, EncryptionOpts, IndexMethod, LimboError, MvCursor, MvStore, OpenFlags, PageSize,
+    Pager, Parser, Program, QueryMode, QueryRunner, Result, Schema, Statement, SyncMode,
+    TransactionMode, Trigger, Value, VirtualTable,
 };
 use crate::{is_memory_like, turso_assert};
 use crate::{MAIN_DB_ID, TEMP_DB_ID};
@@ -40,6 +44,13 @@ use std::path::Path;
 use tempfile::TempDir;
 use tracing::{instrument, Level};
 use turso_macros::{turso_assert_ne, AtomicEnum};
+
+fn maybe_transform_root_page_to_positive(mv_store: Option<&Arc<MvStore>>, root_page: i64) -> i64 {
+    match mv_store {
+        Some(mv_store) if root_page < 0 => mv_store.get_real_table_id(root_page),
+        _ => root_page,
+    }
+}
 
 #[cfg(feature = "simulator")]
 fn db_identity_for_testing(db_path: &Path) -> Result<(u32, u32)> {
@@ -960,17 +971,6 @@ impl Connection {
             })
             .collect();
 
-        // TODO: this is hack to avoid a cyclical problem with schema reprepare
-        // The problem here is that we prepare a statement here, but when the statement tries
-        // to execute it, it first checks the schema cookie to see if it needs to reprepare the statement.
-        // But in this occasion it will always reprepare, and we get an error. So we trick the statement by swapping our schema
-        // with a new clean schema that has the same header cookie.
-        self.with_schema_mut(|schema| {
-            *schema = fresh.clone();
-        });
-
-        let stmt = self.prepare("SELECT * FROM sqlite_schema")?;
-
         // MVCC bootstrap connection gets the "baseline" from the DB file and ignores anything in MV store
         let mv_tx = if self.is_mvcc_bootstrap_connection() {
             None
@@ -985,14 +985,7 @@ impl Connection {
                 .get_database_by_name(&crate::util::normalize_ident(name))
                 .map(|(idx, _)| idx)
         };
-        // TODO: This function below is synchronous, make it async
-        parse_schema_rows(
-            stmt,
-            &mut fresh,
-            &self.syms.read(),
-            mv_tx,
-            &attached_resolver,
-        )?;
+        self.parse_schema_table_into(&mut fresh, mv_tx, &attached_resolver)?;
 
         // Rehydrate built-in table-valued functions that were captured above.
         for vtab in &table_valued_functions {
@@ -1037,6 +1030,85 @@ impl Connection {
             *schema = fresh;
         });
         Result::Ok(())
+    }
+
+    fn parse_schema_table_into(
+        self: &Arc<Connection>,
+        schema: &mut Schema,
+        mv_tx: Option<(u64, TransactionMode)>,
+        resolve_attached_db: &dyn Fn(&str) -> Option<usize>,
+    ) -> Result<()> {
+        let rows = self.collect_schema_table_rows(mv_tx)?;
+        let syms = self.syms.read();
+        let mut parser = SchemaTableParser::default();
+        for row in &rows {
+            parser.parse_row(schema, row, &syms, resolve_attached_db)?;
+        }
+        parser.finish(schema, &syms, self.mv_store_for_db(MAIN_DB_ID).is_some())
+    }
+
+    fn collect_schema_table_rows(
+        self: &Arc<Connection>,
+        mv_tx: Option<(u64, TransactionMode)>,
+    ) -> Result<Vec<SchemaTableRow>> {
+        let pager = self.get_pager_from_database_index(&MAIN_DB_ID)?;
+        let opened_read_tx = self.get_tx_state() == TransactionState::None;
+        if opened_read_tx {
+            pager.begin_read_tx()?;
+            self.set_tx_state(TransactionState::Read);
+        }
+
+        let result = (|| {
+            let mut cursor = self.schema_table_cursor(mv_tx)?;
+            let mut rows = Vec::new();
+            while let Some(row) = pager.io.block(|| cursor.next_row())? {
+                rows.push(row);
+            }
+            Ok(rows)
+        })();
+
+        if opened_read_tx {
+            let previous = self.transaction_state.swap(TransactionState::None);
+            turso_assert!(
+                previous == TransactionState::Read,
+                "unexpected schema table scan transaction state"
+            );
+            pager.end_read_tx();
+        }
+
+        result
+    }
+
+    fn schema_table_cursor(
+        self: &Arc<Connection>,
+        mv_tx: Option<(u64, TransactionMode)>,
+    ) -> Result<SchemaTableCursor> {
+        let pager = self.get_pager_from_database_index(&MAIN_DB_ID)?;
+        let mv_store = self.mv_store_for_db(MAIN_DB_ID);
+        let root_page = maybe_transform_root_page_to_positive(mv_store.as_ref(), 1);
+        let btree_cursor: Box<dyn CursorTrait> =
+            Box::new(BTreeCursor::new_table(pager, root_page, 5));
+        let cursor: Box<dyn CursorTrait> = if let Some((tx_id, _)) = mv_tx {
+            let mv_store = mv_store
+                .as_ref()
+                .expect("mv_store should be Some when MVCC transaction is active")
+                .clone();
+            Box::new(MvCursor::new(
+                mv_store,
+                self,
+                tx_id,
+                1,
+                MvccCursorType::Table,
+                btree_cursor,
+            )?)
+        } else {
+            btree_cursor
+        };
+
+        Ok(SchemaTableCursor::new(
+            cursor,
+            SchemaTableDecodeErrorKind::Conversion,
+        ))
     }
 
     pub(crate) fn read_current_schema_cookie(&self) -> Result<u32> {
@@ -1820,84 +1892,26 @@ impl Connection {
         if self.is_closed() {
             return Err(LimboError::InternalError("Connection closed".to_string()));
         }
-        // Collect row data from the Statement first, then drop the Statement
-        // before taking the schema write lock. This prevents a deadlock in MVCC
-        // mode where Statement::drop -> abort -> rollback_tx -> schema.read()
-        // would deadlock against the schema write lock.
-        let mut rows_data: Vec<(String, String, String, i64, Option<String>)> = Vec::new();
-        {
-            let mut rows = self
-                .query("SELECT * FROM sqlite_schema")?
-                .expect("query must be parsed to statement");
-            rows.run_with_row_callback(|row| {
-                let ty = row.get::<&str>(0)?.to_string();
-                let name = row.get::<&str>(1)?.to_string();
-                let table_name = row.get::<&str>(2)?.to_string();
-                let root_page = row.get::<i64>(3)?;
-                let sql = row.get::<&str>(4).ok().map(|s| s.to_string());
-                rows_data.push((ty, name, table_name, root_page, sql));
-                Ok(())
-            })?;
-        } // Statement dropped here, before schema write lock
+        let mv_tx = if self.is_mvcc_bootstrap_connection() {
+            None
+        } else {
+            self.get_mv_tx()
+        };
+        let rows_data = self.collect_schema_table_rows(mv_tx)?;
 
         let syms = self.syms.read();
         self.with_schema_mut(|schema| -> Result<()> {
-            // Incremental re-parse after extension loading. The schema already has
-            // tables/indices/views from initial parse. We only need to pick up
-            // entries that previously failed (e.g. virtual tables whose module
-            // wasn't loaded yet). "Already exists" errors are expected and skipped.
-            let mut from_sql_indexes = Vec::new();
-            let mut automatic_indices = HashMap::default();
-            let mut dbsp_state_roots = HashMap::default();
-            let mut dbsp_state_index_roots = HashMap::default();
-            let mut materialized_view_info = HashMap::default();
-
             let attached_resolver = |name: &str| -> Option<usize> {
                 self.attached_databases
                     .read()
                     .get_database_by_name(&crate::util::normalize_ident(name))
                     .map(|(idx, _)| idx)
             };
-            for (ty, name, table_name, root_page, sql) in &rows_data {
-                match schema.handle_schema_row(
-                    ty,
-                    name,
-                    table_name,
-                    *root_page,
-                    sql.as_deref(),
-                    &syms,
-                    &mut from_sql_indexes,
-                    &mut automatic_indices,
-                    &mut dbsp_state_roots,
-                    &mut dbsp_state_index_roots,
-                    &mut materialized_view_info,
-                    &attached_resolver,
-                ) {
-                    Ok(()) => {}
-                    Err(LimboError::ParseError(msg)) if msg.contains("already exists") => {}
-                    Err(LimboError::ExtensionError(msg)) => {
-                        eprintln!("Warning: {msg}");
-                    }
-                    Err(e) => return Err(e),
-                }
+            let mut parser = SchemaTableParser::default();
+            for row in &rows_data {
+                parser.parse_extension_load_row(schema, row, &syms, &attached_resolver)?;
             }
-
-            match schema.populate_indices(&syms, from_sql_indexes, automatic_indices, false) {
-                Ok(()) => {}
-                Err(LimboError::ParseError(msg)) if msg.contains("already exists") => {}
-                Err(LimboError::ExtensionError(msg)) => eprintln!("Warning: {msg}"),
-                Err(e) => return Err(e),
-            }
-            match schema.populate_materialized_views(
-                materialized_view_info,
-                dbsp_state_roots,
-                dbsp_state_index_roots,
-            ) {
-                Ok(()) => {}
-                Err(LimboError::ExtensionError(msg)) => eprintln!("Warning: {msg}"),
-                Err(e) => return Err(e),
-            }
-            Ok(())
+            parser.finish_extension_load(schema, &syms)
         })
     }
 

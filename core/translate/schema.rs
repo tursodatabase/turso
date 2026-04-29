@@ -20,10 +20,7 @@ use crate::translate::plan::{Plan, QueryDestination};
 use crate::translate::planner::ROWID_STRS;
 use crate::translate::select::{emit_select_plan, prepare_select_plan};
 use crate::translate::{ProgramBuilder, ProgramBuilderOpts};
-use crate::util::{
-    escape_sql_string_literal, normalize_ident, quote_identifier,
-    PRIMARY_KEY_AUTOMATIC_INDEX_NAME_PREFIX,
-};
+use crate::util::{normalize_ident, quote_identifier, PRIMARY_KEY_AUTOMATIC_INDEX_NAME_PREFIX};
 use crate::vdbe::builder::CursorType;
 use crate::vdbe::insn::{
     to_u16, {CmpInsFlags, Cookie, InsertFlags, Insn, RegisterOrLiteral},
@@ -1390,17 +1387,16 @@ pub fn translate_create_table(
         p5: 0,
     });
 
-    // TODO: remove format, it sucks for performance but is convenient
-    let escaped_tbl_name = escape_sql_string_literal(&normalized_tbl_name);
-    let mut parse_schema_where_clause =
-        format!("tbl_name = '{escaped_tbl_name}' AND type != 'trigger'");
+    let mut parse_schema_table_names = vec![normalized_tbl_name.clone()];
     if created_sequence_table {
-        parse_schema_where_clause.push_str(" OR tbl_name = 'sqlite_sequence'");
+        parse_schema_table_names.push("sqlite_sequence".to_string());
     }
 
     program.emit_insn(Insn::ParseSchema {
         db: database_id,
-        where_clause: Some(parse_schema_where_clause),
+        filter: crate::vdbe::insn::ParseSchemaFilter::TableNameNotTrigger {
+            table_names: parse_schema_table_names,
+        },
     });
 
     // For CTAS, emit bytecode to populate the new table from the SELECT
@@ -1733,12 +1729,11 @@ pub fn translate_create_virtual_table(
         value: resolver.schema().schema_version as i32 + 1,
         p5: 0,
     });
-    let escaped_table_name = escape_sql_string_literal(&table_name);
-    let parse_schema_where_clause =
-        format!("tbl_name = '{escaped_table_name}' AND type != 'trigger'");
     program.emit_insn(Insn::ParseSchema {
-        db: sqlite_schema_cursor_id,
-        where_clause: Some(parse_schema_where_clause),
+        db: crate::MAIN_DB_ID,
+        filter: crate::vdbe::insn::ParseSchemaFilter::TableNameNotTrigger {
+            table_names: vec![table_name],
+        },
     });
 
     Ok(())
@@ -2454,10 +2449,10 @@ fn persist_type_definition(
 
         // Parse schema to register the new table in-memory
         program.emit_insn(Insn::ParseSchema {
-            db: schema_cursor_id,
-            where_clause: Some(format!(
-                "tbl_name = '{TURSO_TYPES_TABLE_NAME}' AND type != 'trigger'"
-            )),
+            db: MAIN_DB_ID,
+            filter: crate::vdbe::insn::ParseSchemaFilter::TableNameNotTrigger {
+                table_names: vec![TURSO_TYPES_TABLE_NAME.to_string()],
+            },
         });
     }
 
