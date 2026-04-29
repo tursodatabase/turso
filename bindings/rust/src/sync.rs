@@ -361,6 +361,7 @@ impl Future for AsyncOpFuture {
         tracing::trace!("poll async op future");
         let this = unsafe { self.get_unchecked_mut() };
         let Some(op) = &this.op else {
+            tracing::trace!("async op misuse - no op");
             return Poll::Ready(Err(Error::Misuse(
                 "operation future has been already completed".to_string(),
             )));
@@ -393,6 +394,7 @@ impl Future for AsyncOpFuture {
                 Poll::Pending
             }
             Ok(turso_sdk_kit::rsapi::TursoStatusCode::Row) => {
+                tracing::trace!("async op misuse - has rows");
                 // Not expected from top-level sync operations.
                 Poll::Ready(Err(Error::Misuse(
                     "unexpected row status in sync operation".to_string(),
