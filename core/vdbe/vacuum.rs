@@ -246,8 +246,7 @@ pub(crate) fn open_vacuum_temp_db(
     page_size: u32,
     reserved_space: u8,
 ) -> Result<VacuumTempDb> {
-    // todo: let users specify the temp dir path
-    let temp_dir = tempfile::tempdir().map_err(|e| crate::error::io_error(e, "tempdir"))?;
+    let temp_dir = source_conn.create_tempdir()?;
     let source_db_name = std::path::Path::new(&source_db.path)
         .file_name()
         .and_then(|name| name.to_str())
