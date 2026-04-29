@@ -204,6 +204,7 @@ pub(super) fn choose_best_btree_candidate(
     rhs_table_idx: usize,
     maybe_order_target: Option<&OrderTarget>,
     schema: &Schema,
+    available_indexes: &HashMap<String, VecDeque<Arc<Index>>>,
     analyze_stats: &AnalyzeStats,
     input_cardinality: f64,
     base_row_count: RowCountEstimate,
@@ -322,12 +323,34 @@ pub(super) fn choose_best_btree_candidate(
             index: candidate.index.as_ref(),
             stats: analyze_stats,
         };
+        // For partial indexes, the index physically contains only the rows whose
+        // values pass the index's WHERE clause. Discount the row count estimate
+        // accordingly so the cost model recognizes the partial index as cheaper
+        // than a full table scan.
+        let candidate_base_row_count = match candidate
+            .index
+            .as_ref()
+            .and_then(|idx| idx.where_clause.as_ref())
+        {
+            Some(where_expr) => {
+                let selectivity = super::constraints::estimate_partial_index_where_selectivity(
+                    where_expr.as_ref(),
+                    rhs_table,
+                    schema,
+                    available_indexes,
+                    params,
+                )
+                .clamp(1e-6, 1.0);
+                RowCountEstimate::AnalyzeStats((*base_row_count * selectivity).max(1.0))
+            }
+            None => base_row_count,
+        };
         let cost = estimate_cost_for_scan_or_seek(
             Some(index_info),
             &rhs_constraints.constraints,
             &usable_constraint_refs,
             input_cardinality,
-            base_row_count,
+            candidate_base_row_count,
             is_index_ordered,
             params,
             Some(&analyze_ctx),
@@ -712,6 +735,7 @@ fn find_best_access_method_for_btree(
         rhs_table_idx,
         maybe_order_target,
         schema,
+        available_indexes,
         analyze_stats,
         input_cardinality,
         base_row_count,
