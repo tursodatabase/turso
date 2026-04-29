@@ -356,6 +356,25 @@ impl Completion {
         }
     }
 
+    /// Fire a "progress wake" without consuming the completion's result —
+    /// wakes the waker on this completion *and* on its parent group, if any.
+    /// Used by IO backends to nudge the future when an operation made progress
+    /// but isn't fully done (e.g. an io_uring writev that completed only the
+    /// first chunk and was resubmitted internally). Without this, a poll
+    /// whose drained CQEs are all intermediate-chunk completions returns
+    /// without waking anything, and since `step()` is the only thing that
+    /// drains the CQ, the resubmitted chunks pile up and the task deadlocks.
+    pub fn wake_progress(&self) {
+        if let Some(inner) = &self.inner {
+            if let Some(group) = inner.parent.get() {
+                if let Some(group_completion) = group.self_completion.get() {
+                    group_completion.wake();
+                }
+            }
+            inner.context.wake();
+        }
+    }
+
     pub fn set_waker(&self, waker: &Waker) {
         if self.finished() || self.inner.is_none() {
             waker.wake_by_ref();
