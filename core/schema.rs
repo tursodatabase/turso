@@ -3598,11 +3598,22 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
         } => {
             has_rowid = !options.contains_without_rowid();
             is_strict = options.contains_strict();
+            let column_fk_count = columns
+                .iter()
+                .flat_map(|col| col.constraints.iter())
+                .filter(|constraint| {
+                    matches!(
+                        &constraint.constraint,
+                        ast::ColumnConstraint::ForeignKey { .. }
+                    )
+                })
+                .count();
 
             // we need to preserve order of unique sets definition
             // but also, we analyze constraints first in order to check PRIMARY KEY constraint and recognize rowid alias properly
             // that's why we maintain 2 unique_set sequences and merge them together in the end
 
+            let mut table_fk_order = column_fk_count;
             for c in constraints {
                 if let ast::TableConstraint::PrimaryKey {
                     columns,
@@ -3730,7 +3741,9 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
                             })
                             .unwrap_or(RefAct::NoAction),
                         deferred,
+                        decl_order: table_fk_order,
                     };
+                    table_fk_order += 1;
                     foreign_keys.push(Arc::new(fk));
                 } else if let ast::TableConstraint::Check(expr) = &c.constraint {
                     check_constraints.push(CheckConstraint::new(c.name.as_ref(), expr, None));
@@ -3742,6 +3755,7 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
             // Issue: https://github.com/tursodatabase/turso/issues/3665
             let mut primary_key_desc_columns_constraint = false;
 
+            let mut column_fk_order = 0;
             for ast::ColumnDefinition {
                 col_name,
                 col_type,
@@ -3916,7 +3930,9 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
                                     }
                                     None => false,
                                 },
+                                decl_order: column_fk_order,
                             };
+                            column_fk_order += 1;
                             foreign_keys.push(Arc::new(fk));
                         }
                     }
@@ -4178,6 +4194,10 @@ pub struct ForeignKey {
     pub on_update: RefAct,
     /// DEFERRABLE INITIALLY DEFERRED
     pub deferred: bool,
+    /// Declaration order among this table's foreign key constraints.
+    ///
+    /// SQLite reports PRAGMA foreign_key_list rows in reverse declaration order.
+    pub decl_order: usize,
 }
 #[inline]
 fn fk_mismatch_err(child: &str, parent: &str) -> crate::LimboError {

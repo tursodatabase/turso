@@ -1162,6 +1162,12 @@ pub fn translate_alter_table(
                                 clause.tbl_name.as_str()
                             )));
                         }
+                        let decl_order = btree
+                            .foreign_keys
+                            .iter()
+                            .map(|fk| fk.decl_order)
+                            .max()
+                            .map_or(0, |order| order + 1);
                         let fk = ForeignKey {
                             parent_table: normalize_ident(clause.tbl_name.as_str()),
                             parent_columns: clause
@@ -1203,6 +1209,7 @@ pub fn translate_alter_table(
                                 }
                                 None => false,
                             },
+                            decl_order,
                         };
                         btree.foreign_keys.push(Arc::new(fk));
                     }

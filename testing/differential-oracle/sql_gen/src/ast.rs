@@ -26,6 +26,7 @@ pub enum Stmt {
     AlterTable(AlterTableStmt),
     CreateIndex(CreateIndexStmt),
     DropIndex(DropIndexStmt),
+    PragmaForeignKeyList(PragmaForeignKeyListStmt),
     CreateTrigger(CreateTriggerStmt),
     DropTrigger(DropTriggerStmt),
     Begin,
@@ -53,6 +54,7 @@ impl fmt::Display for Stmt {
             Stmt::AlterTable(s) => write!(f, "{s}"),
             Stmt::CreateIndex(s) => write!(f, "{s}"),
             Stmt::DropIndex(s) => write!(f, "{s}"),
+            Stmt::PragmaForeignKeyList(s) => write!(f, "{s}"),
             Stmt::CreateTrigger(s) => write!(f, "{s}"),
             Stmt::DropTrigger(s) => write!(f, "{s}"),
             Stmt::Begin => write!(f, "BEGIN"),
@@ -90,6 +92,7 @@ impl Stmt {
             | Stmt::AlterTable(_)
             | Stmt::CreateIndex(_)
             | Stmt::DropIndex(_)
+            | Stmt::PragmaForeignKeyList(_)
             | Stmt::CreateTrigger(_)
             | Stmt::DropTrigger(_)
             | Stmt::Begin
@@ -1292,6 +1295,23 @@ impl fmt::Display for DropIndexStmt {
             write!(f, "IF EXISTS ")?;
         }
         write!(f, "{}", self.name)
+    }
+}
+
+/// A PRAGMA foreign_key_list statement.
+#[derive(Debug, Clone)]
+pub struct PragmaForeignKeyListStmt {
+    pub database: Option<String>,
+    pub table: String,
+}
+
+impl fmt::Display for PragmaForeignKeyListStmt {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let table = self.table.replace('\'', "''");
+        match &self.database {
+            Some(database) => write!(f, "PRAGMA {database}.foreign_key_list('{table}')"),
+            None => write!(f, "PRAGMA foreign_key_list('{table}')"),
+        }
     }
 }
 

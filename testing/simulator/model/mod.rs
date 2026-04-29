@@ -414,7 +414,7 @@ impl Shadow for Query {
             Query::Commit(commit) => Ok(commit.shadow(env)),
             Query::Rollback(rollback) => Ok(rollback.shadow(env)),
             Query::Placeholder => Ok(vec![]),
-            Query::Pragma(Pragma::AutoVacuumMode(_)) => Ok(vec![]),
+            Query::Pragma(Pragma::AutoVacuumMode(_) | Pragma::ForeignKeyList(_)) => Ok(vec![]),
         }
     }
 }
