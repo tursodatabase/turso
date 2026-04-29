@@ -1,11 +1,12 @@
 use std::fmt::Debug;
 
-use crate::mvcc::yield_points::{YieldInjector, YieldPoint};
+use crate::mvcc::yield_points::{FailureInjector, YieldInjector, YieldPoint};
 use crate::state_machine::TransitionResult;
 use crate::sync::Arc;
 use crate::types::IOCompletions;
 use crate::types::IOResult;
 use crate::Completion;
+use crate::LimboError;
 
 pub(crate) trait YieldPointMarker: Copy + Debug {
     const POINT_COUNT: u8;
@@ -28,6 +29,7 @@ impl YieldPoint {
 
 pub(crate) struct YieldContext {
     pub(crate) injector: Option<Arc<dyn YieldInjector>>,
+    pub(crate) failure_injector: Option<Arc<dyn FailureInjector>>,
     pub(crate) instance_id: u64,
     pub(crate) selection_key: u64,
 }
@@ -35,11 +37,13 @@ pub(crate) struct YieldContext {
 impl YieldContext {
     pub(crate) fn new(
         injector: Option<Arc<dyn YieldInjector>>,
+        failure_injector: Option<Arc<dyn FailureInjector>>,
         instance_id: u64,
         selection_key: u64,
     ) -> Self {
         Self {
             injector,
+            failure_injector,
             instance_id,
             selection_key,
         }
@@ -80,4 +84,18 @@ pub(crate) fn maybe_inject_io_yield<T, P: YieldPointMarker>(
         return Some(IOResult::IO(IOCompletions::Single(Completion::new_yield())));
     }
     None
+}
+
+pub(crate) fn maybe_inject_transition_failure<P: YieldPointMarker>(
+    injector: Option<&Arc<dyn FailureInjector>>,
+    instance_id: u64,
+    selection_key: u64,
+    point: P,
+) -> Option<LimboError> {
+    let err = injector
+        .and_then(|injector| injector.should_fail(instance_id, selection_key, point.point()));
+    if let Some(ref err) = err {
+        tracing::debug!(?point, %err, "injecting MVCC failure");
+    }
+    err
 }

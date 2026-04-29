@@ -2,7 +2,7 @@ use crate::mvcc::clock::LogicalClock;
 use crate::mvcc::cursor::{static_iterator_hack, MvccIterator};
 #[cfg(any(test, injected_yields))]
 use crate::mvcc::yield_hooks::{ProvidesYieldContext, YieldContext, YieldPointMarker};
-use crate::mvcc::yield_points::inject_transition_yield;
+use crate::mvcc::yield_points::{inject_transition_failure, inject_transition_yield};
 use crate::schema::{Schema, Table};
 use crate::state_machine::StateMachine;
 use crate::state_machine::StateTransition;
@@ -926,10 +926,14 @@ impl CommitCoordinator {
 #[cfg(any(test, injected_yields))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, strum_macros::EnumCount)]
 #[repr(u8)]
-enum CommitYieldPoint {
+pub(crate) enum CommitYieldPoint {
     CommitValidation,
     WaitForDependencies,
     LogRecordPrepared,
+    /// Boundary right after `remove_tx` runs but before the connection cache
+    /// is cleared by the caller at vdbe/mod.rs. Used for failure injection
+    /// to reproduce divergence between `mv_store.txs` and `connection.mv_tx_id`.
+    AfterRemoveTx,
 }
 
 #[cfg(any(test, injected_yields))]
@@ -953,6 +957,7 @@ impl<Clock: LogicalClock> ProvidesYieldContext for CommitStateMachine<Clock> {
     fn yield_context(&self) -> YieldContext {
         YieldContext::new(
             self.connection.yield_injector(),
+            self.connection.failure_injector(),
             self.yield_instance_id,
             commit_yield_key(self.tx_id),
         )
@@ -1679,6 +1684,7 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
                     }
                     mvcc_store.unlock_commit_lock_if_held(tx);
                     mvcc_store.remove_tx(self.tx_id);
+                    inject_transition_failure!(self, CommitYieldPoint::AfterRemoveTx);
                     self.finalize(mvcc_store)?;
                     return Ok(TransitionResult::Done(()));
                 }
@@ -1763,6 +1769,7 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
                         self.commit_coordinator.pager_commit_lock.unlock();
                     }
                     mvcc_store.remove_tx(self.tx_id);
+                    inject_transition_failure!(self, CommitYieldPoint::AfterRemoveTx);
                     self.finalize(mvcc_store)?;
                     return Ok(TransitionResult::Done(()));
                 }
@@ -1931,6 +1938,7 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
                 // transaction ID to a timestamp and can, therefore, remove the
                 // transaction.
                 mvcc_store.remove_tx(self.tx_id);
+                inject_transition_failure!(self, CommitYieldPoint::AfterRemoveTx);
 
                 if mvcc_store.is_exclusive_tx(&self.tx_id) {
                     mvcc_store.release_exclusive_tx(&self.tx_id);

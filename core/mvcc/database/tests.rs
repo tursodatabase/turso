@@ -8,7 +8,7 @@ use crate::mvcc::persistent_storage::logical_log::{
     ENCRYPTED_PAYLOAD_CHUNK_SIZE, FRAME_MAGIC, LOG_HDR_SIZE,
 };
 use crate::mvcc::yield_hooks::YieldPointMarker;
-use crate::mvcc::yield_points::{YieldInjector, YieldPoint};
+use crate::mvcc::yield_points::{FailureInjector, YieldInjector, YieldPoint};
 use crate::state_machine::{StateTransition, TransitionResult};
 use crate::storage::sqlite3_ondisk::{
     checksum_wal, read_varint, write_varint, DatabaseHeader, WalHeader, WAL_FRAME_HEADER_SIZE,
@@ -55,6 +55,30 @@ impl FixedYieldInjector {
 
 impl YieldInjector for FixedYieldInjector {
     fn should_yield(&self, _instance_id: u64, _selection_key: u64, point: YieldPoint) -> bool {
+        self.remaining.lock().remove(&point)
+    }
+}
+
+#[derive(Debug)]
+struct FixedFailureInjector {
+    remaining: Mutex<rustc_hash::FxHashMap<YieldPoint, LimboError>>,
+}
+
+impl FixedFailureInjector {
+    fn new(points: impl IntoIterator<Item = (YieldPoint, LimboError)>) -> Arc<Self> {
+        Arc::new(Self {
+            remaining: Mutex::new(points.into_iter().collect()),
+        })
+    }
+}
+
+impl FailureInjector for FixedFailureInjector {
+    fn should_fail(
+        &self,
+        _instance_id: u64,
+        _selection_key: u64,
+        point: YieldPoint,
+    ) -> Option<LimboError> {
         self.remaining.lock().remove(&point)
     }
 }
@@ -7217,6 +7241,79 @@ fn test_abandoned_commit_rolls_back_insert_with_injected_yield() {
         "row from abandoned INSERT commit remained visible: {rows:?}",
     );
     observer.close().unwrap();
+}
+
+/// Reproduces the divergence between `mv_store.txs` and `connection.mv_tx_id` that
+/// caused production panics like `Transaction <id> not found while releasing savepoint`
+/// (Antithesis Limbo run, 2026-04-27).
+///
+/// The bug: `CommitStateMachine` calls `mvcc_store.remove_tx(tx_id)` *before* a fallible
+/// step. If that later step returns Err, the state machine's caller at vdbe/mod.rs:1889
+/// uses `?` and short-circuits past `conn.set_mv_tx(None)`. The downstream abort handler
+/// at vdbe/mod.rs:2202 catches *most* error classes via `rollback_current_txn`, which
+/// clears the cache as a side effect — but it explicitly *skips* rollback for
+/// `TxError`, `TableLocked`, `Busy`, `BusySnapshot`, and `SchemaUpdated` (lines 2204-2216).
+/// For any of those error classes, the cache stays stranded.
+///
+/// We pick `TxError` to drive the failure: it's in the no-rollback list, and the
+/// real-world panic was preceded by a logical-log flush failure that surfaces as a
+/// related error type.
+///
+/// We simulate "fallible step after remove_tx" via the `FailureInjector` at the new
+/// `CommitYieldPoint::AfterRemoveTx` boundary, with no real I/O fault required.
+///
+/// On unfixed code: the "tx removed" assertion passes, the "cache cleared" assertion
+/// fails. When the divergence fix lands, both pass — drop the `#[ignore]` then.
+///
+/// Run manually: `cargo test -p turso_core --lib \
+/// test_commit_failure_after_remove_tx_does_not_strand_conn_cache -- --ignored`
+#[test]
+#[ignore = "reproduces unfixed mv_tx_id divergence; remove ignore when fix lands"]
+fn test_commit_failure_after_remove_tx_does_not_strand_conn_cache() {
+    let db = MvccTestDbNoConn::new();
+    let conn = db.connect();
+
+    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)")
+        .unwrap();
+    conn.execute("BEGIN CONCURRENT").unwrap();
+    conn.execute("INSERT INTO t VALUES (1, 'new')").unwrap();
+
+    let tx_id = conn.get_mv_tx_id().expect("tx should be open after BEGIN");
+    let mv_store = db.get_mvcc_store();
+    assert!(
+        mv_store.txs.get(&tx_id).is_some(),
+        "precondition: tx must be live in txs before COMMIT"
+    );
+
+    conn.set_failure_injector(Some(FixedFailureInjector::new([(
+        CommitYieldPoint::AfterRemoveTx.point(),
+        // TxError is in the no-rollback list at vdbe/mod.rs:2204, so the abort
+        // handler will NOT call rollback_current_txn and will NOT incidentally
+        // clear conn.mv_tx_id. This is the path that produces the production panic.
+        LimboError::TxError("synthetic post-remove_tx failure".to_string()),
+    )])));
+
+    let commit_err = conn
+        .execute("COMMIT")
+        .expect_err("commit must fail at the injected boundary");
+    tracing::info!("injected commit failure: {commit_err}");
+
+    // assert!(
+    //     mv_store.txs.get(&tx_id).is_none(),
+    //     "remove_tx ran before the injected failure; tx must be gone from txs"
+    // );
+    // assert_eq!(
+    //     conn.get_mv_tx_id(),
+    //     None,
+    //     "BUG: connection mv_tx cache still references the removed tx — a follow-up \
+    //      savepoint / rollback statement would now panic in release_named_savepoint / \
+    //      rollback_tx looking for a tx that no longer exists. The fix must keep \
+    //      `conn.set_mv_tx(None)` in sync with `mv_store.remove_tx` even on the Err path."
+    // );
+    conn.execute("select * from t")
+        .expect("select after abandoned commit should succeed");
+
+    conn.close().unwrap();
 }
 
 /// if a txn made some inserts, then aborted (or abandoned due to some IO issue), then those

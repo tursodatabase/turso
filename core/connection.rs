@@ -1,6 +1,6 @@
 use crate::error::io_error;
 #[cfg(any(test, injected_yields))]
-use crate::mvcc::yield_points::YieldInjector;
+use crate::mvcc::yield_points::{FailureInjector, YieldInjector};
 use crate::statement::StatementOrigin;
 use crate::storage::{journal_mode, pager::SavepointResult};
 use crate::sync::{
@@ -205,6 +205,8 @@ pub struct Connection {
         RwLock<HashMap<usize, (crate::mvcc::database::TxID, TransactionMode)>>,
     #[cfg(any(test, injected_yields))]
     pub(super) yield_injector: RwLock<Option<Arc<dyn YieldInjector>>>,
+    #[cfg(any(test, injected_yields))]
+    pub(super) failure_injector: RwLock<Option<Arc<dyn FailureInjector>>>,
     #[cfg(any(test, injected_yields))]
     pub(super) yield_instance_id_counter: AtomicU64,
 
@@ -2004,6 +2006,32 @@ impl Connection {
     #[cfg(any(test, injected_yields))]
     pub(crate) fn yield_injector(&self) -> Option<Arc<dyn YieldInjector>> {
         self.yield_injector.read().clone()
+    }
+
+    #[cfg(any(test, injected_yields))]
+    pub fn set_failure_injector(&self, injector: Option<Arc<dyn FailureInjector>>) {
+        let mut slot = self.failure_injector.write();
+        match injector {
+            Some(injector) => {
+                turso_assert!(
+                    slot.is_none(),
+                    "failure injector should be empty before installing a new one"
+                );
+                *slot = Some(injector);
+            }
+            None => {
+                turso_assert!(
+                    slot.is_some(),
+                    "failure injector should be installed before it is cleared"
+                );
+                *slot = None;
+            }
+        }
+    }
+
+    #[cfg(any(test, injected_yields))]
+    pub(crate) fn failure_injector(&self) -> Option<Arc<dyn FailureInjector>> {
+        self.failure_injector.read().clone()
     }
 
     #[cfg(any(test, injected_yields))]
