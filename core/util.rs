@@ -2398,7 +2398,19 @@ mod rename_column_view {
         }
 
         if let Some(ref sources) = scope_sources {
+            // SQLite resolves a bare ORDER BY identifier against the SELECT's
+            // explicit output-column aliases before falling back to table
+            // columns, so the rename must not touch a bare identifier that
+            // matches an alias. (Compound ORDER BY scopes against the leftmost
+            // SELECT's columns, which is `select.body.select`.)
+            let order_by_aliases = output_column_aliases(&select.body.select);
             for sorted_col in &mut select.order_by {
+                if let ast::Expr::Id(name) = &*sorted_col.expr {
+                    let id_norm = normalize_ident(name.as_str());
+                    if order_by_aliases.contains(&id_norm) {
+                        continue;
+                    }
+                }
                 rewrite_expr_in_scope(
                     &mut sorted_col.expr,
                     sources,
@@ -3324,6 +3336,24 @@ pub fn rewrite_trigger_cmd_table_refs(cmd: &mut ast::TriggerCmd, old_tbl: &str, 
     }
 }
 
+/// Collect explicit output-column aliases (`AS foo` or elided `foo`) from a
+/// SELECT body. Used when handling ORDER BY, where SQLite resolves a bare
+/// identifier against output aliases before falling back to table columns.
+fn output_column_aliases(one_select: &ast::OneSelect) -> Vec<String> {
+    let ast::OneSelect::Select { columns, .. } = one_select else {
+        return Vec::new();
+    };
+    columns
+        .iter()
+        .filter_map(|col| match col {
+            ast::ResultColumn::Expr(_, Some(alias)) if alias.is_explicit() => {
+                Some(normalize_ident(alias.name().as_str()))
+            }
+            _ => None,
+        })
+        .collect()
+}
+
 /// Scope-aware version of `rewrite_select_column_refs` that checks table qualifiers.
 fn rewrite_select_column_refs_scoped(
     select: &mut ast::Select,
@@ -3374,7 +3404,18 @@ fn rewrite_select_column_refs_scoped(
     };
     let rename_unqualified =
         !target_qualifiers.is_empty() || target_table.eq_ignore_ascii_case(trigger_table);
+    // SQLite's ORDER BY resolution prefers an output-column alias over a table
+    // column when the term is a bare identifier, so a bare ORDER BY identifier
+    // that matches an explicit alias must not be rewritten by the column rename.
+    // (Compound ORDER BY scopes against the leftmost SELECT's columns.)
+    let order_by_output_aliases = output_column_aliases(&select.body.select);
     for col in &mut select.order_by {
+        if let ast::Expr::Id(name) = &*col.expr {
+            let id_norm = normalize_ident(name.as_str());
+            if order_by_output_aliases.contains(&id_norm) {
+                continue;
+            }
+        }
         rename_identifiers_scoped_inner(
             &mut col.expr,
             target_table,
@@ -4010,8 +4051,18 @@ fn select_still_references_renamed_column(
     let rename_unqualified =
         !target_qualifiers.is_empty() || target_table.eq_ignore_ascii_case(trigger_table);
 
+    // A bare ORDER BY identifier that matches an explicit output alias resolves
+    // to that output column (per SQLite's ORDER BY rules), not to a table
+    // column, so it must be excluded from the "still references" check.
+    let order_by_output_aliases = output_column_aliases(&select.body.select);
     let mut found = false;
     for sorted_col in &select.order_by {
+        if let ast::Expr::Id(name) = &*sorted_col.expr {
+            let id_norm = normalize_ident(name.as_str());
+            if order_by_output_aliases.contains(&id_norm) {
+                continue;
+            }
+        }
         if expr_still_references_renamed_column(
             &sorted_col.expr,
             target_table,

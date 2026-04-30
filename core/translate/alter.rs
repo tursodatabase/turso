@@ -2946,6 +2946,21 @@ fn apply_upsert_for_column_rename(
     Ok(())
 }
 
+fn output_column_aliases(one_select: &ast::OneSelect) -> Vec<String> {
+    let ast::OneSelect::Select { columns, .. } = one_select else {
+        return Vec::new();
+    };
+    columns
+        .iter()
+        .filter_map(|col| match col {
+            ast::ResultColumn::Expr(_, Some(alias)) if alias.is_explicit() => {
+                Some(normalize_ident(alias.name().as_str()))
+            }
+            _ => None,
+        })
+        .collect()
+}
+
 #[allow(clippy::too_many_arguments)]
 fn apply_select_for_column_rename(
     mode: ColumnRenameMode<'_>,
@@ -3008,7 +3023,21 @@ fn apply_select_for_column_rename(
         _ => outer_target_qualifiers.to_vec(),
     };
 
+    // SQLite's ORDER BY resolution (https://sqlite.org/lang_select.html) gives
+    // a bare-identifier ORDER BY term priority over table columns when it
+    // matches an explicit output-column alias. In that case the term refers
+    // to the SELECT's output, not to a table column, and so the column rename
+    // must not touch it. For compound SELECTs the alias scope is the leftmost
+    // SELECT's columns, which is what `select.body.select` holds.
+    let order_by_output_aliases = output_column_aliases(&select.body.select);
+
     for sorted_col in &mut select.order_by {
+        if let ast::Expr::Id(name) = &*sorted_col.expr {
+            let id_norm = normalize_ident(name.as_str());
+            if order_by_output_aliases.contains(&id_norm) {
+                continue;
+            }
+        }
         apply_expr_for_column_rename(
             mode,
             &mut sorted_col.expr,

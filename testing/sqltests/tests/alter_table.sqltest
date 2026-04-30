@@ -2522,3 +2522,165 @@ expect {
     table|purchases|purchases
     trigger|tr|purchases
 }
+
+# RENAME COLUMN must not rewrite a bare ORDER BY identifier when it
+# matches an output-column alias — per SQLite's ORDER BY resolution
+# rules, the alias takes priority over the table column.
+# Regression test for https://github.com/tursodatabase/turso/issues/6332
+test alter-table-rename-column-order-by-alias-trigger {
+    CREATE TABLE src(a, b);
+    CREATE TABLE dst(x);
+    CREATE TABLE log(v);
+    INSERT INTO src VALUES(2,100),(1,200);
+    CREATE TRIGGER trig AFTER INSERT ON dst BEGIN
+        INSERT INTO log SELECT a AS b FROM src ORDER BY b;
+    END;
+    ALTER TABLE src RENAME COLUMN b TO c;
+    INSERT INTO dst VALUES(1);
+    SELECT group_concat(v, '|') FROM log;
+}
+expect {
+    1|2
+}
+
+# After the rename, the trigger SQL must keep `ORDER BY b` unchanged
+# because `b` refers to the output alias, not the renamed table column.
+test alter-table-rename-column-order-by-alias-trigger-sql {
+    CREATE TABLE src(a, b);
+    CREATE TABLE dst(x);
+    CREATE TABLE log(v);
+    CREATE TRIGGER trig AFTER INSERT ON dst BEGIN
+        INSERT INTO log SELECT a AS b FROM src ORDER BY b;
+    END;
+    ALTER TABLE src RENAME COLUMN b TO c;
+    SELECT sql FROM sqlite_schema WHERE name = 'trig';
+}
+expect pattern {
+    .*ORDER BY b.*
+}
+
+# The renamed column inside an ORDER BY *expression* (e.g. `b+0`) is
+# not a bare identifier and must still be rewritten — the alias rule
+# only applies to bare-identifier ORDER BY terms.
+test alter-table-rename-column-order-by-expr-rewrites {
+    CREATE TABLE src(a, b);
+    CREATE TABLE dst(x);
+    CREATE TABLE log(v);
+    INSERT INTO src VALUES(2,100),(1,200);
+    CREATE TRIGGER trig AFTER INSERT ON dst BEGIN
+        INSERT INTO log SELECT a AS b FROM src ORDER BY b+0;
+    END;
+    ALTER TABLE src RENAME COLUMN b TO c;
+    INSERT INTO dst VALUES(1);
+    SELECT group_concat(v, '|') FROM log;
+}
+expect {
+    2|1
+}
+
+# A qualified ORDER BY reference (e.g. `src.b`) is not an alias
+# resolution case — the rename must rewrite it to the new column name.
+test alter-table-rename-column-order-by-qualified-rewrites {
+    CREATE TABLE src(a, b);
+    CREATE TABLE dst(x);
+    CREATE TABLE log(v);
+    INSERT INTO src VALUES(2,100),(1,200);
+    CREATE TRIGGER trig AFTER INSERT ON dst BEGIN
+        INSERT INTO log SELECT a AS b FROM src ORDER BY src.b;
+    END;
+    ALTER TABLE src RENAME COLUMN b TO c;
+    INSERT INTO dst VALUES(1);
+    SELECT group_concat(v, '|') FROM log;
+}
+expect {
+    2|1
+}
+
+# Without an explicit alias, the SELECT's column name comes from the
+# expression text; it is NOT an explicit alias, so the rename must
+# rewrite both the SELECT expression and ORDER BY.
+test alter-table-rename-column-order-by-no-alias-rewrites {
+    CREATE TABLE src(a, b);
+    CREATE TABLE dst(x);
+    CREATE TABLE log(v);
+    INSERT INTO src VALUES(2,100),(1,200);
+    CREATE TRIGGER trig AFTER INSERT ON dst BEGIN
+        INSERT INTO log SELECT b FROM src ORDER BY b;
+    END;
+    ALTER TABLE src RENAME COLUMN b TO c;
+    INSERT INTO dst VALUES(1);
+    SELECT group_concat(v, '|') FROM log;
+}
+expect {
+    100|200
+}
+
+# Compound SELECTs scope ORDER BY against the leftmost SELECT's
+# columns. The leftmost SELECT exposes alias `b`, so ORDER BY `b`
+# refers to the alias and must not be rewritten.
+test alter-table-rename-column-order-by-alias-trigger-compound {
+    CREATE TABLE src(a, b);
+    CREATE TABLE dst(x);
+    CREATE TABLE log(v);
+    INSERT INTO src VALUES(2,100),(1,200);
+    CREATE TRIGGER trig AFTER INSERT ON dst BEGIN
+        INSERT INTO log SELECT a AS b FROM src UNION SELECT a FROM src ORDER BY b;
+    END;
+    ALTER TABLE src RENAME COLUMN b TO c;
+    INSERT INTO dst VALUES(1);
+    SELECT group_concat(v, '|') FROM log;
+}
+expect {
+    1|2
+}
+
+# Alias collides with the post-rename column name: the SELECT
+# expression is rewritten (`b` → `c`) but ORDER BY `c` matches the
+# alias, so it is preserved as `ORDER BY c`.
+test alter-table-rename-column-order-by-alias-collides-with-new-name {
+    CREATE TABLE src(a, b);
+    CREATE TABLE dst(x);
+    CREATE TABLE log(v);
+    INSERT INTO src VALUES(2,100),(1,200);
+    CREATE TRIGGER trig AFTER INSERT ON dst BEGIN
+        INSERT INTO log SELECT b AS c FROM src ORDER BY c;
+    END;
+    ALTER TABLE src RENAME COLUMN b TO c;
+    INSERT INTO dst VALUES(1);
+    SELECT group_concat(v, '|') FROM log;
+}
+expect {
+    100|200
+}
+
+# View rewrite path: an `ORDER BY` term that matches an explicit
+# output alias must not be rewritten when the underlying base-table
+# column is renamed.
+@skip-if mvcc "views not supported in MVCC mode"
+test alter-table-rename-column-order-by-alias-view {
+    CREATE TABLE src(a, b);
+    CREATE VIEW v AS SELECT a AS b FROM src ORDER BY b;
+    ALTER TABLE src RENAME COLUMN b TO c;
+    SELECT sql FROM sqlite_schema WHERE name = 'v';
+}
+expect {
+    CREATE VIEW v AS SELECT a AS b FROM src ORDER BY b
+}
+
+# Validation path: before the fix, the post-rewrite check would
+# flag `ORDER BY b` as a stale reference to the renamed column and
+# fail the entire ALTER. The alias-skip in the validator must keep
+# this rename succeeding.
+test alter-table-rename-column-order-by-alias-cross-table-validates {
+    CREATE TABLE src(a, b);
+    CREATE TABLE dst(x);
+    CREATE TABLE log(v);
+    CREATE TRIGGER trig AFTER INSERT ON dst BEGIN
+        INSERT INTO log SELECT a AS b FROM src ORDER BY b;
+    END;
+    ALTER TABLE src RENAME COLUMN b TO c;
+    SELECT count(*) FROM sqlite_schema WHERE name = 'trig';
+}
+expect {
+    1
+}
