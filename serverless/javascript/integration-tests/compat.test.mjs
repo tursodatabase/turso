@@ -64,3 +64,23 @@ test.serial('createClient works with basic libSQL API', async t => {
   client.close();
   t.true(client.closed);
 });
+
+test.serial('compat execute preserves lastInsertRowid of 0', async t => {
+  const client = createClient({
+    url: 'http://localhost:0',
+  });
+
+  client.session.execute = async () => ({
+    columns: [],
+    columnTypes: [],
+    rows: [],
+    rowsAffected: 1,
+    lastInsertRowid: 0,
+  });
+
+  const result = await client.execute('INSERT INTO users DEFAULT VALUES');
+  t.is(result.lastInsertRowid, 0n);
+  t.is(typeof result.lastInsertRowid, 'bigint');
+
+  client.close();
+});
