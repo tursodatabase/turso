@@ -6537,6 +6537,7 @@ dependencies = [
  "serde_json",
  "shlex",
  "syntect",
+ "tempfile",
  "termimad",
  "toml",
  "toml_edit 0.22.26",

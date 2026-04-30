@@ -489,65 +489,145 @@ impl TursoSyncServer {
             None
         };
 
-        let mut seen_pages: HashSet<u32> = HashSet::new();
+        let frame_size = WAL_FRAME_HEADER_SIZE + PAGE_SIZE;
+
         let mut pages_to_send: Vec<(u32, Vec<u8>)> = Vec::new();
 
-        let frame_size = WAL_FRAME_HEADER_SIZE + PAGE_SIZE;
-        let mut frame_buffer = vec![0u8; frame_size];
+        let db_size: u64;
 
-        debug!(
-            "pull-updates: scanning WAL frames {}..={} (client_revision={}, server_revision={})",
-            client_revision + 1,
-            server_revision,
-            client_revision,
-            server_revision
-        );
+        if client_revision == 0 {
+            // Bootstrap (or pull-specific-pages) request: the client has no prior
+            // state at server_revision and expects the actual page contents, not
+            // just WAL deltas. Walking WAL frames alone is unsafe because pages
+            // that were never modified through the current WAL (e.g. page 1 in a
+            // mostly-checkpointed DB) would silently be omitted, leaving the
+            // client with a zero-filled file that fails to open
+            // ("invalid page size in database header: 0"). Read each requested
+            // page from the current DB state (WAL ∪ main DB) at a fixed
+            // server_revision watermark instead.
+            let frame_watermark = if wal_state.max_frame > 0 {
+                Some(server_revision)
+            } else {
+                None
+            };
 
-        if server_revision > client_revision {
-            for frame_no in (client_revision + 1..=server_revision).rev() {
-                let frame_info = conn.wal_get_frame(frame_no, &mut frame_buffer)?;
+            // Derive db_size from page 1 of the current snapshot (WAL ∪ main
+            // DB) rather than from the last WAL frame: a fully-checkpointed DB
+            // has max_frame == 0 yet still has a non-empty main.db, and a WAL
+            // frame's db_size field is only populated on commit frames.
+            let mut page1 = vec![0u8; PAGE_SIZE];
+            db_size = if conn.try_wal_watermark_read_page(1, &mut page1, frame_watermark)? {
+                u32::from_be_bytes(page1[28..32].try_into().unwrap()) as u64
+            } else {
+                0
+            };
 
-                let page_no = frame_info.page_no;
-                // WAL uses 1-based page numbers, sync protocol uses 0-based
-                let page_id = page_no - 1;
+            let max_page_id = u32::try_from(db_size).unwrap_or(u32::MAX);
+            let mut page_buf = vec![0u8; PAGE_SIZE];
 
-                if seen_pages.contains(&page_no) {
-                    continue;
-                }
+            let emit_page =
+                |page_id: u32, buf: &mut [u8], out: &mut Vec<(u32, Vec<u8>)>| -> Result<()> {
+                    let page_no = page_id + 1;
+                    if !conn.try_wal_watermark_read_page(page_no, buf, frame_watermark)? {
+                        // Sparse page within [0, db_size): nothing on disk for this
+                        // offset (e.g. an unallocated free-list slot). Skip it —
+                        // the client zero-fills via the initial truncate, matching
+                        // what the server's own filesystem holds.
+                        debug!("pull-updates: skipping sparse page page_no={}", page_no);
+                        return Ok(());
+                    }
+                    out.push((page_id, buf.to_vec()));
+                    Ok(())
+                };
 
-                if let Some(ref selector) = pages_selector {
-                    if !selector.contains(page_id) {
+            if let Some(ref selector) = pages_selector {
+                for page_id in selector.iter() {
+                    if page_id >= max_page_id {
                         continue;
                     }
+                    if page_id == 0 {
+                        // Page 1 was already read above; reuse it.
+                        pages_to_send.push((0, page1.clone()));
+                        continue;
+                    }
+                    emit_page(page_id, &mut page_buf, &mut pages_to_send)?;
                 }
-
-                seen_pages.insert(page_no);
-
-                let type_byte = frame_buffer[WAL_FRAME_HEADER_SIZE];
-                debug!(
-                    "pull-updates: including page_no={}, frame_no={}, type_byte={}, db_size={}",
-                    page_no, frame_no, type_byte, frame_info.db_size
-                );
-
-                let page_data = frame_buffer[WAL_FRAME_HEADER_SIZE..].to_vec();
-                pages_to_send.push((page_id, page_data));
+            } else {
+                if max_page_id > 0 {
+                    pages_to_send.push((0, page1));
+                }
+                for page_id in 1..max_page_id {
+                    emit_page(page_id, &mut page_buf, &mut pages_to_send)?;
+                }
             }
-        }
 
-        debug!(
-            "pull-updates: sending {} pages, seen_pages={:?}",
-            pages_to_send.len(),
-            seen_pages
-        );
-        pages_to_send.reverse();
-
-        let db_size = if wal_state.max_frame > 0 {
-            let mut last_frame = vec![0u8; frame_size];
-            let last_info = conn.wal_get_frame(wal_state.max_frame, &mut last_frame)?;
-            last_info.db_size as u64
+            debug!(
+                "pull-updates: bootstrap mode, sending {} pages (db_size={})",
+                pages_to_send.len(),
+                db_size,
+            );
         } else {
-            0
-        };
+            // Incremental sync: the client already has a consistent snapshot at
+            // client_revision and only needs the pages that changed in WAL up to
+            // server_revision. Walk frames newest-to-oldest and emit each page's
+            // most recent version once.
+            db_size = if wal_state.max_frame > 0 {
+                let mut last_frame = vec![0u8; frame_size];
+                let last_info = conn.wal_get_frame(wal_state.max_frame, &mut last_frame)?;
+                last_info.db_size as u64
+            } else {
+                0
+            };
+
+            let mut seen_pages: HashSet<u32> = HashSet::new();
+            let mut frame_buffer = vec![0u8; frame_size];
+
+            debug!(
+                "pull-updates: scanning WAL frames {}..={} (client_revision={}, server_revision={})",
+                client_revision + 1,
+                server_revision,
+                client_revision,
+                server_revision
+            );
+
+            if server_revision > client_revision {
+                for frame_no in (client_revision + 1..=server_revision).rev() {
+                    let frame_info = conn.wal_get_frame(frame_no, &mut frame_buffer)?;
+
+                    let page_no = frame_info.page_no;
+                    // WAL uses 1-based page numbers, sync protocol uses 0-based
+                    let page_id = page_no - 1;
+
+                    if seen_pages.contains(&page_no) {
+                        continue;
+                    }
+
+                    if let Some(ref selector) = pages_selector {
+                        if !selector.contains(page_id) {
+                            continue;
+                        }
+                    }
+
+                    seen_pages.insert(page_no);
+
+                    let type_byte = frame_buffer[WAL_FRAME_HEADER_SIZE];
+                    debug!(
+                        "pull-updates: including page_no={}, frame_no={}, type_byte={}, db_size={}",
+                        page_no, frame_no, type_byte, frame_info.db_size
+                    );
+
+                    let page_data = frame_buffer[WAL_FRAME_HEADER_SIZE..].to_vec();
+                    pages_to_send.push((page_id, page_data));
+                }
+            }
+
+            debug!(
+                "pull-updates: incremental mode, sending {} pages, seen_pages={:?}",
+                pages_to_send.len(),
+                seen_pages
+            );
+            pages_to_send.reverse();
+        }
 
         let header = PullUpdatesRespProtoBody {
             server_revision: server_revision.to_string(),
@@ -691,5 +771,282 @@ fn convert_core_to_value(value: CoreValue) -> Value {
         CoreValue::Blob(b) => Value::Blob {
             value: Bytes::from(b),
         },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::AtomicUsize;
+    use turso_core::{CheckpointMode, Database, OpenFlags, PlatformIO, IO};
+
+    fn open_db(dir: &std::path::Path) -> (Arc<dyn IO>, Arc<turso_core::Connection>) {
+        let path = dir.join("test.db");
+        let io: Arc<dyn IO> = Arc::new(PlatformIO::new().unwrap());
+        let db = Database::open_file_with_flags(
+            io.clone(),
+            path.to_str().unwrap(),
+            OpenFlags::default(),
+            turso_core::DatabaseOpts::new(),
+            None,
+        )
+        .unwrap();
+        let conn = db.connect().unwrap();
+        (io, conn)
+    }
+
+    fn read_varint(buf: &[u8], pos: &mut usize) -> Option<usize> {
+        let mut result: usize = 0;
+        let mut shift = 0;
+        loop {
+            if *pos >= buf.len() {
+                return None;
+            }
+            let byte = buf[*pos];
+            *pos += 1;
+            result |= ((byte & 0x7f) as usize) << shift;
+            if byte & 0x80 == 0 {
+                break;
+            }
+            shift += 7;
+        }
+        Some(result)
+    }
+
+    fn decode_pull_response(body: &[u8]) -> (PullUpdatesRespProtoBody, Vec<PageData>) {
+        let mut pos = 0;
+        let header_len = read_varint(body, &mut pos).expect("header length");
+        let header =
+            <PullUpdatesRespProtoBody as Message>::decode(&body[pos..pos + header_len]).unwrap();
+        pos += header_len;
+        let mut pages = Vec::new();
+        while pos < body.len() {
+            let page_len = read_varint(body, &mut pos).expect("page length");
+            let page = <PageData as Message>::decode(&body[pos..pos + page_len]).unwrap();
+            pos += page_len;
+            pages.push(page);
+        }
+        (header, pages)
+    }
+
+    fn make_server(conn: Arc<turso_core::Connection>) -> TursoSyncServer {
+        TursoSyncServer::new(
+            "127.0.0.1:0".to_string(),
+            conn,
+            Arc::new(AtomicUsize::new(0)),
+        )
+    }
+
+    fn bootstrap_request_body() -> Vec<u8> {
+        let req = PullUpdatesReqProtoBody {
+            encoding: PageUpdatesEncodingReq::Raw as i32,
+            server_revision: String::new(),
+            client_revision: String::new(),
+            long_poll_timeout_ms: 0,
+            server_pages_selector: Bytes::new(),
+            server_query_selector: String::new(),
+            client_pages: Bytes::new(),
+        };
+        req.encode_to_vec()
+    }
+
+    /// Bootstrap must return every page in [0, db_size) with valid contents,
+    /// even when some pages are NOT in WAL because they were checkpointed
+    /// out before later writes added new frames. Regression test for the
+    /// "page 1 zero-filled" bug (#5971).
+    #[test]
+    fn bootstrap_includes_pages_not_in_wal_after_checkpoint() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_io, conn) = open_db(dir.path());
+
+        conn.execute("CREATE TABLE foo (id INTEGER PRIMARY KEY, val TEXT)")
+            .unwrap();
+        for i in 0..100 {
+            conn.execute(format!(
+                "INSERT INTO foo VALUES ({i}, 'value-padding-padding-padding-{i}')"
+            ))
+            .unwrap();
+        }
+
+        // Flush WAL into the main DB. After this max_frame may be 0 or small,
+        // and the pages we just wrote live in main.db rather than WAL.
+        conn.checkpoint(CheckpointMode::Truncate {
+            upper_bound_inclusive: None,
+        })
+        .unwrap();
+
+        // A few more writes after checkpoint produce WAL frames that DO NOT
+        // necessarily cover every page (e.g. unchanged b-tree interior pages
+        // or page 1) — exactly the scenario that left bootstrap clients with
+        // a zero-filled page 1 on v0.5.1.
+        for i in 100..110 {
+            conn.execute(format!("INSERT INTO foo VALUES ({i}, 'extra-{i}')"))
+                .unwrap();
+        }
+
+        let server = make_server(conn);
+        let resp = server
+            .handle_pull_updates(&bootstrap_request_body())
+            .unwrap();
+        assert_eq!(resp.status, 200);
+
+        let (header, pages) = decode_pull_response(&resp.body);
+        assert!(header.db_size > 0, "bootstrap header must report db_size");
+        assert_eq!(
+            pages.len() as u64,
+            header.db_size,
+            "bootstrap must return every page in [0, db_size)"
+        );
+
+        let mut page_ids: Vec<u64> = pages.iter().map(|p| p.page_id).collect();
+        page_ids.sort_unstable();
+        let expected: Vec<u64> = (0..header.db_size).collect();
+        assert_eq!(page_ids, expected, "page ids must cover [0, db_size)");
+
+        let page1 = pages.iter().find(|p| p.page_id == 0).expect("page 1");
+        assert_eq!(page1.encoded_page.len(), PAGE_SIZE);
+        let page_size_field = u16::from_be_bytes(page1.encoded_page[16..18].try_into().unwrap());
+        assert!(
+            page_size_field != 0,
+            "page 1 page_size header field must be non-zero (regression: zero-filled page 1)"
+        );
+        assert!(
+            page1.encoded_page.iter().any(|&b| b != 0),
+            "page 1 must not be zero-filled"
+        );
+    }
+
+    /// The selector path must also serve actual page contents, not just WAL
+    /// deltas, when the client's revision is 0 (e.g. pull_pages_v1).
+    #[test]
+    fn bootstrap_with_selector_returns_requested_pages_from_main_db() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_io, conn) = open_db(dir.path());
+
+        conn.execute("CREATE TABLE foo (id INTEGER PRIMARY KEY, val TEXT)")
+            .unwrap();
+        for i in 0..50 {
+            conn.execute(format!(
+                "INSERT INTO foo VALUES ({i}, 'padding-padding-padding-{i}')"
+            ))
+            .unwrap();
+        }
+        conn.checkpoint(CheckpointMode::Truncate {
+            upper_bound_inclusive: None,
+        })
+        .unwrap();
+        conn.execute("INSERT INTO foo VALUES (1000, 'after-ckpt')")
+            .unwrap();
+
+        let server = make_server(conn);
+
+        let mut bitmap = RoaringBitmap::new();
+        bitmap.insert(0u32);
+        bitmap.insert(1u32);
+        let mut bitmap_bytes = Vec::with_capacity(bitmap.serialized_size());
+        bitmap.serialize_into(&mut bitmap_bytes).unwrap();
+
+        let req = PullUpdatesReqProtoBody {
+            encoding: PageUpdatesEncodingReq::Raw as i32,
+            server_revision: String::new(),
+            client_revision: String::new(),
+            long_poll_timeout_ms: 0,
+            server_pages_selector: Bytes::from(bitmap_bytes),
+            server_query_selector: String::new(),
+            client_pages: Bytes::new(),
+        };
+        let resp = server.handle_pull_updates(&req.encode_to_vec()).unwrap();
+        assert_eq!(resp.status, 200);
+
+        let (_, pages) = decode_pull_response(&resp.body);
+        let mut page_ids: Vec<u64> = pages.iter().map(|p| p.page_id).collect();
+        page_ids.sort_unstable();
+        assert_eq!(page_ids, vec![0u64, 1u64]);
+        let page1 = pages.iter().find(|p| p.page_id == 0).unwrap();
+        assert!(page1.encoded_page.iter().any(|&b| b != 0));
+    }
+
+    /// Incremental sync (client_revision > 0) must keep the existing
+    /// behaviour of returning only the pages that changed in WAL between
+    /// client_revision and server_revision.
+    #[test]
+    fn incremental_sync_returns_only_wal_changed_pages() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_io, conn) = open_db(dir.path());
+
+        conn.execute("CREATE TABLE foo (id INTEGER PRIMARY KEY, val TEXT)")
+            .unwrap();
+        for i in 0..20 {
+            conn.execute(format!("INSERT INTO foo VALUES ({i}, 'v-{i}')"))
+                .unwrap();
+        }
+        let baseline = conn.wal_state().unwrap().max_frame;
+
+        conn.execute("INSERT INTO foo VALUES (999, 'incremental')")
+            .unwrap();
+        let after = conn.wal_state().unwrap().max_frame;
+        assert!(after > baseline, "follow-up insert must add WAL frames");
+
+        let server = make_server(conn);
+        let req = PullUpdatesReqProtoBody {
+            encoding: PageUpdatesEncodingReq::Raw as i32,
+            server_revision: String::new(),
+            client_revision: baseline.to_string(),
+            long_poll_timeout_ms: 0,
+            server_pages_selector: Bytes::new(),
+            server_query_selector: String::new(),
+            client_pages: Bytes::new(),
+        };
+        let resp = server.handle_pull_updates(&req.encode_to_vec()).unwrap();
+        assert_eq!(resp.status, 200);
+
+        let (header, pages) = decode_pull_response(&resp.body);
+        assert!(!pages.is_empty(), "incremental sync must return changes");
+        // Incremental response must NOT be a full snapshot: it should be
+        // strictly smaller than the on-server db_size for this workload.
+        assert!(
+            (pages.len() as u64) < header.db_size,
+            "incremental response should only carry WAL deltas"
+        );
+    }
+
+    /// After a TRUNCATE checkpoint with no subsequent writes the WAL is empty
+    /// (max_frame == 0) but main.db still holds the database. Bootstrap must
+    /// derive db_size from page 1's header rather than from the (absent) last
+    /// WAL frame, otherwise the client receives a header with db_size == 0
+    /// and ends up with a 0-byte replica even though data exists.
+    #[test]
+    fn bootstrap_after_truncate_with_no_writes_returns_full_db() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_io, conn) = open_db(dir.path());
+
+        conn.execute("CREATE TABLE foo (id INTEGER PRIMARY KEY, val TEXT)")
+            .unwrap();
+        for i in 0..50 {
+            conn.execute(format!("INSERT INTO foo VALUES ({i}, 'pad-pad-pad-{i}')"))
+                .unwrap();
+        }
+        conn.checkpoint(CheckpointMode::Truncate {
+            upper_bound_inclusive: None,
+        })
+        .unwrap();
+        // No writes after the checkpoint: WAL is fully drained.
+        assert_eq!(conn.wal_state().unwrap().max_frame, 0);
+
+        let server = make_server(conn);
+        let resp = server
+            .handle_pull_updates(&bootstrap_request_body())
+            .unwrap();
+        assert_eq!(resp.status, 200);
+
+        let (header, pages) = decode_pull_response(&resp.body);
+        assert!(
+            header.db_size > 0,
+            "bootstrap must report a non-zero db_size when main.db is non-empty"
+        );
+        assert_eq!(pages.len() as u64, header.db_size);
+        let page1 = pages.iter().find(|p| p.page_id == 0).expect("page 1");
+        let page_size_field = u16::from_be_bytes(page1.encoded_page[16..18].try_into().unwrap());
+        assert!(page_size_field != 0);
     }
 }

@@ -77,3 +77,6 @@ stacker = ["turso_core/stacker"]
 [build-dependencies]
 syntect = { git = "https://github.com/trishume/syntect.git", rev = "64644ffe064457265cbcee12a0c1baf9485ba6ee", default-features = false, features = ["default-fancy"] }
 include_dir = "0.7"
+
+[dev-dependencies]
+tempfile = { workspace = true }
