@@ -4,8 +4,8 @@ use crate::turso_assert;
 use tracing::{instrument, Level};
 use turso_parser::ast::{self, Expr, ResolveType, SubqueryType, TableInternalId, UnaryOperator};
 
-use super::collate::{get_collseq_from_expr, CollationSeq};
-use super::emitter::Resolver;
+use super::collate::{get_collseq_from_expr, get_expr_collation_ctx, CollationSeq};
+use super::emitter::{CachedExprCollation, Resolver};
 use super::optimizer::Optimizable;
 use super::plan::TableReferences;
 #[cfg(all(feature = "fts", not(target_family = "wasm")))]
@@ -14,9 +14,7 @@ use crate::function::FtsFunc;
 use crate::function::JsonFunc;
 use crate::function::{AggFunc, Func, FuncCtx, MathFuncArity, ScalarFunc, VectorFunc};
 use crate::functions::datetime;
-use crate::schema::{
-    BTreeTable, ColDef, Column, ColumnLayout, GeneratedType, Table, Type, TypeDef,
-};
+use crate::schema::{BTreeTable, Column, ColumnLayout, GeneratedType, Table, Type, TypeDef};
 use crate::sync::Arc;
 use crate::translate::expression_index::{
     normalize_expr_for_index_matching, single_table_column_usage,
