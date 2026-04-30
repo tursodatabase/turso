@@ -1,0 +1,142 @@
+@database :memory:
+
+# Regression tests for https://github.com/tursodatabase/turso/issues/6351
+# Pages modified inside a savepoint can be spilled and evicted from a small
+# page cache. ROLLBACK TO must restore each subjournaled page even when the
+# remaining cached pages are all dirty and unspilled, so the cache is allowed
+# to temporarily exceed its capacity during the restore.
+
+@cross-check-integrity
+test savepoint-rollback-cache-spill-mixed-dml {
+    PRAGMA page_size = 512;
+    PRAGMA cache_size = 2;
+    PRAGMA cache_spill = ON;
+
+    CREATE TABLE t(a INTEGER PRIMARY KEY, b INT, p BLOB);
+    INSERT INTO t
+        SELECT value, value % 43, randomblob(2550)
+        FROM generate_series(1, 135);
+
+    SAVEPOINT s1;
+    DELETE FROM t WHERE a BETWEEN 27 AND 60;
+    INSERT INTO t
+        SELECT value + 2700, value % 43, randomblob(3062)
+        FROM generate_series(1, 27);
+    UPDATE t SET p = randomblob(2806) WHERE a BETWEEN 67 AND 78;
+    ROLLBACK TO s1;
+    RELEASE s1;
+
+    SELECT COUNT(*) FROM t;
+    SELECT COUNT(*) FROM t WHERE a BETWEEN 27 AND 60;
+    SELECT MIN(a), MAX(a) FROM t;
+    SELECT length(p) FROM t WHERE a IN (1, 67, 135);
+}
+expect {
+    135
+    34
+    1|135
+    2550
+    2550
+    2550
+}
+
+# After ROLLBACK TO, work can resume in the same outer transaction. Any
+# pages spilled to make room during the rollback must remain consistent with
+# the eventual COMMIT so the rolled-back image is durable.
+@cross-check-integrity
+test savepoint-rollback-cache-spill-then-commit {
+    PRAGMA page_size = 512;
+    PRAGMA cache_size = 2;
+    PRAGMA cache_spill = ON;
+
+    CREATE TABLE t(a INTEGER PRIMARY KEY, b INT, p BLOB);
+    INSERT INTO t
+        SELECT value, value % 43, randomblob(2550)
+        FROM generate_series(1, 135);
+
+    BEGIN;
+    INSERT INTO t VALUES (200, 7, randomblob(50));
+    SAVEPOINT s1;
+    DELETE FROM t WHERE a BETWEEN 1 AND 100;
+    UPDATE t SET p = randomblob(2806) WHERE a BETWEEN 101 AND 135;
+    ROLLBACK TO s1;
+    RELEASE s1;
+    COMMIT;
+
+    SELECT COUNT(*) FROM t;
+    SELECT b, length(p) FROM t WHERE a = 200;
+    SELECT length(p) FROM t WHERE a = 67;
+    SELECT length(p) FROM t WHERE a = 110;
+}
+expect {
+    136
+    7|50
+    2550
+    2550
+}
+
+# Combine page allocation (post-savepoint pages) with modifications to many
+# pre-existing pages so the rollback both truncates new pages and restores
+# subjournaled before-images of every modified pre-savepoint page.
+@cross-check-integrity
+test savepoint-rollback-after-page-allocation-spill {
+    PRAGMA page_size = 512;
+    PRAGMA cache_size = 2;
+    PRAGMA cache_spill = ON;
+
+    CREATE TABLE t(a INTEGER PRIMARY KEY, p BLOB);
+    INSERT INTO t
+        SELECT value, randomblob(2000)
+        FROM generate_series(1, 100);
+
+    SAVEPOINT s1;
+    UPDATE t SET p = randomblob(2400) WHERE a BETWEEN 1 AND 100;
+    INSERT INTO t
+        SELECT value + 1000, randomblob(3000)
+        FROM generate_series(1, 60);
+    ROLLBACK TO s1;
+    RELEASE s1;
+
+    SELECT COUNT(*) FROM t;
+    SELECT MIN(a), MAX(a) FROM t;
+    SELECT length(p) FROM t WHERE a = 1;
+    SELECT length(p) FROM t WHERE a = 100;
+}
+expect {
+    100
+    1|100
+    2000
+    2000
+}
+
+# Nested savepoints: rolling back the inner savepoint must not lose the
+# outer-savepoint changes that were already spilled to durable storage.
+@cross-check-integrity
+test savepoint-rollback-cache-spill-nested {
+    PRAGMA page_size = 512;
+    PRAGMA cache_size = 2;
+    PRAGMA cache_spill = ON;
+
+    CREATE TABLE t(a INTEGER PRIMARY KEY, p BLOB);
+    INSERT INTO t
+        SELECT value, randomblob(2000)
+        FROM generate_series(1, 60);
+
+    SAVEPOINT outer_sp;
+    UPDATE t SET p = randomblob(2200) WHERE a BETWEEN 1 AND 30;
+    SAVEPOINT inner_sp;
+    DELETE FROM t WHERE a BETWEEN 31 AND 45;
+    UPDATE t SET p = randomblob(2400) WHERE a BETWEEN 1 AND 30;
+    ROLLBACK TO inner_sp;
+    RELEASE inner_sp;
+    RELEASE outer_sp;
+
+    SELECT COUNT(*) FROM t;
+    SELECT length(p) FROM t WHERE a = 1;
+    SELECT length(p) FROM t WHERE a = 60;
+}
+expect {
+    60
+    2200
+    2000
+}

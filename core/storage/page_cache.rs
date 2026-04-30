@@ -204,12 +204,25 @@ impl PageCache {
 
     #[inline]
     pub fn insert(&mut self, key: PageCacheKey, value: PageRef) -> Result<(), CacheError> {
-        self._insert(key, value, false)
+        self._insert(key, value, false, false)
     }
 
     #[inline]
     pub fn upsert_page(&mut self, key: PageCacheKey, value: PageRef) -> Result<(), CacheError> {
-        self._insert(key, value, true)
+        self._insert(key, value, true, false)
+    }
+
+    /// Like `upsert_page`, but allows the cache to grow beyond its capacity when
+    /// no page is evictable. Used by savepoint rollback, which must restore the
+    /// pre-savepoint image of every subjournaled page even if all currently
+    /// cached pages are dirty and unspilled. The cache returns to its capacity
+    /// once subsequent operations spill these dirty pages to the WAL.
+    pub fn force_upsert_page(
+        &mut self,
+        key: PageCacheKey,
+        value: PageRef,
+    ) -> Result<(), CacheError> {
+        self._insert(key, value, true, true)
     }
 
     pub fn _insert(
@@ -217,6 +230,7 @@ impl PageCache {
         key: PageCacheKey,
         value: PageRef,
         update_in_place: bool,
+        bypass_capacity: bool,
     ) -> Result<(), CacheError> {
         trace!("insert(key={:?})", key);
 
@@ -252,7 +266,9 @@ impl PageCache {
         }
 
         // Key doesn't exist, proceed with new entry
-        self.make_room_for(1)?;
+        if !bypass_capacity {
+            self.make_room_for(1)?;
+        }
 
         // Track evictable count for the new page
         let is_evictable = Self::counted_as_evictable(&value);
@@ -589,7 +605,7 @@ impl PageCache {
         if n > self.capacity {
             return Err(CacheError::Full);
         }
-        let available = self.capacity - self.len();
+        let available = self.capacity.saturating_sub(self.len());
         if n <= available {
             return Ok(());
         }
