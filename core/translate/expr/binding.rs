@@ -965,54 +965,59 @@ pub(super) fn resolve_expr_output_type<'a>(
     referenced_tables: Option<&TableReferences>,
     resolver: &'a Resolver<'a>,
 ) -> crate::Result<&'a crate::schema::TypeDef> {
-    match expr {
-        ast::Expr::Column { table, column, .. } => {
-            let Some(referenced_tables) = referenced_tables else {
-                crate::bail_parse_error!("cannot resolve type: no table context");
-            };
-            let Some((_is_outer, tbl)) = referenced_tables.find_table_by_internal_id(*table) else {
-                crate::bail_parse_error!("cannot resolve type: table not found");
-            };
-            let col = &tbl.columns()[*column];
-            let Some(td) = resolver.schema().get_type_def_unchecked(&col.ty_str) else {
-                crate::bail_parse_error!(
-                    "column '{}' has type '{}' which is not a known struct or union type",
-                    col.name.as_deref().unwrap_or("?"),
-                    col.ty_str
-                );
-            };
-            Ok(td)
-        }
-        ast::Expr::FieldAccess { base, field, .. } => {
-            let parent_td = resolve_expr_output_type(base, referenced_tables, resolver)?;
-            let field_name = normalize_ident(field.as_str());
-            // Find what type this field/variant produces
-            let inner_type_name =
-                if let Some((_, variant)) = parent_td.find_union_variant(&field_name) {
-                    &variant.type_name
-                } else if let Some((_, f)) = parent_td.find_struct_field(&field_name) {
-                    &f.type_name
-                } else {
-                    let kind = if parent_td.is_union() {
-                        "variant"
-                    } else {
-                        "field"
-                    };
-                    crate::bail_parse_error!("no such {} '{}' in type", kind, field_name);
+    let mut current = expr;
+    let mut fields = Vec::new();
+    let mut td = loop {
+        match current {
+            ast::Expr::FieldAccess { base, field, .. } => {
+                fields.push(field);
+                current = base;
+            }
+            ast::Expr::Column { table, column, .. } => {
+                let Some(referenced_tables) = referenced_tables else {
+                    crate::bail_parse_error!("cannot resolve type: no table context");
                 };
-            let Some(td) = resolver.schema().get_type_def_unchecked(inner_type_name) else {
-                crate::bail_parse_error!(
-                    "'{}' resolves to type '{}' which is not a known type",
-                    field_name,
-                    inner_type_name
-                );
-            };
-            Ok(td)
+                let Some((_is_outer, tbl)) = referenced_tables.find_table_by_internal_id(*table)
+                else {
+                    crate::bail_parse_error!("cannot resolve type: table not found");
+                };
+                let col = &tbl.columns()[*column];
+                let Some(td) = resolver.schema().get_type_def_unchecked(&col.ty_str) else {
+                    crate::bail_parse_error!(
+                        "column '{}' has type '{}' which is not a known struct or union type",
+                        col.name.as_deref().unwrap_or("?"),
+                        col.ty_str
+                    );
+                };
+                break td;
+            }
+            _ => {
+                crate::bail_parse_error!("expression does not produce a known custom type");
+            }
         }
-        _ => {
-            crate::bail_parse_error!("expression does not produce a known custom type");
-        }
+    };
+
+    for field in fields.iter().rev() {
+        let field_name = normalize_ident(field.as_str());
+        let inner_type_name = if let Some((_, variant)) = td.find_union_variant(&field_name) {
+            variant.type_name.clone()
+        } else if let Some((_, f)) = td.find_struct_field(&field_name) {
+            f.type_name.clone()
+        } else {
+            let kind = if td.is_union() { "variant" } else { "field" };
+            crate::bail_parse_error!("no such {} '{}' in type", kind, field_name);
+        };
+        let Some(next_td) = resolver.schema().get_type_def_unchecked(&inner_type_name) else {
+            crate::bail_parse_error!(
+                "'{}' resolves to type '{}' which is not a known type",
+                field_name,
+                inner_type_name
+            );
+        };
+        td = next_td;
     }
+
+    Ok(td)
 }
 
 /// Validates custom-type function calls (arrays, structs, unions) at bind time.
