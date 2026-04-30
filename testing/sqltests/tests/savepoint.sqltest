@@ -350,3 +350,101 @@ test savepoint-rollback-to-temp-table-unreachable {
 expect error {
     no such table
 }
+
+# Regression for #6210: DML against an existing table (which dirties pages
+# already in the cache) followed by DDL inside a SAVEPOINT used to fail
+# ROLLBACK TO with "page N is dirty", because pages allocated for the new
+# btree root were never cleared from the dirty set before cache truncation.
+@cross-check-integrity
+test savepoint-rollback-to-after-dml-then-ddl {
+    CREATE TABLE t(x);
+    BEGIN;
+    INSERT INTO t VALUES (1);
+    INSERT INTO t VALUES (2);
+    SAVEPOINT xx;
+    CREATE TABLE t2(x);
+    ROLLBACK TO xx;
+    COMMIT;
+    SELECT x FROM t ORDER BY x;
+    SELECT name FROM sqlite_schema WHERE type='table' ORDER BY name;
+}
+expect {
+    1
+    2
+    t
+}
+
+@cross-check-integrity
+test savepoint-rollback-to-after-dml-then-multi-ddl {
+    CREATE TABLE t(x);
+    BEGIN;
+    INSERT INTO t VALUES (1);
+    SAVEPOINT xx;
+    CREATE TABLE t2(x);
+    CREATE TABLE t3(x);
+    CREATE TABLE t4(x);
+    ROLLBACK TO xx;
+    COMMIT;
+    SELECT x FROM t;
+    SELECT name FROM sqlite_schema WHERE type='table' ORDER BY name;
+}
+expect {
+    1
+    t
+}
+
+@cross-check-integrity
+test savepoint-rollback-to-after-dml-then-ddl-with-inserts {
+    CREATE TABLE t(x);
+    BEGIN;
+    INSERT INTO t VALUES (1);
+    SAVEPOINT xx;
+    CREATE TABLE t2(y);
+    INSERT INTO t2 VALUES (10);
+    INSERT INTO t2 VALUES (20);
+    ROLLBACK TO xx;
+    COMMIT;
+    SELECT x FROM t;
+    SELECT name FROM sqlite_schema WHERE type='table' ORDER BY name;
+}
+expect {
+    1
+    t
+}
+
+@cross-check-integrity
+test savepoint-rollback-to-after-dml-then-create-index {
+    CREATE TABLE t(x);
+    BEGIN;
+    INSERT INTO t VALUES (1);
+    INSERT INTO t VALUES (2);
+    SAVEPOINT xx;
+    CREATE INDEX t_idx ON t(x);
+    ROLLBACK TO xx;
+    COMMIT;
+    SELECT x FROM t ORDER BY x;
+    SELECT count(*) FROM sqlite_schema WHERE type='index';
+}
+expect {
+    1
+    2
+    0
+}
+
+@cross-check-integrity
+test savepoint-rollback-to-after-ddl-without-outer-begin {
+    CREATE TABLE t(x);
+    INSERT INTO t VALUES (1);
+    INSERT INTO t VALUES (2);
+    SAVEPOINT xx;
+    CREATE TABLE t2(x);
+    ROLLBACK TO xx;
+    RELEASE xx;
+    SELECT x FROM t ORDER BY x;
+    SELECT name FROM sqlite_schema WHERE type='table' ORDER BY name;
+}
+expect {
+    1
+    2
+    t
+}
