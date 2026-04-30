@@ -1,13 +1,5 @@
 use std::{num::NonZeroUsize, vec};
 
-use sql_generation::{
-    generation::{Arbitrary, ArbitraryFrom, GenerationContext, frequency},
-    model::query::{
-        Create,
-        transaction::{Begin, Commit},
-    },
-};
-
 use crate::{
     SimulatorEnv,
     generation::{
@@ -23,6 +15,15 @@ use crate::{
         },
         metrics::{InteractionStats, Remaining},
         property::Property,
+    },
+};
+use sql_generation::model::query::Select;
+use sql_generation::model::query::predicate::Predicate;
+use sql_generation::{
+    generation::{Arbitrary, ArbitraryFrom, GenerationContext, frequency},
+    model::query::{
+        Create,
+        transaction::{Begin, Commit},
     },
 };
 
