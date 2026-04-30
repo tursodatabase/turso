@@ -4,8 +4,8 @@ use crate::SqlGen;
 use crate::ast::{
     AlterTableAction, AlterTableActionKind, AlterTableStmt, BinOp, ColumnDefStmt, ConflictClause,
     CreateIndexStmt, CreateTableStmt, CreateTriggerStmt, DeleteStmt, DropIndexStmt, DropTableStmt,
-    DropTriggerStmt, Expr, InsertStmt, Literal, Stmt, TemporaryKeyword, TriggerBodyStmtKind,
-    TriggerEvent, TriggerEventKind, TriggerStmt, TriggerTiming, UpdateStmt,
+    DropTriggerStmt, Expr, InsertStmt, Literal, PragmaForeignKeyListStmt, Stmt, TemporaryKeyword,
+    TriggerBodyStmtKind, TriggerEvent, TriggerEventKind, TriggerStmt, TriggerTiming, UpdateStmt,
 };
 use crate::capabilities::Capabilities;
 use crate::context::Context;
@@ -91,6 +91,9 @@ fn collect_capability_allowed_stmts<C: Capabilities>() -> Vec<StmtKind> {
     }
     if C::DROP_INDEX {
         candidates.push(StmtKind::DropIndex);
+    }
+    if C::PRAGMA {
+        candidates.push(StmtKind::PragmaForeignKeyList);
     }
     if C::BEGIN {
         candidates.push(StmtKind::Begin);
@@ -181,7 +184,11 @@ fn is_stmt_valid_for_schema(
         // DROP TRIGGER requires triggers to exist
         StmtKind::DropTrigger => has_triggers,
         // These are always valid
-        StmtKind::CreateTable | StmtKind::Begin | StmtKind::Commit | StmtKind::Rollback => true,
+        StmtKind::CreateTable
+        | StmtKind::Begin
+        | StmtKind::Commit
+        | StmtKind::Rollback
+        | StmtKind::PragmaForeignKeyList => true,
         // Stubs — always valid (would require tables for views but weight is 0 anyway)
         StmtKind::CreateView => has_tables,
         StmtKind::DropView => true,
@@ -207,6 +214,7 @@ fn dispatch_stmt_generation<C: Capabilities>(
         StmtKind::AlterTable => generate_alter_table(generator, ctx),
         StmtKind::CreateIndex => generate_create_index(generator, ctx),
         StmtKind::DropIndex => generate_drop_index(generator, ctx),
+        StmtKind::PragmaForeignKeyList => generate_pragma_foreign_key_list(generator, ctx),
         StmtKind::Begin => Ok(Stmt::Begin),
         StmtKind::Commit => Ok(Stmt::Commit),
         StmtKind::Rollback => Ok(Stmt::Rollback),
@@ -1068,6 +1076,22 @@ pub fn generate_drop_index<C: Capabilities>(
     Ok(Stmt::DropIndex(DropIndexStmt {
         name: index_name,
         if_exists: ctx.gen_bool_with_prob(drop_index_config.if_exists_probability),
+    }))
+}
+
+/// Generate a PRAGMA foreign_key_list statement.
+pub fn generate_pragma_foreign_key_list<C: Capabilities>(
+    generator: &SqlGen<C>,
+    ctx: &mut Context,
+) -> Result<Stmt, GenError> {
+    let table = ctx
+        .choose(&generator.schema().tables)
+        .ok_or_else(|| GenError::schema_empty("tables"))?
+        .clone();
+
+    Ok(Stmt::PragmaForeignKeyList(PragmaForeignKeyListStmt {
+        database: table.database.clone(),
+        table: table.unqualified_name().to_string(),
     }))
 }
 

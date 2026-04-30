@@ -182,6 +182,19 @@ pub fn pragma_for(pragma: &PragmaName) -> Pragma {
             PragmaFlags::NoColumns1 | PragmaFlags::Result0,
             &["foreign_keys"],
         ),
+        ForeignKeyList => Pragma::new(
+            PragmaFlags::NeedSchema | PragmaFlags::Result1 | PragmaFlags::SchemaOpt,
+            &[
+                "id",
+                "seq",
+                "table",
+                "from",
+                "to",
+                "on_update",
+                "on_delete",
+                "match",
+            ],
+        ),
         FunctionList => Pragma::new(
             PragmaFlags::Result0,
             &["name", "builtin", "type", "enc", "narg", "flags"],

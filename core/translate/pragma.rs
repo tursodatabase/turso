@@ -4,7 +4,7 @@
 use crate::sync::Arc;
 use crate::turso_soft_unreachable;
 use chrono::Datelike;
-use turso_macros::match_ignore_ascii_case;
+use turso_macros::{match_ignore_ascii_case, turso_debug_assert};
 use turso_parser::ast::PragmaName;
 use turso_parser::ast::{self, Expr, Literal};
 
@@ -119,6 +119,16 @@ fn resolve_index_pragma_database_id(
         alias: None,
     };
     resolver.resolve_existing_index_database_id(&qualified_name)
+}
+
+fn foreign_key_action_name(action: ast::RefAct) -> &'static str {
+    match action {
+        ast::RefAct::SetNull => "SET NULL",
+        ast::RefAct::SetDefault => "SET DEFAULT",
+        ast::RefAct::Cascade => "CASCADE",
+        ast::RefAct::Restrict => "RESTRICT",
+        ast::RefAct::NoAction => "NO ACTION",
+    }
 }
 
 fn emit_table_list_rows_for_schema(
@@ -237,6 +247,7 @@ pub fn translate_pragma(
             PragmaName::IndexInfo
             | PragmaName::IndexXinfo
             | PragmaName::IndexList
+            | PragmaName::ForeignKeyList
             | PragmaName::TableList
             | PragmaName::TableInfo
             | PragmaName::TableXinfo
@@ -600,6 +611,7 @@ fn update_pragma(
         PragmaName::IndexInfo => unreachable!("index_info cannot be set"),
         PragmaName::IndexXinfo => unreachable!("index_xinfo cannot be set"),
         PragmaName::IndexList => unreachable!("index_list cannot be set"),
+        PragmaName::ForeignKeyList => unreachable!("foreign_key_list cannot be set"),
         PragmaName::TableList => unreachable!("table_list cannot be set"),
         PragmaName::QueryOnly => query_pragma(
             PragmaName::QueryOnly,
@@ -1123,6 +1135,71 @@ fn query_pragma(
                             program.emit_string8(origin.to_string(), base_reg + 3);
                             program.emit_int(index.where_clause.is_some() as i64, base_reg + 4);
                             program.emit_result_row(base_reg, 5);
+                        }
+                    }
+                });
+            }
+
+            let pragma_meta = pragma_for(&pragma);
+            for col_name in pragma_meta.columns.iter() {
+                program.add_pragma_result_column(col_name.to_string());
+            }
+            Ok(TransactionMode::None)
+        }
+        PragmaName::ForeignKeyList => {
+            let table_name = match value {
+                Some(ast::Expr::Name(name)) => Some(name),
+                _ => None,
+            };
+
+            let base_reg = register;
+            // 8 columns: id, seq, table, from, to, on_update, on_delete, match
+            program.alloc_registers(7);
+
+            if let Some(table_name) = table_name {
+                let table_name = table_name.as_str();
+                let table_database_id = resolve_table_pragma_database_id(
+                    resolver,
+                    database_id,
+                    schema_was_explicit,
+                    table_name,
+                )?;
+                resolver.with_schema(table_database_id, |schema| {
+                    let Some(table) = schema.get_table(table_name).and_then(|table| table.btree())
+                    else {
+                        return;
+                    };
+
+                    let mut foreign_keys = table.foreign_keys.iter().collect::<Vec<_>>();
+                    foreign_keys.sort_by_key(|fk| std::cmp::Reverse(fk.decl_order));
+
+                    for (id, fk) in foreign_keys.into_iter().enumerate() {
+                        turso_debug_assert!(
+                            fk.parent_columns.is_empty()
+                                || fk.parent_columns.len() == fk.child_columns.len()
+                        );
+                        for (idx, child_column) in fk.child_columns.iter().enumerate() {
+                            let parent_column = fk
+                                .parent_columns
+                                .get(idx)
+                                .map(String::as_str)
+                                .unwrap_or_default();
+
+                            program.emit_int(id as i64, base_reg);
+                            program.emit_int(idx as i64, base_reg + 1);
+                            program.emit_string8(fk.parent_table.clone(), base_reg + 2);
+                            program.emit_string8(child_column.clone(), base_reg + 3);
+                            program.emit_string8(parent_column.to_string(), base_reg + 4);
+                            program.emit_string8(
+                                foreign_key_action_name(fk.on_update).to_string(),
+                                base_reg + 5,
+                            );
+                            program.emit_string8(
+                                foreign_key_action_name(fk.on_delete).to_string(),
+                                base_reg + 6,
+                            );
+                            program.emit_string8("NONE".to_string(), base_reg + 7);
+                            program.emit_result_row(base_reg, 8);
                         }
                     }
                 });
