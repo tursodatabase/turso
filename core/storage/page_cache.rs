@@ -718,6 +718,43 @@ impl PageCache {
         Ok(())
     }
 
+    /// Forcibly removes all pages from the cache with pgno greater than max_page_num,
+    /// clearing dirty/pinned state first. Intended for use after a savepoint rollback:
+    /// pages allocated within the savepoint no longer logically exist, so the cache
+    /// must drop its entry even if a transient holder (e.g. a `PinGuard` from a
+    /// balance context that was mid-flight when the rollback was triggered) would
+    /// otherwise block eviction. External holders of the page's `Arc` will see
+    /// `pin_count == 0` on subsequent `try_unpin` calls (which become no-ops).
+    /// Without this, a stale entry could survive truncation and trigger the
+    /// "different page with same key" assertion in `_insert` when the same page id
+    /// is later re-allocated.
+    ///
+    /// Safety: this relies on tursodb's single-writer invariant — `rollback_to_snapshot`
+    /// is only called by the connection's own write path, so no other thread is
+    /// concurrently `pin()`ing or otherwise touching these pages while we clear state.
+    pub fn force_truncate(&mut self, max_page_num: usize) -> Result<(), CacheError> {
+        for key in self
+            .map
+            .keys()
+            .filter(|k| k.0 > max_page_num)
+            .copied()
+            .collect::<Vec<_>>()
+        {
+            if let Some(&entry_ptr) = self.map.get(&key) {
+                let entry = unsafe { &*entry_ptr };
+                let page = &entry.page;
+                // Pages with pgno > db_size were allocated within the savepoint
+                // via `allocate_new_page`, which never issues disk I/O and thus
+                // never sets PAGE_LOCKED. We only need to clear dirty + pin so
+                // `_delete`'s safety checks pass.
+                page.clear_dirty();
+                page.get().pin_count.store(0, Ordering::SeqCst);
+            }
+            self._delete(key, true)?;
+        }
+        Ok(())
+    }
+
     /// Removes clean cached pages that were read from WAL frames newer than a
     /// rollback target. Dirty pages are preserved because they may contain
     /// restored transaction-local state that still needs to be committed or

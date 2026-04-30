@@ -350,3 +350,106 @@ test savepoint-rollback-to-temp-table-unreachable {
 expect error {
     no such table
 }
+
+# Regression: AUTOINCREMENT inserts inside a savepoint, rolled back, then
+# followed by more inserts must not leave a stale page-cache entry that the
+# next allocate_page would collide with (see issue #6354). The original
+# panic was "Attempted to insert different page with same key" in
+# core/storage/page_cache.rs after `cache.truncate(db_size)` failed to
+# evict pinned/dirty pages allocated within the savepoint.
+@cross-check-integrity
+test savepoint-rollback-autoinc-then-insert {
+    PRAGMA page_size = 512;
+    PRAGMA cache_size = 2;
+    PRAGMA cache_spill = ON;
+    CREATE TABLE t(
+        a INTEGER PRIMARY KEY AUTOINCREMENT,
+        g INT  NOT NULL DEFAULT 0,
+        v TEXT NOT NULL DEFAULT 'x'
+    );
+    CREATE INDEX t_g_v ON t(g, v);
+    INSERT INTO t(g, v)
+    SELECT value % 5, printf('%07d:', 0 + value) || hex(zeroblob(46))
+    FROM generate_series(1, 833);
+    SAVEPOINT s1;
+    INSERT INTO t(g, v)
+    SELECT value % 5, printf('%07d:', 833 + value) || hex(zeroblob(62))
+    FROM generate_series(1, 200);
+    ROLLBACK TO s1;
+    RELEASE s1;
+    INSERT INTO t(g, v)
+    SELECT value % 5, printf('%07d:', 1033 + value) || hex(zeroblob(70))
+    FROM generate_series(1, 92);
+    SELECT max(a), count(*) FROM t;
+}
+expect {
+    925|925
+}
+
+# Variant: nested savepoints with rollback at the inner level. Pages
+# allocated by the inner savepoint must be evicted from cache so the
+# outer savepoint can keep extending the table.
+@cross-check-integrity
+test savepoint-rollback-nested-inner-then-extend {
+    PRAGMA cache_size = 2;
+    PRAGMA cache_spill = ON;
+    CREATE TABLE t(id INTEGER PRIMARY KEY AUTOINCREMENT, v TEXT);
+    INSERT INTO t(v) SELECT hex(zeroblob(80)) FROM generate_series(1, 200);
+    SAVEPOINT outer_sp;
+    INSERT INTO t(v) SELECT hex(zeroblob(80)) FROM generate_series(1, 100);
+    SAVEPOINT inner_sp;
+    INSERT INTO t(v) SELECT hex(zeroblob(80)) FROM generate_series(1, 100);
+    ROLLBACK TO inner_sp;
+    RELEASE inner_sp;
+    INSERT INTO t(v) SELECT hex(zeroblob(80)) FROM generate_series(1, 50);
+    RELEASE outer_sp;
+    SELECT max(id), count(*) FROM t;
+}
+expect {
+    350|350
+}
+
+# Variant: multiple ROLLBACK TO/RELEASE cycles on the same savepoint
+# exercise the truncate path repeatedly.
+@cross-check-integrity
+test savepoint-rollback-repeated-cycles {
+    PRAGMA cache_size = 2;
+    PRAGMA cache_spill = ON;
+    CREATE TABLE t(id INTEGER PRIMARY KEY AUTOINCREMENT, v TEXT);
+    INSERT INTO t(v) SELECT hex(zeroblob(80)) FROM generate_series(1, 100);
+    SAVEPOINT s;
+    INSERT INTO t(v) SELECT hex(zeroblob(80)) FROM generate_series(1, 50);
+    ROLLBACK TO s;
+    INSERT INTO t(v) SELECT hex(zeroblob(80)) FROM generate_series(1, 50);
+    ROLLBACK TO s;
+    INSERT INTO t(v) SELECT hex(zeroblob(80)) FROM generate_series(1, 30);
+    RELEASE s;
+    SELECT max(id), count(*) FROM t;
+}
+expect {
+    130|130
+}
+
+# Variant: rollback an UPDATE that touched many pages (modifying existing
+# rows, not allocating new ones). The pre-savepoint images must be restored
+# from the subjournal without leaving a mismatched Arc<Page> in the cache.
+@cross-check-integrity
+test savepoint-rollback-update-then-reinsert {
+    PRAGMA cache_size = 2;
+    PRAGMA cache_spill = ON;
+    CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT);
+    INSERT INTO t(id, v)
+    SELECT value, hex(zeroblob(60)) FROM generate_series(1, 400);
+    SAVEPOINT s;
+    UPDATE t SET v = hex(zeroblob(120));
+    ROLLBACK TO s;
+    RELEASE s;
+    INSERT INTO t(id, v)
+    SELECT 400 + value, hex(zeroblob(60)) FROM generate_series(1, 50);
+    SELECT count(*) FROM t;
+    SELECT length(v) FROM t WHERE id = 1;
+}
+expect {
+    450
+    120
+}

@@ -2020,16 +2020,18 @@ impl Pager {
         // are never subjournaled (see subjournal_page_if_required), so the loop
         // above won't encounter them. We must clean them from dirty_pages before
         // truncating the cache, or phantom dirty entries survive into commit.
+        //
+        // We use `force_truncate` (rather than `truncate`) because pages
+        // allocated within the savepoint may still be pinned/locked by transient
+        // state (e.g. a balance context that was mid-flight). Those pages no
+        // longer logically exist after rollback, and a leftover cache entry
+        // would cause the next `allocate_page` to fire the "different page with
+        // same key" assertion when it inserts a fresh Arc<Page> for the
+        // re-used id.
         {
             let mut cache = self.page_cache.write();
-            for page_id in dirty_pages.iter().filter(|&id| id > db_size) {
-                if let Some(page) = cache.get(&PageCacheKey::new(page_id as usize))? {
-                    page.clear_dirty();
-                    page.try_unpin();
-                }
-            }
             dirty_pages.remove_range((db_size + 1)..);
-            cache.truncate(db_size as usize)?;
+            cache.force_truncate(db_size as usize)?;
         }
 
         if let Some(wal) = &self.wal {
