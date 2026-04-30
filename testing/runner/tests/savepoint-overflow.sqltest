@@ -1,0 +1,110 @@
+@database :memory:
+
+# Regression tests for https://github.com/tursodatabase/turso/issues/6349
+# Panic in btree overflow read after savepoint rollback.
+#
+# UPDATE/DELETE/DDL operations that touch rows with overflow payloads
+# followed by ROLLBACK TO SAVEPOINT must leave the database in a state where
+# subsequent queries traversing overflow chains succeed.
+
+@cross-check-integrity
+test savepoint-overflow-delete-rollback {
+    PRAGMA page_size = 1024;
+    CREATE TABLE t(a INTEGER PRIMARY KEY, k TEXT NOT NULL);
+    CREATE INDEX t_k ON t(k);
+    INSERT INTO t SELECT value, printf('%06d:%s', value, hex(zeroblob(8192)))
+        FROM generate_series(1, 60);
+    SAVEPOINT s1;
+    DELETE FROM t WHERE a BETWEEN 20 AND 40;
+    ROLLBACK TO s1;
+    RELEASE s1;
+    SELECT count(*) FROM t;
+    SELECT a FROM t INDEXED BY t_k WHERE a = 25;
+    SELECT length(k) FROM t WHERE a = 25;
+}
+expect {
+    60
+    25
+    16391
+}
+
+@cross-check-integrity
+test savepoint-overflow-alter-rollback {
+    PRAGMA page_size = 1024;
+    CREATE TABLE t(a INTEGER PRIMARY KEY, k TEXT NOT NULL);
+    CREATE INDEX t_k ON t(k);
+    INSERT INTO t SELECT value, printf('%06d:%s', value, hex(zeroblob(8192)))
+        FROM generate_series(1, 30);
+    SAVEPOINT s1;
+    ALTER TABLE t RENAME TO t_renamed;
+    ROLLBACK TO s1;
+    RELEASE s1;
+    SELECT count(*) FROM t;
+    SELECT length(k) FROM t WHERE a = 5;
+}
+expect {
+    30
+    16391
+}
+
+@cross-check-integrity
+test savepoint-overflow-update-rollback {
+    PRAGMA page_size = 1024;
+    CREATE TABLE t(a INTEGER PRIMARY KEY, k TEXT NOT NULL);
+    INSERT INTO t SELECT value, printf('%06d:%s', value, hex(zeroblob(2048)))
+        FROM generate_series(1, 40);
+    SAVEPOINT s1;
+    UPDATE t SET k = printf('%06d:%s', a, hex(zeroblob(4096))) WHERE a BETWEEN 10 AND 20;
+    ROLLBACK TO s1;
+    RELEASE s1;
+    SELECT a, length(k) FROM t WHERE a IN (5, 15, 25) ORDER BY a;
+}
+expect {
+    5|4103
+    15|4103
+    25|4103
+}
+
+@cross-check-integrity
+test savepoint-overflow-nested-rollback {
+    PRAGMA page_size = 1024;
+    CREATE TABLE t(a INTEGER PRIMARY KEY, k TEXT NOT NULL);
+    CREATE INDEX t_k ON t(k);
+    INSERT INTO t SELECT value, printf('%06d:%s', value, hex(zeroblob(8192)))
+        FROM generate_series(1, 20);
+    SAVEPOINT outer_sp;
+    DELETE FROM t WHERE a BETWEEN 5 AND 10;
+    SAVEPOINT inner_sp;
+    DELETE FROM t WHERE a BETWEEN 11 AND 15;
+    ROLLBACK TO inner_sp;
+    RELEASE inner_sp;
+    ROLLBACK TO outer_sp;
+    RELEASE outer_sp;
+    SELECT count(*) FROM t;
+    SELECT length(k) FROM t WHERE a = 7;
+    SELECT length(k) FROM t WHERE a = 13;
+}
+expect {
+    20
+    16391
+    16391
+}
+
+@cross-check-integrity
+test savepoint-overflow-rollback-then-reuse-cursor {
+    PRAGMA page_size = 1024;
+    CREATE TABLE t(a INTEGER PRIMARY KEY, k TEXT NOT NULL);
+    INSERT INTO t SELECT value, printf('%06d:%s', value, hex(zeroblob(8192)))
+        FROM generate_series(1, 20);
+    SAVEPOINT s1;
+    DELETE FROM t WHERE a BETWEEN 5 AND 15;
+    ROLLBACK TO s1;
+    RELEASE s1;
+    SELECT a, length(k) FROM t WHERE a IN (4, 8, 12, 16) ORDER BY a;
+}
+expect {
+    4|16391
+    8|16391
+    12|16391
+    16|16391
+}

@@ -324,6 +324,12 @@ struct ReadPayloadOverflow {
     next_page: u32,
     remaining_to_read: usize,
     page: PageRef,
+    /// Fingerprint of the initial call parameters. Used to detect stale state
+    /// being reused for a different cell's overflow read (e.g. when a previous
+    /// in-flight read was abandoned without going through a cursor reset).
+    initial_payload_size: u64,
+    initial_first_overflow_page: u32,
+    initial_local_payload_len: usize,
 }
 
 #[derive(Debug)]
@@ -970,6 +976,29 @@ impl BTreeCursor {
         start_next_page: u32,
         payload_size: u64,
     ) -> Result<IOResult<()>> {
+        // If state was left over from a previous traversal (e.g. an aborted
+        // read that did not go through a cursor reset), it can mismatch the
+        // current call's cell. Detect that and start fresh — otherwise the
+        // saved chain state would be silently reused for a different cell,
+        // which can underflow `remaining_to_read` or surface as a "Corrupt"
+        // error when the chains don't line up.
+        if let Some(state) = self.read_overflow_state.as_ref() {
+            if state.initial_payload_size != payload_size
+                || state.initial_first_overflow_page != start_next_page
+                || state.initial_local_payload_len != payload.len()
+            {
+                tracing::warn!(
+                    saved_payload_size = state.initial_payload_size,
+                    saved_first_overflow_page = state.initial_first_overflow_page,
+                    saved_local_payload_len = state.initial_local_payload_len,
+                    payload_size,
+                    start_next_page,
+                    local_payload_len = payload.len(),
+                    "discarding stale overflow read state"
+                );
+                self.read_overflow_state.take();
+            }
+        }
         loop {
             if self.read_overflow_state.is_none() {
                 let remaining_to_read =
@@ -986,6 +1015,9 @@ impl BTreeCursor {
                     next_page: start_next_page,
                     remaining_to_read,
                     page,
+                    initial_payload_size: payload_size,
+                    initial_first_overflow_page: start_next_page,
+                    initial_local_payload_len: payload.len(),
                 });
                 if let Some(c) = c {
                     io_yield_one!(c);
@@ -9797,6 +9829,74 @@ mod tests {
         .expect_err("inconsistent overflow chain should fail with Corrupt");
         assert!(matches!(err, LimboError::Corrupt(_)));
         assert!(cursor.read_overflow_state.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn test_process_overflow_read_resets_stale_state() -> Result<()> {
+        // Stale `read_overflow_state` left over from a previous (e.g. aborted)
+        // call must not be reused for a new cell. The fingerprint stored in the
+        // state should detect the parameter mismatch and start fresh.
+        let pager = setup_test_env(3);
+        let mut cursor = BTreeCursor::new_table(pager.clone(), 1, 5);
+
+        let usable_space = cursor.usable_space();
+
+        // Inject a stale state that pretends to be in the middle of reading a
+        // different cell with an unfinished chain.
+        let stale_page = {
+            let (page, c) = cursor.read_page(2)?;
+            if let Some(c) = c {
+                pager.io.wait_for_completion(c)?;
+            }
+            while page.is_locked() {
+                pager.io.step()?;
+            }
+            page
+        };
+        cursor.read_overflow_state = Some(ReadPayloadOverflow {
+            payload: vec![0xAA; 7],
+            next_page: 99,
+            remaining_to_read: 12345,
+            page: stale_page,
+            initial_payload_size: 9999,
+            initial_first_overflow_page: 99,
+            initial_local_payload_len: 7,
+        });
+
+        // Set up the page that the new call will actually traverse: a single
+        // overflow page with `next == 0` and matching payload size.
+        let (real_page, c) = cursor.read_page(2)?;
+        if let Some(c) = c {
+            pager.io.wait_for_completion(c)?;
+        }
+        while real_page.is_locked() {
+            pager.io.step()?;
+        }
+        let contents = real_page.get_contents();
+        contents.write_u32_no_offset(0, 0);
+        contents.as_ptr()[4..].fill(b'Z');
+
+        let local_payload: &'static [u8] = Box::leak(vec![b'Y'; 16].into_boxed_slice());
+        // payload_size = local + exactly one overflow page worth of bytes.
+        let payload_size = local_payload.len() as u64 + (usable_space - 4) as u64;
+        let cursor_pager = cursor.pager.clone();
+
+        run_until_done(
+            || cursor.process_overflow_read(local_payload, 2, payload_size),
+            &cursor_pager,
+        )
+        .expect("overflow read should succeed once stale state is discarded");
+
+        assert!(cursor.read_overflow_state.is_none());
+        let record = cursor
+            .reusable_immutable_record
+            .as_ref()
+            .expect("immutable record should be populated");
+        let serialized = record.get_payload();
+        assert_eq!(serialized.len(), payload_size as usize);
+        assert!(serialized.starts_with(local_payload));
+        assert!(serialized[local_payload.len()..].iter().all(|&b| b == b'Z'));
         Ok(())
     }
 
