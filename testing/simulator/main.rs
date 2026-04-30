@@ -530,6 +530,8 @@ fn run_simulation_default(
     if result.error.is_none() {
         if env.opts.disable_integrity_check {
             tracing::info!("skipping integrity check (disabled by configuration)");
+        } else if env.profile.mvcc {
+            tracing::info!("skipping integrity check (not supported under MVCC)");
         } else {
             let ic = integrity_check(&env.get_db_path());
             if let Err(err) = ic {
