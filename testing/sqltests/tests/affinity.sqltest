@@ -550,3 +550,13 @@ expect {
     2251799813685247|integer
     2.25179981368525e+15|real
 }
+expect @js {
+    3|integer
+    3.5|real
+    10000000000|integer
+    1e-10|real
+    0|integer
+    1e+100|real
+    2251799813685247|integer
+    2251799813685248|real
+}
