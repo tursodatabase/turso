@@ -110,6 +110,65 @@ fn test_savepoint_rollback_after_cache_spill_preserves_wal_pages(
     Ok(())
 }
 
+/// Regression for issue #6350: ROLLBACK TO a savepoint with `cache_size=1`
+/// and `cache_spill=ON` used to fail with "Failed to insert loaded page X
+/// into cache: Full" because the rollback path always re-inserted a fresh
+/// dirty Page entry per subjournaled page, which exhausts the tiny cache.
+///
+/// The pre-fix behavior errored out before the rollback completed, leaving
+/// the savepoint stack in an inconsistent state ("no such savepoint: s1"
+/// on the subsequent RELEASE). With the cache-aware restoration, pages
+/// that were clean at subjournal time get their cached buffer overwritten
+/// in place — no fresh dirty entry — so the rollback succeeds.
+#[allow(clippy::arc_with_non_send_sync)]
+#[turso_macros::test]
+fn test_savepoint_rollback_tiny_cache_with_two_indexes_6350(tmp_db: TempDatabase) -> Result<()> {
+    maybe_setup_tracing();
+    let conn = tmp_db.connect_limbo();
+
+    conn.execute("PRAGMA page_size=512;")?;
+    conn.execute("PRAGMA journal_mode=WAL;")?;
+    conn.execute("PRAGMA cache_size=1;")?;
+    conn.execute("PRAGMA cache_spill=ON;")?;
+
+    conn.execute(
+        "CREATE TABLE t(\
+            a INTEGER PRIMARY KEY,\
+            k1 TEXT NOT NULL,\
+            k2 TEXT NOT NULL,\
+            v  TEXT NOT NULL\
+        );",
+    )?;
+    conn.execute("CREATE INDEX t_k12  ON t(k1, k2);")?;
+    conn.execute("CREATE INDEX t_v_k1 ON t(v, k1);")?;
+    conn.execute(
+        "INSERT INTO t \
+         SELECT value, \
+                printf('g%03d', value % 6), \
+                printf('%06d:%s', value, hex(randomblob(112))), \
+                printf('%06d:%s', value, hex(randomblob(48))) \
+         FROM generate_series(1, 560);",
+    )?;
+
+    conn.execute("SAVEPOINT s1;")?;
+    conn.execute(
+        "UPDATE t INDEXED BY t_k12 \
+         SET k2 = printf('%06d:%s', a, hex(randomblob(160))) \
+         WHERE a BETWEEN 100 AND 190;",
+    )?;
+    // Pre-fix this errored with "Failed to insert loaded page X into cache: Full".
+    conn.execute("ROLLBACK TO s1;")?;
+    // Pre-fix this errored with "no such savepoint: s1" because the previous
+    // rollback failed and left the stack inconsistent.
+    conn.execute("RELEASE s1;")?;
+
+    // Row count must remain at the pre-savepoint value.
+    let res = execute_and_get_strings(&conn, "SELECT count(*) FROM t;")?;
+    assert_eq!(res, vec!["560"]);
+
+    Ok(())
+}
+
 #[test]
 #[ignore = "ignored for now because it's flaky"]
 fn test_wal_1_writer_1_reader() -> Result<()> {

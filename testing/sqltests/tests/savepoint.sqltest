@@ -350,3 +350,104 @@ test savepoint-rollback-to-temp-table-unreachable {
 expect error {
     no such table
 }
+
+# Regression for #6350: ROLLBACK TO with cache_size=1 + cache_spill used to
+# fail with "Failed to insert loaded page X into cache: Full" because the
+# rollback path always re-inserted a fresh dirty Page entry per subjournaled
+# page, exhausting the tiny cache. With the cache-aware restoration, pages
+# that were clean at subjournal time get their existing cache buffer
+# overwritten in place (no fresh dirty entry), so rollback succeeds and
+# subsequent reads return the pre-savepoint state.
+#
+# This reproduces the cache-full failure mode with two secondary indexes
+# (matching the issue's reproducer) and a small-but-not-tiny cache that
+# forces continuous spilling during the UPDATE.
+@cross-check-integrity
+test savepoint-rollback-tiny-cache-two-indexes-6350 {
+    PRAGMA page_size = 512;
+    PRAGMA cache_size = 1;
+    PRAGMA cache_spill = ON;
+    CREATE TABLE t(a INTEGER PRIMARY KEY, k1 TEXT NOT NULL, k2 TEXT NOT NULL, v TEXT NOT NULL);
+    CREATE INDEX t_k12 ON t(k1, k2);
+    CREATE INDEX t_v_k1 ON t(v, k1);
+    INSERT INTO t
+    SELECT value,
+           printf('g%03d', value % 6),
+           printf('row%06d-payload-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA', value),
+           printf('vvv-row%06d', value)
+    FROM generate_series(1, 200);
+    SAVEPOINT s1;
+    UPDATE t INDEXED BY t_k12
+    SET k2 = printf('NEW%06d-payload-BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB', a)
+    WHERE a BETWEEN 50 AND 100;
+    ROLLBACK TO s1;
+    RELEASE s1;
+    SELECT a, k2 FROM t WHERE a IN (40, 75, 150) ORDER BY a;
+}
+expect {
+    40|row000040-payload-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+    75|row000075-payload-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+    150|row000150-payload-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+}
+
+# Regression for #6350: index lookups after the rollback must return the
+# pre-savepoint values. The pre-fix rollback errored out and left the
+# savepoint stack inconsistent.
+@cross-check-integrity
+test savepoint-rollback-tiny-cache-index-lookup-6350 {
+    PRAGMA page_size = 512;
+    PRAGMA cache_size = 1;
+    PRAGMA cache_spill = ON;
+    CREATE TABLE t(a INTEGER PRIMARY KEY, k1 TEXT NOT NULL, k2 TEXT NOT NULL, v TEXT NOT NULL);
+    CREATE INDEX t_k12 ON t(k1, k2);
+    CREATE INDEX t_v_k1 ON t(v, k1);
+    INSERT INTO t
+    SELECT value,
+           printf('g%03d', value % 6),
+           printf('row%06d-payload-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA', value),
+           printf('vvv-row%06d', value)
+    FROM generate_series(1, 200);
+    SAVEPOINT s1;
+    UPDATE t INDEXED BY t_k12
+    SET k2 = printf('NEW%06d-payload-BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB', a)
+    WHERE a BETWEEN 50 AND 100;
+    ROLLBACK TO s1;
+    RELEASE s1;
+    SELECT a FROM t INDEXED BY t_k12 WHERE k1 = 'g001' ORDER BY a LIMIT 5;
+}
+expect {
+    1
+    7
+    13
+    19
+    25
+}
+
+# Regression for #6350: nested savepoint with cache spilling. Inner rollback
+# must not corrupt outer-savepoint state.
+@cross-check-integrity
+test savepoint-rollback-nested-tiny-cache-6350 {
+    PRAGMA page_size = 512;
+    PRAGMA cache_size = 2;
+    PRAGMA cache_spill = ON;
+    CREATE TABLE t(a INTEGER PRIMARY KEY, k TEXT NOT NULL);
+    CREATE INDEX t_k ON t(k);
+    INSERT INTO t
+    SELECT value, printf('row%06d-payload-CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC', value)
+    FROM generate_series(1, 200);
+    SAVEPOINT outer_sp;
+    UPDATE t SET k = printf('outer%06d-payload-DDDDDDDDDDDDDDDDDDDDDDDDDDDDDD', a)
+    WHERE a BETWEEN 30 AND 60;
+    SAVEPOINT inner_sp;
+    UPDATE t SET k = printf('inner%06d-payload-EEEEEEEEEEEEEEEEEEEEEEEEEEEEEE', a)
+    WHERE a BETWEEN 50 AND 80;
+    ROLLBACK TO inner_sp;
+    RELEASE inner_sp;
+    SELECT a, k FROM t WHERE a IN (45, 55, 75, 150) ORDER BY a;
+}
+expect {
+    45|outer000045-payload-DDDDDDDDDDDDDDDDDDDDDDDDDDDDDD
+    55|outer000055-payload-DDDDDDDDDDDDDDDDDDDDDDDDDDDDDD
+    75|row000075-payload-CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC
+    150|row000150-payload-CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC
+}
