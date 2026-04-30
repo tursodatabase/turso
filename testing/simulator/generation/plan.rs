@@ -206,17 +206,29 @@ impl<'a, R: rand::Rng> PlanGenerator<'a, R> {
 
                     let query_gen = property.get_extensional_query_gen_function();
 
-                    let mut count = 0;
-                    let new_query = loop {
-                        if count > 1_000_000 {
+                    let new_query = 'retries: {
+                        for _ in 0..if env.profile.mvcc {1_000} else {1_000_000} {
+                            if let Some(query) =
+                                query_gen(self.rng, &conn_ctx, &query_distr, property)
+                            {
+                                break 'retries query;
+                            }
+                        }
+                        break 'retries if env.profile.mvcc {
+                            // Under MVCC the property's required table can be absent from this
+                            // connection's snapshot in the shadow model, due to difficulties in
+                            // keeping track of concurrent connections.
+                            // Fall back to an innocuous SELECT TRUE.
+                            let property_name: &'static str = property.into();
+                            tracing::info!(
+                                property = property_name,
+                                connection_index = interaction.connection_index,
+                                "extensional query generation exhausted max attempts; falling back to SELECT TRUE"
+                            );
+                            Query::Select(Select::expr(Predicate::true_()))
+                        } else {
                             panic!("possible infinite loop in query generation");
-                        }
-                        if let Some(new_query) =
-                            (query_gen)(self.rng, &conn_ctx, &query_distr, property)
-                        {
-                            break new_query;
-                        }
-                        count += 1;
+                        };
                     };
 
                     InteractionBuilder::from_interaction(&interaction)
