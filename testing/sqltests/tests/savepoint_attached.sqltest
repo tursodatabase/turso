@@ -1,0 +1,200 @@
+@database :memory:
+@skip-file-if mvcc "attach is not supported for mvcc"
+
+# Regression tests for issue #6270: ROLLBACK TO savepoint did not undo changes
+# on attached databases, and RELEASE of the root savepoint failed when the
+# resulting commit yielded IO while flushing dirty pages on attached pagers.
+
+@cross-check-integrity
+test savepoint-attached-rollback-undoes-insert {
+    ATTACH ':memory:' AS aux;
+    CREATE TABLE aux.t1 (id INTEGER PRIMARY KEY, name TEXT);
+    SAVEPOINT sp1;
+    INSERT INTO aux.t1 VALUES (1, 'a');
+    SAVEPOINT sp2;
+    INSERT INTO aux.t1 VALUES (2, 'b');
+    ROLLBACK TO sp2;
+    INSERT INTO aux.t1 VALUES (3, 'c');
+    RELEASE sp1;
+    SELECT * FROM aux.t1 ORDER BY id;
+}
+expect {
+    1|a
+    3|c
+}
+
+@cross-check-integrity
+test savepoint-attached-rollback-undoes-delete {
+    ATTACH ':memory:' AS aux;
+    CREATE TABLE aux.t1 (id INTEGER PRIMARY KEY, name TEXT);
+    INSERT INTO aux.t1 VALUES (1, 'a'), (2, 'b'), (3, 'c');
+    SAVEPOINT sp1;
+    DELETE FROM aux.t1 WHERE id = 2;
+    ROLLBACK TO sp1;
+    RELEASE sp1;
+    SELECT * FROM aux.t1 ORDER BY id;
+}
+expect {
+    1|a
+    2|b
+    3|c
+}
+
+@cross-check-integrity
+test savepoint-attached-rollback-undoes-update {
+    ATTACH ':memory:' AS aux;
+    CREATE TABLE aux.t1 (id INTEGER PRIMARY KEY, name TEXT);
+    INSERT INTO aux.t1 VALUES (1, 'a'), (2, 'b'), (3, 'c');
+    SAVEPOINT sp1;
+    UPDATE aux.t1 SET name = 'X' WHERE id = 2;
+    ROLLBACK TO sp1;
+    RELEASE sp1;
+    SELECT * FROM aux.t1 ORDER BY id;
+}
+expect {
+    1|a
+    2|b
+    3|c
+}
+
+# Savepoint opened BEFORE any access on the attached pager. After DDL+DML on
+# aux, ROLLBACK TO must undo both, and RELEASE of the root must commit cleanly
+# (this case previously failed with "no such savepoint" because the root
+# RELEASE issued an AutoCommit that yielded IO on the attached pager flush
+# and the runtime re-entered the Savepoint instruction with the savepoint
+# stack already drained).
+@cross-check-integrity
+test savepoint-attached-release-root-after-ddl {
+    ATTACH ':memory:' AS aux;
+    SAVEPOINT sp1;
+    CREATE TABLE aux.t1 (id INTEGER PRIMARY KEY, name TEXT);
+    INSERT INTO aux.t1 VALUES (1, 'a');
+    ROLLBACK TO sp1;
+    RELEASE sp1;
+    SELECT count(*) FROM aux.sqlite_schema WHERE type = 'table' AND name = 't1';
+}
+expect {
+    0
+}
+
+@cross-check-integrity
+test savepoint-attached-release-root-with-changes {
+    ATTACH ':memory:' AS aux;
+    CREATE TABLE aux.t1 (id INTEGER PRIMARY KEY, name TEXT);
+    INSERT INTO aux.t1 VALUES (1, 'a');
+    SAVEPOINT sp1;
+    INSERT INTO aux.t1 VALUES (2, 'b');
+    INSERT INTO aux.t1 VALUES (3, 'c');
+    DELETE FROM aux.t1 WHERE id = 1;
+    RELEASE sp1;
+    SELECT * FROM aux.t1 ORDER BY id;
+}
+expect {
+    2|b
+    3|c
+}
+
+@cross-check-integrity
+test savepoint-attached-mixed-main-and-aux {
+    CREATE TABLE main_t (id INTEGER PRIMARY KEY, name TEXT);
+    ATTACH ':memory:' AS aux;
+    CREATE TABLE aux.aux_t (id INTEGER PRIMARY KEY, name TEXT);
+    SAVEPOINT sp1;
+    INSERT INTO main_t VALUES (1, 'main1');
+    INSERT INTO aux.aux_t VALUES (10, 'aux1');
+    SAVEPOINT sp2;
+    INSERT INTO main_t VALUES (2, 'main2');
+    INSERT INTO aux.aux_t VALUES (20, 'aux2');
+    ROLLBACK TO sp2;
+    INSERT INTO main_t VALUES (3, 'main3');
+    INSERT INTO aux.aux_t VALUES (30, 'aux3');
+    RELEASE sp1;
+    SELECT 'main' as src, id, name FROM main_t UNION ALL SELECT 'aux', id, name FROM aux.aux_t ORDER BY id;
+}
+expect {
+    main|1|main1
+    main|3|main3
+    aux|10|aux1
+    aux|30|aux3
+}
+
+@cross-check-integrity
+test savepoint-attached-multiple-aux-dbs {
+    ATTACH ':memory:' AS aux1;
+    ATTACH ':memory:' AS aux2;
+    CREATE TABLE aux1.t (x INTEGER);
+    CREATE TABLE aux2.t (x INTEGER);
+    SAVEPOINT sp1;
+    INSERT INTO aux1.t VALUES (1);
+    INSERT INTO aux2.t VALUES (10);
+    ROLLBACK TO sp1;
+    INSERT INTO aux1.t VALUES (2);
+    INSERT INTO aux2.t VALUES (20);
+    RELEASE sp1;
+    SELECT 'a1' as src, x FROM aux1.t UNION ALL SELECT 'a2', x FROM aux2.t ORDER BY x;
+}
+expect {
+    a1|2
+    a2|20
+}
+
+@cross-check-integrity
+test savepoint-attached-rollback-to-can-be-repeated {
+    ATTACH ':memory:' AS aux;
+    CREATE TABLE aux.t (id INTEGER PRIMARY KEY, v INTEGER);
+    SAVEPOINT sp;
+    INSERT INTO aux.t VALUES (1, 100);
+    ROLLBACK TO sp;
+    INSERT INTO aux.t VALUES (2, 200);
+    ROLLBACK TO sp;
+    INSERT INTO aux.t VALUES (3, 300);
+    RELEASE sp;
+    SELECT * FROM aux.t;
+}
+expect {
+    3|300
+}
+
+@cross-check-integrity
+test savepoint-attached-inside-explicit-begin {
+    ATTACH ':memory:' AS aux;
+    CREATE TABLE aux.t (id INTEGER PRIMARY KEY, name TEXT);
+    INSERT INTO aux.t VALUES (1, 'keep');
+    BEGIN;
+    SAVEPOINT sp1;
+    INSERT INTO aux.t VALUES (2, 'rollback_me');
+    ROLLBACK TO sp1;
+    INSERT INTO aux.t VALUES (3, 'keep2');
+    RELEASE sp1;
+    COMMIT;
+    SELECT * FROM aux.t ORDER BY id;
+}
+expect {
+    1|keep
+    3|keep2
+}
+
+# Indexed table on attached DB: rollback must restore both table and index
+# pages so subsequent index lookups are consistent.
+@cross-check-integrity
+test savepoint-attached-rollback-with-index {
+    ATTACH ':memory:' AS aux;
+    CREATE TABLE aux.t (id INTEGER PRIMARY KEY, name TEXT);
+    CREATE INDEX aux.t_name ON t(name);
+    INSERT INTO aux.t VALUES (1, 'a'), (2, 'b'), (3, 'c');
+    SAVEPOINT sp1;
+    INSERT INTO aux.t VALUES (4, 'd'), (5, 'e');
+    DELETE FROM aux.t WHERE id IN (1, 2);
+    UPDATE aux.t SET name = 'X' WHERE id = 3;
+    ROLLBACK TO sp1;
+    RELEASE sp1;
+    SELECT * FROM aux.t ORDER BY id;
+    SELECT id FROM aux.t WHERE name = 'a';
+    SELECT id FROM aux.t WHERE name = 'd';
+}
+expect {
+    1|a
+    2|b
+    3|c
+    1
+}

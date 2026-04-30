@@ -4058,6 +4058,19 @@ pub fn op_savepoint(
             })
         }
         SavepointOp::Release => {
+            // RELEASE of the root savepoint commits the transaction. That commit
+            // can yield IO (e.g., flushing dirty pages on attached pagers), in
+            // which case op_auto_commit returns IO and the runtime re-enters
+            // this Savepoint instruction. On re-entry the savepoint stack has
+            // already been mutated, so we must skip the release work and just
+            // resume the in-flight commit.
+            if !matches!(state.commit_state, CommitState::Ready) {
+                let auto_commit = Insn::AutoCommit {
+                    auto_commit: true,
+                    rollback: false,
+                };
+                return op_auto_commit(program, state, &auto_commit, pager);
+            }
             let release_result = if let Some(mv_store) = mv_store.as_ref() {
                 match conn.get_mv_tx_id() {
                     Some(tx_id) => mv_store.release_named_savepoint(tx_id, name)?,
