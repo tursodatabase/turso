@@ -680,6 +680,22 @@ pub fn find_best_access_method_for_join_order(
             base_row_count,
             params,
         ),
+        Table::RecursiveCte(_) => Ok(Some(AccessMethod {
+            cost: estimate_cost_for_scan_or_seek(
+                None,
+                &[],
+                &[],
+                input_cardinality,
+                base_row_count,
+                false,
+                params,
+                None,
+            ),
+            estimated_rows_per_outer_row: 1.0,
+            residual_constraints: ResidualConstraintMode::None,
+            consumed_where_terms: SmallVec::new(),
+            params: AccessMethodParams::Subquery { iter_dir: IterationDirection::Forwards },
+        })),
     }
 }
 
