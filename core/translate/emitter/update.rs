@@ -2077,50 +2077,51 @@ fn emit_update_insns<'a>(
     // PK REPLACE: when the new rowid conflicts with an existing row, delete it.
     // Runs AFTER Phase 1 (all index constraint checks) so that non-REPLACE index
     // constraints fire before this deletion, matching SQLite's ordering.
-    if target_table.table.btree().is_some() {
-        if updates_rowid && matches!(effective_rowid_alias_conflict, ResolveType::Replace) {
-            let target_reg = rowid_set_clause_reg.expect("rowid_set_clause_reg must be set");
-            let no_rowid_conflict_label = program.allocate_label();
-            let row_not_found_label = check_rowid_not_exists_label
-                .expect("check_rowid_not_exists_label must be set when rowid is updated");
+    if target_table.table.btree().is_some()
+        && updates_rowid
+        && matches!(effective_rowid_alias_conflict, ResolveType::Replace)
+    {
+        let target_reg = rowid_set_clause_reg.expect("rowid_set_clause_reg must be set");
+        let no_rowid_conflict_label = program.allocate_label();
+        let row_not_found_label = check_rowid_not_exists_label
+            .expect("check_rowid_not_exists_label must be set when rowid is updated");
 
-            // If the new rowid equals the old rowid, no conflict.
-            program.emit_insn(Insn::Eq {
-                lhs: target_reg,
-                rhs: beg,
-                target_pc: no_rowid_conflict_label,
-                flags: CmpInsFlags::default(),
-                collation: program.curr_collation(),
-            });
+        // If the new rowid equals the old rowid, no conflict.
+        program.emit_insn(Insn::Eq {
+            lhs: target_reg,
+            rhs: beg,
+            target_pc: no_rowid_conflict_label,
+            flags: CmpInsFlags::default(),
+            collation: program.curr_collation(),
+        });
 
-            // If a row with the new rowid doesn't exist, no conflict.
-            program.emit_insn(Insn::NotExists {
-                cursor: target_table_cursor_id,
-                rowid_reg: target_reg,
-                target_pc: no_rowid_conflict_label,
-            });
+        // If a row with the new rowid doesn't exist, no conflict.
+        program.emit_insn(Insn::NotExists {
+            cursor: target_table_cursor_id,
+            rowid_reg: target_reg,
+            target_pc: no_rowid_conflict_label,
+        });
 
-            emit_replace_delete(
-                program,
-                connection,
-                table_references,
-                &target_table,
-                target_table_cursor_id,
-                all_index_cursors,
-                target_reg,
-                Some((start, effective_rowid_reg)),
-                update_database_id,
-                t_ctx,
-            )?;
+        emit_replace_delete(
+            program,
+            connection,
+            table_references,
+            &target_table,
+            target_table_cursor_id,
+            all_index_cursors,
+            target_reg,
+            Some((start, effective_rowid_reg)),
+            update_database_id,
+            t_ctx,
+        )?;
 
-            // Re-seek to the row under update so Phase 2's old-image reads are correct.
-            program.preassign_label_to_next_insn(no_rowid_conflict_label);
-            program.emit_insn(Insn::NotExists {
-                cursor: target_table_cursor_id,
-                rowid_reg: beg,
-                target_pc: row_not_found_label,
-            });
-        }
+        // Re-seek to the row under update so Phase 2's old-image reads are correct.
+        program.preassign_label_to_next_insn(no_rowid_conflict_label);
+        program.emit_insn(Insn::NotExists {
+            cursor: target_table_cursor_id,
+            rowid_reg: beg,
+            target_pc: row_not_found_label,
+        });
     }
 
     // ---- Phase 2: Delete old index entries ----

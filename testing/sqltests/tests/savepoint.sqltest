@@ -350,3 +350,85 @@ test savepoint-rollback-to-temp-table-unreachable {
 expect error {
     no such table
 }
+
+# Regression for #6355: a savepoint UPDATE that grew overflow chains, with a
+# small page cache and cache_spill enabled, used to leave stale interior
+# pages cached after ROLLBACK TO so the next seek hit a debug_assert that
+# the page must be TableInterior. The seek below crashed pre-fix.
+@cross-check-integrity
+test savepoint-rollback-after-overflow-update-small-cache-6355 {
+    PRAGMA page_size = 512;
+    PRAGMA cache_size = 4;
+    PRAGMA cache_spill = ON;
+    CREATE TABLE t(a INTEGER PRIMARY KEY, k TEXT NOT NULL, v TEXT NOT NULL);
+    CREATE INDEX t_k ON t(k);
+    INSERT INTO t
+    SELECT value,
+           printf('%06d:%s', value, hex(randomblob(9216))),
+           printf('%06d:%s', value, hex(randomblob(17408)))
+    FROM generate_series(1, 184);
+    SAVEPOINT s1;
+    UPDATE t SET v = printf('%06d:%s', a, hex(randomblob(20480)))
+    WHERE a BETWEEN 38 AND 126;
+    ROLLBACK TO s1;
+    RELEASE s1;
+    SELECT length(v) FROM t WHERE a <= 154 ORDER BY a DESC LIMIT 10;
+}
+expect {
+    34823
+    34823
+    34823
+    34823
+    34823
+    34823
+    34823
+    34823
+    34823
+    34823
+}
+
+# Smaller variant of the same scenario: the rollback restoration path
+# needs to be cache-aware even when the subjournal holds many pages.
+@cross-check-integrity
+test savepoint-rollback-after-overflow-update-many-rows {
+    PRAGMA page_size = 512;
+    PRAGMA cache_size = 8;
+    PRAGMA cache_spill = ON;
+    CREATE TABLE t(a INTEGER PRIMARY KEY, v TEXT NOT NULL);
+    INSERT INTO t
+    SELECT value, printf('%06d:%s', value, hex(randomblob(2048)))
+    FROM generate_series(1, 60);
+    SAVEPOINT s1;
+    UPDATE t SET v = printf('%06d:%s', a, hex(randomblob(4096))) WHERE a <= 40;
+    ROLLBACK TO s1;
+    RELEASE s1;
+    SELECT a, length(v) FROM t WHERE a IN (1, 30, 60) ORDER BY a;
+}
+expect {
+    1|4103
+    30|4103
+    60|4103
+}
+
+# After a rollback that exercises the cache-aware restoration path, the
+# table must remain readable for an aggregate over the full range. This
+# would also panic pre-fix because the b-tree traversal followed stale
+# page refs left over from the UPDATE.
+@cross-check-integrity
+test savepoint-rollback-full-table-scan-after-overflow-update {
+    PRAGMA page_size = 512;
+    PRAGMA cache_size = 4;
+    PRAGMA cache_spill = ON;
+    CREATE TABLE t(a INTEGER PRIMARY KEY, v TEXT NOT NULL);
+    INSERT INTO t
+    SELECT value, printf('%06d:%s', value, hex(randomblob(4096)))
+    FROM generate_series(1, 80);
+    SAVEPOINT s1;
+    UPDATE t SET v = printf('%06d:%s', a, hex(randomblob(8192))) WHERE a <= 40;
+    ROLLBACK TO s1;
+    RELEASE s1;
+    SELECT count(*), sum(length(v)) FROM t;
+}
+expect {
+    80|655920
+}
