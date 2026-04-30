@@ -216,6 +216,10 @@ pub fn pragma_for(pragma: &PragmaName) -> Pragma {
             PragmaFlags::Result0,
             &["type", "parent", "encode", "decode", "default", "operators"],
         ),
+        VdbeTrace => Pragma::new(
+            PragmaFlags::NoColumns1 | PragmaFlags::Result0,
+            &["vbde_trace"],
+        ),
     }
 }
 

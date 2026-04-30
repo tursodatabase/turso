@@ -752,6 +752,12 @@ fn update_pragma(
             connection.set_temp_store(temp_store);
             Ok(TransactionMode::None)
         }
+        PragmaName::VdbeTrace => {
+            let enabled = parse_pragma_enabled(&value);
+            connection.set_vdbe_trace(enabled);
+            Ok(TransactionMode::None)
+        }
+
         PragmaName::FunctionList => query_pragma(
             PragmaName::FunctionList,
             resolver,
@@ -1450,6 +1456,14 @@ fn query_pragma(
             program.emit_result_row(register, 1);
             program.add_pragma_result_column(pragma.to_string());
 
+            Ok(TransactionMode::None)
+        }
+        PragmaName::VdbeTrace => {
+            let register = program.alloc_register();
+            let is_enabled = connection.get_vdbe_trace();
+            program.emit_int(is_enabled as i64, register);
+            program.emit_result_row(register, 1);
+            program.add_pragma_result_column(pragma.to_string());
             Ok(TransactionMode::None)
         }
         PragmaName::FreelistCount => {

@@ -196,6 +196,7 @@ pub struct Connection {
     /// Attached databases
     pub(super) attached_databases: RwLock<DatabaseCatalog>,
     pub(super) query_only: AtomicBool,
+    pub(super) vdbe_trace: AtomicBool,
     /// If enabled, the UPDATE/DELETE statements must have a WHERE clause
     pub(super) dml_require_where: AtomicBool,
     /// SQLite DQS misfeature: when ON (default), unresolved double-quoted identifiers
@@ -2761,6 +2762,14 @@ impl Connection {
     pub fn set_query_only(&self, value: bool) {
         self.query_only.store(value, Ordering::SeqCst);
         self.bump_prepare_context_generation();
+    }
+
+    pub fn set_vdbe_trace(&self, value: bool) {
+        self.vdbe_trace.store(value, Ordering::SeqCst);
+    }
+
+    pub fn get_vdbe_trace(&self) -> bool {
+        self.vdbe_trace.load(Ordering::SeqCst)
     }
 
     pub fn get_dml_require_where(&self) -> bool {

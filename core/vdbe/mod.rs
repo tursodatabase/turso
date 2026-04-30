@@ -1534,7 +1534,8 @@ impl Program {
         pager: &Arc<Pager>,
         waker: Option<&Waker>,
     ) -> Result<StepResult> {
-        let enable_tracing = tracing::enabled!(tracing::Level::TRACE);
+        let enable_tracing =
+            tracing::enabled!(tracing::Level::TRACE) || self.connection.get_vdbe_trace();
         loop {
             if self.connection.is_closed() {
                 // Connection is closed for whatever reason, rollback the transaction.
@@ -1583,7 +1584,28 @@ impl Program {
             let (insn, _) = &self.insns[state.pc as usize];
             let insn_function = insn.to_function();
             if enable_tracing {
-                trace_insn(self, state.pc as InsnReference, insn);
+                if self.connection.get_vdbe_trace() {
+                    if matches!(insn, Insn::Init { .. }) {
+                        println!("VDBE Trace:");
+                    }
+
+                    println!(
+                        "{}",
+                        explain::insn_to_str(
+                            self,
+                            state.pc as InsnReference,
+                            insn,
+                            String::new(),
+                            self.comments
+                                .iter()
+                                .find(|(offset, _)| *offset == state.pc as InsnReference)
+                                .map(|(_, comment)| comment)
+                                .copied()
+                        )
+                    );
+                } else {
+                    trace_insn(self, state.pc as InsnReference, insn);
+                }
                 crate::stack::trace_remaining("program_step:opcode");
             }
             // Always increment VM steps for every loop iteration
