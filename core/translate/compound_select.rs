@@ -164,10 +164,11 @@ pub fn emit_program_for_compound_select(
 
     emit_explain!(program, true, "COMPOUND QUERY".to_owned());
 
-    // This is inefficient, but emit_compound_select() takes ownership of 'plan' and we
-    // must set the result columns to the leftmost subselect's result columns to be compatible
-    // with SQLite.
-    program.result_columns.clone_from(&left[0].0.result_columns);
+    // The compound query's result columns are the leftmost subselect's result columns
+    // (per SQLite semantics). Save them so we can install them on `program` after
+    // `emit_compound_select` finishes — emission of nested subqueries (e.g. IN-subqueries)
+    // calls `emit_program_for_select`, which clobbers `program.result_columns`.
+    let leftmost_result_columns = left[0].0.result_columns.clone();
 
     // These must also be set because we make the decision to start a transaction based on whether
     // any tables are actually touched by the query. Previously this only used the rightmost subselect's
@@ -199,6 +200,13 @@ pub fn emit_program_for_compound_select(
         )
     })?;
     program.pop_current_parent_explain();
+
+    // Install the compound query's result columns. Emission of nested subqueries above may
+    // have overwritten `program.result_columns` (each `emit_program_for_select` call sets
+    // it to the inner plan's result columns). Restore to the leftmost subselect's columns
+    // so `column_count`/column metadata reflect the compound query, and so that the
+    // ORDER BY emitter below sees the correct columns.
+    program.result_columns = leftmost_result_columns;
 
     // When ORDER BY is present, sort the collected results and emit to the real destination.
     if let (Some(order_by), Some(collection_cursor_id), Some(collection_idx)) =
