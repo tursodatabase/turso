@@ -1316,7 +1316,7 @@ impl SimulatorEnv {
     pub fn connection_context(&self, conn_index: usize) -> impl GenerationContext {
         struct ConnectionGenContext<'a> {
             tables: &'a Vec<sql_generation::model::table::Table>,
-            opts: &'a sql_generation::generation::Opts,
+            opts: sql_generation::generation::Opts,
         }
 
         impl<'a> GenerationContext for ConnectionGenContext<'a> {
@@ -1325,16 +1325,16 @@ impl SimulatorEnv {
             }
 
             fn opts(&self) -> &sql_generation::generation::Opts {
-                self.opts
+                &self.opts
             }
         }
 
         let tables = self.get_conn_tables(conn_index).tables();
 
-        ConnectionGenContext {
-            opts: &self.profile.query.gen_opts,
-            tables,
-        }
+        let mut opts = self.profile.query.gen_opts.clone();
+        opts.mvcc = self.profile.mvcc;
+
+        ConnectionGenContext { opts, tables }
     }
 
     pub fn conn_in_transaction(&self, conn_index: usize) -> bool {
