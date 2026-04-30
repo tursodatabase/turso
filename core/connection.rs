@@ -656,12 +656,14 @@ impl Connection {
         Ok(true)
     }
 
+    #[turso_macros::trace_stack]
     fn compile_cmd(
         self: &Arc<Connection>,
         cmd: Cmd,
         input: &str,
     ) -> Result<(Program, Arc<Pager>, QueryMode)> {
         self.maybe_update_schema();
+
         let syms = self.syms.read();
         let pager = self.pager.load().clone();
         let mode = QueryMode::new(&cmd);
@@ -682,9 +684,13 @@ impl Connection {
                 // than cloning the original AST, which can overflow the stack
                 // on deeply nested expression trees.
                 drop(syms);
-                let mut parser = Parser::new(input.as_bytes());
-                let Some(cmd) = parser.next_cmd()? else {
-                    return Err(err);
+                let cmd = {
+                    crate::stack::trace_stack!("schema_retry_parse");
+                    let mut parser = Parser::new(input.as_bytes());
+                    let Some(cmd) = parser.next_cmd()? else {
+                        return Err(err);
+                    };
+                    cmd
                 };
                 self.maybe_update_schema();
                 let syms = self.syms.read();
@@ -723,6 +729,7 @@ impl Connection {
         self.prepare_with_origin(sql, StatementOrigin::Root)
     }
 
+    #[turso_macros::trace_stack]
     fn prepare_with_origin(
         self: &Arc<Connection>,
         sql: impl AsRef<str>,
@@ -744,20 +751,24 @@ impl Connection {
         let result = (|| {
             let sql = sql.as_ref();
             tracing::debug!("Preparing: {}", sql);
-            let mut parser = Parser::new(sql.as_bytes());
-            let cmd = match parser.next_cmd()? {
-                Some(cmd) => cmd,
-                None => {
-                    return Err(LimboError::InvalidArgument(
-                        "The supplied SQL string contains no statements".to_string(),
-                    ));
-                }
+            let (cmd, byte_offset_end) = {
+                crate::stack::trace_stack!("parse");
+                let mut parser = Parser::new(sql.as_bytes());
+                let cmd = match parser.next_cmd()? {
+                    Some(cmd) => cmd,
+                    None => {
+                        return Err(LimboError::InvalidArgument(
+                            "The supplied SQL string contains no statements".to_string(),
+                        ));
+                    }
+                };
+                (cmd, parser.offset())
             };
-            let byte_offset_end = parser.offset();
             let input = str::from_utf8(&sql.as_bytes()[..byte_offset_end])
                 .unwrap()
                 .trim();
             let (program, pager, mode) = self.compile_cmd(cmd, input)?;
+
             Ok(Statement::new_with_origin(
                 program,
                 pager,
@@ -779,6 +790,7 @@ impl Connection {
         self.prepare_stmt_with_origin(stmt, StatementOrigin::Root)
     }
 
+    #[turso_macros::trace_stack]
     fn prepare_stmt_with_origin(
         self: &Arc<Connection>,
         stmt: ast::Stmt,
@@ -1116,6 +1128,7 @@ impl Connection {
     /// Execute will run a query from start to finish taking ownership of I/O because it will run pending I/Os if it didn't finish.
     /// TODO: make this api async
     #[instrument(skip_all, level = Level::INFO)]
+    #[turso_macros::trace_stack]
     pub fn execute(self: &Arc<Connection>, sql: impl AsRef<str>) -> Result<()> {
         if self.is_closed() {
             return Err(LimboError::InternalError("Connection closed".to_string()));
@@ -1128,7 +1141,10 @@ impl Connection {
                 .unwrap()
                 .trim();
             let (program, pager, mode) = self.compile_cmd(cmd, input)?;
-            Statement::new(program, pager.clone(), mode, 0).run_ignore_rows()?;
+            {
+                crate::stack::trace_stack!("run");
+                Statement::new(program, pager.clone(), mode, 0).run_ignore_rows()?;
+            }
         }
         Ok(())
     }

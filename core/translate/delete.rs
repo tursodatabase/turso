@@ -68,6 +68,7 @@ fn validate_delete(
 }
 
 #[allow(clippy::too_many_arguments)]
+#[turso_macros::trace_stack]
 pub fn translate_delete(
     tbl_name: &QualifiedName,
     resolver: &Resolver,
@@ -175,6 +176,7 @@ pub fn translate_delete(
 }
 
 #[allow(clippy::too_many_arguments)]
+#[turso_macros::trace_stack]
 pub fn prepare_delete_plan(
     program: &mut ProgramBuilder,
     resolver: &Resolver,

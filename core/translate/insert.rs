@@ -228,6 +228,7 @@ impl<'a> InsertEmitCtx<'a> {
 }
 
 #[allow(clippy::too_many_arguments)]
+#[turso_macros::trace_stack]
 pub fn translate_insert(
     resolver: &mut Resolver,
     on_conflict: Option<ResolveType>,
@@ -1387,6 +1388,7 @@ fn emit_commit_phase(
     Ok(())
 }
 
+#[turso_macros::trace_stack]
 fn translate_rows_and_open_tables(
     program: &mut ProgramBuilder,
     resolver: &Resolver,
@@ -1880,6 +1882,7 @@ fn resolve_defaults_in_row(
     }
 }
 
+#[turso_macros::trace_stack]
 fn bind_insert(
     program: &mut ProgramBuilder,
     resolver: &Resolver,
@@ -2052,6 +2055,7 @@ fn bind_insert(
 /// default expressions registered for the columns, or NULLs, so they can be translated into
 /// registers later.
 #[allow(clippy::too_many_arguments, clippy::vec_box)]
+#[turso_macros::trace_stack]
 fn init_source_emission<'a>(
     program: &mut ProgramBuilder,
     table: &Table,

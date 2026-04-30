@@ -440,6 +440,7 @@ fn collect_index_method_candidates(
 }
 
 #[tracing::instrument(skip_all, level = tracing::Level::DEBUG)]
+#[turso_macros::trace_stack]
 pub fn optimize_plan(
     program: &mut ProgramBuilder,
     plan: &mut Plan,
@@ -637,6 +638,7 @@ struct OptimizeTableAccessResult {
  * TODO: these could probably be done in less passes,
  * but having them separate makes them easier to understand
  */
+#[turso_macros::trace_stack]
 pub fn optimize_select_plan(plan: &mut SelectPlan, schema: &Schema) -> Result<()> {
     // Transform MATCH expressions to fts_match() for FTS optimizer recognition
     #[cfg(all(feature = "fts", not(target_family = "wasm")))]

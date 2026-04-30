@@ -68,6 +68,7 @@ use update::translate_update;
 
 #[instrument(skip_all, level = Level::DEBUG)]
 #[allow(clippy::too_many_arguments)]
+#[turso_macros::trace_stack]
 pub fn translate(
     schema: &Schema,
     stmt: ast::Stmt,
@@ -128,6 +129,7 @@ pub fn translate(
 // TODO: for now leaving the return value as a Program. But ideally to support nested parsing of arbitraty
 // statements, we would have to return a program builder instead
 /// Translate SQL statement into bytecode program.
+#[turso_macros::trace_stack(detail = stmt_kind(&stmt))]
 pub fn translate_inner(
     stmt: ast::Stmt,
     resolver: &mut Resolver,
@@ -415,6 +417,42 @@ pub fn translate_inner(
     }
 
     Ok(())
+}
+
+fn stmt_kind(stmt: &ast::Stmt) -> &'static str {
+    match stmt {
+        ast::Stmt::AlterTable(_) => "alter_table",
+        ast::Stmt::Analyze { .. } => "analyze",
+        ast::Stmt::Attach { .. } => "attach",
+        ast::Stmt::Begin { .. } => "begin",
+        ast::Stmt::Commit { .. } => "commit",
+        ast::Stmt::CreateIndex { .. } => "create_index",
+        ast::Stmt::CreateTable { .. } => "create_table",
+        ast::Stmt::CreateTrigger { .. } => "create_trigger",
+        ast::Stmt::CreateView { .. } => "create_view",
+        ast::Stmt::CreateMaterializedView { .. } => "create_materialized_view",
+        ast::Stmt::CreateVirtualTable(_) => "create_virtual_table",
+        ast::Stmt::CreateType { .. } => "create_type",
+        ast::Stmt::CreateDomain { .. } => "create_domain",
+        ast::Stmt::Delete { .. } => "delete",
+        ast::Stmt::Detach { .. } => "detach",
+        ast::Stmt::DropIndex { .. } => "drop_index",
+        ast::Stmt::DropTable { .. } => "drop_table",
+        ast::Stmt::DropType { .. } => "drop_type",
+        ast::Stmt::DropDomain { .. } => "drop_domain",
+        ast::Stmt::DropTrigger { .. } => "drop_trigger",
+        ast::Stmt::DropView { .. } => "drop_view",
+        ast::Stmt::Insert { .. } => "insert",
+        ast::Stmt::Pragma { .. } => "pragma",
+        ast::Stmt::Reindex { .. } => "reindex",
+        ast::Stmt::Release { .. } => "release",
+        ast::Stmt::Rollback { .. } => "rollback",
+        ast::Stmt::Savepoint { .. } => "savepoint",
+        ast::Stmt::Select { .. } => "select",
+        ast::Stmt::Update { .. } => "update",
+        ast::Stmt::Vacuum { .. } => "vacuum",
+        ast::Stmt::Optimize { .. } => "optimize",
+    }
 }
 
 #[cfg(test)]

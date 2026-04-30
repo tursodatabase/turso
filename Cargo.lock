@@ -3427,9 +3427,12 @@ dependencies = [
  "rand 0.9.4",
  "serde",
  "serde_json",
+ "stacker",
  "tokio",
+ "tracing",
  "tracing-subscriber",
  "turso",
+ "turso_parser",
 ]
 
 [[package]]
@@ -6607,6 +6610,7 @@ dependencies = [
  "simsimd",
  "smallvec",
  "sorted-vec",
+ "stacker",
  "strum",
  "strum_macros",
  "tantivy",

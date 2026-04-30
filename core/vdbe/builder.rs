@@ -641,6 +641,8 @@ impl ProgramBuilder {
     ) -> Self {
         ProgramBuilder::_new(query_mode, capture_data_changes_info, opts, None, true)
     }
+
+    #[turso_macros::trace_stack]
     fn _new(
         query_mode: QueryMode,
         capture_data_changes_info: Option<CaptureDataChangesInfo>,
@@ -1967,6 +1969,7 @@ impl ProgramBuilder {
         Ok(prepared)
     }
 
+    #[turso_macros::trace_stack]
     pub fn build(
         self,
         connection: Arc<Connection>,

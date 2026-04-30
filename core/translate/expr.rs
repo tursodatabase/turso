@@ -1017,6 +1017,7 @@ pub fn resolve_expr(
 }
 
 /// Translate an expression into bytecode.
+#[turso_macros::trace_stack]
 pub fn translate_expr(
     program: &mut ProgramBuilder,
     referenced_tables: Option<&TableReferences>,
@@ -5875,6 +5876,7 @@ fn resolve_qualified_on_ref(
 /// Rewrite ast::Expr in place, binding Column references/rewriting Expr::Id -> Expr::Column
 /// using the provided TableReferences, and replacing anonymous parameters with internal named
 /// ones
+#[turso_macros::trace_stack]
 pub fn bind_and_rewrite_expr<'a>(
     top_level_expr: &mut ast::Expr,
     mut referenced_tables: Option<&'a mut TableReferences>,
@@ -5887,6 +5889,7 @@ pub fn bind_and_rewrite_expr<'a>(
         &mut |expr: &mut ast::Expr| -> Result<WalkControl> {
             match expr {
                 Expr::Id(id) => {
+                    crate::stack::trace_stack!("bind_id");
                     let Some(referenced_tables) = &mut referenced_tables else {
                         if binding_behavior == BindingBehavior::AllowUnboundIdentifiers {
                             return Ok(WalkControl::Continue);
@@ -6045,6 +6048,7 @@ pub fn bind_and_rewrite_expr<'a>(
                     }
                 }
                 Expr::Qualified(tbl, id) => {
+                    crate::stack::trace_stack!("bind_qualified");
                     // Resolve a `<tbl>.<id>` reference.
                     //
                     // Two-stage lookup with shadowing:
@@ -6192,14 +6196,14 @@ pub fn bind_and_rewrite_expr<'a>(
                         // The `cte_id`/`cte_select` check restricts this to real CTE
                         // definition refs so any other future use of `cte_definition_only`
                         // still falls through to "no such table".
-                        if referenced_tables
+                        let is_definition_only_cte = referenced_tables
                             .find_outer_query_ref_by_identifier(&normalized_table_name)
                             .is_some_and(|outer_ref| {
                                 outer_ref.cte_definition_only
                                     && (outer_ref.cte_id.is_some()
                                         || outer_ref.cte_select.is_some())
-                            })
-                        {
+                            });
+                        if is_definition_only_cte {
                             crate::bail_parse_error!(
                                 "no such column: {}.{}",
                                 tbl.as_str(),
@@ -6270,6 +6274,7 @@ pub fn bind_and_rewrite_expr<'a>(
                     return Ok(WalkControl::Continue);
                 }
                 Expr::DoublyQualified(db_name, tbl_name, col_name) => {
+                    crate::stack::trace_stack!("bind_doubly_qualified");
                     // Clone the names upfront so we can reassign *expr later
                     // without lifetime conflicts.
                     let db_name_str = db_name.as_str().to_string();
@@ -6620,6 +6625,7 @@ struct CustomTypeColumnMatch<'a> {
 
 /// Search all joined tables for a column named `col_name` with a struct/union type.
 /// Errors on ambiguity (>1 match). Returns `None` if no match.
+#[turso_macros::trace_stack]
 fn find_custom_type_column<'a>(
     referenced_tables: &TableReferences,
     col_name: &str,

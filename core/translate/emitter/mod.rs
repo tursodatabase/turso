@@ -913,6 +913,7 @@ pub enum TransactionMode {
 /// Main entry point for emitting bytecode for a SQL query
 /// Takes a query plan and generates the corresponding bytecode program
 #[instrument(skip_all, level = tracing::Level::DEBUG)]
+#[turso_macros::trace_stack]
 pub fn emit_program(
     connection: &Arc<Connection>,
     resolver: &Resolver,

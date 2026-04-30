@@ -279,6 +279,7 @@ fn rewrite_upsert_exprs_for_subprogram(
 }
 
 /// Convert TriggerCmd to Stmt, rewriting NEW/OLD to Variable expressions (for subprogram compilation)
+#[turso_macros::trace_stack(detail = trigger_command_kind(cmd))]
 fn trigger_cmd_to_stmt_for_subprogram(
     cmd: &ast::TriggerCmd,
     subprogram_ctx: &TriggerSubprogramContext,
@@ -523,6 +524,7 @@ fn rewrite_trigger_expr_single_for_subprogram(
 
 /// Execute trigger commands by compiling them as a subprogram and emitting Program instruction
 /// Returns true if there are triggers that will fire.
+#[turso_macros::trace_stack(detail = trigger_event_kind(&trigger.event))]
 fn execute_trigger_commands(
     program: &mut ProgramBuilder,
     resolver: &mut Resolver,
@@ -855,6 +857,7 @@ pub fn has_triggers_including_temp(
     false
 }
 
+#[turso_macros::trace_stack(detail = trigger_event_kind(&trigger.event))]
 pub fn fire_trigger(
     program: &mut ProgramBuilder,
     resolver: &mut Resolver,
@@ -880,6 +883,7 @@ pub fn fire_trigger(
     let result = (|| -> Result<()> {
         // Evaluate WHEN clause if present
         if let Some(mut when_expr) = trigger.when_clause.clone() {
+            crate::stack::trace_stack!("when_clause");
             // Rewrite NEW/OLD references in WHEN clause to use registers
             rewrite_trigger_expr_for_when_clause(&mut when_expr, &ctx.table, ctx)?;
 
@@ -947,6 +951,24 @@ pub fn fire_trigger(
     })();
     resolver.register_affinities = saved_register_affinities;
     result
+}
+
+fn trigger_event_kind(event: &TriggerEvent) -> &'static str {
+    match event {
+        TriggerEvent::Delete => "delete",
+        TriggerEvent::Insert => "insert",
+        TriggerEvent::Update => "update",
+        TriggerEvent::UpdateOf(_) => "update_of",
+    }
+}
+
+fn trigger_command_kind(command: &ast::TriggerCmd) -> &'static str {
+    match command {
+        ast::TriggerCmd::Insert { .. } => "insert",
+        ast::TriggerCmd::Update { .. } => "update",
+        ast::TriggerCmd::Delete { .. } => "delete",
+        ast::TriggerCmd::Select(_) => "select",
+    }
 }
 
 /// Decode encoded custom type registers in a TriggerContext.
@@ -1044,6 +1066,7 @@ fn populate_trigger_row_register_affinities(
 }
 
 /// Rewrite NEW/OLD references in WHEN clause expressions (uses Register expressions, not Variable)
+#[turso_macros::trace_stack]
 fn rewrite_trigger_expr_for_when_clause(
     expr: &mut ast::Expr,
     table: &BTreeTable,

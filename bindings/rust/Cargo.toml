@@ -17,6 +17,7 @@ default = ["mimalloc", "fts"]
 mimalloc = ["dep:mimalloc"]
 pure-rust-crypto = ["turso_sdk_kit/pure-rust-crypto", "turso_sync_sdk_kit/pure-rust-crypto"]
 fts = ["turso_sdk_kit/fts"]
+stacker = ["turso_core/stacker"]
 sync = [
     "dep:hyper",
     "dep:tokio",
@@ -60,4 +61,3 @@ rand_chacha = { workspace = true }
 anyhow.workspace = true
 reqwest = { version = "0.13.2", features = ["json"] }
 serde_json.workspace = true
-

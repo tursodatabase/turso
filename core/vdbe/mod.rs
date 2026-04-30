@@ -1310,6 +1310,7 @@ impl Program {
         state.is_interrupted()
     }
 
+    #[turso_macros::trace_stack]
     pub fn step(
         &self,
         state: &mut ProgramState,
@@ -1536,6 +1537,7 @@ impl Program {
             let insn_function = insn.to_function();
             if enable_tracing {
                 trace_insn(self, state.pc as InsnReference, insn);
+                crate::stack::trace_remaining("program_step:opcode");
             }
             // Always increment VM steps for every loop iteration
             state.metrics.vm_steps = state.metrics.vm_steps.saturating_add(1);

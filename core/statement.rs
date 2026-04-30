@@ -130,6 +130,7 @@ impl Statement {
         )
     }
 
+    #[turso_macros::trace_stack]
     pub(crate) fn new_with_origin(
         program: vdbe::Program,
         pager: Arc<Pager>,
