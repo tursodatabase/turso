@@ -91,7 +91,7 @@ use std::{
     num::NonZero,
     sync::{atomic::Ordering, Arc},
 };
-use turso_macros::match_ignore_ascii_case;
+use turso_macros::{match_ignore_ascii_case, turso_debug_assert};
 
 use crate::pseudo::PseudoCursor;
 
@@ -3842,87 +3842,94 @@ pub fn op_auto_commit(
         return Ok(InsnFunctionStepResult::Step);
     }
 
-    // The logic in this opcode can be a bit confusing, so to make things a bit clearer lets be
-    // very explicit about the currently existing and requested state.
-    let requested_autocommit = *auto_commit;
-    let requested_rollback = *rollback;
-    let changed = requested_autocommit != had_autocommit;
-    let is_txn_end_eq = changed && requested_autocommit;
-    // what the requested operation is
-    let is_begin_req = had_autocommit && !requested_autocommit && !requested_rollback;
-    let is_commit_req = !had_autocommit && requested_autocommit && !requested_rollback;
-    let is_rollback_req = !had_autocommit && requested_autocommit && requested_rollback;
-
-    if is_txn_end_eq && conn.n_active_writes.load(Ordering::SeqCst) > 0 {
-        return Err(LimboError::Busy);
+    #[derive(Debug)]
+    enum TxOp {
+        Begin,
+        Commit,
+        Rollback,
     }
+    let tx_op = match (*auto_commit, *rollback) {
+        (false, false) => TxOp::Begin,
+        (true, false) => TxOp::Commit,
+        (true, true) => TxOp::Rollback,
+        (false, true) => {
+            return Err(LimboError::InternalError(
+                "Insn::AutoCommit {{ auto_commit: false, rollback: true }} is not valid".into(),
+            ))
+        }
+    };
 
-    if changed {
-        if requested_rollback {
-            // ROLLBACK transition
-            if let Some(mv_store) = mv_store.as_ref() {
-                if let Some(tx_id) = conn.get_mv_tx_id() {
-                    mv_store.rollback_tx(tx_id, pager.clone(), &conn, MAIN_DB_ID);
+    // BEGIN disables autocommit; COMMIT/ROLLBACK enables it. Anything else (BEGIN within a txn,
+    // or COMMIT/ROLLBACK without one) is invalid.
+    let valid_transition = matches!(
+        (&tx_op, had_autocommit),
+        (TxOp::Begin, true) | (TxOp::Commit | TxOp::Rollback, false)
+    );
+
+    if valid_transition {
+        if matches!(tx_op, TxOp::Commit | TxOp::Rollback)
+            && conn.n_active_writes.load(Ordering::SeqCst) > 0
+        {
+            return Err(LimboError::Busy);
+        }
+
+        match tx_op {
+            TxOp::Rollback => {
+                if let Some(mv_store) = mv_store.as_ref() {
+                    if let Some(tx_id) = conn.get_mv_tx_id() {
+                        mv_store.rollback_tx(tx_id, pager.clone(), &conn, MAIN_DB_ID);
+                    }
+                    pager.end_read_tx();
+                    conn.rollback_attached_mvcc_txs(true);
+                } else {
+                    pager.rollback_tx(&conn);
                 }
-                pager.end_read_tx();
-                conn.rollback_attached_mvcc_txs(true);
-            } else {
-                pager.rollback_tx(&conn);
+                conn.rollback_attached_wal_txns();
+                conn.rollback_temp_schema();
+                conn.set_tx_state(TransactionState::None);
+                conn.auto_commit.store(true, Ordering::SeqCst);
+                conn.set_cdc_transaction_id(-1);
             }
-            conn.rollback_attached_wal_txns();
-            conn.rollback_temp_schema();
-            conn.set_tx_state(TransactionState::None);
-            conn.auto_commit.store(true, Ordering::SeqCst);
-            conn.set_cdc_transaction_id(-1);
-        } else {
-            // BEGIN (true->false) or COMMIT (false->true)
-            if is_commit_req {
+            TxOp::Commit => {
                 // Pre-check deferred FKs; leave tx open and do NOT clear violations
                 check_deferred_fk_on_commit(&conn)?;
+                conn.auto_commit.store(true, Ordering::SeqCst);
             }
-            conn.auto_commit
-                .store(requested_autocommit, Ordering::SeqCst);
+            TxOp::Begin => {
+                conn.auto_commit.store(false, Ordering::SeqCst);
+                return Ok(InsnFunctionStepResult::Done);
+            }
         }
     } else {
-        // No autocommit flip.
-        let mvcc_tx_active = conn.get_mv_tx().is_some();
-        if !mvcc_tx_active {
-            if !requested_autocommit {
-                return Err(LimboError::TxError(
-                    "cannot start a transaction within a transaction".to_string(),
-                ));
-            } else if requested_rollback {
-                return Err(LimboError::TxError(
-                    "cannot rollback - no transaction is active".to_string(),
-                ));
-            } else {
-                return Err(LimboError::TxError(
-                    "cannot commit - no transaction is active".to_string(),
-                ));
-            }
-        } else if is_begin_req {
-            return Err(LimboError::TxError(
-                "cannot use BEGIN after BEGIN CONCURRENT".to_string(),
-            ));
-        }
+        return match &tx_op {
+            TxOp::Begin => Err(LimboError::TxError(
+                "cannot start a transaction within a transaction".to_string(),
+            )),
+            TxOp::Commit => Err(LimboError::TxError(
+                "cannot commit - no transaction is active".to_string(),
+            )),
+            TxOp::Rollback => Err(LimboError::TxError(
+                "cannot rollback - no transaction is active".to_string(),
+            )),
+        };
     }
 
+    turso_debug_assert!(matches!(tx_op, TxOp::Commit | TxOp::Rollback), "tx_op should be commit or rollback by now", {"tx_op": tx_op});
+
     // For explicit COMMIT, flush any pending index method writes first
-    if is_commit_req {
+    if matches!(tx_op, TxOp::Commit) {
         index_method_pre_commit_all(state, pager)?;
     }
 
-    let res = program
-        .commit_txn(pager.clone(), state, mv_store.as_ref(), requested_rollback)
-        .map(Into::into);
-
-    if mv_store.is_none()
-        && matches!(
-            res,
-            Ok(InsnFunctionStepResult::Step | InsnFunctionStepResult::Done)
-        )
-        && (is_rollback_req || is_commit_req)
+    let res = match program
+        .commit_txn(pager.clone(), state, mv_store.as_ref(), *rollback)
+        .map(Into::<InsnFunctionStepResult>::into)?
     {
+        res @ (InsnFunctionStepResult::Done | InsnFunctionStepResult::Step) => res,
+        res @ (InsnFunctionStepResult::IO(_) | InsnFunctionStepResult::Row) => return Ok(res),
+    };
+
+    if mv_store.is_none() {
         pager.clear_savepoints()?;
         // Non-main pagers (temp + attached) accumulate savepoints from the
         // mirror path; they're not cleared by the main pager's commit/
@@ -3939,27 +3946,15 @@ pub fn op_auto_commit(
     }
 
     // Clear deferred FK counters only after FINAL success of COMMIT/ROLLBACK.
-    if fk_on
-        && matches!(
-            res,
-            Ok(InsnFunctionStepResult::Step | InsnFunctionStepResult::Done)
-        )
-        && (is_rollback_req || is_commit_req)
-    {
+    if fk_on {
         conn.clear_deferred_foreign_key_violations();
     }
 
     // Reset CDC transaction ID after successful COMMIT or ROLLBACK.
-    if matches!(
-        res,
-        Ok(InsnFunctionStepResult::Step | InsnFunctionStepResult::Done)
-    ) && (is_rollback_req || is_commit_req)
-    {
-        conn.set_cdc_transaction_id(-1);
-        conn.clear_named_savepoints();
-    }
+    conn.set_cdc_transaction_id(-1);
+    conn.clear_named_savepoints();
 
-    res
+    Ok(res)
 }
 
 pub fn op_savepoint(
