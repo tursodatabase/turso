@@ -20,116 +20,18 @@ pub(super) fn operator_to_str(op: &ast::Operator) -> Option<&'static str> {
 
 /// Emit bytecode for a resolved custom type operator call.
 /// Handles argument swapping, literal encoding, and result negation.
-pub(super) fn emit_custom_type_operator(
-    program: &mut ProgramBuilder,
-    referenced_tables: Option<&TableReferences>,
-    e1: &ast::Expr,
-    e2: &ast::Expr,
-    resolved: &ResolvedOperator,
-    resolver: &Resolver,
-) -> Result<usize> {
-    let func = resolver
-        .resolve_function(&resolved.func_name, 2)?
-        .ok_or_else(|| {
-            LimboError::InternalError(format!("function not found: {}", resolved.func_name))
-        })?;
-    let (first, second) = if resolved.swap_args {
-        (e2, e1)
-    } else {
-        (e1, e2)
-    };
-
-    // When encoding a literal operand, we must use separate registers for the
-    // function call arguments. translate_expr may place literals in preamble
-    // registers (constant optimization), and encoding in-place would clobber
-    // that register — breaking subsequent loop iterations.
-    let func_start = if let Some(ref encode_info) = resolved.encode_info {
-        if let Some(encode_expr) = encode_info.type_def.encode() {
-            // Translate operands into temporary registers first.
-            let tmp1 = program.alloc_register();
-            let tmp2 = program.alloc_register();
-            translate_expr(program, referenced_tables, first, tmp1, resolver)?;
-            translate_expr(program, referenced_tables, second, tmp2, resolver)?;
-
-            // Determine which tmp holds the literal and which holds the column.
-            let (lit_tmp, col_tmp) = match encode_info.which {
-                EncodeArg::First if resolved.swap_args => (tmp2, tmp1),
-                EncodeArg::First => (tmp1, tmp2),
-                EncodeArg::Second if resolved.swap_args => (tmp1, tmp2),
-                EncodeArg::Second => (tmp2, tmp1),
-            };
-
-            // Allocate fresh contiguous registers for the function call.
-            let func_args = program.alloc_registers(2);
-            // The literal goes in the same position it occupied in arg layout.
-            let (lit_dst, col_dst) = match encode_info.which {
-                EncodeArg::First if resolved.swap_args => (func_args + 1, func_args),
-                EncodeArg::First => (func_args, func_args + 1),
-                EncodeArg::Second if resolved.swap_args => (func_args, func_args + 1),
-                EncodeArg::Second => (func_args + 1, func_args),
-            };
-
-            // Copy column value as-is.
-            program.emit_insn(Insn::Copy {
-                src_reg: col_tmp,
-                dst_reg: col_dst,
-                extra_amount: 0,
-            });
-            // Encode the literal into the fresh function arg slot.
-            emit_type_expr(
-                program,
-                encode_expr,
-                lit_tmp,
-                lit_dst,
-                &encode_info.column,
-                &encode_info.type_def,
-                resolver,
-            )?;
-            func_args
-        } else {
-            // Type has no encode expression; translate directly into arg slots.
-            let arg_reg = program.alloc_registers(2);
-            translate_expr(program, referenced_tables, first, arg_reg, resolver)?;
-            translate_expr(program, referenced_tables, second, arg_reg + 1, resolver)?;
-            arg_reg
-        }
-    } else {
-        // No encoding needed; translate directly into arg slots.
-        let arg_reg = program.alloc_registers(2);
-        translate_expr(program, referenced_tables, first, arg_reg, resolver)?;
-        translate_expr(program, referenced_tables, second, arg_reg + 1, resolver)?;
-        arg_reg
-    };
-
-    let result_reg = program.alloc_register();
-    program.emit_insn(Insn::Function {
-        constant_mask: 0,
-        start_reg: func_start,
-        dest: result_reg,
-        func: FuncCtx { func, arg_count: 2 },
-    });
-    if resolved.negate {
-        program.emit_insn(Insn::Not {
-            reg: result_reg,
-            dest: result_reg,
-        });
-    }
-    Ok(result_reg)
-}
-
-/// Info about a column with a custom type, extracted from an expression.
-pub(super) struct ExprCustomTypeInfo {
+pub(super) struct ExprCustomTypeInfo<'a> {
     type_name: String,
-    column: Column,
-    type_def: Arc<TypeDef>,
+    column: &'a Column,
+    pub(super) type_def: &'a TypeDef,
 }
 
 /// If the expression is a column reference to a custom type, return the type info.
-pub(super) fn expr_custom_type_info(
+pub(super) fn expr_custom_type_info<'a>(
     expr: &ast::Expr,
-    referenced_tables: Option<&TableReferences>,
-    resolver: &Resolver,
-) -> Option<ExprCustomTypeInfo> {
+    referenced_tables: Option<&'a TableReferences>,
+    resolver: &'a Resolver,
+) -> Option<ExprCustomTypeInfo<'a>> {
     if let ast::Expr::Column {
         table: table_ref_id,
         column,
@@ -145,8 +47,8 @@ pub(super) fn expr_custom_type_info(
             .get_type_def(type_name, table.is_strict())?;
         return Some(ExprCustomTypeInfo {
             type_name: type_name.to_lowercase(),
-            column: col.clone(),
-            type_def: Arc::clone(type_def),
+            column: col,
+            type_def,
         });
     }
     None
@@ -183,6 +85,7 @@ pub(super) fn literal_compatible_with_value_type(
 }
 
 /// Which operand of a binary expression needs encoding before the operator call.
+#[derive(Clone, Copy)]
 pub(super) enum EncodeArg {
     /// Encode the first argument (e1 is a literal, e2 is the custom type column)
     First,
@@ -191,20 +94,24 @@ pub(super) enum EncodeArg {
 }
 
 /// Info needed to encode a literal argument for an operator call.
-pub(super) struct OperatorEncodeInfo {
-    column: Column,
-    type_def: Arc<TypeDef>,
-    which: EncodeArg,
+// When encoding a literal operand, we must use separate registers for the
+// function call arguments. translate_expr may place literals in preamble
+// registers (constant optimization), and encoding in-place would clobber
+// that register — breaking subsequent loop iterations.
+pub(super) struct OperatorEncodeInfo<'a> {
+    pub(super) column: &'a Column,
+    pub(super) type_def: &'a TypeDef,
+    pub(super) which: EncodeArg,
 }
 
 /// Result of resolving a custom type operator. May be a direct match or derived
 /// from `<` and `=` operators (e.g. `>` is derived as swap_args + `<`).
-pub(super) struct ResolvedOperator {
-    func_name: String,
-    swap_args: bool,
-    negate: bool,
+pub(super) struct ResolvedOperator<'a> {
+    pub(super) func_name: String,
+    pub(super) swap_args: bool,
+    pub(super) negate: bool,
     /// If a literal operand needs encoding before the operator call.
-    encode_info: Option<OperatorEncodeInfo>,
+    pub(super) encode_info: Option<OperatorEncodeInfo<'a>>,
 }
 
 /// Find a custom type operator function for a binary expression.
@@ -216,13 +123,13 @@ pub(super) struct ResolvedOperator {
 ///
 /// When case 2 applies, the literal is encoded before being passed to the operator
 /// function so both arguments are in the same (encoded) representation.
-pub(super) fn find_custom_type_operator(
+pub(super) fn find_custom_type_operator<'a>(
     e1: &ast::Expr,
     e2: &ast::Expr,
     op: &ast::Operator,
-    referenced_tables: Option<&TableReferences>,
-    resolver: &Resolver,
-) -> Option<ResolvedOperator> {
+    referenced_tables: Option<&'a TableReferences>,
+    resolver: &'a Resolver,
+) -> Option<ResolvedOperator<'a>> {
     let op_str = operator_to_str(op)?;
     let lhs_info = expr_custom_type_info(e1, referenced_tables, resolver);
     let rhs_info = expr_custom_type_info(e2, referenced_tables, resolver);
@@ -286,8 +193,8 @@ pub(super) fn find_custom_type_operator(
                         swap_args,
                         negate,
                         encode_info: Some(OperatorEncodeInfo {
-                            column: lhs.column.clone(),
-                            type_def: lhs.type_def.clone(),
+                            column: lhs.column,
+                            type_def: lhs.type_def,
                             which: EncodeArg::Second,
                         }),
                     });
@@ -306,8 +213,8 @@ pub(super) fn find_custom_type_operator(
                         swap_args,
                         negate,
                         encode_info: Some(OperatorEncodeInfo {
-                            column: rhs.column.clone(),
-                            type_def: rhs.type_def.clone(),
+                            column: rhs.column,
+                            type_def: rhs.type_def,
                             which: EncodeArg::First,
                         }),
                     });
@@ -427,130 +334,23 @@ pub(crate) fn emit_user_facing_column_value(
     Ok(())
 }
 
-/// Emit domain constraint checks for CAST(expr AS domain).
-/// Validates NOT NULL and CHECK constraints from the domain type chain.
-pub(super) fn emit_domain_cast_constraints(
-    program: &mut ProgramBuilder,
-    chain: &[crate::sync::Arc<TypeDef>],
-    reg: usize,
-    resolver: &Resolver,
-) -> Result<()> {
-    use crate::error::{SQLITE_CONSTRAINT_CHECK, SQLITE_CONSTRAINT_NOTNULL};
-
-    let any_not_null = chain.iter().any(|td| td.not_null);
-
-    if any_not_null {
-        program.emit_insn(Insn::HaltIfNull {
-            target_reg: reg,
-            err_code: SQLITE_CONSTRAINT_NOTNULL,
-            description: format!(
-                "domain {} does not allow null values",
-                chain.first().map(|td| td.name.as_str()).unwrap_or("?")
-            ),
-        });
-    }
-
-    for td in chain {
-        for (i, dc) in td.domain_checks.iter().enumerate() {
-            let constraint_name = dc
-                .name
-                .clone()
-                .unwrap_or_else(|| format!("{}_{}", td.name, i));
-
-            // Bind `value` → reg, translate check expr, verify truthy
-            program
-                .id_register_overrides
-                .insert("value".to_string(), reg);
-
-            let expr_result_reg = program.alloc_register();
-            translate_expr(program, None, &dc.check, expr_result_reg, resolver)?;
-
-            program.id_register_overrides.remove("value");
-
-            let passed_label = program.allocate_label();
-
-            // NULL result passes CHECK constraints (SQLite semantics)
-            program.emit_insn(Insn::IsNull {
-                reg: expr_result_reg,
-                target_pc: passed_label,
-            });
-
-            program.emit_insn(Insn::If {
-                reg: expr_result_reg,
-                target_pc: passed_label,
-                jump_if_null: false,
-            });
-
-            program.emit_insn(Insn::Halt {
-                err_code: SQLITE_CONSTRAINT_CHECK,
-                description: format!(
-                    "value for domain {} violates check constraint \"{}\"",
-                    td.name, constraint_name
-                ),
-                on_error: None,
-                description_reg: None,
-            });
-
-            program.preassign_label_to_next_insn(passed_label);
-        }
-    }
-    Ok(())
-}
-
 /// Emit bytecode for a custom type encode/decode expression.
 /// Sets up `value` to reference `value_reg`, and type parameter overrides
 /// from `column.ty_params` matched against `type_def.params`.
 /// The expression result is written to `dest_reg`.
-pub(crate) fn emit_type_expr(
+pub(crate) fn emit_type_expr<'a, 'r>(
     program: &mut ProgramBuilder,
-    expr: &ast::Expr,
+    expr: &'a ast::Expr,
     value_reg: usize,
     dest_reg: usize,
-    column: &Column,
-    type_def: &TypeDef,
-    resolver: &Resolver,
+    column: &'a Column,
+    type_def: &'a TypeDef,
+    resolver: &'a Resolver<'r>,
 ) -> Result<usize> {
-    // Set up value override
-    program
-        .id_register_overrides
-        .insert("value".to_string(), value_reg);
-
-    // Set up type parameter overrides. Capture the result so we can
-    // clean up overrides even if param translation fails.
-    let param_result: Result<()> = (|| {
-        // Skip `value` param (already handled above); match remaining params
-        // against the user-provided ty_params by position.
-        let user_params: Vec<_> = type_def.user_params().collect();
-        for (i, param) in user_params.iter().enumerate() {
-            if let Some(param_expr) = column.ty_params.get(i) {
-                let reg = program.alloc_register();
-                translate_expr(program, None, param_expr, reg, resolver)?;
-                program
-                    .id_register_overrides
-                    .insert(param.name.clone(), reg);
-            }
-        }
-        Ok(())
-    })();
-
-    // Translate body expression only if param setup succeeded
-    let result = param_result.and_then(|()| {
-        // Translate the expression, disabling constant optimization since
-        // the `value` placeholder refers to a register that changes per row.
-        translate_expr_no_constant_opt(
-            program,
-            None,
-            expr,
-            dest_reg,
-            resolver,
-            NoConstantOptReason::RegisterReuse,
-        )
-    });
-
-    // Always clean up overrides, even on error
-    program.id_register_overrides.clear();
-
-    result
+    let mut translator = IterativeExprTranslator::new(program, resolver);
+    translator.schedule_type_expr(expr, value_reg, dest_reg, column, type_def)?;
+    translator.run()?;
+    Ok(dest_reg)
 }
 
 /// Decode custom type columns for AFTER trigger NEW registers.
