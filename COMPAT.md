@@ -76,10 +76,6 @@ ongoing work to pass the full SQLite TCL test suite.
 * 🚧 SQLite query language [[status](#sqlite-query-language)] is partially supported
 * 🚧 SQLite C API [[status](#sqlite-c-api)] is partially supported
 
-### Limitations
-
-* ⛔️ Concurrent access from multiple processes is not supported.
-* ⛔️ Plain VACUUM is not supported (VACUUM INTO is supported).
 
 ## SQLite query language
 
@@ -939,7 +935,7 @@ Modifiers:
 | VOpen          | ✅ Yes    |         |
 | VRename        | ✅ Yes    |         |
 | VUpdate        | ✅ Yes    |         |
-| Vacuum         | ❌ No     |         |
+| Vacuum         | 🚧 Partial     |         |
 | Variable       | ✅ Yes    |         |
 | Yield          | ✅ Yes    |         |
 | ZeroOrNull     | ✅ Yes    |         |
