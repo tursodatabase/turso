@@ -8,7 +8,7 @@ use crate::mvcc::persistent_storage::logical_log::{
     ENCRYPTED_PAYLOAD_CHUNK_SIZE, FRAME_MAGIC, LOG_HDR_SIZE,
 };
 use crate::mvcc::yield_hooks::YieldPointMarker;
-use crate::mvcc::yield_points::{YieldInjector, YieldPoint};
+use crate::mvcc::yield_points::{FailureInjector, YieldInjector, YieldPoint};
 use crate::state_machine::{StateTransition, TransitionResult};
 use crate::storage::sqlite3_ondisk::{
     checksum_wal, read_varint, write_varint, DatabaseHeader, WalHeader, WAL_FRAME_HEADER_SIZE,
@@ -55,6 +55,30 @@ impl FixedYieldInjector {
 
 impl YieldInjector for FixedYieldInjector {
     fn should_yield(&self, _instance_id: u64, _selection_key: u64, point: YieldPoint) -> bool {
+        self.remaining.lock().remove(&point)
+    }
+}
+
+#[derive(Debug)]
+struct FixedFailureInjector {
+    remaining: Mutex<rustc_hash::FxHashMap<YieldPoint, LimboError>>,
+}
+
+impl FixedFailureInjector {
+    fn new(points: impl IntoIterator<Item = (YieldPoint, LimboError)>) -> Arc<Self> {
+        Arc::new(Self {
+            remaining: Mutex::new(points.into_iter().collect()),
+        })
+    }
+}
+
+impl FailureInjector for FixedFailureInjector {
+    fn should_fail(
+        &self,
+        _instance_id: u64,
+        _selection_key: u64,
+        point: YieldPoint,
+    ) -> Option<LimboError> {
         self.remaining.lock().remove(&point)
     }
 }
@@ -3001,7 +3025,7 @@ pub(crate) fn commit_tx(
     conn: &Arc<Connection>,
     tx_id: u64,
 ) -> Result<()> {
-    let mut sm = mv_store.commit_tx(tx_id, conn).unwrap();
+    let mut sm = mv_store.commit_tx(tx_id, conn, crate::MAIN_DB_ID).unwrap();
     // TODO: sync IO hack
     loop {
         let res = sm.step(&mv_store)?;
@@ -3022,7 +3046,7 @@ pub(crate) fn commit_tx_no_conn(
     conn: &Arc<Connection>,
 ) -> Result<(), LimboError> {
     let mv_store = db.get_mvcc_store();
-    let mut sm = mv_store.commit_tx(tx_id, conn).unwrap();
+    let mut sm = mv_store.commit_tx(tx_id, conn, crate::MAIN_DB_ID).unwrap();
     // TODO: sync IO hack
     loop {
         let res = sm.step(&mv_store)?;
@@ -7246,6 +7270,93 @@ fn test_abandoned_commit_rolls_back_insert_with_injected_yield() {
         "row from abandoned INSERT commit remained visible: {rows:?}",
     );
     observer.close().unwrap();
+}
+
+/// Regression guard for the `mv_store.txs` ↔ `connection.mv_tx_id` divergence
+/// originally observed in production as `Transaction <id> not found while
+/// releasing savepoint` (panic) and `NoSuchTransactionID(<id>)` (read-path
+/// error) — see Antithesis Limbo run, 2026-04-27.
+///
+/// **Bug shape (pre-fix):** `CommitStateMachine` called `mvcc_store.remove_tx(tx_id)`
+/// directly. The connection-cache clear (`conn.set_mv_tx(None)`) lived at the
+/// caller (vdbe/mod.rs:1898) and only ran on the success path. If anything
+/// between `remove_tx` and that caller-side clear failed or yielded I/O and
+/// then the runtime abandoned the task before re-entering, the cache was
+/// stranded pointing at a tx that was already gone from `txs`. The natural
+/// trigger in production was an IO yield from `CheckpointStateMachine::step`
+/// (called after `remove_tx` at the EndCommitLogicalLog site) followed by
+/// task abandonment under network partition.
+///
+/// **Fix:** `MvStore::finish_committed_tx(tx_id, conn, db_id)` clears the
+/// connection's mv_tx cache and removes the tx from `txs` together,
+/// atomically. All three commit sites that previously called `remove_tx`
+/// directly now call `finish_committed_tx`. After this, no in-flight state
+/// (Err propagation, IO yield + abandon, success) can produce the divergent
+/// `(cache=Some, txs=None)` pair — they're mutated as a single act.
+///
+/// **What this test exercises:** we inject a `TxError` at the historical
+/// post-`remove_tx` boundary (`CommitYieldPoint::AfterRemoveTx`). The abort
+/// handler at vdbe/mod.rs:2204 explicitly skips rollback for `TxError`, so
+/// pre-fix nothing else would have cleared the cache — the divergence would
+/// surface. Post-fix, `finish_committed_tx` already cleared the cache before
+/// the injection point fires, so both stores are gone in lock-step and a
+/// follow-up read on the connection sees a clean state.
+#[test]
+fn test_commit_failure_after_remove_tx_does_not_strand_conn_cache() {
+    let db = MvccTestDbNoConn::new();
+    let conn = db.connect();
+
+    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)")
+        .unwrap();
+    conn.execute("BEGIN CONCURRENT").unwrap();
+    conn.execute("INSERT INTO t VALUES (1, 'new')").unwrap();
+
+    let tx_id = conn.get_mv_tx_id().expect("tx should be open after BEGIN");
+    let mv_store = db.get_mvcc_store();
+    assert!(
+        mv_store.txs.get(&tx_id).is_some(),
+        "precondition: tx must be live in txs before COMMIT"
+    );
+
+    conn.set_failure_injector(Some(FixedFailureInjector::new([(
+        CommitYieldPoint::AfterRemoveTx.point(),
+        // `TxError` is in the no-rollback list at vdbe/mod.rs:2204, so the abort
+        // handler will not rescue stranded state on its own — the only thing
+        // keeping the connection coherent here is `finish_committed_tx`.
+        LimboError::TxError("synthetic post-remove_tx failure".to_string()),
+    )])));
+
+    let commit_err = conn
+        .execute("COMMIT")
+        .expect_err("commit must fail at the injected boundary");
+    tracing::info!("injected commit failure: {commit_err}");
+
+    // The pairing invariant: `finish_committed_tx` clears both atomically, so
+    // after the injected Err we see them gone together — no half-state.
+    assert!(
+        mv_store.txs.get(&tx_id).is_none(),
+        "fix: tx must be gone from txs (finish_committed_tx ran before the \
+         injection point)"
+    );
+    assert_eq!(
+        conn.get_mv_tx_id(),
+        None,
+        "fix: connection mv_tx cache must be cleared in lock-step with the \
+         txs removal — pre-fix this stranded the cache"
+    );
+
+    // NOTE: we deliberately do not assert anything about the *visibility* of
+    // the failed-commit's INSERT here. By the time the injection fires at
+    // `AfterRemoveTx`, the commit pipeline has already published
+    // `tx.state = Committed(end_ts)` and timestamp-rewritten live versions
+    // (mod.rs:1901-1903) — so the row IS visible to subsequent readers. That's
+    // a separate "Err on COMMIT but data is durable" semantic concern that
+    // predates this fix and applies equally to the production network-partition
+    // scenario; it's not what this regression test is guarding. This test
+    // verifies only the pairing invariant: `mv_store.txs` and
+    // `conn.mv_tx_id` mutate in lock-step, leaving the connection reusable.
+
+    conn.close().unwrap();
 }
 
 /// if a txn made some inserts, then aborted (or abandoned due to some IO issue), then those

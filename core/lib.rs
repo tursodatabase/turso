@@ -1692,6 +1692,8 @@ impl Database {
             #[cfg(any(test, injected_yields))]
             yield_injector: RwLock::new(None),
             #[cfg(any(test, injected_yields))]
+            failure_injector: RwLock::new(None),
+            #[cfg(any(test, injected_yields))]
             yield_instance_id_counter: AtomicU64::new(1),
             view_transaction_states: AllViewsTxState::new(),
             metrics: RwLock::new(ConnectionMetrics::new()),
