@@ -6936,7 +6936,6 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
- "libc",
  "rand 0.9.4",
  "rusqlite",
  "tokio",
