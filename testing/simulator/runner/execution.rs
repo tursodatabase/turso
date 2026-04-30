@@ -10,8 +10,12 @@ use turso_core::{Connection, LimboError, Result, Value};
 ///
 /// - WriteWriteConflict: MVCC conflict, the DB rolled back the transaction
 /// - TxError: Transaction state error (e.g., BEGIN twice, COMMIT with no transaction)
+/// - SchemaUpdated: a concurrent connection altered the schema
 fn is_recoverable_tx_error(err: &LimboError) -> bool {
-    matches!(err, LimboError::WriteWriteConflict | LimboError::TxError(_))
+    matches!(
+        err,
+        LimboError::WriteWriteConflict | LimboError::TxError(_) | LimboError::SchemaUpdated
+    )
 }
 
 /// Returns true if the error indicates the transaction was rolled back by the database.
