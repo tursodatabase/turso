@@ -2077,8 +2077,8 @@ fn emit_update_insns<'a>(
     // PK REPLACE: when the new rowid conflicts with an existing row, delete it.
     // Runs AFTER Phase 1 (all index constraint checks) so that non-REPLACE index
     // constraints fire before this deletion, matching SQLite's ordering.
-    if target_table.table.btree().is_some() {
-        if updates_rowid && matches!(effective_rowid_alias_conflict, ResolveType::Replace) {
+    if target_table.table.btree().is_some()
+        && updates_rowid && matches!(effective_rowid_alias_conflict, ResolveType::Replace) {
             let target_reg = rowid_set_clause_reg.expect("rowid_set_clause_reg must be set");
             let no_rowid_conflict_label = program.allocate_label();
             let row_not_found_label = check_rowid_not_exists_label
@@ -2121,7 +2121,6 @@ fn emit_update_insns<'a>(
                 target_pc: row_not_found_label,
             });
         }
-    }
 
     // ---- Phase 2: Delete old index entries ----
     // All constraint checks passed. Now safe to mutate indexes.
