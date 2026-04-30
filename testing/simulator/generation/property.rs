@@ -164,11 +164,9 @@ impl Property {
                 // - [x] There will be no errors in the middle interactions. (this constraint is impossible to check, so this is just best effort)
                 // - [x] A row that holds for the predicate will not be inserted.
                 // - [x] The table `t` will not be renamed, dropped, or altered.
-                // - [x] Under MVCC, no DDL anywhere: `PlanGenerator::next`
-                //   injects COMMITs on every open `BEGIN CONCURRENT` before it
-                //   runs DDL, which closes this property's transaction and
-                //   lets the final SELECT see rows committed by other
-                //   connections — breaking the property's invariant.
+                // - [x] Under MVCC, there will be no DDL (this is a best effort, because concurrent
+                //       transactions could still drop the table, in which case this property will
+                //       be skipped).
 
                 |rng, ctx, query_distr, property| {
                     let Property::DeleteSelect {
@@ -230,6 +228,10 @@ impl Property {
                         }
                         Query::AlterTable(AlterTable { table_name: t, .. }) if *t == table.name => {
                             // Cannot alter the same table
+                            None
+                        }
+                        _ if ctx.opts().mvcc && query.is_ddl() => {
+                            // No DDL in MVCC
                             None
                         }
                         _ => Some(query),
@@ -413,9 +415,9 @@ impl Property {
                         None,
                         Distinctness::All,
                     );
-                    builders.push(InteractionBuilder::with_interaction(InteractionType::Query(
-                        Query::Select(select),
-                    )));
+                    builders.push(InteractionBuilder::with_interaction(
+                        InteractionType::Query(Query::Select(select)),
+                    ));
                 }
 
                 let columns_for_assertion = columns.clone();
@@ -438,8 +440,11 @@ impl Property {
                                 "table {table_for_assertion} disappeared from model"
                             )));
                         };
-                        let model_cols: Vec<&str> =
-                            model_table.columns.iter().map(|c| c.name.as_str()).collect();
+                        let model_cols: Vec<&str> = model_table
+                            .columns
+                            .iter()
+                            .map(|c| c.name.as_str())
+                            .collect();
 
                         let start = stack.len() - n;
                         for (i, col_name) in columns_for_assertion.iter().enumerate() {
