@@ -164,6 +164,11 @@ impl Property {
                 // - [x] There will be no errors in the middle interactions. (this constraint is impossible to check, so this is just best effort)
                 // - [x] A row that holds for the predicate will not be inserted.
                 // - [x] The table `t` will not be renamed, dropped, or altered.
+                // - [x] Under MVCC, no DDL anywhere: `PlanGenerator::next`
+                //   injects COMMITs on every open `BEGIN CONCURRENT` before it
+                //   runs DDL, which closes this property's transaction and
+                //   lets the final SELECT see rows committed by other
+                //   connections — breaking the property's invariant.
 
                 |rng, ctx, query_distr, property| {
                     let Property::DeleteSelect {
@@ -177,6 +182,9 @@ impl Property {
 
                     let table_name = table_name.clone();
                     let query = Query::arbitrary_from(rng, ctx, query_distr);
+                    if ctx.opts().mvcc && query.is_ddl() {
+                        return None;
+                    }
                     // See InsertValuesSelect above — if the target table was
                     // dropped between schedule and generation, fall back to
                     // an unconstrained query.
