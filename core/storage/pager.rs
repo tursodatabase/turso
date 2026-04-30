@@ -471,7 +471,10 @@ impl PageInner {
                     read_varint(crate::slice_in_bounds_or_corrupt!(buf, cell_offset..))?;
                 (size, len, 0usize)
             }
-            _ => unreachable!("cell_index_read_payload_ptr called on non-index page"),
+            other => crate::bail_corrupt_error!(
+                "cell_index_read_payload_ptr called on non-index page (page type: {:?})",
+                other
+            ),
         };
 
         let payload_start = cell_offset + header_skip + varint_len;

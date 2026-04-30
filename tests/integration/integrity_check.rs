@@ -1893,3 +1893,95 @@ fn test_freelist_trunk_page_reuse(db: TempDatabase) {
         "Database should pass integrity check after freelist trunk reuse"
     );
 }
+
+// =============================================================================
+// REGRESSION TEST: Index seek on a page whose type byte is not an index page
+// =============================================================================
+
+/// Regression test for issue #6568.
+///
+/// If a corrupt or unexpected page is encountered while seeking through an index
+/// b-tree (e.g. during sync pull from a remote whose pages don't match local
+/// schema assumptions), `cell_index_read_payload_ptr` previously hit
+/// `unreachable!("cell_index_read_payload_ptr called on non-index page")` and
+/// panicked. It must instead surface a `LimboError::Corrupt`.
+#[cfg(not(feature = "checksum"))]
+#[turso_macros::test]
+fn test_index_seek_on_non_index_page_returns_error(db: TempDatabase) {
+    let conn = db.connect_limbo();
+
+    conn.execute("CREATE TABLE t1(id INTEGER PRIMARY KEY, name TEXT);")
+        .unwrap();
+    conn.execute("CREATE INDEX idx_name ON t1(name);").unwrap();
+    for i in 0..20 {
+        conn.execute(format!("INSERT INTO t1 VALUES ({i}, 'name{i}');"))
+            .unwrap();
+    }
+    checkpoint_database(&conn);
+
+    drop(conn);
+
+    {
+        let mut file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&db.path)
+            .unwrap();
+
+        let file_size = file.metadata().unwrap().len();
+        let num_pages = file_size as usize / PAGE_SIZE;
+
+        let mut corrupted_page_num = None;
+        for page_num in 2..=num_pages {
+            let page_offset = (page_num - 1) * PAGE_SIZE;
+            let mut page_type_byte = [0u8; 1];
+            file.seek(SeekFrom::Start(page_offset as u64)).unwrap();
+            file.read_exact(&mut page_type_byte).unwrap();
+
+            // 0x0a = IndexLeaf, 0x02 = IndexInterior
+            if page_type_byte[0] == 0x0a || page_type_byte[0] == 0x02 {
+                // Overwrite the page-type byte with TableLeaf (0x0d).
+                file.seek(SeekFrom::Start(page_offset as u64)).unwrap();
+                file.write_all(&[0x0d]).unwrap();
+                corrupted_page_num = Some(page_num);
+                break;
+            }
+        }
+        file.sync_all().unwrap();
+        assert!(
+            corrupted_page_num.is_some(),
+            "Expected to find an index page to corrupt"
+        );
+    }
+
+    let db = TempDatabase::new_with_existent(&db.path);
+    let conn = db.connect_limbo();
+
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        // This SELECT plans through idx_name, which seeks the corrupted index page.
+        conn.prepare("SELECT id FROM t1 WHERE name = 'name5'")
+            .and_then(|mut stmt| stmt.run_with_row_callback(|_| Ok(())))
+    }));
+
+    match result {
+        Ok(Ok(())) => panic!("Expected query to return an error, but it succeeded"),
+        Ok(Err(err)) => {
+            let msg = format!("{err}");
+            assert!(
+                msg.to_lowercase().contains("corrupt"),
+                "Expected a corruption error, got: {msg}"
+            );
+        }
+        Err(panic_info) => {
+            let panic_msg = panic_info
+                .downcast_ref::<&str>()
+                .map(|s| s.to_string())
+                .or_else(|| panic_info.downcast_ref::<String>().cloned())
+                .unwrap_or_else(|| "unknown panic".to_string());
+            panic!(
+                "Expected an error, but the query panicked: {panic_msg}. \
+                 Index seek on a non-index page must surface a corruption error."
+            );
+        }
+    }
+}
