@@ -3188,3 +3188,175 @@ test fk-alter-table-add-column-rejects-missing {
 }
 expect error {
 }
+
+# Regression for #6218: UPDATE on a parent's rowid-alias PK must not
+# double-decrement the deferred FK violation counter. With the bug, the
+# inline NEW-key probe and a duplicate post-write NEW-key probe both
+# decrement, allowing RELEASE to succeed when violations remain.
+@cross-check-integrity
+test fk-deferred-update-parent-no-double-decrement {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE p (id INTEGER PRIMARY KEY, tag TEXT);
+    CREATE TABLE c (id INTEGER PRIMARY KEY, pid INT,
+        FOREIGN KEY(pid) REFERENCES p(id) DEFERRABLE INITIALLY DEFERRED);
+    INSERT INTO p VALUES (24,'p24'),(4,'p4');
+    INSERT INTO c VALUES (1,24,NULL),(2,24,NULL),(3,4,NULL),(4,4,NULL);
+    SAVEPOINT sp0;
+    DELETE FROM p WHERE id = 4;            -- +2 violations (c rows pid=4)
+    UPDATE p SET id = 4 WHERE id = 24;     -- OLD probe +2, NEW probe -2; net 0
+    RELEASE sp0;                            -- 2 real violations remain (c.pid=24)
+}
+expect error {
+}
+
+# Same scenario but the parent key is referenced via a UNIQUE index, not the
+# rowid alias. Exercises the index-key change path in
+# emit_parent_index_key_change_checks.
+@cross-check-integrity
+test fk-deferred-update-parent-unique-no-double-decrement {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE p (id INTEGER PRIMARY KEY, k INT UNIQUE);
+    CREATE TABLE c (id INTEGER PRIMARY KEY, pk INT,
+        FOREIGN KEY(pk) REFERENCES p(k) DEFERRABLE INITIALLY DEFERRED);
+    INSERT INTO p VALUES (1,24),(2,4);
+    INSERT INTO c VALUES (10,24),(11,24),(12,4),(13,4);
+    SAVEPOINT sp0;
+    DELETE FROM p WHERE k = 4;             -- +2 violations on c.pk=4
+    UPDATE p SET k = 4 WHERE k = 24;       -- inline OLD +2, inline NEW -2
+    RELEASE sp0;                            -- c.pk=24 rows still orphaned
+}
+expect error {
+}
+
+# Counter must reach exactly zero (not negative) when an UPDATE moves the
+# parent key onto a value that has matching children, and there are no
+# pre-existing violations. Without the guard against negative counters,
+# a double-decrement would let the RELEASE of unrelated future violations
+# pass.
+@cross-check-integrity
+test fk-deferred-update-parent-net-zero-then-violate {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE p (id INTEGER PRIMARY KEY);
+    CREATE TABLE c (id INTEGER PRIMARY KEY, pid INT,
+        FOREIGN KEY(pid) REFERENCES p(id) DEFERRABLE INITIALLY DEFERRED);
+    INSERT INTO p VALUES (24),(4);
+    INSERT INTO c VALUES (1,4),(2,4);
+    SAVEPOINT sp0;
+    DELETE FROM p WHERE id = 4;            -- +2 violations
+    UPDATE p SET id = 4 WHERE id = 24;     -- inline OLD scan finds none, inline NEW -2; counter 0
+    INSERT INTO c VALUES (3,77);           -- +1 deferred violation (no parent 77)
+    RELEASE sp0;                            -- one real violation remains
+}
+expect error {
+}
+
+# Plain UPDATE that should leave the counter at zero must not somehow flip
+# negative or cancel later violations. Without the bug, OLD probe +0 and
+# NEW probe -0 yields 0; we then add a real deferred violation and verify
+# it is detected at RELEASE.
+@cross-check-integrity
+test fk-deferred-update-parent-no-children-then-violate {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE p (id INTEGER PRIMARY KEY);
+    CREATE TABLE c (id INTEGER PRIMARY KEY, pid INT,
+        FOREIGN KEY(pid) REFERENCES p(id) DEFERRABLE INITIALLY DEFERRED);
+    INSERT INTO p VALUES (1),(2);
+    SAVEPOINT sp0;
+    UPDATE p SET id = 99 WHERE id = 1;     -- no children referencing OLD or NEW
+    INSERT INTO c VALUES (1,77);           -- +1 deferred violation
+    RELEASE sp0;
+}
+expect error {
+}
+
+# UPDATE OR REPLACE on a parent must use the AfterReplace post-write probe
+# (since a child matching the NEW key may still belong to a soon-to-be-replaced
+# parent row). This test exercises that path; without the post-write decrement
+# the counter would stay positive after the REPLACE-driven delete cancels it.
+@cross-check-integrity
+test fk-deferred-update-or-replace-parent-counter-balances {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE p (id INTEGER PRIMARY KEY, tag TEXT);
+    CREATE TABLE c (id INTEGER PRIMARY KEY, pid INT,
+        FOREIGN KEY(pid) REFERENCES p(id) DEFERRABLE INITIALLY DEFERRED);
+    INSERT INTO p VALUES (24,'p24'),(4,'p4');
+    INSERT INTO c VALUES (1,4),(2,4);
+    BEGIN;
+    UPDATE OR REPLACE p SET id = 4 WHERE id = 24;  -- replaces p.id=4; c.pid=4 reattaches
+    COMMIT;
+    SELECT id, pid FROM c ORDER BY id;
+}
+expect {
+    1|4
+    2|4
+}
+
+# UPDATE OR REPLACE that creates orphans must still fail at COMMIT.
+@cross-check-integrity
+test fk-deferred-update-or-replace-parent-leaves-violation {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE p (id INTEGER PRIMARY KEY);
+    CREATE TABLE c (id INTEGER PRIMARY KEY, pid INT,
+        FOREIGN KEY(pid) REFERENCES p(id) DEFERRABLE INITIALLY DEFERRED);
+    INSERT INTO p VALUES (24),(4);
+    INSERT INTO c VALUES (1,24);
+    BEGIN;
+    UPDATE OR REPLACE p SET id = 4 WHERE id = 24;  -- c.pid=24 orphaned
+    COMMIT;
+}
+expect error {
+}
+
+# Composite (multi-column) FK: an UPDATE on the composite parent key must
+# not double-decrement when the new key happens to match other child rows.
+@cross-check-integrity
+test fk-deferred-update-parent-composite-no-double-decrement {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE p (a INT, b INT, PRIMARY KEY(a,b));
+    CREATE TABLE c (id INTEGER PRIMARY KEY, ca INT, cb INT,
+        FOREIGN KEY(ca,cb) REFERENCES p(a,b) DEFERRABLE INITIALLY DEFERRED);
+    INSERT INTO p VALUES (1,1),(2,2);
+    INSERT INTO c VALUES (10,1,1),(11,1,1),(12,2,2),(13,2,2);
+    SAVEPOINT sp0;
+    DELETE FROM p WHERE a = 2;             -- +2 violations on c.(ca,cb)=(2,2)
+    UPDATE p SET a = 2, b = 2 WHERE a = 1; -- inline OLD +2, inline NEW -2
+    RELEASE sp0;                            -- c rows (1,1) now orphaned
+}
+expect error {
+}
+
+# Self-referential deferred FK: UPDATE on self-ref parent must not
+# double-decrement. A child row that also lives in the same table must
+# not be counted twice in OLD/NEW reconciliation.
+@cross-check-integrity
+test fk-deferred-update-self-ref-parent-no-double-decrement {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE t (id INTEGER PRIMARY KEY, pid INT,
+        FOREIGN KEY(pid) REFERENCES t(id) DEFERRABLE INITIALLY DEFERRED);
+    INSERT INTO t VALUES (1,NULL),(2,1),(3,1),(4,NULL);
+    SAVEPOINT sp0;
+    DELETE FROM t WHERE id = 4;            -- no children of 4; counter unchanged
+    UPDATE t SET id = 99 WHERE id = 1;     -- OLD probe finds rows 2,3 -> +2; NEW probe finds none -> 0
+    RELEASE sp0;                            -- 2 real violations remain (rows 2,3 -> id=1 missing)
+}
+expect error {
+}
+
+# When the parent UPDATE doesn't actually change the key (NEW == OLD), the
+# counter should be untouched. With the bug, the post-write probe could fire
+# anyway and underflow / mask later violations.
+@cross-check-integrity
+test fk-deferred-update-parent-key-unchanged {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE p (id INTEGER PRIMARY KEY, tag TEXT);
+    CREATE TABLE c (id INTEGER PRIMARY KEY, pid INT,
+        FOREIGN KEY(pid) REFERENCES p(id) DEFERRABLE INITIALLY DEFERRED);
+    INSERT INTO p VALUES (1,'a'),(2,'b');
+    INSERT INTO c VALUES (10,1),(11,1);
+    BEGIN;
+    UPDATE p SET tag = 'updated' WHERE id = 1;  -- key unchanged; no probes
+    INSERT INTO c VALUES (12,77);                -- +1 deferred violation
+    COMMIT;
+}
+expect error {
+}
