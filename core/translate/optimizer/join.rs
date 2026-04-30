@@ -25,7 +25,10 @@ use crate::{
                 estimate_hash_join_cost, try_hash_join_access_method, AccessMethodParams,
                 ResidualConstraintMode,
             },
-            cost::{Cost, RowCountEstimate},
+            cost::{
+                estimate_rows_per_seek, rows_per_leaf_page_for_index, AnalyzeCtx, Cost, IndexInfo,
+                RowCountEstimate,
+            },
             order::plan_satisfies_order_target,
         },
         plan::{
@@ -1395,8 +1398,15 @@ pub fn compute_greedy_join_order<'a>(
     let mut join_order: Vec<JoinOrderMember> = Vec::with_capacity(num_tables);
 
     // Pick starting table: prefer tables with high "hub score" (referenced by many constraints).
-    let first_idx =
-        find_best_starting_table(num_tables, constraints, base_table_rows, &left_join_deps);
+    let first_idx = find_best_starting_table(
+        num_tables,
+        joined_tables,
+        constraints,
+        base_table_rows,
+        &left_join_deps,
+        analyze_stats,
+        params,
+    );
     let first_table = &joined_tables[first_idx];
     join_order.push(JoinOrderMember {
         table_id: first_table.internal_id,
@@ -1556,11 +1566,22 @@ pub fn compute_greedy_join_order<'a>(
 /// Lower score wins. Outer join RHS tables are excluded.
 fn find_best_starting_table(
     num_tables: usize,
+    joined_tables: &[JoinedTable],
     constraints: &[TableConstraints],
     base_table_rows: &[RowCountEstimate],
     left_join_deps: &HashMap<usize, TableMask>,
+    analyze_stats: &AnalyzeStats,
+    params: &CostModelParams,
 ) -> usize {
-    let multipliers = compute_indexed_seek_benefits(num_tables, constraints, left_join_deps);
+    let multipliers = compute_indexed_seek_benefits(
+        num_tables,
+        joined_tables,
+        constraints,
+        base_table_rows,
+        left_join_deps,
+        analyze_stats,
+        params,
+    );
 
     let mut best: Option<(usize, f64)> = None;
     for t in 0..num_tables {
@@ -1639,12 +1660,17 @@ impl IndexedSeekBenefit {
 /// ### Complexity
 ///
 /// - Time: O(C + T), where C is the total number of constraint
-///   references across all index candidates, and T is the number of tables.
+///   references scanned across all index candidates, including usable-prefix
+///   row-estimation work, and T is the number of tables.
 /// - Space: O(T) to store the benefits for each candidate table.
 fn compute_indexed_seek_benefits(
     num_tables: usize,
+    joined_tables: &[JoinedTable],
     constraints: &[TableConstraints],
+    base_table_rows: &[RowCountEstimate],
     left_join_deps: &HashMap<usize, TableMask>,
+    analyze_stats: &AnalyzeStats,
+    params: &CostModelParams,
 ) -> Vec<f64> {
     let mut benefits = vec![IndexedSeekBenefit::default(); num_tables];
 
@@ -1663,7 +1689,15 @@ fn compute_indexed_seek_benefits(
         if let Some(dep_t) = deps.iter().next() {
             let mut mask = TableMask::default();
             mask.set(dep_t);
-            let score = get_best_seek_score(&constraints[rhs], &mask, rhs);
+            let score = get_best_seek_score(
+                &constraints[rhs],
+                &mask,
+                rhs,
+                &joined_tables[rhs],
+                base_table_rows[rhs],
+                analyze_stats,
+                params,
+            );
             if score > 0.0 {
                 benefits[dep_t].reward += score;
                 benefits[rhs].penalty += score;
@@ -1686,7 +1720,15 @@ fn compute_indexed_seek_benefits(
                 }
             }
 
-            let constant_score = get_best_seek_score(&constraints[rhs], &TableMask::default(), rhs);
+            let constant_score = get_best_seek_score(
+                &constraints[rhs],
+                &TableMask::default(),
+                rhs,
+                &joined_tables[rhs],
+                base_table_rows[rhs],
+                analyze_stats,
+                params,
+            );
             if constant_score > 0.0 {
                 total_constant_score += constant_score;
                 constant_scores[rhs] = constant_score;
@@ -1699,7 +1741,15 @@ fn compute_indexed_seek_benefits(
                 }
                 let mut mask = TableMask::default();
                 mask.set(t);
-                let specific_score = get_best_seek_score(&constraints[rhs], &mask, rhs);
+                let specific_score = get_best_seek_score(
+                    &constraints[rhs],
+                    &mask,
+                    rhs,
+                    &joined_tables[rhs],
+                    base_table_rows[rhs],
+                    analyze_stats,
+                    params,
+                );
                 let delta = specific_score - constant_score;
                 if delta != 0.0 {
                     benefits[t].reward += delta;
@@ -1719,19 +1769,22 @@ fn compute_indexed_seek_benefits(
 /// Calculate the best "seek score" for a table given a set of already joined tables (lhs_mask).
 ///
 /// A higher score indicates that joining the LHS tables enables a more efficient indexed seek
-/// for the RHS table. Priorities are:
-/// 1. Secondary index equality seek (highest)
-/// 2. RowID/PK equality seek
-/// 3. Range scan (lowest)
+/// for the RHS table. The score is based on estimated row reduction:
+///
+/// `ln(base_rows / estimated_rows_per_seek)`
+///
+/// This reuses the normal access-path row estimator, so longer usable index prefixes,
+/// selectivity defaults, and ANALYZE stats affect the greedy starting-table heuristic
+/// in the same direction as regular seek costing.
 fn get_best_seek_score(
     rhs_constraints: &TableConstraints,
     lhs_mask: &TableMask,
     rhs: usize,
+    rhs_table: &JoinedTable,
+    base_row_count: RowCountEstimate,
+    analyze_stats: &AnalyzeStats,
+    params: &CostModelParams,
 ) -> f64 {
-    const INDEX_EQ_SCORE: f64 = 2.0;
-    const ROWID_EQ_SCORE: f64 = 1.5;
-    const RANGE_SCORE: f64 = 0.5;
-
     let mut best_score = 0.0;
     for candidate in &rhs_constraints.candidates {
         let usable_constraint_refs = usable_constraints_for_lhs_mask(
@@ -1740,19 +1793,45 @@ fn get_best_seek_score(
             lhs_mask,
             rhs,
         );
-        if let Some(first_ref) = usable_constraint_refs.first() {
-            let score = if first_ref.eq.is_some() {
-                if candidate.index.is_some() {
-                    INDEX_EQ_SCORE
-                } else {
-                    ROWID_EQ_SCORE
-                }
-            } else {
-                RANGE_SCORE
-            };
-            if score > best_score {
-                best_score = score;
-            }
+        if usable_constraint_refs.is_empty() {
+            continue;
+        }
+
+        let index_info = match candidate.index.as_ref() {
+            Some(index) => IndexInfo {
+                unique: index.unique,
+                covering: rhs_table.index_is_covering(index),
+                column_count: index.columns.len(),
+                rows_per_leaf_page: rows_per_leaf_page_for_index(
+                    index.columns.len(),
+                    rhs_table,
+                    params.rows_per_table_page,
+                ),
+            },
+            None => IndexInfo {
+                unique: true,
+                covering: true,
+                column_count: 1,
+                rows_per_leaf_page: params.rows_per_table_page,
+            },
+        };
+        let analyze_ctx = AnalyzeCtx {
+            rhs_table,
+            index: candidate.index.as_ref(),
+            stats: analyze_stats,
+        };
+        let estimated_rows = estimate_rows_per_seek(
+            index_info,
+            &rhs_constraints.constraints,
+            &usable_constraint_refs,
+            base_row_count,
+            Some(&analyze_ctx),
+        )
+        .max(1.0);
+        let base_rows = (*base_row_count).max(1.0);
+        let score = (base_rows / estimated_rows).ln().max(0.0);
+        if score > best_score {
+            best_score = score;
         }
     }
     best_score
@@ -1976,6 +2055,70 @@ mod tests {
         assert!(bitmasks.contains(&0b1001.into())); // {0,3}
         assert!(bitmasks.contains(&0b1010.into())); // {1,3}
         assert!(bitmasks.contains(&0b1100.into())); // {2,3}
+    }
+
+    #[test]
+    fn test_seek_score_accounts_for_composite_index_prefix() {
+        let mut table_id_counter = TableRefIdCounter::new();
+        let t1 = _create_btree_table("table1", _create_column_list(&["x"], Type::Integer));
+        let t2 = _create_btree_table(
+            "table2",
+            _create_column_list(&["x", "y", "z"], Type::Integer),
+        );
+        let joined_tables = vec![
+            _create_table_reference(t1, None, table_id_counter.next()),
+            _create_table_reference(
+                t2,
+                Some(JoinInfo {
+                    join_type: JoinType::Inner,
+                    using: vec![],
+                    no_reorder: false,
+                }),
+                table_id_counter.next(),
+            ),
+        ];
+
+        const TABLE1: usize = 0;
+        const TABLE2: usize = 1;
+
+        let where_clause = vec![
+            _create_binary_expr(
+                _create_column_expr(joined_tables[TABLE2].internal_id, 0, false),
+                ast::Operator::Equals,
+                _create_column_expr(joined_tables[TABLE1].internal_id, 0, false),
+            ),
+            _create_binary_expr(
+                _create_column_expr(joined_tables[TABLE2].internal_id, 1, false),
+                ast::Operator::Equals,
+                _create_numeric_literal("1"),
+            ),
+            _create_binary_expr(
+                _create_column_expr(joined_tables[TABLE2].internal_id, 2, false),
+                ast::Operator::Equals,
+                _create_numeric_literal("2"),
+            ),
+        ];
+
+        let single_col_index = _create_index("idx_table2_x", "table2", &[("x", 0)], false);
+        let composite_index = _create_index(
+            "idx_table2_xyz",
+            "table2",
+            &[("x", 0), ("y", 1), ("z", 2)],
+            false,
+        );
+
+        let single_col_score = seek_score_for_indexes(
+            &joined_tables,
+            &where_clause,
+            VecDeque::from([single_col_index]),
+        );
+        let composite_score = seek_score_for_indexes(
+            &joined_tables,
+            &where_clause,
+            VecDeque::from([composite_index]),
+        );
+
+        assert!(composite_score > single_col_score);
     }
 
     #[test]
@@ -3370,6 +3513,36 @@ mod tests {
         ))
     }
 
+    fn _create_index(
+        name: &str,
+        table_name: &str,
+        columns: &[(&str, usize)],
+        unique: bool,
+    ) -> Arc<Index> {
+        Arc::new(Index {
+            name: name.to_string(),
+            table_name: table_name.to_string(),
+            where_clause: None,
+            columns: columns
+                .iter()
+                .map(|(name, pos_in_table)| IndexColumn {
+                    name: (*name).to_string(),
+                    order: SortOrder::Asc,
+                    pos_in_table: *pos_in_table,
+                    collation: None,
+                    default: None,
+                    expr: None,
+                })
+                .collect(),
+            unique,
+            ephemeral: false,
+            root_page: 1,
+            has_rowid: true,
+            index_method: None,
+            on_conflict: None,
+        })
+    }
+
     /// Creates a TableReference for a BTreeTable
     fn _create_table_reference(
         table: Arc<BTreeTable>,
@@ -3414,6 +3587,37 @@ mod tests {
     /// Creates a numeric literal expression
     fn _create_numeric_literal(value: &str) -> Expr {
         Expr::Literal(ast::Literal::Numeric(value.to_string()))
+    }
+
+    fn seek_score_for_indexes(
+        joined_tables: &[JoinedTable],
+        where_clause: &[WhereTerm],
+        indexes: VecDeque<Arc<Index>>,
+    ) -> f64 {
+        let mut available_indexes = HashMap::default();
+        available_indexes.insert("table2".to_string(), indexes);
+        let table_references = TableReferences::new(joined_tables.to_vec(), vec![]);
+        let constraints = constraints_from_where_clause(
+            where_clause,
+            &table_references,
+            &available_indexes,
+            &[],
+            &empty_schema(),
+            &DEFAULT_PARAMS,
+        )
+        .unwrap();
+
+        let mut lhs_mask = TableMask::default();
+        lhs_mask.set(0);
+        get_best_seek_score(
+            &constraints[1],
+            &lhs_mask,
+            1,
+            &joined_tables[1],
+            RowCountEstimate::hardcoded_fallback(&DEFAULT_PARAMS),
+            &AnalyzeStats::default(),
+            &DEFAULT_PARAMS,
+        )
     }
 
     fn _as_btree(
