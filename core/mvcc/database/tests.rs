@@ -1083,6 +1083,35 @@ fn test_recovery_checkpoint_then_more_writes() {
     assert_eq!(rows[2][1].to_string(), "c");
 }
 
+/// This test checks that after MVCC restart, the auto-indexes for PRIMARY KEY and UNIQUE
+/// constraints stay associated with the columns they were created for.
+#[test]
+fn test_restart_preserves_autoindex_to_column_mapping() {
+    let mut db = MvccTestDbNoConn::new_with_random_db_with_opts(DatabaseOpts::new());
+    {
+        let conn = db.connect();
+        // The dummy table exposes the bug because of the implementation of the HashMap used to
+        // store schema rows. This test is not perfect, because it may not catch a regression if
+        // the implementation changes. But until we patch the simulator to reproduce the bug,
+        // this'll do.
+        conn.execute("CREATE TABLE dummy(x)").unwrap();
+        conn.execute("CREATE TABLE t(a TEXT PRIMARY KEY, b TEXT UNIQUE)")
+            .unwrap();
+        conn.execute("INSERT INTO t VALUES('aa', 'bb')").unwrap();
+        conn.close().unwrap();
+    }
+
+    db.restart();
+
+    let conn = db.connect();
+    let a_rows = get_rows(&conn, "SELECT a FROM t");
+    assert_eq!(a_rows.len(), 1);
+    assert_eq!(a_rows[0][0].to_string(), "aa");
+    let b_rows = get_rows(&conn, "SELECT b FROM t");
+    assert_eq!(b_rows.len(), 1);
+    assert_eq!(b_rows[0][0].to_string(), "bb");
+}
+
 /// What this test checks: MVCC restart handles sqlite_schema rows with rootpage=0 (triggers).
 /// Why this matters: Trigger definitions are stored without btrees and should not break recovery.
 #[test]

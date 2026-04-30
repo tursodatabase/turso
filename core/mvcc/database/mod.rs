@@ -4665,7 +4665,10 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                 let syms = connection.syms.read();
                 let mv_store = connection.db.get_mv_store().clone();
 
-                for record in schema_rows.values() {
+                let mut sorted_rowids: Vec<i64> = schema_rows.keys().copied().collect();
+                sorted_rowids.sort_unstable();
+                for rowid in &sorted_rowids {
+                    let record = &schema_rows[rowid];
                     let ty = match record.get_value_opt(0) {
                         Some(ValueRef::Text(v)) => v.as_str(),
                         _ => {
