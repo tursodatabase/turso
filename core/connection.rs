@@ -2526,22 +2526,22 @@ impl Connection {
             .get_pager_from_database_index(&database_id)
             .expect("attached database should always have a pager");
 
-        if pager.holds_read_lock() || pager.holds_write_lock() {
+        // Block DETACH whenever the attached database has an open transaction.
+        // Otherwise its in-flight changes would be silently discarded, breaking
+        // atomicity across databases (matches SQLite's behavior).
+        if pager.holds_read_lock()
+            || pager.holds_write_lock()
+            || self.get_mv_tx_for_db(database_id).is_some()
+        {
             return Err(LimboError::InvalidArgument(format!(
                 "database {alias} is locked"
             )));
         }
 
-        if let Some((tx_id, _mode)) = self.get_mv_tx_for_db(database_id) {
-            if let Some(mv_store) = self.mv_store_for_db(database_id) {
-                mv_store.rollback_tx(tx_id, pager.clone(), self, database_id);
-                pager.end_read_tx();
-            }
-            self.set_mv_tx_for_db(database_id, None);
-        } else {
-            // Non-MVCC attached DB (e.g. :memory:) — rollback WAL state.
-            pager.rollback_attached();
-        }
+        // No active transaction on this database — nothing to roll back, but
+        // call rollback_attached to release any lingering pager state for
+        // non-MVCC attached DBs (e.g. :memory:).
+        pager.rollback_attached();
 
         // Remove from catalog. The write lock must be released before
         // acquiring database_schemas.write() to maintain consistent lock

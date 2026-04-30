@@ -32,3 +32,89 @@ test detach-succeeds-after-commit {
 }
 expect {
 }
+
+test detach-fails-during-savepoint-with-aux-write {
+    ATTACH ':memory:' AS aux;
+    CREATE TABLE aux.t1 (id INTEGER PRIMARY KEY, val TEXT);
+    INSERT INTO aux.t1 VALUES (1, 'committed');
+    SAVEPOINT sp1;
+    INSERT INTO aux.t1 VALUES (2, 'in_savepoint');
+    DETACH aux;
+}
+expect error {
+    .*database aux is locked.*
+}
+
+test detach-fails-during-nested-savepoint-with-aux-write {
+    ATTACH ':memory:' AS aux;
+    CREATE TABLE aux.t1 (id INTEGER PRIMARY KEY);
+    BEGIN;
+    SAVEPOINT sp1;
+    INSERT INTO aux.t1 VALUES (1);
+    DETACH aux;
+}
+expect error {
+    .*database aux is locked.*
+}
+
+test detach-fails-during-savepoint-with-aux-read {
+    ATTACH ':memory:' AS aux;
+    CREATE TABLE aux.t1 (id INTEGER PRIMARY KEY);
+    SAVEPOINT sp1;
+    SELECT * FROM aux.t1;
+    DETACH aux;
+}
+expect error {
+    .*database aux is locked.*
+}
+
+test detach-fails-mixed-main-aux-update {
+    ATTACH ':memory:' AS aux;
+    CREATE TABLE main.m1 (id INTEGER PRIMARY KEY, val TEXT);
+    CREATE TABLE aux.a1 (id INTEGER PRIMARY KEY, val TEXT);
+    INSERT INTO main.m1 VALUES (1, 'main_orig');
+    INSERT INTO aux.a1 VALUES (1, 'aux_orig');
+    BEGIN;
+    UPDATE main.m1 SET val = 'main_changed';
+    UPDATE aux.a1 SET val = 'aux_changed';
+    DETACH aux;
+}
+expect error {
+    .*database aux is locked.*
+}
+
+test detach-succeeds-after-savepoint-release {
+    ATTACH ':memory:' AS aux;
+    CREATE TABLE aux.t1 (id INTEGER PRIMARY KEY);
+    SAVEPOINT sp1;
+    INSERT INTO aux.t1 VALUES (1);
+    RELEASE sp1;
+    DETACH aux;
+}
+expect {
+}
+
+test detach-succeeds-after-rollback {
+    ATTACH ':memory:' AS aux;
+    CREATE TABLE aux.t1 (id INTEGER PRIMARY KEY);
+    BEGIN;
+    INSERT INTO aux.t1 VALUES (1);
+    ROLLBACK;
+    DETACH aux;
+}
+expect {
+}
+
+test detach-succeeds-during-begin-without-aux-access {
+    ATTACH ':memory:' AS aux;
+    CREATE TABLE aux.t1 (id INTEGER PRIMARY KEY);
+    CREATE TABLE main.m1 (id INTEGER PRIMARY KEY);
+    BEGIN;
+    INSERT INTO main.m1 VALUES (1);
+    DETACH aux;
+    COMMIT;
+    SELECT * FROM main.m1;
+}
+expect {
+    1
+}
