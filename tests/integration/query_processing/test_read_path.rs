@@ -1069,3 +1069,121 @@ fn test_parameter_column_names(tmp_db: TempDatabase) {
         assert_eq!(names, expected, "Turso column names mismatch for: {sql}");
     }
 }
+
+/// Regression test for https://github.com/tursodatabase/turso/issues/5979
+///
+/// When the same `?N` placeholder appears multiple times — including inside
+/// arithmetic expressions and LIMIT/OFFSET — `parameters_count()` must return
+/// the highest declared index, every declared slot must be registered, and
+/// execution must match SQLite. The Go binding (and other clients) compares
+/// `parameters_count()` against the number of supplied args before calling
+/// `bind`, so an off-by-one count surfaces as a hard "got X args, want Y"
+/// error rather than silent corruption.
+#[turso_macros::test]
+fn test_repeated_parameter_count_and_execution(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+    conn.execute(
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, val INTEGER, label TEXT, ts TEXT UNIQUE)",
+    )?;
+    for i in 1..=5 {
+        conn.execute(format!(
+            "INSERT INTO t VALUES ({i}, {}, 'row{i}', 'ts{i}')",
+            i * 10
+        ))?;
+    }
+
+    // Each case: (sql, [(?N → bound value)], expected param count, expected rows).
+    // Rows are formatted as comma-joined typed Values for easy comparison.
+    type Bind<'a> = (usize, Value);
+    type Case<'a> = (&'a str, &'a [Bind<'a>], usize, &'a [&'a str]);
+    let cases: &[Case] = &[
+        // ?1 reused inside arithmetic on result column AND in LIMIT/OFFSET.
+        // This is the exact pattern from the bug report's pagination query.
+        (
+            "SELECT id, (1 + cast(?1 AS int) - 1) / cast(?1 AS int) AS pages FROM t LIMIT ?1 OFFSET ?1 * (cast(?2 AS int) - 1)",
+            &[(1, Value::from_i64(2)), (2, Value::from_i64(2))],
+            2,
+            &["3,1", "4,1"],
+        ),
+        // Workaround variant from the bug report: arithmetic with reversed
+        // multiplication order (`(cast(?2 AS int) - 1) * ?1`) must behave
+        // identically to the form above.
+        (
+            "SELECT id FROM t LIMIT ?1 OFFSET (cast(?2 AS int) - 1) * ?1",
+            &[(1, Value::from_i64(2)), (2, Value::from_i64(2))],
+            2,
+            &["3", "4"],
+        ),
+        // ?1 reused 3+ times in an expression.
+        (
+            "SELECT ?1 + ?1 + ?1",
+            &[(1, Value::from_i64(7))],
+            1,
+            &["21"],
+        ),
+        // Sparse positional indices: highest index dictates count even when
+        // earlier slots are never referenced.
+        (
+            "SELECT ?5, ?1",
+            &[(1, Value::from_i64(11)), (5, Value::from_i64(55))],
+            5,
+            &["55,11"],
+        ),
+        // River-queue style INSERT: ?1 appears in two separate VALUES columns.
+        // ON CONFLICT + RETURNING shouldn't change parameter accounting.
+        (
+            "INSERT INTO t (id, val, label, ts) VALUES (
+                100,
+                cast(?1 AS int),
+                ?2,
+                coalesce(cast(?3 AS text), cast(?1 AS text), 'fallback')
+             ) ON CONFLICT (ts) DO UPDATE SET val = EXCLUDED.val
+             RETURNING id, val, label, ts",
+            &[
+                (1, Value::from_i64(99)),
+                (2, Value::build_text("inserted")),
+                (3, Value::Null),
+            ],
+            3,
+            &["100,99,inserted,99"],
+        ),
+    ];
+
+    for (sql, binds, expected_count, expected_rows) in cases {
+        let mut stmt = conn.prepare(sql)?;
+        assert_eq!(
+            stmt.parameters().count(),
+            *expected_count,
+            "parameters_count mismatch for: {sql}"
+        );
+        // Every declared slot must be registered so the binding layer can
+        // validate args without a spurious "unknown parameter" error.
+        for slot in 1..=*expected_count {
+            assert!(
+                stmt.parameters().has_slot(slot.try_into().unwrap()),
+                "slot {slot} not registered for: {sql}"
+            );
+        }
+        for (idx, value) in *binds {
+            stmt.bind_at((*idx).try_into()?, value.clone());
+        }
+        let mut rows: Vec<String> = Vec::new();
+        stmt.run_with_row_callback(|row| {
+            let parts: Vec<String> = row
+                .get_values()
+                .map(|v| match v {
+                    Value::Null => "NULL".to_string(),
+                    Value::Numeric(Numeric::Integer(i)) => i.to_string(),
+                    Value::Numeric(Numeric::Float(f)) => f64::from(*f).to_string(),
+                    Value::Text(s) => s.as_str().to_string(),
+                    Value::Blob(b) => format!("blob:{}", b.len()),
+                })
+                .collect();
+            rows.push(parts.join(","));
+            Ok(())
+        })?;
+        let expected: Vec<String> = expected_rows.iter().map(|s| s.to_string()).collect();
+        assert_eq!(rows, expected, "rows mismatch for: {sql}");
+    }
+    Ok(())
+}
