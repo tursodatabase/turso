@@ -1529,6 +1529,82 @@ expect {
     2|4|4
 }
 
+test gencol_tvf_comma_join_json_each_virtual_column {
+    CREATE TABLE t1(a INTEGER, b GENERATED ALWAYS AS (a*2) VIRTUAL);
+    INSERT INTO t1(a) VALUES(1),(2),(3);
+    SELECT t1.a, t1.b FROM t1, json_each('[1,2,3]') je WHERE t1.a = je.value;
+}
+expect {
+    1|2
+    2|4
+    3|6
+}
+
+test gencol_tvf_comma_join_generate_series_virtual_column {
+    CREATE TABLE t1(a INTEGER, b GENERATED ALWAYS AS (a*2) VIRTUAL);
+    INSERT INTO t1(a) VALUES(1),(2),(3);
+    SELECT t1.a, t1.b FROM t1, generate_series(1, 3) gs WHERE t1.a = gs.value;
+}
+expect {
+    1|2
+    2|4
+    3|6
+}
+
+test gencol_tvf_left_join_virtual_column {
+    CREATE TABLE t1(a INTEGER, b GENERATED ALWAYS AS (a*2) VIRTUAL);
+    INSERT INTO t1(a) VALUES(1),(2),(3);
+    SELECT t1.b FROM generate_series(1,3) gs LEFT JOIN t1 ON gs.value = t1.a;
+}
+expect {
+    2
+    4
+    6
+}
+
+test gencol_tvf_first_comma_join_virtual_column {
+    CREATE TABLE t1(a INTEGER, b GENERATED ALWAYS AS (a*2) VIRTUAL);
+    INSERT INTO t1(a) VALUES(1),(2),(3);
+    SELECT t1.b FROM generate_series(1,3) gs, t1 WHERE gs.value = t1.a;
+}
+expect {
+    2
+    4
+    6
+}
+
+test gencol_tvf_comma_join_base_column {
+    CREATE TABLE t1(a INTEGER, b GENERATED ALWAYS AS (a*2) VIRTUAL);
+    INSERT INTO t1(a) VALUES(1),(2),(3);
+    SELECT t1.a FROM t1, json_each('[1,2,3]') je WHERE t1.a = je.value;
+}
+expect {
+    1
+    2
+    3
+}
+
+test gencol_tvf_left_join_virtual_column_table_first {
+    CREATE TABLE t1(a INTEGER, b GENERATED ALWAYS AS (a*2) VIRTUAL);
+    INSERT INTO t1(a) VALUES(1),(2),(3);
+    SELECT t1.b FROM t1 LEFT JOIN generate_series(1,3) gs ON t1.a = gs.value;
+}
+expect {
+    2
+    4
+    6
+}
+
+test gencol_tvf_subquery_virtual_column {
+    CREATE TABLE t1(a INTEGER, b GENERATED ALWAYS AS (a*2) VIRTUAL);
+    INSERT INTO t1(a) VALUES(1),(2),(3);
+    SELECT * FROM t1 WHERE b IN (SELECT value FROM json_each('[2,6]'));
+}
+expect {
+    1|2
+    3|6
+}
+
 test gencol_window_sum_partition {
     CREATE TABLE t1(a INTEGER, b TEXT, c AS (a % 2) VIRTUAL);
     INSERT INTO t1(a, b) VALUES(1, 'a'), (2, 'b'), (3, 'c'), (4, 'd'), (5, 'e');
