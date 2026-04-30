@@ -53,11 +53,12 @@ simulator covers and tests.
 | INSERT                    | Partial | TODO                                                                              |
 | ON CONFLICT clause        | No      |                                                                                   |
 | REINDEX                   | No      |                                                                                   |
-| RELEASE SAVEPOINT         | No      |                                                                                   |
+| RELEASE SAVEPOINT         | Partial | Covered by SavepointRollback property.                                            |
 | REPLACE                   | No      |                                                                                   |
 | RETURNING clause          | No      | TODO                                                                              |
 | ROLLBACK TRANSACTION      | Partial | TODO                                                                              |
-| SAVEPOINT                 | No      |                                                                                   |
+| ROLLBACK TO SAVEPOINT     | Partial | Covered by SavepointRollback property.                                            |
+| SAVEPOINT                 | Partial | Covered by SavepointRollback property.                                            |
 | SELECT                    | Partial | TODO                                                                              |
 | SELECT ... WHERE          | Partial | TODO                                                                              |
 | SELECT ... WHERE ... LIKE | No      |                                                                                   |

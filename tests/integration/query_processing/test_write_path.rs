@@ -1327,6 +1327,42 @@ pub fn test_conflict_inside_txn(limbo: TempDatabase) {
     );
 }
 
+#[turso_macros::test]
+pub fn test_savepoint_rollback_uses_current_wal_snapshot(
+    limbo: TempDatabase,
+) -> anyhow::Result<()> {
+    let _ = env_logger::try_init();
+    let conn1 = limbo.db.connect()?;
+    let conn2 = limbo.db.connect()?;
+
+    conn1.execute("CREATE TABLE t (u1 TEXT UNIQUE, u2 INTEGER UNIQUE, payload TEXT)")?;
+    for i in 1..=8 {
+        conn1.execute(format!("INSERT INTO t VALUES ('u{i}', {i}, 'base')"))?;
+    }
+
+    // Leave conn1's local WAL snapshot behind the committed frames added by conn2.
+    for i in 9..=20 {
+        conn2.execute(format!("INSERT INTO t VALUES ('u{i}', {i}, 'from_conn2')"))?;
+    }
+
+    conn1.execute("SAVEPOINT sp")?;
+    let payload = "X".repeat(4000);
+    assert!(matches!(
+        conn1.execute(format!(
+            "UPDATE t SET payload = '{payload}', u2 = CASE WHEN u2 = 20 THEN 1 ELSE u2 END WHERE TRUE"
+        )),
+        Err(LimboError::Constraint(_))
+    ));
+    conn1.execute("ROLLBACK TO sp")?;
+    conn1.execute("RELEASE sp")?;
+
+    let count: Vec<(i64,)> = conn1.exec_rows("SELECT COUNT(*) FROM t");
+    assert_eq!(count, vec![(20,)]);
+    let integrity: Vec<(String,)> = conn1.exec_rows("PRAGMA integrity_check");
+    assert_eq!(integrity, vec![("ok".to_string(),)]);
+    Ok(())
+}
+
 #[test]
 pub fn test_reopen_database_wal_restart() {
     let _ = env_logger::try_init();

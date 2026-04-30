@@ -129,6 +129,8 @@ pub struct Snapshot {
     current_tables: Vec<Table>,
     /// Operations recorded during this transaction, in order
     operations: Vec<TxOperation>,
+    /// Named savepoint snapshots in this transaction.
+    savepoints: Vec<ShadowSavepoint>,
 
     transaction_mode: TransactionMode,
 }
@@ -138,6 +140,14 @@ impl Snapshot {
     fn set_transaction_mode(&mut self, transaction_mode: TransactionMode) {
         self.transaction_mode = transaction_mode;
     }
+}
+
+#[derive(Debug, Clone)]
+pub struct ShadowSavepoint {
+    name: String,
+    current_tables: Vec<Table>,
+    operation_len: usize,
+    starts_transaction: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -445,6 +455,66 @@ where
         }
     }
 
+    pub fn savepoint(&mut self, name: String) {
+        let starts_transaction = self.transaction_tables.is_none();
+        if starts_transaction
+            || matches!(
+                self.transaction_tables.as_ref(),
+                Some(TransactionTables::Deferred)
+            )
+        {
+            self.create_snapshot(TransactionMode::Write);
+        }
+
+        let snapshot = self
+            .transaction_tables
+            .as_mut()
+            .expect("savepoint should create a transaction snapshot")
+            .expect_snapshot_mut();
+        snapshot.savepoints.push(ShadowSavepoint {
+            name,
+            current_tables: snapshot.current_tables.clone(),
+            operation_len: snapshot.operations.len(),
+            starts_transaction,
+        });
+    }
+
+    pub fn rollback_to_savepoint(&mut self, name: &str) -> anyhow::Result<()> {
+        let Some(txn) = self.transaction_tables.as_mut() else {
+            return Err(anyhow::anyhow!(
+                "cannot rollback to savepoint {name}: no active transaction"
+            ));
+        };
+        let snapshot = txn.expect_snapshot_mut();
+        let Some(savepoint_idx) = snapshot.savepoints.iter().rposition(|sp| sp.name == name) else {
+            return Err(anyhow::anyhow!("no such savepoint: {name}"));
+        };
+        let savepoint = snapshot.savepoints[savepoint_idx].clone();
+        snapshot.current_tables = savepoint.current_tables;
+        snapshot.operations.truncate(savepoint.operation_len);
+        // ROLLBACK TO keeps the target savepoint active and discards nested ones.
+        snapshot.savepoints.truncate(savepoint_idx + 1);
+        Ok(())
+    }
+
+    pub fn release_savepoint(&mut self, name: &str) -> anyhow::Result<()> {
+        let Some(txn) = self.transaction_tables.as_mut() else {
+            return Err(anyhow::anyhow!(
+                "cannot release savepoint {name}: no active transaction"
+            ));
+        };
+        let snapshot = txn.expect_snapshot_mut();
+        let Some(savepoint_idx) = snapshot.savepoints.iter().rposition(|sp| sp.name == name) else {
+            return Err(anyhow::anyhow!("no such savepoint: {name}"));
+        };
+        let starts_transaction = snapshot.savepoints[savepoint_idx].starts_transaction;
+        snapshot.savepoints.truncate(savepoint_idx);
+        if starts_transaction {
+            self.apply_snapshot();
+        }
+        Ok(())
+    }
+
     /// Tries to upgrade the Transaction Mode
     #[inline]
     pub fn upgrade_transaction(&mut self, query: &Query) {
@@ -489,6 +559,7 @@ where
         *self.transaction_tables = Some(TransactionTables::Snapshot(Snapshot {
             current_tables: self.commited_tables.clone(),
             operations: Vec::new(),
+            savepoints: Vec::new(),
             transaction_mode,
         }));
     }
@@ -733,6 +804,89 @@ impl<'a> DerefMut for ShadowTablesMut<'a> {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn shadow_tables_mut<'a>(
+        commited_tables: &'a mut Vec<Table>,
+        transaction_tables: &'a mut Option<TransactionTables>,
+    ) -> ShadowTablesMut<'a> {
+        ShadowTablesMut {
+            commited_tables,
+            transaction_tables,
+        }
+    }
+
+    #[test]
+    fn savepoint_outside_transaction_commits_on_release() {
+        let mut commited_tables = Vec::new();
+        let mut transaction_tables = None;
+
+        {
+            let mut tables = shadow_tables_mut(&mut commited_tables, &mut transaction_tables);
+            tables.savepoint("sp".to_string());
+            let snapshot = tables
+                .transaction_tables
+                .as_ref()
+                .expect("savepoint should create a transaction")
+                .expect_snaphot();
+            assert_eq!(snapshot.savepoints.len(), 1);
+            assert!(snapshot.savepoints[0].starts_transaction);
+
+            tables.release_savepoint("sp").unwrap();
+        }
+
+        assert!(transaction_tables.is_none());
+    }
+
+    #[test]
+    fn rollback_to_savepoint_keeps_target_active() {
+        let mut commited_tables = Vec::new();
+        let mut transaction_tables = None;
+
+        let mut tables = shadow_tables_mut(&mut commited_tables, &mut transaction_tables);
+        tables.create_snapshot(TransactionMode::Write);
+        tables.savepoint("sp".to_string());
+        tables.record_insert("table_0".to_string(), vec![]);
+
+        tables.rollback_to_savepoint("sp").unwrap();
+        let snapshot = tables
+            .transaction_tables
+            .as_ref()
+            .expect("rollback target transaction should exist")
+            .expect_snaphot();
+        assert!(snapshot.operations.is_empty());
+        assert_eq!(snapshot.savepoints.len(), 1);
+        assert_eq!(snapshot.savepoints[0].name, "sp");
+    }
+
+    #[test]
+    fn savepoint_inside_deferred_transaction_stays_open_on_release() {
+        let mut commited_tables = Vec::new();
+        let mut transaction_tables = Some(TransactionTables::Deferred);
+
+        let mut tables = shadow_tables_mut(&mut commited_tables, &mut transaction_tables);
+        tables.savepoint("sp".to_string());
+        let snapshot = tables
+            .transaction_tables
+            .as_ref()
+            .expect("deferred transaction should materialize")
+            .expect_snaphot();
+        assert_eq!(snapshot.transaction_mode, TransactionMode::Write);
+        assert_eq!(snapshot.savepoints.len(), 1);
+        assert!(!snapshot.savepoints[0].starts_transaction);
+
+        tables.release_savepoint("sp").unwrap();
+        let snapshot = tables
+            .transaction_tables
+            .as_ref()
+            .expect("outer transaction should remain open")
+            .expect_snaphot();
+        assert!(snapshot.savepoints.is_empty());
+    }
+}
+
 pub(crate) struct SimulatorEnv {
     pub(crate) opts: SimulatorOpts,
     pub profile: Profile,
@@ -950,6 +1104,7 @@ impl SimulatorEnv {
             disable_where_true_false_null: cli_opts.disable_where_true_false_null,
             disable_union_all_preserves_cardinality: cli_opts
                 .disable_union_all_preserves_cardinality,
+            disable_savepoint_rollback: cli_opts.disable_savepoint_rollback,
             disable_fsync_no_wait: cli_opts.disable_fsync_no_wait,
             disable_faulty_query: cli_opts.disable_faulty_query,
             page_size: 4096, // TODO: randomize this too
@@ -1198,7 +1353,12 @@ impl SimulatorEnv {
         let value = query.is_some_and(|query| {
             matches!(
                 query,
-                Query::Begin(..) | Query::Commit(..) | Query::Rollback(..)
+                Query::Begin(..)
+                    | Query::Commit(..)
+                    | Query::Rollback(..)
+                    | Query::Savepoint(..)
+                    | Query::RollbackToSavepoint(..)
+                    | Query::ReleaseSavepoint(..)
             )
         });
         self.connection_last_query.set(conn_index, value);
@@ -1282,6 +1442,7 @@ pub(crate) struct SimulatorOpts {
     pub(crate) disable_drop_select: bool,
     pub(crate) disable_where_true_false_null: bool,
     pub(crate) disable_union_all_preserves_cardinality: bool,
+    pub(crate) disable_savepoint_rollback: bool,
     pub(crate) disable_fsync_no_wait: bool,
     pub(crate) disable_faulty_query: bool,
     pub(crate) disable_reopen_database: bool,

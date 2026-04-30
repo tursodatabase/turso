@@ -3995,6 +3995,12 @@ pub fn op_savepoint(
                         deferred_fk_violations,
                     );
                 } else {
+                    if !pager.holds_read_lock() {
+                        pager.begin_read_tx()?;
+                    }
+                    if matches!(conn.get_tx_state(), TransactionState::None) {
+                        conn.set_tx_state(TransactionState::Read);
+                    }
                     pager.open_subjournal()?;
                     let db_size =
                         return_if_io!(pager.with_header(|header| header.database_size.get()));
@@ -11356,12 +11362,12 @@ fn drive_init_cdc_version(
                             "CREATE TABLE IF NOT EXISTS {cdc_table_name} (change_id INTEGER PRIMARY KEY AUTOINCREMENT, change_time INTEGER, change_txn_id INTEGER, change_type INTEGER, table_name TEXT, id, before BLOB, after BLOB, updates BLOB)",
                         ),
                     };
-                    inner.stmt = prepare_cdc_internal(&conn, create_sql)?;
+                    inner.stmt = prepare_cdc_internal(conn, create_sql)?;
                     inner.phase = OpInitCdcVersionPhase::CreateCdcTable;
                 }
                 OpInitCdcVersionPhase::CreateCdcTable => {
                     inner.stmt = prepare_cdc_internal(
-                        &conn,
+                        conn,
                         format!(
                             "CREATE TABLE IF NOT EXISTS {TURSO_CDC_VERSION_TABLE_NAME} (table_name TEXT PRIMARY KEY, version TEXT NOT NULL)",
                         ),
@@ -11378,7 +11384,7 @@ fn drive_init_cdc_version(
                         *version
                     };
                     inner.stmt = prepare_cdc_internal(
-                        &conn,
+                        conn,
                         format!(
                             "INSERT OR IGNORE INTO {TURSO_CDC_VERSION_TABLE_NAME} (table_name, version) VALUES ('{escaped_cdc_table_name}', '{version_to_insert}')",
                         ),
@@ -11387,7 +11393,7 @@ fn drive_init_cdc_version(
                 }
                 OpInitCdcVersionPhase::InsertVersion => {
                     inner.stmt = prepare_cdc_internal(
-                        &conn,
+                        conn,
                         format!(
                             "SELECT version FROM {TURSO_CDC_VERSION_TABLE_NAME} WHERE table_name = '{escaped_cdc_table_name}'",
                         ),
@@ -15428,7 +15434,7 @@ mod tests {
         );
         assert_eq!(state.pc, 0, "pc should not advance on invariant violation");
         assert!(
-            matches!(state.active_op_state.hash_probe(), None),
+            state.active_op_state.hash_probe().is_none(),
             "HashProbe should not stash resumable state for the removed fallback path"
         );
     }
