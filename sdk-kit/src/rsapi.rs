@@ -641,14 +641,10 @@ impl TursoDatabase {
                     // Store the IO so that it can be retrieved with `io()` call even if the database is still opening
                     *self.io.lock().unwrap() = Some(io.clone());
 
-                    let open_flags = OpenFlags::default();
-                    let db_file = if let Some(db_file) = &self.config.db_file {
-                        db_file.clone()
-                    } else {
-                        let file = io.open_file(&self.config.path, open_flags, true)?;
-                        Arc::new(DatabaseFile::new(file))
-                    };
-
+                    // Opts must be computed BEFORE the file open so we can apply
+                    // OpenFlags::NoLock when multiprocess WAL is enabled — taking
+                    // the OS-level fcntl lock here would block every other
+                    // multiprocess process from opening the same file.
                     let mut opts = DatabaseOpts::new();
                     if let Some(experimental_features) = &self.config.experimental_features {
                         for features in experimental_features.split(",").map(|s| s.trim()) {
@@ -673,6 +669,17 @@ impl TursoDatabase {
                             "encryption is experimental and must be explicitly enabled through experimental features list".to_string(),
                         ));
                     }
+
+                    let mut open_flags = OpenFlags::default();
+                    if opts.enable_multiprocess_wal {
+                        open_flags |= OpenFlags::NoLock;
+                    }
+                    let db_file = if let Some(db_file) = &self.config.db_file {
+                        db_file.clone()
+                    } else {
+                        let file = io.open_file(&self.config.path, open_flags, true)?;
+                        Arc::new(DatabaseFile::new(file))
+                    };
 
                     state.io = Some(io);
                     state.db_file = Some(db_file);
