@@ -1470,7 +1470,14 @@ impl Schema {
         for unparsed_sql_from_index in from_sql_indexes {
             let table = self
                 .get_btree_table(&unparsed_sql_from_index.table_name)
-                .unwrap();
+                .ok_or_else(|| {
+                    LimboError::Corrupt(format!(
+                        "sqlite_schema contains index for missing table '{}': rootpage={} sql={}",
+                        unparsed_sql_from_index.table_name,
+                        unparsed_sql_from_index.root_page,
+                        unparsed_sql_from_index.sql
+                    ))
+                })?;
             let index = Index::from_sql(
                 syms,
                 &unparsed_sql_from_index.sql,
@@ -1488,7 +1495,12 @@ impl Schema {
             // The SQL statement parser enforces that the column definitions come first, and compounds are defined after that,
             // e.g. CREATE TABLE t (a, b, UNIQUE(a, b)), and you can't do something like CREATE TABLE t (a, b, UNIQUE(a, b), c);
             // Hence, we can process the singles first (unique_set.columns.len() == 1), and then the compounds (unique_set.columns.len() > 1).
-            let table = self.get_btree_table(&automatic_index.0).unwrap();
+            let table = self.get_btree_table(&automatic_index.0).ok_or_else(|| {
+                LimboError::Corrupt(format!(
+                    "sqlite_schema contains automatic index for missing table '{}': indexes={:?}",
+                    automatic_index.0, automatic_index.1
+                ))
+            })?;
             let mut automatic_indexes = automatic_index.1;
             automatic_indexes.reverse(); // reverse so we can pop() without shifting array elements, while still processing in left-to-right order
 
