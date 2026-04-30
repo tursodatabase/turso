@@ -972,6 +972,10 @@ pub struct CommitStateMachine<Clock: LogicalClock> {
     did_commit_schema_change: bool,
     tx_id: TxID,
     connection: Arc<Connection>,
+    /// Database index this commit is for (`MAIN_DB_ID` or an attached-db id).
+    /// Threaded through so that `finish_committed_tx` can clear the matching
+    /// connection-level mv_tx slot atomically with `remove_tx`.
+    db_id: usize,
     /// Write set sorted by table id and row id
     write_set: Vec<RowID>,
     commit_coordinator: Arc<CommitCoordinator>,
@@ -1024,6 +1028,7 @@ impl<Clock: LogicalClock> CommitStateMachine<Clock> {
         state: CommitState<Clock>,
         tx_id: TxID,
         connection: Arc<Connection>,
+        db_id: usize,
         commit_coordinator: Arc<CommitCoordinator>,
         header: Arc<RwLock<Option<DatabaseHeader>>>,
         sync_mode: SyncMode,
@@ -1048,6 +1053,7 @@ impl<Clock: LogicalClock> CommitStateMachine<Clock> {
             did_commit_schema_change: schema_did_change_from_tx,
             tx_id,
             connection,
+            db_id,
             write_set: Vec::new(),
             commit_coordinator,
             pager,
@@ -1683,7 +1689,7 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
                         mvcc_store.release_exclusive_tx(&self.tx_id);
                     }
                     mvcc_store.unlock_commit_lock_if_held(tx);
-                    mvcc_store.remove_tx(self.tx_id);
+                    mvcc_store.finish_committed_tx(self.tx_id, &self.connection, self.db_id);
                     inject_transition_failure!(self, CommitYieldPoint::AfterRemoveTx);
                     self.finalize(mvcc_store)?;
                     return Ok(TransitionResult::Done(()));
@@ -1768,7 +1774,7 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
                         mvcc_store.release_exclusive_tx(&self.tx_id);
                         self.commit_coordinator.pager_commit_lock.unlock();
                     }
-                    mvcc_store.remove_tx(self.tx_id);
+                    mvcc_store.finish_committed_tx(self.tx_id, &self.connection, self.db_id);
                     inject_transition_failure!(self, CommitYieldPoint::AfterRemoveTx);
                     self.finalize(mvcc_store)?;
                     return Ok(TransitionResult::Done(()));
@@ -1936,8 +1942,10 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
 
                 // We have now updated all the versions with a reference to the
                 // transaction ID to a timestamp and can, therefore, remove the
-                // transaction.
-                mvcc_store.remove_tx(self.tx_id);
+                // transaction. Pair removal with the connection cache clear so
+                // an IO yield + abandon during the upcoming checkpoint cannot
+                // strand `conn.mv_tx_id` referencing a tx that's gone from `txs`.
+                mvcc_store.finish_committed_tx(self.tx_id, &self.connection, self.db_id);
                 inject_transition_failure!(self, CommitYieldPoint::AfterRemoveTx);
 
                 if mvcc_store.is_exclusive_tx(&self.tx_id) {
@@ -3523,6 +3531,23 @@ impl<Clock: LogicalClock> MvStore<Clock> {
         self.blocking_checkpoint_lock.unlock();
     }
 
+    /// Atomically retire a committed tx: clear the connection's mv_tx_id cache
+    /// for `db_id`, then remove the tx from `txs`. Pairs the two mutations so
+    /// no concurrent observer (or in-flight statement) can see the divergent
+    /// `(cache=Some, txs=None)` state — the production-panic shape from
+    /// `release_named_savepoint` and `NoSuchTransactionID` read-path errors.
+    ///
+    /// Order matches `rollback_tx` (cache cleared before `remove_tx`) so the
+    /// commit and rollback paths are symmetric.
+    ///
+    /// Use this anywhere the commit state machine would otherwise call
+    /// `remove_tx` directly. Other call sites that don't have a connection
+    /// context (e.g. tests poking internal state) keep using `remove_tx`.
+    pub fn finish_committed_tx(&self, tx_id: TxID, conn: &Connection, db_id: usize) {
+        conn.set_mv_tx_for_db(db_id, None);
+        self.remove_tx(tx_id);
+    }
+
     fn get_new_transaction_database_header(&self, pager: &Arc<Pager>) -> DatabaseHeader {
         if self.global_header.read().is_none() {
             pager
@@ -3628,11 +3653,13 @@ impl<Clock: LogicalClock> MvStore<Clock> {
         &self,
         tx_id: TxID,
         connection: &Arc<Connection>,
+        db_id: usize,
     ) -> Result<StateMachine<Box<CommitStateMachine<Clock>>>> {
         let state = Box::new(CommitStateMachine::new(
             CommitState::Initial,
             tx_id,
             connection.clone(),
+            db_id,
             self.commit_coordinator.clone(),
             self.global_header.clone(),
             connection.get_sync_mode(),

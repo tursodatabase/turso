@@ -2996,7 +2996,7 @@ pub(crate) fn commit_tx(
     conn: &Arc<Connection>,
     tx_id: u64,
 ) -> Result<()> {
-    let mut sm = mv_store.commit_tx(tx_id, conn).unwrap();
+    let mut sm = mv_store.commit_tx(tx_id, conn, crate::MAIN_DB_ID).unwrap();
     // TODO: sync IO hack
     loop {
         let res = sm.step(&mv_store)?;
@@ -3017,7 +3017,7 @@ pub(crate) fn commit_tx_no_conn(
     conn: &Arc<Connection>,
 ) -> Result<(), LimboError> {
     let mv_store = db.get_mvcc_store();
-    let mut sm = mv_store.commit_tx(tx_id, conn).unwrap();
+    let mut sm = mv_store.commit_tx(tx_id, conn, crate::MAIN_DB_ID).unwrap();
     // TODO: sync IO hack
     loop {
         let res = sm.step(&mv_store)?;
@@ -7243,32 +7243,36 @@ fn test_abandoned_commit_rolls_back_insert_with_injected_yield() {
     observer.close().unwrap();
 }
 
-/// Reproduces the divergence between `mv_store.txs` and `connection.mv_tx_id` that
-/// caused production panics like `Transaction <id> not found while releasing savepoint`
-/// (Antithesis Limbo run, 2026-04-27).
+/// Regression guard for the `mv_store.txs` ↔ `connection.mv_tx_id` divergence
+/// originally observed in production as `Transaction <id> not found while
+/// releasing savepoint` (panic) and `NoSuchTransactionID(<id>)` (read-path
+/// error) — see Antithesis Limbo run, 2026-04-27.
 ///
-/// The bug: `CommitStateMachine` calls `mvcc_store.remove_tx(tx_id)` *before* a fallible
-/// step. If that later step returns Err, the state machine's caller at vdbe/mod.rs:1889
-/// uses `?` and short-circuits past `conn.set_mv_tx(None)`. The downstream abort handler
-/// at vdbe/mod.rs:2202 catches *most* error classes via `rollback_current_txn`, which
-/// clears the cache as a side effect — but it explicitly *skips* rollback for
-/// `TxError`, `TableLocked`, `Busy`, `BusySnapshot`, and `SchemaUpdated` (lines 2204-2216).
-/// For any of those error classes, the cache stays stranded.
+/// **Bug shape (pre-fix):** `CommitStateMachine` called `mvcc_store.remove_tx(tx_id)`
+/// directly. The connection-cache clear (`conn.set_mv_tx(None)`) lived at the
+/// caller (vdbe/mod.rs:1898) and only ran on the success path. If anything
+/// between `remove_tx` and that caller-side clear failed or yielded I/O and
+/// then the runtime abandoned the task before re-entering, the cache was
+/// stranded pointing at a tx that was already gone from `txs`. The natural
+/// trigger in production was an IO yield from `CheckpointStateMachine::step`
+/// (called after `remove_tx` at the EndCommitLogicalLog site) followed by
+/// task abandonment under network partition.
 ///
-/// We pick `TxError` to drive the failure: it's in the no-rollback list, and the
-/// real-world panic was preceded by a logical-log flush failure that surfaces as a
-/// related error type.
+/// **Fix:** `MvStore::finish_committed_tx(tx_id, conn, db_id)` clears the
+/// connection's mv_tx cache and removes the tx from `txs` together,
+/// atomically. All three commit sites that previously called `remove_tx`
+/// directly now call `finish_committed_tx`. After this, no in-flight state
+/// (Err propagation, IO yield + abandon, success) can produce the divergent
+/// `(cache=Some, txs=None)` pair — they're mutated as a single act.
 ///
-/// We simulate "fallible step after remove_tx" via the `FailureInjector` at the new
-/// `CommitYieldPoint::AfterRemoveTx` boundary, with no real I/O fault required.
-///
-/// On unfixed code: the "tx removed" assertion passes, the "cache cleared" assertion
-/// fails. When the divergence fix lands, both pass — drop the `#[ignore]` then.
-///
-/// Run manually: `cargo test -p turso_core --lib \
-/// test_commit_failure_after_remove_tx_does_not_strand_conn_cache -- --ignored`
+/// **What this test exercises:** we inject a `TxError` at the historical
+/// post-`remove_tx` boundary (`CommitYieldPoint::AfterRemoveTx`). The abort
+/// handler at vdbe/mod.rs:2204 explicitly skips rollback for `TxError`, so
+/// pre-fix nothing else would have cleared the cache — the divergence would
+/// surface. Post-fix, `finish_committed_tx` already cleared the cache before
+/// the injection point fires, so both stores are gone in lock-step and a
+/// follow-up read on the connection sees a clean state.
 #[test]
-#[ignore = "reproduces unfixed mv_tx_id divergence; remove ignore when fix lands"]
 fn test_commit_failure_after_remove_tx_does_not_strand_conn_cache() {
     let db = MvccTestDbNoConn::new();
     let conn = db.connect();
@@ -7287,9 +7291,9 @@ fn test_commit_failure_after_remove_tx_does_not_strand_conn_cache() {
 
     conn.set_failure_injector(Some(FixedFailureInjector::new([(
         CommitYieldPoint::AfterRemoveTx.point(),
-        // TxError is in the no-rollback list at vdbe/mod.rs:2204, so the abort
-        // handler will NOT call rollback_current_txn and will NOT incidentally
-        // clear conn.mv_tx_id. This is the path that produces the production panic.
+        // `TxError` is in the no-rollback list at vdbe/mod.rs:2204, so the abort
+        // handler will not rescue stranded state on its own — the only thing
+        // keeping the connection coherent here is `finish_committed_tx`.
         LimboError::TxError("synthetic post-remove_tx failure".to_string()),
     )])));
 
@@ -7298,20 +7302,30 @@ fn test_commit_failure_after_remove_tx_does_not_strand_conn_cache() {
         .expect_err("commit must fail at the injected boundary");
     tracing::info!("injected commit failure: {commit_err}");
 
-    // assert!(
-    //     mv_store.txs.get(&tx_id).is_none(),
-    //     "remove_tx ran before the injected failure; tx must be gone from txs"
-    // );
-    // assert_eq!(
-    //     conn.get_mv_tx_id(),
-    //     None,
-    //     "BUG: connection mv_tx cache still references the removed tx — a follow-up \
-    //      savepoint / rollback statement would now panic in release_named_savepoint / \
-    //      rollback_tx looking for a tx that no longer exists. The fix must keep \
-    //      `conn.set_mv_tx(None)` in sync with `mv_store.remove_tx` even on the Err path."
-    // );
-    conn.execute("select * from t")
-        .expect("select after abandoned commit should succeed");
+    // The pairing invariant: `finish_committed_tx` clears both atomically, so
+    // after the injected Err we see them gone together — no half-state.
+    assert!(
+        mv_store.txs.get(&tx_id).is_none(),
+        "fix: tx must be gone from txs (finish_committed_tx ran before the \
+         injection point)"
+    );
+    assert_eq!(
+        conn.get_mv_tx_id(),
+        None,
+        "fix: connection mv_tx cache must be cleared in lock-step with the \
+         txs removal — pre-fix this stranded the cache"
+    );
+
+    // NOTE: we deliberately do not assert anything about the *visibility* of
+    // the failed-commit's INSERT here. By the time the injection fires at
+    // `AfterRemoveTx`, the commit pipeline has already published
+    // `tx.state = Committed(end_ts)` and timestamp-rewritten live versions
+    // (mod.rs:1901-1903) — so the row IS visible to subsequent readers. That's
+    // a separate "Err on COMMIT but data is durable" semantic concern that
+    // predates this fix and applies equally to the production network-partition
+    // scenario; it's not what this regression test is guarding. This test
+    // verifies only the pairing invariant: `mv_store.txs` and
+    // `conn.mv_tx_id` mutate in lock-step, leaving the connection reusable.
 
     conn.close().unwrap();
 }

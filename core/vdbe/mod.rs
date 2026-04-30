@@ -1870,7 +1870,7 @@ impl Program {
         // Phase 1: Commit main DB MVCC transaction
         if matches!(program_state.commit_state, CommitState::Ready) {
             if let Some(tx_id) = conn.get_mv_tx_id() {
-                let state_machine = mv_store.commit_tx(tx_id, &conn)?;
+                let state_machine = mv_store.commit_tx(tx_id, &conn, crate::MAIN_DB_ID)?;
                 program_state.commit_state = CommitState::CommittingMvcc { state_machine };
             }
             // If no main MVCC tx, commit_state stays Ready and we fall
@@ -1939,7 +1939,7 @@ impl Program {
                 conn.set_mv_tx_for_db(db_id, None);
                 continue;
             };
-            let mut state_machine = match attached_mv_store.commit_tx(tx_id, &conn) {
+            let mut state_machine = match attached_mv_store.commit_tx(tx_id, &conn, db_id) {
                 Ok(sm) => sm,
                 Err(e) => {
                     tracing::error!(
