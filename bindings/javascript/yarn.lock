@@ -1789,7 +1789,7 @@ __metadata:
   languageName: node
   linkType: hard
 
-"@tursodatabase/database-common@npm:^0.6.0-pre.24, @tursodatabase/database-common@workspace:packages/common":
+"@tursodatabase/database-common@npm:^0.6.0-pre.25, @tursodatabase/database-common@workspace:packages/common":
   version: 0.0.0-use.local
   resolution: "@tursodatabase/database-common@workspace:packages/common"
   dependencies:
@@ -1798,7 +1798,7 @@ __metadata:
   languageName: unknown
   linkType: soft
 
-"@tursodatabase/database-wasm-common@npm:^0.6.0-pre.24, @tursodatabase/database-wasm-common@workspace:packages/wasm-common":
+"@tursodatabase/database-wasm-common@npm:^0.6.0-pre.25, @tursodatabase/database-wasm-common@workspace:packages/wasm-common":
   version: 0.0.0-use.local
   resolution: "@tursodatabase/database-wasm-common@workspace:packages/wasm-common"
   dependencies:
@@ -1814,8 +1814,8 @@ __metadata:
   resolution: "@tursodatabase/database-wasm@workspace:packages/wasm"
   dependencies:
     "@napi-rs/cli": "npm:^3.1.5"
-    "@tursodatabase/database-common": "npm:^0.6.0-pre.24"
-    "@tursodatabase/database-wasm-common": "npm:^0.6.0-pre.24"
+    "@tursodatabase/database-common": "npm:^0.6.0-pre.25"
+    "@tursodatabase/database-wasm-common": "npm:^0.6.0-pre.25"
     "@vitest/browser": "npm:^3.2.4"
     playwright: "npm:^1.55.0"
     typescript: "npm:^5.9.2"
@@ -1829,7 +1829,7 @@ __metadata:
   resolution: "@tursodatabase/database@workspace:packages/native"
   dependencies:
     "@napi-rs/cli": "npm:^3.1.5"
-    "@tursodatabase/database-common": "npm:^0.6.0-pre.24"
+    "@tursodatabase/database-common": "npm:^0.6.0-pre.25"
     "@types/node": "npm:^24.3.1"
     better-sqlite3: "npm:^12.2.0"
     drizzle-kit: "npm:^0.31.4"
@@ -1846,11 +1846,11 @@ __metadata:
   languageName: node
   linkType: hard
 
-"@tursodatabase/sync-common@npm:^0.6.0-pre.24, @tursodatabase/sync-common@workspace:sync/packages/common":
+"@tursodatabase/sync-common@npm:^0.6.0-pre.25, @tursodatabase/sync-common@workspace:sync/packages/common":
   version: 0.0.0-use.local
   resolution: "@tursodatabase/sync-common@workspace:sync/packages/common"
   dependencies:
-    "@tursodatabase/database-common": "npm:^0.6.0-pre.24"
+    "@tursodatabase/database-common": "npm:^0.6.0-pre.25"
     "@tursodatabase/serverless": "npm:^0.2.2"
     "@types/node": "npm:^24.12.2"
     typescript: "npm:^5.9.2"
@@ -1862,9 +1862,9 @@ __metadata:
   resolution: "@tursodatabase/sync-wasm@workspace:sync/packages/wasm"
   dependencies:
     "@napi-rs/cli": "npm:^3.1.5"
-    "@tursodatabase/database-common": "npm:^0.6.0-pre.24"
-    "@tursodatabase/database-wasm-common": "npm:^0.6.0-pre.24"
-    "@tursodatabase/sync-common": "npm:^0.6.0-pre.24"
+    "@tursodatabase/database-common": "npm:^0.6.0-pre.25"
+    "@tursodatabase/database-wasm-common": "npm:^0.6.0-pre.25"
+    "@tursodatabase/sync-common": "npm:^0.6.0-pre.25"
     "@vitest/browser": "npm:^3.2.4"
     playwright: "npm:^1.57.0"
     typescript: "npm:^5.9.2"
@@ -1878,8 +1878,8 @@ __metadata:
   resolution: "@tursodatabase/sync@workspace:sync/packages/native"
   dependencies:
     "@napi-rs/cli": "npm:^3.1.5"
-    "@tursodatabase/database-common": "npm:^0.6.0-pre.24"
-    "@tursodatabase/sync-common": "npm:^0.6.0-pre.24"
+    "@tursodatabase/database-common": "npm:^0.6.0-pre.25"
+    "@tursodatabase/sync-common": "npm:^0.6.0-pre.25"
     "@types/node": "npm:^24.12.2"
     typescript: "npm:^5.9.2"
     vitest: "npm:^3.2.4"
@@ -2457,14 +2457,14 @@ __metadata:
   linkType: hard
 
 "es-toolkit@npm:^1.39.8":
-  version: 1.46.0
-  resolution: "es-toolkit@npm:1.46.0"
+  version: 1.46.1
+  resolution: "es-toolkit@npm:1.46.1"
   dependenciesMeta:
     "@trivago/prettier-plugin-sort-imports@4.3.0":
       unplugged: true
     prettier-plugin-sort-re-exports@0.0.1:
       unplugged: true
-  checksum: 10c0/d52d3602e89621d8cf8e0f74d6b574e7d5296d97ff34b57ae5331735a4296e7c88c8c28fe6e43388c3c6df84fa06179705a3125767ebcc8b76f672bd06dccfb7
+  checksum: 10c0/6a4c3dd0ddc2138fa13d983d93ebaf8061759c52c2cf7c3101315139fc1fca826d253daa67fe85ad880c03cc4c092bd53a83a7cbf58b4721c251479122ba5303
   languageName: node
   linkType: hard
 
