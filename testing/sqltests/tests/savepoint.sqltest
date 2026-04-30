@@ -350,3 +350,90 @@ test savepoint-rollback-to-temp-table-unreachable {
 expect error {
     no such table
 }
+
+# Regression test for #6357: indexed lookups after rolling back a savepoint that
+# performed a mass DELETE/INSERT against an indexed table previously panicked in
+# the b-tree seek path (cell pointer index OOB). The post-rollback seek must
+# return the pre-savepoint contents unchanged.
+@cross-check-integrity
+test savepoint-rollback-mass-dml-indexed-seek-issue-6357 {
+    CREATE TABLE t6357(a INTEGER PRIMARY KEY, b TEXT UNIQUE, c TEXT);
+    CREATE INDEX i6357_c_b ON t6357(c, b);
+    INSERT INTO t6357
+        SELECT value,
+               printf('sv_%05d', value),
+               printf('sc_%05d', value)
+        FROM generate_series(1, 200);
+    SAVEPOINT s;
+    DELETE FROM t6357 WHERE a BETWEEN 50 AND 150;
+    INSERT INTO t6357
+        SELECT value + 9000,
+               printf('sv_new_%05d', value),
+               printf('sc_new_%05d', value)
+        FROM generate_series(1, 60);
+    ROLLBACK TO s;
+    RELEASE s;
+    SELECT count(*) FROM t6357 INDEXED BY i6357_c_b WHERE c >= 'sc_';
+    SELECT a, b FROM t6357 INDEXED BY i6357_c_b
+        WHERE c >= 'sc_00099' AND c < 'sc_00102'
+        ORDER BY c, b;
+}
+expect {
+    200
+    99|sv_00099
+    100|sv_00100
+    101|sv_00101
+}
+
+# Repeat the mass DML / rollback cycle multiple times to make sure the index
+# b-tree state stays consistent across savepoints.
+@cross-check-integrity
+test savepoint-rollback-mass-dml-indexed-seek-repeated {
+    CREATE TABLE t_rep(a INTEGER PRIMARY KEY, b TEXT UNIQUE);
+    CREATE INDEX i_rep_b ON t_rep(b);
+    INSERT INTO t_rep
+        SELECT value, printf('row_%05d', value) FROM generate_series(1, 100);
+
+    SAVEPOINT one;
+    DELETE FROM t_rep WHERE a > 25;
+    ROLLBACK TO one;
+    RELEASE one;
+
+    SAVEPOINT two;
+    DELETE FROM t_rep WHERE a > 25;
+    ROLLBACK TO two;
+    RELEASE two;
+
+    SELECT count(*) FROM t_rep INDEXED BY i_rep_b WHERE b >= 'row_';
+    SELECT a FROM t_rep INDEXED BY i_rep_b WHERE b = 'row_00050';
+}
+expect {
+    100
+    50
+}
+
+# Nested savepoints: rolling back the inner savepoint must leave the outer
+# savepoint's modifications intact and the index in a consistent state.
+@cross-check-integrity
+test savepoint-nested-rollback-inner-indexed-seek {
+    CREATE TABLE t_nested(a INTEGER PRIMARY KEY, b TEXT);
+    CREATE INDEX i_nested_b ON t_nested(b);
+    INSERT INTO t_nested VALUES (1, 'one'), (2, 'two'), (3, 'three');
+
+    SAVEPOINT outer_sp;
+    INSERT INTO t_nested VALUES (4, 'four');
+
+    SAVEPOINT inner_sp;
+    DELETE FROM t_nested WHERE a >= 2;
+    INSERT INTO t_nested VALUES (10, 'ten'), (11, 'eleven');
+    ROLLBACK TO inner_sp;
+    RELEASE inner_sp;
+
+    SELECT a, b FROM t_nested INDEXED BY i_nested_b ORDER BY b;
+}
+expect {
+    4|four
+    1|one
+    3|three
+    2|two
+}

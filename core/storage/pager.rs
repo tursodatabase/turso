@@ -371,19 +371,37 @@ impl PageInner {
         }
     }
 
+    /// Reads the cell pointer at index `idx` from the cell pointer array, validating
+    /// that `idx` is within `cell_count()` and that the read does not extend past the
+    /// page buffer. Returns `LimboError::Corrupt` instead of panicking when either
+    /// invariant is violated, e.g. when a cursor observes a stale page header with a
+    /// bogus cell count.
+    #[inline(always)]
+    fn read_cell_pointer(&self, idx: usize) -> crate::Result<usize> {
+        let buf = self.as_ptr();
+        let ncells = self.cell_count();
+        crate::assert_or_bail_corrupt!(
+            idx < ncells,
+            "cell index {} out of bounds for cell count {}",
+            idx,
+            ncells
+        );
+        let cell_pointer_in_array = self.header_size() + (idx * CELL_PTR_SIZE_BYTES);
+        let absolute_offset = self.offset() + cell_pointer_in_array;
+        crate::assert_or_bail_corrupt!(
+            absolute_offset + CELL_PTR_SIZE_BYTES <= buf.len(),
+            "cell pointer array offset {} out of bounds for buffer size {}",
+            absolute_offset,
+            buf.len()
+        );
+        Ok(u16::from_be_bytes([buf[absolute_offset], buf[absolute_offset + 1]]) as usize)
+    }
+
     #[inline]
     pub fn cell_get(&self, idx: usize, usable_size: usize) -> crate::Result<BTreeCell> {
         tracing::trace!("cell_get(idx={})", idx);
         let buf = self.as_ptr();
-
-        let ncells = self.cell_count();
-        turso_assert_less_than!(idx, ncells,
-            "cell_get: idx out of bounds",
-            {"idx": idx, "ncells": ncells}
-        );
-        let cell_pointer_array_start = self.header_size();
-        let cell_pointer = cell_pointer_array_start + (idx * CELL_PTR_SIZE_BYTES);
-        let cell_pointer = self.read_u16(cell_pointer) as usize;
+        let cell_pointer = self.read_cell_pointer(idx)?;
 
         let static_buf: &'static [u8] = unsafe { std::mem::transmute::<&[u8], &'static [u8]>(buf) };
         read_btree_cell(static_buf, self, cell_pointer, usable_size)
@@ -393,9 +411,7 @@ impl PageInner {
     pub fn cell_table_interior_read_rowid(&self, idx: usize) -> crate::Result<i64> {
         turso_debug_assert!(matches!(self.page_type(), Ok(PageType::TableInterior)));
         let buf = self.as_ptr();
-        let cell_pointer_array_start = self.header_size();
-        let cell_pointer = cell_pointer_array_start + (idx * CELL_PTR_SIZE_BYTES);
-        let cell_pointer = self.read_u16(cell_pointer) as usize;
+        let cell_pointer = self.read_cell_pointer(idx)?;
         const LEFT_CHILD_PAGE_SIZE_BYTES: usize = 4;
         let (rowid, _) = read_varint(crate::slice_in_bounds_or_corrupt!(
             buf,
@@ -411,9 +427,7 @@ impl PageInner {
             Ok(PageType::TableInterior) | Ok(PageType::IndexInterior)
         ));
         let buf = self.as_ptr();
-        let cell_pointer_array_start = self.header_size();
-        let cell_pointer = cell_pointer_array_start + (idx * CELL_PTR_SIZE_BYTES);
-        let cell_pointer = self.read_u16(cell_pointer) as usize;
+        let cell_pointer = self.read_cell_pointer(idx)?;
         crate::assert_or_bail_corrupt!(
             cell_pointer + 4 <= buf.len(),
             "cell pointer {} out of bounds for page size {}",
@@ -432,9 +446,7 @@ impl PageInner {
     pub fn cell_table_leaf_read_rowid(&self, idx: usize) -> crate::Result<i64> {
         turso_debug_assert!(matches!(self.page_type(), Ok(PageType::TableLeaf)));
         let buf = self.as_ptr();
-        let cell_pointer_array_start = self.header_size();
-        let cell_pointer = cell_pointer_array_start + (idx * CELL_PTR_SIZE_BYTES);
-        let cell_pointer = self.read_u16(cell_pointer) as usize;
+        let cell_pointer = self.read_cell_pointer(idx)?;
         let mut pos = cell_pointer;
         let (_, nr) = read_varint(crate::slice_in_bounds_or_corrupt!(buf, pos..))?;
         pos += nr;
@@ -455,9 +467,7 @@ impl PageInner {
         usable_size: usize,
     ) -> crate::Result<(&'static [u8], u64, Option<u32>)> {
         let buf = self.as_ptr();
-        let cell_pointer_array_start = self.header_size();
-        let cell_pointer = cell_pointer_array_start + (idx * CELL_PTR_SIZE_BYTES);
-        let cell_offset = self.read_u16(cell_pointer) as usize;
+        let cell_offset = self.read_cell_pointer(idx)?;
 
         let page_type = self.page_type()?;
         let (payload_size, varint_len, header_skip) = match page_type {
@@ -5379,7 +5389,11 @@ mod tests {
 
     use crate::sync::RwLock;
 
+    use crate::error::LimboError;
+    use crate::io::Buffer;
+    use crate::storage::btree::offset::BTREE_CELL_COUNT;
     use crate::storage::page_cache::{PageCache, PageCacheKey};
+    use crate::storage::sqlite3_ondisk::PageType;
 
     use super::Page;
 
@@ -5404,6 +5418,78 @@ mod tests {
         let page_key = PageCacheKey::new(1);
         let page = cache.get(&page_key).unwrap();
         assert_eq!(page.unwrap().get().id, 1);
+    }
+
+    /// Build a freshly-zeroed page of the given type. The cell_count is left at zero and
+    /// the cell pointer array is empty, so any positive `idx` is out of bounds — useful
+    /// for exercising the corrupt-on-OOB bounds checks.
+    fn make_empty_page(page_type: PageType, page_size: usize) -> super::PageRef {
+        let page = Arc::new(Page::new(2));
+        {
+            let inner = page.get();
+            inner.buffer = Some(Arc::new(Buffer::new_temporary(page_size)));
+        }
+        page.set_loaded();
+        let contents = page.get_contents();
+        contents.write_page_type(page_type as u8);
+        contents.write_first_freeblock(0);
+        contents.write_cell_count(0);
+        contents.write_cell_content_area(page_size);
+        contents.write_fragmented_bytes_count(0);
+        if matches!(page_type, PageType::TableInterior | PageType::IndexInterior) {
+            contents.write_rightmost_ptr(0);
+        }
+        page
+    }
+
+    /// Forge a stale/corrupt cell_count without touching the rest of the page header.
+    /// Mirrors what the cursor sees after observing bytes from the wrong page image
+    /// (the failure mode behind issue #6357).
+    fn forge_cell_count(page: &super::PageRef, value: u16) {
+        page.get_contents().write_u16(BTREE_CELL_COUNT, value);
+    }
+
+    /// Out-of-bounds cell index must surface as Corrupt rather than a panic from the
+    /// raw slice indexing inside read_u16. Covers each cell-pointer accessor that the
+    /// b-tree seek path can call.
+    #[test]
+    fn read_cell_pointer_out_of_bounds_returns_corrupt() {
+        let page = make_empty_page(PageType::IndexLeaf, 512);
+        let contents = page.get_contents();
+
+        // Honest empty page: idx 0 is past the empty cell pointer array.
+        let err = contents.cell_index_read_payload_ptr(0, 504).unwrap_err();
+        assert!(matches!(err, LimboError::Corrupt(_)), "got {err:?}");
+
+        let err = contents.cell_get(0, 504).unwrap_err();
+        assert!(matches!(err, LimboError::Corrupt(_)), "got {err:?}");
+
+        // Forge a bogus cell_count — what a stale page header looks like — and verify
+        // every accessor path bails with Corrupt rather than tripping the raw index
+        // panic in read_u16.
+        forge_cell_count(&page, 19_500);
+
+        let err = contents
+            .cell_index_read_payload_ptr(19_485, 504)
+            .unwrap_err();
+        assert!(matches!(err, LimboError::Corrupt(_)), "got {err:?}");
+
+        let table_leaf = make_empty_page(PageType::TableLeaf, 512);
+        forge_cell_count(&table_leaf, 19_500);
+        let err = table_leaf.get_contents().cell_table_leaf_read_rowid(19_485);
+        assert!(matches!(err, Err(LimboError::Corrupt(_))), "got {err:?}");
+
+        let table_int = make_empty_page(PageType::TableInterior, 512);
+        forge_cell_count(&table_int, 19_500);
+        let err = table_int
+            .get_contents()
+            .cell_table_interior_read_rowid(19_485);
+        assert!(matches!(err, Err(LimboError::Corrupt(_))), "got {err:?}");
+
+        let err = table_int
+            .get_contents()
+            .cell_interior_read_left_child_page(19_485);
+        assert!(matches!(err, Err(LimboError::Corrupt(_))), "got {err:?}");
     }
 }
 
