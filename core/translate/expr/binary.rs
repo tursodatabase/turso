@@ -1,198 +1,5 @@
 use super::*;
 
-#[allow(clippy::too_many_arguments)]
-pub(super) fn binary_expr_shared(
-    program: &mut ProgramBuilder,
-    referenced_tables: Option<&TableReferences>,
-    e1: &ast::Expr,
-    e2: &ast::Expr,
-    op: &ast::Operator,
-    target_register: usize,
-    resolver: &Resolver,
-    emit_mode: BinaryEmitMode,
-) -> Result<usize> {
-    let lhs_arity = expr_vector_size(e1)?;
-    let rhs_arity = expr_vector_size(e2)?;
-    if lhs_arity != rhs_arity {
-        crate::bail_parse_error!(
-            "all arguments to binary operator {op} must return the same number of values. Got: ({lhs_arity}) {op} ({rhs_arity})"
-        );
-    }
-
-    if lhs_arity == 1 {
-        emit_binary_expr_scalar(
-            program,
-            referenced_tables,
-            e1,
-            e2,
-            op,
-            target_register,
-            resolver,
-            emit_mode,
-        )?;
-        return Ok(target_register);
-    }
-
-    if !supports_row_value_binary_comparison(op) {
-        crate::bail_parse_error!("row value misused");
-    }
-
-    let lhs_reg = program.alloc_registers(lhs_arity);
-    let rhs_reg = program.alloc_registers(lhs_arity);
-    translate_expr(program, referenced_tables, e1, lhs_reg, resolver)?;
-    translate_expr(program, referenced_tables, e2, rhs_reg, resolver)?;
-
-    emit_binary_expr_row_valued(
-        program,
-        op,
-        lhs_reg,
-        rhs_reg,
-        lhs_arity,
-        target_register,
-        e1,
-        e2,
-        referenced_tables,
-        Some(resolver),
-    )?;
-
-    if let BinaryEmitMode::Condition(metadata) = emit_mode {
-        emit_cond_jump(program, metadata, target_register);
-    }
-    Ok(target_register)
-}
-
-#[allow(clippy::too_many_arguments)]
-pub(super) fn emit_binary_expr_scalar(
-    program: &mut ProgramBuilder,
-    referenced_tables: Option<&TableReferences>,
-    e1: &ast::Expr,
-    e2: &ast::Expr,
-    op: &ast::Operator,
-    target_register: usize,
-    resolver: &Resolver,
-    emit_mode: BinaryEmitMode,
-) -> Result<usize> {
-    let (emit_fn, condition_metadata) = match emit_mode {
-        BinaryEmitMode::Value => (
-            emit_binary_insn
-                as fn(
-                    &mut ProgramBuilder,
-                    &ast::Operator,
-                    usize,
-                    usize,
-                    usize,
-                    &ast::Expr,
-                    &ast::Expr,
-                    Option<&TableReferences>,
-                    Option<ConditionMetadata>,
-                    Option<&Resolver>,
-                ) -> Result<()>,
-            None,
-        ),
-        BinaryEmitMode::Condition(metadata) => (
-            emit_binary_condition_insn
-                as fn(
-                    &mut ProgramBuilder,
-                    &ast::Operator,
-                    usize,
-                    usize,
-                    usize,
-                    &ast::Expr,
-                    &ast::Expr,
-                    Option<&TableReferences>,
-                    Option<ConditionMetadata>,
-                    Option<&Resolver>,
-                ) -> Result<()>,
-            Some(metadata),
-        ),
-    };
-
-    // Check if both sides of the expression are equivalent and reuse the same register if so
-    if exprs_are_equivalent(e1, e2) {
-        let shared_reg = program.alloc_register();
-        translate_expr(program, referenced_tables, e1, shared_reg, resolver)?;
-
-        emit_fn(
-            program,
-            op,
-            shared_reg,
-            shared_reg,
-            target_register,
-            e1,
-            e2,
-            referenced_tables,
-            condition_metadata,
-            Some(resolver),
-        )?;
-        if op.is_comparison() {
-            program.reset_collation();
-        }
-        Ok(target_register)
-    } else {
-        let e1_reg = program.alloc_registers(2);
-        let e2_reg = e1_reg + 1;
-
-        translate_expr(program, referenced_tables, e1, e1_reg, resolver)?;
-        let left_collation_ctx = program.curr_collation_ctx();
-        program.reset_collation();
-
-        translate_expr(program, referenced_tables, e2, e2_reg, resolver)?;
-        let right_collation_ctx = program.curr_collation_ctx();
-        program.reset_collation();
-
-        /*
-         * The rules for determining which collating function to use for a binary comparison
-         * operator (=, <, >, <=, >=, !=, IS, and IS NOT) are as follows:
-         *
-         * 1. If either operand has an explicit collating function assignment using the postfix COLLATE operator,
-         * then the explicit collating function is used for comparison,
-         * with precedence to the collating function of the left operand.
-         *
-         * 2. If either operand is a column, then the collating function of that column is used
-         * with precedence to the left operand. For the purposes of the previous sentence,
-         * a column name preceded by one or more unary "+" operators and/or CAST operators is still considered a column name.
-         *
-         * 3. Otherwise, the BINARY collating function is used for comparison.
-         */
-        let collation_ctx = {
-            match (left_collation_ctx, right_collation_ctx) {
-                (Some((c_left, true)), _) => Some((c_left, true)),
-                (_, Some((c_right, true))) => Some((c_right, true)),
-                (Some((c_left, from_collate_left)), None) => Some((c_left, from_collate_left)),
-                (None, Some((c_right, from_collate_right))) => Some((c_right, from_collate_right)),
-                (Some((c_left, from_collate_left)), Some((_, false))) => {
-                    Some((c_left, from_collate_left))
-                }
-                _ => None,
-            }
-        };
-        program.set_collation(collation_ctx);
-
-        emit_fn(
-            program,
-            op,
-            e1_reg,
-            e2_reg,
-            target_register,
-            e1,
-            e2,
-            referenced_tables,
-            condition_metadata,
-            Some(resolver),
-        )?;
-        // Only reset collation for comparison operators, which consume it.
-        // Non-comparison operators (Concat, Add, etc.) must propagate the
-        // collation to the parent expression so that e.g.
-        //   (name COLLATE NOCASE || '') <> 'admin'
-        // correctly applies NOCASE to the Ne comparison.
-        if op.is_comparison() {
-            program.reset_collation();
-        }
-        Ok(target_register)
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
 pub(super) fn emit_binary_expr_row_valued(
     program: &mut ProgramBuilder,
     op: &ast::Operator,
@@ -454,6 +261,20 @@ pub(super) fn comparison_collation(
     rhs_expr: &Expr,
     referenced_tables: Option<&TableReferences>,
 ) -> Result<Option<CollationSeq>> {
+    /*
+     * The rules for determining which collating function to use for a binary comparison
+     * operator (=, <, >, <=, >=, !=, IS, and IS NOT) are as follows:
+     *
+     * 1. If either operand has an explicit collating function assignment using the postfix COLLATE operator,
+     * then the explicit collating function is used for comparison,
+     * with precedence to the collating function of the left operand.
+     *
+     * 2. If either operand is a column, then the collating function of that column is used
+     * with precedence to the left operand. For the purposes of the previous sentence,
+     * a column name preceded by one or more unary "+" operators and/or CAST operators is still considered a column name.
+     *
+     * 3. Otherwise, the BINARY collating function is used for comparison.
+     */
     if let Some(tables) = referenced_tables {
         let lhs_collation = get_collseq_from_expr(lhs_expr, tables)?;
         if lhs_collation.is_some() {
@@ -787,99 +608,117 @@ pub(super) fn emit_binary_insn(
 
 /// Check if an expression is known to produce an array value.
 pub(crate) fn expr_is_array(expr: &Expr, referenced_tables: Option<&TableReferences>) -> bool {
-    match expr {
-        Expr::Column { table, column, .. } => {
-            if let Some(tables) = referenced_tables {
-                tables
-                    .find_table_by_internal_id(*table)
-                    .map(|(_, t)| t)
-                    .and_then(|t| t.get_column_at(*column))
-                    .is_some_and(|col| col.is_array())
-            } else {
-                false
+    let mut stack = vec![expr];
+    while let Some(expr) = stack.pop() {
+        match expr {
+            Expr::Column { table, column, .. } => {
+                if let Some(tables) = referenced_tables {
+                    if tables
+                        .find_table_by_internal_id(*table)
+                        .map(|(_, t)| t)
+                        .and_then(|t| t.get_column_at(*column))
+                        .is_some_and(|col| col.is_array())
+                    {
+                        return true;
+                    }
+                }
             }
-        }
-        Expr::FunctionCall { name, args, .. } => {
-            if let Ok(Some(f)) = Func::resolve_function(name.as_str(), args.len()) {
-                match &f {
-                    Func::Scalar(sf) if sf.returns_array_blob() => return true,
-                    Func::Agg(AggFunc::ArrayAgg) => return true,
+            Expr::FunctionCall { name, args, .. } => {
+                if let Ok(Some(f)) = Func::resolve_function(name.as_str(), args.len()) {
+                    match &f {
+                        Func::Scalar(sf) if sf.returns_array_blob() => return true,
+                        Func::Agg(AggFunc::ArrayAgg) => return true,
+                        _ => {}
+                    }
+                }
+                match name.as_str().to_lowercase().as_str() {
+                    "coalesce" | "ifnull" | "min" | "max" => {
+                        for arg in args.iter().rev() {
+                            stack.push(arg);
+                        }
+                    }
+                    "iif" => {
+                        if let Some(arg) = args.get(2) {
+                            stack.push(arg);
+                        }
+                        if let Some(arg) = args.get(1) {
+                            stack.push(arg);
+                        }
+                    }
+                    "nullif" => {
+                        if let Some(arg) = args.first() {
+                            stack.push(arg);
+                        }
+                    }
+                    "array_element" => {
+                        if let Some(tables) = referenced_tables {
+                            if args
+                                .first()
+                                .is_some_and(|a| expr_array_dimensions(a, tables) > 1)
+                            {
+                                return true;
+                            }
+                        }
+                    }
                     _ => {}
                 }
             }
-            // Wrapper functions that pass through an array value
-            match name.as_str().to_lowercase().as_str() {
-                "coalesce" | "ifnull" | "min" | "max" => {
-                    args.iter().any(|a| expr_is_array(a, referenced_tables))
-                }
-                "iif" => {
-                    // args: condition, then_val, else_val
-                    args.get(1)
-                        .is_some_and(|a| expr_is_array(a, referenced_tables))
-                        || args
-                            .get(2)
-                            .is_some_and(|a| expr_is_array(a, referenced_tables))
-                }
-                "nullif" => args
-                    .first()
-                    .is_some_and(|a| expr_is_array(a, referenced_tables)),
-                "array_element" => {
-                    // Subscripting a multi-dim array yields a lower-dim array
-                    if let Some(tables) = referenced_tables {
-                        args.first()
-                            .is_some_and(|a| expr_array_dimensions(a, tables) > 1)
-                    } else {
-                        false
-                    }
-                }
-                _ => false,
+            Expr::Array { .. } | Expr::Subscript { .. } => {
+                unreachable!("Array and Subscript are desugared into function calls by the parser")
             }
+            Expr::Binary(lhs, ast::Operator::Concat, rhs) => {
+                stack.push(rhs);
+                stack.push(lhs);
+            }
+            Expr::Case {
+                when_then_pairs,
+                else_expr,
+                ..
+            } => {
+                if let Some(else_expr) = else_expr {
+                    stack.push(else_expr);
+                }
+                for (_, then_expr) in when_then_pairs.iter().rev() {
+                    stack.push(then_expr);
+                }
+            }
+            _ => {}
         }
-        Expr::Array { .. } | Expr::Subscript { .. } => {
-            unreachable!("Array and Subscript are desugared into function calls by the parser")
-        }
-        Expr::Binary(lhs, ast::Operator::Concat, rhs) => {
-            expr_is_array(lhs, referenced_tables) || expr_is_array(rhs, referenced_tables)
-        }
-        Expr::Case {
-            when_then_pairs,
-            else_expr,
-            ..
-        } => {
-            when_then_pairs
-                .iter()
-                .any(|(_, then_expr)| expr_is_array(then_expr, referenced_tables))
-                || else_expr
-                    .as_ref()
-                    .is_some_and(|e| expr_is_array(e, referenced_tables))
-        }
-        _ => false,
     }
+    false
 }
 
 /// Return the number of array dimensions for an expression, or 0 for non-array.
 pub(super) fn expr_array_dimensions(expr: &Expr, tables: &TableReferences) -> u32 {
-    match expr {
-        Expr::Column { table, column, .. } => tables
-            .find_table_by_internal_id(*table)
-            .map(|(_, t)| t)
-            .and_then(|t| t.get_column_at(*column))
-            .map(|col| col.array_dimensions())
-            .unwrap_or(0),
-        Expr::FunctionCall { name, args, .. }
-            if name.as_str().eq_ignore_ascii_case("array_element") =>
-        {
-            let d = args
-                .first()
-                .map(|a| expr_array_dimensions(a, tables))
-                .unwrap_or(0);
-            d.saturating_sub(1)
+    let mut current = expr;
+    let mut subscripts = 0u32;
+    loop {
+        match current {
+            Expr::Column { table, column, .. } => {
+                return tables
+                    .find_table_by_internal_id(*table)
+                    .map(|(_, t)| t)
+                    .and_then(|t| t.get_column_at(*column))
+                    .map(|col| col.array_dimensions().saturating_sub(subscripts))
+                    .unwrap_or(0);
+            }
+            Expr::FunctionCall { name, args, .. }
+                if name.as_str().eq_ignore_ascii_case("array_element") =>
+            {
+                subscripts += 1;
+                let Some(first) = args.first() else {
+                    return 0;
+                };
+                current = first;
+            }
+            Expr::FunctionCall { name, .. } if name.as_str().eq_ignore_ascii_case("array") => {
+                return 1u32.saturating_sub(subscripts);
+            }
+            Expr::Subscript { .. } | Expr::Array { .. } => {
+                unreachable!("Array and Subscript are desugared into function calls by the parser")
+            }
+            _ => return 0,
         }
-        Expr::FunctionCall { name, .. } if name.as_str().eq_ignore_ascii_case("array") => 1,
-        Expr::Subscript { .. } | Expr::Array { .. } => {
-            unreachable!("Array and Subscript are desugared into function calls by the parser")
-        }
-        _ => 0,
     }
 }
 
