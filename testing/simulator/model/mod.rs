@@ -10,7 +10,7 @@ use sql_generation::model::{
         Create, CreateIndex, Delete, Drop, DropIndex, Insert, Select,
         alter_table::{AlterTable, AlterTableType},
         pragma::Pragma,
-        select::{CompoundOperator, FromClause, ResultColumn, SelectInner},
+        select::{AggFunc, CompoundOperator, FromClause, ResultColumn, SelectInner},
         transaction::{Begin, Commit, Rollback},
         update::{SetValue, Update},
     },
@@ -881,6 +881,15 @@ impl Shadow for SelectInner {
                 .rows
                 .retain(|row| self.where_clause.test(row, &join_clone));
 
+            // Handle GROUP BY
+            if let Some(group_by) = &self.group_by {
+                let grouped_rows = shadow_group_by(&join_table, group_by, &self.columns)?;
+                join_table.rows = grouped_rows;
+                // GROUP BY produces a new result set; tables metadata no longer applies
+                join_table.tables = Vec::new();
+                return Ok(join_table);
+            }
+
             if self.distinctness == Distinctness::Distinct {
                 join_table.rows.sort_unstable();
                 join_table.rows.dedup();
@@ -926,6 +935,246 @@ impl Shadow for SelectInner {
                 rows: vec![row],
             })
         }
+    }
+}
+
+/// Resolve a column name (e.g. "t.col") to its index in the join table.
+fn resolve_column_index(join_table: &JoinTable, col_name: &str) -> Option<usize> {
+    let mut idx = 0;
+    for table in &join_table.tables {
+        for col in &table.columns {
+            let qualified = format!("{}.{}", table.name, col.name);
+            if qualified == col_name {
+                return Some(idx);
+            }
+            idx += 1;
+        }
+    }
+    None
+}
+
+/// Compute aggregate function over a group of rows for a specific column index.
+fn compute_aggregate(func: &AggFunc, col_idx: Option<usize>, group: &[Vec<SimValue>]) -> SimValue {
+    match func {
+        AggFunc::CountStar => SimValue(Value::Numeric(turso_core::Numeric::Integer(
+            group.len() as i64
+        ))),
+        AggFunc::Count => {
+            let col_idx = col_idx.expect("COUNT(col) needs column index");
+            let count = group
+                .iter()
+                .filter(|row| row[col_idx].0 != Value::Null)
+                .count();
+            SimValue(Value::Numeric(turso_core::Numeric::Integer(count as i64)))
+        }
+        AggFunc::Sum => {
+            let col_idx = col_idx.expect("SUM(col) needs column index");
+            let mut has_non_null = false;
+            let mut int_sum: i64 = 0;
+            let mut float_sum: f64 = 0.0;
+            let mut is_float = false;
+
+            for row in group {
+                match &row[col_idx].0 {
+                    Value::Null => {}
+                    Value::Numeric(turso_core::Numeric::Integer(i)) => {
+                        has_non_null = true;
+                        int_sum = int_sum.wrapping_add(*i);
+                    }
+                    Value::Numeric(turso_core::Numeric::Float(f)) => {
+                        has_non_null = true;
+                        is_float = true;
+                        float_sum += **f;
+                    }
+                    Value::Text(t) => {
+                        has_non_null = true;
+                        // SQLite coerces text to numeric for SUM
+                        if let Ok(i) = t.value.parse::<i64>() {
+                            int_sum = int_sum.wrapping_add(i);
+                        } else if let Ok(f) = t.value.parse::<f64>() {
+                            is_float = true;
+                            float_sum += f;
+                        }
+                        // Non-numeric text treated as 0
+                    }
+                    Value::Blob(_) => {
+                        has_non_null = true;
+                        // Blobs treated as 0 in SUM
+                    }
+                }
+            }
+
+            if !has_non_null {
+                SimValue(Value::Null)
+            } else if is_float {
+                let total = float_sum + int_sum as f64;
+                SimValue(Value::Numeric(turso_core::Numeric::Float(
+                    turso_core::NonNan::new(total).expect("SUM produced NaN"),
+                )))
+            } else {
+                SimValue(Value::Numeric(turso_core::Numeric::Integer(int_sum)))
+            }
+        }
+        AggFunc::Min => {
+            let col_idx = col_idx.expect("MIN(col) needs column index");
+            let mut min: Option<&SimValue> = None;
+            for row in group {
+                let val = &row[col_idx];
+                if val.0 == Value::Null {
+                    continue;
+                }
+                min = Some(match min {
+                    None => val,
+                    Some(current) => {
+                        if val < current {
+                            val
+                        } else {
+                            current
+                        }
+                    }
+                });
+            }
+            min.cloned().unwrap_or(SimValue(Value::Null))
+        }
+        AggFunc::Max => {
+            let col_idx = col_idx.expect("MAX(col) needs column index");
+            let mut max: Option<&SimValue> = None;
+            for row in group {
+                let val = &row[col_idx];
+                if val.0 == Value::Null {
+                    continue;
+                }
+                max = Some(match max {
+                    None => val,
+                    Some(current) => {
+                        if val > current {
+                            val
+                        } else {
+                            current
+                        }
+                    }
+                });
+            }
+            max.cloned().unwrap_or(SimValue(Value::Null))
+        }
+    }
+}
+
+/// Execute GROUP BY in shadow: group rows by key columns, then compute result columns.
+fn shadow_group_by(
+    join_table: &JoinTable,
+    group_by: &sql_generation::model::query::select::GroupByClause,
+    result_columns: &[ResultColumn],
+) -> anyhow::Result<Vec<Vec<SimValue>>> {
+    use std::collections::BTreeMap;
+    // Resolve GROUP BY column indices
+    let group_col_indices: Vec<usize> = group_by
+        .columns
+        .iter()
+        .map(|col_name| {
+            resolve_column_index(join_table, col_name)
+                .ok_or_else(|| anyhow::anyhow!("GROUP BY column not found: {}", col_name))
+        })
+        .collect::<anyhow::Result<Vec<_>>>()?;
+
+    // Group rows by key values
+    let mut groups: BTreeMap<Vec<SimValue>, Vec<Vec<SimValue>>> = BTreeMap::new();
+    for row in &join_table.rows {
+        let key: Vec<SimValue> = group_col_indices
+            .iter()
+            .map(|&idx| row[idx].clone())
+            .collect();
+        groups.entry(key).or_default().push(row.clone());
+    }
+
+    // For each group, compute the result columns
+    let mut result_rows = Vec::new();
+    for (group_key, group_rows) in &groups {
+        let mut result_row = Vec::new();
+        let mut group_col_key_idx = 0;
+        for col in result_columns {
+            match col {
+                ResultColumn::Column(col_name) => {
+                    // This should be a GROUP BY column, use the key value
+                    if group_by.columns.contains(col_name) {
+                        result_row.push(group_key[group_col_key_idx].clone());
+                        group_col_key_idx += 1;
+                    } else {
+                        // Non-grouped column: use the first row's value (SQLite behavior)
+                        let col_idx = resolve_column_index(join_table, col_name)
+                            .ok_or_else(|| anyhow::anyhow!("Column not found: {}", col_name))?;
+                        result_row.push(group_rows[0][col_idx].clone());
+                    }
+                }
+                ResultColumn::Aggregate(agg) => {
+                    let agg_col_idx = match &agg.func {
+                        AggFunc::CountStar => None,
+                        _ => {
+                            let col_name = agg.column.as_ref().ok_or_else(|| {
+                                anyhow::anyhow!("Non-CountStar aggregate missing column")
+                            })?;
+                            let idx =
+                                resolve_column_index(join_table, col_name).ok_or_else(|| {
+                                    anyhow::anyhow!("Column not found for aggregate: {}", col_name)
+                                })?;
+                            Some(idx)
+                        }
+                    };
+                    result_row.push(compute_aggregate(&agg.func, agg_col_idx, group_rows));
+                }
+                ResultColumn::Star => {
+                    // Should not occur in GROUP BY selects
+                    result_row.extend(group_rows[0].clone());
+                }
+                ResultColumn::Expr(_) => {
+                    // Expr result columns are not generated in GROUP BY selects.
+                    // If encountered, fall back to NULL.
+                    result_row.push(SimValue(Value::Null));
+                }
+            }
+        }
+        // Apply HAVING filter
+        if let Some(having) = &group_by.having {
+            // HAVING uses aggregate values, but for simplicity we evaluate
+            // against the computed row. Since HAVING typically uses COUNT(*) > N,
+            // we need to evaluate it differently.
+            // For our generated HAVING (COUNT(*) > N), compute it directly.
+            if !eval_having(having, group_rows) {
+                continue;
+            }
+        }
+        result_rows.push(result_row);
+    }
+
+    Ok(result_rows)
+}
+
+/// Evaluate a HAVING predicate against a group of rows.
+/// Our generated HAVING is always COUNT(*) > N, so we handle that case.
+fn eval_having(
+    having: &sql_generation::model::query::predicate::Predicate,
+    group_rows: &[Vec<SimValue>],
+) -> bool {
+    use turso_parser::ast::{Expr, Literal, Operator};
+    match &having.0 {
+        Expr::Binary(left, Operator::Greater, right) => {
+            // Check if left is COUNT(*)
+            let left_val = match left.as_ref() {
+                Expr::FunctionCallStar { name, .. }
+                    if name.as_str().eq_ignore_ascii_case("COUNT") =>
+                {
+                    group_rows.len() as i64
+                }
+                _ => return true, // Can't evaluate, be conservative
+            };
+            // Check if right is a numeric literal
+            let right_val = match right.as_ref() {
+                Expr::Literal(Literal::Numeric(n)) => n.parse::<i64>().unwrap_or(0),
+                _ => return true,
+            };
+            left_val > right_val
+        }
+        _ => true, // Unknown HAVING, accept all groups
     }
 }
 
