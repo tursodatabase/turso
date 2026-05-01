@@ -1024,215 +1024,218 @@ func openDB(t *testing.T, driver string) *sql.DB {
 // ---------------------------------------------------------------------------
 
 func TestAPIParity(t *testing.T) {
-	// Delete hypothesis example database to prevent stale cached failures
-	// from causing flaky "non-deterministic" errors after test logic changes.
-	// The Go hegel API doesn't expose a database=None option.
-	os.RemoveAll(".hypothesis")
+	t.Run("parity", func(t *testing.T) {
+		hegel.Test(t, func(ht *hegel.T) {
+			localDB := openDB(t, "turso")
+			defer localDB.Close()
+			remoteDB := openDB(t, "turso-serverless")
+			defer remoteDB.Close()
 
-	t.Run("parity", hegel.Case(func(ht *hegel.T) {
-		localDB := openDB(t, "turso")
-		defer localDB.Close()
-		remoteDB := openDB(t, "turso-serverless")
-		defer remoteDB.Close()
+			prefix := hegel.Draw(ht, hegel.Integers(0, 65535))
 
-		prefix := hegel.Draw(ht, hegel.Integers(0, 65535))
+			// Drop any leftover tables for this prefix (from prior runs or Hegel replays).
+			for i := 0; i < spec.Constants.NumTables; i++ {
+				remoteDB.Exec(fmt.Sprintf("DROP TABLE IF EXISTS t_%d_%d", prefix, i))
+				remoteDB.Exec(fmt.Sprintf("DROP TABLE IF EXISTS t_%d_%d_audit", prefix, i))
+				remoteDB.Exec(fmt.Sprintf("DROP TRIGGER IF EXISTS tr_t_%d_%d_ins", prefix, i))
+			}
 
-		// Drop any leftover tables for this prefix (from prior runs or Hegel replays).
-		for i := 0; i < spec.Constants.NumTables; i++ {
-			remoteDB.Exec(fmt.Sprintf("DROP TABLE IF EXISTS t_%d_%d", prefix, i))
-			remoteDB.Exec(fmt.Sprintf("DROP TABLE IF EXISTS t_%d_%d_audit", prefix, i))
-			remoteDB.Exec(fmt.Sprintf("DROP TRIGGER IF EXISTS tr_t_%d_%d_ins", prefix, i))
-		}
+			tableCols := make(map[string]int)
+			numOps := hegel.Draw(ht, hegel.Integers(1, spec.Constants.MaxOpsPerCase))
 
-		tableCols := make(map[string]int)
-		numOps := hegel.Draw(ht, hegel.Integers(1, spec.Constants.MaxOpsPerCase))
+			// Accumulate an operation trace so failures show the full history.
+			var trace []string
 
-		// Accumulate an operation trace so failures show the full history.
-		var trace []string
+			for i := 0; i < numOps; i++ {
+				op := genOp(ht, tableCols, prefix)
 
-		for i := 0; i < numOps; i++ {
-			op := genOp(ht, tableCols, prefix)
+				localResult := executeOp(localDB, op)
+				remoteResult := executeOp(remoteDB, op)
 
-			localResult := executeOp(localDB, op)
-			remoteResult := executeOp(remoteDB, op)
+				trace = append(trace, fmt.Sprintf(
+					"  op[%d]: kind=%s table=%q\n    local:  ok=%v cols=%d rows=%d affected=%d\n    remote: ok=%v cols=%d rows=%d affected=%d",
+					i, op.Kind, op.Table,
+					localResult.Success, localResult.ColumnCount, localResult.RowCount, localResult.AffectedRows,
+					remoteResult.Success, remoteResult.ColumnCount, remoteResult.RowCount, remoteResult.AffectedRows,
+				))
+				traceDump := strings.Join(trace, "\n")
 
-			trace = append(trace, fmt.Sprintf(
-				"  op[%d]: kind=%s table=%q\n    local:  ok=%v cols=%d rows=%d affected=%d\n    remote: ok=%v cols=%d rows=%d affected=%d",
-				i, op.Kind, op.Table,
-				localResult.Success, localResult.ColumnCount, localResult.RowCount, localResult.AffectedRows,
-				remoteResult.Success, remoteResult.ColumnCount, remoteResult.RowCount, remoteResult.AffectedRows,
-			))
-			traceDump := strings.Join(trace, "\n")
+				// ErrorCheck only compares success/failure -- error messages legitimately differ.
+				if op.Kind == "error_check" {
+					if localResult.Success != remoteResult.Success {
+						ht.Fatalf(
+							"Parity violation on op #%d %+v:\n  local.Success:  %v\n  remote.Success: %v\n\nFull trace (prefix=%d):\n%s",
+							i, op, localResult.Success, remoteResult.Success, prefix, traceDump,
+						)
+					}
+					continue
+				}
 
-			// ErrorCheck only compares success/failure -- error messages legitimately differ.
-			if op.Kind == "error_check" {
-				if localResult.Success != remoteResult.Success {
+				if !resultsEqual(localResult, remoteResult) {
 					ht.Fatalf(
-						"Parity violation on op #%d %+v:\n  local.Success:  %v\n  remote.Success: %v\n\nFull trace (prefix=%d):\n%s",
-						i, op, localResult.Success, remoteResult.Success, prefix, traceDump,
+						"Parity violation on op #%d %+v:\n  local:  %+v\n  remote: %+v\n\nFull trace (prefix=%d):\n%s",
+						i, op, localResult, remoteResult, prefix, traceDump,
 					)
 				}
-				continue
-			}
 
-			if !resultsEqual(localResult, remoteResult) {
-				ht.Fatalf(
-					"Parity violation on op #%d %+v:\n  local:  %+v\n  remote: %+v\n\nFull trace (prefix=%d):\n%s",
-					i, op, localResult, remoteResult, prefix, traceDump,
-				)
+				// If both failed, stop — continuing with diverged implicit
+				// transaction state leads to false positives.
+				if !localResult.Success {
+					break
+				}
 			}
-
-			// If both failed, stop — continuing with diverged implicit
-			// transaction state leads to false positives.
-			if !localResult.Success {
-				break
-			}
-		}
-	}))
+		})
+	})
 
 	// Error recovery property: errors must never prevent subsequent commands
-	t.Run("error_recovery", hegel.Case(func(ht *hegel.T) {
-		remoteDB2 := openDB(t, "turso-serverless")
-		defer remoteDB2.Close()
+	t.Run("error_recovery", func(t *testing.T) {
+		hegel.Test(t, func(ht *hegel.T) {
+			remoteDB2 := openDB(t, "turso-serverless")
+			defer remoteDB2.Close()
 
-		prefix := hegel.Draw(ht, hegel.Integers(100000, 165535))
-		errorSQL := genErrorSQL(ht, prefix)
+			prefix := hegel.Draw(ht, hegel.Integers(100000, 165535))
+			errorSQL := genErrorSQL(ht, prefix)
 
-		// Send the error-inducing SQL (expected to fail)
-		_, _ = remoteDB2.Exec(errorSQL)
+			// Send the error-inducing SQL (expected to fail)
+			_, _ = remoteDB2.Exec(errorSQL)
 
-		// The critical assertion: SELECT 1 must succeed afterward
-		var val int
-		err := remoteDB2.QueryRow("SELECT 1").Scan(&val)
-		if err != nil {
-			ht.Fatalf("SELECT 1 failed after error SQL %q: %v", errorSQL, err)
-		}
-		if val != 1 {
-			ht.Fatalf("SELECT 1 returned %d after error SQL %q", val, errorSQL)
-		}
-	}))
+			// The critical assertion: SELECT 1 must succeed afterward
+			var val int
+			err := remoteDB2.QueryRow("SELECT 1").Scan(&val)
+			if err != nil {
+				ht.Fatalf("SELECT 1 failed after error SQL %q: %v", errorSQL, err)
+			}
+			if val != 1 {
+				ht.Fatalf("SELECT 1 returned %d after error SQL %q", val, errorSQL)
+			}
+		})
+	})
 
 	// DDL visibility in transactions: CREATE TABLE must be visible to
 	// subsequent statements within the same transaction.
-	t.Run("ddl_in_transaction", hegel.Case(func(ht *hegel.T) {
-		localDB := openDB(t, "turso")
-		defer localDB.Close()
-		remoteDB := openDB(t, "turso-serverless")
-		defer remoteDB.Close()
+	t.Run("ddl_in_transaction", func(t *testing.T) {
+		hegel.Test(t, func(ht *hegel.T) {
+			localDB := openDB(t, "turso")
+			defer localDB.Close()
+			remoteDB := openDB(t, "turso-serverless")
+			defer remoteDB.Close()
 
-		prefix := hegel.Draw(ht, hegel.Integers(200000, 265535))
-		tableIdx := hegel.Draw(ht, hegel.Integers(0, 5))
-		table := fmt.Sprintf("t_%d_%d", prefix, tableIdx)
-		val := hegel.Draw(ht, hegel.Integers(-1000, 1000))
+			prefix := hegel.Draw(ht, hegel.Integers(200000, 265535))
+			tableIdx := hegel.Draw(ht, hegel.Integers(0, 5))
+			table := fmt.Sprintf("t_%d_%d", prefix, tableIdx)
+			val := hegel.Draw(ht, hegel.Integers(-1000, 1000))
 
-		// Drop any leftover from prior runs so the INSERT produces exactly 1 row.
-		remoteDB.Exec(fmt.Sprintf("DROP TABLE IF EXISTS %s", table))
+			// Drop any leftover from prior runs so the INSERT produces exactly 1 row.
+			remoteDB.Exec(fmt.Sprintf("DROP TABLE IF EXISTS %s", table))
 
-		for _, tc := range []struct {
-			label string
-			db    *sql.DB
-		}{
-			{"local", localDB},
-			{"remote", remoteDB},
-		} {
-			tx, err := tc.db.BeginTx(context.Background(), nil)
-			if err != nil {
-				ht.Fatalf("%s: BEGIN failed: %v", tc.label, err)
+			for _, tc := range []struct {
+				label string
+				db    *sql.DB
+			}{
+				{"local", localDB},
+				{"remote", remoteDB},
+			} {
+				tx, err := tc.db.BeginTx(context.Background(), nil)
+				if err != nil {
+					ht.Fatalf("%s: BEGIN failed: %v", tc.label, err)
+				}
+
+				_, err = tx.Exec(fmt.Sprintf("CREATE TABLE IF NOT EXISTS %s (a INTEGER, b TEXT)", table))
+				if err != nil {
+					tx.Rollback()
+					ht.Fatalf("%s: CREATE TABLE failed: %v", tc.label, err)
+				}
+
+				_, err = tx.Exec(fmt.Sprintf("INSERT INTO %s VALUES (?, 'txn_ddl')", table), val)
+				if err != nil {
+					tx.Rollback()
+					ht.Fatalf("%s: INSERT failed: %v", tc.label, err)
+				}
+
+				result := queryResultTx(tx, fmt.Sprintf("SELECT a FROM %s", table))
+				if !result.Success {
+					tx.Rollback()
+					ht.Fatalf("%s: SELECT inside txn failed after CREATE+INSERT", tc.label)
+				}
+				if result.RowCount != 1 {
+					tx.Rollback()
+					ht.Fatalf("%s: expected 1 row, got %d", tc.label, result.RowCount)
+				}
+
+				err = tx.Commit()
+				if err != nil {
+					ht.Fatalf("%s: COMMIT failed: %v", tc.label, err)
+				}
 			}
-
-			_, err = tx.Exec(fmt.Sprintf("CREATE TABLE IF NOT EXISTS %s (a INTEGER, b TEXT)", table))
-			if err != nil {
-				tx.Rollback()
-				ht.Fatalf("%s: CREATE TABLE failed: %v", tc.label, err)
-			}
-
-			_, err = tx.Exec(fmt.Sprintf("INSERT INTO %s VALUES (?, 'txn_ddl')", table), val)
-			if err != nil {
-				tx.Rollback()
-				ht.Fatalf("%s: INSERT failed: %v", tc.label, err)
-			}
-
-			result := queryResultTx(tx, fmt.Sprintf("SELECT a FROM %s", table))
-			if !result.Success {
-				tx.Rollback()
-				ht.Fatalf("%s: SELECT inside txn failed after CREATE+INSERT", tc.label)
-			}
-			if result.RowCount != 1 {
-				tx.Rollback()
-				ht.Fatalf("%s: expected 1 row, got %d", tc.label, result.RowCount)
-			}
-
-			err = tx.Commit()
-			if err != nil {
-				ht.Fatalf("%s: COMMIT failed: %v", tc.label, err)
-			}
-		}
-	}))
+		})
+	})
 
 	// DDL + Prepare() in transactions: Prepare() calls describe which must
 	// see tables created earlier in the same transaction (issue #6562).
-	t.Run("ddl_prepare_in_transaction", hegel.Case(func(ht *hegel.T) {
-		localDB := openDB(t, "turso")
-		defer localDB.Close()
-		remoteDB := openDB(t, "turso-serverless")
-		defer remoteDB.Close()
+	t.Run("ddl_prepare_in_transaction", func(t *testing.T) {
+		hegel.Test(t, func(ht *hegel.T) {
+			localDB := openDB(t, "turso")
+			defer localDB.Close()
+			remoteDB := openDB(t, "turso-serverless")
+			defer remoteDB.Close()
 
-		prefix := hegel.Draw(ht, hegel.Integers(300000, 365535))
-		tableIdx := hegel.Draw(ht, hegel.Integers(0, 5))
-		table := fmt.Sprintf("t_%d_%d", prefix, tableIdx)
-		val := hegel.Draw(ht, hegel.Integers(-1000, 1000))
+			prefix := hegel.Draw(ht, hegel.Integers(300000, 365535))
+			tableIdx := hegel.Draw(ht, hegel.Integers(0, 5))
+			table := fmt.Sprintf("t_%d_%d", prefix, tableIdx)
+			val := hegel.Draw(ht, hegel.Integers(-1000, 1000))
 
-		// Drop any leftover from prior runs so the INSERT produces exactly 1 row.
-		remoteDB.Exec(fmt.Sprintf("DROP TABLE IF EXISTS %s", table))
+			// Drop any leftover from prior runs so the INSERT produces exactly 1 row.
+			remoteDB.Exec(fmt.Sprintf("DROP TABLE IF EXISTS %s", table))
 
-		for _, tc := range []struct {
-			label string
-			db    *sql.DB
-		}{
-			{"local", localDB},
-			{"remote", remoteDB},
-		} {
-			tx, err := tc.db.BeginTx(context.Background(), nil)
-			if err != nil {
-				ht.Fatalf("%s: BEGIN failed: %v", tc.label, err)
-			}
+			for _, tc := range []struct {
+				label string
+				db    *sql.DB
+			}{
+				{"local", localDB},
+				{"remote", remoteDB},
+			} {
+				tx, err := tc.db.BeginTx(context.Background(), nil)
+				if err != nil {
+					ht.Fatalf("%s: BEGIN failed: %v", tc.label, err)
+				}
 
-			_, err = tx.Exec(fmt.Sprintf("CREATE TABLE IF NOT EXISTS %s (a INTEGER, b TEXT)", table))
-			if err != nil {
-				tx.Rollback()
-				ht.Fatalf("%s: CREATE TABLE failed: %v", tc.label, err)
-			}
+				_, err = tx.Exec(fmt.Sprintf("CREATE TABLE IF NOT EXISTS %s (a INTEGER, b TEXT)", table))
+				if err != nil {
+					tx.Rollback()
+					ht.Fatalf("%s: CREATE TABLE failed: %v", tc.label, err)
+				}
 
-			// Use Prepare() on the tx — this exercises the describe
-			// path which must see DDL from the current transaction.
-			stmt, err := tx.Prepare(fmt.Sprintf("INSERT INTO %s VALUES (?, 'txn_ddl')", table))
-			if err != nil {
-				tx.Rollback()
-				ht.Fatalf("%s: Prepare(INSERT) failed after CREATE in same txn: %v", tc.label, err)
-			}
-			_, err = stmt.Exec(val)
-			stmt.Close()
-			if err != nil {
-				tx.Rollback()
-				ht.Fatalf("%s: prepared INSERT Exec failed: %v", tc.label, err)
-			}
+				// Use Prepare() on the tx — this exercises the describe
+				// path which must see DDL from the current transaction.
+				stmt, err := tx.Prepare(fmt.Sprintf("INSERT INTO %s VALUES (?, 'txn_ddl')", table))
+				if err != nil {
+					tx.Rollback()
+					ht.Fatalf("%s: Prepare(INSERT) failed after CREATE in same txn: %v", tc.label, err)
+				}
+				_, err = stmt.Exec(val)
+				stmt.Close()
+				if err != nil {
+					tx.Rollback()
+					ht.Fatalf("%s: prepared INSERT Exec failed: %v", tc.label, err)
+				}
 
-			result := queryResultTx(tx, fmt.Sprintf("SELECT a FROM %s", table))
-			if !result.Success {
-				tx.Rollback()
-				ht.Fatalf("%s: SELECT inside txn failed after CREATE+Prepare(INSERT)", tc.label)
-			}
-			if result.RowCount != 1 {
-				tx.Rollback()
-				ht.Fatalf("%s: expected 1 row, got %d", tc.label, result.RowCount)
-			}
+				result := queryResultTx(tx, fmt.Sprintf("SELECT a FROM %s", table))
+				if !result.Success {
+					tx.Rollback()
+					ht.Fatalf("%s: SELECT inside txn failed after CREATE+Prepare(INSERT)", tc.label)
+				}
+				if result.RowCount != 1 {
+					tx.Rollback()
+					ht.Fatalf("%s: expected 1 row, got %d", tc.label, result.RowCount)
+				}
 
-			err = tx.Commit()
-			if err != nil {
-				ht.Fatalf("%s: COMMIT failed: %v", tc.label, err)
+				err = tx.Commit()
+				if err != nil {
+					ht.Fatalf("%s: COMMIT failed: %v", tc.label, err)
+				}
 			}
-		}
-	}))
+		})
+	})
 }
 
 // ---------------------------------------------------------------------------
