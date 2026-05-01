@@ -125,7 +125,7 @@ pub fn run_worker(
                         continue;
                     }
                 };
-                conn.wal_auto_checkpoint_disable();
+                conn.wal_auto_actions_disable();
                 send_response(&WorkerResponse::Ack)?;
             }
             WorkerCommand::PassiveCheckpoint {

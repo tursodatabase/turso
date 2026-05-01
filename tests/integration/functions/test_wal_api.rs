@@ -302,11 +302,11 @@ fn test_wal_frame_api_no_schema_changes_fuzz(db: TempDatabase) {
         let conn1 = db1.connect_limbo();
         let db2 = builder.clone().build();
         let conn2 = db2.connect_limbo();
-        conn1.wal_auto_checkpoint_disable();
+        conn1.wal_auto_actions_disable();
         conn1
             .execute("CREATE TABLE t(x INTEGER PRIMARY KEY, y)")
             .unwrap();
-        conn2.wal_auto_checkpoint_disable();
+        conn2.wal_auto_actions_disable();
         conn2
             .execute("CREATE TABLE t(x INTEGER PRIMARY KEY, y)")
             .unwrap();
@@ -875,7 +875,7 @@ fn test_db_share_same_file() {
     )
     .unwrap();
     let conn1 = db1.connect().unwrap();
-    conn1.wal_auto_checkpoint_disable();
+    conn1.wal_auto_actions_disable();
 
     conn1.execute("create table a(x, y)").unwrap();
     conn1
@@ -902,7 +902,7 @@ fn test_db_share_same_file() {
     )
     .unwrap();
     let conn2 = db2.connect().unwrap();
-    conn2.wal_auto_checkpoint_disable();
+    conn2.wal_auto_actions_disable();
 
     let mut stmt = conn2.prepare("select x, length(y) from a").unwrap();
     let mut rows: Vec<Vec<turso_core::types::Value>> = Vec::new();

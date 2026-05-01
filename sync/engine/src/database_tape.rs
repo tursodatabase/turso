@@ -136,14 +136,14 @@ impl DatabaseTape {
     pub(crate) fn connect_untracked(&self) -> Result<Arc<turso_core::Connection>> {
         let connection = self.inner.connect()?;
         if self.disable_auto_checkpoint {
-            connection.wal_auto_checkpoint_disable();
+            connection.wal_auto_actions_disable();
         }
         Ok(connection)
     }
     pub async fn connect<Ctx>(&self, coro: &Coro<Ctx>) -> Result<Arc<turso_core::Connection>> {
         let connection = self.inner.connect()?;
         if self.disable_auto_checkpoint {
-            connection.wal_auto_checkpoint_disable();
+            connection.wal_auto_actions_disable();
         }
         tracing::debug!("set '{CDC_PRAGMA_NAME}' for new connection");
         let mut stmt = connection.prepare(&self.pragma_query)?;
@@ -194,7 +194,7 @@ impl DatabaseTape {
         tracing::debug!("opening changes iterator with options {:?}", opts);
         let conn = self.inner.connect()?;
         if self.disable_auto_checkpoint {
-            conn.wal_auto_checkpoint_disable();
+            conn.wal_auto_actions_disable();
         }
 
         let cdc_version = self

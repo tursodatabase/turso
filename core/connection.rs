@@ -179,8 +179,8 @@ pub struct Connection {
     pub(super) page_size: AtomicU16,
     /// Allowed automatic WAL maintenance actions for this connection.
     /// Stored as the `bits()` of a `WalAutoActions`. Default is
-    /// `WalAutoActions::all_enabled()`. `wal_auto_checkpoint_disable`
-    /// clears every bit, opting out of both auto-checkpoint and WAL header
+    /// `WalAutoActions::all_enabled()`. `wal_auto_actions_disable` clears
+    /// every bit, opting out of both auto-checkpoint and WAL header
     /// restart — sync-engine consumers rely on the latter staying disabled
     /// because rotating the WAL header invalidates their published
     /// watermarks.
@@ -1652,7 +1652,7 @@ impl Connection {
     /// Disable every automatic WAL maintenance action for this connection
     /// (auto-checkpoint AND WAL header restart). Sync-engine consumers call
     /// this so they own all WAL bookkeeping themselves.
-    pub fn wal_auto_checkpoint_disable(&self) {
+    pub fn wal_auto_actions_disable(&self) {
         self.wal_auto_actions
             .store(WalAutoActions::empty().bits(), Ordering::SeqCst);
     }

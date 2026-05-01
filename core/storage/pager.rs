@@ -5719,7 +5719,7 @@ mod checkpoint_phase_tests {
         let (db, dir) = open_checkpoint_test_database();
         let db_path = dir.join("test.db");
         let conn = db.connect().unwrap();
-        conn.wal_auto_checkpoint_disable();
+        conn.wal_auto_actions_disable();
         conn.execute("create table test(id integer primary key, value blob)")
             .unwrap();
         conn.execute("begin immediate").unwrap();

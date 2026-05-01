@@ -7407,7 +7407,7 @@ pub mod test {
         let wal_path = path.join("test.db-wal");
         let wal_path_str = wal_path.to_str().unwrap();
         let conn = db.connect().unwrap();
-        conn.wal_auto_checkpoint_disable();
+        conn.wal_auto_actions_disable();
         conn.execute("create table test(id integer primary key, value text)")
             .unwrap();
         bulk_inserts(&conn, 8, 2);
@@ -7495,7 +7495,7 @@ pub mod test {
         let wal_path = path.join("test.db-wal");
         let wal_path_str = wal_path.to_str().unwrap();
         let conn = db.connect().unwrap();
-        conn.wal_auto_checkpoint_disable();
+        conn.wal_auto_actions_disable();
         conn.execute("create table test(id integer primary key, value text)")
             .unwrap();
         bulk_inserts(&conn, 8, 2);

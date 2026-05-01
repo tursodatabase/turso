@@ -30,7 +30,7 @@ pub struct TursoSyncServer {
 
 impl TursoSyncServer {
     pub fn new(address: String, conn: Arc<Connection>, interrupt_count: Arc<AtomicUsize>) -> Self {
-        conn.wal_auto_checkpoint_disable();
+        conn.wal_auto_actions_disable();
         Self {
             address,
             conn: Arc::new(Mutex::new(conn)),

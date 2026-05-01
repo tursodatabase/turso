@@ -1721,39 +1721,10 @@ mod tests {
         assert_eq!(remote_rows[1][2], Value::Text("from-local".to_string()));
     }
 
-    /// Reproducer for the panic seen by read-only sync-engine consumers:
-    ///     thread 'tokio-rt-worker' panicked at core/storage/wal.rs
-    ///     frame_count must be not less than frame_watermark
-    ///     frame_count=0, frame_watermark=23
-    ///
-    /// Scenario the user described: a service only reads from a locally
-    /// synced database — it never writes — and `db.pull()` panics inside
-    /// `apply_changes_internal` after a previous pull populated the WAL.
-    ///
-    /// Mechanism:
-    /// 1. First pull writes N frames into the local WAL and stores
-    ///    `meta.revert_since_wal_watermark = N` (no `revert_since_wal_salt`
-    ///    is recorded on the pull path).
-    /// 2. The service does not write anything between pulls, so
-    ///    `WAL.max_frame` stays at N.
-    /// 3. Second pull -> `apply_changes_internal`:
-    ///    a. `checkpoint_passive` returns `watermark = N` and runs a
-    ///       Passive checkpoint with `upper_bound_inclusive = N`. Because
-    ///       no other reader is holding a read mark and `max_frame == N`,
-    ///       the checkpoint backfills every frame, leaving
-    ///       `nbackfills == max_frame == N`.
-    ///    b. `WalSession::begin()` calls `begin_write_tx`, which calls
-    ///       `try_restart_log_before_write` (core/storage/wal.rs:4737).
-    ///       The conditions to restart are now all met
-    ///       (`max_frame == nbackfills > 0`, holds read-mark 0), so the
-    ///       WAL header is restarted and `apply_restart_snapshot` resets
-    ///       this connection's `WalFile::max_frame` to 0.
-    ///    c. `rollback_changes_after(coro, watermark = N)` calls
-    ///       `wal_changed_pages_after(N)`, whose
-    ///       `turso_assert!(frame_count >= frame_watermark, ...)` fires
-    ///       with `frame_count=0, frame_watermark=N`.
-    ///
-    /// The test must complete the second `db.pull().await` without panicking.
+    /// Read-only consumer: pull + checkpoint loop with concurrent readers must
+    /// not panic with `frame_count must be not less than frame_watermark` when
+    /// a checkpoint backfills every frame and the next write tx restarts the
+    /// WAL header behind a stale sync-engine watermark.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     pub async fn test_sync_pull_panics_after_full_backfill() {
         use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
