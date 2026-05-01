@@ -202,6 +202,9 @@ jobs:
           - name: Differential
             iterations: 10
             args: "--maximum-tests 1000 --differential --io-backend=memory"
+          - name: SimpleMVCC
+            iterations: 10
+            args: "--maximum-tests 1000 --min-tick 10 --max-tick 50 --profile simple_mvcc --io-backend=memory"
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -375,7 +378,7 @@ jobs:
       - name: Run Windows core multiprocess regressions
         run: cargo test -q -p turso_core --features "fs experimental_win_iocp" multiprocess_tests:: -- --nocapture
       - name: Run Windows multiprocess startup smoke
-          run: cargo run -q -p turso_whopper -- --mode fast --multiprocess --connections-per-process 4 --processes 4 --kill-probability 0.01
+        run: cargo run -q -p turso_whopper -- --mode fast --multiprocess --connections-per-process 4 --processes 4 --kill-probability 0.01
 
   test-sqlite:
     runs-on: blacksmith-4vcpu-ubuntu-2404
