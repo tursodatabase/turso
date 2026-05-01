@@ -4640,27 +4640,21 @@ pub fn op_row_id(
                 index_cursor_id,
                 table_cursor_id,
             } => {
-                let rowid = {
+                // The index cursor may not be positioned on a record here:
+                // e.g. an UPDATE that rewrites overflow-bearing index keys can
+                // leave the cursor without a current record by the time the
+                // deferred seek is consumed. Mirror op_column's handling and
+                // produce a NULL rowid in that case rather than panicking.
+                let Some(rowid) = ({
                     let index_cursor = state.get_cursor(index_cursor_id);
                     match index_cursor {
-                        Cursor::BTree(index_cursor) => {
-                            let record = return_if_io!(index_cursor.record());
-                            let record =
-                                record.as_ref().expect("index cursor should have a record");
-                            let rowid = record
-                                .last_value()
-                                .expect("record should have a last value");
-                            match rowid {
-                                Ok(ValueRef::Numeric(Numeric::Integer(rowid))) => rowid,
-                                _ => unreachable!(),
-                            }
-                        }
-                        Cursor::IndexMethod(index_cursor) => {
-                            return_if_io!(index_cursor.query_rowid())
-                                .expect("index cursor should have a rowid")
-                        }
+                        Cursor::BTree(cursor) => return_if_io!(cursor.rowid()),
+                        Cursor::IndexMethod(cursor) => return_if_io!(cursor.query_rowid()),
                         _ => panic!("unexpected cursor type"),
                     }
+                }) else {
+                    state.registers[*dest].set_null();
+                    break;
                 };
                 *state.active_op_state.row_id() = OpRowIdState::Seek {
                     rowid,
