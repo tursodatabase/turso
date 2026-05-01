@@ -15,6 +15,7 @@ use tracing::{instrument, Level};
 
 use crate::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use crate::sync::RwLock;
+use bitflags::bitflags;
 use std::fmt::{Debug, Formatter};
 use std::{fmt, sync::Arc};
 
@@ -114,6 +115,35 @@ pub(crate) fn coordination_path_for_wal_path(wal_path: &str) -> String {
         format!("{db_path}-tshm")
     } else {
         format!("{wal_path}-tshm")
+    }
+}
+
+bitflags! {
+    /// Automatic WAL maintenance actions a caller permits the engine to take
+    /// during routine operations (begin write tx, commit, shutdown).
+    ///
+    /// Callers that manage WAL state out-of-band — e.g. the sync engine,
+    /// which keeps its own watermarks across the WAL header — pass an
+    /// explicit subset so unrelated bookkeeping remains untouched. The
+    /// previous single `wal_auto_checkpoint_disabled` boolean conflated both
+    /// auto-checkpoint and WAL header restart; spelling them out separately
+    /// avoids breaking sync-engine assumptions whenever one of the two is
+    /// disabled.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct WalAutoActions: u8 {
+        /// Run an auto-checkpoint after commit when `should_checkpoint()`
+        /// is true, and the truncate-checkpoint on connection shutdown.
+        const Checkpoint = 0b01;
+        /// Restart the WAL header in `try_restart_log_before_write` when
+        /// every frame has been backfilled, before starting a write tx.
+        const Restart    = 0b10;
+    }
+}
+
+impl WalAutoActions {
+    /// Default policy for ordinary connections: every auto action allowed.
+    pub const fn all_enabled() -> Self {
+        Self::from_bits_truncate(Self::Checkpoint.bits() | Self::Restart.bits())
     }
 }
 
@@ -572,7 +602,13 @@ pub trait Wal: Debug + Send + Sync {
     fn mvcc_refresh_if_db_changed(&self) -> bool;
 
     /// Begin a write transaction.
-    fn begin_write_tx(&self) -> Result<()>;
+    ///
+    /// `allowed_auto_actions` controls which automatic WAL maintenance
+    /// actions are permitted within this call — currently only
+    /// `WalAutoActions::Restart` is consulted (it gates
+    /// `try_restart_log_before_write`). Callers that own WAL state
+    /// externally (e.g. the sync engine) pass an empty set to opt out.
+    fn begin_write_tx(&self, allowed_auto_actions: WalAutoActions) -> Result<()>;
 
     /// End a read transaction.
     fn end_read_tx(&self);
@@ -3094,7 +3130,7 @@ impl Wal for WalFile {
 
     /// Begin a write transaction
     #[instrument(skip_all, level = Level::DEBUG)]
-    fn begin_write_tx(&self) -> Result<()> {
+    fn begin_write_tx(&self, allowed_auto_actions: WalAutoActions) -> Result<()> {
         tracing::debug!("begin_write_tx");
         let begin_write_result: Result<()> = {
             // sqlite/src/wal.c 3702
@@ -3142,6 +3178,10 @@ impl Wal for WalFile {
                 false,
                 "begin_write_tx called while write lock already held according to connection state"
             );
+        }
+
+        if !allowed_auto_actions.contains(WalAutoActions::Restart) {
+            return Ok(());
         }
 
         let result = self.try_restart_log_before_write();
@@ -5480,7 +5520,8 @@ pub mod test {
     };
     use super::{
         CheckpointLocks, InProcessWalCoordination, ReadGuardKind, TryBeginReadResult, Wal,
-        WalCommitState, WalConnectionState, WalCoordination, WalFile, WalSnapshot, NO_LOCK_HELD,
+        WalAutoActions, WalCommitState, WalConnectionState, WalCoordination, WalFile, WalSnapshot,
+        NO_LOCK_HELD,
     };
     #[cfg(host_shared_wal)]
     use crate::storage::shared_wal_coordination::{
@@ -7366,7 +7407,7 @@ pub mod test {
         let wal_path = path.join("test.db-wal");
         let wal_path_str = wal_path.to_str().unwrap();
         let conn = db.connect().unwrap();
-        conn.wal_auto_checkpoint_disable();
+        conn.wal_auto_actions_disable();
         conn.execute("create table test(id integer primary key, value text)")
             .unwrap();
         bulk_inserts(&conn, 8, 2);
@@ -7454,7 +7495,7 @@ pub mod test {
         let wal_path = path.join("test.db-wal");
         let wal_path_str = wal_path.to_str().unwrap();
         let conn = db.connect().unwrap();
-        conn.wal_auto_checkpoint_disable();
+        conn.wal_auto_actions_disable();
         conn.execute("create table test(id integer primary key, value text)")
             .unwrap();
         bulk_inserts(&conn, 8, 2);
@@ -8862,7 +8903,7 @@ pub mod test {
             let pager = conn2.pager.load();
             let wal = pager.wal.as_ref().unwrap();
             let _ = wal.begin_read_tx().unwrap();
-            wal.begin_write_tx().unwrap();
+            wal.begin_write_tx(WalAutoActions::all_enabled()).unwrap();
         }
 
         // should fail because writer lock is held
@@ -8902,7 +8943,7 @@ pub mod test {
         // Attempt to start a write transaction without a read transaction
         let pager = conn.pager.load();
         let wal = pager.wal.as_ref().unwrap();
-        let _ = wal.begin_write_tx();
+        let _ = wal.begin_write_tx(WalAutoActions::all_enabled());
     }
 
     fn check_read_lock_slot(conn: &Arc<Connection>, _expected_slot: usize) -> bool {
@@ -9166,7 +9207,7 @@ pub mod test {
         let result = {
             let pager = conn2.pager.load();
             let wal = pager.wal.as_ref().unwrap();
-            wal.begin_write_tx()
+            wal.begin_write_tx(WalAutoActions::all_enabled())
         };
         // Should get BusySnapShot due to stale snapshot
         assert!(matches!(result, Err(LimboError::BusySnapshot)));
@@ -9182,7 +9223,7 @@ pub mod test {
         let result = {
             let pager = conn2.pager.load();
             let wal = pager.wal.as_ref().unwrap();
-            wal.begin_write_tx()
+            wal.begin_write_tx(WalAutoActions::all_enabled())
         };
         assert!(matches!(result, Ok(())));
     }

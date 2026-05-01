@@ -52,7 +52,7 @@ use super::sqlite3_ondisk::{
     FREELIST_TRUNK_OFFSET_FIRST_LEAF_PTR, FREELIST_TRUNK_OFFSET_LEAF_COUNT,
     FREELIST_TRUNK_OFFSET_NEXT_TRUNK_PTR,
 };
-use super::wal::CheckpointMode;
+use super::wal::{CheckpointMode, WalAutoActions};
 use crate::storage::encryption::{CipherMode, EncryptionContext, EncryptionKey};
 
 /// SQLite's default maximum page count
@@ -2681,14 +2681,20 @@ impl Pager {
 
     #[inline(always)]
     #[instrument(skip_all, level = Level::DEBUG)]
-    pub fn begin_write_tx(&self) -> Result<IOResult<()>> {
+    /// `allowed_auto_actions` controls which automatic WAL maintenance the
+    /// caller permits during this begin. The only action consulted here is
+    /// `WalAutoActions::Restart`, which gates the WAL-header restart inside
+    /// `try_restart_log_before_write`. Callers managing WAL state externally
+    /// (sync engine) must not pass `Restart` because rotating the WAL header
+    /// behind their back invalidates watermarks they have already published.
+    pub fn begin_write_tx(&self, allowed_auto_actions: WalAutoActions) -> Result<IOResult<()>> {
         // TODO(Diego): The only possibly allocate page1 here is because OpenEphemeral needs a write transaction
         // we should have a unique API to begin transactions, something like sqlite3BtreeBeginTrans
         return_if_io!(self.maybe_allocate_page1());
         let Some(wal) = self.wal.as_ref() else {
             return Ok(IOResult::Done(()));
         };
-        Ok(IOResult::Done(wal.begin_write_tx()?))
+        Ok(IOResult::Done(wal.begin_write_tx(allowed_auto_actions)?))
     }
 
     /// Acquire exclusive WAL access + block new transactions (used by VACUUM).
@@ -2769,7 +2775,7 @@ impl Pager {
                 }
                 _ => {
                     return_if_io!(self.commit_dirty_pages(
-                        connection.is_wal_auto_checkpoint_disabled(),
+                        connection.wal_auto_actions(),
                         connection.get_sync_mode(),
                         connection.get_data_sync_retry(),
                     ));
@@ -3607,10 +3613,15 @@ impl Pager {
     /// In the base case, it will write the dirty pages to the WAL and then fsync the WAL.
     /// If the WAL size is over the checkpoint threshold, it will checkpoint the WAL to
     /// the database file and then fsync the database file.
+    ///
+    /// `allowed_auto_actions` controls automatic WAL maintenance permitted at
+    /// commit time. Only `WalAutoActions::Checkpoint` is consulted here — it
+    /// gates the post-commit auto-checkpoint when `should_checkpoint()` is
+    /// true.
     #[instrument(skip_all, level = Level::DEBUG)]
     pub fn commit_dirty_pages(
         &self,
-        wal_auto_checkpoint_disabled: bool,
+        allowed_auto_actions: WalAutoActions,
         sync_mode: SyncMode,
         data_sync_retry: bool,
     ) -> Result<IOResult<()>> {
@@ -3627,7 +3638,7 @@ impl Pager {
         }
 
         let result =
-            self.commit_dirty_pages_inner(wal_auto_checkpoint_disabled, sync_mode, data_sync_retry);
+            self.commit_dirty_pages_inner(allowed_auto_actions, sync_mode, data_sync_retry);
         if result.is_err() {
             self.commit_info.write().reset();
         }
@@ -3641,7 +3652,7 @@ impl Pager {
     #[instrument(skip_all, level = Level::DEBUG)]
     fn commit_dirty_pages_inner(
         &self,
-        wal_auto_checkpoint_disabled: bool,
+        allowed_auto_actions: WalAutoActions,
         sync_mode: SyncMode,
         data_sync_retry: bool,
     ) -> Result<IOResult<()>> {
@@ -3881,7 +3892,8 @@ impl Pager {
                     self.dirty_pages.write().clear();
                     commit_info.prepared_frames.clear();
 
-                    let need_checkpoint = !wal_auto_checkpoint_disabled && wal.should_checkpoint();
+                    let need_checkpoint = allowed_auto_actions.contains(WalAutoActions::Checkpoint)
+                        && wal.should_checkpoint();
                     if need_checkpoint {
                         commit_info.state = CommitState::AutoCheckpoint;
                     }
@@ -4470,7 +4482,7 @@ impl Pager {
     /// deletes the WAL file.
     pub fn checkpoint_shutdown(
         &self,
-        wal_auto_checkpoint_disabled: bool,
+        allowed_auto_actions: WalAutoActions,
         sync_mode: crate::SyncMode,
     ) -> Result<()> {
         let mut attempts = 0;
@@ -4485,7 +4497,7 @@ impl Pager {
             let c = wal.sync(self.get_sync_type())?;
             self.io.wait_for_completion(c)?;
         }
-        if !wal_auto_checkpoint_disabled {
+        if allowed_auto_actions.contains(WalAutoActions::Checkpoint) {
             while let Err(LimboError::Busy) = self.blocking_checkpoint(
                 CheckpointMode::Truncate {
                     upper_bound_inclusive: None,
@@ -5707,7 +5719,7 @@ mod checkpoint_phase_tests {
         let (db, dir) = open_checkpoint_test_database();
         let db_path = dir.join("test.db");
         let conn = db.connect().unwrap();
-        conn.wal_auto_checkpoint_disable();
+        conn.wal_auto_actions_disable();
         conn.execute("create table test(id integer primary key, value blob)")
             .unwrap();
         conn.execute("begin immediate").unwrap();

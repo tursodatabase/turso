@@ -8320,7 +8320,8 @@ mod tests {
         },
         types::Text,
         vdbe::Register,
-        BufferPool, Completion, Connection, IOContext, StepResult, Wal, WalFile, WalFileShared,
+        BufferPool, Completion, Connection, IOContext, StepResult, Wal, WalAutoActions, WalFile,
+        WalFileShared,
     };
     use arc_swap::ArcSwapOption;
     use std::{mem::transmute, ops::Deref, sync::Arc};
@@ -8674,7 +8675,11 @@ mod tests {
 
         // force allocate page1 with a transaction
         pager.begin_read_tx().unwrap();
-        run_until_done(|| pager.begin_write_tx(), &pager).unwrap();
+        run_until_done(
+            || pager.begin_write_tx(WalAutoActions::all_enabled()),
+            &pager,
+        )
+        .unwrap();
         run_until_done(|| pager.commit_tx(&conn, true), &pager).unwrap();
 
         let page2 = run_until_done(|| pager.allocate_page(), &pager).unwrap();
@@ -8951,7 +8956,11 @@ mod tests {
             for insert_id in 0..inserts {
                 let do_validate = do_validate_btree || (insert_id % VALIDATE_INTERVAL == 0);
                 pager.begin_read_tx().unwrap();
-                run_until_done(|| pager.begin_write_tx(), &pager).unwrap();
+                run_until_done(
+                    || pager.begin_write_tx(WalAutoActions::all_enabled()),
+                    &pager,
+                )
+                .unwrap();
                 let size = size(&mut rng);
                 let key = {
                     let result;
@@ -9096,7 +9105,10 @@ mod tests {
             tracing::info!("seed: {seed}");
             for i in 0..inserts {
                 pager.begin_read_tx().unwrap();
-                pager.io.block(|| pager.begin_write_tx()).unwrap();
+                pager
+                    .io
+                    .block(|| pager.begin_write_tx(WalAutoActions::all_enabled()))
+                    .unwrap();
                 let key = {
                     let result;
                     loop {
@@ -9271,7 +9283,10 @@ mod tests {
                 let print_progress = i % 100 == 0;
                 pager.begin_read_tx().unwrap();
 
-                pager.io.block(|| pager.begin_write_tx()).unwrap();
+                pager
+                    .io
+                    .block(|| pager.begin_write_tx(WalAutoActions::all_enabled()))
+                    .unwrap();
 
                 // Decide whether to insert or delete (80% chance of insert)
                 let is_insert = rng.next_u64() % 100 < (insert_chance * 100.0) as u64;

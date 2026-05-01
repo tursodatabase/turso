@@ -438,7 +438,7 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
         // DB wasn't synced with remote but will be encrypted on remote - so we must properly set reserved bytes field in advance
         if meta.synced_revision.is_none() && opts.reserved_bytes != 0 {
             let conn = main_db.connect()?;
-            conn.wal_auto_checkpoint_disable();
+            conn.wal_auto_actions_disable();
             conn.set_reserved_bytes(opts.reserved_bytes as u8)?;
 
             // write transaction forces allocation of root DB page
@@ -571,7 +571,7 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
             }
         };
         let conn = db.connect()?;
-        conn.wal_auto_checkpoint_disable();
+        conn.wal_auto_actions_disable();
         Ok(conn)
     }
 
@@ -1108,9 +1108,10 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
     /// Create read/write database connection and appropriately configure it before use
     pub async fn connect_rw<Ctx>(&self, coro: &Coro<Ctx>) -> Result<Arc<turso_core::Connection>> {
         let conn = self.main_tape.connect(coro).await?;
-        assert!(
-            conn.is_wal_auto_checkpoint_disabled(),
-            "tape must be configured to have autocheckpoint disabled"
+        assert_eq!(
+            conn.wal_auto_actions(),
+            turso_core::WalAutoActions::empty(),
+            "tape must be configured to have all auto-WAL actions disabled"
         );
         Ok(conn)
     }

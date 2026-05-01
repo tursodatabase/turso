@@ -84,8 +84,8 @@ use crate::{
     },
     sync::{
         atomic::{
-            AtomicBool, AtomicI32, AtomicI64, AtomicIsize, AtomicU16, AtomicU64, AtomicUsize,
-            Ordering,
+            AtomicBool, AtomicI32, AtomicI64, AtomicIsize, AtomicU16, AtomicU64, AtomicU8,
+            AtomicUsize, Ordering,
         },
         Arc, LazyLock, Mutex, RwLock, Weak,
     },
@@ -142,7 +142,7 @@ pub use storage::{
     database::{DatabaseStorage, IOContext},
     encryption::{CipherMode, EncryptionContext, EncryptionKey},
     pager::{Page, PageRef, Pager},
-    wal::{CheckpointMode, CheckpointResult, Wal, WalFile, WalFileShared},
+    wal::{CheckpointMode, CheckpointResult, Wal, WalAutoActions, WalFile, WalFileShared},
 };
 pub use translate::expr::{walk_expr_mut, WalkControl};
 pub use turso_macros::{
@@ -1678,7 +1678,7 @@ impl Database {
             _shared_cache: false,
             cache_size: AtomicI32::new(default_cache_size),
             page_size: AtomicU16::new(page_size.get_raw()),
-            wal_auto_checkpoint_disabled: AtomicBool::new(false),
+            wal_auto_actions: AtomicU8::new(WalAutoActions::all_enabled().bits()),
             capture_data_changes: RwLock::new(None),
             cdc_transaction_id: AtomicI64::new(-1),
             closed: AtomicBool::new(false),

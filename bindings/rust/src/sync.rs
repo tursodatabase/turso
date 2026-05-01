@@ -1720,4 +1720,103 @@ mod tests {
         assert_eq!(remote_rows[1][1], Value::Text("beta".to_string()));
         assert_eq!(remote_rows[1][2], Value::Text("from-local".to_string()));
     }
+
+    /// Read-only consumer: pull + checkpoint loop with concurrent readers must
+    /// not panic with `frame_count must be not less than frame_watermark` when
+    /// a checkpoint backfills every frame and the next write tx restarts the
+    /// WAL header behind a stale sync-engine watermark.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    pub async fn test_sync_pull_panics_after_full_backfill() {
+        use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
+        use std::sync::Arc;
+
+        let _ = tracing_subscriber::fmt::try_init();
+        let dir = TempDir::new().unwrap();
+        let server = TursoServer::new().await.unwrap();
+
+        let db = crate::sync::Builder::new_remote(dir.path().join("local.db").to_str().unwrap())
+            .with_remote_url(server.db_url())
+            .build()
+            .await
+            .unwrap();
+
+        server.db_sql("CREATE TABLE t(y BLOB)").await.unwrap();
+        db.pull().await.unwrap();
+
+        // Read-only consumer: only opens a connection and queries.
+        let conn = db.connect().await.unwrap();
+
+        // Spawn random readers on independent connections that race against
+        // the pull+checkpoint loop. Each reader picks a random query out of a
+        // small set, sleeps a random short interval, and verifies that the
+        // observed row count never goes backward and never exceeds what the
+        // pull loop has already applied.
+        let done = Arc::new(AtomicBool::new(false));
+        let applied_total = Arc::new(AtomicI64::new(0));
+        let mut readers = Vec::new();
+        for _ in 0..4 {
+            let reader_conn = db.connect().await.unwrap();
+            let done = done.clone();
+            let applied_total = applied_total.clone();
+            readers.push(tokio::spawn(async move {
+                let mut last_seen: i64 = 0;
+                while !done.load(Ordering::Relaxed) {
+                    let sleep_ms = rand::rng().random_range(0..=4);
+                    tokio::time::sleep(Duration::from_millis(sleep_ms)).await;
+
+                    let sql = match rand::rng().random_range(0..3) {
+                        0 => "SELECT count(*) FROM t",
+                        1 => "SELECT count(length(y)) FROM t",
+                        _ => "SELECT count(*) FROM t WHERE length(y) > 0",
+                    };
+                    let rows = match reader_conn.query(sql, ()).await {
+                        Ok(rows) => rows,
+                        // Acceptable transient errors during pull/checkpoint;
+                        // anything else (including the WAL panic) propagates.
+                        Err(crate::Error::Busy(_)) => continue,
+                        Err(e) => panic!("reader query failed: {e:?}"),
+                    };
+                    let all = all_rows(rows).await.unwrap();
+                    let Value::Integer(n) = all[0][0] else {
+                        panic!("unexpected reader value: {:?}", all[0][0]);
+                    };
+                    let upper = applied_total.load(Ordering::Acquire);
+                    assert!(
+                        n >= last_seen && n <= upper,
+                        "reader saw inconsistent count {n}, last_seen={last_seen}, upper={upper}"
+                    );
+                    last_seen = n;
+                }
+            }));
+        }
+
+        let mut total: i64 = 0;
+        for _ in 0..25 {
+            let cnt: u16 = rand::rng().random_range(1..=16);
+            let size: u32 = rand::rng().random_range(1..=4 * 1024);
+
+            server
+                .db_sql(&format!(
+                    "INSERT INTO t SELECT randomblob({size}) FROM generate_series(1, {cnt})"
+                ))
+                .await
+                .unwrap();
+            total += cnt as i64;
+
+            applied_total.store(total, Ordering::Release);
+            db.pull().await.unwrap();
+
+            let _ = db.checkpoint().await;
+
+            let rows = all_rows(conn.query("SELECT count(*) FROM t", ()).await.unwrap())
+                .await
+                .unwrap();
+            assert_eq!(rows, vec![vec![Value::Integer(total)]]);
+        }
+
+        done.store(true, Ordering::Relaxed);
+        for h in readers {
+            h.await.unwrap();
+        }
+    }
 }

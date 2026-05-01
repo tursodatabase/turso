@@ -9,7 +9,7 @@ use crate::state_machine::{StateMachine, StateTransition, TransitionResult};
 use crate::storage::btree::{BTreeCursor, CursorTrait};
 use crate::storage::pager::CreateBTreeFlags;
 use crate::storage::sqlite3_ondisk::DatabaseHeader;
-use crate::storage::wal::{CheckpointMode, TursoRwLock};
+use crate::storage::wal::{CheckpointMode, TursoRwLock, WalAutoActions};
 use crate::sync::atomic::Ordering;
 use crate::sync::Arc;
 use crate::sync::RwLock;
@@ -855,7 +855,9 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                     self.lock_states.pager_read_tx = true;
                 }
 
-                self.pager.io.block(|| self.pager.begin_write_tx())?;
+                self.pager
+                    .io
+                    .block(|| self.pager.begin_write_tx(WalAutoActions::all_enabled()))?;
                 if self.update_transaction_state {
                     self.connection.set_tx_state(TransactionState::Write {
                         schema_did_change: false,

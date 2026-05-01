@@ -272,7 +272,7 @@ pub(crate) fn open_vacuum_temp_db(
     let conn = db.connect_with_encryption(encryption_key)?;
     conn.reset_page_size(page_size)?;
     conn.set_reserved_bytes(reserved_space)?;
-    conn.wal_auto_checkpoint_disable();
+    conn.wal_auto_actions_disable();
 
     Ok(VacuumTempDb {
         conn,
@@ -540,7 +540,7 @@ pub(crate) fn vacuum_target_build_step(
                 state.target_conn.set_sync_mode(crate::SyncMode::Off);
                 state.target_conn.set_foreign_keys_enabled(false);
                 state.target_conn.set_check_constraints_ignored(true);
-                state.target_conn.wal_auto_checkpoint_disable();
+                state.target_conn.wal_auto_actions_disable();
 
                 // Wrap all operations in a single write transaction so helper
                 // statements share one durable target build and cleanup can
@@ -2792,7 +2792,7 @@ mod tests {
         )?;
         let conn = db.connect()?;
         conn.set_sync_mode(crate::SyncMode::Off);
-        conn.wal_auto_checkpoint_disable();
+        conn.wal_auto_actions_disable();
 
         conn.execute("BEGIN IMMEDIATE")?;
         conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")?;
@@ -2974,7 +2974,10 @@ mod tests {
 
         assert!(Arc::ptr_eq(&temp._db.io, &source_db.io));
         assert_ne!(temp.path, source_db.path);
-        assert!(temp.conn.is_wal_auto_checkpoint_disabled());
+        assert_eq!(
+            temp.conn.wal_auto_actions(),
+            crate::storage::wal::WalAutoActions::empty()
+        );
         assert_eq!(temp.conn.get_page_size().get(), 4096);
         assert_eq!(temp.conn.get_reserved_bytes(), Some(0));
 

@@ -292,8 +292,8 @@ fn test_vector_sparse_ivf_fuzz(tmp_db: TempDatabase) {
         );
         let simple_conn = simple_db.connect_limbo();
         let index_conn = index_db.connect_limbo();
-        simple_conn.wal_auto_checkpoint_disable();
-        index_conn.wal_auto_checkpoint_disable();
+        simple_conn.wal_auto_actions_disable();
+        index_conn.wal_auto_actions_disable();
         index_conn
             .execute(format!("CREATE INDEX t_idx ON t USING toy_vector_sparse_ivf (embedding) WITH (delta = {delta})"))
             .unwrap();
