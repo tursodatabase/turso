@@ -11075,7 +11075,7 @@ fn op_parse_schema_step(
                 let io = inner
                     .stmt
                     .take_io_completions()
-                    .expect("IO returned but no completions");
+                    .unwrap_or_else(|| IOCompletions::Single(Completion::new_yield()));
                 return Ok(InsnFunctionStepResult::IO(io));
             }
             StepResult::Row => {
@@ -11334,7 +11334,7 @@ fn drive_init_cdc_version(
                 let io = inner
                     .stmt
                     .take_io_completions()
-                    .expect("IO returned but no completions");
+                    .unwrap_or_else(|| IOCompletions::Single(Completion::new_yield()));
                 return Ok(InsnFunctionStepResult::IO(io));
             }
             StepResult::Row => match &inner.phase {
