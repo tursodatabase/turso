@@ -143,6 +143,33 @@ impl<Clock: LogicalClock + 'static> ProvidesYieldContext for MvccLazyCursor<Cloc
     }
 }
 
+/// Whether the cursor's current row matches the given seek key.
+///
+/// Used to short-circuit eq-only seeks that re-target the entry the cursor is
+/// already on (see `MvccLazyCursor::seek`).
+fn current_pos_matches_seek_key(
+    current_row_id: &RowKey,
+    seek_key: &SeekKey<'_>,
+    mv_cursor_type: &MvccCursorType,
+) -> Result<bool> {
+    Ok(match (current_row_id, seek_key) {
+        (RowKey::Int(current), SeekKey::TableRowId(target)) => *current == *target,
+        (RowKey::Record(current), SeekKey::IndexKey(target)) => {
+            let MvccCursorType::Index(index_info) = mv_cursor_type else {
+                return Ok(false);
+            };
+            let key_info: Vec<_> = index_info
+                .key_info
+                .iter()
+                .take(target.column_count())
+                .cloned()
+                .collect();
+            compare_immutable(target.get_values()?, current.key.get_values()?, &key_info).is_eq()
+        }
+        _ => false,
+    })
+}
+
 #[cfg(any(test, injected_yields))]
 fn cursor_yield_key(tx_id: u64, table_id: MVTableId) -> u64 {
     // ASCII-ish "CURSORCR"
@@ -1158,6 +1185,58 @@ impl<Clock: LogicalClock + 'static> CursorTrait for MvccLazyCursor<Clock> {
         // ge -> lower_bound bound included, we want first row equal to row_id or first row after row_id
         // lt -> upper_bound bound excluded, we want last row before row_id
         // le -> upper_bound bound included, we want last row equal to row_id or first row before row_id
+
+        // Short-circuit eq-only seeks when the cursor is already positioned at the
+        // target key AND that entry is still visible to this transaction.
+        //
+        // The DELETE statement's bytecode, when iterating via an index, emits
+        // `IdxDelete` on the same cursor it is iterating, using the key of the
+        // entry it just read. The op_idx_delete handler unconditionally re-seeks
+        // (op = `GE { eq_only: true }`) before deleting. Re-running our seek path
+        // resets dual_peek and re-creates the underlying iterator, which throws
+        // away the btree-side iteration position that the initial range seek
+        // primed — so once MVCC entries are exhausted the cursor reports End even
+        // though the btree still has rows to visit. Short-circuiting here keeps
+        // the iteration state intact: the cursor stays positioned at the entry
+        // (which is what `cursor.delete()` consumes), and the next call to
+        // `cursor.next()` resumes scanning normally.
+        //
+        // The visibility check is essential: after a prior `cursor.delete()` the
+        // current_pos still names the deleted entry, but a subsequent eq-only
+        // probe (e.g. NoConflict during an UPSERT, after the upsert's IdxDelete
+        // tore down the old index entry) must report NotFound — the row is gone
+        // from this transaction's view. Without re-checking visibility we'd
+        // falsely report Found and trip the upsert's "rowid mismatch" halt with
+        // a UNIQUE-constraint error against the very column the ON CONFLICT
+        // clause was meant to resolve.
+        if self.state.is_none()
+            && matches!(
+                op,
+                SeekOp::GE { eq_only: true } | SeekOp::LE { eq_only: true }
+            )
+        {
+            if let CursorPosition::Loaded { row_id, .. } = &self.current_pos {
+                if current_pos_matches_seek_key(&row_id.row_id, &seek_key, &self.mv_cursor_type)? {
+                    let maybe_index_id = match &self.mv_cursor_type {
+                        MvccCursorType::Index(_) => Some(self.table_id),
+                        MvccCursorType::Table => None,
+                    };
+                    if self
+                        .db
+                        .read_from_table_or_index(self.tx_id, row_id, maybe_index_id)?
+                        .is_some()
+                    {
+                        // Repositioning to a real row must clear any synthetic
+                        // NULL state left over from an outer-join unmatched
+                        // emission; the slow path below clears it explicitly,
+                        // and skipping that step here would let `Column` reads
+                        // return NULL even though the row exists.
+                        self.set_null_flag(false);
+                        return Ok(IOResult::Done(SeekResult::Found));
+                    }
+                }
+            }
+        }
 
         loop {
             let state = self.state.clone();
