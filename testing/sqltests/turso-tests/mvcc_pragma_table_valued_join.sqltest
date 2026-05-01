@@ -1,0 +1,84 @@
+# Regression test for #6013: MVCC + PRAGMA Table-Valued Function Joins panic.
+#
+# Table-valued PRAGMA helpers (e.g. pragma_table_list) prepare and step a
+# nested helper statement on the same connection during the parent
+# statement's VM step. If the helper is not marked as nested, its Halt
+# would commit/rollback the parent's MVCC transaction, causing later
+# cursor advances on the parent's MVCC tx to panic with
+# "transaction should exist in txs map".
+
+@database :memory:
+
+test mvcc-pragma-table-list-left-join {
+    PRAGMA journal_mode='mvcc';
+    CREATE TABLE t(id INTEGER PRIMARY KEY, name TEXT);
+    INSERT INTO t VALUES(1, 'row1');
+    SELECT t.id FROM t LEFT JOIN pragma_table_list() p ON p.ncol=t.id;
+}
+expect {
+    mvcc
+    1
+}
+
+test mvcc-pragma-table-list-inner-join {
+    PRAGMA journal_mode='mvcc';
+    CREATE TABLE t2(id INTEGER PRIMARY KEY, name TEXT);
+    INSERT INTO t2 VALUES(99, 'row99');
+    SELECT count(*) FROM t2 JOIN pragma_table_list() p ON p.name='t2';
+}
+expect {
+    mvcc
+    1
+}
+
+test mvcc-pragma-table-list-empty-table {
+    PRAGMA journal_mode='mvcc';
+    CREATE TABLE empty_t(id INTEGER PRIMARY KEY, name TEXT);
+    SELECT empty_t.id, p.name FROM empty_t LEFT JOIN pragma_table_list() p ON p.ncol=empty_t.id;
+}
+expect {
+    mvcc
+}
+
+test mvcc-pragma-table-info-join {
+    PRAGMA journal_mode='mvcc';
+    CREATE TABLE multi(a, b, c, d);
+    INSERT INTO multi VALUES(1, 2, 3, 4);
+    SELECT m.rowid FROM multi m LEFT JOIN pragma_table_info('multi') p ON p.cid=m.a;
+}
+expect {
+    mvcc
+    1
+}
+
+test mvcc-pragma-table-list-multi-row-scan {
+    PRAGMA journal_mode='mvcc';
+    CREATE TABLE multi_t(id INTEGER PRIMARY KEY, name TEXT);
+    INSERT INTO multi_t VALUES(1, 'a');
+    INSERT INTO multi_t VALUES(2, 'b');
+    INSERT INTO multi_t VALUES(3, 'c');
+    SELECT count(*) FROM multi_t LEFT JOIN pragma_table_list() p ON p.name='multi_t';
+}
+expect {
+    mvcc
+    3
+}
+
+# UPDATE ... FROM pragma_table_info(...) is the original motivating scenario
+# called out in the fix's comment. The outer UPDATE holds an MVCC write
+# cursor on `dst` while the nested helper executes; if the helper isn't
+# kept nested, the parent's tx is committed mid-statement and the next
+# write cursor advance panics.
+test mvcc-update-from-pragma-table-info {
+    PRAGMA journal_mode='mvcc';
+    CREATE TABLE dst(id INTEGER PRIMARY KEY, name TEXT);
+    INSERT INTO dst VALUES(0, 'a');
+    INSERT INTO dst VALUES(1, 'b');
+    UPDATE dst SET name='updated' FROM pragma_table_info('dst') p WHERE p.cid=dst.id;
+    SELECT id, name FROM dst ORDER BY id;
+}
+expect {
+    mvcc
+    0|updated
+    1|updated
+}
