@@ -4,7 +4,9 @@ use crate::mvcc::yield_points::{FailureInjector, YieldInjector};
 use crate::statement::StatementOrigin;
 use crate::storage::{journal_mode, pager::SavepointResult};
 use crate::sync::{
-    atomic::{AtomicBool, AtomicI32, AtomicI64, AtomicIsize, AtomicU16, AtomicU64, Ordering},
+    atomic::{
+        AtomicBool, AtomicI32, AtomicI64, AtomicIsize, AtomicU16, AtomicU64, AtomicU8, Ordering,
+    },
     Arc, RwLock,
 };
 #[cfg(all(feature = "fs", feature = "conn_raw_api"))]
@@ -25,7 +27,7 @@ use crate::{
     Completion, ConnectionMetrics, Database, DatabaseCatalog, DatabaseOpts, Duration,
     EncryptionKey, EncryptionOpts, IndexMethod, LimboError, MvStore, OpenFlags, PageSize, Pager,
     Parser, Program, QueryMode, QueryRunner, Result, Schema, Statement, SyncMode, TransactionMode,
-    Trigger, Value, VirtualTable,
+    Trigger, Value, VirtualTable, WalAutoActions,
 };
 use crate::{is_memory_like, turso_assert};
 use crate::{MAIN_DB_ID, TEMP_DB_ID};
@@ -175,9 +177,14 @@ pub struct Connection {
     /// page size used for an uninitialized database or the next vacuum command.
     /// it's not always equal to the current page size of the database
     pub(super) page_size: AtomicU16,
-    /// Disable automatic checkpoint behaviour when DB is shutted down or WAL reach certain size
-    /// Client still can manually execute PRAGMA wal_checkpoint(...) commands
-    pub(super) wal_auto_checkpoint_disabled: AtomicBool,
+    /// Allowed automatic WAL maintenance actions for this connection.
+    /// Stored as the `bits()` of a `WalAutoActions`. Default is
+    /// `WalAutoActions::all_enabled()`. `wal_auto_checkpoint_disable`
+    /// clears every bit, opting out of both auto-checkpoint and WAL header
+    /// restart — sync-engine consumers rely on the latter staying disabled
+    /// because rotating the WAL header invalidates their published
+    /// watermarks.
+    pub(super) wal_auto_actions: AtomicU8,
     pub(super) capture_data_changes: RwLock<Option<CaptureDataChangesInfo>>,
     /// CDC v2: transaction ID for grouping CDC records by transaction.
     /// -1 means unset (will be assigned on first CDC write in the transaction).
@@ -1472,9 +1479,16 @@ impl Connection {
     pub fn wal_insert_begin(&self) -> Result<()> {
         let pager = self.pager.load();
         pager.begin_read_tx()?;
-        pager.io.block(|| pager.begin_write_tx()).inspect_err(|_| {
-            pager.end_read_tx();
-        })?;
+        // Sync-engine drives WAL maintenance explicitly: any auto-restart of
+        // the WAL header here would invalidate the watermarks the caller has
+        // already published (see `wal_changed_pages_after`), so opt out of
+        // every auto action for this write transaction.
+        pager
+            .io
+            .block(|| pager.begin_write_tx(WalAutoActions::empty()))
+            .inspect_err(|_| {
+                pager.end_read_tx();
+            })?;
 
         // start write transaction and disable auto-commit mode as SQL can be executed within WAL session (at caller own risk)
         self.set_tx_state(TransactionState::Write {
@@ -1505,7 +1519,7 @@ impl Connection {
                     .io
                     .block(|| {
                         return_if_io!(pager.commit_dirty_pages(
-                            true,
+                            WalAutoActions::empty(),
                             self.get_sync_mode(),
                             self.get_data_sync_retry(),
                         ));
@@ -1628,21 +1642,29 @@ impl Connection {
             && !is_memory_db
             && should_checkpoint_on_close
         {
-            self.pager.load().checkpoint_shutdown(
-                self.is_wal_auto_checkpoint_disabled(),
-                self.get_sync_mode(),
-            )?;
+            self.pager
+                .load()
+                .checkpoint_shutdown(self.wal_auto_actions(), self.get_sync_mode())?;
         };
         Ok(())
     }
 
+    /// Disable every automatic WAL maintenance action for this connection
+    /// (auto-checkpoint AND WAL header restart). Sync-engine consumers call
+    /// this so they own all WAL bookkeeping themselves.
     pub fn wal_auto_checkpoint_disable(&self) {
-        self.wal_auto_checkpoint_disabled
-            .store(true, Ordering::SeqCst);
+        self.wal_auto_actions
+            .store(WalAutoActions::empty().bits(), Ordering::SeqCst);
     }
 
-    pub fn is_wal_auto_checkpoint_disabled(&self) -> bool {
-        self.wal_auto_checkpoint_disabled.load(Ordering::SeqCst) || self.db.get_mv_store().is_some()
+    /// Returns the set of automatic WAL maintenance actions this connection
+    /// permits. MVCC connections always return an empty set because the
+    /// MVCC checkpoint state machine drives WAL maintenance explicitly.
+    pub fn wal_auto_actions(&self) -> WalAutoActions {
+        if self.db.get_mv_store().is_some() {
+            return WalAutoActions::empty();
+        }
+        WalAutoActions::from_bits_truncate(self.wal_auto_actions.load(Ordering::SeqCst))
     }
 
     #[cfg(feature = "simulator")]

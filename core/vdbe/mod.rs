@@ -57,7 +57,7 @@ use crate::{
         metrics::StatementMetrics,
         vacuum::VacuumInPlaceOpContext,
     },
-    ValueRef,
+    ValueRef, WalAutoActions,
 };
 use smallvec::SmallVec;
 
@@ -2084,7 +2084,11 @@ impl Program {
                     // Commit dirty pages to WAL, then end write+read transactions.
                     // We disable auto-checkpoint and avoid pager.commit_tx() since
                     // the checkpoint logic can leave read locks held.
-                    match attached_pager.commit_dirty_pages(true, SyncMode::Normal, false) {
+                    match attached_pager.commit_dirty_pages(
+                        WalAutoActions::empty(),
+                        SyncMode::Normal,
+                        false,
+                    ) {
                         Ok(IOResult::Done(_)) => {}
                         Ok(IOResult::IO(io)) => {
                             // IO pending — return so the caller can yield and re-enter.

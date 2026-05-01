@@ -2974,7 +2974,10 @@ mod tests {
 
         assert!(Arc::ptr_eq(&temp._db.io, &source_db.io));
         assert_ne!(temp.path, source_db.path);
-        assert!(temp.conn.is_wal_auto_checkpoint_disabled());
+        assert_eq!(
+            temp.conn.wal_auto_actions(),
+            crate::storage::wal::WalAutoActions::empty()
+        );
         assert_eq!(temp.conn.get_page_size().get(), 4096);
         assert_eq!(temp.conn.get_reserved_bytes(), Some(0));
 

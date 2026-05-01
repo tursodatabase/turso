@@ -62,7 +62,7 @@ use crate::{
     },
     CaptureDataChangesInfo, CdcVersion, CheckpointMode, Completion, Connection, Database,
     DatabaseStorage, IOExt, MvCursor, NonNan, OpenFlags, QueryMode, Statement, TransactionState,
-    ValueRef, MAIN_DB_ID, TEMP_DB_ID,
+    ValueRef, WalAutoActions, MAIN_DB_ID, TEMP_DB_ID,
 };
 use crate::{
     error::{
@@ -3612,7 +3612,7 @@ pub fn op_transaction_inner(
                             !conn.is_nested_stmt(),
                             "nested stmt should not begin a new write transaction"
                         );
-                        let begin_w_tx_res = pager.begin_write_tx();
+                        let begin_w_tx_res = pager.begin_write_tx(conn.wal_auto_actions());
                         if matches!(
                             begin_w_tx_res,
                             Err(LimboError::Busy | LimboError::BusySnapshot)
@@ -3667,7 +3667,8 @@ pub fn op_transaction_inner(
             // 3b. For attached databases, begin the write transaction after
             // begin_read_tx has already completed in the Start state.
             OpTransactionState::AttachedBeginWriteTx => {
-                let res = pager.begin_write_tx()?;
+                let conn = program.connection.clone();
+                let res = pager.begin_write_tx(conn.wal_auto_actions())?;
                 if let IOResult::IO(io) = res {
                     return Ok(InsnFunctionStepResult::IO(io));
                 }
@@ -11962,7 +11963,7 @@ pub fn op_open_ephemeral(
             pager
                 .begin_read_tx() // we have to begin a read tx before beginning a write
                 .expect("Failed to start read transaction");
-            return_if_io!(pager.begin_write_tx());
+            return_if_io!(pager.begin_write_tx(WalAutoActions::all_enabled()));
             *state.active_op_state.open_ephemeral() = OpOpenEphemeralState::CreateBtree {
                 pager: pager.clone(),
                 temp_file: temp_file.take(),
