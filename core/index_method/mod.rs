@@ -177,7 +177,7 @@ pub(crate) fn open_table_cursor(
     database_id: usize,
     table: &str,
 ) -> Result<BTreeCursor> {
-    let pager = connection.get_pager_from_database_index(&database_id);
+    let pager = connection.get_pager_from_database_index(&database_id)?;
     let Some(table) = connection.with_schema(database_id, |schema| schema.get_table(table)) else {
         return Err(LimboError::InternalError(format!(
             "table {table} not found",
@@ -195,7 +195,7 @@ pub(crate) fn open_index_cursor(
     index: &str,
     keys: Vec<KeyInfo>,
 ) -> Result<BTreeCursor> {
-    let pager = connection.get_pager_from_database_index(&database_id);
+    let pager = connection.get_pager_from_database_index(&database_id)?;
     let Some(scratch) = connection.with_schema(database_id, |schema| {
         schema.get_index(table, index).cloned()
     }) else {

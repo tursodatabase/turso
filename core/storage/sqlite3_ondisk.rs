@@ -51,7 +51,7 @@ use tracing::{instrument, Level};
 
 use super::pager::PageRef;
 pub use super::pager::{PageContent, PageInner};
-use super::wal::TursoRwLock;
+use super::wal::{OverflowFallbackCoverage, TursoRwLock, WalSharedMetadata, WalSharedRuntime};
 use crate::error::LimboError;
 use crate::fast_lock::SpinLock;
 use crate::io::{Buffer, Completion, FileSyncType, ReadComplete};
@@ -753,11 +753,16 @@ pub fn begin_sync(
 ) -> Result<Completion> {
     turso_assert!(!syncing.load(Ordering::SeqCst));
     syncing.store(true, Ordering::SeqCst);
-    let completion = Completion::new_sync(move |_| {
-        syncing.store(false, Ordering::SeqCst);
+    let completion = Completion::new_sync({
+        let syncing = syncing.clone();
+        move |_| {
+            syncing.store(false, Ordering::SeqCst);
+        }
     });
     #[allow(clippy::arc_with_non_send_sync)]
-    db_file.sync(completion, sync_type)
+    db_file.sync(completion, sync_type).inspect_err(|_| {
+        syncing.store(false, Ordering::SeqCst);
+    })
 }
 
 #[allow(clippy::enum_variant_names)]
@@ -1429,25 +1434,38 @@ pub fn build_shared_wal(
     }
 
     let wal_file_shared = Arc::new(RwLock::new(WalFileShared {
-        enabled: AtomicBool::new(true),
-        wal_header: header.clone(),
-        min_frame: AtomicU64::new(0),
-        max_frame: AtomicU64::new(0),
-        nbackfills: AtomicU64::new(0),
-        transaction_count: AtomicU64::new(0),
-        frame_cache: Arc::new(SpinLock::new(FxHashMap::default())),
-        last_checksum: (0, 0),
-        file: Some(file.clone()),
-        read_locks,
-        write_lock: TursoRwLock::new(),
-        loaded: AtomicBool::new(false),
-        checkpoint_lock: TursoRwLock::new(),
-        initialized: AtomicBool::new(false),
-        epoch: AtomicU32::new(0),
+        metadata: WalSharedMetadata {
+            enabled: AtomicBool::new(true),
+            wal_header: header.clone(),
+            min_frame: AtomicU64::new(0),
+            max_frame: AtomicU64::new(0),
+            nbackfills: AtomicU64::new(0),
+            transaction_count: AtomicU64::new(0),
+            last_checksum: (0, 0),
+            loaded: AtomicBool::new(false),
+            loaded_from_disk_scan: AtomicBool::new(true),
+            initialized: AtomicBool::new(false),
+        },
+        runtime: WalSharedRuntime {
+            frame_cache: Arc::new(SpinLock::new(FxHashMap::default())),
+            file: Some(file.clone()),
+            read_locks,
+            vacuum_lock: TursoRwLock::new(),
+            write_lock: TursoRwLock::new(),
+            checkpoint_lock: TursoRwLock::new(),
+            epoch: AtomicU32::new(0),
+            overflow_fallback_coverage: Arc::new(
+                SpinLock::new(OverflowFallbackCoverage::default()),
+            ),
+        },
     }));
 
     if size < WAL_HEADER_SIZE as u64 {
-        wal_file_shared.write().loaded.store(true, Ordering::SeqCst);
+        wal_file_shared
+            .write()
+            .metadata
+            .loaded
+            .store(true, Ordering::SeqCst);
         return Ok(wal_file_shared);
     }
 
@@ -1617,6 +1635,21 @@ impl StreamingWalReader {
                 calc == (h.checksum_1, h.checksum_2),
             )
         };
+        #[cfg(debug_assertions)]
+        {
+            let header = self.header.lock();
+            tracing::debug!(
+                "WAL_SCAN header page_size={} checkpoint_seq={} salts=({}, {}) checksum=({}, {}) use_native={} valid={}",
+                page_sz,
+                header.checkpoint_seq,
+                header.salt_1,
+                header.salt_2,
+                c1,
+                c2,
+                use_native,
+                ok
+            );
+        }
         if PageSize::new(page_sz).is_none() || !ok {
             self.finalize_loading();
             return;
@@ -1683,6 +1716,14 @@ impl StreamingWalReader {
             }
             if s1 != header.salt_1 || s2 != header.salt_2 {
                 tracing::debug!(
+                    "WAL_SCAN stop: frame={} salt mismatch frame=({}, {}) header=({}, {})",
+                    st.frame_idx,
+                    s1,
+                    s2,
+                    header.salt_1,
+                    header.salt_2
+                );
+                tracing::debug!(
                     "process_frames: salt mismatch, stop reading WAL at initialization phase"
                 );
                 break;
@@ -1692,7 +1733,12 @@ impl StreamingWalReader {
             let calc = checksum_wal(page, header, seed, use_native);
             if calc != (c1, c2) {
                 tracing::debug!(
-                    "process_frames: checksum mismatch, stop reading WAL at initialization phase"
+                    " WAL_SCAN stop: process_frames, checksum mismatch, stop reading WAL at initialization phase: frame={} checksum mismatch calc=({},{}) file=({},{})",
+                    st.frame_idx,
+                    calc.0,
+                    calc.1,
+                    c1,
+                    c2
                 );
                 break;
             }
@@ -1707,6 +1753,12 @@ impl StreamingWalReader {
             if db_size > 0 {
                 st.last_valid_frame = st.frame_idx;
                 st.last_valid_checksum = calc;
+                tracing::debug!(
+                    "WAL_SCAN commit frame={} page_no={} db_size={}",
+                    st.frame_idx,
+                    page_no,
+                    db_size
+                );
                 self.flush_pending_frames(&mut st);
             }
             st.frame_idx += 1;
@@ -1721,7 +1773,7 @@ impl StreamingWalReader {
         }
         let wfs = self.wal_shared.read();
         {
-            let mut frame_cache = wfs.frame_cache.lock();
+            let mut frame_cache = wfs.runtime.frame_cache.lock();
             for (page, mut frames) in state.pending_frames.drain() {
                 // Only include frames up to last valid commit
                 frames.retain(|&f| f <= state.last_valid_frame);
@@ -1730,7 +1782,8 @@ impl StreamingWalReader {
                 }
             }
         }
-        wfs.max_frame
+        wfs.metadata
+            .max_frame
             .store(state.last_valid_frame, Ordering::Release);
     }
 
@@ -1738,24 +1791,39 @@ impl StreamingWalReader {
     fn finalize_loading(&self) {
         let mut wfs = self.wal_shared.write();
         let st = self.state.read();
+        tracing::debug!(
+            "WAL_SCAN finalize last_valid_frame={} pending_pages={} header_valid={}",
+            st.last_valid_frame,
+            st.pending_frames.len(),
+            st.header_valid
+        );
 
         let max_frame = st.last_valid_frame;
         if max_frame > 0 {
-            let mut frame_cache = wfs.frame_cache.lock();
+            let mut frame_cache = wfs.runtime.frame_cache.lock();
             for frames in frame_cache.values_mut() {
                 frames.retain(|&f| f <= max_frame);
             }
             frame_cache.retain(|_, frames| !frames.is_empty());
+            let header = wfs.metadata.wal_header.lock();
+            wfs.runtime.overflow_fallback_coverage.lock().record(
+                header.checkpoint_seq,
+                header.salt_1,
+                header.salt_2,
+                max_frame,
+            );
+        } else {
+            wfs.runtime.overflow_fallback_coverage.lock().clear();
         }
 
-        wfs.max_frame.store(max_frame, Ordering::SeqCst);
+        wfs.metadata.max_frame.store(max_frame, Ordering::SeqCst);
         // use checksum of last valid commit frame, not necessarily the last frame
-        wfs.last_checksum = st.last_valid_checksum;
+        wfs.metadata.last_checksum = st.last_valid_checksum;
         if st.header_valid {
-            wfs.initialized.store(true, Ordering::SeqCst);
+            wfs.metadata.initialized.store(true, Ordering::SeqCst);
         }
-        wfs.nbackfills.store(0, Ordering::SeqCst);
-        wfs.loaded.store(true, Ordering::SeqCst);
+        wfs.metadata.nbackfills.store(0, Ordering::SeqCst);
+        wfs.metadata.loaded.store(true, Ordering::SeqCst);
 
         self.done.store(true, Ordering::Release);
         tracing::debug!(
@@ -2259,13 +2327,13 @@ mod tests {
 
         let shared = build_shared_wal(&file, &io).unwrap();
         let guard = shared.read();
-        assert_eq!(guard.max_frame.load(Ordering::Acquire), 1);
-        assert_eq!(guard.last_checksum, commit_checksum);
+        assert_eq!(guard.metadata.max_frame.load(Ordering::Acquire), 1);
+        assert_eq!(guard.metadata.last_checksum, commit_checksum);
 
         // checksum should only include committed frame.
-        assert_ne!(guard.last_checksum, after_frame3_checksum);
+        assert_ne!(guard.metadata.last_checksum, after_frame3_checksum);
 
-        let frame_cache = guard.frame_cache.lock();
+        let frame_cache = guard.runtime.frame_cache.lock();
         assert_eq!(frame_cache.get(&1), Some(&vec![1u64]));
         assert!(frame_cache.get(&2).is_none());
     }

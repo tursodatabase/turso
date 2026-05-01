@@ -5,12 +5,13 @@ import {
   type QueryOptions
 } from './protocol.js';
 import { Session, type SessionConfig } from './session.js';
+import { type AsyncLock } from './async-lock.js';
 import { DatabaseError } from './error.js';
 
 /**
  * A prepared SQL statement that can be executed in multiple ways.
  * 
- * Each statement has its own session to avoid conflicts during concurrent execution.
+ * Statements may either own a dedicated session or share a connection session to preserve transaction boundaries.
  * Provides three execution modes:
  * - `get(args?)`: Returns the first row or null
  * - `all(args?)`: Returns all rows as an array
@@ -22,11 +23,28 @@ export class Statement {
   private presentationMode: 'expanded' | 'raw' | 'pluck' = 'expanded';
   private safeIntegerMode: boolean = false;
   private columnMetadata: Column[];
+  private execLock?: AsyncLock;
 
   constructor(sessionConfig: SessionConfig, sql: string, columns?: Column[]) {
     this.session = new Session(sessionConfig);
     this.sql = sql;
     this.columnMetadata = columns || [];
+  }
+
+  /**
+   * Create a Statement that shares an existing session and serializes execution
+   * through the given lock. Used by Connection.prepare() so prepared statements
+   * participate in the connection's transaction scope.
+   */
+  static fromSession(session: Session, sql: string, columns: Column[] | undefined, execLock: AsyncLock): Statement {
+    const stmt = Object.create(Statement.prototype) as Statement;
+    stmt.session = session;
+    stmt.sql = sql;
+    stmt.columnMetadata = columns || [];
+    stmt.presentationMode = 'expanded';
+    stmt.safeIntegerMode = false;
+    stmt.execLock = execLock;
+    return stmt;
   }
 
   /**
@@ -115,6 +133,18 @@ export class Statement {
     }));
   }
 
+  private async withLock<T>(fn: () => Promise<T>): Promise<T> {
+    if (!this.execLock) {
+      return await fn();
+    }
+    await this.execLock.acquire();
+    try {
+      return await fn();
+    } finally {
+      this.execLock.release();
+    }
+  }
+
   /**
    * Executes the prepared statement.
    * 
@@ -129,9 +159,11 @@ export class Statement {
    * ```
    */
   async run(args?: any, queryOptions?: QueryOptions): Promise<any> {
-    const normalizedArgs = this.normalizeArgs(args);
-    const result = await this.session.execute(this.sql, normalizedArgs, this.safeIntegerMode, queryOptions);
-    return { changes: result.rowsAffected, lastInsertRowid: result.lastInsertRowid };
+    return await this.withLock(async () => {
+      const normalizedArgs = this.normalizeArgs(args);
+      const result = await this.session.execute(this.sql, normalizedArgs, this.safeIntegerMode, queryOptions);
+      return { changes: result.rowsAffected, lastInsertRowid: result.lastInsertRowid };
+    });
   }
 
   /**
@@ -150,30 +182,32 @@ export class Statement {
    * ```
    */
   async get(args?: any, queryOptions?: QueryOptions): Promise<any> {
-    const normalizedArgs = this.normalizeArgs(args);
-    const result = await this.session.execute(this.sql, normalizedArgs, this.safeIntegerMode, queryOptions);
-    const row = result.rows[0];
-    if (!row) {
-      return undefined;
-    }
-    
-    if (this.presentationMode === 'pluck') {
-      // In pluck mode, return only the first column value
-      return row[0];
-    }
-    
-    if (this.presentationMode === 'raw') {
-      // In raw mode, return the row as a plain array (it already is one)
-      // The row object is already an array with column properties added
-      return [...row];
-    }
-    
-    // In expanded mode, convert to plain object with named properties  
-    const obj: any = {};
-    result.columns.forEach((col: string, i: number) => {
-      obj[col] = row[i];
+    return await this.withLock(async () => {
+      const normalizedArgs = this.normalizeArgs(args);
+      const result = await this.session.execute(this.sql, normalizedArgs, this.safeIntegerMode, queryOptions);
+      const row = result.rows[0];
+      if (!row) {
+        return undefined;
+      }
+
+      if (this.presentationMode === 'pluck') {
+        // In pluck mode, return only the first column value
+        return row[0];
+      }
+
+      if (this.presentationMode === 'raw') {
+        // In raw mode, return the row as a plain array (it already is one)
+        // The row object is already an array with column properties added
+        return [...row];
+      }
+
+      // In expanded mode, convert to plain object with named properties
+      const obj: any = {};
+      result.columns.forEach((col: string, i: number) => {
+        obj[col] = row[i];
+      });
+      return obj;
     });
-    return obj;
   }
 
   /**
@@ -190,25 +224,27 @@ export class Statement {
    * ```
    */
   async all(args?: any, queryOptions?: QueryOptions): Promise<any[]> {
-    const normalizedArgs = this.normalizeArgs(args);
-    const result = await this.session.execute(this.sql, normalizedArgs, this.safeIntegerMode, queryOptions);
-    
-    if (this.presentationMode === 'pluck') {
-      // In pluck mode, return only the first column value from each row
-      return result.rows.map((row: any) => row[0]);
-    }
-    
-    if (this.presentationMode === 'raw') {
-      return result.rows.map((row: any) => [...row]);
-    }
-    
-    // In expanded mode, convert rows to plain objects with named properties
-    return result.rows.map((row: any) => {
-      const obj: any = {};
-      result.columns.forEach((col: string, i: number) => {
-        obj[col] = row[i];
+    return await this.withLock(async () => {
+      const normalizedArgs = this.normalizeArgs(args);
+      const result = await this.session.execute(this.sql, normalizedArgs, this.safeIntegerMode, queryOptions);
+
+      if (this.presentationMode === 'pluck') {
+        // In pluck mode, return only the first column value from each row
+        return result.rows.map((row: any) => row[0]);
+      }
+
+      if (this.presentationMode === 'raw') {
+        return result.rows.map((row: any) => [...row]);
+      }
+
+      // In expanded mode, convert rows to plain objects with named properties
+      return result.rows.map((row: any) => {
+        const obj: any = {};
+        result.columns.forEach((col: string, i: number) => {
+          obj[col] = row[i];
+        });
+        return obj;
       });
-      return obj;
     });
   }
 
@@ -231,11 +267,21 @@ export class Statement {
    * ```
    */
   async *iterate(args?: any, queryOptions?: QueryOptions): AsyncGenerator<any> {
+    // Shared-connection statements must not hold the connection lock across
+    // `yield` points, or nested queries in the loop body can deadlock.
+    if (this.execLock) {
+      const rows = await this.all(args, queryOptions);
+      for (const row of rows) {
+        yield row;
+      }
+      return;
+    }
+
     const normalizedArgs = this.normalizeArgs(args);
-    const { response, entries } = await this.session.executeRaw(this.sql, normalizedArgs, queryOptions);
-    
+    const { entries } = await this.session.executeRaw(this.sql, normalizedArgs, queryOptions);
+
     let columns: string[] = [];
-    
+
     for await (const entry of entries) {
       switch (entry.type) {
         case 'step_begin':

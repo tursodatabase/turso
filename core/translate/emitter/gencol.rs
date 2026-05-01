@@ -1,22 +1,27 @@
-use crate::schema::{ColumnLayout, GeneratedType};
+use crate::schema::{BTreeTable, ColumnLayout, ColumnsTopologicalSort, GeneratedType};
 use crate::translate::expr::translate_expr;
 use crate::vdbe::affinity::Affinity;
 use crate::vdbe::builder::{DmlColumnContext, SelfTableContext};
-use crate::Result;
+use crate::{Arc, Result};
 use turso_parser::ast;
 
 use super::{ProgramBuilder, Resolver};
 
-/// Emit bytecode to compute all virtual generated columns for a row.
+/// Emit bytecode to compute virtual generated columns for a row.
+#[turso_macros::trace_stack]
 pub fn compute_virtual_columns(
     program: &mut ProgramBuilder,
-    columns: &[crate::schema::Column],
+    columns: &ColumnsTopologicalSort<'_>,
     dml_ctx: &DmlColumnContext,
     resolver: &Resolver,
+    table: &Arc<BTreeTable>,
 ) -> Result<()> {
-    let ctx = SelfTableContext::ForDML(dml_ctx.clone());
-    for (idx, column) in columns.iter().enumerate() {
-        let GeneratedType::Virtual { resolved: expr, .. } = column.generated_type() else {
+    let ctx = SelfTableContext::ForDML {
+        dml_ctx: dml_ctx.clone(),
+        table: Arc::clone(table),
+    };
+    for (idx, column) in columns.iter() {
+        let GeneratedType::Virtual { expr, .. } = column.generated_type() else {
             continue;
         };
         let target_reg = dml_ctx.to_column_reg(idx);
@@ -41,13 +46,12 @@ pub(crate) fn emit_gencol_expr_from_registers(
     resolver: &Resolver,
     rowid_reg: usize,
     layout: &ColumnLayout,
+    table: &Arc<BTreeTable>,
 ) -> Result<()> {
-    let ctx = SelfTableContext::ForDML(DmlColumnContext::layout(
-        columns,
-        registers_start,
-        rowid_reg,
-        layout.clone(),
-    ));
+    let ctx = SelfTableContext::ForDML {
+        dml_ctx: DmlColumnContext::layout(columns, registers_start, rowid_reg, layout.clone()),
+        table: Arc::clone(table),
+    };
     program.with_self_table_context(Some(&ctx), |program, _| {
         translate_expr(program, None, expr, target_reg, resolver)?;
         Ok(())

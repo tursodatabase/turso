@@ -62,7 +62,7 @@ pub(crate) fn custom_type_comparator(
         }
         let type_def = schema.get_type_def(&col.ty_str, table.is_strict())?;
         type_def
-            .operators
+            .operators()
             .iter()
             .find(|op| op.op == "<")
             .and_then(|op| op.func_name.as_ref())
@@ -117,9 +117,9 @@ fn is_custom_type_without_lt(
         if let Some((_, table)) = referenced_tables.find_table_by_internal_id(*table_ref_id) {
             if let Some(col) = table.get_column_at(*column) {
                 if let Some(type_def) = schema.get_type_def(&col.ty_str, table.is_strict()) {
-                    if type_def.decode.is_some() {
+                    if type_def.decode().is_some() {
                         // No `<` operator at all (naked or with function)
-                        return !type_def.operators.iter().any(|op| op.op == "<");
+                        return !type_def.operators().iter().any(|op| op.op == "<");
                     }
                 }
             }
@@ -398,7 +398,7 @@ impl EmitOrderBy {
                     &plan.table_references,
                     t_ctx.resolver.schema(),
                 ) {
-                    if let Some(ref decode_expr) = type_def.decode {
+                    if let Some(decode_expr) = type_def.decode() {
                         let skip_label = program.allocate_label();
                         program.emit_insn(Insn::IsNull {
                             reg,
@@ -413,7 +413,7 @@ impl EmitOrderBy {
                             &type_def,
                             &t_ctx.resolver,
                         )?;
-                        program.resolve_label(skip_label, program.offset());
+                        program.preassign_label_to_next_insn(skip_label);
                     }
                 }
             }
@@ -440,7 +440,7 @@ impl EmitOrderBy {
             },
         )?;
 
-        program.resolve_label(sort_loop_next_label, program.offset());
+        program.preassign_label_to_next_insn(sort_loop_next_label);
         if !use_heap_sort {
             program.emit_insn(Insn::SorterNext {
                 cursor_id: sort_cursor,
@@ -505,9 +505,9 @@ impl EmitOrderBy {
                 // built-in comparison (naked OPERATOR '<') or a custom comparator function.
                 let is_custom =
                     result_column_custom_type_info(expr, &plan.table_references, resolver.schema())
-                        .is_some_and(|(_, td)| td.decode.is_some());
+                        .is_some_and(|(_, td)| td.decode().is_some());
                 if is_custom {
-                    program.suppress_custom_type_decode = true;
+                    program.flags.set_suppress_custom_type_decode(true);
                 }
                 let result = translate_expr(
                     program,
@@ -517,7 +517,7 @@ impl EmitOrderBy {
                     resolver,
                 );
                 if is_custom {
-                    program.suppress_custom_type_decode = false;
+                    program.flags.set_suppress_custom_type_decode(false);
                 }
                 result?;
             }

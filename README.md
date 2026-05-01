@@ -38,6 +38,7 @@ Turso Database is an in-process SQL database written in Rust, compatible with SQ
 ## Features and Roadmap
 
 * **SQLite compatibility** for SQL dialect, file formats, and the C API [see [document](COMPAT.md) for details]
+* **`BEGIN CONCURRENT`** for improved write throughput using multi-version concurrency control (MVCC).
 * **Change data capture (CDC)** for real-time tracking of database changes.
 * **Multi-language support** for
   * [Go](bindings/go)
@@ -54,10 +55,10 @@ Turso Database is an in-process SQL database written in Rust, compatible with SQ
 
 The database has the following experimental features:
 
-* **`BEGIN CONCURRENT`** for improved write throughput using multi-version concurrency control (MVCC).
 * **Encryption at rest** for protecting the data locally.
 * **Incremental computation** using DBSP for incremental view maintenance and query subscriptions.
 * **Full-Text-Search** powered by the awesome [tantivy](https://github.com/quickwit-oss/tantivy) library
+* **Multi-process WAL coordination** via the `.tshm` sidecar for cross-process WAL readers and writers.
 
 The following features are on our current roadmap:
 

@@ -2400,7 +2400,9 @@ impl<'a> LogicalPlanBuilder<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::schema::{BTreeTable, ColDef, Column as SchemaColumn, Schema, Type};
+    use crate::schema::{
+        BTreeCharacteristics, BTreeTable, ColDef, Column as SchemaColumn, Schema, Type,
+    };
     use turso_parser::parser::Parser;
 
     fn create_test_schema() -> Schema {
@@ -2426,22 +2428,17 @@ mod tests {
             SchemaColumn::new_default_integer(Some("age".to_string()), "INTEGER".to_string(), None),
             SchemaColumn::new_default_text(Some("email".to_string()), "TEXT".to_string(), None),
         ];
-        let logical_to_physical_map = BTreeTable::build_logical_to_physical_map(&columns);
-        let users_table = BTreeTable {
-            name: "users".to_string(),
-            root_page: 2,
-            primary_key_columns: vec![("id".to_string(), turso_parser::ast::SortOrder::Asc)],
-            foreign_keys: vec![],
-            check_constraints: vec![],
-            rowid_alias_conflict_clause: None,
+        let users_table = BTreeTable::new(
+            2,
+            "users".to_string(),
+            vec![("id".to_string(), turso_parser::ast::SortOrder::Asc)],
             columns,
-            has_rowid: true,
-            is_strict: false,
-            has_autoincrement: false,
-            unique_sets: vec![],
-            has_virtual_columns: false,
-            logical_to_physical_map,
-        };
+            BTreeCharacteristics::HAS_ROWID,
+            vec![],
+            vec![],
+            vec![],
+            None,
+        );
         schema
             .add_btree_table(Arc::new(users_table))
             .expect("Test setup: failed to add users table");
@@ -2478,22 +2475,17 @@ mod tests {
                 ColDef::default(),
             ),
         ];
-        let logical_to_physical_map = BTreeTable::build_logical_to_physical_map(&columns);
-        let orders_table = BTreeTable {
-            name: "orders".to_string(),
-            root_page: 3,
-            primary_key_columns: vec![("id".to_string(), turso_parser::ast::SortOrder::Asc)],
+        let orders_table = BTreeTable::new(
+            3,
+            "orders".to_string(),
+            vec![("id".to_string(), turso_parser::ast::SortOrder::Asc)],
             columns,
-            has_rowid: true,
-            is_strict: false,
-            has_autoincrement: false,
-            unique_sets: vec![],
-            foreign_keys: vec![],
-            check_constraints: vec![],
-            rowid_alias_conflict_clause: None,
-            has_virtual_columns: false,
-            logical_to_physical_map,
-        };
+            BTreeCharacteristics::HAS_ROWID,
+            vec![],
+            vec![],
+            vec![],
+            None,
+        );
         schema
             .add_btree_table(Arc::new(orders_table))
             .expect("Test setup: failed to add orders table");
@@ -2530,22 +2522,17 @@ mod tests {
                 None,
             ),
         ];
-        let logical_to_physical_map = BTreeTable::build_logical_to_physical_map(&columns);
-        let products_table = BTreeTable {
-            name: "products".to_string(),
-            root_page: 4,
-            primary_key_columns: vec![("id".to_string(), turso_parser::ast::SortOrder::Asc)],
+        let products_table = BTreeTable::new(
+            4,
+            "products".to_string(),
+            vec![("id".to_string(), turso_parser::ast::SortOrder::Asc)],
             columns,
-            has_rowid: true,
-            is_strict: false,
-            has_autoincrement: false,
-            unique_sets: vec![],
-            foreign_keys: vec![],
-            check_constraints: vec![],
-            rowid_alias_conflict_clause: None,
-            has_virtual_columns: false,
-            logical_to_physical_map,
-        };
+            BTreeCharacteristics::HAS_ROWID,
+            vec![],
+            vec![],
+            vec![],
+            None,
+        );
         schema
             .add_btree_table(Arc::new(products_table))
             .expect("Test setup: failed to add products table");

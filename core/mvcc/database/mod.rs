@@ -2,7 +2,7 @@ use crate::mvcc::clock::LogicalClock;
 use crate::mvcc::cursor::{static_iterator_hack, MvccIterator};
 #[cfg(any(test, injected_yields))]
 use crate::mvcc::yield_hooks::{ProvidesYieldContext, YieldContext, YieldPointMarker};
-use crate::mvcc::yield_points::inject_transition_yield;
+use crate::mvcc::yield_points::{inject_transition_failure, inject_transition_yield};
 use crate::schema::{Schema, Table};
 use crate::state_machine::StateMachine;
 use crate::state_machine::StateTransition;
@@ -383,6 +383,8 @@ enum SavepointKind {
 pub struct Savepoint {
     kind: SavepointKind,
     deferred_fk_violations: isize,
+    header: DatabaseHeader,
+    header_dirty: bool,
     /// Versions CREATED during this savepoint (insert operations).
     /// On rollback: these versions are removed from their chains.
     created_table_versions: Vec<(RowID, u64)>,
@@ -398,18 +400,30 @@ pub struct Savepoint {
 
 impl Savepoint {
     /// Creates an internal statement savepoint used for per-statement rollback.
-    fn statement() -> Self {
-        Self::default()
+    fn statement(header: DatabaseHeader, header_dirty: bool) -> Self {
+        Self {
+            header,
+            header_dirty,
+            ..Default::default()
+        }
     }
 
     /// Creates a user-visible named savepoint snapshot.
-    fn named(name: String, starts_transaction: bool, deferred_fk_violations: isize) -> Self {
+    fn named(
+        name: String,
+        starts_transaction: bool,
+        deferred_fk_violations: isize,
+        header: DatabaseHeader,
+        header_dirty: bool,
+    ) -> Self {
         Self {
             kind: SavepointKind::Named {
                 name,
                 starts_transaction,
             },
             deferred_fk_violations,
+            header,
+            header_dirty,
             ..Default::default()
         }
     }
@@ -512,7 +526,11 @@ impl Transaction {
     fn begin_savepoint(&self) {
         let depth = self.savepoint_stack.read().len();
         tracing::debug!("begin_savepoint(tx_id={}, depth={})", self.tx_id, depth);
-        self.savepoint_stack.write().push(Savepoint::statement());
+        let header = *self.header.read();
+        let header_dirty = self.header_dirty.load(Ordering::Acquire);
+        self.savepoint_stack
+            .write()
+            .push(Savepoint::statement(header, header_dirty));
     }
 
     /// Begin a new named savepoint. If `starts_transaction` is true, this savepoint represents the
@@ -531,10 +549,14 @@ impl Transaction {
             depth,
             name
         );
+        let header = *self.header.read();
+        let header_dirty = self.header_dirty.load(Ordering::Acquire);
         self.savepoint_stack.write().push(Savepoint::named(
             name,
             starts_transaction,
             deferred_fk_violations,
+            header,
+            header_dirty,
         ));
     }
 
@@ -636,12 +658,16 @@ impl Transaction {
             }
         );
         let deferred_fk_violations = savepoints[target_idx].deferred_fk_violations;
+        let header = savepoints[target_idx].header;
+        let header_dirty = savepoints[target_idx].header_dirty;
 
         let drained: Vec<Savepoint> = savepoints.drain(target_idx..).collect();
         savepoints.push(Savepoint::named(
             target_name,
             starts_transaction,
             deferred_fk_violations,
+            header,
+            header_dirty,
         ));
         Some(SavepointRollbackResult {
             rolledback_savepoints: drained,
@@ -900,10 +926,14 @@ impl CommitCoordinator {
 #[cfg(any(test, injected_yields))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, strum_macros::EnumCount)]
 #[repr(u8)]
-enum CommitYieldPoint {
+pub(crate) enum CommitYieldPoint {
     CommitValidation,
     WaitForDependencies,
     LogRecordPrepared,
+    /// Boundary right after `remove_tx` runs but before the connection cache
+    /// is cleared by the caller at vdbe/mod.rs. Used for failure injection
+    /// to reproduce divergence between `mv_store.txs` and `connection.mv_tx_id`.
+    AfterRemoveTx,
 }
 
 #[cfg(any(test, injected_yields))]
@@ -927,6 +957,7 @@ impl<Clock: LogicalClock> ProvidesYieldContext for CommitStateMachine<Clock> {
     fn yield_context(&self) -> YieldContext {
         YieldContext::new(
             self.connection.yield_injector(),
+            self.connection.failure_injector(),
             self.yield_instance_id,
             commit_yield_key(self.tx_id),
         )
@@ -941,6 +972,10 @@ pub struct CommitStateMachine<Clock: LogicalClock> {
     did_commit_schema_change: bool,
     tx_id: TxID,
     connection: Arc<Connection>,
+    /// Database index this commit is for (`MAIN_DB_ID` or an attached-db id).
+    /// Threaded through so that `finish_committed_tx` can clear the matching
+    /// connection-level mv_tx slot atomically with `remove_tx`.
+    db_id: usize,
     /// Write set sorted by table id and row id
     write_set: Vec<RowID>,
     commit_coordinator: Arc<CommitCoordinator>,
@@ -993,19 +1028,32 @@ impl<Clock: LogicalClock> CommitStateMachine<Clock> {
         state: CommitState<Clock>,
         tx_id: TxID,
         connection: Arc<Connection>,
+        db_id: usize,
         commit_coordinator: Arc<CommitCoordinator>,
         header: Arc<RwLock<Option<DatabaseHeader>>>,
         sync_mode: SyncMode,
     ) -> Self {
         let pager = connection.pager.load().clone();
+        // Use the connection's tx-level schema_did_change flag as the
+        // single source of truth.  This flag is set by SetCookie(SchemaVersion)
+        // which every DDL emits, so it covers all schema-changing operations
+        // including ones that don't write to sqlite_schema (e.g. AddType
+        // writing to __turso_internal_types for custom types).
+        let schema_did_change_from_tx = matches!(
+            connection.get_tx_state(),
+            crate::connection::TransactionState::Write {
+                schema_did_change: true
+            }
+        );
         Self {
             state,
             is_finalized: false,
             #[cfg(any(test, injected_yields))]
             yield_instance_id: connection.next_yield_instance_id(),
-            did_commit_schema_change: false,
+            did_commit_schema_change: schema_did_change_from_tx,
             tx_id,
             connection,
+            db_id,
             write_set: Vec::new(),
             commit_coordinator,
             pager,
@@ -1303,9 +1351,7 @@ impl<Clock: LogicalClock> CommitStateMachine<Clock> {
             }
         };
 
-        let collect_versions = |id: &RowID,
-                                log_record: &mut LogRecord,
-                                did_commit_schema: &mut bool| {
+        let collect_versions = |id: &RowID, log_record: &mut LogRecord| {
             if let Some(row_versions) = mvcc_store.rows.get(id) {
                 let row_versions = row_versions.value().read();
                 for row_version in row_versions.iter() {
@@ -1317,9 +1363,6 @@ impl<Clock: LogicalClock> CommitStateMachine<Clock> {
                             // transaction's end timestamp. See Hekaton page 299.
                             committed_version.begin = Some(TxTimestampOrID::Timestamp(end_ts));
                             changed = true;
-                            if committed_version.row.id.table_id == SQLITE_SCHEMA_MVCC_TABLE_ID {
-                                *did_commit_schema = true;
-                            }
                         }
                     }
                     if let Some(TxTimestampOrID::TxID(vid)) = committed_version.end {
@@ -1328,9 +1371,6 @@ impl<Clock: LogicalClock> CommitStateMachine<Clock> {
                             // transaction's end timestamp. See Hekaton page 299.
                             committed_version.end = Some(TxTimestampOrID::Timestamp(end_ts));
                             changed = true;
-                            if committed_version.row.id.table_id == SQLITE_SCHEMA_MVCC_TABLE_ID {
-                                *did_commit_schema = true;
-                            }
                         }
                     }
                     if changed {
@@ -1379,16 +1419,16 @@ impl<Clock: LogicalClock> CommitStateMachine<Clock> {
             }
         };
 
-        // First pass: schema rows only
+        // First pass: schema rows only (ordering matters for recovery)
         for id in &self.write_set {
             if id.table_id == SQLITE_SCHEMA_MVCC_TABLE_ID {
-                collect_versions(id, &mut log_record, &mut self.did_commit_schema_change);
+                collect_versions(id, &mut log_record);
             }
         }
         // Second pass: all non-schema rows
         for id in &self.write_set {
             if id.table_id != SQLITE_SCHEMA_MVCC_TABLE_ID {
-                collect_versions(id, &mut log_record, &mut self.did_commit_schema_change);
+                collect_versions(id, &mut log_record);
             }
         }
 
@@ -1649,7 +1689,8 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
                         mvcc_store.release_exclusive_tx(&self.tx_id);
                     }
                     mvcc_store.unlock_commit_lock_if_held(tx);
-                    mvcc_store.remove_tx(self.tx_id);
+                    mvcc_store.finish_committed_tx(self.tx_id, &self.connection, self.db_id);
+                    inject_transition_failure!(self, CommitYieldPoint::AfterRemoveTx);
                     self.finalize(mvcc_store)?;
                     return Ok(TransitionResult::Done(()));
                 }
@@ -1733,7 +1774,8 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
                         mvcc_store.release_exclusive_tx(&self.tx_id);
                         self.commit_coordinator.pager_commit_lock.unlock();
                     }
-                    mvcc_store.remove_tx(self.tx_id);
+                    mvcc_store.finish_committed_tx(self.tx_id, &self.connection, self.db_id);
+                    inject_transition_failure!(self, CommitYieldPoint::AfterRemoveTx);
                     self.finalize(mvcc_store)?;
                     return Ok(TransitionResult::Done(()));
                 }
@@ -1804,17 +1846,24 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
             }
             CommitState::EndCommitLogicalLog { end_ts } => {
                 let connection = self.connection.clone();
-                let schema_did_change = self.did_commit_schema_change;
-                if schema_did_change {
-                    let schema = connection.schema.read().clone();
-                    connection.db.update_schema_if_newer(schema);
-                }
                 let tx = mvcc_store
                     .txs
                     .get(&self.tx_id)
                     .ok_or_else(|| LimboError::NoSuchTransactionID(self.tx_id.to_string()))?;
                 let tx_unlocked = tx.value();
-                self.header.write().replace(*tx_unlocked.header.read());
+                let tx_header = *tx_unlocked.header.read();
+                let schema_did_change = self.did_commit_schema_change
+                    || self
+                        .header
+                        .read()
+                        .as_ref()
+                        .map(|header| header.schema_cookie.get())
+                        != Some(tx_header.schema_cookie.get());
+                if schema_did_change {
+                    let schema = connection.schema.read().clone();
+                    connection.db.update_schema_if_newer(schema);
+                }
+                self.header.write().replace(tx_header);
                 tracing::trace!("end_commit_logical_log(tx_id={})", self.tx_id);
                 self.state = CommitState::CommitEnd { end_ts: *end_ts };
                 return Ok(TransitionResult::Continue);
@@ -1893,8 +1942,11 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
 
                 // We have now updated all the versions with a reference to the
                 // transaction ID to a timestamp and can, therefore, remove the
-                // transaction.
-                mvcc_store.remove_tx(self.tx_id);
+                // transaction. Pair removal with the connection cache clear so
+                // an IO yield + abandon during the upcoming checkpoint cannot
+                // strand `conn.mv_tx_id` referencing a tx that's gone from `txs`.
+                mvcc_store.finish_committed_tx(self.tx_id, &self.connection, self.db_id);
+                inject_transition_failure!(self, CommitYieldPoint::AfterRemoveTx);
 
                 if mvcc_store.is_exclusive_tx(&self.tx_id) {
                     mvcc_store.release_exclusive_tx(&self.tx_id);
@@ -2247,7 +2299,7 @@ pub struct MvStore<Clock: LogicalClock> {
 
 impl<Clock: LogicalClock> MvStore<Clock> {
     fn uses_durable_mvcc_metadata(&self, connection: &Arc<Connection>) -> bool {
-        !connection.db.path.starts_with(":memory:")
+        !connection.db.is_in_memory_db()
     }
 
     /// Captures table-valued functions (e.g. generate_series) from the schema before
@@ -2357,6 +2409,108 @@ impl<Clock: LogicalClock> MvStore<Clock> {
         if minimum <= self.next_table_id.load(Ordering::SeqCst) {
             self.next_table_id.store(minimum - 1, Ordering::SeqCst);
         }
+    }
+
+    /// Acquire MVCC's stop-the-world gate for VACUUM.
+    ///
+    /// This is the same lock used by MVCC checkpointing. All MVCC transactions
+    /// hold it in read mode for their whole lifetime, so acquiring it in write
+    /// mode proves there are no active MVCC transactions and prevents new ones
+    /// from starting until VACUUM releases it.
+    pub(crate) fn try_begin_vacuum_gate(&self) -> Result<()> {
+        if !self.blocking_checkpoint_lock.write() {
+            return Err(LimboError::Busy);
+        }
+        turso_assert!(
+            self.txs.is_empty(),
+            "MVCC vacuum gate acquired while transactions are still active"
+        );
+        Ok(())
+    }
+
+    /// Release the MVCC stop-the-world gate acquired by `try_begin_vacuum_gate`.
+    pub(crate) fn release_vacuum_gate(&self) {
+        self.blocking_checkpoint_lock.unlock();
+    }
+
+    /// VACUUM copies the physical DB image, so any MVCC logical-log bytes must
+    /// be checkpointed first.
+    pub(crate) fn has_uncheckpointed_log(&self) -> Result<bool> {
+        Ok(self.get_logical_log_file().size()? != 0)
+    }
+
+    /// Rebuild MVCC's physical root-page metadata after in-place VACUUM
+    /// reparses the rewritten B-tree image and stages the committed page-1
+    /// header that now owns the physical schema cookie.
+    ///
+    /// The caller must hold the MVCC vacuum gate and pass both the committed
+    /// page-1 header and the schema parsed from the post-VACUUM physical
+    /// database image.
+    pub(crate) fn reset_after_vacuum(&self, header: DatabaseHeader, schema: &Schema) {
+        turso_assert!(
+            self.txs.is_empty(),
+            "MVCC VACUUM reset requires no active transactions"
+        );
+        // see the test `test_mvcc_plain_vacuum_active_write_tx_returns_busy`
+        self.drop_unused_row_versions();
+        let has_table_versions = self
+            .rows
+            .iter()
+            .any(|entry| !entry.value().read().is_empty());
+        turso_assert!(
+            !has_table_versions,
+            "MVCC VACUUM reset requires checkpointed table versions to be cleared"
+        );
+        let has_index_versions = self.index_rows.iter().any(|index_entry| {
+            index_entry
+                .value()
+                .iter()
+                .any(|entry| !entry.value().read().is_empty())
+        });
+        turso_assert!(
+            !has_index_versions,
+            "MVCC VACUUM reset requires checkpointed index versions to be cleared"
+        );
+        turso_assert!(
+            self.finalized_tx_states.is_empty(),
+            "MVCC VACUUM reset requires finalized transaction cache to be cleared"
+        );
+        let root_pages = schema
+            .tables
+            .values()
+            .filter_map(|table| match table.as_ref() {
+                Table::BTree(btree) => Some(btree.root_page),
+                _ => None,
+            })
+            .chain(
+                schema
+                    .indexes
+                    .values()
+                    .flatten()
+                    .map(|index| index.root_page),
+            )
+            .collect::<Vec<_>>();
+        for &root_page in &root_pages {
+            turso_assert!(
+                root_page > 0,
+                "post-VACUUM B-tree root page must be positive"
+            );
+        }
+        let keys = self
+            .table_id_to_rootpage
+            .iter()
+            .map(|entry| *entry.key())
+            .collect::<Vec<_>>();
+        for key in keys {
+            self.table_id_to_rootpage.remove(&key);
+        }
+        self.table_id_to_last_rowid.write().clear();
+        self.insert_table_id_to_rootpage(SQLITE_SCHEMA_MVCC_TABLE_ID, Some(1));
+        for root_page in root_pages {
+            let table_id = MVTableId::from(-root_page);
+            self.insert_table_id_to_rootpage(table_id, Some(root_page as u64));
+        }
+        self.global_header.write().replace(header);
     }
 
     /// Creates the `__turso_internal_mvcc_meta` table and seeds it with
@@ -3377,6 +3531,23 @@ impl<Clock: LogicalClock> MvStore<Clock> {
         self.blocking_checkpoint_lock.unlock();
     }
 
+    /// Atomically retire a committed tx: clear the connection's mv_tx_id cache
+    /// for `db_id`, then remove the tx from `txs`. Pairs the two mutations so
+    /// no concurrent observer (or in-flight statement) can see the divergent
+    /// `(cache=Some, txs=None)` state — the production-panic shape from
+    /// `release_named_savepoint` and `NoSuchTransactionID` read-path errors.
+    ///
+    /// Order matches `rollback_tx` (cache cleared before `remove_tx`) so the
+    /// commit and rollback paths are symmetric.
+    ///
+    /// Use this anywhere the commit state machine would otherwise call
+    /// `remove_tx` directly. Other call sites that don't have a connection
+    /// context (e.g. tests poking internal state) keep using `remove_tx`.
+    pub fn finish_committed_tx(&self, tx_id: TxID, conn: &Connection, db_id: usize) {
+        conn.set_mv_tx_for_db(db_id, None);
+        self.remove_tx(tx_id);
+    }
+
     fn get_new_transaction_database_header(&self, pager: &Arc<Pager>) -> DatabaseHeader {
         if self.global_header.read().is_none() {
             pager
@@ -3482,16 +3653,18 @@ impl<Clock: LogicalClock> MvStore<Clock> {
         &self,
         tx_id: TxID,
         connection: &Arc<Connection>,
-    ) -> Result<StateMachine<CommitStateMachine<Clock>>> {
-        let state_machine: StateMachine<CommitStateMachine<Clock>> =
-            StateMachine::<CommitStateMachine<Clock>>::new(CommitStateMachine::new(
-                CommitState::Initial,
-                tx_id,
-                connection.clone(),
-                self.commit_coordinator.clone(),
-                self.global_header.clone(),
-                connection.get_sync_mode(),
-            ));
+        db_id: usize,
+    ) -> Result<StateMachine<Box<CommitStateMachine<Clock>>>> {
+        let state = Box::new(CommitStateMachine::new(
+            CommitState::Initial,
+            tx_id,
+            connection.clone(),
+            db_id,
+            self.commit_coordinator.clone(),
+            self.global_header.clone(),
+            connection.get_sync_mode(),
+        ));
+        let state_machine = StateMachine::new(state);
         Ok(state_machine)
     }
 
@@ -3706,6 +3879,8 @@ impl<Clock: LogicalClock> MvStore<Clock> {
 
     fn rollback_savepoint_changes(&self, tx_id: TxID, savepoint: Savepoint) {
         let Savepoint {
+            header,
+            header_dirty,
             created_table_versions,
             created_index_versions,
             deleted_table_versions,
@@ -3793,6 +3968,14 @@ impl<Clock: LogicalClock> MvStore<Clock> {
 
         touched_rowids.extend(newly_added_to_write_set);
         self.remove_rolled_back_rows_from_write_set(tx_id, touched_rowids.clone());
+
+        let tx = self
+            .txs
+            .get(&tx_id)
+            .unwrap_or_else(|| panic!("Transaction {tx_id} not found while restoring savepoint"));
+        let tx = tx.value();
+        *tx.header.write() = header;
+        tx.header_dirty.store(header_dirty, Ordering::Release);
     }
 
     fn row_has_uncommitted_version_for_tx(&self, rowid: &RowID, tx_id: TxID) -> bool {
@@ -4517,7 +4700,10 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                 let syms = connection.syms.read();
                 let mv_store = connection.db.get_mv_store().clone();
 
-                for record in schema_rows.values() {
+                let mut sorted_rowids: Vec<i64> = schema_rows.keys().copied().collect();
+                sorted_rowids.sort_unstable();
+                for rowid in &sorted_rowids {
+                    let record = &schema_rows[rowid];
                     let ty = match record.get_value_opt(0) {
                         Some(ValueRef::Text(v)) => v.as_str(),
                         _ => {
@@ -4703,6 +4889,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                                 }
                                 self.insert_table_id_to_rootpage(table_id, None);
                             } else {
+                                dropped_root_pages.remove(&root_page);
                                 let table_id = self.get_table_id_from_root_page(root_page);
                                 let Some(entry) = self.table_id_to_rootpage.get(&table_id) else {
                                     panic!("Logical log contains root page reference {root_page} that does not exist in the table_id_to_rootpage map");
@@ -4762,6 +4949,22 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                         // serialized before the schema INSERT that registers the table_id.
                         self.insert_table_id_to_rootpage(rowid.table_id, None);
                     }
+                    let tombstone_row = if rowid.table_id == SQLITE_SCHEMA_MVCC_TABLE_ID {
+                        let rowid_int = rowid.row_id.to_int_or_panic();
+                        if let Some(record) = schema_rows.get(&rowid_int) {
+                            // Preserve the pre-delete sqlite_schema record in recovered
+                            // tombstones so checkpoint can still recover B-tree identity.
+                            Row::new_table_row(
+                                rowid.clone(),
+                                record.as_blob().clone(),
+                                record.column_count(),
+                            )
+                        } else {
+                            Row::new_table_row(rowid.clone(), Vec::new(), 0)
+                        }
+                    } else {
+                        Row::new_table_row(rowid.clone(), Vec::new(), 0)
+                    };
                     if let Some(versions) = self.rows.get(&rowid) {
                         // Row exists in memory — try to find the current (non-ended) version
                         // that was committed before this delete, and mark it as ended. If no
@@ -4775,24 +4978,22 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                             existing.end = Some(TxTimestampOrID::Timestamp(commit_ts));
                         } else {
                             let version_id = self.get_version_id();
-                            let row = Row::new_table_row(rowid.clone(), Vec::new(), 0);
                             let row_version = RowVersion {
                                 id: version_id,
                                 begin: None,
                                 end: Some(TxTimestampOrID::Timestamp(commit_ts)),
-                                row,
+                                row: tombstone_row.clone(),
                                 btree_resident,
                             };
                             self.insert_version_raw(&mut versions, row_version);
                         }
                     } else {
                         let version_id = self.get_version_id();
-                        let row = Row::new_table_row(rowid.clone(), Vec::new(), 0);
                         let row_version = RowVersion {
                             id: version_id,
                             begin: None,
                             end: Some(TxTimestampOrID::Timestamp(commit_ts)),
-                            row,
+                            row: tombstone_row,
                             btree_resident,
                         };
                         let versions = self
@@ -5159,9 +5360,36 @@ impl RowVersion {
                 tx.begin_ts > end_ts
             }
             Some(TxTimestampOrID::TxID(end_tx_id)) => {
-                // Row is being deleted/updated by another transaction
-                // If it's OUR transaction, the B-tree row is invalid (we deleted/updated it)
-                end_tx_id == tx.tx_id
+                // Row is being deleted/updated by another transaction.
+                // Consult the deleting tx's state so we don't race with the
+                // post-commit rewrite that turns TxID(W) into Timestamp(W.end_ts).
+                if end_tx_id == tx.tx_id {
+                    return true;
+                }
+                match lookup_tx_state(txs, finalized_tx_states, end_tx_id) {
+                    Some(TransactionState::Committed(committed_ts)) => {
+                        // Same predicate as the Timestamp arm above.
+                        tx.begin_ts > committed_ts
+                    }
+                    Some(TransactionState::Preparing(end_ts)) => {
+                        // Hekaton speculative read: treat as if W will commit at
+                        // its prepared end_ts. When we speculatively invalidate
+                        // the B-tree row, register a commit dependency on W —
+                        // for tombstones (begin=None) we are the only place that
+                        // decides this, since `is_visible_to` short-circuits at
+                        // `is_begin_visible` and never calls `is_end_visible`.
+                        // If W aborts, we must cascade-abort to avoid letting
+                        // the reader observe the row reappear.
+                        let speculatively_invalidated = tx.begin_ts > end_ts;
+                        if speculatively_invalidated {
+                            register_commit_dependency(txs, tx, end_tx_id);
+                        }
+                        speculatively_invalidated
+                    }
+                    Some(TransactionState::Active) => false,
+                    Some(TransactionState::Aborted) | Some(TransactionState::Terminated) => false,
+                    None => false,
+                }
             }
             None => false,
         }

@@ -187,6 +187,16 @@ pub struct QueryOptions {
     pub query_timeout: Option<u32>,
 }
 
+#[napi(object)]
+pub struct TableColumn {
+    pub name: String,
+    #[napi(ts_type = "string | null")]
+    pub r#type: Option<String>,
+    pub column: Option<()>,
+    pub table: Option<()>,
+    pub database: Option<()>,
+}
+
 fn step_sync(stmt: &StatementHandle) -> napi::Result<u32> {
     let mut guard = stmt.borrow_mut();
     let core_stmt = guard
@@ -269,8 +279,10 @@ fn connect_sync(db: &DatabaseInner) -> napi::Result<()> {
                     "encryption" => core_opts.with_encryption(true),
                     "index_method" => core_opts.with_index_method(true),
                     "autovacuum" => core_opts.with_autovacuum(true),
+                    "vacuum" => core_opts.with_vacuum(true),
                     "attach" => core_opts.with_attach(true),
                     "generated_columns" => core_opts.with_generated_columns(true),
+                    "multiprocess_wal" => core_opts.with_multiprocess_wal(true),
                     _ => core_opts,
                 };
             }
@@ -452,8 +464,8 @@ impl Database {
     ///
     /// # Returns
     ///
-    /// A `Statement` instance.
-    #[napi]
+    /// A promise resolving to a `Statement` instance.
+    #[napi(ts_return_type = "Promise<Statement>")]
     pub fn prepare(&self, sql: String) -> napi::Result<Statement> {
         let inner = self.inner()?;
         let stmt = self
@@ -872,7 +884,7 @@ impl Statement {
     }
 
     /// Get column information for the statement
-    #[napi(ts_return_type = "Promise<any>")]
+    #[napi(ts_return_type = "Promise<TableColumn[]>")]
     pub fn columns<'env>(&self, env: &'env Env) -> Result<Array<'env>> {
         let guard = self.statement_handle()?.borrow();
         let stmt = guard

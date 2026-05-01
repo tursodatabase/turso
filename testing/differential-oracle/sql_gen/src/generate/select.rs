@@ -218,7 +218,7 @@ fn generate_select_impl_inner<C: Capabilities>(
             if group_by.is_some() {
                 // Aggregate output column
                 vec![SelectColumn {
-                    expr: generate_aggregate_call(ctx)?,
+                    expr: generate_aggregate_call(generator, ctx)?,
                     alias: None,
                 }]
             } else {
@@ -431,7 +431,10 @@ fn generate_group_by_clause<C: Capabilities>(
 /// Array aggregate functions (e.g. ARRAY_AGG) are excluded by default since
 /// they are Turso-only and not supported by SQLite. They are only included
 /// when array support is explicitly enabled.
-fn generate_aggregate_call(ctx: &mut Context) -> Result<Expr, GenError> {
+fn generate_aggregate_call<C: Capabilities>(
+    generator: &SqlGen<C>,
+    ctx: &mut Context,
+) -> Result<Expr, GenError> {
     // Filter out array aggregate functions — they are Turso-only
     let allowed: Vec<_> = AGGREGATE_FUNCTIONS
         .iter()
@@ -462,7 +465,20 @@ fn generate_aggregate_call(ctx: &mut Context) -> Result<Expr, GenError> {
     let (qualifier, col_name) = ctx.choose(&qualified_cols).unwrap().clone();
 
     let arg = Expr::column_ref(ctx, qualifier, col_name);
-    Ok(Expr::function_call(ctx, func.name.to_string(), vec![arg]))
+
+    // Optionally add FILTER clause
+    let prob = generator.policy().expr_config.aggregate_filter_probability;
+    if prob > 0.0 && ctx.gen_bool_with_prob(prob) {
+        let filter = generate_aggregate_filter(generator, ctx)?;
+        Ok(Expr::function_call_with_filter(
+            ctx,
+            func.name.to_string(),
+            vec![arg],
+            filter,
+        ))
+    } else {
+        Ok(Expr::function_call(ctx, func.name.to_string(), vec![arg]))
+    }
 }
 
 /// Generate SELECT columns for a grouped query.
@@ -470,7 +486,7 @@ fn generate_aggregate_call(ctx: &mut Context) -> Result<Expr, GenError> {
 /// Each column is either a GROUP BY column ref or an aggregate call,
 /// ensuring non-aggregated columns appear in GROUP BY.
 fn generate_grouped_select_columns<C: Capabilities>(
-    _generator: &SqlGen<C>,
+    generator: &SqlGen<C>,
     ctx: &mut Context,
     group_by_exprs: &[Expr],
 ) -> Result<Vec<SelectColumn>, GenError> {
@@ -499,7 +515,7 @@ fn generate_grouped_select_columns<C: Capabilities>(
         } else {
             // Generate an aggregate call
             columns.push(SelectColumn {
-                expr: generate_aggregate_call(ctx)?,
+                expr: generate_aggregate_call(generator, ctx)?,
                 alias: None,
             });
         }
@@ -523,7 +539,7 @@ fn generate_having<C: Capabilities>(
     generator: &SqlGen<C>,
     ctx: &mut Context,
 ) -> Result<Expr, GenError> {
-    let agg = generate_aggregate_call(ctx)?;
+    let agg = generate_aggregate_call(generator, ctx)?;
     let ops = BinOp::comparison();
     let op = *ctx
         .choose(ops)
@@ -811,7 +827,7 @@ fn select_nulls_order(
 /// Picks a random number of joins (1..=max_joins), selects join types by weight,
 /// and generates ON conditions for INNER/LEFT joins. Each joined table is pushed
 /// into the current scope before generating its ON condition.
-fn generate_join_clauses<C: Capabilities>(
+pub(crate) fn generate_join_clauses<C: Capabilities>(
     generator: &SqlGen<C>,
     ctx: &mut Context,
 ) -> Result<Vec<JoinClause>, GenError> {
@@ -929,7 +945,7 @@ fn generate_join_clauses<C: Capabilities>(
 /// using compatible columns. Otherwise generates a general boolean expression.
 /// Both tables are read from the current scope: the primary table is `[0]` and the
 /// just-pushed joined table is the last entry.
-fn generate_join_on_condition<C: Capabilities>(
+pub(crate) fn generate_join_on_condition<C: Capabilities>(
     generator: &SqlGen<C>,
     ctx: &mut Context,
 ) -> Result<Expr, GenError> {
@@ -1381,10 +1397,10 @@ fn generate_aggregate_distinct<C: Capabilities>(
 
 #[trace_gen(Origin::AggregateFilter)]
 fn generate_aggregate_filter<C: Capabilities>(
-    _generator: &SqlGen<C>,
-    _ctx: &mut Context,
+    generator: &SqlGen<C>,
+    ctx: &mut Context,
 ) -> Result<Expr, GenError> {
-    todo!("aggregate FILTER generation")
+    generate_condition(generator, ctx)
 }
 
 #[cfg(test)]

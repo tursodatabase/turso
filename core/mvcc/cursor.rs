@@ -136,6 +136,7 @@ impl<Clock: LogicalClock + 'static> ProvidesYieldContext for MvccLazyCursor<Cloc
     fn yield_context(&self) -> YieldContext {
         YieldContext::new(
             self.connection.yield_injector(),
+            self.connection.failure_injector(),
             self.yield_instance_id,
             cursor_yield_key(self.tx_id, self.table_id),
         )

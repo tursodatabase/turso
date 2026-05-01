@@ -718,6 +718,32 @@ impl PageCache {
         Ok(())
     }
 
+    /// Removes clean cached pages that were read from WAL frames newer than a
+    /// rollback target. Dirty pages are preserved because they may contain
+    /// restored transaction-local state that still needs to be committed or
+    /// rolled back by an outer savepoint.
+    pub fn delete_clean_pages_after_wal_frame(&mut self, max_frame: u64) -> Result<(), CacheError> {
+        for key in self
+            .map
+            .iter()
+            .filter_map(|(key, &entry_ptr)| {
+                let entry = unsafe { &*entry_ptr };
+                let page = &entry.page;
+                if !page.is_dirty() && page.has_wal_tag() {
+                    let (frame, _) = page.wal_tag_pair();
+                    if frame > max_frame {
+                        return Some(*key);
+                    }
+                }
+                None
+            })
+            .collect::<Vec<_>>()
+        {
+            self.delete(key)?;
+        }
+        Ok(())
+    }
+
     pub fn print(&self) {
         tracing::debug!("page_cache_len={}", self.map.len());
 

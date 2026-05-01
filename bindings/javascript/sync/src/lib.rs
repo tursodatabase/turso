@@ -149,6 +149,16 @@ pub struct SyncEngineOpts {
     /// Must match the key used when creating the encrypted database.
     pub remote_encryption_key: Option<String>,
     pub partial_sync_opts: Option<JsPartialSyncOpts>,
+    /// Optional cap on the number of CDC operations packed into a single push
+    /// batch. When set, push splits on transaction boundaries once the batch
+    /// has accumulated at least this many operations. `None` (default) sends
+    /// the entire change set in one batch.
+    pub push_operations_threshold: Option<u32>,
+    /// Optional hint, in bytes, that splits the bootstrap download into
+    /// multiple `/pull-updates` HTTP requests of >= this many bytes each.
+    /// `None` (default) bootstraps in a single round-trip. No-op when
+    /// partial-sync uses the query bootstrap strategy.
+    pub pull_bytes_threshold: Option<u32>,
 }
 
 struct SyncEngineOptsFilled {
@@ -164,6 +174,8 @@ struct SyncEngineOptsFilled {
     pub remote_encryption_cipher: Option<CipherMode>,
     pub remote_encryption_key: Option<String>,
     pub partial_sync_opts: Option<PartialSyncOpts>,
+    pub push_operations_threshold: Option<usize>,
+    pub pull_bytes_threshold: Option<usize>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -306,6 +318,8 @@ impl SyncEngine {
                 None => None,
             },
             remote_encryption_key: opts.remote_encryption_key.clone(),
+            push_operations_threshold: opts.push_operations_threshold.map(|x| x as usize),
+            pull_bytes_threshold: opts.pull_bytes_threshold.map(|x| x as usize),
         };
         Ok(SyncEngine {
             opts: opts_filled,
@@ -336,6 +350,8 @@ impl SyncEngine {
                 .unwrap_or(0),
             partial_sync_opts: self.opts.partial_sync_opts.clone(),
             remote_encryption_key: self.opts.remote_encryption_key.clone(),
+            push_operations_threshold: self.opts.push_operations_threshold,
+            pull_bytes_threshold: self.opts.pull_bytes_threshold,
         };
 
         let io = self.io()?;

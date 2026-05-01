@@ -558,10 +558,7 @@ pub(crate) fn make_array_from_registers(
     start_reg: usize,
     count: usize,
 ) -> Value {
-    let values: Vec<Value> = (0..count)
-        .map(|i| registers[start_reg + i].get_value().clone())
-        .collect();
-    let record = ImmutableRecord::from_values(&values, count);
+    let record = ImmutableRecord::from_registers(&registers[start_reg..start_reg + count], count);
     Value::Blob(record.into_payload())
 }
 

@@ -339,24 +339,28 @@ pub fn compute_group_by_sort_order(
 /// results), we reduce sorter record size and avoid redundant B-tree column reads.
 fn collect_agg_leaf_columns(aggregates: &[Aggregate], plan: &SelectPlan) -> Result<Vec<ast::Expr>> {
     let mut leaf_columns: Vec<ast::Expr> = Vec::new();
+    let mut collect = |expr: &ast::Expr| -> Result<WalkControl> {
+        match expr {
+            ast::Expr::Column { table, .. } | ast::Expr::RowId { table, .. } => {
+                if plan
+                    .table_references
+                    .find_joined_table_by_internal_id(*table)
+                    .is_some()
+                    && !leaf_columns.iter().any(|e| exprs_are_equivalent(e, expr))
+                {
+                    leaf_columns.push(expr.clone());
+                }
+                Ok(WalkControl::SkipChildren)
+            }
+            _ => Ok(WalkControl::Continue),
+        }
+    };
     for agg in aggregates {
         for arg in &agg.args {
-            walk_expr(arg, &mut |expr: &ast::Expr| -> Result<WalkControl> {
-                match expr {
-                    ast::Expr::Column { table, .. } | ast::Expr::RowId { table, .. } => {
-                        if plan
-                            .table_references
-                            .find_joined_table_by_internal_id(*table)
-                            .is_some()
-                            && !leaf_columns.iter().any(|e| exprs_are_equivalent(e, expr))
-                        {
-                            leaf_columns.push(expr.clone());
-                        }
-                        Ok(WalkControl::SkipChildren)
-                    }
-                    _ => Ok(WalkControl::Continue),
-                }
-            })?;
+            walk_expr(arg, &mut collect)?;
+        }
+        if let Some(filter_expr) = &agg.filter_expr {
+            walk_expr(filter_expr, &mut collect)?;
         }
     }
     Ok(leaf_columns)
@@ -665,7 +669,7 @@ pub fn group_by_process_single_group(
         program.offset(),
         "check if ended group had data, and output if so",
     );
-    program.resolve_label(label_jump_after_comparison, program.offset());
+    program.preassign_label_to_next_insn(label_jump_after_comparison);
     program.emit_insn(Insn::Gosub {
         target_pc: labels.label_subrtn_acc_output,
         return_reg: registers.reg_subrtn_acc_output_return_offset,
@@ -721,6 +725,28 @@ pub fn group_by_process_single_group(
                     .reg_agg_start
                     .expect("aggregate registers must be initialized");
                 let agg_result_reg = agg_start_reg + i;
+
+                // FILTER: skip AggStep if filter condition is false
+                let filter_skip_label = if let Some(filter_expr) = &agg.filter_expr {
+                    let label = program.allocate_label();
+                    let filter_reg = program.alloc_register();
+                    translate_expr(
+                        program,
+                        Some(&plan.table_references),
+                        filter_expr,
+                        filter_reg,
+                        &t_ctx.resolver,
+                    )?;
+                    program.emit_insn(Insn::IfNot {
+                        reg: filter_reg,
+                        target_pc: label,
+                        jump_if_null: true,
+                    });
+                    Some(label)
+                } else {
+                    None
+                };
+
                 let agg_arg_source =
                     AggArgumentSource::new_from_expression(&agg.func, &agg.args, &agg.distinctness);
                 translate_aggregation_step(
@@ -736,6 +762,10 @@ pub fn group_by_process_single_group(
                         .expect("distinct aggregate context not populated");
                     program.preassign_label_to_next_insn(ctx.label_on_conflict);
                 }
+
+                if let Some(label) = filter_skip_label {
+                    program.preassign_label_to_next_insn(label);
+                }
             }
 
             t_ctx.resolver.expr_to_reg_cache.truncate(cache_len);
@@ -748,6 +778,28 @@ pub fn group_by_process_single_group(
                     .reg_agg_start
                     .expect("aggregate registers must be initialized");
                 let agg_result_reg = agg_start_reg + i;
+
+                // FILTER: skip AggStep if filter condition is false
+                let filter_skip_label = if let Some(filter_expr) = &agg.filter_expr {
+                    let label = program.allocate_label();
+                    let filter_reg = program.alloc_register();
+                    translate_expr(
+                        program,
+                        Some(&plan.table_references),
+                        filter_expr,
+                        filter_reg,
+                        &t_ctx.resolver,
+                    )?;
+                    program.emit_insn(Insn::IfNot {
+                        reg: filter_reg,
+                        target_pc: label,
+                        jump_if_null: true,
+                    });
+                    Some(label)
+                } else {
+                    None
+                };
+
                 let start_reg_aggs = start_reg_src + t_ctx.non_aggregate_expressions.len();
                 let agg_arg_source =
                     AggArgumentSource::new_from_registers(start_reg_aggs + offset, agg);
@@ -764,6 +816,11 @@ pub fn group_by_process_single_group(
                         .expect("distinct aggregate context not populated");
                     program.preassign_label_to_next_insn(ctx.label_on_conflict);
                 }
+
+                if let Some(label) = filter_skip_label {
+                    program.preassign_label_to_next_insn(label);
+                }
+
                 offset += agg.args.len();
             }
         }
@@ -834,7 +891,7 @@ pub fn group_by_process_single_group(
     }
 
     // Mark that we've stored data for this group
-    program.resolve_label(labels.label_acc_indicator_set_flag_true, program.offset());
+    program.preassign_label_to_next_insn(labels.label_acc_indicator_set_flag_true);
     program.add_comment(program.offset(), "indicate data in accumulator");
     program.emit_insn(Insn::Integer {
         value: 1,
@@ -915,7 +972,7 @@ pub fn group_by_emit_row_phase<'a>(
         can_fallthrough: false,
     });
 
-    program.resolve_label(labels.label_subrtn_acc_output, program.offset());
+    program.preassign_label_to_next_insn(labels.label_subrtn_acc_output);
 
     // Only output a row if there's data in the accumulator
     program.add_comment(program.offset(), "output group by row subroutine start");
@@ -926,14 +983,11 @@ pub fn group_by_emit_row_phase<'a>(
     });
 
     // If no data, return without outputting a row
-    program.resolve_label(
-        labels.label_group_by_end_without_emitting_row,
-        program.offset(),
-    );
+    program.preassign_label_to_next_insn(labels.label_group_by_end_without_emitting_row);
     // SELECT DISTINCT also jumps here if there is a duplicate.
     if let Distinctness::Distinct { ctx } = &plan.distinctness {
         let distinct_ctx = ctx.as_ref().expect("distinct context must exist");
-        program.resolve_label(distinct_ctx.label_on_conflict, program.offset());
+        program.preassign_label_to_next_insn(distinct_ctx.label_on_conflict);
     }
     program.emit_insn(Insn::Return {
         return_reg: registers.reg_subrtn_acc_output_return_offset,
@@ -941,7 +995,7 @@ pub fn group_by_emit_row_phase<'a>(
     });
 
     // Resolve the label for the start of the group by output row subroutine
-    program.resolve_label(labels.label_agg_final, program.offset());
+    program.preassign_label_to_next_insn(labels.label_agg_final);
     // Finalize aggregate values for output
     for (i, agg) in plan.aggregates.iter().enumerate() {
         let agg_start_reg = t_ctx
@@ -1034,7 +1088,7 @@ pub fn group_by_emit_row_phase<'a>(
 
     // Subroutine to clear accumulators for a new group
     program.add_comment(program.offset(), "clear accumulator subroutine start");
-    program.resolve_label(labels.label_subrtn_acc_clear, program.offset());
+    program.preassign_label_to_next_insn(labels.label_subrtn_acc_clear);
     let start_reg = registers.reg_non_aggregate_exprs_acc;
 
     // Reset all accumulator registers to NULL

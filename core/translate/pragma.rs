@@ -4,7 +4,7 @@
 use crate::sync::Arc;
 use crate::turso_soft_unreachable;
 use chrono::Datelike;
-use turso_macros::match_ignore_ascii_case;
+use turso_macros::{match_ignore_ascii_case, turso_debug_assert};
 use turso_parser::ast::PragmaName;
 use turso_parser::ast::{self, Expr, Literal};
 
@@ -20,6 +20,7 @@ use crate::storage::pager::Pager;
 use crate::storage::sqlite3_ondisk::CacheSize;
 use crate::storage::wal::CheckpointMode;
 use crate::translate::emitter::{Resolver, TransactionMode};
+use crate::translate::plan::BitSet;
 use crate::util::{normalize_ident, parse_signed_number, parse_string, IOExt as _};
 use crate::vdbe::builder::{ProgramBuilder, ProgramBuilderOpts};
 use crate::vdbe::insn::{Cookie, Insn};
@@ -46,17 +47,18 @@ fn parse_max_errors_from_value(value: &Option<Expr>) -> usize {
     }
 }
 
-fn visible_database_ids_for_table_list(connection: &crate::Connection) -> Vec<usize> {
-    let mut ids = vec![crate::MAIN_DB_ID, crate::TEMP_DB_ID];
-    let mut attached_ids: Vec<_> = connection
-        .attached_databases()
-        .read()
-        .index_to_data
-        .keys()
-        .copied()
-        .collect();
-    attached_ids.sort_unstable();
-    ids.extend(attached_ids);
+fn visible_database_ids_for_table_list(connection: &crate::Connection) -> BitSet {
+    let mut ids = BitSet::default();
+    ids.set(crate::MAIN_DB_ID);
+    ids.set(crate::TEMP_DB_ID);
+    ids.extend(
+        connection
+            .attached_databases()
+            .read()
+            .index_to_data
+            .keys()
+            .copied(),
+    );
     ids
 }
 
@@ -119,6 +121,16 @@ fn resolve_index_pragma_database_id(
     resolver.resolve_existing_index_database_id(&qualified_name)
 }
 
+fn foreign_key_action_name(action: ast::RefAct) -> &'static str {
+    match action {
+        ast::RefAct::SetNull => "SET NULL",
+        ast::RefAct::SetDefault => "SET DEFAULT",
+        ast::RefAct::Cascade => "CASCADE",
+        ast::RefAct::Restrict => "RESTRICT",
+        ast::RefAct::NoAction => "NO ACTION",
+    }
+}
+
 fn emit_table_list_rows_for_schema(
     program: &mut ProgramBuilder,
     schema: &Schema,
@@ -178,7 +190,7 @@ fn emit_table_list_rows_for_schema(
             program,
             &bt.name,
             "table",
-            bt.columns.len(),
+            bt.columns().len(),
             !bt.has_rowid,
             bt.is_strict,
         );
@@ -203,11 +215,7 @@ pub fn translate_pragma(
     connection: Arc<crate::Connection>,
     program: &mut ProgramBuilder,
 ) -> crate::Result<()> {
-    let opts = ProgramBuilderOpts {
-        num_cursors: 0,
-        approx_num_insns: 20,
-        approx_num_labels: 0,
-    };
+    let opts = ProgramBuilderOpts::new(0, 20, 0);
     program.extend(&opts);
 
     if name.name.as_str().eq_ignore_ascii_case("pragma_list") {
@@ -239,6 +247,7 @@ pub fn translate_pragma(
             PragmaName::IndexInfo
             | PragmaName::IndexXinfo
             | PragmaName::IndexList
+            | PragmaName::ForeignKeyList
             | PragmaName::TableList
             | PragmaName::TableInfo
             | PragmaName::TableXinfo
@@ -539,9 +548,9 @@ fn update_pragma(
                 }
             };
             match auto_vacuum_mode {
-                0 => update_auto_vacuum_mode(AutoVacuumMode::None, 0, pager)?,
-                1 => update_auto_vacuum_mode(AutoVacuumMode::Full, 1, pager)?,
-                2 => update_auto_vacuum_mode(AutoVacuumMode::Incremental, 1, pager)?,
+                0 => pager.persist_auto_vacuum_mode(AutoVacuumMode::None)?,
+                1 => pager.persist_auto_vacuum_mode(AutoVacuumMode::Full)?,
+                2 => pager.persist_auto_vacuum_mode(AutoVacuumMode::Incremental)?,
                 _ => {
                     return Err(LimboError::InvalidArgument(
                         "invalid auto vacuum mode".to_string(),
@@ -566,7 +575,7 @@ fn update_pragma(
                 on_error: None,
                 description_reg: None,
             });
-            program.resolve_label(set_cookie_label, program.offset());
+            program.preassign_label_to_next_insn(set_cookie_label);
             program.emit_insn(Insn::SetCookie {
                 db: database_id,
                 cookie: Cookie::IncrementalVacuum,
@@ -602,6 +611,7 @@ fn update_pragma(
         PragmaName::IndexInfo => unreachable!("index_info cannot be set"),
         PragmaName::IndexXinfo => unreachable!("index_xinfo cannot be set"),
         PragmaName::IndexList => unreachable!("index_list cannot be set"),
+        PragmaName::ForeignKeyList => unreachable!("foreign_key_list cannot be set"),
         PragmaName::TableList => unreachable!("table_list cannot be set"),
         PragmaName::QueryOnly => query_pragma(
             PragmaName::QueryOnly,
@@ -1136,6 +1146,71 @@ fn query_pragma(
             }
             Ok(TransactionMode::None)
         }
+        PragmaName::ForeignKeyList => {
+            let table_name = match value {
+                Some(ast::Expr::Name(name)) => Some(name),
+                _ => None,
+            };
+
+            let base_reg = register;
+            // 8 columns: id, seq, table, from, to, on_update, on_delete, match
+            program.alloc_registers(7);
+
+            if let Some(table_name) = table_name {
+                let table_name = table_name.as_str();
+                let table_database_id = resolve_table_pragma_database_id(
+                    resolver,
+                    database_id,
+                    schema_was_explicit,
+                    table_name,
+                )?;
+                resolver.with_schema(table_database_id, |schema| {
+                    let Some(table) = schema.get_table(table_name).and_then(|table| table.btree())
+                    else {
+                        return;
+                    };
+
+                    let mut foreign_keys = table.foreign_keys.iter().collect::<Vec<_>>();
+                    foreign_keys.sort_by_key(|fk| std::cmp::Reverse(fk.decl_order));
+
+                    for (id, fk) in foreign_keys.into_iter().enumerate() {
+                        turso_debug_assert!(
+                            fk.parent_columns.is_empty()
+                                || fk.parent_columns.len() == fk.child_columns.len()
+                        );
+                        for (idx, child_column) in fk.child_columns.iter().enumerate() {
+                            let parent_column = fk
+                                .parent_columns
+                                .get(idx)
+                                .map(String::as_str)
+                                .unwrap_or_default();
+
+                            program.emit_int(id as i64, base_reg);
+                            program.emit_int(idx as i64, base_reg + 1);
+                            program.emit_string8(fk.parent_table.clone(), base_reg + 2);
+                            program.emit_string8(child_column.clone(), base_reg + 3);
+                            program.emit_string8(parent_column.to_string(), base_reg + 4);
+                            program.emit_string8(
+                                foreign_key_action_name(fk.on_update).to_string(),
+                                base_reg + 5,
+                            );
+                            program.emit_string8(
+                                foreign_key_action_name(fk.on_delete).to_string(),
+                                base_reg + 6,
+                            );
+                            program.emit_string8("NONE".to_string(), base_reg + 7);
+                            program.emit_result_row(base_reg, 8);
+                        }
+                    }
+                });
+            }
+
+            let pragma_meta = pragma_for(&pragma);
+            for col_name in pragma_meta.columns.iter() {
+                program.add_pragma_result_column(col_name.to_string());
+            }
+            Ok(TransactionMode::None)
+        }
         PragmaName::TableList => {
             let name = match value {
                 Some(ast::Expr::Name(name)) => Some(normalize_ident(name.as_str())),
@@ -1147,11 +1222,11 @@ fn query_pragma(
             program.alloc_registers(5);
 
             let database_ids = if schema_was_explicit {
-                vec![database_id]
+                [database_id].into_iter().collect::<BitSet>()
             } else {
                 visible_database_ids_for_table_list(connection.as_ref())
             };
-            for current_database_id in database_ids {
+            for current_database_id in &database_ids {
                 let database_name = connection
                     .get_database_name_by_index(current_database_id)
                     .unwrap_or_else(|| "main".to_string());
@@ -1501,11 +1576,11 @@ fn query_pragma(
                 type_names.sort();
                 for type_name in type_names {
                     let type_def = &schema.type_registry[type_name];
-                    let display_name = if type_def.params.is_empty() {
+                    let display_name = if type_def.params().is_empty() {
                         type_def.name.clone()
                     } else {
                         let params: Vec<String> = type_def
-                            .params
+                            .params()
                             .iter()
                             .map(|p| match &p.ty {
                                 Some(ty) => format!("{} {}", p.name, ty),
@@ -1515,27 +1590,27 @@ fn query_pragma(
                         format!("{}({})", type_def.name, params.join(", "))
                     };
                     program.emit_string8(display_name, base_reg);
-                    program.emit_string8(type_def.base.clone(), base_reg + 1);
-                    if let Some(ref expr) = type_def.encode {
+                    program.emit_string8(type_def.base().to_string(), base_reg + 1);
+                    if let Some(expr) = type_def.encode() {
                         program.emit_string8(expr.to_string(), base_reg + 2);
                     } else {
                         program.emit_null(base_reg + 2, None);
                     }
-                    if let Some(ref expr) = type_def.decode {
+                    if let Some(expr) = type_def.decode() {
                         program.emit_string8(expr.to_string(), base_reg + 3);
                     } else {
                         program.emit_null(base_reg + 3, None);
                     }
-                    if let Some(ref expr) = type_def.default {
+                    if let Some(expr) = type_def.default_expr() {
                         program.emit_string8(expr.to_string(), base_reg + 4);
                     } else {
                         program.emit_null(base_reg + 4, None);
                     }
-                    if type_def.operators.is_empty() {
+                    if type_def.operators().is_empty() {
                         program.emit_null(base_reg + 5, None);
                     } else {
                         let ops: Vec<String> = type_def
-                            .operators
+                            .operators()
                             .iter()
                             .map(|op| match &op.func_name {
                                 Some(f) => format!("'{}' {}", op.op, f),
@@ -1625,20 +1700,6 @@ fn emit_columns_for_table_info(
 
         program.emit_result_row(base_reg, 6 + if extended { 1 } else { 0 });
     }
-}
-
-fn update_auto_vacuum_mode(
-    auto_vacuum_mode: AutoVacuumMode,
-    largest_root_page_number: u32,
-    pager: Arc<Pager>,
-) -> crate::Result<()> {
-    pager.io.block(|| {
-        pager.with_header_mut(|header| {
-            header.vacuum_mode_largest_root_page = largest_root_page_number.into()
-        })
-    })?;
-    pager.set_auto_vacuum_mode(auto_vacuum_mode);
-    Ok(())
 }
 
 fn update_cache_size(

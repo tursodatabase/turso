@@ -46,12 +46,12 @@ pub fn emit_program_for_compound_select(
     let Plan::CompoundSelect { ref left, .. } = plan else {
         unreachable!()
     };
-    let right_most_ctx = TranslateCtx::new(
+    let right_most_ctx = Box::new(TranslateCtx::new(
         program,
         resolver.fork(),
         right_plan.table_references.joined_tables().len(),
         false,
-    );
+    ));
 
     // Each subselect shares the same limit_ctx and offset, because the LIMIT, OFFSET applies to
     // the entire compound select, not just a single subselect.
@@ -254,12 +254,12 @@ fn emit_compound_select(
             jump_if_null: false,
         });
     }
-    let mut right_most_ctx = TranslateCtx::new(
+    let mut right_most_ctx = Box::new(TranslateCtx::new(
         program,
         resolver.fork(),
         right_most.table_references.joined_tables().len(),
         false,
-    );
+    ));
     right_most_ctx.reg_result_cols_start = reg_result_cols_start;
     match left.pop() {
         Some((mut plan, operator)) => match operator {
@@ -274,7 +274,7 @@ fn emit_compound_select(
                 }
                 let compound_select = Plan::CompoundSelect {
                     left,
-                    right_most: plan,
+                    right_most: Box::new(plan),
                     limit: limit.clone(),
                     offset: offset.clone(),
                     order_by,
@@ -328,7 +328,7 @@ fn emit_compound_select(
                 };
                 let compound_select = Plan::CompoundSelect {
                     left,
-                    right_most: plan,
+                    right_most: Box::new(plan),
                     limit,
                     offset,
                     order_by,
@@ -391,7 +391,7 @@ fn emit_compound_select(
                 };
                 let compound_select = Plan::CompoundSelect {
                     left,
-                    right_most: plan,
+                    right_most: Box::new(plan),
                     limit,
                     offset,
                     order_by,
@@ -439,7 +439,7 @@ fn emit_compound_select(
                 };
                 let compound_select = Plan::CompoundSelect {
                     left,
-                    right_most: plan,
+                    right_most: Box::new(plan),
                     limit,
                     offset,
                     order_by,
@@ -1066,7 +1066,7 @@ fn emit_compound_order_by(
         });
     }
 
-    program.resolve_label(sort_loop_next, program.offset());
+    program.preassign_label_to_next_insn(sort_loop_next);
     program.emit_insn(Insn::SorterNext {
         cursor_id: sort_cursor,
         pc_if_next: sort_loop_start,

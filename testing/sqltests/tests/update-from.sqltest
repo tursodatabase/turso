@@ -1,0 +1,3102 @@
+@database :memory:
+
+# UPDATE ... FROM basic tests.
+# See https://sqlite.org/lang_update.html — added in SQLite 3.33.0.
+# The target table is NOT part of the FROM clause, unless the intent is a
+# self-join (in which case the FROM-side reference must be aliased).
+
+# Simple two-table UPDATE ... FROM with equality join on primary key.
+@cross-check-integrity
+test update-from-basic-equijoin {
+    CREATE TABLE inventory (itemId INTEGER PRIMARY KEY, quantity INTEGER);
+    CREATE TABLE sales (itemId INTEGER, qty INTEGER);
+    INSERT INTO inventory VALUES (1, 100), (2, 200), (3, 300);
+    INSERT INTO sales VALUES (1, 5), (2, 15);
+    UPDATE inventory SET quantity = quantity - sales.qty
+      FROM sales
+     WHERE inventory.itemId = sales.itemId;
+    SELECT itemId, quantity FROM inventory ORDER BY itemId;
+}
+expect {
+    1|95
+    2|185
+    3|300
+}
+
+# Update multiple columns from a source table.
+@cross-check-integrity
+test update-from-multiple-columns {
+    CREATE TABLE target (id INTEGER PRIMARY KEY, name TEXT, value INTEGER);
+    CREATE TABLE src (id INTEGER, new_name TEXT, new_value INTEGER);
+    INSERT INTO target VALUES (1, 'a', 10), (2, 'b', 20), (3, 'c', 30);
+    INSERT INTO src VALUES (1, 'alpha', 100), (3, 'gamma', 300);
+    UPDATE target SET name = src.new_name, value = src.new_value
+      FROM src
+     WHERE target.id = src.id;
+    SELECT id, name, value FROM target ORDER BY id;
+}
+expect {
+    1|alpha|100
+    2|b|20
+    3|gamma|300
+}
+
+# Expression on the right-hand side using both target and source columns.
+@cross-check-integrity
+test update-from-expression-mixing-sides {
+    CREATE TABLE target (id INTEGER PRIMARY KEY, val INTEGER);
+    CREATE TABLE src (id INTEGER, delta INTEGER);
+    INSERT INTO target VALUES (1, 10), (2, 20), (3, 30);
+    INSERT INTO src VALUES (1, 1), (2, 2), (3, 3);
+    UPDATE target SET val = target.val * 10 + src.delta
+      FROM src
+     WHERE target.id = src.id;
+    SELECT id, val FROM target ORDER BY id;
+}
+expect {
+    1|101
+    2|202
+    3|303
+}
+
+# Additional WHERE predicate beyond the join condition.
+@cross-check-integrity
+test update-from-extra-where-filter {
+    CREATE TABLE target (id INTEGER PRIMARY KEY, val INTEGER, flag INTEGER);
+    CREATE TABLE src (id INTEGER, bump INTEGER);
+    INSERT INTO target VALUES (1, 10, 0), (2, 20, 1), (3, 30, 0), (4, 40, 1);
+    INSERT INTO src VALUES (1, 100), (2, 200), (3, 300), (4, 400);
+    UPDATE target SET val = val + src.bump
+      FROM src
+     WHERE target.id = src.id AND target.flag = 1;
+    SELECT id, val, flag FROM target ORDER BY id;
+}
+expect {
+    1|10|0
+    2|220|1
+    3|30|0
+    4|440|1
+}
+
+# Unqualified column references in SET should bind to the target table.
+@cross-check-integrity
+test update-from-unqualified-set-columns {
+    CREATE TABLE target (id INTEGER PRIMARY KEY, val INTEGER);
+    CREATE TABLE src (id INTEGER, val INTEGER);
+    INSERT INTO target VALUES (1, 10), (2, 20);
+    INSERT INTO src VALUES (1, 999), (2, 888);
+    UPDATE target SET val = src.val
+      FROM src
+     WHERE target.id = src.id;
+    SELECT id, val FROM target ORDER BY id;
+}
+expect {
+    1|999
+    2|888
+}
+
+# Rows in target with no matching source row stay unchanged.
+@cross-check-integrity
+test update-from-no-match-leaves-unchanged {
+    CREATE TABLE target (id INTEGER PRIMARY KEY, val INTEGER);
+    CREATE TABLE src (id INTEGER, val INTEGER);
+    INSERT INTO target VALUES (1, 10), (2, 20), (3, 30);
+    INSERT INTO src VALUES (2, 200);
+    UPDATE target SET val = src.val
+      FROM src
+     WHERE target.id = src.id;
+    SELECT id, val FROM target ORDER BY id;
+}
+expect {
+    1|10
+    2|200
+    3|30
+}
+
+# Empty source — update should be a no-op.
+@cross-check-integrity
+test update-from-empty-source {
+    CREATE TABLE target (id INTEGER PRIMARY KEY, val INTEGER);
+    CREATE TABLE src (id INTEGER, val INTEGER);
+    INSERT INTO target VALUES (1, 10), (2, 20);
+    UPDATE target SET val = src.val
+      FROM src
+     WHERE target.id = src.id;
+    SELECT id, val FROM target ORDER BY id;
+}
+expect {
+    1|10
+    2|20
+}
+
+# NULL join keys don't match (standard SQL equality semantics).
+@cross-check-integrity
+test update-from-null-join-key-no-match {
+    CREATE TABLE target (id INTEGER PRIMARY KEY, val INTEGER);
+    CREATE TABLE src (id INTEGER, val INTEGER);
+    INSERT INTO target VALUES (1, 10), (2, 20);
+    INSERT INTO src VALUES (NULL, 999), (1, 111);
+    UPDATE target SET val = src.val
+      FROM src
+     WHERE target.id = src.id;
+    SELECT id, val FROM target ORDER BY id;
+}
+expect {
+    1|111
+    2|20
+}
+
+# Subquery as the FROM source (the canonical SQLite docs example).
+@cross-check-integrity
+test update-from-aggregated-subquery {
+    CREATE TABLE inventory (itemId INTEGER PRIMARY KEY, quantity INTEGER);
+    CREATE TABLE sales (itemId INTEGER, quantity INTEGER);
+    INSERT INTO inventory VALUES (1, 100), (2, 200), (3, 300);
+    INSERT INTO sales VALUES (1, 5), (1, 2), (2, 15), (2, 5), (2, 10);
+    UPDATE inventory
+       SET quantity = quantity - daily.amt
+      FROM (SELECT sum(quantity) AS amt, itemId FROM sales GROUP BY itemId) AS daily
+     WHERE inventory.itemId = daily.itemId;
+    SELECT itemId, quantity FROM inventory ORDER BY itemId;
+}
+expect {
+    1|93
+    2|170
+    3|300
+}
+
+# Explicit INNER JOIN in the FROM clause.
+@cross-check-integrity
+test update-from-explicit-inner-join {
+    CREATE TABLE target (id INTEGER PRIMARY KEY, val INTEGER);
+    CREATE TABLE a (id INTEGER, key INTEGER);
+    CREATE TABLE b (key INTEGER, bump INTEGER);
+    INSERT INTO target VALUES (1, 10), (2, 20), (3, 30);
+    INSERT INTO a VALUES (1, 100), (2, 200);
+    INSERT INTO b VALUES (100, 1), (200, 2);
+    UPDATE target SET val = val + b.bump
+      FROM a JOIN b ON a.key = b.key
+     WHERE target.id = a.id;
+    SELECT id, val FROM target ORDER BY id;
+}
+expect {
+    1|11
+    2|22
+    3|30
+}
+
+# JOIN ... USING in the FROM clause should bind shared join columns correctly.
+@cross-check-integrity
+test update-from-join-using {
+    CREATE TABLE target (id INTEGER PRIMARY KEY, val INTEGER);
+    CREATE TABLE s1 (id INTEGER, k INTEGER);
+    CREATE TABLE s2 (k INTEGER, bump INTEGER);
+    INSERT INTO target VALUES (1, 10), (2, 20), (3, 30);
+    INSERT INTO s1 VALUES (1, 100), (2, 200);
+    INSERT INTO s2 VALUES (100, 7), (200, 8);
+    UPDATE target
+       SET val = val + bump
+      FROM s1 JOIN s2 USING (k)
+     WHERE target.id = s1.id;
+    SELECT id, val FROM target ORDER BY id;
+}
+expect {
+    1|17
+    2|28
+    3|30
+}
+
+# NATURAL JOIN in the FROM clause should only use the overlapping source columns.
+@cross-check-integrity
+test update-from-natural-join {
+    CREATE TABLE target (id INTEGER PRIMARY KEY, val INTEGER);
+    CREATE TABLE s1 (id INTEGER, k INTEGER, shared TEXT);
+    CREATE TABLE s2 (k INTEGER, bump INTEGER, shared TEXT);
+    INSERT INTO target VALUES (1, 10), (2, 20), (3, 30);
+    INSERT INTO s1 VALUES (1, 100, 'm'), (2, 200, 'n');
+    INSERT INTO s2 VALUES (100, 5, 'm'), (200, 6, 'n'), (200, 99, 'x');
+    UPDATE target
+       SET val = val + bump
+      FROM s1 NATURAL JOIN s2
+     WHERE target.id = s1.id;
+    SELECT id, val FROM target ORDER BY id;
+}
+expect {
+    1|15
+    2|26
+    3|30
+}
+
+# CTE in the FROM clause.
+@cross-check-integrity
+test update-from-with-cte {
+    CREATE TABLE target (id INTEGER PRIMARY KEY, val INTEGER);
+    CREATE TABLE src (id INTEGER, val INTEGER);
+    INSERT INTO target VALUES (1, 10), (2, 20), (3, 30);
+    INSERT INTO src VALUES (1, 1), (1, 2), (2, 3), (2, 4), (3, 5);
+    WITH totals AS (SELECT id, sum(val) AS s FROM src GROUP BY id)
+    UPDATE target SET val = totals.s
+      FROM totals
+     WHERE target.id = totals.id;
+    SELECT id, val FROM target ORDER BY id;
+}
+expect {
+    1|3
+    2|7
+    3|5
+}
+
+# A VALUES-backed CTE may act as the FROM-side source.
+@cross-check-integrity
+test update-from-values-cte-source {
+    CREATE TABLE target (id INTEGER PRIMARY KEY, val TEXT);
+    INSERT INTO target VALUES (1, 'a'), (2, 'b'), (3, 'c');
+    WITH src(id, new_val) AS (VALUES (1, 'x'), (3, 'z'))
+    UPDATE target
+       SET val = src.new_val
+      FROM src
+     WHERE target.id = src.id;
+    SELECT id, val FROM target ORDER BY id;
+}
+expect {
+    1|x
+    2|b
+    3|z
+}
+
+# Self-join: the target appears in FROM but must be aliased to a different name.
+@cross-check-integrity
+test update-from-self-join-aliased {
+    CREATE TABLE t (id INTEGER PRIMARY KEY, parent INTEGER, label TEXT);
+    INSERT INTO t VALUES (1, NULL, 'root'), (2, 1, 'child-a'), (3, 1, 'child-b'), (4, 2, 'grandchild');
+    UPDATE t SET label = p.label || '->' || t.label
+      FROM t AS p
+     WHERE t.parent = p.id;
+    SELECT id, parent, label FROM t ORDER BY id;
+}
+expect {
+    1||root
+    2|1|root->child-a
+    3|1|root->child-b
+    4|2|child-a->grandchild
+}
+
+# Unaliased self-reference in FROM is illegal when the target is also unaliased.
+test update-from-self-reference-unaliased-errors {
+    CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER);
+    INSERT INTO t VALUES (1, 10);
+    UPDATE t
+       SET v = 1
+      FROM t
+     WHERE t.id = t.id;
+}
+expect error {
+}
+
+test update-from-self-reference-unaliased-case-insensitive-errors {
+    CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER);
+    INSERT INTO t VALUES (1, 10);
+    UPDATE t
+       SET v = 1
+      FROM T
+     WHERE t.id = T.id;
+}
+expect error {
+}
+
+# Three-table FROM list (comma-join).
+@cross-check-integrity
+test update-from-three-tables {
+    CREATE TABLE target (id INTEGER PRIMARY KEY, val INTEGER);
+    CREATE TABLE a (id INTEGER, ak INTEGER);
+    CREATE TABLE b (ak INTEGER, bk INTEGER);
+    CREATE TABLE c (bk INTEGER, bump INTEGER);
+    INSERT INTO target VALUES (1, 10), (2, 20), (3, 30);
+    INSERT INTO a VALUES (1, 100), (2, 200);
+    INSERT INTO b VALUES (100, 1000), (200, 2000);
+    INSERT INTO c VALUES (1000, 7), (2000, 9);
+    UPDATE target SET val = val + c.bump
+      FROM a, b, c
+     WHERE target.id = a.id AND a.ak = b.ak AND b.bk = c.bk;
+    SELECT id, val FROM target ORDER BY id;
+}
+expect {
+    1|17
+    2|29
+    3|30
+}
+
+# RETURNING clause sees the updated target row. Per SQLite, RETURNING
+# may only reference columns of the modified table, not FROM-side columns.
+@cross-check-integrity
+test update-from-returning-target {
+    CREATE TABLE target (id INTEGER PRIMARY KEY, val INTEGER);
+    CREATE TABLE src (id INTEGER, bump INTEGER);
+    INSERT INTO target VALUES (1, 10), (2, 20);
+    INSERT INTO src VALUES (1, 5), (2, 6);
+    UPDATE target SET val = val + src.bump
+      FROM src
+     WHERE target.id = src.id
+    RETURNING id, val;
+}
+expect {
+    1|15
+    2|26
+}
+
+@cross-check-integrity
+test update-from-returning-star {
+    CREATE TABLE target (id INTEGER PRIMARY KEY, val INTEGER);
+    CREATE TABLE src (id INTEGER, bump INTEGER);
+    INSERT INTO target VALUES (1, 10), (2, 20);
+    INSERT INTO src VALUES (1, 5), (2, 6);
+    UPDATE target SET val = val + src.bump
+      FROM src
+     WHERE target.id = src.id
+    RETURNING *;
+}
+expect {
+    1|15
+    2|26
+}
+
+@cross-check-integrity
+test update-from-returning-complex-expressions {
+    CREATE TABLE target (id INTEGER PRIMARY KEY, name TEXT, val INTEGER);
+    CREATE TABLE src (id INTEGER, bump INTEGER, suffix TEXT);
+    INSERT INTO target VALUES (1, 'alpha', 10), (2, 'beta', 20);
+    INSERT INTO src VALUES (1, 5, '!'), (2, 7, '?');
+    UPDATE target
+       SET val = val + src.bump,
+           name = upper(name) || src.suffix
+      FROM src
+     WHERE target.id = src.id
+    RETURNING id, length(name), val * 2, substr(name, 1, 2);
+    SELECT id, name, val FROM target ORDER BY id;
+}
+expect {
+    1|6|30|AL
+    2|5|54|BE
+    1|ALPHA!|15
+    2|BETA?|27
+}
+
+@cross-check-integrity
+test update-from-returning-correlated-subquery-can-see-target {
+    CREATE TABLE target (id INTEGER PRIMARY KEY, grp INTEGER, val INTEGER);
+    CREATE TABLE src (id INTEGER, bump INTEGER);
+    INSERT INTO target VALUES (1, 1, 10), (2, 1, 20), (3, 2, 30);
+    INSERT INTO src VALUES (1, 5), (3, 7);
+    UPDATE target
+       SET val = val + src.bump
+      FROM src
+     WHERE target.id = src.id
+    RETURNING id, grp, (SELECT count(*) FROM target t2 WHERE t2.grp = target.grp);
+}
+expect {
+    1|1|2
+    3|2|1
+}
+
+test update-from-returning-may-not-reference-source-columns {
+    CREATE TABLE target (id INTEGER PRIMARY KEY, val INTEGER);
+    CREATE TABLE src (id INTEGER, bump INTEGER);
+    INSERT INTO target VALUES (1, 10);
+    INSERT INTO src VALUES (1, 5);
+    UPDATE target SET val = val + src.bump
+      FROM src
+     WHERE target.id = src.id
+    RETURNING src.bump;
+}
+expect error {
+}
+
+# UPDATE ... FROM must still evaluate scalar subqueries in SET.
+@cross-check-integrity
+test update-from-set-subquery {
+    CREATE TABLE target (id INTEGER PRIMARY KEY, val INTEGER);
+    CREATE TABLE src (id INTEGER PRIMARY KEY, bump INTEGER);
+    INSERT INTO target VALUES (1, 0), (2, 0);
+    INSERT INTO src VALUES (1, 7), (2, 8);
+    WITH c(x) AS (SELECT 42)
+    UPDATE target
+       SET val = (SELECT x FROM c)
+      FROM src
+     WHERE target.id = src.id;
+    SELECT id, val FROM target ORDER BY id;
+}
+expect {
+    1|42
+    2|42
+}
+
+@cross-check-integrity
+test update-from-row-value-set {
+    CREATE TABLE target (id INTEGER PRIMARY KEY, a TEXT, b INTEGER);
+    CREATE TABLE src (id INTEGER, x TEXT, y INTEGER);
+    INSERT INTO target VALUES (1, 'old', 1), (2, 'older', 2);
+    INSERT INTO src VALUES (1, 'new', 10), (2, 'newer', 20);
+    UPDATE target
+       SET (a, b) = (src.x, src.y)
+      FROM src
+     WHERE target.id = src.id;
+    SELECT id, a, b FROM target ORDER BY id;
+}
+expect {
+    1|new|10
+    2|newer|20
+}
+
+@cross-check-integrity
+test update-from-row-value-set-extra-parens {
+    CREATE TABLE target (id INTEGER PRIMARY KEY, a TEXT, b INTEGER);
+    CREATE TABLE src (id INTEGER, x TEXT, y INTEGER);
+    INSERT INTO target VALUES (1, 'old', 1), (2, 'older', 2);
+    INSERT INTO src VALUES (1, 'new', 10), (2, 'newer', 20);
+    UPDATE target
+       SET (a, b) = ((src.x, src.y))
+      FROM src
+     WHERE target.id = src.id;
+    SELECT id, a, b FROM target ORDER BY id;
+}
+expect {
+    1|new|10
+    2|newer|20
+}
+
+@cross-check-integrity
+test update-from-row-value-set-subquery {
+    CREATE TABLE target (id INTEGER PRIMARY KEY, a TEXT, b INTEGER);
+    CREATE TABLE src (id INTEGER PRIMARY KEY, lookup_id INTEGER);
+    CREATE TABLE payload (lookup_id INTEGER PRIMARY KEY, x TEXT, y INTEGER);
+    INSERT INTO target VALUES (1, 'old', 1), (2, 'older', 2);
+    INSERT INTO src VALUES (1, 100), (2, 200);
+    INSERT INTO payload VALUES (100, 'new', 10), (200, 'newer', 20);
+    UPDATE target
+       SET (a, b) = (
+            SELECT payload.x, payload.y
+              FROM payload
+             WHERE payload.lookup_id = src.lookup_id
+       )
+      FROM src
+     WHERE target.id = src.id;
+    SELECT id, a, b FROM target ORDER BY id;
+}
+expect {
+    1|new|10
+    2|newer|20
+}
+
+@cross-check-integrity
+test update-from-set-subquery-may-reference-source-table {
+    CREATE TABLE target (id INTEGER PRIMARY KEY, val INTEGER);
+    CREATE TABLE src (id INTEGER PRIMARY KEY, bump INTEGER);
+    INSERT INTO target VALUES (1, 10), (2, 20);
+    INSERT INTO src VALUES (1, 7), (2, 8);
+    UPDATE target
+       SET val = (SELECT target.val + src.bump * 10)
+      FROM src
+     WHERE target.id = src.id;
+    SELECT id, val FROM target ORDER BY id;
+}
+expect {
+    1|80
+    2|100
+}
+
+# RETURNING subqueries may still reference statement-scoped CTEs.
+@cross-check-integrity
+test update-from-returning-subquery-can-see-cte {
+    CREATE TABLE target (id INTEGER PRIMARY KEY, val INTEGER);
+    CREATE TABLE src (id INTEGER PRIMARY KEY, bump INTEGER);
+    INSERT INTO target VALUES (1, 10), (2, 20);
+    INSERT INTO src VALUES (1, 5), (2, 6);
+    WITH c(x) AS (SELECT 42)
+    UPDATE target
+       SET val = val + src.bump
+      FROM src
+     WHERE target.id = src.id
+    RETURNING id, (SELECT x FROM c);
+}
+expect {
+    1|42
+    2|42
+}
+
+# When a FROM-side CTE is reused from RETURNING, both reads must see the same
+# statement snapshot even if a trigger mutates the CTE's base table mid-update.
+@cross-check-integrity
+test update-from-returning-reuses-cte-snapshot-after-trigger-mutation {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, v INTEGER);
+    CREATE TABLE s(id INTEGER PRIMARY KEY, bump INTEGER);
+    INSERT INTO t VALUES(1,0),(2,0),(3,0);
+    INSERT INTO s VALUES(1,1),(2,2),(3,3);
+    CREATE TRIGGER bu BEFORE UPDATE ON t
+    WHEN NEW.id = 1
+    BEGIN
+        UPDATE s SET bump = 100 WHERE id = 2;
+    END;
+    WITH c(sum_bump) AS (SELECT sum(bump) FROM s)
+    UPDATE t
+       SET v = 0
+      FROM c
+     WHERE t.id > 0
+    RETURNING id, v, (SELECT sum_bump FROM c);
+}
+expect {
+    1|0|6
+    2|0|6
+    3|0|6
+}
+
+# The FROM-side CTE read is done before the trigger mutates `s`, but the
+# correlated RETURNING subquery re-runs after each row is written. Those two
+# reads must not share one materialized CTE result.
+@cross-check-integrity
+test update-from-returning-reuses-row-cte-snapshot-after-trigger-mutation {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, v INTEGER);
+    CREATE TABLE s(id INTEGER PRIMARY KEY, bump INTEGER);
+    INSERT INTO t VALUES(1,0),(2,0),(3,0);
+    INSERT INTO s VALUES(1,1),(2,2),(3,3);
+    CREATE TRIGGER bu BEFORE UPDATE ON t
+    WHEN NEW.id = 1
+    BEGIN
+        UPDATE s SET bump = 100 WHERE id = 2;
+    END;
+    WITH c(id, bump) AS (SELECT id, bump FROM s)
+    UPDATE t
+       SET v = src.bump
+      FROM c AS src
+     WHERE t.id = src.id
+    RETURNING id, (SELECT bump FROM c WHERE c.id = t.id);
+}
+expect {
+    1|1
+    2|100
+    3|3
+}
+
+# Aliasing the target in UPDATE and referring to the alias in SET/WHERE.
+@cross-check-integrity
+test update-from-target-alias {
+    CREATE TABLE target (id INTEGER PRIMARY KEY, val INTEGER);
+    CREATE TABLE src (id INTEGER, bump INTEGER);
+    INSERT INTO target VALUES (1, 10), (2, 20);
+    INSERT INTO src VALUES (1, 100), (2, 200);
+    UPDATE target AS t SET val = t.val + src.bump
+      FROM src
+     WHERE t.id = src.id;
+    SELECT id, val FROM target ORDER BY id;
+}
+expect {
+    1|110
+    2|220
+}
+
+# Once the target is aliased, a FROM-side alias may reuse the base table name.
+@cross-check-integrity
+test update-from-target-alias-allows-source-alias-matching-base-name {
+    CREATE TABLE t (id INTEGER PRIMARY KEY, val INTEGER);
+    CREATE TABLE u (id INTEGER PRIMARY KEY, val INTEGER);
+    INSERT INTO t VALUES (1, 10), (2, 20);
+    INSERT INTO u VALUES (1, 100), (2, 200);
+    UPDATE t AS x
+       SET val = t.val
+      FROM u AS t
+     WHERE x.id = t.id;
+    SELECT id, val FROM t ORDER BY id;
+}
+expect {
+    1|100
+    2|200
+}
+
+# Reusing the target alias for a different physical source table is legal.
+@cross-check-integrity
+test update-from-target-alias-allows-different-table-same-alias {
+    CREATE TABLE t (id INTEGER PRIMARY KEY, val INTEGER);
+    CREATE TABLE s (id INTEGER PRIMARY KEY, bump INTEGER);
+    INSERT INTO t VALUES (1, 10), (2, 20);
+    INSERT INTO s VALUES (1, 100), (2, 200);
+    UPDATE t AS x
+       SET val = val + 1
+      FROM s AS x
+     WHERE 1;
+    SELECT id, val FROM t ORDER BY id;
+}
+expect {
+    1|11
+    2|21
+}
+
+@cross-check-integrity
+test update-from-source-alias-collision-still-allows-source-only-column {
+    CREATE TABLE t(id INT PRIMARY KEY, v INT);
+    CREATE TABLE s(id INT, w INT);
+    INSERT INTO t VALUES(1,0),(2,0);
+    INSERT INTO s VALUES(1,10),(2,20);
+    UPDATE t AS x
+       SET v = 1
+      FROM s AS x
+     WHERE x.w = 20;
+    SELECT id, v FROM t ORDER BY id;
+}
+expect {
+    1|1
+    2|1
+}
+
+@cross-check-integrity
+test update-from-source-alias-collision-still-allows-source-only-column-in-subquery {
+    CREATE TABLE t(id INT PRIMARY KEY, v INT);
+    CREATE TABLE s(id INT, w INT);
+    INSERT INTO t VALUES(1,0),(2,0);
+    INSERT INTO s VALUES(1,10),(2,20);
+    UPDATE t AS x
+       SET v = 1
+      FROM s AS x
+     WHERE EXISTS(SELECT 1 WHERE x.w = 10);
+    SELECT id, v FROM t ORDER BY id;
+}
+expect {
+    1|1
+    2|1
+}
+
+test update-from-target-not-visible-in-join-on {
+    CREATE TABLE t(id INT PRIMARY KEY, v INT);
+    CREATE TABLE s(id INT, w INT);
+    CREATE TABLE u(id INT);
+    INSERT INTO t VALUES(1,0),(2,0);
+    INSERT INTO s VALUES(1,10),(2,20);
+    INSERT INTO u VALUES(1),(2);
+    UPDATE t
+       SET v = s.w
+      FROM s JOIN u ON u.id = t.id AND s.id = u.id
+     WHERE t.id = s.id;
+}
+expect error {
+}
+
+test update-from-target-not-visible-in-join-on-subquery {
+    CREATE TABLE t(id INT PRIMARY KEY, v INT);
+    CREATE TABLE s(id INT, w INT);
+    CREATE TABLE u(id INT);
+    INSERT INTO t VALUES(1,0),(2,0);
+    INSERT INTO s VALUES(1,10),(2,20);
+    INSERT INTO u VALUES(1),(2);
+    UPDATE t
+       SET v = s.w
+      FROM s JOIN u
+        ON EXISTS(SELECT 1 WHERE t.id = u.id) AND s.id = u.id
+     WHERE t.id = s.id;
+}
+expect error {
+}
+
+test update-from-target-alias-not-visible-in-join-on {
+    CREATE TABLE t(id INT PRIMARY KEY, v INT);
+    CREATE TABLE s(id INT, w INT);
+    CREATE TABLE u(id INT);
+    INSERT INTO t VALUES(1,0),(2,0);
+    INSERT INTO s VALUES(1,10),(2,20);
+    INSERT INTO u VALUES(1),(2);
+    UPDATE t AS x
+       SET v = s.w
+      FROM s JOIN u ON u.id = x.id AND s.id = u.id
+     WHERE x.id = s.id;
+}
+expect error {
+}
+
+# Once the target is aliased, an unaliased FROM-side self-reference is legal.
+@cross-check-integrity
+test update-from-target-alias-allows-unaliased-self-reference {
+    CREATE TABLE t (id INTEGER PRIMARY KEY, parent INTEGER, label TEXT);
+    INSERT INTO t VALUES (1, NULL, 'root'), (2, 1, 'child-a'), (3, 1, 'child-b');
+    UPDATE t AS child
+       SET label = t.label || '->' || child.label
+      FROM t
+     WHERE child.parent = t.id;
+    SELECT id, parent, label FROM t ORDER BY id;
+}
+expect {
+    1||root
+    2|1|root->child-a
+    3|1|root->child-b
+}
+
+# Updating a column that is also an indexed column — indexes must be maintained.
+@cross-check-integrity
+test update-from-updates-indexed-column {
+    CREATE TABLE target (id INTEGER PRIMARY KEY, k INTEGER, v INTEGER);
+    CREATE INDEX target_k ON target(k);
+    CREATE TABLE src (id INTEGER, new_k INTEGER);
+    INSERT INTO target VALUES (1, 10, 100), (2, 20, 200), (3, 30, 300);
+    INSERT INTO src VALUES (1, 11), (3, 33);
+    UPDATE target SET k = src.new_k
+      FROM src
+     WHERE target.id = src.id;
+    SELECT id, v FROM target WHERE k = 11;
+    SELECT id, v FROM target WHERE k = 20;
+    SELECT id, v FROM target WHERE k = 33;
+}
+expect {
+    1|100
+    2|200
+    3|300
+}
+
+# If multiple FROM-side rows match the same target row, SQLite updates from one
+# arbitrary match. It must not apply multiple matches cumulatively.
+@cross-check-integrity
+test update-from-duplicate-match-updates-once {
+    CREATE TABLE target (id INTEGER PRIMARY KEY, val INTEGER);
+    CREATE TABLE src (id INTEGER, bump INTEGER);
+    INSERT INTO target VALUES (1, 10), (2, 20);
+    INSERT INTO src VALUES (1, 1), (1, 100), (2, 7);
+    UPDATE target
+       SET val = val + src.bump
+      FROM src
+     WHERE target.id = src.id;
+    SELECT val IN (11, 110), val != 111 FROM target WHERE id = 1;
+    SELECT val FROM target WHERE id = 2;
+}
+expect {
+    1|1
+    27
+}
+
+# When multiple source rows match, all SET columns must come from the same
+# chosen source row, not from a mixture of different matching rows.
+@cross-check-integrity
+test update-from-duplicate-match-keeps-set-columns-consistent {
+    CREATE TABLE target (id INTEGER PRIMARY KEY, name TEXT, value INTEGER);
+    CREATE TABLE src (id INTEGER, new_name TEXT, new_value INTEGER);
+    INSERT INTO target VALUES (1, 'orig', 0);
+    INSERT INTO src VALUES (1, 'alpha', 100), (1, 'beta', 200);
+    UPDATE target
+       SET name = src.new_name, value = src.new_value
+      FROM src
+     WHERE target.id = src.id;
+    SELECT
+        (name = 'alpha' AND value = 100) OR (name = 'beta' AND value = 200),
+        NOT ((name = 'alpha' AND value = 200) OR (name = 'beta' AND value = 100))
+    FROM target WHERE id = 1;
+}
+expect {
+    1|1
+}
+
+# An explicit INDEXED BY on the target table must still be honored when
+# UPDATE ... FROM builds its internal write-set SELECT.
+@cross-check-integrity
+test update-from-indexed-by-target-hint-is-preserved {
+    CREATE TABLE p(id INT PRIMARY KEY, v TEXT, k INT);
+    CREATE INDEX p_k ON p(k);
+    CREATE TABLE s(id INT, newv TEXT);
+    INSERT INTO p VALUES(1,'x',10),(2,'y',20);
+    INSERT INTO s VALUES(1,'b'),(1,'a');
+
+    UPDATE p INDEXED BY p_k
+       SET v = newv
+      FROM s
+     WHERE p.id = s.id;
+
+    SELECT id, v, k FROM p ORDER BY id;
+}
+expect {
+    1|b|10
+    2|y|20
+}
+
+# Virtual-table/table-valued-function arguments from FROM must be preserved.
+@cross-check-integrity
+test update-from-vtab-source-arguments {
+    CREATE TABLE dst (id INTEGER PRIMARY KEY, val TEXT);
+    INSERT INTO dst VALUES (0, 'a'), (1, 'b');
+    UPDATE dst
+       SET val = p.name
+      FROM pragma_table_info('dst') AS p
+     WHERE dst.id = p.cid;
+    SELECT id, val FROM dst ORDER BY id;
+}
+expect {
+    0|id
+    1|val
+}
+
+# Regression for differential fuzzing: dead UPDATE ... FROM statements must not
+# hit the single-table update path during compilation. In SQLite, a non-numeric
+# string in WHERE coerces to 0, so this statement updates no rows.
+@cross-check-integrity
+test update-from-attached-constant-where-literal-set {
+    ATTACH ':memory:' AS aux;
+    CREATE TABLE aux.t1(id INTEGER PRIMARY KEY, v BLOB);
+    CREATE TABLE aux.t2(id INTEGER PRIMARY KEY, x INTEGER);
+    INSERT INTO aux.t1 VALUES (1, X'01'), (2, X'02');
+    INSERT INTO aux.t2 VALUES (10, 1), (20, 2);
+    UPDATE aux.t1
+       SET v = X'AA'
+      FROM aux.t2
+     WHERE 'constant true';
+    SELECT hex(v) FROM aux.t1 ORDER BY id;
+}
+expect {
+    01
+    02
+}
+
+# Numeric-false WHERE follows the same dead-code path and must likewise avoid
+# the normal two-table UPDATE loop.
+@cross-check-integrity
+test update-from-attached-constant-where-zero {
+    ATTACH ':memory:' AS aux;
+    CREATE TABLE aux.t1(id INTEGER PRIMARY KEY, v INTEGER);
+    CREATE TABLE aux.t2(id INTEGER PRIMARY KEY, x INTEGER);
+    INSERT INTO aux.t1 VALUES (1, 10), (2, 20);
+    INSERT INTO aux.t2 VALUES (10, 1), (20, 2);
+    UPDATE aux.t1
+       SET v = 7
+      FROM aux.t2
+     WHERE 0;
+    SELECT id, v FROM aux.t1 ORDER BY id;
+}
+expect {
+    1|10
+    2|20
+}
+
+# Same regression shape, but with a numeric constant WHERE.
+@cross-check-integrity
+test update-from-attached-constant-where-one {
+    ATTACH ':memory:' AS aux;
+    CREATE TABLE aux.t1(id INTEGER PRIMARY KEY, v INTEGER);
+    CREATE TABLE aux.t2(id INTEGER PRIMARY KEY, x INTEGER);
+    INSERT INTO aux.t1 VALUES (1, 10), (2, 20);
+    INSERT INTO aux.t2 VALUES (10, 1);
+    UPDATE aux.t1
+       SET v = 7
+      FROM aux.t2
+     WHERE 1;
+    SELECT id, v FROM aux.t1 ORDER BY id;
+}
+expect {
+    1|7
+    2|7
+}
+
+# Constant WHERE with a no-op SET should still execute through UPDATE ... FROM
+# without panicking, including on attached databases.
+@cross-check-integrity
+test update-from-attached-constant-where-noop-set {
+    ATTACH ':memory:' AS aux;
+    CREATE TABLE aux.t1(id INTEGER PRIMARY KEY, v INTEGER);
+    CREATE TABLE aux.t2(id INTEGER PRIMARY KEY, x INTEGER);
+    INSERT INTO aux.t1 VALUES (1, 10), (2, 20);
+    INSERT INTO aux.t2 VALUES (10, 1), (20, 2);
+    UPDATE aux.t1
+       SET v = v
+      FROM aux.t2
+     WHERE 1;
+    SELECT id, v FROM aux.t1 ORDER BY id;
+}
+expect {
+    1|10
+    2|20
+}
+
+# BEFORE/AFTER triggers on the target should see the same row transitions as a
+# plain UPDATE, even when values come from a FROM-side source.
+@cross-check-integrity
+test update-from-triggers-see-updated-values {
+    CREATE TABLE target(id INTEGER PRIMARY KEY, val TEXT);
+    CREATE TABLE src(id INTEGER PRIMARY KEY, new_val TEXT);
+    CREATE TABLE log(seq INTEGER PRIMARY KEY, kind TEXT, payload TEXT);
+    INSERT INTO target VALUES (1, 'a'), (2, 'b');
+    INSERT INTO src VALUES (1, 'x'), (2, 'y');
+    CREATE TRIGGER bu BEFORE UPDATE ON target BEGIN
+        INSERT INTO log(kind, payload)
+        VALUES('before', OLD.id || ':' || OLD.val || '->' || NEW.val);
+    END;
+    CREATE TRIGGER au AFTER UPDATE ON target BEGIN
+        INSERT INTO log(kind, payload)
+        VALUES('after', NEW.id || ':' || NEW.val);
+    END;
+    UPDATE target
+       SET val = src.new_val
+      FROM src
+     WHERE target.id = src.id;
+    SELECT kind, payload FROM log ORDER BY seq;
+}
+expect {
+    before|1:a->x
+    after|1:x
+    before|2:b->y
+    after|2:y
+}
+
+@cross-check-integrity
+test update-from-before-trigger-raise-ignore-skips-row {
+    CREATE TABLE target(id INTEGER PRIMARY KEY, val INTEGER);
+    CREATE TABLE src(id INTEGER PRIMARY KEY, bump INTEGER);
+    INSERT INTO target VALUES (1, 10), (2, 20), (3, 30);
+    INSERT INTO src VALUES (1, 1), (2, 2), (3, 3);
+    CREATE TRIGGER bu BEFORE UPDATE ON target
+    WHEN NEW.id = 2
+    BEGIN
+        SELECT RAISE(IGNORE);
+    END;
+    UPDATE target
+       SET val = val + src.bump
+      FROM src
+     WHERE target.id = src.id;
+    SELECT id, val FROM target ORDER BY id;
+}
+expect {
+    1|11
+    2|20
+    3|33
+}
+
+# Trigger-body UPDATE ... FROM must rewrite NEW references inside FROM-side
+# derived subqueries, not just top-level SET/WHERE expressions.
+@cross-check-integrity
+test update-from-trigger-derived-source-sees-new {
+    CREATE TABLE src(id INTEGER PRIMARY KEY, v INTEGER);
+    CREATE TABLE dst(id INTEGER PRIMARY KEY, v INTEGER);
+    CREATE TABLE s(id INTEGER, w INTEGER);
+    INSERT INTO src VALUES (1, 10), (2, 20);
+    INSERT INTO dst VALUES (1, 0), (2, 0);
+    INSERT INTO s VALUES (1, 100), (2, 200);
+    CREATE TRIGGER trg AFTER UPDATE ON src BEGIN
+        UPDATE dst
+           SET v = q.w
+          FROM (SELECT id, w FROM s WHERE NEW.id = id) AS q
+         WHERE dst.id = q.id;
+    END;
+    UPDATE src SET v = v + 1 WHERE id = 1;
+    SELECT id, v FROM dst ORDER BY id;
+}
+expect {
+    1|100
+    2|0
+}
+
+# LIMIT/OFFSET inside that derived source must see OLD/NEW too; SQLite permits
+# trigger pseudo-tables there as outer references.
+@cross-check-integrity
+test update-from-trigger-derived-source-limit-sees-old {
+    CREATE TABLE src(id INTEGER PRIMARY KEY, v INTEGER);
+    CREATE TABLE dst(id INTEGER PRIMARY KEY, v INTEGER);
+    CREATE TABLE s(id INTEGER, w INTEGER);
+    INSERT INTO src VALUES (1, 10), (2, 20);
+    INSERT INTO dst VALUES (1, 0), (2, 0);
+    INSERT INTO s VALUES (1, 100), (2, 200);
+    CREATE TRIGGER trg AFTER UPDATE ON src BEGIN
+        UPDATE dst
+           SET v = q.w
+          FROM (SELECT id, w FROM s ORDER BY id LIMIT OLD.id) AS q
+         WHERE dst.id = q.id;
+    END;
+    UPDATE src SET v = v + 1 WHERE id = 1;
+    SELECT id, v FROM dst ORDER BY id;
+}
+expect {
+    1|100
+    2|0
+}
+
+# LEFT JOIN sources in the FROM clause should preserve unmatched rows from the
+# joined source graph and still drive the target update once per matched target.
+@cross-check-integrity
+test update-from-left-join-source-graph {
+    CREATE TABLE target(id INTEGER PRIMARY KEY, val INTEGER);
+    CREATE TABLE a(id INTEGER PRIMARY KEY, k INTEGER);
+    CREATE TABLE b(k INTEGER PRIMARY KEY, bump INTEGER);
+    INSERT INTO target VALUES (1, 10), (2, 20), (3, 30);
+    INSERT INTO a VALUES (1, 100), (2, 200), (3, 300);
+    INSERT INTO b VALUES (100, 7), (300, 9);
+    UPDATE target
+       SET val = COALESCE(b.bump, -1)
+      FROM a LEFT JOIN b ON a.k = b.k
+     WHERE target.id = a.id;
+    SELECT id, val FROM target ORDER BY id;
+}
+expect {
+    1|7
+    2|-1
+    3|9
+}
+
+# RIGHT JOIN sources in the FROM clause should preserve unmatched rows from the
+# right side of the join and still drive target updates through the preserved map.
+@cross-check-integrity
+test update-from-right-join-source-graph {
+    CREATE TABLE target(id INTEGER PRIMARY KEY, val TEXT);
+    CREATE TABLE src(src_id INTEGER PRIMARY KEY, txt TEXT);
+    CREATE TABLE map(target_id INTEGER PRIMARY KEY, src_id INTEGER);
+    INSERT INTO target VALUES (1, 'a'), (2, 'b'), (3, 'c');
+    INSERT INTO src VALUES (10, 'ten'), (30, 'thirty');
+    INSERT INTO map VALUES (1, 10), (2, 20), (3, 30);
+    UPDATE target
+       SET val = COALESCE(src.txt, 'missing')
+      FROM src RIGHT JOIN map ON src.src_id = map.src_id
+     WHERE target.id = map.target_id;
+    SELECT id, val FROM target ORDER BY id;
+}
+expect {
+    1|ten
+    2|missing
+    3|thirty
+}
+
+# RIGHT JOIN ... USING(...) must preserve the matched right-row payload and must
+# not update target rows that only exist on the unmatched left side of the join.
+@cross-check-integrity
+test update-from-right-join-using-preserves-right-row-payload {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT);
+    CREATE TABLE s(id INTEGER, src TEXT);
+    CREATE TABLE u(id INTEGER, extra TEXT);
+    INSERT INTO t VALUES(1, 'x'), (2, 'x'), (3, 'x'), (4, 'x');
+    INSERT INTO s VALUES(1, 's1'), (4, 's4');
+    INSERT INTO u VALUES(1, 'u1'), (2, 'u2');
+    UPDATE t
+       SET v = extra
+      FROM s RIGHT JOIN u USING(id)
+     WHERE t.id = COALESCE(s.id, u.id);
+    SELECT id, v FROM t ORDER BY id;
+}
+expect {
+    1|u1
+    2|u2
+    3|x
+    4|x
+}
+
+# Partial indexes must stay query-correct when UPDATE ... FROM moves rows in
+# and out of the index predicate while also changing indexed values.
+@cross-check-integrity
+test update-from-maintains-partial-index {
+    CREATE TABLE target(id INTEGER PRIMARY KEY, flag INTEGER, val INTEGER);
+    CREATE TABLE src(id INTEGER PRIMARY KEY, new_flag INTEGER, new_val INTEGER);
+    CREATE INDEX target_partial ON target(val) WHERE flag = 1;
+    INSERT INTO target VALUES (1, 1, 10), (2, 0, 20), (3, 1, 30);
+    INSERT INTO src VALUES (1, 0, 100), (2, 1, 200), (3, 1, 300);
+    UPDATE target
+       SET flag = src.new_flag,
+           val = src.new_val
+      FROM src
+     WHERE target.id = src.id;
+    SELECT id FROM target WHERE flag = 1 AND val = 100 ORDER BY id;
+    SELECT id FROM target WHERE flag = 1 AND val = 200 ORDER BY id;
+    SELECT id FROM target WHERE flag = 1 AND val = 300 ORDER BY id;
+}
+expect {
+    2
+    3
+}
+
+# Expression indexes must also stay query-correct when values are replaced from
+# a FROM-side source.
+@cross-check-integrity
+test update-from-maintains-expression-index {
+    CREATE TABLE target(id INTEGER PRIMARY KEY, val TEXT);
+    CREATE TABLE src(id INTEGER PRIMARY KEY, new_val TEXT);
+    CREATE INDEX target_expr ON target(lower(val));
+    INSERT INTO target VALUES (1, 'Alpha'), (2, 'Beta'), (3, 'Gamma');
+    INSERT INTO src VALUES (1, 'ONE'), (3, 'THREE');
+    UPDATE target
+       SET val = src.new_val
+      FROM src
+     WHERE target.id = src.id;
+    SELECT id FROM target WHERE lower(val) = 'one' ORDER BY id;
+    SELECT id FROM target WHERE lower(val) = 'beta' ORDER BY id;
+    SELECT id FROM target WHERE lower(val) = 'three' ORDER BY id;
+}
+expect {
+    1
+    2
+    3
+}
+
+# Updating the INTEGER PRIMARY KEY from a FROM-side source must still fire
+# ON UPDATE CASCADE on child tables.
+@cross-check-integrity
+test update-from-rowid-update-cascades-foreign-keys {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE parent(id INTEGER PRIMARY KEY, v TEXT);
+    CREATE TABLE child(
+        id INTEGER PRIMARY KEY,
+        parent_id INT REFERENCES parent(id) ON UPDATE CASCADE
+    );
+    CREATE TABLE src(old_id INTEGER PRIMARY KEY, new_id INTEGER);
+    INSERT INTO parent VALUES (1, 'a'), (2, 'b');
+    INSERT INTO child VALUES (10, 1), (20, 2);
+    INSERT INTO src VALUES (1, 11), (2, 22);
+    UPDATE parent
+       SET id = src.new_id
+      FROM src
+     WHERE parent.id = src.old_id;
+    SELECT id, parent_id FROM child ORDER BY id;
+}
+expect {
+    10|11
+    20|22
+}
+
+# Composite parent keys should also cascade correctly when updated from a source table.
+@cross-check-integrity
+test update-from-composite-key-update-cascades-foreign-keys {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE parent(a INTEGER, b INTEGER, v TEXT, PRIMARY KEY(a, b));
+    CREATE TABLE child(
+        id INTEGER PRIMARY KEY,
+        ca INTEGER,
+        cb INTEGER,
+        FOREIGN KEY(ca, cb) REFERENCES parent(a, b) ON UPDATE CASCADE
+    );
+    CREATE TABLE src(a INTEGER, b INTEGER, new_a INTEGER, new_b INTEGER);
+    INSERT INTO parent VALUES (1, 10, 'x'), (2, 20, 'y');
+    INSERT INTO child VALUES (1, 1, 10), (2, 2, 20);
+    INSERT INTO src VALUES (1, 10, 11, 110), (2, 20, 22, 220);
+    UPDATE parent
+       SET a = src.new_a,
+           b = src.new_b
+      FROM src
+     WHERE parent.a = src.a
+       AND parent.b = src.b;
+    SELECT id, ca, cb FROM child ORDER BY id;
+}
+expect {
+    1|11|110
+    2|22|220
+}
+
+# OR IGNORE should keep rows that would conflict unchanged while still applying
+# non-conflicting source-driven updates.
+@cross-check-integrity
+test update-from-or-ignore-skips-conflicting-row {
+    CREATE TABLE target(id INTEGER PRIMARY KEY, u TEXT UNIQUE, v INTEGER);
+    CREATE TABLE src(id INTEGER PRIMARY KEY, new_u TEXT, new_v INTEGER);
+    INSERT INTO target VALUES (1, 'a', 10), (2, 'b', 20), (3, 'c', 30);
+    INSERT INTO src VALUES (1, 'b', 111), (2, 'z', 222);
+    UPDATE OR IGNORE target
+       SET u = src.new_u,
+           v = src.new_v
+      FROM src
+     WHERE target.id = src.id;
+    SELECT id, u, v FROM target ORDER BY id;
+}
+expect {
+    1|a|10
+    2|z|222
+    3|c|30
+}
+
+# OR REPLACE should delete the conflicting row and apply the replacement row
+# chosen by the UPDATE ... FROM source.
+@cross-check-integrity
+test update-from-or-replace-deletes-conflicting-row {
+    CREATE TABLE target(id INTEGER PRIMARY KEY, u TEXT UNIQUE, v INTEGER);
+    CREATE TABLE src(id INTEGER PRIMARY KEY, new_u TEXT, new_v INTEGER);
+    INSERT INTO target VALUES (1, 'a', 10), (2, 'b', 20), (3, 'c', 30);
+    INSERT INTO src VALUES (1, 'b', 111), (2, 'z', 222);
+    UPDATE OR REPLACE target
+       SET u = src.new_u,
+           v = src.new_v
+      FROM src
+     WHERE target.id = src.id;
+    SELECT id, u, v FROM target ORDER BY id;
+}
+expect {
+    1|b|111
+    3|c|30
+}
+
+test update-from-source-null-violates-not-null {
+    CREATE TABLE target(id INTEGER PRIMARY KEY, v TEXT NOT NULL);
+    CREATE TABLE src(id INTEGER PRIMARY KEY, new_v TEXT);
+    INSERT INTO target VALUES (1, 'x');
+    INSERT INTO src VALUES (1, NULL);
+    UPDATE target
+       SET v = src.new_v
+      FROM src
+     WHERE target.id = src.id;
+}
+expect error {
+}
+
+test update-from-source-value-violates-check {
+    CREATE TABLE target(
+        id INTEGER PRIMARY KEY,
+        score INTEGER CHECK(score BETWEEN 0 AND 10)
+    );
+    CREATE TABLE src(id INTEGER PRIMARY KEY, new_score INTEGER);
+    INSERT INTO target VALUES (1, 5);
+    INSERT INTO src VALUES (1, 99);
+    UPDATE target
+       SET score = src.new_score
+      FROM src
+     WHERE target.id = src.id;
+}
+expect error {
+}
+
+@cross-check-integrity
+test update-from-strict-table-coerces-compatible-values {
+    CREATE TABLE target(id INTEGER PRIMARY KEY, v INTEGER) STRICT;
+    CREATE TABLE src(id INTEGER PRIMARY KEY, new_v TEXT);
+    INSERT INTO target VALUES (1, 1);
+    INSERT INTO src VALUES (1, '7');
+    UPDATE target
+       SET v = src.new_v
+      FROM src
+     WHERE target.id = src.id;
+    SELECT id, typeof(v), v FROM target;
+}
+expect {
+    1|integer|7
+}
+
+test update-from-strict-table-rejects-incompatible-values {
+    CREATE TABLE target(id INTEGER PRIMARY KEY, v INTEGER) STRICT;
+    CREATE TABLE src(id INTEGER PRIMARY KEY, new_v TEXT);
+    INSERT INTO target VALUES (1, 1);
+    INSERT INTO src VALUES (1, 'abc');
+    UPDATE target
+       SET v = src.new_v
+      FROM src
+     WHERE target.id = src.id;
+}
+expect error {
+}
+
+@cross-check-integrity
+test update-from-updates-generated-columns {
+    CREATE TABLE target(
+        id INTEGER PRIMARY KEY,
+        base INTEGER,
+        doubled INTEGER GENERATED ALWAYS AS (base * 2) VIRTUAL
+    );
+    CREATE TABLE src(id INTEGER PRIMARY KEY, new_base INTEGER);
+    INSERT INTO target(id, base) VALUES (1, 3), (2, 4);
+    INSERT INTO src VALUES (1, 7), (2, 9);
+    UPDATE target
+       SET base = src.new_base
+      FROM src
+     WHERE target.id = src.id;
+    SELECT id, base, doubled FROM target ORDER BY id;
+}
+expect {
+    1|7|14
+    2|9|18
+}
+
+@cross-check-integrity
+test update-from-or-replace-cascades-foreign-key-deletes {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE target(id INTEGER PRIMARY KEY, u TEXT UNIQUE, v INTEGER);
+    CREATE TABLE child(
+        id INTEGER PRIMARY KEY,
+        target_u TEXT REFERENCES target(u) ON DELETE CASCADE
+    );
+    CREATE TABLE src(id INTEGER PRIMARY KEY, new_u TEXT);
+    INSERT INTO target VALUES (1, 'a', 10), (2, 'b', 20);
+    INSERT INTO child VALUES (10, 'b');
+    INSERT INTO src VALUES (1, 'b');
+    UPDATE OR REPLACE target
+       SET u = src.new_u
+      FROM src
+     WHERE target.id = src.id;
+    SELECT id, u, v FROM target ORDER BY id;
+    SELECT id, target_u FROM child ORDER BY id;
+}
+expect {
+    1|b|10
+}
+
+# ─── Adversarial: ephemeral materialization / snapshot semantics ───
+
+# Shift every row's value to its predecessor's value. Without snapshot
+# semantics (ephemeral materialization), row 2 would see the already-updated
+# row 1 value instead of the original.
+@cross-check-integrity
+test update-from-snapshot-shift-predecessor {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, v INTEGER);
+    INSERT INTO t VALUES(1,1),(2,2),(3,3),(4,4),(5,5);
+    UPDATE t SET v = prev.v
+      FROM t AS prev
+     WHERE t.id = prev.id + 1;
+    SELECT * FROM t ORDER BY id;
+}
+expect {
+    1|1
+    2|1
+    3|2
+    4|3
+    5|4
+}
+
+# Mirror of the above — shift to successor values.
+@cross-check-integrity
+test update-from-snapshot-shift-successor {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, v INTEGER);
+    INSERT INTO t VALUES(1,1),(2,2),(3,3),(4,4),(5,5);
+    UPDATE t SET v = nxt.v
+      FROM t AS nxt
+     WHERE t.id + 1 = nxt.id;
+    SELECT * FROM t ORDER BY id;
+}
+expect {
+    1|2
+    2|3
+    3|4
+    4|5
+    5|5
+}
+
+# Reverse the ordering of values via self-join. This swaps rows 1↔3
+# simultaneously — without snapshot semantics row 3 would see row 1's
+# already-updated value.
+@cross-check-integrity
+test update-from-snapshot-reverse-three-rows {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, v INTEGER);
+    INSERT INTO t VALUES(1,100),(2,200),(3,300);
+    UPDATE t AS a SET v = b.v
+      FROM t AS b
+     WHERE a.id = 4 - b.id;
+    SELECT * FROM t ORDER BY id;
+}
+expect {
+    1|300
+    2|200
+    3|100
+}
+
+# FROM-subquery sources that read the target table must also see the pre-update snapshot.
+@cross-check-integrity
+test update-from-from-subquery-reads-target-snapshot {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, a INTEGER, b INTEGER);
+    INSERT INTO t VALUES(1,10,20),(2,30,40);
+    UPDATE t
+       SET a = src.b,
+           b = src.a
+      FROM (SELECT id, a, b FROM t) AS src
+     WHERE t.id = src.id;
+    SELECT * FROM t ORDER BY id;
+}
+expect {
+    1|20|10
+    2|40|30
+}
+
+# Set every row to the pre-update sum. The subquery must read the
+# pre-materialization snapshot, not partially-updated rows.
+@cross-check-integrity
+test update-from-snapshot-set-to-pre-update-aggregate {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, v INTEGER);
+    INSERT INTO t VALUES(1,10),(2,20),(3,30);
+    UPDATE t SET v = (SELECT sum(v) FROM t) FROM (SELECT 1) AS dummy;
+    SELECT * FROM t ORDER BY id;
+}
+expect {
+    1|60
+    2|60
+    3|60
+}
+
+# ─── Adversarial: type preservation through ephemeral table ───
+
+# Mixed storage classes must survive the round-trip through the BLOB-affinity
+# ephemeral scratch table without coercion.
+@cross-check-integrity
+test update-from-type-preservation-mixed-types {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, v);
+    CREATE TABLE s(id INTEGER, v);
+    INSERT INTO t VALUES(1,NULL),(2,'hello'),(3,42),(4,3.14),(5,X'DEADBEEF');
+    INSERT INTO s VALUES(1,'replaced'),(2,NULL),(3,X'CAFE'),(4,999),(5,0.5);
+    UPDATE t SET v=s.v FROM s WHERE t.id=s.id;
+    SELECT id, typeof(v), quote(v) FROM t ORDER BY id;
+}
+expect {
+    1|text|'replaced'
+    2|null|NULL
+    3|blob|X'CAFE'
+    4|integer|999
+    5|real|0.5
+}
+
+# Integer affinity column receiving a text value that looks like a number.
+# The ephemeral table uses BLOB affinity, so the coercion must happen
+# during the final INSERT, not during materialization.
+@cross-check-integrity
+test update-from-affinity-coercion-at-insert {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, v INTEGER);
+    CREATE TABLE s(id INTEGER, v TEXT);
+    INSERT INTO t VALUES(1,10);
+    INSERT INTO s VALUES(1,'99');
+    UPDATE t SET v=s.v FROM s WHERE t.id=s.id;
+    SELECT typeof(v), v FROM t;
+}
+expect {
+    integer|99
+}
+
+# i64 extremes must survive the ephemeral round-trip.
+@cross-check-integrity
+test update-from-i64-extremes-through-ephemeral {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, v INTEGER);
+    CREATE TABLE s(id INTEGER, v INTEGER);
+    INSERT INTO t VALUES(1,0),(2,0);
+    INSERT INTO s VALUES(1,9223372036854775807),(2,-9223372036854775808);
+    UPDATE t SET v=s.v FROM s WHERE t.id=s.id;
+    SELECT id, v FROM t ORDER BY id;
+}
+expect {
+    1|9223372036854775807
+    2|-9223372036854775808
+}
+
+# ─── Adversarial: self-join cursor confusion ───
+
+# Triple self-join: the same physical table is opened three times. Cursor
+# management must keep the write cursor, the two read aliases, and the
+# ephemeral scratch table separate.
+@cross-check-integrity
+test update-from-triple-self-join {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, v INTEGER);
+    INSERT INTO t VALUES(1,10),(2,20);
+    UPDATE t AS x SET v = y.v + z.v
+      FROM t AS y, t AS z
+     WHERE x.id = y.id AND x.id = z.id;
+    SELECT * FROM t ORDER BY id;
+}
+expect {
+    1|20
+    2|40
+}
+
+# Linked-list traversal via self-join. Each node gets its parent's value.
+@cross-check-integrity
+test update-from-self-join-linked-list {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, next_id INTEGER, v INTEGER);
+    INSERT INTO t VALUES(1,2,10),(2,3,20),(3,NULL,30);
+    UPDATE t SET v = nxt.v FROM t AS nxt WHERE t.next_id = nxt.id;
+    SELECT * FROM t ORDER BY id;
+}
+expect {
+    1|2|20
+    2|3|30
+    3||30
+}
+
+# When the source is a self-join alias on the same physical table and the join
+# column is unindexed, the write phase must re-read preserved columns from the
+# freshly-seeked target row, not from stale source-side cursor state.
+@cross-check-integrity
+test update-from-self-join-preserves-non-set-columns {
+    CREATE TABLE t(id INT, v INT);
+    INSERT INTO t VALUES(1,10),(2,20);
+    UPDATE t
+       SET v=99
+      FROM t AS s
+     WHERE t.id=s.id AND s.id=1
+    RETURNING *;
+    SELECT rowid, id, v FROM t ORDER BY rowid;
+}
+expect {
+    1|99
+    1|1|99
+    2|2|20
+}
+
+# The same cursor-state hazard appears through USING when the self-join aliases
+# are tied together on the shared column.
+@cross-check-integrity
+test update-from-self-join-using-preserves-non-set-columns {
+    CREATE TABLE t(id INT, v INT);
+    INSERT INTO t VALUES(1,10),(2,20);
+    UPDATE t
+       SET v=99
+      FROM t AS s
+      JOIN t AS u USING(id)
+     WHERE t.id=s.id AND s.id=1;
+    SELECT rowid, id, v FROM t ORDER BY rowid;
+}
+expect {
+    1|1|99
+    2|2|20
+}
+
+# ─── Adversarial: index consistency after FROM-driven mutations ───
+
+# Three separate indexes all updated in one UPDATE FROM statement.
+@cross-check-integrity
+test update-from-three-indexes-maintained {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, a INTEGER, b TEXT, c REAL);
+    CREATE INDEX t_a ON t(a);
+    CREATE INDEX t_b ON t(b);
+    CREATE INDEX t_c ON t(c);
+    CREATE TABLE s(id INTEGER, na INTEGER, nb TEXT, nc REAL);
+    INSERT INTO t VALUES(1,10,'x',1.0),(2,20,'y',2.0),(3,30,'z',3.0);
+    INSERT INTO s VALUES(1,11,'xx',1.1),(3,33,'zz',3.3);
+    UPDATE t SET a=s.na, b=s.nb, c=s.nc FROM s WHERE t.id=s.id;
+    SELECT * FROM t ORDER BY id;
+    SELECT id FROM t WHERE a=11;
+    SELECT id FROM t WHERE b='y';
+    SELECT id FROM t WHERE c=3.3;
+}
+expect {
+    1|11|xx|1.1
+    2|20|y|2.0
+    3|33|zz|3.3
+    1
+    2
+    3
+}
+expect @js {
+    1|11|xx|1.1
+    2|20|y|2
+    3|33|zz|3.3
+    1
+    2
+    3
+}
+
+# Expression index on (a+b) must stay correct when only 'a' is updated.
+@cross-check-integrity
+test update-from-expression-index-partial-column-update {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, a INTEGER, b INTEGER);
+    CREATE INDEX t_expr ON t(a + b);
+    CREATE TABLE s(id INTEGER, new_a INTEGER);
+    INSERT INTO t VALUES(1,10,5),(2,20,10);
+    INSERT INTO s VALUES(1,100);
+    UPDATE t SET a=s.new_a FROM s WHERE t.id=s.id;
+    SELECT * FROM t ORDER BY id;
+    SELECT id FROM t WHERE a + b = 105;
+    SELECT id FROM t WHERE a + b = 30;
+}
+expect {
+    1|100|5
+    2|20|10
+    1
+    2
+}
+
+# ─── Adversarial: OR REPLACE cascading through ephemeral plan ───
+
+# All four rows chain-conflict: row 1→gets key of row 2 (deleting 2),
+# row 2→gets key of row 3 (but row 2 is already gone), etc.
+# The ephemeral snapshot means the conflict set is computed before any
+# deletes happen.
+@cross-check-integrity
+test update-from-or-replace-cascading-unique-chain {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, k INTEGER UNIQUE);
+    CREATE TABLE s(id INTEGER, new_k INTEGER);
+    INSERT INTO t VALUES(1,10),(2,20),(3,30),(4,40);
+    INSERT INTO s VALUES(1,20),(2,30),(3,40),(4,50);
+    UPDATE OR REPLACE t SET k=s.new_k FROM s WHERE t.id=s.id;
+    SELECT * FROM t ORDER BY id;
+}
+expect {
+    1|20
+    3|40
+}
+
+# OR REPLACE that swaps unique keys between two rows simultaneously.
+# Without snapshot semantics, the second row's update would fail because
+# the first row already holds the conflicting key.
+@cross-check-integrity
+test update-from-or-replace-swap-unique-keys {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, k INTEGER UNIQUE, v TEXT);
+    CREATE TABLE s(id INTEGER, new_k INTEGER, new_v TEXT);
+    INSERT INTO t VALUES(1,10,'a'),(2,20,'b'),(3,30,'c');
+    INSERT INTO s VALUES(1,20,'aa'),(3,10,'cc');
+    UPDATE OR REPLACE t SET k=s.new_k, v=s.new_v FROM s WHERE t.id=s.id;
+    SELECT * FROM t ORDER BY id;
+}
+expect {
+    1|20|aa
+    3|10|cc
+}
+
+# ─── Adversarial: OR IGNORE with NOT NULL and CHECK ───
+
+# OR IGNORE + NOT NULL: source provides NULL for some rows. Those rows
+# should be skipped while the rest update normally.
+@cross-check-integrity
+test update-from-or-ignore-skips-notnull-violation {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, v INTEGER NOT NULL DEFAULT 0);
+    CREATE TABLE s(id INTEGER, v INTEGER);
+    INSERT INTO t VALUES(1,10),(2,20),(3,30);
+    INSERT INTO s VALUES(1,NULL),(2,100),(3,NULL);
+    UPDATE OR IGNORE t SET v = s.v FROM s WHERE t.id = s.id;
+    SELECT * FROM t ORDER BY id;
+}
+expect {
+    1|10
+    2|100
+    3|30
+}
+
+# OR IGNORE + CHECK: only the row violating the CHECK is skipped.
+@cross-check-integrity
+test update-from-or-ignore-skips-check-violation {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, v INTEGER CHECK(v > 0));
+    CREATE TABLE s(id INTEGER, new_v INTEGER);
+    INSERT INTO t VALUES(1,10),(2,20),(3,30);
+    INSERT INTO s VALUES(1,100),(2,-5),(3,300);
+    UPDATE OR IGNORE t SET v = s.new_v FROM s WHERE t.id = s.id;
+    SELECT * FROM t ORDER BY id;
+}
+expect {
+    1|100
+    2|20
+    3|300
+}
+
+# ─── Adversarial: BEFORE trigger modifies the row being updated ───
+
+# The BEFORE trigger bumps a non-SET column. After the trigger fires the
+# row is re-read; the SET value from the FROM source must still apply, and
+# the trigger's change to the non-SET column must be visible in the result.
+@cross-check-integrity
+test update-from-before-trigger-modifies-target-row {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, v INTEGER, extra INTEGER);
+    CREATE TABLE s(id INTEGER, new_v INTEGER);
+    CREATE TRIGGER t_bu BEFORE UPDATE ON t BEGIN
+      UPDATE t SET extra = extra + 1000 WHERE id = NEW.id;
+    END;
+    INSERT INTO t VALUES(1,10,0),(2,20,0);
+    INSERT INTO s VALUES(1,100),(2,200);
+    UPDATE t SET v = s.new_v FROM s WHERE t.id = s.id;
+    SELECT * FROM t ORDER BY id;
+}
+expect {
+    1|100|1000
+    2|200|1000
+}
+
+# ─── Adversarial: cartesian product and duplicate source rows ───
+
+# Cartesian product: FROM source has multiple rows but no join condition
+# to the target. Each target row should be updated exactly once (not N
+# times for N source rows).
+@cross-check-integrity
+test update-from-cartesian-updates-once {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, v INTEGER);
+    CREATE TABLE s(x INTEGER);
+    INSERT INTO t VALUES(1,0);
+    INSERT INTO s VALUES(1),(2),(3);
+    UPDATE t SET v = 999 FROM s;
+    SELECT * FROM t;
+}
+expect {
+    1|999
+}
+
+# No-PK table with duplicate target rows matching the same source row.
+# Both target rows should be updated.
+@cross-check-integrity
+test update-from-no-pk-duplicate-target-rows {
+    CREATE TABLE t(a, b, c);
+    CREATE TABLE s(a, x);
+    INSERT INTO t VALUES(1,2,3),(1,5,6);
+    INSERT INTO s VALUES(1,99);
+    UPDATE t SET b=s.x FROM s WHERE t.a=s.a;
+    SELECT * FROM t ORDER BY c;
+}
+expect {
+    1|99|3
+    1|99|6
+}
+
+# ─── Adversarial: correlated subquery in SET referencing FROM source ───
+
+# The subquery in SET references the FROM-side table. This exercises the
+# subquery re-phasing logic that moves SET subqueries into the ephemeral
+# plan for UPDATE FROM.
+@cross-check-integrity
+test update-from-correlated-subquery-refs-from-source {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, v INTEGER);
+    CREATE TABLE s(id INTEGER, category INTEGER);
+    CREATE TABLE lookup(category INTEGER, bonus INTEGER);
+    INSERT INTO t VALUES(1,0),(2,0);
+    INSERT INTO s VALUES(1,10),(2,20);
+    INSERT INTO lookup VALUES(10,5),(20,8);
+    UPDATE t SET v = (SELECT bonus FROM lookup WHERE lookup.category = s.category)
+      FROM s WHERE t.id = s.id;
+    SELECT * FROM t ORDER BY id;
+}
+expect {
+    1|5
+    2|8
+}
+
+# ─── Adversarial: window function in FROM subquery ───
+
+@cross-check-integrity
+test update-from-window-function-in-from-subquery {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, rank INTEGER);
+    INSERT INTO t VALUES(1,3),(2,1),(3,2);
+    UPDATE t SET rank = sub.new_rank
+      FROM (
+        SELECT id, row_number() OVER (ORDER BY rank) AS new_rank FROM t
+      ) AS sub
+     WHERE t.id = sub.id;
+    SELECT * FROM t ORDER BY id;
+}
+expect {
+    1|3
+    2|1
+    3|2
+}
+
+# ─── Adversarial: rowid mutation via FROM ───
+
+# Changing the INTEGER PRIMARY KEY (rowid alias) via a FROM source.
+@cross-check-integrity
+test update-from-rowid-mutation {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, v INTEGER);
+    CREATE TABLE s(old_id INTEGER, new_id INTEGER);
+    INSERT INTO t VALUES(1,10),(2,20),(3,30);
+    INSERT INTO s VALUES(1,100);
+    UPDATE t SET id = s.new_id FROM s WHERE t.id = s.old_id;
+    SELECT * FROM t ORDER BY id;
+}
+expect {
+    2|20
+    3|30
+    100|10
+}
+
+# Rowid mutation that conflicts with an existing row should ABORT.
+test update-from-rowid-mutation-conflict {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, v INTEGER);
+    CREATE TABLE s(old_id INTEGER, new_id INTEGER);
+    INSERT INTO t VALUES(1,10),(2,20),(3,30);
+    INSERT INTO s VALUES(1,2);
+    UPDATE t SET id = s.new_id FROM s WHERE t.id = s.old_id;
+}
+expect error {
+}
+
+# OR REPLACE on a rowid collision via FROM should delete the conflicting row.
+@cross-check-integrity
+test update-from-or-replace-rowid-collision {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, v INTEGER);
+    CREATE TABLE s(old_id INTEGER, new_id INTEGER);
+    INSERT INTO t VALUES(1,10),(2,20),(3,30);
+    INSERT INTO s VALUES(1,2);
+    UPDATE OR REPLACE t SET id = s.new_id FROM s WHERE t.id = s.old_id;
+    SELECT * FROM t ORDER BY id;
+}
+expect {
+    2|10
+    3|30
+}
+
+# ─── Adversarial: NATURAL JOIN inside UPDATE FROM ───
+
+# A regular JOIN followed by a NATURAL JOIN in the FROM clause merges
+# column names from the NATURAL JOIN. SQLite rejects this with
+# "ambiguous column name" even when no bare column reference appears,
+# because the merged NATURAL JOIN columns conflict with identically-named
+# columns from the preceding JOIN. Turso must reject it too.
+test update-from-natural-join-after-join-is-ambiguous {
+    CREATE TABLE t(x INTEGER PRIMARY KEY, y TEXT);
+    CREATE TABLE u(a INTEGER PRIMARY KEY, b TEXT);
+    INSERT INTO t VALUES(1, 'x');
+    INSERT INTO u VALUES(1, 'x');
+    UPDATE t SET y = 'z'
+      FROM u AS u1
+      JOIN u AS u2 ON u1.b = u2.b
+      NATURAL JOIN u AS u3
+     WHERE t.y = u1.b;
+}
+expect error {
+}
+
+test update-from-unqualified-set-rhs-is-ambiguous {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, v INTEGER);
+    CREATE TABLE s(id INTEGER PRIMARY KEY, v INTEGER);
+    INSERT INTO t VALUES(1, 10);
+    INSERT INTO s VALUES(1, 99);
+    UPDATE t
+       SET v = v + 1
+      FROM s
+     WHERE t.id = s.id;
+}
+expect error {
+    ambiguous column name: v
+}
+
+test update-from-duplicate-source-alias-using-is-ambiguous {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, v INTEGER);
+    CREATE TABLE s(id INTEGER, w INTEGER);
+    CREATE TABLE u(id INTEGER, z INTEGER);
+    INSERT INTO t VALUES(1,0),(2,0);
+    INSERT INTO s VALUES(1,10),(2,20);
+    INSERT INTO u VALUES(1,100),(2,200);
+    UPDATE t
+       SET v = 1
+      FROM s AS x JOIN u AS x USING(id)
+     WHERE x.id = 1;
+}
+expect error {
+    ambiguous column name: main.x._ROWID_
+}
+
+test update-from-duplicate-source-alias-natural-is-ambiguous {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, v INTEGER);
+    CREATE TABLE s(id INTEGER, w INTEGER);
+    CREATE TABLE u(id INTEGER, z INTEGER);
+    INSERT INTO t VALUES(1,0),(2,0);
+    INSERT INTO s VALUES(1,10),(2,20);
+    INSERT INTO u VALUES(1,100),(2,200);
+    UPDATE t
+       SET v = 1
+      FROM s AS x NATURAL JOIN u AS x
+     WHERE x.id = 1;
+}
+expect error {
+    ambiguous column name: main.x._ROWID_
+}
+
+#-----------------------------------------------------------------------
+# Duplicate unaliased table in FROM should error (same table name, no alias).
+#-----------------------------------------------------------------------
+
+test update-from-dup-unaliased-comma {
+    CREATE TABLE t1(a INTEGER PRIMARY KEY, b TEXT);
+    CREATE TABLE t2(id INT);
+    INSERT INTO t1 VALUES(1,'x');
+    INSERT INTO t2 VALUES(1);
+    UPDATE t1 SET b = 'changed' FROM t2, t2 WHERE t1.a = 1;
+}
+expect error {
+    ambiguous column name
+}
+
+test update-from-dup-unaliased-cross-join {
+    CREATE TABLE t1(a INTEGER PRIMARY KEY, b TEXT);
+    CREATE TABLE t2(id INT);
+    INSERT INTO t1 VALUES(1,'x');
+    INSERT INTO t2 VALUES(1);
+    UPDATE t1 SET b = 'changed' FROM t2 CROSS JOIN t2 WHERE t1.a = 1;
+}
+expect error {
+    ambiguous column name
+}
+
+test update-from-dup-unaliased-triple {
+    CREATE TABLE t1(a INTEGER PRIMARY KEY, b TEXT);
+    CREATE TABLE t2(id INT);
+    INSERT INTO t1 VALUES(1,'x');
+    INSERT INTO t2 VALUES(1);
+    UPDATE t1 SET b = 'changed' FROM t2, t2, t2 WHERE t1.a = 1;
+}
+expect error {
+    ambiguous column name
+}
+
+#-----------------------------------------------------------------------
+# NATURAL/USING + additional JOIN: column shared by the deduplicated pair
+# and another table is ambiguous.
+#-----------------------------------------------------------------------
+
+test update-from-natural-plus-join-ambiguous {
+    CREATE TABLE t1(a INTEGER PRIMARY KEY, b TEXT);
+    CREATE TABLE s1(x INT, y TEXT);
+    CREATE TABLE s2(x INT, z TEXT);
+    CREATE TABLE s3(x INT, w TEXT);
+    INSERT INTO t1 VALUES(1,'orig');
+    INSERT INTO s1 VALUES(1,'hello');
+    INSERT INTO s2 VALUES(1,'world');
+    INSERT INTO s3 VALUES(1,'extra');
+    UPDATE t1 SET b = s1.y
+    FROM s1 NATURAL JOIN s2 JOIN s3 ON s1.x = s3.x
+    WHERE s1.x = t1.a;
+}
+expect error {
+    ambiguous column name
+}
+
+test update-from-using-plus-join-ambiguous {
+    CREATE TABLE t1(a INTEGER PRIMARY KEY, b TEXT);
+    CREATE TABLE s1(x INT, y TEXT);
+    CREATE TABLE s2(x INT, z TEXT);
+    CREATE TABLE s3(x INT, w TEXT);
+    INSERT INTO t1 VALUES(1,'orig');
+    INSERT INTO s1 VALUES(1,'hello');
+    INSERT INTO s2 VALUES(1,'world');
+    INSERT INTO s3 VALUES(1,'extra');
+    UPDATE t1 SET b = s1.y
+    FROM s1 JOIN s2 USING(x) JOIN s3 ON s1.x = s3.x
+    WHERE s1.x = t1.a;
+}
+expect error {
+    ambiguous column name
+}
+
+test update-from-natural-plus-left-join-ambiguous {
+    CREATE TABLE t1(a INTEGER PRIMARY KEY, b TEXT, c INT);
+    INSERT INTO t1 VALUES(1,'x',10);
+    UPDATE t1 SET b = 'new'
+    FROM t1 AS t8 NATURAL JOIN t1 AS t9 LEFT JOIN t1 AS t10 ON t8.c = t10.c
+    WHERE t1.a = t8.a;
+}
+expect error {
+    ambiguous column name
+}
+
+test update-from-natural-plus-inner-join-ambiguous {
+    CREATE TABLE t1(a INTEGER PRIMARY KEY, b TEXT, c INT);
+    INSERT INTO t1 VALUES(1,'x',10);
+    UPDATE t1 SET b = 'new'
+    FROM t1 AS t8 NATURAL JOIN t1 AS t9 JOIN t1 AS t10 ON t8.c = t10.c
+    WHERE t1.a = t8.a;
+}
+expect error {
+    ambiguous column name
+}
+
+#-----------------------------------------------------------------------
+# Additional positive edge-case coverage.
+#-----------------------------------------------------------------------
+
+# Subquery as FROM source with expression
+@cross-check-integrity
+test update-from-subquery-source {
+    CREATE TABLE t1(a INTEGER PRIMARY KEY, b TEXT);
+    CREATE TABLE t2(id INTEGER, val TEXT);
+    INSERT INTO t1 VALUES(1,'a'),(2,'b'),(3,'c');
+    INSERT INTO t2 VALUES(1,'X'),(2,'Y');
+    UPDATE t1 SET b = sub.val
+    FROM (SELECT id, upper(val) as val FROM t2) AS sub
+    WHERE sub.id = t1.a;
+    SELECT * FROM t1 ORDER BY a;
+}
+expect {
+    1|X
+    2|Y
+    3|c
+}
+
+# Three-way join in FROM
+@cross-check-integrity
+test update-from-three-way-join {
+    CREATE TABLE t1(a INTEGER PRIMARY KEY, b TEXT);
+    CREATE TABLE t2(x INTEGER, y TEXT);
+    CREATE TABLE t3(x INTEGER, z TEXT);
+    INSERT INTO t1 VALUES(1,'a'),(2,'b'),(3,'c');
+    INSERT INTO t2 VALUES(1,'X'),(2,'Y');
+    INSERT INTO t3 VALUES(1,'Z1'),(2,'Z2');
+    UPDATE t1 SET b = t2.y || t3.z FROM t2 JOIN t3 ON t2.x = t3.x WHERE t2.x = t1.a;
+    SELECT * FROM t1 ORDER BY a;
+}
+expect {
+    1|XZ1
+    2|YZ2
+    3|c
+}
+
+# Cross join with no WHERE (single-row FROM)
+@cross-check-integrity
+test update-from-cross-join-no-where {
+    CREATE TABLE t1(a INTEGER PRIMARY KEY, b TEXT);
+    CREATE TABLE t2(val TEXT);
+    INSERT INTO t1 VALUES(1,'a'),(2,'b');
+    INSERT INTO t2 VALUES('ONLY');
+    UPDATE t1 SET b = t2.val FROM t2;
+    SELECT * FROM t1 ORDER BY a;
+}
+expect {
+    1|ONLY
+    2|ONLY
+}
+
+# No matching rows between target and source
+@cross-check-integrity
+test update-from-no-matches-extra {
+    CREATE TABLE t1(a INTEGER PRIMARY KEY, b TEXT);
+    CREATE TABLE t2(id INT, val TEXT);
+    INSERT INTO t1 VALUES(1,'a'),(2,'b');
+    INSERT INTO t2 VALUES(10,'X'),(20,'Y');
+    UPDATE t1 SET b = t2.val FROM t2 WHERE t2.id = t1.a;
+    SELECT * FROM t1 ORDER BY a;
+}
+expect {
+    1|a
+    2|b
+}
+
+# NULL source value
+@cross-check-integrity
+test update-from-null-source-value {
+    CREATE TABLE t1(a INTEGER PRIMARY KEY, b TEXT);
+    CREATE TABLE t2(id INT, val TEXT);
+    INSERT INTO t1 VALUES(1,'a'),(2,'b');
+    INSERT INTO t2 VALUES(1,NULL),(2,'X');
+    UPDATE t1 SET b = t2.val FROM t2 WHERE t2.id = t1.a;
+    SELECT a, b, typeof(b) FROM t1 ORDER BY a;
+}
+expect {
+    1||null
+    2|X|text
+}
+
+# NULL join key (NULL = NULL is false)
+@cross-check-integrity
+test update-from-null-join-key-extra {
+    CREATE TABLE t1(a INT, b TEXT);
+    CREATE TABLE t2(id INT, val TEXT);
+    INSERT INTO t1 VALUES(NULL,'a'),(1,'b'),(2,'c');
+    INSERT INTO t2 VALUES(NULL,'X'),(1,'Y');
+    UPDATE t1 SET b = t2.val FROM t2 WHERE t2.id = t1.a;
+    SELECT a, b FROM t1 ORDER BY rowid;
+}
+expect {
+    |a
+    1|Y
+    2|c
+}
+
+# IS join (NULL matches NULL)
+@cross-check-integrity
+test update-from-is-join {
+    CREATE TABLE t1(a INT, b TEXT);
+    CREATE TABLE t2(id INT, val TEXT);
+    INSERT INTO t1 VALUES(NULL,'a'),(1,'b'),(2,'c');
+    INSERT INTO t2 VALUES(NULL,'X'),(1,'Y');
+    UPDATE t1 SET b = t2.val FROM t2 WHERE t2.id IS t1.a;
+    SELECT a, b FROM t1 ORDER BY rowid;
+}
+expect {
+    |X
+    1|Y
+    2|c
+}
+
+# Range/inequality join
+@cross-check-integrity
+test update-from-range-join {
+    CREATE TABLE t1(a INTEGER PRIMARY KEY, b INT);
+    CREATE TABLE t2(threshold INT, label TEXT);
+    INSERT INTO t1 VALUES(1,10),(2,20),(3,30);
+    INSERT INTO t2 VALUES(15,'high');
+    UPDATE t1 SET b = 0 FROM t2 WHERE t1.b > t2.threshold;
+    SELECT * FROM t1 ORDER BY a;
+}
+expect {
+    1|10
+    2|0
+    3|0
+}
+
+# View as FROM source
+@cross-check-integrity
+test update-from-view-source {
+    CREATE TABLE t1(a INTEGER PRIMARY KEY, b TEXT);
+    INSERT INTO t1 VALUES(1,'a'),(2,'b'),(3,'c');
+    CREATE VIEW v2 AS SELECT 1 as id, 'VIEW' as val;
+    UPDATE t1 SET b = v2.val FROM v2 WHERE v2.id = t1.a;
+    SELECT * FROM t1 ORDER BY a;
+}
+expect {
+    1|VIEW
+    2|b
+    3|c
+}
+
+# Aggregate subquery in FROM
+@cross-check-integrity
+test update-from-aggregate-subquery-extra {
+    CREATE TABLE t1(a INTEGER PRIMARY KEY, b INT);
+    CREATE TABLE t2(grp INT, val INT);
+    INSERT INTO t1 VALUES(1,0),(2,0),(3,0);
+    INSERT INTO t2 VALUES(1,10),(1,20),(2,30),(2,40),(3,50);
+    UPDATE t1 SET b = sub.s
+    FROM (SELECT grp, SUM(val) as s FROM t2 GROUP BY grp) AS sub
+    WHERE sub.grp = t1.a;
+    SELECT * FROM t1 ORDER BY a;
+}
+expect {
+    1|30
+    2|70
+    3|50
+}
+
+# HAVING in FROM subquery
+@cross-check-integrity
+test update-from-having-subquery {
+    CREATE TABLE t1(a INTEGER PRIMARY KEY, b INT);
+    CREATE TABLE t2(grp INT, val INT);
+    INSERT INTO t1 VALUES(1,0),(2,0),(3,0);
+    INSERT INTO t2 VALUES(1,5),(1,10),(2,3),(2,7),(3,1);
+    UPDATE t1 SET b = src.total
+    FROM (SELECT grp, SUM(val) as total FROM t2 GROUP BY grp HAVING SUM(val) > 5) AS src
+    WHERE src.grp = t1.a;
+    SELECT * FROM t1 ORDER BY a;
+}
+expect {
+    1|15
+    2|10
+    3|0
+}
+
+# Window function in FROM subquery
+@cross-check-integrity
+test update-from-window-function-extra {
+    CREATE TABLE t1(a INTEGER PRIMARY KEY, b INT);
+    CREATE TABLE t2(id INT, val INT);
+    INSERT INTO t1 VALUES(1,0),(2,0),(3,0);
+    INSERT INTO t2 VALUES(1,10),(2,20),(3,30);
+    UPDATE t1 SET b = sub.running_sum
+    FROM (SELECT id, SUM(val) OVER (ORDER BY id) as running_sum FROM t2) AS sub
+    WHERE sub.id = t1.a;
+    SELECT * FROM t1 ORDER BY a;
+}
+expect {
+    1|10
+    2|30
+    3|60
+}
+
+# UNION ALL in FROM subquery
+@cross-check-integrity
+test update-from-union-all {
+    CREATE TABLE t1(a INTEGER PRIMARY KEY, b TEXT);
+    INSERT INTO t1 VALUES(1,'a'),(2,'b'),(3,'c');
+    UPDATE t1 SET b = src.val
+    FROM (SELECT 1 as id, 'U1' as val UNION ALL SELECT 2, 'U2') AS src
+    WHERE src.id = t1.a;
+    SELECT * FROM t1 ORDER BY a;
+}
+expect {
+    1|U1
+    2|U2
+    3|c
+}
+
+# INTERSECT in FROM subquery
+@cross-check-integrity
+test update-from-intersect {
+    CREATE TABLE t1(a INTEGER PRIMARY KEY, b TEXT);
+    CREATE TABLE t2(id INT, val TEXT);
+    CREATE TABLE t3(id INT, val TEXT);
+    INSERT INTO t1 VALUES(1,'a'),(2,'b');
+    INSERT INTO t2 VALUES(1,'X'),(2,'Y'),(3,'Z');
+    INSERT INTO t3 VALUES(1,'X'),(4,'W');
+    UPDATE t1 SET b = src.val
+    FROM (SELECT id, val FROM t2 INTERSECT SELECT id, val FROM t3) AS src
+    WHERE src.id = t1.a;
+    SELECT * FROM t1 ORDER BY a;
+}
+expect {
+    1|X
+    2|b
+}
+
+# EXCEPT in FROM subquery
+@cross-check-integrity
+test update-from-except {
+    CREATE TABLE t1(a INTEGER PRIMARY KEY, b TEXT);
+    CREATE TABLE t2(id INT, val TEXT);
+    CREATE TABLE t3(id INT, val TEXT);
+    INSERT INTO t1 VALUES(1,'a'),(2,'b'),(3,'c');
+    INSERT INTO t2 VALUES(1,'X'),(2,'Y'),(3,'Z');
+    INSERT INTO t3 VALUES(2,'Y');
+    UPDATE t1 SET b = src.val
+    FROM (SELECT id, val FROM t2 EXCEPT SELECT id, val FROM t3) AS src
+    WHERE src.id = t1.a;
+    SELECT * FROM t1 ORDER BY a;
+}
+expect {
+    1|X
+    2|b
+    3|Z
+}
+
+# Multiple CTEs, one referencing another
+@cross-check-integrity
+test update-from-cte-chain {
+    CREATE TABLE t1(a INTEGER PRIMARY KEY, b TEXT);
+    INSERT INTO t1 VALUES(1,'a'),(2,'b'),(3,'c');
+    WITH
+      base AS (SELECT 1 as id, 'X' as val UNION ALL SELECT 2, 'Y' UNION ALL SELECT 3, 'Z'),
+      derived AS (SELECT id, val || '!' as val FROM base WHERE id <= 2)
+    UPDATE t1 SET b = derived.val FROM derived WHERE derived.id = t1.a;
+    SELECT * FROM t1 ORDER BY a;
+}
+expect {
+    1|X!
+    2|Y!
+    3|c
+}
+
+# Self-join shift: each row gets the value of the next row
+@cross-check-integrity
+test update-from-self-join-shift {
+    CREATE TABLE t1(a INTEGER PRIMARY KEY, c INT);
+    INSERT INTO t1 VALUES(1,10),(2,20),(3,30);
+    UPDATE t1 SET c = t1_src.c FROM t1 AS t1_src WHERE t1_src.a = t1.a + 1;
+    SELECT * FROM t1 ORDER BY a;
+}
+expect {
+    1|20
+    2|30
+    3|30
+}
+
+# Value rotation using CASE in self-join
+@cross-check-integrity
+test update-from-rotate-values {
+    CREATE TABLE t1(a INTEGER PRIMARY KEY, b INT);
+    INSERT INTO t1 VALUES(1,100),(2,200),(3,300);
+    UPDATE t1 SET b = src.b FROM t1 AS src
+    WHERE src.a = CASE t1.a WHEN 1 THEN 2 WHEN 2 THEN 3 WHEN 3 THEN 1 END;
+    SELECT * FROM t1 ORDER BY a;
+}
+expect {
+    1|200
+    2|300
+    3|100
+}
+
+# Self-referential aggregate: each row gets average of all original values
+@cross-check-integrity
+test update-from-self-ref-aggregate {
+    CREATE TABLE t1(a INTEGER PRIMARY KEY, b INT);
+    INSERT INTO t1 VALUES(1,10),(2,20),(3,30);
+    UPDATE t1 SET b = src.avg_b FROM (SELECT AVG(b) as avg_b FROM t1) AS src;
+    SELECT a, CAST(b AS INT) FROM t1 ORDER BY a;
+}
+expect {
+    1|20
+    2|20
+    3|20
+}
+
+# Snapshot semantics: WHERE references column being SET
+@cross-check-integrity
+test update-from-snapshot-where-set-same-col {
+    CREATE TABLE t1(a INTEGER PRIMARY KEY, b INT, c TEXT);
+    INSERT INTO t1 VALUES(1,100,'a'),(2,200,'b'),(3,300,'c');
+    UPDATE t1 SET b = 999 FROM (SELECT 1 as x) AS src WHERE t1.b = 200;
+    SELECT * FROM t1 ORDER BY a;
+}
+expect {
+    1|100|a
+    2|999|b
+    3|300|c
+}
+
+# Correlated subquery in SET referencing FROM table
+@cross-check-integrity
+test update-from-correlated-sub-refs-from-extra {
+    CREATE TABLE t1(a INTEGER PRIMARY KEY, b INT);
+    CREATE TABLE t2(id INT, multiplier INT);
+    CREATE TABLE t3(ref_id INT, bonus INT);
+    INSERT INTO t1 VALUES(1,0),(2,0),(3,0);
+    INSERT INTO t2 VALUES(1,2),(2,3);
+    INSERT INTO t3 VALUES(1,5),(2,10),(3,15);
+    UPDATE t1 SET b = (SELECT t3.bonus FROM t3 WHERE t3.ref_id = t2.id) FROM t2 WHERE t2.id = t1.a;
+    SELECT * FROM t1 ORDER BY a;
+}
+expect {
+    1|5
+    2|10
+    3|0
+}
+
+# Scalar subquery referencing FROM + third table
+@cross-check-integrity
+test update-from-nested-join-subquery {
+    CREATE TABLE t1(a INTEGER PRIMARY KEY, b INT);
+    CREATE TABLE t2(id INT, group_id INT);
+    CREATE TABLE t3(group_id INT, value INT);
+    INSERT INTO t1 VALUES(1,0),(2,0);
+    INSERT INTO t2 VALUES(1,10),(2,20);
+    INSERT INTO t3 VALUES(10,1000),(20,2000);
+    UPDATE t1 SET b = (SELECT t3.value FROM t3 WHERE t3.group_id = t2.group_id)
+    FROM t2 WHERE t2.id = t1.a;
+    SELECT * FROM t1 ORDER BY a;
+}
+expect {
+    1|1000
+    2|2000
+}
+
+# Deeply nested join chain (4 FROM tables)
+@cross-check-integrity
+test update-from-deep-join-chain {
+    CREATE TABLE t1(a INTEGER PRIMARY KEY, b TEXT);
+    CREATE TABLE j1(id INT, v1 TEXT);
+    CREATE TABLE j2(id INT, v2 TEXT);
+    CREATE TABLE j3(id INT, v3 TEXT);
+    CREATE TABLE j4(id INT, v4 TEXT);
+    INSERT INTO t1 VALUES(1,'a'),(2,'b');
+    INSERT INTO j1 VALUES(1,'j1_1'),(2,'j1_2');
+    INSERT INTO j2 VALUES(1,'j2_1'),(2,'j2_2');
+    INSERT INTO j3 VALUES(1,'j3_1'),(2,'j3_2');
+    INSERT INTO j4 VALUES(1,'j4_1'),(2,'j4_2');
+    UPDATE t1 SET b = j1.v1 || ',' || j2.v2 || ',' || j3.v3 || ',' || j4.v4
+    FROM j1 JOIN j2 ON j1.id = j2.id JOIN j3 ON j2.id = j3.id JOIN j4 ON j3.id = j4.id
+    WHERE j1.id = t1.a;
+    SELECT * FROM t1 ORDER BY a;
+}
+expect {
+    1|j1_1,j2_1,j3_1,j4_1
+    2|j1_2,j2_2,j3_2,j4_2
+}
+
+# FROM subquery with LIMIT
+@cross-check-integrity
+test update-from-subquery-with-limit {
+    CREATE TABLE t1(a INTEGER PRIMARY KEY, b TEXT);
+    CREATE TABLE t2(id INT, val TEXT);
+    INSERT INTO t1 VALUES(1,'a'),(2,'b'),(3,'c');
+    INSERT INTO t2 VALUES(1,'X'),(2,'Y'),(3,'Z');
+    UPDATE t1 SET b = sub.val
+    FROM (SELECT id, val FROM t2 ORDER BY id LIMIT 2) AS sub
+    WHERE sub.id = t1.a;
+    SELECT * FROM t1 ORDER BY a;
+}
+expect {
+    1|X
+    2|Y
+    3|c
+}
+
+# CASE expression with FROM columns
+@cross-check-integrity
+test update-from-case-expression {
+    CREATE TABLE t1(a INTEGER PRIMARY KEY, b TEXT);
+    CREATE TABLE t2(id INT, val TEXT);
+    INSERT INTO t1 VALUES(1,'a'),(2,'b'),(3,'c');
+    INSERT INTO t2 VALUES(1,'X'),(2,'Y'),(3,'Z');
+    UPDATE t1 SET b = CASE WHEN t2.val = 'X' THEN 'matched_x' WHEN t2.val = 'Y' THEN 'matched_y' ELSE 'other' END
+    FROM t2 WHERE t2.id = t1.a;
+    SELECT * FROM t1 ORDER BY a;
+}
+expect {
+    1|matched_x
+    2|matched_y
+    3|other
+}
+
+# Mixed target+source in SET expression
+@cross-check-integrity
+test update-from-mixed-target-source-set {
+    CREATE TABLE t1(a INTEGER PRIMARY KEY, b INT, c TEXT);
+    CREATE TABLE t2(id INT, factor INT);
+    INSERT INTO t1 VALUES(1,10,'x'),(2,20,'y'),(3,30,'z');
+    INSERT INTO t2 VALUES(1,2),(2,3);
+    UPDATE t1 SET b = t1.b * t2.factor, c = t1.c || cast(t2.factor as text) FROM t2 WHERE t2.id = t1.a;
+    SELECT * FROM t1 ORDER BY a;
+}
+expect {
+    1|20|x2
+    2|60|y3
+    3|30|z
+}
+
+# Multiple FROM tables (comma-join)
+@cross-check-integrity
+test update-from-multi-tables {
+    CREATE TABLE t1(a INTEGER PRIMARY KEY, b TEXT, c INT);
+    CREATE TABLE t2(id INT, name TEXT);
+    CREATE TABLE t3(id INT, score INT);
+    INSERT INTO t1 VALUES(1,'a',0),(2,'b',0),(3,'c',0);
+    INSERT INTO t2 VALUES(1,'alpha'),(2,'beta');
+    INSERT INTO t3 VALUES(1,100),(2,200);
+    UPDATE t1 SET b = t2.name, c = t3.score FROM t2, t3 WHERE t2.id = t1.a AND t3.id = t1.a;
+    SELECT * FROM t1 ORDER BY a;
+}
+expect {
+    1|alpha|100
+    2|beta|200
+    3|c|0
+}
+
+# GROUP_CONCAT in FROM subquery
+@cross-check-integrity
+test update-from-group-concat {
+    CREATE TABLE t1(a INTEGER PRIMARY KEY, b TEXT);
+    CREATE TABLE t2(grp INT, item TEXT);
+    INSERT INTO t1 VALUES(1,''),(2,''),(3,'');
+    INSERT INTO t2 VALUES(1,'a'),(1,'b'),(1,'c'),(2,'x'),(2,'y'),(3,'z');
+    UPDATE t1 SET b = src.items
+    FROM (SELECT grp, GROUP_CONCAT(item, ',') as items FROM t2 GROUP BY grp) AS src
+    WHERE src.grp = t1.a;
+    SELECT * FROM t1 ORDER BY a;
+}
+expect {
+    1|a,b,c
+    2|x,y
+    3|z
+}
+
+# Complex multi-column expression update
+@cross-check-integrity
+test update-from-complex-multi-col {
+    CREATE TABLE t1(a INTEGER PRIMARY KEY, b TEXT, c INT, d REAL);
+    CREATE TABLE t2(id INT, category TEXT, weight REAL);
+    INSERT INTO t1 VALUES(1,'alpha',10,1.1),(2,'beta',20,2.2),(3,'gamma',30,3.3);
+    INSERT INTO t2 VALUES(1,'A',0.5),(2,'B',1.5),(3,'A',2.5);
+    UPDATE t1 SET
+      b = CASE t2.category
+        WHEN 'A' THEN upper(t1.b)
+        WHEN 'B' THEN lower(t1.b)
+        ELSE t1.b
+      END,
+      c = CAST(t1.c * t2.weight AS INT),
+      d = ROUND(t1.d + t2.weight, 2)
+    FROM t2 WHERE t2.id = t1.a;
+    SELECT * FROM t1 ORDER BY a;
+}
+expect {
+    1|ALPHA|5|1.6
+    2|beta|30|3.7
+    3|GAMMA|75|5.8
+}
+
+# Sequential UPDATE FROMs building on each other
+@cross-check-integrity
+test update-from-sequential-visibility {
+    CREATE TABLE t1(a INTEGER PRIMARY KEY, b INT, c TEXT);
+    CREATE TABLE t2(id INT, val INT);
+    INSERT INTO t1 VALUES(1,0,'a'),(2,0,'b'),(3,0,'c');
+    INSERT INTO t2 VALUES(1,100),(2,200),(3,300);
+    BEGIN;
+    UPDATE t1 SET b = t2.val FROM t2 WHERE t2.id = t1.a;
+    UPDATE t1 SET c = 'updated_' || t1.b FROM t2 WHERE t2.id = t1.a;
+    COMMIT;
+    SELECT * FROM t1 ORDER BY a;
+}
+expect {
+    1|100|updated_100
+    2|200|updated_200
+    3|300|updated_300
+}
+
+# Repeated UPDATE FROMs accumulating changes
+@cross-check-integrity
+test update-from-repeated-accumulate {
+    CREATE TABLE t1(a INTEGER PRIMARY KEY, b INT);
+    CREATE TABLE deltas(id INT, delta INT);
+    INSERT INTO t1 VALUES(1,0),(2,0),(3,0);
+    INSERT INTO deltas VALUES(1,1),(2,2),(3,3);
+    UPDATE t1 SET b = t1.b + deltas.delta FROM deltas WHERE deltas.id = t1.a;
+    UPDATE t1 SET b = t1.b + deltas.delta FROM deltas WHERE deltas.id = t1.a;
+    UPDATE t1 SET b = t1.b + deltas.delta FROM deltas WHERE deltas.id = t1.a;
+    SELECT * FROM t1 ORDER BY a;
+}
+expect {
+    1|3
+    2|6
+    3|9
+}
+
+# LIKE in join condition
+@cross-check-integrity
+test update-from-like-join {
+    CREATE TABLE t1(a INTEGER PRIMARY KEY, b TEXT, c TEXT);
+    CREATE TABLE t2(pattern TEXT, replacement TEXT);
+    INSERT INTO t1 VALUES(1,'hello','old'),(2,'world','old'),(3,'help','old');
+    INSERT INTO t2 VALUES('hel%','matched');
+    UPDATE t1 SET c = t2.replacement FROM t2 WHERE t1.b LIKE t2.pattern;
+    SELECT * FROM t1 ORDER BY a;
+}
+expect {
+    1|hello|matched
+    2|world|old
+    3|help|matched
+}
+
+# NATURAL JOIN of same table is OK when all joins are NATURAL
+@cross-check-integrity
+test update-from-double-natural-join-ok {
+    CREATE TABLE t1(a INTEGER PRIMARY KEY, b TEXT);
+    CREATE TABLE s1(x INT, y TEXT);
+    CREATE TABLE s2(x INT, z TEXT);
+    CREATE TABLE s3(x INT, w TEXT);
+    INSERT INTO t1 VALUES(1,'orig');
+    INSERT INTO s1 VALUES(1,'s1');
+    INSERT INTO s2 VALUES(1,'s2');
+    INSERT INTO s3 VALUES(1,'s3');
+    UPDATE t1 SET b = s1.y FROM s1 NATURAL JOIN s2 NATURAL JOIN s3 WHERE s1.x = t1.a;
+    SELECT * FROM t1;
+}
+expect {
+    1|s1
+}
+
+# Multiple USING columns
+@cross-check-integrity
+test update-from-multi-using-cols {
+    CREATE TABLE t1(a INTEGER PRIMARY KEY, b TEXT);
+    CREATE TABLE t2(x INT, y INT, val TEXT);
+    CREATE TABLE t3(x INT, y INT, extra TEXT);
+    INSERT INTO t1 VALUES(1,'a'),(2,'b');
+    INSERT INTO t2 VALUES(1,10,'X'),(2,20,'Y');
+    INSERT INTO t3 VALUES(1,10,'E1'),(2,20,'E2');
+    UPDATE t1 SET b = t2.val || t3.extra FROM t2 JOIN t3 USING(x, y) WHERE t2.x = t1.a;
+    SELECT * FROM t1 ORDER BY a;
+}
+expect {
+    1|XE1
+    2|YE2
+}
+
+# LEFT JOIN in FROM with COALESCE
+@cross-check-integrity
+test update-from-left-join-coalesce {
+    CREATE TABLE t1(a INTEGER PRIMARY KEY, b TEXT);
+    CREATE TABLE t2(id INT, x TEXT);
+    CREATE TABLE t3(id INT, y TEXT);
+    INSERT INTO t1 VALUES(1,'orig');
+    INSERT INTO t2 VALUES(1,'X1');
+    INSERT INTO t3 VALUES(1,'Y1'),(2,'Y2');
+    UPDATE t1 SET b = COALESCE(t2.x, '') || COALESCE(t3.y, '')
+    FROM t2 LEFT JOIN t3 ON t2.id = t3.id WHERE t2.id = t1.a;
+    SELECT * FROM t1;
+}
+expect {
+    1|X1Y1
+}
+
+# Mixed types from UNION subquery
+@cross-check-integrity
+test update-from-mixed-types-union {
+    CREATE TABLE t1(a INTEGER PRIMARY KEY, b);
+    INSERT INTO t1 VALUES(1,NULL),(2,NULL),(3,NULL);
+    UPDATE t1 SET b = src.val
+    FROM (SELECT 1 as id, 42 as val UNION ALL SELECT 2, 'text' UNION ALL SELECT 3, 3.14) AS src
+    WHERE src.id = t1.a;
+    SELECT a, b, typeof(b) FROM t1 ORDER BY a;
+}
+expect {
+    1|42|integer
+    2|text|text
+    3|3.14|real
+}
+
+# All value types through UPDATE FROM
+@cross-check-integrity
+test update-from-all-types {
+    CREATE TABLE t1(a INTEGER PRIMARY KEY, b);
+    CREATE TABLE t2(id INT, val);
+    INSERT INTO t1 VALUES(1,NULL),(2,NULL),(3,NULL),(4,NULL),(5,NULL);
+    INSERT INTO t2 VALUES(1, 42);
+    INSERT INTO t2 VALUES(2, 3.14);
+    INSERT INTO t2 VALUES(3, 'hello');
+    INSERT INTO t2 VALUES(4, x'DEADBEEF');
+    INSERT INTO t2 VALUES(5, NULL);
+    UPDATE t1 SET b = t2.val FROM t2 WHERE t2.id = t1.a;
+    SELECT a, typeof(b) FROM t1 ORDER BY a;
+}
+expect {
+    1|integer
+    2|real
+    3|text
+    4|blob
+    5|null
+}
+
+# NUMERIC affinity through ephemeral table
+@cross-check-integrity
+test update-from-numeric-affinity {
+    CREATE TABLE t1(a INTEGER PRIMARY KEY, b NUMERIC);
+    CREATE TABLE t2(id INT, val);
+    INSERT INTO t1 VALUES(1,0),(2,0),(3,0);
+    INSERT INTO t2 VALUES(1, '123');
+    INSERT INTO t2 VALUES(2, '12.5');
+    INSERT INTO t2 VALUES(3, 'abc');
+    UPDATE t1 SET b = t2.val FROM t2 WHERE t2.id = t1.a;
+    SELECT a, b, typeof(b) FROM t1 ORDER BY a;
+}
+expect {
+    1|123|integer
+    2|12.5|real
+    3|abc|text
+}
+
+# INTEGER affinity
+@cross-check-integrity
+test update-from-integer-affinity {
+    CREATE TABLE t1(a INTEGER PRIMARY KEY, b INTEGER);
+    CREATE TABLE t2(id INT, val);
+    INSERT INTO t1 VALUES(1,0),(2,0),(3,0);
+    INSERT INTO t2 VALUES(1, 3.0);
+    INSERT INTO t2 VALUES(2, 3.5);
+    INSERT INTO t2 VALUES(3, '42');
+    UPDATE t1 SET b = t2.val FROM t2 WHERE t2.id = t1.a;
+    SELECT a, b, typeof(b) FROM t1 ORDER BY a;
+}
+expect {
+    1|3|integer
+    2|3.5|real
+    3|42|integer
+}
+
+# Trigger (BEFORE + AFTER) with UPDATE FROM
+@cross-check-integrity
+test update-from-before-after-triggers {
+    CREATE TABLE t1(a INTEGER PRIMARY KEY, b TEXT);
+    CREATE TABLE t2(id INT, val TEXT);
+    CREATE TABLE audit(msg TEXT);
+    INSERT INTO t1 VALUES(1,'a'),(2,'b');
+    INSERT INTO t2 VALUES(1,'X'),(2,'Y');
+    CREATE TRIGGER tr_before BEFORE UPDATE ON t1 BEGIN
+      INSERT INTO audit VALUES('before: old=' || OLD.b || ' new=' || NEW.b);
+    END;
+    CREATE TRIGGER tr_after AFTER UPDATE ON t1 BEGIN
+      INSERT INTO audit VALUES('after: old=' || OLD.b || ' new=' || NEW.b);
+    END;
+    UPDATE t1 SET b = t2.val FROM t2 WHERE t2.id = t1.a;
+    SELECT * FROM t1 ORDER BY a;
+    SELECT * FROM audit ORDER BY rowid;
+}
+expect {
+    1|X
+    2|Y
+    before: old=a new=X
+    after: old=a new=X
+    before: old=b new=Y
+    after: old=b new=Y
+}
+
+# Trigger doing cascading UPDATE
+@cross-check-integrity
+test update-from-trigger-cascading-update {
+    CREATE TABLE t1(a INTEGER PRIMARY KEY, b INT);
+    CREATE TABLE t2(id INT, val INT);
+    CREATE TABLE t3(x INT);
+    INSERT INTO t1 VALUES(1,10),(2,20),(3,30);
+    INSERT INTO t2 VALUES(1,100);
+    INSERT INTO t3 VALUES(0);
+    CREATE TRIGGER tr AFTER UPDATE ON t1 BEGIN
+      UPDATE t3 SET x = x + 1;
+    END;
+    UPDATE t1 SET b = t2.val FROM t2 WHERE t2.id = t1.a;
+    SELECT * FROM t1 ORDER BY a;
+    SELECT * FROM t3;
+}
+expect {
+    1|100
+    2|20
+    3|30
+    1
+}
+
+# FK cascade via UPDATE FROM
+@cross-check-integrity
+test update-from-fk-cascade-extra {
+    CREATE TABLE parent(id INTEGER PRIMARY KEY, name TEXT);
+    CREATE TABLE child(id INTEGER PRIMARY KEY, pid INTEGER REFERENCES parent(id) ON UPDATE CASCADE, val TEXT);
+    CREATE TABLE src(old_id INTEGER, new_id INTEGER);
+    INSERT INTO parent VALUES(1,'p1'),(2,'p2');
+    INSERT INTO child VALUES(10,1,'c1'),(20,2,'c2');
+    INSERT INTO src VALUES(1,100);
+    PRAGMA foreign_keys = ON;
+    UPDATE parent SET id = src.new_id FROM src WHERE src.old_id = parent.id;
+    SELECT * FROM parent ORDER BY id;
+    SELECT * FROM child ORDER BY id;
+}
+expect {
+    2|p2
+    100|p1
+    10|100|c1
+    20|2|c2
+}
+
+# Savepoint + rollback
+@cross-check-integrity
+test update-from-savepoint-rollback {
+    CREATE TABLE t1(a INTEGER PRIMARY KEY, b TEXT);
+    CREATE TABLE t2(id INT, val TEXT);
+    INSERT INTO t1 VALUES(1,'a'),(2,'b');
+    INSERT INTO t2 VALUES(1,'X'),(2,'Y');
+    SAVEPOINT sp1;
+    UPDATE t1 SET b = t2.val FROM t2 WHERE t2.id = t1.a;
+    ROLLBACK TO sp1;
+    SELECT * FROM t1 ORDER BY a;
+    RELEASE sp1;
+}
+expect {
+    1|a
+    2|b
+}
+
+# WHERE 0 should match nothing
+@cross-check-integrity
+test update-from-where-false {
+    CREATE TABLE t1(a INTEGER PRIMARY KEY, b TEXT);
+    CREATE TABLE t2(id INT, val TEXT);
+    INSERT INTO t1 VALUES(1,'a'),(2,'b'),(3,'c');
+    INSERT INTO t2 VALUES(1,'X'),(2,'Y'),(3,'Z');
+    UPDATE t1 SET b = t2.val FROM t2 WHERE 0;
+    SELECT * FROM t1 ORDER BY a;
+}
+expect {
+    1|a
+    2|b
+    3|c
+}
+
+# json_extract in SET
+@cross-check-integrity
+test update-from-json-extract {
+    CREATE TABLE t1(a INTEGER PRIMARY KEY, b TEXT);
+    CREATE TABLE t2(id INT, data TEXT);
+    INSERT INTO t1 VALUES(1,'old'),(2,'old');
+    INSERT INTO t2 VALUES(1,'{"name":"hello"}'),(2,'{"name":"world"}');
+    UPDATE t1 SET b = json_extract(t2.data, '$.name') FROM t2 WHERE t2.id = t1.a;
+    SELECT * FROM t1 ORDER BY a;
+}
+expect {
+    1|hello
+    2|world
+}
+
+# === Adversarial bughunt regressions (hunt summary: 435+ scenarios, no bugs). ===
+# These verify invariants that are specifically load-bearing for UPDATE…FROM.
+
+# Multi-match with an accumulating SET expression: the SET RHS is evaluated
+# from the pre-update (snapshot) row image, so multiple matches do NOT each
+# re-increment. All matches write the same pre-image calculation.
+@cross-check-integrity
+test update-from-snapshot-accumulate-stays-one {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, cnt INTEGER);
+    CREATE TABLE s(id INTEGER);
+    INSERT INTO t VALUES(1,0),(2,0);
+    INSERT INTO s VALUES(1),(1),(1),(2);
+    UPDATE t SET cnt = cnt + 1 FROM s WHERE t.id = s.id;
+    SELECT * FROM t ORDER BY id;
+}
+expect {
+    1|1
+    2|1
+}
+
+# BEFORE UPDATE trigger that RAISE(IGNORE)s based on NEW values skips
+# individual rows; other matched rows still update normally.
+@cross-check-integrity
+test update-from-before-trigger-raise-ignore-conditional {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, v INTEGER);
+    CREATE TABLE s(id INTEGER, v INTEGER);
+    INSERT INTO t VALUES(1,0),(2,0),(3,0);
+    INSERT INTO s VALUES(1,100),(2,200),(3,300);
+    CREATE TRIGGER trg BEFORE UPDATE ON t FOR EACH ROW WHEN NEW.v > 150 AND NEW.v < 250 BEGIN
+      SELECT RAISE(IGNORE);
+    END;
+    UPDATE t SET v = s.v FROM s WHERE t.id = s.id;
+    SELECT * FROM t ORDER BY id;
+}
+expect {
+    1|100
+    2|0
+    3|300
+}
+
+# A trigger that deletes rows from the source mid-update must not affect the
+# already-materialized write set: both target rows still update.
+@cross-check-integrity
+test update-from-trigger-deletes-source-mid-flight {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, v INTEGER);
+    CREATE TABLE s(id INTEGER, v INTEGER);
+    INSERT INTO t VALUES(1,10),(2,20);
+    INSERT INTO s VALUES(1,100),(2,200);
+    CREATE TRIGGER trg BEFORE UPDATE ON t FOR EACH ROW BEGIN
+      DELETE FROM s;
+    END;
+    UPDATE t SET v = s.v FROM s WHERE t.id = s.id;
+    SELECT 't'; SELECT * FROM t ORDER BY id;
+    SELECT 's'; SELECT count(*) FROM s;
+}
+expect {
+    t
+    1|100
+    2|200
+    s
+    0
+}
+
+# A trigger that inserts new target rows during the write phase does NOT
+# observe those inserts as new join matches: the write set is frozen.
+@cross-check-integrity
+test update-from-trigger-inserts-target-not-matched {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, v INTEGER);
+    CREATE TABLE s(id INTEGER, v INTEGER);
+    INSERT INTO t VALUES(1,10);
+    INSERT INTO s VALUES(1,100),(2,200);
+    CREATE TRIGGER trg AFTER UPDATE ON t FOR EACH ROW BEGIN
+      INSERT INTO t(id, v) VALUES(2, 0);
+    END;
+    UPDATE t SET v = s.v FROM s WHERE t.id = s.id;
+    SELECT * FROM t ORDER BY id;
+}
+expect {
+    1|100
+    2|0
+}
+
+# GLOB pattern as the join predicate.
+@cross-check-integrity
+test update-from-glob-pattern-join {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT);
+    CREATE TABLE s(pat TEXT, newv TEXT);
+    INSERT INTO t VALUES(1,'foo1'),(2,'bar2'),(3,'foo3');
+    INSERT INTO s VALUES('foo*','F'),('bar*','B');
+    UPDATE t SET v = s.newv FROM s WHERE t.v GLOB s.pat;
+    SELECT * FROM t ORDER BY id;
+}
+expect {
+    1|F
+    2|B
+    3|F
+}
+
+# LIKE … ESCAPE with the source supplying the pattern.
+@cross-check-integrity
+test update-from-like-escape-join {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT);
+    CREATE TABLE s(p TEXT, newv TEXT);
+    INSERT INTO t VALUES(1,'x%y'),(2,'x_y'),(3,'xAy');
+    INSERT INTO s VALUES('x\%y','escaped-percent');
+    UPDATE t SET v = s.newv FROM s WHERE t.v LIKE s.p ESCAPE '\';
+    SELECT * FROM t ORDER BY id;
+}
+expect {
+    1|escaped-percent
+    2|x_y
+    3|xAy
+}
+
+# Row-value equality as the join predicate: (t.a, t.b) = (s.a, s.b).
+@cross-check-integrity
+test update-from-row-value-equality-join {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, a INTEGER, b INTEGER, v INTEGER);
+    CREATE TABLE s(a INTEGER, b INTEGER, newv INTEGER);
+    INSERT INTO t VALUES(1,1,2,10),(2,3,4,20),(3,5,6,30);
+    INSERT INTO s VALUES(1,2,100),(3,4,200);
+    UPDATE t SET v = s.newv FROM s WHERE (t.a, t.b) = (s.a, s.b);
+    SELECT * FROM t ORDER BY id;
+}
+expect {
+    1|1|2|100
+    2|3|4|200
+    3|5|6|30
+}
+
+# IS NOT DISTINCT FROM is NULL-safe: NULL=NULL matches in the join.
+@cross-check-integrity
+test update-from-is-not-distinct-from-join {
+    CREATE TABLE t(id INTEGER, v INTEGER);
+    CREATE TABLE s(id INTEGER, v INTEGER);
+    INSERT INTO t VALUES(1,10),(NULL,20),(2,30);
+    INSERT INTO s VALUES(1,100),(NULL,999),(2,200);
+    UPDATE t SET v = s.v FROM s WHERE t.id IS NOT DISTINCT FROM s.id;
+    SELECT coalesce(id,-1), v FROM t ORDER BY coalesce(id,-1);
+}
+expect {
+    -1|999
+    1|100
+    2|200
+}
+
+# A table-valued function (pragma_table_info) can serve as the FROM source.
+@cross-check-integrity
+test update-from-pragma-table-info-source {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, colname TEXT);
+    INSERT INTO t VALUES(0,''),(1,'');
+    UPDATE t SET colname = pi.name FROM pragma_table_info('t') AS pi WHERE t.id = pi.cid;
+    SELECT * FROM t ORDER BY id;
+}
+expect {
+    0|id
+    1|colname
+}
+
+# Source rowid in the SET RHS expression.
+@cross-check-integrity
+test update-from-source-rowid-in-set-expr {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, v INTEGER);
+    CREATE TABLE s(v INTEGER);
+    INSERT INTO t VALUES(1,10),(2,20),(3,30);
+    INSERT INTO s VALUES(100),(200),(300);
+    UPDATE t SET v = s.v + s.rowid * 1000 FROM s WHERE t.id = s.rowid;
+    SELECT * FROM t ORDER BY id;
+}
+expect {
+    1|1100
+    2|2200
+    3|3300
+}
+
+# Explicit CROSS JOIN syntax in the FROM clause.
+@cross-check-integrity
+test update-from-explicit-cross-join {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, v INTEGER);
+    CREATE TABLE a(id INTEGER, x INTEGER);
+    CREATE TABLE b(id INTEGER, y INTEGER);
+    INSERT INTO t VALUES(1,10),(2,20);
+    INSERT INTO a VALUES(1,1),(2,2);
+    INSERT INTO b VALUES(1,10),(2,20);
+    UPDATE t SET v = a.x + b.y FROM a CROSS JOIN b WHERE a.id = t.id AND b.id = t.id;
+    SELECT * FROM t ORDER BY id;
+}
+expect {
+    1|11
+    2|22
+}
+
+# BETWEEN with source-side bounds as the join predicate.
+@cross-check-integrity
+test update-from-between-source-bounds {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, v INTEGER);
+    CREATE TABLE s(lo INTEGER, hi INTEGER, delta INTEGER);
+    INSERT INTO t VALUES(5,0),(10,0),(15,0),(20,0);
+    INSERT INTO s VALUES(0,9,1),(10,19,5),(20,29,10);
+    UPDATE t SET v = v + s.delta FROM s WHERE t.id BETWEEN s.lo AND s.hi;
+    SELECT * FROM t ORDER BY id;
+}
+expect {
+    5|1
+    10|5
+    15|5
+    20|10
+}
+
+# Chain rowid remap (5→8, 6→5, 7→6) — each update observes the pre-update
+# target rowid image; no intermediate collision.
+@cross-check-integrity
+test update-from-chain-rowid-remap {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, v INTEGER);
+    CREATE TABLE s(old INTEGER, newk INTEGER);
+    INSERT INTO t VALUES(5,5),(6,6),(7,7);
+    INSERT INTO s VALUES(5,8),(6,5),(7,6);
+    UPDATE t SET id = s.newk FROM s WHERE t.id = s.old;
+    SELECT * FROM t ORDER BY id;
+}
+expect {
+    5|6
+    6|7
+    8|5
+}
+
+# Setting the rowid alias AND another column together in one UPDATE FROM.
+@cross-check-integrity
+test update-from-rowid-alias-plus-column {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, v INTEGER);
+    CREATE TABLE s(old INTEGER, newk INTEGER, newv INTEGER);
+    INSERT INTO t VALUES(1,10),(2,20);
+    INSERT INTO s VALUES(1,100,1000);
+    UPDATE t SET id = s.newk, v = s.newv FROM s WHERE t.id = s.old;
+    SELECT * FROM t ORDER BY id;
+}
+expect {
+    2|20
+    100|1000
+}
+
+# OR IGNORE with multi-match where each target's intended value conflicts
+# with another target's current (pre-update) unique value: SQLite leaves
+# all rows untouched because per-row IGNORE is a no-op at the statement
+# level when none of the applied SETs ever commits successfully under
+# write-set semantics.
+@cross-check-integrity
+test update-from-or-ignore-mutual-unique-conflict {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, u INTEGER UNIQUE);
+    CREATE TABLE s(id INTEGER, u INTEGER);
+    INSERT INTO t VALUES(1,10),(2,20),(3,30);
+    INSERT INTO s VALUES(1,20),(2,10);
+    UPDATE OR IGNORE t SET u = s.u FROM s WHERE t.id = s.id;
+    SELECT * FROM t ORDER BY id;
+}
+expect {
+    1|10
+    2|20
+    3|30
+}
+
+# BEFORE UPDATE trigger observes NEW.<col> as the source-provided value.
+@cross-check-integrity
+test update-from-before-trigger-new-is-source-value {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, v INTEGER);
+    CREATE TABLE s(id INTEGER, v INTEGER);
+    CREATE TABLE log(id INTEGER, oldv INTEGER, newv INTEGER);
+    INSERT INTO t VALUES(1,10),(2,20);
+    INSERT INTO s VALUES(1,100),(2,200);
+    CREATE TRIGGER trg BEFORE UPDATE ON t FOR EACH ROW BEGIN
+      INSERT INTO log VALUES(OLD.id, OLD.v, NEW.v);
+    END;
+    UPDATE t SET v = s.v FROM s WHERE t.id = s.id;
+    SELECT * FROM log ORDER BY id;
+}
+expect {
+    1|10|100
+    2|20|200
+}
+
+# LEFT JOIN in the source where the right side is absent: SET expression
+# sees NULL on the FROM side and coalesces to a target-derived default.
+@cross-check-integrity
+test update-from-left-join-null-in-set {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, v INTEGER);
+    CREATE TABLE a(id INTEGER);
+    CREATE TABLE b(id INTEGER, v INTEGER);
+    INSERT INTO t VALUES(1,10),(2,20);
+    INSERT INTO a VALUES(1),(2);
+    INSERT INTO b VALUES(1,100);
+    UPDATE t SET v = coalesce(b.v, -1) FROM a LEFT JOIN b ON a.id = b.id WHERE t.id = a.id;
+    SELECT * FROM t ORDER BY id;
+}
+expect {
+    1|100
+    2|-1
+}
+
+# Cascade of AFTER-UPDATE triggers: UPDATE FROM on t fires trg_t which
+# updates u, which fires trg_u which updates w.
+@cross-check-integrity
+test update-from-cascade-afters-through-three-tables {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, v INTEGER);
+    CREATE TABLE u(id INTEGER PRIMARY KEY, v INTEGER);
+    CREATE TABLE w(id INTEGER PRIMARY KEY, v INTEGER);
+    CREATE TABLE s(id INTEGER, v INTEGER);
+    INSERT INTO t VALUES(1,0);
+    INSERT INTO u VALUES(1,0);
+    INSERT INTO w VALUES(1,0);
+    INSERT INTO s VALUES(1,100);
+    CREATE TRIGGER trg_t AFTER UPDATE ON t BEGIN UPDATE u SET v = NEW.v + 1 WHERE id = NEW.id; END;
+    CREATE TRIGGER trg_u AFTER UPDATE ON u BEGIN UPDATE w SET v = NEW.v + 1 WHERE id = NEW.id; END;
+    UPDATE t SET v = s.v FROM s WHERE t.id = s.id;
+    SELECT 't'; SELECT * FROM t;
+    SELECT 'u'; SELECT * FROM u;
+    SELECT 'w'; SELECT * FROM w;
+}
+expect {
+    t
+    1|100
+    u
+    1|101
+    w
+    1|102
+}
+
+# A CTE that shadows the base source table with a self-reference is a
+# circular CTE and must be rejected at planning time.
+test update-from-cte-shadows-source-is-circular {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, v INTEGER);
+    CREATE TABLE s(id INTEGER, v INTEGER);
+    INSERT INTO t VALUES(1,10);
+    INSERT INTO s VALUES(1,100);
+    WITH s(id, v) AS (SELECT id, v*10 FROM s)
+    UPDATE t SET v = s.v FROM s WHERE t.id = s.id;
+}
+expect error {
+}

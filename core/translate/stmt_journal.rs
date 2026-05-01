@@ -25,7 +25,7 @@ use crate::translate::emitter::Resolver;
 use crate::translate::plan::{DeletePlan, DmlSafetyReason, UpdatePlan};
 use crate::translate::trigger_exec::has_triggers_including_temp;
 use crate::vdbe::builder::ProgramBuilder;
-use crate::{sync::Arc, Connection, HashSet, Result};
+use crate::{sync::Arc, Connection, Result};
 use turso_parser::ast::{ResolveType, TriggerEvent};
 
 /// Check whether any DDL-level constraint (IPK or index) uses REPLACE.
@@ -180,22 +180,17 @@ pub(crate) fn set_update_stmt_journal_flags(
     resolver: &Resolver,
     connection: &crate::sync::Arc<crate::Connection>,
 ) -> Result<()> {
-    // When an ephemeral table is used (key mutation / Halloween protection),
-    // the actual target table is in the ephemeral_plan's table_references.
-    let table_refs = plan
-        .ephemeral_plan
-        .as_ref()
-        .map(|ep| &ep.table_references)
-        .unwrap_or(&plan.table_references);
-    let Some(target_table) = table_refs.joined_tables().first() else {
-        crate::bail_parse_error!("UPDATE should have one target table");
-    };
+    let target_table = &plan.target_table;
     let Some(btree_table) = target_table.btree() else {
         return Ok(()); // Virtual table — keep conservative defaults.
     };
     let database_id = target_table.database_id;
 
-    let updated_cols: HashSet<usize> = plan.set_clauses.iter().map(|(i, _)| *i).collect();
+    let updated_cols = plan
+        .set_clauses
+        .iter()
+        .map(|set_clause| set_clause.column_index)
+        .collect();
     let has_triggers = has_triggers_including_temp(
         resolver,
         database_id,
@@ -223,13 +218,13 @@ pub(crate) fn set_update_stmt_journal_flags(
         program.set_multi_write(false);
     }
 
-    let has_notnull_cols = plan.set_clauses.iter().any(|(col_idx, _)| {
-        if *col_idx == crate::schema::ROWID_SENTINEL {
+    let has_notnull_cols = plan.set_clauses.iter().any(|set_clause| {
+        if set_clause.column_index == crate::schema::ROWID_SENTINEL {
             return false;
         }
         btree_table
-            .columns
-            .get(*col_idx)
+            .columns()
+            .get(set_clause.column_index)
             .is_some_and(|c| c.notnull() && !c.is_rowid_alias())
     });
     let has_check = !btree_table.check_constraints.is_empty();

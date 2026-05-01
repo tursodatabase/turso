@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use sql_generation::model::query::{Create, Insert, Select, predicate::Predicate, update::Update};
 
-use crate::model::Query;
+use crate::model::{Query, QueryDiscriminants};
 
 /// Properties are representations of executable specifications
 /// about the database behavior.
@@ -182,6 +182,15 @@ pub enum Property {
     FaultyQuery {
         query: Query,
     },
+    /// SavepointRollback wraps random write interactions in a named savepoint,
+    /// rolls them back, then checks that the database still matches the shadow
+    /// model. This targets pager/WAL/cache-spill bugs where rolled-back page
+    /// contents remain visible.
+    SavepointRollback {
+        queries: Vec<Query>,
+        tables: Vec<String>,
+        write_kinds: Vec<QueryDiscriminants>,
+    },
     /// Property used to subsititute a property with its queries only
     Queries {
         queries: Vec<Query>,
@@ -210,6 +219,7 @@ impl Property {
                 | Property::DoubleCreateFailure { .. }
                 | Property::DeleteSelect { .. }
                 | Property::DropSelect { .. }
+                | Property::SavepointRollback { .. }
                 | Property::Queries { .. }
         )
     }
@@ -220,6 +230,7 @@ impl Property {
             | Property::DoubleCreateFailure { queries, .. }
             | Property::DeleteSelect { queries, .. }
             | Property::DropSelect { queries, .. }
+            | Property::SavepointRollback { queries, .. }
             | Property::Queries { queries } => Some(queries),
             Property::FsyncNoWait { .. } | Property::FaultyQuery { .. } => None,
             Property::SelectLimit { .. }

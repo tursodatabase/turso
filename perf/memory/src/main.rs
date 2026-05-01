@@ -6,13 +6,18 @@ use std::time::{Duration, Instant};
 use anyhow::Result;
 use clap::{Parser, ValueEnum};
 use profile::{
-    Phase, Profile, WorkItem, insert::InsertHeavy, mixed::Mixed, read::ReadHeavy, scan::ScanHeavy,
+    Phase, Profile, WorkItem, checkpoint::Checkpoint, insert::InsertHeavy, mixed::Mixed,
+    read::ReadHeavy, scan::ScanHeavy, series_blob::SeriesBlob,
 };
 use turso::Connection;
 use turso::params::Params;
 
 use crate::measure::{MemoryReport, MemorySnapshot, file_size, take_snapshot};
 
+// Workspace Clippy runs with `--all-features`, which enables `turso`'s
+// mimalloc-backed global allocator. Skip the benchmark-only dhat allocator
+// under Clippy so the lint build does not try to link two allocators.
+#[cfg(not(clippy))]
 #[global_allocator]
 static ALLOC: dhat::Alloc = dhat::Alloc;
 
@@ -37,6 +42,7 @@ enum WorkloadProfile {
     ReadHeavy,
     Mixed,
     ScanHeavy,
+    SeriesBlob,
 }
 
 impl std::fmt::Display for WorkloadProfile {
@@ -46,6 +52,7 @@ impl std::fmt::Display for WorkloadProfile {
             WorkloadProfile::ReadHeavy => write!(f, "read-heavy"),
             WorkloadProfile::Mixed => write!(f, "mixed"),
             WorkloadProfile::ScanHeavy => write!(f, "scan-heavy"),
+            WorkloadProfile::SeriesBlob => write!(f, "series-blob"),
         }
     }
 }
@@ -92,9 +99,14 @@ struct Args {
     /// Output format
     #[arg(long = "format", default_value = "human")]
     format: OutputFormat,
+
+    /// Run a final checkpoint after the workload completes
+    #[arg(long)]
+    checkpoint: bool,
 }
 
 fn main() -> Result<()> {
+    #[cfg(not(clippy))]
     let _profiler = dhat::Profiler::new_heap();
 
     tracing_subscriber::fmt()
@@ -114,7 +126,12 @@ async fn async_main(args: Args) -> Result<()> {
     let db_path = "memory_benchmark.db";
     clean_db_files(db_path);
 
-    let mut profile = create_profile(args.workload, args.iterations, args.batch_size);
+    let mut profile = create_profile(
+        args.workload,
+        args.iterations,
+        args.batch_size,
+        args.checkpoint,
+    );
     let timeout = Duration::from_millis(args.timeout);
 
     let start = Instant::now();
@@ -161,6 +178,7 @@ async fn async_main(args: Args) -> Result<()> {
             let label = match phase {
                 Phase::Setup => "setup",
                 Phase::Run => "run-start",
+                Phase::Checkpoint => "checkpoint",
                 Phase::Done => unreachable!(),
             };
             snapshots.push(take_snapshot(start, label));
@@ -171,34 +189,44 @@ async fn async_main(args: Args) -> Result<()> {
             continue;
         }
 
-        if phase == Phase::Setup {
-            // Setup runs sequentially on a single connection
-            let items = batches.into_iter().next().unwrap_or_default();
-            if !items.is_empty() {
-                setup_conn.execute("BEGIN", ()).await?;
-                execute_items(&setup_conn, items).await?;
-                setup_conn.execute("COMMIT", ()).await?;
-            }
-        } else {
-            // Run phase: dispatch batches concurrently across connections
-            let mut handles = Vec::with_capacity(batches.len());
-            for items in batches {
-                if items.is_empty() {
-                    continue;
+        match phase {
+            Phase::Setup => {
+                // Setup runs sequentially on a single connection.
+                let items = batches.into_iter().next().unwrap_or_default();
+                if !items.is_empty() {
+                    setup_conn.execute("BEGIN", ()).await?;
+                    execute_items(&setup_conn, items).await?;
+                    setup_conn.execute("COMMIT", ()).await?;
                 }
-                let conn = db.connect()?;
-                conn.busy_timeout(timeout)?;
-                let begin = begin_stmt.to_string();
-                handles.push(tokio::spawn(async move {
-                    conn.execute(&begin, ()).await?;
-                    execute_items(&conn, items).await?;
-                    conn.execute("COMMIT", ()).await?;
-                    Ok::<_, turso::Error>(())
-                }));
             }
-            for handle in handles {
-                handle.await??;
+            Phase::Run => {
+                // Run phase: dispatch batches concurrently across connections.
+                let mut handles = Vec::with_capacity(batches.len());
+                for items in batches {
+                    if items.is_empty() {
+                        continue;
+                    }
+                    let conn = db.connect()?;
+                    conn.busy_timeout(timeout)?;
+                    let begin = begin_stmt.to_string();
+                    handles.push(tokio::spawn(async move {
+                        conn.execute(&begin, ()).await?;
+                        execute_items(&conn, items).await?;
+                        conn.execute("COMMIT", ()).await?;
+                        Ok::<_, turso::Error>(())
+                    }));
+                }
+                for handle in handles {
+                    handle.await??;
+                }
             }
+            Phase::Checkpoint => {
+                let items = batches.into_iter().next().unwrap_or_default();
+                if !items.is_empty() {
+                    execute_checkpoint_items(&setup_conn, items).await?;
+                }
+            }
+            Phase::Done => unreachable!(),
         }
 
         // Track peak
@@ -281,13 +309,34 @@ fn create_profile(
     workload: WorkloadProfile,
     iterations: usize,
     batch_size: usize,
+    checkpoint: bool,
 ) -> Box<dyn Profile> {
-    match workload {
+    let profile: Box<dyn Profile> = match workload {
         WorkloadProfile::InsertHeavy => Box::new(InsertHeavy::new(iterations, batch_size)),
         WorkloadProfile::ReadHeavy => Box::new(ReadHeavy::new(iterations, batch_size)),
         WorkloadProfile::Mixed => Box::new(Mixed::new(iterations, batch_size)),
         WorkloadProfile::ScanHeavy => Box::new(ScanHeavy::new(iterations, batch_size)),
+        WorkloadProfile::SeriesBlob => Box::new(SeriesBlob::new(iterations, batch_size)),
+    };
+
+    if checkpoint {
+        Box::new(Checkpoint::new(profile))
+    } else {
+        profile
     }
+}
+
+async fn execute_checkpoint_items(
+    conn: &Connection,
+    items: Vec<WorkItem>,
+) -> Result<(), turso::Error> {
+    for item in items {
+        let mut rows = conn
+            .query(&item.sql, Params::Positional(item.params))
+            .await?;
+        while rows.next().await?.is_some() {}
+    }
+    Ok(())
 }
 
 fn clean_db_files(db_path: &str) {

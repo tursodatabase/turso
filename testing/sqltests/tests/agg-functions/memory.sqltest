@@ -123,3 +123,349 @@ expect {
     42
 }
 
+
+@cross-check-integrity
+test count-filter-clause {
+    CREATE TABLE todos(id INTEGER PRIMARY KEY, title TEXT, user_id INTEGER);
+    INSERT INTO todos VALUES (1, 'A', 1), (2, 'B', 1), (3, 'C', 2);
+    SELECT COUNT(*) AS total, COUNT(*) FILTER (WHERE user_id = 1) AS user_count FROM todos;
+}
+expect {
+    3|2
+}
+
+# =========================================================================
+# FILTER clause adversarial tests
+# =========================================================================
+
+@cross-check-integrity
+test filter-sum {
+    CREATE TABLE t(x INTEGER, grp TEXT);
+    INSERT INTO t VALUES (10, 'a'), (20, 'a'), (30, 'b'), (40, 'b');
+    SELECT SUM(x), SUM(x) FILTER (WHERE grp = 'a') FROM t;
+}
+expect {
+    100|30
+}
+
+@cross-check-integrity
+test filter-avg {
+    CREATE TABLE t(x INTEGER, grp TEXT);
+    INSERT INTO t VALUES (11, 'a'), (20, 'a'), (30, 'b'), (40, 'b');
+    SELECT AVG(x), AVG(x) FILTER (WHERE grp = 'a') FROM t;
+}
+expect {
+    25.25|15.5
+}
+
+@cross-check-integrity
+test filter-min-max {
+    CREATE TABLE t(x INTEGER, grp TEXT);
+    INSERT INTO t VALUES (10, 'a'), (20, 'a'), (30, 'b'), (40, 'b');
+    SELECT MIN(x) FILTER (WHERE grp = 'b'), MAX(x) FILTER (WHERE grp = 'a') FROM t;
+}
+expect {
+    30|20
+}
+
+@cross-check-integrity
+test filter-total {
+    CREATE TABLE t(x REAL, grp TEXT);
+    INSERT INTO t VALUES (1.5, 'a'), (2.3, 'a'), (3.5, 'b');
+    SELECT TOTAL(x), TOTAL(x) FILTER (WHERE grp = 'a') FROM t;
+}
+expect {
+    7.3|3.8
+}
+
+@cross-check-integrity
+test filter-group-concat {
+    CREATE TABLE t(name TEXT, active INTEGER);
+    INSERT INTO t VALUES ('Alice', 1), ('Bob', 0), ('Carol', 1), ('Dave', 0);
+    SELECT GROUP_CONCAT(name), GROUP_CONCAT(name) FILTER (WHERE active = 1) FROM t;
+}
+expect {
+    Alice,Bob,Carol,Dave|Alice,Carol
+}
+
+@cross-check-integrity
+test filter-with-group-by {
+    CREATE TABLE t(x INTEGER, grp TEXT, flag INTEGER);
+    INSERT INTO t VALUES (1, 'a', 1), (2, 'a', 0), (3, 'b', 1), (4, 'b', 1);
+    SELECT grp, COUNT(*), COUNT(*) FILTER (WHERE flag = 1) FROM t GROUP BY grp;
+}
+expect {
+    a|2|1
+    b|2|2
+}
+
+@cross-check-integrity
+test filter-multiple-different-conditions {
+    CREATE TABLE t(val INTEGER, cat TEXT);
+    INSERT INTO t VALUES (1, 'x'), (2, 'y'), (4, 'x'), (5, 'y'), (7, 'x');
+    SELECT
+        COUNT(*) FILTER (WHERE cat = 'x'),
+        COUNT(*) FILTER (WHERE cat = 'y'),
+        SUM(val) FILTER (WHERE val > 2),
+        AVG(val) FILTER (WHERE val <= 2)
+    FROM t;
+}
+expect {
+    3|2|16|1.5
+}
+
+@cross-check-integrity
+test filter-all-rows-filtered-out {
+    CREATE TABLE t(x INTEGER);
+    INSERT INTO t VALUES (1), (2), (3);
+    SELECT COUNT(*) FILTER (WHERE x > 100), SUM(x) FILTER (WHERE x > 100) FROM t;
+}
+expect {
+    0|
+}
+
+@cross-check-integrity
+test filter-on-empty-table {
+    CREATE TABLE t(x INTEGER);
+    SELECT COUNT(*) FILTER (WHERE x > 0), SUM(x) FILTER (WHERE x > 0) FROM t;
+}
+expect {
+    0|
+}
+
+@cross-check-integrity
+test filter-null-in-condition {
+    CREATE TABLE t(x INTEGER, y INTEGER);
+    INSERT INTO t VALUES (1, NULL), (2, 1), (3, NULL), (4, 1);
+    SELECT COUNT(*) FILTER (WHERE y = 1), COUNT(*) FILTER (WHERE y IS NULL) FROM t;
+}
+expect {
+    2|2
+}
+
+@cross-check-integrity
+test filter-with-having {
+    CREATE TABLE t(x INTEGER, grp TEXT, flag INTEGER);
+    INSERT INTO t VALUES (1, 'a', 1), (2, 'a', 0), (3, 'a', 1),
+                         (4, 'b', 0), (5, 'b', 0);
+    SELECT grp, COUNT(*) FILTER (WHERE flag = 1) AS cnt FROM t GROUP BY grp HAVING cnt > 0;
+}
+expect {
+    a|2
+}
+
+@cross-check-integrity
+test filter-same-agg-different-filters {
+    CREATE TABLE t(x INTEGER);
+    INSERT INTO t VALUES (1), (2), (3), (4), (5);
+    SELECT
+        SUM(x) FILTER (WHERE x <= 2),
+        SUM(x) FILTER (WHERE x >= 4),
+        SUM(x) FILTER (WHERE x = 3)
+    FROM t;
+}
+expect {
+    3|9|3
+}
+
+@cross-check-integrity
+test filter-with-expression-condition {
+    CREATE TABLE t(x INTEGER, y INTEGER);
+    INSERT INTO t VALUES (1, 10), (2, 20), (3, 30), (4, 40);
+    SELECT COUNT(*) FILTER (WHERE x + y > 25), SUM(x) FILTER (WHERE y / 10 = x) FROM t;
+}
+expect {
+    2|10
+}
+
+@cross-check-integrity
+test filter-with-distinct-agg {
+    CREATE TABLE t(x INTEGER, grp TEXT);
+    INSERT INTO t VALUES (1, 'a'), (1, 'a'), (2, 'a'), (2, 'b'), (3, 'b');
+    SELECT COUNT(DISTINCT x), COUNT(DISTINCT x) FILTER (WHERE grp = 'a') FROM t;
+}
+expect {
+    3|2
+}
+
+@cross-check-integrity
+test filter-mixed-agg-and-nonagg {
+    CREATE TABLE t(x INTEGER, grp TEXT);
+    INSERT INTO t VALUES (10, 'a'), (20, 'b'), (30, 'a');
+    SELECT COUNT(*), SUM(x) FILTER (WHERE grp = 'a'), MAX(x) FROM t;
+}
+expect {
+    3|40|30
+}
+
+@cross-check-integrity
+test filter-with-case-condition {
+    CREATE TABLE t(x INTEGER, status TEXT);
+    INSERT INTO t VALUES (1, 'active'), (2, 'inactive'), (3, 'active'), (4, NULL);
+    SELECT COUNT(*) FILTER (WHERE CASE WHEN status = 'active' THEN 1 ELSE 0 END) FROM t;
+}
+expect {
+    2
+}
+
+@cross-check-integrity
+test filter-with-subquery-in-condition {
+    CREATE TABLE t(x INTEGER);
+    INSERT INTO t VALUES (1), (2), (3), (4), (5);
+    SELECT COUNT(*) FILTER (WHERE x > (SELECT AVG(x) FROM t)) FROM t;
+}
+expect {
+    2
+}
+
+@cross-check-integrity
+test filter-group-by-multiple-groups {
+    CREATE TABLE t(val INTEGER, a TEXT, b TEXT);
+    INSERT INTO t VALUES (1, 'x', 'p'), (2, 'x', 'q'), (3, 'y', 'p'), (4, 'y', 'q');
+    SELECT a, SUM(val), SUM(val) FILTER (WHERE b = 'p') FROM t GROUP BY a;
+}
+expect {
+    x|3|1
+    y|7|3
+}
+
+@cross-check-integrity
+test filter-with-order-by-on-agg {
+    CREATE TABLE t(x INTEGER, grp TEXT);
+    INSERT INTO t VALUES (1, 'a'), (2, 'b'), (3, 'a'), (4, 'b'), (5, 'a');
+    SELECT grp, SUM(x) FILTER (WHERE x > 1) AS s FROM t GROUP BY grp ORDER BY s;
+}
+expect {
+    b|6
+    a|8
+}
+
+@cross-check-integrity
+test filter-boolean-condition {
+    CREATE TABLE t(x INTEGER, flag INTEGER);
+    INSERT INTO t VALUES (10, 1), (20, 0), (30, 1), (40, 0);
+    SELECT SUM(x) FILTER (WHERE flag) FROM t;
+}
+expect {
+    40
+}
+
+@cross-check-integrity
+test filter-negative-values {
+    CREATE TABLE t(x INTEGER, grp TEXT);
+    INSERT INTO t VALUES (-5, 'a'), (-3, 'b'), (0, 'a'), (7, 'b');
+    SELECT SUM(x) FILTER (WHERE x < 0), MIN(x) FILTER (WHERE grp = 'b') FROM t;
+}
+expect {
+    -8|-3
+}
+
+@cross-check-integrity
+test filter-with-limit {
+    CREATE TABLE t(x INTEGER, grp TEXT);
+    INSERT INTO t VALUES (1, 'a'), (2, 'b'), (3, 'a'), (4, 'b');
+    SELECT grp, COUNT(*) FILTER (WHERE x > 1) FROM t GROUP BY grp LIMIT 1;
+}
+expect {
+    a|1
+}
+
+@cross-check-integrity
+test filter-with-join {
+    CREATE TABLE t1(id INTEGER, val INTEGER);
+    CREATE TABLE t2(id INTEGER, label TEXT);
+    INSERT INTO t1 VALUES (1, 10), (2, 20), (3, 30);
+    INSERT INTO t2 VALUES (1, 'yes'), (2, 'no'), (3, 'yes');
+    SELECT COUNT(*) FILTER (WHERE t2.label = 'yes'), SUM(t1.val) FILTER (WHERE t2.label = 'yes')
+    FROM t1 JOIN t2 ON t1.id = t2.id;
+}
+expect {
+    2|40
+}
+
+@cross-check-integrity
+test filter-all-agg-types-same-table {
+    CREATE TABLE t(x REAL, flag INTEGER);
+    INSERT INTO t VALUES (5.5, 1), (10.2, 0), (15.3, 1), (20.1, 0), (25.7, 1);
+    SELECT
+        COUNT(x) FILTER (WHERE flag = 1),
+        SUM(x) FILTER (WHERE flag = 1),
+        AVG(x) FILTER (WHERE flag = 1),
+        MIN(x) FILTER (WHERE flag = 1),
+        MAX(x) FILTER (WHERE flag = 1),
+        TOTAL(x) FILTER (WHERE flag = 1)
+    FROM t;
+}
+expect {
+    3|46.5|15.5|5.5|25.7|46.5
+}
+
+@cross-check-integrity
+test filter-group-concat-with-filter {
+    CREATE TABLE t(name TEXT, active INTEGER);
+    INSERT INTO t VALUES ('a', 1), ('b', 0), ('c', 1), ('d', 0), ('e', 1);
+    SELECT GROUP_CONCAT(name, ';') FILTER (WHERE active = 1) FROM t;
+}
+expect {
+    a;c;e
+}
+
+@cross-check-integrity
+test filter-with-coalesce {
+    CREATE TABLE t(x INTEGER, y INTEGER);
+    INSERT INTO t VALUES (1, NULL), (2, 10), (3, NULL), (4, 20);
+    SELECT SUM(COALESCE(y, 0)) FILTER (WHERE x > 1) FROM t;
+}
+expect {
+    30
+}
+
+@cross-check-integrity
+test filter-single-row {
+    CREATE TABLE t(x INTEGER);
+    INSERT INTO t VALUES (42);
+    SELECT COUNT(*) FILTER (WHERE x = 42), COUNT(*) FILTER (WHERE x != 42) FROM t;
+}
+expect {
+    1|0
+}
+
+@cross-check-integrity
+test filter-with-between {
+    CREATE TABLE t(x INTEGER);
+    INSERT INTO t VALUES (1), (2), (3), (4), (5), (6), (7), (8), (9), (10);
+    SELECT COUNT(*) FILTER (WHERE x BETWEEN 3 AND 7), SUM(x) FILTER (WHERE x BETWEEN 3 AND 7) FROM t;
+}
+expect {
+    5|25
+}
+
+@cross-check-integrity
+test filter-with-in-list {
+    CREATE TABLE t(x INTEGER);
+    INSERT INTO t VALUES (1), (2), (3), (4), (5);
+    SELECT SUM(x) FILTER (WHERE x IN (1, 3, 5)) FROM t;
+}
+expect {
+    9
+}
+
+@cross-check-integrity
+test filter-with-like {
+    CREATE TABLE t(name TEXT, val INTEGER);
+    INSERT INTO t VALUES ('apple', 1), ('banana', 2), ('avocado', 3), ('berry', 4);
+    SELECT SUM(val) FILTER (WHERE name LIKE 'a%') FROM t;
+}
+expect {
+    4
+}
+
+@cross-check-integrity
+test filter-with-null-agg-arg {
+    CREATE TABLE t(x INTEGER, flag INTEGER);
+    INSERT INTO t VALUES (1, 1), (NULL, 1), (3, 1), (NULL, 0);
+    SELECT COUNT(x) FILTER (WHERE flag = 1), SUM(x) FILTER (WHERE flag = 1) FROM t;
+}
+expect {
+    2|4
+}

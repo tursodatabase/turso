@@ -26,6 +26,7 @@ pub enum Stmt {
     AlterTable(AlterTableStmt),
     CreateIndex(CreateIndexStmt),
     DropIndex(DropIndexStmt),
+    PragmaForeignKeyList(PragmaForeignKeyListStmt),
     CreateTrigger(CreateTriggerStmt),
     DropTrigger(DropTriggerStmt),
     Begin,
@@ -53,6 +54,7 @@ impl fmt::Display for Stmt {
             Stmt::AlterTable(s) => write!(f, "{s}"),
             Stmt::CreateIndex(s) => write!(f, "{s}"),
             Stmt::DropIndex(s) => write!(f, "{s}"),
+            Stmt::PragmaForeignKeyList(s) => write!(f, "{s}"),
             Stmt::CreateTrigger(s) => write!(f, "{s}"),
             Stmt::DropTrigger(s) => write!(f, "{s}"),
             Stmt::Begin => write!(f, "BEGIN"),
@@ -90,6 +92,7 @@ impl Stmt {
             | Stmt::AlterTable(_)
             | Stmt::CreateIndex(_)
             | Stmt::DropIndex(_)
+            | Stmt::PragmaForeignKeyList(_)
             | Stmt::CreateTrigger(_)
             | Stmt::DropTrigger(_)
             | Stmt::Begin
@@ -993,9 +996,13 @@ impl fmt::Display for InsertStmt {
 pub struct UpdateStmt {
     pub with_clause: Option<WithClause>,
     pub table: String,
+    pub alias: Option<String>,
     pub sets: Vec<(String, Expr)>,
+    pub from: Option<FromClause>,
+    pub joins: Vec<JoinClause>,
     pub where_clause: Option<Expr>,
     pub conflict: Option<ConflictClause>,
+    pub returning: Option<Vec<Expr>>,
 }
 
 impl fmt::Display for UpdateStmt {
@@ -1007,7 +1014,11 @@ impl fmt::Display for UpdateStmt {
         if let Some(conflict) = &self.conflict {
             write!(f, "{conflict}")?;
         }
-        write!(f, " {} SET ", self.table)?;
+        write!(f, " {}", self.table)?;
+        if let Some(alias) = &self.alias {
+            write!(f, " AS {alias}")?;
+        }
+        write!(f, " SET ")?;
 
         for (i, (col, val)) in self.sets.iter().enumerate() {
             if i > 0 {
@@ -1016,8 +1027,40 @@ impl fmt::Display for UpdateStmt {
             write!(f, "{col} = {val}")?;
         }
 
+        if let Some(from) = &self.from {
+            write!(f, " FROM {}", from.table)?;
+            if let Some(alias) = &from.alias {
+                write!(f, " AS {alias}")?;
+            }
+        }
+
+        for join in &self.joins {
+            match join.join_type {
+                JoinType::Inner => write!(f, " JOIN {}", join.table)?,
+                JoinType::Left => write!(f, " LEFT JOIN {}", join.table)?,
+                JoinType::Cross => write!(f, " CROSS JOIN {}", join.table)?,
+                JoinType::Natural => write!(f, " NATURAL JOIN {}", join.table)?,
+            }
+            if let Some(alias) = &join.alias {
+                write!(f, " AS {alias}")?;
+            }
+            if let Some(JoinConstraint::On(expr)) = &join.constraint {
+                write!(f, " ON {expr}")?;
+            }
+        }
+
         if let Some(where_clause) = &self.where_clause {
             write!(f, " WHERE {where_clause}")?;
+        }
+
+        if let Some(returning) = &self.returning {
+            write!(f, " RETURNING ")?;
+            for (i, expr) in returning.iter().enumerate() {
+                if i > 0 {
+                    write!(f, ", ")?;
+                }
+                write!(f, "{expr}")?;
+            }
         }
 
         Ok(())
@@ -1255,6 +1298,23 @@ impl fmt::Display for DropIndexStmt {
     }
 }
 
+/// A PRAGMA foreign_key_list statement.
+#[derive(Debug, Clone)]
+pub struct PragmaForeignKeyListStmt {
+    pub database: Option<String>,
+    pub table: String,
+}
+
+impl fmt::Display for PragmaForeignKeyListStmt {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let table = self.table.replace('\'', "''");
+        match &self.database {
+            Some(database) => write!(f, "PRAGMA {database}.foreign_key_list('{table}')"),
+            None => write!(f, "PRAGMA foreign_key_list('{table}')"),
+        }
+    }
+}
+
 /// A CREATE TRIGGER statement.
 #[derive(Debug, Clone)]
 pub struct CreateTriggerStmt {
@@ -1488,7 +1548,26 @@ impl Expr {
     /// Create a function call (records to context).
     pub fn function_call(ctx: &mut Context, name: String, args: Vec<Expr>) -> Self {
         ctx.record(ExprKind::FunctionCall);
-        Expr::FunctionCall(FunctionCallExpr { name, args })
+        Expr::FunctionCall(FunctionCallExpr {
+            name,
+            args,
+            filter: None,
+        })
+    }
+
+    /// Create a function call with a FILTER clause (records to context).
+    pub fn function_call_with_filter(
+        ctx: &mut Context,
+        name: String,
+        args: Vec<Expr>,
+        filter: Expr,
+    ) -> Self {
+        ctx.record(ExprKind::FunctionCall);
+        Expr::FunctionCall(FunctionCallExpr {
+            name,
+            args,
+            filter: Some(Box::new(filter)),
+        })
     }
 
     /// Create a subquery (records to context).
@@ -1832,6 +1911,7 @@ pub enum UnaryOp {
 pub struct FunctionCallExpr {
     pub name: String,
     pub args: Vec<Expr>,
+    pub filter: Option<Box<Expr>>,
 }
 
 impl fmt::Display for FunctionCallExpr {
@@ -1843,7 +1923,11 @@ impl fmt::Display for FunctionCallExpr {
             }
             write!(f, "{arg}")?;
         }
-        write!(f, ")")
+        write!(f, ")")?;
+        if let Some(filter_expr) = &self.filter {
+            write!(f, " FILTER (WHERE {filter_expr})")?;
+        }
+        Ok(())
     }
 }
 

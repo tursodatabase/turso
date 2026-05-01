@@ -541,6 +541,49 @@ pub enum Insn {
         default: Option<Value>,
     },
 
+    /// Jump to `target_pc` if the cursor's current record contains a field at
+    /// the given column index.  Falls through when the record has fewer fields
+    /// (a "short record" from before ALTER TABLE ADD COLUMN).
+    ///
+    /// # Why this instruction exists
+    ///
+    /// SQLite's `Column` instruction has a P4 operand that holds an optional
+    /// constant default value.  When a record is shorter than expected (because
+    /// the column was added after the row was written), Column writes P4 into
+    /// the destination register.  Because P4 must be a compile-time constant,
+    /// SQLite enforces this in `sqlite3AlterFinishAddColumn`:
+    ///
+    /// ```c
+    /// rc = sqlite3ValueFromExpr(db, pDflt, SQLITE_UTF8, SQLITE_AFF_BLOB, &pVal);
+    /// if( !pVal ){
+    ///     sqlite3ErrorIfNotEmpty(pParse, zDb, zTab,
+    ///         "Cannot add a column with non-constant default");
+    /// }
+    /// ```
+    ///
+    /// PostgreSQL takes a different approach: it stores the evaluated default
+    /// in `pg_attribute.attmissingval` (for non-volatile expressions) or
+    /// rewrites the entire table (for volatile ones).  This lets Postgres
+    /// accept `ALTER TABLE ADD COLUMN x DEFAULT now()`.
+    ///
+    /// We want the same flexibility as Postgres.  Custom types with ENCODE
+    /// make this need appear sooner: even when the DEFAULT is a constant
+    /// (which SQLite requires), the stored value must be ENCODE(DEFAULT) —
+    /// an arbitrary SQL expression applied to that constant.  For example,
+    /// `DEFAULT ('Hello')` with `ENCODE (lower(value))` needs to store
+    /// `'hello'`.  Since the ENCODE expression can be complex (CASE, function
+    /// calls, etc.), it cannot always be constant-folded into a P4 value.
+    ///
+    /// `ColumnHasField` lets us detect short records at runtime and branch to
+    /// bytecode that computes the encoded default dynamically, without
+    /// restricting what expressions ENCODE (or future non-constant defaults)
+    /// may contain.
+    ColumnHasField {
+        cursor_id: CursorID,
+        column: usize,
+        target_pc: BranchOffset,
+    },
+
     TypeCheck {
         start_reg: usize, // P1
         count: usize,     // P2
@@ -598,6 +641,39 @@ pub enum Insn {
     MakeArrayDynamic {
         start_reg: usize,
         count_reg: usize,
+        dest: usize,
+    },
+
+    /// Extract a field from a struct blob by field index.
+    /// If src_reg is NULL, dest = NULL.
+    StructField {
+        src_reg: usize,
+        field_index: usize,
+        dest: usize,
+    },
+
+    /// Pack a tag index and a value into a union blob.
+    /// Format: [tag_index: 1 byte][record-format value].
+    UnionPack {
+        tag_index: u8,
+        value_reg: usize,
+        dest: usize,
+    },
+
+    /// Extract the tag name from a union blob as text.
+    /// Reads the tag index byte, looks up the name via tag_names.
+    /// If src_reg is NULL, dest = NULL. Otherwise dest = tag name as Text.
+    UnionTag {
+        src_reg: usize,
+        dest: usize,
+        tag_names: Arc<[String]>,
+    },
+
+    /// Extract the value from a union blob if the tag index matches.
+    /// If tag matches, dest = extracted value. If mismatch or NULL, dest = NULL.
+    UnionExtract {
+        src_reg: usize,
+        expected_tag: u8,
         dest: usize,
     },
 
@@ -739,6 +815,11 @@ pub enum Insn {
         /// Points to the "skip this row" address in the parent program.
         ignore_jump_target: BranchOffset,
     },
+
+    /// Copy the current VM change counter to the connection-level counters, then reset it.
+    /// SQLite emits this between trigger-body DML statements so `changes()` and
+    /// `total_changes()` observe the just-completed statement without leaking into the next one.
+    ResetCount,
 
     /// Write an integer value into a register.
     Integer {
@@ -1676,6 +1757,13 @@ pub enum Insn {
         dest_path: String,
     },
 
+    /// In-place VACUUM - compact the database (by writing to a temporary location and then copying
+    /// back)
+    Vacuum {
+        /// Database index to vacuum (0 = main)
+        db: usize,
+    },
+
     /// Ensure turso_cdc_version table exists and insert/replace a version row,
     /// then enable CDC on the connection. Runs nested SQL at VDBE execution time
     /// (same pattern as ParseSchema). CDC is enabled after version table operations
@@ -1761,6 +1849,7 @@ impl InsnVariants {
             InsnVariants::Rewind => execute::op_rewind,
             InsnVariants::Last => execute::op_last,
             InsnVariants::Column => execute::op_column,
+            InsnVariants::ColumnHasField => execute::op_column_has_field,
             InsnVariants::TypeCheck => execute::op_type_check,
             InsnVariants::ArrayEncode => execute::op_array_encode,
             InsnVariants::ArrayDecode => execute::op_array_decode,
@@ -1768,6 +1857,10 @@ impl InsnVariants {
             InsnVariants::ArrayLength => execute::op_array_length,
             InsnVariants::MakeArray => execute::op_make_array,
             InsnVariants::MakeArrayDynamic => execute::op_make_array_dynamic,
+            InsnVariants::StructField => execute::op_struct_field,
+            InsnVariants::UnionPack => execute::op_union_pack,
+            InsnVariants::UnionTag => execute::op_union_tag,
+            InsnVariants::UnionExtract => execute::op_union_extract,
             InsnVariants::RegCopyOffset => execute::op_reg_copy_offset,
             InsnVariants::ArrayConcat => execute::op_array_concat,
             InsnVariants::ArraySetElement => execute::op_array_set_element,
@@ -1786,6 +1879,7 @@ impl InsnVariants {
             InsnVariants::Return => execute::op_return,
             InsnVariants::Integer => execute::op_integer,
             InsnVariants::Program => execute::op_program,
+            InsnVariants::ResetCount => execute::op_reset_count,
             InsnVariants::Real => execute::op_real,
             InsnVariants::RealAffinity => execute::op_real_affinity,
             InsnVariants::String8 => execute::op_string8,
@@ -1906,6 +2000,7 @@ impl InsnVariants {
             InsnVariants::HashGraceNextProbe => execute::op_hash_grace_next_probe,
             InsnVariants::HashGraceAdvancePartition => execute::op_hash_grace_advance_partition,
             InsnVariants::VacuumInto => execute::op_vacuum_into,
+            InsnVariants::Vacuum => execute::op_vacuum,
             InsnVariants::InitCdcVersion => execute::op_init_cdc_version,
         }
     }
@@ -1915,12 +2010,12 @@ impl Insn {
     // SAFETY: If the enumeration specifies a primitive representation,
     // then the discriminant may be reliably accessed via unsafe pointer casting
     #[inline(always)]
-    fn discriminant(&self) -> u8 {
+    const fn discriminant(&self) -> u8 {
         unsafe { *(self as *const Self as *const u8) }
     }
 
     #[inline(always)]
-    pub fn to_function(&self) -> InsnFunction {
+    pub const fn to_function(&self) -> InsnFunction {
         // dont use this because its still using match
         // InsnVariants::from(self).to_function_fast()
         INSN_VTABLE[self.discriminant() as usize]
@@ -1962,7 +2057,8 @@ impl Insn {
             | Self::DropColumn { .. }
             | Self::AddColumn { .. }
             | Self::AlterColumn { .. }
-            | Self::JournalMode { .. } => false,
+            | Self::JournalMode { .. }
+            | Self::Vacuum { .. } => false,
             Self::MaxPgcnt { new_max, .. } => *new_max == 0,
             Self::Program { program, .. } => program.is_readonly(),
             _ => true,

@@ -39,7 +39,7 @@ jobs:
       matrix:
         os:
           - blacksmith-4vcpu-ubuntu-2404
-          - macos-latest
+          - blacksmith-6vcpu-macos-latest
           - windows-latest
         python-version: ${{ fromJson(needs.configure-strategy.outputs.python-versions) }}
     runs-on: ${{ matrix.os }}
@@ -171,7 +171,7 @@ jobs:
           path: bindings/python/dist
 
   macos:
-    runs-on: macos-latest
+    runs-on: blacksmith-6vcpu-macos-latest
     timeout-minutes: 30
     defaults:
       run:

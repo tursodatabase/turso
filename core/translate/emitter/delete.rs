@@ -44,12 +44,12 @@ pub fn emit_program_for_delete(
     program: &mut ProgramBuilder,
     mut plan: DeletePlan,
 ) -> Result<()> {
-    let mut t_ctx = TranslateCtx::new(
+    let mut t_ctx = Box::new(TranslateCtx::new(
         program,
         resolver.fork(),
         plan.table_references.joined_tables().len(),
         connection.db.opts.unsafe_testing,
-    );
+    ));
 
     let after_main_loop_label = program.allocate_label();
     t_ctx.label_main_loop_end = Some(after_main_loop_label);
@@ -296,7 +296,7 @@ pub fn emit_fk_child_decrement_on_delete(
         }
         // Fast path: if any FK column is NULL can't be a violation
         let null_skip = program.allocate_label();
-        for cname in &fk_ref.child_cols {
+        for cname in &fk_ref.fk.child_columns {
             let (pos, col) = child_tbl.get_column(cname).unwrap();
             let src = if col.is_rowid_alias() {
                 child_rowid_reg
@@ -323,7 +323,7 @@ pub fn emit_fk_child_decrement_on_delete(
                 .expect("parent btree");
             let pcur = open_read_table(program, &parent_tbl, database_id);
 
-            let (pos, col) = child_tbl.get_column(&fk_ref.child_cols[0]).unwrap();
+            let (pos, col) = child_tbl.get_column(&fk_ref.fk.child_columns[0]).unwrap();
             let val = if col.is_rowid_alias() {
                 child_rowid_reg
             } else {
@@ -372,9 +372,9 @@ pub fn emit_fk_child_decrement_on_delete(
             let icur = open_read_index(program, idx, database_id);
 
             // Build probe from current child row
-            let n = fk_ref.child_cols.len();
+            let n = fk_ref.fk.child_columns.len();
             let probe = program.alloc_registers(n);
-            for (i, cname) in fk_ref.child_cols.iter().enumerate() {
+            for (i, cname) in fk_ref.fk.child_columns.iter().enumerate() {
                 let (pos, col) = child_tbl.get_column(cname).unwrap();
                 let src = if col.is_rowid_alias() {
                     child_rowid_reg
@@ -642,6 +642,7 @@ fn emit_delete_row_common(
                     table_name,
                     main_table_cursor_id,
                     rowid_reg,
+                    None,
                     delete_db_id,
                 )?
             } else {
@@ -750,7 +751,7 @@ fn emit_delete_row_common(
                 raise_error_if_no_matching_entry: index.where_clause.is_none(),
             });
             if let Some(label) = skip_delete_label {
-                program.resolve_label(label, program.offset());
+                program.preassign_label_to_next_insn(label);
             }
         }
 

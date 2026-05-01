@@ -558,14 +558,17 @@ test.serial("Statement.reader [DELETE RETURNING is true]", (t) => {
   t.is(stmt.reader, true);
 });
 
-test.serial("Query timeout option interrupts long-running query", async (t) => {
+const queryTimeoutInterruptsLongRunningQueryTest =
+  process.env.PROVIDER === "better-sqlite3" ? test.serial.skip : test.serial;
+
+queryTimeoutInterruptsLongRunningQueryTest("Query timeout option interrupts long-running query", async (t) => {
   const path = genDatabaseFilename();
   const [db] = await connect(path, { defaultQueryTimeout: 50 });
   const stmt = db.prepare("SELECT sum(value) FROM generate_series(1, 1000000000);");
 
   const error = t.throws(() => {
     stmt.get();
-  });
+  }, { any: true });
   t.truthy(error);
   t.true(error.message.toLowerCase().includes("interrupt"));
 
@@ -686,6 +689,81 @@ test.serial("Open database after rename", async (t) => {
   }
 });
 
+
+// ==========================================================================
+// Interactive transaction conformance
+// ==========================================================================
+
+test.serial("Interactive transaction COMMIT visibility across connections", async (t) => {
+  const db = t.context.db;
+  const [db2] = await connect(t.context.path);
+
+  const countByName = (conn, name) => Number(
+    conn.prepare("SELECT COUNT(*) AS count FROM users WHERE name = ?").get([name]).count,
+  );
+
+  try {
+    db.exec("BEGIN");
+    db.prepare("INSERT INTO users(name, email) VALUES (?, ?)").run(["TxCommit", "tx-commit@example.org"]);
+
+    t.is(countByName(db, "TxCommit"), 1);
+    t.is(countByName(db2, "TxCommit"), 0);
+
+    db.exec("COMMIT");
+
+    t.is(countByName(db2, "TxCommit"), 1);
+  } finally {
+    db2.close();
+  }
+});
+
+test.serial("Interactive transaction ROLLBACK discards writes", async (t) => {
+  const db = t.context.db;
+
+  const countByName = (name) => Number(
+    db.prepare("SELECT COUNT(*) AS count FROM users WHERE name = ?").get([name]).count,
+  );
+
+  db.exec("BEGIN IMMEDIATE");
+  db.prepare("INSERT INTO users(name, email) VALUES (?, ?)").run(["TxRollback", "tx-rollback@example.org"]);
+  t.is(countByName("TxRollback"), 1);
+
+  db.exec("ROLLBACK");
+  t.is(countByName("TxRollback"), 0);
+});
+
+test.serial("Interactive transaction error + ROLLBACK keeps connection usable", async (t) => {
+  const db = t.context.db;
+
+  const countByName = (name) => Number(
+    db.prepare("SELECT COUNT(*) AS count FROM users WHERE name = ?").get([name]).count,
+  );
+
+  db.exec("BEGIN");
+  db.prepare("INSERT INTO users(name, email) VALUES (?, ?)").run(["WillRollback", "will-rollback@example.org"]);
+
+  const constraintError = t.throws(() => {
+    db.prepare("INSERT INTO users(id, name, email) VALUES (?, ?, ?)").run([1, "DuplicateId", "duplicate-id@example.org"]);
+  }, {
+    any: true,
+  });
+  t.truthy(constraintError);
+  const constraintHint = `${constraintError.code ?? ""} ${constraintError.message ?? ""}`.toUpperCase();
+  t.true(
+    constraintHint.includes("CONSTRAINT")
+    || constraintHint.includes("UNIQUE")
+    || constraintHint.includes("PRIMARYKEY"),
+  );
+
+  db.exec("ROLLBACK");
+  t.is(countByName("WillRollback"), 0);
+
+  db.exec("BEGIN");
+  db.prepare("INSERT INTO users(name, email) VALUES (?, ?)").run(["AfterRollback", "after-rollback@example.org"]);
+  db.exec("COMMIT");
+
+  t.is(countByName("AfterRollback"), 1);
+});
 const connect = async (path, options = {}) => {
   if (!path) {
     path = genDatabaseFilename();

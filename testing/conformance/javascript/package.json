@@ -1,0 +1,24 @@
+{
+  "name": "turso-integration-tests",
+  "type": "module",
+  "private": true,
+  "scripts": {
+    "test": "npm run test:turso && npm run test:serverless && npm run test:better-sqlite3",
+    "test:turso": "PROVIDER=turso ava __test__/*.test.js",
+    "test:serverless": "PROVIDER=serverless ava __test__/async.test.js",
+    "test:libsql": "PROVIDER=libsql ava __test__/*.test.js",
+    "test:better-sqlite3": "PROVIDER=better-sqlite3 ava __test__/sync.test.js",
+    "test:serverless-compat": "COMPAT_PROVIDER=serverless-compat ava __test__/compat.test.js",
+    "test:libsql-client": "COMPAT_PROVIDER=libsql-client ava __test__/compat.test.js"
+  },
+  "devDependencies": {
+    "ava": "^6.4.1"
+  },
+  "dependencies": {
+    "@tursodatabase/serverless": "../../../serverless/javascript",
+    "@tursodatabase/database": "../../../bindings/javascript/packages/native",
+    "better-sqlite3": "^12.9.0",
+    "libsql": "^0.6.0-pre.34",
+    "@libsql/client": "^0.15.15"
+  }
+}

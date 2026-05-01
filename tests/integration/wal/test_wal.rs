@@ -64,6 +64,52 @@ fn test_truncate_checkpoint_not_busy_after_rollback(tmp_db: TempDatabase) -> Res
     Ok(())
 }
 
+#[allow(clippy::arc_with_non_send_sync)]
+#[turso_macros::test]
+fn test_savepoint_rollback_after_cache_spill_preserves_wal_pages(
+    tmp_db: TempDatabase,
+) -> Result<()> {
+    maybe_setup_tracing();
+    let conn = tmp_db.connect_limbo();
+
+    conn.execute("PRAGMA page_size=512;")?;
+    conn.execute("PRAGMA journal_mode=WAL;")?;
+    conn.execute("PRAGMA cache_size=50;")?;
+
+    conn.execute("CREATE TABLE filler(x INTEGER PRIMARY KEY);")?;
+    conn.execute("INSERT INTO filler(x) VALUES (1),(2),(3),(4),(5),(6),(7),(8),(9),(10);")?;
+
+    conn.execute("BEGIN;")?;
+    conn.execute("CREATE TABLE t(k INTEGER PRIMARY KEY, v TEXT NOT NULL);")?;
+    conn.execute("CREATE TABLE b(k INTEGER PRIMARY KEY, v TEXT NOT NULL);")?;
+    conn.execute(
+        "INSERT INTO t(v)
+         SELECT printf('%0*d', 4000, f1.x*1000 + f2.x)
+         FROM filler f1, filler f2
+         LIMIT 25;",
+    )?;
+    conn.execute(
+        "UPDATE t
+         SET v = printf('%0*d', 4000, k + 10000000)
+         WHERE k BETWEEN 1 AND 23;",
+    )?;
+    conn.execute("SAVEPOINT s1;")?;
+    conn.execute(
+        "INSERT INTO b(v)
+         SELECT printf('%0*d', 4000, f1.x*1000 + f2.x)
+         FROM filler f1, filler f2
+         LIMIT 40;",
+    )?;
+    conn.execute("ROLLBACK TO s1;")?;
+    conn.execute("RELEASE s1;")?;
+    conn.execute("COMMIT;")?;
+
+    let res = execute_and_get_strings(&conn, "PRAGMA integrity_check;")?;
+    assert_eq!(res, vec!["ok"]);
+
+    Ok(())
+}
+
 #[test]
 #[ignore = "ignored for now because it's flaky"]
 fn test_wal_1_writer_1_reader() -> Result<()> {

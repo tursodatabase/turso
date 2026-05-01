@@ -1,10 +1,12 @@
 use crate::sync::Arc;
+use crate::HashMap;
 
 use crate::ext::VTabImpl;
 use crate::function::{Deterministic, Func, MathFunc, ScalarFunc};
 use crate::schema::{
-    create_table, translate_ident_to_string_literal, BTreeTable, ColDef, Column, SchemaObjectType,
-    Table, Type, RESERVED_TABLE_PREFIXES, SQLITE_SEQUENCE_TABLE_NAME, TURSO_TYPES_TABLE_NAME,
+    create_table, translate_ident_to_string_literal, BTreeCharacteristics, BTreeTable, ColDef,
+    Column, SchemaObjectType, Table, Type, RESERVED_TABLE_PREFIXES, SQLITE_SEQUENCE_TABLE_NAME,
+    TURSO_TYPES_TABLE_NAME,
 };
 use crate::stats::STATS_TABLE;
 use crate::storage::pager::CreateBTreeFlags;
@@ -14,10 +16,13 @@ use crate::translate::emitter::{
 };
 use crate::translate::expr::{walk_expr, WalkControl};
 use crate::translate::fkeys::emit_fk_drop_table_check;
+use crate::translate::plan::{Plan, QueryDestination};
 use crate::translate::planner::ROWID_STRS;
+use crate::translate::select::{emit_select_plan, prepare_select_plan};
 use crate::translate::{ProgramBuilder, ProgramBuilderOpts};
 use crate::util::{
-    escape_sql_string_literal, normalize_ident, PRIMARY_KEY_AUTOMATIC_INDEX_NAME_PREFIX,
+    escape_sql_string_literal, normalize_ident, quote_identifier,
+    PRIMARY_KEY_AUTOMATIC_INDEX_NAME_PREFIX,
 };
 use crate::vdbe::builder::CursorType;
 use crate::vdbe::insn::{
@@ -597,11 +602,12 @@ fn resolve_type_name(type_name: &str, resolver: &Resolver) -> Result<CheckExprTy
         return Ok(ty);
     }
     // Check if it's a known custom type
-    if resolver
-        .schema()
-        .get_type_def_unchecked(type_name)
-        .is_some()
-    {
+    if let Ok(Some(resolved)) = resolver.schema().resolve_type_unchecked(type_name) {
+        // Domains are transparent wrappers — resolve to the base primitive type
+        // so CHECK constraint type checking compares primitives, not domain names.
+        if resolved.is_domain() {
+            return resolve_type_name(&resolved.primitive, resolver);
+        }
         return Ok(CheckExprType::CustomType(type_name.to_lowercase()));
     }
     bail_parse_error!("unknown type '{}' in CHECK constraint", type_name);
@@ -726,9 +732,6 @@ fn validate(
         constraints,
     } = &body
     {
-        if options.contains_without_rowid() {
-            bail_parse_error!("WITHOUT ROWID tables are not supported");
-        }
         let column_names: Vec<&str> = columns.iter().map(|c| c.col_name.as_str()).collect();
         for i in 0..columns.len() {
             let col_i = &columns[i];
@@ -789,10 +792,22 @@ fn validate(
                     );
                 }
 
+                // Domain types require STRICT tables because domain constraints
+                // (CHECK, NOT NULL, DEFAULT) are only enforced on STRICT tables.
+                if !is_builtin && !is_strict {
+                    let type_def = resolver.schema().get_type_def_unchecked(type_name);
+                    if let Some(td) = type_def {
+                        if td.is_domain {
+                            bail_parse_error!(
+                                "domain type columns require STRICT tables: {}.{}",
+                                table_name,
+                                c.col_name
+                            );
+                        }
+                    }
+                }
+
                 if !is_builtin && is_strict {
-                    // On non-STRICT tables any type name is allowed and is
-                    // treated as a plain affinity hint (no encode/decode).
-                    // Custom type validation only applies to STRICT tables.
                     let type_def = resolver.schema().get_type_def_unchecked(type_name);
                     {
                         match type_def {
@@ -847,7 +862,226 @@ fn validate(
                 }
             }
         }
+
+        let table = create_table(table_name, body, 0)?;
+        if !table.has_rowid {
+            if table.has_autoincrement {
+                bail_parse_error!("AUTOINCREMENT is not allowed on WITHOUT ROWID tables");
+            }
+            if table.primary_key_columns.is_empty() {
+                bail_parse_error!("PRIMARY KEY missing on table {}", table_name);
+            }
+            if table.unique_sets.iter().any(|us| !us.is_primary_key) {
+                bail_parse_error!(
+                    "secondary UNIQUE constraints on WITHOUT ROWID tables are not supported"
+                );
+            }
+        }
     }
+    Ok(())
+}
+
+/// Schema information derived from a CTAS SELECT.
+struct CtasInfo {
+    plan: Plan,
+    schema_sql: String,
+}
+
+/// Pre-plan the SELECT to derive the schema for a CTAS table.
+/// Returns the plan (for reuse in emission) along with the complete schema SQL and column definitions.
+fn derive_ctas_schema(
+    select: ast::Select,
+    table_name: &str,
+    resolver: &Resolver,
+    program: &mut ProgramBuilder,
+    connection: &Arc<Connection>,
+) -> Result<(CtasInfo, Vec<ColumnDefinition>)> {
+    let plan = prepare_select_plan(
+        select,
+        resolver,
+        program,
+        &[],
+        QueryDestination::ResultRows,
+        connection,
+    )?;
+
+    // For compound selects, use the leftmost select's columns for naming (matching SQLite).
+    // The planner guarantees `left` is always non-empty in a CompoundSelect.
+    let (result_columns, table_refs) = match &plan {
+        Plan::Select(sp) => (&sp.result_columns, &sp.table_references),
+        Plan::CompoundSelect { left, .. } => {
+            (&left[0].0.result_columns, &left[0].0.table_references)
+        }
+        _ => bail_parse_error!("unexpected plan type for CTAS"),
+    };
+
+    // Collect names first, then deduplicate using SQLite's :N suffix convention.
+    let mut names: Vec<String> = result_columns
+        .iter()
+        .map(|col| col.name_or_expr(table_refs))
+        .collect();
+
+    let mut seen: HashMap<String, usize> = HashMap::default();
+    for name in &mut names {
+        let lower = name.to_lowercase();
+        let count = seen.entry(lower).or_insert(0);
+        if *count > 0 {
+            *name = format!("{name}:{count}");
+        }
+        *count += 1;
+    }
+
+    let mut sql_parts = Vec::with_capacity(result_columns.len());
+    let mut col_defs = Vec::with_capacity(result_columns.len());
+
+    for (col, name) in result_columns.iter().zip(names) {
+        let ty = col.declared_type(table_refs);
+
+        let quoted = quote_identifier(&name);
+        if ty.is_empty() {
+            sql_parts.push(quoted);
+        } else {
+            sql_parts.push(format!("{quoted} {ty}"));
+        }
+
+        let col_type = if ty.is_empty() {
+            None
+        } else {
+            Some(ast::Type {
+                name: ty.to_string(),
+                size: None,
+                array_dimensions: 0,
+            })
+        };
+        col_defs.push(ColumnDefinition {
+            col_name: ast::Name::exact(name),
+            col_type,
+            constraints: vec![],
+        });
+    }
+
+    let info = CtasInfo {
+        plan,
+        schema_sql: format!("CREATE TABLE {table_name}({})", sql_parts.join(",")),
+    };
+    Ok((info, col_defs))
+}
+
+/// Emit bytecode to populate a newly-created CTAS table from the SELECT.
+/// Uses a coroutine to run the SELECT and insert each result row.
+/// Takes an already-prepared plan (from `derive_ctas_schema`) to avoid double planning.
+#[allow(clippy::too_many_arguments)]
+fn emit_ctas_insert(
+    program: &mut ProgramBuilder,
+    resolver: &Resolver,
+    mut plan: Plan,
+    body: &ast::CreateTableBody,
+    table_root_reg: usize,
+    col_count: usize,
+    database_id: usize,
+    table_name: &str,
+    connection: &Arc<Connection>,
+) -> Result<()> {
+    let opts = ProgramBuilderOpts {
+        num_cursors: 2,
+        approx_num_insns: 20,
+        approx_num_labels: 3,
+    };
+    program.extend(&opts);
+
+    // Set up coroutine for the SELECT
+    let yield_reg = program.alloc_register();
+    let jump_on_definition_label = program.allocate_label();
+    let start_offset_label = program.allocate_label();
+    let halt_label = program.allocate_label();
+
+    program.emit_insn(Insn::InitCoroutine {
+        yield_reg,
+        jump_on_definition: jump_on_definition_label,
+        start_offset: start_offset_label,
+    });
+    program.preassign_label_to_next_insn(start_offset_label);
+
+    // Switch the plan's destination to coroutine yield mode.
+    let dest = plan.select_query_destination_mut().ok_or_else(|| {
+        crate::LimboError::InternalError("CTAS plan must be a SELECT or CompoundSelect".into())
+    })?;
+    *dest = QueryDestination::CoroutineYield {
+        yield_reg,
+        coroutine_implementation_start: halt_label,
+    };
+
+    let num_result_cols =
+        program.nested(|program| emit_select_plan(plan, resolver, program, connection))?;
+
+    if num_result_cols != col_count {
+        bail_parse_error!(
+            "CTAS internal error: expected {} columns from SELECT but got {}",
+            col_count,
+            num_result_cols
+        );
+    }
+
+    program.emit_insn(Insn::EndCoroutine { yield_reg });
+    program.preassign_label_to_next_insn(jump_on_definition_label);
+
+    // Open the new table for writing using the root page from CreateBtree.
+    let ctas_btree = Arc::new(create_table(table_name, body, 0)?);
+    let new_table_cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(ctas_btree));
+    program.emit_insn(Insn::OpenWrite {
+        cursor_id: new_table_cursor_id,
+        root_page: RegisterOrLiteral::Register(table_root_reg),
+        db: database_id,
+    });
+
+    // Main insert loop: yield from coroutine, make record, insert
+    let loop_start = program.allocate_label();
+    let loop_end = program.allocate_label();
+
+    program.preassign_label_to_next_insn(loop_start);
+    program.emit_insn(Insn::Yield {
+        yield_reg,
+        end_offset: loop_end,
+        subtype_clear_start_reg: 0,
+        subtype_clear_count: 0,
+    });
+
+    let result_start_reg = program.reg_result_cols_start.ok_or_else(|| {
+        crate::LimboError::InternalError(
+            "CTAS internal error: result column start register not set".into(),
+        )
+    })?;
+    let record_reg = program.alloc_register();
+    program.emit_insn(Insn::MakeRecord {
+        start_reg: to_u16(result_start_reg),
+        count: to_u16(col_count),
+        dest_reg: to_u16(record_reg),
+        index_name: None,
+        affinity_str: None,
+    });
+
+    let rowid_reg = program.alloc_register();
+    program.emit_insn(Insn::NewRowid {
+        cursor: new_table_cursor_id,
+        rowid_reg,
+        prev_largest_reg: 0,
+    });
+
+    program.emit_insn(Insn::Insert {
+        cursor: new_table_cursor_id,
+        key_reg: rowid_reg,
+        record_reg,
+        flag: InsertFlags::new(),
+        table_name: table_name.to_string(),
+    });
+
+    program.emit_insn(Insn::Goto {
+        target_pc: loop_start,
+    });
+
+    program.preassign_label_to_next_insn(loop_end);
+    program.preassign_label_to_next_insn(halt_label);
+
     Ok(())
 }
 
@@ -858,8 +1092,29 @@ pub fn translate_create_table(
     if_not_exists: bool,
     body: ast::CreateTableBody,
     program: &mut ProgramBuilder,
-    connection: &Connection,
+    connection: &Arc<Connection>,
 ) -> Result<()> {
+    // For CTAS, extract the SELECT, determine column info, and convert to a
+    // regular ColumnsAndConstraints body + separate SELECT for data insertion.
+    let (body, ctas_info) = match body {
+        ast::CreateTableBody::AsSelect(select) => {
+            let (info, col_defs) = derive_ctas_schema(
+                select,
+                &tbl_name.name.as_ident(),
+                resolver,
+                program,
+                connection,
+            )?;
+            let body = ast::CreateTableBody::ColumnsAndConstraints {
+                columns: col_defs,
+                constraints: vec![],
+                options: ast::TableOptions::empty(),
+            };
+            (body, Some(info))
+        }
+        other => (other, None),
+    };
+
     let database_id = if temporary {
         crate::TEMP_DB_ID
     } else {
@@ -883,11 +1138,7 @@ pub fn translate_create_table(
         }
     }
 
-    let opts = ProgramBuilderOpts {
-        num_cursors: 1,
-        approx_num_insns: 30,
-        approx_num_labels: 1,
-    };
+    let opts = ProgramBuilderOpts::new(1, 30, 1);
     program.extend(&opts);
 
     if !connection.is_mvcc_bootstrap_connection()
@@ -990,7 +1241,7 @@ pub fn translate_create_table(
         value: 1,
         p5: 0,
     });
-    program.resolve_label(create_btree_label, program.offset());
+    program.preassign_label_to_next_insn(create_btree_label);
 
     let created_sequence_table = if has_autoincrement
         && resolver.with_schema(database_id, |s| {
@@ -1028,15 +1279,28 @@ pub fn translate_create_table(
         false
     };
 
-    let sql = create_table_body_to_str(&tbl_name, &body)?;
+    // For CTAS, use the pre-built SQL string; for regular CREATE TABLE, build it from the body.
+    let sql = if let Some(ref info) = ctas_info {
+        info.schema_sql.clone()
+    } else {
+        create_table_body_to_str(&tbl_name, &body)?
+    };
 
     let parse_schema_label = program.allocate_label();
 
     let table_root_reg = program.alloc_register();
+    let btree_flags = match &body {
+        ast::CreateTableBody::ColumnsAndConstraints { options, .. }
+            if options.contains_without_rowid() =>
+        {
+            CreateBTreeFlags::new_index()
+        }
+        _ => CreateBTreeFlags::new_table(),
+    };
     program.emit_insn(Insn::CreateBtree {
         db: database_id,
         root: table_root_reg,
-        flags: CreateBTreeFlags::new_table(),
+        flags: btree_flags,
     });
 
     // Create an automatic index B-tree if needed
@@ -1117,7 +1381,7 @@ pub fn translate_create_table(
         }
     }
 
-    program.resolve_label(parse_schema_label, program.offset());
+    program.preassign_label_to_next_insn(parse_schema_label);
     let schema_version = resolver.with_schema(database_id, |s| s.schema_version);
     program.emit_insn(Insn::SetCookie {
         db: database_id,
@@ -1139,7 +1403,24 @@ pub fn translate_create_table(
         where_clause: Some(parse_schema_where_clause),
     });
 
-    // TODO: SqlExec
+    // For CTAS, emit bytecode to populate the new table from the SELECT
+    if let Some(info) = ctas_info {
+        let col_count = match &body {
+            ast::CreateTableBody::ColumnsAndConstraints { columns, .. } => columns.len(),
+            _ => unreachable!("CTAS body was converted to ColumnsAndConstraints above"),
+        };
+        emit_ctas_insert(
+            program,
+            resolver,
+            info.plan,
+            &body,
+            table_root_reg,
+            col_count,
+            database_id,
+            &normalized_tbl_name,
+            connection,
+        )?;
+    }
 
     Ok(())
 }
@@ -1267,6 +1548,9 @@ fn collect_autoindexes(
 
     // include UNIQUE singles, include PK single only if not rowid alias
     for us in table.unique_sets.iter().filter(|us| us.columns.len() == 1) {
+        if us.is_primary_key && !table.has_rowid {
+            continue;
+        }
         let (col_name, _sort) = us.columns.first().unwrap();
         let Some((_pos, col)) = table.get_column(col_name) else {
             bail_parse_error!("Column {col_name} not found in table {}", table.name);
@@ -1285,6 +1569,9 @@ fn collect_autoindexes(
     }
 
     for _us in table.unique_sets.iter().filter(|us| us.columns.len() > 1) {
+        if !table.has_rowid && _us.is_primary_key {
+            continue;
+        }
         regs.push(program.alloc_register());
     }
     if regs.is_empty() {
@@ -1387,11 +1674,7 @@ pub fn translate_create_virtual_table(
         bail_parse_error!("Table {} already exists", tbl_name);
     }
 
-    let opts = ProgramBuilderOpts {
-        num_cursors: 2,
-        approx_num_insns: 40,
-        approx_num_labels: 2,
-    };
+    let opts = ProgramBuilderOpts::new(2, 40, 2);
     program.extend(&opts);
     let module_name_reg = program.emit_string8_new_reg(module_name_str.clone());
     let table_name_reg = program.emit_string8_new_reg(table_name.clone());
@@ -1493,11 +1776,7 @@ pub fn translate_drop_table(
 ) -> Result<()> {
     let database_id = resolver.resolve_existing_table_database_id_qualified(&tbl_name)?;
     let name = tbl_name.name.as_str();
-    let opts = ProgramBuilderOpts {
-        num_cursors: 4,
-        approx_num_insns: 40,
-        approx_num_labels: 4,
-    };
+    let opts = ProgramBuilderOpts::new(4, 40, 4);
     program.extend(&opts);
 
     let schema_cookie = resolver.with_schema(database_id, |s| s.schema_version);
@@ -1585,7 +1864,7 @@ pub fn translate_drop_table(
         let before_record_reg = if program.capture_data_changes_info().has_before() {
             Some(emit_cdc_full_record(
                 program,
-                &schema_table.columns,
+                schema_table.columns(),
                 sqlite_schema_cursor_id_0,
                 row_id_reg,
                 schema_table.is_strict,
@@ -1604,7 +1883,7 @@ pub fn translate_drop_table(
             None,
             SQLITE_TABLEID,
         )?;
-        program.resolve_label(skip_cdc_label, program.offset());
+        program.preassign_label_to_next_insn(skip_cdc_label);
     }
     program.emit_insn(Insn::Delete {
         cursor_id: sqlite_schema_cursor_id_0,
@@ -1612,7 +1891,7 @@ pub fn translate_drop_table(
         is_part_of_update: false,
     });
 
-    program.resolve_label(next_label, program.offset());
+    program.preassign_label_to_next_insn(next_label);
     program.emit_insn(Insn::Next {
         cursor_id: sqlite_schema_cursor_id_0,
         pc_if_next: metadata_loop,
@@ -1715,13 +1994,13 @@ pub fn translate_drop_table(
                 program.emit_insn(Insn::Goto {
                     target_pc: temp_next_label,
                 });
-                program.resolve_label(temp_delete_label, program.offset());
+                program.preassign_label_to_next_insn(temp_delete_label);
                 program.emit_insn(Insn::Delete {
                     cursor_id: temp_cursor,
                     table_name: SQLITE_TABLEID.to_string(),
                     is_part_of_update: false,
                 });
-                program.resolve_label(temp_next_label, program.offset());
+                program.preassign_label_to_next_insn(temp_next_label);
                 program.emit_insn(Insn::Next {
                     cursor_id: temp_cursor,
                     pc_if_next: temp_loop_label,
@@ -1805,22 +2084,17 @@ pub fn translate_drop_table(
             None,
             ColDef::default(),
         )];
-        let logical_to_physical_map = BTreeTable::build_logical_to_physical_map(&columns);
-        let simple_table_rc = Arc::new(BTreeTable {
-            root_page: 0, // Not relevant for ephemeral table definition
-            name: "ephemeral_scratch".to_string(),
-            has_rowid: true,
-            has_autoincrement: false,
-            primary_key_columns: vec![],
+        let simple_table_rc = Arc::new(BTreeTable::new(
+            0, // root_page, not relevant for ephemeral table definition
+            "ephemeral_scratch".to_string(),
+            vec![],
             columns,
-            is_strict: false,
-            unique_sets: vec![],
-            foreign_keys: vec![],
-            check_constraints: vec![],
-            rowid_alias_conflict_clause: None,
-            has_virtual_columns: false,
-            logical_to_physical_map,
-        });
+            BTreeCharacteristics::HAS_ROWID,
+            vec![],
+            vec![],
+            vec![],
+            None,
+        ));
         // cursor id 2
         let ephemeral_cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(simple_table_rc));
         program.emit_insn(Insn::OpenEphemeral {
@@ -1879,7 +2153,7 @@ pub fn translate_drop_table(
             table_name: "scratch_table".to_string(),
         });
 
-        program.resolve_label(next_label, program.offset());
+        program.preassign_label_to_next_insn(next_label);
         program.emit_insn(Insn::Next {
             cursor_id: sqlite_schema_cursor_id_1,
             pc_if_next: copy_schema_to_temp_table_loop,
@@ -1887,7 +2161,7 @@ pub fn translate_drop_table(
         program.preassign_label_to_next_insn(copy_schema_to_temp_table_loop_end_label);
         // End loop to copy over row id's from the schema table for rows that have the same root page as the one that was moved
 
-        program.resolve_label(if_not_label, program.offset());
+        program.preassign_label_to_next_insn(if_not_label);
 
         // 5. Open a write cursor to the schema table and re-insert the records placed in the ephemeral table but insert the correct root page now
         program.emit_insn(Insn::OpenWrite {
@@ -1945,7 +2219,7 @@ pub fn translate_drop_table(
             table_name: SQLITE_TABLEID.to_string(),
         });
 
-        program.resolve_label(next_label, program.offset());
+        program.preassign_label_to_next_insn(next_label);
         program.emit_insn(Insn::Next {
             cursor_id: ephemeral_cursor_id,
             pc_if_next: copy_temp_table_to_schema_loop,
@@ -1999,7 +2273,7 @@ pub fn translate_drop_table(
             is_part_of_update: false,
         });
 
-        program.resolve_label(continue_loop_label, program.offset());
+        program.preassign_label_to_next_insn(continue_loop_label);
         program.emit_insn(Insn::Next {
             cursor_id: seq_cursor_id,
             pc_if_next: loop_start_label,
@@ -2053,7 +2327,7 @@ pub fn translate_drop_table(
             is_part_of_update: false,
         });
 
-        program.resolve_label(continue_ver_label, program.offset());
+        program.preassign_label_to_next_insn(continue_ver_label);
         program.emit_insn(Insn::Next {
             cursor_id: ver_cursor_id,
             pc_if_next: ver_loop_start_label,
@@ -2130,50 +2404,14 @@ fn validate_type_expr(expr: &ast::Expr, kind: &str, resolver: &Resolver) -> Resu
     Ok(())
 }
 
-pub fn translate_create_type(
-    type_name: &str,
-    body: &ast::CreateTypeBody,
-    if_not_exists: bool,
+/// Shared persistence logic for CREATE TYPE / CREATE DOMAIN.
+/// Persists the type SQL into __turso_internal_types and registers it in memory.
+fn persist_type_definition(
+    normalized_name: String,
+    sql: String,
     resolver: &Resolver,
     program: &mut ProgramBuilder,
 ) -> Result<()> {
-    let normalized_name = normalize_ident(type_name);
-
-    // Reject names that shadow SQLite base types — these are not in the
-    // type_registry but are handled by the column type system. Allowing
-    // them would create confusion and undropable types.
-    let is_base_type = turso_macros::match_ignore_ascii_case!(match normalized_name.as_bytes() {
-        b"INT" | b"INTEGER" | b"REAL" | b"TEXT" | b"BLOB" | b"ANY" => true,
-        _ => false,
-    });
-    if is_base_type {
-        bail_parse_error!("cannot create type \"{normalized_name}\": name is a built-in type");
-    }
-
-    // Check if type already exists
-    if resolver
-        .schema()
-        .get_type_def_unchecked(&normalized_name)
-        .is_some()
-    {
-        if if_not_exists {
-            return Ok(());
-        }
-        bail_parse_error!("type {normalized_name} already exists");
-    }
-
-    // Validate encode/decode expressions for safety
-    if let Some(ref encode) = body.encode {
-        validate_type_expr(encode, "ENCODE", resolver)?;
-    }
-    if let Some(ref decode) = body.decode {
-        validate_type_expr(decode, "DECODE", resolver)?;
-    }
-
-    // Reconstruct the SQL string (without IF NOT EXISTS) using TypeDef::to_sql()
-    let type_def = crate::schema::TypeDef::from_create_type(&normalized_name, body, false);
-    let sql = type_def.to_sql();
-
     // Ensure sqlite_turso_types table exists (lazy creation)
     let types_table: Arc<BTreeTable>;
     let types_root_page: RegisterOrLiteral<i64>;
@@ -2272,13 +2510,246 @@ pub fn translate_create_type(
     Ok(())
 }
 
-pub fn translate_drop_type(
+pub fn translate_create_type(
     type_name: &str,
-    if_exists: bool,
+    body: &ast::CreateTypeBody,
+    if_not_exists: bool,
     resolver: &Resolver,
     program: &mut ProgramBuilder,
 ) -> Result<()> {
     let normalized_name = normalize_ident(type_name);
+
+    // Reject names that shadow SQLite base types
+    let is_base_type = turso_macros::match_ignore_ascii_case!(match normalized_name.as_bytes() {
+        b"INT" | b"INTEGER" | b"REAL" | b"TEXT" | b"BLOB" | b"ANY" => true,
+        _ => false,
+    });
+    if is_base_type {
+        bail_parse_error!("cannot create type \"{normalized_name}\": name is a built-in type");
+    }
+
+    // Check if type already exists
+    if resolver
+        .schema()
+        .get_type_def_unchecked(&normalized_name)
+        .is_some()
+    {
+        if if_not_exists {
+            return Ok(());
+        }
+        bail_parse_error!("type {normalized_name} already exists");
+    }
+
+    // Validate encode/decode expressions for safety (only for custom types)
+    if let ast::CreateTypeBody::CustomType {
+        ref encode,
+        ref decode,
+        ..
+    } = body
+    {
+        if let Some(ref encode) = encode {
+            validate_type_expr(encode, "ENCODE", resolver)?;
+        }
+        if let Some(ref decode) = decode {
+            validate_type_expr(decode, "DECODE", resolver)?;
+        }
+    }
+
+    // Build canonical SQL (without IF NOT EXISTS) for persistence
+    let sql = build_create_type_sql(&normalized_name, body);
+
+    persist_type_definition(normalized_name, sql, resolver, program)
+}
+
+/// Build canonical CREATE TYPE SQL from a normalized name and parsed body.
+fn build_create_type_sql(name: &str, body: &ast::CreateTypeBody) -> String {
+    use crate::util::quote_identifier as quote_ident;
+    fn quote_string_literal(s: &str) -> String {
+        s.replace('\'', "''")
+    }
+
+    match body {
+        ast::CreateTypeBody::CustomType {
+            params,
+            base,
+            encode,
+            decode,
+            default,
+            operators,
+        } => {
+            let mut sql = if params.is_empty() {
+                format!(
+                    "CREATE TYPE {} BASE {}",
+                    quote_ident(name),
+                    quote_ident(base)
+                )
+            } else {
+                let param_strs: Vec<String> = params
+                    .iter()
+                    .map(|p| match &p.ty {
+                        Some(ty) => format!("{} {}", quote_ident(&p.name), ty),
+                        None => quote_ident(&p.name),
+                    })
+                    .collect();
+                format!(
+                    "CREATE TYPE {}({}) BASE {}",
+                    quote_ident(name),
+                    param_strs.join(", "),
+                    quote_ident(base)
+                )
+            };
+            if let Some(ref encode) = encode {
+                sql.push_str(&format!(" ENCODE {encode}"));
+            }
+            if let Some(ref decode) = decode {
+                sql.push_str(&format!(" DECODE {decode}"));
+            }
+            if let Some(ref default) = default {
+                sql.push_str(&format!(" DEFAULT {default}"));
+            }
+            for op in operators {
+                match &op.func_name {
+                    Some(func_name) => sql.push_str(&format!(
+                        " OPERATOR '{}' {}",
+                        quote_string_literal(&op.op),
+                        quote_ident(func_name)
+                    )),
+                    None => sql.push_str(&format!(" OPERATOR '{}'", quote_string_literal(&op.op))),
+                }
+            }
+            sql
+        }
+        ast::CreateTypeBody::Struct(fields) => {
+            let field_strs: Vec<String> = fields
+                .iter()
+                .map(|f| {
+                    format!(
+                        "{} {}",
+                        quote_ident(f.name.as_str()),
+                        quote_ident(&f.field_type.name)
+                    )
+                })
+                .collect();
+            format!(
+                "CREATE TYPE {} AS STRUCT({})",
+                quote_ident(name),
+                field_strs.join(", ")
+            )
+        }
+        ast::CreateTypeBody::Union(fields) => {
+            let variant_strs: Vec<String> = fields
+                .iter()
+                .map(|f| {
+                    format!(
+                        "{} {}",
+                        quote_ident(f.name.as_str()),
+                        quote_ident(&f.field_type.name)
+                    )
+                })
+                .collect();
+            format!(
+                "CREATE TYPE {} AS UNION({})",
+                quote_ident(name),
+                variant_strs.join(", ")
+            )
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn translate_create_domain(
+    domain_name: &str,
+    base_type: &str,
+    not_null: bool,
+    constraints: &[ast::DomainConstraint],
+    default: Option<Box<ast::Expr>>,
+    if_not_exists: bool,
+    resolver: &Resolver,
+    program: &mut ProgramBuilder,
+) -> Result<()> {
+    let normalized_name = normalize_ident(domain_name);
+
+    // Reject names that shadow SQLite base types
+    let is_base_type = turso_macros::match_ignore_ascii_case!(match normalized_name.as_bytes() {
+        b"INT" | b"INTEGER" | b"REAL" | b"TEXT" | b"BLOB" | b"ANY" => true,
+        _ => false,
+    });
+    if is_base_type {
+        bail_parse_error!("cannot create domain \"{normalized_name}\": name is a built-in type");
+    }
+
+    // Check if type/domain already exists
+    if resolver
+        .schema()
+        .get_type_def_unchecked(&normalized_name)
+        .is_some()
+    {
+        if if_not_exists {
+            return Ok(());
+        }
+        bail_parse_error!("type {normalized_name} already exists");
+    }
+
+    // Validate base type exists — must be a primitive or a registered type
+    let base_normalized = normalize_ident(base_type);
+    let is_primitive = turso_macros::match_ignore_ascii_case!(match base_normalized.as_bytes() {
+        b"INT" | b"INTEGER" | b"REAL" | b"TEXT" | b"BLOB" => true,
+        _ => false,
+    });
+    if !is_primitive
+        && resolver
+            .schema()
+            .get_type_def_unchecked(&base_normalized)
+            .is_none()
+    {
+        bail_parse_error!("base type \"{base_type}\" does not exist");
+    }
+
+    // Validate no cycles — check if base type chain is acyclic
+    if !is_primitive {
+        resolver
+            .schema()
+            .resolve_base_type_chain(&base_normalized)?;
+    }
+
+    // Validate CHECK and DEFAULT expressions (reject subqueries, aggregates, etc.)
+    for c in constraints {
+        validate_type_expr(&c.check, "domain CHECK", resolver)?;
+    }
+    if let Some(ref def) = default {
+        validate_type_expr(def, "domain DEFAULT", resolver)?;
+    }
+
+    // Build the CREATE DOMAIN SQL for persistence
+    let sql = {
+        let mut s = format!("CREATE DOMAIN {normalized_name} AS {base_type}");
+        if let Some(ref def) = default {
+            s.push_str(&format!(" DEFAULT {def}"));
+        }
+        if not_null {
+            s.push_str(" NOT NULL");
+        }
+        for c in constraints {
+            if let Some(ref name) = c.name {
+                s.push_str(&format!(" CONSTRAINT {name}"));
+            }
+            s.push_str(&format!(" CHECK ({})", c.check));
+        }
+        s
+    };
+
+    persist_type_definition(normalized_name, sql, resolver, program)
+}
+
+pub fn translate_drop_type(
+    type_name: &str,
+    if_exists: bool,
+    is_domain_drop: bool,
+    resolver: &Resolver,
+    program: &mut ProgramBuilder,
+) -> Result<()> {
+    let normalized_name = normalize_ident(type_name);
+    let kind = if is_domain_drop { "domain" } else { "type" };
 
     // Check if type exists
     let type_def = resolver.schema().get_type_def_unchecked(&normalized_name);
@@ -2286,11 +2757,22 @@ pub fn translate_drop_type(
         if if_exists {
             return Ok(());
         }
-        bail_parse_error!("no such type: {normalized_name}");
+        bail_parse_error!("no such {kind}: {normalized_name}");
+    }
+
+    let type_def = type_def.unwrap();
+
+    // Validate that DROP TYPE targets a type and DROP DOMAIN targets a domain
+    let target_is_domain = type_def.is_domain;
+    if is_domain_drop && !target_is_domain {
+        bail_parse_error!("{normalized_name} is a type, not a domain. Use DROP TYPE instead");
+    }
+    if !is_domain_drop && target_is_domain {
+        bail_parse_error!("{normalized_name} is a domain, not a type. Use DROP DOMAIN instead");
     }
 
     // Check if built-in type
-    if type_def.unwrap().is_builtin {
+    if type_def.is_builtin {
         bail_parse_error!("cannot drop built-in type: {normalized_name}");
     }
 
@@ -2304,6 +2786,17 @@ pub fn translate_drop_type(
                     table.get_name()
                 );
             }
+        }
+    }
+
+    // Check if any other type/domain depends on this type
+    for (name, td) in resolver.schema().type_registry.iter() {
+        if normalize_ident(td.base()) == normalized_name {
+            bail_parse_error!(
+                "cannot drop type {}: type {} depends on it",
+                normalized_name,
+                name
+            );
         }
     }
 
@@ -2357,7 +2850,7 @@ pub fn translate_drop_type(
         is_part_of_update: false,
     });
 
-    program.resolve_label(skip_delete_label, program.offset());
+    program.preassign_label_to_next_insn(skip_delete_label);
 
     program.emit_insn(Insn::Next {
         cursor_id: types_cursor_id,

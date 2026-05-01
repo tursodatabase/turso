@@ -1,0 +1,110 @@
+@database :memory:
+
+@cross-check-integrity
+test pragma-foreign-key-list-mixed {
+    CREATE TABLE parent(
+        id INTEGER PRIMARY KEY,
+        code TEXT UNIQUE,
+        a INTEGER,
+        b INTEGER,
+        UNIQUE(a, b)
+    );
+    CREATE TABLE child(
+        implicit_parent REFERENCES parent,
+        code_ref TEXT REFERENCES parent(code) ON UPDATE CASCADE ON DELETE SET NULL,
+        a INTEGER,
+        b INTEGER,
+        FOREIGN KEY(a, b) REFERENCES parent(a, b) ON UPDATE SET DEFAULT ON DELETE RESTRICT DEFERRABLE INITIALLY DEFERRED
+    );
+    PRAGMA foreign_key_list('child');
+}
+expect {
+    0|0|parent|a|a|SET DEFAULT|RESTRICT|NONE
+    0|1|parent|b|b|SET DEFAULT|RESTRICT|NONE
+    1|0|parent|code_ref|code|CASCADE|SET NULL|NONE
+    2|0|parent|implicit_parent||NO ACTION|NO ACTION|NONE
+}
+
+@cross-check-integrity
+test pragma-foreign-key-list-equals-syntax {
+    CREATE TABLE parent(id INTEGER PRIMARY KEY, code TEXT UNIQUE);
+    CREATE TABLE child(
+        parent_id REFERENCES parent(id),
+        code_ref REFERENCES parent(code) ON UPDATE CASCADE
+    );
+    PRAGMA foreign_key_list=child;
+}
+expect {
+    0|0|parent|code_ref|code|CASCADE|NO ACTION|NONE
+    1|0|parent|parent_id|id|NO ACTION|NO ACTION|NONE
+}
+
+@cross-check-integrity
+test pragma-foreign-key-list-table-valued-function {
+    CREATE TABLE parent(id INTEGER PRIMARY KEY, code TEXT UNIQUE);
+    CREATE TABLE child(
+        parent_id REFERENCES parent(id),
+        code_ref REFERENCES parent(code) ON DELETE CASCADE
+    );
+    SELECT id, seq, "table", "from", "to", on_update, on_delete, match
+      FROM pragma_foreign_key_list('child')
+     ORDER BY id, seq;
+}
+expect {
+    0|0|parent|code_ref|code|NO ACTION|CASCADE|NONE
+    1|0|parent|parent_id|id|NO ACTION|NO ACTION|NONE
+}
+
+@cross-check-integrity
+test pragma-foreign-key-list-hidden-arg {
+    CREATE TABLE parent(id INTEGER PRIMARY KEY, code TEXT UNIQUE);
+    CREATE TABLE child(
+        parent_id REFERENCES parent(id),
+        code_ref REFERENCES parent(code)
+    );
+    SELECT arg, "from", "to"
+      FROM pragma_foreign_key_list
+     WHERE arg = 'child'
+     ORDER BY id, seq;
+}
+expect {
+    child|code_ref|code
+    child|parent_id|id
+}
+
+test pragma-foreign-key-list-empty-results {
+    CREATE TABLE parent(id INTEGER PRIMARY KEY);
+    CREATE TABLE child(id INTEGER PRIMARY KEY);
+    PRAGMA foreign_key_list;
+    PRAGMA foreign_key_list('missing');
+    SELECT * FROM pragma_foreign_key_list;
+}
+expect {
+}
+
+@cross-check-integrity
+test pragma-foreign-key-list-prefers-temp-shadowed-table {
+    CREATE TABLE parent(id PRIMARY KEY);
+    CREATE TABLE t(main_ref REFERENCES parent(id));
+    CREATE TEMP TABLE t(temp_ref REFERENCES parent(id) ON DELETE CASCADE);
+    PRAGMA foreign_key_list(t);
+    PRAGMA main.foreign_key_list(t);
+    PRAGMA temp.foreign_key_list(t);
+}
+expect {
+    0|0|parent|temp_ref|id|NO ACTION|CASCADE|NONE
+    0|0|parent|main_ref|id|NO ACTION|NO ACTION|NONE
+    0|0|parent|temp_ref|id|NO ACTION|CASCADE|NONE
+}
+
+@skip-if mvcc "attach is not supported for mvcc"
+@cross-check-integrity
+test pragma-foreign-key-list-attached-database {
+    ATTACH ':memory:' AS aux;
+    CREATE TABLE aux.parent(id INTEGER PRIMARY KEY);
+    CREATE TABLE aux.child(parent_id REFERENCES parent(id));
+    PRAGMA aux.foreign_key_list('child');
+}
+expect {
+    0|0|parent|parent_id|id|NO ACTION|NO ACTION|NONE
+}

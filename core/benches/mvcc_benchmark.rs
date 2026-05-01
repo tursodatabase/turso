@@ -57,7 +57,9 @@ fn bench(c: &mut Criterion) {
             let conn = &db.conn;
             let tx_id = db.mvcc_store.begin_tx(conn.get_pager()).unwrap();
             let mv_store = &db.mvcc_store;
-            let mut sm = mv_store.commit_tx(tx_id, conn).unwrap();
+            let mut sm = mv_store
+                .commit_tx(tx_id, conn, turso_core::MAIN_DB_ID)
+                .unwrap();
             // TODO: sync IO hack
             loop {
                 let res = sm.step(mv_store).unwrap();
@@ -84,7 +86,9 @@ fn bench(c: &mut Criterion) {
                 )
                 .unwrap();
             let mv_store = &db.mvcc_store;
-            let mut sm = mv_store.commit_tx(tx_id, conn).unwrap();
+            let mut sm = mv_store
+                .commit_tx(tx_id, conn, turso_core::MAIN_DB_ID)
+                .unwrap();
             // TODO: sync IO hack
             loop {
                 let res = sm.step(mv_store).unwrap();
@@ -114,7 +118,9 @@ fn bench(c: &mut Criterion) {
                 )
                 .unwrap();
             let mv_store = &db.mvcc_store;
-            let mut sm = mv_store.commit_tx(tx_id, conn).unwrap();
+            let mut sm = mv_store
+                .commit_tx(tx_id, conn, turso_core::MAIN_DB_ID)
+                .unwrap();
             // TODO: sync IO hack
             loop {
                 let res = sm.step(mv_store).unwrap();

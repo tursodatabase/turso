@@ -14,7 +14,7 @@ use super::{
     emitter::{LimitCtx, Resolver},
     expr::{
         emit_array_decode, expr_is_array, translate_expr, translate_expr_no_constant_opt,
-        NoConstantOptReason,
+        walk_expr, NoConstantOptReason, WalkControl,
     },
     plan::{Distinctness, QueryDestination, ResultSetColumn, SelectPlan, TableReferences},
 };
@@ -101,6 +101,17 @@ pub fn emit_select_result(
                     resolver,
                 )?;
             }
+        }
+    } else {
+        // EXISTS optimization skips column evaluation, but parameters in those
+        // expressions must still be registered for bind validation to succeed.
+        for rc in plan.result_columns.iter() {
+            let _ = walk_expr(&rc.expr, &mut |e| {
+                if let ast::Expr::Variable(variable) = e {
+                    program.register_variable(variable);
+                }
+                Ok(WalkControl::Continue)
+            });
         }
     }
 

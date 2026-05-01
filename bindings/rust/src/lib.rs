@@ -144,7 +144,9 @@ pub struct Builder {
     enable_custom_types: bool,
     enable_index_method: bool,
     enable_materialized_views: bool,
+    enable_vacuum: bool,
     enable_generated_columns: bool,
+    enable_multiprocess_wal: bool,
     vfs: Option<String>,
     encryption_opts: Option<turso_sdk_kit::rsapi::EncryptionOpts>,
     io: Option<Arc<dyn turso_core::IO>>,
@@ -160,7 +162,9 @@ impl Builder {
             enable_custom_types: false,
             enable_index_method: false,
             enable_materialized_views: false,
+            enable_vacuum: false,
             enable_generated_columns: false,
+            enable_multiprocess_wal: false,
             vfs: None,
             encryption_opts: None,
             io: None,
@@ -212,6 +216,16 @@ impl Builder {
         self
     }
 
+    pub fn experimental_vacuum(mut self, enabled: bool) -> Self {
+        self.enable_vacuum = enabled;
+        self
+    }
+
+    pub fn experimental_multiprocess_wal(mut self, enabled: bool) -> Self {
+        self.enable_multiprocess_wal = enabled;
+        self
+    }
+
     pub fn with_io(mut self, vfs: String) -> Self {
         self.vfs = Some(vfs);
         self
@@ -240,8 +254,14 @@ impl Builder {
         if self.enable_materialized_views {
             features.push("views");
         }
+        if self.enable_vacuum {
+            features.push("vacuum");
+        }
         if self.enable_generated_columns {
             features.push("generated_columns");
+        }
+        if self.enable_multiprocess_wal {
+            features.push("multiprocess_wal");
         }
         if features.is_empty() {
             return None;
@@ -484,6 +504,11 @@ impl Statement {
         let mut stmt = self.inner.lock().unwrap();
         stmt.reset()?;
         Ok(())
+    }
+
+    /// Returns the number of rows modified (insert/delete operations) by the most recent executed statement.
+    pub fn n_change(&self) -> u64 {
+        self.inner.lock().unwrap().n_change() as u64
     }
 
     /// Execute a query that returns the first [`Row`].

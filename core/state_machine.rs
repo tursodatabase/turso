@@ -36,6 +36,23 @@ pub struct StateMachine<State: StateTransition> {
     is_finalized: bool,
 }
 
+impl<State: StateTransition> StateTransition for Box<State> {
+    type Context = State::Context;
+    type SMResult = State::SMResult;
+
+    fn step(&mut self, context: &Self::Context) -> Result<TransitionResult<Self::SMResult>> {
+        self.as_mut().step(context)
+    }
+
+    fn finalize(&mut self, context: &Self::Context) -> Result<()> {
+        self.as_mut().finalize(context)
+    }
+
+    fn is_finalized(&self) -> bool {
+        self.as_ref().is_finalized()
+    }
+}
+
 /// A generic state machine that loops calling `transition` until it returns `TransitionResult::Done` or `TransitionResult::Io`.
 impl<State: StateTransition> StateMachine<State> {
     pub fn new(state: State) -> Self {

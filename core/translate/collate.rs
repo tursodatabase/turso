@@ -233,7 +233,7 @@ mod tests {
     use turso_parser::ast::{Literal, Name, Operator, TableInternalId, UnaryOperator};
 
     use crate::{
-        schema::{BTreeTable, ColDef, Column, Table, Type},
+        schema::{BTreeCharacteristics, BTreeTable, ColDef, Column, Table, Type},
         translate::plan::{ColumnUsedMask, IterationDirection, JoinedTable, Operation, Scan},
     };
 
@@ -521,22 +521,17 @@ mod tests {
             collation,
             ColDef::default(),
         )];
-        let logical_to_physical_map = BTreeTable::build_logical_to_physical_map(&columns);
-        let table = Table::BTree(Arc::new(BTreeTable {
-            root_page: 0,
-            has_autoincrement: false,
-            has_rowid: false,
-            is_strict: false,
-            name: "foo".to_string(),
-            primary_key_columns: vec![],
+        let table = Table::BTree(Arc::new(BTreeTable::new(
+            0,
+            "foo".to_string(),
+            vec![],
             columns,
-            unique_sets: vec![],
-            foreign_keys: vec![],
-            check_constraints: vec![],
-            rowid_alias_conflict_clause: None,
-            has_virtual_columns: false,
-            logical_to_physical_map,
-        }));
+            BTreeCharacteristics::empty(),
+            vec![],
+            vec![],
+            vec![],
+            None,
+        )));
         table_references.add_joined_table(JoinedTable {
             op: Operation::Scan(Scan::BTreeTable {
                 iter_dir: IterationDirection::Forwards,
@@ -571,7 +566,6 @@ mod tests {
             left,
             ColDef::default(),
         )];
-        let logical_to_physical_map = BTreeTable::build_logical_to_physical_map(&columns);
         table_references.add_joined_table(JoinedTable {
             op: Operation::Scan(Scan::BTreeTable {
                 iter_dir: IterationDirection::Forwards,
@@ -584,21 +578,17 @@ mod tests {
             identifier: "t1".to_string(),
             internal_id: TableInternalId::from(1),
             join_info: None,
-            table: Table::BTree(Arc::new(BTreeTable {
-                root_page: 0,
-                has_autoincrement: false,
-                has_rowid: true,
-                is_strict: false,
-                name: "t1".to_string(),
-                primary_key_columns: vec![],
+            table: Table::BTree(Arc::new(BTreeTable::new(
+                0,
+                "t1".to_string(),
+                vec![],
                 columns,
-                unique_sets: vec![],
-                foreign_keys: vec![],
-                check_constraints: vec![],
-                rowid_alias_conflict_clause: None,
-                has_virtual_columns: false,
-                logical_to_physical_map,
-            })),
+                BTreeCharacteristics::HAS_ROWID,
+                vec![],
+                vec![],
+                vec![],
+                None,
+            ))),
             indexed: None,
         });
         // Right table t2(id=2)
@@ -611,7 +601,6 @@ mod tests {
             right,
             ColDef::default(),
         )];
-        let logical_to_physical_map = BTreeTable::build_logical_to_physical_map(&columns);
         table_references.add_joined_table(JoinedTable {
             op: Operation::Scan(Scan::BTreeTable {
                 iter_dir: IterationDirection::Forwards,
@@ -624,21 +613,17 @@ mod tests {
             identifier: "t2".to_string(),
             internal_id: TableInternalId::from(2),
             join_info: None,
-            table: Table::BTree(Arc::new(BTreeTable {
-                root_page: 0,
-                has_autoincrement: false,
-                has_rowid: true,
-                is_strict: false,
-                name: "t2".to_string(),
-                primary_key_columns: vec![],
+            table: Table::BTree(Arc::new(BTreeTable::new(
+                0,
+                "t2".to_string(),
+                vec![],
                 columns,
-                unique_sets: vec![],
-                foreign_keys: vec![],
-                check_constraints: vec![],
-                rowid_alias_conflict_clause: None,
-                has_virtual_columns: false,
-                logical_to_physical_map,
-            })),
+                BTreeCharacteristics::HAS_ROWID,
+                vec![],
+                vec![],
+                vec![],
+                None,
+            ))),
             indexed: None,
         });
         table_references
@@ -660,12 +645,12 @@ mod tests {
                 primary_key: true,
                 rowid_alias: true,
                 notnull: false,
+                explicit_notnull: false,
                 unique: true,
                 hidden: false,
                 notnull_conflict_clause: None,
             },
         )];
-        let logical_to_physical_map = BTreeTable::build_logical_to_physical_map(&columns);
         table_references.add_joined_table(JoinedTable {
             op: Operation::Scan(Scan::BTreeTable {
                 iter_dir: IterationDirection::Forwards,
@@ -679,21 +664,17 @@ mod tests {
             internal_id: TableInternalId::from(1),
             join_info: None,
             indexed: None,
-            table: Table::BTree(Arc::new(BTreeTable {
-                root_page: 0,
-                has_autoincrement: false,
-                has_rowid: true,
-                is_strict: false,
-                name: "bar".to_string(),
-                primary_key_columns: vec![("id".to_string(), SortOrder::Asc)],
+            table: Table::BTree(Arc::new(BTreeTable::new(
+                0,
+                "bar".to_string(),
+                vec![("id".to_string(), SortOrder::Asc)],
                 columns,
-                unique_sets: vec![],
-                foreign_keys: vec![],
-                check_constraints: vec![],
-                rowid_alias_conflict_clause: None,
-                has_virtual_columns: false,
-                logical_to_physical_map,
-            })),
+                BTreeCharacteristics::HAS_ROWID,
+                vec![],
+                vec![],
+                vec![],
+                None,
+            ))),
         });
         table_references
     }

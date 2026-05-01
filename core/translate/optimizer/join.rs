@@ -274,7 +274,7 @@ pub fn join_lhs_and_rhs<'a>(
     if let Some(lhs) = lhs {
         let rhs_table_idx = join_order.last().unwrap().original_idx;
         let last_lhs_table_idx = join_order[join_order.len() - 2].original_idx;
-        let lhs_table_numbers: Vec<usize> = lhs.table_numbers().collect();
+        let lhs_table_numbers: TableMask = lhs.table_numbers().collect();
 
         let rhs_has_selective_seek = matches!(
             best_access_method.params,
@@ -375,7 +375,7 @@ pub fn join_lhs_and_rhs<'a>(
             // - products has constraint from items, BUT items is build of an earlier hash join where products was probe
             // - So the constraint IS consumed, and products cursor IS positioned via SeekRowid
             // Get the set of tables that are build tables for hash joins where build_table_idx was probe
-            let tables_already_hash_joined_as_build: Vec<usize> = {
+            let prior_hash_build_mask: TableMask = {
                 let arena = &access_methods_arena;
                 lhs.data
                     .iter()
@@ -399,10 +399,6 @@ pub fn join_lhs_and_rhs<'a>(
                     })
                     .collect()
             };
-            let prior_hash_build_mask: TableMask = tables_already_hash_joined_as_build
-                .iter()
-                .cloned()
-                .collect();
 
             let build_has_prior_constraints = {
                 build_constraints.constraints.iter().any(|c| {
@@ -416,7 +412,7 @@ pub fn join_lhs_and_rhs<'a>(
                     for table_idx in 0..64 {
                         if c.lhs_mask.get(table_idx)
                             && prior_mask.get(table_idx)
-                            && !tables_already_hash_joined_as_build.contains(&table_idx)
+                            && !prior_hash_build_mask.get(table_idx)
                         {
                             // This prior table is NOT handled by a hash join, constraint not consumed
                             return true;
@@ -1173,9 +1169,8 @@ pub(crate) fn compute_best_join_order_with_context<'a>(
                 };
 
                 // Stable iteration keeps tie-breaks consistent across runs.
-                let mut lhs_keys: Vec<usize> = lhs_variants.keys().copied().collect();
-                lhs_keys.sort_unstable();
-                for lhs_key in lhs_keys {
+                let lhs_keys: TableMask = lhs_variants.keys().copied().collect();
+                for lhs_key in &lhs_keys {
                     let lhs = &lhs_variants[&lhs_key];
                     // Build a JoinOrder out of the table bitmask under consideration.
                     for table_no in lhs.table_numbers() {
@@ -1396,7 +1391,7 @@ pub fn compute_greedy_join_order<'a>(
         })
         .collect();
 
-    let mut remaining: Vec<usize> = (0..num_tables).collect();
+    let mut remaining: TableMask = (0..num_tables).collect();
     let mut join_order: Vec<JoinOrderMember> = Vec::with_capacity(num_tables);
 
     // Pick starting table: prefer tables with high "hub score" (referenced by many constraints).
@@ -1408,7 +1403,7 @@ pub fn compute_greedy_join_order<'a>(
         original_idx: first_idx,
         is_outer: false, // First table cannot be outer join RHS
     });
-    remaining.retain(|&x| x != first_idx);
+    remaining.clear(first_idx);
 
     let mut current_plan: Option<JoinN> = join_lhs_and_rhs(
         None,
@@ -1449,7 +1444,7 @@ pub fn compute_greedy_join_order<'a>(
         let mut best: Option<(usize, JoinN)> = None;
 
         let mut has_connected_candidate = false;
-        for &idx in &remaining {
+        for idx in &remaining {
             // Outer join RHS requires all preceding tables joined first
             if let Some(required) = left_join_deps.get(&idx) {
                 if !current_mask.contains_all_set_bits_of(required) {
@@ -1470,7 +1465,7 @@ pub fn compute_greedy_join_order<'a>(
             }
         }
 
-        for &idx in &remaining {
+        for idx in &remaining {
             // Outer join RHS requires all preceding tables joined first
             if let Some(required) = left_join_deps.get(&idx) {
                 if !current_mask.contains_all_set_bits_of(required) {
@@ -1540,7 +1535,7 @@ pub fn compute_greedy_join_order<'a>(
                 .as_ref()
                 .is_some_and(|ji| ji.is_outer()),
         });
-        remaining.retain(|&x| x != next_idx);
+        remaining.clear(next_idx);
         current_plan = Some(next_plan);
     }
 
@@ -1793,7 +1788,10 @@ mod tests {
 
     use super::*;
     use crate::{
-        schema::{BTreeTable, ColDef, Column, Index, IndexColumn, Schema, Table, Type},
+        schema::{
+            BTreeCharacteristics, BTreeTable, ColDef, Column, Index, IndexColumn, Schema, Table,
+            Type,
+        },
         stats::AnalyzeStats,
         translate::{
             optimizer::{
@@ -3208,22 +3206,17 @@ mod tests {
 
     /// Creates a BTreeTable with the given name and columns
     fn _create_btree_table(name: &str, columns: Vec<Column>) -> Arc<BTreeTable> {
-        let logical_to_physical_map = BTreeTable::build_logical_to_physical_map(&columns);
-        Arc::new(BTreeTable {
-            root_page: 1, // Page number doesn't matter for tests
-            name: name.to_string(),
-            has_autoincrement: false,
-            primary_key_columns: vec![],
+        Arc::new(BTreeTable::new(
+            1, // root_page, doesn't matter for tests
+            name.to_string(),
+            vec![],
             columns,
-            has_rowid: true,
-            is_strict: false,
-            unique_sets: vec![],
-            foreign_keys: vec![],
-            check_constraints: vec![],
-            rowid_alias_conflict_clause: None,
-            has_virtual_columns: false,
-            logical_to_physical_map,
-        })
+            BTreeCharacteristics::HAS_ROWID,
+            vec![],
+            vec![],
+            vec![],
+            None,
+        ))
     }
 
     /// Creates a TableReference for a BTreeTable

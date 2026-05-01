@@ -1,3 +1,4 @@
+use crate::translate::expr::emit_table_column;
 use crate::vdbe::builder::SelfTableContext;
 use crate::{
     schema::{GeneratedType, Index, Schema, Table},
@@ -13,6 +14,7 @@ use crate::{
         builder::{CursorKey, CursorType, ProgramBuilder},
         insn::{CmpInsFlags, Insn},
     },
+    HashSet,
 };
 use turso_parser::ast;
 
@@ -138,6 +140,7 @@ fn translate_integrity_check_impl(
     // SQLite's OP_IntegrityCk front-pass and can already emit corruption errors
     // before any row-by-row semantic checks run.
     let mut root_pages = Vec::with_capacity(schema.tables.len() + schema.indexes.len());
+    let mut live_root_pages = HashSet::default();
 
     for table in schema.tables.values() {
         if let Table::BTree(btree_table) = table.as_ref() {
@@ -145,10 +148,12 @@ fn translate_integrity_check_impl(
                 continue;
             }
             root_pages.push(btree_table.root_page);
+            live_root_pages.insert(btree_table.root_page);
             if let Some(indexes) = schema.indexes.get(btree_table.name.as_str()) {
                 for index in indexes {
                     if index.root_page > 0 {
                         root_pages.push(index.root_page);
+                        live_root_pages.insert(index.root_page);
                     }
                 }
             }
@@ -156,7 +161,9 @@ fn translate_integrity_check_impl(
     }
 
     for &dropped_root in &schema.dropped_root_pages {
-        root_pages.push(dropped_root);
+        if !live_root_pages.contains(&dropped_root) {
+            root_pages.push(dropped_root);
+        }
     }
 
     let remaining_errors_reg = program.alloc_register();
@@ -268,7 +275,7 @@ fn translate_integrity_check_impl(
                         unique_nullable.push(true);
                     } else {
                         columns.push(BoundIndexColumn::Column(col.pos_in_table));
-                        unique_nullable.push(!btree_table.columns[col.pos_in_table].notnull());
+                        unique_nullable.push(!btree_table.columns()[col.pos_in_table].notnull());
                     }
                 }
 
@@ -293,16 +300,16 @@ fn translate_integrity_check_impl(
         }
 
         let not_null_columns: Vec<(BoundIndexColumn, String)> = btree_table
-            .columns
+            .columns()
             .iter()
             .enumerate()
             .filter(|(_, col)| col.notnull() && !col.is_rowid_alias())
             .filter_map(|(idx, col)| {
                 let name = col.name.clone().unwrap_or_else(|| format!("column{idx}"));
                 match col.generated_type() {
-                    GeneratedType::Virtual { resolved, .. } => {
+                    GeneratedType::Virtual { expr, .. } => {
                         let bound =
-                            bind_expr_for_table(resolved, &mut table_references, resolver).ok()?;
+                            bind_expr_for_table(expr, &mut table_references, resolver).ok()?;
                         Some((BoundIndexColumn::Expr(Box::new(bound)), name))
                     }
                     GeneratedType::NotGenerated => Some((BoundIndexColumn::Column(idx), name)),
@@ -372,20 +379,24 @@ fn translate_integrity_check_impl(
 
         for check_expr in &bound_checks {
             let check_ok = program.allocate_label();
-            let check_fail = program.allocate_label();
-            translate_condition_expr(
+            // Evaluate the CHECK expression into a register, then branch.
+            // A CHECK constraint passes when the result is TRUE *or* NULL
+            // (only explicit FALSE/0 is a violation), so we use
+            // jump_if_null: true to treat NULL as passing.
+            let check_reg = program.alloc_register();
+            translate_expr_no_constant_opt(
                 program,
-                &table_references,
+                Some(&table_references),
                 check_expr,
-                ConditionMetadata {
-                    jump_if_condition_is_true: true,
-                    jump_target_when_true: check_ok,
-                    jump_target_when_false: check_fail,
-                    jump_target_when_null: check_ok,
-                },
+                check_reg,
                 resolver,
+                NoConstantOptReason::RegisterReuse,
             )?;
-            program.preassign_label_to_next_insn(check_fail);
+            program.emit_insn(Insn::If {
+                reg: check_reg,
+                target_pc: check_ok,
+                jump_if_null: true,
+            });
             program.emit_string8(
                 format!("CHECK constraint failed in {}", btree_table.name),
                 message_reg,
@@ -429,7 +440,16 @@ fn translate_integrity_check_impl(
                 let target = key_start_reg + i;
                 match col {
                     BoundIndexColumn::Column(pos) => {
-                        program.emit_column_or_rowid(table_cursor_id, *pos, target);
+                        emit_table_column(
+                            program,
+                            table_cursor_id,
+                            table_ref_id,
+                            &table_references,
+                            &btree_table.columns()[*pos],
+                            *pos,
+                            target,
+                            resolver,
+                        )?;
                     }
                     BoundIndexColumn::Expr(expr) => {
                         let self_table_context =

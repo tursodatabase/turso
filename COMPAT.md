@@ -76,10 +76,6 @@ ongoing work to pass the full SQLite TCL test suite.
 * 🚧 SQLite query language [[status](#sqlite-query-language)] is partially supported
 * 🚧 SQLite C API [[status](#sqlite-c-api)] is partially supported
 
-### Limitations
-
-* ⛔️ Concurrent access from multiple processes is not supported.
-* ⛔️ Plain VACUUM is not supported (VACUUM INTO is supported).
 
 ## SQLite query language
 
@@ -101,7 +97,7 @@ ongoing work to pass the full SQLite TCL test suite.
 | CREATE VIRTUAL TABLE      | ✅ Yes     |                                                                                   |
 | DELETE                    | ✅ Yes     |                                                                                   |
 | DETACH DATABASE           | ✅ Yes     |                                                                                   |
-| DROP INDEX                | 🚧 Partial | Disabled by default.                                                              |
+| DROP INDEX                | ✅ Yes     |                                                                                   |
 | DROP TABLE                | ✅ Yes     |                                                                                   |
 | DROP TRIGGER              | ✅ Yes     |                                                                                   |
 | DROP VIEW                 | ✅ Yes     |                                                                                   |
@@ -131,7 +127,7 @@ ongoing work to pass the full SQLite TCL test suite.
 | SELECT ... JOIN USING     | ✅ Yes     |                                                                                   |
 | SELECT ... NATURAL JOIN   | ✅ Yes     |                                                                                   |
 | UPDATE                    | ✅ Yes     |                                                                                   |
-| VACUUM                    | 🚧 Partial | VACUUM INTO supported, plain VACUUM not yet                                       |
+| VACUUM                    | 🚧 Partial | VACUUM INTO supported; plain in-place VACUUM is experimental                       |
 | WITH clause               | 🚧 Partial | ❌ No RECURSIVE, no MATERIALIZED, only SELECT supported in CTEs                      |
 | WINDOW functions             | 🚧 Partial | ROW_NUMBER() supported; RANK(), DENSE_RANK(), LAG(), LEAD(), NTILE() not yet     |
 | GENERATED                 | 🚧 Partial      | virtual columns only (no ALTER, partial affinity support)                |
@@ -307,7 +303,8 @@ Feature support of [sqlite expr syntax](https://www.sqlite.org/lang_expr.html).
 | unicode(X)                   | ✅ Yes     |                                                      |
 | unlikely(X)                  | ✅ Yes     |                                                      |
 | upper(X)                     | ✅ Yes     |                                                      |
-| unistr(X)                    | ❌ No      |                                                      |
+| unistr(X)                    | ✅ Yes     |                                                      |
+| unistr_quote(X)              | ✅ Yes     |                                                      |
 | zeroblob(N)                  | ✅ Yes     |                                                      |
 
 #### Mathematical functions
@@ -938,7 +935,7 @@ Modifiers:
 | VOpen          | ✅ Yes    |         |
 | VRename        | ✅ Yes    |         |
 | VUpdate        | ✅ Yes    |         |
-| Vacuum         | ❌ No     |         |
+| Vacuum         | 🚧 Partial     |         |
 | Variable       | ✅ Yes    |         |
 | Yield          | ✅ Yes    |         |
 | ZeroOrNull     | ✅ Yes    |         |

@@ -103,6 +103,36 @@ fn test_sequential_overflow_page(tmp_db: TempDatabase) -> anyhow::Result<()> {
     Ok(())
 }
 
+#[turso_macros::test]
+fn test_insert_without_rowid_table(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let _ = env_logger::try_init();
+    let conn = tmp_db.connect_limbo();
+
+    conn.execute(
+        "CREATE TABLE config (value TEXT NOT NULL, key TEXT PRIMARY KEY, scope TEXT) WITHOUT ROWID",
+    )?;
+    conn.execute("INSERT INTO config (scope, key, value) VALUES ('user', 'theme', 'dark')")?;
+    conn.execute("INSERT INTO config (key, value, scope) VALUES ('language', 'en', 'global')")?;
+
+    let rows: Vec<(String, String, String)> =
+        conn.exec_rows("SELECT key, value, scope FROM config ORDER BY key");
+    assert_eq!(
+        rows,
+        vec![
+            (
+                "language".to_string(),
+                "en".to_string(),
+                "global".to_string()
+            ),
+            ("theme".to_string(), "dark".to_string(), "user".to_string()),
+        ]
+    );
+
+    do_flush(&conn, &tmp_db)?;
+    rusqlite_integrity_check(tmp_db.path.as_path())?;
+    Ok(())
+}
+
 #[turso_macros::test(init_sql = "CREATE TABLE test (x INTEGER PRIMARY KEY);")]
 #[ignore = "this takes too long :)"]
 fn test_sequential_write(tmp_db: TempDatabase) -> anyhow::Result<()> {
@@ -894,6 +924,28 @@ pub fn upsert_conflict(limbo: TempDatabase) {
 }
 
 #[turso_macros::test]
+pub fn insert_returning_qualified_quoted_table(limbo: TempDatabase) {
+    // Regression: qualified column refs in RETURNING (e.g. "users"."id")
+    // failed with `no such table: users` when the table was created with
+    // quoted identifiers, because INSERT stored the joined-table identifier
+    // via `Name::to_string` (which preserves quotes) instead of normalizing
+    // it like DELETE/UPDATE do.
+    let conn = limbo.db.connect().unwrap();
+    conn.execute(r#"CREATE TABLE "users" ("id" INTEGER PRIMARY KEY AUTOINCREMENT, "name" TEXT);"#)
+        .unwrap();
+    assert_eq!(
+        vec![vec![
+            rusqlite::types::Value::Integer(1),
+            rusqlite::types::Value::Text("ret".to_string()),
+        ]],
+        limbo_exec_rows(
+            &conn,
+            r#"INSERT INTO "users" ("name") VALUES ('ret') RETURNING "users"."id", "users"."name""#,
+        )
+    );
+}
+
+#[turso_macros::test]
 pub fn concurrent_writes_over_single_connection(limbo: TempDatabase) {
     const COUNT: usize = 16;
     let conn = limbo.db.connect().unwrap();
@@ -1273,6 +1325,42 @@ pub fn test_conflict_inside_txn(limbo: TempDatabase) {
         ],
         limbo_exec_rows(&conn2, "SELECT * FROM t")
     );
+}
+
+#[turso_macros::test]
+pub fn test_savepoint_rollback_uses_current_wal_snapshot(
+    limbo: TempDatabase,
+) -> anyhow::Result<()> {
+    let _ = env_logger::try_init();
+    let conn1 = limbo.db.connect()?;
+    let conn2 = limbo.db.connect()?;
+
+    conn1.execute("CREATE TABLE t (u1 TEXT UNIQUE, u2 INTEGER UNIQUE, payload TEXT)")?;
+    for i in 1..=8 {
+        conn1.execute(format!("INSERT INTO t VALUES ('u{i}', {i}, 'base')"))?;
+    }
+
+    // Leave conn1's local WAL snapshot behind the committed frames added by conn2.
+    for i in 9..=20 {
+        conn2.execute(format!("INSERT INTO t VALUES ('u{i}', {i}, 'from_conn2')"))?;
+    }
+
+    conn1.execute("SAVEPOINT sp")?;
+    let payload = "X".repeat(4000);
+    assert!(matches!(
+        conn1.execute(format!(
+            "UPDATE t SET payload = '{payload}', u2 = CASE WHEN u2 = 20 THEN 1 ELSE u2 END WHERE TRUE"
+        )),
+        Err(LimboError::Constraint(_))
+    ));
+    conn1.execute("ROLLBACK TO sp")?;
+    conn1.execute("RELEASE sp")?;
+
+    let count: Vec<(i64,)> = conn1.exec_rows("SELECT COUNT(*) FROM t");
+    assert_eq!(count, vec![(20,)]);
+    let integrity: Vec<(String,)> = conn1.exec_rows("PRAGMA integrity_check");
+    assert_eq!(integrity, vec![("ok".to_string(),)]);
+    Ok(())
 }
 
 #[test]

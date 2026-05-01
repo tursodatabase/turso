@@ -1,4 +1,6 @@
-use crate::common::{ExecRows, TempDatabase};
+use crate::common::{limbo_exec_rows, sqlite_exec_rows, ExecRows, TempDatabase};
+use rusqlite::Connection as SqliteConnection;
+use tempfile::TempDir;
 use turso_core::{LimboError, Numeric, StepResult, Value};
 
 #[turso_macros::test(mvcc, init_sql = "create table test (i integer);")]
@@ -73,6 +75,47 @@ fn test_statement_bind(tmp_db: TempDatabase) -> anyhow::Result<()> {
         Ok(())
     })
     .unwrap();
+
+    Ok(())
+}
+
+#[turso_macros::test]
+fn test_open_existing_without_rowid_database(_tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let temp_dir = TempDir::new()?;
+    let db_path = temp_dir.path().join("without_rowid.db");
+    let query = "SELECT key, value FROM config ORDER BY key";
+    let schema_query = "SELECT sql FROM sqlite_schema WHERE name = 'config'";
+
+    let (sqlite_rows, sqlite_schema) = {
+        let sqlite = SqliteConnection::open(&db_path)?;
+        sqlite.pragma_update(None, "journal_mode", "wal")?;
+        sqlite.execute_batch(
+            "CREATE TABLE config (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            ) WITHOUT ROWID;
+            INSERT INTO config VALUES ('language', 'en');
+            INSERT INTO config VALUES ('theme', 'dark');
+            PRAGMA wal_checkpoint(TRUNCATE);",
+        )?;
+
+        (
+            sqlite_exec_rows(&sqlite, query),
+            sqlite_exec_rows(&sqlite, schema_query),
+        )
+    };
+
+    let db = TempDatabase::new_with_existent(&db_path);
+    let conn = db.connect_limbo();
+
+    assert_eq!(limbo_exec_rows(&conn, query), sqlite_rows);
+    assert_eq!(limbo_exec_rows(&conn, schema_query), sqlite_schema);
+
+    let err = conn.prepare("SELECT rowid FROM config").unwrap_err();
+    assert!(
+        err.to_string().contains("no such column: rowid"),
+        "expected rowid access to be rejected for WITHOUT ROWID table, got {err}"
+    );
 
     Ok(())
 }
@@ -933,4 +976,96 @@ fn test_too_many_columns_in_select(tmp_db: TempDatabase) {
         result.is_err(),
         "Expected error for UNION with 2001 columns"
     );
+}
+
+#[turso_macros::test(
+    init_sql = "CREATE TABLE profiles (id INTEGER PRIMARY KEY, bio TEXT, user_id INTEGER NOT NULL)"
+)]
+fn test_bind_in_exists_subquery(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let query = "SELECT id, bio, user_id FROM profiles WHERE EXISTS (SELECT ?2 AS column1 FROM (VALUES (?1)) AS tbl_1_0 WHERE tbl_1_0.column1 = profiles.user_id)";
+
+    // Verify expected behavior against sqlite (rusqlite) first.
+    // init_sql already created the table via rusqlite; insert test data and
+    // checkpoint so the row is visible to both engines.
+    {
+        let sqlite_conn = rusqlite::Connection::open(&tmp_db.path)?;
+        sqlite_conn.execute(
+            "INSERT INTO profiles (bio, user_id) VALUES ('Hello', 42)",
+            [],
+        )?;
+        sqlite_conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")?;
+
+        let mut stmt = sqlite_conn.prepare(query)?;
+        let sqlite_rows: Vec<(i64, String, i64)> = stmt
+            .query_map(rusqlite::params![42, 1], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        assert_eq!(sqlite_rows.len(), 1);
+        assert_eq!(sqlite_rows[0].2, 42);
+    }
+
+    // Now verify turso matches sqlite with the same bound parameters.
+    // Use has_slot() assertions to validate parameter registration — this is
+    // the same check that bind_positional() performs in the Rust binding.
+    // bind_at() alone silently succeeds even when parameters are unregistered,
+    // which masked the bug this test is meant to catch.
+    let conn = tmp_db.connect_limbo();
+    let mut stmt = conn.prepare(query)?;
+    assert!(
+        stmt.parameters().has_slot(1.try_into().unwrap()),
+        "parameter ?1 should be registered"
+    );
+    assert!(
+        stmt.parameters().has_slot(2.try_into().unwrap()),
+        "parameter ?2 should be registered"
+    );
+    stmt.bind_at(1.try_into()?, Value::from_i64(42));
+    stmt.bind_at(2.try_into()?, Value::from_i64(1));
+    let mut turso_rows = Vec::new();
+    stmt.run_with_row_callback(|row| {
+        turso_rows.push(row.get::<&Value>(2).unwrap().clone());
+        Ok(())
+    })?;
+    assert_eq!(turso_rows.len(), 1);
+    assert_eq!(turso_rows[0], Value::from_i64(42));
+    Ok(())
+}
+
+/// Column names for bound parameters must match SQLite:
+///   bare `?` → "?", explicit `?NNN` → "?NNN", named → verbatim text.
+#[turso_macros::test(mvcc)]
+fn test_parameter_column_names(tmp_db: TempDatabase) {
+    let cases: &[(&str, &[&str])] = &[
+        ("SELECT ?, ?", &["?", "?"]),
+        ("SELECT ?1, ?2", &["?1", "?2"]),
+        ("SELECT ?999", &["?999"]),
+        ("SELECT :foo", &[":foo"]),
+        ("SELECT @bar", &["@bar"]),
+        ("SELECT $baz", &["$baz"]),
+        (
+            "SELECT ?, ?1, :foo, @bar, $baz",
+            &["?", "?1", ":foo", "@bar", "$baz"],
+        ),
+        ("SELECT ? AS alias", &["alias"]),
+    ];
+
+    // Verify expected values against rusqlite (bundled SQLite)
+    let sqlite_conn = rusqlite::Connection::open_in_memory().unwrap();
+    for (sql, expected) in cases {
+        let stmt = sqlite_conn.prepare(sql).unwrap();
+        let names: Vec<&str> = stmt.column_names();
+        assert_eq!(names, *expected, "SQLite column names mismatch for: {sql}");
+    }
+
+    // Verify Turso matches
+    let conn = tmp_db.connect_limbo();
+    for (sql, expected) in cases {
+        let stmt = conn.prepare(sql).unwrap();
+        let names: Vec<String> = (0..stmt.num_columns())
+            .map(|i| stmt.get_column_name(i).to_string())
+            .collect();
+        let expected: Vec<String> = expected.iter().map(|s| s.to_string()).collect();
+        assert_eq!(names, expected, "Turso column names mismatch for: {sql}");
+    }
 }

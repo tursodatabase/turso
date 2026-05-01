@@ -1,6 +1,6 @@
 {
   "name": "@tursodatabase/sync-common",
-  "version": "0.6.0-pre.17",
+  "version": "0.6.0-pre.25",
   "repository": {
     "type": "git",
     "url": "https://github.com/tursodatabase/turso"
@@ -15,6 +15,7 @@
     "README.md"
   ],
   "devDependencies": {
+    "@types/node": "^24.12.2",
     "typescript": "^5.9.2"
   },
   "scripts": {
@@ -23,7 +24,7 @@
     "test": "echo 'no tests'"
   },
   "dependencies": {
-    "@tursodatabase/database-common": "^0.6.0-pre.17",
+    "@tursodatabase/database-common": "^0.6.0-pre.25",
     "@tursodatabase/serverless": "^0.2.2"
   }
 }

@@ -1,23 +1,21 @@
-use crate::sync::Arc;
-use rustc_hash::FxHashMap as HashMap;
-
 use crate::error::SQLITE_CONSTRAINT_UNIQUE;
 use crate::function::{Deterministic, Func, ScalarFunc};
 use crate::index_method::IndexMethodConfiguration;
 use crate::numeric::Numeric;
 use crate::schema::{Column, GeneratedType, Table, EXPR_INDEX_SENTINEL, RESERVED_TABLE_PREFIXES};
-use crate::translate::collate::CollationSeq;
-use crate::translate::emitter::{
-    emit_cdc_autocommit_commit, emit_cdc_full_record, emit_cdc_insns, prepare_cdc_if_necessary,
-    OperationMode, Resolver,
-};
-use crate::translate::expr::{
-    bind_and_rewrite_expr, translate_condition_expr, translate_expr, unwrap_parens, walk_expr,
-    BindingBehavior, ConditionMetadata, WalkControl,
-};
-use crate::translate::insert::format_unique_violation_desc;
-use crate::translate::plan::{
-    ColumnUsedMask, IterationDirection, JoinedTable, Operation, Scan, TableReferences,
+use crate::sync::Arc;
+use crate::translate::{
+    collate::CollationSeq,
+    emitter::{
+        emit_cdc_autocommit_commit, emit_cdc_full_record, emit_cdc_insns, prepare_cdc_if_necessary,
+        OperationMode, Resolver,
+    },
+    expr::{
+        bind_and_rewrite_expr, translate_condition_expr, translate_expr, unwrap_parens, walk_expr,
+        BindingBehavior, ConditionMetadata, WalkControl,
+    },
+    insert::format_unique_violation_desc,
+    plan::{ColumnUsedMask, IterationDirection, JoinedTable, Operation, Scan, TableReferences},
 };
 use crate::vdbe::builder::{CursorKey, ProgramBuilderOpts, SelfTableContext};
 use crate::vdbe::insn::{to_u16, CmpInsFlags, Cookie};
@@ -25,12 +23,13 @@ use crate::{bail_parse_error, CaptureDataChangesExt, LimboError, MAIN_DB_ID};
 use crate::{
     schema::{BTreeTable, Index, IndexColumn, PseudoCursorType},
     storage::pager::CreateBTreeFlags,
-    util::{escape_sql_string_literal, normalize_ident},
+    util::{escape_sql_string_literal, normalize_ident, PRIMARY_KEY_AUTOMATIC_INDEX_NAME_PREFIX},
     vdbe::{
         builder::{CursorType, ProgramBuilder},
         insn::{IdxInsertFlags, Insn, RegisterOrLiteral},
     },
 };
+use rustc_hash::FxHashMap as HashMap;
 use turso_parser::ast::{self, Expr, QualifiedName, SortOrder, SortedColumn};
 
 use super::schema::{emit_schema_entry, SchemaEntryType, SQLITE_TABLEID};
@@ -46,6 +45,40 @@ fn canonical_create_index_sql(stmt: &ast::Stmt) -> String {
     // e.g. CREATE INDEX aux.idx1 ON t1 (name) -> CREATE INDEX idx1 ON t1 (name)
     idx_name.db_name = None;
     canonical_stmt.to_string()
+}
+
+fn validate(
+    tbl_name: &str,
+    idx_name: &str,
+    original_idx_name: &QualifiedName,
+    using: &Option<ast::Name>,
+    with_clause: &[(ast::Name, Box<Expr>)],
+    connection: &Arc<crate::Connection>,
+) -> crate::Result<()> {
+    if !connection.experimental_index_method_enabled()
+        && (using.is_some() || !with_clause.is_empty())
+    {
+        bail_parse_error!(
+            "index method is an experimental feature. Enable with --experimental-index-method flag"
+        )
+    }
+    if connection.mvcc_enabled() && using.is_some() {
+        bail_parse_error!("Custom index modules are not supported in MVCC mode");
+    }
+    if tbl_name.eq_ignore_ascii_case("sqlite_sequence") {
+        crate::bail_parse_error!("table sqlite_sequence may not be indexed");
+    }
+    if RESERVED_TABLE_PREFIXES
+        .iter()
+        .any(|prefix| idx_name.starts_with(prefix) || tbl_name.starts_with(prefix))
+        && !connection.is_nested_stmt()
+    {
+        bail_parse_error!(
+            "Object name reserved for internal use: {}",
+            original_idx_name
+        );
+    }
+    Ok(())
 }
 
 pub fn translate_create_index(
@@ -69,18 +102,6 @@ pub fn translate_create_index(
         panic!("translate_create_index must be called with CreateIndex AST node");
     };
 
-    if !connection.experimental_index_method_enabled()
-        && (using.is_some() || !with_clause.is_empty())
-    {
-        bail_parse_error!(
-            "index method is an experimental feature. Enable with --experimental-index-method flag"
-        )
-    }
-
-    if connection.mvcc_enabled() && using.is_some() {
-        bail_parse_error!("Custom index modules are not supported in MVCC mode");
-    }
-
     let original_idx_name = idx_name;
     let database_id = if original_idx_name.db_name.is_some() {
         resolver.resolve_database_id(&original_idx_name)?
@@ -90,24 +111,15 @@ pub fn translate_create_index(
     let idx_name = normalize_ident(original_idx_name.name.as_str());
     let tbl_name = normalize_ident(tbl_name.as_str());
 
-    if tbl_name.eq_ignore_ascii_case("sqlite_sequence") {
-        crate::bail_parse_error!("table sqlite_sequence may not be indexed");
-    }
-    if RESERVED_TABLE_PREFIXES
-        .iter()
-        .any(|prefix| idx_name.starts_with(prefix) || tbl_name.starts_with(prefix))
-        && !connection.is_nested_stmt()
-    {
-        bail_parse_error!(
-            "Object name reserved for internal use: {}",
-            original_idx_name
-        );
-    }
-    let opts = ProgramBuilderOpts {
-        num_cursors: 5,
-        approx_num_insns: 40,
-        approx_num_labels: 5,
-    };
+    validate(
+        &tbl_name,
+        &idx_name,
+        &original_idx_name,
+        &using,
+        &with_clause,
+        connection,
+    )?;
+    let opts = ProgramBuilderOpts::new(5, 40, 5);
     program.extend(&opts);
 
     let schema_cookie = resolver.with_schema(database_id, |s| s.schema_version);
@@ -130,19 +142,28 @@ pub fn translate_create_index(
     let Some(tbl) = table.btree() else {
         crate::bail_parse_error!("Error: table '{tbl_name}' is not a b-tree table.");
     };
+    if !tbl.has_rowid {
+        bail_parse_error!("CREATE INDEX on WITHOUT ROWID tables is not supported");
+    }
     let columns = resolve_sorted_columns(&tbl, &columns)?;
 
-    // Block CREATE INDEX on non-orderable custom type columns
+    // Block CREATE INDEX on non-orderable custom type columns and STRUCT/UNION columns
     for col in &columns {
         if col.expr.is_none() {
             // Simple column reference (not expression index)
-            if let Some(column) = tbl.columns.get(col.pos_in_table) {
+            if let Some(column) = tbl.columns().get(col.pos_in_table) {
                 if let Some(type_def) = resolver
                     .schema()
                     .get_type_def(&column.ty_str, tbl.is_strict)
                 {
-                    if type_def.decode.is_some()
-                        && !type_def.operators.iter().any(|op| op.op == "<")
+                    if type_def.is_struct() || type_def.is_union() {
+                        bail_parse_error!(
+                            "cannot create index on STRUCT/UNION column '{}'",
+                            col.name
+                        );
+                    }
+                    if type_def.decode().is_some()
+                        && !type_def.operators().iter().any(|op| op.op == "<")
                     {
                         bail_parse_error!(
                             "cannot create index on column '{}' of type '{}': type does not declare OPERATOR '<'",
@@ -222,7 +243,7 @@ pub fn translate_create_index(
     );
     let sorter_cursor_id = program.alloc_cursor_id(CursorType::Sorter);
     let pseudo_cursor_id = program.alloc_cursor_id(CursorType::Pseudo(PseudoCursorType {
-        column_count: tbl.columns.len(),
+        column_count: tbl.columns().len(),
     }));
 
     let mut table_references = TableReferences::new(
@@ -368,7 +389,7 @@ pub fn translate_create_index(
         });
 
         if let Some(skip_row_label) = skip_row_label {
-            program.resolve_label(skip_row_label, program.offset());
+            program.preassign_label_to_next_insn(skip_row_label);
         }
         program.emit_insn(Insn::Next {
             cursor_id: table_cursor_id,
@@ -466,7 +487,7 @@ pub fn translate_create_index(
         });
 
         if let Some(skip_row_label) = skip_row_label {
-            program.resolve_label(skip_row_label, program.offset());
+            program.preassign_label_to_next_insn(skip_row_label);
         }
         program.emit_insn(Insn::Next {
             cursor_id: table_cursor_id,
@@ -498,7 +519,7 @@ pub fn translate_create_index(
             // we fall through to Halt with a unique constraint violation error.
             let goto_label = program.allocate_label();
             let label_after_sorter_compare = program.allocate_label();
-            program.resolve_label(goto_label, program.offset());
+            program.preassign_label_to_next_insn(goto_label);
             program.emit_insn(Insn::Goto {
                 target_pc: label_after_sorter_compare,
             });
@@ -585,7 +606,7 @@ pub fn resolve_sorted_columns(
         if let Some((pos, column_name, column)) = resolve_index_column(unwrapped_expr, table) {
             let collation = explicit_collation.or_else(|| column.collation_opt());
             let expr = match column.generated_type() {
-                GeneratedType::Virtual { resolved, .. } => Some(resolved.clone()),
+                GeneratedType::Virtual { expr, .. } => Some(expr.clone()),
                 GeneratedType::NotGenerated => None,
             };
             resolved.push(IndexColumn {
@@ -680,7 +701,7 @@ fn validate_index_expression(expr: &Expr, table: &BTreeTable) -> bool {
     let has_col = |name: &str| {
         let n = normalize_ident(name);
         table
-            .columns
+            .columns()
             .iter()
             .any(|c| c.name.as_ref().is_some_and(|cn| normalize_ident(cn) == n))
     };
@@ -903,11 +924,7 @@ pub fn translate_drop_index(
 ) -> crate::Result<()> {
     let database_id = resolver.resolve_existing_index_database_id(qualified_name)?;
     let idx_name = normalize_ident(qualified_name.name.as_str());
-    let opts = ProgramBuilderOpts {
-        num_cursors: 5,
-        approx_num_insns: 40,
-        approx_num_labels: 5,
-    };
+    let opts = ProgramBuilderOpts::new(5, 40, 5);
     program.extend(&opts);
 
     let schema_cookie = resolver.with_schema(database_id, |s| s.schema_version);
@@ -939,9 +956,13 @@ pub fn translate_drop_index(
             )));
         }
     }
-    // Return an error if the index is associated with a unique or primary key constraint.
+    // Return an error if the index is an auto-generated constraint-backing index.
+    // User-created UNIQUE indexes (via CREATE UNIQUE INDEX) are allowed to be dropped.
     if let Some(ref idx) = maybe_index {
-        if idx.name.starts_with("sqlite_autoindex_") {
+        if idx
+            .name
+            .starts_with(PRIMARY_KEY_AUTOMATIC_INDEX_NAME_PREFIX)
+        {
             return Err(crate::error::LimboError::InvalidArgument(
                 "index associated with UNIQUE or PRIMARY KEY constraint cannot be dropped"
                     .to_string(),
@@ -982,7 +1003,7 @@ pub fn translate_drop_index(
         cursor_id: sqlite_schema_cursor_id,
         pc_if_empty: loop_end_label,
     });
-    program.resolve_label(loop_start_label, program.offset());
+    program.preassign_label_to_next_insn(loop_start_label);
 
     // Read sqlite_schema.name into dest_reg
     let dest_reg = program.alloc_register();
@@ -1020,13 +1041,13 @@ pub fn translate_drop_index(
     program.emit_insn(Insn::Once {
         target_pc_when_reentered: label_once_end,
     });
-    program.resolve_label(label_once_end, program.offset());
+    program.preassign_label_to_next_insn(label_once_end);
 
     if let Some((cdc_cursor_id, _)) = cdc_table {
         let before_record_reg = if program.capture_data_changes_info().has_before() {
             Some(emit_cdc_full_record(
                 program,
-                &sqlite_table.columns,
+                sqlite_table.columns(),
                 sqlite_schema_cursor_id,
                 row_id_reg,
                 sqlite_table.is_strict,
@@ -1053,13 +1074,13 @@ pub fn translate_drop_index(
         is_part_of_update: false,
     });
 
-    program.resolve_label(next_label, program.offset());
+    program.preassign_label_to_next_insn(next_label);
     program.emit_insn(Insn::Next {
         cursor_id: sqlite_schema_cursor_id,
         pc_if_next: loop_start_label,
     });
 
-    program.resolve_label(loop_end_label, program.offset());
+    program.preassign_label_to_next_insn(loop_end_label);
     if let Some((cdc_cursor_id, _)) = cdc_table {
         emit_cdc_autocommit_commit(program, resolver, cdc_cursor_id)?;
     }
@@ -1113,11 +1134,7 @@ pub fn translate_optimize(
         )
     }
 
-    let opts = ProgramBuilderOpts {
-        num_cursors: 5,
-        approx_num_insns: 20,
-        approx_num_labels: 2,
-    };
+    let opts = ProgramBuilderOpts::new(5, 20, 2);
     program.extend(&opts);
 
     let mut indexes_to_optimize = Vec::new();

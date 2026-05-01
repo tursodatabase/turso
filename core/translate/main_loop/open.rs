@@ -83,7 +83,7 @@ impl OpenLoop {
                 if prev_is_anti {
                     if let Some(prev_sa_meta) = t_ctx.meta_semi_anti_joins[prev_table_idx].as_ref()
                     {
-                        program.resolve_label(prev_sa_meta.label_body, program.offset());
+                        program.preassign_label_to_next_insn(prev_sa_meta.label_body);
                     }
                 }
             }
@@ -308,7 +308,7 @@ impl OpenLoop {
                                     };
                                     let num_seek_keys = seek_def.size(&seek_def.start);
                                     let table_columns = if let Table::BTree(btree) = &table.table {
-                                        Some(btree.columns.as_slice())
+                                        Some(btree.columns())
                                     } else {
                                         None
                                     };
@@ -593,7 +593,7 @@ impl OpenLoop {
             if let Some(join_info) = table.join_info.as_ref() {
                 if join_info.is_outer() && !is_outer_hj_probe {
                     let lj_meta = t_ctx.meta_left_joins[joined_table_index].as_ref().unwrap();
-                    program.resolve_label(lj_meta.label_match_flag_set_true, program.offset());
+                    program.preassign_label_to_next_insn(lj_meta.label_match_flag_set_true);
                     program.emit_insn(Insn::Integer {
                         value: 1,
                         dest: lj_meta.reg_match_flag,
@@ -615,8 +615,7 @@ impl OpenLoop {
                     if matches!(hj.join_type, HashJoinType::FullOuter) {
                         let probe_idx = hj.probe_table_idx;
                         if let Some(lj_meta) = t_ctx.meta_left_joins[probe_idx].as_ref() {
-                            program
-                                .resolve_label(lj_meta.label_match_flag_set_true, program.offset());
+                            program.preassign_label_to_next_insn(lj_meta.label_match_flag_set_true);
                             program.emit_insn(Insn::Integer {
                                 value: 1,
                                 dest: lj_meta.reg_match_flag,

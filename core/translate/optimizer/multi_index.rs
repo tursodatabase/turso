@@ -14,8 +14,8 @@ use crate::translate::optimizer::access_method::{
     BranchReadMode, ChosenInSeekCandidate, ResidualConstraintMode,
 };
 use crate::translate::optimizer::constraints::{
-    analyze_binary_term_for_index, constraints_from_where_clause, Constraint, RangeConstraintRef,
-    TableConstraints,
+    analyze_binary_term_for_index, constraints_from_where_clause, summarize_binary_term_for_index,
+    Constraint, RangeConstraintRef, TableConstraints,
 };
 use crate::translate::optimizer::cost::{
     estimate_cost_for_scan_or_seek, estimate_rows_per_seek, rows_per_leaf_page_for_index,
@@ -23,13 +23,14 @@ use crate::translate::optimizer::cost::{
 };
 use crate::translate::optimizer::cost_params::CostModelParams;
 use crate::translate::plan::{
-    InSeekSource, JoinedTable, NonFromClauseSubquery, SetOperation, TableReferences,
+    BitSet, InSeekSource, JoinedTable, NonFromClauseSubquery, SetOperation, TableReferences,
     UnionBranchPrePostFilters, WhereTerm,
 };
 use crate::translate::planner::{table_mask_from_expr, TableMask};
 use rustc_hash::FxHashMap as HashMap;
 use smallvec::SmallVec;
 use std::{collections::VecDeque, sync::Arc};
+use turso_macros::turso_assert_eq;
 use turso_parser::ast::{self, TableInternalId};
 
 #[derive(Debug, Clone)]
@@ -70,6 +71,12 @@ struct AndBranch {
     constraint: Constraint,
     index: Option<Arc<Index>>,
     constraint_refs: Vec<RangeConstraintRef>,
+}
+
+struct AndBranchSummary {
+    where_term_idx: usize,
+    table_col_pos: Option<usize>,
+    index: Option<Arc<Index>>,
 }
 
 /// Internal branch representation while evaluating a candidate multi-index plan.
@@ -323,6 +330,7 @@ fn choose_multi_index_branch_access(
     lhs_mask: &TableMask,
     rhs_idx: usize,
     schema: &Schema,
+    available_indexes: &HashMap<String, VecDeque<Arc<Index>>>,
     base_row_count: RowCountEstimate,
     analyze_stats: &AnalyzeStats,
     params: &CostModelParams,
@@ -334,6 +342,7 @@ fn choose_multi_index_branch_access(
         rhs_idx,
         None,
         schema,
+        available_indexes,
         analyze_stats,
         1.0,
         base_row_count,
@@ -705,7 +714,7 @@ fn evaluate_multi_index_branches(
             additional_consumed_terms,
         } = &set_op
         {
-            for term_idx in additional_consumed_terms.iter().copied() {
+            for term_idx in additional_consumed_terms.iter() {
                 if !consumed_where_terms.contains(&term_idx) {
                     consumed_where_terms.push(term_idx);
                 }
@@ -769,43 +778,32 @@ fn analyze_and_terms_for_multi_index(
     // 3. Can use an index
     // 4. Are not already consumed
     // 5. Are local constraints rather than cross-table join conditions
-    let mut candidate_branches: Vec<AndBranch> = Vec::new();
-    let mut columns_used: Vec<Option<usize>> = Vec::new();
+    let mut candidate_branches: Vec<AndBranchSummary> = Vec::new();
 
     for (where_term_idx, term) in where_clause.iter().enumerate() {
-        if term.consumed {
-            continue;
-        }
-        if matches!(&term.expr, ast::Expr::Binary(_, ast::Operator::Or, _)) {
+        if term.consumed || matches!(&term.expr, ast::Expr::Binary(_, ast::Operator::Or, _)) {
             continue;
         }
 
-        let Some(analyzed) = analyze_binary_term_for_index(
+        let Some(summary) = summarize_binary_term_for_index(
             &term.expr,
-            where_term_idx,
             table_id,
-            table_reference,
             indexes,
             rowid_alias_column,
-            available_indexes,
             table_references,
             subqueries,
-            schema,
-            params,
         ) else {
             continue;
         };
 
-        if !analyzed.constraint.lhs_mask.is_empty() {
+        if !summary.lhs_mask.is_empty() {
             continue;
         }
 
-        columns_used.push(analyzed.constraint.table_col_pos);
-        candidate_branches.push(AndBranch {
+        candidate_branches.push(AndBranchSummary {
             where_term_idx,
-            constraint: analyzed.constraint,
-            index: analyzed.best_index,
-            constraint_refs: analyzed.constraint_refs,
+            table_col_pos: summary.table_col_pos,
+            index: summary.best_index,
         });
     }
 
@@ -818,12 +816,15 @@ fn analyze_and_terms_for_multi_index(
     if let Some(indexes) = indexes {
         for index in indexes.iter().filter(|idx| idx.index_method.is_none()) {
             let mut columns_covered = 0;
-            for (i, col_pos) in columns_used.iter().enumerate() {
+            for (i, branch) in candidate_branches.iter().enumerate() {
+                let col_pos = branch.table_col_pos;
                 if let Some(col_pos) = col_pos {
-                    if let Some(idx_pos) = index.column_table_pos_to_index_pos(*col_pos) {
+                    if let Some(idx_pos) = index.column_table_pos_to_index_pos(col_pos) {
                         if idx_pos < index.columns.len() {
-                            let earlier_covered =
-                                columns_used[..i].iter().filter_map(|c| *c).any(|c| {
+                            let earlier_covered = candidate_branches[..i]
+                                .iter()
+                                .filter_map(|candidate| candidate.table_col_pos)
+                                .any(|c| {
                                     index
                                         .column_table_pos_to_index_pos(c)
                                         .is_some_and(|p| p < idx_pos)
@@ -843,20 +844,51 @@ fn analyze_and_terms_for_multi_index(
 
     // Keep only branches that use distinct named indexes. Rowid (`None`) may
     // still appear more than once because it is not tied to a named index.
-    let mut unique_branches: Vec<AndBranch> = Vec::new();
-    let mut seen_indexes: Vec<Option<String>> = Vec::new();
+    let mut selected_branches: Vec<AndBranchSummary> = Vec::new();
+    let mut seen_indexes: Vec<*const Index> = Vec::new();
     for branch in candidate_branches {
-        let index_name = branch.index.as_ref().map(|idx| idx.name.clone());
-        if index_name.is_some() && seen_indexes.contains(&index_name) {
-            continue;
+        if let Some(index) = branch.index.as_ref() {
+            let index_ptr = Arc::as_ptr(index);
+            if seen_indexes.contains(&index_ptr) {
+                continue;
+            }
+            seen_indexes.push(index_ptr);
         }
-        seen_indexes.push(index_name);
-        unique_branches.push(branch);
+        selected_branches.push(branch);
     }
 
-    if unique_branches.len() < 2 {
+    if selected_branches.len() < 2 {
         return None;
     }
+
+    let unique_branches = selected_branches
+        .into_iter()
+        .map(|branch| {
+            let analyzed = analyze_binary_term_for_index(
+                &where_clause[branch.where_term_idx].expr,
+                branch.where_term_idx,
+                table_id,
+                table_reference,
+                indexes,
+                rowid_alias_column,
+                available_indexes,
+                table_references,
+                subqueries,
+                schema,
+                params,
+            )
+            .expect("multi-index prepass accepted a term that full analysis rejected");
+
+            turso_assert_eq!(analyzed.constraint.table_col_pos, branch.table_col_pos);
+
+            AndBranch {
+                where_term_idx: branch.where_term_idx,
+                constraint: analyzed.constraint,
+                index: analyzed.best_index,
+                constraint_refs: analyzed.constraint_refs,
+            }
+        })
+        .collect::<Vec<_>>();
 
     Some(AndClauseDecomposition {
         term_indices: unique_branches.iter().map(|b| b.where_term_idx).collect(),
@@ -940,6 +972,7 @@ pub fn consider_multi_index_union(
                     lhs_mask,
                     rhs_idx,
                     schema,
+                    available_indexes,
                     base_row_count,
                     analyze_stats,
                     params,
@@ -1081,7 +1114,7 @@ pub fn consider_multi_index_intersection(
         .collect();
 
     let where_term_idx = decomposition.term_indices[0];
-    let additional_consumed_terms: Vec<usize> =
+    let additional_consumed_terms: BitSet =
         decomposition.term_indices.iter().skip(1).copied().collect();
 
     evaluate_multi_index_branches(
@@ -1109,7 +1142,10 @@ mod tests {
         MultiIndexBranchParams,
     };
     use crate::{
-        schema::{BTreeTable, ColDef, Column, Index, IndexColumn, Schema, Table, Type},
+        schema::{
+            BTreeCharacteristics, BTreeTable, ColDef, Column, Index, IndexColumn, Schema, Table,
+            Type,
+        },
         translate::{
             optimizer::{
                 access_method::AccessMethodParams,
@@ -1164,22 +1200,17 @@ mod tests {
     }
 
     fn create_btree_table(name: &str, columns: Vec<Column>) -> Arc<BTreeTable> {
-        let logical_to_physical_map = BTreeTable::build_logical_to_physical_map(&columns);
-        Arc::new(BTreeTable {
-            root_page: 1,
-            name: name.to_string(),
-            has_autoincrement: false,
-            primary_key_columns: vec![],
+        Arc::new(BTreeTable::new(
+            1,
+            name.to_string(),
+            vec![],
             columns,
-            has_rowid: true,
-            is_strict: false,
-            unique_sets: vec![],
-            foreign_keys: vec![],
-            check_constraints: vec![],
-            rowid_alias_conflict_clause: None,
-            has_virtual_columns: false,
-            logical_to_physical_map,
-        })
+            BTreeCharacteristics::HAS_ROWID,
+            vec![],
+            vec![],
+            vec![],
+            None,
+        ))
     }
 
     fn create_table_reference(

@@ -1,0 +1,50 @@
+@database :memory:
+@requires-file custom_types "uses custom types"
+
+@requires strict "uses custom types which require STRICT tables"
+
+test partial-index-union-tag-insert {
+    CREATE TYPE u1 AS UNION(u1_v0 INTEGER[], u1_v1 TEXT);
+    CREATE TABLE t1(id INT PRIMARY KEY, x u1) STRICT;
+    CREATE INDEX pidx ON t1(id) WHERE union_tag(x) = 'u1_v0';
+    INSERT INTO t1 VALUES (1, union_value('u1_v0', ARRAY[1, 2]));
+    INSERT INTO t1 VALUES (2, union_value('u1_v1', 'hello'));
+    INSERT INTO t1 VALUES (3, union_value('u1_v0', ARRAY[3]));
+    SELECT id, union_tag(x) FROM t1 ORDER BY id;
+}
+expect {
+    1|u1_v0
+    2|u1_v1
+    3|u1_v0
+}
+
+test partial-index-union-tag-update {
+    CREATE TYPE u1 AS UNION(u1_v0 INTEGER[], u1_v1 TEXT);
+    CREATE TABLE t1(id INT PRIMARY KEY, x u1) STRICT;
+    CREATE INDEX pidx ON t1(id) WHERE union_tag(x) = 'u1_v0';
+    INSERT INTO t1 VALUES (1, union_value('u1_v0', ARRAY[1, 2]));
+    INSERT INTO t1 VALUES (2, union_value('u1_v1', 'hello'));
+    UPDATE t1 SET x = union_value('u1_v1', 'changed') WHERE id = 1;
+    UPDATE t1 SET x = union_value('u1_v0', ARRAY[9]) WHERE id = 2;
+    SELECT id, union_tag(x) FROM t1 ORDER BY id;
+}
+expect {
+    1|u1_v1
+    2|u1_v0
+}
+
+test partial-index-union-tag-upsert {
+    CREATE TYPE u1 AS UNION(u1_v0 INTEGER[], u1_v1 TEXT);
+    CREATE TABLE t1(id INT PRIMARY KEY, x u1) STRICT;
+    CREATE INDEX pidx ON t1(id) WHERE union_tag(x) = 'u1_v0';
+    INSERT INTO t1 VALUES (1, union_value('u1_v0', ARRAY[1, 2]));
+    INSERT INTO t1 VALUES (1, union_value('u1_v1', 'upserted'))
+        ON CONFLICT(id) DO UPDATE SET x = excluded.x;
+    INSERT INTO t1 VALUES (2, union_value('u1_v0', ARRAY[5]))
+        ON CONFLICT(id) DO UPDATE SET x = excluded.x;
+    SELECT id, union_tag(x) FROM t1 ORDER BY id;
+}
+expect {
+    1|u1_v1
+    2|u1_v0
+}

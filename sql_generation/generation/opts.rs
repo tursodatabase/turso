@@ -99,6 +99,8 @@ pub struct QueryOpts {
 pub struct SelectOpts {
     #[garde(range(min = 0.0, max = 1.0))]
     pub order_by_prob: f64,
+    #[garde(range(min = 1, max = 64))]
+    pub free_expr_size: u32,
     #[garde(length(min = 1))]
     pub compound_selects: Vec<CompoundSelectWeight>,
 }
@@ -107,6 +109,7 @@ impl Default for SelectOpts {
     fn default() -> Self {
         Self {
             order_by_prob: 0.3,
+            free_expr_size: 8,
             compound_selects: vec![
                 CompoundSelectWeight {
                     num_compound_selects: 0,

@@ -1,8 +1,13 @@
-use crate::schema::{SchemaObjectType, DBSP_TABLE_PREFIX, RESERVED_TABLE_PREFIXES};
+use crate::incremental::{compiler::DBSP_CIRCUIT_VERSION, view::IncrementalView};
+use crate::schema::{
+    BTreeCharacteristics, BTreeTable, SchemaObjectType, DBSP_TABLE_PREFIX, RESERVED_TABLE_PREFIXES,
+};
 use crate::storage::pager::CreateBTreeFlags;
 use crate::sync::Arc;
-use crate::translate::emitter::Resolver;
-use crate::translate::schema::{emit_schema_entry, SchemaEntryType, SQLITE_TABLEID};
+use crate::translate::{
+    emitter::Resolver,
+    schema::{emit_schema_entry, SchemaEntryType, SQLITE_TABLEID},
+};
 use crate::util::{
     escape_sql_string_literal, normalize_ident, PRIMARY_KEY_AUTOMATIC_INDEX_NAME_PREFIX,
 };
@@ -11,12 +16,11 @@ use crate::vdbe::insn::{CmpInsFlags, Cookie, Insn, RegisterOrLiteral};
 use crate::{bail_parse_error, Connection, Result, MAIN_DB_ID};
 use turso_parser::ast;
 
-pub fn translate_create_materialized_view(
-    view_name: &ast::QualifiedName,
+fn validate_materialized(
+    connection: &Arc<crate::Connection>,
+    database_id: usize,
     resolver: &Resolver,
-    select_stmt: &ast::Select,
-    connection: Arc<Connection>,
-    program: &mut ProgramBuilder,
+    normalized_view_name: &str,
 ) -> Result<()> {
     // Check if experimental views are enabled
     if !connection.experimental_views_enabled() {
@@ -25,45 +29,49 @@ pub fn translate_create_materialized_view(
                 .to_string(),
         ));
     }
-
-    let database_id = resolver.resolve_database_id(view_name)?;
     // The DBSP incremental maintenance runtime (populate_from_table, etc.) assumes
     // the main database pager/schema. Block attached databases until that is fixed.
     if database_id != crate::MAIN_DB_ID {
         crate::bail_parse_error!("materialized views are not supported on attached databases");
     }
-    let schema_cookie = resolver.with_schema(database_id, |s| s.schema_version);
-    program.begin_write_on_database(database_id, schema_cookie);
-
-    let normalized_view_name = normalize_ident(view_name.name.as_str());
     if RESERVED_TABLE_PREFIXES
         .iter()
         .any(|prefix| normalized_view_name.starts_with(prefix))
     {
-        bail_parse_error!(
-            "Object name reserved for internal use: {}",
-            view_name.name.as_str()
-        );
+        bail_parse_error!("Object name reserved for internal use: {normalized_view_name}",);
     }
 
     // Check if view already exists
     if resolver.with_schema(database_id, |s| {
-        s.get_materialized_view(&normalized_view_name).is_some()
+        s.get_materialized_view(normalized_view_name).is_some()
     }) {
         return Err(crate::LimboError::ParseError(format!(
             "View {normalized_view_name} already exists"
         )));
     }
+    Ok(())
+}
+
+pub fn translate_create_materialized_view(
+    view_name: &ast::QualifiedName,
+    resolver: &Resolver,
+    select_stmt: &ast::Select,
+    connection: Arc<Connection>,
+    program: &mut ProgramBuilder,
+) -> Result<()> {
+    let database_id = resolver.resolve_database_id(view_name)?;
+    let schema_cookie = resolver.with_schema(database_id, |s| s.schema_version);
+    program.begin_write_on_database(database_id, schema_cookie);
+    let normalized_view_name = normalize_ident(view_name.name.as_str());
 
     // Validate the view can be created and extract its columns
     // This validation happens before updating sqlite_master to prevent
     // storing invalid view definitions
+    validate_materialized(&connection, database_id, resolver, &normalized_view_name)?;
 
     // Check for cross-database table references first
     crate::util::validate_select_for_views(select_stmt, view_name.db_name.as_ref())?;
 
-    use crate::incremental::view::IncrementalView;
-    use crate::schema::BTreeTable;
     let view_column_schema = resolver.with_schema(database_id, |s| {
         IncrementalView::validate_and_extract_columns(select_stmt, s)
     })?;
@@ -93,23 +101,17 @@ pub fn translate_create_materialized_view(
     });
 
     // Create a proper BTreeTable for the cursor with the actual view columns
-    let logical_to_physical_map = BTreeTable::build_logical_to_physical_map(&view_columns);
-    let view_table = Arc::new(BTreeTable {
-        root_page: 0, // Will be set to actual root page after creation
-        name: normalized_view_name.clone(),
-        columns: view_columns,
-        primary_key_columns: vec![], // Materialized views use implicit rowid
-        has_rowid: true,
-        is_strict: false,
-        has_autoincrement: false,
-
-        unique_sets: vec![],
-        foreign_keys: vec![],
-        check_constraints: vec![],
-        rowid_alias_conflict_clause: None,
-        has_virtual_columns: false,
-        logical_to_physical_map,
-    });
+    let view_table = Arc::new(BTreeTable::new(
+        0, // root_page, will be set to actual root page after creation
+        normalized_view_name.clone(),
+        vec![], // primary_key_columns — materialized views use implicit rowid
+        view_columns,
+        BTreeCharacteristics::HAS_ROWID,
+        vec![],
+        vec![],
+        vec![],
+        None,
+    ));
 
     // Allocate a cursor for writing to the view's btree during population
     let view_cursor_id =
@@ -173,7 +175,6 @@ pub fn translate_create_materialized_view(
 
     // Add the DBSP state table to sqlite_master (required for materialized views)
     // Include the version number in the table name
-    use crate::incremental::compiler::DBSP_CIRCUIT_VERSION;
     let dbsp_table_name = ast::Name::exact(format!(
         "{DBSP_TABLE_PREFIX}{DBSP_CIRCUIT_VERSION}_{normalized_view_name}"
     ));
@@ -265,6 +266,28 @@ fn create_materialized_view_to_str(view_name: &str, select_stmt: &ast::Select) -
     format!("CREATE MATERIALIZED VIEW {view_name} AS {select_stmt}")
 }
 
+fn validate_create_view(
+    resolver: &Resolver,
+    database_id: usize,
+    normalized_view_name: &str,
+) -> Result<()> {
+    // Check if view already exists
+    if resolver.with_schema(database_id, |s| {
+        s.get_view(normalized_view_name).is_some() || s.is_materialized_view(normalized_view_name)
+    }) {
+        return Err(crate::LimboError::ParseError(format!(
+            "View {normalized_view_name} already exists"
+        )));
+    }
+    if RESERVED_TABLE_PREFIXES
+        .iter()
+        .any(|prefix| normalized_view_name.starts_with(prefix))
+    {
+        bail_parse_error!("Object name reserved for internal use: {normalized_view_name}",);
+    }
+    Ok(())
+}
+
 pub fn translate_create_view(
     view_name: &ast::QualifiedName,
     resolver: &Resolver,
@@ -277,15 +300,7 @@ pub fn translate_create_view(
     program.begin_write_on_database(database_id, schema_cookie);
     let normalized_view_name = normalize_ident(view_name.name.as_str());
 
-    if RESERVED_TABLE_PREFIXES
-        .iter()
-        .any(|prefix| normalized_view_name.starts_with(prefix))
-    {
-        bail_parse_error!(
-            "Object name reserved for internal use: {}",
-            view_name.name.as_str()
-        );
-    }
+    validate_create_view(resolver, database_id, &normalized_view_name)?;
 
     // Check for name conflicts with existing schema objects
     if let Some(object_type) =
@@ -298,18 +313,6 @@ pub fn translate_create_view(
         };
         return Err(crate::LimboError::ParseError(format!(
             "{type_str} {normalized_view_name} already exists"
-        )));
-    }
-
-    // Also check materialized views (not in get_object_type since they're stored differently)
-    if resolver
-        .with_schema(database_id, |s| {
-            s.get_materialized_view(&normalized_view_name)
-        })
-        .is_some()
-    {
-        return Err(crate::LimboError::ParseError(format!(
-            "view {normalized_view_name} already exists"
         )));
     }
 
@@ -533,7 +536,7 @@ pub fn translate_drop_view(
         is_part_of_update: false,
     });
 
-    program.resolve_label(skip_delete_label, program.offset());
+    program.preassign_label_to_next_insn(skip_delete_label);
 
     // Move to next row
     program.emit_insn(Insn::Next {
@@ -648,7 +651,7 @@ pub fn translate_drop_view(
             is_part_of_update: false,
         });
 
-        program.resolve_label(dbsp_skip_delete_label, program.offset());
+        program.preassign_label_to_next_insn(dbsp_skip_delete_label);
 
         // Move to next row
         program.emit_insn(Insn::Next {

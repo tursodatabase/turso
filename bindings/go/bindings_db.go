@@ -178,6 +178,7 @@ var (
 	c_turso_statement_row_value_double       func(self TursoStatement, index uintptr) float64
 	c_turso_statement_named_position         func(self TursoStatement, name string) int64
 	c_turso_statement_parameters_count       func(self TursoStatement) int64
+	c_turso_statement_parameter_name         func(self TursoStatement, index int64) uintptr
 	c_turso_statement_bind_positional_null   func(self TursoStatement, position uintptr) turso_status_code_t
 	c_turso_statement_bind_positional_int    func(self TursoStatement, position uintptr, value int64) turso_status_code_t
 	c_turso_statement_bind_positional_double func(self TursoStatement, position uintptr, value float64) turso_status_code_t
@@ -218,6 +219,7 @@ func registerTursoDb(handle uintptr) error {
 	purego.RegisterLibFunc(&c_turso_statement_row_value_double, handle, "turso_statement_row_value_double")
 	purego.RegisterLibFunc(&c_turso_statement_named_position, handle, "turso_statement_named_position")
 	purego.RegisterLibFunc(&c_turso_statement_parameters_count, handle, "turso_statement_parameters_count")
+	purego.RegisterLibFunc(&c_turso_statement_parameter_name, handle, "turso_statement_parameter_name")
 	purego.RegisterLibFunc(&c_turso_statement_bind_positional_null, handle, "turso_statement_bind_positional_null")
 	purego.RegisterLibFunc(&c_turso_statement_bind_positional_int, handle, "turso_statement_bind_positional_int")
 	purego.RegisterLibFunc(&c_turso_statement_bind_positional_double, handle, "turso_statement_bind_positional_double")
@@ -602,6 +604,17 @@ func turso_statement_named_position(self TursoStatement, name string) int64 {
 // turso_statement_parameters_count returns parameters count for the statement.
 func turso_statement_parameters_count(self TursoStatement) int64 {
 	return c_turso_statement_parameters_count(self)
+}
+
+// turso_statement_parameter_name returns the name of the parameter at 1-based
+// index, including its SQL prefix (e.g. ":name", "@name", "$name").
+// Returns "" for positional-only parameters or out-of-range indices.
+func turso_statement_parameter_name(self TursoStatement, index int) string {
+	ptr := c_turso_statement_parameter_name(self, int64(index))
+	if ptr == 0 {
+		return ""
+	}
+	return decodeAndFreeCStringRaw(ptr)
 }
 
 // turso_statement_bind_positional_null binds a positional argument as NULL.

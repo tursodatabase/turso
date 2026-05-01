@@ -580,7 +580,7 @@ pub fn insn_to_row(
                 let cursor_type = &program.cursor_ref[*cursor_id].1;
                 let column_name: Option<&String> = match cursor_type {
                     CursorType::BTreeTable(table) => {
-                        let name = table.columns.get(*column).and_then(|v| v.name.as_ref());
+                        let name = table.columns().get(*column).and_then(|v| v.name.as_ref());
                         name
                     }
                     CursorType::BTreeIndex(index) => {
@@ -588,7 +588,7 @@ pub fn insn_to_row(
                         Some(name)
                     }
                     CursorType::MaterializedView(table, _) => {
-                        let name = table.columns.get(*column).and_then(|v| v.name.as_ref());
+                        let name = table.columns().get(*column).and_then(|v| v.name.as_ref());
                         name
                     }
                     CursorType::Pseudo(_) => None,
@@ -611,6 +611,22 @@ pub fn insn_to_row(
                     ),
                 )
             }
+            Insn::ColumnHasField {
+                cursor_id,
+                column,
+                target_pc,
+            } => (
+                "ColumnHasField",
+                *cursor_id as i64,
+                *column as i64,
+                target_pc.as_debug_int().into(),
+                Value::build_text(""),
+                0,
+                format!(
+                    "if cursor {} record has field {} goto {}",
+                    cursor_id, column, target_pc.as_debug_int()
+                ),
+            ),
             Insn::TypeCheck {
                 start_reg,
                 count,
@@ -693,6 +709,58 @@ pub fn insn_to_row(
                 *start_reg as i64,
                 *count_reg as i64,
                 *dest as i64,
+                Value::build_text(""),
+                0,
+                String::new(),
+            ),
+            Insn::StructField {
+                src_reg,
+                field_index,
+                dest,
+            } => (
+                "StructField",
+                *src_reg as i64,
+                *field_index as i64,
+                *dest as i64,
+                Value::build_text(""),
+                0,
+                String::new(),
+            ),
+            Insn::UnionPack {
+                tag_index,
+                value_reg,
+                dest,
+            } => (
+                "UnionPack",
+                *value_reg as i64,
+                *dest as i64,
+                *tag_index as i64,
+                Value::build_text(""),
+                0,
+                String::new(),
+            ),
+            Insn::UnionTag {
+                src_reg,
+                dest,
+                tag_names: _,
+            } => (
+                "UnionTag",
+                *src_reg as i64,
+                *dest as i64,
+                0,
+                Value::build_text(""),
+                0,
+                String::new(),
+            ),
+            Insn::UnionExtract {
+                src_reg,
+                expected_tag,
+                dest,
+            } => (
+                "UnionExtract",
+                *src_reg as i64,
+                *dest as i64,
+                *expected_tag as i64,
                 Value::build_text(""),
                 0,
                 String::new(),
@@ -900,6 +968,15 @@ pub fn insn_to_row(
                 Value::build_text(program.sql.clone()),
                 0,
                 format!("subprogram={}", program.sql),
+            ),
+            Insn::ResetCount => (
+                "ResetCount",
+                0,
+                0,
+                0,
+                Value::build_text(""),
+                0,
+                "".to_string(),
             ),
             Insn::Real { value, dest } => (
                 "Real",
@@ -2356,6 +2433,15 @@ pub fn insn_to_row(
             Value::build_text(dest_path.to_string()),
             0,
             format!("schema={schema_name}, dest={dest_path}"),
+        ),
+        Insn::Vacuum { db } => (
+            "Vacuum",
+            *db as i64,
+            0,
+            0,
+            Value::Null,
+            0,
+            format!("db={db}"),
         ),
         Insn::InitCdcVersion { cdc_table_name, version, cdc_mode } => (
             "InitCdcVersion",

@@ -1,4 +1,4 @@
-export type ExperimentalFeature = 'views' | 'strict' | 'encryption' | 'index_method' | 'autovacuum' | 'triggers' | 'attach';
+export type ExperimentalFeature = 'views' | 'strict' | 'encryption' | 'index_method' | 'autovacuum' | 'vacuum' | 'triggers' | 'attach' | 'multiprocess_wal';
 
 /** Supported encryption ciphers for local database encryption. */
 export type EncryptionCipher = 'aes128gcm' | 'aes256gcm' | 'aegis256' | 'aegis256x2' | 'aegis128l' | 'aegis128x2' | 'aegis128x4'
@@ -59,7 +59,10 @@ export const STEP_IO = 3;
 
 export interface TableColumn {
     name: string,
-    type: string
+    type: string | null,
+    column: null,
+    table: null,
+    database: null
 }
 
 export interface NativeExecutor {

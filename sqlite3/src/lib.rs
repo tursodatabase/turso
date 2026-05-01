@@ -13,6 +13,12 @@ use turso_ext::Value as ExtValue;
 /// Global flag: when set, all subsequently opened databases enable experimental features.
 static EXPERIMENTAL_ENABLED: AtomicBool = AtomicBool::new(false);
 
+/// Global B-tree search counter exposed to the TCL test harness as
+/// `sqlite_search_count`.
+#[no_mangle]
+#[allow(non_upper_case_globals)]
+pub static mut sqlite3_search_count: ffi::c_int = 0;
+
 /// Enable all experimental features for databases opened after this call.
 #[no_mangle]
 pub extern "C" fn turso_enable_experimental() {
@@ -23,7 +29,7 @@ pub extern "C" fn turso_enable_experimental() {
 fn default_db_opts() -> DatabaseOpts {
     let mut opts = DatabaseOpts::new();
     if EXPERIMENTAL_ENABLED.load(Ordering::Acquire) {
-        opts = opts.with_generated_columns(true);
+        opts = opts.with_generated_columns(true).with_vacuum(true);
     }
     opts
 }
@@ -152,6 +158,9 @@ pub struct sqlite3_stmt {
     /// Cached ExtValue instances for sqlite3_column_value().
     /// Populated lazily per column; cleared on each step/reset.
     pub(crate) value_cache: Vec<Option<ExtValue>>,
+    /// High-water mark of `search_count` already published to the global
+    /// counter, so each step contributes only the delta.
+    pub(crate) prev_search_count: i64,
 }
 
 impl sqlite3_stmt {
@@ -164,6 +173,7 @@ impl sqlite3_stmt {
             next: std::ptr::null_mut(),
             text_cache: vec![vec![]; n_cols],
             value_cache: (0..n_cols).map(|_| None).collect(),
+            prev_search_count: 0,
         }
     }
     #[inline]
@@ -901,7 +911,7 @@ pub unsafe extern "C" fn sqlite3_step(stmt: *mut sqlite3_stmt) -> ffi::c_int {
     let db = &mut *stmt.db;
     let mut db_inner = db.inner.lock().unwrap();
     let res = stmt.stmt.run_one_step_blocking(|| Ok(()), || Ok(()));
-    match res {
+    let rc = match res {
         Ok(Some(_)) => {
             stmt.clear_text_cache();
             SQLITE_ROW
@@ -913,7 +923,12 @@ pub unsafe extern "C" fn sqlite3_step(stmt: *mut sqlite3_stmt) -> ffi::c_int {
         Err(LimboError::Busy) => SQLITE_BUSY,
         Err(LimboError::Interrupt) => SQLITE_INTERRUPT,
         Err(err) => set_db_err(&mut db_inner, err),
-    }
+    };
+    let current = stmt.stmt.metrics().search_count;
+    let delta = current - stmt.prev_search_count;
+    stmt.prev_search_count = current;
+    sqlite3_search_count = sqlite3_search_count.saturating_add(delta as ffi::c_int);
+    rc
 }
 
 type exec_callback = Option<
@@ -1210,6 +1225,7 @@ pub unsafe extern "C" fn sqlite3_reset(stmt: *mut sqlite3_stmt) -> ffi::c_int {
     if let Err(err) = stmt.stmt.reset() {
         return handle_limbo_err(err, std::ptr::null_mut());
     }
+    stmt.prev_search_count = 0;
     stmt.clear_text_cache();
     SQLITE_OK
 }

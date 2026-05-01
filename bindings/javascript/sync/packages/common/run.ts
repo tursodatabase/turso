@@ -9,7 +9,7 @@ interface TrackPromise<T> {
 }
 
 function trackPromise<T>(p: Promise<T>): TrackPromise<T> {
-    let status = { promise: null, finished: false };
+    let status: any = { promise: null, finished: false };
     status.promise = p.finally(() => status.finished = true);
     return status;
 }
@@ -45,13 +45,17 @@ async function process(opts: RunOpts, io: ProtocolIo, request: any) {
                     headers[header[0]] = header[1];
                 }
             }
-            const response = await fetch(`${url}${requestType.path}`, {
+            const fetchImpl = opts.fetch ?? fetch;
+            const response = await fetchImpl(`${url}${requestType.path}`, {
                 method: requestType.method,
                 headers: headers,
                 body: requestType.body != null ? new Uint8Array(requestType.body) : null,
             });
             completion.status(response.status);
-            const reader = response.body.getReader();
+            const reader = response.body?.getReader();
+            if (reader == null) {
+                throw new Error("reader is null");
+            }
             while (true) {
                 const { done, value } = await reader.read();
                 if (done) {
@@ -104,6 +108,84 @@ async function process(opts: RunOpts, io: ProtocolIo, request: any) {
     }
 }
 
+/**
+ * Configuration for {@link retryFetch}.
+ */
+export interface RetryFetchOpts {
+    /** total number of attempts (including the first try). must be >= 1. default: 3 */
+    attempts?: number;
+    /** delay before the second attempt, in milliseconds. default: 500 */
+    delayMs?: number;
+    /** multiplier applied to {@link delayMs} after each failed attempt. default: 2 */
+    backoff?: number;
+    /** underlying fetch implementation to retry around. default: globalThis.fetch */
+    fetch?: typeof fetch;
+}
+
+/**
+ * Wraps a fetch implementation in a retry/backoff loop. Plug into
+ * {@link DatabaseOpts.fetch} to give the sync engine resilient HTTP transport.
+ *
+ * Retries on:
+ *   - thrown network errors (DNS, connection reset, AbortError, etc.)
+ *   - 5xx server responses
+ *   - 429 rate-limit responses
+ *
+ * Does NOT retry on:
+ *   - 2xx, 3xx, or other 4xx responses (auth/bad-request — won't fix itself)
+ *
+ * Defaults: 3 attempts (initial + 2 retries), 500ms initial delay, 2x backoff
+ * (so delays are 500ms, 1000ms between attempts).
+ *
+ * @example
+ * ```ts
+ * import { connect } from '@tursodatabase/sync';
+ * import { retryFetch } from '@tursodatabase/sync-common';
+ *
+ * const db = await connect({
+ *   path: 'local.db',
+ *   url: 'libsql://...',
+ *   fetch: retryFetch(),                              // defaults
+ *   // fetch: retryFetch({ attempts: 5, delayMs: 1000 }),
+ * });
+ * ```
+ */
+export function retryFetch(opts: RetryFetchOpts = {}): typeof fetch {
+    const attempts = opts.attempts ?? 3;
+    const baseDelay = opts.delayMs ?? 500;
+    const backoff = opts.backoff ?? 2;
+    const underlying: typeof fetch = opts.fetch ?? ((input, init) => fetch(input, init));
+    if (!Number.isFinite(attempts) || attempts < 1) {
+        throw new Error(`retryFetch: attempts must be a finite integer >= 1, got ${attempts}`);
+    }
+    return async (input: RequestInfo | URL, init?: RequestInit) => {
+        let lastError: unknown = null;
+        let lastResponse: Response | null = null;
+        let delay = baseDelay;
+        for (let i = 0; i < attempts; i++) {
+            try {
+                const response = await underlying(input, init);
+                if (response.status < 500 && response.status !== 429) {
+                    return response;
+                }
+                lastResponse = response;
+                lastError = null;
+            } catch (error) {
+                lastError = error;
+                lastResponse = null;
+            }
+            if (i + 1 < attempts) {
+                await timeoutMs(delay);
+                delay *= backoff;
+            }
+        }
+        if (lastResponse != null) {
+            return lastResponse;
+        }
+        throw lastError ?? new Error('retryFetch: exhausted with no response');
+    };
+}
+
 export function memoryIO(): ProtocolIo {
     let values = new Map();
     return {
@@ -121,7 +203,7 @@ export interface Runner {
 }
 
 export function runner(opts: RunOpts, io: ProtocolIo, engine: any): Runner {
-    let tasks = [];
+    let tasks: TrackPromise<any>[] = [];
     return {
         async wait() {
             for (let request = engine.protocolIo(); request != null; request = engine.protocolIo()) {

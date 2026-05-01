@@ -1,50 +1,53 @@
-use crate::translate::collate::{get_expr_collation_ctx, CollationSeq};
-use crate::translate::emitter::delete::emit_program_for_delete;
-use crate::translate::emitter::select::emit_program_for_select;
-use crate::translate::emitter::update::emit_program_for_update;
-use crate::translate::main_loop::SemiAntiJoinMetadata;
 // This module contains code for emitting bytecode instructions for SQL query execution.
 // It handles translating high-level SQL operations into low-level bytecode that can be executed by the virtual machine.
-
-use crate::sync::Arc;
-use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
-use std::borrow::Cow;
-use std::cell::RefCell;
-use turso_macros::turso_assert_ne;
-
-use super::expr::{emit_table_column, translate_expr, ExprAffinityInfo};
-use super::group_by::GroupByMetadata;
-use super::main_loop::{LeftJoinMetadata, LoopLabels};
-use super::order_by::SortMetadata;
-use super::plan::{HashJoinType, TableReferences};
-use crate::error::SQLITE_CONSTRAINT_CHECK;
-use crate::function::Func;
-use crate::schema::stored_deps_of_virtual;
+use super::{
+    collate::{get_expr_collation_ctx, CollationSeq},
+    compound_select::emit_program_for_compound_select,
+    emitter::{
+        delete::emit_program_for_delete, select::emit_program_for_select,
+        update::emit_program_for_update,
+    },
+    expr::{
+        bind_and_rewrite_expr, emit_table_column, translate_expr, translate_expr_no_constant_opt,
+        walk_expr, BindingBehavior, ExprAffinityInfo, NoConstantOptReason, WalkControl,
+    },
+    group_by::GroupByMetadata,
+    main_loop::{LeftJoinMetadata, LoopLabels, SemiAntiJoinMetadata},
+    order_by::SortMetadata,
+    plan::{
+        BitSet, HashJoinType, JoinedTable, NonFromClauseSubquery, Plan, ResultSetColumn,
+        TableReferences,
+    },
+    planner::{TableMask, ROWID_STRS},
+    trigger_exec::{get_triggers_including_temp, has_triggers_including_temp},
+    window::WindowMetadata,
+};
+use crate::instrument;
 use crate::schema::{
     BTreeTable, CheckConstraint, Column, ColumnLayout, GeneratedType, IndexColumn, Schema, Table,
 };
-use crate::translate::compound_select::emit_program_for_compound_select;
-use crate::translate::expr::{
-    bind_and_rewrite_expr, translate_expr_no_constant_opt, walk_expr, walk_expr_mut,
-    BindingBehavior, NoConstantOptReason, WalkControl,
+use crate::translate::plan::ColumnMask;
+use crate::vdbe::{
+    affinity::Affinity,
+    builder::{CursorType, DmlColumnContext, ProgramBuilder, SelfTableContext},
+    insn::{to_u16, InsertFlags, Insn},
+    BranchOffset, CursorID,
 };
-use crate::translate::plan::{JoinedTable, NonFromClauseSubquery, Plan, ResultSetColumn};
-use crate::translate::planner::TableMask;
-use crate::translate::planner::ROWID_STRS;
-pub use crate::translate::trigger_exec::{
-    get_triggers_including_temp, has_triggers_including_temp,
+use crate::{
+    bail_parse_error,
+    error::SQLITE_CONSTRAINT_CHECK,
+    function::Func,
+    sync::Arc,
+    turso_assert_ne,
+    util::{
+        check_expr_references_column, exprs_are_equivalent, normalize_ident, parse_numeric_literal,
+    },
+    CaptureDataChangesExt, Connection, Database, DatabaseCatalog, LimboError, Result, RwLock,
+    SymbolTable,
 };
-use crate::translate::window::WindowMetadata;
-use crate::util::{
-    check_expr_references_column, exprs_are_equivalent, normalize_ident, parse_numeric_literal,
-};
-use crate::vdbe::affinity::Affinity;
-use crate::vdbe::builder::{CursorType, DmlColumnContext, ProgramBuilder, SelfTableContext};
-use crate::vdbe::insn::{to_u16, InsertFlags};
-use crate::vdbe::{insn::Insn, BranchOffset, CursorID};
-use crate::{bail_parse_error, Database, DatabaseCatalog, LimboError, Result, RwLock, SymbolTable};
-use crate::{CaptureDataChangesExt, Connection};
-use tracing::instrument;
+use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
+use std::borrow::Cow;
+use std::cell::RefCell;
 use turso_parser::ast::{
     self, Expr, Literal, ResolveType, SubqueryType, TableInternalId, TriggerTime,
 };
@@ -147,6 +150,11 @@ pub struct Resolver<'a> {
     /// mechanism, but operates as a side-channel since limbo rewrites the AST rather
     /// than redirecting column reads at codegen time.
     pub register_affinities: HashMap<usize, Affinity>,
+    /// Column affinities for the SELF_TABLE context (DML expression index evaluation).
+    /// Indexed by table column position. Populated alongside `register_affinities`
+    /// so that `get_expr_affinity_info` can resolve `Expr::Column { SELF_TABLE }`
+    /// affinities when `referenced_tables` is `None`.
+    pub self_table_column_affinities: Vec<Affinity>,
     /// Affinity metadata for planned scalar subqueries keyed by their internal ID.
     /// This lets comparison affinity follow SQLite rules for expressions like
     /// `(SELECT text_col FROM ...) > some_numeric_expr`.
@@ -213,6 +221,7 @@ impl<'a> Resolver<'a> {
             expr_to_reg_cache_enabled: false,
             expr_to_reg_cache: Vec::new(),
             register_affinities: HashMap::default(),
+            self_table_column_affinities: Vec::new(),
             subquery_affinities: RefCell::new(HashMap::default()),
             enable_custom_types,
             dqs_dml,
@@ -240,6 +249,7 @@ impl<'a> Resolver<'a> {
             expr_to_reg_cache_enabled: false,
             expr_to_reg_cache: Vec::new(),
             register_affinities: HashMap::default(),
+            self_table_column_affinities: Vec::new(),
             subquery_affinities: RefCell::new(self.subquery_affinities.borrow().clone()),
             enable_custom_types: self.enable_custom_types,
             dqs_dml: self.dqs_dml,
@@ -259,6 +269,7 @@ impl<'a> Resolver<'a> {
             expr_to_reg_cache_enabled: self.expr_to_reg_cache_enabled,
             expr_to_reg_cache: self.expr_to_reg_cache.clone(),
             register_affinities: self.register_affinities.clone(),
+            self_table_column_affinities: self.self_table_column_affinities.clone(),
             subquery_affinities: RefCell::new(self.subquery_affinities.borrow().clone()),
             enable_custom_types: self.enable_custom_types,
             dqs_dml: self.dqs_dml,
@@ -303,7 +314,13 @@ impl<'a> Resolver<'a> {
                 .read()
                 .as_ref()
                 .map(|temp_db| temp_db.db.schema.lock().clone())
-                .unwrap_or_else(|| Arc::new(Schema::with_options(self.enable_custom_types))),
+                .unwrap_or_else(|| {
+                    // with_options only fails if built-in type SQL is malformed (programmer bug).
+                    Arc::new(
+                        Schema::with_options(self.enable_custom_types)
+                            .expect("built-in type definitions are malformed"),
+                    )
+                }),
             _ => {
                 let attached_dbs = self.attached_databases.read();
                 let (db, _pager) = attached_dbs
@@ -404,16 +421,13 @@ impl<'a> Resolver<'a> {
         }
     }
 
-    pub(crate) fn attached_database_ids_in_search_order(&self) -> Vec<usize> {
-        let mut database_ids: Vec<_> = self
-            .attached_databases
+    pub(crate) fn attached_database_ids_in_search_order(&self) -> BitSet {
+        self.attached_databases
             .read()
             .index_to_data
             .keys()
             .copied()
-            .collect();
-        database_ids.sort_unstable();
-        database_ids
+            .collect()
     }
 
     fn resolve_unqualified_existing_database_id<F>(
@@ -548,8 +562,8 @@ impl<'a> Resolver<'a> {
         let resolved_id = if let Some(db_name) = &qualified_name.db_name {
             let db_name_normalized = normalize_ident(db_name.as_str());
             match db_name_normalized.as_str() {
-                "main" => Ok(0),
-                "temp" => Ok(1),
+                "main" => Ok(crate::MAIN_DB_ID),
+                "temp" => Ok(crate::TEMP_DB_ID),
                 _ => {
                     // Look up attached database
                     if let Some((idx, _attached_db)) =
@@ -899,6 +913,7 @@ pub enum TransactionMode {
 /// Main entry point for emitting bytecode for a SQL query
 /// Takes a query plan and generates the corresponding bytecode program
 #[instrument(skip_all, level = tracing::Level::DEBUG)]
+#[turso_macros::trace_stack]
 pub fn emit_program(
     connection: &Arc<Connection>,
     resolver: &Resolver,
@@ -907,9 +922,9 @@ pub fn emit_program(
     after: impl FnOnce(&mut ProgramBuilder),
 ) -> Result<()> {
     match plan {
-        Plan::Select(plan) => emit_program_for_select(program, resolver, plan),
-        Plan::Delete(plan) => emit_program_for_delete(connection, resolver, program, plan),
-        Plan::Update(plan) => emit_program_for_update(connection, resolver, program, plan, after),
+        Plan::Select(plan) => emit_program_for_select(program, resolver, *plan),
+        Plan::Delete(plan) => emit_program_for_delete(connection, resolver, program, *plan),
+        Plan::Update(plan) => emit_program_for_update(connection, resolver, program, *plan, after),
         Plan::CompoundSelect { .. } => {
             emit_program_for_compound_select(program, resolver, plan).map(|_| ())
         }
@@ -1470,7 +1485,7 @@ pub fn emit_cdc_autocommit_commit(
 
         emit_cdc_commit_insns(program, resolver, cdc_cursor_id)?;
 
-        program.resolve_label(skip_label, program.offset());
+        program.preassign_label_to_next_insn(skip_label);
     }
 
     Ok(())
@@ -1576,90 +1591,79 @@ pub(crate) fn init_limit(
     Ok(())
 }
 
-/// We have `Expr`s which have *not* had column references bound to them,
-/// so they are in the state of Expr::Id/Expr::Qualified, etc, and instead of binding Expr::Column
-/// we need to bind Expr::Register, as we have already loaded the *new* column values from the
-/// UPDATE statement into registers starting at `columns_start_reg`, which we want to reference.
-fn rewrite_where_for_update_registers(
-    expr: &mut Expr,
-    columns: &[Column],
-    columns_start_reg: usize,
-    rowid_reg: usize,
-    layout: &ColumnLayout,
-) -> Result<WalkControl> {
-    walk_expr_mut(expr, &mut |e: &mut Expr| -> Result<WalkControl> {
-        match e {
-            Expr::Qualified(_, col) | Expr::DoublyQualified(_, _, col) => {
-                let normalized = normalize_ident(col.as_str());
-                if let Some((idx, c)) = columns.iter().enumerate().find(|(_, c)| {
-                    c.name
-                        .as_ref()
-                        .is_some_and(|n| n.eq_ignore_ascii_case(&normalized))
-                }) {
-                    if c.is_rowid_alias() {
-                        *e = Expr::Register(rowid_reg);
-                    } else {
-                        *e = Expr::Register(layout.to_register(columns_start_reg, idx));
-                    }
-                }
-            }
-            Expr::Id(name) => {
-                let normalized = normalize_ident(name.as_str());
-                if ROWID_STRS
-                    .iter()
-                    .any(|s| s.eq_ignore_ascii_case(&normalized))
-                {
-                    *e = Expr::Register(rowid_reg);
-                } else if let Some((idx, c)) = columns.iter().enumerate().find(|(_, c)| {
-                    c.name
-                        .as_ref()
-                        .is_some_and(|n| n.eq_ignore_ascii_case(&normalized))
-                }) {
-                    if c.is_rowid_alias() {
-                        *e = Expr::Register(rowid_reg);
-                    } else {
-                        *e = Expr::Register(layout.to_register(columns_start_reg, idx));
-                    }
-                }
-            }
-            Expr::RowId { .. } => {
-                *e = Expr::Register(rowid_reg);
-            }
-            Expr::Column { table, .. } if table.is_self_table() => {
-                return Ok(WalkControl::SkipChildren);
-            }
-            _ => {}
-        }
-        Ok(WalkControl::Continue)
-    })
-}
-
-/// Reads the stored columns needed by `target_columns` into compact registers. This takes into
-/// account stored columns, and any stored columns required by virtual columns in `target_columns`.
-pub(crate) fn cursor_to_registers(
+/// Emits  `target_columns`, plus the stored columns needed by `target_columns`, into compact
+/// registers. This takes into account stored columns, and any stored columns required
+/// by virtual columns in `target_columns`.
+///
+/// Target columns are guaranteed to be in a contiguous block, in the given order, at the start of
+/// registers. The following postcondition holds:
+///
+/// ```text
+/// dml_ctx.to_column_reg(target_columns[i]) == dml_ctx.to_column_reg(target_columns[0]) + i
+/// ```
+///
+/// This way, target_columns[0] can be used as a base for opcodes that require unpacked records.
+pub(crate) fn emit_columns_and_dependencies(
     program: &mut ProgramBuilder,
     table: &BTreeTable,
     cursor_id: usize,
     rowid_reg: usize,
     target_columns: impl IntoIterator<Item = usize>,
-) -> DmlColumnContext {
-    let dependencies = stored_deps_of_virtual(&table.columns, target_columns);
-    let base = program.alloc_registers(dependencies.count());
-    let mut next_reg = base;
-    let pairs = table.columns.iter().enumerate().map(|(idx, col)| {
+    resolver: &Resolver,
+) -> Result<DmlColumnContext> {
+    let targets: Vec<usize> = target_columns.into_iter().collect();
+    let dependencies = table.dependencies_of_columns(targets.iter().copied())?;
+
+    let target_base = program.alloc_registers(targets.len());
+    let extra_base = {
+        let mut dependencies_not_in_targets: ColumnMask = dependencies.clone();
+        let target_mask = targets.iter().copied().collect();
+        dependencies_not_in_targets -= &target_mask;
+
+        let extra_count = dependencies_not_in_targets.count();
+
+        if extra_count > 0 {
+            program.alloc_registers(extra_count)
+        } else {
+            0
+        }
+    };
+
+    let mut extra_idx = 0;
+    let pairs = table.columns().iter().enumerate().map(|(idx, col)| {
         let reg = if col.is_rowid_alias() {
             rowid_reg
+        } else if let Some(pos) = targets.iter().position(|&t| t == idx) {
+            let reg = target_base + pos;
+            if !col.is_virtual_generated() {
+                program.emit_column_or_rowid(cursor_id, idx, reg);
+            }
+            reg
         } else if dependencies.get(idx) {
-            let reg = next_reg;
+            let reg = extra_base + extra_idx;
             program.emit_column_or_rowid(cursor_id, idx, reg);
-            next_reg += 1;
+            extra_idx += 1;
             reg
         } else {
             0
         };
         (col, reg)
     });
-    DmlColumnContext::from_column_reg_mapping(pairs)
+    let dml_ctx = DmlColumnContext::from_column_reg_mapping(pairs);
+    debug_assert!(targets
+        .windows(2)
+        .all(|w| { dml_ctx.to_column_reg(w[1]) == dml_ctx.to_column_reg(w[0]) + 1 }));
+
+    let table_arc = Arc::new(table.clone());
+    gencol::compute_virtual_columns(
+        program,
+        &table.columns_topo_sort()?,
+        &dml_ctx,
+        resolver,
+        &table_arc,
+    )?;
+
+    Ok(dml_ctx)
 }
 
 /// Emit code to load the value of an IndexColumn from the OLD image of the row being updated.
@@ -1683,15 +1687,11 @@ pub(crate) fn emit_index_column_value_old_image(
             BindingBehavior::ResultColumnsNotAllowed,
         )?;
 
-        let self_table_context =
-            table_references
-                .joined_tables()
-                .first()
-                .map(|jt| SelfTableContext::ForSelect {
-                    table_ref_id: jt.internal_id,
-                    referenced_tables: table_references.clone(),
-                });
-        program.with_self_table_context(self_table_context.as_ref(), |program, _| {
+        let self_table_context = SelfTableContext::ForSelect {
+            table_ref_id: table_internal_id,
+            referenced_tables: table_references.clone(),
+        };
+        program.with_self_table_context(Some(&self_table_context), |program, _| {
             translate_expr_no_constant_opt(
                 program,
                 Some(table_references),
@@ -1702,11 +1702,7 @@ pub(crate) fn emit_index_column_value_old_image(
             )?;
             Ok(())
         })?;
-    } else if let Some((table, generated_column)) =
-        generated_column(program, table_cursor_id, idx_col)
-    {
-        cursor_to_registers(program, &table, table_cursor_id, 0, [idx_col.pos_in_table]);
-
+    } else if let Some(generated_column) = generated_column(program, table_cursor_id, idx_col) {
         emit_table_column(
             program,
             table_cursor_id,
@@ -1727,17 +1723,17 @@ fn generated_column(
     program: &mut ProgramBuilder,
     table_cursor_id: usize,
     idx_col: &IndexColumn,
-) -> Option<(Arc<BTreeTable>, Column)> {
+) -> Option<Column> {
     program
         .btree_table_from_cursor(table_cursor_id)
         .iter()
         .cloned()
         .flat_map(|table| {
             table
-                .columns
+                .columns()
                 .get(idx_col.pos_in_table)
                 .filter(|col| col.is_virtual_generated())
-                .map(|col| (table.clone(), col.clone()))
+                .cloned()
         })
         .next()
 }
@@ -1753,68 +1749,47 @@ fn emit_index_column_value_new_image(
     rowid_reg: usize,
     idx_col: &IndexColumn,
     dest_reg: usize,
-    is_strict: bool,
     layout: &ColumnLayout,
+    table: &Arc<BTreeTable>,
 ) -> Result<()> {
     if let Some(expr) = &idx_col.expr {
-        let mut expr = expr.as_ref().clone();
-        rewrite_where_for_update_registers(
-            &mut expr,
-            columns,
-            columns_start_reg,
-            rowid_reg,
-            layout,
-        )?;
-        // The caller must have populated resolver.register_affinities so that
-        // comparison instructions in the expression get the correct column
-        // affinity even though column references have been rewritten to
-        // Expr::Register.
-        // After rewrite, Expr::Register nodes reference encoded column registers.
-        // Decode custom type registers so the expression evaluates on user-facing
-        // values, matching what SELECT / CREATE INDEX see.
-        crate::translate::expr::decode_custom_type_registers_in_expr(
+        let expr = expr.as_ref().clone();
+        let mut column_regs: Vec<usize> = columns
+            .iter()
+            .enumerate()
+            .map(|(i, col)| {
+                if col.is_rowid_alias() {
+                    rowid_reg
+                } else {
+                    layout.to_register(columns_start_reg, i)
+                }
+            })
+            .collect();
+        crate::translate::expr::emit_dml_expr_index_value(
             program,
             resolver,
-            &mut expr,
+            expr,
             columns,
-            columns_start_reg,
-            Some(rowid_reg),
-            is_strict,
-            layout,
+            &mut column_regs,
+            table,
+            dest_reg,
         )?;
-
-        let ctx = SelfTableContext::ForDML(DmlColumnContext::layout(
-            columns,
-            columns_start_reg,
-            rowid_reg,
-            layout.clone(),
-        ));
-        program.with_self_table_context(Some(&ctx), |program, _| {
-            translate_expr_no_constant_opt(
-                program,
-                None,
-                &expr,
-                dest_reg,
-                resolver,
-                NoConstantOptReason::RegisterReuse,
-            )?;
-            Ok(())
-        })?;
     } else {
         let col_in_table = columns
             .get(idx_col.pos_in_table)
             .expect("column index out of bounds");
         match col_in_table.generated_type() {
-            GeneratedType::Virtual { ref resolved, .. } => {
+            GeneratedType::Virtual { ref expr, .. } => {
                 gencol::emit_gencol_expr_from_registers(
                     program,
-                    resolved,
+                    expr,
                     dest_reg,
                     columns_start_reg,
                     columns,
                     resolver,
                     rowid_reg,
                     layout,
+                    table,
                 )?;
                 program.emit_column_affinity(dest_reg, col_in_table.affinity());
             }

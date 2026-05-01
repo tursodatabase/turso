@@ -13,12 +13,14 @@ Some Turso features are still experimental and must be explicitly enabled before
 | Feature | Flag | Description |
 |---------|------|-------------|
 | Views | `views` | [CREATE VIEW](/docs/sql-reference/statements/create-view) and [CREATE MATERIALIZED VIEW](/docs/sql-reference/statements/create-materialized-view) |
-| Custom Types | `custom_types` | [CREATE TYPE](/docs/sql-reference/statements/create-type) and [DROP TYPE](/docs/sql-reference/statements/drop-type) for STRICT tables |
+| Custom Types | `custom_types` | [CREATE TYPE](/docs/sql-reference/statements/create-type), [DROP TYPE](/docs/sql-reference/statements/drop-type), [CREATE DOMAIN](/docs/sql-reference/statements/create-domain), and [DROP DOMAIN](/docs/sql-reference/statements/drop-domain) for STRICT tables |
 | Triggers | `triggers` | [CREATE TRIGGER](/docs/sql-reference/statements/create-trigger) and [DROP TRIGGER](/docs/sql-reference/statements/drop-trigger) |
 | Encryption | `encryption` | At-rest encryption via [PRAGMA cipher / hexkey](/docs/sql-reference/pragmas#encryption) |
 | Index Methods | `index_method` | [CREATE INDEX ... USING](/docs/sql-reference/statements/create-index#using-clause) for FTS and custom index types |
 | Autovacuum | `autovacuum` | Automatic database file compaction |
+| Vacuum | `vacuum` | In-place [VACUUM](/docs/sql-reference/statements/vacuum) compaction |
 | Attach | `attach` | [ATTACH DATABASE](/docs/sql-reference/statements/attach-database) and [DETACH DATABASE](/docs/sql-reference/statements/detach-database) |
+| Multi-Process WAL | `multiprocess_wal` | [Multi-Process Access](/docs/sql-reference/multiprocess-access) — share a database file between OS processes via a shared WAL coordinator |
 
 ## CLI
 
@@ -37,6 +39,7 @@ tursodb \
   --experimental-triggers \
   --experimental-encryption \
   --experimental-index-method \
+  --experimental-vacuum \
   database.db
 ```
 
@@ -53,7 +56,9 @@ let db = Builder::new_local("database.db")
     .experimental_materialized_views(true)
     .experimental_custom_types(true)
     .experimental_index_method(true)
+    .experimental_vacuum(true)
     .experimental_attach(true)
+    .experimental_multiprocess_wal(true)
     .build()?;
 ```
 
@@ -66,7 +71,7 @@ import turso
 
 conn = turso.connect(
     "database.db",
-    experimental_features="views,triggers,custom_types",
+    experimental_features="views,triggers,custom_types,vacuum",
 )
 ```
 
@@ -78,7 +83,7 @@ Pass an array of feature strings to the `experimental` option:
 import { Database } from "@tursodatabase/libsql";
 
 const db = new Database("file:database.db", {
-    experimental: ["views", "triggers", "custom_types", "encryption"],
+    experimental: ["views", "triggers", "custom_types", "encryption", "vacuum"],
 });
 ```
 
@@ -89,14 +94,14 @@ Set the `ExperimentalFeatures` field as a comma-separated string:
 ```go
 db, err := turso.NewDatabase(turso.TursoDatabaseConfig{
     Path: "database.db",
-    ExperimentalFeatures: "views,triggers,custom_types",
+    ExperimentalFeatures: "views,triggers,custom_types,vacuum",
 })
 ```
 
 The Go driver also supports DSN query parameters:
 
 ```go
-db, err := sql.Open("turso", "database.db?experimental=views,triggers")
+db, err := sql.Open("turso", "database.db?experimental=views,triggers,vacuum")
 ```
 
 ## Java SDK

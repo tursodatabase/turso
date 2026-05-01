@@ -7,11 +7,76 @@ description: How to benchmark and analyze memory usage in Turso using the memory
 
 The `perf/memory` crate benchmarks memory usage of SQL workloads under WAL and MVCC journal modes. It uses `dhat` as the global allocator to track every heap allocation, and `memory-stats` for process-level RSS snapshots.
 
+It also contains a `stack-report` helper binary for stack-usage investigations.
+That binary runs a SQL payload with the `stacker` feature enabled and captures
+`turso_stack` tracing events in-process, aggregating structured tracing fields
+instead of parsing stderr log text.
+
 ## Location
 
 - Benchmark crate: `perf/memory/`
 - Analysis script: `perf/memory/analyze-dhat.py`
 - dhat output: `dhat-heap.json` (written to CWD after each run)
+
+## Running Stack Reports
+
+Use this when investigating stack usage from SQL translation/execution probes.
+Run stack reports in release mode with `--features stacker` when comparing
+against server logs or CI stack-size output. Debug builds can materially
+overstate stack deltas and should only be used for quick local iteration.
+
+```bash
+cargo run --release -q -p memory-benchmark --features stacker --bin stack-report -- \
+  --sql path/to/payload.sql \
+  --top 40
+```
+
+Useful options:
+
+```bash
+--sql FILE|-             # SQL payload, or stdin with -
+--format human|json|csv  # output format
+--top N                  # aggregate/span rows per statement in human output
+--statement N[,N...]     # only include reports for 1-based statement indexes
+--sql-contains TEXT      # only include reports for statements containing TEXT, ASCII case-insensitive
+```
+
+The report is statement-oriented. For each SQL statement, it records the
+remaining stack before execution, the minimum remaining stack sampled while that
+statement ran, and `stack_used = baseline_remaining_stack - min_remaining_stack`.
+Statements are sorted by `stack_used` descending so the worst SQL statements are
+first. The human report also prints global and per-statement span aggregates
+sorted by `total_inclusive_stack_used` descending. These aggregate rows group by
+`label` plus `detail` and include call count, total/max self stack, total/max
+inclusive stack, max cumulative stack at span entry, and `peak_path_hits` for
+spans that were active at the statement's minimum remaining-stack sample.
+
+Within each statement, raw span rows are still sorted by `stack_used`
+descending, with the original tracing emission sequence kept in the
+`trace_sequence` field (`seq` in human output). Raw span rows include
+`inclusive_stack_used`, which is measured from the span's parent stack level down
+to the deepest sampled remaining stack while the span was active. This is an
+inclusive profiler-style metric, so nested spans intentionally overlap; use it
+for ranking likely contributors, not for summing to statement total stack.
+
+JSON and CSV formats are deterministic and intended for comparing runs. CSV
+uses a `row_type` column with `global_aggregate`, `statement_aggregate`, `span`,
+and `statement` rows.
+
+Statement filters affect reporting only. The runner still executes the full SQL
+payload in order so schema/data setup and earlier statements remain visible to
+later selected statements. Multiple `--statement` and `--sql-contains` filters
+are allowed; when both are present, a statement must match both kinds.
+
+`stack-report` splits payloads with `turso_parser::parser::Parser::next_cmd()`.
+It then executes statements with no result columns, and queries and drains
+row-producing statements. Do not change binding `execute_batch` semantics for
+stack reports.
+
+The runner currently uses a fixed in-memory database and enables generated
+columns, custom types, and materialized views internally. There are no stack
+report CLI flags for selecting the database path or toggling those experimental
+features.
 
 ## Running Benchmarks
 
@@ -24,13 +89,17 @@ cargo run --release -p memory-benchmark -- --mode wal --workload insert-heavy -i
 # MVCC with concurrent connections
 cargo run --release -p memory-benchmark -- --mode mvcc --workload mixed -i 100 -b 100 --connections 4
 
+# Run a final checkpoint after the workload
+cargo run --release -p memory-benchmark -- --mode wal --workload read-heavy --checkpoint
+
 # All CLI options
 cargo run --release -p memory-benchmark -- \
   --mode wal|mvcc \
-  --workload insert-heavy|read-heavy|mixed|scan-heavy \
+  --workload insert-heavy|read-heavy|mixed|scan-heavy|series-blob \
   -i <iterations> \
   -b <batch-size> \
   --connections <N> \
+  --checkpoint \
   --timeout <ms> \
   --cache-size <pages> \
   --format human|json|csv
@@ -46,6 +115,7 @@ Every run produces a `dhat-heap.json` in the current directory. This file contai
 | `read-heavy` | 90% SELECT by id / 10% INSERT | Seeds 10k rows |
 | `mixed` | 50% SELECT / 50% INSERT | Seeds 10k rows |
 | `scan-heavy` | Full table scans with LIKE | Seeds 10k rows |
+| `series-blob` | `INSERT INTO bench(data) SELECT zeroblob(2048) FROM generate_series(1, ?)` | Creates `bench`; `batch-size` is the series length |
 
 Profiles implement the `Profile` trait in `perf/memory/src/profile/`. To add a new workload, create a new file implementing the trait and wire it into the `WorkloadProfile` enum in `main.rs`.
 
@@ -145,6 +215,7 @@ When investigating memory usage or a suspected regression:
 When `--connections > 1`:
 - Setup phase (schema creation, seeding) always runs on a single connection sequentially
 - Run phase spawns one tokio task per connection, each executing its batch concurrently
+- `--checkpoint` adds a final single-connection `PRAGMA wal_checkpoint(TRUNCATE)` phase after the run phase
 - Each connection gets `busy_timeout` set (default 30s, configurable via `--timeout`)
 - WAL mode uses `BEGIN`, MVCC uses `BEGIN CONCURRENT`
 - The `Profile` trait's `next_batch(connections)` returns one batch per connection with non-overlapping row IDs

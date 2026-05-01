@@ -541,6 +541,12 @@ pub enum ScalarFunc {
     ArrayToString,
     ArrayOverlap,
     ArrayContainsAll,
+    // Struct/Union construction and access
+    StructPack,
+    StructExtractFunc,
+    UnionValueFunc,
+    UnionTagFunc,
+    UnionExtractFunc,
 }
 
 impl Deterministic for ScalarFunc {
@@ -647,6 +653,11 @@ impl Deterministic for ScalarFunc {
             | ScalarFunc::ArrayToString
             | ScalarFunc::ArrayOverlap
             | ScalarFunc::ArrayContainsAll => true,
+            ScalarFunc::StructPack
+            | ScalarFunc::StructExtractFunc
+            | ScalarFunc::UnionValueFunc
+            | ScalarFunc::UnionTagFunc
+            | ScalarFunc::UnionExtractFunc => true,
         }
     }
 }
@@ -778,6 +789,11 @@ impl Display for ScalarFunc {
             Self::ArrayToString => "array_to_string",
             Self::ArrayOverlap => "array_overlap",
             Self::ArrayContainsAll => "array_contains_all",
+            Self::StructPack => "struct_pack",
+            Self::StructExtractFunc => "struct_extract",
+            Self::UnionValueFunc => "union_value",
+            Self::UnionTagFunc => "union_tag",
+            Self::UnionExtractFunc => "union_extract",
         };
         write!(f, "{str}")
     }
@@ -913,6 +929,15 @@ impl ScalarFunc {
             Self::ArraySlice => &[3],
             Self::StringToArray => &[2, 3],
             Self::ArrayToString => &[2, 3],
+            // Struct/Union functions
+            // struct_pack is intentionally variable-arity: field count validation
+            // happens at INSERT time when the value is stored into a typed column.
+            // Standalone calls produce a generic record blob.
+            Self::StructPack => &[-1],
+            Self::StructExtractFunc => &[2], // struct_extract(col, 'field')
+            Self::UnionValueFunc => &[2],    // union_value('tag', value)
+            Self::UnionTagFunc => &[1],      // union_tag(col)
+            Self::UnionExtractFunc => &[2],  // union_extract(col, 'tag')
         }
     }
 
@@ -1263,8 +1288,18 @@ impl Func {
             "json_group_object" => Ok(Some(Self::Agg(AggFunc::JsonGroupObject))),
             "char" => Ok(Some(Self::Scalar(ScalarFunc::Char))),
             "coalesce" => Ok(Some(Self::Scalar(ScalarFunc::Coalesce))),
-            "concat" => Ok(Some(Self::Scalar(ScalarFunc::Concat))),
-            "concat_ws" => Ok(Some(Self::Scalar(ScalarFunc::ConcatWs))),
+            "concat" => {
+                if arg_count == 0 {
+                    crate::bail_parse_error!("wrong number of arguments to function {}()", name)
+                }
+                Ok(Some(Self::Scalar(ScalarFunc::Concat)))
+            }
+            "concat_ws" => {
+                if arg_count < 2 {
+                    crate::bail_parse_error!("wrong number of arguments to function {}()", name)
+                }
+                Ok(Some(Self::Scalar(ScalarFunc::ConcatWs)))
+            }
             "changes" => Ok(Some(Self::Scalar(ScalarFunc::Changes))),
             "total_changes" => Ok(Some(Self::Scalar(ScalarFunc::TotalChanges))),
             "glob" => Ok(Some(Self::Scalar(ScalarFunc::Glob))),
@@ -1284,8 +1319,18 @@ impl Func {
             "length" => Ok(Some(Self::Scalar(ScalarFunc::Length))),
             "octet_length" => Ok(Some(Self::Scalar(ScalarFunc::OctetLength))),
             "sign" => Ok(Some(Self::Scalar(ScalarFunc::Sign))),
-            "substr" => Ok(Some(Self::Scalar(ScalarFunc::Substr))),
-            "substring" => Ok(Some(Self::Scalar(ScalarFunc::Substring))),
+            "substr" => {
+                if arg_count != 2 && arg_count != 3 {
+                    crate::bail_parse_error!("wrong number of arguments to function {}()", name)
+                }
+                Ok(Some(Self::Scalar(ScalarFunc::Substr)))
+            }
+            "substring" => {
+                if arg_count != 2 && arg_count != 3 {
+                    crate::bail_parse_error!("wrong number of arguments to function {}()", name)
+                }
+                Ok(Some(Self::Scalar(ScalarFunc::Substring)))
+            }
             "date" => Ok(Some(Self::Scalar(ScalarFunc::Date))),
             "time" => Ok(Some(Self::Scalar(ScalarFunc::Time))),
             "datetime" => Ok(Some(Self::Scalar(ScalarFunc::DateTime))),
@@ -1451,6 +1496,12 @@ impl Func {
             "array_to_string" => Ok(Some(Self::Scalar(ScalarFunc::ArrayToString))),
             "array_overlap" | "array_overlaps" => Ok(Some(Self::Scalar(ScalarFunc::ArrayOverlap))),
             "array_contains_all" => Ok(Some(Self::Scalar(ScalarFunc::ArrayContainsAll))),
+            // Struct/Union functions
+            "struct_pack" => Ok(Some(Self::Scalar(ScalarFunc::StructPack))),
+            "struct_extract" => Ok(Some(Self::Scalar(ScalarFunc::StructExtractFunc))),
+            "union_value" => Ok(Some(Self::Scalar(ScalarFunc::UnionValueFunc))),
+            "union_tag" => Ok(Some(Self::Scalar(ScalarFunc::UnionTagFunc))),
+            "union_extract" => Ok(Some(Self::Scalar(ScalarFunc::UnionExtractFunc))),
             _ => Ok(None),
         }
     }

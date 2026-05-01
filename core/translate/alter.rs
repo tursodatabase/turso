@@ -5,6 +5,10 @@ use turso_parser::{
     parser::Parser,
 };
 
+use super::{
+    schema::{validate_check_expr, SQLITE_TABLEID},
+    update::translate_update_for_schema_change,
+};
 use crate::{
     error::SQLITE_CONSTRAINT_CHECK,
     function::{AlterTableFunc, Func},
@@ -12,7 +16,7 @@ use crate::{
     translate::{
         emitter::{emit_check_constraints, gencol::compute_virtual_columns, Resolver},
         expr::{translate_expr, walk_expr, walk_expr_mut, WalkControl},
-        plan::{ColumnUsedMask, OuterQueryReference, TableReferences},
+        plan::{ColumnMask, ColumnUsedMask, OuterQueryReference, TableReferences},
         trigger::create_trigger_to_sql,
     },
     util::{
@@ -30,11 +34,6 @@ use crate::{
 };
 use either::Either;
 use rustc_hash::FxHashSet as HashSet;
-
-use super::{
-    schema::{validate_check_expr, SQLITE_TABLEID},
-    update::translate_update_for_schema_change,
-};
 
 fn validate(alter_table: &ast::AlterTableBody, table_name: &str) -> Result<()> {
     // Check if someone is trying to ALTER a system table
@@ -177,7 +176,7 @@ fn emit_rename_sqlite_sequence_entry(
     program.mark_last_insn_constant();
 
     let affinity_str = sqlite_sequence
-        .columns
+        .columns()
         .iter()
         .map(|col| col.affinity().aff_mask())
         .collect::<String>();
@@ -241,7 +240,7 @@ fn emit_rename_sqlite_sequence_entry(
             table_name: crate::schema::SQLITE_SEQUENCE_TABLE_NAME.to_string(),
         });
 
-        program.resolve_label(continue_loop_label, program.offset());
+        program.preassign_label_to_next_insn(continue_loop_label);
     });
 }
 
@@ -377,7 +376,7 @@ fn emit_add_column_default_type_validation(
         description_reg: None,
     });
 
-    program.resolve_label(skip_check_label, program.offset());
+    program.preassign_label_to_next_insn(skip_check_label);
     Ok(())
 }
 
@@ -427,10 +426,9 @@ fn emit_add_virtual_column_validation(
     })?;
 
     let mut original_table = table.clone();
-    original_table.columns.retain(|c| !c.is_virtual_generated());
-    original_table.has_virtual_columns = false;
-    original_table.logical_to_physical_map =
-        BTreeTable::build_logical_to_physical_map(&original_table.columns);
+    original_table
+        .columns_mut()
+        .retain(|c| !c.is_virtual_generated());
     let original_table = Arc::new(original_table);
     let cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(original_table.clone()));
     program.emit_insn(Insn::OpenRead {
@@ -455,7 +453,7 @@ fn emit_add_virtual_column_validation(
 
     let layout = resolved_table.column_layout();
     let base_dest_reg = program.alloc_registers(layout.column_count());
-    for (idx, table_column) in resolved_table.columns.iter().enumerate() {
+    for (idx, table_column) in resolved_table.columns().iter().enumerate() {
         if table_column.is_virtual_generated() || table_column.is_rowid_alias() {
             continue;
         }
@@ -468,8 +466,15 @@ fn emit_add_virtual_column_validation(
     }
 
     let dml_ctx =
-        DmlColumnContext::layout(&resolved_table.columns, base_dest_reg, rowid_reg, layout);
-    compute_virtual_columns(program, &resolved_table.columns, &dml_ctx, resolver)?;
+        DmlColumnContext::layout(resolved_table.columns(), base_dest_reg, rowid_reg, layout);
+    let resolved_table_arc = Arc::new(resolved_table.clone());
+    compute_virtual_columns(
+        program,
+        &resolved_table.columns_topo_sort()?,
+        &dml_ctx,
+        resolver,
+        &resolved_table_arc,
+    )?;
     let result_reg = dml_ctx.to_column_reg(new_column_idx);
 
     if !check_constraints.is_empty() {
@@ -482,7 +487,7 @@ fn emit_add_virtual_column_validation(
             resolved_table.name.as_str(),
             rowid_reg,
             resolved_table
-                .columns
+                .columns()
                 .iter()
                 .enumerate()
                 .filter_map(|(idx, col)| {
@@ -509,7 +514,7 @@ fn emit_add_virtual_column_validation(
             on_error: None,
             description_reg: None,
         });
-        program.resolve_label(notnull_passed, program.offset());
+        program.preassign_label_to_next_insn(notnull_passed);
     }
 
     program.emit_insn(Insn::Next {
@@ -517,7 +522,7 @@ fn emit_add_virtual_column_validation(
         pc_if_next: loop_start,
     });
 
-    program.resolve_label(skip_label, program.offset());
+    program.preassign_label_to_next_insn(skip_label);
     Ok(())
 }
 
@@ -547,19 +552,38 @@ fn emit_add_column_check_validation(
         _ => return Ok(()),
     };
 
-    // Collect CHECK constraints from the column constraints being added.
-    let check_exprs: Vec<(&Option<ast::Name>, &Box<ast::Expr>)> = constraints
+    // Collect CHECK constraints from column-level constraints + domain CHECKs.
+    // Domain CHECKs use `value` as placeholder which must be rewritten to the column name.
+    let mut all_checks: Vec<(Option<String>, Box<ast::Expr>)> = constraints
         .iter()
         .filter_map(|c| {
             if let ast::ColumnConstraint::Check(expr) = &c.constraint {
-                Some((&c.name, expr))
+                Some((
+                    c.name.as_ref().map(|n| n.as_str().to_string()),
+                    expr.clone(),
+                ))
             } else {
                 None
             }
         })
         .collect();
 
-    if check_exprs.is_empty() {
+    if let Ok(Some(resolved)) = resolver
+        .schema()
+        .resolve_type(&column.ty_str, btree.is_strict)
+    {
+        if resolved.is_domain() {
+            for td in &resolved.chain {
+                for dc in &td.domain_checks {
+                    let rewritten =
+                        crate::schema::rewrite_value_to_column(&dc.check, new_column_name);
+                    all_checks.push((dc.name.clone(), rewritten));
+                }
+            }
+        }
+    }
+
+    if all_checks.is_empty() {
         return Ok(());
     }
 
@@ -581,8 +605,8 @@ fn emit_add_column_check_validation(
     });
 
     // Table has rows -- evaluate each CHECK constraint with the default value substituted.
-    for (constraint_name, check_expr) in &check_exprs {
-        let mut substituted = (*check_expr).clone();
+    for (constraint_name, check_expr) in &all_checks {
+        let mut substituted = *check_expr.clone();
 
         // Replace references to the new column with the default value expression.
         let _ = walk_expr_mut(
@@ -624,7 +648,7 @@ fn emit_add_column_check_validation(
 
         // CHECK failed -- halt with constraint error.
         let name = match constraint_name {
-            Some(name) => name.as_str().to_string(),
+            Some(name) => name.clone(),
             None => format!("{check_expr}"),
         };
         program.emit_insn(Insn::Halt {
@@ -637,7 +661,7 @@ fn emit_add_column_check_validation(
         program.preassign_label_to_next_insn(check_passed_label);
     }
 
-    program.resolve_label(skip_check_label, program.offset());
+    program.preassign_label_to_next_insn(skip_check_label);
     Ok(())
 }
 
@@ -708,9 +732,9 @@ pub fn translate_alter_table(
             let column_name = column_name.as_str();
 
             // Tables always have at least one column.
-            turso_assert_ne!(btree.columns.len(), 0);
+            turso_assert_ne!(btree.columns().len(), 0);
 
-            if btree.columns.len() == 1 {
+            if btree.columns().len() == 1 {
                 return Err(LimboError::ParseError(format!(
                     "cannot drop column \"{column_name}\": no other columns exist"
                 )));
@@ -782,6 +806,7 @@ pub fn translate_alter_table(
                             identifier: table_name.to_string(),
                             internal_id: TableInternalId::from(0),
                             table: Table::BTree(Arc::new(btree.clone())),
+                            using_dedup_hidden_cols: ColumnMask::default(),
                             col_used_mask: ColumnUsedMask::default(),
                             cte_select: None,
                             cte_explicit_columns: vec![],
@@ -862,7 +887,7 @@ pub fn translate_alter_table(
             // Must have at least one non-generated column after the drop
             {
                 let remaining_non_generated = btree
-                    .columns
+                    .columns()
                     .iter()
                     .enumerate()
                     .filter(|(idx, col)| *idx != dropped_index && !col.is_generated())
@@ -876,12 +901,9 @@ pub fn translate_alter_table(
 
             // Check if any virtual column depends on the dropped column
             {
-                let mut dropped_set = rustc_hash::FxHashSet::default();
-                dropped_set.insert(dropped_index);
-                let affected =
-                    crate::schema::columns_affected_by_update(&btree.columns, &dropped_set);
+                let affected = btree.columns_affected_by_update([dropped_index])?;
                 for idx in &affected {
-                    if *idx != dropped_index && btree.columns[*idx].is_virtual_generated() {
+                    if idx != dropped_index && btree.columns()[idx].is_virtual_generated() {
                         return Err(LimboError::ParseError(format!(
                             "error in table {table_name} after drop column: no such column: {column_name}"
                         )));
@@ -898,7 +920,7 @@ pub fn translate_alter_table(
             // trigger execution time.
             let post_drop_btree = {
                 let mut t = btree.clone();
-                t.columns.remove(dropped_index);
+                t.columns_mut().remove(dropped_index);
                 t
             };
             let table_name_norm = normalize_ident(table_name);
@@ -943,7 +965,7 @@ pub fn translate_alter_table(
                 }
             }
 
-            btree.columns.remove(dropped_index);
+            btree.columns_mut().remove(dropped_index);
 
             let sql = escape_sql_string_literal(&btree.to_sql());
 
@@ -975,7 +997,7 @@ pub fn translate_alter_table(
                 |program| {
                     let table_name = btree.name.clone();
                     let source_column_by_schema_idx = btree
-                        .columns
+                        .columns()
                         .iter()
                         .enumerate()
                         .map(|(new_idx, column)| {
@@ -1055,14 +1077,14 @@ pub fn translate_alter_table(
                 ));
             }
 
-            let new_column_name = column.name.as_ref().ok_or_else(|| {
+            let new_column_name = column.name.clone().ok_or_else(|| {
                 LimboError::ParseError(
                     "column name is missing in ALTER TABLE ADD COLUMN".to_string(),
                 )
             })?;
-            if btree.get_column(new_column_name).is_some() {
+            if btree.get_column(&new_column_name).is_some() {
                 return Err(LimboError::ParseError(
-                    "duplicate column name: ".to_string() + new_column_name,
+                    "duplicate column name: ".to_string() + &new_column_name,
                 ));
             }
 
@@ -1081,10 +1103,22 @@ pub fn translate_alter_table(
                     || ty.eq_ignore_ascii_case("TEXT")
                     || ty.eq_ignore_ascii_case("BLOB")
                     || ty.eq_ignore_ascii_case("ANY");
+                // Domain types require STRICT tables because domain constraints
+                // (CHECK, NOT NULL, DEFAULT) are only enforced on STRICT tables.
+                if !is_builtin && !btree.is_strict {
+                    let type_def = resolver
+                        .schema()
+                        .get_type_def_unchecked(&normalize_ident(ty));
+                    if let Some(td) = type_def {
+                        if td.is_domain {
+                            return Err(LimboError::ParseError(format!(
+                                "domain type columns require STRICT tables: {table_name}.{new_column_name}"
+                            )));
+                        }
+                    }
+                }
+
                 if !is_builtin && btree.is_strict {
-                    // On non-STRICT tables any type name is allowed and is
-                    // treated as a plain affinity hint (no encode/decode).
-                    // Custom type validation only applies to STRICT tables.
                     let type_def = resolver
                         .schema()
                         .get_type_def_unchecked(&normalize_ident(ty));
@@ -1102,18 +1136,18 @@ pub fn translate_alter_table(
             // one, propagate the type-level DEFAULT to the column so that
             // existing rows get the type default instead of NULL.
             if column.default.is_none() {
-                if let Some(type_def) = resolver
+                if let Ok(Some(resolved)) = resolver
                     .schema()
-                    .get_type_def(&column.ty_str, btree.is_strict)
+                    .resolve_type(&column.ty_str, btree.is_strict)
                 {
-                    if let Some(ref type_default) = type_def.default {
-                        column.default = Some(type_default.clone());
+                    if let Some(type_default) = resolved.default_expr() {
+                        column.default = Some(Box::new(type_default.clone()));
                     }
                 }
             }
 
             // TODO: All quoted ids will be quoted with `[]`, we should store some info from the parsed AST
-            btree.columns.push(column.clone());
+            btree.columns_mut().push(column.clone());
 
             // Add foreign key constraints and CHECK constraints to the btree table
             for constraint in &constraints {
@@ -1128,13 +1162,20 @@ pub fn translate_alter_table(
                                 clause.tbl_name.as_str()
                             )));
                         }
+                        let decl_order = btree
+                            .foreign_keys
+                            .iter()
+                            .map(|fk| fk.decl_order)
+                            .max()
+                            .map_or(0, |order| order + 1);
                         let fk = ForeignKey {
                             parent_table: normalize_ident(clause.tbl_name.as_str()),
                             parent_columns: clause
                                 .columns
                                 .iter()
                                 .map(|c| normalize_ident(c.col_name.as_str()))
-                                .collect(),
+                                .collect::<Vec<_>>()
+                                .into_boxed_slice(),
                             on_delete: clause
                                 .args
                                 .iter()
@@ -1157,7 +1198,7 @@ pub fn translate_alter_table(
                                     }
                                 })
                                 .unwrap_or(ast::RefAct::NoAction),
-                            child_columns: vec![new_column_name.to_string()],
+                            child_columns: Box::from([new_column_name.to_string()]),
                             deferred: match defer_clause {
                                 Some(d) => {
                                     d.deferrable
@@ -1168,12 +1209,13 @@ pub fn translate_alter_table(
                                 }
                                 None => false,
                             },
+                            decl_order,
                         };
                         btree.foreign_keys.push(Arc::new(fk));
                     }
                     ast::ColumnConstraint::Check(expr) => {
                         let column_names: Vec<&str> = btree
-                            .columns
+                            .columns()
                             .iter()
                             .filter_map(|c| c.name.as_deref())
                             .collect();
@@ -1181,7 +1223,7 @@ pub fn translate_alter_table(
                         btree.check_constraints.push(CheckConstraint::new(
                             constraint.name.as_ref(),
                             expr,
-                            Some(new_column_name),
+                            Some(&new_column_name),
                         ));
                     }
                     _ => {
@@ -1189,6 +1231,16 @@ pub fn translate_alter_table(
                     }
                 }
             }
+
+            // Propagate domain CHECK and NOT NULL constraints to the newly
+            // added column. Without this, columns typed with a domain would
+            // silently skip domain-level enforcement after ALTER TABLE.
+            resolver.with_schema(database_id, |schema| {
+                btree.propagate_domain_constraints(schema);
+            });
+            // Refresh local `column` from btree so that domain NOT NULL is
+            // visible to the empty-table check below.
+            column = btree.columns().last().unwrap().clone();
 
             let escaped = escape_sql_string_literal(&btree.to_sql());
             let escaped_table_name = escape_sql_string_literal(table_name);
@@ -1222,15 +1274,15 @@ pub fn translate_alter_table(
                 )?;
             } else {
                 // Check if we need to verify the table is empty at runtime.
-                let effective_default = column.default.as_ref().or_else(|| {
-                    resolver
-                        .schema()
-                        .get_type_def(&column.ty_str, btree.is_strict)
-                        .and_then(|td| td.default.as_ref())
-                });
+                let type_default = resolver
+                    .schema()
+                    .resolve_type(&column.ty_str, btree.is_strict)
+                    .ok()
+                    .flatten()
+                    .and_then(|r| r.default_expr().cloned());
+                let effective_default = column.default.as_deref().or(type_default.as_ref());
                 let needs_notnull_check = column.notnull()
-                    && effective_default
-                        .is_none_or(|default| crate::util::expr_contains_null(default));
+                    && effective_default.is_none_or(crate::util::expr_contains_null);
 
                 let needs_nondeterministic_check = column
                     .default
@@ -1267,7 +1319,7 @@ pub fn translate_alter_table(
                         description_reg: None,
                     });
 
-                    program.resolve_label(skip_error_label, program.offset());
+                    program.preassign_label_to_next_insn(skip_error_label);
                 }
 
                 if default_type_mismatch {
@@ -1278,7 +1330,7 @@ pub fn translate_alter_table(
                     program,
                     &btree,
                     &original_btree,
-                    new_column_name,
+                    &new_column_name,
                     &column,
                     &constraints,
                     resolver,
@@ -1386,7 +1438,7 @@ pub fn translate_alter_table(
             });
 
             program.cursor_loop(cursor_id, |program, rowid| {
-                let sqlite_schema_column_len = sqlite_schema.columns.len();
+                let sqlite_schema_column_len = sqlite_schema.columns().len();
                 turso_assert_eq!(sqlite_schema_column_len, 5);
 
                 let first_column = program.alloc_registers(sqlite_schema_column_len);
@@ -1573,8 +1625,18 @@ pub fn translate_alter_table(
                 true => (false, None),
                 false => {
                     let replacement_column = Column::try_from(&definition)?;
-                    let rewrites_physical_layout = !btree.columns[column_index].is_generated()
-                        && replacement_column.is_generated();
+                    let old_column = &btree.columns()[column_index];
+                    let becomes_generated =
+                        !old_column.is_generated() && replacement_column.is_generated();
+                    // A change of declared type can change the column's affinity, in
+                    // which case existing on-disk values must be coerced to match the
+                    // new affinity. Without this, the row payload retains the old
+                    // serial type and SQLite's `PRAGMA integrity_check` reports the
+                    // file as corrupt (e.g. "NUMERIC value in <table>.<col>" when
+                    // changing NUMERIC -> TEXT). See issue #3706.
+                    let affinity_changed = old_column.affinity_with_strict(btree.is_strict)
+                        != replacement_column.affinity_with_strict(btree.is_strict);
+                    let rewrites_physical_layout = becomes_generated || affinity_changed;
                     (rewrites_physical_layout, Some(replacement_column))
                 }
             };
@@ -1607,7 +1669,7 @@ pub fn translate_alter_table(
                 }
 
                 let non_generated_count = btree
-                    .columns
+                    .columns()
                     .iter()
                     .enumerate()
                     .filter(|(idx, col)| *idx != column_index && !col.is_generated())
@@ -1622,11 +1684,9 @@ pub fn translate_alter_table(
 
             let rewritten_table = if rewrites_physical_layout {
                 let mut table = btree.clone();
-                table.columns[column_index] =
+                table.columns_mut()[column_index] =
                     replacement_column.expect("replacement_column must exist for ALTER COLUMN");
                 table.prepare_generated_columns()?;
-                table.logical_to_physical_map =
-                    BTreeTable::build_logical_to_physical_map(&table.columns);
                 Some(table)
             } else {
                 None
@@ -1778,7 +1838,7 @@ pub fn translate_alter_table(
             });
 
             program.cursor_loop(cursor_id, |program, rowid| {
-                let sqlite_schema_column_len = sqlite_schema.columns.len();
+                let sqlite_schema_column_len = sqlite_schema.columns().len();
                 turso_assert_eq!(sqlite_schema_column_len, 5);
 
                 let first_column = program.alloc_registers(sqlite_schema_column_len);
@@ -1924,7 +1984,7 @@ pub fn translate_alter_table(
                 emit_add_virtual_column_validation(
                     program,
                     &rewritten_table,
-                    &rewritten_table.columns[column_index],
+                    &rewritten_table.columns()[column_index],
                     &definition.constraints,
                     resolver,
                     connection,
@@ -1932,7 +1992,7 @@ pub fn translate_alter_table(
                 )?;
 
                 let source_column_by_schema_idx = rewritten_table
-                    .columns
+                    .columns()
                     .iter()
                     .enumerate()
                     .map(|(idx, column)| {
@@ -1987,7 +2047,7 @@ fn emit_rewrite_table_rows(
 ) {
     turso_assert_eq!(
         source_column_by_schema_idx.len(),
-        rewritten_table.columns.len()
+        rewritten_table.columns().len()
     );
 
     let layout = rewritten_table.column_layout();
@@ -2046,7 +2106,7 @@ fn emit_rewrite_table_rows(
 
 fn non_virtual_affinity_str(table: &BTreeTable) -> String {
     table
-        .columns
+        .columns()
         .iter()
         .filter(|col| !col.is_virtual_generated())
         .map(|col| col.affinity_with_strict(table.is_strict).aff_mask())
@@ -2090,7 +2150,7 @@ fn translate_rename_virtual_table(
     });
 
     program.cursor_loop(schema_cur, |program, rowid| {
-        let ncols = sqlite_schema.columns.len();
+        let ncols = sqlite_schema.columns().len();
         turso_assert_eq!(ncols, 5);
 
         let first_col = program.alloc_registers(ncols);
@@ -3661,7 +3721,7 @@ fn validate_trigger_columns_after_drop(
     {
         Some(
             post_drop_table
-                .columns
+                .columns()
                 .iter()
                 .filter_map(|c| c.name.as_deref().map(normalize_ident))
                 .collect(),
@@ -3670,7 +3730,7 @@ fn validate_trigger_columns_after_drop(
         resolver.with_schema(trigger_database_id, |s| {
             s.get_table(&trigger_table_norm).and_then(|t| {
                 t.btree().map(|bt| {
-                    bt.columns
+                    bt.columns()
                         .iter()
                         .filter_map(|c| c.name.as_deref().map(normalize_ident))
                         .collect()
@@ -5299,7 +5359,7 @@ fn get_table_columns(
     if lookup_database_id == altered_database_id && table_name_norm == altered_table_norm {
         Some(
             post_drop_table
-                .columns
+                .columns()
                 .iter()
                 .filter_map(|c| c.name.as_deref().map(normalize_ident))
                 .collect(),
@@ -5308,7 +5368,7 @@ fn get_table_columns(
         resolver.with_schema(lookup_database_id, |s| {
             s.get_table(table_name_norm).and_then(|t| {
                 t.btree().map(|bt| {
-                    bt.columns
+                    bt.columns()
                         .iter()
                         .filter_map(|c| c.name.as_deref().map(normalize_ident))
                         .collect()

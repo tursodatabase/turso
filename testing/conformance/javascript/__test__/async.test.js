@@ -2,6 +2,18 @@ import test from "ava";
 import crypto from 'crypto';
 import fs from 'fs';
 
+const withTimeout = (promise, timeoutMs, label) => {
+  let timer;
+  const timeout = new Promise((_, reject) => {
+    timer = setTimeout(() => {
+      reject(new Error(`${label} timed out after ${timeoutMs}ms`));
+    }, timeoutMs);
+  });
+  return Promise.race([promise, timeout]).finally(() => {
+    clearTimeout(timer);
+  });
+};
+
 
 test.beforeEach(async (t) => {
   const [db, path,errorType] = await connect();
@@ -537,13 +549,17 @@ test.skip("Statement.interrupt()", async (t) => {
 });
 
 test.serial("Query timeout option interrupts long-running query", async (t) => {
+  if (process.env.PROVIDER === "serverless") {
+    t.pass("Skipping generic timeout test for serverless");
+    return;
+  }
   const path = genDatabaseFilename();
   const [db] = await connect(path, { defaultQueryTimeout: 50 });
   const stmt = await db.prepare("SELECT sum(value) FROM generate_series(1, 1000000000);");
 
   const error = await t.throwsAsync(async () => {
     await stmt.get();
-  });
+  }, { any: true });
   t.truthy(error);
   t.true(error.message.toLowerCase().includes("interrupt"));
 
@@ -552,6 +568,10 @@ test.serial("Query timeout option interrupts long-running query", async (t) => {
 });
 
 test.serial("Query timeout option allows short-running query", async (t) => {
+  if (process.env.PROVIDER === "serverless") {
+    t.pass("Skipping generic timeout test for serverless");
+    return;
+  }
   const path = genDatabaseFilename();
   const [db] = await connect(path, { defaultQueryTimeout: 50 });
   const stmt = await db.prepare("SELECT 1 AS value");
@@ -561,14 +581,46 @@ test.serial("Query timeout option allows short-running query", async (t) => {
   cleanupDatabaseFiles(path);
 });
 
+test.serial("Stale timeout guard from exhausted iterator does not interrupt later queries", async (t) => {
+  if (process.env.PROVIDER === "serverless") {
+    t.pass("Skipping in-memory test for serverless");
+    return;
+  }
+  t.timeout(30_000);
+  const [db] = await connect(":memory:", { defaultQueryTimeout: 1_000 });
+
+  // Insert test data.
+  await db.exec("CREATE TABLE t(x INTEGER)");
+  const insert = await db.prepare("INSERT INTO t VALUES (?)");
+  for (let i = 0; i < 2_000; i++) {
+    await insert.run(i);
+  }
+
+  // Run many sequential queries via stmt.all() (which uses iterate() internally).
+  // Each query finishes well under the timeout, but if the RowsIterator's
+  // TimeoutGuard is not released until GC, stale guards will fire and
+  // interrupt unrelated later queries.
+  const stmt = await db.prepare("SELECT * FROM t ORDER BY x ASC");
+  for (let i = 0; i < 150; i++) {
+    const rows = await stmt.all();
+    t.is(rows.length, 2_000);
+  }
+
+  db.close();
+});
+
 test.serial("Per-query timeout option interrupts long-running Statement.get()", async (t) => {
+  if (process.env.PROVIDER === "serverless") {
+    t.pass("Skipping generic timeout test for serverless");
+    return;
+  }
   const path = genDatabaseFilename();
   const [db] = await connect(path);
   const stmt = await db.prepare("SELECT sum(value) FROM generate_series(1, 1000000000);");
 
   const error = await t.throwsAsync(async () => {
     await stmt.get(undefined, { queryTimeout: 50 });
-  });
+  }, { any: true });
   t.truthy(error);
   t.true(error.message.toLowerCase().includes("interrupt"));
 
@@ -577,6 +629,10 @@ test.serial("Per-query timeout option interrupts long-running Statement.get()", 
 });
 
 test.serial("Per-query timeout option is accepted by Database.exec()", async (t) => {
+  if (process.env.PROVIDER === "serverless") {
+    t.pass("Skipping generic timeout test for serverless");
+    return;
+  }
   const path = genDatabaseFilename();
   const [db] = await connect(path);
   await t.notThrowsAsync(async () => {
@@ -647,6 +703,31 @@ test.serial("Concurrent writes over same connection", async (t) => {
   t.is(rows[0][0], 22);
 });
 
+test.serial("Statement.iterate() with nested execute() on same connection does not deadlock", async (t) => {
+  if (process.env.PROVIDER !== "serverless") {
+    t.pass("Skipping serverless-only deadlock reproduction");
+    return;
+  }
+
+  const db = t.context.db;
+  await db.exec("DROP TABLE IF EXISTS iter_deadlock");
+  await db.exec("CREATE TABLE iter_deadlock (id INTEGER PRIMARY KEY, value TEXT)");
+  await db.exec("INSERT INTO iter_deadlock (id, value) VALUES (1, 'a')");
+  await db.exec("INSERT INTO iter_deadlock (id, value) VALUES (2, 'b')");
+
+  const stmt = await db.prepare("SELECT id FROM iter_deadlock ORDER BY id");
+  const run = (async () => {
+    for await (const row of stmt.iterate()) {
+      const id = row.id ?? row[0];
+      await db.execute("SELECT ? as echoed_id", [id]);
+    }
+  })();
+
+  await t.notThrowsAsync(async () => {
+    await withTimeout(run, 2000, "nested iterate/execute");
+  });
+});
+
 // ==========================================================================
 // Database rename
 // ==========================================================================
@@ -700,6 +781,89 @@ test.serial("Open database after rename", async (t) => {
 });
 
 // ==========================================================================
+// Interactive transaction conformance
+// ==========================================================================
+
+test.serial("Interactive transaction COMMIT visibility across connections", async (t) => {
+  const db = t.context.db;
+  const [db2] = await connect(t.context.path);
+
+  const countByName = async (conn, name) => {
+    const stmt = await conn.prepare("SELECT COUNT(*) FROM users WHERE name = ?");
+    const row = await stmt.raw().get([name]);
+    return Number(row[0]);
+  };
+
+  try {
+    await db.exec("BEGIN");
+    const insert = await db.prepare("INSERT INTO users(name, email) VALUES (?, ?)");
+    await insert.run(["TxCommit", "tx-commit@example.org"]);
+
+    t.is(await countByName(db, "TxCommit"), 1);
+    t.is(await countByName(db2, "TxCommit"), 0);
+
+    await db.exec("COMMIT");
+
+    t.is(await countByName(db2, "TxCommit"), 1);
+  } finally {
+    await db2.close();
+  }
+});
+
+test.serial("Interactive transaction ROLLBACK discards writes", async (t) => {
+  const db = t.context.db;
+
+  const countByName = async (name) => {
+    const stmt = await db.prepare("SELECT COUNT(*) FROM users WHERE name = ?");
+    const row = await stmt.raw().get([name]);
+    return Number(row[0]);
+  };
+
+  await db.exec("BEGIN IMMEDIATE");
+  const insert = await db.prepare("INSERT INTO users(name, email) VALUES (?, ?)");
+  await insert.run(["TxRollback", "tx-rollback@example.org"]);
+  t.is(await countByName("TxRollback"), 1);
+
+  await db.exec("ROLLBACK");
+  t.is(await countByName("TxRollback"), 0);
+});
+
+test.serial("Interactive transaction error + ROLLBACK keeps connection usable", async (t) => {
+  const db = t.context.db;
+
+  const countByName = async (name) => {
+    const stmt = await db.prepare("SELECT COUNT(*) FROM users WHERE name = ?");
+    const row = await stmt.raw().get([name]);
+    return Number(row[0]);
+  };
+
+  await db.exec("BEGIN");
+  const insert = await db.prepare("INSERT INTO users(name, email) VALUES (?, ?)");
+  await insert.run(["WillRollback", "will-rollback@example.org"]);
+
+  const constraintError = await t.throwsAsync(async () => {
+    const duplicateInsert = await db.prepare("INSERT INTO users(id, name, email) VALUES (?, ?, ?)");
+    await duplicateInsert.run([1, "DuplicateId", "duplicate-id@example.org"]);
+  }, {
+    any: true,
+  });
+  t.truthy(constraintError);
+  const constraintHint = `${constraintError.code ?? ""} ${constraintError.message ?? ""}`.toUpperCase();
+  t.true(
+    constraintHint.includes("CONSTRAINT")
+    || constraintHint.includes("UNIQUE")
+    || constraintHint.includes("PRIMARYKEY"),
+  );
+
+  await db.exec("ROLLBACK");
+  t.is(await countByName("WillRollback"), 0);
+
+  await db.exec("BEGIN");
+  await insert.run(["AfterRollback", "after-rollback@example.org"]);
+  await db.exec("COMMIT");
+
+  t.is(await countByName("AfterRollback"), 1);
+});
 // Query timeout (serverless only — uses AbortSignal under the hood)
 // ==========================================================================
 

@@ -1,5 +1,5 @@
 use crate::function::WindowFunc;
-use crate::schema::{BTreeTable, Table};
+use crate::schema::{BTreeCharacteristics, BTreeTable, Table};
 use crate::sync::Arc;
 use crate::translate::aggregation::{translate_aggregation_step, AggArgumentSource};
 use crate::translate::collate::{get_collseq_from_expr, CollationSeq};
@@ -88,6 +88,7 @@ struct WindowSubqueryContext<'a> {
 ///     ORDER BY c, d
 /// );
 /// ```
+#[turso_macros::trace_stack]
 pub fn plan_windows(
     program: &mut ProgramBuilder,
     plan: &mut SelectPlan,
@@ -229,6 +230,7 @@ fn prepare_window_subquery(
         input_cardinality_hint: None,
         estimated_output_rows: None,
         simple_aggregate: None,
+        phantom_params: vec![],
     };
 
     prepare_window_subquery(
@@ -539,26 +541,21 @@ impl EmitWindow {
         let window_function_count = window.functions.len();
 
         // An ephemeral table used to buffer rows for the current frame
-        let logical_to_physical_map = BTreeTable::build_logical_to_physical_map(&src_columns);
-        let buffer_table = Arc::new(BTreeTable {
-            root_page: 0,
+        let buffer_table = Arc::new(BTreeTable::new(
+            0,
             // TODO: Generating the name this way may cause collisions with real tables in the
-            //  attached database. Other ephemeral tables are created similarly, so it’s left
+            //  attached database. Other ephemeral tables are created similarly, so it's left
             //  as-is for now. Ideally, there should be a way to mark tables as ephemeral so
             //  they can be handled differently from regular tables.
-            name: format!("buffer_table_{window_name}"),
-            has_rowid: true,
-            primary_key_columns: vec![],
-            columns: src_columns,
-            is_strict: false,
-            unique_sets: vec![],
-            has_autoincrement: false,
-            foreign_keys: vec![],
-            check_constraints: vec![],
-            rowid_alias_conflict_clause: None,
-            has_virtual_columns: false,
-            logical_to_physical_map,
-        });
+            format!("buffer_table_{window_name}"),
+            vec![],
+            src_columns,
+            BTreeCharacteristics::HAS_ROWID,
+            vec![],
+            vec![],
+            vec![],
+            None,
+        ));
         let cursor_buffer_read =
             program.alloc_cursor_id(CursorType::BTreeTable(buffer_table.clone()));
         let cursor_buffer_write =
@@ -795,7 +792,7 @@ fn emit_flush_buffer_if_new_partition(
             target_pc_gt: new_partition_label,
         });
 
-        program.resolve_label(new_partition_label, program.offset());
+        program.preassign_label_to_next_insn(new_partition_label);
         program.add_comment(program.offset(), "detected new partition");
         program.emit_insn(Insn::Gosub {
             target_pc: labels.flush_buffer,
@@ -812,7 +809,7 @@ fn emit_flush_buffer_if_new_partition(
             extra_amount: partition_by_len - 1,
         });
 
-        program.resolve_label(same_partition_label, program.offset());
+        program.preassign_label_to_next_insn(same_partition_label);
     }
 
     Ok(())
@@ -905,7 +902,7 @@ fn emit_flush_buffer_if_not_peer(
             target_pc_gt: label_not_peer,
         });
 
-        program.resolve_label(label_not_peer, program.offset());
+        program.preassign_label_to_next_insn(label_not_peer);
         program.add_comment(program.offset(), "detected non-peer row");
         program.emit_insn(Insn::Gosub {
             target_pc: labels.flush_buffer,
@@ -917,7 +914,7 @@ fn emit_flush_buffer_if_not_peer(
             extra_amount: order_by_len - 1,
         });
 
-        program.resolve_label(label_peer, program.offset());
+        program.preassign_label_to_next_insn(label_peer);
     }
 
     Ok(())
@@ -1059,7 +1056,7 @@ pub fn emit_window_results(
 
     emit_return_buffered_rows(program, window, t_ctx, plan)?;
 
-    program.resolve_label(label_empty, program.offset());
+    program.preassign_label_to_next_insn(label_empty);
 
     program.emit_insn(Insn::ResetSorter {
         cursor_id: cursor_buffer_read,
@@ -1150,7 +1147,7 @@ fn emit_return_buffered_rows(
         }
     }
 
-    program.resolve_label(label_skip_returning_row, program.offset());
+    program.preassign_label_to_next_insn(label_skip_returning_row);
 
     if let Distinctness::Distinct { ctx } = &plan.distinctness {
         let distinct_ctx = ctx.as_ref().expect("distinct context must exist");

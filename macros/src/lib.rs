@@ -87,6 +87,8 @@ mod test;
 
 // Import assertion proc macro implementations
 mod assert;
+#[path = "trace_stack.rs"]
+mod trace_stack_impl;
 
 use assert::{
     comparison_auto_message, details_debug_check, details_format_args, details_json,
@@ -645,6 +647,27 @@ pub fn derive_atomic_enum(input: TokenStream) -> TokenStream {
 #[proc_macro_attribute]
 pub fn test(args: TokenStream, input: TokenStream) -> TokenStream {
     test::test_macro_attribute(args, input)
+}
+
+/// Wrap a function body in a stack trace guard and a `turso_stack` tracing span.
+///
+/// With no arguments, the label is inferred as `module_path!()::function_name`
+/// and the span name is the function name.
+/// A string literal argument overrides the label.
+///
+/// ```ignore
+/// #[turso_macros::trace_stack]
+/// fn prepare_select_plan(...) { ... }
+///
+/// #[turso_macros::trace_stack("select:translate")]
+/// fn translate_select(...) { ... }
+///
+/// #[turso_macros::trace_stack(detail = stmt_kind(&stmt))]
+/// fn translate_inner(stmt: ast::Stmt, ...) { ... }
+/// ```
+#[proc_macro_attribute]
+pub fn trace_stack(attr: TokenStream, input: TokenStream) -> TokenStream {
+    trace_stack_impl::trace_stack_attribute(attr, input)
 }
 
 /// Controls the `#[cfg(not(antithesis))]` fallback in "always" comparison macros.

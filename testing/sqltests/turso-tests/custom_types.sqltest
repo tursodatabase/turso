@@ -1509,3 +1509,166 @@ test trigger-after-insert-new-decoded {
 expect {
     555.55
 }
+
+# --- FILTER CLAUSE WITH CUSTOM TYPES ---
+
+@requires strict "uses STRICT tables"
+test filter-sum-numeric {
+    CREATE TABLE t1(id INTEGER PRIMARY KEY, val numeric(10,2), grp TEXT) STRICT;
+    INSERT INTO t1 VALUES (1, 100, 'a'), (2, 9, 'b'), (3, 50, 'a'), (4, -5, 'b');
+    SELECT SUM(val), SUM(val) FILTER (WHERE grp = 'a') FROM t1;
+}
+expect {
+    154.0|150.0
+}
+
+@requires strict "uses STRICT tables"
+test filter-count-numeric {
+    CREATE TABLE t1(id INTEGER PRIMARY KEY, val numeric(10,2)) STRICT;
+    INSERT INTO t1 VALUES (1, 100), (2, 9), (3, 50), (4, -5);
+    SELECT COUNT(*), COUNT(*) FILTER (WHERE val > 10) FROM t1;
+}
+expect {
+    4|2
+}
+
+@requires strict "uses STRICT tables"
+test filter-avg-numeric {
+    CREATE TABLE t1(val numeric(10,2), grp TEXT) STRICT;
+    INSERT INTO t1 VALUES (10, 'a'), (20, 'a'), (30, 'b'), (40, 'b');
+    SELECT AVG(val), AVG(val) FILTER (WHERE grp = 'b') FROM t1;
+}
+expect {
+    25.0|35.0
+}
+
+@requires strict "uses STRICT tables"
+test filter-min-max-numeric {
+    CREATE TABLE t1(val numeric(10,2), grp TEXT) STRICT;
+    INSERT INTO t1 VALUES (10, 'a'), (20, 'a'), (30, 'b'), (40, 'b');
+    SELECT MIN(val) FILTER (WHERE grp = 'b'), MAX(val) FILTER (WHERE grp = 'a') FROM t1;
+}
+expect {
+    30.00|20.00
+}
+
+@requires strict "uses STRICT tables"
+test filter-group-by-numeric {
+    CREATE TABLE t1(val numeric(10,2), grp TEXT, flag INTEGER) STRICT;
+    INSERT INTO t1 VALUES (10, 'a', 1), (20, 'a', 0), (30, 'b', 1), (40, 'b', 1);
+    SELECT grp, COUNT(*), COUNT(*) FILTER (WHERE flag = 1) FROM t1 GROUP BY grp;
+}
+expect {
+    a|2|1
+    b|2|2
+}
+
+@requires strict "uses STRICT tables"
+test filter-numeric-all-filtered-out {
+    CREATE TABLE t1(val numeric(10,2)) STRICT;
+    INSERT INTO t1 VALUES (1), (2), (3);
+    SELECT COUNT(*) FILTER (WHERE val > 100), SUM(val) FILTER (WHERE val > 100) FROM t1;
+}
+expect {
+    0|
+}
+
+@requires strict "uses STRICT tables"
+test filter-numeric-with-nulls {
+    CREATE TABLE t1(val numeric(10,2), flag INTEGER) STRICT;
+    INSERT INTO t1 VALUES (10, 1), (NULL, 1), (30, 0), (NULL, 0);
+    SELECT COUNT(val) FILTER (WHERE flag = 1), SUM(val) FILTER (WHERE flag = 1) FROM t1;
+}
+expect {
+    1|10.0
+}
+
+@requires strict "uses STRICT tables"
+test filter-numeric-with-having {
+    CREATE TABLE t1(val numeric(10,2), grp TEXT, flag INTEGER) STRICT;
+    INSERT INTO t1 VALUES (10, 'a', 1), (20, 'a', 0), (30, 'a', 1),
+                         (40, 'b', 0), (50, 'b', 0);
+    SELECT grp, SUM(val) FILTER (WHERE flag = 1) AS s FROM t1 GROUP BY grp HAVING s > 0;
+}
+expect {
+    a|40.0
+}
+
+@requires strict "uses STRICT tables"
+test filter-numeric-order-by-filtered-agg {
+    CREATE TABLE t1(val numeric(10,2), grp TEXT) STRICT;
+    INSERT INTO t1 VALUES (10, 'a'), (20, 'b'), (30, 'a'), (40, 'b'), (50, 'a');
+    SELECT grp, SUM(val) FILTER (WHERE val > 15) AS s FROM t1 GROUP BY grp ORDER BY s;
+}
+expect {
+    b|60.0
+    a|80.0
+}
+
+@requires strict "uses STRICT tables"
+test filter-cents-encode-decode {
+    CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100;
+    CREATE TABLE t1(id INTEGER PRIMARY KEY, amount cents, active INTEGER) STRICT;
+    INSERT INTO t1 VALUES (1, 42, 1), (2, 10, 0), (3, 25, 1), (4, 5, 0);
+    SELECT SUM(amount), SUM(amount) FILTER (WHERE active = 1) FROM t1;
+}
+expect {
+    82|67
+}
+
+@requires strict "uses STRICT tables"
+test filter-uint-with-custom-operators {
+    CREATE TYPE test_uint(value any) BASE text
+        ENCODE test_uint_encode(value) DECODE test_uint_decode(value)
+        OPERATOR '<' test_uint_lt
+        OPERATOR '=' test_uint_eq;
+    CREATE TABLE t1(id INTEGER PRIMARY KEY, val test_uint, grp TEXT) STRICT;
+    INSERT INTO t1 VALUES (1, 10, 'a'), (2, 20, 'a'), (3, 30, 'b'), (4, 40, 'b');
+    SELECT COUNT(*), COUNT(*) FILTER (WHERE grp = 'a') FROM t1;
+}
+expect {
+    4|2
+}
+
+@requires strict "uses STRICT tables"
+test filter-numeric-multiple-different-conditions {
+    CREATE TABLE t1(val numeric(10,2), cat TEXT) STRICT;
+    INSERT INTO t1 VALUES (1, 'x'), (2, 'y'), (3, 'x'), (4, 'y'), (5, 'x');
+    SELECT
+        COUNT(*) FILTER (WHERE cat = 'x'),
+        COUNT(*) FILTER (WHERE cat = 'y'),
+        SUM(val) FILTER (WHERE val > 2)
+    FROM t1;
+}
+expect {
+    3|2|12.0
+}
+
+@requires strict "uses STRICT tables"
+test filter-numeric-condition-on-custom-col {
+    CREATE TABLE t1(id INTEGER PRIMARY KEY, val numeric(10,2), threshold numeric(10,2)) STRICT;
+    INSERT INTO t1 VALUES (1, 100, 50), (2, 9, 50), (3, 50, 50), (4, -5, 50);
+    SELECT COUNT(*) FILTER (WHERE val > 10), SUM(val) FILTER (WHERE val > 10) FROM t1;
+}
+expect {
+    2|150.0
+}
+
+@requires strict "uses STRICT tables"
+test filter-numeric-empty-table {
+    CREATE TABLE t1(val numeric(10,2), flag INTEGER) STRICT;
+    SELECT COUNT(*) FILTER (WHERE flag = 1), SUM(val) FILTER (WHERE flag = 1) FROM t1;
+}
+expect {
+    0|
+}
+
+@requires strict "uses STRICT tables"
+test filter-numeric-group-concat {
+    CREATE TABLE t1(name TEXT, val numeric(10,2), active INTEGER) STRICT;
+    INSERT INTO t1 VALUES ('Alice', 10, 1), ('Bob', 20, 0), ('Carol', 30, 1);
+    SELECT GROUP_CONCAT(name) FILTER (WHERE active = 1) FROM t1;
+}
+expect {
+    Alice,Carol
+}

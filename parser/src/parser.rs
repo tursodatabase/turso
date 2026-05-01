@@ -1,15 +1,16 @@
 use crate::ast::{
     check::ColumnCount, AlterTable, AlterTableBody, As, Cmd, ColumnConstraint, ColumnDefinition,
     CommonTableExpr, CompoundOperator, CompoundSelect, CreateTableBody, CreateTypeBody,
-    CreateVirtualTable, DeferSubclause, Distinctness, Expr, ForeignKeyClause, FrameBound,
-    FrameClause, FrameExclude, FrameMode, FromClause, FunctionTail, GeneratedColumnType, GroupBy,
-    Indexed, IndexedColumn, InitDeferredPred, InsertBody, JoinConstraint, JoinOperator, JoinType,
-    JoinedSelectTable, LikeOperator, Limit, Literal, Materialized, Name, NamedColumnConstraint,
-    NamedTableConstraint, NullsOrder, OneSelect, Operator, Over, PragmaBody, PragmaValue,
-    QualifiedName, RefAct, RefArg, ResolveType, ResultColumn, Select, SelectBody, SelectTable, Set,
-    SortOrder, SortedColumn, Stmt, TableConstraint, TableOptions, TransactionType, TriggerCmd,
-    TriggerEvent, TriggerTime, Type, TypeOperator, TypeParam, TypeSize, UnaryOperator, Update,
-    Upsert, UpsertDo, UpsertIndex, Variable, Window, WindowDef, With,
+    CreateVirtualTable, DeferSubclause, Distinctness, DomainConstraint, Expr, ForeignKeyClause,
+    FrameBound, FrameClause, FrameExclude, FrameMode, FromClause, FunctionTail,
+    GeneratedColumnType, GroupBy, Indexed, IndexedColumn, InitDeferredPred, InsertBody,
+    JoinConstraint, JoinOperator, JoinType, JoinedSelectTable, LikeOperator, Limit, Literal,
+    Materialized, Name, NamedColumnConstraint, NamedTableConstraint, NullsOrder, OneSelect,
+    Operator, Over, PragmaBody, PragmaValue, QualifiedName, RefAct, RefArg, ResolveType,
+    ResultColumn, Select, SelectBody, SelectTable, Set, SortOrder, SortedColumn, Stmt,
+    TableConstraint, TableOptions, TransactionType, TriggerCmd, TriggerEvent, TriggerTime, Type,
+    TypeField, TypeOperator, TypeParam, TypeSize, UnaryOperator, Update, Upsert, UpsertDo,
+    UpsertIndex, Variable, Window, WindowDef, With,
 };
 use crate::error::Error;
 use crate::lexer::{Lexer, Token};
@@ -153,6 +154,8 @@ pub struct Parser<'a> {
     /// Parser tracks that in order to properly auto-assign variable ids in correct order for anonymous parameters '?'
     last_variable_id: u32,
     named_variables: HashMap<&'a [u8], NonZeroU32>,
+    /// Tracks STRUCT/UNION nesting depth to prevent stack overflow from deeply nested types
+    type_nesting_depth: u32,
 }
 
 impl<'a> Iterator for Parser<'a> {
@@ -177,30 +180,19 @@ impl<'a> Parser<'a> {
             current_token: Token::new(&input[..0], TokenType::TK_NONE),
             last_variable_id: 0,
             named_variables: HashMap::new(),
+            type_nesting_depth: 0,
         }
     }
 
     fn create_variable(&mut self, token: &'a [u8]) -> Result<Expr> {
-        if token.is_empty() {
+        debug_assert!(!token.is_empty());
+        if token == b"?" {
             // Rewrite anonymous variables in encounter order
             self.last_variable_id += 1;
             let index = NonZeroU32::new(self.last_variable_id).unwrap();
             Ok(Expr::Variable(Variable::indexed(index)))
-        } else if matches!(token[0], b':' | b'@' | b'$') {
-            let index = if let Some(index) = self.named_variables.get(token).copied() {
-                index
-            } else {
-                self.last_variable_id += 1;
-                let index = NonZeroU32::new(self.last_variable_id).unwrap();
-                self.named_variables.insert(token, index);
-                index
-            };
-            Ok(Expr::Variable(Variable::named(
-                from_bytes_as_str(token),
-                index,
-            )))
-        } else {
-            let variable_str = std::str::from_utf8(token)
+        } else if token[0] == b'?' {
+            let variable_str = std::str::from_utf8(&token[1..])
                 .map_err(|e| Error::Custom(format!("non-utf8 positional variable id: {e}")))?;
             let variable_id = variable_str
                 .parse::<u32>()
@@ -218,6 +210,20 @@ impl<'a> Parser<'a> {
             self.last_variable_id = self.last_variable_id.max(variable_id);
             let index = NonZeroU32::new(variable_id).unwrap();
             Ok(Expr::Variable(Variable::indexed(index)))
+        } else {
+            debug_assert!(matches!(token[0], b':' | b'@' | b'$'));
+            let index = if let Some(index) = self.named_variables.get(token).copied() {
+                index
+            } else {
+                self.last_variable_id += 1;
+                let index = NonZeroU32::new(self.last_variable_id).unwrap();
+                self.named_variables.insert(token, index);
+                index
+            };
+            Ok(Expr::Variable(Variable::named(
+                from_bytes_as_str(token),
+                index,
+            )))
         }
     }
 
@@ -941,7 +947,8 @@ impl<'a> Parser<'a> {
             TK_UNIQUE,
             TK_TRIGGER,
             TK_MATERIALIZED,
-            TK_TYPE
+            TK_TYPE,
+            TK_ID
         );
         let mut temp = false;
         if first_tok.token_type == TK_TEMP {
@@ -958,7 +965,13 @@ impl<'a> Parser<'a> {
             TK_VIRTUAL => self.parse_create_virtual(),
             TK_INDEX | TK_UNIQUE => self.parse_create_index(),
             TK_TYPE => self.parse_create_type(),
-            _ => unreachable!(),
+            TK_ID if first_tok.to_utf8().eq_ignore_ascii_case("DOMAIN") => {
+                self.parse_create_domain()
+            }
+            _ => Err(Error::ParseError(format!(
+                "unexpected token: {}",
+                first_tok.to_utf8()
+            )))?,
         }
     }
 
@@ -1065,6 +1078,24 @@ impl<'a> Parser<'a> {
             return Ok(None);
         };
 
+        // Inline STRUCT/UNION types (e.g. `col STRUCT(x INT)`) are only valid
+        // inside CREATE TYPE field lists (tracked by type_nesting_depth > 0).
+        // In column definitions and CAST expressions, reject them.
+        let is_struct = type_name.eq_ignore_ascii_case("STRUCT");
+        let is_union = type_name.eq_ignore_ascii_case("UNION");
+        if (is_struct || is_union) && self.peek()?.is_some_and(|t| t.token_type == TK_LP) {
+            if self.type_nesting_depth == 0 {
+                return Err(Error::ParseError(
+                    "inline STRUCT/UNION column types are not supported; \
+                     use CREATE TYPE to define a named type first, then use the type name in the column definition".to_owned(),
+                ));
+            }
+            // Inside a CREATE TYPE field list — consume the field list but
+            // store only the bare type name. The nested fields are validated
+            // during schema loading (from_create_type), not here.
+            let _fields = self.parse_type_field_list()?;
+        }
+
         while let Some(tok) = self.peek()? {
             match tok.token_type.fallback_id_if_ok() {
                 TK_ID | TK_STRING => {
@@ -1110,6 +1141,43 @@ impl<'a> Parser<'a> {
             size,
             array_dimensions,
         }))
+    }
+
+    /// Parse a parenthesized list of `name Type` pairs for STRUCT/UNION type declarations.
+    /// Expects the opening `(` to be the next token.
+    fn parse_type_field_list(&mut self) -> Result<Vec<TypeField>> {
+        self.type_nesting_depth += 1;
+        if self.type_nesting_depth > 32 {
+            self.type_nesting_depth -= 1;
+            return Err(Error::ParseError(
+                "STRUCT/UNION nesting depth exceeds maximum (32)".to_owned(),
+            ));
+        }
+        let result = self.parse_type_field_list_inner();
+        self.type_nesting_depth -= 1;
+        result
+    }
+
+    fn parse_type_field_list_inner(&mut self) -> Result<Vec<TypeField>> {
+        eat_expect!(self, TK_LP);
+        let mut fields = Vec::new();
+        loop {
+            // Parse field name (use parse_nm to handle keywords-as-identifiers)
+            let name = self.parse_nm()?;
+            // Parse field type (recursive — allows nested STRUCT/UNION)
+            let field_type = self.parse_type()?.ok_or_else(|| {
+                Error::ParseError("expected type after field name in STRUCT/UNION".to_owned())
+            })?;
+            fields.push(TypeField { name, field_type });
+            match self.peek()? {
+                Some(tok) if tok.token_type == TK_COMMA => {
+                    eat_assert!(self, TK_COMMA);
+                }
+                _ => break,
+            }
+        }
+        eat_expect!(self, TK_RP);
+        Ok(fields)
     }
 
     /// SQLite understands these operators, listed in precedence1 order
@@ -4278,11 +4346,8 @@ impl<'a> Parser<'a> {
         }
     }
 
-    /// Parse `CREATE TYPE [IF NOT EXISTS] name[(param, ...)] BASE base_type
-    ///     [ENCODE expr]
-    ///     [DECODE expr]
-    ///     [DEFAULT expr]
-    ///     [OPERATOR 'op' func_name]*`
+    /// Parse `CREATE TYPE [IF NOT EXISTS] name AS STRUCT(...) | UNION(...)`
+    /// or `CREATE TYPE [IF NOT EXISTS] name[(param, ...)] BASE base_type ...`
     fn parse_create_type(&mut self) -> Result<Stmt> {
         eat_assert!(self, TK_TYPE);
         let if_not_exists = self.parse_if_not_exists()?;
@@ -4293,6 +4358,43 @@ impl<'a> Parser<'a> {
             Some(tok) if tok.token_type == TK_ID => from_bytes(tok.as_bytes()),
             _ => return Err(Error::ParseError("expected type name".to_owned())),
         };
+
+        // Check for AS STRUCT/UNION syntax
+        if let Some(tok) = self.peek()? {
+            if tok.token_type == TK_AS {
+                eat_assert!(self, TK_AS);
+                let next = self.peek()?;
+                match next {
+                    Some(t) if t.token_type.fallback_id_if_ok() == TK_ID => {
+                        let kw = from_bytes_as_str(t.as_bytes());
+                        let is_struct = kw.eq_ignore_ascii_case("STRUCT");
+                        let is_union = kw.eq_ignore_ascii_case("UNION");
+                        if !is_struct && !is_union {
+                            return Err(Error::ParseError(format!(
+                                "expected STRUCT or UNION after AS, got {kw}"
+                            )));
+                        }
+                        eat_assert!(self, TK_ID);
+                        let fields = self.parse_type_field_list()?;
+                        let body = if is_struct {
+                            CreateTypeBody::Struct(fields)
+                        } else {
+                            CreateTypeBody::Union(fields)
+                        };
+                        return Ok(Stmt::CreateType {
+                            if_not_exists,
+                            type_name,
+                            body,
+                        });
+                    }
+                    _ => {
+                        return Err(Error::ParseError(
+                            "expected STRUCT or UNION after AS".to_owned(),
+                        ))
+                    }
+                }
+            }
+        }
 
         // Parse optional parameter list: (name [type], name [type], ...)
         let mut params = Vec::new();
@@ -4456,7 +4558,7 @@ impl<'a> Parser<'a> {
         Ok(Stmt::CreateType {
             if_not_exists,
             type_name,
-            body: CreateTypeBody {
+            body: CreateTypeBody::CustomType {
                 params,
                 base,
                 encode,
@@ -4467,9 +4569,119 @@ impl<'a> Parser<'a> {
         })
     }
 
+    /// Parse `CREATE DOMAIN [IF NOT EXISTS] name AS base_type
+    ///     [DEFAULT expr]
+    ///     [NOT NULL | NULL]
+    ///     [[CONSTRAINT name] CHECK (expr)]...`
+    fn parse_create_domain(&mut self) -> Result<Stmt> {
+        // Eat 'DOMAIN' (which is TK_ID)
+        eat_assert!(self, TK_ID);
+        let if_not_exists = self.parse_if_not_exists()?;
+
+        // Parse domain name
+        let name_tok = self.eat()?;
+        let domain_name = match name_tok {
+            Some(tok) if tok.token_type == TK_ID => from_bytes(tok.as_bytes()),
+            _ => return Err(Error::ParseError("expected domain name".to_owned())),
+        };
+
+        // Eat AS keyword
+        eat_expect!(self, TK_AS);
+
+        // Parse base type name (any identifier — primitive, custom type, or another domain)
+        let base_tok = self.eat()?;
+        let base_type = match base_tok {
+            Some(tok) if tok.token_type == TK_ID => from_bytes(tok.as_bytes()),
+            _ => return Err(Error::ParseError("expected base type name".to_owned())),
+        };
+
+        let mut default = None;
+        let mut not_null = false;
+        let mut has_null = false;
+        let mut has_default = false;
+        let mut constraints = Vec::new();
+
+        // Parse optional clauses: DEFAULT, NOT NULL, NULL, CONSTRAINT/CHECK
+        loop {
+            match self.peek()? {
+                Some(tok) if tok.token_type == TK_DEFAULT => {
+                    eat_assert!(self, TK_DEFAULT);
+                    if has_default {
+                        return Err(Error::ParseError(
+                            "multiple DEFAULT clauses in domain definition".to_owned(),
+                        ));
+                    }
+                    let expr = self.parse_expr(0)?;
+                    default = Some(expr);
+                    has_default = true;
+                }
+                Some(tok) if tok.token_type == TK_NOT => {
+                    eat_assert!(self, TK_NOT);
+                    eat_expect!(self, TK_NULL);
+                    if has_null {
+                        return Err(Error::ParseError(
+                            "conflicting NULL/NOT NULL clauses in domain definition".to_owned(),
+                        ));
+                    }
+                    if not_null {
+                        return Err(Error::ParseError(
+                            "duplicate NOT NULL clause in domain definition".to_owned(),
+                        ));
+                    }
+                    not_null = true;
+                }
+                Some(tok) if tok.token_type == TK_NULL => {
+                    eat_assert!(self, TK_NULL);
+                    if not_null {
+                        return Err(Error::ParseError(
+                            "conflicting NULL/NOT NULL clauses in domain definition".to_owned(),
+                        ));
+                    }
+                    has_null = true;
+                }
+                Some(tok) if tok.token_type == TK_CONSTRAINT => {
+                    eat_assert!(self, TK_CONSTRAINT);
+                    let cname_tok = self.eat()?;
+                    let cname = match cname_tok {
+                        Some(t) if t.token_type == TK_ID => from_bytes(t.as_bytes()),
+                        _ => return Err(Error::ParseError("expected constraint name".to_owned())),
+                    };
+                    eat_expect!(self, TK_CHECK);
+                    eat_expect!(self, TK_LP);
+                    let check_expr = self.parse_expr(0)?;
+                    eat_expect!(self, TK_RP);
+                    constraints.push(DomainConstraint {
+                        name: Some(cname),
+                        check: check_expr,
+                    });
+                }
+                Some(tok) if tok.token_type == TK_CHECK => {
+                    eat_assert!(self, TK_CHECK);
+                    eat_expect!(self, TK_LP);
+                    let check_expr = self.parse_expr(0)?;
+                    eat_expect!(self, TK_RP);
+                    constraints.push(DomainConstraint {
+                        name: None,
+                        check: check_expr,
+                    });
+                }
+                _ => break,
+            }
+        }
+
+        Ok(Stmt::CreateDomain {
+            if_not_exists,
+            domain_name,
+            base_type,
+            default,
+            not_null,
+            constraints,
+        })
+    }
+
     fn parse_drop_stmt(&mut self) -> Result<Stmt> {
         eat_assert!(self, TK_DROP);
-        let tok = peek_expect!(self, TK_TABLE, TK_INDEX, TK_TRIGGER, TK_VIEW, TK_TYPE);
+        let tok = peek_expect!(self, TK_TABLE, TK_INDEX, TK_TRIGGER, TK_VIEW, TK_TYPE, TK_ID);
 
         match tok.token_type {
             TK_TABLE => {
@@ -4521,7 +4733,23 @@ impl<'a> Parser<'a> {
                     type_name,
                 })
             }
-            _ => unreachable!(),
+            TK_ID if tok.to_utf8().eq_ignore_ascii_case("DOMAIN") => {
+                eat_assert!(self, TK_ID);
+                let if_exists = self.parse_if_exists()?;
+                let name_tok = self.eat()?;
+                let domain_name = match name_tok {
+                    Some(tok) if tok.token_type == TK_ID => from_bytes(tok.as_bytes()),
+                    _ => return Err(Error::ParseError("expected domain name".to_owned())),
+                };
+                Ok(Stmt::DropDomain {
+                    if_exists,
+                    domain_name,
+                })
+            }
+            _ => Err(Error::ParseError(format!(
+                "unexpected token: {}",
+                tok.to_utf8()
+            )))?,
         }
     }
 
@@ -12232,6 +12460,134 @@ mod tests {
                 let result_str = result.to_string();
                 assert_eq!(result_str, expected_str[i], "Input: {rstring:?}");
             }
+        }
+    }
+
+    #[test]
+    fn test_inline_struct_rejected() {
+        let sql = b"CREATE TABLE t(s STRUCT(x INT, y TEXT)) STRICT";
+        let err = Parser::new(sql).next().unwrap().unwrap_err();
+        assert!(err.to_string().contains("inline STRUCT/UNION"));
+    }
+
+    #[test]
+    fn test_inline_union_rejected() {
+        let sql = b"CREATE TABLE t(u UNION(i INT, t TEXT)) STRICT";
+        let err = Parser::new(sql).next().unwrap().unwrap_err();
+        assert!(err.to_string().contains("inline STRUCT/UNION"));
+    }
+
+    #[test]
+    fn test_create_type_as_struct() {
+        let sql = b"CREATE TYPE point AS STRUCT(x INT, y INT)";
+        let cmd = Parser::new(sql).next().unwrap().unwrap();
+        if let Cmd::Stmt(Stmt::CreateType {
+            type_name, body, ..
+        }) = cmd
+        {
+            assert_eq!(type_name, "point");
+            match body {
+                CreateTypeBody::Struct(fields) => {
+                    assert_eq!(fields.len(), 2);
+                    assert_eq!(fields[0].name.to_string(), "x");
+                    assert_eq!(fields[1].name.to_string(), "y");
+                }
+                _ => panic!("expected Struct body"),
+            }
+        } else {
+            panic!("expected CreateType");
+        }
+    }
+
+    #[test]
+    fn test_create_type_as_union() {
+        let sql = b"CREATE TYPE platform AS UNION(telegram INT, slack TEXT)";
+        let cmd = Parser::new(sql).next().unwrap().unwrap();
+        if let Cmd::Stmt(Stmt::CreateType {
+            type_name, body, ..
+        }) = cmd
+        {
+            assert_eq!(type_name, "platform");
+            match body {
+                CreateTypeBody::Union(fields) => {
+                    assert_eq!(fields.len(), 2);
+                    assert_eq!(fields[0].name.to_string(), "telegram");
+                    assert_eq!(fields[1].name.to_string(), "slack");
+                }
+                _ => panic!("expected Union body"),
+            }
+        } else {
+            panic!("expected CreateType");
+        }
+    }
+
+    #[test]
+    fn test_dot_notation_still_produces_qualified() {
+        let sql = b"SELECT col.field FROM t";
+        let cmd = Parser::new(sql).next().unwrap().unwrap();
+        if let Cmd::Stmt(Stmt::Select(sel)) = cmd {
+            if let OneSelect::Select { columns, .. } = &sel.body.select {
+                if let ResultColumn::Expr(expr, _) = &columns[0] {
+                    assert!(
+                        matches!(expr.as_ref(), Expr::Qualified(_, _)),
+                        "expected Qualified, got: {expr:?}",
+                    );
+                } else {
+                    panic!("expected Expr");
+                }
+            } else {
+                panic!("expected Select");
+            }
+        } else {
+            panic!("expected Select");
+        }
+    }
+
+    #[test]
+    fn test_struct_pack_positional() {
+        let sql = b"SELECT struct_pack(1, 'hello')";
+        let cmd = Parser::new(sql).next().unwrap().unwrap();
+        if let Cmd::Stmt(Stmt::Select(sel)) = cmd {
+            if let OneSelect::Select { columns, .. } = &sel.body.select {
+                if let ResultColumn::Expr(expr, _) = &columns[0] {
+                    if let Expr::FunctionCall { name, args, .. } = expr.as_ref() {
+                        assert_eq!(name.to_string(), "struct_pack");
+                        assert_eq!(args.len(), 2);
+                    } else {
+                        panic!("expected FunctionCall");
+                    }
+                } else {
+                    panic!("expected Expr");
+                }
+            } else {
+                panic!("expected Select");
+            }
+        } else {
+            panic!("expected Select");
+        }
+    }
+
+    #[test]
+    fn test_union_value_string_tag() {
+        let sql = b"SELECT union_value('i', 42)";
+        let cmd = Parser::new(sql).next().unwrap().unwrap();
+        if let Cmd::Stmt(Stmt::Select(sel)) = cmd {
+            if let OneSelect::Select { columns, .. } = &sel.body.select {
+                if let ResultColumn::Expr(expr, _) = &columns[0] {
+                    if let Expr::FunctionCall { name, args, .. } = expr.as_ref() {
+                        assert_eq!(name.to_string(), "union_value");
+                        assert_eq!(args.len(), 2);
+                    } else {
+                        panic!("expected FunctionCall");
+                    }
+                } else {
+                    panic!("expected Expr");
+                }
+            } else {
+                panic!("expected Select");
+            }
+        } else {
+            panic!("expected Select");
         }
     }
 }

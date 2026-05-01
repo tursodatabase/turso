@@ -16,8 +16,8 @@ fn index_seek_affinities(
         .iter()
         .zip(seek_def.iter(seek_key))
         .map(|(ic, key_component)| {
-            let col_aff = if ic.expr.is_some() {
-                Affinity::Blob
+            let col_aff = if let Some(ref expr) = ic.expr {
+                crate::translate::expr::get_expr_affinity(expr, Some(tables), None)
             } else {
                 table
                     .table
@@ -69,7 +69,7 @@ fn encode_seek_keys_for_custom_types(
             Some(td) => td,
             None => continue,
         };
-        let encode_expr = match &type_def.encode {
+        let encode_expr = match type_def.encode() {
             Some(e) => e,
             None => continue,
         };
@@ -88,7 +88,7 @@ fn encode_seek_keys_for_custom_types(
             type_def,
             resolver,
         )?;
-        program.resolve_label(skip_label, program.offset());
+        program.preassign_label_to_next_insn(skip_label);
     }
     Ok(())
 }

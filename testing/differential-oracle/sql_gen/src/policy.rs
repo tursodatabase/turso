@@ -373,6 +373,7 @@ pub struct StmtWeights {
     pub alter_table: u32,
     pub create_index: u32,
     pub drop_index: u32,
+    pub pragma_foreign_key_list: u32,
     pub create_trigger: u32,
     pub drop_trigger: u32,
 
@@ -405,6 +406,7 @@ impl Default for StmtWeights {
             alter_table: 1,
             create_index: 2,
             drop_index: 1,
+            pragma_foreign_key_list: 1,
             create_trigger: 1,
             drop_trigger: 1,
             // Transactions (disabled by default)
@@ -455,6 +457,7 @@ impl StmtWeights {
             alter_table: 0,
             create_index: 0,
             drop_index: 0,
+            pragma_foreign_key_list: 0,
             create_trigger: 0,
             drop_trigger: 0,
             begin: 0,
@@ -482,6 +485,7 @@ impl StmtWeights {
             StmtKind::AlterTable => self.alter_table,
             StmtKind::CreateIndex => self.create_index,
             StmtKind::DropIndex => self.drop_index,
+            StmtKind::PragmaForeignKeyList => self.pragma_foreign_key_list,
             StmtKind::CreateTrigger => self.create_trigger,
             StmtKind::DropTrigger => self.drop_trigger,
             StmtKind::Begin => self.begin,
@@ -510,6 +514,7 @@ impl StmtWeights {
             (StmtKind::AlterTable, self.alter_table),
             (StmtKind::CreateIndex, self.create_index),
             (StmtKind::DropIndex, self.drop_index),
+            (StmtKind::PragmaForeignKeyList, self.pragma_foreign_key_list),
             (StmtKind::CreateTrigger, self.create_trigger),
             (StmtKind::DropTrigger, self.drop_trigger),
             (StmtKind::Begin, self.begin),
@@ -1440,12 +1445,26 @@ pub struct UpdateConfig {
     /// Probability of generating a CTE (WITH clause) for UPDATE.
     pub cte_probability: f64,
 
-    // Stubs (not yet implemented, probability 0.0)
     /// Probability of UPDATE ... FROM.
     pub from_probability: f64,
 
     /// Probability of RETURNING clause.
     pub returning_probability: f64,
+
+    /// Probability of self-join (target table in FROM with alias).
+    pub self_join_probability: f64,
+
+    /// Probability of adding JOINs after the FROM table.
+    pub join_in_from_probability: f64,
+
+    /// Probability of using a subquery in FROM instead of a bare table.
+    pub subquery_from_probability: f64,
+
+    /// Probability of aliasing the target table (UPDATE t AS x).
+    pub target_alias_probability: f64,
+
+    /// Probability that a SET clause references a FROM-side column.
+    pub from_set_reference_probability: f64,
 }
 
 impl Default for UpdateConfig {
@@ -1460,9 +1479,13 @@ impl Default for UpdateConfig {
             expression_value_probability: 0.4,
             expression_value_max_depth: 2,
             cte_probability: 0.1,
-            // Stubs
-            from_probability: 0.0,
+            from_probability: 0.15,
             returning_probability: 0.0,
+            self_join_probability: 0.0,
+            join_in_from_probability: 0.0,
+            subquery_from_probability: 0.0,
+            target_alias_probability: 0.0,
+            from_set_reference_probability: 0.0,
         }
     }
 }
@@ -1939,7 +1962,7 @@ impl Default for ExprConfig {
             // Stubs
             like_escape_probability: 0.0,
             aggregate_distinct_probability: 0.0,
-            aggregate_filter_probability: 0.0,
+            aggregate_filter_probability: 0.3,
         }
     }
 }

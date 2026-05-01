@@ -83,7 +83,12 @@ fn random_create_index<R: rand::Rng + ?Sized>(
     Query::CreateIndex(create_index)
 }
 
-fn random_pragma<R: rand::Rng + ?Sized>(rng: &mut R, _conn_ctx: &impl GenerationContext) -> Query {
+fn random_pragma<R: rand::Rng + ?Sized>(rng: &mut R, conn_ctx: &impl GenerationContext) -> Query {
+    if !conn_ctx.tables().is_empty() && rng.random_bool(0.5) {
+        let table = conn_ctx.tables().choose(rng).unwrap();
+        return Query::Pragma(Pragma::ForeignKeyList(table.name.clone()));
+    }
+
     const ALL_MODES: [VacuumMode; 2] = [
         VacuumMode::None,
         // VacuumMode::Incremental, not implemented yet
@@ -147,7 +152,10 @@ impl QueryDiscriminants {
             QueryDiscriminants::DropIndex => random_drop_index,
             QueryDiscriminants::Begin
             | QueryDiscriminants::Commit
-            | QueryDiscriminants::Rollback => {
+            | QueryDiscriminants::Rollback
+            | QueryDiscriminants::Savepoint
+            | QueryDiscriminants::RollbackToSavepoint
+            | QueryDiscriminants::ReleaseSavepoint => {
                 unreachable!("transactional queries should not be generated")
             }
             QueryDiscriminants::Placeholder => {
@@ -172,7 +180,10 @@ impl QueryDiscriminants {
             QueryDiscriminants::DropIndex => remaining.drop_index,
             QueryDiscriminants::Begin
             | QueryDiscriminants::Commit
-            | QueryDiscriminants::Rollback => {
+            | QueryDiscriminants::Rollback
+            | QueryDiscriminants::Savepoint
+            | QueryDiscriminants::RollbackToSavepoint
+            | QueryDiscriminants::ReleaseSavepoint => {
                 unreachable!("transactional queries should not be generated")
             }
             QueryDiscriminants::Placeholder => {
@@ -186,17 +197,30 @@ impl QueryDiscriminants {
 #[derive(Debug)]
 pub(super) struct QueryDistribution {
     queries: &'static [QueryDiscriminants],
+    query_weights: Vec<u32>,
     weights: WeightedIndex<u32>,
 }
 
 impl QueryDistribution {
     pub fn new(queries: &'static [QueryDiscriminants], remaining: &Remaining) -> Self {
-        let query_weights =
-            WeightedIndex::new(queries.iter().map(|query| query.weight(remaining))).unwrap();
+        let query_weights = queries
+            .iter()
+            .map(|query| query.weight(remaining))
+            .collect::<Vec<_>>();
+        let weights = WeightedIndex::new(query_weights.iter().copied()).unwrap();
         Self {
             queries,
-            weights: query_weights,
+            query_weights,
+            weights,
         }
+    }
+
+    pub(super) fn positive_items(&self) -> impl Iterator<Item = QueryDiscriminants> + '_ {
+        self.queries
+            .iter()
+            .zip(self.query_weights.iter())
+            .filter(|(_, weight)| **weight > 0)
+            .map(|(query, _)| *query)
     }
 }
 

@@ -1,10 +1,8 @@
-use crate::incremental::view::IncrementalView;
 use crate::numeric::StrToF64;
 use crate::schema::ColDef;
-use crate::sync::Mutex;
 use crate::translate::emitter::TransactionMode;
 use crate::translate::expr::{walk_expr, walk_expr_mut, WalkControl};
-use crate::translate::plan::{JoinedTable, TableReferences};
+use crate::translate::plan::{BitSet, JoinedTable, TableReferences};
 use crate::translate::planner::{parse_row_id, TableMask};
 use crate::types::IOResult;
 use crate::IO;
@@ -16,7 +14,6 @@ use crate::{
 use either::Either;
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use std::future::Future;
-use std::sync::Arc;
 use tracing::{instrument, Level};
 use turso_macros::match_ignore_ascii_case;
 use turso_parser::ast::{self, CreateTableBody, Expr, Literal, UnaryOperator};
@@ -164,7 +161,6 @@ pub fn parse_schema_rows(
     schema: &mut Schema,
     syms: &SymbolTable,
     mv_tx: Option<(u64, TransactionMode)>,
-    _existing_views: HashMap<String, Arc<Mutex<IncrementalView>>>,
     resolve_attached_db: &dyn Fn(&str) -> Option<usize>,
 ) -> Result<()> {
     rows.set_mv_tx(mv_tx);
@@ -642,16 +638,16 @@ pub fn try_capture_parameters_column_agnostic(
 
     // For column arguments: check that the same set of columns is used (order-independent)
     // We use a greedy matching approach: for each query column, find a matching pattern column
-    let mut matched_pattern_indices: HashSet<usize> = HashSet::default();
+    let mut matched_pattern_indices = BitSet::default();
 
     for query_col in query_col_args {
         let mut found_match = false;
         for (i, pattern_col) in pattern_col_args.iter().enumerate() {
-            if matched_pattern_indices.contains(&i) {
+            if matched_pattern_indices.get(i) {
                 continue;
             }
             if exprs_are_equivalent(pattern_col, query_col) {
-                matched_pattern_indices.insert(i);
+                matched_pattern_indices.set(i);
                 found_match = true;
                 break;
             }
@@ -661,7 +657,7 @@ pub fn try_capture_parameters_column_agnostic(
         }
     }
     // All pattern columns must be matched
-    if matched_pattern_indices.len() != pattern_col_args.len() {
+    if matched_pattern_indices.count() != pattern_col_args.len() {
         return None;
     }
     // Remaining args must match positionally (includes the query string parameter)
@@ -1456,21 +1452,6 @@ where
     walk_select_expressions_inner(select, func)
 }
 
-pub fn validate_aggregate_function_tail(
-    filter_over: &ast::FunctionTail,
-    order_by: &[ast::SortedColumn],
-) -> Result<()> {
-    if filter_over.filter_clause.is_some() {
-        crate::bail_parse_error!("FILTER clause is not supported yet in aggregate functions");
-    }
-
-    if !order_by.is_empty() {
-        crate::bail_parse_error!("ORDER BY clause is not supported yet in aggregate functions");
-    }
-
-    Ok(())
-}
-
 fn walk_select_expressions_inner<F>(select: &ast::Select, func: &mut F) -> Result<()>
 where
     F: FnMut(&ast::Expr) -> Result<WalkControl>,
@@ -1729,20 +1710,13 @@ fn validate_select_table_no_cross_db(
 
 pub fn validate_select_for_unsupported_features(select_stmt: &ast::Select) -> Result<()> {
     walk_select_expressions(select_stmt, &mut |expr| {
-        match expr {
-            ast::Expr::FunctionCall {
-                filter_over,
-                order_by,
-                ..
-            } => {
-                validate_aggregate_function_tail(filter_over, order_by)?;
+        if let ast::Expr::FunctionCall { order_by, .. } = expr {
+            if !order_by.is_empty() {
+                crate::bail_parse_error!(
+                    "ORDER BY clause is not supported yet in aggregate functions"
+                );
             }
-            ast::Expr::FunctionCallStar { filter_over, .. } => {
-                validate_aggregate_function_tail(filter_over, &[])?;
-            }
-            _ => {}
         }
-
         Ok(WalkControl::Continue)
     })
 }

@@ -1288,6 +1288,17 @@ expect {
     |null
 }
 
+test substr-embedded-nul {
+    SELECT hex(substr('a' || char(0) || 'b' || char(0) || 'c', 1, 2));
+    SELECT hex(substr('a' || char(0) || 'b' || char(0) || 'c', 2, 1));
+    SELECT hex(substr('a' || char(0) || 'b' || char(0) || 'c', 3, 1));
+}
+expect {
+    61
+
+
+}
+
 test typeof-null {
     SELECT typeof(null);
 }
@@ -2399,4 +2410,91 @@ test unistr-quote-ignores-control-after-nul {
 }
 expect {
     'a'
+}
+
+test func2-1-2-1 {
+    SELECT SUBSTR();
+} 
+expect error {
+    wrong number of arguments to function SUBSTR()
+}
+
+test func2-1-2-2 {
+    SELECT SUBSTR('Supercalifragilisticexpialidocious')
+} 
+expect error {
+    wrong number of arguments to function SUBSTR()
+}
+
+test func2-1-2-3 {
+    SELECT SUBSTR('Supercalifragilisticexpialidocious', 1,1,1)
+} 
+expect error {
+    wrong number of arguments to function SUBSTR()
+}
+
+test func3-5-8 {
+    SELECT likelihood(123, 1.000001);
+} 
+expect error {
+    second argument to likelihood\(\) must be a constant between 0.0 and 1.0
+}
+
+test func3-5-9 {
+    SELECT likelihood(123, -0.000001);
+} 
+expect error {
+    second argument to likelihood\(\) must be a constant between 0.0 and 1.0
+}
+
+test func3-5-10 {
+    SELECT likelihood(123, 0.5+0.3);
+} 
+expect error {
+    second argument to likelihood\(\) must be a constant between 0.0 and 1.0
+}
+
+test func9-120 {
+  SELECT concat();
+} 
+expect error {
+    wrong number of arguments to function concat()
+}
+
+test func9-150 {
+  SELECT concat_ws();
+} 
+expect error {
+    wrong number of arguments to function concat_ws()
+}
+
+test func9-160 {
+  SELECT concat_ws(',');
+} 
+expect error {
+    wrong number of arguments to function concat_ws()
+}
+
+test func7-pg-180 {
+    SELECT log10(1000.0);
+}
+expect {
+    3.0
+}
+expect @js {
+    3
+}
+
+test func7-pg-401 {
+   SELECT cos( radians(60.0) );
+} 
+expect {
+    0.5
+}
+
+test func7-pg-411 {
+   SELECT sin( radians(30) );
+} 
+expect {
+    0.5
 }

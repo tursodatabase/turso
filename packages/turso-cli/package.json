@@ -1,6 +1,6 @@
 {
   "name": "turso",
-  "version": "0.6.0-pre.17",
+  "version": "0.6.0-pre.25",
   "description": "Turso CLI - SQLite for production",
   "license": "MIT",
   "repository": {
@@ -14,10 +14,10 @@
     "src/index.js"
   ],
   "optionalDependencies": {
-    "@tursodatabase/cli-darwin-arm64": "0.6.0-pre.17",
-    "@tursodatabase/cli-darwin-x64": "0.6.0-pre.17",
-    "@tursodatabase/cli-linux-arm64-gnu": "0.6.0-pre.17",
-    "@tursodatabase/cli-linux-x64-gnu": "0.6.0-pre.17",
-    "@tursodatabase/cli-win32-x64-msvc": "0.6.0-pre.17"
+    "@tursodatabase/cli-darwin-arm64": "0.6.0-pre.25",
+    "@tursodatabase/cli-darwin-x64": "0.6.0-pre.25",
+    "@tursodatabase/cli-linux-arm64-gnu": "0.6.0-pre.25",
+    "@tursodatabase/cli-linux-x64-gnu": "0.6.0-pre.25",
+    "@tursodatabase/cli-win32-x64-msvc": "0.6.0-pre.25"
   }
 }

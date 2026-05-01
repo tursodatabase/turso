@@ -2,10 +2,10 @@ use crate::{
     schema::{Column, Index, Schema},
     translate::{
         collate::get_collseq_from_expr,
-        expr::{as_binary_components, comparison_affinity},
+        expr::{as_binary_components, comparison_affinity, walk_expr_mut, WalkControl},
         expression_index::normalize_expr_for_index_matching,
         plan::{JoinOrderMember, JoinedTable, NonFromClauseSubquery, TableReferences, WhereTerm},
-        planner::{table_mask_from_expr, TableMask},
+        planner::{break_predicate_at_and_boundaries, table_mask_from_expr, TableMask, ROWID_STRS},
     },
     util::exprs_are_equivalent,
     vdbe::affinity::Affinity,
@@ -846,7 +846,8 @@ pub fn constraints_from_where_clause(
                     }
                     if let Some(index_candidate) = cs.candidates.iter_mut().find_map(|candidate| {
                         if candidate.index.as_ref().is_some_and(|i| {
-                            Arc::ptr_eq(index, i) && can_use_partial_index(index, where_clause)
+                            Arc::ptr_eq(index, i)
+                                && can_use_partial_index(index, table_reference, where_clause)
                         }) {
                             Some(candidate)
                         } else {
@@ -869,8 +870,14 @@ pub fn constraints_from_where_clause(
         }
         cs.candidates.retain(|c| {
             if let Some(idx) = &c.index {
-                if idx.where_clause.is_some() && c.refs.is_empty() {
-                    // prevent a partial index from even being considered as a scan driver.
+                if idx.where_clause.is_some()
+                    && c.refs.is_empty()
+                    && !can_use_partial_index(idx, table_reference, where_clause)
+                {
+                    // A partial index with no column constraints can still drive a
+                    // scan, but only if every conjunct of its WHERE clause is implied
+                    // by the query's WHERE. Otherwise it would skip rows the query
+                    // needs.
                     return false;
                 }
             }
@@ -1160,19 +1167,246 @@ pub fn ordered_materialized_key_columns(constraints: &[&Constraint]) -> Vec<usiz
     ordered
 }
 
-fn can_use_partial_index(index: &Index, query_where_clause: &[WhereTerm]) -> bool {
+fn can_use_partial_index(
+    index: &Index,
+    table_reference: &JoinedTable,
+    query_where_clause: &[WhereTerm],
+) -> bool {
     let Some(index_where) = &index.where_clause else {
         // Full index, always usable
         return true;
     };
-    // Check if query WHERE contains the exact same predicate
-    for term in query_where_clause {
-        if exprs_are_equivalent(&term.expr, index_where.as_ref()) {
-            return true;
+    // Bind the index WHERE expression's column references to this query's
+    // table reference so it can be compared symmetrically against bound query
+    // WHERE terms. Each conjunct of the index WHERE must match some query
+    // WHERE term for the partial index to be safe to use.
+    let mut bound = (**index_where).clone();
+    bind_partial_index_columns(&mut bound, table_reference);
+    let mut index_conjuncts: Vec<ast::Expr> = Vec::new();
+    break_predicate_at_and_boundaries(&bound, &mut index_conjuncts);
+    index_conjuncts.iter().all(|ic| {
+        query_where_clause
+            .iter()
+            .any(|t| exprs_are_equivalent(ic, &t.expr))
+    })
+    // TODO: recognize implication beyond syntactic equivalence (e.g. `x = 5` implies
+    // `x IS NOT NULL`, `x > 10` implies `x > 5`).
+}
+
+/// Rewrite identifier nodes in a partial-index WHERE expression to bound
+/// `Expr::Column` / `Expr::RowId` against `table_reference`. Partial-index
+/// WHERE clauses are validated to only reference columns of the indexed
+/// table (`Index::validate_where_expr`), so this minimal binder is enough
+/// to make the expression directly comparable to a bound query expression
+/// via `exprs_are_equivalent` — without threading a full `Resolver`.
+fn bind_partial_index_columns(expr: &mut ast::Expr, table_reference: &JoinedTable) {
+    let column_pos = |name: &str| -> Option<usize> {
+        table_reference.columns().iter().position(|c| {
+            c.name
+                .as_ref()
+                .is_some_and(|cn| cn.eq_ignore_ascii_case(name))
+        })
+    };
+    let is_rowid_keyword = |name: &str| ROWID_STRS.iter().any(|s| s.eq_ignore_ascii_case(name));
+    let qualifier_matches = |ns: &str| -> bool {
+        ns.eq_ignore_ascii_case(&table_reference.identifier)
+            || ns.eq_ignore_ascii_case(table_reference.table.get_name())
+    };
+    let make_column = |col_idx: usize| -> ast::Expr {
+        let col = &table_reference.columns()[col_idx];
+        ast::Expr::Column {
+            database: None,
+            table: table_reference.internal_id,
+            column: col_idx,
+            is_rowid_alias: col.is_rowid_alias(),
         }
+    };
+    let make_rowid = || -> ast::Expr {
+        ast::Expr::RowId {
+            database: None,
+            table: table_reference.internal_id,
+        }
+    };
+
+    let _ = walk_expr_mut(expr, &mut |e: &mut ast::Expr| -> Result<WalkControl> {
+        match e {
+            ast::Expr::Id(name) => {
+                if let Some(idx) = column_pos(name.as_str()) {
+                    *e = make_column(idx);
+                } else if is_rowid_keyword(name.as_str()) {
+                    *e = make_rowid();
+                }
+            }
+            ast::Expr::Qualified(ns, col) | ast::Expr::DoublyQualified(_, ns, col) => {
+                if qualifier_matches(ns.as_str()) {
+                    if let Some(idx) = column_pos(col.as_str()) {
+                        *e = make_column(idx);
+                    } else if is_rowid_keyword(col.as_str()) {
+                        *e = make_rowid();
+                    }
+                }
+            }
+            _ => {}
+        }
+        Ok(WalkControl::Continue)
+    });
+}
+
+/// Estimate the selectivity of a partial index's WHERE clause, i.e. what
+/// fraction of the table's rows pass the predicate (and therefore appear in
+/// the partial index). The expression is bound to the table's column space
+/// first so that leaf comparisons can dispatch through the standard
+/// `estimate_selectivity` path — picking up ANALYZE stats when available.
+pub fn estimate_partial_index_where_selectivity(
+    where_expr: &ast::Expr,
+    table_reference: &JoinedTable,
+    schema: &Schema,
+    available_indexes: &HashMap<String, VecDeque<Arc<Index>>>,
+    params: &CostModelParams,
+) -> f64 {
+    let mut bound = where_expr.clone();
+    bind_partial_index_columns(&mut bound, table_reference);
+    estimate_bound_expr_selectivity(&bound, table_reference, schema, available_indexes, params)
+}
+
+fn estimate_bound_expr_selectivity(
+    expr: &ast::Expr,
+    table_reference: &JoinedTable,
+    schema: &Schema,
+    available_indexes: &HashMap<String, VecDeque<Arc<Index>>>,
+    params: &CostModelParams,
+) -> f64 {
+    use ast::Expr;
+    let expr = crate::translate::expr::unwrap_parens(expr).unwrap_or(expr);
+
+    // Try to resolve the constrained column from a binary leaf so we can use
+    // ANALYZE-aware selectivity. Returns (Column, column_pos, is_rowid).
+    let resolve_side = |side: &ast::Expr| -> Option<(Option<&Column>, Option<usize>, bool)> {
+        match side {
+            Expr::Column { table, column, .. } if *table == table_reference.internal_id => Some((
+                Some(&table_reference.table.columns()[*column]),
+                Some(*column),
+                false,
+            )),
+            Expr::RowId { table, .. } if *table == table_reference.internal_id => {
+                let rowid_alias = table_reference
+                    .columns()
+                    .iter()
+                    .position(|c| c.is_rowid_alias());
+                Some((
+                    rowid_alias.map(|p| &table_reference.table.columns()[p]),
+                    rowid_alias,
+                    true,
+                ))
+            }
+            _ => None,
+        }
+    };
+    let leaf_selectivity = |lhs: &ast::Expr, rhs: &ast::Expr, op: ConstraintOperator| -> f64 {
+        let resolved = resolve_side(lhs).or_else(|| resolve_side(rhs));
+        let (col, col_pos, is_rowid) = resolved.unwrap_or((None, None, false));
+        estimate_constraint_selectivity(
+            schema,
+            table_reference,
+            col,
+            col_pos,
+            op,
+            available_indexes,
+            params,
+            is_rowid,
+        )
+    };
+
+    match expr {
+        Expr::Binary(lhs, ast::Operator::And, rhs) => {
+            let l = estimate_bound_expr_selectivity(
+                lhs,
+                table_reference,
+                schema,
+                available_indexes,
+                params,
+            );
+            let r = estimate_bound_expr_selectivity(
+                rhs,
+                table_reference,
+                schema,
+                available_indexes,
+                params,
+            );
+            l * r
+        }
+        Expr::Binary(lhs, ast::Operator::Or, rhs) => {
+            let l = estimate_bound_expr_selectivity(
+                lhs,
+                table_reference,
+                schema,
+                available_indexes,
+                params,
+            );
+            let r = estimate_bound_expr_selectivity(
+                rhs,
+                table_reference,
+                schema,
+                available_indexes,
+                params,
+            );
+            (l + r - l * r).min(1.0)
+        }
+        Expr::Binary(_, ast::Operator::Is, rhs)
+            if matches!(rhs.as_ref(), Expr::Literal(ast::Literal::Null)) =>
+        {
+            params.sel_is_null
+        }
+        Expr::Binary(_, ast::Operator::IsNot, rhs)
+            if matches!(rhs.as_ref(), Expr::Literal(ast::Literal::Null)) =>
+        {
+            params.sel_is_not_null
+        }
+        Expr::Binary(lhs, op, rhs) => leaf_selectivity(lhs, rhs, (*op).into()),
+        Expr::IsNull(_) => params.sel_is_null,
+        Expr::NotNull(_) => params.sel_is_not_null,
+        Expr::Between { not, .. } => {
+            if *not {
+                1.0 - params.sel_range
+            } else {
+                params.sel_range
+            }
+        }
+        Expr::InList { lhs, not, rhs } => {
+            let resolved = resolve_side(lhs);
+            let (col, col_pos, is_rowid) = resolved.unwrap_or((None, None, false));
+            estimate_constraint_selectivity(
+                schema,
+                table_reference,
+                col,
+                col_pos,
+                ConstraintOperator::In {
+                    not: *not,
+                    estimated_values: rhs.len() as f64,
+                },
+                available_indexes,
+                params,
+                is_rowid,
+            )
+        }
+        Expr::Like { not, .. } => {
+            if *not {
+                params.sel_not_like
+            } else {
+                params.sel_like
+            }
+        }
+        Expr::Unary(ast::UnaryOperator::Not, inner) => {
+            1.0 - estimate_bound_expr_selectivity(
+                inner,
+                table_reference,
+                schema,
+                available_indexes,
+                params,
+            )
+        }
+        _ => params.sel_other,
     }
-    // TODO: do better to determine if we should use partial index
-    false
 }
 
 pub fn convert_to_vtab_constraint(
@@ -1251,26 +1485,32 @@ pub struct AnalyzedTerm {
     pub constraint_refs: Vec<RangeConstraintRef>,
 }
 
-/// Analyzes a single binary expression to determine if it can use an index.
-///
-/// This is a shared helper for both OR and AND multi-index analysis.
-/// Returns `Some(AnalyzedTerm)` if the expression is a usable indexed constraint,
-/// `None` otherwise.
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn analyze_binary_term_for_index(
-    expr: &ast::Expr,
-    where_term_idx: usize,
+/// Lightweight prepass result for a binary term that can seed a multi-index branch.
+#[derive(Debug, Clone)]
+pub struct IndexableTermSummary {
+    /// The constrained table column, if any.
+    pub table_col_pos: Option<usize>,
+    /// The other tables referenced by the constraining expression.
+    pub lhs_mask: TableMask,
+    /// The chosen index for this term, or `None` for rowid access.
+    pub best_index: Option<Arc<Index>>,
+}
+
+struct BinaryTermIndexInfo<'a> {
+    lhs: &'a ast::Expr,
+    rhs: &'a ast::Expr,
+    operator: ConstraintOperator,
+    table_col_pos: Option<usize>,
+    constraining_expr: &'a ast::Expr,
+    side: BinaryExprSide,
+    is_rowid: bool,
+}
+
+fn analyze_binary_term_index_info<'a>(
+    expr: &'a ast::Expr,
     table_id: TableInternalId,
-    table_reference: &JoinedTable,
-    indexes: Option<&VecDeque<Arc<Index>>>,
     rowid_alias_column: Option<usize>,
-    available_indexes: &HashMap<String, VecDeque<Arc<Index>>>,
-    table_references: &TableReferences,
-    subqueries: &[NonFromClauseSubquery],
-    schema: &Schema,
-    params: &CostModelParams,
-) -> Option<AnalyzedTerm> {
-    // Try to extract a binary comparison
+) -> Option<BinaryTermIndexInfo<'a>> {
     let (lhs, operator, rhs) = as_binary_components(expr).ok().flatten()?;
 
     // Check if the operator is usable for index seeks
@@ -1292,17 +1532,17 @@ pub(crate) fn analyze_binary_term_for_index(
     // Check if this is an indexable constraint on our table
     let (table_col_pos, constraining_expr, side, is_rowid) = match lhs {
         ast::Expr::Column { table, column, .. } if *table == table_id => {
-            (Some(*column), rhs.clone(), BinaryExprSide::Rhs, false)
+            (Some(*column), rhs, BinaryExprSide::Rhs, false)
         }
         ast::Expr::RowId { table, .. } if *table == table_id => {
-            (rowid_alias_column, rhs.clone(), BinaryExprSide::Rhs, true)
+            (rowid_alias_column, rhs, BinaryExprSide::Rhs, true)
         }
         _ => match rhs {
             ast::Expr::Column { table, column, .. } if *table == table_id => {
-                (Some(*column), lhs.clone(), BinaryExprSide::Lhs, false)
+                (Some(*column), lhs, BinaryExprSide::Lhs, false)
             }
             ast::Expr::RowId { table, .. } if *table == table_id => {
-                (rowid_alias_column, lhs.clone(), BinaryExprSide::Lhs, true)
+                (rowid_alias_column, lhs, BinaryExprSide::Lhs, true)
             }
             _ => return None, // Doesn't reference our table
         },
@@ -1315,6 +1555,93 @@ pub(crate) fn analyze_binary_term_for_index(
     } else {
         operator
     };
+
+    Some(BinaryTermIndexInfo {
+        lhs,
+        rhs,
+        operator,
+        table_col_pos,
+        constraining_expr,
+        side,
+        is_rowid,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn summarize_binary_term_for_index(
+    expr: &ast::Expr,
+    table_id: TableInternalId,
+    indexes: Option<&VecDeque<Arc<Index>>>,
+    rowid_alias_column: Option<usize>,
+    table_references: &TableReferences,
+    subqueries: &[NonFromClauseSubquery],
+) -> Option<IndexableTermSummary> {
+    let BinaryTermIndexInfo {
+        operator,
+        table_col_pos,
+        constraining_expr,
+        is_rowid,
+        ..
+    } = analyze_binary_term_index_info(expr, table_id, rowid_alias_column)?;
+
+    let (best_index, constraint_refs) = find_best_index_for_constraint(
+        table_col_pos,
+        operator,
+        indexes,
+        rowid_alias_column,
+        is_rowid,
+    );
+    if constraint_refs.is_empty() {
+        return None;
+    }
+
+    let lhs_mask = table_mask_from_expr(constraining_expr, table_references, subqueries)
+        .unwrap_or_else(|_| TableMask::default());
+
+    let table_pos = table_references
+        .joined_tables()
+        .iter()
+        .position(|t| t.internal_id == table_id)
+        .expect("target table must exist in table_references");
+    if lhs_mask.get(table_pos) {
+        return None;
+    }
+
+    Some(IndexableTermSummary {
+        table_col_pos,
+        lhs_mask,
+        best_index,
+    })
+}
+
+/// Analyzes a single binary expression to determine if it can use an index.
+///
+/// This is a shared helper for both OR and AND multi-index analysis.
+/// Returns `Some(AnalyzedTerm)` if the expression is a usable indexed constraint,
+/// `None` otherwise.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn analyze_binary_term_for_index(
+    expr: &ast::Expr,
+    where_term_idx: usize,
+    table_id: TableInternalId,
+    table_reference: &JoinedTable,
+    indexes: Option<&VecDeque<Arc<Index>>>,
+    rowid_alias_column: Option<usize>,
+    available_indexes: &HashMap<String, VecDeque<Arc<Index>>>,
+    table_references: &TableReferences,
+    subqueries: &[NonFromClauseSubquery],
+    schema: &Schema,
+    params: &CostModelParams,
+) -> Option<AnalyzedTerm> {
+    let BinaryTermIndexInfo {
+        lhs,
+        rhs,
+        operator,
+        table_col_pos,
+        constraining_expr,
+        side,
+        is_rowid,
+    } = analyze_binary_term_index_info(expr, table_id, rowid_alias_column)?;
 
     // Find the best index for this constraint
     let (best_index, constraint_refs) = find_best_index_for_constraint(
@@ -1342,7 +1669,7 @@ pub(crate) fn analyze_binary_term_for_index(
         is_rowid,
     );
 
-    let lhs_mask = table_mask_from_expr(&constraining_expr, table_references, subqueries)
+    let lhs_mask = table_mask_from_expr(constraining_expr, table_references, subqueries)
         .unwrap_or_else(|_| TableMask::default());
 
     // Cannot use index seek if the constraining expression references the same table

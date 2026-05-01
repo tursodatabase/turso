@@ -1,6 +1,6 @@
 {
   "name": "@tursodatabase/sync",
-  "version": "0.6.0-pre.17",
+  "version": "0.6.0-pre.25",
   "repository": {
     "type": "git",
     "url": "https://github.com/tursodatabase/turso"
@@ -21,7 +21,7 @@
   "packageManager": "yarn@4.9.2",
   "devDependencies": {
     "@napi-rs/cli": "^3.1.5",
-    "@types/node": "^24.3.1",
+    "@types/node": "^24.12.2",
     "typescript": "^5.9.2",
     "vitest": "^3.2.4"
   },
@@ -31,7 +31,7 @@
     "napi-artifacts": "napi artifacts --output-dir .",
     "tsc-build": "npm exec tsc",
     "build": "npm run napi-build && npm run tsc-build",
-    "test": "VITE_TURSO_DB_URL=http://jj--a--a.localhost:8080 vitest --run --exclude remote-write.test.ts",
+    "test": "LOCAL_SYNC_SERVER=../../../../../target/debug/tursodb vitest --run --exclude remote-write.test.ts",
     "test:remote-write": "vitest --run remote-write.test.ts",
     "prepublishOnly": "npm run napi-dirs && npm run napi-artifacts && napi prepublish -t npm"
   },
@@ -45,8 +45,8 @@
     ]
   },
   "dependencies": {
-    "@tursodatabase/database-common": "^0.6.0-pre.17",
-    "@tursodatabase/sync-common": "^0.6.0-pre.17"
+    "@tursodatabase/database-common": "^0.6.0-pre.25",
+    "@tursodatabase/sync-common": "^0.6.0-pre.25"
   },
   "imports": {
     "#index": "./index.js"

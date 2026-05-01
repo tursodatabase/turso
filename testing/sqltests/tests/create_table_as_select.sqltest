@@ -1,0 +1,631 @@
+@database :memory:
+
+# Basic CREATE TABLE AS SELECT
+
+@cross-check-integrity
+test ctas_basic {
+    CREATE TABLE src (id INTEGER PRIMARY KEY, name TEXT, value REAL);
+    INSERT INTO src VALUES (1, 'alice', 10.5);
+    INSERT INTO src VALUES (2, 'bob', 20.3);
+    INSERT INTO src VALUES (3, 'charlie', 30.7);
+    CREATE TABLE dst AS SELECT * FROM src;
+    SELECT * FROM dst;
+}
+expect {
+    1|alice|10.5
+    2|bob|20.3
+    3|charlie|30.7
+}
+
+@cross-check-integrity
+test ctas_select_columns {
+    CREATE TABLE src (id INTEGER, name TEXT, value REAL);
+    INSERT INTO src VALUES (1, 'alice', 10.5);
+    INSERT INTO src VALUES (2, 'bob', 20.3);
+    CREATE TABLE dst AS SELECT id, name FROM src;
+    SELECT * FROM dst;
+}
+expect {
+    1|alice
+    2|bob
+}
+
+@cross-check-integrity
+test ctas_with_expressions {
+    CREATE TABLE src (a INTEGER, b INTEGER);
+    INSERT INTO src VALUES (10, 3);
+    INSERT INTO src VALUES (20, 7);
+    CREATE TABLE dst AS SELECT a + b AS sum, a * b AS product FROM src;
+    SELECT * FROM dst;
+}
+expect {
+    13|30
+    27|140
+}
+
+@cross-check-integrity
+test ctas_with_where {
+    CREATE TABLE src (id INTEGER, val INTEGER);
+    INSERT INTO src VALUES (1, 100);
+    INSERT INTO src VALUES (2, 200);
+    INSERT INTO src VALUES (3, 300);
+    CREATE TABLE dst AS SELECT * FROM src WHERE val > 150;
+    SELECT * FROM dst;
+}
+expect {
+    2|200
+    3|300
+}
+
+@cross-check-integrity
+test ctas_with_order_by_limit {
+    CREATE TABLE src (id INTEGER, val INTEGER);
+    INSERT INTO src VALUES (1, 30);
+    INSERT INTO src VALUES (2, 10);
+    INSERT INTO src VALUES (3, 20);
+    CREATE TABLE dst AS SELECT * FROM src ORDER BY val LIMIT 2;
+    SELECT * FROM dst;
+}
+expect {
+    2|10
+    3|20
+}
+
+# Aggregates
+
+@cross-check-integrity
+test ctas_aggregate {
+    CREATE TABLE src (category TEXT, amount REAL);
+    INSERT INTO src VALUES ('a', 10.5);
+    INSERT INTO src VALUES ('a', 20.3);
+    INSERT INTO src VALUES ('b', 30.7);
+    CREATE TABLE dst AS SELECT category, SUM(amount) AS total FROM src GROUP BY category;
+    SELECT * FROM dst ORDER BY category;
+}
+expect {
+    a|30.8
+    b|30.7
+}
+
+@cross-check-integrity
+test ctas_aggregate_count {
+    CREATE TABLE src (x INTEGER);
+    INSERT INTO src VALUES (1);
+    INSERT INTO src VALUES (2);
+    INSERT INTO src VALUES (3);
+    CREATE TABLE dst AS SELECT COUNT(*) AS cnt FROM src;
+    SELECT * FROM dst;
+}
+expect {
+    3
+}
+
+# Joins
+
+@cross-check-integrity
+test ctas_join {
+    CREATE TABLE t1 (id INTEGER, name TEXT);
+    CREATE TABLE t2 (id INTEGER, t1_id INTEGER, value REAL);
+    INSERT INTO t1 VALUES (1, 'alice');
+    INSERT INTO t1 VALUES (2, 'bob');
+    INSERT INTO t2 VALUES (1, 1, 100.5);
+    INSERT INTO t2 VALUES (2, 2, 200.3);
+    CREATE TABLE dst AS SELECT t1.name, t2.value FROM t1 JOIN t2 ON t1.id = t2.t1_id;
+    SELECT * FROM dst ORDER BY name;
+}
+expect {
+    alice|100.5
+    bob|200.3
+}
+
+@cross-check-integrity
+test ctas_left_join {
+    CREATE TABLE t1 (id INTEGER, name TEXT);
+    CREATE TABLE t2 (t1_id INTEGER, val TEXT);
+    INSERT INTO t1 VALUES (1, 'alice');
+    INSERT INTO t1 VALUES (2, 'bob');
+    INSERT INTO t2 VALUES (1, 'x');
+    CREATE TABLE dst AS SELECT t1.name, t2.val FROM t1 LEFT JOIN t2 ON t1.id = t2.t1_id;
+    SELECT * FROM dst ORDER BY name;
+}
+expect {
+    alice|x
+    bob|
+}
+
+# NULL handling
+
+@cross-check-integrity
+test ctas_nulls {
+    CREATE TABLE src (a INTEGER, b TEXT);
+    INSERT INTO src VALUES (1, NULL);
+    INSERT INTO src VALUES (NULL, 'hello');
+    INSERT INTO src VALUES (NULL, NULL);
+    CREATE TABLE dst AS SELECT * FROM src;
+    SELECT * FROM dst;
+}
+expect {
+    1|
+    |hello
+    |
+}
+
+# Empty result set
+
+@cross-check-integrity
+test ctas_empty_result {
+    CREATE TABLE src (id INTEGER, name TEXT);
+    CREATE TABLE dst AS SELECT * FROM src;
+    SELECT COUNT(*) FROM dst;
+}
+expect {
+    0
+}
+
+@cross-check-integrity
+test ctas_empty_with_where_false {
+    CREATE TABLE src (id INTEGER, name TEXT);
+    INSERT INTO src VALUES (1, 'alice');
+    CREATE TABLE dst AS SELECT * FROM src WHERE 0;
+    SELECT COUNT(*) FROM dst;
+}
+expect {
+    0
+}
+
+# Type affinity
+
+@cross-check-integrity
+test ctas_type_preservation {
+    CREATE TABLE src (i INTEGER, r REAL, t TEXT, b BLOB);
+    INSERT INTO src VALUES (42, 3.14, 'hello', X'DEADBEEF');
+    CREATE TABLE dst AS SELECT * FROM src;
+    SELECT typeof(i), typeof(r), typeof(t), typeof(b) FROM dst;
+}
+expect {
+    integer|real|text|blob
+}
+
+# Literals and constants
+
+@cross-check-integrity
+test ctas_literals {
+    CREATE TABLE dst AS SELECT 1 AS a, 'text' AS b, 3.14 AS c, NULL AS d;
+    SELECT * FROM dst;
+}
+expect {
+    1|text|3.14|
+}
+
+# UNION
+
+@cross-check-integrity
+test ctas_union {
+    CREATE TABLE t1 (x INTEGER);
+    CREATE TABLE t2 (x INTEGER);
+    INSERT INTO t1 VALUES (1), (2);
+    INSERT INTO t2 VALUES (2), (3);
+    CREATE TABLE dst AS SELECT x FROM t1 UNION SELECT x FROM t2;
+    SELECT * FROM dst ORDER BY x;
+}
+expect {
+    1
+    2
+    3
+}
+
+@cross-check-integrity
+test ctas_union_all {
+    CREATE TABLE t1 (x INTEGER);
+    CREATE TABLE t2 (x INTEGER);
+    INSERT INTO t1 VALUES (1), (2);
+    INSERT INTO t2 VALUES (2), (3);
+    CREATE TABLE dst AS SELECT x FROM t1 UNION ALL SELECT x FROM t2;
+    SELECT * FROM dst ORDER BY x;
+}
+expect {
+    1
+    2
+    2
+    3
+}
+
+# Subquery
+
+@cross-check-integrity
+test ctas_subquery {
+    CREATE TABLE src (id INTEGER, val INTEGER);
+    INSERT INTO src VALUES (1, 10);
+    INSERT INTO src VALUES (2, 20);
+    INSERT INTO src VALUES (3, 30);
+    CREATE TABLE dst AS SELECT * FROM (SELECT id, val * 2 AS doubled FROM src) sub WHERE doubled > 25;
+    SELECT * FROM dst;
+}
+expect {
+    2|40
+    3|60
+}
+
+# IF NOT EXISTS
+
+@cross-check-integrity
+test ctas_if_not_exists {
+    CREATE TABLE dst (x INTEGER);
+    INSERT INTO dst VALUES (999);
+    CREATE TABLE IF NOT EXISTS dst AS SELECT 1 AS x;
+    SELECT * FROM dst;
+}
+expect {
+    999
+}
+
+# Duplicate table name error
+
+@cross-check-integrity
+test ctas_duplicate_table {
+    CREATE TABLE dst (x INTEGER);
+    CREATE TABLE dst AS SELECT 1 AS x;
+}
+expect error {
+}
+
+# CTAS from schema introspection
+
+@cross-check-integrity
+test ctas_column_names {
+    CREATE TABLE src (alpha INTEGER, beta TEXT, gamma REAL);
+    CREATE TABLE dst AS SELECT alpha, beta, gamma FROM src;
+    SELECT name FROM pragma_table_info('dst') ORDER BY cid;
+}
+expect {
+    alpha
+    beta
+    gamma
+}
+
+@cross-check-integrity
+test ctas_aliased_columns {
+    CREATE TABLE src (x INTEGER);
+    INSERT INTO src VALUES (1);
+    CREATE TABLE dst AS SELECT x AS renamed FROM src;
+    SELECT name FROM pragma_table_info('dst');
+}
+expect {
+    renamed
+}
+
+@cross-check-integrity
+test ctas_expression_column_names {
+    CREATE TABLE src (a INTEGER, b INTEGER);
+    INSERT INTO src VALUES (1, 2);
+    CREATE TABLE dst AS SELECT a + b AS result FROM src;
+    SELECT name FROM pragma_table_info('dst');
+}
+expect {
+    result
+}
+
+# DISTINCT
+
+@cross-check-integrity
+test ctas_distinct {
+    CREATE TABLE src (x INTEGER);
+    INSERT INTO src VALUES (1), (1), (2), (2), (3);
+    CREATE TABLE dst AS SELECT DISTINCT x FROM src;
+    SELECT * FROM dst ORDER BY x;
+}
+expect {
+    1
+    2
+    3
+}
+
+# HAVING
+
+@cross-check-integrity
+test ctas_group_by_having {
+    CREATE TABLE src (cat TEXT, val INTEGER);
+    INSERT INTO src VALUES ('a', 1), ('a', 2), ('b', 10), ('b', 20), ('c', 100);
+    CREATE TABLE dst AS SELECT cat, SUM(val) AS total FROM src GROUP BY cat HAVING total > 5;
+    SELECT * FROM dst ORDER BY cat;
+}
+expect {
+    b|30
+    c|100
+}
+
+# CASE expression
+
+@cross-check-integrity
+test ctas_case_expression {
+    CREATE TABLE src (val INTEGER);
+    INSERT INTO src VALUES (1), (2), (3);
+    CREATE TABLE dst AS SELECT val, CASE WHEN val < 2 THEN 'low' WHEN val < 3 THEN 'med' ELSE 'high' END AS label FROM src;
+    SELECT * FROM dst ORDER BY val;
+}
+expect {
+    1|low
+    2|med
+    3|high
+}
+
+# COALESCE / IFNULL
+
+@cross-check-integrity
+test ctas_coalesce {
+    CREATE TABLE src (a INTEGER, b INTEGER);
+    INSERT INTO src VALUES (NULL, 10);
+    INSERT INTO src VALUES (5, 20);
+    CREATE TABLE dst AS SELECT COALESCE(a, b) AS result FROM src;
+    SELECT * FROM dst;
+}
+expect {
+    10
+    5
+}
+
+# Multiple tables with same columns
+
+@cross-check-integrity
+test ctas_cross_join {
+    CREATE TABLE t1 (a INTEGER);
+    CREATE TABLE t2 (b TEXT);
+    INSERT INTO t1 VALUES (1), (2);
+    INSERT INTO t2 VALUES ('x'), ('y');
+    CREATE TABLE dst AS SELECT a, b FROM t1, t2;
+    SELECT * FROM dst ORDER BY a, b;
+}
+expect {
+    1|x
+    1|y
+    2|x
+    2|y
+}
+
+# Schema: verify dst is insertable after CTAS
+
+@cross-check-integrity
+test ctas_insert_after_create {
+    CREATE TABLE src (id INTEGER, name TEXT);
+    INSERT INTO src VALUES (1, 'alice');
+    CREATE TABLE dst AS SELECT * FROM src;
+    INSERT INTO dst VALUES (2, 'bob');
+    SELECT * FROM dst ORDER BY id;
+}
+expect {
+    1|alice
+    2|bob
+}
+
+# Verify table schema is stored correctly (sqlite_schema)
+
+@cross-check-integrity
+test ctas_schema_sql {
+    CREATE TABLE src (id INTEGER, name TEXT);
+    CREATE TABLE dst AS SELECT * FROM src;
+    SELECT sql FROM sqlite_schema WHERE name = 'dst';
+}
+expect {
+    CREATE TABLE dst(id INT,name TEXT)
+}
+
+# Schema SQL: expression column names must be double-quoted
+
+@cross-check-integrity
+test ctas_schema_sql_expression_columns {
+    CREATE TABLE src (a INTEGER, b TEXT);
+    INSERT INTO src VALUES(1, 'hello');
+    CREATE TABLE dst AS SELECT a + 1, count(*) FROM src GROUP BY a;
+    SELECT sql FROM sqlite_schema WHERE name = 'dst';
+}
+expect {
+    CREATE TABLE dst("a + 1","count(*)")
+}
+
+# Schema SQL: mixed aliased and expression columns
+
+@cross-check-integrity
+test ctas_schema_sql_mixed_alias_expr {
+    CREATE TABLE src (a INTEGER, b TEXT, c REAL);
+    CREATE TABLE dst AS SELECT a as id, b || c, length(b) FROM src;
+    SELECT sql FROM sqlite_schema WHERE name = 'dst';
+}
+expect {
+    CREATE TABLE dst(id INT,"b || c","length(b)")
+}
+
+# Schema SQL: literal-only columns
+
+@cross-check-integrity
+test ctas_schema_sql_literals {
+    CREATE TABLE dst AS SELECT 1, 'text', 3.14, NULL;
+    SELECT sql FROM sqlite_schema WHERE name = 'dst';
+}
+expect {
+    CREATE TABLE dst("1","'text'","3.14","NULL")
+}
+
+# Schema SQL: source column with spaces needs quoting
+
+@cross-check-integrity
+test ctas_schema_sql_quoted_source_col {
+    CREATE TABLE src ("weird col" TEXT);
+    CREATE TABLE dst AS SELECT "weird col" FROM src;
+    SELECT sql FROM sqlite_schema WHERE name = 'dst';
+}
+expect {
+    CREATE TABLE dst("weird col" TEXT)
+}
+
+# Schema SQL: verify expression-derived schema is re-parseable (can query the table)
+
+@cross-check-integrity
+test ctas_schema_expr_reparseable {
+    CREATE TABLE src (a INTEGER, b TEXT);
+    INSERT INTO src VALUES(1, 'hello');
+    INSERT INTO src VALUES(2, 'world');
+    CREATE TABLE dst AS SELECT a + 1, length(b) FROM src;
+    SELECT * FROM dst ORDER BY "a + 1";
+}
+expect {
+    2|5
+    3|5
+}
+
+# Values from different types in same column
+
+@cross-check-integrity
+test ctas_mixed_types {
+    CREATE TABLE src (x);
+    INSERT INTO src VALUES (1);
+    INSERT INTO src VALUES ('hello');
+    INSERT INTO src VALUES (3.14);
+    INSERT INTO src VALUES (NULL);
+    CREATE TABLE dst AS SELECT * FROM src;
+    SELECT typeof(x), x FROM dst;
+}
+expect {
+    integer|1
+    text|hello
+    real|3.14
+    null|
+}
+
+# Scalar functions
+
+@cross-check-integrity
+test ctas_with_functions {
+    CREATE TABLE src (name TEXT);
+    INSERT INTO src VALUES ('hello');
+    INSERT INTO src VALUES ('world');
+    CREATE TABLE dst AS SELECT UPPER(name) AS uname, LENGTH(name) AS len FROM src;
+    SELECT * FROM dst;
+}
+expect {
+    HELLO|5
+    WORLD|5
+}
+
+# EXCEPT / INTERSECT
+
+@cross-check-integrity
+test ctas_intersect {
+    CREATE TABLE t1 (x INTEGER);
+    CREATE TABLE t2 (x INTEGER);
+    INSERT INTO t1 VALUES (1), (2), (3);
+    INSERT INTO t2 VALUES (2), (3), (4);
+    CREATE TABLE dst AS SELECT x FROM t1 INTERSECT SELECT x FROM t2;
+    SELECT * FROM dst ORDER BY x;
+}
+expect {
+    2
+    3
+}
+
+@cross-check-integrity
+test ctas_except {
+    CREATE TABLE t1 (x INTEGER);
+    CREATE TABLE t2 (x INTEGER);
+    INSERT INTO t1 VALUES (1), (2), (3);
+    INSERT INTO t2 VALUES (2), (3), (4);
+    CREATE TABLE dst AS SELECT x FROM t1 EXCEPT SELECT x FROM t2;
+    SELECT * FROM dst;
+}
+expect {
+    1
+}
+
+# Large number of columns
+
+@cross-check-integrity
+test ctas_many_columns {
+    CREATE TABLE src (a, b, c, d, e, f, g, h, i, j);
+    INSERT INTO src VALUES (1, 2, 3, 4, 5, 6, 7, 8, 9, 10);
+    CREATE TABLE dst AS SELECT * FROM src;
+    SELECT * FROM dst;
+}
+expect {
+    1|2|3|4|5|6|7|8|9|10
+}
+
+# Verify rowid behavior (CTAS tables should have implicit rowid)
+
+@cross-check-integrity
+test ctas_rowid {
+    CREATE TABLE src (a INTEGER, b TEXT);
+    INSERT INTO src VALUES (10, 'x');
+    INSERT INTO src VALUES (20, 'y');
+    CREATE TABLE dst AS SELECT * FROM src;
+    SELECT rowid, a, b FROM dst;
+}
+expect {
+    1|10|x
+    2|20|y
+}
+
+# CTAS with OFFSET
+
+@cross-check-integrity
+test ctas_offset {
+    CREATE TABLE src (id INTEGER);
+    INSERT INTO src VALUES (1), (2), (3), (4), (5);
+    CREATE TABLE dst AS SELECT * FROM src ORDER BY id LIMIT 2 OFFSET 2;
+    SELECT * FROM dst;
+}
+expect {
+    3
+    4
+}
+
+# CTAS with multiple aliases on same source column
+
+@cross-check-integrity
+test ctas_duplicate_source_different_alias {
+    CREATE TABLE src (x INTEGER);
+    INSERT INTO src VALUES (42);
+    CREATE TABLE dst AS SELECT x AS a, x AS b, x AS c FROM src;
+    SELECT * FROM dst;
+}
+expect {
+    42|42|42
+}
+
+# Duplicate column names from join
+
+@cross-check-integrity
+test ctas_duplicate_column_names {
+    CREATE TABLE t1 (id INTEGER, name TEXT);
+    CREATE TABLE t2 (id INTEGER, value TEXT);
+    CREATE TABLE dst AS SELECT t1.id, t2.id, t1.name, t2.value FROM t1, t2;
+    SELECT sql FROM sqlite_schema WHERE name = 'dst';
+}
+expect {
+    CREATE TABLE dst(id INT,"id:1" INT,name TEXT,value TEXT)
+}
+
+# Triple duplicate column names
+
+@cross-check-integrity
+test ctas_triple_duplicate_columns {
+    CREATE TABLE t1 (x INTEGER);
+    CREATE TABLE t2 (x INTEGER);
+    CREATE TABLE t3 (x INTEGER);
+    CREATE TABLE dst AS SELECT t1.x, t2.x, t3.x FROM t1, t2, t3;
+    SELECT sql FROM sqlite_schema WHERE name = 'dst';
+}
+expect {
+    CREATE TABLE dst(x INT,"x:1" INT,"x:2" INT)
+}
+
+# Compound SELECT uses leftmost column names
+
+@cross-check-integrity
+test ctas_compound_select_column_names {
+    CREATE TABLE t1 (a INTEGER, b TEXT);
+    CREATE TABLE t2 (x INTEGER, y TEXT);
+    CREATE TABLE dst AS SELECT a, b FROM t1 UNION ALL SELECT x, y FROM t2;
+    SELECT sql FROM sqlite_schema WHERE name = 'dst';
+}
+expect {
+    CREATE TABLE dst(a INT,b TEXT)
+}

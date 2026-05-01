@@ -175,6 +175,14 @@ impl From<SeekOp> for ComparisonOp {
     }
 }
 
+#[inline]
+fn sqlite_text_prefix(s: &str) -> &str {
+    match s.find('\0') {
+        Some(idx) => &s[..idx],
+        None => s,
+    }
+}
+
 enum TrimType {
     All,
     Left,
@@ -190,12 +198,7 @@ impl Value {
     pub fn exec_length(&self) -> Self {
         match self {
             Value::Text(t) => {
-                let s = t.as_str();
-                let len_before_null = s.find('\0').map_or_else(
-                    || s.chars().count(),
-                    |null_pos| s[..null_pos].chars().count(),
-                );
-                Value::from_i64(len_before_null as i64)
+                Value::from_i64(sqlite_text_prefix(t.as_str()).chars().count() as i64)
             }
             Value::Numeric(_) => {
                 // For numbers, SQLite returns the length of the string representation
@@ -546,13 +549,13 @@ impl Value {
             }
             (value, Value::Numeric(Numeric::Integer(start))) => {
                 if let Some(text) = value.cast_text() {
+                    let s = sqlite_text_prefix(text.as_str());
                     // Use character count to accurately resolve negative offsets in UTF-8 strings
-                    let char_count = text.chars().count();
+                    let char_count = s.chars().count();
                     let (mut start, mut end) =
                         calculate_postions(start, char_count, length_value.as_ref());
 
                     // https://github.com/sqlite/sqlite/blob/a248d84f/src/func.c#L417
-                    let s = text.as_str();
                     let mut start_byte_idx = 0;
                     end -= start;
                     while start > 0 {
@@ -1179,6 +1182,8 @@ impl Value {
                 "LIKE or GLOB pattern too complex".to_string(),
             ));
         }
+        let pattern = sqlite_text_prefix(pattern);
+        let text = sqlite_text_prefix(text);
 
         let has_escape = escape.is_some_and(|e| pattern.contains(e));
 
@@ -1221,6 +1226,8 @@ impl Value {
                 "GLOB pattern too complex".to_string(),
             ));
         }
+        let pattern = sqlite_text_prefix(pattern);
+        let text = sqlite_text_prefix(text);
 
         // 1. Exact match (no wildcards)
         if !pattern.contains(GLOB_CHARS) {

@@ -194,6 +194,21 @@ pub enum Stmt {
         /// type body
         body: CreateTypeBody,
     },
+    /// `CREATE DOMAIN`
+    CreateDomain {
+        /// `IF NOT EXISTS`
+        if_not_exists: bool,
+        /// domain name
+        domain_name: String,
+        /// base type (primitive or another domain/custom type)
+        base_type: String,
+        /// default expression
+        default: Option<Box<Expr>>,
+        /// NOT NULL constraint
+        not_null: bool,
+        /// CHECK constraints
+        constraints: Vec<DomainConstraint>,
+    },
     /// `DELETE`
     Delete {
         /// CTE
@@ -250,6 +265,13 @@ pub enum Stmt {
         if_exists: bool,
         /// type name
         type_name: String,
+    },
+    /// `DROP DOMAIN`
+    DropDomain {
+        /// `IF EXISTS`
+        if_exists: bool,
+        /// domain name
+        domain_name: String,
     },
     /// `INSERT`
     Insert {
@@ -329,7 +351,7 @@ impl TableInternalId {
     /// used in generated columns to signify "the table that the column belongs to"
     pub const SELF_TABLE: Self = Self(0);
 
-    pub fn is_self_table(&self) -> bool {
+    pub const fn is_self_table(&self) -> bool {
         self.0 == 0
     }
 }
@@ -365,6 +387,15 @@ impl std::fmt::Display for TableInternalId {
 }
 
 /// SQL expression
+/// Pre-resolved field/variant index for FieldAccess expressions.
+/// Populated during binding so that translation can emit instructions directly.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub enum FieldAccessResolution {
+    StructField { field_index: usize },
+    UnionVariant { tag_index: u8 },
+}
+
 // https://sqlite.org/syntax/expr.html
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
@@ -407,6 +438,15 @@ pub enum Expr {
     DoublyQualified(Name, Name, Name),
     /// `EXISTS` subquery
     Exists(Select),
+    /// Struct/union field access (produced by translator, not parser directly)
+    FieldAccess {
+        /// base expression (e.g., column reference)
+        base: Box<Expr>,
+        /// field or variant name
+        field: Name,
+        /// pre-resolved field/variant index (populated during binding)
+        resolved: Option<FieldAccessResolution>,
+    },
     /// call to a built-in function
     FunctionCall {
         /// function name
@@ -554,17 +594,36 @@ impl Default for Expr {
 pub struct Variable {
     pub index: NonZeroU32,
     pub name: Option<Box<str>>,
+    /// Type of the source column, if known (e.g. from trigger NEW/OLD rewrite).
+    pub col_type: Option<Box<str>>,
 }
 
 impl Variable {
     pub fn indexed(index: NonZeroU32) -> Self {
-        Self { index, name: None }
+        Self {
+            index,
+            name: None,
+            col_type: None,
+        }
+    }
+
+    pub fn indexed_typed(index: NonZeroU32, col_type: &str) -> Self {
+        Self {
+            index,
+            name: None,
+            col_type: if col_type.is_empty() {
+                None
+            } else {
+                Some(col_type.into())
+            },
+        }
     }
 
     pub fn named(name: impl Into<Box<str>>, index: NonZeroU32) -> Self {
         Self {
             index,
             name: Some(name.into()),
+            col_type: None,
         }
     }
 }
@@ -659,7 +718,7 @@ impl Expr {
         Expr::Raise(resolve_type, expr.map(Box::new))
     }
 
-    pub fn can_be_null(&self) -> bool {
+    pub const fn can_be_null(&self) -> bool {
         // todo: better handling columns. Check sqlite3ExprCanBeNull
         match self {
             Expr::Literal(literal) => !matches!(
@@ -772,7 +831,7 @@ pub enum Operator {
 
 impl Operator {
     /// returns whether order of operations can be ignored
-    pub fn is_commutative(&self) -> bool {
+    pub const fn is_commutative(&self) -> bool {
         matches!(
             self,
             Operator::Add
@@ -785,7 +844,7 @@ impl Operator {
     }
 
     /// Returns true if this operator is a comparison operator that may need affinity conversion
-    pub fn is_comparison(&self) -> bool {
+    pub const fn is_comparison(&self) -> bool {
         matches!(
             self,
             Self::Equals
@@ -1102,6 +1161,12 @@ impl Name {
     pub fn from_bytes(s: &[u8]) -> Self {
         Self::from_string(unsafe { std::str::from_utf8_unchecked(s) })
     }
+    pub const fn empty() -> Self {
+        Self {
+            value: String::new(),
+            quote: None,
+        }
+    }
     /// Parse name from the string (e.g. handle quoting and handle escaped quotes)
     pub fn from_string(s: impl AsRef<str>) -> Self {
         let s = s.as_ref();
@@ -1150,7 +1215,9 @@ impl Name {
         if let Some(quote) = self.quote {
             let single = quote.to_string();
             let double = single.clone() + &single;
-            return format!("{}{}{}", quote, self.value.replace(&single, &double), quote);
+            return quote.to_string()
+                + self.value.replace(&single, &double).as_str()
+                + quote.to_string().as_str();
         }
         let value = self.value.as_bytes();
         let safe_char = |&c: &u8| c.is_ascii_alphanumeric() || c == b'_';
@@ -1170,7 +1237,7 @@ impl Name {
         self.quote == Some(quote)
     }
 
-    pub fn quoted(&self) -> bool {
+    pub const fn quoted(&self) -> bool {
         self.quote.is_some()
     }
 }
@@ -1189,7 +1256,7 @@ pub struct QualifiedName {
 
 impl QualifiedName {
     /// Constructor
-    pub fn single(name: Name) -> Self {
+    pub const fn single(name: Name) -> Self {
         Self {
             db_name: None,
             name,
@@ -1197,7 +1264,7 @@ impl QualifiedName {
         }
     }
     /// Constructor
-    pub fn fullname(db_name: Name, name: Name) -> Self {
+    pub const fn fullname(db_name: Name, name: Name) -> Self {
         Self {
             db_name: Some(db_name),
             name,
@@ -1205,7 +1272,7 @@ impl QualifiedName {
         }
     }
     /// Constructor
-    pub fn xfullname(db_name: Name, name: Name, alias: Name) -> Self {
+    pub const fn xfullname(db_name: Name, name: Name, alias: Name) -> Self {
         Self {
             db_name: Some(db_name),
             name,
@@ -1213,12 +1280,20 @@ impl QualifiedName {
         }
     }
     /// Constructor
-    pub fn alias(name: Name, alias: Name) -> Self {
+    pub const fn alias(name: Name, alias: Name) -> Self {
         Self {
             db_name: None,
             name,
             alias: Some(alias),
         }
+    }
+
+    /// Return the resolved identifier as a String
+    pub fn identifier(&self) -> String {
+        self.alias.as_ref().map_or_else(
+            || self.name.as_str().to_string(),
+            |alias| alias.as_str().to_string(),
+        )
     }
 }
 
@@ -1264,22 +1339,39 @@ pub struct TypeParam {
     pub ty: Option<String>,
 }
 
+/// A single named CHECK constraint on a domain
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct DomainConstraint {
+    /// CONSTRAINT name (optional)
+    pub name: Option<String>,
+    /// CHECK expression using `value` placeholder
+    pub check: Box<Expr>,
+}
+
 /// Body of a `CREATE TYPE` statement
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
-pub struct CreateTypeBody {
-    /// type parameters, e.g. `(value text, maxlen integer)` for varchar
-    pub params: Vec<TypeParam>,
-    /// base storage type: "text", "integer", "real", "blob"
-    pub base: String,
-    /// encode expression (called on write), uses `value` placeholder for input
-    pub encode: Option<Box<Expr>>,
-    /// decode expression (called on read), uses `value` placeholder for input
-    pub decode: Option<Box<Expr>>,
-    /// operator-to-function mappings
-    pub operators: Vec<TypeOperator>,
-    /// default expression for columns of this type
-    pub default: Option<Box<Expr>>,
+pub enum CreateTypeBody {
+    /// Custom type with encode/decode (e.g., varchar, email)
+    CustomType {
+        /// type parameters, e.g. `(value text, maxlen integer)` for varchar
+        params: Vec<TypeParam>,
+        /// base storage type: "text", "integer", "real", "blob"
+        base: String,
+        /// encode expression (called on write), uses `value` placeholder for input
+        encode: Option<Box<Expr>>,
+        /// decode expression (called on read), uses `value` placeholder for input
+        decode: Option<Box<Expr>>,
+        /// operator-to-function mappings
+        operators: Vec<TypeOperator>,
+        /// default expression for columns of this type
+        default: Option<Box<Expr>>,
+    },
+    /// `CREATE TYPE name AS STRUCT(field1 type1, field2 type2, ...)`
+    Struct(Vec<TypeField>),
+    /// `CREATE TYPE name AS UNION(variant1 type1, variant2 type2, ...)`
+    Union(Vec<TypeField>),
 }
 
 /// `CREATE TABLE` body
@@ -1674,6 +1766,8 @@ pub enum PragmaName {
     FreelistCount,
     /// Enable or disable foreign key constraint enforcement
     ForeignKeys,
+    /// Returns information about foreign keys declared by a table
+    ForeignKeyList,
     /// Deprecated: control whether column names include table name prefix
     FullColumnNames,
     /// List all SQL functions known to the database connection
@@ -1890,6 +1984,16 @@ pub struct CommonTableExpr {
     pub materialized: Materialized,
     /// query
     pub select: Select,
+}
+
+/// A field in a STRUCT or UNION type declaration, e.g. `x INT` in `STRUCT(x INT, y TEXT)`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct TypeField {
+    /// field/variant name
+    pub name: Name,
+    /// field/variant type (recursive — allows nested STRUCT/UNION)
+    pub field_type: Type,
 }
 
 /// Column type

@@ -800,6 +800,41 @@ expect {
     2|mordor
 }
 
+test update-returning-may-not-reference-target-alias {
+    CREATE TABLE t (id INTEGER PRIMARY KEY, parent INTEGER, label TEXT);
+    INSERT INTO t VALUES (1, NULL, 'root'), (2, 1, 'child');
+    UPDATE t AS child
+       SET label = label || '!'
+    RETURNING child.id, child.parent, child.label;
+}
+expect error {
+}
+
+@cross-check-integrity
+test update-returning-may-reference-base-table-name-when-aliased {
+    CREATE TABLE t (id INTEGER PRIMARY KEY, label TEXT);
+    INSERT INTO t VALUES (1, 'a');
+    UPDATE t AS child
+       SET label = 'x'
+    RETURNING t.id, t.label;
+}
+expect {
+    1|x
+}
+
+test update-from-returning-may-not-reference-target-alias {
+    CREATE TABLE t (id INTEGER PRIMARY KEY, parent INTEGER, label TEXT);
+    INSERT INTO t VALUES (1, NULL, 'root'), (2, 1, 'a'), (3, 1, 'b'), (4, 2, 'c');
+    UPDATE t AS child
+       SET label = parent.label || '>' || child.label
+      FROM t AS parent
+     WHERE child.parent = parent.id
+    RETURNING child.id, child.label,
+              (SELECT count(*) FROM t t2 WHERE t2.parent = child.parent);
+}
+expect error {
+}
+
 @cross-check-integrity
 test update-returning-correlated-in-selfread {
     CREATE TABLE t (id INTEGER PRIMARY KEY, grp INTEGER, val INTEGER, note TEXT);

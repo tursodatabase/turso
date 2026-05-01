@@ -280,7 +280,7 @@ impl Blob {
 
 impl Value {
     /// Creates a new Value with type Null
-    pub fn null() -> Self {
+    pub const fn null() -> Self {
         Self {
             value_type: ValueType::Null,
             value: ValueData { int: 0 },
@@ -288,7 +288,7 @@ impl Value {
     }
 
     /// Returns the value type of the Value
-    pub fn value_type(&self) -> ValueType {
+    pub const fn value_type(&self) -> ValueType {
         self.value_type
     }
 
