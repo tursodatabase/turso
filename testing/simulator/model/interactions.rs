@@ -88,44 +88,31 @@ impl InteractionPlan {
     }
 
     /// Finds the range of interactions that are contained between the start and end spans for a given ID.
+    ///
+    /// Note: linear scan rather than binary search because the plan is not strictly
+    /// sorted by id. MVCC's pre-DDL synthetic-commit synthesis renumbers the
+    /// peeked DDL to a fresh id while leaving any in-flight property's iter
+    /// alone, so a later property's iter interactions can be pushed with an
+    /// id that is smaller than the renumbered DDL pushed before them.
     pub fn find_interactions_range(&self, id: NonZeroUsize) -> Range<usize> {
         let interactions = self.interactions_list();
-        let idx = interactions
-            .binary_search_by_key(&id, |interaction| interaction.id())
-            .map_err(|_| format!("Interaction containing id `{id}` should be present"))
-            .unwrap();
-        let interaction = &interactions[idx];
+        let first = interactions
+            .iter()
+            .position(|interaction| interaction.id() == id)
+            .unwrap_or_else(|| panic!("Interaction containing id `{id}` should be present"));
+        let interaction = &interactions[first];
 
-        let backward = || -> usize {
-            interactions
+        let range = if interaction.property_meta.is_some() {
+            let last = interactions
                 .iter()
                 .enumerate()
                 .rev()
-                .skip(interactions.len() - idx)
-                .find(|(_, interaction)| interaction.id() != id)
-                .map(|(idx, _)| idx.saturating_add(1))
-                .unwrap_or(idx)
-        };
-
-        let forward = || -> usize {
-            interactions
-                .iter()
-                .enumerate()
-                .skip(idx + 1)
-                .find(|(_, interaction)| interaction.id() != id)
-                .map(|(idx, _)| idx.saturating_sub(1))
-                .unwrap_or(idx)
-        };
-
-        let range = if interaction.property_meta.is_some() {
-            // go backward and find the interaction that is not the same id
-            let start_idx = backward();
-            // go forward and find the interaction that is not the same id
-            let end_idx = forward();
-
-            start_idx..end_idx + 1
+                .find(|(_, i)| i.id() == id)
+                .map(|(idx, _)| idx)
+                .unwrap_or(first);
+            first..last + 1
         } else {
-            idx..idx + 1
+            first..first + 1
         };
 
         assert!(!range.is_empty());

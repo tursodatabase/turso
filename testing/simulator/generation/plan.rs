@@ -254,58 +254,116 @@ impl<'a, R: rand::Rng> InteractionPlanIterator for PlanGenerator<'a, R> {
     /// try to generate the next [Interactions] and store it
     fn next(&mut self, env: &mut SimulatorEnv) -> Option<Interaction> {
         let mvcc = self.plan.mvcc;
-        let mut next_interaction = || match self.peek(env) {
-            Some(peek_interaction) => {
-                if mvcc && peek_interaction.is_ddl() {
-                    // if any connection is in a transaction,
-                    // try to commit the transaction as we cannot execute DDL statements in concurrent mode
 
-                    if let Some(conn_index) =
-                        (0..env.connections.len()).find(|idx| env.conn_in_transaction(*idx))
-                    {
-                        return Some(
-                            InteractionBuilder::from_interaction(peek_interaction)
-                                .interaction(InteractionType::Query(Query::Commit(Commit)))
-                                .connection_index(conn_index)
-                                .build()
-                                .unwrap(),
-                        );
-                    }
-                }
-
-                self.peek.take()
-            }
-            None => {
-                // after we generated all interactions if some connection is still in a transaction, commit
-                let commit = (0..env.connections.len())
-                    .find(|idx| env.conn_in_transaction(*idx))
-                    .map(|conn_index| {
-                        let query = Query::Commit(Commit);
-                        let interactions =
-                            Interactions::new(conn_index, InteractionsType::Query(query));
-
-                        let interaction = InteractionBuilder::with_interaction(
-                            InteractionType::Query(Query::Commit(Commit)),
-                        )
-                        .connection_index(conn_index)
-                        .id(self.plan.next_property_id())
+        // In MVCC mode, if the next peeked interaction is DDL but some connection is
+        // still in a transaction, we must drain those transactions first via synthetic
+        // COMMITs (DDL cannot run in concurrent mode).
+        //
+        // The synthetic COMMIT is its own logical step, not part of the DDL property.
+        // We give it its own fresh property id and renumber the still-peeked DDL to a
+        // higher fresh id, so the plan stays sorted by id. This matters because:
+        //   - find_interactions_range relies on binary search by id.
+        //   - if a synthetic COMMIT fails recoverably (e.g. WriteWriteConflict) and
+        //     execution returns NextInteractionOutsideThisProperty, the skip loop in
+        //     `execute_interactions` advances `plan.next` until it sees a different
+        //     id. Reusing the DDL's id would trap that loop forever, because plan.next
+        //     keeps minting same-id synthetic COMMITs for the remaining in-txn
+        //     connections (they never execute in the skip loop, so progress stalls).
+        // Only synthesize when the peeked DDL is the *first* interaction we will
+        // emit for its property — i.e. nothing with this id is already in the plan.
+        // If an interaction with the same id is already there, we're mid-way
+        // through emitting that property (e.g. an InsertValuesSelect whose
+        // placeholder middle query just substituted to a DDL). Synthesizing here
+        // would slip COMMITs into the property's emission and leave the rest of
+        // the property (its verifying SELECT and ASSERT) to execute against
+        // post-DDL state — wrong, and not what the property is testing.
+        let in_flight_property = self
+            .peek(env)
+            .map(|p| p.id())
+            .is_some_and(|peek_id| {
+                self.plan
+                    .interactions_list()
+                    .last()
+                    .is_some_and(|last| last.id() == peek_id)
+            });
+        let synthetic_pre_ddl_commit = if mvcc
+            && !in_flight_property
+            && self.peek(env).is_some_and(|p| p.is_ddl())
+        {
+            (0..env.connections.len())
+                .find(|idx| env.conn_in_transaction(*idx))
+                .map(|conn_index| {
+                    let commit_id = self.plan.next_property_id();
+                    let renumbered_id = self.plan.next_property_id();
+                    // Renumber only the peeked DDL — NOT the rest of `self.iter`.
+                    //
+                    // Earlier versions also renumbered the iter to "preserve plan order
+                    // ↔ id order" so binary search by id stayed valid. That was wrong:
+                    // when the iter belongs to a different in-flight property whose
+                    // placeholder happened to substitute to a DDL (e.g.
+                    // InsertValuesSelect with a DDL middle query), the iter holds that
+                    // property's remaining structural interactions (its SELECT and
+                    // verification ASSERT). Renumbering them moves them out of their
+                    // home property, so they survive `NextInteractionOutsideThisProperty`
+                    // skipping and execute later against wrong state, e.g. failing the
+                    // "row should be found" assertion because intervening synthetic
+                    // commits and DDL changed the database between the INSERT and the
+                    // verifying SELECT. The plan-sort invariant has been relaxed
+                    // (find_interactions_range now linear-scans).
+                    let old_ddl = self
+                        .peek
+                        .take()
+                        .expect("peek was Some on the line above");
+                    let renumbered_ddl = InteractionBuilder::from_interaction(&old_ddl)
+                        .id(renumbered_id)
                         .build()
                         .unwrap();
+                    self.peek = Some(renumbered_ddl);
 
-                        self.plan.push_interactions(interactions);
+                    InteractionBuilder::with_interaction(InteractionType::Query(Query::Commit(
+                        Commit,
+                    )))
+                    .connection_index(conn_index)
+                    .id(commit_id)
+                    .build()
+                    .unwrap()
+                })
+        } else {
+            None
+        };
 
-                        interaction
-                    });
+        let next_interaction = if synthetic_pre_ddl_commit.is_some() {
+            synthetic_pre_ddl_commit
+        } else {
+            match self.peek(env) {
+                Some(_) => self.peek.take(),
+                None => {
+                    // after we generated all interactions if some connection is still in a
+                    // transaction, commit
+                    let commit = (0..env.connections.len())
+                        .find(|idx| env.conn_in_transaction(*idx))
+                        .map(|conn_index| {
+                            let query = Query::Commit(Commit);
+                            let interactions =
+                                Interactions::new(conn_index, InteractionsType::Query(query));
 
-                #[cfg(debug_assertions)]
-                if commit.is_none() {
-                    // Do a final sanity check to make sure that all interactions are sorted by ids
-                    assert!(self.plan.interactions_list().is_sorted_by_key(|a| a.id()));
+                            let interaction = InteractionBuilder::with_interaction(
+                                InteractionType::Query(Query::Commit(Commit)),
+                            )
+                            .connection_index(conn_index)
+                            .id(self.plan.next_property_id())
+                            .build()
+                            .unwrap();
+
+                            self.plan.push_interactions(interactions);
+
+                            interaction
+                        });
+
+                    commit
                 }
-                commit
             }
         };
-        let next_interaction = next_interaction();
         // intercept interaction to update metrics
         if let Some(next_interaction) = next_interaction.as_ref() {
             // Skip counting queries that come from Properties that only exist to check tables
