@@ -479,12 +479,15 @@ pub(super) fn emit_autoindex(
     } = build;
     turso_assert!(index.ephemeral, "index must be ephemeral", { "index_name": &index.name });
     let label_ephemeral_build_end = program.allocate_label();
-    // Since this typically happens in an inner loop, we only build it once.
+    // The OpenAutoindex for `index_cursor_id` is emitted by InitLoop before the outer
+    // loop's Rewind so that the cursor is always opened, even when the outer table is
+    // empty. If we emitted it here (inside the loop body), an empty outer table would
+    // skip past this code and leave the cursor unopened, breaking post-loop NullRow +
+    // Column reads from the ephemeral index for ungrouped aggregates (issue #5233).
+    //
+    // Since this build step typically happens in an inner loop, we only build it once.
     program.emit_insn(Insn::Once {
         target_pc_when_reentered: label_ephemeral_build_end,
-    });
-    program.emit_insn(Insn::OpenAutoindex {
-        cursor_id: index_cursor_id,
     });
     // Rewind source table
     let label_ephemeral_build_loop_start = program.allocate_label();

@@ -1,0 +1,136 @@
+@database :memory:
+
+setup empty_table {
+    CREATE TABLE t(x);
+}
+
+setup single_row_table {
+    CREATE TABLE t(x);
+    INSERT INTO t VALUES(1);
+}
+
+setup multi_row_table {
+    CREATE TABLE t(x);
+    INSERT INTO t VALUES(1),(2),(3);
+}
+
+setup mixed_types_table {
+    CREATE TABLE t(x);
+    INSERT INTO t VALUES(1),('hello'),(NULL),(3.14);
+}
+
+setup two_tables {
+    CREATE TABLE a(x);
+    CREATE TABLE b(y);
+}
+
+@setup empty_table
+test issue_5233_left_join_empty_table_with_count {
+    SELECT b.x, COUNT(*) FROM t a LEFT JOIN t b ON a.x=b.x;
+}
+expect {
+    |0
+}
+
+@setup empty_table
+test issue_5233_left_join_empty_table_with_sum {
+    SELECT b.x, SUM(b.x) FROM t a LEFT JOIN t b ON a.x=b.x;
+}
+expect {
+    |
+}
+
+@setup empty_table
+test issue_5233_left_join_empty_table_min_max {
+    SELECT b.x, MIN(b.x), MAX(b.x) FROM t a LEFT JOIN t b ON a.x=b.x;
+}
+expect {
+    ||
+}
+
+@setup empty_table
+test issue_5233_left_join_empty_table_count_only {
+    SELECT COUNT(*) FROM t a LEFT JOIN t b ON a.x=b.x;
+}
+expect {
+    0
+}
+
+@setup single_row_table
+test issue_5233_left_join_single_row {
+    SELECT b.x, COUNT(*) FROM t a LEFT JOIN t b ON a.x=b.x;
+}
+expect {
+    1|1
+}
+
+@setup multi_row_table
+test issue_5233_left_join_multi_row {
+    SELECT b.x, COUNT(*) FROM t a LEFT JOIN t b ON a.x=b.x;
+}
+expect {
+    1|3
+}
+
+@setup two_tables
+test issue_5233_left_join_two_empty_tables {
+    SELECT b.y, COUNT(*) FROM a LEFT JOIN b ON a.x=b.y;
+}
+expect {
+    |0
+}
+
+@setup empty_table
+test issue_5233_left_join_empty_table_no_match {
+    -- Outer table empty: still produces a single row from ungrouped aggregate.
+    SELECT b.x, AVG(b.x), COUNT(b.x) FROM t a LEFT JOIN t b ON a.x=b.x;
+}
+expect {
+    ||0
+}
+
+@setup mixed_types_table
+test issue_5233_left_join_mixed_types_with_aggregate {
+    SELECT b.x, COUNT(*) FROM t a LEFT JOIN t b ON a.x=b.x;
+}
+expect {
+    1|4
+}
+
+@setup empty_table
+test issue_5233_left_join_three_way_empty {
+    -- Three-way LEFT JOIN with empty table; ensure ephemeral cursors for both
+    -- right tables are opened before the outer Rewind.
+    SELECT b.x, c.x, COUNT(*) FROM t a LEFT JOIN t b ON a.x=b.x LEFT JOIN t c ON b.x=c.x;
+}
+expect {
+    ||0
+}
+
+setup correlated_exists_schema {
+    CREATE TABLE t1(a INT, b INT);
+    CREATE TABLE t2(x INT, y INT);
+    INSERT INTO t1 VALUES(1, 10), (2, 20), (3, 30), (4, 40);
+    INSERT INTO t2 VALUES(1, 100), (2, 200), (3, 300);
+}
+
+@setup correlated_exists_schema
+test issue_5233_nested_correlated_exists_with_autoindex {
+    -- Regression test: the inner EXISTS subquery body becomes a subroutine that
+    -- is invoked once per outer row. The autoindex on t22 must be built once
+    -- and reused; without the Once-wrapped OpenAutoindex in init.rs, the cursor
+    -- gets cleared by the fast path on every subroutine call and only the first
+    -- outer row matches.
+    SELECT a, b FROM t1
+    WHERE EXISTS (
+      SELECT 1 FROM t2
+      WHERE t2.x = t1.a
+      AND EXISTS (SELECT 1 FROM t2 t22 WHERE t22.x = t2.x)
+    )
+    ORDER BY a;
+}
+expect {
+    1|10
+    2|20
+    3|30
+}

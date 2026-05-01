@@ -1,4 +1,7 @@
 use super::*;
+use crate::translate::subquery::{
+    materialized_from_clause_subquery_storage, MaterializedFromClauseSubqueryStorage,
+};
 
 pub fn init_distinct(program: &mut ProgramBuilder, plan: &SelectPlan) -> Result<DistinctCtx> {
     let collations = plan
@@ -329,8 +332,41 @@ impl InitLoop {
                         _ => None,
                     };
                     if let Some(index) = search_index {
-                        // Ephemeral index cursor are opened ad-hoc when needed.
-                        if !index.ephemeral {
+                        if index.ephemeral {
+                            // The ephemeral index cursor must be opened before the outer
+                            // loop's Rewind. Otherwise, when the outer table is empty,
+                            // execution skips the loop body where the autoindex would
+                            // otherwise be opened, and post-loop NullRow + Column reads
+                            // from this cursor panic (issue #5233). For materialized
+                            // subqueries that store rows directly in this index, the
+                            // cursor is opened by the materialization step instead.
+                            //
+                            // We wrap OpenAutoindex in a Once block so it runs exactly
+                            // once for the lifetime of the program. Without it, when
+                            // this code is part of a subroutine (e.g. a correlated
+                            // EXISTS body), each subroutine call would re-enter
+                            // OpenAutoindex's fast path and clear the populated cursor
+                            // before the build's own Once gate could rebuild it.
+                            let is_direct_index_subquery = matches!(
+                                &table.table,
+                                Table::FromClauseSubquery(from_clause_subquery)
+                                    if matches!(
+                                        materialized_from_clause_subquery_storage(from_clause_subquery),
+                                        Some(MaterializedFromClauseSubqueryStorage::DirectIndex),
+                                    )
+                            );
+                            if !is_direct_index_subquery {
+                                let label_open_autoindex_end = program.allocate_label();
+                                program.emit_insn(Insn::Once {
+                                    target_pc_when_reentered: label_open_autoindex_end,
+                                });
+                                program.emit_insn(Insn::OpenAutoindex {
+                                    cursor_id: index_cursor_id
+                                        .expect("index cursor is always opened in Seek with index"),
+                                });
+                                program.preassign_label_to_next_insn(label_open_autoindex_end);
+                            }
+                        } else {
                             match mode {
                                 OperationMode::SELECT => {
                                     program.emit_insn(Insn::OpenRead {
