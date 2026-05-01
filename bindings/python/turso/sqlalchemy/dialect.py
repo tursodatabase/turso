@@ -9,6 +9,7 @@ This module provides SQLAlchemy dialects:
 from __future__ import annotations
 
 import logging
+import warnings
 from typing import TYPE_CHECKING, Any, Dict, List
 
 from sqlalchemy import pool
@@ -437,6 +438,14 @@ class TursoSyncDialect(_TursoDialectMixin, SQLiteDialect_pysqlite):
 
     def connect(self, *cargs, **cparams):
         """Remap sync_url to remote_url for libsql-sqlalchemy compatibility."""
+        if "sync_url" in cparams:
+            warnings.warn(
+                "'sync_url' is deprecated (libsql-sqlalchemy compatibility shim) "
+                "and will be removed in a future release; use 'remote_url' instead.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+
         if "sync_url" in cparams and "remote_url" not in cparams:
             cparams["remote_url"] = cparams.pop("sync_url")
         return super().connect(*cargs, **cparams)
@@ -531,6 +540,13 @@ class TursoSyncDialect(_TursoDialectMixin, SQLiteDialect_pysqlite):
 
         query_params = dict(url.query)
         # Accept both remote_url and sync_url (libsql-sqlalchemy compat)
+        if "sync_url" in query_params:
+            warnings.warn(
+                "'sync_url' is deprecated (libsql-sqlalchemy compatibility shim) "
+                "and will be removed in a future release; use 'remote_url' instead.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
         remote_url = query_params.pop("remote_url", None) or query_params.pop("sync_url", None)
         kwargs = self._extract_sync_params(query_params)
 
@@ -549,8 +565,6 @@ class TursoSyncDialect(_TursoDialectMixin, SQLiteDialect_pysqlite):
 
         # Warn about unused query parameters
         if query_params:
-            import warnings
-
             warnings.warn(
                 f"Unrecognized query parameters ignored: {list(query_params.keys())}",
                 UserWarning,
