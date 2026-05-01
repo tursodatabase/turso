@@ -6764,22 +6764,31 @@ impl PageStack {
             .map(|page| page.get_contents())
     }
 
-    fn unpin_all_if_pinned(&mut self) {
-        self.stack.iter_mut().flatten().for_each(|page| {
-            let _ = page.try_unpin();
-        });
+    /// Unpin and remove every page currently held in the stack.
+    /// Slots are taken so that stale page references cannot survive past a
+    /// reset — a leftover `Some(page)` after a clear could otherwise be
+    /// unpinned again on the next reset, decrementing the pin count of a
+    /// page another cursor's stack still relies on.
+    fn unpin_all_and_clear_slots(&mut self) {
+        for slot in self.stack.iter_mut() {
+            if let Some(page) = slot.take() {
+                let _ = page.try_unpin();
+            }
+        }
+        for state in self.node_states.iter_mut() {
+            *state = BTreeNodeState::default();
+        }
     }
 
     fn clear(&mut self) {
-        self.unpin_all_if_pinned();
-
+        self.unpin_all_and_clear_slots();
         self.current_page = -1;
     }
 }
 
 impl Drop for PageStack {
     fn drop(&mut self) {
-        self.unpin_all_if_pinned();
+        self.unpin_all_and_clear_slots();
     }
 }
 

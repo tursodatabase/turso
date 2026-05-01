@@ -1,0 +1,165 @@
+@database :temp:
+
+# Regression test for #6356: pager panicked with "Attempted to unpin page that
+# was not pinned" when an AFTER INSERT trigger fired during heavy cache spill.
+# The root cause was that PageStack::clear left stale Some(page) entries in the
+# stack, which could later be unpinned a second time and decrement the pin
+# count of pages still held by another cursor's stack.
+
+@cross-check-integrity
+test after-insert-trigger-cache-spill-with-index {
+    PRAGMA page_size = 512;
+    PRAGMA cache_size = 1;
+    PRAGMA cache_spill = ON;
+
+    CREATE TABLE t(
+        a INTEGER PRIMARY KEY AUTOINCREMENT,
+        g INT  NOT NULL DEFAULT 0,
+        v TEXT NOT NULL DEFAULT 'x'
+    );
+    CREATE INDEX t_g_v ON t(g, v);
+
+    CREATE TRIGGER t_ai AFTER INSERT ON t
+    WHEN (NEW.a % 7) = 0
+    BEGIN
+      DELETE FROM t WHERE a BETWEEN NEW.a - 5 AND NEW.a - 1;
+    END;
+
+    INSERT INTO t(g, v)
+    SELECT value % 9, printf('%07d:', 0 + value) || hex(randomblob(70))
+    FROM generate_series(1, 1016);
+
+    SELECT max(a), count(*) FROM t;
+}
+expect {
+    1016|291
+}
+
+# Same trigger interaction, smaller dataset to ensure fix holds with shorter
+# index workloads where the trigger only fires a handful of times.
+@cross-check-integrity
+test after-insert-trigger-cache-spill-with-index-small {
+    PRAGMA page_size = 512;
+    PRAGMA cache_size = 1;
+    PRAGMA cache_spill = ON;
+
+    CREATE TABLE t(
+        a INTEGER PRIMARY KEY AUTOINCREMENT,
+        g INT  NOT NULL DEFAULT 0,
+        v TEXT NOT NULL DEFAULT 'x'
+    );
+    CREATE INDEX t_g_v ON t(g, v);
+
+    CREATE TRIGGER t_ai AFTER INSERT ON t
+    WHEN (NEW.a % 7) = 0
+    BEGIN
+      DELETE FROM t WHERE a BETWEEN NEW.a - 5 AND NEW.a - 1;
+    END;
+
+    INSERT INTO t(g, v)
+    SELECT value % 9, printf('%07d:', 0 + value) || hex(randomblob(70))
+    FROM generate_series(1, 100);
+
+    SELECT max(a), count(*) FROM t;
+}
+expect {
+    100|30
+}
+
+# BEFORE INSERT trigger that uses explicit rowids (so NEW.a is non-NULL when
+# the trigger fires) and deletes prior rows. Exercises the same bug class
+# from the BEFORE side, with cursor stacks interleaving differently than for
+# the AFTER case.
+@cross-check-integrity
+test before-insert-trigger-cache-spill-with-index {
+    PRAGMA page_size = 512;
+    PRAGMA cache_size = 1;
+    PRAGMA cache_spill = ON;
+
+    CREATE TABLE t(
+        a INTEGER PRIMARY KEY,
+        g INT  NOT NULL DEFAULT 0,
+        v TEXT NOT NULL DEFAULT 'x'
+    );
+    CREATE INDEX t_g_v ON t(g, v);
+
+    CREATE TRIGGER t_bi BEFORE INSERT ON t
+    WHEN (NEW.a % 7) = 0
+    BEGIN
+      DELETE FROM t WHERE a BETWEEN NEW.a - 5 AND NEW.a - 1;
+    END;
+
+    INSERT INTO t(a, g, v)
+    SELECT value, value % 9, printf('%07d:', 0 + value) || hex(randomblob(70))
+    FROM generate_series(1, 200);
+
+    SELECT max(a), count(*) FROM t;
+}
+expect {
+    200|60
+}
+
+# AFTER INSERT trigger with no index, exercising only the table btree under
+# cache pressure. Confirms the fix doesn't regress the non-index path.
+@cross-check-integrity
+test after-insert-trigger-cache-spill-no-index {
+    PRAGMA page_size = 512;
+    PRAGMA cache_size = 1;
+    PRAGMA cache_spill = ON;
+
+    CREATE TABLE t(
+        a INTEGER PRIMARY KEY AUTOINCREMENT,
+        g INT  NOT NULL DEFAULT 0,
+        v TEXT NOT NULL DEFAULT 'x'
+    );
+
+    CREATE TRIGGER t_ai AFTER INSERT ON t
+    WHEN (NEW.a % 7) = 0
+    BEGIN
+      DELETE FROM t WHERE a BETWEEN NEW.a - 5 AND NEW.a - 1;
+    END;
+
+    INSERT INTO t(g, v)
+    SELECT value % 9, printf('%07d:', 0 + value) || hex(randomblob(70))
+    FROM generate_series(1, 200);
+
+    SELECT max(a), count(*) FROM t;
+}
+expect {
+    200|60
+}
+
+# AFTER INSERT trigger that deletes only when a multi-column index is also
+# being modified. Forces interleaving between the table cursor and a
+# wider index cursor, ensuring the cleared cursor stacks don't corrupt
+# pin accounting.
+@cross-check-integrity
+test after-insert-trigger-cache-spill-multi-index {
+    PRAGMA page_size = 512;
+    PRAGMA cache_size = 1;
+    PRAGMA cache_spill = ON;
+
+    CREATE TABLE t(
+        a INTEGER PRIMARY KEY AUTOINCREMENT,
+        g INT NOT NULL DEFAULT 0,
+        h INT NOT NULL DEFAULT 0,
+        v TEXT NOT NULL DEFAULT 'x'
+    );
+    CREATE INDEX t_g_v ON t(g, v);
+    CREATE INDEX t_h ON t(h);
+
+    CREATE TRIGGER t_ai AFTER INSERT ON t
+    WHEN (NEW.a % 5) = 0
+    BEGIN
+      DELETE FROM t WHERE a BETWEEN NEW.a - 3 AND NEW.a - 1;
+    END;
+
+    INSERT INTO t(g, h, v)
+    SELECT value % 7, value % 11, printf('%05d:', 0 + value) || hex(randomblob(50))
+    FROM generate_series(1, 300);
+
+    SELECT max(a), count(*) FROM t;
+}
+expect {
+    300|120
+}
