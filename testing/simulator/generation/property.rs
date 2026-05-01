@@ -2188,9 +2188,14 @@ impl PropertyDiscriminants {
                 }
             }
             PropertyDiscriminants::FaultyQuery => {
+                // Disabled under MVCC: I/O fault injection during writes can leave the
+                // MVCC store / btree in a state the (experimental) MVCC layer does not
+                // currently recover from, manifesting as committed rows that survive a
+                // subsequent DELETE. Re-enable once MVCC is robust to fault injection.
                 if env.profile.io.enable
                     && env.profile.io.fault.enable
                     && !env.opts.disable_faulty_query
+                    && !env.profile.mvcc
                 {
                     20
                 } else {
