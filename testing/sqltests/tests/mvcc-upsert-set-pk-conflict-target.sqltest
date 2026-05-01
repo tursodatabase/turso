@@ -1,0 +1,24 @@
+@database :temp:
+@skip-file-if sqlite "MVCC is not supported in SQLite"
+
+# Regression test: under MVCC, an INSERT ... ON CONFLICT(<unique-col>) DO UPDATE
+# whose SET clause assigns the row's PRIMARY KEY (rowid) must NOT raise a
+# UNIQUE constraint error on the conflict-target column itself.
+#
+# The conflict on `b` is exactly what the ON CONFLICT(b) clause is there to
+# resolve, so re-raising that constraint inside the upsert path is a bug.
+# WAL mode handles this correctly; only MVCC mode trips on it. Rowid-changing
+# upsert path appears to mishandle index re-keying when the conflict target
+# itself stays the same value.
+
+test mvcc-upsert-set-pk-from-conflict-target {
+    PRAGMA journal_mode='MVCC';
+    CREATE TABLE t (pk INTEGER PRIMARY KEY, a TEXT, b TEXT UNIQUE);
+    INSERT INTO t VALUES (1, 'a', 'unique1');
+    INSERT INTO t VALUES (2, 'b', 'unique1') ON CONFLICT(b) DO UPDATE SET pk = excluded.pk, a = excluded.a;
+    SELECT * FROM t;
+}
+expect {
+    mvcc
+    2|b|unique1
+}
