@@ -2826,7 +2826,7 @@ pub fn translate_expr(
                             // union_tag(col): resolve col's union type for index→name lookup.
                             let args = expect_arguments_exact!(args, 1, srf);
                             let td = resolve_union_from_column(
-                                &*args[0],
+                                &args[0],
                                 referenced_tables,
                                 resolver,
                                 program,
@@ -2842,10 +2842,10 @@ pub fn translate_expr(
                         }
                         ScalarFunc::UnionExtractFunc => {
                             let args = expect_arguments_exact!(args, 2, srf);
-                            let tag_name = extract_string_literal(&*args[1])?;
+                            let tag_name = extract_string_literal(&args[1])?;
                             // union_extract(col, 'tag'): resolve col's union type for name→index.
                             let td = resolve_union_from_column(
-                                &*args[0],
+                                &args[0],
                                 referenced_tables,
                                 resolver,
                                 program,
@@ -2864,9 +2864,9 @@ pub fn translate_expr(
                         }
                         ScalarFunc::StructExtractFunc => {
                             let args = expect_arguments_exact!(args, 2, srf);
-                            let field_name = extract_string_literal(&*args[1])?;
+                            let field_name = extract_string_literal(&args[1])?;
                             let td = resolve_struct_from_expr(
-                                &*args[0],
+                                &args[0],
                                 referenced_tables,
                                 resolver,
                                 program,
