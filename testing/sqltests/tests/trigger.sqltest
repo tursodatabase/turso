@@ -405,6 +405,31 @@ expect {
     min=10
 }
 
+# Regression for #4028: NEW reference inside a correlated subquery in a
+# trigger body where the subquery reads the same table the trigger inserts
+# into. Each successive INSERT computes `d` by looking up the parent's `d`
+# via NEW.m, exercising the NEW rewrite inside the nested subquery.
+@cross-check-integrity
+test trigger-new-reference-in-subquery-self-cascade {
+    CREATE TABLE t4028 (id INT PRIMARY KEY, n TEXT, m INT);
+    CREATE TABLE t4028_log (eid INT PRIMARY KEY, d INT);
+    CREATE TRIGGER trg4028 AFTER INSERT ON t4028
+    BEGIN
+        INSERT INTO t4028_log(eid, d)
+        SELECT NEW.id,
+               COALESCE((SELECT d FROM t4028_log WHERE eid = NEW.m), -1) + 1;
+    END;
+    INSERT INTO t4028 VALUES (1, 'CEO', NULL);
+    INSERT INTO t4028 VALUES (2, 'VP', 1);
+    INSERT INTO t4028 VALUES (3, 'Manager', 2);
+    SELECT * FROM t4028_log ORDER BY eid;
+}
+expect {
+    1|0
+    2|1
+    3|2
+}
+
 # Trigger with UPDATE OF clause
 @cross-check-integrity
 test trigger-update-of {
