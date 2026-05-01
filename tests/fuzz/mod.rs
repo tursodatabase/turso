@@ -5495,9 +5495,8 @@ mod fuzz_tests {
 
     #[turso_macros::test(mvcc)]
     #[cfg(feature = "test_helper")]
-    #[serial_test::file_serial]
     pub fn fuzz_pending_byte_database(db: TempDatabase) -> anyhow::Result<()> {
-        use core_tester::common::rusqlite_integrity_check;
+        use core_tester::common::{pending_byte_lock, rusqlite_integrity_check};
 
         let (mut rng, _seed) = helpers::init_fuzz_test_tracing("fuzz_pending_byte_database");
 
@@ -5509,7 +5508,16 @@ mod fuzz_tests {
 
         const MAX_PAGENO: u32 = MAX_DB_SIZE_BYTES / PAGE_SIZE;
 
+        // Capture flags from the macro-provided db, then drop it. Its read
+        // guard would otherwise deadlock our exclusive acquisition below.
         let builder = helpers::builder_from_db(&db);
+        drop(db);
+
+        // Hold the exclusive guard for the entire test. This blocks any other
+        // test in the same process from constructing a TempDatabase while we
+        // mutate the global PENDING_BYTE, and resets it to the default on
+        // drop so a panic cannot leave subsequent tests with corrupted state.
+        let _exclusive = pending_byte_lock::acquire_exclusive();
 
         for _ in 0..helpers::fuzz_iterations(10) {
             // generate a random pending page that is smaller than the 100 MB mark

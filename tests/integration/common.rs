@@ -7,6 +7,73 @@ use tempfile::TempDir;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 use turso_core::{Clock, Connection, Database, FromValueRow, Row, IO};
 
+/// Process-wide synchronization for tests that mutate global SQLite/turso state
+/// (currently the `PENDING_BYTE` value, which is shared by both rusqlite's bundled
+/// SQLite and turso's pager). When `cargo test` runs all tests in a single process,
+/// a test that flips the pending byte will corrupt any other test running in
+/// parallel that has already opened a database.
+///
+/// Ordinary tests acquire a read guard for the lifetime of their `TempDatabase`,
+/// so multiple tests can still run in parallel. The `fuzz_pending_byte_database`
+/// test acquires the exclusive guard via [`pending_byte_lock::acquire_exclusive`],
+/// which both restores the default pending byte on drop and lets the holding
+/// thread create new `TempDatabase`s without deadlocking on its own write guard.
+pub mod pending_byte_lock {
+    use parking_lot::{RwLock, RwLockReadGuard, RwLockWriteGuard};
+    use std::cell::Cell;
+    use std::sync::OnceLock;
+
+    static LOCK: OnceLock<RwLock<()>> = OnceLock::new();
+
+    fn lock() -> &'static RwLock<()> {
+        LOCK.get_or_init(|| RwLock::new(()))
+    }
+
+    thread_local! {
+        static OWNS_WRITE: Cell<bool> = const { Cell::new(false) };
+    }
+
+    /// Read guard held by a `TempDatabase` for its lifetime. `None` when the
+    /// current thread already holds the exclusive guard, so building a
+    /// `TempDatabase` inside the pending-byte test does not deadlock.
+    pub struct ReadGuard {
+        _inner: Option<RwLockReadGuard<'static, ()>>,
+    }
+
+    pub fn acquire_read() -> ReadGuard {
+        let inner = if OWNS_WRITE.with(|c| c.get()) {
+            None
+        } else {
+            Some(lock().read())
+        };
+        ReadGuard { _inner: inner }
+    }
+
+    /// Exclusive guard for tests that mutate the global pending byte. Holding
+    /// it blocks every other `TempDatabase` from being constructed, and
+    /// restores the default pending byte on drop so a panic mid-test cannot
+    /// leave the global state corrupted.
+    pub struct ExclusiveGuard {
+        _inner: RwLockWriteGuard<'static, ()>,
+    }
+
+    #[cfg(feature = "test_helper")]
+    #[allow(dead_code)]
+    pub fn acquire_exclusive() -> ExclusiveGuard {
+        let inner = lock().write();
+        OWNS_WRITE.with(|c| c.set(true));
+        ExclusiveGuard { _inner: inner }
+    }
+
+    impl Drop for ExclusiveGuard {
+        fn drop(&mut self) {
+            #[cfg(feature = "test_helper")]
+            super::TempDatabase::reset_pending_byte();
+            OWNS_WRITE.with(|c| c.set(false));
+        }
+    }
+}
+
 pub struct TempDatabase {
     pub path: PathBuf,
     pub io: Arc<dyn IO + Send>,
@@ -18,6 +85,9 @@ pub struct TempDatabase {
     pub init_sql: Option<String>,
     #[allow(dead_code)]
     pub enable_mvcc: bool,
+    /// Held for the lifetime of this `TempDatabase` so that tests mutating the
+    /// global pending byte cannot run concurrently. See [`pending_byte_lock`].
+    _pending_byte_guard: pending_byte_lock::ReadGuard,
 }
 unsafe impl Send for TempDatabase {}
 
@@ -167,6 +237,11 @@ impl TempDatabaseBuilder {
     }
 
     pub fn build(self) -> TempDatabase {
+        // Acquire the read guard before doing any I/O so the pending-byte test
+        // cannot flip the global PENDING_BYTE while we are reading the DB
+        // header or initializing the file via rusqlite.
+        let pending_byte_guard = pending_byte_lock::acquire_read();
+
         let mut opts = self
             .opts
             .unwrap_or_else(|| turso_core::DatabaseOpts::new().with_encryption(true));
@@ -238,6 +313,7 @@ impl TempDatabaseBuilder {
             db_flags: flags,
             init_sql: self.init_sql,
             enable_mvcc: self.enable_mvcc,
+            _pending_byte_guard: pending_byte_guard,
         }
     }
 }
