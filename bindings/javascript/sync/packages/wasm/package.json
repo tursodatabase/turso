@@ -1,6 +1,6 @@
 {
   "name": "@tursodatabase/sync-wasm",
-  "version": "0.6.0-pre.25",
+  "version": "0.6.0-pre.26",
   "repository": {
     "type": "git",
     "url": "https://github.com/tursodatabase/turso"
@@ -54,8 +54,8 @@
     "#index": "./index.js"
   },
   "dependencies": {
-    "@tursodatabase/database-common": "^0.6.0-pre.25",
-    "@tursodatabase/database-wasm-common": "^0.6.0-pre.25",
-    "@tursodatabase/sync-common": "^0.6.0-pre.25"
+    "@tursodatabase/database-common": "^0.6.0-pre.26",
+    "@tursodatabase/database-wasm-common": "^0.6.0-pre.26",
+    "@tursodatabase/sync-common": "^0.6.0-pre.26"
   }
 }
