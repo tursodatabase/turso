@@ -5780,35 +5780,30 @@ fn update_agg_payload(
                     "Avg: payload[2] is not an integer".to_string(),
                 ));
             };
-            let val = match arg {
-                Value::Numeric(Numeric::Integer(i)) => i as f64,
-                Value::Numeric(Numeric::Float(f)) => f64::from(f),
+            let mut sum_state = SumAggState {
+                r_err,
+                ..Default::default()
+            };
+            match arg {
+                Value::Numeric(Numeric::Integer(i)) => {
+                    apply_kbn_step_int(sum_val, i, &mut sum_state);
+                }
+                Value::Numeric(Numeric::Float(f)) => {
+                    apply_kbn_step(sum_val, f64::from(f), &mut sum_state);
+                }
                 Value::Text(t) => match try_for_float(t.as_str().as_bytes()).1 {
-                    ParsedNumber::Integer(i) => i as f64,
-                    ParsedNumber::Float(f) => f,
-                    ParsedNumber::None => 0.0,
+                    ParsedNumber::Integer(i) => apply_kbn_step_int(sum_val, i, &mut sum_state),
+                    ParsedNumber::Float(f) => apply_kbn_step(sum_val, f, &mut sum_state),
+                    ParsedNumber::None => apply_kbn_step(sum_val, 0.0, &mut sum_state),
                 },
                 Value::Blob(b) => match try_for_float(&b).1 {
-                    ParsedNumber::Integer(i) => i as f64,
-                    ParsedNumber::Float(f) => f,
-                    ParsedNumber::None => 0.0,
+                    ParsedNumber::Integer(i) => apply_kbn_step_int(sum_val, i, &mut sum_state),
+                    ParsedNumber::Float(f) => apply_kbn_step(sum_val, f, &mut sum_state),
+                    ParsedNumber::None => apply_kbn_step(sum_val, 0.0, &mut sum_state),
                 },
                 _ => unreachable!(),
-            };
-            // Use Kahan-Babuška-Neumaier compensation for better floating-point precision
-            let s = sum_val.to_float_or_zero();
-            let t = s + val;
-            // When t is infinite, the KBN correction computes inf - inf = NaN,
-            // which is meaningless. Skip compensation in that case.
-            if t.is_finite() {
-                let correction = if s.abs() > val.abs() {
-                    (s - t) + val
-                } else {
-                    (val - t) + s
-                };
-                *r_err_val = Value::from_f64(r_err + correction);
             }
-            *sum_val = Value::from_f64(t);
+            *r_err_val = Value::from_f64(sum_state.r_err);
             *count = count.checked_add(1).ok_or(LimboError::IntegerOverflow)?;
         }
         AggFunc::Sum | AggFunc::Total => {
@@ -15814,6 +15809,37 @@ mod tests {
         ];
         let result = finalize_agg_payload(&AggFunc::Avg, &payload).unwrap();
         assert_eq!(result, Value::Null);
+    }
+
+    #[test]
+    fn test_finalize_avg_large_integers() {
+        let mut payload = vec![
+            Value::from_f64(0.0),
+            Value::from_f64(0.0),
+            Value::from_i64(0),
+        ];
+
+        update_agg_payload(
+            &AggFunc::Avg,
+            Value::from_i64(9007199254740994),
+            None,
+            &mut payload,
+            CollationSeq::Binary,
+            &None,
+        )
+        .unwrap();
+        update_agg_payload(
+            &AggFunc::Avg,
+            Value::from_i64(-9007199254740993),
+            None,
+            &mut payload,
+            CollationSeq::Binary,
+            &None,
+        )
+        .unwrap();
+
+        let result = finalize_agg_payload(&AggFunc::Avg, &payload).unwrap();
+        assert_eq!(result, Value::from_f64(0.5));
     }
 
     #[test]
