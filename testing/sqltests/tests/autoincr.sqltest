@@ -328,3 +328,16 @@ test autoinc-expicit-negative-rowid-initializes-seq-table {
 } expect {
 	t|0
 }
+
+# https://github.com/tursodatabase/turso/issues/3764
+# The sqlite_sequence table is reserved and cannot be dropped, even when
+# referenced via sqlite_schema. This guards the AUTOINCREMENT fast path,
+# which assumes sqlite_sequence exists whenever an AUTOINCREMENT table does.
+@cross-check-integrity
+test autoinc-fail-drop-sequence-after-insert {
+    CREATE TABLE t(id INTEGER PRIMARY KEY AUTOINCREMENT, val TEXT);
+    INSERT INTO t(val) VALUES('a');
+    DROP TABLE sqlite_sequence;
+}
+expect error {
+}

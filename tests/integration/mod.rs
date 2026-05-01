@@ -1,5 +1,6 @@
 mod assert_details;
 mod attach;
+mod autoincrement_schema;
 mod common;
 mod conflict_resolution;
 mod custom_types;
