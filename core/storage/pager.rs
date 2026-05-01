@@ -1867,21 +1867,30 @@ impl Pager {
     /// of the savepoint to the end of the subjournal and restoring the page images to the page cache.
     pub fn rollback_to_newest_savepoint(&self) -> Result<bool> {
         let (savepoint, journal_end_offset) = {
-            let mut savepoints = self.savepoints.write();
+            let savepoints = self.savepoints.read();
             if !matches!(
                 savepoints.last().map(|savepoint| &savepoint.kind),
                 Some(SavepointKind::Statement)
             ) {
                 return Ok(false);
             }
-            let savepoint = savepoints.pop().expect("savepoint must exist");
+            let savepoint = savepoints.last().expect("savepoint must exist");
             let journal_end_offset = savepoint.write_offset();
             (savepoint.snapshot(), journal_end_offset)
         };
 
         self.rollback_to_snapshot(&savepoint, journal_end_offset)?;
 
-        let savepoints = self.savepoints.write();
+        let mut savepoints = self.savepoints.write();
+        if !matches!(
+            savepoints.last().map(|savepoint| &savepoint.kind),
+            Some(SavepointKind::Statement)
+        ) {
+            return Err(LimboError::InternalError(
+                "statement savepoint changed during rollback".to_string(),
+            ));
+        }
+        savepoints.pop().expect("statement savepoint must exist");
         if let Some(parent) = savepoints.last() {
             parent.set_write_offset(savepoint.start_offset);
         }

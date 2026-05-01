@@ -185,6 +185,76 @@ fn sim_statement_rollback_restores_overflow_pages_when_cache_spills() -> Result<
 }
 
 #[test]
+fn sim_statement_rollback_spill_does_not_pollute_parent_savepoint() -> Result<()> {
+    let io = make_io_with_page_size(10, 512);
+    let conn = open_conn(io.clone(), "sim_stmt_nested_rollback_spill.db")?;
+
+    conn.execute("PRAGMA page_size=512")?;
+    conn.execute("PRAGMA journal_mode=WAL")?;
+    conn.execute("PRAGMA cache_size=8")?;
+    conn.execute(
+        "CREATE TABLE t(
+            id INTEGER PRIMARY KEY,
+            v TEXT,
+            unique_text TEXT UNIQUE,
+            unique_int INTEGER UNIQUE
+        )",
+    )?;
+
+    let values = (1..=30)
+        .map(|i| {
+            let payload = "X".repeat(12_000);
+            format!("({i}, '{payload}', 'u{i}', {i})")
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    conn.execute(format!("INSERT INTO t VALUES {values}"))?;
+
+    conn.execute("SAVEPOINT outer")?;
+    let update_payload = "Y".repeat(16_000);
+    let failed_update = conn.execute(format!(
+        "UPDATE t
+            SET v = '{update_payload}',
+                id = CASE WHEN id = 30 THEN 1 ELSE id END
+          WHERE TRUE"
+    ));
+    assert!(
+        failed_update.is_err(),
+        "update should fail with a duplicate rowid"
+    );
+    assert_eq!(
+        query_one_i64(&conn, io.as_ref(), "SELECT sum(length(v)) FROM t")?,
+        30 * 12_000
+    );
+    assert_eq!(
+        query_one_string(&conn, io.as_ref(), "PRAGMA integrity_check")?,
+        "ok"
+    );
+
+    conn.execute("UPDATE t SET v = 'changed' WHERE id = 1")?;
+    conn.execute("ROLLBACK TO outer")?;
+    conn.execute("RELEASE outer")?;
+
+    assert_eq!(
+        query_one_i64(&conn, io.as_ref(), "SELECT count(*) FROM t")?,
+        30
+    );
+    assert_eq!(
+        query_one_i64(&conn, io.as_ref(), "SELECT sum(length(v)) FROM t")?,
+        30 * 12_000
+    );
+    assert_eq!(
+        query_one_i64(&conn, io.as_ref(), "SELECT length(v) FROM t WHERE id = 1")?,
+        12_000
+    );
+    assert_eq!(
+        query_one_string(&conn, io.as_ref(), "PRAGMA integrity_check")?,
+        "ok"
+    );
+    Ok(())
+}
+
+#[test]
 fn sim_abandon_during_dml_rolls_back() -> Result<()> {
     let (conn, io) = make_conn(1)?;
     conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)")?;
