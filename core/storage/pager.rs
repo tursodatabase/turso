@@ -1237,6 +1237,14 @@ struct Savepoint {
     write_offset: AtomicU64,
     /// Bitmap of page numbers that are dirty in the savepoint.
     page_bitmap: RwLock<RoaringBitmap>,
+    /// Pages whose pre-modification state was already dirty in the cache when
+    /// they were subjournaled. For these pages the savepoint state lives only
+    /// in the subjournal — the WAL up to [`Self::wal_max_frame`] does not hold
+    /// it, so rollback must restore them as dirty in the cache. Pages NOT in
+    /// this bitmap were clean at subjournal time, so the WAL still holds their
+    /// savepoint state and rollback can restore the bytes in place and then
+    /// let the cache drop them on demand.
+    dirty_at_subjournal: RwLock<RoaringBitmap>,
     /// Database size at the start of the savepoint.
     /// If the database grows during the savepoint and a rollback to the savepoint is performed,
     /// the pages exceeding the database size at the start of the savepoint will be ignored.
@@ -1264,6 +1272,7 @@ impl Savepoint {
             start_offset: AtomicU64::new(subjournal_offset),
             write_offset: AtomicU64::new(subjournal_offset),
             page_bitmap: RwLock::new(RoaringBitmap::new()),
+            dirty_at_subjournal: RwLock::new(RoaringBitmap::new()),
             db_size: AtomicU32::new(db_size),
             wal_max_frame: AtomicU64::new(wal_max_frame),
             wal_checksum: RwLock::new(wal_checksum),
@@ -1277,6 +1286,10 @@ impl Savepoint {
 
     pub fn has_dirty_page(&self, page_num: u32) -> bool {
         self.page_bitmap.read().contains(page_num)
+    }
+
+    pub fn mark_dirty_at_subjournal(&self, page_num: u32) {
+        self.dirty_at_subjournal.write().insert(page_num);
     }
 
     fn start_offset(&self) -> u64 {
@@ -1308,6 +1321,7 @@ impl Savepoint {
             start_offset: AtomicU64::new(snapshot.start_offset),
             write_offset: AtomicU64::new(snapshot.start_offset),
             page_bitmap: RwLock::new(RoaringBitmap::new()),
+            dirty_at_subjournal: RwLock::new(RoaringBitmap::new()),
             db_size: AtomicU32::new(snapshot.db_size),
             wal_max_frame: AtomicU64::new(snapshot.wal_max_frame),
             wal_checksum: RwLock::new(snapshot.wal_checksum),
@@ -1672,6 +1686,19 @@ impl Pager {
             if cur_savepoint.has_dirty_page(page_id_u32) {
                 return Ok(());
             }
+            // Capture whether the page was dirty BEFORE this modification.
+            // subjournal_page_if_required is invoked from add_dirty() prior to
+            // set_dirty(), so is_dirty() here reflects the pre-modification
+            // state. A dirty pre-state means an outer transaction or earlier
+            // statement modified the page without spilling, so the
+            // savepoint-visible bytes only live in the subjournal — rollback
+            // must restore them as dirty in the cache. A clean pre-state means
+            // the savepoint-visible bytes are still recoverable from the WAL
+            // up to wal_max_frame, so rollback can restore in place and let
+            // the cache evict the page on demand without losing data.
+            if page.is_dirty() {
+                cur_savepoint.mark_dirty_at_subjournal(page_id_u32);
+            }
             cur_savepoint.write_offset.load(Ordering::SeqCst)
         };
         let page_id = page.get().id;
@@ -1767,6 +1794,12 @@ impl Pager {
         let savepoint = savepoints.pop().expect("savepoint must exist");
         if let Some(parent) = savepoints.last() {
             parent.set_write_offset(savepoint.write_offset());
+            // The released savepoint's subjournal entries now belong to the
+            // parent. Merge dirty-at-subjournal tracking so a later rollback
+            // crossing this range still knows whether each page must be
+            // restored as dirty or can be restored in place and evicted.
+            let dirty = savepoint.dirty_at_subjournal.read().clone();
+            *parent.dirty_at_subjournal.write() |= dirty;
         } else {
             let subjournal = self.subjournal.read();
             let Some(subjournal) = subjournal.as_ref() else {
@@ -1836,10 +1869,19 @@ impl Pager {
             .map(|savepoint| savepoint.write_offset())
             .unwrap_or(0);
 
+        // Merge dirty-at-subjournal tracking from all savepoints being
+        // released so the surviving parent (if any) preserves it for any
+        // future rollback that crosses this range.
+        let mut merged_dirty = RoaringBitmap::new();
+        for sp in &savepoints[target_idx..] {
+            merged_dirty |= sp.dirty_at_subjournal.read().clone();
+        }
+
         savepoints.truncate(target_idx);
 
         if let Some(parent) = savepoints.last() {
             parent.set_write_offset(journal_end_offset);
+            *parent.dirty_at_subjournal.write() |= merged_dirty;
         } else {
             let subjournal = self.subjournal.read();
             let Some(subjournal) = subjournal.as_ref() else {
@@ -1875,9 +1917,10 @@ impl Pager {
         }
         let savepoint = savepoints.pop().expect("savepoint must exist");
         let journal_end_offset = savepoint.write_offset();
+        let dirty_at_subjournal = savepoint.dirty_at_subjournal.read().clone();
         let savepoint = savepoint.snapshot();
 
-        self.rollback_to_snapshot(&savepoint, journal_end_offset)?;
+        self.rollback_to_snapshot(&savepoint, journal_end_offset, &dirty_at_subjournal)?;
 
         if let Some(parent) = savepoints.last() {
             parent.set_write_offset(savepoint.start_offset);
@@ -1907,14 +1950,24 @@ impl Pager {
                 .last()
                 .map(|savepoint| savepoint.write_offset())
                 .unwrap_or_else(|| savepoints[target_idx].write_offset());
+            // The subjournal stream covers all entries written by
+            // savepoints[target_idx..]; the first entry per page wins on
+            // rollback. Union dirty-at-subjournal across the whole range so
+            // we know whether each restored page must be cache-restored as
+            // dirty, or can be restored in place and evicted.
+            let mut dirty_at_subjournal = RoaringBitmap::new();
+            for sp in &savepoints[target_idx..] {
+                dirty_at_subjournal |= sp.dirty_at_subjournal.read().clone();
+            }
             (
                 target_idx,
                 savepoints[target_idx].snapshot(),
                 journal_end_offset,
+                dirty_at_subjournal,
             )
         };
 
-        self.rollback_to_snapshot(&target.1, target.2)?;
+        self.rollback_to_snapshot(&target.1, target.2, &target.3)?;
 
         let mut savepoints = self.savepoints.write();
         let deferred_fk_violations = target.1.deferred_fk_violations;
@@ -1960,6 +2013,7 @@ impl Pager {
         &self,
         savepoint: &SavepointSnapshot,
         journal_end_offset: u64,
+        dirty_at_subjournal: &RoaringBitmap,
     ) -> Result<()> {
         let subjournal = self.subjournal.read();
         let Some(subjournal) = subjournal.as_ref() else {
@@ -1989,6 +2043,7 @@ impl Pager {
                 current_offset += page_size;
                 continue;
             }
+            rollback_bitset.insert(page_id);
 
             let page_buffer = Arc::new(self.buffer_pool.allocate(page_size as usize));
             let page = Arc::new(Page::new(page_id as i64));
@@ -2000,14 +2055,69 @@ impl Pager {
             )?;
             turso_assert!(c.succeeded(), "memory IO should complete immediately");
             current_offset += page_size;
-            rollback_bitset.insert(page_id);
-            // The restored image is the transaction-visible state at the
-            // savepoint, not necessarily durable state. Keep it dirty so cache
-            // eviction cannot drop uncommitted changes that predate the
-            // rolled-back savepoint/statement.
-            page.set_dirty();
-            dirty_pages.insert(page_id);
-            self.upsert_page_in_cache(page_id as usize, page, true)?;
+
+            // Restore the savepoint-visible bytes for this page.
+            //
+            // We must ensure that any cursor that already holds an Arc to the
+            // existing cached PageRef observes the rolled-back bytes. The
+            // previous implementation called `upsert_page_in_cache` here,
+            // which swaps the cache entry to a brand-new PageRef but leaves
+            // older Arcs holding the post-modification buffer. A subsequent
+            // statement reading the page through a stack-cached Arc could
+            // then dereference stale bytes and trip the per-cell type
+            // assertions (e.g. `cell_table_interior_read_rowid`).
+            //
+            // Overwriting the existing buffer in place keeps the live Arc(s)
+            // and the cache entry in sync. The page is marked dirty so it
+            // cannot be evicted before the upcoming commit/rollback flushes
+            // the savepoint state to the WAL — without that pin, the cache
+            // can drop the page and a later read would pick up the
+            // post-modification bytes from a WAL frame older than the
+            // truncation point below cannot guarantee to overwrite.
+            let mut cache = self.page_cache.write();
+            let key = PageCacheKey::new(page_id as usize);
+            let restored_existing = if let Some(existing) = cache.get(&key)? {
+                let was_dirty = existing.is_dirty();
+                let dst = existing.get_contents().as_ptr();
+                let src = page.get_contents().as_ptr();
+                turso_assert!(
+                    dst.len() == src.len(),
+                    "page contents length mismatch during rollback"
+                );
+                dst.copy_from_slice(src);
+                existing.clear_wal_tag();
+                if !was_dirty {
+                    existing.set_dirty();
+                }
+                true
+            } else {
+                false
+            };
+            drop(cache);
+            if restored_existing {
+                dirty_pages.insert(page_id);
+                continue;
+            }
+
+            // Page is not in the cache. If its pre-modification state was
+            // dirty (an outer txn or earlier statement had modified it
+            // without spilling), the savepoint-visible bytes only live in
+            // the subjournal, so we must reinsert the restored buffer.
+            // Otherwise the WAL up to `savepoint.wal_max_frame` still holds
+            // those bytes and a future read can fetch them on demand.
+            if dirty_at_subjournal.contains(page_id) {
+                page.set_dirty();
+                dirty_pages.insert(page_id);
+                self.upsert_page_in_cache(page_id as usize, page, true)?;
+            } else {
+                // The savepoint-visible bytes for this page are recoverable
+                // from the WAL once we truncate below. Drop it from
+                // dirty_pages so the imminent commit does not flush the
+                // post-modification bytes (which the cache still holds via
+                // an evicted spill record) back into the WAL above the
+                // savepoint frame.
+                dirty_pages.remove(page_id);
+            }
         }
 
         let truncate_completion = subjournal.truncate(journal_start_offset)?;

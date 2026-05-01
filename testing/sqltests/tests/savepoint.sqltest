@@ -350,3 +350,99 @@ test savepoint-rollback-to-temp-table-unreachable {
 expect error {
     no such table
 }
+
+# Regression: rolling back an UPDATE that grew overflow chains under heavy
+# cache pressure used to leave inconsistent state in cache + dirty_pages,
+# causing later seeks to descend through a stale child pointer and trip
+# `cell_table_interior_read_rowid`'s page-type assertion. See issue #6355.
+@cross-check-integrity
+test savepoint-rollback-overflow-grow-cache-pressure {
+    PRAGMA page_size = 512;
+    PRAGMA cache_size = 4;
+    PRAGMA cache_spill = ON;
+    CREATE TABLE t(a INTEGER PRIMARY KEY, k TEXT NOT NULL, v TEXT NOT NULL);
+    CREATE INDEX t_k ON t(k);
+    INSERT INTO t
+    SELECT value,
+           printf('%06d:%s', value, hex(randomblob(9216))),
+           printf('%06d:%s', value, hex(randomblob(17408)))
+    FROM generate_series(1, 184);
+    SAVEPOINT s1;
+    UPDATE t SET v = printf('%06d:%s', a, hex(randomblob(20480)))
+    WHERE a BETWEEN 38 AND 126;
+    ROLLBACK TO s1;
+    RELEASE s1;
+    SELECT length(v) FROM t WHERE a <= 154 ORDER BY a DESC LIMIT 5;
+}
+expect {
+    34823
+    34823
+    34823
+    34823
+    34823
+}
+
+# Smaller variant exercising overflow-chain grow + index pressure without
+# the very small cache; verifies the in-place restore path also works
+# when rollback fits comfortably in cache.
+@cross-check-integrity
+test savepoint-rollback-overflow-grow-modest-cache {
+    PRAGMA page_size = 4096;
+    CREATE TABLE t(x INTEGER PRIMARY KEY, v BLOB);
+    INSERT INTO t SELECT value, randomblob(8000) FROM generate_series(1, 50);
+    SAVEPOINT s1;
+    UPDATE t SET v = randomblob(20000) WHERE x BETWEEN 10 AND 30;
+    ROLLBACK TO s1;
+    RELEASE s1;
+    SELECT count(*), sum(length(v)) FROM t;
+}
+expect {
+    50|400000
+}
+
+# Nested savepoint: inner ROLLBACK TO + RELEASE must preserve the outer
+# savepoint's pending changes; a subsequent RELEASE of the outer commits
+# them. The fix must not over-restore pages when only the inner range
+# was modified.
+@cross-check-integrity
+test savepoint-rollback-nested-overflow {
+    PRAGMA page_size = 512;
+    CREATE TABLE t(x INTEGER PRIMARY KEY, v TEXT);
+    INSERT INTO t SELECT value, hex(randomblob(2000)) FROM generate_series(1, 30);
+    SAVEPOINT outer_sp;
+    UPDATE t SET v = 'in-outer' WHERE x = 5;
+    SAVEPOINT inner_sp;
+    UPDATE t SET v = hex(randomblob(5000)) WHERE x BETWEEN 10 AND 20;
+    ROLLBACK TO inner_sp;
+    RELEASE inner_sp;
+    SELECT x, length(v) FROM t WHERE x IN (5, 10, 15) ORDER BY x;
+    RELEASE outer_sp;
+    SELECT x, length(v) FROM t WHERE x IN (5, 10, 15) ORDER BY x;
+}
+expect {
+    5|8
+    10|4000
+    15|4000
+    5|8
+    10|4000
+    15|4000
+}
+
+# Single-row UPDATE rolled back inside a savepoint should not change
+# anything observable. Smallest possible regression test for the
+# in-place restore path.
+@cross-check-integrity
+test savepoint-rollback-single-row-update {
+    CREATE TABLE t(x INTEGER PRIMARY KEY, v TEXT);
+    INSERT INTO t VALUES (1, 'a'), (2, 'b'), (3, 'c');
+    SAVEPOINT s1;
+    UPDATE t SET v = 'updated' WHERE x = 2;
+    ROLLBACK TO s1;
+    RELEASE s1;
+    SELECT x, v FROM t ORDER BY x;
+}
+expect {
+    1|a
+    2|b
+    3|c
+}
