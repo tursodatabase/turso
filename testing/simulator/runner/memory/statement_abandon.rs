@@ -22,8 +22,12 @@ fn make_two_conns(seed: u64) -> Result<(Arc<Connection>, Arc<Connection>, Arc<Me
 }
 
 fn make_io(seed: u64) -> Arc<MemorySimIO> {
+    make_io_with_page_size(seed, 4096)
+}
+
+fn make_io_with_page_size(seed: u64, page_size: usize) -> Arc<MemorySimIO> {
     Arc::new(MemorySimIO::new(
-        seed, 4096, 100, // Always schedule operations asynchronously.
+        seed, page_size, 100, // Always schedule operations asynchronously.
         1, 5,
     ))
 }
@@ -54,16 +58,36 @@ fn open_two_conns(io: Arc<MemorySimIO>, path: &str) -> Result<(Arc<Connection>, 
 }
 
 fn query_count(conn: &Arc<Connection>, io: &MemorySimIO) -> Result<i64> {
-    let mut stmt = conn.prepare("SELECT COUNT(*) FROM t")?;
+    query_one_i64(conn, io, "SELECT COUNT(*) FROM t")
+}
+
+fn query_one_i64(conn: &Arc<Connection>, io: &MemorySimIO, sql: &str) -> Result<i64> {
+    let mut stmt = conn.prepare(sql)?;
     loop {
         match stmt.step()? {
             StepResult::IO => io.step()?,
             StepResult::Row => {
-                let row = stmt.row().expect("row should exist for count query");
-                let count = row.get::<i64>(0).expect("count column should exist");
-                return Ok(count);
+                let row = stmt.row().expect("row should exist for scalar query");
+                let value = row.get::<i64>(0).expect("i64 column should exist");
+                return Ok(value);
             }
-            StepResult::Done => panic!("count query ended without a row"),
+            StepResult::Done => panic!("scalar query ended without a row"),
+            other => panic!("unexpected step result: {other:?}"),
+        }
+    }
+}
+
+fn query_one_string(conn: &Arc<Connection>, io: &MemorySimIO, sql: &str) -> Result<String> {
+    let mut stmt = conn.prepare(sql)?;
+    loop {
+        match stmt.step()? {
+            StepResult::IO => io.step()?,
+            StepResult::Row => {
+                let row = stmt.row().expect("row should exist for scalar query");
+                let value = row.get::<String>(0).expect("text column should exist");
+                return Ok(value);
+            }
+            StepResult::Done => panic!("scalar query ended without a row"),
             other => panic!("unexpected step result: {other:?}"),
         }
     }
@@ -86,6 +110,78 @@ fn query_rows(conn: &Arc<Connection>, io: &MemorySimIO) -> Result<Vec<(i64, Stri
             other => panic!("unexpected step result: {other:?}"),
         }
     }
+}
+
+#[test]
+fn sim_statement_rollback_restores_overflow_pages_when_cache_spills() -> Result<()> {
+    let io = make_io_with_page_size(9, 512);
+    let conn = open_conn(io.clone(), "sim_stmt_overflow_rollback_spill.db")?;
+
+    conn.execute("PRAGMA page_size=512")?;
+    conn.execute("PRAGMA cache_size=200")?;
+    conn.execute(
+        "CREATE TABLE t(
+            id INTEGER PRIMARY KEY,
+            v TEXT,
+            unique_text TEXT UNIQUE,
+            r REAL,
+            unique_int INTEGER UNIQUE
+        )",
+    )?;
+
+    let values = (0..8)
+        .map(|i| {
+            let id = if i == 0 {
+                "NULL".to_string()
+            } else {
+                (1000 + i).to_string()
+            };
+            let prefix = format!("p{i}:");
+            let payload = format!("{prefix}{}", "X".repeat(12_000 - prefix.len()));
+            format!("({id}, '{payload}', 'u{i}', 0, {})", 2000 + i)
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    conn.execute(format!("INSERT INTO t VALUES {values}"))?;
+    conn.execute("SAVEPOINT sp")?;
+    conn.execute("INSERT INTO t VALUES (999999, 'small', 'ufail', 0, 999999)")?;
+
+    let update_payload = "Y".repeat(16_000);
+    let failed_update = conn.execute(format!(
+        "UPDATE t
+            SET v = '{update_payload}',
+                id = CASE WHEN id = 999999 THEN 1 ELSE id END
+          WHERE TRUE"
+    ));
+    assert!(
+        failed_update.is_err(),
+        "update should fail with a duplicate rowid"
+    );
+
+    assert_eq!(
+        query_one_i64(&conn, io.as_ref(), "SELECT COUNT(*) FROM t")?,
+        9
+    );
+    assert_eq!(
+        query_one_i64(&conn, io.as_ref(), "SELECT sum(length(v)) FROM t")?,
+        8 * 12_000 + 5
+    );
+    assert_eq!(
+        query_one_string(&conn, io.as_ref(), "PRAGMA integrity_check")?,
+        "ok"
+    );
+
+    conn.execute("ROLLBACK TO sp")?;
+    conn.execute("RELEASE sp")?;
+    assert_eq!(
+        query_one_i64(&conn, io.as_ref(), "SELECT COUNT(*) FROM t")?,
+        8
+    );
+    assert_eq!(
+        query_one_i64(&conn, io.as_ref(), "SELECT sum(length(v)) FROM t")?,
+        8 * 12_000
+    );
+    Ok(())
 }
 
 #[test]

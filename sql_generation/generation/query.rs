@@ -369,7 +369,13 @@ fn gen_insert_values<R: Rng + ?Sized, C: GenerationContext>(
                             base_offset + (col_idx as i64 * UNIQUE_COL_STRIDE) + row_idx as i64;
                         SimValue::unique_for_type(&c.column_type, offset)
                     } else {
-                        SimValue::arbitrary_from(rng, env, &c.column_type)
+                        padded_insert_value(
+                            insert_opts.padding_size,
+                            row_idx,
+                            col_idx,
+                            &c.column_type,
+                        )
+                        .unwrap_or_else(|| SimValue::arbitrary_from(rng, env, &c.column_type))
                     }
                 })
                 .collect()
@@ -381,6 +387,26 @@ fn gen_insert_values<R: Rng + ?Sized, C: GenerationContext>(
         values,
         on_conflict: None,
     })
+}
+
+fn padded_insert_value(
+    padding_size: Option<usize>,
+    row_idx: u32,
+    col_idx: usize,
+    column_type: &ColumnType,
+) -> Option<SimValue> {
+    let size = padding_size?;
+    let mut bytes = Vec::with_capacity(size);
+    let prefix = format!("p{row_idx}_{col_idx}:");
+    bytes.extend_from_slice(prefix.as_bytes());
+    bytes.resize(size, b'X');
+    match column_type {
+        ColumnType::Text => Some(SimValue(turso_core::Value::build_text(
+            String::from_utf8(bytes).unwrap(),
+        ))),
+        ColumnType::Blob => Some(SimValue(turso_core::Value::Blob(bytes))),
+        ColumnType::Integer | ColumnType::Float => None,
+    }
 }
 
 fn gen_insert_upsert_values<R: Rng + ?Sized, C: GenerationContext>(

@@ -1866,19 +1866,22 @@ impl Pager {
     /// Rollback to the newest savepoint. This basically just means reading the subjournal from the start offset
     /// of the savepoint to the end of the subjournal and restoring the page images to the page cache.
     pub fn rollback_to_newest_savepoint(&self) -> Result<bool> {
-        let mut savepoints = self.savepoints.write();
-        if !matches!(
-            savepoints.last().map(|savepoint| &savepoint.kind),
-            Some(SavepointKind::Statement)
-        ) {
-            return Ok(false);
-        }
-        let savepoint = savepoints.pop().expect("savepoint must exist");
-        let journal_end_offset = savepoint.write_offset();
-        let savepoint = savepoint.snapshot();
+        let (savepoint, journal_end_offset) = {
+            let mut savepoints = self.savepoints.write();
+            if !matches!(
+                savepoints.last().map(|savepoint| &savepoint.kind),
+                Some(SavepointKind::Statement)
+            ) {
+                return Ok(false);
+            }
+            let savepoint = savepoints.pop().expect("savepoint must exist");
+            let journal_end_offset = savepoint.write_offset();
+            (savepoint.snapshot(), journal_end_offset)
+        };
 
         self.rollback_to_snapshot(&savepoint, journal_end_offset)?;
 
+        let savepoints = self.savepoints.write();
         if let Some(parent) = savepoints.last() {
             parent.set_write_offset(savepoint.start_offset);
         }
@@ -1972,8 +1975,11 @@ impl Pager {
         let mut rollback_bitset = RoaringBitmap::new();
         let mut current_offset = journal_start_offset;
         let page_size = self.page_size.load(Ordering::SeqCst) as u64;
-        let mut dirty_pages = self.dirty_pages.write();
+        let mut restored_pages = Vec::new();
 
+        // Read all before-images before touching the cache. Restoring a page
+        // can require spilling, and spilling before cached statement changes
+        // are restored can persist rolled-back content into the WAL.
         while current_offset < journal_end_offset {
             let page_id_buffer = Arc::new(self.buffer_pool.allocate(4));
             let c = subjournal.read_page_number(current_offset, page_id_buffer.clone())?;
@@ -2001,26 +2007,22 @@ impl Pager {
             turso_assert!(c.succeeded(), "memory IO should complete immediately");
             current_offset += page_size;
             rollback_bitset.insert(page_id);
-            // The restored image is the transaction-visible state at the
-            // savepoint, not necessarily durable state. Keep it dirty so cache
-            // eviction cannot drop uncommitted changes that predate the
-            // rolled-back savepoint/statement.
-            page.set_dirty();
-            dirty_pages.insert(page_id);
-            self.upsert_page_in_cache(page_id as usize, page, true)?;
+            restored_pages.push((page_id, page));
         }
 
-        let truncate_completion = subjournal.truncate(journal_start_offset)?;
-        turso_assert!(
-            truncate_completion.succeeded(),
-            "memory IO should complete immediately"
-        );
+        if let Some(wal) = &self.wal {
+            wal.rollback(Some(RollbackTo {
+                frame: savepoint.wal_max_frame,
+                checksum: savepoint.wal_checksum,
+            }));
+        }
 
         // Discard all dirty pages allocated after the savepoint. These pages
         // are never subjournaled (see subjournal_page_if_required), so the loop
         // above won't encounter them. We must clean them from dirty_pages before
         // truncating the cache, or phantom dirty entries survive into commit.
         {
+            let mut dirty_pages = self.dirty_pages.write();
             let mut cache = self.page_cache.write();
             for page_id in dirty_pages.iter().filter(|&id| id > db_size) {
                 if let Some(page) = cache.get(&PageCacheKey::new(page_id as usize))? {
@@ -2032,11 +2034,39 @@ impl Pager {
             cache.truncate(db_size as usize)?;
         }
 
-        if let Some(wal) = &self.wal {
-            wal.rollback(Some(RollbackTo {
-                frame: savepoint.wal_max_frame,
-                checksum: savepoint.wal_checksum,
-            }));
+        let mut missing_pages = Vec::new();
+        // Restore resident pages first. Once the cache no longer contains
+        // statement-dirty versions, inserting missing pages may safely spill.
+        for (page_id, page) in restored_pages {
+            // The restored image is the transaction-visible state at the
+            // savepoint, not necessarily durable state. Keep it dirty so cache
+            // eviction cannot drop uncommitted changes that predate the
+            // rolled-back savepoint/statement.
+            page.set_dirty();
+            if self
+                .page_cache
+                .read()
+                .contains_key(&PageCacheKey::new(page_id as usize))
+            {
+                self.upsert_page_in_cache(page_id as usize, page, true)?;
+                self.dirty_pages.write().insert(page_id);
+            } else {
+                missing_pages.push((page_id, page));
+            }
+        }
+
+        for (page_id, page) in missing_pages {
+            self.upsert_page_in_cache(page_id as usize, page, true)?;
+            self.dirty_pages.write().insert(page_id);
+        }
+
+        let truncate_completion = subjournal.truncate(journal_start_offset)?;
+        turso_assert!(
+            truncate_completion.succeeded(),
+            "memory IO should complete immediately"
+        );
+
+        if self.wal.is_some() {
             self.page_cache
                 .write()
                 .delete_clean_pages_after_wal_frame(savepoint.wal_max_frame)
@@ -4977,18 +5007,41 @@ impl Pager {
         page: PageRef,
         dirty_page_must_exist: bool,
     ) -> Result<(), LimboError> {
-        let mut cache = self.page_cache.write();
         let page_key = PageCacheKey::new(id);
 
         // FIXME: use specific page key for writer instead of max frame, this will make readers not conflict
         if dirty_page_must_exist {
             turso_assert!(page.is_dirty(), "page must be dirty for upsert", { "page_id": id });
         }
-        cache.upsert_page(page_key, page.clone()).map_err(|e| {
-            LimboError::InternalError(format!(
-                "Failed to insert loaded page {id} into cache: {e:?}"
-            ))
-        })?;
+
+        loop {
+            {
+                let mut cache = self.page_cache.write();
+                match cache.upsert_page(page_key, page.clone()) {
+                    Ok(()) => break,
+                    Err(CacheError::Full) => {}
+                    Err(e) => {
+                        return Err(LimboError::InternalError(format!(
+                            "Failed to insert loaded page {id} into cache: {e:?}"
+                        )));
+                    }
+                }
+            }
+
+            match self.try_spill_dirty_pages()? {
+                IOResult::Done(true) => {}
+                IOResult::Done(false) => {
+                    return Err(LimboError::InternalError(format!(
+                        "Failed to insert loaded page {id} into cache: {:?}",
+                        CacheError::Full
+                    )));
+                }
+                IOResult::IO(completion) => {
+                    completion.wait(&*self.io)?;
+                }
+            }
+        }
+
         page.set_loaded();
         page.clear_wal_tag();
         Ok(())

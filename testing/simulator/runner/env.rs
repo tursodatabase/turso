@@ -1107,7 +1107,7 @@ impl SimulatorEnv {
             disable_savepoint_rollback: cli_opts.disable_savepoint_rollback,
             disable_fsync_no_wait: cli_opts.disable_fsync_no_wait,
             disable_faulty_query: cli_opts.disable_faulty_query,
-            page_size: 4096, // TODO: randomize this too
+            page_size: profile.page_size.unwrap_or(4096),
             max_interactions: rng.random_range(cli_opts.minimum_tests..=cli_opts.maximum_tests),
             max_time_simulation: cli_opts.maximum_time,
             disable_reopen_database: cli_opts.disable_reopen_database,
@@ -1271,6 +1271,10 @@ impl SimulatorEnv {
                     .expect("db to be Some")
                     .connect()
                     .expect("Failed to connect to Limbo database");
+                if self.opts.page_size != 4096 {
+                    conn.execute(format!("PRAGMA page_size = {}", self.opts.page_size))
+                        .expect("set pragma page_size");
+                }
                 if self.opts.cache_size != DEFAULT_CACHE_SIZE {
                     conn.execute(format!("PRAGMA cache_size = {}", self.opts.cache_size))
                         .expect("set pragma cache_size");
@@ -1278,10 +1282,17 @@ impl SimulatorEnv {
                 self.connections[connection_index] = SimConnection::LimboConnection(conn);
             }
             SimulationType::Differential => {
-                self.connections[connection_index] = SimConnection::SQLiteConnection(
-                    rusqlite::Connection::open(self.get_db_path())
-                        .expect("Failed to open SQLite connection"),
-                );
+                let conn = rusqlite::Connection::open(self.get_db_path())
+                    .expect("Failed to open SQLite connection");
+                if self.opts.page_size != 4096 {
+                    conn.execute(&format!("PRAGMA page_size = {}", self.opts.page_size), [])
+                        .expect("set sqlite pragma page_size");
+                }
+                if self.opts.cache_size != DEFAULT_CACHE_SIZE {
+                    conn.execute(&format!("PRAGMA cache_size = {}", self.opts.cache_size), [])
+                        .expect("set sqlite pragma cache_size");
+                }
+                self.connections[connection_index] = SimConnection::SQLiteConnection(conn);
             }
         };
 
