@@ -1,0 +1,119 @@
+@database :temp:
+@skip-file-if sqlite "MVCC is not supported in SQLite"
+
+# Regression tests for issue #5790:
+# "Btree cursor should have a record when deleting a row that only exists in
+# the btree" was reported under Antithesis. The MVCC cursor's `delete()`
+# previously bailed with corruption when `was_deleted=false` and the cursor
+# was positioned on an MVCC version (`in_btree=false`), but the visible
+# version had been invalidated by an earlier write in the same transaction.
+# The delete should be a no-op in that case because any existing version's
+# `end = our_tx` already invalidates the corresponding btree row.
+
+test mvcc-delete-btree-resident-row {
+    CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT);
+    INSERT INTO t VALUES (1, 'btree');
+    PRAGMA journal_mode = 'MVCC';
+    DELETE FROM t WHERE id = 1;
+    SELECT count(*) FROM t;
+}
+expect {
+    mvcc
+    0
+}
+
+test mvcc-delete-btree-resident-row-data-gone {
+    CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT);
+    INSERT INTO t VALUES (1, 'btree');
+    INSERT INTO t VALUES (2, 'kept');
+    PRAGMA journal_mode = 'MVCC';
+    DELETE FROM t WHERE id = 1;
+    SELECT id, val FROM t ORDER BY id;
+}
+expect {
+    mvcc
+    2|kept
+}
+
+test mvcc-delete-mvcc-only-row {
+    PRAGMA journal_mode = 'MVCC';
+    CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT);
+    INSERT INTO t VALUES (1, 'a');
+    DELETE FROM t WHERE id = 1;
+    SELECT count(*) FROM t;
+}
+expect {
+    mvcc
+    0
+}
+
+test mvcc-delete-row-in-both-btree-and-mvcc {
+    CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT);
+    INSERT INTO t VALUES (1, 'old');
+    PRAGMA journal_mode = 'MVCC';
+    UPDATE t SET val = 'new' WHERE id = 1;
+    DELETE FROM t WHERE id = 1;
+    SELECT count(*) FROM t;
+}
+expect {
+    mvcc
+    0
+}
+
+test mvcc-delete-then-reinsert-then-delete {
+    PRAGMA journal_mode = 'MVCC';
+    CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT);
+    INSERT INTO t VALUES (1, 'first');
+    DELETE FROM t WHERE id = 1;
+    INSERT INTO t VALUES (1, 'second');
+    DELETE FROM t WHERE id = 1;
+    SELECT count(*) FROM t;
+}
+expect {
+    mvcc
+    0
+}
+
+test mvcc-update-then-delete-with-index {
+    CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT);
+    CREATE INDEX idx_val ON t(val);
+    INSERT INTO t VALUES (1, 'a'), (2, 'b'), (3, 'c');
+    PRAGMA journal_mode = 'MVCC';
+    UPDATE t SET val = 'z' WHERE id = 2;
+    DELETE FROM t WHERE val = 'z';
+    SELECT id, val FROM t ORDER BY id;
+}
+expect {
+    mvcc
+    1|a
+    3|c
+}
+
+test mvcc-delete-via-index-on-btree-resident {
+    CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT);
+    CREATE INDEX idx_val ON t(val);
+    INSERT INTO t VALUES (1, 'apple'), (2, 'banana'), (3, 'cherry');
+    PRAGMA journal_mode = 'MVCC';
+    DELETE FROM t WHERE val = 'banana';
+    SELECT id, val FROM t ORDER BY id;
+}
+expect {
+    mvcc
+    1|apple
+    3|cherry
+}
+
+test mvcc-delete-all-rows-after-mixed-writes {
+    CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT);
+    INSERT INTO t VALUES (1, 'btree-only');
+    INSERT INTO t VALUES (2, 'btree-then-update');
+    PRAGMA journal_mode = 'MVCC';
+    UPDATE t SET val = 'updated' WHERE id = 2;
+    INSERT INTO t VALUES (3, 'mvcc-only');
+    DELETE FROM t;
+    SELECT count(*) FROM t;
+}
+expect {
+    mvcc
+    0
+}

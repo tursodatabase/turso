@@ -1420,10 +1420,19 @@ impl<Clock: LogicalClock + 'static> CursorTrait for MvccLazyCursor<Clock> {
         let was_deleted =
             self.db
                 .delete_from_table_or_index(self.tx_id, rowid.clone(), maybe_index_id)?;
-        // If was_deleted is false, this can ONLY happen when we have a row that only exists
-        // in the btree but not the mv store. In this case, we create a tombstone for the row
-        // based on the btree row.
-        if !was_deleted {
+        // `was_deleted == false` has two possible causes:
+        //   1. `in_btree == true`: cursor is positioned on a btree-resident row that
+        //      has no MVCC version yet. We must materialize a tombstone from the
+        //      btree record so that checkpoint propagates the deletion to the btree
+        //      file.
+        //   2. `in_btree == false`: cursor is positioned on an MVCC version that is
+        //      no longer visible to this transaction (e.g. our own transaction has
+        //      already deleted/updated the row, possibly via a savepoint replay or a
+        //      double-delete on the same cursor). Any existing version's
+        //      `end = our_tx` already invalidates the corresponding btree row for
+        //      our view via `is_btree_invalidating_version`, so no new tombstone
+        //      is needed and this delete is a no-op.
+        if !was_deleted && in_btree {
             // The btree cursor must be correctly positioned and cannot cause IO to happen
             // because we pre-fetched the record above when `in_btree` was true.
             let IOResult::Done(Some(record)) = self.record()? else {
