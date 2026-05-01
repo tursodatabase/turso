@@ -406,9 +406,21 @@ fn link_with_window(
     expr_vector_size(expr)?;
     if let Some(windows) = windows {
         let window = resolve_window(windows, over_clause)?;
+        // Dedup: if an equivalent window function expression is already linked to
+        // this window, skip adding it again. Multiple occurrences of the same
+        // window function should share a single entry so the rewrite + emit code
+        // can rely on each entry being rewritten exactly once.
+        if window
+            .functions
+            .iter()
+            .any(|f| exprs_are_equivalent(&f.original_expr, expr))
+        {
+            return Ok(());
+        }
         window.functions.push(WindowFunction {
             func,
             original_expr: expr.clone(),
+            rewritten_expr: None,
         });
     } else {
         let func_name = match &func {

@@ -3031,8 +3031,15 @@ pub struct WindowFunction {
     /// The resolved function. Aggregate window functions and specialized window
     /// functions such as ROW_NUMBER() are supported.
     pub func: WindowFunctionKind,
-    /// The expression from which the function was resolved.
+    /// The expression from which the function was resolved. Used as the lookup
+    /// key when locating this function during window-to-subquery rewriting.
     pub original_expr: Expr,
+    /// The rewritten form of `original_expr`, with arguments and the OVER clause
+    /// remapped to reference the window's input subquery. Set the first time
+    /// `rewrite_terminal_expr` matches this function. Subsequent occurrences of
+    /// the same `original_expr` reuse this cached rewrite so they end up pointing
+    /// at the same registers as the first occurrence.
+    pub rewritten_expr: Option<Expr>,
 }
 
 #[derive(Debug, Clone)]

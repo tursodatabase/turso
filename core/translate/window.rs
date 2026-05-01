@@ -319,16 +319,26 @@ fn rewrite_terminal_expr(
                         // If the expression is a window function tied to the current window,
                         // do not push it to the subquery. Instead, rewrite it so its child
                         // expressions reference the subquery where needed.
-                        rewrite_expr_referencing_current_window(
-                            aggregates,
-                            current_window
-                                .name
-                                .clone()
-                                .expect("current_window must always have a name here"),
-                            ctx,
-                            expr,
-                        )?;
-                        window_function.original_expr = expr.clone();
+                        //
+                        // The same window function expression may appear in multiple places
+                        // (e.g. both in result columns and in ORDER BY, or twice in result
+                        // columns). The first occurrence performs the rewrite and caches the
+                        // result in `rewritten_expr`; subsequent occurrences just clone the
+                        // cached form so every reference points at the same window output.
+                        if let Some(rewritten) = &window_function.rewritten_expr {
+                            *expr = rewritten.clone();
+                        } else {
+                            rewrite_expr_referencing_current_window(
+                                aggregates,
+                                current_window
+                                    .name
+                                    .clone()
+                                    .expect("current_window must always have a name here"),
+                                ctx,
+                                expr,
+                            )?;
+                            window_function.rewritten_expr = Some(expr.clone());
+                        }
 
                         // At this point, the expression and all its children now reference the subquery,
                         // so further traversal is unnecessary.
@@ -576,8 +586,12 @@ impl EmitWindow {
         let reg_acc_start = program.alloc_registers(window_function_count);
         let reg_acc_result_start = program.alloc_registers(window_function_count);
         for (i, func) in window.functions.iter().enumerate() {
+            // Cache by the rewritten form (when available) so lookups against the
+            // result-column / ORDER-BY expressions — which were rewritten to
+            // reference this window's subquery — find the cached register.
+            let cache_expr = func.rewritten_expr.as_ref().unwrap_or(&func.original_expr);
             t_ctx.resolver.cache_expr_reg(
-                std::borrow::Cow::Borrowed(&func.original_expr),
+                std::borrow::Cow::Borrowed(cache_expr),
                 reg_acc_result_start + i,
                 false,
                 None,
@@ -988,7 +1002,10 @@ fn emit_aggregation_step(
         // The aggregation step is performed incrementally as each row from the subquery is
         // processed. Therefore, we don’t need to access the buffer table and can obtain argument
         // values directly by evaluating the expressions that reference the subquery result columns.
-        let args = match &func.original_expr {
+        // Use the rewritten form when available so the args reference the subquery
+        // rather than the (no-longer-visible) original tables.
+        let func_expr = func.rewritten_expr.as_ref().unwrap_or(&func.original_expr);
+        let args = match func_expr {
             Expr::FunctionCall { args, .. } => args.iter().map(|a| (**a).clone()).collect(),
             Expr::FunctionCallStar { .. } => vec![],
             _ => unreachable!(
