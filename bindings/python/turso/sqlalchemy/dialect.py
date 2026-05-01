@@ -23,7 +23,7 @@ from sqlalchemy.engine.reflection import ObjectKind
 from sqlalchemy.util.concurrency import await_only
 
 if TYPE_CHECKING:
-    from sqlalchemy.engine.interfaces import ConnectArgsType, ReflectedForeignKeyConstraint, ReflectedIndex
+    from sqlalchemy.engine.interfaces import ConnectArgsType, ReflectedForeignKeyConstraint
     from sqlalchemy.pool import Pool
 
 logger = logging.getLogger(__name__)
@@ -33,10 +33,15 @@ class _TursoDialectMixin:
     """
     Mixin providing Turso-specific overrides for SQLAlchemy dialect.
 
-    Turso doesn't support all SQLite PRAGMAs. This mixin overrides methods
-    that would otherwise fail due to unsupported PRAGMAs:
-    - PRAGMA foreign_key_list (not supported)
-    - PRAGMA index_list (not supported)
+    Index, unique-constraint, and check-constraint reflection (single- and
+    multi-table) are inherited from SQLAlchemy's parent SQLite dialect, which
+    issues `PRAGMA index_list` / `PRAGMA index_info` and parses
+    `sqlite_master.sql` — all supported by Turso.
+
+    The methods below override the parent only where Turso still lacks the
+    underlying capability:
+    - PRAGMA foreign_key_list (foreign key reflection)
+    - sqlite_temp_master (temp tables/views)
     """
 
     def get_foreign_keys(
@@ -58,87 +63,6 @@ class _TursoDialectMixin:
         )
         return []
 
-    def get_indexes(
-        self,
-        connection,
-        table_name,
-        schema=None,
-        **kw,
-    ) -> List[ReflectedIndex]:
-        """
-        Return indexes for a table.
-
-        Turso doesn't support PRAGMA index_list, so we return an empty list.
-        Indexes still exist and are used for query optimization.
-        """
-        logger.debug(
-            "PRAGMA index_list not supported; index reflection unavailable for table '%s'",
-            table_name,
-        )
-        return []
-
-    def get_unique_constraints(
-        self,
-        connection,
-        table_name,
-        schema=None,
-        **kw,
-    ) -> List[Dict[str, Any]]:
-        """
-        Return unique constraints for a table.
-
-        This also relies on PRAGMA index_list which Turso doesn't support.
-        """
-        logger.debug(
-            "PRAGMA index_list not supported; unique constraint reflection unavailable for table '%s'",
-            table_name,
-        )
-        return []
-
-    def get_check_constraints(
-        self,
-        connection,
-        table_name,
-        schema=None,
-        **kw,
-    ) -> List[Dict[str, Any]]:
-        """
-        Return check constraints for a table.
-
-        SQLite stores these in sqlite_master which Turso may not fully support.
-        """
-        logger.debug(
-            "check constraint reflection not supported for table '%s'",
-            table_name,
-        )
-        return []
-
-    def get_multi_indexes(
-        self,
-        connection,
-        schema=None,
-        filter_names=None,
-        kind=ObjectKind.TABLE,
-        scope=None,
-        **kw,
-    ) -> Dict[Any, List[ReflectedIndex]]:
-        """Return indexes for multiple tables."""
-        logger.debug("PRAGMA index_list not supported; multi-index reflection unavailable")
-        return {}
-
-    def get_multi_unique_constraints(
-        self,
-        connection,
-        schema=None,
-        filter_names=None,
-        kind=ObjectKind.TABLE,
-        scope=None,
-        **kw,
-    ) -> Dict[Any, List[Dict[str, Any]]]:
-        """Return unique constraints for multiple tables."""
-        logger.debug("PRAGMA index_list not supported; multi-unique-constraint reflection unavailable")
-        return {}
-
     def get_multi_foreign_keys(
         self,
         connection,
@@ -150,19 +74,6 @@ class _TursoDialectMixin:
     ) -> Dict[Any, List[ReflectedForeignKeyConstraint]]:
         """Return foreign keys for multiple tables."""
         logger.debug("PRAGMA foreign_key_list not supported; multi-foreign-key reflection unavailable")
-        return {}
-
-    def get_multi_check_constraints(
-        self,
-        connection,
-        schema=None,
-        filter_names=None,
-        kind=ObjectKind.TABLE,
-        scope=None,
-        **kw,
-    ) -> Dict[Any, List[Dict[str, Any]]]:
-        """Return check constraints for multiple tables."""
-        logger.debug("multi-check-constraint reflection not supported")
         return {}
 
     def get_temp_table_names(self, connection, **kw) -> List[str]:

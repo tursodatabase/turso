@@ -251,38 +251,36 @@ All dialects share these overrides via `_TursoDialectMixin` and direct method im
 
 ### Reflection Overrides (via `_TursoDialectMixin`)
 
+Index, unique-constraint, and check-constraint reflection (`get_indexes`,
+`get_unique_constraints`, `get_check_constraints`, and their `get_multi_*`
+counterparts) are inherited from SQLAlchemy's parent SQLite dialect — Turso
+supports `PRAGMA index_list` / `index_info` / `index_xinfo` and returns the
+original DDL via `sqlite_master.sql`.
+
+Only the following remain overridden as empty stubs:
+
 Single-table methods (return empty list):
 - `get_foreign_keys()` - `PRAGMA foreign_key_list` not supported
-- `get_indexes()` - `PRAGMA index_list` not supported
-- `get_unique_constraints()` - Relies on `PRAGMA index_list`
-- `get_check_constraints()` - `sqlite_master` parsing not fully supported
+- `get_temp_table_names()` / `get_temp_view_names()` - no temp database
 
 Multi-table methods (return empty dict):
-- `get_multi_indexes()`
-- `get_multi_unique_constraints()`
 - `get_multi_foreign_keys()`
-- `get_multi_check_constraints()`
 
 ## Limitations
 
 ### Table Reflection
 
-Turso doesn't support some SQLite PRAGMAs used for table reflection:
-- `PRAGMA foreign_key_list` - Foreign key introspection
-- `PRAGMA index_list` - Index introspection
+Foreign-key reflection is not yet supported because Turso has not implemented
+`PRAGMA foreign_key_list`. As a result:
+- `inspector.get_foreign_keys()` returns an empty list
+- Foreign key constraints still **work** at runtime, they just can't be
+  introspected
+- All other reflection (`get_indexes()`, `get_unique_constraints()`,
+  `get_check_constraints()`, `get_table_names()`, `get_columns()`) works
+  normally
 
-This means:
-- `inspector.get_foreign_keys()` returns empty list
-- `inspector.get_indexes()` returns empty list
-- `inspector.get_unique_constraints()` returns empty list
-- `inspector.get_check_constraints()` returns empty list
-- Foreign keys, indexes, and constraints still **work** at runtime, just can't be introspected
-- `inspector.get_table_names()` and `inspector.get_columns()` work normally
-
-This doesn't affect normal usage including:
-- Pandas `df.to_sql()` with `if_exists='replace'`
-- SQLAlchemy ORM operations
-- Alembic migrations (when using `--autogenerate`, manually verify FK/index changes)
+This means Alembic `--autogenerate` will not detect added or dropped foreign
+keys; verify FK changes manually.
 
 ### Native Datetime
 
