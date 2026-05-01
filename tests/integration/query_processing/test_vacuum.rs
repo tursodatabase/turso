@@ -4803,16 +4803,14 @@ fn test_plain_vacuum_empty_table_after_updates(tmp_db: TempDatabase) -> anyhow::
     let updated_odd_payload = "c".repeat(900);
 
     for i in 0..240 {
-        conn.execute(format!("INSERT INTO t VALUES({i}, '{}')", initial_payload))?;
+        conn.execute(format!("INSERT INTO t VALUES({i}, '{initial_payload}')"))?;
     }
 
     conn.execute(format!(
-        "UPDATE t SET payload = '{}' WHERE id % 2 = 0",
-        updated_even_payload
+        "UPDATE t SET payload = '{updated_even_payload}' WHERE id % 2 = 0"
     ))?;
     conn.execute(format!(
-        "UPDATE t SET payload = '{}' WHERE id % 2 = 1",
-        updated_odd_payload
+        "UPDATE t SET payload = '{updated_odd_payload}' WHERE id % 2 = 1"
     ))?;
     conn.execute("DELETE FROM t")?;
 
