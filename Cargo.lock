@@ -6825,7 +6825,7 @@ dependencies = [
 
 [[package]]
 name = "turso_hegel_parity"
-version = "0.6.0-pre.24"
+version = "0.6.0-pre.26"
 dependencies = [
  "hegeltest",
  "serde_json",
@@ -6877,7 +6877,7 @@ dependencies = [
 
 [[package]]
 name = "turso_remote_protocol"
-version = "0.6.0-pre.24"
+version = "0.6.0-pre.26"
 dependencies = [
  "base64 0.22.1",
  "bytes",
@@ -6912,7 +6912,7 @@ dependencies = [
 
 [[package]]
 name = "turso_serverless"
-version = "0.6.0-pre.24"
+version = "0.6.0-pre.26"
 dependencies = [
  "base64 0.22.1",
  "bytes",
@@ -6927,7 +6927,7 @@ dependencies = [
 
 [[package]]
 name = "turso_shared_tests"
-version = "0.6.0-pre.24"
+version = "0.6.0-pre.26"
 dependencies = [
  "tokio",
  "turso",
