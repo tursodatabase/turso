@@ -238,6 +238,7 @@ pub(super) fn find_custom_type_operator<'a>(
 ///
 /// The expression is resolved via `resolve_gencol_expr_columns` and custom-type
 /// columns are decoded in-place in `column_regs`.
+#[turso_macros::trace_stack]
 pub(crate) fn emit_dml_expr_index_value(
     program: &mut ProgramBuilder,
     resolver: &Resolver,
@@ -287,6 +288,7 @@ pub(crate) fn emit_dml_expr_index_value(
 /// Every code path that surfaces a stored column value to the user — SELECT,
 /// RETURNING, trigger OLD/NEW — should go through this function so decode
 /// logic lives in one place.
+#[turso_macros::trace_stack]
 pub(crate) fn emit_user_facing_column_value(
     program: &mut ProgramBuilder,
     source_reg: usize,
@@ -338,6 +340,7 @@ pub(crate) fn emit_user_facing_column_value(
 /// Sets up `value` to reference `value_reg`, and type parameter overrides
 /// from `column.ty_params` matched against `type_def.params`.
 /// The expression result is written to `dest_reg`.
+#[turso_macros::trace_stack]
 pub(crate) fn emit_type_expr<'a, 'r>(
     program: &mut ProgramBuilder,
     expr: &'a ast::Expr,
@@ -358,6 +361,7 @@ pub(crate) fn emit_type_expr<'a, 'r>(
 /// For each column with a custom type decode expression, copies the encoded register
 /// to a new register and emits the decode expression. NULL values are skipped.
 /// Returns a Vec of registers: one per column (decoded or original) plus the rowid at the end.
+#[turso_macros::trace_stack]
 pub(crate) fn emit_trigger_decode_registers(
     program: &mut ProgramBuilder,
     resolver: &Resolver,

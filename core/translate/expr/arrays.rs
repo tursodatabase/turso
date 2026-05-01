@@ -8,6 +8,7 @@ const MAX_ARRAY_LOOP_ELEMENTS: usize = 1024;
 /// Extracts each element, applies `transform_expr` via emit_type_expr,
 /// stores results into contiguous registers, then rebuilds the blob with
 /// MakeArrayDynamic. O(N) instead of O(N²) ArraySetElement per iteration.
+#[turso_macros::trace_stack]
 pub(super) fn emit_array_element_loop(
     program: &mut ProgramBuilder,
     reg: usize,
@@ -124,6 +125,7 @@ pub(super) fn emit_array_element_loop(
 /// elements, and serialize to a native record-format BLOB.
 /// For custom element types with encode expressions, a per-element bytecode loop
 /// normalizes input to blob, applies encode per element, then rebuilds the blob.
+#[turso_macros::trace_stack]
 pub(super) fn emit_array_encode(
     program: &mut ProgramBuilder,
     reg: usize,
@@ -177,6 +179,7 @@ pub(super) fn emit_array_encode(
 /// For base element types, this is a single ArrayDecode instruction.
 /// For custom element types with decode expressions, a per-element loop
 /// extracts elements via ArrayElement, applies decode, then rebuilds the blob.
+#[turso_macros::trace_stack]
 pub(crate) fn emit_array_decode(
     program: &mut ProgramBuilder,
     reg: usize,
@@ -200,6 +203,7 @@ pub(crate) fn emit_array_decode(
 /// If `only_columns` is `Some`, only encode columns whose index is in the set.
 /// This is needed for UPDATE/UPSERT where non-SET columns are already encoded
 /// (read from disk), and re-encoding them would corrupt data.
+#[turso_macros::trace_stack]
 pub(crate) fn emit_custom_type_encode_columns(
     program: &mut ProgramBuilder,
     resolver: &Resolver,
@@ -272,6 +276,7 @@ pub(crate) fn emit_custom_type_encode_columns(
 /// WHERE/SET expressions in DO UPDATE see user-facing values.
 ///
 /// If `only_columns` is `Some`, only decode columns whose index is in the set.
+#[turso_macros::trace_stack]
 pub(crate) fn emit_custom_type_decode_columns(
     program: &mut ProgramBuilder,
     resolver: &Resolver,

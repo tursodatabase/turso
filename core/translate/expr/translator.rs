@@ -46,6 +46,7 @@ pub(super) enum BinaryEmitMode {
 /// Translate an expression into bytecode via [translate_expr()], and forbid any constant values from being hoisted
 /// into the beginning of the program. This is a good idea in most cases where
 /// a register will end up being reused e.g. in a coroutine.
+#[turso_macros::trace_stack]
 pub fn translate_expr_no_constant_opt(
     program: &mut ProgramBuilder,
     referenced_tables: Option<&TableReferences>,
@@ -74,6 +75,7 @@ pub fn translate_expr_no_constant_opt(
 ///
 /// Callers MUST use the returned register — they cannot assume a specific destination.
 #[must_use = "the returned register must be used, because that is where the expression value is stored"]
+#[turso_macros::trace_stack]
 pub fn resolve_expr(
     program: &mut ProgramBuilder,
     referenced_tables: Option<&TableReferences>,
@@ -4819,6 +4821,7 @@ impl<'p, 'a, 'r> IterativeExprTranslator<'p, 'a, 'r> {
 }
 
 #[allow(clippy::too_many_arguments)]
+#[turso_macros::trace_stack]
 pub(super) fn emit_binary_with_mode(
     program: &mut ProgramBuilder,
     emit_mode: BinaryEmitMode,
