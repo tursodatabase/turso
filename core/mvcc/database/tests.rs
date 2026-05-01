@@ -9523,7 +9523,7 @@ fn test_snapshot_stability_full() {
         conn.execute("CREATE INDEX idx_v ON t(v)").unwrap();
         // Pre-existing rows so V_old candidates exist before any tx starts.
         for i in 0..500 {
-            conn.execute(&format!("INSERT INTO t VALUES ({i}, 'v_{i}', NULL)"))
+            conn.execute(format!("INSERT INTO t VALUES ({i}, 'v_{i}', NULL)"))
                 .unwrap();
         }
         conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
@@ -9630,7 +9630,7 @@ fn test_snapshot_stability_full() {
                 let mut aborted = false;
                 'sp: for i in 0..depth {
                     let name = format!("sp_{i}_{}", rng.random::<u32>() % 100_000);
-                    if conn.execute(&format!("SAVEPOINT {name}")).is_err() {
+                    if conn.execute(format!("SAVEPOINT {name}")).is_err() {
                         aborted = true;
                         break 'sp;
                     }
@@ -9665,8 +9665,8 @@ fn test_snapshot_stability_full() {
                 }
                 let rb = (rng.random::<u8>() as usize) % depth;
                 let target = sps[rb].clone();
-                let _ = conn.execute(&format!("ROLLBACK TO {target}"));
-                let _ = conn.execute(&format!("RELEASE {target}"));
+                let _ = conn.execute(format!("ROLLBACK TO {target}"));
+                let _ = conn.execute(format!("RELEASE {target}"));
                 let _ = conn.execute("COMMIT");
                 sp_iters.fetch_add(1, Ordering::Relaxed);
             }
@@ -9717,7 +9717,7 @@ fn test_snapshot_stability_full() {
             let modes = ["PASSIVE", "FULL", "RESTART", "TRUNCATE"];
             let mut idx = 0usize;
             while !stop.load(Ordering::Relaxed) && !mismatch.load(Ordering::Relaxed) {
-                let _ = conn.execute(&format!(
+                let _ = conn.execute(format!(
                     "PRAGMA wal_checkpoint({})",
                     modes[idx % modes.len()]
                 ));
@@ -9738,8 +9738,8 @@ fn test_snapshot_stability_full() {
             let mut i = 0u32;
             while !stop.load(Ordering::Relaxed) && !mismatch.load(Ordering::Relaxed) {
                 let name = format!("idx_dyn_{}", i % 4);
-                let _ = conn.execute(&format!("CREATE INDEX {name} ON t(v)"));
-                let _ = conn.execute(&format!("DROP INDEX {name}"));
+                let _ = conn.execute(format!("CREATE INDEX {name} ON t(v)"));
+                let _ = conn.execute(format!("DROP INDEX {name}"));
                 i = i.wrapping_add(1);
                 ddl_iters.fetch_add(1, Ordering::Relaxed);
             }
