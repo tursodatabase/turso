@@ -9809,3 +9809,241 @@ fn test_read_lock_leak_deferred_then_concurrent() {
     let rows = get_rows(&conn1, "SELECT * FROM t1");
     assert_eq!(rows.len(), 1);
 }
+
+/// Regression test for #5935: DESC index scans must respect MVCC snapshots.
+///
+/// A reverse scan over a secondary index used to terminate as soon as the
+/// last entry was invisible to the current snapshot, instead of continuing
+/// backwards to find the first visible entry. After a concurrent committed
+/// insert, this caused queries with `ORDER BY ... DESC` and `MAX()` over
+/// indexed columns to return empty/NULL results.
+#[test]
+fn test_desc_index_scan_respects_mvcc_snapshot() {
+    let db = MvccTestDbNoConn::new();
+    let conn0 = db.connect();
+    conn0.execute("CREATE TABLE t(id INT, val INT)").unwrap();
+    conn0.execute("CREATE INDEX idx_val ON t(val)").unwrap();
+    conn0.execute("INSERT INTO t VALUES (1, 10)").unwrap();
+    conn0.execute("INSERT INTO t VALUES (2, 20)").unwrap();
+    conn0.execute("INSERT INTO t VALUES (3, 30)").unwrap();
+
+    let conn1 = db.connect();
+    conn1.execute("BEGIN CONCURRENT").unwrap();
+    let rows = get_rows(
+        &conn1,
+        "SELECT id, val FROM t WHERE val > 10 ORDER BY val DESC",
+    );
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0][1].as_int().unwrap(), 30);
+    assert_eq!(rows[1][1].as_int().unwrap(), 20);
+
+    let conn2 = db.connect();
+    conn2.execute("BEGIN CONCURRENT").unwrap();
+    conn2.execute("INSERT INTO t VALUES (4, 100)").unwrap();
+    conn2.execute("COMMIT").unwrap();
+
+    // After concurrent insert+commit, conn1's snapshot should be unchanged.
+    let rows = get_rows(
+        &conn1,
+        "SELECT id, val FROM t WHERE val > 10 ORDER BY val DESC",
+    );
+    assert_eq!(
+        rows.len(),
+        2,
+        "DESC scan should still see 2 rows from snapshot"
+    );
+    assert_eq!(rows[0][1].as_int().unwrap(), 30);
+    assert_eq!(rows[1][1].as_int().unwrap(), 20);
+
+    // MAX() uses a reverse index scan internally and must also be correct.
+    let rows = get_rows(&conn1, "SELECT MAX(val) FROM t");
+    assert_eq!(
+        rows[0][0].as_int().unwrap(),
+        30,
+        "MAX should be 30 from snapshot"
+    );
+
+    // ASC direction (sanity check) should be unaffected.
+    let rows = get_rows(
+        &conn1,
+        "SELECT id, val FROM t WHERE val > 10 ORDER BY val ASC",
+    );
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0][1].as_int().unwrap(), 20);
+    assert_eq!(rows[1][1].as_int().unwrap(), 30);
+
+    // DESC scan with explicit upper bound (uses SeekLT internally rather than Last).
+    let rows = get_rows(
+        &conn1,
+        "SELECT id, val FROM t WHERE val < 200 AND val > 10 ORDER BY val DESC",
+    );
+    assert_eq!(
+        rows.len(),
+        2,
+        "SeekLT-based DESC scan must respect snapshot"
+    );
+    assert_eq!(rows[0][1].as_int().unwrap(), 30);
+    assert_eq!(rows[1][1].as_int().unwrap(), 20);
+}
+
+/// Regression test for #5935: multiple consecutive invisible entries at the
+/// end of the index must be skipped, not terminate the scan.
+#[test]
+fn test_desc_index_scan_skips_multiple_invisible_tail_entries() {
+    let db = MvccTestDbNoConn::new();
+    let conn0 = db.connect();
+    conn0.execute("CREATE TABLE t(id INT, val INT)").unwrap();
+    conn0.execute("CREATE INDEX idx_val ON t(val)").unwrap();
+    conn0.execute("INSERT INTO t VALUES (1, 10)").unwrap();
+    conn0.execute("INSERT INTO t VALUES (2, 20)").unwrap();
+    conn0.execute("INSERT INTO t VALUES (3, 30)").unwrap();
+
+    let conn1 = db.connect();
+    conn1.execute("BEGIN CONCURRENT").unwrap();
+
+    // Two distinct concurrent transactions append rows beyond conn1's snapshot.
+    let conn2 = db.connect();
+    conn2.execute("BEGIN CONCURRENT").unwrap();
+    conn2.execute("INSERT INTO t VALUES (4, 100)").unwrap();
+    conn2.execute("COMMIT").unwrap();
+
+    let conn3 = db.connect();
+    conn3.execute("BEGIN CONCURRENT").unwrap();
+    conn3.execute("INSERT INTO t VALUES (5, 200)").unwrap();
+    conn3.execute("COMMIT").unwrap();
+
+    let rows = get_rows(&conn1, "SELECT MAX(val) FROM t");
+    assert_eq!(
+        rows[0][0].as_int().unwrap(),
+        30,
+        "MAX must skip both invisible tail entries"
+    );
+
+    let rows = get_rows(
+        &conn1,
+        "SELECT id, val FROM t WHERE val > 10 ORDER BY val DESC",
+    );
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0][1].as_int().unwrap(), 30);
+    assert_eq!(rows[1][1].as_int().unwrap(), 20);
+}
+
+/// Regression test: same shape as #5935 but using a checkpointed btree, so
+/// the visible rows live in the b-tree while the MVCC store contains only
+/// the (invisible to conn1) row inserted by conn2.
+#[test]
+fn test_desc_index_scan_respects_mvcc_snapshot_btree_resident() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let conn0 = db.connect();
+    conn0.execute("CREATE TABLE t(id INT, val INT)").unwrap();
+    conn0.execute("CREATE INDEX idx_val ON t(val)").unwrap();
+    conn0.execute("INSERT INTO t VALUES (1, 10)").unwrap();
+    conn0.execute("INSERT INTO t VALUES (2, 20)").unwrap();
+    conn0.execute("INSERT INTO t VALUES (3, 30)").unwrap();
+    conn0.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+    conn0.close().unwrap();
+
+    let conn1 = db.connect();
+    conn1.execute("BEGIN CONCURRENT").unwrap();
+    let rows = get_rows(
+        &conn1,
+        "SELECT id, val FROM t WHERE val > 10 ORDER BY val DESC",
+    );
+    assert_eq!(rows.len(), 2);
+
+    let conn2 = db.connect();
+    conn2.execute("BEGIN CONCURRENT").unwrap();
+    conn2.execute("INSERT INTO t VALUES (4, 100)").unwrap();
+    conn2.execute("COMMIT").unwrap();
+
+    let rows = get_rows(
+        &conn1,
+        "SELECT id, val FROM t WHERE val > 10 ORDER BY val DESC",
+    );
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0][1].as_int().unwrap(), 30);
+    assert_eq!(rows[1][1].as_int().unwrap(), 20);
+
+    let rows = get_rows(&conn1, "SELECT MAX(val) FROM t");
+    assert_eq!(rows[0][0].as_int().unwrap(), 30);
+
+    // SeekLE-based DESC scan must also respect snapshot.
+    let rows = get_rows(
+        &conn1,
+        "SELECT id, val FROM t WHERE val <= 100 ORDER BY val DESC",
+    );
+    assert_eq!(rows.len(), 3);
+    assert_eq!(rows[0][1].as_int().unwrap(), 30);
+    assert_eq!(rows[1][1].as_int().unwrap(), 20);
+    assert_eq!(rows[2][1].as_int().unwrap(), 10);
+}
+
+/// Regression test for #5935: a DESC scan with a tight upper bound that
+/// would seek strictly below the invisible region. Verifies the seek itself
+/// is not poisoned by an invisible entry that the underlying iterator may
+/// traverse over.
+#[test]
+fn test_desc_index_scan_seek_lt_below_invisible_region() {
+    let db = MvccTestDbNoConn::new();
+    let conn0 = db.connect();
+    conn0.execute("CREATE TABLE t(id INT, val INT)").unwrap();
+    conn0.execute("CREATE INDEX idx_val ON t(val)").unwrap();
+    conn0.execute("INSERT INTO t VALUES (1, 10)").unwrap();
+    conn0.execute("INSERT INTO t VALUES (2, 20)").unwrap();
+    conn0.execute("INSERT INTO t VALUES (3, 30)").unwrap();
+
+    let conn1 = db.connect();
+    conn1.execute("BEGIN CONCURRENT").unwrap();
+
+    let conn2 = db.connect();
+    conn2.execute("BEGIN CONCURRENT").unwrap();
+    conn2.execute("INSERT INTO t VALUES (4, 100)").unwrap();
+    conn2.execute("COMMIT").unwrap();
+
+    // Upper bound is below the invisible (100) row, so the seek lands
+    // squarely in the visible region. Result must be the visible rows
+    // strictly less than 50.
+    let rows = get_rows(
+        &conn1,
+        "SELECT id, val FROM t WHERE val < 50 ORDER BY val DESC",
+    );
+    assert_eq!(rows.len(), 3);
+    assert_eq!(rows[0][1].as_int().unwrap(), 30);
+    assert_eq!(rows[1][1].as_int().unwrap(), 20);
+    assert_eq!(rows[2][1].as_int().unwrap(), 10);
+}
+
+/// Regression test for #5935: a concurrent insert that *aborts* must also
+/// remain invisible to conn1's snapshot. Exercises the aborted-version
+/// branch of the visibility check on the reverse iteration path.
+#[test]
+fn test_desc_index_scan_skips_aborted_concurrent_insert() {
+    let db = MvccTestDbNoConn::new();
+    let conn0 = db.connect();
+    conn0.execute("CREATE TABLE t(id INT, val INT)").unwrap();
+    conn0.execute("CREATE INDEX idx_val ON t(val)").unwrap();
+    conn0.execute("INSERT INTO t VALUES (1, 10)").unwrap();
+    conn0.execute("INSERT INTO t VALUES (2, 20)").unwrap();
+    conn0.execute("INSERT INTO t VALUES (3, 30)").unwrap();
+
+    let conn1 = db.connect();
+    conn1.execute("BEGIN CONCURRENT").unwrap();
+
+    let conn2 = db.connect();
+    conn2.execute("BEGIN CONCURRENT").unwrap();
+    conn2.execute("INSERT INTO t VALUES (4, 100)").unwrap();
+    conn2.execute("ROLLBACK").unwrap();
+
+    // The rollback leaves an aborted version in the MVCC store at val=100;
+    // it must be skipped on the reverse path.
+    let rows = get_rows(&conn1, "SELECT MAX(val) FROM t");
+    assert_eq!(rows[0][0].as_int().unwrap(), 30);
+
+    let rows = get_rows(
+        &conn1,
+        "SELECT id, val FROM t WHERE val > 10 ORDER BY val DESC",
+    );
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0][1].as_int().unwrap(), 30);
+    assert_eq!(rows[1][1].as_int().unwrap(), 20);
+}
