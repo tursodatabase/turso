@@ -2452,6 +2452,15 @@ pub fn insn_to_row(
             0,
             format!("ensure turso_cdc_version({cdc_table_name}, {version}); set cdc={cdc_mode}"),
         ),
+        Insn::MvccFkRegisterParentDep { parent_root_page, parent_rowid_reg, db } => (
+            "MvccFkRegisterParentDep",
+            *parent_root_page,
+            *parent_rowid_reg as i64,
+            *db as i64,
+            Value::Null,
+            0,
+            "register parent FK dep for MVCC commit validation".to_string(),
+        ),
     }
 }
 

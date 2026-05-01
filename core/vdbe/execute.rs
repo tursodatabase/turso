@@ -13346,6 +13346,38 @@ pub fn op_fk_check(
     Ok(InsnFunctionStepResult::Step)
 }
 
+/// Register a parent FK dependency in the active MVCC transaction so the FK
+/// constraint can be re-validated at commit time against concurrent
+/// transactions (issue #5955). No-op when MVCC is inactive on the relevant DB
+/// or when the connection has no active MVCC transaction.
+pub fn op_mvcc_fk_register_parent_dep(
+    program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+    _pager: &Arc<Pager>,
+) -> Result<InsnFunctionStepResult> {
+    load_insn!(
+        MvccFkRegisterParentDep {
+            parent_root_page,
+            parent_rowid_reg,
+            db,
+        },
+        insn
+    );
+    let conn = &program.connection;
+    if let Some(mv_store) = conn.mv_store_for_db(*db) {
+        if let Some(tx_id) = conn.get_mv_tx_id_for_db(*db) {
+            if let Value::Numeric(Numeric::Integer(rowid)) =
+                state.registers[*parent_rowid_reg].get_value()
+            {
+                mv_store.register_fk_parent_dependency(tx_id, *parent_root_page, *rowid);
+            }
+        }
+    }
+    state.pc += 1;
+    Ok(InsnFunctionStepResult::Step)
+}
+
 pub fn op_hash_build(
     program: &Program,
     state: &mut ProgramState,

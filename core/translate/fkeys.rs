@@ -937,6 +937,13 @@ pub fn emit_fk_child_update_counters(
                 rowid_reg: tmp,
                 target_pc: violation,
             });
+            // Parent found: register cross-tx FK dependency for MVCC commit
+            // validation (issue #5955). No-op outside MVCC.
+            program.emit_insn(Insn::MvccFkRegisterParentDep {
+                parent_root_page: parent_tbl.root_page,
+                parent_rowid_reg: tmp,
+                db: database_id,
+            });
             // found: close and continue
             program.emit_insn(Insn::Close { cursor_id: pcur });
             program.emit_insn(Insn::Goto { target_pc: fk_ok });
@@ -982,12 +989,28 @@ pub fn emit_fk_child_update_counters(
             };
 
             // FOUND: ok; NOT FOUND: violation path
+            let parent_root_page = parent_tbl.root_page;
+            let db_id = database_id;
             index_probe(
                 program,
                 icur,
                 probe,
                 ncols,
-                |_p| Ok(()),
+                // on_found: register cross-tx FK dependency for MVCC commit
+                // validation (issue #5955).
+                |p| {
+                    let rid_reg = p.alloc_register();
+                    p.emit_insn(Insn::IdxRowId {
+                        cursor_id: icur,
+                        dest: rid_reg,
+                    });
+                    p.emit_insn(Insn::MvccFkRegisterParentDep {
+                        parent_root_page,
+                        parent_rowid_reg: rid_reg,
+                        db: db_id,
+                    });
+                    Ok(())
+                },
                 |p| {
                     emit_fk_violation(p, &fk_ref.fk)?;
                     Ok(())

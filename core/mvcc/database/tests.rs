@@ -3375,6 +3375,7 @@ fn new_tx(tx_id: TxID, begin_ts: u64, state: TransactionState) -> Transaction {
         begin_ts,
         write_set: SkipSet::new(),
         read_set: SkipSet::new(),
+        fk_parent_dep_set: SkipSet::new(),
         header: RwLock::new(DatabaseHeader::default()),
         header_dirty: AtomicBool::new(false),
         savepoint_stack: RwLock::new(Vec::new()),
@@ -4743,6 +4744,7 @@ fn transaction_display() {
         begin_ts,
         write_set,
         read_set,
+        fk_parent_dep_set: SkipSet::new(),
         header: RwLock::new(DatabaseHeader::default()),
         header_dirty: AtomicBool::new(false),
         savepoint_stack: RwLock::new(Vec::new()),
@@ -9521,7 +9523,7 @@ fn test_snapshot_stability_full() {
         conn.execute("CREATE INDEX idx_v ON t(v)").unwrap();
         // Pre-existing rows so V_old candidates exist before any tx starts.
         for i in 0..500 {
-            conn.execute(&format!("INSERT INTO t VALUES ({i}, 'v_{i}', NULL)"))
+            conn.execute(format!("INSERT INTO t VALUES ({i}, 'v_{i}', NULL)"))
                 .unwrap();
         }
         conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
@@ -9628,7 +9630,7 @@ fn test_snapshot_stability_full() {
                 let mut aborted = false;
                 'sp: for i in 0..depth {
                     let name = format!("sp_{i}_{}", rng.random::<u32>() % 100_000);
-                    if conn.execute(&format!("SAVEPOINT {name}")).is_err() {
+                    if conn.execute(format!("SAVEPOINT {name}")).is_err() {
                         aborted = true;
                         break 'sp;
                     }
@@ -9663,8 +9665,8 @@ fn test_snapshot_stability_full() {
                 }
                 let rb = (rng.random::<u8>() as usize) % depth;
                 let target = sps[rb].clone();
-                let _ = conn.execute(&format!("ROLLBACK TO {target}"));
-                let _ = conn.execute(&format!("RELEASE {target}"));
+                let _ = conn.execute(format!("ROLLBACK TO {target}"));
+                let _ = conn.execute(format!("RELEASE {target}"));
                 let _ = conn.execute("COMMIT");
                 sp_iters.fetch_add(1, Ordering::Relaxed);
             }
@@ -9715,7 +9717,7 @@ fn test_snapshot_stability_full() {
             let modes = ["PASSIVE", "FULL", "RESTART", "TRUNCATE"];
             let mut idx = 0usize;
             while !stop.load(Ordering::Relaxed) && !mismatch.load(Ordering::Relaxed) {
-                let _ = conn.execute(&format!(
+                let _ = conn.execute(format!(
                     "PRAGMA wal_checkpoint({})",
                     modes[idx % modes.len()]
                 ));
@@ -9736,8 +9738,8 @@ fn test_snapshot_stability_full() {
             let mut i = 0u32;
             while !stop.load(Ordering::Relaxed) && !mismatch.load(Ordering::Relaxed) {
                 let name = format!("idx_dyn_{}", i % 4);
-                let _ = conn.execute(&format!("CREATE INDEX {name} ON t(v)"));
-                let _ = conn.execute(&format!("DROP INDEX {name}"));
+                let _ = conn.execute(format!("CREATE INDEX {name} ON t(v)"));
+                let _ = conn.execute(format!("DROP INDEX {name}"));
                 i = i.wrapping_add(1);
                 ddl_iters.fetch_add(1, Ordering::Relaxed);
             }
@@ -9808,4 +9810,263 @@ fn test_read_lock_leak_deferred_then_concurrent() {
     // After the error, SELECT should work without panicking
     let rows = get_rows(&conn1, "SELECT * FROM t1");
     assert_eq!(rows.len(), 1);
+}
+
+/// Issue #5955: Two CONCURRENT transactions must not commit changes that together
+/// violate a foreign key constraint. Each transaction's FK check passes against
+/// its own snapshot, but the merged committed state would have a child row
+/// referencing a non-existent parent. The second committer must abort.
+#[test]
+fn test_fk_violation_through_concurrent_transactions_insert_child_after_delete_parent() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let setup = db.connect();
+    setup.execute("PRAGMA foreign_keys = ON").unwrap();
+    setup
+        .execute("CREATE TABLE parent(id INTEGER PRIMARY KEY)")
+        .unwrap();
+    setup
+        .execute(
+            "CREATE TABLE child(id INTEGER PRIMARY KEY, parent_id INTEGER REFERENCES parent(id))",
+        )
+        .unwrap();
+    setup.execute("INSERT INTO parent VALUES (1)").unwrap();
+    setup.execute("INSERT INTO parent VALUES (2)").unwrap();
+    setup.close().unwrap();
+
+    let conn0 = db.connect();
+    let conn1 = db.connect();
+    conn0.execute("PRAGMA foreign_keys = ON").unwrap();
+    conn1.execute("PRAGMA foreign_keys = ON").unwrap();
+
+    conn0.execute("BEGIN CONCURRENT").unwrap();
+    conn1.execute("BEGIN CONCURRENT").unwrap();
+    conn0.execute("DELETE FROM parent WHERE id = 2").unwrap();
+    conn1.execute("INSERT INTO child VALUES (1, 2)").unwrap();
+    conn0.execute("COMMIT").unwrap();
+
+    // conn1 COMMIT should fail — parent id=2 was deleted by conn0
+    let result = conn1.execute("COMMIT");
+    assert!(
+        matches!(&result, Err(LimboError::ForeignKeyConstraint(_))),
+        "COMMIT should fail with FK violation: child references non-existent parent id=2; got {result:?}"
+    );
+
+    // Final state should not contain the orphan child row.
+    let conn2 = db.connect();
+    let parents = get_rows(&conn2, "SELECT id FROM parent ORDER BY id");
+    assert_eq!(parents.len(), 1);
+    assert_eq!(parents[0][0].as_int().unwrap(), 1);
+    let children = get_rows(&conn2, "SELECT id, parent_id FROM child");
+    assert!(
+        children.is_empty(),
+        "expected no orphan child rows; got {children:?}"
+    );
+}
+
+/// Sibling case: a transaction that did NOT touch FK relationships should still
+/// commit successfully when concurrent transactions also commit.
+#[test]
+fn test_fk_concurrent_transactions_no_dependency_both_commit() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let setup = db.connect();
+    setup.execute("PRAGMA foreign_keys = ON").unwrap();
+    setup
+        .execute("CREATE TABLE parent(id INTEGER PRIMARY KEY)")
+        .unwrap();
+    setup
+        .execute(
+            "CREATE TABLE child(id INTEGER PRIMARY KEY, parent_id INTEGER REFERENCES parent(id))",
+        )
+        .unwrap();
+    setup.execute("INSERT INTO parent VALUES (1)").unwrap();
+    setup.execute("INSERT INTO parent VALUES (2)").unwrap();
+    setup.close().unwrap();
+
+    let conn0 = db.connect();
+    let conn1 = db.connect();
+    conn0.execute("PRAGMA foreign_keys = ON").unwrap();
+    conn1.execute("PRAGMA foreign_keys = ON").unwrap();
+
+    conn0.execute("BEGIN CONCURRENT").unwrap();
+    conn1.execute("BEGIN CONCURRENT").unwrap();
+    // conn0 deletes parent 2; conn1 inserts a child referencing parent 1 (a different parent).
+    conn0.execute("DELETE FROM parent WHERE id = 2").unwrap();
+    conn1.execute("INSERT INTO child VALUES (1, 1)").unwrap();
+    conn0.execute("COMMIT").unwrap();
+    conn1.execute("COMMIT").unwrap();
+
+    let conn2 = db.connect();
+    let parents = get_rows(&conn2, "SELECT id FROM parent ORDER BY id");
+    assert_eq!(parents.len(), 1);
+    assert_eq!(parents[0][0].as_int().unwrap(), 1);
+    let children = get_rows(&conn2, "SELECT id, parent_id FROM child ORDER BY id");
+    assert_eq!(children.len(), 1);
+    assert_eq!(children[0][0].as_int().unwrap(), 1);
+    assert_eq!(children[0][1].as_int().unwrap(), 1);
+}
+
+/// Reverse temporal order from issue #5955: when the INSERT child commits FIRST
+/// and DELETE parent commits SECOND, the second committer (parent deleter) must
+/// abort because the merged state would have a child referencing a non-existent
+/// parent.
+#[test]
+fn test_fk_violation_through_concurrent_transactions_delete_parent_after_insert_child() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let setup = db.connect();
+    setup.execute("PRAGMA foreign_keys = ON").unwrap();
+    setup
+        .execute("CREATE TABLE parent(id INTEGER PRIMARY KEY)")
+        .unwrap();
+    setup
+        .execute(
+            "CREATE TABLE child(id INTEGER PRIMARY KEY, parent_id INTEGER REFERENCES parent(id))",
+        )
+        .unwrap();
+    setup.execute("INSERT INTO parent VALUES (1)").unwrap();
+    setup.execute("INSERT INTO parent VALUES (2)").unwrap();
+    setup.close().unwrap();
+
+    let conn0 = db.connect();
+    let conn1 = db.connect();
+    conn0.execute("PRAGMA foreign_keys = ON").unwrap();
+    conn1.execute("PRAGMA foreign_keys = ON").unwrap();
+
+    conn0.execute("BEGIN CONCURRENT").unwrap();
+    conn1.execute("BEGIN CONCURRENT").unwrap();
+    conn0.execute("DELETE FROM parent WHERE id = 2").unwrap();
+    conn1.execute("INSERT INTO child VALUES (1, 2)").unwrap();
+    // Reverse commit order from the prior test: child INSERT commits FIRST.
+    conn1.execute("COMMIT").unwrap();
+    let result = conn0.execute("COMMIT");
+    assert!(
+        matches!(&result, Err(LimboError::ForeignKeyConstraint(_))),
+        "DELETE parent after concurrent INSERT child must fail at commit; got {result:?}"
+    );
+
+    let conn2 = db.connect();
+    let parents = get_rows(&conn2, "SELECT id FROM parent ORDER BY id");
+    assert_eq!(parents.len(), 2);
+    let children = get_rows(&conn2, "SELECT id, parent_id FROM child ORDER BY id");
+    assert_eq!(children.len(), 1);
+    assert_eq!(children[0][1].as_int().unwrap(), 2);
+}
+
+/// Same as the asymmetric test but using a UNIQUE index parent reference
+/// (FK references a non-rowid column with a UNIQUE index). Verifies the
+/// index-based FK probe path also registers cross-tx dependencies.
+#[test]
+fn test_fk_violation_through_concurrent_transactions_unique_index_parent() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let setup = db.connect();
+    setup.execute("PRAGMA foreign_keys = ON").unwrap();
+    setup
+        .execute("CREATE TABLE parent(id INTEGER PRIMARY KEY, code TEXT UNIQUE)")
+        .unwrap();
+    setup
+        .execute("CREATE TABLE child(id INTEGER PRIMARY KEY, code TEXT REFERENCES parent(code))")
+        .unwrap();
+    setup
+        .execute("INSERT INTO parent VALUES (1, 'A'), (2, 'B')")
+        .unwrap();
+    setup.close().unwrap();
+
+    let conn0 = db.connect();
+    let conn1 = db.connect();
+    conn0.execute("PRAGMA foreign_keys = ON").unwrap();
+    conn1.execute("PRAGMA foreign_keys = ON").unwrap();
+
+    conn0.execute("BEGIN CONCURRENT").unwrap();
+    conn1.execute("BEGIN CONCURRENT").unwrap();
+    conn0
+        .execute("DELETE FROM parent WHERE code = 'B'")
+        .unwrap();
+    conn1.execute("INSERT INTO child VALUES (1, 'B')").unwrap();
+    conn0.execute("COMMIT").unwrap();
+
+    let result = conn1.execute("COMMIT");
+    assert!(
+        matches!(&result, Err(LimboError::ForeignKeyConstraint(_))),
+        "INSERT child via UNIQUE-index FK to a concurrently-deleted parent must fail; got {result:?}"
+    );
+}
+
+/// Aborted transactions must release their FK parent dependency entries so
+/// they don't haunt subsequent committers.
+#[test]
+fn test_fk_dep_index_cleared_on_rollback() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let setup = db.connect();
+    setup.execute("PRAGMA foreign_keys = ON").unwrap();
+    setup
+        .execute("CREATE TABLE parent(id INTEGER PRIMARY KEY)")
+        .unwrap();
+    setup
+        .execute(
+            "CREATE TABLE child(id INTEGER PRIMARY KEY, parent_id INTEGER REFERENCES parent(id))",
+        )
+        .unwrap();
+    setup.execute("INSERT INTO parent VALUES (1), (2)").unwrap();
+    setup.close().unwrap();
+
+    let conn0 = db.connect();
+    let conn1 = db.connect();
+    conn0.execute("PRAGMA foreign_keys = ON").unwrap();
+    conn1.execute("PRAGMA foreign_keys = ON").unwrap();
+
+    // conn1 starts an INSERT against parent id=2 then rolls back: its FK dep
+    // on parent id=2 must be released.
+    conn1.execute("BEGIN CONCURRENT").unwrap();
+    conn1.execute("INSERT INTO child VALUES (1, 2)").unwrap();
+    conn1.execute("ROLLBACK").unwrap();
+
+    // conn0 should now be free to delete parent id=2 without false conflict.
+    conn0.execute("BEGIN CONCURRENT").unwrap();
+    conn0.execute("DELETE FROM parent WHERE id = 2").unwrap();
+    conn0
+        .execute("COMMIT")
+        .expect("rolled-back FK dep must not block subsequent parent delete");
+
+    let conn2 = db.connect();
+    let parents = get_rows(&conn2, "SELECT id FROM parent ORDER BY id");
+    assert_eq!(parents.len(), 1);
+    assert_eq!(parents[0][0].as_int().unwrap(), 1);
+}
+
+/// UPDATE that changes a child's FK column to a now-deleted parent must also fail.
+#[test]
+fn test_fk_violation_through_concurrent_transactions_update_child_to_deleted_parent() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let setup = db.connect();
+    setup.execute("PRAGMA foreign_keys = ON").unwrap();
+    setup
+        .execute("CREATE TABLE parent(id INTEGER PRIMARY KEY)")
+        .unwrap();
+    setup
+        .execute(
+            "CREATE TABLE child(id INTEGER PRIMARY KEY, parent_id INTEGER REFERENCES parent(id))",
+        )
+        .unwrap();
+    setup.execute("INSERT INTO parent VALUES (1)").unwrap();
+    setup.execute("INSERT INTO parent VALUES (2)").unwrap();
+    setup.execute("INSERT INTO child VALUES (10, 1)").unwrap();
+    setup.close().unwrap();
+
+    let conn0 = db.connect();
+    let conn1 = db.connect();
+    conn0.execute("PRAGMA foreign_keys = ON").unwrap();
+    conn1.execute("PRAGMA foreign_keys = ON").unwrap();
+
+    conn0.execute("BEGIN CONCURRENT").unwrap();
+    conn1.execute("BEGIN CONCURRENT").unwrap();
+    conn0.execute("DELETE FROM parent WHERE id = 2").unwrap();
+    conn1
+        .execute("UPDATE child SET parent_id = 2 WHERE id = 10")
+        .unwrap();
+    conn0.execute("COMMIT").unwrap();
+
+    let result = conn1.execute("COMMIT");
+    assert!(
+        matches!(&result, Err(LimboError::ForeignKeyConstraint(_))),
+        "UPDATE child to a concurrently-deleted parent must fail at commit; got {result:?}"
+    );
 }

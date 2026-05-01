@@ -3920,6 +3920,13 @@ pub fn emit_fk_child_insert_checks(
                 rowid_reg: tmp,
                 target_pc: violation,
             });
+            // Parent found: register cross-tx FK dependency for MVCC commit
+            // validation (issue #5955). No-op outside MVCC.
+            program.emit_insn(Insn::MvccFkRegisterParentDep {
+                parent_root_page: parent_tbl.root_page,
+                parent_rowid_reg: tmp,
+                db: database_id,
+            });
             program.emit_insn(Insn::Close { cursor_id: pcur });
             program.emit_insn(Insn::Goto { target_pc: fk_ok });
 
@@ -4011,13 +4018,29 @@ pub fn emit_fk_child_insert_checks(
                 program.emit_insn(Insn::Goto { target_pc: fk_ok });
                 program.preassign_label_to_next_insn(mismatch);
             }
+            let parent_root_page = parent_tbl.root_page;
+            let db_id = database_id;
             index_probe(
                 program,
                 icur,
                 probe,
                 ncols,
-                // on_found: parent exists, FK satisfied
-                |_p| Ok(()),
+                // on_found: parent exists, FK satisfied. Register cross-tx FK
+                // dependency for MVCC commit validation (issue #5955). The
+                // parent table rowid is read from the index cursor.
+                |p| {
+                    let rid_reg = p.alloc_register();
+                    p.emit_insn(Insn::IdxRowId {
+                        cursor_id: icur,
+                        dest: rid_reg,
+                    });
+                    p.emit_insn(Insn::MvccFkRegisterParentDep {
+                        parent_root_page,
+                        parent_rowid_reg: rid_reg,
+                        db: db_id,
+                    });
+                    Ok(())
+                },
                 // on_not_found: immediate → Halt; deferred → counter
                 |p| {
                     if fk_ref.fk.deferred {

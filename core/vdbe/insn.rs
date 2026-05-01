@@ -1614,6 +1614,16 @@ pub enum Insn {
     FkCheck {
         deferred: bool,
     },
+    /// Register a foreign-key parent dependency in the active MVCC transaction.
+    /// Emitted after a successful parent existence probe during INSERT/UPDATE on
+    /// a child row, so the FK relationship can be re-validated at commit time
+    /// against concurrent transactions (issue #5955). No-op when MVCC is not
+    /// the active journal mode.
+    MvccFkRegisterParentDep {
+        parent_root_page: i64,
+        parent_rowid_reg: usize,
+        db: usize,
+    },
 
     /// Build a hash table from a cursor for hash join.
     HashBuild {
@@ -1980,6 +1990,7 @@ impl InsnVariants {
             InsnVariants::FkCounter => execute::op_fk_counter,
             InsnVariants::FkIfZero => execute::op_fk_if_zero,
             InsnVariants::FkCheck => execute::op_fk_check,
+            InsnVariants::MvccFkRegisterParentDep => execute::op_mvcc_fk_register_parent_dep,
             InsnVariants::VBegin => execute::op_vbegin,
             InsnVariants::VRename => execute::op_vrename,
             InsnVariants::FilterAdd => execute::op_filter_add,

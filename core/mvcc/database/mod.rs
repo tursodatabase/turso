@@ -465,6 +465,15 @@ pub struct Transaction {
     write_set: SkipSet<RowID>,
     /// The transaction read set.
     read_set: SkipSet<RowID>,
+    /// Parent rows that this transaction's INSERTs/UPDATEs of child rows
+    /// depend on for foreign key validity. Each entry is a parent table row
+    /// that was probed (and found) during an FK check on a child write.
+    /// Validated at commit: if any of these rows have been deleted by a
+    /// concurrently committed transaction, the FK constraint would be
+    /// violated by the merged state, so we abort with [LimboError::ForeignKeyConstraint].
+    /// Snapshot isolation alone does not catch this cross-table write skew —
+    /// see issue #5955.
+    fk_parent_dep_set: SkipSet<RowID>,
     /// The transaction header.
     header: RwLock<DatabaseHeader>,
     /// True when the transaction mutated its local database header snapshot.
@@ -496,6 +505,7 @@ impl Transaction {
             begin_ts,
             write_set: SkipSet::new(),
             read_set: SkipSet::new(),
+            fk_parent_dep_set: SkipSet::new(),
             header: RwLock::new(header),
             header_dirty: AtomicBool::new(false),
             savepoint_stack: RwLock::new(Vec::new()),
@@ -508,6 +518,10 @@ impl Transaction {
 
     fn insert_to_read_set(&self, id: RowID) {
         self.read_set.insert(id);
+    }
+
+    fn insert_to_fk_parent_dep_set(&self, id: RowID) {
+        self.fk_parent_dep_set.insert(id);
     }
 
     fn insert_to_write_set(&self, id: RowID) {
@@ -1720,6 +1734,40 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
                     }
                 }
 
+                // Foreign-key cross-transaction validation (issue #5955).
+                // Two complementary checks:
+                //
+                // 1. As a child-side INSERT/UPDATE committer: if any of the
+                //    parent rows we relied on for FK validity is no longer
+                //    visible at our commit timestamp (because a concurrent
+                //    transaction committed a delete after our begin), the
+                //    merged state would have a child referencing a
+                //    non-existent parent. Abort.
+                for parent_rowid in tx.fk_parent_dep_set.iter() {
+                    if !mvcc_store.is_row_visible_at_ts(parent_rowid.value(), *end_ts) {
+                        return Err(LimboError::ForeignKeyConstraint(
+                            "FOREIGN KEY constraint failed (parent row deleted by concurrent transaction)".to_string(),
+                        ));
+                    }
+                }
+
+                // 2. As a parent-side DELETE/UPDATE committer: if any
+                //    concurrent transaction has registered an FK dependency on
+                //    a row we are deleting, and that transaction has committed
+                //    (or is concurrently preparing) since we began, the merged
+                //    state would orphan its child row. Abort.
+                for rowid in &self.write_set {
+                    if mvcc_store.has_concurrent_fk_dependent_committer(
+                        rowid,
+                        self.tx_id,
+                        tx.begin_ts,
+                    ) {
+                        return Err(LimboError::ForeignKeyConstraint(
+                            "FOREIGN KEY constraint failed (parent row referenced by concurrent transaction)".to_string(),
+                        ));
+                    }
+                }
+
                 // Validation passed. Wait for commit dependencies before building
                 // the durable commit record. The live row versions must stay on
                 // TxID references until CommitEnd so an abandoned commit can
@@ -2295,6 +2343,17 @@ pub struct MvStore<Clock: LogicalClock> {
     /// to exclusive, it will abort if another transaction committed after its begin timestamp.
     last_committed_tx_ts: AtomicU64,
     table_id_to_last_rowid: RwLock<HashMap<MVTableId, Arc<RowidAllocator>>>,
+    /// Reverse index of foreign-key parent dependencies: for each parent rowid
+    /// that any in-flight or recently-committed transaction has registered as
+    /// an FK dependency (via INSERT/UPDATE on a child row), the set of
+    /// transaction IDs that registered it.
+    ///
+    /// At commit time, when a transaction wants to delete or PK-modify a
+    /// parent row, it consults this index to detect concurrent committed
+    /// child INSERTs that would be orphaned by the delete (issue #5955).
+    /// Entries are cleared when the originating transaction's tx state is
+    /// no longer needed by any concurrent reader.
+    fk_parent_dep_index: SkipMap<RowID, SkipSet<TxID>>,
 }
 
 impl<Clock: LogicalClock> MvStore<Clock> {
@@ -2369,7 +2428,164 @@ impl<Clock: LogicalClock> MvStore<Clock> {
             last_committed_schema_change_ts: AtomicU64::new(0),
             last_committed_tx_ts: AtomicU64::new(0),
             table_id_to_last_rowid: RwLock::new(HashMap::default()),
+            fk_parent_dep_index: SkipMap::new(),
         }
+    }
+
+    /// Register a parent row that this transaction's INSERT/UPDATE depends on
+    /// for foreign key validity. Validated at commit time.
+    ///
+    /// `parent_root_page` is the root page of the parent table as known to the
+    /// schema; resolved to an [MVTableId] internally.
+    pub fn register_fk_parent_dependency(
+        &self,
+        tx_id: TxID,
+        parent_root_page: i64,
+        parent_rowid: i64,
+    ) {
+        let Some(tx_entry) = self.txs.get(&tx_id) else {
+            return;
+        };
+        let table_id = self.get_table_id_from_root_page(parent_root_page);
+        let row_id = RowID::new(table_id, RowKey::Int(parent_rowid));
+        tx_entry.value().insert_to_fk_parent_dep_set(row_id.clone());
+        // Mirror in the reverse global index so a concurrent DELETE/UPDATE of
+        // this parent row can detect the dependency at commit time even after
+        // we've finalized.
+        self.fk_parent_dep_index
+            .get_or_insert_with(row_id, SkipSet::new)
+            .value()
+            .insert(tx_id);
+    }
+
+    /// Returns true if any other transaction (committed concurrently or still
+    /// in-flight) has registered an FK parent dependency on `parent_rowid`.
+    /// Used by a parent-row deleter at commit time to detect cross-transaction
+    /// FK conflicts (issue #5955).
+    fn has_concurrent_fk_dependent_committer(
+        &self,
+        parent_rowid: &RowID,
+        self_tx_id: TxID,
+        self_begin_ts: u64,
+    ) -> bool {
+        let Some(entry) = self.fk_parent_dep_index.get(parent_rowid) else {
+            return false;
+        };
+        for tx_id_entry in entry.value().iter() {
+            let dep_tx_id = *tx_id_entry.value();
+            if dep_tx_id == self_tx_id {
+                continue;
+            }
+            match lookup_tx_state(&self.txs, &self.finalized_tx_states, dep_tx_id) {
+                // A concurrent committed inserter would orphan the row we are
+                // about to delete. Concurrent here means committed after our
+                // begin timestamp.
+                Some(TransactionState::Committed(committed_ts)) if committed_ts > self_begin_ts => {
+                    return true;
+                }
+                // Preparing concurrently — conservatively treat as conflict to
+                // avoid relying on speculative-read commit dependencies for FK
+                // correctness. False positives only happen on rare commit
+                // races and just force a retry.
+                Some(TransactionState::Preparing(_)) => {
+                    return true;
+                }
+                _ => {}
+            }
+        }
+        false
+    }
+
+    /// Drop all FK parent dependency index entries registered by `tx_id`.
+    /// The index is consulted only by parent-side committers that need to
+    /// detect concurrent child INSERTs; once `tx_id` has been finalized AND
+    /// no concurrent committer can have a `begin_ts < tx_id`'s commit_ts,
+    /// the entry is no longer load-bearing.
+    pub(crate) fn purge_fk_parent_dep_index_for_tx(&self, tx_id: TxID) {
+        // Walk the tx's local set so this is O(deps) instead of O(global index).
+        // The Transaction struct may already be gone (post-finalize); in that
+        // case we can't drive the cleanup here. The fallback path below scans
+        // the whole index. The fast path is taken when the tx is still in
+        // `txs` (typical for rollback / immediately-after-commit cleanup).
+        if let Some(tx_entry) = self.txs.get(&tx_id) {
+            for dep_entry in tx_entry.value().fk_parent_dep_set.iter() {
+                let row_id = dep_entry.value();
+                if let Some(set_entry) = self.fk_parent_dep_index.get(row_id) {
+                    set_entry.value().remove(&tx_id);
+                    if set_entry.value().is_empty() {
+                        self.fk_parent_dep_index.remove(row_id);
+                    }
+                }
+            }
+            return;
+        }
+        // Fallback: tx_id finalized and removed from `txs`. Scan whole index.
+        let mut empty_keys: Vec<RowID> = Vec::new();
+        for entry in self.fk_parent_dep_index.iter() {
+            entry.value().remove(&tx_id);
+            if entry.value().is_empty() {
+                empty_keys.push(entry.key().clone());
+            }
+        }
+        for key in empty_keys {
+            if let Some(entry) = self.fk_parent_dep_index.get(&key) {
+                if entry.value().is_empty() {
+                    self.fk_parent_dep_index.remove(&key);
+                }
+            }
+        }
+    }
+
+    /// Check whether `row_id` is still visible (not deleted) at `at_ts`,
+    /// considering committed and in-flight versions. If a concurrent
+    /// transaction (committed by `at_ts` or speculatively visible) has deleted
+    /// the row, returns false.
+    fn is_row_visible_at_ts(&self, row_id: &RowID, at_ts: u64) -> bool {
+        let Some(rows) = self.rows.get(row_id) else {
+            return false;
+        };
+        let row_versions = rows.value().read();
+        // Walk versions newest-first looking for one whose [begin, end) covers at_ts.
+        for v in row_versions.iter().rev() {
+            // Check end first - if the row is deleted before at_ts, not visible
+            let end_visible = match v.end {
+                None => true,
+                Some(TxTimestampOrID::Timestamp(end_ts)) => end_ts > at_ts,
+                Some(TxTimestampOrID::TxID(end_tx)) => {
+                    match lookup_tx_state(&self.txs, &self.finalized_tx_states, end_tx) {
+                        Some(TransactionState::Committed(committed_ts)) => committed_ts > at_ts,
+                        Some(TransactionState::Preparing(end_ts)) => end_ts > at_ts,
+                        Some(TransactionState::Active) => true,
+                        Some(TransactionState::Aborted) | Some(TransactionState::Terminated) => {
+                            true
+                        }
+                        None => true,
+                    }
+                }
+            };
+            if !end_visible {
+                continue;
+            }
+            let begin_visible = match v.begin {
+                None => false, // tombstone version
+                Some(TxTimestampOrID::Timestamp(begin_ts)) => begin_ts <= at_ts,
+                Some(TxTimestampOrID::TxID(begin_tx)) => {
+                    match lookup_tx_state(&self.txs, &self.finalized_tx_states, begin_tx) {
+                        Some(TransactionState::Committed(committed_ts)) => committed_ts <= at_ts,
+                        Some(TransactionState::Preparing(end_ts)) => end_ts <= at_ts,
+                        Some(TransactionState::Active) => false,
+                        Some(TransactionState::Aborted) | Some(TransactionState::Terminated) => {
+                            false
+                        }
+                        None => false,
+                    }
+                }
+            };
+            if begin_visible {
+                return true;
+            }
+        }
+        false
     }
 
     /// Get the table ID from the root page.
@@ -3732,6 +3948,10 @@ impl<Clock: LogicalClock> MvStore<Clock> {
             *connection.schema.write() = connection.db.clone_schema();
         }
 
+        // Drop FK parent dependency entries owned by this tx — an aborted tx's
+        // child INSERTs are gone, so no committer needs to detect them.
+        self.purge_fk_parent_dep_index_for_tx(tx_id);
+
         let tx = tx_unlocked.value();
         tx.state.store(TransactionState::Terminated);
         tracing::trace!("terminate(tx_id={})", tx_id);
@@ -4199,6 +4419,10 @@ impl<Clock: LogicalClock> MvStore<Clock> {
 
         for tx_id in &to_remove {
             self.finalized_tx_states.remove(tx_id);
+            // FK parent dependency entries owned by this tx are also no longer
+            // observable: any concurrent committer that could conflict has
+            // already drained.
+            self.purge_fk_parent_dep_index_for_tx(*tx_id);
         }
 
         to_remove.len()
