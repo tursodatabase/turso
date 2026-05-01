@@ -43,26 +43,10 @@ proc evaluate_sql {sqlite_exec db_name sql} {
         append load_commands ".load $extensions($name)\n"
     }
 
-    set mvcc_journal_mode ""
-    if {[is_turso_mvcc]} {
-        append mvcc_journal_mode "PRAGMA journal_mode=mvcc;\n"
-    }
-
-    set statements "${mvcc_journal_mode}${load_commands}${sql}"
+    set statements "${load_commands}${sql}"
 
     set command [list $sqlite_exec $db_name]
     set output [exec echo $statements | {*}$command]
-
-    if {[is_turso_mvcc]} {
-        # PRAGMA journal_mode=mvcc returns a single line result
-        # at the top; drop that first line from the output.
-        set lines [split $output "\n"]
-        if {[llength $lines] > 0} {
-            # Remove the first line and rejoin the rest
-            set lines [lrange $lines 1 end]
-            set output [join $lines "\n"]
-        }
-    }
 
     return $output
 }
@@ -311,8 +295,4 @@ proc do_execsql_test_in_memory_error {test_name sql_statements expected_error_pa
 
     set combined_sql [string trim $sql_statements]
     run_test_expecting_error $::sqlite_exec $db_name $combined_sql $expected_error_pattern
-}
-
-proc is_turso_mvcc {} {
-    return [expr {[info exists ::env(SQLITE_EXEC)] && $::env(SQLITE_EXEC) eq "scripts/turso-mvcc-sqlite3"}]
 }
