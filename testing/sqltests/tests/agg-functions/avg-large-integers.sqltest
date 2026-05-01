@@ -66,6 +66,9 @@ test avg_large_integer_mixed_with_real {
 expect {
     1.0
 }
+expect @js {
+    1
+}
 
 @cross-check-integrity
 test avg_large_integers_grouped {
@@ -80,6 +83,10 @@ test avg_large_integers_grouped {
 expect {
     1|0.5
     2|15.0
+}
+expect @js {
+    1|0.5
+    2|15
 }
 
 @cross-check-integrity
