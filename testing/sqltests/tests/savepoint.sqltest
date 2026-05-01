@@ -350,3 +350,105 @@ test savepoint-rollback-to-temp-table-unreachable {
 expect error {
     no such table
 }
+
+# Regression test for #6352: savepoint rollback over a transaction that
+# touches lots of overflow pages under cache pressure must not leave the
+# pager with dirty entries whose buffers cannot be loaded at commit time.
+@cross-check-integrity
+test savepoint-rollback-overflow-issue-6352 {
+    PRAGMA page_size = 2048;
+    PRAGMA cache_size = 8;
+    CREATE TABLE t6352(id INTEGER PRIMARY KEY, x BLOB);
+    BEGIN;
+    INSERT INTO t6352 VALUES(1, zeroblob(1720000));
+    SAVEPOINT s1;
+    UPDATE t6352 SET x = zeroblob(215000) WHERE id = 1;
+    ROLLBACK TO s1;
+    RELEASE s1;
+    INSERT INTO t6352 VALUES(2, zeroblob(860000));
+    COMMIT;
+    SELECT id, length(x) FROM t6352 ORDER BY id;
+}
+expect {
+    1|1720000
+    2|860000
+}
+
+# Same scenario but with nested savepoints — the inner savepoint is
+# released, and only the outer one is rolled back. Exercises the
+# subjournal entry coalescing across nested savepoints.
+@cross-check-integrity
+test savepoint-rollback-overflow-nested-issue-6352 {
+    PRAGMA page_size = 2048;
+    PRAGMA cache_size = 4;
+    CREATE TABLE t6352n(id INTEGER PRIMARY KEY, x BLOB);
+    BEGIN;
+    INSERT INTO t6352n VALUES(1, zeroblob(1720000));
+    SAVEPOINT s1;
+    UPDATE t6352n SET x = zeroblob(215000) WHERE id = 1;
+    SAVEPOINT s2;
+    UPDATE t6352n SET x = zeroblob(50000) WHERE id = 1;
+    ROLLBACK TO s2;
+    RELEASE s2;
+    ROLLBACK TO s1;
+    RELEASE s1;
+    INSERT INTO t6352n VALUES(2, zeroblob(860000));
+    COMMIT;
+    SELECT id, length(x) FROM t6352n ORDER BY id;
+}
+expect {
+    1|1720000
+    2|860000
+}
+
+# Repeated rollback of the same savepoint within a transaction. Each cycle
+# must produce a clean state for the surrounding outer transaction.
+@cross-check-integrity
+test savepoint-rollback-overflow-repeated-issue-6352 {
+    PRAGMA page_size = 2048;
+    PRAGMA cache_size = 8;
+    CREATE TABLE t6352r(id INTEGER PRIMARY KEY, x BLOB);
+    INSERT INTO t6352r VALUES(0, zeroblob(900000));
+    BEGIN;
+    SAVEPOINT a;
+    UPDATE t6352r SET x = zeroblob(50000) WHERE id = 0;
+    ROLLBACK TO a;
+    RELEASE a;
+    SAVEPOINT b;
+    UPDATE t6352r SET x = zeroblob(100000) WHERE id = 0;
+    ROLLBACK TO b;
+    RELEASE b;
+    SAVEPOINT c;
+    UPDATE t6352r SET x = zeroblob(150000) WHERE id = 0;
+    ROLLBACK TO c;
+    RELEASE c;
+    COMMIT;
+    SELECT id, length(x) FROM t6352r ORDER BY id;
+}
+expect {
+    0|900000
+}
+
+# Rollback after an UPDATE that grows the blob (additional overflow pages
+# allocated within the savepoint and then thrown away). The rollback must
+# truncate dirty page state and the database size cleanly so a follow-up
+# INSERT can append fresh overflow chains.
+@cross-check-integrity
+test savepoint-rollback-overflow-grow-issue-6352 {
+    PRAGMA page_size = 2048;
+    PRAGMA cache_size = 8;
+    CREATE TABLE t6352g(id INTEGER PRIMARY KEY, x BLOB);
+    BEGIN;
+    INSERT INTO t6352g VALUES(1, zeroblob(100000));
+    SAVEPOINT s1;
+    UPDATE t6352g SET x = zeroblob(2000000) WHERE id = 1;
+    ROLLBACK TO s1;
+    RELEASE s1;
+    INSERT INTO t6352g VALUES(2, zeroblob(500000));
+    COMMIT;
+    SELECT id, length(x) FROM t6352g ORDER BY id;
+}
+expect {
+    1|100000
+    2|500000
+}

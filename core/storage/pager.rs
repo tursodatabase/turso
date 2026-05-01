@@ -3700,6 +3700,18 @@ impl Pager {
                         } else {
                             let (page, completion) =
                                 self.read_page_no_cache(page_id as i64, None, false)?;
+                            // If the read completed synchronously with an error,
+                            // surface it now. Otherwise we would silently drop the
+                            // failure (the completion is "finished" so we'd skip
+                            // pushing it into the wait list) and later trip the
+                            // page-buffer-not-loaded panic in prepare_frames when
+                            // it tries to read content from the evicted page.
+                            if completion.finished() && !completion.succeeded() {
+                                let err = completion.get_error().unwrap_or(
+                                    CompletionError::IOError(std::io::ErrorKind::Other, "read"),
+                                );
+                                return Err(LimboError::CompletionError(err));
+                            }
                             commit_info.page_sources.push(PageSource::Evicted(page));
                             if !completion.finished() {
                                 commit_info.completions.push(completion);
@@ -3766,6 +3778,17 @@ impl Pager {
                             }
                             PageSource::Evicted(page) => page.clone(),
                         };
+                        // Defensive check: prepare_frames will read page contents,
+                        // which panics if the buffer is not loaded. If we got here
+                        // with an unloaded page (e.g. an evicted dirty page whose
+                        // backing WAL frame was truncated by a savepoint rollback),
+                        // surface a corrupt error instead of panicking.
+                        if !page.is_loaded() {
+                            return Err(LimboError::Corrupt(format!(
+                                "dirty page {} has no buffer loaded at commit time",
+                                page.get().id
+                            )));
+                        }
                         commit_info.page_source_cursor += 1;
                         commit_info.collected_pages.push(page);
 
