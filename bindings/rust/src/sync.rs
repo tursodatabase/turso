@@ -1720,4 +1720,132 @@ mod tests {
         assert_eq!(remote_rows[1][1], Value::Text("beta".to_string()));
         assert_eq!(remote_rows[1][2], Value::Text("from-local".to_string()));
     }
+
+    /// Reproducer for the panic seen by read-only sync-engine consumers:
+    ///     thread 'tokio-rt-worker' panicked at core/storage/wal.rs
+    ///     frame_count must be not less than frame_watermark
+    ///     frame_count=0, frame_watermark=23
+    ///
+    /// Scenario the user described: a service only reads from a locally
+    /// synced database — it never writes — and `db.pull()` panics inside
+    /// `apply_changes_internal` after a previous pull populated the WAL.
+    ///
+    /// Mechanism:
+    /// 1. First pull writes N frames into the local WAL and stores
+    ///    `meta.revert_since_wal_watermark = N` (no `revert_since_wal_salt`
+    ///    is recorded on the pull path).
+    /// 2. The service does not write anything between pulls, so
+    ///    `WAL.max_frame` stays at N.
+    /// 3. Second pull -> `apply_changes_internal`:
+    ///    a. `checkpoint_passive` returns `watermark = N` and runs a
+    ///       Passive checkpoint with `upper_bound_inclusive = N`. Because
+    ///       no other reader is holding a read mark and `max_frame == N`,
+    ///       the checkpoint backfills every frame, leaving
+    ///       `nbackfills == max_frame == N`.
+    ///    b. `WalSession::begin()` calls `begin_write_tx`, which calls
+    ///       `try_restart_log_before_write` (core/storage/wal.rs:4737).
+    ///       The conditions to restart are now all met
+    ///       (`max_frame == nbackfills > 0`, holds read-mark 0), so the
+    ///       WAL header is restarted and `apply_restart_snapshot` resets
+    ///       this connection's `WalFile::max_frame` to 0.
+    ///    c. `rollback_changes_after(coro, watermark = N)` calls
+    ///       `wal_changed_pages_after(N)`, whose
+    ///       `turso_assert!(frame_count >= frame_watermark, ...)` fires
+    ///       with `frame_count=0, frame_watermark=N`.
+    ///
+    /// The test must complete the second `db.pull().await` without panicking.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    pub async fn test_sync_pull_panics_after_full_backfill() {
+        use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
+        use std::sync::Arc;
+
+        let _ = tracing_subscriber::fmt::try_init();
+        let dir = TempDir::new().unwrap();
+        let server = TursoServer::new().await.unwrap();
+
+        let db = crate::sync::Builder::new_remote(dir.path().join("local.db").to_str().unwrap())
+            .with_remote_url(server.db_url())
+            .build()
+            .await
+            .unwrap();
+
+        server.db_sql("CREATE TABLE t(y BLOB)").await.unwrap();
+        db.pull().await.unwrap();
+
+        // Read-only consumer: only opens a connection and queries.
+        let conn = db.connect().await.unwrap();
+
+        // Spawn random readers on independent connections that race against
+        // the pull+checkpoint loop. Each reader picks a random query out of a
+        // small set, sleeps a random short interval, and verifies that the
+        // observed row count never goes backward and never exceeds what the
+        // pull loop has already applied.
+        let done = Arc::new(AtomicBool::new(false));
+        let applied_total = Arc::new(AtomicI64::new(0));
+        let mut readers = Vec::new();
+        for _ in 0..4 {
+            let reader_conn = db.connect().await.unwrap();
+            let done = done.clone();
+            let applied_total = applied_total.clone();
+            readers.push(tokio::spawn(async move {
+                let mut last_seen: i64 = 0;
+                while !done.load(Ordering::Relaxed) {
+                    let sleep_ms = rand::rng().random_range(0..=4);
+                    tokio::time::sleep(Duration::from_millis(sleep_ms)).await;
+
+                    let sql = match rand::rng().random_range(0..3) {
+                        0 => "SELECT count(*) FROM t",
+                        1 => "SELECT count(length(y)) FROM t",
+                        _ => "SELECT count(*) FROM t WHERE length(y) > 0",
+                    };
+                    let rows = match reader_conn.query(sql, ()).await {
+                        Ok(rows) => rows,
+                        // Acceptable transient errors during pull/checkpoint;
+                        // anything else (including the WAL panic) propagates.
+                        Err(crate::Error::Busy(_)) => continue,
+                        Err(e) => panic!("reader query failed: {e:?}"),
+                    };
+                    let all = all_rows(rows).await.unwrap();
+                    let Value::Integer(n) = all[0][0] else {
+                        panic!("unexpected reader value: {:?}", all[0][0]);
+                    };
+                    let upper = applied_total.load(Ordering::Acquire);
+                    assert!(
+                        n >= last_seen && n <= upper,
+                        "reader saw inconsistent count {n}, last_seen={last_seen}, upper={upper}"
+                    );
+                    last_seen = n;
+                }
+            }));
+        }
+
+        let mut total: i64 = 0;
+        for _ in 0..25 {
+            let cnt: u16 = rand::rng().random_range(1..=16);
+            let size: u32 = rand::rng().random_range(1..=4 * 1024);
+
+            server
+                .db_sql(&format!(
+                    "INSERT INTO t SELECT randomblob({size}) FROM generate_series(1, {cnt})"
+                ))
+                .await
+                .unwrap();
+            total += cnt as i64;
+
+            applied_total.store(total, Ordering::Release);
+            db.pull().await.unwrap();
+
+            let _ = db.checkpoint().await;
+
+            let rows = all_rows(conn.query("SELECT count(*) FROM t", ()).await.unwrap())
+                .await
+                .unwrap();
+            assert_eq!(rows, vec![vec![Value::Integer(total)]]);
+        }
+
+        done.store(true, Ordering::Relaxed);
+        for h in readers {
+            h.await.unwrap();
+        }
+    }
 }
