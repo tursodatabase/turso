@@ -218,7 +218,7 @@ pub fn pragma_for(pragma: &PragmaName) -> Pragma {
         ),
         VdbeTrace => Pragma::new(
             PragmaFlags::NoColumns1 | PragmaFlags::Result0,
-            &["vbde_trace"],
+            &["vdbe_trace"],
         ),
     }
 }
