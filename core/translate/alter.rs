@@ -1628,6 +1628,14 @@ pub fn translate_alter_table(
                     let old_column = &btree.columns()[column_index];
                     let becomes_generated =
                         !old_column.is_generated() && replacement_column.is_generated();
+                    // Toggling the virtual-generated bit changes whether the column
+                    // occupies a stored slot, so the on-disk row layout shifts even
+                    // if neither side is "becomes_generated" (e.g. virtual -> regular).
+                    // Without rewriting, post-ALTER reads use the new schema's column
+                    // indexes against rows that still hold the pre-ALTER layout, and
+                    // values land in the wrong logical columns. See issue #6624.
+                    let virtuality_changed = old_column.is_virtual_generated()
+                        != replacement_column.is_virtual_generated();
                     // A change of declared type can change the column's affinity, in
                     // which case existing on-disk values must be coerced to match the
                     // new affinity. Without this, the row payload retains the old
@@ -1636,7 +1644,8 @@ pub fn translate_alter_table(
                     // changing NUMERIC -> TEXT). See issue #3706.
                     let affinity_changed = old_column.affinity_with_strict(btree.is_strict)
                         != replacement_column.affinity_with_strict(btree.is_strict);
-                    let rewrites_physical_layout = becomes_generated || affinity_changed;
+                    let rewrites_physical_layout =
+                        becomes_generated || virtuality_changed || affinity_changed;
                     (rewrites_physical_layout, Some(replacement_column))
                 }
             };
@@ -1991,14 +2000,29 @@ pub fn translate_alter_table(
                     database_id,
                 )?;
 
+                let original_columns = original_btree.columns();
                 let source_column_by_schema_idx = rewritten_table
                     .columns()
                     .iter()
                     .enumerate()
                     .map(|(idx, column)| {
                         if column.is_virtual_generated() {
+                            // Virtual columns don't occupy a slot in the rewritten record.
+                            None
+                        } else if original_columns
+                            .get(idx)
+                            .is_some_and(|c| c.is_virtual_generated())
+                        {
+                            // Newly-stored slot (the original column was virtual): no
+                            // source value exists on the old row image — leave NULL.
                             None
                         } else {
+                            // The cursor is opened on the original btree, so the logical
+                            // index passed here is mapped to the original physical slot
+                            // by `emit_column_or_rowid` via the original's logical-to-
+                            // physical map. Schema order is preserved by ALTER COLUMN,
+                            // so the rewritten schema_idx also identifies the same
+                            // logical column in the original.
                             Some(idx)
                         }
                     })
@@ -2064,7 +2088,10 @@ fn emit_rewrite_table_rows(
     });
 
     program.cursor_loop(cursor_id, |program, rowid| {
-        let base_dest_reg = program.alloc_registers(non_virtual_column_count);
+        // Initialize all destination slots to NULL so that columns without a
+        // source value (e.g. when a virtual generated column becomes stored,
+        // there is no pre-existing value on the old row image) default to NULL.
+        let base_dest_reg = program.alloc_registers_and_init_w_null(non_virtual_column_count);
         for (schema_idx, source_column_idx) in source_column_by_schema_idx.iter().enumerate() {
             let Some(source_column_idx) = source_column_idx else {
                 continue;
