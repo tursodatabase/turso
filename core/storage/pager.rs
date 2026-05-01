@@ -3370,7 +3370,7 @@ impl Pager {
             }
             Err(e) => {
                 self.io.cancel(&state.completions)?;
-                self.io.drain()?;
+                self.io.drain_completions(&state.completions)?;
                 Err(e)
             }
         }
@@ -3569,7 +3569,7 @@ impl Pager {
                 Ok(c) => completions.push(c),
                 Err(e) => {
                     self.io.cancel(&completions)?;
-                    self.io.drain()?;
+                    self.io.drain_completions(&completions)?;
                     return Err(e);
                 }
             }

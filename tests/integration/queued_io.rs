@@ -109,8 +109,12 @@ impl IO for QueuedIo {
         self.step_one().map(|_| ())
     }
 
-    fn drain(&self) -> turso_core::Result<()> {
-        while self.step_one()?.is_some() {}
+    fn drain_completions(&self, completions: &[Completion]) -> turso_core::Result<()> {
+        while completions.iter().any(|c| !c.finished()) {
+            if self.step_one()?.is_none() {
+                break;
+            }
+        }
         Ok(())
     }
 

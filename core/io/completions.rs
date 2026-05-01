@@ -143,6 +143,13 @@ impl CompletionGroup {
         self.completions.push(completion.clone());
     }
 
+    /// The children added so far. Used by error paths that need to
+    /// wait on the kernel side via `IO::drain_completions` after
+    /// cancelling the group.
+    pub fn completions(&self) -> &[Completion] {
+        &self.completions
+    }
+
     pub fn cancel(&self) {
         for c in &self.completions {
             c.abort();

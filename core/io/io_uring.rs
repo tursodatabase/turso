@@ -322,12 +322,7 @@ impl RingState {
 
     /// Submit or resubmit a writev operation. SAFETY: caller must hold the
     /// `RingState` Mutex (so no other `SubmissionQueue` exists for `ring`).
-    unsafe fn submit_writev(
-        &mut self,
-        ring: &io_uring::IoUring,
-        key: u64,
-        mut st: WritevState,
-    ) {
+    unsafe fn submit_writev(&mut self, ring: &io_uring::IoUring, key: u64, mut st: WritevState) {
         st.free_last_iov(&mut self.iov_pool);
 
         let mut iov_allocation = self.iov_pool.acquire().unwrap_or_else(|| {
@@ -478,17 +473,6 @@ impl IO for UringIO {
         Ok(())
     }
 
-    fn drain(&self) -> Result<()> {
-        trace!("drain()");
-        loop {
-            self.step()?;
-            let state = self.state.lock();
-            if state.empty() {
-                return Ok(());
-            }
-        }
-    }
-
     fn cancel(&self, completions: &[Completion]) -> Result<()> {
         let mut state = self.state.lock();
         for c in completions {
@@ -510,13 +494,13 @@ impl IO for UringIO {
     ///   never blocked by the kernel-side wait, so concurrent submitters
     ///   pipeline their SQEs into the ring while another thread is
     ///   waiting on the kernel.
-    /// - **One** thread at a time is the *leader*: it holds `wait_lock`
+    /// - One thread at a time is the *leader*: it holds `wait_lock`
     ///   and runs `submit_and_wait` + `drain_cq` in a tight loop until
     ///   the ring drains. The drain *must* happen while the wait guard
     ///   is still held — if released before draining, a follower could
     ///   compute `pending_ops` to include CQEs we're about to consume
     ///   and block forever on completions that no longer exist.
-    /// - **Followers** (concurrent callers of `step`) `try_lock` the
+    /// - Followers (concurrent callers of `step`) `try_lock` the
     ///   `wait_lock`. If they lose the race they return immediately:
     ///   the current leader will fire their waker as it drains. This
     ///   replaces the previous "block on `wait_lock` and serialize"
@@ -529,7 +513,7 @@ impl IO for UringIO {
     fn step(&self) -> Result<()> {
         // Try to become the leader. If `wait_lock` is held, someone else
         // is already inside `submit_and_wait`/`drain_cq` and will fire
-        // wakers on every completion drained — including ours. The
+        // wakers on every completion drained: including ours. The
         // follower returns Ok immediately and lets the calling Future
         // park on its completion's waker.
         let Some(_wait_guard) = self.wait_lock.try_lock() else {
@@ -568,9 +552,10 @@ impl IO for UringIO {
             "fixed buffer length must be logical block aligned"
         );
         let mut state = self.state.lock();
-        let slot = state.free_arenas.iter().position(|e| e.is_none()).ok_or({
-            crate::error::CompletionError::UringIOError("no free fixed buffer slots")
-        })?;
+        let slot =
+            state.free_arenas.iter().position(|e| e.is_none()).ok_or({
+                crate::error::CompletionError::UringIOError("no free fixed buffer slots")
+            })?;
         unsafe {
             self.ring
                 .submitter()
