@@ -49,6 +49,7 @@ pub(super) fn in_expr_affinity(
     }
 }
 
+#[turso_macros::trace_stack]
 #[instrument(skip(program, referenced_tables, expr, resolver), level = Level::DEBUG)]
 pub fn translate_condition_expr(
     program: &mut ProgramBuilder,
