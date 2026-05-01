@@ -12592,6 +12592,7 @@ fn rewrite_trigger_for_column_rename(
     new_col: &str,
 ) -> crate::Result<()> {
     let trigger_tbl = normalize_ident(&trigger.table_name);
+    let old_sql = trigger.sql.clone();
     if let Some(ref mut when) = trigger.when_clause {
         rename_identifiers_scoped_when_clause(when, table_name, &trigger_tbl, old_col, new_col);
     }
@@ -12612,6 +12613,13 @@ fn rewrite_trigger_for_column_rename(
             "error in trigger {} after rename: no such column: {}",
             trigger.name, old_col
         )));
+    }
+    // Keep trigger.sql in sync with the rewritten in-memory AST so a subsequent
+    // RENAME COLUMN sees the current column name (the translate step uses the
+    // in-memory trigger.sql as the source of the next rewrite).
+    let new_sql = regenerate_trigger_sql(trigger);
+    if new_sql != old_sql {
+        trigger.sql = new_sql;
     }
     Ok(())
 }

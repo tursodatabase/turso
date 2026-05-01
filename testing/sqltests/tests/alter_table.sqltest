@@ -1468,6 +1468,97 @@ expect {
     500
 }
 
+# Round-trip rename: renaming away and back must restore the original column
+# name in the stored trigger SQL (issue #6625). Previously the in-memory
+# trigger.sql was not refreshed after a column rename, so the second rename
+# saw the stale (pre-rename) text and made no change.
+@cross-check-integrity
+test alter-table-rename-column-trigger-round-trip-stored-sql {
+    CREATE TABLE log (msg TEXT);
+    CREATE TABLE core (id TEXT UNIQUE, row_rank TEXT UNIQUE);
+    CREATE TRIGGER core_ai AFTER INSERT ON core BEGIN
+        INSERT INTO log VALUES (NEW.id || ':' || NEW.row_rank);
+    END;
+    ALTER TABLE core RENAME COLUMN row_rank TO row_rank2;
+    ALTER TABLE core RENAME COLUMN row_rank2 TO row_rank;
+    SELECT sql FROM sqlite_schema WHERE name = 'core_ai';
+}
+expect pattern {
+    CREATE TRIGGER core_ai AFTER INSERT ON core\s+BEGIN\s+INSERT INTO log VALUES\s*\(NEW\.id \|\| ':' \|\| NEW\.row_rank\);?\s+END
+}
+
+# Round-trip rename: WHEN clause column references must also be restored.
+@cross-check-integrity
+test alter-table-rename-column-trigger-round-trip-when-clause {
+    CREATE TABLE log (v);
+    CREATE TABLE t1 (a, b);
+    CREATE TRIGGER trig1 AFTER INSERT ON t1 WHEN NEW.b > 0 BEGIN
+        INSERT INTO log VALUES (NEW.b);
+    END;
+    ALTER TABLE t1 RENAME COLUMN b TO b2;
+    ALTER TABLE t1 RENAME COLUMN b2 TO b;
+    SELECT sql FROM sqlite_schema WHERE name = 'trig1';
+}
+expect pattern {
+    CREATE TRIGGER trig1 AFTER INSERT ON t1 WHEN NEW\.b > 0\s+BEGIN\s+INSERT INTO log VALUES\s*\(NEW\.b\);?\s+END
+}
+
+# Round-trip rename: UPDATE OF column list must also be restored.
+@cross-check-integrity
+test alter-table-rename-column-trigger-round-trip-update-of {
+    CREATE TABLE log (v);
+    CREATE TABLE t1 (a, b);
+    CREATE TRIGGER trig1 AFTER UPDATE OF b ON t1 BEGIN
+        INSERT INTO log VALUES (NEW.b);
+    END;
+    ALTER TABLE t1 RENAME COLUMN b TO b2;
+    ALTER TABLE t1 RENAME COLUMN b2 TO b;
+    SELECT sql FROM sqlite_schema WHERE name = 'trig1';
+}
+expect pattern {
+    CREATE TRIGGER trig1 AFTER UPDATE OF b ON t1\s+BEGIN\s+INSERT INTO log VALUES\s*\(NEW\.b\);?\s+END
+}
+
+# Round-trip rename: subsequent inserts must fire the trigger correctly.
+# Without the fix, the stored trigger SQL persists the intermediate name
+# (row_rank2), so reopening the database -- or any code path that recompiles
+# the trigger from the stored SQL -- would fail with "no such column: row_rank2".
+@cross-check-integrity
+test alter-table-rename-column-trigger-round-trip-fires {
+    CREATE TABLE log (msg TEXT);
+    CREATE TABLE core (id TEXT UNIQUE, row_rank TEXT UNIQUE);
+    CREATE TRIGGER core_ai AFTER INSERT ON core BEGIN
+        INSERT INTO log VALUES (NEW.id || ':' || NEW.row_rank);
+    END;
+    INSERT INTO core(id, row_rank) VALUES ('i-001', 'A001');
+    ALTER TABLE core RENAME COLUMN row_rank TO row_rank2;
+    ALTER TABLE core RENAME COLUMN row_rank2 TO row_rank;
+    INSERT INTO core(id, row_rank) VALUES ('i-002', 'A002');
+    SELECT msg FROM log ORDER BY rowid;
+}
+expect {
+    i-001:A001
+    i-002:A002
+}
+
+# Multi-hop rename A -> B -> C -> A: confirms the in-memory trigger.sql
+# refresh works for arbitrary chains, not just a single round trip.
+@cross-check-integrity
+test alter-table-rename-column-trigger-multi-hop-rename {
+    CREATE TABLE log (v);
+    CREATE TABLE t1 (a, b);
+    CREATE TRIGGER trig1 AFTER INSERT ON t1 BEGIN
+        INSERT INTO log VALUES (NEW.b);
+    END;
+    ALTER TABLE t1 RENAME COLUMN b TO b2;
+    ALTER TABLE t1 RENAME COLUMN b2 TO b3;
+    ALTER TABLE t1 RENAME COLUMN b3 TO b;
+    SELECT sql FROM sqlite_schema WHERE name = 'trig1';
+}
+expect pattern {
+    CREATE TRIGGER trig1 AFTER INSERT ON t1\s+BEGIN\s+INSERT INTO log VALUES\s*\(NEW\.b\);?\s+END
+}
+
 test alter-table-rename-column-temp-trigger-main-cross-table {
     CREATE TABLE src_temp_main (a INTEGER PRIMARY KEY, b);
     CREATE TABLE log_temp_main (v);
