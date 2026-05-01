@@ -937,7 +937,13 @@ pub fn emit_fk_child_update_counters(
                 rowid_reg: tmp,
                 target_pc: violation,
             });
-            // found: close and continue
+            // found: track FK parent read for MVCC commit-time validation
+            // (issue #5955), then close and continue.
+            program.emit_insn(Insn::MvccFkParentTrackRowid {
+                db: database_id,
+                root_page: parent_tbl.root_page,
+                rowid_reg: tmp,
+            });
             program.emit_insn(Insn::Close { cursor_id: pcur });
             program.emit_insn(Insn::Goto { target_pc: fk_ok });
 
@@ -981,13 +987,26 @@ pub fn emit_fk_child_update_counters(
                 start
             };
 
-            // FOUND: ok; NOT FOUND: violation path
+            let parent_root_page = parent_tbl.root_page;
+            // FOUND: track parent for MVCC commit-time validation; NOT FOUND: violation
             index_probe(
                 program,
                 icur,
                 probe,
                 ncols,
-                |_p| Ok(()),
+                |p| {
+                    let parent_rowid_reg = p.alloc_register();
+                    p.emit_insn(Insn::IdxRowId {
+                        cursor_id: icur,
+                        dest: parent_rowid_reg,
+                    });
+                    p.emit_insn(Insn::MvccFkParentTrackRowid {
+                        db: database_id,
+                        root_page: parent_root_page,
+                        rowid_reg: parent_rowid_reg,
+                    });
+                    Ok(())
+                },
                 |p| {
                     emit_fk_violation(p, &fk_ref.fk)?;
                     Ok(())

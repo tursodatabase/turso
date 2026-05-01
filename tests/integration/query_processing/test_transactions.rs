@@ -467,6 +467,160 @@ fn test_mvcc_concurrent_conflicting_update_2() {
     assert!(matches!(err, LimboError::WriteWriteConflict));
 }
 
+// Issue #5955: Two CONCURRENT transactions cannot together commit a state that
+// violates a foreign-key constraint. conn0 deletes a parent row; conn1 inserts
+// a child referencing the same parent. Each transaction's FK check passes
+// against its own snapshot, so write-set-only conflict detection misses the
+// cross-table read-write skew. The second committer must abort.
+#[test]
+fn test_mvcc_concurrent_fk_parent_delete_vs_child_insert() {
+    let tmp_db =
+        TempDatabase::new_with_mvcc("test_mvcc_concurrent_fk_parent_delete_vs_child_insert.db");
+    let setup = tmp_db.connect_limbo();
+    setup.execute("PRAGMA foreign_keys = ON").unwrap();
+    setup
+        .execute("CREATE TABLE parent(id INTEGER PRIMARY KEY)")
+        .unwrap();
+    setup
+        .execute(
+            "CREATE TABLE child(id INTEGER PRIMARY KEY, parent_id INTEGER REFERENCES parent(id))",
+        )
+        .unwrap();
+    setup.execute("INSERT INTO parent VALUES (1)").unwrap();
+    setup.execute("INSERT INTO parent VALUES (2)").unwrap();
+    setup.close().unwrap();
+
+    let conn0 = tmp_db.connect_limbo();
+    let conn1 = tmp_db.connect_limbo();
+    conn0.execute("PRAGMA foreign_keys = ON").unwrap();
+    conn1.execute("PRAGMA foreign_keys = ON").unwrap();
+
+    conn0.execute("BEGIN CONCURRENT").unwrap();
+    conn1.execute("BEGIN CONCURRENT").unwrap();
+    conn0.execute("DELETE FROM parent WHERE id = 2").unwrap();
+    conn1.execute("INSERT INTO child VALUES (1, 2)").unwrap();
+    conn0.execute("COMMIT").unwrap();
+
+    let result = conn1.execute("COMMIT");
+    assert!(
+        result.is_err(),
+        "COMMIT should fail: child references non-existent parent id=2 after conn0 deleted it, got {result:?}"
+    );
+}
+
+// Issue #5955: a CONCURRENT INSERT into child does not conflict with an
+// unrelated parent INSERT. The FK parent track only fires when the FK check
+// observes the parent rowid we depend on — adding an extra parent row should
+// not cause spurious aborts.
+#[test]
+fn test_mvcc_concurrent_fk_unrelated_parent_insert() {
+    let tmp_db = TempDatabase::new_with_mvcc("test_mvcc_concurrent_fk_unrelated_parent.db");
+    let setup = tmp_db.connect_limbo();
+    setup.execute("PRAGMA foreign_keys = ON").unwrap();
+    setup
+        .execute("CREATE TABLE parent(id INTEGER PRIMARY KEY)")
+        .unwrap();
+    setup
+        .execute(
+            "CREATE TABLE child(id INTEGER PRIMARY KEY, parent_id INTEGER REFERENCES parent(id))",
+        )
+        .unwrap();
+    setup.execute("INSERT INTO parent VALUES (1)").unwrap();
+    setup.close().unwrap();
+
+    let conn0 = tmp_db.connect_limbo();
+    let conn1 = tmp_db.connect_limbo();
+    conn0.execute("PRAGMA foreign_keys = ON").unwrap();
+    conn1.execute("PRAGMA foreign_keys = ON").unwrap();
+
+    conn0.execute("BEGIN CONCURRENT").unwrap();
+    conn1.execute("BEGIN CONCURRENT").unwrap();
+    // conn0 inserts a different parent; conn1 inserts a child against parent(1).
+    // No conflict — conn1 only observed parent(1), not parent(2).
+    conn0.execute("INSERT INTO parent VALUES (2)").unwrap();
+    conn1.execute("INSERT INTO child VALUES (1, 1)").unwrap();
+    conn0.execute("COMMIT").unwrap();
+    conn1.execute("COMMIT").unwrap();
+}
+
+// Issue #5955: FK with parent referenced by a UNIQUE INDEX (not the rowid).
+// Same skew anomaly applies — the parent is observed via index probe, but the
+// row deletion by another tx must still be detected at commit.
+#[test]
+fn test_mvcc_concurrent_fk_index_parent_delete_vs_child_insert() {
+    let tmp_db = TempDatabase::new_with_mvcc("test_mvcc_concurrent_fk_index_parent.db");
+    let setup = tmp_db.connect_limbo();
+    setup.execute("PRAGMA foreign_keys = ON").unwrap();
+    setup
+        .execute("CREATE TABLE parent(id INTEGER PRIMARY KEY, code TEXT UNIQUE)")
+        .unwrap();
+    setup
+        .execute("CREATE TABLE child(id INTEGER PRIMARY KEY, code TEXT REFERENCES parent(code))")
+        .unwrap();
+    setup.execute("INSERT INTO parent VALUES (1, 'A')").unwrap();
+    setup.execute("INSERT INTO parent VALUES (2, 'B')").unwrap();
+    setup.close().unwrap();
+
+    let conn0 = tmp_db.connect_limbo();
+    let conn1 = tmp_db.connect_limbo();
+    conn0.execute("PRAGMA foreign_keys = ON").unwrap();
+    conn1.execute("PRAGMA foreign_keys = ON").unwrap();
+
+    conn0.execute("BEGIN CONCURRENT").unwrap();
+    conn1.execute("BEGIN CONCURRENT").unwrap();
+    conn0
+        .execute("DELETE FROM parent WHERE code = 'B'")
+        .unwrap();
+    conn1.execute("INSERT INTO child VALUES (1, 'B')").unwrap();
+    conn0.execute("COMMIT").unwrap();
+
+    let result = conn1.execute("COMMIT");
+    assert!(
+        result.is_err(),
+        "COMMIT should fail: child references non-existent parent code='B' after conn0 deleted it, got {result:?}"
+    );
+}
+
+// Issue #5955: UPDATE child to reference a parent that another concurrent
+// transaction is about to delete must abort the second committer.
+#[test]
+fn test_mvcc_concurrent_fk_parent_delete_vs_child_update() {
+    let tmp_db = TempDatabase::new_with_mvcc("test_mvcc_concurrent_fk_child_update.db");
+    let setup = tmp_db.connect_limbo();
+    setup.execute("PRAGMA foreign_keys = ON").unwrap();
+    setup
+        .execute("CREATE TABLE parent(id INTEGER PRIMARY KEY)")
+        .unwrap();
+    setup
+        .execute(
+            "CREATE TABLE child(id INTEGER PRIMARY KEY, parent_id INTEGER REFERENCES parent(id))",
+        )
+        .unwrap();
+    setup.execute("INSERT INTO parent VALUES (1)").unwrap();
+    setup.execute("INSERT INTO parent VALUES (2)").unwrap();
+    setup.execute("INSERT INTO child VALUES (10, 1)").unwrap();
+    setup.close().unwrap();
+
+    let conn0 = tmp_db.connect_limbo();
+    let conn1 = tmp_db.connect_limbo();
+    conn0.execute("PRAGMA foreign_keys = ON").unwrap();
+    conn1.execute("PRAGMA foreign_keys = ON").unwrap();
+
+    conn0.execute("BEGIN CONCURRENT").unwrap();
+    conn1.execute("BEGIN CONCURRENT").unwrap();
+    conn0.execute("DELETE FROM parent WHERE id = 2").unwrap();
+    conn1
+        .execute("UPDATE child SET parent_id = 2 WHERE id = 10")
+        .unwrap();
+    conn0.execute("COMMIT").unwrap();
+
+    let result = conn1.execute("COMMIT");
+    assert!(
+        result.is_err(),
+        "COMMIT should fail: child(10).parent_id=2 references non-existent parent, got {result:?}"
+    );
+}
+
 #[test]
 fn test_mvcc_checkpoint_works() {
     let tmp_db = TempDatabase::new_with_mvcc("test_mvcc_checkpoint_works.db");

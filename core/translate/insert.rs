@@ -3920,6 +3920,14 @@ pub fn emit_fk_child_insert_checks(
                 rowid_reg: tmp,
                 target_pc: violation,
             });
+            // Parent exists: under MVCC, record the parent rowid so commit-time
+            // validation can detect a concurrent transaction deleting/modifying
+            // the parent we just observed (issue #5955).
+            program.emit_insn(Insn::MvccFkParentTrackRowid {
+                db: database_id,
+                root_page: parent_tbl.root_page,
+                rowid_reg: tmp,
+            });
             program.emit_insn(Insn::Close { cursor_id: pcur });
             program.emit_insn(Insn::Goto { target_pc: fk_ok });
 
@@ -4011,13 +4019,29 @@ pub fn emit_fk_child_insert_checks(
                 program.emit_insn(Insn::Goto { target_pc: fk_ok });
                 program.preassign_label_to_next_insn(mismatch);
             }
+            let parent_root_page = parent_tbl.root_page;
             index_probe(
                 program,
                 icur,
                 probe,
                 ncols,
-                // on_found: parent exists, FK satisfied
-                |_p| Ok(()),
+                // on_found: parent exists, FK satisfied. Under MVCC, record the
+                // parent rowid so commit-time validation can detect a concurrent
+                // transaction deleting/modifying the parent we just observed
+                // (issue #5955).
+                |p| {
+                    let parent_rowid_reg = p.alloc_register();
+                    p.emit_insn(Insn::IdxRowId {
+                        cursor_id: icur,
+                        dest: parent_rowid_reg,
+                    });
+                    p.emit_insn(Insn::MvccFkParentTrackRowid {
+                        db: database_id,
+                        root_page: parent_root_page,
+                        rowid_reg: parent_rowid_reg,
+                    });
+                    Ok(())
+                },
                 // on_not_found: immediate → Halt; deferred → counter
                 |p| {
                     if fk_ref.fk.deferred {

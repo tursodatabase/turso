@@ -465,6 +465,14 @@ pub struct Transaction {
     write_set: SkipSet<RowID>,
     /// The transaction read set.
     read_set: SkipSet<RowID>,
+    /// Subset of reads that must be validated for cross-row read-write skews
+    /// at commit time. Currently populated by FK parent-row existence checks
+    /// (see [Insn::MvccFkParentTrackRowid]) so that BEGIN CONCURRENT cannot
+    /// commit a child row whose parent was concurrently deleted/modified
+    /// (issue #5955). Distinct from `read_set`, which captures every cursor
+    /// read and is intentionally not used for serializability validation
+    /// (BEGIN CONCURRENT remains snapshot-isolation by default).
+    fk_read_set: SkipSet<RowID>,
     /// The transaction header.
     header: RwLock<DatabaseHeader>,
     /// True when the transaction mutated its local database header snapshot.
@@ -496,6 +504,7 @@ impl Transaction {
             begin_ts,
             write_set: SkipSet::new(),
             read_set: SkipSet::new(),
+            fk_read_set: SkipSet::new(),
             header: RwLock::new(header),
             header_dirty: AtomicBool::new(false),
             savepoint_stack: RwLock::new(Vec::new()),
@@ -508,6 +517,10 @@ impl Transaction {
 
     fn insert_to_read_set(&self, id: RowID) {
         self.read_set.insert(id);
+    }
+
+    fn insert_to_fk_read_set(&self, id: RowID) {
+        self.fk_read_set.insert(id);
     }
 
     fn insert_to_write_set(&self, id: RowID) {
@@ -1149,6 +1162,97 @@ impl<Clock: LogicalClock> CommitStateMachine<Clock> {
         Ok(())
     }
 
+    /// Validates that a row in the transaction's read set has not been modified
+    /// by a concurrent transaction since this transaction's begin_ts.
+    ///
+    /// Used to detect cross-row read-write skews (issue #5955): for example,
+    /// when an FK check observed a parent row in our snapshot but another
+    /// transaction has since deleted or modified it. Returns
+    /// [LimboError::WriteWriteConflict] when a concurrent commit (or in-flight
+    /// commit that wins under first-committer-wins) has touched the row.
+    fn check_read_for_conflicts(
+        &self,
+        rowid: &RowID,
+        end_ts: u64,
+        tx: &Transaction,
+        mvcc_store: &Arc<MvStore<Clock>>,
+    ) -> Result<()> {
+        let Some(row_versions) = mvcc_store.rows.get(rowid) else {
+            return Ok(());
+        };
+        let row_versions = row_versions.value().read();
+        for version in row_versions.iter().rev() {
+            // Did a tx commit a delete/update-out of this row after our begin_ts?
+            if let Some(TxTimestampOrID::Timestamp(committed_end_ts)) = version.end {
+                if committed_end_ts > tx.begin_ts {
+                    return Err(LimboError::WriteWriteConflict);
+                }
+            }
+            // Did a tx commit a new version (insert or update-in) for this rowid
+            // after our begin_ts? This indicates the row we read has changed.
+            if let Some(TxTimestampOrID::Timestamp(committed_begin_ts)) = version.begin {
+                if committed_begin_ts > tx.begin_ts {
+                    return Err(LimboError::WriteWriteConflict);
+                }
+            }
+            // In-flight delete/update-out by another tx. Mirror the
+            // first-committer-wins logic from check_version_conflicts: we
+            // conflict with already-committed deletes and with preparing tx's
+            // that will commit before us (lower end_ts).
+            if let Some(TxTimestampOrID::TxID(other_tx_id)) = version.end {
+                if other_tx_id != self.tx_id {
+                    if let Some(other_state) = lookup_tx_state(
+                        &mvcc_store.txs,
+                        &mvcc_store.finalized_tx_states,
+                        other_tx_id,
+                    ) {
+                        match other_state {
+                            TransactionState::Committed(committed_end_ts) => {
+                                if committed_end_ts > tx.begin_ts {
+                                    return Err(LimboError::WriteWriteConflict);
+                                }
+                            }
+                            TransactionState::Preparing(other_end_ts) => {
+                                if other_end_ts < end_ts {
+                                    return Err(LimboError::WriteWriteConflict);
+                                }
+                            }
+                            TransactionState::Active
+                            | TransactionState::Aborted
+                            | TransactionState::Terminated => {}
+                        }
+                    }
+                }
+            }
+            // In-flight insert/update-in by another tx for this rowid. Same
+            // first-committer-wins handling.
+            if let Some(TxTimestampOrID::TxID(other_tx_id)) = version.begin {
+                if other_tx_id != self.tx_id {
+                    if let Some(other_state) = lookup_tx_state(
+                        &mvcc_store.txs,
+                        &mvcc_store.finalized_tx_states,
+                        other_tx_id,
+                    ) {
+                        match other_state {
+                            TransactionState::Committed(_) => {
+                                return Err(LimboError::WriteWriteConflict);
+                            }
+                            TransactionState::Preparing(other_end_ts) => {
+                                if other_end_ts < end_ts {
+                                    return Err(LimboError::WriteWriteConflict);
+                                }
+                            }
+                            TransactionState::Active
+                            | TransactionState::Aborted
+                            | TransactionState::Terminated => {}
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Validates a single version chain against the current transaction's commit timestamp.
     ///
     /// This enforces snapshot-isolation conflict checks for both:
@@ -1718,6 +1822,21 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
                     } else {
                         self.check_index_for_conflicts(id, *end_ts, tx, mvcc_store)?;
                     }
+                }
+
+                // Validate the FK read set: catch read-write skews on FK
+                // parent rows that were observed in our snapshot but may have
+                // been concurrently deleted/modified (issue #5955). Distinct
+                // from `read_set`, which captures every cursor read; we only
+                // validate the FK-tracked subset here so BEGIN CONCURRENT
+                // keeps snapshot-isolation semantics for non-FK reads.
+                for id in tx.fk_read_set.iter() {
+                    let id = id.value();
+                    if tx.write_set.contains(id) {
+                        // Already validated by the write_set loop above.
+                        continue;
+                    }
+                    self.check_read_for_conflicts(id, *end_ts, tx, mvcc_store)?;
                 }
 
                 // Validation passed. Wait for commit dependencies before building
@@ -3302,6 +3421,23 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                 return Some(visible_row);
             }
         }
+    }
+
+    /// Records `rowid` in the active transaction's FK read set so commit-time
+    /// validation can detect cross-row read-write skews on FK constraints.
+    /// Used by FK checks where the parent row was observed in this
+    /// transaction's snapshot but may be modified by another concurrent
+    /// transaction before we commit (issue #5955). No-op if the transaction
+    /// is not active.
+    pub fn track_fk_parent_read(&self, tx_id: TxID, rowid: RowID) {
+        let Some(tx) = self.txs.get(&tx_id) else {
+            return;
+        };
+        let tx = tx.value();
+        if !matches!(tx.state.load(), TransactionState::Active) {
+            return;
+        }
+        tx.insert_to_fk_read_set(rowid);
     }
 
     pub fn seek_rowid(

@@ -13346,6 +13346,44 @@ pub fn op_fk_check(
     Ok(InsnFunctionStepResult::Step)
 }
 
+pub fn op_mvcc_fk_parent_track_rowid(
+    program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+    _pager: &Arc<Pager>,
+) -> Result<InsnFunctionStepResult> {
+    load_insn!(
+        MvccFkParentTrackRowid {
+            db,
+            root_page,
+            rowid_reg,
+        },
+        insn
+    );
+    let Some(mv_store) = program.connection.mv_store_for_db(*db) else {
+        state.pc += 1;
+        return Ok(InsnFunctionStepResult::Step);
+    };
+    let Some(tx_id) = program.connection.get_mv_tx_id_for_db(*db) else {
+        state.pc += 1;
+        return Ok(InsnFunctionStepResult::Step);
+    };
+    let rowid = match state.registers[*rowid_reg].get_value() {
+        Value::Numeric(Numeric::Integer(v)) => *v,
+        _ => {
+            state.pc += 1;
+            return Ok(InsnFunctionStepResult::Step);
+        }
+    };
+    let table_id = mv_store.get_table_id_from_root_page(*root_page);
+    mv_store.track_fk_parent_read(
+        tx_id,
+        crate::mvcc::database::RowID::new(table_id, crate::mvcc::database::RowKey::Int(rowid)),
+    );
+    state.pc += 1;
+    Ok(InsnFunctionStepResult::Step)
+}
+
 pub fn op_hash_build(
     program: &Program,
     state: &mut ProgramState,

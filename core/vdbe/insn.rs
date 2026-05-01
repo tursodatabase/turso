@@ -1614,6 +1614,15 @@ pub enum Insn {
     FkCheck {
         deferred: bool,
     },
+    // Track an FK parent-row read in the current MVCC transaction's read set so
+    // commit-time validation can detect cross-transaction read-write skews
+    // (e.g. tx0 deletes the parent row that tx1's FK check observed). No-op when
+    // MVCC is not enabled or the rowid register is NULL.
+    MvccFkParentTrackRowid {
+        db: usize,
+        root_page: i64,
+        rowid_reg: usize,
+    },
 
     /// Build a hash table from a cursor for hash join.
     HashBuild {
@@ -1980,6 +1989,7 @@ impl InsnVariants {
             InsnVariants::FkCounter => execute::op_fk_counter,
             InsnVariants::FkIfZero => execute::op_fk_if_zero,
             InsnVariants::FkCheck => execute::op_fk_check,
+            InsnVariants::MvccFkParentTrackRowid => execute::op_mvcc_fk_parent_track_rowid,
             InsnVariants::VBegin => execute::op_vbegin,
             InsnVariants::VRename => execute::op_vrename,
             InsnVariants::FilterAdd => execute::op_filter_add,
