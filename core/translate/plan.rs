@@ -734,6 +734,11 @@ pub enum DmlSafetyReason {
     /// The index method cursor does not materialize results up front,
     /// so writes could invalidate the live iterator.
     IndexMethodNotMaterialized,
+    /// The UPDATE changes a column referenced by an FK with a cascading
+    /// action (CASCADE / SET NULL / SET DEFAULT). The cascade can fire
+    /// triggers on referencing tables that write back to the target,
+    /// which would invalidate the live scan iterator.
+    FkCascade,
 }
 
 /// Safety decisions made while planning UPDATE/DELETE.

@@ -1,0 +1,217 @@
+@database :memory:
+
+# Issue #6460: UPDATE on a parent table must materialize its target rowids
+# when the parent's key is referenced by an FK with a cascading action.
+# Without materialization, the cascade can fire triggers on the child
+# that mutate the parent table mid-scan, causing later rows to be
+# skipped or visited twice.
+
+@cross-check-integrity
+test update-fk-cascade-trigger-mutates-parent {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE parent(key INTEGER UNIQUE, x INTEGER);
+    CREATE TABLE child(id INTEGER PRIMARY KEY,
+                       pkey INTEGER REFERENCES parent(key) ON UPDATE CASCADE);
+    CREATE TRIGGER tr AFTER UPDATE ON child BEGIN
+      UPDATE parent SET x = 0 WHERE rowid > 0;
+    END;
+    INSERT INTO parent VALUES (1,100),(2,200),(3,300);
+    INSERT INTO child  VALUES (10,1),(20,2),(30,3);
+    UPDATE parent SET key = key + 10 WHERE x > 150;
+    SELECT key, x FROM parent ORDER BY rowid;
+    SELECT 'sep';
+    SELECT id, pkey FROM child ORDER BY id;
+}
+expect {
+    1|0
+    12|0
+    13|0
+    sep
+    10|1
+    20|12
+    30|13
+}
+
+@cross-check-integrity
+test update-fk-set-null-trigger-mutates-parent {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE parent(key INTEGER UNIQUE, x INTEGER);
+    CREATE TABLE child(id INTEGER PRIMARY KEY,
+                       pkey INTEGER REFERENCES parent(key) ON UPDATE SET NULL);
+    CREATE TRIGGER tr AFTER UPDATE ON child BEGIN
+      UPDATE parent SET x = 0 WHERE rowid > 0;
+    END;
+    INSERT INTO parent VALUES (1,100),(2,200),(3,300);
+    INSERT INTO child  VALUES (10,1),(20,2),(30,3);
+    UPDATE parent SET key = key + 10 WHERE x > 150;
+    SELECT key, x FROM parent ORDER BY rowid;
+    SELECT 'sep';
+    SELECT id, pkey FROM child ORDER BY id;
+}
+expect {
+    1|0
+    12|0
+    13|0
+    sep
+    10|1
+    20|
+    30|
+}
+
+@cross-check-integrity
+test update-fk-set-default-trigger-mutates-parent {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE parent(key INTEGER UNIQUE, x INTEGER);
+    CREATE TABLE child(id INTEGER PRIMARY KEY,
+                       pkey INTEGER DEFAULT 0 REFERENCES parent(key) ON UPDATE SET DEFAULT);
+    INSERT INTO parent VALUES (0,0),(1,100),(2,200),(3,300);
+    INSERT INTO child  VALUES (10,1),(20,2),(30,3);
+    CREATE TRIGGER tr AFTER UPDATE ON child BEGIN
+      UPDATE parent SET x = 0 WHERE key <> 0;
+    END;
+    UPDATE parent SET key = key + 10 WHERE x > 150;
+    SELECT key, x FROM parent ORDER BY rowid;
+    SELECT 'sep';
+    SELECT id, pkey FROM child ORDER BY id;
+}
+expect {
+    0|0
+    1|0
+    12|0
+    13|0
+    sep
+    10|1
+    20|0
+    30|0
+}
+
+# AFTER UPDATE trigger on the child mutates the parent (matches the
+# second variant in the issue): SET NULL action with an UPDATE trigger
+# on child writing back to parent.
+@cross-check-integrity
+test update-fk-set-null-after-update-trigger-on-child {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE parent(key INTEGER UNIQUE, x INTEGER);
+    CREATE TABLE child(id INTEGER PRIMARY KEY,
+                       pkey INTEGER REFERENCES parent(key) ON UPDATE SET NULL);
+    INSERT INTO parent VALUES (1,100),(2,200),(3,300);
+    INSERT INTO child  VALUES (10,1),(20,2),(30,3);
+    CREATE TRIGGER tr AFTER UPDATE ON child BEGIN
+      UPDATE parent SET x = x + 1 WHERE x > 0;
+    END;
+    UPDATE parent SET key = key + 10 WHERE x > 150;
+    SELECT key, x FROM parent ORDER BY rowid;
+}
+expect {
+    1|102
+    12|202
+    13|302
+}
+
+# Multi-column FK with cascade.
+@cross-check-integrity
+test update-fk-multicol-cascade {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE parent(a INTEGER, b INTEGER, x INTEGER, UNIQUE(a, b));
+    CREATE TABLE child(id INTEGER PRIMARY KEY, ca INTEGER, cb INTEGER,
+                       FOREIGN KEY(ca, cb) REFERENCES parent(a, b) ON UPDATE CASCADE);
+    INSERT INTO parent VALUES (1,1,100),(2,2,200),(3,3,300);
+    INSERT INTO child  VALUES (10,1,1),(20,2,2),(30,3,3);
+    CREATE TRIGGER tr AFTER UPDATE ON child BEGIN
+      UPDATE parent SET x = 0 WHERE x > 0;
+    END;
+    UPDATE parent SET a = a + 10 WHERE x > 150;
+    SELECT a, b, x FROM parent ORDER BY rowid;
+    SELECT 'sep';
+    SELECT id, ca, cb FROM child ORDER BY id;
+}
+expect {
+    1|1|0
+    12|2|0
+    13|3|0
+    sep
+    10|1|1
+    20|12|2
+    30|13|3
+}
+
+# BEFORE UPDATE trigger on child mutates parent during cascade.
+@cross-check-integrity
+test update-fk-cascade-before-update-trigger-on-child {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE parent(key INTEGER UNIQUE, x INTEGER);
+    CREATE TABLE child(id INTEGER PRIMARY KEY,
+                       pkey INTEGER REFERENCES parent(key) ON UPDATE CASCADE);
+    INSERT INTO parent VALUES (1,100),(2,200),(3,300);
+    INSERT INTO child  VALUES (10,1),(20,2),(30,3);
+    CREATE TRIGGER tr BEFORE UPDATE ON child BEGIN
+      UPDATE parent SET x = 0 WHERE rowid > 0;
+    END;
+    UPDATE parent SET key = key + 10 WHERE x > 150;
+    SELECT key, x FROM parent ORDER BY rowid;
+    SELECT 'sep';
+    SELECT id, pkey FROM child ORDER BY id;
+}
+expect {
+    1|0
+    12|0
+    13|0
+    sep
+    10|1
+    20|12
+    30|13
+}
+
+# FK references parent's INTEGER PRIMARY KEY (rowid alias). The existing
+# KeyMutation safety path also catches this, but it is good to exercise
+# the FkCascade path explicitly so future refactors don't regress.
+@cross-check-integrity
+test update-fk-cascade-rowid-alias-parent {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE parent(id INTEGER PRIMARY KEY, x INTEGER);
+    CREATE TABLE child(cid INTEGER PRIMARY KEY,
+                       pid INTEGER REFERENCES parent(id) ON UPDATE CASCADE);
+    INSERT INTO parent VALUES (1,100),(2,200),(3,300);
+    INSERT INTO child  VALUES (10,1),(20,2),(30,3);
+    CREATE TRIGGER tr AFTER UPDATE ON child BEGIN
+      UPDATE parent SET x = 0 WHERE id > 0;
+    END;
+    UPDATE parent SET id = id + 10 WHERE x > 150;
+    SELECT id, x FROM parent ORDER BY rowid;
+    SELECT 'sep';
+    SELECT cid, pid FROM child ORDER BY cid;
+}
+expect {
+    1|0
+    12|0
+    13|0
+    sep
+    10|1
+    20|12
+    30|13
+}
+
+# Sanity check: an UPDATE that does NOT touch a parent FK column should
+# behave as before — no cascade fires, scan does not need materialization.
+@cross-check-integrity
+test update-fk-no-cascade-when-key-untouched {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE parent(key INTEGER UNIQUE, x INTEGER);
+    CREATE TABLE child(id INTEGER PRIMARY KEY,
+                       pkey INTEGER REFERENCES parent(key) ON UPDATE CASCADE);
+    INSERT INTO parent VALUES (1,100),(2,200),(3,300);
+    INSERT INTO child  VALUES (10,1),(20,2),(30,3);
+    UPDATE parent SET x = x + 1 WHERE x > 150;
+    SELECT key, x FROM parent ORDER BY rowid;
+    SELECT 'sep';
+    SELECT id, pkey FROM child ORDER BY id;
+}
+expect {
+    1|100
+    2|201
+    3|301
+    sep
+    10|1
+    20|2
+    30|3
+}

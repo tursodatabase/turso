@@ -64,6 +64,7 @@ use order::{
 use rustc_hash::FxHashMap as HashMap;
 use std::{cmp::Ordering, collections::VecDeque, sync::Arc};
 use turso_ext::{ConstraintInfo, ConstraintUsage};
+use turso_parser::ast::RefAct;
 use turso_parser::ast::{self, Expr, SortOrder, SubqueryType, TriggerEvent};
 
 pub(crate) mod access_method;
@@ -896,6 +897,25 @@ fn update_write_set_reason(
             btree_table,
         ) {
             break 'requires Some(DmlSafetyReason::Trigger);
+        }
+
+        // FK cascading actions on the target's parent key may fire writes on
+        // other tables (CASCADE / SET NULL / SET DEFAULT). Those writes can in
+        // turn fire triggers that mutate the target table while the UPDATE
+        // scan is still iterating it, causing rows to be skipped or visited
+        // twice. Self-referential cascades likewise rewrite rows in the
+        // target during the scan. Materialize target rowids first to keep
+        // the write set stable. (See issue #6460.)
+        let referencing_fks = resolver.with_schema(database_id, |s| {
+            s.resolved_fks_referencing(&btree_table.name)
+        })?;
+        for fk in &referencing_fks {
+            if matches!(fk.fk.on_update, RefAct::NoAction | RefAct::Restrict) {
+                continue;
+            }
+            if fk.parent_key_may_change(&updated_cols, btree_table)? {
+                break 'requires Some(DmlSafetyReason::FkCascade);
+            }
         }
 
         // REPLACE mode requires ephemeral table because REPLACE deletes conflicting rows,
