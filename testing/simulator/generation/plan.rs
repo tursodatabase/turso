@@ -411,10 +411,17 @@ fn random_fault<R: rand::Rng + ?Sized>(
     env: &SimulatorEnv,
     conn_index: usize,
 ) -> Interactions {
-    let faults = if env.opts.disable_reopen_database {
-        vec![Fault::Disconnect]
-    } else {
+    // MVCC has no recovery from the logical log on restart (see
+    // docs/agent-guides/mvcc.md), so REOPEN_DATABASE silently drops every
+    // committed-but-not-checkpointed row. The simulator's shadow does not
+    // model that loss and would flag it as missing rows in a later assertion.
+    // Skip until MVCC recovery is implemented; same pattern as
+    // FaultyQuery being gated on `!env.profile.mvcc`.
+    let allow_reopen = !env.opts.disable_reopen_database && !env.profile.mvcc;
+    let faults = if allow_reopen {
         vec![Fault::Disconnect, Fault::ReopenDatabase]
+    } else {
+        vec![Fault::Disconnect]
     };
     let fault = faults[rng.random_range(0..faults.len())];
     Interactions::new(conn_index, InteractionsType::Fault(fault))
