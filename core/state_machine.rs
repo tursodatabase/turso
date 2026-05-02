@@ -62,6 +62,28 @@ impl<State: StateTransition> StateMachine<State> {
         }
     }
 
+    /// Borrow the inner state, e.g. to inspect intermediate progress.
+    pub fn current_state(&self) -> &State {
+        &self.state
+    }
+
+    /// Run a single inner transition without looping on `Continue`.
+    /// Used when callers need to stop at an intermediate state.
+    pub fn try_step_inner(
+        &mut self,
+        context: &State::Context,
+    ) -> Result<TransitionResult<State::SMResult>> {
+        if self.is_finalized {
+            unreachable!("StateMachine::try_step_inner: state machine is finalized");
+        }
+        let result = self.state.step(context)?;
+        if let TransitionResult::Done(_) = &result {
+            assert!(self.state.is_finalized());
+            self.is_finalized = true;
+        }
+        Ok(result)
+    }
+
     pub fn step(&mut self, context: &State::Context) -> Result<IOResult<State::SMResult>> {
         loop {
             if self.is_finalized {

@@ -1592,6 +1592,27 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CommitStateMachine<Clock, A> {
         self.pager.end_read_tx();
     }
 
+    /// True once the state machine has moved past the validation phase
+    /// (`Initial` → `Commit`). After this point, no further write-write
+    /// conflict checks run, so callers can safely defer the rest of the
+    /// commit work.
+    pub fn is_past_validation(&self) -> bool {
+        !matches!(
+            self.state,
+            CommitState::Initial | CommitState::Commit { .. }
+        )
+    }
+
+    /// The transaction id this state machine is committing.
+    pub fn tx_id(&self) -> TxID {
+        self.tx_id
+    }
+
+    /// The database id this state machine is committing.
+    pub fn db_id(&self) -> usize {
+        self.db_id
+    }
+
     /// Validates commit-time write-write conflicts for one table row key.
     ///
     /// Returns [LimboError::WriteWriteConflict] when another transaction committed or is
