@@ -1865,7 +1865,20 @@ impl ProgramBuilder {
         let default = 'value: {
             let default = match cursor_type {
                 CursorType::BTreeTable(btree) => &btree.columns()[column].default,
-                CursorType::BTreeIndex(index) => &index.columns[column].default,
+                CursorType::BTreeIndex(index) => {
+                    // `column` is a *table* ordinal; an index only stores a
+                    // subset of the table's columns, so the same ordinal may
+                    // exceed `index.columns.len()`. This happens when emitting
+                    // the OLD image of a DELETE that iterates via an index
+                    // covering a virtual generated column whose expression
+                    // depends on a non-indexed column (#6612). The non-indexed
+                    // dependency has no entry in the index, so it carries no
+                    // default from this cursor — fall through.
+                    let Some(col) = index.columns.get(column) else {
+                        break 'value None;
+                    };
+                    &col.default
+                }
                 CursorType::MaterializedView(btree, _) => &btree.columns()[column].default,
                 _ => break 'value None,
             };

@@ -584,8 +584,12 @@ pub fn insn_to_row(
                         name
                     }
                     CursorType::BTreeIndex(index) => {
-                        let name = &index.columns.get(*column).expect("column index out of bounds").name;
-                        Some(name)
+                        // `column` is a table ordinal; not every table column is in
+                        // the index. When EXPLAINing a DELETE that emits the OLD
+                        // image of a virtual generated column from an index cursor
+                        // (#6612), the dependency's table ordinal can exceed
+                        // `index.columns.len()`. Tolerate that and skip the name.
+                        index.columns.get(*column).map(|c| &c.name)
                     }
                     CursorType::MaterializedView(table, _) => {
                         let name = table.columns().get(*column).and_then(|v| v.name.as_ref());
