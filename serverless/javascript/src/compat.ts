@@ -231,7 +231,7 @@ class LibSQLClient implements Client {
       columnTypes: result.columnTypes || [],
       rows: result.rows || [],
       rowsAffected: result.rowsAffected || 0,
-      lastInsertRowid: result.lastInsertRowid ? BigInt(result.lastInsertRowid) : undefined,
+      lastInsertRowid: result.lastInsertRowid != null ? BigInt(result.lastInsertRowid) : undefined,
       toJSON() {
         return {
           columns: this.columns,
