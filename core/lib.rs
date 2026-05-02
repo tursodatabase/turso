@@ -458,6 +458,11 @@ enum DatabaseKey {
 static DATABASE_MANAGER: LazyLock<Arc<parking_lot::Mutex<HashMap<DatabaseKey, RegistryEntry>>>> =
     LazyLock::new(|| Arc::new(parking_lot::Mutex::new(HashMap::default())));
 
+#[cfg(feature = "simulator")]
+pub fn clear_database_registry() {
+    DATABASE_MANAGER.lock().clear();
+}
+
 /// The `Database` object contains per database file state that is shared
 /// between multiple connections.
 ///
