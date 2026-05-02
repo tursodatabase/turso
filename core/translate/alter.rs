@@ -1,5 +1,6 @@
 use crate::sync::Arc;
 use crate::{schema::BTreeTable, turso_assert_eq, turso_assert_ne};
+use std::num::NonZeroUsize;
 use turso_parser::{
     ast::{self, TableInternalId},
     parser::Parser,
@@ -10,13 +11,26 @@ use super::{
     update::translate_update_for_schema_change,
 };
 use crate::{
-    error::SQLITE_CONSTRAINT_CHECK,
+    error::{SQLITE_CONSTRAINT_CHECK, SQLITE_CONSTRAINT_UNIQUE},
     function::{AlterTableFunc, Func},
-    schema::{CheckConstraint, Column, ForeignKey, Table, RESERVED_TABLE_PREFIXES},
+    schema::{
+        CheckConstraint, Column, ForeignKey, Index, PseudoCursorType, Table,
+        RESERVED_TABLE_PREFIXES,
+    },
     translate::{
-        emitter::{emit_check_constraints, gencol::compute_virtual_columns, Resolver},
-        expr::{translate_expr, walk_expr, walk_expr_mut, WalkControl},
-        plan::{ColumnMask, ColumnUsedMask, OuterQueryReference, TableReferences},
+        emitter::{
+            emit_check_constraints, emit_index_column_value_new_image,
+            emit_index_column_value_old_image, gencol::compute_virtual_columns, Resolver,
+        },
+        expr::{
+            emit_dml_expr_index_value, translate_condition_expr, translate_expr, walk_expr,
+            walk_expr_mut, ConditionMetadata, WalkControl,
+        },
+        insert::format_unique_violation_desc,
+        plan::{
+            ColumnMask, ColumnUsedMask, IterationDirection, JoinedTable, Operation,
+            OuterQueryReference, Scan, TableReferences,
+        },
         trigger::create_trigger_to_sql,
     },
     util::{
@@ -26,8 +40,8 @@ use crate::{
     },
     vdbe::{
         affinity::Affinity,
-        builder::{CursorType, DmlColumnContext, ProgramBuilder},
-        insn::{to_u16, CmpInsFlags, Cookie, Insn, RegisterOrLiteral},
+        builder::{CursorKey, CursorType, DmlColumnContext, ProgramBuilder},
+        insn::{to_u16, CmpInsFlags, Cookie, IdxInsertFlags, Insn, RegisterOrLiteral},
     },
     vtab::VirtualTable,
     LimboError, Numeric, Result, Value,
@@ -996,7 +1010,7 @@ pub fn translate_alter_table(
                 input,
                 |program| {
                     let table_name = btree.name.clone();
-                    let source_column_by_schema_idx = btree
+                    let source_column_by_schema_idx: Vec<Option<usize>> = btree
                         .columns()
                         .iter()
                         .enumerate()
@@ -1012,12 +1026,15 @@ pub fn translate_alter_table(
                         .collect();
                     emit_rewrite_table_rows(
                         program,
+                        resolver,
                         original_btree.clone(),
                         &btree,
-                        source_column_by_schema_idx,
+                        &source_column_by_schema_idx,
+                        &[],
                         connection,
                         database_id,
-                    );
+                    )
+                    .expect("DROP COLUMN row rewrite should not fail without index rewrites");
 
                     program.emit_insn(Insn::SetCookie {
                         db: database_id,
@@ -1691,6 +1708,31 @@ pub fn translate_alter_table(
             } else {
                 None
             };
+            let indexes_to_rewrite = if rewrites_physical_layout {
+                resolver.with_schema(database_id, |s| {
+                    s.get_indices(table_name)
+                        .filter(|index| index.index_method.is_none())
+                        .cloned()
+                        .collect::<Vec<_>>()
+                })
+            } else {
+                Vec::new()
+            };
+            let rewrite_source_column_by_schema_idx =
+                rewritten_table.as_ref().map(|rewritten_table| {
+                    rewritten_table
+                        .columns()
+                        .iter()
+                        .enumerate()
+                        .map(|(idx, column)| {
+                            if column.is_virtual_generated() {
+                                None
+                            } else {
+                                Some(idx)
+                            }
+                        })
+                        .collect::<Vec<_>>()
+                });
 
             // If renaming, rewrite trigger SQL for all triggers that reference this column
             // We'll collect the triggers to rewrite and update them in sqlite_schema
@@ -1822,6 +1864,20 @@ pub fn translate_alter_table(
             } else {
                 None
             };
+
+            if let (Some(rewritten_table), Some(source_column_by_schema_idx)) =
+                (&rewritten_table, &rewrite_source_column_by_schema_idx)
+            {
+                emit_validate_rewritten_unique_indexes(
+                    program,
+                    resolver,
+                    original_btree.clone(),
+                    rewritten_table,
+                    source_column_by_schema_idx,
+                    &indexes_to_rewrite,
+                    database_id,
+                )?;
+            }
 
             let sqlite_schema = resolver
                 .with_schema(database_id, |s| s.get_btree_table(SQLITE_TABLEID))
@@ -1991,26 +2047,19 @@ pub fn translate_alter_table(
                     database_id,
                 )?;
 
-                let source_column_by_schema_idx = rewritten_table
-                    .columns()
-                    .iter()
-                    .enumerate()
-                    .map(|(idx, column)| {
-                        if column.is_virtual_generated() {
-                            None
-                        } else {
-                            Some(idx)
-                        }
-                    })
-                    .collect();
+                let source_column_by_schema_idx = rewrite_source_column_by_schema_idx
+                    .as_ref()
+                    .expect("rewrite source map must exist when table is rewritten");
                 emit_rewrite_table_rows(
                     program,
+                    resolver,
                     original_btree.clone(),
                     &rewritten_table,
                     source_column_by_schema_idx,
+                    &indexes_to_rewrite,
                     connection,
                     database_id,
-                );
+                )?;
             }
 
             program.emit_insn(Insn::SetCookie {
@@ -2032,6 +2081,240 @@ pub fn translate_alter_table(
     Ok(())
 }
 
+/// Check that rewritten keys for UNIQUE indexes remain unique before schema/data writes.
+fn emit_validate_rewritten_unique_indexes(
+    program: &mut ProgramBuilder,
+    resolver: &Resolver,
+    original_btree: Arc<BTreeTable>,
+    rewritten_table: &BTreeTable,
+    source_column_by_schema_idx: &[Option<usize>],
+    indexes_to_rewrite: &[Arc<Index>],
+    database_id: usize,
+) -> Result<()> {
+    for index in indexes_to_rewrite.iter().filter(|index| index.unique) {
+        emit_validate_rewritten_unique_index(
+            program,
+            resolver,
+            original_btree.clone(),
+            rewritten_table,
+            source_column_by_schema_idx,
+            index,
+            database_id,
+        )?;
+    }
+    Ok(())
+}
+
+fn emit_validate_rewritten_unique_index(
+    program: &mut ProgramBuilder,
+    resolver: &Resolver,
+    original_btree: Arc<BTreeTable>,
+    rewritten_table: &BTreeTable,
+    source_column_by_schema_idx: &[Option<usize>],
+    index: &Arc<Index>,
+    database_id: usize,
+) -> Result<()> {
+    let layout = rewritten_table.column_layout();
+    let non_virtual_column_count = layout.num_non_virtual_cols();
+    let table_cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(original_btree.clone()));
+    let sorter_cursor_id = program.alloc_cursor_id(CursorType::Sorter);
+    let content_reg = program.alloc_register();
+    let pseudo_cursor_id = program.alloc_cursor_id(CursorType::Pseudo(PseudoCursorType {
+        column_count: index.columns.len() + 1,
+    }));
+    let order_collations_nulls = index
+        .columns
+        .iter()
+        .map(|column| (column.order, column.collation, None))
+        .collect();
+
+    program.emit_insn(Insn::SorterOpen {
+        cursor_id: sorter_cursor_id,
+        columns: index.columns.len(),
+        order_collations_nulls,
+        comparators: vec![],
+    });
+    program.emit_insn(Insn::OpenPseudo {
+        cursor_id: pseudo_cursor_id,
+        content_reg,
+        num_fields: index.columns.len() + 1,
+    });
+    program.emit_insn(Insn::OpenRead {
+        cursor_id: table_cursor_id,
+        root_page: original_btree.root_page,
+        db: database_id,
+    });
+
+    let loop_start = program.allocate_label();
+    let loop_end = program.allocate_label();
+    program.emit_insn(Insn::Rewind {
+        cursor_id: table_cursor_id,
+        pc_if_empty: loop_end,
+    });
+    program.preassign_label_to_next_insn(loop_start);
+
+    let rowid = program.alloc_register();
+    program.emit_insn(Insn::RowId {
+        cursor_id: table_cursor_id,
+        dest: rowid,
+    });
+    program.emit_insn(Insn::IsNull {
+        reg: rowid,
+        target_pc: loop_end,
+    });
+
+    let base_dest_reg = program.alloc_registers(non_virtual_column_count);
+    for (schema_idx, source_column_idx) in source_column_by_schema_idx.iter().enumerate() {
+        let Some(source_column_idx) = source_column_idx else {
+            continue;
+        };
+
+        program.emit_column_or_rowid(
+            table_cursor_id,
+            *source_column_idx,
+            layout.to_register(base_dest_reg, schema_idx),
+        );
+    }
+
+    let mut skip_insert_label = None;
+    if let Some(where_clause) = &index.where_clause {
+        let columns = original_btree.columns();
+        let mut column_regs = columns
+            .iter()
+            .enumerate()
+            .map(|(idx, column)| {
+                if column.is_rowid_alias() {
+                    rowid
+                } else {
+                    layout.to_register(base_dest_reg, idx)
+                }
+            })
+            .collect::<Vec<_>>();
+        let where_reg = program.alloc_register();
+        emit_dml_expr_index_value(
+            program,
+            resolver,
+            where_clause.as_ref().clone(),
+            columns,
+            &mut column_regs,
+            &original_btree,
+            where_reg,
+        )?;
+
+        let label = program.allocate_label();
+        program.emit_insn(Insn::IfNot {
+            reg: where_reg,
+            target_pc: label,
+            jump_if_null: true,
+        });
+        skip_insert_label = Some(label);
+    }
+
+    let num_cols = index.columns.len();
+    let start_reg = program.alloc_registers(num_cols + 1);
+    for (reg_offset, index_column) in index.columns.iter().enumerate() {
+        emit_index_column_value_new_image(
+            program,
+            resolver,
+            original_btree.columns(),
+            base_dest_reg,
+            rowid,
+            index_column,
+            start_reg + reg_offset,
+            &layout,
+            &original_btree,
+        )?;
+    }
+    program.emit_insn(Insn::Copy {
+        src_reg: rowid,
+        dst_reg: start_reg + num_cols,
+        extra_amount: 0,
+    });
+
+    let affinity_str = index
+        .columns
+        .iter()
+        .map(|index_column| {
+            if index_column.expr.is_some() {
+                Affinity::Blob.aff_mask()
+            } else {
+                rewritten_table.columns()[index_column.pos_in_table]
+                    .affinity_with_strict(rewritten_table.is_strict)
+                    .aff_mask()
+            }
+        })
+        .collect::<String>();
+    program.emit_insn(Insn::Affinity {
+        start_reg,
+        count: NonZeroUsize::new(num_cols).expect("index should have columns"),
+        affinities: affinity_str,
+    });
+
+    let record = program.alloc_register();
+    program.emit_insn(Insn::MakeRecord {
+        start_reg: to_u16(start_reg),
+        count: to_u16(num_cols + 1),
+        dest_reg: to_u16(record),
+        index_name: Some(index.name.clone()),
+        affinity_str: None,
+    });
+    program.emit_insn(Insn::SorterInsert {
+        cursor_id: sorter_cursor_id,
+        record_reg: record,
+    });
+
+    if let Some(label) = skip_insert_label {
+        program.preassign_label_to_next_insn(label);
+    }
+    program.emit_insn(Insn::Next {
+        cursor_id: table_cursor_id,
+        pc_if_next: loop_start,
+    });
+    program.preassign_label_to_next_insn(loop_end);
+
+    let sorted_loop_start = program.allocate_label();
+    let sorted_loop_end = program.allocate_label();
+    program.emit_insn(Insn::SorterSort {
+        cursor_id: sorter_cursor_id,
+        pc_if_empty: sorted_loop_end,
+    });
+
+    let sorted_record_reg = program.alloc_register();
+    let goto_label = program.allocate_label();
+    let label_after_sorter_compare = program.allocate_label();
+    program.preassign_label_to_next_insn(goto_label);
+    program.emit_insn(Insn::Goto {
+        target_pc: label_after_sorter_compare,
+    });
+    program.preassign_label_to_next_insn(sorted_loop_start);
+    program.emit_insn(Insn::SorterCompare {
+        cursor_id: sorter_cursor_id,
+        sorted_record_reg,
+        num_regs: num_cols,
+        pc_when_nonequal: goto_label,
+    });
+    program.emit_insn(Insn::Halt {
+        err_code: SQLITE_CONSTRAINT_UNIQUE,
+        description: format_unique_violation_desc(rewritten_table.name.as_str(), index),
+        on_error: None,
+        description_reg: None,
+    });
+    program.preassign_label_to_next_insn(label_after_sorter_compare);
+    program.emit_insn(Insn::SorterData {
+        pseudo_cursor: pseudo_cursor_id,
+        cursor_id: sorter_cursor_id,
+        dest_reg: sorted_record_reg,
+    });
+    program.emit_insn(Insn::SorterNext {
+        cursor_id: sorter_cursor_id,
+        pc_if_next: sorted_loop_start,
+    });
+    program.preassign_label_to_next_insn(sorted_loop_end);
+    program.close_cursors(&[sorter_cursor_id, table_cursor_id, pseudo_cursor_id]);
+
+    Ok(())
+}
+
 /// Rewrite every row in `original_btree` into the physical layout of `rewritten_table`.
 ///
 /// `source_column_by_schema_idx` is indexed by the rewritten table's schema order. Each
@@ -2039,12 +2322,14 @@ pub fn translate_alter_table(
 /// for virtual generated columns, which are omitted from the stored record entirely.
 fn emit_rewrite_table_rows(
     program: &mut ProgramBuilder,
+    resolver: &Resolver,
     original_btree: Arc<BTreeTable>,
     rewritten_table: &BTreeTable,
-    source_column_by_schema_idx: Vec<Option<usize>>,
+    source_column_by_schema_idx: &[Option<usize>],
+    indexes_to_rewrite: &[Arc<Index>],
     connection: &Arc<crate::Connection>,
     database_id: usize,
-) {
+) -> Result<()> {
     turso_assert_eq!(
         source_column_by_schema_idx.len(),
         rewritten_table.columns().len()
@@ -2055,7 +2340,41 @@ fn emit_rewrite_table_rows(
     let root_page = rewritten_table.root_page;
     let table_name = rewritten_table.name.clone();
     let affinity_str = non_virtual_affinity_str(rewritten_table);
-    let cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(original_btree));
+    let table_ref = program.table_reference_counter.next();
+    let cursor_id = program.alloc_cursor_id_keyed(
+        CursorKey::table(table_ref),
+        CursorType::BTreeTable(original_btree.clone()),
+    );
+    let mut table_references = TableReferences::new(
+        vec![JoinedTable {
+            op: Operation::Scan(Scan::BTreeTable {
+                iter_dir: IterationDirection::Forwards,
+                index: None,
+            }),
+            table: Table::BTree(original_btree.clone()),
+            identifier: table_name.clone(),
+            internal_id: table_ref,
+            join_info: None,
+            col_used_mask: ColumnUsedMask::default(),
+            column_use_counts: Vec::new(),
+            expression_index_usages: Vec::new(),
+            database_id,
+            indexed: None,
+        }],
+        vec![],
+    );
+    let index_cursor_ids = indexes_to_rewrite
+        .iter()
+        .map(|index| {
+            let index_cursor_id = program.alloc_cursor_index(None, index)?;
+            program.emit_insn(Insn::OpenWrite {
+                cursor_id: index_cursor_id,
+                root_page: RegisterOrLiteral::Literal(index.root_page),
+                db: database_id,
+            });
+            Ok(index_cursor_id)
+        })
+        .collect::<Result<Vec<_>>>()?;
 
     program.emit_insn(Insn::OpenWrite {
         cursor_id,
@@ -2063,45 +2382,215 @@ fn emit_rewrite_table_rows(
         db: database_id,
     });
 
-    program.cursor_loop(cursor_id, |program, rowid| {
-        let base_dest_reg = program.alloc_registers(non_virtual_column_count);
-        for (schema_idx, source_column_idx) in source_column_by_schema_idx.iter().enumerate() {
-            let Some(source_column_idx) = source_column_idx else {
-                continue;
-            };
+    let loop_start = program.allocate_label();
+    let loop_end = program.allocate_label();
+    program.emit_insn(Insn::Rewind {
+        cursor_id,
+        pc_if_empty: loop_end,
+    });
+    program.preassign_label_to_next_insn(loop_start);
 
-            program.emit_column_or_rowid(
-                cursor_id,
-                *source_column_idx,
-                layout.to_register(base_dest_reg, schema_idx),
-            );
+    let rowid = program.alloc_register();
+    program.emit_insn(Insn::RowId {
+        cursor_id,
+        dest: rowid,
+    });
+    program.emit_insn(Insn::IsNull {
+        reg: rowid,
+        target_pc: loop_end,
+    });
+
+    let base_dest_reg = program.alloc_registers(non_virtual_column_count);
+    for (schema_idx, source_column_idx) in source_column_by_schema_idx.iter().enumerate() {
+        let Some(source_column_idx) = source_column_idx else {
+            continue;
+        };
+
+        program.emit_column_or_rowid(
+            cursor_id,
+            *source_column_idx,
+            layout.to_register(base_dest_reg, schema_idx),
+        );
+    }
+
+    for (index, index_cursor_id) in indexes_to_rewrite.iter().zip(index_cursor_ids.iter()) {
+        let mut skip_delete_label = None;
+        if let Some(where_clause) = index.bind_where_expr(Some(&mut table_references), resolver) {
+            let label = program.allocate_label();
+            let condition_true_label = program.allocate_label();
+            translate_condition_expr(
+                program,
+                &table_references,
+                &where_clause,
+                ConditionMetadata {
+                    jump_if_condition_is_true: false,
+                    jump_target_when_false: label,
+                    jump_target_when_true: condition_true_label,
+                    jump_target_when_null: label,
+                },
+                resolver,
+            )?;
+            program.preassign_label_to_next_insn(condition_true_label);
+            skip_delete_label = Some(label);
         }
+
+        let num_regs = index.columns.len() + 1;
+        let start_reg = program.alloc_registers(num_regs);
+        for (reg_offset, index_column) in index.columns.iter().enumerate() {
+            emit_index_column_value_old_image(
+                program,
+                resolver,
+                &mut table_references,
+                cursor_id,
+                table_ref,
+                index_column,
+                start_reg + reg_offset,
+            )?;
+        }
+        program.emit_insn(Insn::RowId {
+            cursor_id,
+            dest: start_reg + num_regs - 1,
+        });
+        program.emit_insn(Insn::IdxDelete {
+            start_reg,
+            num_regs,
+            cursor_id: *index_cursor_id,
+            raise_error_if_no_matching_entry: index.where_clause.is_none(),
+        });
+
+        if let Some(label) = skip_delete_label {
+            program.preassign_label_to_next_insn(label);
+        }
+    }
+
+    let record = program.alloc_register();
+    program.emit_insn(Insn::MakeRecord {
+        start_reg: to_u16(base_dest_reg),
+        count: to_u16(non_virtual_column_count),
+        dest_reg: to_u16(record),
+        index_name: None,
+        affinity_str: Some(affinity_str.clone()),
+    });
+
+    if database_uses_mvcc(connection, database_id) {
+        program.emit_insn(Insn::Delete {
+            cursor_id,
+            table_name: table_name.clone(),
+            is_part_of_update: true,
+        });
+    }
+
+    program.emit_insn(Insn::Insert {
+        cursor: cursor_id,
+        key_reg: rowid,
+        record_reg: record,
+        flag: crate::vdbe::insn::InsertFlags(0),
+        table_name: table_name.clone(),
+    });
+
+    for (index, index_cursor_id) in indexes_to_rewrite.iter().zip(index_cursor_ids.iter()) {
+        let mut skip_insert_label = None;
+        if let Some(where_clause) = &index.where_clause {
+            let columns = original_btree.columns();
+            let mut column_regs = columns
+                .iter()
+                .enumerate()
+                .map(|(idx, column)| {
+                    if column.is_rowid_alias() {
+                        rowid
+                    } else {
+                        layout.to_register(base_dest_reg, idx)
+                    }
+                })
+                .collect::<Vec<_>>();
+            let where_reg = program.alloc_register();
+            emit_dml_expr_index_value(
+                program,
+                resolver,
+                where_clause.as_ref().clone(),
+                columns,
+                &mut column_regs,
+                &original_btree,
+                where_reg,
+            )?;
+
+            let label = program.allocate_label();
+            program.emit_insn(Insn::IfNot {
+                reg: where_reg,
+                target_pc: label,
+                jump_if_null: true,
+            });
+            skip_insert_label = Some(label);
+        }
+
+        let num_cols = index.columns.len();
+        let start_reg = program.alloc_registers(num_cols + 1);
+        for (reg_offset, index_column) in index.columns.iter().enumerate() {
+            emit_index_column_value_new_image(
+                program,
+                resolver,
+                original_btree.columns(),
+                base_dest_reg,
+                rowid,
+                index_column,
+                start_reg + reg_offset,
+                &layout,
+                &original_btree,
+            )?;
+        }
+        program.emit_insn(Insn::Copy {
+            src_reg: rowid,
+            dst_reg: start_reg + num_cols,
+            extra_amount: 0,
+        });
+
+        let affinity_str = index
+            .columns
+            .iter()
+            .map(|index_column| {
+                if index_column.expr.is_some() {
+                    Affinity::Blob.aff_mask()
+                } else {
+                    rewritten_table.columns()[index_column.pos_in_table]
+                        .affinity_with_strict(rewritten_table.is_strict)
+                        .aff_mask()
+                }
+            })
+            .collect::<String>();
+        program.emit_insn(Insn::Affinity {
+            start_reg,
+            count: NonZeroUsize::new(num_cols).expect("index should have columns"),
+            affinities: affinity_str,
+        });
 
         let record = program.alloc_register();
         program.emit_insn(Insn::MakeRecord {
-            start_reg: to_u16(base_dest_reg),
-            count: to_u16(non_virtual_column_count),
+            start_reg: to_u16(start_reg),
+            count: to_u16(num_cols + 1),
             dest_reg: to_u16(record),
-            index_name: None,
-            affinity_str: Some(affinity_str.clone()),
+            index_name: Some(index.name.clone()),
+            affinity_str: None,
         });
-
-        if database_uses_mvcc(connection, database_id) {
-            program.emit_insn(Insn::Delete {
-                cursor_id,
-                table_name: table_name.clone(),
-                is_part_of_update: true,
-            });
-        }
-
-        program.emit_insn(Insn::Insert {
-            cursor: cursor_id,
-            key_reg: rowid,
+        program.emit_insn(Insn::IdxInsert {
+            cursor_id: *index_cursor_id,
             record_reg: record,
-            flag: crate::vdbe::insn::InsertFlags(0),
-            table_name: table_name.clone(),
+            unpacked_start: Some(start_reg),
+            unpacked_count: Some((num_cols + 1) as u16),
+            flags: IdxInsertFlags::new(),
         });
+
+        if let Some(label) = skip_insert_label {
+            program.preassign_label_to_next_insn(label);
+        }
+    }
+
+    program.emit_insn(Insn::Next {
+        cursor_id,
+        pc_if_next: loop_start,
     });
+    program.preassign_label_to_next_insn(loop_end);
+
+    Ok(())
 }
 
 fn non_virtual_affinity_str(table: &BTreeTable) -> String {
