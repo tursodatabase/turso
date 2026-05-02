@@ -10,6 +10,7 @@ use sql_generation::{
 };
 use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap};
+use std::fmt::Write;
 use std::ops::Bound;
 use std::sync::Arc;
 use tracing::{debug, error, trace};
@@ -258,6 +259,40 @@ pub struct WhopperOpts {
     /// On each idle step, each profile fires with the given probability (0.0–1.0).
     /// If none fires, regular workloads run instead.
     pub chaotic_profiles: Vec<(f64, &'static str, Box<dyn ChaoticWorkloadProfile>)>,
+    /// Schema-generation bias.
+    pub schema_bias: SchemaBias,
+    /// If true, MVCC's auto-checkpoint is disabled on the Database immediately after open.
+    /// Recovery bugs need uncheckpointed schema rows to remain in the logical log to exercise recovery.
+    pub disable_mvcc_auto_checkpoint: bool,
+    /// If false, don't close connections before dropping them
+    pub close_connections_gracefully: bool,
+    /// Probabilty of a reopen fault.
+    pub reopen_probability: f64,
+}
+
+/// Schema-generation bias
+#[derive(Debug, Clone)]
+pub struct SchemaBias {
+    /// Probability that a generated table uses a non-integer PRIMARY KEY
+    pub non_rowid_pk_prob: f64,
+    /// Probability that a column is UNIQUE (autoindex)
+    pub unique_col_prob: f64,
+    pub num_tables_range: std::ops::RangeInclusive<u32>,
+    pub num_columns_range: std::ops::RangeInclusive<u32>,
+    /// Initial rows per table. Rows are guaranteed unique, so that INSERTs won't fail.
+    pub initial_rows_per_table: u32,
+}
+
+impl Default for SchemaBias {
+    fn default() -> Self {
+        Self {
+            non_rowid_pk_prob: 0.0,
+            unique_col_prob: 0.3,
+            num_tables_range: 1..=5,
+            num_columns_range: 2..=8,
+            initial_rows_per_table: 0,
+        }
+    }
 }
 
 impl Default for WhopperOpts {
@@ -274,6 +309,10 @@ impl Default for WhopperOpts {
             workloads: vec![],
             properties: vec![],
             chaotic_profiles: vec![],
+            schema_bias: SchemaBias::default(),
+            disable_mvcc_auto_checkpoint: false,
+            close_connections_gracefully: true,
+            reopen_probability: 0.0,
         }
     }
 }
@@ -301,6 +340,22 @@ impl WhopperOpts {
             max_steps: 1_000_000,
             cosmic_ray_probability: 0.0001,
             ..Default::default()
+        }
+    }
+
+    pub fn recovery_heavy() -> Self {
+        Self {
+            schema_bias: SchemaBias {
+                non_rowid_pk_prob: 0.5,
+                unique_col_prob: 0.5,
+                num_tables_range: 1..=2,
+                num_columns_range: 2..=4,
+                initial_rows_per_table: 3,
+            },
+            disable_mvcc_auto_checkpoint: true,
+            close_connections_gracefully: false,
+            reopen_probability: 0.1,
+            ..Self::fast()
         }
     }
 
@@ -484,6 +539,10 @@ pub struct Whopper {
     pub stats: Stats,
     /// Chaotic workload profiles: (probability, name, profile).
     chaotic_profiles: Vec<(f64, &'static str, Box<dyn ChaoticWorkloadProfile>)>,
+    /// Setting this to true sets `pramga mvcc_checkpoint_threshold = -1` (disabled).
+    disable_mvcc_auto_checkpoint: bool,
+    /// If false, drop fiber connections without first closing them.
+    close_connections_gracefully: bool,
 }
 
 impl Whopper {
@@ -506,7 +565,15 @@ impl Whopper {
         let io = Arc::new(SimulatorIO::new(opts.keep_files, io_rng, fault_config));
         let file_sizes = io.file_sizes();
 
-        let db_path = format!("whopper-{}-{}.db", seed, std::process::id());
+        // Use an absolute path to match `PRAGMA journal_mode = 'mvcc'` (which canonicalizes the
+        // path), otherwise recovery is a no-op, because SimulatorIO's file cache is keyed on the
+        // path string, and an absolute/relative mismatch will make it think that there was no
+        // existing logical log.
+        let db_path = std::env::current_dir()?
+            .join(format!("whopper-{}-{}.db", seed, std::process::id()))
+            .to_str()
+            .unwrap()
+            .to_string();
         let wal_path = format!("{db_path}-wal");
 
         let encryption_opts = if opts.enable_encryption {
@@ -544,7 +611,7 @@ impl Whopper {
             bootstrap_conn.execute("PRAGMA journal_mode = 'mvcc'")?;
         }
 
-        let schema = create_initial_schema(&mut rng);
+        let schema = create_initial_schema(&mut rng, &opts.schema_bias);
         let tables = schema.iter().map(|t| t.table.clone()).collect::<Vec<_>>();
         for create_table in &schema {
             let sql = create_table.to_string();
@@ -557,6 +624,15 @@ impl Whopper {
             let sql = create_index.to_string();
             debug!("{}", sql);
             bootstrap_conn.execute(&sql)?;
+        }
+
+        if opts.schema_bias.initial_rows_per_table > 0 {
+            for create_table in &schema {
+                for row_idx in 0..opts.schema_bias.initial_rows_per_table {
+                    let sql = seed_insert_sql(&create_table.table, row_idx);
+                    bootstrap_conn.execute(&sql)?;
+                }
+            }
         }
 
         // Create Elle tables if configured
@@ -609,6 +685,8 @@ impl Whopper {
             seed,
             stats: Stats::default(),
             chaotic_profiles: opts.chaotic_profiles,
+            disable_mvcc_auto_checkpoint: opts.disable_mvcc_auto_checkpoint,
+            close_connections_gracefully: opts.close_connections_gracefully,
         };
 
         whopper.open_connections()?;
@@ -791,7 +869,9 @@ impl Whopper {
                     | turso_core::LimboError::BusySnapshot
                     | turso_core::LimboError::WriteWriteConflict
                     | turso_core::LimboError::CommitDependencyAborted
-                    | turso_core::LimboError::InvalidArgument(..) => {
+                    | turso_core::LimboError::InvalidArgument(..)
+                    | turso_core::LimboError::Constraint(..)
+                    | turso_core::LimboError::ForeignKeyConstraint(..) => {
                         if ctx.fiber.state.is_in_tx() && !ctx.fiber.connection.get_auto_commit() {
                             ctx.fiber.current_op = Some(Operation::Rollback);
                         } else {
@@ -1062,16 +1142,19 @@ impl Whopper {
         {
             let fibers = self.context.fibers.drain(..).collect::<Vec<_>>();
             for fiber in fibers {
-                // Drop statement first
                 drop(fiber.statement.into_inner());
-                // Close and drop connection
-                if let Err(e) = fiber.connection.close() {
-                    debug!("Error closing connection during restart: {}", e);
+                if self.close_connections_gracefully {
+                    if let Err(e) = fiber.connection.close() {
+                        debug!("Error closing connection during restart: {}", e);
+                    }
                 }
                 drop(fiber.connection);
             }
             // All fibers are now dropped, database Arc should be released
         }
+
+        // Without this, the Database object is never dropped and recovery never happens
+        turso_core::clear_database_registry();
 
         // Reopen connections (creates new Database instance)
         self.open_connections()?;
@@ -1094,6 +1177,12 @@ impl Whopper {
             self.encryption_opts.clone(),
         )
         .map_err(|e| anyhow::anyhow!("Database open failed: {}", e))?;
+
+        if self.disable_mvcc_auto_checkpoint {
+            if let Some(mv_store) = db.get_mv_store().as_ref() {
+                mv_store.set_checkpoint_threshold(-1);
+            }
+        }
 
         for i in 0..self.max_connections {
             let conn = db
@@ -1176,25 +1265,63 @@ pub fn create_initial_indexes(rng: &mut ChaCha8Rng, tables: &[Table]) -> Vec<Cre
     indexes
 }
 
-pub fn create_initial_schema(rng: &mut ChaCha8Rng) -> Vec<Create> {
+fn seed_insert_sql(table: &Table, row_idx: u32) -> String {
+    let mut sql = format!("INSERT INTO {} VALUES (", table.name);
+    let mut first = true;
+    for col in &table.columns {
+        if !first {
+            sql.push_str(", ");
+        }
+        first = false;
+        // use unique values to avoid UNIQUE or PRIMARY KEY constraint violations
+        match col.column_type {
+            ColumnType::Integer => {
+                let _ = write!(sql, "{}", row_idx as i64);
+            }
+            ColumnType::Float => {
+                let _ = write!(sql, "{}.0", row_idx);
+            }
+            ColumnType::Text => {
+                let _ = write!(sql, "'seed_{}_{}'", col.name, row_idx);
+            }
+            ColumnType::Blob => {
+                let _ = write!(sql, "x'{:08x}'", row_idx);
+            }
+        }
+    }
+    sql.push(')');
+    sql
+}
+
+pub fn create_initial_schema(rng: &mut ChaCha8Rng, bias: &SchemaBias) -> Vec<Create> {
     let mut schema = Vec::new();
 
-    // Generate random number of tables (1-5)
-    let num_tables = rng.random_range(1..=5);
+    let num_tables = rng.random_range(bias.num_tables_range.clone());
 
     for i in 0..num_tables {
         let table_name = format!("table_{i}");
 
-        // Generate random number of columns (2-8)
-        let num_columns = rng.random_range(2..=8);
+        let num_columns = rng.random_range(bias.num_columns_range.clone());
         let mut columns = Vec::new();
 
-        // TODO: there is no proper unique generation yet in whopper, so disable primary keys for now
-        columns.push(Column {
-            name: "id".to_string(),
-            column_type: ColumnType::Integer,
-            constraints: vec![],
-        });
+        let id_column = if rng.random_bool(bias.non_rowid_pk_prob) {
+            Column {
+                name: "id".to_string(),
+                column_type: ColumnType::Text,
+                constraints: vec![ColumnConstraint::PrimaryKey {
+                    order: None,
+                    conflict_clause: None,
+                    auto_increment: false,
+                }],
+            }
+        } else {
+            Column {
+                name: "id".to_string(),
+                column_type: ColumnType::Integer,
+                constraints: vec![],
+            }
+        };
+        columns.push(id_column);
 
         // Add random columns
         for j in 1..num_columns {
@@ -1203,11 +1330,7 @@ pub fn create_initial_schema(rng: &mut ChaCha8Rng) -> Vec<Create> {
                 1 => ColumnType::Text,
                 _ => ColumnType::Float,
             };
-
-            // FIXME: before sql_generation did not incorporate ColumnConstraint into the sql string
-            // now it does and it the simulation here fails `whopper` with UNIQUE CONSTRAINT ERROR
-            // 20% chance of unique
-            let constraints = if rng.random_bool(0.0) {
+            let constraints = if rng.random_bool(bias.unique_col_prob) {
                 vec![ColumnConstraint::Unique(None)]
             } else {
                 Vec::new()

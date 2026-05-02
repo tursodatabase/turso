@@ -277,7 +277,7 @@ impl MultiprocessWhopper {
                 conn.execute("PRAGMA journal_mode = 'mvcc'")?;
             }
 
-            let schema = create_initial_schema(&mut rng);
+            let schema = create_initial_schema(&mut rng, &crate::SchemaBias::default());
             let tables = schema.iter().map(|t| t.table.clone()).collect::<Vec<_>>();
             for create_table in &schema {
                 conn.execute(create_table.to_string())?;
@@ -307,7 +307,7 @@ impl MultiprocessWhopper {
 
         // Build initial simulator state from the schema we just created
         let mut schema_rng = ChaCha8Rng::seed_from_u64(seed);
-        let schema = create_initial_schema(&mut schema_rng);
+        let schema = create_initial_schema(&mut schema_rng, &crate::SchemaBias::default());
         let tables = schema.iter().map(|t| t.table.clone()).collect::<Vec<_>>();
         let indexes = create_initial_indexes(&mut schema_rng, &tables);
         let indexes_vec: Vec<(String, String)> = indexes
