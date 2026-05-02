@@ -314,7 +314,9 @@ fn emit_compound_select(
                 let dedupe_index = match &right_most.query_destination {
                     QueryDestination::EphemeralIndex {
                         cursor_id, index, ..
-                    } if !index.has_rowid => (*cursor_id, index.clone()),
+                    } if !index.has_rowid && limit_ctx.is_none() && offset_reg.is_none() => {
+                        (*cursor_id, index.clone())
+                    }
                     _ => {
                         new_dedupe_index = true;
                         create_dedupe_index(program, &plan, &right_most)?
@@ -425,7 +427,9 @@ fn emit_compound_select(
                 let (cursor_id, index) = match &right_most.query_destination {
                     QueryDestination::EphemeralIndex {
                         cursor_id, index, ..
-                    } if !index.has_rowid => (*cursor_id, index.clone()),
+                    } if !index.has_rowid && limit_ctx.is_none() && offset_reg.is_none() => {
+                        (*cursor_id, index.clone())
+                    }
                     _ => {
                         new_index = true;
                         create_dedupe_index(program, &plan, &right_most)?
