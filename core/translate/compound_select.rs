@@ -311,6 +311,10 @@ fn emit_compound_select(
             }
             CompoundOperator::Union => {
                 let mut new_dedupe_index = false;
+                let affinity_str = match &right_most.query_destination {
+                    QueryDestination::EphemeralIndex { affinity_str, .. } => affinity_str.clone(),
+                    _ => None,
+                };
                 let dedupe_index = match &right_most.query_destination {
                     QueryDestination::EphemeralIndex {
                         cursor_id, index, ..
@@ -323,7 +327,7 @@ fn emit_compound_select(
                 plan.query_destination = QueryDestination::EphemeralIndex {
                     cursor_id: dedupe_index.0,
                     index: dedupe_index.1.clone(),
-                    affinity_str: None,
+                    affinity_str: affinity_str.clone(),
                     is_delete: false,
                 };
                 let compound_select = Plan::CompoundSelect {
@@ -346,7 +350,7 @@ fn emit_compound_select(
                 right_most.query_destination = QueryDestination::EphemeralIndex {
                     cursor_id: dedupe_index.0,
                     index: dedupe_index.1.clone(),
-                    affinity_str: None,
+                    affinity_str,
                     is_delete: false,
                 };
 

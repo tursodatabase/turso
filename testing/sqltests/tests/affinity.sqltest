@@ -221,6 +221,17 @@ expect {
 }
 
 @cross-check-integrity
+test affinity-in-subquery-union-text-rhs {
+    CREATE TABLE t (a INTEGER);
+    INSERT INTO t VALUES (1), (2), (3);
+    SELECT a FROM t WHERE a IN (SELECT '1' UNION SELECT '2') ORDER BY a;
+}
+expect {
+    1
+    2
+}
+
+@cross-check-integrity
 test affinity-scalar-subquery-text-comparison {
     CREATE TABLE t_text (a TEXT);
     CREATE TABLE t_real (b REAL);
