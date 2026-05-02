@@ -1351,29 +1351,54 @@ impl<Clock: LogicalClock> CommitStateMachine<Clock> {
             }
         };
 
+        // Returns Some(row_version) if our tx contributed to it and if we must therefore log it.
+        let our_committed_image = |row_version: &RowVersion| -> Option<RowVersion> {
+            let our_begin = matches!(
+                row_version.begin,
+                Some(TxTimestampOrID::TxID(vid)) if vid == self.tx_id
+            );
+            let our_end = matches!(
+                row_version.end,
+                Some(TxTimestampOrID::TxID(vid)) if vid == self.tx_id
+            );
+            if !our_begin && !our_end {
+                // row_version belongs to another tx
+                return None;
+            }
+            let mut committed = row_version.clone();
+            if our_begin {
+                // New version is valid STARTING FROM the committing
+                // transaction's end timestamp. See Hekaton page 299.
+                committed.begin = Some(TxTimestampOrID::Timestamp(end_ts));
+
+                if !our_end {
+                    // A version row_version we inserted may have row_version.end == tx_b.tx_id,
+                    // where tx_b is a concurrent tx. This is because when a tx transitions to
+                    // Preparing, its row_version becomes *speculatively updatable*, and a tx tx_b
+                    // is allowed to change row_version.end from None to tx_b.tx_id to delete it
+                    // (see the Hekaton paper, §3.1, heading "check updatability").
+                    //
+                    // That deletion is tx_b's contribution, and tx_b will log it on its own commit.
+                    // Our log record must capture our own contribution, but if the `end` field is
+                    // set, it will be serialized as a OP_DELETE_* in the logical log, so we unset
+                    // it so that it will be serialized as an OP_UPSERT_*. tx_b will take care of
+                    // logging the deletion.
+                    committed.end = None;
+                }
+            }
+            if our_end {
+                // Old version is valid UNTIL the committing
+                // transaction's end timestamp. See Hekaton page 299.
+                committed.end = Some(TxTimestampOrID::Timestamp(end_ts));
+            }
+            Some(committed)
+        };
+
         let collect_versions = |id: &RowID, log_record: &mut LogRecord| {
             if let Some(row_versions) = mvcc_store.rows.get(id) {
                 let row_versions = row_versions.value().read();
                 for row_version in row_versions.iter() {
-                    let mut committed_version = row_version.clone();
-                    let mut changed = false;
-                    if let Some(TxTimestampOrID::TxID(vid)) = committed_version.begin {
-                        if vid == self.tx_id {
-                            // New version is valid STARTING FROM the committing
-                            // transaction's end timestamp. See Hekaton page 299.
-                            committed_version.begin = Some(TxTimestampOrID::Timestamp(end_ts));
-                            changed = true;
-                        }
-                    }
-                    if let Some(TxTimestampOrID::TxID(vid)) = committed_version.end {
-                        if vid == self.tx_id {
-                            // Old version is valid UNTIL the committing
-                            // transaction's end timestamp. See Hekaton page 299.
-                            committed_version.end = Some(TxTimestampOrID::Timestamp(end_ts));
-                            changed = true;
-                        }
-                    }
-                    if changed {
+                    if let Some(mut committed_version) = our_committed_image(row_version) {
                         canonicalize_table_id(&mut committed_version);
                         mvcc_store
                             .insert_version_raw(&mut log_record.row_versions, committed_version);
@@ -1389,25 +1414,7 @@ impl<Clock: LogicalClock> CommitStateMachine<Clock> {
                 if let Some(row_versions) = index.get(index_key) {
                     let row_versions = row_versions.value().read();
                     for row_version in row_versions.iter() {
-                        let mut committed_version = row_version.clone();
-                        let mut changed = false;
-                        if let Some(TxTimestampOrID::TxID(vid)) = committed_version.begin {
-                            if vid == self.tx_id {
-                                // New version is valid STARTING FROM the committing
-                                // transaction's end timestamp. See Hekaton page 299.
-                                committed_version.begin = Some(TxTimestampOrID::Timestamp(end_ts));
-                                changed = true;
-                            }
-                        }
-                        if let Some(TxTimestampOrID::TxID(vid)) = committed_version.end {
-                            if vid == self.tx_id {
-                                // Old version is valid UNTIL the committing
-                                // transaction's end timestamp. See Hekaton page 299.
-                                committed_version.end = Some(TxTimestampOrID::Timestamp(end_ts));
-                                changed = true;
-                            }
-                        }
-                        if changed {
+                        if let Some(mut committed_version) = our_committed_image(row_version) {
                             canonicalize_table_id(&mut committed_version);
                             mvcc_store.insert_version_raw(
                                 &mut log_record.row_versions,
