@@ -319,7 +319,7 @@ struct MaterializationSpec {
 /// For probe->build chaining we store join keys and payload columns directly
 /// in the ephemeral table; otherwise we only store rowids and `SeekRowid`
 /// during probing when needed.
-fn emit_materialized_build_inputs(
+pub(crate) fn emit_materialized_build_inputs(
     program: &mut ProgramBuilder,
     resolver: &Resolver,
     plan: &mut SelectPlan,
@@ -496,12 +496,21 @@ fn emit_materialized_build_inputs(
         });
         program.nested(|program| -> Result<()> {
             program.set_hash_tables_to_keep_open(&hash_tables_to_keep_open);
+            // emit_program_for_select_with_inputs unconditionally overwrites
+            // program.result_columns and extends program.table_references with
+            // the materialize subplan's columns/refs. In a nested context (e.g.
+            // a compound branch or CTE) those belong to the *outer* SELECT, so
+            // save and restore them around the nested emission.
+            let saved_result_columns = std::mem::take(&mut program.result_columns);
+            let saved_table_references = std::mem::take(&mut program.table_references);
             emit_program_for_select_with_inputs(
                 program,
                 resolver,
                 materialize_plan,
                 build_inputs.clone(),
             )?;
+            program.result_columns = saved_result_columns;
+            program.table_references = saved_table_references;
             program.clear_hash_tables_to_keep_open();
             Ok(())
         })?;

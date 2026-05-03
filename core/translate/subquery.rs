@@ -10,7 +10,8 @@ use crate::{
         collate::get_collseq_from_expr,
         compound_select::emit_program_for_compound_select,
         emitter::select::{
-            emit_program_for_select, emit_program_for_select_with_resolver, emit_query,
+            emit_materialized_build_inputs, emit_program_for_select,
+            emit_program_for_select_with_resolver, emit_query,
         },
         expr::{
             compare_affinity, get_expr_affinity_info, unwrap_parens, walk_expr_mut, WalkControl,
@@ -1552,6 +1553,8 @@ pub fn emit_from_clause_subquery(
                 hash_table_contexts: HashMap::default(),
                 unsafe_testing: t_ctx.unsafe_testing,
             });
+            metadata.materialized_build_inputs =
+                emit_materialized_build_inputs(program, &metadata.resolver, select_plan)?;
             emit_query(program, select_plan, &mut metadata)?
         }
         Plan::CompoundSelect { .. } => {
@@ -1638,6 +1641,8 @@ fn emit_indexed_materialized_subquery(
                 hash_table_contexts: HashMap::default(),
                 unsafe_testing: t_ctx.unsafe_testing,
             });
+            metadata.materialized_build_inputs =
+                emit_materialized_build_inputs(program, &metadata.resolver, select_plan)?;
             emit_query(program, select_plan, &mut metadata)?;
         }
         Plan::CompoundSelect { .. } => {
@@ -1731,6 +1736,8 @@ fn emit_materialized_subquery_table(
                 hash_table_contexts: HashMap::default(),
                 unsafe_testing: t_ctx.unsafe_testing,
             });
+            metadata.materialized_build_inputs =
+                emit_materialized_build_inputs(program, &metadata.resolver, select_plan)?;
             emit_query(program, select_plan, &mut metadata)?;
         }
         Plan::CompoundSelect { .. } => {
