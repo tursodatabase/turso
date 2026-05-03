@@ -1136,6 +1136,88 @@ fn test_restart_preserves_autoindex_to_column_mapping() {
     assert_eq!(b_rows[0][0].to_string(), "bb");
 }
 
+/// What this test checks: when transaction A updates a row and a concurrent
+/// transaction B (later begin_ts) speculatively tombstones that row while A
+/// is in `Preparing`, A's commit must serialize its OWN writes — not the
+/// DELETEs that B's tombstone TxID, still pinned to the versions' `end`
+/// fields, would imply.
+///
+/// References: Hekaton paper (https://www.cs.cmu.edu/~15721-f24/papers/Hekaton.pdf)
+/// §2.5 Table 1 (speculative read of preparing writer), §2.7 (commit deps).
+#[test]
+fn test_concurrent_update_then_delete_serializes_correctly_across_restart() {
+    let mut db = MvccTestDbNoConn::new_with_random_db_with_opts(DatabaseOpts::new());
+
+    {
+        let conn = db.connect();
+        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT UNIQUE)")
+            .unwrap();
+        conn.execute("INSERT INTO t(id, v) VALUES (1, 'initial')")
+            .unwrap();
+        conn.close().unwrap();
+    }
+
+    {
+        let conn_a = db.connect();
+        let conn_b = db.connect();
+
+        conn_a.execute("BEGIN CONCURRENT").unwrap();
+        conn_a
+            .execute("UPDATE t SET v = 'a_value' WHERE id = 1")
+            .unwrap();
+
+        conn_a.set_yield_injector(Some(FixedYieldInjector::new([
+            CommitYieldPoint::CommitValidation.point(),
+        ])));
+
+        let mut commit_stmt = conn_a.prepare("COMMIT").unwrap();
+        let mut yielded = false;
+        for _ in 0..100 {
+            match commit_stmt.step().unwrap() {
+                StepResult::IO => {
+                    yielded = true;
+                    break;
+                }
+                StepResult::Done => break,
+                _ => {}
+            }
+        }
+        assert!(
+            yielded,
+            "tx_a's COMMIT should yield at CommitYieldPoint::CommitValidation"
+        );
+
+        // tx_b begins *after* tx_a's prepare so tx_b.begin_ts > tx_a's
+        // prepared end_ts; its DELETE plants a speculative tombstone whose
+        // TxID(tx_b) lands in the `end` field of tx_a's new versions.
+        conn_b.execute("BEGIN CONCURRENT").unwrap();
+        conn_b.execute("DELETE FROM t WHERE id = 1").unwrap();
+
+        commit_stmt.run_collect_rows().unwrap();
+        drop(commit_stmt);
+
+        let rows = get_rows(&conn_a, "SELECT id, v FROM t");
+        assert_eq!(rows.len(), 1);
+
+        conn_b.execute("ROLLBACK").unwrap();
+
+        conn_a.close().unwrap();
+        conn_b.close().unwrap();
+    }
+
+    db.restart();
+
+    let conn = db.connect();
+    let rows = get_rows(&conn, "SELECT id, v FROM t");
+    assert_eq!(
+        rows.len(),
+        1,
+        "tx_a's committed row must survive recovery, got {rows:?}"
+    );
+    assert_eq!(rows[0][0].as_int().unwrap(), 1);
+    assert_eq!(rows[0][1].to_string(), "a_value");
+}
+
 /// What this test checks: MVCC restart handles sqlite_schema rows with rootpage=0 (triggers).
 /// Why this matters: Trigger definitions are stored without btrees and should not break recovery.
 #[test]
