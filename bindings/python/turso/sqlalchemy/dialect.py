@@ -4,6 +4,7 @@ This module provides SQLAlchemy dialects:
 - TursoDialect: Basic local database connections (sqlite+turso://)
 - AioTursoDialect: Basic local asyncio connections (sqlite+aioturso://)
 - TursoSyncDialect: Sync-enabled connections with remote support (sqlite+turso_sync://)
+- AioTursoSyncDialect: Sync-enabled asyncio connections with remote support (sqlite+aioturso_sync://)
 """
 
 from __future__ import annotations
@@ -300,10 +301,10 @@ class TursoDialect(_TursoDialectMixin, SQLiteDialect_pysqlite):
 
 
 class AsyncAdapt_turso_dbapi(AsyncAdapt_dbapi_module):
-    """Bridge turso.aio (coroutine API) to SQLAlchemy's DBAPI-shaped async adapter contract.
+    """Bridge turso asyncio modules to SQLAlchemy's DBAPI-shaped async adapter contract.
 
     SQLAlchemy's async engine still drives execution through DBAPI-style
-    connection/cursor semantics internally. turso.aio exposes awaitable
+    connection/cursor semantics internally. turso.aio modules expose awaitable
     operations, so we provide this adapter layer to map turso.aio connections
     into SQLAlchemy's AsyncAdapt_dbapi_connection while exposing DBAPI module
     attributes/exceptions (paramstyle, Error hierarchy, sqlite version info).
@@ -313,6 +314,7 @@ class AsyncAdapt_turso_dbapi(AsyncAdapt_dbapi_module):
         # Match SQLAlchemy 2.0.x adapter style (same approach as aiosqlite).
         self.turso_aio = turso_aio_module
         self.turso = turso_module
+        self._connect = turso_aio_module.connect
         self.paramstyle = "qmark"
         self._init_dbapi_attributes()
 
@@ -359,7 +361,7 @@ class AsyncAdapt_turso_dbapi(AsyncAdapt_dbapi_module):
         if creator_fn:
             connection = creator_fn(*arg, **kw)
         else:
-            connection = self.turso_aio.connect(*arg, **kw)
+            connection = self._connect(*arg, **kw)
 
         return AsyncAdapt_dbapi_connection(self, await_only(connection))
 
@@ -620,7 +622,9 @@ class TursoSyncDialect(_TursoDialectMixin, SQLiteDialect_pysqlite):
 
         query_params = dict(url.query)
         # Accept both remote_url and sync_url (libsql-sqlalchemy compat)
-        remote_url = query_params.pop("remote_url", None) or query_params.pop("sync_url", None)
+        remote_url = query_params.pop("remote_url", None)
+        sync_url = query_params.pop("sync_url", None)
+        remote_url = remote_url or sync_url
         kwargs = self._extract_sync_params(query_params)
 
         # Handle isolation_level
@@ -664,6 +668,100 @@ class TursoSyncDialect(_TursoDialectMixin, SQLiteDialect_pysqlite):
         if url.database == ":memory:":
             return pool.SingletonThreadPool
         return pool.QueuePool
+
+
+class AioTursoSyncDialect(_TursoDialectMixin, SQLiteDialect_aiosqlite):
+    """
+    SQLAlchemy asyncio dialect for pyturso sync-enabled connections.
+
+    This dialect uses turso.aio.sync.connect() and supports the same remote
+    sync options as sqlite+turso_sync://, while integrating with SQLAlchemy's
+    AsyncEngine.
+
+    Usage:
+        from sqlalchemy.ext.asyncio import create_async_engine
+
+        engine = create_async_engine(
+            "sqlite+aioturso_sync:///local.db"
+            "?remote_url=https://your-db.turso.io"
+            "&auth_token=your-token"
+        )
+    """
+
+    name = "sqlite"
+    driver = "aioturso_sync"
+
+    supports_statement_cache = True
+    supports_native_datetime = False
+
+    @classmethod
+    def import_dbapi(cls):
+        """Import turso.aio.sync as async DBAPI with SQLAlchemy adapter."""
+        import turso
+        import turso.aio.sync
+
+        return AsyncAdapt_turso_dbapi(turso.aio.sync, turso)
+
+    def connect(self, *cargs, **cparams):
+        """Remap sync_url to remote_url for libsql-sqlalchemy compatibility."""
+        if "sync_url" in cparams and "remote_url" not in cparams:
+            cparams["remote_url"] = cparams.pop("sync_url")
+        return super().connect(*cargs, **cparams)
+
+    def on_connect(self):
+        """Skip pysqlite REGEXP function setup (unsupported by turso)."""
+        return None
+
+    def get_isolation_level(self, dbapi_connection):
+        """Turso does not use PRAGMA read_uncommitted; always SERIALIZABLE."""
+        return "SERIALIZABLE"
+
+    def set_isolation_level(self, dbapi_connection, level):
+        """No-op: isolation level is set at connect time."""
+        pass
+
+    def create_connect_args(self, url: URL) -> ConnectArgsType:
+        """Create connection arguments from SQLAlchemy URL."""
+        opts = url.translate_connect_args()
+        path = opts.pop("database", ":memory:")
+        TursoSyncDialect._validate_sync_url(opts)
+
+        query_params = dict(url.query)
+        remote_url = query_params.pop("remote_url", None)
+        sync_url = query_params.pop("sync_url", None)
+        remote_url = remote_url or sync_url
+        kwargs = TursoSyncDialect._extract_sync_params(query_params)
+
+        isolation_level = query_params.pop("isolation_level", None)
+        if isolation_level:
+            if isolation_level.upper() == "AUTOCOMMIT":
+                kwargs["isolation_level"] = None
+            else:
+                kwargs["isolation_level"] = isolation_level
+
+        experimental_features = query_params.pop("experimental_features", None)
+        if experimental_features:
+            kwargs["experimental_features"] = experimental_features
+
+        if query_params:
+            import warnings
+
+            warnings.warn(
+                f"Unrecognized query parameters ignored: {list(query_params.keys())}",
+                UserWarning,
+                stacklevel=2,
+            )
+
+        if remote_url:
+            return ([path, remote_url], kwargs)
+        return ([path], kwargs)
+
+    @classmethod
+    def get_pool_class(cls, url: URL) -> type[pool.Pool]:
+        """Match SQLAlchemy async SQLite pool behavior."""
+        if cls._is_url_file_db(url):
+            return pool.AsyncAdaptedQueuePool
+        return pool.StaticPool
 
 
 def get_sync_connection(connection):
@@ -720,3 +818,35 @@ def get_sync_connection(connection):
         )
 
     return dbapi_conn
+
+
+def get_async_sync_connection(connection):
+    """
+    Get the underlying turso.aio.sync.ConnectionSync from a SQLAlchemy AsyncConnection.
+
+    The returned object exposes async sync-specific methods:
+    - pull() - Pull changes from remote, returns True if updates were pulled
+    - push() - Push changes to remote
+    - checkpoint() - Checkpoint the WAL
+    - stats() - Get sync statistics
+    """
+    from turso.lib_sync_aio import ConnectionSync
+
+    sync_connection = getattr(connection, "sync_connection", None)
+    if sync_connection is None:
+        raise TypeError("Cannot get synchronous proxy from SQLAlchemy async connection")
+
+    raw_conn = getattr(sync_connection, "connection", None)
+    if raw_conn is None:
+        raise TypeError("Cannot get raw connection from SQLAlchemy async connection")
+
+    dbapi_conn = getattr(raw_conn, "dbapi_connection", raw_conn)
+    driver_conn = getattr(dbapi_conn, "driver_connection", dbapi_conn)
+
+    if not isinstance(driver_conn, ConnectionSync):
+        raise TypeError(
+            f"Expected turso.aio.sync.ConnectionSync, got {type(driver_conn).__name__}. "
+            "This function only works with sqlite+aioturso_sync:// connections."
+        )
+
+    return driver_conn
