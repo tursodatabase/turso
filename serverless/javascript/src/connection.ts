@@ -137,9 +137,20 @@ export class Connection {
     if (!this.isOpen) {
       throw new TypeError("The database connection is not open");
     }
+    const upper = sql.trimStart().toUpperCase();
+    if (upper.startsWith('BEGIN') || upper.startsWith('SAVEPOINT')) {
+      this.session.setKeepAlive(true);
+    }
     await this.execLock.acquire();
     try {
-      return await this.session.execute(sql, args || [], this.defaultSafeIntegerMode, queryOptions);
+      const result = await this.session.execute(sql, args || [], this.defaultSafeIntegerMode, queryOptions);
+      if (upper.startsWith('COMMIT') || upper.startsWith('ROLLBACK') || upper.startsWith('END') || upper.startsWith('RELEASE')) {
+        this.session.setKeepAlive(false);
+      }
+      return result;
+    } catch (e) {
+      this.session.setKeepAlive(false);
+      throw e;
     } finally {
       this.execLock.release();
     }
@@ -161,9 +172,20 @@ export class Connection {
     if (!this.isOpen) {
       throw new TypeError("The database connection is not open");
     }
+    const upper = sql.trimStart().toUpperCase();
+    if (upper.startsWith('BEGIN') || upper.startsWith('SAVEPOINT')) {
+      this.session.setKeepAlive(true);
+    }
     await this.execLock.acquire();
     try {
-      return await this.session.sequence(sql, queryOptions);
+      const result = await this.session.sequence(sql, queryOptions);
+      if (upper.startsWith('COMMIT') || upper.startsWith('ROLLBACK') || upper.startsWith('END') || upper.startsWith('RELEASE')) {
+        this.session.setKeepAlive(false);
+      }
+      return result;
+    } catch (e) {
+      this.session.setKeepAlive(false);
+      throw e;
     } finally {
       this.execLock.release();
     }
