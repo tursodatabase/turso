@@ -527,6 +527,56 @@ export default function App() {
     }
 
     setResults(testResults);
+
+    // Structured output for CI capture
+    const passed = testResults.filter(r => r.passed).length;
+    const failed = testResults.filter(r => !r.passed).length;
+    console.log('=== TURSO_BENCH_RESULTS_START ===');
+    for (const r of testResults) {
+      const status = r.passed ? 'PASS' : 'FAIL';
+      const extra = r.metric ? ` [${r.metric}]` : '';
+      const err = r.error ? ` ERROR: ${r.error}` : '';
+      console.log(`[${status}] ${r.name}${extra}${err}`);
+    }
+    console.log(`SUMMARY: ${passed} passed, ${failed} failed`);
+    console.log('=== TURSO_BENCH_RESULTS_END ===');
+    if (failed > 0) {
+      console.log('TURSO_BENCH_EXIT_CODE=1');
+    } else {
+      console.log('TURSO_BENCH_EXIT_CODE=0');
+    }
+
+    // Write results to a SQLite database for CI to read (console.log is not
+    // captured reliably in Release builds on iOS simulators).
+    try {
+      const resultsDb = await connect({ path: 'ci_bench_results.db' });
+      await resultsDb.exec(
+        'CREATE TABLE IF NOT EXISTS results (id INTEGER PRIMARY KEY, status TEXT, name TEXT, metric TEXT, error TEXT)',
+      );
+      await resultsDb.exec(
+        `CREATE TABLE IF NOT EXISTS summary (passed INTEGER, failed INTEGER, exit_code INTEGER)`,
+      );
+      await resultsDb.exec('BEGIN');
+      for (const r of testResults) {
+        await resultsDb.run(
+          'INSERT INTO results (status, name, metric, error) VALUES (?, ?, ?, ?)',
+          r.passed ? 'PASS' : 'FAIL',
+          r.name,
+          r.metric ?? null,
+          r.error ?? null,
+        );
+      }
+      await resultsDb.run(
+        'INSERT INTO summary (passed, failed, exit_code) VALUES (?, ?, ?)',
+        passed,
+        failed,
+        failed > 0 ? 1 : 0,
+      );
+      await resultsDb.exec('COMMIT');
+      resultsDb.close();
+    } catch (e) {
+      console.log('Failed to write CI results db: ' + String(e));
+    }
   }
 
   const passedCount = results.filter(r => r.passed).length;
