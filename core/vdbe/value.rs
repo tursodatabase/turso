@@ -793,11 +793,47 @@ impl Value {
             return Value::from_f64(((f + if f < 0.0 { -0.5 } else { 0.5 }) as i64) as f64);
         }
 
-        let f: f64 = crate::numeric::str_to_f64(format!("{f:.precision$}"))
-            .expect("formatted float should always parse successfully")
-            .into();
+        // Format once with extra fractional digits, then round that decimal
+        // buffer in place using SQLite's round-half-away-from-zero rule.
+        let abs_f = f.abs();
+        let extra_prec = precision + 20;
+        let mut buf = format!("{abs_f:.extra_prec$}");
+        let dot_pos = buf
+            .find('.')
+            .expect("fixed-precision format should contain '.'");
+        let round_pos = dot_pos + 1 + precision;
+        let round_up = buf.as_bytes()[round_pos] >= b'5';
+        buf.truncate(round_pos);
 
-        Value::from_f64(f)
+        if round_up {
+            // Safe: we only mutate ASCII digits and keep the existing '.' intact,
+            // so the string remains valid UTF-8.
+            let bytes = unsafe { buf.as_mut_vec() };
+            let mut i = bytes.len();
+            loop {
+                // Walk right-to-left over e.g. "12.349", turning trailing 9s into 0s
+                // until we can increment one kept digit, yielding "12.350".
+
+                // If we've reached the leftmost digit, we've seen only digit 9s so prepend a 1 to round up
+                if i == 0 {
+                    bytes.insert(0, b'1');
+                    break;
+                }
+                i -= 1;
+                if bytes[i] == b'.' {
+                    continue;
+                }
+                if bytes[i] < b'9' {
+                    bytes[i] += 1;
+                    break;
+                }
+                bytes[i] = b'0';
+            }
+        }
+
+        let result = buf.parse::<f64>().unwrap();
+
+        Value::from_f64(if f < 0.0 { -result } else { result })
     }
 
     fn _exec_trim(&self, pattern: Option<&Value>, trim_type: TrimType) -> Value {
@@ -2719,6 +2755,44 @@ mod tests {
         let input_val = Value::from_f64(100.123);
         let expected_val = Value::Null;
         assert_eq!(input_val.exec_round(Some(&Value::Null)), expected_val);
+
+        // round-half-away-from-zero tie-breaking (issue #5748)
+        let input_val = Value::from_f64(2.25);
+        let precision_val = Value::from_i64(1);
+        let expected_val = Value::from_f64(2.3);
+        assert_eq!(input_val.exec_round(Some(&precision_val)), expected_val);
+
+        let input_val = Value::from_f64(-2.25);
+        let precision_val = Value::from_i64(1);
+        let expected_val = Value::from_f64(-2.3);
+        assert_eq!(input_val.exec_round(Some(&precision_val)), expected_val);
+
+        // 2.55 in f64 is 2.54999... (below midpoint), rounds down
+        let input_val = Value::from_f64(2.55);
+        let precision_val = Value::from_i64(1);
+        let expected_val = Value::from_f64(2.5);
+        assert_eq!(input_val.exec_round(Some(&precision_val)), expected_val);
+
+        // 2.45 in f64 is 2.45000...018 (above midpoint), rounds up
+        let input_val = Value::from_f64(2.45);
+        let precision_val = Value::from_i64(1);
+        let expected_val = Value::from_f64(2.5);
+        assert_eq!(input_val.exec_round(Some(&precision_val)), expected_val);
+
+        // 2.65 in f64 is 2.64999... (below midpoint), rounds down
+        let input_val = Value::from_f64(2.65);
+        let precision_val = Value::from_i64(1);
+        let expected_val = Value::from_f64(2.6);
+        assert_eq!(input_val.exec_round(Some(&precision_val)), expected_val);
+
+        let input_val = Value::from_f64(2.5);
+        let expected_val = Value::from_f64(3.0);
+        assert_eq!(input_val.exec_round(None), expected_val);
+
+        let input_val = Value::from_f64(1.125);
+        let precision_val = Value::from_i64(2);
+        let expected_val = Value::from_f64(1.13);
+        assert_eq!(input_val.exec_round(Some(&precision_val)), expected_val);
     }
 
     #[test]

@@ -855,6 +855,51 @@ test round-null-precision {
 expect {
 }
 
+test round-half-away-from-zero-positive {
+    SELECT round(2.25, 1);
+}
+expect {
+    2.3
+}
+
+test round-half-away-from-zero-negative {
+    SELECT round(-2.25, 1);
+}
+expect {
+    -2.3
+}
+
+test round-half-away-from-zero-precision0 {
+    SELECT round(2.5);
+}
+expect {
+    3.0
+}
+expect @js {
+    3
+}
+
+test round-half-away-from-zero-255 {
+    SELECT round(2.55, 1);
+}
+expect {
+    2.5
+}
+
+test round-half-away-from-zero-245 {
+    SELECT round(2.45, 1);
+}
+expect {
+    2.5
+}
+
+test round-half-away-from-zero-265 {
+    SELECT round(2.65, 1);
+}
+expect {
+    2.6
+}
+
 test length-text {
     SELECT length('limbo');
 }
