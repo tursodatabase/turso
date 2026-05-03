@@ -1,13 +1,13 @@
 use crate::schema::{BTreeTable, Trigger};
 use crate::sync::Arc;
-use crate::translate::expr::WalkControl;
+use crate::translate::expr::push_expr_children_mut;
 use crate::translate::plan::ColumnMask;
 use crate::translate::subquery::{
     emit_non_from_clause_subquery, plan_subqueries_from_trigger_when_clause,
 };
 use crate::translate::{
     emitter::Resolver,
-    expr::{self, translate_expr, walk_expr_mut},
+    expr::{self, translate_expr},
     planner::ROWID_STRS,
     translate_inner, ProgramBuilder, ProgramBuilderOpts,
 };
@@ -16,6 +16,7 @@ use crate::vdbe::affinity::Affinity;
 use crate::vdbe::insn::Insn;
 use crate::vdbe::BranchOffset;
 use crate::{bail_parse_error, QueryMode, Result};
+use smallvec::SmallVec;
 use std::cell::RefCell;
 use std::num::NonZero;
 use turso_parser::ast::{self, Expr, TriggerEvent, TriggerTime};
@@ -242,11 +243,9 @@ fn rewrite_trigger_expr_for_subprogram(
     expr: &mut ast::Expr,
     ctx: &TriggerSubprogramContext,
 ) -> Result<()> {
-    walk_expr_mut(expr, &mut |e: &mut ast::Expr| -> Result<WalkControl> {
-        rewrite_trigger_expr_single_for_subprogram(e, ctx)?;
-        Ok(WalkControl::Continue)
-    })?;
-    Ok(())
+    rewrite_expression_tree(expr, &mut |e: &mut ast::Expr| {
+        rewrite_trigger_expr_single_for_subprogram(e, ctx)
+    })
 }
 
 /// Rewrite NEW/OLD references in all expressions within an Upsert clause for subprogram
@@ -415,14 +414,6 @@ fn rewrite_trigger_expr_single_for_subprogram(
     ctx: &TriggerSubprogramContext,
 ) -> Result<()> {
     match e {
-        Expr::Exists(select) | Expr::Subquery(select) => {
-            rewrite_expressions_in_select_for_subprogram(select, ctx)?;
-            return Ok(());
-        }
-        Expr::InSelect { rhs, .. } => {
-            rewrite_expressions_in_select_for_subprogram(rhs, ctx)?;
-            return Ok(());
-        }
         Expr::Qualified(ns, col) | Expr::DoublyQualified(_, ns, col) => {
             let ns = normalize_ident(ns.as_str());
             let col = normalize_ident(col.as_str());
@@ -1072,21 +1063,8 @@ fn rewrite_trigger_expr_for_when_clause(
     table: &BTreeTable,
     ctx: &TriggerContext,
 ) -> Result<()> {
-    walk_expr_mut(expr, &mut |e: &mut ast::Expr| -> Result<WalkControl> {
-        rewrite_trigger_expr_single_for_when_clause(e, table, ctx, false)?;
-        Ok(WalkControl::Continue)
-    })?;
-    Ok(())
-}
-
-/// Rewrite NEW/OLD references in all expressions within a SELECT statement for trigger WHEN clauses.
-fn rewrite_expressions_in_select_for_when_clause(
-    select: &mut ast::Select,
-    table: &BTreeTable,
-    ctx: &TriggerContext,
-) -> Result<()> {
-    rewrite_select_expressions(select, &mut |e: &mut ast::Expr| {
-        rewrite_trigger_expr_single_for_when_clause(e, table, ctx, true)
+    rewrite_expression_tree(expr, &mut |e: &mut ast::Expr| {
+        rewrite_trigger_expr_single_for_when_clause(e, table, ctx, false)
     })
 }
 
@@ -1096,171 +1074,176 @@ fn rewrite_select_expressions<F>(select: &mut ast::Select, rewrite_expr: &mut F)
 where
     F: FnMut(&mut ast::Expr) -> Result<()>,
 {
-    // Rewrite WITH clause (CTEs)
-    if let Some(with_clause) = &mut select.with {
-        for cte in &mut with_clause.ctes {
-            rewrite_select_expressions(&mut cte.select, rewrite_expr)?;
-        }
-    }
-
-    rewrite_one_select_expressions(&mut select.body.select, rewrite_expr)?;
-
-    // Rewrite compound SELECT arms (UNION/EXCEPT/INTERSECT)
-    for compound in &mut select.body.compounds {
-        rewrite_one_select_expressions(&mut compound.select, rewrite_expr)?;
-    }
-
-    // Rewrite top-level ORDER BY
-    for sorted_col in &mut select.order_by {
-        rewrite_expression_tree(&mut sorted_col.expr, rewrite_expr)?;
-    }
-
-    // Rewrite top-level LIMIT/OFFSET
-    if let Some(limit) = &mut select.limit {
-        rewrite_expression_tree(&mut limit.expr, rewrite_expr)?;
-        if let Some(offset) = &mut limit.offset {
-            rewrite_expression_tree(offset, rewrite_expr)?;
-        }
-    }
-
-    Ok(())
+    let mut stack = vec![TriggerRewriteItem::Select(select)];
+    rewrite_trigger_items(&mut stack, rewrite_expr)
 }
 
-fn rewrite_one_select_expressions<F>(
-    one_select: &mut ast::OneSelect,
-    rewrite_expr: &mut F,
-) -> Result<()>
+enum TriggerRewriteItem {
+    Select(*mut ast::Select),
+    OneSelect(*mut ast::OneSelect),
+    FromClause(*mut ast::FromClause),
+    SelectTable(*mut ast::SelectTable),
+    Window(*mut ast::Window),
+    FrameBound(*mut ast::FrameBound),
+    Expr(*mut ast::Expr),
+}
+
+fn rewrite_trigger_items<F>(stack: &mut Vec<TriggerRewriteItem>, rewrite_expr: &mut F) -> Result<()>
 where
     F: FnMut(&mut ast::Expr) -> Result<()>,
 {
-    match one_select {
-        ast::OneSelect::Select {
-            columns,
-            from,
-            where_clause,
-            group_by,
-            window_clause,
-            ..
-        } => {
-            for col in columns {
-                if let ast::ResultColumn::Expr(expr, _) = col {
-                    rewrite_expression_tree(expr, rewrite_expr)?;
+    let mut expr_children = SmallVec::<[*mut ast::Expr; 16]>::new();
+    while let Some(item) = stack.pop() {
+        match item {
+            TriggerRewriteItem::Select(select) => {
+                // SAFETY: All pointers in this stack are derived from unique
+                // mutable roots supplied to this traversal. The walker never
+                // mutates ancestor containers after child pointers are pushed.
+                let select = unsafe { &mut *select };
+                if let Some(limit) = &mut select.limit {
+                    if let Some(offset) = &mut limit.offset {
+                        stack.push(TriggerRewriteItem::Expr(&mut **offset));
+                    }
+                    stack.push(TriggerRewriteItem::Expr(&mut *limit.expr));
+                }
+                for sorted_col in select.order_by.iter_mut().rev() {
+                    stack.push(TriggerRewriteItem::Expr(&mut *sorted_col.expr));
+                }
+                for compound in select.body.compounds.iter_mut().rev() {
+                    stack.push(TriggerRewriteItem::OneSelect(&mut compound.select));
+                }
+                stack.push(TriggerRewriteItem::OneSelect(&mut select.body.select));
+                if let Some(with_clause) = &mut select.with {
+                    for cte in with_clause.ctes.iter_mut().rev() {
+                        stack.push(TriggerRewriteItem::Select(&mut cte.select));
+                    }
                 }
             }
-
-            if let Some(from_clause) = from {
-                rewrite_from_clause_expressions(from_clause, rewrite_expr)?;
-            }
-
-            if let Some(where_expr) = where_clause {
-                rewrite_expression_tree(where_expr, rewrite_expr)?;
-            }
-
-            if let Some(group_by) = group_by {
-                for expr in &mut group_by.exprs {
-                    rewrite_expression_tree(expr, rewrite_expr)?;
+            TriggerRewriteItem::OneSelect(one_select) => {
+                // SAFETY: See the `Select` arm above.
+                let one_select = unsafe { &mut *one_select };
+                match one_select {
+                    ast::OneSelect::Select {
+                        columns,
+                        from,
+                        where_clause,
+                        group_by,
+                        window_clause,
+                        ..
+                    } => {
+                        for window_def in window_clause.iter_mut().rev() {
+                            stack.push(TriggerRewriteItem::Window(&mut window_def.window));
+                        }
+                        if let Some(group_by) = group_by {
+                            if let Some(having_expr) = &mut group_by.having {
+                                stack.push(TriggerRewriteItem::Expr(&mut **having_expr));
+                            }
+                            for expr in group_by.exprs.iter_mut().rev() {
+                                stack.push(TriggerRewriteItem::Expr(&mut **expr));
+                            }
+                        }
+                        if let Some(where_expr) = where_clause {
+                            stack.push(TriggerRewriteItem::Expr(&mut **where_expr));
+                        }
+                        if let Some(from_clause) = from {
+                            stack.push(TriggerRewriteItem::FromClause(from_clause));
+                        }
+                        for col in columns.iter_mut().rev() {
+                            if let ast::ResultColumn::Expr(expr, _) = col {
+                                stack.push(TriggerRewriteItem::Expr(&mut **expr));
+                            }
+                        }
+                    }
+                    ast::OneSelect::Values(values) => {
+                        for row in values.iter_mut().rev() {
+                            for expr in row.iter_mut().rev() {
+                                stack.push(TriggerRewriteItem::Expr(&mut **expr));
+                            }
+                        }
+                    }
                 }
-                if let Some(having_expr) = &mut group_by.having {
-                    rewrite_expression_tree(having_expr, rewrite_expr)?;
+            }
+            TriggerRewriteItem::FromClause(from_clause) => {
+                // SAFETY: See the `Select` arm above.
+                let from_clause = unsafe { &mut *from_clause };
+                for join in from_clause.joins.iter_mut().rev() {
+                    if let Some(ast::JoinConstraint::On(expr)) = &mut join.constraint {
+                        stack.push(TriggerRewriteItem::Expr(&mut **expr));
+                    }
+                    stack.push(TriggerRewriteItem::SelectTable(&mut *join.table));
+                }
+                stack.push(TriggerRewriteItem::SelectTable(&mut *from_clause.select));
+            }
+            TriggerRewriteItem::SelectTable(select_table) => {
+                // SAFETY: See the `Select` arm above.
+                let select_table = unsafe { &mut *select_table };
+                match select_table {
+                    ast::SelectTable::Table(..) => {}
+                    ast::SelectTable::TableCall(_, args, _) => {
+                        for arg in args.iter_mut().rev() {
+                            stack.push(TriggerRewriteItem::Expr(&mut **arg));
+                        }
+                    }
+                    ast::SelectTable::Select(select, _) => {
+                        stack.push(TriggerRewriteItem::Select(select));
+                    }
+                    ast::SelectTable::Sub(from_clause, _) => {
+                        stack.push(TriggerRewriteItem::FromClause(from_clause));
+                    }
                 }
             }
-
-            for window_def in window_clause {
-                rewrite_window_expressions(&mut window_def.window, rewrite_expr)?;
+            TriggerRewriteItem::Window(window) => {
+                // SAFETY: See the `Select` arm above.
+                let window = unsafe { &mut *window };
+                if let Some(frame_clause) = &mut window.frame_clause {
+                    if let Some(end) = &mut frame_clause.end {
+                        stack.push(TriggerRewriteItem::FrameBound(end));
+                    }
+                    stack.push(TriggerRewriteItem::FrameBound(&mut frame_clause.start));
+                }
+                for sorted_col in window.order_by.iter_mut().rev() {
+                    stack.push(TriggerRewriteItem::Expr(&mut *sorted_col.expr));
+                }
+                for expr in window.partition_by.iter_mut().rev() {
+                    stack.push(TriggerRewriteItem::Expr(&mut **expr));
+                }
             }
-        }
-        ast::OneSelect::Values(values) => {
-            for row in values {
-                for expr in row {
-                    rewrite_expression_tree(expr, rewrite_expr)?;
+            TriggerRewriteItem::FrameBound(frame_bound) => {
+                // SAFETY: See the `Select` arm above.
+                let frame_bound = unsafe { &mut *frame_bound };
+                match frame_bound {
+                    ast::FrameBound::Following(expr) | ast::FrameBound::Preceding(expr) => {
+                        stack.push(TriggerRewriteItem::Expr(&mut **expr));
+                    }
+                    ast::FrameBound::CurrentRow
+                    | ast::FrameBound::UnboundedFollowing
+                    | ast::FrameBound::UnboundedPreceding => {}
+                }
+            }
+            TriggerRewriteItem::Expr(expr) => {
+                // SAFETY: See the `Select` arm above.
+                let expr = unsafe { &mut *expr };
+                rewrite_expr(expr)?;
+
+                match expr {
+                    Expr::Exists(select) | Expr::Subquery(select) => {
+                        stack.push(TriggerRewriteItem::Select(select));
+                    }
+                    Expr::InSelect { rhs, .. } => {
+                        stack.push(TriggerRewriteItem::Select(rhs));
+                    }
+                    _ => {}
+                }
+
+                expr_children.clear();
+                push_expr_children_mut(expr, &mut expr_children);
+                for child in expr_children.drain(..) {
+                    stack.push(TriggerRewriteItem::Expr(child));
                 }
             }
         }
     }
 
-    Ok(())
-}
-
-fn rewrite_from_clause_expressions<F>(
-    from_clause: &mut ast::FromClause,
-    rewrite_expr: &mut F,
-) -> Result<()>
-where
-    F: FnMut(&mut ast::Expr) -> Result<()>,
-{
-    rewrite_select_table_expressions(&mut from_clause.select, rewrite_expr)?;
-
-    for join in &mut from_clause.joins {
-        rewrite_select_table_expressions(&mut join.table, rewrite_expr)?;
-        if let Some(ast::JoinConstraint::On(expr)) = &mut join.constraint {
-            rewrite_expression_tree(expr, rewrite_expr)?;
-        }
-    }
-
-    Ok(())
-}
-
-fn rewrite_select_table_expressions<F>(
-    select_table: &mut ast::SelectTable,
-    rewrite_expr: &mut F,
-) -> Result<()>
-where
-    F: FnMut(&mut ast::Expr) -> Result<()>,
-{
-    match select_table {
-        ast::SelectTable::Table(..) => {}
-        ast::SelectTable::TableCall(_, args, _) => {
-            for arg in args {
-                rewrite_expression_tree(arg, rewrite_expr)?;
-            }
-        }
-        ast::SelectTable::Select(select, _) => {
-            rewrite_select_expressions(select, rewrite_expr)?;
-        }
-        ast::SelectTable::Sub(from_clause, _) => {
-            rewrite_from_clause_expressions(from_clause, rewrite_expr)?;
-        }
-    }
-    Ok(())
-}
-
-fn rewrite_window_expressions<F>(window: &mut ast::Window, rewrite_expr: &mut F) -> Result<()>
-where
-    F: FnMut(&mut ast::Expr) -> Result<()>,
-{
-    for expr in &mut window.partition_by {
-        rewrite_expression_tree(expr, rewrite_expr)?;
-    }
-
-    for sorted_col in &mut window.order_by {
-        rewrite_expression_tree(&mut sorted_col.expr, rewrite_expr)?;
-    }
-
-    if let Some(frame_clause) = &mut window.frame_clause {
-        rewrite_frame_bound_expressions(&mut frame_clause.start, rewrite_expr)?;
-        if let Some(end) = &mut frame_clause.end {
-            rewrite_frame_bound_expressions(end, rewrite_expr)?;
-        }
-    }
-
-    Ok(())
-}
-
-fn rewrite_frame_bound_expressions<F>(
-    frame_bound: &mut ast::FrameBound,
-    rewrite_expr: &mut F,
-) -> Result<()>
-where
-    F: FnMut(&mut ast::Expr) -> Result<()>,
-{
-    match frame_bound {
-        ast::FrameBound::Following(expr) | ast::FrameBound::Preceding(expr) => {
-            rewrite_expression_tree(expr, rewrite_expr)?;
-        }
-        ast::FrameBound::CurrentRow
-        | ast::FrameBound::UnboundedFollowing
-        | ast::FrameBound::UnboundedPreceding => {}
-    }
     Ok(())
 }
 
@@ -1268,15 +1251,8 @@ fn rewrite_expression_tree<F>(expr: &mut ast::Expr, rewrite_expr: &mut F) -> Res
 where
     F: FnMut(&mut ast::Expr) -> Result<()>,
 {
-    walk_expr_mut(
-        expr,
-        &mut |e: &mut ast::Expr| -> Result<expr::WalkControl> {
-            rewrite_expr(e)?;
-            Ok(WalkControl::Continue)
-        },
-    )?;
-
-    Ok(())
+    let mut stack = vec![TriggerRewriteItem::Expr(expr)];
+    rewrite_trigger_items(&mut stack, rewrite_expr)
 }
 
 fn rewrite_trigger_expr_single_for_when_clause(
@@ -1295,14 +1271,6 @@ fn rewrite_trigger_expr_single_for_when_clause(
             {
                 crate::bail_parse_error!("no such column: {}", ident);
             }
-            return Ok(());
-        }
-        Expr::Exists(select) | Expr::Subquery(select) => {
-            rewrite_expressions_in_select_for_when_clause(select, table, ctx)?;
-            return Ok(());
-        }
-        Expr::InSelect { rhs, .. } => {
-            rewrite_expressions_in_select_for_when_clause(rhs, table, ctx)?;
             return Ok(());
         }
         Expr::Qualified(ns, col) | Expr::DoublyQualified(_, ns, col) => {

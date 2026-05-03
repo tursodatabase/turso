@@ -2153,7 +2153,7 @@ fn optimize_table_access(
                         })
                         .collect();
 
-                    temp_constraint_refs.sort_by_key(|x| x.index_col_pos);
+                    temp_constraint_refs.sort_unstable_by_key(|x| x.index_col_pos);
                     let usable_constraint_refs = usable_constraints_for_join_order(
                         &table_constraints.constraints,
                         &temp_constraint_refs,
@@ -2723,186 +2723,225 @@ impl Optimizable for ast::Expr {
     /// for any expression where we aren't sure and didn't bother to find out
     /// by writing more complex code.
     fn is_nonnull(&self, tables: &TableReferences) -> bool {
-        match self {
-            Expr::SubqueryResult { .. } => false,
-            Expr::Between {
-                lhs, start, end, ..
-            } => lhs.is_nonnull(tables) && start.is_nonnull(tables) && end.is_nonnull(tables),
-            Expr::Binary(_, ast::Operator::Modulus | ast::Operator::Divide, _) => false, // 1 % 0, 1 / 0
-            Expr::Binary(expr, _, expr1) => expr.is_nonnull(tables) && expr1.is_nonnull(tables),
-            Expr::Case {
-                base,
-                when_then_pairs,
-                else_expr,
-                ..
-            } => {
-                base.as_ref().is_none_or(|base| base.is_nonnull(tables))
-                    && when_then_pairs
-                        .iter()
-                        .all(|(_, then)| then.is_nonnull(tables))
-                    && else_expr
-                        .as_ref()
-                        .is_none_or(|else_expr| else_expr.is_nonnull(tables))
-            }
-            Expr::Cast { expr, .. } => expr.is_nonnull(tables),
-            Expr::Collate(expr, _) => expr.is_nonnull(tables),
-            Expr::DoublyQualified(..) => {
-                panic!("Do not call is_nonnull before DoublyQualified has been rewritten as Column")
-            }
-            Expr::Exists(..) => false,
-            Expr::FunctionCall { .. } => false,
-            Expr::FunctionCallStar { .. } => false,
-            Expr::Id(..) => panic!("Do not call is_nonnull before Id has been rewritten as Column"),
-            Expr::Column {
-                table,
-                column,
-                is_rowid_alias,
-                ..
-            } => {
-                if *is_rowid_alias {
-                    return true;
+        let mut stack = vec![self];
+        while let Some(expr) = stack.pop() {
+            match expr {
+                Expr::SubqueryResult { .. } => return false,
+                Expr::Between {
+                    lhs, start, end, ..
+                } => {
+                    stack.push(end);
+                    stack.push(start);
+                    stack.push(lhs);
                 }
+                Expr::Binary(_, ast::Operator::Modulus | ast::Operator::Divide, _) => {
+                    return false;
+                } // 1 % 0, 1 / 0
+                Expr::Binary(lhs, _, rhs) => {
+                    stack.push(rhs);
+                    stack.push(lhs);
+                }
+                Expr::Case {
+                    base,
+                    when_then_pairs,
+                    else_expr,
+                    ..
+                } => {
+                    if let Some(else_expr) = else_expr {
+                        stack.push(else_expr);
+                    }
+                    stack.extend(when_then_pairs.iter().map(|(_, then)| then.as_ref()));
+                    if let Some(base) = base {
+                        stack.push(base);
+                    }
+                }
+                Expr::Cast { expr, .. } => stack.push(expr),
+                Expr::Collate(expr, _) => stack.push(expr),
+                Expr::DoublyQualified(..) => {
+                    panic!("Do not call is_nonnull before DoublyQualified has been rewritten as Column")
+                }
+                Expr::Exists(..) => return false,
+                Expr::FunctionCall { .. } => return false,
+                Expr::FunctionCallStar { .. } => return false,
+                Expr::Id(..) => {
+                    panic!("Do not call is_nonnull before Id has been rewritten as Column")
+                }
+                Expr::Column {
+                    table,
+                    column,
+                    is_rowid_alias,
+                    ..
+                } => {
+                    if *is_rowid_alias {
+                        continue;
+                    }
 
-                let (_, table_ref) = tables
-                    .find_table_by_internal_id(*table)
-                    .expect("table not found");
-                let columns = table_ref.columns();
-                let column = &columns[*column];
-                // Only INTEGER PRIMARY KEY (rowid alias) is implicitly NOT NULL.
-                // Other PRIMARY KEY types (e.g., TEXT PRIMARY KEY) can contain NULL.
-                column.is_rowid_alias() || column.notnull()
-            }
-            Expr::RowId { .. } => true,
-            Expr::InList { lhs, rhs, .. } => {
-                lhs.is_nonnull(tables)
-                    && (rhs.is_empty() || rhs.iter().all(|v| v.is_nonnull(tables)))
-            }
-            Expr::InSelect { .. } => false,
-            Expr::InTable { .. } => false,
-            Expr::IsNull(..) => true,
-            Expr::Like { lhs, rhs, .. } => lhs.is_nonnull(tables) && rhs.is_nonnull(tables),
-            Expr::Literal(literal) => match literal {
-                ast::Literal::Numeric(_) => true,
-                ast::Literal::String(_) => true,
-                ast::Literal::Blob(_) => true,
-                ast::Literal::Keyword(_) => true,
-                ast::Literal::Null => false,
-                ast::Literal::True => true,
-                ast::Literal::False => true,
-                ast::Literal::CurrentDate => true,
-                ast::Literal::CurrentTime => true,
-                ast::Literal::CurrentTimestamp => true,
-            },
-            Expr::Name(..) => false,
-            Expr::NotNull(..) => true,
-            Expr::Parenthesized(exprs) => exprs.iter().all(|expr| expr.is_nonnull(tables)),
-            Expr::Qualified(..) => {
-                panic!("Do not call is_nonnull before Qualified has been rewritten as Column")
-            }
-            Expr::FieldAccess { .. } => false, // struct/union field extraction can return NULL
-            Expr::Raise(..) => false,
-            Expr::Subquery(..) => false,
-            Expr::Unary(_, expr) => expr.is_nonnull(tables),
-            Expr::Variable(..) => false,
-            Expr::Register(..) => false, // Register values can be null
-            Expr::Default => false,
-            Expr::Array { .. } | Expr::Subscript { .. } => {
-                unreachable!("Array and Subscript are desugared into function calls by the parser")
+                    let (_, table_ref) = tables
+                        .find_table_by_internal_id(*table)
+                        .expect("table not found");
+                    let columns = table_ref.columns();
+                    let column = &columns[*column];
+                    // Only INTEGER PRIMARY KEY (rowid alias) is implicitly NOT NULL.
+                    // Other PRIMARY KEY types (e.g., TEXT PRIMARY KEY) can contain NULL.
+                    if !(column.is_rowid_alias() || column.notnull()) {
+                        return false;
+                    }
+                }
+                Expr::RowId { .. } => {}
+                Expr::InList { lhs, rhs, .. } => {
+                    stack.extend(rhs.iter().map(|expr| expr.as_ref()));
+                    stack.push(lhs);
+                }
+                Expr::InSelect { .. } => return false,
+                Expr::InTable { .. } => return false,
+                Expr::IsNull(..) => {}
+                Expr::Like { lhs, rhs, .. } => {
+                    stack.push(rhs);
+                    stack.push(lhs);
+                }
+                Expr::Literal(literal) => match literal {
+                    ast::Literal::Numeric(_) => {}
+                    ast::Literal::String(_) => {}
+                    ast::Literal::Blob(_) => {}
+                    ast::Literal::Keyword(_) => {}
+                    ast::Literal::Null => return false,
+                    ast::Literal::True => {}
+                    ast::Literal::False => {}
+                    ast::Literal::CurrentDate => {}
+                    ast::Literal::CurrentTime => {}
+                    ast::Literal::CurrentTimestamp => {}
+                },
+                Expr::Name(..) => return false,
+                Expr::NotNull(..) => {}
+                Expr::Parenthesized(exprs) => stack.extend(exprs.iter().map(|expr| expr.as_ref())),
+                Expr::Qualified(..) => {
+                    panic!("Do not call is_nonnull before Qualified has been rewritten as Column")
+                }
+                Expr::FieldAccess { .. } => return false, // struct/union field extraction can return NULL
+                Expr::Raise(..) => return false,
+                Expr::Subquery(..) => return false,
+                Expr::Unary(_, expr) => stack.push(expr),
+                Expr::Variable(..) => return false,
+                Expr::Register(..) => return false, // Register values can be null
+                Expr::Default => return false,
+                Expr::Array { .. } | Expr::Subscript { .. } => {
+                    unreachable!(
+                        "Array and Subscript are desugared into function calls by the parser"
+                    )
+                }
             }
         }
+        true
     }
     /// Returns true if the expression is a constant i.e. does not depend on columns and can be evaluated only once during the execution
     fn is_constant(&self, resolver: &Resolver<'_>) -> bool {
-        match self {
-            Expr::SubqueryResult { .. } => false,
-            Expr::Between {
-                lhs, start, end, ..
-            } => {
-                lhs.is_constant(resolver)
-                    && start.is_constant(resolver)
-                    && end.is_constant(resolver)
-            }
-            Expr::Binary(expr, _, expr1) => {
-                expr.is_constant(resolver) && expr1.is_constant(resolver)
-            }
-            Expr::Case {
-                base,
-                when_then_pairs,
-                else_expr,
-            } => {
-                base.as_ref().is_none_or(|base| base.is_constant(resolver))
-                    && when_then_pairs.iter().all(|(when, then)| {
-                        when.is_constant(resolver) && then.is_constant(resolver)
-                    })
-                    && else_expr
-                        .as_ref()
-                        .is_none_or(|else_expr| else_expr.is_constant(resolver))
-            }
-            Expr::Cast { expr, .. } => expr.is_constant(resolver),
-            Expr::Collate(expr, _) => expr.is_constant(resolver),
-            // Not constant. Normally rewritten to Expr::Column by the optimizer,
-            // but CHECK constraints bypass the rewrite pass and legitimately
-            // contain DoublyQualified nodes.
-            Expr::DoublyQualified(_, _, _) => false,
-            Expr::Exists(_) => false,
-            Expr::FunctionCall {
-                args,
-                name,
-                filter_over,
-                ..
-            } => {
-                if filter_over.over_clause.is_some() {
-                    return false;
+        let mut stack = vec![self];
+        while let Some(expr) = stack.pop() {
+            match expr {
+                Expr::SubqueryResult { .. } => return false,
+                Expr::Between {
+                    lhs, start, end, ..
+                } => {
+                    stack.push(end);
+                    stack.push(start);
+                    stack.push(lhs);
                 }
-                let Some(func) = resolver
-                    .resolve_function(name.as_str(), args.len())
-                    .ok()
-                    .flatten()
-                else {
-                    return false;
-                };
-                func.is_deterministic() && args.iter().all(|arg| arg.is_constant(resolver))
-            }
-            Expr::FunctionCallStar { .. } => false,
-            Expr::Id(_) => true,
-            Expr::Column { .. } => false,
-            Expr::RowId { .. } => false,
-            Expr::InList { lhs, rhs, .. } => {
-                lhs.is_constant(resolver)
-                    && (rhs.is_empty() || rhs.iter().all(|v| v.is_constant(resolver)))
-            }
-            Expr::InSelect { .. } => {
-                false // might be constant, too annoying to check subqueries etc. implement later
-            }
-            Expr::InTable { .. } => false,
-            Expr::IsNull(expr) => expr.is_constant(resolver),
-            Expr::Like {
-                lhs, rhs, escape, ..
-            } => {
-                lhs.is_constant(resolver)
-                    && rhs.is_constant(resolver)
-                    && escape
-                        .as_ref()
-                        .is_none_or(|escape| escape.is_constant(resolver))
-            }
-            Expr::Literal(_) => true,
-            Expr::Name(_) => false,
-            Expr::NotNull(expr) => expr.is_constant(resolver),
-            Expr::Parenthesized(exprs) => exprs.iter().all(|expr| expr.is_constant(resolver)),
-            // Not constant. Normally rewritten to Expr::Column by the optimizer,
-            // but CHECK constraints bypass the rewrite pass and legitimately
-            // contain Qualified nodes.
-            Expr::Qualified(_, _) | Expr::FieldAccess { .. } => false,
-            Expr::Raise(_, expr) => expr.as_ref().is_none_or(|expr| expr.is_constant(resolver)),
-            Expr::Subquery(_) => false,
-            Expr::Unary(_, expr) => expr.is_constant(resolver),
-            Expr::Variable(_) => true,
-            Expr::Register(_) => false,
-            Expr::Default => true,
-            Expr::Array { .. } | Expr::Subscript { .. } => {
-                unreachable!("Array and Subscript are desugared into function calls by the parser")
+                Expr::Binary(lhs, _, rhs) => {
+                    stack.push(rhs);
+                    stack.push(lhs);
+                }
+                Expr::Case {
+                    base,
+                    when_then_pairs,
+                    else_expr,
+                } => {
+                    if let Some(else_expr) = else_expr {
+                        stack.push(else_expr);
+                    }
+                    for (when, then) in when_then_pairs {
+                        stack.push(then);
+                        stack.push(when);
+                    }
+                    if let Some(base) = base {
+                        stack.push(base);
+                    }
+                }
+                Expr::Cast { expr, .. } => stack.push(expr),
+                Expr::Collate(expr, _) => stack.push(expr),
+                // Not constant. Normally rewritten to Expr::Column by the optimizer,
+                // but CHECK constraints bypass the rewrite pass and legitimately
+                // contain DoublyQualified nodes.
+                Expr::DoublyQualified(_, _, _) => return false,
+                Expr::Exists(_) => return false,
+                Expr::FunctionCall {
+                    args,
+                    name,
+                    filter_over,
+                    ..
+                } => {
+                    if filter_over.over_clause.is_some() {
+                        return false;
+                    }
+                    let Some(func) = resolver
+                        .resolve_function(name.as_str(), args.len())
+                        .ok()
+                        .flatten()
+                    else {
+                        return false;
+                    };
+                    if !func.is_deterministic() {
+                        return false;
+                    }
+                    stack.extend(args.iter().map(|expr| expr.as_ref()));
+                }
+                Expr::FunctionCallStar { .. } => return false,
+                Expr::Id(_) => {}
+                Expr::Column { .. } => return false,
+                Expr::RowId { .. } => return false,
+                Expr::InList { lhs, rhs, .. } => {
+                    stack.extend(rhs.iter().map(|expr| expr.as_ref()));
+                    stack.push(lhs);
+                }
+                Expr::InSelect { .. } => {
+                    return false; // might be constant, too annoying to check subqueries etc. implement later
+                }
+                Expr::InTable { .. } => return false,
+                Expr::IsNull(expr) => stack.push(expr),
+                Expr::Like {
+                    lhs, rhs, escape, ..
+                } => {
+                    if let Some(escape) = escape {
+                        stack.push(escape);
+                    }
+                    stack.push(rhs);
+                    stack.push(lhs);
+                }
+                Expr::Literal(_) => {}
+                Expr::Name(_) => return false,
+                Expr::NotNull(expr) => stack.push(expr),
+                Expr::Parenthesized(exprs) => stack.extend(exprs.iter().map(|expr| expr.as_ref())),
+                // Not constant. Normally rewritten to Expr::Column by the optimizer,
+                // but CHECK constraints bypass the rewrite pass and legitimately
+                // contain Qualified nodes.
+                Expr::Qualified(_, _) | Expr::FieldAccess { .. } => return false,
+                Expr::Raise(_, expr) => {
+                    if let Some(expr) = expr {
+                        stack.push(expr);
+                    }
+                }
+                Expr::Subquery(_) => return false,
+                Expr::Unary(_, expr) => stack.push(expr),
+                Expr::Variable(_) => {}
+                Expr::Register(_) => return false,
+                Expr::Default => {}
+                Expr::Array { .. } | Expr::Subscript { .. } => {
+                    unreachable!(
+                        "Array and Subscript are desugared into function calls by the parser"
+                    )
+                }
             }
         }
+        true
     }
     /// Returns true if the expression is a constant expression that, when evaluated as a condition, is always true or false
     fn check_always_true_or_false(&self) -> Result<Option<AlwaysTrueOrFalse>> {

@@ -1471,7 +1471,7 @@ fn find_best_access_method_for_subquery(
         })
         .collect();
 
-    temp_constraint_refs.sort_by_key(|x| x.index_col_pos);
+    temp_constraint_refs.sort_unstable_by_key(|x| x.index_col_pos);
 
     // Filter to only constraints that can be used given the current join order
     let usable_constraint_refs = usable_constraints_for_join_order(

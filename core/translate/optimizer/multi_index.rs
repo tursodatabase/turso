@@ -103,28 +103,31 @@ enum MultiIdxBranchAccess {
 ///
 /// For example, `(a OR b) OR c` becomes `[a, b, c]`.
 fn flatten_or_expr(expr: &ast::Expr) -> Vec<&ast::Expr> {
-    match expr {
-        ast::Expr::Binary(lhs, ast::Operator::Or, rhs) => {
-            let mut result = flatten_or_expr(lhs);
-            result.extend(flatten_or_expr(rhs));
-            result
-        }
-        _ => vec![expr],
-    }
+    flatten_binary_expr(expr, ast::Operator::Or)
 }
 
 /// Flattens nested AND expressions into a list of conjuncts.
 ///
 /// For example, `(a AND b) AND c` becomes `[a, b, c]`.
 fn flatten_and_expr(expr: &ast::Expr) -> Vec<&ast::Expr> {
-    match expr {
-        ast::Expr::Binary(lhs, ast::Operator::And, rhs) => {
-            let mut result = flatten_and_expr(lhs);
-            result.extend(flatten_and_expr(rhs));
-            result
+    flatten_binary_expr(expr, ast::Operator::And)
+}
+
+fn flatten_binary_expr(expr: &ast::Expr, operator: ast::Operator) -> Vec<&ast::Expr> {
+    let mut flattened = Vec::new();
+    let mut stack = vec![expr];
+
+    while let Some(expr) = stack.pop() {
+        match expr {
+            ast::Expr::Binary(lhs, expr_operator, rhs) if *expr_operator == operator => {
+                stack.push(rhs);
+                stack.push(lhs);
+            }
+            _ => flattened.push(expr),
         }
-        _ => vec![expr],
     }
+
+    flattened
 }
 
 /// Build temporary `WhereTerm`s from branch-local expressions and extract the
