@@ -2725,7 +2725,7 @@ impl Connection {
         }
 
         // Sort by sequence number to ensure consistent ordering
-        databases.sort_by_key(|&(seq, _, _)| seq);
+        databases.sort_unstable_by_key(|&(seq, _, _)| seq);
         databases
     }
 

@@ -866,7 +866,9 @@ pub fn constraints_from_where_clause(
 
         for candidate in cs.candidates.iter_mut() {
             // Sort by index_col_pos, ascending -- index columns must be consumed in contiguous order.
-            candidate.refs.sort_by_key(|cref| cref.index_col_pos);
+            candidate
+                .refs
+                .sort_unstable_by_key(|cref| cref.index_col_pos);
         }
         cs.candidates.retain(|c| {
             if let Some(idx) = &c.index {
