@@ -345,7 +345,13 @@ fn gen_insert_values<R: Rng + ?Sized, C: GenerationContext>(
 
     let table = pick(env.tables(), rng);
 
+    // always self-assign IPKs in mvcc, to avoid having to simulate RowidAllocator::max_rowid
     const INTEGER_PK_NULL_PROB: f64 = 0.05;
+    let null_ipk_prob = if env.opts().mvcc {
+        0.0
+    } else {
+        INTEGER_PK_NULL_PROB
+    };
     let integer_pk_idx = table
         .columns
         .iter()
@@ -361,7 +367,7 @@ fn gen_insert_values<R: Rng + ?Sized, C: GenerationContext>(
                 .iter()
                 .enumerate()
                 .map(|(col_idx, c)| {
-                    if integer_pk_idx == Some(col_idx) && rng.random_bool(INTEGER_PK_NULL_PROB) {
+                    if integer_pk_idx == Some(col_idx) && rng.random_bool(null_ipk_prob) {
                         return SimValue::NULL;
                     }
                     if c.has_unique_or_pk() {
@@ -523,7 +529,8 @@ fn gen_insert_upsert_values<R: Rng + ?Sized, C: GenerationContext>(
         );
     }
     row[pk_idx] = SimValue::unique_for_type(&pk_col.column_type, new_id);
-    if rng.random_bool(UPSERT_INTEGER_PK_NULL_PROB) {
+    // always self-assign IPKs in mvcc, to avoid having to simulate RowidAllocator::max_rowid
+    if !env.opts().mvcc && rng.random_bool(UPSERT_INTEGER_PK_NULL_PROB) {
         row[pk_idx] = SimValue::NULL;
     }
 

@@ -1080,3 +1080,58 @@ fn test_multiple_create_drop_cycles_recover(db: TempDatabase) -> anyhow::Result<
 
     Ok(())
 }
+
+/// A multi-database MVCC commit must be atomic across the main and attached
+/// databases: if validation fails for any DB, every other DB must roll back.
+///
+/// Regression test for the simulator-discovered bug (seed
+/// 15785957889433018030) where conn1 wrote to both main and an attached DB,
+/// conn2 committed a conflicting write to the attached DB first, and conn1's
+/// COMMIT then partially succeeded — main-DB rows persisted even though the
+/// commit returned `WriteWriteConflict` to the user.
+#[turso_macros::test]
+fn test_mvcc_multi_db_commit_atomic_on_conflict(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let conn1 = tmp_db.connect_limbo();
+    conn1.pragma_update("journal_mode", "'mvcc'")?;
+
+    let aux_path = tmp_db.path.with_extension("aux_atomic.db");
+    create_mvcc_db(&tmp_db.io, &aux_path)?;
+
+    conn1.execute(format!("ATTACH '{}' AS aux", aux_path.display()))?;
+    conn1.execute("CREATE TABLE t(x INTEGER)")?;
+    conn1.execute("CREATE TABLE aux.u(x INTEGER PRIMARY KEY)")?;
+
+    let conn2 = tmp_db.connect_limbo();
+    conn2.execute(format!("ATTACH '{}' AS aux", aux_path.display()))?;
+
+    // Both connections begin a concurrent MVCC tx and prepare conflicting
+    // writes on the attached DB; conn1 also writes to the main DB.
+    conn1.execute("BEGIN CONCURRENT")?;
+    conn2.execute("BEGIN CONCURRENT")?;
+    conn1.execute("INSERT INTO t VALUES (1), (2), (3), (4), (5)")?;
+    conn1.execute("INSERT INTO aux.u VALUES (1)")?;
+    conn2.execute("INSERT INTO aux.u VALUES (1)")?;
+
+    // conn2 wins the race on aux.u.
+    conn2.execute("COMMIT")?;
+
+    // conn1's commit must fail with WriteWriteConflict, rolling back BOTH the
+    // attached-DB insert AND the main-DB inserts.
+    let conn1_commit = conn1.execute("COMMIT");
+    assert!(
+        matches!(conn1_commit, Err(LimboError::WriteWriteConflict)),
+        "expected WriteWriteConflict on conn1.COMMIT, got {conn1_commit:?}"
+    );
+
+    // The whole conn1 tx must be rolled back. A fresh connection ensures we
+    // are not seeing stale per-connection cache.
+    let observer = tmp_db.connect_limbo();
+    let main_count: Vec<(i64,)> = observer.exec_rows("SELECT COUNT(*) FROM t");
+    assert_eq!(
+        main_count,
+        vec![(0,)],
+        "main-DB rows from conn1's failed COMMIT must not be visible"
+    );
+
+    Ok(())
+}

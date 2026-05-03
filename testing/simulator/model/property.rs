@@ -61,6 +61,15 @@ pub enum Property {
     TableHasExpectedContent {
         table: String,
     },
+    /// EachColumnMatchesModel selects individual columns from a table, and asserts that each result
+    /// matches the shadow model. Since this increases the chances of the optimizer choosing
+    /// covering index scans, this can catch desynchronization between indexes and their base table.
+    /// Execution:
+    ///     SELECT <col> from <t>  -- for every <col>
+    EachColumnMatchesModel {
+        table: String,
+        columns: Vec<String>,
+    },
     /// AllTablesHaveExpectedContent is a property in which the table
     /// must have the expected content, i.e. all the insertions and
     /// updates and deletions should have been persisted in the way
@@ -239,6 +248,7 @@ impl Property {
             | Property::UnionAllPreservesCardinality { .. }
             | Property::ReadYourUpdatesBack { .. }
             | Property::TableHasExpectedContent { .. }
+            | Property::EachColumnMatchesModel { .. }
             | Property::AllTableHaveExpectedContent { .. } => None,
         }
     }

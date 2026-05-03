@@ -28,6 +28,8 @@ pub struct Opts {
     /// Generate arbitrary INSERT INTO ... SELECT queries. This is disabled by default, as it makes
     /// the simulator very slow and generates huge databases.
     pub arbitrary_insert_into_select: bool,
+    #[garde(skip)]
+    pub mvcc: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, Validate)]
