@@ -413,7 +413,7 @@ impl Connection {
 
         #[cfg(not(target_family = "wasm"))]
         {
-            let temp_dir = tempfile::tempdir().map_err(|e| io_error(e, "tempdir"))?;
+            let temp_dir = self.create_tempdir()?;
             let temp_path = temp_dir.path().join("tursodb-temp.db");
             let temp_path_str = temp_path.to_str().ok_or_else(|| {
                 LimboError::InternalError("temp db path is not valid UTF-8".into())
@@ -2797,6 +2797,24 @@ impl Connection {
         self.reset_temp_database();
         self.temp_store.set(value);
         self.bump_prepare_context_generation();
+    }
+
+    /// Create a `TempDir` honoring `TURSO_TMPDIR` and `SQLITE_TMPDIR`,
+    /// falling back to the OS default (`env::temp_dir()`).
+    ///
+    /// `&self` is reserved for a future per-connection
+    /// `temp_store_directory` setting (e.g. `PRAGMA temp_store_directory`)
+    /// so call sites don't need to change when that lands.
+    #[cfg(not(target_family = "wasm"))]
+    pub(crate) fn create_tempdir(&self) -> Result<TempDir> {
+        let res = if let Some(d) = std::env::var_os("TURSO_TMPDIR") {
+            tempfile::tempdir_in(d)
+        } else if let Some(d) = std::env::var_os("SQLITE_TMPDIR") {
+            tempfile::tempdir_in(d)
+        } else {
+            tempfile::tempdir()
+        };
+        res.map_err(|e| io_error(e, "tempdir"))
     }
 
     pub fn get_data_sync_retry(&self) -> bool {
