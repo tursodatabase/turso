@@ -150,15 +150,13 @@ pub struct Resolver<'a> {
     /// mechanism, but operates as a side-channel since limbo rewrites the AST rather
     /// than redirecting column reads at codegen time.
     pub register_affinities: HashMap<usize, Affinity>,
-    /// Column affinities for the SELF_TABLE context (DML expression index evaluation).
-    /// Indexed by table column position. Populated alongside `register_affinities`
-    /// so that `get_expr_affinity_info` can resolve `Expr::Column { SELF_TABLE }`
-    /// affinities when `referenced_tables` is `None`.
-    pub self_table_column_affinities: Vec<Affinity>,
     /// Affinity metadata for planned scalar subqueries keyed by their internal ID.
     /// This lets comparison affinity follow SQLite rules for expressions like
     /// `(SELECT text_col FROM ...) > some_numeric_expr`.
     pub(crate) subquery_affinities: RefCell<HashMap<TableInternalId, ExprAffinityInfo>>,
+    /// Context and metadata for resolving Expr::Column values that use
+    /// [TableInternalId::SELF_TABLE] as a placeholder.
+    self_table_scope: RefCell<Option<SelfTableScope>>,
     pub enable_custom_types: bool,
     /// Controls whether unresolved double-quoted identifiers fall back to string
     /// literals (SQLite's DQS misfeature) in DML statements.
@@ -180,6 +178,65 @@ pub struct Resolver<'a> {
     /// (e.g. via a nested sub-program), update this field on that
     /// path or switch to a live read.
     has_temp_schema: bool,
+}
+
+#[derive(Clone)]
+struct SelfTableScope {
+    context: SelfTableContext,
+    affinities: Option<Arc<[Affinity]>>,
+}
+
+impl SelfTableScope {
+    fn new(context: SelfTableContext) -> Self {
+        let affinities = match &context {
+            SelfTableContext::ForDML { table, .. } => Some(
+                table
+                    .columns()
+                    .iter()
+                    .map(|c| c.affinity_with_strict(table.is_strict))
+                    .collect(),
+            ),
+            SelfTableContext::ForSelect {
+                table_ref_id,
+                referenced_tables,
+            } => referenced_tables
+                .find_table_by_internal_id(*table_ref_id)
+                .and_then(|(_, table_ref)| table_ref.btree())
+                .map(|btree| {
+                    btree
+                        .columns()
+                        .iter()
+                        .map(|c| c.affinity_with_strict(btree.is_strict))
+                        .collect()
+                }),
+        };
+
+        Self {
+            context,
+            affinities,
+        }
+    }
+
+    fn affinity(&self, column: usize) -> Option<Affinity> {
+        self.affinities
+            .as_ref()
+            .and_then(|affinities| affinities.get(column).copied())
+    }
+
+    fn column_type_str(&self, column: usize) -> Option<String> {
+        match &self.context {
+            SelfTableContext::ForDML { table, .. } => {
+                table.columns().get(column).map(|c| c.ty_str.clone())
+            }
+            SelfTableContext::ForSelect {
+                table_ref_id,
+                referenced_tables,
+            } => referenced_tables
+                .find_table_by_internal_id(*table_ref_id)
+                .and_then(|(_, table_ref)| table_ref.columns().get(column))
+                .map(|c| c.ty_str.clone()),
+        }
+    }
 }
 
 /// Context for restricting table resolution during trigger subprogram compilation.
@@ -221,8 +278,8 @@ impl<'a> Resolver<'a> {
             expr_to_reg_cache_enabled: false,
             expr_to_reg_cache: Vec::new(),
             register_affinities: HashMap::default(),
-            self_table_column_affinities: Vec::new(),
             subquery_affinities: RefCell::new(HashMap::default()),
+            self_table_scope: RefCell::new(None),
             enable_custom_types,
             dqs_dml,
             trigger_context: None,
@@ -249,8 +306,8 @@ impl<'a> Resolver<'a> {
             expr_to_reg_cache_enabled: false,
             expr_to_reg_cache: Vec::new(),
             register_affinities: HashMap::default(),
-            self_table_column_affinities: Vec::new(),
             subquery_affinities: RefCell::new(self.subquery_affinities.borrow().clone()),
+            self_table_scope: RefCell::new(self.self_table_scope.borrow().clone()),
             enable_custom_types: self.enable_custom_types,
             dqs_dml: self.dqs_dml,
             trigger_context: self.trigger_context.clone(),
@@ -269,8 +326,8 @@ impl<'a> Resolver<'a> {
             expr_to_reg_cache_enabled: self.expr_to_reg_cache_enabled,
             expr_to_reg_cache: self.expr_to_reg_cache.clone(),
             register_affinities: self.register_affinities.clone(),
-            self_table_column_affinities: self.self_table_column_affinities.clone(),
             subquery_affinities: RefCell::new(self.subquery_affinities.borrow().clone()),
+            self_table_scope: RefCell::new(self.self_table_scope.borrow().clone()),
             enable_custom_types: self.enable_custom_types,
             dqs_dml: self.dqs_dml,
             trigger_context: self.trigger_context.clone(),
@@ -283,6 +340,50 @@ impl<'a> Resolver<'a> {
             crate::bail_parse_error!("{} require --experimental-custom-types flag", feature);
         }
         Ok(())
+    }
+
+    pub(crate) fn with_self_table_context<T>(
+        &self,
+        program: &mut ProgramBuilder,
+        ctx: Option<&SelfTableContext>,
+        f: impl FnOnce(&mut ProgramBuilder, Option<&SelfTableContext>) -> Result<T>,
+    ) -> Result<T> {
+        match ctx {
+            Some(ctx) => {
+                let scope = SelfTableScope::new(ctx.clone());
+                let prev = self.self_table_scope.borrow_mut().replace(scope);
+                let result = f(program, Some(ctx));
+                *self.self_table_scope.borrow_mut() = prev;
+                result
+            }
+            None => f(program, None),
+        }
+    }
+
+    pub(crate) fn with_existing_self_table_context<T>(
+        &self,
+        f: impl FnOnce(Option<&SelfTableContext>) -> Result<T>,
+    ) -> Result<T> {
+        let ctx = self
+            .self_table_scope
+            .borrow()
+            .as_ref()
+            .map(|scope| scope.context.clone());
+        f(ctx.as_ref())
+    }
+
+    pub(crate) fn self_table_affinity(&self, column: usize) -> Option<Affinity> {
+        self.self_table_scope
+            .borrow()
+            .as_ref()
+            .and_then(|scope| scope.affinity(column))
+    }
+
+    pub(crate) fn self_table_column_type_str(&self, column: usize) -> Option<String> {
+        self.self_table_scope
+            .borrow()
+            .as_ref()
+            .and_then(|scope| scope.column_type_str(column))
     }
 
     fn cached_non_main_schema(&self, database_id: usize) -> Arc<Schema> {
@@ -1691,7 +1792,7 @@ pub(crate) fn emit_index_column_value_old_image(
             table_ref_id: table_internal_id,
             referenced_tables: table_references.clone(),
         };
-        program.with_self_table_context(Some(&self_table_context), |program, _| {
+        resolver.with_self_table_context(program, Some(&self_table_context), |program, _| {
             translate_expr_no_constant_opt(
                 program,
                 Some(table_references),

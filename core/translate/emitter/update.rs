@@ -830,7 +830,8 @@ fn emit_update_column_values<'a>(
                         GeneratedType::NotGenerated => None,
                     };
 
-                    program.with_self_table_context(
+                    t_ctx.resolver.with_self_table_context(
+                        program,
                         self_table_context.as_ref(),
                         |program, _| {
                             // Save/restore target_union_type so union_value() resolves tags
@@ -1534,8 +1535,6 @@ fn emit_update_insns<'a>(
     // the end of the function.
     {
         let columns = target_table.table.columns();
-        t_ctx.resolver.self_table_column_affinities =
-            columns.iter().map(|c| c.affinity()).collect();
         for (idx, col) in columns.iter().enumerate() {
             t_ctx
                 .resolver
@@ -2542,6 +2541,5 @@ fn emit_update_insns<'a>(
     program.preassign_label_to_next_insn(trigger_ignore_jump_label);
 
     t_ctx.resolver.register_affinities.clear();
-    t_ctx.resolver.self_table_column_affinities.clear();
     Ok(())
 }

@@ -20,19 +20,19 @@ pub fn compute_virtual_columns(
         dml_ctx: dml_ctx.clone(),
         table: Arc::clone(table),
     };
-    for (idx, column) in columns.iter() {
-        let GeneratedType::Virtual { expr, .. } = column.generated_type() else {
-            continue;
-        };
-        let target_reg = dml_ctx.to_column_reg(idx);
-        program.with_self_table_context(Some(&ctx), |program, _| {
-            translate_expr(program, None, expr, target_reg, resolver)
-        })?;
-        if column.affinity() != Affinity::Blob {
-            program.emit_column_affinity(target_reg, column.affinity());
+    resolver.with_self_table_context(program, Some(&ctx), |program, _| {
+        for (idx, column) in columns.iter() {
+            let GeneratedType::Virtual { expr, .. } = column.generated_type() else {
+                continue;
+            };
+            let target_reg = dml_ctx.to_column_reg(idx);
+            translate_expr(program, None, expr, target_reg, resolver)?;
+            if column.affinity() != Affinity::Blob {
+                program.emit_column_affinity(target_reg, column.affinity());
+            }
         }
-    }
-    Ok(())
+        Ok(())
+    })
 }
 
 /// Emit bytecode to compute a single virtual generated column expression.
@@ -52,7 +52,7 @@ pub(crate) fn emit_gencol_expr_from_registers(
         dml_ctx: DmlColumnContext::layout(columns, registers_start, rowid_reg, layout.clone()),
         table: Arc::clone(table),
     };
-    program.with_self_table_context(Some(&ctx), |program, _| {
+    resolver.with_self_table_context(program, Some(&ctx), |program, _| {
         translate_expr(program, None, expr, target_reg, resolver)?;
         Ok(())
     })?;

@@ -835,14 +835,11 @@ pub fn translate_insert(
     // while the table row gets the default value, causing integrity_check failures.
     emit_notnulls(program, &ctx, &insertion, resolver)?;
 
-    // Populate register-to-affinity and column-to-affinity maps so that
-    // partial index WHERE clauses and expression index expressions get
+    // Populate register-to-affinity map so partial index WHERE clauses get
     // correct column affinity during INSERT.
     //
     // Partial index WHEREs use rewrite_partial_index_where which converts
     // column refs to Expr::Register — register_affinities handles those.
-    // Expression index values use SelfTableContext::ForDML which keeps
-    // Expr::Column { SELF_TABLE } — self_table_column_affinities handles those.
     //
     // Without this, comparisons like `integer_col < '2'` lose their
     // INTEGER affinity and evaluate under type-ordering rules, producing
@@ -855,8 +852,6 @@ pub fn translate_insert(
     resolver
         .register_affinities
         .insert(insertion.key_register(), Affinity::Integer);
-    resolver.self_table_column_affinities =
-        ctx.table.columns().iter().map(|c| c.affinity()).collect();
 
     emit_preflight_constraint_checks(
         program,
@@ -911,7 +906,6 @@ pub fn translate_insert(
     }
 
     resolver.register_affinities.clear();
-    resolver.self_table_column_affinities.clear();
 
     let mut insert_flags = InsertFlags::new();
 

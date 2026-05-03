@@ -873,7 +873,7 @@ fn emit_index_column_value_from_cursor(
                     table_ref_id: jt.internal_id,
                     referenced_tables: table_references.clone(),
                 });
-        program.with_self_table_context(self_table_context.as_ref(), |program, _| {
+        resolver.with_self_table_context(program, self_table_context.as_ref(), |program, _| {
             translate_expr(program, Some(table_references), &expr, dest_reg, resolver)?;
             Ok(())
         })?;

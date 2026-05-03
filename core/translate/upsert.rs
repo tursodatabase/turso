@@ -403,10 +403,6 @@ pub fn emit_upsert(
     connection: &Arc<Connection>,
     table_references: &mut TableReferences,
 ) -> crate::Result<()> {
-    // Populate SELF_TABLE column affinities so expression index evaluation
-    // can resolve affinity for column references (matches UPDATE path).
-    resolver.self_table_column_affinities = table.columns().iter().map(|c| c.affinity()).collect();
-
     // Seek & snapshot CURRENT
     program.emit_insn(Insn::SeekRowid {
         cursor_id: ctx.cursor_id,

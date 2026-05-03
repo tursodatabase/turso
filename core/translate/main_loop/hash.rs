@@ -422,7 +422,8 @@ impl<'a, 'plan> PreparedHashBuild<'a, 'plan> {
                     .map(|c| c.generated_type())
                 {
                     Some(GeneratedType::Virtual { expr, .. }) if !config.use_materialized_keys => {
-                        planner.program.with_self_table_context(
+                        planner.t_ctx.resolver.with_self_table_context(
+                            planner.program,
                             Some(&SelfTableContext::ForSelect {
                                 table_ref_id: build_table.internal_id,
                                 referenced_tables: planner.table_references.clone(),

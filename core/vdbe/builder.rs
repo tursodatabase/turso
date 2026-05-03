@@ -248,8 +248,6 @@ pub struct ProgramBuilder {
     /// Maps table internal_id to result_columns_start_reg for FROM clause subqueries.
     /// Used when nested subqueries need to reference columns from outer query subqueries.
     subquery_result_regs: HashMap<TableInternalId, usize>,
-    /// Context for resolving an Expr::Column that has a [TableInternalId::SELF_TABLE] placeholder.
-    self_table_context: Option<SelfTableContext>,
     /// The mode in which the query is being executed.
     query_mode: QueryMode,
     pub flags: ProgramBuilderFlags,
@@ -283,7 +281,7 @@ pub struct ProgramBuilder {
     /// the target column, so the type must come from the INSERT/UPDATE/UPSERT context.
     ///
     /// This follows the same save/restore pattern as `id_register_overrides`
-    /// (ENCODE/DECODE context) and `self_table_context` (DML column resolution).
+    /// (ENCODE/DECODE context).
     /// Callers must save with `.take()`, set the new value, translate the expression,
     /// then restore the saved value. For nested unions (union-in-union), the
     /// `UnionValueFunc` handler in expr.rs saves/restores this to the inner union
@@ -686,7 +684,6 @@ impl ProgramBuilder {
             hash_build_signatures: HashMap::default(),
             hash_tables_to_keep_open: BitSet::default(),
             subquery_result_regs: HashMap::default(),
-            self_table_context: None,
             next_cte_id: 0,
             materialized_ctes: HashMap::default(),
             ctes_being_defined: Vec::new(),
@@ -1979,33 +1976,5 @@ impl ProgramBuilder {
         let prepare_context = PrepareContext::from_connection(&connection);
         let prepared = self.build_prepared_program(prepare_context, change_cnt_on, sql)?;
         Ok(Program::from_prepared(Arc::new(prepared), connection))
-    }
-
-    pub fn with_existing_self_table_context<T>(
-        &mut self,
-        f: impl FnOnce(&mut ProgramBuilder, Option<&SelfTableContext>) -> crate::Result<T>,
-    ) -> crate::Result<T> {
-        let result = f(self, self.self_table_context.clone().as_ref())?;
-        Ok(result)
-    }
-
-    pub fn with_self_table_context<T>(
-        &mut self,
-        ctx: Option<&SelfTableContext>,
-        f: impl FnOnce(&mut ProgramBuilder, Option<&SelfTableContext>) -> crate::Result<T>,
-    ) -> crate::Result<T> {
-        if ctx.is_none() {
-            return f(self, ctx);
-        }
-
-        let prev = self.self_table_context.take();
-        self.self_table_context = ctx.cloned();
-        let result = f(self, ctx);
-        self.self_table_context = prev;
-        result
-    }
-
-    pub fn current_self_table_context(&self) -> Option<&SelfTableContext> {
-        self.self_table_context.as_ref()
     }
 }

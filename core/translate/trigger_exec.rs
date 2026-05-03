@@ -1048,13 +1048,13 @@ fn populate_trigger_row_register_affinities(
     };
 
     for (idx, column) in table.columns().iter().enumerate() {
-        let affinity = if column.is_rowid_alias() {
-            Affinity::Integer
-        } else {
-            column.affinity_with_strict(table.is_strict)
-        };
+        if !column.is_rowid_alias() {
+            continue;
+        }
         if let Some(&register) = registers.get(idx) {
-            resolver.register_affinities.insert(register, affinity);
+            resolver
+                .register_affinities
+                .insert(register, Affinity::Integer);
         }
     }
 
