@@ -1,0 +1,58 @@
+@database :memory:
+
+setup schema {
+    CREATE TABLE t1 (id TEXT PRIMARY KEY, val TEXT);
+    CREATE TABLE t2 (id TEXT PRIMARY KEY, val TEXT);
+    INSERT INTO t1 VALUES ('1','apple'),('2','banana');
+    INSERT INTO t2 VALUES ('3','xenon'),('4','yam');
+}
+
+@setup schema
+test union-all-no-in-subquery {
+    SELECT 'A' AS dim, val FROM t1
+    UNION ALL
+    SELECT 'B' AS dim, val FROM t2;
+}
+expect {
+    A|apple
+    A|banana
+    B|xenon
+    B|yam
+}
+
+@setup schema
+test union-all-where-literal {
+    SELECT 'A' AS dim, val FROM t1 WHERE val = 'apple'
+    UNION ALL
+    SELECT 'B' AS dim, val FROM t2 WHERE val = 'xenon';
+}
+expect {
+    A|apple
+    B|xenon
+}
+
+@setup schema
+test union-all-with-in-subquery-two-cols {
+    SELECT 'A' AS dim, val FROM t1
+    WHERE id IN (SELECT id FROM t1 WHERE val = 'apple')
+    UNION ALL
+    SELECT 'B' AS dim, val FROM t2
+    WHERE id IN (SELECT id FROM t2 WHERE val = 'xenon');
+}
+expect {
+    A|apple
+    B|xenon
+}
+
+@setup schema
+test union-all-with-in-subquery-three-cols {
+    SELECT 'A' AS dim, val, 1 AS n FROM t1
+    WHERE id IN (SELECT id FROM t1 WHERE val = 'apple')
+    UNION ALL
+    SELECT 'B' AS dim, val, 2 AS n FROM t2
+    WHERE id IN (SELECT id FROM t2 WHERE val = 'xenon');
+}
+expect {
+    A|apple|1
+    B|xenon|2
+}
