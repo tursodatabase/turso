@@ -2542,6 +2542,11 @@ fn test_vacuum_into_preserves_mvcc_after_reopen(tmp_db: TempDatabase) -> anyhow:
         vec![("mvcc".to_string(),)],
         "Source should have MVCC enabled"
     );
+    let db_log = tmp_db.path.with_extension("db-log");
+    assert!(
+        db_log.exists(),
+        "MVCC log file should exist at {db_log:?} before VACUUM INTO"
+    );
 
     conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, data TEXT)")?;
     conn.execute("INSERT INTO t VALUES (1, 'hello')")?;
@@ -2552,6 +2557,12 @@ fn test_vacuum_into_preserves_mvcc_after_reopen(tmp_db: TempDatabase) -> anyhow:
     };
     let source_hash =
         compute_dbhash_with_options_and_database_opts(&tmp_db, &hash_opts, tmp_db.db_opts);
+
+    let db_log_size = std::fs::metadata(&db_log).unwrap().len();
+    assert!(
+        db_log_size > 0,
+        "MVCC log file should be non-empty at {db_log:?} before VACUUM INTO (size={db_log_size})"
+    );
 
     let dest_dir = TempDir::new()?;
     let dest_path = dest_dir.path().join("vacuumed_mvcc.db");
