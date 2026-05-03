@@ -2847,7 +2847,7 @@ impl BTreeCursor {
                                 mark_unlikely();
                                 tracing::error!("error reading page {}: {}", pgno, e);
                                 group.cancel();
-                                self.pager.io.drain()?;
+                                self.pager.io.drain_completions(group.completions())?;
                                 return Err(e);
                             }
                             Ok((page, c)) => {

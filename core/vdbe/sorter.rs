@@ -311,7 +311,7 @@ impl Sorter {
                         Err(e) => {
                             tracing::error!("Failed to read chunk: {e}");
                             group.cancel();
-                            self.io.drain()?;
+                            self.io.drain_completions(group.completions())?;
                             return Err(e);
                         }
                         Ok(Some(c)) => group.add(&c),

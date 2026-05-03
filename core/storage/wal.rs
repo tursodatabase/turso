@@ -4265,7 +4265,7 @@ impl Wal for WalFile {
         let file = self.coordination.wal_file()?;
         let c = file.pwritev(start_off, iovecs, c)?;
 
-        self.io.drain()?;
+        self.io.drain_completions(std::slice::from_ref(&c))?;
 
         for (page, fid, csum) in &page_frame_and_checksum {
             self.complete_append_frame(page.get().id as u64, *fid, *csum);
@@ -4553,7 +4553,7 @@ impl WalFile {
                             .map(|r| r.completion.clone())
                             .collect();
                         pager.io.cancel(&to_cancel)?;
-                        pager.io.drain()?;
+                        pager.io.drain_completions(&to_cancel)?;
                         return Err(LimboError::CompletionError(e));
                     }
                     let epoch = self.coordination.checkpoint_epoch();
