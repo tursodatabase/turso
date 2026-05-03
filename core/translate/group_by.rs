@@ -1016,6 +1016,12 @@ pub fn group_by_emit_row_phase<'a>(
 
     t_ctx.resolver.enable_expr_to_reg_cache();
 
+    // Disable constant optimization within the GROUP BY output subroutine.
+    // Constants hoisted to the init section would cause the IfPos jump
+    // (targeting label_agg_final) to land in the init block, which ends
+    // with Goto back to the start of the program, creating an infinite loop.
+    let span_idx = program.constant_spans_next_idx();
+
     if let Some(having) = &group_by.having {
         emit_non_from_clause_subqueries_for_phase(
             program,
@@ -1046,11 +1052,6 @@ pub fn group_by_emit_row_phase<'a>(
         }
     }
 
-    // Disable constant optimization within the GROUP BY output subroutine.
-    // Constants hoisted to the init section would cause the IfPos jump
-    // (targeting label_agg_final) to land in the init block, which ends
-    // with Goto back to the start of the program, creating an infinite loop.
-    let span_idx = program.constant_spans_next_idx();
     emit_non_from_clause_subqueries_for_phase(
         program,
         &t_ctx.resolver,
