@@ -505,6 +505,65 @@ test.serial("Statement.columns()", async (t) => {
   t.is(columns2[2].type, "TEXT");
 });
 
+test.serial("Statement.columns() [returns an array synchronously]", (t) => {
+  const db = t.context.db;
+
+  const stmt = db.prepare("SELECT id FROM users");
+  const cols = stmt.columns();
+  t.true(Array.isArray(cols), "columns() must return an array, not a Promise");
+});
+
+test.serial("Statement.columns() [name/column/table/database/type for table columns]", (t) => {
+  const db = t.context.db;
+
+  const stmt = db.prepare("SELECT id, name, email FROM users WHERE id = ?");
+  const cols = stmt.columns();
+  t.is(cols.length, 3);
+
+  t.is(cols[0].name, "id");
+  t.is(cols[0].column, "id");
+  t.is(cols[0].table, "users");
+  t.is(cols[0].database, "main");
+  t.is(cols[0].type, "INTEGER");
+
+  t.is(cols[1].name, "name");
+  t.is(cols[1].column, "name");
+  t.is(cols[1].table, "users");
+  t.is(cols[1].database, "main");
+  t.is(cols[1].type, "TEXT");
+
+  t.is(cols[2].name, "email");
+  t.is(cols[2].column, "email");
+  t.is(cols[2].table, "users");
+  t.is(cols[2].database, "main");
+  t.is(cols[2].type, "TEXT");
+});
+
+test.serial("Statement.columns() [aliased column keeps original column/table]", (t) => {
+  const db = t.context.db;
+
+  const stmt = db.prepare("SELECT id AS user_id FROM users");
+  const cols = stmt.columns();
+  t.is(cols.length, 1);
+  t.is(cols[0].name, "user_id");
+  t.is(cols[0].column, "id");
+  t.is(cols[0].table, "users");
+  t.is(cols[0].database, "main");
+  t.is(cols[0].type, "INTEGER");
+});
+
+test.serial("Statement.columns() [expression has null column/table/database]", (t) => {
+  const db = t.context.db;
+
+  const stmt = db.prepare("SELECT 1 AS x");
+  const cols = stmt.columns();
+  t.is(cols.length, 1);
+  t.is(cols[0].name, "x");
+  t.is(cols[0].column, null);
+  t.is(cols[0].table, null);
+  t.is(cols[0].database, null);
+});
+
 // ==========================================================================
 // Statement.reader
 // ==========================================================================
