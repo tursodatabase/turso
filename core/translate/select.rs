@@ -157,7 +157,7 @@ pub fn prepare_select_plan(
 ) -> Result<Plan> {
     let compounds = select.body.compounds;
     match compounds.is_empty() {
-        true => Ok(Plan::Select(Box::new(prepare_one_select_plan(
+        true => Ok(Plan::Select(prepare_one_select_plan(
             select.body.select,
             resolver,
             program,
@@ -167,7 +167,7 @@ pub fn prepare_select_plan(
             outer_query_refs,
             query_destination,
             connection,
-        )?))),
+        )?)),
         false => {
             // For compound SELECTs, the WITH clause applies to all parts.
             // We clone the WITH clause for each SELECT in the compound so that
@@ -225,8 +225,8 @@ pub fn prepare_select_plan(
             // from any constituent SELECT's result columns.
             let all_plans: Vec<&SelectPlan> = left
                 .iter()
-                .map(|(plan, _)| plan)
-                .chain(std::iter::once(&last))
+                .map(|(plan, _)| plan.as_ref())
+                .chain(std::iter::once(last.as_ref()))
                 .collect();
             let order_by = if select.order_by.is_empty() {
                 None
@@ -241,7 +241,7 @@ pub fn prepare_select_plan(
 
             Ok(Plan::CompoundSelect {
                 left,
-                right_most: Box::new(last),
+                right_most: last,
                 limit,
                 offset,
                 order_by,
@@ -262,7 +262,7 @@ fn prepare_one_select_plan(
     outer_query_refs: &[OuterQueryReference],
     query_destination: QueryDestination,
     connection: &Arc<crate::Connection>,
-) -> Result<SelectPlan> {
+) -> Result<Box<SelectPlan>> {
     match select {
         ast::OneSelect::Select {
             columns,
@@ -337,7 +337,7 @@ fn prepare_one_select_plan(
                     })
                     .sum(),
             );
-            let mut plan = SelectPlan {
+            let mut plan = Box::new(SelectPlan {
                 join_order: table_references
                     .joined_tables()
                     .iter()
@@ -366,7 +366,7 @@ fn prepare_one_select_plan(
                 estimated_output_rows: None,
                 simple_aggregate: None,
                 phantom_params: vec![],
-            };
+            });
 
             let mut windows = Vec::with_capacity(window_clause.len());
             {
@@ -795,7 +795,7 @@ fn prepare_one_select_plan(
                 connection,
             )?;
 
-            let plan = SelectPlan {
+            let plan = Box::new(SelectPlan {
                 join_order: vec![],
                 table_references,
                 result_columns,
@@ -818,7 +818,7 @@ fn prepare_one_select_plan(
                 estimated_output_rows: None,
                 simple_aggregate: None,
                 phantom_params: vec![],
-            };
+            });
 
             validate_expr_correct_column_counts(&plan)?;
 
