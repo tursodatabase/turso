@@ -35,8 +35,10 @@ pub struct Profile {
     pub io: IOProfile,
     #[garde(dive)]
     pub query: QueryProfile,
-    #[garde(range(min = 200, max = 2000))]
+    #[garde(range(min = 1, max = 2000))]
     pub cache_size_pages: Option<usize>,
+    #[garde(skip)]
+    pub page_size: Option<usize>,
 }
 
 impl Default for Profile {
@@ -47,6 +49,7 @@ impl Default for Profile {
             io: Default::default(),
             query: Default::default(),
             cache_size_pages: Some(2000),
+            page_size: None,
         }
     }
 }
@@ -141,6 +144,7 @@ impl Profile {
                 ..Default::default()
             },
             cache_size_pages: Some(200),
+            page_size: None,
             query: QueryProfile {
                 gen_opts: Opts {
                     table: TableOpts {
@@ -174,6 +178,67 @@ impl Profile {
                 delete_weight: 5,
                 create_index_weight: 15,
                 create_table_weight: 8,
+                drop_table_weight: 0,
+                alter_table_weight: 0,
+                drop_index: 0,
+                pragma_weight: 0,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        profile.validate().unwrap();
+        profile
+    }
+
+    /// Profile that biases savepoint rollback toward overflow pages and very
+    /// small cache sizes. This targets page restoration bugs involving large
+    /// table/index payloads.
+    pub fn savepoint_overflow_stress() -> Self {
+        let profile = Profile {
+            io: IOProfile {
+                fault: FaultProfile {
+                    enable: false,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            cache_size_pages: Some(8),
+            page_size: Some(512),
+            query: QueryProfile {
+                gen_opts: Opts {
+                    table: TableOpts {
+                        rowid_alias_prob: 0.75,
+                        column_range: 3..7,
+                        large_table: LargeTableOpts {
+                            large_table_prob: 0.0,
+                            ..Default::default()
+                        },
+                    },
+                    query: QueryOpts {
+                        select: SelectOpts {
+                            free_expr_size: 1,
+                            ..Default::default()
+                        },
+                        insert: InsertOpts {
+                            min_rows: NonZeroU32::new(12).unwrap(),
+                            max_rows: NonZeroU32::new(16).unwrap(),
+                            padding_size: Some(10_000),
+                            ..Default::default()
+                        },
+                        update: UpdateOpts {
+                            padding_size: Some(14_000),
+                            force_late_failure: true,
+                        },
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+                select_weight: 0,
+                insert_weight: 40,
+                update_weight: 35,
+                delete_weight: 10,
+                create_index_weight: 15,
+                create_table_weight: 6,
                 drop_table_weight: 0,
                 alter_table_weight: 0,
                 drop_index: 0,
@@ -221,6 +286,7 @@ impl Profile {
             mvcc: true,
             max_connections: 2,
             cache_size_pages: Some(2000),
+            page_size: None,
         };
         profile.validate().unwrap();
         profile
@@ -235,6 +301,7 @@ impl Profile {
             ProfileType::SimpleMvcc => Self::simple_mvcc(),
             ProfileType::WriteStress => Self::write_stress(),
             ProfileType::SavepointStress => Self::savepoint_stress(),
+            ProfileType::SavepointOverflowStress => Self::savepoint_overflow_stress(),
             ProfileType::Custom(path) => {
                 Self::parse(path).with_context(|| "failed to parse JSON profile")?
             }
@@ -277,6 +344,7 @@ pub enum ProfileType {
     SimpleMvcc,
     WriteStress,
     SavepointStress,
+    SavepointOverflowStress,
     #[strum(disabled)]
     Custom(PathBuf),
 }
