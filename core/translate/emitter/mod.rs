@@ -1741,7 +1741,7 @@ fn generated_column(
 /// Emit code to load the value of an IndexColumn from the NEW image of the row being updated.
 /// Handling expression indexes and regular columns
 #[allow(clippy::too_many_arguments)]
-fn emit_index_column_value_new_image(
+pub(crate) fn emit_index_column_value_new_image(
     program: &mut ProgramBuilder,
     resolver: &Resolver,
     columns: &[Column],

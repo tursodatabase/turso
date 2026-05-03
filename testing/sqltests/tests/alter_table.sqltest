@@ -2522,3 +2522,33 @@ expect {
     table|purchases|purchases
     trigger|tr|purchases
 }
+
+@skip-if sqlite "ALTER COLUMN is a Turso extension"
+test alter-table-alter-column-rebuilds-unique-index-after-affinity-change {
+    CREATE TABLE t(id NUMERIC);
+    CREATE UNIQUE INDEX ux ON t(id);
+    INSERT INTO t VALUES('001');
+
+    ALTER TABLE t ALTER COLUMN id TO id2 TEXT;
+    ALTER TABLE t RENAME COLUMN id2 TO id;
+    INSERT OR IGNORE INTO t VALUES('1');
+
+    SELECT id, typeof(id), count(*) FROM t GROUP BY id, typeof(id) ORDER BY id;
+    PRAGMA integrity_check;
+}
+expect {
+    1|text|1
+    ok
+}
+
+@skip-if sqlite "ALTER COLUMN is a Turso extension"
+test alter-table-alter-column-rejects-unique-index-collision-after-affinity-change {
+    CREATE TABLE t(id TEXT);
+    CREATE UNIQUE INDEX ux ON t(id);
+    INSERT INTO t VALUES('001'),('1');
+
+    ALTER TABLE t ALTER COLUMN id TO id2 NUMERIC;
+}
+expect error {
+    UNIQUE constraint failed: t.id
+}
