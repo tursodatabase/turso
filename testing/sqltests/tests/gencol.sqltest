@@ -4660,3 +4660,16 @@ test update-virtual-column-index-via-single-column-unique-index-scan {
     UPDATE t SET b = 42 WHERE c = 'x';
 } expect {
 }
+
+@cross-check-integrity
+test update-covering-index-chained-virtual-gencol {
+    CREATE TABLE t (a, c, e AS (a), d AS (e));
+    INSERT INTO t (a, c) VALUES (1, 'aaa');
+    CREATE INDEX idx_t ON t (d, c);
+    UPDATE t SET c = 'bbb';
+    SELECT d, c FROM t INDEXED BY idx_t WHERE d = 1;
+    PRAGMA integrity_check;
+} expect {
+    1|bbb
+    ok
+}
