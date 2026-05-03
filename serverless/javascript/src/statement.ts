@@ -7,10 +7,11 @@ import {
 import { Session, type SessionConfig } from './session.js';
 import { type AsyncLock } from './async-lock.js';
 import { DatabaseError } from './error.js';
+import { normalizeArgs } from './args.js';
 
 /**
  * A prepared SQL statement that can be executed in multiple ways.
- * 
+ *
  * Statements may either own a dedicated session or share a connection session to preserve transaction boundaries.
  * Provides three execution modes:
  * - `get(args?)`: Returns the first row or null
@@ -160,7 +161,7 @@ export class Statement {
    */
   async run(args?: any, queryOptions?: QueryOptions): Promise<any> {
     return await this.withLock(async () => {
-      const normalizedArgs = this.normalizeArgs(args);
+      const normalizedArgs = normalizeArgs(args);
       const result = await this.session.execute(this.sql, normalizedArgs, this.safeIntegerMode, queryOptions);
       return { changes: result.rowsAffected, lastInsertRowid: result.lastInsertRowid };
     });
@@ -183,7 +184,7 @@ export class Statement {
    */
   async get(args?: any, queryOptions?: QueryOptions): Promise<any> {
     return await this.withLock(async () => {
-      const normalizedArgs = this.normalizeArgs(args);
+      const normalizedArgs = normalizeArgs(args);
       const result = await this.session.execute(this.sql, normalizedArgs, this.safeIntegerMode, queryOptions);
       const row = result.rows[0];
       if (!row) {
@@ -225,7 +226,7 @@ export class Statement {
    */
   async all(args?: any, queryOptions?: QueryOptions): Promise<any[]> {
     return await this.withLock(async () => {
-      const normalizedArgs = this.normalizeArgs(args);
+      const normalizedArgs = normalizeArgs(args);
       const result = await this.session.execute(this.sql, normalizedArgs, this.safeIntegerMode, queryOptions);
 
       if (this.presentationMode === 'pluck') {
@@ -277,7 +278,7 @@ export class Statement {
       return;
     }
 
-    const normalizedArgs = this.normalizeArgs(args);
+    const normalizedArgs = normalizeArgs(args);
     const { entries } = await this.session.executeRaw(this.sql, normalizedArgs, queryOptions);
 
     let columns: string[] = [];
@@ -315,27 +316,4 @@ export class Statement {
     }
   }
 
-  /**
-   * Normalize arguments to handle both single values and arrays.
-   * Matches the behavior of the native bindings.
-   */
-  private normalizeArgs(args: any): any[] | Record<string, any> {
-    // No arguments provided
-    if (args === undefined) {
-      return [];
-    }
-    
-    // If it's an array, return as-is
-    if (Array.isArray(args)) {
-      return args;
-    }
-    
-    // Check if it's a plain object (for named parameters)
-    if (args !== null && typeof args === 'object' && args.constructor === Object) {
-      return args;
-    }
-    
-    // Single value - wrap in array
-    return [args];
-  }
 }
