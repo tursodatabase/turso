@@ -2008,4 +2008,11 @@ impl ProgramBuilder {
     pub fn current_self_table_context(&self) -> Option<&SelfTableContext> {
         self.self_table_context.as_ref()
     }
+
+    pub(crate) fn replace_self_table_context(
+        &mut self,
+        ctx: Option<SelfTableContext>,
+    ) -> Option<SelfTableContext> {
+        std::mem::replace(&mut self.self_table_context, ctx)
+    }
 }

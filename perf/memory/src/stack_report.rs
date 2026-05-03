@@ -516,8 +516,9 @@ fn build_statement_report(
     let mut spans = build_span_reports(baseline_remaining_stack, min_remaining_stack, &samples);
     let span_aggregates = aggregate_span_reports(&spans);
     spans.sort_by(|a, b| {
-        b.stack_used
-            .cmp(&a.stack_used)
+        b.cumulative_stack_used
+            .cmp(&a.cumulative_stack_used)
+            .then_with(|| b.stack_used.cmp(&a.stack_used))
             .then_with(|| a.trace_sequence.cmp(&b.trace_sequence))
     });
 
@@ -1205,6 +1206,51 @@ mod tests {
         assert_eq!(aggregate.total_inclusive_stack_used, 2_500);
         assert_eq!(aggregate.max_inclusive_stack_used, 1_500);
         assert_eq!(aggregate.peak_path_hits, 1);
+    }
+
+    #[test]
+    fn span_samples_sort_by_cumulative_stack_used() {
+        let report = build_statement_report(
+            1,
+            "SELECT 1",
+            10_000,
+            vec![
+                StackSample {
+                    label: "wide".to_string(),
+                    detail: None,
+                    phase: StackPhase::Sample,
+                    remaining_stack: 9_000,
+                },
+                StackSample {
+                    label: "wide".to_string(),
+                    detail: None,
+                    phase: StackPhase::Sample,
+                    remaining_stack: 9_000,
+                },
+                StackSample {
+                    label: "wide".to_string(),
+                    detail: None,
+                    phase: StackPhase::Sample,
+                    remaining_stack: 9_000,
+                },
+                StackSample {
+                    label: "deep".to_string(),
+                    detail: None,
+                    phase: StackPhase::Sample,
+                    remaining_stack: 8_000,
+                },
+            ],
+        );
+
+        assert_eq!(report.spans[0].label, "deep");
+        assert_eq!(report.spans[0].cumulative_stack_used, 2_000);
+        assert_eq!(report.spans[1].label, "wide");
+        assert_eq!(report.spans[1].cumulative_stack_used, 1_000);
+
+        assert_eq!(report.span_aggregates[0].label, "wide");
+        assert_eq!(report.span_aggregates[0].total_inclusive_stack_used, 3_000);
+        assert_eq!(report.span_aggregates[1].label, "deep");
+        assert_eq!(report.span_aggregates[1].max_cumulative_stack_used, 2_000);
     }
 
     #[test]
