@@ -1431,6 +1431,7 @@ pub enum SchemaEntryType {
     Index,
     View,
     Trigger,
+    Server,
 }
 
 impl SchemaEntryType {
@@ -1440,6 +1441,7 @@ impl SchemaEntryType {
             SchemaEntryType::Index => "index",
             SchemaEntryType::View => "view",
             SchemaEntryType::Trigger => "trigger",
+            SchemaEntryType::Server => "server",
         }
     }
 }
@@ -1739,6 +1741,273 @@ pub fn translate_create_virtual_table(
     program.emit_insn(Insn::ParseSchema {
         db: sqlite_schema_cursor_id,
         where_clause: Some(parse_schema_where_clause),
+    });
+
+    Ok(())
+}
+
+pub fn translate_create_server(
+    server: ast::CreateServer,
+    resolver: &Resolver,
+    program: &mut ProgramBuilder,
+    connection: &Arc<Connection>,
+) -> Result<()> {
+    let server_name = server.server_name.as_str().to_string();
+
+    // Check the driver option exists
+    let driver = server
+        .options
+        .iter()
+        .find(|o| o.key.as_str().eq_ignore_ascii_case("driver"))
+        .map(|o| o.value.clone())
+        .ok_or_else(|| {
+            crate::LimboError::ParseError("CREATE SERVER requires a 'driver' option".to_string())
+        })?;
+
+    // Validate the driver is registered
+    if !connection.syms.read().foreign_drivers.contains_key(&driver) {
+        bail_parse_error!("no such foreign driver: {}", driver);
+    }
+
+    // Check if server already exists
+    if resolver.schema().get_foreign_server(&server_name).is_some() {
+        if server.if_not_exists {
+            return Ok(());
+        }
+        bail_parse_error!("server {} already exists", server_name);
+    }
+
+    let opts = ProgramBuilderOpts {
+        num_cursors: 2,
+        approx_num_insns: 20,
+        approx_num_labels: 2,
+    };
+    program.extend(&opts);
+
+    let table = resolver.schema().get_btree_table(SQLITE_TABLEID).unwrap();
+    let sqlite_schema_cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(table));
+    program.emit_insn(Insn::OpenWrite {
+        cursor_id: sqlite_schema_cursor_id,
+        root_page: 1i64.into(),
+        db: crate::MAIN_DB_ID,
+    });
+
+    let cdc_table = prepare_cdc_if_necessary(program, resolver.schema(), SQLITE_TABLEID)?;
+
+    // Reconstruct the SQL from the AST for storage
+    let sql = ast::Stmt::CreateServer(server).to_string();
+
+    emit_schema_entry(
+        program,
+        resolver,
+        sqlite_schema_cursor_id,
+        cdc_table.map(|x| x.0),
+        SchemaEntryType::Server,
+        &server_name,
+        &server_name, // tbl_name = server_name for servers
+        0,
+        Some(sql),
+    )?;
+
+    program.emit_insn(Insn::SetCookie {
+        db: crate::MAIN_DB_ID,
+        cookie: Cookie::SchemaVersion,
+        value: resolver.schema().schema_version as i32 + 1,
+        p5: 0,
+    });
+    let escaped_name = escape_sql_string_literal(&server_name);
+    program.emit_insn(Insn::ParseSchema {
+        db: sqlite_schema_cursor_id,
+        where_clause: Some(format!("name = '{escaped_name}' AND type = 'server'")),
+    });
+
+    Ok(())
+}
+
+pub fn translate_create_foreign_table(
+    ft: ast::CreateForeignTable,
+    resolver: &Resolver,
+    program: &mut ProgramBuilder,
+    connection: &Arc<Connection>,
+) -> Result<()> {
+    let table_name = ft.tbl_name.name.as_str().to_string();
+    let server_name = ft.server_name.as_str().to_string();
+
+    // Validate server exists
+    if resolver.schema().get_foreign_server(&server_name).is_none() {
+        bail_parse_error!("no such server: {}", server_name);
+    }
+
+    // Validate driver exists
+    let server = resolver.schema().get_foreign_server(&server_name).unwrap();
+    if !connection
+        .syms
+        .read()
+        .foreign_drivers
+        .contains_key(&server.driver)
+    {
+        bail_parse_error!("no such foreign driver: {}", server.driver);
+    }
+
+    // Check table name conflicts
+    if resolver.schema().get_table(&table_name).is_some() {
+        if ft.if_not_exists {
+            return Ok(());
+        }
+        bail_parse_error!("table {} already exists", table_name);
+    }
+
+    let opts = ProgramBuilderOpts {
+        num_cursors: 2,
+        approx_num_insns: 30,
+        approx_num_labels: 2,
+    };
+    program.extend(&opts);
+
+    // Reconstruct SQL for storage
+    let sql = ast::Stmt::CreateForeignTable(ft).to_string();
+
+    // No ForeignCreate instruction needed — ParseSchema will reconstruct
+    // the foreign table from the stored SQL via populate_foreign_table().
+
+    // Write schema entry
+    let table = resolver.schema().get_btree_table(SQLITE_TABLEID).unwrap();
+    let sqlite_schema_cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(table));
+    program.emit_insn(Insn::OpenWrite {
+        cursor_id: sqlite_schema_cursor_id,
+        root_page: 1i64.into(),
+        db: crate::MAIN_DB_ID,
+    });
+
+    let cdc_table = prepare_cdc_if_necessary(program, resolver.schema(), SQLITE_TABLEID)?;
+    emit_schema_entry(
+        program,
+        resolver,
+        sqlite_schema_cursor_id,
+        cdc_table.map(|x| x.0),
+        SchemaEntryType::Table,
+        &table_name,
+        &table_name,
+        0, // foreign tables have root_page=0 like virtual tables
+        Some(sql),
+    )?;
+
+    program.emit_insn(Insn::SetCookie {
+        db: crate::MAIN_DB_ID,
+        cookie: Cookie::SchemaVersion,
+        value: resolver.schema().schema_version as i32 + 1,
+        p5: 0,
+    });
+    let escaped_table_name = escape_sql_string_literal(&table_name);
+    program.emit_insn(Insn::ParseSchema {
+        db: sqlite_schema_cursor_id,
+        where_clause: Some(format!(
+            "tbl_name = '{escaped_table_name}' AND type != 'trigger'"
+        )),
+    });
+
+    Ok(())
+}
+
+pub fn translate_drop_server(
+    server_name: &turso_parser::ast::Name,
+    resolver: &Resolver,
+    if_exists: bool,
+    program: &mut ProgramBuilder,
+) -> Result<()> {
+    let name = server_name.as_str().to_string();
+
+    if resolver.schema().get_foreign_server(&name).is_none() {
+        if if_exists {
+            return Ok(());
+        }
+        bail_parse_error!("no such server: {}", name);
+    }
+
+    let dependents = resolver.schema().foreign_tables_using_server(&name);
+    if !dependents.is_empty() {
+        bail_parse_error!(
+            "cannot drop server {}: foreign table {} depends on it",
+            name,
+            dependents[0]
+        );
+    }
+
+    let opts = ProgramBuilderOpts {
+        num_cursors: 2,
+        approx_num_insns: 20,
+        approx_num_labels: 4,
+    };
+    program.extend(&opts);
+
+    let table = resolver.schema().get_btree_table(SQLITE_TABLEID).unwrap();
+    let sqlite_schema_cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(table));
+    program.emit_insn(Insn::OpenWrite {
+        cursor_id: sqlite_schema_cursor_id,
+        root_page: 1i64.into(),
+        db: crate::MAIN_DB_ID,
+    });
+
+    // Loop through sqlite_schema and delete rows where type='server' AND name=server_name
+    let name_reg = program.emit_string8_new_reg(name);
+    program.mark_last_insn_constant();
+    let server_type_reg = program.emit_string8_new_reg("server".to_string());
+    program.mark_last_insn_constant();
+    let col_type_reg = program.alloc_register();
+    let col_name_reg = program.alloc_register();
+    let rowid_reg = program.alloc_register();
+
+    let end_label = program.allocate_label();
+    let loop_label = program.allocate_label();
+    let next_label = program.allocate_label();
+
+    program.emit_insn(Insn::Rewind {
+        cursor_id: sqlite_schema_cursor_id,
+        pc_if_empty: end_label,
+    });
+    program.preassign_label_to_next_insn(loop_label);
+
+    // Check type = 'server'
+    program.emit_column_or_rowid(sqlite_schema_cursor_id, 0, col_type_reg);
+    program.emit_insn(Insn::Ne {
+        lhs: col_type_reg,
+        rhs: server_type_reg,
+        target_pc: next_label,
+        flags: CmpInsFlags::default(),
+        collation: None,
+    });
+    // Check name = server_name
+    program.emit_column_or_rowid(sqlite_schema_cursor_id, 1, col_name_reg);
+    program.emit_insn(Insn::Ne {
+        lhs: col_name_reg,
+        rhs: name_reg,
+        target_pc: next_label,
+        flags: CmpInsFlags::default(),
+        collation: None,
+    });
+    // Delete the row
+    program.emit_insn(Insn::RowId {
+        cursor_id: sqlite_schema_cursor_id,
+        dest: rowid_reg,
+    });
+    program.emit_insn(Insn::Delete {
+        cursor_id: sqlite_schema_cursor_id,
+        table_name: String::new(),
+        is_part_of_update: false,
+    });
+
+    program.preassign_label_to_next_insn(next_label);
+    program.emit_insn(Insn::Next {
+        cursor_id: sqlite_schema_cursor_id,
+        pc_if_next: loop_label,
+    });
+    program.preassign_label_to_next_insn(end_label);
+
+    program.emit_insn(Insn::SetCookie {
+        db: crate::MAIN_DB_ID,
+        cookie: Cookie::SchemaVersion,
+        value: resolver.schema().schema_version as i32 + 1,
+        p5: 0,
     });
 
     Ok(())
