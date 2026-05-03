@@ -4584,6 +4584,16 @@ test delete-using-indexed-virtual-column {
 } expect {
 }
 
+@cross-check-integrity
+test delete-indexed-virtual-generated-column-old-image {
+    CREATE TABLE t (c0 TEXT, c1 INTEGER AS (c2 + 1), c2 INTEGER);
+    CREATE INDEX i ON t (c1, c0);
+    DELETE FROM t WHERE c0 < 'X';
+    SELECT count(*) FROM t;
+} expect {
+    0
+}
+
 test update-with-virtual-column-before-pk {
     PRAGMA foreign_keys = ON;
     CREATE TABLE t(a AS (1), b, c, PRIMARY KEY (b));
