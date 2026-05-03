@@ -1,0 +1,12 @@
+[package]
+name = "turso_remote_protocol"
+version.workspace = true
+edition.workspace = true
+publish = false
+
+[dependencies]
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+bytes = "1"
+base64 = "0.22"
+prost = "0.13"

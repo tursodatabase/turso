@@ -7,10 +7,14 @@ import {
   type CursorResponse,
   type CursorEntry,
   type PipelineRequest,
+  type ExecuteRequest,
+  type BatchRequest,
+  type BatchResult,
   type SequenceRequest,
   type CloseRequest,
   type DescribeRequest,
   type DescribeResult,
+  type ExecuteResult,
   type QueryOptions,
   type NamedArg,
   type Value
@@ -35,7 +39,7 @@ export interface SessionConfig {
 }
 
 function normalizeUrl(url: string): string {
-  return url.replace(/^libsql:\/\//, 'https://');
+  return url.replace(/^(libsql|turso):\/\//, 'https://');
 }
 
 function isValidIdentifier(str: string): boolean {
@@ -44,7 +48,7 @@ function isValidIdentifier(str: string): boolean {
 
 /**
  * A database session that manages the connection state and baton.
- * 
+ *
  * Each session maintains its own connection state and can execute SQL statements
  * independently without interfering with other sessions.
  */
@@ -52,10 +56,20 @@ export class Session {
   private config: SessionConfig;
   private baton: string | null = null;
   private baseUrl: string;
+  private _keepAlive: boolean = false;
 
   constructor(config: SessionConfig) {
     this.config = config;
     this.baseUrl = normalizeUrl(config.url);
+  }
+
+  /**
+   * Set keepAlive mode. When true, the stream baton is preserved across
+   * requests (for transactions). When false, each pipeline includes a
+   * close request and resets the baton.
+   */
+  setKeepAlive(keepAlive: boolean): void {
+    this._keepAlive = keepAlive;
   }
 
   private createAbortSignal(queryOptions?: QueryOptions): AbortSignal | undefined {
@@ -67,41 +81,108 @@ export class Session {
   }
 
   /**
-   * Describe a SQL statement to get its column metadata.
-   * 
-   * @param sql - The SQL statement to describe
-   * @returns Promise resolving to the statement description
+   * Encode arguments (array or named-parameter object) into positional/named
+   * Value arrays for the Hrana protocol.
    */
-  async describe(sql: string, queryOptions?: QueryOptions): Promise<DescribeResult> {
+  private encodeArgs(args: any[] | Record<string, any>): { positionalArgs: Value[]; namedArgs: NamedArg[] } {
+    let positionalArgs: Value[] = [];
+    let namedArgs: NamedArg[] = [];
+
+    if (Array.isArray(args)) {
+      positionalArgs = args.map(encodeValue);
+    } else {
+      const keys = Object.keys(args);
+      const isNumericKeys = keys.length > 0 && keys.every(key => /^\d+$/.test(key));
+
+      if (isNumericKeys) {
+        const sortedKeys = keys.sort((a, b) => parseInt(a) - parseInt(b));
+        const maxIndex = parseInt(sortedKeys[sortedKeys.length - 1]);
+        positionalArgs = new Array(maxIndex);
+        for (const key of sortedKeys) {
+          const index = parseInt(key) - 1;
+          positionalArgs[index] = encodeValue(args[key]);
+        }
+        for (let i = 0; i < positionalArgs.length; i++) {
+          if (positionalArgs[i] === undefined) {
+            positionalArgs[i] = { type: 'null' };
+          }
+        }
+      } else {
+        namedArgs = Object.entries(args).map(([name, value]) => ({
+          name,
+          value: encodeValue(value)
+        }));
+      }
+    }
+
+    return { positionalArgs, namedArgs };
+  }
+
+  /**
+   * Send a pipeline request, updating baton/baseUrl from the response.
+   * When not in keepAlive mode, appends a close request and resets the
+   * baton afterward.
+   */
+  private async sendPipeline(
+    requests: PipelineRequest['requests'],
+    queryOptions?: QueryOptions
+  ): Promise<import('./protocol.js').PipelineResponse> {
+    const pipelineRequests = [...requests];
+
+    if (!this._keepAlive) {
+      pipelineRequests.push({ type: 'close' } as CloseRequest);
+    }
+
     const request: PipelineRequest = {
-      baton: this.baton,
-      requests: [{
-        type: "describe",
-        sql: sql
-      } as DescribeRequest]
+      baton: this._keepAlive ? this.baton : null,
+      requests: pipelineRequests,
     };
 
     let response;
     try {
-      response = await executePipeline(this.baseUrl, this.config.authToken, request, this.config.remoteEncryptionKey, this.createAbortSignal(queryOptions));
+      response = await executePipeline(
+        this.baseUrl,
+        this.config.authToken,
+        request,
+        this.config.remoteEncryptionKey,
+        this.createAbortSignal(queryOptions)
+      );
     } catch (e) {
       this.baton = null;
       throw e;
     }
 
-    this.baton = response.baton;
+    if (this._keepAlive) {
+      this.baton = response.baton;
+    } else {
+      this.baton = null;
+    }
+
     if (response.base_url) {
       this.baseUrl = response.base_url;
     }
 
-    // Check for errors in the response
+    return response;
+  }
+
+  /**
+   * Describe a SQL statement to get its column metadata.
+   *
+   * @param sql - The SQL statement to describe
+   * @returns Promise resolving to the statement description
+   */
+  async describe(sql: string, queryOptions?: QueryOptions): Promise<DescribeResult> {
+    const response = await this.sendPipeline(
+      [{ type: 'describe', sql } as DescribeRequest],
+      queryOptions
+    );
+
     if (response.results && response.results[0]) {
       const result = response.results[0];
-      if (result.type === "error") {
+      if (result.type === 'error') {
         throw new DatabaseError(result.error?.message || 'Describe execution failed', result.error?.code);
       }
-
-      if (result.response?.type === "describe" && result.response.result) {
+      if (result.response?.type === 'describe' && result.response.result) {
         return result.response.result as DescribeResult;
       }
     }
@@ -111,66 +192,55 @@ export class Session {
 
   /**
    * Execute a SQL statement and return all results.
-   * 
+   * Uses pipeline (not cursor) so the stream is properly closed.
+   *
    * @param sql - The SQL statement to execute
    * @param args - Optional array of parameter values or object with named parameters
    * @param safeIntegers - Whether to return integers as BigInt
    * @returns Promise resolving to the complete result set
    */
   async execute(sql: string, args: any[] | Record<string, any> = [], safeIntegers: boolean = false, queryOptions?: QueryOptions): Promise<any> {
-    const { response, entries } = await this.executeRaw(sql, args, queryOptions);
-    const result = await this.processCursorEntries(entries, safeIntegers);
-    return result;
+    const { positionalArgs, namedArgs } = this.encodeArgs(args);
+
+    const executeReq: ExecuteRequest = {
+      type: 'execute',
+      stmt: {
+        sql,
+        args: positionalArgs,
+        named_args: namedArgs,
+        want_rows: true,
+      },
+    };
+
+    const response = await this.sendPipeline([executeReq], queryOptions);
+
+    if (response.results && response.results[0]) {
+      const result = response.results[0];
+      if (result.type === 'error') {
+        throw new DatabaseError(result.error?.message || 'SQL execution failed', result.error?.code);
+      }
+      if (result.response?.type === 'execute' && result.response.result) {
+        const execResult = result.response.result as ExecuteResult;
+        return this.processExecuteResult(execResult, safeIntegers);
+      }
+    }
+
+    throw new DatabaseError('Unexpected execute response');
   }
 
   /**
    * Execute a SQL statement and return the raw response and entries.
-   * 
+   * Uses cursor for streaming support.
+   *
    * @param sql - The SQL statement to execute
    * @param args - Optional array of parameter values or object with named parameters
    * @returns Promise resolving to the raw response and cursor entries
    */
   async executeRaw(sql: string, args: any[] | Record<string, any> = [], queryOptions?: QueryOptions): Promise<{ response: CursorResponse; entries: AsyncGenerator<CursorEntry> }> {
-    let positionalArgs: Value[] = [];
-    let namedArgs: NamedArg[] = [];
-
-    if (Array.isArray(args)) {
-      positionalArgs = args.map(encodeValue);
-    } else {
-      // Check if this is an object with numeric keys (for ?1, ?2 style parameters)
-      const keys = Object.keys(args);
-      const isNumericKeys = keys.length > 0 && keys.every(key => /^\d+$/.test(key));
-      
-      if (isNumericKeys) {
-        // Convert numeric-keyed object to positional args
-        // Sort keys numerically to ensure correct order
-        const sortedKeys = keys.sort((a, b) => parseInt(a) - parseInt(b));
-        const maxIndex = parseInt(sortedKeys[sortedKeys.length - 1]);
-        
-        // Create array with undefined for missing indices
-        positionalArgs = new Array(maxIndex);
-        for (const key of sortedKeys) {
-          const index = parseInt(key) - 1; // Convert to 0-based index
-          positionalArgs[index] = encodeValue(args[key]);
-        }
-        
-        // Fill any undefined values with null
-        for (let i = 0; i < positionalArgs.length; i++) {
-          if (positionalArgs[i] === undefined) {
-            positionalArgs[i] = { type: 'null' };
-          }
-        }
-      } else {
-        // Convert object with named parameters to NamedArg array
-        namedArgs = Object.entries(args).map(([name, value]) => ({
-          name,
-          value: encodeValue(value)
-        }));
-      }
-    }
+    const { positionalArgs, namedArgs } = this.encodeArgs(args);
 
     const request: CursorRequest = {
-      baton: this.baton,
+      baton: this._keepAlive ? this.baton : null,
       batch: {
         steps: [{
           stmt: {
@@ -192,12 +262,59 @@ export class Session {
     }
 
     const { response, entries } = result;
-    this.baton = response.baton;
+
+    if (this._keepAlive) {
+      this.baton = response.baton;
+    } else {
+      // Wrap the generator to null the baton after consumption
+      const self = this;
+      const originalEntries = entries;
+      const wrappedEntries = (async function* () {
+        try {
+          yield* originalEntries;
+        } finally {
+          self.baton = null;
+        }
+      })();
+      if (response.base_url) {
+        this.baseUrl = response.base_url;
+      }
+      return { response, entries: wrappedEntries };
+    }
+
     if (response.base_url) {
       this.baseUrl = response.base_url;
     }
 
     return { response, entries };
+  }
+
+  /**
+   * Convert an ExecuteResult from the pipeline into the same shape
+   * that processCursorEntries returns.
+   */
+  private processExecuteResult(execResult: ExecuteResult, safeIntegers: boolean): any {
+    const columns = execResult.cols.map(col => col.name);
+    const columnTypes = execResult.cols.map(col => col.decltype || '');
+    const rows = execResult.rows.map(row => {
+      const decodedRow = row.map(value => decodeValue(value, safeIntegers));
+      return this.createRowObject(decodedRow, columns);
+    });
+
+    let lastInsertRowid: number | undefined;
+    if (execResult.last_insert_rowid !== undefined && execResult.last_insert_rowid !== null) {
+      lastInsertRowid = typeof execResult.last_insert_rowid === 'number'
+        ? execResult.last_insert_rowid
+        : parseInt(execResult.last_insert_rowid as string, 10);
+    }
+
+    return {
+      columns,
+      columnTypes,
+      rows,
+      rowsAffected: execResult.affected_row_count,
+      lastInsertRowid,
+    };
   }
 
   /**
@@ -255,16 +372,14 @@ export class Session {
 
   /**
    * Create a row object with both array and named property access.
-   * 
+   *
    * @param values - Array of column values
    * @param columns - Array of column names
    * @returns Row object with dual access patterns
    */
   createRowObject(values: any[], columns: string[]): any {
     const row = [...values];
-    
-    // Add column name properties to the array as non-enumerable
-    // Only add valid identifier names to avoid conflicts
+
     columns.forEach((column, index) => {
       if (column && isValidIdentifier(column)) {
         Object.defineProperty(row, column, {
@@ -275,104 +390,92 @@ export class Session {
         });
       }
     });
-    
+
     return row;
   }
 
   /**
    * Execute multiple SQL statements in a batch.
-   * 
+   * Uses pipeline (not cursor) so the stream is properly closed.
+   *
    * @param statements - Array of SQL statements to execute
    * @returns Promise resolving to batch execution results
    */
   async batch(statements: string[], queryOptions?: QueryOptions): Promise<any> {
-    const request: CursorRequest = {
-      baton: this.baton,
+    const batchReq: BatchRequest = {
+      type: 'batch',
       batch: {
         steps: statements.map(sql => ({
           stmt: {
             sql,
             args: [],
             named_args: [],
-            want_rows: false
-          }
-        }))
-      }
+            want_rows: false,
+          },
+        })),
+      },
     };
 
-    let batchResult;
-    try {
-      batchResult = await executeCursor(this.baseUrl, this.config.authToken, request, this.config.remoteEncryptionKey, this.createAbortSignal(queryOptions));
-    } catch (e) {
-      this.baton = null;
-      throw e;
+    const response = await this.sendPipeline([batchReq], queryOptions);
+
+    if (response.results && response.results[0]) {
+      const result = response.results[0];
+      if (result.type === 'error') {
+        throw new DatabaseError(result.error?.message || 'Batch execution failed', result.error?.code);
+      }
+      if (result.response?.type === 'batch' && result.response.result) {
+        const batchResult = result.response.result as BatchResult;
+        return this.processBatchResult(batchResult);
+      }
     }
 
-    const { response, entries } = batchResult;
-    this.baton = response.baton;
-    if (response.base_url) {
-      this.baseUrl = response.base_url;
-    }
+    throw new DatabaseError('Unexpected batch response');
+  }
 
+  /**
+   * Convert a BatchResult from the pipeline into the summary shape.
+   */
+  private processBatchResult(batchResult: BatchResult): any {
     let totalRowsAffected = 0;
     let lastInsertRowid: number | undefined;
 
-    for await (const entry of entries) {
-      switch (entry.type) {
-        case 'step_end':
-          if (entry.affected_row_count !== undefined) {
-            totalRowsAffected += entry.affected_row_count;
-          }
-          if (entry.last_insert_rowid !== undefined && entry.last_insert_rowid !== null) {
-            lastInsertRowid = typeof entry.last_insert_rowid === 'number'
-              ? entry.last_insert_rowid
-              : parseInt(entry.last_insert_rowid, 10);
-          }
-          break;
-        case 'step_error':
-        case 'error':
-          throw new DatabaseError(entry.error?.message || 'Batch execution failed', entry.error?.code);
+    for (let i = 0; i < batchResult.step_results.length; i++) {
+      const stepError = batchResult.step_errors[i];
+      if (stepError) {
+        throw new DatabaseError(stepError.message || 'Batch execution failed', stepError.code);
+      }
+      const stepResult = batchResult.step_results[i];
+      if (stepResult) {
+        totalRowsAffected += stepResult.affected_row_count;
+        if (stepResult.last_insert_rowid !== undefined && stepResult.last_insert_rowid !== null) {
+          lastInsertRowid = typeof stepResult.last_insert_rowid === 'number'
+            ? stepResult.last_insert_rowid
+            : parseInt(stepResult.last_insert_rowid as string, 10);
+        }
       }
     }
 
     return {
       rowsAffected: totalRowsAffected,
-      lastInsertRowid
+      lastInsertRowid,
     };
   }
 
   /**
    * Execute a sequence of SQL statements separated by semicolons.
-   * 
+   *
    * @param sql - SQL string containing multiple statements separated by semicolons
    * @returns Promise resolving when all statements are executed
    */
   async sequence(sql: string, queryOptions?: QueryOptions): Promise<void> {
-    const request: PipelineRequest = {
-      baton: this.baton,
-      requests: [{
-        type: "sequence",
-        sql: sql
-      } as SequenceRequest]
-    };
+    const response = await this.sendPipeline(
+      [{ type: 'sequence', sql } as SequenceRequest],
+      queryOptions
+    );
 
-    let seqResponse;
-    try {
-      seqResponse = await executePipeline(this.baseUrl, this.config.authToken, request, this.config.remoteEncryptionKey, this.createAbortSignal(queryOptions));
-    } catch (e) {
-      this.baton = null;
-      throw e;
-    }
-
-    this.baton = seqResponse.baton;
-    if (seqResponse.base_url) {
-      this.baseUrl = seqResponse.base_url;
-    }
-
-    // Check for errors in the response
-    if (seqResponse.results && seqResponse.results[0]) {
-      const result = seqResponse.results[0];
-      if (result.type === "error") {
+    if (response.results && response.results[0]) {
+      const result = response.results[0];
+      if (result.type === 'error') {
         throw new DatabaseError(result.error?.message || 'Sequence execution failed', result.error?.code);
       }
     }
@@ -381,20 +484,16 @@ export class Session {
   /**
    * Close the session.
    *
-   * This sends a close request to the server to properly clean up the stream
+   * Sends a close request to the server to properly clean up the stream
    * before resetting the local state.
    */
   async close(): Promise<void> {
-    // Only send close request if we have an active baton
     if (this.baton) {
       try {
         const request: PipelineRequest = {
           baton: this.baton,
-          requests: [{
-            type: "close"
-          } as CloseRequest]
+          requests: [{ type: 'close' } as CloseRequest],
         };
-
         await executePipeline(this.baseUrl, this.config.authToken, request, this.config.remoteEncryptionKey);
       } catch {
         // Ignore errors during close — the connection might already be closed

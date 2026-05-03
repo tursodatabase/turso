@@ -1,0 +1,18 @@
+[package]
+name = "hrana-proxy"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+turso_remote_protocol = { workspace = true }
+axum = "0.8"
+hyper = { version = "1", features = ["full"] }
+reqwest = { version = "0.12", features = ["json"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["full"] }
+clap = { version = "4", features = ["derive"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+prost = "0.13"

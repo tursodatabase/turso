@@ -41,7 +41,12 @@ members = [
     "testing/differential-oracle/sql_gen_prop",
     "testing/differential-oracle/sql_gen",
     "testing/differential-oracle/fuzzer",
-    "testing/sqltests"
+    "testing/sqltests",
+    "testing/rust-shared",
+    "testing/hegel/rust",
+    "testing/hegel/proxy",
+    "serverless/rust",
+    "remote/protocol"
 ]
 exclude = ["perf/latency/limbo"]
 
@@ -83,7 +88,8 @@ default-members = [
     "testing/differential-oracle/sql_gen_prop",
     "testing/differential-oracle/sql_gen",
     "testing/differential-oracle/fuzzer",
-    "testing/sqltests"
+    "testing/sqltests",
+    "remote/protocol"
 ]
 
 [workspace.package]
@@ -103,6 +109,8 @@ limbo_completion = { path = "extensions/completion", version = "0.6.0-pre.26" }
 turso_core = { path = "core", version = "0.6.0-pre.26" }
 turso_sync_engine = { path = "sync/engine", version = "0.6.0-pre.26" }
 turso_ext = { path = "extensions/core", version = "0.6.0-pre.26" }
+turso_serverless = { path = "serverless/rust", version = "0.6.0-pre.26" }
+turso_remote_protocol = { path = "remote/protocol", version = "0.6.0-pre.26" }
 turso_macros = { path = "macros", version = "0.6.0-pre.26" }
 turso_parser = { path = "parser", version = "0.6.0-pre.26" }
 sql_generation = { path = "sql_generation" }
