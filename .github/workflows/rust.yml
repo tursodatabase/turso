@@ -328,6 +328,9 @@ jobs:
           - name: in-process-mvcc
             iterations: 100
             args: "--mode fast --reopen-probability 0.01 --enable-mvcc"
+          - name: recovery-heavy-mvcc
+            iterations: 100
+            args: "--mode recovery-heavy --enable-mvcc"
           - name: multiprocess
             iterations: 20
             args: "--mode fast --multiprocess --connections-per-process 4 --processes 4"
