@@ -5792,16 +5792,27 @@ fn update_agg_payload(
                 Value::Numeric(Numeric::Float(f)) => {
                     apply_kbn_step(sum_val, f64::from(f), &mut sum_state);
                 }
-                Value::Text(t) => match try_for_float(t.as_str().as_bytes()).1 {
-                    ParsedNumber::Integer(i) => apply_kbn_step_int(sum_val, i, &mut sum_state),
-                    ParsedNumber::Float(f) => apply_kbn_step(sum_val, f, &mut sum_state),
-                    ParsedNumber::None => apply_kbn_step(sum_val, 0.0, &mut sum_state),
-                },
-                Value::Blob(b) => match try_for_float(&b).1 {
-                    ParsedNumber::Integer(i) => apply_kbn_step_int(sum_val, i, &mut sum_state),
-                    ParsedNumber::Float(f) => apply_kbn_step(sum_val, f, &mut sum_state),
-                    ParsedNumber::None => apply_kbn_step(sum_val, 0.0, &mut sum_state),
-                },
+                Value::Text(t) => {
+                    let (parse_result, parsed_number) = try_for_float(t.as_str().as_bytes());
+                    match parsed_number {
+                        ParsedNumber::Integer(i) => {
+                            if matches!(parse_result, NumericParseResult::ValidPrefixOnly) {
+                                apply_kbn_step(sum_val, i as f64, &mut sum_state);
+                            } else {
+                                apply_kbn_step_int(sum_val, i, &mut sum_state);
+                            }
+                        }
+                        ParsedNumber::Float(f) => apply_kbn_step(sum_val, f, &mut sum_state),
+                        ParsedNumber::None => apply_kbn_step(sum_val, 0.0, &mut sum_state),
+                    }
+                }
+                Value::Blob(b) => {
+                    match try_for_float(&b).1 {
+                        ParsedNumber::Integer(i) => apply_kbn_step(sum_val, i as f64, &mut sum_state),
+                        ParsedNumber::Float(f) => apply_kbn_step(sum_val, f, &mut sum_state),
+                        ParsedNumber::None => apply_kbn_step(sum_val, 0.0, &mut sum_state),
+                    }
+                }
                 _ => unreachable!(),
             }
             *r_err_val = Value::from_f64(sum_state.r_err);
