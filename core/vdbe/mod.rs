@@ -1996,6 +1996,9 @@ impl Program {
                     conn.set_mv_tx(None);
                     conn.set_tx_state(TransactionState::None);
                     pager.end_read_tx();
+                    if !rollback {
+                        conn.publish_schema_if_newer();
+                    }
                     program_state.commit_state = CommitState::Ready;
                     // Fall through to attached phase
                 }
@@ -2139,6 +2142,9 @@ impl Program {
         tracing::debug!("txn_finish_result: {:?}", txn_finish_result);
         match txn_finish_result? {
             IOResult::Done(_) => {
+                if !rollback {
+                    connection.publish_schema_if_newer();
+                }
                 // Main pager commit done, now commit attached database pagers
                 match self.end_attached_write_txns(connection, rollback)? {
                     IOResult::Done(_) => {

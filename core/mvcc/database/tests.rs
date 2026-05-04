@@ -7,7 +7,7 @@ use crate::mvcc::cursor::{CursorYieldPoint, MvccCursorType};
 use crate::mvcc::database::checkpoint_state_machine::CheckpointYieldPoint;
 use crate::mvcc::database::CommitYieldPoint;
 use crate::mvcc::persistent_storage::logical_log::{
-    ENCRYPTED_PAYLOAD_CHUNK_SIZE, FRAME_MAGIC, LOG_HDR_SIZE,
+    StreamingLogicalLogReader, ENCRYPTED_PAYLOAD_CHUNK_SIZE, FRAME_MAGIC, LOG_HDR_SIZE,
 };
 use crate::mvcc::yield_hooks::YieldPointMarker;
 use crate::mvcc::yield_points::{FailureInjector, YieldInjector, YieldPoint};
@@ -29,7 +29,7 @@ use quickcheck_macros::quickcheck;
 use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha8Rng;
 
-const TX_HEADER_SIZE: usize = 24;
+const TX_HEADER_SIZE: usize = 40;
 const TX_TRAILER_SIZE: usize = 8;
 
 pub(crate) struct MvccTestDbNoConn {
@@ -6619,6 +6619,165 @@ fn test_sql_checkpoint_reinsert_existing_interior_index_key_keeps_sqlite_integri
     assert_eq!(integrity, "ok");
 }
 
+#[test]
+fn test_mvcc_checkpoint_integrity_after_upsert_with_secondary_indexes() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let conn = db.connect();
+
+    conn.execute(
+        "CREATE TABLE t(\
+            id INTEGER PRIMARY KEY,\
+            owner TEXT NOT NULL,\
+            payload TEXT NOT NULL,\
+            rev INTEGER NOT NULL DEFAULT 0,\
+            note TEXT,\
+            bucket INTEGER NOT NULL DEFAULT 0,\
+            tag TEXT,\
+            status INTEGER NOT NULL DEFAULT 0\
+        )",
+    )
+    .unwrap();
+    conn.execute("CREATE INDEX t_owner_rev_idx ON t(owner, rev)")
+        .unwrap();
+    conn.execute("CREATE INDEX t_note_idx ON t(note)").unwrap();
+    conn.execute("CREATE INDEX t_bucket_idx ON t(bucket)")
+        .unwrap();
+    conn.execute("CREATE INDEX t_tag_idx ON t(tag)").unwrap();
+    conn.execute("CREATE INDEX t_status_idx ON t(status)")
+        .unwrap();
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+
+    for id in 1..=200 {
+        conn.execute(format!(
+            "INSERT INTO t(id, owner, payload, rev, note, bucket, tag, status) \
+             VALUES ({id}, 'owner-{id}', 'payload-{id}', 1, 'note-{id}', {bucket}, 'tag-{tag}', {status}) \
+             ON CONFLICT(id) DO UPDATE SET \
+                id = excluded.id, \
+                owner = excluded.owner, \
+                payload = excluded.payload, \
+                rev = excluded.rev, \
+                note = excluded.note, \
+                bucket = excluded.bucket, \
+                tag = excluded.tag, \
+                status = excluded.status",
+            bucket = id % 17,
+            tag = id % 7,
+            status = id % 9,
+        ))
+        .unwrap();
+    }
+
+    for id in 1..=100 {
+        conn.execute(format!(
+            "INSERT INTO t(id, owner, payload, rev, note, bucket, tag, status) \
+             VALUES ({id}, 'owner-{id}', 'payload-{id}-updated', 2, 'note-{id}-updated', {bucket}, 'tag-{tag}-updated', {status}) \
+             ON CONFLICT(id) DO UPDATE SET \
+                id = excluded.id, \
+                owner = excluded.owner, \
+                payload = excluded.payload, \
+                rev = excluded.rev, \
+                note = excluded.note, \
+                bucket = excluded.bucket, \
+                tag = excluded.tag, \
+                status = excluded.status",
+            bucket = (id + 3) % 17,
+            tag = (id + 2) % 7,
+            status = (id + 1) % 9,
+        ))
+        .unwrap();
+    }
+
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+
+    let rows = get_rows(&conn, "PRAGMA integrity_check");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(&rows[0][0].to_string(), "ok");
+}
+
+#[test]
+fn test_mvcc_cached_insert_reprepared_after_index_create() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let conn = db.connect();
+
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, owner TEXT, rev INTEGER, payload TEXT)")
+        .unwrap();
+    let mut insert = conn
+        .prepare(
+            "INSERT INTO t(id, owner, rev, payload) VALUES (1, 'a', 1, 'before') \
+             ON CONFLICT(id) DO UPDATE SET owner = excluded.owner, rev = excluded.rev, payload = excluded.payload",
+        )
+        .unwrap();
+    insert.run_ignore_rows().unwrap();
+
+    conn.execute("CREATE INDEX t_owner_rev_idx ON t(owner, rev)")
+        .unwrap();
+
+    insert.reset().unwrap();
+    insert.run_ignore_rows().unwrap();
+    conn.execute("INSERT INTO t(id, owner, rev, payload) VALUES (2, 'b', 1, 'after')")
+        .unwrap();
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+
+    let rows = get_rows(&conn, "PRAGMA integrity_check");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(&rows[0][0].to_string(), "ok");
+}
+
+#[test]
+fn test_mvcc_integrity_after_mixed_dml_create_index_transaction() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let conn = db.connect();
+
+    conn.execute(
+        "CREATE TABLE t(\
+            id INTEGER PRIMARY KEY,\
+            owner TEXT NOT NULL,\
+            payload TEXT NOT NULL,\
+            rev INTEGER NOT NULL DEFAULT 0,\
+            note TEXT,\
+            bucket INTEGER NOT NULL DEFAULT 0,\
+            tag TEXT,\
+            status INTEGER NOT NULL DEFAULT 0\
+        )",
+    )
+    .unwrap();
+    conn.execute("CREATE INDEX t_owner_rev_idx ON t(owner, rev)")
+        .unwrap();
+    conn.execute("CREATE INDEX t_note_idx ON t(note)").unwrap();
+    conn.execute("CREATE INDEX t_bucket_idx ON t(bucket)")
+        .unwrap();
+    conn.execute("CREATE INDEX t_tag_idx ON t(tag)").unwrap();
+    conn.execute("CREATE INDEX t_status_idx ON t(status)")
+        .unwrap();
+    for id in 1..=13 {
+        conn.execute(format!(
+            "INSERT INTO t(id, owner, payload, rev, note, bucket, tag, status) \
+             VALUES ({id}, 'owner-{id}', 'payload-{id}', 1, 'note-{id}', {bucket}, 'tag-{tag}', {status})",
+            bucket = id % 17,
+            tag = id % 7,
+            status = id % 9,
+        ))
+        .unwrap();
+    }
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+
+    conn.execute("BEGIN IMMEDIATE").unwrap();
+    conn.execute("UPDATE t SET payload = 'local-mixed-payload', rev = rev + 1 WHERE id = 1")
+        .unwrap();
+    conn.execute("CREATE INDEX \"t local mixed idx\" ON t(payload)")
+        .unwrap();
+    conn.execute(
+        "INSERT INTO t(id, owner, payload, rev, note, bucket, tag, status) \
+         VALUES (20006, 'replica-1', 'replica-1-mixed-insert', 1, 'replica-1-note-20006', 1, 'tag-0', 1)",
+    )
+    .unwrap();
+    conn.execute("COMMIT").unwrap();
+
+    let rows = get_rows(&conn, "PRAGMA integrity_check");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(&rows[0][0].to_string(), "ok");
+}
+
 /// Test that integrity_check passes after DROP TABLE but before checkpoint.
 /// Issue #4975: After checkpointing a table and then dropping it, integrity_check
 /// would fail because the dropped table's btree pages still exist but aren't
@@ -8347,6 +8506,35 @@ fn test_checkpoint_drop_table_then_create_index_page_reuse() {
     let rows = get_rows(&conn, "PRAGMA integrity_check");
     assert_eq!(rows.len(), 1);
     assert_eq!(&rows[0][0].to_string(), "ok");
+}
+
+#[test]
+fn test_checkpoint_drop_table_removes_stale_rootpage_mapping() {
+    let db = MvccTestDb::new();
+
+    db.conn
+        .execute("CREATE TABLE stale_root(id INTEGER PRIMARY KEY, v TEXT)")
+        .unwrap();
+    db.conn
+        .execute("INSERT INTO stale_root VALUES(1, 'old')")
+        .unwrap();
+    db.conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+
+    let rows = get_rows(
+        &db.conn,
+        "SELECT rootpage FROM sqlite_schema WHERE type = 'table' AND name = 'stale_root'",
+    );
+    let rootpage = rows[0][0].as_int().unwrap();
+    let table_id = db.mvcc_store.get_table_id_from_root_page(rootpage);
+    assert!(db.mvcc_store.table_id_to_rootpage.get(&table_id).is_some());
+
+    db.conn.execute("DROP TABLE stale_root").unwrap();
+    db.conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+
+    assert!(
+        db.mvcc_store.table_id_to_rootpage.get(&table_id).is_none(),
+        "dropped checkpointed table mapping must not survive rootpage reuse"
+    );
 }
 
 /// Test that inserting a duplicate primary key fails when the existing row
@@ -10958,6 +11146,7 @@ fn assert_log_payloads_decrypt(
 
     while offset + TX_HEADER_SIZE + TX_TRAILER_SIZE <= log_bytes.len() {
         // TX Header: frame_magic(4) | payload_size(8) | op_count(4) | commit_ts(8)
+        // | sync_payload_size(8) | sync_op_count(4) | frame_flags(4)
         let frame_magic = u32::from_le_bytes(log_bytes[offset..offset + 4].try_into().unwrap());
         if frame_magic != FRAME_MAGIC {
             break; // not a valid frame
@@ -10966,6 +11155,8 @@ fn assert_log_payloads_decrypt(
             u64::from_le_bytes(log_bytes[offset + 4..offset + 12].try_into().unwrap()) as usize;
         let op_count = u32::from_le_bytes(log_bytes[offset + 12..offset + 16].try_into().unwrap());
         let commit_ts = u64::from_le_bytes(log_bytes[offset + 16..offset + 24].try_into().unwrap());
+        let sync_payload_size =
+            u64::from_le_bytes(log_bytes[offset + 24..offset + 32].try_into().unwrap()) as usize;
 
         let mut payload_offset = offset + TX_HEADER_SIZE;
         let chunk_count = if payload_size == 0 {
@@ -11012,13 +11203,509 @@ fn assert_log_payloads_decrypt(
         }
 
         frame_count += 1;
-        offset = payload_offset + TX_TRAILER_SIZE; // skip trailer
+        offset = payload_offset + sync_payload_size + TX_TRAILER_SIZE; // skip sync payload and trailer
     }
 
     assert!(
         frame_count > 0,
         "db-log should contain at least one TX frame"
     );
+}
+
+fn collect_mvcc_sync_payload_bytes(conn: &Arc<Connection>) -> Vec<u8> {
+    let mv_store = conn
+        .mv_store()
+        .as_ref()
+        .expect("test database must be in MVCC mode")
+        .clone();
+    let io = conn.get_pager().io.clone();
+    let mut reader = StreamingLogicalLogReader::new(mv_store.get_logical_log_file(), None);
+    reader.read_header(&io).unwrap();
+
+    let mut payload = Vec::new();
+    while let Some(frame) = reader.next_sync_payload(&io).unwrap() {
+        payload.extend_from_slice(&frame.payload);
+    }
+    payload
+}
+
+fn bytes_contain(haystack: &[u8], needle: &[u8]) -> bool {
+    haystack
+        .windows(needle.len())
+        .any(|window| window == needle)
+}
+
+#[derive(Debug)]
+struct DecodedSyncOp {
+    op_type: u64,
+    schema_action: Option<u64>,
+    schema_kind: Option<u64>,
+    table_name: String,
+    sql: String,
+    schema_name: String,
+    user_version: Option<u64>,
+    application_id: Option<u64>,
+}
+
+fn read_proto_varint(bytes: &[u8], offset: &mut usize) -> u64 {
+    let mut value = 0u64;
+    let mut shift = 0;
+    loop {
+        let byte = bytes[*offset];
+        *offset += 1;
+        value |= ((byte & 0x7f) as u64) << shift;
+        if byte & 0x80 == 0 {
+            return value;
+        }
+        shift += 7;
+    }
+}
+
+fn skip_proto_field(bytes: &[u8], offset: &mut usize, wire_type: u64) {
+    match wire_type {
+        0 => {
+            let _ = read_proto_varint(bytes, offset);
+        }
+        2 => {
+            let len = read_proto_varint(bytes, offset) as usize;
+            *offset += len;
+        }
+        other => panic!("unsupported protobuf wire type in test decoder: {other}"),
+    }
+}
+
+fn decode_sync_op(bytes: &[u8]) -> DecodedSyncOp {
+    let mut op = DecodedSyncOp {
+        op_type: u64::MAX,
+        schema_action: None,
+        schema_kind: None,
+        table_name: String::new(),
+        sql: String::new(),
+        schema_name: String::new(),
+        user_version: None,
+        application_id: None,
+    };
+    let mut offset = 0usize;
+    while offset < bytes.len() {
+        let key = read_proto_varint(bytes, &mut offset);
+        let field = key >> 3;
+        let wire_type = key & 7;
+        match (field, wire_type) {
+            (1, 0) => op.op_type = read_proto_varint(bytes, &mut offset),
+            (6, 0) => op.user_version = Some(read_proto_varint(bytes, &mut offset)),
+            (7, 0) => op.application_id = Some(read_proto_varint(bytes, &mut offset)),
+            (8, 0) => op.schema_action = Some(read_proto_varint(bytes, &mut offset)),
+            (9, 0) => op.schema_kind = Some(read_proto_varint(bytes, &mut offset)),
+            (2, 2) => {
+                let len = read_proto_varint(bytes, &mut offset) as usize;
+                op.table_name = String::from_utf8(bytes[offset..offset + len].to_vec()).unwrap();
+                offset += len;
+            }
+            (5, 2) => {
+                let len = read_proto_varint(bytes, &mut offset) as usize;
+                op.sql = String::from_utf8(bytes[offset..offset + len].to_vec()).unwrap();
+                offset += len;
+            }
+            (10, 2) => {
+                let len = read_proto_varint(bytes, &mut offset) as usize;
+                op.schema_name = String::from_utf8(bytes[offset..offset + len].to_vec()).unwrap();
+                offset += len;
+            }
+            _ => skip_proto_field(bytes, &mut offset, wire_type),
+        }
+    }
+    op
+}
+
+fn decode_sync_payload_ops(payload: &[u8]) -> Vec<DecodedSyncOp> {
+    let mut ops = Vec::new();
+    let mut offset = 0usize;
+    while offset < payload.len() {
+        let txn_len = read_proto_varint(payload, &mut offset) as usize;
+        let txn_end = offset + txn_len;
+        let txn = &payload[offset..txn_end];
+        offset = txn_end;
+
+        let mut txn_offset = 0usize;
+        while txn_offset < txn.len() {
+            let key = read_proto_varint(txn, &mut txn_offset);
+            let field = key >> 3;
+            let wire_type = key & 7;
+            if field == 3 && wire_type == 2 {
+                let op_len = read_proto_varint(txn, &mut txn_offset) as usize;
+                ops.push(decode_sync_op(&txn[txn_offset..txn_offset + op_len]));
+                txn_offset += op_len;
+            } else {
+                skip_proto_field(txn, &mut txn_offset, wire_type);
+            }
+        }
+    }
+    ops
+}
+
+fn decode_sync_payload_origins(payload: &[u8]) -> Vec<String> {
+    let mut origins = Vec::new();
+    let mut offset = 0usize;
+    while offset < payload.len() {
+        let txn_len = read_proto_varint(payload, &mut offset) as usize;
+        let txn_end = offset + txn_len;
+        let txn = &payload[offset..txn_end];
+        offset = txn_end;
+
+        let mut txn_offset = 0usize;
+        while txn_offset < txn.len() {
+            let key = read_proto_varint(txn, &mut txn_offset);
+            let field = key >> 3;
+            let wire_type = key & 7;
+            if field == 4 && wire_type == 2 {
+                let len = read_proto_varint(txn, &mut txn_offset) as usize;
+                origins
+                    .push(String::from_utf8(txn[txn_offset..txn_offset + len].to_vec()).unwrap());
+                txn_offset += len;
+            } else {
+                skip_proto_field(txn, &mut txn_offset, wire_type);
+            }
+        }
+    }
+    origins
+}
+
+#[test]
+fn test_mvcc_sync_payload_encoder_matches_logical_op_wire_golden() {
+    let row = SyncSchemaRow {
+        row_type: "view".to_string(),
+        name: "v".to_string(),
+        rootpage: 0,
+        sql: Some("CREATE VIEW v AS SELECT 1".to_string()),
+    };
+    let mut encoded = Vec::new();
+
+    encode_schema_logical_op(LOGICAL_SCHEMA_CREATE, &row, &mut encoded);
+
+    assert_eq!(
+        encoded,
+        vec![
+            0x1a, 0x24, // LogicalTxnData.ops, length 36
+            0x08, 0x02, // LogicalOp.op_type = Schema
+            0x2a, 0x19, // LogicalOp.sql, length 25
+            b'C', b'R', b'E', b'A', b'T', b'E', b' ', b'V', b'I', b'E', b'W', b' ', b'v', b' ',
+            b'A', b'S', b' ', b'S', b'E', b'L', b'E', b'C', b'T', b' ', b'1', 0x40,
+            0x00, // LogicalOp.schema_action = Create
+            0x48, 0x03, // LogicalOp.schema_kind = View
+            0x52, 0x01, b'v', // LogicalOp.schema_name = "v"
+        ]
+    );
+}
+
+#[test]
+fn test_mvcc_sync_payload_contains_user_schema_and_rows() {
+    let db = MvccTestDb::new();
+    db.conn
+        .execute("CREATE TABLE items(id INTEGER PRIMARY KEY, payload TEXT)")
+        .unwrap();
+    db.conn
+        .execute("INSERT INTO items VALUES (1, 'alpha')")
+        .unwrap();
+
+    let payload = collect_mvcc_sync_payload_bytes(&db.conn);
+    let ops = decode_sync_payload_ops(&payload);
+
+    assert!(ops.iter().any(|op| op.op_type == 2
+        && op.schema_name == "items"
+        && op.sql.contains("CREATE TABLE items")));
+    assert!(ops
+        .iter()
+        .any(|op| op.op_type == 0 && op.table_name == "items"));
+}
+
+#[test]
+fn test_mvcc_sync_payload_emits_refresh_for_same_rowid_schema_update() {
+    let db = MvccTestDb::new();
+    db.conn
+        .execute("CREATE TABLE items(id INTEGER PRIMARY KEY, payload TEXT)")
+        .unwrap();
+    db.conn
+        .execute("ALTER TABLE items ADD COLUMN note TEXT")
+        .unwrap();
+
+    let payload = collect_mvcc_sync_payload_bytes(&db.conn);
+    let ops = decode_sync_payload_ops(&payload);
+
+    assert!(ops.iter().any(|op| op.op_type == 2
+        && op.schema_action == Some(2)
+        && op.schema_name == "items"
+        && op.sql.contains("note TEXT")));
+}
+
+#[test]
+fn test_mvcc_sync_payload_emits_drop_and_create_for_drop_recreate_same_name() {
+    let db = MvccTestDb::new();
+    db.conn
+        .execute("CREATE TABLE items(id INTEGER PRIMARY KEY, payload TEXT)")
+        .unwrap();
+    db.conn
+        .execute("INSERT INTO items VALUES (1, 'old')")
+        .unwrap();
+
+    db.conn.execute("BEGIN").unwrap();
+    db.conn.execute("DROP TABLE items").unwrap();
+    db.conn
+        .execute("CREATE TABLE items(id INTEGER PRIMARY KEY, note TEXT)")
+        .unwrap();
+    db.conn
+        .execute("INSERT INTO items VALUES (2, 'new')")
+        .unwrap();
+    db.conn.execute("COMMIT").unwrap();
+
+    let payload = collect_mvcc_sync_payload_bytes(&db.conn);
+    let ops = decode_sync_payload_ops(&payload);
+
+    assert!(ops.iter().any(|op| op.op_type == 2
+        && op.schema_action == Some(1)
+        && op.schema_kind == Some(0)
+        && op.schema_name == "items"));
+    assert!(ops.iter().any(|op| op.op_type == 2
+        && op.schema_action == Some(0)
+        && op.schema_kind == Some(0)
+        && op.schema_name == "items"
+        && op.sql.contains("note TEXT")));
+    assert!(ops
+        .iter()
+        .any(|op| op.op_type == 0 && op.table_name == "items"));
+}
+
+#[test]
+fn test_mvcc_sync_payload_emits_index_drop_for_drop_table() {
+    let db = MvccTestDb::new();
+    db.conn
+        .execute("CREATE TABLE items(id INTEGER PRIMARY KEY, payload TEXT)")
+        .unwrap();
+    db.conn
+        .execute("CREATE INDEX items_payload_idx ON items(payload)")
+        .unwrap();
+    db.conn.execute("DROP TABLE items").unwrap();
+
+    let payload = collect_mvcc_sync_payload_bytes(&db.conn);
+    let ops = decode_sync_payload_ops(&payload);
+
+    assert!(ops.iter().any(|op| op.op_type == 2
+        && op.schema_action == Some(1)
+        && op.schema_kind == Some(0)
+        && op.schema_name == "items"));
+    assert!(ops.iter().any(|op| op.op_type == 2
+        && op.schema_action == Some(1)
+        && op.schema_kind == Some(1)
+        && op.schema_name == "items_payload_idx"));
+}
+
+#[test]
+fn test_mvcc_sync_payload_emits_index_trigger_and_view_schema_ops() {
+    let db = MvccTestDb::new();
+    db.conn
+        .execute("CREATE TABLE items(id INTEGER PRIMARY KEY, payload TEXT)")
+        .unwrap();
+    db.conn
+        .execute("CREATE INDEX items_payload_idx ON items(payload)")
+        .unwrap();
+    db.conn
+        .execute("CREATE VIEW items_view AS SELECT id, payload FROM items")
+        .unwrap();
+    db.conn
+        .execute(
+            "CREATE TRIGGER items_ai AFTER INSERT ON items BEGIN UPDATE items SET payload = NEW.payload WHERE id = NEW.id; END",
+        )
+        .unwrap();
+
+    let payload = collect_mvcc_sync_payload_bytes(&db.conn);
+    let ops = decode_sync_payload_ops(&payload);
+
+    assert!(ops.iter().any(|op| op.op_type == 2
+        && op.schema_action == Some(0)
+        && op.schema_kind == Some(1)
+        && op.schema_name == "items_payload_idx"
+        && op.sql.contains("CREATE INDEX items_payload_idx")));
+    assert!(ops.iter().any(|op| op.op_type == 2
+        && op.schema_action == Some(0)
+        && op.schema_kind == Some(3)
+        && op.schema_name == "items_view"
+        && op.sql.contains("CREATE VIEW items_view")));
+    assert!(ops.iter().any(|op| op.op_type == 2
+        && op.schema_action == Some(0)
+        && op.schema_kind == Some(2)
+        && op.schema_name == "items_ai"
+        && op.sql.contains("CREATE TRIGGER items_ai")));
+}
+
+#[test]
+fn test_mvcc_sync_payload_emits_trigger_and_view_lifecycle_ops() {
+    let db = MvccTestDb::new();
+    db.conn
+        .execute("CREATE TABLE items(id INTEGER PRIMARY KEY, payload TEXT)")
+        .unwrap();
+    db.conn
+        .execute("CREATE VIEW items_view AS SELECT id, payload FROM items")
+        .unwrap();
+    db.conn
+        .execute(
+            "CREATE TRIGGER items_ai AFTER INSERT ON items BEGIN UPDATE items SET payload = NEW.payload WHERE id = NEW.id; END",
+        )
+        .unwrap();
+
+    db.conn.execute("BEGIN").unwrap();
+    db.conn.execute("DROP VIEW items_view").unwrap();
+    db.conn.execute("DROP TRIGGER items_ai").unwrap();
+    db.conn
+        .execute("CREATE VIEW items_view AS SELECT id FROM items")
+        .unwrap();
+    db.conn
+        .execute("CREATE TRIGGER items_ai AFTER INSERT ON items BEGIN SELECT NEW.id; END")
+        .unwrap();
+    db.conn.execute("COMMIT").unwrap();
+
+    let payload = collect_mvcc_sync_payload_bytes(&db.conn);
+    let ops = decode_sync_payload_ops(&payload);
+
+    assert!(ops.iter().any(|op| op.op_type == 2
+        && op.schema_action == Some(1)
+        && op.schema_kind == Some(3)
+        && op.schema_name == "items_view"));
+    assert!(ops.iter().any(|op| op.op_type == 2
+        && op.schema_action == Some(0)
+        && op.schema_kind == Some(3)
+        && op.schema_name == "items_view"
+        && op.sql.contains("CREATE VIEW items_view AS SELECT id")));
+    assert!(ops.iter().any(|op| op.op_type == 2
+        && op.schema_action == Some(1)
+        && op.schema_kind == Some(2)
+        && op.schema_name == "items_ai"));
+    assert!(ops.iter().any(|op| op.op_type == 2
+        && op.schema_action == Some(0)
+        && op.schema_kind == Some(2)
+        && op.schema_name == "items_ai"
+        && op.sql.contains("CREATE TRIGGER items_ai")));
+}
+
+#[test]
+fn test_mvcc_sync_payload_emits_header_only_commits() {
+    let db = MvccTestDb::new();
+    db.conn.execute("PRAGMA user_version = 42").unwrap();
+    db.conn.execute("PRAGMA application_id = 1337").unwrap();
+
+    let payload = collect_mvcc_sync_payload_bytes(&db.conn);
+    let ops = decode_sync_payload_ops(&payload);
+    let header_ops = ops.iter().filter(|op| op.op_type == 3).collect::<Vec<_>>();
+
+    assert_eq!(header_ops.len(), 2);
+    assert!(ops
+        .iter()
+        .any(|op| op.op_type == 3 && op.user_version == Some(42)));
+    assert!(ops
+        .iter()
+        .any(|op| op.op_type == 3 && op.application_id == Some(1337)));
+}
+
+#[test]
+fn test_mvcc_sync_payload_uses_checkpointed_schema_after_restart() {
+    let mut db = MvccTestDbNoConn::new_with_random_db();
+    {
+        let conn = db.connect();
+        conn.execute("CREATE TABLE items(id INTEGER PRIMARY KEY, payload TEXT)")
+            .unwrap();
+        conn.execute("INSERT INTO items VALUES (1, 'before')")
+            .unwrap();
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+        conn.close().unwrap();
+    }
+
+    db.restart();
+    {
+        let conn = db.connect();
+        conn.execute("INSERT INTO items VALUES (2, 'after')")
+            .unwrap();
+        conn.execute("ALTER TABLE items ADD COLUMN note TEXT")
+            .unwrap();
+        conn.execute("UPDATE items SET note = 'backfill' WHERE id = 2")
+            .unwrap();
+
+        let payload = collect_mvcc_sync_payload_bytes(&conn);
+        let ops = decode_sync_payload_ops(&payload);
+
+        assert!(ops
+            .iter()
+            .any(|op| op.op_type == 0 && op.table_name == "items"));
+        assert!(ops.iter().any(|op| op.op_type == 2
+            && op.schema_action == Some(2)
+            && op.schema_kind == Some(0)
+            && op.schema_name == "items"
+            && op.sql.contains("note TEXT")));
+        conn.close().unwrap();
+    }
+}
+
+#[test]
+fn test_mvcc_sync_payload_emits_ddl_and_backfill_rows_in_same_transaction() {
+    let db = MvccTestDb::new();
+    db.conn
+        .execute("CREATE TABLE items(id INTEGER PRIMARY KEY, payload TEXT)")
+        .unwrap();
+    db.conn
+        .execute("INSERT INTO items VALUES (1, 'alpha'), (2, 'beta')")
+        .unwrap();
+
+    db.conn.execute("BEGIN").unwrap();
+    db.conn
+        .execute("ALTER TABLE items ADD COLUMN note TEXT")
+        .unwrap();
+    db.conn
+        .execute("UPDATE items SET note = 'backfilled'")
+        .unwrap();
+    db.conn.execute("COMMIT").unwrap();
+
+    let payload = collect_mvcc_sync_payload_bytes(&db.conn);
+    let ops = decode_sync_payload_ops(&payload);
+
+    assert!(ops.iter().any(|op| op.op_type == 2
+        && op.schema_action == Some(2)
+        && op.schema_kind == Some(0)
+        && op.schema_name == "items"
+        && op.sql.contains("note TEXT")));
+    assert!(
+        ops.iter()
+            .filter(|op| op.op_type == 0 && op.table_name == "items")
+            .count()
+            >= 2
+    );
+}
+
+#[test]
+fn test_mvcc_sync_payload_filters_sync_metadata_table() {
+    let db = MvccTestDb::new();
+    db.conn
+        .execute(
+            "CREATE TABLE turso_sync_last_change_id(client_id TEXT PRIMARY KEY, pull_gen INTEGER, change_id INTEGER)",
+        )
+        .unwrap();
+    db.conn
+        .execute("CREATE TABLE items(id INTEGER PRIMARY KEY, payload TEXT)")
+        .unwrap();
+    db.conn.execute("BEGIN").unwrap();
+    db.conn
+        .execute("INSERT INTO turso_sync_last_change_id VALUES ('client-a', 1, 10)")
+        .unwrap();
+    db.conn
+        .execute("INSERT INTO items VALUES (1, 'visible')")
+        .unwrap();
+    db.conn.execute("COMMIT").unwrap();
+
+    let payload = collect_mvcc_sync_payload_bytes(&db.conn);
+    let ops = decode_sync_payload_ops(&payload);
+    let origins = decode_sync_payload_origins(&payload);
+
+    assert!(!bytes_contain(&payload, b"turso_sync_last_change_id"));
+    assert!(origins.iter().any(|origin| origin == "client-a"));
+    assert!(ops
+        .iter()
+        .any(|op| op.op_type == 0 && op.table_name == "items"));
 }
 
 /// Encrypted version of test_recovery_checkpoint_then_more_writes.
@@ -11645,6 +12332,148 @@ fn test_checkpoint_recovers_after_restart_drop_checkpointed_index() {
     let rows = get_rows(&conn, "PRAGMA integrity_check");
     assert_eq!(rows.len(), 1);
     assert_eq!(&rows[0][0].to_string(), "ok");
+}
+
+#[test]
+fn test_recovery_after_drop_table_with_uncheckpointed_index() {
+    let mut db = MvccTestDbNoConn::new_with_random_db();
+
+    {
+        let conn = db.connect();
+        conn.execute("PRAGMA mvcc_checkpoint_threshold = 1000000")
+            .unwrap();
+        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")
+            .unwrap();
+        conn.execute("CREATE INDEX idx_t_v ON t(v)").unwrap();
+        conn.execute("DROP TABLE t").unwrap();
+    }
+
+    force_close_for_artifact_tamper(&mut db);
+    db.restart();
+
+    let conn = db.connect();
+    let rows = get_rows(
+        &conn,
+        "SELECT type, name, tbl_name FROM sqlite_schema WHERE name IN ('t', 'idx_t_v') ORDER BY type, name",
+    );
+    assert_eq!(rows, Vec::<Vec<Value>>::new());
+}
+
+#[test]
+fn test_recovery_after_drop_checkpointed_table_with_index() {
+    let mut db = MvccTestDbNoConn::new_with_random_db();
+
+    {
+        let conn = db.connect();
+        conn.execute("PRAGMA mvcc_checkpoint_threshold = 1000000")
+            .unwrap();
+        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")
+            .unwrap();
+        conn.execute("CREATE INDEX idx_t_v ON t(v)").unwrap();
+        conn.execute("INSERT INTO t VALUES (1, 'seed')").unwrap();
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+        conn.execute("DROP TABLE t").unwrap();
+    }
+
+    force_close_for_artifact_tamper(&mut db);
+    db.restart();
+
+    let conn = db.connect();
+    let rows = get_rows(
+        &conn,
+        "SELECT type, name, tbl_name FROM sqlite_schema WHERE name IN ('t', 'idx_t_v') ORDER BY type, name",
+    );
+    assert_eq!(rows, Vec::<Vec<Value>>::new());
+}
+
+#[test]
+fn test_recovery_after_drop_checkpointed_table_with_if_not_exists_index() {
+    let mut db = MvccTestDbNoConn::new_with_random_db();
+    let table = "mvcc_sync_items_1777416431036232886";
+    let index = "mvcc_sync_items_1777416431036232886_owner_rev_idx";
+
+    {
+        let conn = db.connect();
+        conn.execute("PRAGMA mvcc_checkpoint_threshold = 1000000")
+            .unwrap();
+        conn.execute(format!(
+            "CREATE TABLE IF NOT EXISTS {table} (id INTEGER PRIMARY KEY, owner TEXT NOT NULL, payload TEXT NOT NULL, rev INTEGER NOT NULL DEFAULT 0)"
+        ))
+        .unwrap();
+        conn.execute(format!(
+            "CREATE INDEX IF NOT EXISTS {index} ON {table} (owner, rev)"
+        ))
+        .unwrap();
+        conn.execute(format!(
+            "INSERT INTO {table} (id, owner, payload, rev) VALUES (1, 'seed-a', 'alpha', 1)"
+        ))
+        .unwrap();
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+        conn.execute(format!("DROP TABLE IF EXISTS {table}"))
+            .unwrap();
+    }
+
+    force_close_for_artifact_tamper(&mut db);
+    db.restart();
+
+    let conn = db.connect();
+    let rows = get_rows(
+        &conn,
+        &format!(
+            "SELECT type, name, tbl_name FROM sqlite_schema WHERE name IN ('{table}', '{index}') ORDER BY type, name"
+        ),
+    );
+    assert_eq!(rows, Vec::<Vec<Value>>::new());
+}
+
+#[test]
+fn test_recovery_after_drop_table_with_many_schema_rows() {
+    let mut db = MvccTestDbNoConn::new_with_random_db();
+    let target = "mvcc_sync_items_1777416431036232886";
+    let target_index = "mvcc_sync_items_1777416431036232886_owner_rev_idx";
+
+    {
+        let conn = db.connect();
+        conn.execute("PRAGMA mvcc_checkpoint_threshold = 1000000")
+            .unwrap();
+        for i in 0..350 {
+            conn.execute(format!(
+                "CREATE TABLE filler_{i}(id INTEGER PRIMARY KEY, owner TEXT, rev INTEGER)"
+            ))
+            .unwrap();
+            conn.execute(format!(
+                "CREATE INDEX filler_{i}_idx ON filler_{i}(owner, rev)"
+            ))
+            .unwrap();
+        }
+        conn.execute(format!(
+            "CREATE TABLE IF NOT EXISTS {target} (id INTEGER PRIMARY KEY, owner TEXT NOT NULL, payload TEXT NOT NULL, rev INTEGER NOT NULL DEFAULT 0)"
+        ))
+        .unwrap();
+        conn.execute(format!(
+            "CREATE INDEX IF NOT EXISTS {target_index} ON {target} (owner, rev)"
+        ))
+        .unwrap();
+        conn.execute(format!(
+            "INSERT INTO {target} (id, owner, payload, rev) VALUES (1, 'seed-a', 'alpha', 1)"
+        ))
+        .unwrap();
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+        conn.execute(format!("DROP TABLE IF EXISTS {target}"))
+            .unwrap();
+    }
+
+    force_close_for_artifact_tamper(&mut db);
+    db.restart();
+
+    let conn = db.connect();
+    let rows = get_rows(
+        &conn,
+        &format!(
+            "SELECT type, name, tbl_name FROM sqlite_schema WHERE name IN ('{target}', '{target_index}') ORDER BY type, name"
+        ),
+    );
+    assert_eq!(rows, Vec::<Vec<Value>>::new());
 }
 
 #[test]
@@ -12709,8 +13538,14 @@ fn busy_from_log_tx_strands_pager_commit_lock_then_blocks_subsequent_commit() {
         fn truncate(&self) -> Result<Completion> {
             self.inner.truncate()
         }
+        fn reset_to_fresh_header(&self) -> Result<Completion> {
+            self.inner.reset_to_fresh_header()
+        }
         fn get_logical_log_file(&self) -> Arc<dyn File> {
             self.inner.get_logical_log_file()
+        }
+        fn logical_log_offset(&self) -> u64 {
+            self.inner.logical_log_offset()
         }
         fn should_checkpoint(&self) -> bool {
             self.inner.should_checkpoint()

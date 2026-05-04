@@ -590,14 +590,11 @@ fn update_pragma(
         PragmaName::QuickCheck => unreachable!("quick_check cannot be set"),
         PragmaName::CaptureDataChangesConn | PragmaName::UnstableCaptureDataChangesConn => {
             let value = parse_string(&value)?;
-            let opts = CaptureDataChangesInfo::parse(&value, Some(CDC_VERSION_CURRENT))?;
-            if opts.is_some() && connection.mvcc_enabled() {
-                bail_parse_error!("CDC is not supported in MVCC mode");
-            }
             // InitCdcVersion handles everything at execution time:
             // - For enable: creates CDC table + version table, records version,
             //   reads back actual version, defers CDC state to Halt
             // - For disable ("off"): defers CDC=None to Halt
+            let opts = CaptureDataChangesInfo::parse(&value, Some(CDC_VERSION_CURRENT))?;
             let cdc_table_name = opts
                 .as_ref()
                 .map(|i| i.table.to_string())

@@ -2258,7 +2258,9 @@ fn emit_update_insns<'a>(
             };
 
             // create full CDC record before update if necessary
-            let cdc_before_reg = if program.capture_data_changes_info().has_before() {
+            let cdc_before_reg = if t_ctx.cdc_cursor_id.is_some()
+                && program.capture_data_changes_info().has_before()
+            {
                 Some(emit_cdc_full_record(
                     program,
                     target_table.table.columns(),
@@ -2469,7 +2471,9 @@ fn emit_update_insns<'a>(
             }
 
             // create full CDC record after update if necessary
-            let cdc_after_reg = if program.capture_data_changes_info().has_after() {
+            let cdc_after_reg = if t_ctx.cdc_cursor_id.is_some()
+                && program.capture_data_changes_info().has_after()
+            {
                 Some(emit_cdc_patch_record(
                     program,
                     &target_table.table,

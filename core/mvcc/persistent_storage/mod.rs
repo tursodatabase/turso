@@ -52,7 +52,14 @@ pub trait DurableStorage: Send + Sync + Debug {
     fn update_header(&self) -> Result<Completion>;
 
     fn truncate(&self) -> Result<Completion>;
+
+    /// Reset the logical log to a fresh header-only file.
+    ///
+    /// Used after an external database restore so future MVCC recovery starts
+    /// from the restored image instead of replaying stale local log frames.
+    fn reset_to_fresh_header(&self) -> Result<Completion>;
     fn get_logical_log_file(&self) -> Arc<dyn File>;
+    fn logical_log_offset(&self) -> u64;
     fn should_checkpoint(&self) -> bool;
     /// Set the checkpoint threshold in bytes of logical-log data written.
     /// A negative value disables automatic checkpointing.
@@ -131,6 +138,7 @@ impl DurableStorage for Storage {
         log_record.op_count = log_record.op_count.checked_add(1).ok_or_else(|| {
             LimboError::InternalError("logical log op_count exceeds u32".to_string())
         })?;
+        log_record.sync_row_versions.push(row_version.clone());
         Ok(())
     }
 
@@ -148,6 +156,7 @@ impl DurableStorage for Storage {
         log_record.op_count = log_record.op_count.checked_add(1).ok_or_else(|| {
             LimboError::InternalError("logical log op_count exceeds u32".to_string())
         })?;
+        log_record.sync_header = Some(*header);
         Ok(())
     }
 
@@ -175,8 +184,18 @@ impl DurableStorage for Storage {
         Ok(c)
     }
 
+    fn reset_to_fresh_header(&self) -> Result<Completion> {
+        let c = self.logical_log.write().reset_to_fresh_header()?;
+        self.shadow_offset_store(0);
+        Ok(c)
+    }
+
     fn get_logical_log_file(&self) -> Arc<dyn File> {
         self.logical_log.read().file.clone()
+    }
+
+    fn logical_log_offset(&self) -> u64 {
+        self.log_offset.load(Ordering::Relaxed)
     }
 
     fn encryption_ctx(&self) -> Option<EncryptionContext> {

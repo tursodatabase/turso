@@ -1660,6 +1660,71 @@ impl Database {
         self._connect(false, None, None)
     }
 
+    #[cfg(feature = "conn_raw_api")]
+    /// Rebuild the process-local shared WAL view after a caller restores the
+    /// database and WAL files outside the pager.
+    pub fn reload_wal_after_external_restore(self: &Arc<Self>) -> Result<()> {
+        let flags = self.open_flags;
+        #[cfg(host_shared_wal)]
+        let shared_authority = self.open_shared_wal_coordination_for_open()?;
+        #[cfg(not(host_shared_wal))]
+        let shared_authority: Option<()> = None;
+
+        let new_shared_wal = {
+            #[cfg(host_shared_wal)]
+            {
+                if let Some(authority) = shared_authority.as_ref() {
+                    if !authority.frame_index_overflowed() {
+                        WalFileShared::open_shared_from_authority_if_exists(
+                            &self.io,
+                            &self.wal_path,
+                            flags,
+                            authority,
+                            &self.db_file,
+                        )?
+                    } else {
+                        WalFileShared::open_shared_if_exists(&self.io, &self.wal_path, flags)?
+                    }
+                } else {
+                    WalFileShared::open_shared_if_exists(&self.io, &self.wal_path, flags)?
+                }
+            }
+            #[cfg(not(host_shared_wal))]
+            {
+                WalFileShared::open_shared_if_exists(&self.io, &self.wal_path, flags)?
+            }
+        };
+        let new_shared_wal = Arc::try_unwrap(new_shared_wal).map_err(|_| {
+            LimboError::InternalError(
+                "new WAL state unexpectedly shared during external restore reload".to_string(),
+            )
+        })?;
+        *self.shared_wal.write() = new_shared_wal.into_inner();
+        if self.mvcc_enabled() || journal_mode::logical_log_exists(std::path::Path::new(&self.path))
+        {
+            let mv_store = journal_mode::open_mv_store(
+                self.io.clone(),
+                &self.path,
+                self.open_flags,
+                self.durable_storage.clone(),
+                None,
+            )?;
+            self.mv_store.store(Some(mv_store.clone()));
+            let mvcc_bootstrap_conn = self._connect(true, None, None)?;
+            match mv_store.bootstrap(mvcc_bootstrap_conn.clone()) {
+                Ok(()) => {}
+                Err(LimboError::SchemaUpdated) => {
+                    mvcc_bootstrap_conn.force_reparse_schema()?;
+                    mv_store.bootstrap(mvcc_bootstrap_conn)?;
+                }
+                Err(error) => return Err(error),
+            }
+        } else {
+            self.mv_store.store(None);
+        }
+        Ok(())
+    }
+
     /// Connect with an encryption key.
     /// Use this when opening an encrypted database where the key is known at connect time.
     #[instrument(skip_all, level = Level::INFO)]

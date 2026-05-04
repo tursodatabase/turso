@@ -554,6 +554,7 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                                     // No BTreeDestroyIndex needed since there's no physical B-tree.
                                     let index_id = MVTableId(root_page);
                                     self.destroyed_indexes.insert(index_id);
+                                    self.mvstore.remove_table_id_to_rootpage(&index_id);
                                     skip_write = true;
                                 } else {
                                     // DROP INDEX - index was checkpointed
@@ -610,6 +611,7 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                                     // No BTreeDestroy needed since there's no physical B-tree.
                                     let table_id = MVTableId::from(root_page);
                                     self.destroyed_tables.insert(table_id);
+                                    self.mvstore.remove_table_id_to_rootpage(&table_id);
                                     skip_write = true;
                                 } else {
                                     // Table was checkpointed - look up by physical root page
@@ -1168,6 +1170,7 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                             // Evict stale cursor.
                             self.cursors.remove(&root_page);
                             self.destroyed_tables.insert(table_id);
+                            self.mvstore.remove_table_id_to_rootpage(&table_id);
                         }
                         SpecialWrite::BTreeCreateIndex { index_id, .. } => {
                             let created_root_page: u32 = self.pager.io.block(|| {
@@ -1229,6 +1232,7 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                             // Evict stale cursor.
                             self.cursors.remove(&root_page);
                             self.destroyed_indexes.insert(index_id);
+                            self.mvstore.remove_table_id_to_rootpage(&index_id);
                         }
                     }
                 }

@@ -4,9 +4,9 @@ use crate::HashMap;
 use crate::ext::VTabImpl;
 use crate::function::{Deterministic, Func, MathFunc, ScalarFunc};
 use crate::schema::{
-    create_table, translate_ident_to_string_literal, BTreeCharacteristics, BTreeTable, ColDef,
-    Column, SchemaObjectType, Table, Type, RESERVED_TABLE_PREFIXES, SQLITE_SEQUENCE_TABLE_NAME,
-    TURSO_TYPES_TABLE_NAME,
+    create_table, is_system_table, translate_ident_to_string_literal, BTreeCharacteristics,
+    BTreeTable, ColDef, Column, SchemaObjectType, Table, Type, RESERVED_TABLE_PREFIXES,
+    SQLITE_SEQUENCE_TABLE_NAME, TURSO_TYPES_TABLE_NAME,
 };
 use crate::stats::STATS_TABLE;
 use crate::storage::pager::CreateBTreeFlags;
@@ -1516,7 +1516,7 @@ pub fn emit_schema_entry(
         table_name: tbl_name.to_string(),
     });
 
-    if let Some(cdc_table_cursor_id) = cdc_table_cursor_id {
+    if let Some(cdc_table_cursor_id) = cdc_table_cursor_id.filter(|_| !is_system_table(tbl_name)) {
         let after_record_reg = if program.capture_data_changes_info().has_after() {
             Some(record_reg)
         } else {

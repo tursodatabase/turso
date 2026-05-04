@@ -925,6 +925,32 @@ impl Connection {
         if db_schema_version == on_disk_schema_version {
             return Ok(());
         }
+        self.reparse_schema_from_current_pages()
+    }
+
+    /// Parse schema from scratch even if the schema cookie did not change.
+    ///
+    /// This is needed after sync applies a replace-base page snapshot outside
+    /// normal SQL DDL. The replacement can reuse the same schema cookie while
+    /// changing root pages, so cookie-based schema refresh would keep stale
+    /// btree root metadata.
+    #[cfg(feature = "conn_raw_api")]
+    pub fn force_reparse_schema(self: &Arc<Connection>) -> Result<()> {
+        if self.get_tx_state() != TransactionState::None {
+            return Ok(());
+        }
+        if self.get_mv_tx().is_some() || self.next_attached_mv_tx().is_some() {
+            return Ok(());
+        }
+
+        let pager = self.pager.load().clone();
+        pager.clear_page_cache(false);
+        pager.set_schema_cookie(None);
+        self.reparse_schema_from_current_pages()
+    }
+
+    fn reparse_schema_from_current_pages(self: &Arc<Connection>) -> Result<()> {
+        let pager = self.pager.load().clone();
         // start read transaction manually, because we will read schema cookie once again and
         // we must be sure that it will consistent with schema content
         //
@@ -1423,6 +1449,90 @@ impl Connection {
         Ok(())
     }
 
+    /// Discard the current main-database MVCC transaction while keeping the
+    /// surrounding WAL-insert session open.
+    ///
+    /// Sync replay uses SQL statements inside a raw WAL session to inspect
+    /// metadata before applying remote changes. Those reads can leave a
+    /// non-exclusive MVCC transaction attached to the connection, which later
+    /// prevents schema/header replay from upgrading to the exclusive MVCC
+    /// transaction required for DDL.
+    #[cfg(all(feature = "fs", feature = "conn_raw_api"))]
+    pub fn reset_main_mvcc_tx_for_wal_session(&self) {
+        let mv_store = self.mv_store();
+        let Some(mv_store) = mv_store.as_ref() else {
+            return;
+        };
+        let Some(tx_id) = self.get_mv_tx_id() else {
+            return;
+        };
+        let pager = self.pager.load();
+        mv_store.rollback_tx(tx_id, pager.clone(), self, MAIN_DB_ID);
+    }
+
+    /// Returns whether the main database currently has a live MVCC transaction.
+    #[cfg(all(feature = "fs", feature = "conn_raw_api"))]
+    pub fn has_main_mvcc_tx_for_wal_session(&self) -> bool {
+        self.get_mv_tx_id().is_some()
+    }
+
+    /// Commit the main-database MVCC transaction while keeping the surrounding
+    /// raw WAL-insert session open.
+    ///
+    /// Sync replay uses a WAL session to rewrite rollback frames, then runs
+    /// logical MVCC SQL on the same connection. Those SQL statements open a
+    /// normal MVCC transaction that `wal_insert_end()` does not commit for us.
+    #[cfg(all(feature = "fs", feature = "conn_raw_api"))]
+    pub fn commit_main_mvcc_tx_for_wal_session(self: &Arc<Self>) -> Result<()> {
+        use crate::types::IOResult;
+
+        let mv_store_handle = self.mv_store();
+        let Some(mv_store) = mv_store_handle.as_ref() else {
+            return Ok(());
+        };
+        let Some(tx_id) = self.get_mv_tx_id() else {
+            return Ok(());
+        };
+
+        let mut state_machine = mv_store.commit_tx(tx_id, self, MAIN_DB_ID)?;
+        loop {
+            match state_machine.step(mv_store)? {
+                IOResult::IO(io) => io.wait(self.db.io.as_ref())?,
+                IOResult::Done(_) => break,
+            }
+        }
+        assert!(state_machine.is_finalized());
+        self.set_mv_tx(None);
+        self.publish_schema_if_newer();
+        Ok(())
+    }
+
+    /// Publish the connection's current schema snapshot to the shared database
+    /// cache after a successful commit so other live connections can refresh.
+    pub fn publish_schema_if_newer(&self) {
+        let schema = self.schema.read().clone();
+        self.db.update_schema_if_newer(schema);
+    }
+
+    /// Publish the connection's current schema snapshot after pages were
+    /// replaced outside normal SQL commit ordering.
+    ///
+    /// External restore paths, such as sync raw page replay and VACUUM image
+    /// install, can move the schema cookie backwards. In that case the shared
+    /// database schema cache must be replaced rather than updated
+    /// monotonically, otherwise new connections can re-adopt a stale higher
+    /// cookie and loop on `SchemaUpdated`.
+    #[cfg(feature = "conn_raw_api")]
+    pub fn publish_schema_after_external_restore(&self) {
+        let schema = self.schema.read().clone();
+        self.db
+            .with_schema_mut(|current| {
+                *current = schema.as_ref().clone();
+                Ok(())
+            })
+            .expect("external restore schema replacement should be infallible");
+    }
+
     /// Try to read page with given ID with fixed WAL watermark position
     /// This method return false if page is not found (so, this is probably new page created after watermark position which wasn't checkpointed to the DB file yet)
     #[cfg(all(feature = "fs", feature = "conn_raw_api"))]
@@ -1822,6 +1932,11 @@ impl Connection {
 
     pub fn get_database_canonical_path(&self) -> String {
         self.db.get_database_canonical_path()
+    }
+
+    #[cfg(feature = "conn_raw_api")]
+    pub fn reload_wal_after_external_restore(&self) -> Result<()> {
+        self.db.reload_wal_after_external_restore()
     }
 
     /// Check if a specific attached database is read only or not, by its index
@@ -2354,6 +2469,94 @@ impl Connection {
             )));
         }
         Ok(())
+    }
+
+    /// Read `sqlite_schema` rows from the checkpointed database-file view.
+    ///
+    /// In MVCC mode this temporarily demotes a regular connection so reads ignore
+    /// the MV store, reparses the baseline schema so the statement schema cookie
+    /// matches the checkpointed file, then restores the regular live schema view.
+    pub fn read_checkpointed_sqlite_schema_rows(
+        self: &Arc<Connection>,
+    ) -> Result<Vec<(i64, String, String, String, i64, Option<String>)>> {
+        if self.is_closed() {
+            return Err(LimboError::InternalError("Connection closed".to_string()));
+        }
+
+        struct RestoreGuard<'a> {
+            conn: &'a Arc<Connection>,
+            promote_on_drop: bool,
+        }
+
+        impl Drop for RestoreGuard<'_> {
+            fn drop(&mut self) {
+                if self.promote_on_drop {
+                    self.conn.promote_to_regular_connection();
+                    self.conn.maybe_update_schema();
+                }
+            }
+        }
+
+        let was_bootstrap = self.is_mvcc_bootstrap_connection();
+        if !was_bootstrap {
+            self.demote_to_mvcc_connection();
+        }
+        let _guard = RestoreGuard {
+            conn: self,
+            promote_on_drop: !was_bootstrap,
+        };
+
+        let checkpointed_cookie = {
+            let pager = self.pager.load().clone();
+            pager.begin_read_tx()?;
+            let cookie = match pager.get_schema_cookie()? {
+                crate::types::IOResult::Done(cookie) => cookie,
+                crate::types::IOResult::IO(io) => {
+                    io.wait(pager.io.as_ref())?;
+                    match pager.get_schema_cookie()? {
+                        crate::types::IOResult::Done(cookie) => cookie,
+                        crate::types::IOResult::IO(_) => {
+                            return Err(LimboError::InternalError(
+                                "schema cookie read unexpectedly yielded twice".to_string(),
+                            ));
+                        }
+                    }
+                }
+            };
+            pager.end_read_tx();
+            cookie
+        };
+        self.with_schema_mut(|schema| -> Result<()> {
+            schema.schema_version = checkpointed_cookie;
+            Ok(())
+        })?;
+
+        let mut rows_data: Vec<(i64, String, String, String, i64, Option<String>)> = Vec::new();
+        {
+            let sql = "SELECT rowid, type, name, tbl_name, rootpage, sql FROM sqlite_schema";
+            let mut parser = Parser::new(sql.as_bytes());
+            let cmd = parser
+                .next_cmd()?
+                .expect("checkpointed sqlite_schema query must parse");
+            let input = std::str::from_utf8(&sql.as_bytes()[..parser.offset()])
+                .unwrap()
+                .trim();
+            let mut rows = self
+                .run_cmd(cmd, input)?
+                .expect("query must be parsed to statement");
+            rows.run_with_row_callback(|row| {
+                let rowid = row.get::<i64>(0)?;
+                let ty = row.get::<&str>(1)?.to_string();
+                let name = row.get::<&str>(2)?.to_string();
+                let table_name = row.get::<&str>(3)?.to_string();
+                let root_page = row.get::<i64>(4)?;
+                let sql = row.get::<&str>(5).ok().map(|s| s.to_string());
+                rows_data.push((rowid, ty, name, table_name, root_page, sql));
+                Ok(())
+            })?;
+        }
+
+        Ok(rows_data)
     }
 
     fn apply_page_layout_to_fresh_attach_db(
@@ -3475,6 +3678,11 @@ mod tests {
         )
         .unwrap();
         db.connect().unwrap()
+    }
+
+    fn open_database(path: &std::path::Path) -> Arc<Database> {
+        let io: Arc<dyn IO> = Arc::new(crate::PlatformIO::new().unwrap());
+        Database::open_file(io, path.to_str().unwrap()).unwrap()
     }
 
     fn open_connection(path: &std::path::Path) -> Arc<Connection> {

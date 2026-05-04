@@ -23,26 +23,27 @@ use super::{
     window::WindowMetadata,
 };
 use crate::alloc::TursoIteratorExt;
-use crate::instrument;
-use crate::schema::{
-    BTreeTable, CheckConstraint, Column, ColumnLayout, GeneratedType, IndexColumn, Schema, Table,
-    EXPR_INDEX_SENTINEL,
-};
-use crate::translate::plan::ColumnMask;
-use crate::vdbe::{
-    affinity::Affinity,
-    builder::{CursorType, DmlColumnContext, ProgramBuilder, SelfTableContext},
-    insn::{to_u16, InsertFlags, Insn},
-    BranchOffset, CursorID,
-};
 use crate::{
+    ast::{self, Expr, Literal, SubqueryType, TableInternalId, TriggerTime},
     bail_parse_error,
     error::SQLITE_CONSTRAINT_CHECK,
     function::Func,
+    instrument,
+    schema::{
+        BTreeTable, CheckConstraint, Column, ColumnLayout, GeneratedType, IndexColumn, Schema,
+        Table, EXPR_INDEX_SENTINEL, SQLITE_SEQUENCE_TABLE_NAME, TURSO_INTERNAL_PREFIX,
+    },
     sync::Arc,
+    translate::plan::ColumnMask,
     turso_assert_ne,
     util::{
         check_expr_references_column, exprs_are_equivalent, normalize_ident, parse_numeric_literal,
+    },
+    vdbe::{
+        affinity::Affinity,
+        builder::{CursorType, DmlColumnContext, ProgramBuilder, SelfTableContext},
+        insn::{to_u16, InsertFlags, Insn},
+        BranchOffset, CursorID,
     },
     CaptureDataChangesExt, Connection, Database, DatabaseCatalog, LimboError, Result, RwLock,
     SymbolTable,
@@ -50,9 +51,7 @@ use crate::{
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use std::borrow::Cow;
 use std::cell::RefCell;
-use turso_parser::ast::{
-    self, Expr, Literal, ResolveType, SubqueryType, TableInternalId, TriggerTime,
-};
+use turso_parser::ast::ResolveType;
 
 pub(crate) mod delete;
 pub(crate) mod gencol;
@@ -1052,6 +1051,8 @@ pub fn prepare_cdc_if_necessary(
     };
     if changed_table_name == cdc_table
         || changed_table_name == crate::translate::pragma::TURSO_CDC_VERSION_TABLE_NAME
+        || changed_table_name == SQLITE_SEQUENCE_TABLE_NAME
+        || changed_table_name.starts_with(TURSO_INTERNAL_PREFIX)
     {
         return Ok(None);
     }
