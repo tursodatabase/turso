@@ -70,7 +70,7 @@ pub struct DatabaseSyncEngineOpts {
     /// `Query` bootstrap strategy** — the server picks the page set, so the
     /// client can't chunk it locally.
     pub pull_bytes_threshold: Option<usize>,
-    /// Opt into decoded logical MVCC pull-updates streams when the server supports them.
+    /// Opt into MVCC logical pull-updates streams when the server supports them.
     pub logical_mvcc_pull: bool,
 }
 
