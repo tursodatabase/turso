@@ -3024,6 +3024,115 @@ unsafe fn set_db_err(db: &mut sqlite3Inner, err: LimboError) -> i32 {
     code
 }
 
+// Symbols required by libsqlite3-sys / sqlx-sqlite that are not yet
+// implemented in Turso.  They are declared here so the dynamic library links
+// successfully; each returns a safe no-op value.
+
+#[no_mangle]
+pub unsafe extern "C" fn sqlite3_update_hook(
+    _db: *mut sqlite3,
+    _callback: Option<
+        unsafe extern "C" fn(*mut ffi::c_void, ffi::c_int, *const ffi::c_char, *const ffi::c_char, i64),
+    >,
+    _context: *mut ffi::c_void,
+) -> *mut ffi::c_void {
+    std::ptr::null_mut()
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn sqlite3_commit_hook(
+    _db: *mut sqlite3,
+    _callback: Option<unsafe extern "C" fn(*mut ffi::c_void) -> ffi::c_int>,
+    _context: *mut ffi::c_void,
+) -> *mut ffi::c_void {
+    std::ptr::null_mut()
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn sqlite3_rollback_hook(
+    _db: *mut sqlite3,
+    _callback: Option<unsafe extern "C" fn(*mut ffi::c_void)>,
+    _context: *mut ffi::c_void,
+) {
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn sqlite3_extended_result_codes(
+    _db: *mut sqlite3,
+    _onoff: ffi::c_int,
+) -> ffi::c_int {
+    SQLITE_OK
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn sqlite3_load_extension(
+    _db: *mut sqlite3,
+    _z_file: *const ffi::c_char,
+    _z_proc: *const ffi::c_char,
+    _pz_err_msg: *mut *mut ffi::c_char,
+) -> ffi::c_int {
+    SQLITE_ERROR
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn sqlite3_unlock_notify(
+    _db: *mut sqlite3,
+    _callback: Option<unsafe extern "C" fn(*mut *mut ffi::c_void, ffi::c_int)>,
+    _context: *mut ffi::c_void,
+) -> ffi::c_int {
+    SQLITE_OK
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn sqlite3_sql(_stmt: *mut sqlite3_stmt) -> *const ffi::c_char {
+    std::ptr::null()
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn sqlite3_column_database_name(
+    _stmt: *mut sqlite3_stmt,
+    _idx: ffi::c_int,
+) -> *const ffi::c_char {
+    std::ptr::null()
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn sqlite3_column_origin_name(
+    _stmt: *mut sqlite3_stmt,
+    _idx: ffi::c_int,
+) -> *const ffi::c_char {
+    std::ptr::null()
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn sqlite3_bind_blob64(
+    stmt: *mut sqlite3_stmt,
+    idx: ffi::c_int,
+    blob: *const ffi::c_void,
+    len: u64,
+    destructor: Option<unsafe extern "C" fn(*mut ffi::c_void)>,
+) -> ffi::c_int {
+    if len > ffi::c_int::MAX as u64 {
+        return SQLITE_TOOBIG;
+    }
+    sqlite3_bind_blob(stmt, idx, blob, len as ffi::c_int, destructor)
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn sqlite3_bind_text64(
+    stmt: *mut sqlite3_stmt,
+    idx: ffi::c_int,
+    text: *const ffi::c_char,
+    len: u64,
+    destructor: Option<unsafe extern "C" fn(*mut ffi::c_void)>,
+    _encoding: ffi::c_uchar,
+) -> ffi::c_int {
+    if len > ffi::c_int::MAX as u64 {
+        return SQLITE_TOOBIG;
+    }
+    sqlite3_bind_text(stmt, idx, text, len as ffi::c_int, destructor)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
