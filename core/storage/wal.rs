@@ -3794,7 +3794,14 @@ impl Wal for WalFile {
             .unwrap_or(snapshot.max_frame);
         let last_checksum = rollback_to
             .as_ref()
-            .map(|r| r.checksum)
+            .map(|r| {
+                if r.frame == 0 {
+                    let hdr = self.coordination.wal_header();
+                    (hdr.checksum_1, hdr.checksum_2)
+                } else {
+                    r.checksum
+                }
+            })
             .unwrap_or(snapshot.last_checksum);
         self.coordination.rollback_cache(max_frame);
         *self.last_checksum.write() = last_checksum;

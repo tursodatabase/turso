@@ -455,8 +455,24 @@ impl PageInner {
         usable_size: usize,
     ) -> crate::Result<(&'static [u8], u64, Option<u32>)> {
         let buf = self.as_ptr();
+        let cell_count = self.cell_count();
+        crate::assert_or_bail_corrupt!(
+            idx < cell_count,
+            "cell index {} out of bounds for index page {} with {} cells",
+            idx,
+            self.id,
+            cell_count
+        );
         let cell_pointer_array_start = self.header_size();
         let cell_pointer = cell_pointer_array_start + (idx * CELL_PTR_SIZE_BYTES);
+        crate::assert_or_bail_corrupt!(
+            cell_pointer + CELL_PTR_SIZE_BYTES <= buf.len(),
+            "cell pointer offset {} out of bounds for index page {} with {} cells and page size {}",
+            cell_pointer,
+            self.id,
+            cell_count,
+            buf.len()
+        );
         let cell_offset = self.read_u16(cell_pointer) as usize;
 
         let page_type = self.page_type()?;
@@ -1224,7 +1240,9 @@ struct SavepointSnapshot {
     kind: SavepointKind,
     start_offset: u64,
     db_size: u32,
+    dirty_pages_at_start: RoaringBitmap,
     wal_max_frame: u64,
+    wal_checkpoint_seq: u32,
     wal_checksum: (u32, u32),
     deferred_fk_violations: isize,
 }
@@ -1241,9 +1259,13 @@ struct Savepoint {
     /// If the database grows during the savepoint and a rollback to the savepoint is performed,
     /// the pages exceeding the database size at the start of the savepoint will be ignored.
     db_size: AtomicU32,
+    /// Dirty pages that existed before this savepoint was opened.
+    dirty_pages_at_start: RoaringBitmap,
     /// We might want to rollback.
     /// WAL max frame at the start of the savepoint.
     wal_max_frame: AtomicU64,
+    /// WAL checkpoint sequence at the start of the savepoint.
+    wal_checkpoint_seq: AtomicU32,
     /// WAL checksum at the start of the savepoint.
     wal_checksum: RwLock<(u32, u32)>,
     /// Deferred FK counter value at the start of this savepoint.
@@ -1251,11 +1273,14 @@ struct Savepoint {
 }
 
 impl Savepoint {
+    #[expect(clippy::too_many_arguments)]
     fn new(
         kind: SavepointKind,
         subjournal_offset: u64,
         db_size: u32,
+        dirty_pages_at_start: RoaringBitmap,
         wal_max_frame: u64,
+        wal_checkpoint_seq: u32,
         wal_checksum: (u32, u32),
         deferred_fk_violations: isize,
     ) -> Self {
@@ -1265,7 +1290,9 @@ impl Savepoint {
             write_offset: AtomicU64::new(subjournal_offset),
             page_bitmap: RwLock::new(RoaringBitmap::new()),
             db_size: AtomicU32::new(db_size),
+            dirty_pages_at_start,
             wal_max_frame: AtomicU64::new(wal_max_frame),
+            wal_checkpoint_seq: AtomicU32::new(wal_checkpoint_seq),
             wal_checksum: RwLock::new(wal_checksum),
             deferred_fk_violations: AtomicIsize::new(deferred_fk_violations),
         }
@@ -1296,7 +1323,9 @@ impl Savepoint {
             kind: self.kind.clone(),
             start_offset: self.start_offset(),
             db_size: self.db_size.load(Ordering::Acquire),
+            dirty_pages_at_start: self.dirty_pages_at_start.clone(),
             wal_max_frame: self.wal_max_frame.load(Ordering::Acquire),
+            wal_checkpoint_seq: self.wal_checkpoint_seq.load(Ordering::Acquire),
             wal_checksum: *self.wal_checksum.read(),
             deferred_fk_violations: self.deferred_fk_violations.load(Ordering::Acquire),
         }
@@ -1309,7 +1338,9 @@ impl Savepoint {
             write_offset: AtomicU64::new(snapshot.start_offset),
             page_bitmap: RwLock::new(RoaringBitmap::new()),
             db_size: AtomicU32::new(snapshot.db_size),
+            dirty_pages_at_start: snapshot.dirty_pages_at_start,
             wal_max_frame: AtomicU64::new(snapshot.wal_max_frame),
+            wal_checkpoint_seq: AtomicU32::new(snapshot.wal_checkpoint_seq),
             wal_checksum: RwLock::new(snapshot.wal_checksum),
             deferred_fk_violations: AtomicIsize::new(snapshot.deferred_fk_violations),
         }
@@ -1933,22 +1964,29 @@ impl Pager {
         db_size: u32,
         deferred_fk_violations: isize,
     ) -> Result<()> {
+        let dirty_pages_at_start = self.dirty_pages.read().clone();
         let subjournal_offset = self
             .savepoints
             .read()
             .last()
             .map(|savepoint| savepoint.write_offset())
             .unwrap_or(0);
-        let (wal_max_frame, wal_checksum) = if let Some(wal) = &self.wal {
-            (wal.get_max_frame(), wal.get_last_checksum())
+        let (wal_max_frame, wal_checkpoint_seq, wal_checksum) = if let Some(wal) = &self.wal {
+            (
+                wal.get_max_frame(),
+                wal.get_checkpoint_seq(),
+                wal.get_last_checksum(),
+            )
         } else {
-            (0, (0, 0))
+            (0, 0, (0, 0))
         };
         let savepoint = Savepoint::new(
             kind,
             subjournal_offset,
             db_size,
+            dirty_pages_at_start,
             wal_max_frame,
+            wal_checkpoint_seq,
             wal_checksum,
             deferred_fk_violations,
         );
@@ -2016,15 +2054,37 @@ impl Pager {
             "memory IO should complete immediately"
         );
 
-        // Discard all dirty pages allocated after the savepoint. These pages
-        // are never subjournaled (see subjournal_page_if_required), so the loop
-        // above won't encounter them. We must clean them from dirty_pages before
-        // truncating the cache, or phantom dirty entries survive into commit.
         {
             let mut cache = self.page_cache.write();
+            // Restored pages must regain the dirty/spilled state they had when
+            // the savepoint was opened so cache bookkeeping matches the
+            // rolled-back page contents.
+            for page_id in rollback_bitset.iter() {
+                let key = PageCacheKey::new(page_id as usize);
+                let Some(page) = cache.peek(&key, false) else {
+                    continue;
+                };
+                if savepoint.dirty_pages_at_start.contains(page_id) {
+                    if !page.is_dirty() {
+                        cache.notify_page_dirty(key);
+                    }
+                    page.clear_spilled();
+                    page.set_dirty();
+                    dirty_pages.insert(page_id);
+                } else {
+                    page.clear_spilled();
+                    page.clear_dirty();
+                    dirty_pages.remove(page_id);
+                    page.try_unpin();
+                }
+            }
+            // Dirty pages allocated after the savepoint are never subjournaled
+            // (see subjournal_page_if_required), so remove them before
+            // truncating the cache to avoid phantom dirty entries at commit.
             for page_id in dirty_pages.iter().filter(|&id| id > db_size) {
                 if let Some(page) = cache.get(&PageCacheKey::new(page_id as usize))? {
                     page.clear_dirty();
+                    page.clear_spilled();
                     page.try_unpin();
                 }
             }
@@ -2033,8 +2093,15 @@ impl Pager {
         }
 
         if let Some(wal) = &self.wal {
+            let current_checkpoint_seq = wal.get_checkpoint_seq();
+            let current_max_frame = wal.get_max_frame();
+            let rollback_frame = if current_checkpoint_seq == savepoint.wal_checkpoint_seq {
+                savepoint.wal_max_frame.min(current_max_frame)
+            } else {
+                0
+            };
             wal.rollback(Some(RollbackTo {
-                frame: savepoint.wal_max_frame,
+                frame: rollback_frame,
                 checksum: savepoint.wal_checksum,
             }));
             self.page_cache

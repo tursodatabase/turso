@@ -280,6 +280,43 @@ expect {
 }
 
 @cross-check-integrity
+test savepoint-rollback-restores-index-pages-for-indexed-seek {
+    PRAGMA page_size = 512;
+    PRAGMA cache_size = 2;
+    CREATE TABLE t(a INTEGER PRIMARY KEY, b TEXT UNIQUE, c TEXT);
+    CREATE INDEX i_c_b ON t(c, b);
+    INSERT INTO t
+    SELECT
+        value,
+        printf('sv35_%05d_', value) || hex(randomblob(90)),
+        printf('sc35_%05d_', value) || hex(randomblob(180))
+    FROM generate_series(1, 495);
+    SAVEPOINT s;
+    DELETE FROM t WHERE a BETWEEN 105 AND 385;
+    INSERT INTO t
+    SELECT
+        value + 9000,
+        printf('sv35_new%05d_', value) || hex(randomblob(120)),
+        printf('sc35_new%05d_', value) || hex(randomblob(220))
+    FROM generate_series(1, 120);
+    ROLLBACK TO s;
+    RELEASE s;
+    SELECT count(*), min(a), max(a)
+    FROM (
+        SELECT a
+        FROM t INDEXED BY i_c_b
+        WHERE c >= 'sc35_'
+        ORDER BY c, b
+        LIMIT 240
+    );
+    PRAGMA integrity_check;
+}
+expect {
+    240|1|240
+    ok
+}
+
+@cross-check-integrity
 test savepoint-release-root-with-deferred-fk-fails {
     PRAGMA foreign_keys = ON;
     CREATE TABLE p(id INTEGER PRIMARY KEY);
