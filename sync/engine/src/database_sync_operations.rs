@@ -403,37 +403,17 @@ async fn replay_logical_transactions<Ctx>(
     replay: &mut DatabaseReplaySession,
     txns: &[LogicalTxnData],
     commit_at_end: bool,
-) -> Result<()> {
-    for txn in txns {
-        for operation in logical_txn_to_tape_operations(txn)? {
-            replay.replay(coro, operation).await?;
-        }
-    }
-    if commit_at_end && !txns.is_empty() {
-        replay.replay(coro, DatabaseTapeOperation::Commit).await?;
-    }
-    Ok(())
-}
-
-/// Replays logical transactions while skipping transactions from one client.
-///
-/// This is used for incremental logical pulls, where the server may include
-/// transactions that only acknowledge local writes already present in the
-/// client database.
-async fn replay_logical_transactions_excluding_client_txns<Ctx>(
-    coro: &Coro<Ctx>,
-    replay: &mut DatabaseReplaySession,
-    txns: &[LogicalTxnData],
-    commit_at_end: bool,
-    excluded_client_id: &str,
+    excluded_client_id: Option<&str>,
 ) -> Result<()> {
     let mut saw_replayed_txns = false;
     for txn in txns {
-        if logical_txn_acknowledges_client(txn, excluded_client_id)? {
-            tracing::debug!(
-                "skipping logical transaction that acknowledges local client {excluded_client_id}"
-            );
-            continue;
+        if let Some(excluded_client_id) = excluded_client_id {
+            if logical_txn_acknowledges_client(txn, excluded_client_id)? {
+                tracing::debug!(
+                    "skipping logical transaction that acknowledges local client {excluded_client_id}"
+                );
+                continue;
+            }
         }
         saw_replayed_txns = true;
         for operation in logical_txn_to_tape_operations(txn)? {
@@ -520,46 +500,12 @@ async fn read_proto_file_chunk<Ctx>(
 /// This is used for large pull-update streams so the client does not need to
 /// keep the whole logical response body in memory. The optional final commit
 /// follows the same contract as `replay_logical_transactions`.
-pub async fn replay_logical_transactions_from_file<Ctx>(
+async fn replay_logical_transactions_from_file<Ctx>(
     coro: &Coro<Ctx>,
     replay: &mut DatabaseReplaySession,
     txns_file: &Arc<dyn turso_core::File>,
     commit_at_end: bool,
-) -> Result<()> {
-    let size = txns_file.size()?;
-    let mut file_offset = 0u64;
-    let mut bytes = BytesMut::new();
-    let mut saw_txns = false;
-    loop {
-        while let Some(txn) = take_proto_message_from_bytes::<LogicalTxnData>(&mut bytes)? {
-            saw_txns = true;
-            for operation in logical_txn_to_tape_operations(&txn)? {
-                replay.replay(coro, operation).await?;
-            }
-        }
-        if file_offset >= size {
-            if bytes.is_empty() {
-                break;
-            }
-            return Err(Error::DatabaseSyncEngineError(
-                "unexpected end of protobuf message in file".to_string(),
-            ));
-        }
-        read_proto_file_chunk(coro, txns_file, size, &mut file_offset, &mut bytes).await?;
-    }
-    if commit_at_end && saw_txns {
-        replay.replay(coro, DatabaseTapeOperation::Commit).await?;
-    }
-    Ok(())
-}
-
-/// Replays file-backed logical transactions while skipping one client's writes.
-pub async fn replay_logical_transactions_from_file_excluding_client_txns<Ctx>(
-    coro: &Coro<Ctx>,
-    replay: &mut DatabaseReplaySession,
-    txns_file: &Arc<dyn turso_core::File>,
-    commit_at_end: bool,
-    excluded_client_id: &str,
+    excluded_client_id: Option<&str>,
 ) -> Result<()> {
     let size = txns_file.size()?;
     let mut file_offset = 0u64;
@@ -567,11 +513,13 @@ pub async fn replay_logical_transactions_from_file_excluding_client_txns<Ctx>(
     let mut saw_replayed_txns = false;
     loop {
         while let Some(txn) = take_proto_message_from_bytes::<LogicalTxnData>(&mut bytes)? {
-            if logical_txn_acknowledges_client(&txn, excluded_client_id)? {
-                tracing::debug!(
-                    "skipping logical transaction that acknowledges local client {excluded_client_id}"
-                );
-                continue;
+            if let Some(excluded_client_id) = excluded_client_id {
+                if logical_txn_acknowledges_client(&txn, excluded_client_id)? {
+                    tracing::debug!(
+                        "skipping logical transaction that acknowledges local client {excluded_client_id}"
+                    );
+                    continue;
+                }
             }
             saw_replayed_txns = true;
             for operation in logical_txn_to_tape_operations(&txn)? {
@@ -600,51 +548,7 @@ pub async fn apply_logical_transactions<Ctx>(
     replay: &mut DatabaseReplaySession,
     txns: &[LogicalTxnData],
 ) -> Result<()> {
-    replay_logical_transactions(coro, replay, txns, true).await
-}
-
-/// Applies decoded logical MVCC transactions without committing the session.
-///
-/// Callers use this when logical replay is one phase of a larger transaction.
-pub async fn apply_logical_transactions_without_commit<Ctx>(
-    coro: &Coro<Ctx>,
-    replay: &mut DatabaseReplaySession,
-    txns: &[LogicalTxnData],
-) -> Result<()> {
-    replay_logical_transactions(coro, replay, txns, false).await
-}
-
-/// Applies decoded logical MVCC transactions without committing, while skipping
-/// transactions that acknowledge `excluded_client_id`.
-pub async fn apply_logical_transactions_without_commit_excluding_client_txns<Ctx>(
-    coro: &Coro<Ctx>,
-    replay: &mut DatabaseReplaySession,
-    txns: &[LogicalTxnData],
-    excluded_client_id: &str,
-) -> Result<()> {
-    replay_logical_transactions_excluding_client_txns(coro, replay, txns, false, excluded_client_id)
-        .await
-}
-
-/// Applies file-backed logical MVCC transactions and commits the replay session.
-pub async fn apply_logical_transactions_file<Ctx>(
-    coro: &Coro<Ctx>,
-    replay: &mut DatabaseReplaySession,
-    txns_file: &Arc<dyn turso_core::File>,
-) -> Result<()> {
-    replay_logical_transactions_from_file(coro, replay, txns_file, true).await
-}
-
-/// Applies file-backed logical MVCC transactions without committing the session.
-///
-/// Replace-base uses this form before local CDC replay so both phases succeed
-/// or roll back together.
-pub async fn apply_logical_transactions_file_without_commit<Ctx>(
-    coro: &Coro<Ctx>,
-    replay: &mut DatabaseReplaySession,
-    txns_file: &Arc<dyn turso_core::File>,
-) -> Result<()> {
-    replay_logical_transactions_from_file(coro, replay, txns_file, false).await
+    replay_logical_transactions(coro, replay, txns, true, None).await
 }
 
 /// Applies file-backed logical MVCC transactions without committing, while
@@ -655,14 +559,8 @@ pub async fn apply_logical_transactions_file_without_commit_excluding_client_txn
     txns_file: &Arc<dyn turso_core::File>,
     excluded_client_id: &str,
 ) -> Result<()> {
-    replay_logical_transactions_from_file_excluding_client_txns(
-        coro,
-        replay,
-        txns_file,
-        false,
-        excluded_client_id,
-    )
-    .await
+    replay_logical_transactions_from_file(coro, replay, txns_file, false, Some(excluded_client_id))
+        .await
 }
 
 /// RAII holder for a single shared temporary resource.

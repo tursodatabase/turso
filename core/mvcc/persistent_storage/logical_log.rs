@@ -997,21 +997,18 @@ fn proto_varint_len(mut value: u64) -> usize {
 }
 
 fn encode_sync_txn_payload(end_offset: u64, commit_ts: u64, encoded_ops: &[u8]) -> Vec<u8> {
-    let mut body = Vec::with_capacity(
-        2 + proto_varint_len(end_offset) + proto_varint_len(commit_ts) + encoded_ops.len(),
-    );
+    let body_len =
+        2 + proto_varint_len(end_offset) + proto_varint_len(commit_ts) + encoded_ops.len();
+    let mut out = Vec::with_capacity(proto_varint_len(body_len as u64) + body_len);
+    write_proto_varint(body_len as u64, &mut out);
     // LogicalTxnData.end_offset, field 1, varint.
-    write_proto_varint(1 << 3, &mut body);
-    write_proto_varint(end_offset, &mut body);
+    write_proto_varint(1 << 3, &mut out);
+    write_proto_varint(end_offset, &mut out);
     // LogicalTxnData.commit_ts, field 2, varint.
-    write_proto_varint(2 << 3, &mut body);
-    write_proto_varint(commit_ts, &mut body);
+    write_proto_varint(2 << 3, &mut out);
+    write_proto_varint(commit_ts, &mut out);
     // LogicalTxnData.ops, field 3, length-delimited messages already encoded by the commit builder.
-    body.extend_from_slice(encoded_ops);
-
-    let mut out = Vec::with_capacity(proto_varint_len(body.len() as u64) + body.len());
-    write_proto_varint(body.len() as u64, &mut out);
-    out.extend_from_slice(&body);
+    out.extend_from_slice(encoded_ops);
     out
 }
 
@@ -1522,7 +1519,6 @@ impl StreamingLogicalLogReader {
         &mut self,
         io: &Arc<dyn crate::IO>,
     ) -> Result<Option<SyncPayloadFrame>> {
-        self.file_size = self.file.size()? as usize;
         loop {
             let Some(frame) = self.next_sync_frame(io)? else {
                 return Ok(None);
@@ -3375,7 +3371,9 @@ mod tests {
                 });
 
             let Some(index_row) = index_row_opt else {
-                panic!("Index row for ({data_value}, {row_id}) not found after recovery. Index rows should be in the logical log.");
+                panic!(
+                    "Index row for ({data_value}, {row_id}) not found after recovery. Index rows should be in the logical log."
+                );
             };
             // Verify the index row contains the correct data
             let RowKey::Record(sortable_key) = index_row.id.row_id else {
@@ -5481,8 +5479,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            encrypted_blob_size,
-            expected_blob_size,
+            encrypted_blob_size, expected_blob_size,
             "on-disk blob size ({encrypted_blob_size}) != expected chunked encrypted size({expected_blob_size})"
         );
 
@@ -5605,8 +5602,7 @@ mod tests {
             });
 
             assert_eq!(
-                actual_frames,
-                expected_frames,
+                actual_frames, expected_frames,
                 "encrypted carry fuzz failed: root_seed={seed} case_index={case_index} forced_case_index={forced_case_index} include_forced_prefix={include_forced_prefix} case_seed={case_seed}"
             );
         }

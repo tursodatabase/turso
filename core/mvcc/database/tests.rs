@@ -102,6 +102,7 @@ impl MvccTestDb {
         let io = Arc::new(MemoryIO::new());
         let db = Database::open_file(io, ":memory:").unwrap();
         let conn = db.connect().unwrap();
+        conn.set_mvcc_sync_payload_enabled(true);
         // Enable MVCC via PRAGMA
         conn.execute("PRAGMA journal_mode = 'mvcc'").unwrap();
         let mvcc_store = db.get_mv_store().clone().unwrap();
@@ -11398,6 +11399,23 @@ fn test_mvcc_sync_payload_encoder_matches_logical_op_wire_golden() {
 }
 
 #[test]
+fn test_mvcc_sync_payload_disabled_by_default() {
+    let io = Arc::new(MemoryIO::new());
+    let db = Database::open_file(io, ":memory:").unwrap();
+    let conn = db.connect().unwrap();
+    conn.execute("PRAGMA journal_mode = 'mvcc'").unwrap();
+    conn.execute("CREATE TABLE items(id INTEGER PRIMARY KEY, payload TEXT)")
+        .unwrap();
+    conn.execute("INSERT INTO items VALUES (1, 'alpha')")
+        .unwrap();
+
+    let payload = collect_mvcc_sync_payload_bytes(&conn);
+
+    assert!(payload.is_empty());
+}
+
+#[test]
+#[cfg(feature = "conn_raw_api")]
 fn test_mvcc_sync_payload_contains_user_schema_and_rows() {
     let db = MvccTestDb::new();
     db.conn
@@ -11419,6 +11437,7 @@ fn test_mvcc_sync_payload_contains_user_schema_and_rows() {
 }
 
 #[test]
+#[cfg(feature = "conn_raw_api")]
 fn test_mvcc_sync_payload_emits_refresh_for_same_rowid_schema_update() {
     let db = MvccTestDb::new();
     db.conn
@@ -11438,6 +11457,7 @@ fn test_mvcc_sync_payload_emits_refresh_for_same_rowid_schema_update() {
 }
 
 #[test]
+#[cfg(feature = "conn_raw_api")]
 fn test_mvcc_sync_payload_emits_drop_and_create_for_drop_recreate_same_name() {
     let db = MvccTestDb::new();
     db.conn
@@ -11475,6 +11495,7 @@ fn test_mvcc_sync_payload_emits_drop_and_create_for_drop_recreate_same_name() {
 }
 
 #[test]
+#[cfg(feature = "conn_raw_api")]
 fn test_mvcc_sync_payload_emits_index_drop_for_drop_table() {
     let db = MvccTestDb::new();
     db.conn
@@ -11499,6 +11520,7 @@ fn test_mvcc_sync_payload_emits_index_drop_for_drop_table() {
 }
 
 #[test]
+#[cfg(feature = "conn_raw_api")]
 fn test_mvcc_sync_payload_emits_index_trigger_and_view_schema_ops() {
     let db = MvccTestDb::new();
     db.conn
@@ -11537,6 +11559,7 @@ fn test_mvcc_sync_payload_emits_index_trigger_and_view_schema_ops() {
 }
 
 #[test]
+#[cfg(feature = "conn_raw_api")]
 fn test_mvcc_sync_payload_emits_trigger_and_view_lifecycle_ops() {
     let db = MvccTestDb::new();
     db.conn
@@ -11586,6 +11609,7 @@ fn test_mvcc_sync_payload_emits_trigger_and_view_lifecycle_ops() {
 }
 
 #[test]
+#[cfg(feature = "conn_raw_api")]
 fn test_mvcc_sync_payload_emits_header_only_commits() {
     let db = MvccTestDb::new();
     db.conn.execute("PRAGMA user_version = 42").unwrap();
@@ -11605,10 +11629,12 @@ fn test_mvcc_sync_payload_emits_header_only_commits() {
 }
 
 #[test]
+#[cfg(feature = "conn_raw_api")]
 fn test_mvcc_sync_payload_uses_checkpointed_schema_after_restart() {
     let mut db = MvccTestDbNoConn::new_with_random_db();
     {
         let conn = db.connect();
+        conn.set_mvcc_sync_payload_enabled(true);
         conn.execute("CREATE TABLE items(id INTEGER PRIMARY KEY, payload TEXT)")
             .unwrap();
         conn.execute("INSERT INTO items VALUES (1, 'before')")
@@ -11620,6 +11646,7 @@ fn test_mvcc_sync_payload_uses_checkpointed_schema_after_restart() {
     db.restart();
     {
         let conn = db.connect();
+        conn.set_mvcc_sync_payload_enabled(true);
         conn.execute("INSERT INTO items VALUES (2, 'after')")
             .unwrap();
         conn.execute("ALTER TABLE items ADD COLUMN note TEXT")
@@ -11643,6 +11670,7 @@ fn test_mvcc_sync_payload_uses_checkpointed_schema_after_restart() {
 }
 
 #[test]
+#[cfg(feature = "conn_raw_api")]
 fn test_mvcc_sync_payload_emits_ddl_and_backfill_rows_in_same_transaction() {
     let db = MvccTestDb::new();
     db.conn
@@ -11678,6 +11706,7 @@ fn test_mvcc_sync_payload_emits_ddl_and_backfill_rows_in_same_transaction() {
 }
 
 #[test]
+#[cfg(feature = "conn_raw_api")]
 fn test_mvcc_sync_payload_filters_sync_metadata_table() {
     let db = MvccTestDb::new();
     db.conn

@@ -185,6 +185,11 @@ pub struct Connection {
     /// because rotating the WAL header invalidates their published
     /// watermarks.
     pub(super) wal_auto_actions: AtomicU8,
+    /// Whether MVCC commits should include server sync payloads in the logical log.
+    ///
+    /// This is off by default because the payloads are only useful when tursodb
+    /// is used as the storage engine behind turso-server logical sync.
+    pub(super) mvcc_sync_payload_enabled: AtomicBool,
     pub(super) capture_data_changes: RwLock<Option<CaptureDataChangesInfo>>,
     /// CDC v2: transaction ID for grouping CDC records by transaction.
     /// -1 means unset (will be assigned on first CDC write in the transaction).
@@ -1824,6 +1829,20 @@ impl Connection {
         WalAutoActions::from_bits_truncate(self.wal_auto_actions.load(Ordering::SeqCst))
     }
 
+    /// Enable or disable writing server sync payloads into MVCC logical-log frames.
+    pub fn set_mvcc_sync_payload_enabled(&self, enabled: bool) {
+        #[cfg(feature = "conn_raw_api")]
+        {
+            self.mvcc_sync_payload_enabled
+                .store(enabled, Ordering::Release);
+        }
+        let _ = enabled;
+    }
+
+    pub fn mvcc_sync_payload_enabled(&self) -> bool {
+        self.mvcc_sync_payload_enabled.load(Ordering::Acquire)
+    }
+
     #[cfg(feature = "simulator")]
     pub fn checkpoint_for_testing(&self, mode: CheckpointMode) -> Result<CheckpointResult> {
         let pager = self.pager.load();
@@ -2469,94 +2488,6 @@ impl Connection {
             )));
         }
         Ok(())
-    }
-
-    /// Read `sqlite_schema` rows from the checkpointed database-file view.
-    ///
-    /// In MVCC mode this temporarily demotes a regular connection so reads ignore
-    /// the MV store, reparses the baseline schema so the statement schema cookie
-    /// matches the checkpointed file, then restores the regular live schema view.
-    pub fn read_checkpointed_sqlite_schema_rows(
-        self: &Arc<Connection>,
-    ) -> Result<Vec<(i64, String, String, String, i64, Option<String>)>> {
-        if self.is_closed() {
-            return Err(LimboError::InternalError("Connection closed".to_string()));
-        }
-
-        struct RestoreGuard<'a> {
-            conn: &'a Arc<Connection>,
-            promote_on_drop: bool,
-        }
-
-        impl Drop for RestoreGuard<'_> {
-            fn drop(&mut self) {
-                if self.promote_on_drop {
-                    self.conn.promote_to_regular_connection();
-                    self.conn.maybe_update_schema();
-                }
-            }
-        }
-
-        let was_bootstrap = self.is_mvcc_bootstrap_connection();
-        if !was_bootstrap {
-            self.demote_to_mvcc_connection();
-        }
-        let _guard = RestoreGuard {
-            conn: self,
-            promote_on_drop: !was_bootstrap,
-        };
-
-        let checkpointed_cookie = {
-            let pager = self.pager.load().clone();
-            pager.begin_read_tx()?;
-            let cookie = match pager.get_schema_cookie()? {
-                crate::types::IOResult::Done(cookie) => cookie,
-                crate::types::IOResult::IO(io) => {
-                    io.wait(pager.io.as_ref())?;
-                    match pager.get_schema_cookie()? {
-                        crate::types::IOResult::Done(cookie) => cookie,
-                        crate::types::IOResult::IO(_) => {
-                            return Err(LimboError::InternalError(
-                                "schema cookie read unexpectedly yielded twice".to_string(),
-                            ));
-                        }
-                    }
-                }
-            };
-            pager.end_read_tx();
-            cookie
-        };
-        self.with_schema_mut(|schema| -> Result<()> {
-            schema.schema_version = checkpointed_cookie;
-            Ok(())
-        })?;
-
-        let mut rows_data: Vec<(i64, String, String, String, i64, Option<String>)> = Vec::new();
-        {
-            let sql = "SELECT rowid, type, name, tbl_name, rootpage, sql FROM sqlite_schema";
-            let mut parser = Parser::new(sql.as_bytes());
-            let cmd = parser
-                .next_cmd()?
-                .expect("checkpointed sqlite_schema query must parse");
-            let input = std::str::from_utf8(&sql.as_bytes()[..parser.offset()])
-                .unwrap()
-                .trim();
-            let mut rows = self
-                .run_cmd(cmd, input)?
-                .expect("query must be parsed to statement");
-            rows.run_with_row_callback(|row| {
-                let rowid = row.get::<i64>(0)?;
-                let ty = row.get::<&str>(1)?.to_string();
-                let name = row.get::<&str>(2)?.to_string();
-                let table_name = row.get::<&str>(3)?.to_string();
-                let root_page = row.get::<i64>(4)?;
-                let sql = row.get::<&str>(5).ok().map(|s| s.to_string());
-                rows_data.push((rowid, ty, name, table_name, root_page, sql));
-                Ok(())
-            })?;
-        }
-
-        Ok(rows_data)
     }
 
     fn apply_page_layout_to_fresh_attach_db(
