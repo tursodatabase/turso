@@ -7,18 +7,22 @@ use serde::{Deserialize, Serialize};
 
 use crate::{database_sync_operations::MutexSlot, errors::Error, Result};
 
+/// Coroutine adapter used by sync operations to yield while core I/O is pending.
 pub struct Coro<Ctx> {
     pub ctx: Mutex<Ctx>,
     gen: genawaiter::sync::Co<SyncEngineIoResult, Result<Ctx>>,
 }
 
 impl<Ctx> Coro<Ctx> {
+    /// Creates a coroutine wrapper with mutable caller context.
     pub fn new(ctx: Ctx, gen: genawaiter::sync::Co<SyncEngineIoResult, Result<Ctx>>) -> Self {
         Self {
             ctx: Mutex::new(ctx),
             gen,
         }
     }
+
+    /// Yields to the outer sync executor and stores the returned context.
     pub async fn yield_(&self, value: SyncEngineIoResult) -> Result<()> {
         let ctx = self.gen.yield_(value).await?;
         *self.ctx.lock().unwrap() = ctx;
@@ -37,11 +41,15 @@ impl From<genawaiter::sync::Co<SyncEngineIoResult, Result<()>>> for Coro<()> {
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
+/// Strategy used to bootstrap only part of a remote database.
 pub enum PartialBootstrapStrategy {
+    /// Bootstrap the first `length` bytes worth of pages.
     Prefix { length: usize },
+    /// Bootstrap pages selected by a server-side query.
     Query { query: String },
 }
 
+/// Partial-sync configuration persisted in sync metadata.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct PartialSyncOpts {
     pub bootstrap_strategy: Option<PartialBootstrapStrategy>,
@@ -50,6 +58,7 @@ pub struct PartialSyncOpts {
 }
 
 impl PartialSyncOpts {
+    /// Returns the configured segment size or the default partial-sync segment.
     pub fn segment_size(&self) -> usize {
         if self.segment_size == 0 {
             128 * 1024
@@ -59,11 +68,13 @@ impl PartialSyncOpts {
     }
 }
 
+/// Legacy bootstrap metadata returned by the export endpoint.
 #[derive(Debug, Deserialize, Serialize)]
 pub struct DbSyncInfo {
     pub current_generation: u64,
 }
 
+/// Legacy WAL pull status returned by the remote.
 #[derive(Debug, Deserialize, Serialize)]
 pub struct DbSyncStatus {
     pub baton: Option<String>,
@@ -72,10 +83,34 @@ pub struct DbSyncStatus {
     pub max_frame_no: u64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Transport and apply semantics for a pull-updates response body.
+pub enum DbChangesStreamKind {
+    /// Incremental WAL page frames.
+    Pages,
+    /// Decoded MVCC logical transactions.
+    Logical,
+    /// Full base-database page snapshot that replaces the client's local base.
+    ReplaceBasePages,
+}
+
+/// Remote changes staged by `wait_changes_from_remote` and consumed by apply.
 pub struct DbChangesStatus {
+    /// Client wall-clock time when the response was received.
     pub time: turso_core::WallClockInstant,
+    /// Server revision that the client should persist after a successful apply.
     pub revision: DatabasePullRevision,
+    /// Temporary file containing the streamed response body, if the response was non-empty.
     pub file_slot: Option<MutexSlot<Arc<dyn turso_core::File>>>,
+    /// How `file_slot` should be interpreted by the apply path.
+    pub stream_kind: DbChangesStreamKind,
+}
+
+impl DbChangesStatus {
+    /// Returns true when the server reported no new changes.
+    pub fn is_empty(&self) -> bool {
+        self.file_slot.is_none()
+    }
 }
 
 impl std::fmt::Debug for DbChangesStatus {
@@ -84,10 +119,12 @@ impl std::fmt::Debug for DbChangesStatus {
             .field("time", &self.time)
             .field("revision", &self.revision)
             .field("file_slot.is_some()", &self.file_slot.is_some())
+            .field("stream_kind", &self.stream_kind)
             .finish()
     }
 }
 
+/// Runtime sync statistics exposed to callers.
 #[derive(Debug, Serialize)]
 pub struct SyncEngineStats {
     pub cdc_operations: i64,
@@ -100,6 +137,7 @@ pub struct SyncEngineStats {
     pub network_received_bytes: usize,
 }
 
+/// Row-level operation kind used by replay SQL generation.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum DatabaseChangeType {
     Delete,
@@ -110,6 +148,7 @@ pub enum DatabaseChangeType {
 
 pub const DATABASE_METADATA_VERSION: &str = "v1";
 
+/// Persistent sync metadata stored next to the local database.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 pub struct DatabaseMetadata {
     pub version: String,
@@ -132,6 +171,7 @@ pub struct DatabaseMetadata {
     pub saved_configuration: Option<DatabaseSavedConfiguration>,
 }
 
+/// Sync configuration saved in metadata for future engine opens.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 pub struct DatabaseSavedConfiguration {
     pub remote_url: Option<String>,
@@ -139,9 +179,11 @@ pub struct DatabaseSavedConfiguration {
     pub partial_sync_segment_size: Option<usize>,
 }
 
+/// Durable remote revision marker for legacy and V1 sync protocols.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum DatabasePullRevision {
+    // Kept for compatibility with servers that only expose the pre-V1 WAL page protocol.
     Legacy {
         generation: u64,
         synced_frame_no: Option<u64>,
@@ -151,6 +193,7 @@ pub enum DatabasePullRevision {
     },
 }
 
+/// Remote sync protocol selected for this database.
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq)]
 pub enum DatabaseSyncEngineProtocolVersion {
     Legacy,
@@ -158,12 +201,15 @@ pub enum DatabaseSyncEngineProtocolVersion {
 }
 
 impl DatabaseMetadata {
+    /// Returns the persisted remote URL, if one was saved.
     pub fn remote_url(&self) -> Option<String> {
         self.saved_configuration
             .as_ref()
             .and_then(|x| x.remote_url.as_deref())
             .map(|x| x.to_string())
     }
+
+    /// Reconstructs partial-sync options from persisted metadata.
     pub fn partial_sync_opts(&self) -> Option<PartialSyncOpts> {
         if self.partial_bootstrap_server_revision.is_none() {
             None
@@ -184,6 +230,8 @@ impl DatabaseMetadata {
             Some(partial_sync_opts)
         }
     }
+
+    /// Merges newly supplied configuration and reports whether metadata changed.
     pub fn update_configuration(&mut self, configuration: DatabaseSavedConfiguration) -> bool {
         let Some(saved_configuration) = &mut self.saved_configuration else {
             self.saved_configuration = Some(configuration);
@@ -204,6 +252,8 @@ impl DatabaseMetadata {
         }
         changed
     }
+
+    /// Parses a metadata file and validates that it uses the expected shape.
     pub fn load(data: &[u8]) -> Result<Self> {
         let value: serde_json::Value = serde_json::from_slice(data)?;
 
@@ -221,6 +271,8 @@ impl DatabaseMetadata {
             )),
         }
     }
+
+    /// Serializes metadata for durable storage next to the database.
     pub fn dump(&self) -> Result<Vec<u8>> {
         let data = serde_json::to_string(self)?;
         Ok(data.into_bytes())
@@ -406,8 +458,16 @@ impl DatabaseChange {
         let change_id = get_core_value_i64(row, 0)?;
         let change_time = get_core_value_i64(row, 1)? as u64;
         let change_txn_id = get_core_value_i64_or_null(row, 2)?;
-        let change_type = get_core_value_i64(row, 3)?;
-        let change_type = parse_change_type(change_type)?;
+        let change_type = match get_core_value_i64_or_null(row, 3)? {
+            Some(change_type) => parse_change_type(change_type)?,
+            None if is_null_cdc_v2_commit_payload(row) => DatabaseChangeType::Commit,
+            None => {
+                return Err(Error::DatabaseTapeError(
+                    "column 3 type mismatch: expected integer for non-COMMIT CDC row, got NULL"
+                        .to_string(),
+                ))
+            }
+        };
         // COMMIT records have NULL for table_name and id
         let table_name = get_core_value_text_or_null(row, 4)?.unwrap_or_default();
         let id = get_core_value_i64_or_null(row, 5)?.unwrap_or(0);
@@ -427,6 +487,7 @@ impl DatabaseChange {
         })
     }
 
+    /// Parses a CDC row using the negotiated CDC table version.
     pub fn from_row(row: &turso_core::Row, cdc_version: turso_core::CdcVersion) -> Result<Self> {
         match cdc_version {
             turso_core::CdcVersion::V2 => Self::from_row_v2(row),
@@ -435,6 +496,12 @@ impl DatabaseChange {
     }
 }
 
+/// Returns true for CDC v2 COMMIT rows whose payload columns are all NULL.
+fn is_null_cdc_v2_commit_payload(row: &turso_core::Row) -> bool {
+    (4..=8).all(|index| matches!(row.get_value(index), turso_core::Value::Null))
+}
+
+/// Row mutation shape passed to user transformation callbacks.
 pub struct DatabaseRowMutation {
     pub change_time: u64,
     pub table_name: String,
@@ -445,12 +512,14 @@ pub struct DatabaseRowMutation {
     pub updates: Option<HashMap<String, turso_core::Value>>,
 }
 
+/// Replacement SQL produced by a transformation callback.
 #[derive(Debug, Clone)]
 pub struct DatabaseStatementReplay {
     pub sql: String,
     pub values: Vec<turso_core::Value>,
 }
 
+/// Decision returned by a row transformation callback.
 #[derive(Debug, Clone)]
 pub enum DatabaseRowTransformResult {
     Keep,
@@ -489,9 +558,58 @@ impl From<&DatabaseTapeRowChangeType> for DatabaseChangeType {
 /// by consuming events from [crate::database_tape::DatabaseChangesIterator]
 #[derive(Debug)]
 pub enum DatabaseTapeOperation {
+    /// Replay one SQL statement with bound values.
     StmtReplay(DatabaseStatementReplay),
+    /// Replay a schema operation with idempotence rules suitable for sync.
+    SchemaReplay(DatabaseSchemaReplay),
+    /// Replay one row-level CDC mutation.
     RowChange(DatabaseTapeRowChange),
+    /// Commit the current replay transaction.
     Commit,
+}
+
+#[derive(Debug)]
+/// Schema operation emitted by logical MVCC sync or CDC schema replay.
+pub enum DatabaseSchemaReplay {
+    /// Create the schema object if it is not already present.
+    Create {
+        /// CREATE statement to execute.
+        sql: String,
+    },
+    /// Drop the named schema object.
+    Drop {
+        /// Kind of object to drop.
+        kind: DatabaseSchemaKind,
+        /// Object name to drop.
+        name: String,
+    },
+    /// Replace the schema object by dropping and recreating it from SQL.
+    Refresh {
+        /// Kind of object to refresh.
+        kind: DatabaseSchemaKind,
+        /// Object name to refresh.
+        name: String,
+        /// CREATE statement for the replacement object.
+        sql: String,
+    },
+    /// Replay an ALTER statement exactly as supplied.
+    Alter {
+        /// ALTER statement to execute.
+        sql: String,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Schema object kind used by schema replay operations.
+pub enum DatabaseSchemaKind {
+    /// Table object.
+    Table,
+    /// Index object.
+    Index,
+    /// Trigger object.
+    Trigger,
+    /// View object.
+    View,
 }
 
 /// [DatabaseTapeRowChange] is the specific operation over single row which can be performed on database

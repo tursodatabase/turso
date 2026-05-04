@@ -42,13 +42,11 @@ mod tests {
         seed: &[u8],
         f: impl Fn() -> F,
     ) {
-        let seed = tokio::runtime::RngSeed::from_bytes(seed);
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_time()
-            .start_paused(true)
-            .rng_seed(seed)
-            .build_local(Default::default())
-            .unwrap();
+        let mut builder = tokio::runtime::Builder::new_current_thread();
+        builder.enable_time();
+        builder.start_paused(true);
+        let _ = seed;
+        let runtime = builder.build().unwrap();
         runtime.block_on(f());
     }
 

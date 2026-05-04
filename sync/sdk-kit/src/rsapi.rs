@@ -42,7 +42,6 @@ pub struct TursoDatabaseSyncConfig {
 pub type PartialSyncOpts = turso_sync_engine::types::PartialSyncOpts;
 pub type PartialBootstrapStrategy = turso_sync_engine::types::PartialBootstrapStrategy;
 pub type DatabaseSyncStats = turso_sync_engine::types::SyncEngineStats;
-
 impl TursoDatabaseSyncConfig {
     /// helper method to restore [TursoDatabaseSyncConfig] instance from C representation
     /// this method is used in the capi wrappers
@@ -128,7 +127,7 @@ pub struct TursoDatabaseSyncChanges {
 
 impl TursoDatabaseSyncChanges {
     pub fn empty(&self) -> bool {
-        self.changes.file_slot.is_none()
+        self.changes.is_empty()
     }
     pub fn to_capi(self: Box<Self>) -> *mut capi::c::turso_sync_changes_t {
         Box::into_raw(self) as *mut capi::c::turso_sync_changes_t
@@ -246,6 +245,7 @@ impl<TBytes: AsRef<[u8]> + Send + Sync + 'static> TursoDatabaseSync<TBytes> {
             remote_encryption_key: sync_config.remote_encryption_key.clone(),
             push_operations_threshold: sync_config.push_operations_threshold,
             pull_bytes_threshold: sync_config.pull_bytes_threshold,
+            logical_mvcc_pull: true,
         };
         let is_memory = db_config.path == ":memory:";
         let db_io: Option<Arc<dyn IO>> = if is_memory {
@@ -336,6 +336,7 @@ impl<TBytes: AsRef<[u8]> + Send + Sync + 'static> TursoDatabaseSync<TBytes> {
                     &main_db_path,
                 )
                 .await?;
+                let fresh_bootstrap = metadata.is_none() && sync_engine_opts.bootstrap_if_empty;
                 let io = match io {
                     Some(io) => io,
                     None => persistent_io(if let Some(metadata) = &metadata {
@@ -377,6 +378,11 @@ impl<TBytes: AsRef<[u8]> + Send + Sync + 'static> TursoDatabaseSync<TBytes> {
                     sync_engine_opts,
                 )
                 .await?;
+                if fresh_bootstrap {
+                    sync_engine_opened
+                        .acknowledge_existing_cdc_for_current_client(&coro, "fresh bootstrap")
+                        .await?;
+                }
                 *sync_engine.lock() = Some(sync_engine_opened);
                 Ok(None)
             })

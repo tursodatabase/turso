@@ -40,8 +40,13 @@ impl WalSession {
     }
     pub fn end(&mut self, force_commit: bool) -> Result<()> {
         assert!(self.in_txn);
-        self.conn.wal_insert_end(force_commit)?;
+        let result = self.conn.wal_insert_end(force_commit);
+        // `wal_insert_end` may report an error after it has already released
+        // the underlying WAL locks, for example while refreshing schema after
+        // commit. In either case this session must not try to end the same WAL
+        // transaction again from Drop.
         self.in_txn = false;
+        result?;
         Ok(())
     }
     pub fn in_txn(&self) -> bool {

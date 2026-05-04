@@ -3,6 +3,7 @@ use std::collections::VecDeque;
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 
+/// Requested page encoding for pull-updates responses.
 #[derive(Serialize, Deserialize, Debug, PartialEq, Clone)]
 #[serde(rename_all = "snake_case")]
 #[derive(prost::Enumeration)]
@@ -12,11 +13,15 @@ pub enum PageUpdatesEncodingReq {
     Zstd = 1,
 }
 
+/// Request body for the V1 `/pull-updates` protobuf endpoint.
 #[derive(prost::Message)]
 pub struct PullUpdatesReqProtoBody {
     /// requested encoding of the pages
     #[prost(enumeration = "PageUpdatesEncodingReq", tag = "1")]
     pub encoding: i32,
+    /// request decoded logical MVCC updates instead of raw logical-log bytes
+    #[prost(bool, tag = "8")]
+    pub logical_updates: bool,
     /// revision of the requested pages on server side; can be None - in which case server will pick latest revision
     #[prost(string, tag = "2")]
     pub server_revision: String,
@@ -38,6 +43,7 @@ pub struct PullUpdatesReqProtoBody {
     pub client_pages: Bytes,
 }
 
+/// One page payload returned by a page pull-updates stream.
 #[derive(prost::Message, Serialize, Deserialize, Clone, Eq, PartialEq)]
 pub struct PageData {
     #[prost(uint64, tag = "1")]
@@ -48,9 +54,129 @@ pub struct PageData {
     pub encoded_page: Bytes,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, prost::Enumeration)]
+#[repr(i32)]
+/// Body format used after a pull-updates response header.
+pub enum PullUpdatesStreamKind {
+    /// The response body contains WAL-style page frames.
+    Pages = 0,
+    /// The response body contains length-delimited [`LogicalTxnData`] messages.
+    Logical = 1,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, prost::Enumeration)]
+#[repr(i32)]
+/// How the client must apply the streamed updates.
+pub enum PullUpdatesApplyMode {
+    /// Apply the stream on top of the client's current base revision.
+    Incremental = 0,
+    /// Replace the local base database with the streamed pages before replaying local changes.
+    ReplaceBase = 1,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, prost::Enumeration)]
+#[repr(i32)]
+/// Logical operation kind decoded from the server's MVCC log.
+pub enum LogicalOpType {
+    /// Insert or replace one row by rowid.
+    UpsertRow = 0,
+    /// Delete one row by rowid.
+    DeleteRow = 1,
+    /// Replay a schema create/drop/refresh/alter operation.
+    Schema = 2,
+    /// Replay database-header fields such as `user_version` and `application_id`.
+    UpdateHeader = 3,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, prost::Enumeration)]
+#[repr(i32)]
+/// Schema action represented by a logical schema operation.
+pub enum LogicalSchemaAction {
+    /// Create the schema object if it does not already exist.
+    Create = 0,
+    /// Drop the schema object.
+    Drop = 1,
+    /// Replace the client-side schema object definition with the supplied SQL.
+    Refresh = 2,
+    /// Replay an ALTER statement exactly as supplied by the server.
+    Alter = 3,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, prost::Enumeration)]
+#[repr(i32)]
+/// Type of schema object affected by a logical schema operation.
+pub enum LogicalSchemaKind {
+    /// A table entry in `sqlite_schema`.
+    Table = 0,
+    /// An index entry in `sqlite_schema`.
+    Index = 1,
+    /// A trigger entry in `sqlite_schema`.
+    Trigger = 2,
+    /// A view entry in `sqlite_schema`.
+    View = 3,
+}
+
+#[derive(prost::Message, Clone, PartialEq, Eq)]
+/// One logical operation from the server's decoded MVCC log.
+///
+/// Only the fields required by `op_type` are populated. Row operations use
+/// `table_name`, `rowid`, and optionally `record`; schema operations use the
+/// schema fields; header updates use `user_version` and/or `application_id`.
+pub struct LogicalOp {
+    /// Encoded [`LogicalOpType`].
+    #[prost(enumeration = "LogicalOpType", tag = "1")]
+    pub op_type: i32,
+    /// User table affected by row operations.
+    #[prost(string, tag = "2")]
+    pub table_name: String,
+    /// Rowid affected by row operations.
+    #[prost(sint64, tag = "3")]
+    pub rowid: i64,
+    /// SQLite record bytes for upsert operations.
+    #[prost(bytes, tag = "4")]
+    pub record: Bytes,
+    /// SQL used for schema create, refresh, or alter operations.
+    #[prost(string, tag = "5")]
+    pub sql: String,
+    /// New `PRAGMA user_version`, when the operation updates it.
+    #[prost(optional, uint32, tag = "6")]
+    pub user_version: Option<u32>,
+    /// New `PRAGMA application_id`, when the operation updates it.
+    #[prost(optional, uint32, tag = "7")]
+    pub application_id: Option<u32>,
+    /// Encoded [`LogicalSchemaAction`] for schema operations.
+    #[prost(optional, enumeration = "LogicalSchemaAction", tag = "8")]
+    pub schema_action: Option<i32>,
+    /// Encoded [`LogicalSchemaKind`] for schema operations.
+    #[prost(optional, enumeration = "LogicalSchemaKind", tag = "9")]
+    pub schema_kind: Option<i32>,
+    /// Schema object name for schema operations.
+    #[prost(string, tag = "10")]
+    pub schema_name: String,
+}
+
+#[derive(prost::Message, Clone, PartialEq, Eq)]
+/// One committed MVCC transaction in a logical pull-updates stream.
+pub struct LogicalTxnData {
+    /// Logical-log byte offset immediately after this transaction.
+    #[prost(uint64, tag = "1")]
+    pub end_offset: u64,
+    /// MVCC commit timestamp used as the replay change time.
+    #[prost(uint64, tag = "2")]
+    pub commit_ts: u64,
+    /// Logical operations in commit order.
+    #[prost(message, repeated, tag = "3")]
+    pub ops: Vec<LogicalOp>,
+    /// Client that originated this transaction, when known.
+    #[prost(string, tag = "4")]
+    pub origin_client_id: String,
+}
+
+/// Marker for raw page encoding in a page-set response.
 #[derive(prost::Message)]
 pub struct PageSetRawEncodingProto {}
 
+/// Marker and options for zstd page encoding in a page-set response.
 #[derive(prost::Message)]
 pub struct PageSetZstdEncodingProto {
     #[prost(int32, tag = "1")]
@@ -70,6 +196,10 @@ pub struct PullUpdatesRespProtoBody {
     pub raw_encoding: Option<PageSetRawEncodingProto>,
     #[prost(optional, message, tag = "4")]
     pub zstd_encoding: Option<PageSetZstdEncodingProto>,
+    #[prost(enumeration = "PullUpdatesStreamKind", tag = "5")]
+    pub stream_kind: i32,
+    #[prost(enumeration = "PullUpdatesApplyMode", tag = "6")]
+    pub apply_mode: i32,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
