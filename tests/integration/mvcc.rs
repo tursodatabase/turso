@@ -86,8 +86,16 @@ impl turso_core::mvcc::persistent_storage::DurableStorage for RecordingDurableSt
         self.inner.truncate()
     }
 
+    fn reset_to_fresh_header(&self) -> turso_core::Result<turso_core::Completion> {
+        self.inner.reset_to_fresh_header()
+    }
+
     fn get_logical_log_file(&self) -> Arc<dyn turso_core::File> {
         self.inner.get_logical_log_file()
+    }
+
+    fn logical_log_offset(&self) -> u64 {
+        self.inner.logical_log_offset()
     }
 
     fn should_checkpoint(&self) -> bool {
