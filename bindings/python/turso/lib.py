@@ -468,14 +468,22 @@ class Connection:
         traceback: TracebackType | None,
     ) -> bool:
         # sqlite3 behavior: In context manager, if no exception -> commit, else rollback (legacy and PEP 249 modes)
-        try:
-            if type is None:
+        if type is None:
+            try:
                 self.commit()
-            else:
-                self.rollback()
-        finally:
-            # Always propagate exceptions (returning False)
-            return False
+            except BaseException as commit_exc:
+                # sqlite3 behavior: if commit fails, try to rollback to unlock the database, then re-raise the commit exception
+                try:
+                    self.rollback()
+                except BaseException as rollback_exc:
+                    # If rollback also fails, chain the exceptions
+                    raise rollback_exc from commit_exc
+                raise
+        else:
+            self.rollback()
+
+        # Always propagate exceptions (returning False)
+        return False
 
 
 # Cursor goes SECOND
