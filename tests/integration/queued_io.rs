@@ -1,11 +1,13 @@
 use std::{
     collections::VecDeque,
+    io::ErrorKind,
     sync::{Arc, Mutex},
 };
 
 use turso_core::{
     io::{FileId, FileSyncType},
-    Buffer, Clock, Completion, File, MonotonicInstant, OpenFlags, WallClockInstant, IO,
+    Buffer, Clock, Completion, CompletionError, File, MonotonicInstant, OpenFlags,
+    WallClockInstant, IO,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -73,6 +75,30 @@ impl QueuedIo {
         (op.action)()?;
         self.state.history.lock().unwrap().push(event.clone());
         Ok(Some(event))
+    }
+
+    /// Injects an I/O error after `allowed_successes` matching queued operations.
+    ///
+    /// REINDEX rollback tests use this to fail the destructive refill path at a
+    /// deterministic write boundary while still exercising the normal queued I/O
+    /// completion machinery.
+    pub(crate) fn fault_after(
+        &self,
+        path_suffix: impl Into<String>,
+        kind: QueuedIoOpKind,
+        allowed_successes: usize,
+    ) {
+        *self.state.fault.lock().unwrap() = Some(QueuedIoFault {
+            path_suffix: path_suffix.into(),
+            kind,
+            allowed_successes,
+            seen: 0,
+        });
+    }
+
+    /// Removes the active queued-I/O fault so cleanup and integrity checks can run normally.
+    pub(crate) fn clear_fault(&self) {
+        *self.state.fault.lock().unwrap() = None;
     }
 }
 
@@ -172,7 +198,7 @@ impl QueuedFile {
         let queued_completion = completion.clone();
         let queued_action: Box<dyn FnOnce() -> turso_core::Result<()> + Send> = if fault_this_op {
             Box::new(move || {
-                queued_completion.abort();
+                queued_completion.error(CompletionError::IOError(ErrorKind::Other, "queued_io"));
                 Ok(())
             })
         } else {

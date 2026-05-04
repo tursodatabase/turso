@@ -56,7 +56,7 @@ use crate::vdbe::Program;
 use crate::{bail_parse_error, Connection, Result, SymbolTable};
 use alter::translate_alter_table;
 use analyze::translate_analyze;
-use index::{translate_create_index, translate_drop_index, translate_optimize};
+use index::{translate_create_index, translate_drop_index, translate_optimize, translate_reindex};
 use insert::translate_insert;
 use rollback::{translate_release, translate_rollback, translate_savepoint};
 use schema::{translate_create_table, translate_create_virtual_table, translate_drop_table};
@@ -356,7 +356,7 @@ pub fn translate_inner(
         ast::Stmt::Pragma { .. } => {
             bail_parse_error!("PRAGMA statement cannot be evaluated in a nested context")
         }
-        ast::Stmt::Reindex { .. } => bail_parse_error!("REINDEX not supported yet"),
+        ast::Stmt::Reindex { name } => translate_reindex(name, resolver, program, connection)?,
         ast::Stmt::Optimize { idx_name } => {
             translate_optimize(idx_name, resolver, program, connection)?
         }

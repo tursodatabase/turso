@@ -1645,6 +1645,15 @@ pub fn insn_to_row(
                 0,
                 "".to_string()
             ),
+            Insn::ClearBtree { db, root } => (
+                "ClearBtree",
+                *root,
+                *db as i64,
+                0,
+                Value::build_text(""),
+                0,
+                format!("root={root} iDb={db}"),
+            ),
             Insn::Destroy {
                 db,
                 root,
