@@ -38,6 +38,8 @@ pub struct TableOpts {
     #[garde(range(min = 0.0, max = 1.0))]
     #[serde(alias = "rowid_style_prob")]
     pub rowid_alias_prob: f64,
+    #[garde(range(min = 0.0, max = 1.0))]
+    pub without_rowid_prob: f64,
     /// Range of numbers of columns to generate
     #[garde(custom(range_struct_min(1)))]
     pub column_range: Range<u32>,
@@ -48,6 +50,7 @@ impl Default for TableOpts {
         Self {
             large_table: Default::default(),
             rowid_alias_prob: 0.05,
+            without_rowid_prob: 0.0,
             // Up to 10 columns
             column_range: 1..11,
         }

@@ -210,15 +210,38 @@ fn validate_integer_pk_row_non_null(
     }
 }
 
+fn validate_without_rowid_primary_key_not_null(
+    table_name: &str,
+    columns: &[Column],
+    row: &[SimValue],
+) -> anyhow::Result<()> {
+    for (idx, column) in columns.iter().enumerate() {
+        if column.is_primary_key() && row[idx].0 == Value::Null {
+            return Err(anyhow::anyhow!(
+                "datatype mismatch: table '{}' PRIMARY KEY column '{}' cannot be NULL",
+                table_name,
+                column.name
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn prepare_insert_rows(
     table_name: &str,
     columns: &[Column],
+    without_rowid: bool,
     existing_rows: &[Vec<SimValue>],
     input_rows: &[Vec<SimValue>],
 ) -> anyhow::Result<Vec<Vec<SimValue>>> {
     let mut new_rows = input_rows.to_vec();
 
-    if let Some(pk_idx) = integer_pk_index(columns) {
+    if without_rowid {
+        for r in &new_rows {
+            ensure_row_width(table_name, columns, r)?;
+            validate_without_rowid_primary_key_not_null(table_name, columns, r)?;
+        }
+    } else if let Some(pk_idx) = integer_pk_index(columns) {
         let mut alloc = RowidAllocator::new(existing_rows, pk_idx);
         new_rows = new_rows
             .iter()
@@ -654,8 +677,14 @@ impl Shadow for Insert {
                     .ok_or_else(|| anyhow::anyhow!("Table {} does not exist", table_name))?;
 
                 let columns = tables[table_pos].columns.clone();
-                let rows =
-                    prepare_insert_rows(&table_name, &columns, &tables[table_pos].rows, &raw_rows)?;
+                let without_rowid = tables[table_pos].without_rowid;
+                let rows = prepare_insert_rows(
+                    &table_name,
+                    &columns,
+                    without_rowid,
+                    &tables[table_pos].rows,
+                    &raw_rows,
+                )?;
 
                 for row in &rows {
                     tables.record_insert(table_name.clone(), row.clone());
@@ -676,12 +705,14 @@ impl Shadow for Insert {
                     .ok_or_else(|| anyhow::anyhow!("Table {} does not exist", table_name))?;
 
                 let columns = tables[table_pos].columns.clone();
+                let without_rowid = tables[table_pos].without_rowid;
 
                 match on_conflict {
                     None => {
                         let new_rows = prepare_insert_rows(
                             &table_name,
                             &columns,
+                            without_rowid,
                             &tables[table_pos].rows,
                             values,
                         )?;

@@ -484,10 +484,9 @@ pub fn translate_insert(
     // trigger bodies see affinity-applied values. Affinity is idempotent, so
     // applying it here means we can skip the per-trigger Copy+Affinity in fire_trigger.
     if !ctx.table.is_strict {
-        let affinity = insertion
-            .col_mappings
+        let storable_mappings = storable_col_mappings_in_register_order(&insertion);
+        let affinity = storable_mappings
             .iter()
-            .filter(|cm| !cm.column.is_virtual_generated())
             .map(|col_mapping| col_mapping.column.affinity());
 
         // Only emit Affinity if there's meaningful affinity to apply
@@ -868,9 +867,10 @@ pub fn translate_insert(
     )?;
 
     // Create and insert the record
+    let storable_mappings = storable_col_mappings_in_register_order(&insertion);
     emit_make_record(
         program,
-        insertion.col_mappings.iter().map(|m| m.column),
+        storable_mappings.iter().map(|m| m.column),
         insertion.base_reg,
         insertion.record_register(),
         ctx.table.is_strict,
@@ -2390,6 +2390,18 @@ impl<'a> Insertion<'a> {
                 .is_some_and(|n| n.eq_ignore_ascii_case(name))
         })
     }
+}
+
+fn storable_col_mappings_in_register_order<'a, 'b>(
+    insertion: &'a Insertion<'b>,
+) -> Vec<&'a ColMapping<'b>> {
+    let mut mappings = insertion
+        .col_mappings
+        .iter()
+        .filter(|cm| !cm.column.is_virtual_generated())
+        .collect::<Vec<_>>();
+    mappings.sort_unstable_by_key(|cm| cm.register);
+    mappings
 }
 
 #[derive(Debug)]

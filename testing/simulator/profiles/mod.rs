@@ -186,6 +186,59 @@ impl Profile {
         profile
     }
 
+    /// Profile that generates WITHOUT ROWID tables and checks typed row content
+    /// after inserts. This exercises b-tree record layout paths that differ from
+    /// ordinary rowid tables.
+    pub fn without_rowid() -> Self {
+        let profile = Profile {
+            io: IOProfile {
+                fault: FaultProfile {
+                    enable: false,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            query: QueryProfile {
+                gen_opts: Opts {
+                    table: TableOpts {
+                        rowid_alias_prob: 0.0,
+                        without_rowid_prob: 1.0,
+                        ..Default::default()
+                    },
+                    query: QueryOpts {
+                        select: SelectOpts {
+                            free_expr_size: 1,
+                            order_by_prob: 0.0,
+                            ..Default::default()
+                        },
+                        insert: InsertOpts {
+                            min_rows: NonZeroU32::new(1).unwrap(),
+                            max_rows: NonZeroU32::new(4).unwrap(),
+                            upsert_prob: 0.0,
+                        },
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+                select_weight: 20,
+                insert_weight: 70,
+                create_table_weight: 10,
+                update_weight: 0,
+                delete_weight: 0,
+                create_index_weight: 0,
+                drop_table_weight: 0,
+                alter_table_weight: 0,
+                drop_index: 0,
+                pragma_weight: 0,
+                ..Default::default()
+            },
+            max_connections: 1,
+            ..Default::default()
+        };
+        profile.validate().unwrap();
+        profile
+    }
+
     pub fn faultless() -> Self {
         let profile = Profile {
             io: IOProfile {
@@ -235,6 +288,7 @@ impl Profile {
             ProfileType::SimpleMvcc => Self::simple_mvcc(),
             ProfileType::WriteStress => Self::write_stress(),
             ProfileType::SavepointStress => Self::savepoint_stress(),
+            ProfileType::WithoutRowid => Self::without_rowid(),
             ProfileType::Custom(path) => {
                 Self::parse(path).with_context(|| "failed to parse JSON profile")?
             }
@@ -277,6 +331,7 @@ pub enum ProfileType {
     SimpleMvcc,
     WriteStress,
     SavepointStress,
+    WithoutRowid,
     #[strum(disabled)]
     Custom(PathBuf),
 }

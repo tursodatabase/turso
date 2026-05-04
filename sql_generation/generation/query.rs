@@ -361,7 +361,10 @@ fn gen_insert_values<R: Rng + ?Sized, C: GenerationContext>(
                 .iter()
                 .enumerate()
                 .map(|(col_idx, c)| {
-                    if integer_pk_idx == Some(col_idx) && rng.random_bool(INTEGER_PK_NULL_PROB) {
+                    if !table.without_rowid
+                        && integer_pk_idx == Some(col_idx)
+                        && rng.random_bool(INTEGER_PK_NULL_PROB)
+                    {
                         return SimValue::NULL;
                     }
                     if c.has_unique_or_pk() {

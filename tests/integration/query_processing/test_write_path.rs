@@ -3,9 +3,10 @@ use crate::common::{
 };
 use crate::common::{compare_string, do_flush, TempDatabase};
 use log::debug;
-use rusqlite::types::Value as RValue;
+use rusqlite::{types::Value as RValue, Connection as SqliteConnection};
 use std::io::{Read, Seek, Write};
 use std::sync::Arc;
+use tempfile::TempDir;
 use turso_core::vdbe::StepResult;
 use turso_core::{CheckpointMode, Connection, LimboError, Numeric, Row, Statement, Value};
 
@@ -130,6 +131,114 @@ fn test_insert_without_rowid_table(tmp_db: TempDatabase) -> anyhow::Result<()> {
 
     do_flush(&conn, &tmp_db)?;
     rusqlite_integrity_check(tmp_db.path.as_path())?;
+    Ok(())
+}
+
+#[turso_macros::test]
+fn test_insert_without_rowid_applies_affinity_in_record_order(
+    tmp_db: TempDatabase,
+) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+
+    conn.execute("CREATE TABLE wr(c TEXT, b INTEGER PRIMARY KEY, a REAL) WITHOUT ROWID")?;
+    conn.execute("INSERT INTO wr VALUES('x', 1, 2.5)")?;
+    conn.execute("INSERT INTO wr(a, c, b) VALUES(3.5, 'y', 2)")?;
+    conn.execute("CREATE TABLE src(c TEXT, b INTEGER, a REAL)")?;
+    conn.execute("INSERT INTO src VALUES('z', 3, 4.5)")?;
+    conn.execute("INSERT INTO wr SELECT c, b, a FROM src")?;
+
+    let types: Vec<(String, String, String)> =
+        conn.exec_rows("SELECT typeof(c), typeof(b), typeof(a) FROM wr ORDER BY b");
+    assert_eq!(
+        types,
+        vec![
+            (
+                "text".to_string(),
+                "integer".to_string(),
+                "real".to_string()
+            ),
+            (
+                "text".to_string(),
+                "integer".to_string(),
+                "real".to_string()
+            ),
+            (
+                "text".to_string(),
+                "integer".to_string(),
+                "real".to_string()
+            ),
+        ]
+    );
+
+    let integer_pk_rows: Vec<(i64,)> =
+        conn.exec_rows("SELECT COUNT(*) FROM wr WHERE typeof(b) = 'integer'");
+    assert_eq!(integer_pk_rows, vec![(3,)]);
+
+    conn.execute(
+        "CREATE TABLE wd(c TEXT DEFAULT 7, b INTEGER PRIMARY KEY, a REAL DEFAULT '5.5') WITHOUT ROWID",
+    )?;
+    conn.execute("INSERT INTO wd(b) VALUES(4)")?;
+    let default_types: Vec<(String, String, String)> =
+        conn.exec_rows("SELECT typeof(c), typeof(b), typeof(a) FROM wd");
+    assert_eq!(
+        default_types,
+        vec![(
+            "text".to_string(),
+            "integer".to_string(),
+            "real".to_string()
+        )]
+    );
+
+    do_flush(&conn, &tmp_db)?;
+    rusqlite_integrity_check(tmp_db.path.as_path())?;
+    Ok(())
+}
+
+#[turso_macros::test]
+fn test_insert_existing_strict_without_rowid_applies_type_check_in_record_order(
+    _tmp_db: TempDatabase,
+) -> anyhow::Result<()> {
+    let temp_dir = TempDir::new()?;
+    let db_path = temp_dir.path().join("strict_without_rowid.db");
+    {
+        let sqlite = SqliteConnection::open(&db_path)?;
+        sqlite.execute_batch(
+            "CREATE TABLE wr(c TEXT DEFAULT 'd', b INTEGER PRIMARY KEY, a REAL DEFAULT '5.5') STRICT, WITHOUT ROWID;",
+        )?;
+    }
+
+    let db = TempDatabase::new_with_existent(&db_path);
+    let conn = db.connect_limbo();
+
+    conn.execute("INSERT INTO wr VALUES('x', 1, 2.5)")?;
+    conn.execute("INSERT INTO wr(a, c, b) VALUES(3.5, 'y', 2)")?;
+    conn.execute("INSERT INTO wr(b) VALUES(3)")?;
+
+    let types: Vec<(String, String, String)> =
+        conn.exec_rows("SELECT typeof(c), typeof(b), typeof(a) FROM wr ORDER BY b");
+    assert_eq!(
+        types,
+        vec![
+            (
+                "text".to_string(),
+                "integer".to_string(),
+                "real".to_string()
+            ),
+            (
+                "text".to_string(),
+                "integer".to_string(),
+                "real".to_string()
+            ),
+            (
+                "text".to_string(),
+                "integer".to_string(),
+                "real".to_string()
+            ),
+        ]
+    );
+
+    do_flush(&conn, &db)?;
+    rusqlite_integrity_check(db.path.as_path())?;
     Ok(())
 }
 

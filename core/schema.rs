@@ -2712,23 +2712,58 @@ impl BTreeTable {
         ColumnsMut { table: self }
     }
 
+    fn storable_columns_in_register_order(table: &BTreeTable) -> Vec<(usize, Column)> {
+        let mut columns = table
+            .columns
+            .iter()
+            .enumerate()
+            .filter(|(_, col)| !col.is_virtual_generated())
+            .map(|(idx, col)| {
+                let physical_offset = table
+                    .logical_to_physical_map
+                    .get(idx)
+                    .copied()
+                    .unwrap_or(idx);
+                (idx, physical_offset, col.clone())
+            })
+            .collect::<Vec<_>>();
+        columns.sort_unstable_by_key(|(_, physical_offset, _)| *physical_offset);
+        columns
+            .into_iter()
+            .map(|(idx, _, col)| (idx, col))
+            .collect()
+    }
+
+    fn type_check_table_ref_needs_register_order(table: &BTreeTable) -> bool {
+        let columns = Self::storable_columns_in_register_order(table);
+        columns.len() != table.columns.len()
+            || columns
+                .iter()
+                .enumerate()
+                .any(|(register_offset, (logical_idx, _))| *logical_idx != register_offset)
+    }
+
     /// Create a table reference for TypeCheck where custom type columns have
     /// their `ty_str` replaced with the base type name, and where virtual columns
     /// are skipped. This ensures TypeCheck validates the encoded value against the
     /// correct base type (e.g., BLOB) rather than accepting any STRICT type via the wildcard arm.
     pub fn type_check_table_ref(table: &Arc<BTreeTable>, schema: &Schema) -> Arc<BTreeTable> {
-        let has_virtual = table.has_virtual_columns();
+        let needs_register_order = Self::type_check_table_ref_needs_register_order(table);
         let has_custom = table
             .columns
             .iter()
             .any(|c| c.is_array() || schema.get_type_def(&c.ty_str, table.is_strict).is_some());
-        if !has_custom && !has_virtual {
+        if !has_custom && !needs_register_order {
             return Arc::clone(table);
         }
         let mut modified = (**table).clone();
-        if has_virtual {
-            modified.columns.retain(|c| !c.is_virtual_generated());
+        if needs_register_order {
+            modified.columns = Self::storable_columns_in_register_order(table)
+                .into_iter()
+                .map(|(_, col)| col)
+                .collect();
             modified.has_virtual_columns = false;
+            modified.logical_to_physical_map = (0..modified.columns.len()).collect();
         }
         for col in &mut modified.columns {
             if col.is_array() {
@@ -2750,32 +2785,29 @@ impl BTreeTable {
         schema: &Schema,
         only_columns: Option<&ColumnMask>,
     ) -> Arc<BTreeTable> {
-        let has_virtual = table.has_virtual_columns();
+        let needs_register_order = Self::type_check_table_ref_needs_register_order(table);
         let has_custom = table
             .columns
             .iter()
             .any(|c| c.is_array() || schema.get_type_def(&c.ty_str, table.is_strict).is_some());
-        if !has_custom && !has_virtual {
+        if !has_custom && !needs_register_order {
             return Arc::clone(table);
         }
         let mut modified = (**table).clone();
-        let remapped_only_columns = if has_virtual {
+        let remapped_only_columns = if needs_register_order {
+            let columns = Self::storable_columns_in_register_order(table);
             let remapped = only_columns.map(|only| {
                 let mut new_set = ColumnMask::default();
-                let mut physical = 0usize;
-                for (orig, col) in modified.columns.iter().enumerate() {
-                    if col.is_virtual_generated() {
-                        continue;
+                for (register_offset, (logical_idx, _)) in columns.iter().enumerate() {
+                    if only.get(*logical_idx) {
+                        new_set.set(register_offset);
                     }
-                    if only.get(orig) {
-                        new_set.set(physical);
-                    }
-                    physical += 1;
                 }
                 new_set
             });
-            modified.columns.retain(|c| !c.is_virtual_generated());
+            modified.columns = columns.into_iter().map(|(_, col)| col).collect();
             modified.has_virtual_columns = false;
+            modified.logical_to_physical_map = (0..modified.columns.len()).collect();
             remapped
         } else {
             None

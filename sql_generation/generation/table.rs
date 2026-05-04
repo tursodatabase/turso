@@ -50,6 +50,7 @@ impl Table {
             name,
             columns: Vec::from_iter(column_set),
             indexes: vec![],
+            without_rowid: false,
         }
     }
 }
@@ -57,6 +58,41 @@ impl Table {
 impl Arbitrary for Table {
     fn arbitrary<R: Rng + ?Sized, C: GenerationContext>(rng: &mut R, context: &C) -> Self {
         let name = Name::arbitrary(rng, context).0;
+
+        let without_rowid = rng.random_bool(context.opts().table.without_rowid_prob);
+        if without_rowid {
+            let payload_name = Name::arbitrary(rng, context).0;
+            let pk_name = Name::arbitrary(rng, context).0;
+            let extra_name = Name::arbitrary(rng, context).0;
+
+            return Table {
+                rows: Vec::new(),
+                name,
+                columns: vec![
+                    Column {
+                        name: payload_name,
+                        column_type: ColumnType::Text,
+                        constraints: vec![],
+                    },
+                    Column {
+                        name: pk_name,
+                        column_type: ColumnType::Integer,
+                        constraints: vec![ColumnConstraint::PrimaryKey {
+                            order: None,
+                            conflict_clause: None,
+                            auto_increment: false,
+                        }],
+                    },
+                    Column {
+                        name: extra_name,
+                        column_type: ColumnType::Float,
+                        constraints: vec![],
+                    },
+                ],
+                indexes: vec![],
+                without_rowid: true,
+            };
+        }
 
         let rowid_alias = rng.random_bool(context.opts().table.rowid_alias_prob);
         if rowid_alias {
@@ -95,6 +131,7 @@ impl Arbitrary for Table {
                 name,
                 columns,
                 indexes: vec![],
+                without_rowid: false,
             }
         } else {
             Table::arbitrary_with_columns(rng, context, name, vec![])

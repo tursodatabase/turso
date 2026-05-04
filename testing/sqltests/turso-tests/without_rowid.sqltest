@@ -19,6 +19,15 @@ expect error {
     UNIQUE constraint failed
 }
 
+test without-rowid-insert-affinity-follows-record-order {
+    CREATE TABLE t(c TEXT, b INTEGER PRIMARY KEY, a REAL) WITHOUT ROWID;
+    INSERT INTO t VALUES ('x', 1, 2.5);
+    SELECT typeof(c), typeof(b), typeof(a) FROM t;
+}
+expect {
+    text|integer|real
+}
+
 test without-rowid-missing-primary-key-rejected {
     CREATE TABLE t(a INTEGER, b TEXT) WITHOUT ROWID;
 }
