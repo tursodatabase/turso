@@ -2263,10 +2263,11 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
         })?;
         // Replace-base page snapshots can already contain changes this client
         // pushed earlier, so the push high-water mark is a valid replay floor
-        // there. Incremental logical pulls exclude this client's transactions
-        // from the remote stream; after the local WAL rollback we must replay
-        // those local CDC rows to preserve the client's own writes.
+        // there. Incremental logical pulls are pull-only: after the local WAL
+        // rollback, pending local CDC rows must not be replayed into the local
+        // database as part of this apply.
         let use_pushed_change_hint = replace_base_pages;
+        let replay_local_changes = !matches!(stream_kind, DbChangesStreamKind::Logical);
 
         // Phase 4: as now DB has all data from remote - let's read pull generation and last change id for current client
         // we will use last_change_id in order to replay local changes made strictly after that id locally
@@ -2324,7 +2325,9 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
             ignore_schema_changes: false,
             ..Default::default()
         };
-        let local_changes = if let Some(local_changes) = precollected_replace_base_local_changes {
+        let local_changes = if !replay_local_changes {
+            Vec::new()
+        } else if let Some(local_changes) = precollected_replace_base_local_changes {
             local_changes
         } else {
             // it's important here that DatabaseTape create fresh connection under the hood
