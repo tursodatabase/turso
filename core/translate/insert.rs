@@ -5,7 +5,7 @@ use crate::{
     error::{SQLITE_CONSTRAINT_NOTNULL, SQLITE_CONSTRAINT_PRIMARYKEY, SQLITE_CONSTRAINT_UNIQUE},
     schema::{
         self, BTreeTable, ColDef, Column, Index, IndexColumn, ResolvedFkRef, Table,
-        SQLITE_SEQUENCE_TABLE_NAME,
+        EXPR_INDEX_SENTINEL, SQLITE_SEQUENCE_TABLE_NAME,
     },
     sync::Arc,
     translate::{
@@ -3480,6 +3480,14 @@ fn emit_index_column_value_for_insert(
             table,
             dest_reg,
         )?;
+        // For virtual generated column references, apply the column's 
+        // declared affinity to the computed expression result.
+        if idx_col.pos_in_table != EXPR_INDEX_SENTINEL {
+            let column = &table.columns()[idx_col.pos_in_table];
+            if column.is_virtual_generated() {
+                program.emit_column_affinity(dest_reg, column.affinity());
+            }
+        }
     } else {
         let Some(cm) = insertion.get_col_mapping_by_name(&idx_col.name) else {
             return Err(LimboError::PlanningError(

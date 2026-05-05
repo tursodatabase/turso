@@ -4896,3 +4896,15 @@ test update-expression-index-references-virtual-gencol {
     1|aaaaaa
     ok
 }
+
+@cross-check-integrity
+test gencol-virtual-affinity-applied-to-index {
+    CREATE TABLE t (a INTEGER, b INTEGER, v REAL AS (a + b));
+    INSERT INTO t (a, b) VALUES (5000000000000001, 5000000000000002);
+    INSERT INTO t (a, b) VALUES (1, 2);
+    CREATE INDEX idx_v ON t (v);
+    PRAGMA integrity_check;
+}
+expect {
+    ok
+}
