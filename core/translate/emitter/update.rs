@@ -1923,11 +1923,17 @@ fn emit_update_insns<'a>(
         // Apply affinity BEFORE MakeRecord so the index record has correctly converted values.
         // This is needed for all indexes (not just unique) because the index should store
         // values with proper affinity conversion.
+        //
+        // Virtual generated columns (pos_in_table != EXPR_INDEX_SENTINEL but ic.expr.is_some()
+        // because resolve_sorted_columns inlines their expression) keep their declared column
+        // affinity — the index was populated with that affinity at CREATE INDEX / INSERT time,
+        // so probes and rebuilds must match. Pure expression indices have no declared
+        // affinity and stay Blob.
         let aff = index
             .columns
             .iter()
             .map(|ic| {
-                if ic.expr.is_some() {
+                if ic.pos_in_table == EXPR_INDEX_SENTINEL {
                     Affinity::Blob.aff_mask()
                 } else {
                     target_table.table.columns()[ic.pos_in_table]

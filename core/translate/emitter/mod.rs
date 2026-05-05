@@ -25,6 +25,7 @@ use super::{
 use crate::instrument;
 use crate::schema::{
     BTreeTable, CheckConstraint, Column, ColumnLayout, GeneratedType, IndexColumn, Schema, Table,
+    EXPR_INDEX_SENTINEL,
 };
 use crate::translate::plan::ColumnMask;
 use crate::vdbe::{
@@ -1803,6 +1804,21 @@ pub(crate) fn emit_index_column_value_old_image(
             )?;
             Ok(())
         })?;
+        // Virtual generated column index entries: apply the column's declared
+        // affinity to the computed expression so the OLD probe key matches the
+        // affinity-coerced value stored in the index. Without this, a column
+        // declared `REAL AS (int_expr)` with |value| > 2^53 builds an Integer
+        // probe key that fails to match the Float index entry, producing
+        // 'IdxDelete: no matching index entry'. Pure expression indexes
+        // (pos_in_table == EXPR_INDEX_SENTINEL) have no declared affinity.
+        if idx_col.pos_in_table != EXPR_INDEX_SENTINEL {
+            if let Some(table) = program.btree_table_from_cursor(table_cursor_id) {
+                let column = &table.columns()[idx_col.pos_in_table];
+                if column.is_virtual_generated() {
+                    program.emit_column_affinity(dest_reg, column.affinity());
+                }
+            }
+        }
     } else if let Some(generated_column) = generated_column(program, table_cursor_id, idx_col) {
         emit_table_column(
             program,
