@@ -49,9 +49,14 @@ fn main() -> anyhow::Result<()> {
             }
             SimulatorCommand::Loop { n, short_circuit } => {
                 banner();
+                let explicit_seed = cli_opts.seed;
                 for i in 0..n {
                     println!("iteration {i}");
-                    let result = testing_main(&mut cli_opts, &profile);
+                    let mut iteration_opts = cli_opts.clone();
+                    if explicit_seed.is_none() {
+                        iteration_opts.seed = None;
+                    }
+                    let result = testing_main(&mut iteration_opts, &profile);
                     if result.is_err() && short_circuit {
                         println!("short circuiting after {i} iterations");
                         return result;
