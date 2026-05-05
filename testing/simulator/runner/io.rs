@@ -133,6 +133,7 @@ impl IO for SimulatorIO {
             path: path.to_string(),
             inner,
             fault: Cell::new(false),
+            locked: Cell::new(false),
             nr_pread_faults: Cell::new(0),
             nr_pwrite_faults: Cell::new(0),
             nr_sync_faults: Cell::new(0),

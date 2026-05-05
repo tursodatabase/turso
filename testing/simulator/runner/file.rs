@@ -14,6 +14,7 @@ pub(crate) struct SimulatorFile {
     pub path: String,
     pub(crate) inner: Arc<dyn File>,
     pub(crate) fault: Cell<bool>,
+    pub(crate) locked: Cell<bool>,
 
     /// Number of `pread` function calls (both success and failures).
     pub(crate) nr_pread_calls: Cell<usize>,
@@ -125,7 +126,9 @@ impl File for SimulatorFile {
                 FAULT_ERROR_MSG.into(),
             ));
         }
-        self.inner.lock_file(exclusive)
+        self.inner.lock_file(exclusive)?;
+        self.locked.set(true);
+        Ok(())
     }
 
     fn unlock_file(&self) -> Result<()> {
@@ -134,7 +137,9 @@ impl File for SimulatorFile {
                 FAULT_ERROR_MSG.into(),
             ));
         }
-        self.inner.unlock_file()
+        self.inner.unlock_file()?;
+        self.locked.set(false);
+        Ok(())
     }
 
     fn pread(&self, pos: u64, c: turso_core::Completion) -> Result<turso_core::Completion> {
@@ -270,8 +275,125 @@ impl File for SimulatorFile {
 
 impl Drop for SimulatorFile {
     fn drop(&mut self) {
-        self.inner.unlock_file().expect("Failed to unlock file");
+        if self.locked.get() {
+            if let Err(error) = self.inner.unlock_file() {
+                tracing::warn!(?error, "failed to unlock simulator file during drop");
+            } else {
+                self.locked.set(false);
+            }
+        }
     }
 }
 
 struct Latency {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rand::SeedableRng;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+    use turso_core::{Buffer, Completion, LimboError, io::FileSyncType};
+
+    struct CountingFile {
+        locks: AtomicUsize,
+        unlocks: AtomicUsize,
+    }
+
+    impl CountingFile {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                locks: AtomicUsize::new(0),
+                unlocks: AtomicUsize::new(0),
+            })
+        }
+    }
+
+    impl File for CountingFile {
+        fn lock_file(&self, _exclusive: bool) -> Result<()> {
+            self.locks.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+
+        fn unlock_file(&self) -> Result<()> {
+            let unlocks = self.unlocks.fetch_add(1, Ordering::SeqCst);
+            if unlocks >= self.locks.load(Ordering::SeqCst) {
+                return Err(LimboError::LockingError("already unlocked".into()));
+            }
+            Ok(())
+        }
+
+        fn pread(&self, _pos: u64, c: Completion) -> Result<Completion> {
+            Ok(c)
+        }
+
+        fn pwrite(&self, _pos: u64, _buffer: Arc<Buffer>, c: Completion) -> Result<Completion> {
+            Ok(c)
+        }
+
+        fn sync(&self, c: Completion, _sync_type: FileSyncType) -> Result<Completion> {
+            Ok(c)
+        }
+
+        fn size(&self) -> Result<u64> {
+            Ok(0)
+        }
+
+        fn truncate(&self, _len: u64, c: Completion) -> Result<Completion> {
+            Ok(c)
+        }
+    }
+
+    fn simulator_file(inner: Arc<dyn File>) -> SimulatorFile {
+        SimulatorFile {
+            path: "test.db".into(),
+            inner,
+            fault: Cell::new(false),
+            locked: Cell::new(false),
+            nr_pread_calls: Cell::new(0),
+            nr_pread_faults: Cell::new(0),
+            nr_pwrite_calls: Cell::new(0),
+            nr_pwrite_faults: Cell::new(0),
+            nr_sync_calls: Cell::new(0),
+            nr_sync_faults: Cell::new(0),
+            page_size: 4096,
+            rng: RefCell::new(ChaCha8Rng::seed_from_u64(0)),
+            latency_probability: 0,
+            sync_completion: RefCell::new(None),
+            queued_io: RefCell::new(Vec::new()),
+            clock: Arc::new(SimulatorClock::new(ChaCha8Rng::seed_from_u64(0), 1, 2)),
+        }
+    }
+
+    #[test]
+    fn drop_does_not_unlock_never_locked_file() {
+        let inner = CountingFile::new();
+        {
+            let _file = simulator_file(inner.clone());
+        }
+        assert_eq!(inner.unlocks.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn drop_does_not_unlock_after_explicit_unlock() {
+        let inner = CountingFile::new();
+        {
+            let file = simulator_file(inner.clone());
+            file.lock_file(true).unwrap();
+            file.unlock_file().unwrap();
+        }
+        assert_eq!(inner.unlocks.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn drop_unlocks_still_locked_file_once() {
+        let inner = CountingFile::new();
+        {
+            let file = simulator_file(inner.clone());
+            file.lock_file(true).unwrap();
+        }
+        assert_eq!(inner.unlocks.load(Ordering::SeqCst), 1);
+    }
+}
