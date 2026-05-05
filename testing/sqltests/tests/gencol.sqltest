@@ -4991,3 +4991,30 @@ expect @js {
     -3000000000000000|-5000000000000000|X'0102'|-8000000000000000|11000000000000000
     ok
 }
+
+# Regression: when an indexed virtual generated column is probed via a join
+# against another table whose value has TEXT affinity, the seek key must be
+# coerced to the indexed column's declared affinity before SeekGE — otherwise
+# `index_seek_affinities` (which inlines the gen-col expression into the
+# IndexColumn's `expr` field but keeps `pos_in_table` valid) falls through
+# to `get_expr_affinity` on the inlined `a + b`, returns Blob, and emits no
+# Affinity op. The text "3" is then compared lexically against the REAL index
+# entry, yielding zero rows.
+test gencol-select-virtual-real-index-join-text {
+    CREATE TABLE t (a INTEGER, b INTEGER, v REAL AS (a + b));
+    CREATE INDEX iv ON t (v);
+    CREATE TABLE u (k TEXT);
+    INSERT INTO t (a, b) VALUES (5000000000000001, 5000000000000002);
+    INSERT INTO t (a, b) VALUES (1, 2);
+    INSERT INTO u VALUES ('3');
+    INSERT INTO u VALUES ('10000000000000004');
+    SELECT u.k, t.v FROM t, u WHERE t.v = u.k ORDER BY u.k;
+}
+expect {
+    10000000000000004|1.0e+16
+    3|3.0
+}
+expect @js {
+    10000000000000004|10000000000000000
+    3|3
+}

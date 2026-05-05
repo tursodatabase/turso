@@ -23,7 +23,7 @@ use super::{
 };
 use crate::{
     emit_explain,
-    schema::{Index, IndexColumn, Table},
+    schema::{Index, IndexColumn, Table, EXPR_INDEX_SENTINEL},
     translate::{
         collate::{get_collseq_from_expr, resolve_comparison_collseq, CollationSeq},
         emitter::{prepare_cdc_if_necessary, HashCtx},

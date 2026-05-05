@@ -16,7 +16,14 @@ fn index_seek_affinities(
         .iter()
         .zip(seek_def.iter(seek_key))
         .map(|(ic, key_component)| {
-            let col_aff = if let Some(ref expr) = ic.expr {
+            // Virtual generated columns: resolve_sorted_columns inlines their
+            // expression into ic.expr while keeping pos_in_table valid, so we
+            // must use the column's declared affinity (which is what the index
+            // actually stores after INSERT/CREATE INDEX coercion). Pure
+            // expression indices (pos_in_table == EXPR_INDEX_SENTINEL) have no
+            // declared affinity and fall back to the inlined expr's affinity.
+            let col_aff = if ic.expr.is_some() && ic.pos_in_table == EXPR_INDEX_SENTINEL {
+                let expr = ic.expr.as_ref().unwrap();
                 crate::translate::expr::get_expr_affinity(expr, Some(tables), None)
             } else {
                 table
