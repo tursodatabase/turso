@@ -1241,6 +1241,42 @@ expect {
     CHERRY
 }
 
+@cross-check-integrity
+test collate_orderby_ordinal_with_explicit_collate {
+    CREATE TABLE t_orderby_ordinal (x TEXT);
+    INSERT INTO t_orderby_ordinal VALUES ('b'), ('Z'), ('c'), ('a');
+    SELECT group_concat(x, '|') FROM (
+        SELECT x FROM t_orderby_ordinal ORDER BY 1 COLLATE NOCASE
+    );
+}
+expect {
+    a|b|c|Z
+}
+
+@cross-check-integrity
+test collate_groupby_ordinal_with_explicit_collate {
+    CREATE TABLE t_groupby_ordinal (x TEXT, v INTEGER);
+    INSERT INTO t_groupby_ordinal VALUES ('b', 2), ('A', 1), ('c', 3), ('a', 4);
+    SELECT count(*) FROM (
+        SELECT x FROM t_groupby_ordinal GROUP BY 1 COLLATE NOCASE
+    );
+}
+expect {
+    3
+}
+
+@cross-check-integrity
+test collate_orderby_parenthesized_ordinal_with_explicit_collate {
+    CREATE TABLE t_orderby_parenthesized_ordinal (x TEXT);
+    INSERT INTO t_orderby_parenthesized_ordinal VALUES ('b'), ('Z'), ('c'), ('a');
+    SELECT group_concat(x, '|') FROM (
+        SELECT x FROM t_orderby_parenthesized_ordinal ORDER BY (1) COLLATE NOCASE
+    );
+}
+expect {
+    a|b|c|Z
+}
+
 # =============================================================================
 # COLLATION PROPAGATION THROUGH CONCAT (||)
 # =============================================================================
