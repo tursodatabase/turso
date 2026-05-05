@@ -5012,21 +5012,66 @@ impl Pager {
         page: PageRef,
         dirty_page_must_exist: bool,
     ) -> Result<(), LimboError> {
-        let mut cache = self.page_cache.write();
         let page_key = PageCacheKey::new(id);
 
         // FIXME: use specific page key for writer instead of max frame, this will make readers not conflict
         if dirty_page_must_exist {
             turso_assert!(page.is_dirty(), "page must be dirty for upsert", { "page_id": id });
         }
-        cache.upsert_page(page_key, page.clone()).map_err(|e| {
-            LimboError::InternalError(format!(
-                "Failed to insert loaded page {id} into cache: {e:?}"
-            ))
-        })?;
-        page.set_loaded();
-        page.clear_wal_tag();
-        Ok(())
+
+        // Fast path: try upsert directly
+        {
+            let mut cache = self.page_cache.write();
+            match cache.upsert_page(page_key, page.clone()) {
+                Ok(()) => {
+                    page.set_loaded();
+                    page.clear_wal_tag();
+                    return Ok(());
+                }
+                Err(CacheError::Full) => {
+                    // Fall through to spill-retry path
+                }
+                Err(e) => {
+                    return Err(LimboError::InternalError(format!(
+                        "Failed to insert loaded page {id} into cache: {e:?}"
+                    )));
+                }
+            }
+        }
+
+        // Spill dirty pages to WAL to make room, then retry once.
+        // Matching the cache_insert pattern — no busy-loop.
+        let spill_io = self.try_spill_dirty_pages()?;
+        let spilled = match spill_io {
+            IOResult::Done(true) => true,
+            IOResult::Done(false) => false,
+            IOResult::IO(IOCompletions::Single(c)) => {
+                self.io.wait_for_completion(c)?;
+                true
+            }
+        };
+
+        if !spilled {
+            return Err(LimboError::InternalError(format!(
+                "Failed to insert loaded page {id} into cache: Full"
+            )));
+        }
+
+        let mut cache = self.page_cache.write();
+        match cache.upsert_page(page_key, page.clone()) {
+            Ok(()) => {
+                page.set_loaded();
+                page.clear_wal_tag();
+                Ok(())
+            }
+            Err(e) => {
+                let msg = format!(
+                    "Failed to insert loaded page {id} into cache: {e:?}"
+                );
+                // Don't retry again — the spill already succeeded.
+                Err(LimboError::InternalError(msg))
+            }
+        }
     }
 
     #[instrument(skip_all, level = Level::DEBUG)]

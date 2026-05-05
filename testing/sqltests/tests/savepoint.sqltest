@@ -452,3 +452,168 @@ expect {
     1|100000
     2|500000
 }
+
+@cross-check-integrity
+test savepoint-rollback-upsert-cache-spill {
+    PRAGMA page_size = 512;
+    PRAGMA cache_size = 4;
+
+    CREATE TABLE t(
+        id INTEGER PRIMARY KEY,
+        u INTEGER UNIQUE,
+        x TEXT
+    );
+    CREATE INDEX t_x ON t(x);
+
+    BEGIN;
+    INSERT INTO t VALUES (1, 1, hex(randomblob(200)));
+    INSERT INTO t VALUES (2, 2, hex(randomblob(200)));
+    INSERT INTO t VALUES (3, 3, hex(randomblob(200)));
+    INSERT INTO t VALUES (4, 4, hex(randomblob(200)));
+    INSERT INTO t VALUES (5, 5, hex(randomblob(200)));
+    COMMIT;
+
+    BEGIN;
+    SAVEPOINT sp1;
+
+    INSERT INTO t(u, x) VALUES (1, hex(randomblob(300)))
+    ON CONFLICT(u) DO UPDATE SET x = excluded.x;
+
+    ROLLBACK TO sp1;
+    RELEASE sp1;
+    COMMIT;
+
+    SELECT count(*) FROM t;
+    SELECT count(*) FROM t WHERE u = 1;
+}
+expect {5
+1
+}
+
+# #6350
+@cross-check-integrity
+test savepoint-rollback-index-text-corruption-6350 {
+    PRAGMA page_size = 512;
+    PRAGMA cache_size = 2;
+
+    CREATE TABLE t(a INTEGER PRIMARY KEY, k1 TEXT NOT NULL, k2 TEXT NOT NULL);
+    CREATE INDEX t_k1 ON t(k1);
+    CREATE INDEX t_k2 ON t(k2);
+
+    INSERT INTO t VALUES
+    (1, hex(randomblob(80)), hex(randomblob(120))),
+    (2, hex(randomblob(80)), hex(randomblob(120))),
+    (3, hex(randomblob(80)), hex(randomblob(120))),
+    (4, hex(randomblob(80)), hex(randomblob(120))),
+    (5, hex(randomblob(80)), hex(randomblob(120))),
+    (6, hex(randomblob(80)), hex(randomblob(120))),
+    (7, hex(randomblob(80)), hex(randomblob(120))),
+    (8, hex(randomblob(80)), hex(randomblob(120))),
+    (9, hex(randomblob(80)), hex(randomblob(120))),
+    (10, hex(randomblob(80)), hex(randomblob(120)));
+
+    SAVEPOINT s1;
+    UPDATE t SET k2 = hex(randomblob(200)) WHERE a BETWEEN 3 AND 7;
+    ROLLBACK TO s1;
+    RELEASE s1;
+
+    SELECT count(*) FROM t;
+}
+expect {10
+}
+
+# #6351
+@cross-check-integrity
+test savepoint-rollback-page-type-zero-6351 {
+    PRAGMA page_size = 512;
+    PRAGMA cache_size = 2;
+
+    CREATE TABLE t(a INTEGER PRIMARY KEY, b INT, p BLOB);
+    CREATE INDEX t_b ON t(b);
+
+    INSERT INTO t VALUES
+    (1, 1, randomblob(400)),
+    (2, 2, randomblob(400)),
+    (3, 3, randomblob(400)),
+    (4, 4, randomblob(400)),
+    (5, 5, randomblob(400));
+
+    SAVEPOINT s1;
+    DELETE FROM t WHERE a BETWEEN 2 AND 3;
+    INSERT INTO t VALUES
+    (6, 6, randomblob(500)),
+    (7, 7, randomblob(500));
+    UPDATE t SET p = randomblob(450) WHERE a = 1;
+    ROLLBACK TO s1;
+    RELEASE s1;
+
+    SELECT count(*) FROM t;
+}
+expect {5
+}
+
+# #6355
+@cross-check-integrity
+test savepoint-rollback-non-tableinterior-6355 {
+    PRAGMA page_size = 512;
+    PRAGMA cache_size = 4;
+
+    CREATE TABLE t(a INTEGER PRIMARY KEY, k TEXT NOT NULL, v TEXT NOT NULL);
+    CREATE INDEX t_k ON t(k);
+
+    INSERT INTO t VALUES
+    (1, hex(randomblob(180)), hex(randomblob(250))),
+    (2, hex(randomblob(180)), hex(randomblob(250))),
+    (3, hex(randomblob(180)), hex(randomblob(250))),
+    (4, hex(randomblob(180)), hex(randomblob(250))),
+    (5, hex(randomblob(180)), hex(randomblob(250))),
+    (6, hex(randomblob(180)), hex(randomblob(250))),
+    (7, hex(randomblob(180)), hex(randomblob(250))),
+    (8, hex(randomblob(180)), hex(randomblob(250)));
+
+    SAVEPOINT s1;
+    UPDATE t SET v = hex(randomblob(350)) WHERE a BETWEEN 2 AND 5;
+    ROLLBACK TO s1;
+    RELEASE s1;
+
+    SELECT count(*) FROM t;
+}
+expect {8
+}
+
+# #6357
+@cross-check-integrity
+test savepoint-rollback-index-oob-6357 {
+    PRAGMA page_size = 512;
+    PRAGMA cache_size = 2;
+
+    CREATE TABLE t(a INTEGER PRIMARY KEY, b TEXT UNIQUE, c TEXT);
+    CREATE INDEX i_c ON t(c);
+
+    INSERT INTO t VALUES
+    (1, hex(randomblob(60)), hex(randomblob(100))),
+    (2, hex(randomblob(60)), hex(randomblob(100))),
+    (3, hex(randomblob(60)), hex(randomblob(100))),
+    (4, hex(randomblob(60)), hex(randomblob(100))),
+    (5, hex(randomblob(60)), hex(randomblob(100))),
+    (6, hex(randomblob(60)), hex(randomblob(100))),
+    (7, hex(randomblob(60)), hex(randomblob(100))),
+    (8, hex(randomblob(60)), hex(randomblob(100))),
+    (9, hex(randomblob(60)), hex(randomblob(100))),
+    (10, hex(randomblob(60)), hex(randomblob(100))),
+    (11, hex(randomblob(60)), hex(randomblob(100))),
+    (12, hex(randomblob(60)), hex(randomblob(100)));
+
+    SAVEPOINT s;
+    DELETE FROM t WHERE a BETWEEN 4 AND 8;
+    INSERT INTO t VALUES
+    (13, hex(randomblob(80)), hex(randomblob(120))),
+    (14, hex(randomblob(80)), hex(randomblob(120))),
+    (15, hex(randomblob(80)), hex(randomblob(120)));
+    ROLLBACK TO s;
+    RELEASE s;
+
+    SELECT count(*) FROM t;
+}
+expect {12
+}
