@@ -371,19 +371,36 @@ impl PageInner {
         }
     }
 
+    /// Read a cell pointer entry with bounds checks so corrupt headers surface as
+    /// `LimboError::Corrupt` instead of panicking on raw slice indexing.
+    #[inline(always)]
+    fn read_cell_pointer(&self, idx: usize) -> crate::Result<usize> {
+        let buf = self.as_ptr();
+        let cell_count = self.cell_count();
+        crate::assert_or_bail_corrupt!(
+            idx < cell_count,
+            "cell index {} out of bounds for page {} with {} cells",
+            idx,
+            self.id,
+            cell_count
+        );
+        let cell_pointer_in_array = self.header_size() + (idx * CELL_PTR_SIZE_BYTES);
+        let absolute_offset = self.offset() + cell_pointer_in_array;
+        crate::assert_or_bail_corrupt!(
+            absolute_offset + CELL_PTR_SIZE_BYTES <= buf.len(),
+            "cell pointer array offset {} out of bounds for page {} with page size {}",
+            absolute_offset,
+            self.id,
+            buf.len()
+        );
+        Ok(u16::from_be_bytes([buf[absolute_offset], buf[absolute_offset + 1]]) as usize)
+    }
+
     #[inline]
     pub fn cell_get(&self, idx: usize, usable_size: usize) -> crate::Result<BTreeCell> {
         tracing::trace!("cell_get(idx={})", idx);
         let buf = self.as_ptr();
-
-        let ncells = self.cell_count();
-        turso_assert_less_than!(idx, ncells,
-            "cell_get: idx out of bounds",
-            {"idx": idx, "ncells": ncells}
-        );
-        let cell_pointer_array_start = self.header_size();
-        let cell_pointer = cell_pointer_array_start + (idx * CELL_PTR_SIZE_BYTES);
-        let cell_pointer = self.read_u16(cell_pointer) as usize;
+        let cell_pointer = self.read_cell_pointer(idx)?;
 
         let static_buf: &'static [u8] = unsafe { std::mem::transmute::<&[u8], &'static [u8]>(buf) };
         read_btree_cell(static_buf, self, cell_pointer, usable_size)
@@ -393,9 +410,7 @@ impl PageInner {
     pub fn cell_table_interior_read_rowid(&self, idx: usize) -> crate::Result<i64> {
         turso_debug_assert!(matches!(self.page_type(), Ok(PageType::TableInterior)));
         let buf = self.as_ptr();
-        let cell_pointer_array_start = self.header_size();
-        let cell_pointer = cell_pointer_array_start + (idx * CELL_PTR_SIZE_BYTES);
-        let cell_pointer = self.read_u16(cell_pointer) as usize;
+        let cell_pointer = self.read_cell_pointer(idx)?;
         const LEFT_CHILD_PAGE_SIZE_BYTES: usize = 4;
         let (rowid, _) = read_varint(crate::slice_in_bounds_or_corrupt!(
             buf,
@@ -411,9 +426,7 @@ impl PageInner {
             Ok(PageType::TableInterior) | Ok(PageType::IndexInterior)
         ));
         let buf = self.as_ptr();
-        let cell_pointer_array_start = self.header_size();
-        let cell_pointer = cell_pointer_array_start + (idx * CELL_PTR_SIZE_BYTES);
-        let cell_pointer = self.read_u16(cell_pointer) as usize;
+        let cell_pointer = self.read_cell_pointer(idx)?;
         crate::assert_or_bail_corrupt!(
             cell_pointer + 4 <= buf.len(),
             "cell pointer {} out of bounds for page size {}",
@@ -432,9 +445,7 @@ impl PageInner {
     pub fn cell_table_leaf_read_rowid(&self, idx: usize) -> crate::Result<i64> {
         turso_debug_assert!(matches!(self.page_type(), Ok(PageType::TableLeaf)));
         let buf = self.as_ptr();
-        let cell_pointer_array_start = self.header_size();
-        let cell_pointer = cell_pointer_array_start + (idx * CELL_PTR_SIZE_BYTES);
-        let cell_pointer = self.read_u16(cell_pointer) as usize;
+        let cell_pointer = self.read_cell_pointer(idx)?;
         let mut pos = cell_pointer;
         let (_, nr) = read_varint(crate::slice_in_bounds_or_corrupt!(buf, pos..))?;
         pos += nr;
@@ -455,25 +466,7 @@ impl PageInner {
         usable_size: usize,
     ) -> crate::Result<(&'static [u8], u64, Option<u32>)> {
         let buf = self.as_ptr();
-        let cell_count = self.cell_count();
-        crate::assert_or_bail_corrupt!(
-            idx < cell_count,
-            "cell index {} out of bounds for index page {} with {} cells",
-            idx,
-            self.id,
-            cell_count
-        );
-        let cell_pointer_array_start = self.header_size();
-        let cell_pointer = cell_pointer_array_start + (idx * CELL_PTR_SIZE_BYTES);
-        crate::assert_or_bail_corrupt!(
-            cell_pointer + CELL_PTR_SIZE_BYTES <= buf.len(),
-            "cell pointer offset {} out of bounds for index page {} with {} cells and page size {}",
-            cell_pointer,
-            self.id,
-            cell_count,
-            buf.len()
-        );
-        let cell_offset = self.read_u16(cell_pointer) as usize;
+        let cell_offset = self.read_cell_pointer(idx)?;
 
         let page_type = self.page_type()?;
         let (payload_size, varint_len, header_skip) = match page_type {
@@ -5479,9 +5472,13 @@ pub(crate) mod ptrmap {
 mod tests {
     use crate::sync::Arc;
 
+    use crate::error::LimboError;
+    use crate::io::Buffer;
     use crate::sync::RwLock;
 
+    use crate::storage::btree::offset::BTREE_CELL_COUNT;
     use crate::storage::page_cache::{PageCache, PageCacheKey};
+    use crate::storage::sqlite3_ondisk::PageType;
 
     use super::Page;
 
@@ -5506,6 +5503,54 @@ mod tests {
         let page_key = PageCacheKey::new(1);
         let page = cache.get(&page_key).unwrap();
         assert_eq!(page.unwrap().get().id, 1);
+    }
+
+    // Create a synthetic page with no cells and a valid header.
+    // Tests can optionally corrupt fields (like cell_count) to exercise error paths.
+    fn make_empty_page(page_type: PageType, page_size: usize) -> Arc<Page> {
+        let page = Arc::new(Page::new(2));
+        {
+            let inner = page.get();
+            inner.buffer = Some(Arc::new(Buffer::new_temporary(page_size)));
+        }
+        page.set_loaded();
+        let contents = page.get_contents();
+        contents.write_page_type(page_type as u8);
+        contents.write_first_freeblock(0);
+        contents.write_cell_count(0);
+        contents.write_cell_content_area(page_size);
+        contents.write_fragmented_bytes_count(0);
+        if matches!(page_type, PageType::TableInterior | PageType::IndexInterior) {
+            contents.write_rightmost_ptr(0);
+        }
+        page
+    }
+
+    // Exercises the `idx < cell_count` guard:
+    // page has 0 cells, asking for cell 0 should return Corrupt.
+    #[test]
+    fn cell_index_read_payload_ptr_rejects_index_past_cell_count() {
+        let index_leaf = make_empty_page(PageType::IndexLeaf, 512);
+        let contents = index_leaf.get_contents();
+
+        let err = contents.cell_index_read_payload_ptr(0, 504).unwrap_err();
+        assert!(matches!(err, LimboError::Corrupt(_)), "got {err:?}");
+    }
+
+    // Exercises the `absolute_offset + 2 <= page.len()` guard:
+    // corrupt cell_count passes the first check, but the pointer-array slot is past the page buffer.
+    #[test]
+    fn cell_index_read_payload_ptr_rejects_pointer_entry_past_page_end() {
+        let index_leaf = make_empty_page(PageType::IndexLeaf, 512);
+        index_leaf
+            .get_contents()
+            .write_u16(BTREE_CELL_COUNT, 19_500);
+        let contents = index_leaf.get_contents();
+
+        let err = contents
+            .cell_index_read_payload_ptr(19_485, 504)
+            .unwrap_err();
+        assert!(matches!(err, LimboError::Corrupt(_)), "got {err:?}");
     }
 }
 
