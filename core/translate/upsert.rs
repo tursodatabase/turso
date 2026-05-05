@@ -6,7 +6,7 @@ use turso_parser::ast::{self, TriggerEvent, TriggerTime, Upsert};
 
 use super::emitter::gencol::compute_virtual_columns;
 use crate::error::SQLITE_CONSTRAINT_PRIMARYKEY;
-use crate::schema::{BTreeTable, ColumnLayout, IndexColumn, ROWID_SENTINEL};
+use crate::schema::{BTreeTable, ColumnLayout, IndexColumn, EXPR_INDEX_SENTINEL, ROWID_SENTINEL};
 use crate::translate::emitter::{emit_check_constraints, emit_make_record, UpdateRowSource};
 use crate::translate::expr::{walk_expr, WalkControl};
 use crate::translate::fkeys::{
@@ -1434,6 +1434,20 @@ fn emit_upsert_expr_index_value(
         &bt,
         dest_reg,
     )?;
+    // Virtual generated columns: resolve_sorted_columns inlines their
+    // expression into IndexColumn.expr but keeps pos_in_table valid (only
+    // pure expression indexes use EXPR_INDEX_SENTINEL). The index entry was
+    // populated with the column's declared affinity at INSERT/CREATE INDEX
+    // time, so probes built here (IdxDelete OLD on the conflict victim,
+    // NoConflict on rebuild) must apply the same coercion — otherwise e.g.
+    // `REAL AS (int_expr)` builds an Integer key that fails to match the
+    // Float index entry once |value| > 2^53.
+    if idx_col.pos_in_table != EXPR_INDEX_SENTINEL {
+        let column = &columns[idx_col.pos_in_table];
+        if column.is_virtual_generated() {
+            program.emit_column_affinity(dest_reg, column.affinity());
+        }
+    }
     Ok(())
 }
 

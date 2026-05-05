@@ -4957,3 +4957,37 @@ expect @js {
     -2929861166669336|-5586410532100113|X'0303'|-8516271698769449|11446132865438800
     ok
 }
+
+# Regression: UPSERT (INSERT ... ON CONFLICT DO UPDATE) rebuilds OLD/NEW index
+# keys via its own helper that bypassed `emit_index_column_value_old_image` /
+# `emit_index_column_value_for_insert`. Virtual generated columns declared
+# with a non-matching affinity (e.g. `REAL AS (int_expr)`) need the same
+# affinity-coerce-before-store/probe rule there too. Without this, the IdxDelete
+# of the conflict victim's OLD key built an Integer probe that did not match
+# the Float entry stored in the index, leaving the index entry behind and
+# producing "wrong # of entries in index" on integrity_check once the value
+# exceeded 2^53.
+@cross-check-integrity
+test gencol-upsert-do-update-real-affinity-applied-to-index {
+    CREATE TABLE t (
+        a INTEGER,
+        b INTEGER,
+        c BLOB UNIQUE,
+        v1 INTEGER AS (a + b),
+        v2 REAL AS (-a - v1)
+    );
+    CREATE INDEX i ON t (c, v1, v2);
+    INSERT INTO t (a, b, c) VALUES (-2929861166669336, -5586410532100113, X'0102');
+    INSERT INTO t (a, b, c) VALUES (1, 2, X'0102')
+        ON CONFLICT(c) DO UPDATE SET a = -3000000000000000, b = -5000000000000000;
+    SELECT a, b, quote(c), v1, v2 FROM t INDEXED BY i;
+    PRAGMA integrity_check;
+}
+expect {
+    -3000000000000000|-5000000000000000|X'0102'|-8000000000000000|1.1e+16
+    ok
+}
+expect @js {
+    -3000000000000000|-5000000000000000|X'0102'|-8000000000000000|11000000000000000
+    ok
+}
