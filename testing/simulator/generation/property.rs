@@ -1327,18 +1327,26 @@ fn random_main_table_insert<R: rand::Rng + ?Sized>(
     const UNIQUE_BASE_OFFSET_RANGE: std::ops::Range<i64> = 3_000_000_000..4_000_000_000;
     const UNIQUE_COL_STRIDE: i64 = 10_000_000;
 
+    // Generated columns are computed and cannot be inserted into.
+    let non_generated_columns: Vec<(usize, &Column)> = table
+        .columns
+        .iter()
+        .enumerate()
+        .filter(|(_, c)| !c.is_generated())
+        .collect();
+    let has_generated = non_generated_columns.len() < table.columns.len();
+
     let num_rows = rng.random_range(1..=5);
     let base_offset: i64 = rng.random_range(UNIQUE_BASE_OFFSET_RANGE);
-    let values = (0..num_rows)
+    let values: Vec<Vec<SimValue>> = (0..num_rows)
         .map(|row_idx| {
-            table
-                .columns
+            non_generated_columns
                 .iter()
                 .enumerate()
-                .map(|(col_idx, column)| {
+                .map(|(ng_idx, (_, column))| {
                     if column.has_unique_or_pk() {
                         let offset =
-                            base_offset + (col_idx as i64 * UNIQUE_COL_STRIDE) + row_idx as i64;
+                            base_offset + (ng_idx as i64 * UNIQUE_COL_STRIDE) + row_idx as i64;
                         SimValue::unique_for_type(&column.column_type, offset)
                     } else {
                         SimValue::arbitrary_from(rng, ctx, &column.column_type)
@@ -1348,11 +1356,22 @@ fn random_main_table_insert<R: rand::Rng + ?Sized>(
         })
         .collect();
 
-    Query::Insert(Insert::Values {
-        table: table.name.clone(),
-        values,
-        on_conflict: None,
-    })
+    if has_generated {
+        Query::Insert(Insert::ValuesWithColumns {
+            table: table.name.clone(),
+            columns: non_generated_columns
+                .iter()
+                .map(|(_, c)| c.name.clone())
+                .collect(),
+            values,
+        })
+    } else {
+        Query::Insert(Insert::Values {
+            table: table.name.clone(),
+            values,
+            on_conflict: None,
+        })
+    }
 }
 
 fn random_main_table_update<R: rand::Rng + ?Sized>(
@@ -1361,18 +1380,21 @@ fn random_main_table_update<R: rand::Rng + ?Sized>(
     table: &Table,
 ) -> Query {
     let update_opts = &ctx.opts().query.update;
+    // Generated columns cannot be the target of an UPDATE.
     let unique_columns = table
         .columns
         .iter()
         .enumerate()
         .filter(|(_, column)| {
-            column.has_unique_or_pk() && !matches!(column.column_type, ColumnType::Blob)
+            column.has_unique_or_pk()
+                && !column.is_generated()
+                && !matches!(column.column_type, ColumnType::Blob)
         })
         .collect::<Vec<_>>();
     let non_unique_columns = table
         .columns
         .iter()
-        .filter(|column| !column.has_unique_or_pk())
+        .filter(|column| !column.has_unique_or_pk() && !column.is_generated())
         .collect::<Vec<_>>();
 
     let last_row_idx = table.rows.len().saturating_sub(1);
@@ -1422,8 +1444,10 @@ fn random_main_table_update<R: rand::Rng + ?Sized>(
         });
     }
 
+    let updatable_columns: Vec<&Column> =
+        table.columns.iter().filter(|c| !c.is_generated()).collect();
     let column = if non_unique_columns.is_empty() {
-        pick(&table.columns, rng)
+        *pick(&updatable_columns, rng)
     } else {
         *pick(&non_unique_columns, rng)
     };
