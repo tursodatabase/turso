@@ -27,11 +27,12 @@ use crate::translate::plan::{
     UnionBranchPrePostFilters, WhereTerm,
 };
 use crate::translate::planner::{table_mask_from_expr, TableMask};
-use rustc_hash::FxHashMap as HashMap;
 use smallvec::SmallVec;
-use std::{collections::VecDeque, sync::Arc};
+use std::sync::Arc;
 use turso_macros::turso_assert_eq;
 use turso_parser::ast::{self, TableInternalId};
+
+use super::AvailableIndexes;
 
 #[derive(Debug, Clone)]
 /// Parameters for a single branch of a multi-index scan.
@@ -147,7 +148,7 @@ fn get_table_local_constraints_for_branch(
     from_outer_join: Option<TableInternalId>,
     table_reference: &JoinedTable,
     table_references: &TableReferences,
-    available_indexes: &HashMap<String, VecDeque<Arc<Index>>>,
+    available_indexes: &AvailableIndexes,
     subqueries: &[NonFromClauseSubquery],
     schema: &Schema,
     params: &CostModelParams,
@@ -330,7 +331,7 @@ fn choose_multi_index_branch_access(
     lhs_mask: &TableMask,
     rhs_idx: usize,
     schema: &Schema,
-    available_indexes: &HashMap<String, VecDeque<Arc<Index>>>,
+    available_indexes: &AvailableIndexes,
     base_row_count: RowCountEstimate,
     analyze_stats: &AnalyzeStats,
     params: &CostModelParams,
@@ -509,7 +510,7 @@ fn estimate_residual_expr_selectivity(
     expr: &ast::Expr,
     rhs_table: &JoinedTable,
     table_references: &TableReferences,
-    available_indexes: &HashMap<String, VecDeque<Arc<Index>>>,
+    available_indexes: &AvailableIndexes,
     subqueries: &[NonFromClauseSubquery],
     schema: &Schema,
     params: &CostModelParams,
@@ -604,7 +605,7 @@ fn estimate_multi_or_residual_selectivity(
     residual_exprs: &[ast::Expr],
     rhs_table: &JoinedTable,
     table_references: &TableReferences,
-    available_indexes: &HashMap<String, VecDeque<Arc<Index>>>,
+    available_indexes: &AvailableIndexes,
     subqueries: &[NonFromClauseSubquery],
     schema: &Schema,
     params: &CostModelParams,
@@ -635,7 +636,7 @@ fn evaluate_multi_index_branches(
     where_term_idx: usize,
     rhs_table: &JoinedTable,
     table_references: &TableReferences,
-    available_indexes: &HashMap<String, VecDeque<Arc<Index>>>,
+    available_indexes: &AvailableIndexes,
     subqueries: &[NonFromClauseSubquery],
     schema: &Schema,
     base_row_count: RowCountEstimate,
@@ -758,15 +759,14 @@ fn evaluate_multi_index_branches(
 fn analyze_and_terms_for_multi_index(
     table_reference: &JoinedTable,
     where_clause: &[WhereTerm],
-    available_indexes: &HashMap<String, VecDeque<Arc<Index>>>,
+    available_indexes: &AvailableIndexes,
     table_references: &TableReferences,
     subqueries: &[NonFromClauseSubquery],
     schema: &Schema,
     params: &CostModelParams,
 ) -> Option<AndClauseDecomposition> {
     let table_id = table_reference.internal_id;
-    let table_name = table_reference.table.get_name();
-    let indexes = available_indexes.get(table_name);
+    let indexes = available_indexes.get(table_reference);
     let rowid_alias_column = table_reference
         .columns()
         .iter()
@@ -905,7 +905,7 @@ fn analyze_and_terms_for_multi_index(
 pub fn consider_multi_index_union(
     rhs_table: &JoinedTable,
     where_clause: &[WhereTerm],
-    available_indexes: &HashMap<String, VecDeque<Arc<Index>>>,
+    available_indexes: &AvailableIndexes,
     table_references: &TableReferences,
     subqueries: &[NonFromClauseSubquery],
     schema: &Schema,
@@ -1035,7 +1035,7 @@ pub fn consider_multi_index_union(
 pub fn consider_multi_index_intersection(
     rhs_table: &JoinedTable,
     where_clause: &[WhereTerm],
-    available_indexes: &HashMap<String, VecDeque<Arc<Index>>>,
+    available_indexes: &AvailableIndexes,
     table_references: &TableReferences,
     subqueries: &[NonFromClauseSubquery],
     schema: &Schema,
@@ -1151,6 +1151,7 @@ mod tests {
                 access_method::AccessMethodParams,
                 cost::{Cost, RowCountEstimate},
                 cost_params::DEFAULT_PARAMS,
+                AvailableIndexes,
             },
             plan::{
                 ColumnUsedMask, JoinInfo, JoinType, JoinedTable, Operation, TableReferences,
@@ -1161,7 +1162,6 @@ mod tests {
         vdbe::builder::TableRefIdCounter,
         MAIN_DB_ID,
     };
-    use rustc_hash::FxHashMap as HashMap;
     use std::{collections::VecDeque, sync::Arc};
     use turso_parser::ast::{self, Expr, Operator, SortOrder, TableInternalId};
 
@@ -1311,9 +1311,9 @@ mod tests {
         const ITEM: usize = 1;
         const META: usize = 2;
 
-        let mut available_indexes = HashMap::default();
+        let mut available_indexes = AvailableIndexes::default();
         available_indexes.insert(
-            "item".to_string(),
+            joined_tables[ITEM].internal_id,
             VecDeque::from([Arc::new(Index {
                 name: "idx_item_id".to_string(),
                 table_name: "item".to_string(),
@@ -1460,9 +1460,9 @@ mod tests {
         let joined_tables = vec![create_table_reference(item, None, table_id_counter.next())];
         let item_id = joined_tables[0].internal_id;
 
-        let mut available_indexes = HashMap::default();
+        let mut available_indexes = AvailableIndexes::default();
         available_indexes.insert(
-            "item".to_string(),
+            joined_tables[0].internal_id,
             VecDeque::from([Arc::new(Index {
                 name: "idx_item_a".to_string(),
                 table_name: "item".to_string(),
@@ -1573,9 +1573,9 @@ mod tests {
         const LINK: usize = 0;
         const ITEM: usize = 1;
 
-        let mut available_indexes = HashMap::default();
+        let mut available_indexes = AvailableIndexes::default();
         available_indexes.insert(
-            "item".to_string(),
+            joined_tables[ITEM].internal_id,
             VecDeque::from([Arc::new(Index {
                 name: "idx_item_id_kind".to_string(),
                 table_name: "item".to_string(),
@@ -1769,9 +1769,9 @@ mod tests {
         let link_id = joined_tables[LINK].internal_id;
         let item_id = joined_tables[ITEM].internal_id;
 
-        let mut available_indexes = HashMap::default();
+        let mut available_indexes = AvailableIndexes::default();
         available_indexes.insert(
-            "item".to_string(),
+            joined_tables[ITEM].internal_id,
             VecDeque::from([Arc::new(Index {
                 name: "idx_item_id".to_string(),
                 table_name: "item".to_string(),

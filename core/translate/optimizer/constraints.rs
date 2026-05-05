@@ -12,12 +12,11 @@ use crate::{
     Result,
 };
 use crate::{turso_assert, turso_debug_assert};
-use rustc_hash::FxHashMap as HashMap;
 use std::{cmp::Ordering, collections::VecDeque, sync::Arc};
 use turso_ext::{ConstraintInfo, ConstraintOp};
 use turso_parser::ast::{self, SortOrder, TableInternalId};
 
-use super::cost_params::CostModelParams;
+use super::{cost_params::CostModelParams, AvailableIndexes};
 
 /// Represents a single condition derived from a `WHERE` clause term
 /// that constrains a specific column of a table.
@@ -250,7 +249,7 @@ fn estimate_selectivity(
     table_name: &str,
     column: Option<&Column>,
     column_pos: Option<usize>,
-    available_indexes: &HashMap<String, VecDeque<Arc<Index>>>,
+    available_indexes: Option<&VecDeque<Arc<Index>>>,
     op: ConstraintOperator,
     params: &CostModelParams,
     is_rowid: bool,
@@ -275,7 +274,7 @@ fn estimate_selectivity(
                 selectivity_when_unique
             } else if let Some(col_pos) = column_pos {
                 // For non-unique columns, find an index containing this column and use its stats
-                if let Some(indexes) = available_indexes.get(table_name) {
+                if let Some(indexes) = available_indexes {
                     for index in indexes {
                         // Check if this index has our column as its first column
                         // (selectivity is most accurate when column is leftmost in index)
@@ -339,7 +338,7 @@ fn estimate_constraint_selectivity(
     column: Option<&Column>,
     column_pos: Option<usize>,
     operator: ConstraintOperator,
-    available_indexes: &HashMap<String, VecDeque<Arc<Index>>>,
+    available_indexes: &AvailableIndexes,
     params: &CostModelParams,
     is_rowid: bool,
 ) -> f64 {
@@ -348,7 +347,7 @@ fn estimate_constraint_selectivity(
         table_reference.table.get_name(),
         column,
         column_pos,
-        available_indexes,
+        available_indexes.get(table_reference),
         operator,
         params,
         is_rowid,
@@ -379,7 +378,7 @@ fn expression_matches_table(
 pub fn constraints_from_where_clause(
     where_clause: &[WhereTerm],
     table_references: &TableReferences,
-    available_indexes: &HashMap<String, VecDeque<Arc<Index>>>,
+    available_indexes: &AvailableIndexes,
     subqueries: &[NonFromClauseSubquery],
     schema: &Schema,
     params: &CostModelParams,
@@ -397,7 +396,7 @@ pub fn constraints_from_where_clause(
             table_id: table_reference.internal_id,
             constraints: Vec::new(),
             candidates: available_indexes
-                .get(table_reference.table.get_name())
+                .get(table_reference)
                 .map_or(Vec::new(), |indexes| {
                     indexes
                         .iter()
@@ -802,9 +801,11 @@ pub fn constraints_from_where_clause(
                     sort_order: SortOrder::Asc,
                 });
             }
-            for index in available_indexes
-                .get(table_reference.table.get_name())
-                .unwrap_or(&VecDeque::new())
+            let empty_indexes = VecDeque::new();
+            let table_indexes = available_indexes
+                .get(table_reference)
+                .unwrap_or(&empty_indexes);
+            for index in table_indexes
                 .iter()
                 .filter(|idx| idx.index_method.is_none())
             {
@@ -1261,7 +1262,7 @@ pub fn estimate_partial_index_where_selectivity(
     where_expr: &ast::Expr,
     table_reference: &JoinedTable,
     schema: &Schema,
-    available_indexes: &HashMap<String, VecDeque<Arc<Index>>>,
+    available_indexes: &AvailableIndexes,
     params: &CostModelParams,
 ) -> f64 {
     let mut bound = where_expr.clone();
@@ -1273,7 +1274,7 @@ fn estimate_bound_expr_selectivity(
     expr: &ast::Expr,
     table_reference: &JoinedTable,
     schema: &Schema,
-    available_indexes: &HashMap<String, VecDeque<Arc<Index>>>,
+    available_indexes: &AvailableIndexes,
     params: &CostModelParams,
 ) -> f64 {
     use ast::Expr;
@@ -1627,7 +1628,7 @@ pub(crate) fn analyze_binary_term_for_index(
     table_reference: &JoinedTable,
     indexes: Option<&VecDeque<Arc<Index>>>,
     rowid_alias_column: Option<usize>,
-    available_indexes: &HashMap<String, VecDeque<Arc<Index>>>,
+    available_indexes: &AvailableIndexes,
     table_references: &TableReferences,
     subqueries: &[NonFromClauseSubquery],
     schema: &Schema,

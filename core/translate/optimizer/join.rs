@@ -1,6 +1,3 @@
-use std::collections::VecDeque;
-use std::sync::Arc;
-
 use crate::{turso_assert_eq, turso_assert_greater_than};
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 
@@ -13,10 +10,10 @@ use super::{
     constraints::TableConstraints,
     cost_params::CostModelParams,
     order::OrderTarget,
-    IndexMethodCandidate,
+    AvailableIndexes, IndexMethodCandidate,
 };
 use crate::{
-    schema::{Index, Schema},
+    schema::Schema,
     stats::AnalyzeStats,
     translate::{
         expr::{walk_expr, WalkControl},
@@ -164,7 +161,7 @@ pub fn join_lhs_and_rhs<'a>(
     index_method_candidates: &[IndexMethodCandidate],
     params: &CostModelParams,
     analyze_stats: &AnalyzeStats,
-    available_indexes: &HashMap<String, VecDeque<Arc<Index>>>,
+    available_indexes: &AvailableIndexes,
     table_references: &TableReferences,
     schema: &Schema,
 ) -> Result<Option<JoinN>> {
@@ -892,7 +889,7 @@ pub fn compute_best_join_order<'a>(
     index_method_candidates: &[IndexMethodCandidate],
     params: &CostModelParams,
     analyze_stats: &AnalyzeStats,
-    available_indexes: &HashMap<String, VecDeque<Arc<Index>>>,
+    available_indexes: &AvailableIndexes,
     table_references: &TableReferences,
     schema: &Schema,
 ) -> Result<Option<BestJoinOrderResult>> {
@@ -930,7 +927,7 @@ pub(crate) fn compute_best_join_order_with_context<'a>(
     index_method_candidates: &[IndexMethodCandidate],
     params: &CostModelParams,
     analyze_stats: &AnalyzeStats,
-    available_indexes: &HashMap<String, VecDeque<Arc<Index>>>,
+    available_indexes: &AvailableIndexes,
     table_references: &TableReferences,
     schema: &Schema,
 ) -> Result<Option<BestJoinOrderResult>> {
@@ -1364,7 +1361,7 @@ pub fn compute_greedy_join_order<'a>(
     index_method_candidates: &[IndexMethodCandidate],
     params: &CostModelParams,
     analyze_stats: &AnalyzeStats,
-    available_indexes: &HashMap<String, VecDeque<Arc<Index>>>,
+    available_indexes: &AvailableIndexes,
     table_references: &TableReferences,
     schema: &Schema,
 ) -> Result<Option<BestJoinOrderResult>> {
@@ -1624,7 +1621,7 @@ pub fn compute_naive_left_deep_plan<'a>(
     index_method_candidates: &[IndexMethodCandidate],
     params: &CostModelParams,
     analyze_stats: &AnalyzeStats,
-    available_indexes: &HashMap<String, VecDeque<Arc<Index>>>,
+    available_indexes: &AvailableIndexes,
     table_references: &TableReferences,
     schema: &Schema,
 ) -> Result<Option<JoinN>> {
@@ -1831,7 +1828,7 @@ mod tests {
     /// Test that [compute_best_join_order] returns None when there are no table references.
     fn test_compute_best_join_order_empty() {
         let table_references = TableReferences::new(vec![], vec![]);
-        let available_indexes = HashMap::default();
+        let available_indexes = AvailableIndexes::default();
         let mut where_clause = vec![];
 
         let mut access_methods_arena = Vec::new();
@@ -1874,7 +1871,7 @@ mod tests {
         let mut table_id_counter = TableRefIdCounter::new();
         let joined_tables = vec![_create_table_reference(t1, None, table_id_counter.next())];
         let table_references = TableReferences::new(joined_tables, vec![]);
-        let available_indexes = HashMap::default();
+        let available_indexes = AvailableIndexes::default();
         let mut where_clause = vec![];
 
         let mut access_methods_arena = Vec::new();
@@ -1932,7 +1929,7 @@ mod tests {
 
         let table_references = TableReferences::new(joined_tables, vec![]);
         let mut access_methods_arena = Vec::new();
-        let available_indexes = HashMap::default();
+        let available_indexes = AvailableIndexes::default();
         let table_constraints = constraints_from_where_clause(
             &where_clause,
             &table_references,
@@ -1996,9 +1993,10 @@ mod tests {
             _create_numeric_literal("42"),
         )];
 
+        let table_id = joined_tables[0].internal_id;
         let table_references = TableReferences::new(joined_tables, vec![]);
         let mut access_methods_arena = Vec::new();
-        let mut available_indexes = HashMap::default();
+        let mut available_indexes = AvailableIndexes::default();
         let index = Arc::new(Index {
             name: "sqlite_autoindex_test_table_1".to_string(),
             table_name: "test_table".to_string(),
@@ -2018,7 +2016,7 @@ mod tests {
             index_method: None,
             on_conflict: None,
         });
-        available_indexes.insert("test_table".to_string(), VecDeque::from([index]));
+        available_indexes.insert(table_id, VecDeque::from([index]));
 
         let table_constraints = constraints_from_where_clause(
             &where_clause,
@@ -2090,7 +2088,7 @@ mod tests {
         const TABLE1: usize = 0;
         const TABLE2: usize = 1;
 
-        let mut available_indexes = HashMap::default();
+        let mut available_indexes = AvailableIndexes::default();
         // Index on the outer table (table1)
         let index1 = Arc::new(Index {
             name: "index1".to_string(),
@@ -2111,7 +2109,7 @@ mod tests {
             index_method: None,
             on_conflict: None,
         });
-        available_indexes.insert("table1".to_string(), VecDeque::from([index1]));
+        available_indexes.insert(joined_tables[TABLE1].internal_id, VecDeque::from([index1]));
 
         // SELECT * FROM table1 JOIN table2 WHERE table1.id = table2.id
         // expecting table2 to be chosen first due to the index on table1.id
@@ -2228,33 +2226,64 @@ mod tests {
         const TABLE_NO_CUSTOMERS: usize = 1;
         const TABLE_NO_ORDER_ITEMS: usize = 2;
 
-        let mut available_indexes = HashMap::default();
-        ["orders", "customers", "order_items"]
-            .iter()
-            .for_each(|table_name| {
-                // add primary key index called sqlite_autoindex_<tablename>_1
-                let index_name = format!("sqlite_autoindex_{table_name}_1");
-                let index = Arc::new(Index {
-                    name: index_name,
-                    where_clause: None,
-                    table_name: table_name.to_string(),
-                    columns: vec![IndexColumn {
-                        name: "id".to_string(),
-                        order: SortOrder::Asc,
-                        pos_in_table: 0,
-                        collation: None,
-                        default: None,
-                        expr: None,
-                    }],
-                    unique: true,
-                    ephemeral: false,
-                    root_page: 1,
-                    has_rowid: true,
-                    index_method: None,
-                    on_conflict: None,
-                });
-                available_indexes.insert(table_name.to_string(), VecDeque::from([index]));
-            });
+        let mut available_indexes = AvailableIndexes::default();
+        let orders_pk = Arc::new(Index {
+            name: "sqlite_autoindex_orders_1".to_string(),
+            where_clause: None,
+            table_name: "orders".to_string(),
+            columns: vec![IndexColumn {
+                name: "id".to_string(),
+                order: SortOrder::Asc,
+                pos_in_table: 0,
+                collation: None,
+                default: None,
+                expr: None,
+            }],
+            unique: true,
+            ephemeral: false,
+            root_page: 1,
+            has_rowid: true,
+            index_method: None,
+            on_conflict: None,
+        });
+        let customers_pk = Arc::new(Index {
+            name: "sqlite_autoindex_customers_1".to_string(),
+            where_clause: None,
+            table_name: "customers".to_string(),
+            columns: vec![IndexColumn {
+                name: "id".to_string(),
+                order: SortOrder::Asc,
+                pos_in_table: 0,
+                collation: None,
+                default: None,
+                expr: None,
+            }],
+            unique: true,
+            ephemeral: false,
+            root_page: 1,
+            has_rowid: true,
+            index_method: None,
+            on_conflict: None,
+        });
+        let order_items_pk = Arc::new(Index {
+            name: "sqlite_autoindex_order_items_1".to_string(),
+            where_clause: None,
+            table_name: "order_items".to_string(),
+            columns: vec![IndexColumn {
+                name: "id".to_string(),
+                order: SortOrder::Asc,
+                pos_in_table: 0,
+                collation: None,
+                default: None,
+                expr: None,
+            }],
+            unique: true,
+            ephemeral: false,
+            root_page: 1,
+            has_rowid: true,
+            index_method: None,
+            on_conflict: None,
+        });
         let customer_id_idx = Arc::new(Index {
             name: "orders_customer_id_idx".to_string(),
             table_name: "orders".to_string(),
@@ -2294,12 +2323,21 @@ mod tests {
             on_conflict: None,
         });
 
-        available_indexes
-            .entry("orders".to_string())
-            .and_modify(|v| v.push_front(customer_id_idx));
-        available_indexes
-            .entry("order_items".to_string())
-            .and_modify(|v| v.push_front(order_id_idx));
+        let mut orders_indexes = VecDeque::from([orders_pk]);
+        orders_indexes.push_front(customer_id_idx);
+        available_indexes.insert(joined_tables[TABLE_NO_ORDERS].internal_id, orders_indexes);
+
+        available_indexes.insert(
+            joined_tables[TABLE_NO_CUSTOMERS].internal_id,
+            VecDeque::from([customers_pk]),
+        );
+
+        let mut order_items_indexes = VecDeque::from([order_items_pk]);
+        order_items_indexes.push_front(order_id_idx);
+        available_indexes.insert(
+            joined_tables[TABLE_NO_ORDER_ITEMS].internal_id,
+            order_items_indexes,
+        );
 
         // SELECT * FROM orders JOIN customers JOIN order_items
         // WHERE orders.customer_id = customers.id AND orders.id = order_items.order_id AND customers.id = 42
@@ -2456,7 +2494,7 @@ mod tests {
         ];
 
         let table_references = TableReferences::new(joined_tables, vec![]);
-        let available_indexes = HashMap::default();
+        let available_indexes = AvailableIndexes::default();
         let mut access_methods_arena = Vec::new();
         let table_constraints = constraints_from_where_clause(
             &where_clause,
@@ -2583,7 +2621,7 @@ mod tests {
 
         let table_references = TableReferences::new(joined_tables, vec![]);
         let mut access_methods_arena = Vec::new();
-        let available_indexes = HashMap::default();
+        let available_indexes = AvailableIndexes::default();
         let table_constraints = constraints_from_where_clause(
             &where_clause,
             &table_references,
@@ -2663,7 +2701,7 @@ mod tests {
             tables.push(_create_btree_table(&format!("t{}", i + 1), columns));
         }
 
-        let available_indexes = HashMap::default();
+        let available_indexes = AvailableIndexes::default();
 
         let mut table_id_counter = TableRefIdCounter::new();
         // Create table references
@@ -2798,14 +2836,14 @@ mod tests {
             on_conflict: None,
         });
 
-        let mut available_indexes = HashMap::default();
-        available_indexes.insert("t1".to_string(), VecDeque::from([index]));
+        let mut available_indexes = AvailableIndexes::default();
+        let table_id = table_id_counter.next();
 
         let table = Table::BTree(table);
         joined_tables.push(JoinedTable {
             op: Operation::default_scan_for(&table),
             table,
-            internal_id: table_id_counter.next(),
+            internal_id: table_id,
             identifier: "t1".to_string(),
             join_info: None,
             col_used_mask: ColumnUsedMask::default(),
@@ -2814,6 +2852,7 @@ mod tests {
             database_id: MAIN_DB_ID,
             indexed: None,
         });
+        available_indexes.insert(table_id, VecDeque::from([index]));
 
         // Create where clause that only references second column
         let mut where_clause = vec![WhereTerm {
@@ -2876,7 +2915,7 @@ mod tests {
     fn test_index_skips_middle_column() {
         let mut table_id_counter = TableRefIdCounter::new();
         let mut joined_tables = Vec::new();
-        let mut available_indexes = HashMap::default();
+        let mut available_indexes = AvailableIndexes::default();
 
         let columns = _create_column_list(&["c1", "c2", "c3"], Type::Integer);
         let table = _create_btree_table("t1", columns);
@@ -2917,13 +2956,13 @@ mod tests {
             index_method: None,
             on_conflict: None,
         });
-        available_indexes.insert("t1".to_string(), VecDeque::from([index]));
+        let table_id = table_id_counter.next();
 
         let table = Table::BTree(table);
         joined_tables.push(JoinedTable {
             op: Operation::default_scan_for(&table),
             table,
-            internal_id: table_id_counter.next(),
+            internal_id: table_id,
             identifier: "t1".to_string(),
             join_info: None,
             col_used_mask: ColumnUsedMask::default(),
@@ -2932,6 +2971,7 @@ mod tests {
             database_id: MAIN_DB_ID,
             indexed: None,
         });
+        available_indexes.insert(table_id, VecDeque::from([index]));
 
         // Create where clause that references first and third columns
         let mut where_clause = vec![
@@ -3015,7 +3055,7 @@ mod tests {
     fn test_index_stops_at_range_operator() {
         let mut table_id_counter = TableRefIdCounter::new();
         let mut joined_tables = Vec::new();
-        let mut available_indexes = HashMap::default();
+        let mut available_indexes = AvailableIndexes::default();
 
         let columns = _create_column_list(&["c1", "c2", "c3"], Type::Integer);
         let table = _create_btree_table("t1", columns);
@@ -3056,13 +3096,13 @@ mod tests {
             index_method: None,
             on_conflict: None,
         });
-        available_indexes.insert("t1".to_string(), VecDeque::from([index]));
+        let table_id = table_id_counter.next();
 
         let table = Table::BTree(table);
         joined_tables.push(JoinedTable {
             op: Operation::default_scan_for(&table),
             table,
-            internal_id: table_id_counter.next(),
+            internal_id: table_id,
             identifier: "t1".to_string(),
             join_info: None,
             col_used_mask: ColumnUsedMask::default(),
@@ -3071,6 +3111,7 @@ mod tests {
             database_id: MAIN_DB_ID,
             indexed: None,
         });
+        available_indexes.insert(table_id, VecDeque::from([index]));
 
         // Create where clause: c1 = 5 AND c2 > 10 AND c3 = 7
         let mut where_clause = vec![
@@ -3314,7 +3355,7 @@ mod tests {
         const TABLE2: usize = 1;
 
         // Index on t2.a
-        let mut available_indexes = HashMap::default();
+        let mut available_indexes = AvailableIndexes::default();
         let index_t2_a = Arc::new(Index {
             name: "idx_t2_a".to_string(),
             table_name: "t2".to_string(),
@@ -3334,7 +3375,10 @@ mod tests {
             index_method: None,
             on_conflict: None,
         });
-        available_indexes.insert("t2".to_string(), VecDeque::from([index_t2_a]));
+        available_indexes.insert(
+            joined_tables[TABLE2].internal_id,
+            VecDeque::from([index_t2_a]),
+        );
 
         // WHERE t1.a = t2.a
         let mut where_clause = vec![_create_binary_expr(

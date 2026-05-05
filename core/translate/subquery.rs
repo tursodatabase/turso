@@ -641,7 +641,7 @@ fn get_subquery_parser<'a>(
                         "compound SELECT queries not supported yet in WHERE clause subqueries"
                     );
                 };
-                optimize_select_plan(&mut plan, resolver.schema())?;
+                optimize_select_plan(&mut plan, resolver)?;
                 let correlated = select_plan_has_outer_scope_dependency(&plan);
                 handle_unsupported_correlation(correlated, position, allow_correlated)?;
                 out_subqueries.push(NonFromClauseSubquery {
@@ -693,7 +693,7 @@ fn get_subquery_parser<'a>(
                         "compound SELECT queries not supported yet in WHERE clause subqueries"
                     );
                 };
-                optimize_select_plan(&mut plan, resolver.schema())?;
+                optimize_select_plan(&mut plan, resolver)?;
                 let reg_count = plan.result_columns.len();
                 let reg_start = program.alloc_registers(reg_count);
 
@@ -790,7 +790,7 @@ fn get_subquery_parser<'a>(
                 )?;
                 let mut plan = match plan {
                     Plan::Select(mut select_plan) => {
-                        optimize_select_plan(&mut select_plan, resolver.schema())?;
+                        optimize_select_plan(&mut select_plan, resolver)?;
                         Plan::Select(select_plan)
                     }
                     Plan::CompoundSelect {
@@ -800,9 +800,9 @@ fn get_subquery_parser<'a>(
                         offset,
                         order_by,
                     } => {
-                        optimize_select_plan(&mut right_most, resolver.schema())?;
+                        optimize_select_plan(&mut right_most, resolver)?;
                         for (select_plan, _) in left.iter_mut() {
-                            optimize_select_plan(select_plan, resolver.schema())?;
+                            optimize_select_plan(select_plan, resolver)?;
                         }
                         Plan::CompoundSelect {
                             left,

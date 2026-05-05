@@ -1,0 +1,42 @@
+@database :memory:
+@skip-file-if mvcc "attach is not supported for mvcc"
+
+# Attached database tables can have the same table names as main. Index lookup
+# must follow the resolved table reference's database, not the table name alone.
+
+@skip-if sqlite "query plan explanation output is different in sqlite"
+test plan-attached-db-index-used {
+    ATTACH ':memory:' AS aux;
+    CREATE TABLE aux.t (a INTEGER, b TEXT);
+    CREATE INDEX aux.idx_aux_t_a ON t(a);
+    EXPLAIN QUERY PLAN SELECT b FROM aux.t WHERE a = 1;
+}
+expect {
+    1|0|0|SEARCH t USING INDEX idx_aux_t_a (a=?)
+}
+
+@cross-check-integrity
+test attached-db-does-not-borrow-main-index {
+    CREATE TABLE t (a INTEGER, b TEXT);
+    CREATE INDEX idx_main_t_a ON t(a);
+    INSERT INTO t VALUES (1, 'main-one');
+    ATTACH ':memory:' AS aux;
+    CREATE TABLE aux.t (a INTEGER, b TEXT);
+    INSERT INTO aux.t VALUES (1, 'aux-one'), (2, 'aux-two');
+    SELECT b FROM aux.t WHERE a = 1;
+}
+expect {
+    aux-one
+}
+
+@cross-check-integrity
+test attached-db-indexed-by-finds-attached-index {
+    ATTACH ':memory:' AS aux;
+    CREATE TABLE aux.t (a INTEGER, b TEXT);
+    CREATE INDEX aux.idx_aux_t_a ON t(a);
+    INSERT INTO aux.t VALUES (1, 'one'), (2, 'two');
+    SELECT b FROM aux.t INDEXED BY idx_aux_t_a WHERE a = 2;
+}
+expect {
+    two
+}

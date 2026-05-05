@@ -1,7 +1,6 @@
 use crate::sync::Arc;
 use rustc_hash::FxHashMap as HashMap;
 use smallvec::SmallVec;
-use std::collections::VecDeque;
 
 use turso_ext::{ConstraintInfo, ConstraintUsage, ResultCode};
 use turso_parser::ast::{self, SortOrder, TableInternalId};
@@ -44,6 +43,7 @@ use super::{
         btree_access_order_consumed, subquery_intrinsic_order_consumed, ColumnTarget,
         EqualityPrefixScope, OrderTarget,
     },
+    AvailableIndexes,
 };
 use crate::translate::planner::TableMask;
 
@@ -204,7 +204,7 @@ pub(super) fn choose_best_btree_candidate(
     rhs_table_idx: usize,
     maybe_order_target: Option<&OrderTarget>,
     schema: &Schema,
-    available_indexes: &HashMap<String, VecDeque<Arc<Index>>>,
+    available_indexes: &AvailableIndexes,
     analyze_stats: &AnalyzeStats,
     input_cardinality: f64,
     base_row_count: RowCountEstimate,
@@ -659,7 +659,7 @@ pub fn find_best_access_method_for_join_order(
     join_order: &[JoinOrderMember],
     planning_context: JoinPlanningContext<'_>,
     where_clause: &[WhereTerm],
-    available_indexes: &HashMap<String, VecDeque<Arc<Index>>>,
+    available_indexes: &AvailableIndexes,
     table_references: &TableReferences,
     subqueries: &[NonFromClauseSubquery],
     schema: &Schema,
@@ -713,7 +713,7 @@ fn find_best_access_method_for_btree(
     join_order: &[JoinOrderMember],
     maybe_order_target: Option<&OrderTarget>,
     where_clause: &[WhereTerm],
-    available_indexes: &HashMap<String, VecDeque<Arc<Index>>>,
+    available_indexes: &AvailableIndexes,
     table_references: &TableReferences,
     subqueries: &[NonFromClauseSubquery],
     schema: &Schema,
