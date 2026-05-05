@@ -2032,13 +2032,18 @@ impl Pager {
             turso_assert!(c.succeeded(), "memory IO should complete immediately");
             current_offset += page_size;
             rollback_bitset.insert(page_id);
-            // The restored image is the transaction-visible state at the
-            // savepoint, not necessarily durable state. Keep it dirty so cache
-            // eviction cannot drop uncommitted changes that predate the
-            // rolled-back savepoint/statement.
-            page.set_dirty();
-            dirty_pages.insert(page_id);
-            self.upsert_page_in_cache(page_id as usize, page, true)?;
+            let was_dirty_at_start = savepoint.dirty_pages_at_start.contains(page_id);
+            if was_dirty_at_start {
+                // The restored image is the transaction-visible state at the
+                // savepoint, not necessarily durable state. Keep pages that
+                // were already dirty at savepoint-open dirty so eviction
+                // cannot drop older uncommitted changes.
+                page.set_dirty();
+                dirty_pages.insert(page_id);
+            } else {
+                dirty_pages.remove(page_id);
+            }
+            self.upsert_page_in_cache(page_id as usize, page, was_dirty_at_start)?;
         }
 
         let truncate_completion = subjournal.truncate(journal_start_offset)?;

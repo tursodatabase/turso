@@ -2970,10 +2970,9 @@ pub fn translate_expr(
                 }
                 ResolveType::Replace => {
                     crate::bail_parse_error!("REPLACE is not valid for RAISE");
-                }
-                // If the custom type requires parameters but the CAST
-                // doesn't provide them (e.g. CAST(x AS NUMERIC) vs
-                // CAST(x AS numeric(10,2))), fall through to regular CAST.
+                } // If the custom type requires parameters but the CAST
+                  // doesn't provide them (e.g. CAST(x AS NUMERIC) vs
+                  // CAST(x AS numeric(10,2))), fall through to regular CAST.
             }
             Ok(target_register)
         }
