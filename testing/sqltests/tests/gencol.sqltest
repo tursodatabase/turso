@@ -4905,3 +4905,23 @@ test update-expression-index-references-virtual-gencol {
     1|aaaaaa
     ok
 }
+
+# Regression: virtual generated columns must be affinity-coerced before being
+# stored in index records. Otherwise, a column declared `REAL AS (int_expr)`
+# ends up with INTEGER serial type in the index record, while the row's
+# user-facing value is REAL — a value > 2^53 cannot round-trip int↔real, so
+# integrity_check (which rebuilds the key with declared affinity and seeks)
+# reports the row as missing from the index.
+# Caught by simulator seed 3288223176870984363 (turso index integrity violation
+# on `ambitious_sharkey_698`).
+@cross-check-integrity
+test gencol-virtual-real-affinity-applied-to-index {
+    CREATE TABLE t (a INTEGER, b INTEGER, v REAL AS (a + b));
+    INSERT INTO t (a, b) VALUES (5000000000000001, 5000000000000002);
+    INSERT INTO t (a, b) VALUES (1, 2);
+    CREATE INDEX idx_v ON t (v);
+    PRAGMA integrity_check;
+}
+expect {
+    ok
+}

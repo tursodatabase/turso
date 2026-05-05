@@ -361,6 +361,7 @@ pub fn translate_create_index(
                 resolver,
                 &mut table_references,
                 table_cursor_id,
+                &tbl,
                 col,
                 start_reg + i,
             )?;
@@ -464,6 +465,7 @@ pub fn translate_create_index(
                 resolver,
                 &mut table_references,
                 table_cursor_id,
+                &tbl,
                 col,
                 start_reg + i,
             )?;
@@ -853,6 +855,7 @@ fn emit_index_column_value_from_cursor(
     resolver: &Resolver,
     table_references: &mut TableReferences,
     table_cursor_id: usize,
+    table: &BTreeTable,
     idx_col: &IndexColumn,
     dest_reg: usize,
 ) -> crate::Result<()> {
@@ -877,6 +880,19 @@ fn emit_index_column_value_from_cursor(
             translate_expr(program, Some(table_references), &expr, dest_reg, resolver)?;
             Ok(())
         })?;
+        // For virtual generated column references, apply the column's declared
+        // affinity to the computed expression result. Without this, a column
+        // declared `REAL AS (int_expr)` would be stored in the index record
+        // with INTEGER serial type — for values > 2^53 the int↔real round-trip
+        // is lossy, so integrity_check would later report the row as missing.
+        // Pure expression indexes (pos_in_table == EXPR_INDEX_SENTINEL) have
+        // no declared affinity to apply.
+        if idx_col.pos_in_table != EXPR_INDEX_SENTINEL {
+            let column = &table.columns()[idx_col.pos_in_table];
+            if column.is_virtual_generated() {
+                program.emit_column_affinity(dest_reg, column.affinity());
+            }
+        }
     } else {
         program.emit_column_or_rowid(table_cursor_id, idx_col.pos_in_table, dest_reg);
     }

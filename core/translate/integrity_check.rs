@@ -1,7 +1,8 @@
 use crate::translate::expr::emit_table_column;
+use crate::vdbe::affinity::Affinity;
 use crate::vdbe::builder::SelfTableContext;
 use crate::{
-    schema::{GeneratedType, Index, Schema, Table},
+    schema::{GeneratedType, Index, Schema, Table, EXPR_INDEX_SENTINEL},
     translate::{
         emitter::Resolver,
         expr::{
@@ -24,7 +25,12 @@ pub const MAX_INTEGRITY_CHECK_ERRORS: usize = 100;
 
 enum BoundIndexColumn {
     Column(usize),
-    Expr(Box<ast::Expr>),
+    /// An expression-bound index column. The optional affinity is `Some` when
+    /// the index column refers to a virtual generated column (the affinity is
+    /// the column's declared type) — the integrity_check probe must apply it
+    /// to match what the index-population paths wrote into the index record.
+    /// For pure expression indexes (`CREATE INDEX ... ON t(a+b)`) it is `None`.
+    Expr(Box<ast::Expr>, Option<Affinity>),
 }
 
 struct BoundIntegrityIndex {
@@ -267,11 +273,17 @@ fn translate_integrity_check_impl(
                 let mut unique_nullable = Vec::with_capacity(index.columns.len());
                 for col in &index.columns {
                     if let Some(expr) = col.expr.as_deref() {
-                        columns.push(BoundIndexColumn::Expr(Box::new(bind_expr_for_table(
-                            expr,
-                            &mut table_references,
-                            resolver,
-                        )?)));
+                        // Pure expression indexes have no declared affinity to apply;
+                        // only virtual generated column references do.
+                        let affinity = if col.pos_in_table != EXPR_INDEX_SENTINEL {
+                            Some(btree_table.columns()[col.pos_in_table].affinity())
+                        } else {
+                            None
+                        };
+                        columns.push(BoundIndexColumn::Expr(
+                            Box::new(bind_expr_for_table(expr, &mut table_references, resolver)?),
+                            affinity,
+                        ));
                         unique_nullable.push(true);
                     } else {
                         columns.push(BoundIndexColumn::Column(col.pos_in_table));
@@ -310,7 +322,10 @@ fn translate_integrity_check_impl(
                     GeneratedType::Virtual { expr, .. } => {
                         let bound =
                             bind_expr_for_table(expr, &mut table_references, resolver).ok()?;
-                        Some((BoundIndexColumn::Expr(Box::new(bound)), name))
+                        Some((
+                            BoundIndexColumn::Expr(Box::new(bound), Some(col.affinity())),
+                            name,
+                        ))
                     }
                     GeneratedType::NotGenerated => Some((BoundIndexColumn::Column(idx), name)),
                 }
@@ -340,7 +355,9 @@ fn translate_integrity_check_impl(
                 BoundIndexColumn::Column(idx) => {
                     program.emit_column_or_rowid(table_cursor_id, *idx, col_value_reg);
                 }
-                BoundIndexColumn::Expr(expr) => {
+                BoundIndexColumn::Expr(expr, _affinity) => {
+                    // Affinity is irrelevant here: this branch is the NOT NULL
+                    // probe, and affinity coercion does not change NULL-ness.
                     let self_table_context = table_references.joined_tables().first().map(|jt| {
                         SelfTableContext::ForSelect {
                             table_ref_id: jt.internal_id,
@@ -452,7 +469,7 @@ fn translate_integrity_check_impl(
                             resolver,
                         )?;
                     }
-                    BoundIndexColumn::Expr(expr) => {
+                    BoundIndexColumn::Expr(expr, affinity) => {
                         let self_table_context =
                             table_references.joined_tables().first().map(|jt| {
                                 SelfTableContext::ForSelect {
@@ -475,7 +492,15 @@ fn translate_integrity_check_impl(
                                 )?;
                                 Ok(())
                             },
-                        )?
+                        )?;
+                        // For virtual generated column references the index
+                        // record was written with the column's declared
+                        // affinity, so apply it here when building the probe
+                        // key — otherwise a `REAL AS (int+int)` whose value
+                        // exceeds 2^53 would not round-trip.
+                        if let Some(aff) = affinity {
+                            program.emit_column_affinity(target, *aff);
+                        }
                     }
                 }
             }
