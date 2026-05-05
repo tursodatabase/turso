@@ -1,5 +1,7 @@
 use serde::{Deserialize, Serialize};
-use sql_generation::model::query::{Create, Insert, Select, predicate::Predicate, update::Update};
+use sql_generation::model::query::{
+    Create, Insert, Select, pragma::WalCheckpointMode, predicate::Predicate, update::Update,
+};
 
 use crate::model::{Query, QueryDiscriminants};
 
@@ -191,6 +193,11 @@ pub enum Property {
         tables: Vec<String>,
         write_kinds: Vec<QueryDiscriminants>,
     },
+    /// Run a WAL checkpoint and validate durable file-size invariants against
+    /// the SQLite database header.
+    WalCheckpointPreservesDatabase {
+        mode: WalCheckpointMode,
+    },
     /// Property used to subsititute a property with its queries only
     Queries {
         queries: Vec<Query>,
@@ -237,6 +244,7 @@ impl Property {
             | Property::SelectSelectOptimizer { .. }
             | Property::WhereTrueFalseNull { .. }
             | Property::UnionAllPreservesCardinality { .. }
+            | Property::WalCheckpointPreservesDatabase { .. }
             | Property::ReadYourUpdatesBack { .. }
             | Property::TableHasExpectedContent { .. }
             | Property::AllTableHaveExpectedContent { .. } => None,

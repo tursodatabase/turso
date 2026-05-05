@@ -28,6 +28,7 @@ use crate::{
 pub(crate) struct InteractionPlan {
     plan: Vec<Interaction>,
     stats: InteractionStats,
+    pub(crate) storage_stress: StorageStress,
     // In the future, this should probably be a stack of interactions
     // so we can have nested properties
     last_interactions: Option<Interactions>,
@@ -44,6 +45,7 @@ impl InteractionPlan {
         Self {
             plan: Vec::new(),
             stats: InteractionStats::default(),
+            storage_stress: StorageStress::default(),
             last_interactions: None,
             mvcc,
             len_properties: 0,
@@ -245,6 +247,17 @@ where
 
         Some(property_interactions.into_iter())
     }
+}
+
+#[derive(Debug, Clone, Default)]
+pub(crate) enum StorageStress {
+    #[default]
+    Undecided,
+    Off,
+    Active {
+        page_size_conn: Option<usize>,
+        checkpoint_attempted: bool,
+    },
 }
 
 pub trait InteractionPlanIterator {

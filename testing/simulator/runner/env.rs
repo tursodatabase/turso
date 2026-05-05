@@ -911,6 +911,7 @@ pub(crate) struct SimulatorEnv {
     connection_last_query: Bitmap<64>,
     // Table data that is committed into the database or wal
     pub committed_tables: Vec<Table>,
+    main_database_initialized: bool,
     /// Names of attached databases (e.g. ["aux0", "aux1", "aux2"])
     pub(crate) attached_dbs: Vec<String>,
 }
@@ -937,12 +938,14 @@ impl SimulatorEnv {
             connection_tables: self.connection_tables.clone(),
             connection_last_query: self.connection_last_query,
             committed_tables: self.committed_tables.clone(),
+            main_database_initialized: self.main_database_initialized,
             attached_dbs: self.attached_dbs.clone(),
         }
     }
 
     pub(crate) fn clear(&mut self) {
         self.clear_tables();
+        self.main_database_initialized = false;
         self.connections.iter_mut().for_each(|c| c.disconnect());
         self.rng = ChaCha8Rng::seed_from_u64(self.opts.seed);
 
@@ -1249,6 +1252,7 @@ impl SimulatorEnv {
             committed_tables: Vec::new(),
             connection_tables: vec![None; profile.max_connections],
             connection_last_query: Bitmap::new(),
+            main_database_initialized: false,
             attached_dbs,
         }
     }
@@ -1310,6 +1314,7 @@ impl SimulatorEnv {
         self.committed_tables.clear();
         self.connection_tables.iter_mut().for_each(|t| *t = None);
         self.connection_last_query = Bitmap::new();
+        self.main_database_initialized = false;
     }
 
     // TODO: does not yet create the appropriate context to avoid WriteWriteConflitcs
@@ -1345,6 +1350,22 @@ impl SimulatorEnv {
 
     pub fn has_conn_executed_query_after_transaction(&self, conn_index: usize) -> bool {
         self.connection_last_query.get(conn_index)
+    }
+
+    pub fn main_database_allows_initial_page_size(&self) -> bool {
+        !self.main_database_initialized
+    }
+
+    pub fn mark_main_database_initialized_for_page_size(&mut self) {
+        self.main_database_initialized = true;
+    }
+
+    pub fn record_successful_query_effect(&mut self, query: &Query) {
+        if let Query::Create(create) = query
+            && !create.table.name.contains('.')
+        {
+            self.mark_main_database_initialized_for_page_size();
+        }
     }
 
     pub fn update_conn_last_interaction(&mut self, conn_index: usize, query: Option<&Query>) {

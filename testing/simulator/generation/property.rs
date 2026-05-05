@@ -14,6 +14,7 @@ use sql_generation::{
         query::{
             Create, Delete, Drop, Insert, Select,
             alter_table::{AlterTable, AlterTableType},
+            pragma::{Pragma, WalCheckpointMode},
             predicate::Predicate,
             select::{CompoundOperator, CompoundSelect, ResultColumn, SelectBody, SelectInner},
             transaction::{Begin, Commit, Rollback},
@@ -240,6 +241,9 @@ impl Property {
                 unreachable!("No extensional querie generation for `Property::Queries`")
             }
             Property::FsyncNoWait { .. } | Property::FaultyQuery { .. } => {
+                unreachable!("No extensional queries")
+            }
+            Property::WalCheckpointPreservesDatabase { .. } => {
                 unreachable!("No extensional queries")
             }
             Property::SelectLimit { .. }
@@ -1233,6 +1237,13 @@ impl Property {
                 interactions.push(assert_integrity_check(tables, connection_index));
                 interactions
             }
+            Property::WalCheckpointPreservesDatabase { mode } => {
+                let checkpoint = InteractionBuilder::with_interaction(InteractionType::Query(
+                    Query::Pragma(Pragma::WalCheckpoint(*mode)),
+                ));
+
+                vec![checkpoint, assert_checkpoint_preserves_database(*mode)]
+            }
         };
 
         assert!(!interactions.is_empty());
@@ -1472,6 +1483,227 @@ fn run_integrity_check(
             "connection is disconnected during integrity_check assertion".into(),
         )),
     }
+}
+
+fn assert_checkpoint_preserves_database(mode: WalCheckpointMode) -> InteractionBuilder {
+    InteractionBuilder::with_interaction(InteractionType::Assertion(Assertion::new(
+        format!("wal_checkpoint({mode:?}) should preserve durable database file invariants"),
+        move |stack: &Vec<ResultSet>, env: &mut SimulatorEnv| {
+            let checkpoint_result = stack.last().ok_or_else(|| {
+                LimboError::InternalError(
+                    "checkpoint durability assertion has no checkpoint result".into(),
+                )
+            })?;
+
+            env.io
+                .persist_files()
+                .map_err(|err| LimboError::InternalError(err.to_string()))?;
+
+            let db_path = env.get_db_path();
+            let checkpoint_rows = match checkpoint_result {
+                Ok(rows) => rows,
+                Err(err) => return Ok(Err(format!("wal_checkpoint({mode:?}) failed: {err}"))),
+            };
+
+            let header_file_size = match check_sqlite_header_file_size(&db_path) {
+                Ok(header_file_size) => header_file_size,
+                Err(message) => {
+                    return Ok(Err(format!(
+                        "wal_checkpoint({mode:?}) corrupted durable database file: {message}"
+                    )));
+                }
+            };
+
+            let checkpoint_progress = match checkpoint_progress(checkpoint_rows) {
+                Ok(checkpoint_progress) => checkpoint_progress,
+                Err(message) => {
+                    return Ok(Err(format!(
+                        "wal_checkpoint({mode:?}) returned malformed progress: {message}"
+                    )));
+                }
+            };
+
+            if let Err(message) =
+                checkpt_file_size_if_cmpltd(&db_path, &header_file_size, checkpoint_progress)
+            {
+                return Ok(Err(format!(
+                    "wal_checkpoint({mode:?}) corrupted durable database file: {message}"
+                )));
+            }
+
+            if let Err(message) = check_sqlite_database_integrity(&db_path) {
+                return Ok(Err(format!(
+                    "wal_checkpoint({mode:?}) corrupted durable database file: {message}"
+                )));
+            }
+
+            Ok(Ok(()))
+        },
+        Vec::new(),
+    )))
+}
+
+#[derive(Debug, Clone, Copy)]
+struct SqliteHeaderFileSize {
+    page_size: u64,
+    header_page_count: u64,
+    expected_size: u64,
+    actual_size: u64,
+    page_count_trusted: bool,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct CheckpointProgress {
+    busy: i64,
+    log: i64,
+    checkpointed: i64,
+}
+
+impl CheckpointProgress {
+    fn completed(self) -> bool {
+        self.busy == 0 && self.log >= 0 && self.log == self.checkpointed
+    }
+}
+
+fn checkpoint_progress(rows: &[Vec<SimValue>]) -> Result<CheckpointProgress, String> {
+    if rows.len() != 1 {
+        return Err(format!(
+            "expected one row with 3 columns (busy, log, checkpointed), got {} rows",
+            rows.len()
+        ));
+    }
+    let row = &rows[0];
+    if row.len() != 3 {
+        return Err(format!(
+            "expected one row with 3 columns (busy, log, checkpointed), got {} columns",
+            row.len()
+        ));
+    }
+
+    Ok(CheckpointProgress {
+        busy: sim_value_i64(&row[0], "busy")?,
+        log: sim_value_i64(&row[1], "log")?,
+        checkpointed: sim_value_i64(&row[2], "checkpointed")?,
+    })
+}
+
+fn sim_value_i64(value: &SimValue, column: &str) -> Result<i64, String> {
+    match &value.0 {
+        types::Value::Numeric(Numeric::Integer(value)) => Ok(*value),
+        _ => Err(format!("expected integer {column}, got {value:?}")),
+    }
+}
+
+fn check_sqlite_header_file_size(
+    db_path: &std::path::Path,
+) -> Result<SqliteHeaderFileSize, String> {
+    let bytes = std::fs::read(db_path)
+        .map_err(|err| format!("failed to read {}: {err}", db_path.display()))?;
+    if bytes.len() < 100 {
+        return Err(format!(
+            "{} is too short to contain a SQLite database header: {} bytes",
+            db_path.display(),
+            bytes.len()
+        ));
+    }
+
+    const SQLITE_HEADER: &[u8; 16] = b"SQLite format 3\0";
+    if &bytes[..16] != SQLITE_HEADER {
+        return Err(format!(
+            "{} does not start with a SQLite database header: {:02x?}",
+            db_path.display(),
+            &bytes[..16]
+        ));
+    }
+
+    let raw_page_size = u16::from_be_bytes([bytes[16], bytes[17]]);
+    let page_size = if raw_page_size == 1 {
+        65_536
+    } else {
+        u64::from(raw_page_size)
+    };
+    if !(512..=65_536).contains(&page_size) || !page_size.is_power_of_two() {
+        return Err(format!(
+            "{} has invalid SQLite header page size {raw_page_size}",
+            db_path.display()
+        ));
+    }
+
+    let db_size = u32::from_be_bytes([bytes[28], bytes[29], bytes[30], bytes[31]]) as u64;
+    let page_count_trusted = db_size != 0 && bytes[24..28] == bytes[92..96];
+    let expected_min_size = db_size.checked_mul(page_size).ok_or_else(|| {
+        format!("database size overflows: pages={db_size}, page_size={page_size}")
+    })?;
+    let actual_size = std::fs::metadata(db_path)
+        .map_err(|err| format!("failed to stat {}: {err}", db_path.display()))?
+        .len();
+
+    if actual_size % page_size != 0 {
+        return Err(format!(
+            "{} size is not aligned to its SQLite header page size: actual_bytes={actual_size}, header_page_size={page_size}",
+            db_path.display()
+        ));
+    }
+
+    if page_count_trusted && actual_size < expected_min_size {
+        return Err(format!(
+            "{} is shorter than its SQLite header declares: actual_bytes={actual_size}, header_pages={db_size}, header_page_size={page_size}, expected_min_bytes={expected_min_size}",
+            db_path.display()
+        ));
+    }
+
+    Ok(SqliteHeaderFileSize {
+        page_size,
+        header_page_count: db_size,
+        expected_size: expected_min_size,
+        actual_size,
+        page_count_trusted,
+    })
+}
+
+fn checkpt_file_size_if_cmpltd(
+    db_path: &std::path::Path,
+    header_file_size: &SqliteHeaderFileSize,
+    checkpoint_progress: CheckpointProgress,
+) -> Result<(), String> {
+    if !checkpoint_progress.completed() || !header_file_size.page_count_trusted {
+        return Ok(());
+    }
+
+    if header_file_size.actual_size != header_file_size.expected_size {
+        return Err(format!(
+            "{} has trailing bytes after a completed checkpoint: actual_bytes={}, header_pages={}, header_page_size={}, expected_bytes={}",
+            db_path.display(),
+            header_file_size.actual_size,
+            header_file_size.header_page_count,
+            header_file_size.page_size,
+            header_file_size.expected_size
+        ));
+    }
+
+    Ok(())
+}
+
+fn check_sqlite_database_integrity(db_path: &std::path::Path) -> Result<(), String> {
+    let conn =
+        rusqlite::Connection::open_with_flags(db_path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .map_err(|err| format!("SQLite open failed for {}: {err}", db_path.display()))?;
+    let rows = sqlite_integrity_check(&conn)
+        .map_err(|err| format!("PRAGMA integrity_check failed: {err}"))?;
+
+    if rows.len() == 1 && rows[0] == "ok" {
+        return Ok(());
+    }
+
+    Err(format!(
+        "PRAGMA integrity_check reported: {}",
+        rows.join("; ")
+    ))
+}
+
+fn sqlite_integrity_check(conn: &rusqlite::Connection) -> Result<Vec<String>, rusqlite::Error> {
+    let mut stmt = conn.prepare("PRAGMA integrity_check")?;
+    stmt.query_map([], |row| row.get(0))?.collect()
 }
 
 fn assert_all_table_values(
@@ -1887,6 +2119,29 @@ fn property_faulty_query<R: rand::Rng + ?Sized>(
     }
 }
 
+fn property_wal_checkpoint_preserves_database<R: rand::Rng + ?Sized>(
+    _rng: &mut R,
+    _query_distr: &QueryDistribution,
+    _ctx: &impl GenerationContext,
+    _mvcc: bool,
+) -> Property {
+    Property::WalCheckpointPreservesDatabase {
+        mode: WalCheckpointMode::Truncate,
+    }
+}
+
+fn has_checkpoint_durability_workload(ctx: &impl GenerationContext) -> bool {
+    // Opportunistic checkpoints compete with many other properties, so wait for
+    // a larger workload than storage stress before spending a generated property.
+    const OPPORTUNISTIC_CHECKPOINT_MIN_MAIN_TABLE_ROWS: usize = 32;
+    ctx.tables()
+        .iter()
+        .filter(|table| !table.name.contains('.'))
+        .map(|table| table.rows.len())
+        .sum::<usize>()
+        >= OPPORTUNISTIC_CHECKPOINT_MIN_MAIN_TABLE_ROWS
+}
+
 type PropertyGenFunc<R, G> = fn(&mut R, &QueryDistribution, &G, bool) -> Property;
 
 impl PropertyDiscriminants {
@@ -1914,6 +2169,9 @@ impl PropertyDiscriminants {
             }
             PropertyDiscriminants::FsyncNoWait => property_fsync_no_wait,
             PropertyDiscriminants::FaultyQuery => property_faulty_query,
+            PropertyDiscriminants::WalCheckpointPreservesDatabase => {
+                property_wal_checkpoint_preserves_database
+            }
             PropertyDiscriminants::Queries => {
                 unreachable!("should not try to generate queries property")
             }
@@ -1925,6 +2183,7 @@ impl PropertyDiscriminants {
         env: &SimulatorEnv,
         remaining: &Remaining,
         ctx: &impl GenerationContext,
+        conn_index: usize,
     ) -> u32 {
         match self {
             PropertyDiscriminants::InsertValuesSelect => {
@@ -2033,6 +2292,22 @@ impl PropertyDiscriminants {
                     0
                 }
             }
+            PropertyDiscriminants::WalCheckpointPreservesDatabase => {
+                let storage_pragmas = matches!(
+                    env.type_,
+                    crate::runner::env::SimulationType::Default
+                        | crate::runner::env::SimulationType::Doublecheck
+                ) && !env.profile.mvcc;
+                if storage_pragmas
+                    && !env.conn_in_transaction(conn_index)
+                    && remaining.pragma_count > 0
+                    && has_checkpoint_durability_workload(ctx)
+                {
+                    (remaining.insert + remaining.update + remaining.create_index).max(1)
+                } else {
+                    0
+                }
+            }
             PropertyDiscriminants::Queries => {
                 unreachable!("queries property should not be generated")
             }
@@ -2074,6 +2349,7 @@ impl PropertyDiscriminants {
             PropertyDiscriminants::UnionAllPreservesCardinality => QueryCapabilities::SELECT,
             PropertyDiscriminants::FsyncNoWait => QueryCapabilities::all(),
             PropertyDiscriminants::FaultyQuery => QueryCapabilities::all(),
+            PropertyDiscriminants::WalCheckpointPreservesDatabase => QueryCapabilities::empty(),
             PropertyDiscriminants::Queries => panic!("queries property should not be generated"),
         }
     }
@@ -2092,13 +2368,22 @@ impl<'a> PropertyDistribution<'a> {
         remaining: &Remaining,
         query_distr: &'a QueryDistribution,
         ctx: &impl GenerationContext,
+        conn_index: usize,
     ) -> Result<Self, rand::distr::weighted::Error> {
         let properties = PropertyDiscriminants::can_generate(query_distr.items());
-        let weights = WeightedIndex::new(
-            properties
-                .iter()
-                .map(|property| property.weight(env, remaining, ctx)),
-        )?;
+        let weights = WeightedIndex::new(properties.iter().map(|property| {
+            let weight = property.weight(env, remaining, ctx, conn_index);
+            if query_distr.storage_stress()
+                && matches!(
+                    property,
+                    PropertyDiscriminants::WalCheckpointPreservesDatabase
+                )
+            {
+                weight.saturating_mul(6)
+            } else {
+                weight
+            }
+        }))?;
 
         Ok(Self {
             properties,

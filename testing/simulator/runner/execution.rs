@@ -320,6 +320,12 @@ pub fn execute_interaction_turso(
             "DB succeeded but shadow detected error: {e}"
         )));
     }
+    match &interaction.interaction {
+        InteractionType::Query(query)
+        | InteractionType::FsyncQuery(query)
+        | InteractionType::FaultyQuery(query) => env.record_successful_query_effect(query),
+        _ => {}
+    }
     Ok(ExecutionContinuation::NextInteraction)
 }
 
@@ -435,6 +441,9 @@ fn execute_interaction_rusqlite(
             "DB succeeded but shadow detected error: {e}. This may indicate a constraint enforcement bug."
         )));
     }
+    if let InteractionType::Query(query) = &interaction.interaction {
+        env.record_successful_query_effect(query);
+    }
     Ok(ExecutionContinuation::NextInteraction)
 }
 
@@ -459,44 +468,42 @@ fn execute_query_rusqlite(
         );
     }
     match query {
-        Query::Select(select) => {
-            let mut stmt = connection.prepare(select.to_string().as_str())?;
-            let rows = stmt.query_map([], |row| {
-                let mut values = vec![];
-                for i in 0.. {
-                    let value = match row.get(i) {
-                        Ok(value) => value,
-                        Err(err) => match err {
-                            rusqlite::Error::InvalidColumnIndex(_) => break,
-                            _ => {
-                                tracing::error!(?err);
-                                panic!("{err}")
-                            }
-                        },
-                    };
-                    let value = match value {
-                        rusqlite::types::Value::Null => Value::Null,
-                        rusqlite::types::Value::Integer(i) => Value::from_i64(i),
-                        rusqlite::types::Value::Real(f) => Value::from_f64(f),
-                        rusqlite::types::Value::Text(s) => Value::build_text(s),
-                        rusqlite::types::Value::Blob(b) => Value::Blob(b),
-                    };
-                    values.push(SimValue(value));
-                }
-                Ok(values)
-            })?;
+        Query::Placeholder => {
+            unreachable!("simulation cannot have a placeholder Query for execution")
+        }
+        query => {
+            let query = query.to_string();
+            let mut stmt = connection.prepare(query.as_str())?;
+            let column_count = stmt.column_count();
+            if column_count == 0 {
+                stmt.execute([])?;
+                return Ok(vec![]);
+            }
+
+            let rows = stmt.query_map([], |row| rusqlite_row_values(row, column_count))?;
             let mut result = vec![];
             for row in rows {
                 result.push(row?);
             }
             Ok(result)
         }
-        Query::Placeholder => {
-            unreachable!("simulation cannot have a placeholder Query for execution")
-        }
-        _ => {
-            connection.execute(query.to_string().as_str(), ())?;
-            Ok(vec![])
-        }
     }
+}
+
+fn rusqlite_row_values(
+    row: &rusqlite::Row<'_>,
+    column_count: usize,
+) -> rusqlite::Result<Vec<SimValue>> {
+    let mut values = Vec::with_capacity(column_count);
+    for i in 0..column_count {
+        let value = match row.get(i)? {
+            rusqlite::types::Value::Null => Value::Null,
+            rusqlite::types::Value::Integer(i) => Value::from_i64(i),
+            rusqlite::types::Value::Real(f) => Value::from_f64(f),
+            rusqlite::types::Value::Text(s) => Value::build_text(s),
+            rusqlite::types::Value::Blob(b) => Value::Blob(b),
+        };
+        values.push(SimValue(value));
+    }
+    Ok(values)
 }
