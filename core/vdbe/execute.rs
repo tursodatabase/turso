@@ -12811,9 +12811,10 @@ pub fn op_drop_column(
         Ok(())
     })?;
 
-    // Update index.pos_in_table for all indexes.
-    // For example, if the dropped column had index 2, then anything that was indexed on column 3 or higher should be decremented by 1.
-    conn.with_database_schema_mut(*db, |schema| {
+    // Shift left pos_in_table in all indexes, and self-table placeholders in generated column
+    // expressions, to account for the dropped column. For example, if the dropped column had index
+    // 2, then anything that was indexed on column 3 or higher should be decremented by 1.
+    conn.with_database_schema_mut(*db, |schema| -> Result<()> {
         if let Some(indexes) = schema.indexes.get_mut(&normalized_table_name) {
             for index in indexes {
                 let index = Arc::get_mut(index).expect("this should be the only strong reference");
@@ -12821,10 +12822,24 @@ pub fn op_drop_column(
                     if index_column.pos_in_table > *column_index {
                         index_column.pos_in_table -= 1;
                     }
+                    if let Some(ref mut expr) = index_column.expr {
+                        crate::translate::expr::walk_expr_mut(expr, &mut |e| {
+                            if let ast::Expr::Column {
+                                table, column: c, ..
+                            } = e
+                            {
+                                if table.is_self_table() && *c > *column_index {
+                                    *c -= 1;
+                                }
+                            }
+                            Ok(crate::translate::expr::WalkControl::Continue)
+                        })?;
+                    }
                 }
             }
         }
-    });
+        Ok(())
+    })?;
 
     conn.with_schema(*db, |schema| -> crate::Result<()> {
         for (view_name, view) in schema.views.iter() {

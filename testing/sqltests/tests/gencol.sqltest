@@ -3426,6 +3426,21 @@ expect {
     CREATE TABLE t (a REAL AS (ee), c INTEGER, f INTEGER AS (c * ee), ee REAL)
 }
 
+test gencol_drop_column_shifts_index_expr {
+    CREATE TABLE t (a INTEGER, b INTEGER, c INTEGER, d INTEGER AS (b + c));
+    INSERT INTO t (a, b, c) VALUES (1, 10, 20);
+    CREATE INDEX idx ON t (d);
+    ALTER TABLE t DROP COLUMN a;
+    INSERT INTO t (b, c) VALUES (100, 200);
+    SELECT * FROM t ORDER BY rowid;
+    PRAGMA integrity_check;
+}
+expect {
+    10|20|30
+    100|200|300
+    ok
+}
+
 # =============================================================================
 # 15. INTEGER PRIMARY KEY Reference in Generated Columns
 # =============================================================================
