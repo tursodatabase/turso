@@ -62,13 +62,33 @@ fn random_insert<R: rand::Rng + ?Sized>(rng: &mut R, conn_ctx: &impl GenerationC
     Query::Insert(Insert::arbitrary(rng, conn_ctx))
 }
 
-fn random_storage_stress_insert<R: rand::Rng + ?Sized>(
+pub(super) fn random_storage_stress_insert<R: rand::Rng + ?Sized>(
     rng: &mut R,
     conn_ctx: &impl GenerationContext,
 ) -> Query {
+    storage_stress_insert(rng, conn_ctx, StorageStressInsertRows::ProfileCapped)
+}
+
+pub(super) fn forced_storage_stress_fill_insert<R: rand::Rng + ?Sized>(
+    rng: &mut R,
+    conn_ctx: &impl GenerationContext,
+) -> Query {
+    storage_stress_insert(rng, conn_ctx, StorageStressInsertRows::ForcedFill)
+}
+
+enum StorageStressInsertRows {
+    ProfileCapped,
+    ForcedFill,
+}
+
+fn storage_stress_insert<R: rand::Rng + ?Sized>(
+    rng: &mut R,
+    conn_ctx: &impl GenerationContext,
+    rows: StorageStressInsertRows,
+) -> Query {
     const UNIQUE_BASE_OFFSET_RANGE: std::ops::Range<i64> = 3_000_000_000..4_000_000_000;
     const UNIQUE_COL_STRIDE: i64 = 10_000_000;
-    const TARGET_ROWS: u32 = 8;
+    const TARGET_ROWS: u32 = 80;
     const PAYLOAD_BYTES: usize = 3_000;
 
     let table = conn_ctx
@@ -89,11 +109,16 @@ fn random_storage_stress_insert<R: rand::Rng + ?Sized>(
 
     let insert_opts = &conn_ctx.opts().query.insert;
     let min_rows = insert_opts.min_rows.get();
-    let max_rows = insert_opts.max_rows.get().saturating_sub(1);
-    let num_rows = if max_rows < min_rows {
-        min_rows
-    } else {
-        TARGET_ROWS.clamp(min_rows, max_rows)
+    let num_rows = match rows {
+        StorageStressInsertRows::ForcedFill => TARGET_ROWS.max(min_rows),
+        StorageStressInsertRows::ProfileCapped => {
+            let max_rows = insert_opts.max_rows.get().saturating_sub(1);
+            if max_rows < min_rows {
+                min_rows
+            } else {
+                TARGET_ROWS.clamp(min_rows, max_rows)
+            }
+        }
     };
     let base_offset = rng.random_range(UNIQUE_BASE_OFFSET_RANGE);
     let values = (0..num_rows)

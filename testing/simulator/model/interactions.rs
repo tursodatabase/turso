@@ -256,6 +256,7 @@ pub(crate) enum StorageStress {
     Off,
     Active {
         page_size_conn: Option<usize>,
+        writer_conn: Option<usize>,
         checkpoint_attempted: bool,
     },
 }

@@ -2,10 +2,13 @@ use std::{num::NonZeroUsize, vec};
 
 use sql_generation::{
     generation::{Arbitrary, ArbitraryFrom, GenerationContext, frequency},
-    model::query::{
-        Create,
-        pragma::{Pragma, WalCheckpointMode},
-        transaction::{Begin, Commit},
+    model::{
+        query::{
+            Create,
+            pragma::{Pragma, WalCheckpointMode},
+            transaction::{Begin, Commit},
+        },
+        table::{Column, ColumnType, Table},
     },
 };
 
@@ -16,7 +19,7 @@ use crate::{
         property::PropertyDistribution,
         query::{
             PragmaGeneration, QueryDistribution, QueryGeneration, STORAGE_STRESS_PAGE_SIZES,
-            possible_queries,
+            forced_storage_stress_fill_insert, possible_queries,
         },
     },
     model::{
@@ -32,10 +35,9 @@ use crate::{
 
 const STORAGE_STRESS_RATE: f64 = 0.05;
 const STORAGE_STRESS_INITIAL_PAGE_SIZE_RATE: f64 = 0.75;
-const STORAGE_STRESS_CHECKPOINT_CONN_RATE: f64 = 0.45;
 // Storage stress deliberately checkpoints early: once the alternate page-size
 // connection has produced a small WAL, checkpointing is the behavior under test.
-const STORAGE_STRESS_MIN_MAIN_TABLE_ROWS_FOR_CHECKPOINT: usize = 4;
+const STORAGE_STRESS_MIN_MAIN_TABLE_ROWS_FOR_CHECKPOINT: usize = 64;
 
 fn is_main_table_name(name: &str) -> bool {
     !name.contains('.')
@@ -52,6 +54,21 @@ fn main_schema_empty(env: &SimulatorEnv) -> bool {
 fn random_storage_stress_page_size<R: rand::Rng + ?Sized>(rng: &mut R) -> Query {
     let page_size = STORAGE_STRESS_PAGE_SIZES[rng.random_range(0..STORAGE_STRESS_PAGE_SIZES.len())];
     Query::Pragma(Pragma::PageSizeSet(page_size))
+}
+
+fn storage_stress_create_table() -> Query {
+    Query::Create(Create {
+        table: Table {
+            name: "storage_stress_t".to_string(),
+            columns: vec![Column {
+                name: "x".to_string(),
+                column_type: ColumnType::Text,
+                constraints: vec![],
+            }],
+            rows: vec![],
+            indexes: vec![],
+        },
+    })
 }
 
 fn storage_pragmas_allowed(env: &SimulatorEnv) -> bool {
@@ -99,6 +116,7 @@ impl InteractionPlan {
                 if storage_pragmas_allowed(env) && rng.random_bool(STORAGE_STRESS_RATE) {
                     StorageStress::Active {
                         page_size_conn: None,
+                        writer_conn: None,
                         checkpoint_attempted: false,
                     }
                 } else {
@@ -107,15 +125,15 @@ impl InteractionPlan {
         }
     }
 
-    fn storage_stress_page_size_conn(&self) -> Option<usize> {
+    fn storage_stress_writer_conn(&self) -> Option<usize> {
         match self.storage_stress {
-            StorageStress::Active { page_size_conn, .. } => page_size_conn,
+            StorageStress::Active { writer_conn, .. } => writer_conn,
             StorageStress::Undecided | StorageStress::Off => None,
         }
     }
 
     fn storage_stress_enabled_for(&self, conn_index: usize) -> bool {
-        self.storage_stress_page_size_conn() == Some(conn_index)
+        self.storage_stress_writer_conn() == Some(conn_index)
     }
 
     fn storage_stress_initial_page_size(
@@ -127,37 +145,88 @@ impl InteractionPlan {
             return None;
         }
 
-        if !main_schema_empty(env) || !rng.random_bool(STORAGE_STRESS_INITIAL_PAGE_SIZE_RATE) {
+        if env.connections.len() < 2
+            || !main_schema_empty(env)
+            || !rng.random_bool(STORAGE_STRESS_INITIAL_PAGE_SIZE_RATE)
+        {
             self.storage_stress = StorageStress::Off;
             return None;
         }
 
-        let conn_index = rng.random_range(0..env.connections.len());
+        let page_size_conn_index = rng.random_range(0..env.connections.len());
+        let writer_conn_index = loop {
+            let conn_index = rng.random_range(0..env.connections.len());
+            if conn_index != page_size_conn_index {
+                break conn_index;
+            }
+        };
         let StorageStress::Active {
             ref mut page_size_conn,
+            ref mut writer_conn,
             ref mut checkpoint_attempted,
         } = self.storage_stress
         else {
             unreachable!("storage stress should still be active after initial page size decision");
         };
-        *page_size_conn = Some(conn_index);
+        *page_size_conn = Some(page_size_conn_index);
+        *writer_conn = Some(writer_conn_index);
         *checkpoint_attempted = false;
 
         Some(Interactions::new(
-            conn_index,
+            page_size_conn_index,
             InteractionsType::Query(random_storage_stress_page_size(rng)),
         ))
     }
 
-    fn choose_storage_stress_conn(
+    fn storage_stress_writer_create(&self, env: &SimulatorEnv) -> Option<Interactions> {
+        let writer_conn_index = self.storage_stress_writer_conn()?;
+        if !main_schema_empty(env) || env.conn_in_transaction(writer_conn_index) {
+            return None;
+        }
+
+        Some(Interactions::new(
+            writer_conn_index,
+            InteractionsType::Query(storage_stress_create_table()),
+        ))
+    }
+
+    fn storage_stress_writer_insert(&self, env: &SimulatorEnv) -> Option<usize> {
+        let conn_index = self.storage_stress_writer_conn()?;
+        if env.conn_in_transaction(conn_index)
+            || main_schema_empty(env)
+            || main_table_rows(env, conn_index) >= STORAGE_STRESS_MIN_MAIN_TABLE_ROWS_FOR_CHECKPOINT
+        {
+            return None;
+        }
+        Some(conn_index)
+    }
+
+    fn storage_stress_forced_insert(
         &self,
         rng: &mut impl rand::Rng,
         env: &SimulatorEnv,
-    ) -> Option<usize> {
-        let conn_index = self.storage_stress_page_size_conn()?;
+    ) -> Option<Interactions> {
+        let conn_index = self.storage_stress_writer_insert(env)?;
+        let conn_ctx = env.connection_context(conn_index);
+        Some(Interactions::new(
+            conn_index,
+            InteractionsType::Query(forced_storage_stress_fill_insert(rng, &conn_ctx)),
+        ))
+    }
+
+    fn storage_stress_checkpoint_conn(&self, env: &SimulatorEnv) -> Option<usize> {
+        let StorageStress::Active {
+            page_size_conn: Some(conn_index),
+            writer_conn: Some(writer_conn_index),
+            checkpoint_attempted: false,
+        } = self.storage_stress
+        else {
+            return None;
+        };
+
         if env.conn_in_transaction(conn_index)
-            || main_table_rows(env, conn_index) < STORAGE_STRESS_MIN_MAIN_TABLE_ROWS_FOR_CHECKPOINT
-            || !rng.random_bool(STORAGE_STRESS_CHECKPOINT_CONN_RATE)
+            || main_table_rows(env, writer_conn_index)
+                < STORAGE_STRESS_MIN_MAIN_TABLE_ROWS_FOR_CHECKPOINT
         {
             return None;
         }
@@ -167,6 +236,7 @@ impl InteractionPlan {
     fn storage_stress_checkpoint(&mut self, env: &SimulatorEnv) -> Option<Interactions> {
         let StorageStress::Active {
             page_size_conn: Some(conn_index),
+            writer_conn: Some(writer_conn_index),
             ref mut checkpoint_attempted,
         } = self.storage_stress
         else {
@@ -175,7 +245,8 @@ impl InteractionPlan {
 
         if *checkpoint_attempted
             || env.conn_in_transaction(conn_index)
-            || main_table_rows(env, conn_index) < STORAGE_STRESS_MIN_MAIN_TABLE_ROWS_FOR_CHECKPOINT
+            || main_table_rows(env, writer_conn_index)
+                < STORAGE_STRESS_MIN_MAIN_TABLE_ROWS_FOR_CHECKPOINT
         {
             return None;
         }
@@ -192,6 +263,7 @@ impl InteractionPlan {
     fn observe_storage_stress_interaction(&mut self, interaction: &Interaction) {
         let StorageStress::Active {
             ref mut page_size_conn,
+            ref mut writer_conn,
             ref mut checkpoint_attempted,
         } = self.storage_stress
         else {
@@ -203,10 +275,19 @@ impl InteractionPlan {
                 if Some(interaction.connection_index) == *page_size_conn =>
             {
                 *page_size_conn = None;
+                *writer_conn = None;
+                *checkpoint_attempted = false;
+            }
+            InteractionType::Fault(Fault::Disconnect)
+                if Some(interaction.connection_index) == *writer_conn =>
+            {
+                *page_size_conn = None;
+                *writer_conn = None;
                 *checkpoint_attempted = false;
             }
             InteractionType::Fault(Fault::ReopenDatabase) => {
                 *page_size_conn = None;
+                *writer_conn = None;
                 *checkpoint_attempted = false;
             }
             _ => {}
@@ -288,23 +369,21 @@ impl InteractionPlan {
             return Some(interactions);
         }
 
-        if let Some(conn_index) = self.storage_stress_page_size_conn()
-            && main_schema_empty(env)
-        {
-            let create_query = Create::arbitrary(rng, &env.connection_context(conn_index));
-            return Some(Interactions::new(
-                conn_index,
-                InteractionsType::Query(Query::Create(create_query)),
-            ));
+        if let Some(interactions) = self.storage_stress_writer_create(env) {
+            return Some(interactions);
         }
 
         if self.len_properties() < num_interactions {
+            if let Some(interactions) = self.storage_stress_forced_insert(rng, env) {
+                return Some(interactions);
+            }
+
             if let Some(interactions) = self.storage_stress_checkpoint(env) {
                 return Some(interactions);
             }
 
             let conn_index = self
-                .choose_storage_stress_conn(rng, env)
+                .storage_stress_checkpoint_conn(env)
                 .unwrap_or_else(|| env.choose_conn(rng));
             let interactions = if self.mvcc && !env.conn_in_transaction(conn_index) {
                 let query = Query::Begin(Begin::Concurrent);
