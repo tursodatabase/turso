@@ -1927,7 +1927,7 @@ fn emit_update_insns<'a>(
             .columns
             .iter()
             .map(|ic| {
-                if ic.expr.is_some() {
+                if ic.pos_in_table == EXPR_INDEX_SENTINEL {
                     Affinity::Blob.aff_mask()
                 } else {
                     target_table.table.columns()[ic.pos_in_table]
