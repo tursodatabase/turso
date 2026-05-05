@@ -65,7 +65,7 @@ use rustc_hash::FxHashMap as HashMap;
 use std::{cmp::Ordering, collections::VecDeque, sync::Arc};
 use turso_ext::{ConstraintInfo, ConstraintUsage};
 use turso_parser::ast::RefAct;
-use turso_parser::ast::{self, Expr, SortOrder, SubqueryType, TriggerEvent};
+use turso_parser::ast::{self, Expr, SortOrder, SubqueryType, TableInternalId, TriggerEvent};
 
 pub(crate) mod access_method;
 pub(crate) mod constraints;
@@ -76,6 +76,98 @@ pub(crate) mod lift_common_subexpressions;
 pub(crate) mod multi_index;
 pub(crate) mod order;
 pub(crate) mod unnest;
+
+#[derive(Debug, Default)]
+pub(crate) struct AvailableIndexes {
+    indexes_by_table_id: HashMap<TableInternalId, VecDeque<Arc<Index>>>,
+}
+
+impl AvailableIndexes {
+    fn for_table_references(resolver: &Resolver, table_references: &TableReferences) -> Self {
+        let mut available_indexes = Self::default();
+        for table_ref in table_references.joined_tables() {
+            if !matches!(table_ref.table, Table::BTree(_) | Table::Virtual(_)) {
+                continue;
+            }
+            let indexes = resolver.with_schema(table_ref.database_id, |schema| {
+                schema.indexes.get(table_ref.table.get_name()).cloned()
+            });
+            if let Some(indexes) = indexes {
+                available_indexes
+                    .indexes_by_table_id
+                    .insert(table_ref.internal_id, indexes);
+            }
+        }
+        available_indexes
+    }
+
+    pub(crate) fn indexes_for_table(
+        &self,
+        table_id: TableInternalId,
+    ) -> Option<&VecDeque<Arc<Index>>> {
+        self.indexes_by_table_id.get(&table_id)
+    }
+
+    pub(crate) fn btree_indexes_for_column(
+        &self,
+        table_id: TableInternalId,
+        column_pos: usize,
+    ) -> impl Iterator<Item = &Index> {
+        self.indexes_for_table(table_id)
+            .into_iter()
+            .flat_map(|indexes| indexes.iter())
+            .filter(move |index| {
+                index.index_method.is_none()
+                    && index.column_table_pos_to_index_pos(column_pos) == Some(0)
+            })
+            .map(Arc::as_ref)
+    }
+
+    fn btree_index_by_name(
+        &self,
+        table_id: TableInternalId,
+        index_name: &str,
+    ) -> Option<Arc<Index>> {
+        self.indexes_for_table(table_id)?
+            .iter()
+            .find(|index| {
+                index.name.eq_ignore_ascii_case(index_name) && index.index_method.is_none()
+            })
+            .cloned()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn insert_for_table_name(
+        &mut self,
+        joined_tables: &[JoinedTable],
+        table_name: &str,
+        indexes: VecDeque<Arc<Index>>,
+    ) {
+        let table_ref = joined_tables
+            .iter()
+            .find(|table_ref| table_ref.table.get_name() == table_name)
+            .expect("test table should exist");
+        self.indexes_by_table_id
+            .insert(table_ref.internal_id, indexes);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn push_front_for_table_name(
+        &mut self,
+        joined_tables: &[JoinedTable],
+        table_name: &str,
+        index: Arc<Index>,
+    ) {
+        let table_ref = joined_tables
+            .iter()
+            .find(|table_ref| table_ref.table.get_name() == table_name)
+            .expect("test table should exist");
+        self.indexes_by_table_id
+            .entry(table_ref.internal_id)
+            .or_default()
+            .push_front(index);
+    }
+}
 
 /// A candidate index method that could be used for table access in a join query.
 /// This struct captures all information needed to construct an IndexMethodQuery
@@ -353,7 +445,7 @@ fn sorted_arguments_from_parameters(parameters: &HashMap<i32, ast::Expr>) -> Vec
 #[allow(clippy::too_many_arguments)]
 fn collect_index_method_candidates(
     table_references: &TableReferences,
-    available_indexes: &HashMap<String, VecDeque<Arc<Index>>>,
+    available_indexes: &AvailableIndexes,
     where_clause: &[WhereTerm],
     order_by: &[(
         Box<ast::Expr>,
@@ -375,7 +467,7 @@ fn collect_index_method_candidates(
 
     let tables = table_references.joined_tables();
     for (table_idx, table) in tables.iter().enumerate() {
-        let Some(indexes) = available_indexes.get(table.table.get_name()) else {
+        let Some(indexes) = available_indexes.indexes_for_table(table.internal_id) else {
             continue;
         };
 
@@ -447,17 +539,16 @@ pub fn optimize_plan(
     plan: &mut Plan,
     resolver: &Resolver,
 ) -> Result<()> {
-    let schema = resolver.schema();
     match plan {
-        Plan::Select(plan) => optimize_select_plan(plan, schema)?,
-        Plan::Delete(plan) => optimize_delete_plan(plan, schema)?,
+        Plan::Select(plan) => optimize_select_plan(plan, resolver)?,
+        Plan::Delete(plan) => optimize_delete_plan(plan, resolver)?,
         Plan::Update(plan) => optimize_update_plan(program, plan, resolver)?,
         Plan::CompoundSelect {
             left, right_most, ..
         } => {
-            optimize_select_plan(right_most, schema)?;
+            optimize_select_plan(right_most, resolver)?;
             for (plan, _) in left {
-                optimize_select_plan(plan, schema)?;
+                optimize_select_plan(plan, resolver)?;
             }
         }
     }
@@ -640,7 +731,8 @@ struct OptimizeTableAccessResult {
  * but having them separate makes them easier to understand
  */
 #[turso_macros::trace_stack]
-pub fn optimize_select_plan(plan: &mut SelectPlan, schema: &Schema) -> Result<()> {
+pub fn optimize_select_plan(plan: &mut SelectPlan, resolver: &Resolver) -> Result<()> {
+    let schema = resolver.schema();
     // Transform MATCH expressions to fts_match() for FTS optimizer recognition
     #[cfg(all(feature = "fts", not(target_family = "wasm")))]
     transform_match_to_fts_match(&mut plan.where_clause, schema, &plan.table_references)?;
@@ -665,7 +757,9 @@ pub fn optimize_select_plan(plan: &mut SelectPlan, schema: &Schema) -> Result<()
             }
         }
     }
-    optimize_subqueries(plan, schema)?;
+    optimize_subqueries(plan, resolver)?;
+    let available_indexes =
+        AvailableIndexes::for_table_references(resolver, &plan.table_references);
     lift_common_subexpressions_from_binary_or_terms(&mut plan.where_clause)?;
     if let ConstantConditionEliminationResult::ImpossibleCondition =
         eliminate_constant_conditions(&mut plan.where_clause)?
@@ -679,7 +773,7 @@ pub fn optimize_select_plan(plan: &mut SelectPlan, schema: &Schema) -> Result<()
         schema,
         &mut plan.result_columns,
         &mut plan.table_references,
-        &schema.indexes,
+        &available_indexes,
         &mut plan.where_clause,
         &mut plan.order_by,
         &mut plan.group_by,
@@ -730,12 +824,15 @@ pub fn optimize_select_plan(plan: &mut SelectPlan, schema: &Schema) -> Result<()
         plan.estimated_output_rows = Some(est);
     }
 
-    reoptimize_correlated_subqueries(plan, schema)?;
+    reoptimize_correlated_subqueries(plan, resolver)?;
 
     Ok(())
 }
 
-fn optimize_delete_plan(plan: &mut DeletePlan, schema: &Schema) -> Result<()> {
+fn optimize_delete_plan(plan: &mut DeletePlan, resolver: &Resolver) -> Result<()> {
+    let schema = resolver.schema();
+    let available_indexes =
+        AvailableIndexes::for_table_references(resolver, &plan.table_references);
     #[cfg(all(feature = "fts", not(target_family = "wasm")))]
     transform_match_to_fts_match(&mut plan.where_clause, schema, &plan.table_references)?;
 
@@ -748,14 +845,14 @@ fn optimize_delete_plan(plan: &mut DeletePlan, schema: &Schema) -> Result<()> {
     }
 
     if let Some(rowset_plan) = plan.rowset_plan.as_mut() {
-        optimize_select_plan(rowset_plan, schema)?;
+        optimize_select_plan(rowset_plan, resolver)?;
     }
 
     let _ = optimize_table_access(
         schema,
         &mut plan.result_columns,
         &mut plan.table_references,
-        &schema.indexes,
+        &available_indexes,
         &mut plan.where_clause,
         &mut plan.order_by,
         &mut None,
@@ -805,17 +902,18 @@ fn optimize_update_plan(
                 .as_mut()
                 .expect("UPDATE ... FROM must build its write-set SELECT before optimization")
                 .select,
-            schema,
+            resolver,
         )?;
         return Ok(());
     }
 
     let mut order_by = vec![];
+    let available_indexes = AvailableIndexes::for_table_references(resolver, &target_tables);
     let optimize_result = optimize_table_access(
         schema,
         &mut [],
         &mut target_tables,
-        &schema.indexes,
+        &available_indexes,
         &mut plan.where_clause,
         &mut order_by,
         &mut None,
@@ -1193,19 +1291,19 @@ fn update_from_set_result_columns(set_clauses: &[UpdateSetClause]) -> Vec<Result
         .collect()
 }
 
-fn optimize_subqueries(plan: &mut SelectPlan, schema: &Schema) -> Result<()> {
+fn optimize_subqueries(plan: &mut SelectPlan, resolver: &Resolver) -> Result<()> {
     for table in plan.table_references.joined_tables_mut() {
         if let Table::FromClauseSubquery(from_clause_subquery) = &mut table.table {
             let from_clause_subquery = Arc::make_mut(from_clause_subquery);
             // Use match to handle both SelectPlan and CompoundSelect variants
             match from_clause_subquery.plan.as_mut() {
-                Plan::Select(select_plan) => optimize_select_plan(select_plan, schema)?,
+                Plan::Select(select_plan) => optimize_select_plan(select_plan, resolver)?,
                 Plan::CompoundSelect {
                     left, right_most, ..
                 } => {
-                    optimize_select_plan(right_most, schema)?;
+                    optimize_select_plan(right_most, resolver)?;
                     for (select_plan, _) in left {
-                        optimize_select_plan(select_plan, schema)?;
+                        optimize_select_plan(select_plan, resolver)?;
                     }
                 }
                 Plan::Delete(_) | Plan::Update(_) => {
@@ -1233,7 +1331,7 @@ fn optimize_subqueries(plan: &mut SelectPlan, schema: &Schema) -> Result<()> {
 /// strictly larger. The recursive call therefore only propagates larger hints
 /// down the subquery tree; it does not oscillate based on newly estimated row
 /// counts.
-fn reoptimize_correlated_subqueries(plan: &mut SelectPlan, schema: &Schema) -> Result<()> {
+fn reoptimize_correlated_subqueries(plan: &mut SelectPlan, resolver: &Resolver) -> Result<()> {
     let Some(invocation_hint) = plan
         .input_cardinality_hint
         .or(plan.estimated_output_rows)
@@ -1267,7 +1365,7 @@ fn reoptimize_correlated_subqueries(plan: &mut SelectPlan, schema: &Schema) -> R
         }
 
         inner_plan.input_cardinality_hint = Some(invocation_hint);
-        optimize_select_plan(inner_plan, schema)?;
+        optimize_select_plan(inner_plan, resolver)?;
     }
 
     Ok(())
@@ -1304,7 +1402,7 @@ fn select_plan_contains_cte_from_clause_subquery(plan: &SelectPlan) -> bool {
 fn optimize_table_access_with_custom_modules(
     result_columns: &mut [ResultSetColumn],
     table_references: &mut TableReferences,
-    available_indexes: &HashMap<String, VecDeque<Arc<Index>>>,
+    available_indexes: &AvailableIndexes,
     where_query: &mut [WhereTerm],
     order_by: &mut Vec<(
         Box<ast::Expr>,
@@ -1328,7 +1426,7 @@ fn optimize_table_access_with_custom_modules(
     // Only optimize the first table with custom index methods.
     // This allows FTS to be used as the driving table in joins.
     let table = &mut tables[0];
-    let Some(indexes) = available_indexes.get(table.table.get_name()) else {
+    let Some(indexes) = available_indexes.indexes_for_table(table.internal_id) else {
         return Ok(false);
     };
     for index in indexes {
@@ -1638,16 +1736,16 @@ fn expr_has_null_masking_for_table(expr: &ast::Expr, table_id: ast::TableInterna
 /// filtering constraint candidates accordingly.
 fn enforce_indexed_by_hints(
     table_references: &TableReferences,
-    available_indexes: &HashMap<String, VecDeque<Arc<Index>>>,
+    available_indexes: &AvailableIndexes,
     constraints_per_table: &mut [TableConstraints],
 ) -> Result<()> {
     for (i, table_ref) in table_references.joined_tables().iter().enumerate() {
         let Some(ref indexed) = table_ref.indexed else {
             continue;
         };
-        let Some(btree) = table_ref.btree() else {
+        if table_ref.btree().is_none() {
             continue;
-        };
+        }
         let Some(cs) = constraints_per_table.get_mut(i) else {
             continue;
         };
@@ -1655,11 +1753,8 @@ fn enforce_indexed_by_hints(
             ast::Indexed::IndexedBy(name) => {
                 let idx_name = name.as_str();
                 // Verify the index exists and belongs to this table.
-                let forced_index = available_indexes.get(&btree.name).and_then(|indexes| {
-                    indexes.iter().find(|idx| {
-                        idx.name.eq_ignore_ascii_case(idx_name) && idx.index_method.is_none()
-                    })
-                });
+                let forced_index =
+                    available_indexes.btree_index_by_name(table_ref.internal_id, idx_name);
                 let Some(forced_index) = forced_index else {
                     crate::bail_parse_error!("no such index: {}", idx_name);
                 };
@@ -1704,7 +1799,7 @@ fn optimize_table_access(
     schema: &Schema,
     result_columns: &mut [ResultSetColumn],
     table_references: &mut TableReferences,
-    available_indexes: &HashMap<String, VecDeque<Arc<Index>>>,
+    available_indexes: &AvailableIndexes,
     where_clause: &mut [WhereTerm],
     order_by: &mut Vec<(
         Box<ast::Expr>,
@@ -1736,8 +1831,8 @@ fn optimize_table_access(
     }
 
     let has_expression_index = table_references.joined_tables().iter().any(|t| {
-        matches!(&t.table, Table::BTree(btree) if available_indexes
-            .get(&btree.name)
+        matches!(&t.table, Table::BTree(_) if available_indexes
+            .indexes_for_table(t.internal_id)
             .is_some_and(|indexes| indexes.iter().any(|index| index.is_expression_index())))
     });
 
