@@ -711,6 +711,51 @@ impl Statement {
         }
     }
 
+    pub fn get_column_database_name(&self, idx: usize) -> Option<String> {
+        if self.query_mode == QueryMode::Explain || self.query_mode == QueryMode::ExplainQueryPlan {
+            return None;
+        }
+        let column = &self.program.result_columns.get(idx).expect("No column");
+        match &column.expr {
+            turso_parser::ast::Expr::Column { table, .. } => {
+                let joined = self
+                    .program
+                    .table_references
+                    .find_joined_table_by_internal_id(*table)?;
+                self.program
+                    .connection
+                    .get_database_name_by_index(joined.database_id)
+            }
+            _ => None,
+        }
+    }
+
+    pub fn get_column_origin_name(&self, idx: usize) -> Option<Cow<'_, str>> {
+        if self.query_mode == QueryMode::Explain || self.query_mode == QueryMode::ExplainQueryPlan {
+            return None;
+        }
+        let column = &self.program.result_columns.get(idx).expect("No column");
+        match &column.expr {
+            turso_parser::ast::Expr::Column {
+                table,
+                column: col_idx,
+                ..
+            } => {
+                let joined = self
+                    .program
+                    .table_references
+                    .find_joined_table_by_internal_id(*table)?;
+                joined
+                    .table
+                    .get_column_at(*col_idx)?
+                    .name
+                    .as_deref()
+                    .map(Cow::Borrowed)
+            }
+            _ => None,
+        }
+    }
+
     /// Returns the declared type of a result column.
     ///
     /// This behaves similarly to SQLite's `sqlite3_column_decltype()`:

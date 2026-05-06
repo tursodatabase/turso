@@ -176,6 +176,25 @@ extern "C" {
     fn sqlite3_value_dup(value: *mut libc::c_void) -> *mut libc::c_void;
     fn sqlite3_value_free(value: *mut libc::c_void);
     fn sqlite3_context_db_handle(context: *mut libc::c_void) -> *mut libc::c_void;
+    fn sqlite3_bind_blob64(
+        stmt: *mut sqlite3_stmt,
+        idx: i32,
+        blob: *const libc::c_void,
+        len: u64,
+        destructor: Option<unsafe extern "C" fn(*mut libc::c_void)>,
+    ) -> i32;
+    fn sqlite3_bind_text64(
+        stmt: *mut sqlite3_stmt,
+        idx: i32,
+        text: *const libc::c_char,
+        len: u64,
+        destructor: Option<unsafe extern "C" fn(*mut libc::c_void)>,
+        encoding: libc::c_uchar,
+    ) -> i32;
+    fn sqlite3_sql(stmt: *mut sqlite3_stmt) -> *const libc::c_char;
+    fn sqlite3_column_database_name(stmt: *mut sqlite3_stmt, idx: i32) -> *const libc::c_char;
+    fn sqlite3_column_origin_name(stmt: *mut sqlite3_stmt, idx: i32) -> *const libc::c_char;
+    fn sqlite3_extended_result_codes(db: *mut sqlite3, onoff: i32) -> i32;
 }
 
 const SQLITE_OK: i32 = 0;
@@ -3633,6 +3652,217 @@ mod tests {
             let null_handle = sqlite3_context_db_handle(ptr::null_mut());
             assert!(null_handle.is_null());
 
+            assert_eq!(sqlite3_close(db), SQLITE_OK);
+        }
+    }
+
+    #[test]
+    fn test_sqlite3_bind_blob64() {
+        unsafe {
+            let mut db: *mut sqlite3 = ptr::null_mut();
+            assert_eq!(sqlite3_open(c":memory:".as_ptr(), &mut db), SQLITE_OK);
+
+            let mut stmt: *mut sqlite3_stmt = ptr::null_mut();
+            assert_eq!(
+                sqlite3_prepare_v2(
+                    db,
+                    c"CREATE TABLE t (data BLOB)".as_ptr(),
+                    -1,
+                    &mut stmt,
+                    ptr::null_mut(),
+                ),
+                SQLITE_OK
+            );
+            assert_eq!(sqlite3_step(stmt), SQLITE_DONE);
+            assert_eq!(sqlite3_finalize(stmt), SQLITE_OK);
+
+            let blob: &[u8] = &[0xCA, 0xFE, 0xBA, 0xBE];
+            let mut stmt: *mut sqlite3_stmt = ptr::null_mut();
+            assert_eq!(
+                sqlite3_prepare_v2(
+                    db,
+                    c"INSERT INTO t VALUES (?)".as_ptr(),
+                    -1,
+                    &mut stmt,
+                    ptr::null_mut(),
+                ),
+                SQLITE_OK
+            );
+            assert_eq!(
+                sqlite3_bind_blob64(stmt, 1, blob.as_ptr() as *const _, blob.len() as u64, None),
+                SQLITE_OK
+            );
+            assert_eq!(sqlite3_step(stmt), SQLITE_DONE);
+            assert_eq!(sqlite3_finalize(stmt), SQLITE_OK);
+
+            let mut stmt: *mut sqlite3_stmt = ptr::null_mut();
+            assert_eq!(
+                sqlite3_prepare_v2(
+                    db,
+                    c"SELECT data FROM t".as_ptr(),
+                    -1,
+                    &mut stmt,
+                    ptr::null_mut()
+                ),
+                SQLITE_OK
+            );
+            assert_eq!(sqlite3_step(stmt), SQLITE_ROW);
+            let ptr = sqlite3_column_blob(stmt, 0);
+            let len = sqlite3_column_bytes(stmt, 0);
+            assert_eq!(len, 4);
+            let got = std::slice::from_raw_parts(ptr as *const u8, len as usize);
+            assert_eq!(got, blob);
+            assert_eq!(sqlite3_finalize(stmt), SQLITE_OK);
+            assert_eq!(sqlite3_close(db), SQLITE_OK);
+        }
+    }
+
+    #[test]
+    fn test_sqlite3_bind_text64() {
+        unsafe {
+            let mut db: *mut sqlite3 = ptr::null_mut();
+            assert_eq!(sqlite3_open(c":memory:".as_ptr(), &mut db), SQLITE_OK);
+
+            let mut stmt: *mut sqlite3_stmt = ptr::null_mut();
+            assert_eq!(
+                sqlite3_prepare_v2(
+                    db,
+                    c"CREATE TABLE t (val TEXT)".as_ptr(),
+                    -1,
+                    &mut stmt,
+                    ptr::null_mut(),
+                ),
+                SQLITE_OK
+            );
+            assert_eq!(sqlite3_step(stmt), SQLITE_DONE);
+            assert_eq!(sqlite3_finalize(stmt), SQLITE_OK);
+
+            let text = b"hello\0";
+            let mut stmt: *mut sqlite3_stmt = ptr::null_mut();
+            assert_eq!(
+                sqlite3_prepare_v2(
+                    db,
+                    c"INSERT INTO t VALUES (?)".as_ptr(),
+                    -1,
+                    &mut stmt,
+                    ptr::null_mut(),
+                ),
+                SQLITE_OK
+            );
+            // SQLITE_UTF8 = 1
+            assert_eq!(
+                sqlite3_bind_text64(
+                    stmt,
+                    1,
+                    text.as_ptr() as *const libc::c_char,
+                    5, // length without null terminator
+                    None,
+                    1,
+                ),
+                SQLITE_OK
+            );
+            assert_eq!(sqlite3_step(stmt), SQLITE_DONE);
+            assert_eq!(sqlite3_finalize(stmt), SQLITE_OK);
+
+            let mut stmt: *mut sqlite3_stmt = ptr::null_mut();
+            assert_eq!(
+                sqlite3_prepare_v2(
+                    db,
+                    c"SELECT val FROM t".as_ptr(),
+                    -1,
+                    &mut stmt,
+                    ptr::null_mut()
+                ),
+                SQLITE_OK
+            );
+            assert_eq!(sqlite3_step(stmt), SQLITE_ROW);
+            let result = sqlite3_column_text(stmt, 0);
+            assert!(!result.is_null());
+            let got = std::ffi::CStr::from_ptr(result).to_str().unwrap();
+            assert_eq!(got, "hello");
+            assert_eq!(sqlite3_finalize(stmt), SQLITE_OK);
+            assert_eq!(sqlite3_close(db), SQLITE_OK);
+        }
+    }
+
+    #[test]
+    fn test_sqlite3_sql() {
+        unsafe {
+            let mut db: *mut sqlite3 = ptr::null_mut();
+            assert_eq!(sqlite3_open(c":memory:".as_ptr(), &mut db), SQLITE_OK);
+
+            let mut stmt: *mut sqlite3_stmt = ptr::null_mut();
+            assert_eq!(
+                sqlite3_prepare_v2(db, c"SELECT 42".as_ptr(), -1, &mut stmt, ptr::null_mut()),
+                SQLITE_OK
+            );
+            let sql_ptr = sqlite3_sql(stmt);
+            assert!(!sql_ptr.is_null());
+            let sql = std::ffi::CStr::from_ptr(sql_ptr).to_str().unwrap();
+            assert_eq!(sql, "SELECT 42");
+            assert_eq!(sqlite3_finalize(stmt), SQLITE_OK);
+            assert_eq!(sqlite3_close(db), SQLITE_OK);
+        }
+    }
+
+    #[test]
+    fn test_sqlite3_column_database_and_origin_name() {
+        unsafe {
+            let mut db: *mut sqlite3 = ptr::null_mut();
+            assert_eq!(sqlite3_open(c":memory:".as_ptr(), &mut db), SQLITE_OK);
+
+            assert_eq!(
+                sqlite3_exec(
+                    db,
+                    c"CREATE TABLE users (id INTEGER, name TEXT)".as_ptr(),
+                    None,
+                    ptr::null_mut(),
+                    ptr::null_mut(),
+                ),
+                SQLITE_OK
+            );
+
+            let mut stmt: *mut sqlite3_stmt = ptr::null_mut();
+            assert_eq!(
+                sqlite3_prepare_v2(
+                    db,
+                    c"SELECT id AS user_id, name FROM users".as_ptr(),
+                    -1,
+                    &mut stmt,
+                    ptr::null_mut(),
+                ),
+                SQLITE_OK
+            );
+
+            // database name is always "main" for local tables
+            let db_name_ptr = sqlite3_column_database_name(stmt, 0);
+            assert!(!db_name_ptr.is_null());
+            let db_name = std::ffi::CStr::from_ptr(db_name_ptr).to_str().unwrap();
+            assert_eq!(db_name, "main");
+
+            // origin name is the real column name, not the alias
+            let origin_ptr = sqlite3_column_origin_name(stmt, 0);
+            assert!(!origin_ptr.is_null());
+            let origin = std::ffi::CStr::from_ptr(origin_ptr).to_str().unwrap();
+            assert_eq!(origin, "id");
+
+            let origin2_ptr = sqlite3_column_origin_name(stmt, 1);
+            assert!(!origin2_ptr.is_null());
+            let origin2 = std::ffi::CStr::from_ptr(origin2_ptr).to_str().unwrap();
+            assert_eq!(origin2, "name");
+
+            assert_eq!(sqlite3_finalize(stmt), SQLITE_OK);
+            assert_eq!(sqlite3_close(db), SQLITE_OK);
+        }
+    }
+
+    #[test]
+    fn test_sqlite3_extended_result_codes() {
+        unsafe {
+            let mut db: *mut sqlite3 = ptr::null_mut();
+            assert_eq!(sqlite3_open(c":memory:".as_ptr(), &mut db), SQLITE_OK);
+            assert_eq!(sqlite3_extended_result_codes(db, 1), SQLITE_OK);
+            assert_eq!(sqlite3_extended_result_codes(db, 0), SQLITE_OK);
             assert_eq!(sqlite3_close(db), SQLITE_OK);
         }
     }

@@ -164,6 +164,7 @@ pub struct sqlite3_stmt {
     /// High-water mark of `search_count` already published to the global
     /// counter, so each step contributes only the delta.
     pub(crate) prev_search_count: i64,
+    pub(crate) sql: Option<CString>,
 }
 
 impl sqlite3_stmt {
@@ -177,6 +178,7 @@ impl sqlite3_stmt {
             text_cache: vec![vec![]; n_cols],
             value_cache: (0..n_cols).map(|_| None).collect(),
             prev_search_count: 0,
+            sql: None,
         }
     }
     #[inline]
@@ -829,6 +831,7 @@ pub unsafe extern "C" fn sqlite3_prepare_v2(
         *tail = sql.add(stmt.tail_offset());
     }
     let new_stmt = Box::leak(Box::new(sqlite3_stmt::new(raw_db, stmt)));
+    new_stmt.sql = CString::new(sql_str).ok();
 
     new_stmt.next = db.stmt_list;
     db.stmt_list = new_stmt;
@@ -3024,19 +3027,23 @@ unsafe fn set_db_err(db: &mut sqlite3Inner, err: LimboError) -> i32 {
     code
 }
 
-// Symbols required by libsqlite3-sys / sqlx-sqlite that are not yet
-// implemented in Turso.  They are declared here so the dynamic library links
-// successfully; each returns a safe no-op value.
+// Symbols required by libsqlite3-sys / sqlx-sqlite.
 
 #[no_mangle]
 pub unsafe extern "C" fn sqlite3_update_hook(
     _db: *mut sqlite3,
     _callback: Option<
-        unsafe extern "C" fn(*mut ffi::c_void, ffi::c_int, *const ffi::c_char, *const ffi::c_char, i64),
+        unsafe extern "C" fn(
+            *mut ffi::c_void,
+            ffi::c_int,
+            *const ffi::c_char,
+            *const ffi::c_char,
+            i64,
+        ),
     >,
     _context: *mut ffi::c_void,
 ) -> *mut ffi::c_void {
-    std::ptr::null_mut()
+    stub!();
 }
 
 #[no_mangle]
@@ -3045,7 +3052,7 @@ pub unsafe extern "C" fn sqlite3_commit_hook(
     _callback: Option<unsafe extern "C" fn(*mut ffi::c_void) -> ffi::c_int>,
     _context: *mut ffi::c_void,
 ) -> *mut ffi::c_void {
-    std::ptr::null_mut()
+    stub!();
 }
 
 #[no_mangle]
@@ -3054,13 +3061,24 @@ pub unsafe extern "C" fn sqlite3_rollback_hook(
     _callback: Option<unsafe extern "C" fn(*mut ffi::c_void)>,
     _context: *mut ffi::c_void,
 ) {
+    stub!();
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn sqlite3_extended_result_codes(
-    _db: *mut sqlite3,
-    _onoff: ffi::c_int,
+    raw_db: *mut sqlite3,
+    onoff: ffi::c_int,
 ) -> ffi::c_int {
+    if raw_db.is_null() {
+        return SQLITE_MISUSE;
+    }
+    let db = &mut *raw_db;
+    let mut db = db.inner.lock().unwrap();
+    db.err_mask = if onoff != 0 {
+        0xFFFFFFFFu32 as i32
+    } else {
+        0xFF
+    };
     SQLITE_OK
 }
 
@@ -3080,28 +3098,67 @@ pub unsafe extern "C" fn sqlite3_unlock_notify(
     _callback: Option<unsafe extern "C" fn(*mut *mut ffi::c_void, ffi::c_int)>,
     _context: *mut ffi::c_void,
 ) -> ffi::c_int {
-    SQLITE_OK
+    stub!();
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn sqlite3_sql(_stmt: *mut sqlite3_stmt) -> *const ffi::c_char {
-    std::ptr::null()
+pub unsafe extern "C" fn sqlite3_sql(stmt: *mut sqlite3_stmt) -> *const ffi::c_char {
+    if stmt.is_null() {
+        return std::ptr::null();
+    }
+    let stmt = &*stmt;
+    stmt.sql
+        .as_ref()
+        .map(|s| s.as_ptr())
+        .unwrap_or(std::ptr::null())
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn sqlite3_column_database_name(
-    _stmt: *mut sqlite3_stmt,
-    _idx: ffi::c_int,
+    stmt: *mut sqlite3_stmt,
+    idx: ffi::c_int,
 ) -> *const ffi::c_char {
-    std::ptr::null()
+    if stmt.is_null() {
+        return std::ptr::null();
+    }
+    let stmt = &mut *stmt;
+    let idx = match usize::try_from(idx) {
+        Ok(i) => i,
+        Err(_) => return std::ptr::null(),
+    };
+    let name = match stmt.stmt.get_column_database_name(idx) {
+        Some(n) => n,
+        None => return std::ptr::null(),
+    };
+    let c_string = match CString::new(name) {
+        Ok(s) => s,
+        Err(_) => return std::ptr::null(),
+    };
+    c_string.into_raw()
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn sqlite3_column_origin_name(
-    _stmt: *mut sqlite3_stmt,
-    _idx: ffi::c_int,
+    stmt: *mut sqlite3_stmt,
+    idx: ffi::c_int,
 ) -> *const ffi::c_char {
-    std::ptr::null()
+    if stmt.is_null() {
+        return std::ptr::null();
+    }
+    let stmt = &mut *stmt;
+    let idx = match usize::try_from(idx) {
+        Ok(i) => i,
+        Err(_) => return std::ptr::null(),
+    };
+    let binding = match stmt.stmt.get_column_origin_name(idx) {
+        Some(n) => n.into_owned(),
+        None => return std::ptr::null(),
+    };
+    let c_string = match CString::new(binding) {
+        Ok(s) => s,
+        Err(_) => return std::ptr::null(),
+    };
+    c_string.into_raw()
 }
 
 #[no_mangle]
