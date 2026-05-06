@@ -1374,11 +1374,25 @@ mod tests {
     }
 
     fn history_output_path(label: &str) -> std::path::PathBuf {
+        let label = sanitize_history_path_component(label);
+        let thread_name =
+            sanitize_history_path_component(std::thread::current().name().unwrap_or("test"));
         std::env::temp_dir().join(format!(
-            "turso-whopper-history-{label}-{}-{}.jsonl",
+            "turso-whopper-history-{label}-{}-{thread_name}.jsonl",
             std::process::id(),
-            std::thread::current().name().unwrap_or("test")
         ))
+    }
+
+    /// remove characters that are invalid in Windows path names
+    fn sanitize_history_path_component(component: &str) -> String {
+        component
+            .chars()
+            .map(|ch| match ch {
+                '<' | '>' | ':' | '"' | '/' | '\\' | '|' | '?' | '*' => '_',
+                ch if ch.is_control() => '_',
+                ch => ch,
+            })
+            .collect()
     }
 
     #[test]

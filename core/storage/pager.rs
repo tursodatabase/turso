@@ -5708,6 +5708,21 @@ mod checkpoint_phase_tests {
     use crate::types::IOResult;
     use crate::Database;
 
+    fn shared_wal_test_io() -> Arc<dyn IO> {
+        cfg_if::cfg_if! {
+            if #[cfg(all(
+                target_os = "windows",
+                feature = "experimental_win_iocp",
+                feature = "fs",
+                not(miri)
+            ))] {
+                Arc::new(crate::WindowsIOCP::new().unwrap())
+            } else {
+                Arc::new(PlatformIO::new().unwrap())
+            }
+        }
+    }
+
     fn open_checkpoint_test_database() -> (Arc<Database>, std::path::PathBuf) {
         let dir = tempfile::tempdir().unwrap().keep();
         let db_path = dir.join("test.db");
@@ -5717,7 +5732,7 @@ mod checkpoint_phase_tests {
                 .pragma_update(None, "journal_mode", "wal")
                 .unwrap();
         }
-        let io: Arc<dyn IO> = Arc::new(PlatformIO::new().unwrap());
+        let io = shared_wal_test_io();
         let db = Database::open_file_with_flags(
             io,
             db_path.to_str().unwrap(),

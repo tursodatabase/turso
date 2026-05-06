@@ -70,6 +70,7 @@ tantivy = { version = "0.26.0", optional = true }
 [dependencies]
 turso_ext = { workspace = true, features = ["core_only"] }
 cfg_block = "0.1.1"
+cfg-if = { workspace = true }
 fallible-iterator = { workspace = true }
 hex = { workspace = true }
 thiserror = { workspace = true }
