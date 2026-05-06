@@ -912,8 +912,7 @@ fn reopen_database(env: &mut SimulatorEnv) {
                 turso_core::OpenFlags::default(),
                 turso_core::DatabaseOpts::new()
                     .with_autovacuum(true)
-                    .with_attach(true)
-                    .with_generated_columns(true),
+                    .with_attach(true),
                 None,
             ) {
                 Ok(db) => db,

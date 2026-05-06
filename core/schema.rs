@@ -653,8 +653,6 @@ pub struct Schema {
 
     /// Custom type registry, loaded from sqlite_turso_types
     pub type_registry: HashMap<String, Arc<TypeDef>>,
-
-    pub generated_columns_enabled: bool,
 }
 
 impl Default for Schema {
@@ -778,7 +776,6 @@ impl Schema {
             incompatible_views,
             dropped_root_pages: HashSet::default(),
             type_registry,
-            generated_columns_enabled: false,
         })
     }
 
@@ -1722,13 +1719,6 @@ impl Schema {
                 } else {
                     let table = BTreeTable::from_sql(sql, root_page)?;
 
-                    if table.has_virtual_columns && !self.generated_columns_enabled {
-                        return Err(LimboError::ParseError(format!(
-                            "table '{}' uses generated columns but the generated_columns feature is not enabled",
-                            table.name
-                        )));
-                    }
-
                     // Check if this is a DBSP state table
                     if table.name.starts_with(DBSP_TABLE_PREFIX) {
                         // Extract version and view name from __turso_internal_dbsp_state_v<version>_<viewname>
@@ -2222,7 +2212,6 @@ impl Clone for Schema {
             incompatible_views,
             dropped_root_pages: self.dropped_root_pages.clone(),
             type_registry: self.type_registry.clone(),
-            generated_columns_enabled: self.generated_columns_enabled,
         }
     }
 }
@@ -5905,31 +5894,6 @@ mod tests {
         assert!(matches!(index.columns[0].order, SortOrder::Asc));
 
         Ok(())
-    }
-
-    #[test]
-    fn test_schema_loading_rejects_gencol_without_flag() {
-        let mut schema = Schema::new();
-        schema.generated_columns_enabled = false;
-
-        let result = schema.handle_schema_row(
-            "table",
-            "t1",
-            "t1",
-            2,
-            Some("CREATE TABLE t1(a INTEGER, b AS (a*2))"),
-            &SymbolTable::default(),
-            &mut Vec::new(),
-            &mut HashMap::default(),
-            &mut HashMap::default(),
-            &mut HashMap::default(),
-            &mut HashMap::default(),
-            &|_| None,
-        );
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("generated columns"));
     }
 
     fn indices(mask: &ColumnMask) -> Vec<usize> {

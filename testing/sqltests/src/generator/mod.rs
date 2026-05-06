@@ -853,7 +853,6 @@ async fn generate_gencol_not_null_violation_fixture(db_path: &Path) -> Result<()
 
     let db_path_str = db_path.to_string_lossy().to_string();
     let db = Builder::new_local(&db_path_str)
-        .experimental_generated_columns(true)
         .build()
         .await
         .with_context(|| {

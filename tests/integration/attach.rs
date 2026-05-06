@@ -306,26 +306,6 @@ fn test_fresh_mvcc_attach_rejects_custom_durable_storage_without_attached_backen
 }
 
 #[turso_macros::test]
-fn test_attach_inherits_generated_columns_flag_on_reattach(
-    _tmp_db: TempDatabase,
-) -> anyhow::Result<()> {
-    let db = attach_enabled_db(DatabaseOpts::new().with_generated_columns(true));
-    let conn = db.connect_limbo();
-
-    let aux_path = db.path.with_extension("attach_generated_columns.db");
-    conn.execute(format!("ATTACH '{}' AS aux", aux_path.display()))?;
-    conn.execute("CREATE TABLE aux.t(x INTEGER, y INTEGER GENERATED ALWAYS AS (x + 1) VIRTUAL)")?;
-    conn.execute("INSERT INTO aux.t(x) VALUES (41)")?;
-    conn.execute("DETACH aux")?;
-
-    conn.execute(format!("ATTACH '{}' AS aux", aux_path.display()))?;
-    let rows: Vec<(i64, i64)> = conn.exec_rows("SELECT x, y FROM aux.t");
-    assert_eq!(rows, vec![(41, 42)]);
-
-    Ok(())
-}
-
-#[turso_macros::test]
 fn test_attach_inherits_index_method_flag_on_reattach(_tmp_db: TempDatabase) -> anyhow::Result<()> {
     let db = attach_enabled_db(DatabaseOpts::new().with_index_method(true));
     let conn = db.connect_limbo();

@@ -657,7 +657,7 @@ impl TursoDatabase {
                                 "vacuum" => opts.with_vacuum(true),
                                 "encryption" => opts.with_encryption(true),
                                 "attach" => opts.with_attach(true),
-                                "generated_columns" => opts.with_generated_columns(true),
+                                "generated_columns" => opts, // generated columns are always enabled, kept for backwards compatibility
                                 "multiprocess_wal" => opts.with_multiprocess_wal(true),
                                 _ => opts,
                             };

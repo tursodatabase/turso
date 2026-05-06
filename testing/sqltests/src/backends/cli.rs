@@ -19,7 +19,6 @@ const TURSO_CLI_EXPERIMENTAL_FLAGS: &[&str] = &[
     "--experimental-custom-types",
     "--experimental-attach",
     "--experimental-index-method",
-    "--experimental-generated-columns",
     "--experimental-vacuum",
 ];
 

@@ -3591,7 +3591,7 @@ fn test_vacuum_into_preserves_sqlite_stat1(tmp_db: TempDatabase) -> anyhow::Resu
 #[test]
 fn test_vacuum_into_preserves_generated_columns() -> anyhow::Result<()> {
     let _ = env_logger::try_init();
-    let opts = turso_core::DatabaseOpts::new().with_generated_columns(true);
+    let opts = turso_core::DatabaseOpts::new();
     let tmp_db = TempDatabase::builder().with_opts(opts).build();
     let conn = tmp_db.connect_limbo();
 
@@ -3638,7 +3638,7 @@ fn test_vacuum_into_preserves_generated_columns() -> anyhow::Result<()> {
 #[test]
 fn test_vacuum_into_generated_column_with_rowid_and_deletes() -> anyhow::Result<()> {
     let _ = env_logger::try_init();
-    let opts = turso_core::DatabaseOpts::new().with_generated_columns(true);
+    let opts = turso_core::DatabaseOpts::new();
     let tmp_db = TempDatabase::builder().with_opts(opts).build();
     let conn = tmp_db.connect_limbo();
 
@@ -3993,7 +3993,7 @@ fn test_vacuum_into_preserves_vector_blobs(tmp_db: TempDatabase) -> anyhow::Resu
 /// Plain VACUUM must preserve generated column values.
 #[test]
 fn test_plain_vacuum_preserves_generated_columns() -> anyhow::Result<()> {
-    let opts = DatabaseOpts::new().with_generated_columns(true);
+    let opts = DatabaseOpts::new();
     let tmp_db = TempDatabase::builder().with_opts(opts).build();
     let conn = tmp_db.connect_limbo();
 

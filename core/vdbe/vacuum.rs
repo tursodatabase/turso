@@ -159,7 +159,6 @@ pub(crate) fn vacuum_target_opts_from_source(source_db: &Database) -> DatabaseOp
         .with_encryption(source_db.experimental_encryption_enabled())
         .with_autovacuum(source_db.experimental_autovacuum_enabled())
         .with_attach(source_db.experimental_attach_enabled())
-        .with_generated_columns(source_db.experimental_generated_columns_enabled())
 }
 
 pub(crate) fn reject_unsupported_vacuum_auto_vacuum_mode(mode: AutoVacuumMode) -> Result<()> {
@@ -2621,7 +2620,6 @@ mod tests {
         })?;
 
         let replacement = Schema {
-            generated_columns_enabled: true,
             schema_version: 0,
             ..Default::default()
         };
@@ -2629,7 +2627,6 @@ mod tests {
 
         let schema = db.clone_schema();
         assert_eq!(schema.schema_version, 0);
-        assert!(schema.generated_columns_enabled);
 
         Ok(())
     }
@@ -2653,7 +2650,6 @@ mod tests {
         let committed = VacuumCommittedImageMeta {
             header,
             schema: Arc::new(Schema {
-                generated_columns_enabled: true,
                 schema_version: 42,
                 ..Default::default()
             }),
@@ -2662,10 +2658,8 @@ mod tests {
         install_committed_vacuum_image(&conn, crate::MAIN_DB_ID, &committed);
 
         assert_eq!(conn.schema.read().schema_version, 42);
-        assert!(conn.schema.read().generated_columns_enabled);
         let shared = db.clone_schema();
         assert_eq!(shared.schema_version, 42);
-        assert!(shared.generated_columns_enabled);
 
         Ok(())
     }
@@ -2689,7 +2683,6 @@ mod tests {
         let committed = VacuumCommittedImageMeta {
             header,
             schema: Arc::new(Schema {
-                generated_columns_enabled: true,
                 schema_version: 43,
                 ..Default::default()
             }),
@@ -2705,10 +2698,8 @@ mod tests {
         )?;
 
         assert_eq!(conn.schema.read().schema_version, 43);
-        assert!(conn.schema.read().generated_columns_enabled);
         let shared = db.clone_schema();
         assert_eq!(shared.schema_version, 43);
-        assert!(shared.generated_columns_enabled);
 
         Ok(())
     }

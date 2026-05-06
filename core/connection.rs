@@ -358,9 +358,8 @@ impl Connection {
 
     pub(crate) fn empty_temp_schema(&self) -> Arc<Schema> {
         // with_options only fails if built-in type SQL is malformed (programmer bug).
-        let mut schema = Schema::with_options(self.db.experimental_custom_types_enabled())
+        let schema = Schema::with_options(self.db.experimental_custom_types_enabled())
             .expect("built-in type definitions are malformed");
-        schema.generated_columns_enabled = self.db.experimental_generated_columns_enabled();
         Arc::new(schema)
     }
 
@@ -370,7 +369,6 @@ impl Connection {
             .with_custom_types(self.db.experimental_custom_types_enabled())
             .with_index_method(self.db.experimental_index_method_enabled())
             .with_vacuum(self.db.experimental_vacuum_enabled())
-            .with_generated_columns(self.db.experimental_generated_columns_enabled())
     }
 
     fn effective_temp_store(&self) -> crate::TempStore {
@@ -960,7 +958,6 @@ impl Connection {
         self.pager.load().set_schema_cookie(Some(cookie));
         // create fresh schema as some objects can be deleted
         let mut fresh = Schema::with_options(self.experimental_custom_types_enabled())?;
-        fresh.generated_columns_enabled = self.db.experimental_generated_columns_enabled();
         fresh.schema_version = cookie;
 
         // Capture built-in table-valued functions (e.g. generate_series, json_each)
@@ -2002,10 +1999,6 @@ impl Connection {
         self.db.experimental_multiprocess_wal_enabled()
     }
 
-    pub fn experimental_generated_columns_enabled(&self) -> bool {
-        self.db.experimental_generated_columns_enabled()
-    }
-
     pub fn mvcc_enabled(&self) -> bool {
         self.db.mvcc_enabled()
     }
@@ -2457,8 +2450,7 @@ impl Connection {
             .with_views(self.db.experimental_views_enabled())
             .with_custom_types(self.db.experimental_custom_types_enabled())
             .with_index_method(self.db.experimental_index_method_enabled())
-            .with_vacuum(self.db.experimental_vacuum_enabled())
-            .with_generated_columns(self.db.experimental_generated_columns_enabled());
+            .with_vacuum(self.db.experimental_vacuum_enabled());
         // Select the IO layer for the attached database:
         // - :memory: databases always get a fresh MemoryIO
         // - File-based databases reuse the parent's IO when the parent is also

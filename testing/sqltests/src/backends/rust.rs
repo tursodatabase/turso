@@ -9,14 +9,8 @@ use std::sync::Arc;
 use tempfile::NamedTempFile;
 use turso::{Builder, Connection, Database, Value};
 
-const TURSO_RUST_EXPERIMENTAL_FEATURES: &[&str] = &[
-    "attach",
-    "index_method",
-    "views",
-    "custom_types",
-    "generated_columns",
-    "vacuum",
-];
+const TURSO_RUST_EXPERIMENTAL_FEATURES: &[&str] =
+    &["attach", "index_method", "views", "custom_types", "vacuum"];
 
 fn apply_turso_experimental_features(mut builder: Builder) -> Builder {
     for feature in TURSO_RUST_EXPERIMENTAL_FEATURES {
@@ -25,7 +19,6 @@ fn apply_turso_experimental_features(mut builder: Builder) -> Builder {
             "index_method" => builder.experimental_index_method(true),
             "views" => builder.experimental_materialized_views(true),
             "custom_types" => builder.experimental_custom_types(true),
-            "generated_columns" => builder.experimental_generated_columns(true),
             "vacuum" => builder.experimental_vacuum(true),
             _ => unreachable!("unexpected sqltests Rust backend experimental feature"),
         };

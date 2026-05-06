@@ -81,7 +81,9 @@ impl Property {
                             // in the type system?
                             expand_with_generated_columns(table, Some(columns), partial_row)
                         }
-                        Insert::Values { .. } => expand_with_generated_columns(table, None, partial_row),
+                        Insert::Values { .. } => {
+                            expand_with_generated_columns(table, None, partial_row)
+                        }
                         _ => unreachable!(),
                     };
 

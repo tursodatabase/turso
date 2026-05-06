@@ -93,8 +93,6 @@ pub struct Opts {
     pub experimental_vacuum: bool,
     #[clap(long, help = "Enable experimental attach feature")]
     pub experimental_attach: bool,
-    #[clap(long, help = "Enable experimental generated columns feature")]
-    pub experimental_generated_columns: bool,
     #[clap(
         long,
         help = "Enable experimental multiprocess WAL coordination (on Windows, use --vfs experimental_win_iocp)"
@@ -240,7 +238,6 @@ impl Limbo {
             .with_autovacuum(opts.experimental_autovacuum)
             .with_vacuum(opts.experimental_vacuum)
             .with_attach(opts.experimental_attach)
-            .with_generated_columns(opts.experimental_generated_columns)
             .with_multiprocess_wal(opts.experimental_multiprocess_wal)
             .with_unsafe_testing(opts.unsafe_testing);
 

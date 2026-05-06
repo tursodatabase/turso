@@ -145,7 +145,6 @@ pub struct Builder {
     enable_index_method: bool,
     enable_materialized_views: bool,
     enable_vacuum: bool,
-    enable_generated_columns: bool,
     enable_multiprocess_wal: bool,
     vfs: Option<String>,
     encryption_opts: Option<turso_sdk_kit::rsapi::EncryptionOpts>,
@@ -163,7 +162,6 @@ impl Builder {
             enable_index_method: false,
             enable_materialized_views: false,
             enable_vacuum: false,
-            enable_generated_columns: false,
             enable_multiprocess_wal: false,
             vfs: None,
             encryption_opts: None,
@@ -201,8 +199,8 @@ impl Builder {
         self
     }
 
-    pub fn experimental_generated_columns(mut self, gencols_enabled: bool) -> Self {
-        self.enable_generated_columns = gencols_enabled;
+    /// Kept for backwards compatibility. Generated columns are now always enabled.
+    pub fn experimental_generated_columns(self, _gencols_enabled: bool) -> Self {
         self
     }
 
@@ -256,9 +254,6 @@ impl Builder {
         }
         if self.enable_vacuum {
             features.push("vacuum");
-        }
-        if self.enable_generated_columns {
-            features.push("generated_columns");
         }
         if self.enable_multiprocess_wal {
             features.push("multiprocess_wal");
