@@ -230,7 +230,7 @@ impl CommitState {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum Register {
     Value(Value),
     Aggregate(AggContext),
@@ -624,6 +624,8 @@ pub struct ProgramState {
     pub(crate) cursors: Vec<Option<Cursor>>,
     cursor_seqs: Vec<i64>,
     registers: Box<[Register]>,
+    /// Trace state: last pc we printed a line for, and a register snapshot for diffing.
+    pre_op_registers: Option<Box<[Register]>>,
     pub(crate) result_row: Option<Row>,
     last_compare: Option<std::cmp::Ordering>,
     deferred_seeks: Vec<Option<DeferredSeekState>>,
@@ -721,6 +723,7 @@ impl ProgramState {
             cursors,
             cursor_seqs,
             registers,
+            pre_op_registers: None,
             result_row: None,
             last_compare: None,
             deferred_seeks: vec![None; max_cursors],
@@ -1585,10 +1588,28 @@ impl Program {
             let insn_function = insn.to_function();
             if enable_tracing {
                 if self.connection.get_vdbe_trace() {
+                    // Diff registers from PREVIOUS opcode
+                    // The last opcode (Halt) won't have its diff printed, but Halt
+                    // doesn't write to any registers
+                    if let Some(ref old) = state.pre_op_registers {
+                        for (i, (old_reg, new_reg)) in
+                            old.iter().zip(state.registers.iter()).enumerate()
+                        {
+                            if old_reg != new_reg {
+                                match new_reg {
+                                    Register::Value(v) => println!("R[{i}] = {v}"),
+                                    Register::Aggregate(_) => println!("R[{i}] = <aggregate>"),
+                                    Register::Record(_) => println!("R[{i}] = <record>"),
+                                }
+                            }
+                        }
+                        state.pre_op_registers = None;
+                    }
+
+                    // Print CURRENT opcode
                     if matches!(insn, Insn::Init { .. }) {
                         println!("VDBE Trace:");
                     }
-
                     println!(
                         "{}",
                         explain::insn_to_str(
@@ -1603,6 +1624,8 @@ impl Program {
                                 .copied()
                         )
                     );
+                    // Snapshot for next iteration
+                    state.pre_op_registers = Some(state.registers.clone());
                 } else {
                     trace_insn(self, state.pc as InsnReference, insn);
                 }
