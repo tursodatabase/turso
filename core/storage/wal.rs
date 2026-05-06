@@ -418,9 +418,7 @@ impl TursoRwLock {
         (self.0.load(Ordering::Acquire) >> Self::VALUE_SHIFT) as u32
     }
 
-    /// Non-mutating check for whether the writer bit is currently set.
-    /// Intended for diagnostics and tests that want to assert lock state
-    /// without acquiring (which would itself perturb the state).
+    /// Returns whether the writer bit is currently set, without acquiring.
     #[inline]
     pub fn is_writer_held(&self) -> bool {
         Self::has_writer(self.0.load(Ordering::Acquire))

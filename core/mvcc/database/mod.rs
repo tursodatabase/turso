@@ -1570,6 +1570,27 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
                     return Err(LimboError::SchemaConflict);
                 }
 
+                // A CONCURRENT writer must not transition to Preparing while
+                // an exclusive tx is active. Otherwise the exclusive tx could
+                // speculatively read a Preparing row from this writer and
+                // form a wait-for cycle: writer waits for pager_commit_lock
+                // (held by the exclusive tx), exclusive tx waits in
+                // WaitForDependencies for this writer to commit.
+                //
+                // Yield IO and re-check on the next step. We have not drawn
+                // an end_ts and have not mutated any row versions, so
+                // waiting here costs nothing the exclusive tx needs. Once
+                // the exclusive tx finishes, has_exclusive_tx returns false
+                // and we proceed without losing any of the writer's work.
+                if !mvcc_store.is_exclusive_tx(&self.tx_id)
+                    && mvcc_store.has_exclusive_tx()
+                    && !tx.write_set.is_empty()
+                {
+                    return Ok(TransitionResult::Io(IOCompletions::Single(
+                        Completion::new_yield(),
+                    )));
+                }
+
                 // Atomically generate end_ts and publish Preparing(end_ts) while the
                 // clock lock is held. This closes the TOCTOU window
                 // Consider the example:
@@ -3461,6 +3482,29 @@ impl<Clock: LogicalClock> MvStore<Clock> {
         if !already_exclusive {
             self.acquire_exclusive_tx(&tx_id)
                 .inspect_err(|_| unlock_checkpoint_guard())?;
+        }
+
+        // Check if any CONCURRENT writer is in Preparing state. If there is one,
+        // we must wait for it to complete before proceeding. Otherwise, we can
+        // have concurrent txn deadlock trying to acquire pager_commit_lock.
+        let any_concurrent_in_preparing = self.txs.iter().any(|entry| {
+            let other_tx_id = *entry.key();
+            if other_tx_id == tx_id {
+                return false;
+            }
+            matches!(entry.value().state.load(), TransactionState::Preparing(_))
+        });
+        if any_concurrent_in_preparing {
+            tracing::debug!(
+                "begin_exclusive_tx: tx_id={} returned Busy because a \
+                 CONCURRENT writer is in Preparing",
+                tx_id
+            );
+            if !already_exclusive {
+                self.release_exclusive_tx(&tx_id);
+            }
+            unlock_checkpoint_guard();
+            return Err(LimboError::Busy);
         }
 
         let already_holds_commit_lock = maybe_existing_tx_id
