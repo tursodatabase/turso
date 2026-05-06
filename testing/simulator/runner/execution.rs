@@ -410,11 +410,6 @@ fn execute_interaction_rusqlite(
                     .map_err(|e| {
                         LimboError::InternalError(format!("DB succeeded but shadow detected error: {e}. This may indicate a constraint enforcement bug."))
                     })?;
-            } else {
-                // TODO why?
-                // Don't propagate shadow errors if the DB failed
-                let _ =
-                    interaction.shadow(&mut env.get_conn_tables_mut(interaction.connection_index));
             }
         }
         InteractionType::FsyncQuery(..) => {
