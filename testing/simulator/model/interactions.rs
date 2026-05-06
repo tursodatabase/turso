@@ -881,6 +881,7 @@ fn reopen_database(env: &mut SimulatorEnv) {
             env.rollback_conn(conn_index);
         }
     }
+    env.mvcc_rowid_allocators.clear();
 
     env.connections.clear();
 

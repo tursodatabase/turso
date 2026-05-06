@@ -9922,3 +9922,34 @@ fn test_read_lock_leak_deferred_then_concurrent() {
     let rows = get_rows(&conn1, "SELECT * FROM t1");
     assert_eq!(rows.len(), 1);
 }
+
+#[test]
+fn test_mvcc_rowid_allocator_preserves_explicit_rowids_seen_before_first_auto_rowid() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let conn0 = db.connect();
+    let conn1 = db.connect();
+
+    conn0
+        .execute("CREATE TABLE t(id INTEGER PRIMARY KEY, val TEXT)")
+        .unwrap();
+    conn1.execute("BEGIN CONCURRENT").unwrap();
+    conn0.execute("BEGIN CONCURRENT").unwrap();
+
+    conn1
+        .execute("INSERT INTO t VALUES (10, 'a'), (11, 'b')")
+        .unwrap();
+    conn0
+        .execute("INSERT INTO t VALUES (1, 'c'), (NULL, 'd')")
+        .unwrap();
+
+    let rows = get_rows(&conn0, "SELECT id FROM t WHERE val = 'd'");
+    assert_eq!(rows[0][0].to_string(), "12");
+
+    conn1
+        .execute("UPDATE t SET val = 'a2' WHERE id = 10")
+        .unwrap();
+    conn1.execute("INSERT INTO t VALUES (NULL, 'e')").unwrap();
+
+    let rows = get_rows(&conn1, "SELECT id FROM t WHERE val = 'e'");
+    assert_eq!(rows[0][0].to_string(), "13");
+}

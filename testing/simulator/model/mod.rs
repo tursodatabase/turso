@@ -211,6 +211,7 @@ fn validate_integer_pk_row_non_null(
 }
 
 fn prepare_insert_rows(
+    tables: &mut ShadowTablesMut,
     table_name: &str,
     columns: &[Column],
     existing_rows: &[Vec<SimValue>],
@@ -219,11 +220,36 @@ fn prepare_insert_rows(
     let mut new_rows = input_rows.to_vec();
 
     if let Some(pk_idx) = integer_pk_index(columns) {
-        let mut alloc = RowidAllocator::new(existing_rows, pk_idx);
-        new_rows = new_rows
-            .iter()
-            .map(|r| normalize_integer_pk_row(table_name, columns, pk_idx, &mut alloc, r))
-            .collect::<anyhow::Result<Vec<_>>>()?;
+        if tables.uses_mvcc_rowid_allocator() {
+            new_rows = new_rows
+                .iter()
+                .map(|r| {
+                    ensure_row_width(table_name, columns, r)?;
+                    let mut out = r.clone();
+                    if out[pk_idx].0 == Value::Null {
+                        let new_id = tables
+                            .allocate_mvcc_rowid(table_name, existing_rows, pk_idx)
+                            .expect("MVCC rowid allocator should be available");
+                        out[pk_idx] = SimValue(Value::from_i64(new_id));
+                    } else if let Some(i) = out[pk_idx].0.as_int() {
+                        tables.observe_mvcc_rowid(table_name, i);
+                    } else {
+                        return Err(anyhow::anyhow!(
+                            "datatype mismatch: table '{}' INTEGER PRIMARY KEY column '{}' must be an integer",
+                            table_name,
+                            columns[pk_idx].name
+                        ));
+                    }
+                    Ok(out)
+                })
+                .collect::<anyhow::Result<Vec<_>>>()?;
+        } else {
+            let mut alloc = RowidAllocator::new(existing_rows, pk_idx);
+            new_rows = new_rows
+                .iter()
+                .map(|r| normalize_integer_pk_row(table_name, columns, pk_idx, &mut alloc, r))
+                .collect::<anyhow::Result<Vec<_>>>()?;
+        }
     } else {
         for r in &new_rows {
             ensure_row_width(table_name, columns, r)?;
@@ -553,6 +579,7 @@ impl Shadow for Create {
         if !tables.iter().any(|t| t.name == self.table.name) {
             // Record the operation BEFORE applying it to current_tables
             tables.record_create_table(self.table.clone());
+            tables.reset_mvcc_rowid_allocator(&self.table.name);
             tables.push(self.table.clone());
             Ok(vec![])
         } else {
@@ -631,6 +658,7 @@ impl Shadow for Drop {
 
         // Record the drop for transaction tracking
         tables.record_drop_table(self.table.clone());
+        tables.remove_mvcc_rowid_allocator(&self.table);
 
         tables.retain(|t| t.name != self.table);
 
@@ -654,8 +682,9 @@ impl Shadow for Insert {
                     .ok_or_else(|| anyhow::anyhow!("Table {} does not exist", table_name))?;
 
                 let columns = tables[table_pos].columns.clone();
+                let existing_rows = tables[table_pos].rows.clone();
                 let rows =
-                    prepare_insert_rows(&table_name, &columns, &tables[table_pos].rows, &raw_rows)?;
+                    prepare_insert_rows(tables, &table_name, &columns, &existing_rows, &raw_rows)?;
 
                 for row in &rows {
                     tables.record_insert(table_name.clone(), row.clone());
@@ -676,13 +705,15 @@ impl Shadow for Insert {
                     .ok_or_else(|| anyhow::anyhow!("Table {} does not exist", table_name))?;
 
                 let columns = tables[table_pos].columns.clone();
+                let existing_rows = tables[table_pos].rows.clone();
 
                 match on_conflict {
                     None => {
                         let new_rows = prepare_insert_rows(
+                            tables,
                             &table_name,
                             &columns,
-                            &tables[table_pos].rows,
+                            &existing_rows,
                             values,
                         )?;
 
@@ -724,8 +755,11 @@ impl Shadow for Insert {
 
                         let pk_idx_opt = integer_pk_index(&columns);
                         let mut staged_rows = tables[table_pos].rows.clone();
-                        let mut alloc_opt =
-                            pk_idx_opt.map(|pk_idx| RowidAllocator::new(&staged_rows, pk_idx));
+                        let mut alloc_opt = if tables.uses_mvcc_rowid_allocator() {
+                            None
+                        } else {
+                            pk_idx_opt.map(|pk_idx| RowidAllocator::new(&staged_rows, pk_idx))
+                        };
 
                         enum StagedOp {
                             Insert(Vec<SimValue>),
@@ -739,16 +773,35 @@ impl Shadow for Insert {
                         for raw_row in values.iter() {
                             ensure_row_width(&table_name, &columns, raw_row)?;
 
-                            let excluded_row = if let (Some(pk_idx), Some(alloc)) =
-                                (pk_idx_opt, alloc_opt.as_mut())
-                            {
-                                normalize_integer_pk_row(
-                                    &table_name,
-                                    &columns,
-                                    pk_idx,
-                                    alloc,
-                                    raw_row,
-                                )?
+                            let excluded_row = if let Some(pk_idx) = pk_idx_opt {
+                                if tables.uses_mvcc_rowid_allocator() {
+                                    let mut out = raw_row.clone();
+                                    if out[pk_idx].0 == Value::Null {
+                                        let new_id = tables
+                                            .allocate_mvcc_rowid(&table_name, &staged_rows, pk_idx)
+                                            .expect("MVCC rowid allocator should be available");
+                                        out[pk_idx] = SimValue(Value::from_i64(new_id));
+                                    } else if let Some(i) = out[pk_idx].0.as_int() {
+                                        tables.observe_mvcc_rowid(&table_name, i);
+                                    } else {
+                                        return Err(anyhow::anyhow!(
+                                            "datatype mismatch: table '{}' INTEGER PRIMARY KEY column '{}' must be an integer",
+                                            table_name,
+                                            columns[pk_idx].name
+                                        ));
+                                    }
+                                    out
+                                } else if let Some(alloc) = alloc_opt.as_mut() {
+                                    normalize_integer_pk_row(
+                                        &table_name,
+                                        &columns,
+                                        pk_idx,
+                                        alloc,
+                                        raw_row,
+                                    )?
+                                } else {
+                                    raw_row.clone()
+                                }
                             } else {
                                 raw_row.clone()
                             };
@@ -810,9 +863,7 @@ impl Shadow for Insert {
                                         new_row[dst_idx] = excluded_row[src_idx].clone();
                                     }
 
-                                    if let (Some(pk_idx), Some(alloc)) =
-                                        (pk_idx_opt, alloc_opt.as_mut())
-                                    {
+                                    if let Some(pk_idx) = pk_idx_opt {
                                         validate_integer_pk_row_non_null(
                                             &table_name,
                                             &columns,
@@ -820,7 +871,11 @@ impl Shadow for Insert {
                                             &new_row,
                                         )?;
                                         if let Some(i) = new_row[pk_idx].0.as_int() {
-                                            alloc.observe(i);
+                                            if tables.uses_mvcc_rowid_allocator() {
+                                                tables.observe_mvcc_rowid(&table_name, i);
+                                            } else if let Some(alloc) = alloc_opt.as_mut() {
+                                                alloc.observe(i);
+                                            }
                                         }
                                     }
 
@@ -1134,6 +1189,9 @@ impl Shadow for Update {
         if let Some(pk_idx) = integer_pk_index(&columns) {
             for (_, _, new_row) in &updates {
                 validate_integer_pk_row_non_null(&self.table, &columns, pk_idx, new_row)?;
+                if let Some(rowid) = new_row[pk_idx].0.as_int() {
+                    tables.observe_mvcc_rowid(&self.table, rowid);
+                }
             }
         }
 
@@ -1212,7 +1270,8 @@ impl Shadow for AlterTable {
                     Some(prefix) => format!("{prefix}.{new_name}"),
                     None => new_name.clone(),
                 };
-                tables.record_rename_table(self.table_name.clone(), qualified_new);
+                tables.record_rename_table(self.table_name.clone(), qualified_new.clone());
+                tables.rename_mvcc_rowid_allocator(&self.table_name, &qualified_new);
             }
             AlterTableType::AddColumn { column } => {
                 tables.record_add_column(self.table_name.clone(), column.clone());

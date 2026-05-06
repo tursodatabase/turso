@@ -5268,7 +5268,10 @@ impl RowidAllocator {
     /// Initialize from btree max. Called once per table, under lock.
     pub fn initialize(&self, rowid: Option<i64>) {
         tracing::trace!("initialize({rowid:?})");
-        self.max_rowid.store(rowid.unwrap_or(0), Ordering::SeqCst);
+        // Explicit inserts can bump the allocator before the first automatic rowid
+        // initializes it. Preserve that higher observed value instead of replacing
+        // it with a lower visible btree max from another concurrent transaction.
+        self.insert_row_id_maybe_update(rowid.unwrap_or(0));
         self.initialized.store(true, Ordering::SeqCst);
     }
 

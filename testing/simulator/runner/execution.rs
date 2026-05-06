@@ -221,6 +221,11 @@ pub fn execute_interaction_turso(
                 let continuation = match err {
                     err if is_recoverable_tx_error(err) => {
                         if error_causes_rollback(err) && env.conn_in_transaction(connection_index) {
+                            // A statement may have advanced MVCC's global rowid allocator
+                            // before hitting a write-write conflict. Apply the shadow query
+                            // first so allocator side effects survive the transaction rollback.
+                            let _ =
+                                interaction.shadow(&mut env.get_conn_tables_mut(connection_index));
                             env.rollback_conn(connection_index);
                         }
                         ExecutionContinuation::NextInteractionOutsideThisProperty

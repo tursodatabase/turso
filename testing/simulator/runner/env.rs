@@ -122,6 +122,34 @@ pub enum TxOperation {
     },
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct MvccRowidAllocator {
+    max_rowid: i64,
+    initialized: bool,
+}
+
+impl MvccRowidAllocator {
+    pub fn observe(&mut self, rowid: i64) {
+        if rowid > self.max_rowid {
+            self.max_rowid = rowid;
+        }
+    }
+
+    pub fn allocate(&mut self, existing_rows: &[Vec<SimValue>], pk_idx: usize) -> i64 {
+        if !self.initialized {
+            for row in existing_rows {
+                if let Some(rowid) = row.get(pk_idx).and_then(|value| value.0.as_int()) {
+                    self.observe(rowid);
+                }
+            }
+            self.initialized = true;
+        }
+
+        self.max_rowid = self.max_rowid.saturating_add(1);
+        self.max_rowid
+    }
+}
+
 /// Database snapshot
 #[derive(Debug, Clone)]
 pub struct Snapshot {
@@ -318,6 +346,7 @@ pub struct ShadowTables<'a> {
 pub struct ShadowTablesMut<'a> {
     commited_tables: &'a mut Vec<Table>,
     transaction_tables: &'a mut Option<TransactionTables>,
+    mvcc_rowid_allocators: Option<&'a mut HashMap<String, MvccRowidAllocator>>,
 }
 
 impl<'a> ShadowTables<'a> {
@@ -352,6 +381,53 @@ where
             .map_or(self.commited_tables, |v| {
                 &mut v.expect_snapshot_mut().current_tables
             })
+    }
+
+    pub fn uses_mvcc_rowid_allocator(&self) -> bool {
+        self.mvcc_rowid_allocators.is_some()
+    }
+
+    pub fn allocate_mvcc_rowid(
+        &mut self,
+        table_name: &str,
+        existing_rows: &[Vec<SimValue>],
+        pk_idx: usize,
+    ) -> Option<i64> {
+        self.mvcc_rowid_allocators.as_mut().map(|allocators| {
+            allocators
+                .entry(table_name.to_string())
+                .or_default()
+                .allocate(existing_rows, pk_idx)
+        })
+    }
+
+    pub fn observe_mvcc_rowid(&mut self, table_name: &str, rowid: i64) {
+        if let Some(allocators) = self.mvcc_rowid_allocators.as_mut() {
+            allocators
+                .entry(table_name.to_string())
+                .or_default()
+                .observe(rowid);
+        }
+    }
+
+    pub fn reset_mvcc_rowid_allocator(&mut self, table_name: &str) {
+        if let Some(allocators) = self.mvcc_rowid_allocators.as_mut() {
+            allocators.remove(table_name);
+        }
+    }
+
+    pub fn remove_mvcc_rowid_allocator(&mut self, table_name: &str) {
+        if let Some(allocators) = self.mvcc_rowid_allocators.as_mut() {
+            allocators.remove(table_name);
+        }
+    }
+
+    pub fn rename_mvcc_rowid_allocator(&mut self, old_name: &str, new_name: &str) {
+        if let Some(allocators) = self.mvcc_rowid_allocators.as_mut()
+            && let Some(allocator) = allocators.remove(old_name)
+        {
+            allocators.insert(new_name.to_string(), allocator);
+        }
     }
 
     /// Record that a row was inserted during the current transaction
@@ -815,6 +891,7 @@ mod tests {
         ShadowTablesMut {
             commited_tables,
             transaction_tables,
+            mvcc_rowid_allocators: None,
         }
     }
 
@@ -911,6 +988,7 @@ pub(crate) struct SimulatorEnv {
     connection_last_query: Bitmap<64>,
     // Table data that is committed into the database or wal
     pub committed_tables: Vec<Table>,
+    pub mvcc_rowid_allocators: HashMap<String, MvccRowidAllocator>,
     /// Names of attached databases (e.g. ["aux0", "aux1", "aux2"])
     pub(crate) attached_dbs: Vec<String>,
 }
@@ -937,6 +1015,7 @@ impl SimulatorEnv {
             connection_tables: self.connection_tables.clone(),
             connection_last_query: self.connection_last_query,
             committed_tables: self.committed_tables.clone(),
+            mvcc_rowid_allocators: self.mvcc_rowid_allocators.clone(),
             attached_dbs: self.attached_dbs.clone(),
         }
     }
@@ -1247,6 +1326,7 @@ impl SimulatorEnv {
             io_backend,
             profile: profile.clone(),
             committed_tables: Vec::new(),
+            mvcc_rowid_allocators: HashMap::new(),
             connection_tables: vec![None; profile.max_connections],
             connection_last_query: Bitmap::new(),
             attached_dbs,
@@ -1310,6 +1390,7 @@ impl SimulatorEnv {
         self.committed_tables.clear();
         self.connection_tables.iter_mut().for_each(|t| *t = None);
         self.connection_last_query = Bitmap::new();
+        self.mvcc_rowid_allocators.clear();
     }
 
     // TODO: does not yet create the appropriate context to avoid WriteWriteConflitcs
@@ -1377,9 +1458,11 @@ impl SimulatorEnv {
     }
 
     pub fn get_conn_tables_mut(&mut self, conn_index: usize) -> ShadowTablesMut<'_> {
+        let mvcc_rowid_allocators = self.profile.mvcc.then_some(&mut self.mvcc_rowid_allocators);
         ShadowTablesMut {
             transaction_tables: self.connection_tables.get_mut(conn_index).unwrap(),
             commited_tables: &mut self.committed_tables,
+            mvcc_rowid_allocators,
         }
     }
 }
