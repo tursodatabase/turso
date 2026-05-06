@@ -9,7 +9,7 @@ description = "SQLite test extensions"
 build = "build.rs"
 
 [build-dependencies]
-cc = "1.0"
+cc = "1.2.60"
 
 [lib]
 crate-type = ["cdylib"]
