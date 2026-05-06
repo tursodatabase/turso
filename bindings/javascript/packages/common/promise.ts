@@ -54,6 +54,24 @@ function toBindArgs(params) {
 }
 
 /**
+ * A wrapped transaction function. Calling it runs the wrapped function inside a
+ * `BEGIN`/`COMMIT` block; the mode properties (`deferred`, `concurrent`, etc.)
+ * return equivalent wrappers that begin the transaction with the corresponding
+ * locking mode.
+ */
+export interface TransactionFunction<
+  F extends (...args: any[]) => Promise<any> = (...args: any[]) => Promise<any>,
+> {
+  (...args: Parameters<F>): ReturnType<F>;
+  default: TransactionFunction<F>;
+  deferred: TransactionFunction<F>;
+  concurrent: TransactionFunction<F>;
+  immediate: TransactionFunction<F>;
+  exclusive: TransactionFunction<F>;
+  database: Database;
+}
+
+/**
  * Database represents a connection that can prepare and execute SQL statements.
  */
 class Database {
@@ -122,7 +140,9 @@ class Database {
    *
    * @param {function} fn - The function to wrap in a transaction.
    */
-  transaction(fn: (...any) => Promise<any>) {
+  transaction<F extends (...args: any[]) => Promise<any>>(
+    fn: F,
+  ): TransactionFunction<F> {
     if (typeof fn !== "function")
       throw new TypeError("Expected first argument to be a function");
 
@@ -146,15 +166,17 @@ class Database {
     const properties = {
       default: { value: wrapTxn("") },
       deferred: { value: wrapTxn("DEFERRED") },
+      concurrent: { value: wrapTxn("CONCURRENT") },
       immediate: { value: wrapTxn("IMMEDIATE") },
       exclusive: { value: wrapTxn("EXCLUSIVE") },
       database: { value: this, enumerable: true },
     };
     Object.defineProperties(properties.default.value, properties);
     Object.defineProperties(properties.deferred.value, properties);
+    Object.defineProperties(properties.concurrent.value, properties);
     Object.defineProperties(properties.immediate.value, properties);
     Object.defineProperties(properties.exclusive.value, properties);
-    return properties.default.value;
+    return properties.default.value as TransactionFunction<F>;
   }
 
   /**
