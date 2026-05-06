@@ -654,6 +654,9 @@ fn multiprocess_seed_5724542806254236599_restart_then_finalize_preserves_key_684
     })
     .expect("create seeded multiprocess whopper");
     let db_path = whopper.db_path().to_path_buf();
+    let table_name = "simple_kv_28209";
+    let key = "key_6848";
+    let value_len = 15853;
 
     while whopper.current_step < 4950 {
         whopper.step().expect("seeded whopper step");
@@ -662,17 +665,19 @@ fn multiprocess_seed_5724542806254236599_restart_then_finalize_preserves_key_684
     let rows_after_restart = whopper
         .execute_sql_direct(
             0,
-            "select count(*), min(length(value)), max(length(value)) from simple_kv_19961 where key='key_684'",
+            format!(
+                "select count(*), min(length(value)), max(length(value)) from {table_name} where key='{key}'"
+            ),
         )
-        .expect("query key_684 after restart")
+        .expect("query seeded key after restart")
         .expect("post-restart query should succeed");
     assert_eq!(
         rows_after_restart[0][0].as_int(),
         Some(1),
         "row should remain visible immediately after the step 4950 restart",
     );
-    assert_eq!(rows_after_restart[0][1].as_int(), Some(6871));
-    assert_eq!(rows_after_restart[0][2].as_int(), Some(6871));
+    assert_eq!(rows_after_restart[0][1].as_int(), Some(value_len));
+    assert_eq!(rows_after_restart[0][2].as_int(), Some(value_len));
     let snapshot_after_restart = whopper
         .shared_wal_snapshot_direct(0)
         .expect("read shared WAL snapshot after restart")
@@ -699,17 +704,19 @@ fn multiprocess_seed_5724542806254236599_restart_then_finalize_preserves_key_684
     let pre_finalize_rows = whopper
         .execute_sql_direct(
             0,
-            "select count(*), min(length(value)), max(length(value)) from simple_kv_19961 where key='key_684'",
+            format!(
+                "select count(*), min(length(value)), max(length(value)) from {table_name} where key='{key}'"
+            ),
         )
-        .expect("query key_684 before finalize")
+        .expect("query seeded key before finalize")
         .expect("pre-finalize query should succeed");
     assert_eq!(
         pre_finalize_rows[0][0].as_int(),
         Some(1),
         "row should still be visible after the step 4951 integrity check",
     );
-    assert_eq!(pre_finalize_rows[0][1].as_int(), Some(6871));
-    assert_eq!(pre_finalize_rows[0][2].as_int(), Some(6871));
+    assert_eq!(pre_finalize_rows[0][1].as_int(), Some(value_len));
+    assert_eq!(pre_finalize_rows[0][2].as_int(), Some(value_len));
 
     whopper
         .finalize()
@@ -720,7 +727,9 @@ fn multiprocess_seed_5724542806254236599_restart_then_finalize_preserves_key_684
         .expect("reopen finalized seeded database");
     let conn = reopened.connect().expect("connect reopened seeded db");
     let mut stmt = conn
-        .prepare("select count(*), min(length(value)), max(length(value)) from simple_kv_19961 where key='key_684'")
+        .prepare(format!(
+            "select count(*), min(length(value)), max(length(value)) from {table_name} where key='{key}'"
+        ))
         .expect("prepare reopened seeded query");
     let mut reopened_rows = Vec::new();
     stmt.run_with_row_callback(|row| {
@@ -732,7 +741,7 @@ fn multiprocess_seed_5724542806254236599_restart_then_finalize_preserves_key_684
         Ok(())
     })
     .expect("run reopened seeded query");
-    assert_eq!(reopened_rows, vec![(1, 6871, 6871)]);
+    assert_eq!(reopened_rows, vec![(1, value_len, value_len)]);
 
     let db_str = db_path.to_str().expect("db path utf8");
     let _ = std::fs::remove_file(&db_path);
@@ -775,14 +784,16 @@ fn multiprocess_seed_5724542806254236599_localizes_key_4994_loss() {
     .expect("create seeded multiprocess whopper");
 
     let db_path = whopper.db_path().to_path_buf();
-    let table_name = "simple_kv_57904";
+    let table_name = "simple_kv_40264";
     let key = "key_4994";
 
     advance_seeded_whopper_to_step(&mut whopper, 267);
     let live_rows = whopper
         .execute_sql_direct(
             10,
-            "select count(*), min(length(value)), max(length(value)) from simple_kv_57904 where key='key_4994'",
+            format!(
+                "select count(*), min(length(value)), max(length(value)) from {table_name} where key='{key}'"
+            ),
         )
         .expect("query key_4994 on live worker after insert")
         .expect("live worker query should succeed");
@@ -874,19 +885,19 @@ fn multiprocess_seed_8849519299024683634_localizes_schema_loss_boundary() {
 
     advance_seeded_whopper_to_step(&mut whopper, 67);
     assert!(
-        probe_table_rootpage_via_fresh_worker(&whopper, "simple_kv_9842").is_some(),
-        "simple_kv_9842 should still exist for a fresh opener immediately after the step 66 restart",
+        probe_table_rootpage_via_fresh_worker(&whopper, "simple_kv_65644").is_some(),
+        "simple_kv_65644 should still exist for a fresh opener after step 66",
     );
     assert_eq!(
-        probe_simple_kv_length_via_fresh_worker(&whopper, "simple_kv_9842", "key_6095"),
-        Some(874),
-        "baseline row should still be visible for a fresh opener immediately after the step 66 restart",
+        probe_simple_kv_length_via_fresh_worker(&whopper, "simple_kv_65644", "key_811"),
+        Some(7074),
+        "baseline row should still be visible for a fresh opener after step 66",
     );
 
     advance_seeded_whopper_to_step(&mut whopper, 70);
     assert!(
-        probe_table_rootpage_via_fresh_worker(&whopper, "simple_kv_9842").is_some(),
-        "simple_kv_9842 disappeared from sqlite_schema by the step 70 restart; cohort_telemetries={:?}",
+        probe_table_rootpage_via_fresh_worker(&whopper, "simple_kv_65644").is_some(),
+        "simple_kv_65644 disappeared from sqlite_schema by step 70; cohort_telemetries={:?}",
         whopper.worker_startup_telemetries(),
     );
 
