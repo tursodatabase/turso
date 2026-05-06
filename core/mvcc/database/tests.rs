@@ -10174,6 +10174,70 @@ fn test_snapshot_stability_full() {
 }
 
 #[test]
+fn test_concurrent_and_exclusive_deadlock_reproducer() {
+    let db = MvccTestDbNoConn::new();
+    let conn_a = db.connect();
+    let conn_b = db.connect();
+
+    conn_a
+        .execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)")
+        .unwrap();
+
+    // Pause conn_a at the boundary right after Preparing(end_ts) is
+    // published, before BeginCommitLogicalLog acquires the lock.
+    conn_a.set_yield_injector(Some(FixedYieldInjector::new([
+        CommitYieldPoint::LogRecordPrepared.point(),
+    ])));
+    conn_a.execute("BEGIN CONCURRENT").unwrap();
+    conn_a
+        .execute("INSERT INTO t VALUES (3, 'concurrent')")
+        .unwrap();
+    let mut stmt_a = conn_a.prepare("COMMIT").unwrap();
+    loop {
+        if matches!(stmt_a.step().unwrap(), crate::StepResult::IO) {
+            break;
+        }
+    }
+
+    // Drive both transactions to completion.
+    let mut conn_b_done = false;
+    let mut conn_a_done = false;
+    loop {
+        if !conn_b_done {
+            match conn_b.execute("BEGIN IMMEDIATE") {
+                Ok(_) => {
+                    conn_b
+                        .execute("INSERT INTO t VALUES (2, 'exclusive')")
+                        .unwrap();
+                    // SELECT triggers spec-read of conn_a's Preparing row →
+                    // pre-fix this registers the commit dep that closes the cycle.
+                    conn_b.execute("SELECT v FROM t WHERE id = 3").unwrap();
+                    conn_b.execute("COMMIT").unwrap();
+                    conn_b_done = true;
+                }
+                Err(LimboError::Busy) => {}
+                Err(e) => panic!("unexpected error from BEGIN IMMEDIATE: {e:?}"),
+            }
+        }
+        if !conn_a_done {
+            match stmt_a.step().unwrap() {
+                crate::StepResult::Done => conn_a_done = true,
+                crate::StepResult::IO => {}
+                other => panic!("unexpected step result: {other:?}"),
+            }
+        }
+        if conn_a_done && conn_b_done {
+            break;
+        }
+    }
+    drop(stmt_a);
+    assert!(conn_a_done && conn_b_done);
+
+    let rows = get_rows(&conn_a, "SELECT id, v FROM t ORDER BY id");
+    assert_eq!(rows.len(), 2, "both rows must be visible; got {rows:?}");
+}
+
+#[test]
 fn test_read_lock_leak_deferred_then_concurrent() {
     let db = MvccTestDbNoConn::new_with_random_db();
     let conn0 = db.connect();
