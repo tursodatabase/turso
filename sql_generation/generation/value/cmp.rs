@@ -15,10 +15,8 @@ impl ArbitraryFrom<(&SimValue, ColumnType)> for LTValue {
     ) -> Self {
         let new_value = match &value.0 {
             Value::Numeric(Numeric::Integer(i)) => {
-                // `i64::MIN` has no i64 less than it; `i64::MIN + 1` would make the
-                // sampling range `i64::MIN..i64::MIN`, which is empty.
                 if *i <= i64::MIN + 1 {
-                    Value::from_i64(i64::MIN)
+                    Value::from_i64(i64::MIN) // avoid panic on empty range
                 } else {
                     Value::from_i64(rng.random_range(i64::MIN..*i - 1))
                 }
@@ -71,17 +69,15 @@ impl ArbitraryFrom<(&SimValue, ColumnType)> for GTValue {
     ) -> Self {
         let new_value = match &value.0 {
             Value::Numeric(Numeric::Integer(i)) => {
-                // `i64::MAX` has no i64 greater than it; `i64::MAX - 1` would make the
-                // sampling range `i64::MAX..=i64::MAX` with an empty "strictly greater" set.
                 if *i >= i64::MAX - 1 {
-                    Value::from_i64(i64::MAX)
+                    Value::from_i64(i64::MAX) // avoid panic on empty range
                 } else {
                     Value::from_i64(rng.random_range(*i + 1..=i64::MAX))
                 }
             }
             Value::Numeric(Numeric::Float(f)) => {
                 if f64::from(*f) >= 1e10 {
-                    Value::from_f64(1e10)
+                    Value::from_f64(1e10) // avoid panic on empty range
                 } else {
                     Value::from_f64(rng.random_range(f64::from(*f)..1e10))
                 }
