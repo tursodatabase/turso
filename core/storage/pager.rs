@@ -2007,7 +2007,7 @@ impl Pager {
             // rolled-back savepoint/statement.
             page.set_dirty();
             dirty_pages.insert(page_id);
-            self.upsert_page_in_cache(page_id as usize, page, true)?;
+            self.force_upsert_page_in_cache(page_id as usize, page)?;
         }
 
         let truncate_completion = subjournal.truncate(journal_start_offset)?;
@@ -3592,7 +3592,7 @@ impl Pager {
                     if spilled {
                         // After spilling, try to evict clean pages to make room in the cache
                         let mut cache = self.page_cache.write();
-                        if let Err(e) = cache.make_room_for(1) {
+                        if let Err(e) = cache.make_room_for(1, false) {
                             // Cache is completely full with unevictable pages
                             tracing::error!(
                                 "ensure_cache_space: {e} cache full, could not make room"
@@ -5024,6 +5024,27 @@ impl Pager {
                 "Failed to insert loaded page {id} into cache: {e:?}"
             ))
         })?;
+        page.set_loaded();
+        page.clear_wal_tag();
+        Ok(())
+    }
+
+    fn force_upsert_page_in_cache(&self, id: usize, page: PageRef) -> Result<(), LimboError> {
+        let mut cache = self.page_cache.write();
+        let page_key = PageCacheKey::new(id);
+
+        turso_assert!(
+            page.is_dirty(),
+            "restored savepoint page must be dirty",
+            { "page_id": id }
+        );
+        cache
+            .force_upsert_page(page_key, page.clone())
+            .map_err(|e| {
+                LimboError::InternalError(format!(
+                    "Failed to restore savepoint page {id} into cache: {e:?}"
+                ))
+            })?;
         page.set_loaded();
         page.clear_wal_tag();
         Ok(())

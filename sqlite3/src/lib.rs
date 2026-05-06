@@ -2565,7 +2565,10 @@ pub unsafe extern "C" fn sqlite3_complete(sql: *const ffi::c_char) -> ffi::c_int
         return 0;
     }
     let s = CStr::from_ptr(sql).to_bytes();
-    s.iter().rev().find(|&&b| !b.is_ascii_whitespace()).map_or(0, |&b| (b == b';') as ffi::c_int)
+    s.iter()
+        .rev()
+        .find(|&&b| !b.is_ascii_whitespace())
+        .map_or(0, |&b| (b == b';') as ffi::c_int)
 }
 
 #[no_mangle]
