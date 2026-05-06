@@ -1,0 +1,130 @@
+@database :memory:
+
+setup schema {
+    CREATE TABLE t (f REAL);
+    CREATE INDEX t_f ON t(f);
+    INSERT INTO t VALUES (-2701729208700874036);
+}
+
+@setup schema
+test real-index-near-miss-low {
+    SELECT count(*) FROM t WHERE f = -2701729208700874000;
+}
+expect {
+    0
+}
+
+@setup schema
+test real-index-original-int {
+    SELECT count(*) FROM t WHERE f = -2701729208700874036;
+}
+expect {
+    0
+}
+
+@setup schema
+test real-index-roundtrip-int {
+    SELECT count(*) FROM t WHERE f = -2701729208700874240;
+}
+expect {
+    1
+}
+
+setup schema_unique {
+    CREATE TABLE q (f REAL UNIQUE);
+    INSERT INTO q VALUES (-2701729208700874036);
+}
+
+@setup schema_unique
+test real-unique-near-miss {
+    SELECT count(*) FROM q WHERE f = -2701729208700874000;
+}
+expect {
+    0
+}
+
+@setup schema_unique
+test real-unique-roundtrip {
+    SELECT count(*) FROM q WHERE f = -2701729208700874240;
+}
+expect {
+    1
+}
+
+setup schema_text {
+    CREATE TABLE st (s TEXT);
+    CREATE INDEX st_s ON st(s);
+    INSERT INTO st VALUES ('-5');
+    INSERT INTO st VALUES ('5');
+}
+
+@setup schema_text
+test text-index-plain {
+    SELECT count(*) FROM st WHERE s = '5';
+}
+expect {
+    1
+}
+
+@setup schema_text
+test text-index-unary-plus {
+    SELECT count(*) FROM st WHERE s = +'5';
+}
+expect {
+    1
+}
+
+@setup schema_text
+test text-index-unary-minus {
+    SELECT count(*) FROM st WHERE s = -'5';
+}
+expect {
+    1
+}
+
+@setup schema_text
+test text-index-unary-minus-row {
+    SELECT s FROM st WHERE s = -'5';
+}
+expect {
+    -5
+}
+
+setup schema_blob {
+    CREATE TABLE sb (data BLOB);
+    CREATE INDEX sb_data ON sb(data);
+    INSERT INTO sb VALUES (x'05');
+    INSERT INTO sb VALUES (x'00');
+}
+
+@setup schema_blob
+test blob-index-plain {
+    SELECT count(*) FROM sb WHERE data = x'05';
+}
+expect {
+    1
+}
+
+@setup schema_blob
+test blob-index-unary-plus {
+    SELECT count(*) FROM sb WHERE data = +x'05';
+}
+expect {
+    1
+}
+
+@setup schema_blob
+test blob-index-unary-minus {
+    SELECT count(*) FROM sb WHERE data = -x'05';
+}
+expect {
+    0
+}
+
+@setup schema_blob
+test blob-index-unary-minus-zero {
+    SELECT count(*) FROM sb WHERE data = -x'00';
+}
+expect {
+    0
+}

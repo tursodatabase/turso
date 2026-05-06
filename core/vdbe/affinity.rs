@@ -282,13 +282,23 @@ impl Affinity {
         if !self.has_affinity() {
             return true;
         }
-        // TODO: check for unary minus in the expr, as it may be an additional optimization.
-        // This involves mostly likely walking the expression
-        match expr {
+
+        // Unwrap unary +/-; track minus since `-'5'` / `-x'01'` aren't the bare literal.
+        let mut inner = expr;
+        let mut unary_minus = false;
+        while let Expr::Unary(op, sub) = inner {
+            match op {
+                turso_parser::ast::UnaryOperator::Negative => unary_minus = true,
+                turso_parser::ast::UnaryOperator::Positive => {}
+                _ => break,
+            }
+            inner = sub;
+        }
+        match inner {
             Expr::Literal(literal) => match literal {
                 Literal::Numeric(_) => self.is_numeric(),
-                Literal::String(_) => matches!(self, Affinity::Text),
-                Literal::Blob(_) => true,
+                Literal::String(_) => !unary_minus && matches!(self, Affinity::Text),
+                Literal::Blob(_) => !unary_minus,
                 _ => false,
             },
             Expr::Column {
@@ -697,6 +707,38 @@ mod tests {
             ValueRef::Numeric(Numeric::Float(f)) => assert!(f64::from(f).is_infinite()),
             other => panic!("expected Float, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn test_expr_needs_no_affinity_change_unary_signs() {
+        use turso_parser::ast::UnaryOperator;
+
+        let num = Expr::Literal(Literal::Numeric("5".into()));
+        let neg_num = Expr::Unary(UnaryOperator::Negative, Box::new(num.clone()));
+        let pos_num = Expr::Unary(UnaryOperator::Positive, Box::new(num.clone()));
+
+        assert!(Affinity::Real.expr_needs_no_affinity_change(&neg_num));
+        assert!(Affinity::Integer.expr_needs_no_affinity_change(&neg_num));
+        assert!(Affinity::Numeric.expr_needs_no_affinity_change(&neg_num));
+        assert!(Affinity::Real.expr_needs_no_affinity_change(&pos_num));
+
+        let s = Expr::Literal(Literal::String("'5'".into()));
+        let neg_s = Expr::Unary(UnaryOperator::Negative, Box::new(s.clone()));
+        let pos_s = Expr::Unary(UnaryOperator::Positive, Box::new(s.clone()));
+
+        assert!(Affinity::Text.expr_needs_no_affinity_change(&s));
+        assert!(Affinity::Text.expr_needs_no_affinity_change(&pos_s));
+        assert!(!Affinity::Text.expr_needs_no_affinity_change(&neg_s));
+        assert!(!Affinity::Real.expr_needs_no_affinity_change(&neg_s));
+
+        let blob = Expr::Literal(Literal::Blob("01".into()));
+        let neg_blob = Expr::Unary(UnaryOperator::Negative, Box::new(blob.clone()));
+        let pos_blob = Expr::Unary(UnaryOperator::Positive, Box::new(blob.clone()));
+
+        assert!(Affinity::Text.expr_needs_no_affinity_change(&blob));
+        assert!(Affinity::Text.expr_needs_no_affinity_change(&pos_blob));
+        assert!(!Affinity::Text.expr_needs_no_affinity_change(&neg_blob));
+        assert!(!Affinity::Real.expr_needs_no_affinity_change(&neg_blob));
     }
 
     #[test]
