@@ -605,6 +605,14 @@ const BANNER: &str = r#"
 
 fn integrity_check(db_path: &Path) -> anyhow::Result<()> {
     assert!(db_path.exists());
+    match sqlite_integrity_check(db_path) {
+        Ok(()) => Ok(()),
+        Err(err) if is_sqlite_not_a_database(&err) => turso_integrity_check(db_path),
+        Err(err) => Err(err),
+    }
+}
+
+fn sqlite_integrity_check(db_path: &Path) -> anyhow::Result<()> {
     let conn = rusqlite::Connection::open(db_path)?;
     let mut stmt = conn.prepare("SELECT * FROM pragma_integrity_check;")?;
     let mut rows = stmt.query(())?;
@@ -613,6 +621,49 @@ fn integrity_check(db_path: &Path) -> anyhow::Result<()> {
     while let Some(row) = rows.next()? {
         result.push(row.get(0)?);
     }
+    validate_integrity_check_result(result)
+}
+
+fn turso_integrity_check(db_path: &Path) -> anyhow::Result<()> {
+    let io: Arc<dyn turso_core::IO> = Arc::new(turso_core::PlatformIO::new()?);
+    let db_path = db_path
+        .to_str()
+        .ok_or_else(|| anyhow!("database path is not valid UTF-8"))?;
+    let db = turso_core::Database::open_file(io, db_path)?;
+    let conn = db.connect()?;
+    let mut rows = conn
+        .query("PRAGMA integrity_check")?
+        .ok_or_else(|| anyhow!("simulation failed: integrity_check returned no rows"))?;
+    let mut result = Vec::new();
+    rows.run_with_row_callback(|row| {
+        let value = row
+            .get_value(0)
+            .to_text()
+            .ok_or_else(|| {
+                turso_core::LimboError::InternalError(
+                    "integrity_check returned a non-text value".to_string(),
+                )
+            })?
+            .to_string();
+        result.push(value);
+        Ok(())
+    })?;
+    validate_integrity_check_result(result)
+}
+
+fn is_sqlite_not_a_database(err: &anyhow::Error) -> bool {
+    err.chain().any(|cause| {
+        cause.downcast_ref::<rusqlite::Error>().is_some_and(|err| {
+            matches!(
+                err,
+                rusqlite::Error::SqliteFailure(sqlite_err, _)
+                    if sqlite_err.code == rusqlite::ErrorCode::NotADatabase
+            )
+        })
+    })
+}
+
+fn validate_integrity_check_result(mut result: Vec<String>) -> anyhow::Result<()> {
     if result.is_empty() {
         anyhow::bail!("simulation failed: integrity_check should return `ok` or a list of problems")
     }
@@ -622,4 +673,26 @@ fn integrity_check(db_path: &Path) -> anyhow::Result<()> {
         anyhow::bail!("simulation failed: {}", result.join("\n"))
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn final_integrity_check_accepts_mvcc_database() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let db_path = temp_dir.path().join("mvcc.db");
+        let io: Arc<dyn turso_core::IO> = Arc::new(turso_core::PlatformIO::new().unwrap());
+        let db = turso_core::Database::open_file(io, db_path.to_str().unwrap()).unwrap();
+        let conn = db.connect().unwrap();
+
+        conn.execute("PRAGMA journal_mode = 'mvcc'").unwrap();
+        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, val TEXT)")
+            .unwrap();
+        conn.execute("INSERT INTO t VALUES(1, 'ok')").unwrap();
+        conn.close().unwrap();
+
+        integrity_check(&db_path).unwrap();
+    }
 }
