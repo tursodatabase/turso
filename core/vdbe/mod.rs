@@ -624,7 +624,7 @@ pub struct ProgramState {
     pub(crate) cursors: Vec<Option<Cursor>>,
     cursor_seqs: Vec<i64>,
     registers: Box<[Register]>,
-    /// Trace state: last pc we printed a line for, and a register snapshot for diffing.
+    /// Trace state: register snapshot for diffing.
     pre_op_registers: Option<Box<[Register]>>,
     pub(crate) result_row: Option<Row>,
     last_compare: Option<std::cmp::Ordering>,
