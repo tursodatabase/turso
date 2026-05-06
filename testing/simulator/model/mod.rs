@@ -643,7 +643,7 @@ impl Shadow for Drop {
 }
 
 /// Expand a partial row to a full row, by evaluating generated column expressions.
-pub(crate) fn expand_to_full_row(
+pub(crate) fn expand_with_generated_columns(
     table: &Table,
     insert_columns: Option<&[String]>,
     insert_values: &[SimValue],
@@ -661,7 +661,7 @@ pub(crate) fn expand_to_full_row(
             .columns
             .iter()
             .enumerate()
-            .filter(|(idx, c)| !c.is_generated())
+            .filter(|(_, c)| !c.is_generated())
             .map(|(idx, _)| idx)
             .enumerate()
         {
@@ -720,10 +720,9 @@ impl Shadow for Insert {
 
                 let table_ref = tables[table_pos].clone();
 
-                // Expand partial rows to full width (NULLs for virtual columns)
                 let full_rows: Vec<Vec<SimValue>> = values
                     .iter()
-                    .map(|row| expand_to_full_row(&table_ref, Some(insert_columns), row))
+                    .map(|row| expand_with_generated_columns(&table_ref, Some(insert_columns), row))
                     .collect();
 
                 let columns = tables[table_pos].columns.clone();
@@ -754,17 +753,10 @@ impl Shadow for Insert {
 
                 let columns = tables[table_pos].columns.clone();
 
-                // Expand rows to full width if table has virtual generated columns
-                let has_generated = columns.iter().any(|c| c.is_generated());
-                let effective_values: Vec<Vec<SimValue>> = if has_generated {
-                    let table_ref = tables[table_pos].clone();
-                    values
-                        .iter()
-                        .map(|row| expand_to_full_row(&table_ref, None, row))
-                        .collect()
-                } else {
-                    values.clone()
-                };
+                let effective_values: Vec<Vec<SimValue>> = values
+                    .iter()
+                    .map(|row| expand_with_generated_columns(&tables[table_pos].clone(), None, row))
+                    .collect();
 
                 match on_conflict {
                     None => {
@@ -1353,7 +1345,6 @@ impl Shadow for AlterTable {
             }
             AlterTableType::AddColumn { column } => {
                 table.columns.push(column.clone());
-                // Virtual generated columns are computed on-the-fly; just add NULL placeholder
                 table.rows.iter_mut().for_each(|row| {
                     row.push(SimValue(turso_core::Value::Null));
                 });
@@ -1370,11 +1361,9 @@ impl Shadow for AlterTable {
                 });
             }
             AlterTableType::RenameColumn { old, new } => {
-                // Rename the column itself
                 let col = table.columns.iter_mut().find(|c| c.name == *old).unwrap();
                 col.name.clone_from(new);
 
-                // Update generated column expressions that reference the old column name
                 for col in &mut table.columns {
                     for constraint in &mut col.constraints {
                         if let ColumnConstraint::Generated { expr, .. } = constraint {

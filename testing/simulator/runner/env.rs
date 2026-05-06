@@ -751,7 +751,6 @@ where
                             .find(|c| &c.name == old_name)
                             .expect("Column should exist");
                         col.name.clone_from(new_name);
-                        // Update generated column expressions that reference the old column name
                         for col in &mut committed.columns {
                             for constraint in &mut col.constraints {
                                 if let ColumnConstraint::Generated { expr, .. } = constraint {

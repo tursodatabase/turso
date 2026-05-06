@@ -31,7 +31,7 @@ use crate::{
     generation::{Shadow, WeightedDistribution, query::QueryDistribution},
     model::{
         Query, QueryCapabilities, QueryDiscriminants, ReleaseSavepoint, ResultSet,
-        RollbackToSavepoint, Savepoint, expand_to_full_row,
+        RollbackToSavepoint, Savepoint, expand_with_generated_columns,
         interactions::{
             Assertion, Interaction, InteractionBuilder, InteractionType, PropertyMetadata,
         },
@@ -79,9 +79,9 @@ impl Property {
                         Insert::ValuesWithColumns { columns, .. } => {
                             //TODO could we encode the two types of rows and the transition
                             // in the type system?
-                            expand_to_full_row(table, Some(columns), partial_row)
+                            expand_with_generated_columns(table, Some(columns), partial_row)
                         }
-                        Insert::Values { .. } => expand_to_full_row(table, None, partial_row),
+                        Insert::Values { .. } => expand_with_generated_columns(table, None, partial_row),
                         _ => unreachable!(),
                     };
 

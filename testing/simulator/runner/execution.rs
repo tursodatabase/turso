@@ -313,8 +313,6 @@ pub fn execute_interaction_turso(
             if !env.profile.mvcc && env.rng.random_ratio(1, 10) {
                 limbo_integrity_check(&conn)?;
             }
-            // FaultyQuery doesn't need special shadow handling
-            let _ = interaction.shadow(&mut env.get_conn_tables_mut(connection_index));
         }
     }
     if let Err(e) = interaction.shadow(&mut env.get_conn_tables_mut(connection_index)) {
@@ -406,14 +404,15 @@ fn execute_interaction_rusqlite(
             stack.push(results.clone());
             env.update_conn_last_interaction(interaction.connection_index, Some(query));
 
-            // Only propagate shadow errors if the query succeeded
             if results.is_ok() {
                 interaction
                     .shadow(&mut env.get_conn_tables_mut(interaction.connection_index))
                     .map_err(|e| {
-                        LimboError::InternalError(format!("shadow operation failed: {e}"))
+                        LimboError::InternalError(format!("DB succeeded but shadow detected error: {e}. This may indicate a constraint enforcement bug."))
                     })?;
             } else {
+                // TODO why?
+                // Don't propagate shadow errors if the DB failed
                 let _ =
                     interaction.shadow(&mut env.get_conn_tables_mut(interaction.connection_index));
             }
