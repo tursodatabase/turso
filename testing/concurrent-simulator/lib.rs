@@ -1279,13 +1279,13 @@ fn seed_insert_sql(table: &Table, row_idx: u32) -> String {
                 let _ = write!(sql, "{}", row_idx as i64);
             }
             ColumnType::Float => {
-                let _ = write!(sql, "{}.0", row_idx);
+                let _ = write!(sql, "{row_idx}.0");
             }
             ColumnType::Text => {
                 let _ = write!(sql, "'seed_{}_{}'", col.name, row_idx);
             }
             ColumnType::Blob => {
-                let _ = write!(sql, "x'{:08x}'", row_idx);
+                let _ = write!(sql, "x'{row_idx:08x}'");
             }
         }
     }
