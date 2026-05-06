@@ -214,9 +214,7 @@ mod tests {
 
     use super::*;
 
-    // Boundary values must not panic with "cannot sample empty range" or byte
-    // over/underflow. Covers LTValue @ i64::MIN / i64::MIN+1, GTValue @ i64::MAX /
-    // i64::MAX-1, GTValue @ float >= 1e10, and empty/saturated blobs.
+    /// `random_range` panics on empty ranges. Check that boundaries and arbitrary values don't panic.
     #[test]
     fn lt_gt_value_boundaries_do_not_panic() {
         let mut rng = ChaCha8Rng::seed_from_u64(0);

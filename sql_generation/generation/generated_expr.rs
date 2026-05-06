@@ -9,17 +9,14 @@ use crate::model::table::{Column, ColumnType};
 
 /// Generates a type-compatible expression for a generated column.
 ///
-/// This function creates expressions that can reference ANY column in the table
-/// (including forward references and other generated columns), matching SQLite behavior.
-///
-/// Returns (expression, set of column indices referenced).
+/// Returns (expression, set of column indices referenced by the expression).
 pub fn generate_column_expr_with_refs<R: Rng + ?Sized>(
     rng: &mut R,
     all_columns: &[Column],
     current_col_idx: usize,
     target_type: &ColumnType,
     max_depth: usize,
-) -> (ast::Expr, HashSet<usize>) {
+) -> (Expr, HashSet<usize>) {
     let mut refs = HashSet::new();
     let expr = generate_expr_inner(
         rng,
@@ -39,8 +36,7 @@ fn generate_expr_inner<R: Rng + ?Sized>(
     target_type: &ColumnType,
     depth: usize,
     refs: &mut HashSet<usize>,
-) -> ast::Expr {
-    // Find columns that are type-compatible (excluding self)
+) -> Expr {
     let compatible_cols: Vec<(usize, &Column)> = all_columns
         .iter()
         .enumerate()
@@ -49,28 +45,26 @@ fn generate_expr_inner<R: Rng + ?Sized>(
         })
         .collect();
 
-    // Base case: depth 0 or no compatible columns
     if depth == 0 || compatible_cols.is_empty() {
-        // Try a column reference first if we have compatible columns
-        if !compatible_cols.is_empty() && rng.random_bool(0.7) {
-            let (idx, col) = compatible_cols[rng.random_range(0..compatible_cols.len())];
-            refs.insert(idx);
-            return Expr::Id(Name::from_string(&col.name));
-        }
-        // Otherwise, use a literal
-        return generate_literal(rng, target_type);
+        return if !compatible_cols.is_empty() && rng.random_bool(0.7) {
+            let (chosen_idx, chosen_col) =
+                compatible_cols[rng.random_range(0..compatible_cols.len())];
+            refs.insert(chosen_idx);
+            Expr::Id(Name::from_string(&chosen_col.name))
+        } else {
+            generate_literal(rng, target_type)
+        };
     }
 
-    // Choose what kind of expression to generate
     let choice = rng.random_range(0..10);
     match choice {
-        // Column reference (40% chance)
+        // Column reference
         0..=3 => {
             let (idx, col) = compatible_cols[rng.random_range(0..compatible_cols.len())];
             refs.insert(idx);
             Expr::Id(Name::from_string(&col.name))
         }
-        // Binary operation (30% chance)
+        // Binary operation
         4..=6 => {
             if let Some(op) = pick_binary_op(rng, target_type) {
                 let lhs = generate_expr_inner(
@@ -89,6 +83,7 @@ fn generate_expr_inner<R: Rng + ?Sized>(
                     depth - 1,
                     refs,
                 );
+                //TODO this feels like a workaround for a flaw in the shadow model's evaluation precedence?
                 // Wrap subexpressions in parentheses to ensure correct evaluation order
                 // when the shadow model evaluates the expression tree directly
                 let lhs = if matches!(lhs, Expr::Binary(..)) {
@@ -103,9 +98,10 @@ fn generate_expr_inner<R: Rng + ?Sized>(
                 };
                 Expr::Binary(Box::new(lhs), op, Box::new(rhs))
             } else if !compatible_cols.is_empty() && rng.random_bool(0.7) {
-                let (idx, col) = compatible_cols[rng.random_range(0..compatible_cols.len())];
-                refs.insert(idx);
-                Expr::Id(Name::from_string(&col.name))
+                let (chosen_idx, chosen_col) =
+                    compatible_cols[rng.random_range(0..compatible_cols.len())];
+                refs.insert(chosen_idx);
+                Expr::Id(Name::from_string(&chosen_col.name))
             } else {
                 generate_literal(rng, target_type)
             }
@@ -194,18 +190,18 @@ fn generate_literal<R: Rng + ?Sized>(rng: &mut R, target_type: &ColumnType) -> E
     }
 }
 
-// TODO: Extend expression generation to include more operators (/, %, bitwise,
+//TODO: Extend expression generation to include more operators (/, %, bitwise,
 // comparison, LIKE, BETWEEN, IN) and expression types (CASE, function calls)
 // to improve fuzzer coverage of generated column expressions.
-
 /// Pick an appropriate binary operator for the target type.
 fn pick_binary_op<R: Rng + ?Sized>(rng: &mut R, target_type: &ColumnType) -> Option<Operator> {
     match target_type {
         ColumnType::Integer | ColumnType::Float => {
-            // Numeric operations
             let ops = [Operator::Add, Operator::Subtract, Operator::Multiply];
             Some(ops[rng.random_range(0..ops.len())])
         }
+        // don't generate `||` (concat), as a workaround for
+        // https://github.com/tursodatabase/turso/issues/4860
         ColumnType::Text | ColumnType::Blob => None,
     }
 }
@@ -226,62 +222,60 @@ fn pick_unary_op<R: Rng + ?Sized>(rng: &mut R, target_type: &ColumnType) -> Opti
 }
 
 /// Extract all column references from an expression.
-pub fn extract_column_refs(expr: &ast::Expr) -> HashSet<String> {
+pub fn extract_column_refs(expr: &Expr) -> HashSet<String> {
+    fn collect_refs_recursive(expr: &Expr, refs: &mut HashSet<String>) {
+        match expr {
+            Expr::Id(name) | Expr::Name(name) => {
+                refs.insert(name.as_str().to_ascii_lowercase());
+            }
+            Expr::Qualified(_, col) | Expr::DoublyQualified(_, _, col) => {
+                refs.insert(col.as_str().to_ascii_lowercase());
+            }
+            Expr::Binary(lhs, _, rhs) => {
+                collect_refs_recursive(lhs, refs);
+                collect_refs_recursive(rhs, refs);
+            }
+            Expr::Unary(_, operand) => {
+                collect_refs_recursive(operand, refs);
+            }
+            Expr::Parenthesized(exprs) => {
+                for e in exprs {
+                    collect_refs_recursive(e, refs);
+                }
+            }
+            _ => {}
+        }
+    }
+
     let mut refs = HashSet::new();
     collect_refs_recursive(expr, &mut refs);
     refs
 }
 
-fn collect_refs_recursive(expr: &ast::Expr, refs: &mut HashSet<String>) {
-    match expr {
-        ast::Expr::Id(name) | ast::Expr::Name(name) => {
-            refs.insert(name.as_str().to_ascii_lowercase());
-        }
-        ast::Expr::Qualified(_, col) | ast::Expr::DoublyQualified(_, _, col) => {
-            refs.insert(col.as_str().to_ascii_lowercase());
-        }
-        ast::Expr::Binary(lhs, _, rhs) => {
-            collect_refs_recursive(lhs, refs);
-            collect_refs_recursive(rhs, refs);
-        }
-        ast::Expr::Unary(_, operand) => {
-            collect_refs_recursive(operand, refs);
-        }
-        ast::Expr::Parenthesized(exprs) => {
-            for e in exprs {
-                collect_refs_recursive(e, refs);
-            }
-        }
-        _ => {}
-    }
-}
-
 /// Rename column references in an expression from `from` to `to`.
-pub fn rename_column_refs_in_expr(expr: &mut ast::Expr, from: &str, to: &str) {
+pub fn rename_column_refs_in_expr(expr: &mut Expr, from: &str, to: &str) {
     let from_lower = from.to_ascii_lowercase();
     match expr {
-        ast::Expr::Id(name) if name.as_str().to_ascii_lowercase() == from_lower => {
+        Expr::Id(name) if name.as_str().to_ascii_lowercase() == from_lower => {
             *name = Name::exact(to.to_owned());
         }
-        ast::Expr::Name(name) if name.as_str().to_ascii_lowercase() == from_lower => {
+        Expr::Name(name) if name.as_str().to_ascii_lowercase() == from_lower => {
             *name = Name::exact(to.to_owned());
         }
-        ast::Expr::Qualified(_, col) if col.as_str().to_ascii_lowercase() == from_lower => {
+        Expr::Qualified(_, col) if col.as_str().to_ascii_lowercase() == from_lower => {
             *col = Name::exact(to.to_owned());
         }
-        ast::Expr::DoublyQualified(_, _, col)
-            if col.as_str().to_ascii_lowercase() == from_lower =>
-        {
+        Expr::DoublyQualified(_, _, col) if col.as_str().to_ascii_lowercase() == from_lower => {
             *col = Name::exact(to.to_owned());
         }
-        ast::Expr::Binary(lhs, _, rhs) => {
+        Expr::Binary(lhs, _, rhs) => {
             rename_column_refs_in_expr(lhs, from, to);
             rename_column_refs_in_expr(rhs, from, to);
         }
-        ast::Expr::Unary(_, operand) => {
+        Expr::Unary(_, operand) => {
             rename_column_refs_in_expr(operand, from, to);
         }
-        ast::Expr::Parenthesized(exprs) => {
+        Expr::Parenthesized(exprs) => {
             for e in exprs {
                 rename_column_refs_in_expr(e, from, to);
             }
