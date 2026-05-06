@@ -1866,19 +1866,21 @@ impl Pager {
     /// Rollback to the newest savepoint. This basically just means reading the subjournal from the start offset
     /// of the savepoint to the end of the subjournal and restoring the page images to the page cache.
     pub fn rollback_to_newest_savepoint(&self) -> Result<bool> {
-        let mut savepoints = self.savepoints.write();
-        if !matches!(
-            savepoints.last().map(|savepoint| &savepoint.kind),
-            Some(SavepointKind::Statement)
-        ) {
-            return Ok(false);
-        }
-        let savepoint = savepoints.pop().expect("savepoint must exist");
-        let journal_end_offset = savepoint.write_offset();
-        let savepoint = savepoint.snapshot();
+        let (savepoint, journal_end_offset) = {
+            let mut savepoints = self.savepoints.write();
+            if !matches!(
+                savepoints.last().map(|savepoint| &savepoint.kind),
+                Some(SavepointKind::Statement)
+            ) {
+                return Ok(false);
+            }
+            let savepoint = savepoints.pop().expect("savepoint must exist");
+            (savepoint.snapshot(), savepoint.write_offset())
+        };
 
         self.rollback_to_snapshot(&savepoint, journal_end_offset)?;
 
+        let savepoints = self.savepoints.write();
         if let Some(parent) = savepoints.last() {
             parent.set_write_offset(savepoint.start_offset);
         }
@@ -1961,18 +1963,22 @@ impl Pager {
         savepoint: &SavepointSnapshot,
         journal_end_offset: u64,
     ) -> Result<()> {
-        let subjournal = self.subjournal.read();
-        let Some(subjournal) = subjournal.as_ref() else {
-            return Ok(());
+        let subjournal = {
+            let subjournal = self.subjournal.read();
+            let Some(subjournal) = subjournal.as_ref() else {
+                return Ok(());
+            };
+            subjournal.clone()
         };
 
         let journal_start_offset = savepoint.start_offset;
         let db_size = savepoint.db_size;
+        let original_cache_capacity = self.page_cache.read().capacity();
+        let mut cache_capacity_was_expanded = false;
 
         let mut rollback_bitset = RoaringBitmap::new();
         let mut current_offset = journal_start_offset;
         let page_size = self.page_size.load(Ordering::SeqCst) as u64;
-        let mut dirty_pages = self.dirty_pages.write();
 
         while current_offset < journal_end_offset {
             let page_id_buffer = Arc::new(self.buffer_pool.allocate(4));
@@ -2006,8 +2012,13 @@ impl Pager {
             // eviction cannot drop uncommitted changes that predate the
             // rolled-back savepoint/statement.
             page.set_dirty();
-            dirty_pages.insert(page_id);
-            self.upsert_page_in_cache(page_id as usize, page, true)?;
+            self.dirty_pages.write().insert(page_id);
+            self.upsert_page_in_cache_allow_overflow(
+                page_id as usize,
+                page,
+                true,
+                &mut cache_capacity_was_expanded,
+            )?;
         }
 
         let truncate_completion = subjournal.truncate(journal_start_offset)?;
@@ -2021,6 +2032,7 @@ impl Pager {
         // above won't encounter them. We must clean them from dirty_pages before
         // truncating the cache, or phantom dirty entries survive into commit.
         {
+            let mut dirty_pages = self.dirty_pages.write();
             let mut cache = self.page_cache.write();
             for page_id in dirty_pages.iter().filter(|&id| id > db_size) {
                 if let Some(page) = cache.get(&PageCacheKey::new(page_id as usize))? {
@@ -2045,6 +2057,10 @@ impl Pager {
                         "failed to invalidate rolled-back WAL pages: {e:?}"
                     ))
                 })?;
+        }
+
+        if cache_capacity_was_expanded {
+            self.restore_page_cache_capacity(original_cache_capacity)?;
         }
 
         Ok(())
@@ -5012,6 +5028,71 @@ impl Pager {
         page: PageRef,
         dirty_page_must_exist: bool,
     ) -> Result<(), LimboError> {
+        self.try_upsert_page_in_cache(id, page, dirty_page_must_exist)
+            .map_err(|e| {
+                LimboError::InternalError(format!(
+                    "Failed to insert loaded page {id} into cache: {e:?}"
+                ))
+            })
+    }
+
+    fn upsert_page_in_cache_allow_overflow(
+        &self,
+        id: usize,
+        page: PageRef,
+        dirty_page_must_exist: bool,
+        cache_capacity_was_expanded: &mut bool,
+    ) -> Result<(), LimboError> {
+        match self.try_upsert_page_in_cache(id, page.clone(), dirty_page_must_exist) {
+            Ok(()) => return Ok(()),
+            Err(CacheError::Full) => {
+                let mut cache = self.page_cache.write();
+                let expanded_capacity = cache.len() + 1;
+                cache.resize(expanded_capacity);
+                *cache_capacity_was_expanded = true;
+            }
+            Err(e) => {
+                return Err(LimboError::InternalError(format!(
+                    "Failed to insert loaded page {id} into cache: {e:?}"
+                )));
+            }
+        }
+
+        self.try_upsert_page_in_cache(id, page, dirty_page_must_exist)
+            .map_err(|e| {
+                LimboError::InternalError(format!(
+                    "Failed to insert loaded page {id} into cache: {e:?}"
+                ))
+            })
+    }
+
+    fn restore_page_cache_capacity(&self, capacity: usize) -> Result<()> {
+        loop {
+            {
+                let mut cache = self.page_cache.write();
+                if cache.capacity() <= capacity {
+                    return Ok(());
+                }
+                if matches!(cache.resize(capacity), CacheResizeResult::Done) {
+                    return Ok(());
+                }
+                cache.set_spill_threshold(capacity.max(1));
+            }
+
+            match self.try_spill_dirty_pages()? {
+                IOResult::Done(true) => {}
+                IOResult::Done(false) => return Ok(()),
+                IOResult::IO(completions) => completions.wait(self.io.as_ref())?,
+            }
+        }
+    }
+
+    fn try_upsert_page_in_cache(
+        &self,
+        id: usize,
+        page: PageRef,
+        dirty_page_must_exist: bool,
+    ) -> Result<(), CacheError> {
         let mut cache = self.page_cache.write();
         let page_key = PageCacheKey::new(id);
 
@@ -5019,11 +5100,7 @@ impl Pager {
         if dirty_page_must_exist {
             turso_assert!(page.is_dirty(), "page must be dirty for upsert", { "page_id": id });
         }
-        cache.upsert_page(page_key, page.clone()).map_err(|e| {
-            LimboError::InternalError(format!(
-                "Failed to insert loaded page {id} into cache: {e:?}"
-            ))
-        })?;
+        cache.upsert_page(page_key, page.clone())?;
         page.set_loaded();
         page.clear_wal_tag();
         Ok(())

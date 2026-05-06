@@ -53,12 +53,12 @@ simulator covers and tests.
 | INSERT                    | Partial | TODO                                                                              |
 | ON CONFLICT clause        | No      |                                                                                   |
 | REINDEX                   | No      |                                                                                   |
-| RELEASE SAVEPOINT         | Partial | Covered by SavepointRollback property.                                            |
+| RELEASE SAVEPOINT         | Partial | Covered by SavepointRollback and SavepointRollbackReopen properties.              |
 | REPLACE                   | No      |                                                                                   |
 | RETURNING clause          | No      | TODO                                                                              |
 | ROLLBACK TRANSACTION      | Partial | TODO                                                                              |
-| ROLLBACK TO SAVEPOINT     | Partial | Covered by SavepointRollback property.                                            |
-| SAVEPOINT                 | Partial | Covered by SavepointRollback property.                                            |
+| ROLLBACK TO SAVEPOINT     | Partial | Covered by SavepointRollback and SavepointRollbackReopen properties.              |
+| SAVEPOINT                 | Partial | Covered by SavepointRollback and SavepointRollbackReopen properties.              |
 | SELECT                    | Partial | TODO                                                                              |
 | SELECT ... WHERE          | Partial | TODO                                                                              |
 | SELECT ... WHERE ... LIKE | No      |                                                                                   |
@@ -115,7 +115,7 @@ simulator covers and tests.
 | PRAGMA index_info                | No         |                                                  |
 | PRAGMA index_list                | No         |                                                  |
 | PRAGMA index_xinfo               | No         |                                                  |
-| PRAGMA integrity_check           | No         |                                                  |
+| PRAGMA integrity_check           | Partial    | Checked after savepoint rollback properties.      |
 | PRAGMA journal_mode              | No         |                                                  |
 | PRAGMA journal_size_limit        | No         |                                                  |
 | PRAGMA legacy_alter_table        | No         |                                                  |

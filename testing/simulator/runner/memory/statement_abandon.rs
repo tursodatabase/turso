@@ -88,6 +88,23 @@ fn query_rows(conn: &Arc<Connection>, io: &MemorySimIO) -> Result<Vec<(i64, Stri
     }
 }
 
+fn query_integrity_check(conn: &Arc<Connection>, io: &MemorySimIO) -> Result<String> {
+    let mut stmt = conn.prepare("PRAGMA integrity_check")?;
+    loop {
+        match stmt.step()? {
+            StepResult::IO => io.step()?,
+            StepResult::Row => {
+                let row = stmt.row().expect("integrity_check should return a row");
+                return Ok(row
+                    .get::<String>(0)
+                    .expect("integrity_check column should exist"));
+            }
+            StepResult::Done => panic!("integrity_check ended without a row"),
+            other => panic!("unexpected step result: {other:?}"),
+        }
+    }
+}
+
 #[test]
 fn sim_abandon_during_dml_rolls_back() -> Result<()> {
     let (conn, io) = make_conn(1)?;
@@ -279,6 +296,42 @@ fn sim_reset_releases_subjournal_when_abort_called_without_error() -> Result<()>
         query_rows(&conn, io.as_ref())?,
         vec![(99, "ok".to_string())]
     );
+    Ok(())
+}
+
+#[test]
+fn sim_statement_rollback_under_cache_pressure_does_not_corrupt_db() -> Result<()> {
+    let (conn, io) = make_conn(8)?;
+    conn.execute("PRAGMA cache_size=10")?;
+    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, u INTEGER UNIQUE, v TEXT)")?;
+
+    conn.execute("BEGIN")?;
+    let payload = "a".repeat(2048);
+    for id in 1..=700 {
+        conn.execute(format!("INSERT INTO t VALUES ({id}, {id}, '{payload}')"))?;
+    }
+    conn.execute("COMMIT")?;
+
+    let update_payload = "x".repeat(3072);
+    let mut stmt = conn.prepare(format!(
+        "UPDATE t SET v = '{update_payload}', u = CASE WHEN id = 350 THEN 1 ELSE u END WHERE id <= 700"
+    ))?;
+    let err = loop {
+        match stmt.step() {
+            Ok(StepResult::IO) => io.step()?,
+            Ok(StepResult::Done) => panic!("update should fail with a UNIQUE constraint"),
+            Ok(other) => panic!("unexpected step result: {other:?}"),
+            Err(err) => break err,
+        }
+    };
+    assert!(
+        err.to_string().contains("UNIQUE constraint failed"),
+        "expected UNIQUE constraint, got {err}"
+    );
+    drop(stmt);
+
+    assert_eq!(query_count(&conn, io.as_ref())?, 700);
+    assert_eq!(query_integrity_check(&conn, io.as_ref())?, "ok");
     Ok(())
 }
 

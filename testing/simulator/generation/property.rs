@@ -33,7 +33,7 @@ use crate::{
         Query, QueryCapabilities, QueryDiscriminants, ReleaseSavepoint, ResultSet,
         RollbackToSavepoint, Savepoint,
         interactions::{
-            Assertion, Interaction, InteractionBuilder, InteractionType, PropertyMetadata,
+            Assertion, Fault, Interaction, InteractionBuilder, InteractionType, PropertyMetadata,
         },
         metrics::Remaining,
         property::{InteractiveQueryInfo, Property, PropertyDiscriminants},
@@ -231,6 +231,14 @@ impl Property {
             Property::SavepointRollback { .. } => {
                 |rng: &mut R, ctx: &G, _query_distr: &QueryDistribution, property: &Property| {
                     let Property::SavepointRollback { write_kinds, .. } = property else {
+                        unreachable!()
+                    };
+                    random_main_table_write(rng, ctx, write_kinds)
+                }
+            }
+            Property::SavepointRollbackReopen { .. } => {
+                |rng: &mut R, ctx: &G, _query_distr: &QueryDistribution, property: &Property| {
+                    let Property::SavepointRollbackReopen { write_kinds, .. } = property else {
                         unreachable!()
                     };
                     random_main_table_write(rng, ctx, write_kinds)
@@ -1208,31 +1216,10 @@ impl Property {
                 .collect(),
             Property::SavepointRollback {
                 queries, tables, ..
-            } => {
-                let savepoint_name = format!("sim_sp_{}", id.get());
-                let mut interactions = Vec::with_capacity(queries.len() + 4 + tables.len() * 2);
-                interactions.push(InteractionBuilder::with_interaction(
-                    InteractionType::Query(Query::Savepoint(Savepoint {
-                        name: savepoint_name.clone(),
-                    })),
-                ));
-                interactions.extend(queries.clone().into_iter().map(|query| {
-                    InteractionBuilder::with_interaction(InteractionType::Query(query))
-                }));
-                interactions.push(InteractionBuilder::with_interaction(
-                    InteractionType::Query(Query::RollbackToSavepoint(RollbackToSavepoint {
-                        name: savepoint_name.clone(),
-                    })),
-                ));
-                interactions.push(InteractionBuilder::with_interaction(
-                    InteractionType::Query(Query::ReleaseSavepoint(ReleaseSavepoint {
-                        name: savepoint_name,
-                    })),
-                ));
-                interactions.extend(assert_all_table_values(tables, connection_index));
-                interactions.push(assert_integrity_check(tables, connection_index));
-                interactions
-            }
+            } => savepoint_rollback_interactions(queries, tables, connection_index, id, false),
+            Property::SavepointRollbackReopen {
+                queries, tables, ..
+            } => savepoint_rollback_interactions(queries, tables, connection_index, id, true),
         };
 
         assert!(!interactions.is_empty());
@@ -1248,6 +1235,46 @@ impl Property {
             })
             .collect()
     }
+}
+
+fn savepoint_rollback_interactions(
+    queries: &[Query],
+    tables: &[String],
+    connection_index: usize,
+    id: NonZeroUsize,
+    reopen: bool,
+) -> Vec<InteractionBuilder> {
+    let savepoint_name = format!("sim_sp_{}", id.get());
+    let mut interactions = Vec::with_capacity(queries.len() + 5 + tables.len() * 2);
+    interactions.push(InteractionBuilder::with_interaction(
+        InteractionType::Query(Query::Savepoint(Savepoint {
+            name: savepoint_name.clone(),
+        })),
+    ));
+    interactions.extend(
+        queries
+            .iter()
+            .cloned()
+            .map(|query| InteractionBuilder::with_interaction(InteractionType::Query(query))),
+    );
+    interactions.push(InteractionBuilder::with_interaction(
+        InteractionType::Query(Query::RollbackToSavepoint(RollbackToSavepoint {
+            name: savepoint_name.clone(),
+        })),
+    ));
+    interactions.push(InteractionBuilder::with_interaction(
+        InteractionType::Query(Query::ReleaseSavepoint(ReleaseSavepoint {
+            name: savepoint_name,
+        })),
+    ));
+    if reopen {
+        interactions.push(InteractionBuilder::with_interaction(
+            InteractionType::Fault(Fault::ReopenDatabase),
+        ));
+    }
+    interactions.extend(assert_all_table_values(tables, connection_index));
+    interactions.push(assert_integrity_check(tables, connection_index));
+    interactions
 }
 
 fn random_main_table_write<R: rand::Rng + ?Sized>(
@@ -1651,6 +1678,24 @@ fn property_savepoint_rollback<R: rand::Rng + ?Sized>(
     ctx: &impl GenerationContext,
     _mvcc: bool,
 ) -> Property {
+    property_savepoint_rollback_impl(rng, query_distr, ctx, false)
+}
+
+fn property_savepoint_rollback_reopen<R: rand::Rng + ?Sized>(
+    rng: &mut R,
+    query_distr: &QueryDistribution,
+    ctx: &impl GenerationContext,
+    _mvcc: bool,
+) -> Property {
+    property_savepoint_rollback_impl(rng, query_distr, ctx, true)
+}
+
+fn property_savepoint_rollback_impl<R: rand::Rng + ?Sized>(
+    rng: &mut R,
+    query_distr: &QueryDistribution,
+    ctx: &impl GenerationContext,
+    reopen: bool,
+) -> Property {
     let tables = ctx
         .tables()
         .iter()
@@ -1671,10 +1716,19 @@ fn property_savepoint_rollback<R: rand::Rng + ?Sized>(
         .collect::<Vec<_>>();
     assert!(!write_kinds.is_empty());
     let amount = rng.random_range(1..=5);
-    Property::SavepointRollback {
-        queries: std::iter::repeat_n(Query::Placeholder, amount).collect(),
-        tables,
-        write_kinds,
+    let queries = std::iter::repeat_n(Query::Placeholder, amount).collect();
+    if reopen {
+        Property::SavepointRollbackReopen {
+            queries,
+            tables,
+            write_kinds,
+        }
+    } else {
+        Property::SavepointRollback {
+            queries,
+            tables,
+            write_kinds,
+        }
     }
 }
 
@@ -1899,6 +1953,7 @@ impl PropertyDiscriminants {
             PropertyDiscriminants::InsertValuesSelect => property_insert_values_select,
             PropertyDiscriminants::ReadYourUpdatesBack => property_read_your_updates_back,
             PropertyDiscriminants::SavepointRollback => property_savepoint_rollback,
+            PropertyDiscriminants::SavepointRollbackReopen => property_savepoint_rollback_reopen,
             PropertyDiscriminants::TableHasExpectedContent => property_table_has_expected_content,
             PropertyDiscriminants::AllTableHaveExpectedContent => {
                 property_all_tables_have_expected_content
@@ -1950,6 +2005,17 @@ impl PropertyDiscriminants {
             }
             PropertyDiscriminants::SavepointRollback => {
                 if !env.opts.disable_savepoint_rollback
+                    && !env.profile.mvcc
+                    && ctx.tables().iter().any(|table| !table.name.contains('.'))
+                {
+                    remaining.insert + remaining.update + remaining.delete
+                } else {
+                    0
+                }
+            }
+            PropertyDiscriminants::SavepointRollbackReopen => {
+                if !env.opts.disable_savepoint_rollback
+                    && !env.opts.disable_reopen_database
                     && !env.profile.mvcc
                     && ctx.tables().iter().any(|table| !table.name.contains('.'))
                 {
@@ -2059,6 +2125,7 @@ impl PropertyDiscriminants {
                 QueryCapabilities::SELECT.union(QueryCapabilities::UPDATE)
             }
             PropertyDiscriminants::SavepointRollback => QueryCapabilities::INSERT,
+            PropertyDiscriminants::SavepointRollbackReopen => QueryCapabilities::INSERT,
             PropertyDiscriminants::TableHasExpectedContent => QueryCapabilities::SELECT,
             PropertyDiscriminants::AllTableHaveExpectedContent => QueryCapabilities::SELECT,
             PropertyDiscriminants::DoubleCreateFailure => QueryCapabilities::CREATE,
@@ -2159,4 +2226,55 @@ fn print_row(row: &[SimValue]) -> String {
         })
         .collect::<Vec<String>>()
         .join(", ")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn savepoint_rollback_reopen_reopens_before_assertions() {
+        let property = Property::SavepointRollbackReopen {
+            queries: vec![Query::Placeholder],
+            tables: vec!["t".to_string()],
+            write_kinds: vec![QueryDiscriminants::Insert],
+        };
+
+        let id = NonZeroUsize::new(7).unwrap();
+        let interactions = property.interactions(2, id);
+
+        assert!(
+            interactions
+                .iter()
+                .all(|interaction| interaction.connection_index == 2 && interaction.id() == id)
+        );
+
+        let release_idx = interactions
+            .iter()
+            .position(|interaction| {
+                matches!(
+                    &interaction.interaction,
+                    InteractionType::Query(Query::ReleaseSavepoint(_))
+                )
+            })
+            .expect("property should release the savepoint");
+        let reopen_idx = interactions
+            .iter()
+            .position(|interaction| {
+                matches!(
+                    &interaction.interaction,
+                    InteractionType::Fault(Fault::ReopenDatabase)
+                )
+            })
+            .expect("property should reopen the database");
+        let assertion_idx = interactions
+            .iter()
+            .position(|interaction| {
+                matches!(&interaction.interaction, InteractionType::Assertion(_))
+            })
+            .expect("property should assert table contents after rollback");
+
+        assert!(release_idx < reopen_idx);
+        assert!(reopen_idx < assertion_idx);
+    }
 }
