@@ -1,0 +1,98 @@
+@database :memory:
+
+
+test paren-around-single-table {
+    CREATE TABLE t(x INT);
+    INSERT INTO t VALUES (1), (2), (3);
+    SELECT x FROM (t) ORDER BY x;
+}
+expect {
+    1
+    2
+    3
+}
+
+test paren-around-inner-join {
+    CREATE TABLE a(x INT);
+    CREATE TABLE b(y INT, ax INT);
+    INSERT INTO a VALUES (1), (2), (3);
+    INSERT INTO b VALUES (10, 1), (20, 2);
+    SELECT a.x, b.y FROM (a INNER JOIN b ON a.x = b.ax) ORDER BY a.x;
+}
+expect {
+    1|10
+    2|20
+}
+
+test paren-around-inner-join-then-outer-join {
+    CREATE TABLE a(x INT);
+    CREATE TABLE b(y INT, ax INT);
+    CREATE TABLE c(z INT, by_ INT);
+    INSERT INTO a VALUES (1), (2);
+    INSERT INTO b VALUES (10, 1), (20, 2);
+    INSERT INTO c VALUES (100, 10), (200, 20);
+    SELECT a.x, b.y, c.z
+    FROM (a INNER JOIN b ON a.x = b.ax)
+    INNER JOIN c ON c.by_ = b.y
+    ORDER BY a.x;
+}
+expect {
+    1|10|100
+    2|20|200
+}
+
+test paren-around-left-join {
+    CREATE TABLE a(x INT);
+    CREATE TABLE b(y INT, ax INT);
+    INSERT INTO a VALUES (1), (2), (3);
+    INSERT INTO b VALUES (10, 1), (20, 2);
+    SELECT a.x, b.y FROM (a LEFT JOIN b ON a.x = b.ax) ORDER BY a.x;
+}
+expect {
+    1|10
+    2|20
+    3|
+}
+
+test double-paren-around-join {
+    CREATE TABLE a(x INT);
+    CREATE TABLE b(y INT, ax INT);
+    INSERT INTO a VALUES (1), (2);
+    INSERT INTO b VALUES (10, 1), (20, 2);
+    SELECT a.x, b.y FROM ((a INNER JOIN b ON a.x = b.ax)) ORDER BY a.x;
+}
+expect {
+    1|10
+    2|20
+}
+
+test paren-around-from-with-where {
+    CREATE TABLE a(x INT);
+    CREATE TABLE b(y INT, ax INT);
+    INSERT INTO a VALUES (1), (2), (3);
+    INSERT INTO b VALUES (10, 1), (20, 2), (30, 3);
+    SELECT a.x, b.y
+    FROM (a INNER JOIN b ON a.x = b.ax)
+    WHERE b.y > 10
+    ORDER BY a.x;
+}
+expect {
+    2|20
+    3|30
+}
+
+test paren-around-three-way-join {
+    CREATE TABLE a(x INT);
+    CREATE TABLE b(y INT, ax INT);
+    CREATE TABLE c(z INT, by_ INT);
+    INSERT INTO a VALUES (1), (2);
+    INSERT INTO b VALUES (10, 1), (20, 2);
+    INSERT INTO c VALUES (100, 10), (200, 20);
+    SELECT a.x, b.y, c.z
+    FROM (a INNER JOIN b ON a.x = b.ax INNER JOIN c ON c.by_ = b.y)
+    ORDER BY a.x;
+}
+expect {
+    1|10|100
+    2|20|200
+}

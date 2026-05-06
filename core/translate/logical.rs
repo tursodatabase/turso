@@ -577,14 +577,24 @@ impl<'a> LogicalPlanBuilder<'a> {
 
     // Build FROM clause
     fn build_from(&mut self, from: &ast::FromClause) -> Result<LogicalPlan> {
-        let mut plan = { self.build_select_table(&from.select)? };
+        // Flatten top-level unaliased parenthesized FROM expressions:
+        //   FROM (a JOIN b ON x) JOIN c ON y  →  FROM a JOIN b ON x JOIN c ON y
+        // Each unwrap prepends the inner joins to the running join chain.
+        // Aliased `Sub(.., Some(_))` is left to fall through to build_select_table
+        // so it still produces the existing parse error rather than silently flattening.
+        let mut head: &ast::SelectTable = &from.select;
+        let mut all_joins: Vec<&ast::JoinedSelectTable> = from.joins.iter().collect();
+        while let ast::SelectTable::Sub(inner, None) = head {
+            let mut prepended: Vec<&ast::JoinedSelectTable> = inner.joins.iter().collect();
+            prepended.append(&mut all_joins);
+            all_joins = prepended;
+            head = &inner.select;
+        }
 
-        // Handle JOINs
-        if !from.joins.is_empty() {
-            for join in &from.joins {
-                let right = self.build_select_table(&join.table)?;
-                plan = self.build_join(plan, right, &join.operator, &join.constraint)?;
-            }
+        let mut plan = self.build_select_table(head)?;
+        for join in all_joins {
+            let right = self.build_select_table(&join.table)?;
+            plan = self.build_join(plan, right, &join.operator, &join.constraint)?;
         }
 
         Ok(plan)

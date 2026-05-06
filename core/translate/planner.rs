@@ -1302,10 +1302,25 @@ pub fn parse_from(
 
     // Process FROM clause if present
     if let Some(from_owned) = from {
-        let select_owned = from_owned.select;
-        let joins_owned = from_owned.joins;
+        // Flatten top-level unaliased parenthesized FROM expressions. The parens
+        // are syntactic grouping with no enclosing JOIN here, so:
+        //   FROM (a JOIN b ON x)              →  FROM a JOIN b ON x
+        //   FROM (a JOIN b ON x) JOIN c ON y  →  FROM a JOIN b ON x JOIN c ON y
+        // Repeat in case of nested wrapping like `FROM ((a JOIN b ...))`.
+        // Aliased `Sub(.., Some(_))` is not flattened: aliasing a multi-table
+        // grouping is a derived-table construct that would need separate
+        // handling and isn't emitted by diesel.
+        let mut current_select = *from_owned.select;
+        let mut current_joins = from_owned.joins;
+        while let ast::SelectTable::Sub(inner, None) = current_select {
+            let mut combined = inner.joins;
+            combined.append(&mut current_joins);
+            current_select = *inner.select;
+            current_joins = combined;
+        }
+
         parse_from_clause_table(
-            *select_owned,
+            current_select,
             resolver,
             program,
             table_references,
@@ -1314,7 +1329,7 @@ pub fn parse_from(
             connection,
         )?;
 
-        for join in joins_owned.into_iter() {
+        for join in current_joins.into_iter() {
             parse_join(
                 join,
                 resolver,
