@@ -263,6 +263,9 @@ impl Arbitrary for Insert {
             non_unique.first()?;
             let table = *pick(&non_unique, rng);
 
+            //TODO fix this, it means that if there's 10 cols per table, there's a very tiny chance
+            // of actually using this statement shape. Instead, we should intelligently SELECT into
+            // only the non-generated columns.
             // Skip tables with generated columns - INSERT INTO ... SELECT * doesn't work
             // because SELECT * includes generated columns which can't be inserted
             if table.columns.iter().any(|c| c.is_generated()) {
@@ -303,6 +306,7 @@ impl Arbitrary for Insert {
         };
 
         let gen_select = |rng: &mut R| {
+            //TODO see comment at line 266, we need to be able to use tables with generated columns
             // Find a non-empty, not-too-large table without UNIQUE or generated columns
             // INSERT INTO ... SELECT * doesn't work with generated columns
             let max_rows = insert_opts.max_rows.get() as usize;
@@ -356,25 +360,21 @@ fn gen_insert_values<R: Rng + ?Sized, C: GenerationContext>(
 
     let table = pick(env.tables(), rng);
 
-    // Filter out generated columns - they are computed, not inserted
-    let non_generated_columns: Vec<(usize, &Column)> = table
-        .columns
-        .iter()
-        .enumerate()
-        .filter(|(_, c)| !c.is_generated())
-        .collect();
+    let non_generated_columns: Vec<&Column> =
+        table.columns.iter().filter(|c| !c.is_generated()).collect();
 
-    // If all columns are generated, skip this table
-    if non_generated_columns.is_empty() {
-        return None;
-    }
+    assert!(
+        !non_generated_columns.is_empty(),
+        "Table '{}' did not have at least one non-generated column",
+        table.name
+    );
 
-    let has_generated = non_generated_columns.len() < table.columns.len();
+    let has_generated_cols = non_generated_columns.len() < table.columns.len();
 
     const INTEGER_PK_NULL_PROB: f64 = 0.05;
     let integer_pk_idx = non_generated_columns
         .iter()
-        .position(|(_, c)| matches!(c.column_type, ColumnType::Integer) && c.is_primary_key());
+        .position(|c| matches!(c.column_type, ColumnType::Integer) && c.is_primary_key());
 
     let num_rows = rng.random_range(insert_opts.min_rows.get()..insert_opts.max_rows.get());
     let base_offset: i64 = rng.random_range(UNIQUE_BASE_OFFSET_RANGE);
@@ -384,13 +384,13 @@ fn gen_insert_values<R: Rng + ?Sized, C: GenerationContext>(
             non_generated_columns
                 .iter()
                 .enumerate()
-                .map(|(ng_idx, (_, c))| {
-                    if integer_pk_idx == Some(ng_idx) && rng.random_bool(INTEGER_PK_NULL_PROB) {
+                .map(|(col_idx, c)| {
+                    if integer_pk_idx == Some(col_idx) && rng.random_bool(INTEGER_PK_NULL_PROB) {
                         return SimValue::NULL;
                     }
                     if c.has_unique_or_pk() {
                         let offset =
-                            base_offset + (ng_idx as i64 * UNIQUE_COL_STRIDE) + row_idx as i64;
+                            base_offset + (col_idx as i64 * UNIQUE_COL_STRIDE) + row_idx as i64;
                         SimValue::unique_for_type(&c.column_type, offset)
                     } else {
                         SimValue::arbitrary_from(rng, env, &c.column_type)
@@ -400,12 +400,12 @@ fn gen_insert_values<R: Rng + ?Sized, C: GenerationContext>(
         })
         .collect();
 
-    if has_generated {
+    if has_generated_cols {
         Some(Insert::ValuesWithColumns {
             table: table.name.clone(),
             columns: non_generated_columns
                 .iter()
-                .map(|(_, c)| c.name.clone())
+                .map(|c| c.name.clone())
                 .collect(),
             values,
         })
@@ -624,10 +624,9 @@ impl Arbitrary for CreateIndex {
             );
         }
 
-        let indexable_column_indices: Vec<usize> = (0..table.columns.len()).collect();
-
-        let num_columns_to_pick = rng.random_range(1..=indexable_column_indices.len());
-        let picked_column_indices: Vec<usize> = indexable_column_indices
+        let num_columns_to_pick = rng.random_range(1..=table.columns.len());
+        let picked_column_indices: Vec<usize> = (0..table.columns.len())
+            .collect::<Vec<usize>>()
             .choose_multiple(rng, num_columns_to_pick)
             .copied()
             .collect();
@@ -676,14 +675,12 @@ impl Arbitrary for Update {
         let table = pick(env.tables(), rng);
         let update_opts = &env.opts().query.update;
 
-        // Filter out generated columns - they cannot be directly updated
         let updatable_columns: Vec<&Column> =
             table.columns.iter().filter(|c| !c.is_generated()).collect();
 
-        // Tables must have at least one non-generated column per SQLite rules
         assert!(
             !updatable_columns.is_empty(),
-            "Table '{}' has no non-generated columns - this violates SQLite constraints",
+            "Table '{}' did not have at least one non-generated column",
             table.name
         );
 
@@ -864,7 +861,7 @@ fn get_column_diff(table: &Table) -> IndexSet<&str> {
     }
 
     if undropable.len() == table.columns.len() {
-        // Optimization: all columns cannot be dropped
+        // no columns can be dropped
         return IndexSet::new();
     }
 

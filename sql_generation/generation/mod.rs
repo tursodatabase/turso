@@ -214,10 +214,10 @@ pub mod tests {
         pub tables: Vec<Table>,
     }
 
-    impl TestContext {
-        pub fn default() -> Self {
+    impl Default for TestContext {
+        fn default() -> Self {
             // Create a test context with generated columns disabled.
-            // Predicate ests create random values for all columns, which doesn't work correctly
+            // Predicate tests create random values for all columns, which doesn't work correctly
             // with generated columns since their values should be computed from expressions.
             let mut ctx = Self {
                 opts: Default::default(),

@@ -74,10 +74,11 @@ impl Property {
                     let partial_rows = insert.rows();
                     let partial_row = &partial_rows[*row_index];
 
-                    // Expand partial row to full width for predicate testing.
-                    // Virtual column slots are NULL; expr_to_value evaluates them on-the-fly.
+                    // full_row has its generated columns evaluated
                     let full_row = match insert {
                         Insert::ValuesWithColumns { columns, .. } => {
+                            //TODO could we encode the two types of rows and the transition
+                            // in the type system?
                             expand_to_full_row(table, Some(columns), partial_row)
                         }
                         Insert::Values { .. } => expand_to_full_row(table, None, partial_row),
@@ -188,9 +189,9 @@ impl Property {
                             columns: _,
                             values: _,
                         }) if *t == table_name => {
-                            // A row that holds for the predicate will not be inserted.
-                            // For ValuesWithColumns, we can't easily test partial rows against
-                            // the predicate, so conservatively reject all inserts to this table.
+                            // A row that holds for the predicate will not be inserted. We can't
+                            // easily test partial rows (rows with unevaluated generated columns)
+                            // against the predicate, so conservatively reject all ValuesWithColumns.
                             None
                         }
                         Query::Insert(Insert::Select {
@@ -321,23 +322,15 @@ impl Property {
                             .iter()
                             .find(|t| t.name == table)
                             .expect("table should be in enviroment");
-                        let has_virtual = sim_table.columns.iter().any(|c| c.is_generated());
-                        let expected: Vec<Vec<SimValue>> = if has_virtual {
-                            sim_table
-                                .rows
-                                .iter()
-                                .map(|r| strip_virtual_cols(sim_table, r))
-                                .collect()
-                        } else {
-                            sim_table.rows.clone()
-                        };
-                        let actual: Vec<Vec<SimValue>> = if has_virtual {
-                            rows.iter()
-                                .map(|r| strip_virtual_cols(sim_table, r))
-                                .collect()
-                        } else {
-                            rows.clone()
-                        };
+                        let expected: Vec<Vec<SimValue>> = sim_table
+                            .rows
+                            .iter()
+                            .map(|r| strip_virtual_cols(sim_table, r))
+                            .collect();
+                        let actual: Vec<Vec<SimValue>> = rows
+                            .iter()
+                            .map(|r| strip_virtual_cols(sim_table, r))
+                            .collect();
                         if actual.len() != expected.len() {
                             print_diff(&expected, &actual, "simulator", "database");
                             return Ok(Err(format!(
@@ -511,22 +504,14 @@ impl Property {
                 select,
                 interactive,
             } => {
-                let (table, values) = match insert {
-                    Insert::Values {
-                        table,
-                        values,
-                        on_conflict: None,
-                    } => (table.clone(), values.clone()),
-                    Insert::ValuesWithColumns {
-                        table,
-                        columns: _,
-                        values,
-                    } => (table.clone(), values.clone()),
-                    _ => {
-                        unreachable!(
-                            "insert query should be Insert::Values or Insert::ValuesWithColumns for Insert-Values-Select property"
-                        )
-                    }
+                let (table, values) = if let Insert::Values { table, values, .. }
+                | Insert::ValuesWithColumns { table, values, .. } = insert
+                {
+                    (table, values)
+                } else {
+                    unreachable!(
+                        "insert query should be Insert::Values or Insert::ValuesWithColumns for Insert-Values-Select property"
+                    )
                 };
                 // Check that the insert query has at least 1 value
                 assert!(
@@ -1334,7 +1319,7 @@ fn random_main_table_insert<R: rand::Rng + ?Sized>(
         .enumerate()
         .filter(|(_, c)| !c.is_generated())
         .collect();
-    let has_generated = non_generated_columns.len() < table.columns.len();
+    let has_generated_col = non_generated_columns.len() < table.columns.len();
 
     let num_rows = rng.random_range(1..=5);
     let base_offset: i64 = rng.random_range(UNIQUE_BASE_OFFSET_RANGE);
@@ -1356,7 +1341,7 @@ fn random_main_table_insert<R: rand::Rng + ?Sized>(
         })
         .collect();
 
-    if has_generated {
+    if has_generated_col {
         Query::Insert(Insert::ValuesWithColumns {
             table: table.name.clone(),
             columns: non_generated_columns
@@ -1547,7 +1532,7 @@ fn strip_virtual_cols(table: &Table, row: &[SimValue]) -> Vec<SimValue> {
         .iter()
         .zip(row.iter())
         .filter(|(col, _)| !col.is_generated())
-        .map(|(_, val)| val.clone())
+        .map(|(_, sim_val)| sim_val.clone())
         .collect()
 }
 

@@ -26,7 +26,7 @@ pub enum Insert {
         #[serde(default)]
         on_conflict: Option<OnConflict>,
     },
-    /// Insert with explicit column list (required when skipping generated columns)
+    /// Insert with explicit column list
     ValuesWithColumns {
         table: String,
         columns: Vec<String>,
@@ -51,14 +51,6 @@ impl Insert {
         match self {
             Insert::Values { values, .. } | Insert::ValuesWithColumns { values, .. } => values,
             Insert::Select { .. } => unreachable!(),
-        }
-    }
-
-    /// Returns the column names for ValuesWithColumns, or None for other variants
-    pub fn columns(&self) -> Option<&[String]> {
-        match self {
-            Insert::ValuesWithColumns { columns, .. } => Some(columns),
-            _ => None,
         }
     }
 }

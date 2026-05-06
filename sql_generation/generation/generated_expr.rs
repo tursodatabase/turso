@@ -83,9 +83,6 @@ fn generate_expr_inner<R: Rng + ?Sized>(
                     depth - 1,
                     refs,
                 );
-                //TODO this feels like a workaround for a flaw in the shadow model's evaluation precedence?
-                // Wrap subexpressions in parentheses to ensure correct evaluation order
-                // when the shadow model evaluates the expression tree directly
                 let lhs = if matches!(lhs, Expr::Binary(..)) {
                     Expr::Parenthesized(vec![Box::new(lhs)])
                 } else {
@@ -190,14 +187,21 @@ fn generate_literal<R: Rng + ?Sized>(rng: &mut R, target_type: &ColumnType) -> E
     }
 }
 
-//TODO: Extend expression generation to include more operators (/, %, bitwise,
-// comparison, LIKE, BETWEEN, IN) and expression types (CASE, function calls)
-// to improve fuzzer coverage of generated column expressions.
 /// Pick an appropriate binary operator for the target type.
 fn pick_binary_op<R: Rng + ?Sized>(rng: &mut R, target_type: &ColumnType) -> Option<Operator> {
     match target_type {
         ColumnType::Integer | ColumnType::Float => {
-            let ops = [Operator::Add, Operator::Subtract, Operator::Multiply];
+            let ops = [
+                Operator::Add,
+                Operator::Subtract,
+                Operator::Multiply,
+                Operator::Divide,
+                Operator::Modulus,
+                Operator::BitwiseAnd,
+                Operator::BitwiseOr,
+                Operator::LeftShift,
+                Operator::RightShift,
+            ];
             Some(ops[rng.random_range(0..ops.len())])
         }
         // don't generate `||` (concat), as a workaround for

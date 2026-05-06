@@ -119,16 +119,13 @@ pub fn expr_to_value<T: TableContext>(
                 .iter()
                 .zip(row.iter())
                 .find(|(column, _)| column.column.name == col_name)
-                .and_then(|(col_ctx, row_value)| {
+                .map(|(col_ctx, row_value)| {
                     let col = &col_ctx.column;
-                    if col.is_generated() {
-                        // VIRTUAL column: evaluate the expression and apply column type affinity
-                        // to match SQLite's behavior (e.g., INTEGER to REAL conversion)
-                        col.generated_expr()
-                            .and_then(|gen_expr| expr_to_value(gen_expr, row, table))
-                            .map(|v| v.apply_affinity(col.column_type))
-                    } else {
-                        Some(row_value.clone())
+                    match col.generated_expr() {
+                        Some(expr) => expr_to_value(expr, row, table)
+                            .expect("could not resolve expression")
+                            .apply_affinity(col.column_type),
+                        None => row_value.clone(),
                     }
                 })
         }

@@ -105,14 +105,12 @@ impl Column {
             .any(|c| matches!(c, ColumnConstraint::PrimaryKey { .. }))
     }
 
-    /// Returns true if this column has a GENERATED constraint
     pub fn is_generated(&self) -> bool {
         self.constraints
             .iter()
             .any(|c| matches!(c, ColumnConstraint::Generated { .. }))
     }
 
-    /// Returns the expression for this generated column, if any
     pub fn generated_expr(&self) -> Option<&ast::Expr> {
         self.constraints.iter().find_map(|c| match c {
             ColumnConstraint::Generated { expr, .. } => Some(expr.as_ref()),
@@ -233,12 +231,8 @@ impl SimValue {
             .unwrap_or_default()
     }
 
-    /// SQLite-compatible comparison that handles cross-type numeric comparisons.
-    /// In SQLite, INTEGER vs FLOAT comparisons use truncate-then-compare semantics
-    /// to preserve precision for large integers.
     fn sqlite_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
         match (&self.0, &other.0) {
-            // NULL comparisons
             (types::Value::Null, _) | (_, types::Value::Null) => None,
             _ => Some(self.0.cmp(&other.0)),
         }
@@ -359,18 +353,12 @@ impl SimValue {
         Self(new_value)
     }
 
-    /// Apply column type affinity to a SimValue, matching SQLite's behavior.
-    /// This is necessary for generated columns where the expression result type
-    /// may differ from the declared column type.
     pub fn apply_affinity(self, column_type: ColumnType) -> SimValue {
         match column_type {
             ColumnType::Integer => {
-                // For INTEGER affinity, convert floats that can be exactly represented as integers
                 if let types::Value::Numeric(Numeric::Float(fl)) = &self.0 {
                     let fl = f64::from(*fl);
-                    // Check if the float has no fractional part
                     if fl.is_finite() && fl.trunc() == fl {
-                        // Convert float to i64 with saturation at limits (matches SQLite's doubleToInt64)
                         let int_val = if fl < -9223372036854774784.0 {
                             i64::MIN
                         } else if fl > 9223372036854774784.0 {
@@ -378,7 +366,6 @@ impl SimValue {
                         } else {
                             fl as i64
                         };
-                        // Check if round-trip conversion is exact (key check from SQLite)
                         if (int_val as f64) == fl && int_val != i64::MIN {
                             return SimValue(types::Value::from_i64(int_val));
                         }
@@ -387,14 +374,11 @@ impl SimValue {
                 self
             }
             ColumnType::Float => {
-                // For REAL affinity, SQLite forces integer values into floating point representation.
-                // This can cause precision loss for large integers (> 2^53).
                 if let types::Value::Numeric(Numeric::Integer(i)) = &self.0 {
                     return SimValue(types::Value::from_f64(*i as f64));
                 }
                 self
             }
-            // For other affinities (TEXT, BLOB, NUMERIC), no conversion needed in this context
             _ => self,
         }
     }

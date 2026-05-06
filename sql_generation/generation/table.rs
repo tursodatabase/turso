@@ -3,7 +3,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use indexmap::IndexSet;
 use rand::Rng;
-use turso_parser::ast::ColumnConstraint;
+use turso_parser::ast::{ColumnConstraint, GeneratedColumnType};
 
 use crate::generation::generated_expr::generate_column_expr_with_refs;
 use crate::generation::{pick, readable_name_custom, Arbitrary, GenerationContext};
@@ -47,30 +47,26 @@ impl Table {
             column_set.insert(Column::arbitrary(rng, context));
         }
 
-        let mut columns: Vec<Column> = Vec::from_iter(column_set);
+        let mut columns: Vec<Column> = column_set.into_iter().collect();
 
-        // Pass 2: Add generated column constraints if enabled
+        // Turn some columns into generated columns
         if opts.generated_columns.enable && columns.len() >= 2 {
             let gen_opts = &opts.generated_columns;
 
+            //TODO find a better algorithm for incremental cycle detection
             // Track dependencies between columns: col_idx -> set of column indices it references
             let mut dependencies: HashMap<usize, HashSet<usize>> = HashMap::new();
 
             for i in 0..columns.len() {
-                // Count non-generated columns so far
                 let non_generated_count = columns.iter().filter(|c| !c.is_generated()).count();
-
-                // Must keep at least one non-generated column
                 if non_generated_count <= 1 {
                     continue;
                 }
 
-                // Randomly decide if this column should be generated
                 if !rng.random_bool(gen_opts.generated_column_prob) {
                     continue;
                 }
 
-                // Generate expression referencing other columns
                 let (expr, refs) = generate_column_expr_with_refs(
                     rng,
                     &columns,
@@ -79,18 +75,15 @@ impl Table {
                     gen_opts.max_expr_depth,
                 );
 
-                // Check if adding this would create a cycle
                 if would_create_cycle(&dependencies, i, &refs) {
                     continue;
                 }
 
-                // Record dependencies
                 dependencies.insert(i, refs);
 
-                // Always VIRTUAL (typ: None is the default)
                 columns[i].constraints.push(ColumnConstraint::Generated {
                     expr: Box::new(expr),
-                    typ: None,
+                    typ: Some(GeneratedColumnType::Virtual),
                 });
             }
         }
@@ -104,13 +97,11 @@ impl Table {
     }
 }
 
-/// Check if adding a new dependency would create a cycle.
 fn would_create_cycle(
     deps: &HashMap<usize, HashSet<usize>>,
     new_col: usize,
     new_refs: &HashSet<usize>,
 ) -> bool {
-    // DFS from each referenced column to see if we can reach new_col
     for &ref_col in new_refs {
         if can_reach(deps, ref_col, new_col) {
             return true;
@@ -119,7 +110,6 @@ fn would_create_cycle(
     false
 }
 
-/// Check if we can reach 'to' from 'from' via dependencies.
 fn can_reach(deps: &HashMap<usize, HashSet<usize>>, from: usize, to: usize) -> bool {
     if from == to {
         return true;

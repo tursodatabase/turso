@@ -57,17 +57,13 @@ impl Default for TableOpts {
     }
 }
 
-/// Options for generating columns with GENERATED constraints
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, Validate)]
 #[serde(deny_unknown_fields, default)]
 pub struct GeneratedColumnOpts {
-    /// Enable generated column generation
     #[garde(skip)]
     pub enable: bool,
-    /// Probability of a column being generated (0.0 - 1.0)
     #[garde(range(min = 0.0, max = 1.0))]
     pub generated_column_prob: f64,
-    /// Maximum expression depth for generated column expressions (1-10)
     #[garde(range(min = 1, max = 10))]
     pub max_expr_depth: usize,
 }
