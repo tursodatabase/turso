@@ -642,11 +642,7 @@ impl Shadow for Drop {
     }
 }
 
-/// Expand partial insert values into a full-width row.
-///
-/// Maps the inserted values (which only cover non-generated columns) to their
-/// correct positions. Virtual generated column values are computed from their
-/// expressions so that UNIQUE constraint checks see the actual values.
+/// Expand a partial row to a full row, by evaluating generated column expressions.
 pub(crate) fn expand_to_full_row(
     table: &Table,
     insert_columns: Option<&[String]>,
@@ -657,23 +653,23 @@ pub(crate) fn expand_to_full_row(
     if let Some(cols) = insert_columns {
         for (i, col_name) in cols.iter().enumerate() {
             if let Some(pos) = table.columns.iter().position(|c| &c.name == col_name) {
-                if i < insert_values.len() {
-                    full_row[pos] = insert_values[i].clone();
-                }
+                full_row[pos] = insert_values[i].clone();
             }
         }
     } else {
-        let mut idx = 0;
-        for (col_idx, col) in table.columns.iter().enumerate() {
-            if !col.is_generated() && idx < insert_values.len() {
-                full_row[col_idx] = insert_values[idx].clone();
-                idx += 1;
-            }
+        for (idx, col_idx) in table
+            .columns
+            .iter()
+            .enumerate()
+            .filter(|(idx, c)| !c.is_generated())
+            .map(|(idx, _)| idx)
+            .enumerate()
+        {
+            full_row[col_idx] = insert_values[idx].clone();
         }
     }
 
-    // Evaluate virtual generated column expressions so that UNIQUE constraint
-    // checks see the real computed values instead of NULL.
+    // Evaluate virtual generated column expressions
     for (col_idx, col) in table.columns.iter().enumerate() {
         if let Some(expr) = col.generated_expr() {
             if let Some(value) = expr_to_value(expr, &full_row, table) {

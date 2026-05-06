@@ -1319,7 +1319,6 @@ fn random_main_table_insert<R: rand::Rng + ?Sized>(
         .enumerate()
         .filter(|(_, c)| !c.is_generated())
         .collect();
-    let has_generated_col = non_generated_columns.len() < table.columns.len();
 
     let num_rows = rng.random_range(1..=5);
     let base_offset: i64 = rng.random_range(UNIQUE_BASE_OFFSET_RANGE);
@@ -1341,6 +1340,8 @@ fn random_main_table_insert<R: rand::Rng + ?Sized>(
         })
         .collect();
 
+    // lazy heuristic, could be improved
+    let has_generated_col = non_generated_columns.len() < table.columns.len();
     if has_generated_col {
         Query::Insert(Insert::ValuesWithColumns {
             table: table.name.clone(),
@@ -1365,8 +1366,8 @@ fn random_main_table_update<R: rand::Rng + ?Sized>(
     table: &Table,
 ) -> Query {
     let update_opts = &ctx.opts().query.update;
-    // Generated columns cannot be the target of an UPDATE.
-    let unique_columns = table
+    // Generated columns cannot be updated
+    let unique_updatable_columns = table
         .columns
         .iter()
         .enumerate()
@@ -1376,7 +1377,7 @@ fn random_main_table_update<R: rand::Rng + ?Sized>(
                 && !matches!(column.column_type, ColumnType::Blob)
         })
         .collect::<Vec<_>>();
-    let non_unique_columns = table
+    let non_unique_updatable_columns = table
         .columns
         .iter()
         .filter(|column| !column.has_unique_or_pk() && !column.is_generated())
@@ -1384,7 +1385,7 @@ fn random_main_table_update<R: rand::Rng + ?Sized>(
 
     let last_row_idx = table.rows.len().saturating_sub(1);
     let conflict_capable_columns = if table.rows.len() >= 2 {
-        unique_columns
+        unique_updatable_columns
             .iter()
             .filter(|(col_idx, _)| table.rows[0][*col_idx] != table.rows[last_row_idx][*col_idx])
             .copied()
@@ -1395,10 +1396,10 @@ fn random_main_table_update<R: rand::Rng + ?Sized>(
 
     if update_opts.force_late_failure
         && !conflict_capable_columns.is_empty()
-        && !non_unique_columns.is_empty()
+        && !non_unique_updatable_columns.is_empty()
     {
         let (col_idx, unique_col) = *pick(&conflict_capable_columns, rng);
-        let marker_col = *pick(&non_unique_columns, rng);
+        let marker_col = *pick(&non_unique_updatable_columns, rng);
         let first_val = table.rows[0][col_idx].clone();
         let last_val = table.rows[last_row_idx][col_idx].clone();
         let marker_value = match update_opts.padding_size {
@@ -1431,10 +1432,10 @@ fn random_main_table_update<R: rand::Rng + ?Sized>(
 
     let updatable_columns: Vec<&Column> =
         table.columns.iter().filter(|c| !c.is_generated()).collect();
-    let column = if non_unique_columns.is_empty() {
+    let column = if non_unique_updatable_columns.is_empty() {
         *pick(&updatable_columns, rng)
     } else {
-        *pick(&non_unique_columns, rng)
+        *pick(&non_unique_updatable_columns, rng)
     };
     let value = match (update_opts.padding_size, &column.column_type) {
         (Some(size), ColumnType::Blob) => SimValue(turso_core::Value::Blob(vec![b'X'; size])),
@@ -1558,18 +1559,11 @@ fn assert_all_table_values(
                     let last = stack.last().unwrap();
                     match last {
                         Ok(vals) => {
-                            let has_virtual = table.columns.iter().any(|c| c.is_generated());
-                            let expected: Vec<Vec<SimValue>> = if has_virtual {
-                                table.rows.iter().map(|r| strip_virtual_cols(table, r)).collect()
-                            } else {
-                                table.rows.clone()
-                            };
-                            let actual: Vec<Vec<SimValue>> = if has_virtual {
-                                vals.iter().map(|r| strip_virtual_cols(table, r)).collect()
-                            } else {
-                                vals.clone()
-                            };
+                            let expected: Vec<Vec<SimValue>> = table.rows.iter().map(|r| strip_virtual_cols(table, r)).collect();
+                            let actual: Vec<Vec<SimValue>> = vals.iter().map(|r| strip_virtual_cols(table, r)).collect();
 
+                            // Check if all values in the table are present in the result set
+                            // Find a value in the table that is not in the result set
                             let model_contains_db = expected.iter().find(|v| {
                                 !actual.contains(v)
                             });
@@ -1627,23 +1621,19 @@ fn property_insert_values_select<R: rand::Rng + ?Sized>(
         *pick(&non_unique_tables, rng)
     };
 
-    // Filter out generated columns - we can't insert into them
     let non_generated_columns: Vec<Column> = table
         .columns
         .iter()
         .filter(|c| !c.is_generated())
         .cloned()
         .collect();
-    let has_generated = non_generated_columns.len() < table.columns.len();
 
-    // Ensure we have at least one insertable column
-    debug_assert!(
+    assert!(
         !non_generated_columns.is_empty(),
-        "Table {} has no insertable columns (all are generated)",
+        "Table {} should have at least one non-generated column",
         table.name
     );
 
-    // Generate rows to insert (only for non-generated columns)
     let rows = (0..rng.random_range(1..=5))
         .map(|_| {
             non_generated_columns
@@ -1657,7 +1647,8 @@ fn property_insert_values_select<R: rand::Rng + ?Sized>(
     let row_index = pick_index(rows.len(), rng);
     let row = rows[row_index].clone();
 
-    // Insert the rows - use ValuesWithColumns if table has generated columns
+    // lazy heuristic, could be improved
+    let has_generated = non_generated_columns.len() < table.columns.len();
     let insert_query = if has_generated {
         Query::Insert(Insert::ValuesWithColumns {
             table: table.name.clone(),
@@ -1707,10 +1698,10 @@ fn property_insert_values_select<R: rand::Rng + ?Sized>(
         });
     }
 
-    // For tables with generated columns, create a "virtual" table with only
-    // non-generated columns for predicate generation. This ensures the predicate
-    // only references columns we have values for.
     let predicate = if has_generated {
+        // For tables with generated columns, create a "virtual" table with only
+        // non-generated columns for predicate generation. This ensures the predicate
+        // only references columns we have values for.
         let virtual_table = Table {
             name: table.name.clone(),
             columns: non_generated_columns.clone(),
@@ -1722,22 +1713,17 @@ fn property_insert_values_select<R: rand::Rng + ?Sized>(
         Predicate::arbitrary_from(rng, ctx, (table, &row))
     };
 
-    // For tables with generated columns, select only the non-generated columns
-    // so the assertion can compare with the inserted values
-    let select_query = if has_generated {
-        Select::single(
-            table.name.clone(),
-            non_generated_columns
-                .iter()
-                .map(|c| ResultColumn::Column(c.name.clone()))
-                .collect(),
-            predicate,
-            None,
-            Distinctness::All,
-        )
-    } else {
-        Select::simple(table.name.clone(), predicate)
-    };
+    // Select only the non-generated columns so the assertion can compare with the inserted values
+    let select_query = Select::single(
+        table.name.clone(),
+        non_generated_columns
+            .iter()
+            .map(|c| ResultColumn::Column(c.name.clone()))
+            .collect(),
+        predicate,
+        None,
+        Distinctness::All,
+    );
 
     Property::InsertValuesSelect {
         insert: insert_query.unwrap_insert(),
