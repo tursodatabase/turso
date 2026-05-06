@@ -114,39 +114,9 @@ pub fn get_expr_collation_ctx(
     top_expr: &Expr,
     referenced_tables: &TableReferences,
 ) -> Result<Option<(CollationSeq, bool)>> {
-    let mut maybe_column_collseq = None;
-    let mut maybe_explicit_collseq = None;
-
-    walk_expr(top_expr, &mut |expr: &Expr| -> Result<WalkControl> {
-        match expr {
-            Expr::Collate(_, seq) => {
-                if maybe_explicit_collseq.is_none() {
-                    maybe_explicit_collseq =
-                        Some(CollationSeq::new(seq.as_str()).unwrap_or_default());
-                }
-                return Ok(WalkControl::SkipChildren);
-            }
-            Expr::Column { table, column, .. } => {
-                // generated columns (the SELF_TABLE placeholder) don't inherit an implicit
-                // collation from their expression, so we skip them
-                if !table.is_self_table() {
-                    let (_, table_ref) = referenced_tables
-                        .find_table_by_internal_id(*table)
-                        .ok_or_else(|| {
-                            crate::LimboError::ParseError("table not found".to_string())
-                        })?;
-                    let column = table_ref.get_column_at(*column).ok_or_else(|| {
-                        crate::LimboError::ParseError("column not found".to_string())
-                    })?;
-                    if maybe_column_collseq.is_none() {
-                        maybe_column_collseq = Some(column.collation());
-                    }
-                }
-            }
-            _ => {}
-        }
-        Ok(WalkControl::Continue)
-    })?;
+    let maybe_explicit_collseq = get_explicit_collseq_from_expr(top_expr)?;
+    let maybe_column_collseq =
+        get_implicit_column_collseq_from_expr(top_expr, referenced_tables, true, true)?;
 
     Ok(maybe_explicit_collseq
         .map(|collation| (collation, true))
@@ -179,21 +149,49 @@ fn get_collseq_parts_from_expr(
     top_expr: &Expr,
     referenced_tables: &TableReferences,
 ) -> Result<(Option<CollationSeq>, Option<CollationSeq>)> {
-    let mut maybe_column_collseq = None;
+    let maybe_explicit_collseq = get_explicit_collseq_from_expr(top_expr)?;
+    let maybe_column_collseq =
+        get_implicit_column_collseq_from_expr(top_expr, referenced_tables, false, false)?;
+
+    Ok((maybe_explicit_collseq, maybe_column_collseq))
+}
+
+fn get_explicit_collseq_from_expr(top_expr: &Expr) -> Result<Option<CollationSeq>> {
     let mut maybe_explicit_collseq = None;
 
     walk_expr(top_expr, &mut |expr: &Expr| -> Result<WalkControl> {
+        if let Expr::Collate(_, seq) = expr {
+            if maybe_explicit_collseq.is_none() {
+                maybe_explicit_collseq = Some(CollationSeq::new(seq.as_str()).unwrap_or_default());
+            }
+            return Ok(WalkControl::SkipChildren);
+        }
+        Ok(WalkControl::Continue)
+    })?;
+
+    Ok(maybe_explicit_collseq)
+}
+
+fn get_implicit_column_collseq_from_expr(
+    top_expr: &Expr,
+    referenced_tables: &TableReferences,
+    include_default_binary: bool,
+    skip_self_table: bool,
+) -> Result<Option<CollationSeq>> {
+    let mut maybe_column_collseq = None;
+
+    walk_expr(top_expr, &mut |expr: &Expr| -> Result<WalkControl> {
         match expr {
-            Expr::Collate(_, seq) => {
-                // Only store the first (leftmost) COLLATE operator we find
-                if maybe_explicit_collseq.is_none() {
-                    maybe_explicit_collseq =
-                        Some(CollationSeq::new(seq.as_str()).unwrap_or_default());
-                }
-                // Skip children since we've found a COLLATE operator
+            Expr::Collate(_, _) => {
+                return Ok(WalkControl::SkipChildren);
+            }
+            Expr::FunctionCall { .. } | Expr::FunctionCallStar { .. } => {
                 return Ok(WalkControl::SkipChildren);
             }
             Expr::Column { table, column, .. } => {
+                if skip_self_table && table.is_self_table() {
+                    return Ok(WalkControl::Continue);
+                }
                 let (_, table_ref) = referenced_tables
                     .find_table_by_internal_id(*table)
                     .ok_or_else(|| crate::LimboError::ParseError("table not found".to_string()))?;
@@ -201,7 +199,11 @@ fn get_collseq_parts_from_expr(
                     .get_column_at(*column)
                     .ok_or_else(|| crate::LimboError::ParseError("column not found".to_string()))?;
                 if maybe_column_collseq.is_none() {
-                    maybe_column_collseq = column.collation_opt();
+                    maybe_column_collseq = if include_default_binary {
+                        Some(column.collation())
+                    } else {
+                        column.collation_opt()
+                    };
                 }
                 return Ok(WalkControl::Continue);
             }
@@ -212,7 +214,11 @@ fn get_collseq_parts_from_expr(
                 if let Some(btree) = table_ref.btree() {
                     if let Some((_, rowid_alias_col)) = btree.get_rowid_alias_column() {
                         if maybe_column_collseq.is_none() {
-                            maybe_column_collseq = rowid_alias_col.collation_opt();
+                            maybe_column_collseq = if include_default_binary {
+                                Some(rowid_alias_col.collation())
+                            } else {
+                                rowid_alias_col.collation_opt()
+                            };
                         }
                     }
                 }
@@ -223,14 +229,16 @@ fn get_collseq_parts_from_expr(
         Ok(WalkControl::Continue)
     })?;
 
-    Ok((maybe_explicit_collseq, maybe_column_collseq))
+    Ok(maybe_column_collseq)
 }
 
 #[cfg(test)]
 mod tests {
     use crate::{sync::Arc, MAIN_DB_ID};
 
-    use turso_parser::ast::{Literal, Name, Operator, TableInternalId, UnaryOperator};
+    use turso_parser::ast::{
+        FunctionTail, Literal, Name, Operator, TableInternalId, UnaryOperator,
+    };
 
     use crate::{
         schema::{BTreeCharacteristics, BTreeTable, ColDef, Column, Table, Type},
@@ -387,6 +395,71 @@ mod tests {
         let expr = Expr::binary(lhs, Operator::Add, rhs);
         let collseq = get_collseq_from_expr(&expr, &table_references).unwrap();
         assert_eq!(collseq, Some(CollationSeq::NoCase));
+    }
+
+    #[test]
+    fn test_function_call_does_not_inherit_argument_column_collation() {
+        let table_references = get_table_references_single_table_single_column_with_collation(
+            Some(CollationSeq::Rtrim),
+        );
+        let expr = Expr::FunctionCall {
+            name: Name::exact("lower".to_string()),
+            distinctness: None,
+            args: vec![Box::new(Expr::Column {
+                database: None,
+                table: TableInternalId::from(1),
+                column: 0,
+                is_rowid_alias: false,
+            })],
+            order_by: vec![],
+            filter_over: FunctionTail {
+                filter_clause: None,
+                over_clause: None,
+            },
+        };
+
+        assert_eq!(
+            get_collseq_from_expr(&expr, &table_references).unwrap(),
+            None
+        );
+        assert_eq!(
+            get_expr_collation_ctx(&expr, &table_references).unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn test_function_call_preserves_explicit_argument_collation() {
+        let table_references = get_table_references_single_table_single_column_with_collation(
+            Some(CollationSeq::Rtrim),
+        );
+        let expr = Expr::FunctionCall {
+            name: Name::exact("lower".to_string()),
+            distinctness: None,
+            args: vec![Box::new(Expr::Collate(
+                Box::new(Expr::Column {
+                    database: None,
+                    table: TableInternalId::from(1),
+                    column: 0,
+                    is_rowid_alias: false,
+                }),
+                Name::exact("NOCASE".to_string()),
+            ))],
+            order_by: vec![],
+            filter_over: FunctionTail {
+                filter_clause: None,
+                over_clause: None,
+            },
+        };
+
+        assert_eq!(
+            get_collseq_from_expr(&expr, &table_references).unwrap(),
+            Some(CollationSeq::NoCase)
+        );
+        assert_eq!(
+            get_expr_collation_ctx(&expr, &table_references).unwrap(),
+            Some((CollationSeq::NoCase, true))
+        );
     }
 
     #[test]

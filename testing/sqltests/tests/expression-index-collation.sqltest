@@ -1,0 +1,30 @@
+@database :memory:
+
+test expression-index-function-order-uses-binary-collation {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, c TEXT COLLATE RTRIM);
+    CREATE INDEX idx_expr ON t(lower(c), id DESC);
+    INSERT INTO t VALUES (1, ''), (2, ' '), (3, '  '), (4, '');
+    SELECT id, quote(c) FROM t INDEXED BY idx_expr
+        WHERE lower(c) IS NOT NULL
+        ORDER BY lower(c), id DESC;
+}
+expect {
+    4|''
+    1|''
+    2|' '
+    3|'  '
+}
+
+test expression-index-substr-order-uses-binary-collation {
+    CREATE TABLE u(id INTEGER PRIMARY KEY, d TEXT COLLATE NOCASE);
+    CREATE INDEX idx_substr ON u(substr(d, 1, 1), id);
+    INSERT INTO u VALUES (1, 'a'), (2, 'A'), (3, 'b');
+    SELECT id, d FROM u INDEXED BY idx_substr
+        WHERE substr(d, 1, 1) IS NOT NULL
+        ORDER BY substr(d, 1, 1), id;
+}
+expect {
+    2|A
+    1|a
+    3|b
+}

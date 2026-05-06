@@ -25,6 +25,30 @@ mod tests {
         "b ", "B ", "a  ", "A  ", " a", " A", "abc", "ABC",
     ];
 
+    struct FunctionExprCase {
+        table_collation: &'static str,
+        expression: &'static str,
+        values: &'static [&'static str],
+    }
+
+    const FUNCTION_EXPR_CASES: [FunctionExprCase; 3] = [
+        FunctionExprCase {
+            table_collation: "RTRIM",
+            expression: "lower(c1)",
+            values: &["", " ", "  ", "", "x", "x "],
+        },
+        FunctionExprCase {
+            table_collation: "NOCASE",
+            expression: "substr(c1, 1, 1)",
+            values: &["A", "a", "B", "b", "C", "c"],
+        },
+        FunctionExprCase {
+            table_collation: "RTRIM",
+            expression: "substr(c1 COLLATE NOCASE, 1, 1)",
+            values: &["A", "a", "B", "b", "C", "c"],
+        },
+    ];
+
     /// Compare two strings using the specified collation.
     /// Returns Ordering::Equal if they are equal under the collation.
     fn compare_with_collation(a: &str, b: &str, collation: &str) -> std::cmp::Ordering {
@@ -105,6 +129,54 @@ mod tests {
         }
 
         Ok(())
+    }
+
+    /// Function expressions should not inherit implicit collation from their
+    /// arguments, but explicit COLLATE operators inside the expression still apply.
+    #[turso_macros::test(mvcc)]
+    pub fn orderby_function_expression_index_collation_regression(db: TempDatabase) {
+        let builder = helpers::builder_from_db(&db);
+
+        for case in FUNCTION_EXPR_CASES.iter() {
+            let table_ddl = format!(
+                "CREATE TABLE t (id INTEGER PRIMARY KEY, c1 TEXT COLLATE {})",
+                case.table_collation
+            );
+            let index_ddl = format!("CREATE INDEX idx ON t ({}, id DESC)", case.expression);
+
+            let limbo_db = builder.clone().with_init_sql(&table_ddl).build();
+            let limbo_conn = limbo_db.connect_limbo();
+            limbo_conn.execute(&index_ddl).unwrap();
+
+            let sqlite_conn = rusqlite::Connection::open_in_memory().unwrap();
+            sqlite_conn.execute(&table_ddl, ()).unwrap();
+            sqlite_conn.execute(&index_ddl, ()).unwrap();
+
+            for (idx, value) in case.values.iter().enumerate() {
+                let insert = format!(
+                    "INSERT INTO t VALUES ({}, '{}')",
+                    idx + 1,
+                    value.replace("'", "''")
+                );
+                sqlite_conn.execute(&insert, ()).unwrap();
+                limbo_conn.execute(&insert).unwrap();
+            }
+
+            let query = format!(
+                "SELECT id, quote(c1) FROM t INDEXED BY idx WHERE {} IS NOT NULL ORDER BY {}, id DESC",
+                case.expression, case.expression
+            );
+            let sqlite_rows = sqlite_exec_rows(&sqlite_conn, &query);
+            let limbo_rows = limbo_exec_rows(&limbo_conn, &query);
+
+            similar_asserts::assert_eq!(
+                Turso: limbo_rows,
+                Sqlite: sqlite_rows,
+                "MISMATCH!\nQuery: {query}\nTable: {table_ddl}\nIndex: {index_ddl}\nTurso ({} rows)\nSQLite ({} rows)",
+                limbo_rows.len(),
+                sqlite_rows.len(),
+            );
+        }
     }
 
     /// Test ORDER BY with explicit COLLATE that differs from index collation.
