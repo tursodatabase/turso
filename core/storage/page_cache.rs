@@ -1,5 +1,6 @@
 use crate::sync::{atomic::Ordering, Arc};
 use intrusive_collections::{intrusive_adapter, LinkedList, LinkedListLink};
+use roaring::RoaringBitmap;
 use rustc_hash::FxHashMap as HashMap;
 use tracing::trace;
 
@@ -718,29 +719,58 @@ impl PageCache {
         Ok(())
     }
 
-    /// Removes clean cached pages that were read from WAL frames newer than a
-    /// rollback target. Dirty pages are preserved because they may contain
-    /// restored transaction-local state that still needs to be committed or
-    /// rolled back by an outer savepoint.
-    pub fn delete_clean_pages_after_wal_frame(&mut self, max_frame: u64) -> Result<(), CacheError> {
-        for key in self
-            .map
-            .iter()
-            .filter_map(|(key, &entry_ptr)| {
-                let entry = unsafe { &*entry_ptr };
-                let page = &entry.page;
-                if !page.is_dirty() && page.has_wal_tag() {
-                    let (frame, _) = page.wal_tag_pair();
-                    if frame > max_frame {
-                        return Some(*key);
+    /// Invalidates cached pages that reference WAL frames newer than a rollback target.
+    ///
+    /// Clean pages can be dropped and re-read from the rollback target. Dirty pages
+    /// must stay in cache, but if they were spilled to a frame that has just been
+    /// rolled back they are no longer safe to evict.
+    pub fn invalidate_pages_after_wal_frame(
+        &mut self,
+        max_frame: u64,
+        dirty_pages: &RoaringBitmap,
+    ) -> Result<(), CacheError> {
+        let mut clean_keys = Vec::new();
+        let mut dirty_keys = Vec::new();
+
+        for (key, &entry_ptr) in self.map.iter() {
+            let entry = unsafe { &*entry_ptr };
+            let page = &entry.page;
+            if page.has_wal_tag() {
+                let (frame, _) = page.wal_tag_pair();
+                if frame > max_frame {
+                    if dirty_pages.contains(key.0 as u32) {
+                        dirty_keys.push(*key);
+                    } else {
+                        clean_keys.push(*key);
                     }
                 }
-                None
-            })
-            .collect::<Vec<_>>()
-        {
+            }
+        }
+
+        for key in dirty_keys {
+            if let Some(&entry_ptr) = self.map.get(&key) {
+                let entry = unsafe { &*entry_ptr };
+                let page = &entry.page;
+                if page.has_wal_tag() {
+                    let (frame, _) = page.wal_tag_pair();
+                    if frame > max_frame {
+                        let was_evictable = Self::counted_as_evictable(page);
+                        page.set_dirty();
+                        let is_evictable = Self::counted_as_evictable(page);
+                        if was_evictable && !is_evictable {
+                            self.evictable_count = self.evictable_count.saturating_sub(1);
+                        } else if !was_evictable && is_evictable {
+                            self.evictable_count += 1;
+                        }
+                    }
+                }
+            }
+        }
+
+        for key in clean_keys {
             self.delete(key)?;
         }
+
         Ok(())
     }
 

@@ -3430,6 +3430,16 @@ mod tests {
         }
     }
 
+    fn query_single_text(conn: &Arc<Connection>, sql: &str) -> String {
+        let mut stmt = conn.prepare(sql).unwrap();
+        match stmt.step().unwrap() {
+            StepResult::Row => {
+                text_value(stmt.row().unwrap().get::<&Value>(0).unwrap()).to_string()
+            }
+            other => panic!("expected a row, got {other:?}"),
+        }
+    }
+
     fn text_value(value: &Value) -> &str {
         match value {
             Value::Text(text) => text.as_str(),
@@ -3486,6 +3496,47 @@ mod tests {
         let second_db = Database::open_file(io, ":memory:reopen").unwrap();
         let second = second_db.connect().unwrap();
         assert_eq!(query_single_i64(&second, "SELECT x FROM t"), 99);
+    }
+
+    #[test]
+    fn test_statement_rollback_under_cache_pressure_spills_restored_pages() {
+        let temp_dir = TempDir::new().unwrap();
+        let db_path = temp_dir.path().join("statement_rollback_spill.db");
+        let conn = open_connection(&db_path);
+
+        conn.execute("PRAGMA cache_size=20").unwrap();
+        conn.execute("PRAGMA journal_mode=WAL").unwrap();
+        conn.execute("BEGIN").unwrap();
+        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, u TEXT UNIQUE, pad TEXT)")
+            .unwrap();
+
+        let pad = "x".repeat(3000);
+        for i in 1..=220 {
+            conn.execute(format!("INSERT INTO t(u, pad) VALUES('u{i}', '{pad}')"))
+                .unwrap();
+        }
+
+        conn.execute("SAVEPOINT s").unwrap();
+        let updated_pad = "y".repeat(3000);
+        let err = conn
+            .execute(format!(
+                "UPDATE t
+                 SET pad = '{updated_pad}',
+                     u = CASE WHEN id = 220 THEN 'u1' ELSE u END"
+            ))
+            .expect_err("update should fail on the unique index");
+        assert!(
+            err.to_string().contains("UNIQUE constraint failed"),
+            "unexpected error: {err}"
+        );
+
+        assert_eq!(query_single_text(&conn, "PRAGMA integrity_check"), "ok");
+        assert_eq!(query_single_i64(&conn, "SELECT count(*) FROM t"), 220);
+
+        conn.execute("ROLLBACK TO s").unwrap();
+        conn.execute("RELEASE s").unwrap();
+        conn.execute("COMMIT").unwrap();
+        assert_eq!(query_single_text(&conn, "PRAGMA integrity_check"), "ok");
     }
 
     #[test]
