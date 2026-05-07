@@ -855,6 +855,76 @@ test round-null-precision {
 expect {
 }
 
+# https://github.com/tursodatabase/turso/issues/5748
+# ROUND must use round-half-away-from-zero (matching SQLite's printf), not
+# banker's rounding. The cases below are the canonical halfway case (2.25),
+# the negative mirror, and FP-artifact cases that distinguish a correct
+# decimal-string-based rounding from a naive (f * 10^n).round() rescale.
+test round-half-away-from-zero-positive {
+    SELECT round(2.25, 1);
+}
+expect {
+    2.3
+}
+
+test round-half-away-from-zero-negative {
+    SELECT round(-2.25, 1);
+}
+expect {
+    -2.3
+}
+
+test round-fp-artifact-rounds-down-fifteen {
+    SELECT round(0.15, 1);
+}
+expect {
+    0.1
+}
+
+test round-fp-artifact-rounds-down-twofiftyfive {
+    SELECT round(2.55, 1);
+}
+expect {
+    2.5
+}
+
+test round-five-hundredths-rounds-up {
+    SELECT round(0.05, 1);
+}
+expect {
+    0.1
+}
+
+test round-carry-propagates-into-integer {
+    SELECT round(9.96, 1);
+}
+expect {
+    10.0
+}
+expect @js {
+    10
+}
+
+test round-carry-cascades-multi-digit {
+    SELECT round(99.999, 2);
+}
+expect {
+    100.0
+}
+expect @js {
+    100
+}
+
+test round-carry-fraction-to-integer {
+    SELECT round(0.9999, 2);
+}
+expect {
+    1.0
+}
+expect @js {
+    1
+}
+
 test length-text {
     SELECT length('limbo');
 }

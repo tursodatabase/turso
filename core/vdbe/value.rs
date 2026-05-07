@@ -772,6 +772,7 @@ impl Value {
     }
 
     pub fn exec_round(&self, precision: Option<&Value>) -> Value {
+        // See `round_half_away_from_zero` below for the precision > 0 path.
         let Some(f) = Numeric::from_value(self).map(|v| v.to_f64()) else {
             return Value::Null;
         };
@@ -793,11 +794,7 @@ impl Value {
             return Value::from_f64(((f + if f < 0.0 { -0.5 } else { 0.5 }) as i64) as f64);
         }
 
-        let f: f64 = crate::numeric::str_to_f64(format!("{f:.precision$}"))
-            .expect("formatted float should always parse successfully")
-            .into();
-
-        Value::from_f64(f)
+        Value::from_f64(round_half_away_from_zero(f, precision))
     }
 
     fn _exec_trim(&self, pattern: Option<&Value>, trim_type: TrimType) -> Value {
@@ -1354,6 +1351,86 @@ impl Value {
             .collect();
         Value::build_text(result)
     }
+}
+
+/// Round `f` to `precision` fractional digits using round-half-away-from-zero,
+/// matching SQLite's `printf("%.*f", ...)` behaviour.
+///
+/// Rust's `format!("{f:.precision$}")` uses banker's rounding (round-half-to-even),
+/// which makes `ROUND(2.25, 1)` return `2.2` instead of SQLite's `2.3`. Naively
+/// switching to a `(f * 10^precision).round() / 10^precision` rescale would also
+/// be wrong: `0.15 * 10` rounds up to *exactly* `1.5` in IEEE 754 (because the
+/// f64 for 0.15 is `0.149999…994`), so the rescaled approach incorrectly produces
+/// `0.2`, while SQLite's printf-on-the-decimal-expansion approach correctly
+/// produces `0.1`.
+///
+/// Instead, we work directly on the f64's decimal expansion: format with enough
+/// fractional digits to capture every meaningful bit (35 — well beyond f64's
+/// ~17 significant digits), then look at the digit at position `precision`. If
+/// it is `>= '5'` we increment the kept prefix in magnitude (with carry into the
+/// integer part); otherwise we truncate. Negative sign is reattached at the end.
+///
+/// Precondition: `1 <= precision <= 30` and `f` is finite within the i64-safe
+/// range (callers handle the precision-zero and out-of-range cases).
+fn round_half_away_from_zero(f: f64, precision: usize) -> f64 {
+    debug_assert!(precision > 0 && precision <= 30);
+    let sign_negative = f.is_sign_negative();
+    let abs_f = f.abs();
+
+    // 35 fractional digits exceeds f64's precision so the digit we look at to
+    // decide rounding is meaningful, not noise.
+    const EXTRA_DIGITS: usize = 35;
+    let formatted = format!("{abs_f:.EXTRA_DIGITS$}");
+    let dot = formatted
+        .find('.')
+        .expect("formatted f64 with precision contains a decimal point");
+    let int_part = &formatted[..dot];
+    let frac_part = &formatted[dot + 1..];
+    debug_assert_eq!(frac_part.len(), EXTRA_DIGITS);
+
+    let next_digit = frac_part.as_bytes()[precision];
+    let rounded = if next_digit >= b'5' {
+        increment_decimal_magnitude(int_part, &frac_part[..precision])
+    } else {
+        format!("{int_part}.{}", &frac_part[..precision])
+    };
+
+    let abs_result: f64 = rounded
+        .parse()
+        .expect("rounded decimal string should parse as f64");
+    if sign_negative {
+        -abs_result
+    } else {
+        abs_result
+    }
+}
+
+/// Add 1 to the magnitude of the decimal `int_str.frac_str`, propagating carry
+/// from the last fractional digit up through the integer part.
+fn increment_decimal_magnitude(int_str: &str, frac_str: &str) -> String {
+    let mut digits = Vec::with_capacity(int_str.len() + frac_str.len() + 1);
+    digits.extend_from_slice(int_str.as_bytes());
+    digits.extend_from_slice(frac_str.as_bytes());
+
+    let mut carry = 1u8;
+    for d in digits.iter_mut().rev() {
+        if carry == 0 {
+            break;
+        }
+        let v = *d - b'0' + carry;
+        *d = (v % 10) + b'0';
+        carry = v / 10;
+    }
+    if carry > 0 {
+        digits.insert(0, b'0' + carry);
+    }
+
+    let int_len = digits.len() - frac_str.len();
+    let mut s = String::from_utf8(digits).expect("ascii digits remain ascii");
+    if !frac_str.is_empty() {
+        s.insert(int_len, '.');
+    }
+    s
 }
 
 /// Parse exactly `n` hex digits into a u32. Mirrors SQLite's isNHex().
@@ -2719,6 +2796,52 @@ mod tests {
         let input_val = Value::from_f64(100.123);
         let expected_val = Value::Null;
         assert_eq!(input_val.exec_round(Some(&Value::Null)), expected_val);
+    }
+
+    /// https://github.com/tursodatabase/turso/issues/5748
+    ///
+    /// `ROUND(x, n)` must use round-half-away-from-zero (matching SQLite's
+    /// printf-style rounding), not Rust's default banker's rounding. Each row
+    /// here was cross-checked against the `sqlite3` CLI; a few are FP-artifact
+    /// cases where the f64 lies just below the decimal "halfway" and the
+    /// result rounds *toward* zero — they're included on purpose because a
+    /// naive `(f * 10^n).round() / 10^n` fix gets them wrong.
+    #[test]
+    fn test_exec_round_half_away_from_zero() {
+        let cases: &[(f64, i64, f64)] = &[
+            // Exactly halfway (2.25 is exact in binary): banker's would give
+            // 2.2, away-from-zero gives 2.3.
+            (2.25, 1, 2.3),
+            (-2.25, 1, -2.3),
+            // 2.35 stored as 2.350…009 — already above halfway, both methods
+            // agreed; kept as a regression check.
+            (2.35, 1, 2.4),
+            // 0.15 stored as 0.149…994 — below halfway, must truncate to 0.1.
+            // A `(f * 10).round()` rescale would incorrectly produce 0.2.
+            (0.15, 1, 0.1),
+            // 2.55 stored as 2.549…998 — same trap, must give 2.5.
+            (2.55, 1, 2.5),
+            // 0.05 stored as 0.050…028 — just above halfway, rounds up to 0.1.
+            (0.05, 1, 0.1),
+            (-0.05, 1, -0.1),
+            // Carry must propagate from fractional into integer part.
+            // 9.95 itself is *below* halfway in f64 (9.949…) so we use 9.96
+            // which is above (9.960…0085) and actually triggers the carry.
+            (9.96, 1, 10.0),
+            (99.999, 2, 100.0),
+            (0.9999, 2, 1.0),
+            // Multi-digit precision cases.
+            (0.125, 2, 0.13),
+            (0.375, 2, 0.38),
+        ];
+        for &(input, prec, expected) in cases {
+            let got = Value::from_f64(input).exec_round(Some(&Value::from_i64(prec)));
+            assert_eq!(
+                got,
+                Value::from_f64(expected),
+                "ROUND({input}, {prec}) expected {expected}, got {got:?}",
+            );
+        }
     }
 
     #[test]
