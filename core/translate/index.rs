@@ -21,7 +21,7 @@ use crate::vdbe::builder::{CursorKey, ProgramBuilderOpts, SelfTableContext};
 use crate::vdbe::insn::{to_u16, CmpInsFlags, Cookie};
 use crate::{bail_parse_error, CaptureDataChangesExt, LimboError, MAIN_DB_ID, TEMP_DB_ID};
 use crate::{
-    schema::{BTreeTable, Index, IndexColumn, PseudoCursorType},
+    schema::{BTreeTable, Index, IndexColumn, PseudoCursorType, SchemaObjectType},
     storage::pager::CreateBTreeFlags,
     util::{escape_sql_string_literal, normalize_ident, PRIMARY_KEY_AUTOMATIC_INDEX_NAME_PREFIX},
     vdbe::{
@@ -626,6 +626,9 @@ pub fn translate_reindex(
     if targets.is_empty() {
         return Ok(());
     }
+    if connection.get_query_only() {
+        bail_parse_error!("Cannot execute write statement in query_only mode");
+    }
 
     let mut write_databases = Vec::new();
     for (database_id, _, _) in &targets {
@@ -776,15 +779,24 @@ fn find_reindex_table(
 
 /// Returns all indexes belonging to `table_name` inside a single database.
 ///
-/// A table without indexes is still a valid REINDEX target, so this returns an
-/// empty vector wrapped in `Some` when the table exists.
+/// A table or view without indexes is still a valid REINDEX target, so this
+/// returns an empty vector wrapped in `Some` when the object exists.
 fn find_reindex_table_in_db(
     table_name: &str,
     database_id: usize,
     resolver: &Resolver,
 ) -> Option<Vec<ReindexTarget>> {
     resolver.with_schema(database_id, |schema| {
-        let table = schema.get_btree_table(table_name)?;
+        let object_type = schema.get_object_type(table_name)?;
+        if object_type == SchemaObjectType::View {
+            return Some(Vec::new());
+        }
+        let SchemaObjectType::Table = object_type else {
+            return None;
+        };
+        let Some(table) = schema.get_btree_table(table_name) else {
+            return Some(Vec::new());
+        };
         let targets = schema
             .indexes
             .get(&normalize_ident(table.name.as_str()))

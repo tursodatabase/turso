@@ -155,7 +155,6 @@ pub fn translate_inner(
             | ast::Stmt::DropType { .. }
             | ast::Stmt::DropDomain { .. }
             | ast::Stmt::DropView { .. }
-            | ast::Stmt::Reindex { .. }
             | ast::Stmt::Optimize { .. }
             | ast::Stmt::Update { .. }
             | ast::Stmt::Insert { .. }

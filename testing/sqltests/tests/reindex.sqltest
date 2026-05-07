@@ -291,6 +291,18 @@ expect {
     ok
 }
 
+test reindex-view-is-noop {
+    CREATE TABLE t_reindex_view(id INTEGER PRIMARY KEY, a TEXT);
+    CREATE INDEX idx_reindex_view_a ON t_reindex_view(a);
+    INSERT INTO t_reindex_view VALUES (1, 'view-ok');
+    CREATE VIEW v_reindex_view AS SELECT * FROM t_reindex_view;
+    REINDEX v_reindex_view;
+    SELECT id, a FROM t_reindex_view ORDER BY id;
+}
+expect {
+    1|view-ok
+}
+
 test reindex-bracket-quoted-target {
     CREATE TABLE [t_reindex_bracket](a);
     CREATE INDEX [idx_reindex_bracket] ON [t_reindex_bracket](a);

@@ -91,6 +91,21 @@ fn reindex_requires_stmt_journal_for_all_target_forms(
     Ok(())
 }
 
+/// SQLite allows REINDEX under query_only when target resolution finds no
+/// indexes to rebuild, because no write is attempted.
+#[turso_macros::test]
+fn reindex_query_only_allows_empty_work(tmp_db: crate::common::TempDatabase) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+    conn.execute("CREATE TABLE t_without_indexes(a)")?;
+
+    conn.execute("PRAGMA query_only = 1")?;
+    conn.execute("REINDEX")?;
+    conn.execute("REINDEX t_without_indexes")?;
+    conn.execute("PRAGMA query_only = 0")?;
+
+    Ok(())
+}
+
 /// Resetting a REINDEX statement while writes are pending must roll back the
 /// partially executed statement instead of leaving the target index empty.
 #[test]
