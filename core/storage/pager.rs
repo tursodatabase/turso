@@ -5019,11 +5019,18 @@ impl Pager {
         if dirty_page_must_exist {
             turso_assert!(page.is_dirty(), "page must be dirty for upsert", { "page_id": id });
         }
-        cache.upsert_page(page_key, page.clone()).map_err(|e| {
-            LimboError::InternalError(format!(
-                "Failed to insert loaded page {id} into cache: {e:?}"
-            ))
-        })?;
+        // During rollback we must not fail -- if the cache is full (e.g. all
+        // pages are dirty and cannot be evicted), temporarily expand capacity
+        // by 1 so the restored page can always be inserted.
+        if cache.upsert_page(page_key.clone(), page.clone()).is_err() {
+            let old_cap = cache.capacity();
+            let _ = cache.resize(old_cap + 1);
+            cache.upsert_page(page_key, page.clone()).map_err(|e| {
+                LimboError::InternalError(format!(
+                    "Failed to insert loaded page {id} into cache: {e:?}"
+                ))
+            })?;
+        }
         page.set_loaded();
         page.clear_wal_tag();
         Ok(())
