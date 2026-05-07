@@ -314,6 +314,18 @@ expect {
     1
 }
 
+test reindex-expression-index-after-rename-column {
+    CREATE TABLE t_reindex_rename_expr(a, b);
+    CREATE INDEX idx_reindex_rename_expr ON t_reindex_rename_expr(a + b);
+    INSERT INTO t_reindex_rename_expr VALUES (1, 2), (3, 4);
+    ALTER TABLE t_reindex_rename_expr RENAME COLUMN a TO aa;
+    REINDEX idx_reindex_rename_expr;
+    SELECT * FROM t_reindex_rename_expr WHERE aa + b = 3;
+}
+expect {
+    1|2
+}
+
 test reindex-expression-index-explicit-collate {
     CREATE TABLE t_reindex_expr_collate(a TEXT);
     CREATE INDEX idx_reindex_expr_collate ON t_reindex_expr_collate((a COLLATE NOCASE));

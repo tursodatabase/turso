@@ -13598,12 +13598,15 @@ pub fn op_alter_column(
             .expect("btree column should be named")
             .clone();
 
-        // Update indexes on THIS table that name the old column (you already had this)
+        // Update this table's indexes that reference the old column.
         if let Some(idxs) = schema.indexes.get_mut(&normalized_table_name) {
             for idx in idxs {
                 let idx = Arc::make_mut(idx);
                 for ic in &mut idx.columns {
-                    if ic.name.eq_ignore_ascii_case(&existing_column_name) {
+                    if let Some(expr) = &mut ic.expr {
+                        rename_identifiers(expr.as_mut(), &old_column_name, &new_name);
+                        ic.name = expr.to_string();
+                    } else if ic.name.eq_ignore_ascii_case(&existing_column_name) {
                         ic.name.clone_from(&new_name);
                     }
                 }
