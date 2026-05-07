@@ -3796,7 +3796,15 @@ impl Wal for WalFile {
             .as_ref()
             .map(|r| r.checksum)
             .unwrap_or(snapshot.last_checksum);
-        self.coordination.rollback_cache(max_frame);
+        // Savepoints can be opened on a stale connection-local WAL snapshot.
+        // Do not let that rollback remove frame-cache mappings for frames that
+        // are already globally committed by another connection.
+        let cache_rollback_frame = if is_savepoint {
+            max_frame.max(snapshot.max_frame)
+        } else {
+            max_frame
+        };
+        self.coordination.rollback_cache(cache_rollback_frame);
         *self.last_checksum.write() = last_checksum;
         self.max_frame.store(max_frame, Ordering::Release);
         if !is_savepoint {
@@ -5519,9 +5527,9 @@ pub mod test {
         AuthoritySnapshotValidation, ShmWalCoordination,
     };
     use super::{
-        CheckpointLocks, InProcessWalCoordination, ReadGuardKind, TryBeginReadResult, Wal,
-        WalAutoActions, WalCommitState, WalConnectionState, WalCoordination, WalFile, WalSnapshot,
-        NO_LOCK_HELD,
+        CheckpointLocks, InProcessWalCoordination, ReadGuardKind, RollbackTo, TryBeginReadResult,
+        Wal, WalAutoActions, WalCommitState, WalConnectionState, WalCoordination, WalFile,
+        WalSnapshot, NO_LOCK_HELD,
     };
     #[cfg(host_shared_wal)]
     use crate::storage::shared_wal_coordination::{
@@ -6480,6 +6488,37 @@ pub mod test {
             shared.read().runtime.frame_cache.lock().get(&7),
             Some(&vec![2])
         );
+    }
+
+    #[test]
+    fn test_savepoint_rollback_preserves_committed_frame_cache() {
+        let (shared, wal) = make_test_wal();
+        let coordination = make_test_coordination(&shared);
+        set_shared_snapshot(
+            &shared,
+            WalSnapshot {
+                max_frame: 25,
+                nbackfills: 0,
+                last_checksum: (55, 89),
+                checkpoint_seq: 1,
+                transaction_count: 3,
+            },
+        );
+
+        coordination.cache_frame(7, 10);
+        coordination.cache_frame(9, 20);
+        coordination.cache_frame(11, 30);
+        wal.max_frame.store(30, Ordering::Release);
+
+        wal.rollback(Some(RollbackTo {
+            frame: 10,
+            checksum: (13, 21),
+        }));
+
+        assert_eq!(coordination.find_frame(7, 0, 30, None), Some(10));
+        assert_eq!(coordination.find_frame(9, 0, 30, None), Some(20));
+        assert_eq!(coordination.find_frame(11, 0, 30, None), None);
+        assert_eq!(wal.get_max_frame(), 10);
     }
 
     #[test]
