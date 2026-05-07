@@ -291,6 +291,17 @@ expect {
     ok
 }
 
+test reindex-bracket-quoted-target {
+    CREATE TABLE [t_reindex_bracket](a);
+    CREATE INDEX [idx_reindex_bracket] ON [t_reindex_bracket](a);
+    INSERT INTO [t_reindex_bracket] VALUES(1);
+    REINDEX [t_reindex_bracket];
+    SELECT a FROM [t_reindex_bracket];
+}
+expect {
+    1
+}
+
 test reindex-nocase-embedded-nul {
     CREATE TABLE t_reindex_nul(a);
     CREATE INDEX idx_reindex_nul ON t_reindex_nul(a COLLATE NOCASE);
@@ -324,6 +335,15 @@ test reindex-non-ascii-identifiers-use-ascii-case-folding {
 }
 expect error {
     unable to identify the object to be reindexed
+}
+
+test reindex-unquoted-compound-keyword-target-rejected {
+    CREATE TABLE [union](a);
+    CREATE INDEX idx_reindex_union_keyword ON [union](a);
+    INSERT INTO [union] VALUES(1);
+    REINDEX union;
+}
+expect error {
 }
 
 test reindex-unknown-target {

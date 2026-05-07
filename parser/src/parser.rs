@@ -1071,6 +1071,67 @@ impl<'a> Parser<'a> {
         }
     }
 
+    fn parse_reindex_fullname(&mut self) -> Result<QualifiedName> {
+        let first_name = self.parse_reindex_nm()?;
+
+        let second_name = if let Some(tok) = self.peek()? {
+            if tok.token_type == TK_DOT {
+                eat_assert!(self, TK_DOT);
+                Some(self.parse_reindex_nm()?)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        if let Some(second_name) = second_name {
+            Ok(QualifiedName {
+                db_name: Some(first_name),
+                name: second_name,
+                alias: None,
+            })
+        } else {
+            Ok(QualifiedName {
+                db_name: None,
+                name: first_name,
+                alias: None,
+            })
+        }
+    }
+
+    fn parse_reindex_nm(&mut self) -> Result<Name> {
+        let offset = self.offset();
+        let token = self.peek_no_eof()?;
+        if Self::is_reindex_compound_operator_name(token) {
+            let token_len = token.value.len();
+            let token_text = token.to_utf8();
+            return Err(Error::ParseUnexpectedToken {
+                parsed_offset: (offset, token_len).into(),
+                expected: &[TK_ID, TK_STRING, TK_INDEXED, TK_JOIN_KW, TK_LBRACKET],
+                got: token.token_type,
+                token_text,
+                offset,
+                expected_display: crate::token::TokenType::format_expected_tokens(&[
+                    TK_ID,
+                    TK_STRING,
+                    TK_INDEXED,
+                    TK_JOIN_KW,
+                    TK_LBRACKET,
+                ]),
+            });
+        }
+        self.parse_nm()
+    }
+
+    fn is_reindex_compound_operator_name(token: &Token<'_>) -> bool {
+        matches!(token.token_type, TK_UNION | TK_EXCEPT | TK_INTERSECT)
+            || matches!(token.token_type, TK_ID)
+                && (token.as_bytes().eq_ignore_ascii_case(b"union")
+                    || token.as_bytes().eq_ignore_ascii_case(b"except")
+                    || token.as_bytes().eq_ignore_ascii_case(b"intersect"))
+    }
+
     fn parse_signed(&mut self) -> Result<Box<Expr>> {
         peek_expect!(self, TK_FLOAT, TK_INTEGER, TK_PLUS, TK_MINUS);
 
@@ -4897,8 +4958,8 @@ impl<'a> Parser<'a> {
         eat_assert!(self, TK_REINDEX);
         match self.peek()? {
             Some(tok) => match tok.token_type.fallback_id_if_ok() {
-                TK_ID | TK_STRING | TK_JOIN_KW | TK_INDEXED => Ok(Stmt::Reindex {
-                    name: Some(self.parse_fullname(false)?),
+                TK_ID | TK_STRING | TK_JOIN_KW | TK_INDEXED | TK_LBRACKET => Ok(Stmt::Reindex {
+                    name: Some(self.parse_reindex_fullname()?),
                 }),
                 _ => Ok(Stmt::Reindex { name: None }),
             },
