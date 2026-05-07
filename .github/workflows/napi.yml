@@ -205,7 +205,7 @@ jobs:
         run: docker run --rm -v $(pwd):/build -w /build node:${{ matrix.node }}-slim yarn workspace @tursodatabase/database test
   test-db-wasm-binding:
     name: Test DB bindings on browser@${{ matrix.node }}
-    timeout-minutes: 30
+    timeout-minutes: 45
     needs:
       - build
     strategy:
@@ -227,7 +227,7 @@ jobs:
       - name: Build wasm-common
         run: yarn workspace @tursodatabase/database-wasm-common build
       - name: Install playwright with deps
-        run: yarn workspace @tursodatabase/database-wasm playwright install --with-deps
+        run: yarn workspace @tursodatabase/database-wasm playwright install --with-deps chromium firefox
       - name: Download all DB artifacts
         uses: actions/download-artifact@v4
         with:
