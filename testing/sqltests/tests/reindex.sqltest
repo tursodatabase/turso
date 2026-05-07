@@ -314,6 +314,32 @@ expect {
     1
 }
 
+test reindex-expression-index-explicit-collate {
+    CREATE TABLE t_reindex_expr_collate(a TEXT);
+    CREATE INDEX idx_reindex_expr_collate ON t_reindex_expr_collate((a COLLATE NOCASE));
+    INSERT INTO t_reindex_expr_collate VALUES('alpha'),('ALPHA'),('AlPhA'),('beta'),('BETA');
+    REINDEX idx_reindex_expr_collate;
+    SELECT quote(a) FROM t_reindex_expr_collate
+        WHERE (a COLLATE NOCASE) = 'alpha'
+        ORDER BY rowid;
+}
+expect {
+    'alpha'
+    'ALPHA'
+    'AlPhA'
+}
+
+test reindex-expression-index-outer-collate-target {
+    CREATE TABLE t_reindex_outer_collate(a TEXT);
+    CREATE INDEX idx_reindex_outer_collate ON t_reindex_outer_collate(((a COLLATE NOCASE) COLLATE RTRIM));
+    REINDEX rtrim;
+    PRAGMA index_xinfo('idx_reindex_outer_collate');
+}
+expect {
+    0|0|a|0|RTRIM|1
+    1|-1||0|BINARY|0
+}
+
 test reindex-nocase-embedded-nul {
     CREATE TABLE t_reindex_nul(a);
     CREATE INDEX idx_reindex_nul ON t_reindex_nul(a COLLATE NOCASE);

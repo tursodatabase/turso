@@ -929,18 +929,25 @@ fn extract_collation<'a>(
 ) -> crate::Result<(Option<CollationSeq>, &'a Expr)> {
     let mut current = expr;
     let mut coll = None;
-    while let Expr::Collate(inner, seq) = current {
-        let collation = match resolver {
-            Some(resolver) => resolver.resolve_collation(seq.as_str())?,
-            None => CollationSeq::new(seq.as_str())?,
-        };
-        if collation.is_custom() {
-            crate::bail_parse_error!("custom collations are not supported in indexes");
+    loop {
+        current = unwrap_parens(current)?;
+        match current {
+            Expr::Collate(inner, seq) => {
+                if coll.is_none() {
+                    let collation = match resolver {
+                        Some(resolver) => resolver.resolve_collation(seq.as_str())?,
+                        None => CollationSeq::new(seq.as_str())?,
+                    };
+                    if collation.is_custom() {
+                        crate::bail_parse_error!("custom collations are not supported in indexes");
+                    }
+                    coll = Some(collation);
+                }
+                current = inner.as_ref();
+            }
+            _ => return Ok((coll, current)),
         }
-        coll = Some(collation);
-        current = inner.as_ref();
     }
-    Ok((coll, current))
 }
 
 /// For a given Index Expression, attempts to resolve it to a column position in the table.
