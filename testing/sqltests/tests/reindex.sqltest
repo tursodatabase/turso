@@ -316,6 +316,16 @@ expect error {
     unable to identify the object to be reindexed
 }
 
+test reindex-non-ascii-identifiers-use-ascii-case-folding {
+    CREATE TABLE Café_reindex(a INT);
+    CREATE INDEX idx_cafe_reindex ON Café_reindex(a);
+    INSERT INTO Café_reindex VALUES(1);
+    REINDEX CAFÉ_reindex;
+}
+expect error {
+    unable to identify the object to be reindexed
+}
+
 test reindex-unknown-target {
     REINDEX missing_reindex_target;
 }
