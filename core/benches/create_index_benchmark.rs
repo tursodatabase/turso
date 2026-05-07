@@ -22,13 +22,15 @@
 //! profile also works; `bench-profile` is preferred when profiling.
 
 #[cfg(not(feature = "codspeed"))]
-use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
+use criterion::{
+    criterion_group, criterion_main, BenchmarkId, Criterion, SamplingMode, Throughput,
+};
 #[cfg(not(feature = "codspeed"))]
 use pprof::criterion::{Output, PProfProfiler};
 
 #[cfg(feature = "codspeed")]
 use codspeed_criterion_compat::{
-    criterion_group, criterion_main, BenchmarkId, Criterion, Throughput,
+    criterion_group, criterion_main, BenchmarkId, Criterion, SamplingMode, Throughput,
 };
 
 use std::sync::Arc;
@@ -173,7 +175,7 @@ fn bench_create_index(criterion: &mut Criterion) {
     let mut group = criterion.benchmark_group("CREATE INDEX on populated table");
     // Each sample creates one index, but throughput is in rows so the report
     // shows rows/s of index build.
-    group.sampling_mode(criterion::SamplingMode::Flat);
+    group.sampling_mode(SamplingMode::Flat);
 
     for &row_count in &row_counts() {
         group.throughput(Throughput::Elements(row_count as u64));
@@ -239,12 +241,13 @@ fn bench_create_index(criterion: &mut Criterion) {
 
 /// Benchmark CREATE INDEX inside an explicit BEGIN/COMMIT, isolating the
 /// commit cost the user is hitting in production.
+#[cfg(feature = "codspeed")]
 fn bench_create_index_commit(criterion: &mut Criterion) {
     let enable_rusqlite =
         std::env::var("DISABLE_RUSQLITE_BENCHMARK").is_err() && !cfg!(feature = "codspeed");
 
     let mut group = criterion.benchmark_group("CREATE INDEX explicit commit");
-    group.sampling_mode(criterion::SamplingMode::Flat);
+    group.sampling_mode(SamplingMode::Flat);
 
     for &row_count in &row_counts() {
         group.throughput(Throughput::Elements(row_count as u64));
