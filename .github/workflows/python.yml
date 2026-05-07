@@ -139,11 +139,12 @@ jobs:
         run: uvx ruff check
 
   linux:
-    timeout-minutes: 30
+    timeout-minutes: 45
     defaults:
       run:
         working-directory: ${{ env.working-directory }}
     strategy:
+      fail-fast: false
       matrix:
         include:
           - target: x86_64
@@ -156,6 +157,19 @@ jobs:
       - uses: useblacksmith/setup-python@v6
         with:
           python-version: '3.10'
+      - name: Pre-pull manylinux image
+        shell: bash
+        run: |
+          image="quay.io/pypa/manylinux2014_${{ matrix.target }}:latest"
+          for attempt in 1 2 3; do
+            if docker pull "$image"; then
+              exit 0
+            fi
+            if [ "$attempt" = "3" ]; then
+              exit 1
+            fi
+            sleep $((attempt * 10))
+          done
       - name: Build wheels
         uses: PyO3/maturin-action@v1
         with:
