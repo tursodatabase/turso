@@ -291,6 +291,21 @@ expect {
     ok
 }
 
+test reindex-nocase-embedded-nul {
+    CREATE TABLE t_reindex_nul(a);
+    CREATE INDEX idx_reindex_nul ON t_reindex_nul(a COLLATE NOCASE);
+    INSERT INTO t_reindex_nul VALUES(CAST(X'410078' AS TEXT));
+    INSERT INTO t_reindex_nul VALUES(CAST(X'410079' AS TEXT));
+    REINDEX idx_reindex_nul;
+    SELECT hex(a) FROM t_reindex_nul
+        WHERE a = CAST(X'410078' AS TEXT) COLLATE NOCASE
+        ORDER BY rowid;
+}
+expect {
+    410078
+    410079
+}
+
 test reindex-unset-is-not-a-collation {
     CREATE TABLE t_reindex_unset(id INTEGER PRIMARY KEY, a TEXT);
     CREATE INDEX idx_reindex_unset ON t_reindex_unset(a);

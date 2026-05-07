@@ -64,6 +64,13 @@ expect {
     1
 }
 
+test collate_nocase_embedded_nul {
+    SELECT CAST(X'410078' AS TEXT) = CAST(X'410079' AS TEXT) COLLATE NOCASE;
+}
+expect {
+    1
+}
+
 
 
 @cross-check-integrity

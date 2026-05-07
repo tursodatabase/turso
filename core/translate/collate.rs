@@ -170,9 +170,17 @@ impl CollationSeq {
 
     #[inline(always)]
     fn nocase_cmp(lhs: &str, rhs: &str) -> Ordering {
-        let nocase_lhs = uncased::UncasedStr::new(lhs);
-        let nocase_rhs = uncased::UncasedStr::new(rhs);
-        nocase_lhs.cmp(nocase_rhs)
+        for (left, right) in lhs.bytes().zip(rhs.bytes()) {
+            let left = left.to_ascii_lowercase();
+            let right = right.to_ascii_lowercase();
+            if left != right {
+                return left.cmp(&right);
+            }
+            if left == 0 {
+                return lhs.len().cmp(&rhs.len());
+            }
+        }
+        lhs.len().cmp(&rhs.len())
     }
 
     #[inline(always)]

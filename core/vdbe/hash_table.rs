@@ -45,8 +45,12 @@ const BLOB_HASH: u8 = 4;
 /// Hash text case-insensitively without allocation (ASCII-only for SQLite NOCASE).
 /// SQLite's NOCASE collation only considers ASCII case, so to_ascii_lowercase() is correct.
 fn hash_text_nocase(hasher: &mut impl Hasher, text: &str) {
+    hasher.write_usize(text.len());
     for byte in text.bytes() {
         hasher.write_u8(byte.to_ascii_lowercase());
+        if byte == 0 {
+            break;
+        }
     }
 }
 
@@ -86,7 +90,7 @@ fn hash_join_key(key_values: &[ValueRef], collations: &[CollationSeq]) -> u64 {
                         hash_text_nocase(&mut hasher, text.as_str());
                     }
                     CollationSeq::Rtrim => {
-                        let trimmed = text.as_str().trim_end();
+                        let trimmed = text.as_str().trim_end_matches(' ');
                         hasher.write(trimmed.as_bytes());
                     }
                     CollationSeq::Binary | CollationSeq::Unset => {
@@ -3864,6 +3868,28 @@ mod hashtests {
         assert_ne!(
             h1, h2,
             "non-ASCII chars should not be case-folded by NOCASE"
+        );
+    }
+
+    #[test]
+    fn test_hash_nocase_embedded_nul_matches_equality() {
+        use crate::types::{TextRef, TextSubtype};
+
+        let nocase_coll = vec![CollationSeq::NoCase];
+        let keys1 = vec![ValueRef::Text(TextRef::new("A\0x", TextSubtype::Text))];
+        let keys2 = vec![ValueRef::Text(TextRef::new("a\0y", TextSubtype::Text))];
+        let keys3 = vec![ValueRef::Text(TextRef::new("a\0yz", TextSubtype::Text))];
+
+        assert!(values_equal(keys1[0], keys2[0], CollationSeq::NoCase));
+        assert_eq!(
+            hash_join_key(&keys1, &nocase_coll),
+            hash_join_key(&keys2, &nocase_coll)
+        );
+
+        assert!(!values_equal(keys1[0], keys3[0], CollationSeq::NoCase));
+        assert_ne!(
+            hash_join_key(&keys1, &nocase_coll),
+            hash_join_key(&keys3, &nocase_coll)
         );
     }
 
