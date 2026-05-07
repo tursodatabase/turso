@@ -291,6 +291,16 @@ expect {
     ok
 }
 
+test reindex-unset-is-not-a-collation {
+    CREATE TABLE t_reindex_unset(id INTEGER PRIMARY KEY, a TEXT);
+    CREATE INDEX idx_reindex_unset ON t_reindex_unset(a);
+    INSERT INTO t_reindex_unset VALUES (1, 'x');
+    REINDEX UNSET;
+}
+expect error {
+    unable to identify the object to be reindexed
+}
+
 test reindex-unknown-target {
     REINDEX missing_reindex_target;
 }
