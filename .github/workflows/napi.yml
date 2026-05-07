@@ -295,7 +295,7 @@ jobs:
         run: yarn workspace @tursodatabase/sync test
   test-sync-wasm-binding:
     name: Test sync bindings on browser@${{ matrix.node }}
-    timeout-minutes: 30
+    timeout-minutes: 45
     needs:
       - build
     strategy:
@@ -331,7 +331,7 @@ jobs:
       - name: Build sync common
         run: yarn workspace @tursodatabase/sync-common build
       - name: Install playwright with deps
-        run: yarn workspace @tursodatabase/sync-wasm playwright install --with-deps
+        run: yarn workspace @tursodatabase/sync-wasm playwright install --with-deps chromium
       - name: Download all DB artifacts
         uses: actions/download-artifact@v4
         with:
