@@ -96,3 +96,50 @@ expect {
     1|10|100
     2|20|200
 }
+
+# Issue #4585 reproducer 1: Sub appears as the right side of a JOIN.
+# `(b)` is a single table in parens — always safe to flatten regardless of
+# the outer join type.
+test left-join-with-paren-single-table {
+    CREATE TABLE a(x INT);
+    CREATE TABLE b(y INT);
+    INSERT INTO a VALUES (1), (2);
+    INSERT INTO b VALUES (1);
+    SELECT * FROM a LEFT JOIN (b) ON a.x = b.y ORDER BY a.x;
+}
+expect {
+    1|1
+    2|
+}
+
+# Issue #4585 reproducer 3: Sub as the second table in a comma-join. Comma is
+# not an OUTER join, so the multi-table inner is safe to flatten.
+test cross-join-with-paren-multi-table {
+    CREATE TABLE a(x INT);
+    CREATE TABLE b(y INT);
+    CREATE TABLE c(z INT);
+    INSERT INTO a VALUES (1);
+    INSERT INTO b VALUES (1);
+    INSERT INTO c VALUES (1);
+    SELECT * FROM a, (b LEFT JOIN c ON b.y = c.z);
+}
+expect {
+    1|1|1
+}
+
+# Inner LEFT JOIN inside an outer comma-join (still safe — comma is not OUTER).
+test cross-join-with-paren-left-inner-no-match {
+    CREATE TABLE a(x INT);
+    CREATE TABLE b(y INT);
+    CREATE TABLE c(z INT);
+    INSERT INTO a VALUES (1), (2);
+    INSERT INTO b VALUES (1), (2);
+    INSERT INTO c VALUES (1);
+    SELECT * FROM a, (b LEFT JOIN c ON b.y = c.z) ORDER BY a.x, b.y;
+}
+expect {
+    1|1|1
+    1|2|
+    2|1|1
+    2|2|
+}

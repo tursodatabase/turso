@@ -591,10 +591,18 @@ impl<'a> LogicalPlanBuilder<'a> {
             head = &inner.select;
         }
 
+        // Now expand any Sub(_, None) appearing as a joined table. Safe cases:
+        //   1. Inner has no joins (single table in parens) — always equivalent.
+        //   2. Outer JOIN is not OUTER (Comma/CROSS/INNER) — associative.
+        // Outer-OUTER + multi-table inner falls through unflattened and will
+        // hit build_select_table's bail.
+        let mut flat: Vec<FlattenedJoin> = Vec::with_capacity(all_joins.len());
+        expand_sub_joins(&all_joins, &mut flat);
+
         let mut plan = self.build_select_table(head)?;
-        for join in all_joins {
-            let right = self.build_select_table(&join.table)?;
-            plan = self.build_join(plan, right, &join.operator, &join.constraint)?;
+        for fj in flat {
+            let right = self.build_select_table(fj.table)?;
+            plan = self.build_join(plan, right, fj.operator, fj.constraint)?;
         }
 
         Ok(plan)
@@ -2404,6 +2412,44 @@ impl<'a> LogicalPlanBuilder<'a> {
             LogicalExpr::Like { .. } => Ok(Type::Integer),
             _ => Ok(Type::Text),
         }
+    }
+}
+
+/// Borrowed view of a single join after Sub-flattening.
+struct FlattenedJoin<'a> {
+    operator: &'a ast::JoinOperator,
+    table: &'a ast::SelectTable,
+    constraint: &'a Option<ast::JoinConstraint>,
+}
+
+/// Recursively expand `Sub(_, None)` joined tables into the surrounding chain.
+/// See `build_from` for the safety rule.
+fn expand_sub_joins<'a>(joins: &[&'a ast::JoinedSelectTable], out: &mut Vec<FlattenedJoin<'a>>) {
+    for j in joins {
+        let outer_is_outer_join = matches!(
+            &j.operator,
+            ast::JoinOperator::TypedJoin(Some(jt))
+                if jt.contains(ast::JoinType::LEFT)
+                    || jt.contains(ast::JoinType::RIGHT)
+                    || jt.contains(ast::JoinType::OUTER)
+        );
+        let mut current_table: &ast::SelectTable = &j.table;
+        let mut accumulated: Vec<&'a ast::JoinedSelectTable> = Vec::new();
+        while let ast::SelectTable::Sub(inner, None) = current_table {
+            if !inner.joins.is_empty() && outer_is_outer_join {
+                break;
+            }
+            for inner_join in &inner.joins {
+                accumulated.push(inner_join);
+            }
+            current_table = &inner.select;
+        }
+        out.push(FlattenedJoin {
+            operator: &j.operator,
+            table: current_table,
+            constraint: &j.constraint,
+        });
+        expand_sub_joins(&accumulated, out);
     }
 }
 
