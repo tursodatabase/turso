@@ -6,7 +6,7 @@ sidebarTitle: Data Types
 
 # Data Types
 
-Turso uses the same dynamic type system as SQLite, where values have types but columns do not enforce a single type (unless using STRICT tables). Every value stored in Turso belongs to one of five storage classes.
+Turso uses the same dynamic type system as SQLite, where values have types but columns do not enforce a single type (unless using STRICT tables). Every value stored in Turso belongs to one of five storage classes. Turso extends this system with [custom types](#custom-types), [composite types](#composite-types-struct-and-union), and [native array types](#array-types) for STRICT tables.
 
 ## Storage Classes
 
@@ -99,7 +99,7 @@ STRICT tables only allow these base type names:
 | ANY | Any storage class (disables type checking for this column) |
 
 <Info>
-**Turso Extension**: STRICT tables also accept [custom type](/docs/sql-reference/statements/create-type) names. Custom types extend the type system with user-defined encoding, decoding, validation, and operator overloading.
+**Turso Extension**: STRICT tables also accept [custom type](/docs/sql-reference/statements/create-type) names, [composite types](#composite-types-struct-and-union) (STRUCT and UNION), and [array types](#array-types). Any base type can be turned into an array column by appending `[]` to the type name (e.g., `INTEGER[]`, `TEXT[]`). Arrays, custom types, and composite types are Turso-specific features.
 </Info>
 
 ## Custom Types
