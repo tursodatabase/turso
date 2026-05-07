@@ -66,8 +66,7 @@ impl InitLoop {
                 "DISTINCT aggregate functions must have exactly one argument"
             );
             let collations =
-                vec![get_collseq_from_expr(&agg.original_expr, tables)?
-                    .unwrap_or(CollationSeq::Binary)];
+                vec![get_collseq_from_expr(&agg.args[0], tables)?.unwrap_or(CollationSeq::Binary)];
             let hash_table_id = program.alloc_hash_table_id();
             agg.distinctness = Distinctness::Distinct {
                 ctx: Some(DistinctCtx {
