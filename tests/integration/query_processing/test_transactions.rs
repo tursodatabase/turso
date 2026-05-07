@@ -1548,7 +1548,6 @@ fn test_rollback_without_mvcc() {
 }
 
 #[test]
-#[ignore = "ignoring for now vaccum is experimental, should be fixed later."]
 fn test_wal_savepoint_rollback_on_constraint_violation() {
     let tmp_db = TempDatabase::new("test_90969.db");
     let conn = tmp_db.connect_limbo();

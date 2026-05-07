@@ -1891,7 +1891,7 @@ fn vacuum_in_place_step(
                     return Ok(IOResult::IO(IOCompletions::Single(completion.clone())));
                 }
                 if !completion.succeeded() {
-                    return Err(vacuum_completion_error(completion, "WAL header init"));
+                    return Err(vacuum_completion_error(&completion, "WAL header init"));
                 }
 
                 if !*fsync_phase {
@@ -1958,7 +1958,7 @@ fn vacuum_in_place_step(
                     return Ok(IOResult::IO(IOCompletions::Single(read_completion.clone())));
                 }
                 if !read_completion.succeeded() {
-                    return Err(vacuum_completion_error(read_completion, "temp batch read"));
+                    return Err(vacuum_completion_error(&read_completion, "temp batch read"));
                 }
 
                 // All pages in this batch are loaded. Prepare WAL frames.
@@ -1984,7 +1984,7 @@ fn vacuum_in_place_step(
                 let db_size_on_commit = if all_read { Some(*total_pages) } else { None };
 
                 let prepared = wal.prepare_frames(
-                    batch_pages,
+                    &batch_pages,
                     page_sz,
                     db_size_on_commit,
                     prev_prepared.as_deref(),
@@ -2110,7 +2110,7 @@ fn vacuum_in_place_step(
                     return Ok(IOResult::IO(IOCompletions::Single(sync_completion.clone())));
                 }
                 if !sync_completion.succeeded() {
-                    return Err(vacuum_completion_error(sync_completion, "WAL fsync"));
+                    return Err(vacuum_completion_error(&sync_completion, "WAL fsync"));
                 }
                 *phase = VacuumInPlacePhase::PublishWalCommit;
                 continue;
@@ -2715,7 +2715,6 @@ mod tests {
 
     #[cfg(not(target_family = "wasm"))]
     #[test]
-    #[ignore = "ignoring for now vaccum is experimental, should be fixed later."]
     fn capture_target_metadata_uses_final_header_cookie_and_preserves_tvfs() -> Result<()> {
         let io: Arc<dyn crate::IO> = Arc::new(crate::io::PlatformIO::new()?);
         let source_dir = tempfile::tempdir().unwrap();
@@ -2831,7 +2830,7 @@ mod tests {
             io_dyn,
             "vacuum-source.db",
             OpenFlags::Create,
-            DatabaseOpts::new().with_vacuum(true),
+            DatabaseOpts::new(),
             None,
         )?;
         let conn = db.connect()?;
@@ -2872,7 +2871,7 @@ mod tests {
             io_dyn,
             "vacuum-source-full.db",
             OpenFlags::Create,
-            DatabaseOpts::new().with_vacuum(true),
+            DatabaseOpts::new(),
             None,
         )?;
         let conn = db.connect()?;

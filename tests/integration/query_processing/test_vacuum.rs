@@ -5110,7 +5110,6 @@ fn test_plain_vacuum_copy_batch_page_count_boundaries() -> anyhow::Result<()> {
 /// may be no user schema pages to copy, but VACUUM still must leave the file
 /// usable and folded.
 #[test]
-#[ignore = "ignoring for now vaccum is experimental, should be fixed later."]
 fn test_plain_vacuum_empty_schema_physical_contract() -> anyhow::Result<()> {
     let tmp_db = TempDatabase::new_empty();
     let conn = tmp_db.connect_limbo();
@@ -5841,7 +5840,6 @@ fn assert_mvcc_multi_object_vacuum_workload(conn: &Arc<Connection>) -> anyhow::R
 }
 
 #[test]
-#[ignore = "ignoring for now vaccum is experimental, should be fixed later."]
 fn test_mvcc_plain_vacuum_multi_object_rootpage_reset() -> anyhow::Result<()> {
     let tmp_db =
         TempDatabase::new_with_mvcc("test_mvcc_plain_vacuum_multi_object_rootpage_reset.db");
@@ -5897,7 +5895,6 @@ fn test_mvcc_plain_vacuum_multi_object_rootpage_reset() -> anyhow::Result<()> {
 }
 
 #[test]
-#[ignore = "ignoring for now vaccum is experimental, should be fixed later."]
 fn test_mvcc_plain_vacuum_discards_reused_index_rootpage_state() -> anyhow::Result<()> {
     let tmp_db = TempDatabase::new_with_mvcc(
         "test_mvcc_plain_vacuum_discards_reused_index_rootpage_state.db",

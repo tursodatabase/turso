@@ -921,21 +921,13 @@ fn subprocess_database_open_selects_multiprocess_shm_backend() {
 }
 
 #[test]
-#[ignore = "ignoring for now vaccum is experimental, should be fixed later."]
 fn plain_vacuum_rejects_multiprocess_wal_database() {
     let dir = tempfile::tempdir().unwrap();
     let db_path = dir.path().join("vacuum-multiprocess.db");
     let db_path_str = db_path.to_str().unwrap();
     let io: Arc<dyn IO> = Arc::new(PlatformIO::new().unwrap());
 
-    let db = Database::open_file_with_flags(
-        io,
-        db_path_str,
-        OpenFlags::default(),
-        multiprocess_wal_db_opts().with_vacuum(true),
-        None,
-    )
-    .unwrap();
+    let db = open_multiprocess_db(io, db_path_str).unwrap();
     let conn = db.connect().unwrap();
     conn.execute("create table test(id integer primary key, value text)")
         .unwrap();
