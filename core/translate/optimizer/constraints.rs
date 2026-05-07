@@ -12,12 +12,11 @@ use crate::{
     Result,
 };
 use crate::{turso_assert, turso_debug_assert};
-use rustc_hash::FxHashMap as HashMap;
 use std::{cmp::Ordering, collections::VecDeque, sync::Arc};
 use turso_ext::{ConstraintInfo, ConstraintOp};
 use turso_parser::ast::{self, SortOrder, TableInternalId};
 
-use super::cost_params::CostModelParams;
+use super::{cost_params::CostModelParams, AvailableIndexes};
 
 /// Represents a single condition derived from a `WHERE` clause term
 /// that constrains a specific column of a table.
@@ -249,8 +248,7 @@ fn estimate_selectivity(
     schema: &Schema,
     table_name: &str,
     column: Option<&Column>,
-    column_pos: Option<usize>,
-    available_indexes: &HashMap<String, VecDeque<Arc<Index>>>,
+    index: Option<&Index>,
     op: ConstraintOperator,
     params: &CostModelParams,
     is_rowid: bool,
@@ -273,40 +271,27 @@ fn estimate_selectivity(
 
             if is_pk_or_rowid_alias {
                 selectivity_when_unique
-            } else if let Some(col_pos) = column_pos {
-                // For non-unique columns, find an index containing this column and use its stats
-                if let Some(indexes) = available_indexes.get(table_name) {
-                    for index in indexes {
-                        // Check if this index has our column as its first column
-                        // (selectivity is most accurate when column is leftmost in index)
-                        if let Some(idx_col_pos) = index.column_table_pos_to_index_pos(col_pos) {
-                            // Only use stats if column is first in index (idx_col_pos == 0)
-                            // because that's when the distinct count is most useful
-                            if idx_col_pos == 0 {
-                                // Only use unique selectivity for single-column unique indexes.
-                                // For composite unique indexes like tpc-h (l_orderkey, l_linenumber),
-                                // the first column alone is NOT unique.
-                                if index.unique && index.columns.len() == 1 {
-                                    return selectivity_when_unique;
-                                }
-                                if let Some(stats) = table_stats {
-                                    if let Some(idx_stat) = stats.index_stats.get(&index.name) {
-                                        if let (Some(total), Some(&avg_rows)) = (
-                                            idx_stat.total_rows,
-                                            idx_stat.avg_rows_per_distinct_prefix.first(),
-                                        ) {
-                                            if total > 0 && avg_rows > 0 {
-                                                // selectivity = avg_rows_per_key / total_rows
-                                                return avg_rows as f64 / total as f64;
-                                            }
-                                        }
-                                    }
-                                } else {
-                                    return params.sel_eq_indexed;
-                                }
+            } else if let Some(index) = index {
+                // Only use unique selectivity for single-column unique indexes.
+                // For composite unique indexes like tpc-h (l_orderkey, l_linenumber),
+                // the first column alone is NOT unique.
+                if index.unique && index.columns.len() == 1 {
+                    return selectivity_when_unique;
+                }
+                if let Some(stats) = table_stats {
+                    if let Some(idx_stat) = stats.index_stats.get(&index.name) {
+                        if let (Some(total), Some(&avg_rows)) = (
+                            idx_stat.total_rows,
+                            idx_stat.avg_rows_per_distinct_prefix.first(),
+                        ) {
+                            if total > 0 && avg_rows > 0 {
+                                // selectivity = avg_rows_per_key / total_rows
+                                return avg_rows as f64 / total as f64;
                             }
                         }
                     }
+                } else {
+                    return params.sel_eq_indexed;
                 }
                 // Fallback: use hardcoded selectivity for non-indexed columns
                 // Don't scale by row_count - keep it distinct from PK selectivity
@@ -337,9 +322,8 @@ fn estimate_constraint_selectivity(
     schema: &Schema,
     table_reference: &JoinedTable,
     column: Option<&Column>,
-    column_pos: Option<usize>,
     operator: ConstraintOperator,
-    available_indexes: &HashMap<String, VecDeque<Arc<Index>>>,
+    index: Option<&Index>,
     params: &CostModelParams,
     is_rowid: bool,
 ) -> f64 {
@@ -347,12 +331,44 @@ fn estimate_constraint_selectivity(
         schema,
         table_reference.table.get_name(),
         column,
-        column_pos,
-        available_indexes,
+        index,
         operator,
         params,
         is_rowid,
     )
+}
+
+fn selectivity_index_for_column<'a>(
+    schema: &Schema,
+    table_reference: &JoinedTable,
+    available_indexes: &'a AvailableIndexes,
+    column_pos: usize,
+) -> Option<&'a Index> {
+    let table_stats = schema
+        .analyze_stats
+        .table_stats(table_reference.table.get_name());
+    available_indexes
+        .btree_indexes_for_column(table_reference.internal_id, column_pos)
+        .find(|index| {
+            if index.unique && index.columns.len() == 1 {
+                return true;
+            }
+            let Some(table_stats) = table_stats else {
+                return true;
+            };
+            table_stats
+                .index_stats
+                .get(&index.name)
+                .is_some_and(|idx_stat| {
+                    matches!(
+                        (
+                            idx_stat.total_rows,
+                            idx_stat.avg_rows_per_distinct_prefix.first()
+                        ),
+                        (Some(total), Some(&avg_rows)) if total > 0 && avg_rows > 0
+                    )
+                })
+        })
 }
 
 fn expression_matches_table(
@@ -379,7 +395,7 @@ fn expression_matches_table(
 pub fn constraints_from_where_clause(
     where_clause: &[WhereTerm],
     table_references: &TableReferences,
-    available_indexes: &HashMap<String, VecDeque<Arc<Index>>>,
+    available_indexes: &AvailableIndexes,
     subqueries: &[NonFromClauseSubquery],
     schema: &Schema,
     params: &CostModelParams,
@@ -397,7 +413,7 @@ pub fn constraints_from_where_clause(
             table_id: table_reference.internal_id,
             constraints: Vec::new(),
             candidates: available_indexes
-                .get(table_reference.table.get_name())
+                .indexes_for_table(table_reference.internal_id)
                 .map_or(Vec::new(), |indexes| {
                     indexes
                         .iter()
@@ -416,6 +432,10 @@ pub fn constraints_from_where_clause(
             index: None,
             refs: Vec::new(),
         });
+
+        let index_for_column = |column_pos| {
+            selectivity_index_for_column(schema, table_reference, available_indexes, column_pos)
+        };
 
         for (i, term) in where_clause.iter().enumerate() {
             // Constraints originating from a LEFT JOIN must always be evaluated in that join's RHS table's loop,
@@ -444,9 +464,8 @@ pub fn constraints_from_where_clause(
                                     schema,
                                     table_reference,
                                     Some(table_column),
-                                    Some(*column),
                                     operator,
-                                    available_indexes,
+                                    index_for_column(*column),
                                     params,
                                     false,
                                 ),
@@ -473,9 +492,8 @@ pub fn constraints_from_where_clause(
                                     schema,
                                     table_reference,
                                     col,
-                                    col_pos,
                                     operator,
-                                    available_indexes,
+                                    None,
                                     params,
                                     true,
                                 ),
@@ -495,9 +513,8 @@ pub fn constraints_from_where_clause(
                             schema,
                             table_reference,
                             None,
-                            None,
                             operator,
-                            available_indexes,
+                            None,
                             params,
                             false,
                         );
@@ -538,9 +555,8 @@ pub fn constraints_from_where_clause(
                                     schema,
                                     table_reference,
                                     Some(table_column),
-                                    Some(*column),
                                     operator,
-                                    available_indexes,
+                                    index_for_column(*column),
                                     params,
                                     false,
                                 ),
@@ -567,9 +583,8 @@ pub fn constraints_from_where_clause(
                                     schema,
                                     table_reference,
                                     col,
-                                    col_pos,
                                     operator,
-                                    available_indexes,
+                                    None,
                                     params,
                                     true,
                                 ),
@@ -589,9 +604,8 @@ pub fn constraints_from_where_clause(
                             schema,
                             table_reference,
                             None,
-                            None,
                             operator,
-                            available_indexes,
+                            None,
                             params,
                             false,
                         );
@@ -803,9 +817,9 @@ pub fn constraints_from_where_clause(
                 });
             }
             for index in available_indexes
-                .get(table_reference.table.get_name())
-                .unwrap_or(&VecDeque::new())
-                .iter()
+                .indexes_for_table(table_reference.internal_id)
+                .into_iter()
+                .flat_map(|indexes| indexes.iter())
                 .filter(|idx| idx.index_method.is_none())
             {
                 if let Some(position_in_index) = match constraint.table_col_pos {
@@ -1261,7 +1275,7 @@ pub fn estimate_partial_index_where_selectivity(
     where_expr: &ast::Expr,
     table_reference: &JoinedTable,
     schema: &Schema,
-    available_indexes: &HashMap<String, VecDeque<Arc<Index>>>,
+    available_indexes: &AvailableIndexes,
     params: &CostModelParams,
 ) -> f64 {
     let mut bound = where_expr.clone();
@@ -1273,7 +1287,7 @@ fn estimate_bound_expr_selectivity(
     expr: &ast::Expr,
     table_reference: &JoinedTable,
     schema: &Schema,
-    available_indexes: &HashMap<String, VecDeque<Arc<Index>>>,
+    available_indexes: &AvailableIndexes,
     params: &CostModelParams,
 ) -> f64 {
     use ast::Expr;
@@ -1305,16 +1319,10 @@ fn estimate_bound_expr_selectivity(
     let leaf_selectivity = |lhs: &ast::Expr, rhs: &ast::Expr, op: ConstraintOperator| -> f64 {
         let resolved = resolve_side(lhs).or_else(|| resolve_side(rhs));
         let (col, col_pos, is_rowid) = resolved.unwrap_or((None, None, false));
-        estimate_constraint_selectivity(
-            schema,
-            table_reference,
-            col,
-            col_pos,
-            op,
-            available_indexes,
-            params,
-            is_rowid,
-        )
+        let index = col_pos.and_then(|pos| {
+            selectivity_index_for_column(schema, table_reference, available_indexes, pos)
+        });
+        estimate_constraint_selectivity(schema, table_reference, col, op, index, params, is_rowid)
     };
 
     match expr {
@@ -1375,16 +1383,18 @@ fn estimate_bound_expr_selectivity(
         Expr::InList { lhs, not, rhs } => {
             let resolved = resolve_side(lhs);
             let (col, col_pos, is_rowid) = resolved.unwrap_or((None, None, false));
+            let index = col_pos.and_then(|pos| {
+                selectivity_index_for_column(schema, table_reference, available_indexes, pos)
+            });
             estimate_constraint_selectivity(
                 schema,
                 table_reference,
                 col,
-                col_pos,
                 ConstraintOperator::In {
                     not: *not,
                     estimated_values: rhs.len() as f64,
                 },
-                available_indexes,
+                index,
                 params,
                 is_rowid,
             )
@@ -1627,7 +1637,6 @@ pub(crate) fn analyze_binary_term_for_index(
     table_reference: &JoinedTable,
     indexes: Option<&VecDeque<Arc<Index>>>,
     rowid_alias_column: Option<usize>,
-    available_indexes: &HashMap<String, VecDeque<Arc<Index>>>,
     table_references: &TableReferences,
     subqueries: &[NonFromClauseSubquery],
     schema: &Schema,
@@ -1662,9 +1671,8 @@ pub(crate) fn analyze_binary_term_for_index(
         schema,
         table_reference,
         table_column,
-        table_col_pos,
         operator,
-        available_indexes,
+        best_index.as_deref(),
         params,
         is_rowid,
     );
