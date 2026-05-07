@@ -1320,7 +1320,7 @@ fn emit_cdc_insns_v1(
         cursor: cdc_cursor_id,
         key_reg: rowid_reg,
         record_reg,
-        flag: InsertFlags::new(),
+        flag: InsertFlags::new().skip_last_rowid(),
         table_name: "".to_string(),
     });
     Ok(())
@@ -1459,7 +1459,7 @@ fn emit_cdc_insns_v2(
         cursor: cdc_cursor_id,
         key_reg: rowid_reg,
         record_reg,
-        flag: InsertFlags::new(),
+        flag: InsertFlags::new().skip_last_rowid(),
         table_name: "".to_string(),
     });
     Ok(())
@@ -1545,7 +1545,7 @@ pub fn emit_cdc_commit_insns(
         cursor: cdc_cursor_id,
         key_reg: rowid_reg,
         record_reg,
-        flag: InsertFlags::new(),
+        flag: InsertFlags::new().skip_last_rowid(),
         table_name: "".to_string(),
     });
     Ok(())
