@@ -2746,10 +2746,13 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                 let RowKey::Record(sortable_key) = row.id.row_id else {
                     panic!("Index writes must be to a record");
                 };
-                let sortable_key = self.get_or_create_index_key_arc(index_id, sortable_key);
                 tx.insert_to_write_set(id);
-                tx.record_created_index_version((index_id, sortable_key.clone()), version_id);
-                self.insert_index_version(index_id, sortable_key, row_version);
+                // Single SkipMap traversal: pass in a fresh Arc; the SkipMap
+                // returns the canonical Arc (ours on miss, an existing one
+                // on hit), which we hand to savepoint tracking.
+                let canonical_key =
+                    self.insert_index_version(index_id, Arc::new(sortable_key), row_version);
+                tx.record_created_index_version((index_id, canonical_key), version_id);
             }
             None => {
                 // NOTE: We do NOT check for conflicts at insert time (pure optimistic).
@@ -2805,9 +2808,9 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                 let RowKey::Record(sortable_key) = row.id.row_id else {
                     panic!("Index writes must be to a record");
                 };
-                let sortable_key = self.get_or_create_index_key_arc(index_id, sortable_key);
-                tx.record_created_index_version((index_id, sortable_key.clone()), version_id);
-                self.insert_index_version(index_id, sortable_key, row_version);
+                let canonical_key =
+                    self.insert_index_version(index_id, Arc::new(sortable_key), row_version);
+                tx.record_created_index_version((index_id, canonical_key), version_id);
             }
             None => {
                 tx.record_created_table_version(id.clone(), version_id);
@@ -2852,10 +2855,10 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                 let RowKey::Record(sortable_key) = row.id.row_id else {
                     panic!("Index writes must be to a record");
                 };
-                let sortable_key = self.get_or_create_index_key_arc(index_id, sortable_key);
                 tx.insert_to_write_set(id);
-                tx.record_created_index_version((index_id, sortable_key.clone()), version_id);
-                self.insert_index_version(index_id, sortable_key, row_version);
+                let canonical_key =
+                    self.insert_index_version(index_id, Arc::new(sortable_key), row_version);
+                tx.record_created_index_version((index_id, canonical_key), version_id);
             }
             None => {
                 let version_id = self.get_version_id();
@@ -4345,17 +4348,29 @@ impl<Clock: LogicalClock> MvStore<Clock> {
         existing.unwrap_or_else(|| Arc::new(key))
     }
 
+    /// Inserts (or appends to) the version chain for an index entry and returns
+    /// the canonical `Arc<SortableIndexKey>` that ended up in the SkipMap.
+    ///
+    /// Callers that previously did `get_or_create_index_key_arc` followed by
+    /// `insert_index_version` were paying for two SkipMap traversals; the
+    /// canonical Arc is now produced as a side effect of the single
+    /// `get_or_insert_with` traversal here, so they can drop the prelude.
     pub fn insert_index_version(
         &self,
         index_id: MVTableId,
         key: Arc<SortableIndexKey>,
         row_version: RowVersion,
-    ) {
+    ) -> Arc<SortableIndexKey> {
         let index = self.index_rows.get_or_insert_with(index_id, SkipMap::new);
         let index = index.value();
-        let versions = index.get_or_insert_with(key, || RwLock::new(Vec::new()));
-        let mut versions = versions.value().write();
+        let entry = index.get_or_insert_with(key, || RwLock::new(Vec::new()));
+        // The Arc that's actually stored in the SkipMap may be the one we
+        // passed in (on miss) or a pre-existing one (on hit). Return that
+        // canonical Arc so savepoint tracking and the SkipMap stay in sync.
+        let canonical_key = entry.key().clone();
+        let mut versions = entry.value().write();
         self.insert_version_raw(&mut versions, row_version);
+        canonical_key
     }
 
     /// Inserts a new row version into the internal data structure for versions,
@@ -5097,9 +5112,11 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                     let RowKey::Record(sortable_key) = rowid.row_id.clone() else {
                         panic!("Index writes must be to a record");
                     };
-                    let sortable_key =
-                        self.get_or_create_index_key_arc(rowid.table_id, sortable_key);
-                    self.insert_index_version(rowid.table_id, sortable_key, row_version);
+                    self.insert_index_version(
+                        rowid.table_id,
+                        Arc::new(sortable_key),
+                        row_version,
+                    );
                 }
                 StreamingResult::DeleteIndexRow {
                     row,
