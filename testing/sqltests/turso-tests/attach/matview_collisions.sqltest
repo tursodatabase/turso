@@ -1,0 +1,87 @@
+@database :memory:
+@requires-file materialized_views ""
+@skip-file-if mvcc "materialized_views not supported with mvcc"
+
+# Regression tests for #6273: a materialized view in the *main* database must not
+# block INSERT / UPDATE / DELETE on a regular, same-named table that lives in an
+# attached database (and vice versa). Materialized views live in their owning
+# schema only, so the matview check needs to dispatch on the resolved
+# `database_id` of the target table rather than always reading from the main
+# database's schema.
+
+# DELETE on aux.mv1 must succeed even though main has a materialized view with
+# the same name targeting an unrelated source table.
+test attach-matview-collision-delete-aux-table {
+    ATTACH ':memory:' AS aux;
+    CREATE TABLE aux.mv1 (id INTEGER PRIMARY KEY, val TEXT);
+    INSERT INTO aux.mv1 VALUES (1, 'hello'), (2, 'world');
+    CREATE TABLE main.t1 (id INTEGER PRIMARY KEY, val INTEGER);
+    INSERT INTO main.t1 VALUES (1, 10);
+    CREATE MATERIALIZED VIEW mv1 AS SELECT * FROM main.t1;
+    DELETE FROM aux.mv1 WHERE id = 1;
+    SELECT id, val FROM aux.mv1 ORDER BY id;
+}
+expect {
+    2|world
+}
+
+# UPDATE on aux.mv1 must succeed under the same shadowing.
+test attach-matview-collision-update-aux-table {
+    ATTACH ':memory:' AS aux;
+    CREATE TABLE aux.mv1 (id INTEGER PRIMARY KEY, val TEXT);
+    INSERT INTO aux.mv1 VALUES (1, 'hello');
+    CREATE TABLE main.t1 (id INTEGER PRIMARY KEY, val INTEGER);
+    INSERT INTO main.t1 VALUES (1, 10);
+    CREATE MATERIALIZED VIEW mv1 AS SELECT * FROM main.t1;
+    UPDATE aux.mv1 SET val = 'updated' WHERE id = 1;
+    SELECT id, val FROM aux.mv1 ORDER BY id;
+}
+expect {
+    1|updated
+}
+
+# INSERT on aux.mv1 must succeed under the same shadowing.
+test attach-matview-collision-insert-aux-table {
+    ATTACH ':memory:' AS aux;
+    CREATE TABLE aux.mv1 (id INTEGER PRIMARY KEY, val TEXT);
+    INSERT INTO aux.mv1 VALUES (1, 'hello');
+    CREATE TABLE main.t1 (id INTEGER PRIMARY KEY, val INTEGER);
+    INSERT INTO main.t1 VALUES (1, 10);
+    CREATE MATERIALIZED VIEW mv1 AS SELECT * FROM main.t1;
+    INSERT INTO aux.mv1 VALUES (2, 'world');
+    SELECT id, val FROM aux.mv1 ORDER BY id;
+}
+expect {
+    1|hello
+    2|world
+}
+
+# Symmetric case: a materialized view in `aux` must not block DML against a
+# same-named regular table in `main`.
+test attach-matview-collision-write-main-table-aux-mv-shadow {
+    ATTACH ':memory:' AS aux;
+    CREATE TABLE main.mv2 (id INTEGER PRIMARY KEY, val TEXT);
+    INSERT INTO main.mv2 VALUES (1, 'orig');
+    CREATE TABLE aux.src (id INTEGER PRIMARY KEY, val INTEGER);
+    INSERT INTO aux.src VALUES (1, 99);
+    CREATE MATERIALIZED VIEW aux.mv2 AS SELECT * FROM aux.src;
+    INSERT INTO main.mv2 VALUES (2, 'second');
+    UPDATE main.mv2 SET val = 'patched' WHERE id = 1;
+    DELETE FROM main.mv2 WHERE id = 2;
+    SELECT id, val FROM main.mv2 ORDER BY id;
+}
+expect {
+    1|patched
+}
+
+# Sanity: when the target *is* a materialized view, the DML guard must still
+# fire. We only relax the check across schema boundaries.
+test attach-matview-collision-still-blocks-real-mv-target {
+    CREATE TABLE main.t1 (id INTEGER PRIMARY KEY, val INTEGER);
+    INSERT INTO main.t1 VALUES (1, 10);
+    CREATE MATERIALIZED VIEW mv1 AS SELECT * FROM main.t1;
+    DELETE FROM main.mv1 WHERE id = 1;
+}
+expect error {
+    cannot modify materialized view mv1
+}
