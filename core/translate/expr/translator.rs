@@ -98,6 +98,14 @@ pub fn translate_expr(
     target_register: usize,
     resolver: &Resolver,
 ) -> Result<usize> {
+    let mut expr = expr;
+    while let ast::Expr::Parenthesized(exprs) = expr {
+        if exprs.len() != 1 {
+            break;
+        }
+        expr = exprs[0].as_ref();
+    }
+
     let constant_span = if expr.is_constant(resolver) {
         if !program.constant_span_is_open() {
             Some(program.constant_span_start())

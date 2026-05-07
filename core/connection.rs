@@ -3430,6 +3430,16 @@ mod tests {
         }
     }
 
+    fn query_single_text(conn: &Arc<Connection>, sql: &str) -> String {
+        let mut stmt = conn.prepare(sql).unwrap();
+        match stmt.step().unwrap() {
+            StepResult::Row => {
+                text_value(stmt.row().unwrap().get::<&Value>(0).unwrap()).to_string()
+            }
+            other => panic!("expected a row, got {other:?}"),
+        }
+    }
+
     fn text_value(value: &Value) -> &str {
         match value {
             Value::Text(text) => text.as_str(),
@@ -3486,6 +3496,34 @@ mod tests {
         let second_db = Database::open_file(io, ":memory:reopen").unwrap();
         let second = second_db.connect().unwrap();
         assert_eq!(query_single_i64(&second, "SELECT x FROM t"), 99);
+    }
+
+    #[test]
+    fn test_generated_column_with_nested_parentheses_and_coalesce() {
+        let temp_dir = TempDir::new().unwrap();
+        let db_path = temp_dir.path().join("generated_parenthesized.db");
+        let conn =
+            open_connection_with_opts(&db_path, DatabaseOpts::new().with_generated_columns(true));
+
+        conn.execute(
+            "CREATE TABLE t(
+                id INTEGER PRIMARY KEY,
+                a INTEGER,
+                b INTEGER,
+                c TEXT,
+                w TEXT GENERATED ALWAYS AS (c || ((a + coalesce(b, 0)) % 5)) VIRTUAL
+            )",
+        )
+        .unwrap();
+        conn.execute("INSERT INTO t(a, b, c) VALUES (1, 2, 'x')")
+            .unwrap();
+
+        assert_eq!(query_single_text(&conn, "SELECT w FROM t"), "x3");
+
+        conn.execute("CREATE INDEX idx_w ON t(w)").unwrap();
+        conn.execute("UPDATE t SET a = -36, b = 11 WHERE b IS NULL")
+            .unwrap();
+        assert_eq!(query_single_text(&conn, "PRAGMA integrity_check"), "ok");
     }
 
     #[test]
