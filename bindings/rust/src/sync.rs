@@ -27,6 +27,15 @@ pub use turso_sync_sdk_kit::rsapi::PartialSyncOpts;
 // Constants used across the sync module
 const DEFAULT_CLIENT_NAME: &str = "turso-sync-rust";
 
+/// Future returned by an auth token provider. Resolves to a bearer token string
+/// (without the `Bearer ` prefix — that prefix is added when building the header).
+pub type AuthTokenFut = Pin<Box<dyn Future<Output = Result<String>> + Send + 'static>>;
+
+/// Async callback that produces an auth token on demand. Invoked before every
+/// HTTP request issued by the sync engine, so it can return a freshly-rotated
+/// token (e.g. fetched from a secrets manager or refreshed via OAuth).
+pub type AuthTokenFn = Arc<dyn Fn() -> AuthTokenFut + Send + Sync + 'static>;
+
 /// Encryption cipher for Turso Cloud remote encryption.
 /// These match the server-side encryption settings.
 #[derive(Debug, Clone, Copy)]
@@ -81,8 +90,8 @@ pub struct Builder {
     path: String,
     // Remote URL base. Supports https://, http:// and libsql:// (translated to https://).
     remote_url: Option<String>,
-    // Optional authorization token (e.g., Bearer token).
-    auth_token: Option<String>,
+    // Optional authorization token provider (static string or async callback).
+    auth_token: Option<AuthTokenFn>,
     // Optional custom client identifier used by the sync engine for telemetry/tracing.
     client_name: Option<String>,
     // Optional long-poll timeout when waiting for server changes.
@@ -122,7 +131,28 @@ impl Builder {
 
     // Set optional authorization token for HTTP requests.
     pub fn with_auth_token(mut self, token: impl Into<String>) -> Self {
-        self.auth_token = Some(token.into());
+        let token = token.into();
+        self.auth_token = Some(Arc::new(move || {
+            let token = token.clone();
+            Box::pin(async move { Ok(token) })
+        }));
+        self
+    }
+
+    /// Set an async callback that produces an auth token on demand.
+    ///
+    /// The callback is invoked before every HTTP request, so it can return a
+    /// freshly rotated token (e.g. fetched from a secrets manager or refreshed
+    /// via OAuth). If the callback returns an error, the in-flight sync
+    /// operation fails with that error.
+    ///
+    /// Calling this overrides any previously configured static token.
+    pub fn with_auth_token_fn<F, Fut>(mut self, f: F) -> Self
+    where
+        F: Fn() -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<String>> + Send + 'static,
+    {
+        self.auth_token = Some(Arc::new(move || Box::pin(f())));
         self
     }
 
@@ -424,8 +454,8 @@ struct IoWorker {
     sync: Arc<turso_sync_sdk_kit::rsapi::TursoDatabaseSync<Bytes>>,
     // Normalized base URL (http/https).
     base_url: Option<String>,
-    // Optional auth token.
-    auth_token: Option<String>,
+    // Optional auth token provider (resolved per request).
+    auth_token: Option<AuthTokenFn>,
     // Channel to wake the worker to process IO.
     tx: mpsc::UnboundedSender<()>,
     // Wakers to notify pending futures when IO makes progress.
@@ -436,7 +466,7 @@ impl IoWorker {
     fn spawn(
         sync: Arc<turso_sync_sdk_kit::rsapi::TursoDatabaseSync<Bytes>>,
         base_url: Option<String>,
-        auth_token: Option<String>,
+        auth_token: Option<AuthTokenFn>,
     ) -> Arc<Self> {
         let (tx, rx) = mpsc::unbounded_channel::<()>();
         let wakers = Arc::new(Mutex::new(Vec::new()));
@@ -597,6 +627,21 @@ impl IoWorker {
             format!("{url}{p}")
         };
 
+        // Resolve auth token (may fail if a dynamic provider returns an error).
+        // Resolved here rather than once at spawn so dynamic providers can rotate
+        // the token between requests.
+        let auth_token = match &this.auth_token {
+            Some(provider) => match provider().await {
+                Ok(token) => Some(token),
+                Err(err) => {
+                    completion.poison(format!("failed to resolve auth token: {err}"));
+                    this.sync.step_io_callbacks();
+                    return;
+                }
+            },
+            None => None,
+        };
+
         let mut builder = Request::builder().method(method).uri(&full_url);
 
         // Set headers from request
@@ -609,7 +654,7 @@ impl IoWorker {
                 }
             }
             // Add Authorization header if not already set
-            if let Some(token) = &this.auth_token {
+            if let Some(token) = &auth_token {
                 if !headers_map.contains_key(AUTHORIZATION) {
                     let value = format!("Bearer {token}");
                     if let Ok(hv) = hyper::header::HeaderValue::try_from(value.as_str()) {
