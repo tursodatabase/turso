@@ -371,6 +371,7 @@ impl Connection {
             .with_index_method(self.db.experimental_index_method_enabled())
             .with_vacuum(self.db.experimental_vacuum_enabled())
             .with_generated_columns(self.db.experimental_generated_columns_enabled())
+            .with_without_rowid(self.db.experimental_without_rowid_enabled())
     }
 
     fn effective_temp_store(&self) -> crate::TempStore {
@@ -2006,6 +2007,10 @@ impl Connection {
         self.db.experimental_generated_columns_enabled()
     }
 
+    pub fn experimental_without_rowid_enabled(&self) -> bool {
+        self.db.experimental_without_rowid_enabled()
+    }
+
     pub fn mvcc_enabled(&self) -> bool {
         self.db.mvcc_enabled()
     }
@@ -2458,7 +2463,8 @@ impl Connection {
             .with_custom_types(self.db.experimental_custom_types_enabled())
             .with_index_method(self.db.experimental_index_method_enabled())
             .with_vacuum(self.db.experimental_vacuum_enabled())
-            .with_generated_columns(self.db.experimental_generated_columns_enabled());
+            .with_generated_columns(self.db.experimental_generated_columns_enabled())
+            .with_without_rowid(self.db.experimental_without_rowid_enabled());
         // Select the IO layer for the attached database:
         // - :memory: databases always get a fresh MemoryIO
         // - File-based databases reuse the parent's IO when the parent is also

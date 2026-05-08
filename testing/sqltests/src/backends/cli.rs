@@ -21,6 +21,7 @@ const TURSO_CLI_EXPERIMENTAL_FLAGS: &[&str] = &[
     "--experimental-index-method",
     "--experimental-generated-columns",
     "--experimental-vacuum",
+    "--experimental-without-rowid",
 ];
 
 /// CLI backend that executes SQL via the tursodb CLI tool

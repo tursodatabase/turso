@@ -147,6 +147,7 @@ pub struct Builder {
     enable_vacuum: bool,
     enable_generated_columns: bool,
     enable_multiprocess_wal: bool,
+    enable_without_rowid: bool,
     vfs: Option<String>,
     encryption_opts: Option<turso_sdk_kit::rsapi::EncryptionOpts>,
     io: Option<Arc<dyn turso_core::IO>>,
@@ -165,6 +166,7 @@ impl Builder {
             enable_vacuum: false,
             enable_generated_columns: false,
             enable_multiprocess_wal: false,
+            enable_without_rowid: false,
             vfs: None,
             encryption_opts: None,
             io: None,
@@ -226,6 +228,11 @@ impl Builder {
         self
     }
 
+    pub fn experimental_without_rowid(mut self, enabled: bool) -> Self {
+        self.enable_without_rowid = enabled;
+        self
+    }
+
     pub fn with_io(mut self, vfs: String) -> Self {
         self.vfs = Some(vfs);
         self
@@ -262,6 +269,9 @@ impl Builder {
         }
         if self.enable_multiprocess_wal {
             features.push("multiprocess_wal");
+        }
+        if self.enable_without_rowid {
+            features.push("without_rowid");
         }
         if features.is_empty() {
             return None;
