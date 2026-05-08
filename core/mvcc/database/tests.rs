@@ -6869,6 +6869,54 @@ fn test_delete_btree_resident_row_is_skipped_by_desc_unique_index_scan() {
     assert_eq!(&rows[0][0].to_string(), "ok");
 }
 
+/// Regression test for issue #5935: a reverse (DESC) index scan inside a
+/// `BEGIN CONCURRENT` snapshot must not observe rows inserted and committed
+/// by another transaction after the snapshot started. The same root cause
+/// also produced phantom NULL results from `MAX()` on an indexed column.
+#[test]
+fn test_desc_index_scan_respects_mvcc_snapshot_for_concurrent_insert() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+
+    let setup = db.connect();
+    setup.execute("CREATE TABLE t(id INT, val INT)").unwrap();
+    setup.execute("CREATE INDEX idx_val ON t(val)").unwrap();
+    setup.execute("INSERT INTO t VALUES (1, 10)").unwrap();
+    setup.execute("INSERT INTO t VALUES (2, 20)").unwrap();
+    setup.execute("INSERT INTO t VALUES (3, 30)").unwrap();
+
+    let reader = db.connect();
+    reader.execute("BEGIN CONCURRENT").unwrap();
+    let rows = get_rows(
+        &reader,
+        "SELECT id, val FROM t WHERE val > 10 ORDER BY val DESC",
+    );
+    assert_eq!(rows.len(), 2);
+
+    let writer = db.connect();
+    writer.execute("BEGIN CONCURRENT").unwrap();
+    writer.execute("INSERT INTO t VALUES (4, 100)").unwrap();
+    writer.execute("COMMIT").unwrap();
+
+    let rows = get_rows(
+        &reader,
+        "SELECT id, val FROM t WHERE val > 10 ORDER BY val DESC",
+    );
+    assert_eq!(
+        rows.len(),
+        2,
+        "DESC scan must still see 2 rows from snapshot"
+    );
+    assert_eq!(rows[0][1].as_int().unwrap(), 30);
+    assert_eq!(rows[1][1].as_int().unwrap(), 20);
+
+    let rows = get_rows(&reader, "SELECT MAX(val) FROM t");
+    assert_eq!(
+        rows[0][0].as_int().unwrap(),
+        30,
+        "MAX must still be 30 from snapshot"
+    );
+}
+
 /// Test DELETE all B-tree rows and re-insert with same IDs in MVCC.
 /// Verifies tombstones correctly shadow B-tree and new rows are visible.
 ///
