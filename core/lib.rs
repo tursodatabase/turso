@@ -206,6 +206,7 @@ pub struct DatabaseOpts {
     pub enable_attach: bool,
     pub enable_generated_columns: bool,
     pub enable_multiprocess_wal: bool,
+    pub enable_without_rowid: bool,
     pub unsafe_testing: bool,
     enable_load_extension: bool,
 }
@@ -263,6 +264,11 @@ impl DatabaseOpts {
 
     pub fn with_multiprocess_wal(mut self, enable: bool) -> Self {
         self.enable_multiprocess_wal = enable;
+        self
+    }
+
+    pub fn with_without_rowid(mut self, enable: bool) -> Self {
+        self.enable_without_rowid = enable;
         self
     }
 
@@ -2406,6 +2412,10 @@ impl Database {
 
     pub fn experimental_multiprocess_wal_enabled(&self) -> bool {
         self.opts.enable_multiprocess_wal
+    }
+
+    pub fn experimental_without_rowid_enabled(&self) -> bool {
+        self.opts.enable_without_rowid
     }
 
     /// check if database is currently in MVCC mode

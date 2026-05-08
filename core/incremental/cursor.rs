@@ -397,6 +397,7 @@ mod tests {
                 enable_attach: false,
                 enable_generated_columns: false,
                 enable_multiprocess_wal: false,
+                enable_without_rowid: false,
                 unsafe_testing: false,
             },
             None,

@@ -659,6 +659,7 @@ impl TursoDatabase {
                                 "attach" => opts.with_attach(true),
                                 "generated_columns" => opts.with_generated_columns(true),
                                 "multiprocess_wal" => opts.with_multiprocess_wal(true),
+                                "without_rowid" => opts.with_without_rowid(true),
                                 _ => opts,
                             };
                         }
