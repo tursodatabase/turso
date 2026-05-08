@@ -1841,6 +1841,10 @@ pub enum PragmaName {
     WalCheckpoint,
     /// Sets or queries the threshold (in bytes) at which MVCC triggers an automatic checkpoint.
     MvccCheckpointThreshold,
+    /// Sets or queries the maximum number of VDBE step-loop iterations within a
+    /// single `step()` call before the program preemptively yields back to the
+    /// cooperative scheduler. `0` disables preemptive yielding.
+    VdbeYieldInterval,
     /// List all available types (built-in and custom)
     ListTypes,
     /// Deprecated no-op: control whether callback is invoked for empty result sets

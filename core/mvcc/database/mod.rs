@@ -5112,11 +5112,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                     let RowKey::Record(sortable_key) = rowid.row_id.clone() else {
                         panic!("Index writes must be to a record");
                     };
-                    self.insert_index_version(
-                        rowid.table_id,
-                        Arc::new(sortable_key),
-                        row_version,
-                    );
+                    self.insert_index_version(rowid.table_id, Arc::new(sortable_key), row_version);
                 }
                 StreamingResult::DeleteIndexRow {
                     row,

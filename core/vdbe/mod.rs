@@ -1493,6 +1493,8 @@ impl Program {
         waker: Option<&Waker>,
     ) -> Result<StepResult> {
         let enable_tracing = tracing::enabled!(tracing::Level::TRACE);
+        let yield_interval = self.connection.get_vdbe_yield_interval();
+        let mut iters_since_yield: u64 = 0;
         loop {
             if self.connection.is_closed() {
                 // Connection is closed for whatever reason, rollback the transaction.
@@ -1505,6 +1507,17 @@ impl Program {
             if self.maybe_request_interrupt(state, pager.io.as_ref()) {
                 self.abort(pager, None, state)?;
                 return Ok(StepResult::Interrupt);
+            }
+
+            // Preemptive yield: if we've iterated for too long without any
+            // natural I/O wait, return control to the cooperative scheduler so
+            // other connections can make progress. The next `step()` call will
+            // resume at the same `state.pc`.
+            if yield_interval > 0 && iters_since_yield >= yield_interval {
+                let yield_completion =
+                    crate::types::IOCompletions::Single(crate::io::Completion::new_yield());
+                yield_completion.set_waker(waker);
+                return Ok(StepResult::IO);
             }
 
             if let Some(io) = &state.io_completions {
@@ -1546,6 +1559,7 @@ impl Program {
             }
             // Always increment VM steps for every loop iteration
             state.metrics.vm_steps = state.metrics.vm_steps.saturating_add(1);
+            iters_since_yield = iters_since_yield.saturating_add(1);
 
             match insn_function(self, state, insn, pager) {
                 Ok(InsnFunctionStepResult::Step) => {

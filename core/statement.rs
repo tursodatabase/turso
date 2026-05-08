@@ -1092,4 +1092,84 @@ mod tests {
             "cumulative metrics should include root and trigger writes"
         );
     }
+
+    #[test]
+    fn test_vdbe_yield_interval_default_is_zero() {
+        let conn = open_test_connection().unwrap();
+        assert_eq!(conn.get_vdbe_yield_interval(), 0);
+        let rows = count_pragma_int(&conn, "PRAGMA vdbe_yield_interval");
+        assert_eq!(rows, 0);
+    }
+
+    fn count_pragma_int(conn: &Arc<crate::Connection>, sql: &str) -> i64 {
+        let mut stmt = conn.prepare(sql).unwrap();
+        loop {
+            match stmt.step().unwrap() {
+                vdbe::StepResult::Row => {
+                    let row = stmt.row().unwrap();
+                    let value = row.get_values().next().unwrap().to_owned();
+                    match value {
+                        crate::Value::Numeric(crate::numeric::Numeric::Integer(i)) => return i,
+                        other => panic!("expected integer, got {other:?}"),
+                    }
+                }
+                vdbe::StepResult::IO => conn.get_pager().io.step().unwrap(),
+                vdbe::StepResult::Done => panic!("no row produced"),
+                _ => panic!("unexpected step result"),
+            }
+        }
+    }
+
+    #[test]
+    fn test_vdbe_yield_interval_set_via_pragma() {
+        let conn = open_test_connection().unwrap();
+        conn.execute("PRAGMA vdbe_yield_interval=128").unwrap();
+        assert_eq!(conn.get_vdbe_yield_interval(), 128);
+        conn.execute("PRAGMA vdbe_yield_interval=0").unwrap();
+        assert_eq!(conn.get_vdbe_yield_interval(), 0);
+    }
+
+    fn run_counting_io(conn: &Arc<crate::Connection>, sql: &str) -> (u64, u64) {
+        let mut stmt = conn.prepare(sql).unwrap();
+        let mut io_returns: u64 = 0;
+        loop {
+            match stmt.step().unwrap() {
+                vdbe::StepResult::Done => break,
+                vdbe::StepResult::IO => {
+                    io_returns += 1;
+                    conn.get_pager().io.step().unwrap();
+                }
+                vdbe::StepResult::Row => {}
+                _ => panic!("unexpected step result"),
+            }
+        }
+        (io_returns, stmt.metrics().vm_steps)
+    }
+
+    #[test]
+    fn test_vdbe_yield_interval_yields_periodically() {
+        let conn = open_test_connection().unwrap();
+        conn.execute("CREATE TABLE t(x)").unwrap();
+        for i in 0..500 {
+            conn.execute(format!("INSERT INTO t VALUES ({i})"))
+                .unwrap();
+        }
+        // sum(x) iterates one VDBE step per row, unlike count(*) which has a
+        // fast path.
+        let sql = "SELECT sum(x) FROM t";
+
+        conn.set_vdbe_yield_interval(0);
+        let (baseline_io, baseline_vm_steps) = run_counting_io(&conn, sql);
+
+        conn.set_vdbe_yield_interval(8);
+        let (io_with_yield, yield_vm_steps) = run_counting_io(&conn, sql);
+
+        // We expect roughly vm_steps / interval preemptive yields. Allow a wide
+        // band to absorb prologue/epilogue iterations and any natural IO.
+        let expected_min_yields = yield_vm_steps / 16;
+        assert!(
+            io_with_yield > baseline_io + expected_min_yields,
+            "expected at least {expected_min_yields} extra yields, got {io_with_yield} (baseline {baseline_io}, vm_steps {yield_vm_steps} vs baseline {baseline_vm_steps})"
+        );
+    }
 }

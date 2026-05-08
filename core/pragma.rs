@@ -178,6 +178,10 @@ pub fn pragma_for(pragma: &PragmaName) -> Pragma {
             PragmaFlags::NoColumns1 | PragmaFlags::Result0,
             &["mvcc_checkpoint_threshold"],
         ),
+        VdbeYieldInterval => Pragma::new(
+            PragmaFlags::NoColumns1 | PragmaFlags::Result0,
+            &["vdbe_yield_interval"],
+        ),
         ForeignKeys => Pragma::new(
             PragmaFlags::NoColumns1 | PragmaFlags::Result0,
             &["foreign_keys"],

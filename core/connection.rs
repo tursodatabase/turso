@@ -247,6 +247,10 @@ pub struct Connection {
     /// Maximum execution time for a single statement on this connection.
     /// `Duration::ZERO` means disabled.
     pub(super) query_timeout_ms: AtomicU64,
+    /// Maximum number of VDBE step-loop iterations within a single `step()` call
+    /// before the program preemptively yields back to the cooperative scheduler.
+    /// `0` disables preemptive yielding (default).
+    pub(super) vdbe_yield_interval: AtomicU64,
     /// True when sqlite3_interrupt()-style cancellation is pending for active root statements.
     pub(super) interrupt_requested: AtomicBool,
     /// Whether this is an internal connection used for MVCC bootstrap
@@ -2983,6 +2987,18 @@ impl Connection {
     /// Get the query timeout duration.
     pub fn get_query_timeout(&self) -> Duration {
         Duration::from_millis(self.query_timeout_ms.load(Ordering::SeqCst))
+    }
+
+    /// Sets the maximum number of VDBE step-loop iterations within a single
+    /// `step()` call before the program preemptively yields back to the
+    /// cooperative scheduler. `0` disables preemptive yielding.
+    pub fn set_vdbe_yield_interval(&self, interval: u64) {
+        self.vdbe_yield_interval.store(interval, Ordering::Relaxed);
+    }
+
+    /// Get the VDBE preemptive yield interval. `0` means disabled.
+    pub fn get_vdbe_yield_interval(&self) -> u64 {
+        self.vdbe_yield_interval.load(Ordering::Relaxed)
     }
 
     /// Get a reference to the busy handler.

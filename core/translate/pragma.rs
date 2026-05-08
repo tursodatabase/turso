@@ -684,6 +684,15 @@ fn update_pragma(
             connection.set_mvcc_checkpoint_threshold(threshold)?;
             Ok(TransactionMode::None)
         }
+        PragmaName::VdbeYieldInterval => {
+            let interval = match parse_signed_number(&value)? {
+                Value::Numeric(Numeric::Integer(i)) if i >= 0 => i as u64,
+                Value::Numeric(Numeric::Float(f)) if f64::from(f) >= 0.0 => f64::from(f) as u64,
+                _ => bail_parse_error!("vdbe_yield_interval must be a non-negative integer"),
+            };
+            connection.set_vdbe_yield_interval(interval);
+            Ok(TransactionMode::None)
+        }
         PragmaName::ForeignKeys => {
             let enabled = parse_pragma_enabled(&value);
             connection.set_foreign_keys_enabled(enabled);
@@ -1503,6 +1512,12 @@ fn query_pragma(
             let threshold = connection.mvcc_checkpoint_threshold()?;
             let register = program.alloc_register();
             program.emit_int(threshold, register);
+            program.emit_result_row(register, 1);
+            program.add_pragma_result_column(pragma.to_string());
+            Ok(TransactionMode::None)
+        }
+        PragmaName::VdbeYieldInterval => {
+            program.emit_int(connection.get_vdbe_yield_interval() as i64, register);
             program.emit_result_row(register, 1);
             program.add_pragma_result_column(pragma.to_string());
             Ok(TransactionMode::None)
