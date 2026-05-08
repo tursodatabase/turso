@@ -194,7 +194,7 @@ fn bench_create_index(criterion: &mut Criterion) {
             let (db, conn) = open_limbo(&temp_dir);
             populate_limbo(&db, &conn, row_count);
 
-            group.bench_function(BenchmarkId::new("limbo", row_count), |b| {
+            group.bench_function(BenchmarkId::new("limbo_create_index", row_count), |b| {
                 b.iter_custom(|iters| {
                     let mut total = std::time::Duration::ZERO;
                     for _ in 0..iters {
@@ -263,20 +263,23 @@ fn bench_create_index_commit(criterion: &mut Criterion) {
             let (db, conn) = open_limbo(&temp_dir);
             populate_limbo(&db, &conn, row_count);
 
-            group.bench_function(BenchmarkId::new("limbo", row_count), |b| {
-                b.iter_custom(|iters| {
-                    let mut total = std::time::Duration::ZERO;
-                    for _ in 0..iters {
-                        let start = std::time::Instant::now();
-                        exec_limbo(&conn, &db, "BEGIN");
-                        exec_limbo(&conn, &db, "CREATE INDEX idx_val ON t(val)");
-                        exec_limbo(&conn, &db, "COMMIT");
-                        total += start.elapsed();
-                        exec_limbo(&conn, &db, "DROP INDEX idx_val");
-                    }
-                    total
-                });
-            });
+            group.bench_function(
+                BenchmarkId::new("limbo_create_index_commit", row_count),
+                |b| {
+                    b.iter_custom(|iters| {
+                        let mut total = std::time::Duration::ZERO;
+                        for _ in 0..iters {
+                            let start = std::time::Instant::now();
+                            exec_limbo(&conn, &db, "BEGIN");
+                            exec_limbo(&conn, &db, "CREATE INDEX idx_val ON t(val)");
+                            exec_limbo(&conn, &db, "COMMIT");
+                            total += start.elapsed();
+                            exec_limbo(&conn, &db, "DROP INDEX idx_val");
+                        }
+                        total
+                    });
+                },
+            );
             drop(conn);
             drop(db);
             drop(temp_dir);
