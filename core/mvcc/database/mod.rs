@@ -1029,6 +1029,15 @@ pub struct DeleteRowStateMachine {
 }
 
 impl<Clock: LogicalClock> CommitStateMachine<Clock> {
+    pub(crate) fn cleanup_mvcc_checkpoint_state(&mut self) {
+        if let CommitState::Checkpoint { state_machine } = &mut self.state {
+            state_machine
+                .lock()
+                .inner_mut()
+                .cleanup_after_external_io_error();
+        }
+    }
+
     fn new(
         state: CommitState<Clock>,
         tx_id: TxID,
@@ -5112,11 +5121,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                     let RowKey::Record(sortable_key) = rowid.row_id.clone() else {
                         panic!("Index writes must be to a record");
                     };
-                    self.insert_index_version(
-                        rowid.table_id,
-                        Arc::new(sortable_key),
-                        row_version,
-                    );
+                    self.insert_index_version(rowid.table_id, Arc::new(sortable_key), row_version);
                 }
                 StreamingResult::DeleteIndexRow {
                     row,
