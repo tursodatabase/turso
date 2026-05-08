@@ -1,0 +1,32 @@
+---
+source: parenthesized_from.sqltest
+expression: SELECT a.x, b.y FROM a INNER JOIN b ON a.x = b.ax;
+info:
+  statement_type: SELECT
+  tables:
+  - a
+  - a.x
+  - b
+  setup_blocks:
+  - schema
+  database: ':memory:'
+---
+QUERY PLAN
+|--SCAN b
+`--SEARCH a USING INTEGER PRIMARY KEY (rowid=?)
+
+BYTECODE
+addr  opcode       p1  p2  p3  p4        p5  comment
+   0  Init          0  11   0             0  Start at 11
+   1  OpenRead      0   2   0  k(1,B)     0  table=a, root=2, iDb=0
+   2  OpenRead      1   3   0  k(2,B,B)   0  table=b, root=3, iDb=0
+   3  Rewind        1  10   0             0  Rewind table b
+   4    Column      1   1   3             0  r[3]=b.ax
+   5    SeekRowid   0   3   9             0  if (r[3]!=cursor 0 for table a.rowid) goto 9
+   6    RowId       0   1   0             0  r[1]=a.rowid
+   7    RowId       1   2   0             0  r[2]=b.rowid
+   8    ResultRow   1   2   0             0  output=r[1..2]
+   9  Next          1   4   0             0
+  10  Halt          0   0   0             0
+  11  Transaction   0   1   3             0  iDb=0 tx_mode=Read
+  12  Goto          0   1   0             0

@@ -1,0 +1,77 @@
+---
+source: parenthesized_from.sqltest
+expression: SELECT a.x, b.y FROM (a LEFT JOIN b ON a.x = b.ax);
+info:
+  statement_type: SELECT
+  tables:
+  - a.x
+  - b
+  setup_blocks:
+  - schema
+  database: ':memory:'
+---
+QUERY PLAN
+|--HASH JOIN b
+`--SCAN a
+
+BYTECODE
+addr  opcode               p1  p2  p3  p4                                     p5  comment
+   0    Init                0  57   0                                          0  Start at 57
+   1    OpenRead            0   2   0  k(1,B)                                  0  table=a, root=2, iDb=0
+   2    OpenRead            1   3   0  k(2,B,B)                                0  table=b, root=3, iDb=0
+   3    Integer             0   3   0                                          0  r[3]=0
+   4    Once               13   0   0                                          0  goto 13
+   5    OpenRead            2   2   0  k(1,B)                                  0  table=a, root=2, iDb=0
+   6    Rewind              2  12   0                                          0  Rewind table a
+   7      RowId             2   4   0                                          0  r[4]=a.rowid
+   8      Affinity          4   1   0                                          0  r[4..5] = C
+   9      RowId             2   5   0                                          0  r[5]=a.rowid
+  10      HashBuild         2   4   1  r=[1] budget=32768 payload=r[5]..r[5]   0
+  11    Next                2   7   0                                          0
+  12    HashBuildFinalize   1   0   0                                          0
+  13    HashResetMatched    1   0   0                                          0
+  14    Rewind              1  31   0                                          0  Rewind table b
+  15      Column            1   1   6                                          0  r[6]=b.ax
+  16      Affinity          6   1   0                                          0  r[6..7] = C
+  17      RowId             1   8   0                                          0  r[8]=b.rowid
+  18      Integer           0   9   0                                          0  r[9]=0
+  19      HashProbe         1   6   1  r[10]=30 payload=r[7]..r[7]             0
+  20      HashMarkMatched   1   0   0                                          0
+  21      Gosub            11  23   0                                          0
+  22      Goto              0  27   0                                          0
+  23      Copy              7   1   0                                          0  r[1]=r[7]
+  24      RowId             1   2   0                                          0  r[2]=b.rowid
+  25      ResultRow         1   2   0                                          0  output=r[1..2]
+  26    Return             11   0   0                                          0
+  27    IfPos               9  44   0                                          0  r[9]>0 -> r[9]-=0, goto 44
+  28    HashNext            1  10  30   payload=r[7]..r[7]                     0
+  29    Goto                0  20   0                                          0
+  30  Next                  1  15   0                                          0
+  31  NullRow               1   0   0                                          0  Set cursor 1 to a (pseudo) NULL row
+  32  HashScanUnmatched     1  10  37                                          0  hash_table_id=1 payload=r[7]..r[7]
+  33  SeekRowid             0  10  37                                          0  if (r[10]!=cursor 0 for table a.rowid) goto 37
+  34  Gosub                11  23   0                                          0
+  35  HashNextUnmatched     1  10  37                                          0  hash_table_id=1 payload=r[7]..r[7]
+  36  Goto                  0  33   0                                          0
+  37  HashGraceInit         1   0  55                                          0  hash_table_id=1
+  38  Integer               1   9   0                                          0  r[9]=1
+  39  HashGraceLoadPart     1   0  54                                          0  hash_table_id=1
+  40  HashGraceNextProbe    1   6  46                                          0  hash_table_id=1 keys=r[6]..r[6] probe_rowid_dest=r[8]
+  41  SeekRowid             1   8  40                                          0  if (r[8]!=cursor 1 for table b.rowid) goto 40
+  42  HashProbe             1   6   1  r[10]=40 payload=r[7]..r[7]             0
+  43  Goto                  0  20   0                                          0
+  44  HashNext              1  10  40   payload=r[7]..r[7]                     0
+  45  Goto                  0  20   0                                          0
+  46  NullRow               1   0   0                                          0  Set cursor 1 to a (pseudo) NULL row
+  47  HashScanUnmatched     1  10  52                                          0  hash_table_id=1 payload=r[7]..r[7]
+  48  SeekRowid             0  10  52                                          0  if (r[10]!=cursor 0 for table a.rowid) goto 52
+  49  Gosub                11  23   0                                          0
+  50  HashNextUnmatched     1  10  52                                          0  hash_table_id=1 payload=r[7]..r[7]
+  51  Goto                  0  48   0                                          0
+  52  HashGraceAdvPart      1   0  54                                          0  hash_table_id=1
+  53  Goto                  0  39   0                                          0
+  54  Integer               0   9   0                                          0  r[9]=0
+  55  HashClose             1   0   0                                          0
+  56  Halt                  0   0   0                                          0
+  57  Transaction           0   1   3                                          0  iDb=0 tx_mode=Read
+  58  Goto                  0   1   0                                          0
