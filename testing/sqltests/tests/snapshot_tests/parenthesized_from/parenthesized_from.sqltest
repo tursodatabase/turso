@@ -13,9 +13,14 @@
 @skip-file-if mvcc "mvcc has different cursor ids"
 
 setup schema {
+    -- Indexes on the join columns force an index-based plan instead of a
+    -- hash join, keeping the bytecode free of the environment-dependent
+    -- `budget=N` literal that HashBuild emits.
     CREATE TABLE a (x INTEGER PRIMARY KEY);
     CREATE TABLE b (y INTEGER PRIMARY KEY, ax INTEGER);
+    CREATE INDEX idx_b_ax ON b(ax);
     CREATE TABLE c (z INTEGER PRIMARY KEY, by_ INTEGER);
+    CREATE INDEX idx_c_by ON c(by_);
 }
 
 # Pair 1: paren wraps an INNER JOIN at the top of FROM.
