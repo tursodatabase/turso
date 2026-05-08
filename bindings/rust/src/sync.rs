@@ -27,6 +27,15 @@ pub use turso_sync_sdk_kit::rsapi::PartialSyncOpts;
 // Constants used across the sync module
 const DEFAULT_CLIENT_NAME: &str = "turso-sync-rust";
 
+/// Future returned by an auth token provider. Resolves to a bearer token string
+/// (without the `Bearer ` prefix — that prefix is added when building the header).
+pub type AuthTokenFut = Pin<Box<dyn Future<Output = Result<String>> + Send + 'static>>;
+
+/// Async callback that produces an auth token on demand. Invoked before every
+/// HTTP request issued by the sync engine, so it can return a freshly-rotated
+/// token (e.g. fetched from a secrets manager or refreshed via OAuth).
+pub type AuthTokenFn = Arc<dyn Fn() -> AuthTokenFut + Send + Sync + 'static>;
+
 /// Encryption cipher for Turso Cloud remote encryption.
 /// These match the server-side encryption settings.
 #[derive(Debug, Clone, Copy)]
@@ -81,8 +90,8 @@ pub struct Builder {
     path: String,
     // Remote URL base. Supports https://, http:// and libsql:// (translated to https://).
     remote_url: Option<String>,
-    // Optional authorization token (e.g., Bearer token).
-    auth_token: Option<String>,
+    // Optional authorization token provider (static string or async callback).
+    auth_token: Option<AuthTokenFn>,
     // Optional custom client identifier used by the sync engine for telemetry/tracing.
     client_name: Option<String>,
     // Optional long-poll timeout when waiting for server changes.
@@ -122,7 +131,28 @@ impl Builder {
 
     // Set optional authorization token for HTTP requests.
     pub fn with_auth_token(mut self, token: impl Into<String>) -> Self {
-        self.auth_token = Some(token.into());
+        let token = token.into();
+        self.auth_token = Some(Arc::new(move || {
+            let token = token.clone();
+            Box::pin(async move { Ok(token) })
+        }));
+        self
+    }
+
+    /// Set an async callback that produces an auth token on demand.
+    ///
+    /// The callback is invoked before every HTTP request, so it can return a
+    /// freshly rotated token (e.g. fetched from a secrets manager or refreshed
+    /// via OAuth). If the callback returns an error, the in-flight sync
+    /// operation fails with that error.
+    ///
+    /// Calling this overrides any previously configured static token.
+    pub fn with_auth_token_fn<F, Fut>(mut self, f: F) -> Self
+    where
+        F: Fn() -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<String>> + Send + 'static,
+    {
+        self.auth_token = Some(Arc::new(move || Box::pin(f())));
         self
     }
 
@@ -424,8 +454,8 @@ struct IoWorker {
     sync: Arc<turso_sync_sdk_kit::rsapi::TursoDatabaseSync<Bytes>>,
     // Normalized base URL (http/https).
     base_url: Option<String>,
-    // Optional auth token.
-    auth_token: Option<String>,
+    // Optional auth token provider (resolved per request).
+    auth_token: Option<AuthTokenFn>,
     // Channel to wake the worker to process IO.
     tx: mpsc::UnboundedSender<()>,
     // Wakers to notify pending futures when IO makes progress.
@@ -436,7 +466,7 @@ impl IoWorker {
     fn spawn(
         sync: Arc<turso_sync_sdk_kit::rsapi::TursoDatabaseSync<Bytes>>,
         base_url: Option<String>,
-        auth_token: Option<String>,
+        auth_token: Option<AuthTokenFn>,
     ) -> Arc<Self> {
         let (tx, rx) = mpsc::unbounded_channel::<()>();
         let wakers = Arc::new(Mutex::new(Vec::new()));
@@ -597,6 +627,21 @@ impl IoWorker {
             format!("{url}{p}")
         };
 
+        // Resolve auth token (may fail if a dynamic provider returns an error).
+        // Resolved here rather than once at spawn so dynamic providers can rotate
+        // the token between requests.
+        let auth_token = match &this.auth_token {
+            Some(provider) => match provider().await {
+                Ok(token) => Some(token),
+                Err(err) => {
+                    completion.poison(format!("failed to resolve auth token: {err}"));
+                    this.sync.step_io_callbacks();
+                    return;
+                }
+            },
+            None => None,
+        };
+
         let mut builder = Request::builder().method(method).uri(&full_url);
 
         // Set headers from request
@@ -609,7 +654,7 @@ impl IoWorker {
                 }
             }
             // Add Authorization header if not already set
-            if let Some(token) = &this.auth_token {
+            if let Some(token) = &auth_token {
                 if !headers_map.contains_key(AUTHORIZATION) {
                     let value = format!("Bearer {token}");
                     if let Ok(hv) = hyper::header::HeaderValue::try_from(value.as_str()) {
@@ -1818,5 +1863,209 @@ mod tests {
         for h in readers {
             h.await.unwrap();
         }
+    }
+
+    /// Spin up a minimal mock HTTP server that captures the headers of every
+    /// request, returns 500, and closes the connection. Returns the bound URL
+    /// and a snapshot handle.
+    async fn spawn_mock_http_server() -> (
+        String,
+        std::sync::Arc<std::sync::Mutex<Vec<Vec<String>>>>,
+        std::sync::Arc<tokio::sync::Notify>,
+    ) {
+        use std::sync::Arc as StdArc;
+        use std::sync::Mutex as StdMutex;
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        use tokio::net::TcpListener;
+        use tokio::sync::Notify;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let url = format!("http://127.0.0.1:{port}");
+
+        let captured: StdArc<StdMutex<Vec<Vec<String>>>> = StdArc::new(StdMutex::new(Vec::new()));
+        let notify = StdArc::new(Notify::new());
+
+        let server_captured = captured.clone();
+        let server_notify = notify.clone();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    return;
+                };
+                let captured = server_captured.clone();
+                let notify = server_notify.clone();
+                tokio::spawn(async move {
+                    let (read_half, mut write_half) = socket.split();
+                    let mut reader = BufReader::new(read_half);
+                    let mut headers = Vec::new();
+                    loop {
+                        let mut line = String::new();
+                        match reader.read_line(&mut line).await {
+                            Ok(0) => return,
+                            Ok(_) => {
+                                if line == "\r\n" || line == "\n" {
+                                    break;
+                                }
+                                headers.push(line.trim_end().to_string());
+                            }
+                            Err(_) => return,
+                        }
+                    }
+                    captured.lock().unwrap().push(headers);
+                    notify.notify_waiters();
+                    let _ = write_half
+                        .write_all(
+                            b"HTTP/1.1 500 Internal Server Error\r\n\
+                              Content-Length: 0\r\n\
+                              Connection: close\r\n\r\n",
+                        )
+                        .await;
+                });
+            }
+        });
+
+        (url, captured, notify)
+    }
+
+    fn extract_bearer_token(headers: &[String]) -> Option<String> {
+        let auth = headers
+            .iter()
+            .find(|h| h.to_ascii_lowercase().starts_with("authorization:"))?;
+        let prefix = "Bearer ";
+        let pos = auth.find(prefix)?;
+        Some(auth[pos + prefix.len()..].trim().to_string())
+    }
+
+    /// Mock-server test: every HTTP request the sync engine issues must carry
+    /// `Authorization: Bearer <token>` when the builder was configured with an
+    /// auth token. Uses a raw `tokio::net::TcpListener` instead of a full
+    /// sync server so the test runs without any external infrastructure.
+    #[tokio::test]
+    pub async fn test_sync_sends_bearer_auth_header() {
+        let _ = tracing_subscriber::fmt::try_init();
+
+        let (url, captured, notify) = spawn_mock_http_server().await;
+
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("local.db");
+        let build_task = tokio::spawn({
+            let url = url.clone();
+            let path = path.to_str().unwrap().to_string();
+            async move {
+                // Build is expected to fail (mock server returns 500) — we
+                // only care that it issued a request with the right header.
+                let _ = crate::sync::Builder::new_remote(&path)
+                    .with_remote_url(&url)
+                    .with_auth_token("my-secret-token-XYZ")
+                    .build()
+                    .await;
+            }
+        });
+
+        tokio::time::timeout(Duration::from_secs(10), notify.notified())
+            .await
+            .expect("mock server did not receive any HTTP request from build");
+        build_task.abort();
+
+        let requests = captured.lock().unwrap().clone();
+        let first = requests.first().expect("expected at least one request");
+        let token = extract_bearer_token(first)
+            .unwrap_or_else(|| panic!("no Bearer Authorization in request: {first:?}"));
+        assert_eq!(token, "my-secret-token-XYZ");
+    }
+
+    /// `with_auth_token_fn` is documented to invoke its callback before every
+    /// HTTP request so callers can rotate the token between requests. Verify
+    /// that: (1) the callback fires once per request the engine issues, and
+    /// (2) the value it produced is the value sent in `Authorization`.
+    #[tokio::test]
+    pub async fn test_sync_auth_token_fn_called_per_request() {
+        use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+        use std::sync::Arc as StdArc;
+
+        let _ = tracing_subscriber::fmt::try_init();
+
+        let (url, captured, notify) = spawn_mock_http_server().await;
+
+        let counter = StdArc::new(AtomicUsize::new(0));
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("local.db");
+
+        // bootstrap_if_empty(false) keeps `build()` from issuing any HTTP
+        // requests so we control invocations purely through `pull()` calls.
+        let db = crate::sync::Builder::new_remote(path.to_str().unwrap())
+            .with_remote_url(&url)
+            .bootstrap_if_empty(false)
+            .with_auth_token_fn({
+                let counter = counter.clone();
+                move || {
+                    let n = counter.fetch_add(1, AtomicOrdering::SeqCst) + 1;
+                    async move { Ok(format!("rotating-token-{n}")) }
+                }
+            })
+            .build()
+            .await
+            .expect("build with bootstrap_if_empty(false) must not issue HTTP");
+
+        // Each pull issues at least one HTTP request; mock returns 500 so
+        // pull errors, but the auth callback was invoked before the send.
+        const PULLS: usize = 3;
+        for _ in 0..PULLS {
+            let _ = db.pull().await;
+        }
+
+        // Drain in case responses raced ahead of the captured-vector push.
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if captured.lock().unwrap().len() >= PULLS {
+                    break;
+                }
+                notify.notified().await;
+            }
+        })
+        .await
+        .expect("did not see expected requests");
+
+        let requests = captured.lock().unwrap().clone();
+        assert!(
+            requests.len() >= PULLS,
+            "expected >= {PULLS} captured requests, got {}",
+            requests.len()
+        );
+
+        let invocations = counter.load(AtomicOrdering::SeqCst);
+        assert!(
+            invocations >= requests.len(),
+            "auth callback called {invocations} times for {} requests",
+            requests.len()
+        );
+
+        // Every captured request carries a unique `Bearer rotating-token-N`
+        // value drawn from `1..=invocations`.
+        let mut tokens: Vec<String> = Vec::new();
+        for (i, req) in requests.iter().enumerate() {
+            let tok = extract_bearer_token(req)
+                .unwrap_or_else(|| panic!("no Bearer in request {i}: {req:?}"));
+            assert!(
+                tok.starts_with("rotating-token-"),
+                "unexpected token shape in request {i}: {tok:?}"
+            );
+            println!("token: {tok}");
+            let n: usize = tok["rotating-token-".len()..]
+                .parse()
+                .unwrap_or_else(|_| panic!("bad token suffix: {tok:?}"));
+            assert!(
+                (1..=invocations).contains(&n),
+                "token {n} outside expected range 1..={invocations}"
+            );
+            tokens.push(tok);
+        }
+        let unique: std::collections::HashSet<_> = tokens.iter().cloned().collect();
+        assert_eq!(
+            unique.len(),
+            tokens.len(),
+            "tokens must be unique per request: {tokens:?}"
+        );
     }
 }
