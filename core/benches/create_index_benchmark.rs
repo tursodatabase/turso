@@ -37,6 +37,9 @@ use std::sync::Arc;
 use tempfile::TempDir;
 use turso_core::{Database, PlatformIO, StepResult};
 
+#[path = "step_latency/mod.rs"]
+mod step_latency;
+
 #[cfg(not(target_family = "wasm"))]
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
@@ -194,12 +197,20 @@ fn bench_create_index(criterion: &mut Criterion) {
             let (db, conn) = open_limbo(&temp_dir);
             populate_limbo(&db, &conn, row_count);
 
+            let mut latency = step_latency::StepLatency::new();
+
             group.bench_function(BenchmarkId::new("limbo_create_index", row_count), |b| {
                 b.iter_custom(|iters| {
                     let mut total = std::time::Duration::ZERO;
                     for _ in 0..iters {
                         let start = std::time::Instant::now();
-                        exec_limbo(&conn, &db, "CREATE INDEX idx_val ON t(val)");
+                        let mut stmt = conn
+                            .query("CREATE INDEX idx_val ON t(val)")
+                            .unwrap()
+                            .unwrap();
+                        step_latency::run_to_completion_measured(&mut stmt, &db, &mut latency)
+                            .unwrap();
+                        drop(stmt);
                         total += start.elapsed();
                         // Restore the un-indexed state for the next sample.
                         exec_limbo(&conn, &db, "DROP INDEX idx_val");
@@ -207,6 +218,7 @@ fn bench_create_index(criterion: &mut Criterion) {
                     total
                 });
             });
+            latency.print_summary(&format!("limbo_create_index/{row_count}"));
             // Keep temp_dir alive until after the bench runs.
             drop(conn);
             drop(db);

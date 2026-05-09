@@ -146,6 +146,7 @@ cfg_aliases = "0.2.1"
 pprof = { version = "0.14.0", features = ["criterion", "flamegraph"] }
 
 [dev-dependencies]
+hdrhistogram = "7.5.2"
 memory-stats = "1.2.0"
 criterion = { workspace = true, features = [
     "html_reports",
