@@ -623,8 +623,11 @@ impl LogicalLog {
             cb(&self.write_buf, crc)?;
         }
 
-        // 7. Copy write_buf into an I/O buffer and pwrite. write_buf keeps its allocation.
-        let buffer = Arc::new(Buffer::new(self.write_buf.to_vec()));
+        // 7. Hand off the populated buffer to the I/O layer without copying.
+        // `to_vec()` would allocate a second N-byte buffer and memcpy, briefly
+        // holding two full copies in memory — fatal for million-row commits.
+        // `take` swaps in a fresh empty Vec; the next call grows from zero.
+        let buffer = Arc::new(Buffer::new(std::mem::take(&mut self.write_buf)));
         let c = Completion::new_write({
             let buffer_len = buffer.len();
             move |res: Result<i32, CompletionError>| {
