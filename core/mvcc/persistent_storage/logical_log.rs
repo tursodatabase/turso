@@ -660,6 +660,21 @@ impl LogicalLog {
         op_count: u32,
         commit_ts: u64,
     ) -> Result<u64> {
+        // Frame-level prediction. A.2/A.4 in MVCC_COMMIT_IMPL_STEPS_V2.md will
+        // *use* this number to pre-size streaming chunks; here we only assert
+        // that the size helpers stay byte-exact with serialize_op_entry /
+        // serialize_header_entry so the streaming path can rely on them.
+        let predicted_payload_size: u64 = tx
+            .row_versions
+            .iter()
+            .map(|rv| serialized_op_size(rv, rv.row.id.table_id) as u64)
+            .sum::<u64>()
+            + if tx.header.is_some() {
+                serialized_header_size() as u64
+            } else {
+                0
+            };
+
         if let Some(enc_ctx) = &self.encryption_ctx {
             self.encryption_scratch_buffer.clear();
             for row_version in &tx.row_versions {
@@ -669,6 +684,11 @@ impl LogicalLog {
                 serialize_header_entry(&mut self.encryption_scratch_buffer, &hdr);
             }
             let payload_size = self.encryption_scratch_buffer.len();
+            let actual = payload_size as u64;
+            turso_assert!(
+                actual == predicted_payload_size,
+                "frame-level payload size drift (encrypted): actual={actual} predicted={predicted_payload_size}"
+            );
 
             let salt = self
                 .header
@@ -733,7 +753,12 @@ impl LogicalLog {
             if let Some(header) = tx.header {
                 serialize_header_entry(&mut self.write_buf, &header);
             }
-            Ok((self.write_buf.len() - payload_start) as u64)
+            let actual_payload_size = (self.write_buf.len() - payload_start) as u64;
+            turso_assert!(
+                actual_payload_size == predicted_payload_size,
+                "frame-level payload size drift (plaintext): actual={actual_payload_size} predicted={predicted_payload_size}"
+            );
+            Ok(actual_payload_size)
         }
     }
 
@@ -845,6 +870,7 @@ impl LogicalLog {
 /// Serialize one op into `buffer`.
 /// Op layout: tag(1) | flags(1) | table_id(4, le i32) | payload_len(varint) | payload(variable)
 fn serialize_op_entry(buffer: &mut Vec<u8>, row_version: &RowVersion) -> Result<()> {
+    let start_len = buffer.len();
     let is_delete = row_version.end.is_some();
     let tag = match (&row_version.row.id.row_id, is_delete) {
         (RowKey::Int(_), false) => OP_UPSERT_TABLE,
@@ -907,7 +933,31 @@ fn serialize_op_entry(buffer: &mut Vec<u8>, row_version: &RowVersion) -> Result<
         }
     }
 
+    debug_assert_eq!(
+        buffer.len() - start_len,
+        serialized_op_size(row_version, row_version.row.id.table_id),
+        "serialize_op_entry / serialized_op_size byte-count drift for {:?}",
+        row_version.row.id,
+    );
     Ok(())
+}
+
+/// Predict, without serializing, the number of bytes [`serialize_op_entry`] writes for `rv`.
+///
+/// `canonical_table_id` is unused for size accounting — `table_id` is a fixed
+/// 4-byte `i32` regardless of value — but appears in the signature for parity
+/// with the canonical-id sidecar that A.3 will plumb through the streaming path
+/// (see `MVCC_COMMIT_IMPL_STEPS_V2.md`). The size is determined entirely by the
+/// op tag (delete vs upsert, table vs index) and the payload length.
+fn serialized_op_size(rv: &RowVersion, _canonical_table_id: MVTableId) -> usize {
+    let is_delete = rv.end.is_some();
+    let payload_len = match (&rv.row.id.row_id, is_delete) {
+        (RowKey::Int(rowid), false) => varint_len(*rowid as u64) + rv.row.payload().len(),
+        (RowKey::Int(rowid), true) => varint_len(*rowid as u64),
+        (RowKey::Record(_), _) => rv.row.payload().len(),
+    };
+    // tag(1) + flags(1) + table_id(4) + payload_len varint + payload
+    1 + 1 + 4 + varint_len(payload_len as u64) + payload_len
 }
 
 fn serialize_header_entry(buffer: &mut Vec<u8>, header: &DatabaseHeader) {
@@ -917,6 +967,12 @@ fn serialize_header_entry(buffer: &mut Vec<u8>, header: &DatabaseHeader) {
     buffer.extend_from_slice(&0i32.to_le_bytes());
     write_varint_to_vec(DatabaseHeader::SIZE as u64, buffer);
     buffer.extend_from_slice(bytemuck::bytes_of(header));
+}
+
+/// Predict, without serializing, the number of bytes [`serialize_header_entry`] writes.
+fn serialized_header_size() -> usize {
+    // tag(1) + flags(1) + table_id(4) + payload_len varint + DatabaseHeader bytes
+    1 + 1 + 4 + varint_len(DatabaseHeader::SIZE as u64) + DatabaseHeader::SIZE
 }
 
 /// Parse all ops from a decrypted plaintext buffer.
@@ -2337,10 +2393,11 @@ mod tests {
     use super::{
         build_encrypted_chunk_aad, encrypted_chunk_blob_size, encrypted_chunk_plaintext_len,
         encrypted_payload_blob_size, encrypted_payload_chunk_count, serialize_header_entry,
-        serialize_op_entry, HeaderReadResult, LogHeader, LogicalLog, ParseResult, ParsedOp,
-        StreamingLogicalLogReader, StreamingResult, ENCRYPTED_CHUNK_AAD_SIZE,
-        ENCRYPTED_PAYLOAD_CHUNK_SIZE, END_MAGIC, FRAME_MAGIC, LOG_HDR_CRC_START,
-        LOG_HDR_RESERVED_START, LOG_HDR_SIZE, LOG_VERSION, TX_HEADER_SIZE, TX_TRAILER_SIZE,
+        serialize_op_entry, serialized_header_size, serialized_op_size, HeaderReadResult,
+        LogHeader, LogicalLog, ParseResult, ParsedOp, StreamingLogicalLogReader, StreamingResult,
+        ENCRYPTED_CHUNK_AAD_SIZE, ENCRYPTED_PAYLOAD_CHUNK_SIZE, END_MAGIC, FRAME_MAGIC,
+        LOG_HDR_CRC_START, LOG_HDR_RESERVED_START, LOG_HDR_SIZE, LOG_VERSION, TX_HEADER_SIZE,
+        TX_TRAILER_SIZE,
     };
     use crate::OpenFlags;
     use crate::{turso_assert, turso_assert_less_than};
@@ -4384,6 +4441,65 @@ mod tests {
         let row_version = make_test_row_version((-2).into(), rowid, &value, 100);
         serialize_op_entry(&mut encoded, &row_version).unwrap();
         encoded.len()
+    }
+
+    /// What this test checks: `serialized_op_size` predicts byte-for-byte the
+    /// number of bytes `serialize_op_entry` will write, across every op tag, both
+    /// flag values, and the rowid varint width extremes.
+    /// Why this matters: the streaming-output path introduced by A.2/A.4 (see
+    /// MVCC_COMMIT_IMPL_STEPS_V2.md) does a "size pass" before any plaintext is
+    /// emitted; if the helper drifts from `serialize_op_entry`, encrypted commits
+    /// will produce wrong AAD / mis-sized chunks and decrypt will fail.
+    #[test]
+    fn test_serialized_op_size_matches_serialize_op_entry() {
+        init_tracing();
+        let table_id: MVTableId = (-100).into();
+
+        let mut fixtures: Vec<crate::mvcc::database::RowVersion> = vec![
+            // OP_UPSERT_TABLE — small rowid, 1-byte varint, non-empty payload.
+            make_test_row_version(table_id, 1, "hello", 100),
+            // OP_UPSERT_TABLE — rowid that forces 9-byte varint width.
+            make_test_row_version(table_id, i64::MIN + 1, "x", 101),
+            // OP_UPSERT_TABLE — empty record body.
+            make_test_row_version(table_id, 5, "", 102),
+            // OP_UPSERT_INDEX — record-keyed.
+            make_test_index_row_version(table_id, 8, "indexkey", 105),
+            // OP_DELETE_TABLE.
+            make_test_raw_table_row_version(table_id, 7, b"unused".to_vec(), 104, true),
+            // OP_DELETE_INDEX.
+            make_test_raw_index_row_version(table_id, 9, b"keybytes".to_vec(), 106, true),
+            // OP_UPSERT_INDEX — empty key payload.
+            make_test_raw_index_row_version(table_id, 10, vec![], 107, false),
+        ];
+        // OP_UPSERT_TABLE with btree_resident flag set.
+        let mut resident = make_test_row_version(table_id, 42, "world", 103);
+        resident.btree_resident = true;
+        fixtures.push(resident);
+
+        for rv in &fixtures {
+            let mut buf = Vec::new();
+            serialize_op_entry(&mut buf, rv).unwrap();
+            let predicted = serialized_op_size(rv, rv.row.id.table_id);
+            assert_eq!(
+                buf.len(),
+                predicted,
+                "byte-count drift for op {:?} (delete={}, btree_resident={})",
+                rv.row.id,
+                rv.end.is_some(),
+                rv.btree_resident,
+            );
+        }
+    }
+
+    /// What this test checks: `serialized_header_size` predicts the byte count
+    /// `serialize_header_entry` writes for `OP_UPDATE_HEADER`.
+    #[test]
+    fn test_serialized_header_size_matches_serialize_header_entry() {
+        init_tracing();
+        let header = DatabaseHeader::default();
+        let mut buf = Vec::new();
+        serialize_header_entry(&mut buf, &header);
+        assert_eq!(buf.len(), serialized_header_size());
     }
 
     fn try_text_len_for_single_upsert_table_op_size(
