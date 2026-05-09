@@ -354,6 +354,20 @@ fn gen_insert_values<R: Rng + ?Sized, C: GenerationContext>(
     let num_rows = rng.random_range(insert_opts.min_rows.get()..insert_opts.max_rows.get());
     let base_offset: i64 = rng.random_range(UNIQUE_BASE_OFFSET_RANGE);
 
+    let padding_target_idx: Option<usize> = insert_opts.padding_size.and_then(|_| {
+        let eligible: Vec<usize> = table
+            .columns
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, c)| {
+                (matches!(c.column_type, ColumnType::Blob | ColumnType::Text)
+                    && !c.has_unique_or_pk())
+                .then_some(idx)
+            })
+            .collect();
+        (!eligible.is_empty()).then(|| *pick(&eligible, rng))
+    });
+
     let values: Vec<Vec<SimValue>> = (0..num_rows)
         .map(|row_idx| {
             table
@@ -367,10 +381,18 @@ fn gen_insert_values<R: Rng + ?Sized, C: GenerationContext>(
                     if c.has_unique_or_pk() {
                         let offset =
                             base_offset + (col_idx as i64 * UNIQUE_COL_STRIDE) + row_idx as i64;
-                        SimValue::unique_for_type(&c.column_type, offset)
-                    } else {
-                        SimValue::arbitrary_from(rng, env, &c.column_type)
+                        return SimValue::unique_for_type(&c.column_type, offset);
                     }
+                    if Some(col_idx) == padding_target_idx {
+                        let size = insert_opts.padding_size.unwrap();
+                        let p = "X".repeat(size);
+                        return if matches!(c.column_type, ColumnType::Blob) {
+                            SimValue(turso_core::Value::Blob(p.into_bytes()))
+                        } else {
+                            SimValue(turso_core::Value::Text(p.into()))
+                        };
+                    }
+                    SimValue::arbitrary_from(rng, env, &c.column_type)
                 })
                 .collect()
         })

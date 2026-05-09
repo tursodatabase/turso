@@ -191,6 +191,10 @@ pub struct InsertOpts {
     pub max_rows: NonZeroU32,
     #[garde(range(min = 0.0, max = 1.0))]
     pub upsert_prob: f64,
+    /// If set, replaces one non-PK BLOB/TEXT value per row with `"X".repeat(size)`.
+    /// INSERT analog of `UpdateOpts.padding_size`.
+    #[garde(skip)]
+    pub padding_size: Option<usize>,
 }
 
 impl Default for InsertOpts {
@@ -199,6 +203,7 @@ impl Default for InsertOpts {
             min_rows: NonZero::new(1).unwrap(),
             max_rows: NonZero::new(10).unwrap(),
             upsert_prob: 0.15,
+            padding_size: None,
         }
     }
 }
